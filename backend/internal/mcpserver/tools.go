@@ -1585,7 +1585,7 @@ type GetRunStatusOutput struct {
 	// pair above, which tracks a stage's REVIEW rather than its execution.
 	// Omitted (nil) when no stage of that type exists in the run.
 	PlanStageWaitStatus      *StageWaitStatus `json:"plan_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the plan stage: status is one of pending, running, succeeded, failed, cancelled, superseded (a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, superseded -> superseded, and any state added later also buckets to pending; superseded is TERMINAL — a merge made the stage unreachable (#3083) — so a wait on it resolves). Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining. Omitted when no plan stage exists"`
-	ImplementStageWaitStatus *StageWaitStatus `json:"implement_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the implement stage: status is one of pending, running, succeeded, failed, cancelled, superseded (a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, superseded -> superseded, and any state added later also buckets to pending; superseded is TERMINAL — a merge made the stage unreachable (#3083) — so a wait on it resolves). Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining — a filed scope amendment needs at least the amendment poll window of remaining budget to be decidable. Omitted when no implement stage exists"`
+	ImplementStageWaitStatus *StageWaitStatus `json:"implement_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the implement stage: status is one of pending, running, succeeded, failed, cancelled, superseded (a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, superseded -> superseded, and any state added later also buckets to pending; superseded is TERMINAL — a merge made the stage unreachable (#3083) — so a wait on it resolves). Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining — a filed scope amendment needs at least the amendment poll window of remaining budget to be decidable. It also carries fixup_recovered (#3081) when the LATEST fix-up pass for the stage FAILED and the backend recovered the stage — a succeeded status is then TRUE of the stage and MISLEADING of the fix-up: no fix-up commit landed and the routed concerns were NOT addressed. Omitted when no implement stage exists"`
 	// AcceptanceStageWaitStatus summarizes the acceptance stage's EXECUTION
 	// lifecycle (E31.9 / ADR-049), computed via the same generic
 	// stageWaitStatusFor helper. Omitted (nil) when the workflow declares no
@@ -1927,12 +1927,17 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// fix-up-pass count. On any error or when no implement stage exists the
 	// field stays nil — never fails the snapshot.
 	var reviewActionHint *ReviewActionHint
+	// implementFixupRecovery is the E68.31 / #3081 marker, resolved from the SAME
+	// implement stage id the hint below uses. Best-effort: nil on any audit read
+	// error or when no fix-up round exists, so it never fails the snapshot.
+	var implementFixupRecovery *FixupRecovery
 	if implementStageID, ok := stageIDOfType(stages, "implement"); ok {
 		// runRow.Concerns is the store-derived open-concern block decoded off
 		// GET /v0/runs/{id} above — the authoritative count source (#3043); nil
 		// (backend could not read the store) degrades the hint to the audit
 		// fallback.
 		reviewActionHint, _ = r.reviewActionHintFor(ctx, runID, implementStageID, runRow.State, implementReviewStatus, runRow.Concerns)
+		implementFixupRecovery = r.fixupRecoveryFor(ctx, runID, implementStageID)
 	}
 
 	// Stage-execution wait status (#879/#880, ADR-037), derived from the
@@ -1949,6 +1954,19 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// Acceptance stage-execution wait status (E31.9), via the same generic
 	// helper — nil (omitted) when the workflow declares no acceptance stage.
 	acceptanceStageWaitStatus := stageWaitStatusFor(stages, "acceptance", runRow.State, runRow.PredictedRuntimeMinutes, waitNow)
+	// Fix-up recovery marker (E68.31 / #3081): a fix-up that FAILED and was
+	// recovered leaves the implement stage `succeeded`, which is true of the stage
+	// and misleading about the fix-up. The bucket vocabulary is deliberately NOT
+	// re-mapped (it is a total, pinned mapping); the additive marker carries the
+	// difference. Guarded on BOTH nils. The wait-status half is REDUNDANT BY
+	// CONSTRUCTION today — both it and implementFixupRecovery are derived from the
+	// same `stages` slice, so a run with no implement stage produces nil for both,
+	// and deleting the check leaves TestGetRunStatus_NoImplementStageDoesNotPanic
+	// green (verified, not reasoned). It is kept as a nil-deref guard against a
+	// future caller that resolves the two independently.
+	if implementStageWaitStatus != nil && implementFixupRecovery != nil {
+		implementStageWaitStatus.FixupRecovered = implementFixupRecovery
+	}
 
 	// Server-suggested next actions (#1024): a pure function over the
 	// run/stage/review/hint/drive data fetched above — no extra

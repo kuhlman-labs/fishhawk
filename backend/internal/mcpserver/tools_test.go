@@ -13593,3 +13593,207 @@ func TestRunMirror_DecodesCompletionBlockedWireBytes(t *testing.T) {
 		t.Fatal("the decoded wire value \"superseded\" is not treated as terminal; fishhawk_await_stage would block forever (#3083)")
 	}
 }
+
+// --- fix-up recovery marker on get_run_status (E68.31 / #3081) ---
+
+// TestGetRunStatus_ImplementWaitStatusCarriesFixupRecovery is the DONE-MEANS
+// assertion on the second surface the issue names: a run whose latest fix-up
+// pass FAILED and was recovered reports implement_stage_wait_status.status
+// `succeeded` — true of the stage, misleading about the fix-up — so the block
+// must carry the additive marker naming what actually happened.
+func TestGetRunStatus_ImplementWaitStatusCarriesFixupRecovery(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	implID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: implID.String(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+	}
+	seedFixupTriggeredAudit(fb, runID, implID)
+	seedFixupRecoveredPayload(fb, runID, implID, "C", "commit/push onto PR branch failed")
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ImplementStageWaitStatus == nil {
+		t.Fatal("implement_stage_wait_status is nil")
+	}
+	if out.ImplementStageWaitStatus.Status != "succeeded" {
+		t.Errorf("status = %q, want succeeded (the bucket vocabulary must NOT move)", out.ImplementStageWaitStatus.Status)
+	}
+	rec := out.ImplementStageWaitStatus.FixupRecovered
+	if rec == nil {
+		t.Fatal("implement_stage_wait_status.fixup_recovered is absent; want the #3081 marker")
+	}
+	if rec.SourceFailureCategory != "C" {
+		t.Errorf("source_failure_category = %q, want C", rec.SourceFailureCategory)
+	}
+	if rec.SourceFailureReason != "commit/push onto PR branch failed" {
+		t.Errorf("source_failure_reason = %q", rec.SourceFailureReason)
+	}
+	if rec.RestoredState != "succeeded" {
+		t.Errorf("restored_state = %q, want succeeded", rec.RestoredState)
+	}
+	if rec.Message == "" {
+		t.Error("marker message is empty")
+	}
+}
+
+// TestGetRunStatus_SucceededFixupCarriesNoMarker is the get_run_status CONTROL:
+// a fix-up that LANDED writes no recovery entry, so the block must be
+// byte-identical to today.
+func TestGetRunStatus_SucceededFixupCarriesNoMarker(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	implID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: implID.String(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+	}
+	seedFixupTriggeredAudit(fb, runID, implID)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ImplementStageWaitStatus == nil {
+		t.Fatal("implement_stage_wait_status is nil")
+	}
+	if out.ImplementStageWaitStatus.FixupRecovered != nil {
+		t.Errorf("fixup_recovered = %+v, want absent for a fix-up that landed", out.ImplementStageWaitStatus.FixupRecovered)
+	}
+	raw := mustMarshal(t, out.ImplementStageWaitStatus)
+	if strings.Contains(string(raw), "fixup_recovered") {
+		t.Errorf("the marker-less block serialized a fixup_recovered key: %s", raw)
+	}
+}
+
+// TestGetRunStatus_NoImplementStageDoesNotPanic pins the nil-wait-status guard:
+// a run with no implement stage has nothing to decorate, and the snapshot must
+// come back clean rather than dereferencing a nil block.
+func TestGetRunStatus_NoImplementStageDoesNotPanic(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ImplementStageWaitStatus != nil {
+		t.Errorf("implement_stage_wait_status = %+v, want nil with no implement stage", out.ImplementStageWaitStatus)
+	}
+}
+
+// TestGetRunStatus_FixupRecoveryAuditErrorDegrades pins the get_run_status half
+// of the best-effort contract: an audit read failure loses the marker and still
+// returns the snapshot, rather than failing it.
+//
+// The failure is injected PER CATEGORY (via the fake's reviewFlip hook, which
+// runs before the handler reads its status override) rather than as a blanket
+// audit outage. That is deliberate and honest: get_run_status's own
+// loadImplementReviews read runs BEFORE this probe and already fails the whole
+// snapshot on a blanket outage — pre-existing behaviour this change neither
+// introduces nor alters. Scoping the failure to the recovery category isolates
+// THIS probe's degrade, which is the branch under test.
+func TestGetRunStatus_FixupRecoveryAuditErrorDegrades(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	implID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: implID.String(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+	}
+	seedFixupTriggeredAudit(fb, runID, implID)
+	seedFixupRecoveredPayload(fb, runID, implID, "C", "boom")
+	// Fail ONLY the stage_fixup_recovered read. reviewFlip runs under fb.mu
+	// before the handler reads perRunAuditStatus, so setting it here decides
+	// this request's status.
+	fb.reviewFlip = func(category string) {
+		if category == categoryStageFixupRecovered {
+			fb.perRunAuditStatus = http.StatusInternalServerError
+			return
+		}
+		fb.perRunAuditStatus = http.StatusOK
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus returned an error on a failing audit read: %v (the probe must be best-effort)", err)
+	}
+	if out.ImplementStageWaitStatus == nil {
+		t.Fatal("implement_stage_wait_status is nil; the snapshot must be intact")
+	}
+	if out.ImplementStageWaitStatus.Status != "succeeded" {
+		t.Errorf("status = %q, want succeeded (the snapshot must be intact)", out.ImplementStageWaitStatus.Status)
+	}
+	if out.ImplementStageWaitStatus.FixupRecovered != nil {
+		t.Errorf("fixup_recovered = %+v, want absent when the audit read failed", out.ImplementStageWaitStatus.FixupRecovered)
+	}
+}
+
+// TestGetRunStatus_FixupRecoverySurvivesTheDiagnosisSkeleton is the operator's
+// BINDING CONDITION 2 case, made TESTED rather than asserted from repository
+// knowledge: a BUDGET-DEGRADED response — one reduced all the way to the
+// diagnosis skeleton — must still carry the marker.
+//
+// The claim rests on skeletonRunStatus copying each wait-status block BY
+// POINTER. That is exactly the kind of fact a later refactor to a field-by-field
+// copy would silently break, and it would break it in precisely the degraded
+// responses where an operator most needs the marker — so it is pinned here
+// rather than read off the source.
+//
+// The band is DERIVED (the skeleton's own marshalled size), mirroring
+// bound_test.go's TestSkeletonTier_IsReachedAndItemisesPerField, so the test
+// cannot drift into asserting against a tier it never reached: the tier is
+// asserted to be "skeleton" before the marker is read.
+func TestGetRunStatus_FixupRecoverySurvivesTheDiagnosisSkeleton(t *testing.T) {
+	runID := uuid.NewString()
+	marker := &FixupRecovery{
+		SourceFailureReason:   "commit/push onto PR branch failed",
+		SourceFailureCategory: "C",
+		RestoredState:         "succeeded",
+		DetailsAvailable:      true,
+		Message:               "the fix-up pass FAILED and pushed no commit",
+	}
+	src := maximalRunStatusOutput(runID)
+	src.ImplementStageWaitStatus = &StageWaitStatus{
+		Stage: "implement", Status: "succeeded", FixupRecovered: marker,
+	}
+
+	sk, _, err := skeletonRunStatus(src, runID, fixedBudget(1<<30))
+	if err != nil {
+		t.Fatalf("skeleton: %v", err)
+	}
+	band := len(mustMarshal(t, sk))
+
+	out, err := boundRunStatusOutput(src, runID, fixedBudget(band))
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+	if out.Elisions == nil || out.Elisions.Tier != "skeleton" {
+		t.Fatalf("tier at budget %d = %+v, want the skeleton tier (the degraded response under test)", band, out.Elisions)
+	}
+	if out.ImplementStageWaitStatus == nil {
+		t.Fatal("the diagnosis skeleton dropped implement_stage_wait_status entirely")
+	}
+	got := out.ImplementStageWaitStatus.FixupRecovered
+	if got == nil {
+		t.Fatal("the diagnosis skeleton dropped fixup_recovered; a budget-degraded response must still carry the marker")
+	}
+	if got.SourceFailureCategory != "C" || got.SourceFailureReason != "commit/push onto PR branch failed" {
+		t.Errorf("marker details lost in the skeleton: %+v", got)
+	}
+	if !strings.Contains(string(mustMarshal(t, out)), "fixup_recovered") {
+		t.Error("the marshalled skeleton response carries no fixup_recovered key")
+	}
+}
