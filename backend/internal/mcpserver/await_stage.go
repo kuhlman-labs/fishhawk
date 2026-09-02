@@ -37,7 +37,7 @@ type AwaitStageInput struct {
 // AwaitStageOutput is the fishhawk_await_stage response. Status is one of:
 //
 //   - "settled"      — the stage reached a SETTLED state (run.StageState.IsSettled):
-//     terminal (succeeded/failed/cancelled) OR parked-for-operator
+//     terminal (succeeded/failed/cancelled/superseded) OR parked-for-operator
 //     (awaiting_approval / awaiting_children / awaiting_input /
 //     awaiting_scope_decision / awaiting_deploy_approval /
 //     awaiting_host_dispatch). State carries the RAW backend state so a parked
@@ -68,10 +68,10 @@ type AwaitStageOutput struct {
 	// awaiting_approval settles the wait but is reported as awaiting_approval,
 	// NOT succeeded, so the operator can tell a completed stage from one parked
 	// for their attention.
-	State string `json:"state" jsonschema:"the RAW backend stage state (succeeded/failed/cancelled or a parked awaiting_* state); never coerced, so a parked settled stage is distinguishable from a succeeded one"`
+	State string `json:"state" jsonschema:"the RAW backend stage state (succeeded/failed/cancelled/superseded or a parked awaiting_* state); never coerced, so a parked settled stage is distinguishable from a succeeded one. superseded means a merge made the stage unreachable (#3083) — neither a pass nor an operator cancellation"`
 	// Terminal is the endpoint's settledness flag (#1252): true when the stage
 	// IsSettled — terminal OR parked. It is the authority for the settled
-	// resolve; keying on terminality alone (succeeded/failed/cancelled) would
+	// resolve; keying on terminality alone (succeeded/failed/cancelled/superseded) would
 	// silently miss the parked half.
 	Terminal            bool             `json:"terminal" jsonschema:"true when the stage has SETTLED — a terminal state OR a parked-for-operator state; the authoritative resolve signal"`
 	FailureCategory     string           `json:"failure_category,omitempty" jsonschema:"the failed stage's category, when the settled state is failed"`
@@ -126,7 +126,8 @@ There are TWO release conditions: the stage SETTLES, or the awaited stage
 files a mid-stage scope amendment that is still pending (#2588).
 
 "Settled" is deliberately BROADER than "terminal": the wait resolves the
-moment the stage reaches a terminal state (succeeded / failed / cancelled) OR
+moment the stage reaches a terminal state (succeeded / failed / cancelled /
+superseded) OR
 a parked-for-operator state (awaiting_approval / awaiting_children /
 awaiting_input / awaiting_scope_decision / awaiting_deploy_approval /
 awaiting_host_dispatch) — the settledness a detached watcher actually wants

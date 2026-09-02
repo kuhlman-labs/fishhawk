@@ -13505,3 +13505,91 @@ func TestApprovePlan_ReasonLint_SilentOnOrdinaryReason(t *testing.T) {
 		}
 	}
 }
+
+// TestRunMirror_DecodesCompletionBlockedWireBytes is the MCP half of binding
+// approval CONDITION 3: the `superseded` state and the completion_blocked
+// projection must survive SERIALIZATION into this package's hand-maintained
+// wire mirrors, which is exactly the seam a missing enum member or an unmirrored
+// json tag hides in.
+//
+// The fixture is the LITERAL byte sequence the backend emits — the same
+// literals backend/internal/server/merge_supersede_test.go asserts against the
+// REAL GET /v0/runs/{run_id} and GET /v0/runs/{run_id}/stages response bodies.
+// The two halves meet on those bytes; they cannot be joined in one process
+// because backend/internal/server IMPORTS this package (the /mcp route) and the
+// mirror's api client is unexported.
+//
+// Every assertion is on the LITERAL WIRE STRING, never on a Go constant: a
+// constant comparison passes even when the json tag is wrong, which is the trap
+// this test exists to avoid.
+func TestRunMirror_DecodesCompletionBlockedWireBytes(t *testing.T) {
+	const runBytes = `{
+	  "id": "0f4b4a5e-6d51-4f2f-9f0d-2b7c3d4e5f60",
+	  "state": "running",
+	  "completion_blocked": {
+	    "stage_id": "11111111-2222-3333-4444-555555555555",
+	    "stage_type": "acceptance",
+	    "stage_state": "awaiting_host_dispatch",
+	    "reason": "the merge made stage acceptance (parked at \"awaiting_host_dispatch\") unreachable; POST /v0/runs/{run_id}/reconcile-merge supersedes it and completes the run",
+	    "recovery": "reconcile-merge"
+	  }
+	}`
+	var r Run
+	if err := json.Unmarshal([]byte(runBytes), &r); err != nil {
+		t.Fatalf("decode run: %v", err)
+	}
+	if r.CompletionBlocked == nil {
+		t.Fatal("completion_blocked decoded to nil: the json tag does not byte-match the backend's runResponse field (#371-class mirror trap)")
+	}
+	if got := r.CompletionBlocked.StageState; got != "awaiting_host_dispatch" {
+		t.Errorf("stage_state = %q, want the literal awaiting_host_dispatch", got)
+	}
+	if got := r.CompletionBlocked.Recovery; got != "reconcile-merge" {
+		t.Errorf("recovery = %q, want the literal reconcile-merge", got)
+	}
+	if got := r.CompletionBlocked.StageType; got != "acceptance" {
+		t.Errorf("stage_type = %q, want the literal acceptance", got)
+	}
+	if r.CompletionBlocked.StageID == "" || r.CompletionBlocked.Reason == "" {
+		t.Errorf("stage_id/reason decoded empty: %+v", r.CompletionBlocked)
+	}
+
+	// The omitted case must decode to nil, not to a zero-valued block — a
+	// consumer branches on presence.
+	var unblocked Run
+	if err := json.Unmarshal([]byte(`{"id":"x","state":"succeeded"}`), &unblocked); err != nil {
+		t.Fatalf("decode unblocked run: %v", err)
+	}
+	if unblocked.CompletionBlocked != nil {
+		t.Errorf("completion_blocked = %+v on a run that omits the key, want nil", unblocked.CompletionBlocked)
+	}
+
+	// Re-serialization must reproduce the SAME wire keys, so a value that
+	// round-trips through this mirror stays decodable by the backend's own
+	// contract.
+	out, err := json.Marshal(r.CompletionBlocked)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	for _, key := range []string{`"stage_id"`, `"stage_type"`, `"stage_state"`, `"reason"`, `"recovery"`} {
+		if !strings.Contains(string(out), key) {
+			t.Errorf("re-serialized completion_blocked drops %s: %s", key, out)
+		}
+	}
+
+	// And the sibling literal: a `superseded` stage state must decode into the
+	// Stage mirror and classify TERMINAL on the stage-wait seam, or
+	// fishhawk_await_stage blocks forever on a run that is already settled.
+	var stages struct {
+		Items []Stage `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(`{"items":[{"id":"11111111-2222-3333-4444-555555555555","type":"acceptance","state":"superseded"}]}`), &stages); err != nil {
+		t.Fatalf("decode stage list: %v", err)
+	}
+	if len(stages.Items) != 1 || stages.Items[0].State != "superseded" {
+		t.Fatalf("stage mirror did not decode the literal state \"superseded\": %+v", stages.Items)
+	}
+	if !stageStateIsTerminal(stages.Items[0].State) {
+		t.Fatal("the decoded wire value \"superseded\" is not treated as terminal; fishhawk_await_stage would block forever (#3083)")
+	}
+}

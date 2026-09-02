@@ -239,7 +239,52 @@ type runResponse struct {
 	// missing, or no stage declares either block — so a run whose spec declares
 	// none keeps a byte-identical response.
 	Permissions []runStagePermissionsPayload `json:"permissions,omitempty"`
+	// CompletionBlocked names the stage that is stopping a `running` run from
+	// completing (E64.2 / #3083) and — load bearing — whether anything can move
+	// it. Orchestrator.completeRun refuses to stamp a run `succeeded` while any
+	// stage is non-terminal (the #968 guard); before this field the refusal was
+	// invisible, so an operator watching a merged PR on a run stuck at `running`
+	// had no way to learn WHICH stage held it or whether a verb existed.
+	//
+	// Populated by handleGetRun ONLY (the single-run read, same best-effort
+	// posture as Concerns / DerivedStatus / SliceDependsOn — the list endpoint
+	// never pays the per-row stage + audit reads). omitempty, so every run that
+	// is not blocked keeps a byte-identical response.
+	//
+	// Recovery DISCRIMINATES rather than pointing at a verb and hoping: it reads
+	// "reconcile-merge" ONLY when the blocker is a pair-table-admissible (type,
+	// state) on a run whose PR is observably merged — i.e. when the sweep can
+	// genuinely move it — and "none" otherwise, with Reason naming the state.
+	// Pointing at a verb guaranteed to refuse is this issue's own complaint
+	// about merge_run.
+	CompletionBlocked *runCompletionBlockedPayload `json:"completion_blocked,omitempty"`
 }
+
+// runCompletionBlockedPayload is the completion-refusal projection on the wire
+// (E64.2 / #3083). The MCP client mirror decodes it; the json tags MUST
+// byte-match their counterparts (backend/internal/mcpserver/client.go's
+// RunCompletionBlocked) or the field silently decodes to nil — the #371-class
+// hand-maintained-wire-mirror trap.
+type runCompletionBlockedPayload struct {
+	StageID    string `json:"stage_id"`
+	StageType  string `json:"stage_type"`
+	StageState string `json:"stage_state"`
+	Reason     string `json:"reason"`
+	Recovery   string `json:"recovery"`
+}
+
+// The two values of runCompletionBlockedPayload.Recovery. A closed set on
+// purpose: an operator (or the MCP surface) branches on it, and a free-form
+// hint would be unbranchable.
+const (
+	// completionBlockedRecoveryReconcileMerge — POST
+	// /v0/runs/{run_id}/reconcile-merge will supersede this stage and let the
+	// run complete.
+	completionBlockedRecoveryReconcileMerge = "reconcile-merge"
+	// completionBlockedRecoveryNone — no reconcile applies. Reason names the
+	// state and says what the stage needs instead.
+	completionBlockedRecoveryNone = "none"
+)
 
 // runStagePermissionsPayload is one stage's declared permissions/egress on the
 // wire (E53.5 / #2228). DECLARATION-ONLY. The Enforced flag is the HONEST
@@ -1728,7 +1773,93 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// carries no cached spec, the spec fails to parse, or no stage declares a
 	// permissions/egress block.
 	resp.Permissions = s.buildStagePermissionsSurface(got)
+	// Completion-refusal surface (E64.2 / #3083): single-run read ONLY (same
+	// posture as Concerns / SecurityFindings — no per-row stage + audit reads on
+	// the list endpoint). nil (field omitted) for any run that is not `running`,
+	// a running run whose stages are all terminal, or when a read fails
+	// (best-effort — warn and omit, never fail the read).
+	resp.CompletionBlocked = s.completionBlockedForRun(r.Context(), got)
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// completionBlockedForRun names the stage stopping a `running` run from
+// completing, and whether the merge-supersede sweep can move it (E64.2 /
+// #3083).
+//
+// The blocker is the LOWEST-sequence non-terminal stage — the run's own stage
+// order, so the answer is stable across calls and names the stage an operator
+// would reach for first.
+//
+// Recovery is `reconcile-merge` ONLY when BOTH hold: the blocker's (type, state)
+// is a row of the DEFAULT-DENY run.MergeSupersedable pair table, AND the run's
+// PR is observably merged (the same pr_merged / post_merge_observed evidence
+// handleReconcileMerge's own precondition reads, so the surface and the verb can
+// never disagree). Every other blocker — `running`, `dispatched`,
+// `awaiting_children`, the deploy park states, `awaiting_scope_decision`, and an
+// admissible park on a run whose PR has NOT merged — reads `none` with a Reason
+// naming the state, because pointing an operator at a verb guaranteed to refuse
+// is exactly the defect this issue reports against merge_run.
+//
+// Best-effort: a stage-list failure warn-logs and omits the field. A merge-
+// evidence read failure does NOT omit the field — it degrades Recovery to
+// `none` (fail closed on unknown evidence: never advertise a verb we cannot
+// confirm would work) and still names the blocking stage, which is the half of
+// the answer that does not depend on the chain.
+func (s *Server) completionBlockedForRun(ctx context.Context, got *run.Run) *runCompletionBlockedPayload {
+	if got == nil || got.State != run.StateRunning || s.cfg.RunRepo == nil {
+		return nil
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, got.ID)
+	if err != nil {
+		s.cfg.Logger.Warn("list stages failed; omitting completion_blocked block",
+			"run_id", got.ID.String(), "error", err.Error())
+		return nil
+	}
+	var blocker *run.Stage
+	for _, st := range stages {
+		if st == nil || st.State.IsTerminal() {
+			continue
+		}
+		if blocker == nil || st.Sequence < blocker.Sequence {
+			blocker = st
+		}
+	}
+	if blocker == nil {
+		return nil
+	}
+
+	out := &runCompletionBlockedPayload{
+		StageID:    blocker.ID.String(),
+		StageType:  string(blocker.Type),
+		StageState: string(blocker.State),
+		Recovery:   completionBlockedRecoveryNone,
+	}
+	if !run.MergeSupersedable(blocker.Type, blocker.State) {
+		out.Reason = fmt.Sprintf(
+			"the run cannot complete while stage %s is in state %q: %q is not a merge-supersedable park, so the stage must run, settle or be cancelled",
+			blocker.Type, blocker.State, blocker.State)
+		return out
+	}
+	merged := false
+	if s.cfg.AuditRepo != nil {
+		var merr error
+		if merged, merr = s.runPRObservablyMerged(ctx, got.ID); merr != nil {
+			s.cfg.Logger.Warn("read merge observation failed; completion_blocked recovery degraded to none",
+				"run_id", got.ID.String(), "error", merr.Error())
+			merged = false
+		}
+	}
+	if !merged {
+		out.Reason = fmt.Sprintf(
+			"the run cannot complete while stage %s is parked at %q, and this run's pull request is not observably merged, so no reconcile applies yet",
+			blocker.Type, blocker.State)
+		return out
+	}
+	out.Recovery = completionBlockedRecoveryReconcileMerge
+	out.Reason = fmt.Sprintf(
+		"the merge made stage %s (parked at %q) unreachable; POST /v0/runs/{run_id}/reconcile-merge supersedes it and completes the run",
+		blocker.Type, blocker.State)
+	return out
 }
 
 // securityFindingsForRun distills the run's unresolved high-severity

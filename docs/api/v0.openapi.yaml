@@ -1282,12 +1282,88 @@ components:
             byte-identical response.
           items:
             $ref: '#/components/schemas/RunStagePermissions'
+        completion_blocked:
+          $ref: '#/components/schemas/RunCompletionBlocked'
+          description: |
+            The stage stopping a `running` run from completing (E64.2 / #3083),
+            and whether anything can move it. `Orchestrator.completeRun` refuses
+            to stamp a run `succeeded` while any stage is non-terminal (#968);
+            before this field that refusal was invisible, so an operator
+            watching a merged PR on a run stuck at `running` had no way to learn
+            WHICH stage held it. Emitted by `GET /v0/runs/{run_id}` ONLY (the
+            list endpoint omits it — no per-row stage + audit reads) and omitted
+            for any run that is not `running` or whose stages are all terminal,
+            so an unblocked run keeps a byte-identical response.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    RunCompletionBlocked:
+      type: object
+      description: |
+        Why a `running` run cannot complete, and what (if anything) an operator
+        can do about it (E64.2 / #3083). Names the LOWEST-SEQUENCE non-terminal
+        stage — the run's own stage order, so the answer is stable and names the
+        stage an operator would reach for first.
+      required: [stage_id, stage_type, stage_state, reason, recovery]
+      properties:
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        stage_type:
+          type: string
+          description: The blocking stage's type.
+        stage_state:
+          type: string
+          description: The blocking stage's RAW backend state.
+        reason:
+          type: string
+          description: |
+            Why the run cannot complete, naming the stage and its state — the
+            half of the answer that does not depend on the audit chain.
+        recovery:
+          type: string
+          enum: [reconcile-merge, none]
+          description: |
+            DISCRIMINATES rather than always naming a verb. `reconcile-merge`
+            means POST `/v0/runs/{run_id}/reconcile-merge` will supersede this
+            stage and complete the run — emitted ONLY when the blocker's
+            `(stage_type, state)` is a row of the default-deny merge-supersede
+            pair table AND the run's PR is observably merged, i.e. exactly the
+            endpoint's own preconditions. `none` means no verb applies and
+            `reason` says what the stage needs instead. Pointing an operator at
+            a verb guaranteed to refuse is the defect #3083 reports against the
+            merge verb, so a client must branch on this field. A merge-evidence
+            read failure degrades this to `none` (fail closed — never advertise
+            a verb that cannot be confirmed to work).
+
+    SupersededStage:
+      type: object
+      description: |
+        One stage a merge terminalized as `superseded` (E64.2 / #3083). Returned
+        only for stages whose compare-and-swap SUCCEEDED, so a refused move
+        contributes nothing — the same "a missing row, never a false one"
+        property the audit ordering has.
+      required: [stage_id, stage_type, from_state, reason]
+      properties:
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        stage_type:
+          type: string
+          description: The superseded stage's type (`acceptance` or `review`).
+        from_state:
+          type: string
+          description: |
+            The state the stage was parked in when the merge made it
+            unreachable (`awaiting_host_dispatch` or `awaiting_approval`); for a
+            repaired row, `superseded` (the stage had already moved).
+        reason:
+          type: string
+          enum: [merge_observed, operator_reconcile, repair]
+          description: |
+            What ran the supersession: the merge-observation path swept it, an
+            operator invoked `reconcile-merge`, or a missing audit row was
+            repaired (transitioning nothing).
 
     RunEscalations:
       type: object
@@ -2862,7 +2938,7 @@ components:
             [pending, awaiting_host_dispatch, dispatched, running,
              awaiting_approval, awaiting_children, awaiting_input,
              awaiting_scope_decision, awaiting_deploy_approval,
-             awaiting_deployment, succeeded, failed, cancelled]
+             awaiting_deployment, succeeded, failed, cancelled, superseded]
           description: |
             `awaiting_host_dispatch` is the parked-for-host-spawn state
             (#1912): a runner_kind-locked-`local` agent stage the backend wants
@@ -2871,18 +2947,31 @@ components:
             `/v0/runs/{run_id}/stages/{stage_id}/host-dispatch`). Post-#1912
             `dispatched` unambiguously means a spawn attempt exists.
 
+            `superseded` (E64.2 / #3083) is TERMINAL and records that the
+            merge of the change the stage was gating made the stage
+            UNREACHABLE. It is distinct from `failed` (the work was attempted
+            and did not pass) and from `cancelled` (an operator halted the
+            run): the stage neither ran nor was halted. Only two
+            `(stage_type, state)` pairs may enter it — an `acceptance` stage
+            parked at `awaiting_host_dispatch` and a `review` stage at
+            `awaiting_approval` — enforced as a default-deny table at the
+            repository transition boundary, because `superseded` is terminal
+            and would otherwise let a run complete around work never done.
+            Written by the merge-supersede sweep and by POST
+            `/v0/runs/{run_id}/reconcile-merge`.
+
             TWO VOCABULARIES (#2494). This raw `state` is the authoritative
-            thirteen-value stage state (the `run.StageState` set, enumerated
+            fourteen-value stage state (the `run.StageState` set, enumerated
             above — the enum previously omitted the five park states
             `awaiting_children`, `awaiting_input`, `awaiting_scope_decision`,
             `awaiting_deploy_approval` and `awaiting_deployment`, which the API
             has always been able to return). The MCP surface reports a coarser
-            five-value BUCKET (`*_stage_wait_status.status`) answering "should
+            six-value BUCKET (`*_stage_wait_status.status`) answering "should
             I keep polling?"; neither is renamed, and the mapping is total:
-            `running` maps to `running`, `succeeded`, `failed` and `cancelled`
-            map to themselves, and every other state — including one added
-            later — buckets to `pending`, the conservative keep-polling
-            default. The mapping is written down once, in
+            `running` maps to `running`, `succeeded`, `failed`, `cancelled` and
+            `superseded` map to themselves, and every other state — including
+            one added later — buckets to `pending`, the conservative
+            keep-polling default. The mapping is written down once, in
             `backend/internal/mcpserver/stage_wait.go`.
         started_at:
           type: [string, "null"]
@@ -15767,6 +15856,123 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: Run/audit repositories not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/reconcile-merge:
+    post:
+      operationId: reconcileMerge
+      summary: Supersede the stages a merge left parked and complete the run (operator)
+      description: |
+        Settles a run whose pull request MERGED while a stage stayed parked in
+        a state nothing will ever re-dispatch (E64.2 / #3083) — a fix-up pass
+        re-parked `acceptance` at `awaiting_host_dispatch`, or the human
+        `review` gate was still `awaiting_approval` when the PR merged.
+        `Orchestrator.completeRun` then CORRECTLY refuses to stamp the run
+        `succeeded` around a non-terminal stage (#968), and every pre-existing
+        escape hatch records something untrue: reap writes `failed` for work
+        never attempted, cancel writes `cancelled` for a change that shipped.
+
+        This verb supersedes exactly the stages a DEFAULT-DENY
+        `(stage_type, state)` pair table admits — `acceptance` @
+        `awaiting_host_dispatch` and `review` @ `awaiting_approval`, no others
+        — appends one `stage_superseded_by_merge` audit entry per stage it
+        MOVED, and re-runs completion. A stage in any other non-terminal state
+        (`running`, `dispatched`, `awaiting_children`, the deploy park states,
+        `awaiting_scope_decision`) is left alone and the run stays `running`:
+        that is the #968 invariant, not a gap.
+
+        The order is TRANSITION FIRST, THEN AUDIT. The chain is append-only, so
+        a row written before a compare-and-swap that then refused would be an
+        immutable record of a supersession that never happened; the failure
+        mode is a MISSING row, never a false one.
+
+        IDEMPOTENT and self-repairing. A second POST moves nothing (`superseded`
+        is not a pair-table state) and returns 200 with two empty lists. A stage
+        that is already `superseded` but carries NO audit row — the residue of a
+        sweep whose transition committed and whose append then failed — is
+        REPAIRED with a row carrying `reason: repair`, transitioning nothing.
+        Exactly one row exists per swept stage no matter how often the verb is
+        called.
+
+        Read `completion_blocked` on GET `/v0/runs/{run_id}` first: it names the
+        blocking stage and reads `recovery: "reconcile-merge"` only when this
+        endpoint can actually move it.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            What the reconcile did. `superseded` lists the stages THIS
+            invocation moved; `repaired` lists already-superseded stages whose
+            missing audit row was restored. Both are empty on an idempotent
+            repeat. `run_state` is the run's state after the completion
+            re-evaluation, so a caller sees whether the run actually settled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, superseded, repaired, run_state]
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  superseded:
+                    type: array
+                    items: { $ref: '#/components/schemas/SupersededStage' }
+                  repaired:
+                    type: array
+                    items: { $ref: '#/components/schemas/SupersededStage' }
+                  run_state:
+                    type: string
+                    description: The run's state after completion was re-evaluated.
+        '400':
+          description: '`validation_failed` — malformed run_id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: No authenticated token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Caller is not permitted to write to this run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — unknown run id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `reconcile_merge_pr_not_merged` — the run's pull request is not
+            OBSERVABLY merged (no `pr_merged` / `post_merge_observed` entry on
+            its audit chain). Without this precondition the verb could
+            manufacture a `succeeded` run for a change that never shipped.
+
+            `reconcile_merge_not_applicable` — the run holds no
+            pair-table-admissible parked stage and no already-superseded stage
+            to repair, so there is nothing for this verb to do. A stage in any
+            other non-terminal state must run, settle or be cancelled.
+
+            Every 409 is evaluated BEFORE any write: no stage moves and no
+            audit row is appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — a run/stage/audit read failed. The merge-evidence
+            read in particular fails CLOSED as a 500 rather than proceeding: a
+            verb that can complete a run must never run on unknown evidence.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`reconcile_merge_unconfigured` — run/audit repositories not wired.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
