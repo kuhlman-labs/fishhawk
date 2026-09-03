@@ -34,6 +34,16 @@ TLS_PID_FILE="${REPO_ROOT}/.fishhawk/tls-proxy.pid"
 TLS_DIR="${REPO_ROOT}/.fishhawk/cache/tls"
 TLS_LOG_FILE="${LOG_DIR}/tls-proxy.log"
 
+# Opt-in local webhook relay (E64.49 / #3169): a smee.io client that forwards
+# GitHub App deliveries from a stable per-developer channel to POST
+# /webhooks/github on the local fishhawkd. Off by default; enabled by
+# FISHHAWK_DEV_WEBHOOK_RELAY=1 in .env. Like TLS_PID_FILE, the pid file is
+# covered by the .gitignore `.fishhawk/*.pid` glob and is NOT space-prefixed, so
+# _clean_stray_pid_files leaves it alone; the log lands under the gitignored
+# logs/. See docs/local-webhook-relay.md.
+RELAY_PID_FILE="${REPO_ROOT}/.fishhawk/webhook-relay.pid"
+RELAY_LOG_FILE="${LOG_DIR}/webhook-relay.log"
+
 cmd="${1:-}"
 
 _die() { print -u2 "error: $*"; exit 1 }
@@ -1600,6 +1610,197 @@ _tls_down() {
   return 0
 }
 
+# --- Opt-in local webhook relay (E64.49 / #3169) ---------------------------
+# A smee.io relay: a smee client that receives GitHub App deliveries from a
+# stable per-developer channel and POSTs them verbatim to POST /webhooks/github
+# on the local fishhawkd, so the webhook-driven behaviours in handleWebhook work
+# on the local stack instead of accreting one poller each. Every helper below is
+# pure or single-purpose so scripts/test-dev drives it with a stub client (no
+# real network, no real smee client). _relay_up is the one impure orchestration
+# leg; _relay_down the teardown.
+#
+# DEPARTURE FROM THE TLS PRECEDENT (issue #3169 instruction): a relay
+# precondition failure DEGRADES with a printed, actionable reason and leaves
+# `scripts/dev up` succeeding — it never aborts. Unlike _tls_up, whose
+# through-the-proxy readiness `up` gates its own success on, a missing relay
+# invalidates nothing `up` claims to have started.
+
+# Enabled ONLY when FISHHAWK_DEV_WEBHOOK_RELAY is exactly "1" (mirror
+# _tls_enabled's exact-match form, not a truthiness test — default off).
+_relay_enabled() {
+  [[ "${FISHHAWK_DEV_WEBHOOK_RELAY:-}" == "1" ]]
+}
+
+# The smee channel URL (empty when unset). Strictly per-developer .env config;
+# there is no committed default (settled decision 1 — docs/local-webhook-relay.md).
+_relay_channel() {
+  print -r -- "${FISHHAWK_DEV_WEBHOOK_CHANNEL:-}"
+}
+
+# Typo guard, NOT a reachability check (documented as such in
+# docs/local-webhook-relay.md): 0 only for a syntactically plausible
+# https://smee.io/<token> URL — non-empty, https scheme, a non-empty path
+# segment after the host — and non-zero otherwise.
+_relay_channel_valid() {
+  local url="$1"
+  [[ -n "$url" ]] || return 1
+  [[ "$url" == https://* ]] || return 1
+  local rest="${url#https://}"       # host[/path]
+  local path="${rest#*/}"            # everything after the first '/'
+  # No slash at all (path == rest), or an empty path segment → reject.
+  [[ "$path" != "$rest" && -n "$path" ]] || return 1
+  return 0
+}
+
+# The local fishhawkd webhook endpoint the relay POSTs to. Composes the SAME
+# port accessor (_healthz_port) the TLS front end and readiness gate use, so the
+# relay target cannot drift from the port `up` actually bound.
+_relay_target_url() {
+  print -r -- "http://127.0.0.1:$(_healthz_port)/webhooks/github"
+}
+
+# Client detection (mirrors _tls_resolve_proxy_bin, but the CALLER emits the
+# reason, not this helper). Order: FISHHAWK_DEV_SMEE_BIN (an explicit path, also
+# the seam the tests inject a stub through) wins, then a `smee-client` on PATH,
+# then a `smee` on PATH. On success prints the resolved path and returns 0; on
+# failure prints NOTHING to stdout and returns non-zero, leaving _relay_up to
+# emit the resolve-stage reason.
+_relay_resolve_bin() {
+  if [[ -n "${FISHHAWK_DEV_SMEE_BIN:-}" ]]; then
+    print -r -- "$FISHHAWK_DEV_SMEE_BIN"
+    return 0
+  fi
+  local found
+  if found="$(command -v smee-client 2>/dev/null)"; then
+    print -r -- "$found"
+    return 0
+  fi
+  if found="$(command -v smee 2>/dev/null)"; then
+    print -r -- "$found"
+    return 0
+  fi
+  return 1
+}
+
+# Orchestrate the relay. Degrade-not-abort: every failure path prints ONE
+# actionable line to stderr, removes any pid file it created, and returns
+# non-zero WITHOUT aborting (the caller wraps it in `if !`). On success writes
+# the pid to RELAY_PID_FILE and prints one line naming pid/channel/target.
+_relay_up() {
+  # RE-ENTRANCY GUARD (approval condition 1): a second `up` with a relay already
+  # running would spawn a second client and overwrite the sole pid file,
+  # stranding the first with nothing for cmd_down to reap. The TLS precedent's
+  # PORT PREFLIGHT does not transfer — the relay is an OUTBOUND long-poll client
+  # with no listening port — so guard on the pid-file artifact cmd_down acts on.
+  # A stale pid file (absent process) falls through to a normal spawn, exactly as
+  # _relay_down already treats it.
+  if [[ -f "$RELAY_PID_FILE" ]]; then
+    local existing
+    existing="$(cat "$RELAY_PID_FILE" 2>/dev/null)"
+    if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
+      print "webhook relay already running (pid ${existing})"
+      return 0
+    fi
+  fi
+
+  # ---------------------------------------------------------------------------
+  # C3 INVARIANT (approval condition 4, load-bearing for scripts/test-dev's
+  # counterfactual C3): among the reason strings below, the resolve-stage reason
+  # (c) and the spawn-then-die reason (d) MUST stay textually distinct, and ONLY
+  # reason (c) may contain the substring 'npm install -g smee-client'. C3
+  # discriminates a resolve-stage failure from a spawn-then-die failure PURELY on
+  # that substring; a future edit adding an install hint to reason (a)/(b)/(d)
+  # would silently weaken the counterfactual without reddening anything. Nothing
+  # enforces this textual invariant — keep it true by hand.
+  # ---------------------------------------------------------------------------
+
+  # (a) Channel unset.
+  local channel
+  channel="$(_relay_channel)"
+  if [[ -z "$channel" ]]; then
+    print -u2 "webhook relay not started: FISHHAWK_DEV_WEBHOOK_CHANNEL is unset — create a channel at https://smee.io/new and set it in .env (see docs/local-webhook-relay.md)"
+    return 1
+  fi
+
+  # (b) Channel present but malformed.
+  if ! _relay_channel_valid "$channel"; then
+    print -u2 "webhook relay not started: FISHHAWK_DEV_WEBHOOK_CHANNEL='${channel}' is malformed — expected an https://smee.io/<token> URL (see docs/local-webhook-relay.md)"
+    return 1
+  fi
+
+  # (c) Client binary unresolvable. RESOLVE-STAGE reason — the ONLY reason that
+  # may carry 'npm install -g smee-client' (see the C3 invariant note above).
+  local bin
+  if ! bin="$(_relay_resolve_bin)"; then
+    print -u2 "webhook relay not started: no smee client found — run 'npm install -g smee-client', or set FISHHAWK_DEV_SMEE_BIN to its path (see docs/local-webhook-relay.md)"
+    return 1
+  fi
+
+  # (d) Spawn, then a bounded liveness poll to catch a client that dies
+  # IMMEDIATELY (a rejected channel or an unsupported flag). Short flags -u/-t
+  # per docs/github-app/README.md:113. This reason MUST NOT contain
+  # 'npm install -g smee-client' (C3 invariant above).
+  local target
+  target="$(_relay_target_url)"
+  mkdir -p "$LOG_DIR"
+  "$bin" -u "$channel" -t "$target" >> "$RELAY_LOG_FILE" 2>&1 &
+  local relay_pid=$!
+  disown
+  print "$relay_pid" > "$RELAY_PID_FILE"
+
+  # Poll for DEATH within a bounded window: if the client exits during it, it
+  # died immediately → fail; if it survives the whole window, it is up.
+  # (( ++i )) pre-increment per the #631 trap (post-increment returns 1 at i==0
+  # → set -e abort); every command stays in a tested context so ZERR cannot fire.
+  local i=0
+  while (( i < 5 )); do
+    if ! kill -0 "$relay_pid" 2>/dev/null; then
+      print -u2 "webhook relay client died immediately (pid ${relay_pid}) — read ${RELAY_LOG_FILE} for the client error (a rejected channel or an unsupported flag)"
+      rm -f "$RELAY_PID_FILE"
+      return 1
+    fi
+    sleep 0.2
+    (( ++i ))
+  done
+
+  print "webhook relay up (pid ${relay_pid}) — ${channel} → ${target}"
+  return 0
+}
+
+# Tear down the relay. Modelled on _tls_down: idempotent on an absent pid file
+# (a double teardown and a never-started teardown are both harmless no-ops
+# returning 0). cmd_down calls this UNCONDITIONALLY (guarded on the pid file,
+# never on FISHHAWK_DEV_WEBHOOK_RELAY), so an operator who disables the flag
+# between `up` and `down`/`reload` does not orphan the client.
+_relay_down() {
+  local pid_file="$1"
+  if [[ ! -f "$pid_file" ]]; then
+    print "webhook relay is not running (no pid file)"
+    return 0
+  fi
+  local pid
+  pid="$(cat "$pid_file")"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    print "webhook relay already stopped"
+    rm -f "$pid_file"
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  local i=0
+  while kill -0 "$pid" 2>/dev/null && (( i < 5 )); do
+    sleep 1
+    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    print "webhook relay killed (SIGKILL after 5s)"
+  else
+    print "webhook relay stopped"
+  fi
+  rm -f "$pid_file"
+  return 0
+}
+
 cmd_up() {
   print "up: starting"
   _warn_stale_worktrees || true
@@ -1877,6 +2078,18 @@ cmd_up() {
     fi
   fi
 
+  # Opt-in webhook relay (E64.49 / #3169). Placed AFTER the fishhawkd readiness
+  # gate so the relay only starts once there is something at the target URL to
+  # POST to, and BEFORE the MCP banner so its output does not split the banner.
+  # DELIBERATELY UNLIKE the TLS proxy: the `if !` wrapper makes a relay failure
+  # NON-fatal under `set -e` — `up` does NOT gate its own success on the relay,
+  # because a missing relay invalidates nothing `up` claims to have started.
+  if _relay_enabled; then
+    if ! _relay_up; then
+      print -u2 "webhook relay not started (see reason above); continuing — scripts/dev up is unaffected"
+    fi
+  fi
+
   # Last line(s): tell the operator what MCP-activation step (if any) this run
   # requires. The kind selects among the schema-major banner (#1422), its
   # registered-shim sibling that asks you to VERIFY rather than reconnect
@@ -1901,6 +2114,12 @@ cmd_down() {
   # on FISHHAWK_DEV_TLS) — an operator who disabled the flag between `up` and
   # `down`/`reload` must not orphan the proxy. Idempotent on an absent pid file.
   _tls_down "$TLS_PID_FILE"
+
+  # Tear down the webhook relay UNCONDITIONALLY (guarded on the pid file inside
+  # _relay_down, NEVER on FISHHAWK_DEV_WEBHOOK_RELAY) — an operator who disabled
+  # the flag between `up` and `down`/`reload` must not orphan the client.
+  # Idempotent on an absent pid file (a no-op when no relay ran).
+  _relay_down "$RELAY_PID_FILE"
 
   # The missing-pid-file and already-stopped paths no longer return success
   # immediately — every path falls through to the port fallback below, so
