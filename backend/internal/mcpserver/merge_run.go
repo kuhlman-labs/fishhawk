@@ -50,8 +50,15 @@ type MergeRunInput struct {
 //     Resumable: re-invoke once the checks complete — but if a required check
 //     has already FAILED the merge will never queue, so inspect the PR instead
 //     of waiting. See the per-field notes below for what the flags mean here.
+//   - "conflicting"   — the pull request has a merge conflict against its base
+//     (E64.14 / #3109), so GitHub can NEVER queue the merge. UNLIKE
+//     checks_pending this is NOT resumable by waiting: an immediate return, no
+//     verdict row recorded (merge_queued / verdict_recorded / already_recorded
+//     all false). The Message names the resolution path — resolve the conflict,
+//     vouch the resulting commit so the audit-complete check re-posts, re-approve,
+//     and re-merge.
 type MergeRunOutput struct {
-	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending"`
+	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting"`
 	// RunState is the run's lifecycle state at resolution (succeeded on a
 	// settled merge; failed/cancelled on the run_terminal backstop).
 	RunState string `json:"run_state,omitempty" jsonschema:"the run's lifecycle state at resolution"`
@@ -140,6 +147,13 @@ Statuses:
                      PR instead of waiting. This is a STATUS, not a tool error: an
                      immediate re-POST cannot succeed, so the tool waits within its
                      timeout budget rather than surfacing a remedy that would fail.
+  - "conflicting"   — the pull request has a merge conflict against its base, so
+                     GitHub can NEVER queue the merge. UNLIKE checks_pending this
+                     is NOT resumable by waiting — the tool returns it IMMEDIATELY
+                     (no poll, no re-POST) and records no verdict row. Resolve the
+                     conflict on the run branch, vouch the resulting commit with
+                     fishhawk_vouch_commit (so the fishhawk_audit_complete check
+                     re-posts on the new head), re-approve, and re-invoke.
 
 Inputs:
   - run_id          (required) — the gate-approved run's UUID; it must carry
@@ -164,6 +178,11 @@ The backend's 409 merge_checks_pending is NOT surfaced as a tool error: it is
 the checks-not-all-passed precondition the tool WAITS on (re-POSTing on the poll
 tick within the shared timeout budget), returning status=checks_pending on
 budget exhaustion rather than an error whose remedy is guaranteed to fail.
+
+The backend's 409 merge_conflicting is likewise NOT a tool error: it is the
+merge-conflict precondition the tool returns IMMEDIATELY as status=conflicting
+(no poll, no re-POST — waiting cannot resolve a conflict), naming the
+resolve-then-vouch-then-re-merge path.
 `),
 	}, resolver.mergeRun)
 }
@@ -178,6 +197,46 @@ func isChecksPending(err error) (*apiError, bool) {
 		return ae, true
 	}
 	return nil, false
+}
+
+// isConflicting reports whether err is the backend's 409 merge_conflicting
+// classification (E64.14 / #3109) — the PR has a merge conflict against its
+// base, so GitHub can NEVER queue the merge. Unlike checks_pending (which is
+// resumable by waiting), this is an IMMEDIATE return: re-invoking without
+// resolving the conflict cannot succeed, so the tool does not poll or re-POST.
+// Returns the *apiError so the caller can read details.pr_url / mergeable_state.
+func isConflicting(err error) (*apiError, bool) {
+	var ae *apiError
+	if errors.As(err, &ae) && ae.Code == "merge_conflicting" {
+		return ae, true
+	}
+	return nil, false
+}
+
+// conflictingOutput builds the IMMEDIATE checkpoint returned when the backend
+// refuses a conflicting PR (E64.14 / #3109). MergeQueued / VerdictRecorded /
+// AlreadyRecorded are ALL false — nothing was queued and no verdict row was
+// appended (the backend refuses before the append). The Message names the
+// resolution path: resolve the conflict, vouch the resulting commit so the
+// audit-complete check re-posts, re-approve, and re-merge. This is NOT
+// resumable by waiting, so the tool returns it at once rather than polling.
+func conflictingOutput(ae *apiError, start time.Time) MergeRunOutput {
+	prURL, _ := ae.Details["pr_url"].(string)
+	mergeableState, _ := ae.Details["mergeable_state"].(string)
+	msg := "the pull request has a merge conflict against its base, so GitHub can never queue the squash merge. Waiting cannot resolve it. Resolve the conflict on the run branch, then vouch the resulting commit with fishhawk_vouch_commit (so the fishhawk_audit_complete check re-posts on the new head), re-approve the pull request, and re-invoke fishhawk_merge_run."
+	if mergeableState != "" {
+		msg += " (GitHub reports mergeable_state=" + mergeableState + ".)"
+	}
+	return MergeRunOutput{
+		Status:          "conflicting",
+		MergeQueued:     false,
+		VerdictRecorded: false,
+		AlreadyRecorded: false,
+		PRURL:           prURL,
+		WaitedSeconds:   time.Since(start).Seconds(),
+		Note:            mergeRunNote,
+		Message:         msg,
+	}
 }
 
 // mergeVerdictSequenceFrom best-effort reads details.verdict_sequence (the audit
@@ -311,6 +370,13 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 		res, merr = r.api.MergeRun(deadlineCtx, runID, verdict)
 		if merr == nil {
 			break
+		}
+		// A conflicting PR (E64.14 / #3109) can NEVER queue, so return the
+		// immediate checkpoint — no poll, no re-POST. Checked before the
+		// checks-pending arm because it is not a wait-and-resolve precondition:
+		// waiting cannot clear a merge conflict.
+		if cae, conflicting := isConflicting(merr); conflicting {
+			return nil, conflictingOutput(cae, start), nil
 		}
 		ae, pending := isChecksPending(merr)
 		if !pending {

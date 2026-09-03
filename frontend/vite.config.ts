@@ -2,18 +2,24 @@ import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'node:path';
+import { resolveFsDeny } from './vite-fs-deny.ts';
 
 // Backend talks on :8080 by default (see backend/cmd/fishhawkd serve).
 // Proxying /v0 here means the dev server can carry the session cookie
 // without CORS gymnastics — same-origin from the browser's perspective.
-export default defineConfig({
+export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      '@': path.resolve(import.meta.dirname, './src'),
     },
   },
   server: {
+    // Drop Vite's `**/.git/**` deny default ONLY when this checkout lives
+    // under a `.git/` path segment (a Fishhawk run worktree), so the frontend
+    // toolchain runs from there. `undefined` in a normal checkout keeps Vite's
+    // stock posture. See ./vite-fs-deny.ts and #3030.
+    fs: { deny: await resolveFsDeny(import.meta.dirname) },
     port: 5173,
     proxy: {
       '/v0': {
@@ -34,4 +40,4 @@ export default defineConfig({
     setupFiles: ['./src/test-setup.ts'],
     css: true,
   },
-});
+}));

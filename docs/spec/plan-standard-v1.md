@@ -194,6 +194,8 @@ When **every** criterion in `acceptance_criteria` carries `skip_expected: true` 
 
 **Plan-gate advisory `all_criteria_skip_expected` (#3026).** Because that whole-plan shape is decided at authoring time, the deterministic acceptance rule set flags it at the plan gate, where it can still be fixed: a plan declaring at least one criterion whose criteria are ALL `skip_expected`-with-basis draws one PLAN-LEVEL `all_criteria_skip_expected` finding (empty `criterion_id`) on the plan-review gate evidence, plus an `all_skip_short_circuit: true` headline on the `plan_acceptance_precheck` audit payload. The rule reuses the same predicate the orchestrator short-circuits on, so the gate advisory and the runtime behaviour agree by construction — including the whitespace-only-`expectation_basis` edge, where neither treats the plan as all-skip. Like `undecidable_criterion` (#2512) and `missing_live_validation_marker` (#2845) it is **ADVISORY and never refuses a plan**: a change may genuinely have no in-sandbox observable. It applies no cross-rule suppression — an all-skip plan naming a live target still draws its `missing_live_validation_marker` findings.
 
+**`missing_live_validation_marker` is POLARITY-AWARE (#3016).** The rule flags a criterion whose statement names a LIVE forge/deploy/external target and which is not marked `requires_live_validation`. It does NOT flag a criterion asserting the **ABSENCE** of such a dependency whose stated verification runs in-repository: suppression requires BOTH that every liveness-bearing token in the statement carries a negation within four tokens before it, AND that `verify_hint`/`expectation_basis` (never the statement) names an in-repository harness — a `_test.go` file, `go test`, `pgtest`/`httptest`, a fake or stub. An in-repository basis ALONE never suppresses, so a genuinely live-dependent criterion citing a unit test still draws the finding (#2845). The finding's remedy text is correspondingly **conditional**: it prescribes the `requires_live_validation` + `skip_expected` + `expectation_basis` triple for a genuinely live-dependent criterion, and explicitly warns an author NOT to add that triple to an in-sandbox absence assertion — marking one skips a criterion the sandbox can actually verify, which is how a plan drifts into the all-skip shape above.
+
 `acceptance_criteria` is annotated `x-intended-required: true` in the schema: it is additive-optional today, but a future `standard` version promotes it to required after an E31 soak period (see `AGENTS.md` → Schema change checklist). Downstream consumers are later E31 waves — **E31.5** (`plan_acceptance_precheck`) and **E31.7** (the runner acceptance agent) — which is why the field is optional now and no consumer depends on it yet.
 
 #### `verification.out_of_scope`
@@ -218,7 +220,17 @@ Two required fields capture the agent's estimate of how long the implement stage
 
 #### `predicted_runtime_minutes`
 
-Integer ≥ 1. The agent's estimate in minutes. Used to surface scope problems early: if the estimate exceeds the implement-stage budget (per ADR-025), the agent must also populate `decomposition.sub_plans`.
+Integer ≥ 1. The agent's estimate in minutes, CALIBRATED — when the plan-stage prompt renders a calibration hint, this is the number after the fleet factor has been applied. Used to surface scope problems early: if the estimate exceeds the implement-stage budget (per ADR-025), the agent must also populate `decomposition.sub_plans`. It is also the term the dynamic implement kill cap and the `runtime_observed` calibration series build on, so its meaning is deliberately unchanged by #2862.
+
+#### `raw_predicted_runtime_minutes`
+
+Integer ≥ 1. **Optional** (additive within `standard_v1`, #2862). The agent's PRE-calibration estimate — the number it arrived at *before* multiplying by the fleet calibration factor the hint supplied.
+
+It exists because folding the factor into `predicted_runtime_minutes` destroys the raw estimate at the source: a raw 90 times a 0.56 fleet ratio lands at ~50, the implement-budget gate sees `50 <= 60`, and a required decomposition dissolves with nothing in the artifact recording it was ever triggered.
+
+The implement-budget gate therefore evaluates **`max(predicted_runtime_minutes, raw_predicted_runtime_minutes)`**. Calibration applies only in the structure-ADDING direction: a factor below 1.0 can never pull a plan under the budget, while a factor above 1.0 can still push one over. `raw_predicted_runtime_minutes` equal to `predicted_runtime_minutes` is legitimate (factor 1.0, or no hint rendered) and the schema enforces no relation between the two.
+
+Populate it whenever the prompt rendered a calibration hint. Omitting it is legal and leaves the gate reading `predicted_runtime_minutes` exactly as before, but a hint-bearing plan that omits it draws a plan-gate advisory, because the gate then cannot verify that calibration did not clear the budget.
 
 #### `predicted_runtime_confidence`
 
@@ -230,7 +242,7 @@ One of `"low"`, `"medium"`, or `"high"`.
 | `medium` | Reasonably grounded; agent has read the relevant code |
 | `high` | Well-understood scope; agent has high certainty |
 
-These fields are MUST-populate: every `standard_v1` artifact must carry an estimate. The plan-stage prompt instructs the agent accordingly (ADR-025 D1 framing).
+`predicted_runtime_minutes` and `predicted_runtime_confidence` are MUST-populate: every `standard_v1` artifact must carry an estimate and a confidence level. `raw_predicted_runtime_minutes` is optional and reported alongside them whenever a calibration hint was rendered. The plan-stage prompt instructs the agent accordingly (ADR-025 D1 framing).
 
 ## Optional fields
 
@@ -247,7 +259,7 @@ Free-form strings. The plan-review UI surfaces these in a sidebar. Useful for th
 
 ### Decomposition
 
-Populated when `predicted_runtime_minutes` exceeds the implement-stage budget. Signals that the agent believes the work should be split across multiple runs.
+Populated when the agent's runtime estimate exceeds the implement-stage budget — measured against the LARGER of `predicted_runtime_minutes` and `raw_predicted_runtime_minutes`, which is the number the budget gate reads (#2862). Signals that the agent believes the work should be split across multiple runs.
 
 ```json
 {

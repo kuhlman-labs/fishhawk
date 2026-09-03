@@ -287,13 +287,15 @@ func TestDispatchStage_ArgvParity_ImplementStage(t *testing.T) {
 
 // postDispatchStagesCall is the ordinal (1-based, per run id) of the
 // post-dispatch classify read of GET /v0/runs/{id}/stages: (1) resolveStageID,
-// (2) the sibling-in-flight guard (#1872), (3) the post-dispatch classify. It is
-// BOTH the value both ordinal-injection tests assign to fb.stagesFailOnCall and
-// the expected total stages-read count they assert afterwards, so a future extra
-// or shifted stages read fails with a NAMED count mismatch instead of silently
-// re-targeting the injected 500 onto a different call. Shared by the dispatch and
-// acceptance-short-circuit users of the knob (both take the same three reads).
-const postDispatchStagesCall = 3
+// (2) the sibling-in-flight guard (#1872), (3) the runner self-host bootstrap
+// advisory's plan resolution (guardRunnerSelfHost -> tryGetPlanForRun, E64.5 /
+// #3086), (4) the post-dispatch classify. It is BOTH the value both
+// ordinal-injection tests assign to fb.stagesFailOnCall and the expected total
+// stages-read count they assert afterwards, so a future extra or shifted stages
+// read fails with a NAMED count mismatch instead of silently re-targeting the
+// injected 500 onto a different call. Shared by the dispatch and
+// acceptance-short-circuit users of the knob (both take the same four reads).
+const postDispatchStagesCall = 4
 
 // withStubbedDispatchSpawn replaces the injectable detached-spawn seam
 // (dispatchSpawnDetached) with a stub returning a fixed fake log path and a nil
@@ -2229,5 +2231,50 @@ func assertPushAndOpenPRDescription(t *testing.T, tool string, schema *jsonschem
 	}
 	if strings.Contains(base.Description, "no effect when push_and_open_pr is false") {
 		t.Errorf("%s base_branch description still claims no effect under push_and_open_pr=false, which is wrong (--base-branch and --check-base-ref are passed unconditionally):\n%s", tool, base.Description)
+	}
+}
+
+// --- runner self-host bootstrap advisory (E64.5 / #3086), verb boundary ---
+
+// TestDispatchStage_RunnerScope_SurfacesBootstrapWarning drives the real
+// dispatchStage handler end to end (fake backend -> guard -> DispatchStageOutput)
+// with the detached spawn stubbed, asserting BOTH that the advisory string
+// reaches DispatchStageOutput.Warnings AND that the dispatch still succeeds (a
+// resolved stage_id returned, the spawn seam invoked) — so the advisory is
+// proven non-blocking at the verb boundary. scope.files spans the guard, this
+// verb, and the operator-visible tool output, so the per-layer guard unit is not
+// sufficient.
+func TestDispatchStage_RunnerScope_SurfacesBootstrapWarning(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withStubbedDispatchSpawn(t)
+
+	runID := uuid.New()
+	planScopeForRun(fb, runID, "runner/internal/agent/claudecode/claudecode.go")
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID:      runID.String(),
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("the self-host advisory must NOT block a dispatch: %v", err)
+	}
+	if out.StageID == "" {
+		t.Error("dispatch must still succeed with a resolved stage_id")
+	}
+	if out.LogPath != "/dev/null" {
+		t.Errorf("the spawn seam must have been invoked (LogPath=%q, want /dev/null)", out.LogPath)
+	}
+	found := false
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "runner/README.md") && strings.Contains(w, "fix-up budget") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("advisory not surfaced in DispatchStageOutput.Warnings: %v", out.Warnings)
 	}
 }

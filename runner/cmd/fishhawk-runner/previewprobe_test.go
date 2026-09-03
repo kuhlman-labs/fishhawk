@@ -311,25 +311,54 @@ func TestAcceptanceTargetGate_NoHostsSkips(t *testing.T) {
 	}
 }
 
-// Empty expected SHA → warn acceptance_target_unverified, proceed, and do
-// NOT provision (there is no candidate identity to build).
-func TestAcceptanceTargetGate_EmptyExpectedSHA_WarnsProceedsNoProvision(t *testing.T) {
+// (o) A DECLARED target with an empty expected SHA → fail CLOSED category-C
+// acceptance_expected_head_unresolved, provisioning NOTHING (#3091). This
+// replaces the pre-#3091 warn-and-proceed: with no expectation the gate could
+// not fail for the reason it named, so the stage validated whatever build
+// answered at the shared slot and the verdict bound to no tree. The provision
+// hook is asserted NOT to have run — a provision command cannot provision an
+// unknown head, and running it would leak a preview instance behind a refusal.
+func TestAcceptanceTargetGate_EmptyExpectation_FailsClosed(t *testing.T) {
 	marker := markerPath(t)
 	gcfg := fastGateConfig()
 	gcfg.provisionCmd = "echo ran > " + marker
 	var log strings.Builder
-	teardown, reason, _ := acceptanceTargetGate(context.Background(), gcfg, []string{"localhost:1"}, "", "run-1", &log)
-	if reason != "" {
-		t.Fatalf("empty expectation must proceed, got %q", reason)
+	teardown, reason, detail := acceptanceTargetGate(context.Background(), gcfg, []string{"localhost:1"}, "", "run-1", &log)
+	if reason != acceptanceReasonHeadUnresolved {
+		t.Fatalf("reason = %q (%s), want %q", reason, detail, acceptanceReasonHeadUnresolved)
+	}
+	if !strings.Contains(detail, "localhost:1") {
+		t.Errorf("detail %q must name the declared host", detail)
 	}
 	if teardown != nil {
 		t.Error("no provision happened; no teardown must be returned")
 	}
-	if !strings.Contains(log.String(), `"event":"acceptance_target_unverified"`) {
-		t.Errorf("missing acceptance_target_unverified warn: %s", log.String())
-	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Error("provision command must not run without an expected SHA")
+	}
+}
+
+// (p) NO declared hosts + an empty expected SHA → still unaffected: the gate
+// skips before the #3091 refusal can fire. A stage with no declared target has
+// nothing to bind an identity to, so tightening the missing-expectation branch
+// must not start failing it.
+func TestAcceptanceTargetGate_NoHosts_EmptyExpectation_Unaffected(t *testing.T) {
+	marker := markerPath(t)
+	gcfg := fastGateConfig()
+	gcfg.provisionCmd = "echo ran > " + marker
+	var log strings.Builder
+	teardown, reason, detail := acceptanceTargetGate(context.Background(), gcfg, nil, "", "run-1", &log)
+	if reason != "" {
+		t.Fatalf("no declared hosts must skip the gate, got reason %q (%s)", reason, detail)
+	}
+	if teardown != nil {
+		t.Error("skip must return no teardown")
+	}
+	if log.Len() != 0 {
+		t.Errorf("skip must be silent, got %q", log.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Error("skipped gate must not provision")
 	}
 }
 

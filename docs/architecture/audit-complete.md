@@ -2,16 +2,42 @@
 
 Per-area appendix for the `Audit-complete derivation (#229, #282)` row in [ARCHITECTURE.md](../ARCHITECTURE.md). Hand-extracted from that row for readability; content is verbatim, not a rewrite.
 
-Implementation: `backend/internal/auditcomplete` derives the `fishhawk_audit_complete` blocking-check state on demand — no row in `stage_checks`, no hook on writes. `Compute(ctx, runID, deps) (state, missing, err)` walks six rules.
+Implementation: `backend/internal/auditcomplete` derives the `fishhawk_audit_complete` blocking-check state on demand — no row in `stage_checks`, no hook on writes. `ComputeResult(ctx, runID, deps) (Result, err)` walks six rules and returns `{state, missing[], resolved[]}`. `Compute(ctx, runID, deps) (state, missing, err)` is a signature-identical thin wrapper that drops `resolved` — kept so every pre-#3092 call site is unchanged.
 
 ## The six rules
 
 1. Every plan stage produced a `kind=plan, schema_version=standard_v1` artifact.
-2. Every non-review stage that executed has `trace_uploaded` audit entries for both raw and redacted variants (E2.4 #220).
+2. Every non-review stage that executed has `trace_uploaded` audit entries for both raw and redacted variants (E2.4 #220). **Rule 2b (#3092): on a DECOMPOSED run the parent implement stage's gap is RESOLVED through the fan-out** — see below.
 3. Every implement stage produced a `kind=pull_request` artifact.
 4. The run's audit chain re-hashes consistently via `audit.ComputeEntryHash` over each entry's `HashInputs`.
 5. **The PR's live HEAD on GitHub is one of the Fishhawk-recorded head_shas across the run + its `parent_run_id` chain** (#282 — closes the "foreign commit lands on PR" audit-integrity gap).
 6. **A configured agent implement-review (ADR-027 `reviewers.agent` > 0) reached a terminal verdict** (#947 — the pre-merge **presence** gate). Drives `review_pending` while a dispatched review has not landed.
+
+## Rule 2b (decomposition trace resolution, #3092) details
+
+A decomposed run's **parent implement stage is the fan-out stage**: it parks `awaiting_children`, spawns no agent, and by construction can never ship a trace bundle. Rule 2 was therefore unsatisfiable for EVERY decomposed run — the required check could never go green and the run could never merge.
+
+The fix RESOLVES the evidence through the fan-out rather than exempting the stage. When the parent implement stage has a trace gap AND the run has decomposition children (`run.ListRunsFilter.DecomposedFrom`), Compute reads each child run's own implement-stage `trace_uploaded` entries and satisfies the parent's requirement only when every executed child is trace-complete. **Resolution is never an exemption**: a child genuinely missing a trace still FAILS, naming the child run id and the child stage id.
+
+Only the IMPLEMENT stage is eligible. The misses are partitioned by owning stage id through a parallel slice returned by `missingTraces` (never by string-matching `Detail`, and never by a new field on the JSON-serialized `MissingItem`), so a plan- or acceptance-stage trace gap passes through verbatim in every branch — children carry no evidence for it.
+
+Five branches are fail-closed by construction, each pinned by its own test:
+
+| Child set | Outcome |
+|---|---|
+| A child's implement stage is NON-terminal (`pending`, `running`, `awaiting_*`) | The parent's opaque `trace_missing` items are REPLACED by a single pending-flavored `children_pending` item. State `pending` — not-yet, never a pass and never a hard fail. |
+| A child's OWN audit chain does not verify | The child contributes NOTHING regardless of how complete its trace evidence looks, and the parent's items are REPLACED by a `chain_invalid` (hash mismatch) / `chain_unrecoverable` (read or recomputation failure) item naming that child. State `fail` — neither kind is pending-flavored. |
+| Children exist but NONE contributed evidence (every child cancelled, or carrying no implement stage) | NO `Resolution` at all. A `Resolution` is a POSITIVE claim that named child runs supplied the traces, so it is constructed only from a non-empty contributor set; the parent's own `trace_missing` items stand. |
+| The child query hit its page ceiling without a short page proving exhaustion | OVERFLOW: no resolution, the parent's items stand. A truncated read can never become a pass. |
+| The run has NO children (a flat run), or is non-decomposed | Unchanged — byte-identical to the pre-#3092 output. No silent exemption. |
+
+Child enumeration is **complete, not a bounded prefix**: `ListRuns(DecomposedFrom)` is paginated to exhaustion (`childPageSize` = 100) because `plan-standard-v1.schema.json` declares no `maxItems` on `decomposition.sub_plans`, so there is no schema cap to lean on and a fixed `Limit` would let the resolution inspect a prefix and pass while an omitted child had no trace. `childPageCeiling` (100 pages) is a non-termination guard only, and its exhaustion is the OVERFLOW row above. Every read failure that decides WHICH evidence to look at (child query, child stages, child traces) is returned as a **transient error**, matching rule 2's I/O posture — never a silent pass. The child-chain read is the deliberate exception: like rule 4 on the parent's own chain, a failure to read or re-hash it is categorized as a `chain_unrecoverable` missing item rather than a retryable error, so an unreadable child chain gates the merge instead of looking like a blip.
+
+**Child-chain integrity.** Rule 4 verifies the PARENT run's chain only — `verifyChain` is scoped to a single run's entries — and a child run need never pass through any check that verifies its own chain. Reading a child's `trace_uploaded` rows without verifying that chain would let a decomposed parent's REQUIRED merge check pass on evidence that does not hash, an audit-integrity hole that exists for decomposed runs alone. So the resolver verifies each candidate child's chain FIRST, before any of its entries are trusted: the `trace_uploaded` rows come out of that same chain and are only as trustworthy as it is. Pinned by `TestComputeResult_DecompositionChainInvalidChildRejected`, whose "with a healthy sibling" case discriminates a real rejection from a fixture accident — a resolution built over the untampered sibling alone would still pass.
+
+**Child provenance.** A run row carrying `decomposed_from == parent` is accepted as a legitimate child without further proof. That is sound because `decomposed_from` is not caller-settable: `server.createRunRequest` has no such field, so no REST or MCP client can mint a run claiming this parentage, and the only writers are the fan-out paths themselves (the orchestrator's child mint, consolidate, the childcompletion sweeper), each of which already holds the parent run. Anyone able to write a run row directly already has backend/database access and could forge the parent's own evidence just as easily.
+
+The resolution is surfaced as evidence, not hidden: `ComputeResult` returns an `auditcomplete.Resolution` naming the satisfying child run ids, `GET /v0/stages/{id}/checks` carries it as the audit-complete row's `resolved[]` array, and the published Check Run's pass summary names those child runs so an auditor can follow the chain rather than trust the resolution.
 
 ## Normalization (rule 4 specifics)
 
@@ -32,21 +58,34 @@ Rule 6 is gated on the `ImplementReviewers` + `ReviewBackstop` closures in `Deps
 
 ## State output
 
-- `pending` while any non-review stage is non-terminal OR the only gaps are pending-flavored (`head_fetch_failed` and/or `review_pending`).
+- `pending` while any non-review stage is non-terminal OR the only gaps are pending-flavored (`head_fetch_failed`, `review_pending`, `security_findings_unverified`, and/or `children_pending` — a decomposition child whose implement stage has not terminated, #3092).
 - `fail` with a structured `missing []{kind, detail}` list when other rules trip.
-- `pass` only when all six rules clear.
+- `pass` only when all six rules clear — possibly with rule 2's parent implement-stage gap RESOLVED through the decomposition children, in which case `ComputeResult` also returns a `resolved []{kind, stage_id, child_run_ids, detail}` list naming them (#3092).
 
 Compute-on-read per #229's recommendation; cheap on the write path.
 
 ## Integration points
 
-`server/checks.go::handleListStageChecks` injects a synthetic row carrying `state` + `missing[]` so the SPA can render "fail because: plan missing, redacted trace missing on stage X" without a secondary call. (Pre-#253 `server/approvals.go::checkBlockingChecks` also special-cased the name to gate the approval API — that gate moved to GitHub branch protection per ADR-017 / #249.)
+`server/checks.go::handleListStageChecks` injects a synthetic row carrying `state` + `missing[]` (+ `resolved[]`, #3092) so the SPA can render "fail because: plan missing, redacted trace missing on stage X" without a secondary call. (Pre-#253 `server/approvals.go::checkBlockingChecks` also special-cased the name to gate the approval API — that gate moved to GitHub branch protection per ADR-017 / #249.)
 
 The publisher (`backend/internal/auditcheckpublisher`) mirrors the state to the PR as a Check Run (#231) so branch protection can enforce it.
 
 ## Republish on drift
 
-`pull_request.synchronize` webhooks fire `server/pullrequest_synchronize.go::republishOnSynchronize`, which looks up the matching Fishhawk run via `runs.pull_request_url` (#216) and re-runs Compute + publish so branch protection sees the drift immediately rather than waiting for the next SPA visit. Falls open (returns pass) when `ArtifactRepo` or `AuditRepo` aren't wired — same posture as the other check-derivation paths.
+`pull_request` webhooks with action `opened`, `reopened` or `synchronize` fire `server/pullrequest_synchronize.go::republishOnPullRequestEvent`, which looks up the matching Fishhawk run via `runs.pull_request_url` (#216) and re-runs Compute + publish so branch protection sees the drift immediately rather than waiting for the next SPA visit. Falls open (returns pass) when `ArtifactRepo` or `AuditRepo` aren't wired — same posture as the other check-derivation paths.
+
+`opened` / `reopened` were added in E64.43 (#3160); before that only `synchronize` was routed, which meant a PR never pushed to after opening (the Dependabot shape) received no publish at all. Routing the extra actions is safe for the run-BEARING path because the publisher's per-`(forge, repo, head_sha)` dedup cache makes a repeat at the same head a no-op.
+
+## Every PR class receives a terminal check (E64.43 / #3160)
+
+Once `fishhawk_audit_complete` is marked a **Required** status check, a PR that never gets the context published is blocked forever. Since #3160 the contract is complete:
+
+- A **run-bearing** PR goes through the existing `ComputeResult` + `publishAuditCheck` path and receives `in_progress` → `success` / `failure` exactly as before.
+- A **run-less** PR — Dependabot, a human hotfix, an operator-authored docs PR — receives a terminal `completed` / `neutral` Check Run via `auditcheckpublisher.PublishNotApplicable`, whose summary states plainly that no Fishhawk run is associated with the PR and the audit gate does not apply. GitHub treats `success`, `neutral` and `skipped` as satisfying a required context, and `neutral` stays honest that nothing was verified.
+
+**What keeps a Fishhawk-managed PR out of the run-less path** is the App-identity discriminator in `server/pullrequest_synchronize.go::authoredByFishhawkApp`. Zero runs on a PR is not by itself proof the PR is foreign: an `opened` webhook for a Fishhawk-managed PR can arrive before `runs.pull_request_url` is denormalized. So before publishing not-applicable the handler must positively establish the PR was neither opened nor pushed by Fishhawk's own App — matching the App's own `<app-slug>[bot]` login (resolved from `GET /app`, never a hardcoded literal) case-insensitively against BOTH the PR author and the event sender.
+
+The guard is **fail-closed in both directions**: an unresolvable App identity publishes nothing and logs at WARN, and a `ListRuns` error publishes nothing (an error is not evidence of zero runs). The direction is deliberate — a missing publish leaves a PR blocked, which an admin merge recovers; a wrong publish greens a real audit gate silently, which nothing recovers. Long-form contract, including the stated residuals: `backend/internal/server/README.md` and `backend/internal/auditcheckpublisher/README.md`.
 
 ## Reconcile sweep
 
@@ -56,4 +95,4 @@ Every publish surface above is one-shot best-effort: a transient GitHub failure 
 
 ## Verifier mirror
 
-The verifier package (`/verifier/internal/audit`) ships an external mirror of rules 1–4; rules 5 and 6 are **backend-only** — rule 5 needs GitHub access, rule 6 needs the live spec-reviewers + backstop closures, neither of which the verifier has.
+The verifier package (`/verifier/internal/audit`) ships an external mirror of rules 1–4; rules 5 and 6 are **backend-only** — rule 5 needs GitHub access, rule 6 needs the live spec-reviewers + backstop closures, neither of which the verifier has. **Rule 2b (#3092) is backend-only for the same reason**: resolving a decomposed parent's trace through its children needs a live `ListRuns(DecomposedFrom)` query against the run repository, which an export-based verifier cannot issue — so the verifier's rule-2 mirror still reads a decomposed parent's fan-out implement stage as trace-less. That is a known, deliberate divergence, not a defect in either side.

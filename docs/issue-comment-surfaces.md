@@ -462,6 +462,48 @@ Notes:
   `plan_review_backstop_elapsed`: it exists so a reviewer that dies emitting no
   terminal verdict can never strand a merge resolution, and so the degrade is
   auditable.
+- The merge-supersede audit kind — `stage_superseded_by_merge` (E64.2 / #3083),
+  written by the shared merge-supersede sweep
+  (`server/merge_supersede.go::supersedeParkedStagesOnMerge`) once per stage a
+  merge terminalized as `superseded`, from BOTH writers (the automatic merged
+  path and `POST /v0/runs/{run_id}/reconcile-merge`) — is an **internal,
+  fact-record audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it to the issue thread; the run's sticky status comment
+  already reflects the stage's new state through the shared `stageStateIcon`
+  glyph. Payload: `{run_id, stage_id, stage_type, from_state, reason}`, where
+  `reason` is `merge_observed` | `operator_reconcile` | `repair`. It is the
+  durable record of WHY a run completed around a stage that never executed —
+  the honesty the state exists for, since the pre-existing escape hatches
+  recorded `failed` (work never attempted) or `cancelled` (a change that
+  shipped). The entry is appended ONLY AFTER the compare-and-swap that moved the
+  stage succeeded, so a refused sweep leaves a MISSING row rather than a false
+  one; the reconcile endpoint's `repair` reason is what closes that window from
+  the other side.
+- The merge-observation audit kind — `merge_observation_recorded` (E64.32 /
+  #3136), written by the operator recovery verb
+  (`server/merge_observation.go::handleRecordMergeObservation`, POST
+  `/v0/runs/{run_id}/record-merge-observation`) once per invocation that read
+  the run's pull request off the FORGE and found it merged — is an **internal,
+  fact-record audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it to the issue thread, and it has no Notifier method;
+  the merge itself is already announced through the existing `pr_merged` /
+  `post_merge_observed` path and the run's sticky status comment. Payload:
+  `{run_id, pull_request_url, pull_request_number, merge_commit_sha, merged_at,
+  observed_at, reconciled_after_the_fact}`, appended with `actor_kind` **user**
+  (or `agent` for an operator-role subject) — an operator-invoked observation,
+  never a system one, which is a second signal alongside the category that the
+  fact was learned by hand rather than seen live.
+
+  It is the OBSERVE half of the #3083 recovery pair and is DELIBERATELY DISTINCT
+  from `pr_merged` rather than a synthetic `pr_merged` row: `pr_merged` carries
+  a live-observation timestamp that the latency and cost surfaces already read
+  as "when Fishhawk knew", so back-dating one would corrupt those series and lie
+  about how the merge was learned. Recording `merged_at` (when the merge
+  happened, from the forge) alongside `observed_at` (when Fishhawk learned it)
+  lets a reader see the gap with nothing back-dated. `reconcile-merge` reads it
+  as a third qualifying evidence category alongside `pr_merged` /
+  `post_merge_observed`; the settling verb still reads only the chain and never
+  re-observes the forge.
 - The plan-gate scope pre-check audit kind — `plan_scope_precheck` (#658),
   written by the plan upload handler (`server/scope_precheck.go::runScopePrecheck`)
   immediately after `plan_generated` and before plan review — is an **internal,
@@ -848,6 +890,26 @@ Notes:
   `plan_violates_budget` / `plan_budget_override_acknowledged` runtime-budget
   pattern. Listed here only so a future reader grepping the audit categories
   doesn't mistake them for comment surfaces.
+- The runtime-budget calibration-crossing audit kind —
+  `plan_budget_calibration_crossing` (#2862) — is an **internal, system-actor
+  audit kind, NOT an issue-comment surface**. Nothing in `issuecomment` posts
+  it; it has no Notifier method. The approval handler
+  (`approvals.go::checkPlanBudget`) writes one per plan-stage approve whose
+  pre-calibration `raw_predicted_runtime_minutes` and calibrated
+  `predicted_runtime_minutes` STRADDLE the resolved implement-stage budget —
+  i.e. the fleet calibration factor moved the estimate across the threshold. It
+  is written on EVERY outcome branch, including the two that let the approval
+  proceed, with payload `{stage_id, raw_predicted_minutes, predicted_minutes,
+  gate_predicted_minutes, implied_factor, fleet_calibration_ratio (omitted when
+  no hint resolves), budget_minutes, budget_source, spec_budget_minutes,
+  gate_outcome}`. `gate_outcome` is one of `refused` /
+  `decomposition_satisfied` / `override_acknowledged` and never
+  `within_budget`: a crossing is over budget by construction, because the gate
+  reads the maximum of the two estimates. It is the third member of the
+  `plan_violates_budget` / `plan_budget_override_acknowledged` runtime-budget
+  family above, and gates nothing — it records why a decision was what it was.
+  Listed here only so a future reader grepping the audit categories doesn't
+  mistake it for a comment surface.
 - The fan-out re-drive parking audit kind — `parent_awaiting_redrive` (#698) —
   is an **internal, system-actor audit kind, not an issue-comment surface**.
   Nothing in `issuecomment` posts it to the issue thread; it has no Notifier

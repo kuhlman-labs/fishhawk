@@ -304,6 +304,15 @@ func TestE2E_AmendAcceptanceCriteria_RetiredAtApproval_ReachesAcceptancePromptAn
 		t.Fatalf("CreateStage acceptance: %v", err)
 	}
 
+	// Seed the minimum ledger a really-dispatched acceptance stage carries so the
+	// #3091 unbound-head clamp does NOT fire on this retirement arm (#3124): a
+	// reported head plus an acceptance-dispatch anchor at a strictly greater
+	// sequence. A head entry alone is necessary but not sufficient — without the
+	// dispatch anchor acceptanceValidatedHeadSHA resolves to "" and the ship would
+	// legitimately clamp the neutralized pass to undecidable.
+	seedReportedHead(t, ctx, auditRepo, fx.runID, acceptStage.ID, "pull_request_opened", "e2evalidatedhead", time.Now())
+	seedAcceptanceDispatch(t, ctx, auditRepo, fx.runID, acceptStage.ID)
+
 	// 2. REAL MCP approve carrying the conditions AND the retirement.
 	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
 	const conditionText = "1. Drop the /healthz budget line; the budget rides the run row instead."
@@ -413,6 +422,13 @@ func TestE2E_AmendAcceptanceCriteria_RetiredAtApproval_ReachesAcceptancePromptAn
 	if len(ids) != 1 || ids[0] != "crit-2" {
 		t.Errorf("retired_criterion_ids = %v, want [crit-2]", outcome["retired_criterion_ids"])
 	}
+	// Fixture precondition (#3124): the seeded head + dispatch anchor must resolve
+	// a non-empty validated head, so this arm records the neutralized `passed`
+	// because retirement holds — NOT because the unbound-head clamp is absent. A
+	// future fixture drift surfaces here as a named failure, not a verdict mystery.
+	if hs, _ := outcome["head_sha"].(string); hs == "" {
+		t.Fatalf("fixture precondition failed: recorded head_sha is empty; the seeded dispatch anchor + head must resolve a validated head")
+	}
 
 	// 6. Arm 2 (the counterfactual): a verdict that ALSO fails a NON-retired
 	// criterion is recorded FAILED and routed to triage.
@@ -426,6 +442,10 @@ func TestE2E_AmendAcceptanceCriteria_RetiredAtApproval_ReachesAcceptancePromptAn
 	if err != nil {
 		t.Fatalf("CreateStage acceptance 2: %v", err)
 	}
+	// Same bound-head ledger for arm 2, so it exercises a resolvable head rather
+	// than silently relying on a shipped `failed` being un-softenable (#3124).
+	seedReportedHead(t, ctx, auditRepo, fx.runID, acceptStage2.ID, "pull_request_opened", "e2evalidatedhead2", time.Now())
+	seedAcceptanceDispatch(t, ctx, auditRepo, fx.runID, acceptStage2.ID)
 	liveFailure := []byte(`{"verdict":"failed","failure_mode":"assertion_fail","criteria":[` +
 		`{"id":"crit-1","result":"failed","observed":"the run never settled"},` +
 		`{"id":"crit-2","result":"failed"}]}`)
@@ -468,6 +488,33 @@ func getPromptRenderRaw(t *testing.T, ctx context.Context, baseURL string, stage
 		t.Fatalf("prompt-render status %d: %s", resp.StatusCode, raw)
 	}
 	return raw
+}
+
+// seedAcceptanceDispatch appends the acceptance-dispatch ANCHOR entry
+// (acceptance_dispatched, scoped to the stage) that acceptanceValidatedHeadSHA
+// requires before it will resolve any reported head — a head entry alone is
+// necessary but NOT sufficient (#3124). It is deliberately its own helper rather
+// than an overload of seedReportedHead: a dispatch entry is not a head-report
+// category, and reusing the head helper would misstate what is being seeded.
+// Append it AFTER the head entry so its audit sequence is strictly greater and
+// the head falls at-or-before the anchor.
+func seedAcceptanceDispatch(t *testing.T, ctx context.Context, repo audit.Repository, runID, stageID uuid.UUID) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"stage_id": stageID.String()})
+	if err != nil {
+		t.Fatalf("marshal acceptance_dispatched payload: %v", err)
+	}
+	kind := audit.ActorKind("system")
+	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now(),
+		Category:  server.CategoryAcceptanceDispatched,
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("AppendChained acceptance_dispatched: %v", err)
+	}
 }
 
 // shipAcceptanceE2E POSTs an acceptance verdict as the operator bearer and

@@ -115,6 +115,19 @@ var redactableDetailKeys = map[string]struct{}{
 	// of its rows survived.
 	"recorded":  {},
 	"requested": {},
+	// resolved / items_total / suggested_grooming_order_limit / budget_seconds:
+	// the counts the 504 issue_set_resolution_timeout refusal exists to carry
+	// (E54.59 / #3113). A 504 is a 5xx, so WITHOUT these four entries the
+	// default-deny redactor above strips exactly the numbers the refusal is
+	// made of and the operator is handed an empty body. Each is a product-owned
+	// integer the handler computes — three from the resolver's own typed
+	// accounting, one from the server's configured budget — never derived from
+	// an error, a subprocess or a third-party response, so all four satisfy the
+	// membership rule above on the `recorded`/`requested` precedent.
+	"resolved":                       {},
+	"items_total":                    {},
+	"suggested_grooming_order_limit": {},
+	"budget_seconds":                 {},
 }
 
 // redactErrorDetails returns a NEW map holding only the allow-listed keys of

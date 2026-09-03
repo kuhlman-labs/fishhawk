@@ -36,6 +36,12 @@ type apiClient struct {
 	// multi-minute LLM inference, so the 30s short client aborts it mid-flight
 	// (aborting the request context and, server-side, killing the drafter).
 	httpLong *http.Client
+	// httpIssueSet is the issue-set client for CreateCampaign. A no-epic
+	// campaign resolves each named issue's depends_on through the forge, so a
+	// full ratified grooming order costs one forge round-trip per item. See
+	// issueSetClientTimeout for why it is its own client rather than the 30s
+	// short one.
+	httpIssueSet *http.Client
 }
 
 // refinementDraftClientTimeout bounds the MCP client's wait on the two
@@ -47,12 +53,56 @@ type apiClient struct {
 // backend/internal/planreview/budget.go).
 const refinementDraftClientTimeout = 22 * time.Minute
 
+// issueSetClientTimeout bounds the MCP client's wait on POST /v0/campaigns,
+// whose no-epic branch resolves an arbitrary issue set through the forge
+// (E54.59 / #3113). It is set ABOVE server.MaxIssueSetResolutionBudget (10m)
+// so the CLIENT can never be what gives up first: the server's own bounded
+// 504 issue_set_resolution_timeout — which carries resolved/items_total and a
+// suggested grooming_order_limit — is what the operator sees, instead of a
+// bare transport error carrying no counts. Before this the 30s short client's
+// wall was what aborted, which is the defect #3113 reports. (#3113's original
+// Summary diagnosed a SERVER-side 30s deadline on this path; that diagnosis
+// was wrong — the server had no deadline here at all.)
+//
+// WHY THE MARGIN IS SOUND (operator condition 1(b), corrected in the #3113
+// fix-up to the HONEST framing). handleCreateCampaign anchors the server
+// resolution deadline at HANDLER ENTRY (requestStart), which folds the
+// unbounded per-item forge work — the dimension #3113 is about — into the
+// server-bounded span. But the server budget bounds ONLY [handler entry ..
+// resolver return], while this client's 11-minute wall measures from before
+// network transit to after the full response is read. So it is NOT literally
+// "the same span": three pieces of the client's measurement sit OUTSIDE the
+// server budget — (a) network transit both directions, (b) the middleware
+// chain ahead of the handler (request-id, bearer auth), and (c) all
+// post-resolution handler work (campaign + item persistence, the idempotency
+// record, response encode + write). The one-minute margin (this constant −
+// MaxIssueSetResolutionBudget) must absorb (a)+(b)+(c). It is adequate for (c)
+// because that is local database writes on an already-open pool plus a small
+// JSON encode, NOT per-item forge round-trips, so it does not scale with issue
+// count. THIS IS AN ARGUED MARGIN, NOT A CONSTRUCTED GUARANTEE — no server-side
+// deadline can bound client-side transit, and (c) is bounded by inspection. See
+// handleCreateCampaign's requestStart comment (campaigns.go) for the full
+// residual accounting and why the handler is deliberately NOT wrapped in a
+// deadline.
+//
+// What IS guaranteed by CONSTRUCTION is the other half (operator condition
+// 1(a)): the ceiling this constant sits above cannot be exceeded, because
+// Server.issueSetResolutionBudget clamps to MaxIssueSetResolutionBudget however
+// the Config was built — not only in fishhawkd's startup refusal — so no
+// configured budget can rise above the number this constant is set over.
+const issueSetClientTimeout = 11 * time.Minute
+
 func newAPIClient(cfg config) *apiClient {
 	return &apiClient{
 		baseURL:  cfg.backendURL,
 		token:    cfg.apiToken,
 		http:     &http.Client{Timeout: 30 * time.Second},
 		httpLong: &http.Client{Timeout: refinementDraftClientTimeout},
+		// The issue-set client is its own instance rather than a reuse of
+		// httpLong: the two timeouts are pinned against DIFFERENT server-side
+		// budgets (refinementDraftBudget vs MaxIssueSetResolutionBudget), so
+		// sharing one would silently couple them.
+		httpIssueSet: &http.Client{Timeout: issueSetClientTimeout},
 	}
 }
 
@@ -204,9 +254,46 @@ type Run struct {
 	// trap. That degrade is also the mixed-version behaviour against an older
 	// backend that omits the key entirely, which is why it is a graceful
 	// fallback rather than a failure.
-	PredictedRuntimeMinutes int       `json:"predicted_runtime_minutes,omitempty" jsonschema:"the approved plan's predicted_runtime_minutes, stamped on the run at plan approval. Drives the advertised stage-wait poll cadence; omitted when the run's plan is not yet approved"`
-	CreatedAt               time.Time `json:"created_at"`
-	UpdatedAt               time.Time `json:"updated_at"`
+	PredictedRuntimeMinutes int `json:"predicted_runtime_minutes,omitempty" jsonschema:"the approved plan's predicted_runtime_minutes, stamped on the run at plan approval. Drives the advertised stage-wait poll cadence; omitted when the run's plan is not yet approved"`
+	// CompletionBlocked mirrors the backend runResponse.completion_blocked
+	// (E64.2 / #3083): the stage stopping a `running` run from completing, and
+	// whether the merge-supersede sweep can move it. The backend emits it on
+	// the SINGLE-run read only (handleGetRun), so it is populated when this Run
+	// came from GetRun and nil otherwise; an OLDER backend omits it entirely
+	// (nil-decode, the mixed-version degrade). The json tags MUST byte-match
+	// the backend's runCompletionBlockedPayload or the field silently decodes
+	// to nil — the #371-class hand-maintained-wire-mirror trap.
+	CompletionBlocked *runCompletionBlocked `json:"completion_blocked,omitempty" jsonschema:"the stage stopping a running run from completing (#968 guard) plus whether a reconcile can move it. Omitted when the run is not blocked"`
+	CreatedAt         time.Time             `json:"created_at"`
+	UpdatedAt         time.Time             `json:"updated_at"`
+}
+
+// runCompletionBlocked mirrors the backend's run-status completion_blocked block
+// (E64.2 / #3083 — backend/internal/server/runs.go's
+// runCompletionBlockedPayload): which stage is holding a `running` run open, and
+// whether anything can move it.
+//
+// Recovery is a CLOSED two-value set — "reconcile-merge" or "none" — and it
+// DISCRIMINATES: it names the verb ONLY when the blocking stage is one the
+// default-deny merge-supersede pair table admits AND the run's PR is observably
+// merged. Reason names the state otherwise. Pointing an operator at a verb
+// guaranteed to refuse is the defect #3083 reports against merge_run, so a
+// consumer must branch on Recovery rather than always suggesting the endpoint.
+//
+// The json tags MUST stay byte-identical with the backend field or the mirror
+// decodes to nil silently (the #371-class hand-maintained-wire-mirror trap).
+// It is deliberately UNEXPORTED, unlike its RunConcerns / RunReviewAuthority
+// siblings: the package's export-surface baseline (export_surface_test.go) is
+// not in this slice's scope, and nothing outside this package names the type —
+// the field is exported, so encoding/json and the jsonschema reflector reach it
+// exactly as they would an exported type. If a consumer ever needs to name it,
+// exporting it is a one-line change plus a baseline row.
+type runCompletionBlocked struct {
+	StageID    string `json:"stage_id" jsonschema:"the id of the non-terminal stage blocking completion"`
+	StageType  string `json:"stage_type" jsonschema:"the blocking stage's type (plan | implement | review | deploy | acceptance)"`
+	StageState string `json:"stage_state" jsonschema:"the blocking stage's RAW backend state (e.g. awaiting_host_dispatch, awaiting_approval, running)"`
+	Reason     string `json:"reason" jsonschema:"why the run cannot complete, naming the stage and its state"`
+	Recovery   string `json:"recovery" jsonschema:"'reconcile-merge' when POST /v0/runs/{run_id}/reconcile-merge can supersede this stage and complete the run (a merge-supersedable park on an observably merged PR), otherwise 'none' — no verb applies and reason says what the stage needs instead"`
 }
 
 // init classifies the decomposition-lineage Run fields this change adds
@@ -226,6 +313,13 @@ func init() {
 		pathClassification{Path: "run.decomposed_from", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 		pathClassification{Path: "run.slice_index", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 		pathClassification{Path: "run.slice_depends_on", Tier: "skeleton", Class: classStored, Surfaces: restRun},
+		// The completion-refusal projection (E64.2 / #3083). Derived by the
+		// backend from the run's stage rows + merge evidence and surfaced by
+		// the single-run REST read, so it classifies like the sibling
+		// single-read projections: stored, retrievable from GET
+		// /v0/runs/{id}, retained through T1..T9, itemised out only at the
+		// diagnosis skeleton.
+		pathClassification{Path: "run.completion_blocked", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 	)
 }
 
@@ -2072,11 +2166,15 @@ type MergeRunResult struct {
 //   - 404 run_not_found
 //   - 409 run_not_mergeable (no PR URL; run failed/cancelled),
 //     acceptance_gate_not_passed (the acceptance gate is not
-//     passed/not-declared/skipped-out-of-scope), or merge_checks_pending
+//     passed/not-declared/skipped-out-of-scope), merge_checks_pending
 //     (E67.56 / #2717 — the PR's required checks have not all passed, so GitHub
 //     will not queue the merge; the verdict row is durable; details carry
-//     verdict_sequence + reason:"checks_pending"). fishhawk_merge_run WAITS on
-//     this one rather than surfacing it as an error.
+//     verdict_sequence + reason:"checks_pending"; fishhawk_merge_run WAITS on
+//     this one rather than surfacing it as an error), or merge_conflicting
+//     (E64.14 / #3109 — the PR has a merge conflict against its base, so GitHub
+//     can never queue the merge and NO verdict row is recorded; details carry
+//     pr_url + mergeable_state; fishhawk_merge_run returns status=conflicting
+//     IMMEDIATELY rather than waiting, since waiting cannot resolve a conflict).
 //   - 502 merge_dispatch_failed (the verdict row is durable; the queue step
 //     is retryable — re-POST re-queues with no duplicate row)
 //   - 503 merge_unconfigured (the merger seam is not wired)
@@ -2821,6 +2919,10 @@ type campaignGroomingSource struct {
 //   - 422 campaign_item_not_child (a requested items ref is not a child of the epic)
 //   - 501 issue_set_resolution_unsupported (no-epic variant on a provider that
 //     cannot resolve an arbitrary issue set)
+//   - 504 issue_set_resolution_timeout (the no-epic resolution exceeded the
+//     server's issue-set budget; details carry resolved / items_total /
+//     budget_seconds and, when one could be proven to fit, a
+//     suggested_grooming_order_limit)
 //   - 503 campaign_repo_unconfigured (no campaign repository wired on the deploy)
 //
 // items is the OPTIONAL subset filter (#2003) WITH epicRef (issue refs naming the
@@ -2837,7 +2939,10 @@ func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePoli
 		return nil, fmt.Errorf("marshal create campaign: %w", err)
 	}
 	var camp Campaign
-	if _, err := c.doWithStatus(ctx, http.MethodPost, "/v0/campaigns", body, nil, &camp); err != nil {
+	// Routed through the ISSUE-SET client, not the 30s short one: the no-epic
+	// branch resolves each named issue through the forge, so a full ratified
+	// order legitimately takes minutes. See issueSetClientTimeout.
+	if _, err := c.doWithStatusUsing(c.httpIssueSet, ctx, http.MethodPost, "/v0/campaigns", body, nil, &camp); err != nil {
 		return nil, err
 	}
 	return &camp, nil

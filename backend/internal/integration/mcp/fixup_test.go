@@ -2047,7 +2047,7 @@ func TestE2E_Fixup_ReviewActionHintSurfacesAndOverride(t *testing.T) {
 // end: the MCP review-action hint must mirror the backend's no-change fix-up
 // refund (#967). The per-layer units can't cover the seam (cf. #618) — it lives
 // between the backend's refund accounting (handleFixupStage /
-// countFixupNoChangeRefunds, which widens MaxPasses so a refunded normal pass is
+// fixupRefundedPasses, which widens MaxPasses so a refunded normal pass is
 // admissible WITHOUT force_additional_pass) and the INDEPENDENT MCP surface
 // (reviewActionHintFor, which before #1150 derived RemainingFixupBudget from the
 // RAW stage_fixup_triggered count alone). Without the fix the operator saw
@@ -2849,5 +2849,649 @@ func TestE2E_Fixup_DuplicateFailureReportThenRefundedPass(t *testing.T) {
 	}
 	if len(triggeredFinal) != 3 {
 		t.Errorf("stage_fixup_triggered entries = %d, want 3 (the ceiling refusal writes no fourth trigger)", len(triggeredFinal))
+	}
+}
+
+// --- E68.31 / #3081: the fix-up-recovery marker on the MCP wait/status surfaces ---
+
+// fixupRecoveredView is the local decode-only mirror of the #3081 marker the
+// MCP surfaces carry on a stage wait status. Hand-mirrored (as the sibling
+// views in this file are) so a json-tag drift on either side fails HERE.
+type fixupRecoveredView struct {
+	SourceFailureReason   string `json:"source_failure_reason"`
+	SourceFailureCategory string `json:"source_failure_category"`
+	RestoredState         string `json:"restored_state"`
+	RestoredReviewStageID string `json:"restored_review_stage_id"`
+	DetailsAvailable      bool   `json:"details_available"`
+	Message               string `json:"message"`
+}
+
+type stageWaitStatusView struct {
+	Stage          string              `json:"stage"`
+	Status         string              `json:"status"`
+	FixupRecovered *fixupRecoveredView `json:"fixup_recovered"`
+}
+
+type awaitStageView struct {
+	Status          string               `json:"status"`
+	State           string               `json:"state"`
+	Terminal        bool                 `json:"terminal"`
+	Message         string               `json:"message"`
+	StageWaitStatus *stageWaitStatusView `json:"stage_wait_status"`
+}
+
+type runStatusWaitView struct {
+	ImplementStageWaitStatus *stageWaitStatusView `json:"implement_stage_wait_status"`
+}
+
+// driveFixupToPushGate sets a run up in the push_and_open_pr shape (implement
+// SUCCEEDED, review parked at its gate), records an implement-review concern,
+// triggers the fix-up through the REAL fishhawk-mcp binary, and ships the
+// re-dispatched implement's push_fixup trace so the stage sits `running` behind
+// the #794 forward gate — the exact point from which a /pull-request report
+// decides whether the pass LANDED or was RECOVERED. Returns the two stage rows.
+func driveFixupToPushGate(t *testing.T, ctx context.Context, fx *e2eFixture, session *mcp.ClientSession, auditRepo audit.Repository) (*runpkg.Stage, *runpkg.Stage) {
+	t.Helper()
+	if _, err := fx.runRepo.TransitionRun(ctx, fx.runID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun → running: %v", err)
+	}
+	impl, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: fx.runID, Sequence: 1, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(implement): %v", err)
+	}
+	walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+
+	review, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: fx.runID, Sequence: 2, Type: runpkg.StageTypeReview,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(review): %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, review.ID)
+
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "address the drift"})
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "address the scope concern on the open PR",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+	}
+	shipPushFixupTraceViaBackend(t, ctx, fx, impl.ID)
+	return impl, review
+}
+
+// callAwaitStageImplement calls fishhawk_await_stage for the run's implement
+// stage through the REAL MCP binary and decodes the response.
+func callAwaitStageImplement(t *testing.T, ctx context.Context, session *mcp.ClientSession, runID uuid.UUID) awaitStageView {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_await_stage",
+		Arguments: map[string]any{
+			"run_id":          runID.String(),
+			"stage":           "implement",
+			"timeout_seconds": 30,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_await_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fishhawk_await_stage returned error: %s", toolContentString(t, result))
+	}
+	var out awaitStageView
+	decodeStructured(t, result, &out)
+	return out
+}
+
+// callGetRunStatusWait calls fishhawk_get_run_status through the REAL MCP
+// binary and decodes just the implement wait-status block.
+func callGetRunStatusWait(t *testing.T, ctx context.Context, session *mcp.ClientSession, runID uuid.UUID) runStatusWaitView {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_get_run_status",
+		Arguments: map[string]any{"run_id": runID.String()},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_get_run_status: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fishhawk_get_run_status returned error: %s", toolContentString(t, result))
+	}
+	var out runStatusWaitView
+	decodeStructured(t, result, &out)
+	return out
+}
+
+// TestE2E_Fixup_RecoveredPassIsReportedOnTheWaitSurfaces is the executable form
+// of #3081's done-means, and the seam per-layer units structurally cannot cover:
+// backend recovery writer → Postgres audit chain → MCP audit probe → tool
+// response. It drives a REAL fix-up → re-dispatch FAILURE → backend recovery
+// through the real MCP binary against real Postgres, then asserts BOTH surfaces
+// an operator acts on report the recovery rather than a bare `succeeded`.
+//
+// Without the change, both surfaces report `succeeded` / `terminal: true` and
+// seedFixupRecoveredCategory appends a stage_fixup_recovered audit entry for the
+// stage carrying source_failure_category — the #788 recovery record. Used here
+// to drive the #3085 category-A (harness-death) delivered-nothing arm, which has
+// no HTTP report path to shape it the way failPushPRViaBackend shapes the
+// category-C one.
+func seedFixupRecoveredCategory(t *testing.T, ctx context.Context, repo audit.Repository, runID, stageID uuid.UUID, category string) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"stage_id":                stageID.String(),
+		"restored_state":          string(runpkg.StageStateSucceeded),
+		"source_failure_category": category,
+		"source_failure_reason":   "agent harness terminated without a result",
+	})
+	if err != nil {
+		t.Fatalf("marshal stage_fixup_recovered payload: %v", err)
+	}
+	kind := audit.ActorKind("system")
+	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  server.CategoryStageFixupRecovered,
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("AppendChained stage_fixup_recovered: %v", err)
+	}
+}
+
+// seedFixupPushedEntry appends a fixup_pushed audit entry for the stage — the
+// PUSH VETO signal (#3085). A pass that landed a commit delivered SOMETHING, so
+// its window is never refunded however the pass later died.
+func seedFixupPushedEntry(t *testing.T, ctx context.Context, repo audit.Repository, runID, stageID uuid.UUID) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"run_id":   runID.String(),
+		"stage_id": stageID.String(),
+		"head_sha": "cafebabecafebabecafebabecafebabecafebabe",
+		"branch":   "fishhawk/run-x/stage-y",
+	})
+	if err != nil {
+		t.Fatalf("marshal fixup_pushed payload: %v", err)
+	}
+	kind := audit.ActorKind("system")
+	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  server.CategoryFixupPushed,
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("AppendChained fixup_pushed: %v", err)
+	}
+}
+
+// seedCrashRefundFixture builds the push_and_open_pr shape (implement SUCCEEDED
+// with the PR open, a separate review stage holding the gate), routes ONE real
+// fix-up pass through the MCP binary, and returns the two stages plus the live
+// session. The caller then seeds whatever delivered-nothing / push history the
+// case needs and re-parks the gate.
+func seedCrashRefundFixture(t *testing.T, ctx context.Context, fx *e2eFixture, auditRepo audit.Repository) (*runpkg.Stage, *runpkg.Stage, *mcp.ClientSession) {
+	t.Helper()
+	if _, err := fx.runRepo.TransitionRun(ctx, fx.runID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun → running: %v", err)
+	}
+	impl, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: fx.runID, Sequence: 1, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(implement): %v", err)
+	}
+	walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+
+	review, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: fx.runID, Sequence: 2, Type: runpkg.StageTypeReview,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(review): %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, review.ID)
+
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "address the drift"})
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "pass 1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage (pass 1): %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("pass 1 fix-up refused: %s", toolContentString(t, res))
+	}
+	return impl, review, session
+}
+
+// restoreReviewGate puts the stages back at the #788-recovered shape — implement
+// SUCCEEDED, review parked at the gate — the state a recovery leaves behind and
+// the precondition for the next fix-up.
+func restoreReviewGate(t *testing.T, ctx context.Context, fx *e2eFixture, implID, reviewID uuid.UUID) {
+	t.Helper()
+	walkToSucceeded(t, ctx, fx.runRepo, implID)
+	parkAtGate(t, ctx, fx.runRepo, reviewID)
+}
+
+// TestE2E_Fixup_CategoryACrashRefundAgreesAcrossHintAndBackend is the #3085
+// cross-boundary pin. The change spans the audit store, the HTTP handler, the
+// auto-drive service path and the MCP hint surface, and per-layer units pass
+// while the seam breaks — so this drives the real MCP binary against a real
+// Postgres with real audit history.
+//
+// One fix-up pass is triggered, then dies category-A in the harness having
+// pushed NOTHING. The hint and the backend must AGREE: review_action_hint
+// reports remaining_fixup_budget 1 / override_available false, AND
+// fishhawk_fixup_stage succeeds WITHOUT force_additional_pass, with the second
+// stage_fixup_triggered payload carrying refunded_passes 1 / forced false.
+// Before this change the refund keyed only on category "C", so the crash matched
+// no signal, the hint read 0/true, and the operator burned the override.
+func TestE2E_Fixup_CategoryACrashRefundAgreesAcrossHintAndBackend(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	impl, review, session := seedCrashRefundFixture(t, ctx, fx, auditRepo)
+
+	// The pass dies category-A in the harness, pushing NOTHING, and is recovered
+	// back to the review gate.
+	seedFixupRecoveredCategory(t, ctx, auditRepo, fx.runID, impl.ID, "A")
+	restoreReviewGate(t, ctx, fx, impl.ID, review.ID)
+
+	// A fresh re-review round so the hint has a concern to point at.
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "the re-review still sees drift"})
+
+	hint := getReviewActionHint(t, ctx, session, fx.runID)
+	if hint == nil {
+		t.Fatal("review_action_hint = nil, want a populated hint agreeing with the backend")
+	}
+	if hint.RemainingFixupBudget != 1 {
+		t.Errorf("review_action_hint.remaining_fixup_budget = %d, want 1 (the category-A death delivered nothing, so it refunds)", hint.RemainingFixupBudget)
+	}
+	if hint.OverrideAvailable {
+		t.Errorf("review_action_hint.override_available = true, want false (a normal pass is available; no override is needed)")
+	}
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "refunded normal pass after a category-A harness death",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool refunded fishhawk_fixup_stage: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("refunded fix-up refused — a category-A death that pushed nothing must refund the normal budget (#3085): %s",
+			toolContentString(t, res))
+	}
+
+	triggered, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(triggered): %v", err)
+	}
+	if len(triggered) != 2 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want 2", len(triggered))
+	}
+	var payload struct {
+		Forced         bool    `json:"forced"`
+		RefundedPasses float64 `json:"refunded_passes"`
+	}
+	if err := json.Unmarshal(triggered[len(triggered)-1].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal refunded payload: %v", err)
+	}
+	if payload.Forced {
+		t.Errorf("refunded fix-up audit forced = true, want false (admitted within the refunded normal budget)")
+	}
+	if payload.RefundedPasses != 1 {
+		t.Errorf("refunded fix-up audit refunded_passes = %v, want 1", payload.RefundedPasses)
+	}
+}
+
+// TestE2E_Fixup_PushedThenCrashedConsumesBudgetAndReportsCrashCount drives the
+// PUSH VETO and the crashed_without_push 422 detail through the REAL MCP error
+// path (#3085). A pass that landed a commit on the PR branch and THEN died
+// category-A delivered SOMETHING, so it consumes budget: fishhawk_fixup_stage
+// returns fixup_budget_exhausted, and the error details name
+// crashed_without_push so an operator can see what they would be overriding.
+func TestE2E_Fixup_PushedThenCrashedConsumesBudgetAndReportsCrashCount(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	impl, review, session := seedCrashRefundFixture(t, ctx, fx, auditRepo)
+
+	// The pass PUSHED a commit, then died category-A. The push veto applies.
+	seedFixupPushedEntry(t, ctx, auditRepo, fx.runID, impl.ID)
+	seedFixupRecoveredCategory(t, ctx, auditRepo, fx.runID, impl.ID, "A")
+	restoreReviewGate(t, ctx, fx, impl.ID, review.ID)
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "still drifting"})
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "second pass after a pushed-then-crashed pass",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("fix-up admitted — a pass that PUSHED delivered something and must CONSUME budget however it later died (#3085)")
+	}
+	body := toolContentString(t, res)
+	if !strings.Contains(body, "fixup_budget_exhausted") {
+		t.Errorf("tool error missing fixup_budget_exhausted: %s", body)
+	}
+	if !strings.Contains(body, "crashed_without_push") {
+		t.Errorf("tool error details missing crashed_without_push (#3085): %s", body)
+	}
+	// The veto held: NO second trigger entry was recorded.
+	triggered, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(triggered): %v", err)
+	}
+	if len(triggered) != 1 {
+		t.Errorf("stage_fixup_triggered entries = %d, want 1 (the budget refused the second pass)", len(triggered))
+	}
+}
+
+// are indistinguishable from a fix-up that landed a commit — the exact defect.
+func TestE2E_Fixup_RecoveredPassIsReportedOnTheWaitSurfaces(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+	impl, review := driveFixupToPushGate(t, ctx, fx, session, auditRepo)
+
+	// The re-dispatched implement FAILS its commit/push step — the backend
+	// recovers the stage to its pre-fix-up good state and writes
+	// stage_fixup_recovered.
+	failPushPRViaBackend(t, ctx, fx, impl.ID)
+
+	// Precondition: the stage really is back to `succeeded`, which is what makes
+	// the bare status misleading.
+	curImpl, err := fx.runRepo.GetStage(ctx, impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage(implement): %v", err)
+	}
+	if curImpl.State != runpkg.StageStateSucceeded {
+		t.Fatalf("implement state = %q, want succeeded (restored)", curImpl.State)
+	}
+
+	// Surface 1: fishhawk_await_stage.
+	awaited := callAwaitStageImplement(t, ctx, session, fx.runID)
+	if awaited.Status != "settled" || awaited.State != string(runpkg.StageStateSucceeded) {
+		t.Fatalf("await_stage status/state = %q/%q, want settled/succeeded", awaited.Status, awaited.State)
+	}
+	if awaited.StageWaitStatus == nil || awaited.StageWaitStatus.FixupRecovered == nil {
+		t.Fatalf("await_stage carried no fixup_recovered marker: %+v", awaited.StageWaitStatus)
+	}
+	rec := awaited.StageWaitStatus.FixupRecovered
+	if rec.SourceFailureCategory != "C" {
+		t.Errorf("await_stage source_failure_category = %q, want C", rec.SourceFailureCategory)
+	}
+	if !strings.Contains(rec.SourceFailureReason, "commit/push onto PR branch failed") {
+		t.Errorf("await_stage source_failure_reason = %q, want the backend-recorded reason", rec.SourceFailureReason)
+	}
+	if rec.RestoredState != string(runpkg.StageStateSucceeded) {
+		t.Errorf("await_stage restored_state = %q, want succeeded", rec.RestoredState)
+	}
+	if rec.RestoredReviewStageID != review.ID.String() {
+		t.Errorf("await_stage restored_review_stage_id = %q, want %s", rec.RestoredReviewStageID, review.ID)
+	}
+	if !rec.DetailsAvailable {
+		t.Error("await_stage details_available = false, want true for a well-formed recovery payload")
+	}
+	if awaited.Message == "" {
+		t.Error("await_stage top-level message is empty; a recovered fix-up must not settle silently")
+	}
+
+	// Surface 2: fishhawk_get_run_status.
+	status := callGetRunStatusWait(t, ctx, session, fx.runID)
+	if status.ImplementStageWaitStatus == nil {
+		t.Fatal("get_run_status carried no implement_stage_wait_status")
+	}
+	if status.ImplementStageWaitStatus.Status != "succeeded" {
+		t.Errorf("get_run_status status = %q, want succeeded (the bucket vocabulary must NOT move)", status.ImplementStageWaitStatus.Status)
+	}
+	srec := status.ImplementStageWaitStatus.FixupRecovered
+	if srec == nil {
+		t.Fatalf("get_run_status carried no fixup_recovered marker: %+v", status.ImplementStageWaitStatus)
+	}
+	if srec.SourceFailureCategory != "C" {
+		t.Errorf("get_run_status source_failure_category = %q, want C", srec.SourceFailureCategory)
+	}
+	if !strings.Contains(srec.SourceFailureReason, "commit/push onto PR branch failed") {
+		t.Errorf("get_run_status source_failure_reason = %q", srec.SourceFailureReason)
+	}
+}
+
+// TestE2E_Fixup_SucceededPassCarriesNoRecoveryMarker is the companion CONTROL
+// on the SAME path: a fix-up that genuinely LANDS a commit must leave both
+// surfaces byte-identical to today. Without it, a marker that fired
+// unconditionally would pass the test above.
+func TestE2E_Fixup_SucceededPassCarriesNoRecoveryMarker(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+	impl, _ := driveFixupToPushGate(t, ctx, fx, session, auditRepo)
+
+	// The fix-up LANDS: the /pull-request report carries fixup_pushed, driving
+	// the stage terminal with no recovery entry written.
+	succeedFixupPushViaBackend(t, ctx, fx, impl.ID)
+
+	recovered, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupRecovered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(recovered): %v", err)
+	}
+	if len(recovered) != 0 {
+		t.Fatalf("stage_fixup_recovered entries = %d, want 0 for a fix-up that landed", len(recovered))
+	}
+
+	awaited := callAwaitStageImplement(t, ctx, session, fx.runID)
+	if awaited.Status != "settled" {
+		t.Fatalf("await_stage status = %q, want settled", awaited.Status)
+	}
+	if awaited.StageWaitStatus != nil && awaited.StageWaitStatus.FixupRecovered != nil {
+		t.Errorf("await_stage carried a fixup_recovered marker for a fix-up that LANDED: %+v", awaited.StageWaitStatus.FixupRecovered)
+	}
+	if awaited.Message != "" {
+		t.Errorf("await_stage message = %q, want empty on an ordinary settled response", awaited.Message)
+	}
+
+	status := callGetRunStatusWait(t, ctx, session, fx.runID)
+	if status.ImplementStageWaitStatus != nil && status.ImplementStageWaitStatus.FixupRecovered != nil {
+		t.Errorf("get_run_status carried a fixup_recovered marker for a fix-up that LANDED: %+v", status.ImplementStageWaitStatus.FixupRecovered)
+	}
+}
+
+// TestE2E_Fixup_AcceptancePendingRefusesAndSurfacesRemedy is the #3116
+// cross-boundary done-means, spanning concern store → run HTTP → MCP hint →
+// next_actions classifier → the REAL fix-up endpoint. It seeds the exact
+// topology the defect lives in — plan succeeded, implement SUCCEEDED, an
+// acceptance stage NOT settled, a review stage NOT yet at its gate, and open
+// implement-stage concerns in the durable store — then asserts AT ONE INSTANT
+// that all three surfaces tell one story:
+//
+//	(a) next_actions recommends DISPATCHING ACCEPTANCE and offers NO
+//	    fishhawk_fixup_stage (the classifier no longer names a refused verb);
+//	(b) review_action_hint still reports the surviving remaining_fixup_budget
+//	    and its message names dispatching acceptance first;
+//	(c) a REAL fishhawk_fixup_stage call at that moment is refused
+//	    fixup_not_applicable with a message naming the SAME remedy.
+//
+// Per-layer units pass while exactly this seam breaks (cf. #618): the
+// classifier's mirror and the endpoint's predicate are in different packages,
+// and the disagreement between them IS the bug.
+func TestE2E_Fixup_AcceptancePendingRefusesAndSurfacesRemedy(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	concernRepo := concern.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ConcernRepo:  concernRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	mkStage := func(seq int, typ runpkg.StageType) *runpkg.Stage {
+		t.Helper()
+		st, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+			RunID:            fx.runID,
+			Sequence:         seq,
+			Type:             typ,
+			ExecutorKind:     runpkg.ExecutorAgent,
+			ExecutorRef:      "fishhawk/runner@v1",
+			RequiresApproval: typ != runpkg.StageTypeAcceptance,
+		})
+		if err != nil {
+			t.Fatalf("CreateStage %s: %v", typ, err)
+		}
+		return st
+	}
+
+	// The feature_change topology: acceptance ordered BEFORE review. Seeded BY
+	// CONSTRUCTION — the plan and implement stages are walked to succeeded, the
+	// acceptance and review stages are left in their creation state (pending), so
+	// a counterfactual RED lands on a behavioral assertion, not on fixture setup.
+	plan := mkStage(1, runpkg.StageTypePlan)
+	walkToSucceeded(t, ctx, fx.runRepo, plan.ID)
+	impl := mkStage(2, runpkg.StageTypeImplement)
+	walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+	mkStage(3, runpkg.StageTypeAcceptance)
+	mkStage(4, runpkg.StageTypeReview)
+
+	// The implement review landed approve_with_concerns, in BOTH the audit and
+	// the durable store (the authoritative open set).
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "guard the nil stage"})
+	if _, err := concernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID:                fx.runID,
+		StageID:              impl.ID,
+		StageKind:            concern.StageKindImplement,
+		ReviewerModel:        "claude-opus-4-8",
+		OriginReviewSequence: 1,
+		Concerns:             []concern.RaisedConcern{{Severity: "medium", Category: "scope", Note: "guard the nil stage"}},
+	}); err != nil {
+		t.Fatalf("InsertRaised: %v", err)
+	}
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	// (a) next_actions points at acceptance and offers NO fix-up verb.
+	na := getNextActions(t, ctx, session, fx.runID)
+	if na == nil || na.State != "implement_concerns_open_acceptance_pending" {
+		t.Fatalf("next_actions = %+v, want state implement_concerns_open_acceptance_pending", na)
+	}
+	if len(na.Actions) == 0 {
+		t.Fatal("next_actions carries zero actions")
+	}
+	// The first action must point at the ACCEPTANCE stage. Its exact shape is
+	// runner-kind-dependent (dispatchOrPollActions offers fishhawk_dispatch_stage
+	// on a local run and a poll on a github_actions one, which auto-dispatches);
+	// this fixture's run carries the default kind, so the assertion is on WHICH
+	// stage the action names, not on the verb. The unit-layer cases
+	// (TestNextActions_GateClosedNeverOffersFixup,
+	// TestGetRunStatus_NextActions_ConcernsOpenAcceptancePending) pin the
+	// local-run fishhawk_dispatch_stage(stage=acceptance) shape exactly.
+	if first := na.Actions[0]; first.Params["stage"] != "acceptance" && !strings.Contains(first.Reason, "acceptance stage") {
+		t.Errorf("first action = %+v, want one naming the acceptance stage", first)
+	}
+	var sawDefer bool
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_fixup_stage" {
+			t.Errorf("next_actions offers fishhawk_fixup_stage while the endpoint refuses it — the #3116 defect: %+v", a)
+		}
+		if a.Action == "fishhawk_defer_concern" {
+			sawDefer = true
+		}
+	}
+	if !sawDefer {
+		t.Errorf("next_actions dropped fishhawk_defer_concern, which is legal now and spends no fix-up budget: %+v", na.Actions)
+	}
+
+	// (b) The hint reports the SURVIVING budget and names the ordering remedy.
+	hint := getReviewActionHint(t, ctx, session, fx.runID)
+	if hint == nil {
+		t.Fatal("review_action_hint absent; the budget must still be reported while the gate is closed")
+	}
+	if hint.RemainingFixupBudget != 1 {
+		t.Errorf("review_action_hint.remaining_fixup_budget = %d, want 1 — waiting for acceptance must not consume budget", hint.RemainingFixupBudget)
+	}
+	if !strings.Contains(hint.Message, "dispatch acceptance first") {
+		t.Errorf("review_action_hint.message does not name the ordering remedy: %q", hint.Message)
+	}
+
+	// (c) The REAL endpoint refuses at that same moment, naming the same remedy.
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"reason":   "route the scope concern back",
+			"concerns": []int{0},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("fishhawk_fixup_stage SUCCEEDED while the review gate is closed; the endpoint must refuse fixup_not_applicable")
+	}
+	refusal := toolContentString(t, res)
+	if !strings.Contains(refusal, "fixup_not_applicable") {
+		t.Errorf("refusal does not carry the fixup_not_applicable code: %s", refusal)
+	}
+	if !strings.Contains(refusal, "acceptance stage") || !strings.Contains(refusal, "Dispatch the acceptance stage") {
+		t.Errorf("refusal does not name the same remedy the surfaces do: %s", refusal)
 	}
 }

@@ -56,6 +56,19 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
+// PullRequestStateReader reads a pull request's live state back off the forge.
+// It is the injectable seam behind the merge-observation recovery verb
+// (E64.32 / #3136): the ONE method the endpoint needs, so a test can drive the
+// merged / not-merged / no-SHA / no-timestamp / forge-error branches without a
+// live forge.
+//
+// The signature deliberately mirrors mergereconciler.PRGetter, so
+// *githubclient.Client already satisfies it and the production wiring is a
+// fallback to cfg.GitHub rather than a new construction site.
+type PullRequestStateReader interface {
+	GetPullRequest(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int) (*forge.PullRequest, error)
+}
+
 // Config holds the values needed to construct a Server. Zero-valued
 // fields fall back to safe defaults.
 type Config struct {
@@ -167,6 +180,25 @@ type Config struct {
 	// wall-clock test cannot hold its ratios against a shipped constant it
 	// cannot scale with (AGENTS.md / #1984). Production wires it nowhere.
 	IntakeGroomDeadline time.Duration
+
+	// IssueSetResolutionBudget bounds the no-epic campaign source's issue-set
+	// dependency resolution (E54.59 / #3113) — the per-item forge round-trips a
+	// full ratified grooming order costs. fishhawkd wires it from
+	// --issue-set-resolution-budget / FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET.
+	//
+	// A NON-POSITIVE VALUE MEANS "USE THE DEFAULT"
+	// (DefaultIssueSetResolutionBudget), so every existing construction site —
+	// none of which sets this field — keeps today's behaviour with no edit.
+	//
+	// A value ABOVE MaxIssueSetResolutionBudget is CLAMPED to that maximum at
+	// the read site (issueSetResolutionBudget, campaigns.go). The clamp is not
+	// a convenience: the MCP client's issue-set timeout is pinned above
+	// MaxIssueSetResolutionBudget so the client is never what gives up first,
+	// and that relationship must hold however this Config was built — not only
+	// when it came through fishhawkd's flag handling, which additionally
+	// REFUSES an over-maximum value at startup so the operator is told rather
+	// than silently clamped.
+	IssueSetResolutionBudget time.Duration
 
 	// ArtifactRepo persists typed stage outputs (plans, PR refs).
 	// Wired by GET /v0/stages/{id}/artifacts and
@@ -368,6 +400,19 @@ type Config struct {
 	// auto-drive handler passes it straight to AutoDriveRunGate, whose
 	// merge arm already returns observe-only when the merger is nil.
 	GateMerger GitHubMerger
+
+	// PRStateReader is the forge pull-request read seam the merge-observation
+	// recovery verb (POST /v0/runs/{run_id}/record-merge-observation, E64.32 /
+	// #3136) reads the live merge state through. It is the ONLY new way onto a
+	// run's evidence chain, so it is the seam a test must be able to drive
+	// without a live forge.
+	//
+	// nil in production: the handler falls back to cfg.GitHub, which satisfies
+	// this interface (the signature mirrors mergereconciler.PRGetter). When
+	// BOTH are nil the endpoint returns 503 rather than degrading — a verb that
+	// records forge evidence must never record evidence it did not read. Same
+	// nil-means-test-seam posture as the sibling seams in this file.
+	PRStateReader PullRequestStateReader
 
 	// AuthRepo persists users + sessions for the OAuth
 	// sign-in flow (E4.2). Wired by the /v0/auth/* handlers; nil
