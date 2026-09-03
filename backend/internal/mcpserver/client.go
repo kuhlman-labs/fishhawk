@@ -36,6 +36,12 @@ type apiClient struct {
 	// multi-minute LLM inference, so the 30s short client aborts it mid-flight
 	// (aborting the request context and, server-side, killing the drafter).
 	httpLong *http.Client
+	// httpIssueSet is the issue-set client for CreateCampaign. A no-epic
+	// campaign resolves each named issue's depends_on through the forge, so a
+	// full ratified grooming order costs one forge round-trip per item. See
+	// issueSetClientTimeout for why it is its own client rather than the 30s
+	// short one.
+	httpIssueSet *http.Client
 }
 
 // refinementDraftClientTimeout bounds the MCP client's wait on the two
@@ -47,12 +53,56 @@ type apiClient struct {
 // backend/internal/planreview/budget.go).
 const refinementDraftClientTimeout = 22 * time.Minute
 
+// issueSetClientTimeout bounds the MCP client's wait on POST /v0/campaigns,
+// whose no-epic branch resolves an arbitrary issue set through the forge
+// (E54.59 / #3113). It is set ABOVE server.MaxIssueSetResolutionBudget (10m)
+// so the CLIENT can never be what gives up first: the server's own bounded
+// 504 issue_set_resolution_timeout — which carries resolved/items_total and a
+// suggested grooming_order_limit — is what the operator sees, instead of a
+// bare transport error carrying no counts. Before this the 30s short client's
+// wall was what aborted, which is the defect #3113 reports. (#3113's original
+// Summary diagnosed a SERVER-side 30s deadline on this path; that diagnosis
+// was wrong — the server had no deadline here at all.)
+//
+// WHY THE MARGIN IS SOUND (operator condition 1(b), corrected in the #3113
+// fix-up to the HONEST framing). handleCreateCampaign anchors the server
+// resolution deadline at HANDLER ENTRY (requestStart), which folds the
+// unbounded per-item forge work — the dimension #3113 is about — into the
+// server-bounded span. But the server budget bounds ONLY [handler entry ..
+// resolver return], while this client's 11-minute wall measures from before
+// network transit to after the full response is read. So it is NOT literally
+// "the same span": three pieces of the client's measurement sit OUTSIDE the
+// server budget — (a) network transit both directions, (b) the middleware
+// chain ahead of the handler (request-id, bearer auth), and (c) all
+// post-resolution handler work (campaign + item persistence, the idempotency
+// record, response encode + write). The one-minute margin (this constant −
+// MaxIssueSetResolutionBudget) must absorb (a)+(b)+(c). It is adequate for (c)
+// because that is local database writes on an already-open pool plus a small
+// JSON encode, NOT per-item forge round-trips, so it does not scale with issue
+// count. THIS IS AN ARGUED MARGIN, NOT A CONSTRUCTED GUARANTEE — no server-side
+// deadline can bound client-side transit, and (c) is bounded by inspection. See
+// handleCreateCampaign's requestStart comment (campaigns.go) for the full
+// residual accounting and why the handler is deliberately NOT wrapped in a
+// deadline.
+//
+// What IS guaranteed by CONSTRUCTION is the other half (operator condition
+// 1(a)): the ceiling this constant sits above cannot be exceeded, because
+// Server.issueSetResolutionBudget clamps to MaxIssueSetResolutionBudget however
+// the Config was built — not only in fishhawkd's startup refusal — so no
+// configured budget can rise above the number this constant is set over.
+const issueSetClientTimeout = 11 * time.Minute
+
 func newAPIClient(cfg config) *apiClient {
 	return &apiClient{
 		baseURL:  cfg.backendURL,
 		token:    cfg.apiToken,
 		http:     &http.Client{Timeout: 30 * time.Second},
 		httpLong: &http.Client{Timeout: refinementDraftClientTimeout},
+		// The issue-set client is its own instance rather than a reuse of
+		// httpLong: the two timeouts are pinned against DIFFERENT server-side
+		// budgets (refinementDraftBudget vs MaxIssueSetResolutionBudget), so
+		// sharing one would silently couple them.
+		httpIssueSet: &http.Client{Timeout: issueSetClientTimeout},
 	}
 }
 
@@ -2869,6 +2919,10 @@ type campaignGroomingSource struct {
 //   - 422 campaign_item_not_child (a requested items ref is not a child of the epic)
 //   - 501 issue_set_resolution_unsupported (no-epic variant on a provider that
 //     cannot resolve an arbitrary issue set)
+//   - 504 issue_set_resolution_timeout (the no-epic resolution exceeded the
+//     server's issue-set budget; details carry resolved / items_total /
+//     budget_seconds and, when one could be proven to fit, a
+//     suggested_grooming_order_limit)
 //   - 503 campaign_repo_unconfigured (no campaign repository wired on the deploy)
 //
 // items is the OPTIONAL subset filter (#2003) WITH epicRef (issue refs naming the
@@ -2885,7 +2939,10 @@ func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePoli
 		return nil, fmt.Errorf("marshal create campaign: %w", err)
 	}
 	var camp Campaign
-	if _, err := c.doWithStatus(ctx, http.MethodPost, "/v0/campaigns", body, nil, &camp); err != nil {
+	// Routed through the ISSUE-SET client, not the 30s short one: the no-epic
+	// branch resolves each named issue through the forge, so a full ratified
+	// order legitimately takes minutes. See issueSetClientTimeout.
+	if _, err := c.doWithStatusUsing(c.httpIssueSet, ctx, http.MethodPost, "/v0/campaigns", body, nil, &camp); err != nil {
 		return nil, err
 	}
 	return &camp, nil

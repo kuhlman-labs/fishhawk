@@ -3139,6 +3139,130 @@ func TestServeRejectsInvalidMCPRoute(t *testing.T) {
 	}
 }
 
+// TestValidateIssueSetResolutionBudget covers the pure startup gate's four
+// branches (E54.59 / #3113): unset/0 accepted (the read site substitutes
+// server.DefaultIssueSetResolutionBudget), an in-range value accepted, a
+// NEGATIVE value refused, and a value ABOVE server.MaxIssueSetResolutionBudget
+// refused NAMING BOTH numbers — the configured value and the permitted maximum
+// — because the operator cannot act on a refusal that names neither.
+func TestValidateIssueSetResolutionBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		in      time.Duration
+		wantErr bool
+		// mustName are substrings the refusal must carry.
+		mustName []string
+	}{
+		{name: "unset uses the default", in: 0},
+		{name: "in-range is accepted", in: 5 * time.Minute},
+		{name: "at the maximum is accepted", in: server.MaxIssueSetResolutionBudget},
+		{
+			name:     "negative is refused",
+			in:       -time.Second,
+			wantErr:  true,
+			mustName: []string{"-1s", server.DefaultIssueSetResolutionBudget.String()},
+		},
+		{
+			name:     "above the maximum is refused naming both numbers",
+			in:       server.MaxIssueSetResolutionBudget + time.Minute,
+			wantErr:  true,
+			mustName: []string{(server.MaxIssueSetResolutionBudget + time.Minute).String(), server.MaxIssueSetResolutionBudget.String()},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateIssueSetResolutionBudget(tc.in)
+			if tc.wantErr && err == nil {
+				t.Fatalf("validateIssueSetResolutionBudget(%s) = nil, want a refusal", tc.in)
+			}
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("validateIssueSetResolutionBudget(%s) = %v, want nil", tc.in, err)
+				}
+				return
+			}
+			for _, want := range tc.mustName {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal %q does not name %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
+// TestServe_IssueSetResolutionBudget pins the SAME decision THROUGH runServe, so
+// a refactor that drops the call site (leaving the pure helper green) still
+// fails, and so the in-range branch is proven to reach the wiring rather than
+// only the helper. The bootstrapAbortFlag carries an accepted value past the
+// guard to a deliberately-invalid --review-resolution, which is how "accepted"
+// is observable without booting a server.
+func TestServe_IssueSetResolutionBudget(t *testing.T) {
+	t.Run("above the maximum refuses boot naming both numbers", func(t *testing.T) {
+		over := server.MaxIssueSetResolutionBudget + time.Minute
+		code, log := serveWithProfile(t, "-issue-set-resolution-budget="+over.String())
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (an over-maximum budget must refuse to boot); log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, "invalid --issue-set-resolution-budget") {
+			t.Errorf("log does not carry the diagnosis:\n%s", log)
+		}
+		for _, want := range []string{over.String(), server.MaxIssueSetResolutionBudget.String()} {
+			if !strings.Contains(log, want) {
+				t.Errorf("refusal log does not name %q:\n%s", want, log)
+			}
+		}
+	})
+
+	t.Run("negative refuses boot", func(t *testing.T) {
+		code, log := serveWithProfile(t, "-issue-set-resolution-budget=-1s")
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (a negative budget must refuse to boot); log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, "invalid --issue-set-resolution-budget") {
+			t.Errorf("log does not carry the diagnosis:\n%s", log)
+		}
+	})
+
+	t.Run("in-range boots past the guard", func(t *testing.T) {
+		code, log := serveWithProfile(t, "-issue-set-resolution-budget=90s", bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (startup aborts at the invalid --review-resolution, AFTER the budget guard); log:\n%s", code, exitFailure, log)
+		}
+		if strings.Contains(log, "invalid --issue-set-resolution-budget") {
+			t.Errorf("an in-range budget was rejected at boot:\n%s", log)
+		}
+		if !strings.Contains(log, "review-resolution") {
+			t.Errorf("startup did not reach the later --review-resolution guard, so the budget guard was not passed:\n%s", log)
+		}
+	})
+
+	// The three subtests above prove the GUARD is reached; none of them proves
+	// the accepted value is WIRED, because that needs a booted server. A source
+	// pin closes the gap the same way the other serve.go wiring pins do: the
+	// server.Config literal must carry the flag, so an edit that validates the
+	// budget and then forgets to hand it to the server fails here rather than
+	// shipping a flag that does nothing.
+	t.Run("the accepted value is wired into server.Config", func(t *testing.T) {
+		src, err := os.ReadFile("serve.go")
+		if err != nil {
+			t.Fatalf("read serve.go: %v", err)
+		}
+		if !strings.Contains(string(src), "IssueSetResolutionBudget: *issueSetResolutionBudget") {
+			t.Error("serve.go's server.Config literal does not carry IssueSetResolutionBudget: *issueSetResolutionBudget — the flag would be validated and then discarded")
+		}
+	})
+
+	t.Run("unset boots past the guard", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET", "")
+		code, log := serveWithProfile(t, bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+		}
+		if strings.Contains(log, "invalid --issue-set-resolution-budget") {
+			t.Errorf("an unset budget was rejected at boot:\n%s", log)
+		}
+	})
+}
+
 // TestServe_DispatchWatchdogWithoutLivenessRefusesToBoot pins the #2744
 // CONDITION 3 fail-closed startup refusal THROUGH runServe: enabling the
 // dispatch watchdog on a RunRepo that cannot supply the dispatch-liveness signal
