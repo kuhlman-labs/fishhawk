@@ -3102,13 +3102,56 @@ func TestResolveDependenciesByteIdenticalUnderJitter(t *testing.T) {
 	}
 }
 
+// epicJitterGolden is the BY-HAND serial expectation for the
+// epicJitterFixture, mirroring jitterGolden's role for the ResolveDependencies
+// path. It is derived from documented EpicChildren semantics, NOT captured from
+// current output (which would reintroduce the vacuity this pins closes):
+//
+//   - Children are the three sub-issues sorted ascending by Number (10, 11, 12).
+//     None carries a CLOSED+COMPLETED state, so Complete is false for all three;
+//     each carries the SubIssue's Body verbatim and no URL/Autonomy.
+//   - 12's `Depends on: #11` resolves to a fellow child (isChild[11]), so it is
+//     an in-set Edge 12->11.
+//   - 11's `Depends on: #900` targets a CLOSED+COMPLETED out-of-set issue, so it
+//     is a SatisfiedEdge carrying the target's (state, state_reason).
+//   - 10's `Depends on: #901` targets an OPEN out-of-set issue, so it is a
+//     DroppedEdge with DropNotChild and no ToRef/ToRefDigest (a numeric ref).
+func epicJitterGolden() *workmgmt.EpicChildrenResult {
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 10, Title: "ten", Body: "Depends on: #901\n"},
+			{Number: 11, Title: "eleven", Body: "Depends on: #900\n"},
+			{Number: 12, Title: "twelve", Body: "Depends on: #11\n"},
+		},
+		Edges: []workmgmt.DependsEdge{{From: 12, To: 11}},
+		DroppedEdges: []workmgmt.DependsEdge{
+			{From: 10, To: 901, Reason: workmgmt.DropNotChild},
+		},
+		SatisfiedEdges: []workmgmt.SatisfiedEdge{
+			{From: 11, To: 900, State: "closed", StateReason: "completed"},
+		},
+	}
+}
+
 // TestEpicChildrenByteIdenticalUnderJitter proves the EPIC path's output is
 // unchanged by #3113: EpicChildren still resolves serially through
 // classifyOutOfSetTarget (now delegating to the extracted pure
 // classifyFetchedTarget), so 50 repetitions under the same jittering fake are
-// byte-identical. This is the guard on the "EpicChildren's output stays
-// byte-identical" constraint — a future attempt to share the concurrent pool
-// with the epic path would have to keep it green.
+// byte-identical — AND byte-identical to a hand-written serial golden, so the
+// test pins CONTENT (children, edges, dropped edges, satisfied edges,
+// classification), not merely self-consistent DETERMINISM. A deterministic
+// regression in any of those — the earlier weak substring check let one through
+// — reddens against the golden. This is the guard on the "EpicChildren's output
+// stays byte-identical" constraint; a future attempt to share the concurrent
+// pool with the epic path would have to keep it green.
+//
+// COUNTERFACTUAL (operator condition, #3113 fix-up): mutating
+// provider.go classifyFetchedTarget's closed+completed case from
+// `targetState{satisfied: true, ...}` to `targetState{reason:
+// workmgmt.DropNotChild, ...}` reclassifies edge 11->900 from a SatisfiedEdge
+// to a DroppedEdge, and this test goes RED against the golden ("rep 0 differs
+// from serial golden") — verified by executing the mutation (confirmed landed
+// by re-reading the line) and restoring it byte-identically to green.
 func TestEpicChildrenByteIdenticalUnderJitter(t *testing.T) {
 	newFake := func() *fakeAPI {
 		return &fakeAPI{
@@ -3123,6 +3166,10 @@ func TestEpicChildrenByteIdenticalUnderJitter(t *testing.T) {
 				901: {Number: 901, State: "open"},
 			},
 		}
+	}
+	want, err := json.Marshal(epicJitterGolden())
+	if err != nil {
+		t.Fatalf("marshal golden: %v", err)
 	}
 	var first []byte
 	for i := 0; i < 50; i++ {
@@ -3139,14 +3186,13 @@ func TestEpicChildrenByteIdenticalUnderJitter(t *testing.T) {
 		}
 		if i == 0 {
 			first = got
-			continue
+			if string(got) != string(want) {
+				t.Fatalf("rep 0 differs from serial golden:\n got %s\nwant %s", got, want)
+			}
 		}
 		if string(got) != string(first) {
 			t.Fatalf("rep %d differs from rep 0:\n got %s\nwant %s", i, got, first)
 		}
-	}
-	if !strings.Contains(string(first), `"Number":10`) {
-		t.Fatalf("epic fixture did not resolve children: %s", first)
 	}
 }
 

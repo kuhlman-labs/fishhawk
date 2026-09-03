@@ -1368,8 +1368,12 @@ func TestCreateCampaign_NoEpic_ResolutionTimeout_NoSuggestion(t *testing.T) {
 }
 
 // TestCreateCampaign_NoEpic_BudgetAnchoredAtRequestStart pins operator condition
-// 1(b): the budget must measure the SAME SPAN the caller's client timeout
-// measures, so it is anchored at handler entry rather than at the resolver call.
+// 1(b): the budget is anchored at HANDLER ENTRY rather than at the resolver
+// call, so the unbounded per-item pre-resolution work is folded INTO the
+// server-bounded span instead of sitting outside it. (This is not a literal
+// "same span" as the caller's client timeout — the residual accounting is in
+// handleCreateCampaign's requestStart comment — but the anchor is what keeps the
+// unbounded work inside the budget, and that is what this test discriminates.)
 //
 // The discrimination is strict-`<=` against a timestamp taken BEFORE the
 // request: with the deadline anchored at the resolver call, everything the

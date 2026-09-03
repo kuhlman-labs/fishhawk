@@ -64,27 +64,32 @@ const refinementDraftClientTimeout = 22 * time.Minute
 // Summary diagnosed a SERVER-side 30s deadline on this path; that diagnosis
 // was wrong — the server had no deadline here at all.)
 //
-// WHY THE MARGIN IS SOUND (operator condition 1(b)). The condition permitted
-// two resolutions: bound the pre-resolution work and size the margin against
-// that bound, or measure the two over the SAME SPAN. This takes the second,
-// jointly with the server side: handleCreateCampaign anchors the resolution
-// deadline at HANDLER ENTRY (requestStart), not at the resolver call, so the
-// span the server bounds is the span this client measures. The one minute of
-// headroom therefore does not have to absorb unbounded auth / decode /
-// grooming-order / installation work — that work is INSIDE the server's own
-// budget — and covers only network transit, the middleware chain that runs
-// AHEAD of the handler (request-id, bearer authentication — verified by
-// inspection: requireWriteScope reads an Identity the auth middleware already
-// resolved, so the token lookup is outside requestStart's span), and the
-// response write. That residual is bounded by a database lookup plus transit,
-// not by per-item forge round-trips, which is the unbounded work the condition
-// was about.
+// WHY THE MARGIN IS SOUND (operator condition 1(b), corrected in the #3113
+// fix-up to the HONEST framing). handleCreateCampaign anchors the server
+// resolution deadline at HANDLER ENTRY (requestStart), which folds the
+// unbounded per-item forge work — the dimension #3113 is about — into the
+// server-bounded span. But the server budget bounds ONLY [handler entry ..
+// resolver return], while this client's 11-minute wall measures from before
+// network transit to after the full response is read. So it is NOT literally
+// "the same span": three pieces of the client's measurement sit OUTSIDE the
+// server budget — (a) network transit both directions, (b) the middleware
+// chain ahead of the handler (request-id, bearer auth), and (c) all
+// post-resolution handler work (campaign + item persistence, the idempotency
+// record, response encode + write). The one-minute margin (this constant −
+// MaxIssueSetResolutionBudget) must absorb (a)+(b)+(c). It is adequate for (c)
+// because that is local database writes on an already-open pool plus a small
+// JSON encode, NOT per-item forge round-trips, so it does not scale with issue
+// count. THIS IS AN ARGUED MARGIN, NOT A CONSTRUCTED GUARANTEE — no server-side
+// deadline can bound client-side transit, and (c) is bounded by inspection. See
+// handleCreateCampaign's requestStart comment (campaigns.go) for the full
+// residual accounting and why the handler is deliberately NOT wrapped in a
+// deadline.
 //
-// The relationship is guaranteed by CONSTRUCTION on both ends: the ceiling is
-// enforced where the value is CONSUMED (Server.issueSetResolutionBudget
-// clamps to MaxIssueSetResolutionBudget however the Config was built), not
-// only in fishhawkd's startup refusal, so no configured budget can exceed the
-// number this constant sits above.
+// What IS guaranteed by CONSTRUCTION is the other half (operator condition
+// 1(a)): the ceiling this constant sits above cannot be exceeded, because
+// Server.issueSetResolutionBudget clamps to MaxIssueSetResolutionBudget however
+// the Config was built — not only in fishhawkd's startup refusal — so no
+// configured budget can rise above the number this constant is set over.
 const issueSetClientTimeout = 11 * time.Minute
 
 func newAPIClient(cfg config) *apiClient {

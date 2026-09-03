@@ -483,13 +483,37 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// auth, body decode, provider resolution, grooming-order resolution,
 	// installation lookup — outside the measured span and unbounded. The
 	// client could then still abort first, which is exactly this issue's
-	// defect. Of the operator's two permitted resolutions ("bound the
-	// pre-resolution work and size the margin against that bound" or "measure
-	// the two over the same span") this takes the SECOND: the deadline is
-	// requestStart+budget, so the same span the client measures is the span
-	// the server bounds. The residual difference is network transit plus the
-	// middleware chain ahead of this handler, which is not the unbounded
-	// pre-resolution work the condition named.
+	// defect. Anchoring at handler entry folds that pre-resolution work into
+	// the bounded span, which is where the unbounded per-item forge cost the
+	// budget exists for actually lives.
+	//
+	// WHAT STILL SITS OUTSIDE THE SERVER-BOUNDED SPAN (and is therefore NOT a
+	// "same span" guarantee — the honest framing after the #3113 fix-up). The
+	// resolveCtx below is cancelled the instant ResolveDependencies returns, so
+	// the server bounds ONLY [handler entry .. resolver return]. The client's
+	// 11-minute wall, by contrast, measures from before network transit to
+	// after the full response is read. Three pieces of the client's span are
+	// therefore OUTSIDE the server's budget:
+	//   (a) network transit in both directions;
+	//   (b) the middleware chain ahead of this handler (request-id, bearer
+	//       authentication — requireWriteScope reads an Identity the auth
+	//       middleware already resolved, so the token lookup runs before
+	//       requestStart);
+	//   (c) all POST-resolution handler work — campaign row + item row
+	//       persistence, the idempotency record, and response encoding + write.
+	// The one-minute margin (issueSetClientTimeout 11m − MaxIssueSetResolution-
+	// Budget 10m) must absorb (a)+(b)+(c). It is adequate for (c) because that
+	// work is local database writes on an already-open pool plus a small JSON
+	// encode, NOT per-item forge round-trips — it does not scale with issue
+	// count, the dimension #3113 is about. THIS IS AN ARGUED MARGIN, NOT A
+	// CONSTRUCTED GUARANTEE: no server-side deadline can bound client-side
+	// transit, and (c) is bounded by inspection rather than by a deadline.
+	//
+	// DO NOT "FIX" THIS BY WRAPPING THE WHOLE HANDLER IN A DEADLINE. Aborting
+	// after a resolution that already SUCCEEDED would throw away up to ten
+	// minutes of completed forge reads only to report a timeout for work that
+	// finished — strictly worse than letting the persistence + write run to
+	// completion. The deadline belongs on the resolver, which is where it is.
 	requestStart := time.Now()
 	if !s.requireWriteScope(w, r, "write:campaigns") {
 		return
