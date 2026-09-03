@@ -253,7 +253,9 @@ type reconcileMergeResponse struct {
 //  2. 503 reconcile_merge_unconfigured — the run/audit repositories are unwired;
 //  3. 404 run_not_found;
 //  4. 409 reconcile_merge_pr_not_merged — the run's PR is not OBSERVABLY merged
-//     (no pr_merged / post_merge_observed entry on its chain). This is the guard
+//     (no pr_merged / post_merge_observed / merge_observation_recorded entry on
+//     its chain — the third is the row POST /v0/runs/{run_id}/record-merge-observation
+//     appends after a live merged=true forge read, E64.32 / #3136). This is the guard
 //     that stops the verb manufacturing a `succeeded` run for an unmerged
 //     change: without it, an operator could settle a run whose work never
 //     shipped. A chain-read failure is a 500, never a write — fail closed;
@@ -528,12 +530,24 @@ func (s *Server) runHasSupersededStage(ctx context.Context, runID uuid.UUID) boo
 }
 
 // runPRObservablyMerged reports whether the run's chain carries a merge
-// observation — a pr_merged or post_merge_observed entry. It is the
-// evidence the reconcile verb and the completion_blocked recovery
-// discrimination both key on, so the two can never disagree about whether a
-// reconcile applies.
+// observation — a pr_merged, post_merge_observed or merge_observation_recorded
+// entry. It is the evidence the reconcile verb and the completion_blocked
+// recovery discrimination both key on, so the two can never disagree about
+// whether a reconcile applies.
+//
+// merge_observation_recorded (E64.32 / #3136) is the THIRD category, and adding
+// it is NOT a loosening of the #3083 gate. Evidence is still REQUIRED, it is
+// still read from the run's OWN chain, and this settling path still NEVER
+// re-observes the forge itself. The new category is a durable,
+// operator-attributed, distinctly-labelled record of a forge read that a
+// DIFFERENT verb (POST /v0/runs/{run_id}/record-merge-observation) performed
+// and audited, and that verb writes it only on a live merged=true answer
+// carrying a merge commit SHA and a merge timestamp. What changes is that the
+// previously UNREACHABLE shape — a run whose merge genuinely happened and was
+// never recorded — now has a way onto the chain; what does not change is that
+// an unmerged run can never acquire one.
 func (s *Server) runPRObservablyMerged(ctx context.Context, runID uuid.UUID) (bool, error) {
-	for _, category := range []string{CategoryPRMerged, CategoryPostMergeObserved} {
+	for _, category := range []string{CategoryPRMerged, CategoryPostMergeObserved, CategoryMergeObservationRecorded} {
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, category)
 		if err != nil {
 			return false, err

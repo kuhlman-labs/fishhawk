@@ -56,6 +56,19 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
+// PullRequestStateReader reads a pull request's live state back off the forge.
+// It is the injectable seam behind the merge-observation recovery verb
+// (E64.32 / #3136): the ONE method the endpoint needs, so a test can drive the
+// merged / not-merged / no-SHA / no-timestamp / forge-error branches without a
+// live forge.
+//
+// The signature deliberately mirrors mergereconciler.PRGetter, so
+// *githubclient.Client already satisfies it and the production wiring is a
+// fallback to cfg.GitHub rather than a new construction site.
+type PullRequestStateReader interface {
+	GetPullRequest(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int) (*forge.PullRequest, error)
+}
+
 // Config holds the values needed to construct a Server. Zero-valued
 // fields fall back to safe defaults.
 type Config struct {
@@ -368,6 +381,19 @@ type Config struct {
 	// auto-drive handler passes it straight to AutoDriveRunGate, whose
 	// merge arm already returns observe-only when the merger is nil.
 	GateMerger GitHubMerger
+
+	// PRStateReader is the forge pull-request read seam the merge-observation
+	// recovery verb (POST /v0/runs/{run_id}/record-merge-observation, E64.32 /
+	// #3136) reads the live merge state through. It is the ONLY new way onto a
+	// run's evidence chain, so it is the seam a test must be able to drive
+	// without a live forge.
+	//
+	// nil in production: the handler falls back to cfg.GitHub, which satisfies
+	// this interface (the signature mirrors mergereconciler.PRGetter). When
+	// BOTH are nil the endpoint returns 503 rather than degrading — a verb that
+	// records forge evidence must never record evidence it did not read. Same
+	// nil-means-test-seam posture as the sibling seams in this file.
+	PRStateReader PullRequestStateReader
 
 	// AuthRepo persists users + sessions for the OAuth
 	// sign-in flow (E4.2). Wired by the /v0/auth/* handlers; nil

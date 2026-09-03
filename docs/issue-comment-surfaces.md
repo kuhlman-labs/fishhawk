@@ -479,6 +479,31 @@ Notes:
   stage succeeded, so a refused sweep leaves a MISSING row rather than a false
   one; the reconcile endpoint's `repair` reason is what closes that window from
   the other side.
+- The merge-observation audit kind — `merge_observation_recorded` (E64.32 /
+  #3136), written by the operator recovery verb
+  (`server/merge_observation.go::handleRecordMergeObservation`, POST
+  `/v0/runs/{run_id}/record-merge-observation`) once per invocation that read
+  the run's pull request off the FORGE and found it merged — is an **internal,
+  fact-record audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it to the issue thread, and it has no Notifier method;
+  the merge itself is already announced through the existing `pr_merged` /
+  `post_merge_observed` path and the run's sticky status comment. Payload:
+  `{run_id, pull_request_url, pull_request_number, merge_commit_sha, merged_at,
+  observed_at, reconciled_after_the_fact}`, appended with `actor_kind` **user**
+  (or `agent` for an operator-role subject) — an operator-invoked observation,
+  never a system one, which is a second signal alongside the category that the
+  fact was learned by hand rather than seen live.
+
+  It is the OBSERVE half of the #3083 recovery pair and is DELIBERATELY DISTINCT
+  from `pr_merged` rather than a synthetic `pr_merged` row: `pr_merged` carries
+  a live-observation timestamp that the latency and cost surfaces already read
+  as "when Fishhawk knew", so back-dating one would corrupt those series and lie
+  about how the merge was learned. Recording `merged_at` (when the merge
+  happened, from the forge) alongside `observed_at` (when Fishhawk learned it)
+  lets a reader see the gap with nothing back-dated. `reconcile-merge` reads it
+  as a third qualifying evidence category alongside `pr_merged` /
+  `post_merge_observed`; the settling verb still reads only the chain and never
+  re-observes the forge.
 - The plan-gate scope pre-check audit kind — `plan_scope_precheck` (#658),
   written by the plan upload handler (`server/scope_precheck.go::runScopePrecheck`)
   immediately after `plan_generated` and before plan review — is an **internal,

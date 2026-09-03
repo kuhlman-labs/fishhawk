@@ -442,3 +442,16 @@ func TestKnownCategories_StageSupersededByMerge(t *testing.T) {
 		t.Fatal("stage_superseded_by_merge is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_MergeObservationRecorded pins the E64.32 / #3136
+// category: the observe half of the #3083 recovery pair
+// (backend/internal/server/merge_observation.go) writes one entry per
+// operator-invoked merge observation that the forge confirmed. An unregistered
+// category is un-awaitable — an operator could not arm fishhawk_await_audit on
+// the row that unblocks reconcile-merge — and categories_completeness_test.go's
+// AST sweep would fail the build on the emit site.
+func TestKnownCategories_MergeObservationRecorded(t *testing.T) {
+	if !IsKnownCategory("merge_observation_recorded") {
+		t.Fatal("merge_observation_recorded is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

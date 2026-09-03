@@ -1118,3 +1118,71 @@ func TestRepairMissingSupersedeRows_ReListFailureRepairsNothing(t *testing.T) {
 		t.Errorf("rows = %d, want 0", len(rows))
 	}
 }
+
+// observeMergeVia appends merge evidence under the given category, so a test
+// can seed EXACTLY one of the three qualifying categories and nothing else.
+func (f *supersedeFixture) observeMergeVia(t *testing.T, category string) {
+	t.Helper()
+	if _, err := f.audit.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     f.runID,
+		Timestamp: time.Now().UTC(),
+		Category:  category,
+		Payload:   json.RawMessage(`{"merged":true}`),
+	}); err != nil {
+		t.Fatalf("append %s: %v", category, err)
+	}
+}
+
+// TestReconcileMergeAcceptsMergeObservationRecorded is the E64.32 / #3136
+// evidence-widening half: a run whose chain carries ONLY a
+// merge_observation_recorded entry — no pr_merged, no post_merge_observed — is
+// ACCEPTED by reconcile-merge, where before this change it drew a 409
+// reconcile_merge_pr_not_merged and the run was unreconcilable forever.
+//
+// This is the whole point of the observe/settle split: the settling verb still
+// reads only the chain, and the new category is simply a third way a TRUE merge
+// can be on it.
+func TestReconcileMergeAcceptsMergeObservationRecorded(t *testing.T) {
+	f := newSupersedeFixture(t, parkedShape())
+	f.observeMergeVia(t, CategoryMergeObservationRecorded)
+
+	w := f.postReconcile(t)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a merge_observation_recorded row IS merge evidence):\n%s",
+			w.Code, w.Body.String())
+	}
+	if got := f.stageState(t, f.stages[run.StageTypeReview].ID); got != run.StageStateSuperseded {
+		t.Errorf("review stage = %q, want superseded", got)
+	}
+}
+
+// TestReconcileMergeStillRefusesWithNoEvidence is the COUNTERFACTUAL ANCHOR for
+// the widening above: a run whose chain carries NONE of the three qualifying
+// categories is still refused with reconcile_merge_pr_not_merged, and no stage
+// moves. If the widening were ever mistakenly written as an unconditional
+// `return true, nil` — the failure mode that turns "we added a category" into
+// "we removed the gate" — this test goes RED while the acceptance test above
+// stays green.
+func TestReconcileMergeStillRefusesWithNoEvidence(t *testing.T) {
+	f := newSupersedeFixture(t, parkedShape())
+	// Deliberately NO evidence appended, of any category.
+
+	w := f.postReconcile(t)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (no merge evidence of ANY category):\n%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if body.Error.Code != "reconcile_merge_pr_not_merged" {
+		t.Errorf("error code = %q, want reconcile_merge_pr_not_merged", body.Error.Code)
+	}
+	if got := f.stageState(t, f.stages[run.StageTypeReview].ID); got != run.StageStateAwaitingApproval {
+		t.Errorf("review stage = %q, want untouched awaiting_approval: an unevidenced reconcile must move nothing", got)
+	}
+}

@@ -15975,9 +15975,12 @@ paths:
         '409':
           description: |
             `reconcile_merge_pr_not_merged` — the run's pull request is not
-            OBSERVABLY merged (no `pr_merged` / `post_merge_observed` entry on
-            its audit chain). Without this precondition the verb could
-            manufacture a `succeeded` run for a change that never shipped.
+            OBSERVABLY merged (no `pr_merged` / `post_merge_observed` /
+            `merge_observation_recorded` entry on its audit chain; the third is
+            the row POST `/v0/runs/{run_id}/record-merge-observation` appends
+            after a live `merged=true` forge read, #3136). Without this
+            precondition the verb could manufacture a `succeeded` run for a
+            change that never shipped.
 
             `reconcile_merge_not_applicable` — the run holds no
             pair-table-admissible parked stage and no already-superseded stage
@@ -15999,6 +16002,190 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: '`reconcile_merge_unconfigured` — run/audit repositories not wired.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/record-merge-observation:
+    post:
+      operationId: recordMergeObservation
+      summary: Read the run's pull request off the forge and record a merge observation (operator)
+      description: |
+        The OBSERVE half of the #3083 recovery pair (E64.32 / #3136). Reads the
+        run's pull request from the forge and — ONLY when the forge answers
+        merged — appends one chained `merge_observation_recorded` audit entry
+        carrying the real merge commit SHA, the forge's merge timestamp, and the
+        fact that this observation was reconciled AFTER the fact rather than
+        seen live.
+
+        Why it exists: `reconcile-merge`'s evidence gate reads the run's audit
+        CHAIN and never the forge, so a run whose PR genuinely merged but whose
+        merge was never recorded (a webhook that never arrived, an observation
+        lost when the backend restarted mid-write) is unreconcilable — the
+        evidence it needs can never appear. This verb is the ONLY new way onto
+        that chain, and it requires a live `merged=true` answer to use it.
+
+        The split is load-bearing: this verb OBSERVES and records a fact, and
+        settles nothing — it transitions no stage and completes no run.
+        `reconcile-merge` SETTLES and still reads only the chain. So the
+        fail-closed posture stays exactly as it was; what changes is that a
+        previously unreachable-but-true shape now has a recorded path.
+
+        The category is DELIBERATELY DISTINCT from `pr_merged` rather than a
+        synthetic `pr_merged` row. `pr_merged` carries a LIVE-observation
+        timestamp that the latency and cost surfaces already read as "when
+        Fishhawk knew", so back-dating one would corrupt those series and lie
+        about how the merge was learned. Recording `merged_at` (when the merge
+        happened) alongside `observed_at` (when Fishhawk learned it) lets a
+        reader see the gap without anything being back-dated.
+
+        IDEMPOTENCE — the honest claim. The guard is a READ-THEN-APPEND and is
+        NOT atomic. A SEQUENTIAL repeat POST appends nothing and returns 200
+        with `already_recorded: true` and an empty `observation`. Two CONCURRENT
+        posts can each append; that duplicate is POSSIBLE and HARMLESS, because
+        the evidence gate asks only whether AT LEAST ONE qualifying row exists —
+        a second row is inert and changes no decision.
+
+        GitLab: the GitLab adapter does not populate the merge commit SHA or
+        merge timestamp yet, so a GitLab run draws the named
+        `record_merge_observation_no_merge_commit` refusal rather than an
+        observation recorded with empty evidence.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            The observation this call recorded. `already_recorded: true` means
+            the chain ALREADY carried qualifying merge evidence
+            (`pr_merged` / `post_merge_observed` / `merge_observation_recorded`)
+            and this call appended NOTHING — `observation` is then empty,
+            because a no-op must not claim a fact it did not write.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, already_recorded, observation]
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  already_recorded:
+                    type: boolean
+                    description: |
+                      True when qualifying merge evidence was already on the
+                      chain and nothing was appended.
+                  observation:
+                    type: object
+                    description: |
+                      The recorded fact. All fields are zero-valued when
+                      `already_recorded` is true.
+                    required: [pull_request_url, pull_request_number, merge_commit_sha, merged_at, observed_at]
+                    properties:
+                      pull_request_url:
+                        type: string
+                        description: The run's recorded pull request URL.
+                      pull_request_number:
+                        type: integer
+                        description: The pull request number resolved from that URL.
+                      merge_commit_sha:
+                        type: string
+                        description: The forge's merge commit SHA.
+                      merged_at:
+                        type: string
+                        description: |
+                          The FORGE's merge timestamp (RFC 3339) — WHEN THE
+                          MERGE HAPPENED. Never a Fishhawk-side clock read.
+                      observed_at:
+                        type: string
+                        description: |
+                          When Fishhawk read the forge (RFC 3339) — WHEN
+                          FISHHAWK LEARNED IT.
+        '400':
+          description: |
+            `validation_failed` — malformed run_id.
+
+            `record_merge_observation_malformed_pr_url` — the run's recorded
+            pull request URL does not resolve to a repository and pull request
+            number, so there is nothing to read from the forge.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: No authenticated token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Caller is not permitted to write to this run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — unknown run id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `record_merge_observation_no_pull_request` — the run carries no pull
+            request URL, so it never reached a PR and there is no merge to
+            observe.
+
+            `record_merge_observation_pr_not_merged` — the forge reports the
+            pull request is NOT merged. This is the guard that stops the verb
+            manufacturing evidence for a change that never shipped.
+
+            `record_merge_observation_no_merge_commit` — the forge reports the
+            pull request merged but carries no merge commit SHA. Refused rather
+            than recording an observation with no commit. This is also the
+            truthful refusal a GitLab run draws today.
+
+            `record_merge_observation_no_merge_timestamp` — the forge reports
+            the pull request merged with a SHA but no merge timestamp. Refused
+            rather than recording a partial fact that would claim a merge time
+            it does not carry.
+
+            `record_merge_observation_pr_url_repo_mismatch` — the run's
+            recorded pull request URL resolves, but it does not name THIS run's
+            repository on THIS run's forge. The forge read is scoped by the
+            run's `repo` while the pull request NUMBER comes from that URL, and
+            the appended row records the URL as the pull request observed
+            merged; without this refusal the verb would confirm a different
+            repository's pull request and then write trusted evidence naming
+            this run's URL. Refused BEFORE the forge read, so a mismatch costs
+            no forge request. Owner/name are compared case-insensitively (a
+            case-differing spelling is the same repository) and the host is not
+            compared (the run row records none), but a run whose credential ref
+            names a non-GitHub forge cannot own a GitHub-style `/pull/` URL and
+            is refused here too.
+
+            Every refusal is evaluated BEFORE any write: no audit row is
+            appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — a run read, the chain read, or the audit append
+            failed. The chain read in particular fails CLOSED as a 500 rather
+            than proceeding: a verb whose job is deciding whether evidence is
+            MISSING must never treat "unknown" as "absent" and write on top of
+            it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            `record_merge_observation_forge_unavailable` — the pull request
+            could not be read from the forge, so the merge state is unknown and
+            nothing was recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `record_merge_observation_unconfigured` — the run/audit repositories
+            or the forge pull-request reader are not wired. A verb that records
+            forge evidence never records evidence it could not read.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

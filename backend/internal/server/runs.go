@@ -1792,9 +1792,12 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 //
 // Recovery is `reconcile-merge` ONLY when BOTH hold: the blocker's (type, state)
 // is a row of the DEFAULT-DENY run.MergeSupersedable pair table, AND the run's
-// PR is observably merged (the same pr_merged / post_merge_observed evidence
-// handleReconcileMerge's own precondition reads, so the surface and the verb can
-// never disagree). Every other blocker — `running`, `dispatched`,
+// PR is observably merged (the same pr_merged / post_merge_observed /
+// merge_observation_recorded evidence handleReconcileMerge's own precondition
+// reads — both call runPRObservablyMerged, so the surface and the verb can never
+// disagree; the third category, E64.32 / #3136, is why this surface flips from
+// `none` to `reconcile-merge` once an operator records a merge observation, with
+// no change here). Every other blocker — `running`, `dispatched`,
 // `awaiting_children`, the deploy park states, `awaiting_scope_decision`, and an
 // admissible park on a run whose PR has NOT merged — reads `none` with a Reason
 // naming the state, because pointing an operator at a verb guaranteed to refuse
