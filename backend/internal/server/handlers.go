@@ -146,6 +146,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// a destructive one: it refuses unless the run's PR is observably merged,
 	// and the default-deny pair table bounds what it can terminalize.
 	mux.HandleFunc("POST /v0/runs/{run_id}/reconcile-merge", s.requireRunAccount(memberWrite, s.handleReconcileMerge))
+	// Merge-OBSERVATION recovery (E64.32 / #3136): read the run's PR off the
+	// forge and, only on a live merged=true answer, append the evidence row
+	// reconcile-merge's chain-only gate needs. Same memberWrite posture as
+	// reconcile-merge deliberately — the two are the observe/settle pair and
+	// must not diverge in who may call them.
+	mux.HandleFunc("POST /v0/runs/{run_id}/record-merge-observation", s.requireRunAccount(memberWrite, s.handleRecordMergeObservation))
 	mux.HandleFunc("GET /v0/stages/{stage_id}", s.requireStageAccount(readAccess, s.handleGetStage))
 	mux.HandleFunc("GET /v0/stages/{stage_id}/artifacts", s.requireStageAccount(readAccess, s.handleListStageArtifacts))
 	mux.HandleFunc("GET /v0/stages/{stage_id}/prompt", s.requireStageAccount(readAccess, s.handleGetStagePrompt))

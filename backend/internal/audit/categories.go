@@ -82,6 +82,22 @@ import "sort"
 // operator_reconcile | repair). It is APPENDED ONLY AFTER the compare-and-swap
 // that moved the stage actually succeeded, so a refused sweep leaves a MISSING
 // row rather than a false record of a supersession that never happened.
+// E64.32 / #3136 added merge_observation_recorded, the OBSERVE half of the
+// #3083 recovery pair: one chained entry per operator-invoked
+// POST /v0/runs/{run_id}/record-merge-observation that read the run's pull
+// request from the forge and found it merged. It carries the forge's merge
+// commit SHA, the forge's merged_at (WHEN the merge happened), observed_at
+// (when Fishhawk learned it) and reconciled_after_the_fact:true.
+//
+// It is DELIBERATELY DISTINCT from pr_merged rather than a synthetic pr_merged
+// row. pr_merged carries a LIVE-observation timestamp that the latency and cost
+// surfaces already read as "when Fishhawk knew", so back-dating one to the
+// forge's merge time would corrupt those series and lie about how the merge was
+// learned. Recording both timestamps under a separate category lets a reader
+// see the gap without back-dating anything.
+//
+// Internal fact-record kind projected through the audit chain — NOT a new
+// issue-comment surface (docs/issue-comment-surfaces.md).
 // E55.1 / #2242 added the two document-injection markers written by
 // backend/internal/repodoc: document_injected (one per repo-authored document
 // injected into an agent prompt, naming the resolved path, the PINNED commit,
@@ -229,6 +245,7 @@ var KnownCategories = map[string]struct{}{
 	"issue_commented":                         {},
 	"lineage_violation":                       {},
 	"mcp_token_issued":                        {},
+	"merge_observation_recorded":              {},
 	"merge_verdict_recorded":                  {},
 	"model_resolved":                          {},
 	"operator_commit_vouched":                 {},

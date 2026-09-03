@@ -2538,6 +2538,54 @@ func TestGetPullRequest_DecodesMergeable(t *testing.T) {
 	})
 }
 
+// TestGetPullRequest_DecodesMergeEvidence pins the E64.32 / #3136 merge-evidence
+// decode: GetPullRequest must surface `merged_at` (a *time.Time, so an unmerged
+// PR's JSON null stays distinguishable from the zero time) and
+// `merge_commit_sha`. These two fields are the whole payload of the
+// record-merge-observation verb, so a decode that silently DROPS one passes
+// every presence gate and writes an observation carrying no evidence — which is
+// exactly what this test refuses.
+func TestGetPullRequest_DecodesMergeEvidence(t *testing.T) {
+	t.Run("merged: merged_at and merge_commit_sha land on the PR", func(t *testing.T) {
+		fg, srv := newFakeGitHub(t)
+		fg.getPullRequestBody = `{"node_id":"PR_x","state":"closed","merged":true,` +
+			`"merged_at":"2026-08-30T12:34:56Z","merge_commit_sha":"cafebabe1234",` +
+			`"head":{"sha":"abc"},"base":{"ref":"main"}}`
+		c, _ := newTestClient(t, srv, nil)
+		pr, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 7)
+		if err != nil {
+			t.Fatalf("GetPullRequest: %v", err)
+		}
+		if pr.MergeCommitSHA != "cafebabe1234" {
+			t.Errorf("MergeCommitSHA = %q, want cafebabe1234", pr.MergeCommitSHA)
+		}
+		if pr.MergedAt == nil {
+			t.Fatalf("MergedAt = nil, want the forge's decoded merge timestamp")
+		}
+		want := time.Date(2026, 8, 30, 12, 34, 56, 0, time.UTC)
+		if !pr.MergedAt.Equal(want) {
+			t.Errorf("MergedAt = %v, want %v", pr.MergedAt.UTC(), want)
+		}
+	})
+	t.Run("unmerged: merged_at null stays nil, not the zero time", func(t *testing.T) {
+		fg, srv := newFakeGitHub(t)
+		fg.getPullRequestBody = `{"node_id":"PR_x","state":"open","merged":false,` +
+			`"merged_at":null,"merge_commit_sha":null,` +
+			`"head":{"sha":"abc"},"base":{"ref":"main"}}`
+		c, _ := newTestClient(t, srv, nil)
+		pr, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 7)
+		if err != nil {
+			t.Fatalf("GetPullRequest: %v", err)
+		}
+		if pr.MergedAt != nil {
+			t.Errorf("MergedAt = %v, want nil (a null merged_at must not decode to the zero time)", pr.MergedAt.UTC())
+		}
+		if pr.MergeCommitSHA != "" {
+			t.Errorf("MergeCommitSHA = %q, want empty on an unmerged PR", pr.MergeCommitSHA)
+		}
+	})
+}
+
 func TestListOpenPullRequestsByHead_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.listPullsBody = `[{"number":99,"node_id":"PR_kw99","state":"open","html_url":"https://github.com/x/y/pull/99","head":{"sha":"def456"}}]`

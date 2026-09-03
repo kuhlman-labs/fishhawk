@@ -3526,7 +3526,7 @@ The operator recovery verb. `memberWrite` (an operator-decision write, not a des
 | 400 | `validation_failed` | non-UUID `run_id` |
 | 503 | `reconcile_merge_unconfigured` | run/audit repositories unwired |
 | 404 | `run_not_found` | — |
-| 409 | `reconcile_merge_pr_not_merged` | no `pr_merged` / `post_merge_observed` entry on the run's chain |
+| 409 | `reconcile_merge_pr_not_merged` | no `pr_merged` / `post_merge_observed` / `merge_observation_recorded` entry on the run's chain (the third is the row `POST /v0/runs/{run_id}/record-merge-observation` appends after a live `merged=true` forge read, E64.32 / #3136) |
 | 409 | `reconcile_merge_not_applicable` | no pair-table-admissible parked stage AND no already-superseded stage to repair |
 
 The merged-PR precondition is what stops the verb manufacturing a `succeeded` run for a change that never shipped; a chain-read failure is a 500, never a write (fail closed on unknown evidence).
