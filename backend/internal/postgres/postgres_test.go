@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,45 +25,131 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
-// startContainer spins up a throwaway Postgres 16 container and
-// returns its connection URL. Skips the test if Docker isn't
-// reachable so devs without Docker still pass `go test`.
+// fataler is the subset of *testing.T that startContainerWith needs. Isolating
+// it lets startcontainer_test.go drive the container-start ERROR BRANCH — the
+// branch that decides whether the leaked container is terminated — through a
+// fake, so the load-bearing test exercises the call site and not just the leaf
+// helper (#3122). A real *testing.T's Fatalf/Skipf ends the goroutine; a fake's
+// records the call and RETURNS, which is why startContainerWith has explicit
+// post-Fatalf returns below.
+type fataler interface {
+	Helper()
+	Skipf(format string, args ...any)
+	Fatalf(format string, args ...any)
+}
+
+// connStringFunc resolves a started container's connection URL. The run closure
+// returns it (capturing the concrete *tcpostgres.PostgresContainer, whose
+// ConnectionString is not on the testcontainers.Container interface) so
+// startContainerWith can call ConnectionString only on the success path, after
+// registering the terminate cleanup — preserving the original ordering.
+type connStringFunc func(context.Context) (string, error)
+
+// startContainer spins up a throwaway Postgres 16 container and returns its
+// connection URL. Skips the test if Docker isn't reachable so devs without
+// Docker still pass `go test`. It is a one-line wrapper over startContainerWith,
+// which contains the error-branch leak fix (#3122); the ~30 existing callers see
+// an unchanged `func startContainer(t *testing.T) string`.
 func startContainer(t *testing.T) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-
-	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("fishhawk"),
-		tcpostgres.WithUsername("fishhawk"),
-		tcpostgres.WithPassword("fishhawk"),
-		testcontainers.WithWaitStrategy(
-			wait.ForAll(
-				wait.ForLog("database system is ready to accept connections").
-					WithOccurrence(2).
-					WithStartupTimeout(60*time.Second),
-				wait.ForListeningPort("5432/tcp"),
+	return startContainerWith(t, t.Cleanup, ctx, func(ctx context.Context) (testcontainers.Container, connStringFunc, error) {
+		c, err := tcpostgres.Run(ctx,
+			"postgres:16-alpine",
+			tcpostgres.WithDatabase("fishhawk"),
+			tcpostgres.WithUsername("fishhawk"),
+			tcpostgres.WithPassword("fishhawk"),
+			testcontainers.WithWaitStrategy(
+				wait.ForAll(
+					wait.ForLog("database system is ready to accept connections").
+						WithOccurrence(2).
+						WithStartupTimeout(60*time.Second),
+					wait.ForListeningPort("5432/tcp"),
+				),
 			),
-		),
-	)
-	if err != nil {
-		if isDockerUnavailable(err) {
-			t.Skipf("Docker not available; skipping integration test: %v", err)
+		)
+		if err != nil {
+			// c is non-nil (or a typed-nil *PostgresContainer) even on error —
+			// testcontainers-go's generic.go returns the handle alongside the
+			// error so the caller can Destroy it. Hand it back for termination.
+			return c, nil, err
 		}
-		t.Fatalf("start postgres: %v", err)
+		return c, func(ctx context.Context) (string, error) {
+			return c.ConnectionString(ctx, "sslmode=disable")
+		}, nil
+	})
+}
+
+// startContainerWith is the injectable seam under startContainer. It runs the
+// container start via run, and on error TERMINATES the returned handle before
+// skipping/fataling — the #3122 leak fix — then, on success, registers the
+// terminate cleanup and resolves the connection URL. Splitting run/cleanup out
+// of *testing.T is what makes the error branch drivable by startcontainer_test.go
+// without Docker; startContainer passes t, t.Cleanup and a real tcpostgres.Run.
+func startContainerWith(
+	f fataler,
+	cleanup func(func()),
+	startCtx context.Context,
+	run func(context.Context) (testcontainers.Container, connStringFunc, error),
+) string {
+	f.Helper()
+	c, connString, err := run(startCtx)
+	if err != nil {
+		terminateStartFailure(startCtx, c)
+		if isDockerUnavailable(err) {
+			f.Skipf("Docker not available; skipping integration test: %v", err)
+			return "" // fake fataler returns; real *testing.T.Skipf never reaches here
+		}
+		f.Fatalf("start postgres: %v", err)
+		return "" // fake fataler returns; real *testing.T.Fatalf never reaches here
 	}
-	t.Cleanup(func() {
+	cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		_ = c.Terminate(ctx)
 	})
 
-	url, err := c.ConnectionString(ctx, "sslmode=disable")
+	url, err := connString(startCtx)
 	if err != nil {
-		t.Fatalf("conn string: %v", err)
+		f.Fatalf("conn string: %v", err)
+		return ""
 	}
 	return url
+}
+
+// terminateStartFailure terminates a container handle returned ALONGSIDE a start
+// error. testcontainers-go returns a non-nil, already-created, already-running
+// container even when Run reports an error (generic.go: "At this point `c` might
+// not be nil. Give the caller an opportunity to call Destroy on the container."),
+// and with ryuk disabled (scripts/test sets TESTCONTAINERS_RYUK_DISABLED=true)
+// nothing else reaps it — so this raw-container exemption must terminate it here
+// or every start timeout leaks a Postgres container (#3122). Three properties,
+// each pinned by a test in startcontainer_test.go:
+//
+//   - TYPED-NIL guard: postgres.Run returns a nil *PostgresContainer boxed in a
+//     non-nil testcontainers.Container interface when the inner container is nil,
+//     so a bare `c != nil` is insufficient — the interface is non-nil. reflect
+//     catches the typed nil before Terminate dereferences it and panics.
+//   - FRESH context, NOT startCtx: startCtx is the start's own deadline, and the
+//     budget left on it when a start fails LATE is unpredictable and can be near
+//     zero, so cleanup gets its OWN bounded 30s deadline rather than an unknown
+//     remainder. startCtx is deliberately not derived from — passing it keeps the
+//     choice visible at the call site (and is the counterfactual seam).
+//   - Terminate error SWALLOWED: the ORIGINAL start error must reach the caller's
+//     Fatalf/Skipf verbatim — the #3122 diagnostic signature must not be replaced
+//     by a cleanup error.
+func terminateStartFailure(startCtx context.Context, c testcontainers.Container) {
+	_ = startCtx // deliberately NOT the cleanup deadline; see the fresh-context note above.
+	if c == nil {
+		return
+	}
+	if v := reflect.ValueOf(c); v.Kind() == reflect.Pointer && v.IsNil() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = c.Terminate(ctx)
 }
 
 func isDockerUnavailable(err error) bool {
@@ -3106,6 +3193,97 @@ func TestMigrateDown_RunsInstallationRefReversal(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_InstallationsProjectPathReversal pins 0078 (E45.26 / #2877)
+// in BOTH directions: installations.project_path EXISTS after MigrateUp and is
+// GONE after rolling back through 0078, with the installations table surviving
+// (0078 is an ALTER, never a DROP TABLE). Mirrors the 0076 column-reversal
+// shape.
+//
+// It also pins the two properties the migration's whole design rests on. The
+// column must be NULLABLE — the pre-0078 row shape the authorizer refuses
+// fail-closed is precisely "project_path IS NULL", and a NOT NULL column would
+// have blocked the ALTER on any existing row anyway. And it must carry NO
+// DEFAULT: a default would silently BACKFILL every pre-existing row with an
+// invented binding, which is the one thing this migration must not do — the
+// project path is an operator authorization decision, not something derivable
+// from the payload being authorized.
+func TestMigrateDown_InstallationsProjectPathReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+	projectPathColumn := func() int {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = 'installations' AND column_name = 'project_path'`).Scan(&n); err != nil {
+			t.Fatalf("query installations.project_path: %v", err)
+		}
+		return n
+	}
+
+	if n := projectPathColumn(); n != 1 {
+		t.Errorf("installations.project_path count after MigrateUp = %d, want 1 (0078 added it)", n)
+	}
+	var nullable string
+	var columnDefault *string
+	if err := pool.QueryRow(ctx,
+		`SELECT is_nullable, column_default FROM information_schema.columns
+		  WHERE table_name = 'installations' AND column_name = 'project_path'`).Scan(&nullable, &columnDefault); err != nil {
+		t.Fatalf("query installations.project_path attributes: %v", err)
+	}
+	if nullable != "YES" {
+		t.Errorf("installations.project_path is_nullable = %q, want YES (the unbound state is load-bearing)", nullable)
+	}
+	if columnDefault != nil {
+		t.Errorf("installations.project_path column_default = %q, want none (a default would backfill an invented binding)", *columnDefault)
+	}
+
+	// Additive, behaviorally: an INSERT that names no project_path — every
+	// pre-0078 writer's shape — still succeeds and lands NULL.
+	acctID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO accounts (id, provider, account_key, granularity)
+		 VALUES ($1, 'gitlab', 'acme-0078', 'group')`, acctID); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO installations (id, account_id, provider, installation_ref)
+		 VALUES ($1, $2, 'gitlab', 'gitlab:78')`, uuid.New(), acctID); err != nil {
+		t.Fatalf("insert installation without project_path failed (column not nullable?): %v", err)
+	}
+	var landedNull bool
+	if err := pool.QueryRow(ctx,
+		`SELECT project_path IS NULL FROM installations WHERE installation_ref = 'gitlab:78'`).Scan(&landedNull); err != nil {
+		t.Fatalf("read back project_path: %v", err)
+	}
+	if !landedNull {
+		t.Error("project_path is not NULL on a row inserted without it, want NULL (no backfill / no default)")
+	}
+
+	// Roll back through 0078, the reversal under test. downThrough names the
+	// target so this stays a one-line target when a migration lands above it.
+	downThrough(t, url, "0078")
+	if n := projectPathColumn(); n != 0 {
+		t.Errorf("installations.project_path count after MigrateDown = %d, want 0 (0078 reverted)", n)
+	}
+	var installationsTable int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'installations'`).Scan(&installationsTable); err != nil {
+		t.Fatalf("query installations table: %v", err)
+	}
+	if installationsTable != 1 {
+		t.Errorf("'installations' table count after MigrateDown = %d, want 1 (0078 is an ALTER)", installationsTable)
+	}
+}
+
 // accountsGranularityCheckDefSQL reads the accounts granularity CHECK
 // expression, whose admitted-value set 0077 (#2925) widens with 'user'.
 const accountsGranularityCheckDefSQL = `SELECT pg_get_constraintdef(oid) FROM pg_constraint
@@ -4842,5 +5020,100 @@ func TestMigrateUp_DirtyErrorNamesRecovery(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("dirty error does not contain %q; got: %s", want, msg)
 		}
+	}
+}
+
+// TestMigrateDown_StagesSupersededReversal pins 0079 (E64.2 / #3083) in BOTH
+// directions against REAL ROWS, not against the rendered constraint text: a
+// CHECK that merely MENTIONS 'superseded' (in a negated or misspelled clause)
+// would satisfy a text search while still rejecting the row the product must
+// write.
+//
+// Up: a stage row carrying state='superseded' INSERTs. Without the widening it
+// is uninsertable with SQLSTATE 23514, so a no-op migration fails here rather
+// than passing silently.
+//
+// Down: the NORMALIZE-THEN-NARROW order is the load-bearing property. The
+// rollback maps every 'superseded' row to 'cancelled' BEFORE re-adding the
+// narrower 0053 CHECK; if the ordering were inverted the ADD CONSTRAINT would
+// raise 23514 against the surviving row and MigrateDown would fail outright —
+// which is precisely what downThrough would surface. This asserts both that the
+// rollback SUCCEEDS and that the row normalized to 'cancelled' (the closest
+// pre-0079 legal value) rather than being deleted or left behind.
+func TestMigrateDown_StagesSupersededReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	runID, supersededID, cancelledID := uuid.New(), uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	// The row the widening exists for: acceptance, superseded by a merge.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 0, 'acceptance', 'agent', 'claude-code', 'superseded')`,
+		supersededID, runID,
+	); err != nil {
+		t.Fatalf("INSERT a superseded stage failed (0079 did not widen stages_state_check?): %v", err)
+	}
+	// A genuinely cancelled sibling, so the down-direction assertion below
+	// distinguishes "normalized" from "was already cancelled".
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 1, 'review', 'human', 'operator', 'cancelled')`,
+		cancelledID, runID,
+	); err != nil {
+		t.Fatalf("seed cancelled stage: %v", err)
+	}
+	// An out-of-set value is still refused — the widening is ADDITIVE, not a
+	// removal of the CHECK.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 2, 'plan', 'agent', 'claude-code', 'obsoleted')`,
+		uuid.New(), runID,
+	); err == nil {
+		t.Error("INSERT with an out-of-set state succeeded; 0079 must widen stages_state_check, not drop it")
+	}
+
+	// Roll back through 0079, the reversal under test. downThrough names the
+	// target so this stays a one-line target when a migration lands above it.
+	// This call FAILS if the down migration narrows before normalizing (the
+	// ADD CONSTRAINT would raise 23514 against the superseded row).
+	downThrough(t, url, "0079")
+
+	var state string
+	if err := pool.QueryRow(ctx, `SELECT state FROM stages WHERE id = $1`, supersededID).Scan(&state); err != nil {
+		t.Fatalf("read back the formerly-superseded stage: %v", err)
+	}
+	if state != "cancelled" {
+		t.Errorf("formerly-superseded stage state after rollback = %q, want cancelled "+
+			"(the down migration normalizes to the closest pre-0079 legal value)", state)
+	}
+	// The sibling is untouched and the row was normalized, not deleted.
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM stages WHERE run_id = $1`, runID).Scan(&n); err != nil {
+		t.Fatalf("count stages: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("stage count after rollback = %d, want 2 (normalize, never delete)", n)
+	}
+	// And the narrowed CHECK is back in force: 'superseded' is uninsertable.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 3, 'acceptance', 'agent', 'claude-code', 'superseded')`,
+		uuid.New(), runID,
+	); err == nil {
+		t.Error("INSERT of a superseded stage succeeded after rollback; the 0053 CHECK was not restored")
 	}
 }

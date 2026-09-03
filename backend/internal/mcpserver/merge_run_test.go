@@ -953,3 +953,61 @@ func TestMergeRun_TerminalFailedRun_RefusesBeforePOST(t *testing.T) {
 		})
 	}
 }
+
+// mergeConflictingBody is the backend's 409 merge_conflicting envelope (E64.14 /
+// #3109), carrying pr_url + mergeable_state in details.
+const mergeConflictingBody = `{"error":{"code":"merge_conflicting",` +
+	`"message":"the pull request has a merge conflict against its base",` +
+	`"details":{"pr_url":"https://github.com/x/y/pull/7","mergeable_state":"dirty"}}}`
+
+// TestMergeRunToolConflictingReturnsImmediately (c5) pins the immediate
+// conflict return: a 409 merge_conflicting yields status=conflicting after
+// EXACTLY ONE POST — the count is what proves the tool does NOT re-arm a doomed
+// wait (unlike checks_pending it does not poll or re-POST) — and returns well
+// inside the timeout budget. The fake backend is an in-test httptest server, so
+// deleting the isConflicting arm cannot pass for the unrelated reason of an
+// unreachable address. Counterfactual: deleting the isConflicting arm in the
+// POST loop makes this RED (the 409 surfaces as a bare tool error).
+func TestMergeRunToolConflictingReturnsImmediately(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:             "https://github.com/x/y/pull/7",
+		stateBeforeMerge:  "running",
+		stateAfterMerge:   "running",
+		mergeStickyStatus: http.StatusConflict, // every POST 409 conflicting
+		mergeErrBody:      mergeConflictingBody,
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+
+	start := time.Now()
+	// A generous timeout: the point is the tool returns IMMEDIATELY, not that the
+	// budget expired. A conflicting return must not consume the wait budget.
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it", TimeoutSeconds: 600})
+	if err != nil {
+		t.Fatalf("mergeRun: %v — a conflict 409 must be returned as status=conflicting, not a tool error", err)
+	}
+	if out.Status != "conflicting" {
+		t.Fatalf("status = %q, want conflicting", out.Status)
+	}
+	if out.MergeQueued || out.VerdictRecorded || out.AlreadyRecorded {
+		t.Errorf("flags = queued:%v recorded:%v already:%v, want all false (nothing queued, no verdict)", out.MergeQueued, out.VerdictRecorded, out.AlreadyRecorded)
+	}
+	if out.PRURL != "https://github.com/x/y/pull/7" {
+		t.Errorf("pr_url = %q, want the details pr_url", out.PRURL)
+	}
+	if !strings.Contains(out.Message, "fishhawk_vouch_commit") {
+		t.Errorf("message must name the resolve-then-vouch path: %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "dirty") {
+		t.Errorf("message should surface mergeable_state: %q", out.Message)
+	}
+	fb.mu.Lock()
+	calls := fb.mergeCalls
+	fb.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("merge POSTed %d times, want EXACTLY 1 (conflict does not re-arm a doomed wait)", calls)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("mergeRun took %s, want an immediate return well inside the 600s budget", elapsed)
+	}
+}

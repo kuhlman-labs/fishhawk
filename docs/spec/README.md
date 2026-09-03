@@ -42,7 +42,9 @@ check-jsonschema --schemafile docs/spec/workflow-v1.schema.json \
 # .fishhawk/workflows.yaml belongs here ONLY because it declares no `defaults`
 # and no `extends`: a bare check-jsonschema run resolves no same-document
 # reuse (#2340, and see the reuse note below). Add a reuse block to it and
-# this invocation must become `fishhawk validate`.
+# this invocation must become `fishhawk validate`. Which command it is listed
+# under is machine-pinned by TestSpecReadmeListsShippedSpecUnderDeclaredMajor in
+# backend/internal/spec, so reshaping this block will trip a test (#3013).
 check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \
     docs/spec/examples/workflow-v2-backlog-grooming.yaml \
     docs/spec/examples/workflow-v2-milestone-scoping.yaml \

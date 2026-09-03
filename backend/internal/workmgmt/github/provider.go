@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -770,36 +771,47 @@ func (p *Provider) classifyOutOfSetTarget(ctx context.Context, scope forge.Crede
 		return ts, nil
 	}
 	issue, err := p.api.GetIssue(ctx, scope, repo, number)
+	ts := classifyFetchedTarget(issue, err)
+	cache[number] = ts
+	return ts, nil
+}
+
+// classifyFetchedTarget is the PURE classification half of
+// classifyOutOfSetTarget: given an ALREADY-FETCHED out-of-set target it makes
+// no forge call and consults no cache, so the same rules can be applied by the
+// serial EpicChildren path (which fetches inline, above) and by the concurrent
+// ResolveDependencies path (which fetches in a bounded pool and classifies
+// afterwards, #3113) with ONE definition of what "satisfied" means. The
+// branches are unchanged from the pre-#3113 inline switch:
+//   - a fetch error yields DropTargetStateUnreadable (never satisfied — an
+//     unreadable target is not evidence of satisfaction). Kept DISTINCT from
+//     the nil-issue branch below so deleting either control is independently
+//     observable (#2953 operator condition 4);
+//   - a nil issue with no error yields DropTargetStateUnreadable;
+//   - closed AND completed (case-insensitive, since GetIssue's REST payload is
+//     lowercase) yields satisfied;
+//   - a closed issue with any other state_reason yields DropTargetClosedIncomplete;
+//   - anything else (open) keeps DropNotChild.
+func classifyFetchedTarget(issue *githubclient.Issue, err error) targetState {
 	if err != nil {
-		// Unreadable: the read failed. Never satisfied. Distinct from the nil
-		// branch below so deleting either control is independently observable
-		// (operator condition 4).
-		ts := targetState{reason: workmgmt.DropTargetStateUnreadable}
-		cache[number] = ts
-		return ts, nil
+		return targetState{reason: workmgmt.DropTargetStateUnreadable}
 	}
 	if issue == nil {
-		// Unreadable: the forge returned no issue and no error. Fail closed.
-		ts := targetState{reason: workmgmt.DropTargetStateUnreadable}
-		cache[number] = ts
-		return ts, nil
+		return targetState{reason: workmgmt.DropTargetStateUnreadable}
 	}
-	var ts targetState
 	switch {
 	case strings.EqualFold(issue.State, "closed") && strings.EqualFold(issue.StateReason, "completed"):
 		// Closed AND completed: the prerequisite landed. Satisfied — the same
 		// rule EpicChild.Complete encodes, case-insensitively (REST is lowercase).
-		ts = targetState{satisfied: true, state: issue.State, stateReason: issue.StateReason}
+		return targetState{satisfied: true, state: issue.State, stateReason: issue.StateReason}
 	case strings.EqualFold(issue.State, "closed"):
 		// Closed but not completed (not_planned/duplicate): work did not land, so
 		// no batch-widening knob can satisfy the edge.
-		ts = targetState{reason: workmgmt.DropTargetClosedIncomplete, state: issue.State, stateReason: issue.StateReason}
+		return targetState{reason: workmgmt.DropTargetClosedIncomplete, state: issue.State, stateReason: issue.StateReason}
 	default:
 		// Open (or any non-closed state): the pre-#2953 dangling refusal.
-		ts = targetState{reason: workmgmt.DropNotChild, state: issue.State, stateReason: issue.StateReason}
+		return targetState{reason: workmgmt.DropNotChild, state: issue.State, stateReason: issue.StateReason}
 	}
-	cache[number] = ts
-	return ts, nil
 }
 
 // sortEdges deterministically orders depends_on edges by (From, To, ToRefDigest)
@@ -855,6 +867,42 @@ func sortSatisfiedEdges(es []workmgmt.SatisfiedEdge) {
 // and all edge slices are deterministically sorted (by From, then To),
 // mirroring EpicChildren. It validates the target repo + installation (fail
 // closed with File's actionable style).
+//
+// # Three-phase bounded-concurrency resolution (#3113)
+//
+// Resolving a large named set serially costs one round-trip per named issue
+// plus one per distinct out-of-set target — ~60-100 sequential REST calls for a
+// sixty-item grooming order, which is what made campaign assembly from a full
+// ratified order time out. The resolution therefore runs in three phases:
+//
+//   - PHASE 1 fetches every named issue with at most issueSetFetchConcurrency
+//     concurrent GetIssue calls;
+//   - PHASE 2 collects the DISTINCT out-of-set depends_on targets in
+//     first-encounter order and fetches them with the same bounded pool,
+//     building the state cache afterwards;
+//   - PHASE 3 classifies SERIALLY, on one goroutine, in request order.
+//
+// NO SHARED MUTABLE STATE crosses a goroutine boundary and there is no mutex: a
+// worker's only output is a value struct sent on a channel, and every map and
+// slice write is the parent's, made after the pool has drained. That is what
+// makes the emitted *workmgmt.EpicChildrenResult BYTE-IDENTICAL to the serial
+// result regardless of completion order (pinned by the 50-repetition
+// jitter test), and it is why Go's concurrent-map-write fatal error is
+// unreachable here by construction rather than by locking discipline.
+//
+// EpicChildren is deliberately NOT routed through this pool: it reads its
+// sibling set in ONE ListSubIssues call, so it was never the cost, and keeping
+// it serial keeps its output byte-identical.
+//
+// DEADLINES. Every phase checks the context BEFORE returning any wrapped fetch
+// error and returns *workmgmt.IssueSetResolutionTimeout instead, carrying the
+// honest counts (see issueSetTimeout for the accounting rule). An ORDINARY
+// phase-1 fetch failure with the context alive still returns the wrapped
+// provider error, and deterministically the one FIRST IN REQUEST ORDER. An
+// ordinary phase-2 (target) fetch failure is NOT an error at all — it still
+// classifies DropTargetStateUnreadable exactly as the serial path did, so
+// #2953's meaning of "unreadable" is unchanged; only a CONTEXT-TERMINATED
+// target fetch is treated differently, leaving no cache entry.
 func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSetRequest) (*workmgmt.EpicChildrenResult, error) {
 	if p.api == nil {
 		return nil, errors.New("workmgmt/github: provider missing API client")
@@ -888,25 +936,74 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 		numbers = append(numbers, n)
 	}
 
+	// PHASE 1 — fetch every named issue with bounded concurrency. Workers RETURN
+	// their results over a channel and write nothing shared; the parent places
+	// each into an ordinal-indexed slice after the pool drains, so the whole
+	// resolution has no shared mutable state across goroutines and no mutex
+	// (#3113).
+	fetches := p.fetchIssuesBounded(ctx, scope, repo, numbers)
+	// Deadline precedence: check the context BEFORE returning any wrapped fetch
+	// error, so a deadline that tripped a forge call surfaces as the typed
+	// timeout with honest counts rather than as `get issue #N: context deadline
+	// exceeded` — which would present a deadline as a provider fault and leave
+	// the server on its generic failure code.
+	if ctx.Err() != nil {
+		return nil, issueSetTimeout(numbers, inSet, fetches, nil, "fetch_items")
+	}
+	// Context alive, but a fetch failed: return the error of the item FIRST IN
+	// REQUEST ORDER. The parent walks the ordinal-indexed slice ascending, so
+	// the returned error is deterministic no matter which worker finished first.
+	for _, f := range fetches {
+		if f.err != nil {
+			return nil, fmt.Errorf("workmgmt/github: get issue #%d: %w", f.number, f.err)
+		}
+		if f.issue == nil {
+			// A named item the forge returned neither an issue nor an error for.
+			// Fail closed naming the item: every downstream phase reads the
+			// issue's number/title/body, so continuing would either panic or
+			// invent a child.
+			return nil, fmt.Errorf("workmgmt/github: get issue #%d: no issue returned", f.number)
+		}
+	}
+
+	// PHASE 2 — collect the DISTINCT out-of-set targets in first-encounter order
+	// (a single-goroutine walk of the phase-1 results in request order), fetch
+	// them with the same bounded pool, and build the state cache SERIALLY in the
+	// parent after the pool drains.
+	targets := outOfSetTargets(inSet, fetches)
+	stateCache := map[int]targetState{}
+	targetFetches := p.fetchIssuesBounded(ctx, scope, repo, targets)
+	for _, tf := range targetFetches {
+		if tf.aborted {
+			// A context-TERMINATED fetch is not evidence of anything: it is never
+			// cached and never counts its item resolved. This is deliberately
+			// distinct from an ordinary 404/permission error, which still caches
+			// DropTargetStateUnreadable exactly as the serial path did (#2953 is
+			// not widened) — the distinction is context-termination, not
+			// error-vs-success.
+			continue
+		}
+		stateCache[tf.number] = classifyFetchedTarget(tf.issue, tf.err)
+	}
+	if ctx.Err() != nil {
+		return nil, issueSetTimeout(numbers, inSet, fetches, stateCache, "classify_targets")
+	}
+
+	// PHASE 3 — a SERIAL classification pass on one goroutine over the phase-1
+	// results in request order, reading the now-immutable stateCache. This is
+	// the pre-#3113 loop body verbatim except that the classification is a cache
+	// LOOKUP rather than a forge call, so the emitted result is byte-identical.
 	children := make([]workmgmt.EpicChild, 0, len(numbers))
 	var edges, dropped []workmgmt.DependsEdge
 	var satisfied []workmgmt.SatisfiedEdge
-	// Memoize the out-of-set target state read across every edge in this one
-	// resolution, so N depends_on references to the same closed target cost ONE
-	// GetIssue (#2953). The in-set issue fetches below are separate (each named
-	// issue is fetched once via the inSet dedup already applied).
-	stateCache := map[int]targetState{}
 	// Collapse duplicate edges so a repeated depends_on token
 	// (`Depends on: #1639, #1639`) yields AT MOST ONE edge in whichever slice it
 	// classifies into (#2953 condition 3) — the same (From, To, ToRefDigest) key
 	// EpicChildren applies, so two DISTINCT cross-repo tokens stay two edges while
 	// the same canonical token repeated collapses (#2956).
 	seenEdge := map[dependsEdgeKey]bool{}
-	for _, n := range numbers {
-		issue, err := p.api.GetIssue(ctx, scope, repo, n)
-		if err != nil {
-			return nil, fmt.Errorf("workmgmt/github: get issue #%d: %w", n, err)
-		}
+	for _, f := range fetches {
+		issue := f.issue
 		children = append(children, workmgmt.EpicChild{
 			Number:   issue.Number,
 			Title:    issue.Title,
@@ -933,9 +1030,14 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 			// closed-and-completed target is a satisfied dependency (elided from the
 			// DAG), while an open/incomplete/unreadable one — and any UNRESOLVABLE
 			// cross-repo ref — is dangling and campaign assembly fails closed on it.
-			cls, cerr := p.classifyOutOfSetTarget(ctx, scope, repo, dep, stateCache)
-			if cerr != nil {
-				return nil, cerr
+			cls, ok := lookupTargetState(dep, stateCache)
+			if !ok {
+				// Defensive: a target reached classification unclassified — its
+				// phase-2 fetch was context-terminated and left no cache entry.
+				// Return the typed timeout rather than GUESSING a classification;
+				// guessing would either invent a satisfied dependency or fabricate
+				// an unreadable one, and both are worse than an honest refusal.
+				return nil, issueSetTimeout(numbers, inSet, fetches, stateCache, "build_result")
 			}
 			if cls.satisfied {
 				satisfied = append(satisfied, workmgmt.SatisfiedEdge{
@@ -957,6 +1059,197 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 	sortEdges(dropped)
 	sortSatisfiedEdges(satisfied)
 	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges, DroppedEdges: dropped, SatisfiedEdges: satisfied}, nil
+}
+
+// issueSetFetchConcurrency bounds the in-flight forge reads of one issue-set
+// resolution. It is well under GitHub's published no-more-than-100-concurrent-
+// requests REST guidance, and it is the bound the at-most-N / at-least-N channel
+// probes in provider_test.go pin structurally rather than by reading the
+// constant.
+const issueSetFetchConcurrency = 8
+
+// issueFetch is ONE worker's return value: a pure value struct sent over a
+// channel. A worker writes to nothing else — no map, no counter, no mutex, no
+// slice element — so the concurrent phases of ResolveDependencies have no shared
+// mutable state at all (#3113). The parent places each value into an
+// ordinal-indexed slice after the pool drains.
+type issueFetch struct {
+	ordinal int
+	number  int
+	issue   *githubclient.Issue
+	err     error
+	// aborted marks a fetch the CONTEXT terminated, as distinct from one the
+	// forge refused. A context-terminated target is never cached and never
+	// counts its item resolved; an ordinary 404/permission error still classifies
+	// DropTargetStateUnreadable exactly as the serial path did.
+	aborted bool
+}
+
+// fetchIssuesBounded fetches numbers with at most issueSetFetchConcurrency
+// concurrent GetIssue calls and returns one issueFetch per input, INDEXED BY
+// REQUEST ORDER regardless of completion order. Every result slot is filled:
+// the feeder never short-circuits on a dead context, because a GetIssue made
+// with an expired context returns promptly with a context error, and filling
+// every slot is what keeps the accounting (and the deterministic
+// first-in-request-order error selection) total rather than dependent on how
+// many results happened to arrive.
+func (p *Provider) fetchIssuesBounded(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, numbers []int) []issueFetch {
+	out := make([]issueFetch, len(numbers))
+	if len(numbers) == 0 {
+		return out
+	}
+	workers := issueSetFetchConcurrency
+	if workers > len(numbers) {
+		workers = len(numbers)
+	}
+	jobs := make(chan int)
+	// Buffered to len(numbers) so no worker can block on the send: a worker that
+	// has produced its value is done, and the parent drains at its own pace.
+	results := make(chan issueFetch, len(numbers))
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				n := numbers[i]
+				issue, err := p.api.GetIssue(ctx, scope, repo, n)
+				results <- issueFetch{
+					ordinal: i,
+					number:  n,
+					issue:   issue,
+					err:     err,
+					// Context-terminated iff the call FAILED and the failure is (or
+					// happened under) a dead context. The err != nil guard is what
+					// keeps a successful fetch made just before the deadline from
+					// being mislabelled aborted.
+					aborted: err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil),
+				}
+			}
+		}()
+	}
+	for i := range numbers {
+		jobs <- i
+	}
+	close(jobs)
+	for range numbers {
+		r := <-results
+		out[r.ordinal] = r
+	}
+	wg.Wait()
+	return out
+}
+
+// outOfSetTargets walks the phase-1 results in REQUEST ORDER on a single
+// goroutine and collects the distinct out-of-set depends_on targets that need a
+// forge read, in first-encounter order. It applies the SAME per-item
+// (From, To, ToRefDigest) dedup phase 3 applies, so a token phase 3 will skip is
+// never fetched, and it excludes exactly the refs classifyOutOfSetTarget
+// classifies WITHOUT a forge call: an unresolvable cross-repo/unparseable ref
+// (reducing it to a local number could read an UNRELATED issue and falsely
+// satisfy the edge — #2953 operator condition 2) and a non-positive number.
+func outOfSetTargets(inSet map[int]bool, fetches []issueFetch) []int {
+	var targets []int
+	seenTarget := map[int]bool{}
+	seenEdge := map[dependsEdgeKey]bool{}
+	for _, f := range fetches {
+		if f.issue == nil {
+			continue
+		}
+		for _, dep := range parseDependsOnMarker(f.issue.Body) {
+			key := dependsEdgeKey{From: f.issue.Number, To: dep.Number, Digest: dep.RawDigest}
+			if seenEdge[key] {
+				continue
+			}
+			seenEdge[key] = true
+			if !needsTargetFetch(dep, inSet) || seenTarget[dep.Number] {
+				continue
+			}
+			seenTarget[dep.Number] = true
+			targets = append(targets, dep.Number)
+		}
+	}
+	return targets
+}
+
+// needsTargetFetch reports whether a parsed depends_on ref costs a forge read:
+// it must be resolvable, positive, and OUTSIDE the named set. It is the single
+// predicate phase 2 (what to fetch), the accounting (what must be classified for
+// an item to count resolved) and lookupTargetState (what may be answered without
+// a cache entry) all agree on, so the three can never drift.
+func needsTargetFetch(dep dependsOnRef, inSet map[int]bool) bool {
+	if !dep.Resolvable || dep.Number <= 0 {
+		return false
+	}
+	return !inSet[dep.Number]
+}
+
+// lookupTargetState answers phase 3's classification from the immutable cache.
+// The two no-forge-call refusals classifyOutOfSetTarget stamps directly — an
+// UNRESOLVABLE ref and a non-positive number — are answered here WITHOUT a cache
+// entry, preserving that neither ever reaches GetIssue. Anything else must have
+// been fetched in phase 2; ok=false means it was not (a context-terminated
+// fetch), which phase 3 turns into the typed timeout rather than a guess.
+func lookupTargetState(dep dependsOnRef, cache map[int]targetState) (targetState, bool) {
+	if !dep.Resolvable {
+		return targetState{reason: workmgmt.DropTargetStateUnreadable}, true
+	}
+	if dep.Number <= 0 {
+		return targetState{reason: workmgmt.DropTargetStateUnreadable}, true
+	}
+	ts, ok := cache[dep.Number]
+	return ts, ok
+}
+
+// issueSetTimeout builds the typed deadline error with the counts, applying ONE
+// uniform accounting rule at whichever phase the deadline hit. An item is FULLY
+// RESOLVED when its own fetch completed AND every out-of-set target it names is
+// classified; an item naming no out-of-set target is fully resolved as soon as
+// its fetch completes. Resolved is the count of such items anywhere in the
+// request order; SuggestedLimit is the length of the longest fully-resolved
+// PREFIX of that order — a value that provably would have fit, because the
+// grooming path takes the top-N by ratified rank and this resolver preserves
+// request order — and 0 (no suggestion) when that prefix is empty. A suggestion
+// is NEVER derived from a non-prefix count.
+func issueSetTimeout(numbers []int, inSet map[int]bool, fetches []issueFetch, cache map[int]targetState, phase string) *workmgmt.IssueSetResolutionTimeout {
+	resolved := 0
+	suggested := 0
+	prefixIntact := true
+	for _, f := range fetches {
+		if itemFullyResolved(f, inSet, cache) {
+			resolved++
+			if prefixIntact {
+				suggested++
+			}
+		} else {
+			prefixIntact = false
+		}
+	}
+	return &workmgmt.IssueSetResolutionTimeout{
+		Resolved:       resolved,
+		Total:          len(numbers),
+		SuggestedLimit: suggested,
+		Phase:          phase,
+	}
+}
+
+// itemFullyResolved is the single accounting predicate (see issueSetTimeout).
+// A nil cache — the phase-1 deadline, where no target has been classified yet —
+// makes every item naming an out-of-set target unresolved, which is exactly
+// true at that phase.
+func itemFullyResolved(f issueFetch, inSet map[int]bool, cache map[int]targetState) bool {
+	if f.err != nil || f.issue == nil {
+		return false
+	}
+	for _, dep := range parseDependsOnMarker(f.issue.Body) {
+		if !needsTargetFetch(dep, inSet) {
+			continue
+		}
+		if _, ok := cache[dep.Number]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // dependsOnMarkerRE matches the depends_on body marker line and captures the

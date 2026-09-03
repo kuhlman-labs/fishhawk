@@ -20,6 +20,9 @@ const stageStateStyles: Record<StageState, string> = {
   succeeded: 'text-emerald-700 dark:text-emerald-300',
   failed: 'text-rose-700 dark:text-rose-300',
   cancelled: 'text-neutral-500',
+  // Merge-superseded (#3083): terminal but not a failure and not an
+  // operator halt — neutral like cancelled, deliberately NOT rose.
+  superseded: 'text-neutral-500',
 };
 
 export function StageStateBadge({ state, className }: { state: StageState; className?: string }) {

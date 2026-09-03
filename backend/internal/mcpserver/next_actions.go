@@ -517,7 +517,7 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	// Implement stage arms (the plan gate is behind us, or no plan stage
 	// exists — the resume_run recovery-child shape).
 	if impl != nil && (plan == nil || plan.State == "succeeded") {
-		if a := implementStageNextActions(run, impl, acceptance, implementReviewStatus, hint, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition); a != nil {
+		if a := implementStageNextActions(run, impl, review, acceptance, implementReviewStatus, hint, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition); a != nil {
 			return a
 		}
 	}
@@ -661,7 +661,10 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 // acceptance_triage_decided audit payloads. acceptanceSkippedOutOfScope is the
 // recent-audit-window flag threaded down so the acceptance arm can recognize an
 // E38.3 / #1877 out-of-scope skip as a merge-eligible disposition.
-func implementStageNextActions(run *Run, impl, acceptance *Stage, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, acceptanceSkippedOutOfScope, acceptanceArbitrated bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
+// review is the run's review stage (nil when the workflow declares none); it is
+// read ONLY by the #3116 fix-up-gate check below, which decides whether
+// recommending fishhawk_fixup_stage would point at a verb the endpoint refuses.
+func implementStageNextActions(run *Run, impl, review, acceptance *Stage, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, acceptanceSkippedOutOfScope, acceptanceArbitrated bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
 	switch impl.State {
 	case "pending", "awaiting_host_dispatch":
 		// pending and awaiting_host_dispatch (#1912) both await a host spawn — the
@@ -731,6 +734,21 @@ func implementStageNextActions(run *Run, impl, acceptance *Stage, implementRevie
 			}
 		}
 		if hint != nil {
+			// #3116: recommending fishhawk_fixup_stage is only legal while the
+			// fix-up gate is actually open. In a workflow that orders acceptance
+			// BEFORE review (feature_change), a succeeded implement stage sits with
+			// its review stage still `pending`, and run.findOpenReviewStage refuses
+			// the fix-up with 422 fixup_not_applicable. The classifier used to
+			// recommend it anyway — a surface naming a verb the endpoint refuses.
+			// Both arms keep fishhawk_defer_concern (legal now, spends no fix-up
+			// budget) and the hint keeps reporting remaining_fixup_budget, so the
+			// operator sees the route-back survives the wait.
+			if !fixupGateOpen(impl, review) {
+				if acceptance != nil && !stageStateIsTerminal(acceptance.State) {
+					return &NextActions{State: "implement_concerns_open_acceptance_pending", Actions: hint.gateClosedActions(run, acceptance)}
+				}
+				return &NextActions{State: "implement_concerns_open_gate_closed", Actions: hint.gateClosedActions(run, nil)}
+			}
 			// Open concerns: embed the hint's options as actions. The
 			// entries derive FROM the computed ReviewActionHint value
 			// (review_action_hint.go), so the two surfaces agree by

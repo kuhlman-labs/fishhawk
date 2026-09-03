@@ -24,6 +24,12 @@
 //     for v0; tighter behaviour belongs in a webhook listener.
 //   - Translate `ci_pass` or other externally-fed checks. Those
 //     ORIGINATE from GitHub; re-posting them would be circular.
+//
+// Since E64.43 (#3160) the package ALSO carries a run-less publish,
+// PublishNotApplicable: a terminal `neutral` Check Run for a pull
+// request that has no Fishhawk run at all, so a repo that marked the
+// check Required doesn't permanently block every Dependabot / hotfix /
+// docs PR on a context nothing would otherwise publish.
 package auditcheckpublisher
 
 import (
@@ -217,6 +223,42 @@ func New(d Deps) *Publisher {
 // The bool return is "did we actually publish to GitHub on this
 // call." Useful for tests; production callers usually ignore it.
 func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem) (bool, error) {
+	return p.PublishResult(ctx, runID, state, missing, nil)
+}
+
+// PublishResult is Publish plus the structured RESOLUTIONS auditcomplete
+// derived (#3092). When the state is a pass and `resolved` is non-empty, the
+// Check Run's summary NAMES the child runs whose traces satisfied the parent
+// implement stage, so an auditor can follow the resolution chain from the
+// forge itself instead of having to trust it. Publish delegates here with
+// resolved=nil, so every pre-#3092 call site is unchanged.
+//
+// Note the dedup cache keys on (forge, repo, head_sha, state) only, so the
+// resolution text lands with the FIRST pass publish at a given head — a pass
+// already published at that head is not re-published merely because its
+// summary would now name the child runs.
+func (p *Publisher) PublishResult(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution) (bool, error) {
+	return p.PublishResultAtHead(ctx, runID, state, missing, resolved, "")
+}
+
+// PublishResultAtHead is PublishResult with an explicit head override
+// (E64.14 / #3109). When headSHAOverride is non-empty the Check Run is
+// published AT THAT SHA instead of the head findHeadSHA would resolve;
+// everything downstream — repo/forge resolution, the (forge, repo, head_sha,
+// state) dedup cache, the (run_id, head_sha) degraded-episode tracking, and
+// buildParams — keys on the RESOLVED head, so an override publishes and dedups
+// against the overridden sha with no special-casing. PublishResult delegates
+// here with an empty override, so every pre-#3109 caller's behavior (and its
+// head resolution, dedup, and episode keys) is byte-identical.
+//
+// The override exists for the operator-vouch path (server/vouch.go): the live
+// PR head there is an operator-pushed commit that by construction appears in
+// NO head-report audit category (fixup_pushed / child_pushed /
+// pull_request_opened), so findHeadSHA would resolve the stale audit-recorded
+// head and republish the required check against a sha the operator's merge
+// commit is not on. Passing the vouched sha as the override re-posts the check
+// on the live head.
+func (p *Publisher) PublishResultAtHead(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution, headSHAOverride string) (bool, error) {
 	if p == nil {
 		return false, nil
 	}
@@ -249,12 +291,20 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 		return false, nil
 	}
 
-	headSHA, ok, err := p.findHeadSHA(ctx, runID)
-	if err != nil {
-		return false, fmt.Errorf("auditcheckpublisher: find head_sha: %w", err)
-	}
-	if !ok {
-		return false, nil
+	// An explicit override (the operator-vouch path, #3109) publishes AT that
+	// sha, bypassing the head-report resolution — an operator-pushed commit is
+	// in no head-report category, so findHeadSHA would resolve a stale head.
+	// An empty override keeps the pre-#3109 resolution exactly.
+	headSHA := strings.TrimSpace(headSHAOverride)
+	if headSHA == "" {
+		var ok bool
+		headSHA, ok, err = p.findHeadSHA(ctx, runID)
+		if err != nil {
+			return false, fmt.Errorf("auditcheckpublisher: find head_sha: %w", err)
+		}
+		if !ok {
+			return false, nil
+		}
 	}
 
 	// Resolve the check-run creator + credential scope now that a head
@@ -302,7 +352,7 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 		return false, nil
 	}
 
-	params := buildParams(state, missing, headSHA, p.detailsURL(runID))
+	params := buildParams(state, missing, resolved, headSHA, p.detailsURL(runID))
 	if _, err := creator.CreateCheckRun(ctx, scope, repo, params); err != nil {
 		err = fmt.Errorf("auditcheckpublisher: create check run: %w", err)
 		p.recordFailure(ctx, runID, headSHA, err)
@@ -313,6 +363,109 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 		p.onRecovered(ctx, runID, headSHA, attempts)
 	}
 	return true, nil
+}
+
+// stateNotApplicable is the dedup-cache sentinel for the run-less
+// not-applicable publish (E64.43 / #3160). It is deliberately a
+// package-local stagecheck.State value and NOT a new member of the
+// stagecheck enum: nothing outside this package derives, persists, or
+// switches on it, so promoting it would move exhaustiveness tables in
+// every consumer for a value none of them can ever see.
+//
+// Because the dedup cache stores the last published state as its VALUE
+// and shouldPublish compares that value against the incoming state, an
+// entry under this sentinel can never suppress a later real
+// pass/fail/pending at the same head (and vice versa) — the states
+// differ, so shouldPublish returns true. That invariant is load-bearing
+// and is pinned in both orders by
+// TestPublishNotApplicable_SentinelDoesNotSuppressRealState.
+const stateNotApplicable = stagecheck.State("fishhawk_not_applicable")
+
+// notApplicableSummary is the Check Run summary for the run-less
+// publish. It must read unambiguously as "the gate does not apply", NOT
+// as an audit pass — the pass summary's "audit chain verifies" phrase is
+// deliberately absent, and a test asserts that absence.
+const notApplicableSummary = "No Fishhawk run is associated with this pull request, so the audit gate does not apply to it. " +
+	"This is not an audit result: nothing was verified, because there is nothing Fishhawk-managed here to verify."
+
+// PublishNotApplicable posts a TERMINAL, non-blocking
+// fishhawk_audit_complete Check Run for a pull request that has NO
+// associated Fishhawk run (E64.43 / #3160). Without it, a repo that has
+// marked the check Required leaves every non-Fishhawk PR (Dependabot, a
+// human hotfix, an operator-authored docs PR) permanently blocked on a
+// context nothing will ever publish.
+//
+// It is deliberately RUN-LESS — it takes repo/scope/headSHA directly
+// rather than a runID — because there is no run row, no implement-stage
+// pull_request artifact, and therefore nothing for GetRun/findHeadSHA to
+// resolve.
+//
+// Deliberate omissions:
+//   - It does not open or advance a degraded-failure EPISODE. Episodes
+//     are keyed by (run_id, head_sha); a run-less failure would open one
+//     under uuid.Nil that no later publish could ever close. It does
+//     route through recordPublished on success, which calls clearEpisode
+//     with uuid.Nil — a map lookup that finds nothing and returns 0,
+//     since no episode is ever created under that key. So the episode
+//     side is READ (harmlessly, always a miss) but never WRITTEN, and
+//     OnDegraded/OnRecovered are never invoked from this path.
+//   - It is GitHub-only. runner_kind is a property of a run, and a
+//     run-less PR has none, so there is no signal to route a GitLab
+//     commit status on.
+//
+// The conclusion is `neutral`: GitHub treats success, neutral and
+// skipped as satisfying a required status check, and neutral stays
+// semantically honest about the fact that nothing was verified. If live
+// validation ever shows neutral does NOT satisfy the required context,
+// the forward fix is a one-line change to
+// forge.CheckRunConclusionSuccess in buildNotApplicableParams — the
+// summary text already reads unambiguously as not-applicable.
+//
+// Returns (false, nil) — a silent, caller-branch-free skip — when:
+//   - The receiver is nil (publisher disabled; dev posture).
+//   - repo.Owner, repo.Name or the trimmed headSHA is empty.
+//   - scope is the zero CredentialScope (nothing to authenticate with).
+//   - The dedup cache already holds this sentinel for (github, repo,
+//     head_sha) — repeated opened/reopened/synchronize events at one
+//     head post once.
+func (p *Publisher) PublishNotApplicable(ctx context.Context, repo forge.RepoRef, scope forge.CredentialScope, headSHA string) (bool, error) {
+	if p == nil {
+		return false, nil
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return false, nil
+	}
+	headSHA = strings.TrimSpace(headSHA)
+	if headSHA == "" {
+		return false, nil
+	}
+	if scope == (forge.CredentialScope{}) {
+		return false, nil
+	}
+	if !p.shouldPublish(repo, headSHA, "github", stateNotApplicable) {
+		return false, nil
+	}
+	if _, err := p.github.CreateCheckRun(ctx, scope, repo, buildNotApplicableParams(headSHA, p.externalURL)); err != nil {
+		return false, fmt.Errorf("auditcheckpublisher: create not-applicable check run: %w", err)
+	}
+	p.recordPublished(repo, uuid.Nil, headSHA, "github", stateNotApplicable)
+	return true, nil
+}
+
+// buildNotApplicableParams renders the run-less Check Run. There is no
+// run to link, so details_url points at the Fishhawk root.
+func buildNotApplicableParams(headSHA, detailsURL string) forge.CreateCheckRunParams {
+	return forge.CreateCheckRunParams{
+		Name:       CheckName,
+		HeadSHA:    headSHA,
+		DetailsURL: detailsURL,
+		Status:     forge.CheckRunStatusCompleted,
+		// `success` is the documented one-line fallback if live
+		// validation refutes neutral satisfying a required context.
+		Conclusion:    forge.CheckRunConclusionNeutral,
+		OutputTitle:   "Not a Fishhawk-managed change",
+		OutputSummary: notApplicableSummary,
+	}
 }
 
 // resolveGitLab returns the GitLab forge the publisher routes a gitlab_ci
@@ -514,7 +667,7 @@ func parseRepo(s string) (forge.RepoRef, error) {
 // buildParams maps the (state, missing) tuple to GitHub's check-
 // run wire shape. Pending → in_progress; pass → success; fail →
 // failure with the missing list rendered as a markdown summary.
-func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, headSHA, detailsURL string) forge.CreateCheckRunParams {
+func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution, headSHA, detailsURL string) forge.CreateCheckRunParams {
 	params := forge.CreateCheckRunParams{
 		Name:       CheckName,
 		HeadSHA:    headSHA,
@@ -524,7 +677,7 @@ func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, he
 	case stagecheck.StatePass:
 		params.Status = forge.CheckRunStatusCompleted
 		params.Conclusion = forge.CheckRunConclusionSuccess
-		params.OutputSummary = "Audit chain is intact: plan, traces (raw + redacted), and pull request all present, audit chain verifies."
+		params.OutputSummary = "Audit chain is intact: plan, traces (raw + redacted), and pull request all present, audit chain verifies." + renderResolutions(resolved)
 	case stagecheck.StateFail:
 		params.Status = forge.CheckRunStatusCompleted
 		params.Conclusion = forge.CheckRunConclusionFailure
@@ -538,6 +691,35 @@ func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, he
 		params.OutputSummary = "Audit chain is still being assembled. Fishhawk will update this check when the run terminates."
 	}
 	return params
+}
+
+// renderResolutions appends one line per resolution to the PASS summary,
+// naming the child runs that actually supplied the evidence (#3092). Empty
+// for a run with no resolutions, so an ordinary pass summary is byte-identical
+// to the pre-#3092 text.
+func renderResolutions(resolved []auditcomplete.Resolution) string {
+	if len(resolved) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range resolved {
+		if len(r.ChildRunIDs) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "\n\nImplement stage %s is a decomposition fan-out parent; its traces were resolved from child runs: %s.",
+			shortID(r.StageID), strings.Join(r.ChildRunIDs, ", "))
+	}
+	return b.String()
+}
+
+// shortID renders the first 8 characters of a uuid, matching
+// auditcomplete's own detail-string convention.
+func shortID(id uuid.UUID) string {
+	s := id.String()
+	if len(s) >= 8 {
+		return s[:8]
+	}
+	return s
 }
 
 func renderFailureSummary(missing []auditcomplete.MissingItem) string {

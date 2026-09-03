@@ -75,6 +75,29 @@ import "sort"
 // stage's effective scope, and it is ALSO read as an invalidator by
 // server/prompt.go::resolveHeldCommitExemption, which demotes a stale
 // `exempted` decision when an amend supersedes it.
+// E64.2 / #3083 added stage_superseded_by_merge, the merge-supersede sweep's
+// per-stage marker: one chained entry per stage a merge terminalized as
+// `superseded` because the merge made it unreachable, naming the stage, its
+// type, the state it was parked in and the reason (merge_observed |
+// operator_reconcile | repair). It is APPENDED ONLY AFTER the compare-and-swap
+// that moved the stage actually succeeded, so a refused sweep leaves a MISSING
+// row rather than a false record of a supersession that never happened.
+// E64.32 / #3136 added merge_observation_recorded, the OBSERVE half of the
+// #3083 recovery pair: one chained entry per operator-invoked
+// POST /v0/runs/{run_id}/record-merge-observation that read the run's pull
+// request from the forge and found it merged. It carries the forge's merge
+// commit SHA, the forge's merged_at (WHEN the merge happened), observed_at
+// (when Fishhawk learned it) and reconciled_after_the_fact:true.
+//
+// It is DELIBERATELY DISTINCT from pr_merged rather than a synthetic pr_merged
+// row. pr_merged carries a LIVE-observation timestamp that the latency and cost
+// surfaces already read as "when Fishhawk knew", so back-dating one to the
+// forge's merge time would corrupt those series and lie about how the merge was
+// learned. Recording both timestamps under a separate category lets a reader
+// see the gap without back-dating anything.
+//
+// Internal fact-record kind projected through the audit chain — NOT a new
+// issue-comment surface (docs/issue-comment-surfaces.md).
 // E55.1 / #2242 added the two document-injection markers written by
 // backend/internal/repodoc: document_injected (one per repo-authored document
 // injected into an agent prompt, naming the resolved path, the PINNED commit,
@@ -116,6 +139,19 @@ import "sort"
 // written by the campaign row's own INSERT, because this emit (like every
 // campaign audit emit) is best-effort AFTER persistence. It is an INTERNAL,
 // audit-only category: it renders no issue comment.
+// E67.96 / #2862 added plan_budget_calibration_crossing, the plan-gate marker
+// written when the planner's PRE-calibration runtime estimate
+// (raw_predicted_runtime_minutes) and its calibrated predicted_runtime_minutes
+// straddle the resolved implement-stage budget — i.e. the fleet calibration
+// factor moved the estimate ACROSS the threshold. It records both estimates,
+// the number the gate actually read (max of the two), the implied factor, the
+// fleet ratio, the resolved budget and the gate outcome, so a decision the
+// factor influenced is reconstructable from the trail. A crossing is always
+// OVER budget by construction (the gate takes the maximum), so gate_outcome is
+// one of refused / decomposition_satisfied / override_acknowledged and NEVER
+// within_budget. It is written on EVERY one of those branches — including the
+// two that let the approval proceed — and is INTERNAL, audit-only: it renders
+// no issue comment and gates nothing.
 // When a new
 // canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
@@ -209,6 +245,7 @@ var KnownCategories = map[string]struct{}{
 	"issue_commented":                         {},
 	"lineage_violation":                       {},
 	"mcp_token_issued":                        {},
+	"merge_observation_recorded":              {},
 	"merge_verdict_recorded":                  {},
 	"model_resolved":                          {},
 	"operator_commit_vouched":                 {},
@@ -217,6 +254,7 @@ var KnownCategories = map[string]struct{}{
 	"parent_awaiting_redrive":                 {},
 	"plan_acceptance_precheck":                {},
 	"plan_add_scope_files_fans_into_slices":   {},
+	"plan_budget_calibration_crossing":        {},
 	"plan_budget_override_acknowledged":       {},
 	"plan_coerced":                            {},
 	"plan_comment_only_override_acknowledged": {},
@@ -300,6 +338,7 @@ var KnownCategories = map[string]struct{}{
 	"stage_override_retried":                  {},
 	"stage_permissions_declared":              {},
 	"stage_retried":                           {},
+	"stage_superseded_by_merge":               {},
 	"status_comment_posted":                   {},
 	"trace_uploaded":                          {},
 	"unpriced_model_alert":                    {},

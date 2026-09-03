@@ -29,6 +29,51 @@ const (
 	campaignsMaxLimit     = 200
 )
 
+// Issue-set resolution budget (E54.59 / #3113). The no-epic campaign source
+// resolves each named issue's depends_on through the forge, so a full ratified
+// grooming order costs one forge round-trip per item (plus one per distinct
+// out-of-set target). Before this the path had NO server-side deadline at all —
+// server.go sets ReadHeaderTimeout only, no WriteTimeout, no TimeoutHandler — so
+// the MCP client's own 30s http.Client wall was what gave up, producing a bare
+// transport error carrying no counts. #3113's original Summary diagnosed a
+// server-side 30s deadline on this path; that diagnosis was WRONG.
+//
+// DefaultIssueSetResolutionBudget is the shipped budget;
+// MaxIssueSetResolutionBudget is the PERMITTED MAXIMUM. Both are exported
+// because two other surfaces are pinned against them: fishhawkd names both
+// numbers in its startup refusal, and the MCP client's issue-set http.Client
+// timeout is set above MaxIssueSetResolutionBudget so the client can never be
+// what gives up first.
+//
+// MaxIssueSetResolutionBudget is a CONSTRUCTION-LEVEL ceiling, not merely a
+// flag check: issueSetResolutionBudget() clamps to it at the READ site, so no
+// Config construction path — a test, an embedded use, a second binary — can
+// exceed it (operator condition 1(a)).
+const (
+	DefaultIssueSetResolutionBudget = 120 * time.Second
+	MaxIssueSetResolutionBudget     = 10 * time.Minute
+)
+
+// issueSetResolutionBudget resolves the no-epic resolution budget at the READ
+// site: the default for a non-positive Config value, and otherwise the
+// configured value CLAMPED to MaxIssueSetResolutionBudget.
+//
+// The clamp is here rather than only in fishhawkd's flag handling because a
+// startup refusal in one entry point is not a construction-level guarantee —
+// server.Config is an exported struct any caller can build. Clamping where the
+// value is CONSUMED makes "the effective budget never exceeds
+// MaxIssueSetResolutionBudget" true however the Config was built, which is what
+// the MCP client's timeout relationship rests on.
+func (s *Server) issueSetResolutionBudget() time.Duration {
+	if s.cfg.IssueSetResolutionBudget <= 0 {
+		return DefaultIssueSetResolutionBudget
+	}
+	if s.cfg.IssueSetResolutionBudget > MaxIssueSetResolutionBudget {
+		return MaxIssueSetResolutionBudget
+	}
+	return s.cfg.IssueSetResolutionBudget
+}
+
 // campaignResponse is the JSON shape POST /v0/campaigns and
 // GET /v0/campaigns/{id} return. Field names + types match
 // docs/api/v0.openapi.yaml's `Campaign` schema exactly, mirroring
@@ -430,6 +475,46 @@ func baseCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
 // duplicate at 201. An empty header is equivalent to "not idempotent" — every
 // call mints a new campaign.
 func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
+	// requestStart anchors the no-epic issue-set resolution deadline (#3113).
+	//
+	// WHY HANDLER ENTRY AND NOT THE RESOLVER CALL (operator condition 1(b)):
+	// the MCP client's timeout measures the ENTIRE request, so a budget that
+	// started only at the resolver call would leave everything before it —
+	// auth, body decode, provider resolution, grooming-order resolution,
+	// installation lookup — outside the measured span and unbounded. The
+	// client could then still abort first, which is exactly this issue's
+	// defect. Anchoring at handler entry folds that pre-resolution work into
+	// the bounded span, which is where the unbounded per-item forge cost the
+	// budget exists for actually lives.
+	//
+	// WHAT STILL SITS OUTSIDE THE SERVER-BOUNDED SPAN (and is therefore NOT a
+	// "same span" guarantee — the honest framing after the #3113 fix-up). The
+	// resolveCtx below is cancelled the instant ResolveDependencies returns, so
+	// the server bounds ONLY [handler entry .. resolver return]. The client's
+	// 11-minute wall, by contrast, measures from before network transit to
+	// after the full response is read. Three pieces of the client's span are
+	// therefore OUTSIDE the server's budget:
+	//   (a) network transit in both directions;
+	//   (b) the middleware chain ahead of this handler (request-id, bearer
+	//       authentication — requireWriteScope reads an Identity the auth
+	//       middleware already resolved, so the token lookup runs before
+	//       requestStart);
+	//   (c) all POST-resolution handler work — campaign row + item row
+	//       persistence, the idempotency record, and response encoding + write.
+	// The one-minute margin (issueSetClientTimeout 11m − MaxIssueSetResolution-
+	// Budget 10m) must absorb (a)+(b)+(c). It is adequate for (c) because that
+	// work is local database writes on an already-open pool plus a small JSON
+	// encode, NOT per-item forge round-trips — it does not scale with issue
+	// count, the dimension #3113 is about. THIS IS AN ARGUED MARGIN, NOT A
+	// CONSTRUCTED GUARANTEE: no server-side deadline can bound client-side
+	// transit, and (c) is bounded by inspection rather than by a deadline.
+	//
+	// DO NOT "FIX" THIS BY WRAPPING THE WHOLE HANDLER IN A DEADLINE. Aborting
+	// after a resolution that already SUCCEEDED would throw away up to ten
+	// minutes of completed forge reads only to report a timeout for work that
+	// finished — strictly worse than letting the persistence + write run to
+	// completion. The deadline belongs on the resolver, which is where it is.
+	requestStart := time.Now()
 	if !s.requireWriteScope(w, r, "write:campaigns") {
 		return
 	}
@@ -708,14 +793,46 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 				map[string]any{"provider": conv.Provider})
 			return
 		}
-		result, err = resolver.ResolveDependencies(r.Context(), workmgmt.IssueSetRequest{
+		// Bound the resolution (#3113). The deadline is anchored at
+		// requestStart (see handleCreateCampaign's opening comment), so the
+		// budget covers the whole span the caller's client timeout measures,
+		// not just the resolver call. The EPIC branch above is deliberately
+		// untouched: EpicChildren reads the sibling set in ONE ListSubIssues
+		// call, so it does not have the per-item round-trip cost this bounds.
+		budget := s.issueSetResolutionBudget()
+		resolveCtx, cancelResolve := context.WithDeadline(r.Context(), requestStart.Add(budget))
+		result, err = resolver.ResolveDependencies(resolveCtx, workmgmt.IssueSetRequest{
 			Target: target,
 			// itemRefs is req.Items for the #2051 no-epic variant and the
 			// grooming order's rank-ordered refs for the #2238 variant — one
 			// resolution path, two ways of naming the set.
 			Items: itemRefs,
 		})
+		cancelResolve()
 		if err != nil {
+			// The typed deadline outcome FIRST: the resolver returns
+			// *workmgmt.IssueSetResolutionTimeout in preference to any wrapped
+			// fetch error, and it carries honest counts. Surfacing it as a 504
+			// with those counts is what turns "the request gave up" into an
+			// actionable refusal naming a grooming_order_limit that provably
+			// fits. Anything else keeps today's 502 byte-for-byte.
+			var timeout *workmgmt.IssueSetResolutionTimeout
+			if errors.As(err, &timeout) {
+				details := map[string]any{
+					"resolved":       timeout.Resolved,
+					"items_total":    timeout.Total,
+					"budget_seconds": int(budget / time.Second),
+				}
+				// SuggestedLimit 0 means "no value could be PROVEN to fit", so
+				// the key is OMITTED rather than shipped as a 0 the operator
+				// would read as a suggestion to request nothing.
+				if timeout.SuggestedLimit > 0 {
+					details["suggested_grooming_order_limit"] = timeout.SuggestedLimit
+				}
+				s.writeError(w, r, http.StatusGatewayTimeout, "issue_set_resolution_timeout",
+					"resolving the campaign's issue set exceeded the server's budget", details)
+				return
+			}
 			s.writeError(w, r, http.StatusBadGateway, "issue_set_resolution_failed",
 				"could not resolve the campaign's issue set",
 				map[string]any{"error": err.Error()})

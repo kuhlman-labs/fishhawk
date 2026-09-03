@@ -3090,6 +3090,97 @@ func TestBuild_Implement_CounterfactualDiscipline_DistinctFromFailureModeHeading
 	}
 }
 
+// behaviorClaimSweepHeading is the single heading constant shared by the #3013
+// presence and absence assertions, so the absence half cannot pass vacuously on
+// a typo'd literal that never matches the rendered prompt either way.
+const behaviorClaimSweepHeading = "### Behavior-change claim sweep — confirm in your PR Notes"
+
+// TestBuild_Implement_BehaviorClaimSweep_Rendered pins the #3013 sweep block on
+// the FULL implement path. It asserts the heading AND five phrase-level wants
+// carrying the load-bearing content — not just the heading — so a comment-only
+// no-op touch of prompt.go that adds no WriteString leaves every want missing.
+// Deleting the writeBehaviorClaimSweep call in buildImplement reddens this.
+func TestBuild_Implement_BehaviorClaimSweep_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  42,
+		ApprovedPlan: fixturePlan(),
+		// ApprovalConditions deliberately nil: the block is unconditional.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		behaviorClaimSweepHeading,
+		"the RATIONALE is part of the claim",                               // rule (a)
+		"sweep repo-wide, NOT file-local",                                  // rule (b)
+		"documented COMMAND is checkable by RUNNING it",                    // rule (c)
+		"ONLY inside your sandbox under the project's existing",            // rule (c) egress bound (#3013 security)
+		"never a documented command that pushes, publishes, or reaches an", // rule (c) egress bound
+		"NAME the sites you",                                               // rule (d) left-alone sites
+		"pin the FACT it depends on with a test",                           // escalation: pin the fact
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement prompt missing behavior-claim-sweep string %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Implement_BehaviorClaimSweep_RenderedOnFixup pins the #3013 sweep on
+// the FIX-UP path (buildImplementFixup), deliberately unlike the fix-up-exempt
+// #1199 checklist. Because this test and _Rendered drive two DIFFERENT builders
+// through two DIFFERENT call sites, deleting either single call site reddens
+// exactly one of them — that is the discrimination.
+func TestBuild_Implement_BehaviorClaimSweep_RenderedOnFixup(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		IssueNumber:   42,
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: []FixupConcern{{Text: "[medium/coverage] no test for the bound-exhausted path"}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, behaviorClaimSweepHeading) {
+		t.Errorf("fix-up prompt missing behavior-claim-sweep heading %q\n---\n%s", behaviorClaimSweepHeading, got)
+	}
+	if !strings.Contains(got, "Report BOTH the claims you corrected AND the sites you deliberately left alone") {
+		t.Errorf("fix-up prompt must carry the sweep's report-both instruction\n---\n%s", got)
+	}
+}
+
+// TestBuild_Implement_BehaviorClaimSweep_AbsentFromPlanPrompt is the self-paired
+// presence/absence case (#3013): the block is implement-scoped, so it must be
+// ABSENT from the plan prompt (which carries the frozen
+// testdata/plan-prompt-pre-change.golden) and PRESENT on the implement prompt,
+// asserted with the SAME heading constant so a typo'd literal cannot green the
+// absence half vacuously.
+func TestBuild_Implement_BehaviorClaimSweep_AbsentFromPlanPrompt(t *testing.T) {
+	planPrompt, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	if strings.Contains(planPrompt, behaviorClaimSweepHeading) {
+		t.Errorf("plan prompt must NOT carry the implement-scoped behavior-claim-sweep heading:\n%s", planPrompt)
+	}
+	implementPrompt, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  42,
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build(implement): %v", err)
+	}
+	if !strings.Contains(implementPrompt, behaviorClaimSweepHeading) {
+		t.Errorf("implement prompt must carry the behavior-claim-sweep heading (proves the absence half is not vacuous):\n%s", implementPrompt)
+	}
+}
+
 func TestBuild_Implement_FixupConcerns_Rendered(t *testing.T) {
 	concerns := []FixupConcern{
 		{Text: "[high/security] missing authz check on the fixup endpoint"},
@@ -4654,6 +4745,228 @@ func TestBuild_PlanReview_AcceptanceChecklistItems(t *testing.T) {
 	}
 }
 
+// planWithLiveValidationCriterion returns fixturePlan carrying ONE criterion
+// with all three acceptance-criterion markers set (#2978): the shape a
+// diff-only reviewer previously read as an unverified blocking criterion.
+// marked=false leaves the three fields at their zero values, giving the
+// unflagged control by construction rather than via a setup guard.
+func planWithLiveValidationCriterion(marked bool) *plan.Plan {
+	p := fixturePlan()
+	blocking := true
+	c := plan.AcceptanceCriterion{
+		ID:         "lv1",
+		Statement:  "helm install against a live cluster brings the release to Deployed",
+		Source:     plan.CriterionSourceInferred,
+		Rationale:  "the change ships a chart the sandbox cannot stand up",
+		Blocking:   &blocking,
+		VerifyHint: "operator runs scripts/dev k8s and reads helm status",
+	}
+	if marked {
+		c.SkipExpected = true
+		c.ExpectationBasis = "rendered output pinned by scripts/test-helm-render"
+		c.RequiresLiveValidation = true
+	}
+	p.Verification.AcceptanceCriteria = []plan.AcceptanceCriterion{c}
+	return p
+}
+
+// criterionLine returns the single rendered "Acceptance criteria:" line for
+// criterion id, so a negative assertion measures the CRITERION LINE and not
+// the review-criteria instruction block, which legitimately contains the same
+// marker tokens (binding approval condition 4).
+func criterionLine(t *testing.T, prompt, id string) string {
+	t.Helper()
+	prefix := "- [" + id + "] "
+	for _, ln := range strings.Split(prompt, "\n") {
+		if strings.HasPrefix(ln, prefix) {
+			return ln
+		}
+	}
+	t.Fatalf("no rendered criterion line for %q in prompt:\n%s", id, prompt)
+	return ""
+}
+
+// TestBuild_PlanReview_LiveValidationFlagsRendered pins that the three
+// acceptance-criterion markers reach the reviewer on the criterion line, in a
+// fixed order, with the DECLARED OPERATOR WALK annotation (#2978). Asserted
+// positionally so a reordering or a duplicated render fails.
+func TestBuild_PlanReview_LiveValidationFlagsRendered(t *testing.T) {
+	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: planWithLiveValidationCriterion(true)})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	line := criterionLine(t, got, "lv1")
+
+	segments := []string{
+		" verify_hint: operator runs scripts/dev k8s and reads helm status",
+		" skip_expected: true",
+		" expectation_basis: rendered output pinned by scripts/test-helm-render",
+		" requires_live_validation: true (DECLARED OPERATOR WALK",
+		"a tracked operator-validation walk is auto-filed on plan approval, so this is NOT a coverage defect)",
+	}
+	prev := -1
+	for _, seg := range segments {
+		i := strings.Index(line, seg)
+		if i < 0 {
+			t.Fatalf("criterion line missing segment %q:\n%s", seg, line)
+		}
+		if strings.Contains(line[i+len(seg):], seg) {
+			t.Errorf("segment %q rendered more than once:\n%s", seg, line)
+		}
+		if i <= prev {
+			t.Errorf("segment %q is out of order (index %d, previous %d):\n%s", seg, i, prev, line)
+		}
+		prev = i
+	}
+}
+
+// TestBuild_PlanReview_UnflaggedLiveTargetCriterionUnannotated pins the second
+// half of the done-means: the #2845 shape — a live-target criterion carrying
+// NONE of the markers — is still presented as an unverified criterion, and the
+// deterministic missing_live_validation_marker finding still reaches the
+// reviewer naming the criterion id. Negative assertions are scoped to the
+// criterion LINE (approval condition 4).
+func TestBuild_PlanReview_UnflaggedLiveTargetCriterionUnannotated(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: planWithLiveValidationCriterion(false),
+		PlanGateEvidence: &PlanGateEvidence{
+			AcceptancePrecheck: &AcceptancePrecheckEvidence{
+				AcceptanceStageID: "acceptance",
+				CriteriaCount:     1,
+				BlockingCount:     1,
+				Findings: []AcceptanceFindingEvidence{{
+					Rule:        plan.RuleMissingLiveValidationMarker,
+					CriterionID: "lv1",
+					Detail:      "statement names a live target but the criterion carries no requires_live_validation marker",
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	line := criterionLine(t, got, "lv1")
+	for _, unwanted := range []string{"skip_expected", "expectation_basis", "requires_live_validation", "DECLARED OPERATOR WALK"} {
+		if strings.Contains(line, unwanted) {
+			t.Errorf("unflagged criterion line must not carry %q:\n%s", unwanted, line)
+		}
+	}
+	wantFinding := "- FINDING " + plan.RuleMissingLiveValidationMarker + " (criterion: lv1): " +
+		"statement names a live target but the criterion carries no requires_live_validation marker"
+	if !strings.Contains(got, wantFinding) {
+		t.Errorf("gate evidence missing the unflagged-shape finding %q:\n%s", wantFinding, got)
+	}
+}
+
+// TestBuild_PlanReview_LiveValidationChecklistItem pins the SHIPPED WORDING of
+// review-criteria item 13 and of the verdict-rule clause (#2978). The exact
+// strings are asserted, not paraphrases, so a later reword cannot quietly
+// widen the narrow suppression (binding approval condition 3).
+func TestBuild_PlanReview_LiveValidationChecklistItem(t *testing.T) {
+	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	const wantItem = "13. **Declared operator walks**: a criterion marked `requires_live_validation` " +
+		"(paired with `skip_expected` + `expectation_basis`) is a DECLARED operator-validation walk, not a coverage " +
+		"gap — the acceptance sandbox is default-deny and provably cannot reach a live forge, cluster, or deployed " +
+		"target, and the marking is what files the tracked walk. The absence of a verification step deciding such a " +
+		"criterion is NOT a defect and MUST NOT be recorded as a coverage concern. These ARE still defects — flag " +
+		"them: (a) a criterion that needs a live target but carries no `requires_live_validation` marker (the plan " +
+		"gate reports this as the `missing_live_validation_marker` finding); (b) a marked criterion whose " +
+		"`verify_hint` names no executable walk, so the operator cannot actually perform it; (c) a marker used to " +
+		"dodge a check the sandbox COULD perform.\n\n"
+	if !strings.Contains(got, wantItem) {
+		t.Errorf("plan_review prompt missing review-criteria item 13 verbatim:\n%s", got)
+	}
+
+	const wantClause = "- A criterion's `requires_live_validation` marking is never, on its own, grounds " +
+		"for `reject`, nor on its own grounds for a coverage or verification-gap concern. That suppression is narrow: " +
+		"it covers ONLY coverage/verification-gap concerns arising from the MARKING ITSELF (record those only under " +
+		"the three cases in criterion 13). Concerns about the marked criterion's own statement text — testability, " +
+		"independence, falsifiability — are unaffected; keep recording them.\n\n"
+	if !strings.Contains(got, wantClause) {
+		t.Errorf("plan_review prompt missing the verdict-rule live-validation clause verbatim:\n%s", got)
+	}
+
+	// The clause belongs to the verdict decision rule, after the reject bullet.
+	iReject := strings.Index(got, "- `reject`: one or more blocking problems")
+	iClause := strings.Index(got, wantClause)
+	iItem := strings.Index(got, wantItem)
+	if iItem < 0 || iReject < 0 || iClause < 0 || iItem >= iReject || iReject >= iClause {
+		t.Errorf("item 13 / reject bullet / verdict clause are misordered: item=%d reject=%d clause=%d", iItem, iReject, iClause)
+	}
+}
+
+// TestBuild_PlanReview_LiveValidationRenderIsAdditive pins the additive
+// property SCOPED TO A MARKER-FREE CRITERION (#2978): the marked prompt
+// reduces to the unmarked prompt when exactly the three rendered segments are
+// removed, so no other prompt byte moved for a plan carrying no markers.
+func TestBuild_PlanReview_LiveValidationRenderIsAdditive(t *testing.T) {
+	mk := func(marked bool) string {
+		t.Helper()
+		got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: planWithLiveValidationCriterion(marked)})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+	on, off := mk(true), mk(false)
+	stripped := on
+	for _, seg := range []string{
+		" skip_expected: true",
+		" expectation_basis: rendered output pinned by scripts/test-helm-render",
+		liveValidationCriterionAnnotation,
+	} {
+		stripped = strings.Replace(stripped, seg, "", 1)
+	}
+	if stripped != off {
+		t.Error("the marker rendering is not a clean additive insertion over the marker-free prompt")
+	}
+}
+
+// TestBuild_ImplementReview_LiveValidationFlagsRendered pins the positive half
+// of the reach claim (#2978): the markers land in the implement-review prompt
+// too, because writeAcceptanceCriteriaForReview is reached from
+// writePlanForReview, which all three review builders call. Without this, only
+// the plan-review path was asserted and the README's "all three" claim rested
+// on reading rather than on a test. The marker-free control pins the other
+// half — an unmarked plan's implement_review criterion line is unchanged.
+func TestBuild_ImplementReview_LiveValidationFlagsRendered(t *testing.T) {
+	mk := func(marked bool) string {
+		t.Helper()
+		got, err := Build("implement_review", Trigger{
+			Repo:         "x/y",
+			ApprovedPlan: planWithLiveValidationCriterion(marked),
+			Diff:         "- M pkg/bar/bar.go\n",
+		})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+
+	marked := criterionLine(t, mk(true), "lv1")
+	for _, seg := range []string{
+		" skip_expected: true",
+		" expectation_basis: rendered output pinned by scripts/test-helm-render",
+		liveValidationCriterionAnnotation,
+	} {
+		if !strings.Contains(marked, seg) {
+			t.Errorf("implement_review criterion line missing segment %q:\n%s", seg, marked)
+		}
+	}
+
+	unmarked := criterionLine(t, mk(false), "lv1")
+	for _, unwanted := range []string{"skip_expected", "expectation_basis", "requires_live_validation", "DECLARED OPERATOR WALK"} {
+		if strings.Contains(unmarked, unwanted) {
+			t.Errorf("marker-free implement_review criterion line must not carry %q:\n%s", unwanted, unmarked)
+		}
+	}
+}
+
 func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// #606: the verbose verdict-schema / review-criteria / decision-rule
 	// preamble was trimmed to lower the per-call token cost on the local
@@ -4696,7 +5009,13 @@ func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// framing + BEGIN/END delimiters, minus the 36 bytes the raw body write
 	// used): the envelope is in the current (trimmed) prompt AND would be in
 	// the untrimmed version, so the baseline moves with it (5362 + 746).
-	const preTrimBaselineLen = 6108
+	// #2978 raised it by the 1333 bytes the live-validation instruction adds
+	// (review-criteria item 13 at 858 bytes plus the verdict-rule clause at 476,
+	// less the 1 byte item 12 gave up when its trailing blank line moved onto
+	// item 13): like the blocks above, both are in the current (trimmed) prompt
+	// AND would be in the untrimmed version, so the baseline moves with them
+	// (6108 + 1333).
+	const preTrimBaselineLen = 7441
 	got := buildPlanReview(Trigger{
 		Repo:         "kuhlman-labs/example",
 		IssueNumber:  42,
@@ -12293,7 +12612,7 @@ func TestWriteGateEvidence_FixupCounterfactuals_RenderPerObserved(t *testing.T) 
 				t.Errorf("prompt missing %q:\n%s", tc.want, got)
 			}
 			for _, w := range []string{
-				"### Fix-up counterfactual self-report (agent CLAIM — not a runner observation)",
+				"### Counterfactual self-report (agent CLAIM — not a runner observation)",
 				"The verify runs above are what the RUNNER MEASURED",
 				"only what the AGENT SAYS IT DID",
 				"`observed: red` does NOT establish that the control discriminates",
@@ -12312,8 +12631,14 @@ func TestWriteGateEvidence_FixupCounterfactuals_OmittedWhenEmpty(t *testing.T) {
 	got := implementReviewWithGateEvidence(t, &GateEvidence{
 		VerifyRuns: []GateVerifyRun{{Command: "scripts/test", ExitCode: 0, Outcome: "passed", OutputTail: "ok\n"}},
 	})
-	if strings.Contains(got, "Fix-up counterfactual self-report") {
+	// The HEADING is the absence assertion. A bare "Counterfactual self-report"
+	// substring would false-match standing rule 8, which names the block by
+	// title when telling the reviewer where structured evidence appears.
+	if strings.Contains(got, "### Counterfactual self-report (agent CLAIM — not a runner observation)") {
 		t.Errorf("empty counterfactual slice must render nothing:\n%s", got)
+	}
+	if strings.Contains(got, "### Fix-up counterfactual self-report") {
+		t.Errorf("the old fix-up-only title must not survive anywhere:\n%s", got)
 	}
 }
 
@@ -12340,6 +12665,266 @@ func TestWriteFixupSelfReport_CounterfactualsInstruction(t *testing.T) {
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("fix-up self-report instruction missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Plan_CalibrationHint_RequiresRawEstimate pins the #2862 rewrite of
+// the calibration-hint block: when a hint IS rendered, the planner is told to
+// report BOTH numbers — the calibrated one in predicted_runtime_minutes and the
+// pre-calibration one in raw_predicted_runtime_minutes — and that the budget
+// gate reads the LARGER of the two, so applying a sub-1.0 factor cannot dissolve
+// a decomposition requirement. Without that instruction the raw estimate is
+// destroyed at the source and the gate has nothing to compare (the defect the
+// issue reports), so this is the prompt-side half of the fix.
+func TestBuild_Plan_CalibrationHint_RequiresRawEstimate(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber:           7,
+		Repo:                  "x/y",
+		ImplementStageTimeout: 60 * time.Minute,
+		CalibrationHint: &CalibrationHint{
+			Samples:          9,
+			CalibrationRatio: 0.56,
+			ConfidenceBands: map[string]CalibrationBand{
+				"medium": {Samples: 9, WithinScale: 7},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		// The field the planner must populate, named exactly as the schema spells it.
+		"raw_predicted_runtime_minutes",
+		// The calibrated value keeps its existing meaning.
+		"write the CALIBRATED value to predicted_runtime_minutes",
+		// The max/larger-of-the-two rule the gate applies.
+		"evaluates the LARGER of the two",
+		// The consequence: the RAW estimate is what decides decomposition,
+		// resolved against this run's real implement budget.
+		"if your RAW estimate exceeds the implement-stage budget (60 minutes) you MUST populate decomposition.sub_plans",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("hint-bearing plan prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Plan_NoCalibrationHint_OmitsRawEstimateInstruction is the negative
+// half (#2862): a workflow with no resolvable calibration history renders no
+// hint, so the prompt must NOT carry the report-both-numbers instruction — a
+// planner shown no factor has no meaningful raw/calibrated distinction to draw,
+// and instructing it anyway would invite a fabricated second number. The
+// decomposition instruction still NAMES the field (the gate reads it whenever
+// it is present), so this asserts on the hint block's instruction text, not on
+// the bare field name.
+func TestBuild_Plan_NoCalibrationHint_OmitsRawEstimateInstruction(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber:           7,
+		Repo:                  "x/y",
+		ImplementStageTimeout: 60 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Calibration hint") {
+		t.Fatalf("precondition failed: no hint was configured but the section rendered:\n%s", got)
+	}
+	for _, bad := range []string{
+		"write the CALIBRATED value to predicted_runtime_minutes",
+		"evaluates the LARGER of the two",
+	} {
+		if strings.Contains(got, bad) {
+			t.Errorf("hint-less plan prompt should not carry the calibration instruction %q:\n%s", bad, got)
+		}
+	}
+	// The artifact-contract instruction is NOT conditional on the hint: the gate
+	// reads raw_predicted_runtime_minutes whenever the plan carries it, so even a
+	// hint-less prompt must state which number the budget is measured against.
+	// This is also what keeps the absence assertions above non-vacuous — they
+	// target the hint block's report-both-numbers wording, not the bare field name.
+	if !strings.Contains(got, "measured against the LARGER of predicted_runtime_minutes and raw_predicted_runtime_minutes, which is the number the budget gate reads") {
+		t.Errorf("hint-less plan prompt should still state which number the decomposition threshold is measured against:\n%s", got)
+	}
+}
+
+// TestBuild_Plan_DecomposeRequired_NamesGateNumber pins the re-plan preamble
+// (#2862): a plan rejected for exceeding the budget is told the gate reads the
+// LARGER of the two estimates, so a replan that shrinks only the calibrated
+// value will not clear it.
+func TestBuild_Plan_DecomposeRequired_NamesGateNumber(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber:       7,
+		Repo:              "x/y",
+		DecomposeRequired: true,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"The gate reads the LARGER of predicted_runtime_minutes and raw_predicted_runtime_minutes",
+		"shrinking only the calibrated value will not clear it",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("decompose-required preamble missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// --- #2929 counterfactual sidecar + standing rule 8 ------------------------
+
+const (
+	cfSidecarRunID   = "aaaaaaaa-1111-2222-3333-444444444444"
+	cfSidecarStageID = "bbbbbbbb-5555-6666-7777-888888888888"
+)
+
+// TestBuild_Implement_CounterfactualSidecar_Rendered: the full implement prompt
+// names the run/stage-keyed sidecar path with the ids SUBSTITUTED (which is what
+// pins the format string against the runner's independent copy), and states the
+// diff-only / PR-body limitation that is the whole reason the sidecar exists.
+func TestBuild_Implement_CounterfactualSidecar_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		IssueNumber:      42,
+		ApprovedPlan:     fixturePlan(),
+		ImplementRunID:   cfSidecarRunID,
+		ImplementStageID: cfSidecarStageID,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"#### Also record each counterfactual in the machine-readable sidecar",
+		CounterfactualReportPath(cfSidecarRunID, cfSidecarStageID),
+		"/tmp/fishhawk-counterfactuals-" + cfSidecarRunID + "-" + cfSidecarStageID + ".json",
+		"The implement review is DIFF-ONLY",
+		"it does NOT receive the pull-request body",
+		"`observed` MUST be exactly `red`, `green`, or `not_run`",
+		"an absent `restored` is NOT the same claim as `false`",
+		"any entry past the first 20",
+		"unwitnessed CLAIMS",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement prompt missing counterfactual sidecar string %q\n---\n%s", w, got)
+		}
+	}
+	// The PR `## Notes` obligation is NOT weakened by the sidecar.
+	if !strings.Contains(got, "Record the observed RED output for each cycle in your PR `## Notes`") {
+		t.Errorf("the sidecar must NOT displace the PR Notes reporting obligation\n---\n%s", got)
+	}
+}
+
+// TestBuild_Implement_CounterfactualSidecar_OmittedWithoutIDs: with EMPTY
+// run/stage ids the sub-block is omitted entirely rather than naming a
+// malformed unkeyed path — while the unchanged PR-Notes counterfactual
+// discipline still renders. Self-paired: a presence and an absence over the
+// SAME prompt.
+func TestBuild_Implement_CounterfactualSidecar_OmittedWithoutIDs(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  42,
+		ApprovedPlan: fixturePlan(),
+		// ImplementRunID / ImplementStageID deliberately empty.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### Counterfactual attainability — confirm in your PR Notes") {
+		t.Errorf("the unchanged PR-Notes discipline must still render without ids\n---\n%s", got)
+	}
+	if strings.Contains(got, "#### Also record each counterfactual in the machine-readable sidecar") {
+		t.Errorf("empty ids must OMIT the sidecar sub-block\n---\n%s", got)
+	}
+	if strings.Contains(got, "/tmp/fishhawk-counterfactuals-") {
+		t.Errorf("empty ids must never render an unkeyed sidecar path\n---\n%s", got)
+	}
+}
+
+// TestBuild_Implement_CounterfactualSidecar_AbsentOnFixup: the fix-up prompt
+// does NOT render the sidecar sub-block — the fix-up agent is already told about
+// its own sidecar by writeFixupSelfReport, and a second instruction would split
+// one signal across two files. FixupSelfReportPath IS asserted present, which
+// proves the ids were populated on this fixture, so the absence is the
+// buildImplement-only call site and not an empty-id artifact.
+func TestBuild_Implement_CounterfactualSidecar_AbsentOnFixup(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		IssueNumber:      42,
+		ApprovedPlan:     fixturePlan(),
+		FixupConcerns:    []FixupConcern{{Text: "[medium/coverage] no test for the bound-exhausted path"}},
+		ImplementRunID:   cfSidecarRunID,
+		ImplementStageID: cfSidecarStageID,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, FixupSelfReportPath(cfSidecarRunID, cfSidecarStageID)) {
+		t.Fatalf("fix-up fixture must carry populated ids (self-report path absent)\n---\n%s", got)
+	}
+	if strings.Contains(got, "#### Also record each counterfactual in the machine-readable sidecar") {
+		t.Errorf("the fix-up prompt must NOT render the initial-pass sidecar sub-block\n---\n%s", got)
+	}
+	if strings.Contains(got, CounterfactualReportPath(cfSidecarRunID, cfSidecarStageID)) {
+		t.Errorf("the fix-up prompt must NOT name the initial-pass sidecar path\n---\n%s", got)
+	}
+}
+
+// TestWriteGateEvidence_CounterfactualTitleIsPassAgnostic: the reviewer-facing
+// block renders under the pass-agnostic title, the row format is intact, and no
+// 'fix-up pass' wording survives in the block's lead sentence.
+func TestWriteGateEvidence_CounterfactualTitleIsPassAgnostic(t *testing.T) {
+	got := implementReviewWithGateEvidence(t, &GateEvidence{
+		FixupCounterfactuals: []GateFixupCounterfactual{
+			{ControlPath: "a/guard.go", Observed: "red", Restored: true},
+		},
+	})
+	if !strings.Contains(got, "### Counterfactual self-report (agent CLAIM — not a runner observation)") {
+		t.Errorf("missing the pass-agnostic block title\n---\n%s", got)
+	}
+	if strings.Contains(got, "### Fix-up counterfactual self-report") {
+		t.Errorf("the old fix-up-only title must not survive\n---\n%s", got)
+	}
+	if !strings.Contains(got, "For each control this pass added or tightened") {
+		t.Errorf("the lead sentence must be pass-agnostic\n---\n%s", got)
+	}
+	if !strings.Contains(got, "- a/guard.go — observed: red, restored: yes") {
+		t.Errorf("the row format must be unchanged\n---\n%s", got)
+	}
+}
+
+// TestImplementReview_StandingRule8_Rendered: rule 8 renders on the
+// implement-review prompt, is ORDERED after rule 7, and rules 1-7 are unmoved —
+// the verdict rule's "standing rule 7" cross-reference must still resolve.
+func TestImplementReview_StandingRule8_Rendered(t *testing.T) {
+	got := implementReviewWithGateEvidence(t, &GateEvidence{
+		VerifyRuns: []GateVerifyRun{{Command: "scripts/test", ExitCode: 0, Outcome: "passed", OutputTail: "ok\n"}},
+	})
+	const rule7 = "7. **Do NOT reject on an unconfirmable absence (standing rule)**"
+	const rule8 = "8. **Evidence you cannot see is an evidence-PLACEMENT observation, never a change defect (standing rule)**"
+	i7 := strings.Index(got, rule7)
+	i8 := strings.Index(got, rule8)
+	if i7 < 0 {
+		t.Fatalf("standing rule 7 must be unmoved and byte-identical\n---\n%s", got)
+	}
+	if i8 < 0 {
+		t.Fatalf("standing rule 8 must render\n---\n%s", got)
+	}
+	if i8 < i7 {
+		t.Errorf("standing rule 8 must follow rule 7 (got 8 at %d, 7 at %d)", i8, i7)
+	}
+	for _, w := range []string{
+		"4. **Scope adherence (flag-only)**",
+		"5. **Grounded citations**",
+		"6. **Style is out of scope**",
+		"standing rule 7",
+		"is NOT part of the material available to this review",
+		"'Counterfactual self-report' block above",
+		"do NOT reject on it",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement-review prompt missing %q\n---\n%s", w, got)
 		}
 	}
 }

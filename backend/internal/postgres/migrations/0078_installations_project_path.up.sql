@@ -1,0 +1,34 @@
+-- 0078: record the GitLab project PATH on installations so the run-creation
+-- authorization gate can bind it EXACTLY (E45.26 / #2877, ADR-058).
+--
+-- Before this column, gitLabProjectRegistry.AuthorizedGitLabProject
+-- (backend/cmd/fishhawkd/serve.go) had nothing to compare a payload's
+-- path_with_namespace against, so it could only bind the path's FIRST segment
+-- to the owning account's account_key. A registered 'gitlab:4242' under account
+-- 'acme' was therefore admitted paired with ANY 'acme/*' path, leaving the
+-- workflow-spec read (the one payload-path-selected forge call) steerable to a
+-- sibling project inside the tenant.
+--
+-- NULLABLE, no DEFAULT, and NO BACKFILL — all three deliberate:
+--
+--   * NULLABLE + no DEFAULT means PostgreSQL adds the column without a table
+--     rewrite, so this applies to a live database with no maintenance window
+--     (https://www.postgresql.org/docs/current/sql-altertable.html).
+--   * A pre-existing row is left UNBOUND on purpose. There is no correct value
+--     to invent for it: the project path is an operator authorization decision,
+--     and a GitLab delivery is authenticated by a shared token with no HMAC
+--     over the body, so deriving one from the payload would be deriving the
+--     authorization from the thing being authorized.
+--   * The authorizer therefore REFUSES an unbound gitlab row fail-closed rather
+--     than falling back to the old namespace-only admit, auditing the refusal
+--     as run_rejected_misconfigured with reason 'gitlab_project_path_unbound'.
+--     Operators enumerate affected rows with `fishhawkd installation list`
+--     (which marks them '(unbound)') and repair each with `fishhawkd
+--     installation register --project-path <namespace>/<project>`; the upsert is
+--     idempotent on (provider, installation_ref). See docs/deploy/gitlab.md.
+--
+-- The column is provider-agnostic in SQL but only meaningful for provider
+-- 'gitlab': `fishhawkd installation register` requires it for a gitlab
+-- registration and ignores it for github, whose identity arrives inside an
+-- HMAC-signed payload and is resolved through installation_id instead.
+ALTER TABLE installations ADD COLUMN project_path text;

@@ -137,13 +137,17 @@ func TestRenderStatusBody_StagesEachStateRendered(t *testing.T) {
 		{ID: uuid.New(), Sequence: 5, Type: run.StageTypePlan, State: run.StageStateSucceeded},
 		{ID: uuid.New(), Sequence: 6, Type: run.StageTypePlan, State: run.StageStateFailed},
 		{ID: uuid.New(), Sequence: 7, Type: run.StageTypePlan, State: run.StageStateCancelled},
+		// Merge-supersede terminal state (#3083): the merge made this stage
+		// unreachable. It gets its OWN glyph rather than reusing cancelled's —
+		// the whole point of the state is that it records a different fact.
+		{ID: uuid.New(), Sequence: 8, Type: run.StageTypeAcceptance, State: run.StageStateSuperseded},
 	}
 	body := issuecomment.RenderStatusBody(r, stages, nil, "https://x", time.Now())
 	// Each state-text should appear; if the renderer falls back to
 	// the "❓" glyph for an unknown state the substring check still
 	// passes (state text is present), but it'd surface as a missing
 	// icon in a follow-up assertion. Closed-set guard:
-	for _, icon := range []string{"⏳", "🚀", "🔄", "👋", "✅", "❌", "🚫"} {
+	for _, icon := range []string{"⏳", "🚀", "🔄", "👋", "✅", "❌", "🚫", "⤳"} {
 		if !strings.Contains(body, icon) {
 			t.Errorf("stage section missing icon %q\n---\n%s", icon, body)
 		}
@@ -934,5 +938,32 @@ func TestRenderStatusBody_StateIconsForRunLevel(t *testing.T) {
 				t.Errorf("header missing icon %q for state %q\n---\n%s", tc.icon, tc.state, body)
 			}
 		})
+	}
+}
+
+// TestRenderStatusBody_SupersededGlyphIsDistinct pins the RENDERED glyph for
+// the merge-supersede state (#3083) on its own, because the closed-set guard
+// above would stay green if `superseded` reused cancelled's 🚫. The state
+// exists precisely to record a DIFFERENT fact than cancelled (nobody halted the
+// run; the merge removed the stage's reason to exist), so rendering it as
+// cancelled would reintroduce the dishonesty the state was added to remove.
+//
+// stageStateIcon's fallback is ❓, so a missing case is visible rather than a
+// compile error — which is why this asserts on the rendered output.
+func TestRenderStatusBody_SupersededGlyphIsDistinct(t *testing.T) {
+	runID := uuid.New()
+	r, _ := statusRun(t, runID)
+	stages := []*run.Stage{
+		{ID: uuid.New(), Sequence: 1, Type: run.StageTypeAcceptance, State: run.StageStateSuperseded},
+	}
+	body := issuecomment.RenderStatusBody(r, stages, nil, "https://x", time.Now())
+	if !strings.Contains(body, "⤳") {
+		t.Errorf("superseded stage did not render its own glyph:\n---\n%s", body)
+	}
+	if strings.Contains(body, "❓") {
+		t.Errorf("superseded fell through to the unknown-state fallback ❓; stageStateIcon is missing its case:\n---\n%s", body)
+	}
+	if strings.Contains(body, "🚫") {
+		t.Errorf("superseded rendered cancelled's 🚫; the two states record different facts:\n---\n%s", body)
 	}
 }

@@ -54,6 +54,11 @@
       "enum": ["low", "medium", "high"],
       "description": "Agent's confidence in predicted_runtime_minutes. low = rough guess; medium = reasonably grounded; high = well-understood scope."
     },
+    "raw_predicted_runtime_minutes": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional (#2862). The planner's PRE-calibration runtime estimate in minutes — the number it arrived at BEFORE multiplying by the fleet calibration factor the plan-stage calibration hint supplied. predicted_runtime_minutes keeps its existing meaning (the CALIBRATED value, so the dynamic implement kill cap and the runtime_observed calibration series are unperturbed); this field carries the raw one alongside it. The implement-budget gate evaluates max(predicted_runtime_minutes, raw_predicted_runtime_minutes), so a sub-1.0 calibration factor can never pull a plan under the budget and dissolve a required decomposition, while a factor above 1.0 can still push one over — calibration applies only in the structure-ADDING direction. Populate it whenever the prompt rendered a calibration hint; omitting it is legal (additive-optional within standard_v1) and leaves the gate reading predicted_runtime_minutes exactly as before, but a hint-bearing plan that omits it draws a plan_warnings advisory because the gate then cannot verify that calibration did not clear the budget. Equal to predicted_runtime_minutes is legitimate (factor 1.0, or no hint rendered)."
+    },
     "decomposition": {
       "type": "object",
       "additionalProperties": false,

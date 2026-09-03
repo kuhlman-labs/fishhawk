@@ -233,13 +233,25 @@ var ErrPushedTreeNotVerified = errors.New("gitops: pushed tree was not verified 
 // reported no changes while leaving its work behind rather than on the branch
 // (#2884, run 8ae65577). The stranding shapes are a net-new stash entry (a
 // stash is never a valid terminal artifact), a local HEAD that advanced past
-// the fix-up base tip in unpushed commits, or a commit created during the pass
-// that is dangling — reachable from neither the base tip nor the branch, the
-// exact residue a `fishhawk verify wip` commit leaves after gitResetSoftHEAD1
-// unwinds it (the orphan 0421daeb/b6925a64 shape). Returned before any success
-// report so the runner fails the stage category-B (re-scope/re-plan) and #788
-// recovery restores the pre-fix-up review gate instead of certifying work that
-// is not on the pull request.
+// the fix-up base tip in unpushed commits, or work the committed-tree verify
+// gate CERTIFIED that reached neither the working tree nor the branch — the
+// gate records the tree object hash of the scope-only throwaway commit it
+// certified, and the probe reports a stranding when that hash differs from the
+// tree of the fix-up base tip (both resolved from the object graph) while the
+// pass reports no changes (#3022).
+//
+// A DANGLING COMMIT is NOT one of these shapes and is no longer covered by any
+// probe. #2884 shipped a reflog provenance walk that claimed to detect one; it
+// was removed in #3023 as provably inert — its pre-pass snapshot was captured
+// after the verify gate had already created and unwound its throwaway
+// `fishhawk verify wip` commit, so the orphan 0421daeb/b6925a64 shape was
+// already in its own baseline and skipped. The verified-tree probe covers that
+// incident shape by a different route; see runner/README.md "The
+// dangling-commit gap".
+//
+// Returned before any success report so the runner fails the stage category-B
+// (re-scope/re-plan) and #788 recovery restores the pre-fix-up review gate
+// instead of certifying work that is not on the pull request.
 var ErrFixupWorkStranded = errors.New("gitops: fix-up work is stranded in local commits or a stash")
 
 // ErrFixupPushNotLanded is the category-B sentinel for a fix-up pass that

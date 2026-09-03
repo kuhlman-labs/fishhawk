@@ -40,6 +40,20 @@ type config struct {
 	agentBinary  string
 	agentVersion string
 
+	// handoff is set at runtime (not a flag), in run() after parseFlags: the
+	// per-stage memo of the agent's delete-after-read /tmp handoffs (#2840),
+	// armed immediately before the FIRST openPRAndShipArtifact call of an
+	// implement stage and nil everywhere else. Same runtime-set idiom as
+	// agentBinary/agentVersion above.
+	//
+	// config is copied BY VALUE into every callee, but this field is a
+	// POINTER, so both openPRAndShipArtifact calls of a base-rebase-conflict
+	// re-invoke share ONE memo — without adding a 16th parameter to a function
+	// with 38 test call sites and two shared wire goldens that construct its
+	// args directly. A nil handoff is a pure load (agentHandoff's methods are
+	// nil-tolerant), so every un-armed path behaves exactly as before.
+	handoff *agentHandoff
+
 	// agent selects the coding-agent provider the runner invokes
 	// (E22.X / #839). Maps 1:1 onto an agent.Invoker via
 	// selectInvoker: "claude-code" (default) wires the existing

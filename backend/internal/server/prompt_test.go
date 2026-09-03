@@ -1849,6 +1849,15 @@ func TestGetStagePrompt_StateGuard_Cancelled(t *testing.T) {
 	testPromptStateGuard(t, run.StageStateCancelled, http.StatusConflict)
 }
 
+// A merge-superseded stage is terminal (#3083): the merge made it unreachable,
+// so the runner-facing prompt endpoint must refuse it exactly as it refuses a
+// succeeded/failed/cancelled stage. Without the guard arm the endpoint would
+// hand a prompt to a stage that can never run, and the 409's current_state
+// detail is what tells the caller which terminal fact it hit.
+func TestGetStagePrompt_StateGuard_Superseded(t *testing.T) {
+	testPromptStateGuard(t, run.StageStateSuperseded, http.StatusConflict)
+}
+
 func TestGetStagePrompt_StateGuard_Pending_Passes(t *testing.T) {
 	testPromptStateGuard(t, run.StageStatePending, http.StatusOK)
 }
@@ -1912,6 +1921,14 @@ func TestGetStagePromptRender_StateGuard_Failed(t *testing.T) {
 
 func TestGetStagePromptRender_StateGuard_Cancelled(t *testing.T) {
 	testPromptRenderStateGuard(t, run.StageStateCancelled, http.StatusConflict)
+}
+
+// The SPA-facing render endpoint carries its OWN copy of the state guard
+// (prompt.go has two switches, not one shared helper), so the superseded arm
+// needs its own assertion here — editing only one switch is invisible to the
+// compiler (#3083).
+func TestGetStagePromptRender_StateGuard_Superseded(t *testing.T) {
+	testPromptRenderStateGuard(t, run.StageStateSuperseded, http.StatusConflict)
 }
 
 func TestGetStagePromptRender_StateGuard_Pending_Passes(t *testing.T) {
@@ -3874,9 +3891,12 @@ func TestResolveFixupExpectedHeadSHA_ReadErrorOmitsField(t *testing.T) {
 
 // TestResolveAcceptanceExpectedHeadSHA_ReadErrorOmitsField: the E31.18
 // merge-candidate resolver shares the best-effort posture — a
-// ListForRunByCategory failure must WARN and return "" (the runner's
-// identity gate then degrades to unverifiable-warn) rather than failing
-// the acceptance dispatch.
+// ListForRunByCategory failure must WARN and return "" rather than failing
+// the PROMPT BUILD. The consequence downstream changed in #3091: the
+// dispatch gates now REFUSE on the omitted expectation
+// (acceptance_expected_head_unresolved) instead of degrading to an
+// unverifiable warn, so the resolver's degrade parks the stage rather than
+// shipping an unfalsifiable verdict.
 func TestResolveAcceptanceExpectedHeadSHA_ReadErrorOmitsField(t *testing.T) {
 	s := New(Config{
 		Addr:      "127.0.0.1:0",
@@ -8339,9 +8359,12 @@ func TestGetStagePrompt_Acceptance_ServesExpectedHeadSHA(t *testing.T) {
 
 // TestGetStagePrompt_Acceptance_EmptyLedger_ExpectedHeadSHAOmitted pins the
 // WARN-and-omit posture: an acceptance stage on a run with NO reported-head
-// ledger entries omits acceptance_expected_head_sha entirely (omitempty), so
-// the runner's identity gate degrades to unverifiable-warn rather than
-// comparing against an empty expectation.
+// ledger entries (and no consolidated fan-in record) omits
+// acceptance_expected_head_sha entirely (omitempty) rather than shipping an
+// empty string. Since #3091 the runner's identity gate FAILS a declared-target
+// stage on that absence (acceptance_expected_head_unresolved) instead of
+// degrading to an unverifiable warn — the field's absence is the signal, and
+// this test pins the absence, not the downstream reaction.
 func TestGetStagePrompt_Acceptance_EmptyLedger_ExpectedHeadSHAOmitted(t *testing.T) {
 	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
 	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
@@ -12440,5 +12463,164 @@ func TestResolveStageGateEvidence_FoldedExtractFailureStillReturnsEvidence(t *te
 	if ev.VerifyEvidenceUnavailableReason != "" {
 		t.Errorf("VerifyEvidenceUnavailableReason = %q, want empty on a populated verify tail",
 			ev.VerifyEvidenceUnavailableReason)
+	}
+}
+
+// makeIntegrationCommitEntry renders an integration_commit_recorded audit entry
+// at the given SEQUENCE — the incremental fan-in record the orchestrator writes
+// on the DECOMPOSED PARENT's own chain as each "Integrate slice N" merge commit
+// is created (#1806). Sequence, not timestamp, is the ordering key the #3091
+// consolidated fallback reads.
+func makeIntegrationCommitEntry(runID uuid.UUID, seq int64, mergeSHA string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{"merge_sha": mergeSHA})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), Category: "integration_commit_recorded", RunID: &rid,
+		Sequence: seq, Timestamp: time.Now().UTC(), Payload: payload}
+}
+
+// TestResolveAcceptanceExpectedHeadSHA_ConsolidatedFanIn is the #3091 done-means
+// (a): a DECOMPOSED PARENT's own chain carries NO reported-head entry — each
+// child's child_pushed/fixup_pushed lands on the CHILD's chain and the
+// consolidated PR is opened with a pull_request_url-only payload — so the head
+// must resolve from the parent's OWN incremental fan-in ledger. Two ascending
+// integration entries are seeded and the NEWEST merge_sha (the consolidated
+// branch tip) must win; that ordering assertion is what makes the fixture
+// discriminating rather than incidentally correct.
+func TestResolveAcceptanceExpectedHeadSHA_ConsolidatedFanIn(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const olderMerge = "1111111aaaabbbbccccddddeeeeffff000011112"
+	const newestMerge = "2222222aaaabbbbccccddddeeeeffff000022223"
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+		runID: {
+			makeIntegrationCommitEntry(runID, 7, olderMerge),
+			makeIntegrationCommitEntry(runID, 12, newestMerge),
+		},
+	}}})
+	if got := s.resolveAcceptanceExpectedHeadSHA(context.Background(), runID, stageID); got != newestMerge {
+		t.Errorf("= %q, want the NEWEST fan-in merge %q (the consolidated branch tip)", got, newestMerge)
+	}
+}
+
+// TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins pins that the #3091
+// fallback is strictly SUBORDINATE: a run carrying BOTH a reported head and an
+// integration entry resolves the REPORTED head, so every non-decomposed run's
+// value is byte-identical to before the change.
+func TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const reported = "abc1234def567890abc1234def567890abc12345"
+	const merge = "2222222aaaabbbbccccddddeeeeffff000022223"
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+		runID: {
+			makeReportedHeadEntry(runID, stageID, "pull_request_opened", reported, time.Now().UTC()),
+			makeIntegrationCommitEntry(runID, 99, merge),
+		},
+	}}})
+	if got := s.resolveAcceptanceExpectedHeadSHA(context.Background(), runID, stageID); got != reported {
+		t.Errorf("= %q, want the REPORTED head %q — the fan-in fallback must never override it", got, reported)
+	}
+}
+
+// TestResolveConsolidatedFanInHeadSHA_DegradeBranches covers each named
+// ("", false) branch of the resolver: an unconfigured AuditRepo, a read error,
+// an empty ledger, an entry whose merge_sha is empty, and an entry whose payload
+// does not decode. Each must degrade rather than answer a wrong head.
+func TestResolveConsolidatedFanInHeadSHA_DegradeBranches(t *testing.T) {
+	runID := uuid.New()
+	emptyPayload := func(seq int64, raw string) *audit.Entry {
+		rid := runID
+		return &audit.Entry{ID: uuid.New(), Category: "integration_commit_recorded", RunID: &rid,
+			Sequence: seq, Timestamp: time.Now().UTC(), Payload: []byte(raw)}
+	}
+	cases := []struct {
+		name string
+		srv  *Server
+	}{
+		{"nil AuditRepo", New(Config{Addr: "127.0.0.1:0"})},
+		{"read error", New(Config{Addr: "127.0.0.1:0",
+			AuditRepo: &feedbackAuditRepo{listErr: errors.New("audit store unavailable")}})},
+		{"empty ledger", New(Config{Addr: "127.0.0.1:0",
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{}}})},
+		{"empty merge_sha", New(Config{Addr: "127.0.0.1:0",
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				runID: {emptyPayload(3, `{"merge_sha":""}`)}}}})},
+		{"undecodable payload", New(Config{Addr: "127.0.0.1:0",
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				runID: {emptyPayload(3, `not json`)}}}})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if sha, ok := tc.srv.resolveConsolidatedFanInHeadSHA(context.Background(), runID, 0, false); ok || sha != "" {
+				t.Errorf("= (%q, %v), want (\"\", false)", sha, ok)
+			}
+			// The acceptance resolver inherits the degrade.
+			if got := tc.srv.resolveAcceptanceExpectedHeadSHA(context.Background(), runID, uuid.New()); got != "" {
+				t.Errorf("resolveAcceptanceExpectedHeadSHA = %q, want empty", got)
+			}
+		})
+	}
+}
+
+// TestResolveConsolidatedFanInHeadSHA_Bounded pins the dispatch-anchor
+// semantics acceptanceValidatedHeadSHA relies on: with bounded=true only
+// entries at-or-before maxSeq are candidates, so a fan-in merge recorded AFTER
+// the acceptance dispatch cannot re-bind the verdict to an unvalidated tree.
+func TestResolveConsolidatedFanInHeadSHA_Bounded(t *testing.T) {
+	runID := uuid.New()
+	const atAnchor = "1111111aaaabbbbccccddddeeeeffff000011112"
+	const postAnchor = "2222222aaaabbbbccccddddeeeeffff000022223"
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+		runID: {
+			makeIntegrationCommitEntry(runID, 5, atAnchor),
+			makeIntegrationCommitEntry(runID, 50, postAnchor),
+		},
+	}}})
+	if sha, ok := s.resolveConsolidatedFanInHeadSHA(context.Background(), runID, 10, true); !ok || sha != atAnchor {
+		t.Errorf("bounded = (%q, %v), want (%q, true) — a post-anchor merge must be excluded", sha, ok, atAnchor)
+	}
+	if sha, ok := s.resolveConsolidatedFanInHeadSHA(context.Background(), runID, 10, false); !ok || sha != postAnchor {
+		t.Errorf("unbounded = (%q, %v), want (%q, true)", sha, ok, postAnchor)
+	}
+	// Every entry above the bound -> no candidate at all.
+	if sha, ok := s.resolveConsolidatedFanInHeadSHA(context.Background(), runID, 1, true); ok || sha != "" {
+		t.Errorf("bound below every entry = (%q, %v), want (\"\", false)", sha, ok)
+	}
+}
+
+// TestResolveAcceptanceExpectedHeadSHAWalkingParents_AncestorConsolidatedHead is
+// (d): the parent walk applies the SAME chain-then-consolidated resolution to
+// each ancestor, so a child whose ancestor is a decomposed parent resolves the
+// ancestor's consolidated fan-in head instead of shipping "".
+func TestResolveAcceptanceExpectedHeadSHAWalkingParents_AncestorConsolidatedHead(t *testing.T) {
+	parent, childID, stageID := uuid.New(), uuid.New(), uuid.New()
+	const merge = "3333333aaaabbbbccccddddeeeeffff000033334"
+	rr := newPromptRunRepo()
+	rr.getRuns[parent] = &run.Run{ID: parent}
+	child := &run.Run{ID: childID, ParentRunID: &parent}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			parent: {makeIntegrationCommitEntry(parent, 4, merge)},
+		}}})
+	if got := s.resolveAcceptanceExpectedHeadSHAWalkingParents(context.Background(), child, stageID); got != merge {
+		t.Errorf("= %q, want the ancestor's consolidated fan-in head %q", got, merge)
+	}
+}
+
+// TestResolveFixupExpectedHeadSHA_UnaffectedByIntegrationEntry is (e): the
+// #3091 fallback is wired into the ACCEPTANCE resolvers only. A run carrying
+// ONLY an integration_commit_recorded entry still resolves "" for the fix-up
+// expectation, so the fix-up dispatch path is byte-identical to before.
+func TestResolveFixupExpectedHeadSHA_UnaffectedByIntegrationEntry(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const merge = "4444444aaaabbbbccccddddeeeeffff000044445"
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+		runID: {makeIntegrationCommitEntry(runID, 8, merge)},
+	}}})
+	if got := s.resolveFixupExpectedHeadSHA(context.Background(), runID, stageID); got != "" {
+		t.Errorf("resolveFixupExpectedHeadSHA = %q, want empty — the fan-in fallback is acceptance-only", got)
+	}
+	// Same ledger, acceptance resolver -> the fallback DOES fire. Without this
+	// discriminator the assertion above would pass on a broken fallback too.
+	if got := s.resolveAcceptanceExpectedHeadSHA(context.Background(), runID, stageID); got != merge {
+		t.Errorf("resolveAcceptanceExpectedHeadSHA = %q, want %q (fixture sanity)", got, merge)
 	}
 }

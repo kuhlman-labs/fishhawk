@@ -395,6 +395,23 @@ var verifyEnvDeny = map[string]struct{}{
 // (#2504).
 var verifyEnvDenyPrefix = []string{"GOOGLE_"}
 
+// verifyEnvGitConfigPins neutralizes global and system git config for the verify
+// child by pinning both git config-file environment variables at /dev/null (git
+// reads an empty configuration from an empty file rather than erroring;
+// git-config(1) ENVIRONMENT). It exists for the same reason as the runner's
+// gateEnvGitConfigPins (#912 / #3102): a spec-supplied verify command that runs
+// `git commit` in a temp repo must not inherit the OPERATOR's global
+// commit.gpgsign + gpg.ssh.program, whose signing agent may be unavailable.
+// Default-deny alone does not achieve it — HOME is allow-listed, so git falls
+// back to $HOME/.gitconfig when GIT_CONFIG_GLOBAL is unset. It is a no-op where
+// the config files do not exist. Kept IDENTICAL to
+// runner/cmd/fishhawk-runner/gateenv.go's gateEnvGitConfigPins by the runner's
+// TestGateEnvListsMatchCLICopy — editing one copy fails that test.
+var verifyEnvGitConfigPins = []string{
+	"GIT_CONFIG_GLOBAL=/dev/null",
+	"GIT_CONFIG_SYSTEM=/dev/null",
+}
+
 // sanitizedVerifyEnv returns the allow-listed environment assigned to the
 // verify child's cmd.Env. Assigning a non-nil cmd.Env replaces the child's
 // environment wholesale (os/exec.Cmd.Env: "If Env is nil, the new process uses
@@ -406,7 +423,7 @@ func sanitizedVerifyEnv() []string {
 // sanitizeVerifyEnv applies the default-deny allow-list to base (a slice of
 // "KEY=VALUE" entries). It is the testable inner core of sanitizedVerifyEnv.
 func sanitizeVerifyEnv(base []string) []string {
-	out := make([]string, 0, len(base))
+	out := make([]string, 0, len(base)+len(verifyEnvGitConfigPins))
 	for _, kv := range base {
 		eq := strings.IndexByte(kv, '=')
 		if eq <= 0 {
@@ -428,7 +445,10 @@ func sanitizeVerifyEnv(base []string) []string {
 		}
 		out = append(out, kv)
 	}
-	return out
+	// Pin git config-file env to /dev/null AFTER the allow-list loop. GIT_CONFIG_*
+	// is on no allow-list, so the loop already dropped any inherited value — the
+	// append REPLACES rather than duplicates it (#3102).
+	return append(out, verifyEnvGitConfigPins...)
 }
 
 // verifyEnvAllowed reports whether key is on the allow-list: a system essential

@@ -204,7 +204,7 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 }
 
 // TestStageState_IsSettled pins the settled classification (#1252)
-// across ALL thirteen StageState constants: the three terminal states and
+// across ALL fourteen StageState constants: the four terminal states and
 // the six parked states are settled; the four in-flight states are
 // not. This is the load-bearing behavioral assertion for the stage
 // terminal-wait long-poll — its correctness is not enforced by
@@ -235,9 +235,11 @@ func TestStageState_IsSettled(t *testing.T) {
 		{StageStateDispatched, false},
 		{StageStateRunning, false},
 		{StageStateAwaitingDeployment, false},
+		// Merge-supersede terminal state (#3083): terminal, so settled.
+		{StageStateSuperseded, true},
 	}
-	if len(cases) != 13 {
-		t.Fatalf("expected all thirteen StageState constants enumerated, got %d", len(cases))
+	if len(cases) != 14 {
+		t.Fatalf("expected all fourteen StageState constants enumerated, got %d", len(cases))
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.state), func(t *testing.T) {
@@ -465,5 +467,124 @@ func TestStageStateIsTerminal(t *testing.T) {
 		if got := s.IsTerminal(); got != want {
 			t.Errorf("StageState(%q).IsTerminal() = %v, want %v", s, got, want)
 		}
+	}
+}
+
+// TestStageMergeSupersedeTransitions table-tests the DEFAULT-DENY
+// merge-supersede pair table (E64.2 / #3083). The predicate is TYPE-AWARE, and
+// the type half is what stands between a merge and a fabricated `succeeded`
+// run: `superseded` is terminal, so Orchestrator.completeRun's #968 guard
+// passes it, and a state-only allow-list would let a `pending` plan or
+// implement stage be swept into it and complete a run around work never done.
+//
+// Exactly two pairs are admitted. Everything else is refused — including the
+// admitted STATES on the WRONG stage type, which is the discriminating half a
+// state-only predicate would get wrong.
+func TestStageMergeSupersedeTransitions(t *testing.T) {
+	cases := []struct {
+		name      string
+		stageType StageType
+		from, to  StageState
+		want      bool
+	}{
+		// The two admitted rows.
+		{"acceptance re-parked by a fix-up", StageTypeAcceptance, StageStateAwaitingHostDispatch, StageStateSuperseded, true},
+		{"review gate on an already-merged change", StageTypeReview, StageStateAwaitingApproval, StageStateSuperseded, true},
+
+		// The SAME states on the WRONG stage type. These are the cases a
+		// state-only allow-list would wrongly admit.
+		{"plan at awaiting_approval (review's state, wrong type)", StageTypePlan, StageStateAwaitingApproval, StageStateSuperseded, false},
+		{"implement at awaiting_host_dispatch (acceptance's state, wrong type)", StageTypeImplement, StageStateAwaitingHostDispatch, StageStateSuperseded, false},
+		{"review at awaiting_host_dispatch (acceptance's state, wrong type)", StageTypeReview, StageStateAwaitingHostDispatch, StageStateSuperseded, false},
+		{"acceptance at awaiting_approval (review's state, wrong type)", StageTypeAcceptance, StageStateAwaitingApproval, StageStateSuperseded, false},
+
+		// The #968 shapes: work never done must never be swept.
+		{"plan pending", StageTypePlan, StageStatePending, StageStateSuperseded, false},
+		{"implement pending", StageTypeImplement, StageStatePending, StageStateSuperseded, false},
+		{"implement running", StageTypeImplement, StageStateRunning, StageStateSuperseded, false},
+		{"review pending", StageTypeReview, StageStatePending, StageStateSuperseded, false},
+		{"acceptance running", StageTypeAcceptance, StageStateRunning, StageStateSuperseded, false},
+		{"acceptance dispatched", StageTypeAcceptance, StageStateDispatched, StageStateSuperseded, false},
+		{"acceptance succeeded", StageTypeAcceptance, StageStateSucceeded, StageStateSuperseded, false},
+		{"deploy awaiting_deploy_approval", StageTypeDeploy, StageStateAwaitingDeployApproval, StageStateSuperseded, false},
+		{"implement awaiting_children", StageTypeImplement, StageStateAwaitingChildren, StageStateSuperseded, false},
+		{"implement awaiting_scope_decision", StageTypeImplement, StageStateAwaitingScopeDecision, StageStateSuperseded, false},
+
+		// `to` other than superseded is refused even from an admitted pair —
+		// this table admits ONE destination, it is not a general override.
+		{"admitted pair → succeeded", StageTypeAcceptance, StageStateAwaitingHostDispatch, StageStateSucceeded, false},
+		{"admitted pair → cancelled", StageTypeReview, StageStateAwaitingApproval, StageStateCancelled, false},
+		{"admitted pair → failed", StageTypeReview, StageStateAwaitingApproval, StageStateFailed, false},
+		{"admitted pair → pending", StageTypeAcceptance, StageStateAwaitingHostDispatch, StageStatePending, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ValidStageMergeSupersedeTransition(tc.stageType, tc.from, tc.to); got != tc.want {
+				t.Errorf("ValidStageMergeSupersedeTransition(%q, %q, %q) = %v, want %v",
+					tc.stageType, tc.from, tc.to, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMergeSupersedable pins the classification half of the table — the
+// predicate the merge sweep consults to decide WHICH parked stages it may
+// terminalize, independent of the destination state. Same default-deny
+// posture, same type-awareness.
+func TestMergeSupersedable(t *testing.T) {
+	cases := []struct {
+		stageType StageType
+		from      StageState
+		want      bool
+	}{
+		{StageTypeAcceptance, StageStateAwaitingHostDispatch, true},
+		{StageTypeReview, StageStateAwaitingApproval, true},
+		// Wrong type, admitted state.
+		{StageTypePlan, StageStateAwaitingApproval, false},
+		{StageTypeImplement, StageStateAwaitingHostDispatch, false},
+		// Right type, unadmitted state.
+		{StageTypeAcceptance, StageStateRunning, false},
+		{StageTypeReview, StageStatePending, false},
+		// Already terminal: nothing to supersede.
+		{StageTypeAcceptance, StageStateSuperseded, false},
+		{StageTypeReview, StageStateSucceeded, false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.stageType)+"@"+string(tc.from), func(t *testing.T) {
+			if got := MergeSupersedable(tc.stageType, tc.from); got != tc.want {
+				t.Errorf("MergeSupersedable(%q, %q) = %v, want %v", tc.stageType, tc.from, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidStageTransition_SupersededIsTerminalLockdown pins that the ORDINARY
+// transition table does not admit the merge-supersede edge in either direction
+// (#3083): the pair table is the only route in, and `superseded` admits no
+// route out. Without this, a widening of the base table could silently make the
+// default-deny pair table advisory.
+func TestValidStageTransition_SupersededIsTerminalLockdown(t *testing.T) {
+	// The ordinary table never admits an entry into superseded.
+	for _, from := range []StageState{
+		StageStatePending, StageStateAwaitingHostDispatch, StageStateDispatched,
+		StageStateRunning, StageStateAwaitingApproval, StageStateAwaitingChildren,
+		StageStateAwaitingInput, StageStateAwaitingScopeDecision,
+		StageStateAwaitingDeployApproval, StageStateAwaitingDeployment,
+	} {
+		if ValidStageTransition(from, StageStateSuperseded) {
+			t.Errorf("ValidStageTransition(%q, superseded) = true, want false (the pair table is the only route in)", from)
+		}
+	}
+	// And superseded admits no exit but idempotent same-state re-application.
+	for _, to := range []StageState{
+		StageStatePending, StageStateRunning, StageStateSucceeded,
+		StageStateFailed, StageStateCancelled, StageStateAwaitingApproval,
+	} {
+		if ValidStageTransition(StageStateSuperseded, to) {
+			t.Errorf("ValidStageTransition(superseded, %q) = true, want false (superseded is terminal)", to)
+		}
+	}
+	if !ValidStageTransition(StageStateSuperseded, StageStateSuperseded) {
+		t.Error("ValidStageTransition(superseded, superseded) = false, want true (same-state re-application is idempotent)")
 	}
 }

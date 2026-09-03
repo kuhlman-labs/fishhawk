@@ -102,6 +102,10 @@ func shipAcceptanceRequest(t *testing.T, s *Server, runID, stageID uuid.UUID, pr
 func TestShipAcceptance_HappyPath(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, sf, ar, au, _ := newAcceptanceServer(t, runID, stageID)
+	// An ordinary dispatched stage HAS a resolvable validated head; seeding it
+	// keeps this happy path about the persist/audit seam rather than the #3091
+	// unbound-head clamp (which owns its own tests below).
+	seedValidatedHead(au, runID, stageID)
 	priv, _ := sf.issue(t, runID)
 	body := validAcceptanceBytes(t)
 
@@ -143,6 +147,24 @@ func TestShipAcceptance_HappyPath(t *testing.T) {
 			t.Errorf("audit payload missing %s: %s", want, payload)
 		}
 	}
+}
+
+// seedValidatedHead seeds the minimum ledger a REAL dispatched acceptance stage
+// carries: one reported head at-or-before an acceptance_dispatched anchor for
+// this stage. Without it acceptanceValidatedHeadSHA resolves "" and the #3091
+// unbound-head clamp records `undecidable` — correct behavior, but not what a
+// fixture standing in for an ordinarily-dispatched stage means to exercise.
+// It is IDEMPOTENT: a fixture that already carries this stage's dispatch anchor
+// is left alone, so a call site may state the precondition explicitly in its own
+// file without double-seeding a ledger a shared helper already wrote.
+func seedValidatedHead(au *auditFake, runID, stageID uuid.UUID) {
+	for _, e := range au.seeded {
+		if e.Category == CategoryAcceptanceDispatched && e.StageID != nil && *e.StageID == stageID {
+			return
+		}
+	}
+	seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{"head_sha": "seededvalidatedhead"})
+	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 2, map[string]any{"stage_id": stageID.String()})
 }
 
 // seedHeadEntry adds a seeded head-report / dispatch audit entry for a run so
@@ -199,7 +221,9 @@ func TestShipAcceptance_HeadSHA_FixupBeforeDispatch(t *testing.T) {
 
 // TestShipAcceptance_HeadSHA_NoDispatchAnchor records an empty head_sha when the
 // stage has no acceptance_dispatched entry (a bare ship) — Option C then fails
-// closed to the 422 for that entry.
+// closed to the 422 for that entry. Since #3091 the recorded VERDICT is also
+// clamped: an unanchored ship names no tree, so a shipped `passed` is recorded
+// `undecidable` rather than as a validated pass.
 func TestShipAcceptance_HeadSHA_NoDispatchAnchor(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
@@ -210,8 +234,138 @@ func TestShipAcceptance_HeadSHA_NoDispatchAnchor(t *testing.T) {
 	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
 	}
-	if got := decodeAcceptanceOutcome(t, au)["head_sha"]; got != "" {
+	payload := decodeAcceptanceOutcome(t, au)
+	if got := payload["head_sha"]; got != "" {
 		t.Errorf("head_sha = %v, want empty (no dispatch anchor → unbound)", got)
+	}
+	if got := payload["verdict"]; got != acceptanceVerdictUndecidable {
+		t.Errorf("verdict = %v, want undecidable (#3091: an unbound head can never record a pass)", got)
+	}
+	if got := payload["undecidable_basis"]; got != acceptanceUndecidableBasisHeadUnresolved {
+		t.Errorf("undecidable_basis = %v, want %q", got, acceptanceUndecidableBasisHeadUnresolved)
+	}
+}
+
+// seedIntegrationCommit seeds one integration_commit_recorded entry — the
+// incremental fan-in record a DECOMPOSED PARENT's own chain carries (#1806),
+// and the only head-bearing entry such a parent ever writes for itself.
+func seedIntegrationCommit(au *auditFake, runID uuid.UUID, seq int64, mergeSHA string) {
+	seedHeadEntry(au, runID, nil, "integration_commit_recorded", seq, map[string]any{"merge_sha": mergeSHA})
+}
+
+// TestShipAcceptance_HeadSHA_ConsolidatedFanIn is (f), the #3091 done-means at
+// the SHIP seam: a decomposed parent whose chain carries ONLY fan-in entries
+// records the consolidated merge SHA as the validated head and a plain `passed`
+// verdict — the clamp does not fire, because the head resolved.
+func TestShipAcceptance_HeadSHA_ConsolidatedFanIn(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	// No reported-head entry anywhere: the parent's chain never carries one.
+	seedIntegrationCommit(au, runID, 3, "olderintegrationmerge")
+	seedIntegrationCommit(au, runID, 7, "consolidatedtip")
+	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 10, map[string]any{"stage_id": stageID.String()})
+
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if got := payload["head_sha"]; got != "consolidatedtip" {
+		t.Errorf("head_sha = %v, want the newest fan-in merge %q", got, "consolidatedtip")
+	}
+	if got := payload["verdict"]; got != acceptanceVerdictPassed {
+		t.Errorf("verdict = %v, want passed (a resolved head must not clamp)", got)
+	}
+	if _, present := payload["undecidable_basis"]; present {
+		t.Errorf("undecidable_basis present on a bound verdict: %v", payload)
+	}
+}
+
+// TestShipAcceptance_PostDispatchIntegrationCommitDoesNotBind is (g): the
+// consolidated fallback is BOUNDED by the dispatch anchor exactly as the
+// reported-head walk is. A fan-in merge recorded AFTER the acceptance dispatch
+// must not re-bind the verdict to a tree the stage never validated — the
+// verdict stays unbound and is therefore clamped.
+func TestShipAcceptance_PostDispatchIntegrationCommitDoesNotBind(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 10, map[string]any{"stage_id": stageID.String()})
+	seedIntegrationCommit(au, runID, 20, "postdispatchmerge") // ABOVE the anchor
+
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if got := payload["head_sha"]; got != "" {
+		t.Errorf("head_sha = %v, want empty — a post-dispatch fan-in merge must not bind", got)
+	}
+	if got := payload["verdict"]; got != acceptanceVerdictUndecidable {
+		t.Errorf("verdict = %v, want undecidable (unbound head)", got)
+	}
+}
+
+// TestShipAcceptance_EmptyHead_PassClampedToUndecidable is (h), the #3091
+// clamp's done-means. It READS BACK the persisted governance payload rather
+// than the response code, because the control's effect IS the recorded row: a
+// `passed` shipped with no resolvable validated head is recorded `undecidable`
+// with the shipped verdict preserved as evidence and the clamp's own basis key.
+func TestShipAcceptance_EmptyHead_PassClampedToUndecidable(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	// Bad state BY CONSTRUCTION: no head-bearing entry of any category, so the
+	// head is definitionally unresolvable and the RED lands on the assertion.
+	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 10, map[string]any{"stage_id": stageID.String()})
+
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	for key, want := range map[string]any{
+		"verdict":           acceptanceVerdictUndecidable,
+		"outcome":           plan.AcceptanceOutcomeUndecidable,
+		"verdict_reported":  acceptanceVerdictPassed,
+		"undecidable_basis": acceptanceUndecidableBasisHeadUnresolved,
+		"head_sha":          "",
+	} {
+		if got := payload[key]; got != want {
+			t.Errorf("%s = %v, want %v (payload: %v)", key, got, want, payload)
+		}
+	}
+	// The clamp writes its OWN key; it must not borrow the retirement basis.
+	if _, present := payload["downgrade_basis"]; present {
+		t.Errorf("clamp attached downgrade_basis (the #2581 retirement key): %v", payload)
+	}
+}
+
+// TestShipAcceptance_EmptyHead_FailedNotSoftened is (i), binding condition 4:
+// the ladder never softens. A shipped `failed` with the SAME unresolvable-head
+// fixture as (h) still records `failed` — only `passed` is clamped.
+func TestShipAcceptance_EmptyHead_FailedNotSoftened(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 10, map[string]any{"stage_id": stageID.String()})
+
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "ac-create", Result: "failed", Observed: "500"})
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if got := payload["verdict"]; got != acceptanceVerdictFailed {
+		t.Errorf("verdict = %v, want failed — the clamp must never soften a failure", got)
+	}
+	if got := payload["outcome"]; got != "rejected" {
+		t.Errorf("outcome = %v, want rejected", got)
+	}
+	if got := payload["head_sha"]; got != "" {
+		t.Errorf("head_sha = %v, want empty (fixture sanity: the head IS unresolvable here)", got)
+	}
+	// verdict_reported stays absent: the recorded verdict IS the shipped one.
+	if _, present := payload["verdict_reported"]; present {
+		t.Errorf("verdict_reported present on an unchanged verdict: %v", payload)
 	}
 }
 
@@ -1077,8 +1231,11 @@ func TestShipAcceptance_CrossBoundary_WireToRender(t *testing.T) {
 		t.Errorf("prompt seam wrong (criteria present / diff absent):\n%s", presp.Prompt)
 	}
 
-	// Persist + audit seam: POST the signed evidence.
+	// Persist + audit seam: POST the signed evidence. The stage was dispatched
+	// against a head, so the ledger carries one (without it the #3091 clamp
+	// would record undecidable rather than the accepted line this seam renders).
 	as, sf, ar, au, _ := newAcceptanceServer(t, runID, acceptanceStageID)
+	seedValidatedHead(au, runID, acceptanceStageID)
 	shipPriv, _ := sf.issue(t, runID)
 	body, err := json.Marshal(acceptanceBody{
 		Verdict: "passed",
@@ -2709,6 +2866,16 @@ func amendIngestCriteria() []plan.AcceptanceCriterion {
 // the behavioral assertion.
 func seedRetirementFixture(t *testing.T, ar *fakeArtifactRepo, au *auditFake, rr *promptRunRepo, runID uuid.UUID, amendments []acceptanceCriteriaAmendment) {
 	t.Helper()
+	// A retirement fixture stands in for an ordinarily-DISPATCHED acceptance
+	// stage, so it must carry a resolvable validated head — otherwise every test
+	// built on it would exercise the #3091 unbound-head clamp instead of the
+	// retirement/ladder behavior it is about.
+	for _, st := range rr.getStages {
+		if st != nil && st.RunID == runID && st.Type == run.StageTypeAcceptance {
+			seedValidatedHead(au, runID, st.ID)
+			break
+		}
+	}
 	planStage := &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypePlan}
 	rr.getStages[planStage.ID] = planStage
 	if rr.stagesByRunID == nil {
@@ -2756,6 +2923,12 @@ func acceptanceVerdictBytes(t *testing.T, verdict, failureMode string, results .
 // passed, with the reported verdict, the basis, and the retired ids preserved;
 // the stored artifact bytes are untouched; triage writes nothing; and the merge
 // gate reads a merge-eligible acceptance_passed.
+//
+// This is the RESOLVABLE-HEAD sibling of
+// TestShipAcceptance_EmptyHead_RetirementNeutralizedPassClamped: with a bound
+// head the neutralized pass is recorded exactly as #2581 requires, and only an
+// UNBOUND head raises it to undecidable (#3124). The pair is the deliberate
+// boundary — do not collapse them.
 func TestShipAcceptance_RetiredOnlyFailure_RecordedPassed(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
@@ -2820,6 +2993,78 @@ func TestShipAcceptance_RetiredOnlyFailure_RecordedPassed(t *testing.T) {
 	if state != acceptanceGatePassed {
 		t.Errorf("gate state = %q, want %q", state, acceptanceGatePassed)
 	}
+}
+
+// TestShipAcceptance_EmptyHead_RetirementNeutralizedPassClamped is the #3124
+// done-means, held at the same layer as the clamp itself: the #3091 unbound-head
+// clamp applies to a #2581 retirement-neutralized pass TOO. The fixture is the
+// (h) fixture's unbound head PLUS a #2581 retirement. An unresolvable head names
+// no tree, so retirement — which only decides which criteria count — cannot
+// rescue the pass; the recorded verdict is raised to undecidable WHILE the
+// operator's retirement decision stays fully visible (downgrade_basis /
+// retired_criterion_ids / verdict_reported). Its resolvable-head sibling
+// TestShipAcceptance_RetiredOnlyFailure_RecordedPassed proves the ordinary
+// retirement path is untouched, so the pair reads as a deliberate boundary.
+//
+// COUNTERFACTUAL: restoring the removed `&& downgradedVerdict == ""` half of the
+// clamp condition reddens THIS test (verdict reverts to passed) while the three
+// non-retirement clamp tests stay green — proving it pins the carve-out REMOVAL
+// specifically, not merely the clamp's existence. The unresolvable head is
+// stripped BY CONSTRUCTION via withoutHeadLedger, so a RED lands on the verdict
+// assertion, not on fixture setup.
+func TestShipAcceptance_EmptyHead_RetirementNeutralizedPassClamped(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	// Strip the fixture's validated-head ledger BY CONSTRUCTION, so the clamp's
+	// precondition (an unresolvable head) genuinely holds on this arm.
+	au.seeded = withoutHeadLedger(au.seeded)
+
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed", Observed: "no budget line"},
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if got := payload["head_sha"]; got != "" {
+		t.Fatalf("head_sha = %v, want empty (fixture sanity: the head IS unresolvable here)", got)
+	}
+	// The clamp raises the neutralized pass to undecidable on an unbound head.
+	if got := payload["verdict"]; got != acceptanceVerdictUndecidable {
+		t.Errorf("verdict = %v, want undecidable — the clamp applies to a retirement neutralization too (#3124)", got)
+	}
+	if got := payload["undecidable_basis"]; got != acceptanceUndecidableBasisHeadUnresolved {
+		t.Errorf("undecidable_basis = %v, want %q", got, acceptanceUndecidableBasisHeadUnresolved)
+	}
+	// The shipped verdict is preserved as evidence.
+	if got := payload["verdict_reported"]; got != "failed" {
+		t.Errorf("verdict_reported = %v, want failed (the shipped verdict preserved)", got)
+	}
+	// GOVERNANCE VISIBILITY: the clamp RAISES the verdict without ERASING the
+	// operator's retirement record — the downgrade basis and retired ids remain.
+	if got := payload["downgrade_basis"]; got != acceptanceDowngradeBasisRetiredOnly {
+		t.Errorf("downgrade_basis = %v, want %q (retirement record must survive the clamp)", got, acceptanceDowngradeBasisRetiredOnly)
+	}
+	if got := toStringSlice(payload["retired_criterion_ids"]); !reflect.DeepEqual(got, []string{"crit-2"}) {
+		t.Errorf("retired_criterion_ids = %v, want [crit-2] (retirement record must survive the clamp)", got)
+	}
+}
+
+// withoutHeadLedger drops every head-bearing / dispatch-anchor entry a fixture
+// seeded, leaving a ledger from which no validated head can be resolved.
+func withoutHeadLedger(entries []*audit.Entry) []*audit.Entry {
+	kept := entries[:0:0]
+	for _, e := range entries {
+		switch e.Category {
+		case "pull_request_opened", "fixup_pushed", "integration_commit_recorded", CategoryAcceptanceDispatched:
+		default:
+			kept = append(kept, e)
+		}
+	}
+	return kept
 }
 
 // TestShipAcceptance_NoAmendments_OutcomePayloadUnchanged is the inert-when-

@@ -13,6 +13,13 @@
 //
 // The adapter runs one of two postures per invocation (#2486):
 //
+// BOTH postures pin an EMPTY MCP server set (--strict-mcp-config plus
+// --mcp-config {"mcpServers":{}}), posture-independent (#2524): --tools bounds
+// only the BUILT-IN toolset, so operator-configured MCP tools (browser, Gmail,
+// GitHub) load from the operator's config regardless of grounding. Pinning them
+// off in both postures means the child's MCP exposure does not depend on the
+// CLI's default-deny permission behavior staying the default.
+//
 //   - UNGROUNDED (treeDir == ""): the diff-only posture. The child runs from a
 //     fresh EMPTY scratch directory — NOT the process working directory. This
 //     adapter used to leave cmd.Dir unset, so the reviewer inherited fishhawkd's
@@ -20,16 +27,15 @@
 //     .git); read-only built-in tools need no permission prompt, so an ungrounded
 //     reviewer was accidentally grounded against whatever directory the daemon
 //     sat in. Pinning an empty scratch cwd makes ungrounded genuinely diff-only.
+//     The empty-MCP pin applies here too (#2524).
 //   - GROUNDED (treeDir != ""): the child runs from the caller-supplied EXPORTED
 //     read-only tree (reviewsandbox.ExportTree — tracked files at one commit, no
 //     .git) with --add-dir <tree>, and the toolset restricted to Read,Grep,Glob
 //     via --tools plus --allowed-tools so print mode never hits an unanswerable
-//     permission prompt. --tools bounds only the BUILT-IN toolset, so the grounded
-//     argv ALSO pins an EMPTY MCP server set (--strict-mcp-config plus --mcp-config
-//     {"mcpServers":{}}) — otherwise the operator's MCP tools (browser, Gmail,
-//     GitHub) load past --tools and break the never-network property. Neither
-//     posture passes --dangerously-skip-permissions or --permission-mode
-//     bypassPermissions.
+//     permission prompt. --add-dir/--tools/--allowed-tools are the grounded
+//     tree-read grant; the empty-MCP pin above is shared with the ungrounded
+//     posture, not grounded-specific. Neither posture passes
+//     --dangerously-skip-permissions or --permission-mode bypassPermissions.
 //
 // Either posture seeds the child environment from reviewsandbox.Env — the
 // enumerated ClaudeAllow list plus the operator passthrough — never a wholesale
@@ -44,6 +50,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -106,6 +114,13 @@ type Client struct {
 	// Cmd builds the *exec.Cmd. Defaults to exec.CommandContext; overridable
 	// by tests to redirect to a fake binary.
 	Cmd func(ctx context.Context, name string, args ...string) *exec.Cmd
+	// HostPaths is the injectable host-filesystem seam the #2522 deny rules are
+	// built from. nil means reviewsandbox.DefaultHostPaths(). Grounded-path
+	// TESTS set it to temp dirs so the emitted rules are deterministic and no
+	// test depends on (or reads) the developer's real home.
+	HostPaths *reviewsandbox.HostPaths
+	// GOOS selects the platform deny-root table. Empty means runtime.GOOS.
+	GOOS string
 }
 
 // NewClient constructs a Client from cfg, defaulting Binary to DefaultBinary
@@ -235,31 +250,85 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 		"--output-format", "json",
 		"--model", c.cfg.Model,
 	}
+	// Empty-MCP pin, applied in BOTH postures (#2524, refining #2486). --tools
+	// (below) bounds only the BUILT-IN toolset; MCP tools are not built-ins, so
+	// they load from the operator's config regardless of posture (verified live:
+	// a grounded child enumerated GitHub/Gmail/browser MCP tools despite --tools
+	// Read,Grep,Glob). --strict-mcp-config makes --mcp-config the sole source of
+	// MCP config (ignoring the operator's ~/.claude and project .mcp.json), and
+	// the empty {"mcpServers":{}} document loads zero MCP servers.
+	//
+	// This was previously applied only inside the grounded (treeDir != "") block,
+	// so the UNGROUNDED (diff-only) posture — the shipping posture, since grounding
+	// ships dormant (#2522) — omitted it and the child still loaded the operator's
+	// MCP servers. In ungrounded print mode with no --allowed-tools, MCP tool
+	// INVOCATION was already permission-denied (measured on #2524), so this is
+	// defense-in-depth: it removes MCP tools from the enumeration the child sees,
+	// and removes the dependence on the CLI's default-deny permission behavior
+	// staying the default — a CLI change that auto-approves MCP tools, or a
+	// deployment that pre-approves them in settings, would otherwise turn a listing
+	// into an egress channel with no change on our side. Pinned against Claude
+	// Code 2.1.224.
+	args = append(args,
+		"--strict-mcp-config",
+		"--mcp-config", `{"mcpServers":{}}`,
+	)
 	// Grounded posture (#2486): grant the reviewer read+search of the exported
 	// tree, restrict the AVAILABLE built-in toolset to Read,Grep,Glob (no Bash,
 	// no Write/Edit, no WebFetch/WebSearch) via --tools, and pre-approve exactly
 	// those via --allowed-tools so print mode never reaches an unanswerable
-	// permission prompt. Pinned against Claude Code 2.1.224. Never
-	// --dangerously-skip-permissions and never --permission-mode bypassPermissions.
-	//
-	// --tools bounds only the BUILT-IN toolset; MCP tools are not built-ins, so
-	// they load from the operator's config and survive the --tools restriction
-	// (verified live: a grounded child enumerated GitHub/Gmail/browser MCP tools
-	// despite --tools Read,Grep,Glob). Browser automation and Gmail are network
-	// egress and data exfiltration, which defeat this design's never-network
-	// property. So the grounded argv ALSO pins an EMPTY MCP server set:
-	// --strict-mcp-config makes --mcp-config the sole source of MCP config
-	// (ignoring the operator's ~/.claude and project .mcp.json), and the empty
-	// {"mcpServers":{}} document loads zero MCP servers. Grounding (the sentinel
-	// tree read) is preserved with both flags on. Ungrounded argv is unchanged.
+	// permission prompt. Never --dangerously-skip-permissions and never
+	// --permission-mode bypassPermissions. --add-dir/--tools/--allowed-tools are
+	// the grounded-only tree-read grant; the MCP pin above is posture-independent.
 	if treeDir != "" {
+		// Read bound, grounded posture only (#2522). --add-dir grants the export;
+		// nothing above BOUNDS what else the Read/Grep/Glob tools may reach, and
+		// an operator A/B confirmed a grounded child reads an arbitrary
+		// out-of-tree file straight through this argv. --disallowed-tools rules
+		// over a FIXED set of well-known credential roots close the realistic
+		// egress paths.
+		//
+		// Call it what it is: a BLOCKLIST at the TOOL layer, not confinement.
+		// Anything outside the named roots (/opt, /srv, a mounted volume) stays
+		// readable — a CI non-vacuity control asserts that gap rather than
+		// letting the docs imply a bound that does not exist. Real claude
+		// confinement needs an OS sandbox (#611).
+		//
+		// FAIL CLOSED: a rule-build error fails the invocation rather than
+		// spawning a grounded reviewer with NO deny rules at all.
+		hp := reviewsandbox.DefaultHostPaths()
+		if c.HostPaths != nil {
+			hp = *c.HostPaths
+		}
+		goos := c.GOOS
+		if goos == "" {
+			goos = runtime.GOOS
+		}
+		// The export is canonicalized for --add-dir and cmd.Dir for the same
+		// reason the deny paths are: on darwin os.MkdirTemp returns a /var alias
+		// of a /private real path, and mixing the two spellings makes a rule and
+		// a grant disagree about the same directory.
+		canonTree, cerr := filepath.EvalSymlinks(treeDir)
+		if hp.Canonical != nil {
+			canonTree, cerr = hp.Canonical(treeDir)
+		}
+		if cerr != nil {
+			return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: canonicalize review tree: %w", cerr)
+		}
+		denyRules, derr := reviewsandbox.ClaudeDenyRules(hp, treeDir, goos)
+		if derr != nil {
+			return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: build reviewer deny rules: %w", derr)
+		}
+		workDir = canonTree
 		args = append(args,
-			"--add-dir", treeDir,
+			"--add-dir", canonTree,
 			"--tools", "Read,Grep,Glob",
 			"--allowed-tools", "Read", "Grep", "Glob",
-			"--strict-mcp-config",
-			"--mcp-config", `{"mcpServers":{}}`,
 		)
+		// Each rule is its OWN argv element — the shape the operator verified
+		// live against Claude Code 2.1.224.
+		args = append(args, "--disallowed-tools")
+		args = append(args, denyRules...)
 	}
 	args = append(args, "-p", prompt)
 	cmd := cmdFn(ctx, c.cfg.Binary, args...)
