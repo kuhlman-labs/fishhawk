@@ -3476,6 +3476,19 @@ if _relay_channel_valid "http://smee.io/abc123"; then
 else
   pass "_relay_channel_valid rejects http:// (wrong scheme)"
 fi
+# Wrong HTTPS host (implement-review high/security): an https URL whose host is
+# NOT exactly smee.io must be rejected — the egress guard, not just a typo guard.
+if _relay_channel_valid "https://evil.example.com/abc123"; then
+  fail "_relay_channel_valid should reject an https URL on a non-smee.io host"
+else
+  pass "_relay_channel_valid rejects an https URL on a non-smee.io host (egress guard)"
+fi
+# The classic host-prefix bypass: smee.io as a LABEL of a longer attacker host.
+if _relay_channel_valid "https://smee.io.evil.com/abc123"; then
+  fail "_relay_channel_valid should reject a host that only PREFIXES smee.io (smee.io.evil.com)"
+else
+  pass "_relay_channel_valid rejects a smee.io-prefixed attacker host (smee.io.evil.com)"
+fi
 if _relay_channel_valid "https://smee.io"; then
   fail "_relay_channel_valid should reject a bare host with no path segment"
 else
@@ -3577,6 +3590,25 @@ if [[ ! -f "$relay_wd/relay.pid" ]]; then pass "_relay_up writes NO pid file whe
 if [[ ! -f "$relay_wd/argv" ]]; then pass "_relay_up does NOT spawn the client when the channel is malformed"; else fail "_relay_up must not spawn on channel-malformed"; fi
 rm -rf "$relay_wd"
 
+# 18e-2. Failure mode (b), EGRESS variant (implement-review high/security): a
+# well-FORMED https URL on a NON-smee.io host must be rejected end-to-end through
+# _relay_up — no spawn, no pid file — proving the egress guard is on the spawn
+# path, not just the unit-tested validator.
+relay_wd="$(mktemp -d -t test-dev-relayfm.XXXXXX)"
+print "#!/bin/sh\nprintf '%s\\\\n' \"\$*\" >> \"$relay_wd/argv\"\nsleep 30\n" > "$relay_wd/smee"; chmod +x "$relay_wd/smee"
+(
+  RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
+  export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
+  export FISHHAWK_DEV_WEBHOOK_CHANNEL="https://evil.example.com/abc123"
+  out="$(_relay_up 2>&1)"; rc=$?
+  print -r -- "$rc" > "$relay_wd/rc"; print -r -- "$out" > "$relay_wd/out"
+)
+relay_rc="$(cat "$relay_wd/rc" 2>/dev/null)"; relay_out="$(cat "$relay_wd/out" 2>/dev/null)"
+if [[ -n "$relay_rc" && "$relay_rc" != "0" ]]; then pass "_relay_up rejects a well-formed https channel on a non-smee.io host (egress guard)"; else fail "_relay_up should reject a non-smee.io host (rc=$relay_rc)"; fi
+if [[ ! -f "$relay_wd/relay.pid" ]]; then pass "_relay_up writes NO pid file for a non-smee.io host"; else fail "_relay_up must not write a pid file for a non-smee.io host"; fi
+if [[ ! -f "$relay_wd/argv" ]]; then pass "_relay_up does NOT spawn the client for a non-smee.io host (no egress)"; else fail "_relay_up must not spawn for a non-smee.io host"; fi
+rm -rf "$relay_wd"
+
 # 18f. Failure mode (c): client binary absent. FISHHAWK_DEV_SMEE_BIN UNSET and an
 # emptied PATH (no smee/smee-client) → resolve fails → non-zero, reason CONTAINS
 # 'npm install -g smee-client' (the RESOLVE-STAGE reason, C3's discriminator),
@@ -3628,14 +3660,21 @@ print "#!/bin/sh\nsleep 30\n" > "$relay_wd/incumbent"; chmod +x "$relay_wd/incum
 "$relay_wd/incumbent" &
 relay_incumbent_pid=$!
 print "$relay_incumbent_pid" > "$relay_wd/relay.pid"
+# rc/out are captured to files in the subshell and asserted at TOP LEVEL, per the
+# 18d convention above — a subshell's PASS/FAIL counter increments are lost, so
+# asserting rc==0 and the 'already running' message inside the ( ) would print a
+# line that cannot move the harness tally or exit code (implement-review
+# test_vacuity). Capturing here makes both re-entrancy claims GATING.
 (
   RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
   export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
   export FISHHAWK_DEV_WEBHOOK_CHANNEL="https://smee.io/retoken"
   out="$(_relay_up 2>&1)"; rc=$?
-  if (( rc == 0 )); then pass "_relay_up returns 0 when a relay is already running (re-entrant)"; else fail "_relay_up should return 0 when a relay is already running"; fi
-  if [[ "$out" == *"already running"* ]]; then pass "_relay_up reports 'already running' with the incumbent pid"; else fail "_relay_up should report 'already running' (got: $out)"; fi
+  print -r -- "$rc" > "$relay_wd/rc"; print -r -- "$out" > "$relay_wd/out"
 )
+relay_re_rc="$(cat "$relay_wd/rc" 2>/dev/null)"; relay_re_out="$(cat "$relay_wd/out" 2>/dev/null)"
+if [[ "$relay_re_rc" == "0" ]]; then pass "_relay_up returns 0 when a relay is already running (re-entrant)"; else fail "_relay_up should return 0 when a relay is already running (rc=$relay_re_rc)"; fi
+if [[ "$relay_re_out" == *"already running"* ]]; then pass "_relay_up reports 'already running' with the incumbent pid"; else fail "_relay_up should report 'already running' (got: $relay_re_out)"; fi
 if [[ ! -f "$relay_wd/argv" ]]; then
   pass "_relay_up spawns NO second client when a relay is already running (capture file did not grow)"
 else

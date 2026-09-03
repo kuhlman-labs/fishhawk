@@ -93,6 +93,14 @@ path prints one actionable line, leaves no pid file, and `up` continues.
   If deliveries stop arriving, check `logs/webhook-relay.log` for the client
   error and re-`up`.
 
+- **Reverting this feature while an enabled relay is alive can strand the
+  client.** The revert removes `_relay_down`, so `scripts/dev down` from the
+  reverted revision has nothing to reap the running relay with. **Stop the relay
+  BEFORE reverting** (`scripts/dev down` on this revision). If you have already
+  reverted with a relay still alive, reap it by hand: `kill $(cat
+  .fishhawk/webhook-relay.pid)`, then remove the pid file (`rm -f
+  .fishhawk/webhook-relay.pid`).
+
 ## Settled decisions
 
 Three questions the issue raised, answered as design decisions:

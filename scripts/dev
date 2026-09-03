@@ -1637,15 +1637,20 @@ _relay_channel() {
   print -r -- "${FISHHAWK_DEV_WEBHOOK_CHANNEL:-}"
 }
 
-# Typo guard, NOT a reachability check (documented as such in
+# Egress guard AND typo guard, NOT a reachability check (documented as such in
 # docs/local-webhook-relay.md): 0 only for a syntactically plausible
-# https://smee.io/<token> URL — non-empty, https scheme, a non-empty path
-# segment after the host — and non-zero otherwise.
+# https://smee.io/<token> URL — https scheme, host EXACTLY smee.io, a non-empty
+# path segment after the host — and non-zero otherwise. The exact-host check is
+# a security control (implement-review, high/security): without it any
+# https://<host>/<path> passed, widening the relay's outbound egress beyond the
+# documented smee.io contract. `smee.io.evil.com` and any other host are rejected.
 _relay_channel_valid() {
   local url="$1"
   [[ -n "$url" ]] || return 1
   [[ "$url" == https://* ]] || return 1
   local rest="${url#https://}"       # host[/path]
+  local host="${rest%%/*}"           # up to the first '/'
+  [[ "$host" == "smee.io" ]] || return 1
   local path="${rest#*/}"            # everything after the first '/'
   # No slash at all (path == rest), or an empty path segment → reject.
   [[ "$path" != "$rest" && -n "$path" ]] || return 1
