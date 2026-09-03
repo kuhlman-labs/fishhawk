@@ -278,6 +278,30 @@ The wording is deliberately NOT gated on the change looking security-relevant or
 
 Pinned by four tests in `prompt_test.go`: `TestBuild_Plan_CounterfactualAttainabilityRule`, `TestBuild_Implement_CounterfactualDiscipline_Rendered`, `TestBuild_Implement_CounterfactualDiscipline_RenderedOnFixup` (the #2453 fix-up-path pin), and `TestBuild_Implement_CounterfactualDiscipline_DistinctFromFailureModeHeading` (a presence+absence pair over the same fix-up string). Because `_Rendered` and `_RenderedOnFixup` drive two different builders through two different call sites, deleting either single call site reddens exactly one of them.
 
+### Machine-readable carrier for the initial pass (#2929)
+
+`writeCounterfactualDiscipline` demands the RED transcripts be recorded in the PR `## Notes`, but the implement review is DIFF-ONLY and scope-bounded — it never receives the pull-request body. So every operator condition asking a reviewer to confirm counterfactual evidence could only ever be closed by the operator by hand. #3042 built the machine-readable carrier (a run/stage-keyed sidecar the runner validates fail-closed and folds into `gate_evidence`) but wired it to the FIX-UP pass only.
+
+`writeCounterfactualSidecar` gives the INITIAL implement pass the same channel. It is called from `buildImplement` ONLY, immediately after `writeCounterfactualDiscipline` (which stays byte-identical, so the #2453 two-call-site pins are untouched), and ONLY when both run/stage ids are populated — a trigger missing them omits the sub-block rather than naming a malformed unkeyed path the runner would never read. It renders `CounterfactualReportPath(runID, stageID)` with the ids substituted, states plainly that the review is diff-only and does not receive the PR body (so `## Notes` is for the human reader while the sidecar is what reaches the reviewer), shows the exact JSON shape, and restates the fail-closed per-entry rules in substance from `writeFixupSelfReport`. The PR `## Notes` obligation is NOT weakened — both are required.
+
+`buildImplementFixup` is deliberately untouched: its agent is already told about a sidecar by `writeFixupSelfReport`, and a second instruction would split one signal across two files.
+
+Pinned by `TestBuild_Implement_CounterfactualSidecar_Rendered` (the substituted path — which is what pins the format string against the runner's independent copy — plus the diff-only statement and the rules), `_OmittedWithoutIDs` (the empty-id guard, self-paired: the unchanged PR-Notes discipline still renders while the sub-block and any `/tmp/fishhawk-counterfactuals-` path are absent), and `_AbsentOnFixup` (which asserts `FixupSelfReportPath` IS present, proving the ids were populated, so the absence is the call-site guard and not an empty-id artifact).
+
+### Standing rule 8 — named absence for evidence with no structured carrier (#2929)
+
+Appended AFTER standing rule 7 in `buildImplementReview`, with rules 1-7 left byte-identical so the verdict rule's `standing rule 7` cross-reference and the numbered-lens assertions do not move. Rule 8 tells the reviewer plainly that verification evidence the agent reported in the PULL-REQUEST BODY — counterfactual RED transcripts, grep results, delete-observe-restore outputs — is NOT part of its material, which is scope-bounded and diff-only; that structured counterfactual evidence, where supplied, appears in the gate-evidence `Counterfactual self-report` block and IS in its material; and that where an operator condition asks it to confirm something whose evidence lives on a surface it cannot read, it must record an evidence-PLACEMENT observation naming the condition and the surface, addressed to the operator — never counting it against the change, never treating it as a confirmed gap, and never rejecting on it. This covers the evidence classes (grep results, prose transcripts) for which no structured carrier exists. Pinned by `TestImplementReview_StandingRule8_Rendered`, which asserts the ordering after rule 7 and that rules 4-7 and the `standing rule 7` cross-reference are unmoved.
+
+## Behavior-change claim sweep (#3013)
+
+The sibling defect class to #2444's, one step earlier: not a test that passes with its control deleted, but a claim with NO assertion over it at ALL — prose or a code comment asserting the OLD behavior, which a behavior change leaves standing and wrong because the sentence is not in the diff and nothing anywhere fails on it. Distinguished from #2859 (a test that IS present but does not discriminate): here the assertion is simply absent.
+
+- **Renderer** (`writeBehaviorClaimSweep`, called from BOTH `buildImplement` and `buildImplementFixup`) — "### Behavior-change claim sweep". When this pass changes observable behavior, grep the WHOLE repository (docs/, package README.md files, AGENTS.md, code comments, documented commands) for claims about the old behavior and correct every hit. Four rules, one per motivating #3013 instance: (a) the RATIONALE is part of the claim — instance 4 corrected a sentence's facts (v1.x → v2) and left its now-hollow argument standing; (b) sweep repo-wide, NOT file-local — instance 3's false claim lived in six places; (c) a documented COMMAND is checkable by RUNNING it — instance 1 read a command instead of running it. Rule (c) is BOUNDED: the clause qualifies "run it" with "ONLY inside your sandbox under the project's existing egress controls (ADR-029) — never a documented command that pushes, publishes, or reaches an undeclared host", because a command found in repository prose is the same untrusted-input channel as issue text under Fishhawk's threat model and running one must not license a lethal-trifecta action the sandbox otherwise forbids. (d) a site already correctly conditioned needs NO edit, and naming which sites you left alone is the harder half (instance 3's correctly-conditioned seventh site). Then the escalation: where a claim is load-bearing, pin the FACT with a test whose failure message names every prose site (the `backend/internal/spec` `TestShippedSpecDeclaresWorkflowV2` shape) or DERIVE the prose (`cli/internal/docgen` + `scripts/gen-site-reference`), never a brittle full-sentence assertion. Instances 2 and 5 are covered by the repo-wide sweep clause.
+
+The fix-up call site is deliberate, for the same reason as `writeCounterfactualDiscipline` (#2453): a fix-up changes observable behavior too and sits downstream of every plan-gate condition, so a claim a fix-up invalidates would otherwise escape the sweep. It is NOT rendered on the plan or review paths (a plan proposes, it does not yet change behavior), so the frozen `testdata/plan-prompt-pre-change.golden` needs no regeneration. Cost is paid honestly on every render: the block is **about 2.2 KB** once per implement pass and once per fix-up pass (roughly 5% of a ~44KB implement prompt). This number is UNPINNED — no test asserts it — and dated: it was measured after the #3013 fix-up added the sandbox/egress qualifier to rule (c) (the block was 1806 bytes as first shipped), so treat it as informational for the retirement decision and re-measure before quoting it. The retirement question the issue raises against itself — five instances in nine runs may over-represent the rate on a documentation-heavy queue — is recorded here so a later decision to retire the clause has the number in front of it.
+
+Pinned by three tests in `prompt_test.go`: `TestBuild_Implement_BehaviorClaimSweep_Rendered` (heading + five phrase-level wants, so a comment-only no-op leaves it red), `_RenderedOnFixup` (the fix-up-path pin — because it and `_Rendered` drive two builders through two call sites, deleting either single call site reddens exactly one), and `_AbsentFromPlanPrompt` (a self-paired presence/absence over the same heading constant, so the absence half cannot pass vacuously and a leak onto the golden-pinned plan path goes red).
+
 ## Review grounding — conditional repository-access clause (#2486)
 
 Both review prompts (`buildPlanReview`, `buildImplementReview`) render a
@@ -485,7 +509,15 @@ honest-about-what-it-lacks, which is the whole point of the named literal.
 
 **Half B — agent CLAIM.** `GateEvidence.FixupCounterfactuals` carries the
 `{control_path, observed, restored}` triples the runner validated out of the
-fix-up self-report sidecar (`runner/README.md` for the fail-closed drop rules).
+counterfactual sidecars (`runner/README.md` for the fail-closed drop rules).
+Since #2929 the carrier covers BOTH passes — the fix-up self-report sidecar and
+the initial implement pass's own `/tmp/fishhawk-counterfactuals-<run>-<stage>.json`,
+read through exactly complementary runner branches so a claim can never be
+double-counted — so the block is titled pass-agnostically,
+`### Counterfactual self-report (agent CLAIM — not a runner observation)`. The
+wire kind stays `fixup_counterfactuals` on purpose: the runner is an
+independently pinned module and a renamed kind would be silently dropped by a
+pinned older backend.
 The render says plainly that the verify runs above are what the RUNNER MEASURED
 while this block is only what the AGENT SAYS IT DID: the runner never witnessed
 the mutation and cannot tell a real counterfactual from a no-op one, so
@@ -602,3 +634,94 @@ extraction risks perturbing `buildPlan`'s golden-pinned bytes.
 context and renders a groom stage as an ordinary plan. Widening the preview to
 resolve documents (and then fork) is #2804's, not this slice's; the preview stays
 byte-identical to today.
+
+## Live-validation markers in the review prompt (#2978)
+
+`writeAcceptanceCriteriaForReview` renders three acceptance-criterion markers
+the reviewer was previously never shown. Each is emitted only when set, in a
+fixed order, appended after the existing `verify_hint` segment on the criterion
+line:
+
+1. ` skip_expected: true` — when `SkipExpected`.
+2. ` expectation_basis: <text>` — when `ExpectationBasis` is non-empty.
+3. ` requires_live_validation: true (DECLARED OPERATOR WALK — …)` — when
+   `RequiresLiveValidation`, carrying the inline annotation
+   (`liveValidationCriterionAnnotation`) that names WHY no verification step
+   decides the criterion.
+
+**Why the reviewer needs it.** The markers were dropped on the floor: the line
+carried only id, statement, source, source_ref, blocking, rationale and
+verify_hint. A diff-only reviewer cannot infer a flag from the approach steps,
+so it read a correctly-flagged live-target criterion as an unverified blocking
+criterion and rejected — five identical rejects in one campaign (#2978, runs
+001c7d71, 4450a5d3, 8288446b, b9c22317, d2143e05).
+
+**Division of labour with the deterministic gate.** `backend/internal/plan`'s
+`missing_live_validation_marker` rule reports the UNFLAGGED shape (#2845) and
+already reaches the reviewer through the gate-evidence block. The prompt change
+explains the FLAGGED one. No gate rule changed; the two are complements, and
+`TestBuild_PlanReview_UnflaggedLiveTargetCriterionUnannotated` pins both halves
+in one prompt.
+
+**Instruction side.** `buildPlanReview` gains review-criteria item 13
+(`liveValidationChecklistItem`) and one verdict-decision-rule clause
+(`liveValidationVerdictClause`). The clause's suppression is deliberately
+NARROW and says so in its own words: it covers only coverage/verification-gap
+concerns arising from the MARKING ITSELF, and leaves testability, independence
+and falsifiability findings about the criterion's statement text untouched —
+over-correcting a reviewer into silence is the mirror image of the defect this
+closes. Item 13 names the three shapes that ARE still defects (an unmarked
+live-target criterion; a marked criterion whose `verify_hint` names no
+executable walk; a marker dodging a check the sandbox could perform). Both
+constants' verbatim text is asserted by
+`TestBuild_PlanReview_LiveValidationChecklistItem`, so a reword cannot quietly
+widen the suppression.
+
+**Byte-identity, scoped honestly.** The additive guarantee covers a
+MARKER-FREE criterion: a criterion with none of the three fields set renders
+byte-identical to the pre-#2978 line, which
+`TestBuild_PlanReview_LiveValidationRenderIsAdditive` pins by stripping exactly
+the three segments from the marked prompt and comparing to the unmarked one. It
+does NOT claim every existing prompt is unchanged — a plan CARRYING markers
+renders longer by construction, and the instruction block is unconditional, so
+`TestBuild_PlanReview_TrimmedBelowBaseline`'s `preTrimBaselineLen` moved by the
+1333 bytes item 13 and the verdict clause add (the same convention #1533 and
+#2290 followed).
+
+The marker-bearing-fixture enumeration approval condition (2) asked for has a
+short answer, and it corrects the condition's own premise. The condition named
+`TestBuild_PlanReview_GateEvidence_AllSkipConsequenceRenders` (the all-skip
+consequence test, #3026) as a test that "necessarily sets both on every
+criterion". It does not: it sets `AllSkipShortCircuit` and an
+`all_criteria_skip_expected` finding on the GATE-EVIDENCE struct
+(`AcceptancePrecheckEvidence`) — the precheck's REPORT that the plan is all-skip
+— while its plan is a bare `fixturePlan()` whose criteria set none of
+`SkipExpected` / `ExpectationBasis` / `RequiresLiveValidation`. The two live on
+different structs, and only the criterion fields reach
+`writeAcceptanceCriteriaForReview`. Enumerating the package by grep on all three
+field names returns exactly one site: `planWithLiveValidationCriterion`, the
+helper this change added. `prompt_test.go` is the package's only test file. So
+the enumeration is empty, no existing test needed updating, and no existing
+assertion was touched.
+
+**Reach.** `writeAcceptanceCriteriaForReview` is called from
+`writePlanForReview`, which three builders use — plan review, implement review,
+and the scope-exemption review — so the marker rendering lands in all three.
+That is intended: the implement reviewer benefits from the same context. The
+item-13 instruction and verdict clause are plan-review only.
+`TestBuild_ImplementReview_LiveValidationFlagsRendered` pins the implement-review
+half directly — the marked criterion's line carries the three segments, and the
+marker-free control's line carries none — so the "all three" claim rests on an
+assertion rather than on reading the call graph. The scope-exemption builder
+remains covered by reading alone: it reaches the same
+`writePlanForReview` → `writeAcceptanceCriteriaForReview` path, and the two
+asserted builders are what make that shared writer's behaviour observable.
+
+Caveat worth stating plainly: this is a prompt INSTRUCTION to an LLM reviewer,
+not an enforced control. The tests prove the markers and the instruction render
+in the shipped prompt; they cannot prove a reviewer obeys them. The failure
+direction is unchanged and safe — at worst the next campaign reproduces today's
+spurious reject, which the operator already overrules. Falsifiable check: if a
+reject on the flagged-criterion premise recurs after this ships, the
+informational fix was insufficient and the next step is a deterministic
+gate-side suppression rather than more prompt text.

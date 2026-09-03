@@ -454,6 +454,77 @@ func ValidStageFixupRecoveryTransition(from, to StageState) bool {
 	return ok
 }
 
+// stageMergeSupersedePair is one row of the merge-supersede table: the
+// (stage_type, state) pair a merge is allowed to terminalize as
+// `superseded`. It is a PAIR, not a bare state, because the admissibility
+// question is genuinely type-dependent — `awaiting_approval` on a review
+// stage is a gate the merge dissolved, while the same state on some other
+// stage type is not.
+type stageMergeSupersedePair struct {
+	StageType StageType
+	From      StageState
+}
+
+// stageMergeSupersedeTransitions is the DEFAULT-DENY table of the only
+// (stage_type, state) pairs a merge may terminalize as `superseded`
+// (#3083). Exactly two rows, each with the fact it records:
+//
+//   - acceptance @ awaiting_host_dispatch — a fix-up pass re-parked the
+//     acceptance stage for a host spawn. Once the PR merges nothing will
+//     re-dispatch it, and dispatching it anyway would run the acceptance
+//     agent against a preview bound to a commit that is no longer the
+//     change. The stage is unreachable, not failed.
+//   - review @ awaiting_approval — the human review gate on a change that
+//     has ALREADY merged. The judgment the gate exists to collect can no
+//     longer alter the outcome.
+//
+// A state-only allow-list is REJECTED BY DESIGN. A `pending` plan or
+// implement stage swept to `superseded` would let Orchestrator.completeRun
+// stamp the run `succeeded` having never planned or implemented it —
+// defeating exactly the invariant the #968 completion guard protects. The
+// guard passes `superseded` because it is terminal, so this table is the
+// ONLY thing standing between a merge and a fabricated success. Adding a
+// row here is therefore a decision about run integrity, not a convenience.
+var stageMergeSupersedeTransitions = []stageMergeSupersedePair{
+	{StageType: StageTypeAcceptance, From: StageStateAwaitingHostDispatch},
+	{StageType: StageTypeReview, From: StageStateAwaitingApproval},
+}
+
+// MergeSupersedable reports whether a stage of stageType currently in
+// `from` is one the merge-supersede table admits. It is the classification
+// half of the table, consulted by the sweep to decide which parked stages a
+// merge may terminalize; ValidStageMergeSupersedeTransition is the
+// transition-admissibility half enforced at the repository boundary.
+//
+// The stageType comparison is load-bearing: without it the predicate
+// degrades to a state-only allow-list, which would admit a `pending` plan
+// stage under the review row's state and fabricate a `succeeded` run.
+func MergeSupersedable(stageType StageType, from StageState) bool {
+	for _, p := range stageMergeSupersedeTransitions {
+		if p.StageType == stageType && p.From == from {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidStageMergeSupersedeTransition reports whether a stage of stageType
+// may move from→to via the merge-supersede path. True ONLY when `to` is
+// StageStateSuperseded AND (stageType, from) is a row of the default-deny
+// table above.
+//
+// It is a SEPARATE table from every other transition validator, and unlike
+// them it is TYPE-AWARE: the repository's transition union consults it with
+// the row-locked stage's own stage_type (postgres.go), so the table is
+// enforced at the boundary rather than being advisory guidance a caller
+// reaching the repository directly could bypass.
+func ValidStageMergeSupersedeTransition(stageType StageType, from, to StageState) bool {
+	if to != StageStateSuperseded {
+		return false
+	}
+	return MergeSupersedable(stageType, from)
+}
+
 // InvalidTransitionError describes a refused state transition.
 // Callers can errors.Is/As against it to surface a 409 Conflict at
 // the HTTP layer.

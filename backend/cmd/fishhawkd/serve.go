@@ -884,6 +884,13 @@ func registeredFileFetcher(id string) forge.FileFetcher {
 // (backend/internal/repodoc), not to this wiring.
 var documentInjectionForgeIDs = []string{"github", "gitlab"}
 
+// newServer indirects server.New so serve_test can observe the FULLY
+// CONSTRUCTED server.Config runServe builds — the seam the cross-layer
+// single-tenant-profile-reaches-the-denial-log test (#2468) captures through.
+// A zero-branch func var, never a production nil check; runServe calls it
+// exactly where it called server.New.
+var newServer = server.New
+
 // forgeGetter is the registry read the document-injection wiring performs.
 // Injected rather than called directly so serve_test.go can assert the
 // preference order without mutating the process-wide forge registry.
@@ -1192,6 +1199,31 @@ func gitlabIdentityWarnings(baseURL, deviceClientID, deploymentToken string) []s
 		warnings = append(warnings, "gitlab device flow unconfigured: FISHHAWKD_GITLAB_BASE_URL is set but FISHHAWKD_GITLAB_DEVICE_CLIENT_ID is not; register a NON-Confidential GitLab application for the device flow (FISHHAWKD_GITLAB_OAUTH_CLIENT_ID is the Confidential browser-sign-in application and is deliberately NOT used as a fallback)")
 	}
 	return warnings
+}
+
+// validateIssueSetResolutionBudget is the startup gate on
+// --issue-set-resolution-budget / FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET
+// (E54.59 / #3113), extracted for the same reason resolveMCPRouteMode is: the
+// refusal IS the behavior, and it must be assertable without booting a server.
+//
+// Zero means "use server.DefaultIssueSetResolutionBudget" and is accepted. A
+// NEGATIVE value is a typo that would otherwise silently take the default. A
+// value ABOVE server.MaxIssueSetResolutionBudget is refused naming BOTH the
+// configured value and the permitted maximum, because the maximum is a
+// cross-process invariant: the MCP client's issue-set timeout sits above it so
+// the client can never be what gives up first. server.issueSetResolutionBudget
+// clamps at the read site regardless — this refusal exists so an operator who
+// asked for more is told rather than silently clamped.
+func validateIssueSetResolutionBudget(d time.Duration) error {
+	if d < 0 {
+		return fmt.Errorf("--issue-set-resolution-budget must not be negative; got %s (0 or unset uses the %s default)",
+			d, server.DefaultIssueSetResolutionBudget)
+	}
+	if d > server.MaxIssueSetResolutionBudget {
+		return fmt.Errorf("--issue-set-resolution-budget %s exceeds the permitted maximum %s; the maximum is what the MCP client's issue-set request timeout is set above, so a larger budget would let the client give up before the server does",
+			d, server.MaxIssueSetResolutionBudget)
+	}
+	return nil
 }
 
 // resolveRepoVisibility is the BOTH-REQUIRED config gate for the per-identity
@@ -1745,6 +1777,14 @@ func runServe(args []string, logSink io.Writer) int {
 		"per-KB allowance added to the review-budget floor per kilobyte of prompt (#747); "+
 			"the budget is floor + per_kb*ceil(promptBytes/1024), clamped to [floor, cap]. "+
 			"Set to 0 to collapse the budget to a flat floor (today's fixed-timeout behaviour) without a redeploy")
+	issueSetResolutionBudget := fs.Duration("issue-set-resolution-budget",
+		envOrDuration("FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET", 0),
+		"budget for the no-epic campaign source's issue-set dependency resolution (E54.59 / #3113): "+
+			"a full ratified grooming order costs one forge round-trip per named item, and before this the "+
+			"path had no server-side deadline at all. Unset/0 uses server.DefaultIssueSetResolutionBudget (120s). "+
+			"A NEGATIVE value, or one ABOVE server.MaxIssueSetResolutionBudget (10m), REFUSES startup naming "+
+			"both numbers — the maximum is what the MCP client's issue-set timeout is pinned above, so the "+
+			"client is never what gives up first")
 	reviewBudgetCap := fs.Duration("review-budget-cap",
 		envOrDuration("FISHHAWKD_REVIEW_BUDGET_CAP", planreview.DefaultReviewBudget.Cap),
 		"hard ceiling on the size-aware review budget (#747), bounding the worst-case "+
@@ -1753,10 +1793,14 @@ func runServe(args []string, logSink io.Writer) int {
 		envOrBool("FISHHAWKD_REVIEW_GROUNDING", false),
 		"ground plan-/implement-review agents against an exported read-only source tree (#2486): "+
 			"the reviewer can read and search the repository's tracked files at the reviewed commit to "+
-			"confirm diff-invisible facts. OFF by default (#2522): reviewer reads are NOT confined to "+
-			"the export — cmd.Dir and --add-dir select a working directory, they do not jail reads, so a "+
-			"grounded reviewer can read any file the daemon user can read and its verdict text is an "+
-			"egress path. Set FISHHAWKD_REVIEW_GROUNDING=true to opt in on a trusted single-tenant host. "+
+			"confirm diff-invisible facts. OFF by default. #2522 added per-adapter READ BOUNDS, and they "+
+			"are NOT equivalent: codex gets OS-enforced deny-by-default confinement via a synthesized "+
+			"`confined` permission profile, claude gets a bounded credential-root deny-rule BLOCKLIST "+
+			"(defence-in-depth, not confinement — a read outside the named roots is still permitted). "+
+			"The default stays OFF because live enforcement of the shipped flag combination is not "+
+			"proven at merge; flipping it is a separate follow-up gated on a recorded operator run of "+
+			"backend/internal/reviewsandbox/live_confinement_test.go on BOTH adapters. Set "+
+			"FISHHAWKD_REVIEW_GROUNDING=true to opt in on a trusted single-tenant host. "+
 			"The environment scrub is independent of this flag and always applied")
 	reviewerEnvPassthrough := fs.String("reviewer-env-passthrough",
 		envOr("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", ""),
@@ -1875,6 +1919,21 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 
+	// Issue-set resolution budget (E54.59 / #3113). Fail closed on BOTH
+	// out-of-range directions rather than silently substituting a value: an
+	// operator who configured a budget expecting it to be honoured must be
+	// TOLD it is not. The over-maximum refusal names both numbers because the
+	// maximum is not arbitrary — server.MaxIssueSetResolutionBudget is what the
+	// MCP client's issue-set http.Client timeout is set above, so a budget
+	// beyond it would put the client back in the position of being what gives
+	// up first, which is exactly #3113's defect. The read site clamps too
+	// (server.issueSetResolutionBudget), so the invariant holds however a
+	// Config was built; this refusal is what keeps the clamp from being silent.
+	if err := validateIssueSetResolutionBudget(*issueSetResolutionBudget); err != nil {
+		logger.Error("invalid --issue-set-resolution-budget", slog.String("error", err.Error()))
+		return exitFailure
+	}
+
 	// Warn when an operator .env / flag override drops the plan-review
 	// timeout below the #606 code default (300s) — a value that risks
 	// timing out review of large standard_v1 plans, silently defeating the
@@ -1913,7 +1972,7 @@ func runServe(args []string, logSink io.Writer) int {
 	modelProviders := buildModelProviders(*anthropicAPIKey, *openAIAPIKey)
 	modelOracle := modeloracle.NewCached(modelProviders, *modelsStalenessThreshold, logger)
 
-	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle, MCPRoute: mcpRouteMode}
+	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle, MCPRoute: mcpRouteMode, IssueSetResolutionBudget: *issueSetResolutionBudget}
 
 	// Wire the MCP tool registry into the /mcp route (ADR-076 / #2390). The
 	// route takes a FACTORY rather than importing mcpserver itself: an import
@@ -1995,10 +2054,13 @@ func runServe(args []string, logSink io.Writer) int {
 	cfg.PlanReviewers = planReviewers
 
 	// Review grounding (#2486): grounding is OFF unless FISHHAWKD_REVIEW_GROUNDING
-	// is true. It ships DORMANT because reviewer reads are not confined to the
-	// exported tree (#2522) — verified live: claude reads out-of-tree absolute
-	// paths and codex lists ~/.ssh — so enabling it is an explicit operator
-	// choice for a trusted single-tenant host, not a default posture. The
+	// is true. It still ships DORMANT after #2522 added the per-adapter read
+	// bounds: codex is genuinely confined (OS-enforced allowlist), claude only
+	// gets a bounded credential-root blocklist, and the live denial behaviour of
+	// the shipped flag combination is UNPROVEN at merge (the opt-in harness in
+	// backend/internal/reviewsandbox measures it). So enabling it stays an
+	// explicit operator choice for a trusted single-tenant host, not a default
+	// posture, and the flip is a separate operator-gated follow-up. The
 	// environment scrub is NOT gated on this flag and always applies.
 	// The passthrough list is also carried on the
 	// server config so the grounding-side wiring and the adapter-side scrub read
@@ -2118,20 +2180,29 @@ func runServe(args []string, logSink io.Writer) int {
 	if pool != nil {
 		singleTenantQueries = accountdb.New(pool)
 	}
+	// Build the profile ONCE from the flags, so the bootstrap and the diagnostic
+	// cfg.SingleTenantProfile (read only on the login gate's no-admitting-account
+	// denial log, #2468) can never describe different profiles.
+	singleTenantProfile := account.SingleTenantConfig{
+		Provider:     *singleTenantProvider,
+		AccountKey:   *singleTenantAccountKey,
+		DisplayName:  *singleTenantDisplayName,
+		Granularity:  *singleTenantGranularity,
+		AutoJoinRole: *singleTenantAutoJoinRole,
+	}
 	if _, bootstrapped, err := account.EnsureSingleTenantAccount(context.Background(), singleTenantQueries,
-		account.SingleTenantConfig{
-			Provider:     *singleTenantProvider,
-			AccountKey:   *singleTenantAccountKey,
-			DisplayName:  *singleTenantDisplayName,
-			Granularity:  *singleTenantGranularity,
-			AutoJoinRole: *singleTenantAutoJoinRole,
-		}, logger); err != nil {
+		singleTenantProfile, logger); err != nil {
 		logger.Error("single-tenant profile bootstrap failed", slog.String("error", err.Error()))
 		return exitFailure
 	} else if !bootstrapped {
 		logger.Info("single-tenant profile not configured; running hosted multi-tenant (sign-in admits only against existing accounts rows)",
 			slog.String("ref", "#1833"))
 	}
+	// Diagnostic-only (#2468): the login gate reads this to NAME the configured
+	// profile in the no-admitting-account denial log. cfg is declared at the
+	// server.Config literal ~200 lines above; assign the same value the bootstrap
+	// saw. Never an admission input.
+	cfg.SingleTenantProfile = singleTenantProfile
 
 	// Regional handoff surface (ADR-062, E44.7 / #1831). Constructed only when
 	// the cell's own region, the shared secret, AND a database are all present;
@@ -2809,7 +2880,7 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.String("ref", "#2234"))
 	}
 
-	srv = server.New(cfg)
+	srv = newServer(cfg)
 
 	// Per-repo work-management conventions loader (E45.16 / #2022): fetch
 	// .fishhawk/work-management.yaml from the filing repo's OWN forge,
@@ -3548,14 +3619,38 @@ type gitLabProjectRegistryQueries interface {
 // account that owns it. Both halves of the payload identity are bound:
 //
 //  1. the credential ref must resolve to a registered gitlab installation, and
-//  2. the project path's namespace segment must equal that installation's
-//     account_key — the same owner-segment convention account.Resolver uses.
+//  2. the project path must equal that installation's recorded project_path
+//     EXACTLY, byte for byte.
 //
 // Requiring (2) is what stops a registered project id from being paired with
 // some OTHER project's path: the two selectors address different projects (the
 // ref picks the credential and the pipeline target, the path picks the project
 // the workflow spec is read from), so binding only the ref would still leave
 // the spec read steerable.
+//
+// (2) is EXACT since E45.26 / #2877. It was previously NAMESPACE-level — the
+// path's first segment compared against the account_key — which admitted a
+// registered 'gitlab:4242' under account 'acme' paired with any 'acme/*' path,
+// leaving the spec read steerable to a sibling project inside the tenant.
+// Comparison is case-SENSITIVE: GitLab canonicalises project path case, so a
+// case difference means the payload does not name the recorded project.
+//
+// The namespace comparison is RETAINED alongside the exact compare as a tenancy
+// invariant, and it is NOT redundant: the write path validates that a recorded
+// path's namespace equals its account's key, but a row written BEFORE that
+// validation existed (the hand-written SQL docs/deploy/gitlab.md used to
+// prescribe), or one whose account was re-keyed afterwards, can carry a path
+// outside its account's namespace. The exact compare would admit such a row —
+// recorded and payload paths agree — while the tenancy invariant it violates
+// does not hold. The namespace check refuses it.
+//
+// A row recording NO project path (NULL, or an empty string — a *string has
+// three states and two of them are unbound) is the shape every installation
+// registered before migration 0078 has. It REFUSES with
+// webhook.ErrGitLabProjectPathUnbound rather than falling back to the old
+// namespace-only admit, so the dispatcher can name the condition in the audit
+// and point the operator at re-registration. Falling back would preserve
+// exactly the steering this change closes.
 //
 // A missing row is a REFUSAL (false, nil); a query fault is an ERROR the
 // dispatcher also fails closed on. Neither ever admits.
@@ -3588,7 +3683,17 @@ func (r gitLabProjectRegistry) AuthorizedGitLabProject(ctx context.Context, cred
 		}
 		return false, err
 	}
-	return acct.AccountKey == owner, nil
+	// The retained tenancy invariant: the payload path must live in the owning
+	// account's namespace, whatever the installation recorded.
+	if acct.AccountKey != owner {
+		return false, nil
+	}
+	// Fail closed on an unbound row rather than degrading to the pre-#2877
+	// namespace-only admit. NULL and empty are both unbound.
+	if inst.ProjectPath == nil || strings.TrimSpace(*inst.ProjectPath) == "" {
+		return false, webhook.ErrGitLabProjectPathUnbound
+	}
+	return strings.TrimSpace(*inst.ProjectPath) == projectPath, nil
 }
 
 var _ webhook.GitLabProjectAuthorizer = gitLabProjectRegistry{}

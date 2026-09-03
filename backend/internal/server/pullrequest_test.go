@@ -3152,3 +3152,174 @@ func TestShipPullRequest_FixupNoChanges_NoReviewDispatched(t *testing.T) {
 		t.Errorf("implement_review_started = %v, want none (a fix-up that changed nothing certifies nothing)", heads)
 	}
 }
+
+// wireGoldenOrdinaryBytes reads the ORDINARY-path PR artifact fixture (#3012) —
+// the SAME file runner/cmd/fishhawk-runner asserts openPRAndShipArtifact
+// produces. The held-commit golden covers only the #2570 RESUME path; the bug
+// reported in #3012 happened on the ordinary FIRST-ATTEMPT path, so that path
+// needs its own two-sided fixture or omitting pr_body_fallback_reason from the
+// ordinary artifact map ships silently.
+//
+// Anchored to THIS test source via runtime.Caller, for the same reason
+// wireGoldenHeldCommitBytes is.
+func wireGoldenOrdinaryBytes(t *testing.T) []byte {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "ordinary_pr_artifact.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared wire golden %s: %v", path, err)
+	}
+	return b
+}
+
+// TestShipPullRequest_OrdinaryGoldenCarriesFallbackReason is the BACKEND half of
+// the ordinary-path seam (#3012): the exact bytes the runner ships when the
+// agent composed no PR body MUST decode through the real DisallowUnknownFields +
+// validate() handler as a valid success body, and the composition-failure
+// classification MUST reach the pull_request_opened audit payload. If
+// pr_body_fallback_reason were not a declared pullRequestBody key, this fails
+// 400 here rather than stranding a real stage after the PR already exists.
+func TestShipPullRequest_OrdinaryGoldenCarriesFallbackReason(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, _ := newPRServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	golden := wireGoldenOrdinaryBytes(t)
+
+	var fields struct {
+		Reason string `json:"pr_body_fallback_reason"`
+	}
+	if err := json.Unmarshal(golden, &fields); err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+	if fields.Reason != "handoff_absent" {
+		t.Fatalf("ordinary wire golden pr_body_fallback_reason = %q, want handoff_absent — the runner is no longer classifying the reported branch", fields.Reason)
+	}
+
+	w := shipPRRequest(t, s, runID, stageID, priv, golden, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("ordinary golden status = %d, want 201 (the runner's artifact must validate):\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1", len(ar.all))
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != "pull_request_opened" {
+		t.Fatalf("want one pull_request_opened audit entry, got %+v", au.appended)
+	}
+	var payload struct {
+		Reason string `json:"pr_body_fallback_reason"`
+	}
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("decode audit payload: %v", err)
+	}
+	if payload.Reason != "handoff_absent" {
+		t.Errorf("pull_request_opened pr_body_fallback_reason = %q, want handoff_absent", payload.Reason)
+	}
+}
+
+// TestShipPullRequest_UnknownFallbackReasonNormalized pins the fail-open
+// normalization (#3012): a value this backend does not recognize — a newer
+// runner's sixth reason, say — is accepted 201 and RECORDED as "unknown", never
+// rejected 400. A 400 here would strand the implement stage in `running` after
+// the pull request already exists on the forge, which is strictly worse than the
+// advisory diagnostic it would be rejecting.
+//
+// The malformed body is the golden paired with ITSELF-with-one-field-replaced
+// (not a different clean body), so deleting the membership check lands the RED
+// on the normalization and not on an incidental mismatch.
+func TestShipPullRequest_UnknownFallbackReasonNormalized(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, _ := newPRServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	var m map[string]any
+	if err := json.Unmarshal(wireGoldenOrdinaryBytes(t), &m); err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+	m["pr_body_fallback_reason"] = "a_reason_from_a_newer_runner"
+	mutated, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPRRequest(t, s, runID, stageID, priv, mutated, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — an unrecognized advisory reason must never reject the artifact:\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1", len(ar.all))
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload struct {
+		Reason string `json:"pr_body_fallback_reason"`
+	}
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("decode audit payload: %v", err)
+	}
+	if payload.Reason != "unknown" {
+		t.Errorf("pr_body_fallback_reason = %q, want \"unknown\" — an unrecognized runner value must be normalized, not echoed into the chained audit log", payload.Reason)
+	}
+}
+
+// TestShipPullRequest_ComposedGoldenOmitsFallbackReason: the SAME golden with
+// only that field removed — the shape every composed ship has — records NO
+// pr_body_fallback_reason key at all, so every pre-#3012 audit payload stays
+// byte-identical.
+func TestShipPullRequest_ComposedGoldenOmitsFallbackReason(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newPRServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	var m map[string]any
+	if err := json.Unmarshal(wireGoldenOrdinaryBytes(t), &m); err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+	delete(m, "pr_body_fallback_reason")
+	stripped, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPRRequest(t, s, runID, stageID, priv, stripped, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("decode audit payload: %v", err)
+	}
+	if _, present := payload["pr_body_fallback_reason"]; present {
+		t.Errorf("a composed ship's audit payload must OMIT the key entirely, got %v", payload["pr_body_fallback_reason"])
+	}
+}
+
+// TestNormalizePRBodyFallbackReason_ClosedSet pins the mirrored vocabulary
+// against the runner's prBodyReason constants (#1774/#2501 mirrored-literal
+// pattern): each runner value survives verbatim, "unknown" is itself, absent
+// stays absent, and everything else collapses.
+func TestNormalizePRBodyFallbackReason_ClosedSet(t *testing.T) {
+	for in, want := range map[string]string{
+		"handoff_absent":     "handoff_absent",
+		"handoff_unreadable": "handoff_unreadable",
+		"empty_file":         "empty_file",
+		"empty_title":        "empty_title",
+		"body_absent":        "body_absent",
+		"unknown":            "unknown",
+		"":                   "",
+		"HANDOFF_ABSENT":     "unknown",
+		"handoff_absent ":    "unknown",
+		"something else":     "unknown",
+	} {
+		if got := normalizePRBodyFallbackReason(in); got != want {
+			t.Errorf("normalizePRBodyFallbackReason(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

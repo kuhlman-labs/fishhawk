@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -2754,6 +2755,173 @@ func TestServe_SingleTenantPartialConfig_FailsStartup(t *testing.T) {
 	}
 }
 
+// denyAllMembership is a deny-all auth.MembershipResolver for the cross-layer
+// denial-log test: it returns an empty account set, driving the callback down
+// the no-admitting-account branch.
+type denyAllMembership struct{}
+
+func (denyAllMembership) ResolveAccounts(_ context.Context, _, _ string, _ authpkg.GitHubProfile) ([]uuid.UUID, error) {
+	return nil, nil
+}
+
+// stubGitHubOAuthForDenial mirrors the server package's OAuth stub in package
+// main: an httptest forge returning the given login, wrapped in a real
+// *auth.GitHubOAuth so the callback exercises the full exchange + profile fetch.
+func stubGitHubOAuthForDenial(t *testing.T, login string) *authpkg.GitHubOAuth {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"gho_xxx"}`))
+	})
+	mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+		body, _ := json.Marshal(map[string]any{"id": int64(42), "login": login, "name": "The Octo Cat", "email": "octo@example.com"})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return authpkg.NewGitHubOAuth("client-id", "secret", "https://example.com/cb",
+		authpkg.OAuthURLs{
+			AuthorizeURL: srv.URL + "/login/oauth/authorize",
+			TokenURL:     srv.URL + "/login/oauth/access_token",
+			UserURL:      srv.URL + "/user",
+		})
+}
+
+// TestServe_SingleTenantProfileReachesDenialLog is the WHOLE-PATH test
+// (operator condition 1/3): FLAGS → serve wiring → server.Config → a denied
+// OAuth callback → the emitted denial log record. It captures the FULLY
+// CONSTRUCTED server.Config through the newServer seam — reached because the
+// --review-resolution abort (bootstrapAbortFlag) runs AFTER newServer(cfg) and
+// before the listener binds — then rebuilds a server from that captured config
+// (overriding only Logger, GitHubOAuth, AuthMembership: exactly the three the
+// deny path touches; the deny path never calls SignIn or reaches the closed
+// pool stores) and drives the denied callback. It asserts the denial record
+// carries the account key and granularity that came FROM THE FLAGS through
+// serve.go's wiring, not from a hand-built Config — so it goes red both when
+// auth.go stops reading the field and when serve.go stops assigning it, the
+// seam mismatch neither per-layer half alone catches.
+func TestServe_SingleTenantProfileReachesDenialLog(t *testing.T) {
+	var captured server.Config
+	orig := newServer
+	newServer = func(cfg server.Config) *server.Server {
+		captured = cfg
+		return orig(cfg)
+	}
+	t.Cleanup(func() { newServer = orig })
+
+	code, log := serveWithProfile(t, "-db", pgtest.NewURL(t),
+		"-single-tenant-account-key", "Octocat",
+		"-single-tenant-granularity", "user",
+		bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d (aborts at the invalid review-resolution, AFTER newServer); log:\n%s", code, exitFailure, log)
+	}
+	if !captured.SingleTenantProfile.Enabled() {
+		t.Fatalf("captured server.Config carries no single-tenant profile — the flags did not reach cfg.SingleTenantProfile; log:\n%s", log)
+	}
+
+	// Rebuild a server from the CAPTURED config, overriding only the three
+	// fields the deny path exercises.
+	var buf bytes.Buffer
+	captured.Logger = slog.New(slog.NewJSONHandler(&buf, nil))
+	captured.GitHubOAuth = stubGitHubOAuthForDenial(t, "octocat")
+	captured.AuthMembership = denyAllMembership{}
+	denialSrv := server.New(captured)
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/auth/github/callback?code=abc&state=st", nil)
+	req.AddCookie(&http.Cookie{Name: authpkg.StateCookieName, Value: "st"})
+	w := httptest.NewRecorder()
+	denialSrv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusFound {
+		t.Fatalf("callback status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+
+	var rec map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		if m["msg"] == "oauth sign-in denied: no admitting account" {
+			rec = m
+			break
+		}
+	}
+	if rec == nil {
+		t.Fatalf("no denial record in log:\n%s", buf.String())
+	}
+	if got, _ := rec["configured_account_key"].(string); got != "Octocat" {
+		t.Errorf("configured_account_key = %q, want %q (the flag value threaded through serve.go)\nrecord: %+v", got, "Octocat", rec)
+	}
+	if got, _ := rec["configured_granularity"].(string); got != "user" {
+		t.Errorf("configured_granularity = %q, want %q (the flag value threaded through serve.go)\nrecord: %+v", got, "user", rec)
+	}
+}
+
+// TestEnvExampleDocumentsSingleTenantProfile is the done-means test for the
+// residual-B .env.example block (operator condition 6): a config-file change no
+// compiler enforces. It asserts, at the same width as the acceptance criterion,
+// that the five FISHHAWKD_SINGLE_TENANT_* names occur, each COMMENTED OUT (so a
+// fresh copy never accidentally enables the profile), that the enablement
+// guidance names the account key as the sole signal AND states the partial-
+// configuration startup error, that the personal-namespace guidance names
+// granularity `user`, and that the block points at docs/deploy/self-hosted.md.
+func TestEnvExampleDocumentsSingleTenantProfile(t *testing.T) {
+	raw, err := os.ReadFile("../../../.env.example")
+	if err != nil {
+		t.Fatalf("read .env.example: %v", err)
+	}
+	text := string(raw)
+
+	names := []string{
+		"FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY",
+		"FISHHAWKD_SINGLE_TENANT_GRANULARITY",
+		"FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE",
+		"FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME",
+		"FISHHAWKD_SINGLE_TENANT_PROVIDER",
+	}
+	lines := strings.Split(text, "\n")
+	for _, name := range names {
+		found, commented := false, true
+		for _, ln := range lines {
+			if strings.Contains(ln, name) {
+				found = true
+				if !strings.HasPrefix(strings.TrimSpace(ln), "#") {
+					commented = false
+				}
+			}
+		}
+		if !found {
+			t.Errorf(".env.example does not document %s", name)
+		}
+		if !commented {
+			t.Errorf(".env.example has an UNCOMMENTED %s line — a fresh copy would enable the profile", name)
+		}
+	}
+
+	// Enablement guidance: the account key is the SOLE enablement signal, and a
+	// non-key variable with the key empty is a startup error.
+	if !strings.Contains(text, "FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY alone enables") {
+		t.Error(".env.example does not state that the account key ALONE enables the profile")
+	}
+	if !strings.Contains(text, "startup error") {
+		t.Error(".env.example does not warn that a partially-configured profile is a startup error")
+	}
+	// Personal-namespace guidance names granularity `user`.
+	if !strings.Contains(text, "GRANULARITY=user") {
+		t.Error(".env.example does not document the personal-namespace GRANULARITY=user posture")
+	}
+	// Pointer to the operator doc.
+	if !strings.Contains(text, "docs/deploy/self-hosted.md") {
+		t.Error(".env.example does not point at docs/deploy/self-hosted.md")
+	}
+}
+
 // A configured profile with NO database fails startup rather than booting a
 // deployment whose bootstrap silently did not happen.
 func TestServe_SingleTenantConfiguredWithoutPool(t *testing.T) {
@@ -2969,6 +3137,130 @@ func TestServeRejectsInvalidMCPRoute(t *testing.T) {
 	if !strings.Contains(log.String(), "invalid --mcp-route") {
 		t.Errorf("log = %s, want the invalid --mcp-route diagnosis", log.String())
 	}
+}
+
+// TestValidateIssueSetResolutionBudget covers the pure startup gate's four
+// branches (E54.59 / #3113): unset/0 accepted (the read site substitutes
+// server.DefaultIssueSetResolutionBudget), an in-range value accepted, a
+// NEGATIVE value refused, and a value ABOVE server.MaxIssueSetResolutionBudget
+// refused NAMING BOTH numbers — the configured value and the permitted maximum
+// — because the operator cannot act on a refusal that names neither.
+func TestValidateIssueSetResolutionBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		in      time.Duration
+		wantErr bool
+		// mustName are substrings the refusal must carry.
+		mustName []string
+	}{
+		{name: "unset uses the default", in: 0},
+		{name: "in-range is accepted", in: 5 * time.Minute},
+		{name: "at the maximum is accepted", in: server.MaxIssueSetResolutionBudget},
+		{
+			name:     "negative is refused",
+			in:       -time.Second,
+			wantErr:  true,
+			mustName: []string{"-1s", server.DefaultIssueSetResolutionBudget.String()},
+		},
+		{
+			name:     "above the maximum is refused naming both numbers",
+			in:       server.MaxIssueSetResolutionBudget + time.Minute,
+			wantErr:  true,
+			mustName: []string{(server.MaxIssueSetResolutionBudget + time.Minute).String(), server.MaxIssueSetResolutionBudget.String()},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateIssueSetResolutionBudget(tc.in)
+			if tc.wantErr && err == nil {
+				t.Fatalf("validateIssueSetResolutionBudget(%s) = nil, want a refusal", tc.in)
+			}
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("validateIssueSetResolutionBudget(%s) = %v, want nil", tc.in, err)
+				}
+				return
+			}
+			for _, want := range tc.mustName {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal %q does not name %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
+// TestServe_IssueSetResolutionBudget pins the SAME decision THROUGH runServe, so
+// a refactor that drops the call site (leaving the pure helper green) still
+// fails, and so the in-range branch is proven to reach the wiring rather than
+// only the helper. The bootstrapAbortFlag carries an accepted value past the
+// guard to a deliberately-invalid --review-resolution, which is how "accepted"
+// is observable without booting a server.
+func TestServe_IssueSetResolutionBudget(t *testing.T) {
+	t.Run("above the maximum refuses boot naming both numbers", func(t *testing.T) {
+		over := server.MaxIssueSetResolutionBudget + time.Minute
+		code, log := serveWithProfile(t, "-issue-set-resolution-budget="+over.String())
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (an over-maximum budget must refuse to boot); log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, "invalid --issue-set-resolution-budget") {
+			t.Errorf("log does not carry the diagnosis:\n%s", log)
+		}
+		for _, want := range []string{over.String(), server.MaxIssueSetResolutionBudget.String()} {
+			if !strings.Contains(log, want) {
+				t.Errorf("refusal log does not name %q:\n%s", want, log)
+			}
+		}
+	})
+
+	t.Run("negative refuses boot", func(t *testing.T) {
+		code, log := serveWithProfile(t, "-issue-set-resolution-budget=-1s")
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (a negative budget must refuse to boot); log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, "invalid --issue-set-resolution-budget") {
+			t.Errorf("log does not carry the diagnosis:\n%s", log)
+		}
+	})
+
+	t.Run("in-range boots past the guard", func(t *testing.T) {
+		code, log := serveWithProfile(t, "-issue-set-resolution-budget=90s", bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (startup aborts at the invalid --review-resolution, AFTER the budget guard); log:\n%s", code, exitFailure, log)
+		}
+		if strings.Contains(log, "invalid --issue-set-resolution-budget") {
+			t.Errorf("an in-range budget was rejected at boot:\n%s", log)
+		}
+		if !strings.Contains(log, "review-resolution") {
+			t.Errorf("startup did not reach the later --review-resolution guard, so the budget guard was not passed:\n%s", log)
+		}
+	})
+
+	// The three subtests above prove the GUARD is reached; none of them proves
+	// the accepted value is WIRED, because that needs a booted server. A source
+	// pin closes the gap the same way the other serve.go wiring pins do: the
+	// server.Config literal must carry the flag, so an edit that validates the
+	// budget and then forgets to hand it to the server fails here rather than
+	// shipping a flag that does nothing.
+	t.Run("the accepted value is wired into server.Config", func(t *testing.T) {
+		src, err := os.ReadFile("serve.go")
+		if err != nil {
+			t.Fatalf("read serve.go: %v", err)
+		}
+		if !strings.Contains(string(src), "IssueSetResolutionBudget: *issueSetResolutionBudget") {
+			t.Error("serve.go's server.Config literal does not carry IssueSetResolutionBudget: *issueSetResolutionBudget — the flag would be validated and then discarded")
+		}
+	})
+
+	t.Run("unset boots past the guard", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET", "")
+		code, log := serveWithProfile(t, bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+		}
+		if strings.Contains(log, "invalid --issue-set-resolution-budget") {
+			t.Errorf("an unset budget was rejected at boot:\n%s", log)
+		}
+	})
 }
 
 // TestServe_DispatchWatchdogWithoutLivenessRefusesToBoot pins the #2744
@@ -3241,12 +3533,14 @@ func TestMcpRouteServerConfig(t *testing.T) {
 // server.Config, so the env > flag resolution AND the Config wiring are
 // unit-testable without booting the server. It builds the two Config fields
 // exactly as runServe builds them (ReviewGroundingDisabled = !review-grounding).
+// The unset default MUST track serve.go's — a drifted mirror asserts a posture
+// the daemon does not ship, which is exactly what #2522 found here.
 func resolveReviewGroundingConfig(t *testing.T, args []string) server.Config {
 	t.Helper()
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	grounding := fs.Bool("review-grounding",
-		envOrBool("FISHHAWKD_REVIEW_GROUNDING", true), "test")
+		envOrBool("FISHHAWKD_REVIEW_GROUNDING", false), "test")
 	passthrough := fs.String("reviewer-env-passthrough",
 		envOr("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", ""), "test")
 	if err := fs.Parse(args); err != nil {
@@ -3258,16 +3552,22 @@ func resolveReviewGroundingConfig(t *testing.T, args []string) server.Config {
 	}
 }
 
-// TestResolveReviewGroundingConfig pins the #2486 env vars: grounding is ON when
-// unset (ReviewGroundingDisabled false), OFF when FISHHAWKD_REVIEW_GROUNDING is
+// TestResolveReviewGroundingConfig pins the #2486 env vars: grounding is OFF when
+// unset (ReviewGroundingDisabled true), OFF when FISHHAWKD_REVIEW_GROUNDING is
 // false, and the passthrough list parses to trimmed, case-preserving names.
+//
+// The unset default was corrected DOWN to false here (#2522): this mirror helper
+// had drifted from serve.go's real default, so the subtest asserted — and named —
+// a posture the daemon does not ship. Flipping the default is a SEPARATE
+// operator-filed follow-up gated on a recorded operator harness run passing on
+// BOTH adapters.
 func TestResolveReviewGroundingConfig(t *testing.T) {
-	t.Run("grounding on by default", func(t *testing.T) {
+	t.Run("grounding off by default", func(t *testing.T) {
 		t.Setenv("FISHHAWKD_REVIEW_GROUNDING", "")
 		t.Setenv("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", "")
 		cfg := resolveReviewGroundingConfig(t, nil)
-		if cfg.ReviewGroundingDisabled {
-			t.Error("unset FISHHAWKD_REVIEW_GROUNDING must leave grounding ON")
+		if !cfg.ReviewGroundingDisabled {
+			t.Error("unset FISHHAWKD_REVIEW_GROUNDING must leave grounding OFF")
 		}
 		if len(cfg.ReviewerEnvPassthrough) != 0 {
 			t.Errorf("passthrough = %v, want empty", cfg.ReviewerEnvPassthrough)
@@ -3958,24 +4258,65 @@ func (f *fakeGitLabRegistryQueries) GetAccount(_ context.Context, _ uuid.UUID) (
 
 // TestGitLabProjectRegistry_AuthorizedGitLabProject pins the production
 // authorization binding the webhook dispatcher fails closed on (E45.22 /
-// #2043): a GitLab payload's project is authorized only when its credential
-// ref resolves to a REGISTERED gitlab installation AND the project path lives
-// in that installation's account namespace.
+// #2043, tightened by E45.26 / #2877): a GitLab payload's project is authorized
+// only when its credential ref resolves to a REGISTERED gitlab installation
+// AND the project path equals that installation's recorded project_path
+// EXACTLY, with the path still living in the owning account's namespace.
 //
-// The registered cell is the paired control — without it, "refuses" could be
-// satisfied by a function that returns false unconditionally.
+// The registered cells are the paired control — without them, "refuses" could
+// be satisfied by a function that returns false unconditionally.
+//
+// COUNTERFACTUAL ATTAINABILITY. The two retained comparisons are pinned by
+// cases that ISOLATE them, so deleting either lands the RED on that comparison
+// and not on a downstream guard:
+//
+//   - registered_ref_sibling_project_refuses shares the namespace with the
+//     account key and differs ONLY in the project segment. The namespace check
+//     admits it; only the exact-path compare refuses.
+//   - registered_ref_foreign_namespace_refuses records the SAME path the
+//     payload sends ("other/widgets" both sides) under an account keyed
+//     "acme". The exact-path compare ADMITS it — recorded == payload — so only
+//     the namespace check refuses. A fixture keeping the recorded path at
+//     "acme/widgets" while sending "other/widgets" would be refused by the
+//     exact compare on its own and would prove nothing about the namespace
+//     invariant.
+//
+// That second fixture is reachable in production: the write path now validates
+// namespace consistency, but a row written by the hand-rolled SQL
+// docs/deploy/gitlab.md used to prescribe, or one whose account was re-keyed
+// after registration, can carry a path outside its account's namespace.
 func TestGitLabProjectRegistry_AuthorizedGitLabProject(t *testing.T) {
 	acctID := uuid.New()
-	registered := accountdb.Installation{AccountID: acctID, Provider: "gitlab", InstallationRef: "gitlab:4242"}
 	acmeAccount := accountdb.Account{ID: acctID, Provider: "gitlab", AccountKey: "acme"}
+	// boundTo builds a registered installation whose recorded project_path is
+	// path. Cases seed the row BY CONSTRUCTION rather than through
+	// account.RegisterInstallation, which now refuses to create an unbound or
+	// namespace-inconsistent row — so a RED lands on the behavioral assertion,
+	// never on fixture setup.
+	boundTo := func(path string) accountdb.Installation {
+		p := path
+		return accountdb.Installation{
+			AccountID: acctID, Provider: "gitlab", InstallationRef: "gitlab:4242",
+			ProjectPath: &p,
+		}
+	}
+	// unbound is the shape EVERY installations row registered before migration
+	// 0078 has: registered, but recording no project path.
+	unbound := accountdb.Installation{AccountID: acctID, Provider: "gitlab", InstallationRef: "gitlab:4242"}
+	registered := boundTo("acme/widgets")
 
 	cases := []struct {
-		name    string
-		q       gitLabProjectRegistryQueries
-		ref     string
-		path    string
-		want    bool
-		wantErr bool
+		name string
+		q    gitLabProjectRegistryQueries
+		ref  string
+		path string
+		want bool
+		// wantErr means ANY error; wantUnbound additionally requires it to be
+		// the ErrGitLabProjectPathUnbound sentinel, which is what makes the
+		// dispatcher able to name the refusal instead of auditing a generic
+		// lookup failure.
+		wantErr     bool
+		wantUnbound bool
 	}{
 		{
 			name: "registered_ref_in_account_namespace_authorizes",
@@ -3983,18 +4324,74 @@ func TestGitLabProjectRegistry_AuthorizedGitLabProject(t *testing.T) {
 			ref:  "gitlab:4242", path: "acme/widgets", want: true,
 		},
 		{
-			// A nested group still resolves on its first segment, matching
-			// account.Resolver's owner-segment convention.
+			// A nested group binds on its WHOLE path, and its namespace still
+			// resolves on the first segment — matching account.Resolver's
+			// owner-segment convention. Binding condition 4: nested groups
+			// must stay registerable and admittable.
 			name: "registered_ref_nested_group_authorizes",
-			q:    &fakeGitLabRegistryQueries{inst: registered, acct: acmeAccount},
-			ref:  "gitlab:4242", path: "acme/team/widgets", want: true,
+			q:    &fakeGitLabRegistryQueries{inst: boundTo("acme/platform/widgets"), acct: acmeAccount},
+			ref:  "gitlab:4242", path: "acme/platform/widgets", want: true,
 		},
 		{
-			// The registered id paired with ANOTHER account's project path:
-			// the spec-read selector aimed elsewhere. Refused.
-			name: "registered_ref_foreign_namespace_refuses",
+			// THE EXACT-PATH ISOLATION CASE. The registered id paired with a
+			// SIBLING project in the SAME namespace — the namespace check
+			// admits it, so only the exact-path compare can refuse. This is the
+			// admit the pre-#2877 namespace-only binding allowed.
+			name: "registered_ref_sibling_project_refuses",
 			q:    &fakeGitLabRegistryQueries{inst: registered, acct: acmeAccount},
-			ref:  "gitlab:4242", path: "victim/other", want: false,
+			ref:  "gitlab:4242", path: "acme/other-project", want: false,
+		},
+		{
+			// THE NAMESPACE ISOLATION CASE (binding condition 1). Recorded and
+			// payload paths are IDENTICAL, so the exact compare ADMITS; the
+			// account is keyed "acme" while the path lives under "other", so
+			// only the retained tenancy check refuses. Deleting that check
+			// flips this case alone from refuse to admit.
+			name: "registered_ref_foreign_namespace_refuses",
+			q:    &fakeGitLabRegistryQueries{inst: boundTo("other/widgets"), acct: acmeAccount},
+			ref:  "gitlab:4242", path: "other/widgets", want: false,
+		},
+		{
+			// A nested-group path under a FOREIGN namespace, recorded exactly
+			// as sent: the same isolation, one segment deeper, so the tenancy
+			// check cannot be satisfied by a two-segment special case.
+			name: "registered_ref_foreign_nested_namespace_refuses",
+			q:    &fakeGitLabRegistryQueries{inst: boundTo("other/platform/widgets"), acct: acmeAccount},
+			ref:  "gitlab:4242", path: "other/platform/widgets", want: false,
+		},
+		{
+			// Comparison is case-SENSITIVE. GitLab canonicalises project path
+			// case, so a case difference means the payload does not name the
+			// recorded project. Documented in docs/deploy/gitlab.md rather
+			// than left to be inferred from the code.
+			name: "registered_ref_case_difference_refuses",
+			q:    &fakeGitLabRegistryQueries{inst: boundTo("acme/Widgets"), acct: acmeAccount},
+			ref:  "gitlab:4242", path: "acme/widgets", want: false,
+		},
+		{
+			// NULL project_path — the pre-0078 row shape. Fails closed with
+			// the NAMED sentinel rather than degrading to the old
+			// namespace-only admit, which for this exact payload would have
+			// been an ADMIT.
+			name: "unbound_null_project_path_refuses_with_sentinel",
+			q:    &fakeGitLabRegistryQueries{inst: unbound, acct: acmeAccount},
+			ref:  "gitlab:4242", path: "acme/widgets", want: false,
+			wantErr: true, wantUnbound: true,
+		},
+		{
+			// A *string has THREE states and two of them are unbound: an
+			// empty recorded path must not compare equal to an empty payload
+			// path, nor admit anything else.
+			name: "unbound_empty_project_path_refuses_with_sentinel",
+			q:    &fakeGitLabRegistryQueries{inst: boundTo(""), acct: acmeAccount},
+			ref:  "gitlab:4242", path: "acme/widgets", want: false,
+			wantErr: true, wantUnbound: true,
+		},
+		{
+			name: "unbound_whitespace_project_path_refuses_with_sentinel",
+			q:    &fakeGitLabRegistryQueries{inst: boundTo("   "), acct: acmeAccount},
+			ref:  "gitlab:4242", path: "acme/widgets", want: false,
+			wantErr: true, wantUnbound: true,
 		},
 		{
 			name: "unregistered_ref_refuses",
@@ -4037,10 +4434,20 @@ func TestGitLabProjectRegistry_AuthorizedGitLabProject(t *testing.T) {
 			r := gitLabProjectRegistry{q: tc.q}
 			got, err := r.AuthorizedGitLabProject(context.Background(), tc.ref, tc.path)
 			if tc.wantErr && err == nil {
-				t.Fatal("err = nil, want the query fault surfaced (the dispatcher fails closed on it)")
+				t.Fatal("err = nil, want the fault/refusal surfaced (the dispatcher fails closed on it)")
 			}
 			if !tc.wantErr && err != nil {
 				t.Fatalf("err = %v, want nil", err)
+			}
+			// Error IDENTITY, not merely presence: the dispatcher classifies
+			// the unbound refusal by errors.Is, so an unbound row returning a
+			// generic error would audit as a lookup failure and lose the
+			// operator-actionable reason.
+			if tc.wantUnbound && !errors.Is(err, webhook.ErrGitLabProjectPathUnbound) {
+				t.Errorf("err = %v, want webhook.ErrGitLabProjectPathUnbound", err)
+			}
+			if !tc.wantUnbound && errors.Is(err, webhook.ErrGitLabProjectPathUnbound) {
+				t.Errorf("err = %v, want NOT the unbound sentinel (only an unbound row may carry it)", err)
 			}
 			if got != tc.want {
 				t.Errorf("authorized = %v, want %v", got, tc.want)

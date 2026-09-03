@@ -2,6 +2,16 @@
 
 The agent abstraction (`Invoker`, `Invocation`, `Result`, `Event`) shared by the provider adapters (`claudecode/`, `codex/` — see their READMEs for adapter internals).
 
+## Trace-line reader (`linereader.go`, #3020)
+
+`TraceLineReader` replaces `bufio.Scanner` in both adapters. It reads the child's newline-delimited trace stream one logical line at a time over `bufio.Reader.ReadSlice`, and — the one behaviour that matters — TRUNCATES a line whose CONTENT exceeds `MaxTraceLineBytes` (4 MiB, ~4x the prior scanner limit) rather than aborting the whole read the way `bufio.Scanner`'s `ErrTooLong` did. It retains the first `max` bytes, discards the rest of the physical line, and CONTINUES on the next line, so an over-long line costs one log line, not the whole pass. `Truncated()` reports the truncation; `OriginalBytes()`/`RetainedBytes()` carry the counts an adapter puts in the `trace_line_truncated` event.
+
+BYTE ACCOUNTING is content-only: neither the terminating `\n` nor a `\r` that pairs with it (a CRLF terminator) is counted or retained; `OriginalBytes` is the full content length INCLUDING bytes discarded past the cap, and `RetainedBytes == len(Bytes()) == min(Original, max)`. The **pending-CR rule** makes that hold when a CRLF terminator is split across a `ReadSlice` fragment boundary: a `\r` at the end of a non-terminating fragment is HELD and resolved on the next fragment — dropped if a `\n` follows (terminator), appended-and-counted otherwise (genuine content, and at EOF). Retained memory is bounded: once the cap is hit, further bytes are counted into `OriginalBytes` but discarded, so the buffer never exceeds `max`. `ReadSlice` returns a slice into `bufio`'s internal buffer that the next read invalidates, so every retained fragment is copied immediately.
+
+`Err()` reports ONLY a genuine non-EOF read error; a clean `io.EOF` terminates with `Err() == nil` and a final unterminated line is returned first. Adapters map that non-EOF error to the peer sentinel **`ErrTraceStreamRead`** (below), NOT `ErrAgentFailed`.
+
+`ErrTraceStreamRead` is a PEER sentinel (like `ErrLoopDetected` / `ErrExternalAPI`): it deliberately does NOT wrap `ErrAgentFailed`, so `err_class` classification is unambiguous and the label names the READER (`trace_stream_read`) rather than the agent. `Result.FailureCategory` stays `"A"` on that path, so stage retryability and the bundle signal are unchanged — only the label moves.
+
 ## Loop / duplicate-action detection (#653)
 
 `loopdetect.go`'s `LoopDetector` is a pure, no-I/O detector that trips when the same tool-call signature recurs in an unbroken consecutive run of length ≥ the threshold in force for that signature's CLASS — `DefaultWaitPollThreshold = 60` for a wait-poll, `DefaultLoopThreshold = 8` for everything else (see the #2758 subsection below). The base default is conservative so legit repeats — re-reading a file, retrying a flaky command a couple of times — never false-abort; any differing signature resets the streak, as does the same signature observed with a different class (unreachable in practice — the class is a pure function of the signature — but specified so the state machine is total).

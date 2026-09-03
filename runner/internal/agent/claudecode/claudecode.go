@@ -16,7 +16,6 @@
 package claudecode
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -128,6 +127,29 @@ type Invoker struct {
 	// collapses the two tiers back into the pre-#2758 single threshold.
 	// A per-Invoker field so tests can lower it deterministically.
 	WaitPollThreshold int
+
+	// TraceLineMaxBytes is the retained-content cap handed to the trace-line
+	// reader (#3020). Zero — the production value — selects
+	// agent.MaxTraceLineBytes (4 MiB). A TEST seam, a peer of Cmd/Now: an
+	// adapter test sets it small and emits modest lines rather than genuine
+	// >4 MiB ones. It substitutes the LIMIT; TraceStream substitutes the SOURCE.
+	TraceLineMaxBytes int
+
+	// TraceStream, when non-nil, wraps the child's stdout before the trace-line
+	// reader consumes it (#3020). nil is the identity, so production is
+	// byte-identical. A TEST seam that lets a test drive a genuine non-EOF read
+	// error through the real adapter into the real classifier — orthogonal to
+	// TraceLineMaxBytes.
+	TraceStream func(io.Reader) io.Reader
+}
+
+// traceStream applies the TraceStream seam, defaulting to the identity so a
+// nil seam leaves the child's stdout untouched.
+func (i *Invoker) traceStream(r io.Reader) io.Reader {
+	if i.TraceStream != nil {
+		return i.TraceStream(r)
+	}
+	return r
 }
 
 // New returns an Invoker configured to use the system `claude`
@@ -508,10 +530,36 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// detector flags any Write/Edit-tool target outside all of these.
 	allowedRoots := append([]string{inv.WorkingDir}, allowedExtraDirs...)
 
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := append([]byte(nil), scanner.Bytes()...)
+	reader := agent.NewTraceLineReader(i.traceStream(stdout), i.TraceLineMaxBytes)
+	for reader.Scan() {
+		// A TRUNCATED line is NEVER interpreted (#3020). Its retained bytes are
+		// a PREFIX of the physical line and can themselves be valid JSON when
+		// the cap lands after a complete object with more content following on
+		// the same line — handing that prefix to parseLine would fabricate a
+		// terminal result, a loop signature, or an out-of-tree detection, which
+		// is strictly worse than the one lost log line. So emit ONLY the
+		// truncation event and continue: no parseLine, no res.Events append, no
+		// terminal-result/structured-output capture, no out-of-tree detector, no
+		// loop-detector feed, no token/turn accounting. The accepted consequence
+		// (no prefix salvage): if the agent's own terminal result line is
+		// over-cap it is dropped, res.StructuredOutput stays nil, and the plan
+		// stage reaches its normal missing-result handling downstream
+		// (runner validatePlan -> category B), which is a visible,
+		// correctly-attributed outcome rather than a fabricated one.
+		if reader.Truncated() {
+			res.Events = append(res.Events, agent.Event{
+				Kind:      "trace_line_truncated",
+				Timestamp: now(),
+				Payload: agent.MakePayload(map[string]any{
+					"original_bytes": reader.OriginalBytes(),
+					"retained_bytes": reader.RetainedBytes(),
+					"run_id":         inv.RunID,
+					"stage":          inv.Stage,
+				}),
+			})
+			continue
+		}
+		line := append([]byte(nil), reader.Bytes()...)
 		ev, info, ok := parseLine(line, now())
 		used := info.InputTokens + info.OutputTokens
 		// Model id is pinned from the latest line that surfaced one
@@ -620,7 +668,7 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 			}
 		}
 	}
-	scanErr := scanner.Err()
+	readErr := reader.Err()
 
 	// Stop the heartbeat goroutine now the scan loop has finished —
 	// covers both the EOF path and the budget-hit early break, so the
@@ -746,11 +794,16 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 			"agent_error",
 		), false, fmt.Errorf("%w: %v", agent.ErrAgentFailed, waitErr)
 
-	case scanErr != nil:
+	case readErr != nil:
+		// A genuine non-EOF I/O error on the stdout pipe — truncation cannot
+		// absorb it (#3020). Reclassified off the agent: the ErrTraceStreamRead
+		// PEER sentinel (not ErrAgentFailed) maps to err_class=trace_stream_read
+		// so the label names the reader. Category "A" is RETAINED, so stage
+		// retryability and the bundle signal are unchanged.
 		return failureResult(res, now(), "A",
-			fmt.Sprintf("trace stream read error: %v", scanErr),
-			"stream_error",
-		), false, fmt.Errorf("%w: %v", agent.ErrAgentFailed, scanErr)
+			fmt.Sprintf("trace stream read error: %v", readErr),
+			"trace_stream_read",
+		), false, fmt.Errorf("%w: %v", agent.ErrTraceStreamRead, readErr)
 	}
 
 	res.OK = true

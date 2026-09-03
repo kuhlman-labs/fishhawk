@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -574,5 +575,342 @@ func TestGuardNoPRImplement_GetRunError_FailsOpen(t *testing.T) {
 	}
 	if !strings.Contains(warnings[0], "backstop") {
 		t.Errorf("warning should name the runner-side backstop, got %q", warnings[0])
+	}
+}
+
+// --- Runner self-host bootstrap advisory (E64.5 / #3086) ---------------------
+//
+// guardRunnerSelfHost is ADVISORY-ONLY: it returns []string with NO error, so
+// it can never block a dispatch. Each enumerated mode gets its own assertion,
+// driving the guard through the real fake-backend round trip (api client -> MCP
+// decode -> guard) so the plan-resolution read surface is exercised end to end.
+
+// planScopeForRun seeds a run with a plan stage carrying a standard_v1 plan
+// artifact whose scope.files are the given paths, so guardRunnerSelfHost can
+// resolve them through the real ListRunStages -> ListStageArtifacts path.
+func planScopeForRun(fb *fakeBackend, runID uuid.UUID, paths ...string) {
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		{ID: uuid.New().String(), RunID: runID.String(), Type: "implement", State: "pending"},
+	}
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y"}
+	content := samplePlanContent()
+	files := make([]PlanScopeFile, 0, len(paths))
+	for _, p := range paths {
+		files = append(files, PlanScopeFile{Path: p, Operation: "modify"})
+	}
+	content.Scope.Files = files
+	seedPlanArtifact(fb, planStageID, content, time.Hour)
+}
+
+// (a) A scope naming a runner Go source file warns exactly once, and the single
+// warning names runner/README.md AND the fix-up-budget consequence — asserted on
+// the SHIPPED string, so a comment-only/no-op touch that keeps verify green
+// still fails here.
+func TestGuardRunnerSelfHost_RunnerScope_Warns(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	planScopeForRun(fb, runID, "runner/internal/agent/claudecode/claudecode.go")
+
+	warnings := r.guardRunnerSelfHost(context.Background(), runID, "implement")
+	if len(warnings) != 1 {
+		t.Fatalf("want exactly one advisory, got %d: %v", len(warnings), warnings)
+	}
+	if !strings.Contains(warnings[0], "runner/README.md") {
+		t.Errorf("advisory must point at runner/README.md, got %q", warnings[0])
+	}
+	if !strings.Contains(warnings[0], "fix-up budget") {
+		t.Errorf("advisory must name the fix-up-budget consequence, got %q", warnings[0])
+	}
+	if !strings.Contains(warnings[0], "runner/internal/agent/claudecode/claudecode.go") {
+		t.Errorf("advisory must name the offending scope path, got %q", warnings[0])
+	}
+}
+
+// (b) A scope naming only backend/ and docs/ paths is silent.
+func TestGuardRunnerSelfHost_NonRunnerScope_Silent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	planScopeForRun(fb, runID,
+		"backend/internal/mcpserver/host_dispatch_guard.go",
+		"docs/ARCHITECTURE.md")
+
+	warnings := r.guardRunnerSelfHost(context.Background(), runID, "implement")
+	if len(warnings) != 0 {
+		t.Errorf("a non-runner scope must be silent, got %v", warnings)
+	}
+}
+
+// (c) A scope naming only runner/README.md and a runner *_test.go is silent —
+// the deny-list mode (the issue's anti-noise criterion).
+func TestGuardRunnerSelfHost_DocAndTestOnlyRunnerScope_Silent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	planScopeForRun(fb, runID,
+		"runner/README.md",
+		"runner/cmd/fishhawk-runner/worktree_test.go")
+
+	warnings := r.guardRunnerSelfHost(context.Background(), runID, "implement")
+	if len(warnings) != 0 {
+		t.Errorf("a doc+test-only runner scope must be silent (deny-list), got %v", warnings)
+	}
+}
+
+// (d) A mixed scope (a runner test file plus one runner Go source file) warns
+// exactly once — not once per matching file.
+func TestGuardRunnerSelfHost_MixedScope_WarnsOnce(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	planScopeForRun(fb, runID,
+		"runner/cmd/fishhawk-runner/worktree_test.go",
+		"runner/cmd/fishhawk-runner/worktree.go")
+
+	warnings := r.guardRunnerSelfHost(context.Background(), runID, "implement")
+	if len(warnings) != 1 {
+		t.Fatalf("a mixed scope must warn exactly once, got %d: %v", len(warnings), warnings)
+	}
+}
+
+// (e) An artifact-list read error fails OPEN and silent: nil warnings, and the
+// guard has no error return at all so a dispatch can never be stranded.
+func TestGuardRunnerSelfHost_ArtifactReadError_FailsOpenSilent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	planScopeForRun(fb, runID, "runner/cmd/fishhawk-runner/main.go")
+	fb.artifactsStatus = http.StatusInternalServerError
+
+	warnings := r.guardRunnerSelfHost(context.Background(), runID, "implement")
+	if len(warnings) != 0 {
+		t.Errorf("an artifact read error must fail open and silent, got %v", warnings)
+	}
+}
+
+// (f) A run with no plan artifact at all is silent.
+func TestGuardRunnerSelfHost_NoPlanArtifact_Silent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	// A plan stage exists but carries no plan artifact; the run has no parent.
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y"}
+
+	warnings := r.guardRunnerSelfHost(context.Background(), runID, "implement")
+	if len(warnings) != 0 {
+		t.Errorf("a run with no plan artifact must be silent, got %v", warnings)
+	}
+}
+
+// (g) A plan-stage dispatch is silent AND performs ZERO stage/artifact reads —
+// the cost carve-out, pinned behaviorally on fb.stagesCalledByID.
+func TestGuardRunnerSelfHost_PlanStage_SkipsReads(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	planScopeForRun(fb, runID, "runner/cmd/fishhawk-runner/main.go")
+
+	warnings := r.guardRunnerSelfHost(context.Background(), runID, "plan")
+	if len(warnings) != 0 {
+		t.Errorf("a plan-stage dispatch must be silent, got %v", warnings)
+	}
+	fb.mu.Lock()
+	reads := fb.stagesCalledByID[runID]
+	fb.mu.Unlock()
+	if reads != 0 {
+		t.Errorf("a plan-stage dispatch must perform zero stage reads, got %d", reads)
+	}
+}
+
+// (h) The run's own plan artifact is absent but its PARENT carries a
+// runner-touching plan — the bounded parent walk resolves it and warns.
+func TestGuardRunnerSelfHost_PlanOnParentRun_Warns(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parentID := uuid.New()
+	childID := uuid.New()
+	parentIDStr := parentID.String()
+	// Child has only an implement stage (the CI-retry / decomposition-child shape).
+	fb.stagesByRun[childID] = []Stage{
+		{ID: uuid.New().String(), RunID: childID.String(), Type: "implement", State: "running"},
+	}
+	fb.getRunByID[childID] = Run{ID: childID.String(), ParentRunID: &parentIDStr, State: "running", Repo: "x/y"}
+	// Parent carries the plan whose scope touches runner/.
+	planScopeForRun(fb, parentID, "runner/internal/upload/upload.go")
+
+	warnings := r.guardRunnerSelfHost(context.Background(), childID, "implement")
+	if len(warnings) != 1 {
+		t.Fatalf("the parent-walk must resolve the parent's runner-touching plan, got %d: %v", len(warnings), warnings)
+	}
+	if !strings.Contains(warnings[0], "runner/internal/upload/upload.go") {
+		t.Errorf("advisory must name the parent plan's offending path, got %q", warnings[0])
+	}
+}
+
+// TestRunnerBinaryAffectingScopePath pins the pure predicate: the runner/ prefix
+// boundary (runnerx/main.go must NOT match), a runner Go source file (match), the
+// deny-list (README.md and *_test.go, no match), and an embedded schema asset
+// under runner/ (match — a //go:embed input genuinely changes the binary).
+func TestRunnerBinaryAffectingScopePath(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"runner/cmd/fishhawk-runner/main.go", true},
+		{"runner/internal/upload/upload.go", true},
+		{"runner/internal/plan/schemas/plan-standard-v1.schema.json", true},
+		{"runnerx/main.go", false},
+		{"runner-tools/main.go", false},
+		{"runner/README.md", false},
+		{"runner/cmd/fishhawk-runner/worktree_test.go", false},
+		{"backend/internal/mcpserver/host_dispatch_guard.go", false},
+		{"docs/ARCHITECTURE.md", false},
+		{"./runner/cmd/fishhawk-runner/main.go", true},
+	}
+	for _, tc := range cases {
+		if got := runnerBinaryAffectingScopePath(tc.path); got != tc.want {
+			t.Errorf("runnerBinaryAffectingScopePath(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+// --- resolvePlanScopePathsForRun fail-open branches (E64.5 / #3086) -----------
+//
+// The resolver backs an ADVISORY that must never strand a dispatch, so EVERY
+// error path returns nil with NO error. The artifact-list 500 mode is pinned by
+// TestGuardRunnerSelfHost_ArtifactReadError_FailsOpenSilent above; these cases
+// cover the remaining distinct fail-open branches the guard-boundary tests do not
+// exercise, so a regression that turned any one of them into a non-nil error (or
+// a panic) is caught here rather than surfacing as a stranded local dispatch.
+
+// A stage-list read error (the ListRunStages failure inside tryGetPlanForRun)
+// resolves to nil, not an error.
+func TestResolvePlanScopePathsForRun_StageListError_ReturnsNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.stagesStatusByRun[runID] = http.StatusInternalServerError
+
+	if got := r.resolvePlanScopePathsForRun(context.Background(), runID); got != nil {
+		t.Errorf("a stage-list read error must resolve to nil (fail-open), got %v", got)
+	}
+}
+
+// A plan artifact whose content is valid JSON but does not decode into
+// PlanContent (the json.Unmarshal failure inside tryGetPlanForRun) resolves to
+// nil, not an error.
+func TestResolvePlanScopePathsForRun_PlanDecodeError_ReturnsNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	// scope must decode to an object; a string forces a json.Unmarshal type error
+	// into PlanContent, exercising the decode-failure fail-open branch.
+	v := "standard_v1"
+	fb.mu.Lock()
+	fb.artifactsByStage[planStageID] = []Artifact{{
+		ID:            uuid.New().String(),
+		StageID:       planStageID.String(),
+		Kind:          "plan",
+		SchemaVersion: &v,
+		ContentHash:   "h",
+		Content:       map[string]any{"plan_version": "standard_v1", "scope": "not-an-object"},
+		CreatedAt:     time.Now().UTC(),
+	}}
+	fb.mu.Unlock()
+
+	if got := r.resolvePlanScopePathsForRun(context.Background(), runID); got != nil {
+		t.Errorf("a plan decode error must resolve to nil (fail-open), got %v", got)
+	}
+}
+
+// A GetRun failure during the parent walk (the run has no plan of its own, so the
+// walk reads its run row to find the parent, and that read 500s) resolves to nil.
+func TestResolvePlanScopePathsForRun_ParentGetRunError_ReturnsNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	// No plan stage, so tryGetPlanForRun returns found=false and the walk reads
+	// the run row next — which 500s.
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "running"},
+	}
+	fb.getStatusByID[runID] = http.StatusInternalServerError
+
+	if got := r.resolvePlanScopePathsForRun(context.Background(), runID); got != nil {
+		t.Errorf("a parent-walk GetRun error must resolve to nil (fail-open), got %v", got)
+	}
+}
+
+// An unparseable ParentRunID (the uuid.Parse failure in the walk) resolves to nil.
+func TestResolvePlanScopePathsForRun_UnparseableParentID_ReturnsNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	bad := "not-a-uuid"
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "running"},
+	}
+	fb.getRunByID[runID] = Run{ID: runID.String(), ParentRunID: &bad, State: "running", Repo: "x/y"}
+
+	if got := r.resolvePlanScopePathsForRun(context.Background(), runID); got != nil {
+		t.Errorf("an unparseable parent id must resolve to nil (fail-open), got %v", got)
+	}
+}
+
+// A parent chain deeper than retryPlanChainDepth resolves to nil even though a
+// runner-touching plan exists BEYOND the cap: the walk stops at the cap without
+// reaching it, so the guard stays silent. This pins the cap-exhaustion branch
+// specifically — a plan seeded one level past the cap is deliberately NOT found.
+func TestResolvePlanScopePathsForRun_CapExhaustion_ReturnsNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	// Build a chain of retryPlanChainDepth+2 runs, each pointing at the next.
+	ids := make([]uuid.UUID, retryPlanChainDepth+2)
+	for i := range ids {
+		ids[i] = uuid.New()
+	}
+	for i := 0; i < len(ids); i++ {
+		fb.stagesByRun[ids[i]] = []Stage{
+			{ID: uuid.NewString(), RunID: ids[i].String(), Type: "implement", State: "running"},
+		}
+		var parent *string
+		if i+1 < len(ids) {
+			p := ids[i+1].String()
+			parent = &p
+		}
+		fb.getRunByID[ids[i]] = Run{ID: ids[i].String(), ParentRunID: parent, State: "running", Repo: "x/y"}
+	}
+	// Seed a runner-touching plan on the LAST run — one level beyond the cap, so
+	// the walk from ids[0] must NOT reach it.
+	last := ids[len(ids)-1]
+	planScopeForRun(fb, last, "runner/internal/upload/upload.go")
+
+	if got := r.resolvePlanScopePathsForRun(context.Background(), ids[0]); got != nil {
+		t.Errorf("a chain deeper than retryPlanChainDepth must resolve to nil (cap-exhausted), got %v", got)
 	}
 }

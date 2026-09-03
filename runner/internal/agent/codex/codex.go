@@ -29,7 +29,6 @@
 package codex
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -82,6 +81,29 @@ type Invoker struct {
 	// heartbeats written to Invocation.ProgressSink during an
 	// invocation (#580). Zero means defaultHeartbeatInterval (15s).
 	HeartbeatInterval time.Duration
+
+	// TraceLineMaxBytes is the retained-content cap handed to the trace-line
+	// reader (#3020). Zero — the production value — selects
+	// agent.MaxTraceLineBytes (4 MiB). A TEST seam, a peer of Cmd/Now: an
+	// adapter test sets it small and emits modest lines rather than genuine
+	// >4 MiB ones. It substitutes the LIMIT; TraceStream substitutes the SOURCE.
+	TraceLineMaxBytes int
+
+	// TraceStream, when non-nil, wraps the child's stdout before the trace-line
+	// reader consumes it (#3020). nil is the identity, so production is
+	// byte-identical. A TEST seam that lets a test drive a genuine non-EOF read
+	// error through the real adapter into the real classifier — orthogonal to
+	// TraceLineMaxBytes.
+	TraceStream func(io.Reader) io.Reader
+}
+
+// traceStream applies the TraceStream seam, defaulting to the identity so a
+// nil seam leaves the child's stdout untouched.
+func (i *Invoker) traceStream(r io.Reader) io.Reader {
+	if i.TraceStream != nil {
+		return i.TraceStream(r)
+	}
+	return r
 }
 
 // New returns an Invoker configured to use the system `codex` binary
@@ -312,10 +334,30 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		}()
 	}
 
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := append([]byte(nil), scanner.Bytes()...)
+	reader := agent.NewTraceLineReader(i.traceStream(stdout), i.TraceLineMaxBytes)
+	for reader.Scan() {
+		// A TRUNCATED line is NEVER interpreted (#3020): its retained bytes are
+		// a PREFIX that can itself be valid JSON (a complete usage-bearing
+		// turn.completed object with more content following on the same line),
+		// and handing it to parseLine would credit fabricated usage or a
+		// fabricated event. Emit ONLY the truncation event and continue — no
+		// parseLine, no res.Events append, no model pin, no token/turn
+		// accounting, no budget check. See the claudecode adapter for the full
+		// rationale and the accepted missing-result consequence.
+		if reader.Truncated() {
+			res.Events = append(res.Events, agent.Event{
+				Kind:      "trace_line_truncated",
+				Timestamp: now(),
+				Payload: agent.MakePayload(map[string]any{
+					"original_bytes": reader.OriginalBytes(),
+					"retained_bytes": reader.RetainedBytes(),
+					"run_id":         inv.RunID,
+					"stage":          inv.Stage,
+				}),
+			})
+			continue
+		}
+		line := append([]byte(nil), reader.Bytes()...)
 		ev, info := parseLine(line, now())
 		if info.Model != "" {
 			model = info.Model
@@ -352,7 +394,7 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 			break
 		}
 	}
-	scanErr := scanner.Err()
+	readErr := reader.Err()
 
 	// Stop the heartbeat goroutine now the scan loop has finished —
 	// covers both the EOF path and the budget-hit early break, so the
@@ -405,11 +447,16 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 			"agent_error",
 		), fmt.Errorf("%w: %v", agent.ErrAgentFailed, waitErr)
 
-	case scanErr != nil:
+	case readErr != nil:
+		// A genuine non-EOF I/O error on the stdout pipe — truncation cannot
+		// absorb it (#3020). Reclassified off the agent: the ErrTraceStreamRead
+		// PEER sentinel (not ErrAgentFailed) maps to err_class=trace_stream_read
+		// so the label names the reader. Category "A" is RETAINED, so stage
+		// retryability and the bundle signal are unchanged.
 		return failureResult(res, now(), "A",
-			fmt.Sprintf("trace stream read error: %v", scanErr),
-			"stream_error",
-		), fmt.Errorf("%w: %v", agent.ErrAgentFailed, scanErr)
+			fmt.Sprintf("trace stream read error: %v", readErr),
+			"trace_stream_read",
+		), fmt.Errorf("%w: %v", agent.ErrTraceStreamRead, readErr)
 	}
 
 	res.OK = true

@@ -16,6 +16,18 @@ The peer sentinel `agent.ErrAgentThinkingBlock` does NOT wrap `ErrAgentFailed`; 
 
 Aggregate `Result.TokensUsed` is cumulative across attempts (honest about doubled cost).
 
+## Over-long trace line: truncate, never interpret (#3020)
+
+The scan loop reads the child's stream-json via the shared `agent.TraceLineReader` (see `runner/internal/agent/README.md`) instead of a `bufio.Scanner`, so a single over-long line (a large quoted diff) no longer aborts the whole pass with `bufio.Scanner: token too long`.
+
+**INVARIANT: a truncated line is NEVER interpreted.** When `reader.Truncated()` is true the loop emits ONLY a `trace_line_truncated` event (`{original_bytes, retained_bytes, run_id, stage}`) and `continue`s — the retained bytes are handed to NOTHING: no `parseLine`, no `res.Events` append, no terminal-result/`structured_output` capture, no `out_of_tree_write` detector, no loop-detector feed, no token/turn accounting. The reason is that the retained prefix can ITSELF be valid JSON when the cap lands after a complete object with more content following on the same physical line; parsing it would fabricate a terminal result (or a plan `structured_output`, a loop signature, an out-of-tree detection), which is strictly worse than the one lost log line. There is **no prefix-salvage logic** — the whole point of the skip is that a truncated line cannot be trusted.
+
+**Accepted consequence, deliberately not worked around:** if the agent's OWN terminal `result` line is over-cap it is dropped, so `Result.StructuredOutput` stays nil and no `result` event is derived. For the plan stage that lands in the existing missing-result handling — `runner/cmd/fishhawk-runner/main.go`'s `validatePlan(cfg.planOut)` demotes to `res.OK=false`, `FailureCategory="B"` when neither a `structured_output` nor a valid plan file is present — a visible, correctly-attributed **category-B** outcome rather than a fabricated pass. An operator reading the trace recognises the shape by a `trace_line_truncated` event immediately before the failure. The adapter itself does not synthesize a failure on a dropped result: `invokeOnce` returns `res.OK=true` on a clean child exit, and the missing-result determination is the runner's, downstream.
+
+A genuine non-EOF read error on the stdout pipe (which truncation cannot absorb) is the reader's `Err()`; the terminal switch maps it to the peer sentinel `agent.ErrTraceStreamRead` (`err_class=trace_stream_read`, category `"A"` retained), NOT `ErrAgentFailed`.
+
+Two exported TEST seams, peers of `Cmd`/`Now`: `TraceLineMaxBytes int` (0 → `agent.MaxTraceLineBytes`) substitutes the cap so a test injects a small limit instead of emitting genuine >4 MiB lines; `TraceStream func(io.Reader) io.Reader` (nil → identity) substitutes the SOURCE so a test drives a genuine read error through the real adapter into the real classifier. Both are nil/zero in production, so the spawn is byte-identical.
+
 ## Model-quota-exhaustion classification (#2085)
 
 `invokeOnce`'s terminal switch classifies a model-quota exhaustion (a usage / rate cap) as a distinct failure so the operator can tell it apart from a transient agent crash. Both otherwise collapse into a generic category-A `agent_error` / `agent exited with error: exit status 1`, so a capped account thrashes doomed auto-retries (run a75b0765: the same dispatch failed once as a ~11min/~52000-token real crash and once as a ~2s/0-token post-init exit — the cap fingerprint).

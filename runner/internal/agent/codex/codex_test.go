@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -128,11 +129,32 @@ func TestHelperProcess(t *testing.T) {
 		os.Stdout.Sync()
 		time.Sleep(60 * time.Millisecond)
 		fmt.Println(`{"type":"turn.completed","usage":{"input_tokens":30,"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0}}`)
+	case "trunc_valid_turn_prefix":
+		// ADVERSARIAL (#3020): a normal usage line (credits 7) FOLLOWED by ONE
+		// over-cap line whose retained prefix is a COMPLETE, VALID usage-bearing
+		// turn.completed object (would credit 150). The test sets the cap to
+		// exactly len(advTurnObj), so the retained prefix parses cleanly — which
+		// makes the skip-rule counterfactual observable. The truncated line's
+		// usage must NOT be credited.
+		fmt.Println(`{"type":"turn.completed","usage":{"input_tokens":3,"cached_input_tokens":0,"output_tokens":4,"reasoning_output_tokens":0}}`)
+		fmt.Println(advTurnObj + strings.Repeat("!", 64))
+	case "overcap_then_result":
+		// An over-cap junk line FOLLOWED by a normal turn.completed: reading must
+		// resync and credit the usage, so an over-long line costs one log line,
+		// not the pass.
+		fmt.Println(strings.Repeat("x", 500))
+		fmt.Println(`{"type":"turn.completed","usage":{"input_tokens":11,"cached_input_tokens":0,"output_tokens":13,"reasoning_output_tokens":0}}`)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown HELPER_MODE")
 		helperExit(2)
 	}
 }
+
+// advTurnObj is a COMPLETE, VALID usage-bearing turn.completed object (credits
+// 150 tokens). Used as the retained prefix of an over-cap line: if the skip
+// rule were removed, parseLine would credit its usage (#3020). Shared with the
+// helper process, which is in this same package.
+const advTurnObj = `{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0}}`
 
 // helperCommand returns a Cmd-builder that re-execs the test binary as
 // the `codex` stand-in, passing through HELPER_MODE.
@@ -846,5 +868,139 @@ func TestInvoke_NilProgressSinkNoHeartbeats(t *testing.T) {
 		if ev.Kind == "stage_progress" {
 			t.Error("stage_progress event present with nil ProgressSink")
 		}
+	}
+}
+
+// errInjectingReader returns a genuine non-EOF read error on the first Read,
+// modelling a stdout-pipe I/O fault. It ignores the underlying stream (drained
+// separately by the adapter) so the failure is deterministic (#3020).
+type errInjectingReader struct{ err error }
+
+func (e *errInjectingReader) Read(p []byte) (int, error) { return 0, e.err }
+
+func truncatedEvents(res agent.Result) []agent.Event {
+	var out []agent.Event
+	for _, ev := range res.Events {
+		if ev.Kind == "trace_line_truncated" {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+func hasEventKind(res agent.Result, kind string) bool {
+	for _, ev := range res.Events {
+		if ev.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCodex_TruncatedValidJSONPrefixNotInterpreted is the codex adversarial
+// case (#3020): the retained prefix is a complete usage-bearing turn.completed
+// object with trailing same-line content. The skip rule must ensure NO usage is
+// credited from it and NO event is derived — only the truncation is surfaced.
+func TestCodex_TruncatedValidJSONPrefixNotInterpreted(t *testing.T) {
+	if !json.Valid([]byte(advTurnObj)) {
+		t.Fatalf("advTurnObj is not valid JSON; the adversarial fixture is vacuous")
+	}
+	inv := &Invoker{
+		Cmd:               helperCommand("trunc_valid_turn_prefix"),
+		Now:               frozenNow(),
+		TraceLineMaxBytes: len(advTurnObj),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{RunID: "rid-adv", Stage: "implement"})
+	if err != nil {
+		t.Fatalf("Invoke returned error, want nil: %v", err)
+	}
+	// Only the first (normal) line's usage (7) is credited; the truncated
+	// prefix's 150 must NOT be. If the skip were removed this would be 157.
+	if res.TokensUsed != 7 {
+		t.Errorf("TokensUsed = %d, want 7 (truncated turn's usage must not be credited)", res.TokensUsed)
+	}
+	// Exactly one turn.completed event survives (the normal line); the truncated
+	// line derives no event.
+	var turns int
+	for _, ev := range res.Events {
+		if ev.Kind == "turn.completed" {
+			turns++
+		}
+	}
+	if turns != 1 {
+		t.Errorf("turn.completed events = %d, want 1 (no event from the truncated line)", turns)
+	}
+	if len(truncatedEvents(res)) != 1 {
+		t.Fatalf("trace_line_truncated events = %d, want 1:\n%+v", len(truncatedEvents(res)), res.Events)
+	}
+	payload := string(truncatedEvents(res)[0].Payload)
+	if !strings.Contains(payload, `"run_id":"rid-adv"`) || !strings.Contains(payload, `"stage":"implement"`) {
+		t.Errorf("truncation payload missing run_id/stage: %s", payload)
+	}
+}
+
+// TestCodex_OverLongLineDoesNotFailStage proves an over-long line costs one log
+// line, not the pass (#3020): a truncated line then a normal turn.completed
+// completes the stage with usage credited.
+func TestCodex_OverLongLineDoesNotFailStage(t *testing.T) {
+	inv := &Invoker{
+		Cmd:               helperCommand("overcap_then_result"),
+		Now:               frozenNow(),
+		TraceLineMaxBytes: 200,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{RunID: "rid-b", Stage: "implement"})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false, want true: %q", res.FailureReason)
+	}
+	if res.TokensUsed != 24 {
+		t.Errorf("TokensUsed = %d, want 24 (usage credited after the over-cap line)", res.TokensUsed)
+	}
+	if len(truncatedEvents(res)) != 1 {
+		t.Errorf("trace_line_truncated events = %d, want 1", len(truncatedEvents(res)))
+	}
+}
+
+// TestCodex_NoTruncationMarkerOnNormalLines is the per-adapter anti-vacuity
+// control: a normal transcript under a small cap emits NO truncation event.
+func TestCodex_NoTruncationMarkerOnNormalLines(t *testing.T) {
+	inv := &Invoker{
+		Cmd:               helperCommand("happy"),
+		Now:               frozenNow(),
+		TraceLineMaxBytes: 4096,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{RunID: "rid-ctl", Stage: "implement"})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK || res.TokensUsed != 100 {
+		t.Fatalf("OK=%v TokensUsed=%d, want OK=true TokensUsed=100", res.OK, res.TokensUsed)
+	}
+	if hasEventKind(res, "trace_line_truncated") {
+		t.Errorf("trace_line_truncated emitted on normal lines:\n%+v", res.Events)
+	}
+}
+
+// TestCodex_TraceStreamReadErrorIsNotAgentFailed drives a genuine non-EOF read
+// error through the real adapter: it must map to ErrTraceStreamRead (category A
+// retained), not ErrAgentFailed (#3020).
+func TestCodex_TraceStreamReadErrorIsNotAgentFailed(t *testing.T) {
+	boom := errors.New("injected stdout pipe fault")
+	inv := &Invoker{
+		Cmd:         helperCommand("happy"),
+		Now:         frozenNow(),
+		TraceStream: func(io.Reader) io.Reader { return &errInjectingReader{err: boom} },
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{RunID: "rid-re", Stage: "implement"})
+	if !errors.Is(err, agent.ErrTraceStreamRead) {
+		t.Fatalf("err = %v, want wrapping ErrTraceStreamRead", err)
+	}
+	if errors.Is(err, agent.ErrAgentFailed) {
+		t.Error("ErrTraceStreamRead must not wrap ErrAgentFailed")
+	}
+	if res.FailureCategory != "A" {
+		t.Errorf("FailureCategory = %q, want A (retained)", res.FailureCategory)
 	}
 }

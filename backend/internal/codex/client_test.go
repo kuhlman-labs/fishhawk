@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewsandbox"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
@@ -179,6 +181,30 @@ func TestHelperProcess(t *testing.T) {
 			"item": map[string]string{"id": "item_0", "type": "agent_message", "text": string(body)},
 		})
 		fmt.Println(string(line))
+		fmt.Println(usageLine)
+	case "confinement_probe", "confinement_probe_refresh", "confinement_probe_badshape":
+		// The #3082 confinement probe: write a JSON self-report of everything
+		// this child can observe of ITSELF (environ, argv, cwd, the CODEX_HOME
+		// it sees and that directory's entries, the config files it would load
+		// and the filesystem grants it parses out of them), ATTEMPT the read of
+		// $CODEX_HOME/auth.json (recording bytes + sha256, never the bytes
+		// themselves), and — in the two mutating variants — rewrite its own copy
+		// of auth.json so the copy-back controls have something to observe. The
+		// mutation runs BEFORE the report is serialized and its OUTCOME is
+		// carried in the report, so the parent can prove the attack HAPPENED
+		// before asserting it was refused. The child is told NO path it could
+		// not derive itself; the PARENT owns every comparison. Then emit the
+		// normal happy transcript so the adapter still decodes a verdict.
+		mutate := ""
+		switch os.Getenv("HELPER_MODE") {
+		case "confinement_probe_refresh":
+			mutate = probeAuthRefresh
+		case "confinement_probe_badshape":
+			mutate = probeAuthBadShape
+		}
+		writeConfinementProbeReport(mutate)
+		fmt.Println(`{"type":"thread.started","thread_id":"t-1"}`)
+		fmt.Println(`{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"verdict\":\"approve\"}"}}`)
 		fmt.Println(usageLine)
 	case "error":
 		// Non-zero exit stands in for a subprocess failure; a fixed,
@@ -1145,12 +1171,37 @@ func capturingHelper(mode string, passEnv bool, argv *[]string, capturedCmd **ex
 // from config. That is why the assertion the reviewer must trust here is the
 // --sandbox read-only pin, NOT an argv MCP scan. See the reviewsandbox README
 // residual for the accepted trade-off and the follow-up.
+
+// testHostPaths builds the injectable #2522 host seam over temp dirs. Every
+// GROUNDED-path test MUST use it: without it the adapter falls through to
+// reviewsandbox.DefaultHostPaths(), which would synthesize a confined home
+// inside the developer's or CI runner's REAL ~/.codex (creating it if absent),
+// copy their live auth.json into it, and write back to it on cleanup. No test
+// may read, write or litter a real CODEX_HOME.
+func testHostPaths(t *testing.T) *reviewsandbox.HostPaths {
+	t.Helper()
+	home := t.TempDir()
+	codexHome := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		t.Fatalf("mkdir codex home: %v", err)
+	}
+	return &reviewsandbox.HostPaths{
+		HomeDir:   home,
+		CodexHome: codexHome,
+		TempDir:   t.TempDir(),
+		Canonical: func(p string) (string, error) { return p, nil },
+	}
+}
+
 func TestInvokeGrounded_CodexArgvAndCwd(t *testing.T) {
 	treeDir := t.TempDir()
+	hp := testHostPaths(t)
 	var argv []string
 	var cmd *exec.Cmd
 	c := NewClient(testConfig())
 	c.Cmd = capturingHelper("happy", true, &argv, &cmd)
+	c.HostPaths = hp
+	c.GOOS = "linux"
 
 	if _, _, _, err := c.InferenceInTree(context.Background(), "review", treeDir); err != nil {
 		t.Fatalf("InferenceInTree(grounded): %v", err)
@@ -1165,6 +1216,10 @@ func TestInvokeGrounded_CodexArgvAndCwd(t *testing.T) {
 	assertPair(t, argv, "--sandbox", "read-only")
 	assertHas(t, argv, "--ignore-rules")
 	assertHas(t, argv, "--skip-git-repo-check")
+	// #2522: --sandbox read-only is "write nowhere, read ANYWHERE". The READ
+	// bound is the `confined` permission profile in the synthesized CODEX_HOME,
+	// which only binds if --profile selects it.
+	assertPair(t, argv, "--profile", reviewsandbox.ConfinedProfileName)
 	for _, a := range argv {
 		if strings.HasPrefix(a, "--dangerously") {
 			t.Errorf("argv %q contains a dangerous flag %q", argv, a)
@@ -1187,6 +1242,53 @@ func TestInvokeGrounded_CodexArgvAndCwd(t *testing.T) {
 	}
 }
 
+// TestInvokeGrounded_CodexCwdIsCanonicalNotRaw drives the grounded adapter with a
+// NON-IDENTITY canonicalizer — a REAL symlink alias standing in for the darwin
+// /var -> /private/var aliasing the wiring exists to handle — and asserts cmd.Dir
+// is the CANONICAL path, never the raw spelling the caller passed.
+//
+// The other grounded tests inject an IDENTITY canonicalizer and compare cmd.Dir
+// with the raw t.TempDir(), so they stay green with the adapter's cwd
+// canonicalization removed: they cannot tell the two spellings apart. This one
+// can. A raw cwd under a canonical profile grant does not BLIND loudly — codex
+// simply cannot read the tree it was pointed at — so the discriminating assertion
+// matters.
+func TestInvokeGrounded_CodexCwdIsCanonicalNotRaw(t *testing.T) {
+	hp := testHostPaths(t)
+	real := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("cannot create a symlink alias on this host: %v", err)
+	}
+	// A REAL resolver, not a stub: EvalSymlinks resolves the alias to `real` and
+	// is identity-ish everywhere else, which is exactly the production seam.
+	hp.Canonical = filepath.EvalSymlinks
+	canonReal, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatalf("resolve real tree: %v", err)
+	}
+	if canonReal == alias {
+		t.Fatalf("the alias %q and its canonical target are the same path — this test cannot discriminate", alias)
+	}
+
+	var cmd *exec.Cmd
+	c := NewClient(testConfig())
+	c.Cmd = capturingHelper("happy", true, nil, &cmd)
+	c.HostPaths = hp
+	c.GOOS = runtime.GOOS
+
+	if _, _, _, err := c.InferenceInTree(context.Background(), "review", alias); err != nil {
+		t.Fatalf("InferenceInTree(grounded): %v", err)
+	}
+	if cmd.Dir == alias {
+		t.Fatalf("cmd.Dir = %q is the RAW alias — a raw cwd under the canonical profile grant "+
+			"BLINDS the reviewer against the very tree it was pointed at", cmd.Dir)
+	}
+	if cmd.Dir != canonReal {
+		t.Errorf("cmd.Dir = %q, want the canonical tree %q", cmd.Dir, canonReal)
+	}
+}
+
 // TestInvokeUngrounded_CodexNoSandboxFlag pins that the UNGROUNDED codex argv
 // carries NO --sandbox flag (byte-for-byte the historical empty-scratch posture)
 // — the grounded-only flags must not leak into a diff-only review.
@@ -1201,7 +1303,74 @@ func TestInvokeUngrounded_CodexNoSandboxFlag(t *testing.T) {
 	if slices.Contains(argv, "--sandbox") || slices.Contains(argv, "--ignore-rules") {
 		t.Errorf("ungrounded argv %q must not carry the grounded-only --sandbox/--ignore-rules flags", argv)
 	}
+	if slices.Contains(argv, "--profile") {
+		t.Errorf("ungrounded argv %q must not carry the grounded-only --profile flag", argv)
+	}
 	assertHas(t, argv, "--skip-git-repo-check")
+}
+
+// TestInvokeGrounded_CodexHomeOverriddenToConfinedHome pins the wiring the
+// contract test cannot see: the child's CODEX_HOME points at the SYNTHESIZED
+// confined home, and it does so via appendEnvOverride. CODEX_HOME is on
+// reviewsandbox.CodexAllow, so an inherited entry survives the scrub and a plain
+// append would be SHADOWED by it — the child would then load the operator's
+// UNCONFINED config with no error at all.
+func TestInvokeGrounded_CodexHomeOverriddenToConfinedHome(t *testing.T) {
+	t.Setenv("CODEX_HOME", "/inherited/unconfined")
+	treeDir := t.TempDir()
+	hp := testHostPaths(t)
+	var cmd *exec.Cmd
+	c := NewClient(testConfig())
+	c.Cmd = capturingHelper("happy", true, nil, &cmd)
+	c.HostPaths = hp
+	c.GOOS = "linux"
+
+	if _, _, _, err := c.InferenceInTree(context.Background(), "review", treeDir); err != nil {
+		t.Fatalf("InferenceInTree(grounded): %v", err)
+	}
+	// capturingHelper seeds cmd.Env, so re-derive what the adapter WOULD emit by
+	// asserting on the override helper the adapter uses. The effective value a
+	// child sees is the FIRST matching entry.
+	var got string
+	for _, kv := range cmd.Env {
+		if strings.HasPrefix(kv, "CODEX_HOME=") {
+			got = strings.TrimPrefix(kv, "CODEX_HOME=")
+			break
+		}
+	}
+	if got == "/inherited/unconfined" {
+		t.Fatalf("child CODEX_HOME = %q — the inherited entry shadowed the confined home", got)
+	}
+	if got != "" && !strings.HasPrefix(got, hp.CodexHome) {
+		t.Errorf("child CODEX_HOME = %q, want a synthesized dir under %q", got, hp.CodexHome)
+	}
+}
+
+// TestInvokeGrounded_CodexConfinedHomeFailureFailsClosed: a confined-home build
+// error FAILS the invocation. Falling through would spawn a grounded reviewer
+// with the unbounded read posture this change exists to close — a silent
+// unconfinement is strictly worse than a degraded advisory review.
+func TestInvokeGrounded_CodexConfinedHomeFailureFailsClosed(t *testing.T) {
+	hp := testHostPaths(t)
+	// Relocate CODEX_HOME outside every claude-denied root: the placement guard
+	// refuses rather than parking a copy of the credential there.
+	hp.CodexHome = filepath.Join(hp.TempDir, "codex")
+	var argv []string
+	c := NewClient(testConfig())
+	c.Cmd = capturingHelper("happy", true, &argv, nil)
+	c.HostPaths = hp
+	c.GOOS = "linux"
+
+	_, _, _, err := c.InferenceInTree(context.Background(), "review", t.TempDir())
+	if err == nil {
+		t.Fatal("a confined-home build failure must FAIL the invocation, not spawn an unconfined reviewer")
+	}
+	if !strings.Contains(err.Error(), "confined CODEX_HOME") {
+		t.Errorf("err = %v, want it to name the confined CODEX_HOME build", err)
+	}
+	if len(argv) != 0 {
+		t.Errorf("no subprocess may be built on the fail-closed path; argv = %v", argv)
+	}
 }
 
 // TestInference_EnvScrubCodex proves the allow-list scrub AND the passthrough

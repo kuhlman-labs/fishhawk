@@ -127,8 +127,21 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// branch protection re-evaluates against the new HEAD — that's
 	// where the foreign-commit drift becomes visible to the
 	// reviewer + the merge gate (#282). Best-effort.
-	if ev.Type == "pull_request" && ev.Action == "synchronize" {
-		s.republishOnSynchronize(r.Context(), ev.RawBody)
+	//
+	// `opened` and `reopened` are routed too since E64.43 (#3160). A
+	// Dependabot PR that is never pushed to after opening emits NO
+	// synchronize at all, so under the synchronize-only condition it
+	// received no publish whatsoever and — once the check is Required —
+	// stayed blocked forever on a context nothing would post. The
+	// run-BEARING path is idempotent under the extra events: the
+	// publisher's per-(forge, repo, head_sha) dedup cache suppresses a
+	// repeat at the same head.
+	//
+	// No other action is routed. `edited` / `labeled` and friends do not
+	// move the head and must not reach the handler; that negative is
+	// pinned by TestWebhook_PullRequestActionRouting_NotApplicable.
+	if ev.Type == "pull_request" && isAuditRepublishAction(ev.Action) {
+		s.republishOnPullRequestEvent(r.Context(), ev)
 	}
 
 	// `pull_request.closed` with merged=true is the review-stage
@@ -182,4 +195,18 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// isAuditRepublishAction reports whether a pull_request action should
+// re-drive the audit-complete publish path (E64.43 / #3160). `opened` and
+// `reopened` are what make the run-LESS not-applicable publish reachable
+// on a PR that is never pushed to; `synchronize` is the pre-#3160
+// head-moved trigger.
+func isAuditRepublishAction(action string) bool {
+	switch action {
+	case "opened", "reopened", "synchronize":
+		return true
+	default:
+		return false
+	}
 }

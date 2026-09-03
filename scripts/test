@@ -50,9 +50,14 @@ export GIT_CONFIG_SYSTEM=/dev/null
 # fishhawk-test-postgres container (internal/pgtest, #1174) PERSIST across the
 # per-package test processes that reuse it — it is reaped by the EXIT trap below
 # instead of by ryuk. (The exempt internal/postgres MigrateUp/MigrateDown tests
-# still Terminate their own random-named throwaway containers via t.Cleanup.)
-# Both CI runners and `scripts/dev` are ephemeral / pruned, so orphan reaping is
-# not relied upon. Covers the runner's `scripts/test verify` too, since it
+# start their OWN random-named throwaway containers and Terminate each via
+# t.Cleanup on BOTH the success and the start-error path — the latter added in
+# #3122, where the missing error-path cleanup leaked a container per start
+# timeout and eventually failed a verify gate category-A.) CI runners and
+# `scripts/dev` are ephemeral / pruned, but a developer daemon is NOT, so orphan
+# reaping IS relied upon here: the generation-keyed sweep in _reap_shared_container
+# (#3122) is the backstop for a container whose test binary was SIGKILLed before
+# its t.Cleanup ran. Covers the runner's `scripts/test verify` too, since it
 # sources this script.
 export TESTCONTAINERS_RYUK_DISABLED=true
 
@@ -75,6 +80,123 @@ export TESTCONTAINERS_RYUK_DISABLED=true
 # overridable to make the refcount contract hermetically testable
 # (scripts/test-container-lease).
 LEASE_DIR="${FISHHAWK_TEST_LEASE_DIR:-${TMPDIR:-/tmp}/fishhawk-test-postgres.leases}"
+
+# Generation-keyed orphan snapshot + sweep (#3122). backend/internal/postgres/
+# postgres_test.go is the documented pgtest exemption: it needs raw, un-migrated
+# throwaway databases, so it starts its OWN anonymous testcontainers Postgres
+# containers rather than reusing the shared fishhawk-test-postgres. With ryuk
+# disabled above nothing reaps those, and they accumulate across invocations
+# until a loaded daemon fails a verify gate category-A against packages the change
+# never touched (the #3122 signature). The Go-side t.Cleanup fix (postgres_test.go)
+# is the root repair; this is defence in depth for a container whose test binary
+# was SIGKILLed before its Cleanup ran, or one created by an overlapping
+# invocation that exited without sweeping.
+#
+# The boundary is the one the lease already owns: a GENERATION opens when
+# $LEASE_DIR first comes into existence and closes on the successful `rmdir` the
+# last-holder reap already uses. The FIRST holder to arm records the set of
+# testcontainers-labelled containers that PREDATE the generation into a SIBLING
+# snapshot file ($LEASE_DIR.snapshot — a sibling, NEVER inside $LEASE_DIR, whose
+# emptiness the last-holder rmdir depends on); later holders reuse it unchanged.
+# The last holder removes every labelled container ABSENT from that snapshot
+# (i.e. created DURING the generation) and deletes the snapshot — all INSIDE the
+# lock, so a concurrent invocation cannot arm between rmdir and the removal and
+# have its fresh snapshot deleted. Pre-generation containers are SPARED by design
+# and reported by the preflight instead. Degrades to a no-op — never a
+# remove-everything fallback — when the snapshot is missing/unreadable, docker is
+# absent, or FISHHAWK_TEST_NO_ORPHAN_SWEEP is set. The snapshot path is inline
+# "$LEASE_DIR.snapshot" (as "$LEASE_DIR.lock" is) so it tracks a per-invocation
+# FISHHAWK_TEST_LEASE_DIR override.
+
+# _labelled_container_ids: the current testcontainers-labelled container id set,
+# one id per line. Two DISTINCT outcomes, never conflated: docker ABSENT is a
+# clean no-op (empty output, exit 0) so every caller degrades to a no-op; a docker
+# PRESENT-but-failing query (daemon down, transient error) PROPAGATES docker's
+# non-zero exit — deliberately NOT `|| true`. A snapshot writer must be able to
+# tell a genuine empty set from a failed query and DECLINE to publish an empty
+# snapshot on failure (#3122): swallowing the failure would let a later daemon
+# recovery make the last-holder sweep treat every labelled container as
+# generation-created and remove unrelated testcontainers workloads.
+_labelled_container_ids() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker ps -aq --filter label=org.testcontainers=true 2>/dev/null
+}
+
+# _write_generation_snapshot: record the labelled-container set that exists at
+# generation-open time, written atomically (temp sibling then mv) so a concurrent
+# reader never sees a partial file. Guarded to never fail the run. Callers hold
+# the lock. DECLINE-TO-PUBLISH on a failed query (#3122): _labelled_container_ids
+# propagates docker's non-zero exit when the daemon is present but the query
+# fails, so the `if` goes false and NO snapshot is published — leaving any prior
+# snapshot untouched and, when none exists, leaving the sweep to degrade to a
+# no-op rather than publishing an EMPTY snapshot that a later daemon recovery
+# would turn into a remove-everything sweep.
+_write_generation_snapshot() {
+  command -v docker >/dev/null 2>&1 || return 0
+  local tmp="$LEASE_DIR.snapshot.tmp.$$"
+  if _labelled_container_ids > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$LEASE_DIR.snapshot" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  else
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# _preflight_orphan_warn: non-fatal WARNING when the just-written generation
+# snapshot already holds more than ORPHAN_WARN_AT labelled containers — they
+# predate this run and are spared by the sweep on purpose. Printed to STDERR,
+# which the runner captures via CombinedOutput into the category-A FailureReason,
+# so the count lands in the operator-visible failure text with no runner change
+# (#3122 proposals 3/4). Fires ONLY for the invocation that OPENS a generation;
+# one JOINING an already-open generation on a littered daemon warns nothing
+# (a deliberate residual). Callers hold the lock.
+_preflight_orphan_warn() {
+  command -v docker >/dev/null 2>&1 || return 0
+  [ -r "$LEASE_DIR.snapshot" ] || return 0
+  local count
+  count="$(grep -c . "$LEASE_DIR.snapshot" 2>/dev/null)" || true
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  # Read the threshold at USE time (not a frozen top-level var), so a per-
+  # invocation FISHHAWK_TEST_ORPHAN_WARN_AT is honoured — matching how
+  # FISHHAWK_TEST_NO_ORPHAN_SWEEP is read inline. Dev-only: the runner strips
+  # FISHHAWK_* from the gate env, so in-loop this is always the default 4.
+  local warn_at="${FISHHAWK_TEST_ORPHAN_WARN_AT:-4}"
+  case "$warn_at" in ''|*[!0-9]*) warn_at=4 ;; esac
+  if [ "$count" -gt "$warn_at" ]; then
+    {
+      printf 'scripts/test: WARNING: %d pre-existing testcontainers-labelled container(s) on this daemon before this run.\n' "$count"
+      printf 'scripts/test: they predate this run and are SPARED by the generation sweep on purpose; remove them with:\n'
+      printf 'scripts/test:   docker rm -f $(docker ps -aq --filter label=org.testcontainers=true)\n'
+    } >&2
+  fi
+  return 0
+}
+
+# _sweep_generation_orphans: last-holder-only. Remove every labelled container
+# ABSENT from the generation snapshot — created DURING this lease generation,
+# including by an overlapping invocation that exited ref-held and swept nothing.
+# Degrades to a no-op (NEVER remove-everything) when the opt-out is set, docker is
+# absent, or the snapshot is missing/unreadable. Every command is guarded so it
+# can never fail the run. Callers hold the lock.
+_sweep_generation_orphans() {
+  [ -z "${FISHHAWK_TEST_NO_ORPHAN_SWEEP:-}" ] || return 0
+  command -v docker >/dev/null 2>&1 || return 0
+  [ -r "$LEASE_DIR.snapshot" ] || return 0
+  local removed=0 id
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if ! grep -qxF "$id" "$LEASE_DIR.snapshot" 2>/dev/null; then
+      docker rm -f "$id" >/dev/null 2>&1 || true
+      removed=$((removed + 1))
+    fi
+  done <<EOF
+$(_labelled_container_ids)
+EOF
+  if [ "$removed" -gt 0 ]; then
+    printf 'scripts/test: swept %d orphaned testcontainers container(s) created during this run (#3122).\n' "$removed" >&2
+  fi
+  return 0
+}
 
 # _lease_token: this invocation's lease identity (its PID by default). Injectable
 # so the hermetic test can register/reap distinct synthetic leases.
@@ -171,9 +293,22 @@ _prune_dead_leases() {
 _register_lease() {
   command -v docker >/dev/null 2>&1 || return 1
   _lease_lock || return 1  # lock stuck → hold NO lease; caller must NOT arm reap
+  # A generation opens when $LEASE_DIR is ABSENT: this holder is the first to arm,
+  # so it records the pre-existing labelled set. A holder JOINING an already-open
+  # generation (dir present, snapshot present) reuses the snapshot UNCHANGED — a
+  # container created mid-generation must NOT be captured as pre-existing, or the
+  # last holder would spare it (the per-invocation-snapshot defect this keying
+  # fixes). A dir present with NO snapshot is a crash leftover: (re)write one from
+  # the current set, which spares live containers — the fail-safe direction.
+  local opening_generation=0
+  [ -d "$LEASE_DIR" ] || opening_generation=1
   mkdir -p "$LEASE_DIR" 2>/dev/null || true
   _prune_dead_leases
   : > "$LEASE_DIR/$(_lease_token)" 2>/dev/null || true
+  if [ "$opening_generation" = "1" ] || [ ! -f "$LEASE_DIR.snapshot" ]; then
+    _write_generation_snapshot
+    _preflight_orphan_warn
+  fi
   _lease_unlock
   return 0
 }
@@ -281,6 +416,14 @@ _reap_shared_container() {
   _prune_dead_leases
   if rmdir "$LEASE_DIR" 2>/dev/null; then
     docker rm -f fishhawk-test-postgres >/dev/null 2>&1 || true
+    # Last holder. Sweep the generation's orphans and drop the snapshot INSIDE
+    # the lock (#3122, condition 4): if these ran after _lease_unlock a concurrent
+    # invocation could arm between the rmdir and the snapshot removal, open a new
+    # generation, write a fresh snapshot, and have us delete it — silently
+    # disabling its sweep. Holding the lock across rmdir → sweep → removal closes
+    # that window.
+    _sweep_generation_orphans
+    rm -f "$LEASE_DIR.snapshot" "$LEASE_DIR.snapshot.tmp."* 2>/dev/null || true
   fi
   _lease_unlock
   return 0
@@ -782,6 +925,10 @@ _verify_patch_coverage() {
 # full -race module loop for minutes. All three run UNCONDITIONALLY rather than
 # diff-scoped: a `scripts/`-touched guard would itself be a branch needing a pin
 # and could mis-classify, and the two coverage harnesses already run every time.
+# test-container-lease (#1792, extended for the #3122 generation-keyed orphan
+# snapshot/sweep) sources this script lib-only with a fake `docker` on PATH, so it
+# needs no Docker and adds well under a second; wiring it here machine-enforces the
+# lease + sweep contract in-loop rather than only when a human runs the harness.
 # A missing or non-executable harness prints a reason and is skipped; test-dev is
 # ADDITIONALLY skipped when zsh is absent from PATH — it is `#!/usr/bin/env zsh`,
 # so the exec would otherwise fail 127 and red-line verify instead of skipping.
@@ -806,7 +953,7 @@ _verify_patch_coverage() {
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-dev test-site-voice test-helm-render test-site-reference; do
+  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-helm-render test-site-reference; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue

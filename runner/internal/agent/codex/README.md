@@ -14,6 +14,10 @@ Codex reports usage PER TURN on each `turn.completed` line (`{input_tokens,cache
 
 Codex surfaces no `model` field today, so `Result.Model` is left empty and the bundle prices from the token split alone (`known_usage=false` only when no usage line appears, per #682).
 
+## Over-long trace line: truncate, never interpret (#3020)
+
+Like claudecode, the scan loop reads stdout via the shared `agent.TraceLineReader` (see `runner/internal/agent/README.md`), so one over-long line no longer aborts the pass. **A truncated line is NEVER interpreted:** when `reader.Truncated()` is true the loop emits only a `trace_line_truncated` event (`{original_bytes, retained_bytes, run_id, stage}`) and `continue`s — no `parseLine`, no `res.Events` append, no model pin, no token/turn accounting, no budget check. The hazard is the same shape as claudecode's: the retained prefix can be a complete valid `turn.completed` object with trailing same-line content, and crediting its usage would fabricate spend. A genuine non-EOF read error maps to the peer sentinel `agent.ErrTraceStreamRead` (`err_class=trace_stream_read`, category `"A"` retained), not `ErrAgentFailed`. The two exported test seams `TraceLineMaxBytes` (cap) and `TraceStream` (source) mirror claudecode's and are nil/zero in production.
+
 ## Kill robustness
 
 Unlike claudecode's direct-child `cmd.Process.Kill()`, the codex adapter sets `SysProcAttr{Setpgid:true}` and kills the whole process GROUP (`syscall.Kill(-pid, SIGKILL)`) on budget/timeout — Codex spawns grandchildren (shell exec, MCP servers) that inherit the stdout pipe, so a direct-child kill could hang the `io.Discard` drain + `Wait`; `cmd.Cancel` is overridden to the group kill for the timeout path.
