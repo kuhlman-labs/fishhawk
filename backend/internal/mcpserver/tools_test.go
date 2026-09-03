@@ -13797,3 +13797,68 @@ func TestGetRunStatus_FixupRecoverySurvivesTheDiagnosisSkeleton(t *testing.T) {
 		t.Error("the marshalled skeleton response carries no fixup_recovered key")
 	}
 }
+
+// TestGetRunStatus_NextActions_ConcernsOpenAcceptancePending is #3116 asserted
+// through the real getRunStatus call site: ONE snapshot must carry BOTH the new
+// next_actions state (pointing at dispatching acceptance, never at the fix-up
+// verb the endpoint would refuse) AND the ordering-annotated hint whose
+// remaining_fixup_budget still reports the surviving route-back. Per-layer units
+// pass while the two surfaces disagree — this is where the disagreement showed.
+func TestGetRunStatus_NextActions_ConcernsOpenAcceptancePending(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	implementStageID := uuid.New()
+	openImplement := 2
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", State: "running", RunnerKind: "local",
+		Concerns: &RunConcerns{
+			Open:          2,
+			ByState:       map[string]int{"raised": 2},
+			OpenImplement: &openImplement,
+			Items: []RunConcernItem{
+				{ID: uuid.NewString(), StageKind: "implement", Severity: "medium", Category: "scope", State: "raised"},
+				{ID: uuid.NewString(), StageKind: "implement", Severity: "low", Category: "style", State: "raised"},
+			},
+		},
+	}
+	// The feature_change topology: acceptance ordered BEFORE review, implement
+	// succeeded, acceptance not settled, review not yet at its gate.
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: implementStageID.String(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 3, Type: "acceptance", State: "awaiting_host_dispatch"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 4, Type: "review", State: "pending"},
+	}
+	seedImplementReviewedAudit(fb, runID, implementStageID, 2)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.NextActions == nil {
+		t.Fatal("next_actions absent")
+	}
+	if out.NextActions.State != "implement_concerns_open_acceptance_pending" {
+		t.Fatalf("next_actions.state = %q, want implement_concerns_open_acceptance_pending", out.NextActions.State)
+	}
+	first := out.NextActions.Actions[0]
+	if first.Action != "fishhawk_dispatch_stage" || first.Params["stage"] != "acceptance" {
+		t.Errorf("first action = %q(stage=%q), want fishhawk_dispatch_stage(stage=acceptance)", first.Action, first.Params["stage"])
+	}
+	for _, a := range out.NextActions.Actions {
+		if a.Action == "fishhawk_fixup_stage" {
+			t.Errorf("next_actions offers fishhawk_fixup_stage while the endpoint refuses it: %+v", a)
+		}
+	}
+
+	if out.ReviewActionHint == nil {
+		t.Fatal("review_action_hint absent; the hint must still report the surviving budget")
+	}
+	if out.ReviewActionHint.RemainingFixupBudget != 1 {
+		t.Errorf("hint.RemainingFixupBudget = %d, want 1 — waiting must not consume budget", out.ReviewActionHint.RemainingFixupBudget)
+	}
+	if !strings.Contains(out.ReviewActionHint.Message, "dispatch acceptance first") {
+		t.Errorf("hint message does not name the ordering remedy: %q", out.ReviewActionHint.Message)
+	}
+}

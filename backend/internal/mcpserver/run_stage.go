@@ -803,7 +803,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 			storeConcerns = runView.Concerns
 		}
 		var hintErr error
-		reviewActionHint, hintErr = r.reviewActionHintFor(ctx, runUUID, stageUUID, runState, implementReviewStatus, storeConcerns)
+		reviewActionHint, hintErr = r.reviewActionHintFor(ctx, runUUID, stageUUID, runState, implementReviewStatus, storeConcerns, postStages)
 		if hintErr != nil {
 			warnings = append(warnings, fmt.Sprintf("review-action hint unavailable: %v", hintErr))
 		}

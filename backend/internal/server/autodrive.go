@@ -1030,14 +1030,23 @@ func implementStage(stages []*run.Stage) *run.Stage {
 // succeeded while a review stage is still open (push_and_open_pr flow).
 // Mirrors run.FixupStage's applicability switch so the actor's double-gate
 // matches the domain's contract.
+//
+// A review stage at `pending` is deliberately NOT eligible (#3116).
+// run.findOpenReviewStage admits awaiting_approval ALONE, so the pending half
+// was unreachable-as-success: every delegated route_fixup taken through it
+// ended in ErrFixupNotApplicable, which handleAutoDrive maps to a 500
+// auto_drive_dispatch_failed and fishhawk_drive_run treats as a fail-loud stop
+// — in a workflow that orders acceptance before review, the NORMAL window. With
+// the clause gone autoFixup returns (false, nil) and the driver stays
+// observe-only, dispatching acceptance and routing the fix-up once the gate
+// really opens. Do not re-add it: the endpoint refuses that state.
 func fixupEligibleState(impl *run.Stage, stages []*run.Stage) bool {
 	switch impl.State {
 	case run.StageStateAwaitingApproval:
 		return true
 	case run.StageStateSucceeded:
 		for _, st := range stages {
-			if st.Type == run.StageTypeReview &&
-				(st.State == run.StageStateAwaitingApproval || st.State == run.StageStatePending) {
+			if st.Type == run.StageTypeReview && st.State == run.StageStateAwaitingApproval {
 				return true
 			}
 		}

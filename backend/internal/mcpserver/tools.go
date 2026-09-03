@@ -1936,7 +1936,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 		// GET /v0/runs/{id} above — the authoritative count source (#3043); nil
 		// (backend could not read the store) degrades the hint to the audit
 		// fallback.
-		reviewActionHint, _ = r.reviewActionHintFor(ctx, runID, implementStageID, runRow.State, implementReviewStatus, runRow.Concerns)
+		reviewActionHint, _ = r.reviewActionHintFor(ctx, runID, implementStageID, runRow.State, implementReviewStatus, runRow.Concerns, stages)
 		implementFixupRecovery = r.fixupRecoveryFor(ctx, runID, implementStageID)
 	}
 

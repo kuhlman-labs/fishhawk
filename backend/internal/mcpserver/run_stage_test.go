@@ -3836,3 +3836,55 @@ func TestRunStage_RunnerScope_SurfacesBootstrapWarning(t *testing.T) {
 		t.Errorf("advisory not surfaced in RunStageOutput.Warnings: %v", out.Warnings)
 	}
 }
+
+// TestRunStage_ReviewActionHint_CarriesGateOrderingSentence pins #3116 at the
+// run_stage.go call site: the hint it composes must carry the acceptance-first
+// ordering sentence, which it can only do if run_stage actually hands its
+// already-fetched postStages slice THROUGH to reviewActionHintFor. The
+// per-layer unit passes with the call site still passing nil — only this test
+// proves the wiring.
+func TestRunStage_ReviewActionHint_CarriesGateOrderingSentence(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	// The feature_change topology: acceptance ordered before review, implement
+	// succeeded, acceptance not settled, review not yet at its gate.
+	seedStages(fb, runID,
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		Stage{ID: stageID.String(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "succeeded"},
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Sequence: 3, Type: "acceptance", State: "awaiting_host_dispatch"},
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Sequence: 4, Type: "review", State: "pending"},
+	)
+	seedImplementReviewedAudit(fb, runID, stageID, 2)
+	openImplement := 2
+	fb.mu.Lock()
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", State: "running", RunnerKind: "local",
+		Concerns: &RunConcerns{Open: 2, OpenImplement: &openImplement},
+	}
+	fb.mu.Unlock()
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+		WorkingDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.ReviewActionHint == nil {
+		t.Fatal("review_action_hint absent")
+	}
+	if !strings.Contains(out.ReviewActionHint.Message, "dispatch acceptance first") {
+		t.Errorf("run_stage-composed hint lacks the ordering sentence (postStages not threaded through?): %q", out.ReviewActionHint.Message)
+	}
+	if out.ReviewActionHint.RemainingFixupBudget != 1 {
+		t.Errorf("hint.RemainingFixupBudget = %d, want 1 — waiting must not consume budget", out.ReviewActionHint.RemainingFixupBudget)
+	}
+}

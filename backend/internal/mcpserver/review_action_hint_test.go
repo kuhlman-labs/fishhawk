@@ -683,7 +683,7 @@ func TestReviewActionHintFor(t *testing.T) {
 					Items:         make([]RunConcernItem, tc.storeItems),
 				}
 			}
-			hint, err := r.reviewActionHintFor(context.Background(), runID, implementStageID, runState, tc.status, store)
+			hint, err := r.reviewActionHintFor(context.Background(), runID, implementStageID, runState, tc.status, store, nil)
 			if err != nil {
 				t.Fatalf("reviewActionHintFor: %v", err)
 			}
@@ -748,7 +748,7 @@ func TestReviewActionHintFor_LatestRoundOnly(t *testing.T) {
 
 	r := newResolver(srv, nil)
 	// nil store -> the audit fallback, which is what round-scopes.
-	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil)
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil, nil)
 	if err != nil {
 		t.Fatalf("reviewActionHintFor: %v", err)
 	}
@@ -796,7 +796,7 @@ func TestReviewActionHintFor_TruncatedMixedStage(t *testing.T) {
 	}
 
 	r := newResolver(srv, nil)
-	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), store)
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), store, nil)
 	if err != nil {
 		t.Fatalf("reviewActionHintFor: %v", err)
 	}
@@ -844,7 +844,7 @@ func TestReviewActionHintFor_LegacyPeerNoScalar(t *testing.T) {
 	}
 
 	r := newResolver(srv, nil)
-	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), &store)
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), &store, nil)
 	if err != nil {
 		t.Fatalf("reviewActionHintFor: %v", err)
 	}
@@ -926,7 +926,7 @@ func TestReviewActionHint_CategoryARefundSurfacesBudget(t *testing.T) {
 	seedImplementReviewedAudit(fb, runID, stageID, 1)
 
 	r := newResolver(srv, nil)
-	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil)
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil, nil)
 	if err != nil {
 		t.Fatalf("reviewActionHintFor: %v", err)
 	}
@@ -959,7 +959,7 @@ func TestReviewActionHint_PushVetoesRefund(t *testing.T) {
 			seedImplementReviewedAudit(fb, runID, stageID, 1)
 
 			r := newResolver(srv, nil)
-			hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil)
+			hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil, nil)
 			if err != nil {
 				t.Fatalf("reviewActionHintFor: %v", err)
 			}
@@ -1129,4 +1129,139 @@ func TestReviewActionHint_SuggestedActions(t *testing.T) {
 			t.Errorf("fresh-run consumes = %q, want new_run", actions[2].Consumes)
 		}
 	})
+}
+
+// --- #3116: the fix-up gate predicate + the ordering annotation ---
+
+// TestFixupGateOpen pins the MCP mirror of run.findOpenReviewStage's
+// applicability switch. Getting this wrong in EITHER direction re-introduces
+// the #3116 disagreement: too permissive and the surface recommends a verb the
+// endpoint refuses; too strict and it hides a legal route-back.
+func TestFixupGateOpen(t *testing.T) {
+	stage := func(stageType, state string) *Stage {
+		return &Stage{ID: uuid.NewString(), Type: stageType, State: state}
+	}
+	for _, tc := range []struct {
+		name   string
+		impl   *Stage
+		review *Stage
+		want   bool
+	}{
+		{"commit_yourself_impl_awaiting_approval", stage("implement", "awaiting_approval"), nil, true},
+		{"push_and_open_pr_review_awaiting_approval", stage("implement", "succeeded"), stage("review", "awaiting_approval"), true},
+		{"succeeded_review_pending", stage("implement", "succeeded"), stage("review", "pending"), false},
+		{"succeeded_review_succeeded", stage("implement", "succeeded"), stage("review", "succeeded"), false},
+		{"succeeded_no_review_stage", stage("implement", "succeeded"), nil, false},
+		{"impl_running", stage("implement", "running"), stage("review", "awaiting_approval"), false},
+		{"nil_implement", nil, stage("review", "awaiting_approval"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := fixupGateOpen(tc.impl, tc.review); got != tc.want {
+				t.Errorf("fixupGateOpen = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// hintStages builds the stage slice reviewActionHintFor reads for the #3116
+// annotation. acceptanceState "" omits the acceptance stage entirely.
+func hintStages(implState, reviewState, acceptanceState string) []Stage {
+	stages := []Stage{
+		{ID: uuid.NewString(), Type: "implement", State: implState},
+		{ID: uuid.NewString(), Type: "review", State: reviewState},
+	}
+	if acceptanceState != "" {
+		stages = append(stages, Stage{ID: uuid.NewString(), Type: "acceptance", State: acceptanceState})
+	}
+	return stages
+}
+
+// TestReviewActionHintFor_GateOrderingAnnotation asserts the SHIPPED message
+// annotation for each of the three states — a blocking acceptance stage, a
+// closed gate with none, and a gate that IS open (no annotation) — and that the
+// annotation changes NOTHING else. The budget must still be reported: the
+// route-back survives the wait, and saying so is the point of #3116.
+func TestReviewActionHintFor_GateOrderingAnnotation(t *testing.T) {
+	openImplement := 2
+	store := &RunConcerns{Open: 2, OpenImplement: &openImplement}
+
+	// Fixed ids so the messages differ ONLY by the annotation (the message
+	// interpolates the implement stage id).
+	runID, stageID := uuid.New(), uuid.New()
+	get := func(t *testing.T, stages []Stage) *ReviewActionHint {
+		t.Helper()
+		_, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), store, stages)
+		if err != nil {
+			t.Fatalf("reviewActionHintFor: %v", err)
+		}
+		if hint == nil {
+			t.Fatal("hint = nil, want a populated hint")
+		}
+		return hint
+	}
+
+	const acceptanceSentence = "dispatch acceptance first"
+	const gateClosedSentence = "the review stage has not reached awaiting_approval"
+
+	// (1) Blocking acceptance stage -> the acceptance-first wording.
+	blocking := get(t, hintStages("succeeded", "pending", "awaiting_host_dispatch"))
+	if !strings.Contains(blocking.Message, acceptanceSentence) {
+		t.Errorf("message lacks the acceptance-first ordering sentence: %q", blocking.Message)
+	}
+	if !strings.Contains(blocking.Message, "the remaining fix-up budget above is preserved") {
+		t.Errorf("message does not say the budget survives the wait: %q", blocking.Message)
+	}
+
+	// (2) Gate closed with NO acceptance stage -> the shorter wording, and it
+	// must NOT tell the operator to dispatch a stage the run does not have.
+	closed := get(t, hintStages("succeeded", "pending", ""))
+	if !strings.Contains(closed.Message, gateClosedSentence) {
+		t.Errorf("message lacks the gate-closed ordering sentence: %q", closed.Message)
+	}
+	if strings.Contains(closed.Message, acceptanceSentence) {
+		t.Errorf("gate-closed message names acceptance when the run has no acceptance stage: %q", closed.Message)
+	}
+
+	// (3) Gate OPEN -> no annotation at all.
+	open := get(t, hintStages("succeeded", "awaiting_approval", "pending"))
+	if strings.Contains(open.Message, "the fix-up gate is not open yet") {
+		t.Errorf("gate-open hint carries the ordering annotation: %q", open.Message)
+	}
+
+	// (4) A nil/empty stages slice degrades to the un-annotated message — an
+	// older or partial caller loses guidance, never gains a false claim.
+	degraded := get(t, nil)
+	if strings.Contains(degraded.Message, "the fix-up gate is not open yet") {
+		t.Errorf("nil stages produced an annotation: %q", degraded.Message)
+	}
+
+	// The annotation changes the MESSAGE only: every other field is identical
+	// with and without it. Compared against the gate-open hint, which is the
+	// same run shape minus the annotation.
+	for _, tc := range []struct {
+		name string
+		got  *ReviewActionHint
+	}{{"acceptance_blocking", blocking}, {"gate_closed", closed}, {"nil_stages", degraded}} {
+		if tc.got.Concerns != open.Concerns {
+			t.Errorf("%s: Concerns = %d, want %d (unchanged by the annotation)", tc.name, tc.got.Concerns, open.Concerns)
+		}
+		if tc.got.RemainingFixupBudget != open.RemainingFixupBudget {
+			t.Errorf("%s: RemainingFixupBudget = %d, want %d — the budget must still be reported",
+				tc.name, tc.got.RemainingFixupBudget, open.RemainingFixupBudget)
+		}
+		if tc.got.OverrideAvailable != open.OverrideAvailable {
+			t.Errorf("%s: OverrideAvailable = %v, want %v (unchanged)", tc.name, tc.got.OverrideAvailable, open.OverrideAvailable)
+		}
+		if tc.got.Source != open.Source {
+			t.Errorf("%s: Source = %q, want %q (unchanged)", tc.name, tc.got.Source, open.Source)
+		}
+	}
+	// The annotation is APPENDED: the un-annotated message is a prefix of it, so
+	// the three budget/ceiling wordings (and the degraded-source notes) are
+	// untouched.
+	if !strings.HasPrefix(blocking.Message, open.Message) {
+		t.Errorf("annotated message is not the base message plus a suffix:\n base = %q\n got  = %q", open.Message, blocking.Message)
+	}
 }

@@ -182,17 +182,14 @@ func implementReviewMergeHint(implementStatus *ReviewStatus) string {
 // budget/ceiling branch conditions live once, in reviewActionHintFor, and
 // this method only reads the result (RemainingFixupBudget /
 // OverrideAvailable carry the branch).
-func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) []SuggestedAction {
-	fixupParams := map[string]string{
-		"stage_id":    implementStageID,
-		"concern_ids": "run.concerns.items[].id",
-	}
-	// deferConcern is always legal while a concern is open and consumes NO
-	// fix-up budget (#1202): it files a pre-drafted follow-up and resolves
-	// the concern. It sits between routing the concern back (fix-up) and
-	// accepting it as-is (merge-with-follow-up). parent_epic + n are the
-	// non-derivable title coordinates the operator supplies.
-	deferConcern := SuggestedAction{
+// deferConcernAction is the fishhawk_defer_concern entry shared by every arm
+// that surfaces an open concern. Extracted so the gate-closed arms (#3116) and
+// the three budget/ceiling arms carry ONE definition: deferring is always legal
+// while a concern is open and consumes NO fix-up budget (#1202), which is
+// exactly why it survives into the arms where the fix-up verb does not.
+// parent_epic + n are the non-derivable title coordinates the operator supplies.
+func deferConcernAction(concerns int) SuggestedAction {
+	return SuggestedAction{
 		Action: "fishhawk_defer_concern",
 		Params: map[string]string{
 			"concern_ids": "run.concerns.items[].id",
@@ -201,8 +198,80 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 		},
 		Precondition: "the concern is worth a separate change but should not block the merge",
 		Consumes:     consumesNone,
-		Reason:       fmt.Sprintf("%d open concern(s) — file a pre-drafted follow-up work item and resolve the concern in one call (no fix-up budget spent)", h.Concerns),
+		Reason:       fmt.Sprintf("%d open concern(s) — file a pre-drafted follow-up work item and resolve the concern in one call (no fix-up budget spent)", concerns),
 	}
+}
+
+// fixupGateOpen reports whether an implement fix-up is LEGAL right now — the
+// MCP mirror of the backend's applicability switch. KEEP IN SYNC with
+// run.FixupStage / run.findOpenReviewStage (backend/internal/run/fixup.go),
+// which admits exactly two shapes:
+//
+//   - the implement stage parked at awaiting_approval (commit-yourself flow:
+//     the implement stage is its own gate); or
+//   - the implement stage succeeded WITH the run's review stage still parked
+//     at awaiting_approval (push_and_open_pr flow).
+//
+// A succeeded implement stage whose review stage is still `pending` — the
+// normal window in a workflow that orders acceptance BEFORE review — is NOT
+// eligible: run.findOpenReviewStage refuses it with ErrFixupNotApplicable
+// (422). Recommending fishhawk_fixup_stage there is #3116: a surface naming a
+// verb the endpoint refuses. Drift here re-introduces exactly that
+// disagreement; the mcp integration test in
+// backend/internal/integration/mcp/fixup_test.go is the machine check that
+// this mirror and the endpoint still agree.
+func fixupGateOpen(impl, review *Stage) bool {
+	if impl == nil {
+		return false
+	}
+	switch impl.State {
+	case "awaiting_approval":
+		return true
+	case "succeeded":
+		return review != nil && review.State == "awaiting_approval"
+	default:
+		return false
+	}
+}
+
+// blockingAcceptanceStage returns the run's acceptance stage when it exists and
+// has NOT reached a terminal state — the stage whose settling the review gate
+// waits on in a workflow that orders acceptance before review (#3116). Mirrors
+// run.blockingAcceptanceStage. nil means acceptance is not what is holding the
+// gate closed.
+func blockingAcceptanceStage(stages []Stage) *Stage {
+	for i := range stages {
+		if stages[i].Type == "acceptance" && !stageStateIsTerminal(stages[i].State) {
+			return &stages[i]
+		}
+	}
+	return nil
+}
+
+// gateClosedActions is the action set for the two #3116 arms: open implement
+// concerns while the fix-up gate is NOT open. Deliberately carries NO
+// fishhawk_fixup_stage entry — the endpoint refuses it in this window, and
+// offering it is the defect. fishhawk_defer_concern stays, because it is legal
+// now and spends no fix-up budget, so the operator can still act; the hint's
+// RemainingFixupBudget (reported unchanged) says the route-back survives once
+// the gate opens.
+func (h *ReviewActionHint) gateClosedActions(run *Run, acceptance *Stage) []SuggestedAction {
+	if acceptance != nil {
+		return append(dispatchOrPollActions(run, "acceptance", acceptance), deferConcernAction(h.Concerns))
+	}
+	return []SuggestedAction{
+		pollAction(run, suggestedReviewPollIntervalSeconds,
+			fmt.Sprintf("%d open concern(s) from the implement review, but the review gate has not opened yet — fishhawk_fixup_stage refuses with fixup_not_applicable until the review stage reaches awaiting_approval; re-poll until it does, then route the concerns back (the fix-up budget is not consumed by waiting)", h.Concerns)),
+		deferConcernAction(h.Concerns),
+	}
+}
+
+func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) []SuggestedAction {
+	fixupParams := map[string]string{
+		"stage_id":    implementStageID,
+		"concern_ids": "run.concerns.items[].id",
+	}
+	deferConcern := deferConcernAction(h.Concerns)
 	mergeWithFollowUp := SuggestedAction{
 		Action:       "merge_and_file_follow_up",
 		Params:       prParams(run),
@@ -326,7 +395,13 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 // itself and passes the result). storeConcerns is the run row's concerns
 // block, which both call sites ALREADY fetched (getRunStatus decodes it off
 // GET /v0/runs/{id}; run_stage reads runView.Concerns) — no extra round-trip.
-func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementStageID uuid.UUID, runState string, implementStatus *ReviewStatus, storeConcerns *RunConcerns) (*ReviewActionHint, error) {
+// stages is the run's stage list, which both call sites ALREADY hold (run_stage
+// passes its post-stage fetch, getRunStatus the slice it decoded for the
+// classifier). It is used ONLY to append the #3116 ordering sentence when the
+// fix-up gate is not open; a nil/empty slice degrades to today's un-annotated
+// message, so an older or partial caller loses the hint sentence rather than
+// gaining a false one.
+func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementStageID uuid.UUID, runState string, implementStatus *ReviewStatus, storeConcerns *RunConcerns, stages []Stage) (*ReviewActionHint, error) {
 	if runStateIsTerminal(runState) {
 		return nil, nil
 	}
@@ -485,6 +560,29 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 		hint.Message += " (count from audit fallback — the concern store was unavailable, so this figure is derived from audit payloads that do not track concern lifecycle; verify with fishhawk_get_gate_view)"
 	case hintSourceLegacyPeer:
 		hint.Message += " (count from audit fallback — this backend peer predates the authoritative implement-stage concern count, so the store read SUCCEEDED but this figure is derived from audit payloads that do not track concern lifecycle; verify with fishhawk_get_gate_view)"
+	}
+
+	// #3116 ordering annotation, appended AFTER the degraded-source notes so
+	// their wording is untouched. The three budget/ceiling messages above say
+	// WHETHER a route-back is affordable; this says whether it is LEGAL YET. In
+	// a workflow that orders acceptance before review the endpoint refuses a
+	// fix-up (422 fixup_not_applicable) until the review stage parks at
+	// awaiting_approval, so a message pointing at fishhawk_fixup_stage with no
+	// ordering caveat sends the operator into a refusal. Concerns, Source,
+	// RemainingFixupBudget and OverrideAvailable are deliberately NOT changed:
+	// the budget still survives the wait, and saying so is the point.
+	//
+	// A nil/empty stages slice degrades to no annotation — never a false claim.
+	if len(stages) > 0 {
+		impl := stageByType(stages, "implement")
+		review := stageByType(stages, "review")
+		if !fixupGateOpen(impl, review) {
+			if acc := blockingAcceptanceStage(stages); acc != nil {
+				hint.Message += " NOTE: the fix-up gate is not open yet — the review gate opens after the acceptance stage settles, so dispatch acceptance first; the remaining fix-up budget above is preserved and the route-back is available once the review stage parks at awaiting_approval."
+			} else {
+				hint.Message += " NOTE: the fix-up gate is not open yet — the review stage has not reached awaiting_approval, so fishhawk_fixup_stage refuses until it does."
+			}
+		}
 	}
 	return hint, nil
 }
