@@ -181,6 +181,25 @@ type Config struct {
 	// cannot scale with (AGENTS.md / #1984). Production wires it nowhere.
 	IntakeGroomDeadline time.Duration
 
+	// IssueSetResolutionBudget bounds the no-epic campaign source's issue-set
+	// dependency resolution (E54.59 / #3113) — the per-item forge round-trips a
+	// full ratified grooming order costs. fishhawkd wires it from
+	// --issue-set-resolution-budget / FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET.
+	//
+	// A NON-POSITIVE VALUE MEANS "USE THE DEFAULT"
+	// (DefaultIssueSetResolutionBudget), so every existing construction site —
+	// none of which sets this field — keeps today's behaviour with no edit.
+	//
+	// A value ABOVE MaxIssueSetResolutionBudget is CLAMPED to that maximum at
+	// the read site (issueSetResolutionBudget, campaigns.go). The clamp is not
+	// a convenience: the MCP client's issue-set timeout is pinned above
+	// MaxIssueSetResolutionBudget so the client is never what gives up first,
+	// and that relationship must hold however this Config was built — not only
+	// when it came through fishhawkd's flag handling, which additionally
+	// REFUSES an over-maximum value at startup so the operator is told rather
+	// than silently clamped.
+	IssueSetResolutionBudget time.Duration
+
 	// ArtifactRepo persists typed stage outputs (plans, PR refs).
 	// Wired by GET /v0/stages/{id}/artifacts and
 	// GET /v0/artifacts/{id}; nil leaves both 503.

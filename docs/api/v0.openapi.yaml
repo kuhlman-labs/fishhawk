@@ -10498,6 +10498,24 @@ paths:
             a stale order, but nobody can acknowledge a read that did not happen.
         '503':
           description: "`campaign_repo_unconfigured` — no campaign repository wired."
+        '504':
+          description: |
+            `issue_set_resolution_timeout` (E54.59 / #3113) — resolving the
+            named issue set (no-epic `items`-only path) exceeded the server's
+            budget. The no-epic source costs one forge round-trip per named
+            item, so a large ratified grooming order can outrun the budget;
+            before #3113 this path had NO server-side deadline and the caller's
+            own client timeout was what gave up, producing a transport error
+            carrying no counts. `details` carries `resolved` (fully-resolved
+            items), `items_total`, `budget_seconds`, and — ONLY when a value
+            could be PROVEN to fit — `suggested_grooming_order_limit`, a
+            `grooming_order_limit` to retry with. The suggestion key is OMITTED
+            rather than sent as 0 when nothing could be proven to fit. The epic
+            path never returns this: `epic_children_unsupported`'s sweep reads
+            the sibling set in one call and is not bounded by this budget. The
+            budget is `--issue-set-resolution-budget` /
+            `FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET` (default 120s, permitted
+            maximum 10m).
 
   /v0/campaigns/{campaign_id}:
     get:

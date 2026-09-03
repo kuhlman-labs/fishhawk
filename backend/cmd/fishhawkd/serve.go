@@ -1201,6 +1201,31 @@ func gitlabIdentityWarnings(baseURL, deviceClientID, deploymentToken string) []s
 	return warnings
 }
 
+// validateIssueSetResolutionBudget is the startup gate on
+// --issue-set-resolution-budget / FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET
+// (E54.59 / #3113), extracted for the same reason resolveMCPRouteMode is: the
+// refusal IS the behavior, and it must be assertable without booting a server.
+//
+// Zero means "use server.DefaultIssueSetResolutionBudget" and is accepted. A
+// NEGATIVE value is a typo that would otherwise silently take the default. A
+// value ABOVE server.MaxIssueSetResolutionBudget is refused naming BOTH the
+// configured value and the permitted maximum, because the maximum is a
+// cross-process invariant: the MCP client's issue-set timeout sits above it so
+// the client can never be what gives up first. server.issueSetResolutionBudget
+// clamps at the read site regardless — this refusal exists so an operator who
+// asked for more is told rather than silently clamped.
+func validateIssueSetResolutionBudget(d time.Duration) error {
+	if d < 0 {
+		return fmt.Errorf("--issue-set-resolution-budget must not be negative; got %s (0 or unset uses the %s default)",
+			d, server.DefaultIssueSetResolutionBudget)
+	}
+	if d > server.MaxIssueSetResolutionBudget {
+		return fmt.Errorf("--issue-set-resolution-budget %s exceeds the permitted maximum %s; the maximum is what the MCP client's issue-set request timeout is set above, so a larger budget would let the client give up before the server does",
+			d, server.MaxIssueSetResolutionBudget)
+	}
+	return nil
+}
+
 // resolveRepoVisibility is the BOTH-REQUIRED config gate for the per-identity
 // repo-ACL mirror (ADR-057 Amendment A2, E44.10 / #2071), extracted from the
 // wiring for the same reason resolveIdentityProvider is: the gate is the
@@ -1752,6 +1777,14 @@ func runServe(args []string, logSink io.Writer) int {
 		"per-KB allowance added to the review-budget floor per kilobyte of prompt (#747); "+
 			"the budget is floor + per_kb*ceil(promptBytes/1024), clamped to [floor, cap]. "+
 			"Set to 0 to collapse the budget to a flat floor (today's fixed-timeout behaviour) without a redeploy")
+	issueSetResolutionBudget := fs.Duration("issue-set-resolution-budget",
+		envOrDuration("FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET", 0),
+		"budget for the no-epic campaign source's issue-set dependency resolution (E54.59 / #3113): "+
+			"a full ratified grooming order costs one forge round-trip per named item, and before this the "+
+			"path had no server-side deadline at all. Unset/0 uses server.DefaultIssueSetResolutionBudget (120s). "+
+			"A NEGATIVE value, or one ABOVE server.MaxIssueSetResolutionBudget (10m), REFUSES startup naming "+
+			"both numbers — the maximum is what the MCP client's issue-set timeout is pinned above, so the "+
+			"client is never what gives up first")
 	reviewBudgetCap := fs.Duration("review-budget-cap",
 		envOrDuration("FISHHAWKD_REVIEW_BUDGET_CAP", planreview.DefaultReviewBudget.Cap),
 		"hard ceiling on the size-aware review budget (#747), bounding the worst-case "+
@@ -1886,6 +1919,21 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 
+	// Issue-set resolution budget (E54.59 / #3113). Fail closed on BOTH
+	// out-of-range directions rather than silently substituting a value: an
+	// operator who configured a budget expecting it to be honoured must be
+	// TOLD it is not. The over-maximum refusal names both numbers because the
+	// maximum is not arbitrary — server.MaxIssueSetResolutionBudget is what the
+	// MCP client's issue-set http.Client timeout is set above, so a budget
+	// beyond it would put the client back in the position of being what gives
+	// up first, which is exactly #3113's defect. The read site clamps too
+	// (server.issueSetResolutionBudget), so the invariant holds however a
+	// Config was built; this refusal is what keeps the clamp from being silent.
+	if err := validateIssueSetResolutionBudget(*issueSetResolutionBudget); err != nil {
+		logger.Error("invalid --issue-set-resolution-budget", slog.String("error", err.Error()))
+		return exitFailure
+	}
+
 	// Warn when an operator .env / flag override drops the plan-review
 	// timeout below the #606 code default (300s) — a value that risks
 	// timing out review of large standard_v1 plans, silently defeating the
@@ -1924,7 +1972,7 @@ func runServe(args []string, logSink io.Writer) int {
 	modelProviders := buildModelProviders(*anthropicAPIKey, *openAIAPIKey)
 	modelOracle := modeloracle.NewCached(modelProviders, *modelsStalenessThreshold, logger)
 
-	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle, MCPRoute: mcpRouteMode}
+	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle, MCPRoute: mcpRouteMode, IssueSetResolutionBudget: *issueSetResolutionBudget}
 
 	// Wire the MCP tool registry into the /mcp route (ADR-076 / #2390). The
 	// route takes a FACTORY rather than importing mcpserver itself: an import
