@@ -39,4 +39,9 @@ type Installation struct {
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 	ForgeBaseUrl    *string            `json:"forge_base_url"`
 	OauthBaseUrl    *string            `json:"oauth_base_url"`
+	// ProjectPath is the GitLab path_with_namespace this installation is
+	// authorized to act on (migration 0078, E45.26 / #2877). NULL on a row
+	// registered before 0078 and on every github row; the GitLab
+	// authorization gate treats NULL and empty alike as UNBOUND and refuses.
+	ProjectPath *string `json:"project_path"`
 }

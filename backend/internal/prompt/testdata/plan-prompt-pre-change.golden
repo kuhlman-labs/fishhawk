@@ -5,7 +5,7 @@ You are drafting an implementation plan for a change in the repository `kuhlman-
 This repository is anchored on correctness.
 Rubric V1: correctness before speed.
 
-IMPORTANT: Your previous plan was rejected because predicted_runtime_minutes exceeded the implement-stage budget without a decomposition block. You MUST populate decomposition.sub_plans in this plan — omitting it will block approval again.
+IMPORTANT: Your previous plan was rejected because its runtime estimate exceeded the implement-stage budget without a decomposition block. The gate reads the LARGER of predicted_runtime_minutes and raw_predicted_runtime_minutes, so if you reported a pre-calibration raw estimate it is that number the gate compared, and shrinking only the calibrated value will not clear it. You MUST populate decomposition.sub_plans in this plan — omitting it will block approval again.
 
 ### Prior plan-stage rejection feedback
 
@@ -117,7 +117,7 @@ NOTE: the structured-output channel constrains the PLAN artifact only. To PARK y
 - summary: one paragraph on why the issue is not yet plannable (the lead line of the operator ping)
 - questions: array of >= 1 {"id", "question", "recommended_default", "tradeoffs"} objects — ids MUST be unique (operator answers are keyed by id); add the optional "what_i_can_infer" to narrow each question to the genuinely non-derivable part
 
-Your task: produce a `standard_v1` plan artifact describing the change. Write the plan as a single JSON object to `/tmp/fishhawk-plan.json`. The schema is documented at docs/spec/plan-standard-v1.md and required fields are: plan_version ("standard_v1"), ticket_reference, generated_by, summary, scope, approach, verification, predicted_runtime_minutes, predicted_runtime_confidence. predicted_runtime_minutes and predicted_runtime_confidence are MUST-populate fields — every plan artifact must carry your runtime estimate and confidence level. Populate decomposition.sub_plans if and only if your predicted_runtime_minutes estimate exceeds the implement-stage budget (60 minutes). Do not echo the plan in your final response — only write it to the file. Do not modify source files in this stage — the implement stage that follows will execute the plan.
+Your task: produce a `standard_v1` plan artifact describing the change. Write the plan as a single JSON object to `/tmp/fishhawk-plan.json`. The schema is documented at docs/spec/plan-standard-v1.md and required fields are: plan_version ("standard_v1"), ticket_reference, generated_by, summary, scope, approach, verification, predicted_runtime_minutes, predicted_runtime_confidence. predicted_runtime_minutes and predicted_runtime_confidence are MUST-populate fields — every plan artifact must carry your runtime estimate and confidence level. Populate decomposition.sub_plans if and only if your runtime estimate exceeds the implement-stage budget (60 minutes) — measured against the LARGER of predicted_runtime_minutes and raw_predicted_runtime_minutes, which is the number the budget gate reads. Do not echo the plan in your final response — only write it to the file. Do not modify source files in this stage — the implement stage that follows will execute the plan.
 
 scope.files shape: each entry MUST be an object with "path" and "operation" — not a bare string.
 
@@ -198,6 +198,6 @@ Your last 8 implement-stage predictions on this workflow: actual p50 = 22.0 min,
 Confidence-band accuracy:
 - high: 6 samples, 1 within 1.5x of prediction
 - medium: 5 samples, 1 within 1.5x of prediction
-Multiply your raw estimate by 0.75 to get a calibrated value.
+Multiply your raw estimate by 0.75 to get a calibrated value. Report BOTH numbers: write the CALIBRATED value to predicted_runtime_minutes (its meaning is unchanged) and the PRE-calibration number you started from to raw_predicted_runtime_minutes. The implement-budget gate evaluates the LARGER of the two, so applying this factor cannot dissolve a decomposition requirement: if your RAW estimate exceeds the implement-stage budget (60 minutes) you MUST populate decomposition.sub_plans, however far below the budget the calibrated value lands. Omitting raw_predicted_runtime_minutes is legal but draws a plan-gate advisory, because the gate then cannot verify calibration did not clear the budget.
 → "high" has been the LEAST accurate band historically (1/6 within 1.5x). Reserve "high" for genuinely mechanical changes (rename, doc edit). Default to "medium" when there's any logic, multi-file, or new-code uncertainty.
 → "medium" has degraded too (1/5 within 1.5x) — you over-predict here as well. Estimates in this band run about 1.3x too high; size your raw estimate DOWN by that factor. Drop to "low" for small, well-scoped changes rather than reaching for a higher band.

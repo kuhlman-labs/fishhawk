@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -43,7 +44,7 @@ func seedFixupNoChangesAudit(fb *fakeBackend, runID, stageID uuid.UUID) {
 
 // seedDispatchReaperFailedAudit appends a dispatch_reaper_failed audit entry
 // keyed to stageID carrying failure_category — the #1747 spawn-phase reaper
-// death signal fixupInfraRefunds pairs against a trigger window (#1957). A
+// death signal fixupRefundedPasses evaluates against a trigger window (#1957). A
 // failure_category of "C" refunds a normal pass; any other category does not.
 func seedDispatchReaperFailedAudit(fb *fakeBackend, runID, stageID uuid.UUID, failureCategory string) {
 	sid := stageID.String()
@@ -61,7 +62,7 @@ func seedDispatchReaperFailedAudit(fb *fakeBackend, runID, stageID uuid.UUID, fa
 
 // seedStageFixupRecoveredAudit appends a stage_fixup_recovered audit entry keyed
 // to stageID carrying source_failure_category — the #788 post-agent-work recovery
-// death signal fixupInfraRefunds pairs against a trigger window (#1957). A
+// death signal fixupRefundedPasses evaluates against a trigger window (#1957). A
 // source_failure_category of "C" refunds a normal pass; any other does not.
 func seedStageFixupRecoveredAudit(fb *fakeBackend, runID, stageID uuid.UUID, sourceFailureCategory string) {
 	sid := stageID.String()
@@ -79,7 +80,7 @@ func seedStageFixupRecoveredAudit(fb *fakeBackend, runID, stageID uuid.UUID, sou
 
 // seedInfraSignalUnparseable appends a dispatch_reaper_failed audit entry whose
 // payload is a JSON array — it fails to decode into the failure_category struct,
-// so fixupInfraRefunds must skip it without error and never refund (#1957).
+// so fixupRefundedPasses must skip it without error and never refund (#1957).
 func seedInfraSignalUnparseable(fb *fakeBackend, runID, stageID uuid.UUID) {
 	sid := stageID.String()
 	fb.mu.Lock()
@@ -96,7 +97,7 @@ func seedInfraSignalUnparseable(fb *fakeBackend, runID, stageID uuid.UUID) {
 
 // seedRecoveredSignalUnparseable appends a stage_fixup_recovered audit entry
 // whose payload is a JSON array — it fails to decode into the
-// source_failure_category struct, so fixupInfraRefunds must skip it without
+// source_failure_category struct, so fixupRefundedPasses must skip it without
 // error and never refund (#1957). The recovered-shape analog of
 // seedInfraSignalUnparseable, so the skip guard is exercised on BOTH signal
 // branches, not just the reaper one.
@@ -417,19 +418,35 @@ func TestReviewActionHintFor(t *testing.T) {
 			wantOverride:           true,
 		},
 		{
-			// #1957 (d'): the category gate guards the RECOVERED branch too,
-			// not just the reaper branch — a non-C (category A)
-			// stage_fixup_recovered signal inside a window must NOT refund.
-			// Without this, a recovered-block regression that refunded
-			// regardless of source_failure_category would still pass case (b)
-			// (recovered-C refunds) and case (d) (which only exercises the
-			// reaper branch), leaving the recovered category-gate untested.
-			name:                "recovered category-A in window does not refund -> override",
+			// #3085: the recovered branch's category gate now admits "A"
+			// alongside "C" — a harness death that pushed nothing delivered
+			// nothing, which is the same invariant #1957 encodes with a
+			// different cause. This case previously asserted the OPPOSITE
+			// (category A does not refund); it is updated deliberately, and the
+			// gate is still pinned in the non-refunding direction by the
+			// category-B case below.
+			name:                "recovered category-A in window refunds -> normal budget",
 			status:              completeStatus(),
 			seedConcerns:        1,
 			infraRounds:         1,
 			infraSignalKind:     "recovered",
 			infraSignalCategory: "A",
+			wantNil:             false,
+			wantConcerns:        1,
+			wantRemaining:       1,
+			wantOverride:        false,
+		},
+		{
+			// #3085: category B (policy) is a verdict on DELIVERED work, not a
+			// delivery failure, so it must still CONSUME a pass. This is what
+			// keeps the widened category gate from being written so broadly
+			// that it swallows B — the direction the case above no longer pins.
+			name:                "recovered category-B in window does not refund -> override",
+			status:              completeStatus(),
+			seedConcerns:        1,
+			infraRounds:         1,
+			infraSignalKind:     "recovered",
+			infraSignalCategory: "B",
 			wantNil:             false,
 			wantConcerns:        1,
 			wantRemaining:       0,
@@ -616,7 +633,7 @@ func TestReviewActionHintFor(t *testing.T) {
 			}
 			// Interleaved infra rounds: each trigger immediately followed by a
 			// signal sequenced strictly inside its window, so the per-window
-			// pairing in fixupInfraRefunds can match it (consecutive triggers
+			// pairing in fixupRefundedPasses can match it (consecutive triggers
 			// would leave no integer sequence between them).
 			infraCat := tc.infraSignalCategory
 			if infraCat == "" {
@@ -667,7 +684,7 @@ func TestReviewActionHintFor(t *testing.T) {
 					Items:         make([]RunConcernItem, tc.storeItems),
 				}
 			}
-			hint, err := r.reviewActionHintFor(context.Background(), runID, implementStageID, runState, tc.status, store)
+			hint, err := r.reviewActionHintFor(context.Background(), runID, implementStageID, runState, tc.status, store, nil)
 			if err != nil {
 				t.Fatalf("reviewActionHintFor: %v", err)
 			}
@@ -732,7 +749,7 @@ func TestReviewActionHintFor_LatestRoundOnly(t *testing.T) {
 
 	r := newResolver(srv, nil)
 	// nil store -> the audit fallback, which is what round-scopes.
-	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil)
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil, nil)
 	if err != nil {
 		t.Fatalf("reviewActionHintFor: %v", err)
 	}
@@ -780,7 +797,7 @@ func TestReviewActionHintFor_TruncatedMixedStage(t *testing.T) {
 	}
 
 	r := newResolver(srv, nil)
-	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), store)
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), store, nil)
 	if err != nil {
 		t.Fatalf("reviewActionHintFor: %v", err)
 	}
@@ -828,7 +845,7 @@ func TestReviewActionHintFor_LegacyPeerNoScalar(t *testing.T) {
 	}
 
 	r := newResolver(srv, nil)
-	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), &store)
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), &store, nil)
 	if err != nil {
 		t.Fatalf("reviewActionHintFor: %v", err)
 	}
@@ -851,14 +868,123 @@ func TestReviewActionHintFor_LegacyPeerNoScalar(t *testing.T) {
 	}
 }
 
-// TestFixupInfraRefunds_OneRefundPerTriggerWindow pins the #1987 round-2
-// review concern (761fb56d): fixupInfraRefunds must count AT MOST ONE refund
-// per trigger window, even when multiple category-C death signals land inside
-// the SAME window. Two reaper-death signals are seeded, both sequenced inside
-// the first trigger window (the second window is empty); without the inner
-// break at review_action_hint.go:520 every signal in a window would count,
-// yielding 2 refunds for one fix-up pass instead of 1.
-func TestFixupInfraRefunds_OneRefundPerTriggerWindow(t *testing.T) {
+// seedFixupPushedAudit appends a fixup_pushed audit entry keyed to stageID — the
+// PUSH VETO signal (#3085). A trigger window holding one of these DELIVERED a
+// commit to the PR branch, so fixupRefundedPasses must refund nothing for that
+// window however the pass later died.
+func seedFixupPushedAudit(fb *fakeBackend, runID, stageID uuid.UUID) {
+	sid := stageID.String()
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		StageID:  &sid,
+		Category: categoryFixupPushed,
+		Payload:  map[string]any{"head_sha": "cafebabe"},
+	})
+	fb.mu.Unlock()
+}
+
+// TestFixupRefundedPasses_MixedSignalWindowRefundsOnce is the MCP mirror of the
+// backend's mixed-signal test (#3085) — the defect the SUMMED design could not
+// pass. One trigger window holding BOTH a category-A recovery and a category-C
+// reaper death must refund exactly ONCE; two independently summed counters
+// contribute 2 and surface a budget the backend refuses to honor. TWO raw
+// triggers are used so a clamp against priorPasses cannot mask the double count.
+func TestFixupRefundedPasses_MixedSignalWindowRefundsOnce(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	// Both signals land at sequences 1 and 2; window (0, 3) holds both and
+	// window (3, +inf) is empty.
+	seedStageFixupRecoveredAudit(fb, runID, stageID, "A")
+	seedDispatchReaperFailedAudit(fb, runID, stageID, "C")
+
+	r := newResolver(srv, nil)
+	refunds, err := r.fixupRefundedPasses(context.Background(), runID, stageID, []int64{0, 3})
+	if err != nil {
+		t.Fatalf("fixupRefundedPasses: %v", err)
+	}
+	if refunds != 1 {
+		t.Errorf("refunds = %d, want 1 (one window refunds ONCE however many signal KINDS land in it)", refunds)
+	}
+}
+
+// TestReviewActionHint_CategoryARefundSurfacesBudget: a category-A
+// delivered-nothing recovery must surface remaining_fixup_budget 1 and
+// override_available false — agreeing with the backend, which ADMITS the next
+// pass without force_additional_pass (#3085). Before this change the mirror read
+// remaining 0 / override true and taught the operator to burn the override.
+func TestReviewActionHint_CategoryARefundSurfacesBudget(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	seedFixupTriggeredAudit(fb, runID, stageID)
+	seedStageFixupRecoveredAudit(fb, runID, stageID, "A")
+	seedImplementReviewedAudit(fb, runID, stageID, 1)
+
+	r := newResolver(srv, nil)
+	hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil, nil)
+	if err != nil {
+		t.Fatalf("reviewActionHintFor: %v", err)
+	}
+	if hint == nil {
+		t.Fatal("hint = nil, want a route-back pointer")
+	}
+	if hint.RemainingFixupBudget != 1 {
+		t.Errorf("RemainingFixupBudget = %d, want 1 (the category-A death refunded the pass)", hint.RemainingFixupBudget)
+	}
+	if hint.OverrideAvailable {
+		t.Errorf("OverrideAvailable = true, want false — the normal budget is intact, no override is needed")
+	}
+}
+
+// TestReviewActionHint_PushVetoesRefund pins the mirror's PUSH VETO on BOTH the
+// A and the C signal, so the hint's veto matches the backend's (#3085). A pass
+// that landed a commit and then died delivered SOMETHING, so it consumes budget:
+// the mirror must surface remaining 0 / override available, not a phantom
+// refunded pass the backend would refuse.
+func TestReviewActionHint_PushVetoesRefund(t *testing.T) {
+	for _, cat := range []string{"A", "C"} {
+		t.Run("category_"+cat, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			stageID := uuid.New()
+
+			seedFixupTriggeredAudit(fb, runID, stageID)
+			seedFixupPushedAudit(fb, runID, stageID)
+			seedStageFixupRecoveredAudit(fb, runID, stageID, cat)
+			seedImplementReviewedAudit(fb, runID, stageID, 1)
+
+			r := newResolver(srv, nil)
+			hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil, nil)
+			if err != nil {
+				t.Fatalf("reviewActionHintFor: %v", err)
+			}
+			if hint == nil {
+				t.Fatal("hint = nil, want a budget-exhausted pointer")
+			}
+			if hint.RemainingFixupBudget != 0 {
+				t.Errorf("RemainingFixupBudget = %d, want 0 (the pass PUSHED, so it consumes budget)", hint.RemainingFixupBudget)
+			}
+			if !hint.OverrideAvailable {
+				t.Errorf("OverrideAvailable = false, want true — the budget is spent and the ceiling has headroom")
+			}
+		})
+	}
+}
+
+// TestFixupRefundedPasses_OneRefundPerTriggerWindow pins the #1987 round-2
+// review concern (761fb56d), re-pointed at the unioned helper (#3085):
+// fixupRefundedPasses must count AT MOST ONE refund per trigger window, even
+// when multiple category-C death signals land inside the SAME window. Two
+// reaper-death signals are seeded, both sequenced inside the first trigger
+// window (the second window is empty); without the inner break every signal in
+// a window would count, yielding 2 refunds for one fix-up pass instead of 1.
+func TestFixupRefundedPasses_OneRefundPerTriggerWindow(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
 	stageID := uuid.New()
@@ -869,9 +995,9 @@ func TestFixupInfraRefunds_OneRefundPerTriggerWindow(t *testing.T) {
 	seedDispatchReaperFailedAudit(fb, runID, stageID, "C")
 
 	r := newResolver(srv, nil)
-	refunds, err := r.fixupInfraRefunds(context.Background(), runID, stageID, []int64{0, 3})
+	refunds, err := r.fixupRefundedPasses(context.Background(), runID, stageID, []int64{0, 3})
 	if err != nil {
-		t.Fatalf("fixupInfraRefunds: %v", err)
+		t.Fatalf("fixupRefundedPasses: %v", err)
 	}
 	if refunds != 1 {
 		t.Errorf("refunds = %d, want 1 (at most one refund per trigger window despite two in-window signals)", refunds)
@@ -1004,4 +1130,172 @@ func TestReviewActionHint_SuggestedActions(t *testing.T) {
 			t.Errorf("fresh-run consumes = %q, want new_run", actions[2].Consumes)
 		}
 	})
+}
+
+// --- #3116: the fix-up gate predicate + the ordering annotation ---
+
+// TestFixupGateOpen pins the MCP mirror of run.findOpenReviewStage's
+// applicability switch. Getting this wrong in EITHER direction re-introduces
+// the #3116 disagreement: too permissive and the surface recommends a verb the
+// endpoint refuses; too strict and it hides a legal route-back.
+func TestFixupGateOpen(t *testing.T) {
+	stage := func(stageType, state string) *Stage {
+		return &Stage{ID: uuid.NewString(), Type: stageType, State: state}
+	}
+	for _, tc := range []struct {
+		name   string
+		impl   *Stage
+		review *Stage
+		want   bool
+	}{
+		{"commit_yourself_impl_awaiting_approval", stage("implement", "awaiting_approval"), nil, true},
+		{"push_and_open_pr_review_awaiting_approval", stage("implement", "succeeded"), stage("review", "awaiting_approval"), true},
+		{"succeeded_review_pending", stage("implement", "succeeded"), stage("review", "pending"), false},
+		{"succeeded_review_succeeded", stage("implement", "succeeded"), stage("review", "succeeded"), false},
+		{"succeeded_no_review_stage", stage("implement", "succeeded"), nil, false},
+		{"impl_running", stage("implement", "running"), stage("review", "awaiting_approval"), false},
+		{"nil_implement", nil, stage("review", "awaiting_approval"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := fixupGateOpen(tc.impl, tc.review); got != tc.want {
+				t.Errorf("fixupGateOpen = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// hintStages builds the stage slice reviewActionHintFor reads for the #3116
+// annotation. acceptanceState "" omits the acceptance stage entirely.
+func hintStages(implState, reviewState, acceptanceState string) []Stage {
+	stages := []Stage{
+		{ID: uuid.NewString(), Type: "implement", State: implState},
+		{ID: uuid.NewString(), Type: "review", State: reviewState},
+	}
+	if acceptanceState != "" {
+		stages = append(stages, Stage{ID: uuid.NewString(), Type: "acceptance", State: acceptanceState})
+	}
+	return stages
+}
+
+// TestReviewActionHintFor_GateOrderingAnnotation asserts the SHIPPED message
+// annotation for each of the three states — a blocking acceptance stage, a
+// closed gate with none, and a gate that IS open (no annotation) — and that the
+// annotation changes NOTHING else. The budget must still be reported: the
+// route-back survives the wait, and saying so is the point of #3116.
+func TestReviewActionHintFor_GateOrderingAnnotation(t *testing.T) {
+	openImplement := 2
+	store := &RunConcerns{Open: 2, OpenImplement: &openImplement}
+
+	// Fixed ids so the messages differ ONLY by the annotation (the message
+	// interpolates the implement stage id).
+	runID, stageID := uuid.New(), uuid.New()
+	get := func(t *testing.T, stages []Stage) *ReviewActionHint {
+		t.Helper()
+		_, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), store, stages)
+		if err != nil {
+			t.Fatalf("reviewActionHintFor: %v", err)
+		}
+		if hint == nil {
+			t.Fatal("hint = nil, want a populated hint")
+		}
+		return hint
+	}
+
+	const acceptanceSentence = "dispatch acceptance first"
+	const inFlightSentence = "wait for acceptance to settle rather than dispatching it"
+	const gateClosedSentence = "the review stage has not reached awaiting_approval"
+
+	// (1) Blocking acceptance stage the operator can still DISPATCH -> the
+	// acceptance-first wording.
+	blocking := get(t, hintStages("succeeded", "pending", "awaiting_host_dispatch"))
+	if !strings.Contains(blocking.Message, acceptanceSentence) {
+		t.Errorf("message lacks the acceptance-first ordering sentence: %q", blocking.Message)
+	}
+	if strings.Contains(blocking.Message, inFlightSentence) {
+		t.Errorf("dispatchable acceptance drew the in-flight wait wording: %q", blocking.Message)
+	}
+	if !strings.Contains(blocking.Message, "the remaining fix-up budget above is preserved") {
+		t.Errorf("message does not say the budget survives the wait: %q", blocking.Message)
+	}
+
+	// (2) Gate closed with NO acceptance stage -> the shorter wording, and it
+	// must NOT tell the operator to dispatch a stage the run does not have.
+	closed := get(t, hintStages("succeeded", "pending", ""))
+	if !strings.Contains(closed.Message, gateClosedSentence) {
+		t.Errorf("message lacks the gate-closed ordering sentence: %q", closed.Message)
+	}
+	if strings.Contains(closed.Message, acceptanceSentence) {
+		t.Errorf("gate-closed message names acceptance when the run has no acceptance stage: %q", closed.Message)
+	}
+
+	// (3) Gate OPEN -> no annotation at all.
+	open := get(t, hintStages("succeeded", "awaiting_approval", "pending"))
+	if strings.Contains(open.Message, "the fix-up gate is not open yet") {
+		t.Errorf("gate-open hint carries the ordering annotation: %q", open.Message)
+	}
+
+	// (1b) Acceptance already IN FLIGHT -> the wait wording, and NEVER "dispatch
+	// acceptance first". A spawn attempt exists, so telling the operator to
+	// dispatch is a remedy they cannot take — #3116's own defect reproduced
+	// inside the message that fixes it. Both in-flight states are asserted
+	// because both reach the same branch and both must ship the same guidance.
+	for _, state := range []string{"dispatched", "running"} {
+		inFlight := get(t, hintStages("succeeded", "pending", state))
+		if !strings.Contains(inFlight.Message, inFlightSentence) {
+			t.Errorf("acceptance %q: message lacks the in-flight wait wording: %q", state, inFlight.Message)
+		}
+		if strings.Contains(inFlight.Message, acceptanceSentence) {
+			t.Errorf("acceptance %q: message tells the operator to dispatch a stage already in flight: %q", state, inFlight.Message)
+		}
+		if !strings.Contains(inFlight.Message, fmt.Sprintf("already in flight (state %q)", state)) {
+			t.Errorf("acceptance %q: message does not name the observed state: %q", state, inFlight.Message)
+		}
+		if !strings.Contains(inFlight.Message, "the remaining fix-up budget above is preserved") {
+			t.Errorf("acceptance %q: message does not say the budget survives the wait: %q", state, inFlight.Message)
+		}
+		if !strings.HasPrefix(inFlight.Message, open.Message) {
+			t.Errorf("acceptance %q: annotated message is not the base message plus a suffix:\n base = %q\n got  = %q", state, open.Message, inFlight.Message)
+		}
+		if inFlight.RemainingFixupBudget != open.RemainingFixupBudget {
+			t.Errorf("acceptance %q: RemainingFixupBudget = %d, want %d — the budget must still be reported",
+				state, inFlight.RemainingFixupBudget, open.RemainingFixupBudget)
+		}
+	}
+
+	// (4) A nil/empty stages slice degrades to the un-annotated message — an
+	// older or partial caller loses guidance, never gains a false claim.
+	degraded := get(t, nil)
+	if strings.Contains(degraded.Message, "the fix-up gate is not open yet") {
+		t.Errorf("nil stages produced an annotation: %q", degraded.Message)
+	}
+
+	// The annotation changes the MESSAGE only: every other field is identical
+	// with and without it. Compared against the gate-open hint, which is the
+	// same run shape minus the annotation.
+	for _, tc := range []struct {
+		name string
+		got  *ReviewActionHint
+	}{{"acceptance_blocking", blocking}, {"gate_closed", closed}, {"nil_stages", degraded}} {
+		if tc.got.Concerns != open.Concerns {
+			t.Errorf("%s: Concerns = %d, want %d (unchanged by the annotation)", tc.name, tc.got.Concerns, open.Concerns)
+		}
+		if tc.got.RemainingFixupBudget != open.RemainingFixupBudget {
+			t.Errorf("%s: RemainingFixupBudget = %d, want %d — the budget must still be reported",
+				tc.name, tc.got.RemainingFixupBudget, open.RemainingFixupBudget)
+		}
+		if tc.got.OverrideAvailable != open.OverrideAvailable {
+			t.Errorf("%s: OverrideAvailable = %v, want %v (unchanged)", tc.name, tc.got.OverrideAvailable, open.OverrideAvailable)
+		}
+		if tc.got.Source != open.Source {
+			t.Errorf("%s: Source = %q, want %q (unchanged)", tc.name, tc.got.Source, open.Source)
+		}
+	}
+	// The annotation is APPENDED: the un-annotated message is a prefix of it, so
+	// the three budget/ceiling wordings (and the degraded-source notes) are
+	// untouched.
+	if !strings.HasPrefix(blocking.Message, open.Message) {
+		t.Errorf("annotated message is not the base message plus a suffix:\n base = %q\n got  = %q", open.Message, blocking.Message)
+	}
 }

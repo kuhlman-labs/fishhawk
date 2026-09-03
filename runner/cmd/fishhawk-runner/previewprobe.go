@@ -35,10 +35,12 @@ import (
  *   readiness — polls probeTargetIdentity until the target serves the
  *               expected head SHA or the ready budget expires.
  *   gate      — verified proceeds; stale/unreachable (and a provision
- *               failure) fail the stage category-C BEFORE any spawn;
- *               unverifiable (no build identifier exposed, or an older
- *               backend that sent no expectation) warns and proceeds,
- *               preserving mixed-version compat.
+ *               failure) fail the stage category-C BEFORE any spawn; a
+ *               MISSING expectation (older backend, or backend-side ledger
+ *               resolution failure) also fails category-C
+ *               acceptance_expected_head_unresolved before provisioning
+ *               (#3091); unverifiable (the target answered but exposes no
+ *               build identifier) still warns and proceeds.
  *   teardown  — FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD runs best-effort
  *               via defer at the call site, so it covers BOTH the
  *               after-the-verdict-ships happy path and every
@@ -55,8 +57,16 @@ import (
 // Pre-spawn category-C failure reasons the gate maps probe/provision
 // outcomes onto (main.go emits them as runner_failed events).
 const (
-	acceptanceReasonTargetStale      = "acceptance_target_stale"
-	acceptanceReasonTargetUnreach    = "acceptance_target_unreachable"
+	acceptanceReasonTargetStale   = "acceptance_target_stale"
+	acceptanceReasonTargetUnreach = "acceptance_target_unreachable"
+	// acceptanceReasonHeadUnresolved fails a declared-target acceptance stage
+	// pre-spawn when the backend sent NO expected head SHA (#3091). It
+	// byte-mirrors the verb-side constant of the same name in
+	// backend/internal/mcpserver/acceptance_target.go, so a dispatch that
+	// bypasses the verb (github_actions runner_kind, or an older MCP) refuses
+	// for the same named reason instead of validating whatever answers at the
+	// shared slot.
+	acceptanceReasonHeadUnresolved   = "acceptance_expected_head_unresolved"
 	acceptanceReasonProvisionFailed  = "acceptance_preview_provision_failed"
 	acceptanceEventTeardownMissing   = "acceptance_preview_teardown_missing"
 	previewCmdEnv                    = "FISHHAWK_ACCEPTANCE_PREVIEW_CMD"
@@ -142,6 +152,10 @@ func probeSchemeOrder(host string) []string {
 // plain-HTTP probe with 400, or a handshake failure) never masks the
 // other scheme's real answer.
 func probeTargetIdentity(ctx context.Context, host, expectedSHA string) probeResult {
+	// Defensive only since #3091: acceptanceTargetGate REFUSES an empty
+	// expectation before probing, so this branch is unreachable from the gate.
+	// Kept because the probe is a standalone classifier — with no expectation
+	// the honest classification is unverifiable, never verified.
 	if expectedSHA == "" {
 		return probeResult{
 			outcome: probeUnverifiable,
@@ -331,20 +345,28 @@ func outputTail(out []byte) string {
 //
 // No declared hosts skips the gate entirely (the existing not-declared
 // prompt behavior is preserved). An empty expectedSHA (older backend, or
-// backend-side ledger resolution failure) warns acceptance_target_unverified
-// and proceeds without provisioning — the gate never hard-fails a stage on
-// a missing expectation.
+// backend-side ledger resolution failure) fails the stage category-C
+// acceptance_expected_head_unresolved BEFORE any provision command runs
+// (#3091): with no expectation the target's identity cannot be verified
+// against anything, so proceeding would validate whatever build answers at
+// the shared slot and record a verdict bound to no tree.
 func acceptanceTargetGate(ctx context.Context, gcfg previewGateConfig, targetHosts []string, expectedSHA, runID string, logSink io.Writer) (teardown func(), failReason, failDetail string) {
 	if len(targetHosts) == 0 {
 		return nil, "", ""
 	}
 	host := targetHosts[0]
 
+	// Fail CLOSED on a missing expectation (#3091). Placed AFTER the no-hosts
+	// early return — a stage with no declared target has nothing to bind to and
+	// is unaffected — and BEFORE the provision/teardown block, so no provision
+	// command runs for an unknown head. Previously this warned
+	// acceptance_target_unverified and proceeded, which let the stage validate
+	// whatever build answered at the shared slot and record a `passed` that
+	// named no tree.
 	if expectedSHA == "" {
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"acceptance_target_unverified","run_id":%q,"host":%q,"reason":%q}`+"\n",
-			runID, host, "backend sent no expected head SHA; proceeding unverified")
-		return nil, "", ""
+		return nil, acceptanceReasonHeadUnresolved, fmt.Sprintf(
+			"acceptance target %q is declared but the backend sent no expected head SHA; the target's build identity cannot be verified against anything, so a verdict would bind to no tree",
+			host)
 	}
 
 	// Advisory diagnostic: a provision command with NO teardown command

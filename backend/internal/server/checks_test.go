@@ -344,3 +344,150 @@ func TestFixupHeadResolution_ServerAndPublisherAgree(t *testing.T) {
 func (*stageGetterRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", nil
 }
+
+// --- #3092: the `resolved` array on the audit-complete row ---
+
+// chainedEntry builds an audit entry whose EntryHash is genuinely computed
+// from its inputs and linked to `prev`, so auditcomplete's chain-verify rule
+// agrees with the fixture instead of reporting chain_invalid.
+func chainedEntry(t *testing.T, runID uuid.UUID, stageID *uuid.UUID, seq int64, category string, payload json.RawMessage, prev *string) *audit.Entry {
+	t.Helper()
+	if payload == nil {
+		payload = json.RawMessage(`{}`)
+	}
+	rid := runID
+	ts := time.Date(2026, 5, 7, 12, 0, int(seq), 0, time.UTC)
+	hash, err := audit.ComputeEntryHash(audit.HashInputs{
+		RunID: &rid, StageID: stageID, Timestamp: ts, Category: category, Payload: payload, PrevHash: prev,
+	})
+	if err != nil {
+		t.Fatalf("ComputeEntryHash: %v", err)
+	}
+	return &audit.Entry{
+		ID: uuid.New(), Sequence: seq, RunID: &rid, StageID: stageID,
+		Timestamp: ts, Category: category, Payload: payload, PrevHash: prev, EntryHash: hash,
+	}
+}
+
+func traceVariant(t *testing.T, variant string) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(map[string]string{"variant": variant})
+	if err != nil {
+		t.Fatalf("marshal variant: %v", err)
+	}
+	return b
+}
+
+// checksDecompositionFixture wires the checks handler over the orchestrator
+// fake with a decomposed parent whose implement stage carries NO trace of its
+// own. `withChildren` mints two trace-complete decomposition children.
+func checksDecompositionFixture(t *testing.T, withChildren bool) (*Server, uuid.UUID) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	parent := rr.seedRun()
+
+	planStage := rr.seedStage(parent.ID, 1, run.StageStateSucceeded)
+	planStage.Type = run.StageTypePlan
+	impl := rr.seedStage(parent.ID, 2, run.StageStateSucceeded)
+	impl.Type = run.StageTypeImplement
+	rev := rr.seedStage(parent.ID, 3, run.StageStateAwaitingApproval)
+	rev.Type = run.StageTypeReview
+
+	arts := newFakeArtifactRepo()
+	planSchema := "standard_v1"
+	arts.all = append(arts.all,
+		&artifact.Artifact{ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &planSchema, Content: json.RawMessage(`{}`)},
+		&artifact.Artifact{ID: uuid.New(), StageID: impl.ID, Kind: artifact.KindPullRequest, Content: json.RawMessage(`{}`)},
+	)
+
+	au := newAuditFake()
+	// Parent chain: the PLAN stage is trace-complete; the IMPLEMENT stage
+	// ships nothing (the fan-out stage runs no agent).
+	e1 := chainedEntry(t, parent.ID, &planStage.ID, 1, "trace_uploaded", traceVariant(t, "raw"), nil)
+	e2 := chainedEntry(t, parent.ID, &planStage.ID, 2, "trace_uploaded", traceVariant(t, "redacted"), &e1.EntryHash)
+	au.seeded = append(au.seeded, e1, e2)
+
+	if withChildren {
+		for i := 0; i < 2; i++ {
+			child := rr.seedDecomposedChild(parent.ID, i, run.StateSucceeded)
+			childImpl := rr.seedStage(child.ID, 1, run.StageStateSucceeded)
+			childImpl.Type = run.StageTypeImplement
+			c1 := chainedEntry(t, child.ID, &childImpl.ID, 1, "trace_uploaded", traceVariant(t, "raw"), nil)
+			c2 := chainedEntry(t, child.ID, &childImpl.ID, 2, "trace_uploaded", traceVariant(t, "redacted"), &c1.EntryHash)
+			au.seeded = append(au.seeded, c1, c2)
+		}
+	}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, StageCheckRepo: newStageCheckRepoFake(),
+		ArtifactRepo: arts, AuditRepo: au,
+	})
+	return s, rev.ID
+}
+
+func auditCompleteRow(t *testing.T, s *Server, reviewStageID uuid.UUID) stageCheckResponse {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s/checks", reviewStageID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got stageChecksListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, it := range got.Items {
+		if it.Name == AuditCompleteCheckName {
+			return it
+		}
+	}
+	t.Fatalf("no %s row in %+v", AuditCompleteCheckName, got.Items)
+	return stageCheckResponse{}
+}
+
+// TestListStageChecks_ResolvedArray pins the wire contract both ways: the
+// `resolved` array is emitted on the audit-complete row for a resolved
+// decomposition, naming both child run ids, and the KEY IS ABSENT ENTIRELY
+// (omitempty) for a run with no resolution.
+func TestListStageChecks_ResolvedArray(t *testing.T) {
+	t.Run("resolved decomposition emits resolved", func(t *testing.T) {
+		s, revID := checksDecompositionFixture(t, true)
+		row := auditCompleteRow(t, s, revID)
+		if row.State != string(stagecheck.StatePass) {
+			t.Fatalf("state = %s, want pass; missing=%+v", row.State, row.Missing)
+		}
+		if len(row.Resolved) != 1 {
+			t.Fatalf("want 1 resolution on the audit-complete row; got %+v", row.Resolved)
+		}
+		if len(row.Resolved[0].ChildRunIDs) != 2 {
+			t.Fatalf("resolution must name both child runs; got %+v", row.Resolved[0].ChildRunIDs)
+		}
+	})
+
+	t.Run("no resolution omits the key", func(t *testing.T) {
+		s, revID := checksDecompositionFixture(t, false)
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s/checks", revID), nil)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		var raw struct {
+			Items []map[string]json.RawMessage `json:"items"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		for _, it := range raw.Items {
+			if string(it["name"]) != `"`+AuditCompleteCheckName+`"` {
+				continue
+			}
+			if _, present := it["resolved"]; present {
+				t.Fatalf("`resolved` must be omitted entirely when empty; got %v", it)
+			}
+			return
+		}
+		t.Fatalf("no %s row in %s", AuditCompleteCheckName, w.Body.String())
+	})
+}

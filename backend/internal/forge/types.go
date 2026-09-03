@@ -1,6 +1,9 @@
 package forge
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // This file holds the forge-neutral vocabulary the Forge interface
 // speaks (ADR-058 / E45.4). Every declaration here moved verbatim off
@@ -187,6 +190,46 @@ type PullRequest struct {
 	// into the existing body idempotently. Empty on CreatePullRequest /
 	// ListOpenPullRequestsByHead results (they don't read it back).
 	Body string
+	// Mergeable is GitHub's `mergeable` boolean — true when the PR can be
+	// merged, false on a merge conflict (E64.14 / #3109). It is a POINTER
+	// because GitHub computes mergeability in a BACKGROUND job and returns
+	// JSON `null` while that job is still running, so absent (nil) must stay
+	// distinguishable from false: a nil Mergeable means UNKNOWN, never clean.
+	// Populated by GetPullRequest; nil on CreatePullRequest /
+	// ListOpenPullRequestsByHead results (they don't read it back). The GitLab
+	// adapter (gitlab.go) leaves it nil, so every consumer MUST fail open on
+	// the zero value — a nil Mergeable is never treated as a conflict.
+	Mergeable *bool
+	// MergeableState is GitHub's `mergeable_state` string (E64.14 / #3109):
+	// "dirty" is the merge-conflict value; "clean", "blocked", "behind",
+	// "unstable", "draft", "unknown" and "" are the other documented/observed
+	// states. It is an undocumented-but-stable REST field, treated as ADVISORY
+	// and paired with the documented Mergeable boolean rather than trusted
+	// alone. Populated by GetPullRequest; "" on the other constructors and on
+	// the GitLab adapter (which has no equivalent field), so a zero value means
+	// UNKNOWN, never CLEAN — every consumer must fail open on it.
+	MergeableState string
+	// MergedAt is the forge's own merge timestamp — WHEN the merge happened,
+	// as distinct from when Fishhawk learned of it (E64.32 / #3136). It is a
+	// POINTER for the same three-state reason Mergeable is: GitHub returns
+	// `merged_at` as JSON `null` on an unmerged pull request, so absent must
+	// stay distinguishable from the zero time. A nil MergedAt means UNKNOWN
+	// and NEVER a merge at the Unix epoch.
+	//
+	// Populated by GetPullRequest; nil on CreatePullRequest /
+	// ListOpenPullRequestsByHead results (they don't read it back) and nil on
+	// the GitLab adapter (gitlab.go), whose merge-request payload carries no
+	// merged_at field yet. Every consumer MUST treat nil as unknown — the
+	// record-merge-observation endpoint refuses rather than recording a fact
+	// it cannot carry.
+	MergedAt *time.Time
+	// MergeCommitSHA is the commit the merge produced (`merge_commit_sha`) —
+	// the durable forge-side artifact a merge observation points at
+	// (E64.32 / #3136). Empty means UNKNOWN, never "merged with no commit":
+	// it is "" on CreatePullRequest / ListOpenPullRequestsByHead results and
+	// "" on the GitLab adapter until its half lands, so a consumer that needs
+	// it must refuse on the zero value rather than record an empty SHA.
+	MergeCommitSHA string
 }
 
 // PullRequestRef is the thin PR identity ListPullRequestsForCommit

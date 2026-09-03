@@ -205,8 +205,33 @@ func (s *Server) handleForgeCallback(w http.ResponseWriter, r *http.Request, pro
 		return
 	}
 	if len(accountIDs) == 0 {
-		s.cfg.Logger.Info("oauth sign-in denied: no admitting account",
-			"provider", provider, "login", profile.Login)
+		// Name the CONFIGURED single-tenant profile beside the authenticated
+		// login so the two first-boot foot-guns docs/deploy/self-hosted.md warns
+		// about are diagnosable from this one server-side line (#2468): a
+		// byte-exact account-key vs login comparison with NO normalization (a
+		// casing mismatch denies here), and a personal-namespace install left on
+		// the default `enterprise` granularity. We report the RESOLVED profile
+		// (.Resolved() fills the internal defaults) so an operator who left
+		// granularity empty sees `enterprise`, the value admission actually uses,
+		// not the empty flag. Emit the profile fields ONLY when the profile is
+		// Enabled() — the same predicate the bootstrap consults — with a single
+		// "unconfigured" marker (no empty placeholders) otherwise. DISCLOSURE
+		// BOUNDARY: this is a server-side operator log; the browser-facing
+		// /access-denied redirect, its reason code, and the rendered page are
+		// deliberately unchanged, so a denied caller in the browser learns
+		// nothing new.
+		logArgs := []any{"provider", provider, "login", profile.Login}
+		if s.cfg.SingleTenantProfile.Enabled() {
+			p := s.cfg.SingleTenantProfile.Resolved()
+			logArgs = append(logArgs,
+				"configured_provider", p.Provider,
+				"configured_account_key", p.AccountKey,
+				"configured_granularity", p.Granularity,
+				"ref", "#2468")
+		} else {
+			logArgs = append(logArgs, "single_tenant_profile", "unconfigured")
+		}
+		s.cfg.Logger.Info("oauth sign-in denied: no admitting account", logArgs...)
 		http.Redirect(w, r, s.accessDeniedRedirect(accessDeniedNoAccount), http.StatusFound)
 		return
 	}

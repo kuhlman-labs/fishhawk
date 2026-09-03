@@ -46,7 +46,9 @@ After a successful provision, the runner polls `<scheme>://<host>/healthz` every
 - **verified** — `git_sha` is a ≥7-character prefix of `FISHHAWK_PREVIEW_SHA`. The gate proceeds and the agent spawns.
 - A `-dirty`-suffixed `git_sha` is treated as **stale** (fail-closed): a dirty build is not the committed merge candidate, even when the prefix matches.
 
-**The target MUST expose `git_sha` on `/healthz` to be verifiable.** A target that answers but exposes no build identifier (missing/`unknown`/too-short `git_sha`, non-200, or non-JSON) is classified **unverifiable** → the runner warns and proceeds (mixed-version compatibility posture — a missing identifier is never a hard fail). If you want acceptance to actually gate on identity, serve `git_sha`.
+**The target MUST expose `git_sha` on `/healthz` to be verifiable.** A target that answers but exposes no build identifier (missing/`unknown`/too-short `git_sha`, non-200, or non-JSON) is classified **unverifiable** → the runner warns and proceeds (a missing identifier on an otherwise-reachable target is never a hard fail). If you want acceptance to actually gate on identity, serve `git_sha`.
+
+**A missing EXPECTATION is different, and fails closed.** When the backend sends no `acceptance_expected_head_sha` at all (an older backend, or backend-side ledger resolution failure) there is nothing to compare the target against, so the gate fails the stage pre-spawn with `acceptance_expected_head_unresolved` — before any provision command runs — rather than validating whatever build answers at the declared host (#3091).
 
 Without a provision command the gate is single-shot against a fixed instance: only connection failures are retried (3 quick attempts absorb a blip), and a definitive stale/unverifiable answer gates immediately.
 
@@ -59,6 +61,7 @@ Without a provision command the gate is single-shot against a fixed instance: on
 | provision succeeds, target stale | stage fails pre-spawn, category C, reason `acceptance_target_stale` (expected-vs-got in the detail); teardown runs |
 | provision succeeds, target never ready | stage fails pre-spawn, category C, reason `acceptance_target_unreachable` (`not ready within <budget>` in the detail); teardown runs |
 | provision succeeds, target unverifiable | warn `acceptance_target_unverified`, agent spawns |
+| declared target, backend sent NO expected head SHA | stage fails pre-spawn, category C, reason `acceptance_expected_head_unresolved`; **no provision command runs** and no teardown is returned |
 | teardown exits non-zero | logged `acceptance_preview_teardown_failed`; **stage outcome unchanged** |
 
 A category-C failure is a pre-spawn infrastructure failure: the acceptance agent never runs, and no verdict ships.
@@ -75,6 +78,7 @@ The runner logs these JSON events (one per line) to its log sink:
 | `acceptance_preview_provision_failed` | provision hook non-zero exit / timeout (pre-spawn category-C fail) |
 | `acceptance_target_stale` | target serves a different (or `-dirty`) build (pre-spawn category-C fail) |
 | `acceptance_target_unreachable` | no scheme reached the target, or it never became ready (pre-spawn category-C fail) |
+| `acceptance_expected_head_unresolved` | a target is declared but the backend resolved no merge-candidate head, so identity cannot be verified against anything (pre-spawn category-C fail, before provisioning) |
 | `acceptance_preview_teardown_failed` | teardown hook non-zero exit (advisory; outcome unchanged) |
 | `acceptance_preview_teardown_missing` | **advisory**: a provision command is configured but no teardown command is — the provisioned instance will not be torn down |
 | `acceptance_tree_provisioned` | the merge-candidate checkout was created; carries `path` + `head_sha` (see below) |

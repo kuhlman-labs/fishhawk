@@ -149,7 +149,7 @@ type RunStageOutput struct {
 	// poll_interval_seconds; the non-terminal + poll-interval path is meaningful
 	// via fishhawk_get_run_status (and the future native-async mode). Omitted
 	// when the post-run stage fetch failed.
-	StageWaitStatus *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"stage-execution wait status on the durable (run_id, stage_id) handle: status is one of pending, running, succeeded, failed, cancelled. On a synchronous return the stage is normally already terminal (interval omitted); poll fishhawk_get_run_status on the advertised poll_interval_seconds to await a non-terminal stage. Omitted when the post-run stage fetch failed"`
+	StageWaitStatus *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"stage-execution wait status on the durable (run_id, stage_id) handle: status is one of pending, running, succeeded, failed, cancelled, superseded (superseded is TERMINAL: a merge made the stage unreachable, #3083). On a synchronous return the stage is normally already terminal (interval omitted); poll fishhawk_get_run_status on the advertised poll_interval_seconds to await a non-terminal stage. Omitted when the post-run stage fetch failed"`
 
 	Outcome        string `json:"outcome,omitempty" jsonschema:"terminal runner outcome (ok | failed | short_circuited | needs_target) from the runner_completed event, or a pre-spawn server/verb resolution: short_circuited when the acceptance-admission endpoint settled the stage with no runner, needs_target when the verb-side acceptance target probe refused to spawn; empty when the runner never reported one"`
 	Turns          int    `json:"turns,omitempty" jsonschema:"agent turn count from the last stage_progress heartbeat"`
@@ -448,6 +448,14 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 	guardWarnings = append(guardWarnings, noPRWarnings...)
 
+	// Runner self-host bootstrap advisory (#3086), the parity mirror of the
+	// dispatch_stage call site. Advisory-only — it returns no error and cannot
+	// block — so its warning merges straight into guardWarnings and this blocking
+	// verb surfaces it in RunStageOutput.Warnings. COST: up to (2 plan-resolution
+	// reads + 1 GetRun) per visited run, capped at retryPlanChainDepth, and ZERO
+	// reads on a plan-stage dispatch.
+	guardWarnings = append(guardWarnings, r.guardRunnerSelfHost(ctx, runUUID, in.Stage)...)
+
 	// (1z) Resolve working_dir transport-conditionally BEFORE the runner-binary
 	// resolution, the acceptance short-circuit admission call, the host-dispatch
 	// marker and the spawn (#2479). An omitted/relative working_dir over HTTP
@@ -534,9 +542,11 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// HOST (the runner's network position) BEFORE spawning. Unreachable/stale
 		// refuses to spawn here, ahead of the host-dispatch marker and any spawn
 		// evidence, so the stage stays awaiting_host_dispatch/pending for a clean
-		// re-dispatch. Verified / unverifiable / no-hosts / preview-cmd-set /
-		// empty-SHA all proceed (checkAcceptanceTarget returns nil), preserving
-		// runner parity and the #1928 fail-open contract.
+		// re-dispatch. An UNRESOLVED expected head refuses here too (#3091,
+		// acceptance_expected_head_unresolved) rather than proceeding unverified.
+		// Verified / unverifiable / no-hosts / preview-cmd-set all proceed
+		// (checkAcceptanceTarget returns nil), preserving runner parity and the
+		// #1928 fail-open contract for the branches that remain fail-open.
 		if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission); refusal != nil {
 			stageState := ""
 			var stageWaitStatus *StageWaitStatus
@@ -793,7 +803,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 			storeConcerns = runView.Concerns
 		}
 		var hintErr error
-		reviewActionHint, hintErr = r.reviewActionHintFor(ctx, runUUID, stageUUID, runState, implementReviewStatus, storeConcerns)
+		reviewActionHint, hintErr = r.reviewActionHintFor(ctx, runUUID, stageUUID, runState, implementReviewStatus, storeConcerns, postStages)
 		if hintErr != nil {
 			warnings = append(warnings, fmt.Sprintf("review-action hint unavailable: %v", hintErr))
 		}

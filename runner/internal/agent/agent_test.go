@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -134,10 +135,40 @@ func TestErrors_AreDistinct(t *testing.T) {
 		{ErrAgentThinkingBlock, ErrBudgetExceeded},
 		{ErrAgentThinkingBlock, ErrTimeout},
 		{ErrAgentThinkingBlock, ErrBinaryNotFound},
+		{ErrTraceStreamRead, ErrAgentFailed},
+		{ErrTraceStreamRead, ErrBudgetExceeded},
+		{ErrTraceStreamRead, ErrTimeout},
+		{ErrTraceStreamRead, ErrBinaryNotFound},
+		{ErrTraceStreamRead, ErrAgentThinkingBlock},
+		{ErrTraceStreamRead, ErrLoopDetected},
+		{ErrTraceStreamRead, ErrExternalAPI},
+		{ErrTraceStreamRead, ErrAgentQuotaUnavailable},
 	}
 	for _, p := range pairs {
 		if errors.Is(p.a, p.b) {
 			t.Errorf("errors.Is(%v, %v) = true, want false", p.a, p.b)
 		}
+	}
+}
+
+// TestAgentSentinels_TraceStreamReadIsPeer pins the load-bearing property of
+// the trace-stream-read reclassification (#3020): ErrTraceStreamRead is a PEER
+// of ErrAgentFailed, not a wrapper of it, in BOTH directions. If it wrapped
+// ErrAgentFailed the runner's classifyErr would still stamp agent_failed and
+// the whole point — naming the reader, not the agent — would be lost.
+func TestAgentSentinels_TraceStreamReadIsPeer(t *testing.T) {
+	if errors.Is(ErrTraceStreamRead, ErrAgentFailed) {
+		t.Error("errors.Is(ErrTraceStreamRead, ErrAgentFailed) = true, want false (peer, not wrapper)")
+	}
+	if errors.Is(ErrAgentFailed, ErrTraceStreamRead) {
+		t.Error("errors.Is(ErrAgentFailed, ErrTraceStreamRead) = true, want false")
+	}
+	// A wrapped ErrTraceStreamRead is still itself and still not ErrAgentFailed.
+	wrapped := fmt.Errorf("trace stream read error: %w", ErrTraceStreamRead)
+	if !errors.Is(wrapped, ErrTraceStreamRead) {
+		t.Error("wrapped ErrTraceStreamRead not recognized by errors.Is")
+	}
+	if errors.Is(wrapped, ErrAgentFailed) {
+		t.Error("wrapped ErrTraceStreamRead matched ErrAgentFailed, want false")
 	}
 }

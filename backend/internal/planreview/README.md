@@ -376,5 +376,5 @@ so a reviewer can confirm diff-invisible facts. Long-form contract:
 
 | Env var | Default | Effect |
 |---|---|---|
-| `FISHHAWKD_REVIEW_GROUNDING` | `true` | Kill switch. `false` reverts both adapters to the diff-only (ungrounded) posture and the prompts to diff-only wording, without a rollback. The environment scrub is independent of this flag and always applied. |
+| `FISHHAWKD_REVIEW_GROUNDING` | `false` | Opt-in. Grounding ships DORMANT (#2522) — the per-adapter read bounds landed but the flip to on-by-default is a SEPARATE operator-filed follow-up gated on a recorded operator run of `live_confinement_test.go` passing on BOTH adapters. `false` reverts both adapters to the diff-only (ungrounded) posture and the prompts to diff-only wording, without a rollback. The environment scrub is independent of this flag and always applied. |
 | `FISHHAWKD_REVIEWER_ENV_PASSTHROUGH` | (empty) | Comma-separated EXACT env var names appended to each adapter's scrub allow-list — the escape hatch for a Bedrock/Vertex/proxy deployment whose auth vars the minimal list omits. Named explicitly, never by prefix. |

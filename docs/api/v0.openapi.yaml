@@ -1282,12 +1282,88 @@ components:
             byte-identical response.
           items:
             $ref: '#/components/schemas/RunStagePermissions'
+        completion_blocked:
+          $ref: '#/components/schemas/RunCompletionBlocked'
+          description: |
+            The stage stopping a `running` run from completing (E64.2 / #3083),
+            and whether anything can move it. `Orchestrator.completeRun` refuses
+            to stamp a run `succeeded` while any stage is non-terminal (#968);
+            before this field that refusal was invisible, so an operator
+            watching a merged PR on a run stuck at `running` had no way to learn
+            WHICH stage held it. Emitted by `GET /v0/runs/{run_id}` ONLY (the
+            list endpoint omits it — no per-row stage + audit reads) and omitted
+            for any run that is not `running` or whose stages are all terminal,
+            so an unblocked run keeps a byte-identical response.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    RunCompletionBlocked:
+      type: object
+      description: |
+        Why a `running` run cannot complete, and what (if anything) an operator
+        can do about it (E64.2 / #3083). Names the LOWEST-SEQUENCE non-terminal
+        stage — the run's own stage order, so the answer is stable and names the
+        stage an operator would reach for first.
+      required: [stage_id, stage_type, stage_state, reason, recovery]
+      properties:
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        stage_type:
+          type: string
+          description: The blocking stage's type.
+        stage_state:
+          type: string
+          description: The blocking stage's RAW backend state.
+        reason:
+          type: string
+          description: |
+            Why the run cannot complete, naming the stage and its state — the
+            half of the answer that does not depend on the audit chain.
+        recovery:
+          type: string
+          enum: [reconcile-merge, none]
+          description: |
+            DISCRIMINATES rather than always naming a verb. `reconcile-merge`
+            means POST `/v0/runs/{run_id}/reconcile-merge` will supersede this
+            stage and complete the run — emitted ONLY when the blocker's
+            `(stage_type, state)` is a row of the default-deny merge-supersede
+            pair table AND the run's PR is observably merged, i.e. exactly the
+            endpoint's own preconditions. `none` means no verb applies and
+            `reason` says what the stage needs instead. Pointing an operator at
+            a verb guaranteed to refuse is the defect #3083 reports against the
+            merge verb, so a client must branch on this field. A merge-evidence
+            read failure degrades this to `none` (fail closed — never advertise
+            a verb that cannot be confirmed to work).
+
+    SupersededStage:
+      type: object
+      description: |
+        One stage a merge terminalized as `superseded` (E64.2 / #3083). Returned
+        only for stages whose compare-and-swap SUCCEEDED, so a refused move
+        contributes nothing — the same "a missing row, never a false one"
+        property the audit ordering has.
+      required: [stage_id, stage_type, from_state, reason]
+      properties:
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        stage_type:
+          type: string
+          description: The superseded stage's type (`acceptance` or `review`).
+        from_state:
+          type: string
+          description: |
+            The state the stage was parked in when the merge made it
+            unreachable (`awaiting_host_dispatch` or `awaiting_approval`); for a
+            repaired row, `superseded` (the stage had already moved).
+        reason:
+          type: string
+          enum: [merge_observed, operator_reconcile, repair]
+          description: |
+            What ran the supersession: the merge-observation path swept it, an
+            operator invoked `reconcile-merge`, or a missing audit row was
+            repaired (transitioning nothing).
 
     RunEscalations:
       type: object
@@ -2862,7 +2938,7 @@ components:
             [pending, awaiting_host_dispatch, dispatched, running,
              awaiting_approval, awaiting_children, awaiting_input,
              awaiting_scope_decision, awaiting_deploy_approval,
-             awaiting_deployment, succeeded, failed, cancelled]
+             awaiting_deployment, succeeded, failed, cancelled, superseded]
           description: |
             `awaiting_host_dispatch` is the parked-for-host-spawn state
             (#1912): a runner_kind-locked-`local` agent stage the backend wants
@@ -2871,18 +2947,31 @@ components:
             `/v0/runs/{run_id}/stages/{stage_id}/host-dispatch`). Post-#1912
             `dispatched` unambiguously means a spawn attempt exists.
 
+            `superseded` (E64.2 / #3083) is TERMINAL and records that the
+            merge of the change the stage was gating made the stage
+            UNREACHABLE. It is distinct from `failed` (the work was attempted
+            and did not pass) and from `cancelled` (an operator halted the
+            run): the stage neither ran nor was halted. Only two
+            `(stage_type, state)` pairs may enter it — an `acceptance` stage
+            parked at `awaiting_host_dispatch` and a `review` stage at
+            `awaiting_approval` — enforced as a default-deny table at the
+            repository transition boundary, because `superseded` is terminal
+            and would otherwise let a run complete around work never done.
+            Written by the merge-supersede sweep and by POST
+            `/v0/runs/{run_id}/reconcile-merge`.
+
             TWO VOCABULARIES (#2494). This raw `state` is the authoritative
-            thirteen-value stage state (the `run.StageState` set, enumerated
+            fourteen-value stage state (the `run.StageState` set, enumerated
             above — the enum previously omitted the five park states
             `awaiting_children`, `awaiting_input`, `awaiting_scope_decision`,
             `awaiting_deploy_approval` and `awaiting_deployment`, which the API
             has always been able to return). The MCP surface reports a coarser
-            five-value BUCKET (`*_stage_wait_status.status`) answering "should
+            six-value BUCKET (`*_stage_wait_status.status`) answering "should
             I keep polling?"; neither is renamed, and the mapping is total:
-            `running` maps to `running`, `succeeded`, `failed` and `cancelled`
-            map to themselves, and every other state — including one added
-            later — buckets to `pending`, the conservative keep-polling
-            default. The mapping is written down once, in
+            `running` maps to `running`, `succeeded`, `failed`, `cancelled` and
+            `superseded` map to themselves, and every other state — including
+            one added later — buckets to `pending`, the conservative
+            keep-polling default. The mapping is written down once, in
             `backend/internal/mcpserver/stage_wait.go`.
         started_at:
           type: [string, "null"]
@@ -3283,6 +3372,44 @@ components:
             and the agent re-derived), `apply_failed_reset_failed` (an apply
             failed AND the post-failure reset also failed). Persisted onto the
             fixup_pushed audit entry.
+        pr_body_fallback_reason:
+          type: string
+          enum:
+            - handoff_absent
+            - handoff_unreadable
+            - empty_file
+            - empty_title
+            - body_absent
+            - unknown
+          description: |
+            Present only on a success ship whose PR body is NOT the one the
+            implement agent composed (#3012). Names which composition-failure
+            branch the runner took: `handoff_absent` (neither the run/stage-keyed
+            `/tmp/fishhawk-pr-<run>-<stage>.md` handoff nor the legacy fixed path
+            existed — the commonest branch, and the one that shipped a
+            placeholder body with no Summary, no Test plan and no `Closes #N`
+            with nothing in the trace saying so — BOTH reads must fail not-exist),
+            `handoff_unreadable` (a handoff path existed but could not be read:
+            the keyed path, or the legacy path when the keyed one is absent),
+            `empty_file`, `empty_title`, or
+            `body_absent` (a title-only handoff: the agent's title is honoured
+            but the PR opens footer-only). OMITTED entirely on every composed
+            ship, so a pre-#3012 body is byte-identical.
+
+            ACCEPTED-SET vs RECORDED-SET, stated plainly because the two differ.
+            The `enum` above is the set of values the server can RECORD. It is
+            NOT a rejection contract: a value outside it is ACCEPTED (201) and
+            NORMALIZED to `unknown` rather than rejected 400. That is deliberate
+            and fail-open — this artifact arrives AFTER the pull request already
+            exists on the forge, so rejecting it over an advisory diagnostic
+            would strand the implement stage in `running`, which is strictly
+            worse than the diagnostic being lost. `unknown` is therefore a member
+            of the enum: it is what a newer runner's unrecognized reason is
+            recorded as. An operator reading `unknown` should check the runner
+            version rather than assume a further branch.
+
+            The normalized value is folded into the `pull_request_opened` audit
+            payload under the same key, omitted when absent.
         supplemental_scope_exemptions:
           type: array
           items:
@@ -7483,6 +7610,22 @@ paths:
         commit still fails category-B at the report boundary and still blocks
         merge resolution.
 
+        **Re-posts the `fishhawk_audit_complete` check (E64.14 / #3109).**
+        After the declaration is durable, the endpoint recomputes audit-complete
+        and republishes the required Check Run AT the vouched commit. An
+        operator-pushed commit appears in no head-report audit category, so the
+        publisher's normal head resolution would re-post against a stale sha and
+        leave the check absent from the live merge head — the exact base-advance
+        wedge this closes. The re-post is best-effort for the vouch's success but
+        its outcome is REPORTED on the response
+        (`audit_check_republished` / `audit_check_republish_warning`) rather than
+        swallowed; the merge reconciler's heal CANNOT retry it (it uses the same
+        operator-vouched-blind head resolution), so re-invoking the vouch is the
+        sanctioned idempotent retry (the publisher dedups on success). The
+        post-change route for a base-advance conflict is therefore still
+        operator-resolve-then-vouch — a sanctioned rebase verb is deferred to
+        #3125.
+
         **Authorization.** Operator-token-only by design (ADR-035 sole-writer
         invariant). Requires `write:stages`. A run-bound MCP token (subject
         `mcp:run:<uuid>`) is REJECTED OUTRIGHT 403 (`run_token_forbidden`),
@@ -7526,6 +7669,21 @@ paths:
                   run_id: { $ref: '#/components/schemas/UUID' }
                   vouched_sha: { type: string, description: 'The commit SHA recorded as run-authored lineage.' }
                   reason: { type: string }
+                  audit_check_republished:
+                    type: boolean
+                    description: |
+                      True when the `fishhawk_audit_complete` Check Run was
+                      successfully re-posted at the vouched head (E64.14 /
+                      #3109). False when the re-post did not land — see
+                      `audit_check_republish_warning` — or when no publisher is
+                      wired. Re-invoke the vouch to retry the re-post idempotently.
+                  audit_check_republish_warning:
+                    type: string
+                    description: |
+                      Present only when the audit-complete re-post did NOT land:
+                      names the failure so the operator knows the required check
+                      may be absent from the merge head rather than discovering
+                      it at a blocked merge. Omitted when the re-post succeeded.
         '400':
           description: |
             Malformed body or an empty `sha`/`reason`. Body's `error` is
@@ -7589,9 +7747,26 @@ paths:
         **Fail-closed.** The merge is refused (no verdict recorded) when the
         run has no PR url or is failed/cancelled (`409 run_not_mergeable`),
         when the acceptance gate does not admit a merge
-        (`409 acceptance_gate_not_passed`), or when the merge seam is
-        unconfigured (`503 merge_seam_unconfigured`). It deliberately does NOT
-        block on a review stage awaiting approval (that stage settles ON merge).
+        (`409 acceptance_gate_not_passed`), when the pull request has a merge
+        conflict against its base (`409 merge_conflicting`, E64.14 / #3109), or
+        when the merge seam is unconfigured (`503 merge_seam_unconfigured`). It
+        deliberately does NOT block on a review stage awaiting approval (that
+        stage settles ON merge).
+
+        **Conflict precondition (E64.14 / #3109).** Before recording the
+        verdict, the endpoint checks the PR's mergeability and refuses a
+        conflicting PR with `409 merge_conflicting` — GitHub can never fire the
+        auto-merge on a conflicting PR, so queuing it would only time out. The
+        check is BEST-EFFORT and FAIL-OPEN: it refuses ONLY on an explicit
+        GitHub signal (`mergeable_state == "dirty"` or a documented
+        `mergeable == false`) and proceeds on every uncertainty (GitHub
+        unwired, no installation, unparseable repo/PR, a PR-read error, or a
+        still-computing `mergeable: null`). The post-refusal route is
+        operator-resolve-the-conflict-then-`vouch-commit`-then-re-merge (a
+        sanctioned rebase verb is deferred to #3125). GitLab MRs are NOT
+        classified here (the mergeability fields are GitHub-only, so a
+        conflicting GitLab MR falls through to today's queue-then-timeout
+        behavior — `merge_status`/`detailed_merge_status` would be the signal).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -7648,7 +7823,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            One of three cases. (1) The run cannot be merged: no PR url or a
+            One of four cases. (1) The run cannot be merged: no PR url or a
             failed/cancelled run (`run_not_mergeable`). (2) The acceptance gate
             does not admit a merge (`acceptance_gate_not_passed`). (3) The pull
             request's required checks have NOT all passed, so GitHub reports it
@@ -7659,6 +7834,13 @@ paths:
             retry CANNOT succeed. If the checks are still pending, re-invoke once
             they complete; but if a required check has already FAILED the merge
             will never queue — inspect the pull request instead of waiting.
+            (4) The pull request has a merge conflict against its base
+            (`merge_conflicting`, E64.14 / #3109). NO verdict row is recorded
+            (the guard runs before the append) and `details` carry
+            `{run_id, pr_url, mergeable_state}`. Waiting cannot resolve it:
+            resolve the conflict on the run branch, vouch the resulting commit
+            with `vouch-commit` so the `fishhawk_audit_complete` check re-posts,
+            re-approve the pull request, and re-invoke the merge.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -10316,6 +10498,24 @@ paths:
             a stale order, but nobody can acknowledge a read that did not happen.
         '503':
           description: "`campaign_repo_unconfigured` — no campaign repository wired."
+        '504':
+          description: |
+            `issue_set_resolution_timeout` (E54.59 / #3113) — resolving the
+            named issue set (no-epic `items`-only path) exceeded the server's
+            budget. The no-epic source costs one forge round-trip per named
+            item, so a large ratified grooming order can outrun the budget;
+            before #3113 this path had NO server-side deadline and the caller's
+            own client timeout was what gave up, producing a transport error
+            carrying no counts. `details` carries `resolved` (fully-resolved
+            items), `items_total`, `budget_seconds`, and — ONLY when a value
+            could be PROVEN to fit — `suggested_grooming_order_limit`, a
+            `grooming_order_limit` to retry with. The suggestion key is OMITTED
+            rather than sent as 0 when nothing could be proven to fit. The epic
+            path never returns this: `epic_children_unsupported`'s sweep reads
+            the sibling set in one call and is not bounded by this budget. The
+            budget is `--issue-set-resolution-budget` /
+            `FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET` (default 120s, permitted
+            maximum 10m).
 
   /v0/campaigns/{campaign_id}:
     get:
@@ -11444,16 +11644,24 @@ paths:
                       `head_sha` across the run's reported-head ledger
                       entries (`pull_request_opened` / `child_pushed` /
                       `fixup_pushed`, the same ADR-035 lineage source as
-                      `fixup_expected_head_sha`) — served ONLY on acceptance
-                      stages (E31.18 / #1569). The runner's pre-spawn
+                      `fixup_expected_head_sha`), falling back to the newest
+                      `integration_commit_recorded` `merge_sha` on the run's
+                      own chain when that ledger is empty (#3091), which is
+                      how a DECOMPOSED PARENT — whose children report their
+                      pushes on their own chains — resolves its consolidated
+                      branch tip. Served ONLY on acceptance stages
+                      (E31.18 / #1569). The runner's pre-spawn
                       target-identity gate compares the declared acceptance
                       target's `/healthz` `git_sha` against it before
                       spawning the acceptance agent, so acceptance validates
                       the merge candidate rather than whatever build answers
                       at the declared host. Absent on every other stage type
-                      and when backend-side ledger resolution fails — the
-                      runner then treats the target as unverifiable and
-                      warns-and-proceeds.
+                      and when backend-side resolution fails — the runner
+                      then fails the stage pre-spawn, category C, reason
+                      `acceptance_expected_head_unresolved`, rather than
+                      proceeding unverified (#3091): with no expectation
+                      there is nothing to verify the target against, so a
+                      recorded verdict would bind to no tree.
                   open_pr_from_held_commit:
                     type: boolean
                     description: |
@@ -11756,7 +11964,7 @@ paths:
                     description: The approved plan's `verification.acceptance_criteria` id list (the E31.1 join keys) in plan order, served ONLY on acceptance stages (E31.7 / #1535) — the runner's verdict join-key validation set. Absent on every other stage type and when the approved plan carries no criteria.
                   acceptance_expected_head_sha:
                     type: string
-                    description: The run's merge-candidate identity — the newest `head_sha` across the run's reported-head ledger entries (the ADR-035 lineage source, same as `fixup_expected_head_sha`), served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when ledger resolution fails (the runner then warns-and-proceeds as unverifiable).
+                    description: The run's merge-candidate identity — the newest `head_sha` across the run's reported-head ledger entries (the ADR-035 lineage source, same as `fixup_expected_head_sha`), falling back to the newest `integration_commit_recorded` `merge_sha` on the run's own chain for a decomposed parent whose reported-head ledger is empty (#3091); served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when resolution fails, in which case the runner fails the stage pre-spawn category-C `acceptance_expected_head_unresolved` rather than proceeding unverified (#3091).
                   open_pr_from_held_commit:
                     type: boolean
                     description: True ONLY when this implement stage's scope-completeness park (#1231) was resolved `exempt` (#2501) — the runner then opens the PR from the held commit with NO agent re-invocation. Absent on every other dispatch, including an undecided or `fail`-decided park.
@@ -11976,6 +12184,49 @@ paths:
                                   - foreign_commit
                                   - head_fetch_failed
                                   - review_pending
+                                  - security_findings_unresolved
+                                  - security_findings_unverified
+                                  - children_pending
+                              detail:
+                                type: string
+                        resolved:
+                          type: array
+                          description: |
+                            Populated only on the `fishhawk_audit_complete`
+                            row, and only when the derivation RESOLVED a
+                            requirement the run could not satisfy on its own
+                            (#3092). Today the single kind is
+                            `trace_resolved_from_children`: a decomposed run's
+                            parent implement stage is the fan-out stage — it
+                            spawns no agent and can never ship a trace — so its
+                            trace requirement is satisfied by the implement-stage
+                            traces of the decomposition CHILD runs named in
+                            `child_run_ids`. A positive evidentiary claim, never
+                            an exemption: the array is never emitted with an
+                            empty `child_run_ids`, a child genuinely missing
+                            a trace fails as a `trace_missing` entry naming that
+                            child instead, and a child whose own audit chain
+                            does not re-hash contributes nothing and fails as a
+                            `chain_invalid` / `chain_unrecoverable` entry naming
+                            that child. Absent when nothing was resolved.
+                          items:
+                            type: object
+                            required: [kind, stage_id, child_run_ids, detail]
+                            properties:
+                              kind:
+                                type: string
+                                enum:
+                                  - trace_resolved_from_children
+                              stage_id:
+                                type: string
+                                format: uuid
+                                description: The parent stage whose requirement was resolved.
+                              child_run_ids:
+                                type: array
+                                description: The child runs that actually supplied the evidence.
+                                items:
+                                  type: string
+                                  format: uuid
                               detail:
                                 type: string
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -12668,17 +12919,33 @@ paths:
           description: |
             Possible error codes:
 
-            - `plan_violates_budget` — the plan's
-              `predicted_runtime_minutes` exceeds the resolved
-              implement-stage budget and neither a
-              `decomposition.sub_plans` block nor an
+            - `plan_violates_budget` — the plan's runtime estimate
+              exceeds the resolved implement-stage budget and neither
+              a `decomposition.sub_plans` block nor an
               `--override-budget` marker in the comment is present.
+              The estimate the gate reads is
+              `max(predicted_runtime_minutes,
+              raw_predicted_runtime_minutes)`, NOT the calibrated
+              `predicted_runtime_minutes` alone (#2862): the plan
+              prompt tells the planner to fold the fleet calibration
+              factor into `predicted_runtime_minutes`, so a sub-1.0
+              factor would otherwise pull an over-budget estimate
+              under the budget and dissolve a required decomposition.
+              Reading the maximum means calibration may only ADD
+              structure — a factor above 1.0 can still push a plan
+              over. A plan that omits `raw_predicted_runtime_minutes`
+              is gated on the calibrated value alone, exactly as
+              before.
               The budget is the spec-resolved implement-stage timeout
               widened to the calibration p95 × 1.5 when implement
               runtime data exists, clamped to spec × 2 (#994) — the
               same base the dynamic implement kill cap builds on, so
               gate and runtime cannot disagree. `details` includes
-              `predicted_minutes`, `budget_minutes` (the RESOLVED
+              `predicted_minutes` (the calibrated value),
+              `raw_predicted_minutes` (the pre-calibration value; `0`
+              when the plan reported none), `gate_predicted_minutes`
+              (the maximum of the two — the number the gate actually
+              compared), `budget_minutes` (the RESOLVED
               budget), `budget_source` (`spec`, `p95`, or `ceiling` —
               which term won the resolution), `spec_budget_minutes`
               (the raw spec-resolved floor), and `timeout_source`
@@ -13356,7 +13623,9 @@ paths:
         workflow spec declares egress `target_hosts`, the response adds
         `needs_target: true` plus `target_hosts` (verbatim spec-declared
         hosts) and `expected_head_sha` (the resolved merge-candidate head
-        SHA; may be empty when the ledger resolution fails). The dispatch verb
+        SHA; empty only when the backend could not resolve one, which both
+        dispatch gates now REFUSE on — see that field's description). The
+        dispatch verb
         reads this to probe the first target host FROM THE DISPATCH HOST (the
         same network position the local runner would probe from) using the
         runner's `/healthz` `git_sha` identity semantics, and REFUSES to spawn
@@ -13428,8 +13697,17 @@ paths:
                     description: |
                       The resolved merge-candidate head SHA the target's
                       `/healthz` `git_sha` must match. Present with
-                      `needs_target: true`; may be empty when the backend could
-                      not resolve it (the verb then proceeds with a warning).
+                      `needs_target: true`. Empty when the backend could not
+                      resolve one (an empty reported-head ledger with no
+                      consolidated fan-in record, or a read error), in which
+                      case the dispatch verb REFUSES to spawn — it returns the
+                      structured `needs_target` refusal with an empty
+                      `expected_head_sha` and a `detail` naming
+                      `acceptance_expected_head_unresolved`, ahead of its
+                      `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` proceed branch (#3091).
+                      The runner's own gate fails the stage category-C with the
+                      same reason, so a dispatch that bypasses the verb refuses
+                      too.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
@@ -13476,6 +13754,21 @@ paths:
             SEPARATE **review** stage is still parked at `awaiting_approval`
             (the PR is open, not merged). Refused once the review stage has
             merged/resolved, or when the run has no review stage.
+
+            A workflow that orders **acceptance BEFORE review** (the shipped
+            `feature_change` shape: plan -> implement -> acceptance ->
+            review) leaves the review stage at `pending` until acceptance
+            settles, so a fix-up in that window is refused with
+            `fixup_not_applicable` (#3116) — this is a normal, transient
+            state, not an error in the run. The refusal message names the
+            REMEDY rather than only the unmet precondition, and splits by
+            what the operator can actually do: it says to **dispatch the
+            acceptance stage** when acceptance is still dispatchable
+            (`pending` / `awaiting_host_dispatch`), and to **wait for
+            acceptance to settle** when it is already in flight
+            (`dispatched` / `running`). Waiting consumes NO fix-up budget;
+            re-route the concerns once the review stage reaches
+            `awaiting_approval`.
         - on the deprecated positional path, the stage must carry a
           recorded **`approve_with_concerns`** implement-review verdict
           (the concern set the `concerns` indices address). With no
@@ -13528,6 +13821,26 @@ paths:
         sole-writer lineage gate without breaking ADR-035 (#1068/#1044).
         Otherwise merge with a follow-up, or start a fresh run. The operator
         still owns the merge.
+
+        **Delivered-nothing refund (#967 / #1957 / #3085).** A fix-up pass
+        that landed NOTHING on the PR branch is refunded against the NORMAL
+        budget, so the next trigger is admitted WITHOUT
+        `force_additional_pass`. The server computes the stage's
+        `stage_fixup_triggered` windows once and asks ONE question per window
+        — does it hold at least one delivered-nothing signal and NO
+        `fixup_pushed` entry? A window refunds AT MOST ONCE however many
+        signals of however many kinds land inside it. Four signal shapes are
+        unioned: `fixup_no_changes` (the re-dispatch produced no commit — not
+        a crash), `dispatch_reaper_failed` with `failure_category` `C` (a
+        pre-agent spawn-phase death), `stage_fixup_recovered` with
+        `source_failure_category` `C` (a post-agent-work death on the
+        push/report), and `stage_fixup_recovered` with
+        `source_failure_category` `A` (a harness death that pushed nothing).
+        A category-B (policy) failure still CONSUMES a pass — it is a verdict
+        on delivered work, not a delivery failure — and the PUSH VETO applies
+        UNIFORMLY: a pass that pushed a commit delivered something, so it
+        consumes budget however it later died. No refund ever extends the
+        absolute 3-pass ceiling, which keeps counting RAW triggered passes.
       tags: [stages]
       parameters:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -13763,7 +14076,13 @@ paths:
             or carries no recorded `approve_with_concerns` concerns
             (`fixup_not_applicable`); the NORMAL bounded pass count is already
             spent and no override was requested (`fixup_budget_exhausted` —
-            one more pass is available via `force_additional_pass: true`); or
+            one more pass is available via `force_additional_pass: true`; its
+            `details` carry `max_passes`, `used`, `refunded_passes` and
+            `crashed_without_push`, the last counting the refunding windows
+            whose delivered-nothing signal was a DEATH — a category-A or
+            category-C crash that pushed nothing — and reporting 0 for a
+            window refunded only on `fixup_no_changes`, so an operator can see
+            whether they are overriding a real limit or a crash, #3085); or
             the hard ceiling of 3 total passes is reached and the override can
             no longer help (`fixup_ceiling_reached`, distinct from
             `fixup_budget_exhausted`; its `details` carry a `remediation`
@@ -15596,6 +15915,310 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: Run/audit repositories not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/reconcile-merge:
+    post:
+      operationId: reconcileMerge
+      summary: Supersede the stages a merge left parked and complete the run (operator)
+      description: |
+        Settles a run whose pull request MERGED while a stage stayed parked in
+        a state nothing will ever re-dispatch (E64.2 / #3083) — a fix-up pass
+        re-parked `acceptance` at `awaiting_host_dispatch`, or the human
+        `review` gate was still `awaiting_approval` when the PR merged.
+        `Orchestrator.completeRun` then CORRECTLY refuses to stamp the run
+        `succeeded` around a non-terminal stage (#968), and every pre-existing
+        escape hatch records something untrue: reap writes `failed` for work
+        never attempted, cancel writes `cancelled` for a change that shipped.
+
+        This verb supersedes exactly the stages a DEFAULT-DENY
+        `(stage_type, state)` pair table admits — `acceptance` @
+        `awaiting_host_dispatch` and `review` @ `awaiting_approval`, no others
+        — appends one `stage_superseded_by_merge` audit entry per stage it
+        MOVED, and re-runs completion. A stage in any other non-terminal state
+        (`running`, `dispatched`, `awaiting_children`, the deploy park states,
+        `awaiting_scope_decision`) is left alone and the run stays `running`:
+        that is the #968 invariant, not a gap.
+
+        The order is TRANSITION FIRST, THEN AUDIT. The chain is append-only, so
+        a row written before a compare-and-swap that then refused would be an
+        immutable record of a supersession that never happened; the failure
+        mode is a MISSING row, never a false one.
+
+        IDEMPOTENT and self-repairing. A second POST moves nothing (`superseded`
+        is not a pair-table state) and returns 200 with two empty lists. A stage
+        that is already `superseded` but carries NO audit row — the residue of a
+        sweep whose transition committed and whose append then failed — is
+        REPAIRED with a row carrying `reason: repair`, transitioning nothing.
+        Exactly one row exists per swept stage no matter how often the verb is
+        called.
+
+        Read `completion_blocked` on GET `/v0/runs/{run_id}` first: it names the
+        blocking stage and reads `recovery: "reconcile-merge"` only when this
+        endpoint can actually move it.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            What the reconcile did. `superseded` lists the stages THIS
+            invocation moved; `repaired` lists already-superseded stages whose
+            missing audit row was restored. Both are empty on an idempotent
+            repeat. `run_state` is the run's state after the completion
+            re-evaluation, so a caller sees whether the run actually settled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, superseded, repaired, run_state]
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  superseded:
+                    type: array
+                    items: { $ref: '#/components/schemas/SupersededStage' }
+                  repaired:
+                    type: array
+                    items: { $ref: '#/components/schemas/SupersededStage' }
+                  run_state:
+                    type: string
+                    description: The run's state after completion was re-evaluated.
+        '400':
+          description: '`validation_failed` — malformed run_id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: No authenticated token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Caller is not permitted to write to this run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — unknown run id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `reconcile_merge_pr_not_merged` — the run's pull request is not
+            OBSERVABLY merged (no `pr_merged` / `post_merge_observed` /
+            `merge_observation_recorded` entry on its audit chain; the third is
+            the row POST `/v0/runs/{run_id}/record-merge-observation` appends
+            after a live `merged=true` forge read, #3136). Without this
+            precondition the verb could manufacture a `succeeded` run for a
+            change that never shipped.
+
+            `reconcile_merge_not_applicable` — the run holds no
+            pair-table-admissible parked stage and no already-superseded stage
+            to repair, so there is nothing for this verb to do. A stage in any
+            other non-terminal state must run, settle or be cancelled.
+
+            Every 409 is evaluated BEFORE any write: no stage moves and no
+            audit row is appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — a run/stage/audit read failed. The merge-evidence
+            read in particular fails CLOSED as a 500 rather than proceeding: a
+            verb that can complete a run must never run on unknown evidence.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`reconcile_merge_unconfigured` — run/audit repositories not wired.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/record-merge-observation:
+    post:
+      operationId: recordMergeObservation
+      summary: Read the run's pull request off the forge and record a merge observation (operator)
+      description: |
+        The OBSERVE half of the #3083 recovery pair (E64.32 / #3136). Reads the
+        run's pull request from the forge and — ONLY when the forge answers
+        merged — appends one chained `merge_observation_recorded` audit entry
+        carrying the real merge commit SHA, the forge's merge timestamp, and the
+        fact that this observation was reconciled AFTER the fact rather than
+        seen live.
+
+        Why it exists: `reconcile-merge`'s evidence gate reads the run's audit
+        CHAIN and never the forge, so a run whose PR genuinely merged but whose
+        merge was never recorded (a webhook that never arrived, an observation
+        lost when the backend restarted mid-write) is unreconcilable — the
+        evidence it needs can never appear. This verb is the ONLY new way onto
+        that chain, and it requires a live `merged=true` answer to use it.
+
+        The split is load-bearing: this verb OBSERVES and records a fact, and
+        settles nothing — it transitions no stage and completes no run.
+        `reconcile-merge` SETTLES and still reads only the chain. So the
+        fail-closed posture stays exactly as it was; what changes is that a
+        previously unreachable-but-true shape now has a recorded path.
+
+        The category is DELIBERATELY DISTINCT from `pr_merged` rather than a
+        synthetic `pr_merged` row. `pr_merged` carries a LIVE-observation
+        timestamp that the latency and cost surfaces already read as "when
+        Fishhawk knew", so back-dating one would corrupt those series and lie
+        about how the merge was learned. Recording `merged_at` (when the merge
+        happened) alongside `observed_at` (when Fishhawk learned it) lets a
+        reader see the gap without anything being back-dated.
+
+        IDEMPOTENCE — the honest claim. The guard is a READ-THEN-APPEND and is
+        NOT atomic. A SEQUENTIAL repeat POST appends nothing and returns 200
+        with `already_recorded: true` and an empty `observation`. Two CONCURRENT
+        posts can each append; that duplicate is POSSIBLE and HARMLESS, because
+        the evidence gate asks only whether AT LEAST ONE qualifying row exists —
+        a second row is inert and changes no decision.
+
+        GitLab: the GitLab adapter does not populate the merge commit SHA or
+        merge timestamp yet, so a GitLab run draws the named
+        `record_merge_observation_no_merge_commit` refusal rather than an
+        observation recorded with empty evidence.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            The observation this call recorded. `already_recorded: true` means
+            the chain ALREADY carried qualifying merge evidence
+            (`pr_merged` / `post_merge_observed` / `merge_observation_recorded`)
+            and this call appended NOTHING — `observation` is then empty,
+            because a no-op must not claim a fact it did not write.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, already_recorded, observation]
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  already_recorded:
+                    type: boolean
+                    description: |
+                      True when qualifying merge evidence was already on the
+                      chain and nothing was appended.
+                  observation:
+                    type: object
+                    description: |
+                      The recorded fact. All fields are zero-valued when
+                      `already_recorded` is true.
+                    required: [pull_request_url, pull_request_number, merge_commit_sha, merged_at, observed_at]
+                    properties:
+                      pull_request_url:
+                        type: string
+                        description: The run's recorded pull request URL.
+                      pull_request_number:
+                        type: integer
+                        description: The pull request number resolved from that URL.
+                      merge_commit_sha:
+                        type: string
+                        description: The forge's merge commit SHA.
+                      merged_at:
+                        type: string
+                        description: |
+                          The FORGE's merge timestamp (RFC 3339) — WHEN THE
+                          MERGE HAPPENED. Never a Fishhawk-side clock read.
+                      observed_at:
+                        type: string
+                        description: |
+                          When Fishhawk read the forge (RFC 3339) — WHEN
+                          FISHHAWK LEARNED IT.
+        '400':
+          description: |
+            `validation_failed` — malformed run_id.
+
+            `record_merge_observation_malformed_pr_url` — the run's recorded
+            pull request URL does not resolve to a repository and pull request
+            number, so there is nothing to read from the forge.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: No authenticated token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Caller is not permitted to write to this run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — unknown run id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `record_merge_observation_no_pull_request` — the run carries no pull
+            request URL, so it never reached a PR and there is no merge to
+            observe.
+
+            `record_merge_observation_pr_not_merged` — the forge reports the
+            pull request is NOT merged. This is the guard that stops the verb
+            manufacturing evidence for a change that never shipped.
+
+            `record_merge_observation_no_merge_commit` — the forge reports the
+            pull request merged but carries no merge commit SHA. Refused rather
+            than recording an observation with no commit. This is also the
+            truthful refusal a GitLab run draws today.
+
+            `record_merge_observation_no_merge_timestamp` — the forge reports
+            the pull request merged with a SHA but no merge timestamp. Refused
+            rather than recording a partial fact that would claim a merge time
+            it does not carry.
+
+            `record_merge_observation_pr_url_repo_mismatch` — the run's
+            recorded pull request URL resolves, but it does not name THIS run's
+            repository on THIS run's forge. The forge read is scoped by the
+            run's `repo` while the pull request NUMBER comes from that URL, and
+            the appended row records the URL as the pull request observed
+            merged; without this refusal the verb would confirm a different
+            repository's pull request and then write trusted evidence naming
+            this run's URL. Refused BEFORE the forge read, so a mismatch costs
+            no forge request. Owner/name are compared case-insensitively (a
+            case-differing spelling is the same repository) and the host is not
+            compared (the run row records none), but a run whose credential ref
+            names a non-GitHub forge cannot own a GitHub-style `/pull/` URL and
+            is refused here too.
+
+            Every refusal is evaluated BEFORE any write: no audit row is
+            appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — a run read, the chain read, or the audit append
+            failed. The chain read in particular fails CLOSED as a 500 rather
+            than proceeding: a verb whose job is deciding whether evidence is
+            MISSING must never treat "unknown" as "absent" and write on top of
+            it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            `record_merge_observation_forge_unavailable` — the pull request
+            could not be read from the forge, so the merge state is unknown and
+            nothing was recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `record_merge_observation_unconfigured` — the run/audit repositories
+            or the forge pull-request reader are not wired. A verb that records
+            forge evidence never records evidence it could not read.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

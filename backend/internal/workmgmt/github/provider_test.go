@@ -5,17 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
@@ -132,6 +135,11 @@ type fakeAPI struct {
 	setFieldProjectsToken       bool
 
 	projectsTokenConfigured bool
+
+	// mu guards the fake's own call-recording state. Only GetIssue is reached
+	// concurrently (by ResolveDependencies' bounded pool, #3113); the other
+	// members are driven from the test goroutine.
+	mu sync.Mutex
 }
 
 // fakeAddLabelsCall is one recorded AddIssueLabels dispatch: the issue number
@@ -262,6 +270,13 @@ func (f *fakeAPI) SearchIssuesByTitle(_ context.Context, _ forge.CredentialScope
 }
 
 func (f *fakeAPI) GetIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) (*githubclient.Issue, error) {
+	// ResolveDependencies fetches with bounded CONCURRENCY since #3113, so the
+	// call-count bookkeeping this fake keeps is itself shared mutable state. The
+	// mutex is the FAKE's own bookkeeping lock, not a lock in the production
+	// path — the production path has no shared mutable state across goroutines
+	// at all (workers return values over a channel and the parent merges).
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.getIssueCalls == nil {
 		f.getIssueCalls = map[int]int{}
 	}
@@ -2958,5 +2973,633 @@ func TestEpicChildren_RepeatedIdenticalCrossRepoToken_CollapsesToOneEdge(t *test
 	res := epicChildrenResultBody(t, 43, "Depends on: other/a#1, other/a#1", nil)
 	if len(res.DroppedEdges) != 1 {
 		t.Fatalf("DroppedEdges = %+v, want exactly 1 (repeated identical token collapses)", res.DroppedEdges)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #3113 — bounded-concurrency issue-set resolution.
+//
+// ResolveDependencies now fetches with bounded concurrency in three phases
+// (fetch items -> fetch out-of-set targets -> serial classification). The tests
+// below pin the four properties that shape depends on: the emitted result is
+// BYTE-IDENTICAL to a serial golden regardless of completion order, the
+// concurrency bound holds structurally in BOTH directions, a deadline surfaces
+// as the typed *workmgmt.IssueSetResolutionTimeout with honest counts in
+// preference to any wrapped fetch error, and a context-TERMINATED target is
+// never cached (as distinct from an ordinary 404, which still classifies
+// unreadable).
+// ---------------------------------------------------------------------------
+
+// jitterAPI perturbs completion ORDER without changing any result, so a
+// determinism test observes many different worker interleavings over one
+// fixture. It sleeps a sub-millisecond random amount before delegating; the
+// sleep competes with no deadline (these tests set none), so it is deliberately
+// NOT a timescale.D duration — scaling it would only slow the 50 repetitions.
+type jitterAPI struct{ *fakeAPI }
+
+func (a *jitterAPI) GetIssue(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (*githubclient.Issue, error) {
+	time.Sleep(time.Duration(rand.IntN(300)) * time.Microsecond)
+	return a.fakeAPI.GetIssue(ctx, scope, repo, number)
+}
+
+// jitterFixture is the shared determinism fixture: ten named issues in
+// DESCENDING request order (so request order and the ascending Children order
+// are different, and a phase that leaked completion order into the output would
+// show), carrying one edge of every classification the resolver emits — an
+// in-set edge, a satisfied out-of-set target, an open one, a
+// closed-but-incomplete one, an unreadable one, and an unresolvable cross-repo
+// token.
+func jitterFixture() *fakeAPI {
+	return &fakeAPI{
+		getIssues: map[int]*githubclient.Issue{
+			110: {Number: 110, Title: "one-ten", Body: "Depends on: #101\n"},
+			109: {Number: 109, Title: "one-nine", Body: "Depends on: #900\n"},
+			108: {Number: 108, Title: "one-eight", Body: "Depends on: #901\n"},
+			107: {Number: 107, Title: "one-seven", Body: "Depends on: other/repo#5\n"},
+			106: {Number: 106, Title: "one-six", Body: "Depends on: #902\n"},
+			105: {Number: 105, Title: "one-five", Body: "Depends on: #903\n"},
+			104: {Number: 104, Title: "one-four"},
+			103: {Number: 103, Title: "one-three"},
+			102: {Number: 102, Title: "one-two"},
+			101: {Number: 101, Title: "one-one", State: "closed", StateReason: "completed"},
+			900: {Number: 900, State: "closed", StateReason: "completed"},
+			901: {Number: 901, State: "open"},
+			902: {Number: 902, State: "closed", StateReason: "not_planned"},
+		},
+		// 903 is absent from getIssues, so GetIssue returns a not-found error:
+		// an ORDINARY fetch failure on a TARGET, which still classifies unreadable.
+		getIssueErrs: map[int]error{},
+	}
+}
+
+func jitterItems() []string {
+	return []string{"110", "109", "108", "107", "106", "105", "104", "103", "102", "101"}
+}
+
+// jitterGolden is the SERIAL expectation the concurrent implementation must
+// reproduce byte for byte. The unresolvable edge's identity fields are derived
+// through the same pure token helpers the parser uses (they are unrelated to
+// concurrency), so the golden pins the SHAPE without re-deriving a digest by hand.
+func jitterGolden() *workmgmt.EpicChildrenResult {
+	canon := dependsOnTokenCanonical("other/repo#5")
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 101, Title: "one-one", Complete: true},
+			{Number: 102, Title: "one-two"},
+			{Number: 103, Title: "one-three"},
+			{Number: 104, Title: "one-four"},
+			{Number: 105, Title: "one-five"},
+			{Number: 106, Title: "one-six"},
+			{Number: 107, Title: "one-seven"},
+			{Number: 108, Title: "one-eight"},
+			{Number: 109, Title: "one-nine"},
+			{Number: 110, Title: "one-ten"},
+		},
+		Edges: []workmgmt.DependsEdge{{From: 110, To: 101}},
+		DroppedEdges: []workmgmt.DependsEdge{
+			{From: 105, To: 903, Reason: workmgmt.DropTargetStateUnreadable},
+			{From: 106, To: 902, Reason: workmgmt.DropTargetClosedIncomplete},
+			{From: 107, To: 0, Reason: workmgmt.DropTargetStateUnreadable,
+				ToRef: sanitizeDependsOnToken(canon), ToRefDigest: dependsOnTokenDigest(canon)},
+			{From: 108, To: 901, Reason: workmgmt.DropNotChild},
+		},
+		SatisfiedEdges: []workmgmt.SatisfiedEdge{
+			{From: 109, To: 900, State: "closed", StateReason: "completed"},
+		},
+	}
+}
+
+// TestResolveDependenciesByteIdenticalUnderJitter is the determinism pin: 50
+// repetitions over a fixture whose fake jitters per-call ordering must all
+// marshal to the SAME bytes as each other AND as the serial golden. A phase
+// that let completion order reach the output — an append from a worker, a map
+// iterated for ordering, a non-deterministic error pick — reddens here.
+func TestResolveDependenciesByteIdenticalUnderJitter(t *testing.T) {
+	want, err := json.Marshal(jitterGolden())
+	if err != nil {
+		t.Fatalf("marshal golden: %v", err)
+	}
+	var first []byte
+	for i := 0; i < 50; i++ {
+		res, rerr := New(&jitterAPI{fakeAPI: jitterFixture()}).
+			ResolveDependencies(context.Background(), resolveReq(jitterItems()...))
+		if rerr != nil {
+			t.Fatalf("rep %d: ResolveDependencies: %v", i, rerr)
+		}
+		got, merr := json.Marshal(res)
+		if merr != nil {
+			t.Fatalf("rep %d: marshal: %v", i, merr)
+		}
+		if i == 0 {
+			first = got
+			if string(got) != string(want) {
+				t.Fatalf("rep 0 differs from serial golden:\n got %s\nwant %s", got, want)
+			}
+		}
+		if string(got) != string(first) {
+			t.Fatalf("rep %d differs from rep 0:\n got %s\nwant %s", i, got, first)
+		}
+	}
+}
+
+// epicJitterGolden is the BY-HAND serial expectation for the
+// epicJitterFixture, mirroring jitterGolden's role for the ResolveDependencies
+// path. It is derived from documented EpicChildren semantics, NOT captured from
+// current output (which would reintroduce the vacuity this pins closes):
+//
+//   - Children are the three sub-issues sorted ascending by Number (10, 11, 12).
+//     None carries a CLOSED+COMPLETED state, so Complete is false for all three;
+//     each carries the SubIssue's Body verbatim and no URL/Autonomy.
+//   - 12's `Depends on: #11` resolves to a fellow child (isChild[11]), so it is
+//     an in-set Edge 12->11.
+//   - 11's `Depends on: #900` targets a CLOSED+COMPLETED out-of-set issue, so it
+//     is a SatisfiedEdge carrying the target's (state, state_reason).
+//   - 10's `Depends on: #901` targets an OPEN out-of-set issue, so it is a
+//     DroppedEdge with DropNotChild and no ToRef/ToRefDigest (a numeric ref).
+func epicJitterGolden() *workmgmt.EpicChildrenResult {
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 10, Title: "ten", Body: "Depends on: #901\n"},
+			{Number: 11, Title: "eleven", Body: "Depends on: #900\n"},
+			{Number: 12, Title: "twelve", Body: "Depends on: #11\n"},
+		},
+		Edges: []workmgmt.DependsEdge{{From: 12, To: 11}},
+		DroppedEdges: []workmgmt.DependsEdge{
+			{From: 10, To: 901, Reason: workmgmt.DropNotChild},
+		},
+		SatisfiedEdges: []workmgmt.SatisfiedEdge{
+			{From: 11, To: 900, State: "closed", StateReason: "completed"},
+		},
+	}
+}
+
+// TestEpicChildrenByteIdenticalUnderJitter proves the EPIC path's output is
+// unchanged by #3113: EpicChildren still resolves serially through
+// classifyOutOfSetTarget (now delegating to the extracted pure
+// classifyFetchedTarget), so 50 repetitions under the same jittering fake are
+// byte-identical — AND byte-identical to a hand-written serial golden, so the
+// test pins CONTENT (children, edges, dropped edges, satisfied edges,
+// classification), not merely self-consistent DETERMINISM. A deterministic
+// regression in any of those — the earlier weak substring check let one through
+// — reddens against the golden. This is the guard on the "EpicChildren's output
+// stays byte-identical" constraint; a future attempt to share the concurrent
+// pool with the epic path would have to keep it green.
+//
+// COUNTERFACTUAL (operator condition, #3113 fix-up): mutating
+// provider.go classifyFetchedTarget's closed+completed case from
+// `targetState{satisfied: true, ...}` to `targetState{reason:
+// workmgmt.DropNotChild, ...}` reclassifies edge 11->900 from a SatisfiedEdge
+// to a DroppedEdge, and this test goes RED against the golden ("rep 0 differs
+// from serial golden") — verified by executing the mutation (confirmed landed
+// by re-reading the line) and restoring it byte-identically to green.
+func TestEpicChildrenByteIdenticalUnderJitter(t *testing.T) {
+	newFake := func() *fakeAPI {
+		return &fakeAPI{
+			parentNode: "EPIC_NODE",
+			listSubResults: []githubclient.SubIssue{
+				{Number: 12, Title: "twelve", Body: "Depends on: #11\n"},
+				{Number: 11, Title: "eleven", Body: "Depends on: #900\n"},
+				{Number: 10, Title: "ten", Body: "Depends on: #901\n"},
+			},
+			getIssues: map[int]*githubclient.Issue{
+				900: {Number: 900, State: "closed", StateReason: "completed"},
+				901: {Number: 901, State: "open"},
+			},
+		}
+	}
+	want, err := json.Marshal(epicJitterGolden())
+	if err != nil {
+		t.Fatalf("marshal golden: %v", err)
+	}
+	var first []byte
+	for i := 0; i < 50; i++ {
+		res, err := New(&jitterAPI{fakeAPI: newFake()}).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+			Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+			Epic:   "#7",
+		})
+		if err != nil {
+			t.Fatalf("rep %d: EpicChildren: %v", i, err)
+		}
+		got, merr := json.Marshal(res)
+		if merr != nil {
+			t.Fatalf("rep %d: marshal: %v", i, merr)
+		}
+		if i == 0 {
+			first = got
+			if string(got) != string(want) {
+				t.Fatalf("rep 0 differs from serial golden:\n got %s\nwant %s", got, want)
+			}
+		}
+		if string(got) != string(first) {
+			t.Fatalf("rep %d differs from rep 0:\n got %s\nwant %s", i, got, first)
+		}
+	}
+}
+
+// probeAPI proves the concurrency bound STRUCTURALLY, in both directions, with
+// no shared mutable state of its own beyond channels:
+//
+//   - AT MOST issueSetFetchConcurrency: each call does a NON-BLOCKING send on
+//     slots (capacity issueSetFetchConcurrency) on entry and a receive on exit.
+//     A failed send is the (N+1)-th concurrent call and records a violation.
+//   - AT LEAST issueSetFetchConcurrency: each call announces itself on arrivals
+//     and then waits for release, which the test closes only after collecting
+//     issueSetFetchConcurrency arrivals. A serial implementation never reaches
+//     that many, so the collector times out and closes abort — which unblocks
+//     every call so the test FAILS on the missing-release assertion rather than
+//     deadlocking.
+type probeAPI struct {
+	*fakeAPI
+	slots      chan struct{}
+	violations chan struct{}
+	arrivals   chan struct{}
+	release    chan struct{}
+	abort      chan struct{}
+}
+
+func (a *probeAPI) GetIssue(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (*githubclient.Issue, error) {
+	took := false
+	select {
+	case a.slots <- struct{}{}:
+		took = true
+	default:
+		select {
+		case a.violations <- struct{}{}:
+		default:
+		}
+	}
+	select {
+	case a.arrivals <- struct{}{}:
+	default:
+	}
+	select {
+	case <-a.release:
+	case <-a.abort:
+	}
+	if took {
+		<-a.slots
+	}
+	return a.fakeAPI.GetIssue(ctx, scope, repo, number)
+}
+
+func TestResolveDependenciesConcurrencyBounded(t *testing.T) {
+	const items = 24
+	issues := map[int]*githubclient.Issue{}
+	refs := make([]string, 0, items)
+	for i := 0; i < items; i++ {
+		n := 200 + i
+		issues[n] = &githubclient.Issue{Number: n, Title: strconv.Itoa(n)}
+		refs = append(refs, strconv.Itoa(n))
+	}
+	probe := &probeAPI{
+		fakeAPI:    &fakeAPI{getIssues: issues},
+		slots:      make(chan struct{}, issueSetFetchConcurrency),
+		violations: make(chan struct{}, items),
+		arrivals:   make(chan struct{}, items),
+		release:    make(chan struct{}),
+		abort:      make(chan struct{}),
+	}
+	// Every deadline-competing duration is derived through timescale.D so the
+	// discrimination ratios hold at any factor.
+	collectDeadline := timescale.D(3 * time.Second)
+	runDeadline := timescale.D(20 * time.Second)
+	go func() {
+		for i := 0; i < issueSetFetchConcurrency; i++ {
+			select {
+			case <-probe.arrivals:
+			case <-time.After(collectDeadline):
+				close(probe.abort) // never reached the bound: unblock and let the assertion fail.
+				return
+			}
+		}
+		close(probe.release)
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := New(probe).ResolveDependencies(context.Background(), resolveReq(refs...))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ResolveDependencies: %v", err)
+		}
+	case <-time.After(runDeadline):
+		t.Fatalf("ResolveDependencies did not return within %s", runDeadline)
+	}
+
+	select {
+	case <-probe.release:
+	default:
+		t.Fatalf("never observed %d concurrent GetIssue calls: the fetch is not running concurrently", issueSetFetchConcurrency)
+	}
+	if n := len(probe.violations); n != 0 {
+		t.Fatalf("observed %d call(s) beyond the %d-way concurrency bound", n, issueSetFetchConcurrency)
+	}
+}
+
+// cancelingAPI makes deadline behaviour DETERMINISTIC under concurrency: a
+// number in cancelOn cancels the resolution's context and fails; every other
+// number succeeds from the canned fixture regardless of context state. So which
+// items complete does not depend on which worker won a race.
+type cancelingAPI struct {
+	*fakeAPI
+	cancel   context.CancelFunc
+	cancelOn map[int]bool
+	// failWith, when set for a number, is returned WITHOUT cancelling anything —
+	// the "context-terminated fetch with a live parent context" case that
+	// distinguishes an aborted target from an ordinary error.
+	failWith map[int]error
+}
+
+func (a *cancelingAPI) GetIssue(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (*githubclient.Issue, error) {
+	if err, ok := a.failWith[number]; ok {
+		return nil, err
+	}
+	if a.cancelOn[number] {
+		if a.cancel != nil {
+			a.cancel()
+		}
+		return nil, context.Canceled
+	}
+	return a.fakeAPI.GetIssue(ctx, scope, repo, number)
+}
+
+// timeoutFixture: three named issues, none with out-of-set deps, so an item is
+// fully resolved exactly when its own fetch completes.
+func timeoutFixture() *fakeAPI {
+	return &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		100: {Number: 100, Title: "a"},
+		101: {Number: 101, Title: "b"},
+		102: {Number: 102, Title: "c"},
+	}}
+}
+
+func wantTimeout(t *testing.T, err error, resolved, total, suggested int, phase string) {
+	t.Helper()
+	var to *workmgmt.IssueSetResolutionTimeout
+	if !errors.As(err, &to) {
+		t.Fatalf("want *workmgmt.IssueSetResolutionTimeout, got %T: %v", err, err)
+	}
+	if to.Resolved != resolved || to.Total != total || to.SuggestedLimit != suggested {
+		t.Fatalf("counts: got resolved=%d total=%d suggested=%d, want %d/%d/%d",
+			to.Resolved, to.Total, to.SuggestedLimit, resolved, total, suggested)
+	}
+	if phase != "" && to.Phase != phase {
+		t.Fatalf("phase: got %q want %q", to.Phase, phase)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(err, context.DeadlineExceeded) must hold, got %v", err)
+	}
+}
+
+// TestResolveDependenciesPhase1DeadlineTypedTimeout: a deadline during the
+// named-issue fetch surfaces as the typed timeout with a PREFIX suggestion, and
+// NOT as the wrapped `get issue #N` error the phase-1 error path would return.
+func TestResolveDependenciesPhase1DeadlineTypedTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	api := &cancelingAPI{fakeAPI: timeoutFixture(), cancel: cancel, cancelOn: map[int]bool{102: true}}
+	_, err := New(api).ResolveDependencies(ctx, resolveReq("100", "101", "102"))
+	if err == nil {
+		t.Fatal("want a timeout error")
+	}
+	if strings.Contains(err.Error(), "get issue #") {
+		t.Fatalf("deadline surfaced as a wrapped fetch error: %v", err)
+	}
+	wantTimeout(t, err, 2, 3, 2, "fetch_items")
+}
+
+// TestResolveDependenciesSuggestedLimitPrefixOnly: the fully-resolved set is
+// non-empty but is NOT a prefix of the request order (the FIRST item is the one
+// that failed), so counts are emitted and the suggestion is 0 — a suggestion is
+// never derived from a non-prefix count.
+func TestResolveDependenciesSuggestedLimitPrefixOnly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	api := &cancelingAPI{fakeAPI: timeoutFixture(), cancel: cancel, cancelOn: map[int]bool{100: true}}
+	_, err := New(api).ResolveDependencies(ctx, resolveReq("100", "101", "102"))
+	wantTimeout(t, err, 2, 3, 0, "fetch_items")
+}
+
+// TestResolveDependenciesPhase2DeadlineTypedTimeout: the named fetch completes,
+// then the deadline trips the out-of-set TARGET fetch. The item names an
+// unclassified target, so it is NOT counted resolved (the accounting rule is
+// uniform across phases) and the phase names the target pass.
+func TestResolveDependenciesPhase2DeadlineTypedTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	api := &cancelingAPI{
+		fakeAPI:  &fakeAPI{getIssues: map[int]*githubclient.Issue{100: {Number: 100, Body: "Depends on: #900\n"}}},
+		cancel:   cancel,
+		cancelOn: map[int]bool{900: true},
+	}
+	_, err := New(api).ResolveDependencies(ctx, resolveReq("100"))
+	wantTimeout(t, err, 0, 1, 0, "classify_targets")
+}
+
+// TestResolveDependenciesAbortedTargetNotCachedNotResolved is the
+// context-termination distinction, and the phase-3 defensive branch's vehicle.
+// The target's fetch returns context.Canceled while the PARENT context stays
+// ALIVE, so phase 2's own deadline check does not fire: the target is left
+// unclassified and phase 3 refuses with the typed timeout rather than guessing
+// a classification. Resolved is 0 — a context-terminated target never counts
+// its item resolved.
+func TestResolveDependenciesAbortedTargetNotCachedNotResolved(t *testing.T) {
+	api := &cancelingAPI{
+		fakeAPI:  &fakeAPI{getIssues: map[int]*githubclient.Issue{100: {Number: 100, Body: "Depends on: #900\n"}}},
+		failWith: map[int]error{900: context.Canceled},
+	}
+	_, err := New(api).ResolveDependencies(context.Background(), resolveReq("100"))
+	wantTimeout(t, err, 0, 1, 0, "build_result")
+}
+
+// TestResolveDependenciesOrdinaryTargetErrorStillClassifies is the SIBLING of
+// the case above over the SAME target: an ordinary (non-context) fetch failure
+// still caches DropTargetStateUnreadable and the resolution SUCCEEDS. Pairing
+// the two proves the distinction is context-TERMINATION, not error-vs-success —
+// #2953's meaning of "unreadable" is not widened.
+func TestResolveDependenciesOrdinaryTargetErrorStillClassifies(t *testing.T) {
+	api := &cancelingAPI{
+		fakeAPI:  &fakeAPI{getIssues: map[int]*githubclient.Issue{100: {Number: 100, Body: "Depends on: #900\n"}}},
+		failWith: map[int]error{900: errors.New("githubclient: 404 not found")},
+	}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("100"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0].Reason != workmgmt.DropTargetStateUnreadable {
+		t.Fatalf("want one target_state_unreadable dropped edge, got %+v", res.DroppedEdges)
+	}
+}
+
+// TestResolveDependenciesFetchErrorFirstInRequestOrder pins the deterministic
+// error pick: with BOTH named items failing and the context ALIVE, the returned
+// error names the item FIRST IN REQUEST ORDER. The fixture is DESCENDING (20
+// then 10) on purpose — on ascending input the claim is invisible, because
+// first-in-request-order and lowest-numbered coincide.
+func TestResolveDependenciesFetchErrorFirstInRequestOrder(t *testing.T) {
+	api := &cancelingAPI{
+		fakeAPI:  &fakeAPI{},
+		failWith: map[int]error{20: errors.New("boom-twenty"), 10: errors.New("boom-ten")},
+	}
+	for i := 0; i < 25; i++ {
+		_, err := New(api).ResolveDependencies(context.Background(), resolveReq("20", "10"))
+		if err == nil {
+			t.Fatal("want a fetch error")
+		}
+		if !strings.Contains(err.Error(), "get issue #20") {
+			t.Fatalf("rep %d: want the first item in request order (#20), got %v", i, err)
+		}
+		if strings.Contains(err.Error(), "#10") {
+			t.Fatalf("rep %d: returned the later item's error: %v", i, err)
+		}
+	}
+}
+
+// TestResolveDependenciesNilNamedIssueFailsClosed: the forge returned neither
+// an issue nor an error for a NAMED item. Every downstream phase reads that
+// issue's number/title/body, so the resolution fails closed naming the item
+// rather than inventing a child.
+func TestResolveDependenciesNilNamedIssueFailsClosed(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{100: nil}}
+	_, err := New(api).ResolveDependencies(context.Background(), resolveReq("100"))
+	if err == nil || !strings.Contains(err.Error(), "get issue #100: no issue returned") {
+		t.Fatalf("want the no-issue-returned refusal, got %v", err)
+	}
+}
+
+// TestResolveDependenciesUnresolvableRefMakesNoForgeCall / …NonPositive… are
+// the preserved no-forge-call guards under the new phasing: an unresolvable
+// cross-repo token must never be reduced to a local number and read (which
+// could FALSELY satisfy the edge, #2953 condition 2), so phase 2 must not
+// enqueue it as a target.
+func TestResolveDependenciesUnresolvableRefMakesNoForgeCall(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		100: {Number: 100, Body: "Depends on: other/repo#5\n"},
+		5:   {Number: 5, State: "closed", StateReason: "completed"},
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("100"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if n := api.getIssueCalls[5]; n != 0 {
+		t.Fatalf("cross-repo token was reduced to local #5 and fetched %d time(s)", n)
+	}
+	if len(res.SatisfiedEdges) != 0 {
+		t.Fatalf("cross-repo token must never satisfy an edge: %+v", res.SatisfiedEdges)
+	}
+	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0].Reason != workmgmt.DropTargetStateUnreadable {
+		t.Fatalf("want one target_state_unreadable dropped edge, got %+v", res.DroppedEdges)
+	}
+}
+
+// TestResolveDependenciesTargetFetchedOncePerDistinctNumber: the phase-2 target
+// set is DISTINCT and first-encounter-ordered, so N references to one target
+// still cost ONE GetIssue (#2953's memoization, preserved by the cache being
+// built from a deduped fetch rather than filled opportunistically).
+func TestResolveDependenciesTargetFetchedOncePerDistinctNumber(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		100: {Number: 100, Body: "Depends on: #900\n"},
+		101: {Number: 101, Body: "Depends on: #900\n"},
+		102: {Number: 102, Body: "Depends on: #900, #900\n"},
+		900: {Number: 900, State: "closed", StateReason: "completed"},
+	}}
+	if _, err := New(api).ResolveDependencies(context.Background(), resolveReq("100", "101", "102")); err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if n := api.getIssueCalls[900]; n != 1 {
+		t.Fatalf("target #900 fetched %d times, want exactly 1", n)
+	}
+}
+
+// TestNeedsTargetFetchRefusesUnresolvableRef and its lookupTargetState twin pin
+// the no-forge-call guards on a SYNTHETIC ref — Resolvable=false with a POSITIVE
+// number. That shape is unreachable from parseDependsOnMarker today (an
+// unresolvable token always carries Number 0), which is precisely why the
+// through-the-parser test cannot serve as this control's counterfactual vehicle:
+// deleting the Resolvable check there is a no-op. Asserted here directly, the
+// guard is the one that stops a cross-repo token ever being reduced to a local
+// number and read — the failure mode that could FALSELY satisfy an edge (#2953
+// operator condition 2), preserved across the #3113 rephasing.
+func TestNeedsTargetFetchRefusesUnresolvableRef(t *testing.T) {
+	synthetic := dependsOnRef{Number: 5, Resolvable: false, RawDigest: "d", RawDisplay: "other/repo#5"}
+	if needsTargetFetch(synthetic, map[int]bool{}) {
+		t.Fatal("an unresolvable ref must never be enqueued for a forge read")
+	}
+	if needsTargetFetch(dependsOnRef{Number: 0, Resolvable: true}, map[int]bool{}) {
+		t.Fatal("a non-positive number must never be enqueued for a forge read")
+	}
+	if !needsTargetFetch(dependsOnRef{Number: 900, Resolvable: true}, map[int]bool{}) {
+		t.Fatal("a resolvable positive out-of-set target must be fetched")
+	}
+	if needsTargetFetch(dependsOnRef{Number: 900, Resolvable: true}, map[int]bool{900: true}) {
+		t.Fatal("an IN-SET target must never be re-fetched as an out-of-set target")
+	}
+}
+
+func TestLookupTargetStateAnswersNoForgeCallRefsWithoutCache(t *testing.T) {
+	empty := map[int]targetState{}
+	synthetic := dependsOnRef{Number: 5, Resolvable: false, RawDigest: "d", RawDisplay: "other/repo#5"}
+	ts, ok := lookupTargetState(synthetic, empty)
+	if !ok || ts.satisfied || ts.reason != workmgmt.DropTargetStateUnreadable {
+		t.Fatalf("an unresolvable ref must classify unreadable WITHOUT a cache entry, got %+v ok=%v", ts, ok)
+	}
+	ts, ok = lookupTargetState(dependsOnRef{Number: 0, Resolvable: true}, empty)
+	if !ok || ts.satisfied || ts.reason != workmgmt.DropTargetStateUnreadable {
+		t.Fatalf("a non-positive number must classify unreadable WITHOUT a cache entry, got %+v ok=%v", ts, ok)
+	}
+	if _, ok := lookupTargetState(dependsOnRef{Number: 900, Resolvable: true}, empty); ok {
+		t.Fatal("an uncached resolvable target must report unclassified, not a guessed classification")
+	}
+}
+
+// TestFetchIssuesBoundedAbortedRequiresError pins the `err != nil` qualifier on
+// the aborted flag directly, because it is unobservable through
+// ResolveDependencies: whenever the parent context is dead, phase 2's own
+// deadline check returns the typed timeout before a mislabelled result could be
+// read. The guard is what keeps a fetch that SUCCEEDED just before the deadline
+// from being discarded as context-terminated, so it is asserted at the helper.
+func TestFetchIssuesBoundedAbortedRequiresError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // dead context, but the fake below ignores it and succeeds.
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		900: {Number: 900, State: "closed", StateReason: "completed"},
+		901: nil,
+	}}
+	api.getIssueErrs = map[int]error{901: context.Canceled}
+	got := New(api).fetchIssuesBounded(ctx, forge.FromGitHubInstallationID(99),
+		forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}, []int{900, 901})
+	if len(got) != 2 {
+		t.Fatalf("want one result per input, got %d", len(got))
+	}
+	if got[0].number != 900 || got[0].err != nil || got[0].aborted {
+		t.Fatalf("a SUCCESSFUL fetch must never be marked aborted, got %+v", got[0])
+	}
+	if got[1].number != 901 || !got[1].aborted {
+		t.Fatalf("a context-terminated fetch must be marked aborted, got %+v", got[1])
+	}
+}
+
+// TestFetchIssuesBoundedIndexesByRequestOrder: every result slot is filled and
+// indexed by REQUEST order, not completion order — the property the
+// deterministic first-in-request-order error pick and the prefix-based
+// SuggestedLimit both rest on.
+func TestFetchIssuesBoundedIndexesByRequestOrder(t *testing.T) {
+	issues := map[int]*githubclient.Issue{}
+	nums := []int{}
+	for i := 0; i < 20; i++ {
+		n := 500 - i // descending, so request order != ascending order
+		issues[n] = &githubclient.Issue{Number: n}
+		nums = append(nums, n)
+	}
+	got := New(&jitterAPI{fakeAPI: &fakeAPI{getIssues: issues}}).fetchIssuesBounded(
+		context.Background(), forge.FromGitHubInstallationID(99),
+		forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}, nums)
+	for i, f := range got {
+		if f.ordinal != i || f.number != nums[i] || f.issue == nil {
+			t.Fatalf("slot %d: got %+v, want ordinal %d number %d", i, f, i, nums[i])
+		}
 	}
 }

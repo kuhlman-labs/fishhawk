@@ -20,7 +20,11 @@ On `status >= 500` it:
    rule: a key is admitted only when its value is a product-owned enum /
    identifier / boolean / integer, a caller-echoed request field, or a static
    literal; NEVER a value derived from an error, a subprocess, or a third-party
-   API response. The `error` key is deliberately absent.
+   API response. The `error` key is deliberately absent. As of E54.59 / #3113 the
+   list also admits `resolved` / `items_total` /
+   `suggested_grooming_order_limit` / `budget_seconds` — the counts the `504
+   issue_set_resolution_timeout` refusal is made of, each a product-owned
+   integer the handler computes (see the campaign create section below).
 2. **Sets `error_ref`** on the body from the request id the requestID middleware
    already mints (also echoed as `X-Request-ID`), so the caller gets a
    correlation handle with no new plumbing. `error_ref` is the caller's own
@@ -748,6 +752,35 @@ precedence pin, the wire-fixture equality and the emitter-fidelity decode), and
 `mcpserver/client_test.go` (`TestHostDispatchStage_WireShape`: the fixture-bytes
 decode and the `wave_not_integrated` annotation).
 
+## Run-less `fishhawk_audit_complete` publish + App-identity discriminator (`pullrequest_synchronize.go` / `webhook.go`, E64.43 / [#3160](https://github.com/kuhlman-labs/fishhawk/issues/3160))
+
+`republishOnPullRequestEvent` (renamed from `republishOnSynchronize`) is the `pull_request` webhook consumer that re-drives the audit-complete Compute + publish flow. Two changes here.
+
+**Widened dispatch.** `webhook.go` routes `opened`, `reopened` AND `synchronize` (`isAuditRepublishAction`), not `synchronize` alone. A Dependabot PR that is never pushed to after opening emits NO `synchronize` at all, so under the old condition it received no publish whatsoever — and once the check is marked Required in branch protection, it stayed blocked forever on a context nothing would post. The run-BEARING path is idempotent under the extra events: the publisher's per-`(forge, repo, head_sha)` dedup cache suppresses a repeat at the same head. No other action is routed; `edited` / `labeled` must NOT reach the handler, and that negative is pinned by the same table that pins the positives.
+
+**Run-less publish.** When `ListRuns` returns zero runs the handler now publishes a terminal `neutral` not-applicable Check Run (`auditcheckpublisher.PublishNotApplicable`) instead of no-oping, so the required context is satisfiable on every PR class. The handler takes `webhook.Event` rather than raw bytes because it needs `Sender` / `Repo` / `InstallationID`, which the raw-bytes signature does not carry; the credential scope is `forge.FromGitHubInstallationID(ev.InstallationID)` (`webhook.Event.credentialScope` is unexported).
+
+### The App-identity discriminator — FAIL CLOSED
+
+The publish is gated on `authoredByFishhawkApp`, which must **positively establish** the PR was neither opened nor pushed by Fishhawk's own GitHub App. Without it there is a false-green race: an `opened` webhook for a Fishhawk-managed PR can arrive before `runs.pull_request_url` is denormalized, `ListRuns` returns zero, and a `neutral` check would green an audit gate that was never verified. A stranded `in_progress` fails SAFE under a required context; a stranded `neutral` fails **OPEN**.
+
+- The App's own bot login is resolved through the existing memoized `resolveAppBotIdentity` (`prompt.go`), whose `name` return IS `<app-slug>[bot]`, derived from the App's own `GET /app` slug. **No login literal is hardcoded** — a self-hosted install running under a different App resolves ITS OWN slug.
+- The comparison is case-insensitive against **BOTH** the PR author (`pull_request.user.login`) and the event sender. The AUTHOR covers a Fishhawk-opened PR later reopened or pushed by someone else; the SENDER covers a fix-up push our App makes to a PR whose run row is not yet denormalized. A match on either means **no** not-applicable publish.
+- **An UNRESOLVABLE identity also means no publish.** `authoredByFishhawkApp` returns `(isOurs, resolved)`; a false `isOurs` under a false `resolved` is "unknown", never "not ours". The caller logs at **WARN** — `zero runs but App identity unresolvable — not publishing not-applicable` — which is what makes the residual operator-visible. The trade is deliberate: a missing publish leaves the PR blocked (today's behaviour, recoverable with `gh pr merge <n> --admin`), while a wrong publish greens a real audit gate silently and is not recoverable.
+- The `ListRuns` **error** path is unchanged and equally fail-closed: an error is not evidence of zero runs, so it logs and returns without reaching the publish.
+
+**Residual, stated not asserted away.** `resolveAppBotIdentity` needs BOTH `GetApp` AND `GetUser` to succeed (it builds a commit email as well as a login), so an App whose `GetApp` works but whose `GetUser` fails yields an empty login and — under the fail-closed rule — **no not-applicable publishes at all**, leaving non-Fishhawk PRs blocked. A narrower `GetApp`-only resolver would shrink that residual but needs new memo fields on the `Server` struct. Resolution memoization is success-only, so the steady-state cost is one round-trip per daemon start and a transient failure is retried on the next event.
+
+**State alternation (reviewer-raised residual, not foreclosed by a contract).** The publisher's dedup cache is keyed on state VALUE, so a not-applicable publish is not suppressed by an earlier real pass at the same head — and GitHub surfaces the NEWEST check run of a given name. In principle, a zero-run event arriving at a head where a real pass was already cached would post a `neutral` row that visually supersedes the verified pass. Two things make it unreachable in practice rather than merely unlikely: the ListRuns-error path never publishes, and the discriminator refuses any PR our App authored or pushed — so reaching it requires a PR that HAD a run when the pass was computed and has zero runs on a later event, with a non-Fishhawk author AND a non-Fishhawk sender. That is not a contract, so it is named here rather than left unstated. If it is ever observed, the fix is to skip the not-applicable publish when the dedup cache already holds a real state for that head.
+
+**Durable follow-up.** The structurally stronger fix is a head-SHA-indexed run lookup, but `run.ListRunsFilter` carries no head-SHA field, so adding one touches `run/repository.go`, `run/postgres.go`, `queries.sql` and the sqlc-generated `db/` package — outside this change's scope. The App-identity discriminator is the shipped control.
+
+### What the tests pin
+
+Per-layer handler tests drive the REAL `republishOnPullRequestEvent` against a real `auditcheckpublisher.Publisher` over a recording forge fake and an `appIdentityGetterOverride` stub: foreign author → EXACTLY ONE neutral publish across all three actions; own-App author → ZERO; own-App sender → ZERO; unresolvable identity (`GetApp` errors, `GetUser` errors, GitHub entirely unwired) → ZERO in all three; `ListRuns` error → ZERO; malformed payload / empty PR URL / empty head SHA / unparseable repo / zero installation id → ZERO; and the unaffected-path pin, a PR WITH a run publishing its computed state and never the not-applicable conclusion.
+
+`TestWebhook_PullRequestActionRouting_NotApplicable` is the CROSS-BOUNDARY test: it POSTs a request the test signs itself, in-process, to the real `POST /webhooks/github` route, so signature verify → `webhook.ParseEvent` → the dispatch condition → the handler → the publisher → the forge fake all execute (no live forge, no live delivery). It is not redundant with the per-layer tests: with the dispatch narrowed back to `synchronize`, every per-layer test still PASSES and only this table goes red — the seam the units structurally cannot cover.
+
 ## Run-branch operator-vouch remediation (ADR-035 / #1044)
 
 `vouch.go::handleVouchCommit` — route
@@ -775,6 +808,27 @@ Mechanics:
   to BOTH the #858 report-boundary check (`verifyBranchLineage`) and
   the merge-resolution re-check (`ReverifyBranchLineage`) with no
   caller edits — un-wedging the run an operator commit had parked.
+- **Re-posts the `fishhawk_audit_complete` check at the vouched head
+  (E64.14 / #3109).** After the `operator_commit_vouched` entry is
+  durable, the handler calls
+  `checks.go::recomputeAndPublishAuditCompleteAtHead(runID, vouchedSHA)`,
+  which republishes the required Check Run AT the vouched commit via the
+  publisher's head override. This is load-bearing for the base-advance
+  wedge: an operator-pushed head appears in NO head-report audit category
+  (`fixup_pushed` / `child_pushed` / `pull_request_opened`), so the
+  publisher's normal `findHeadSHA` resolution would recompute correctly
+  and then publish against a STALE sha — leaving the check absent from
+  the merged head rather than red on it. The re-post is best-effort for
+  the vouch's success but its outcome is REPORTED on the response
+  (`audit_check_republished` / `audit_check_republish_warning`), NOT
+  swallowed — the merge reconciler's heal (`RepublishAuditCheck`) uses
+  the SAME operator-vouched-blind head resolution and so cannot retry it,
+  which is why the failure is surfaced and why re-invoking the vouch is
+  the sanctioned idempotent retry (the publisher's dedup cache records
+  only successes, so a re-vouch re-posts exactly the dropped check and
+  no-ops once it is live). The post-base-advance-conflict route is
+  therefore operator-resolve-then-vouch; a sanctioned rebase verb is
+  deferred to #3125.
 
 Invariants:
 
@@ -974,6 +1028,18 @@ The deploy record's `environment` label — the `environment` field of the KindD
 - **Best-effort, silent fallback.** A nil `ApprovalRepo`, a `ListForStage` error, an absent/unparseable spec, or a workflow/deploy stage the spec does not carry all return `""` and fall back — never an error. The label is a convenience surface; `external_run_url` + `outcome` remain the authoritative outcome fields.
 - **First-wins in the fallback is the #2218-characterized behavior**, retained deliberately: on a legacy duplicate-kind `allowed_environments` document the fallback reports the first entry. Selection across MULTIPLE deploy stages is now STAGE-SCOPED (#2642): the gate, the record, and the trigger each key on the deploy stage matching the stage row being acted on, so a second deploy stage gates and labels against its OWN `allowed_environments`, not the first stage's.
 
+## Fix-up delivered-nothing refund — one chokepoint (#3085)
+
+`fixup.go::fixupRefundedPasses(ctx, runID, stageID) (refunded, crashedWithoutPush int, err error)` is the SINGLE derivation behind the fix-up budget refund. It replaces the earlier `countFixupNoChangeRefunds` + `countFixupInfraRefunds` pair, whose independently **summed** counts double-counted a window holding more than one delivered-nothing signal, and it is called by BOTH `handleFixupStage` and the in-process campaign auto-driver (`autodrive.go::autoFixup`) so the two cannot disagree — the auto-driver previously counted only the #967 no-change refund and so already diverged from the HTTP handler by missing the #1957 category-C refund entirely.
+
+- **One question per window, not a sum.** Each `stage_fixup_triggered` entry opens a window `(trigger[i].Sequence, trigger[i+1].Sequence)` — open-ended (`math.MaxInt64`) for the newest. Exactly one question is asked per window: does it hold at least one DELIVERED-NOTHING signal and **no** `fixup_pushed` entry? A window refunds **at most once** however many signals of however many kinds land inside it. Window matching is STRICT on both sides (`sig > lo && sig < hi`), so a signal sequenced before the first trigger — an original-dispatch death, not a fix-up — matches no window.
+- **Four unioned signal shapes.** `fixup_no_changes` (#967 — the re-dispatch produced no commit; **not** a crash, the agent ran); `dispatch_reaper_failed` with `failure_category` `C` (#1957 — the #1747 pre-agent spawn-phase reaper death); `stage_fixup_recovered` with `source_failure_category` `C` (#1957 — the #788 post-agent-work death on the push/report); and `stage_fixup_recovered` with `source_failure_category` **`A`** (#3085 — the harness death: a 400, a zero-token hang). Category **B** (policy) still consumes a pass: it is a verdict on delivered work, not a delivery failure.
+- **Push veto, applied UNIFORMLY — a deliberate behaviour correction, not a refactor side effect.** A window holding a `fixup_pushed` entry contributes nothing: that pass DID land a commit and a later death does not undo the push. `countFixupInfraRefunds` documented exactly this invariant ("a category-C death that landed no commit on the PR branch") but never read `fixup_pushed` at all, so it did not enforce what it documented. **A category-C pass that pushed and then died now CONSUMES budget where it previously did not** — a real tightening of an operator-visible limit, pinned by its own test (`TestFixupStage_InfraRefund_CategoryCAfterPushNotRefunded`), not left incidental.
+- **`crashed_without_push`** counts the refunding windows whose delivered-nothing signal was a **death** (category A or category C), and deliberately EXCLUDES a window that refunded only on `fixup_no_changes` — that pass did not crash, the agent ran and produced nothing. It rides the `422 fixup_budget_exhausted` details alongside `max_passes`, `used` and `refunded_passes`, so an operator reaching for `force_additional_pass` can see whether they are overriding a real limit or a crash. The zero case is pinned by `TestFixupStage_BudgetExhaustedDetailsNameCrashedWithoutPush`.
+- **Every read FAILS CLOSED.** All five audit reads (`stage_fixup_triggered`, `fixup_no_changes`, `dispatch_reaper_failed`, `stage_fixup_recovered`, `fixup_pushed`) return a wrapped error → `500 internal_error` with NO state transition and NO `stage_fixup_triggered` entry. A read failure must never silently produce a smaller refund (wrongly refusing an admissible pass) or a smaller veto set (wrongly admitting one); the `fixup_pushed` read runs unconditionally rather than behind a no-signal early return for exactly that reason. Per-entry `StageID` double-checks keep another stage's signal out, and an entry whose payload fails to unmarshal is SKIPPED (never counted). One test per named read/skip branch (`TestFixupStage_RefundReadErrorsFailClosed`, `TestFixupStage_RefundSignalSkipBranches`).
+- **No refund widens the RAW ceiling.** `MaxPasses` is `defaultMaxFixupPasses + refunded`; `HardCeiling` stays `defaultFixupCeiling` counting RAW `stage_fixup_triggered` entries. Three triggers with three refunding windows still returns `fixup_ceiling_reached` (`TestFixupStage_RefundNeverExtendsRawCeiling`).
+- **The MCP `review_action_hint` mirrors the SAME single unioned per-window evaluation** (`mcpserver/review_action_hint.go::fixupRefundedPasses`), so `remaining_fixup_budget` / `override_available` agree with the backend's admit decision. A mirror that double-counts where the backend does not is worse than no mirror.
+
 ## Fix-up re-review backstop (#1932)
 
 Post-fix-up implement re-review is dispatched from `succeedFixupPushStage`'s path (`trace.go::maybeBackstopFixupReReview`) against the PUSHED head. **Since #2884 this is the PRIMARY path, not a backstop:** `trace.go::advanceStageAfterTrace` now SKIPS the trace-time review hook (the `#793` raw-variant gate) for any `push_fixup` manifest. That hook keyed on `bundle.ExtractHeadSHA` — the throwaway `fishhawk verify wip` verify sha, which the fix-up ships BEFORE the push and which may never reach the branch. On run 8ae65577 (PR #2883) it certified fixes against that orphan sha: `implement_review_started` recorded the verify sha, the review read the fixed code from the dangling commit, and the concern ledger marked all three routed concerns `addressed` — while the PR head carried none of it. Sourcing the re-review diff from `ComparePatch(base, pushedHead)` — the commit the PR will merge — is the fix. A manifest read error leaves the old trace-time dispatch (an older bundle without the flag is indistinguishable from a non-fix-up one; over-reviewing is the safe direction).
@@ -1002,6 +1068,12 @@ Post-fix-up implement re-review is dispatched from `succeedFixupPushStage`'s pat
   - **Deliberate non-coverage** of the MCP-client / operator-session / webhook-delivery capabilities (`liveTarget: false`). The plan artifact schema scopes `requires_live_validation` to a live forge/deploy/external target, "not merely an external trigger event, which `skip_expected` covers" — for those three, `skip_expected` with a basis is the doctrinally complete marking and no walk is owed, so demanding the marker would fire on correctly-authored criteria. Widening is a one-line `liveTarget` flip; the decision is recorded by a control test.
   - **No cross-rule suppression**: a wholly-unmarked live-target criterion draws exactly one finding from EACH rule (one per criterion per rule). Complementary, not redundant — `undecidable_criterion` says "declare it (either marking)", this rule says "the weaker marking will not suffice here" — and it avoids a two-step in which an author applies the weaker remedy and only then learns it was insufficient.
   - **M1's sandbox-marker negation is scoped to ONE CLAUSE**, not to the whole statement. A whole-statement negation is itself a false-NEGATIVE hole — any stray `fake`/`mock`/`preview` anywhere in a sentence disabled M1 even when the sentence named a genuine live target, recreating the defect the rule closes. So the statement is split at clause punctuation (`,` `;` `:` newline em/en-dash — `.` deliberately excluded, since splitting on it would cut the corpus phrase `against github.com` in half) and a clause carrying a liveTarget phrase and no stand-in **of its own** fires, however many stand-ins its neighbours mention.
+  - **POLARITY POST-FILTER (#3016, E32.48)** — a criterion that fired is SUPPRESSED only when BOTH conjuncts hold: **(P)** EVERY *anchor* in the statement carries a negation token within the SAME four-token `livenessProximityWindow` BEFORE it (the constant is REUSED, not redefined — no second bound, nothing widened, so the rule's suppression surface does not grow), and **(S)** the criterion's stated verification method — `verify_hint` and `expectation_basis` JOINED, never the statement — names an in-repository harness (`inRepoVerificationMarkers`: `_test.go`, `pgtest`, `httptest`, `go test`, `fake`, `stub`, …, deliberately NOT a reuse of `sandboxMarkers`, which is evidence about the acceptance executor's TARGET rather than about the criterion's verification method). The filter runs AFTER a matcher fired, so M1's clause-scoped negation and M2's three conjuncts are untouched.
+    - **An ANCHOR is the LIVENESS-BEARING token** (`liveTargetAnchors`): for M1, the head token of every `liveTarget` corpus-phrase occurrence, scanned over the WHOLE statement including clauses M1's own marker filter discarded; for M2, every liveness qualifier satisfying conjunct 1. **M2's external-target noun is deliberately NOT an anchor** — in "no real grooming run against this repo's backlog" the liveness claim is carried by `real … run`, while `repo`/`backlog` are bystander objects; requiring a negator adjacent to the object noun would demand phrasing no criterion writes, and the rule would suppress nothing.
+    - **#2845 is preserved BY THE CONJUNCTION, not by leaving the rule alone.** Conjunct S alone can NEVER suppress: a genuinely live-dependent criterion citing an in-repository basis ("validated by the httptest fake forge in `client_test.go`") has S true and P false and still fires. A single un-negated anchor makes P false, so a statement negating one live target while asserting another still fires (`TestMissingLiveValidationMarker_PartiallyNegatedStatementFires` pins EVERY-anchor, not ANY-anchor, semantics). An empty anchor set returns false — the fail direction is toward FIRING, but that claim is exact only for the FULLY-EMPTY set; see the mixed-case residual below.
+    - **The finding Detail is now conditional**: it keeps the #2845 remedy verbatim for a genuinely live-dependent criterion and APPENDS the counter-instruction that an in-sandbox ABSENCE assertion must NOT be marked, because marking it skips a criterion the sandbox can verify.
+    - **ACCEPTED MISFIRE, pinned not merely disclosed**: a negator inside the window but scoping a different constituent — "the resolver does **not** fail when the **live** forge lister is registered", where `not` sits at exactly distance 4 from the anchor — wrongly suppresses when an in-repository basis is also present. Distinguishing constituent scope needs parsing this word-list matcher deliberately does not do, and the rule is advisory, so the residual fails in the advisory-MISS direction. `TestMissingLiveValidationMarker_AcceptedNegationScopeMisfire` asserts the current behaviour on exactly that phrasing, so a later change to negation scoping is a visible test edit rather than silent drift.
+    - **ACCEPTED MIXED-CASE RESIDUAL, pinned not merely disclosed**: `liveTargetCorpusMatch` is a SUBSTRING test while `phraseHeadIndices` requires exact token-sequence equality, so a corpus phrase matching only inside a longer token ("github api" within "github **apis**") contributes NO anchor. When that is the ONLY live-target occurrence the anchor set is empty and the finding fires. But when it coexists with a NEGATED M2 qualifier-action anchor ("**no real dispatch** is attempted while the loader still calls the github apis") the anchor set is non-empty, every COUNTED anchor is negated, conjunct P holds, and an in-repository basis suppresses — despite the un-negated live-target occurrence. Closing it would mean anchoring on substring fragments inside unrelated words or dropping the substring matcher M1 has used since #2845, so the residual is accepted in the advisory-MISS direction and pinned by `TestMissingLiveValidationMarker_AcceptedSubstringAnchorMixedCase`, whose first assertion proves M1 really fires on the statement.
   - **Known residual**, stated rather than papered over: the clause-scoped negation rescues prose whose clause names its own stand-in ("the `github api` client retries in the **fake** transport test") but not a liveTarget phrase in sandbox-validatable prose with no marker at all ("the **deployed environment** config template is rendered"). The only narrowing that would suppress it also drops the true positive "the deployed environment serves the new endpoint", so the residual is pinned by a test instead. A corpus phrase straddling a clause boundary would also be missed; no corpus phrase has that shape.
 - **`all_criteria_skip_expected` (#3026, E32.50)** — the THIRD advisory rule on the same shared evaluator, and the only PLAN-LEVEL one. It fires when the plan declares at least one acceptance criterion and EVERY one is `skip_expected` with a non-whitespace `expectation_basis` — the shape under which the orchestrator short-circuits the acceptance stage straight to a `not_validated` verdict with no runner spawn and no preview, verifying ZERO criteria. Because the plan is already known AT APPROVAL TIME to skip acceptance entirely, the finding surfaces on the plan-review gate evidence where it can still be fixed, alongside `undecidable_criterion` and `missing_live_validation_marker`.
   - **ADVISORY — it never refuses a plan.** A change may genuinely have no in-sandbox observable (#2894 is the issue's own honest counter-example), so the rule exists to make the approver ask the question, not to ban the shape. The non-blocking outcome is asserted per refusing consumer: `TestShipPlan_AllCriteriaSkipExpected_IsAdvisoryNotARefusal` (the plan gate admits the plan, the stage reaches `awaiting_approval`, no failure category, the run is alive) and `refinement.TestEvaluateDraftCriteria_AllSkipShapedDraft_NotBlocked` (intake never marks the draft `needs_attention`).
@@ -1018,7 +1090,7 @@ The issue asked whether a zero-verification acceptance short-circuit could be mi
 - **The audit record was ALREADY discriminable post-#2347.** The recorded verdict/outcome is `not_validated`, never `accepted`, and it carries an `all-skip-with-basis` basis field no validator-shipped verdict ever sets. A reader keying on outcome or basis could already tell the two apart.
 - **The PR acceptance HEADLINE was ALREADY discriminable post-#2347.** `renderPRAcceptanceHeadline` gives `not_validated` its own sentence under a neutral ❓ icon ("not validated — 0 criteria verified"), deliberately not the generic `<icon> <outcome> (P/N criteria passed)` tally.
 - **The genuinely undistinguished surfaces were the PR MERGE-DECISION sentence and the PLAN GATE** — which is what this change fixes. `renderPRWhatNow` short-circuited on `run.State == succeeded` and printed "run complete — the PR is ready to merge", pre-empting the acceptance-derived arms entirely, so the one sentence a human reads before clicking merge said the PR was ready while zero criteria had been verified; and the plan gate said nothing at all about a shape that was already decided at approval time.
-- **The UPSTREAM mechanism pushing plans toward the all-skip shape is NOT changed here.** That mechanism is the `missing_live_validation_marker` remedy prescribed for a criterion asserting the ABSENCE of a forge call; it is tracked separately in **#3016**. Changing it here would risk regressing #2845, the inverse failure that rule exists to catch.
+- **The UPSTREAM mechanism pushing plans toward the all-skip shape WAS deferred here and is now FIXED in #3016 (E32.48).** That mechanism is the `missing_live_validation_marker` remedy prescribed for a criterion asserting the ABSENCE of a forge call — see the polarity post-filter above. #2845 is preserved not by leaving the rule alone but by the P-AND-S conjunction: an in-repository basis alone never suppresses, and one un-negated anchor still fires.
 - Advisory + fail-open throughout: nil repos, a `GetRun` error, no acceptance stage, or an unmarshal error each returns without blocking/unwinding the upload; an audit-append failure still returns the computed payload.
 - The returned payload threads into the plan-review prompt's `### Gate evidence` block (`planGateEvidence` → `prompt.AcceptancePrecheckEvidence`), where a finding inherits the machine-verified "recorded as a high-severity concern, named FIRST" contract. The plan artifact's criteria themselves also render in `writePlanForReview`, and five semantic checklist items (coverage, warrant-of-inferred, testability, independence, falsifiability) are appended to the `### Review criteria` block.
 - Audit-kind note in `docs/issue-comment-surfaces.md`.
@@ -1392,7 +1464,8 @@ The operator recovery action that re-admits ANY terminal-`failed` run for anothe
 `backend/internal/server/merge_run.go::handleMergeRun` (route `POST /v0/runs/{run_id}/merge`, MCP verb `fishhawk_merge_run`). The one-verb operator merge path: it records the operator's merge verdict as a chained `merge_verdict_recorded` audit entry (modeled on `vouch.go`) and queues the squash merge through the SAME `s.cfg.GateMerger` seam the delegated `may_merge` arm of `AutoDriveRunGate` dispatches through — extracted into the shared `dispatchAcceptanceGatedMerge` helper (`autodrive.go`), so the human merge and the delegated merge converge on one path by construction. The PR-approval review itself stays a `gh pr review --approve` step under the operator's own GitHub identity (the 2026-07-15 option-a decision; App-identity approval deferred to E39).
 
 - **Auth ladder** (operator-only, mirrors `vouch.go`): anonymous → `401`; a run-bound `mcp:run:<uuid>` token → `403 run_token_forbidden` (even for its own run — an agent self-merging its PR would bypass the operator gate); any identity missing `write:approvals` → `403 insufficient_scope`, enforced UNCONDITIONALLY (no cookie-session bypass, since the verb queues a real squash merge).
-- **Fail-closed guards, all BEFORE any write**: `404 run_not_found`; `409 run_not_mergeable` when the run has no PR url OR is `failed`/`cancelled`; `409 acceptance_gate_not_passed` when the acceptance gate is pending/failed/outcome-unknown or unreadable (ADR-049 decision #6 — passed / not-declared / skipped-out-of-scope proceed); `503 merge_seam_unconfigured` when `GateMerger` is nil. It deliberately does NOT block on a review stage parked at `awaiting_approval` — in `feature_change` that stage settles ON merge via `resolveReviewStageOnMerge`, so blocking would deadlock the human merge.
+- **Fail-closed guards, all BEFORE any write**: `404 run_not_found`; `409 run_not_mergeable` when the run has no PR url OR is `failed`/`cancelled`; `409 acceptance_gate_not_passed` when the acceptance gate is pending/failed/outcome-unknown or unreadable (ADR-049 decision #6 — passed / not-declared / skipped-out-of-scope proceed); `503 merge_seam_unconfigured` when `GateMerger` is nil; `409 merge_conflicting` when the PR has a merge conflict against its base. It deliberately does NOT block on a review stage parked at `awaiting_approval` — in `feature_change` that stage settles ON merge via `resolveReviewStageOnMerge`, so blocking would deadlock the human merge.
+- **Conflict precondition (E64.14 / #3109)**: `prMergeConflicting` runs AFTER the `GateMerger` guard and BEFORE the `merge_verdict_recorded` append (a durable verdict for a merge that structurally cannot queue is a false record). A conflicting PR can never fire GitHub's auto-merge, so queuing it would only time out at 360s with a message that says nothing about conflicts. The guard is BEST-EFFORT and FAIL-OPEN — it reuses the `lineage.go` resolution idiom (nil `GitHub`, nil/zero installation, unparseable repo/PR, or a `GetPullRequest` error all proceed) and refuses ONLY on an explicit forge signal: `MergeableState == "dirty"` OR a documented `Mergeable == false` (the `mergeable` boolean is kept load-bearing alongside the advisory `mergeable_state`, so the latter can never quietly become the only path). `mergeable_state` `blocked`/`behind`/`unstable`/`draft`/`unknown`/`""` and a `nil` `Mergeable` (GitHub's background mergeability job still running, returning JSON `null`) all proceed. Response `409 merge_conflicting` carries `details {run_id, pr_url, mergeable_state}`; the resolution path is operator-resolve-the-conflict-then-`vouch-commit`-then-re-merge (a rebase verb is deferred to #3125). GitLab MRs are NOT classified — the `forge.PullRequest` mergeability fields are zero on that adapter, so a conflicting GitLab MR falls through to today's queue-then-timeout behavior (`merge_status`/`detailed_merge_status` would be the GitLab signal).
 - **Endpoint-side idempotence** (binding condition, #1954): a repeated POST that finds an existing `merge_verdict_recorded` row appends NO duplicate and responds `already_recorded:true`, but ALWAYS re-dispatches the merge helper — so a `502`-then-reinvoke re-queues the merge without ever duplicating the verdict. On a merge-helper error the handler branches on the cause: a checks-not-all-passed refusal (`forge.ErrPullRequestUnstableStatus` — GitHub reports the PR in UNSTABLE status, E67.56 / #2717) returns `409 merge_checks_pending` (`details` `{verdict_sequence, pr_url, reason:"checks_pending"}`) — an expected precondition, not a fault, whose message says the required checks have NOT all passed, that an immediate retry cannot succeed, and that a check which has already FAILED means inspecting the PR rather than waiting; EVERY other error returns `502 merge_dispatch_failed` stating the verdict row is durable and the queue step is retryable, so a genuine dispatch failure is never masked as "just waiting". The verdict row is durable across a `merge_checks_pending` refusal, so `fishhawk_merge_run` re-POSTs across a bounded wait with no duplicate row. Response `{run_id, merge_queued, verdict_sequence, already_recorded, pr_url}`.
 - The endpoint does NOT wait for the merge to land: the merge only ENABLES/queues GitHub's merge, and the `pr_merged` / run-completion settle is left to the `pull_request`-closed webhook — the MCP `fishhawk_merge_run` tool awaits the terminal state client-side.
 - `merge_verdict_recorded` is registered in `audit.KnownCategories` and is an internal, non-comment audit kind (see `docs/issue-comment-surfaces.md`).
@@ -1597,6 +1670,11 @@ Stage-type gating in main.go: this whole chain only fires when the prompt respon
 - **Idempotent-replay terminal self-heal (#2630).** The dedup short-circuit (a `GetByHash` hit) already reuses `ensureGovernanceAuditEntry` (#1396) to backfill a missing `pull_request_opened` entry; it ALSO now drives `advanceImplementStageAfterPR` under EXACTLY the create path's guard — `stage.Type == implement && stage.State == running` — before writing the `200 idempotent:true`. Without this, a re-ship of an already-persisted artifact healed the audit entry but left a still-`running` implement stage un-terminalised: the terminal transition rode ONLY on the create-path PR-open event, so an idempotent-suppressed upload settled nothing (the #2630 amplifier that turned a sticky re-entry into a permanently stranded run). The guard keeps this safe WITHOUT re-running the create path's gating-reject and lineage checks, because both leave the stage terminally `failed` — never `running` — so a stage that failed either can never reach the advance. A replay against an already-terminal stage fails the running guard and is an unchanged no-op (no double transition; the second `Orchestrator.Advance` the gateless success path fires never runs). The response body is byte-unchanged.
   The body also accepts a `{outcome:"failed", category, reason}` failure-report variant that fails the stage instead.
 - On a base-rebase re-invoke ship the body additionally carries a `supplemental_scope_exemptions` delta (lowercase `{path,reason}` wire keys, matching `scopeExemptionEvidence`); `handleShipPullRequest` re-emits it as a supplemental `scope_files_exempted` audit row (#1218).
+- **`pr_body_fallback_reason` — the non-composed-PR-body signal (E52.30 / #3012).** An optional wire field naming WHY the shipped PR body is not the one the implement agent composed: `handoff_absent`, `handoff_unreadable`, `empty_file`, `empty_title`, `body_absent` (the runner's `prBodyReason` values — see `runner/cmd/fishhawk-runner/README.md` for the classification and the marker the runner also puts on the body). Omitted entirely on every composed ship, so a pre-#3012 body, content hash and signature is byte-identical.
+  - **It must be DECLARED, not merely tolerated.** `handleShipPullRequest` decodes with `DisallowUnknownFields`, so an undeclared runner key is a 400 AFTER the real pull request already exists on the forge — the #2562/#2563 stranding shape, strictly worse than the diagnostic it carries.
+  - **Normalized, never rejected.** `normalizePRBodyFallbackReason` maps the wire value onto the recorded set (`prBodyFallbackReasons` + `unknown`): empty stays empty, a member survives verbatim, anything else becomes `unknown`. `validate()` does NOT reject a non-member, for the same fail-open reason the `failed` arm does not reject a partial `push_checkpoint`: a 400 on an advisory diagnostic would strand the stage in `running`. The cost is fidelity across a runner/backend version skew — a sixth runner reason collapses to `unknown`, so an operator reading `unknown` should check the runner version rather than assume a further branch. The alternative, echoing an arbitrary agent-adjacent string into an append-only chained audit log, is the worse trade.
+  - **Mirrored, not shared.** `prBodyFallbackReasons` restates the runner's constants (the #1774/#2501 pattern — separate Go modules). Two shared wire goldens make a drift fail a test rather than ship: `testdata/wire/ordinary_pr_artifact.json` (the FIRST-ATTEMPT path the bug happened on, produced by the real `openPRAndShipArtifact` with no handoff present and POSTed here through the real `DisallowUnknownFields` + `validate()` handler) and `testdata/wire/held_commit_pr_artifact.json`. #2558 tracks the shared wire package that would make it compile-enforced.
+  - The normalized value is folded into the `pull_request_opened` audit payload under the same key, OMITTED when empty so every pre-#3012 payload is byte-identical.
   In the terminal-drive branch, before `advanceImplementStageAfterPR`, it also dispatches the ADR-042 / #1250 supplemental implement-review (`runSupplementalReinvokeReview`) against the pushed re-landed tree — a gating reject fails the stage category-B + closes the PR (#877 helper).
 
 #### Local-runner mode (E22.8 / #406) + CLI auto-PR (#422)
@@ -2012,6 +2090,12 @@ It covers evidence assembly (`releaseevidence`) → notes render (`releasenotes`
 - `POST /v0/campaigns/{id}/cancel` (E25.20 / #2355, scope `write:campaigns`; `handleCancelCampaign`): marks every **non-terminal** item `cancelled` then the campaign `cancelled`, so an abandoned/rebuilt campaign stops showing as live `running` work in `GET /v0/campaigns`. **Recovery contract — idempotent + convergent:** the N item transitions run before the campaign transition (which runs LAST), all state-guarded under the repo's `FOR UPDATE`, so a mid-loop failure leaves the campaign non-terminal and a re-invoke re-lists, skips the already-cancelled items, and completes the cancellation — a partial failure never strands a campaign half-cancelled (`TestCancelCampaign_PartialFailureConvergence`). It emits `campaign_cancelled` `{campaign_id,from,items_cancelled}` and **deliberately does NOT cancel the linked RUNS** — a run in flight keeps running; `fishhawk_cancel_run` / `POST /v0/runs/{id}/cancel` owns run cancellation (`TestCancelCampaign_LeavesLinkedRunsUntouched`). `campaign_not_cancellable`/409 for an already-terminal campaign; the nil-repo 503 guard precedes the `write:campaigns` check.
 - Gate codes on create: `repo_not_installed`/`campaign_dangling_dependency`/422, `validation_failed`/400 (bad ref or dependency cycle). The `campaign_dangling_dependency` details map carries a per-cause key set the fishhawk-mcp remedy renderer branches on: `dangling_not_child` (open out-of-set target), `dangling_excluded_incomplete` (#2120), and — added #2953 — `dangling_closed_incomplete` (a target closed WITHOUT completing; no widen remedy) and `dangling_state_unreadable` (an unreadable target; retry).
 - **Satisfied-dependency elision on create (#2953):** a `depends_on` target OUTSIDE the assembled set that is already **closed-and-completed** is NOT dangling — the provider records it in `EpicChildrenResult.SatisfiedEdges`, `campaign.Assemble` carries it onto `Assembly.SatisfiedDependencies`, and `handleCreateCampaign` renders it into the 201 response's **create-response-only** `satisfied_dependencies` block (`[{from,to,state,state_reason}]`, `omitempty`, NOT persisted — GET/list/status omit it) plus a best-effort `campaign_dependency_elided` audit (`{campaign_id,repo,elided}`), emitted only when at least one edge was elided. So a batch whose prerequisite already landed assembles instead of refusing, and an operator can tell "this dependency is done" from "this dependency was ignored".
+- **Issue-set resolution budget + `504 issue_set_resolution_timeout` (E54.59 / #3113).** The no-epic branch costs ONE forge round-trip per named item (plus one per distinct out-of-set `depends_on` target), so a full ratified grooming order can run for minutes. Before #3113 this path had **no server-side deadline at all** — `server.go` sets `ReadHeaderTimeout` only, no `WriteTimeout`, no `TimeoutHandler` — so the caller's own client timeout was what gave up, producing a bare transport error carrying no counts. (#3113's original Summary diagnosed a server-side 30s deadline on this path; that diagnosis was wrong.)
+  - `Config.IssueSetResolutionBudget` bounds it; `issueSetResolutionBudget()` resolves the effective value at the READ site — non-positive → `DefaultIssueSetResolutionBudget` (120s), above `MaxIssueSetResolutionBudget` (10m) → **clamped** to that maximum. The clamp is at the read site, not only in `fishhawkd`'s flag handling, because a startup refusal in one entry point is not a construction-level guarantee: `server.Config` is exported and any caller can build it. Clamping where the value is CONSUMED makes "the effective budget never exceeds `MaxIssueSetResolutionBudget`" hold however the Config was built, which is what the MCP client's issue-set request timeout is pinned above. `fishhawkd` ADDITIONALLY refuses an over-maximum or negative value at startup naming both numbers, so an operator who asked for more is told rather than silently clamped.
+  - The deadline is anchored at **handler entry** (`requestStart`), not at the resolver call. The client's timeout measures the ENTIRE request, so a budget starting at the resolver call would leave the pre-resolution work — auth, decode, provider resolution, grooming-order resolution, installation lookup — outside the measured span and unbounded, and the client could still abort first. Anchoring at handler entry folds that work into the bounded span, where the unbounded per-item forge cost lives. It is **NOT** a literal "same span" guarantee, and the code comment says so honestly: the server bounds only `[handler entry .. resolver return]`, while the client's 11-minute wall also covers **(a)** network transit both directions, **(b)** the middleware chain ahead of the handler, and **(c)** all post-resolution handler work (campaign + item persistence, idempotency record, response encode + write). The one-minute margin must absorb (a)+(b)+(c); it is adequate for (c) because that is local DB writes on an already-open pool plus a small JSON encode, not per-item forge round-trips — an **argued** margin, not a constructed one. The handler is deliberately **not** wrapped in a deadline: aborting after a resolution that already succeeded would discard up to ten minutes of completed forge reads to report a timeout for finished work — strictly worse.
+  - `*workmgmt.IssueSetResolutionTimeout` is matched (via `errors.As`) BEFORE the generic arm and surfaces `504 issue_set_resolution_timeout` with `details` `{resolved, items_total, budget_seconds}` plus `suggested_grooming_order_limit` **only when a limit could be PROVEN to fit** (omitted, never sent as 0). Any other resolver error keeps today's `502 issue_set_resolution_failed` byte-for-byte.
+  - A 504 is a 5xx, so those four keys are members of `redactableDetailKeys` (see the redaction section above). Without them the default-deny redactor strips exactly the numbers the refusal is made of and the operator receives an empty body — the coupling that makes `errors.go` load-bearing here, pinned by `TestRedactableDetailKeys_AdmitsIssueSetTimeoutCounts` and by the 504 detail assertions in `campaigns_test.go`, which read the SHIPPED body.
+  - The **epic branch is deliberately unbounded by this budget**: `EpicChildren` reads the sibling set in one `ListSubIssues` call, so it never had the per-item cost. `TestCreateCampaign_EpicPath_NoIssueSetBudget` pins that the epic sweep's context carries no deadline.
 - NO request idempotency on create (no `idempotency_key` column; an `Idempotency-Key` header is accepted but not enforced — deferred).
 - Source of truth `docs/api/v0.openapi.yaml`; companion `docs/api/v0.md`.
 
@@ -3067,6 +3151,108 @@ positive `TestDowngrade_SurvivingUndecidableOutsideRetirement_RecordsUndecidable
 and is present whenever the two differ, for either reason; `downgrade_basis` and
 `retired_criterion_ids` stay gated on an actual retirement.
 
+### Head binding: the consolidated fan-in fallback and the unbound-head clamp (#3091)
+
+An acceptance verdict is only meaningful if it names the tree it validated. Two
+holes let a `passed` be recorded with `head_sha: ""`, and both are closed here.
+
+**Why a decomposed parent resolved no head at all.** `resolveNewestReportedHeadSHA`
+(and therefore `resolveAcceptanceExpectedHeadSHA`) reads the run's OWN
+reported-head ledger — `pull_request_opened` / `child_pushed` / `fixup_pushed`.
+A DECOMPOSED PARENT writes NONE of them on its own chain: each child's push
+lands on the CHILD's chain (see the decomposition-awareness note on
+`buildReportedHeadLedger`), and the consolidated PR is opened by
+`orchestrator.maybeOpenConsolidatedPR`, whose `consolidated_pr_opened` payload
+carries a `pull_request_url` and no SHA. So the ledger answered `""`, the
+acceptance-admission endpoint shipped an empty `expected_head_sha`, and the
+dispatch gates warned-and-proceeded.
+
+`resolveConsolidatedFanInHeadSHA` supplies the missing head from the parent's own
+`integration_commit_recorded` entries (`lineageIntegrationCommitCategory`, #1806):
+the fan-in emits one per "Integrate slice N" merge the instant it is created, and
+each such merge commit becomes the consolidated branch tip, so the
+highest-SEQUENCE `merge_sha` IS the consolidated head. Ordering is by sequence,
+not timestamp — the fan-in writes these within one pass, and the dispatch-anchored
+caller compares against a sequence anchor.
+
+Three properties are deliberate:
+
+- **Strictly SUBORDINATE.** `acceptanceHeadForRun` returns the reported head
+  verbatim whenever one resolves; the fallback fires only on `""`. A
+  non-decomposed run's answer is byte-identical to before
+  (`TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins`).
+- **ACCEPTANCE-ONLY.** `lineageLedgerCategories` and
+  `auditcomplete.HeadReportCategoriesByPrecedence` are NOT widened — they are
+  shared with the branch-lineage guard and the audit-check publisher, and
+  widening them would silently change head resolution for surfaces this has
+  nothing to do with. `resolveFixupExpectedHeadSHA` is unaffected
+  (`TestResolveFixupExpectedHeadSHA_UnaffectedByIntegrationEntry`).
+- **DISPATCH-SEQUENCE-BOUNDED on the validated-head path.**
+  `acceptanceValidatedHeadSHA` applies the fallback with `bounded=true` against
+  the same `dispatchSeq` anchor its reported-head walk uses, so a fan-in merge
+  recorded AFTER the acceptance dispatch can never re-bind the verdict to a tree
+  the stage did not validate
+  (`TestShipAcceptance_PostDispatchIntegrationCommitDoesNotBind`).
+
+**The unbound-head clamp.** Resolution can still legitimately answer `""` — a
+bare operator ship with no `acceptance_dispatched` anchor, an unreadable ledger,
+a fan-in that recorded no merge. `handleShipAcceptance` therefore runs one final
+rewrite after the #2581 retirement downgrade and the #2512 row aggregation: when
+`validatedHead == ""` the recorded verdict is raised through the SAME
+severity-monotone `acceptanceVerdictAtLeast` ladder to `undecidable`, and
+`undecidable_basis: head_unresolved` is attached to the
+`acceptance_outcome_recorded` payload.
+
+- **Ladder position and DIRECTION.** `passed (0) < undecidable (1) < failed (2)`.
+  Because the clamp is a `max` against `undecidable`, a shipped `failed` can
+  never be softened — that is a property of the operation, not of a branch that
+  could be inverted. Pinned in both directions by
+  `TestShipAcceptance_EmptyHead_PassClampedToUndecidable` and
+  `TestShipAcceptance_EmptyHead_FailedNotSoftened`.
+- **It runs LAST** because an unbound head invalidates whatever the row
+  aggregation concluded about the tree.
+- **It applies to EVERY unbound ship, a #2581 retirement neutralization
+  INCLUDED (#3124).** Retirement and the unbound-head clamp are orthogonal:
+  retirement decides WHICH CRITERIA COUNT, an unresolvable validated head means
+  no tree is named AT ALL — so a neutralized pass on an unbound head is no more
+  anchored to a validated commit than any other pass, and is raised to
+  `undecidable` too. The direction stays safe by construction: the `max` ladder
+  can only lift the neutralized `passed (0)` to `undecidable (1)`, which is
+  strictly LESS soft than the `passed (0)` retirement itself produced from the
+  shipped `failed (2)`, so nothing is softened. The operator's decision stays
+  fully visible on the clamped payload via `downgrade_basis` /
+  `retired_criterion_ids` / `verdict_reported`, and triage routing is unchanged —
+  it stays keyed on the AGENT's shipped `failed` claim plus the downgrade, so a
+  neutralized-then-clamped outcome still routes no triage. Pinned by
+  `TestShipAcceptance_EmptyHead_RetirementNeutralizedPassClamped` (the clamped
+  arm) and its resolvable-head sibling
+  `TestShipAcceptance_RetiredOnlyFailure_RecordedPassed` (which proves an
+  ordinary retirement WITH a bound head still records the neutralized `passed`
+  exactly as #2581 requires). `TestE2E_AmendAcceptanceCriteria_RetiredAtApproval_...`
+  in `backend/internal/integration/mcp` pins the resolvable-head retirement arm
+  end to end (it seeds a validated head + dispatch anchor precisely so the clamp
+  does not fire there).
+- **The basis is attached only when the clamp rewrote the verdict,** so a shipped
+  `failed` on an unbound head carries no `undecidable_basis` it did not earn.
+- **`undecidable_basis` is its own key,** distinct from the #2581
+  `downgrade_basis`, which keeps its retirement meaning; both are omitted when
+  they did not fire, so an outcome with a resolvable head marshals
+  byte-identically to before. `effectiveVerdict` is recomputed AFTER the clamp,
+  so `verdict_reported` carries the agent's shipped verdict on a clamped outcome.
+- **No new downstream state.** `undecidable` already maps to the
+  `undecidable` render vocabulary, routes no triage (#2512), and is
+  merge-eligible-with-acknowledgement — so the operator-visible change is that an
+  unbound run must be acknowledged at the merge gate instead of reading
+  "accepted".
+
+**Both dispatch gates now fail CLOSED on an unresolvable expectation.** The
+verb-side gate (`backend/internal/mcpserver/acceptance_target.go`) refuses with
+`acceptance_expected_head_unresolved` BEFORE its `FISHHAWK_ACCEPTANCE_PREVIEW_CMD`
+proceed branch (a provision command cannot provision an unknown head), and the
+runner's `acceptanceTargetGate` fails the stage category-C with the same reason
+before provisioning. A refused acceptance is recoverable in seconds; an
+unfalsifiable `passed` is not recoverable at all.
+
 **`undecidable` is SERVER-DERIVED and UNFORGEABLE.** The ship endpoint's
 top-level verdict enum still admits only `passed`/`failed` — that switch is
 deliberately INCOMPLETE with respect to the `acceptanceVerdict*` constant set, and
@@ -3271,6 +3457,23 @@ on a bare `ServeMux` 404 with no explanation. (The companion `GET /favicon.ico
 | `no_membership_resolver` | `Config.AuthMembership == nil` | The login gate has no membership resolver wired, so EVERY sign-in is denied. A **deployment-configuration** fault, not a per-user one; the remedy is wiring the database and the workspace profile. |
 | `no_admitting_account` | `len(accountIDs) == 0` | No workspace account admits this login — no invited membership, no auto-join match. Remedies: `FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY`, or an admin invite. |
 
+On the `no_admitting_account` branch the callback ALSO logs
+`oauth sign-in denied: no admitting account` at Info naming, beside the
+authenticated `login`, the **configured** single-tenant profile
+(`configured_provider` / `configured_account_key` / `configured_granularity`),
+read from `Config.SingleTenantProfile` (#2468). That field is threaded from the
+`FISHHAWKD_SINGLE_TENANT_*` flags in serve.go and is **diagnostic only**: it is
+read on this one denial branch and NOWHERE else — never an admission input,
+never consulted by the membership resolver, and never disclosed to the browser
+(the redirect, its reason code, and the rendered page are unchanged). It reports
+the RESOLVED profile (`SingleTenantConfig.Resolved()`) so an operator who left
+granularity empty sees `enterprise`, the value admission actually uses, and the
+fields are emitted ONLY when `SingleTenantProfile.Enabled()` — an unconfigured
+profile logs a single `single_tenant_profile=unconfigured` marker with no empty
+placeholders. This makes the two first-boot foot-guns (a byte-exact account-key
+casing mismatch; a personal-namespace install left on the default `enterprise`
+granularity) diagnosable from one server-side log line.
+
 Absent or unrecognized → the generic body naming both remedies. `reason` is
 matched by `parseAccessDeniedReason`, a **closed allow-list, not a
 passthrough**: the value arrives on the query string of a public,
@@ -3344,3 +3547,48 @@ so an operator-configured target keeps its own parameters. `url.Values.Set`
 returns the FIRST, so an operator-set `reason` would shadow the branch code and
 the page would name the wrong denial — precisely the failure this change exists
 to fix.
+
+## Merge-supersede sweep + `reconcile-merge` recovery (`merge_supersede.go`, E64.2 / #3083)
+
+A merge can leave a stage parked in a state nothing will ever re-dispatch — a fix-up pass re-parks `acceptance` at `awaiting_host_dispatch`, or the human `review` gate is still `awaiting_approval` when the PR merges. `Orchestrator.completeRun`'s #968 guard then CORRECTLY refuses to stamp the run `succeeded` around a non-terminal stage, and every pre-existing escape hatch records something untrue: `reap_stage` writes `failed` for work that was never attempted, `cancel_run` writes `cancelled` for a change that shipped, and re-dispatching acceptance runs the agent against a preview bound to a commit that is no longer the change.
+
+`superseded` (the state itself lives in `backend/internal/run`) records the fact instead: the merge made the stage UNREACHABLE. It is terminal, so the #968 guard passes it — which is exactly why what may enter it is bounded.
+
+### The sweep primitive
+
+`supersedeParkedStagesOnMerge(ctx, runID, skipStageID, reason)` is THE shared primitive. Both writers call it — the operator recovery endpoint here and the automatic merged-path invocation in `pullrequest_review_events.go` — so the two can never disagree about which stages a merge may terminalize.
+
+Four properties carry the design:
+
+- **DEFAULT DENY, and type-aware.** Admission is `run.MergeSupersedable(stageType, state)` — a `(stage_type, state)` pair table with exactly two rows. A state-only allow-list would admit a `pending` plan stage and complete a run `succeeded` around work never planned, defeating precisely the invariant #968 protects. The table is ALSO enforced at the repository transition boundary (`run/postgres.go` consults it with the ROW-LOCKED stage's own `stage_type`), so it is not advisory guidance a caller reaching the repository directly could bypass.
+- **Compare-and-swap, not a bare transition.** The move goes through `run.StageCASTransitioner.TransitionStageFrom` pinned to the state the sweep classified, closing the classify→transition race atomically under the stage row lock: a concurrent writer that re-parks or fails the stage in that window is refused with a typed `run.StageStateChangedError` instead of having its state destroyed. The capability is REQUIRED, not optional — a repository without it sweeps NOTHING rather than degrading to the non-CAS `TransitionStage`, mirroring `reap_failure.go`'s refusal (#2672).
+- **TRANSITION FIRST, THEN AUDIT.** The chain is append-only, so a `stage_superseded_by_merge` row written before a CAS that then refuses would be an IMMUTABLE record of a supersession that never happened. The failure mode must be a MISSING row, never a false one. `TestSupersedeParkedStages_NoAuditRowWhenCASRefuses` seeds the premise mismatch by construction (a stale stage snapshot against a moved DB row) and asserts ZERO rows.
+- **Best-effort throughout.** Every failure warn-logs and the sweep continues; it never returns an error, because both callers are tails on a merge resolution that has already committed and must not be unwound.
+
+`skipStageID` exempts the caller's own stage. It is genuinely load-bearing at the primitive: `review@awaiting_approval` is itself a pair-table row, so a caller that resolves the review stage itself must hand its id in or the sweep would race the transition that caller owns (`TestSupersedeParkedStages_SkipStageIDIsHonored`).
+
+### `POST /v0/runs/{run_id}/reconcile-merge`
+
+The operator recovery verb. `memberWrite` (an operator-decision write, not a destructive one — the merged-PR precondition and the pair table bound what it can do). Refusals, all evaluated BEFORE any write so a refused reconcile moves zero stages and writes zero rows:
+
+| status | code | condition |
+| --- | --- | --- |
+| 400 | `validation_failed` | non-UUID `run_id` |
+| 503 | `reconcile_merge_unconfigured` | run/audit repositories unwired |
+| 404 | `run_not_found` | — |
+| 409 | `reconcile_merge_pr_not_merged` | no `pr_merged` / `post_merge_observed` / `merge_observation_recorded` entry on the run's chain (the third is the row `POST /v0/runs/{run_id}/record-merge-observation` appends after a live `merged=true` forge read, E64.32 / #3136) |
+| 409 | `reconcile_merge_not_applicable` | no pair-table-admissible parked stage AND no already-superseded stage to repair |
+
+The merged-PR precondition is what stops the verb manufacturing a `succeeded` run for a change that never shipped; a chain-read failure is a 500, never a write (fail closed on unknown evidence).
+
+**Idempotent, and self-repairing.** A second POST finds the stage already `superseded` — not a pair-table state — moves nothing, and returns 200 with two empty lists. The **repair scan** closes the missing-row window the transition-first ordering deliberately allows: a stage that is `superseded` but carries no audit row (a sweep whose CAS committed and whose append then failed) gets a row back with reason `repair`, transitioning nothing. That scan compares against a **PRE-sweep** snapshot of the chain, which is exactly why the same-invocation exclusion is load-bearing rather than decorative: without it the stages this very invocation moved would look un-recorded and draw a SECOND row. `TestReconcileMerge_ExactlyOneAuditRowPerSweptStage` asserts EXACTLY one row per swept stage across two sequential POSTs, not at-least-one.
+
+After the sweep the handler re-runs `advanceRunAfterReviewResolve`, so the now-all-terminal stage set routes through `completeRun` on the same request.
+
+### `completion_blocked` on `GET /v0/runs/{id}`
+
+The read half (`runs.go`'s `completionBlockedForRun`). Populated on the single-run read ONLY — the same best-effort posture as `Concerns` / `DerivedStatus` / `SliceDependsOn`, so the list endpoint pays no per-row stage + audit reads — and `omitempty`, so every unblocked run keeps a byte-identical response.
+
+It names the **lowest-sequence** non-terminal stage (the run's own order, so the answer is stable and names the stage an operator reaches for first) and DISCRIMINATES the recovery: `reconcile-merge` ONLY when the blocker is pair-table-admissible AND the run's PR is observably merged — the endpoint's own preconditions, read through the same helper, so the surface and the verb cannot disagree — and `none` otherwise, with `reason` naming the state. Pointing an operator at a verb guaranteed to refuse is #3083's own complaint about `merge_run`.
+
+A merge-evidence read failure does NOT omit the field: it degrades `recovery` to `none` (fail closed — never advertise a verb we cannot confirm would work) and still names the blocking stage, the half of the answer that does not depend on the chain.

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -5390,8 +5392,316 @@ func TestShippedSpecDeclaresWorkflowV2(t *testing.T) {
 			"  - backend/internal/spec/v2reuse_test.go (TestParseV2_VersionGate_ReuseKeysRejectedBelowMajor2 doc comment)\n"+
 			"  - cli/internal/spec/v2reuse_test.go (TestValidateV2_VersionGate_ReuseKeysRejectedBelowMajor2 doc comment)\n"+
 			"  - docs/spec/README.md (the \"Validating locally\" check-jsonschema block — the spec must be listed under the command for the major it declares)\n"+
-			"  - docs/spec/workflow-migration.md (the operator-walk record)",
+			"  - docs/spec/workflow-migration.md (the operator-walk record)\n"+
+			"  - backend/internal/spec/spec_test.go (TestSpecReadmeListsShippedSpecUnderDeclaredMajor — the sibling pin on the DOCUMENTED COMMAND, #3013)",
 			shippedSpecRelPath, s.Version, want)
+	}
+}
+
+// shippedSpecDocPath is the check-jsonschema argument under which
+// docs/spec/README.md lists this repo's own governing spec.
+const shippedSpecDocPath = ".fishhawk/workflows.yaml"
+
+// specReadmeRelPath reaches docs/spec/README.md from backend/internal/spec,
+// by the same relative-path convention shippedSpecRelPath uses for the spec.
+const specReadmeRelPath = "../../../docs/spec/README.md"
+
+// checkJSONSchemaBlock is one `check-jsonschema --schemafile
+// docs/spec/workflow-vN.schema.json ...` invocation parsed out of a markdown
+// document: the workflow major N and the accumulated positional/flag arguments
+// (across trailing-backslash shell continuations).
+type checkJSONSchemaBlock struct {
+	Major int
+	Args  []string
+}
+
+// cjsBlockStartRE matches the start line of a workflow-vN check-jsonschema
+// invocation, capturing the major and whatever trails on the same line. It
+// tolerates a leading pipeline segment ("| check-jsonschema ...", the real
+// doc's --emit-resolved form) because it matches the substring, not the line
+// start.
+var cjsBlockStartRE = regexp.MustCompile(`check-jsonschema --schemafile docs/spec/workflow-v(\d+)\.schema\.json(.*)$`)
+
+// checkJSONSchemaBlocks is the PURE, side-effect-free scanner (#3013). It walks
+// markdown line by line, skips lines whose trimmed form starts with '#' (the
+// "Validating locally" block explains WHY .fishhawk/workflows.yaml is listed
+// under v2 in leading-'#' comments that mention the path twice — those must not
+// be read as command arguments), starts a block on a workflow-vN
+// --schemafile line (capturing the major and any same-line trailing args), and
+// accumulates arguments across trailing-backslash continuations until the first
+// line not ending in a backslash. Purity lets the failure-mode table exercise
+// each parsing branch on synthetic markdown without touching the shipped doc.
+func checkJSONSchemaBlocks(md string) []checkJSONSchemaBlock {
+	var blocks []checkJSONSchemaBlock
+	lines := strings.Split(md, "\n")
+	i := 0
+	appendArgs := func(blk *checkJSONSchemaBlock, s string) {
+		s = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(s), `\`))
+		blk.Args = append(blk.Args, strings.Fields(s)...)
+	}
+	for i < len(lines) {
+		line := lines[i]
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			i++
+			continue
+		}
+		m := cjsBlockStartRE.FindStringSubmatch(line)
+		if m == nil {
+			i++
+			continue
+		}
+		major, _ := strconv.Atoi(m[1])
+		blk := checkJSONSchemaBlock{Major: major}
+		appendArgs(&blk, m[2])
+		cont := strings.HasSuffix(strings.TrimSpace(line), `\`)
+		i++
+		for cont && i < len(lines) {
+			cl := strings.TrimSpace(lines[i])
+			cont = strings.HasSuffix(cl, `\`)
+			appendArgs(&blk, cl)
+			i++
+		}
+		blocks = append(blocks, blk)
+	}
+	return blocks
+}
+
+// shippedSpecListingMajors returns the workflow majors of the blocks that carry
+// the shipped-spec path as an argument.
+func shippedSpecListingMajors(blocks []checkJSONSchemaBlock) []int {
+	var majors []int
+	for _, b := range blocks {
+		for _, a := range b.Args {
+			if a == shippedSpecDocPath {
+				majors = append(majors, b.Major)
+				break
+			}
+		}
+	}
+	return majors
+}
+
+// validateShippedSpecListing is the PURE assertion logic behind the fact-pin,
+// returning a DISTINCT error per failure mode so the failure-mode table can
+// assert error IDENTITY and give each guard — especially the anti-vacuity
+// zero-blocks guard — a clean counterfactual: deleting the guard changes the
+// returned message, reddening exactly the case that asserts that message.
+func validateShippedSpecListing(md string, declaredMajor int) error {
+	blocks := checkJSONSchemaBlocks(md)
+	if len(blocks) == 0 {
+		// Anti-vacuity guard: a doc restructure that removes or reshapes the
+		// commands must fail LOUD, never silently pass having scanned nothing.
+		return fmt.Errorf("anti-vacuity: found no check-jsonschema workflow-vN invocations")
+	}
+	pathMajors := shippedSpecListingMajors(blocks)
+	if len(pathMajors) != 1 {
+		return fmt.Errorf("%s is listed under %d check-jsonschema blocks %v, want exactly one", shippedSpecDocPath, len(pathMajors), pathMajors)
+	}
+	if pathMajors[0] != declaredMajor {
+		return fmt.Errorf("%s is listed under the workflow-v%d command but the spec declares major v%d", shippedSpecDocPath, pathMajors[0], declaredMajor)
+	}
+	return nil
+}
+
+// assertShippedSpecListedUnderDeclaredMajor is the extracted assertion body
+// (approval condition 2, #3013): the fact-pin calls it with the REAL README,
+// and TestValidateShippedSpecListing_FailureModes calls the pure
+// validateShippedSpecListing it wraps with synthetic markdown, so the RED a
+// deleted guard produces is genuinely this assertion's and not an unrelated
+// pure-scanner case's. On failure it NAMES every prose site to correct.
+func assertShippedSpecListedUnderDeclaredMajor(t *testing.T, readmeMD string, declaredMajor int) {
+	t.Helper()
+	if err := validateShippedSpecListing(readmeMD, declaredMajor); err != nil {
+		t.Fatalf("%v.\nIf the spec's declared major or the documented command changed, correct every prose site:\n"+
+			"  - docs/spec/README.md (the \"Validating locally\" check-jsonschema block AND its explanatory comments)\n"+
+			"  - docs/spec/workflow-migration.md (the operator-walk record)\n"+
+			"  - backend/internal/spec/README.md (the shipped-spec prose fact-pins section)\n"+
+			"  - backend/internal/spec/spec_test.go (TestShippedSpecDeclaresWorkflowV2 and this test)", err)
+	}
+}
+
+// TestSpecReadmeListsShippedSpecUnderDeclaredMajor is the #3013 fact-pin: it
+// makes instance 1 (a documented command that drifted from the spec it
+// validates) IMPOSSIBLE rather than merely flagged. It reads the REAL
+// docs/spec/README.md and the REAL .fishhawk/workflows.yaml and asserts the
+// shipped spec is listed under EXACTLY ONE check-jsonschema command whose
+// workflow major equals the major the spec declares. It also DEFENDS the
+// whole-document scan (approval condition 1) by pinning the block count the
+// real doc produces, so a newly added invocation is a deliberate test update
+// rather than a surprise change to the exactly-one arithmetic.
+func TestSpecReadmeListsShippedSpecUnderDeclaredMajor(t *testing.T) {
+	readme, err := os.ReadFile(specReadmeRelPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", specReadmeRelPath, err)
+	}
+	raw, err := os.ReadFile(shippedSpecRelPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", shippedSpecRelPath, err)
+	}
+	s, err := spec.ParseBytes(raw)
+	if err != nil {
+		t.Fatalf("ParseBytes(%s): %v", shippedSpecRelPath, err)
+	}
+	declaredMajor := spec.VersionMajor(s.Version)
+
+	assertShippedSpecListedUnderDeclaredMajor(t, string(readme), declaredMajor)
+
+	// Whole-document-scan defense (condition 1): FOUR workflow-vN invocations
+	// exist today — v0, v1, v2 (all in the "Validating locally" fence), and a
+	// SECOND v2 inside the `fishhawk validate --emit-resolved ... | check-jsonschema`
+	// pipeline. Only the plain v2 block lists .fishhawk/workflows.yaml, so the
+	// exactly-one assertion above holds; pinning the count makes a fifth
+	// invocation a deliberate test update.
+	const wantBlocks = 4
+	if got := len(checkJSONSchemaBlocks(string(readme))); got != wantBlocks {
+		t.Errorf("docs/spec/README.md now has %d workflow-vN check-jsonschema invocations, want %d; a new invocation is a deliberate test update (condition 1, #3013)", got, wantBlocks)
+	}
+}
+
+// TestCheckJSONSchemaBlocks_FailureModes exercises each named parsing branch of
+// the pure scanner on SYNTHETIC markdown (#3013 plan step 6), so the pin's
+// discrimination is proved without mutating a shipped file.
+func TestCheckJSONSchemaBlocks_FailureModes(t *testing.T) {
+	// (e) reproduces the real doc's v2 block AND its --emit-resolved pipeline
+	// block VERBATIM (approval condition 1 / fable-5's ask) so the control
+	// certifies the exact shape the fact-pin depends on.
+	const realShapeControl = "check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \\\n" +
+		"    docs/spec/examples/workflow-v2-backlog-grooming.yaml \\\n" +
+		"    docs/spec/examples/workflow-v2-milestone-scoping.yaml \\\n" +
+		"    .fishhawk/workflows.yaml\n" +
+		"\n" +
+		"fishhawk validate --emit-resolved docs/spec/examples/workflow-v2-reuse.yaml \\\n" +
+		"    | check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \\\n" +
+		"        --default-filetype yaml -\n"
+
+	cases := []struct {
+		name          string
+		md            string
+		wantBlocks    int
+		wantPathCount int   // blocks carrying .fishhawk/workflows.yaml
+		wantPathMajor []int // majors of the path-carrying blocks (in order)
+	}{
+		{
+			name: "a_wrong_major_v1_carries_path",
+			md: "check-jsonschema --schemafile docs/spec/workflow-v1.schema.json \\\n" +
+				"    .fishhawk/workflows.yaml\n",
+			wantBlocks:    1,
+			wantPathCount: 1,
+			wantPathMajor: []int{1},
+		},
+		{
+			name:          "b_no_invocation_zero_blocks",
+			md:            "Some prose about validating, with no check-jsonschema command at all.\n",
+			wantBlocks:    0,
+			wantPathCount: 0,
+		},
+		{
+			name: "c_path_under_two_majors",
+			md: "check-jsonschema --schemafile docs/spec/workflow-v1.schema.json \\\n" +
+				"    .fishhawk/workflows.yaml\n\n" +
+				"check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \\\n" +
+				"    .fishhawk/workflows.yaml\n",
+			wantBlocks:    2,
+			wantPathCount: 2,
+			wantPathMajor: []int{1, 2},
+		},
+		{
+			name: "d_path_only_in_comment_not_an_arg",
+			md: "# .fishhawk/workflows.yaml is listed under the v2 command below\n" +
+				"check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \\\n" +
+				"    docs/spec/examples/workflow-v2-backlog-grooming.yaml\n",
+			wantBlocks:    1,
+			wantPathCount: 0,
+		},
+		{
+			name:          "e_real_doc_shape_control",
+			md:            realShapeControl,
+			wantBlocks:    2, // the v2 example block + the pipeline v2 block
+			wantPathCount: 1, // only the example block lists the shipped spec
+			wantPathMajor: []int{2},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			blocks := checkJSONSchemaBlocks(tc.md)
+			if len(blocks) != tc.wantBlocks {
+				t.Fatalf("got %d blocks, want %d: %+v", len(blocks), tc.wantBlocks, blocks)
+			}
+			majors := shippedSpecListingMajors(blocks)
+			if len(majors) != tc.wantPathCount {
+				t.Fatalf("path listed under %d blocks %v, want %d", len(majors), majors, tc.wantPathCount)
+			}
+			if tc.wantPathMajor != nil && !reflect.DeepEqual(majors, tc.wantPathMajor) {
+				t.Errorf("path-carrying majors = %v, want %v", majors, tc.wantPathMajor)
+			}
+		})
+	}
+}
+
+// TestValidateShippedSpecListing_FailureModes asserts the DISTINCT error each
+// validator guard returns (#3013), giving every guard a clean counterfactual —
+// deleting a guard changes the message and reddens exactly its case. This is
+// the vehicle approval condition 2 mandates for the anti-vacuity zero-blocks
+// guard: the empty-markdown case asserts the "anti-vacuity" message, so
+// deleting `if len(blocks) == 0` makes validateShippedSpecListing fall through
+// to the "want exactly one" message and reddens this case alone.
+func TestValidateShippedSpecListing_FailureModes(t *testing.T) {
+	cases := []struct {
+		name          string
+		md            string
+		declaredMajor int
+		wantErrSubstr string // "" means expect nil error
+	}{
+		{
+			name:          "anti_vacuity_empty_markdown",
+			md:            "",
+			declaredMajor: 2,
+			wantErrSubstr: "anti-vacuity",
+		},
+		{
+			name: "blocks_but_path_not_listed",
+			md: "check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \\\n" +
+				"    docs/spec/examples/workflow-v2-backlog-grooming.yaml\n",
+			declaredMajor: 2,
+			wantErrSubstr: "want exactly one",
+		},
+		{
+			name: "ambiguous_two_listings",
+			md: "check-jsonschema --schemafile docs/spec/workflow-v1.schema.json \\\n" +
+				"    .fishhawk/workflows.yaml\n\n" +
+				"check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \\\n" +
+				"    .fishhawk/workflows.yaml\n",
+			declaredMajor: 2,
+			wantErrSubstr: "want exactly one",
+		},
+		{
+			name: "wrong_major",
+			md: "check-jsonschema --schemafile docs/spec/workflow-v1.schema.json \\\n" +
+				"    .fishhawk/workflows.yaml\n",
+			declaredMajor: 2,
+			wantErrSubstr: "declares major v2",
+		},
+		{
+			name: "valid_single_listing_right_major",
+			md: "check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \\\n" +
+				"    .fishhawk/workflows.yaml\n",
+			declaredMajor: 2,
+			wantErrSubstr: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateShippedSpecListing(tc.md, tc.declaredMajor)
+			if tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("got error %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Fatalf("got error %v, want substring %q", err, tc.wantErrSubstr)
+			}
+		})
 	}
 }
 

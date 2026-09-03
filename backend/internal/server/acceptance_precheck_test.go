@@ -1091,3 +1091,56 @@ func TestAcceptancePrecheck_AllSkip_JoinToRenderedPrompt(t *testing.T) {
 		t.Errorf("mixed-criteria plan must not render the all_criteria_skip_expected finding:\n%s", mixed)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #3016 — the polarity post-filter, through the REAL ship-plan path
+// ---------------------------------------------------------------------------
+
+// (#3016) The persisted plan_acceptance_precheck payload — the artifact the
+// APPROVER actually reads — carries NO missing_live_validation_marker finding
+// for an in-sandbox absence assertion, and its headline count is 0. Driven
+// through the REAL ship-plan HTTP path, not the pre-check helper alone.
+//
+// The plan-package unit test cannot prove this: it asserts on the evaluator's
+// return value, while the approver reads a payload assembled and persisted by a
+// different layer. A finding suppressed in the evaluator but still counted or
+// re-derived on the way to the audit entry would pass there and fail here.
+func TestShipPlan_AbsenceAssertionWithInRepoBasis_NoMarkerFinding(t *testing.T) {
+	s, rr, _, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specWithAcceptanceStage
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	body := acceptancePlanBody(t, []map[string]any{
+		{
+			"id": "invited-grant-admits-without-any-forge-call",
+			// The VERBATIM run-51c3a235 statement: an ABSENCE assertion whose
+			// single anchor ("live", the head of the corpus phrase "live
+			// forge") is negated by "no" one token earlier.
+			"statement":         "A login whose forge login matches an invited grant's member reference is admitted to exactly that account by the existing membership resolver even when no live forge membership lister is registered for the provider, and a login with no grant is admitted to nothing.",
+			"source":            "explicit",
+			"source_ref":        "#3016",
+			"skip_expected":     true,
+			"expectation_basis": "decided by backend/cmd/fishhawkd/member_test.go, which builds auth.NewMembershipResolver with an empty lister map against a pgtest Postgres",
+		},
+	}, nil)
+
+	w := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if n := countAcceptancePrecheckEntries(au.auditFake); n != 1 {
+		t.Fatalf("plan_acceptance_precheck entries = %d, want 1", n)
+	}
+
+	entry := lastAcceptancePrecheckEntry(t, au.auditFake)
+	if f := hasAcceptanceFinding(entry, acceptanceRuleMissingLiveValidationMarker); f != nil {
+		t.Errorf("persisted payload must carry no missing_live_validation_marker for an in-sandbox absence assertion; got %+v", *f)
+	}
+	if entry.LiveValidationMarkerCount != 0 {
+		t.Errorf("persisted live_validation_marker_count = %d, want 0", entry.LiveValidationMarkerCount)
+	}
+}

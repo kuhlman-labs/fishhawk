@@ -1301,3 +1301,403 @@ func TestAllCriteriaSkipExpected_RuleName(t *testing.T) {
 		t.Errorf("rule = %q, want all_criteria_skip_expected", RuleAllCriteriaSkipExpected)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #3016 — polarity-aware suppression
+// ---------------------------------------------------------------------------
+
+// run51c3a235Statement is the VERBATIM criterion statement from run 51c3a235,
+// the flagship case #3016 documents: it asserts the ABSENCE of a live forge
+// call, and its verification runs entirely in-repository, yet the rule fired
+// and its prescribed remedy would have marked the criterion skip_expected —
+// silently disabling a check the sandbox can actually run.
+//
+// TOKEN COUNT (1-based), which is what makes case (A) checkable without
+// re-deriving the tokenizer: … even(23) when(24) no(25) live(26) forge(27) …
+// The single anchor is the M1 corpus phrase "live forge", whose head token
+// "live" sits at 26; the negator "no" sits at 25 — DISTANCE 1, inside the
+// four-token livenessProximityWindow.
+const run51c3a235Statement = "A login whose forge login matches an invited grant's member reference is admitted to exactly that account by the existing membership resolver even when no live forge membership lister is registered for the provider, and a login with no grant is admitted to nothing."
+
+// run51c3a235Basis names the in-repository harness that actually decides the
+// criterion — conjunct S.
+const run51c3a235Basis = "decided by backend/cmd/fishhawkd/member_test.go, which builds auth.NewMembershipResolver with an empty lister map against a pgtest Postgres"
+
+// (A — DONE-MEANS, #1169) The flagship case. An absence assertion whose stated
+// verification names an in-repository harness draws NO
+// missing_live_validation_marker finding.
+func TestMissingLiveValidationMarker_AbsenceAssertionWithInRepoBasis(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "invited-grant-admits-without-any-forge-call", Statement: run51c3a235Statement,
+				Source: CriterionSourceExplicit, SourceRef: "#3016",
+				SkipExpected: true, ExpectationBasis: run51c3a235Basis,
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+		t.Fatalf("an in-sandbox ABSENCE assertion must not demand the live-validation marker; got %d: %+v", len(got), got)
+	}
+}
+
+// (B — M2 suppression) The operator's own fixture. Tokens (1-based): no(1)
+// real(2) grooming(3) run(4) against(5) this(6) repo(7) backlog(8) is(9)
+// performed(10). The ONLY anchor is the M2 qualifier "real" at 2 (its conjunct-1
+// partner is the action noun "run" at 4); the negator "no" sits at 1 — DISTANCE
+// 1, inside the window. "repo"(7) and "backlog"(8) are bystander objects and
+// NOT anchors, which is exactly what lets this case and case (C) hold at once.
+func TestMissingLiveValidationMarker_M2AbsenceAssertionSuppressed(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "no-live-grooming", Statement: "no real grooming run against this repo's backlog is performed",
+				Source: CriterionSourceExplicit, SourceRef: "#3016",
+				VerifyHint: "go test ./backend/internal/grooming/... with the fake tracker",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+		t.Fatalf("a negated M2 liveness claim with an in-repository verify_hint must not fire; got %d: %+v", len(got), got)
+	}
+}
+
+// (C — negation BEYOND the window still fires) Tokens: the(1) run(2) records(3)
+// no(4) diagnostic(5) bundle(6) at(7) all(8) when(9) it(10) dispatches(11)
+// against(12) a(13) live(14) github(15) repository(16). The M1 anchor "live"
+// sits at 14 and the nearest negator "no" at 4 — DISTANCE 10, outside the
+// four-token window, and it scopes a different constituent entirely. The
+// finding fires EVEN WITH an in-repository basis, because P is false.
+func TestMissingLiveValidationMarker_NegationBeyondWindowStillFires(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "far-negation", Statement: "the run records no diagnostic bundle at all when it dispatches against a live github repository",
+				Source: CriterionSourceExplicit, SourceRef: "#3016",
+				ExpectationBasis: "pinned by backend/internal/runner/dispatch_test.go",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("a negator 10 tokens from the anchor must not suppress; want 1 finding, got %d: %+v", len(got), got)
+	}
+}
+
+// (D/E — #2845 NON-REGRESSION) An un-negated live target fires with no stated
+// verification method (D), and — the critical case — STILL fires when the
+// criterion carries an in-repository expectation_basis (E). Conjunct S alone
+// must NEVER suppress: if it could, every #2845 criterion could be silenced by
+// citing a unit test.
+func TestMissingLiveValidationMarker_InRepoBasisAloneNeverSuppresses(t *testing.T) {
+	// Anchors, all UN-negated: M1 "real"(2) from "real github", M1 "github"(3)
+	// from "github api", M2 "real"(2) from the "real … round-trip" pair.
+	const statement = "a real github api round-trip closes the issue"
+	for _, tc := range []struct {
+		name  string
+		basis string
+	}{
+		{"D/no stated verification", ""},
+		{"E/in-repository basis", "validated by the httptest fake forge in backend/internal/github/client_test.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{
+						ID: "live-forge", Statement: statement,
+						Source: CriterionSourceExplicit, SourceRef: "#2845",
+						ExpectationBasis: tc.basis,
+					},
+				},
+			}
+			if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+				t.Fatalf("#2845 regression: want 1 finding for %q with basis %q; got %d: %+v", statement, tc.basis, len(got), got)
+			}
+		})
+	}
+}
+
+// (F — P true, S false) The flagship absence assertion stripped of BOTH
+// verify_hint and expectation_basis. Conjunct P holds, but a criterion that
+// states no verification method at all has given the approver nothing to weigh,
+// so the finding still fires.
+func TestMissingLiveValidationMarker_AbsenceAssertionWithoutStatedVerificationFires(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "invited-grant-admits-without-any-forge-call", Statement: run51c3a235Statement,
+				Source: CriterionSourceExplicit, SourceRef: "#3016",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("an absence assertion with no stated verification method must still fire; want 1, got %d: %+v", len(got), got)
+	}
+}
+
+// (G — EVERY-anchor, not ANY-anchor) Tokens: no(1) live(2) forge(3) lister(4)
+// is(5) registered(6) and(7) the(8) deployed(9) environment(10) serves(11)
+// the(12) endpoint(13). Anchor "live"(2) has "no" at DISTANCE 1 (inside), but
+// anchor "deployed"(9) has its nearest negator at DISTANCE 8 (outside). One
+// negated anchor must not carry the statement.
+func TestMissingLiveValidationMarker_PartiallyNegatedStatementFires(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "partial-negation", Statement: "no live forge lister is registered and the deployed environment serves the endpoint",
+				Source: CriterionSourceExplicit, SourceRef: "#3016",
+				ExpectationBasis: "covered by backend/internal/auth/resolver_test.go",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("EVERY anchor must be negated to suppress; want 1 finding, got %d: %+v", len(got), got)
+	}
+}
+
+// (H — the exemption is unchanged) requires_live_validation short-circuits
+// before the matchers and therefore before the polarity filter, on a statement
+// the filter would otherwise suppress.
+func TestMissingLiveValidationMarker_RequiresLiveValidationStillShortCircuits(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "marked", Statement: run51c3a235Statement,
+				Source: CriterionSourceExplicit, SourceRef: "#3016",
+				RequiresLiveValidation: true,
+				SkipExpected:           true, ExpectationBasis: run51c3a235Basis,
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+		t.Fatalf("requires_live_validation must still exempt; got %d: %+v", len(got), got)
+	}
+}
+
+// (I — ACCEPTED MISFIRE, pinned per operator condition 2 of the #2845 pass and
+// the #3016 approval) THIS TEST DOCUMENTS CURRENT BEHAVIOUR AND AN ACCEPTED
+// MISFIRE, NOT A DESIRED OUTCOME.
+//
+// Tokens: the(1) resolver(2) does(3) not(4) fail(5) when(6) the(7) live(8)
+// forge(9) lister(10) is(11) registered(12). The negator "not" at 4 sits at
+// exactly DISTANCE 4 from the M1 anchor "live" at 8 — ON the window boundary —
+// yet it scopes "fail", not the live target. With an in-repository basis the
+// criterion is therefore suppressed, wrongly.
+//
+// Distinguishing constituent scope needs parsing this deterministic word-list
+// matcher deliberately does not do, and the rule is advisory, so the residual
+// fails in the advisory-MISS direction. Pinning it here means a later change to
+// negation scoping shows up as a visible edit to this test instead of silent
+// drift.
+func TestMissingLiveValidationMarker_AcceptedNegationScopeMisfire(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "scope-misfire", Statement: "the resolver does not fail when the live forge lister is registered",
+				Source: CriterionSourceExplicit, SourceRef: "#3016",
+				ExpectationBasis: "covered by backend/internal/auth/resolver_test.go",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+		t.Fatalf("accepted misfire (see the doc block above liveTargetAnchors): want 0 findings at distance 4; got %d: %+v", len(got), got)
+	}
+}
+
+// (J — TOKENIZER, test-backed not asserted) acceptanceTokens trims only leading
+// and trailing punctuation and a trailing possessive, so a contracted negator
+// survives as ONE token. The behavioural half proves the contraction actually
+// suppresses: the(1) resolver(2) doesn't(3) call(4) a(5) live(6) forge(7)
+// api(8) — anchor "live" at 6, negator "doesn't" at 3, DISTANCE 3.
+func TestMissingLiveValidationMarker_ContractedNegatorsSurviveTokenization(t *testing.T) {
+	got := acceptanceTokens("the resolver doesn't call a live forge api.")
+	want := []string{"the", "resolver", "doesn't", "call", "a", "live", "forge", "api"}
+	if len(got) != len(want) {
+		t.Fatalf("tokens = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("tokens = %q, want %q", got, want)
+		}
+	}
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "contracted", Statement: "the resolver doesn't call a live forge api.",
+				Source: CriterionSourceExplicit, SourceRef: "#3016",
+				ExpectationBasis: "covered by backend/internal/auth/resolver_test.go",
+			},
+		},
+	}
+	if f := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(f) != 0 {
+		t.Fatalf("a contracted negator must suppress like an uncontracted one; got %d: %+v", len(f), f)
+	}
+}
+
+// (empty anchor set fails toward FIRING) everyLiveTargetAnchorNegated's
+// defensive branch. It is unreachable from MissingLiveValidationMarker — P is
+// only evaluated after a matcher fired — so it is asserted directly, on the
+// unit whose fail direction it decides.
+func TestEveryLiveTargetAnchorNegated_EmptyAnchorSetIsNotNegated(t *testing.T) {
+	if everyLiveTargetAnchorNegated(nil, []string{"no", "live", "forge"}) {
+		t.Fatal("an empty anchor set must return false so the finding FIRES, never suppress")
+	}
+}
+
+// (the Detail carries the #3016 counter-instruction) Without a literal
+// assertion the counter-instruction can be dropped while every other test stays
+// green — and dropping it restores the exact advice that caused the harm.
+func TestMissingLiveValidationMarker_DetailCarriesAbsenceCounterInstruction(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "a1", Statement: "a live GitHub round-trip closes the issue", Source: CriterionSourceExplicit, SourceRef: "#3016"},
+		},
+	}
+	f := findingFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker)
+	if f == nil {
+		t.Fatal("want a missing_live_validation_marker finding")
+	}
+	for _, want := range []string{
+		"asserts the ABSENCE of a live dependency",
+		"do NOT add the marker triple",
+		"skips a criterion the sandbox can verify",
+	} {
+		if !strings.Contains(f.Detail, want) {
+			t.Errorf("Detail must carry %q\n---\n%s", want, f.Detail)
+		}
+	}
+}
+
+// (conjunct S reads the VERIFICATION METHOD, never the statement) A statement
+// whose own prose carries an in-repository marker word, with NO verify_hint and
+// NO expectation_basis, must still fire. Otherwise an author could talk the
+// rule out of firing in the statement itself — the surface the matchers already
+// judged.
+//
+// Tokens: no(1) real(2) grooming(3) run(4) against(5) this(6) repo(7)
+// backlog(8) is(9) performed(10) by(11) the(12) fake(13) tracker(14). Conjunct
+// P holds (anchor "real" at 2, negator "no" at 1, DISTANCE 1) and "fake" sits
+// at 13, outside M2's conjunct-3 against-window, so the matcher still fires.
+func TestMissingLiveValidationMarker_StatementProseIsNotStatedVerification(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "prose-only", Statement: "no real grooming run against this repo's backlog is performed by the fake tracker",
+				Source: CriterionSourceExplicit, SourceRef: "#3016",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("an in-repository marker in the STATEMENT must not satisfy conjunct S; want 1 finding, got %d: %+v", len(got), got)
+	}
+}
+
+// (phraseHeadIndices bounds) Both defensive branches, asserted on the unit that
+// owns them: an empty phrase yields no anchors (never every index), and a
+// phrase longer than the statement yields none.
+func TestPhraseHeadIndices_Bounds(t *testing.T) {
+	tokens := []string{"a", "live", "forge"}
+	if got := phraseHeadIndices(tokens, nil); len(got) != 0 {
+		t.Errorf("empty phrase must yield no anchors; got %v", got)
+	}
+	if got := phraseHeadIndices(tokens, []string{"a", "live", "forge", "lister"}); len(got) != 0 {
+		t.Errorf("over-long phrase must yield no anchors; got %v", got)
+	}
+	if got := phraseHeadIndices(tokens, []string{"live", "forge"}); len(got) != 1 || got[0] != 1 {
+		t.Errorf("phraseHeadIndices = %v, want [1]", got)
+	}
+}
+
+// (K — ACCEPTED MIXED-CASE RESIDUAL, pinned rather than asserted) THIS TEST
+// DOCUMENTS CURRENT BEHAVIOUR AND AN ACCEPTED HOLE, NOT A DESIRED OUTCOME.
+//
+// liveTargetCorpusMatch is a SUBSTRING test while phraseHeadIndices requires
+// exact token-sequence equality, so a corpus phrase that matches only as a
+// substring of a longer token contributes NO anchor. The doc block above
+// liveTargetAnchors calls that direction safe, and for a FULLY-EMPTY anchor set
+// it is: everyLiveTargetAnchorNegated returns false and the finding fires.
+//
+// The MIXED case is the hole. Here M1 fires on the corpus phrase "github api",
+// which is present only inside the longer token "apis" and therefore yields no
+// anchor, while a separate NEGATED M2 qualifier-action anchor is present. The
+// anchor set is non-empty, every COUNTED anchor is negated, so conjunct P holds
+// and an in-repository basis suppresses the finding — even though the
+// live-target occurrence M1 fired on carries no negator of its own.
+//
+// Tokens: no(0) real(1) dispatch(2) is(3) attempted(4) while(5) the(6)
+// loader(7) still(8) calls(9) the(10) github(11) apis(12) on(13) every(14)
+// request(15). Counted anchor: the qualifier "real" at 1, negated by "no" at 0
+// (DISTANCE 1). Uncounted occurrence: "github api" inside token 12, whose
+// four-token lookback (7..10 — loader, still, calls, the) holds no negator.
+//
+// The failure direction is an advisory MISS, consistent with this rule's other
+// accepted residuals, and closing it would mean either making the anchor scan
+// substring-based (which would anchor on fragments inside unrelated words) or
+// dropping the substring matcher M1 has used since #2845. So it is pinned:
+// a later change to either matcher's granularity flips this test visibly
+// instead of moving the boundary in silence.
+func TestMissingLiveValidationMarker_AcceptedSubstringAnchorMixedCase(t *testing.T) {
+	const statement = "no real dispatch is attempted while the loader still calls the github apis on every request"
+
+	// BRANCH ISOLATION. MissingLiveValidationMarker emits ONE rule-level
+	// finding whether M1 or M2 fired, so a bare-case finding count alone does
+	// not establish that the SUBSTRING occurrence ("github api" inside "github
+	// apis") is what fired — the statement also carries the qualifier-action
+	// pair "real dispatch", which is M2's conjunct 1. These two white-box
+	// assertions separate the branches directly: M2 is false on this statement
+	// (it carries no "against …" phrase, so conjunct 2 fails), and M1 is true.
+	// Should M1 ever stop matching the substring, the bare assertion below can
+	// no longer be carried by M2 and this test fails rather than staying green
+	// on the other branch.
+	lowered := strings.ToLower(statement)
+	if livenessProximityMatch(acceptanceTokens(lowered)) {
+		t.Fatalf("M2 must NOT fire on the flagship statement (no against-phrase); the bare finding below would then not isolate M1")
+	}
+	if !liveTargetCorpusMatch(lowered) {
+		t.Fatalf("M1 must match the substring occurrence of a liveTarget corpus phrase in %q", statement)
+	}
+
+	// Non-vacuity: M1 really does fire on this statement. Without a stated
+	// in-repository verification method conjunct S fails and the finding
+	// stands, so the suppression below is the post-filter acting, not the
+	// matchers failing to match.
+	bare := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "mixed-bare", Statement: statement, Source: CriterionSourceExplicit, SourceRef: "#3016"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(bare), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("M1 must fire on the substring occurrence; want 1 finding, got %d: %+v", len(got), got)
+	}
+
+	// The same isolation at the RULE level, black-box: strip the "real
+	// dispatch" pair so conjunct 1 — and with it every M2 anchor — is gone,
+	// leaving the substring occurrence as the only thing that can fire. A
+	// finding here is unambiguously M1's.
+	const m1Only = "the loader still calls the github apis on every request"
+	if qualifierNearAction(acceptanceTokens(m1Only)) {
+		t.Fatalf("the M1-only control must carry no qualifier-action pair: %q", m1Only)
+	}
+	m1Bare := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{ID: "mixed-m1-only", Statement: m1Only, Source: CriterionSourceExplicit, SourceRef: "#3016"},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(m1Bare), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("M1 alone must fire on the substring occurrence; want 1 finding, got %d: %+v", len(got), got)
+	}
+
+	// The hole: one negated M2 anchor plus an UNCOUNTED live-target occurrence
+	// is enough for conjunct P, so an in-repository basis suppresses.
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "mixed-suppressed", Statement: statement,
+				Source: CriterionSourceExplicit, SourceRef: "#3016",
+				ExpectationBasis: "covered by backend/internal/plan/acceptance_check_test.go",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+		t.Fatalf("accepted mixed-case residual (see the doc block above liveTargetAnchors): want 0 findings; got %d: %+v", len(got), got)
+	}
+}
