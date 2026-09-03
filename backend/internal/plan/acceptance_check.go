@@ -1,6 +1,9 @@
 package plan
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // acceptance_check.go holds the pure, deterministic acceptance-criteria rule
 // set (#1596, E34.5 / ADR-052). It lives in the plan package — which already
@@ -719,19 +722,236 @@ func livenessProximityMatch(tokens []string) bool {
 }
 
 // qualifierNearAction is conjunct 1 of livenessProximityMatch, named so the
-// conjunct is one idea rather than an inline nested loop.
+// conjunct is one idea rather than an inline nested loop. It is a thin
+// existence wrapper over qualifierActionIndices, which #3016 extracted so the
+// polarity post-filter reads the SAME pairs the matcher fires on rather than
+// re-deriving them. Behaviour is unchanged: a non-empty index set is exactly
+// the old early `return true`.
 func qualifierNearAction(tokens []string) bool {
+	return len(qualifierActionIndices(tokens)) > 0
+}
+
+// qualifierActionIndices returns the index of EVERY liveness qualifier that
+// satisfies conjunct 1 — a live ACTION noun within livenessProximityWindow
+// tokens after it. Indices come out ascending because the scan is left to
+// right, and each qualifier is reported at most once (the inner loop breaks on
+// its first partner).
+func qualifierActionIndices(tokens []string) []int {
+	var idx []int
 	for i, tok := range tokens {
 		if !tokenIn(tok, livenessQualifiers) {
 			continue
 		}
 		for j := i + 1; j <= i+livenessProximityWindow && j < len(tokens); j++ {
 			if tokenIn(tokens[j], liveActionNouns) {
-				return true
+				idx = append(idx, i)
+				break
 			}
 		}
 	}
-	return false
+	return idx
+}
+
+// ---------------------------------------------------------------------------
+// #3016 — polarity awareness: an ABSENCE assertion verified in-repository
+// ---------------------------------------------------------------------------
+//
+// THE DEFECT. The two matchers above are polarity-BLIND: they ask whether a
+// statement NAMES a live target, never whether it asserts that target is
+// ABSENT. So "… is admitted even when no live forge membership lister is
+// registered" — a criterion whose whole point is that NO forge call happens,
+// decided by a Go test in this repository — drew the finding, and the finding's
+// remedy told the author to mark it skip_expected, which SKIPS a criterion the
+// sandbox can actually verify. That is the harm #3016 documents.
+//
+// THE POST-FILTER. A criterion that fired is skipped only when BOTH conjuncts
+// hold:
+//
+//	(P) EVERY anchor in the statement carries a negation token within
+//	    livenessProximityWindow tokens BEFORE it, and
+//	(S) the criterion's stated verification method — verify_hint and
+//	    expectation_basis, never the statement — names an IN-REPOSITORY harness.
+//
+// The conjunction is what preserves #2845. A genuinely live-dependent criterion
+// carrying an in-repository basis ("validated by the httptest fake forge") has
+// S true and P false, so it STILL fires: an in-repository basis alone can never
+// suppress. And a single un-negated anchor anywhere makes P false, so a
+// statement that negates one live target while asserting another still fires.
+//
+// (a) THE WINDOW IS livenessProximityWindow = 4 TOKENS, REUSED NOT REDEFINED.
+// No second constant is introduced and nothing is widened, so the rule's
+// suppression surface does not grow by one token.
+//
+// (b) THE WINDOW IS MEASURED BACK FROM AN ANCHOR, and an anchor is the
+// LIVENESS-BEARING token — for M1 the head token of a liveTarget corpus-phrase
+// occurrence, for M2 the liveness qualifier that satisfies conjunct 1. See
+// liveTargetAnchors.
+//
+// (c) M2's EXTERNAL-TARGET NOUN IS NOT AN ANCHOR. In "no real grooming run
+// against this repo's backlog is performed" the liveness claim is carried by
+// "real … run"; "repo" and "backlog" are bystander objects. Negating the
+// qualifier negates the assertion, whereas demanding a negator adjacent to the
+// object noun would demand phrasing no criterion actually writes ("against this
+// no repo") — the rule would then suppress nothing and the defect would stand.
+//
+// (d) THE PRIOR REVISION'S DEFECT was leaving (b) unspecified: measured to the
+// object noun, the very fixture this rule must suppress sits 6 and 8 tokens
+// from its negator and could not pass. Every negation fixture in the test file
+// therefore carries its token count in a comment.
+
+// acceptanceNegators are the tokens that negate a liveness claim. THE COST IS
+// EXPLICIT: each entry is one more token that can suppress a finding, so the
+// list is short and contains no word that reads as a negator only in context
+// ("only", "except", "unless" are deliberately absent — they scope clauses, and
+// this matcher does not parse clauses).
+//
+// The contracted forms are included because acceptanceTokens trims only
+// LEADING and TRAILING punctuation, so "doesn't" survives tokenization intact
+// as one token rather than splitting — a property the tokenizer test pins
+// rather than this comment merely asserting.
+var acceptanceNegators = []string{
+	"no", "not", "never", "without", "absent", "none", "cannot",
+	"lacks", "lacking", "isn't", "doesn't", "aren't", "won't",
+}
+
+// inRepoVerificationMarkers name an IN-REPOSITORY verification harness. Their
+// presence in a criterion's stated verification method is conjunct S.
+//
+// WHY THIS IS NOT sandboxMarkers, despite three overlapping entries.
+// sandboxMarkers names the acceptance PREVIEW's stand-ins (localhost, preview,
+// sandbox) and is evidence about the acceptance executor's TARGET. This list is
+// evidence about the criterion's stated VERIFICATION METHOD. Conflating them
+// would let "validated against the localhost preview" count as in-repository
+// verification, which it is not — that is a claim about the sandbox executor,
+// the very thing the criterion is being excused from.
+var inRepoVerificationMarkers = []string{
+	"_test.go", "pgtest", "httptest", "testdata", "go test", "unit test",
+	"integration test", "table test", "table-driven", "in-process", "in-repo",
+	"fake", "stub", "mock", "golden file",
+}
+
+// liveTargetAnchors returns the token indices that carry the statement's
+// liveness claim — the points conjunct P measures its negation window back
+// from. The union of both matchers' anchors, ascending and de-duplicated.
+//
+// M1 anchors: the index of the FIRST token of every liveTarget corpus-phrase
+// occurrence. The scan covers the WHOLE statement, NOT only the clauses that
+// survived M1's own sandbox-marker filter: P is an EVERY-anchor conjunct, so an
+// anchor M1 chose to ignore must still be counted, or a statement could be
+// suppressed on the strength of one negated anchor while an un-negated one sat
+// in a marker-bearing clause.
+//
+// M2 anchors: every liveness qualifier satisfying conjunct 1 — exactly the
+// pairs qualifierActionIndices finds, shared with the matcher rather than
+// re-derived.
+//
+// The M1 scan is TOKEN-SEQUENCE based while liveTargetCorpusMatch is a
+// SUBSTRING test, so a corpus phrase matched only as a substring of a longer
+// word yields no anchor here. That direction is safe ONLY when the anchor set
+// comes out FULLY EMPTY: everyLiveTargetAnchorNegated returns false on an empty
+// set, so the finding FIRES.
+//
+// THE MIXED CASE IS NOT SAFE, and is an accepted residual. A statement in which
+// a corpus phrase matches only as a substring (contributing no anchor) AND a
+// NEGATED M2 qualifier-action anchor is present has a non-empty anchor set
+// whose every COUNTED anchor is negated, so conjunct P holds and an
+// in-repository basis suppresses the finding — even though the live-target
+// occurrence M1 fired on carries no negator of its own. The failure direction
+// is an advisory MISS, consistent with this rule's other residuals, and closing
+// it would mean either anchoring on substring fragments inside unrelated words
+// or dropping the substring matcher M1 has used since #2845. So it is PINNED by
+// TestMissingLiveValidationMarker_AcceptedSubstringAnchorMixedCase rather than
+// papered over here.
+func liveTargetAnchors(lowered string, tokens []string) []int {
+	seen := make(map[int]struct{})
+	var anchors []int
+	add := func(i int) {
+		if _, dup := seen[i]; dup {
+			return
+		}
+		seen[i] = struct{}{}
+		anchors = append(anchors, i)
+	}
+
+	for _, uc := range unevaluableCapabilities {
+		if !uc.liveTarget {
+			continue
+		}
+		for _, phrase := range uc.phrases {
+			if !strings.Contains(lowered, phrase) {
+				continue
+			}
+			for _, i := range phraseHeadIndices(tokens, acceptanceTokens(phrase)) {
+				add(i)
+			}
+		}
+	}
+	for _, i := range qualifierActionIndices(tokens) {
+		add(i)
+	}
+
+	slices.Sort(anchors)
+	return anchors
+}
+
+// phraseHeadIndices returns the index of every position in tokens where the
+// token sequence phrase occurs. Phrase tokenization goes through
+// acceptanceTokens so a corpus phrase and a statement normalize identically
+// (possessives trimmed, interior hyphens kept).
+func phraseHeadIndices(tokens, phrase []string) []int {
+	var idx []int
+	if len(phrase) == 0 || len(phrase) > len(tokens) {
+		return idx
+	}
+	for i := 0; i+len(phrase) <= len(tokens); i++ {
+		match := true
+		for j, w := range phrase {
+			if tokens[i+j] != w {
+				match = false
+				break
+			}
+		}
+		if match {
+			idx = append(idx, i)
+		}
+	}
+	return idx
+}
+
+// everyLiveTargetAnchorNegated is conjunct P: EVERY anchor carries a negation
+// token within livenessProximityWindow tokens BEFORE it.
+//
+// An EMPTY anchor set returns FALSE. From the only caller that set is
+// unreachable (P is evaluated only after a matcher fired), but the fail
+// direction matters: returning false keeps an unanchored statement FIRING
+// rather than silently suppressing it.
+func everyLiveTargetAnchorNegated(anchors []int, tokens []string) bool {
+	if len(anchors) == 0 {
+		return false
+	}
+	for _, a := range anchors {
+		negated := false
+		for i := max(0, a-livenessProximityWindow); i < a && i < len(tokens); i++ {
+			if tokenIn(tokens[i], acceptanceNegators) {
+				negated = true
+				break
+			}
+		}
+		if !negated {
+			return false
+		}
+	}
+	return true
+}
+
+// hasInRepoVerification is conjunct S: the criterion's STATED VERIFICATION
+// METHOD names an in-repository harness. It reads VerifyHint and
+// ExpectationBasis joined — NEVER the statement, whose prose is what the
+// matchers already judged and which an author could otherwise use to talk the
+// rule out of firing.
+func hasInRepoVerification(c AcceptanceCriterion) bool {
+	stated := strings.ToLower(c.VerifyHint + " " + c.ExpectationBasis)
+	return containsAnyPhrase(stated, inRepoVerificationMarkers)
 }
 
 // liveTargetCorpusMatch is M1: the statement names a live TARGET via a phrase
@@ -822,7 +1042,14 @@ func MissingLiveValidationMarker(v Verification) []AcceptanceFinding {
 			continue
 		}
 		lowered := strings.ToLower(c.Statement)
-		if !liveTargetCorpusMatch(lowered) && !livenessProximityMatch(acceptanceTokens(lowered)) {
+		tokens := acceptanceTokens(lowered)
+		if !liveTargetCorpusMatch(lowered) && !livenessProximityMatch(tokens) {
+			continue
+		}
+		// POLARITY POST-FILTER (#3016). Both matchers keep their own behaviour
+		// untouched — the filter runs AFTER one of them fired, so M1's
+		// clause-scoped negation and M2's three conjuncts are unchanged.
+		if everyLiveTargetAnchorNegated(liveTargetAnchors(lowered, tokens), tokens) && hasInRepoVerification(c) {
 			continue
 		}
 		findings = append(findings, AcceptanceFinding{
@@ -830,7 +1057,10 @@ func MissingLiveValidationMarker(v Verification) []AcceptanceFinding {
 			CriterionID: c.ID,
 			Detail: "criterion statement names a LIVE forge/deploy/external target the sandboxed acceptance executor cannot stand up; " +
 				"set requires_live_validation: true and pair it with skip_expected: true plus an expectation_basis — that pairing is what " +
-				"auto-files the tracked operator-validation walk on plan approval. A skip_expected-only marking silently loses that walk.",
+				"auto-files the tracked operator-validation walk on plan approval. A skip_expected-only marking silently loses that walk. " +
+				"If instead this criterion asserts the ABSENCE of a live dependency and its verification runs IN-REPOSITORY, do NOT add the " +
+				"marker triple: marking it skips a criterion the sandbox can verify (#3016). Fix it by placing the negation directly before " +
+				"the live-target phrase and naming the in-repository harness in expectation_basis.",
 		})
 	}
 	return findings

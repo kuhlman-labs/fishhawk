@@ -16,8 +16,8 @@ SQL (`docs/deploy/gitlab.md`, `docs/deploy/self-hosted.md`).
 |---|---|---|
 | `account create` | `--db`, `--provider` (**required**, `github`\|`gitlab`), `--account-key` (**required**), `--display-name`, `--granularity` | Upsert one `accounts` row (idempotent on `provider,account_key`). `--granularity` defaults per provider — `organization` for github, `group` for gitlab — and must be one of `enterprise\|organization\|group\|user`. `user` is the personal-namespace tier: `account_key` is the owner's forge login and the login gate admits it with no forge membership read (E44.35 / #2925). |
 | `account list` | `--db`, `--provider` (filter) | Render the registered accounts. |
-| `installation register` | `--db`, `--provider` (**required**), `--account-key` (**required**), `--installation-ref` (**required**), `--forge-base-url`, `--oauth-base-url` | Upsert one `installations` row under the named account (idempotent on `provider,installation_ref`). **FAILS CLOSED** naming the `account create` remedy when the account does not exist — it never materializes it. |
-| `installation list` | `--db`, `--provider` (filter) | Render each installation with its owning `account_key` (the impact-inventory read the auth-change checklist asks for). |
+| `installation register` | `--db`, `--provider` (**required**), `--account-key` (**required**), `--installation-ref` (**required**), `--project-path` (**required for `--provider gitlab`**), `--forge-base-url`, `--oauth-base-url` | Upsert one `installations` row under the named account (idempotent on `provider,installation_ref`). **FAILS CLOSED** naming the `account create` remedy when the account does not exist — it never materializes it. |
+| `installation list` | `--db`, `--provider` (filter) | Render each installation with its owning `account_key` and `PROJECT_PATH` (the impact-inventory read the auth-change checklist asks for). |
 | `member invite` | `--db`, `--provider` (**required**), `--account-key` (**required**), `--member-ref` (**required**), `--role` | Upsert one `account_members` row with `origin='invited'` under the named account (idempotent on `account_id,provider,member_ref`). The login gate admits an invited grant **DB-only**, forge-independently. `--member-ref` is the forge **login** (not a numeric id/email); `--role` defaults to `member` and must be `admin\|member`. **FAILS CLOSED** naming the `account create` remedy when the account does not exist. |
 | `member list` | `--db`, `--provider` (filter), `--account-key` (filter) | Render each grant with its `origin` and owning `account_key`, so an invited grant is distinguishable from a login-minted `auto_join` one. |
 
@@ -513,3 +513,34 @@ startup** with an error naming the variable and the offending entry: it must nev
 empty (strict) allow-list, because a typo silently reverting to strict would masquerade as the
 security posture working while breaking a legitimate cross-namespace deployment. Every refusal
 names the exact entry to add here.
+
+## `installation register --project-path` (E45.26 / #2877)
+
+`--project-path` records the GitLab `path_with_namespace` the run-creation
+authorization gate binds EXACTLY. It is **required** for `--provider gitlab` and
+ignored for `--provider github`, whose payload identity arrives HMAC-signed and
+resolves through the installation id rather than a path.
+
+Validation (all wrapping `account.ErrValidation`, so they exit `exitUsage`, and
+all applied BEFORE any row is written):
+
+- non-empty after trimming;
+- of the form `<namespace>/<project>`, split on the **FIRST** separator only —
+  GitLab groups NEST, so `acme/platform/widgets` is valid and its namespace is
+  `acme`. A validator demanding exactly two segments would make every
+  nested-group project unregisterable. Nesting is not a licence for empty
+  components: EVERY component — the namespace, each intermediate group, and the
+  terminal project — must be non-empty, so `acme//widgets`,
+  `acme/platform//widgets` and `acme/widgets/` are all refused (GitLab never
+  canonicalises a `path_with_namespace` carrying an empty component, so such a
+  row could only ever refuse every trigger);
+- its namespace segment must equal the resolved `--account-key`, and the error
+  names both values.
+
+`installation list` renders the value in a `PROJECT_PATH` column. A **gitlab**
+row recording none renders `(unbound)`; a github row renders blank, because it
+records no project path by design and marking it would manufacture a false
+alarm. An unbound gitlab row is REFUSED by the authorization gate (audit reason
+`gitlab_project_path_unbound`), so this column is how an operator enumerates
+what needs re-registering after upgrading past migration `0078`. Full operator
+procedure: `docs/deploy/gitlab.md`.

@@ -117,6 +117,21 @@ func (c SingleTenantConfig) configured() bool {
 		strings.TrimSpace(c.AutoJoinRole) != ""
 }
 
+// Resolved is the read-only DIAGNOSTIC view of the profile: it returns the
+// EFFECTIVE configuration a caller OUTSIDE this package should report — every
+// field trimmed and the internal defaults filled (empty provider → github,
+// empty granularity → enterprise, empty role → member) — rather than the raw,
+// still-empty flag values. It exists so the login gate's no-admitting-account
+// denial log can name what the deployment is ACTUALLY configured as: a
+// personal-namespace install left on the default `enterprise` granularity, or a
+// byte-exact account-key casing mismatch, is diagnosable from that one line only
+// if the log reports the resolved granularity, not the empty flag. It delegates
+// verbatim to the same resolveDefaults EnsureSingleTenantAccount uses, so the
+// diagnostic and the bootstrap can never describe different effective profiles.
+// Enablement is decided by Enabled(), NOT by this accessor — a caller must gate
+// on Enabled() before reporting a Resolved() view.
+func (c SingleTenantConfig) Resolved() SingleTenantConfig { return c.resolveDefaults() }
+
 // resolveDefaults trims every field and fills the internal defaults for an
 // enabled profile. Applied only AFTER enablement, so an unset deployment never
 // acquires a populated config it did not ask for.

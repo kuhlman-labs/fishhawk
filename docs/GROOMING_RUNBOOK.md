@@ -145,8 +145,26 @@ fishhawk_start_campaign(
 
 Pass `grooming_run_id` INSTEAD of `epic_ref` / `items` — combining them is refused.
 
-Cap the first batch and watch the first item land before trusting the queue. Campaigns
-and recovery are the weaker subsystems in this product and have needed manual driving.
+**A FULL ratified order now assembles (E54.59 / #3113).** `grooming_order_limit` is a
+batch-sizing choice, not a workaround for an assembly failure. It used to be both: the
+no-epic source resolves each named issue's `depends_on` through the forge one at a time,
+so a sixty-item order cost sixty-plus round-trips — and the MCP client's own 30s
+`http.Client` wall aborted at `29999ms` with a bare transport error carrying no counts,
+while the server had no deadline on that path at all. (The issue's original diagnosis of
+a *server-side* 30s deadline was wrong.) Now the server bounds the resolution itself
+(`--issue-set-resolution-budget`, default 120s, permitted maximum 10m) and the client
+waits longer than any permitted budget, so the SERVER is what decides.
+
+If the order is genuinely too large for the budget, the refusal is
+`issue_set_resolution_timeout` and it NAMES A NUMBER: `resolved N of M`, and — when a
+value could be **proven** to fit — a `grooming_order_limit=N` to retry with. Take that
+number rather than guessing; it is the longest prefix of the ratified order that fully
+resolved. When the refusal says it could not prove any count, bisect (halve the limit and
+retry) or raise the deploy's `FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET`.
+
+Still cap the first batch and watch the first item land before trusting the queue — for
+the ordinary reason (a bad first item is cheaper to notice in a batch of five), not
+because a full order cannot assemble.
 
 The alternative — walking the ranked list downward with individual `fishhawk_start_run`
 calls — respects the ordering and skips nothing. Slower, more reliable.

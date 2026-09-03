@@ -590,6 +590,64 @@ func TestAutoDriveRunGate_RouteFixupBudgetExhausted(t *testing.T) {
 	}
 }
 
+// TestAutoFixup_CrashRefundAdmitsPass: the auto-driver's route_fixup arm must
+// agree with the HTTP handler on the NEW #3085 category-A refund. One prior pass
+// that died category-A having pushed nothing is refunded against the normal
+// budget, so the delegated arm ACTS rather than parking the operator with
+// decision_required fixup_budget_exhausted.
+func TestAutoFixup_CrashRefundAdmitsPass(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	seedFixupPass(t, au, runID, impl.ID, 1) // trigger at sequence 1000
+	seedFixupRecoveredC(au, runID, impl.ID, run.FailureA, 1002)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionRouteFixup {
+		t.Fatalf("outcome = %+v, want acted route_fixup (the category-A death refunds the pass)", out)
+	}
+	e := auditEntry(t, au, CategoryStageFixupTriggered)
+	var payload map[string]any
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload["refunded_passes"].(float64) != 1 {
+		t.Errorf("refunded_passes = %v, want 1", payload["refunded_passes"])
+	}
+}
+
+// TestAutoFixup_InfraRefundAdmitsPass exists SPECIFICALLY because an
+// implementation could satisfy the category-A test above while still omitting
+// category C: before #3085 the auto-driver counted ONLY the #967 no-change
+// refund (countFixupNoChangeRefunds), so it already diverged from the HTTP
+// handler by missing the #1957 category-C refund entirely. Routing it through
+// the shared chokepoint fixes that pre-existing gap; this test is what detects a
+// regression of it.
+func TestAutoFixup_InfraRefundAdmitsPass(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	seedFixupPass(t, au, runID, impl.ID, 1) // trigger at sequence 1000
+	seedFixupRecoveredC(au, runID, impl.ID, run.FailureC, 1002)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionRouteFixup {
+		t.Fatalf("outcome = %+v, want acted route_fixup (the category-C death refunds the pass)", out)
+	}
+	e := auditEntry(t, au, CategoryStageFixupTriggered)
+	var payload map[string]any
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload["refunded_passes"].(float64) != 1 {
+		t.Errorf("refunded_passes = %v, want 1", payload["refunded_passes"])
+	}
+}
+
 // TestAutoDriveRunGate_RouteFixupCeilingReached asserts the DISTINCT hard-ceiling
 // sentinel maps to DecisionState=fixup_ceiling_reached (nil error) — the state
 // the operator override can never push past — rather than being collapsed into
@@ -2597,5 +2655,84 @@ func TestAutoDrive_ReportMode_MergeCountReadFailureFallsBackToBaseKey(t *testing
 	}
 	if n := countReportRows(t, au); n != 1 {
 		t.Errorf("act:report rows with the approval read failing = %d, want still 1 (under-emission; acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// --- #3116: the delegated path must OBSERVE, not 500 ------------------------
+
+// appendStageRow appends a stage row to the run BY CONSTRUCTION — the state is
+// written directly rather than reached through the predicate under test, so a
+// counterfactual RED lands on the behavioral assertion, not on fixture setup.
+func appendStageRow(repo *autoDriveRepo, runID uuid.UUID, typ run.StageType, state run.StageState) *run.Stage {
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	st := &run.Stage{ID: uuid.New(), RunID: runID, Type: typ, State: state, Sequence: len(repo.stagesByRun[runID]) + 1}
+	repo.stagesByRun[runID] = append(repo.stagesByRun[runID], st)
+	return st
+}
+
+// TestFixupEligibleState_PendingReviewNotEligible pins the #3116 predicate
+// tightening: run.findOpenReviewStage admits a review stage at awaiting_approval
+// ALONE, so a PENDING review stage must NOT read as fix-up-eligible here — the
+// pending half could only ever produce ErrFixupNotApplicable, which
+// handleAutoDrive maps to a 500.
+func TestFixupEligibleState_PendingReviewNotEligible(t *testing.T) {
+	succeeded := &run.Stage{Type: run.StageTypeImplement, State: run.StageStateSucceeded}
+	pendingReview := []*run.Stage{{Type: run.StageTypeReview, State: run.StageStatePending}}
+	if fixupEligibleState(succeeded, pendingReview) {
+		t.Error("succeeded implement with a PENDING review stage must NOT be fixup-eligible: run.FixupStage refuses that state with ErrFixupNotApplicable (#3116)")
+	}
+	// The open-gate shape stays eligible — the tightening must not hide a legal
+	// route-back.
+	openReview := []*run.Stage{{Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}}
+	if !fixupEligibleState(succeeded, openReview) {
+		t.Error("succeeded implement with a review stage at awaiting_approval must stay fixup-eligible")
+	}
+}
+
+// TestAutoFixup_PendingReviewObservesInsteadOfFailing is the behavioral half:
+// with the implement stage succeeded and the review stage still PENDING (the
+// normal window in a workflow that orders acceptance before review), autoFixup
+// must return dispatched=false with a NIL error — the observe-only outcome that
+// keeps fishhawk_drive_run polling — rather than the raw ErrFixupNotApplicable
+// that handleAutoDrive maps to a 500 auto_drive_dispatch_failed. The err==nil
+// identity assertion is the whole point: a non-nil sentinel here IS the defect.
+func TestAutoFixup_PendingReviewObservesInsteadOfFailing(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	// By construction: implement succeeded (PR open), review stage parked at
+	// pending because acceptance has not settled.
+	impl.State = run.StageStateSucceeded
+	appendStageRow(repo, runID, run.StageTypeAcceptance, run.StageStateAwaitingHostDispatch)
+	appendStageRow(repo, runID, run.StageTypeReview, run.StageStatePending)
+
+	stages, err := repo.ListStagesForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	open, err := cr.ListOpenByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListOpenByRun: %v", err)
+	}
+	if len(open) == 0 {
+		t.Fatal("fixture seeded no open concern; the arm under test would be unreachable")
+	}
+
+	dispatched, err := s.autoFixup(context.Background(), campaignOperatorIdentity(), getRun(t, repo, runID), stages, open, "convergent_concerns")
+	// Sentinel identity is checked FIRST so the branch is live rather than
+	// unreachable behind the generic non-nil report: an ErrFixupNotApplicable
+	// escaping autoFixup is the specific defect (handleAutoDrive maps it to a
+	// 500 auto_drive_dispatch_failed), and it earns its own message.
+	if errors.Is(err, run.ErrFixupNotApplicable) {
+		t.Fatalf("autoFixup returned the raw run.ErrFixupNotApplicable sentinel: %v — handleAutoDrive maps it to a 500 auto_drive_dispatch_failed; want nil (observe-only)", err)
+	}
+	if err != nil {
+		t.Fatalf("autoFixup err = %v, want nil (observe-only)", err)
+	}
+	if dispatched {
+		t.Error("dispatched = true, want false — the endpoint refuses a fix-up while the review stage is pending")
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("%d %s entries appended, want 0 (nothing was routed)", n, CategoryStageFixupTriggered)
 	}
 }

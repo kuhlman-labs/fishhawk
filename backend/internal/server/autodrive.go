@@ -623,7 +623,13 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 	if err != nil {
 		return false, err
 	}
-	refunded, err := s.countFixupNoChangeRefunds(ctx, runRow.ID, impl.ID)
+	// Routed through the SHARED chokepoint (#3085) rather than the old
+	// no-change-only counter, which counted ONLY the #967 signal and so already
+	// diverged from the HTTP handler by missing the #1957 category-C refund
+	// entirely. The crash count is discarded — the auto-drive path has no 422
+	// body to carry it. Pinned by TestAutoFixup_InfraRefundAdmitsPass (category
+	// C) and TestAutoFixup_CrashRefundAdmitsPass (category A).
+	refunded, _, err := s.fixupRefundedPasses(ctx, runRow.ID, impl.ID)
 	if err != nil {
 		return false, err
 	}
@@ -1024,14 +1030,23 @@ func implementStage(stages []*run.Stage) *run.Stage {
 // succeeded while a review stage is still open (push_and_open_pr flow).
 // Mirrors run.FixupStage's applicability switch so the actor's double-gate
 // matches the domain's contract.
+//
+// A review stage at `pending` is deliberately NOT eligible (#3116).
+// run.findOpenReviewStage admits awaiting_approval ALONE, so the pending half
+// was unreachable-as-success: every delegated route_fixup taken through it
+// ended in ErrFixupNotApplicable, which handleAutoDrive maps to a 500
+// auto_drive_dispatch_failed and fishhawk_drive_run treats as a fail-loud stop
+// — in a workflow that orders acceptance before review, the NORMAL window. With
+// the clause gone autoFixup returns (false, nil) and the driver stays
+// observe-only, dispatching acceptance and routing the fix-up once the gate
+// really opens. Do not re-add it: the endpoint refuses that state.
 func fixupEligibleState(impl *run.Stage, stages []*run.Stage) bool {
 	switch impl.State {
 	case run.StageStateAwaitingApproval:
 		return true
 	case run.StageStateSucceeded:
 		for _, st := range stages {
-			if st.Type == run.StageTypeReview &&
-				(st.State == run.StageStateAwaitingApproval || st.State == run.StageStatePending) {
+			if st.Type == run.StageTypeReview && st.State == run.StageStateAwaitingApproval {
 				return true
 			}
 		}

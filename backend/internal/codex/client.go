@@ -41,8 +41,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -120,6 +123,16 @@ type Client struct {
 	// Cmd builds the *exec.Cmd. Defaults to exec.CommandContext; overridable
 	// by tests to redirect to a fake binary.
 	Cmd func(ctx context.Context, name string, args ...string) *exec.Cmd
+	// HostPaths is the injectable host-filesystem seam the #2522 confined
+	// CODEX_HOME is built from. nil means reviewsandbox.DefaultHostPaths().
+	// Every grounded-path TEST sets it to temp dirs: without this seam a plain
+	// `go test` would synthesize a confined home inside the developer's or CI
+	// runner's REAL ~/.codex, copy their live auth.json into it, and write back
+	// to it on cleanup.
+	HostPaths *reviewsandbox.HostPaths
+	// GOOS selects the platform deny-root table used by the confined-home
+	// placement guard. Empty means runtime.GOOS.
+	GOOS string
 }
 
 // NewClient constructs a Client from cfg, defaulting Binary to DefaultBinary
@@ -256,6 +269,9 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	// invocation errors instead (the #955 per-invocation failure path degrades
 	// the advisory review gracefully — terminal *_review_failed entry, loop
 	// continues).
+	// confinedCodexHome is the synthesized throwaway CODEX_HOME (#2522), set
+	// only in the grounded posture below.
+	var confinedCodexHome string
 	workDir := treeDir
 	if workDir == "" {
 		scratchDir, serr := os.MkdirTemp("", "fishhawk-codex-review-")
@@ -298,6 +314,55 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	}
 	if cerr := schemaFile.Close(); cerr != nil {
 		return "", "", planreview.Usage{}, false, fmt.Errorf("codex: close verdict schema file: %w", cerr)
+	}
+
+	// Read confinement, GROUNDED posture only (#2522). --sandbox read-only means
+	// "write nowhere, read ANYWHERE" — operator-verified: the reviewer read an
+	// out-of-tree file straight through it. The bound that actually holds is
+	// codex-cli's permission-profile subsystem: a synthesized throwaway
+	// CODEX_HOME carrying a `confined` profile, which the CLI enforces as a
+	// deny-by-default ALLOWLIST at the OS level (an out-of-tree read returns
+	// EPERM, "Operation not permitted" — not a model refusal).
+	//
+	// FAIL CLOSED: any error here fails the invocation. Falling through would
+	// spawn a grounded reviewer with the unbounded read posture this exists to
+	// close — the #955 per-invocation failure path degrades the advisory review
+	// gracefully, so failing is strictly better than silently unconfining.
+	//
+	// cmd.Dir is set to the CANONICAL export path because the profile grant is
+	// canonical: on darwin os.MkdirTemp returns /var/folders/... whose real path
+	// is /private/var/folders/..., and a raw cwd under a canonical grant would
+	// BLIND the reviewer rather than fail loudly.
+	if treeDir != "" {
+		hp := reviewsandbox.DefaultHostPaths()
+		if c.HostPaths != nil {
+			hp = *c.HostPaths
+		}
+		goos := c.GOOS
+		if goos == "" {
+			goos = runtime.GOOS
+		}
+		canonTree, cerr := filepath.EvalSymlinks(treeDir)
+		if hp.Canonical != nil {
+			canonTree, cerr = hp.Canonical(treeDir)
+		}
+		if cerr != nil {
+			return "", "", planreview.Usage{}, false, fmt.Errorf("codex: canonicalize review tree: %w", cerr)
+		}
+		confinedHome, cleanup, herr := reviewsandbox.CodexConfinedHome(hp, treeDir, schemaPath, goos)
+		if herr != nil {
+			return "", "", planreview.Usage{}, false, fmt.Errorf("codex: build confined CODEX_HOME: %w", herr)
+		}
+		defer func() {
+			// A non-nil cleanup error is a WARNING (a skipped credential
+			// copy-back), never an invocation failure: the operator's on-disk
+			// credential was left untouched, which is the safe outcome.
+			if werr := cleanup(); werr != nil {
+				slog.Warn("codex confined CODEX_HOME cleanup", slog.String("warning", werr.Error()))
+			}
+		}()
+		confinedCodexHome = confinedHome
+		workDir = canonTree
 	}
 
 	// Flag rationale (pinned against codex-cli 0.137.0):
@@ -348,7 +413,7 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	// added when a grounding tree is provided; the ungrounded empty-scratch path
 	// stays byte-for-byte as before.
 	if treeDir != "" {
-		args = append(args, "--sandbox", "read-only", "--ignore-rules")
+		args = append(args, "--sandbox", "read-only", "--ignore-rules", "--profile", reviewsandbox.ConfinedProfileName)
 	}
 	if c.cfg.Model != "" {
 		args = append(args, "--model", c.cfg.Model)
@@ -381,6 +446,13 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	}
 	if c.cfg.APIKey != "" {
 		cmd.Env = appendEnvOverride(cmd.Env, "OPENAI_API_KEY", c.cfg.APIKey)
+	}
+	// Point the child at the synthesized confined CODEX_HOME (#2522). It MUST go
+	// through appendEnvOverride: CODEX_HOME is on reviewsandbox.CodexAllow, so a
+	// plain append would be SHADOWED by the inherited entry the scrub admitted
+	// and the child would load the operator's unconfined config instead.
+	if confinedCodexHome != "" {
+		cmd.Env = appendEnvOverride(cmd.Env, "CODEX_HOME", confinedCodexHome)
 	}
 	// Capture stderr into our own buffer. Because cmd.Stderr is non-nil,
 	// cmd.Output() no longer populates exitErr.Stderr — diagnostics are read

@@ -231,6 +231,17 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		return nil, DispatchStageOutput{}, noPRErr
 	}
 
+	// (2c) Runner self-host bootstrap advisory (#3086). When the run's declared
+	// plan scope changes fishhawk-runner itself, warn that the dispatched stage
+	// runs bin/fishhawk-runner built from main (still carrying the defect the run
+	// fixes) and point at the documented rebuild escape in runner/README.md. It is
+	// placed with the other pre-spawn guards purely so the advisory rides the same
+	// warnings accumulator below — it can NEVER block (no error return), so it
+	// needs no error branch. COST: up to (2 plan-resolution reads + 1 GetRun) per
+	// visited run, capped at retryPlanChainDepth, and ZERO reads on a plan-stage
+	// dispatch.
+	selfHostWarnings := r.guardRunnerSelfHost(ctx, runUUID, in.Stage)
+
 	// (3) Resolve the runner binary (input > env > sibling > PATH > error).
 	binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
 	if err != nil {
@@ -240,7 +251,7 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	// (4) Resolve the GitHub repo with the same soft-fail rule run_stage uses:
 	// push_and_open_pr=false makes a missing repo a warning, not an error.
 	// Seeded with any guard fail-open warning from step (1a) and (2a).
-	warnings := append(append(guardWarnings, siblingWarnings...), noPRWarnings...)
+	warnings := append(append(append(guardWarnings, siblingWarnings...), noPRWarnings...), selfHostWarnings...)
 	repo := in.GitHubRepo
 	if repo == "" {
 		detected, derr := runStageDetectGitHubRepo(workingDir)
@@ -352,8 +363,11 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		// THIS HOST BEFORE recording any spawn evidence. Unreachable/stale refuses
 		// here, ahead of the (5a) record-act AND the (5c) host-dispatch marker, so
 		// nothing is recorded and the stage stays awaiting_host_dispatch/pending
-		// for a clean re-dispatch. Every proceed outcome (verified / unverifiable /
-		// no hosts / preview-cmd-set / empty-SHA) returns nil and falls through.
+		// for a clean re-dispatch. An UNRESOLVED expected head refuses here too
+		// (#3091, acceptance_expected_head_unresolved) — it used to fall through
+		// with a warning, which let the stage record a verdict bound to no tree.
+		// Every proceed outcome (verified / unverifiable / no hosts /
+		// preview-cmd-set) returns nil and falls through.
 		if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission); refusal != nil {
 			var stageWaitStatus *StageWaitStatus
 			if fetchErr := func() error {

@@ -37,7 +37,7 @@ type AwaitStageInput struct {
 // AwaitStageOutput is the fishhawk_await_stage response. Status is one of:
 //
 //   - "settled"      — the stage reached a SETTLED state (run.StageState.IsSettled):
-//     terminal (succeeded/failed/cancelled) OR parked-for-operator
+//     terminal (succeeded/failed/cancelled/superseded) OR parked-for-operator
 //     (awaiting_approval / awaiting_children / awaiting_input /
 //     awaiting_scope_decision / awaiting_deploy_approval /
 //     awaiting_host_dispatch). State carries the RAW backend state so a parked
@@ -58,6 +58,14 @@ type AwaitStageInput struct {
 // than asserted: the amendment probe re-reads the stage before resolving and
 // prefers `settled` if the stage settled while the amendment list was in
 // flight. See awaitStageAmendmentRelease.
+//
+// On the "settled" status the top-level Message is normally EMPTY. It is
+// populated (E68.31 / #3081) when the settled stage is an IMPLEMENT stage whose
+// LATEST fix-up pass failed and was recovered by the backend: State/Status then
+// read `succeeded`, which is true of the stage and misleading about the fix-up,
+// so StageWaitStatus.FixupRecovered carries the marker and Message repeats its
+// advisory at the top level where an operator cannot miss it. See
+// awaitStageSettled.
 type AwaitStageOutput struct {
 	Status string `json:"status" jsonschema:"one of settled, timeout, run_terminal, amendment_pending"`
 	Stage  string `json:"stage" jsonschema:"the resolved stage type"`
@@ -68,17 +76,17 @@ type AwaitStageOutput struct {
 	// awaiting_approval settles the wait but is reported as awaiting_approval,
 	// NOT succeeded, so the operator can tell a completed stage from one parked
 	// for their attention.
-	State string `json:"state" jsonschema:"the RAW backend stage state (succeeded/failed/cancelled or a parked awaiting_* state); never coerced, so a parked settled stage is distinguishable from a succeeded one"`
+	State string `json:"state" jsonschema:"the RAW backend stage state (succeeded/failed/cancelled/superseded or a parked awaiting_* state); never coerced, so a parked settled stage is distinguishable from a succeeded one. superseded means a merge made the stage unreachable (#3083) — neither a pass nor an operator cancellation"`
 	// Terminal is the endpoint's settledness flag (#1252): true when the stage
 	// IsSettled — terminal OR parked. It is the authority for the settled
-	// resolve; keying on terminality alone (succeeded/failed/cancelled) would
+	// resolve; keying on terminality alone (succeeded/failed/cancelled/superseded) would
 	// silently miss the parked half.
 	Terminal            bool             `json:"terminal" jsonschema:"true when the stage has SETTLED — a terminal state OR a parked-for-operator state; the authoritative resolve signal"`
 	FailureCategory     string           `json:"failure_category,omitempty" jsonschema:"the failed stage's category, when the settled state is failed"`
 	FailureReason       string           `json:"failure_reason,omitempty" jsonschema:"the failed stage's reason, when the settled state is failed"`
-	StageWaitStatus     *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the classified execution wait status (same shape get_run_status / dispatch_stage carry), for continuity; the raw state + terminal fields are the authority"`
+	StageWaitStatus     *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the classified execution wait status (same shape get_run_status / dispatch_stage carry), for continuity; the raw state + terminal fields are the authority. On a settled implement stage it may carry fixup_recovered (#3081) — the marker that the latest fix-up pass FAILED and was recovered, so no fix-up commit landed"`
 	WaitedSeconds       float64          `json:"waited_seconds" jsonschema:"elapsed wall time spent waiting"`
-	Message             string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal statuses"`
+	Message             string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal statuses, AND on a SETTLED status whose stage_wait_status carries fixup_recovered (#3081) — a fix-up pass that failed and was recovered, so the succeeded status is misleading about the fix-up"`
 	PollIntervalSeconds int              `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for switching to fishhawk_get_run_status polling; present only on the timeout status"`
 	// Heartbeat reports whether the CLIENT supplied a progressToken and a
 	// per-tick keep-alive was therefore emitted (#2490). Present on every return
@@ -126,7 +134,8 @@ There are TWO release conditions: the stage SETTLES, or the awaited stage
 files a mid-stage scope amendment that is still pending (#2588).
 
 "Settled" is deliberately BROADER than "terminal": the wait resolves the
-moment the stage reaches a terminal state (succeeded / failed / cancelled) OR
+moment the stage reaches a terminal state (succeeded / failed / cancelled /
+superseded) OR
 a parked-for-operator state (awaiting_approval / awaiting_children /
 awaiting_input / awaiting_scope_decision / awaiting_deploy_approval /
 awaiting_host_dispatch) — the settledness a detached watcher actually wants
@@ -249,7 +258,7 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, AwaitStageOutput{}, fmt.Errorf("read stage wait: %w", err)
 	}
 	if sw.Terminal {
-		return nil, awaitStageSettledOutput(stageType, sw, start, heartbeat, capSeconds), nil
+		return nil, r.awaitStageSettled(ctx, runID, stageUUID, stageType, sw, start, heartbeat, capSeconds), nil
 	}
 
 	// Second release condition (#2588), probed on the FAST PATH before the first
@@ -309,7 +318,7 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 				return nil, AwaitStageOutput{}, fmt.Errorf("poll stage wait: %w", err)
 			}
 			if sw.Terminal {
-				return nil, awaitStageSettledOutput(stageType, sw, start, heartbeat, capSeconds), nil
+				return nil, r.awaitStageSettled(pollCtx, runID, stageUUID, stageType, sw, start, heartbeat, capSeconds), nil
 			}
 			// Second release condition (#2588) on every tick, after the settled
 			// check and before the ADR-036 backstop. pollCtx (not ctx) so a
@@ -346,7 +355,7 @@ func (r *runResolver) awaitStageRunTerminalBackstop(ctx context.Context, runID, 
 	// resolves as settled and beats the backstop.
 	sw, ferr := r.api.GetRunStageWait(ctx, runID, stageID, 0)
 	if ferr == nil && sw != nil && sw.Terminal {
-		return awaitStageSettledOutput(stageType, sw, start, heartbeat, capSeconds), true
+		return r.awaitStageSettled(ctx, runID, stageID, stageType, sw, start, heartbeat, capSeconds), true
 	}
 	return AwaitStageOutput{
 		Status:            "run_terminal",
@@ -425,7 +434,7 @@ func (r *runResolver) awaitStageAmendmentRelease(ctx context.Context, runID, sta
 		return AwaitStageOutput{}, false
 	}
 	if sw, err := r.api.GetRunStageWait(ctx, runID, stageUUID, 0); err == nil && sw != nil && sw.Terminal {
-		return awaitStageSettledOutput(stageType, sw, start, heartbeat, capSeconds), true
+		return r.awaitStageSettled(ctx, runID, stageUUID, stageType, sw, start, heartbeat, capSeconds), true
 	}
 	return awaitStageAmendmentPendingOutput(stageType, stageUUID.String(), runID, state, item, start, heartbeat, capSeconds), true
 }
@@ -470,6 +479,53 @@ func awaitStageAmendmentPendingOutput(stageType, stageID string, runID uuid.UUID
 			"the agent polls %s per request and then the request EXPIRES UNDECIDED (it stays pending — an expiry is not a denial, so decide now).",
 			stageType, item.ID, pathList, item.Reason, amendmentPollWindowText()),
 	}
+}
+
+// awaitStageSettled is the settled-response builder every settled path goes
+// through (E68.31 / #3081): it calls the pure awaitStageSettledOutput and then
+// DECORATES the result with the fix-up-recovery marker when one applies.
+//
+// Without this, a fix-up that FAILED and was recovered by the backend settles
+// as a bare `succeeded` / `terminal: true` — byte-identical to a fix-up that
+// landed a commit — so an operator cannot tell the routed concerns were never
+// addressed. The marker rides on StageWaitStatus (the block get_run_status and
+// the dispatch verbs already carry) and its advisory is ALSO promoted to the
+// top-level Message, where a caller reading only the settled summary sees it.
+//
+// The probe is gated on stageType == "implement": no other stage type can carry
+// a fix-up, so an ordinary plan / review / acceptance wait pays nothing. It is
+// BEST-EFFORT (fixupRecoveryFor returns nil on any audit read error), so a
+// transient audit failure loses the advisory and returns the settled response
+// INTACT rather than failing a wait that may have been running for hours.
+func (r *runResolver) awaitStageSettled(ctx context.Context, runID, stageUUID uuid.UUID, stageType string, sw *RunStageWait, start time.Time, heartbeat bool, capSeconds int) AwaitStageOutput {
+	out := awaitStageSettledOutput(stageType, sw, start, heartbeat, capSeconds)
+	if stageType != "implement" {
+		return out
+	}
+	return decorateSettledWithFixupRecovery(out, r.fixupRecoveryFor(ctx, runID, stageUUID))
+}
+
+// decorateSettledWithFixupRecovery attaches the #3081 marker to a settled
+// response. The structured block and the top-level message are ONE advisory in
+// two places, so they are attached TOGETHER or not at all: a response carrying
+// the prose without the block would hand a caller a warning it cannot act on
+// programmatically, and one carrying the block without the prose would let a
+// caller reading only the summary miss it.
+//
+// The StageWaitStatus nil arm is unreachable on today's code —
+// awaitStageSettledOutput always populates it from classifyStageWaitStatus,
+// which returns a non-nil *StageWaitStatus on every path — so this is
+// defence-in-depth against a future refactor that makes the field optional,
+// not a live branch. It is a pure function precisely so the pairing stays
+// falsifiable: the surrounding builder cannot produce a nil block, but a test
+// can hand one straight to this.
+func decorateSettledWithFixupRecovery(out AwaitStageOutput, rec *FixupRecovery) AwaitStageOutput {
+	if rec == nil || out.StageWaitStatus == nil {
+		return out
+	}
+	out.StageWaitStatus.FixupRecovered = rec
+	out.Message = rec.Message
+	return out
 }
 
 // awaitStageSettledOutput builds the resolved response for a settled stage. It

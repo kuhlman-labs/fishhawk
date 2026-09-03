@@ -1273,6 +1273,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// cannot bleed a stale claim into a fresh attempt. No-ops on every
 		// non-fix-up implement stage (the sidecar is fix-up-only).
 		sweepStaleFixupSelfReport(cfg, logSink)
+		// Pre-invoke counterfactual sidecar sweep (#2929): delete any leftover
+		// counterfactual sidecar at THIS run/stage's keyed path before the agent
+		// runs, so a same-keyed leftover from a prior retry of this run/stage
+		// cannot bleed a stale CLAIM into a fresh attempt. Unconditional — it
+		// no-ops on every stage whose agent wrote no sidecar.
+		sweepStaleCounterfactualReport(cfg, logSink, counterfactualSweepPreInvoke)
 		// Pre-invoke fix-up commit-message sweep (#1572): delete any leftover
 		// commit-message sidecar at THIS run/stage's keyed path before the agent
 		// runs, so a pass whose agent never re-writes the file falls back to the
@@ -2185,6 +2191,30 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if len(selfReport.counterfactuals) > 0 {
 			res.Events = append(res.Events, fixupCounterfactualsEvent(cfg, selfReport.counterfactuals))
 		}
+		// A fix-up pass carries its counterfactuals in the self-report sidecar
+		// above, so the #2929 sidecar is NOT read here. Sweep it anyway: an
+		// agent that wrote one on this pass would otherwise leave it unread in
+		// /tmp, where the next pass's keyed path could never reach it but a
+		// human reading /tmp would find a file that looks like live evidence.
+		// The body lives in a helper so a unit test can drive it and assert the
+		// file is GONE, not merely that a sweep call is textually present.
+		sweepUnreadCounterfactualReport(cfg, logSink)
+	}
+
+	// Initial-implement counterfactual self-report (#2929). The EXACT complement
+	// of the fix-up block above (`!cfg.fixup` against its `cfg.fixup`), so
+	// exactly ONE of the two channels reads per pass and a claim can never be
+	// double-counted into gate_evidence. Reuses the #3042 wire kind
+	// (fixup_counterfactuals) and payload shape ON PURPOSE: composeGateEvidence,
+	// bundle.GateEvidence and the backend's trace mapping are all already
+	// pass-agnostic, and the runner is an independently pinned module — a
+	// renamed kind would be silently DROPPED by a pinned older backend, losing
+	// evidence with no error. EVIDENCE ONLY: like its siblings this block NEVER
+	// touches res.OK / res.FailureCategory / budget. The body lives in
+	// emitInitialCounterfactuals so a unit test can DRIVE it and assert the
+	// event on res.Events, rather than only parsing this branch's text.
+	if stageType == "implement" && !cfg.fixup {
+		emitInitialCounterfactuals(cfg, scopePaths(cfg.scopeFiles), &res, logSink)
 	}
 
 	// Emit the GenAI observability span for this stage as soon as the
@@ -2516,6 +2546,17 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// branch, and passed into the failure report below so a retry_stage can
 			// resume the PR open with no agent re-invocation.
 			var prCheckpoint pushCheckpoint
+			// Arm the per-stage agent-handoff memo (#2840) immediately before
+			// the FIRST openPRAndShipArtifact call. Arming here — rather than
+			// capturing eagerly above the retry — is what keeps the first pass
+			// byte-identical: the first read still happens INSIDE
+			// openPRAndShipArtifact, at the same point in the log, with the same
+			// emits in the same order. Only a SECOND pass (the base-rebase
+			// re-invoke retry below, or any future third) consults the memo.
+			// Nothing else in the process is armed, so the plan/acceptance
+			// stages, the held-commit resume and the fix-up-only paths are
+			// unchanged.
+			cfg.handoff = &agentHandoff{}
 			// Migration-number collision park (#2748). Placed HERE, immediately
 			// before the ship, and NOT inside verifyCommit: by the time that
 			// closure runs, CommitAndPush has already staged the scope-only
@@ -3110,6 +3151,11 @@ func classifyErr(err error) string {
 		return "external_api"
 	case errors.Is(err, agent.ErrAgentQuotaUnavailable):
 		return "agent_quota_unavailable"
+	case errors.Is(err, agent.ErrTraceStreamRead):
+		// Placed BEFORE the ErrAgentFailed arm defensively — the sentinel is a
+		// peer that does not wrap ErrAgentFailed (agent_test pins that), so the
+		// switch reads correctly either way, but ordering makes the intent plain.
+		return "trace_stream_read"
 	case errors.Is(err, agent.ErrAgentFailed):
 		return "agent_failed"
 	default:
@@ -4863,7 +4909,17 @@ green.`, verifyCmd, output)
 // already contains the newer commits — with the captured conflict context.
 // detail may be nil (a plain ErrBaseRebaseConflict with no typed context, or
 // a capture-degraded error); the prompt then omits the context sections.
-func baseRebaseConflictPrompt(detail *gitops.BaseRebaseConflictError) string {
+//
+// It also RE-REQUESTS both agent handoffs by absolute keyed path (#2840, the
+// issue's option 3): attempt 1's openPRAndShipArtifact already consumed them
+// (both loaders are delete-after-read), so a re-invoked agent that writes
+// nothing would otherwise ship the placeholder title/body/commit message. The
+// paths are built from the runner's OWN pullRequestDescriptionPath /
+// implementCommitMessagePath helpers, so the prompt can never name a path the
+// runner does not read. This is belt-and-braces: cfg.handoff already closes the
+// hole when the agent does not comply, and prefer-fresh means a compliant
+// agent's re-written text still wins over the memo.
+func baseRebaseConflictPrompt(cfg config, detail *gitops.BaseRebaseConflictError) string {
 	var b strings.Builder
 	b.WriteString(`Your previous edits did NOT land: the base branch moved while you worked —
 sibling or base commits landed after you started, and re-applying your changes
@@ -4878,6 +4934,15 @@ Re-land your full original slice on top of the current tree:
 - Stay within the approved scope.files — edit only the files you were already
   allowed to change.
 `)
+	fmt.Fprintf(&b, `
+Re-write BOTH of your handoff files. The ones you wrote on the previous attempt
+were CONSUMED by the attempt that failed, so they no longer exist on disk:
+- The pull-request description (first line the Conventional Commits title, blank
+  line, then the markdown body ending with your `+"`Closes #N`"+` line):
+  %s
+- The initial commit message (Conventional Commits header, blank line, body):
+  %s
+`, pullRequestDescriptionPath(cfg.runID, cfg.stageID), implementCommitMessagePath(cfg.runID, cfg.stageID))
 	if detail == nil {
 		return b.String()
 	}
@@ -4962,7 +5027,7 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 	}
 
 	reinvokeInv := baseInv
-	reinvokeInv.Prompt = baseRebaseConflictPrompt(detail)
+	reinvokeInv.Prompt = baseRebaseConflictPrompt(cfg, detail)
 
 	// Bounded infra-retry on the re-invocation, mirroring the verify-fix
 	// loop's maxFixInvokeInfraRetries pattern (#804): a transient agent-API/
@@ -6744,7 +6809,7 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	// the placeholder half. The attribution footer is appended EXACTLY ONCE here —
 	// the served body is footer-free by contract (see prTitleAndBodyParts), and
 	// this is the runner that opens the PR, so it owns the footer.
-	title, body, agentAuthored := prTitleAndBodyParts(cfg, branch, logSink)
+	title, body, agentAuthored, prBodyFallbackReason := prTitleAndBodyParts(cfg, branch, logSink)
 	if servedPRTitle != "" {
 		title = servedPRTitle
 	}
@@ -6762,6 +6827,35 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"held_commit_pr_text_recovered","run_id":%q,"stage_id":%q,"title_recovered":%t,"body_recovered":%t}`+"\n",
 			cfg.runID, cfg.stageID, servedPRTitle != "", servedPRBody != "")
+	}
+	// #3012 composition-failure signal, decided on the RESOLVED state — this is
+	// why prTitleAndBodyParts stays pure and the emit lives here. Three outcomes,
+	// and each records only what actually happened:
+	//
+	//   - composition SUCCEEDED (reason none): nothing to announce, whether or
+	//     not this resume also carried served text. Emitting pr_body_recovered
+	//     here would announce a recovery of nothing (binding condition 2).
+	//   - composition FELL BACK and the served body REPLACED the placeholder:
+	//     pr_body_recovered, and NO reason on the artifact. A resume that
+	//     recovered its text must never be recorded as a composition failure.
+	//   - composition FELL BACK and the placeholder survived (including the
+	//     title-recovered-body-missing case): mark the body and emit
+	//     pr_body_not_composed, exactly as the ordinary path does.
+	//
+	// So `grep pr_body_not_composed` never matches a run that recovered.
+	prHandoffPath := pullRequestDescriptionPath(cfg.runID, cfg.stageID)
+	artifactFallbackReason := prBodyFallbackReason
+	switch {
+	case prBodyFallbackReason == prBodyReasonNone:
+		// Nothing failed; say nothing.
+	case servedPRBody != "":
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pr_body_recovered","run_id":%q,"stage_id":%q,"reason":%q,"title_recovered":%t,"body_recovered":true}`+"\n",
+			cfg.runID, cfg.stageID, string(prBodyFallbackReason), servedPRTitle != "")
+		artifactFallbackReason = prBodyReasonNone
+	default:
+		body = prBodyNotComposedMarker(cfg, prBodyFallbackReason, prHandoffPath) + body
+		emitPRBodyNotComposed(logSink, cfg, prBodyFallbackReason, prHandoffPath)
 	}
 	// Route through the forge-agnostic dispatch (ADR-058 / E45.5): a
 	// --forge=gitlab exempt resolution opens a merge request via the GitLab
@@ -6799,7 +6893,7 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		`{"event":%q,"run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q,"base_sha":%q,"branch":%q}`+"\n",
 		openedEvent, cfg.runID, cfg.stageID, prRes.PRNumber, prRes.PRURL, heldSHA, heldBaseSHA, branch)
 
-	artifactBody, _ := json.Marshal(map[string]any{
+	heldArtifactFields := map[string]any{
 		"pr_number": prRes.PRNumber,
 		"pr_url":    prRes.PRURL,
 		"branch":    branch,
@@ -6807,7 +6901,13 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		"base_sha":  heldBaseSHA,
 		"title":     title,
 		"body":      body,
-	})
+	}
+	// Same omit-when-empty rule as the ordinary ship (#3012): absent on a
+	// composed ship AND on a recovered resume, so those bytes are unchanged.
+	if artifactFallbackReason != prBodyReasonNone {
+		heldArtifactFields["pr_body_fallback_reason"] = string(artifactFallbackReason)
+	}
+	artifactBody, _ := json.Marshal(heldArtifactFields)
 	shipRes, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
 		RunID:      cfg.runID,
 		StageID:    cfg.stageID,
@@ -7039,7 +7139,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// unless the agent actually authored a PR description — the placeholder is
 	// never persisted, because persisting it would defeat the whole point of
 	// carrying text across the resume.
-	title, prBody, agentAuthoredPR := prTitleAndBodyParts(cfg, branch, logSink)
+	title, prBody, agentAuthoredPR, prBodyFallbackReason := prTitleAndBodyParts(cfg, branch, logSink)
 	body := prBody
 	var agentPRTitle, agentPRBody string
 	if agentAuthoredPR {
@@ -7054,16 +7154,41 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// the (run/stage-keyed, #1777) PR-description handoff unchanged. Overridden
 	// below on the isFixup path.
 	commitMessage := implementCommitMessage(cfg, title, body, logSink)
-	// #2884 fix-up landing snapshots. Captured on the isFixup path BEFORE
-	// CommitAndPush (and thus before the committed-tree verify gate's throwaway
-	// `fishhawk verify wip` commit + gitResetSoftHEAD1 unwind), so the post-pass
-	// stranded-work check can tell the pass's OWN residue (a net-new stash, an
-	// advanced HEAD, a dangling commit) from pre-existing state. Left zero-valued
-	// off the isFixup path.
+	// #3012. ORDERING IS LOAD-BEARING: the marker is applied AFTER
+	// implementCommitMessage, which on the no-sidecar path composes the commit
+	// message from title + body. Marking first would stamp the marker into
+	// main's squash commit message; TestOpenPRAndShipArtifact_FallbackCommitMessageUnchanged
+	// pins that it does not.
+	//
+	// The condition is `reason != none`, NOT `!agentAuthoredPR` (binding
+	// condition 1): a TITLE-ONLY handoff is agent-authored yet ships a
+	// footer-only body with no `Closes #N` — the exact silent shape of #3012 —
+	// so it gets the marker too.
+	prHandoffPath := pullRequestDescriptionPath(cfg.runID, cfg.stageID)
+	if prBodyFallbackReason != prBodyReasonNone {
+		body = prBodyNotComposedMarker(cfg, prBodyFallbackReason, prHandoffPath) + body
+		emitPRBodyNotComposed(logSink, cfg, prBodyFallbackReason, prHandoffPath)
+	}
+	// #2884 fix-up landing snapshot. Captured on the isFixup path BEFORE
+	// CommitAndPush, so the post-pass stranded-work check can tell the pass's OWN
+	// residue (a net-new stash, an advanced HEAD) from pre-existing state. Left
+	// zero-valued off the isFixup path.
+	//
+	// ORDERING, stated correctly (it was documented backwards until #3023): this
+	// is before CommitAndPush but AFTER the committed-tree verify gate has already
+	// created and unwound its throwaway `fishhawk verify wip` commit —
+	// runVerifyFixLoop runs in run() (main.go ~1987) and openPRAndShipArtifact,
+	// which owns this snapshot, is called after it (~2536 / ~2625). That is why
+	// the #2884 reflog provenance probe could never see a dangling verify-wip
+	// commit and was removed in #3023; no snapshot here detects one.
+	//
+	// #3022: probe 3's witness is NOT this snapshot — it is the verify gate's
+	// certified verifiedTreeSHA (threaded in as a parameter), compared against the
+	// base tip's tree. So probe 3 is unaffected by fixupSnapshotErr and closes the
+	// exact shape no reflog snapshot ordering can reach.
 	var (
 		fixupBaseTipSHA  string
 		fixupPreStash    []stashEntry
-		fixupPreReflog   []stashEntry
 		fixupSnapshotErr error
 	)
 	if isFixup {
@@ -7084,18 +7209,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		fixupBaseTipSHA = baseTipSHA
 		commitMessage = fixupCommitMessage(cfg, baseTipSHA, logSink)
 
-		// #2884: snapshot the stash stack and HEAD reflog before CommitAndPush.
-		// A snapshot read failure makes the later stranded-work check fail CLOSED
-		// (category C) rather than silently skip — with no baseline the runner
-		// cannot prove the work landed, which is the condition the incident
-		// exploited. Fold a reflog read failure into the same signal.
-		var stashErr, reflogErr error
-		fixupPreStash, stashErr = fixupStashList(ctx, repoDir)
-		fixupPreReflog, reflogErr = fixupReflogCommits(ctx, repoDir)
-		fixupSnapshotErr = stashErr
-		if fixupSnapshotErr == nil {
-			fixupSnapshotErr = reflogErr
-		}
+		// #2884: snapshot the stash stack before CommitAndPush. A snapshot read
+		// failure makes the later stranded-work check fail CLOSED (category C)
+		// rather than silently skip — with no baseline the runner cannot prove the
+		// work landed, which is the condition the incident exploited. Since #3023
+		// the STASH read is the sole input to this signal: the reflog is no longer
+		// read at all, so a reflog fault no longer fails the pass closed.
+		fixupPreStash, fixupSnapshotErr = fixupStashList(ctx, repoDir)
 		if fixupSnapshotErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"fixup_stash_snapshot_unavailable","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
@@ -7699,7 +7819,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				return fmt.Errorf("%w: fix-up pre-push snapshot unavailable, cannot prove work landed: %v",
 					gitops.ErrVerifyInfraFailure, fixupSnapshotErr)
 			}
-			reasons, sErr := strandedFixupWork(ctx, repoDir, fixupBaseTipSHA, fixupPreStash, fixupPreReflog)
+			reasons, sErr := strandedFixupWork(ctx, repoDir, fixupBaseTipSHA, fixupPreStash, verifiedTreeSHA)
 			if sErr != nil {
 				// A probe failure is infrastructure (category C): re-run in place
 				// rather than silently reporting success over unproven work.
@@ -7710,8 +7830,8 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				localHead, _ := fixupLocalHead(ctx, repoDir)
 				reasonsJSON, _ := json.Marshal(reasons)
 				_, _ = fmt.Fprintf(logSink,
-					`{"event":"fixup_work_stranded","run_id":%q,"stage_id":%q,"branch":%q,"expected_head_sha":%q,"actual_head_sha":%q,"reasons":%s}`+"\n",
-					cfg.runID, cfg.stageID, branch, fixupBaseTipSHA, localHead, reasonsJSON)
+					`{"event":"fixup_work_stranded","run_id":%q,"stage_id":%q,"branch":%q,"expected_head_sha":%q,"actual_head_sha":%q,"verified_tree_sha":%q,"reasons":%s}`+"\n",
+					cfg.runID, cfg.stageID, branch, fixupBaseTipSHA, localHead, verifiedTreeSHA, reasonsJSON)
 				return fmt.Errorf("%w: %s", gitops.ErrFixupWorkStranded, strings.Join(reasons, "; "))
 			}
 			_, _ = fmt.Fprintf(logSink,
@@ -8007,6 +8127,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		"title":               title,
 		"body":                body,
 		"files_changed_count": filesChanged,
+	}
+	// #3012: ride the classification onto the artifact so the backend can fold
+	// it into the pull_request_opened audit payload. Omitted ENTIRELY on every
+	// composed ship (the #1218/#2570 omitempty discipline), so the happy path's
+	// artifact bytes, content hash and signature stay byte-identical.
+	if prBodyFallbackReason != prBodyReasonNone {
+		artifactFields["pr_body_fallback_reason"] = string(prBodyFallbackReason)
 	}
 	// Base-rebase re-invoke exemption delta (#1218): include the supplemental set
 	// ONLY when the re-invoke produced one, so every non-re-invoke ship omits the
@@ -8614,12 +8741,37 @@ func sweepStaleScopeJustification(cfg config, logSink io.Writer) {
 //     (trailing-slash directory entries and unknown paths excluded) or whose
 //     reason is empty/whitespace, logging scope_justification_entry_ignored.
 //
+// Over the ceiling (E64.12 / #3106) it fails closed (nil), logging
+// scope_justification_oversize and removing the file by hand (this return
+// precedes the deferred removal below). DIAGNOSIS: an oversize read is already a
+// non-ErrNotExist read error the fail-closed return below covers; the named
+// event tells an operator an oversize sidecar from a malformed one.
+//
 // `declared` is the declared scope.files path set (scopePaths(cfg.scopeFiles)).
 // Returns the surviving validated entries.
 func loadScopeExemptions(cfg config, declared []string, logSink io.Writer) []scopeExemption {
 	path := scopeJustificationPath(cfg.runID, cfg.stageID)
-	raw, err := os.ReadFile(path)
+	raw, err := readSidecarBounded(path)
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): fail closed AND remove, checking
+			// the removal result (#3106 fix-up). A readable-but-unremovable file —
+			// a parent directory that denies write, a filesystem error — would
+			// otherwise survive silently and be re-read by a later pass, so a failed
+			// removal gets its own scope_justification_unremovable line BESIDE the
+			// oversize line: a path we could not read and could not remove are two
+			// distinct facts an operator needs both of. Fail-closed return unchanged.
+			rmErr := os.Remove(path)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"scope_justification_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, path, maxSidecarBytes)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"scope_justification_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, path, rmErr.Error())
+			}
+			return nil
+		}
 		// Absent sidecar is the common no-op (strict gate, no exemptions); any
 		// other read error is fail-closed too. Only an existing file's content
 		// can exempt anything, so no log on the not-exist path.
@@ -9119,6 +9271,15 @@ func sweepStaleFixupSelfReport(cfg config, logSink io.Writer) {
 // present sidecar it deletes the file on EVERY return path (consumed/malformed/
 // stale all clean up, so an invalid sidecar is never left behind to bleed into a
 // later read), and:
+//   - fails closed (zero result) when the sidecar exceeds maxSidecarBytes
+//     (E64.12 / #3106), logging fixup_selfreport_oversize and REMOVING the file
+//     by hand — this loader returns on the read-error path BEFORE its deferred
+//     removal is installed, so the oversize branch must write the removal out
+//     itself to satisfy the sidecar-removed requirement. The removal is the one
+//     thing this branch buys beyond diagnosis: the fail-closed return is already
+//     there (an oversize read is a non-ErrNotExist error), so a deleted
+//     event-name assertion would go red while a deleted removal would leave the
+//     file on disk;
 //   - fails closed ("") on malformed JSON, logging fixup_selfreport_invalid;
 //   - fails closed ("") when the embedded run_id/stage_id do not match cfg,
 //     logging fixup_selfreport_stale (a leftover from another run/stage);
@@ -9139,8 +9300,29 @@ func sweepStaleFixupSelfReport(cfg config, logSink io.Writer) {
 // the surviving obligation reports.
 func loadFixupSelfReport(cfg config, scope []string, logSink io.Writer) fixupSelfReportResult {
 	path := fixupSelfReportPath(cfg.runID, cfg.stageID)
-	raw, err := os.ReadFile(path)
+	raw, err := readSidecarBounded(path)
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): log the named diagnostic AND
+			// remove the sidecar by hand — this return is reached BEFORE the
+			// deferred removal below is installed, so an oversize file would
+			// otherwise survive on disk. The removal result is CHECKED (#3106
+			// fix-up): a readable-but-unremovable file would otherwise survive
+			// silently and be re-read by a later pass, so a failed removal gets its
+			// own fixup_selfreport_unremovable line BESIDE the oversize line — a
+			// path we could not read and could not remove are two distinct facts.
+			// The fail-closed zero result is unchanged.
+			rmErr := os.Remove(path)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_selfreport_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, path, maxSidecarBytes)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"fixup_selfreport_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, path, rmErr.Error())
+			}
+			return fixupSelfReportResult{}
+		}
 		// Absent sidecar is the common no-op (the agent reported nothing); any
 		// other read error is fail-closed too. Only an existing file's content
 		// can claim anything, so no log on the not-exist path.
@@ -9174,6 +9356,274 @@ func loadFixupSelfReport(cfg config, scope []string, logSink io.Writer) fixupSel
 	out.obligations = validateFixupObligationReports(cfg, doc.Obligations, logSink)
 	out.counterfactuals = validateFixupCounterfactuals(cfg, doc.Counterfactuals, scope, logSink)
 	return out
+}
+
+// counterfactualReportDir is the directory the run/stage-keyed NON-fix-up
+// counterfactual sidecar lives in (#2929). var (not const) so tests can
+// redirect it to a t.TempDir, avoiding /tmp pollution / parallel-test races —
+// the same seam pattern as scopeJustificationDir / fixupSelfReportDir.
+var counterfactualReportDir = "/tmp"
+
+// counterfactualReportPath mirrors prompt.CounterfactualReportPath in the
+// backend: the run/stage-keyed path the INITIAL (non-fix-up) implement agent
+// writes its counterfactual self-report to and the runner reads it from
+// (#2929). The format string is hardcoded in both independent modules by
+// design — the same coordination as fixupSelfReportPath / FixupSelfReportPath —
+// so a ONE-SIDED edit to either copy silently disables the channel: the agent
+// writes a file nobody reads, and the runner reads a path nobody writes, with
+// no error on either side. It is caught by the prompt-render test (asserts the
+// literal substituted path) plus the runner load tests below.
+//
+// The FULL run + stage ids key the path so a leftover sidecar from another
+// run/stage can never collide — the first of three freshness defenses (the
+// others are the embedded-id validation in loadCounterfactualReport and the
+// pre-invoke sweep in run()).
+func counterfactualReportPath(runID, stageID string) string {
+	return filepath.Join(counterfactualReportDir, fmt.Sprintf("fishhawk-counterfactuals-%s-%s.json", runID, stageID))
+}
+
+// counterfactualReport is the agent's structured counterfactual self-report on
+// the INITIAL implement pass (#2929). It deliberately REUSES
+// fixupCounterfactualReport for its entries rather than declaring a parallel
+// type: the per-entry rules, the *bool Restored (absent != false) and the
+// validator are all shared, so the two channels can never drift into
+// disagreeing about what a valid entry is.
+type counterfactualReport struct {
+	RunID           string                      `json:"run_id"`
+	StageID         string                      `json:"stage_id"`
+	Counterfactuals []fixupCounterfactualReport `json:"counterfactuals"`
+}
+
+// maxSidecarIDBytes bounds ONE agent-authored sidecar id echoed into the runner
+// log. The ids are read out of a file the agent wrote, so they are unbounded
+// agent-controlled text; %q escapes control characters but does NOT bound
+// length, so without this an agent could push arbitrary-length text into the
+// runner log through the stale-path diagnostic.
+const maxSidecarIDBytes = 64
+
+// safeSidecarID renders one agent-authored sidecar id for the stale-path log,
+// bounded to maxSidecarIDBytes with a visible truncation marker. Combined with
+// the %q the caller applies, the emitted value is both escaped and bounded.
+func safeSidecarID(id string) string {
+	if len(id) <= maxSidecarIDBytes {
+		return id
+	}
+	return strings.ToValidUTF8(id[:maxSidecarIDBytes], "") + "…"
+}
+
+// The two counterfactual-sidecar sweep sites carry DISTINCT reasons (#2929
+// fix-up). A single shared literal conflated two situations an operator reading
+// the log must be able to tell apart: a leftover from a PRIOR attempt of this
+// same run/stage, versus a file THIS pass's agent authored that the fix-up
+// channel deliberately never reads. Both are logged under the same
+// counterfactual_report_swept event, so the reason field is what discriminates.
+const (
+	// counterfactualSweepPreInvoke: swept before the agent was invoked, so a
+	// removed file is a leftover from a prior retry of this run/stage and no
+	// agent on THIS attempt authored it.
+	counterfactualSweepPreInvoke = "pre_invoke_stale_leftover"
+	// counterfactualSweepFixupUnread: swept at the end of a FIX-UP pass, so a
+	// removed file is one THIS pass's agent wrote and the fix-up channel
+	// deliberately did not read (a fix-up carries its counterfactuals in the
+	// #3042 self-report sidecar instead).
+	counterfactualSweepFixupUnread = "fixup_pass_authored_unread"
+)
+
+// pathExists reports whether SOMETHING sits at path, WITHOUT following a
+// symlink (#2929 fix-up). os.Lstat is the deliberate choice over os.Stat: a
+// dangling symlink is present agent-authored state that must be cleaned up,
+// yet os.Stat (like os.ReadFile) resolves the link and reports the missing
+// TARGET's ENOENT, which would read as absence.
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+// sweepStaleCounterfactualReport deletes any leftover counterfactual sidecar at
+// this run/stage's keyed path (#2929), naming which of the two sweep sites it
+// is via reason (see the constants above).
+//
+// Removal is RECURSIVE (os.RemoveAll), matching loadCounterfactualReport's
+// unreadable branch: an agent can put a non-empty DIRECTORY at the sidecar
+// path, which a non-recursive os.Remove can never clear. Because os.RemoveAll
+// reports success for an ABSENT path, presence is decided by an os.Lstat first
+// rather than by the removal's error — otherwise the common no-op would log.
+//
+// A cleanup that FAILS is surfaced (counterfactual_report_sweep_failed) rather
+// than silently swallowed: a path that survives the sweep must never be
+// reported as successfully removed.
+func sweepStaleCounterfactualReport(cfg config, logSink io.Writer, reason string) {
+	path := counterfactualReportPath(cfg.runID, cfg.stageID)
+	if _, serr := os.Lstat(path); serr != nil {
+		// Absent (the overwhelmingly common case): silent no-op. Only an
+		// existing file's removal is worth a log line.
+		return
+	}
+	if rerr := os.RemoveAll(path); rerr != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"counterfactual_report_sweep_failed","run_id":%q,"stage_id":%q,"path":%q,"reason":%q,"error":%q}`+"\n",
+			cfg.runID, cfg.stageID, path, reason, rerr.Error())
+		return
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"counterfactual_report_swept","run_id":%q,"stage_id":%q,"path":%q,"reason":%q}`+"\n",
+		cfg.runID, cfg.stageID, path, reason)
+}
+
+// emitInitialCounterfactuals IS the initial (non-fix-up) implement pass's
+// counterfactual channel body, extracted out of run() so a unit test can DRIVE
+// it (#2929 fix-up). run() takes (args []string, logSink io.Writer), spawns the
+// agent CLI and does real git work, so the branch body was previously pinned
+// only STRUCTURALLY (by parsing main.go) — which cannot tell a call that runs
+// from a call sitting under dead code. With the body in a helper,
+// TestEmitInitialCounterfactuals_* asserts the real thing: the event actually
+// appended to res.Events, and the sidecar actually gone from disk.
+//
+// EVIDENCE ONLY, like its two fix-up siblings: it appends to res.Events and
+// touches res.OK / res.FailureCategory / budget never.
+func emitInitialCounterfactuals(cfg config, scope []string, res *agent.Result, logSink io.Writer) {
+	if entries := loadCounterfactualReport(cfg, scope, logSink); len(entries) > 0 {
+		res.Events = append(res.Events, fixupCounterfactualsEvent(cfg, entries))
+	}
+}
+
+// sweepUnreadCounterfactualReport IS the fix-up branch's counterfactual body,
+// extracted for the same reason as emitInitialCounterfactuals: a structural pin
+// cannot distinguish a sweep that RUNS from one that runs and fails to remove
+// the file, and "the file is gone" is precisely the property the fix-up channel
+// owes. A fix-up pass carries its counterfactuals in the #3042 self-report
+// sidecar, so the #2929 sidecar is never read here — only swept, under the
+// fixup_pass_authored_unread reason, so an operator can tell an agent-authored
+// unread file from a pre-invoke leftover.
+func sweepUnreadCounterfactualReport(cfg config, logSink io.Writer) {
+	sweepStaleCounterfactualReport(cfg, logSink, counterfactualSweepFixupUnread)
+}
+
+// loadCounterfactualReport reads + validates the INITIAL implement pass's
+// counterfactual sidecar (#2929) fail-closed, mirroring loadFixupSelfReport's
+// whole-sidecar ladder with one deliberate improvement: the read-error branch
+// distinguishes ABSENT from PRESENT-BUT-UNREADABLE.
+//
+//   - ABSENT (os.ErrNotExist) → nil, silently. This is the common no-op: every
+//     stage whose agent wrote no sidecar takes it, so it must not log.
+//   - PRESENT BUT UNREADABLE (any other read error — a directory at the path, a
+//     permission failure) → the path is REMOVED and counterfactual_report_
+//     unreadable logged before returning nil. loadFixupSelfReport returns here
+//     BEFORE its deferred removal is installed, so an unreadable sidecar
+//     survives on disk contrary to its stated every-return-path cleanup
+//     invariant; this loader closes that gap.
+//   - OVER-CEILING (readSidecarBounded returned errSidecarTooLarge — the read
+//     was refused before the bytes were materialized, E64.12 / #3106) → the
+//     path is REMOVED (reusing the same checked-removal shape as the unreadable
+//     branch) and counterfactual_report_oversize logged before returning nil.
+//     This is DIAGNOSIS, not the control: the security property is the ceiling
+//     inside readSidecarBounded, and even with no oversize branch here this
+//     loader would still fail closed (an errSidecarTooLarge is a non-ErrNotExist
+//     read error, so the unreadable branch below already returns nil). The named
+//     event is what lets an operator tell an oversize sidecar from a malformed
+//     one.
+//   - MALFORMED JSON → nil + counterfactual_report_invalid.
+//   - STALE (embedded run_id/stage_id not matching cfg) → nil +
+//     counterfactual_report_stale, echoing the foreign ids through
+//     safeSidecarID so an unbounded agent-authored string cannot flood the log.
+//
+// On a successfully READ sidecar the file is removed on every return path, so
+// malformed / stale / consumed all clean up and nothing bleeds into a later
+// read.
+//
+// Per-entry validation REUSES validateFixupCounterfactuals unchanged — the same
+// scope-membership, closed observed enum, present-restored, non-empty-record
+// and cap rules, the same fixup_counterfactual_dropped log, and the same
+// discard of the agent-authored record text before the upload boundary. The
+// rules are deliberately NOT forked: one validator means the two channels
+// cannot drift.
+func loadCounterfactualReport(cfg config, scope []string, logSink io.Writer) []fixupCounterfactualEvidence {
+	path := counterfactualReportPath(cfg.runID, cfg.stageID)
+	raw, err := readSidecarBounded(path)
+	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): fail closed AND remove, reusing
+			// the checked-removal shape the unreadable branch uses below — a path
+			// we could not read and could not remove are two distinct facts, each
+			// logged. DIAGNOSIS, not the control: errSidecarTooLarge is already a
+			// non-ErrNotExist read error, so the unreadable branch would fail
+			// closed even without this branch; the named event is what an
+			// operator needs to tell an oversize sidecar from a malformed one.
+			rmErr := os.RemoveAll(path)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"counterfactual_report_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, path, maxSidecarBytes)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"counterfactual_report_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, path, rmErr.Error())
+			}
+			return nil
+		}
+		if errors.Is(err, os.ErrNotExist) && !pathExists(path) {
+			// The common no-op: the agent reported nothing. No log — only an
+			// existing file's content can claim anything.
+			//
+			// The pathExists (os.Lstat) re-check is load-bearing, NOT a
+			// tautology (#2929 fix-up): os.ReadFile FOLLOWS symlinks, so a
+			// DANGLING symlink at the keyed path — present agent-authored
+			// state — reports ENOENT for its missing TARGET. Trusting the read
+			// error alone would return here without cleanup and leave that
+			// symlink on disk, bypassing the present-but-unreadable removal
+			// below. os.Lstat does not follow the link, so it tells actual
+			// path absence from a present-but-broken link, and the latter
+			// falls through to be removed fail-closed.
+			return nil
+		}
+		// Present but unreadable: fail closed AND remove, so a path we could
+		// not read is never left behind to be retried by a later pass.
+		//
+		// The removal result is CHECKED, not discarded (#2929 fix-up). An agent
+		// can construct a path — a non-empty directory whose parent denies
+		// write — for which BOTH the read and the recursive removal fail; the
+		// blocking cleanup requirement is then unmet, and reporting only
+		// counterfactual_report_unreadable would let a PERSISTENT path be read
+		// as successfully removed. So a failed cleanup gets its own
+		// counterfactual_report_unremovable line naming the error, emitted
+		// BESIDE the unreadable line rather than instead of it: the read
+		// failure and the cleanup failure are two distinct facts and an
+		// operator needs both.
+		rmErr := os.RemoveAll(path)
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"counterfactual_report_unreadable","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+		if rmErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"counterfactual_report_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+				cfg.runID, cfg.stageID, path, rmErr.Error())
+		}
+		return nil
+	}
+	// A present sidecar is consumed regardless of outcome — and, as on the
+	// unreadable branch above, a consumption that FAILS is surfaced rather than
+	// discarded, so a file that survives is never read as removed.
+	defer func() {
+		if rmErr := os.Remove(path); rmErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"counterfactual_report_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+				cfg.runID, cfg.stageID, path, rmErr.Error())
+		}
+	}()
+
+	var doc counterfactualReport
+	if json.Unmarshal(raw, &doc) != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"counterfactual_report_invalid","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+		return nil
+	}
+	if doc.RunID != cfg.runID || doc.StageID != cfg.stageID {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"counterfactual_report_stale","run_id":%q,"stage_id":%q,"sidecar_run_id":%q,"sidecar_stage_id":%q}`+"\n",
+			cfg.runID, cfg.stageID, safeSidecarID(doc.RunID), safeSidecarID(doc.StageID))
+		return nil
+	}
+	return validateFixupCounterfactuals(cfg, doc.Counterfactuals, scope, logSink)
 }
 
 // fixupCommitMessageDir is the directory the run/stage-keyed fix-up commit-
@@ -9210,14 +9660,34 @@ func sweepStaleFixupCommitMessage(cfg config, logSink io.Writer) {
 // loadFixupCommitMessage reads the agent's fix-up commit-message sidecar (#1572)
 // and splits it into (subject, body). It deletes the file on EVERY return path
 // (delete-after-read) so a stale sidecar can never bleed into a later pass.
-// Returns ok=false when the sidecar is absent, unreadable, or empty/whitespace-
-// only — the fallback cases the caller resolves to a conventional-shaped
-// synthetic subject. On success the first line is the subject (the Conventional-
-// Commits header) and the remainder after it is the body.
+// Returns ok=false when the sidecar is absent, unreadable, over the ceiling, or
+// empty/whitespace-only — the fallback cases the caller resolves to a
+// conventional-shaped synthetic subject. Over the ceiling (E64.12 / #3106) it
+// also logs fixup_commitmsg_oversize and removes the file by hand (this return
+// precedes the deferred removal below); DIAGNOSIS on top of the already-present
+// fail-closed return. On success the first line is the subject (the
+// Conventional-Commits header) and the remainder after it is the body.
 func loadFixupCommitMessage(cfg config, logSink io.Writer) (subject, body string, ok bool) {
 	path := fixupCommitMessagePath(cfg.runID, cfg.stageID)
-	raw, err := os.ReadFile(path)
+	raw, err := readSidecarBounded(path)
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): fail closed AND remove, checking
+			// the removal result (#3106 fix-up). A readable-but-unremovable file
+			// would otherwise survive silently and be re-read by a later pass, so a
+			// failed removal gets its own fixup_commitmsg_unremovable line BESIDE
+			// the oversize line. Fail-closed return unchanged.
+			rmErr := os.Remove(path)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_commitmsg_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, path, maxSidecarBytes)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"fixup_commitmsg_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, path, rmErr.Error())
+			}
+			return "", "", false
+		}
 		// Absent sidecar is the common no-op (the agent wrote nothing); any
 		// other read error is fail-closed too. Only an existing file's content
 		// can supply a message, so no log on the not-exist path.
@@ -9390,14 +9860,34 @@ func sweepStalePullRequestDescription(cfg config, logSink io.Writer) bool {
 // loadImplementCommitMessage reads the agent's initial-implement commit-message
 // sidecar (#1686) and splits it into (subject, body). It deletes the file on
 // EVERY return path (delete-after-read) so a stale sidecar can never bleed into a
-// later run/stage. Returns ok=false when the sidecar is absent, unreadable, or
-// empty/whitespace-only — the fallback cases the caller resolves to today's
-// title + "\n\n" + body. On success the first line is the subject (the
+// later run/stage. Returns ok=false when the sidecar is absent, unreadable, over
+// the ceiling, or empty/whitespace-only — the fallback cases the caller resolves
+// to today's title + "\n\n" + body. Over the ceiling (E64.12 / #3106) it also
+// logs implement_commitmsg_oversize and removes the file by hand (this return
+// precedes the deferred removal below); DIAGNOSIS on top of the already-present
+// fail-closed return. On success the first line is the subject (the
 // Conventional-Commits header) and the remainder after it is the body.
 func loadImplementCommitMessage(cfg config, logSink io.Writer) (subject, body string, ok bool) {
 	path := implementCommitMessagePath(cfg.runID, cfg.stageID)
-	raw, err := os.ReadFile(path)
+	raw, err := readSidecarBounded(path)
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): fail closed AND remove, checking
+			// the removal result (#3106 fix-up). A readable-but-unremovable file
+			// would otherwise survive silently and be re-read by a later pass, so a
+			// failed removal gets its own implement_commitmsg_unremovable line
+			// BESIDE the oversize line. Fail-closed return unchanged.
+			rmErr := os.Remove(path)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"implement_commitmsg_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, path, maxSidecarBytes)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"implement_commitmsg_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, path, rmErr.Error())
+			}
+			return "", "", false
+		}
 		// Absent sidecar is the common no-op (an older agent wrote nothing); any
 		// other read error is fail-closed too. Only an existing file's content
 		// can supply a message, so no log on the not-exist path.
@@ -9435,7 +9925,7 @@ func loadImplementCommitMessage(cfg config, logSink io.Writer) (subject, body st
 // sees no behavior change. title/body are the PR title/body sourced unchanged
 // from the run/stage-keyed PR-description handoff (#1777).
 func implementCommitMessage(cfg config, title, body string, logSink io.Writer) string {
-	if subject, sidecarBody, ok := loadImplementCommitMessage(cfg, logSink); ok {
+	if subject, sidecarBody, ok := cfg.handoff.commitMessage(cfg, logSink); ok {
 		// Warn-only conventional-commit header check on the sidecar subject,
 		// matching the PR-title warn — advisory, never a rewrite or hard failure.
 		if !conventionalCommitHeaderRe.MatchString(subject) {
@@ -9718,7 +10208,7 @@ var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|te
 // auditable provenance is preserved without requiring the agent to
 // remember to include it in every PR.
 func prTitleAndBody(cfg config, branch string, logSink io.Writer) (title, body string) {
-	title, body, agentAuthored := prTitleAndBodyParts(cfg, branch, logSink)
+	title, body, agentAuthored, _ := prTitleAndBodyParts(cfg, branch, logSink)
 	if !agentAuthored {
 		// Fallback attribution is rolled into the body itself, so don't double up.
 		return title, body
@@ -9738,18 +10228,47 @@ func prTitleAndBody(cfg config, branch string, logSink io.Writer) (title, body s
 // openHeldCommitPR on the resume path. Persisting a footered body would either
 // double the footer on resume or stamp it with the wrong branch/audit URL, and
 // the size clamp could clip it.
-func prTitleAndBodyParts(cfg config, branch string, logSink io.Writer) (title, body string, agentAuthored bool) {
-	agentTitle, agentBody, kind := loadAgentAuthoredPR(cfg, logSink)
+// PURE with respect to the composition-failure signal (#3012 approval condition
+// 2 of the plan gate): it CLASSIFIES the failure into a bounded prBodyReason and
+// RETURNS it, emitting nothing itself. The two call sites own the emit, because
+// only they know whether a fallback was subsequently RECOVERED — the held-commit
+// resume replaces the placeholder from the backend-served text AFTER this
+// returns, and a composition failure that got recovered must not be logged as a
+// failure. Emitting here would manufacture exactly the record-asserts-what-did-
+// -not-happen defect this issue is about.
+func prTitleAndBodyParts(cfg config, branch string, logSink io.Writer) (title, body string, agentAuthored bool, reason prBodyReason) {
+	// Routed through the per-stage memo (#2840) so a base-rebase re-invoke's
+	// SECOND openPRAndShipArtifact call does not fall through to the placeholder
+	// after the first call's delete-after-read consumed the handoff. cfg.handoff
+	// is nil on every un-armed path, and the method is nil-tolerant, so this is a
+	// plain loadAgentAuthoredPR call there.
+	agentTitle, agentBody, kind, reason := cfg.handoff.pullRequest(cfg, logSink)
 
 	if kind == prSourceAgent {
-		return agentTitle, agentBody, true
+		// A title-only handoff is still agent-authored — the agent's title is
+		// honoured — but its body is EMPTY, so the opened PR is footer-only with
+		// no summary, no test plan and no `Closes #N`. loadAgentAuthoredPR
+		// already returns prBodyReasonBodyAbsent for it, so the reason passes
+		// through unchanged and the call site marks it exactly as it marks a
+		// full fallback (#3012 binding condition 1: reason != none implies the
+		// body names the failure — NOT "the handoff was absent implies").
+		//
+		// INVARIANT this relies on, asserted by
+		// TestPRTitleAndBodyParts_ReasonClassification over every case: an
+		// agent-authored EMPTY body always carries body_absent. A re-classifying
+		// `if agentBody == ""` here would be unreachable defensive code — the
+		// parse TrimRights trailing newlines before splitting, so a
+		// separator-with-nothing-after-it (`title\n\n`) already takes the
+		// title-only branch and no other path can return an empty body with
+		// prSourceAgent — so the invariant is pinned by a test instead.
+		return agentTitle, agentBody, true, reason
 	}
 	return fmt.Sprintf("chore: fishhawk implement stage %s", shortID(cfg.stageID)),
 		fmt.Sprintf(
 			"Opened by Fishhawk for run `%s`, stage `%s`.\n\nBranch: `%s`\nAudit log: see `%s/v0/runs/%s/audit`.\n",
 			cfg.runID, cfg.stageID, branch,
 			strings.TrimRight(cfg.backendURL, "/"), cfg.runID,
-		), false
+		), false, reason
 }
 
 // prAttributionFooter renders the Fishhawk attribution footer appended to an
@@ -9778,6 +10297,201 @@ const (
 	prSourceAgent
 )
 
+// prBodyReason names WHY the implement PR body is not the agent-composed one
+// (#3012). Before this existed, loadAgentAuthoredPR's commonest fallback branch
+// — neither the keyed nor the legacy handoff present — returned prSourceFallback
+// with a deliberate "don't log" and no reason at all, so a SKIPPED composition
+// was byte-indistinguishable from a deliberately terse body and from the four
+// other fallback branches. That is how #3011 shipped a placeholder PR body with
+// no Summary, no Test plan and no `Closes #N`, and nothing in the trace said so.
+//
+// prBodyReasonNone means composition SUCCEEDED (a non-empty agent title AND
+// body). Every other value means the shipped body is NOT what the agent wrote,
+// and the call site both marks the body and emits pr_body_not_composed.
+//
+// WIRE VALUES. These strings ride the pull_request artifact as
+// pr_body_fallback_reason and are MIRRORED in
+// backend/internal/server/pullrequest.go's prBodyFallbackReasons — the backend
+// is a separate Go module and cannot import this (the #1774/#2501 mirrored-
+// literal pattern). The shared testdata/wire goldens are what make a drift fail
+// a test rather than ship; #2558 tracks the shared wire package that would make
+// it compile-enforced.
+type prBodyReason string
+
+const (
+	// prBodyReasonNone: the agent authored a non-empty title AND body.
+	prBodyReasonNone prBodyReason = ""
+	// prBodyReasonHandoffAbsent: neither the keyed nor the legacy handoff path
+	// exists — BOTH reads failed not-exist, never merely "the legacy read
+	// errored". The commonest branch, and the silent one that shipped #3011.
+	prBodyReasonHandoffAbsent prBodyReason = "handoff_absent"
+	// prBodyReasonHandoffUnreadable: a handoff path exists — the keyed one, or
+	// the legacy one when the keyed path is absent — but os.ReadFile failed for
+	// a reason other than not-exist (permissions, a directory). Both paths carry
+	// the SAME reason: the failure is identical and a sixth wire value would buy
+	// nothing the pr_description_legacy_unreadable event does not already say.
+	prBodyReasonHandoffUnreadable prBodyReason = "handoff_unreadable"
+	// prBodyReasonEmptyFile: the handoff was read but is empty after trimming.
+	prBodyReasonEmptyFile prBodyReason = "empty_file"
+	// prBodyReasonEmptyTitle: the handoff's first line is blank.
+	prBodyReasonEmptyTitle prBodyReason = "empty_title"
+	// prBodyReasonBodyAbsent: a TITLE-ONLY handoff. The agent's title is
+	// honoured, but the PR opens footer-only with no `Closes #N`, so it is a
+	// composition failure for the BODY and marked as one.
+	prBodyReasonBodyAbsent prBodyReason = "body_absent"
+)
+
+// prBodyReasons is the closed set of non-none reasons, in the order they are
+// documented. ONE list on the runner side; the backend mirrors it.
+var prBodyReasons = []prBodyReason{
+	prBodyReasonHandoffAbsent,
+	prBodyReasonHandoffUnreadable,
+	prBodyReasonEmptyFile,
+	prBodyReasonEmptyTitle,
+	prBodyReasonBodyAbsent,
+}
+
+// prBodyNotComposedMarker renders the leading block prepended to a PR body that
+// the agent did not compose. It is a SIGNAL, not a repair: the runner never
+// receives the trigger issue number (no issueNumber field exists anywhere in
+// this package), so it structurally cannot synthesize the missing `Closes #N`,
+// and there is no retro-edit path to add one later (#2782). Saying outright that
+// the merge will not auto-close is the honest substitute.
+func prBodyNotComposedMarker(cfg config, reason prBodyReason, checkedPath string) string {
+	return fmt.Sprintf(
+		"> **This pull-request body was not composed by the implement agent.**\n"+
+			"> Run `%s`, stage `%s`. Reason: `%s`.\n"+
+			"> Handoff checked: `%s`.\n"+
+			"> What this costs: the body below carries no summary, no test plan and no `Closes #N` reference, "+
+			"so merging will not auto-close the trigger issue — close it by hand.\n\n",
+		cfg.runID, cfg.stageID, reason, checkedPath,
+	)
+}
+
+// emitPRBodyNotComposed records a composition failure that was NOT recovered.
+// Called only from the two PR-opening call sites, after any recovery resolves,
+// so `grep pr_body_not_composed` never matches a run whose text was recovered —
+// that run emits pr_body_recovered instead.
+func emitPRBodyNotComposed(logSink io.Writer, cfg config, reason prBodyReason, checkedPath string) {
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"pr_body_not_composed","run_id":%q,"stage_id":%q,"reason":%q,"handoff_path":%q}`+"\n",
+		cfg.runID, cfg.stageID, string(reason), checkedPath)
+}
+
+// agentHandoff memoizes the implement agent's two /tmp handoffs — the
+// PR-description file (#1777) and the initial-commit-message sidecar (#1686) —
+// for the lifetime of ONE implement stage (#2840).
+//
+// Both loaders are DELETE-AFTER-READ: loadAgentAuthoredPR and
+// loadImplementCommitMessage os.Remove whichever path they read, on EVERY return
+// path, so a stale handoff can never bleed into a later run/stage. That is right
+// ACROSS stages and wrong WITHIN one, because a stage can reach
+// openPRAndShipArtifact TWICE: the bounded base-rebase-conflict re-invoke (#989)
+// retries the whole commit/push/open chain after the first attempt already
+// consumed both files. The second pass then found nothing and shipped the
+// `chore: fishhawk implement stage <id>` placeholder for the PR title, the PR
+// body AND the initial commit message — losing the agent's `Closes #N` and the
+// issue auto-close (PRs #2741/#2755/#2776/#2779).
+//
+// THREE RULES, each a separate control with its own counterfactual test:
+//
+//	(a) ALWAYS attempt the FRESH read first; never short-circuit on a stored
+//	    value. baseRebaseConflictPrompt re-requests both handoffs by absolute
+//	    keyed path, so a compliant re-invoked agent re-writes them — and its
+//	    text is the text that matches the RE-LANDED slice, so it must win.
+//	    Pinned by TestRun_ImplementStage_BaseRebaseConflict_ReinvokeFreshHandoffWins.
+//	(b) STORE only a SUCCESSFUL capture (prSourceAgent for the PR handoff,
+//	    ok for the sidecar). A fallback or an absence is never cached, so a
+//	    first-pass MISS cannot poison a later pass that DOES find text.
+//	    Pinned by TestAgentHandoff_LoadOrReplay's no-poisoning cases.
+//	(c) REPLAY the stored capture only when the fresh read yielded no agent
+//	    text, and say so — pr_description_replayed / implement_commitmsg_replayed
+//	    — because the runner log is the only place this failure is observable at
+//	    all. Pinned by TestRun_ImplementStage_BaseRebaseConflict_ReinvokeKeepsAgentPRText
+//	    and TestAgentHandoff_ReplayEmitsEvent.
+//
+// VOCABULARY REUSE, not a parallel one (#2840 binding condition 2). When neither
+// fresh nor stored text exists the FRESH fallback is returned VERBATIM, its
+// prBodyReason included, so the #3012 marker, the pr_body_not_composed emit and
+// the artifact's pr_body_fallback_reason all keep classifying the real branch. A
+// REPLAY likewise returns the stored tuple verbatim, so the artifact's
+// pr_body_fallback_reason resolves exactly as it did on the pass that captured
+// it: a full agent handoff replays reason none — and emitPRBodyNotComposed is
+// keyed off the RETURNED reason, so a replayed pass emits no spurious
+// pr_body_not_composed by construction, asserted by TestAgentHandoff_ReplayEmitsEvent
+// — while a TITLE-ONLY handoff replays body_absent and is marked exactly as the
+// capturing pass marked it. pr_description_replayed is the memo's sibling of
+// openHeldCommitPR's pr_body_recovered: same resolved-state shape (composition
+// fell back, then text was recovered, so record the recovery and not a
+// composition failure), different mechanism (an in-process memo across two
+// openPRAndShipArtifact calls, vs backend-served text across a park/resume).
+//
+// A NIL receiver is a PURE LOAD: it delegates straight to the loader and stores
+// nothing. That is what keeps every un-armed path — the plan and acceptance
+// stages, the held-commit resume, every fix-up pass — byte-identical to before.
+type agentHandoff struct {
+	// Captured PR-description handoff (rule b: written only on prSourceAgent).
+	prTitle  string
+	prBody   string
+	prKind   prSource
+	prReason prBodyReason
+	prStored bool
+
+	// Captured initial-implement commit-message sidecar (rule b: written only
+	// on ok).
+	cmSubject string
+	cmBody    string
+	cmStored  bool
+}
+
+// pullRequest is loadAgentAuthoredPR with the load-or-replay rules above
+// applied. Signature-identical to the loader so the call site does not change
+// shape; nil-tolerant so an un-armed stage is a pure load.
+func (h *agentHandoff) pullRequest(cfg config, logSink io.Writer) (title, body string, kind prSource, reason prBodyReason) {
+	// Rule (a): the fresh read ALWAYS runs, and it runs FIRST — including its
+	// own delete-after-read, its pr_template_* warnings and its
+	// pr_description_legacy_path deprecation event. This is what makes the
+	// FIRST read of a stage byte-identical to the pre-memo behavior.
+	title, body, kind, reason = loadAgentAuthoredPR(cfg, logSink)
+	if h == nil {
+		return title, body, kind, reason
+	}
+	if kind == prSourceAgent {
+		// Rule (b): store only a successful capture.
+		h.prTitle, h.prBody, h.prKind, h.prReason, h.prStored = title, body, kind, reason, true
+		return title, body, kind, reason
+	}
+	if !h.prStored {
+		// No fresh text and nothing captured: return the fresh FALLBACK
+		// verbatim, reason included, so #3012's classification is untouched.
+		return title, body, kind, reason
+	}
+	// Rule (c): replay, and say so.
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"pr_description_replayed","run_id":%q,"stage_id":%q}`+"\n",
+		cfg.runID, cfg.stageID)
+	return h.prTitle, h.prBody, h.prKind, h.prReason
+}
+
+// commitMessage is loadImplementCommitMessage with the same three rules.
+func (h *agentHandoff) commitMessage(cfg config, logSink io.Writer) (subject, body string, ok bool) {
+	subject, body, ok = loadImplementCommitMessage(cfg, logSink)
+	if h == nil {
+		return subject, body, ok
+	}
+	if ok {
+		h.cmSubject, h.cmBody, h.cmStored = subject, body, true
+		return subject, body, ok
+	}
+	if !h.cmStored {
+		return subject, body, ok
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"implement_commitmsg_replayed","run_id":%q,"stage_id":%q}`+"\n",
+		cfg.runID, cfg.stageID)
+	return h.cmSubject, h.cmBody, true
+}
+
 // loadAgentAuthoredPR tries to read the agent-authored PR file and
 // parse it into a (title, body) pair. Returns prSourceFallback when
 // the file is absent or malformed; prSourceAgent on success.
@@ -9796,28 +10510,113 @@ const (
 //   - Blank line.
 //   - Remaining lines are the body (markdown).
 //
+// Over the ceiling (E64.12 / #3106): a keyed OR legacy handoff that exceeds
+// maxSidecarBytes is refused before decode, logging pr_description_oversize
+// (naming the over-ceiling path), removing that file, and returning
+// prBodyReasonHandoffUnreadable — the SAME reason an unreadable handoff carries,
+// deliberately NOT a sixth wire value: an oversize handoff is a present-but-
+// unusable one, exactly what handoff_unreadable already means, and the distinct
+// pr_description_oversize log carries the discrimination an operator needs. An
+// oversize KEYED handoff does NOT fall through to the legacy path — it is
+// present-but-unusable, and the keyed-unreadable branch already returns rather
+// than falling through, so ordering is preserved. DIAGNOSIS: the fail-closed
+// fallback return is already there; the named event and the removal are what the
+// branch adds.
+//
 // Malformed cases (logged as a `pr_template_invalid` policy event
 // but non-fatal):
 //   - Empty file.
 //   - First line empty.
 //   - No blank line separating title from body.
-func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kind prSource) {
+//
+// The returned prBodyReason (#3012) classifies WHICH of the fallback branches
+// was taken — the distinction that did not exist before, and whose absence made
+// a skipped composition byte-indistinguishable from a terse one. This function
+// does NOT log it: see prTitleAndBodyParts for why the emit lives at the call
+// sites. The pre-existing pr_template_invalid / pr_template_warning /
+// pr_description_legacy_path events are unchanged — they describe the FILE and
+// are already accurate.
+func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kind prSource, reason prBodyReason) {
 	keyed := pullRequestDescriptionPath(cfg.runID, cfg.stageID)
-	raw, err := os.ReadFile(keyed)
+	raw, err := readSidecarBounded(keyed)
 	path := keyed
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			// Over the ceiling (E64.12 / #3106): the keyed handoff is present but
+			// unusable. Remove it, name the keyed path in the diagnostic, and
+			// return the same reason an unreadable keyed handoff carries — NOT a
+			// sixth wire value. Does not fall through to the legacy path (the
+			// keyed-unreadable branch below does not either). The removal result is
+			// CHECKED (#3106 fix-up): a readable-but-unremovable file would
+			// otherwise survive silently and be re-read by a later pass, so a failed
+			// removal gets its own pr_description_unremovable line BESIDE the
+			// oversize line, naming the keyed path.
+			rmErr := os.Remove(keyed)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"pr_description_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, keyed, maxSidecarBytes)
+			if rmErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"pr_description_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+					cfg.runID, cfg.stageID, keyed, rmErr.Error())
+			}
+			return "", "", prSourceFallback, prBodyReasonHandoffUnreadable
+		}
 		if !os.IsNotExist(err) {
 			// Unreadable keyed file (permissions, etc.): fall back to the
 			// generic template, same as the pre-#1777 absent-file no-op.
-			return "", "", prSourceFallback
+			return "", "", prSourceFallback, prBodyReasonHandoffUnreadable
 		}
 		// Keyed path absent: fall back to the legacy fixed path so a fixed-path
 		// prompt render (an older agent/prompt) still lands its PR text.
-		legacyRaw, legacyErr := os.ReadFile(legacyPullRequestDescriptionPath)
+		legacyRaw, legacyErr := readSidecarBounded(legacyPullRequestDescriptionPath)
 		if legacyErr != nil {
-			// Neither path present is the common no-op (agent didn't follow the
-			// instruction, or a stage type that produces no PR). Don't log.
-			return "", "", prSourceFallback
+			if errors.Is(legacyErr, errSidecarTooLarge) {
+				// Over the ceiling on the legacy path: same treatment as the
+				// keyed oversize branch, naming the LEGACY path (the call site's
+				// marker names only the canonical keyed path, so without this the
+				// path that actually failed would appear nowhere in the trace —
+				// mirroring pr_description_legacy_unreadable below). The removal
+				// result is CHECKED (#3106 fix-up), emitting pr_description_unremovable
+				// naming the legacy path on a failed removal BESIDE the oversize line.
+				rmErr := os.Remove(legacyPullRequestDescriptionPath)
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"pr_description_oversize","run_id":%q,"stage_id":%q,"path":%q,"limit_bytes":%d}`+"\n",
+					cfg.runID, cfg.stageID, legacyPullRequestDescriptionPath, maxSidecarBytes)
+				if rmErr != nil {
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"pr_description_unremovable","run_id":%q,"stage_id":%q,"path":%q,"error":%q}`+"\n",
+						cfg.runID, cfg.stageID, legacyPullRequestDescriptionPath, rmErr.Error())
+				}
+				return "", "", prSourceFallback, prBodyReasonHandoffUnreadable
+			}
+			if !os.IsNotExist(legacyErr) {
+				// The legacy handoff EXISTS but could not be read (permissions,
+				// a directory yielding EISDIR). Classifying this as
+				// handoff_absent — as this branch did until the #3012 re-review
+				// — would put a marker and an audit record on the PR falsely
+				// claiming neither path existed: the same record-asserts-what-
+				// -did-not-happen defect this issue exists to close, one branch
+				// over. It is the SAME failure as an unreadable keyed handoff,
+				// so it carries the same reason rather than a sixth wire value.
+				//
+				// The reason is returned, not logged (the call site owns
+				// pr_body_not_composed once recovery resolves), but the FAILING
+				// path is logged here: the call site's marker names the
+				// canonical run/stage-keyed path, so without this line the
+				// legacy path that actually failed would appear nowhere in the
+				// trace.
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"pr_description_legacy_unreadable","run_id":%q,"stage_id":%q,"path":%q,"detail":%q}`+"\n",
+					cfg.runID, cfg.stageID, legacyPullRequestDescriptionPath, legacyErr.Error())
+				return "", "", prSourceFallback, prBodyReasonHandoffUnreadable
+			}
+			// Neither path present. Historically treated as a silent no-op
+			// ("the agent didn't follow the instruction, or a stage type that
+			// produces no PR"), which is precisely how #3011's placeholder body
+			// shipped unremarked. Still not logged HERE — the call site emits
+			// pr_body_not_composed once the recovery question is settled.
+			return "", "", prSourceFallback, prBodyReasonHandoffAbsent
 		}
 		raw = legacyRaw
 		path = legacyPullRequestDescriptionPath
@@ -9834,7 +10633,7 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_template_invalid","reason":%q,"path":%q}`+"\n",
 			"empty file", path)
-		return "", "", prSourceFallback
+		return "", "", prSourceFallback, prBodyReasonEmptyFile
 	}
 
 	// Split into title (first line) + body (rest after blank line).
@@ -9845,7 +10644,7 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_template_invalid","reason":%q,"path":%q}`+"\n",
 			"empty title line", path)
-		return "", "", prSourceFallback
+		return "", "", prSourceFallback, prBodyReasonEmptyTitle
 	}
 
 	// Warn-only conventional-commit header check (#1572): the title doubles as
@@ -9866,7 +10665,7 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_template_warning","reason":%q,"path":%q}`+"\n",
 			"title-only (no body)", path)
-		return title, "", prSourceAgent
+		return title, "", prSourceAgent, prBodyReasonBodyAbsent
 	}
 
 	rest := strings.TrimLeft(lines[1], "\n")
@@ -9879,5 +10678,5 @@ func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kin
 			"no blank line between title and body", path)
 	}
 
-	return title, rest, prSourceAgent
+	return title, rest, prSourceAgent, prBodyReasonNone
 }

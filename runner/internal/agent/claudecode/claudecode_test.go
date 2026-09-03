@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -292,11 +293,53 @@ func TestHelperProcess(t *testing.T) {
 			fmt.Printf(`{"type":"env","key":%q,"value":%q}`+"\n", k, os.Getenv(k))
 		}
 		fmt.Println(`{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}`)
+	case "trunc_valid_result_prefix":
+		// ADVERSARIAL (#3020): ONE physical line whose first advResultObj bytes
+		// are a COMPLETE, VALID terminal-result object (with structured_output
+		// the parser would otherwise adopt as the plan), with more content
+		// following on the SAME line so the line is over-cap. The test sets the
+		// cap to exactly len(advResultObj), so the retained prefix parses cleanly
+		// — which is what makes the skip-rule counterfactual observable. Exit 0
+		// so the only reason no result is adopted is the skip, not a crash.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(advResultObj + strings.Repeat("!", 64))
+	case "trunc_valid_tooluse_prefix":
+		// ADVERSARIAL (#3020): many physical lines whose retained prefix is a
+		// complete assistant tool_use Write to an OUT-OF-TREE path — enough to
+		// exceed the loop-detector threshold had the signatures been fed. Each
+		// line is over-cap (prefix + trailing same-line content); the test sets
+		// the cap to exactly len(advWriteObj).
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		for n := 0; n < 30; n++ {
+			fmt.Println(advWriteObj + strings.Repeat("!", 64))
+		}
+		fmt.Println(`{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}`)
+	case "overcap_then_result":
+		// An over-cap junk line FOLLOWED by a normal terminal result: reading
+		// must resync and adopt the result, so an over-long line costs one log
+		// line, not the pass. The test picks a cap above the result line's
+		// length but below the junk line's.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(strings.Repeat("x", 500))
+		fmt.Println(`{"type":"result","usage":{"input_tokens":11,"output_tokens":13}}`)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown HELPER_MODE")
 		helperExit(2)
 	}
 }
+
+// advResultObj is a COMPLETE, VALID terminal-result object carrying a
+// structured_output the plan stage would adopt. Used as the retained prefix of
+// an over-cap line in the adversarial truncation test: if the skip rule were
+// removed, parseLine would adopt this and fabricate a plan (#3020). Shared with
+// the helper process, which is in this same package.
+const advResultObj = `{"type":"result","subtype":"success","usage":{"input_tokens":7,"output_tokens":9},"structured_output":{"plan_version":"standard_v1","summary":"FABRICATED"}}`
+
+// advWriteObj is a COMPLETE, VALID assistant tool_use Write to an out-of-tree
+// path. Repeated as the retained prefix of over-cap lines: if the skip rule
+// were removed, each would fire an out_of_tree_write event and the identical
+// signatures would trip the loop detector (#3020).
+const advWriteObj = `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"/etc/fishhawk-evil.txt"}}]}}`
 
 // helperCommand returns a Cmd-builder that re-execs the test
 // binary as the `claude` stand-in, passing through HELPER_MODE.
@@ -2406,5 +2449,227 @@ func TestInvoke_FrozenWaitPollTripsAtWaitThreshold(t *testing.T) {
 	}
 	if loopEvents != 1 {
 		t.Errorf("loop_detected event count = %d, want 1", loopEvents)
+	}
+}
+
+// errInjectingReader returns a genuine non-EOF read error on the first Read,
+// modelling a stdout-pipe I/O fault. It ignores the underlying stream (which
+// the adapter's io.Discard drain reads separately) so the failure is
+// deterministic rather than racing the child's writes.
+type errInjectingReader struct{ err error }
+
+func (e *errInjectingReader) Read(p []byte) (int, error) { return 0, e.err }
+
+// truncatedEvents returns every trace_line_truncated event in res.
+func truncatedEvents(res agent.Result) []agent.Event {
+	var out []agent.Event
+	for _, ev := range res.Events {
+		if ev.Kind == "trace_line_truncated" {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// hasResultEvent reports whether res carries any terminal-result event
+// (kind "result" or "result.*") — the thing a fabricated prefix would create.
+func hasResultEvent(res agent.Result) bool {
+	for _, ev := range res.Events {
+		if ev.Kind == "result" || strings.HasPrefix(ev.Kind, "result.") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasEventKind(res agent.Result, kind string) bool {
+	for _, ev := range res.Events {
+		if ev.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// TestClaudeCode_TruncatedValidJSONPrefixNotInterpreted is the operator's
+// required adversarial case (#3020, binding condition 1). The sole over-cap
+// line's retained prefix is a byte-exact COMPLETE terminal-result object with
+// structured_output; the cap is set to exactly that object's length so the
+// prefix parses cleanly. The skip rule must ensure it is NEVER handed to the
+// parser: NO terminal result is adopted, so res.StructuredOutput stays nil and
+// no result event is derived from that line. The truncation is instead surfaced
+// as a trace_line_truncated event.
+//
+// This test uses Stage:"implement" — the originating incident (run c5ed506a).
+// It necessarily STOPS at the ADAPTER boundary: the claudecode package cannot
+// reach the runner's downstream missing-result handling, which is where the
+// dropped result becomes a visible outcome, and that outcome is STAGE-SPECIFIC
+// (both non-silent):
+//   - plan stage: the result IS the deliverable, so the runner's
+//     validatePlan(cfg.planOut) finds no plan and DEMOTES to res.OK=false /
+//     FailureCategory="B". Asserted end to end by the runner's
+//     TestRun_PlanStage_DroppedTerminalResult_DemotesToCategoryB.
+//   - implement stage: the deliverable is the committed working-tree DIFF, not
+//     the result event, so a dropped result neither fabricates nor loses it;
+//     CommitAndPush commits the real diff and the normal PR/verify/scope gates
+//     decide the stage, while an agent that produced NO work is caught by
+//     CommitAndPush's NoChanges -> implement_no_changes outcome. See the
+//     "Dropped-terminal-result outcome, per stage" table in runner/README.md.
+//
+// This assertion therefore covers only the adapter half (the result-less state);
+// the runner test named above covers the concrete failure category.
+func TestClaudeCode_TruncatedValidJSONPrefixNotInterpreted(t *testing.T) {
+	// Guard the fixture: the prefix MUST be valid JSON, else the counterfactual
+	// (deleting the skip) would leave the test green for the wrong reason.
+	if !json.Valid([]byte(advResultObj)) {
+		t.Fatalf("advResultObj is not valid JSON; the adversarial fixture is vacuous")
+	}
+	capBytes := len(advResultObj)
+	inv := &Invoker{
+		Cmd:               helperCommand("trunc_valid_result_prefix"),
+		Now:               frozenNow(),
+		TraceLineMaxBytes: capBytes,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID: "rid-adv", Stage: "implement",
+	})
+	if err != nil {
+		t.Fatalf("Invoke returned error, want nil (clean read, no result adopted): %v", err)
+	}
+	if errors.Is(err, agent.ErrAgentFailed) || errors.Is(err, agent.ErrTraceStreamRead) {
+		t.Fatalf("err matched a failure sentinel: %v", err)
+	}
+	if res.StructuredOutput != nil {
+		t.Errorf("StructuredOutput = %s, want nil: the fabricated prefix was adopted", res.StructuredOutput)
+	}
+	if hasResultEvent(res) {
+		t.Errorf("a result event was derived from the truncated line:\n%+v", res.Events)
+	}
+	tr := truncatedEvents(res)
+	if len(tr) != 1 {
+		t.Fatalf("trace_line_truncated events = %d, want 1:\n%+v", len(tr), res.Events)
+	}
+	payload := string(tr[0].Payload)
+	if !strings.Contains(payload, fmt.Sprintf(`"retained_bytes":%d`, capBytes)) {
+		t.Errorf("truncation payload retained_bytes != cap (%d): %s", capBytes, payload)
+	}
+	if !strings.Contains(payload, `"run_id":"rid-adv"`) || !strings.Contains(payload, `"stage":"implement"`) {
+		t.Errorf("truncation payload missing run_id/stage: %s", payload)
+	}
+	// original_bytes must exceed retained_bytes (it is over-cap).
+	var pl struct {
+		Original int `json:"original_bytes"`
+		Retained int `json:"retained_bytes"`
+	}
+	if uerr := json.Unmarshal(tr[0].Payload, &pl); uerr != nil {
+		t.Fatalf("truncation payload not JSON: %v", uerr)
+	}
+	if pl.Original <= pl.Retained {
+		t.Errorf("original_bytes %d must exceed retained_bytes %d", pl.Original, pl.Retained)
+	}
+}
+
+// TestClaudeCode_TruncatedValidToolUsePrefixFiresNoDetector is the second
+// adversarial case (#3020): the retained prefix is a complete out-of-tree Write
+// tool_use repeated past the loop-detector threshold. The skip rule must feed
+// NEITHER the out-of-tree detector NOR the loop detector, so no such events
+// appear and the process is not killed.
+func TestClaudeCode_TruncatedValidToolUsePrefixFiresNoDetector(t *testing.T) {
+	if !json.Valid([]byte(advWriteObj)) {
+		t.Fatalf("advWriteObj is not valid JSON; the adversarial fixture is vacuous")
+	}
+	inv := &Invoker{
+		Cmd:               helperCommand("trunc_valid_tooluse_prefix"),
+		Now:               frozenNow(),
+		TraceLineMaxBytes: len(advWriteObj),
+		LoopThreshold:     4, // low: 30 identical signatures WOULD trip if fed
+		WaitPollThreshold: 1000,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID: "rid-adv2", Stage: "implement", WorkingDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Invoke returned error, want nil (no detector fired, no kill): %v", err)
+	}
+	if hasEventKind(res, "out_of_tree_write") {
+		t.Errorf("out_of_tree_write fired from a truncated line:\n%+v", res.Events)
+	}
+	if hasEventKind(res, "loop_detected") {
+		t.Errorf("loop_detected fired from truncated lines:\n%+v", res.Events)
+	}
+	if len(truncatedEvents(res)) != 30 {
+		t.Errorf("trace_line_truncated events = %d, want 30", len(truncatedEvents(res)))
+	}
+	if !res.OK {
+		t.Errorf("OK = false; the final normal result should complete the stage: %q", res.FailureReason)
+	}
+}
+
+// TestClaudeCode_OverLongLineDoesNotFailStage proves an over-long line costs one
+// log line, not the pass (#3020): a truncated line followed by a normal result
+// completes the stage with that result adopted and the truncation surfaced.
+func TestClaudeCode_OverLongLineDoesNotFailStage(t *testing.T) {
+	inv := &Invoker{
+		Cmd:               helperCommand("overcap_then_result"),
+		Now:               frozenNow(),
+		TraceLineMaxBytes: 200, // < 500 (junk line) but > the result line
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{RunID: "rid-b", Stage: "implement"})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false, want true: %q", res.FailureReason)
+	}
+	if res.TokensUsed != 24 {
+		t.Errorf("TokensUsed = %d, want 24 (result adopted after the over-cap line)", res.TokensUsed)
+	}
+	if len(truncatedEvents(res)) != 1 {
+		t.Errorf("trace_line_truncated events = %d, want 1", len(truncatedEvents(res)))
+	}
+}
+
+// TestClaudeCode_NoTruncationMarkerOnNormalLines is the anti-vacuity control: a
+// normal transcript under the same small-cap regime emits NO truncation event
+// and produces the usual result. It reddens if the marker is emitted
+// unconditionally.
+func TestClaudeCode_NoTruncationMarkerOnNormalLines(t *testing.T) {
+	inv := &Invoker{
+		Cmd:               helperCommand("happy"),
+		Now:               frozenNow(),
+		TraceLineMaxBytes: 4096, // comfortably above every happy-mode line
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{RunID: "rid-ctl", Stage: "implement"})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK || res.TokensUsed != 100 {
+		t.Fatalf("OK=%v TokensUsed=%d, want OK=true TokensUsed=100", res.OK, res.TokensUsed)
+	}
+	if n := len(truncatedEvents(res)); n != 0 {
+		t.Errorf("trace_line_truncated events = %d, want 0 on normal lines", n)
+	}
+}
+
+// TestClaudeCode_TraceStreamReadErrorIsNotAgentFailed drives a genuine non-EOF
+// read error through the real adapter via the TraceStream seam: it must map to
+// the ErrTraceStreamRead PEER sentinel (category A retained) and NOT to
+// ErrAgentFailed (#3020).
+func TestClaudeCode_TraceStreamReadErrorIsNotAgentFailed(t *testing.T) {
+	boom := errors.New("injected stdout pipe fault")
+	inv := &Invoker{
+		Cmd:         helperCommand("happy"),
+		Now:         frozenNow(),
+		TraceStream: func(io.Reader) io.Reader { return &errInjectingReader{err: boom} },
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{RunID: "rid-re", Stage: "implement"})
+	if !errors.Is(err, agent.ErrTraceStreamRead) {
+		t.Fatalf("err = %v, want wrapping ErrTraceStreamRead", err)
+	}
+	if errors.Is(err, agent.ErrAgentFailed) {
+		t.Error("ErrTraceStreamRead must not wrap ErrAgentFailed")
+	}
+	if res.FailureCategory != "A" {
+		t.Errorf("FailureCategory = %q, want A (retained)", res.FailureCategory)
 	}
 }

@@ -56,6 +56,19 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
+// PullRequestStateReader reads a pull request's live state back off the forge.
+// It is the injectable seam behind the merge-observation recovery verb
+// (E64.32 / #3136): the ONE method the endpoint needs, so a test can drive the
+// merged / not-merged / no-SHA / no-timestamp / forge-error branches without a
+// live forge.
+//
+// The signature deliberately mirrors mergereconciler.PRGetter, so
+// *githubclient.Client already satisfies it and the production wiring is a
+// fallback to cfg.GitHub rather than a new construction site.
+type PullRequestStateReader interface {
+	GetPullRequest(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int) (*forge.PullRequest, error)
+}
+
 // Config holds the values needed to construct a Server. Zero-valued
 // fields fall back to safe defaults.
 type Config struct {
@@ -167,6 +180,25 @@ type Config struct {
 	// wall-clock test cannot hold its ratios against a shipped constant it
 	// cannot scale with (AGENTS.md / #1984). Production wires it nowhere.
 	IntakeGroomDeadline time.Duration
+
+	// IssueSetResolutionBudget bounds the no-epic campaign source's issue-set
+	// dependency resolution (E54.59 / #3113) — the per-item forge round-trips a
+	// full ratified grooming order costs. fishhawkd wires it from
+	// --issue-set-resolution-budget / FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET.
+	//
+	// A NON-POSITIVE VALUE MEANS "USE THE DEFAULT"
+	// (DefaultIssueSetResolutionBudget), so every existing construction site —
+	// none of which sets this field — keeps today's behaviour with no edit.
+	//
+	// A value ABOVE MaxIssueSetResolutionBudget is CLAMPED to that maximum at
+	// the read site (issueSetResolutionBudget, campaigns.go). The clamp is not
+	// a convenience: the MCP client's issue-set timeout is pinned above
+	// MaxIssueSetResolutionBudget so the client is never what gives up first,
+	// and that relationship must hold however this Config was built — not only
+	// when it came through fishhawkd's flag handling, which additionally
+	// REFUSES an over-maximum value at startup so the operator is told rather
+	// than silently clamped.
+	IssueSetResolutionBudget time.Duration
 
 	// ArtifactRepo persists typed stage outputs (plans, PR refs).
 	// Wired by GET /v0/stages/{id}/artifacts and
@@ -369,6 +401,19 @@ type Config struct {
 	// merge arm already returns observe-only when the merger is nil.
 	GateMerger GitHubMerger
 
+	// PRStateReader is the forge pull-request read seam the merge-observation
+	// recovery verb (POST /v0/runs/{run_id}/record-merge-observation, E64.32 /
+	// #3136) reads the live merge state through. It is the ONLY new way onto a
+	// run's evidence chain, so it is the seam a test must be able to drive
+	// without a live forge.
+	//
+	// nil in production: the handler falls back to cfg.GitHub, which satisfies
+	// this interface (the signature mirrors mergereconciler.PRGetter). When
+	// BOTH are nil the endpoint returns 503 rather than degrading — a verb that
+	// records forge evidence must never record evidence it did not read. Same
+	// nil-means-test-seam posture as the sibling seams in this file.
+	PRStateReader PullRequestStateReader
+
 	// AuthRepo persists users + sessions for the OAuth
 	// sign-in flow (E4.2). Wired by the /v0/auth/* handlers; nil
 	// leaves them returning 503 and cookie-bearing requests
@@ -507,9 +552,11 @@ type Config struct {
 	// ReviewGroundingDisabled is the kill switch for review grounding (#2486):
 	// when true the plan- and implement-review loops never export a source tree
 	// and both adapters run in their diff-only posture. serve.go sets it from
-	// FISHHAWKD_REVIEW_GROUNDING=false (grounding is ON by default). It lets an
-	// operator turn off the behaviour change — what a grounded reviewer may read —
-	// without a rollback. The environment scrub is independent of this flag and is
+	// FISHHAWKD_REVIEW_GROUNDING. Grounding is OFF by default: #2522 bounds what a
+	// grounded reviewer may read per-adapter, but the flip to on-by-default is a
+	// SEPARATE operator-filed follow-up gated on a recorded operator harness run
+	// passing on BOTH adapters. It lets an operator turn off the behaviour change
+	// — what a grounded reviewer may read — without a rollback. The environment scrub is independent of this flag and is
 	// always applied.
 	ReviewGroundingDisabled bool
 
@@ -718,6 +765,20 @@ type Config struct {
 	// serve.go only when BOTH FISHHAWKD_HOME_REGION and FISHHAWKD_HANDOFF_
 	// SECRET are set.
 	RegionPinner *account.RegionPinner
+
+	// SingleTenantProfile is the deployment's configured single-tenant profile
+	// (ADR-057 Mode 1), threaded from the FISHHAWKD_SINGLE_TENANT_* flags in
+	// serve.go so the login gate can NAME it in the no-admitting-account denial
+	// log (#2468). It is DIAGNOSTIC ONLY: read on that single denial branch and
+	// NOWHERE ELSE. It is NEVER an admission input, never consulted by the
+	// membership resolver, and never reaches the /access-denied redirect, its
+	// reason code, or the rendered page. Admission remains exactly
+	// s.cfg.AuthMembership.ResolveAccounts(...). A zero value means "no
+	// single-tenant profile configured" (the hosted multi-tenant posture);
+	// emptiness is decided by SingleTenantConfig.Enabled(), the same predicate
+	// account.EnsureSingleTenantAccount consults, so the diagnostic and the
+	// bootstrap agree on "configured" by construction.
+	SingleTenantProfile account.SingleTenantConfig
 
 	// OAuthASIssuer is the RFC 8414 issuer this deployment's OAuth 2.1
 	// authorization server (ADR-076 slice 3, #2436) advertises, e.g.

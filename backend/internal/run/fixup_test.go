@@ -3,6 +3,7 @@ package run_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -676,5 +677,160 @@ func TestFixupStage_NilAcceptanceStageID_ClassicBehavior(t *testing.T) {
 	}
 	if dec.ReparkedReview == nil || dec.ReparkedReview.ID != review.ID {
 		t.Errorf("ReparkedReview = %+v, want the classic re-park", dec.ReparkedReview)
+	}
+}
+
+// --- #3116: the fixup_not_applicable refusal must name the REMEDY ---
+//
+// One behavioral test per named branch of findOpenReviewStage's classified
+// refusal, each asserting BOTH the ErrFixupNotApplicable sentinel (the 422 code
+// is unchanged) AND that branch's distinguishing SHIPPED phrase. The acceptance
+// branch is split by state per the binding approval condition: a dispatchable
+// acceptance stage is told to dispatch, an in-flight one is told to wait —
+// naming a remedy the operator cannot take is the defect #3116 exists to stop.
+
+func TestFixupStage_RefusalNamesDispatchAcceptance(t *testing.T) {
+	// Branch (a), dispatchable: acceptance ordered BEFORE review (feature_change),
+	// review still pending, acceptance parked with no spawn attempt.
+	for _, accState := range []run.StageState{run.StageStatePending, run.StageStateAwaitingHostDispatch} {
+		t.Run(string(accState), func(t *testing.T) {
+			repo, impl, _, _ := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, accState)
+			ctx := context.Background()
+
+			_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
+			if !errors.Is(err, run.ErrFixupNotApplicable) {
+				t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "the acceptance stage") {
+				t.Errorf("refusal does not name the acceptance stage: %q", msg)
+			}
+			if !strings.Contains(msg, "Dispatch the acceptance stage") {
+				t.Errorf("refusal does not name the dispatch remedy: %q", msg)
+			}
+			if !strings.Contains(msg, string(accState)) {
+				t.Errorf("refusal does not name the acceptance state %q: %q", accState, msg)
+			}
+			if strings.Contains(msg, "already in flight") {
+				t.Errorf("dispatchable acceptance drew the in-flight wording: %q", msg)
+			}
+			if cur, _ := repo.GetStage(ctx, impl.ID); cur.State != run.StageStateSucceeded {
+				t.Errorf("implement state = %q, want unchanged (succeeded)", cur.State)
+			}
+		})
+	}
+}
+
+func TestFixupStage_RefusalNamesWaitForInFlightAcceptance(t *testing.T) {
+	// Branch (a), in-flight: a spawn attempt already exists, so "dispatch
+	// acceptance" is advice the operator cannot act on (binding condition 1).
+	for _, accState := range []run.StageState{run.StageStateDispatched, run.StageStateRunning} {
+		t.Run(string(accState), func(t *testing.T) {
+			repo, impl, _, _ := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, accState)
+			ctx := context.Background()
+
+			_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
+			if !errors.Is(err, run.ErrFixupNotApplicable) {
+				t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "already in flight") {
+				t.Errorf("refusal does not say acceptance is already in flight: %q", msg)
+			}
+			if !strings.Contains(msg, "Wait for acceptance to settle") {
+				t.Errorf("refusal does not name the wait remedy: %q", msg)
+			}
+			if !strings.Contains(msg, string(accState)) {
+				t.Errorf("refusal does not name the acceptance state %q: %q", accState, msg)
+			}
+			if strings.Contains(msg, "Dispatch the acceptance stage") {
+				t.Errorf("in-flight acceptance drew the inapplicable dispatch remedy: %q", msg)
+			}
+		})
+	}
+}
+
+func TestFixupStage_RefusalGateNotOpenWithoutAcceptance(t *testing.T) {
+	// Branch (b): review not yet open and NO acceptance stage is holding it —
+	// re-poll, do not point at a stage that does not exist.
+	repo, impl, _ := implementWithReview(t, run.StageStateSucceeded, run.StageStatePending)
+	ctx := context.Background()
+
+	_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
+	if !errors.Is(err, run.ErrFixupNotApplicable) {
+		t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "acceptance") {
+		t.Errorf("refusal names acceptance when no acceptance stage exists: %q", msg)
+	}
+	if !strings.Contains(msg, "it opens when the preceding stages settle") {
+		t.Errorf("refusal does not say the gate opens when preceding stages settle: %q", msg)
+	}
+	if !strings.Contains(msg, "awaiting_approval") {
+		t.Errorf("refusal does not name the state to wait for: %q", msg)
+	}
+}
+
+func TestFixupStage_RefusalReviewAlreadyResolvedWording(t *testing.T) {
+	// Branch (c): the review stage already resolved — the gate is closed for
+	// good, so the remedy is a fresh run, not waiting.
+	repo, impl, _ := implementWithReview(t, run.StageStateSucceeded, run.StageStateSucceeded)
+	ctx := context.Background()
+
+	_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
+	if !errors.Is(err, run.ErrFixupNotApplicable) {
+		t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "already resolved") {
+		t.Errorf("refusal does not use the already-resolved wording: %q", msg)
+	}
+	if !strings.Contains(msg, "fresh run") {
+		t.Errorf("refusal does not name the fresh-run remedy: %q", msg)
+	}
+	if strings.Contains(msg, "has not opened yet") {
+		t.Errorf("resolved review drew the not-yet-open wording: %q", msg)
+	}
+}
+
+func TestFixupStage_RefusalNoReviewStageWording(t *testing.T) {
+	// Branch (d): the run has no review stage at all.
+	repo, stage := implementStage(t, run.StageStateSucceeded)
+	ctx := context.Background()
+
+	_, err := run.FixupStage(ctx, repo, stage.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
+	if !errors.Is(err, run.ErrFixupNotApplicable) {
+		t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "no review stage at all") {
+		t.Errorf("refusal does not name the missing review stage: %q", msg)
+	}
+	if strings.Contains(msg, "has not opened yet") {
+		t.Errorf("missing review stage drew the not-yet-open wording: %q", msg)
+	}
+}
+
+func TestFixupStage_OpenReviewGateStillAdmitsWithUnsettledAcceptance(t *testing.T) {
+	// Control: the classified refusal must not narrow the HAPPY path. A review
+	// stage at awaiting_approval still admits the fix-up even with an unsettled
+	// acceptance stage present.
+	repo, impl, review, acc := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStateAwaitingApproval, run.StageStatePending)
+	ctx := context.Background()
+
+	dec, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
+	if err != nil {
+		t.Fatalf("FixupStage: %v", err)
+	}
+	if dec.ReparkedReview == nil || dec.ReparkedReview.ID != review.ID {
+		t.Fatalf("ReparkedReview = %v, want the review stage %s", dec.ReparkedReview, review.ID)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("implement state = %q, want pending", dec.Stage.State)
+	}
+	// Outside acceptance mode the acceptance stage is untouched.
+	if cur, _ := repo.GetStage(ctx, acc.ID); cur.State != run.StageStatePending {
+		t.Errorf("acceptance state = %q, want unchanged (pending)", cur.State)
 	}
 }

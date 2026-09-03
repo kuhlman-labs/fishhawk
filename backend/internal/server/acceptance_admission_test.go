@@ -407,12 +407,50 @@ func TestAcceptanceAdmission_NeedsTarget(t *testing.T) {
 		}
 	})
 
+	// (k) #3091 CROSS-BOUNDARY: the seam that silently produced "" in run
+	// 10d7c863. A DECOMPOSED PARENT's chain carries NO reported-head entry of any
+	// category — only the incremental fan-in records — and the admission endpoint
+	// must still answer a NON-EMPTY expected_head_sha equal to the newest
+	// merge_sha. Driving the real handler is what makes this a proof: per-layer
+	// resolver unit tests would pass while this audit-ledger → resolver →
+	// response seam stayed broken.
+	t.Run("decomposed parent fan-in ledger -> needs_target with the consolidated head", func(t *testing.T) {
+		seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, mixed))
+		seam.rr.runs[seam.runID].WorkflowSpec = exampleBytes
+		const olderMerge = "1111111aaaabbbbccccddddeeeeffff000011112"
+		const consolidatedTip = "2222222aaaabbbbccccddddeeeeffff000022223"
+		seam.au.seeded = append(seam.au.seeded,
+			makeIntegrationCommitEntry(seam.runID, 3, olderMerge),
+			makeIntegrationCommitEntry(seam.runID, 9, consolidatedTip))
+
+		w := postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity())
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp acceptanceAdmissionResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if !resp.NeedsTarget {
+			t.Errorf("needs_target = false, want true")
+		}
+		if resp.ExpectedHeadSHA != consolidatedTip {
+			t.Errorf("expected_head_sha = %q, want the newest fan-in merge %q — an empty answer is the #3091 defect",
+				resp.ExpectedHeadSHA, consolidatedTip)
+		}
+		// Wire-key assertion: the dispatch verb decodes this exact key.
+		if !strings.Contains(w.Body.String(), `"expected_head_sha":"`+consolidatedTip+`"`) {
+			t.Errorf("response missing the wire key:\n%s", w.Body.String())
+		}
+	})
+
 	t.Run("declared hosts + unresolvable head SHA -> needs_target, empty sha", func(t *testing.T) {
 		seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, mixed))
 		seam.rr.runs[seam.runID].WorkflowSpec = exampleBytes
-		// No reported-head ledger entry seeded -> resolveAcceptanceExpectedHeadSHA
-		// returns "". needs_target must still be present (the verb degrades to a
-		// proceed-with-warning on an empty SHA).
+		// No reported-head ledger entry AND no fan-in entry seeded ->
+		// resolveAcceptanceExpectedHeadSHA returns "". needs_target must still be
+		// present; since #3091 the verb REFUSES on the empty SHA rather than
+		// proceeding with a warning (see TestCheckAcceptanceTarget in mcpserver).
 		w := postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity())
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())

@@ -179,18 +179,48 @@ type acceptanceVerdict struct {
 // verdict-missing. A legacy read emits an acceptance_verdict_legacy_path
 // deprecation event via warn (nil-tolerant). Returns errAcceptanceVerdictMissing
 // when neither transport produced anything.
+//
+// The keyed and legacy reads are bounded by readSidecarBounded (E64.12 / #3106):
+// the verdict is an agent-authored file, so its size is agent-controlled input.
+// An oversize keyed or legacy verdict returns a wrapped non-nil error — NOT
+// errAcceptanceVerdictMissing, since the verdict is present-but-oversize, and
+// conflating the two would let the stage report the wrong failure — and emits
+// the named acceptance_verdict_oversize event through warn. DEVIATION, called
+// out deliberately: unlike the six other sidecar loaders this does NOT remove
+// the oversize file. captureAcceptanceVerdict has never removed on read;
+// removal is owned by the pre-invoke sweepStaleAcceptanceVerdict, which fails
+// the stage category-C when it cannot unlink. This stage's oversize verdict is
+// therefore NOT removed here and NOT removed by this stage at all — it survives
+// on disk until the NEXT acceptance stage's pre-invoke sweep clears it. Folding
+// a removal in here would move that ownership and could mask a sweep failure,
+// so the issue's sidecar-removed requirement is satisfied for this site by the
+// pre-existing sweep, not at read time.
 func captureAcceptanceVerdict(res agent.Result, keyedPath, legacyPath string, warn func(event, detail string)) ([]byte, error) {
 	if len(res.StructuredOutput) > 0 {
 		return res.StructuredOutput, nil
 	}
-	b, err := os.ReadFile(keyedPath)
+	b, err := readSidecarBounded(keyedPath)
 	if err != nil {
+		if errors.Is(err, errSidecarTooLarge) {
+			if warn != nil {
+				warn("acceptance_verdict_oversize",
+					"keyed verdict exceeds size ceiling: "+keyedPath)
+			}
+			return nil, fmt.Errorf("acceptance verdict keyed oversize: %w", err)
+		}
 		if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("acceptance verdict fallback read: %w", err)
 		}
 		// Keyed path absent: fall back to the legacy fixed path the prompt names.
-		lb, lerr := os.ReadFile(legacyPath)
+		lb, lerr := readSidecarBounded(legacyPath)
 		if lerr != nil {
+			if errors.Is(lerr, errSidecarTooLarge) {
+				if warn != nil {
+					warn("acceptance_verdict_oversize",
+						"legacy verdict exceeds size ceiling: "+legacyPath)
+				}
+				return nil, fmt.Errorf("acceptance verdict legacy oversize: %w", lerr)
+			}
 			if os.IsNotExist(lerr) {
 				return nil, errAcceptanceVerdictMissing
 			}
