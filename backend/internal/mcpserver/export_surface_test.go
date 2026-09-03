@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 235 names are tool I/O request/response structs. The MCP
+// The bulk of these 270 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -129,6 +129,11 @@ var exportBaseline = []string{
 	"FileIssueRelations",
 	"FileWorkItemRequest",
 	"FiledWorkItem",
+	// E68.31 / #3081: the additive fix-up-recovery marker nested on
+	// StageWaitStatus. Exported for the same reason as the other nested response
+	// types — the MCP SDK's jsonschema reflection needs the type AND its fields
+	// exported to advertise the shape on every tool that carries the block.
+	"FixupRecovery",
 	"FixupStageInput",
 	"FixupStageOutput",
 	"GateView",
@@ -412,7 +417,11 @@ func TestExportedSurfaceMatchesBaseline(t *testing.T) {
 		}
 	}
 	if len(got) != len(exportBaseline) {
-		t.Errorf("exported identifier count = %d, want %d", len(got), len(exportBaseline))
+		// The count is ALSO quoted in prose. Name that site here so a drift is
+		// fixed everywhere in one pass rather than leaving a stale figure
+		// standing where nothing will ever fail on it (#3013).
+		t.Errorf("exported identifier count = %d, want %d — if this is an intentional export change, also update the figures in README.md \"Exported surface: why N identifiers, not 3\" and the count in this file's exportBaseline doc comment",
+			len(got), len(exportBaseline))
 	}
 }
 

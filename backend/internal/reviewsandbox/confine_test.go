@@ -411,12 +411,21 @@ func TestCodexConfinedHome_PlacedInsideADeniedRoot(t *testing.T) {
 // CONDITION 1 — the credential must NOT be inside the reviewer-readable set.
 // ---------------------------------------------------------------------------
 
-// TestCodexConfinedHome_CredentialNotGrantedToToolLayer asserts that neither the
-// synthesized home nor auth.json appears as a filesystem grant in either profile
-// file, while the export (and the schema) DO. The grant set is what codex-cli
-// enforces as an OS-level allowlist, so a home-wide grant would hand the copied
-// credential straight to the reviewer's tool layer — the exact egress path this
-// issue describes.
+// TestCodexConfinedHome_CredentialNotGrantedToToolLayer asserts that no emitted
+// filesystem grant covers the real CODEX_HOME, the copied auth.json or the
+// synthesized home, while the export (and the schema) DO appear. The grant set
+// is what codex-cli enforces as an OS-level allowlist, so a home-wide grant
+// would hand the copied credential straight to the reviewer's tool layer — the
+// exact egress path this issue describes.
+//
+// THIS IS A BUILDER-CONFIGURATION CLAIM ONLY (#3082). It states what this
+// function WRITES. Whether codex-cli's kernel-level sandbox turns that
+// configuration into an actual denial is not observable hermetically and is
+// carried by the opt-in TestLive_* harness (FISHHAWK_LIVE_CONFINEMENT=1, #3059).
+//
+// The synthesized home is the SINGLE deliberate exemption from the containment
+// claim, so it is asserted rather than assumed: it must be a PROPER
+// subdirectory of the real CODEX_HOME carrying the `fishhawk-confined-` prefix.
 func TestCodexConfinedHome_CredentialNotGrantedToToolLayer(t *testing.T) {
 	hp := fixtureHostPaths(t, nil)
 	export := t.TempDir()
@@ -431,12 +440,27 @@ func TestCodexConfinedHome_CredentialNotGrantedToToolLayer(t *testing.T) {
 	}
 	defer func() { _ = cleanup() }()
 
+	// The single named exemption, asserted not assumed.
+	if !pathCovers(hp.CodexHome, home) || filepath.Clean(home) == filepath.Clean(hp.CodexHome) {
+		t.Fatalf("synthesized home = %q, want a PROPER subdirectory of the real CODEX_HOME %q", home, hp.CodexHome)
+	}
+	if !strings.HasPrefix(filepath.Base(home), "fishhawk-confined-") {
+		t.Fatalf("synthesized home base = %q, want the `fishhawk-confined-` prefix", filepath.Base(home))
+	}
+
+	forbidden := []struct{ label, path string }{
+		{"the real CODEX_HOME", hp.CodexHome},
+		{"the copied credential", filepath.Join(home, "auth.json")},
+		{"the synthesized home (which holds the copied credential)", home},
+	}
 	for _, name := range []string{"config.toml", ConfinedProfileName + ".config.toml"} {
 		body := readFile(t, filepath.Join(home, name))
 		grants := filesystemGrants(body)
 		for _, g := range grants {
-			if pathCovers(g, filepath.Join(home, "auth.json")) {
-				t.Errorf("%s grants %q, which covers the copied credential", name, g)
+			for _, f := range forbidden {
+				if pathCovers(g, f.path) {
+					t.Errorf("%s grants %q, which COVERS %s (%q)", name, g, f.label, f.path)
+				}
 			}
 		}
 		if !slices.Contains(grants, export) {

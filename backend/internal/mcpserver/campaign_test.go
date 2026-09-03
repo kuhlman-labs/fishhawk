@@ -1446,6 +1446,15 @@ type fakeMCPResolverProvider struct {
 	name     string
 	result   *workmgmt.EpicChildrenResult
 	captured workmgmt.IssueSetRequest
+	// err, when non-nil, is returned INSTEAD of result — the seam the #3113
+	// cross-boundary tests drive a *workmgmt.IssueSetResolutionTimeout through.
+	err error
+	// ctxDeadlineAtEntry is the resolver context's deadline as observed on ENTRY
+	// to ResolveDependencies, and ctxHasDeadline whether it carried one at all.
+	// The no-epic branch must hand the resolver a BOUNDED context (#3113); the
+	// epic branch deliberately must not.
+	ctxDeadlineAtEntry time.Time
+	ctxHasDeadline     bool
 }
 
 func (f *fakeMCPResolverProvider) Name() string { return f.name }
@@ -1454,8 +1463,12 @@ func (f *fakeMCPResolverProvider) File(_ context.Context, _ workmgmt.ProviderReq
 	return &workmgmt.CreatedItem{Provider: f.name}, nil
 }
 
-func (f *fakeMCPResolverProvider) ResolveDependencies(_ context.Context, req workmgmt.IssueSetRequest) (*workmgmt.EpicChildrenResult, error) {
+func (f *fakeMCPResolverProvider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSetRequest) (*workmgmt.EpicChildrenResult, error) {
 	f.captured = req
+	f.ctxDeadlineAtEntry, f.ctxHasDeadline = ctx.Deadline()
+	if f.err != nil {
+		return nil, f.err
+	}
 	return f.result, nil
 }
 
@@ -1466,9 +1479,17 @@ func (f *fakeMCPResolverProvider) ResolveDependencies(_ context.Context, req wor
 type stubMCPAPITokens struct {
 	apitoken.Repository
 	tok *apitoken.Token
+	// delay makes authentication deliberately expensive. requireWriteScope runs
+	// INSIDE handleCreateCampaign, AFTER its requestStart anchor, so this is
+	// pre-resolution work that a deadline anchored at handler entry must cover
+	// and one anchored at the resolver call would not.
+	delay time.Duration
 }
 
 func (s *stubMCPAPITokens) Authenticate(_ context.Context, plaintext string) (*apitoken.Token, error) {
+	if s.delay > 0 {
+		time.Sleep(s.delay)
+	}
 	if s.tok != nil && plaintext == s.tok.PlainText {
 		return s.tok, nil
 	}
@@ -2249,5 +2270,263 @@ func TestStartCampaign_UnparseableDependsOnToken_ReachesOperatorMessageEndToEnd(
 	}
 	if strings.Contains(msg, "issue:0") {
 		t.Errorf("operator message %q renders issue:0 for the unresolvable target — forbidden (#2956)", msg)
+	}
+}
+
+// --- issue-set resolution timeout, end to end (E54.59 / #3113) ---
+
+// noopIssueSetCampaignRepo satisfies server.Config's CampaignRepo nil-check
+// without a database. Every #3113 timeout test refuses BEFORE assembly, so no
+// repository method is ever called; the embedded nil interface makes an
+// accidental call panic loudly rather than pass silently.
+type noopIssueSetCampaignRepo struct {
+	campaign.Repository
+}
+
+// startIssueSetTimeoutServer stands up the REAL server.Handler() over httptest
+// with a resolver fake that returns the supplied error, and returns a
+// runResolver whose apiClient is the REAL MCP client pointed at it. Every test
+// below therefore crosses the full boundary the operator asked for: provider
+// error type -> handleCreateCampaign's 504 -> the 5xx detail redactor -> the
+// real HTTP decoder -> the real fishhawk_start_campaign renderer.
+func startIssueSetTimeoutServer(t *testing.T, cfg server.Config, resolveErr error, authDelay time.Duration) (*runResolver, *fakeMCPResolverProvider) {
+	t.Helper()
+	prov := &fakeMCPResolverProvider{name: workmgmt.Default().Provider, err: resolveErr}
+	workmgmt.Register(prov)
+
+	const bearer = "fhk_issueset_timeout"
+	cfg.CampaignRepo = &noopIssueSetCampaignRepo{}
+	cfg.APITokenRepo = &stubMCPAPITokens{
+		delay: authDelay,
+		tok: &apitoken.Token{
+			ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:campaigns"}, PlainText: bearer,
+		},
+	}
+	s := server.New(cfg)
+	httpSrv := httptest.NewServer(s.Handler())
+	t.Cleanup(httpSrv.Close)
+	return &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}, prov
+}
+
+// TestStartCampaignIssueSetTimeoutRendersCounts is the CROSS-BOUNDARY test the
+// plan requires. Testing the two ends separately lets a wrong detail TYPE pass
+// both — the server writes Go ints, the client decodes JSON numbers as float64,
+// and a renderer that asserted int would silently degrade — so this drives ONE
+// path: the REAL server's 504 (built from a real
+// *workmgmt.IssueSetResolutionTimeout, past the real 5xx default-deny detail
+// redactor) through the REAL apiClient decoder into the REAL
+// fishhawk_start_campaign renderer, and asserts the OPERATOR TEXT names the
+// counts and the suggested limit.
+func TestStartCampaignIssueSetTimeoutRendersCounts(t *testing.T) {
+	r, prov := startIssueSetTimeoutServer(t,
+		server.Config{IssueSetResolutionBudget: 90 * time.Second},
+		&workmgmt.IssueSetResolutionTimeout{Resolved: 37, Total: 60, SuggestedLimit: 37, Phase: "phase 1"},
+		0)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo:  "kuhlman-labs/fishhawk",
+		Items: []string{"issue:101", "issue:102"},
+	})
+	if err == nil {
+		t.Fatal("startCampaign succeeded, want the rendered issue_set_resolution_timeout refusal")
+	}
+	if prov.captured.Items == nil {
+		t.Fatal("the resolver was never reached — the request did not route to the no-epic branch")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"issue_set_resolution_timeout",
+		"resolved 37 of 60",
+		"90s issue-set budget",
+		"grooming_order_limit=37",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("rendered refusal %q does not name %q", msg, want)
+		}
+	}
+	// The refusal must NOT be the generic create-campaign wrapper: that is what
+	// shipped before the renderer arm existed, and it carries no counts.
+	if strings.HasPrefix(msg, "create campaign:") {
+		t.Errorf("rendered refusal fell through to the generic wrapper: %q", msg)
+	}
+}
+
+// TestStartCampaignIssueSetTimeoutNoSuggestionRenders is the NO-SUGGESTION
+// variant. The backend OMITS suggested_grooming_order_limit when it could not
+// PROVE a fitting value (SuggestedLimit 0), so the renderer must say so and
+// offer bisection rather than invent a number — in particular it must never
+// advise an operator to request zero items.
+func TestStartCampaignIssueSetTimeoutNoSuggestionRenders(t *testing.T) {
+	r, _ := startIssueSetTimeoutServer(t,
+		server.Config{IssueSetResolutionBudget: 90 * time.Second},
+		&workmgmt.IssueSetResolutionTimeout{Resolved: 0, Total: 60, SuggestedLimit: 0, Phase: "phase 1"},
+		0)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo:  "kuhlman-labs/fishhawk",
+		Items: []string{"issue:101", "issue:102"},
+	})
+	if err == nil {
+		t.Fatal("startCampaign succeeded, want the rendered refusal")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"issue_set_resolution_timeout",
+		"resolved 0 of 60",
+		"could not prove ANY item count that fits",
+		"bisect",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("rendered refusal %q does not name %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "grooming_order_limit=0") {
+		t.Errorf("rendered refusal advises requesting ZERO items: %q", msg)
+	}
+}
+
+// TestStartCampaignIssueSetTimeoutClampedBudgetOnTheWire closes operator
+// condition 1(a) from the CLIENT's vantage. server.Config is exported, so a
+// budget above MaxIssueSetResolutionBudget can be constructed by any caller —
+// a test, an embedded use, a second binary — with fishhawkd's startup refusal
+// nowhere in the picture. This builds exactly such a Config and asserts the
+// EFFECTIVE budget observed on the wire (the 504's budget_seconds, rendered
+// into the operator text) is the CEILING, and that the ceiling is below the
+// client's own timeout. That is what makes the constant relationship pin in
+// client_test.go mean something about the running system.
+func TestStartCampaignIssueSetTimeoutClampedBudgetOnTheWire(t *testing.T) {
+	over := server.MaxIssueSetResolutionBudget + time.Hour
+	r, prov := startIssueSetTimeoutServer(t,
+		server.Config{IssueSetResolutionBudget: over},
+		&workmgmt.IssueSetResolutionTimeout{Resolved: 5, Total: 60, SuggestedLimit: 5, Phase: "phase 1"},
+		0)
+
+	beforeRequest := time.Now()
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo:  "kuhlman-labs/fishhawk",
+		Items: []string{"issue:101", "issue:102"},
+	})
+	if err == nil {
+		t.Fatal("startCampaign succeeded, want the rendered refusal")
+	}
+	msg := err.Error()
+	wantCeiling := fmt.Sprintf("%ds issue-set budget", int(server.MaxIssueSetResolutionBudget/time.Second))
+	if !strings.Contains(msg, wantCeiling) {
+		t.Errorf("rendered refusal %q does not name the CLAMPED %s ceiling — a Config built above the maximum was honoured verbatim", msg, wantCeiling)
+	}
+	notClamped := fmt.Sprintf("%ds issue-set budget", int(over/time.Second))
+	if strings.Contains(msg, notClamped) {
+		t.Errorf("rendered refusal names the UNCLAMPED %s: the ceiling is not enforced at the read site", notClamped)
+	}
+	if server.MaxIssueSetResolutionBudget >= issueSetClientTimeout {
+		t.Errorf("the clamped ceiling %s is not below the client's %s timeout", server.MaxIssueSetResolutionBudget, issueSetClientTimeout)
+	}
+	// The rendered budget_seconds is a NUMBER THE HANDLER PRINTS; the deadline
+	// the resolver actually receives is the thing that bounds the work. Assert
+	// the latter too, so a clamp applied only to the printed number (and not to
+	// the context) cannot green this test. Measured from BEFORE the request, so
+	// an unclamped Config's hour-long deadline lands well past the bound.
+	if !prov.ctxHasDeadline {
+		t.Fatal("the no-epic resolver received an UNBOUNDED context — the budget is not applied at all")
+	}
+	// beforeRequest is taken OUTSIDE the process boundary, so the handler's own
+	// requestStart anchor is later than it by the request's transit latency. The
+	// bound therefore carries a minute of slack for that skew — which costs no
+	// discrimination here, because an UNCLAMPED Config would put the deadline a
+	// full HOUR past the ceiling.
+	const transitSlack = time.Minute
+	if latest := beforeRequest.Add(server.MaxIssueSetResolutionBudget + transitSlack); prov.ctxDeadlineAtEntry.After(latest) {
+		t.Errorf("resolver deadline %s is past beforeRequest+%s: the over-maximum Config was honoured verbatim in the CONTEXT even though the printed budget_seconds was clamped",
+			prov.ctxDeadlineAtEntry.Format(time.RFC3339Nano), server.MaxIssueSetResolutionBudget)
+	}
+}
+
+// TestIssueSetTimeoutRemedyDegrades covers the renderer's DEFENSIVE branches
+// directly: detail values arrive as JSON numbers (float64), so a missing or
+// wrong-typed value must degrade to the generic remedy rather than render a
+// bogus zero. Each branch gets its own assertion.
+func TestIssueSetTimeoutRemedyDegrades(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		details map[string]any
+		want    []string
+		notWant []string
+	}{
+		{
+			name:    "nil details degrades on every read",
+			details: nil,
+			want:    []string{"did not finish", "within its issue-set budget", "could not prove ANY item count"},
+			notWant: []string{"resolved 0 of 0", "grooming_order_limit="},
+		},
+		{
+			name:    "counts present as JSON float64 render",
+			details: map[string]any{"resolved": float64(12), "items_total": float64(60), "budget_seconds": float64(120), "suggested_grooming_order_limit": float64(12)},
+			want:    []string{"resolved 12 of 60", "120s issue-set budget", "grooming_order_limit=12"},
+		},
+		{
+			name:    "wrong-typed counts degrade rather than render a zero",
+			details: map[string]any{"resolved": "12", "items_total": nil, "budget_seconds": true},
+			want:    []string{"did not finish", "within its issue-set budget"},
+			notWant: []string{"resolved 0 of 0", "0s issue-set budget"},
+		},
+		{
+			name:    "resolved present but items_total absent degrades both",
+			details: map[string]any{"resolved": float64(12)},
+			want:    []string{"did not finish"},
+			notWant: []string{"resolved 12 of"},
+		},
+		{
+			name:    "a wrong-typed suggestion falls back to bisection",
+			details: map[string]any{"resolved": float64(1), "items_total": float64(9), "suggested_grooming_order_limit": "9"},
+			want:    []string{"resolved 1 of 9", "bisect"},
+			notWant: []string{"grooming_order_limit=9"},
+		},
+		{
+			name:    "a zero suggestion is never rendered as a number",
+			details: map[string]any{"resolved": float64(0), "items_total": float64(9), "suggested_grooming_order_limit": float64(0)},
+			want:    []string{"could not prove ANY item count", "bisect"},
+			notWant: []string{"grooming_order_limit=0"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := issueSetTimeoutRemedy(tc.details)
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("remedy %q does not name %q", got, w)
+				}
+			}
+			for _, nw := range tc.notWant {
+				if strings.Contains(got, nw) {
+					t.Errorf("remedy %q must not name %q", got, nw)
+				}
+			}
+		})
+	}
+}
+
+// TestDetailInt covers the numeric accessor's branches: JSON float64 (the wire
+// path), a hand-built int (the unit-test path), and every other type / an
+// absent key reporting ABSENT so callers degrade instead of rendering a zero.
+func TestDetailInt(t *testing.T) {
+	details := map[string]any{
+		"f": float64(7), "i": 9, "s": "7", "b": true, "n": nil, "neg": float64(-3),
+	}
+	for _, tc := range []struct {
+		key    string
+		want   int
+		wantOK bool
+	}{
+		{"f", 7, true},
+		{"i", 9, true},
+		{"neg", -3, true},
+		{"s", 0, false},
+		{"b", 0, false},
+		{"n", 0, false},
+		{"absent", 0, false},
+	} {
+		got, ok := detailInt(details, tc.key)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("detailInt(%q) = (%d, %v), want (%d, %v)", tc.key, got, ok, tc.want, tc.wantOK)
+		}
 	}
 }

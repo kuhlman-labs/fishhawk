@@ -1,0 +1,29 @@
+-- 0078 down: drop installations.project_path (E45.26 / #2877).
+--
+-- DESTRUCTIVE. This DISCARDS every exact-path binding recorded since 0078 ran.
+-- No other table carries a copy, so the values are not recoverable from the
+-- database — an operator must re-derive each project path from their GitLab
+-- deployment.
+--
+-- The consequence compounds with the fail-closed design the column exists for:
+-- if the post-0078 code is later re-deployed against a database whose column
+-- was dropped and re-added empty, EVERY gitlab installation is unbound, and an
+-- unbound row REFUSES. GitLab run creation and CI-failure retry stop working
+-- for those installations, each refusal auditing as run_rejected_misconfigured
+-- with reason 'gitlab_project_path_unbound'. That is an outage for the affected
+-- tenants, not a degradation.
+--
+-- Prefer the CODE-ONLY revert instead: revert the Go changes and LEAVE this
+-- migration applied. The generated installation reads carry EXPLICIT column
+-- lists (never `SELECT *` at run time), so pre-0078 code against a
+-- still-present column produces no scan mismatch — the extra column is simply
+-- never selected, the recorded values sit dormant and intact, and re-applying
+-- the change later needs no re-registration.
+--
+-- OPERATOR REMEDY if this down migration is nevertheless run and the feature is
+-- later re-applied: enumerate the unbound rows with `fishhawkd installation
+-- list` (they render '(unbound)') and re-register each:
+--
+--   fishhawkd installation register --provider gitlab --account-key <key> \
+--     --installation-ref gitlab:<project-id> --project-path <namespace>/<project>
+ALTER TABLE installations DROP COLUMN project_path;

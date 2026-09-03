@@ -3,6 +3,7 @@ package workmgmt
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -382,4 +383,43 @@ func TestDependsEdgeTargetRef(t *testing.T) {
 			t.Errorf("TargetRef len = %d, want <= %d (a directly-supplied oversize token must be bounded by the renderer)", len(got), ceiling)
 		}
 	})
+}
+
+// TestIssueSetResolutionTimeoutError pins the rendered message and, decisively,
+// that a ZERO SuggestedLimit renders NO suggestion — 0 is the "no value can be
+// proven to fit" signal, and a message advising an operator to request zero
+// items would be worse than no advice at all (#3113).
+func TestIssueSetResolutionTimeoutError(t *testing.T) {
+	withSuggestion := (&IssueSetResolutionTimeout{Resolved: 12, Total: 60, SuggestedLimit: 12, Phase: "fetch_items"}).Error()
+	for _, want := range []string{"resolved 12 of 60 issues", "during fetch_items", "a limit of 12 would have fit"} {
+		if !strings.Contains(withSuggestion, want) {
+			t.Fatalf("message %q missing %q", withSuggestion, want)
+		}
+	}
+	none := (&IssueSetResolutionTimeout{Resolved: 0, Total: 60, SuggestedLimit: 0, Phase: "fetch_items"}).Error()
+	if strings.Contains(none, "would have fit") {
+		t.Fatalf("a zero SuggestedLimit must render no suggestion, got %q", none)
+	}
+	if !strings.Contains(none, "resolved 0 of 60 issues") {
+		t.Fatalf("counts missing from %q", none)
+	}
+	if bare := (&IssueSetResolutionTimeout{Total: 3}).Error(); strings.Contains(bare, "during") {
+		t.Fatalf("an empty Phase must render no phase clause, got %q", bare)
+	}
+}
+
+// TestIssueSetResolutionTimeoutUnwrap: a caller that only wants to know the
+// request ran out of time can errors.Is it against context.DeadlineExceeded,
+// while errors.As reaches the counts — the two access paths the server's 504
+// arm and the generic timeout handling each need.
+func TestIssueSetResolutionTimeoutUnwrap(t *testing.T) {
+	var err error = &IssueSetResolutionTimeout{Resolved: 1, Total: 2, SuggestedLimit: 1}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("errors.Is(err, context.DeadlineExceeded) must hold")
+	}
+	wrapped := fmt.Errorf("campaign: %w", err)
+	var to *IssueSetResolutionTimeout
+	if !errors.As(wrapped, &to) || to.Resolved != 1 || to.Total != 2 || to.SuggestedLimit != 1 {
+		t.Fatalf("errors.As must reach the counts through a wrap, got %+v", to)
+	}
 }

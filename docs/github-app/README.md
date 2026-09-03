@@ -249,6 +249,14 @@ Fishhawk publishes a `fishhawk_audit_complete` Check Run on every PR's head comm
 
 From this point, GitHub itself refuses the merge until Fishhawk reports `success`. The "Details" link on the check on github.com routes back to the run page in Fishhawk via the operator's configured `FISHHAWKD_EXTERNAL_URL`.
 
+#### PRs with no Fishhawk run (E64.43 / #3160)
+
+A required check that is never published blocks the PR forever, so since #3160 a PR with **no** Fishhawk run — a Dependabot bump, a human hotfix, an operator-authored docs PR — receives a terminal `neutral` `fishhawk_audit_complete` Check Run stating that the PR is not a Fishhawk-managed change and the audit gate does not apply. GitHub treats `neutral` as satisfying a required context, so such PRs are mergeable while the gate stays real for Fishhawk-managed ones.
+
+**This reads the App's own identity on the webhook path.** Before publishing that not-applicable check, the backend resolves the App's own bot login from `GET /app` (the App slug plus `[bot]`) and refuses to publish when it matches the PR's author or the event's sender — that is what keeps a Fishhawk-managed PR whose run row is not yet denormalized from receiving a `neutral` conclusion it did not earn. The lookup is memoized per daemon start, so it costs one round-trip, and it uses the **installing** App's own slug: a self-hosted install under a different App resolves its own identity, with no login literal anywhere.
+
+**If that metadata is not reachable, the behaviour is to publish NOTHING**, not to publish a false green. An App whose `GET /app` or `GET /users/<login>` call fails yields no identity, and the backend then declines to publish the not-applicable check at all — leaving non-Fishhawk PRs blocked, exactly as before #3160, recoverable with `gh pr merge <n> --admin`. A WARN line (`zero runs but App identity unresolvable — not publishing not-applicable`) names the condition in the daemon log. This direction is deliberate: a missing publish is recoverable by an operator, while a wrong publish would green a real audit gate with nothing telling the operator it happened.
+
 ### Re-installing after a permissions bump
 
 When the App's permission set changes (e.g. a new `checks: write` requirement), GitHub flags the installation as needing review and existing installations fall back to the old permission set until the customer accepts the new ones. Reinstall via the App's installation page (**Configure** → **Save**) to pick up the new permissions.

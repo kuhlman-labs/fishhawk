@@ -125,3 +125,37 @@ func TestRunIsIssueAnchored(t *testing.T) {
 		t.Error("(*Run)(nil).IsIssueAnchored() = true, want false")
 	}
 }
+
+// TestStageStateSuperseded_Classification pins the merge-supersede terminal
+// state (E64.2 / #3083). It carries the exact wire value 'superseded' (the
+// audit log and every JSON payload carry it forever) and is classified TERMINAL
+// — which is what makes Orchestrator.completeRun's #968 guard accept it and
+// what makes transitionStage stamp ended_at. Terminal implies settled, so the
+// two classifiers stay consistent. These are behavioral done-means assertions:
+// compilation does not enforce the classifier tables.
+func TestStageStateSuperseded_Classification(t *testing.T) {
+	if got := string(StageStateSuperseded); got != "superseded" {
+		t.Errorf("StageStateSuperseded = %q, want superseded", got)
+	}
+	if !StageStateSuperseded.IsTerminal() {
+		t.Error("superseded must be terminal (the #968 completion guard must accept it, and ended_at must stamp)")
+	}
+	if !StageStateSuperseded.IsSettled() {
+		t.Error("superseded must be settled (every terminal state is settled)")
+	}
+	// It is a DISTINCT fact from the two states an operator would otherwise be
+	// forced to lie with — the whole point of #3083.
+	if StageStateSuperseded == StageStateCancelled || StageStateSuperseded == StageStateFailed {
+		t.Error("superseded must be distinct from cancelled and failed")
+	}
+	// The prior three terminal states remain terminal (the widening is additive).
+	for _, s := range []StageState{StageStateSucceeded, StageStateFailed, StageStateCancelled} {
+		if !s.IsTerminal() {
+			t.Errorf("%q must remain terminal after the #3083 widening", s)
+		}
+	}
+	// A non-terminal park must NOT have been swept into the terminal set.
+	if StageStateAwaitingHostDispatch.IsTerminal() {
+		t.Error("awaiting_host_dispatch must remain non-terminal")
+	}
+}

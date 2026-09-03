@@ -119,6 +119,13 @@ type EpicChildrenRequest struct {
 // SatisfiedEdges and elided from the wave DAG, so a batch whose prerequisite is
 // already done assembles instead of failing closed), while an OPEN, closed-but-
 // incomplete, or unreadable target keeps the fail-closed refusal in DroppedEdges.
+//
+// DEADLINES (#3113): resolving an arbitrary named set costs one forge read per
+// named issue plus one per distinct out-of-set target, so a large set is the
+// path a caller-imposed deadline actually trips. An expired ctx surfaces as
+// *IssueSetResolutionTimeout — in PREFERENCE to any wrapped provider fetch
+// error, so a caller can errors.As the counts and render a numbered refusal
+// rather than mistaking a deadline for a provider fault.
 type IssueSetDependencyResolver interface {
 	ResolveDependencies(ctx context.Context, req IssueSetRequest) (*EpicChildrenResult, error)
 }
@@ -131,6 +138,72 @@ type IssueSetRequest struct {
 	Target Target
 	Items  []string
 }
+
+// IssueSetResolutionTimeout is the typed deadline outcome of an issue-set
+// dependency resolution (#3113): the caller's context expired before the
+// resolution completed, and this error carries the HONEST counts of how far it
+// got so the operator refusal can name a number instead of a bare timeout.
+//
+// It is returned by IssueSetDependencyResolver.ResolveDependencies in
+// PREFERENCE to any wrapped provider fetch error: a deadline that trips a
+// forge call surfaces that call's transport error, and returning that error
+// would present a deadline as a provider fault. Every phase of the resolution
+// therefore checks the context before returning a fetch error.
+//
+// Two invariants callers depend on:
+//
+//   - Resolved counts items whose resolution is COMPLETE — the item's own issue
+//     was fetched AND every out-of-set depends_on target it names was
+//     classified. An item naming no out-of-set target is fully resolved as soon
+//     as its own fetch completes. A partially-resolved item is NEVER counted.
+//   - SuggestedLimit is a value that provably WOULD have fit: the length of the
+//     longest PREFIX of the request order all of whose items are fully
+//     resolved. It is 0 when no value can be proven to fit (the first item did
+//     not complete), and 0 is the "no suggestion" signal — never a suggestion
+//     of zero items. It is deliberately conservative: a non-prefix resolved set
+//     never raises it.
+//
+// Phase names the resolution phase the deadline hit, for the operator message
+// and the audit trail; it is diagnostic, not a contract callers switch on.
+//
+// Unwrap returns context.DeadlineExceeded so errors.Is(err,
+// context.DeadlineExceeded) holds for a caller that only wants to know the
+// request ran out of time, while errors.As reaches the counts.
+type IssueSetResolutionTimeout struct {
+	// Resolved is the number of FULLY resolved items (see the invariant above).
+	Resolved int
+	// Total is the number of distinct issues the request named.
+	Total int
+	// SuggestedLimit is a provably-fitting item count, or 0 for no suggestion.
+	SuggestedLimit int
+	// Phase names the resolution phase the deadline hit (diagnostic).
+	Phase string
+}
+
+// Error renders the counts and the phase. It never renders SuggestedLimit when
+// it is 0, so a message can never advise an operator to request zero items.
+func (e *IssueSetResolutionTimeout) Error() string {
+	var b strings.Builder
+	b.WriteString("workmgmt: issue-set dependency resolution timed out")
+	if e.Phase != "" {
+		b.WriteString(" during ")
+		b.WriteString(e.Phase)
+	}
+	b.WriteString(": resolved ")
+	b.WriteString(strconv.Itoa(e.Resolved))
+	b.WriteString(" of ")
+	b.WriteString(strconv.Itoa(e.Total))
+	b.WriteString(" issues")
+	if e.SuggestedLimit > 0 {
+		b.WriteString("; a limit of ")
+		b.WriteString(strconv.Itoa(e.SuggestedLimit))
+		b.WriteString(" would have fit")
+	}
+	return b.String()
+}
+
+// Unwrap makes errors.Is(err, context.DeadlineExceeded) hold.
+func (*IssueSetResolutionTimeout) Unwrap() error { return context.DeadlineExceeded }
 
 // EpicChildrenResult is the epic-children query output: the epic's child
 // issues and the depends_on edges among them. Children are ordered

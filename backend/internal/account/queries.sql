@@ -92,13 +92,19 @@ RETURNING *;
 
 -- name: UpsertInstallation :one
 -- Idempotent create-or-update keyed on (provider, installation_ref). Carries
--- the relocated forge_base_url / oauth_base_url endpoint columns (Amendment A1).
-INSERT INTO installations (id, account_id, provider, installation_ref, forge_base_url, oauth_base_url)
-VALUES ($1, $2, $3, $4, $5, $6)
+-- the relocated forge_base_url / oauth_base_url endpoint columns (Amendment A1)
+-- and, since 0078 (E45.26 / #2877), project_path — the GitLab
+-- path_with_namespace the run-creation authorization gate binds EXACTLY.
+-- project_path is in the DO UPDATE SET so re-registering an installation
+-- REPAIRS an unbound row in place rather than duplicating it, which is the
+-- documented upgrade and rollback remedy.
+INSERT INTO installations (id, account_id, provider, installation_ref, forge_base_url, oauth_base_url, project_path)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (provider, installation_ref) DO UPDATE
    SET account_id     = EXCLUDED.account_id,
        forge_base_url = EXCLUDED.forge_base_url,
-       oauth_base_url = EXCLUDED.oauth_base_url
+       oauth_base_url = EXCLUDED.oauth_base_url,
+       project_path   = EXCLUDED.project_path
 RETURNING *;
 
 -- name: GetInstallationByRef :one
@@ -109,10 +115,12 @@ SELECT * FROM installations WHERE provider = $1 AND installation_ref = $2;
 -- #2923): every registered installation JOINed with its owning account's
 -- account_key, so the operator's real question — which project is registered
 -- under which namespace — is answered in one row. EXPLICIT column list (not
--- i.*) so the joined account_key is carried and the scan order is pinned. Supports
--- the auth-change checklist's impact-inventory habit: list what exists before
--- tightening anything.
-SELECT i.id, i.account_id, i.provider, i.installation_ref, i.forge_base_url, i.oauth_base_url, i.created_at, i.updated_at, a.account_key
+-- i.*) so the joined account_key is carried and the scan order is pinned.
+-- project_path (0078, E45.26 / #2877) is carried so the CLI can mark a gitlab
+-- row whose exact-path binding is UNBOUND — the mechanism behind the documented
+-- upgrade / rollback remedy. Supports the auth-change checklist's
+-- impact-inventory habit: list what exists before tightening anything.
+SELECT i.id, i.account_id, i.provider, i.installation_ref, i.forge_base_url, i.oauth_base_url, i.project_path, i.created_at, i.updated_at, a.account_key
   FROM installations i
   JOIN accounts a ON a.id = i.account_id
  ORDER BY i.provider ASC, i.installation_ref ASC;

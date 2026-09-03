@@ -83,7 +83,7 @@ func (q *Queries) GetAccountMemberRole(ctx context.Context, arg GetAccountMember
 }
 
 const getInstallationByRef = `-- name: GetInstallationByRef :one
-SELECT id, account_id, provider, installation_ref, created_at, updated_at, forge_base_url, oauth_base_url FROM installations WHERE provider = $1 AND installation_ref = $2
+SELECT id, account_id, provider, installation_ref, created_at, updated_at, forge_base_url, oauth_base_url, project_path FROM installations WHERE provider = $1 AND installation_ref = $2
 `
 
 type GetInstallationByRefParams struct {
@@ -103,6 +103,7 @@ func (q *Queries) GetInstallationByRef(ctx context.Context, arg GetInstallationB
 		&i.UpdatedAt,
 		&i.ForgeBaseUrl,
 		&i.OauthBaseUrl,
+		&i.ProjectPath,
 	)
 	return i, err
 }
@@ -146,7 +147,7 @@ func (q *Queries) ListAccounts(ctx context.Context) ([]Account, error) {
 }
 
 const listInstallations = `-- name: ListInstallations :many
-SELECT i.id, i.account_id, i.provider, i.installation_ref, i.forge_base_url, i.oauth_base_url, i.created_at, i.updated_at, a.account_key
+SELECT i.id, i.account_id, i.provider, i.installation_ref, i.forge_base_url, i.oauth_base_url, i.project_path, i.created_at, i.updated_at, a.account_key
   FROM installations i
   JOIN accounts a ON a.id = i.account_id
  ORDER BY i.provider ASC, i.installation_ref ASC
@@ -159,6 +160,7 @@ type ListInstallationsRow struct {
 	InstallationRef string             `json:"installation_ref"`
 	ForgeBaseUrl    *string            `json:"forge_base_url"`
 	OauthBaseUrl    *string            `json:"oauth_base_url"`
+	ProjectPath     *string            `json:"project_path"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 	AccountKey      string             `json:"account_key"`
@@ -185,6 +187,7 @@ func (q *Queries) ListInstallations(ctx context.Context) ([]ListInstallationsRow
 			&i.InstallationRef,
 			&i.ForgeBaseUrl,
 			&i.OauthBaseUrl,
+			&i.ProjectPath,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.AccountKey,
@@ -718,13 +721,14 @@ func (q *Queries) UpsertInvitedAccountMember(ctx context.Context, arg UpsertInvi
 }
 
 const upsertInstallation = `-- name: UpsertInstallation :one
-INSERT INTO installations (id, account_id, provider, installation_ref, forge_base_url, oauth_base_url)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO installations (id, account_id, provider, installation_ref, forge_base_url, oauth_base_url, project_path)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (provider, installation_ref) DO UPDATE
    SET account_id     = EXCLUDED.account_id,
        forge_base_url = EXCLUDED.forge_base_url,
-       oauth_base_url = EXCLUDED.oauth_base_url
-RETURNING id, account_id, provider, installation_ref, created_at, updated_at, forge_base_url, oauth_base_url
+       oauth_base_url = EXCLUDED.oauth_base_url,
+       project_path   = EXCLUDED.project_path
+RETURNING id, account_id, provider, installation_ref, created_at, updated_at, forge_base_url, oauth_base_url, project_path
 `
 
 type UpsertInstallationParams struct {
@@ -734,6 +738,7 @@ type UpsertInstallationParams struct {
 	InstallationRef string    `json:"installation_ref"`
 	ForgeBaseUrl    *string   `json:"forge_base_url"`
 	OauthBaseUrl    *string   `json:"oauth_base_url"`
+	ProjectPath     *string   `json:"project_path"`
 }
 
 // Idempotent create-or-update keyed on (provider, installation_ref). Carries
@@ -746,6 +751,7 @@ func (q *Queries) UpsertInstallation(ctx context.Context, arg UpsertInstallation
 		arg.InstallationRef,
 		arg.ForgeBaseUrl,
 		arg.OauthBaseUrl,
+		arg.ProjectPath,
 	)
 	var i Installation
 	err := row.Scan(
@@ -757,6 +763,7 @@ func (q *Queries) UpsertInstallation(ctx context.Context, arg UpsertInstallation
 		&i.UpdatedAt,
 		&i.ForgeBaseUrl,
 		&i.OauthBaseUrl,
+		&i.ProjectPath,
 	)
 	return i, err
 }

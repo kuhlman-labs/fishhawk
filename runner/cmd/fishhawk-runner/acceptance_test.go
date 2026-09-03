@@ -122,6 +122,65 @@ func TestCaptureAcceptanceVerdict_ReadErrorNotMissing(t *testing.T) {
 	}
 }
 
+// TestCaptureAcceptanceVerdict_OversizeKeyed (E64.12 / #3106): a valid-but-
+// oversize KEYED verdict returns a wrapped non-nil error that is NOT
+// errAcceptanceVerdictMissing (the verdict is present-but-oversize, not
+// missing), emits the acceptance_verdict_oversize warn, and — the documented
+// ownership DEVIATION — the file SURVIVES on disk (removal is owned by the
+// next stage's pre-invoke sweepStaleAcceptanceVerdict, not by read-time). With
+// the ceiling deleted the padded-but-valid verdict is returned instead.
+func TestCaptureAcceptanceVerdict_OversizeKeyed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "verdict.json")
+	mustWrite(t, path, `{"verdict":"passed","notes":"`+oversizePad()+`"}`)
+
+	var warned []string
+	_, err := captureAcceptanceVerdict(agent.Result{}, path, absentPath(t, "legacy.json"),
+		func(event, _ string) { warned = append(warned, event) })
+	if err == nil {
+		t.Fatal("expected a non-nil error for an oversize keyed verdict")
+	}
+	if errors.Is(err, errAcceptanceVerdictMissing) {
+		t.Errorf("oversize verdict must NOT be errAcceptanceVerdictMissing, got %v", err)
+	}
+	if !errors.Is(err, errSidecarTooLarge) {
+		t.Errorf("err = %v, want a wrapped errSidecarTooLarge", err)
+	}
+	if !slices.Contains(warned, "acceptance_verdict_oversize") {
+		t.Errorf("expected acceptance_verdict_oversize warn, got %v", warned)
+	}
+	// Ownership deviation: the file is NOT removed at read time.
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Errorf("oversize keyed verdict must SURVIVE on disk (sweep owns removal), stat err = %v", statErr)
+	}
+}
+
+// TestCaptureAcceptanceVerdict_OversizeLegacy (E64.12 / #3106): with the keyed
+// path ABSENT, a valid-but-oversize LEGACY verdict returns the same non-missing
+// wrapped error, emits acceptance_verdict_oversize, and SURVIVES on disk.
+func TestCaptureAcceptanceVerdict_OversizeLegacy(t *testing.T) {
+	legacy := filepath.Join(t.TempDir(), "legacy.json")
+	mustWrite(t, legacy, `{"verdict":"passed","notes":"`+oversizePad()+`"}`)
+
+	var warned []string
+	_, err := captureAcceptanceVerdict(agent.Result{}, absentPath(t, "keyed.json"), legacy,
+		func(event, _ string) { warned = append(warned, event) })
+	if err == nil {
+		t.Fatal("expected a non-nil error for an oversize legacy verdict")
+	}
+	if errors.Is(err, errAcceptanceVerdictMissing) {
+		t.Errorf("oversize legacy verdict must NOT be errAcceptanceVerdictMissing, got %v", err)
+	}
+	if !errors.Is(err, errSidecarTooLarge) {
+		t.Errorf("err = %v, want a wrapped errSidecarTooLarge", err)
+	}
+	if !slices.Contains(warned, "acceptance_verdict_oversize") {
+		t.Errorf("expected acceptance_verdict_oversize warn, got %v", warned)
+	}
+	if _, statErr := os.Stat(legacy); statErr != nil {
+		t.Errorf("oversize legacy verdict must SURVIVE on disk (sweep owns removal), stat err = %v", statErr)
+	}
+}
+
 // --- validateAcceptanceVerdict -------------------------------------------
 
 func TestValidateAcceptanceVerdict_Table(t *testing.T) {

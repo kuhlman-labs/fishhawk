@@ -4517,6 +4517,59 @@ func TestMatchGitLabEvent_PipelineClassifiedBuildSkipped(t *testing.T) {
 	}
 }
 
+// TestMatchGitLabCIFailure_CarriesPipelineSource pins the SOURCE discriminator
+// at the matcher seam (E45.30 / #2881). object_attributes.source is the
+// documented, primary signal that distinguishes a merge-request pipeline from
+// a first-stage default-ref pipeline, and the classification in
+// gitlab_ciretry.go can only read it if the matcher carries it onto
+// PipelineRef — so the carry gets its own assertion here, independent of the
+// end-to-end reason tests.
+//
+// The absent-source row is the widening's compatibility control: a payload
+// omitting the field must still MATCH on ref+sha exactly as it does today, and
+// leave Source empty rather than inventing a value.
+func TestMatchGitLabCIFailure_CarriesPipelineSource(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantSource string
+	}{
+		{
+			"merge_request_event",
+			`{"object_attributes":{"id":9001,"ref":"master","sha":"deadbeef","status":"failed","source":"merge_request_event"},"merge_request":{"iid":7}}`,
+			"merge_request_event",
+		},
+		{
+			"push",
+			`{"object_attributes":{"id":9001,"ref":"fishhawk/run-abcdef12","sha":"deadbeef","status":"failed","source":"push"}}`,
+			"push",
+		},
+		{
+			"absent_source",
+			`{"object_attributes":{"id":9001,"ref":"fishhawk/run-abcdef12","sha":"deadbeef","status":"failed"}}`,
+			"",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := MatchGitLabEvent(gitlabEvent("pipeline", "root", tc.body))
+			if m.Skip || m.Action != MatchActionCIFailureRetry {
+				t.Fatalf("match = %+v, want MatchActionCIFailureRetry", m)
+			}
+			if m.PipelineRef == nil {
+				t.Fatal("PipelineRef = nil")
+			}
+			if got := m.PipelineRef.Source; got != tc.wantSource {
+				t.Errorf("PipelineRef.Source = %q, want %q", got, tc.wantSource)
+			}
+			// The correlation inputs are unaffected by the widening.
+			if m.PipelineRef.SHA != "deadbeef" || m.PipelineRef.PipelineID != 9001 {
+				t.Errorf("PipelineRef = %+v, want the ref/sha/id correlation inputs intact", m.PipelineRef)
+			}
+		})
+	}
+}
+
 func TestMatchGitLabEvent_UnknownKindSkips(t *testing.T) {
 	m := MatchGitLabEvent(gitlabEvent("wiki_page", "root", `{}`))
 	if !m.Skip || !strings.Contains(m.Reason, "unrecognized gitlab object_kind") {

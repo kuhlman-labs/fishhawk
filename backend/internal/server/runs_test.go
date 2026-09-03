@@ -1404,3 +1404,175 @@ func TestCreateRun_W3_LegacyIssueContext_LoadsAsNilLabels(t *testing.T) {
 		}
 	}
 }
+
+// decodeCompletionBlocked drives the real GET /v0/runs/{run_id} handler and
+// returns the decoded completion_blocked block (nil when the key is absent) plus
+// the raw body, so a test can assert on the presence/ABSENCE of the key itself
+// rather than only on a zero-valued struct.
+func decodeCompletionBlocked(t *testing.T, s *Server, runID uuid.UUID) (*runCompletionBlockedPayload, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+runID.String(), nil)
+	req.SetPathValue("run_id", runID.String())
+	w := httptest.NewRecorder()
+	s.handleGetRun(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET run status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var envelope struct {
+		CompletionBlocked *runCompletionBlockedPayload `json:"completion_blocked"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode run response: %v (%s)", err, w.Body.String())
+	}
+	return envelope.CompletionBlocked, w.Body.String()
+}
+
+// TestCompletionBlocked_RecoveryDiscrimination is the per-classification sweep
+// the plan requires: ONE case per recovery verdict, not a happy path plus a
+// sample.
+//
+// The discrimination is the whole point of the field. Naming a verb that would
+// refuse is precisely the defect #3083 reports against merge_run, so a blocker
+// the sweep cannot move must read `none` AND name its state, while only a
+// pair-table-admissible park on an OBSERVABLY MERGED run reads `reconcile-merge`.
+func TestCompletionBlocked_RecoveryDiscrimination(t *testing.T) {
+	cases := []struct {
+		name         string
+		blocker      run.StageType
+		state        run.StageState
+		observeMerge bool
+		wantRecovery string
+	}{
+		{
+			name:    "merge-supersedable acceptance park on a merged run names the verb",
+			blocker: run.StageTypeAcceptance, state: run.StageStateAwaitingHostDispatch,
+			observeMerge: true, wantRecovery: completionBlockedRecoveryReconcileMerge,
+		},
+		{
+			name:    "merge-supersedable review gate on a merged run names the verb",
+			blocker: run.StageTypeReview, state: run.StageStateAwaitingApproval,
+			observeMerge: true, wantRecovery: completionBlockedRecoveryReconcileMerge,
+		},
+		{
+			// The SAME admissible pair with no merge evidence: the verb would
+			// refuse its own precondition, so the surface must not name it.
+			name:    "merge-supersedable park on an UNMERGED run names no verb",
+			blocker: run.StageTypeAcceptance, state: run.StageStateAwaitingHostDispatch,
+			observeMerge: false, wantRecovery: completionBlockedRecoveryNone,
+		},
+		{
+			name: "running implement", blocker: run.StageTypeImplement, state: run.StageStateRunning,
+			observeMerge: true, wantRecovery: completionBlockedRecoveryNone,
+		},
+		{
+			name: "dispatched implement", blocker: run.StageTypeImplement, state: run.StageStateDispatched,
+			observeMerge: true, wantRecovery: completionBlockedRecoveryNone,
+		},
+		{
+			name: "awaiting_children implement", blocker: run.StageTypeImplement, state: run.StageStateAwaitingChildren,
+			observeMerge: true, wantRecovery: completionBlockedRecoveryNone,
+		},
+		{
+			name: "awaiting_deploy_approval implement", blocker: run.StageTypeImplement, state: run.StageStateAwaitingDeployApproval,
+			observeMerge: true, wantRecovery: completionBlockedRecoveryNone,
+		},
+		{
+			name: "awaiting_scope_decision implement", blocker: run.StageTypeImplement, state: run.StageStateAwaitingScopeDecision,
+			observeMerge: true, wantRecovery: completionBlockedRecoveryNone,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSupersedeFixture(t, map[run.StageType]run.StageState{tc.blocker: tc.state})
+			if tc.observeMerge {
+				f.observeMerge(t)
+			}
+			got, body := decodeCompletionBlocked(t, f.s, f.runID)
+			if got == nil {
+				t.Fatalf("completion_blocked omitted on a blocked run:\n%s", body)
+			}
+			if got.StageID != f.stages[tc.blocker].ID.String() {
+				t.Errorf("stage_id = %q, want the %s stage %s", got.StageID, tc.blocker, f.stages[tc.blocker].ID)
+			}
+			if got.StageType != string(tc.blocker) {
+				t.Errorf("stage_type = %q, want %q", got.StageType, tc.blocker)
+			}
+			if got.StageState != string(tc.state) {
+				t.Errorf("stage_state = %q, want %q", got.StageState, tc.state)
+			}
+			if got.Recovery != tc.wantRecovery {
+				t.Errorf("recovery = %q, want %q", got.Recovery, tc.wantRecovery)
+			}
+			// The reason must NAME the state either way — an operator reading
+			// `none` needs to know what is holding the run, not just that no
+			// verb applies.
+			if !strings.Contains(got.Reason, string(tc.state)) {
+				t.Errorf("reason does not name the blocking state %q: %s", tc.state, got.Reason)
+			}
+			if tc.wantRecovery == completionBlockedRecoveryReconcileMerge &&
+				!strings.Contains(got.Reason, "reconcile-merge") {
+				t.Errorf("reason does not name the recovery endpoint: %s", got.Reason)
+			}
+		})
+	}
+}
+
+// TestCompletionBlocked_OmittedWhenUnblocked is the control: a run that is not
+// blocked must keep a BYTE-IDENTICAL response, so the field is asserted ABSENT
+// from the raw body rather than merely nil-decoded.
+func TestCompletionBlocked_OmittedWhenUnblocked(t *testing.T) {
+	t.Run("running run whose stages are all terminal", func(t *testing.T) {
+		f := newSupersedeFixture(t, map[run.StageType]run.StageState{})
+		got, body := decodeCompletionBlocked(t, f.s, f.runID)
+		if got != nil {
+			t.Errorf("completion_blocked = %+v, want omitted on an unblocked run", got)
+		}
+		if strings.Contains(body, "completion_blocked") {
+			t.Errorf("response carries the completion_blocked key on an unblocked run:\n%s", body)
+		}
+	})
+
+	t.Run("terminal run", func(t *testing.T) {
+		// A cancelled run holding a non-terminal stage: the run is NOT running,
+		// so there is no completion to be blocked and the field stays absent.
+		f := newSupersedeFixture(t, map[run.StageType]run.StageState{
+			run.StageTypeAcceptance: run.StageStateAwaitingHostDispatch,
+		})
+		if _, err := f.runRepo.TransitionRun(context.Background(), f.runID, run.StateCancelled); err != nil {
+			t.Fatalf("run -> cancelled: %v", err)
+		}
+		got, body := decodeCompletionBlocked(t, f.s, f.runID)
+		if got != nil {
+			t.Errorf("completion_blocked = %+v, want omitted on a terminal run", got)
+		}
+		if strings.Contains(body, "completion_blocked") {
+			t.Errorf("response carries the completion_blocked key on a terminal run:\n%s", body)
+		}
+	})
+}
+
+// TestCompletionBlocked_NamesTheLowestSequenceBlocker pins the blocker choice:
+// the run's own stage order, so the answer is stable across calls and names the
+// stage an operator would reach for first rather than whichever row the
+// repository happened to return.
+func TestCompletionBlocked_NamesTheLowestSequenceBlocker(t *testing.T) {
+	f := newSupersedeFixture(t, map[run.StageType]run.StageState{
+		run.StageTypeImplement:  run.StageStateRunning,              // sequence 1
+		run.StageTypeAcceptance: run.StageStateAwaitingHostDispatch, // sequence 2
+	})
+	f.observeMerge(t)
+
+	got, body := decodeCompletionBlocked(t, f.s, f.runID)
+	if got == nil {
+		t.Fatalf("completion_blocked omitted:\n%s", body)
+	}
+	if got.StageType != string(run.StageTypeImplement) {
+		t.Errorf("stage_type = %q, want implement (the lowest-sequence non-terminal stage)", got.StageType)
+	}
+	// And because the lowest-sequence blocker is NOT supersedable, no verb is
+	// named even though a later stage would be movable — an operator must not
+	// be told a reconcile settles a run it cannot settle.
+	if got.Recovery != completionBlockedRecoveryNone {
+		t.Errorf("recovery = %q, want none: the blocking stage is a running implement", got.Recovery)
+	}
+}

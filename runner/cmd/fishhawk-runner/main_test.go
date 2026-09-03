@@ -3564,6 +3564,13 @@ type fakePusher struct {
 	// calls counts CommitAndPush invocations so tests can assert the retry
 	// is bounded.
 	calls int
+
+	// onCommit, when set, runs at the top of CommitAndPush with the args. The
+	// #3022 incident-reproduction test (M8) uses it to actually REMOVE the
+	// verified work from args.RepoDir (the relocated worktree) — modelling a
+	// pass that committed, reset and reported no changes — and to positively
+	// assert the resulting clean state before the no-changes path evaluates.
+	onCommit func(args gitops.CommitAndPushArgs)
 }
 
 func (f *fakePusher) CommitAndPush(_ context.Context, args gitops.CommitAndPushArgs) (*gitops.CommitAndPushResult, error) {
@@ -3571,6 +3578,9 @@ func (f *fakePusher) CommitAndPush(_ context.Context, args gitops.CommitAndPushA
 	f.gotArgs = &a
 	idx := f.calls
 	f.calls++
+	if f.onCommit != nil {
+		f.onCommit(args)
+	}
 	if len(f.errSeq) > 0 {
 		if idx >= len(f.errSeq) {
 			idx = len(f.errSeq) - 1
@@ -3703,17 +3713,15 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	}
 	// Stub the #2884 fix-up landing seams to a clean-and-landed default so a
 	// fake-pusher run() test never probes the runner's own source repo (".") or
-	// a live remote: no stash, an empty reflog, no dangling commits, and a
-	// remote tip that MATCHES the pushed head (so verifyFixupPushLanded lands).
-	// fixupLocalHead returns "" so the advanced-HEAD probe (guarded on head!="")
-	// never false-fires against the base tip captured from the real ".". Tests
-	// exercising a stranding or a not-landed push swap in recording fakes AFTER
-	// this via withFakeFixup* helpers.
-	origFixStash, origFixHead, origFixStranded := fixupStashList, fixupLocalHead, fixupStrandedReflog
-	origFixReflog, origFixRemoteTip := fixupReflogCommits, fixupRemoteBranchTip
+	// a live remote: no stash and a remote tip that MATCHES the pushed head (so
+	// verifyFixupPushLanded lands). fixupLocalHead returns "" so the
+	// advanced-HEAD probe (guarded on head!="") never false-fires against the
+	// base tip captured from the real ".". Tests exercising a stranding or a
+	// not-landed push swap in recording fakes AFTER this via withFakeFixup*
+	// helpers.
+	origFixStash, origFixHead := fixupStashList, fixupLocalHead
+	origFixRemoteTip := fixupRemoteBranchTip
 	fixupStashList = func(_ context.Context, _ string) ([]stashEntry, error) { return nil, nil }
-	fixupReflogCommits = func(_ context.Context, _ string) ([]stashEntry, error) { return nil, nil }
-	fixupStrandedReflog = func(_ context.Context, _, _ string, _ []stashEntry) ([]stashEntry, error) { return nil, nil }
 	fixupLocalHead = func(_ context.Context, _ string) (string, error) { return "", nil }
 	fixupRemoteBranchTip = func(_ context.Context, _, _, _, _ string) (string, error) {
 		if fp.result != nil && fp.result.HeadSHA != "" {
@@ -3724,8 +3732,6 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	t.Cleanup(func() {
 		fixupStashList = origFixStash
 		fixupLocalHead = origFixHead
-		fixupStrandedReflog = origFixStranded
-		fixupReflogCommits = origFixReflog
 		fixupRemoteBranchTip = origFixRemoteTip
 	})
 	t.Cleanup(func() {
@@ -4707,7 +4713,7 @@ func TestLoadAgentAuthoredPR_DeleteAfterRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stderr strings.Builder
-	if _, _, kind := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &stderr); kind != prSourceAgent {
+	if _, _, kind, _ := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &stderr); kind != prSourceAgent {
 		t.Fatalf("kind = %v, want prSourceAgent", kind)
 	}
 	if _, statErr := os.Stat(keyed); !os.IsNotExist(statErr) {
@@ -5305,16 +5311,6 @@ func withFakeFixupLocalHead(t *testing.T, head string, err error) {
 	orig := fixupLocalHead
 	fixupLocalHead = func(_ context.Context, _ string) (string, error) { return head, err }
 	t.Cleanup(func() { fixupLocalHead = orig })
-}
-
-// withFakeFixupStrandedReflog swaps the dangling-commit provenance seam.
-func withFakeFixupStrandedReflog(t *testing.T, dangling []stashEntry, err error) {
-	t.Helper()
-	orig := fixupStrandedReflog
-	fixupStrandedReflog = func(_ context.Context, _, _ string, _ []stashEntry) ([]stashEntry, error) {
-		return dangling, err
-	}
-	t.Cleanup(func() { fixupStrandedReflog = orig })
 }
 
 // withFakeFixupRemoteBranchTip swaps the fix-up remote-tip probe seam so a
@@ -8490,37 +8486,6 @@ func TestRun_Fixup_NoChanges_UnpushedLocalHead_FailsCategoryB(t *testing.T) {
 	}
 }
 
-// M2b (#2884, condition 1 — the incident shape BY CONSTRUCTION): a no-changes
-// fix-up that COMMITTED then reset back to the base tip with NO stash, leaving a
-// DANGLING commit. The stash probe and the HEAD probe both read clean; only the
-// reflog provenance probe surfaces it. This goes RED against the plan's original
-// two-probe design.
-func TestRun_Fixup_NoChanges_DanglingCommit_FailsCategoryB(t *testing.T) {
-	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
-	fu := newFakeUploader(t)
-	fu.promptResp = fixupLandingPrompt()
-	withFakeUploader(t, fu)
-	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
-	withFakeGitOps(t, fp, &fakePROpener{})
-	// Clean stash and clean HEAD; only the provenance walk finds the orphan.
-	withFakeFixupStrandedReflog(t, []stashEntry{{SHA: "0421daebb24df3d9338d5b28e52d164c7bf49bc1", Subject: "fishhawk verify wip"}}, nil)
-
-	var stderr strings.Builder
-	if got := runFixupLanding(t, &stderr); got != exitFailure {
-		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
-	}
-	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
-		t.Fatalf("report = %+v, want {failed, B}", fu.gotPRArgs)
-	}
-	if strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes"`) {
-		t.Error("must NOT report fixup_no_changes when a dangling commit is stranded")
-	}
-	if !strings.Contains(stderr.String(), "0421daeb") {
-		t.Errorf("stranded log must name the dangling sha (the #2884 orphan):\n%s", stderr.String())
-	}
-}
-
 // M4 (#2884, condition 4): the stash pre-snapshot itself errors → fail CLOSED
 // category-C, never a fall-through to a success report.
 func TestRun_Fixup_NoChanges_StashProbeError_FailsClosedCategoryC(t *testing.T) {
@@ -8620,6 +8585,218 @@ func TestRun_Fixup_RemoteTipMatches_ReportsFixupPushed(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"event":"implement_fixup_pushed"`) {
 		t.Errorf("missing implement_fixup_pushed log:\n%s", stderr.String())
+	}
+}
+
+// fixupVerifyLandingPrompt is the shared fix-up prompt for the #3022 probe-3
+// tests: a real fix-up (Fixup + FixupBranch) with a verify command and ONE
+// in-scope file, so the REAL committed-tree verify gate produces verifiedTreeSHA
+// from production code rather than an injected value.
+func fixupVerifyLandingPrompt() *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		Fixup:               true,
+		FixupBranch:         "fishhawk/run-11111111/stage-22222222",
+		VerifyCommand:       "true",
+		VerifyMaxIterations: 0,
+		ScopeFiles:          []upload.ScopeFile{{Path: "mod/reg.go", Operation: "create"}},
+	}
+}
+
+// M8 (#3022, blocking condition 2 — the incident shape end to end): a fix-up
+// that COMMITS its work, whose committed-tree verify gate certifies a non-base
+// tree (verifiedTreeSHA), then has that work REMOVED so it is absent from BOTH
+// the working tree AND the branch — a clean working tree, HEAD at the base tip,
+// NO stash — and reports NO changes. The stage MUST fail category-B with the
+// verified-tree-stranded reason. This is the property no earlier probe closes
+// and the false-assurance class this issue exists to prevent.
+//
+// The verify gate is REAL (--verify-cmd true runs runVerifyGateCommitted, which
+// stages the in-scope edit, throwaway-commits it, certifies its tree, and
+// soft-resets), so verifiedTreeSHA is produced by production code. The fake
+// pusher's onCommit hook then models the incident's residue: it hard-resets +
+// cleans the relocated worktree back to its base tip and positively asserts the
+// clean state before returning NoChanges.
+func TestRun_Fixup_NoChanges_VerifiedWorkVanished_FailsCategoryB(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	regPath := filepath.Join(repo, "mod", "reg.go")
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo, // reflect the agent edit into the isolated worktree (#1137)
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke: func(idx int, _ agent.Invocation) {
+			// The agent's in-scope work: a new scope file, so the committed
+			// scope-only tree the gate certifies differs from the base tree.
+			mustWrite(t, regPath, "package mod\n\n// verified fix work\n")
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupVerifyLandingPrompt()
+	withFakeUploader(t, fu)
+
+	// Capture the fix-up base tip INDEPENDENTLY, before run() (and thus before the
+	// verify gate's throwaway commit + unwind), so the onCommit assertion below has
+	// a ground-truth base tip that a regressed unwind cannot move. Reading it from
+	// the post-gate worktree HEAD (the pre-#3022-review headBefore) would pass even
+	// if gitResetSoftHEAD1 left HEAD advanced, because headBefore would then BE the
+	// advanced value. The relocated worktree is a checkout of repo at this tip.
+	baseTip := gitHead(t, repo)
+
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	fp.onCommit = func(args gitops.CommitAndPushArgs) {
+		// Remove the verified work so it is absent from the working tree AND the
+		// branch, modelling the incident: commit → reset → no stash → no changes.
+		rd := args.RepoDir
+		fixuplandGit(t, rd, "reset", "--hard", "HEAD")
+		fixuplandGit(t, rd, "clean", "-fdx")
+		// Positively assert the incident shape BEFORE the no-changes path runs:
+		// HEAD at the fix-up base tip (asserted against the independently-captured
+		// base SHA, not the post-gate HEAD, so a regressed verify-gate unwind that
+		// left HEAD advanced would FAIL here), clean working tree, no stash entry.
+		if head := fixuplandGit(t, rd, "rev-parse", "HEAD"); head != baseTip {
+			t.Errorf("HEAD must be at the fix-up base tip, got %q want %q", head, baseTip)
+		}
+		if s := fixuplandGit(t, rd, "status", "--porcelain"); s != "" {
+			t.Errorf("working tree must be clean before the no-changes path, got %q", s)
+		}
+		if st := fixuplandGit(t, rd, "stash", "list"); st != "" {
+			t.Errorf("no stash entry must exist, got %q", st)
+		}
+	}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "B" {
+		t.Fatalf("report = %+v, want {failed, B}", fu.gotPRArgs)
+	}
+	if strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes"`) {
+		t.Error("must NOT report fixup_no_changes when the verified work vanished")
+	}
+	if !strings.Contains(stderr.String(), `"event":"fixup_work_stranded"`) ||
+		!strings.Contains(stderr.String(), "verified work did not reach the branch") ||
+		!strings.Contains(stderr.String(), `"verified_tree_sha"`) {
+		t.Errorf("fixup_work_stranded log must name the certified tree and the probe-3 reason:\n%s", stderr.String())
+	}
+}
+
+// M9 (#3022, blocking condition 3 — no false positive on healthy verify
+// residue): the SAME real verify gate really does create and unwind a
+// `fishhawk verify wip` commit, but the pass then pushes normally. A healthy
+// pass never reaches the no-changes branch (its edits stay in the working tree,
+// so CommitAndPush commits and pushes them), so probe 3 is never evaluated: the
+// stage reports fixup_pushed and exits OK.
+func TestRun_Fixup_HealthyVerifyResidue_NoFalsePositive(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	regPath := filepath.Join(repo, "mod", "reg.go")
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke: func(idx int, _ agent.Invocation) {
+			mustWrite(t, regPath, "package mod\n\n// verified fix work\n")
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupVerifyLandingPrompt()
+	withFakeUploader(t, fu)
+
+	// Default fakePusher: a real push (NoChanges false, HeadSHA "head-sha-abc");
+	// withFakeGitOps's remote-tip stub echoes that head, so the push lands.
+	fp := &fakePusher{}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "fixup_pushed" {
+		t.Fatalf("report = %+v, want fixup_pushed", fu.gotPRArgs)
+	}
+	if strings.Contains(stderr.String(), `"event":"fixup_work_stranded"`) {
+		t.Errorf("probe 3 must NOT fire on a healthy pass with normal verify residue:\n%s", stderr.String())
+	}
+	// Load-bearing anti-vacuity assertion (#3022 review, test_vacuity): prove the
+	// REAL committed-tree verify gate actually created, certified, AND unwound its
+	// throwaway `fishhawk verify wip` commit — otherwise this "no false positive"
+	// test would pass even if verification were skipped entirely (the fake pusher
+	// takes the push branch, where probe 3 is never evaluated). The gate records a
+	// NON-EMPTY verifiedTreeSHA only when commitVerifyWIP committed a non-empty
+	// staged tree AND gitResetSoftHEAD1 unwound it (a reset failure zeroes it, see
+	// runVerifyFixLoop). That witness is carried onto the implement_fixup_pushed
+	// event as verified_tree_sha, so a non-empty value here is proof the healthy
+	// verify residue was really produced and unwound before the push path ran.
+	var pushedLine string
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		if strings.Contains(line, `"event":"implement_fixup_pushed"`) {
+			pushedLine = line
+		}
+	}
+	if pushedLine == "" {
+		t.Fatalf("no implement_fixup_pushed event to prove the verify gate ran:\n%s", stderr.String())
+	}
+	var pushed struct {
+		VerifiedTreeSHA string `json:"verified_tree_sha"`
+	}
+	if err := json.Unmarshal([]byte(pushedLine), &pushed); err != nil {
+		t.Fatalf("parse implement_fixup_pushed line: %v\n%s", err, pushedLine)
+	}
+	if pushed.VerifiedTreeSHA == "" {
+		t.Fatalf("implement_fixup_pushed.verified_tree_sha is empty: the committed-tree verify gate did not create+certify+unwind a throwaway commit, so this test is vacuous:\n%s", pushedLine)
+	}
+}
+
+// M10 (#3022 — the abstain branch): a fix-up that produces NO agent work stages
+// nothing, so commitVerifyWIP makes no throwaway commit and verifiedTreeSHA is
+// EMPTY. Probe 4 abstains on the empty witness, the other probes read clean, and
+// the pass reports fixup_no_changes at exit OK.
+func TestRun_Fixup_NoChanges_NoAgentWork_StillReportsNoChanges(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		// onInvoke writes nothing: no in-scope edit, so nothing is staged.
+	}
+	withFakeInvoker(t, invoker)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupVerifyLandingPrompt()
+	withFakeUploader(t, fu)
+
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "fixup_no_changes" {
+		t.Fatalf("report = %+v, want fixup_no_changes", fu.gotPRArgs)
+	}
+	if strings.Contains(stderr.String(), `"event":"fixup_work_stranded"`) {
+		t.Errorf("probe 3 must abstain on an empty witness (no agent work):\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_fixup_no_changes"`) {
+		t.Errorf("missing implement_fixup_no_changes log:\n%s", stderr.String())
 	}
 }
 
@@ -11091,6 +11268,21 @@ FAIL
 FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/audit	111.660s
 ?   	github.com/kuhlman-labs/fishhawk/backend/internal/audit/db	[no test files]`
 
+// flakeOutput3122 is the #3122 issue body's Observed failure block: two
+// TestMigrateDown_* failures in backend/internal/postgres (the raw-container
+// pgtest EXEMPTION, run 9e9996c4, 2026-09-01) with the testcontainers Docker-
+// socket deadline signature, embedded in surrounding ok-package lines so the
+// fixture is shaped like real full-suite output. The `.../json` path is the
+// issue body's own elision — the marker set the matcher keys on
+// (`%2Fvar%2Frun%2Fdocker.sock`, `mapped port`, `wait until ready`,
+// `context deadline exceeded`) is present verbatim regardless.
+const flakeOutput3122 = `ok  	github.com/kuhlman-labs/fishhawk/backend/internal/server	4.021s
+--- FAIL: TestMigrateDown_StagesDispatchedAtReversal (63.18s)
+    postgres_test.go:3823: start postgres: run postgres: generic container: start container: started hook: wait until ready: mapped port: check target: retries: 9, port: "invalid port", last err: get state: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.54/containers/.../json": context deadline exceeded
+--- FAIL: TestMigrateDown_NormalizesPausedRows (63.19s)
+    postgres_test.go:3901: start postgres: run postgres: generic container: start container: started hook: wait until ready: mapped port: check target: retries: 9, port: "invalid port", last err: get state: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.54/containers/.../json": context deadline exceeded
+FAIL	github.com/kuhlman-labs/fishhawk/backend/internal/postgres	131.402s`
+
 func TestIsTestcontainersStartFlake(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -11099,6 +11291,16 @@ func TestIsTestcontainersStartFlake(t *testing.T) {
 	}{
 		{"verbatim #972 approval-package failure", flakeOutputApproval, true},
 		{"verbatim #972 audit-package failure", flakeOutputAudit, true},
+		// #3122 asserted this testcontainers deadline signature "is not an entry,
+		// so the absorb cannot fire" — that assertion is FALSE: it matches
+		// isTestcontainersStartFlake today (the `mapped port` / `wait until ready`
+		// / `%2Fvar%2Frun%2Fdocker.sock` + `context deadline exceeded` markers),
+		// and the issue's own Observed section records verify_infra_flake_retry
+		// firing on iteration 1. The real limitation is the ONE-SHOT-per-stage
+		// absorb, a different defect. This verbatim-#3122 row pins the claim: a
+		// future narrowing of the matcher (dropping `mapped port` / `wait until
+		// ready`) reddens this test rather than silently reopening #3122's concern.
+		{"verbatim #3122 postgres-exemption leak failure", flakeOutput3122, true},
 		// The #2718 classes are DISTINCT, not a loosening of this matcher: the
 		// deadline matcher must keep refusing both new signatures.
 		{"verbatim #2718 MinIO port-not-found failure", portFlakeOutput2718, false},
@@ -13095,6 +13297,87 @@ func TestVerifyCommittedTreeCompiles_GateSubprocessEnvStripped(t *testing.T) {
 	}
 }
 
+// TestVerifyCommittedTreeCompiles_GateNeutralizesGlobalGitConfig is the
+// end-to-end reproduction of #3102: with the operator's HOME/.gitconfig setting
+// commit.gpgsign=true and a NONEXISTENT gpg.ssh.program, a committed probe test
+// that itself creates a temp repo and `git commit`s into it (the
+// fixupland_test.go shape) would fail inside the gate's `go test` phase unless
+// the gate env pins GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM at /dev/null. The gate
+// must return nil; on failure the gate log names the signing error. Skips when
+// `go` or `git` is absent, matching the sibling gate tests.
+func TestVerifyCommittedTreeCompiles_GateNeutralizesGlobalGitConfig(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	// Capture the ambient Go caches BEFORE redirecting HOME so the gate's
+	// `go vet`/`go test` stay warm and hermetic (both keys are allow-listed, so
+	// they survive sanitization). A cold cache would only make this test slow,
+	// not incorrect.
+	goEnv := func(key string) string {
+		out, err := exec.Command("go", "env", key).Output()
+		if err != nil {
+			t.Fatalf("go env %s: %v", key, err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	gocache := goEnv("GOCACHE")
+	gomodcache := goEnv("GOMODCACHE")
+
+	// Hostile HOME: a global git config that signs every commit with a signing
+	// program that definitionally does not exist — the #3102 shape. If the gate
+	// child inherits this, the probe's `git commit` fails with a signing error.
+	home := t.TempDir()
+	signer := filepath.Join(home, "does-not-exist-signer")
+	mustWrite(t, filepath.Join(home, ".gitconfig"),
+		"[commit]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tprogram = "+signer+"\n")
+	t.Setenv("HOME", home)
+	t.Setenv("GOCACHE", gocache)
+	t.Setenv("GOMODCACHE", gomodcache)
+
+	// compileGateRepo sets repo-local commit.gpgsign=false, so the FIXTURE's own
+	// commits are unaffected by the hostile HOME.
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	mustWrite(t, filepath.Join(repo, "mod", "probe.go"),
+		"package mod\n\nfunc Noop() {}\n")
+	// The probe test creates its OWN temp repo and commits into it. That commit
+	// inherits the gate subprocess's env; it fails iff the gate leaked the
+	// operator's global commit.gpgsign — the exact #3102 failure shape.
+	mustWrite(t, filepath.Join(repo, "mod", "probe_test.go"),
+		"package mod\n\n"+
+			"import (\n\t\"os/exec\"\n\t\"testing\"\n)\n\n"+
+			"func TestGitCommitInGateChild(t *testing.T) {\n"+
+			"\trepo := t.TempDir()\n"+
+			"\trun := func(args ...string) {\n"+
+			"\t\tcmd := exec.Command(\"git\", args...)\n"+
+			"\t\tcmd.Dir = repo\n"+
+			"\t\tif out, err := cmd.CombinedOutput(); err != nil {\n"+
+			"\t\t\tt.Fatalf(\"git %v: %v\\n%s\", args, err, out)\n\t\t}\n\t}\n"+
+			"\trun(\"init\")\n"+
+			"\trun(\"-c\", \"user.name=probe\", \"-c\", \"user.email=probe@example.com\", \"commit\", \"--allow-empty\", \"-m\", \"probe\")\n"+
+			"}\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "git-config-leak probe")
+	head := gitHead(t, repo)
+
+	var log bytes.Buffer
+	// Non-empty drift so the gate runs past the no-drift fast path; scope names
+	// the touched package so the test phase actually runs probe_test.go.
+	err := verifyCommittedTreeCompiles(context.Background(), repo, head,
+		[]string{"README.md"}, []string{"mod/probe.go", "mod/probe_test.go"}, &log)
+	if err != nil {
+		t.Fatalf("gate must pass with global git config neutralized, got %v\nlog: %s", err, log.String())
+	}
+}
+
 // TestVerifyCommittedTreeTests_DriftExcludedFailureBlocks is the #800/#780
 // proof: a committed tree that COMPILES (go vet passes) but has a FAILING
 // test in a touched package because a helper file was excluded as scope
@@ -13922,9 +14205,13 @@ func TestOpenHeldCommitPR_ArtifactBodyMatchesWireGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Guarantee the fallback PR title/body (no agent-authored file leaks in
-	// from another run), so the produced bytes are deterministic.
-	_ = os.Remove(pullRequestDescriptionPath(verifiedTreeRunID, verifiedTreeStageID))
-	_ = os.Remove(legacyPullRequestDescriptionPath)
+	// from another run), so the produced bytes are deterministic. Isolation, NOT
+	// deletion: this used to os.Remove the production keyed AND shared legacy
+	// handoffs, which a concurrent real runner or test could be mid-use of. A
+	// per-test temp dir is absent by construction and touches nothing outside the
+	// test; substituteWireHandoffPath restores the production literal the fixture
+	// carries before the byte comparison.
+	keyed := withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
 	cfg := config{
 		runID:      verifiedTreeRunID,
 		stageID:    verifiedTreeStageID,
@@ -13941,7 +14228,7 @@ func TestOpenHeldCommitPR_ArtifactBodyMatchesWireGolden(t *testing.T) {
 	if fu.gotPRArgs == nil {
 		t.Fatal("ShipPullRequest not called")
 	}
-	produced := fu.gotPRArgs.Body
+	produced := substituteWireHandoffPath(t, fu.gotPRArgs.Body, keyed)
 	goldenPath := wireGoldenHeldCommitPath(t)
 
 	if os.Getenv("FISHHAWK_REGEN_WIRE_GOLDEN") == "1" {
@@ -24568,5 +24855,2211 @@ func TestLoadFixupSelfReport_WholeSidecarRulesStillDiscardCounterfactuals(t *tes
 				t.Errorf("expected %s, got %q", tc.event, logSink.String())
 			}
 		})
+	}
+}
+
+// --- #2929 initial-implement counterfactual sidecar -----------------------
+
+// cfReportCfg is the run/stage the #2929 counterfactual sidecar tests key on.
+// Distinct from fixupReportCfg's ids so a test that accidentally reached the
+// wrong sidecar would be visible.
+func cfReportCfg() config {
+	return config{runID: "run-eeee", stageID: "stage-ffff"}
+}
+
+// redirectCounterfactualDir points counterfactualReportDir at a fresh t.TempDir
+// for the duration of one test and returns cfg's keyed sidecar path.
+func redirectCounterfactualDir(t *testing.T, cfg config) string {
+	t.Helper()
+	dir := t.TempDir()
+	orig := counterfactualReportDir
+	counterfactualReportDir = dir
+	t.Cleanup(func() { counterfactualReportDir = orig })
+	return counterfactualReportPath(cfg.runID, cfg.stageID)
+}
+
+// writeCounterfactualSidecarFile redirects counterfactualReportDir to a temp dir
+// and writes raw JSON to cfg's keyed path. The JSON is written LITERALLY rather
+// than produced by the code under test, so a fail-closed assertion lands on the
+// behavioral check and never on fixture setup.
+func writeCounterfactualSidecarFile(t *testing.T, cfg config, raw string) string {
+	t.Helper()
+	path := redirectCounterfactualDir(t, cfg)
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestLoadCounterfactualReport_AbsentSidecar: no sidecar → nil, no log, and no
+// file conjured at the path. This is the common no-op every stage takes.
+func TestLoadCounterfactualReport_AbsentSidecar(t *testing.T) {
+	cfg := cfReportCfg()
+	path := redirectCounterfactualDir(t, cfg)
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 0 {
+		t.Errorf("absent sidecar must yield nil, got %+v", got)
+	}
+	if logSink.Len() != 0 {
+		t.Errorf("absent sidecar must not log, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("absent sidecar must stay absent, stat err = %v", err)
+	}
+}
+
+// TestLoadCounterfactualReport_MalformedJSON: malformed → nil +
+// counterfactual_report_invalid + the file REMOVED.
+//
+// The malformed fixture is paired with ITSELF (the same bytes, truncated at a
+// point that leaves an otherwise-valid document) rather than against a
+// differently-shaped clean document, so the RED lands on the guard and not on
+// an incidental difference between two fixtures.
+func TestLoadCounterfactualReport_MalformedJSON(t *testing.T) {
+	cfg := cfReportCfg()
+	const entry = `"counterfactuals":[{"control_path":"runner/cmd/fishhawk-runner/main.go",` +
+		`"observed":"red","restored":true,"record":"mutated and saw red"}]`
+	path := writeCounterfactualSidecarFile(t, cfg,
+		`{"run_id":"run-eeee","stage_id":"stage-ffff",`+entry) // deliberately unterminated
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 0 {
+		t.Errorf("malformed sidecar must FAIL CLOSED, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"counterfactual_report_invalid"`) {
+		t.Errorf("expected counterfactual_report_invalid, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("malformed sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadCounterfactualReport_StaleID: embedded ids not matching cfg → nil +
+// counterfactual_report_stale + the file REMOVED.
+//
+// The foreign ids are literals chosen independently of cfg, so the mismatch
+// holds BY CONSTRUCTION, and the sidecar carries an otherwise-VALID entry a
+// missing guard would happily retain — which is what makes the deletion land
+// RED on the behavioral assertion rather than on fixture setup.
+func TestLoadCounterfactualReport_StaleID(t *testing.T) {
+	cfg := cfReportCfg()
+	path := writeCounterfactualSidecarFile(t, cfg,
+		`{"run_id":"FOREIGN-RUN","stage_id":"FOREIGN-STAGE","counterfactuals":[`+
+			`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red",`+
+			`"restored":true,"record":"mutated and saw red"}]}`)
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 0 {
+		t.Errorf("stale-id sidecar must FAIL CLOSED, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"counterfactual_report_stale"`) {
+		t.Errorf("expected counterfactual_report_stale, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("stale sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadCounterfactualReport_PresentButUnreadable: a path that EXISTS but
+// cannot be read → nil + counterfactual_report_unreadable + the path REMOVED.
+//
+// The fixture is a DIRECTORY at the sidecar path, so os.ReadFile fails EISDIR
+// deterministically for every user INCLUDING root — a chmod-based fixture would
+// silently pass as root and stop discriminating.
+//
+// The removal is the load-bearing half: loadFixupSelfReport returns on this
+// branch BEFORE installing its deferred removal, so an unreadable sidecar
+// survives on disk there. Asserting only the returned nil would be error
+// IDENTITY on a control whose real effect is COMMITTED STATE.
+func TestLoadCounterfactualReport_PresentButUnreadable(t *testing.T) {
+	cfg := cfReportCfg()
+	path := redirectCounterfactualDir(t, cfg)
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 0 {
+		t.Errorf("unreadable sidecar must FAIL CLOSED, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"counterfactual_report_unreadable"`) {
+		t.Errorf("expected counterfactual_report_unreadable, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("unreadable sidecar path must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadCounterfactualReport_DanglingSymlinkIsPresentState: a DANGLING SYMLINK
+// at the keyed path is present agent-authored state, not absence (#2929 fix-up).
+//
+// os.ReadFile follows the link and reports ENOENT for its MISSING TARGET, which
+// is byte-indistinguishable from the genuine-absence error. A loader trusting
+// the read error alone returns on the silent no-op branch and leaves the symlink
+// on disk, bypassing the documented present-but-unreadable cleanup entirely. The
+// os.Lstat re-check (pathExists) is what separates the two, so deleting it —
+// reverting the branch to a bare errors.Is(err, os.ErrNotExist) — reddens here.
+//
+// This is the (a)-trap shape: the RETURN value is nil either way, so the
+// load-bearing assertions are the LOG and the COMMITTED on-disk state. The
+// absence check is os.Lstat, not os.Stat: os.Stat reports not-exist for a
+// surviving dangling symlink and would green the very bug under test.
+func TestLoadCounterfactualReport_DanglingSymlinkIsPresentState(t *testing.T) {
+	cfg := cfReportCfg()
+	path := redirectCounterfactualDir(t, cfg)
+	if err := os.Symlink(filepath.Join(filepath.Dir(path), "no-such-target.json"), path); err != nil {
+		t.Fatal(err)
+	}
+	// Fixture invariant: the link is PRESENT while the read fails ENOENT — the
+	// exact ambiguity the control resolves.
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("fixture invariant: the symlink must exist, lstat err = %v", err)
+	}
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 0 {
+		t.Errorf("a dangling symlink must FAIL CLOSED, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"counterfactual_report_unreadable"`) {
+		t.Errorf("a present-but-unreadable path must be surfaced, got %q", logSink.String())
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Errorf("the dangling symlink must be removed, lstat err = %v", err)
+	}
+}
+
+// TestLoadCounterfactualReport_UnreadableAndUnremovableIsSurfaced: a path that
+// can be neither READ nor REMOVED must not be reported as if cleanup succeeded
+// (#2929 fix-up). An agent controls the sidecar path's contents, so it can build
+// exactly this state; the blocking cleanup requirement is then unmet and the
+// operator has to be told, or a persistent path silently looks handled.
+//
+// This is the (a)-trap case from the counterfactual rules: the RETURN value is
+// byte-identical (nil) whether or not the removal succeeded, so the assertion
+// reads the LOG and the surviving path — committed state — not the error.
+func TestLoadCounterfactualReport_UnreadableAndUnremovableIsSurfaced(t *testing.T) {
+	cfg := cfReportCfg()
+	path := redirectCounterfactualDir(t, cfg)
+	mustBuildUnremovableSidecarPath(t, path)
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 0 {
+		t.Errorf("unreadable sidecar must FAIL CLOSED, got %+v", got)
+	}
+	out := logSink.String()
+	// BOTH facts, not one: the read failed AND the cleanup failed.
+	if !strings.Contains(out, `"event":"counterfactual_report_unreadable"`) {
+		t.Errorf("expected counterfactual_report_unreadable, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"counterfactual_report_unremovable"`) {
+		t.Errorf("a cleanup failure must be surfaced, not swallowed, got %q", out)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadCounterfactualReport_ConsumptionFailureIsSurfaced: the SUCCESSFULLY
+// READ path owes the same honesty as the unreadable one. A regular file the
+// loader can read but cannot delete (its parent denies write) must not be
+// silently treated as consumed — the keyed path survives and a later attempt of
+// this same run/stage would re-read it.
+//
+// Note the return value is IDENTICAL either way (the validated triples), which
+// is why the assertion reads the log and the surviving path, not the result.
+func TestLoadCounterfactualReport_ConsumptionFailureIsSurfaced(t *testing.T) {
+	cfg := cfReportCfg()
+	path := writeCounterfactualSidecarFile(t, cfg,
+		`{"run_id":"run-eeee","stage_id":"stage-ffff","counterfactuals":[`+
+			`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true,"record":"r"}]}`)
+	mustDenyParentWrites(t, path)
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 1 {
+		t.Fatalf("a readable sidecar must still yield its triples, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"counterfactual_report_unremovable"`) {
+		t.Errorf("a consumption failure must be surfaced, not swallowed, got %q", logSink.String())
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadCounterfactualReport_StaleLogBoundsAgentIDs: the stale-path log echoes
+// AGENT-AUTHORED ids, so they are bounded. Asserts the truncation marker AND an
+// upper bound on the emitted line length — merely asserting the log fired would
+// stay green with safeSidecarID deleted.
+func TestLoadCounterfactualReport_StaleLogBoundsAgentIDs(t *testing.T) {
+	cfg := cfReportCfg()
+	huge := strings.Repeat("A", 5000)
+	writeCounterfactualSidecarFile(t, cfg,
+		fmt.Sprintf(`{"run_id":%q,"stage_id":%q}`, huge, huge))
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 0 {
+		t.Errorf("stale-id sidecar must FAIL CLOSED, got %+v", got)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"counterfactual_report_stale"`) {
+		t.Fatalf("expected counterfactual_report_stale, got %q", out)
+	}
+	if !strings.Contains(out, "…") {
+		t.Errorf("bounded ids must carry the truncation marker, got %q", out)
+	}
+	if len(out) > 512 {
+		t.Errorf("stale log line must be bounded, got %d bytes: %q", len(out), out)
+	}
+	if strings.Contains(out, strings.Repeat("A", maxSidecarIDBytes+1)) {
+		t.Errorf("stale log echoed an id past the cap: %q", out)
+	}
+}
+
+// TestLoadCounterfactualReport_Valid: a fresh, well-formed sidecar yields the
+// validated triples, the agent-authored record text is ABSENT from what is
+// returned, and the file is consumed (removed).
+func TestLoadCounterfactualReport_Valid(t *testing.T) {
+	cfg := cfReportCfg()
+	const sentinel = "RECORD-SENTINEL-should-not-cross-the-boundary"
+	path := writeCounterfactualSidecarFile(t, cfg,
+		`{"run_id":"run-eeee","stage_id":"stage-ffff","counterfactuals":[`+
+			`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true,"record":"`+sentinel+`"},`+
+			`{"control_path":"backend/internal/prompt/prompt.go","observed":"green","restored":false,"record":"r2"}]}`)
+
+	var logSink strings.Builder
+	got := loadCounterfactualReport(cfg, cfScope(), &logSink)
+	want := []fixupCounterfactualEvidence{
+		{ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red", Restored: true},
+		{ControlPath: "backend/internal/prompt/prompt.go", Observed: "green", Restored: false},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if strings.Contains(fmt.Sprintf("%+v", got), sentinel) {
+		t.Errorf("the agent record text must never cross the boundary: %+v", got)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("consumed sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadCounterfactualReport_SharedValidatorIsWired: an entry violating a
+// PER-ENTRY rule is dropped with validateFixupCounterfactuals' exact
+// fixup_counterfactual_dropped reason literal — proving the shared validator is
+// actually called rather than a shorter hand-rolled result being returned.
+func TestLoadCounterfactualReport_SharedValidatorIsWired(t *testing.T) {
+	cfg := cfReportCfg()
+	writeCounterfactualSidecarFile(t, cfg,
+		`{"run_id":"run-eeee","stage_id":"stage-ffff","counterfactuals":[`+
+			`{"control_path":"etc/never-declared.go","observed":"red","restored":true,"record":"r"}]}`)
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 0 {
+		t.Errorf("out-of-scope entry must be dropped, got %+v", got)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"fixup_counterfactual_dropped"`) ||
+		!strings.Contains(out, `"reason":"path_not_in_scope"`) {
+		t.Errorf("expected the SHARED validator's drop log, got %q", out)
+	}
+}
+
+// TestSweepStaleCounterfactualReport: a pre-existing keyed sidecar is removed
+// and counterfactual_report_swept logged with the CALLER'S reason; an absent one
+// is a silent no-op.
+//
+// The reason is asserted as a literal because the two sweep sites are now
+// DISTINCT (#2929 fix-up): a single shared literal could not tell an operator
+// whether a swept file was a leftover from a prior attempt or one this pass's
+// agent authored and the fix-up channel never read.
+func TestSweepStaleCounterfactualReport(t *testing.T) {
+	cfg := cfReportCfg()
+	path := writeCounterfactualSidecarFile(t, cfg, `{"stale":"leftover"}`)
+
+	var logSink strings.Builder
+	sweepStaleCounterfactualReport(cfg, &logSink, counterfactualSweepPreInvoke)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("pre-existing sidecar must be swept, stat err = %v", err)
+	}
+	if !strings.Contains(logSink.String(), `"event":"counterfactual_report_swept"`) {
+		t.Errorf("expected counterfactual_report_swept, got %q", logSink.String())
+	}
+	if !strings.Contains(logSink.String(), `"reason":"pre_invoke_stale_leftover"`) {
+		t.Errorf("pre-invoke sweep must name its own reason, got %q", logSink.String())
+	}
+
+	var logSink2 strings.Builder
+	sweepStaleCounterfactualReport(cfg, &logSink2, counterfactualSweepPreInvoke)
+	if logSink2.Len() != 0 {
+		t.Errorf("absent-sidecar sweep must be silent, got %q", logSink2.String())
+	}
+}
+
+// TestSweepStaleCounterfactualReport_ReasonsAreDistinct pins that the two sweep
+// SITES cannot be confused in the log: the pre-invoke reason and the fix-up
+// unread reason are different literals, and each site emits its own. Collapsing
+// them back to one shared literal reddens this.
+func TestSweepStaleCounterfactualReport_ReasonsAreDistinct(t *testing.T) {
+	if counterfactualSweepPreInvoke == counterfactualSweepFixupUnread {
+		t.Fatalf("the two sweep sites must be distinguishable in the log, both are %q", counterfactualSweepPreInvoke)
+	}
+	cfg := cfReportCfg()
+	path := writeCounterfactualSidecarFile(t, cfg, `{"agent":"authored"}`)
+
+	var logSink strings.Builder
+	sweepUnreadCounterfactualReport(cfg, &logSink)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("the fix-up sweep must remove the unread sidecar, stat err = %v", err)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"reason":"fixup_pass_authored_unread"`) {
+		t.Errorf("the fix-up sweep must name its own reason, got %q", out)
+	}
+	if strings.Contains(out, `"reason":"pre_invoke_stale_leftover"`) {
+		t.Errorf("the fix-up sweep must not claim the pre-invoke reason, got %q", out)
+	}
+}
+
+// TestSweepStaleCounterfactualReport_NonEmptyDirectoryIsRemovedRecursively is
+// the POSITIVE pin for the sweep's os.RemoveAll (#2929 fix-up). An agent
+// controls what sits at the sidecar path and can put a NON-EMPTY DIRECTORY
+// there, which a non-recursive os.Remove can never clear (ENOTEMPTY) — the case
+// the runner README's "Removal is RECURSIVE" claim rests on.
+//
+// The parent is WRITABLE here, which is what makes this discriminating and
+// TestSweepStaleCounterfactualReport_RemovalFailureIsSurfaced not: that fixture
+// denies the parent write, so BOTH os.Remove and os.RemoveAll fail on it and it
+// passes identically under either implementation. Reverting RemoveAll to Remove
+// reddens this test — the sweep would log counterfactual_report_sweep_failed and
+// the directory would survive.
+func TestSweepStaleCounterfactualReport_NonEmptyDirectoryIsRemovedRecursively(t *testing.T) {
+	cfg := cfReportCfg()
+	path := redirectCounterfactualDir(t, cfg)
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "child"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var logSink strings.Builder
+	sweepStaleCounterfactualReport(cfg, &logSink, counterfactualSweepPreInvoke)
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"counterfactual_report_swept"`) {
+		t.Errorf("a non-empty directory must be swept, got %q", out)
+	}
+	if strings.Contains(out, `"event":"counterfactual_report_sweep_failed"`) {
+		t.Errorf("the recursive removal must succeed on a writable parent, got %q", out)
+	}
+	// os.Lstat, not os.Stat: only committed on-disk state can tell a recursive
+	// removal from a non-recursive one that logged success it did not earn.
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Errorf("the directory must be gone after the sweep, lstat err = %v", err)
+	}
+}
+
+// TestSweepStaleCounterfactualReport_RemovalFailureIsSurfaced: a path the sweep
+// cannot clear must NOT be reported as swept. The fixture is a non-empty
+// directory whose PARENT denies write, which defeats os.RemoveAll — and it is
+// skipped rather than silently passing where the filesystem does not enforce
+// that (running as root), because such a run cannot discriminate at all.
+func TestSweepStaleCounterfactualReport_RemovalFailureIsSurfaced(t *testing.T) {
+	cfg := cfReportCfg()
+	path := redirectCounterfactualDir(t, cfg)
+	mustBuildUnremovableSidecarPath(t, path)
+
+	var logSink strings.Builder
+	sweepStaleCounterfactualReport(cfg, &logSink, counterfactualSweepPreInvoke)
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"counterfactual_report_sweep_failed"`) {
+		t.Errorf("a failed sweep must be surfaced, got %q", out)
+	}
+	if strings.Contains(out, `"event":"counterfactual_report_swept"`) {
+		t.Errorf("a path that survives must NEVER be reported as swept, got %q", out)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// mustBuildUnremovableSidecarPath constructs a sidecar path that BOTH os.ReadFile
+// and os.RemoveAll fail on: a non-empty directory inside a parent stripped of
+// write permission. It skips the calling test when the filesystem does not
+// enforce that permission (root, or a permissive mount), since such a fixture
+// would pass with the control deleted and so proves nothing.
+func mustBuildUnremovableSidecarPath(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "child"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustDenyParentWrites(t, path)
+}
+
+// mustDenyParentWrites strips write permission from path's parent, so an
+// unlink of path fails, and restores it on cleanup. It skips the calling test
+// where the filesystem does not enforce that (root, or a permissive mount),
+// since such a fixture would pass with the control deleted and so proves
+// nothing — the trap the counterfactual rules call out for chmod fixtures.
+func mustDenyParentWrites(t *testing.T, path string) {
+	t.Helper()
+	parent := filepath.Dir(path)
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	// Restore before t.TempDir's own cleanup (registered earlier, so it runs
+	// later under LIFO) tries to remove the tree.
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+
+	probe := filepath.Join(parent, "writability-probe")
+	if err := os.WriteFile(probe, []byte("x"), 0o600); err == nil {
+		_ = os.Remove(probe)
+		t.Skip("filesystem does not enforce directory write permission (running as root?) — this fixture cannot discriminate")
+	}
+}
+
+// TestEmitInitialCounterfactuals_AppendsTheEventAndConsumesTheSidecar is the
+// BEHAVIORAL pin for the initial (non-fix-up) implement channel (#2929 fix-up).
+//
+// It drives the real branch body — emitInitialCounterfactuals, the function
+// run()'s `stageType == "implement" && !cfg.fixup` branch calls — against a
+// redirected counterfactualReportDir, and asserts the two properties a
+// structural AST pin cannot reach: the fixup_counterfactuals event is actually
+// APPENDED to res.Events with the validated triples in its payload, and the
+// sidecar is actually GONE from disk. A call placed under dead code, or a load
+// that silently returns nothing, reddens here and cannot red-line only the
+// text-matching test.
+func TestEmitInitialCounterfactuals_AppendsTheEventAndConsumesTheSidecar(t *testing.T) {
+	cfg := cfReportCfg()
+	const sentinel = "RECORD-SENTINEL-should-not-cross-the-boundary"
+	path := writeCounterfactualSidecarFile(t, cfg,
+		`{"run_id":"run-eeee","stage_id":"stage-ffff","counterfactuals":[`+
+			`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true,"record":"`+sentinel+`"},`+
+			`{"control_path":"backend/internal/prompt/prompt.go","observed":"green","restored":false,"record":"r2"}]}`)
+
+	// A pre-existing event proves the channel APPENDS rather than replaces.
+	res := agent.Result{Events: []agent.Event{{Kind: "runner_started"}}}
+	var logSink strings.Builder
+	emitInitialCounterfactuals(cfg, cfScope(), &res, &logSink)
+
+	if len(res.Events) != 2 {
+		t.Fatalf("expected the pre-existing event plus one counterfactual event, got %d: %+v", len(res.Events), res.Events)
+	}
+	ev := res.Events[1]
+	if ev.Kind != "fixup_counterfactuals" {
+		t.Fatalf("the initial pass must reuse the #3042 wire kind, got %q", ev.Kind)
+	}
+	payload, err := json.Marshal(ev.Payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	for _, want := range []string{
+		`"run_id":"run-eeee"`,
+		`"stage_id":"stage-ffff"`,
+		`"control_path":"runner/cmd/fishhawk-runner/main.go"`,
+		`"observed":"red"`,
+		`"restored":true`,
+		`"control_path":"backend/internal/prompt/prompt.go"`,
+		`"observed":"green"`,
+		`"restored":false`,
+	} {
+		if !strings.Contains(string(payload), want) {
+			t.Errorf("emitted payload missing %s:\n%s", want, payload)
+		}
+	}
+	if strings.Contains(string(payload), sentinel) {
+		t.Errorf("the agent record text must never cross the boundary:\n%s", payload)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("the consumed sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestEmitInitialCounterfactuals_NoSidecarEmitsNothing: the common no-op path.
+// Without a sidecar the channel must leave res.Events untouched — an empty
+// fixup_counterfactuals event would claim evidence that does not exist.
+func TestEmitInitialCounterfactuals_NoSidecarEmitsNothing(t *testing.T) {
+	cfg := cfReportCfg()
+	redirectCounterfactualDir(t, cfg)
+
+	res := agent.Result{Events: []agent.Event{{Kind: "runner_started"}}}
+	var logSink strings.Builder
+	emitInitialCounterfactuals(cfg, cfScope(), &res, &logSink)
+
+	if len(res.Events) != 1 {
+		t.Fatalf("no sidecar must emit no event, got %+v", res.Events)
+	}
+}
+
+// TestSweepUnreadCounterfactualReport_RemovesTheFileAndDoesNotValidate is the
+// BEHAVIORAL pin for the fix-up branch's half (#2929 fix-up). It drives the real
+// branch body and asserts the file's ABSENCE POSITIVELY via os.Stat rather than
+// inferring it from the absence of an event: "no event" is equally consistent
+// with the sidecar being left unread in /tmp, which is exactly the hygiene gap
+// this sweep closes.
+//
+// It deliberately makes NO claim about res.Events (#2929 fix-up). An earlier
+// version constructed an agent.Result and asserted len(res.Events) == 1, which
+// was a TAUTOLOGY: sweepUnreadCounterfactualReport(cfg, logSink) never receives
+// res, so no implementation of it could change that count and the "emits no
+// event" half of the name could not go red. The mutual-exclusion property that
+// assertion was reaching for — the fix-up branch does not ALSO emit the initial
+// channel's event — is pinned where it is actually decidable: by
+// TestCounterfactualChannels_AreExactComplements on the branch CONDITIONS, and
+// by TestFixupBranch_SweepsTheInitialPassSidecar on the branch body's calls.
+//
+// What IS load-bearing here: the file is gone, and no fixup_counterfactual_
+// dropped line was logged — the latter is the observable signature of per-entry
+// VALIDATION, i.e. of the sweep having read the sidecar it must only delete.
+func TestSweepUnreadCounterfactualReport_RemovesTheFileAndDoesNotValidate(t *testing.T) {
+	cfg := cfReportCfg()
+	// The entry is deliberately INVALID (an out-of-scope control_path), so a
+	// sweep that wrongly READ the sidecar would emit fixup_counterfactual_
+	// dropped and redden the log assertion below. A well-formed entry would
+	// validate silently and leave that half of the test unable to discriminate.
+	path := writeCounterfactualSidecarFile(t, cfg,
+		`{"run_id":"run-eeee","stage_id":"stage-ffff","counterfactuals":[`+
+			`{"control_path":"not/in/scope.go","observed":"red","restored":true,"record":"r"}]}`)
+
+	var logSink strings.Builder
+	sweepUnreadCounterfactualReport(cfg, &logSink)
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("the fix-up pass must leave NO file at the sidecar path, stat err = %v", err)
+	}
+	if strings.Contains(logSink.String(), `"event":"fixup_counterfactual_dropped"`) {
+		t.Errorf("the fix-up sweep must not VALIDATE (that is reading), got %q", logSink.String())
+	}
+}
+
+// TestCounterfactualChannels_AreExactComplements pins the #2929 mutual-exclusion
+// GATE — the two branch CONDITIONS — structurally, by parsing main.go. That is
+// all a structural test is claimed to cover here: run() takes (args []string,
+// logSink io.Writer), spawns the agent CLI and does real git work, so no test in
+// this package drives it and the CONDITIONS have no other vehicle.
+//
+// What each branch's body DOES is no longer pinned structurally. The bodies were
+// extracted into emitInitialCounterfactuals and sweepUnreadCounterfactualReport
+// precisely so behavioral tests could drive them —
+// TestEmitInitialCounterfactuals_AppendsTheEventAndConsumesTheSidecar and
+// TestSweepUnreadCounterfactualReport_RemovesTheFileAndDoesNotValidate above assert
+// the emitted event and the file's absence on disk, which a text match cannot:
+// a call under dead code, or a sweep that runs but fails to remove the file,
+// passes a structural assertion and fails those.
+//
+// Three properties, each of which goes RED under a deletion of the thing it
+// guards:
+//
+//  1. the initial-pass branch condition is EXACTLY `stageType == "implement" &&
+//     !cfg.fixup` — the exact complement of the fix-up block's `cfg.fixup`, so
+//     exactly one channel reads per pass and evidence can never be double-
+//     counted;
+//  2. that branch's body calls emitInitialCounterfactuals — the wiring from the
+//     gate to the behaviorally-tested body;
+//  3. that branch's body contains NO assignment to res.OK / res.FailureCategory
+//     — the evidence-only invariant its two siblings hold.
+func TestCounterfactualChannels_AreExactComplements(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: could not resolve this test file's path")
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "main.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+
+	const initialCond = `stageType == "implement" && !cfg.fixup`
+	const fixupCond = `stageType == "implement" && cfg.fixup`
+	bodies := map[string]*ast.BlockStmt{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		var buf strings.Builder
+		if err := printNode(&buf, fset, ifStmt.Cond); err != nil {
+			return true
+		}
+		got := strings.Join(strings.Fields(buf.String()), " ")
+		if got == initialCond || got == fixupCond {
+			bodies[got] = ifStmt.Body
+		}
+		return true
+	})
+
+	initial, okInitial := bodies[initialCond]
+	if !okInitial {
+		t.Fatalf("no branch guarded by %q found in main.go — the two counterfactual channels are no longer exact complements", initialCond)
+	}
+	if _, okFixup := bodies[fixupCond]; !okFixup {
+		t.Fatalf("no branch guarded by %q found in main.go — the two counterfactual channels are no longer exact complements", fixupCond)
+	}
+
+	var buf strings.Builder
+	if err := printNode(&buf, fset, initial); err != nil {
+		t.Fatalf("print branch body: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, "emitInitialCounterfactuals(") {
+		t.Errorf("the initial-pass counterfactual branch must call emitInitialCounterfactuals:\n%s", body)
+	}
+	for _, forbidden := range []string{"res.OK =", "res.FailureCategory ="} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("EVIDENCE ONLY: the initial-pass counterfactual branch must not assign %s:\n%s", forbidden, body)
+		}
+	}
+}
+
+// TestFixupBranch_SweepsTheInitialPassSidecar pins the WIRING: the fix-up branch
+// calls the sweep helper and does NOT call the loader (which would double-count
+// the two channels). That the sweep actually leaves no file on disk is asserted
+// behaviorally by TestSweepUnreadCounterfactualReport_RemovesTheFileAndDoesNotValidate
+// above, which drives the helper and stats the path — this test only proves the
+// branch reaches it.
+func TestFixupBranch_SweepsTheInitialPassSidecar(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: could not resolve this test file's path")
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "main.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+	const fixupCond = `stageType == "implement" && cfg.fixup`
+	var body *ast.BlockStmt
+	ast.Inspect(file, func(n ast.Node) bool {
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		var buf strings.Builder
+		if err := printNode(&buf, fset, ifStmt.Cond); err != nil {
+			return true
+		}
+		if strings.Join(strings.Fields(buf.String()), " ") == fixupCond {
+			body = ifStmt.Body
+			return false
+		}
+		return true
+	})
+	if body == nil {
+		t.Fatalf("no branch guarded by %q found in main.go", fixupCond)
+	}
+	var buf strings.Builder
+	if err := printNode(&buf, fset, body); err != nil {
+		t.Fatalf("print branch body: %v", err)
+	}
+	if got := buf.String(); !strings.Contains(got, "sweepUnreadCounterfactualReport(") {
+		t.Errorf("the fix-up branch must sweep the initial-pass sidecar it does not read:\n%s", got)
+	}
+	if strings.Contains(buf.String(), "loadCounterfactualReport(") {
+		t.Errorf("the fix-up branch must NOT read the initial-pass sidecar (double-counting):\n%s", buf.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #3012: a non-composed implement PR body is LOUD, not silent.
+// ---------------------------------------------------------------------------
+
+// prBodyHandoffCase is one composition-failure mode: how to arrange the handoff
+// (or not) at the keyed path, and the prBodyReason the classification must
+// return for it. ONE table drives BOTH the pure-function reason assertions and
+// the ordinary-call-site marker/log assertions, so a branch cannot be covered in
+// one place and quietly skipped in the other — which is exactly how the
+// body_absent gap survived the plan gate (binding condition 3).
+type prBodyHandoffCase struct {
+	name string
+	// arrange puts the handoff (or a hostile substitute) at keyedPath.
+	arrange func(t *testing.T, keyedPath string)
+	want    prBodyReason
+	// agentAuthored is what prTitleAndBodyParts must report; a title-only
+	// handoff is agent-authored AND a body composition failure.
+	agentAuthored bool
+	// wantLogEvent, when set, is a runner-log event the branch must emit so the
+	// path that actually failed is named somewhere in the trace. Empty means the
+	// branch is fully described by the marker + pr_body_not_composed.
+	wantLogEvent string
+}
+
+func prBodyHandoffCases() []prBodyHandoffCase {
+	return []prBodyHandoffCase{
+		{
+			name:    "handoff_absent",
+			arrange: func(*testing.T, string) {}, // write nothing
+			want:    prBodyReasonHandoffAbsent,
+		},
+		{
+			name: "handoff_unreadable",
+			// A DIRECTORY at the keyed path makes os.ReadFile fail EISDIR — a
+			// non-IsNotExist error. Deliberately not chmod 0: that does not fail
+			// for a root euid, which would make this branch silently untested in
+			// a container.
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				if err := os.Mkdir(keyedPath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: prBodyReasonHandoffUnreadable,
+		},
+		{
+			name: "legacy_handoff_unreadable",
+			// The keyed path stays ABSENT so the legacy fallback is consulted,
+			// and a DIRECTORY at the legacy path makes ITS os.ReadFile fail
+			// EISDIR. Until the #3012 re-review this branch classified every
+			// legacy read error as handoff_absent, so an unreadable legacy
+			// handoff shipped a marker and an audit record falsely claiming
+			// neither path existed. withPRDescriptionPath has already redirected
+			// legacyPullRequestDescriptionPath into this test's temp dir, so
+			// nothing outside the test is touched.
+			arrange: func(t *testing.T, _ string) {
+				t.Helper()
+				if err := os.Mkdir(legacyPullRequestDescriptionPath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want:         prBodyReasonHandoffUnreadable,
+			wantLogEvent: "pr_description_legacy_unreadable",
+		},
+		{
+			name: "empty_file",
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				mustWrite(t, keyedPath, "")
+			},
+			want: prBodyReasonEmptyFile,
+		},
+		{
+			name: "empty_title",
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				mustWrite(t, keyedPath, "   \n\nbody with no title\n")
+			},
+			want: prBodyReasonEmptyTitle,
+		},
+		{
+			name: "body_absent",
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				mustWrite(t, keyedPath, "fix(runner): a title and nothing else\n")
+			},
+			want:          prBodyReasonBodyAbsent,
+			agentAuthored: true,
+		},
+		{
+			name: "body_absent via a separator with nothing after it",
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				mustWrite(t, keyedPath, "fix(runner): a title\n\n\n")
+			},
+			want:          prBodyReasonBodyAbsent,
+			agentAuthored: true,
+		},
+		{
+			name: "none",
+			arrange: func(t *testing.T, keyedPath string) {
+				t.Helper()
+				mustWrite(t, keyedPath, "fix(runner): a real subject\n\n## Summary\n\n- real work\n\nCloses #3012\n")
+			},
+			want:          prBodyReasonNone,
+			agentAuthored: true,
+		},
+	}
+}
+
+// TestPRTitleAndBodyParts_ReasonClassification pins the reason VALUE each branch
+// returns — and only that. It drives the PURE composition function, which by
+// design cannot observe the call-site marker or the emitted event; the
+// marker/log behaviour is asserted through the real call site by
+// TestOpenPRAndShipArtifact_NotComposedPerBranch.
+func TestPRTitleAndBodyParts_ReasonClassification(t *testing.T) {
+	for _, tc := range prBodyHandoffCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			keyed := withPRDescriptionPath(t, "r", "s")
+			tc.arrange(t, keyed)
+			var logSink strings.Builder
+			_, body, agentAuthored, reason := prTitleAndBodyParts(
+				config{runID: "r", stageID: "s", backendURL: "https://x"}, "branch", &logSink)
+			if reason != tc.want {
+				t.Errorf("reason = %q, want %q", reason, tc.want)
+			}
+			if agentAuthored != tc.agentAuthored {
+				t.Errorf("agentAuthored = %t, want %t", agentAuthored, tc.agentAuthored)
+			}
+			// The pure function NEVER emits the new event — that is the whole
+			// point of keeping it pure (the resume recovers after it returns).
+			if strings.Contains(logSink.String(), "pr_body_not_composed") {
+				t.Errorf("prTitleAndBodyParts must not emit pr_body_not_composed; the call sites own it:\n%s", logSink.String())
+			}
+			// The INVARIANT binding condition 1 rests on, asserted in BOTH
+			// directions over every case: an agent-authored empty body always
+			// carries body_absent, and body_absent always means an empty body.
+			// prTitleAndBodyParts deliberately does not re-derive this (the
+			// re-derivation would be unreachable), so a future change to
+			// loadAgentAuthoredPR's classification fails HERE rather than
+			// silently shipping an unmarked footer-only PR again.
+			if tc.want == prBodyReasonBodyAbsent && body != "" {
+				t.Errorf("body_absent must carry an empty body, got %q", body)
+			}
+			if agentAuthored && body == "" && reason != prBodyReasonBodyAbsent {
+				t.Errorf("an agent-authored EMPTY body must be classified body_absent, got %q", reason)
+			}
+		})
+	}
+}
+
+// TestPRBodyReasons_ClosedSet pins the mirrored wire vocabulary. These strings
+// ride the artifact to a backend that cannot import this module, so the list is
+// asserted here and re-asserted against the same literals in
+// backend/internal/server (prBodyFallbackReasons) — the #1774/#2501 pattern.
+func TestPRBodyReasons_ClosedSet(t *testing.T) {
+	want := []string{"handoff_absent", "handoff_unreadable", "empty_file", "empty_title", "body_absent"}
+	if len(prBodyReasons) != len(want) {
+		t.Fatalf("prBodyReasons = %v, want %v", prBodyReasons, want)
+	}
+	for i, w := range want {
+		if string(prBodyReasons[i]) != w {
+			t.Errorf("prBodyReasons[%d] = %q, want %q", i, prBodyReasons[i], w)
+		}
+	}
+	if prBodyReasonNone != "" {
+		t.Errorf("prBodyReasonNone must be the empty string so omitempty drops it, got %q", prBodyReasonNone)
+	}
+}
+
+// TestOpenPRAndShipArtifact_NotComposedPerBranch is binding condition 3: EVERY
+// named failure mode is driven through the ORDINARY call site — the real
+// openPRAndShipArtifact — and asserted on what actually ships: the marker on the
+// opened PR body, the pr_body_not_composed event, and the artifact's
+// pr_body_fallback_reason. The pure-function table above cannot make these
+// assertions, which is precisely why the body_absent gap (a title-only handoff
+// shipping a footer-only body with no marker) reached the gate uncaught.
+func TestOpenPRAndShipArtifact_NotComposedPerBranch(t *testing.T) {
+	for _, tc := range prBodyHandoffCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, _, _ := verifiedTreeRepo(t)
+			fpr := withFakePROpenerOnly(t)
+			fu := newFakeUploader(t)
+			issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keyed := withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
+			tc.arrange(t, keyed)
+
+			var logSink strings.Builder
+			if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"),
+				&logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
+				t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+			}
+			if fpr.gotArgs == nil {
+				t.Fatal("OpenPR not called")
+			}
+			shipped := fpr.gotArgs.Body
+			logs := logSink.String()
+
+			var artifact map[string]any
+			if fu.gotPRArgs == nil {
+				t.Fatal("ShipPullRequest not called")
+			}
+			if err := json.Unmarshal(fu.gotPRArgs.Body, &artifact); err != nil {
+				t.Fatalf("decode shipped artifact: %v", err)
+			}
+			// The PR the forge received and the artifact the backend receives
+			// must agree on the body, or the marker is cosmetic.
+			if artifact["body"] != shipped {
+				t.Errorf("artifact body != opened PR body:\nartifact: %v\nopened:   %q", artifact["body"], shipped)
+			}
+
+			if tc.want == prBodyReasonNone {
+				if strings.Contains(shipped, "was not composed by the implement agent") {
+					t.Errorf("a composed body must carry NO marker:\n%s", shipped)
+				}
+				if strings.Contains(logs, "pr_body_not_composed") {
+					t.Errorf("a composed ship must emit no pr_body_not_composed:\n%s", logs)
+				}
+				if _, present := artifact["pr_body_fallback_reason"]; present {
+					t.Errorf("a composed ship must OMIT pr_body_fallback_reason entirely, got %v", artifact["pr_body_fallback_reason"])
+				}
+				return
+			}
+
+			// Binding condition 1: reason != none implies the body NAMES the
+			// failure — including body_absent, which is agent-authored.
+			if !strings.HasPrefix(shipped, "> **This pull-request body was not composed by the implement agent.**") {
+				t.Errorf("shipped body must START with the marker, got:\n%s", shipped)
+			}
+			for _, want := range []string{
+				verifiedTreeRunID,
+				verifiedTreeStageID,
+				string(tc.want),
+				keyed,
+				"will not auto-close the trigger issue",
+			} {
+				if !strings.Contains(shipped, want) {
+					t.Errorf("marker missing %q:\n%s", want, shipped)
+				}
+			}
+			var emitted struct {
+				Event       string `json:"event"`
+				RunID       string `json:"run_id"`
+				StageID     string `json:"stage_id"`
+				Reason      string `json:"reason"`
+				HandoffPath string `json:"handoff_path"`
+			}
+			var found bool
+			for _, line := range strings.Split(logs, "\n") {
+				if strings.Contains(line, `"event":"pr_body_not_composed"`) {
+					if err := json.Unmarshal([]byte(line), &emitted); err != nil {
+						t.Fatalf("decode pr_body_not_composed %q: %v", line, err)
+					}
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("expected pr_body_not_composed in the log:\n%s", logs)
+			}
+			if emitted.Reason != string(tc.want) || emitted.HandoffPath != keyed ||
+				emitted.RunID != verifiedTreeRunID || emitted.StageID != verifiedTreeStageID {
+				t.Errorf("pr_body_not_composed = %+v, want reason=%q handoff_path=%q", emitted, tc.want, keyed)
+			}
+			if got := artifact["pr_body_fallback_reason"]; got != string(tc.want) {
+				t.Errorf("artifact pr_body_fallback_reason = %v, want %q", got, tc.want)
+			}
+			// The marker names the canonical run/stage-keyed path, so a branch
+			// that failed on a DIFFERENT path must name it in the trace itself.
+			if tc.wantLogEvent != "" && !strings.Contains(logs, `"event":"`+tc.wantLogEvent+`"`) {
+				t.Errorf("expected %s naming the path that actually failed:\n%s", tc.wantLogEvent, logs)
+			}
+		})
+	}
+}
+
+// TestOpenPRAndShipArtifact_FallbackCommitMessageUnchanged pins the ordering the
+// marker depends on (#3012): the marker is applied AFTER
+// implementCommitMessage, so main's squash commit message is byte-identical to
+// the pre-change fallback text. Without this test the leak is invisible until it
+// shows up in the repository history, where it cannot be un-shipped.
+func TestOpenPRAndShipArtifact_FallbackCommitMessageUnchanged(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No handoff anywhere: the pure fallback path, which is the one whose
+	// commit message the marker could contaminate.
+	withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"),
+		&logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	out, err := exec.Command("git", "-C", bare, "log", "-1", "--format=%B", branch).Output()
+	if err != nil {
+		t.Fatalf("read pushed commit message: %v", err)
+	}
+	msg := string(out)
+	if strings.Contains(msg, "was not composed by the implement agent") {
+		t.Errorf("the marker must NOT reach the commit message:\n%s", msg)
+	}
+	if !strings.HasPrefix(msg, "chore: fishhawk implement stage ") {
+		t.Errorf("fallback commit subject changed:\n%s", msg)
+	}
+	if !strings.Contains(msg, "Opened by Fishhawk for run") {
+		t.Errorf("fallback commit body changed:\n%s", msg)
+	}
+}
+
+// wireGoldenOrdinaryPath resolves the ORDINARY-path PR artifact fixture, the
+// second half of the cross-module seam (#3012). Anchored to this test source via
+// runtime.Caller for the same reason wireGoldenHeldCommitPath is.
+func wireGoldenOrdinaryPath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "ordinary_pr_artifact.json")
+}
+
+// Placeholders substituted for the two artifact values a real git fixture cannot
+// make deterministic. See normalizeOrdinaryWireArtifact.
+const (
+	wireGoldenOrdinaryHeadSHA = "1111111111111111111111111111111111111111"
+	wireGoldenOrdinaryBaseSHA = "2222222222222222222222222222222222222222"
+)
+
+// wireGoldenProductionHandoffPath is the PRODUCTION run/stage-keyed handoff path
+// the committed wire fixtures name inside the not-composed marker. The golden
+// tests do NOT point the runner at it: they run against an isolated temp dir
+// (withPRDescriptionPath) so nothing can delete or read a live run's handoff, and
+// substituteWireHandoffPath rewrites the temp path back to this literal before
+// the byte comparison. The fixture keeps naming the path an operator will
+// actually see; the test keeps its hands off /tmp.
+func wireGoldenProductionHandoffPath() string {
+	return "/tmp/fishhawk-pr-" + verifiedTreeRunID + "-" + verifiedTreeStageID + ".md"
+}
+
+// substituteWireHandoffPath rewrites the isolated temp-dir handoff path out of a
+// shipped artifact and puts the production literal in its place, at the BYTE
+// level so no re-marshal can perturb the bytes under test.
+//
+// It FAILS when the temp path is absent: without the marker naming it, the
+// substitution would be a silent no-op and the golden comparison would pass on
+// bytes that never contained a handoff path at all — the vacuous-green shape
+// this whole issue is about.
+func substituteWireHandoffPath(t *testing.T, produced []byte, keyed string) []byte {
+	t.Helper()
+	if !bytes.Contains(produced, []byte(keyed)) {
+		t.Fatalf("shipped artifact does not name the isolated handoff path %q, so the golden comparison would be vacuous:\n%s", keyed, produced)
+	}
+	return bytes.ReplaceAll(produced, []byte(keyed), []byte(wireGoldenProductionHandoffPath()))
+}
+
+// normalizeOrdinaryWireArtifact makes the ordinary ship's bytes comparable
+// against a committed fixture. head_sha and base_sha are real commit hashes from
+// a freshly-created temp repo (the commit timestamp is now), so they cannot be
+// pinned; every OTHER key — including any key a future change ADDS or REMOVES —
+// round-trips untouched through the decode/re-marshal, so the drift-detection
+// property the seam exists for is preserved: change the artifact map and these
+// bytes change.
+func normalizeOrdinaryWireArtifact(t *testing.T, produced []byte) []byte {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(produced, &m); err != nil {
+		t.Fatalf("decode produced artifact: %v", err)
+	}
+	for key, placeholder := range map[string]string{
+		"head_sha": wireGoldenOrdinaryHeadSHA,
+		"base_sha": wireGoldenOrdinaryBaseSHA,
+	} {
+		got, _ := m[key].(string)
+		if len(got) != 40 {
+			t.Fatalf("%s = %q, want a 40-char commit hash (the seam is meaningless without one)", key, got)
+		}
+		m[key] = placeholder
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestOpenPRAndShipArtifact_ArtifactBodyMatchesWireGolden is the runner half of
+// the ORDINARY-path cross-module seam (#3012) — the path the reported bug
+// actually happened on, which the held-commit golden could not cover. It drives
+// the REAL openPRAndShipArtifact with NO handoff present and pins the shipped
+// artifact bytes to the shared fixture that backend/internal/server POSTs
+// through the real DisallowUnknownFields handler. Omitting
+// pr_body_fallback_reason from the ordinary artifact map reddens this test
+// instead of shipping silently.
+//
+// Regenerate after an intentional body change with
+// FISHHAWK_REGEN_WIRE_GOLDEN=1 go test -run ArtifactBodyMatchesWireGolden.
+func TestOpenPRAndShipArtifact_ArtifactBodyMatchesWireGolden(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Redirect BOTH handoff paths into a per-test temp dir. The earlier version
+	// of this test pinned the dir to the production /tmp and unconditionally
+	// os.Remove'd the keyed AND the shared legacy handoff, so running it beside a
+	// real runner (or another test) could delete an ACTIVE PR-description handoff
+	// and silently cost that run its Summary, Test plan and `Closes #N` — the
+	// very loss this issue exists to stop. An isolated dir is absent by
+	// construction, needs no deletion, and mutates no process-external state;
+	// substituteWireHandoffPath puts the production literal back before the
+	// comparison so the fixture is unchanged.
+	keyed := withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"),
+		&logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest not called")
+	}
+	produced := normalizeOrdinaryWireArtifact(t, substituteWireHandoffPath(t, fu.gotPRArgs.Body, keyed))
+	goldenPath := wireGoldenOrdinaryPath(t)
+
+	if os.Getenv("FISHHAWK_REGEN_WIRE_GOLDEN") == "1" {
+		if werr := os.WriteFile(goldenPath, produced, 0o644); werr != nil {
+			t.Fatalf("regen wire golden: %v", werr)
+		}
+		t.Logf("regenerated %s (%d bytes)", goldenPath, len(produced))
+		return
+	}
+	want, rerr := os.ReadFile(goldenPath)
+	if rerr != nil {
+		t.Fatalf("read wire golden %s: %v (regenerate with FISHHAWK_REGEN_WIRE_GOLDEN=1)", goldenPath, rerr)
+	}
+	if !bytes.Equal(produced, want) {
+		t.Errorf("shipped artifact body drifted from the shared wire fixture.\nproduced: %s\ngolden:   %s\n(regenerate intentionally with FISHHAWK_REGEN_WIRE_GOLDEN=1)", produced, want)
+	}
+}
+
+// heldCommitPRBodyOutcome drives the REAL openHeldCommitPR with the given served
+// text and returns the shipped artifact plus the log, so the three resume
+// outcomes can each be asserted on what actually shipped.
+func heldCommitPRBodyOutcome(t *testing.T, handoff string, servedTitle, servedBody string) (map[string]any, string) {
+	t.Helper()
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyed := withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
+	if handoff != "" {
+		mustWrite(t, keyed, handoff)
+	}
+	cfg := config{
+		runID:      verifiedTreeRunID,
+		stageID:    verifiedTreeStageID,
+		githubRepo: "test-owner/test-repo",
+		baseBranch: "main",
+		backendURL: "https://api.fishhawk.test",
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), cfg,
+		wireGoldenHeldCommitHeadSHA, wireGoldenHeldCommitBranch, wireGoldenHeldCommitBaseSHA,
+		"", servedTitle, servedBody, &logSink, fu, issued); code != exitOK {
+		t.Fatalf("openHeldCommitPR exit = %d, want exitOK\n%s", code, logSink.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest not called")
+	}
+	var artifact map[string]any
+	if err := json.Unmarshal(fu.gotPRArgs.Body, &artifact); err != nil {
+		t.Fatalf("decode shipped artifact: %v", err)
+	}
+	return artifact, logSink.String()
+}
+
+// TestOpenHeldCommitPR_RecoveredBodyLogsRecoveredNotFailed: composition FELL
+// BACK and the backend-served body replaced the placeholder. The resume must log
+// pr_body_recovered, NOT pr_body_not_composed, must carry no marker, and must
+// record no reason on the artifact — a resume that recovered its text is not a
+// composition failure. This is why the emit lives at the call site rather than
+// inside prTitleAndBodyParts.
+func TestOpenHeldCommitPR_RecoveredBodyLogsRecoveredNotFailed(t *testing.T) {
+	artifact, logs := heldCommitPRBodyOutcome(t, "",
+		"fix(runner): recovered subject", "## Summary\n\n- recovered narrative\n\nCloses #3012")
+	if strings.Contains(logs, "pr_body_not_composed") {
+		t.Errorf("a recovered resume must NOT be recorded as a composition failure:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"event":"pr_body_recovered"`) {
+		t.Errorf("expected pr_body_recovered:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"reason":"handoff_absent"`) {
+		t.Errorf("pr_body_recovered must name the reason that WOULD have applied:\n%s", logs)
+	}
+	body, _ := artifact["body"].(string)
+	if strings.Contains(body, "was not composed by the implement agent") {
+		t.Errorf("a recovered body must carry no marker:\n%s", body)
+	}
+	if _, present := artifact["pr_body_fallback_reason"]; present {
+		t.Errorf("a recovered resume must omit pr_body_fallback_reason, got %v", artifact["pr_body_fallback_reason"])
+	}
+}
+
+// TestOpenHeldCommitPR_TitleOnlyRecoveryStillNotComposed is the twin: only the
+// TITLE recovered, so the placeholder body survives. That IS a composition
+// failure and must be recorded as one — marker, event and artifact reason —
+// with no pr_body_recovered claiming otherwise.
+func TestOpenHeldCommitPR_TitleOnlyRecoveryStillNotComposed(t *testing.T) {
+	artifact, logs := heldCommitPRBodyOutcome(t, "", "fix(runner): recovered subject", "")
+	if !strings.Contains(logs, `"event":"pr_body_not_composed"`) {
+		t.Errorf("a surviving placeholder body IS a composition failure:\n%s", logs)
+	}
+	if strings.Contains(logs, "pr_body_recovered") {
+		t.Errorf("nothing about the BODY was recovered; pr_body_recovered must not be emitted:\n%s", logs)
+	}
+	body, _ := artifact["body"].(string)
+	if !strings.HasPrefix(body, "> **This pull-request body was not composed by the implement agent.**") {
+		t.Errorf("shipped body must start with the marker:\n%s", body)
+	}
+	if got := artifact["pr_body_fallback_reason"]; got != "handoff_absent" {
+		t.Errorf("artifact pr_body_fallback_reason = %v, want handoff_absent", got)
+	}
+}
+
+// TestOpenHeldCommitPR_ComposedWithServedTextLogsNeither is binding condition 2:
+// a resume whose composition SUCCEEDED (a same-host handoff survived) and which
+// ALSO carries served text must log NEITHER event. Emitting pr_body_recovered
+// here would announce a recovery of nothing — a third false record, in a change
+// whose entire purpose is that the trace stops asserting what did not happen.
+func TestOpenHeldCommitPR_ComposedWithServedTextLogsNeither(t *testing.T) {
+	artifact, logs := heldCommitPRBodyOutcome(t,
+		"fix(runner): agent subject\n\n## Summary\n\n- agent narrative\n",
+		"fix(runner): served subject", "## Summary\n\n- served narrative")
+	if strings.Contains(logs, "pr_body_recovered") {
+		t.Errorf("composition succeeded; there was no recovery to announce:\n%s", logs)
+	}
+	if strings.Contains(logs, "pr_body_not_composed") {
+		t.Errorf("composition succeeded; nothing failed:\n%s", logs)
+	}
+	body, _ := artifact["body"].(string)
+	if strings.Contains(body, "was not composed by the implement agent") {
+		t.Errorf("a successful composition must carry no marker:\n%s", body)
+	}
+	if _, present := artifact["pr_body_fallback_reason"]; present {
+		t.Errorf("a successful composition must omit pr_body_fallback_reason, got %v", artifact["pr_body_fallback_reason"])
+	}
+}
+
+// --- #2840 agent-handoff memo across a base-rebase re-invoke ---------------
+
+// withAgentHandoffPaths redirects BOTH agent-handoff dirs (the PR-description
+// dir + its legacy fixed-path fallback, and the initial-commit-message dir) to
+// one temp dir for the duration of the test, restoring the production values via
+// t.Cleanup, and returns the run/stage-KEYED paths. Nothing under the production
+// /tmp is touched.
+func withAgentHandoffPaths(t *testing.T, runID, stageID string) (prPath, commitMsgPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	origPRDir, origLegacy, origCMDir := pullRequestDescriptionDir, legacyPullRequestDescriptionPath, implementCommitMessageDir
+	pullRequestDescriptionDir = dir
+	legacyPullRequestDescriptionPath = filepath.Join(dir, "legacy-fishhawk-pr.md")
+	implementCommitMessageDir = dir
+	t.Cleanup(func() {
+		pullRequestDescriptionDir = origPRDir
+		legacyPullRequestDescriptionPath = origLegacy
+		implementCommitMessageDir = origCMDir
+	})
+	return pullRequestDescriptionPath(runID, stageID), implementCommitMessagePath(runID, stageID)
+}
+
+// TestRun_ImplementStage_BaseRebaseConflict_ReinvokeKeepsAgentPRText is the
+// #2840 primary regression, driven END-TO-END through the real run() across the
+// whole seam the defect lives in: the agent writes both handoffs -> the FIRST
+// openPRAndShipArtifact consumes them (delete-after-read) -> CommitAndPush fails
+// ErrBaseRebaseConflict -> reinvokeOnBaseRebaseConflict runs an agent that
+// writes NOTHING (the non-compliant case option 3 alone cannot cover) -> the
+// SECOND openPRAndShipArtifact must still open the PR with the AGENT's title,
+// the agent's `Closes #N` body and the agent's commit message, not the
+// `chore: fishhawk implement stage <id>` placeholder that shipped on PRs
+// #2741/#2755/#2776/#2779. No unit test of either loader can see this: the
+// defect is in the seam BETWEEN the two calls.
+func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeKeepsAgentPRText(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	const (
+		runID   = "11111111-2222-3333-4444-555555555555"
+		stageID = "22222222-3333-4444-5555-666666666666"
+	)
+	prPath, cmPath := withAgentHandoffPaths(t, runID, stageID)
+
+	fi := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(callIdx int, _ agent.Invocation) {
+			if callIdx != 0 {
+				// The re-invoked agent writes NOTHING — the memo is the only
+				// thing standing between this run and the placeholder.
+				return
+			}
+			if werr := os.WriteFile(prPath, []byte(
+				"fix(runner): replay the agent handoffs across a re-invoke\n\n## Summary\n\n- carry the text\n\nCloses #2840\n"), 0o600); werr != nil {
+				t.Fatal(werr)
+			}
+			if werr := os.WriteFile(cmPath, []byte(
+				"fix(runner): replay the agent handoffs across a re-invoke\n\nCarry both handoffs across the base-rebase re-invoke.\n"), 0o600); werr != nil {
+				t.Fatal(werr)
+			}
+		},
+	}
+	withFakeInvoker(t, fi)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID: stageID, StageType: "implement", Prompt: "implement", PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+
+	fp := &fakePusher{errSeq: []error{gitops.ErrBaseRebaseConflict, nil}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.calls != 2 {
+		t.Fatalf("CommitAndPush called %d times, want 2 (conflict + retry)", fp.calls)
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR must be called after the successful retried push")
+	}
+	if fpr.gotArgs.Title != "fix(runner): replay the agent handoffs across a re-invoke" {
+		t.Errorf("PR title = %q, want the agent's title; the placeholder here is exactly the shipped defect", fpr.gotArgs.Title)
+	}
+	if strings.Contains(fpr.gotArgs.Title, "chore: fishhawk implement stage") {
+		t.Errorf("PR title fell through to the placeholder: %q", fpr.gotArgs.Title)
+	}
+	if !strings.Contains(fpr.gotArgs.Body, "Closes #2840") {
+		t.Errorf("PR body must carry the agent's Closes #N (the issue auto-close), got:\n%s", fpr.gotArgs.Body)
+	}
+	if strings.Contains(fpr.gotArgs.Body, "was not composed by the implement agent") {
+		t.Errorf("a replayed agent body must carry no #3012 not-composed marker:\n%s", fpr.gotArgs.Body)
+	}
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush args not captured")
+	}
+	if !strings.HasPrefix(fp.gotArgs.CommitMessage, "fix(runner): replay the agent handoffs across a re-invoke\n\nCarry both handoffs") {
+		t.Errorf("commit message = %q, want the agent's replayed sidecar message", fp.gotArgs.CommitMessage)
+	}
+	if !strings.Contains(stderr.String(), `"event":"pr_description_replayed"`) {
+		t.Errorf("expected pr_description_replayed in the log:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"implement_commitmsg_replayed"`) {
+		t.Errorf("expected implement_commitmsg_replayed in the log:\n%s", stderr.String())
+	}
+	// #2840 binding condition 1, pinned against the REAL call site rather than
+	// a test-local replica of it. Both openPRAndShipArtifact passes of this run
+	// resolve agent text — captured on pass 1, replayed on pass 2 — so the
+	// WHOLE stderr must be free of pr_body_not_composed. Asserting it here and
+	// not only in TestAgentHandoff_ReplayEmitsEvent matters: that unit test
+	// mirrors the call site's `if reason != none` decision itself, so it would
+	// still pass if the production emit were later re-keyed off something other
+	// than the returned reason. This assertion would not.
+	if strings.Contains(stderr.String(), "pr_body_not_composed") {
+		t.Errorf("both passes resolved agent text; neither may record a composition failure:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_BaseRebaseConflict_ReinvokeNoHandoffStillFallsBack
+// pins that the memo does not MASK the genuine-absence case (#2658/#3011/#3012):
+// an agent that never writes a handoff at all must still ship the marked
+// placeholder on BOTH passes, with pr_body_not_composed reason handoff_absent.
+// Store-only-on-success (rule b) is what makes this hold — a cached fallback
+// would replay silently and the trace would stop saying the composition was
+// skipped.
+func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeNoHandoffStillFallsBack(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	const (
+		runID   = "11111111-2222-3333-4444-555555555555"
+		stageID = "22222222-3333-4444-5555-666666666666"
+	)
+	withAgentHandoffPaths(t, runID, stageID)
+
+	fi := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fi)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID: stageID, StageType: "implement", Prompt: "implement", PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{errSeq: []error{gitops.ErrBaseRebaseConflict, nil}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	if got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR must be called after the successful retried push")
+	}
+	if !strings.HasPrefix(fpr.gotArgs.Title, "chore: fishhawk implement stage") {
+		t.Errorf("with no handoff at all the placeholder title must survive, got %q", fpr.gotArgs.Title)
+	}
+	if !strings.Contains(fpr.gotArgs.Body, "was not composed by the implement agent") {
+		t.Errorf("a genuine absence must still carry the #3012 marker:\n%s", fpr.gotArgs.Body)
+	}
+	if !strings.Contains(stderr.String(), `"reason":"handoff_absent"`) {
+		t.Errorf("expected pr_body_not_composed reason handoff_absent:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"pr_description_replayed"`) {
+		t.Errorf("nothing was ever captured, so nothing can be replayed:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_BaseRebaseConflict_ReinvokeFreshHandoffWins pins rule
+// (a), fresh-read-first: the re-invoked agent complies with the option-3
+// re-request and writes a DIFFERENT handoff pair for the re-landed slice. That
+// text — not the memoized first-pass text — must reach the PR and the commit,
+// because it is the text that describes what actually landed.
+func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeFreshHandoffWins(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	const (
+		runID   = "11111111-2222-3333-4444-555555555555"
+		stageID = "22222222-3333-4444-5555-666666666666"
+	)
+	prPath, cmPath := withAgentHandoffPaths(t, runID, stageID)
+
+	fi := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(callIdx int, _ agent.Invocation) {
+			title, note := "fix(runner): stale first-pass title", "stale first-pass body"
+			if callIdx != 0 {
+				title, note = "fix(runner): fresh re-landed title", "fresh re-landed body"
+			}
+			if werr := os.WriteFile(prPath, []byte(
+				title+"\n\n## Summary\n\n- "+note+"\n\nCloses #2840\n"), 0o600); werr != nil {
+				t.Fatal(werr)
+			}
+			if werr := os.WriteFile(cmPath, []byte(title+"\n\n"+note+"\n"), 0o600); werr != nil {
+				t.Fatal(werr)
+			}
+		},
+	}
+	withFakeInvoker(t, fi)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID: stageID, StageType: "implement", Prompt: "implement", PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{errSeq: []error{gitops.ErrBaseRebaseConflict, nil}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	if got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("OpenPR must be called after the successful retried push")
+	}
+	if fpr.gotArgs.Title != "fix(runner): fresh re-landed title" {
+		t.Errorf("PR title = %q, want the RE-INVOKED agent's fresh title (fresh-read-first, rule a)", fpr.gotArgs.Title)
+	}
+	if !strings.Contains(fpr.gotArgs.Body, "fresh re-landed body") || strings.Contains(fpr.gotArgs.Body, "stale first-pass body") {
+		t.Errorf("PR body must be the fresh one, got:\n%s", fpr.gotArgs.Body)
+	}
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush args not captured")
+	}
+	if !strings.Contains(fp.gotArgs.CommitMessage, "fresh re-landed body") || strings.Contains(fp.gotArgs.CommitMessage, "stale first-pass body") {
+		t.Errorf("commit message must be the fresh sidecar, got %q", fp.gotArgs.CommitMessage)
+	}
+}
+
+// TestAgentHandoff_ArmedNoConflictUnchanged pins the byte-identical criterion
+// for the ordinary (no-conflict) SINGLE-pass path: an ARMED memo must be
+// indistinguishable from a nil one across every handoff shape. The memo only
+// ever changes a SECOND read, so a single pass must produce exactly the same
+// (title, body, agentAuthored, reason) and commit message either way.
+func TestAgentHandoff_ArmedNoConflictUnchanged(t *testing.T) {
+	cases := []struct {
+		name    string
+		handoff string // "" means write no file at all
+		sidecar string
+	}{
+		{"agent authored", "feat(x): agent title\n\n## Summary\n\nbody\n\nCloses #1\n", "feat(x): agent title\n\nsidecar body\n"},
+		{"handoff absent", "", ""},
+		{"empty title", "\n\nbody only\n", ""},
+		{"title only", "feat(x): title only\n", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := config{
+				runID:      "11111111-2222-3333-4444-555555555555",
+				stageID:    "22222222-3333-4444-5555-666666666666",
+				backendURL: "https://api.fishhawk.test",
+			}
+			type outcome struct {
+				title, body   string
+				agentAuthored bool
+				reason        prBodyReason
+				commitMessage string
+			}
+			// Each read CONSUMES the files, so seed them fresh for each arm.
+			seedAndRun := func(memo *agentHandoff) outcome {
+				prPath, cmPath := withAgentHandoffPaths(t, base.runID, base.stageID)
+				if tc.handoff != "" {
+					if err := os.WriteFile(prPath, []byte(tc.handoff), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tc.sidecar != "" {
+					if err := os.WriteFile(cmPath, []byte(tc.sidecar), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cfg := base
+				cfg.handoff = memo
+				var sink strings.Builder
+				title, body, agentAuthored, reason := prTitleAndBodyParts(cfg, "branch-x", &sink)
+				return outcome{title, body, agentAuthored, reason, implementCommitMessage(cfg, title, body, &sink)}
+			}
+			nilMemo := seedAndRun(nil)
+			armed := seedAndRun(&agentHandoff{})
+			if nilMemo != armed {
+				t.Errorf("armed memo changed the FIRST-pass outcome:\n nil   = %+v\n armed = %+v", nilMemo, armed)
+			}
+		})
+	}
+}
+
+// TestAgentHandoff_LoadOrReplay is the direct unit table on the memo's three
+// rules, for BOTH handoffs: a successful read stores and returns; a second call
+// with the file already consumed REPLAYS; a first-call MISS followed by a
+// now-present file takes the FRESH value (no poisoning — the store-only-on-
+// success guard, rule b); and a nil receiver is a pure load that stores nothing.
+func TestAgentHandoff_LoadOrReplay(t *testing.T) {
+	cfg := config{
+		runID:      "11111111-2222-3333-4444-555555555555",
+		stageID:    "22222222-3333-4444-5555-666666666666",
+		backendURL: "https://api.fishhawk.test",
+	}
+	const prText = "feat(x): memo title\n\n## Summary\n\nmemo body\n"
+	const cmText = "feat(x): memo title\n\nmemo commit body\n"
+
+	t.Run("pr stores then replays", func(t *testing.T) {
+		prPath, _ := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(prPath, []byte(prText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h := &agentHandoff{}
+		var sink strings.Builder
+		title, body, kind, reason := h.pullRequest(cfg, &sink)
+		if kind != prSourceAgent || title != "feat(x): memo title" || reason != prBodyReasonNone {
+			t.Fatalf("fresh read = (%q, %q, %v, %q), want the agent capture", title, body, kind, reason)
+		}
+		// The loader deleted the file; the second call must replay.
+		title2, body2, kind2, reason2 := h.pullRequest(cfg, &sink)
+		if kind2 != prSourceAgent || title2 != title || body2 != body {
+			t.Errorf("replay = (%q, %q, %v), want the stored capture", title2, body2, kind2)
+		}
+		if reason2 != prBodyReasonNone {
+			t.Errorf("replayed reason = %q, want none (a non-IsNotExist read error would surface handoff_unreadable)", reason2)
+		}
+	})
+
+	t.Run("pr title-only replays body_absent", func(t *testing.T) {
+		// Rule (b) stores ANY prSourceAgent capture, and a TITLE-ONLY handoff
+		// is one — it carries reason body_absent. So the replay returns that
+		// tuple verbatim and the real call site emits pr_body_not_composed
+		// reason=body_absent a SECOND time for the same stage, alongside
+		// pr_description_replayed. That double-emit is the DELIBERATE
+		// consequence of "marked exactly as the capturing pass marked it"
+		// (vocabulary reuse, #2840 binding condition 2) rather than an
+		// accident, so it is pinned here.
+		prPath, _ := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(prPath, []byte("feat(x): title only\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h := &agentHandoff{}
+		var sink strings.Builder
+		title, body, kind, reason := h.pullRequest(cfg, &sink)
+		if kind != prSourceAgent || title != "feat(x): title only" || body != "" || reason != prBodyReasonBodyAbsent {
+			t.Fatalf("capture = (%q, %q, %v, %q), want the title-only agent capture", title, body, kind, reason)
+		}
+		title2, body2, kind2, reason2 := h.pullRequest(cfg, &sink)
+		if kind2 != prSourceAgent || title2 != title || body2 != "" {
+			t.Errorf("replay = (%q, %q, %v), want the stored title-only capture", title2, body2, kind2)
+		}
+		if reason2 != prBodyReasonBodyAbsent {
+			t.Errorf("replayed reason = %q, want body_absent — the replayed pass must be marked exactly as the capturing pass was", reason2)
+		}
+		if !strings.Contains(sink.String(), `"event":"pr_description_replayed"`) {
+			t.Errorf("a title-only replay is still a replay and must say so:\n%s", sink.String())
+		}
+	})
+
+	t.Run("fresh malformed loses to stored", func(t *testing.T) {
+		// The (a)/(c) precedence for a FRESH-BUT-MALFORMED read: the re-invoked
+		// agent DID re-write the handoff but botched it (here an empty title
+		// line; handoff_unreadable behaves the same way). "Fresh wins" is
+		// scoped to fresh AGENT TEXT, so a malformed fresh read is a miss and
+		// the stored capture replays, discarding the fresh classification. The
+		// loader's own warning is what keeps that visible, so assert BOTH it
+		// and the replay event — the malformed write must not vanish from the
+		// trace just because the memo recovered.
+		prPath, _ := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(prPath, []byte(prText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h := &agentHandoff{}
+		var sink strings.Builder
+		if _, _, kind, _ := h.pullRequest(cfg, &sink); kind != prSourceAgent {
+			t.Fatalf("capture pass = %v, want prSourceAgent", kind)
+		}
+		// The capture consumed the file; the "re-invoked agent" writes a
+		// malformed one in its place.
+		if err := os.WriteFile(prPath, []byte("\n\nbody with no title\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var replay strings.Builder
+		title, _, kind, reason := h.pullRequest(cfg, &replay)
+		if kind != prSourceAgent || title != "feat(x): memo title" || reason != prBodyReasonNone {
+			t.Errorf("malformed fresh read = (%q, %v, %q), want the stored capture replayed", title, kind, reason)
+		}
+		if !strings.Contains(replay.String(), `"event":"pr_template_invalid"`) {
+			t.Errorf("the malformed fresh write must still be visible in the trace:\n%s", replay.String())
+		}
+		if !strings.Contains(replay.String(), `"event":"pr_description_replayed"`) {
+			t.Errorf("expected pr_description_replayed after the malformed fresh read:\n%s", replay.String())
+		}
+	})
+
+	t.Run("pr miss does not poison", func(t *testing.T) {
+		prPath, _ := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		h := &agentHandoff{}
+		var sink strings.Builder
+		if _, _, kind, reason := h.pullRequest(cfg, &sink); kind != prSourceFallback || reason != prBodyReasonHandoffAbsent {
+			t.Fatalf("first (absent) read = (%v, %q), want fallback/handoff_absent", kind, reason)
+		}
+		if err := os.WriteFile(prPath, []byte(prText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		title, _, kind, reason := h.pullRequest(cfg, &sink)
+		if kind != prSourceAgent || title != "feat(x): memo title" || reason != prBodyReasonNone {
+			t.Errorf("a cached MISS suppressed the now-present handoff: got (%q, %v, %q)", title, kind, reason)
+		}
+	})
+
+	t.Run("pr nil receiver is a pure load", func(t *testing.T) {
+		prPath, _ := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(prPath, []byte(prText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var h *agentHandoff
+		var sink strings.Builder
+		if _, _, kind, _ := h.pullRequest(cfg, &sink); kind != prSourceAgent {
+			t.Fatalf("nil receiver first read = %v, want prSourceAgent", kind)
+		}
+		if _, _, kind, reason := h.pullRequest(cfg, &sink); kind != prSourceFallback || reason != prBodyReasonHandoffAbsent {
+			t.Errorf("a nil receiver must store nothing, got (%v, %q)", kind, reason)
+		}
+		if strings.Contains(sink.String(), "pr_description_replayed") {
+			t.Errorf("a nil receiver must never replay:\n%s", sink.String())
+		}
+	})
+
+	t.Run("commitmsg stores then replays", func(t *testing.T) {
+		_, cmPath := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(cmPath, []byte(cmText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		h := &agentHandoff{}
+		var sink strings.Builder
+		subject, body, ok := h.commitMessage(cfg, &sink)
+		if !ok || subject != "feat(x): memo title" || body != "memo commit body" {
+			t.Fatalf("fresh read = (%q, %q, %t), want the sidecar capture", subject, body, ok)
+		}
+		subject2, body2, ok2 := h.commitMessage(cfg, &sink)
+		if !ok2 || subject2 != subject || body2 != body {
+			t.Errorf("replay = (%q, %q, %t), want the stored capture", subject2, body2, ok2)
+		}
+	})
+
+	t.Run("commitmsg miss does not poison", func(t *testing.T) {
+		_, cmPath := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		h := &agentHandoff{}
+		var sink strings.Builder
+		if _, _, ok := h.commitMessage(cfg, &sink); ok {
+			t.Fatal("first (absent) read must be ok=false")
+		}
+		if err := os.WriteFile(cmPath, []byte(cmText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if subject, _, ok := h.commitMessage(cfg, &sink); !ok || subject != "feat(x): memo title" {
+			t.Errorf("a cached MISS suppressed the now-present sidecar: got (%q, %t)", subject, ok)
+		}
+	})
+
+	t.Run("commitmsg nil receiver is a pure load", func(t *testing.T) {
+		_, cmPath := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+		if err := os.WriteFile(cmPath, []byte(cmText), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var h *agentHandoff
+		var sink strings.Builder
+		if _, _, ok := h.commitMessage(cfg, &sink); !ok {
+			t.Fatal("nil receiver first read must succeed")
+		}
+		if _, _, ok := h.commitMessage(cfg, &sink); ok {
+			t.Error("a nil receiver must store nothing")
+		}
+		if strings.Contains(sink.String(), "implement_commitmsg_replayed") {
+			t.Errorf("a nil receiver must never replay:\n%s", sink.String())
+		}
+	})
+}
+
+// TestAgentHandoff_ReplayEmitsEvent pins the observability rule (c): a replayed
+// pass emits pr_description_replayed / implement_commitmsg_replayed carrying
+// run_id + stage_id — the runner log being the only place this failure is
+// observable at all.
+//
+// It ALSO pins #2840 binding condition 1: a replayed pass must NOT emit a
+// spurious pr_body_not_composed reason=handoff_absent just before the replay.
+// That holds by construction — prTitleAndBodyParts is pure (#3012) and
+// emitPRBodyNotComposed is keyed off the RETURNED reason, which a replay resolves
+// to none — but it is a property inherited from someone else's design, so it is
+// asserted here rather than assumed.
+func TestAgentHandoff_ReplayEmitsEvent(t *testing.T) {
+	cfg := config{
+		runID:      "11111111-2222-3333-4444-555555555555",
+		stageID:    "22222222-3333-4444-5555-666666666666",
+		backendURL: "https://api.fishhawk.test",
+	}
+	prPath, cmPath := withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+	if err := os.WriteFile(prPath, []byte("feat(x): title\n\n## Summary\n\nbody\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cmPath, []byte("feat(x): title\n\ncommit body\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := &agentHandoff{}
+	cfg.handoff = h
+	var first strings.Builder
+	title, body, _, reason := prTitleAndBodyParts(cfg, "branch-x", &first)
+	_ = implementCommitMessage(cfg, title, body, &first)
+	if reason != prBodyReasonNone {
+		t.Fatalf("capture pass reason = %q, want none", reason)
+	}
+
+	var replay strings.Builder
+	title2, body2, _, reason2 := prTitleAndBodyParts(cfg, "branch-x", &replay)
+	_ = implementCommitMessage(cfg, title2, body2, &replay)
+	// The call site's #3012 emit is keyed off the RETURNED reason; mirror it
+	// here so the assertion below covers the real decision, not just the memo.
+	if reason2 != prBodyReasonNone {
+		emitPRBodyNotComposed(&replay, cfg, reason2, prPath)
+	}
+	logs := replay.String()
+	for _, want := range []string{
+		`"event":"pr_description_replayed"`,
+		`"event":"implement_commitmsg_replayed"`,
+		`"run_id":"` + cfg.runID + `"`,
+		`"stage_id":"` + cfg.stageID + `"`,
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("replay log missing %s:\n%s", want, logs)
+		}
+	}
+	if strings.Contains(logs, "pr_body_not_composed") {
+		t.Errorf("a replayed pass recovered its text; it must never be recorded as a composition failure:\n%s", logs)
+	}
+}
+
+// TestBaseRebaseConflictPrompt_ReRequestsHandoffs pins the option-3 half
+// (#2840): the re-invoke prompt names BOTH absolute keyed handoff paths, built
+// from cfg via the runner's own path helpers so the prompt can never name a path
+// the runner does not read, and says the previous attempt's handoffs were
+// consumed. The pre-existing conflict-context assertions are unchanged.
+func TestBaseRebaseConflictPrompt_ReRequestsHandoffs(t *testing.T) {
+	cfg := config{
+		runID:   "11111111-2222-3333-4444-555555555555",
+		stageID: "22222222-3333-4444-5555-666666666666",
+	}
+	withAgentHandoffPaths(t, cfg.runID, cfg.stageID)
+	detail := &gitops.BaseRebaseConflictError{
+		ConflictPaths: []string{"registry.txt"},
+		StashPatch:    "+child-two addition",
+	}
+	got := baseRebaseConflictPrompt(cfg, detail)
+	for _, want := range []string{
+		pullRequestDescriptionPath(cfg.runID, cfg.stageID),
+		implementCommitMessagePath(cfg.runID, cfg.stageID),
+		"CONSUMED",
+		"Closes #N",
+		// Unchanged conflict context.
+		"registry.txt",
+		"+child-two addition",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("prompt missing %q:\n%s", want, got)
+		}
+	}
+	// A nil detail still re-requests the handoffs (the prompt only omits the
+	// conflict-context sections).
+	nilDetail := baseRebaseConflictPrompt(cfg, nil)
+	if !strings.Contains(nilDetail, pullRequestDescriptionPath(cfg.runID, cfg.stageID)) {
+		t.Errorf("nil-detail prompt must still re-request the PR description:\n%s", nilDetail)
+	}
+	if strings.Contains(nilDetail, "registry.txt") {
+		t.Errorf("nil-detail prompt must omit the conflict context:\n%s", nilDetail)
+	}
+}
+
+// --- E64.12 / #3106: over-ceiling sidecar reads --------------------------
+
+// oversizePad returns a legal filler string strictly longer than
+// maxSidecarBytes, so a fixture embedding it is over the ceiling by
+// construction. Each over-ceiling fixture below is OTHERWISE COMPLETELY VALID
+// for its loader — matching ids, a well-formed entry/subject/body — and padded
+// with this filler, so that with the bound in readSidecarBounded deleted the
+// loader SUCCEEDS and returns real content (the RED lands on the behavioral
+// assertion, not a setup error).
+func oversizePad() string {
+	return strings.Repeat("x", int(maxSidecarBytes)+4096)
+}
+
+// TestLoadCounterfactualReport_Oversize: a valid-but-oversize counterfactual
+// sidecar fails closed (nil), emits counterfactual_report_oversize, and is
+// removed. With the ceiling deleted the padded-but-valid entry parses and the
+// loader returns one evidence entry instead.
+func TestLoadCounterfactualReport_Oversize(t *testing.T) {
+	cfg := cfReportCfg()
+	path := writeCounterfactualSidecarFile(t, cfg,
+		`{"run_id":"run-eeee","stage_id":"stage-ffff","counterfactuals":[`+
+			`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red",`+
+			`"restored":true,"record":"`+oversizePad()+`"}]}`)
+
+	var logSink strings.Builder
+	if got := loadCounterfactualReport(cfg, cfScope(), &logSink); len(got) != 0 {
+		t.Errorf("oversize sidecar must FAIL CLOSED, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"counterfactual_report_oversize"`) {
+		t.Errorf("expected counterfactual_report_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("oversize sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadFixupSelfReport_Oversize: a valid-but-oversize fix-up self-report
+// fails closed (zero result), emits fixup_selfreport_oversize, and is removed.
+// The removal is the load-bearing half here: this loader returns on the read-
+// error path BEFORE its deferred removal is installed, so the branch must remove
+// by hand.
+func TestLoadFixupSelfReport_Oversize(t *testing.T) {
+	cfg := fixupReportCfg()
+	path := writeFixupReportSidecar(t, cfg,
+		`{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":"passed",`+
+			`"obligations":[{"id":"ob-1","status":"met","record":"`+oversizePad()+`"}]}`)
+
+	var logSink strings.Builder
+	if got := loadFixupSelfReport(cfg, nil, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
+		t.Errorf("oversize sidecar must FAIL CLOSED, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"fixup_selfreport_oversize"`) {
+		t.Errorf("expected fixup_selfreport_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("oversize sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadScopeExemptions_Oversize: a valid-but-oversize scope-justification
+// sidecar fails closed (nil), emits scope_justification_oversize, and is removed.
+func TestLoadScopeExemptions_Oversize(t *testing.T) {
+	cfg := exemptCfg()
+	path := writeSidecar(t, cfg,
+		`{"run_id":"run-aaaa","stage_id":"stage-bbbb","exemptions":[`+
+			`{"path":"a.go","reason":"`+oversizePad()+`"}]}`)
+
+	var logSink strings.Builder
+	if got := loadScopeExemptions(cfg, []string{"a.go"}, &logSink); len(got) != 0 {
+		t.Errorf("oversize sidecar must FAIL CLOSED, got %+v", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"scope_justification_oversize"`) {
+		t.Errorf("expected scope_justification_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("oversize sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadFixupCommitMessage_Oversize: a valid-but-oversize fix-up commit-message
+// sidecar fails closed (ok=false), emits fixup_commitmsg_oversize, and is removed.
+func TestLoadFixupCommitMessage_Oversize(t *testing.T) {
+	cfg := fixupCommitMsgCfg()
+	path := writeFixupCommitMsgSidecar(t, cfg,
+		"fix: guard nil pool in retry path\n\n"+oversizePad())
+
+	var logSink strings.Builder
+	if _, _, ok := loadFixupCommitMessage(cfg, &logSink); ok {
+		t.Errorf("oversize sidecar must FAIL CLOSED (ok=false)")
+	}
+	if !strings.Contains(logSink.String(), `"event":"fixup_commitmsg_oversize"`) {
+		t.Errorf("expected fixup_commitmsg_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("oversize sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadImplementCommitMessage_Oversize: a valid-but-oversize initial-implement
+// commit-message sidecar fails closed (ok=false), emits implement_commitmsg_oversize,
+// and is removed.
+func TestLoadImplementCommitMessage_Oversize(t *testing.T) {
+	cfg := implementCommitMsgCfg()
+	path := writeImplementCommitMsgSidecar(t, cfg,
+		"feat(runner): add minio-init target\n\n"+oversizePad())
+
+	var logSink strings.Builder
+	if _, _, ok := loadImplementCommitMessage(cfg, &logSink); ok {
+		t.Errorf("oversize sidecar must FAIL CLOSED (ok=false)")
+	}
+	if !strings.Contains(logSink.String(), `"event":"implement_commitmsg_oversize"`) {
+		t.Errorf("expected implement_commitmsg_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("oversize sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadAgentAuthoredPR_OversizeKeyed: a valid-but-oversize KEYED PR handoff
+// fails closed to the fallback with prBodyReasonHandoffUnreadable, emits
+// pr_description_oversize naming the keyed path, and is removed. It does NOT fall
+// through to the legacy path.
+func TestLoadAgentAuthoredPR_OversizeKeyed(t *testing.T) {
+	keyed := withPRDescriptionPath(t, "r", "s")
+	if err := os.WriteFile(keyed,
+		[]byte("feat(runner): add minio-init target\n\n"+oversizePad()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	title, body, kind, reason := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &logSink)
+	if kind != prSourceFallback {
+		t.Errorf("oversize keyed handoff must FAIL CLOSED to fallback, got kind %v (title=%q body=%q)", kind, title, body)
+	}
+	if reason != prBodyReasonHandoffUnreadable {
+		t.Errorf("reason = %q, want %q", reason, prBodyReasonHandoffUnreadable)
+	}
+	if !strings.Contains(logSink.String(), `"event":"pr_description_oversize"`) {
+		t.Errorf("expected pr_description_oversize, got %q", logSink.String())
+	}
+	if _, err := os.Stat(keyed); !os.IsNotExist(err) {
+		t.Errorf("oversize keyed handoff must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadAgentAuthoredPR_OversizeLegacy: with the keyed path ABSENT, a valid-
+// but-oversize LEGACY PR handoff fails closed to the fallback with
+// prBodyReasonHandoffUnreadable, emits pr_description_oversize naming the legacy
+// path, and is removed.
+func TestLoadAgentAuthoredPR_OversizeLegacy(t *testing.T) {
+	withPRDescriptionPath(t, "r", "s") // redirect dirs; keyed stays absent
+	if err := os.WriteFile(legacyPullRequestDescriptionPath,
+		[]byte("feat(runner): legacy handoff\n\n"+oversizePad()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	_, _, kind, reason := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &logSink)
+	if kind != prSourceFallback {
+		t.Errorf("oversize legacy handoff must FAIL CLOSED to fallback, got kind %v", kind)
+	}
+	if reason != prBodyReasonHandoffUnreadable {
+		t.Errorf("reason = %q, want %q", reason, prBodyReasonHandoffUnreadable)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"pr_description_oversize"`) ||
+		!strings.Contains(out, legacyPullRequestDescriptionPath) {
+		t.Errorf("expected pr_description_oversize naming the legacy path, got %q", out)
+	}
+	if _, err := os.Stat(legacyPullRequestDescriptionPath); !os.IsNotExist(err) {
+		t.Errorf("oversize legacy handoff must be removed, stat err = %v", err)
+	}
+}
+
+// The *_oversize-AND-unremovable cases (#3106 fix-up). Each mirrors its plain
+// oversize sibling above but makes the sidecar's PARENT DIRECTORY non-writable
+// (chmod 0500) AFTER the oversize file is written, so the loader can still READ
+// the file (open-for-read needs only r-x on the dir) yet os.Remove FAILS. A
+// readable-but-unremovable file is a state an agent can construct — a parent
+// directory it denies write on — so the loader must SURFACE the failed cleanup
+// (`*_unremovable`) rather than swallow it, mirroring loadCounterfactualReport's
+// TestLoadCounterfactualReport_ConsumptionFailureIsSurfaced. This is the (a)-trap
+// case from the counterfactual rules: the RETURN value is byte-identical whether
+// or not the removal succeeded, so each assertion reads the LOG and the surviving
+// path — committed state — not the error. mustDenyParentWrites SKIPS the test on
+// a filesystem that does not enforce directory write permission (root), since
+// such a fixture would pass with the check deleted and so proves nothing.
+
+// TestLoadScopeExemptions_OversizeUnremovable: an oversize scope-justification
+// sidecar whose parent denies write fails closed (nil), emits BOTH
+// scope_justification_oversize AND scope_justification_unremovable, and survives.
+func TestLoadScopeExemptions_OversizeUnremovable(t *testing.T) {
+	cfg := exemptCfg()
+	path := writeSidecar(t, cfg,
+		`{"run_id":"run-aaaa","stage_id":"stage-bbbb","exemptions":[`+
+			`{"path":"a.go","reason":"`+oversizePad()+`"}]}`)
+	mustDenyParentWrites(t, path)
+
+	var logSink strings.Builder
+	if got := loadScopeExemptions(cfg, []string{"a.go"}, &logSink); len(got) != 0 {
+		t.Errorf("oversize sidecar must FAIL CLOSED, got %+v", got)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"scope_justification_oversize"`) {
+		t.Errorf("expected scope_justification_oversize, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"scope_justification_unremovable"`) || !strings.Contains(out, path) {
+		t.Errorf("a cleanup failure must be surfaced naming the path, got %q", out)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadFixupSelfReport_OversizeUnremovable: an oversize fix-up self-report
+// whose parent denies write fails closed (zero result), emits BOTH
+// fixup_selfreport_oversize AND fixup_selfreport_unremovable, and survives.
+func TestLoadFixupSelfReport_OversizeUnremovable(t *testing.T) {
+	cfg := fixupReportCfg()
+	path := writeFixupReportSidecar(t, cfg,
+		`{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":"passed",`+
+			`"obligations":[{"id":"ob-1","status":"met","record":"`+oversizePad()+`"}]}`)
+	mustDenyParentWrites(t, path)
+
+	var logSink strings.Builder
+	if got := loadFixupSelfReport(cfg, nil, &logSink); got.verifyStatus != "" || len(got.obligations) != 0 {
+		t.Errorf("oversize sidecar must FAIL CLOSED, got %+v", got)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"fixup_selfreport_oversize"`) {
+		t.Errorf("expected fixup_selfreport_oversize, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"fixup_selfreport_unremovable"`) || !strings.Contains(out, path) {
+		t.Errorf("a cleanup failure must be surfaced naming the path, got %q", out)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadFixupCommitMessage_OversizeUnremovable: an oversize fix-up commit-message
+// sidecar whose parent denies write fails closed (ok=false), emits BOTH
+// fixup_commitmsg_oversize AND fixup_commitmsg_unremovable, and survives.
+func TestLoadFixupCommitMessage_OversizeUnremovable(t *testing.T) {
+	cfg := fixupCommitMsgCfg()
+	path := writeFixupCommitMsgSidecar(t, cfg,
+		"fix: guard nil pool in retry path\n\n"+oversizePad())
+	mustDenyParentWrites(t, path)
+
+	var logSink strings.Builder
+	if _, _, ok := loadFixupCommitMessage(cfg, &logSink); ok {
+		t.Errorf("oversize sidecar must FAIL CLOSED (ok=false)")
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"fixup_commitmsg_oversize"`) {
+		t.Errorf("expected fixup_commitmsg_oversize, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"fixup_commitmsg_unremovable"`) || !strings.Contains(out, path) {
+		t.Errorf("a cleanup failure must be surfaced naming the path, got %q", out)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadImplementCommitMessage_OversizeUnremovable: an oversize initial-implement
+// commit-message sidecar whose parent denies write fails closed (ok=false), emits
+// BOTH implement_commitmsg_oversize AND implement_commitmsg_unremovable, survives.
+func TestLoadImplementCommitMessage_OversizeUnremovable(t *testing.T) {
+	cfg := implementCommitMsgCfg()
+	path := writeImplementCommitMsgSidecar(t, cfg,
+		"feat(runner): add minio-init target\n\n"+oversizePad())
+	mustDenyParentWrites(t, path)
+
+	var logSink strings.Builder
+	if _, _, ok := loadImplementCommitMessage(cfg, &logSink); ok {
+		t.Errorf("oversize sidecar must FAIL CLOSED (ok=false)")
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"implement_commitmsg_oversize"`) {
+		t.Errorf("expected implement_commitmsg_oversize, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"implement_commitmsg_unremovable"`) || !strings.Contains(out, path) {
+		t.Errorf("a cleanup failure must be surfaced naming the path, got %q", out)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadAgentAuthoredPR_OversizeKeyedUnremovable: an oversize KEYED PR handoff
+// whose parent denies write fails closed to the fallback with
+// prBodyReasonHandoffUnreadable, emits BOTH pr_description_oversize AND
+// pr_description_unremovable naming the keyed path, and survives.
+func TestLoadAgentAuthoredPR_OversizeKeyedUnremovable(t *testing.T) {
+	keyed := withPRDescriptionPath(t, "r", "s")
+	if err := os.WriteFile(keyed,
+		[]byte("feat(runner): add minio-init target\n\n"+oversizePad()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustDenyParentWrites(t, keyed)
+
+	var logSink strings.Builder
+	_, _, kind, reason := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &logSink)
+	if kind != prSourceFallback {
+		t.Errorf("oversize keyed handoff must FAIL CLOSED to fallback, got kind %v", kind)
+	}
+	if reason != prBodyReasonHandoffUnreadable {
+		t.Errorf("reason = %q, want %q", reason, prBodyReasonHandoffUnreadable)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"pr_description_oversize"`) {
+		t.Errorf("expected pr_description_oversize, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"pr_description_unremovable"`) || !strings.Contains(out, keyed) {
+		t.Errorf("a cleanup failure must be surfaced naming the keyed path, got %q", out)
+	}
+	if _, err := os.Lstat(keyed); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
+	}
+}
+
+// TestLoadAgentAuthoredPR_OversizeLegacyUnremovable: the LEGACY oversize branch is
+// a distinct removal site from the keyed one, so it earns its own case. With the
+// keyed path ABSENT, an oversize legacy handoff whose parent denies write fails
+// closed to the fallback, emits BOTH pr_description_oversize AND
+// pr_description_unremovable naming the legacy path, and survives.
+func TestLoadAgentAuthoredPR_OversizeLegacyUnremovable(t *testing.T) {
+	withPRDescriptionPath(t, "r", "s") // redirect dirs; keyed stays absent
+	if err := os.WriteFile(legacyPullRequestDescriptionPath,
+		[]byte("feat(runner): legacy handoff\n\n"+oversizePad()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustDenyParentWrites(t, legacyPullRequestDescriptionPath)
+
+	var logSink strings.Builder
+	_, _, kind, reason := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &logSink)
+	if kind != prSourceFallback {
+		t.Errorf("oversize legacy handoff must FAIL CLOSED to fallback, got kind %v", kind)
+	}
+	if reason != prBodyReasonHandoffUnreadable {
+		t.Errorf("reason = %q, want %q", reason, prBodyReasonHandoffUnreadable)
+	}
+	out := logSink.String()
+	if !strings.Contains(out, `"event":"pr_description_oversize"`) || !strings.Contains(out, legacyPullRequestDescriptionPath) {
+		t.Errorf("expected pr_description_oversize naming the legacy path, got %q", out)
+	}
+	if !strings.Contains(out, `"event":"pr_description_unremovable"`) || !strings.Contains(out, legacyPullRequestDescriptionPath) {
+		t.Errorf("a cleanup failure must be surfaced naming the legacy path, got %q", out)
+	}
+	if _, err := os.Lstat(legacyPullRequestDescriptionPath); err != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
 	}
 }

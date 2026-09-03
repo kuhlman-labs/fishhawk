@@ -451,6 +451,22 @@ truncated batch is never silent. The refusals you will actually hit:
   nothing else (a supersession check that could not finish is refused whatever
   it says).
 
+- `issue_set_resolution_timeout` (#3113) — the server's own bounded resolution
+  ran out of budget. The refusal NAMES how far it got (`resolved N of M`) and,
+  when a value could be **proven** to fit, a `grooming_order_limit=N` to retry
+  with. Take that number: it is the longest prefix of the ratified order that
+  fully resolved, so it provably fits. When the refusal says it could **not**
+  prove any count, bisect — halve `grooming_order_limit` and retry until the
+  campaign assembles — or raise the deploy's
+  `FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET` (default 120s, permitted maximum
+  10m; a value above the maximum refuses startup naming both numbers, and is
+  clamped to the maximum if it reaches the server by any other route).
+  This refusal is a SERVER decision carrying counts, not a client giving up:
+  before #3113 the MCP client's own 30s wall aborted first and you got a bare
+  `29999ms` transport error with nothing to act on. If you still see a bare
+  transport error on this path, that is a different fault — the client now
+  waits 11 minutes, above every permitted server budget.
+
 Cap the first batch and watch the first item land before trusting the queue.
 The alternative — walking the ranked list downward with individual
 `fishhawk_start_run` calls — respects the ordering, skips nothing, and is
