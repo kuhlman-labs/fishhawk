@@ -329,6 +329,43 @@ func TestNextActions_StateTable(t *testing.T) {
 			wantConsumes: []string{consumesNone, consumesNone, consumesNone},
 		},
 		{
+			// #3116: acceptance already IN FLIGHT (a spawn attempt exists, #1912).
+			// Offering fishhawk_dispatch_stage here would double-drive the stage
+			// and name a remedy the operator cannot take — the same
+			// inapplicable-instruction defect the arm exists to stop. Poll +
+			// defer, and still no fishhawk_fixup_stage.
+			name: "h_concerns_open_acceptance_running_polls_not_dispatch",
+			run:  naRun("running"),
+			stages: []Stage{
+				naStage("plan", "succeeded"),
+				naStage("implement", "succeeded"),
+				naStage("acceptance", "running"),
+				naStage("review", "pending"),
+			},
+			implRS:       naReviewStatus("implement", "complete"),
+			hint:         &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1},
+			wantState:    "implement_concerns_open_acceptance_pending",
+			wantActions:  []string{"fishhawk_get_run_status", "fishhawk_defer_concern"},
+			wantConsumes: []string{consumesNone, consumesNone},
+		},
+		{
+			// Same, with acceptance at `dispatched`: the second in-flight state
+			// must route to the identical poll-not-dispatch action set.
+			name: "h_concerns_open_acceptance_dispatched_polls_not_dispatch",
+			run:  naRun("running"),
+			stages: []Stage{
+				naStage("plan", "succeeded"),
+				naStage("implement", "succeeded"),
+				naStage("acceptance", "dispatched"),
+				naStage("review", "pending"),
+			},
+			implRS:       naReviewStatus("implement", "complete"),
+			hint:         &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1},
+			wantState:    "implement_concerns_open_acceptance_pending",
+			wantActions:  []string{"fishhawk_get_run_status", "fishhawk_defer_concern"},
+			wantConsumes: []string{consumesNone, consumesNone},
+		},
+		{
 			// #3116: same defect, no acceptance stage holding the gate — the review
 			// stage simply has not reached awaiting_approval. Poll + defer; still
 			// no fishhawk_fixup_stage.
@@ -3921,6 +3958,9 @@ func TestNextActions_GateClosedNeverOffersFixup(t *testing.T) {
 		naStage("review", "pending"),
 	}
 	withAcceptance := append(append([]Stage{}, base...), naStage("acceptance", "awaiting_host_dispatch"))
+	withInFlightAcceptance := func(state string) []Stage {
+		return append(append([]Stage{}, base...), naStage("acceptance", state))
+	}
 	hint := &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}
 
 	for _, tc := range []struct {
@@ -3929,6 +3969,8 @@ func TestNextActions_GateClosedNeverOffersFixup(t *testing.T) {
 		wantState string
 	}{
 		{"acceptance_pending", withAcceptance, "implement_concerns_open_acceptance_pending"},
+		{"acceptance_running", withInFlightAcceptance("running"), "implement_concerns_open_acceptance_pending"},
+		{"acceptance_dispatched", withInFlightAcceptance("dispatched"), "implement_concerns_open_acceptance_pending"},
 		{"gate_closed_no_acceptance", base, "implement_concerns_open_gate_closed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3949,7 +3991,8 @@ func TestNextActions_GateClosedNeverOffersFixup(t *testing.T) {
 		})
 	}
 
-	// The acceptance arm's first action dispatches the ACCEPTANCE stage.
+	// The acceptance arm's first action dispatches the ACCEPTANCE stage — but
+	// only while acceptance is still DISPATCHABLE.
 	na := nextActionsFor(naRun("running"), withAcceptance, nil, naReviewStatus("implement", "complete"), hint, nil, false, false, false, "", "", releaseSignals{})
 	first := na.Actions[0]
 	if first.Action != "fishhawk_dispatch_stage" {
@@ -3957,5 +4000,24 @@ func TestNextActions_GateClosedNeverOffersFixup(t *testing.T) {
 	}
 	if first.Params["stage"] != "acceptance" {
 		t.Errorf("first action stage param = %q, want acceptance", first.Params["stage"])
+	}
+
+	// Once acceptance is IN FLIGHT a spawn attempt already exists (#1912), so
+	// the arm must offer NO dispatch at all: "dispatch acceptance" is a remedy
+	// the operator cannot take, which is the #3116 defect on this surface.
+	for _, state := range []string{"dispatched", "running"} {
+		inFlight := nextActionsFor(naRun("running"), withInFlightAcceptance(state), nil, naReviewStatus("implement", "complete"), hint, nil, false, false, false, "", "", releaseSignals{})
+		for _, a := range inFlight.Actions {
+			if a.Action == "fishhawk_dispatch_stage" || a.Action == "fishhawk_run_stage" {
+				t.Errorf("acceptance %q: arm offers %q for a stage already in flight: %+v", state, a.Action, a)
+			}
+		}
+		poll := findAction(t, inFlight, "fishhawk_get_run_status")
+		if !strings.Contains(poll.Reason, "already in flight") {
+			t.Errorf("acceptance %q: poll reason does not say acceptance is already in flight: %q", state, poll.Reason)
+		}
+		if !strings.Contains(poll.Reason, "nothing to dispatch") {
+			t.Errorf("acceptance %q: poll reason does not rule out dispatching: %q", state, poll.Reason)
+		}
 	}
 }

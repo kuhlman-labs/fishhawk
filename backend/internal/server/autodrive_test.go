@@ -2719,11 +2719,15 @@ func TestAutoFixup_PendingReviewObservesInsteadOfFailing(t *testing.T) {
 	}
 
 	dispatched, err := s.autoFixup(context.Background(), campaignOperatorIdentity(), getRun(t, repo, runID), stages, open, "convergent_concerns")
-	if err != nil {
-		t.Fatalf("autoFixup err = %v, want nil (observe-only); a non-nil ErrFixupNotApplicable here becomes a 500 auto_drive_dispatch_failed", err)
-	}
+	// Sentinel identity is checked FIRST so the branch is live rather than
+	// unreachable behind the generic non-nil report: an ErrFixupNotApplicable
+	// escaping autoFixup is the specific defect (handleAutoDrive maps it to a
+	// 500 auto_drive_dispatch_failed), and it earns its own message.
 	if errors.Is(err, run.ErrFixupNotApplicable) {
-		t.Fatalf("autoFixup returned the raw ErrFixupNotApplicable sentinel: %v", err)
+		t.Fatalf("autoFixup returned the raw run.ErrFixupNotApplicable sentinel: %v — handleAutoDrive maps it to a 500 auto_drive_dispatch_failed; want nil (observe-only)", err)
+	}
+	if err != nil {
+		t.Fatalf("autoFixup err = %v, want nil (observe-only)", err)
 	}
 	if dispatched {
 		t.Error("dispatched = true, want false — the endpoint refuses a fix-up while the review stage is pending")

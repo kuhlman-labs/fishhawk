@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -1203,12 +1204,17 @@ func TestReviewActionHintFor_GateOrderingAnnotation(t *testing.T) {
 	}
 
 	const acceptanceSentence = "dispatch acceptance first"
+	const inFlightSentence = "wait for acceptance to settle rather than dispatching it"
 	const gateClosedSentence = "the review stage has not reached awaiting_approval"
 
-	// (1) Blocking acceptance stage -> the acceptance-first wording.
+	// (1) Blocking acceptance stage the operator can still DISPATCH -> the
+	// acceptance-first wording.
 	blocking := get(t, hintStages("succeeded", "pending", "awaiting_host_dispatch"))
 	if !strings.Contains(blocking.Message, acceptanceSentence) {
 		t.Errorf("message lacks the acceptance-first ordering sentence: %q", blocking.Message)
+	}
+	if strings.Contains(blocking.Message, inFlightSentence) {
+		t.Errorf("dispatchable acceptance drew the in-flight wait wording: %q", blocking.Message)
 	}
 	if !strings.Contains(blocking.Message, "the remaining fix-up budget above is preserved") {
 		t.Errorf("message does not say the budget survives the wait: %q", blocking.Message)
@@ -1228,6 +1234,34 @@ func TestReviewActionHintFor_GateOrderingAnnotation(t *testing.T) {
 	open := get(t, hintStages("succeeded", "awaiting_approval", "pending"))
 	if strings.Contains(open.Message, "the fix-up gate is not open yet") {
 		t.Errorf("gate-open hint carries the ordering annotation: %q", open.Message)
+	}
+
+	// (1b) Acceptance already IN FLIGHT -> the wait wording, and NEVER "dispatch
+	// acceptance first". A spawn attempt exists, so telling the operator to
+	// dispatch is a remedy they cannot take — #3116's own defect reproduced
+	// inside the message that fixes it. Both in-flight states are asserted
+	// because both reach the same branch and both must ship the same guidance.
+	for _, state := range []string{"dispatched", "running"} {
+		inFlight := get(t, hintStages("succeeded", "pending", state))
+		if !strings.Contains(inFlight.Message, inFlightSentence) {
+			t.Errorf("acceptance %q: message lacks the in-flight wait wording: %q", state, inFlight.Message)
+		}
+		if strings.Contains(inFlight.Message, acceptanceSentence) {
+			t.Errorf("acceptance %q: message tells the operator to dispatch a stage already in flight: %q", state, inFlight.Message)
+		}
+		if !strings.Contains(inFlight.Message, fmt.Sprintf("already in flight (state %q)", state)) {
+			t.Errorf("acceptance %q: message does not name the observed state: %q", state, inFlight.Message)
+		}
+		if !strings.Contains(inFlight.Message, "the remaining fix-up budget above is preserved") {
+			t.Errorf("acceptance %q: message does not say the budget survives the wait: %q", state, inFlight.Message)
+		}
+		if !strings.HasPrefix(inFlight.Message, open.Message) {
+			t.Errorf("acceptance %q: annotated message is not the base message plus a suffix:\n base = %q\n got  = %q", state, open.Message, inFlight.Message)
+		}
+		if inFlight.RemainingFixupBudget != open.RemainingFixupBudget {
+			t.Errorf("acceptance %q: RemainingFixupBudget = %d, want %d — the budget must still be reported",
+				state, inFlight.RemainingFixupBudget, open.RemainingFixupBudget)
+		}
 	}
 
 	// (4) A nil/empty stages slice degrades to the un-annotated message — an

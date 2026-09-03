@@ -248,6 +248,18 @@ func blockingAcceptanceStage(stages []Stage) *Stage {
 	return nil
 }
 
+// acceptanceIsDispatchable reports whether a blocking acceptance stage is one
+// the operator can still DISPATCH (no spawn attempt exists yet) rather than one
+// already in flight, which they can only WAIT on. Mirrors
+// run.acceptanceIsDispatchable (backend/internal/run/fixup.go). KEEP IN SYNC:
+// the endpoint refusal and this hint must name the SAME remedy for the same
+// acceptance state, because naming a remedy the operator cannot act on is the
+// very defect #3116 exists to stop — and "dispatch acceptance first" is exactly
+// that once a runner is already in flight.
+func acceptanceIsDispatchable(state string) bool {
+	return state == "pending" || state == "awaiting_host_dispatch"
+}
+
 // gateClosedActions is the action set for the two #3116 arms: open implement
 // concerns while the fix-up gate is NOT open. Deliberately carries NO
 // fishhawk_fixup_stage entry — the endpoint refuses it in this window, and
@@ -257,6 +269,17 @@ func blockingAcceptanceStage(stages []Stage) *Stage {
 // the gate opens.
 func (h *ReviewActionHint) gateClosedActions(run *Run, acceptance *Stage) []SuggestedAction {
 	if acceptance != nil {
+		if !acceptanceIsDispatchable(acceptance.State) {
+			// dispatched / running: a spawn attempt already exists (#1912), so a
+			// dispatch action would double-drive the stage AND name a remedy the
+			// operator cannot take. Poll instead, mirroring the acceptance_running /
+			// acceptance_dispatched arms of acceptanceStageNextActions.
+			return []SuggestedAction{
+				pollAction(run, derivedStageWaitPollInterval(run, acceptance),
+					fmt.Sprintf("%d open concern(s) from the implement review, but the review gate opens only after the acceptance stage settles — acceptance is already in flight (state %q), so there is nothing to dispatch; re-poll until it goes terminal, then route the concerns back (the fix-up budget is not consumed by waiting)", h.Concerns, acceptance.State)),
+				deferConcernAction(h.Concerns),
+			}
+		}
 		return append(dispatchOrPollActions(run, "acceptance", acceptance), deferConcernAction(h.Concerns))
 	}
 	return []SuggestedAction{
@@ -578,7 +601,16 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 		review := stageByType(stages, "review")
 		if !fixupGateOpen(impl, review) {
 			if acc := blockingAcceptanceStage(stages); acc != nil {
-				hint.Message += " NOTE: the fix-up gate is not open yet — the review gate opens after the acceptance stage settles, so dispatch acceptance first; the remaining fix-up budget above is preserved and the route-back is available once the review stage parks at awaiting_approval."
+				// Split by what the operator can actually DO, exactly as the endpoint
+				// refusal does (run.findOpenReviewStage): a dispatchable acceptance
+				// stage gets "dispatch acceptance first", one already in flight gets
+				// "wait for acceptance to settle". A single sentence would reproduce
+				// #3116's own defect inside the message that fixes it.
+				if acceptanceIsDispatchable(acc.State) {
+					hint.Message += " NOTE: the fix-up gate is not open yet — the review gate opens after the acceptance stage settles, so dispatch acceptance first; the remaining fix-up budget above is preserved and the route-back is available once the review stage parks at awaiting_approval."
+				} else {
+					hint.Message += fmt.Sprintf(" NOTE: the fix-up gate is not open yet — the review gate opens after the acceptance stage settles, and acceptance is already in flight (state %q), so wait for acceptance to settle rather than dispatching it; the remaining fix-up budget above is preserved and the route-back is available once the review stage parks at awaiting_approval.", acc.State)
+				}
 			} else {
 				hint.Message += " NOTE: the fix-up gate is not open yet — the review stage has not reached awaiting_approval, so fishhawk_fixup_stage refuses until it does."
 			}
