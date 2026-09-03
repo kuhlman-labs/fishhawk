@@ -72,7 +72,20 @@ The publisher (`backend/internal/auditcheckpublisher`) mirrors the state to the 
 
 ## Republish on drift
 
-`pull_request.synchronize` webhooks fire `server/pullrequest_synchronize.go::republishOnSynchronize`, which looks up the matching Fishhawk run via `runs.pull_request_url` (#216) and re-runs Compute + publish so branch protection sees the drift immediately rather than waiting for the next SPA visit. Falls open (returns pass) when `ArtifactRepo` or `AuditRepo` aren't wired — same posture as the other check-derivation paths.
+`pull_request` webhooks with action `opened`, `reopened` or `synchronize` fire `server/pullrequest_synchronize.go::republishOnPullRequestEvent`, which looks up the matching Fishhawk run via `runs.pull_request_url` (#216) and re-runs Compute + publish so branch protection sees the drift immediately rather than waiting for the next SPA visit. Falls open (returns pass) when `ArtifactRepo` or `AuditRepo` aren't wired — same posture as the other check-derivation paths.
+
+`opened` / `reopened` were added in E64.43 (#3160); before that only `synchronize` was routed, which meant a PR never pushed to after opening (the Dependabot shape) received no publish at all. Routing the extra actions is safe for the run-BEARING path because the publisher's per-`(forge, repo, head_sha)` dedup cache makes a repeat at the same head a no-op.
+
+## Every PR class receives a terminal check (E64.43 / #3160)
+
+Once `fishhawk_audit_complete` is marked a **Required** status check, a PR that never gets the context published is blocked forever. Since #3160 the contract is complete:
+
+- A **run-bearing** PR goes through the existing `ComputeResult` + `publishAuditCheck` path and receives `in_progress` → `success` / `failure` exactly as before.
+- A **run-less** PR — Dependabot, a human hotfix, an operator-authored docs PR — receives a terminal `completed` / `neutral` Check Run via `auditcheckpublisher.PublishNotApplicable`, whose summary states plainly that no Fishhawk run is associated with the PR and the audit gate does not apply. GitHub treats `success`, `neutral` and `skipped` as satisfying a required context, and `neutral` stays honest that nothing was verified.
+
+**What keeps a Fishhawk-managed PR out of the run-less path** is the App-identity discriminator in `server/pullrequest_synchronize.go::authoredByFishhawkApp`. Zero runs on a PR is not by itself proof the PR is foreign: an `opened` webhook for a Fishhawk-managed PR can arrive before `runs.pull_request_url` is denormalized. So before publishing not-applicable the handler must positively establish the PR was neither opened nor pushed by Fishhawk's own App — matching the App's own `<app-slug>[bot]` login (resolved from `GET /app`, never a hardcoded literal) case-insensitively against BOTH the PR author and the event sender.
+
+The guard is **fail-closed in both directions**: an unresolvable App identity publishes nothing and logs at WARN, and a `ListRuns` error publishes nothing (an error is not evidence of zero runs). The direction is deliberate — a missing publish leaves a PR blocked, which an admin merge recovers; a wrong publish greens a real audit gate silently, which nothing recovers. Long-form contract, including the stated residuals: `backend/internal/server/README.md` and `backend/internal/auditcheckpublisher/README.md`.
 
 ## Reconcile sweep
 
