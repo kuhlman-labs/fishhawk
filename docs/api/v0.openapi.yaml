@@ -13736,6 +13736,21 @@ paths:
             SEPARATE **review** stage is still parked at `awaiting_approval`
             (the PR is open, not merged). Refused once the review stage has
             merged/resolved, or when the run has no review stage.
+
+            A workflow that orders **acceptance BEFORE review** (the shipped
+            `feature_change` shape: plan -> implement -> acceptance ->
+            review) leaves the review stage at `pending` until acceptance
+            settles, so a fix-up in that window is refused with
+            `fixup_not_applicable` (#3116) — this is a normal, transient
+            state, not an error in the run. The refusal message names the
+            REMEDY rather than only the unmet precondition, and splits by
+            what the operator can actually do: it says to **dispatch the
+            acceptance stage** when acceptance is still dispatchable
+            (`pending` / `awaiting_host_dispatch`), and to **wait for
+            acceptance to settle** when it is already in flight
+            (`dispatched` / `running`). Waiting consumes NO fix-up budget;
+            re-route the concerns once the review stage reaches
+            `awaiting_approval`.
         - on the deprecated positional path, the stage must carry a
           recorded **`approve_with_concerns`** implement-review verdict
           (the concern set the `concerns` indices address). With no

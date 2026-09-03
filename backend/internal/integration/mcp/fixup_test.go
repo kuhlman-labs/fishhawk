@@ -3345,3 +3345,153 @@ func TestE2E_Fixup_SucceededPassCarriesNoRecoveryMarker(t *testing.T) {
 		t.Errorf("get_run_status carried a fixup_recovered marker for a fix-up that LANDED: %+v", status.ImplementStageWaitStatus.FixupRecovered)
 	}
 }
+
+// TestE2E_Fixup_AcceptancePendingRefusesAndSurfacesRemedy is the #3116
+// cross-boundary done-means, spanning concern store → run HTTP → MCP hint →
+// next_actions classifier → the REAL fix-up endpoint. It seeds the exact
+// topology the defect lives in — plan succeeded, implement SUCCEEDED, an
+// acceptance stage NOT settled, a review stage NOT yet at its gate, and open
+// implement-stage concerns in the durable store — then asserts AT ONE INSTANT
+// that all three surfaces tell one story:
+//
+//	(a) next_actions recommends DISPATCHING ACCEPTANCE and offers NO
+//	    fishhawk_fixup_stage (the classifier no longer names a refused verb);
+//	(b) review_action_hint still reports the surviving remaining_fixup_budget
+//	    and its message names dispatching acceptance first;
+//	(c) a REAL fishhawk_fixup_stage call at that moment is refused
+//	    fixup_not_applicable with a message naming the SAME remedy.
+//
+// Per-layer units pass while exactly this seam breaks (cf. #618): the
+// classifier's mirror and the endpoint's predicate are in different packages,
+// and the disagreement between them IS the bug.
+func TestE2E_Fixup_AcceptancePendingRefusesAndSurfacesRemedy(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	concernRepo := concern.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ConcernRepo:  concernRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	mkStage := func(seq int, typ runpkg.StageType) *runpkg.Stage {
+		t.Helper()
+		st, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+			RunID:            fx.runID,
+			Sequence:         seq,
+			Type:             typ,
+			ExecutorKind:     runpkg.ExecutorAgent,
+			ExecutorRef:      "fishhawk/runner@v1",
+			RequiresApproval: typ != runpkg.StageTypeAcceptance,
+		})
+		if err != nil {
+			t.Fatalf("CreateStage %s: %v", typ, err)
+		}
+		return st
+	}
+
+	// The feature_change topology: acceptance ordered BEFORE review. Seeded BY
+	// CONSTRUCTION — the plan and implement stages are walked to succeeded, the
+	// acceptance and review stages are left in their creation state (pending), so
+	// a counterfactual RED lands on a behavioral assertion, not on fixture setup.
+	plan := mkStage(1, runpkg.StageTypePlan)
+	walkToSucceeded(t, ctx, fx.runRepo, plan.ID)
+	impl := mkStage(2, runpkg.StageTypeImplement)
+	walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+	mkStage(3, runpkg.StageTypeAcceptance)
+	mkStage(4, runpkg.StageTypeReview)
+
+	// The implement review landed approve_with_concerns, in BOTH the audit and
+	// the durable store (the authoritative open set).
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "guard the nil stage"})
+	if _, err := concernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID:                fx.runID,
+		StageID:              impl.ID,
+		StageKind:            concern.StageKindImplement,
+		ReviewerModel:        "claude-opus-4-8",
+		OriginReviewSequence: 1,
+		Concerns:             []concern.RaisedConcern{{Severity: "medium", Category: "scope", Note: "guard the nil stage"}},
+	}); err != nil {
+		t.Fatalf("InsertRaised: %v", err)
+	}
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	// (a) next_actions points at acceptance and offers NO fix-up verb.
+	na := getNextActions(t, ctx, session, fx.runID)
+	if na == nil || na.State != "implement_concerns_open_acceptance_pending" {
+		t.Fatalf("next_actions = %+v, want state implement_concerns_open_acceptance_pending", na)
+	}
+	if len(na.Actions) == 0 {
+		t.Fatal("next_actions carries zero actions")
+	}
+	// The first action must point at the ACCEPTANCE stage. Its exact shape is
+	// runner-kind-dependent (dispatchOrPollActions offers fishhawk_dispatch_stage
+	// on a local run and a poll on a github_actions one, which auto-dispatches);
+	// this fixture's run carries the default kind, so the assertion is on WHICH
+	// stage the action names, not on the verb. The unit-layer cases
+	// (TestNextActions_GateClosedNeverOffersFixup,
+	// TestGetRunStatus_NextActions_ConcernsOpenAcceptancePending) pin the
+	// local-run fishhawk_dispatch_stage(stage=acceptance) shape exactly.
+	if first := na.Actions[0]; first.Params["stage"] != "acceptance" && !strings.Contains(first.Reason, "acceptance stage") {
+		t.Errorf("first action = %+v, want one naming the acceptance stage", first)
+	}
+	var sawDefer bool
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_fixup_stage" {
+			t.Errorf("next_actions offers fishhawk_fixup_stage while the endpoint refuses it — the #3116 defect: %+v", a)
+		}
+		if a.Action == "fishhawk_defer_concern" {
+			sawDefer = true
+		}
+	}
+	if !sawDefer {
+		t.Errorf("next_actions dropped fishhawk_defer_concern, which is legal now and spends no fix-up budget: %+v", na.Actions)
+	}
+
+	// (b) The hint reports the SURVIVING budget and names the ordering remedy.
+	hint := getReviewActionHint(t, ctx, session, fx.runID)
+	if hint == nil {
+		t.Fatal("review_action_hint absent; the budget must still be reported while the gate is closed")
+	}
+	if hint.RemainingFixupBudget != 1 {
+		t.Errorf("review_action_hint.remaining_fixup_budget = %d, want 1 — waiting for acceptance must not consume budget", hint.RemainingFixupBudget)
+	}
+	if !strings.Contains(hint.Message, "dispatch acceptance first") {
+		t.Errorf("review_action_hint.message does not name the ordering remedy: %q", hint.Message)
+	}
+
+	// (c) The REAL endpoint refuses at that same moment, naming the same remedy.
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"reason":   "route the scope concern back",
+			"concerns": []int{0},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("fishhawk_fixup_stage SUCCEEDED while the review gate is closed; the endpoint must refuse fixup_not_applicable")
+	}
+	refusal := toolContentString(t, res)
+	if !strings.Contains(refusal, "fixup_not_applicable") {
+		t.Errorf("refusal does not carry the fixup_not_applicable code: %s", refusal)
+	}
+	if !strings.Contains(refusal, "acceptance stage") || !strings.Contains(refusal, "Dispatch the acceptance stage") {
+		t.Errorf("refusal does not name the same remedy the surfaces do: %s", refusal)
+	}
+}

@@ -184,6 +184,18 @@ The operator verb for routing one or more *advisory* implement-review concerns (
 
 It refuses with `ErrFixupNotApplicable` (non-implement stage / wrong state / no recorded concerns → 422 `fixup_not_applicable`) or `ErrFixupBudgetExhausted` (the NORMAL bounded pass count is spent → 422 `fixup_budget_exhausted`).
 
+**The `fixup_not_applicable` refusal names the REMEDY, not only the unmet precondition (#3116).** `findOpenReviewStage` admits a review stage at `awaiting_approval` ALONE, so in a workflow that orders acceptance BEFORE review (the shipped `feature_change` shape) a succeeded implement stage sits with its review stage still `pending` — a normal, transient window in which the generic "the review gate is not open" sentence told the operator nothing actionable. The blocker is now CLASSIFIED into four branches, each with its own test in `fixup_test.go` asserting the shipped text (the sentinel and the 422 code are unchanged on every branch):
+
+| Branch | Condition | What the message says |
+|---|---|---|
+| (a) acceptance blocking, dispatchable | a non-terminal acceptance stage at `pending` / `awaiting_host_dispatch` | names the acceptance stage + its state, and says to **dispatch** it, let it settle, then route the fix-up — waiting consumes no budget |
+| (a') acceptance blocking, in flight | the same stage at `dispatched` / `running` | says acceptance is **already in flight** and to **wait** for it to settle — "dispatch acceptance" would be advice the operator cannot act on, which is the very defect #3116 exists to stop |
+| (b) gate not open, no acceptance | review present and non-terminal, no blocking acceptance stage | says the gate opens when the preceding stages settle — re-poll, and does NOT name a stage the run does not have |
+| (c) review already resolved | review terminal (`succeeded`/`failed`/`cancelled`/`superseded`) | today's already-resolved wording — the gate is closed for good, so the remedy is a fresh run |
+| (d) no review stage | the run declares none | says so, and points at a fresh run |
+
+`blockingAcceptanceStage` (a non-terminal acceptance stage, else nil) and `acceptanceIsDispatchable` (spawn-attempt-free states) are the two predicates the split reads. The MCP surfaces mirror this rule in `mcpserver.fixupGateOpen` under a KEEP IN SYNC comment; `backend/internal/integration/mcp/fixup_test.go` is the machine check that the mirror and this endpoint still agree.
+
 **#860 bounded operator override**: the request's `force_additional_pass: bool` (threaded into `FixupOptions.ForceAdditionalPass`, with `HardCeiling: defaultFixupCeiling == 3` supplied by the handler) grants ONE pass beyond the normal budget — audited via a `forced` flag on the `stage_fixup_triggered` entry — hard-capped at 3 total passes. At the ceiling `FixupStage` returns the DISTINCT `ErrFixupCeilingReached` → 422 `fixup_ceiling_reached` (the handler arm is ordered before `fixup_budget_exhausted` so it is not masked).
 
 The MCP `review_action_hint` (`backend/cmd/fishhawk-mcp/review_action_hint.go`) no longer suppresses on a spent budget when concerns remain: it surfaces the exhaustion plus `OverrideAvailable` and counts only the LATEST review round's concerns (scoped by the most-recent `stage_fixup_triggered` audit sequence).
