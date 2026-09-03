@@ -752,6 +752,35 @@ precedence pin, the wire-fixture equality and the emitter-fidelity decode), and
 `mcpserver/client_test.go` (`TestHostDispatchStage_WireShape`: the fixture-bytes
 decode and the `wave_not_integrated` annotation).
 
+## Run-less `fishhawk_audit_complete` publish + App-identity discriminator (`pullrequest_synchronize.go` / `webhook.go`, E64.43 / [#3160](https://github.com/kuhlman-labs/fishhawk/issues/3160))
+
+`republishOnPullRequestEvent` (renamed from `republishOnSynchronize`) is the `pull_request` webhook consumer that re-drives the audit-complete Compute + publish flow. Two changes here.
+
+**Widened dispatch.** `webhook.go` routes `opened`, `reopened` AND `synchronize` (`isAuditRepublishAction`), not `synchronize` alone. A Dependabot PR that is never pushed to after opening emits NO `synchronize` at all, so under the old condition it received no publish whatsoever — and once the check is marked Required in branch protection, it stayed blocked forever on a context nothing would post. The run-BEARING path is idempotent under the extra events: the publisher's per-`(forge, repo, head_sha)` dedup cache suppresses a repeat at the same head. No other action is routed; `edited` / `labeled` must NOT reach the handler, and that negative is pinned by the same table that pins the positives.
+
+**Run-less publish.** When `ListRuns` returns zero runs the handler now publishes a terminal `neutral` not-applicable Check Run (`auditcheckpublisher.PublishNotApplicable`) instead of no-oping, so the required context is satisfiable on every PR class. The handler takes `webhook.Event` rather than raw bytes because it needs `Sender` / `Repo` / `InstallationID`, which the raw-bytes signature does not carry; the credential scope is `forge.FromGitHubInstallationID(ev.InstallationID)` (`webhook.Event.credentialScope` is unexported).
+
+### The App-identity discriminator — FAIL CLOSED
+
+The publish is gated on `authoredByFishhawkApp`, which must **positively establish** the PR was neither opened nor pushed by Fishhawk's own GitHub App. Without it there is a false-green race: an `opened` webhook for a Fishhawk-managed PR can arrive before `runs.pull_request_url` is denormalized, `ListRuns` returns zero, and a `neutral` check would green an audit gate that was never verified. A stranded `in_progress` fails SAFE under a required context; a stranded `neutral` fails **OPEN**.
+
+- The App's own bot login is resolved through the existing memoized `resolveAppBotIdentity` (`prompt.go`), whose `name` return IS `<app-slug>[bot]`, derived from the App's own `GET /app` slug. **No login literal is hardcoded** — a self-hosted install running under a different App resolves ITS OWN slug.
+- The comparison is case-insensitive against **BOTH** the PR author (`pull_request.user.login`) and the event sender. The AUTHOR covers a Fishhawk-opened PR later reopened or pushed by someone else; the SENDER covers a fix-up push our App makes to a PR whose run row is not yet denormalized. A match on either means **no** not-applicable publish.
+- **An UNRESOLVABLE identity also means no publish.** `authoredByFishhawkApp` returns `(isOurs, resolved)`; a false `isOurs` under a false `resolved` is "unknown", never "not ours". The caller logs at **WARN** — `zero runs but App identity unresolvable — not publishing not-applicable` — which is what makes the residual operator-visible. The trade is deliberate: a missing publish leaves the PR blocked (today's behaviour, recoverable with `gh pr merge <n> --admin`), while a wrong publish greens a real audit gate silently and is not recoverable.
+- The `ListRuns` **error** path is unchanged and equally fail-closed: an error is not evidence of zero runs, so it logs and returns without reaching the publish.
+
+**Residual, stated not asserted away.** `resolveAppBotIdentity` needs BOTH `GetApp` AND `GetUser` to succeed (it builds a commit email as well as a login), so an App whose `GetApp` works but whose `GetUser` fails yields an empty login and — under the fail-closed rule — **no not-applicable publishes at all**, leaving non-Fishhawk PRs blocked. A narrower `GetApp`-only resolver would shrink that residual but needs new memo fields on the `Server` struct. Resolution memoization is success-only, so the steady-state cost is one round-trip per daemon start and a transient failure is retried on the next event.
+
+**State alternation (reviewer-raised residual, not foreclosed by a contract).** The publisher's dedup cache is keyed on state VALUE, so a not-applicable publish is not suppressed by an earlier real pass at the same head — and GitHub surfaces the NEWEST check run of a given name. In principle, a zero-run event arriving at a head where a real pass was already cached would post a `neutral` row that visually supersedes the verified pass. Two things make it unreachable in practice rather than merely unlikely: the ListRuns-error path never publishes, and the discriminator refuses any PR our App authored or pushed — so reaching it requires a PR that HAD a run when the pass was computed and has zero runs on a later event, with a non-Fishhawk author AND a non-Fishhawk sender. That is not a contract, so it is named here rather than left unstated. If it is ever observed, the fix is to skip the not-applicable publish when the dedup cache already holds a real state for that head.
+
+**Durable follow-up.** The structurally stronger fix is a head-SHA-indexed run lookup, but `run.ListRunsFilter` carries no head-SHA field, so adding one touches `run/repository.go`, `run/postgres.go`, `queries.sql` and the sqlc-generated `db/` package — outside this change's scope. The App-identity discriminator is the shipped control.
+
+### What the tests pin
+
+Per-layer handler tests drive the REAL `republishOnPullRequestEvent` against a real `auditcheckpublisher.Publisher` over a recording forge fake and an `appIdentityGetterOverride` stub: foreign author → EXACTLY ONE neutral publish across all three actions; own-App author → ZERO; own-App sender → ZERO; unresolvable identity (`GetApp` errors, `GetUser` errors, GitHub entirely unwired) → ZERO in all three; `ListRuns` error → ZERO; malformed payload / empty PR URL / empty head SHA / unparseable repo / zero installation id → ZERO; and the unaffected-path pin, a PR WITH a run publishing its computed state and never the not-applicable conclusion.
+
+`TestWebhook_PullRequestActionRouting_NotApplicable` is the CROSS-BOUNDARY test: it POSTs a request the test signs itself, in-process, to the real `POST /webhooks/github` route, so signature verify → `webhook.ParseEvent` → the dispatch condition → the handler → the publisher → the forge fake all execute (no live forge, no live delivery). It is not redundant with the per-layer tests: with the dispatch narrowed back to `synchronize`, every per-layer test still PASSES and only this table goes red — the seam the units structurally cannot cover.
+
 ## Run-branch operator-vouch remediation (ADR-035 / #1044)
 
 `vouch.go::handleVouchCommit` — route

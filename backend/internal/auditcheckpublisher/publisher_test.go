@@ -1683,3 +1683,253 @@ func TestPublishResultAtHeadOverrideDedupsAtOverride(t *testing.T) {
 		t.Errorf("expected 1 forge call (dedup on the overridden head), got %d", len(gh.calls))
 	}
 }
+
+// --- E64.43 / #3160: the run-less not-applicable publish ---
+
+// notApplicablePublisher builds a Publisher whose GitHub fake is
+// returned for assertion. Unlike happyDeps it seeds NO run and NO
+// artifact: the run-less path must never touch either.
+func notApplicablePublisher(t *testing.T) (*fakeGitHub, *auditcheckpublisher.Publisher) {
+	t.Helper()
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{},
+		Artifacts:   &fakeArtifacts{},
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+	return gh, pub
+}
+
+func naRepo() forge.RepoRef { return forge.RepoRef{Owner: "x", Name: "y"} }
+
+func naScope() forge.CredentialScope { return forge.FromGitHubInstallationID(42) }
+
+func TestPublishNotApplicable_PublishesNeutralCompleted(t *testing.T) {
+	gh, pub := notApplicablePublisher(t)
+
+	published, err := pub.PublishNotApplicable(context.Background(), naRepo(), naScope(), "deadbeef")
+	if err != nil {
+		t.Fatalf("PublishNotApplicable: %v", err)
+	}
+	if !published {
+		t.Fatal("published = false, want true")
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("CreateCheckRun calls = %d, want 1", len(gh.calls))
+	}
+	p := gh.calls[0].params
+	if p.Name != auditcheckpublisher.CheckName {
+		t.Errorf("name = %q, want %q", p.Name, auditcheckpublisher.CheckName)
+	}
+	if p.HeadSHA != "deadbeef" {
+		t.Errorf("head_sha = %q, want deadbeef", p.HeadSHA)
+	}
+	if p.Status != forge.CheckRunStatusCompleted {
+		t.Errorf("status = %q, want completed", p.Status)
+	}
+	if p.Conclusion != forge.CheckRunConclusionNeutral {
+		t.Errorf("conclusion = %q, want neutral", p.Conclusion)
+	}
+	if p.DetailsURL != "https://app.fishhawk.example.com" {
+		t.Errorf("details_url = %q, want the external-URL root", p.DetailsURL)
+	}
+	if p.OutputTitle != "Not a Fishhawk-managed change" {
+		t.Errorf("output_title = %q", p.OutputTitle)
+	}
+	if !strings.Contains(p.OutputSummary, "No Fishhawk run is associated with this pull request") {
+		t.Errorf("summary lacks the not-applicable wording: %q", p.OutputSummary)
+	}
+	// The summary must never read as an audit PASS.
+	if strings.Contains(p.OutputSummary, "audit chain verifies") {
+		t.Errorf("summary contains the PASS phrase %q: %q", "audit chain verifies", p.OutputSummary)
+	}
+	if gh.calls[0].repo != naRepo() {
+		t.Errorf("repo = %+v, want %+v", gh.calls[0].repo, naRepo())
+	}
+	if gh.calls[0].scope != naScope() {
+		t.Errorf("scope = %+v, want %+v", gh.calls[0].scope, naScope())
+	}
+}
+
+func TestPublishNotApplicable_NilReceiver(t *testing.T) {
+	var pub *auditcheckpublisher.Publisher
+	published, err := pub.PublishNotApplicable(context.Background(), naRepo(), naScope(), "deadbeef")
+	if published || err != nil {
+		t.Fatalf("nil receiver = (%v, %v), want (false, nil)", published, err)
+	}
+}
+
+func TestPublishNotApplicable_GuardModes(t *testing.T) {
+	cases := []struct {
+		name    string
+		repo    forge.RepoRef
+		scope   forge.CredentialScope
+		headSHA string
+	}{
+		{"empty owner", forge.RepoRef{Owner: "", Name: "y"}, naScope(), "deadbeef"},
+		{"empty name", forge.RepoRef{Owner: "x", Name: ""}, naScope(), "deadbeef"},
+		{"empty head sha", naRepo(), naScope(), ""},
+		{"whitespace head sha", naRepo(), naScope(), "   \t\n "},
+		{"zero credential scope", naRepo(), forge.CredentialScope{}, "deadbeef"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gh, pub := notApplicablePublisher(t)
+			published, err := pub.PublishNotApplicable(context.Background(), tc.repo, tc.scope, tc.headSHA)
+			if published || err != nil {
+				t.Errorf("= (%v, %v), want (false, nil)", published, err)
+			}
+			if len(gh.calls) != 0 {
+				t.Errorf("CreateCheckRun calls = %d, want 0", len(gh.calls))
+			}
+		})
+	}
+}
+
+func TestPublishNotApplicable_DedupSuppressesSecondPublishAtSameHead(t *testing.T) {
+	gh, pub := notApplicablePublisher(t)
+	ctx := context.Background()
+
+	first, err := pub.PublishNotApplicable(ctx, naRepo(), naScope(), "deadbeef")
+	if err != nil || !first {
+		t.Fatalf("first publish = (%v, %v), want (true, nil)", first, err)
+	}
+	second, err := pub.PublishNotApplicable(ctx, naRepo(), naScope(), "deadbeef")
+	if err != nil {
+		t.Fatalf("second publish err = %v", err)
+	}
+	if second {
+		t.Error("second publish at the same head returned true, want dedup-suppressed")
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("CreateCheckRun calls = %d, want 1 (deduped)", len(gh.calls))
+	}
+}
+
+// TestPublishNotApplicable_SentinelDoesNotSuppressRealState pins the
+// load-bearing invariant that the package-local not-applicable sentinel
+// shares the dedup cache with real states at the same (forge, repo,
+// head_sha) key WITHOUT either suppressing the other. Asserted in BOTH
+// orders — the test that fails if the sentinel is ever collapsed into an
+// existing stagecheck enum member.
+func TestPublishNotApplicable_SentinelDoesNotSuppressRealState(t *testing.T) {
+	const head = "abc123"
+
+	t.Run("not_applicable then real pass", func(t *testing.T) {
+		runID, gh, pub := happyDeps(t) // seeds run x/y with head abc123
+		ctx := context.Background()
+
+		if ok, err := pub.PublishNotApplicable(ctx, naRepo(), naScope(), head); err != nil || !ok {
+			t.Fatalf("not-applicable publish = (%v, %v), want (true, nil)", ok, err)
+		}
+		published, err := pub.Publish(ctx, runID, stagecheck.StatePass, nil)
+		if err != nil {
+			t.Fatalf("pass publish: %v", err)
+		}
+		if !published {
+			t.Fatal("a real StatePass at the same head was SUPPRESSED by the not-applicable sentinel")
+		}
+		if len(gh.calls) != 2 {
+			t.Fatalf("CreateCheckRun calls = %d, want 2", len(gh.calls))
+		}
+		if gh.calls[1].params.Conclusion != forge.CheckRunConclusionSuccess {
+			t.Errorf("second conclusion = %q, want success", gh.calls[1].params.Conclusion)
+		}
+	})
+
+	t.Run("real pass then not_applicable", func(t *testing.T) {
+		runID, gh, pub := happyDeps(t)
+		ctx := context.Background()
+
+		if ok, err := pub.Publish(ctx, runID, stagecheck.StatePass, nil); err != nil || !ok {
+			t.Fatalf("pass publish = (%v, %v), want (true, nil)", ok, err)
+		}
+		published, err := pub.PublishNotApplicable(ctx, naRepo(), naScope(), head)
+		if err != nil {
+			t.Fatalf("not-applicable publish: %v", err)
+		}
+		if !published {
+			t.Fatal("a not-applicable publish at the same head was SUPPRESSED by the real pass")
+		}
+		if len(gh.calls) != 2 {
+			t.Fatalf("CreateCheckRun calls = %d, want 2", len(gh.calls))
+		}
+		if gh.calls[1].params.Conclusion != forge.CheckRunConclusionNeutral {
+			t.Errorf("second conclusion = %q, want neutral", gh.calls[1].params.Conclusion)
+		}
+	})
+}
+
+// TestPublishNotApplicable_CreateCheckRunError asserts the error is
+// RETURNED and that the run-less path opens NO degraded episode — the
+// deliberate omission from the method's contract is observable, not just
+// claimed. The episode side is proved absent by wiring OnDegraded and
+// driving DefaultDegradedThreshold+1 consecutive failures: the real
+// Publish path would have fired it; this one must not.
+func TestPublishNotApplicable_CreateCheckRunError(t *testing.T) {
+	rec := &episodeCalls{}
+	gh := &fakeGitHub{err: errors.New("boom")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{},
+		Artifacts:   &fakeArtifacts{},
+		ExternalURL: "https://app.fishhawk.example.com",
+		OnDegraded:  rec.onDegraded,
+		OnRecovered: rec.onRecovered,
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+	ctx := context.Background()
+
+	for i := 0; i < auditcheckpublisher.DefaultDegradedThreshold+1; i++ {
+		published, err := pub.PublishNotApplicable(ctx, naRepo(), naScope(), "deadbeef")
+		if published {
+			t.Fatalf("attempt %d: published = true on a failing forge", i)
+		}
+		if err == nil {
+			t.Fatalf("attempt %d: err = nil, want the CreateCheckRun failure", i)
+		}
+		if !strings.Contains(err.Error(), "boom") {
+			t.Errorf("attempt %d: err = %v, want it to wrap the forge error", i, err)
+		}
+	}
+	if got := rec.degradedCalls(); len(got) != 0 {
+		t.Errorf("OnDegraded fired %d time(s) from the run-less path; want 0 (no episode is opened)", len(got))
+	}
+	if got := rec.recoveredCalls(); len(got) != 0 {
+		t.Errorf("OnRecovered fired %d time(s); want 0", len(got))
+	}
+}
+
+// TestPublishNotApplicable_SuccessOpensNoEpisode is the positive
+// counterpart: recordPublished on the run-less path calls clearEpisode
+// with uuid.Nil, and that lookup must not surface as a recovered signal.
+func TestPublishNotApplicable_SuccessOpensNoEpisode(t *testing.T) {
+	rec := &episodeCalls{}
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{},
+		Artifacts:   &fakeArtifacts{},
+		ExternalURL: "https://app.fishhawk.example.com",
+		OnDegraded:  rec.onDegraded,
+		OnRecovered: rec.onRecovered,
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+	if ok, err := pub.PublishNotApplicable(context.Background(), naRepo(), naScope(), "deadbeef"); err != nil || !ok {
+		t.Fatalf("publish = (%v, %v), want (true, nil)", ok, err)
+	}
+	if got := rec.recoveredCalls(); len(got) != 0 {
+		t.Errorf("OnRecovered fired %d time(s) from the run-less path; want 0", len(got))
+	}
+	if got := rec.degradedCalls(); len(got) != 0 {
+		t.Errorf("OnDegraded fired %d time(s); want 0", len(got))
+	}
+}

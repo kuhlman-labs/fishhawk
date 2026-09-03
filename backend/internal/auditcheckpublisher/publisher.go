@@ -24,6 +24,12 @@
 //     for v0; tighter behaviour belongs in a webhook listener.
 //   - Translate `ci_pass` or other externally-fed checks. Those
 //     ORIGINATE from GitHub; re-posting them would be circular.
+//
+// Since E64.43 (#3160) the package ALSO carries a run-less publish,
+// PublishNotApplicable: a terminal `neutral` Check Run for a pull
+// request that has no Fishhawk run at all, so a repo that marked the
+// check Required doesn't permanently block every Dependabot / hotfix /
+// docs PR on a context nothing would otherwise publish.
 package auditcheckpublisher
 
 import (
@@ -357,6 +363,109 @@ func (p *Publisher) PublishResultAtHead(ctx context.Context, runID uuid.UUID, st
 		p.onRecovered(ctx, runID, headSHA, attempts)
 	}
 	return true, nil
+}
+
+// stateNotApplicable is the dedup-cache sentinel for the run-less
+// not-applicable publish (E64.43 / #3160). It is deliberately a
+// package-local stagecheck.State value and NOT a new member of the
+// stagecheck enum: nothing outside this package derives, persists, or
+// switches on it, so promoting it would move exhaustiveness tables in
+// every consumer for a value none of them can ever see.
+//
+// Because the dedup cache stores the last published state as its VALUE
+// and shouldPublish compares that value against the incoming state, an
+// entry under this sentinel can never suppress a later real
+// pass/fail/pending at the same head (and vice versa) — the states
+// differ, so shouldPublish returns true. That invariant is load-bearing
+// and is pinned in both orders by
+// TestPublishNotApplicable_SentinelDoesNotSuppressRealState.
+const stateNotApplicable = stagecheck.State("fishhawk_not_applicable")
+
+// notApplicableSummary is the Check Run summary for the run-less
+// publish. It must read unambiguously as "the gate does not apply", NOT
+// as an audit pass — the pass summary's "audit chain verifies" phrase is
+// deliberately absent, and a test asserts that absence.
+const notApplicableSummary = "No Fishhawk run is associated with this pull request, so the audit gate does not apply to it. " +
+	"This is not an audit result: nothing was verified, because there is nothing Fishhawk-managed here to verify."
+
+// PublishNotApplicable posts a TERMINAL, non-blocking
+// fishhawk_audit_complete Check Run for a pull request that has NO
+// associated Fishhawk run (E64.43 / #3160). Without it, a repo that has
+// marked the check Required leaves every non-Fishhawk PR (Dependabot, a
+// human hotfix, an operator-authored docs PR) permanently blocked on a
+// context nothing will ever publish.
+//
+// It is deliberately RUN-LESS — it takes repo/scope/headSHA directly
+// rather than a runID — because there is no run row, no implement-stage
+// pull_request artifact, and therefore nothing for GetRun/findHeadSHA to
+// resolve.
+//
+// Deliberate omissions:
+//   - It does not open or advance a degraded-failure EPISODE. Episodes
+//     are keyed by (run_id, head_sha); a run-less failure would open one
+//     under uuid.Nil that no later publish could ever close. It does
+//     route through recordPublished on success, which calls clearEpisode
+//     with uuid.Nil — a map lookup that finds nothing and returns 0,
+//     since no episode is ever created under that key. So the episode
+//     side is READ (harmlessly, always a miss) but never WRITTEN, and
+//     OnDegraded/OnRecovered are never invoked from this path.
+//   - It is GitHub-only. runner_kind is a property of a run, and a
+//     run-less PR has none, so there is no signal to route a GitLab
+//     commit status on.
+//
+// The conclusion is `neutral`: GitHub treats success, neutral and
+// skipped as satisfying a required status check, and neutral stays
+// semantically honest about the fact that nothing was verified. If live
+// validation ever shows neutral does NOT satisfy the required context,
+// the forward fix is a one-line change to
+// forge.CheckRunConclusionSuccess in buildNotApplicableParams — the
+// summary text already reads unambiguously as not-applicable.
+//
+// Returns (false, nil) — a silent, caller-branch-free skip — when:
+//   - The receiver is nil (publisher disabled; dev posture).
+//   - repo.Owner, repo.Name or the trimmed headSHA is empty.
+//   - scope is the zero CredentialScope (nothing to authenticate with).
+//   - The dedup cache already holds this sentinel for (github, repo,
+//     head_sha) — repeated opened/reopened/synchronize events at one
+//     head post once.
+func (p *Publisher) PublishNotApplicable(ctx context.Context, repo forge.RepoRef, scope forge.CredentialScope, headSHA string) (bool, error) {
+	if p == nil {
+		return false, nil
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return false, nil
+	}
+	headSHA = strings.TrimSpace(headSHA)
+	if headSHA == "" {
+		return false, nil
+	}
+	if scope == (forge.CredentialScope{}) {
+		return false, nil
+	}
+	if !p.shouldPublish(repo, headSHA, "github", stateNotApplicable) {
+		return false, nil
+	}
+	if _, err := p.github.CreateCheckRun(ctx, scope, repo, buildNotApplicableParams(headSHA, p.externalURL)); err != nil {
+		return false, fmt.Errorf("auditcheckpublisher: create not-applicable check run: %w", err)
+	}
+	p.recordPublished(repo, uuid.Nil, headSHA, "github", stateNotApplicable)
+	return true, nil
+}
+
+// buildNotApplicableParams renders the run-less Check Run. There is no
+// run to link, so details_url points at the Fishhawk root.
+func buildNotApplicableParams(headSHA, detailsURL string) forge.CreateCheckRunParams {
+	return forge.CreateCheckRunParams{
+		Name:       CheckName,
+		HeadSHA:    headSHA,
+		DetailsURL: detailsURL,
+		Status:     forge.CheckRunStatusCompleted,
+		// `success` is the documented one-line fallback if live
+		// validation refutes neutral satisfying a required context.
+		Conclusion:    forge.CheckRunConclusionNeutral,
+		OutputTitle:   "Not a Fishhawk-managed change",
+		OutputSummary: notApplicableSummary,
+	}
 }
 
 // resolveGitLab returns the GitLab forge the publisher routes a gitlab_ci

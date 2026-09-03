@@ -23,9 +23,32 @@ The GitLab lookup is **nil-safe**: an unconfigured GitLab forge (not registered,
 
 ## Hook points and failure posture
 
-`server/checks.go::publishAuditCheck` is called after every `auditcomplete.ComputeResult` in both the read endpoint (`handleListStageChecks`) and the recompute/republish path (`recomputeAndPublishAuditComplete`, which `republishOnSynchronize` and the merge reconciler both reach). It forwards the resolutions to `PublishResultAtHead` with an empty override (via `publishAuditCheckAtHead`); `PublishResult` and `Publish` remain thin wrappers delegating with an empty override / `resolved=nil`. The operator-vouch path reaches the same seam with a non-empty override — see **Head override** below.
+`server/checks.go::publishAuditCheck` is called after every `auditcomplete.ComputeResult` in both the read endpoint (`handleListStageChecks`) and the recompute/republish path (`recomputeAndPublishAuditComplete`, which the merge reconciler reaches; the pull_request webhook handler `republishOnPullRequestEvent` calls `publishAuditCheck` directly). It forwards the resolutions to `PublishResultAtHead` with an empty override (via `publishAuditCheckAtHead`); `PublishResult` and `Publish` remain thin wrappers delegating with an empty override / `resolved=nil`. The operator-vouch path reaches the same seam with a non-empty override — see **Head override** below.
 
 The dedup cache is UNCHANGED by #3092 — it still keys on `(forge, repo, head_sha, state)` only, so the resolution text lands with the FIRST pass publish at a given head; a pass already published at that head is not re-published merely because its summary would now name the child runs.
+
+## Run-less not-applicable publish (E64.43 / #3160)
+
+`PublishNotApplicable(ctx, repo, scope, headSHA)` posts a **terminal, non-blocking** `fishhawk_audit_complete` Check Run for a pull request that has **no Fishhawk run at all** — a Dependabot bump, a human hotfix, an operator-authored docs PR. Without it, a repo that has marked the check Required leaves every such PR permanently blocked on a context nothing would ever publish (#3160).
+
+**Signature is deliberately RUN-LESS.** It takes `repo` / `scope` / `headSHA` directly rather than a `runID`, because there is no run row, no implement-stage `pull_request` artifact, and therefore nothing for `GetRun` / `findHeadSHA` to resolve.
+
+**Wire shape**: `status=completed`, `conclusion=neutral`, `output.title = "Not a Fishhawk-managed change"`, `details_url = <ExternalURL>` (the root — there is no run to link), and a summary that states plainly that no Fishhawk run is associated with the PR and the audit gate does not apply. It is worded so it CANNOT read as an audit pass: the pass summary's phrase `audit chain verifies` is deliberately absent, and `TestPublishNotApplicable_PublishesNeutralCompleted` asserts that absence as well as the not-applicable wording's presence.
+
+**Why `neutral`.** GitHub treats `success`, `neutral` and `skipped` as satisfying a required status check, and `neutral` stays semantically honest about the fact that nothing was verified. If live validation ever refutes that, the forward fix is a **one-line** change of `forge.CheckRunConclusionNeutral` to `forge.CheckRunConclusionSuccess` in `buildNotApplicableParams` — the summary text already reads unambiguously as not-applicable — not a revert.
+
+**Dedup sentinel.** The path consults the SAME `(forge, repo, head_sha)` cache under a package-local `stateNotApplicable = stagecheck.State("fishhawk_not_applicable")`, so repeated `opened` / `reopened` / `synchronize` events at one head post once. It is deliberately NOT a new member of the `stagecheck` enum: nothing outside this package derives, persists or switches on it, so promoting it would move exhaustiveness tables in every consumer for a value none of them can see.
+
+The invariant that makes sharing the cache safe: the cache stores the last published state as its VALUE and `shouldPublish` compares that value against the incoming state, so a `stateNotApplicable` entry can never suppress a later real pass/fail/pending at that head, and a real state can never suppress a not-applicable. `TestPublishNotApplicable_SentinelDoesNotSuppressRealState` pins this in BOTH orders — it is the test that fails if the sentinel is ever collapsed into an existing enum member.
+
+**Deliberate omissions**, both observable in tests rather than merely claimed:
+
+- **No degraded-failure EPISODE.** Episodes key on `(run_id, head_sha)`; a run-less failure would open one under `uuid.Nil` that no later publish could ever close. The path DOES route through `recordPublished` on success, which calls `clearEpisode(uuid.Nil, headSHA)` — a map lookup that always misses and returns 0, because no episode is ever created under that key. So the episode side is READ (harmlessly) but never WRITTEN, and `OnDegraded` / `OnRecovered` are never invoked from this path. `TestPublishNotApplicable_CreateCheckRunError` drives `DefaultDegradedThreshold+1` consecutive failures and asserts `OnDegraded` fires zero times; `TestPublishNotApplicable_SuccessOpensNoEpisode` asserts the success path fires `OnRecovered` zero times.
+- **GitHub-only.** `runner_kind` is a property of a run, and a run-less PR has none — there is no signal to route a GitLab commit status on.
+
+**Fail-closed guards**, each `(false, nil)` with zero forge calls and each with its own test case in `TestPublishNotApplicable_GuardModes` / `_NilReceiver`: nil receiver (publisher disabled — so the call site needs no branch), empty `repo.Owner`, empty `repo.Name`, empty-or-whitespace `headSHA`, and the zero `forge.CredentialScope` (nothing to authenticate with).
+
+The caller-side discriminator that keeps a Fishhawk-managed PR from ever reaching this method is in `backend/internal/server` — see that package's README.
 
 ## Head override (E64.14 / #3109)
 
