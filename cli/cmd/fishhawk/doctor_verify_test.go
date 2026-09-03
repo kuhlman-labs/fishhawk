@@ -647,6 +647,66 @@ func TestSanitizeVerifyEnv(t *testing.T) {
 	}
 }
 
+// TestSanitizeVerifyEnv_PinsGitConfigNeutralization is the CLI mirror of the
+// runner's TestSanitizeEnv_PinsGitConfigNeutralization (#3102): sanitizeVerifyEnv
+// must pin GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM at /dev/null so a spec-supplied
+// verify command's temp-repo `git commit` cannot inherit the operator's global
+// commit.gpgsign. It asserts (a) both keys present at /dev/null when the base has
+// neither; (b) an inherited hostile value is replaced, not honoured; (c) exactly
+// one entry per key in both cases; (d) PATH/HOME/Go entries survive intact.
+func TestSanitizeVerifyEnv_PinsGitConfigNeutralization(t *testing.T) {
+	count := func(env []string, key string) int {
+		n := 0
+		for _, kv := range env {
+			if strings.HasPrefix(kv, key+"=") {
+				n++
+			}
+		}
+		return n
+	}
+	toMap := func(env []string) map[string]string {
+		m := map[string]string{}
+		for _, kv := range env {
+			k, v, _ := strings.Cut(kv, "=")
+			m[k] = v
+		}
+		return m
+	}
+
+	// (a) neither key inherited — both pinned to /dev/null; (d) essentials survive.
+	absent := sanitizeVerifyEnv([]string{"PATH=/usr/bin:/bin", "HOME=/home/op", "GOCACHE=/tmp/gocache"})
+	mapAbsent := toMap(absent)
+	for _, k := range []string{"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"} {
+		if mapAbsent[k] != "/dev/null" {
+			t.Errorf("(a) %s = %q, want /dev/null", k, mapAbsent[k])
+		}
+		if n := count(absent, k); n != 1 {
+			t.Errorf("(a/c) expected exactly 1 %s entry, got %d in %v", k, n, absent)
+		}
+	}
+	for k, v := range map[string]string{"PATH": "/usr/bin:/bin", "HOME": "/home/op", "GOCACHE": "/tmp/gocache"} {
+		if mapAbsent[k] != v {
+			t.Errorf("(d) allow-listed %s = %q, want %q", k, mapAbsent[k], v)
+		}
+	}
+
+	// (b) inherited hostile values — replaced, not honoured; (c) one entry each.
+	hostile := sanitizeVerifyEnv([]string{
+		"GIT_CONFIG_GLOBAL=/home/op/.gitconfig",
+		"GIT_CONFIG_SYSTEM=/etc/gitconfig",
+		"PATH=/usr/bin:/bin",
+	})
+	mapHostile := toMap(hostile)
+	for _, k := range []string{"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"} {
+		if mapHostile[k] != "/dev/null" {
+			t.Errorf("(b) inherited %s = %q, want it replaced by /dev/null", k, mapHostile[k])
+		}
+		if n := count(hostile, k); n != 1 {
+			t.Errorf("(b/c) expected exactly 1 %s entry after replacing inherited, got %d in %v", k, n, hostile)
+		}
+	}
+}
+
 // --- #2504: GOOGLE_* no longer rides the bare "GO" allow-prefix --------------
 
 // TestVerifyEnvAllowed_RejectsGoogleCredentialKeys is the DIRECT counterfactual

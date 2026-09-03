@@ -659,6 +659,15 @@ func TestDowngrade_RetiredCriterionUndecidableRow_DoesNotPinTheRun(t *testing.T)
 	runID, stageID := uuid.New(), uuid.New()
 	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
 	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	// Approved amendment 354a2ff1, binding constraint 1: seed the head entry and
+	// nothing else. This fixture stands in for an ordinarily-DISPATCHED
+	// acceptance stage, so it must carry a resolvable validated head — otherwise
+	// the #3091 unbound-head clamp records `undecidable` and this test can no
+	// longer isolate the property it is about. seedValidatedHead is idempotent,
+	// so stating the precondition here does not double-seed the ledger
+	// seedRetirementFixture already wrote; it keeps the precondition visible in
+	// THIS file, where the amendment required it.
+	seedValidatedHead(au, runID, stageID)
 	priv, _ := sf.issue(t, runID)
 
 	body := acceptanceVerdictBytes(t, "passed", "",
@@ -754,6 +763,15 @@ func TestDowngrade_ShippedPassed_D1GuardLivesInTheFunction(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	srv, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
 	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	// Approved amendment 354a2ff1, binding constraint 1: seed the head entry and
+	// nothing else. This fixture stands in for an ordinarily-DISPATCHED
+	// acceptance stage, so it must carry a resolvable validated head — otherwise
+	// the #3091 unbound-head clamp records `undecidable` and this test can no
+	// longer isolate the property it is about. seedValidatedHead is idempotent,
+	// so stating the precondition here does not double-seed the ledger
+	// seedRetirementFixture already wrote; it keeps the precondition visible in
+	// THIS file, where the amendment required it.
+	seedValidatedHead(au, runID, stageID)
 	priv, _ := sf.issue(t, runID)
 
 	body := acceptanceVerdictBytes(t, "passed", "",

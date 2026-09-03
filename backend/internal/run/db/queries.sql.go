@@ -1087,11 +1087,19 @@ func (q *Queries) ParkScopeCompleteness(ctx context.Context, arg ParkScopeComple
 	return i, err
 }
 
+// PRESERVE ON REGENERATION (#3083): the terminal-state predicate below is a
+// HAND-MIRRORED copy of backend/internal/run/queries.sql's RecordStageProgress,
+// which is the AUTHORITY. `sqlc generate` regenerates every package in this
+// repo and produces out-of-scope churn, so the .sql and this constant are
+// edited in lockstep by hand. If a future regeneration drops 'superseded' from
+// this IN-list, re-add it from the .sql — the drift is caught behaviorally by
+// the run/postgres_test.go case asserting a heartbeat against a superseded
+// stage matches ZERO rows, not by inspection.
 const recordStageProgress = `-- name: RecordStageProgress :execrows
 UPDATE stages
    SET progress = $2
  WHERE id = $1
-   AND state NOT IN ('succeeded', 'failed', 'cancelled')
+   AND state NOT IN ('succeeded', 'failed', 'cancelled', 'superseded')
 `
 
 type RecordStageProgressParams struct {

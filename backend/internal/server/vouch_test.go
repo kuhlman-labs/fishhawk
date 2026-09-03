@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -261,5 +265,211 @@ func TestVouchCommit_MalformedBody(t *testing.T) {
 	}
 	if vouchAudit(au) != nil {
 		t.Error("audit written despite malformed body")
+	}
+}
+
+// --- E64.14 / #3109: vouch triggers the audit-complete re-post ---
+
+// vouchCheckCreator is a fake auditcheckpublisher.CheckRunCreator recording the
+// params of each publish, with an injectable error for the failure path.
+type vouchCheckCreator struct {
+	mu    sync.Mutex
+	calls []forge.CreateCheckRunParams
+	err   error
+}
+
+func (f *vouchCheckCreator) CreateCheckRun(_ context.Context, _ forge.CredentialScope, _ forge.RepoRef, p forge.CreateCheckRunParams) (*forge.CreateCheckRunResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, p)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &forge.CreateCheckRunResult{ID: 1}, nil
+}
+
+// newVouchRepublishServer wires a vouch server over an autoDriveRepo (which
+// supports GetRun + ListStagesForRun, so auditcomplete.ComputeResult runs) with
+// an artifact + audit fake and an auditcheckpublisher over the given fake
+// creator. It seeds a running run with an implement stage so the recompute has
+// a chain to derive, and returns the server, the audit fake, and the run id.
+func newVouchRepublishServer(t *testing.T, creator *vouchCheckCreator) (*Server, *auditFake, uuid.UUID) {
+	t.Helper()
+	repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	au := newAuditFake()
+	ar := newFakeArtifactRepo()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		AuditRepo:    au,
+		ArtifactRepo: ar,
+	})
+	runID := uuid.New()
+	implID := uuid.New()
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99)}
+	stage := &run.Stage{ID: implID, RunID: runID, Type: run.StageTypeImplement}
+	repo.mu.Lock()
+	repo.runs[runID] = runRow
+	repo.stagesByRun[runID] = []*run.Stage{stage}
+	repo.mu.Unlock()
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub:      creator,
+		Runs:        repo,
+		Artifacts:   ar,
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+	s.auditCheckPublisher = pub
+	return s, au, runID
+}
+
+// TestVouchCommit_RepublishesAuditCheckAtVouchedHead pins the re-post trigger
+// (E64.14 / #3109): a vouch publishes the fishhawk_audit_complete Check Run AT
+// the VOUCHED sha (asserted on the recorded head_sha, not merely that a publish
+// happened), and reports audit_check_republished:true with no warning.
+// Counterfactual c4: deleting the republish call in handleVouchCommit turns this
+// RED (zero Check Run creations recorded).
+func TestVouchCommit_RepublishesAuditCheckAtVouchedHead(t *testing.T) {
+	creator := &vouchCheckCreator{}
+	s, _, runID := newVouchRepublishServer(t, creator)
+
+	w := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: vouchedSHA, Reason: "sync-schemas remediation commit"}, withVouchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp vouchCommitResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.AuditCheckRepublished {
+		t.Error("audit_check_republished = false, want true")
+	}
+	if resp.AuditCheckRepublishWarning != "" {
+		t.Errorf("unexpected republish warning: %q", resp.AuditCheckRepublishWarning)
+	}
+	creator.mu.Lock()
+	defer creator.mu.Unlock()
+	if len(creator.calls) != 1 {
+		t.Fatalf("check run creations = %d, want 1 (the vouch re-posts)", len(creator.calls))
+	}
+	if got := creator.calls[0].HeadSHA; got != vouchedSHA {
+		t.Errorf("check run head_sha = %q, want the vouched sha %q", got, vouchedSHA)
+	}
+}
+
+// TestVouchCommit_RepublishFailure_Still200WithWarning pins binding condition 1b:
+// a re-post FAILURE does not fail the vouch (still 200, vouch recorded) but is
+// VISIBLE — audit_check_republished:false with a non-empty warning naming the
+// missing check and the re-invoke retry, rather than being swallowed behind a
+// clean success.
+func TestVouchCommit_RepublishFailure_Still200WithWarning(t *testing.T) {
+	creator := &vouchCheckCreator{err: errBoom}
+	s, au, runID := newVouchRepublishServer(t, creator)
+
+	w := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: vouchedSHA, Reason: "sync-schemas remediation commit"}, withVouchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a publish failure must not fail the vouch):\n%s", w.Code, w.Body.String())
+	}
+	var resp vouchCommitResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.AuditCheckRepublished {
+		t.Error("audit_check_republished = true on a publish failure, want false")
+	}
+	if resp.AuditCheckRepublishWarning == "" {
+		t.Error("republish warning empty; the failure must be VISIBLE (binding condition 1b)")
+	}
+	if !strings.Contains(resp.AuditCheckRepublishWarning, "fishhawk_vouch_commit") {
+		t.Errorf("warning must name the re-invoke retry path: %q", resp.AuditCheckRepublishWarning)
+	}
+	// The vouch itself is still recorded despite the re-post failure.
+	if vouchAudit(au) == nil {
+		t.Error("operator_commit_vouched entry not recorded; the vouch must succeed independently of the re-post")
+	}
+}
+
+// vouchAuditCount returns how many operator_commit_vouched entries were appended.
+func vouchAuditCount(au *auditFake) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for i := range au.appended {
+		if au.appended[i].Category == CategoryOperatorCommitVouched {
+			n++
+		}
+	}
+	return n
+}
+
+// TestVouchCommit_RepeatVouchRetriesRepublish pins binding condition 1c — the
+// sanctioned idempotent retry — end to end through handleVouchCommit, which
+// diff-only review could not confirm: re-invoking fishhawk_vouch_commit on an
+// ALREADY-VOUCHED sha REACHES a second republish attempt (the handler neither
+// refuses nor dedups a repeat vouch short of the re-post). The first vouch's
+// re-post fails (200, republished:false, warning); the second vouch of the SAME
+// sha succeeds (200, republished:true, no warning) and re-fires the Check Run at
+// the vouched head. Without a reachable second attempt the documented first-class
+// recovery would be unreachable behind a doc claim.
+func TestVouchCommit_RepeatVouchRetriesRepublish(t *testing.T) {
+	creator := &vouchCheckCreator{err: errBoom}
+	s, au, runID := newVouchRepublishServer(t, creator)
+
+	// First vouch: the re-post fails; the vouch still succeeds with a warning.
+	w1 := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: vouchedSHA, Reason: "sync-schemas remediation commit"}, withVouchOperator)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first vouch status = %d, want 200:\n%s", w1.Code, w1.Body.String())
+	}
+	var resp1 vouchCommitResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &resp1); err != nil {
+		t.Fatalf("unmarshal first: %v", err)
+	}
+	if resp1.AuditCheckRepublished {
+		t.Fatalf("first vouch audit_check_republished = true, want false (re-post failed):\n%s", w1.Body.String())
+	}
+
+	// The publisher records only SUCCESSES, so the failed first attempt left the
+	// dedup cache empty. The seam recovers; re-invoke the vouch on the SAME sha.
+	creator.mu.Lock()
+	creator.err = nil
+	callsAfterFirst := len(creator.calls)
+	creator.mu.Unlock()
+
+	w2 := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: vouchedSHA, Reason: "retry the dropped audit-check re-post"}, withVouchOperator)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second vouch status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+	var resp2 vouchCommitResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("unmarshal second: %v", err)
+	}
+	if !resp2.AuditCheckRepublished {
+		t.Errorf("second vouch audit_check_republished = false, want true (re-vouch retries the re-post):\n%s", w2.Body.String())
+	}
+	if resp2.AuditCheckRepublishWarning != "" {
+		t.Errorf("second vouch warning non-empty on success: %q", resp2.AuditCheckRepublishWarning)
+	}
+
+	creator.mu.Lock()
+	defer creator.mu.Unlock()
+	// The repeat vouch REACHED a second republish attempt — not refused/deduped.
+	if len(creator.calls) <= callsAfterFirst {
+		t.Fatalf("check run creations did not increase on re-vouch: %d then %d (repeat vouch never reached the re-post)",
+			callsAfterFirst, len(creator.calls))
+	}
+	if got := creator.calls[len(creator.calls)-1].HeadSHA; got != vouchedSHA {
+		t.Errorf("re-vouch check run head_sha = %q, want the vouched sha %q", got, vouchedSHA)
+	}
+	// Two operator_commit_vouched entries were recorded: the handler does not
+	// refuse a repeat vouch of the same sha (which would make 1c unreachable).
+	if n := vouchAuditCount(au); n != 2 {
+		t.Errorf("operator_commit_vouched entries = %d, want 2 (repeat vouch is not refused)", n)
 	}
 }

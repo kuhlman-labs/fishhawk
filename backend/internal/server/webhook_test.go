@@ -6,12 +6,16 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -290,5 +294,109 @@ func TestWebhook_IssueClosedBoardSync(t *testing.T) {
 	}
 	if a["repo"] != "kuhlman-labs/fishhawk" || a["issue_number"] != float64(1817) || a["state_reason"] != "completed" {
 		t.Errorf("audit = %v, want repo/issue_number/state_reason from the payload", a)
+	}
+}
+
+// TestWebhook_PullRequestActionRouting_NotApplicable is the
+// CROSS-BOUNDARY test for E64.43 / #3160. It POSTs a webhook request the
+// test SIGNS ITSELF, in-process, to the REAL POST /webhooks/github route,
+// so signature verification → webhook.ParseEvent → the dispatch condition
+// → republishOnPullRequestEvent → auditcheckpublisher → the forge fake all
+// execute. No live forge and no live delivery are involved.
+//
+// It is the layer-crossing seam the per-layer unit tests cannot cover:
+// every one of them still passes with the dispatch condition narrowed
+// back to `synchronize`, because they call the handler directly.
+func TestWebhook_PullRequestActionRouting_NotApplicable(t *testing.T) {
+	cases := []struct {
+		action       string
+		wantPublish  int
+		wantRouted   bool
+		descriptions string
+	}{
+		{action: "opened", wantPublish: 1, wantRouted: true,
+			descriptions: "a Dependabot PR never pushed to after opening must still get the terminal check"},
+		{action: "reopened", wantPublish: 1, wantRouted: true,
+			descriptions: "reopening re-drives the publish"},
+		{action: "synchronize", wantPublish: 1, wantRouted: true,
+			descriptions: "the pre-#3160 head-moved trigger"},
+		{action: "edited", wantPublish: 0, wantRouted: false,
+			descriptions: "a title/body edit does not move the head and must NOT reach the handler"},
+		{action: "labeled", wantPublish: 0, wantRouted: false,
+			descriptions: "labelling does not move the head and must NOT reach the handler"},
+	}
+	for i, tc := range cases {
+		t.Run(tc.action, func(t *testing.T) {
+			rr := &synchronizeRunRepo{listResult: nil}
+			arts := &synchronizeArtifactRepo{}
+			gh := newPublisherFakeGitHub()
+			store := webhook.NewMemoryStore(0)
+			s := New(Config{
+				Addr:                "127.0.0.1:0",
+				GitHubWebhookSecret: []byte(testSecret),
+				WebhookDeliveries:   store,
+				RunRepo:             rr,
+				ArtifactRepo:        arts,
+				AuditRepo:           &synchronizeAuditRepo{},
+				ExternalURL:         "https://app.fishhawk.example.com",
+			})
+			s.appIdentityGetterOverride = &stubAppIdentityGetter{
+				app:  &githubclient.App{Slug: "fishhawk-dev"},
+				user: &githubclient.User{ID: 12345, Login: ourAppLogin},
+			}
+			s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
+				GitHub: gh, Runs: rr, Artifacts: arts,
+				ExternalURL: "https://app.fishhawk.example.com",
+			})
+
+			body, err := json.Marshal(map[string]any{
+				"action":       tc.action,
+				"repository":   map[string]any{"full_name": "x/y"},
+				"sender":       map[string]any{"login": "dependabot[bot]", "type": "Bot"},
+				"installation": map[string]any{"id": 99},
+				"pull_request": map[string]any{
+					"html_url": "https://github.com/x/y/pull/7",
+					"number":   7,
+					"head":     map[string]any{"sha": "cafebabe"},
+					"user":     map[string]any{"login": "dependabot[bot]", "type": "Bot"},
+				},
+			})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			w := postWebhook(t, s, map[string]string{
+				"X-GitHub-Event":      "pull_request",
+				"X-GitHub-Delivery":   fmt.Sprintf("00000000-0000-0000-0000-0000000000%02d", i),
+				"X-Hub-Signature-256": sign(body),
+				"Content-Type":        "application/json",
+			}, body)
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202 (%s):\n%s", w.Code, tc.descriptions, w.Body.String())
+			}
+
+			if got := len(gh.calls()); got != tc.wantPublish {
+				t.Fatalf("action %q published %d check run(s), want %d — %s",
+					tc.action, got, tc.wantPublish, tc.descriptions)
+			}
+			rr.mu.Lock()
+			routed := len(rr.listURLs) > 0
+			rr.mu.Unlock()
+			if routed != tc.wantRouted {
+				t.Fatalf("action %q reached the handler = %v, want %v — %s",
+					tc.action, routed, tc.wantRouted, tc.descriptions)
+			}
+			if tc.wantPublish > 0 {
+				p := gh.calls()[0].params
+				if p.Conclusion != githubclient.CheckRunConclusionNeutral {
+					t.Errorf("conclusion = %q, want neutral", p.Conclusion)
+				}
+				if p.Status != githubclient.CheckRunStatusCompleted {
+					t.Errorf("status = %q, want completed", p.Status)
+				}
+				if p.HeadSHA != "cafebabe" {
+					t.Errorf("head_sha = %q, want cafebabe", p.HeadSHA)
+				}
+			}
+		})
 	}
 }

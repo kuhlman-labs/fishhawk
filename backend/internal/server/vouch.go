@@ -43,11 +43,30 @@ type vouchCommitRequest struct {
 	Reason string `json:"reason"`
 }
 
-// vouchCommitResponse echoes the recorded declaration.
+// vouchCommitResponse echoes the recorded declaration and reports whether the
+// vouch's audit-complete Check Run re-post landed (E64.14 / #3109).
 type vouchCommitResponse struct {
 	RunID      string `json:"run_id"`
 	VouchedSHA string `json:"vouched_sha"`
 	Reason     string `json:"reason"`
+	// AuditCheckRepublished reports whether the fishhawk_audit_complete Check
+	// Run was successfully re-posted at the vouched head (E64.14 / #3109).
+	// FALSE when the re-post did not land — either it errored (see
+	// AuditCheckRepublishWarning) or no publisher is wired (dev/CLI posture, no
+	// check to post). The vouch itself always succeeds regardless; this field
+	// makes a swallowed re-post failure VISIBLE (binding condition 1b) so the
+	// operator learns the required check is missing HERE rather than at a later
+	// blocked merge. The reconciler heal does NOT retry it (normal head
+	// resolution excludes operator-vouched commits), so re-invoking
+	// fishhawk_vouch_commit is the first-class idempotent retry (condition 1c):
+	// the publisher's dedup cache records only successes, so a re-vouch re-posts
+	// exactly the dropped check and no-ops once it is live.
+	AuditCheckRepublished bool `json:"audit_check_republished"`
+	// AuditCheckRepublishWarning, when non-empty, names why the re-post did not
+	// land, so the failure is legible in the response body rather than only in
+	// the daemon log (E64.14 / #3109, binding condition 1b). Empty when the
+	// re-post succeeded or when no publisher is wired.
+	AuditCheckRepublishWarning string `json:"audit_check_republish_warning,omitempty"`
 }
 
 // handleVouchCommit implements POST /v0/runs/{run_id}/vouch-commit.
@@ -82,6 +101,17 @@ type vouchCommitResponse struct {
 // unreachable ledger entry and un-wedges nothing (the real foreign commit
 // still flags), so the fail-closed property (an unvouched foreign commit
 // still fails category-B) holds.
+//
+// The vouch is ALSO the re-post trigger for the fishhawk_audit_complete Check
+// Run on the operator's head (E64.14 / #3109). After the declaration is
+// durable the handler recomputes audit-complete and republishes the Check Run
+// AT the vouched sha via the head override, because an operator-pushed commit
+// is in no head-report audit category and the publisher's normal head
+// resolution would otherwise re-post against a stale sha — leaving the required
+// check absent from the live merge head. The re-post is best-effort for the
+// vouch's success but its outcome is REPORTED on the response
+// (audit_check_republished / audit_check_republish_warning) rather than
+// swallowed, and re-invoking the vouch idempotently retries the re-post.
 func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
@@ -194,9 +224,33 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, r, http.StatusOK, vouchCommitResponse{
-		RunID:      runID.String(),
-		VouchedSHA: sha,
-		Reason:     reason,
-	})
+	// Re-post the fishhawk_audit_complete Check Run AT the vouched sha (E64.14 /
+	// #3109). This runs ONLY after the operator_commit_vouched entry is durably
+	// appended, so the recompute observes the vouch in the reported-head ledger.
+	// The vouched commit is an operator-pushed head that appears in NO
+	// head-report audit category, so the publisher's normal head resolution
+	// (fixup_pushed > child_pushed > pull_request_opened) would republish
+	// against a STALE sha and leave the required check absent from the live
+	// merge head — the exact wedge this endpoint closes. The head override
+	// targets the vouched sha directly.
+	//
+	// A re-post failure does NOT fail the vouch — the declaration is already
+	// durable. But it is NOT swallowed either (binding condition 1b): the
+	// outcome is surfaced on the response so the operator knows the required
+	// check is missing rather than discovering it at a blocked merge. The
+	// reconciler heal cannot recover it (it uses the same operator-vouched-blind
+	// head resolution), so re-invoking fishhawk_vouch_commit is the sanctioned
+	// idempotent retry (condition 1c): the publisher dedups on success, so a
+	// re-vouch re-posts exactly the dropped check and no-ops once it is live.
+	republished, pubErr := s.recomputeAndPublishAuditCompleteAtHead(r.Context(), runID, sha)
+	resp := vouchCommitResponse{
+		RunID:                 runID.String(),
+		VouchedSHA:            sha,
+		Reason:                reason,
+		AuditCheckRepublished: republished,
+	}
+	if pubErr != nil {
+		resp.AuditCheckRepublishWarning = "the vouch is recorded and durable, but re-posting the fishhawk_audit_complete check at the vouched commit failed; the required check may be absent from the merge head — re-invoke fishhawk_vouch_commit to retry the re-post: " + pubErr.Error()
+	}
+	s.writeJSON(w, r, http.StatusOK, resp)
 }

@@ -1554,7 +1554,18 @@ func (c *Client) GetPullRequest(ctx context.Context, scope forge.CredentialScope
 		State  string `json:"state"`
 		Merged bool   `json:"merged"`
 		Body   string `json:"body"`
-		Head   struct {
+		// Mergeable is a *bool: GitHub returns JSON null while its background
+		// mergeability job runs, and null must stay distinguishable from false
+		// (E64.14 / #3109). mergeable_state carries "dirty" on a conflict.
+		Mergeable      *bool  `json:"mergeable"`
+		MergeableState string `json:"mergeable_state"`
+		// MergedAt is a *time.Time for the same three-state reason: GitHub
+		// returns `merged_at` as JSON null on an UNMERGED pull request, and
+		// null must stay distinguishable from the zero time (E64.32 / #3136).
+		// merge_commit_sha names the commit the merge produced.
+		MergedAt       *time.Time `json:"merged_at"`
+		MergeCommitSHA string     `json:"merge_commit_sha"`
+		Head           struct {
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
 		} `json:"head"`
@@ -1569,13 +1580,17 @@ func (c *Client) GetPullRequest(ctx context.Context, scope forge.CredentialScope
 		return nil, fmt.Errorf("githubclient: pr response missing node_id")
 	}
 	return &PullRequest{
-		NodeID:  body.NodeID,
-		HeadSHA: body.Head.SHA,
-		State:   body.State,
-		Merged:  body.Merged,
-		BaseRef: body.Base.Ref,
-		HeadRef: body.Head.Ref,
-		Body:    body.Body,
+		NodeID:         body.NodeID,
+		HeadSHA:        body.Head.SHA,
+		State:          body.State,
+		Merged:         body.Merged,
+		BaseRef:        body.Base.Ref,
+		HeadRef:        body.Head.Ref,
+		Body:           body.Body,
+		Mergeable:      body.Mergeable,
+		MergeableState: body.MergeableState,
+		MergedAt:       body.MergedAt,
+		MergeCommitSHA: body.MergeCommitSHA,
 	}, nil
 }
 

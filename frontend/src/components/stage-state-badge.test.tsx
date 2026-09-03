@@ -21,3 +21,16 @@ describe('StageStateBadge deploy parked states', () => {
     expect(screen.getByText('awaiting_deployment')).toBeInTheDocument();
   });
 });
+
+/*
+ * The merge-supersede terminal state (#3083). `Record<StageState, string>`
+ * compile-enforces that the key EXISTS, but not that it renders — a blank or
+ * wrong class still type-checks. This asserts the literal wire label reaches
+ * the DOM, which is what the run-detail list and stage-detail header show.
+ */
+describe('StageStateBadge merge-supersede state', () => {
+  it('renders the superseded label', () => {
+    render(<StageStateBadge state="superseded" />);
+    expect(screen.getByText('superseded')).toBeInTheDocument();
+  });
+});

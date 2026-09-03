@@ -771,6 +771,11 @@ func stageStateIcon(s run.StageState) string {
 		return "❌"
 	case run.StageStateCancelled:
 		return "🚫"
+	case run.StageStateSuperseded:
+		// The merge made this stage unreachable (#3083) — distinct from
+		// cancelled (an operator halted it) and from failed (attempted and
+		// did not pass).
+		return "⤳"
 	}
 	return "❓"
 }

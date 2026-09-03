@@ -145,6 +145,77 @@ func TestSanitizeEnv_RedactsMixedSeparatorGoproxy(t *testing.T) {
 	}
 }
 
+// TestSanitizeEnv_PinsGitConfigNeutralization is the DONE-MEANS behavioral test
+// for the git-config pin (#3102): sanitizeEnv must emit GIT_CONFIG_GLOBAL and
+// GIT_CONFIG_SYSTEM at /dev/null so a gate child's temp-repo `git commit` cannot
+// inherit the operator's global commit.gpgsign. One assertion per named mode:
+// (a) both keys present at /dev/null when the base has NEITHER; (b) an inherited
+// hostile value is REPLACED, not honoured; (c) exactly ONE entry per key in both
+// cases, so no duplicate the platform's undocumented Cmd.Env dedup could resolve
+// to the ambient value; (d) the pins do not displace PATH/HOME/Go-toolchain vars.
+func TestSanitizeEnv_PinsGitConfigNeutralization(t *testing.T) {
+	// (a) neither key inherited — both pinned to /dev/null.
+	absent := []string{"PATH=/usr/bin:/bin", "HOME=/home/runner", "GOCACHE=/tmp/gocache"}
+	gotAbsent := sanitizeEnv(absent)
+	mapAbsent := envSliceToMap(t, gotAbsent)
+	for _, k := range []string{"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"} {
+		if mapAbsent[k] != "/dev/null" {
+			t.Errorf("(a) %s = %q, want /dev/null", k, mapAbsent[k])
+		}
+		if n := countKey(gotAbsent, k); n != 1 {
+			t.Errorf("(a/c) expected exactly 1 %s entry, got %d in %v", k, n, gotAbsent)
+		}
+	}
+	// (d) the pins do not displace the allow-listed essentials.
+	for k, v := range map[string]string{"PATH": "/usr/bin:/bin", "HOME": "/home/runner", "GOCACHE": "/tmp/gocache"} {
+		if mapAbsent[k] != v {
+			t.Errorf("(d) allow-listed %s = %q, want %q", k, mapAbsent[k], v)
+		}
+	}
+
+	// (b) inherited hostile values — replaced, not honoured, still one entry each.
+	hostile := []string{
+		"GIT_CONFIG_GLOBAL=/home/op/.gitconfig",
+		"GIT_CONFIG_SYSTEM=/etc/gitconfig",
+		"PATH=/usr/bin:/bin",
+	}
+	gotHostile := sanitizeEnv(hostile)
+	mapHostile := envSliceToMap(t, gotHostile)
+	for _, k := range []string{"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"} {
+		if mapHostile[k] != "/dev/null" {
+			t.Errorf("(b) inherited %s = %q, want it replaced by /dev/null", k, mapHostile[k])
+		}
+		if n := countKey(gotHostile, k); n != 1 {
+			t.Errorf("(b/c) expected exactly 1 %s entry after replacing inherited, got %d in %v", k, n, gotHostile)
+		}
+	}
+}
+
+// TestRunBoundedGateCommand_ChildSeesNeutralizedGitConfig observes the REAL child
+// process env, not the sanitizer's return value (binding condition test): it
+// seeds a hostile GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM into the runner process via
+// t.Setenv, drives runBoundedGateCommand — which assigns
+// withIsolatedLintCache(sanitizedGateEnv(), …) to cmd.Env and spawns `sh -c` — and
+// asserts the child observes /dev/null for both AND still has PATH. Unwiring the
+// sanitized slice from the exec.Cmd.Env, not just breaking the sanitizer, turns
+// this red.
+func TestRunBoundedGateCommand_ChildSeesNeutralizedGitConfig(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", "/home/op/.gitconfig")
+	t.Setenv("GIT_CONFIG_SYSTEM", "/etc/gitconfig")
+
+	dir := t.TempDir()
+	lintCache := t.TempDir()
+	const command = `echo "global=[$GIT_CONFIG_GLOBAL] system=[$GIT_CONFIG_SYSTEM] path=[${PATH:+set}]"`
+
+	output, exitCode := runBoundedGateCommand(context.Background(), command, dir, lintCache, 30*time.Second)
+	if exitCode != 0 {
+		t.Fatalf("gate command exited %d; output: %s", exitCode, output)
+	}
+	if !strings.Contains(output, "global=[/dev/null] system=[/dev/null] path=[set]") {
+		t.Errorf("output = %q, want both git-config vars pinned to /dev/null AND PATH still set", output)
+	}
+}
+
 // TestSanitizedGateEnv_StripsLiveSecret is a thin check that the public
 // entrypoint reads the live process env and drops a planted secret while
 // keeping PATH.
@@ -395,6 +466,13 @@ func TestGateEnvListsMatchCLICopy(t *testing.T) {
 	}{
 		{"verifyEnvAllowPrefix", gateEnvAllowPrefix},
 		{"verifyEnvDenyPrefix", gateEnvDenyPrefix},
+		// The git-config pins are a []string of full "KEY=/dev/null" entries
+		// (binding condition 1). parseVarKeys extracts each quoted entry, and
+		// sameSlice compares them byte-for-byte AND order-sensitively — the
+		// strongest guarantee, chosen over an order-insensitive set because both
+		// copies are fixed literal slices whose order is deterministic and
+		// trivially kept in sync, so any drift in key, value, or order fails here.
+		{"verifyEnvGitConfigPins", gateEnvGitConfigPins},
 	} {
 		keys, perr := parseVarKeys(src, tc.cliVar)
 		if perr != nil {

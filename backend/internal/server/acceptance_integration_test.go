@@ -194,6 +194,16 @@ func TestAcceptanceSeam_ExampleDrivenHappyPath(t *testing.T) {
 		t.Errorf("precheck findings = %+v, want empty (checked-and-clean)", pre.Findings)
 	}
 
+	// 1b) The run reported a head when its PR opened — the ordinary lineage a
+	//     dispatched acceptance stage validates against. Without it
+	//     acceptanceValidatedHeadSHA resolves "" and the #3091 unbound-head clamp
+	//     records `undecidable`, which is correct for a genuinely unbound ship but
+	//     not what this happy-path seam is about. Sequence 0 matches the auditFake's
+	//     appended-entry sequence, so it sits at-or-before the dispatch anchor
+	//     emitted in step 2.
+	seedHeadEntry(seam.au, seam.runID, nil, "pull_request_opened", 0,
+		map[string]any{"head_sha": "seamvalidatedhead"})
+
 	// 2) Orchestrator advance dispatches the acceptance stage (nil GitHub → the
 	//    workflow_dispatch is skipped but the transition + emit still happen).
 	o := &orchestrator.Orchestrator{Runs: seam.rr, Audit: seam.au}

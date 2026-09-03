@@ -1512,3 +1512,202 @@ func mustParsePlan(t *testing.T, body []byte) *plan.Plan {
 	}
 	return &p
 }
+
+// --- #2862: the unreported-raw-estimate advisory -------------------------
+
+// unreportedRawMarker is a stable substring of the advisory, chosen from the
+// sentence that states WHY the absence matters rather than from a number, so
+// the assertion survives a wording tweak but not a deletion.
+const unreportedRawMarker = "omits raw_predicted_runtime_minutes"
+
+// calibratedPlanBody builds a schema-valid standard_v1 plan carrying the given
+// calibrated predicted_runtime_minutes and, when raw > 0, the pre-calibration
+// raw_predicted_runtime_minutes. A raw of 0 OMITS the key entirely (rather than
+// writing a zero, which the schema's minimum:1 rejects) — that omission is the
+// exact shape #2862's advisory exists to surface.
+func calibratedPlanBody(t *testing.T, predicted, raw int) []byte {
+	t.Helper()
+	m := planfixture.Valid()
+	m["predicted_runtime_minutes"] = predicted
+	if raw > 0 {
+		m["raw_predicted_runtime_minutes"] = raw
+	}
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	if err := plan.Validate(body); err != nil {
+		t.Fatalf("fixture plan does not validate: %v", err)
+	}
+	return body
+}
+
+// seedCalibrationSamples seeds enough runtime_observed implement samples for
+// resolveCalibrationHint to return a NON-nil hint (its floor is
+// calibrationHintMinSamples). All samples are attributed to runRow so the
+// per-entry workflow filter matches.
+func seedCalibrationSamples(au *auditFake, runRow *run.Run) {
+	for i := 0; i < calibrationHintMinSamples; i++ {
+		au.seeded = append(au.seeded, runtimeObservedImplementEntry(runRow.ID, 6))
+	}
+}
+
+// warningsContaining returns every plan_warnings advisory containing sub.
+func warningsContaining(t *testing.T, au *auditFake, sub string) []string {
+	t.Helper()
+	var out []string
+	for _, e := range planWarningsEntries(t, au) {
+		for _, w := range e.Warnings {
+			if strings.Contains(w, sub) {
+				out = append(out, w)
+			}
+		}
+	}
+	return out
+}
+
+// M8 — the advisory FIRES: this workflow has a resolvable fleet calibration
+// hint (so the planner was shown a factor and told to report its
+// pre-calibration estimate) and the plan reports only the calibrated number.
+// The budget gate then has one number instead of two and cannot verify that
+// applying the factor did not clear the budget — #2862's residual, made
+// visible at the gate where the operator can act on it.
+func TestRunPlanWarnings_UnreportedRawEstimate_Fires(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specNoImplementCapForCalibration)
+	seedCalibrationSamples(au, runRow)
+	body := calibratedPlanBody(t, 50, 0) // raw OMITTED
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+
+	if got == nil {
+		t.Fatal("want a non-nil result when the unreported-raw advisory fires")
+	}
+	hits := warningsContaining(t, au, unreportedRawMarker)
+	if len(hits) != 1 {
+		t.Fatalf("advisories containing %q = %d, want 1; warnings = %+v",
+			unreportedRawMarker, len(hits), planWarningsEntries(t, au))
+	}
+	// The advisory must name the calibrated estimate the operator is looking at
+	// AND the factor it was derived with, or it cannot be acted on.
+	for _, want := range []string{"predicted_runtime_minutes 50", "0.60", "5 implement samples"} {
+		if !strings.Contains(hits[0], want) {
+			t.Errorf("advisory missing %q:\n%s", want, hits[0])
+		}
+	}
+}
+
+// M9 — every SILENT case. Each is a distinct branch of
+// unreportedRawEstimateWarning, and each must fail OPEN: no advisory, no noise,
+// and the plan settle never blocked.
+func TestRunPlanWarnings_UnreportedRawEstimate_SilentCases(t *testing.T) {
+	// (a) The plan REPORTS a raw estimate: the gate has both numbers, so
+	// there is nothing to warn about. Checked first and without any repo
+	// access, so a compliant plan costs nothing.
+	t.Run("raw estimate reported", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, specNoImplementCapForCalibration)
+		seedCalibrationSamples(au, runRow)
+		body := calibratedPlanBody(t, 50, 90)
+
+		s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+
+		if hits := warningsContaining(t, au, unreportedRawMarker); len(hits) != 0 {
+			t.Errorf("advisory fired for a plan that DOES report a raw estimate: %v", hits)
+		}
+	})
+
+	// (b) No resolvable hint (zero runtime_observed samples, below
+	// calibrationHintMinSamples): the planner was shown NO factor, so an absent
+	// raw estimate is the correct, expected shape and warning would be pure
+	// noise on every workflow with no calibration history.
+	t.Run("nil calibration hint", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, specNoImplementCapForCalibration)
+		body := calibratedPlanBody(t, 50, 0)
+
+		s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+
+		if hits := warningsContaining(t, au, unreportedRawMarker); len(hits) != 0 {
+			t.Errorf("advisory fired on a workflow with no calibration history: %v", hits)
+		}
+	})
+
+	// (b') Below the floor but non-zero: one sample short of
+	// calibrationHintMinSamples still yields a nil hint. Pins the boundary
+	// rather than only the empty case.
+	t.Run("hint below the sample floor", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, specNoImplementCapForCalibration)
+		for i := 0; i < calibrationHintMinSamples-1; i++ {
+			au.seeded = append(au.seeded, runtimeObservedImplementEntry(runRow.ID, 6))
+		}
+		body := calibratedPlanBody(t, 50, 0)
+
+		s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+
+		if hits := warningsContaining(t, au, unreportedRawMarker); len(hits) != 0 {
+			t.Errorf("advisory fired one sample below the hint floor: %v", hits)
+		}
+	})
+
+	// (c) Nil RunRepo: the run's workflow cannot be resolved, so whether a hint
+	// exists is unknown. Fail open.
+	t.Run("nil RunRepo", func(t *testing.T) {
+		au := newAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au}) // RunRepo intentionally nil.
+		body := calibratedPlanBody(t, 50, 0)
+
+		s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+
+		if hits := warningsContaining(t, au, unreportedRawMarker); len(hits) != 0 {
+			t.Errorf("advisory fired with a nil RunRepo: %v", hits)
+		}
+	})
+
+	// (d) GetRun error (an unseeded run id → ErrNotFound): same unknown, fail
+	// open.
+	t.Run("GetRun error", func(t *testing.T) {
+		s, au, _ := newScopePrecheckServer(t, specNoImplementCapForCalibration)
+		body := calibratedPlanBody(t, 50, 0)
+
+		s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+
+		if hits := warningsContaining(t, au, unreportedRawMarker); len(hits) != 0 {
+			t.Errorf("advisory fired when GetRun errored: %v", hits)
+		}
+	})
+
+	// (e) Hint RESOLUTION error: resolveCalibrationHint reads runtime_observed
+	// through ListAll, and a store failure there must degrade to silence rather
+	// than to a spurious advisory. Scoped to runtime_observed so the entry the
+	// advisory itself would be recorded in is unaffected.
+	t.Run("hint resolution error", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, specNoImplementCapForCalibration)
+		seedCalibrationSamples(au, runRow)
+		au.listAllErrCategory = "runtime_observed"
+		body := calibratedPlanBody(t, 50, 0)
+
+		s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+
+		if hits := warningsContaining(t, au, unreportedRawMarker); len(hits) != 0 {
+			t.Errorf("advisory fired when the calibration hint could not be resolved: %v", hits)
+		}
+	})
+}
+
+// specNoImplementCapForCalibration declares an implement stage with NO
+// max_files_changed constraint, so every cap-derived advisory stays silent and
+// the #2862 assertions above isolate the unreported-raw advisory.
+var specNoImplementCapForCalibration = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`)

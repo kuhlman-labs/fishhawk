@@ -254,6 +254,16 @@ The mismatch re-verify emits its own `verify_run` log event, pass or fail, and o
 
 Three residuals, all accepted and both bounded to retry churn (never a verified-tree bypass — the push reads the verify OUTCOME, not the classifier, and a retry re-runs the same command): (1) the admissibility check bounds the CHANGE as the cause, not the freshly merged BASE or its interaction with the change, so `signal: killed` / `signal: terminated` can still be rendered when a supervisor kills a verify the base+change combination made genuinely slow or hung; (2) the classifier's input is UNTRUSTED — verify output is influenced by the diff, so a test the agent authored can print the lint-lock line or a `signal: <name>` rendering and steer its own genuine category-B failure to category-C; (3) the #2718 daemon-unreachable class has ONE concrete instance of residual (2) named rather than left abstract — `backend/internal/pgtest/pgtest_test.go`'s own table fixtures carry the daemon-unavailable marker strings AS DATA, so a genuine failure in that package prints a marker in its `--- FAIL:` output and self-classifies as infrastructure, a real loss of parking precision for that one package. It is pinned expecting-true in the corpus (`TestIsDockerDaemonUnavailable`'s pgtest-fixture row, the matching `TestIsVerifyInfraFailure` row, and the delegation mirror's `TestInfraFlake` row), so a later narrowing reddens those rows and prompts an update to THIS paragraph in the same change rather than letting doc and behavior drift. A stage going category-C REPEATEDLY on any of these signatures warrants inspecting the change and the merged base for a hang, and inspecting the failing output for a self-produced signature, rather than blaming the host.
 
+**Third occurrence — run 87962b5b, 2026-08-30 (#3048), and why the absorb correctly did NOT fire.** The pass died at the same site with a `verified_tree_mismatch` line, and both halves of that are worth naming precisely because they read as two defects and are one, plus a design limit.
+
+The `verified_tree_mismatch` was the #960 guard operating NORMALLY, not a second failure. The committed-tree gate verifies a THROWAWAY scope-only commit that is then reset away, so the real staged commit legitimately carries a different tree; the guard NOTICES that and demands the strict re-verify — exactly its purpose. The mismatch was a CONSEQUENCE of the ordinary flow, not a cause. The failure was the re-verify's own non-zero exit.
+
+The #2645 absorb did not fire because `scripts/test verify` ran to COMPLETION and exited non-zero on an ordinary test assertion — a flaky clock-domain comparison in `backend/internal/run/dispatchliveness_test.go` (a Go-side `time.Now()` heartbeat seed compared against a Postgres-container-stamped `dispatched_at`; see the AGENTS.md cross-clock trap bullet). `isReverifyInfraFailure` matches a signature ALLOW-LIST of diff-INDEPENDENT infra signatures, and a completed run with a failed assertion matches none of them. The design's dividing line is **"did the command complete"**, not "is the failure attributable to the diff" — a completed non-zero verify is category-B by construction, so an unrelated flaky test is structurally non-retryable and destroys the implement pass.
+
+That is a design limitation the operator has ruled INTENTIONAL (#3048), not an implementation defect: widening the allow-list to cover assertion failures would let a genuinely-broken change retry itself. The remedy taken in #3048 is therefore to remove the flake AT ITS SOURCE — DB-anchor the comparative seeds so the test carries no cross-clock dependency — rather than to reclassify the gate.
+
+**#3122 — the testcontainers deadline signature IS an allow-list entry; the limitation is the one-shot absorb.** #3122 reported the `backend/internal/postgres` pgtest-exemption leak and asserted the testcontainers Docker-socket deadline signature "is not an entry, so the absorb cannot fire." That is FALSE: `wait until ready: mapped port: ... %2Fvar%2Frun%2Fdocker.sock ... context deadline exceeded` matches `isTestcontainersStartFlake` (checked FIRST inside `isVerifyInfraFailure`), and the issue's own Observed section records `verify_infra_flake_retry` firing on iteration 1 — the absorb DID fire, exactly once. The claim is pinned by the verbatim-#3122 corpus row in `TestIsTestcontainersStartFlake` (`flakeOutput3122`, want=true), so a later narrowing of the matcher reddens a test instead of silently reopening the concern. The real limitation is that the committed-tree absorb is ONE-SHOT per stage: a saturated daemon that keeps timing out past the single re-run still lands category-A. The durable fix for #3122 is upstream of this classifier — the Go-side `t.Cleanup` leak repair plus `scripts/test`'s generation-keyed orphan sweep (see `scripts/README.md`), which stop the daemon from accumulating the containers that cause the timeout in the first place; no matcher change was made.
+
 Both pre-push failure messages LEAD with the failing command and a bounded excerpt of its output (`verifyFailureExcerpt`), ahead of the tree-mismatch and `N file(s) excluded as scope drift` accounting that read as a scope problem they were not; the full output is still appended unabridged. `pushFailureCategory` (the extracted push-failure classifier) checks `ErrVerifyInfraFailure` FIRST so the category-C verdict survives an error that also wraps a category-B sentinel.
 
 **Where the test coverage stops (stated plainly rather than implied).** Every #2645 test ends at `pushFailureCategory(err) == "C"` inside the runner — that a category-C stage is then ADMITTED by `fishhawk_retry_stage` is a property of `backend/internal/server/retry.go` (`C → 200`, re-open on the same A/C path), asserted here from code reading with NO cross-layer test in this change. The runner-side claim is: the failure record this path produces carries category `C`. The recovery half is the backend's existing, separately-tested contract, and a cross-layer pin (runner failure record → retry admission) is a follow-up, not something this change verifies.
@@ -359,12 +369,27 @@ Layered on top is a known-secret denylist (`gateEnvDeny`) plus a `GOOGLE_` deny
 credentials out even if a future allow-rule re-widens. There is no Go toolchain
 variable named `GOOGLE_*`, so the prefix is unambiguous.
 
+**Global/system git config is neutralized (`gateEnvGitConfigPins`, #912 / #3102).**
+After the allow-list loop, `sanitizeEnv` appends `GIT_CONFIG_GLOBAL=/dev/null`
+and `GIT_CONFIG_SYSTEM=/dev/null` so a gate child's temp-repo `git commit` reads
+an empty git configuration and cannot inherit the operator's global
+`commit.gpgsign` + `gpg.ssh.program` — whose signing agent may be down, which
+would fail every such commit and misclassify the stage category B (#3102).
+Default-deny alone does NOT achieve this: the loop drops any inherited
+`GIT_CONFIG_*` (neither key is on any allow-list), but `HOME` IS allow-listed, so
+git falls back to `$HOME/.gitconfig`; the pin closes that fallback. It is a no-op
+where the config files do not exist (e.g. CI) and matches what `scripts/test` —
+the command the verify gate runs — has exported since #912. It deliberately does
+NOT touch the runner's own git plumbing (worktree/rev-parse/reset/commit/push),
+which keeps the inherited env so push credentials still work.
+
 The CLI's `verifyEnv*` copy in `cli/cmd/fishhawk/doctor_verify.go` guards the
 `doctor` verify-command rung on the OPERATOR's own machine and is kept in
 lockstep with this file — the same allow-exact, allow-Go, allow-prefix,
-deny-exact and deny-prefix sets — by `TestGateEnvListsMatchCLICopy`, which reads
-the CLI source through the workspace root and fails on any divergence. **Adding
-a Go variable means adding it to BOTH copies**, or that test fails.
+deny-exact and deny-prefix sets, plus the `gateEnvGitConfigPins` slice — by
+`TestGateEnvListsMatchCLICopy`, which reads the CLI source through the workspace
+root and fails on any divergence. **Adding a Go variable or a pin means adding it
+to BOTH copies**, or that test fails.
 
 **Filesystem isolation: a throwaway checkout.** `runBoundedGateCommand`
 contains the process and the environment; only a separate checkout contains
@@ -573,6 +598,90 @@ Both zero-re-run resumes above — the #1231 scope-completeness `exempt` resolut
 
 **Never a new failure mode.** With no served text and nothing to synthesize from, the resume opens with today's placeholder and ships its artifact exactly as before. Unrecoverable PR text is a quality gap, never a reason to withhold a resume.
 
+## A non-composed PR body is loud (E52.30 / [#3012](https://github.com/kuhlman-labs/fishhawk/issues/3012))
+
+An implement pass shipped the generic placeholder PR body on its FIRST attempt — no Summary, no Test plan, no `Closes #N`, so merging never auto-closed the trigger issue — and nothing in the trace, the log or the audit chain said the agent's text had been skipped. `loadAgentAuthoredPR`'s commonest fallback branch (neither the run/stage-keyed `/tmp/fishhawk-pr-<run>-<stage>.md` handoff nor the legacy fixed path present) returned `prSourceFallback` with an explicit "don't log" and no reason, so a SKIPPED composition was byte-indistinguishable from a deliberately terse body and from the four other fallback branches.
+
+This is the ORDINARY path, not the [#2570](https://github.com/kuhlman-labs/fishhawk/issues/2570) held-commit resume. `prTitleAndBodyParts` is the ONE composition site, shared by `openPRAndShipArtifact` and `openHeldCommitPR`; #2570 changed only how the RESUME recovers text, so this is neither a #2570 regression nor a second composition path.
+
+**Six classifications, one bounded enum.** `prBodyReason` names why the shipped body is not the agent's:
+
+| Reason | Branch |
+|---|---|
+| `""` (`prBodyReasonNone`) | composition SUCCEEDED — a non-empty agent title AND body |
+| `handoff_absent` | neither the keyed nor the legacy path exists — BOTH reads failed `IsNotExist` (the silent branch that shipped #3011) |
+| `handoff_unreadable` | a handoff path exists but the bounded read (`readSidecarBounded`, E64.12) failed for a non-`IsNotExist` reason — a permission error, a directory, OR an over-ceiling `errSidecarTooLarge` — on the keyed path, or the legacy path when the keyed one is absent (the oversize case also emits `pr_description_oversize`; see the bounded-reads subsection below) |
+| `empty_file` | the handoff is empty after trimming |
+| `empty_title` | the handoff's first line is blank |
+| `body_absent` | a TITLE-ONLY handoff — the agent's title is honoured, the PR opens footer-only |
+
+`body_absent` is classified on the body being EMPTY, not on which parse branch produced it, so `title\n\n` (a separator with nothing after it) is caught alongside a bare title line.
+
+**A legacy read FAILURE is not a legacy absence.** The legacy fallback is consulted only when the keyed path is absent, and until the #3012 re-review it classified every `os.ReadFile` error there as `handoff_absent` — so an unreadable legacy handoff (a directory yielding `EISDIR`, a file the runner cannot read) shipped a marker and an audit record falsely claiming neither path existed: this issue's own defect, one branch over. Only `IsNotExist` is now an absence; anything else is `handoff_unreadable`, the same reason the keyed path carries for the identical failure. It gets no sixth wire value, but because the marker names the canonical run/stage-keyed path, the branch emits `pr_description_legacy_unreadable` (path + `detail`) so the path that actually failed appears in the trace — a path diagnostic alongside the pre-existing `pr_description_legacy_path`, not a third member of the composition-signal pair below.
+
+**The composition function is PURE; the CALL SITES emit.** `prTitleAndBodyParts` classifies and RETURNS the reason, logging nothing. The emit lives at the two PR-opening call sites because only they know whether a fallback was subsequently RECOVERED — the held-commit resume replaces the placeholder from backend-served text AFTER composition returns, so emitting inside the composition function would log a composition failure on a resume that recovered successfully. That is the record-asserts-what-did-not-happen defect this issue is about, so reintroducing it here would be self-defeating.
+
+**Two events, mutually exclusive.**
+
+- `pr_body_not_composed` — `{run_id, stage_id, reason, handoff_path}`. Emitted when the reason is non-none AND nothing recovered the body.
+- `pr_body_recovered` — `{run_id, stage_id, reason, title_recovered, body_recovered}`. Emitted ONLY when BOTH hold: composition fell back, AND the served body replaced the placeholder. A resume whose composition SUCCEEDED and which also carries served text emits NEITHER — there was no recovery to announce. The pre-existing `held_commit_pr_text_recovered` is unchanged; `pr_body_recovered` is its greppable counterpart, so `grep pr_body_not_composed` never matches a run that recovered.
+
+**The marker is on the BODY, keyed to the REASON.** Whenever the reason is non-none — including `body_absent`, which is agent-authored — the call site prepends a block naming the run, the stage, the reason value and the handoff path checked, and stating outright that the body carries no `Closes #N` so the merge will not auto-close the trigger issue. The rule is *reason != none implies the body names the failure*, NOT *the handoff was absent implies it*: a title-only handoff shipping an unmarked footer-only body would be the original bug reproduced by its own fix.
+
+**The runner cannot repair the auto-close, only report it.** No `issueNumber` field exists anywhere in this package, so the runner structurally cannot synthesize the missing `Closes #N`, and there is no retro-edit path to add one after the PR opens ([#2782](https://github.com/kuhlman-labs/fishhawk/issues/2782)). Saying what it costs is the honest substitute for a repair that is not available.
+
+**ORDERING: the marker is applied AFTER `implementCommitMessage`.** On the ordinary path `body` feeds BOTH the PR/artifact and the no-sidecar commit-message fallback. Marking first would stamp the marker into `main`'s squash commit message, where it cannot be un-shipped. `TestOpenPRAndShipArtifact_FallbackCommitMessageUnchanged` pins the ordering.
+
+**The reason rides the artifact.** `pr_body_fallback_reason` is added to the `pull_request` artifact map ONLY when non-none, so every composed ship's bytes, content hash and signature are byte-identical (the #1218/#2570 omitempty discipline). The backend declares it on `pullRequestBody` (it must, or `DisallowUnknownFields` would 400 the ship AFTER the PR exists — the #2562/#2563 stranding shape), normalizes an unrecognized value to `unknown` rather than rejecting, and folds it into the `pull_request_opened` audit payload. Two shared wire goldens bind the modules: `testdata/wire/ordinary_pr_artifact.json` (produced by the real `openPRAndShipArtifact` with no handoff, POSTed by the backend suite through the real handler) and `testdata/wire/held_commit_pr_artifact.json`. Both golden tests run against an ISOLATED temp handoff dir and delete nothing under `/tmp`: pinning the production dir and `os.Remove`-ing the keyed plus the SHARED legacy handoff (as they did until the #3012 re-review) could destroy an active run's PR description mid-flight, costing that run exactly the Summary/Test plan/`Closes #N` this issue exists to protect. The fixtures still carry the production path literal — `substituteWireHandoffPath` rewrites the temp path back before the byte comparison, and FAILS if the marker does not name it, so the substitution can never become a silent no-op that greens a vacuous comparison.
+
+**Obligation for a future call site.** The emit is at the call sites BY DESIGN, which means a third production caller of `prTitleAndBodyParts` added without its own emit would regain today's silence. Stated here so it is discoverable rather than folklore.
+
+## A base-rebase re-invoke replays the agent handoffs (E67.93 / [#2840](https://github.com/kuhlman-labs/fishhawk/issues/2840))
+
+Four PRs ([#2741](https://github.com/kuhlman-labs/fishhawk/pull/2741), [#2755](https://github.com/kuhlman-labs/fishhawk/pull/2755), [#2776](https://github.com/kuhlman-labs/fishhawk/pull/2776), [#2779](https://github.com/kuhlman-labs/fishhawk/pull/2779)) opened with the `chore: fishhawk implement stage <id>` placeholder title, a placeholder body and a placeholder commit message even though their agents had written a perfectly good PR description — so the trigger issue never auto-closed. The agent did nothing wrong; the stage hit a base-rebase conflict.
+
+**The mechanism is delete-after-read meeting a second pass.** Both agent handoffs are one-shot files under `/tmp`:
+
+| Handoff | Path | Loader |
+|---|---|---|
+| PR description | `/tmp/fishhawk-pr-<run>-<stage>.md` (plus the legacy fixed path) | `loadAgentAuthoredPR` |
+| Initial commit message | `/tmp/fishhawk-implement-commitmsg-<run>-<stage>.txt` | `loadImplementCommitMessage` |
+
+Each loader `os.Remove`s whichever path it read, on every return path, so a stale handoff can never bleed into a later run/stage. That is right ACROSS stages and wrong WITHIN one, because `openPRAndShipArtifact` resolves both handoffs BEFORE `CommitAndPush` can fail with `gitops.ErrBaseRebaseConflict` — and on that error `run()` re-invokes the agent (`reinvokeOnBaseRebaseConflict`, [#989](https://github.com/kuhlman-labs/fishhawk/issues/989)) and calls `openPRAndShipArtifact` a SECOND time. By then both files are gone, so the second pass falls through to the placeholder for the title, the body AND the commit message. The runner log was the only place this was observable at all, and it said nothing about it.
+
+**`agentHandoff` is a per-stage memo, armed lazily.** `cfg.handoff` is a runtime-set POINTER field on `config` (the `agentBinary`/`agentVersion` idiom), armed in `run()` immediately before the FIRST `openPRAndShipArtifact` call of an implement stage and nil everywhere else. `config` is passed by value, but copying a struct copies the pointer, not the pointee — so both calls share ONE memo without adding a 16th parameter to a function with 38 test call sites and two shared wire goldens that construct its args directly.
+
+Arming LAZILY rather than hoisting the capture above the retry is deliberate. A hoist would move the loaders' emits (`pr_template_warning`, `pr_description_legacy_path`, `implement_commitmsg_empty`) earlier in the runner log and break first-pass byte-identity. With a memo the FIRST read still happens inside `openPRAndShipArtifact`, at the same point, with the same emits in the same order; only a SECOND pass consults the memo. `TestAgentHandoff_ArmedNoConflictUnchanged` asserts an armed memo is indistinguishable from a nil one across every handoff shape, and the unedited `testdata/wire/ordinary_pr_artifact.json` golden is the independent byte-level detector.
+
+**Three rules, each its own control.**
+
+| Rule | Behaviour | Why | Pinned by |
+|---|---|---|---|
+| (a) fresh-first | ALWAYS attempt the fresh read; never short-circuit on a stored value | `baseRebaseConflictPrompt` re-requests both handoffs by absolute keyed path, so a compliant re-invoked agent re-writes them — and its text describes the RE-LANDED slice, so it must win | `TestRun_ImplementStage_BaseRebaseConflict_ReinvokeFreshHandoffWins` |
+| (b) store-on-success | Store only `prSourceAgent` / `ok` captures | a first-pass MISS must not poison a later pass that DOES find text, and a cached fallback would announce a replay that never happened | `TestAgentHandoff_LoadOrReplay`, `TestRun_ImplementStage_BaseRebaseConflict_ReinvokeNoHandoffStillFallsBack` |
+| (c) replay-on-miss | Replay the stored capture only when the fresh read yielded no agent text, and emit an event | the runner log is the only surface where this failure is visible | `TestRun_ImplementStage_BaseRebaseConflict_ReinvokeKeepsAgentPRText`, `TestAgentHandoff_ReplayEmitsEvent` |
+
+Prefer-fresh, not replay-first, is the correct precedence: replay-first would silently discard the option-3 re-request this change also lands, and would ship a description of the slice the agent could NOT land. The cost is accepted and stated — a re-invoked agent that writes a WORSE description overwrites a good first-pass one.
+
+**Fresh-but-MALFORMED loses to stored.** "Fresh wins" under (a) is scoped to fresh AGENT TEXT — a `prSourceAgent` read — so a re-invoked agent that DID re-write the handoff but botched it (an empty title, an unreadable file: `empty_title`, `empty_file`, `handoff_unreadable`) is a miss under (c), and the stored first-pass capture replays, discarding the fresh read's classification. This is deliberate, not an oversight: the memo exists precisely because the second pass cannot re-derive the agent's text, and a `prBodyReasonEmptyTitle` fallback is strictly worse for the PR than the first pass's real description. The malformed write does not vanish from the trace — the loader's own `pr_template_invalid` / `pr_description_legacy_unreadable` warning is emitted by the fresh read that precedes the replay, so the log carries the warning AND `pr_description_replayed` in that order. Pinned by `TestAgentHandoff_LoadOrReplay`'s `fresh malformed loses to stored` case.
+
+A NIL receiver is a pure load that stores nothing, which is what keeps every un-armed path — the plan and acceptance stages, the held-commit resume, every fix-up pass — byte-identical.
+
+**Two events, and how they relate to [#3012](https://github.com/kuhlman-labs/fishhawk/issues/3012)'s vocabulary.**
+
+- `pr_description_replayed` — `{run_id, stage_id}`.
+- `implement_commitmsg_replayed` — `{run_id, stage_id}`.
+
+`pr_description_replayed` is the memo's sibling of `pr_body_recovered`: the same RESOLVED-STATE shape (composition fell back, then text was recovered, so record the recovery rather than a composition failure), reached by a different mechanism — an in-process memo across two `openPRAndShipArtifact` calls, versus backend-served text across a park/resume. They are distinct events because the mechanisms differ, but they must not disagree about what the audit records, so the memo REUSES #3012's vocabulary rather than growing a parallel one: a replay returns the stored `(title, body, kind, prBodyReason)` tuple VERBATIM, so the artifact's `pr_body_fallback_reason` resolves exactly as it did on the capturing pass. A full agent handoff replays reason `none`, which — because `emitPRBodyNotComposed` is keyed off the RETURNED reason — suppresses a spurious `pr_body_not_composed` by construction rather than by suppression machinery; `TestAgentHandoff_ReplayEmitsEvent` asserts that property rather than assuming it. A TITLE-ONLY handoff replays `body_absent` and is marked exactly as the capturing pass marked it — which means the call site emits `pr_body_not_composed reason=body_absent` a second time for the same stage, alongside `pr_description_replayed`. That double-emit is the accepted consequence of marking a replay identically to its capture rather than inventing a replay-only classification; it is pinned by `TestAgentHandoff_LoadOrReplay`'s `pr title-only replays body_absent` case so it stays a decision rather than an accident. When neither fresh nor stored text exists the FRESH fallback is returned verbatim, reason included, so a genuine absence still ships the marked placeholder and still emits `pr_body_not_composed reason=handoff_absent`.
+
+A replayed pass emits FEWER file-level events than a real read would — no `pr_template_warning`, no `pr_description_legacy_path` on the second pass. That is deliberate single-emission (the discipline #3012 applied to `pr_body_not_composed`), and the two replay events are what make it greppable.
+
+**`baseRebaseConflictPrompt` also re-requests both handoffs** (the issue's option 3), naming the exact absolute keyed paths via the runner's own `pullRequestDescriptionPath` / `implementCommitMessagePath` helpers so the prompt can never name a path the runner does not read, and stating that the previous attempt's handoffs were consumed. It takes `cfg` for that; the single call site in `reinvokeOnBaseRebaseConflict` is updated for the new signature. This is belt-and-braces only — the memo already closes the hole when the agent does not comply, which is the [#2658](https://github.com/kuhlman-labs/fishhawk/issues/2658) shape.
+
+**`runVerifyFixLoop` consumes NEITHER handoff** (the `verify_fix_reinvoke` question the issue asks to check rather than assume). Verified by a caller sweep: the only production consumers of `prTitleAndBody` / `prTitleAndBodyParts` / `implementCommitMessage` are `openPRAndShipArtifact` and `openHeldCommitPR`, and the verify-fix loop calls none of them. The memo makes the question moot for any future re-invoke path added on this stage.
+
+**Residual, deliberate.** A stage that opens a PR through any future THIRD pass inherits the memo automatically, because the memo lives on `config` rather than inside the retry block. A stage whose agent never writes a handoff at all still ships the #3012-marked placeholder, by design — the memo recovers text that existed, it does not invent text that did not.
+
 ## PR-open credential re-authentication (E67.62 / [#2730](https://github.com/kuhlman-labs/fishhawk/issues/2730))
 
 An implement stage that runs the full hour could reach PR-open holding a dead GitHub App installation token and fail the WHOLE stage `401 Bad credentials` — after the gate-verified commit was already pushed. The credential is minted at the top of `openPRAndShipArtifact`, but the forge write happens after `CommitAndPush`, whose committed-tree verify (plus the verify-fix loop) can run for minutes; App installation tokens live ~1 hour and the backend's `githubapp.CachedProvider` only guarantees `RefreshLeadTime` (5m) of remaining life at mint. So the push succeeds on that token and the PR-open 401s.
@@ -695,3 +804,60 @@ one-sided edit silently DISABLES the signal, so both sides are pinned against
 one shared literal JSON fixture. EVIDENCE ONLY: this block never touches
 `res.OK`, `res.FailureCategory`, or the budget. Long-form contract:
 `backend/internal/fixupobligation/README.md`.
+
+## Bounded reads of agent-authored sidecars (E64.12 / [#3106](https://github.com/kuhlman-labs/fishhawk/issues/3106))
+
+Every sidecar in the family is written by an untrusted coding agent, so its size
+is agent-controlled input. `readSidecarBounded` (`sidecarread.go`) is the one
+shared reader they now all go through: an `io.LimitReader` over an `os.Open`,
+capped at `maxSidecarBytes` (**1 MiB**), returning a distinct `errSidecarTooLarge`
+sentinel when the file exceeds the ceiling. It returns the `os.Open`/read error
+UNWRAPPED so every caller's `os.ErrNotExist` / `os.IsNotExist` ladder,
+`loadCounterfactualReport`'s dangling-symlink `os.Lstat` re-check, and the
+keyed-first-legacy-fallback ordering all keep working; over the ceiling it
+returns NIL bytes, never the truncated prefix, so no caller can partially decode.
+
+**The security property lives ENTIRELY in the ceiling, not in the per-loader
+branches.** Every one of these loaders ALREADY fails closed on a non-`ErrNotExist`
+read error today — silently returning its zero value or taking a
+present-but-unreadable branch — and `errSidecarTooLarge` is such an error, so all
+seven sites would fail closed even with no oversize branch written at all. What
+each per-loader branch adds is (1) DIAGNOSIS — a named `*_oversize` event so an
+operator can tell an oversize sidecar from a malformed one — and (2) at the
+loaders that return on the read-error path BEFORE their deferred delete-after-read
+is installed (`loadFixupSelfReport`, `loadScopeExemptions`,
+`loadFixupCommitMessage`, `loadImplementCommitMessage`, `loadAgentAuthoredPR`),
+the removal the early return would otherwise skip. Deleting a branch therefore
+costs the named event everywhere, and additionally the on-disk cleanup at those
+five; it never re-opens the fail-closed hole.
+
+The seven governed loaders and their events: `loadCounterfactualReport`
+(`counterfactual_report_oversize`), `loadFixupSelfReport`
+(`fixup_selfreport_oversize`), `loadScopeExemptions`
+(`scope_justification_oversize`), `loadFixupCommitMessage`
+(`fixup_commitmsg_oversize`), `loadImplementCommitMessage`
+(`implement_commitmsg_oversize`), `loadAgentAuthoredPR` (keyed AND legacy paths,
+`pr_description_oversize`), and `captureAcceptanceVerdict` (keyed AND legacy
+paths, `acceptance_verdict_oversize`). All except the acceptance loader REMOVE the
+oversize file (`loadAgentAuthoredPR` reuses `prBodyReasonHandoffUnreadable` — an
+oversize handoff is a present-but-unusable one, so no sixth wire reason is
+added; the distinct log event carries the discrimination).
+
+ONE documented deviation: `captureAcceptanceVerdict` does NOT remove the oversize
+verdict. It has never removed on read — removal for the acceptance verdict is
+owned by the PRE-INVOKE `sweepStaleAcceptanceVerdict`, which fails the stage
+category-C when it cannot unlink. So this stage's oversize verdict survives on
+disk until the NEXT acceptance stage's pre-invoke sweep clears it; folding a
+removal in here would move that ownership and could mask a sweep failure. The
+oversize verdict returns a wrapped non-`nil` error that is NOT
+`errAcceptanceVerdictMissing` (the verdict is present-but-oversize, not missing),
+so the stage fails closed exactly as for any other verdict read error.
+
+**Severity, honestly:** this is defense-in-depth on an already-documented
+fail-closed boundary, NOT a live vulnerability. The writer is the coding agent
+already executing in the same sandbox, and every path is run/stage-keyed. The
+ceiling bounds what an agent can materialize into runner memory before any cap or
+validation applies; the diagnostic events make a dropped honest sidecar (the
+too-low-ceiling failure mode) visible rather than silent. `maxSidecarBytes` is a
+plain `const`, never a test-injectable var, so the tests exercise the SHIPPED
+value; `TestSidecarCeilingValue` pins the number.
