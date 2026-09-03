@@ -439,18 +439,93 @@ func RestoreFixupStage(ctx context.Context, repo Repository, implementStageID uu
 // commit onto a merged PR is not meaningful). v0 workflows define a
 // single review stage (MVP_SPEC §4.1); the first one awaiting approval
 // is selected.
+//
+// The refusal names the REMEDY, not only the unmet precondition (#3116).
+// In a workflow that orders acceptance BEFORE review (feature_change), an
+// implement stage can succeed while the review stage is still `pending`
+// because the acceptance stage has not settled — a legal, common state in
+// which the generic "the review gate is not open" sentence tells the
+// operator nothing they can act on. So the blocker is CLASSIFIED into four
+// branches, and the acceptance branch splits again by whether the operator
+// can still dispatch acceptance or must simply wait for the in-flight one:
+// naming a remedy the operator cannot take is the very defect #3116 exists
+// to stop, and it would be reproduced here by a single acceptance sentence.
 func findOpenReviewStage(ctx context.Context, repo Repository, runID uuid.UUID) (*Stage, error) {
 	stages, err := repo.ListStagesForRun(ctx, runID)
 	if err != nil {
 		return nil, fmt.Errorf("FixupStage: list stages for run: %w", err)
 	}
+	var review *Stage
 	for _, s := range stages {
-		if s.Type == StageTypeReview && s.State == StageStateAwaitingApproval {
-			return s, nil
+		if s.Type == StageTypeReview {
+			if s.State == StageStateAwaitingApproval {
+				return s, nil
+			}
+			if review == nil {
+				review = s
+			}
 		}
 	}
-	return nil, fmt.Errorf("%w: implement stage succeeded but the run has no review stage awaiting approval (the review gate is not open or already resolved)",
-		ErrFixupNotApplicable)
+
+	// (d) No review stage at all — nothing to re-park, and no gate that will
+	// ever open.
+	if review == nil {
+		return nil, fmt.Errorf("%w: implement stage succeeded but the run has no review stage at all, so there is no review gate a fix-up could re-park; address the concerns in a fresh run",
+			ErrFixupNotApplicable)
+	}
+
+	// (c) The review stage already resolved (succeeded/failed/cancelled/
+	// superseded): the gate is closed for good — a fix-up commit onto an
+	// already-reviewed (possibly merged) PR is not meaningful.
+	if review.State.IsTerminal() {
+		return nil, fmt.Errorf("%w: implement stage succeeded but the run's review stage is already resolved (state %q), so the review gate is closed; address the remaining concerns in a fresh run",
+			ErrFixupNotApplicable, review.State)
+	}
+
+	// The review gate has NOT opened yet. Classify what is holding it closed.
+	if acc := blockingAcceptanceStage(stages); acc != nil {
+		// (a) A not-yet-terminal acceptance stage runs ahead of review, so the
+		// review gate cannot open until it settles. Split the guidance by what
+		// the operator can actually DO about it.
+		if acceptanceIsDispatchable(acc.State) {
+			// pending / awaiting_host_dispatch: no spawn attempt exists yet, so
+			// the operator's move is to dispatch it.
+			return nil, fmt.Errorf("%w: implement stage succeeded but the review gate has not opened yet: the acceptance stage (state %q) must settle first. Dispatch the acceptance stage, let it settle, then route the fix-up — the fix-up budget is not consumed by waiting",
+				ErrFixupNotApplicable, acc.State)
+		}
+		// dispatched / running / awaiting_* : a spawn attempt already exists, so
+		// "dispatch acceptance" would be advice the operator cannot act on.
+		return nil, fmt.Errorf("%w: implement stage succeeded but the review gate has not opened yet: the acceptance stage is already in flight (state %q). Wait for acceptance to settle, then route the fix-up — the fix-up budget is not consumed by waiting",
+			ErrFixupNotApplicable, acc.State)
+	}
+
+	// (b) The review stage is not open and no acceptance stage is holding it:
+	// some other preceding stage has yet to settle. Poll rather than act.
+	return nil, fmt.Errorf("%w: implement stage succeeded but the review gate has not opened yet (review stage state %q); it opens when the preceding stages settle — re-poll the run and route the fix-up once the review stage reaches %q",
+		ErrFixupNotApplicable, review.State, StageStateAwaitingApproval)
+}
+
+// blockingAcceptanceStage returns the run's acceptance stage when it exists
+// and has NOT reached a terminal state — the stage whose settling the review
+// gate is waiting on in a workflow that orders acceptance before review
+// (#3116). Returns nil when the run declares no acceptance stage or its
+// acceptance stage is already terminal, in which case acceptance is not what
+// is holding the review gate closed.
+func blockingAcceptanceStage(stages []*Stage) *Stage {
+	for _, s := range stages {
+		if s.Type == StageTypeAcceptance && !s.State.IsTerminal() {
+			return s
+		}
+	}
+	return nil
+}
+
+// acceptanceIsDispatchable reports whether a blocking acceptance stage is one
+// the operator can still DISPATCH (no spawn attempt exists yet) rather than
+// one already in flight, which they can only wait on. The split exists so the
+// refusal never names a remedy that does not apply (#3116 binding condition 1).
+func acceptanceIsDispatchable(s StageState) bool {
+	return s == StageStatePending || s == StageStateAwaitingHostDispatch
 }
 
 // findReviewStageForAcceptanceReopen locates the run's review stage for an

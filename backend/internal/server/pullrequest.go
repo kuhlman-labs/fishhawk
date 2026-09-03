@@ -44,6 +44,43 @@ const CategoryScopeFilesExempted = "scope_files_exempted"
 // pullRequestBody is the wire shape the runner POSTs. Required
 // fields are validated structurally below — there's no JSON Schema
 // for v0; v1+ can graduate this to `pull_request_v1.schema.json`.
+// prBodyFallbackReasons is the closed set of pr_body_fallback_reason values
+// this backend recognizes. MIRRORED from the runner's prBodyReason constants
+// (runner/cmd/fishhawk-runner/main.go) — the runner is a separate Go module and
+// cannot be imported (the #1774/#2501 mirrored-literal pattern). The shared
+// testdata/wire goldens are what make a drift fail a test rather than ship.
+//
+// "unknown" is a member because it is what this backend RECORDS for a
+// non-member, so the recorded set is closed even though the accepted set is not.
+var prBodyFallbackReasons = map[string]struct{}{
+	"handoff_absent":     {},
+	"handoff_unreadable": {},
+	"empty_file":         {},
+	"empty_title":        {},
+	"body_absent":        {},
+	"unknown":            {},
+}
+
+// normalizePRBodyFallbackReason maps the wire value onto the recorded set: ""
+// for absent, the value itself when recognized, "unknown" for anything else.
+//
+// FAIL-OPEN BY DESIGN. A pull-request artifact arrives AFTER the pull request
+// already exists on the forge, so rejecting it 400 over an advisory diagnostic
+// would strand the stage in `running` — the failure this field's declaration
+// exists to prevent. Normalizing loses fidelity across a runner/backend version
+// skew (a sixth runner reason collapses to "unknown"), which is the right trade
+// against echoing an arbitrary agent-adjacent string into an append-only chained
+// audit log; an operator reading "unknown" should check the runner version.
+func normalizePRBodyFallbackReason(v string) string {
+	if v == "" {
+		return ""
+	}
+	if _, ok := prBodyFallbackReasons[v]; ok {
+		return v
+	}
+	return "unknown"
+}
+
 type pullRequestBody struct {
 	PRNumber          int    `json:"pr_number"`
 	PRURL             string `json:"pr_url"`
@@ -53,6 +90,20 @@ type pullRequestBody struct {
 	Title             string `json:"title"`
 	Body              string `json:"body,omitempty"`
 	FilesChangedCount int    `json:"files_changed_count"`
+
+	// PRBodyFallbackReason names WHY the shipped PR body is not the
+	// agent-composed one (#3012) — handoff_absent, handoff_unreadable,
+	// empty_file, empty_title or body_absent. It must be DECLARED here, not
+	// merely tolerated: the handler decodes with DisallowUnknownFields, so an
+	// undeclared runner key is a 400 AFTER the real pull request already exists
+	// on the forge — the #2562/#2563 stranding shape, strictly worse than the
+	// diagnostic it carries.
+	//
+	// OPTIONAL and absent on every composed ship (the runner omits the key
+	// entirely), so every pre-#3012 body, content hash and signature is
+	// byte-identical. Advisory only: normalizePRBodyFallbackReason maps an
+	// unrecognized value to "unknown" and validate() never rejects on it.
+	PRBodyFallbackReason string `json:"pr_body_fallback_reason,omitempty"`
 
 	// Outcome, Category, and Reason form the optional failure-report
 	// variant (#742). When Outcome=="failed" the body is a runner-reported
@@ -560,7 +611,7 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auditPayload, _ := json.Marshal(map[string]any{
+	auditFields := map[string]any{
 		"run_id":              runID.String(),
 		"stage_id":            stageID.String(),
 		"artifact_id":         created.ID.String(),
@@ -573,7 +624,14 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		"files_changed_count": pr.FilesChangedCount,
 		"size_bytes":          len(body),
 		"auth_method":         authMethod,
-	})
+	}
+	// #3012: surface the composition-failure classification on the audit entry,
+	// OMITTING the key when there is none so every pre-#3012 payload stays
+	// byte-identical.
+	if reason := normalizePRBodyFallbackReason(pr.PRBodyFallbackReason); reason != "" {
+		auditFields["pr_body_fallback_reason"] = reason
+	}
+	auditPayload, _ := json.Marshal(auditFields)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &stageID,

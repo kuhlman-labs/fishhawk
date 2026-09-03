@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -100,7 +101,156 @@ const (
 		"project": {"id": 380, "path_with_namespace": "gitlab-org/gitlab-test"},
 		"user": {"username": "root"}
 	}`
+
+	// The three fixtures below pin the Pipeline Hook REF SHAPES the CI-retry
+	// classification turns on (E45.30 / #2881). Read what they do and do NOT
+	// prove: each pins a TRANSCRIPTION, an ADAPTATION of one, or an INFERENCE —
+	// stated per fixture below — and the parse built on it. Only
+	// glMergeRequestPipelineFixture is transcribed value-for-value from an
+	// upstream example. None of them independently confirms that GitLab
+	// emits that shape — no test in this repository observes a live delivery.
+	// The per-fixture URL is what makes a wrong transcription DETECTABLE by a
+	// reader checking it against upstream; it is a review aid, not an automated
+	// check. Every fixture is TRIMMED to the fields ParseGitLabEvent and the
+	// matchers read.
+
+	// glBranchPipelineFixture — a BRANCH pipeline on a Fishhawk run branch.
+	//
+	// THIS FIXTURE IS ADAPTED, NOT TRANSCRIBED VERBATIM. Its FIELD NAMES and
+	// structure are transcribed from the "Pipeline events" example on GitLab's
+	// webhook events reference
+	// (https://docs.gitlab.com/user/project/integrations/webhook_events/), but
+	// that page's single pipeline example is a MERGE-REQUEST pipeline, so two
+	// VALUES here are substitutions rather than fields lifted from it: ref is a
+	// Fishhawk-namespaced run branch ("fishhawk/run-abcdef12"), which no upstream
+	// example can contain, and source = "push" is set to exercise the run-branch
+	// arm. The absence of a top-level merge_request block follows from that
+	// substitution. Do not read this fixture as an upstream-confirmed branch
+	// pipeline payload; it is the documented SHAPE with run-branch values in it.
+	glBranchPipelineFixture = `{
+		"object_kind": "pipeline",
+		"object_attributes": {
+			"id": 31,
+			"iid": 3,
+			"ref": "fishhawk/run-abcdef12",
+			"sha": "bcbb5ec396a2c0f828686f14fac9b80b780504f2",
+			"source": "push",
+			"status": "failed"
+		},
+		"user": {"username": "root"},
+		"project": {"id": 1, "path_with_namespace": "mike/diaspora"}
+	}`
+
+	// glMergeRequestPipelineFixture — a MERGE-REQUEST pipeline as the Pipeline
+	// Hook documents it. Transcribed from the "Pipeline events" example on
+	// https://docs.gitlab.com/user/project/integrations/webhook_events/ : the ref
+	// is the MR's TARGET BRANCH ("master"), the discriminator is
+	// object_attributes.source = "merge_request_event", and the MR coordinates
+	// ride in the documented top-level merge_request block. This is the shape the
+	// SOURCE signal exists for, and the only MR shape documented for THIS payload
+	// type.
+	glMergeRequestPipelineFixture = `{
+		"object_kind": "pipeline",
+		"object_attributes": {
+			"id": 32,
+			"iid": 4,
+			"ref": "master",
+			"sha": "bcbb5ec396a2c0f828686f14fac9b80b780504f2",
+			"source": "merge_request_event",
+			"status": "failed"
+		},
+		"user": {"username": "root"},
+		"project": {"id": 1, "path_with_namespace": "mike/diaspora"},
+		"merge_request": {"iid": 7, "source_branch": "feature", "target_branch": "master"}
+	}`
+
+	// glMergedResultsPipelineFixture — a MERGED-RESULTS pipeline ref.
+	//
+	// THE REF SHAPE HERE IS INFERRED, NOT TRANSCRIBED FROM A WEBHOOK EXAMPLE.
+	// refs/merge-requests/<iid>/merge and .../head are documented for
+	// CI_MERGE_REQUEST_REF_PATH — a RUNNER-SIDE predefined variable
+	// (https://docs.gitlab.com/ci/variables/predefined_variables/) — and on the
+	// merged-results pipelines page
+	// (https://docs.gitlab.com/ci/pipelines/merged_results_pipelines/). No
+	// upstream Pipeline Hook EXAMPLE shows object_attributes.ref carrying either
+	// form; the documented Pipeline Hook payload carries the target branch with
+	// source = "merge_request_event" (see glMergeRequestPipelineFixture). Do not
+	// read this fixture as evidence that the Pipeline Hook emits this shape — it
+	// is not, and that has not been confirmed upstream. It pins the DEFENSIVE ref
+	// arm, which may never fire on a real Pipeline Hook.
+	//
+	// The source field is omitted on purpose: this fixture must exercise the ref
+	// signal ALONE, so the source signal cannot mask its deletion.
+	glMergedResultsPipelineFixture = `{
+		"object_kind": "pipeline",
+		"object_attributes": {
+			"id": 33,
+			"iid": 5,
+			"ref": "refs/merge-requests/7/merge",
+			"sha": "bcbb5ec396a2c0f828686f14fac9b80b780504f2",
+			"status": "failed"
+		},
+		"user": {"username": "root"},
+		"project": {"id": 1, "path_with_namespace": "mike/diaspora"}
+	}`
 )
+
+// TestParseGitLabEvent_PipelineFixtureRefShapes is the DONE-MEANS test for the
+// committed fixtures (E45.30 / #2881). The fixture bodies are transcribed
+// constants whose correctness no compiler enforces, so they are asserted
+// BEHAVIOURALLY — driven through the real ParseGitLabEvent + MatchGitLabEvent
+// — rather than by a presence check a comment-only edit would satisfy.
+//
+// The property the whole change turns on is the last one: NEITHER merge-request
+// shape (target-branch ref, or refs/merge-requests/<iid>/merge) carries the
+// gitLabRunBranchNamespace prefix, while the branch fixture does. That is why
+// an MR pipeline lands in the not-a-run-branch arm at all.
+func TestParseGitLabEvent_PipelineFixtureRefShapes(t *testing.T) {
+	cases := []struct {
+		name          string
+		body          string
+		wantRef       string
+		wantSource    string
+		wantMRIID     int
+		wantRunBranch bool
+	}{
+		{"branch_pipeline", glBranchPipelineFixture, "fishhawk/run-abcdef12", "push", 0, true},
+		{"merge_request_pipeline", glMergeRequestPipelineFixture, "master", "merge_request_event", 7, false},
+		{"merged_results_pipeline", glMergedResultsPipelineFixture, "refs/merge-requests/7/merge", "", 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev, err := ParseGitLabEvent("Pipeline Hook", "uuid-123", []byte(tc.body))
+			if err != nil {
+				t.Fatalf("ParseGitLabEvent: %v", err)
+			}
+			if ev.Type != "pipeline" {
+				t.Fatalf("Type = %q, want pipeline", ev.Type)
+			}
+			m := MatchGitLabEvent(ev)
+			if m.Skip || m.Action != MatchActionCIFailureRetry {
+				t.Fatalf("match = %+v, want MatchActionCIFailureRetry", m)
+			}
+			if m.PipelineRef == nil {
+				t.Fatal("PipelineRef = nil")
+			}
+			if got := m.PipelineRef.Ref; got != tc.wantRef {
+				t.Errorf("Ref = %q, want %q", got, tc.wantRef)
+			}
+			if got := m.PipelineRef.Source; got != tc.wantSource {
+				t.Errorf("Source = %q, want %q", got, tc.wantSource)
+			}
+			if got := m.PipelineRef.MergeRequestIID; got != tc.wantMRIID {
+				t.Errorf("MergeRequestIID = %d, want %d", got, tc.wantMRIID)
+			}
+			gotRunBranch := strings.HasPrefix(m.PipelineRef.Ref, gitLabRunBranchNamespace)
+			if gotRunBranch != tc.wantRunBranch {
+				t.Errorf("ref %q has run-branch prefix = %v, want %v",
+					m.PipelineRef.Ref, gotRunBranch, tc.wantRunBranch)
+			}
+		})
+	}
+}
 
 func TestParseGitLabEvent_AllKinds(t *testing.T) {
 	cases := []struct {

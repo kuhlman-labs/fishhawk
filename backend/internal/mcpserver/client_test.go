@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // TestAPIError_Error pins the apiError.Error() rendering (#1548): a
@@ -2307,4 +2308,147 @@ func TestCreateCampaign_GroomingSourceOnTheWire(t *testing.T) {
 	if got.GroomingSource["report_content_hash"] != "sha256:abc" {
 		t.Errorf("decoded Campaign.GroomingSource = %v, want the report content hash carried through", got.GroomingSource)
 	}
+}
+
+// --- issue-set client timeout (E54.59 / #3113) ---
+
+// TestIssueSetClientTimeoutExceedsPermittedServerBudget is the RELATIONSHIP
+// PIN: the MCP client's issue-set timeout must sit ABOVE the server's PERMITTED
+// MAXIMUM issue-set resolution budget, not merely above its shipped default. If
+// it did not, an operator who raised FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET
+// toward the maximum would put the client back in the position of giving up
+// first — a bare transport error carrying no counts, which is the #3113 defect.
+//
+// This pin compares two constants, so it is NECESSARY BUT NOT SUFFICIENT (the
+// operator said so explicitly). The two holes it structurally cannot see are
+// covered by TestCreateCampaign_EffectiveBudgetIsClampedOnTheWire (a Config
+// built above the maximum still yields the ceiling, observed through the wire)
+// and TestCreateCampaign_BudgetSpanCoversPreResolutionWork (the server's
+// deadline is anchored at handler entry, so the one-minute margin does not have
+// to absorb unbounded pre-resolution work).
+func TestIssueSetClientTimeoutExceedsPermittedServerBudget(t *testing.T) {
+	if issueSetClientTimeout <= server.MaxIssueSetResolutionBudget {
+		t.Fatalf("issueSetClientTimeout = %s, want STRICTLY GREATER than server.MaxIssueSetResolutionBudget = %s — otherwise a permitted server budget lets the client abort first and the operator sees a bare transport error instead of the 504's counts",
+			issueSetClientTimeout, server.MaxIssueSetResolutionBudget)
+	}
+	// The client must also actually be WIRED with that constant; a pin on an
+	// unused constant proves nothing about the running system.
+	c := newAPIClient(config{backendURL: "http://example.invalid", apiToken: "t"})
+	if c.httpIssueSet == nil {
+		t.Fatal("newAPIClient built no httpIssueSet client")
+	}
+	if c.httpIssueSet.Timeout != issueSetClientTimeout {
+		t.Errorf("httpIssueSet.Timeout = %s, want %s", c.httpIssueSet.Timeout, issueSetClientTimeout)
+	}
+	// And it must not be the 30s short client — that IS the pre-#3113 routing.
+	if c.httpIssueSet == c.http {
+		t.Error("httpIssueSet is the 30s short client — CreateCampaign would still abort at 30s")
+	}
+}
+
+// TestCreateCampaign_RoutesThroughTheIssueSetClient proves the ROUTING, which
+// the constant pin above cannot see: CreateCampaign must actually use
+// httpIssueSet. The seam is observable without waiting minutes — set httpIssueSet
+// to a client that fails every request via a sentinel transport, and assert
+// CreateCampaign surfaces the sentinel. A CreateCampaign still routed through
+// c.http would reach the stub and return a campaign instead.
+func TestCreateCampaign_RoutesThroughTheIssueSetClient(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"` + uuid.NewString() + `","repo":"kuhlman-labs/fishhawk","state":"pending"}`))
+	}))
+	t.Cleanup(stub.Close)
+
+	c := newAPIClient(config{backendURL: stub.URL, apiToken: "t"})
+	c.httpIssueSet = &http.Client{Transport: sentinelRoundTripper{}}
+	_, err := c.CreateCampaign(context.Background(), "kuhlman-labs/fishhawk", "", "", nil,
+		[]string{"issue:101"}, "", nil)
+	if err == nil {
+		t.Fatal("CreateCampaign succeeded — it did NOT route through httpIssueSet")
+	}
+	if !errors.Is(err, errSentinelTransport) {
+		t.Fatalf("error = %v, want the httpIssueSet sentinel — CreateCampaign is routed through some other client", err)
+	}
+}
+
+var errSentinelTransport = errors.New("sentinel: issue-set client")
+
+type sentinelRoundTripper struct{}
+
+func (sentinelRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errSentinelTransport
+}
+
+// TestCreateCampaignDecodesServerTimeout504 is the ORDERING DISCRIMINATION: a
+// backend slower than the OLD 30s short-client wall would have allowed still
+// reaches the client, which decodes the server's own 504 with its counts intact.
+// Its CONTROL (the second subtest) shortens the client timeout BELOW the
+// server's response latency and asserts a transport error and NO 504 — proving
+// it is the ORDERING of the two timeouts, and not the response body, that
+// produces the numbered refusal.
+//
+// The stub is a REACHABLE in-test server, not an unreachable address: pointing
+// at an unreachable host would produce a transport error whether or not the
+// ordering held, which would green the control vacuously.
+func TestCreateCampaignDecodesServerTimeout504(t *testing.T) {
+	// serverLatency stands in for a SHORT injected server budget: the stub sleeps
+	// this long and then emits the real 504 envelope the server writes.
+	serverLatency := timescale.D(300 * time.Millisecond)
+	envelope := `{"error":{"code":"issue_set_resolution_timeout","message":"resolving the campaign's issue set exceeded the server's budget","details":{"resolved":37,"items_total":60,"suggested_grooming_order_limit":37,"budget_seconds":120}}}`
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverLatency)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGatewayTimeout)
+		_, _ = w.Write([]byte(envelope))
+	}))
+	t.Cleanup(stub.Close)
+
+	t.Run("client outlasts the server and decodes the 504", func(t *testing.T) {
+		c := newAPIClient(config{backendURL: stub.URL, apiToken: "t"})
+		// The shipped issueSetClientTimeout is 11 minutes; the test shortens it to
+		// a value still WELL ABOVE the stub's latency to keep the run fast. The
+		// ORDERING (client wait > server latency) is what is under test here; the
+		// shipped constant's own ordering is pinned by the relationship test.
+		c.httpIssueSet = &http.Client{Timeout: timescale.D(10 * time.Second)}
+		_, err := c.CreateCampaign(context.Background(), "kuhlman-labs/fishhawk", "", "", nil,
+			[]string{"issue:101"}, "", nil)
+		var ae *apiError
+		if !errors.As(err, &ae) {
+			t.Fatalf("error = %v (%T), want *apiError decoded from the server's 504", err, err)
+		}
+		if ae.StatusCode != http.StatusGatewayTimeout {
+			t.Errorf("StatusCode = %d, want 504", ae.StatusCode)
+		}
+		if ae.Code != "issue_set_resolution_timeout" {
+			t.Errorf("Code = %q, want issue_set_resolution_timeout", ae.Code)
+		}
+		for key, want := range map[string]float64{
+			"resolved": 37, "items_total": 60, "suggested_grooming_order_limit": 37, "budget_seconds": 120,
+		} {
+			got, ok := ae.Details[key].(float64)
+			if !ok {
+				t.Errorf("Details[%q] = %#v, want a JSON number", key, ae.Details[key])
+				continue
+			}
+			if got != want {
+				t.Errorf("Details[%q] = %v, want %v", key, got, want)
+			}
+		}
+	})
+
+	t.Run("CONTROL: client gives up first and the counts are lost", func(t *testing.T) {
+		c := newAPIClient(config{backendURL: stub.URL, apiToken: "t"})
+		// Client wall BELOW the server's latency — the pre-#3113 ordering.
+		c.httpIssueSet = &http.Client{Timeout: serverLatency / 3}
+		_, err := c.CreateCampaign(context.Background(), "kuhlman-labs/fishhawk", "", "", nil,
+			[]string{"issue:101"}, "", nil)
+		if err == nil {
+			t.Fatal("CreateCampaign succeeded, want a transport error")
+		}
+		var ae *apiError
+		if errors.As(err, &ae) {
+			t.Fatalf("error = %v, want a TRANSPORT error and NOT an *apiError — with the client giving up first the server's 504 (and its counts) never arrive", err)
+		}
+	})
 }

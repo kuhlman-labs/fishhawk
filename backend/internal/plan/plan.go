@@ -38,7 +38,28 @@ type Plan struct {
 	RisksAndAssumptions        []string          `json:"risks_and_assumptions,omitempty"`
 	PredictedRuntimeMinutes    int               `json:"predicted_runtime_minutes"`
 	PredictedRuntimeConfidence RuntimeConfidence `json:"predicted_runtime_confidence"`
-	Decomposition              *Decomposition    `json:"decomposition,omitempty"`
+	// RawPredictedRuntimeMinutes is the planner's optional PRE-calibration
+	// runtime estimate (#2862): the number it arrived at BEFORE multiplying by
+	// the fleet calibration factor the plan-stage calibration hint supplied.
+	// PredictedRuntimeMinutes keeps its existing meaning — the CALIBRATED value
+	// — so the dynamic implement kill cap and the runtime_observed calibration
+	// series are unperturbed; this field carries the raw one alongside it.
+	//
+	// It exists because folding the factor into PredictedRuntimeMinutes DESTROYS
+	// the raw estimate at the source: a raw 90 times a 0.56 fleet ratio lands at
+	// ~50, the implement-budget gate sees 50 <= 60, and a required decomposition
+	// dissolves with nothing in the artifact recording it was ever triggered.
+	// GateRuntimeMinutes is the one place the remedy is expressed.
+	//
+	// Additive-optional within standard_v1; the field must exist on the struct
+	// because plan.Parse strict-decodes with DisallowUnknownFields, so a
+	// raw_predicted_runtime_minutes artifact would otherwise fail to decode.
+	// Zero means the planner reported none (legacy plans, and any plan whose
+	// prompt rendered no calibration hint), and the gate reduces to its prior
+	// behavior. Equal to PredictedRuntimeMinutes is legitimate (factor 1.0), so
+	// semanticCheck deliberately adds NO coupling between the two values.
+	RawPredictedRuntimeMinutes int            `json:"raw_predicted_runtime_minutes,omitempty"`
+	Decomposition              *Decomposition `json:"decomposition,omitempty"`
 	// ModelRecommendation is the agent's optional complexity-informed
 	// recommendation for which model executes the implement stage (#1013).
 	// Advisory: the operator ratifies or overrides it at the plan gate, and
@@ -118,6 +139,27 @@ type Plan struct {
 	// strict-decodes with DisallowUnknownFields. JSON tags mirror the irreducible
 	// $def in the schema.
 	Irreducible *Irreducible `json:"irreducible,omitempty"`
+}
+
+// GateRuntimeMinutes returns the runtime estimate the implement-budget gate must
+// evaluate: max(PredictedRuntimeMinutes, RawPredictedRuntimeMinutes) (#2862).
+//
+// This is the ONE place the structure-ADDING-direction rule is expressed, so the
+// gate and any future consumer cannot disagree about which number decides. The
+// rule: a calibration factor BELOW 1.0 shrinks PredictedRuntimeMinutes, and
+// taking the maximum keeps the raw estimate in charge, so calibration can never
+// pull a plan under the budget and dissolve a decomposition requirement. A
+// factor ABOVE 1.0 grows PredictedRuntimeMinutes past the raw one, and the
+// maximum lets it — calibration is still free to DEMAND more structure.
+//
+// A zero or absent RawPredictedRuntimeMinutes (a legacy plan, or one whose
+// prompt rendered no calibration hint) returns PredictedRuntimeMinutes
+// unchanged: exact legacy behavior, no gate movement.
+func (p *Plan) GateRuntimeMinutes() int {
+	if p.RawPredictedRuntimeMinutes > p.PredictedRuntimeMinutes {
+		return p.RawPredictedRuntimeMinutes
+	}
+	return p.PredictedRuntimeMinutes
 }
 
 // SplitProposal is the plan's optional ordered-phase split (#2055, E50.3): the

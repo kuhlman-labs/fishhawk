@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"path"
 	"strings"
 
 	"github.com/google/uuid"
@@ -253,4 +254,122 @@ func (r *runResolver) targetRunningRefusal(ctx context.Context, runUUID uuid.UUI
 			"stage %s (%s) is 'running' for run %s but runner liveness could not be verified from this host (%s). If no runner is alive the stage is STRANDED — recover with fishhawk_reap_stage (category C) then fishhawk_retry_stage; otherwise wait for it to settle before re-dispatching",
 			s.ID, s.Type, runUUID, strings.Join(warnings, "; "))
 	}
+}
+
+// runnerBinaryAffectingScopePath reports whether a repo-relative plan scope
+// path can change the built fishhawk-runner binary (E64.5 / #3086). It is the
+// pure predicate behind the guardRunnerSelfHost advisory.
+//
+// It fires for any path UNDER runner/ — a directory-boundary prefix match, so
+// runnerx/foo.go does NOT match — EXCEPT the deny-list: a basename of README.md,
+// or a name ending in _test.go. Neither can change the compiled binary: Go
+// excludes _test.go files from the non-test package build, and no package under
+// runner/ embeds a README.md.
+//
+// The deny-list is deliberately a DENY-list defaulting to FIRE, not a *.go
+// allow-list — the same asymmetry AGENTS.md records for scripts/dev's
+// _path_affects_build. The fail-safe direction is over-warning: a spurious
+// advisory line is cosmetic, while a suppressed one leaves the operator in the
+// four-identical-failures loop #3086 exists to end. So embedded assets under
+// runner/ (e.g. runner/internal/plan/schemas/*.json, which are //go:embed inputs
+// that genuinely change the binary) keep firing ON PURPOSE.
+func runnerBinaryAffectingScopePath(p string) bool {
+	clean := path.Clean(strings.TrimSpace(p))
+	if clean != "runner" && !strings.HasPrefix(clean, "runner/") {
+		return false
+	}
+	base := path.Base(clean)
+	if base == "README.md" || strings.HasSuffix(base, "_test.go") {
+		return false
+	}
+	return true
+}
+
+// resolvePlanScopePathsForRun resolves the DECLARED scope.files paths of a run's
+// terminal standard_v1 plan artifact, walking ParentRunID up to
+// retryPlanChainDepth so a CI-retry chain or decomposition child whose plan
+// lives on the parent is still covered — the same shape getPlan uses. It is a
+// bounded, fail-OPEN resolver: EVERY error path (a ListRunStages /
+// ListStageArtifacts / decode failure inside tryGetPlanForRun, a GetRun failure
+// during the walk, an unparseable parent id) returns nil with NO error, because
+// this backs an ADVISORY that must never strand a dispatch.
+//
+// COST is per VISITED RUN, not a flat two reads (#3086 cost correction): each
+// tryGetPlanForRun performs up to two reads (list stages, list stage artifacts),
+// and a miss then adds one GetRun to find the parent. The honest worst-case
+// bound is therefore up to (2 plan-resolution reads + 1 GetRun) per visited run,
+// capped at retryPlanChainDepth (8) levels — i.e. up to 3*retryPlanChainDepth
+// backend reads. A plan resolved on the run itself costs the two reads and stops.
+func (r *runResolver) resolvePlanScopePathsForRun(ctx context.Context, runUUID uuid.UUID) []string {
+	current := runUUID
+	for depth := 0; depth < retryPlanChainDepth; depth++ {
+		p, found, err := r.tryGetPlanForRun(ctx, current)
+		if err != nil {
+			return nil
+		}
+		if found {
+			paths := make([]string, 0, len(p.Scope.Files))
+			for _, f := range p.Scope.Files {
+				paths = append(paths, f.Path)
+			}
+			return paths
+		}
+		runRow, err := r.api.GetRun(ctx, current)
+		if err != nil {
+			return nil
+		}
+		if runRow.ParentRunID == nil || *runRow.ParentRunID == "" {
+			return nil
+		}
+		parent, perr := uuid.Parse(*runRow.ParentRunID)
+		if perr != nil {
+			return nil
+		}
+		current = parent
+	}
+	return nil
+}
+
+// guardRunnerSelfHost is the runner self-host bootstrap advisory (E64.5 /
+// #3086). A run whose approved plan changes fishhawk-runner ITSELF executes
+// under bin/fishhawk-runner built from main — which still carries the very
+// defect the run is fixing — so a stage that triggers that defect fails
+// category-A repeatedly and burns fix-up budget with nothing pushed, and the
+// operator sees four identical failures with no signpost. This guard resolves
+// the run's declared plan scope and, when it names a runner/ path that can
+// change the built binary, appends ONE advisory line naming the consequence and
+// the documented escape in runner/README.md.
+//
+// It is purely ADVISORY: unlike its three siblings it returns only []string and
+// has NO error return, so it structurally CANNOT block a dispatch — giving it no
+// error return makes that structural rather than conventional. It fails OPEN and
+// SILENT on every read error (resolvePlanScopePathsForRun swallows them),
+// matching guardHostDispatch's #1355 posture.
+//
+// A "plan"-stage dispatch returns immediately WITHOUT reading: no plan artifact
+// exists at plan-stage dispatch, so the plan-resolution reads would always be
+// wasted.
+//
+// Two known residuals, documented in backend/internal/mcpserver/README.md: the
+// advisory fires on the DECLARED plan scope, so a runner/ path added later by an
+// approved scope amendment does NOT trigger it; and the parent walk is capped at
+// retryPlanChainDepth, so a chain deeper than that resolves no plan and the
+// guard stays silent.
+func (r *runResolver) guardRunnerSelfHost(ctx context.Context, runUUID uuid.UUID, stage string) []string {
+	if stage == "plan" {
+		return nil
+	}
+	var offending string
+	for _, p := range r.resolvePlanScopePathsForRun(ctx, runUUID) {
+		if runnerBinaryAffectingScopePath(p) {
+			offending = p
+			break
+		}
+	}
+	if offending == "" {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"this run's declared plan scope changes fishhawk-runner itself (e.g. %s), but the dispatched %q stage executes bin/fishhawk-runner built from main — which does NOT contain this run's fix. A stage that triggers the defect this run is fixing will fail category-A repeatedly and burn fix-up budget with nothing pushed. To run the stage under the fixed runner, rebuild bin/fishhawk-runner from the run branch into a scratch worktree before dispatching — see the 'Self-hosting bootstrap deadlock' section in runner/README.md (#3086)",
+		offending, stage)}
 }

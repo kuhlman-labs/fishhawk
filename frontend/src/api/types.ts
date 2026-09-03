@@ -70,7 +70,13 @@ export type StageState =
   | 'awaiting_deployment'
   | 'succeeded'
   | 'failed'
-  | 'cancelled';
+  // Merge-supersede terminal state, mirroring the Go constant
+  // backend/internal/run.StageStateSuperseded (#3083): the merge of the
+  // change this stage was gating made it UNREACHABLE. Distinct from
+  // 'failed' (attempted, did not pass) and 'cancelled' (an operator halted
+  // the run). Terminal, so the SPA renders it as a settled stage.
+  | 'cancelled'
+  | 'superseded';
 
 export type StageType = 'plan' | 'implement' | 'review' | 'deploy';
 export type ExecutorKind = 'agent' | 'human';

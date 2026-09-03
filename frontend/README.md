@@ -52,6 +52,45 @@ session cookie set by `/v0/auth/github/callback` is same-origin from
 the browser's perspective. Override the proxy target by editing
 `vite.config.ts` if the backend runs elsewhere.
 
+### Running from a run worktree (#3030)
+
+A Fishhawk run executes in a git worktree nested under `.git/` — e.g.
+`<repo>/.git/fishhawk-worktrees/run-<id>/frontend`. Out of the box the
+frontend toolchain (Vite/Vitest) is UNRUNNABLE there: Vite's
+`server.fs.deny` default includes `**/.git/**`, and because the served
+root (`server.fs.allow[0]`) is the frontend directory whose absolute path
+contains a `.git` segment, that rule denies EVERY module under the root.
+The refusal surfaces as a misleading message — in this toolchain
+(vite 8.2.2 / vitest 4.1.11) the vitest `setupFiles` refusal renders as
+`Error: Cannot find module '/src/test-setup.ts'` and component imports as
+`Failed to load url … Does the file exist?`. The file exists and the
+resolved config root is the FULL nested path (the `.git` segment is NOT
+stripped), so the originating issue's proposed fix — making `setupFiles`
+an absolute path — does not work and should not be re-tried; the path was
+never the problem.
+
+`vite-fs-deny.ts` drops exactly the `**/.git/**` rule, and ONLY when the
+config directory has a `.git` path SEGMENT (`isNestedUnderGitDir`, a
+segment match — `.github`, `my.git` and `.gitignore-dir` do not trigger
+it). In a normal checkout `resolveFsDeny` returns `undefined`, so Vite
+applies its stock defaults verbatim and the dev server's posture is
+unchanged. The remaining rules are read from Vite's own resolved defaults
+via `resolveConfig({ configFile: false }, 'serve')` — never hardcoded — so
+a future Vite upgrade that widens the list is inherited automatically and a
+rename of the git rule fails loudly rather than silently dropping
+protection. Verified `pnpm test` green — 30 files / 288 tests — from both
+a `.git`-nested worktree and a normal checkout.
+
+SECURITY RESIDUAL (deliberate, narrow): this narrows a default-deny rule.
+The reachable surface is dev-server file reads within `server.fs.allow`. A
+git worktree carries a `.git` FILE not directory, so no worktree-local
+repository metadata was being protected — but the rule ALSO denied any
+DESCENDANT `.git` directory inside the served root (a nested repo, a
+vendored checkout, or one cloned under the tree later), and within a
+`.git`-nested checkout those are no longer denied by this rule. The
+carve-out fires only when the checkout root itself sits under a `.git`
+segment, and never in a normal checkout.
+
 ## What's stubbed
 
 The plan-review vertical slice (E7.1 → E7.2 → E7.3) is in. Still

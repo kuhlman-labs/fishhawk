@@ -25,7 +25,8 @@ func runInstallation(args []string, logSink io.Writer) int {
 		return runInstallationList(rest, logSink)
 	default:
 		_, _ = fmt.Fprintf(logSink, "fishhawkd installation: unknown subcommand %q\n", cmd)
-		_, _ = fmt.Fprintln(logSink, "Usage: fishhawkd installation register --provider <p> --account-key <k> --installation-ref <ref> [--forge-base-url <url>] [--oauth-base-url <url>]")
+		_, _ = fmt.Fprintln(logSink, "Usage: fishhawkd installation register --provider <p> --account-key <k> --installation-ref <ref> [--project-path <ns>/<project>] [--forge-base-url <url>] [--oauth-base-url <url>]")
+		_, _ = fmt.Fprintln(logSink, "       (--project-path is REQUIRED for --provider gitlab)")
 		_, _ = fmt.Fprintln(logSink, "       fishhawkd installation list [--provider <p>]")
 		return exitUsage
 	}
@@ -40,6 +41,7 @@ func runInstallationRegister(args []string, logSink io.Writer) int {
 	installationRef := fs.String("installation-ref", "", "credential-scope ref (gitlab:<project-id> | bare github installation id) — required")
 	forgeBaseURL := fs.String("forge-base-url", "", "per-installation forge base URL override (optional; https only)")
 	oauthBaseURL := fs.String("oauth-base-url", "", "per-installation OAuth base URL override (optional; https only)")
+	projectPath := fs.String("project-path", "", "GitLab project path with namespace (<namespace>/<project>) — required for --provider gitlab")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -73,6 +75,7 @@ func runInstallationRegister(args []string, logSink io.Writer) int {
 		InstallationRef: *installationRef,
 		ForgeBaseURL:    *forgeBaseURL,
 		OAuthBaseURL:    *oauthBaseURL,
+		ProjectPath:     *projectPath,
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(logSink, "fishhawkd installation register: %v\n", err)
@@ -85,8 +88,9 @@ func runInstallationRegister(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 
-	_, _ = fmt.Printf("registered installation id=%s provider=%s installation_ref=%s account_key=%s\n",
-		inst.ID, inst.Provider, inst.InstallationRef, strings.TrimSpace(*accountKey))
+	_, _ = fmt.Printf("registered installation id=%s provider=%s installation_ref=%s account_key=%s project_path=%s\n",
+		inst.ID, inst.Provider, inst.InstallationRef, strings.TrimSpace(*accountKey),
+		renderInstallationProjectPath(inst.Provider, inst.ProjectPath))
 	return exitOK
 }
 
@@ -127,13 +131,39 @@ func runInstallationList(args []string, logSink io.Writer) int {
 		return exitOK
 	}
 
-	_, _ = fmt.Printf("%-8s  %-24s  %-24s  %-32s  %s\n", "PROVIDER", "INSTALLATION_REF", "ACCOUNT_KEY", "FORGE_BASE_URL", "ID")
+	_, _ = fmt.Printf("%-8s  %-24s  %-24s  %-32s  %-32s  %s\n",
+		"PROVIDER", "INSTALLATION_REF", "ACCOUNT_KEY", "PROJECT_PATH", "FORGE_BASE_URL", "ID")
 	for _, i := range rows {
 		forge := ""
 		if i.ForgeBaseUrl != nil {
 			forge = *i.ForgeBaseUrl
 		}
-		_, _ = fmt.Printf("%-8s  %-24s  %-24s  %-32s  %s\n", i.Provider, i.InstallationRef, i.AccountKey, forge, i.ID)
+		_, _ = fmt.Printf("%-8s  %-24s  %-24s  %-32s  %-32s  %s\n",
+			i.Provider, i.InstallationRef, i.AccountKey,
+			renderInstallationProjectPath(i.Provider, i.ProjectPath), forge, i.ID)
 	}
 	return exitOK
+}
+
+// unboundProjectPathMarker is what `installation list` renders for a gitlab
+// installation that records no project_path (E45.26 / #2877). Such a row is
+// REFUSED by the run-creation authorization gate — it cannot evaluate the
+// exact-path binding — so enumerating these rows is the operator's mechanism for
+// both the forward-upgrade remedy and rollback recovery: list, then re-register
+// each with --project-path. A blank cell would be indistinguishable from the
+// legitimately-empty github case.
+const unboundProjectPathMarker = "(unbound)"
+
+// renderInstallationProjectPath renders a nullable project_path for operator
+// output. Only gitlab rows are marked unbound: a github installation's identity
+// arrives HMAC-signed and is resolved through the installation id, so it records
+// no project path BY DESIGN and marking it would manufacture a false alarm.
+func renderInstallationProjectPath(provider string, projectPath *string) string {
+	if projectPath != nil && strings.TrimSpace(*projectPath) != "" {
+		return *projectPath
+	}
+	if provider == "gitlab" {
+		return unboundProjectPathMarker
+	}
+	return ""
 }

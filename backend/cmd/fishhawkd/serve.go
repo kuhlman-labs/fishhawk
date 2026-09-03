@@ -1201,6 +1201,31 @@ func gitlabIdentityWarnings(baseURL, deviceClientID, deploymentToken string) []s
 	return warnings
 }
 
+// validateIssueSetResolutionBudget is the startup gate on
+// --issue-set-resolution-budget / FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET
+// (E54.59 / #3113), extracted for the same reason resolveMCPRouteMode is: the
+// refusal IS the behavior, and it must be assertable without booting a server.
+//
+// Zero means "use server.DefaultIssueSetResolutionBudget" and is accepted. A
+// NEGATIVE value is a typo that would otherwise silently take the default. A
+// value ABOVE server.MaxIssueSetResolutionBudget is refused naming BOTH the
+// configured value and the permitted maximum, because the maximum is a
+// cross-process invariant: the MCP client's issue-set timeout sits above it so
+// the client can never be what gives up first. server.issueSetResolutionBudget
+// clamps at the read site regardless — this refusal exists so an operator who
+// asked for more is told rather than silently clamped.
+func validateIssueSetResolutionBudget(d time.Duration) error {
+	if d < 0 {
+		return fmt.Errorf("--issue-set-resolution-budget must not be negative; got %s (0 or unset uses the %s default)",
+			d, server.DefaultIssueSetResolutionBudget)
+	}
+	if d > server.MaxIssueSetResolutionBudget {
+		return fmt.Errorf("--issue-set-resolution-budget %s exceeds the permitted maximum %s; the maximum is what the MCP client's issue-set request timeout is set above, so a larger budget would let the client give up before the server does",
+			d, server.MaxIssueSetResolutionBudget)
+	}
+	return nil
+}
+
 // resolveRepoVisibility is the BOTH-REQUIRED config gate for the per-identity
 // repo-ACL mirror (ADR-057 Amendment A2, E44.10 / #2071), extracted from the
 // wiring for the same reason resolveIdentityProvider is: the gate is the
@@ -1752,6 +1777,14 @@ func runServe(args []string, logSink io.Writer) int {
 		"per-KB allowance added to the review-budget floor per kilobyte of prompt (#747); "+
 			"the budget is floor + per_kb*ceil(promptBytes/1024), clamped to [floor, cap]. "+
 			"Set to 0 to collapse the budget to a flat floor (today's fixed-timeout behaviour) without a redeploy")
+	issueSetResolutionBudget := fs.Duration("issue-set-resolution-budget",
+		envOrDuration("FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET", 0),
+		"budget for the no-epic campaign source's issue-set dependency resolution (E54.59 / #3113): "+
+			"a full ratified grooming order costs one forge round-trip per named item, and before this the "+
+			"path had no server-side deadline at all. Unset/0 uses server.DefaultIssueSetResolutionBudget (120s). "+
+			"A NEGATIVE value, or one ABOVE server.MaxIssueSetResolutionBudget (10m), REFUSES startup naming "+
+			"both numbers — the maximum is what the MCP client's issue-set timeout is pinned above, so the "+
+			"client is never what gives up first")
 	reviewBudgetCap := fs.Duration("review-budget-cap",
 		envOrDuration("FISHHAWKD_REVIEW_BUDGET_CAP", planreview.DefaultReviewBudget.Cap),
 		"hard ceiling on the size-aware review budget (#747), bounding the worst-case "+
@@ -1886,6 +1919,21 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 
+	// Issue-set resolution budget (E54.59 / #3113). Fail closed on BOTH
+	// out-of-range directions rather than silently substituting a value: an
+	// operator who configured a budget expecting it to be honoured must be
+	// TOLD it is not. The over-maximum refusal names both numbers because the
+	// maximum is not arbitrary — server.MaxIssueSetResolutionBudget is what the
+	// MCP client's issue-set http.Client timeout is set above, so a budget
+	// beyond it would put the client back in the position of being what gives
+	// up first, which is exactly #3113's defect. The read site clamps too
+	// (server.issueSetResolutionBudget), so the invariant holds however a
+	// Config was built; this refusal is what keeps the clamp from being silent.
+	if err := validateIssueSetResolutionBudget(*issueSetResolutionBudget); err != nil {
+		logger.Error("invalid --issue-set-resolution-budget", slog.String("error", err.Error()))
+		return exitFailure
+	}
+
 	// Warn when an operator .env / flag override drops the plan-review
 	// timeout below the #606 code default (300s) — a value that risks
 	// timing out review of large standard_v1 plans, silently defeating the
@@ -1924,7 +1972,7 @@ func runServe(args []string, logSink io.Writer) int {
 	modelProviders := buildModelProviders(*anthropicAPIKey, *openAIAPIKey)
 	modelOracle := modeloracle.NewCached(modelProviders, *modelsStalenessThreshold, logger)
 
-	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle, MCPRoute: mcpRouteMode}
+	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle, MCPRoute: mcpRouteMode, IssueSetResolutionBudget: *issueSetResolutionBudget}
 
 	// Wire the MCP tool registry into the /mcp route (ADR-076 / #2390). The
 	// route takes a FACTORY rather than importing mcpserver itself: an import
@@ -3571,14 +3619,38 @@ type gitLabProjectRegistryQueries interface {
 // account that owns it. Both halves of the payload identity are bound:
 //
 //  1. the credential ref must resolve to a registered gitlab installation, and
-//  2. the project path's namespace segment must equal that installation's
-//     account_key — the same owner-segment convention account.Resolver uses.
+//  2. the project path must equal that installation's recorded project_path
+//     EXACTLY, byte for byte.
 //
 // Requiring (2) is what stops a registered project id from being paired with
 // some OTHER project's path: the two selectors address different projects (the
 // ref picks the credential and the pipeline target, the path picks the project
 // the workflow spec is read from), so binding only the ref would still leave
 // the spec read steerable.
+//
+// (2) is EXACT since E45.26 / #2877. It was previously NAMESPACE-level — the
+// path's first segment compared against the account_key — which admitted a
+// registered 'gitlab:4242' under account 'acme' paired with any 'acme/*' path,
+// leaving the spec read steerable to a sibling project inside the tenant.
+// Comparison is case-SENSITIVE: GitLab canonicalises project path case, so a
+// case difference means the payload does not name the recorded project.
+//
+// The namespace comparison is RETAINED alongside the exact compare as a tenancy
+// invariant, and it is NOT redundant: the write path validates that a recorded
+// path's namespace equals its account's key, but a row written BEFORE that
+// validation existed (the hand-written SQL docs/deploy/gitlab.md used to
+// prescribe), or one whose account was re-keyed afterwards, can carry a path
+// outside its account's namespace. The exact compare would admit such a row —
+// recorded and payload paths agree — while the tenancy invariant it violates
+// does not hold. The namespace check refuses it.
+//
+// A row recording NO project path (NULL, or an empty string — a *string has
+// three states and two of them are unbound) is the shape every installation
+// registered before migration 0078 has. It REFUSES with
+// webhook.ErrGitLabProjectPathUnbound rather than falling back to the old
+// namespace-only admit, so the dispatcher can name the condition in the audit
+// and point the operator at re-registration. Falling back would preserve
+// exactly the steering this change closes.
 //
 // A missing row is a REFUSAL (false, nil); a query fault is an ERROR the
 // dispatcher also fails closed on. Neither ever admits.
@@ -3611,7 +3683,17 @@ func (r gitLabProjectRegistry) AuthorizedGitLabProject(ctx context.Context, cred
 		}
 		return false, err
 	}
-	return acct.AccountKey == owner, nil
+	// The retained tenancy invariant: the payload path must live in the owning
+	// account's namespace, whatever the installation recorded.
+	if acct.AccountKey != owner {
+		return false, nil
+	}
+	// Fail closed on an unbound row rather than degrading to the pre-#2877
+	// namespace-only admit. NULL and empty are both unbound.
+	if inst.ProjectPath == nil || strings.TrimSpace(*inst.ProjectPath) == "" {
+		return false, webhook.ErrGitLabProjectPathUnbound
+	}
+	return strings.TrimSpace(*inst.ProjectPath) == projectPath, nil
 }
 
 var _ webhook.GitLabProjectAuthorizer = gitLabProjectRegistry{}

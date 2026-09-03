@@ -31,6 +31,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
@@ -43,6 +44,9 @@ import (
 // BaseFake so it doesn't have to stub the transition/run-linkage methods the
 // REST handlers never call.
 type fakeCampaignRepo struct {
+	// idempotencyLookupDelay makes GetCampaignByIdempotencyKey slow on purpose;
+	// see the comment on that method (#3113).
+	idempotencyLookupDelay time.Duration
 	campaign.BaseFake
 	mu         sync.Mutex
 	campaigns  map[uuid.UUID]*campaign.Campaign
@@ -154,6 +158,15 @@ func (f *fakeCampaignRepo) CreateCampaign(_ context.Context, p campaign.CreateCa
 // injects a non-NotFound error so the handler's 500 lookup-failed branch is
 // reachable.
 func (f *fakeCampaignRepo) GetCampaignByIdempotencyKey(_ context.Context, repo, key string) (*campaign.Campaign, error) {
+	// idempotencyLookupDelay is the PRE-RESOLUTION latency seam
+	// TestCreateCampaign_NoEpic_BudgetAnchoredAtRequestStart needs (E54.59 /
+	// #3113): this lookup runs between handler entry and the issue-set resolver
+	// call, so delaying it SEPARATES the two candidate anchors far enough for a
+	// threshold to discriminate between them. Zero (every other test) is a
+	// no-op.
+	if f.idempotencyLookupDelay > 0 {
+		time.Sleep(f.idempotencyLookupDelay)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.getIdempErr != nil {
@@ -1092,6 +1105,14 @@ type fakeIssueSetProvider struct {
 	resolveErr    error
 	resolveCalled bool
 	captured      workmgmt.IssueSetRequest
+	// capturedDeadline / capturedHasDeadline record the deadline the handler
+	// bounded the resolution with (E54.59 / #3113), so the budget's VALUE and
+	// its ANCHOR are both assertable.
+	capturedDeadline    time.Time
+	capturedHasDeadline bool
+	// capturedCallTime is when the resolver was ENTERED, the second candidate
+	// anchor the budget could have been measured from.
+	capturedCallTime time.Time
 }
 
 func (f *fakeIssueSetProvider) Name() string { return f.name }
@@ -1100,9 +1121,14 @@ func (f *fakeIssueSetProvider) File(_ context.Context, _ workmgmt.ProviderReques
 	return &workmgmt.CreatedItem{Provider: f.name}, nil
 }
 
-func (f *fakeIssueSetProvider) ResolveDependencies(_ context.Context, req workmgmt.IssueSetRequest) (*workmgmt.EpicChildrenResult, error) {
+func (f *fakeIssueSetProvider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSetRequest) (*workmgmt.EpicChildrenResult, error) {
 	f.resolveCalled = true
 	f.captured = req
+	// The DEADLINE is captured, not the ctx: the effective issue-set budget is
+	// only observable as the deadline the handler hands the resolver, and
+	// storing a context in a struct is what containedctx flags.
+	f.capturedDeadline, f.capturedHasDeadline = ctx.Deadline()
+	f.capturedCallTime = time.Now()
 	if f.resolveErr != nil {
 		return nil, f.resolveErr
 	}
@@ -1127,6 +1153,10 @@ type fakeDualProvider struct {
 	resolveResult *workmgmt.EpicChildrenResult
 	epicCalled    bool
 	resolveCalled bool
+	// epicHadDeadline records whether the EPIC branch's context carried a
+	// deadline: the issue-set budget must NOT bound the epic sweep, which reads
+	// the sibling set in one ListSubIssues call (E54.59 / #3113).
+	epicHadDeadline bool
 }
 
 func (f *fakeDualProvider) Name() string { return f.name }
@@ -1135,8 +1165,9 @@ func (f *fakeDualProvider) File(_ context.Context, _ workmgmt.ProviderRequest) (
 	return &workmgmt.CreatedItem{Provider: f.name}, nil
 }
 
-func (f *fakeDualProvider) EpicChildren(_ context.Context, _ workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+func (f *fakeDualProvider) EpicChildren(ctx context.Context, _ workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
 	f.epicCalled = true
+	_, f.epicHadDeadline = ctx.Deadline()
 	return f.epicResult, nil
 }
 
@@ -1265,6 +1296,198 @@ func TestCreateCampaign_NoEpic_ResolverError_502(t *testing.T) {
 	}
 	if code := decodeCampaignError(t, w); code != "issue_set_resolution_failed" {
 		t.Errorf("error code = %q, want issue_set_resolution_failed", code)
+	}
+}
+
+// --- issue-set resolution budget + 504 timeout (E54.59 / #3113) ---
+
+// TestCreateCampaign_NoEpic_ResolutionTimeout_504 is the typed-deadline branch:
+// a resolver returning *workmgmt.IssueSetResolutionTimeout must surface 504
+// issue_set_resolution_timeout carrying the counts — and the counts must SURVIVE
+// the 5xx default-deny detail redactor, which is the coupling that makes
+// errors.go load-bearing here. The assertion is on the SHIPPED BODY (through the
+// real writeError), not on the details map the handler built, so deleting any of
+// the four redactableDetailKeys entries reddens this test.
+func TestCreateCampaign_NoEpic_ResolutionTimeout_504(t *testing.T) {
+	fp := &fakeIssueSetProvider{resolveErr: &workmgmt.IssueSetResolutionTimeout{
+		Resolved: 12, Total: 60, SuggestedLimit: 12, Phase: "fetch_items",
+	}}
+	registerIssueSetProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101"]}`)
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "issue_set_resolution_timeout" {
+		t.Fatalf("error code = %q, want issue_set_resolution_timeout (body=%s)", code, w.Body.String())
+	}
+	for key, want := range map[string]float64{
+		"resolved":                       12,
+		"items_total":                    60,
+		"suggested_grooming_order_limit": 12,
+		"budget_seconds":                 float64(DefaultIssueSetResolutionBudget / time.Second),
+	} {
+		got, ok := details[key].(float64)
+		if !ok {
+			t.Errorf("detail %q missing or not a number in the SHIPPED body (redacted away?): %+v", key, details)
+			continue
+		}
+		if got != want {
+			t.Errorf("detail %q = %v, want %v", key, got, want)
+		}
+	}
+}
+
+// TestCreateCampaign_NoEpic_ResolutionTimeout_NoSuggestion omits the suggestion
+// key when the resolver could PROVE no fitting limit (SuggestedLimit 0), while
+// still shipping the counts. A 0 rendered as a suggestion would read as "request
+// zero items", which is not what the resolver meant.
+func TestCreateCampaign_NoEpic_ResolutionTimeout_NoSuggestion(t *testing.T) {
+	fp := &fakeIssueSetProvider{resolveErr: &workmgmt.IssueSetResolutionTimeout{
+		Resolved: 0, Total: 60, SuggestedLimit: 0, Phase: "fetch_items",
+	}}
+	registerIssueSetProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101"]}`)
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "issue_set_resolution_timeout" {
+		t.Fatalf("error code = %q, want issue_set_resolution_timeout", code)
+	}
+	if _, present := details["suggested_grooming_order_limit"]; present {
+		t.Errorf("suggested_grooming_order_limit must be OMITTED when no limit could be proven to fit: %+v", details)
+	}
+	if got, _ := details["items_total"].(float64); got != 60 {
+		t.Errorf("items_total = %v, want 60 (the counts must still ship)", details["items_total"])
+	}
+}
+
+// TestCreateCampaign_NoEpic_BudgetAnchoredAtRequestStart pins operator condition
+// 1(b): the budget is anchored at HANDLER ENTRY rather than at the resolver
+// call, so the unbounded per-item pre-resolution work is folded INTO the
+// server-bounded span instead of sitting outside it. (This is not a literal
+// "same span" as the caller's client timeout — the residual accounting is in
+// handleCreateCampaign's requestStart comment — but the anchor is what keeps the
+// unbounded work inside the budget, and that is what this test discriminates.)
+//
+// The discrimination is strict-`<=` against a timestamp taken BEFORE the
+// request: with the deadline anchored at the resolver call, everything the
+// handler does first (auth, decode, provider resolution) pushes the deadline
+// PAST beforeRequest+budget and this test goes red. It also pins the budget's
+// VALUE — the default, since Config leaves the field zero.
+func TestCreateCampaign_NoEpic_BudgetAnchoredAtRequestStart(t *testing.T) {
+	fp := &fakeIssueSetProvider{result: noEpicDAG()}
+	registerIssueSetProvider(t, fp)
+	repo := newFakeCampaignRepo()
+	// Separate the two candidate anchors by a measurable, scale-derived gap.
+	// The idempotency lookup runs AFTER handler entry and BEFORE the resolver
+	// call, so this delay is exactly the pre-resolution work condition 1(b)
+	// named as unbounded.
+	preResolutionDelay := timescale.D(200 * time.Millisecond)
+	repo.idempotencyLookupDelay = preResolutionDelay
+	s := New(Config{CampaignRepo: repo}) // GitHub nil: install skipped
+
+	w := postCampaignWithKey(t, s,
+		`{"repo":"kuhlman-labs/fishhawk","items":["issue:101","issue:102"]}`, "anchor-probe")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if !fp.capturedHasDeadline {
+		t.Fatal("the no-epic resolution ran with NO deadline: the issue-set budget was not applied")
+	}
+	// Threshold placed BETWEEN the two anchors. Anchored at handler entry the
+	// deadline is ~preResolutionDelay EARLIER than resolverCall+budget, so it
+	// lands below; anchored at the resolver call it is ~resolverCall+budget,
+	// which lands above. Half the delay is the margin on both sides, and it
+	// scales with timescale.D so the ratio holds on a loaded runner.
+	threshold := fp.capturedCallTime.Add(DefaultIssueSetResolutionBudget - preResolutionDelay/2)
+	if fp.capturedDeadline.After(threshold) {
+		t.Errorf("resolution deadline %s is later than resolverCall+budget-%s: the budget is anchored at the RESOLVER CALL, so the %s of pre-resolution work sits outside the span the caller's client timeout measures (operator condition 1(b))",
+			fp.capturedDeadline.Format(time.RFC3339Nano), preResolutionDelay/2, preResolutionDelay)
+	}
+}
+
+// TestCreateCampaign_NoEpic_BudgetClampedAtReadSite pins operator condition
+// 1(a): a Config constructed DIRECTLY above MaxIssueSetResolutionBudget — no
+// fishhawkd flag handling in the picture — must still resolve to the ceiling.
+// This is what makes "the effective budget never exceeds the maximum" a
+// construction-level property rather than one entry point's startup check.
+func TestCreateCampaign_NoEpic_BudgetClampedAtReadSite(t *testing.T) {
+	fp := &fakeIssueSetProvider{result: noEpicDAG()}
+	registerIssueSetProvider(t, fp)
+	over := MaxIssueSetResolutionBudget + time.Hour
+	s := New(Config{CampaignRepo: newFakeCampaignRepo(), IssueSetResolutionBudget: over})
+
+	if got := s.issueSetResolutionBudget(); got != MaxIssueSetResolutionBudget {
+		t.Fatalf("issueSetResolutionBudget() = %s for a Config set to %s, want the %s ceiling", got, over, MaxIssueSetResolutionBudget)
+	}
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101","issue:102"]}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if !fp.capturedHasDeadline {
+		t.Fatal("the no-epic resolution ran with NO deadline")
+	}
+	// The deadline is anchored at handler entry, which PRECEDES the resolver
+	// call, so resolverCall+ceiling is a sound upper bound: an unclamped
+	// over-maximum Config would put the deadline an hour past it.
+	if latest := fp.capturedCallTime.Add(MaxIssueSetResolutionBudget); fp.capturedDeadline.After(latest) {
+		t.Errorf("resolution deadline %s exceeds the %s ceiling: an over-maximum Config was honoured verbatim",
+			fp.capturedDeadline.Format(time.RFC3339Nano), MaxIssueSetResolutionBudget)
+	}
+}
+
+// TestIssueSetResolutionBudget covers the read-site resolver's three branches
+// directly: non-positive -> default, in-range -> honoured verbatim, above the
+// maximum -> clamped.
+func TestIssueSetResolutionBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  time.Duration
+		want time.Duration
+	}{
+		{"zero uses the default", 0, DefaultIssueSetResolutionBudget},
+		{"negative uses the default", -time.Second, DefaultIssueSetResolutionBudget},
+		{"in-range is honoured", 45 * time.Second, 45 * time.Second},
+		{"at the maximum is honoured", MaxIssueSetResolutionBudget, MaxIssueSetResolutionBudget},
+		{"above the maximum is clamped", MaxIssueSetResolutionBudget + time.Nanosecond, MaxIssueSetResolutionBudget},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Config{IssueSetResolutionBudget: tc.cfg})
+			if got := s.issueSetResolutionBudget(); got != tc.want {
+				t.Errorf("issueSetResolutionBudget() = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCreateCampaign_EpicPath_NoIssueSetBudget pins that the issue-set budget
+// does NOT bound the epic sweep. EpicChildren reads the sibling set in one
+// ListSubIssues call, so it never had the per-item cost this budget exists for,
+// and bounding it would be a silent behaviour change on the epic path.
+func TestCreateCampaign_EpicPath_NoIssueSetBudget(t *testing.T) {
+	fp := &fakeDualProvider{
+		name:       workmgmt.Default().Provider,
+		epicResult: noEpicDAG(),
+	}
+	workmgmt.Register(fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo(), IssueSetResolutionBudget: time.Second})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:7"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if !fp.epicCalled {
+		t.Fatal("EpicChildren was not called on the epic_ref path")
+	}
+	if fp.epicHadDeadline {
+		t.Error("the epic sweep ran under a deadline: the issue-set budget must not bound the epic branch")
 	}
 }
 

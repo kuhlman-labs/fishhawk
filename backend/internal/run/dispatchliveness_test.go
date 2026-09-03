@@ -10,6 +10,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // livenessLister type-asserts the concrete postgres repo to the optional
@@ -44,6 +45,48 @@ func rawDispatchedAt(t *testing.T, pool *pgxpool.Pool, stageID uuid.UUID) *time.
 		t.Fatalf("read dispatched_at: %v", err)
 	}
 	return ts
+}
+
+// dbAnchoredHeartbeat returns a heartbeat instant derived from the stage row's
+// OWN DB-stamped dispatched_at, offset by the caller's (timescale-scaled)
+// delta. It is the fix for #3048: seeding a comparative heartbeat from the Go
+// process's time.Now() puts the two sides of ListDispatchedStageLiveness's
+// attempt-relative hb.Before(*l.DispatchedAt) comparison in DIFFERENT clock
+// domains — the host's and the Postgres container's — and host/container skew
+// is unbounded, so no margin makes the ordering safe. Anchoring the seed to the
+// value it will be compared against puts both sides in ONE clock domain, and
+// the ordering then holds BY CONSTRUCTION at any skew; timescale.D supplies the
+// offset per the AGENTS.md rule.
+//
+// NO TRUNCATION is applied to the anchor, and that is deliberate. Measured
+// inside pgtest's own postgres:16-alpine container: Postgres now() stamps at
+// MICROSECOND resolution (dispatched_at=2026-08-31T18:22:40.629627Z, raw ::text
+// "2026-08-31 18:22:40.629627+00", Nanosecond()%1000 == 0), and the
+// stages.progress JSONB round-trip is LOSSLESS — it neither truncates nor
+// rounds. That same instant marshalled to "reported_at":
+// "2026-08-31T18:22:40.629627Z", decoded back Equal with delta 0s, and a
+// deliberate sub-microsecond probe (2026-08-31T12:00:00.123456789Z) round-tripped
+// byte-identical, delta 0s. The mechanism is why: a time.Time marshals to an
+// RFC3339Nano STRING and jsonb stores JSON strings verbatim, so there is no
+// timestamptz coercion in that path to truncate or round at all.
+//
+// That losslessness is what makes offset == 0 name the dispatch instant
+// EXACTLY, and therefore what makes the equal-instant boundary expressible at
+// all (see TestListDispatchedStageLiveness_HeartbeatEqualToDispatchIsCurrent).
+// A truncating helper would push a 0-offset seed up to 999µs EARLIER than the
+// row's real stamp, hb.Before would be true, and the boundary test would fail
+// deterministically.
+//
+// A NULL dispatched_at means the anchor is unavailable and the caller's premise
+// is void, so this fails loudly rather than degrading to the host clock — which
+// is precisely the dependency being removed.
+func dbAnchoredHeartbeat(t *testing.T, pool *pgxpool.Pool, stageID uuid.UUID, offset time.Duration) time.Time {
+	t.Helper()
+	d := rawDispatchedAt(t, pool, stageID)
+	if d == nil {
+		t.Fatalf("dispatched_at is NULL for stage %s: cannot anchor a heartbeat to the row's own dispatch clock", stageID)
+	}
+	return d.UTC().Add(offset)
 }
 
 func livenessFor(t *testing.T, rows []run.DispatchedStageLiveness, stageID uuid.UUID) run.DispatchedStageLiveness {
@@ -122,6 +165,13 @@ func TestDispatchedAt_NotBumpedByProgressHeartbeat(t *testing.T) {
 	// Force a distinct transaction clock so the updated_at advance is
 	// unambiguous, then heartbeat.
 	time.Sleep(2 * time.Millisecond)
+	// This ReportedAt is deliberately NOT DB-anchored (#3048 leaves it alone).
+	// It is a NON-COMPARATIVE fixture: this test never reads LastHeartbeatAt and
+	// never compares the seeded value against dispatched_at — it asserts only
+	// that updated_at advanced and dispatched_at did not. There is no
+	// cross-clock dependency here, so anchoring it would be churn in code that
+	// was never at risk. A future blanket "no time.Now() in this file" grep
+	// should read this comment rather than "fix" the line.
 	applied, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{
 		LastEvent:  "assistant",
 		ReportedAt: time.Now().UTC(),
@@ -206,7 +256,13 @@ func TestDispatchedAt_RedispatchWithStaleHeartbeatReportsNeverCheckedIn(t *testi
 
 	// Attempt 1: dispatch and check in with a heartbeat stamped in the past.
 	dispatchStage(t, repo, s.ID)
-	staleHeartbeat := time.Now().UTC().Add(-time.Hour)
+	// #3048: DB-anchored, against ATTEMPT 1's stamp — taken BEFORE the
+	// re-dispatch below re-stamps dispatched_at forward, which is exactly the
+	// ordering this test needs (the seed must predate the SECOND stamp, and it
+	// predates the FIRST by a scaled hour). A one-hour margin dwarfs any
+	// plausible skew, but skew is unbounded in principle, so the anchor makes
+	// the stale direction hold by construction rather than by margin.
+	staleHeartbeat := dbAnchoredHeartbeat(t, pool, s.ID, -timescale.D(time.Hour))
 	if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{LastEvent: "assistant", ReportedAt: staleHeartbeat}); err != nil {
 		t.Fatalf("record attempt-1 heartbeat: %v", err)
 	}
@@ -251,7 +307,10 @@ func TestListDispatchedStageLiveness_MapsHeartbeatReportedAt(t *testing.T) {
 	s := makeStage(t, repo, r.ID, 0)
 	dispatchStage(t, repo, s.ID)
 
-	reportedAt := time.Now().UTC().Truncate(time.Millisecond)
+	// #3048: the seed is DB-ANCHORED — derived from this row's own DB-stamped
+	// dispatched_at rather than the host's time.Now() — so the assertion below
+	// no longer depends on host/container clock agreement.
+	reportedAt := dbAnchoredHeartbeat(t, pool, s.ID, timescale.D(time.Second))
 	if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{LastEvent: "tool_use", ReportedAt: reportedAt}); err != nil {
 		t.Fatalf("record heartbeat: %v", err)
 	}
@@ -264,6 +323,8 @@ func TestListDispatchedStageLiveness_MapsHeartbeatReportedAt(t *testing.T) {
 	if l.LastHeartbeatAt == nil {
 		t.Fatal("LastHeartbeatAt = nil after a fresh heartbeat")
 	}
+	// Doubles as an in-test proof that the stages.progress JSONB round-trip is
+	// lossless: reportedAt carries the row's full microsecond-resolution stamp.
 	if !l.LastHeartbeatAt.Equal(reportedAt) {
 		t.Errorf("LastHeartbeatAt = %v, want %v (the recorded ReportedAt)", l.LastHeartbeatAt, reportedAt)
 	}
@@ -272,6 +333,58 @@ func TestListDispatchedStageLiveness_MapsHeartbeatReportedAt(t *testing.T) {
 	}
 	if l.UpdatedAt.IsZero() {
 		t.Error("UpdatedAt is zero, want the row's updated_at")
+	}
+}
+
+// TestListDispatchedStageLiveness_HeartbeatEqualToDispatchIsCurrent pins the
+// EQUAL-INSTANT boundary of the attempt-relative filter: a heartbeat reported at
+// EXACTLY the dispatch instant belongs to the CURRENT attempt, not a prior one.
+// That is the difference between the shipped `!hb.Before(*l.DispatchedAt)` and
+// the strict spelling `hb.After(*l.DispatchedAt)`.
+//
+// The offset is ZERO deliberately and MUST STAY ZERO. A strictly-positive offset
+// (+1ms, +1µs, anything) passes under BOTH spellings, so the test would go green
+// while pinning nothing — a control that cannot fail, which is worse than no
+// boundary test because it also suppresses the signal that the boundary is
+// untested. Offset 0 is only expressible because the round-trip is lossless (see
+// dbAnchoredHeartbeat). Proof of discriminating power is the manual
+// counterfactual recorded in the PR body: weakening the production filter to
+// `hb.After` turns THIS test red while the stale-heartbeat test stays green.
+func TestListDispatchedStageLiveness_HeartbeatEqualToDispatchIsCurrent(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	store := progressStore(t, repo)
+	lister := livenessLister(t, repo)
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0)
+	dispatchStage(t, repo, s.ID)
+
+	hb := dbAnchoredHeartbeat(t, pool, s.ID, 0)
+	if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{LastEvent: "tool_use", ReportedAt: hb}); err != nil {
+		t.Fatalf("record equal-instant heartbeat: %v", err)
+	}
+
+	rows, err := lister.ListDispatchedStageLiveness(ctx)
+	if err != nil {
+		t.Fatalf("ListDispatchedStageLiveness: %v", err)
+	}
+	l := livenessFor(t, rows, s.ID)
+	// The equality premise depends on dispatched_at NOT being re-stamped by the
+	// progress-only UPDATE. Re-assert it so a future trigger change that broke
+	// the premise fails loudly here instead of making this test silently vacuous.
+	if l.DispatchedAt == nil {
+		t.Fatal("DispatchedAt = nil after an equal-instant heartbeat")
+	}
+	if !l.DispatchedAt.Equal(hb) {
+		t.Fatalf("dispatched_at MOVED under a progress-only heartbeat: anchor=%v now=%v (the equal-instant premise is void)", hb, l.DispatchedAt)
+	}
+	if l.LastHeartbeatAt == nil {
+		t.Fatal("LastHeartbeatAt = nil at the exact dispatch instant, want the heartbeat (a check-in AT the dispatch instant belongs to the current attempt)")
+	}
+	if !l.LastHeartbeatAt.Equal(hb) {
+		t.Errorf("LastHeartbeatAt = %v, want %v (the equal-instant ReportedAt)", l.LastHeartbeatAt, hb)
 	}
 }
 

@@ -247,22 +247,29 @@ type promptResponse struct {
 	// AcceptanceExpectedHeadSHA is the run's merge-candidate identity — the
 	// newest head_sha across the run's reported-head ledger entries
 	// (pull_request_opened / child_pushed / fixup_pushed, the same ADR-035
-	// lineage source FixupExpectedHeadSHA resolves from) — served ONLY on
-	// acceptance stages (E31.18 / #1569). The runner's pre-spawn
-	// target-identity gate compares the declared target's /healthz git_sha
-	// against it before spawning the acceptance agent, so acceptance
-	// validates the merge candidate rather than whatever build answers at
-	// the declared host. Empty/omitted when resolution fails (empty ledger
-	// or read error, WARN-and-omit) — the runner then treats the target as
-	// unverifiable and warns-and-proceeds rather than blocking the stage.
+	// lineage source FixupExpectedHeadSHA resolves from), falling back to
+	// the newest integration_commit_recorded merge_sha on the run's own
+	// chain for a decomposed parent whose reported-head ledger is empty
+	// (#3091) — served ONLY on acceptance stages (E31.18 / #1569). The
+	// runner's pre-spawn target-identity gate compares the declared
+	// target's /healthz git_sha against it before spawning the acceptance
+	// agent, so acceptance validates the merge candidate rather than
+	// whatever build answers at the declared host. Empty/omitted when
+	// resolution fails (empty ledger + no fan-in record, or a read error,
+	// WARN-and-omit) — the runner then FAILS the stage pre-spawn,
+	// category C, reason acceptance_expected_head_unresolved, rather than
+	// warning and proceeding (#3091): with no expectation there is nothing
+	// to verify the target against, so a recorded verdict would bind to no
+	// tree.
 	//
 	// CROSS-MODULE WIRE CONTRACT: the json tag
 	// (`acceptance_expected_head_sha`) MUST stay byte-identical to the
 	// runner's upload.FetchedPrompt.AcceptanceExpectedHeadSHA decoder
 	// (runner/internal/upload/upload.go) — the same independent-struct-by-tag
 	// convention as EgressTargetHosts above. A tag drift here silently drops
-	// the expectation and the runner's identity gate degrades to
-	// unverifiable-warn on every dispatch.
+	// the expectation — which since #3091 HARD-FAILS every declared-target
+	// acceptance dispatch category-C rather than degrading the gate to an
+	// unverifiable warn, so the drift is loud but total.
 	AcceptanceExpectedHeadSHA string `json:"acceptance_expected_head_sha,omitempty"`
 	// OpenPRFromHeldCommit / HeldCommitSHA / HeldCommitBranch are the
 	// scope-completeness EXEMPT resolution fields (#1231's zero-re-run promise,
@@ -954,7 +961,10 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 
 	switch stage.State {
 	case run.StageStateAwaitingApproval, run.StageStateAwaitingChildren,
-		run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled:
+		run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled,
+		// A merge-superseded stage is terminal (#3083): the merge made it
+		// unreachable, so it must be refused a prompt rather than served one.
+		run.StageStateSuperseded:
 		s.writeError(w, r, http.StatusConflict, "stage_not_runnable",
 			"stage is not in a runnable state",
 			map[string]any{"current_state": string(stage.State), "stage_id": stageID.String()})
@@ -1612,7 +1622,10 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 
 	switch stage.State {
 	case run.StageStateAwaitingApproval, run.StageStateAwaitingChildren,
-		run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled:
+		run.StageStateSucceeded, run.StageStateFailed, run.StageStateCancelled,
+		// A merge-superseded stage is terminal (#3083): the merge made it
+		// unreachable, so it must be refused a prompt rather than served one.
+		run.StageStateSuperseded:
 		s.writeError(w, r, http.StatusConflict, "stage_not_runnable",
 			"stage is not in a runnable state",
 			map[string]any{"current_state": string(stage.State), "stage_id": stageID.String()})
@@ -3636,17 +3649,110 @@ func (s *Server) resolveFixupExpectedHeadSHA(ctx context.Context, runID, stageID
 	return s.resolveNewestReportedHeadSHA(ctx, runID, stageID, "fixup_expected_head_sha")
 }
 
-// resolveAcceptanceExpectedHeadSHA returns the run's merge-candidate
-// identity — the same newest-reported-head walk resolveFixupExpectedHeadSHA
-// performs — advertised on acceptance dispatches as
-// `acceptance_expected_head_sha` (E31.18 / #1569) so the runner's pre-spawn
-// target-identity gate can verify the declared acceptance target serves the
-// merge candidate (its /healthz git_sha) rather than a stale build.
+// resolveConsolidatedFanInHeadSHA resolves a DECOMPOSED PARENT's
+// consolidated-branch tip from its OWN integration_commit_recorded audit
+// entries (#3091).
 //
-// Same "" posture: unconfigured AuditRepo, empty ledger, or read error all
-// WARN-and-omit, and the runner degrades to unverifiable-warn.
+// A decomposed parent never writes a reported-head ledger entry on its own
+// chain: each child's child_pushed/fixup_pushed lands on the CHILD's chain
+// (see the decomposition-awareness note on buildReportedHeadLedger), and the
+// consolidated PR is opened by the orchestrator, which emits
+// consolidated_pr_opened with a pull_request_url-only payload — no SHA. So
+// resolveNewestReportedHeadSHA resolves "" for such a run and the acceptance
+// dispatch would ship an empty expectation. The fan-in DOES record each
+// "Integrate slice N" merge commit incrementally as
+// integration_commit_recorded{merge_sha} (lineageIntegrationCommitCategory,
+// #1806), and each such merge commit becomes the consolidated branch tip, so
+// the NEWEST recorded merge IS the consolidated head.
+//
+// Ordering is by SEQUENCE (the chain's monotone append order), not timestamp:
+// the fan-in writes these entries in merge order within one pass, and the
+// dispatch-anchored caller compares against a sequence anchor.
+//
+// When bounded is true only entries with Sequence <= maxSeq are candidates —
+// the acceptanceValidatedHeadSHA semantics, where a merge recorded AFTER the
+// acceptance dispatch must never re-bind the verdict to a tree the stage did
+// not validate. When bounded is false every entry is a candidate.
+//
+// Returns ("", false) on an unconfigured AuditRepo, a read error, no entries,
+// or no entry carrying a non-empty merge_sha — the same WARN-and-omit posture
+// as every other prompt resolver, so an unreadable ledger degrades to today's
+// empty answer and the fail-closed dispatch gates take over.
+func (s *Server) resolveConsolidatedFanInHeadSHA(ctx context.Context, runID uuid.UUID, maxSeq int64, bounded bool) (string, bool) {
+	if s.cfg.AuditRepo == nil {
+		return "", false
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, lineageIntegrationCommitCategory)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: list integration_commit_recorded entries failed; no consolidated fan-in head",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return "", false
+	}
+	var newest *audit.Entry
+	var newestSHA string
+	for _, e := range entries {
+		if bounded && e.Sequence > maxSeq {
+			continue
+		}
+		var payload struct {
+			MergeSHA string `json:"merge_sha"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.MergeSHA == "" {
+			continue
+		}
+		if newest == nil || e.Sequence > newest.Sequence {
+			newest = e
+			newestSHA = payload.MergeSHA
+		}
+	}
+	if newest == nil {
+		return "", false
+	}
+	return newestSHA, true
+}
+
+// acceptanceHeadForRun resolves ONE run's acceptance merge-candidate head:
+// the run's own reported-head ledger FIRST (returned verbatim when non-empty,
+// so every non-decomposed run's value is byte-identical to before #3091), and
+// only when that resolves "" the consolidated fan-in fallback. The fallback is
+// strictly SUBORDINATE — it never overrides a reported head — and deliberately
+// does NOT widen lineageLedgerCategories / auditcomplete.HeadReportCategoriesByPrecedence,
+// which are shared with the audit-check publisher and the branch-lineage guard.
+func (s *Server) acceptanceHeadForRun(ctx context.Context, runID, stageID uuid.UUID) string {
+	if sha := s.resolveNewestReportedHeadSHA(ctx, runID, stageID, "acceptance_expected_head_sha"); sha != "" {
+		return sha
+	}
+	if sha, ok := s.resolveConsolidatedFanInHeadSHA(ctx, runID, 0, false); ok {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: acceptance head resolved from the consolidated fan-in ledger",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("head_sha", sha),
+		)
+		return sha
+	}
+	return ""
+}
+
+// resolveAcceptanceExpectedHeadSHA returns the run's merge-candidate
+// identity — the newest-reported-head walk resolveFixupExpectedHeadSHA
+// performs, with the #3091 consolidated fan-in fallback for a decomposed
+// parent whose own reported-head ledger is empty — advertised on acceptance
+// dispatches as `acceptance_expected_head_sha` (E31.18 / #1569) so the
+// runner's pre-spawn target-identity gate can verify the declared acceptance
+// target serves the merge candidate (its /healthz git_sha) rather than a
+// stale build.
+//
+// Same "" posture: unconfigured AuditRepo, empty ledger + empty fan-in ledger,
+// or read error all WARN-and-omit. Since #3091 an omitted expectation is NOT
+// warn-and-proceed at the dispatch gates: both the verb gate and the runner
+// gate refuse (acceptance_expected_head_unresolved), because a verdict bound
+// to no tree is unfalsifiable.
 func (s *Server) resolveAcceptanceExpectedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) string {
-	return s.resolveNewestReportedHeadSHA(ctx, runID, stageID, "acceptance_expected_head_sha")
+	return s.acceptanceHeadForRun(ctx, runID, stageID)
 }
 
 // resolveAcceptanceExpectedHeadSHAWalkingParents resolves the acceptance
@@ -3654,14 +3760,16 @@ func (s *Server) resolveAcceptanceExpectedHeadSHA(ctx context.Context, runID, st
 // own-run resolveAcceptanceExpectedHeadSHA FIRST and returns its result verbatim
 // when non-empty (BYTE-IDENTICAL to the top-level path). Only when the own-run
 // ledger resolves "" AND r.ParentRunID != nil does it walk ParentRunID upward,
-// re-running resolveNewestReportedHeadSHA against each ancestor's runID until a
-// non-empty head resolves, ParentRunID is nil, or retryPlanChainDepth is hit.
+// re-running the same chain-then-consolidated resolution (acceptanceHeadForRun)
+// against each ancestor's runID until a non-empty head resolves, ParentRunID is
+// nil, or retryPlanChainDepth is hit.
 //
 // It mirrors loadApprovedPlanForRun's parent walk so a plan-stageless recovery
 // child — whose implement lineage was recorded under the PARENT runID — carries
 // its ancestor's non-empty merge-candidate head instead of shipping an empty
-// expected_head_sha (which degrades the #1953 dispatch verb from a hard-block to
-// proceed-with-warning). The walk is a PURE fallback: a top-level run
+// expected_head_sha (which since #3091 makes the #1953 dispatch verb REFUSE
+// with acceptance_expected_head_unresolved rather than spawn). The walk is a
+// PURE fallback: a top-level run
 // (ParentRunID==nil) never enters it, so every own-plan / top-level path is
 // unchanged. Preserves the WARN-and-omit "" posture — an exhausted walk returns
 // "" exactly as the own-run resolver would.
@@ -3677,7 +3785,10 @@ func (s *Server) resolveAcceptanceExpectedHeadSHAWalkingParents(ctx context.Cont
 	}
 	current := *r.ParentRunID
 	for depth := 0; depth < retryPlanChainDepth; depth++ {
-		if sha := s.resolveNewestReportedHeadSHA(ctx, current, stageID, "acceptance_expected_head_sha"); sha != "" {
+		// Each ancestor gets the SAME chain-then-consolidated resolution the
+		// own-run path uses (#3091): an ancestor can itself be a decomposed
+		// parent whose head lives only in its fan-in ledger.
+		if sha := s.acceptanceHeadForRun(ctx, current, stageID); sha != "" {
 			return sha
 		}
 		runRow, err := s.cfg.RunRepo.GetRun(ctx, current)

@@ -1041,6 +1041,71 @@ func TestCompleteRun_RefusesSucceededWithNonTerminalStage(t *testing.T) {
 	}
 }
 
+// TestCompleteRun_CompletesAroundSupersededStage is the orchestrator half of
+// the merge-supersede change (E64.2 / #3083). NOTHING in
+// backend/internal/orchestrator/orchestrator.go is edited by that change: the
+// #968 guard passes `superseded` for free because the state is TERMINAL, and
+// the target computation special-cases only failed/cancelled, so a superseded
+// stage leaves the target at `succeeded`. This test is the proof of both
+// claims, and it goes RED if a future change drops superseded out of
+// StageState.IsTerminal or teaches completeRun to treat it like cancelled.
+func TestCompleteRun_CompletesAroundSupersededStage(t *testing.T) {
+	o, rs, _ := newOrchestrator(t)
+	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, State: run.StageStateSuperseded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStateSucceeded},
+	})
+
+	out, err := o.completeRun(context.Background(), r, stages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeRunCompleted {
+		t.Errorf("Outcome = %q, want run_completed", out)
+	}
+	// SUCCEEDED, not cancelled: superseded must not be folded into the
+	// cancelled arm of the target computation. A run whose acceptance stage the
+	// merge superseded still succeeded — that is the whole point of #3083.
+	if got := rs.runs[r.ID].State; got != run.StateSucceeded {
+		t.Errorf("run state = %q, want succeeded (superseded is terminal and is not a failure or a cancel)", got)
+	}
+}
+
+// TestCompleteRun_RefusesAroundNonSupersededNonTerminalStage is THE PINNED
+// INVARIANT (#3083, plan step 8b). The #968 guard must keep refusing a run that
+// holds a genuinely non-terminal stage the merge did NOT supersede. This is the
+// test that goes RED if a future change tries to derive completion from
+// post_merge_observed and bypass the guard, or widens the merge-supersede pair
+// table to a state-only allow-list that would sweep a running implement stage.
+//
+// The superseded sibling in the same run is deliberately present: it proves the
+// refusal is driven by the RUNNING stage specifically, not by the guard having
+// simply failed to learn about superseded at all.
+func TestCompleteRun_RefusesAroundNonSupersededNonTerminalStage(t *testing.T) {
+	o, rs, _ := newOrchestrator(t)
+	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateRunning},
+		{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, State: run.StageStateSuperseded},
+	})
+
+	out, err := o.completeRun(context.Background(), r, stages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeNoOp {
+		t.Errorf("Outcome = %q, want noop: a run holding a RUNNING implement stage must not complete", out)
+	}
+	if got := rs.runs[r.ID].State; got != run.StateRunning {
+		t.Errorf("run state = %q, want running (the #968 guard must still refuse)", got)
+	}
+	if len(rs.runTransitions) != 0 {
+		t.Errorf("run transitions = %d, want 0 (nothing may be stamped)", len(rs.runTransitions))
+	}
+}
+
 func TestAdvance_AnyStageFailed_RunFails(t *testing.T) {
 	o, rs, _ := newOrchestrator(t)
 	r, _ := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{

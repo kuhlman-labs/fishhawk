@@ -340,6 +340,9 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 			case "grooming_order_invalid":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"grooming_order_invalid: %s — the grooming run's report cannot be turned into a campaign order; re-run the grooming workflow to emit a well-formed report", ae.Message)
+			case "issue_set_resolution_timeout":
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"issue_set_resolution_timeout: %s — %s", ae.Message, issueSetTimeoutRemedy(ae.Details))
 			case "campaign_repo_unconfigured":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"campaign_repo_unconfigured: %s — this deployment has no campaign repository wired, so campaigns cannot be created", ae.Message)
@@ -673,6 +676,63 @@ func (r *runResolver) cancelCampaign(ctx context.Context, _ *mcp.CallToolRequest
 		return nil, CancelCampaignOutput{}, fmt.Errorf("cancel campaign: %w", err)
 	}
 	return nil, CancelCampaignOutput{Campaign: *updated}, nil
+}
+
+// issueSetTimeoutRemedy renders the operator-actionable half of the 504
+// issue_set_resolution_timeout refusal (E54.59 / #3113): how far the server's
+// bounded resolution got, and what to do about it.
+//
+// The remedy BRANCHES on whether the server could prove a value that fits. The
+// backend OMITS suggested_grooming_order_limit when its SuggestedLimit is 0 —
+// "no value could be PROVEN to fit" — so this must not invent a number in that
+// case; it says so plainly and offers bisection instead. Shipping a 0 as a
+// suggestion would advise the operator to request nothing.
+//
+// Detail values arrive as JSON numbers, which encoding/json decodes into a
+// map[string]any as float64 and NOT int, so every read goes through
+// detailInt. A missing or wrong-typed value degrades to naming the code and
+// the generic remedy rather than rendering a bogus count — this is the
+// wrong-detail-type failure mode that testing the two ends separately would
+// let pass, which is why the cross-boundary test drives the REAL server's
+// response through the REAL decoder into this function.
+func issueSetTimeoutRemedy(details map[string]any) string {
+	var b strings.Builder
+	resolved, resolvedOK := detailInt(details, "resolved")
+	total, totalOK := detailInt(details, "items_total")
+	if resolvedOK && totalOK {
+		fmt.Fprintf(&b, "the server resolved %d of %d issues", resolved, total)
+	} else {
+		b.WriteString("the server's issue-set resolution did not finish")
+	}
+	if budget, ok := detailInt(details, "budget_seconds"); ok {
+		fmt.Fprintf(&b, " within its %ds issue-set budget", budget)
+	} else {
+		b.WriteString(" within its issue-set budget")
+	}
+	if suggested, ok := detailInt(details, "suggested_grooming_order_limit"); ok && suggested > 0 {
+		fmt.Fprintf(&b, ". Retry with grooming_order_limit=%d — that many items provably fit within the budget — or raise the deploy's FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET", suggested)
+	} else {
+		// No proven-fitting value: say so rather than inventing one.
+		b.WriteString(". The server could not prove ANY item count that fits, so it suggests no number: bisect with grooming_limit (halve it and retry until the campaign assembles), or raise the deploy's FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET")
+	}
+	return b.String()
+}
+
+// detailInt reads an integer out of an *apiError Details map. JSON numbers
+// decode into map[string]any as float64 (encoding/json), so a plain int type
+// assertion NEVER matches on the wire path; both forms are accepted so a
+// hand-built map in a unit test behaves the same as a decoded response. Any
+// other type — or an absent key — reports absent, so callers degrade rather
+// than render a zero they would have to explain.
+func detailInt(details map[string]any, key string) (int, bool) {
+	switch v := details[key].(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	default:
+		return 0, false
+	}
 }
 
 // formatDanglingEdges renders the campaign_dangling_dependency details' edge

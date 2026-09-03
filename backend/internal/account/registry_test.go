@@ -22,6 +22,11 @@ type fakeRegistryQueries struct {
 	account                 accountdb.Account
 	upsertInstallationCalls int
 	upsertAccountCalls      int
+	// lastInstallation is the params of the most recent UpsertInstallation.
+	// The COMMITTED-STATE read: a validation that fired and was then rolled
+	// back would return a byte-identical error, so every refusal case asserts
+	// the write was never reached rather than only the error identity.
+	lastInstallation accountdb.UpsertInstallationParams
 }
 
 func (f *fakeRegistryQueries) GetAccountByKey(_ context.Context, _ accountdb.GetAccountByKeyParams) (accountdb.Account, error) {
@@ -44,6 +49,7 @@ func (f *fakeRegistryQueries) UpsertAccount(_ context.Context, arg accountdb.Ups
 
 func (f *fakeRegistryQueries) UpsertInstallation(_ context.Context, arg accountdb.UpsertInstallationParams) (accountdb.Installation, error) {
 	f.upsertInstallationCalls++
+	f.lastInstallation = arg
 	return accountdb.Installation{
 		ID:              arg.ID,
 		AccountID:       arg.AccountID,
@@ -51,6 +57,7 @@ func (f *fakeRegistryQueries) UpsertInstallation(_ context.Context, arg accountd
 		InstallationRef: arg.InstallationRef,
 		ForgeBaseUrl:    arg.ForgeBaseUrl,
 		OauthBaseUrl:    arg.OauthBaseUrl,
+		ProjectPath:     arg.ProjectPath,
 	}, nil
 }
 
@@ -281,6 +288,7 @@ func TestRegisterInstallation_HappyPath(t *testing.T) {
 		Provider:        "gitlab",
 		AccountKey:      "acme",
 		InstallationRef: "gitlab:4242",
+		ProjectPath:     "acme/widgets",
 	})
 	if err != nil {
 		t.Fatalf("RegisterInstallation happy path: %v", err)
@@ -290,5 +298,187 @@ func TestRegisterInstallation_HappyPath(t *testing.T) {
 	}
 	if inst.AccountID != acctID {
 		t.Errorf("installation account id = %s, want the resolved account %s", inst.AccountID, acctID)
+	}
+}
+
+// TestRegisterInstallation_GitLabProjectPath covers every named branch of the
+// E45.26 / #2877 write-side binding: --project-path is REQUIRED for a gitlab
+// registration, must be a <namespace>/<project> path (nested groups included),
+// and its namespace segment must equal the resolved account_key.
+//
+// COMMITTED STATE, not error identity (counterfactual trap (a)): each refusal
+// asserts UpsertInstallation was NEVER reached. A validation that fired and was
+// then rolled back would return a byte-identical error, so the error alone
+// cannot discriminate.
+func TestRegisterInstallation_GitLabProjectPath(t *testing.T) {
+	acctID := uuid.New()
+	cases := []struct {
+		name        string
+		provider    string
+		projectPath string
+		wantWrite   bool
+		// wantSub is a substring the refusal message must carry, so a
+		// regression to a generic message reddens.
+		wantSub string
+	}{
+		{
+			name: "missing_project_path_refuses", provider: "gitlab", projectPath: "",
+			wantSub: "--project-path",
+		},
+		{
+			name: "whitespace_project_path_refuses", provider: "gitlab", projectPath: "   ",
+			wantSub: "--project-path",
+		},
+		{
+			// No separator at all: a bare project name names no namespace, so
+			// the gate's own strings.Cut derivation would refuse it later.
+			name: "namespaceless_path_refuses", provider: "gitlab", projectPath: "widgets",
+			wantSub: "<namespace>/<project>",
+		},
+		{
+			name: "empty_namespace_segment_refuses", provider: "gitlab", projectPath: "/widgets",
+			wantSub: "<namespace>/<project>",
+		},
+		{
+			name: "empty_project_segment_refuses", provider: "gitlab", projectPath: "acme/",
+			wantSub: "<namespace>/<project>",
+		},
+		{
+			// Nesting is not a licence for empty components. GitLab never
+			// canonicalises a path_with_namespace carrying one, so a row
+			// recording one could never match a payload: the registration
+			// would report success and then refuse every trigger forever.
+			name: "empty_interior_component_refuses", provider: "gitlab", projectPath: "acme//widgets",
+			wantSub: "every component non-empty",
+		},
+		{
+			name: "empty_nested_interior_component_refuses", provider: "gitlab", projectPath: "acme/platform//widgets",
+			wantSub: "every component non-empty",
+		},
+		{
+			// The TERMINAL component: a trailing separator on an otherwise
+			// well-formed nested path.
+			name: "empty_terminal_component_refuses", provider: "gitlab", projectPath: "acme/platform/widgets/",
+			wantSub: "every component non-empty",
+		},
+		{
+			name: "all_empty_components_refuse", provider: "gitlab", projectPath: "acme//",
+			wantSub: "every component non-empty",
+		},
+		{
+			// The namespace-consistency check: a path outside the owning
+			// account's namespace is the mis-registration the authorizer's
+			// retained tenancy invariant exists to catch. Refuse it at the
+			// write instead of creating a row the gate will always reject.
+			name: "namespace_mismatch_refuses", provider: "gitlab", projectPath: "other/widgets",
+			wantSub: `"acme"`,
+		},
+		{
+			name: "gitlab_happy_path_writes", provider: "gitlab", projectPath: "acme/widgets",
+			wantWrite: true,
+		},
+		{
+			// BINDING CONDITION 4: GitLab groups NEST. A validator splitting on
+			// every "/" and demanding exactly two segments would make every
+			// nested-group project unregisterable. The split is on the FIRST
+			// separator only, so the namespace is "acme" and the project is
+			// "platform/widgets".
+			name: "nested_group_writes", provider: "gitlab", projectPath: "acme/platform/widgets",
+			wantWrite: true,
+		},
+		{
+			name: "deeply_nested_group_writes", provider: "gitlab", projectPath: "acme/platform/infra/widgets",
+			wantWrite: true,
+		},
+		{
+			// The rule is gitlab-ONLY. A github installation's identity arrives
+			// inside an HMAC-signed payload and resolves through the
+			// installation id, so it records no project path — and a required
+			// flag there would be a gratuitous contract break.
+			name: "github_without_project_path_writes", provider: "github", projectPath: "",
+			wantWrite: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := "gitlab:4242"
+			if tc.provider == "github" {
+				ref = "4242"
+			}
+			fake := &fakeRegistryQueries{account: accountdb.Account{
+				ID: acctID, Provider: tc.provider, AccountKey: "acme", Granularity: "group",
+			}}
+			inst, err := RegisterInstallation(context.Background(), fake, RegisterInstallationRequest{
+				Provider:        tc.provider,
+				AccountKey:      "acme",
+				InstallationRef: ref,
+				ProjectPath:     tc.projectPath,
+			})
+
+			if !tc.wantWrite {
+				if err == nil {
+					t.Fatal("err = nil, want a validation refusal")
+				}
+				if !errors.Is(err, ErrValidation) {
+					t.Errorf("err = %v, want ErrValidation", err)
+				}
+				if tc.wantSub != "" && !strings.Contains(err.Error(), tc.wantSub) {
+					t.Errorf("err %q does not name %q", err.Error(), tc.wantSub)
+				}
+				// The committed-state assertion.
+				if fake.upsertInstallationCalls != 0 {
+					t.Errorf("UpsertInstallation called %d times after a refusal, want 0 (no row may be written)",
+						fake.upsertInstallationCalls)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("RegisterInstallation: %v", err)
+			}
+			if fake.upsertInstallationCalls != 1 {
+				t.Fatalf("UpsertInstallation called %d times, want 1", fake.upsertInstallationCalls)
+			}
+			got := fake.lastInstallation.ProjectPath
+			if tc.provider == "github" {
+				// github persists NO project path: writing one would record a
+				// binding nothing evaluates.
+				if got != nil {
+					t.Errorf("github installation project_path = %q, want NULL", *got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("gitlab installation project_path = NULL, want the recorded path")
+			}
+			if *got != tc.projectPath {
+				t.Errorf("persisted project_path = %q, want %q (exact, untransformed)", *got, tc.projectPath)
+			}
+			if inst.ProjectPath == nil || *inst.ProjectPath != tc.projectPath {
+				t.Errorf("returned installation project_path = %v, want %q", inst.ProjectPath, tc.projectPath)
+			}
+		})
+	}
+}
+
+// TestRegisterInstallation_TrimsProjectPath pins that a path is stored trimmed:
+// the authorizer compares the recorded value against a payload path byte for
+// byte, so a stray flag-quoting space would silently produce a row that never
+// admits anything.
+func TestRegisterInstallation_TrimsProjectPath(t *testing.T) {
+	fake := &fakeRegistryQueries{account: accountdb.Account{
+		ID: uuid.New(), Provider: "gitlab", AccountKey: "acme", Granularity: "group",
+	}}
+	if _, err := RegisterInstallation(context.Background(), fake, RegisterInstallationRequest{
+		Provider:        "gitlab",
+		AccountKey:      "acme",
+		InstallationRef: "gitlab:4242",
+		ProjectPath:     "  acme/widgets  ",
+	}); err != nil {
+		t.Fatalf("RegisterInstallation: %v", err)
+	}
+	got := fake.lastInstallation.ProjectPath
+	if got == nil || *got != "acme/widgets" {
+		t.Errorf("persisted project_path = %v, want %q (trimmed)", got, "acme/widgets")
 	}
 }
