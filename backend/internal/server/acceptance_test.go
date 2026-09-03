@@ -2923,6 +2923,12 @@ func acceptanceVerdictBytes(t *testing.T, verdict, failureMode string, results .
 // passed, with the reported verdict, the basis, and the retired ids preserved;
 // the stored artifact bytes are untouched; triage writes nothing; and the merge
 // gate reads a merge-eligible acceptance_passed.
+//
+// This is the RESOLVABLE-HEAD sibling of
+// TestShipAcceptance_EmptyHead_RetirementNeutralizedPassClamped: with a bound
+// head the neutralized pass is recorded exactly as #2581 requires, and only an
+// UNBOUND head raises it to undecidable (#3124). The pair is the deliberate
+// boundary — do not collapse them.
 func TestShipAcceptance_RetiredOnlyFailure_RecordedPassed(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
@@ -2989,14 +2995,24 @@ func TestShipAcceptance_RetiredOnlyFailure_RecordedPassed(t *testing.T) {
 	}
 }
 
-// TestShipAcceptance_EmptyHead_RetirementNeutralizedPassNotClamped is the #3091
-// clamp's SCOPE BOUNDARY, held at the same layer as the clamp itself. The
-// fixture is the (h) fixture's unbound head PLUS a #2581 retirement: the recorded
-// `passed` there is the operator's approval-time decision that the failing
-// criteria no longer apply, not the agent's claim about a tree, so the clamp
-// must leave it alone. Deleting the `downgradedVerdict == ""` guard reddens this
-// test (recorded verdict becomes undecidable) without touching (h)/(i).
-func TestShipAcceptance_EmptyHead_RetirementNeutralizedPassNotClamped(t *testing.T) {
+// TestShipAcceptance_EmptyHead_RetirementNeutralizedPassClamped is the #3124
+// done-means, held at the same layer as the clamp itself: the #3091 unbound-head
+// clamp applies to a #2581 retirement-neutralized pass TOO. The fixture is the
+// (h) fixture's unbound head PLUS a #2581 retirement. An unresolvable head names
+// no tree, so retirement — which only decides which criteria count — cannot
+// rescue the pass; the recorded verdict is raised to undecidable WHILE the
+// operator's retirement decision stays fully visible (downgrade_basis /
+// retired_criterion_ids / verdict_reported). Its resolvable-head sibling
+// TestShipAcceptance_RetiredOnlyFailure_RecordedPassed proves the ordinary
+// retirement path is untouched, so the pair reads as a deliberate boundary.
+//
+// COUNTERFACTUAL: restoring the removed `&& downgradedVerdict == ""` half of the
+// clamp condition reddens THIS test (verdict reverts to passed) while the three
+// non-retirement clamp tests stay green — proving it pins the carve-out REMOVAL
+// specifically, not merely the clamp's existence. The unresolvable head is
+// stripped BY CONSTRUCTION via withoutHeadLedger, so a RED lands on the verdict
+// assertion, not on fixture setup.
+func TestShipAcceptance_EmptyHead_RetirementNeutralizedPassClamped(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
 	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
@@ -3016,14 +3032,24 @@ func TestShipAcceptance_EmptyHead_RetirementNeutralizedPassNotClamped(t *testing
 	if got := payload["head_sha"]; got != "" {
 		t.Fatalf("head_sha = %v, want empty (fixture sanity: the head IS unresolvable here)", got)
 	}
-	if got := payload["verdict"]; got != acceptanceVerdictPassed {
-		t.Errorf("verdict = %v, want passed — the clamp must not override a #2581 neutralization", got)
+	// The clamp raises the neutralized pass to undecidable on an unbound head.
+	if got := payload["verdict"]; got != acceptanceVerdictUndecidable {
+		t.Errorf("verdict = %v, want undecidable — the clamp applies to a retirement neutralization too (#3124)", got)
 	}
+	if got := payload["undecidable_basis"]; got != acceptanceUndecidableBasisHeadUnresolved {
+		t.Errorf("undecidable_basis = %v, want %q", got, acceptanceUndecidableBasisHeadUnresolved)
+	}
+	// The shipped verdict is preserved as evidence.
+	if got := payload["verdict_reported"]; got != "failed" {
+		t.Errorf("verdict_reported = %v, want failed (the shipped verdict preserved)", got)
+	}
+	// GOVERNANCE VISIBILITY: the clamp RAISES the verdict without ERASING the
+	// operator's retirement record — the downgrade basis and retired ids remain.
 	if got := payload["downgrade_basis"]; got != acceptanceDowngradeBasisRetiredOnly {
-		t.Errorf("downgrade_basis = %v, want %q", got, acceptanceDowngradeBasisRetiredOnly)
+		t.Errorf("downgrade_basis = %v, want %q (retirement record must survive the clamp)", got, acceptanceDowngradeBasisRetiredOnly)
 	}
-	if _, present := payload["undecidable_basis"]; present {
-		t.Errorf("clamp fired on a neutralized verdict: %v", payload)
+	if got := toStringSlice(payload["retired_criterion_ids"]); !reflect.DeepEqual(got, []string{"crit-2"}) {
+		t.Errorf("retired_criterion_ids = %v, want [crit-2] (retirement record must survive the clamp)", got)
 	}
 }
 

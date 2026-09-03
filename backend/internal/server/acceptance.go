@@ -853,15 +853,18 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	// aggregation, because an unbound head invalidates whatever those two
 	// concluded about the tree.
 	//
-	// It is deliberately SCOPED OUT of the #2581 retirement neutralization
-	// (downgradedVerdict != ""): that `passed` is not the agent's claim about a
-	// tree at all — it is the OPERATOR's approval-time decision that the failing
-	// criteria no longer apply, whose outcome #2581 fixes at `passed`. Raising it
-	// here would silently undo that decision on runs the operator has already
-	// governed. The residual is honest and named in the README: a neutralized
-	// pass can still be recorded on a run whose head did not resolve.
+	// The clamp applies to EVERY unbound ship, a #2581 retirement neutralization
+	// INCLUDED (#3124). The two concerns are orthogonal: retirement decides WHICH
+	// CRITERIA COUNT, an unresolvable validated head means we do not know WHICH
+	// TREE WAS EXERCISED AT ALL — so a neutralized pass on an unbound head is no
+	// more anchored to a validated commit than any other pass. The direction stays
+	// safe by construction: the max ladder can only RAISE the neutralized passed(0)
+	// to undecidable(1), which is strictly LESS soft than the passed(0) retirement
+	// itself produced from the shipped failed(2), so no shipped `failed` is
+	// softened. The operator's retirement decision stays fully visible on the
+	// clamped payload via downgrade_basis / retired_criterion_ids / verdict_reported.
 	undecidableBasis := ""
-	if validatedHead == "" && downgradedVerdict == "" {
+	if validatedHead == "" {
 		if clamped := acceptanceVerdictAtLeast(recordedVerdict, acceptanceVerdictUndecidable); clamped != recordedVerdict {
 			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 				"acceptance: validated head unresolvable — clamping the recorded verdict to undecidable",
@@ -1615,11 +1618,13 @@ func acceptanceStageOf(stages []*run.Stage) *run.Stage {
 // entry; the highest-sequence one is the current validation episode. Returns
 // ("", false) when no head is recorded at-or-before dispatch, or when the stage
 // has no dispatch entry (a bare operator ship with no orchestrator dispatch, or
-// a read error) — the caller then CLAMPS the recorded verdict (#3091): a
-// `passed` the AGENT shipped whose validated head cannot be resolved is recorded
-// `undecidable` with undecidable_basis=head_unresolved (a #2581
-// retirement-neutralized pass is exempt — see the clamp's own comment), and
-// Option C still fails closed to today's 422 for such an unanchored verdict.
+// a read error) — the caller then CLAMPS the recorded verdict (#3091): any
+// `passed` whose validated head cannot be resolved is recorded `undecidable`
+// with undecidable_basis=head_unresolved. The clamp is UNCONDITIONAL on an
+// unresolvable head, a #2581 retirement-neutralized pass included (#3124) — an
+// unbound head names no tree, so retirement (which decides which criteria count)
+// cannot rescue it. Option C still fails closed to today's 422 for such an
+// unanchored verdict.
 func (s *Server) acceptanceValidatedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) (string, bool) {
 	if s.cfg.AuditRepo == nil {
 		return "", false
