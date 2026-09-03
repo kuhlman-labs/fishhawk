@@ -420,6 +420,25 @@ func TestRedactableDetailKeys_ExcludesErrorAndAdmitsSurveyedKeys(t *testing.T) {
 	}
 }
 
+// TestRedactableDetailKeys_AdmitsIssueSetTimeoutCounts pins the four keys the
+// 504 issue_set_resolution_timeout refusal is MADE OF (E54.59 / #3113). A 504
+// is a 5xx, so the default-deny redactor runs on it: without these entries the
+// operator receives a refusal with no numbers in it at all, which is the empty
+// body the counts exist to prevent.
+//
+// This is the direct counterfactual vehicle for the allow-list additions —
+// deleting any of the four entries from errors.go reddens the matching case
+// here AND the campaigns_test 504 detail assertions, which go through the real
+// writeError.
+func TestRedactableDetailKeys_AdmitsIssueSetTimeoutCounts(t *testing.T) {
+	for _, k := range []string{"resolved", "items_total", "suggested_grooming_order_limit", "budget_seconds"} {
+		out := redactErrorDetails(map[string]any{k: 7})
+		if out[k] != 7 {
+			t.Errorf("issue-set timeout count key %q was dropped by the 5xx allow-list; the 504 refusal would ship with no numbers", k)
+		}
+	}
+}
+
 // TestSplitInternalCause covers the cause-channel split directly, including the
 // branch where the ONLY key is internalCauseKey so the returned client map is
 // emptied to nil (errors.go's len(client)==0 → nil), and the absent-key
