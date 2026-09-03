@@ -3172,16 +3172,27 @@ severity-monotone `acceptanceVerdictAtLeast` ladder to `undecidable`, and
   `TestShipAcceptance_EmptyHead_FailedNotSoftened`.
 - **It runs LAST** because an unbound head invalidates whatever the row
   aggregation concluded about the tree.
-- **It does NOT override a #2581 retirement neutralization.** When the downgrade
-  fired, the recorded `passed` is not the agent's claim about a tree — it is the
-  operator's approval-time decision that the failing criteria no longer apply,
-  and #2581 fixes its outcome at `passed`; clamping it would silently undo a
-  decision the operator already governed
-  (`TestE2E_AmendAcceptanceCriteria_RetiredAtApproval_...` in
-  `backend/internal/integration/mcp` pins that arm end to end). The residual is
-  deliberate and stated plainly: a neutralized pass can still be recorded on a
-  run whose validated head did not resolve. Every OTHER unbound `passed` — the
-  agent's own — is clamped.
+- **It applies to EVERY unbound ship, a #2581 retirement neutralization
+  INCLUDED (#3124).** Retirement and the unbound-head clamp are orthogonal:
+  retirement decides WHICH CRITERIA COUNT, an unresolvable validated head means
+  no tree is named AT ALL — so a neutralized pass on an unbound head is no more
+  anchored to a validated commit than any other pass, and is raised to
+  `undecidable` too. The direction stays safe by construction: the `max` ladder
+  can only lift the neutralized `passed (0)` to `undecidable (1)`, which is
+  strictly LESS soft than the `passed (0)` retirement itself produced from the
+  shipped `failed (2)`, so nothing is softened. The operator's decision stays
+  fully visible on the clamped payload via `downgrade_basis` /
+  `retired_criterion_ids` / `verdict_reported`, and triage routing is unchanged —
+  it stays keyed on the AGENT's shipped `failed` claim plus the downgrade, so a
+  neutralized-then-clamped outcome still routes no triage. Pinned by
+  `TestShipAcceptance_EmptyHead_RetirementNeutralizedPassClamped` (the clamped
+  arm) and its resolvable-head sibling
+  `TestShipAcceptance_RetiredOnlyFailure_RecordedPassed` (which proves an
+  ordinary retirement WITH a bound head still records the neutralized `passed`
+  exactly as #2581 requires). `TestE2E_AmendAcceptanceCriteria_RetiredAtApproval_...`
+  in `backend/internal/integration/mcp` pins the resolvable-head retirement arm
+  end to end (it seeds a validated head + dispatch anchor precisely so the clamp
+  does not fire there).
 - **The basis is attached only when the clamp rewrote the verdict,** so a shipped
   `failed` on an unbound head carries no `undecidable_basis` it did not earn.
 - **`undecidable_basis` is its own key,** distinct from the #2581
