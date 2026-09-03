@@ -16144,6 +16144,20 @@ paths:
             rather than recording a partial fact that would claim a merge time
             it does not carry.
 
+            `record_merge_observation_pr_url_repo_mismatch` — the run's
+            recorded pull request URL resolves, but it does not name THIS run's
+            repository on THIS run's forge. The forge read is scoped by the
+            run's `repo` while the pull request NUMBER comes from that URL, and
+            the appended row records the URL as the pull request observed
+            merged; without this refusal the verb would confirm a different
+            repository's pull request and then write trusted evidence naming
+            this run's URL. Refused BEFORE the forge read, so a mismatch costs
+            no forge request. Owner/name are compared case-insensitively (a
+            case-differing spelling is the same repository) and the host is not
+            compared (the run row records none), but a run whose credential ref
+            names a non-GitHub forge cannot own a GitHub-style `/pull/` URL and
+            is refused here too.
+
             Every refusal is evaluated BEFORE any write: no audit row is
             appended.
           content:

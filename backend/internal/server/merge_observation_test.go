@@ -76,6 +76,13 @@ func newObservationFixture(t *testing.T, reader *fakePRStateReader) *observation
 	return &observationFixture{supersedeFixture: f, reader: reader}
 }
 
+// observationSubject is the KNOWN authenticated subject every observe POST in
+// this file installs unless a test deliberately posts anonymously. It exists so
+// the attribution assertion can name an identity the test SUPPLIED: asserting
+// only that ActorSubject is non-empty passes with identity propagation entirely
+// broken, because the handler substitutes "anonymous".
+const observationSubject = "operator@example.test"
+
 func (f *observationFixture) postObserve(t *testing.T) *httptest.ResponseRecorder {
 	t.Helper()
 	return f.postObserveID(t, f.runID.String())
@@ -83,11 +90,61 @@ func (f *observationFixture) postObserve(t *testing.T) *httptest.ResponseRecorde
 
 func (f *observationFixture) postObserveID(t *testing.T, id string) *httptest.ResponseRecorder {
 	t.Helper()
+	return f.postObserveAs(t, id, observationSubject)
+}
+
+// postObserveAs posts with an explicit authenticated subject. An EMPTY subject
+// installs no identity at all, which is the un-authenticated shape the
+// "anonymous" fallback covers.
+func (f *observationFixture) postObserveAs(t *testing.T, id, subject string) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+id+"/record-merge-observation", nil)
 	req.SetPathValue("run_id", id)
+	if subject != "" {
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{Subject: subject}))
+	}
 	w := httptest.NewRecorder()
 	f.s.handleRecordMergeObservation(w, req)
 	return w
+}
+
+// seedObservationRun creates an ADDITIONAL run in the fixture's repository,
+// carrying the given repo string / credential fields and pull request URL. It
+// is how the tests that need a DIFFERENT run shape (an unparseable repo field,
+// a credential ref, a mismatched URL) get one without reshaping the shared
+// supersede fixture every other test in this package depends on.
+func (f *observationFixture) seedObservationRun(t *testing.T, p run.CreateRunParams, prURL string) uuid.UUID {
+	t.Helper()
+	ctx := context.Background()
+	if p.WorkflowID == "" {
+		p.WorkflowID = "feature_change"
+	}
+	if p.WorkflowSHA == "" {
+		p.WorkflowSHA = "abc"
+	}
+	if p.TriggerSource == "" {
+		p.TriggerSource = run.TriggerCLI
+	}
+	r, err := f.runRepo.CreateRun(ctx, p)
+	if err != nil {
+		t.Fatalf("create run %+v: %v", p, err)
+	}
+	if prURL != "" {
+		if _, err := f.runRepo.SetRunPullRequestURL(ctx, r.ID, prURL); err != nil {
+			t.Fatalf("set pr url: %v", err)
+		}
+	}
+	return r.ID
+}
+
+// observationRowsFor is observationRows for a run other than the fixture's own.
+func (f *observationFixture) observationRowsFor(t *testing.T, runID uuid.UUID) []*audit.Entry {
+	t.Helper()
+	entries, err := f.audit.ListForRunByCategory(context.Background(), runID, CategoryMergeObservationRecorded)
+	if err != nil {
+		t.Fatalf("list merge_observation_recorded rows: %v", err)
+	}
+	return entries
 }
 
 // observationRows reads the run's merge_observation_recorded entries back
@@ -208,6 +265,120 @@ func TestRecordMergeObservationMalformedPRURL(t *testing.T) {
 	}
 	if f.reader.calls != 0 {
 		t.Errorf("forge calls = %d, want 0", f.reader.calls)
+	}
+}
+
+// Rung 5, OTHER trigger condition. The rung guards TWO independent failures —
+// an unparseable runRow.Repo and an unresolvable PR number — and the test above
+// drives only the second. Here the URL is perfectly well formed and it is the
+// RUN's repo field that is not owner/name, so the RED lands on the repo half
+// specifically. Without both halves driven, the rung's counterfactual only ever
+// proved one of its two conditions.
+func TestRecordMergeObservationUnparseableRepoField(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+	id := f.seedObservationRun(t, run.CreateRunParams{Repo: "not-owner-slash-name"},
+		"https://github.com/x/y/pull/3064")
+
+	w := f.postObserveID(t, id.String())
+	assertObserveRefusal(t, w, http.StatusBadRequest, "record_merge_observation_malformed_pr_url")
+	if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0 on a refusal", len(rows))
+	}
+	if f.reader.calls != 0 {
+		t.Errorf("forge calls = %d, want 0: an unresolvable repository must not reach the forge", f.reader.calls)
+	}
+}
+
+// Rung 5b — THE routed security guard. The forge read is scoped by
+// runRow.Repo while the PR number comes from runRow.PullRequestURL, and the
+// appended row records that URL as the pull request observed merged. Without
+// this rung the handler confirms a DIFFERENT repository's pull request and then
+// writes trusted evidence naming this run's URL, which reconcile-merge reads to
+// settle the run.
+//
+// Each case pairs a mismatching URL with a run whose repo field is otherwise
+// fine, so the refusal can only come from the comparison — never from rung 5
+// catching a malformed value first. Every case asserts the zero-row chain AND
+// that the forge was never called: refusing BEFORE the read is half the point.
+func TestRecordMergeObservationPRURLRepoMismatch(t *testing.T) {
+	cases := []struct {
+		name  string
+		repo  string
+		prURL string
+	}{
+		{"different owner", "x/y", "https://github.com/attacker/y/pull/3064"},
+		{"different repository", "x/y", "https://github.com/x/other/pull/3064"},
+		{"both differ", "x/y", "https://github.com/attacker/other/pull/3064"},
+		// A deeper path is not this run's repo either: the two segments ahead
+		// of /pull/ must BE the repo, not merely contain it.
+		{"nested path", "x/y", "https://github.com/org/x/y/pull/3064"},
+		{"no host", "x/y", "/x/y/pull/3064"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+			id := f.seedObservationRun(t, run.CreateRunParams{Repo: tc.repo}, tc.prURL)
+
+			w := f.postObserveID(t, id.String())
+			assertObserveRefusal(t, w, http.StatusConflict, "record_merge_observation_pr_url_repo_mismatch")
+			if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+				t.Errorf("rows = %d, want 0: a URL that is not this run's PR must never gain merge evidence", len(rows))
+			}
+			if f.reader.calls != 0 {
+				t.Errorf("forge calls = %d, want 0: a mismatch must be refused BEFORE the forge read", f.reader.calls)
+			}
+		})
+	}
+}
+
+// Rung 5b, forge half. The run authenticates against a NON-GitHub forge (a
+// "<forge>:<id>" credential ref), so a GitHub-style /pull/ URL cannot be its
+// pull request. The repo field MATCHES the URL here deliberately: this case can
+// only pass because of the forge condition, not the owner/name comparison.
+func TestRecordMergeObservationForgeMismatch(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+	ref := "gitlab:4242"
+	id := f.seedObservationRun(t, run.CreateRunParams{Repo: "x/y", InstallationRef: &ref},
+		"https://github.com/x/y/pull/3064")
+
+	w := f.postObserveID(t, id.String())
+	assertObserveRefusal(t, w, http.StatusConflict, "record_merge_observation_pr_url_repo_mismatch")
+	if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0", len(rows))
+	}
+	if f.reader.calls != 0 {
+		t.Errorf("forge calls = %d, want 0", f.reader.calls)
+	}
+}
+
+// Rung 5b must not refuse a legitimate run. Two shapes that LOOK like
+// mismatches and are not: a case-differing URL spelling (GitHub repo names are
+// case-insensitive, so it is the SAME repository) and an enterprise host (the
+// run row records no host, so the host is not what is being compared).
+func TestRecordMergeObservationAcceptsEquivalentPRURLs(t *testing.T) {
+	cases := []struct {
+		name  string
+		repo  string
+		prURL string
+	}{
+		{"case differs", "x/y", "https://github.com/X/Y/pull/3064"},
+		{"enterprise host", "x/y", "https://github.example.test/x/y/pull/3064"},
+		{"trailing path segment", "x/y", "https://github.com/x/y/pull/3064/files"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+			id := f.seedObservationRun(t, run.CreateRunParams{Repo: tc.repo}, tc.prURL)
+
+			w := f.postObserveID(t, id.String())
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (this URL names the run's own repository):\n%s",
+					w.Code, w.Body.String())
+			}
+			if rows := f.observationRowsFor(t, id); len(rows) != 1 {
+				t.Errorf("rows = %d, want exactly 1", len(rows))
+			}
+		})
 	}
 }
 
@@ -366,8 +537,14 @@ func TestRecordMergeObservationAppendsOneEntry(t *testing.T) {
 	if e.ActorKind == nil || *e.ActorKind != audit.ActorUser {
 		t.Errorf("actor_kind = %v, want user (an operator-invoked observation)", e.ActorKind)
 	}
-	if e.ActorSubject == nil || *e.ActorSubject == "" {
-		t.Errorf("actor_subject = %v, want the authenticated subject", e.ActorSubject)
+	// The EXACT subject the request installed, not merely "non-empty": the
+	// handler substitutes "anonymous" when no identity is present, so a
+	// non-empty assertion passes with identity propagation entirely broken
+	// while guarding an audit-accountability claim.
+	if e.ActorSubject == nil {
+		t.Errorf("actor_subject = nil, want the authenticated %q", observationSubject)
+	} else if *e.ActorSubject != observationSubject {
+		t.Errorf("actor_subject = %q, want the authenticated %q", *e.ActorSubject, observationSubject)
 	}
 	var p struct {
 		RunID                  string `json:"run_id"`
@@ -416,6 +593,79 @@ func TestRecordMergeObservationAppendsOneEntry(t *testing.T) {
 	}
 	if gotObserved.Equal(gotMerged) {
 		t.Error("observed_at equals merged_at; the two timestamps must be recorded independently")
+	}
+}
+
+// The "anonymous" substitution is a real branch and gets its own case, so the
+// attribution test above never has to accommodate it. Posting with NO identity
+// installed must still attribute — to the fallback, explicitly — rather than
+// writing a nil or empty subject.
+func TestRecordMergeObservationAnonymousFallback(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+
+	w := f.postObserveAs(t, f.runID.String(), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rows := f.observationRows(t)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want exactly 1", len(rows))
+	}
+	if rows[0].ActorSubject == nil || *rows[0].ActorSubject != "anonymous" {
+		t.Errorf("actor_subject = %v, want %q", rows[0].ActorSubject, "anonymous")
+	}
+	if rows[0].ActorKind == nil || *rows[0].ActorKind != audit.ActorUser {
+		t.Errorf("actor_kind = %v, want user", rows[0].ActorKind)
+	}
+}
+
+// TestRecordMergeObservationCredentialScope pins the credential-scope ladder
+// the handler resolves for the forge read. The fake reader records lastScope
+// and nothing read it, so a regression in the InstallationRef / legacy
+// InstallationID selection passed the suite while live forge reads used the
+// wrong scope — or none at all.
+func TestRecordMergeObservationCredentialScope(t *testing.T) {
+	legacyID := int64(777)
+	ref := "424242"
+	otherRef := "515151"
+	cases := []struct {
+		name    string
+		params  run.CreateRunParams
+		wantRef string
+	}{
+		// The ADR-057 / ADR-058 forge-neutral ref is authoritative when set.
+		{"installation ref", run.CreateRunParams{Repo: "x/y", InstallationRef: &ref}, "424242"},
+		// Legacy fallback: no ref recorded, so the GitHub installation id is
+		// what the scope must carry.
+		{"legacy installation id", run.CreateRunParams{Repo: "x/y", InstallationID: &legacyID}, "777"},
+		// Both present: the ref WINS. Asserting the fallback alone would pass
+		// with the ladder inverted.
+		{
+			"ref wins over legacy id",
+			run.CreateRunParams{Repo: "x/y", InstallationRef: &otherRef, InstallationID: &legacyID},
+			"515151",
+		},
+		// Neither recorded: the zero scope, which the production reader
+		// rejects — surfacing as the forge-unavailable rung rather than a
+		// silent unauthenticated read.
+		{"neither recorded", run.CreateRunParams{Repo: "x/y"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+			id := f.seedObservationRun(t, tc.params, "https://github.com/x/y/pull/3064")
+
+			w := f.postObserveID(t, id.String())
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if f.reader.calls != 1 {
+				t.Fatalf("forge calls = %d, want 1", f.reader.calls)
+			}
+			if got := f.reader.lastScope.Ref(); got != tc.wantRef {
+				t.Errorf("credential scope ref = %q, want %q", got, tc.wantRef)
+			}
+		})
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -84,6 +86,11 @@ type recordMergeObservationResponse struct {
 //     PullRequestURL, so it never reached a PR and there is nothing to observe;
 //  5. 400 record_merge_observation_malformed_pr_url — the URL does not resolve
 //     to a (repo, number) pair;
+//     Rung 5b, 409 record_merge_observation_pr_url_repo_mismatch: the URL
+//     resolves, but it does not name THIS run's repository on THIS run's
+//     forge. See the rung comment below — without it the verb can confirm a
+//     different pull request and then record a row asserting the run's own URL
+//     was observed merged;
 //  6. IDEMPOTENT 200 with already_recorded:true, appending NOTHING, when the
 //     chain ALREADY carries pr_merged / post_merge_observed /
 //     merge_observation_recorded. A chain-read failure here is a 500 and never a
@@ -168,6 +175,49 @@ func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Req
 				"run_id":           runID.String(),
 				"repo":             runRow.Repo,
 				"pull_request_url": prURL,
+			})
+		return
+	}
+	// Rung 5b. The forge read is scoped by runRow.Repo, but the pull request
+	// NUMBER is scraped from runRow.PullRequestURL — and that URL is what the
+	// appended row records as the pull request observed merged. Nothing so far
+	// has checked that the two agree. If the URL names a DIFFERENT repository
+	// (or a different forge), the handler confirms somebody else's pull request
+	// and then writes a trusted row asserting that THIS url was observed
+	// merged, which reconcile-merge reads to settle the run. That is precisely
+	// the evidence-that-proves-something-else failure this verb exists to
+	// prevent, sitting inside the verb.
+	//
+	// Refuse BEFORE the forge read, so a mismatch also costs no forge request
+	// and — like every other rung — leaves ZERO rows.
+	//
+	// Three trigger conditions, one rung, because they are one defect from the
+	// caller's side (the run's recorded URL is not this run's pull request):
+	//
+	//	a. the URL carries no resolvable {owner}/{name} ahead of its /pull/
+	//	   segment (no host, or the wrong path shape);
+	//	b. that pair does not equal runRow.Repo. Compared case-INSENSITIVELY:
+	//	   GitHub owner/repo names are case-preserving but case-insensitive, so
+	//	   a case-differing spelling is the SAME repository and normalising is
+	//	   the right move rather than loosening the check;
+	//	c. the run's persisted credential ref names a NON-GitHub forge. Getting
+	//	   this far means the URL is a GitHub-style /pull/ URL (rung 5 resolves
+	//	   the number from that segment alone), and a run authenticating against
+	//	   another forge cannot own a pull request there.
+	//
+	// Status is 409 rather than rung 5's 400: rung 5 refuses a MALFORMED value,
+	// while this refuses two well-formed recorded facts that CONFLICT.
+	urlRepo, urlOK := parsePRURLRepo(prURL)
+	if !urlOK || !strings.EqualFold(urlRepo.Owner, repo.Owner) ||
+		!strings.EqualFold(urlRepo.Name, repo.Name) ||
+		refNamesNonGitHubForge(runRow.InstallationRef) {
+		s.writeError(w, r, http.StatusConflict, "record_merge_observation_pr_url_repo_mismatch",
+			"the run's recorded pull request URL does not name this run's repository on this run's forge; refusing to confirm a pull request that is not this run's",
+			map[string]any{
+				"run_id":           runID.String(),
+				"repo":             runRow.Repo,
+				"pull_request_url": prURL,
+				"url_repo":         urlRepo.String(),
 			})
 		return
 	}
@@ -281,6 +331,44 @@ func (s *Server) prStateReader() PullRequestStateReader {
 		return s.cfg.GitHub
 	}
 	return nil
+}
+
+// parsePRURLRepo extracts the {owner}/{name} pair a GitHub-style pull request
+// URL names — the repository the URL CLAIMS, as opposed to runRow.Repo, which
+// is the repository the forge read is actually scoped to. Rung 5b compares the
+// two.
+//
+// It deliberately does NOT reuse parsePRNumberFromURL's substring scan: that
+// one answers "is there a trailing number" and is free to fail open, while this
+// one feeds a refusal and must be strict about SHAPE. So the URL is parsed as a
+// URL (a host is required) and the path ahead of /pull/ must be exactly two
+// non-empty segments. Returns ok=false on anything else; the caller treats that
+// as a mismatch rather than trying to interpret it.
+func parsePRURLRepo(prURL string) (forge.RepoRef, bool) {
+	u, err := url.Parse(prURL)
+	if err != nil || u.Host == "" {
+		return forge.RepoRef{}, false
+	}
+	idx := strings.LastIndex(u.Path, "/pull/")
+	if idx < 0 {
+		return forge.RepoRef{}, false
+	}
+	segs := strings.Split(strings.Trim(u.Path[:idx], "/"), "/")
+	if len(segs) != 2 || segs[0] == "" || segs[1] == "" {
+		return forge.RepoRef{}, false
+	}
+	return forge.RepoRef{Owner: segs[0], Name: segs[1]}, true
+}
+
+// refNamesNonGitHubForge reports whether a run's persisted credential ref names
+// a forge OTHER than GitHub. The canonical GitHub ref is the installation id's
+// bare base-10 decimal (forge.FromGitHubInstallationID); a non-GitHub ref is
+// "<forge>:<id>" (webhook/gitlab.go's "gitlab:<project_id>"). nil and the
+// recorded-as-empty pointer are BOTH "no ref recorded" — the pre-0076 GitHub
+// shape, per Run.InstallationRef's three-state contract — and neither is a
+// non-GitHub forge, so neither refuses here.
+func refNamesNonGitHubForge(ref *string) bool {
+	return ref != nil && strings.Contains(*ref, ":")
 }
 
 // mergeObservationScope resolves the forge credential scope for the run's PR
