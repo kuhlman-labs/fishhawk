@@ -105,9 +105,18 @@ The frontend dev server proxies `/v0` to `:8080`, so `http://localhost:5173` →
 
 ### Mode C — full App with tunneled webhooks
 
-Add a tunnel in front of `:8080`. Two common options:
+GitHub cannot reach *in* to `:8080` to deliver a webhook, so bridge inbound
+reachability. The **primary** path is the orchestrated smee.io relay; the
+hand-run tunnels below are the manual fallbacks.
 
-- **smee.io** (zero install): visit <https://smee.io/new> for a forwarding URL, then run a client that forwards to localhost:
+- **Orchestrated smee.io relay (primary):** set `FISHHAWK_DEV_WEBHOOK_RELAY=1`
+  and `FISHHAWK_DEV_WEBHOOK_CHANNEL=https://smee.io/<token>` in `.env`, then
+  `scripts/dev up` starts and supervises the client for you (teardown on
+  `down`). Set the App's **Webhook URL** to the same smee channel. Full contract,
+  the settled decisions, and the security posture:
+  [`docs/local-webhook-relay.md`](../local-webhook-relay.md).
+
+- **smee.io by hand** (zero install, no orchestration): visit <https://smee.io/new> for a forwarding URL, then run a client that forwards to localhost:
 
   ```sh
   npx smee-client -u https://smee.io/abc123 -t http://localhost:8080/webhooks/github

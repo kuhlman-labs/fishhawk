@@ -627,6 +627,73 @@ Since #2455 `scripts/test verify` runs `scripts/test-dev` in its
 in-loop rather than only when a human remembers to run the harness (it
 is still runnable standalone; skipped in-loop when zsh is absent).
 
+## Opt-in local webhook relay (E64.49 / [#3169](https://github.com/kuhlman-labs/fishhawk/issues/3169))
+
+An **opt-in, default-off** smee.io relay: a smee client that receives
+GitHub App deliveries from a stable per-developer channel and POSTs them
+verbatim to `POST /webhooks/github` on the local `fishhawkd`, so the
+webhook-driven behaviours in `handleWebhook` work locally instead of
+accreting one poller each. Enabled by `FISHHAWK_DEV_WEBHOOK_RELAY=1` +
+`FISHHAWK_DEV_WEBHOOK_CHANNEL=https://smee.io/<token>` in `.env`.
+Operator quickstart, the three settled decisions, and the (accurate)
+replay security posture: `docs/local-webhook-relay.md`.
+
+### Helper inventory
+
+All under `scripts/dev`, pure or single-purpose so `scripts/test-dev`
+drives them with a stub client (no real network, no real smee client):
+
+- `_relay_enabled` — 0 only when `FISHHAWK_DEV_WEBHOOK_RELAY` is exactly
+  `1`.
+- `_relay_channel` — prints `FISHHAWK_DEV_WEBHOOK_CHANNEL` (empty when
+  unset); strictly per-developer, no committed default.
+- `_relay_channel_valid <url>` — a **typo guard** (not a reachability
+  check): 0 only for a plausible `https://smee.io/<token>` URL
+  (non-empty, `https` scheme, non-empty path segment).
+- `_relay_target_url` — `http://127.0.0.1:$(_healthz_port)/webhooks/github`,
+  composing the same port accessor the readiness gate uses so the relay
+  cannot drift from the bound port.
+- `_relay_resolve_bin` — client detection
+  (`FISHHAWK_DEV_SMEE_BIN` > `smee-client` > `smee`); prints nothing and
+  returns non-zero on failure, leaving `_relay_up` to emit the reason.
+- `_relay_up` / `_relay_down` — orchestration and teardown.
+
+### Degrade-not-abort and its divergence from the TLS front end
+
+Unlike the TLS proxy (`docs/local-tls.md`), whose through-the-proxy
+readiness `up` gates its **own** success on, a relay precondition failure
+**never** fails `scripts/dev up`: `cmd_up` runs `_relay_up` under
+`if ! _relay_up; then …` so its non-zero return is NON-fatal under
+`set -e`, and every failure path prints one actionable line and leaves no
+pid file. A missing relay invalidates nothing `up` claims to have
+started. `_relay_up` is **re-entrant** (the pid file, the artifact
+`cmd_down` acts on, is its own guard — the TLS port preflight does not
+transfer because the relay has no listening port): a live pid file makes
+it a no-op, a stale one falls through to a normal spawn. A bounded
+liveness poll catches a client that dies immediately; one that dies later
+presents as a stale pid file plus errors in `logs/webhook-relay.log`
+(troubleshooting in the doc).
+
+### Teardown
+
+`cmd_down` calls `_relay_down` **unconditionally** (guarded on the pid
+file's existence, never on `FISHHAWK_DEV_WEBHOOK_RELAY`), so disabling
+the flag between `up` and `down`/`reload` never orphans the client.
+
+### Testing
+
+`scripts/test-dev` pins the helpers against stubs: the enable predicate
+(only literal `1`), the channel-validity typo guard, the done-means argv
+assertion (exactly `-u <channel> -t <target>`, the short flags), one
+top-level (gating) case per `_relay_up` failure mode (channel-unset,
+channel-malformed, client-absent, spawn-then-die), the re-entrancy guard
+in both directions (live pid → no second spawn + original pid kept; stale
+pid → overwrite), `_relay_down` idempotency + live-kill + stale-pid, and
+the call-site wiring (the `if !` degrade-not-abort wrapper, the
+`_relay_enabled` guard, and `cmd_down`'s unconditional teardown). The
+real client flags are unproven until a live delivery — a stub accepts any
+argv — so flag correctness is a live-validation matter.
+
 ## Docs-site voice gate (E12.1 / [#2261](https://github.com/kuhlman-labs/fishhawk/issues/2261))
 
 `docs/BRAND_FOUNDATIONS.md` §5 ("Things we never say") bans a specific

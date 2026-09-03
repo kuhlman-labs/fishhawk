@@ -3426,6 +3426,380 @@ else
 fi
 rm -rf "$mkt_wd"
 
+# ===========================================================================
+# 18. Opt-in local webhook relay (E64.49 / #3169). Fully hermetic: stub smee
+# clients written to a tempdir, no real smee client, no network, no daemon. The
+# relay is an outbound long-poll client; a "live" client is modelled by a stub
+# that sleeps, a "spawn-then-die" client by one that exits immediately.
+# ===========================================================================
+
+# 18a. _relay_enabled: 0 ONLY when FISHHAWK_DEV_WEBHOOK_RELAY is exactly "1".
+if FISHHAWK_DEV_WEBHOOK_RELAY=1 _relay_enabled; then
+  pass "_relay_enabled returns 0 when FISHHAWK_DEV_WEBHOOK_RELAY=1"
+else
+  fail "_relay_enabled should return 0 when FISHHAWK_DEV_WEBHOOK_RELAY=1"
+fi
+if _relay_enabled; then
+  fail "_relay_enabled should return non-zero when FISHHAWK_DEV_WEBHOOK_RELAY is unset"
+else
+  pass "_relay_enabled returns non-zero when unset (default off)"
+fi
+if FISHHAWK_DEV_WEBHOOK_RELAY=0 _relay_enabled; then
+  fail "_relay_enabled should return non-zero for FISHHAWK_DEV_WEBHOOK_RELAY=0"
+else
+  pass "_relay_enabled returns non-zero for FISHHAWK_DEV_WEBHOOK_RELAY=0"
+fi
+if FISHHAWK_DEV_WEBHOOK_RELAY=true _relay_enabled; then
+  fail "_relay_enabled should treat 'true' as disabled (only literal 1 enables)"
+else
+  pass "_relay_enabled treats FISHHAWK_DEV_WEBHOOK_RELAY=true as disabled"
+fi
+if FISHHAWK_DEV_WEBHOOK_RELAY=yes _relay_enabled; then
+  fail "_relay_enabled should treat 'yes' as disabled (only literal 1 enables)"
+else
+  pass "_relay_enabled treats FISHHAWK_DEV_WEBHOOK_RELAY=yes as disabled"
+fi
+
+# 18b. _relay_channel_valid: typo guard for https://smee.io/<token>.
+if _relay_channel_valid "https://smee.io/abc123"; then
+  pass "_relay_channel_valid accepts a well-formed https://smee.io/<token> URL"
+else
+  fail "_relay_channel_valid should accept https://smee.io/abc123"
+fi
+if _relay_channel_valid ""; then
+  fail "_relay_channel_valid should reject the empty string"
+else
+  pass "_relay_channel_valid rejects the empty string"
+fi
+if _relay_channel_valid "http://smee.io/abc123"; then
+  fail "_relay_channel_valid should reject a http:// (wrong scheme) URL"
+else
+  pass "_relay_channel_valid rejects http:// (wrong scheme)"
+fi
+# Wrong HTTPS host (implement-review high/security): an https URL whose host is
+# NOT exactly smee.io must be rejected — the egress guard, not just a typo guard.
+if _relay_channel_valid "https://evil.example.com/abc123"; then
+  fail "_relay_channel_valid should reject an https URL on a non-smee.io host"
+else
+  pass "_relay_channel_valid rejects an https URL on a non-smee.io host (egress guard)"
+fi
+# The classic host-prefix bypass: smee.io as a LABEL of a longer attacker host.
+if _relay_channel_valid "https://smee.io.evil.com/abc123"; then
+  fail "_relay_channel_valid should reject a host that only PREFIXES smee.io (smee.io.evil.com)"
+else
+  pass "_relay_channel_valid rejects a smee.io-prefixed attacker host (smee.io.evil.com)"
+fi
+if _relay_channel_valid "https://smee.io"; then
+  fail "_relay_channel_valid should reject a bare host with no path segment"
+else
+  pass "_relay_channel_valid rejects a bare host with no path segment"
+fi
+if _relay_channel_valid "https://smee.io/"; then
+  fail "_relay_channel_valid should reject an empty trailing path segment"
+else
+  pass "_relay_channel_valid rejects an empty trailing path segment"
+fi
+if _relay_channel_valid "not-a-url"; then
+  fail "_relay_channel_valid should reject a non-URL string"
+else
+  pass "_relay_channel_valid rejects a non-URL string"
+fi
+
+# 18c. DONE-MEANS argv assertion (a flag string is not compile-enforced, so
+# helper presence proves nothing): with a sleeping stub, _relay_up spawns the
+# resolved binary with EXACTLY '-u <channel> -t <target>' — the SHORT flags
+# docs/github-app/README.md:113 ships — and writes a pid file holding the live
+# pid. The expected target is composed via the real _relay_target_url so the
+# case tracks whatever port the harness env resolves.
+relay_chan="https://smee.io/relaytoken"
+relay_target="$(_relay_target_url)"
+relay_wd="$(mktemp -d -t test-dev-relaydm.XXXXXX)"
+print "#!/bin/sh\nprintf '%s\\\\n' \"\$*\" >> \"$relay_wd/argv\"\nsleep 30\n" > "$relay_wd/smee"; chmod +x "$relay_wd/smee"
+(
+  RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
+  export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
+  export FISHHAWK_DEV_WEBHOOK_CHANNEL="$relay_chan"
+  _relay_up >/dev/null 2>&1
+  [[ -f "$RELAY_PID_FILE" ]] && kill "$(cat "$RELAY_PID_FILE")" 2>/dev/null
+)
+relay_argv="$(cat "$relay_wd/argv" 2>/dev/null)"
+if [[ "$relay_argv" == "-u ${relay_chan} -t ${relay_target}" ]]; then
+  pass "_relay_up spawns the client with EXACTLY '-u <channel> -t <target>' (short flags)"
+else
+  fail "_relay_up should spawn '-u ${relay_chan} -t ${relay_target}' (got: $relay_argv)"
+fi
+rm -rf "$relay_wd"
+
+# 18c-2. pid-file DONE-MEANS: on success the pid file exists and holds a live pid.
+relay_wd="$(mktemp -d -t test-dev-relaypid.XXXXXX)"
+print "#!/bin/sh\nsleep 30\n" > "$relay_wd/smee"; chmod +x "$relay_wd/smee"
+(
+  RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
+  export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
+  export FISHHAWK_DEV_WEBHOOK_CHANNEL="https://smee.io/pidtoken"
+  _relay_up >/dev/null 2>&1
+)
+relay_pid="$(cat "$relay_wd/relay.pid" 2>/dev/null)"
+if [[ -n "$relay_pid" ]] && kill -0 "$relay_pid" 2>/dev/null; then
+  pass "_relay_up writes a pid file holding a live pid on success"
+else
+  fail "_relay_up should write a pid file holding a live pid (got: $relay_pid)"
+fi
+[[ -n "$relay_pid" ]] && kill "$relay_pid" 2>/dev/null
+rm -rf "$relay_wd"
+
+# 18d-18g. Per-failure-mode cases, one per named mode in scripts/dev step 4.
+# rc/out are captured to files in a subshell and asserted at TOP LEVEL so the
+# PASS/FAIL counters reach the final tally (a subshell's counter increments are
+# lost) — this is what makes each failure mode GATING under `scripts/test verify`
+# and lets counterfactual C3 redden the exit code, not just print a FAIL line.
+
+# 18d. Failure mode (a): channel unset → non-zero, reason names the channel var,
+# NO pid file, NO spawn (capture file absent).
+relay_wd="$(mktemp -d -t test-dev-relayfm.XXXXXX)"
+print "#!/bin/sh\nprintf '%s\\\\n' \"\$*\" >> \"$relay_wd/argv\"\nsleep 30\n" > "$relay_wd/smee"; chmod +x "$relay_wd/smee"
+(
+  RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
+  export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
+  unset FISHHAWK_DEV_WEBHOOK_CHANNEL
+  out="$(_relay_up 2>&1)"; rc=$?
+  print -r -- "$rc" > "$relay_wd/rc"; print -r -- "$out" > "$relay_wd/out"
+)
+relay_rc="$(cat "$relay_wd/rc" 2>/dev/null)"; relay_out="$(cat "$relay_wd/out" 2>/dev/null)"
+if [[ -n "$relay_rc" && "$relay_rc" != "0" ]]; then pass "_relay_up fails (non-zero) when the channel is unset"; else fail "_relay_up should fail when the channel is unset (rc=$relay_rc)"; fi
+if [[ "$relay_out" == *"FISHHAWK_DEV_WEBHOOK_CHANNEL"* ]]; then pass "_relay_up names FISHHAWK_DEV_WEBHOOK_CHANNEL when it is unset"; else fail "_relay_up should name FISHHAWK_DEV_WEBHOOK_CHANNEL (got: $relay_out)"; fi
+if [[ ! -f "$relay_wd/relay.pid" ]]; then pass "_relay_up writes NO pid file when the channel is unset"; else fail "_relay_up must not write a pid file on channel-unset"; fi
+if [[ ! -f "$relay_wd/argv" ]]; then pass "_relay_up does NOT spawn the client when the channel is unset"; else fail "_relay_up must not spawn on channel-unset"; fi
+rm -rf "$relay_wd"
+
+# 18e. Failure mode (b): channel malformed → non-zero, reason names the expected
+# shape, NO pid file, NO spawn.
+relay_wd="$(mktemp -d -t test-dev-relayfm.XXXXXX)"
+print "#!/bin/sh\nprintf '%s\\\\n' \"\$*\" >> \"$relay_wd/argv\"\nsleep 30\n" > "$relay_wd/smee"; chmod +x "$relay_wd/smee"
+(
+  RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
+  export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
+  export FISHHAWK_DEV_WEBHOOK_CHANNEL="http://smee.io/wrongscheme"
+  out="$(_relay_up 2>&1)"; rc=$?
+  print -r -- "$rc" > "$relay_wd/rc"; print -r -- "$out" > "$relay_wd/out"
+)
+relay_rc="$(cat "$relay_wd/rc" 2>/dev/null)"; relay_out="$(cat "$relay_wd/out" 2>/dev/null)"
+if [[ -n "$relay_rc" && "$relay_rc" != "0" ]]; then pass "_relay_up fails (non-zero) when the channel is malformed"; else fail "_relay_up should fail when the channel is malformed (rc=$relay_rc)"; fi
+if [[ "$relay_out" == *"https://smee.io/<token>"* ]]; then pass "_relay_up names the expected https://smee.io/<token> shape on a malformed channel"; else fail "_relay_up should name the expected shape (got: $relay_out)"; fi
+if [[ ! -f "$relay_wd/relay.pid" ]]; then pass "_relay_up writes NO pid file when the channel is malformed"; else fail "_relay_up must not write a pid file on channel-malformed"; fi
+if [[ ! -f "$relay_wd/argv" ]]; then pass "_relay_up does NOT spawn the client when the channel is malformed"; else fail "_relay_up must not spawn on channel-malformed"; fi
+rm -rf "$relay_wd"
+
+# 18e-2. Failure mode (b), EGRESS variant (implement-review high/security): a
+# well-FORMED https URL on a NON-smee.io host must be rejected end-to-end through
+# _relay_up — no spawn, no pid file — proving the egress guard is on the spawn
+# path, not just the unit-tested validator.
+relay_wd="$(mktemp -d -t test-dev-relayfm.XXXXXX)"
+print "#!/bin/sh\nprintf '%s\\\\n' \"\$*\" >> \"$relay_wd/argv\"\nsleep 30\n" > "$relay_wd/smee"; chmod +x "$relay_wd/smee"
+(
+  RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
+  export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
+  export FISHHAWK_DEV_WEBHOOK_CHANNEL="https://evil.example.com/abc123"
+  out="$(_relay_up 2>&1)"; rc=$?
+  print -r -- "$rc" > "$relay_wd/rc"; print -r -- "$out" > "$relay_wd/out"
+)
+relay_rc="$(cat "$relay_wd/rc" 2>/dev/null)"; relay_out="$(cat "$relay_wd/out" 2>/dev/null)"
+if [[ -n "$relay_rc" && "$relay_rc" != "0" ]]; then pass "_relay_up rejects a well-formed https channel on a non-smee.io host (egress guard)"; else fail "_relay_up should reject a non-smee.io host (rc=$relay_rc)"; fi
+if [[ ! -f "$relay_wd/relay.pid" ]]; then pass "_relay_up writes NO pid file for a non-smee.io host"; else fail "_relay_up must not write a pid file for a non-smee.io host"; fi
+if [[ ! -f "$relay_wd/argv" ]]; then pass "_relay_up does NOT spawn the client for a non-smee.io host (no egress)"; else fail "_relay_up must not spawn for a non-smee.io host"; fi
+rm -rf "$relay_wd"
+
+# 18f. Failure mode (c): client binary absent. FISHHAWK_DEV_SMEE_BIN UNSET and an
+# emptied PATH (no smee/smee-client) → resolve fails → non-zero, reason CONTAINS
+# 'npm install -g smee-client' (the RESOLVE-STAGE reason, C3's discriminator),
+# NO pid file. _relay_resolve_bin honours FISHHAWK_DEV_SMEE_BIN verbatim, so the
+# override must be UNSET (not a nonexistent path) to reach the resolve failure.
+# This is the counterfactual-C3 vehicle: deleting _relay_resolve_bin's failure
+# return makes _relay_up spawn an empty command and reach the spawn-then-die
+# reason instead, which lacks the substring → the substring assertion goes RED.
+relay_wd="$(mktemp -d -t test-dev-relayfm.XXXXXX)"
+mkdir -p "$relay_wd/empty"
+(
+  RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
+  unset FISHHAWK_DEV_SMEE_BIN
+  export FISHHAWK_DEV_WEBHOOK_CHANNEL="https://smee.io/bintoken"
+  out="$(PATH="$relay_wd/empty" _relay_up 2>&1)"; rc=$?
+  print -r -- "$rc" > "$relay_wd/rc"; print -r -- "$out" > "$relay_wd/out"
+)
+relay_rc="$(cat "$relay_wd/rc" 2>/dev/null)"; relay_out="$(cat "$relay_wd/out" 2>/dev/null)"
+if [[ -n "$relay_rc" && "$relay_rc" != "0" ]]; then pass "_relay_up fails (non-zero) when no smee client resolves"; else fail "_relay_up should fail when no smee client resolves (rc=$relay_rc)"; fi
+if [[ "$relay_out" == *"npm install -g smee-client"* ]]; then pass "_relay_up names 'npm install -g smee-client' when the client is absent (resolve-stage reason)"; else fail "_relay_up should name 'npm install -g smee-client' (got: $relay_out)"; fi
+if [[ ! -f "$relay_wd/relay.pid" ]]; then pass "_relay_up writes NO pid file when the client is absent"; else fail "_relay_up must not write a pid file on client-absent"; fi
+rm -rf "$relay_wd"
+
+# 18g. Failure mode (d): spawn-then-die. A stub that exits immediately → the
+# liveness poll's kill -0 fails → _relay_up returns non-zero, prints a reason
+# DISTINCT from (c) and NOT containing 'npm install -g smee-client', and removes
+# the pid file it wrote.
+relay_wd="$(mktemp -d -t test-dev-relayfm.XXXXXX)"
+print "#!/bin/sh\nprintf '%s\\\\n' \"\$*\" >> \"$relay_wd/argv\"\nexit 0\n" > "$relay_wd/smee"; chmod +x "$relay_wd/smee"
+(
+  RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
+  export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
+  export FISHHAWK_DEV_WEBHOOK_CHANNEL="https://smee.io/dietoken"
+  out="$(_relay_up 2>&1)"; rc=$?
+  print -r -- "$rc" > "$relay_wd/rc"; print -r -- "$out" > "$relay_wd/out"
+)
+relay_rc="$(cat "$relay_wd/rc" 2>/dev/null)"; relay_out="$(cat "$relay_wd/out" 2>/dev/null)"
+if [[ -n "$relay_rc" && "$relay_rc" != "0" ]]; then pass "_relay_up fails (non-zero) on client spawn-then-die"; else fail "_relay_up should fail when the client dies immediately (rc=$relay_rc)"; fi
+if [[ "$relay_out" != *"npm install -g smee-client"* ]]; then pass "_relay_up spawn-then-die reason is DISTINCT from the resolve-stage reason (no 'npm install' substring — C3 invariant)"; else fail "_relay_up spawn-then-die reason must not contain 'npm install -g smee-client' (got: $relay_out)"; fi
+if [[ "$relay_out" == *"died immediately"* ]]; then pass "_relay_up names the immediate death and points at the relay log"; else fail "_relay_up should name the immediate death (got: $relay_out)"; fi
+if [[ ! -f "$relay_wd/relay.pid" ]]; then pass "_relay_up removes the pid file on spawn-then-die"; else fail "_relay_up should remove the pid file on spawn-then-die"; fi
+rm -rf "$relay_wd"
+
+# 18h. RE-ENTRANCY (approval condition 1). A live pid file → zero new spawns (the
+# argv-capture file must NOT appear) and the ORIGINAL pid still in the file.
+relay_wd="$(mktemp -d -t test-dev-relayre.XXXXXX)"
+print "#!/bin/sh\nprintf '%s\\\\n' \"\$*\" >> \"$relay_wd/argv\"\nsleep 30\n" > "$relay_wd/smee"; chmod +x "$relay_wd/smee"
+print "#!/bin/sh\nsleep 30\n" > "$relay_wd/incumbent"; chmod +x "$relay_wd/incumbent"
+"$relay_wd/incumbent" &
+relay_incumbent_pid=$!
+print "$relay_incumbent_pid" > "$relay_wd/relay.pid"
+# rc/out are captured to files in the subshell and asserted at TOP LEVEL, per the
+# 18d convention above — a subshell's PASS/FAIL counter increments are lost, so
+# asserting rc==0 and the 'already running' message inside the ( ) would print a
+# line that cannot move the harness tally or exit code (implement-review
+# test_vacuity). Capturing here makes both re-entrancy claims GATING.
+(
+  RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
+  export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
+  export FISHHAWK_DEV_WEBHOOK_CHANNEL="https://smee.io/retoken"
+  out="$(_relay_up 2>&1)"; rc=$?
+  print -r -- "$rc" > "$relay_wd/rc"; print -r -- "$out" > "$relay_wd/out"
+)
+relay_re_rc="$(cat "$relay_wd/rc" 2>/dev/null)"; relay_re_out="$(cat "$relay_wd/out" 2>/dev/null)"
+if [[ "$relay_re_rc" == "0" ]]; then pass "_relay_up returns 0 when a relay is already running (re-entrant)"; else fail "_relay_up should return 0 when a relay is already running (rc=$relay_re_rc)"; fi
+if [[ "$relay_re_out" == *"already running"* ]]; then pass "_relay_up reports 'already running' with the incumbent pid"; else fail "_relay_up should report 'already running' (got: $relay_re_out)"; fi
+if [[ ! -f "$relay_wd/argv" ]]; then
+  pass "_relay_up spawns NO second client when a relay is already running (capture file did not grow)"
+else
+  fail "_relay_up must not spawn a second client when a relay is running"
+fi
+if [[ "$(cat "$relay_wd/relay.pid" 2>/dev/null)" == "$relay_incumbent_pid" ]]; then
+  pass "_relay_up leaves the ORIGINAL pid in the pid file (no overwrite)"
+else
+  fail "_relay_up should leave the original pid ${relay_incumbent_pid} in the pid file"
+fi
+kill "$relay_incumbent_pid" 2>/dev/null
+wait "$relay_incumbent_pid" 2>/dev/null
+rm -rf "$relay_wd"
+
+# 18h-2. RE-ENTRANCY, stale pid file → a normal spawn that OVERWRITES it (the
+# stale-pid-file must fall through exactly as _relay_down treats it).
+relay_wd="$(mktemp -d -t test-dev-relayre.XXXXXX)"
+print "#!/bin/sh\nprintf '%s\\\\n' \"\$*\" >> \"$relay_wd/argv\"\nsleep 30\n" > "$relay_wd/smee"; chmod +x "$relay_wd/smee"
+# A stale (dead) pid: spawn a trivial process, capture its pid, reap it.
+sh -c 'exit 0' &
+relay_stale_pid=$!
+wait "$relay_stale_pid" 2>/dev/null
+print "$relay_stale_pid" > "$relay_wd/relay.pid"
+(
+  RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
+  export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
+  export FISHHAWK_DEV_WEBHOOK_CHANNEL="https://smee.io/staletoken"
+  _relay_up >/dev/null 2>&1
+)
+relay_new_pid="$(cat "$relay_wd/relay.pid" 2>/dev/null)"
+if [[ -f "$relay_wd/argv" ]]; then
+  pass "_relay_up spawns a normal client through a STALE pid file"
+else
+  fail "_relay_up should spawn through a stale pid file"
+fi
+if [[ -n "$relay_new_pid" && "$relay_new_pid" != "$relay_stale_pid" ]] && kill -0 "$relay_new_pid" 2>/dev/null; then
+  pass "_relay_up OVERWRITES the stale pid file with a new live pid"
+else
+  fail "_relay_up should overwrite the stale pid file (stale=$relay_stale_pid new=$relay_new_pid)"
+fi
+[[ -n "$relay_new_pid" ]] && kill "$relay_new_pid" 2>/dev/null
+rm -rf "$relay_wd"
+
+# 18i. _relay_down behavioral contract (mirrors _tls_down). Absent pid file →
+# silent no-op returning 0.
+relay_dn_wd="$(mktemp -d -t test-dev-relaydn.XXXXXX)"
+if _relay_down "$relay_dn_wd/absent.pid" >/dev/null 2>&1; then
+  pass "_relay_down returns 0 on an absent pid file (idempotent no-op)"
+else
+  fail "_relay_down should return 0 when the pid file is absent"
+fi
+# Live stub pid → process killed AND pid file removed, even with the flag cleared
+# (unconditional-teardown condition 2 — _relay_down never consults the flag).
+print "#!/bin/sh\nsleep 30\n" > "$relay_dn_wd/proc"; chmod +x "$relay_dn_wd/proc"
+"$relay_dn_wd/proc" &
+relay_dn_pid=$!
+print "$relay_dn_pid" > "$relay_dn_wd/live.pid"
+FISHHAWK_DEV_WEBHOOK_RELAY='' _relay_down "$relay_dn_wd/live.pid" >/dev/null 2>&1
+if ! kill -0 "$relay_dn_pid" 2>/dev/null; then
+  pass "_relay_down kills a live client even with FISHHAWK_DEV_WEBHOOK_RELAY cleared (no orphan)"
+else
+  fail "_relay_down should kill the live client pid ${relay_dn_pid}"
+  kill "$relay_dn_pid" 2>/dev/null
+fi
+if [[ ! -f "$relay_dn_wd/live.pid" ]]; then
+  pass "_relay_down removes the pid file after killing the client"
+else
+  fail "_relay_down should remove the pid file after killing the client"
+fi
+wait "$relay_dn_pid" 2>/dev/null
+# Stale pid → pid file removed, returns without error.
+print "999999999" > "$relay_dn_wd/stale.pid"
+if _relay_down "$relay_dn_wd/stale.pid" >/dev/null 2>&1; then
+  pass "_relay_down returns 0 on a stale pid"
+else
+  fail "_relay_down should return 0 on a stale pid"
+fi
+if [[ ! -f "$relay_dn_wd/stale.pid" ]]; then
+  pass "_relay_down removes the pid file on a stale pid"
+else
+  fail "_relay_down should remove the pid file on a stale pid"
+fi
+rm -rf "$relay_dn_wd"
+
+# 18j. Call-site wiring (body-grep, section-13b style). cmd_up runs the relay leg
+# under an _relay_enabled guard AND inside an `if !` tested context (so a failure
+# is NON-fatal under set -e — the degrade-not-abort control). cmd_down calls
+# _relay_down UNCONDITIONALLY (no _relay_enabled guard — condition 2).
+relay_up_body="$(typeset -f cmd_up)"
+relay_down_body="$(typeset -f cmd_down)"
+if print -r -- "$relay_up_body" | grep -q '_relay_up'; then
+  pass "cmd_up invokes _relay_up"
+else
+  fail "cmd_up should invoke _relay_up"
+fi
+if print -r -- "$relay_up_body" | grep -q '_relay_enabled'; then
+  pass "cmd_up guards the relay leg with _relay_enabled (default off)"
+else
+  fail "cmd_up should guard the relay leg with _relay_enabled"
+fi
+# The relay call sits in an `if !` tested context (degrade-not-abort). Grep for
+# the wrapper form 'if ! _relay_up'.
+if print -r -- "$relay_up_body" | grep -Eq 'if[[:space:]]+!\s*_relay_up|if ! _relay_up'; then
+  pass "cmd_up wraps _relay_up in an 'if !' tested context (degrade-not-abort under set -e)"
+else
+  fail "cmd_up should wrap _relay_up in 'if ! _relay_up' (degrade-not-abort)"
+fi
+relay_up_line="$(print -r -- "$relay_up_body" | grep -n '_relay_up' | head -n 1 | cut -d: -f1)"
+relay_mcp_line="$(print -r -- "$relay_up_body" | grep -n '_signal_mcp_activation' | head -n 1 | cut -d: -f1)"
+if [[ -n "$relay_up_line" && -n "$relay_mcp_line" ]] && (( relay_up_line < relay_mcp_line )); then
+  pass "cmd_up runs _relay_up BEFORE _signal_mcp_activation (MCP banner stays last)"
+else
+  fail "cmd_up should order _relay_up before _signal_mcp_activation (relay=$relay_up_line mcp=$relay_mcp_line)"
+fi
+if print -r -- "$relay_down_body" | grep -q '_relay_down'; then
+  pass "cmd_down invokes _relay_down"
+else
+  fail "cmd_down should invoke _relay_down"
+fi
+if print -r -- "$relay_down_body" | grep -q '_relay_enabled'; then
+  fail "cmd_down must NOT guard _relay_down on _relay_enabled (condition 2 — teardown is unconditional)"
+else
+  pass "cmd_down tears down the relay unconditionally (no _relay_enabled guard — condition 2)"
+fi
+
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
   pass "scripts/dev parses clean (zsh -n)"
