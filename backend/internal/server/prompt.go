@@ -3516,7 +3516,10 @@ func (s *Server) resolveFixupPriorDiff(ctx context.Context, runID, stageID uuid.
 // evidence the load-degrade case.
 //
 // The partial case is itself TWO states, kept apart on purpose (#3042 fix-up
-// pass 2) — three verify states in total, not two:
+// pass 2) — three verify states THIS FUNCTION can produce, not two. (A FOURTH
+// RENDER state, the #3132 decomposed-parent per-slice block, is described at the
+// end of this comment; it is never produced here, because a fan-out parent has
+// no stage of its own to resolve.)
 //
 //   - no run AND no summary -> no_verify_runs_in_gate_evidence. There is no
 //     committed-tree verify evidence of any kind, so writeGateEvidence renders
@@ -3531,7 +3534,20 @@ func (s *Server) resolveFixupPriorDiff(ctx context.Context, runID, stageID uuid.
 //     that narrows what is missing without impeaching the summary.
 //
 // Both render blocks in writeGateEvidence are mutually exclusive on
-// VerifySummary's nil-ness, so exactly one of the three states renders.
+// VerifySummary's nil-ness. There is a FOURTH verify state (#3132): a DECOMPOSED
+// PARENT, whose implement stage is a fan-out that spawns no agent and so has no
+// parent-level gate evidence AT ALL by construction. That state renders the
+// per-slice block instead, and BOTH named-absence blocks above additionally
+// require len(SliceVerify) == 0 — their "this is a transport gap / compile-test
+// state is UNVERIFIED" framing is FALSE for a fan-out parent, whose absence is
+// structural and whose per-slice committed-tree evidence exists and renders. So
+// exactly one of the four states renders.
+//
+// This function is ALSO called per CHILD run by childSliceVerifyEvidence
+// (child_verify_evidence.go), which resolves each fan-out slice's own implement
+// stage. It is already run-id and stage-id parameterized, so that is a NEW
+// CALLER, not a behavior change — and each of its named degrade / partial
+// literals is passed through verbatim onto that slice's row.
 func (s *Server) resolveStageGateEvidence(ctx context.Context, runID, stageID uuid.UUID) (*prompt.GateEvidence, string) {
 	if s.cfg.AuditRepo == nil || s.cfg.TraceStore == nil {
 		return nil, "trace_store_not_wired"

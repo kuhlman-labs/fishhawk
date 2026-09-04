@@ -12996,3 +12996,396 @@ func TestImplementReview_StandingRule8_Rendered(t *testing.T) {
 		}
 	}
 }
+
+// --- #3132 decomposed-parent per-slice verify evidence --------------------
+
+// sliceVerifyEvidence builds a GateEvidence carrying the given per-slice records
+// and nothing else, so a render assertion lands on the per-slice block alone.
+func sliceVerifyEvidence(recs ...GateSliceVerify) *GateEvidence {
+	return &GateEvidence{SliceVerify: recs}
+}
+
+func sliceIdx(i int) *int { return &i }
+
+// renderGateEvidence renders the gate-evidence section in isolation.
+func renderGateEvidence(ev *GateEvidence) string {
+	var b strings.Builder
+	writeGateEvidence(&b, ev)
+	return b.String()
+}
+
+// TestWriteGateEvidence_SliceVerifyRendersPerSliceRows is the DONE-MEANS test:
+// the SHIPPED prompt text must carry each slice's index, child run id, verified
+// head, command, outcome and exit code. A comment-only or no-op touch of
+// prompt.go cannot satisfy it.
+func TestWriteGateEvidence_SliceVerifyRendersPerSliceRows(t *testing.T) {
+	got := renderGateEvidence(sliceVerifyEvidence(
+		GateSliceVerify{
+			SliceIndex: sliceIdx(0), ChildRunID: "11111111-1111-1111-1111-111111111111",
+			ChildStageState: "succeeded", VerifiedHeadSHA: "aaaa111",
+			VerifyRuns:    []GateVerifyRun{{Command: "scripts/test verify", ExitCode: 0, Outcome: "passed"}},
+			VerifySummary: &GateVerifySummary{Outcome: "passed", Iterations: 1, MaxIterations: 3},
+		},
+		GateSliceVerify{
+			SliceIndex: sliceIdx(1), ChildRunID: "22222222-2222-2222-2222-222222222222",
+			ChildStageState: "succeeded", VerifiedHeadSHA: "bbbb222",
+			VerifyRuns: []GateVerifyRun{{Command: "go test ./...", ExitCode: 0, Outcome: "passed"}},
+		},
+	))
+	for _, w := range []string{
+		"Per-slice verify (decomposed fan-in — the parent stage ran NO verify gate of its own):",
+		"BY CONSTRUCTION",
+		"- slice 0 (child run 11111111-1111-1111-1111-111111111111, child implement stage: succeeded)",
+		"  verified head: aaaa111",
+		"  command: scripts/test verify",
+		"    outcome: passed (exit code 0)",
+		"  verify summary: outcome=passed (iterations 1/3)",
+		"- slice 1 (child run 22222222-2222-2222-2222-222222222222, child implement stage: succeeded)",
+		"  verified head: bbbb222",
+		"  command: go test ./...",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("per-slice block missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// A slice with no recorded head SHA still names the absence rather than printing
+// a bare row a reviewer would read as "the head is whatever the fan-in is".
+func TestWriteGateEvidence_SliceVerifyMissingHeadSHANamed(t *testing.T) {
+	got := renderGateEvidence(sliceVerifyEvidence(GateSliceVerify{
+		SliceIndex: sliceIdx(0), ChildRunID: "cid", ChildStageState: "succeeded",
+		VerifyRuns: []GateVerifyRun{{Command: "scripts/test verify", Outcome: "passed"}},
+	}))
+	if !strings.Contains(got, "verified head: (not recorded)") {
+		t.Errorf("missing head SHA must render a named absence\n---\n%s", got)
+	}
+}
+
+// A slice with no SliceIndex renders an explicit unknown index rather than a
+// malformed row.
+func TestWriteGateEvidence_SliceVerifyNilIndexRendersUnknown(t *testing.T) {
+	got := renderGateEvidence(sliceVerifyEvidence(GateSliceVerify{
+		ChildRunID: "cid", UnavailableReason: "child_has_no_implement_stage",
+	}))
+	if !strings.Contains(got, "- slice (unknown) (child run cid)") {
+		t.Errorf("nil slice index must render as (unknown)\n---\n%s", got)
+	}
+}
+
+// A FAILED slice renders its output tail AND the high-severity binding bullet;
+// the row is the one a reviewer must name first.
+func TestWriteGateEvidence_FailedSliceRendersTailAndBindingBullet(t *testing.T) {
+	got := renderGateEvidence(sliceVerifyEvidence(GateSliceVerify{
+		SliceIndex: sliceIdx(3), ChildRunID: "failing-child", ChildStageState: "failed",
+		VerifiedHeadSHA: "dead999",
+		VerifyRuns: []GateVerifyRun{{
+			Command: "scripts/test verify", ExitCode: 1, Outcome: "failed",
+			OutputTail: "FAILED_SLICE_TAIL_SENTINEL", TailTruncated: true,
+		}},
+		VerifySummary: &GateVerifySummary{Outcome: "failed", Iterations: 3, MaxIterations: 3, Detail: "budget exhausted"},
+	}))
+	for _, w := range []string{
+		"    outcome: failed (exit code 1)",
+		"    output tail (bounded, pre-redacted, truncated):",
+		"      FAILED_SLICE_TAIL_SENTINEL",
+		"  verify summary: outcome=failed (iterations 3/3) — detail: budget exhausted",
+		"whose verify summary outcome is `failed`",
+		"`high`-severity concern and name it FIRST in `concerns`",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("failed-slice render missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// A PASSED slice renders NO output tail — the resolver blanks it and the
+// renderer must not resurrect one. Bounding, and a green tail carries nothing.
+func TestWriteGateEvidence_PassedSliceRendersNoTail(t *testing.T) {
+	got := renderGateEvidence(sliceVerifyEvidence(GateSliceVerify{
+		SliceIndex: sliceIdx(0), ChildRunID: "cid", ChildStageState: "succeeded",
+		VerifyRuns: []GateVerifyRun{{Command: "scripts/test verify", ExitCode: 0, Outcome: "passed"}},
+	}))
+	if strings.Contains(got, "output tail") {
+		t.Errorf("a passed slice must render no output tail\n---\n%s", got)
+	}
+}
+
+// The honesty claim the whole block turns on: per-slice green certifies each
+// slice's OWN branch, never the consolidated fan-in tree.
+func TestWriteGateEvidence_SliceVerifyStatesConsolidatedTreeNotCertified(t *testing.T) {
+	got := renderGateEvidence(sliceVerifyEvidence(GateSliceVerify{
+		SliceIndex: sliceIdx(0), ChildRunID: "cid",
+		VerifyRuns: []GateVerifyRun{{Command: "scripts/test verify", Outcome: "passed"}},
+	}))
+	for _, w := range []string{
+		"certifies ONLY that the named command exited 0 against THAT SLICE'S OWN BRANCH",
+		"It does NOT certify the consolidated fan-in tree under review here",
+		"no gate in this run ran against the merge result of these slices",
+		"is squarely YOUR job",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("not-certifying-the-consolidated-tree bullet missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// Operator binding condition 2: the block must name the head-SHA residual in the
+// reviewer's own terms, not only in a plan artifact no reviewer reads.
+func TestWriteGateEvidence_SliceVerifyNamesHeadSHAResidual(t *testing.T) {
+	got := renderGateEvidence(sliceVerifyEvidence(GateSliceVerify{
+		SliceIndex: sliceIdx(0), ChildRunID: "cid", VerifiedHeadSHA: "abc123",
+		VerifyRuns: []GateVerifyRun{{Command: "scripts/test verify", Outcome: "passed"}},
+	}))
+	for _, w := range []string{
+		"reflects the CHILD'S PUSHED HEAD at the time that child's gate ran",
+		"normally but not necessarily the exact commit the fan-in integrated",
+		"Nothing here cross-checks the two",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("head-SHA residual sentence missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// An unresolved slice renders as a NAMED-REASON row, never as a dropped slice.
+func TestWriteGateEvidence_SliceVerifyUnresolvedRendersNamedRow(t *testing.T) {
+	got := renderGateEvidence(sliceVerifyEvidence(GateSliceVerify{
+		SliceIndex: sliceIdx(2), ChildRunID: "gone-child",
+		UnavailableReason: "no_redacted_trace_for_stage",
+	}))
+	for _, w := range []string{
+		"- slice 2 (child run gone-child)",
+		"EVIDENCE UNRESOLVED for this slice. Machine reason: `no_redacted_trace_for_stage`.",
+		"is a BACKEND-side named absence",
+		"MUST NOT raise \"the agent attached no evidence\"",
+		"rendered as a row rather than dropped",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("unresolved-slice row missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// The truncation line renders at omitted>0 AND states that what it dropped is
+// all passing (binding condition 1); it is absent at 0.
+func TestWriteGateEvidence_SliceVerifyTruncationLine(t *testing.T) {
+	rec := GateSliceVerify{
+		SliceIndex: sliceIdx(0), ChildRunID: "cid",
+		VerifyRuns: []GateVerifyRun{{Command: "scripts/test verify", Outcome: "passed"}},
+	}
+	ev := sliceVerifyEvidence(rec)
+	ev.SliceVerifyOmitted = 4
+	got := renderGateEvidence(ev)
+	for _, w := range []string{
+		"4 further slice(s) are omitted to bound this prompt.",
+		"The omitted slices are ALL PASSING",
+		"ordered non-passing FIRST and the bound is applied after that ordering",
+		"every slice whose verify FAILED and every slice whose evidence could not be resolved is rendered above",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("truncation line missing %q\n---\n%s", w, got)
+		}
+	}
+	if zero := renderGateEvidence(sliceVerifyEvidence(rec)); strings.Contains(zero, "omitted to bound this prompt") {
+		t.Errorf("truncation line must be absent at omitted=0\n---\n%s", zero)
+	}
+}
+
+// MUTUAL-EXCLUSION PIN. A decomposed parent carries SliceVerify AND a named
+// VerifyEvidenceUnavailableReason AND no parent verify of its own — the exact
+// shape runImplementReviews builds. The per-slice block must render and the
+// #3042 NOT-ATTACHED block must NOT, because its "transport gap /
+// compile-test-state UNVERIFIED" framing is false for a fan-out parent.
+func TestWriteGateEvidence_SliceVerifySuppressesNotAttachedBlock(t *testing.T) {
+	ev := sliceVerifyEvidence(GateSliceVerify{
+		SliceIndex: sliceIdx(0), ChildRunID: "cid", ChildStageState: "succeeded",
+		VerifyRuns: []GateVerifyRun{{Command: "scripts/test verify", Outcome: "passed"}},
+	})
+	ev.VerifyEvidenceUnavailableReason = "decomposed_parent_no_parent_level_verify"
+	got := renderGateEvidence(ev)
+	if !strings.Contains(got, "Per-slice verify (decomposed fan-in") {
+		t.Fatalf("per-slice block must render\n---\n%s", got)
+	}
+	for _, forbidden := range []string{
+		"Verify runs (committed-tree gate): NOT ATTACHED TO THIS ROUND",
+		"Compile/test state is UNVERIFIED for this head",
+		"BACKEND/RUNNER-side transport gap",
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("NOT-ATTACHED block must be suppressed; found %q\n---\n%s", forbidden, got)
+		}
+	}
+	// And the same for the narrower run-tail-absence block, which a summary-
+	// bearing parent would otherwise draw.
+	ev2 := sliceVerifyEvidence(GateSliceVerify{SliceIndex: sliceIdx(0), ChildRunID: "cid"})
+	ev2.VerifyEvidenceUnavailableReason = "no_verify_run_tail_in_gate_evidence"
+	ev2.VerifySummary = &GateVerifySummary{Outcome: "passed", Iterations: 1, MaxIterations: 1}
+	if got2 := renderGateEvidence(ev2); strings.Contains(got2, "Verify run output tail (committed-tree gate): NOT ATTACHED") {
+		t.Errorf("run-tail-absence block must be suppressed by SliceVerify\n---\n%s", got2)
+	}
+}
+
+// nilSliceVerifyGateEvidenceGolden is FROZEN: literal bytes captured from the
+// PRE-#3132 render of the trigger built in
+// TestBuildImplementReview_NilSliceVerifyByteIdentical, from the "### Gate
+// evidence" heading to the end of the prompt — the entire region #3132 touches.
+//
+// It is deliberately NOT regenerated by post-change code (the convention the
+// other *_ByteIdentical tests in this file use, which compares two Build calls).
+// A golden derived from the same run it checks is circular and cannot detect the
+// common-path perturbation this pin exists to catch; a vacuous pin is worse than
+// none because it reads as protection. Operator binding condition 3.
+const nilSliceVerifyGateEvidenceGolden = "### Gate evidence (machine-verified — outranks text-level findings)\n" +
+	"\n" +
+	"The runner's deterministic gates produced the machine-verified results below. They are ground truth about the committed tree's compile/test state and the scope enforcement that shaped the diff — they outrank any text-level reading of the diff. These rules are BINDING:\n" +
+	"\n" +
+	"- A TERMINAL (non-superseded) FAILED verify run (e.g. a tail naming [build failed]), OR a verify_summary outcome of `failed`, means the committed tree does NOT pass the named command. You MUST record it as a `high`-severity concern, name it FIRST in `concerns`, and you MAY shortcut the remaining review lenses — a head that does not build or test green cannot be salvaged by stylistic findings.\n" +
+	"- The verify_summary outcome (and the LAST/terminal verify run) is authoritative for the committed tree. A verify run marked SUPERSEDED is an earlier iteration the verify-fix loop absorbed and re-ran on a newer tree — its failure MUST NOT be treated as a committed-tree blocker. An absorbed-then-passed iteration is NOT a blocker; a terminal failure still is.\n" +
+	"- A divergence between the declared and staged scope (counts below, or drift-excluded paths) likewise outranks stylistic findings — name it before them.\n" +
+	"- A SKIPPED verify run means compile/test state is UNVERIFIED. Do NOT assume the change is CI-green; state the unverified status in a concern or in `free_form`.\n" +
+	"- A PASSED verify run certifies ONLY that the named command exited 0 against the committed tree. It does NOT certify test quality — the test-vacuity and untested-path lenses still apply in full.\n" +
+	"- Escape valve: the evidence above is ground truth ABOUT WHAT THE GATES MEASURED and outranks text-level reading, but it can itself be wrong. When the committed diff under review DIRECTLY and VERIFIABLY contradicts a specific evidence claim above (e.g. the diff plainly contains an edit the evidence reports dropped/undelivered), you MUST report the CONTRADICTION as a `high`-severity concern with category `evidence_conflict` — naming BOTH the evidence claim AND the contradicting observation in the diff — instead of asserting the (wrong) evidence claim as a defect. This fires ONLY on a direct, verifiable contradiction; absent one, the binding rules above stand unchanged.\n" +
+	"\n" +
+	"Verify runs (committed-tree gate):\n" +
+	"\n" +
+	"- command: scripts/test verify\n" +
+	"  outcome: passed (exit code 0)\n" +
+	"  output tail (bounded, pre-redacted):\n" +
+	"    ok\tbackend/internal/prompt\t0.4s\n" +
+	"\n" +
+	"Verify summary: outcome=passed (iterations 1/3)\n" +
+	"\n" +
+	"Scope enforcement:\n" +
+	"\n" +
+	"- declared scope.files: 2\n" +
+	"- files staged into the commit: (not recorded — no git_diff event)\n" +
+	"\n" +
+	"Emit your verdict now. Remember: JSON only, no surrounding prose.\n"
+
+// TestBuildImplementReview_NilSliceVerifyByteIdentical is the prompt-hash
+// replay-stability pin: with SliceVerify nil, the gate-evidence region of an
+// implement-review prompt must be byte-for-byte the pre-#3132 render.
+func TestBuildImplementReview_NilSliceVerifyByteIdentical(t *testing.T) {
+	tr := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		DiffPatch:    "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n@@ -1 +1 @@\n-a\n+b\n",
+		GateEvidence: &GateEvidence{
+			VerifyRuns: []GateVerifyRun{{
+				Command: "scripts/test verify", ExitCode: 0, Outcome: "passed",
+				OutputTail: "ok\tbackend/internal/prompt\t0.4s",
+			}},
+			VerifySummary: &GateVerifySummary{Outcome: "passed", Iterations: 1, MaxIterations: 3},
+			ScopeFacts:    &GateScopeFacts{DeclaredFiles: 2},
+		},
+	}
+	got, err := Build("implement_review", tr)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	i := strings.Index(got, "### Gate evidence")
+	if i < 0 {
+		t.Fatalf("gate-evidence section missing from the implement-review prompt\n---\n%s", got)
+	}
+	if section := got[i:]; section != nilSliceVerifyGateEvidenceGolden {
+		t.Errorf("nil SliceVerify perturbed the pre-#3132 gate-evidence render:\n--- got ---\n%s\n--- want ---\n%s",
+			section, nilSliceVerifyGateEvidenceGolden)
+	}
+	if strings.Contains(got, "Per-slice verify") {
+		t.Errorf("nil SliceVerify must render no per-slice block\n---\n%s", got)
+	}
+}
+
+// TestBuild_ImplementReview_SliceVerifyOnlyKeepsCorrectnessLens is the ADR-059
+// interaction guard #3132 would otherwise break. Before this change a decomposed
+// parent's GateEvidence was NIL, so it took the ADR-059 NO-EVIDENCE branch:
+// correctness lens ENABLED, generic-bug-hunt suppression WITHHELD. Attaching
+// per-slice evidence makes GateEvidence non-nil — and a naive `!= nil` predicate
+// would silently flip that parent onto the with-evidence branch, switching OFF
+// the correctness lens for the exact review whose job the per-slice block
+// declares a cross-slice integration break to be. Per-slice evidence certifies
+// the slice BRANCHES, never the consolidated head under review, so it must not
+// count as head-level evidence.
+func TestBuild_ImplementReview_SliceVerifyOnlyKeepsCorrectnessLens(t *testing.T) {
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		DiffPatch:    "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n@@ -1 +1 @@\n-a\n+b\n",
+	}
+	// The exact shape runImplementReviews builds for a decomposed parent: only
+	// per-slice evidence, no parent-level verify run and no parent summary.
+	sliceOnly := base
+	sliceOnly.GateEvidence = &GateEvidence{
+		VerifyEvidenceUnavailableReason: "decomposed_parent_no_parent_level_verify",
+		SliceVerify: []GateSliceVerify{{
+			SliceIndex: sliceIdx(0), ChildRunID: "cid", ChildStageState: "succeeded",
+			VerifiedHeadSHA: "abc123",
+			VerifyRuns:      []GateVerifyRun{{Command: "scripts/test verify", Outcome: "passed"}},
+		}},
+	}
+	got, err := Build("implement_review", sliceOnly)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// The per-slice block MUST still render — this guard narrows the LENS
+	// branch only, never the evidence section.
+	if !strings.Contains(got, "Per-slice verify (decomposed fan-in") {
+		t.Fatalf("per-slice block must still render\n---\n%s", got)
+	}
+	// The no-evidence branch's two markers: the enabled correctness lens and its
+	// extra reject ground.
+	for _, want := range []string{
+		"or a correctness defect on a code path the change touches",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("per-slice-only evidence must keep the ADR-059 no-evidence branch; missing %q", want)
+		}
+	}
+	// And the with-evidence branch's suppression preamble must be ABSENT.
+	if strings.Contains(got, "Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section below") {
+		t.Errorf("per-slice-only evidence must NOT switch on the with-evidence suppression preamble\n---\n%s", got)
+	}
+
+	// Control: a parent-level verify run alongside the per-slice rows (a parent
+	// fix-up re-review) DOES count as head-level evidence, so that case takes the
+	// with-evidence branch exactly as before #3132.
+	withParent := sliceOnly
+	ev := *sliceOnly.GateEvidence
+	ev.VerifyEvidenceUnavailableReason = ""
+	ev.VerifyRuns = []GateVerifyRun{{Command: "scripts/test verify", ExitCode: 0, Outcome: "passed"}}
+	withParent.GateEvidence = &ev
+	gotParent, err := Build("implement_review", withParent)
+	if err != nil {
+		t.Fatalf("Build with parent verify: %v", err)
+	}
+	if strings.Contains(gotParent, "or a correctness defect on a code path the change touches") {
+		t.Errorf("a parent-level verify run must take the WITH-evidence branch\n---\n%s", gotParent)
+	}
+}
+
+// holdsHeadLevelGateEvidence's table, one row per branch.
+func TestHoldsHeadLevelGateEvidence(t *testing.T) {
+	run := []GateVerifyRun{{Command: "scripts/test verify", Outcome: "passed"}}
+	sv := []GateSliceVerify{{ChildRunID: "cid"}}
+	cases := []struct {
+		name string
+		ev   *GateEvidence
+		want bool
+	}{
+		{"nil", nil, false},
+		{"per-slice only", &GateEvidence{SliceVerify: sv}, false},
+		{"per-slice + parent run", &GateEvidence{SliceVerify: sv, VerifyRuns: run}, true},
+		{"per-slice + parent summary", &GateEvidence{SliceVerify: sv,
+			VerifySummary: &GateVerifySummary{Outcome: "passed"}}, true},
+		{"ordinary evidence, no slices", &GateEvidence{VerifyRuns: run}, true},
+		{"evidence with neither verify nor slices", &GateEvidence{ScopeFacts: &GateScopeFacts{}}, true},
+	}
+	for _, tc := range cases {
+		if got := holdsHeadLevelGateEvidence(tc.ev); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

@@ -3912,6 +3912,35 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// section (buildImplementReview) and the provenance fold (scopeProvenanceForReview,
 	// which receives trig by value below). nil for every non-decomposed run.
 	trig.ChildAmendedScopeFiles = s.childApprovedAmendmentScopePaths(ctx, runID)
+	// Decomposed-parent per-slice verify rollup (#3132), sitting next to its
+	// sibling parent-only resolver above. A fan-out parent's implement stage
+	// spawns no agent and uploads no bundle, so gateEvidence is nil here on the
+	// consolidated review and the reviewer judged the LARGEST diff the loop
+	// produces with the tree's compile/test state unknown. Each CHILD did upload
+	// a trace carrying its own committed-tree gate; this resolves them per slice.
+	//
+	// Placed HERE rather than at the DispatchConsolidatedReview call site so it
+	// covers BOTH parent review paths — the consolidated first review (which
+	// passes nil today) and the parent fix-up re-review dispatched from
+	// maybeBackstopFixupReReview. An empty result changes nothing and leaves
+	// gateEvidence nil, keeping every ordinary run's prompt byte-identical.
+	if sliceVerify, omitted := s.childSliceVerifyEvidence(ctx, runID); len(sliceVerify) > 0 {
+		if gateEvidence == nil {
+			gateEvidence = &prompt.GateEvidence{}
+			trig.GateEvidence = gateEvidence
+		}
+		gateEvidence.SliceVerify = sliceVerify
+		gateEvidence.SliceVerifyOmitted = omitted
+		// Name the STRUCTURAL cause, and only when the parent carries no verify
+		// evidence of its own and nothing already named a reason. Reusing one of
+		// resolveStageGateEvidence's transport-gap literals would assert the
+		// wrong cause: a fan-out parent has no parent-level gate BY
+		// CONSTRUCTION, not because an artifact failed to arrive.
+		if len(gateEvidence.VerifyRuns) == 0 && gateEvidence.VerifySummary == nil &&
+			gateEvidence.VerifyEvidenceUnavailableReason == "" {
+			gateEvidence.VerifyEvidenceUnavailableReason = decomposedParentNoParentLevelVerifyReason
+		}
+	}
 	// Mid-stage amendment rollup (#2874): a path the operator APPROVED via
 	// fishhawk_decide_scope_amendment WHILE THIS STAGE RAN was folded into the
 	// runner's ENFORCED scope, but this review prompt is built from the raw
@@ -6768,8 +6797,13 @@ func gateEvidenceForReview(ev bundle.GateEvidence, folded []string) *prompt.Gate
 	}
 	for _, vr := range ev.VerifyRuns {
 		out.VerifyRuns = append(out.VerifyRuns, prompt.GateVerifyRun{
-			Command:       vr.Command,
-			ExitCode:      vr.ExitCode,
+			Command:  vr.Command,
+			ExitCode: vr.ExitCode,
+			// The commit the gate ran against (#3132). Carrier only — the
+			// ordinary verify-runs block does not render it; it exists so
+			// childSliceVerifyEvidence can name each slice's verified head
+			// without a second bundle fetch.
+			HeadSHA:       vr.HeadSHA,
 			Outcome:       vr.Outcome,
 			OutputTail:    vr.OutputTail,
 			TailTruncated: vr.TailTruncated,
