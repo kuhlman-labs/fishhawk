@@ -1624,12 +1624,17 @@ type GetRunStatusOutput struct {
 	// ImplementReviewMergeHint is a display-only merge-readiness warning (#947
 	// local-loop parity) surfaced while the implement-stage agent review is
 	// 'pending' (dispatched, no terminal verdict). It mirrors the backend's
-	// review-pending presence gate: the required fishhawk_audit_complete check
-	// is held pending on the same condition, so the PR is not safe to merge or
-	// resolve yet — the check flips green automatically once the verdict lands.
+	// review-pending presence gate: the PUBLISHED fishhawk_audit_complete check
+	// is held pending on the same condition, so the review verdict is not in yet
+	// — the check flips green automatically once the verdict lands.
 	// Omitted once the implement review reaches a terminal status. Display-only,
 	// never gates the run (no MCP merge tool; the operator merges on GitHub).
-	ImplementReviewMergeHint string `json:"implement_review_merge_hint,omitempty" jsonschema:"display-only merge-readiness warning while the implement-stage agent review is pending (dispatched but no verdict yet): the PR is NOT safe to merge/resolve because the required fishhawk_audit_complete check is held pending on this review (it flips green automatically once the verdict lands). Omitted once the implement review is terminal. Never gates the run"`
+	//
+	// It does NOT claim the pending check blocks the merge (E64.44 / #3161):
+	// Fishhawk publishes the check, and whether it gates the merge is a property
+	// of the repository's branch protection that fishhawk_doctor's merge_gate
+	// rung reports.
+	ImplementReviewMergeHint string `json:"implement_review_merge_hint,omitempty" jsonschema:"display-only merge-readiness warning while the implement-stage agent review is pending (dispatched but no verdict yet): the PR is NOT safe to merge/resolve because the review verdict is not in and the published fishhawk_audit_complete check is held pending on this review (it flips green automatically once the verdict lands). Whether that pending check gates the merge depends on the repository's branch protection — fishhawk_doctor's merge_gate rung reports it. Omitted once the implement review is terminal. Never gates the run"`
 	// DriveStatus is the drive-mode read view (#1023): drive flag,
 	// the auto_advanced transition list, the distilled next_action,
 	// and the derived awaiting_merge presentation status — so the
@@ -1824,10 +1829,13 @@ omitted when there is nothing to act on or the budget is exhausted.
 
 Also returns implement_review_merge_hint while the implement-stage agent
 review is still pending (dispatched, no verdict yet): a display-only
-warning that the PR is NOT safe to merge/resolve because the required
-fishhawk_audit_complete check is held pending on that review (#947). It
-flips green automatically once the verdict lands; omitted once the
-implement review is terminal. Never gates the run.
+warning that the PR is NOT safe to merge/resolve because the review
+verdict is not in and the published fishhawk_audit_complete check is held
+pending on that review (#947). It flips green automatically once the
+verdict lands; omitted once the implement review is terminal. Never gates
+the run. Whether that pending check gates the merge depends on the
+repository's branch protection — fishhawk_doctor's merge_gate rung
+reports what the forge enforces (E64.44 / #3161).
 
 Also returns drive_status for drive-enabled runs (#1023): auto_advanced
 lists the transitions the backend advanced itself (rule + from/to +

@@ -31,10 +31,15 @@ import (
 )
 
 // AuditCompleteCheckName is the reserved name for the
-// `fishhawk_audit_complete` blocking check (#229). Stage gates
-// declare it like any other check; the backend self-derives its
-// state from artifact + audit-log presence rather than pulling it
-// from the stage_checks table.
+// `fishhawk_audit_complete` check Fishhawk publishes (#229). Stage
+// gates declare it like any other check; the backend self-derives
+// its state from artifact + audit-log presence rather than pulling
+// it from the stage_checks table.
+//
+// It is NOT a "blocking" check by construction (E64.44 / #3161): it
+// blocks a merge only where the repository's branch protection makes
+// it a required status check, which Fishhawk does not configure and
+// did not read until the merge_gate readiness rung landed.
 const AuditCompleteCheckName = "fishhawk_audit_complete"
 
 // approvalRequest mirrors POST /v0/stages/{stage_id}/approvals's
@@ -793,11 +798,13 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 
 	// ADR-017 (#249, #253): the approval handler no longer gates on
 	// stage_check state. Reviewers approve based on plan + diff;
-	// GitHub branch protection blocks the merge until the required
-	// checks (including fishhawk_audit_complete, published as a
-	// Check Run per #231) report green. The live check state is
-	// still rendered on the review page via GET /v0/stages/{id}/
-	// checks — it's informational, not a gate.
+	// GitHub branch protection blocks the merge until the repo's
+	// required checks report green. fishhawk_audit_complete is
+	// PUBLISHED as a Check Run (#231), but whether it is one of
+	// those required checks is the repository's own configuration —
+	// the merge_gate readiness rung reports it (E64.44 / #3161).
+	// The live check state is still rendered on the review page via
+	// GET /v0/stages/{id}/checks — it's informational, not a gate.
 
 	// Gate-action core (E25.6 / ADR-047): the approval Submit + audit +
 	// model-resolution emission + state advance + orchestrator handoff +

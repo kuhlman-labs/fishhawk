@@ -160,19 +160,25 @@ type ReviewActionHint struct {
 // the local loop when the implement-stage agent review has been dispatched but
 // has not yet landed (#947 local-loop parity). It mirrors the backend's
 // review-pending presence gate (auditcomplete rule 6): while the implement
-// ReviewStatus is "pending", the required fishhawk_audit_complete check is held
-// pending on the SAME condition, so the PR is not safe to merge/resolve yet —
+// ReviewStatus is "pending", the PUBLISHED fishhawk_audit_complete check is
+// held pending on the SAME condition, so the review verdict is not in yet —
 // the check flips green automatically once the verdict lands. Returns "" (no
 // hint) for any non-pending status.
 //
+// The hint does NOT claim the pending check blocks the merge (E64.44 / #3161).
+// Fishhawk publishes the check; whether it gates the merge is a property of the
+// repository's branch protection, which fishhawk_doctor's merge_gate rung
+// reports. Asserting otherwise was false on this very repository for the whole
+// dogfood period.
+//
 // Display-only, NEVER gates: there is no MCP merge tool; the operator merges on
-// GitHub where branch protection enforces the held check. The wording is kept
-// consistent with the backend presence gate.
+// GitHub, where a required-and-unbypassable check is what actually enforces the
+// hold. The wording is kept consistent with the backend presence gate.
 func implementReviewMergeHint(implementStatus *ReviewStatus) string {
 	if implementStatus == nil || implementStatus.Status != "pending" {
 		return ""
 	}
-	return "the implement-stage agent review has not landed yet — the PR is NOT safe to merge or resolve. The required fishhawk_audit_complete check is held pending on this review and flips green automatically once the verdict lands. Re-poll fishhawk_get_run_status on the advertised poll_interval_seconds until implement_review_status is terminal."
+	return "the implement-stage agent review has not landed yet — the review verdict is not in, so the PR is NOT safe to merge or resolve. The published fishhawk_audit_complete check is held pending on this review and flips green automatically once the verdict lands; whether that pending check actually blocks the merge depends on this repository's branch protection, which fishhawk_doctor's merge_gate rung reports. Re-poll fishhawk_get_run_status on the advertised poll_interval_seconds until implement_review_status is terminal."
 }
 
 // suggestedActions translates the computed hint into the next_actions

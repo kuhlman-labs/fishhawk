@@ -68,7 +68,9 @@ Compute-on-read per #229's recommendation; cheap on the write path.
 
 `server/checks.go::handleListStageChecks` injects a synthetic row carrying `state` + `missing[]` (+ `resolved[]`, #3092) so the SPA can render "fail because: plan missing, redacted trace missing on stage X" without a secondary call. (Pre-#253 `server/approvals.go::checkBlockingChecks` also special-cased the name to gate the approval API — that gate moved to GitHub branch protection per ADR-017 / #249.)
 
-The publisher (`backend/internal/auditcheckpublisher`) mirrors the state to the PR as a Check Run (#231) so branch protection can enforce it.
+The publisher (`backend/internal/auditcheckpublisher`) mirrors the state to the PR as a Check Run (#231) so branch protection **can** enforce it.
+
+**Publishing is not enforcing (E64.44 / #3161).** Whether that Check Run gates the merge is a property of the repository's branch protection — a required status check on a ruleset or on classic protection — and Fishhawk neither sets it nor, before #3161, read it. On this repository the check was published for the entire dogfood period while nothing required it, and four operator-facing surfaces asserted it was required anyway. `backend/internal/mergegate` now reconciles the published check against the forge's actual protection config and reports `required` / `not_required` / `unknown` (fail-closed: anything the read could not settle is `unknown`, never `not_required`), surfaced as the `merge_gate` rung on `GET /v0/onboarding/readiness` that `fishhawk doctor` and `fishhawk_doctor` render. It is REPORTING only — it does not gate a run, a merge, or a doctor exit code; GitHub remains the merge-time authority. Nothing in this document, or in any operator-facing string, may say the check is required without that read behind it.
 
 ## Republish on drift
 

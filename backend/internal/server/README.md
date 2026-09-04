@@ -2161,14 +2161,42 @@ It covers evidence assembly (`releaseevidence`) → notes render (`releasenotes`
 
 ### First-run readiness introspection (`onboarding.go`, E29.4)
 
-`backend/internal/server/onboarding.go` — `handleGetOnboardingReadiness` serves `GET /v0/onboarding/readiness?repo=owner/name`, aggregating the four server-side-only checks a repo's first run needs, consumed by `fishhawk doctor` (E29.5):
+`backend/internal/server/onboarding.go` — `handleGetOnboardingReadiness` serves `GET /v0/onboarding/readiness?repo=owner/name`, aggregating the five server-side-only checks a repo's first run needs, consumed by `fishhawk doctor` (E29.5):
 
 1. GitHub App installation via `githubclient.GetRepoInstallation`, reusing the run-create `ErrNotInstalled` classification (`runs.go`);
 2. the committed workflow spec's `spec.ParseBytes` + `spec.Validate` state;
 3. per-reviewer availability via the same `ReviewerSet.For(provider, model, reasoningEffort)` probe `unavailableSpecReviewers` performs (`runs.go`), surfacing the adapter's missing-env hint;
-4. caller-token scope adequacy against `requiredRunScopes` (the run-drive subset of `operatorDefaultScopes`, `backend/cmd/fishhawkd/token.go`).
+4. caller-token scope adequacy against `requiredRunScopes` (the run-drive subset of `operatorDefaultScopes`, `backend/cmd/fishhawkd/token.go`);
+5. `merge_gate` — whether the forge actually requires the `fishhawk_audit_complete` check Fishhawk publishes (E64.44 / #3161), below.
 
 Read-only; cascades gracefully (not-installed → spec-unavailable → empty reviewers).
+
+#### Check (5): the `merge_gate` rung (E64.44 / [#3161](https://github.com/kuhlman-labs/fishhawk/issues/3161))
+
+`probeMergeGate` reconciles the check Fishhawk **publishes** against the branch protection the forge **enforces**. Fishhawk posts `fishhawk_audit_complete` on every run's PR; nothing in Fishhawk makes it a required status check, and until #3161 nothing read the forge to find out whether anything else had. On this repository the check was unrequired for the whole dogfood period while four operator-facing surfaces asserted it was required.
+
+Why it matters concretely: `backend/internal/server/merge_run.go` has no server-side implement-review gate — `resolveReviewStageOnMerge` settles the review stage ON the merge — and `backend/internal/auditcomplete` rule 6 is explicitly the pre-merge presence gate whose ONLY enforcement is the published Check Run. With the check unrequired, `fishhawk_merge_run` queues a GitHub auto-merge that fires with the review verdict still pending. That is why an absent requirement is reported as a **warning**, not as information.
+
+**Shape.** The rung resolves the repo's REAL default branch via `mergeGateRepository` (never a hardcoded `main`) and hands it to `mergegate.Reconcile` with `auditcheckpublisher.CheckName`, under a `mergeGateProbeTimeout` (10s) child context. The response carries `status`, `check`, `branch`, `required_contexts`, `sources[]` (each with its `identity`, `bypass_entries` and, for classic protection, `classic` + `enforce_admins`), `bypassable`, `reason` and `remediation`.
+
+**Fail-closed to `unknown`, never to `not_required`.** Every degrade named below resolves to `status: "unknown"` with a `reason` naming it. `not_required` is reachable only from a fully authoritative evaluation in which both protection surfaces answered definitively — the vacuous-green discipline `required_checks_capture.go` documents (#2497 / #2506): a surface that was never read must never be reported as a positive "this repo requires nothing".
+
+| Degrade | `reason` | Test |
+|---|---|---|
+| No GitHub client on this deployment | `github_client_unconfigured` | `TestOnboardingReadiness_MergeGate_NoGitHubClient_Unknown` |
+| The App is not installed on the repo (both protection reads need an installation token) | `app_not_installed` | `TestOnboardingReadiness_MergeGate_AppNotInstalled_Unknown` |
+| The repo's default branch could not be resolved, or resolved empty / nil metadata | `default_branch_unresolved` | `TestOnboardingReadiness_MergeGate_DefaultBranchLookupFails_Unknown`, `_NilRepositoryMetadata_Unknown` |
+| `Reconcile` rejected the call itself (nil api / empty branch / empty check) | `probe_failed` | `TestOnboardingReadiness_MergeGate_ReconcileRejects_Unknown` |
+| The probe exceeded `mergeGateProbeTimeout` | inherited from the reconciler | `TestOnboardingReadiness_MergeGate_ProbeTimeout_Unknown` |
+| Every forge-side degrade (rulesets 404, un-evaluatable `ref_name` token, 403 for a missing `administration: read`, transport error) | `mergegate`'s own reasons | `_RulesetsNotFound_Unknown`, `_UnevaluatableRefName_Unknown`, `_ForbiddenAdministrationRead_Unknown`, `_TransportError_Unknown`; contract in `backend/internal/mergegate/README.md` |
+
+**Bypass posture rides along, per source, as a conjunction.** A required check anyone can bypass is not the gate it looks like, so `sources[]` carries each requiring source's own bypass condition and `bypassable` is the AND over them — one source with no bypass path still enforces the check regardless of what the others allow. A ruleset `bypass_actors` entry is a role, team, app or integration covering an unknown number of people, so it is reported as a count of *entries*, never as a count of actors; classic `enforce_admins: false` is its own named condition ("repository admins are exempt"), never coerced into a count of 1. Full contract: `backend/internal/mergegate/README.md`.
+
+**Residuals, stated:**
+
+- **The read is point-in-time.** A ruleset edited after the probe is not reflected. The rung is REPORTING only — it gates no run, no merge, and no exit code (`warn` does not move `fishhawk doctor`'s exit status; only `fail` does), so an operator who deliberately opts out is informed rather than blocked. GitHub remains the merge-time authority.
+- **`merge_gate` is OPTIONAL on the wire** — deliberately absent from the OpenAPI `required` list, and the CLI emits no rung at all when the key is missing, so a newer client against a pre-#3161 fishhawkd degrades to silence rather than a bogus warning.
+- **Org-level rulesets are only partially covered.** The client lists repo rulesets with `includes_parents=true`, which surfaces inherited org rulesets, but an org ruleset scoped by repository-property conditions is not evaluated by the v0 matcher and lands as non-authoritative → `unknown`.
 
 **Gate ordering is load-bearing: 401 anonymous → 400 malformed repo → `enforceRepoVisibility` (#1512, ADR-057 Amendment A2 / #2071).** It is NOT a write-scope gate — scope adequacy is a reported field — but it IS a repo read-visibility gate **for a non-admin cookie-session caller**: that identity class is the ONLY one that can receive the 403 — the three unfiltered classes below (bearer/MCP tokens, workspace admins INCLUDING admin cookie sessions, no-mirror deployments) keep the exact pre-change surface and never see it. Anonymous is rejected before any filter resolves (an unauthenticated caller must not learn a repo exists); the `repo` query value is validated to a well-formed `owner/name` before the filter is handed it; only then does the visibility gate run, so a denied non-admin cookie session reaches ZERO forge calls, ZERO spec fetches, and receives no `spec.Error` text. The gate reuses `enforceRepoVisibility` rather than hand-rolling a filter, so the endpoint inherits the whole #2071 point-read contract: 403 `repo_forbidden` on a deny of a non-admin cookie session, 503 `service_unavailable` on a mirror-store / provider-resolution / role-resolution fault (the store-fault class is kept DISTINCT from the permission-denied class), and the cross-forge / ambiguous-row / prefixless-subject fail-closed denies.
 

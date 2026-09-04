@@ -894,6 +894,16 @@ func TestNextActions_DriveActionFoldsFirst(t *testing.T) {
 	if strings.Contains(na.Actions[0].Precondition, "every gate resolved and required checks green") {
 		t.Errorf("actions[0].precondition = %q, want it to drop the unconditional all-clear claim (#2487)", na.Actions[0].Precondition)
 	}
+	// E64.44 / #3161: the DRIVE-translated entry carries its OWN precondition
+	// (the drive detail), NOT mergeRunAction's, so it never made the
+	// audit-check claim and needs no correction. It is asserted here only as
+	// a negative: whatever the drive path substitutes must not reintroduce the
+	// over-claim. The positive merge_gate pointer is asserted on the CLASSIFIED
+	// ritual path (TestNextActions_SucceededPROpenUnchangedWhenMergeNotObserved),
+	// which is the one built by mergeRunAction.
+	if strings.Contains(na.Actions[0].Precondition, "required fishhawk_audit_complete") {
+		t.Errorf("actions[0].precondition over-claims the audit check as required (#3161): %q", na.Actions[0].Precondition)
+	}
 	if na.Actions[0].Params["pr_url"] != prURL {
 		t.Errorf("actions[0].params.pr_url = %q, want %q", na.Actions[0].Params["pr_url"], prURL)
 	}
@@ -1355,6 +1365,18 @@ func TestNextActions_SucceededPROpenUnchangedWhenMergeNotObserved(t *testing.T) 
 		if a.Action == "merge_pr" || a.Action == "post_merge" {
 			t.Errorf("retired ritual step %q still surfaced — replaced by fishhawk_merge_run", a.Action)
 		}
+	}
+	// E64.44 / #3161: the merge action's Precondition is the surface an
+	// operator reads immediately before merging, and it asserted the audit
+	// check was REQUIRED with nothing having read the forge. It must now name
+	// the check as PUBLISHED and point at the merge_gate rung that reports
+	// what the repository's branch protection actually enforces.
+	pre := na.Actions[1].Precondition
+	if strings.Contains(pre, "required fishhawk_audit_complete") {
+		t.Errorf("merge precondition over-claims the audit check as required (#3161): %q", pre)
+	}
+	if !strings.Contains(pre, "merge_gate") {
+		t.Errorf("merge precondition must point at the merge_gate rung that reports what the forge enforces (#3161): %q", pre)
 	}
 }
 
