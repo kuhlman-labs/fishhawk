@@ -8,11 +8,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -326,6 +330,258 @@ func TestHostDispatchAnchorAppendFailure_ShipClampsUndecidable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestShipAcceptance_StaleAnchorAfterReopen_ClampsUndecidable is the unit-level
+// table for the E64.54 / #3176 episode-restart staleness guard: when the NEWEST
+// acceptance_dispatched anchor on the chain sits at or below the newest
+// acceptance_reopened marker, it belongs to a PRIOR validation episode (a
+// re-dispatch whose anchor append failed), so the validated head is unresolvable
+// and the recorded verdict is clamped to undecidable — never bound to the
+// pre-fix-up tree. Each leg seeds the plain auditFake `seeded` slice DIRECTLY
+// (the fake stamps APPENDED entries at Sequence 0, so appends cannot express the
+// ordering the guard turns on), then drives the real ship handler and asserts on
+// the PERSISTED acceptance_outcome_recorded payload.
+func TestShipAcceptance_StaleAnchorAfterReopen_ClampsUndecidable(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		// seed writes the per-mode ledger onto the fake.
+		seed        func(au *auditFake, runID, stageID uuid.UUID)
+		injectRead  string // listByCategoryErrCategory injection, "" for none
+		wantVerdict string
+		wantBasis   any
+		wantHeadSHA any
+	}{
+		{
+			// m-stale: newest anchor (@2) predates the newest restart marker (@4) —
+			// the stale-anchor case #3174 left open. Clamped undecidable.
+			name: "m-stale",
+			seed: func(au *auditFake, runID, stageID uuid.UUID) {
+				seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{"head_sha": "prehead"})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 2, map[string]any{"stage_id": stageID.String()})
+				seedHeadEntry(au, runID, nil, "fixup_pushed", 3, map[string]any{"head_sha": "posthead"})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceReopened, 4, map[string]any{"stage_id": stageID.String()})
+			},
+			wantVerdict: acceptanceVerdictUndecidable,
+			wantBasis:   acceptanceUndecidableBasisHeadUnresolved, wantHeadSHA: "",
+		},
+		{
+			// m-fresh: a re-dispatch anchor (@5) ABOVE the restart marker (@4) — a
+			// healthy re-anchored episode. The DISCRIMINATION control: it stops the
+			// stale leg passing vacuously by proving the guard does not clamp a
+			// correctly re-anchored episode. Binds to the post-fix-up head.
+			name: "m-fresh",
+			seed: func(au *auditFake, runID, stageID uuid.UUID) {
+				seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{"head_sha": "prehead"})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 2, map[string]any{"stage_id": stageID.String()})
+				seedHeadEntry(au, runID, nil, "fixup_pushed", 3, map[string]any{"head_sha": "posthead"})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceReopened, 4, map[string]any{"stage_id": stageID.String()})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 5, map[string]any{"stage_id": stageID.String()})
+			},
+			wantVerdict: "passed", wantBasis: nil, wantHeadSHA: "posthead",
+		},
+		{
+			// m-equal: the reopen marker and the newest anchor stamped at the SAME
+			// sequence (@2). The production append path never produces this — a
+			// reopen marker always precedes its re-dispatch on a unique-per-entry
+			// chain — but a store or fake stamping duplicate sequences could, and the
+			// documented "at or below is stale" contract says the equal case is
+			// STALE. It fails CLOSED (undecidable), and is the counterfactual vehicle
+			// for the `restartSeq >= dispatchSeq` comparison: reverting it to `>`
+			// would let this leg proceed on the ambiguous anchor and record `passed`.
+			name: "m-equal",
+			seed: func(au *auditFake, runID, stageID uuid.UUID) {
+				seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{"head_sha": "prehead"})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 2, map[string]any{"stage_id": stageID.String()})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceReopened, 2, map[string]any{"stage_id": stageID.String()})
+			},
+			wantVerdict: acceptanceVerdictUndecidable,
+			wantBasis:   acceptanceUndecidableBasisHeadUnresolved, wantHeadSHA: "",
+		},
+		{
+			// m-none: no acceptance_reopened entry — the legacy / first-episode
+			// shape, byte-identically unaffected. Binds to the PR-open head.
+			name: "m-none",
+			seed: func(au *auditFake, runID, stageID uuid.UUID) {
+				seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{"head_sha": "prehead"})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 2, map[string]any{"stage_id": stageID.String()})
+			},
+			wantVerdict: "passed", wantBasis: nil, wantHeadSHA: "prehead",
+		},
+		{
+			// m-readerr: the stale ledger PLUS an injected read failure on the
+			// acceptance_reopened category. An unreadable restart ledger fails
+			// CLOSED (undecidable), not open — it must never proceed on the newest
+			// anchor as if no restart existed.
+			name: "m-readerr",
+			seed: func(au *auditFake, runID, stageID uuid.UUID) {
+				seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{"head_sha": "prehead"})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 2, map[string]any{"stage_id": stageID.String()})
+				seedHeadEntry(au, runID, nil, "fixup_pushed", 3, map[string]any{"head_sha": "posthead"})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceReopened, 4, map[string]any{"stage_id": stageID.String()})
+			},
+			injectRead:  CategoryAcceptanceReopened,
+			wantVerdict: acceptanceVerdictUndecidable,
+			wantBasis:   acceptanceUndecidableBasisHeadUnresolved, wantHeadSHA: "",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+			tt.seed(au, runID, stageID)
+			if tt.injectRead != "" {
+				au.listByCategoryErrCategory = tt.injectRead
+			}
+
+			priv, _ := sf.issue(t, runID)
+			if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+				t.Fatalf("ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			payload := decodeAcceptanceOutcome(t, au)
+			if got := payload["verdict"]; got != tt.wantVerdict {
+				t.Errorf("verdict = %v, want %v", got, tt.wantVerdict)
+			}
+			if got := payload["undecidable_basis"]; got != tt.wantBasis {
+				t.Errorf("undecidable_basis = %v, want %v", got, tt.wantBasis)
+			}
+			if got := payload["head_sha"]; got != tt.wantHeadSHA {
+				t.Errorf("head_sha = %v, want %v", got, tt.wantHeadSHA)
+			}
+		})
+	}
+}
+
+// TestAcceptanceReopenedWriters_AreExactlyTheKnownSites is the source-level gate
+// that keeps the #3176 staleness guard TOTAL over acceptance episode restarts.
+// The guard resolves the newest acceptance_reopened marker and treats an anchor
+// at or below it as stale; that only works while EVERY re-open path writes such
+// a marker. This assertion reads the package tree (via go/ast, the idiom
+// raw_cause_guard_test.go / surface_sweep_test.go already use) and fails in BOTH
+// directions — a NEW non-test writer of CategoryAcceptanceReopened, or a REMOVED
+// one — so a maintainer adding a third re-open path cannot silently make the
+// guard inert.
+func TestAcceptanceReopenedWriters_AreExactlyTheKnownSites(t *testing.T) {
+	// The two known writers, each with its issue anchor. If you are adding a
+	// re-open path and this test failed, you MUST write an acceptance_reopened
+	// audit entry scoped to the acceptance stage from your new path, or the
+	// #3176 episode-restart staleness guard (acceptanceValidatedHeadSHA) will not
+	// see your episode and a re-dispatch whose anchor append fails will bind the
+	// verdict to the pre-fix-up tree.
+	want := map[string]string{
+		"reopenAcceptanceOnFixupPush": "#1682 fix-up invalidation (acceptance.go)",
+		"writeAcceptanceReopenAudit":  "#1567 operator re-open (retry.go)",
+	}
+
+	got := functionsWritingCategory(t, "CategoryAcceptanceReopened")
+
+	gotSet := map[string]struct{}{}
+	for _, fn := range got {
+		gotSet[fn] = struct{}{}
+	}
+	for fn, anchor := range want {
+		if _, ok := gotSet[fn]; !ok {
+			t.Errorf("expected acceptance_reopened writer %q (%s) is MISSING from the tree. "+
+				"If you removed or renamed a re-open path, update this test's want set — "+
+				"and confirm the remaining re-open paths still write an acceptance_reopened "+
+				"entry scoped to the acceptance stage, or the #3176 staleness guard goes inert.",
+				fn, anchor)
+		}
+	}
+	for _, fn := range got {
+		if _, ok := want[fn]; !ok {
+			t.Errorf("UNEXPECTED acceptance_reopened writer %q found in the tree. "+
+				"A new re-open path must write an acceptance_reopened audit entry SCOPED TO "+
+				"THE ACCEPTANCE STAGE (StageID set) — that is what the #3176 episode-restart "+
+				"staleness guard in acceptanceValidatedHeadSHA keys on; without it a "+
+				"re-dispatch whose anchor append fails will bind the verdict to the pre-fix-up "+
+				"tree. If this writer does that correctly, add it to this test's want set with "+
+				"its issue anchor.", fn)
+		}
+	}
+}
+
+// functionsWritingCategory parses every non-test .go file in the package and
+// returns the names of top-level functions whose body REFERENCES the identifier
+// categoryConst, MINUS an explicit, by-name set of functions that only READ it.
+//
+// Per the #3176 fix-up concern this match is deliberately BROAD: it flags ANY
+// *ast.Ident reference to categoryConst inside a non-test FuncDecl body, not just
+// a composite-literal `Category: categoryConst` key. The earlier composite-only
+// (and later composite-plus-assignment) match was an evadable middle ground — a
+// re-open path that bound the field by ASSIGNMENT (`params.Category = …`), or that
+// handed the constant to a helper as a plain call argument (`appendReopen(id,
+// categoryConst)`), produced no `Category:` KeyValueExpr and stayed invisible
+// while the staleness guard went inert for it. Flagging every reference is the
+// reviewer's first option, chosen over the documentation-only fallback; it closes
+// that residual by construction.
+//
+// EXCLUSIONS. The const DECLARATION is a plain const spec with no enclosing
+// FuncDecl, so it is naturally excluded. The one benign NON-writer reference in
+// this package is latestAcceptanceEpisodeRestartSeq, which passes categoryConst to
+// ListForRunByCategory to READ the reopen markers; it is excluded EXPLICITLY and
+// BY NAME (readerExemptions) rather than by narrowing the match back to a writer
+// shape, so adding an exemption is a recorded, reviewed decision. A NEW benign
+// reader added WITHOUT an exemption entry deliberately trips the gate as an
+// UNEXPECTED writer, forcing a look at every new reference to the constant. (The
+// by-name exemption's own residual: a write ADDED inside an exempted function
+// would be hidden — but that function's job is to read the reopen ledger, and
+// turning it into a writer is exactly the kind of change the exemption comment
+// asks a maintainer to reconsider.)
+//
+// SCAN SCOPE — package dir, BY DESIGN, not an accident of implementation:
+// CategoryAcceptanceReopened is UNEXPORTED and package-scoped, so any writer of it
+// MUST live in this package. A tree-wide scan over backend/ (as the #3176
+// verification grep used) would reach no additional writer and would parse
+// unrelated packages; the package-dir scan is both sufficient and minimal.
+func functionsWritingCategory(t *testing.T, categoryConst string) []string {
+	t.Helper()
+	// Functions that only READ categoryConst (pass it to a query), excluded BY
+	// NAME. Adding an entry here is a recorded decision — see the doc comment.
+	readerExemptions := map[string]struct{}{
+		"latestAcceptanceEpisodeRestartSeq": {},
+	}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	var out []string
+	seen := map[string]struct{}{}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, perr := parser.ParseFile(fset, name, nil, 0)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", name, perr)
+		}
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			if _, exempt := readerExemptions[fn.Name.Name]; exempt {
+				continue
+			}
+			references := false
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if id, ok := n.(*ast.Ident); ok && id.Name == categoryConst {
+					references = true
+					return false
+				}
+				return true
+			})
+			if references {
+				if _, dup := seen[fn.Name.Name]; !dup {
+					seen[fn.Name.Name] = struct{}{}
+					out = append(out, fn.Name.Name)
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // seedIntegrationCommit seeds one integration_commit_recorded entry — the

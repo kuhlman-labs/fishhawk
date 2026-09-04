@@ -1547,7 +1547,7 @@ The report arm (`reportMatrixProposals`) emits an `act:"report"` `run_auto_drive
 - **`409 dispatch_not_admissible`** on a `running`/terminal/`awaiting_*` gate state (and on a CAS-loss whose winner moved the stage to any such state) — a live or settled stage can never be re-marked as a fresh spawn.
 - **Auth** mirrors the reap-failure endpoint: an authenticated identity carrying `write:runs` (anonymous → 401; a token without the scope → 403), with the auth ladder running BEFORE the nil-`RunRepo` guard (the #1915 revive convention) so config state never leaks pre-auth. A `(run_id, stage_id)` handle mismatch is `404 stage_not_found`.
 - The prompt-fetch liveness flip (`prompt.go::markStageRunningOnPromptFetch`) defensively walks a still-parked `awaiting_host_dispatch → dispatched → running` on the authenticated prompt fetch, so a version-skewed spawn whose marker call was skipped/lost still converges.
-- **Acceptance spawn anchor (E64.53 / #3174):** on the `transitioned:true` arm ONLY, and only for an `acceptance`-typed stage, the handler appends an `acceptance_dispatched` audit entry (`emitHostDispatchAcceptanceAnchor`) INSIDE the held admission lock. This is the LOCAL anchor `acceptanceValidatedHeadSHA` binds the verdict to; `orchestrator.Advance` no longer emits one for a parked local stage. Best-effort — nil-`AuditRepo` skips with a WARN and an append failure WARNs without unwinding the CAS or the 200. See the acceptance section for the full provenance contract and its two anchorless residuals.
+- **Acceptance spawn anchor (E64.53 / #3174):** on the `transitioned:true` arm ONLY, and only for an `acceptance`-typed stage, the handler appends an `acceptance_dispatched` audit entry (`emitHostDispatchAcceptanceAnchor`) INSIDE the held admission lock. This is the LOCAL anchor `acceptanceValidatedHeadSHA` binds the verdict to; `orchestrator.Advance` no longer emits one for a parked local stage. Best-effort — nil-`AuditRepo` skips with a WARN and an append failure WARNs without unwinding the CAS or the 200. A RE-dispatch whose append fails leaves the prior episode's stale anchor on the chain, but that is caught at RESOLUTION time by the #3176 episode-restart staleness guard (see the acceptance section) rather than at the marker. See the acceptance section for the full provenance contract and its residuals.
 - **Admission fence (#1936):** when an `Orchestrator` is wired, the handler acquires the SAME per-stage `orchestrator.LockStageAdmission` mutex the acceptance-admission short-circuit walk holds, across its stage-load → eligibility → CAS, so a marker call landing mid-walk cannot observe the walk-intermediate `dispatched` and return `{transitioned:false}` while the walk settles the stage — it serializes behind the walk and then 409s on the settled stage. With no orchestrator wired no lock is taken (behavior unchanged). See the admission section above for the full fence contract.
 
 ### Startup orphaned-review reconcile (`review_reconcile.go`, #1781)
@@ -3236,10 +3236,49 @@ that fix and must NOT be loosened: it is what excludes a post-dispatch head from
 a verdict the stage never validated. Two anchorless residuals fall through to the
 clamp below — a local ship that never went through the marker, and a
 FIRST-dispatch anchor-append failure at the marker
-(`TestHostDispatchAnchorAppendFailure_ShipClampsUndecidable`). A RE-dispatch
-anchor-append failure instead leaves the STALE anchor in place, so #3174's
-wrong-head symptom recurs for that episode rather than clamping; it is
-WARN-logged at the marker and is NOT covered by that test.
+(`TestHostDispatchAnchorAppendFailure_ShipClampsUndecidable`).
+
+**Episode-restart staleness guard (E64.54 / #3176).** A RE-dispatch whose anchor
+append fails is NOT an anchorless residual — the PREVIOUS episode's anchor is
+still on the chain, so `acceptanceValidatedHeadSHA` would resolve it and bind the
+verdict to the PRE-fix-up tree, a confident wrong answer where every sibling path
+is fail-closed (#3174's residual). `acceptanceValidatedHeadSHA` closes it at
+RESOLUTION time: it resolves the newest `acceptance_reopened` marker for the stage
+(`latestAcceptanceEpisodeRestartSeq`) and treats an anchor at or below it as
+STALE — a prior episode's anchor — returning `("", false)` exactly like an absent
+anchor, which the clamp below records as `undecidable`/`head_unresolved`. Two
+design constraints, both load-bearing and non-obvious:
+
+- **No new audit write on the failing path.** Option 1 (invalidate the stale
+  anchor at the marker) was rejected because the invalidation would itself be a
+  DB write on the exact path where DB writes are failing — inert in the fault it
+  exists to handle. The guard adds only reads.
+- **A pure within-chain SEQUENCE comparison, never a timestamp.** A
+  DB-stamped-vs-Go-side comparison here would be the #3048 cross-clock trap, and
+  its near-tie direction would clamp EVERY acceptance verdict to undecidable,
+  since the anchor is appended microseconds after the transition. Both compared
+  values are `Sequence` on the SAME monotone append chain.
+
+The guard is TOTAL over episode restarts ONLY while every re-open path writes an
+`acceptance_reopened` entry scoped to the acceptance stage. There are exactly two
+such non-test writers — `reopenAcceptanceOnFixupPush` (the #1682 fix-up
+invalidation) and `writeAcceptanceReopenAudit` in `retry.go` (the #1567 operator
+re-open) — and `TestAcceptanceReopenedWriters_AreExactlyTheKnownSites` is the
+source-level AST gate that FAILS IN BOTH DIRECTIONS (a new writer or a removed
+one) so a third re-open path cannot silently make the guard inert. An unreadable
+restart ledger fails CLOSED (undecidable), never open. Pinned by
+`TestShipAcceptance_StaleAnchorAfterReopen_ClampsUndecidable` (the m-stale /
+m-fresh / m-none / m-readerr table) and end to end by
+`TestAcceptanceSeam_LocalRedispatchAnchorAppendFailure_ClampsUndecidable`.
+
+Remaining residual, strictly NARROWER than #3174's (which needed only the second
+failure): if the SAME DB fault fails BOTH the `acceptance_reopened` append at the
+re-open AND the `acceptance_dispatched` append at the re-dispatch, no restart
+marker exists and the stale anchor still answers. It cannot be closed by any
+write-based approach — a write is precisely what is failing. Likewise, an episode
+restart that writes NO `acceptance_reopened` entry at all (a hypothetical future
+third re-open path) is outside the guard's reach; the source-level gate above is
+what keeps that hypothetical from landing unnoticed.
 
 **The unbound-head clamp.** Resolution can still legitimately answer `""` — a
 bare operator ship with no `acceptance_dispatched` anchor, an unreadable ledger,

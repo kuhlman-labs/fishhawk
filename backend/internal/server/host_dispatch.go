@@ -351,11 +351,16 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 // Best-effort, mirroring the orchestrator's posture: a nil AuditRepo skips with
 // a WARN, and a failed append is logged at WARN and NEVER unwinds the CAS or
 // changes the 200 response — the stage is genuinely dispatched, and refusing
-// here would wedge it. The residual is disclosed rather than silently fixed: a
-// FIRST dispatch whose append fails leaves the stage anchorless, so the #3091
-// head_unresolved clamp records `undecidable` (fail-closed); a RE-dispatch whose
-// append fails leaves the STALE anchor in place, so the #3174 symptom recurs for
-// that episode.
+// here would wedge it. A FIRST dispatch whose append fails leaves the stage
+// anchorless, so the #3091 head_unresolved clamp records `undecidable`
+// (fail-closed). A RE-dispatch whose append fails leaves the PREVIOUS episode's
+// anchor on the chain, but that stale anchor is NO LONGER trusted: the resolver's
+// episode-restart staleness guard (acceptanceValidatedHeadSHA, E64.54 / #3176)
+// treats an anchor at or below the newest acceptance_reopened marker as
+// unresolvable and clamps to undecidable. The remaining residual, narrower than
+// #3174's, is an episode whose acceptance_reopened append ALSO failed (no restart
+// marker on the chain) — unclosable by any write-based fix, since a write is what
+// is failing.
 func (s *Server) emitHostDispatchAcceptanceAnchor(ctx context.Context, runID uuid.UUID, stage *run.Stage) {
 	if s.cfg.AuditRepo == nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
