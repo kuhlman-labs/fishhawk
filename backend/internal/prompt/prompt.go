@@ -1053,6 +1053,34 @@ type GateEvidence struct {
 	// it. The literals are correspondingly distinct
 	// (no_verify_runs_in_gate_evidence vs no_verify_run_tail_in_gate_evidence).
 	VerifyEvidenceUnavailableReason string
+	// SliceVerify carries a DECOMPOSED PARENT's per-slice committed-tree verify
+	// evidence (#3132), one record per fan-out child. A decomposed parent's
+	// implement stage is a fan-out that spawns no agent and uploads no trace
+	// bundle, so it has NO gate evidence of its own by construction and its
+	// consolidated implement review previously arrived with the tree's
+	// compile/test state entirely unknown. The per-slice verify DID run — on each
+	// child's own branch — and this field propagates it.
+	//
+	// Like OperatorScopeUndelivered, FixupReportingObligations and
+	// ScopeProvenance it is BACKEND-DERIVED at implement-review dispatch time
+	// (server.childSliceVerifyEvidence), NOT bundle-carried, so a nil/empty
+	// slice keeps every existing prompt byte-identical (prompt-hash replay
+	// stability) — an ordinary non-decomposed run resolves nothing.
+	//
+	// writeGateEvidence renders it as the "Per-slice verify (decomposed fan-in)"
+	// block, which is MUTUALLY EXCLUSIVE with the #3042 NOT-ATTACHED block: that
+	// block frames the absence as a transport gap and asserts compile/test state
+	// is UNVERIFIED, both FALSE for a fan-out parent whose absence is structural
+	// and for which per-slice evidence exists.
+	SliceVerify []GateSliceVerify
+	// SliceVerifyOmitted is how many PASSING slices the MaxSliceVerifyEntries cap
+	// dropped from SliceVerify. The resolver spends the cap on PASSING rows ONLY
+	// and retains every non-passing slice (a failed terminal verify, a `failed`
+	// summary, or an UnavailableReason) however many there are, so the cap can
+	// only ever drop passing rows — the block states exactly that, so an omission
+	// reads as safe rather than as an unexplained gap. Zero (the byte-identical
+	// default) omits the line.
+	SliceVerifyOmitted int
 	// ScopeProvenance decomposes the declared scope.files count into its
 	// provenance (#1914) so the implement reviewer can machine-classify a
 	// declared-vs-staged COUNT divergence as NON-drift when it is fully
@@ -1281,8 +1309,17 @@ type GateScopeExemption struct {
 // and a bounded, pre-redacted tail of its output (the skip reason on
 // the skipped paths).
 type GateVerifyRun struct {
-	Command    string
-	ExitCode   int
+	Command  string
+	ExitCode int
+	// HeadSHA is the commit the gate ran against, as recorded on the runner's
+	// verify_run event (#3132). Carrier only on the ORDINARY verify-runs block,
+	// which does not render it — the surrounding prompt already establishes
+	// which head is under review. It exists so childSliceVerifyEvidence can
+	// resolve a slice's GateSliceVerify.VerifiedHeadSHA out of the same seam
+	// without a second bundle fetch (from the non-superseded runs only, so the row
+	// names the head its own outcome is about). Empty on every path that did not
+	// record one.
+	HeadSHA    string
 	Outcome    string
 	OutputTail string
 	// TailTruncated marks a tail the runner cut to its line/byte bounds.
@@ -1294,6 +1331,71 @@ type GateVerifyRun struct {
 	// verify_summary outcome of `failed` is. The last/terminal run is never
 	// marked.
 	Superseded bool
+}
+
+// MaxSliceVerifyEntries and MaxSliceVerifyRunsPerSlice bound what a decomposed
+// parent's per-slice verify block can add to an already-large consolidated
+// review prompt (#3132): a wide fan-out could otherwise push N slices x ~4KB of
+// verify tail into it. They are exported because the BACKEND resolver
+// (server.childSliceVerifyEvidence) applies them — the renderer prints whatever
+// it is handed — and the render-side doc below is written against them.
+//
+// The entry cap bounds the PASSING slices ONLY: every non-passing slice (a failed
+// terminal verify, a `failed` summary, or an unresolved row) is retained however
+// many there are, so a failed slice at index 21 is never the row the bound
+// silently eats — it is the one row whose absence endangers a merge, and the
+// block asserts in as many words that every such row is present. A fan-out with
+// more non-passing slices than the cap therefore renders more than
+// MaxSliceVerifyEntries rows, which is the deliberate trade: the cap exists for a
+// wide GREEN fan-out, and yielding it beats a prompt that lies.
+const (
+	MaxSliceVerifyEntries      = 20
+	MaxSliceVerifyRunsPerSlice = 6
+)
+
+// GateSliceVerify is one fan-out CHILD slice's committed-tree verify evidence,
+// rolled up onto the decomposed PARENT's implement review (#3132).
+//
+// Every field is resolved from the CHILD run: its own gate ran on its OWN
+// branch, never on the consolidated fan-in tree. UnavailableReason is a
+// BACKEND-side machine literal (never agent text) naming why a slice's evidence
+// could not be resolved — an unresolvable slice emits a NAMED-REASON row rather
+// than being dropped, because a dropped slice reads as "this slice does not
+// exist", which is the silent-absence class this change exists to close.
+type GateSliceVerify struct {
+	// SliceIndex is the child's 0-based slice index; nil when the child carries
+	// none (rendered as an unknown index rather than omitted).
+	SliceIndex *int
+	// ChildRunID is the child run's uuid, so a reviewer can go read the slice.
+	ChildRunID string
+	// ChildStageState is the child implement stage's state at resolve time.
+	ChildStageState string
+	// VerifiedHeadSHA is the commit this slice's AUTHORITATIVE gate ran against, as
+	// recorded on the child's verify_run event: the resolver reads the LAST
+	// (terminal-most) non-empty head_sha among the NON-SUPERSEDED runs — the same
+	// runs whose outcomes this row renders — so a terminal PASSED outcome can never
+	// be labelled with a superseded failing iteration's older commit. It is
+	// rendered per row so the block names WHICH commit each outcome refers to, and
+	// is EMPTY (rendered "(not recorded)") when the authoritative runs recorded no
+	// head_sha rather than borrowing a superseded run's. RESIDUAL, stated in the
+	// block itself: this is the child's PUSHED head at the time its gate ran,
+	// which is normally but not necessarily the commit the fan-in integrated —
+	// nothing here cross-checks the two against the integration_commit_recorded
+	// ledger. Empty when the child's evidence recorded no head_sha.
+	VerifiedHeadSHA string
+	// VerifyRuns are the slice's non-superseded verify runs, capped at
+	// MaxSliceVerifyRunsPerSlice, with the OutputTail blanked on any run whose
+	// outcome is `passed` (a green command's tail carries nothing a reviewer
+	// needs). writeSliceVerify suppresses a `passed` tail INDEPENDENTLY, so the
+	// bound does not depend on the caller having blanked it.
+	VerifyRuns []GateVerifyRun
+	// VerifySummary is the slice's once-per-stage verify summary, when it has one.
+	VerifySummary *GateVerifySummary
+	// UnavailableReason names why this slice's evidence could not be resolved —
+	// e.g. child_has_no_implement_stage, child_stage_list_failed, or any of
+	// resolveStageGateEvidence's own load-degrade / partial literals. Empty on a
+	// fully resolved slice.
+	UnavailableReason string
 }
 
 // GateVerifySummary is the stage's once-per-stage verify summary:
@@ -4657,7 +4759,7 @@ func buildImplementReview(t Trigger) string {
 	// upstream gate checked correctness, so a correctness lens is ENABLED and
 	// the bug-hunt suppression is withheld.
 	b.WriteString("### Review criteria\n\n")
-	if t.GateEvidence != nil {
+	if holdsHeadLevelGateEvidence(t.GateEvidence) {
 		// Deferral variant (#963): when gate evidence is present, the
 		// non-goals preamble must NOT assert that mechanical correctness
 		// "is already gated" — that unconditional claim is what licensed
@@ -4764,7 +4866,7 @@ func buildImplementReview(t Trigger) string {
 		"sensitive surface) and any concerns are cosmetic.\n")
 	b.WriteString("- `approve_with_concerns`: diff is acceptable but has non-blocking gaps (including any scope drift); " +
 		"record each gap as a concern with appropriate severity.\n")
-	if t.GateEvidence == nil {
+	if !holdsHeadLevelGateEvidence(t.GateEvidence) {
 		// No-evidence branch (ADR-059 / #1883): the enabled correctness lens
 		// gives a correctness defect on a touched path as an additional reject
 		// ground. The pinned substring "a security / authz regression, a
@@ -5202,6 +5304,135 @@ func writeSecurityFindings(b *strings.Builder, t Trigger) {
 // (output tails, details) is pre-redacted by the runner; tails render
 // indented rather than fenced so they cannot collide with the diff
 // section's code fences.
+// holdsHeadLevelGateEvidence reports whether the trigger holds gate evidence
+// that speaks to THE HEAD UNDER REVIEW, which is the question ADR-059 / #1883
+// actually branches on: with such evidence the correctness lens is deferred to
+// it and the generic-bug-hunt suppression stands; without it the product has no
+// proof any upstream gate checked correctness, so the correctness lens is
+// ENABLED and the suppression withheld.
+//
+// PER-SLICE-ONLY evidence does NOT count (#3132). A decomposed parent whose only
+// verify evidence is its children's per-slice gates holds nothing that ran
+// against the CONSOLIDATED tree under review — those gates ran on the slice
+// branches, and the block says so in as many words. Counting it would silently
+// flip a decomposed parent from the no-evidence branch (which is what it took
+// before #3132, when its GateEvidence was nil) onto the with-evidence branch,
+// switching OFF the correctness lens and switching ON the bug-hunt suppression
+// for the exact review whose job the block declares a cross-slice integration
+// break to be. That would be a regression dressed as an improvement: more
+// evidence in the prompt, a weaker lens over it.
+//
+// Every other shape is unchanged, so an ordinary run's prompt stays
+// byte-identical: a nil GateEvidence is false as before, and any evidence
+// carrying a parent-level verify run or summary — or carrying no SliceVerify at
+// all — is true as before.
+func holdsHeadLevelGateEvidence(ev *GateEvidence) bool {
+	if ev == nil {
+		return false
+	}
+	if len(ev.SliceVerify) > 0 && len(ev.VerifyRuns) == 0 && ev.VerifySummary == nil {
+		return false
+	}
+	return true
+}
+
+// writeSliceVerify renders the decomposed-parent per-slice verify block
+// (#3132). It is the FOURTH verify state, and it is mutually exclusive with the
+// two #3042 named-absence blocks: a fan-out parent's missing parent-level gate
+// is STRUCTURAL, not a transport gap, and the per-slice rows below are real
+// committed-tree evidence — so telling the reviewer "compile/test state is
+// UNVERIFIED" over them would be false.
+//
+// A nil/empty SliceVerify writes NOTHING, keeping every ordinary run's prompt
+// byte-identical to the pre-#3132 render (prompt-hash replay stability).
+func writeSliceVerify(b *strings.Builder, ev *GateEvidence) {
+	if len(ev.SliceVerify) == 0 {
+		return
+	}
+	b.WriteString("Per-slice verify (decomposed fan-in — the parent stage ran NO verify gate of its own):\n\n")
+	b.WriteString("This run is a DECOMPOSED PARENT. Its implement stage is a FAN-OUT: it spawns no agent, " +
+		"produces no commit of its own, and therefore runs no committed-tree verify gate — BY CONSTRUCTION, not " +
+		"because an artifact went missing. The committed-tree verify DID run, once per slice, on each CHILD's own " +
+		"branch. Each row below is one of those child gates, resolved from that child's redacted trace.\n\n")
+	for _, sv := range ev.SliceVerify {
+		idx := "(unknown)"
+		if sv.SliceIndex != nil {
+			idx = strconv.Itoa(*sv.SliceIndex)
+		}
+		fmt.Fprintf(b, "- slice %s (child run %s", idx, sv.ChildRunID)
+		if sv.ChildStageState != "" {
+			fmt.Fprintf(b, ", child implement stage: %s", sv.ChildStageState)
+		}
+		b.WriteString(")\n")
+		if sv.VerifiedHeadSHA != "" {
+			fmt.Fprintf(b, "  verified head: %s\n", sv.VerifiedHeadSHA)
+		} else {
+			b.WriteString("  verified head: (not recorded)\n")
+		}
+		if sv.UnavailableReason != "" {
+			fmt.Fprintf(b, "  EVIDENCE UNRESOLVED for this slice. Machine reason: `%s`.\n", sv.UnavailableReason)
+		}
+		for _, vr := range sv.VerifyRuns {
+			fmt.Fprintf(b, "  command: %s\n", vr.Command)
+			fmt.Fprintf(b, "    outcome: %s (exit code %d)\n", vr.Outcome, vr.ExitCode)
+			// A `passed` run's tail is suppressed HERE, by the renderer, not only by
+			// the backend resolver that blanks it: N slices x ~4KB of green output is
+			// the bound this block exists to respect, and a renderer that prints
+			// whatever it is handed makes that bound depend on a caller it does not
+			// control (a second caller, or a resolver regression, would silently blow
+			// it). The failing tails — the ones a reviewer needs — are unaffected.
+			if vr.OutputTail != "" && vr.Outcome != "passed" {
+				truncNote := ""
+				if vr.TailTruncated {
+					truncNote = ", truncated"
+				}
+				fmt.Fprintf(b, "    output tail (bounded, pre-redacted%s):\n", truncNote)
+				for _, line := range strings.Split(strings.TrimRight(vr.OutputTail, "\n"), "\n") {
+					fmt.Fprintf(b, "      %s\n", line)
+				}
+			}
+		}
+		if sv.VerifySummary != nil {
+			fmt.Fprintf(b, "  verify summary: outcome=%s (iterations %d/%d)",
+				sv.VerifySummary.Outcome, sv.VerifySummary.Iterations, sv.VerifySummary.MaxIterations)
+			if sv.VerifySummary.Detail != "" {
+				fmt.Fprintf(b, " — detail: %s", sv.VerifySummary.Detail)
+			}
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\n")
+	if ev.SliceVerifyOmitted > 0 {
+		fmt.Fprintf(b, "%d further slice(s) are omitted to bound this prompt. The omitted slices are ALL PASSING: "+
+			"the bound is spent on PASSING rows ONLY and every non-passing row is retained however many there "+
+			"are, so every slice whose verify FAILED and every slice whose evidence could not be resolved is "+
+			"rendered above. The omission is therefore safe to read as \"more green slices\", never as a hidden "+
+			"failure.\n\n",
+			ev.SliceVerifyOmitted)
+	}
+	b.WriteString("These rules are BINDING for the rows above:\n\n")
+	b.WriteString("- A slice whose TERMINAL verify FAILED, or whose verify summary outcome is `failed`, means that " +
+		"slice's branch does NOT pass the named command. You MUST record it as a `high`-severity concern and name " +
+		"it FIRST in `concerns`.\n")
+	b.WriteString("- A slice row marked EVIDENCE UNRESOLVED is a BACKEND-side named absence — the evidence could " +
+		"not be resolved for that slice — NOT an agent omission. You MUST NOT raise \"the agent attached no " +
+		"evidence\" (or any equivalent unverifiable-evidence finding) as an agent defect against it. It is rendered " +
+		"as a row rather than dropped precisely so a slice you cannot see is never mistaken for a slice that does " +
+		"not exist.\n")
+	b.WriteString("- A PASSED slice row certifies ONLY that the named command exited 0 against THAT SLICE'S OWN " +
+		"BRANCH. It does NOT certify the consolidated fan-in tree under review here: no gate in this run ran " +
+		"against the merge result of these slices. An integration break that only appears once the slices are " +
+		"combined — a signature one slice changed and another still calls the old way, a duplicated symbol, a test " +
+		"one slice's edit invalidates — is squarely YOUR job and is NOT excluded by any number of green rows " +
+		"above.\n")
+	b.WriteString("- Each row reflects the CHILD'S PUSHED HEAD at the time that child's gate ran (named as " +
+		"`verified head` above), which is normally but not necessarily the exact commit the fan-in integrated. " +
+		"Nothing here cross-checks the two.\n")
+	b.WriteString("- If a PARENT-LEVEL verify run is ALSO present in this prompt (a parent fix-up re-review), THAT " +
+		"run is authoritative for the consolidated head and these per-slice rows are corroborating slice history, " +
+		"not a substitute for it.\n\n")
+}
+
 func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 	b.WriteString("### Gate evidence (machine-verified — outranks text-level findings)\n\n")
 	b.WriteString("The runner's deterministic gates produced the machine-verified results below. They are ground " +
@@ -5269,7 +5500,17 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 	// from the push report carried NO gate-evidence verify section at all, and
 	// reviewers correctly but unresolvably re-raised "the agent attached no
 	// evidence" against every new head.
-	if ev.VerifyEvidenceUnavailableReason != "" && len(ev.VerifyRuns) == 0 && ev.VerifySummary == nil {
+	//
+	// MUTUAL EXCLUSION with the per-slice block below (#3132). A decomposed
+	// parent has no gate evidence of its own BY CONSTRUCTION — its implement
+	// stage is a fan-out that spawns no agent — so both of this block's central
+	// claims are FALSE for it: the absence is structural rather than a
+	// transport gap, and compile/test state is NOT unknown because each slice's
+	// own committed-tree gate did run and is rendered below. Suppressing this
+	// block whenever SliceVerify is populated keeps the reviewer from being told
+	// "UNVERIFIED" over evidence printed a few lines later.
+	if ev.VerifyEvidenceUnavailableReason != "" && len(ev.VerifyRuns) == 0 && ev.VerifySummary == nil &&
+		len(ev.SliceVerify) == 0 {
 		b.WriteString("Verify runs (committed-tree gate): NOT ATTACHED TO THIS ROUND\n\n")
 		fmt.Fprintf(b, "The runner's committed-tree verify output could not be attached to this review round. "+
 			"Machine reason: `%s`.\n\n", ev.VerifyEvidenceUnavailableReason)
@@ -5329,9 +5570,16 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 	// UNVERIFIED over a passing summary would teach the reviewer to distrust it,
 	// turning a true signal into noise. So this note narrows what is missing
 	// (the per-command output) WITHOUT impeaching the summary, and carries its
-	// own distinct machine literal. The two blocks are mutually exclusive on
-	// VerifySummary's nil-ness, so exactly one of the three states renders.
-	if ev.VerifyEvidenceUnavailableReason != "" && len(ev.VerifyRuns) == 0 && ev.VerifySummary != nil {
+	// own distinct machine literal. It is likewise suppressed when the per-slice
+	// block renders (#3132), for the same reason the NOT-ATTACHED block is: on a
+	// fan-out parent the missing tail is structural, not a transport gap, and
+	// the per-slice rows below carry the real per-command evidence.
+	//
+	// The blocks are mutually exclusive — on VerifySummary's nil-ness between
+	// these two, and on SliceVerify's emptiness against the per-slice block — so
+	// exactly one of the FOUR verify states renders.
+	if ev.VerifyEvidenceUnavailableReason != "" && len(ev.VerifyRuns) == 0 && ev.VerifySummary != nil &&
+		len(ev.SliceVerify) == 0 {
 		fmt.Fprintf(b, "Verify run output tail (committed-tree gate): NOT ATTACHED TO THIS ROUND. "+
 			"Machine reason: `%s`.\n\n", ev.VerifyEvidenceUnavailableReason)
 		b.WriteString("- The verify SUMMARY immediately above IS committed-tree evidence and STANDS. This note " +
@@ -5341,6 +5589,8 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 			"NOT raise \"the agent attached no evidence\" (or any equivalent unverifiable-evidence finding) as " +
 			"an agent defect.\n\n")
 	}
+
+	writeSliceVerify(b, ev)
 
 	if ev.FlakeRetries > 0 {
 		fmt.Fprintf(b, "Infra-flake retries absorbed: %d (the retried verify result above is authoritative).\n\n",

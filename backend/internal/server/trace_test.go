@@ -10541,3 +10541,133 @@ func TestCounterfactualsWireToPrompt_PassAgnostic_EndToEnd(t *testing.T) {
 		t.Errorf("the old fix-up-only title must not survive on the wire path:\n%s", got)
 	}
 }
+
+// --- #3132 decomposed-parent per-slice verify evidence, cross-boundary ----
+
+// TestRunImplementReviews_DecomposedParentPromptCarriesPerSliceVerify is the
+// #3132 cross-boundary integration test. It drives a REAL decomposed parent —
+// parent run plus two children with DecomposedFrom/SliceIndex set, each child
+// carrying its own implement stage, trace_uploaded audit row and redacted bundle
+// with a gate_evidence verify_run — through the REAL runImplementReviews with a
+// capturing reviewer, and asserts on the PROMPT STRING the reviewer actually
+// received.
+//
+// This is the seam the per-layer units structurally cannot cover: resolver →
+// GateEvidence.SliceVerify → writeGateEvidence → reviewer prompt. A resolver
+// returning perfect records while trace.go never assigns them passes every unit
+// test in child_verify_evidence_test.go and ships the bug unchanged.
+//
+// The parent is dispatched with a NIL GateEvidence, exactly as
+// DispatchConsolidatedReview does — that nil is the defect this closes.
+func TestRunImplementReviews_DecomposedParentPromptCarriesPerSliceVerify(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	// Real fan-out children of THIS parent, each with its own gate evidence.
+	ts := &hashKeyedTraceStore{bodies: map[string][]byte{}}
+	s.cfg.TraceStore = ts
+	seedChild := func(idx int, seq int64, hash, gateJSON string) *run.Run {
+		child := rr.seedDecomposedChild(runRow.ID, idx, run.StateSucceeded)
+		st := &run.Stage{
+			ID: uuid.New(), RunID: child.ID, Sequence: 1,
+			Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+			State: run.StageStateSucceeded, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+		}
+		rr.mu.Lock()
+		rr.stagesByID[st.ID] = st
+		rr.stagesByRunID[child.ID] = append(rr.stagesByRunID[child.ID], st)
+		rr.mu.Unlock()
+		au.seeded = append(au.seeded, makeTraceUploadedEntry(t, seq, child.ID, st.ID, "redacted", hash))
+		ts.bodies[hash] = makeRedactedGateEvidenceBundle(t, gateJSON)
+		return child
+	}
+	child0 := seedChild(0, 1, strings.Repeat("a", 64),
+		`{"verify_runs":[{"command":"scripts/test verify","exit_code":0,"outcome":"passed",`+
+			`"head_sha":"SLICE0_HEAD_SENTINEL","output_tail":"green"}],`+
+			`"verify_summary":{"outcome":"passed","iterations":1,"max_iterations":3}}`)
+	child1 := seedChild(1, 2, strings.Repeat("b", 64),
+		`{"verify_runs":[{"command":"go test ./internal/slice1/...","exit_code":1,"outcome":"failed",`+
+			`"head_sha":"SLICE1_HEAD_SENTINEL","output_tail":"SLICE1_FAILURE_SENTINEL"}],`+
+			`"verify_summary":{"outcome":"failed","iterations":3,"max_iterations":3}}`)
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+	// nil gate evidence — the parent fan-out stage uploads no bundle of its own.
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"Per-slice verify (decomposed fan-in — the parent stage ran NO verify gate of its own):",
+		"Its implement stage is a FAN-OUT",
+		"- slice 0 (child run " + child0.ID.String() + ", child implement stage: succeeded)",
+		"  verified head: SLICE0_HEAD_SENTINEL",
+		"  command: scripts/test verify",
+		"- slice 1 (child run " + child1.ID.String() + ", child implement stage: succeeded)",
+		"  verified head: SLICE1_HEAD_SENTINEL",
+		"  command: go test ./internal/slice1/...",
+		"      SLICE1_FAILURE_SENTINEL",
+		"It does NOT certify the consolidated fan-in tree under review here",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt missing %q\n---\n%s", want, got)
+		}
+	}
+	// The parent's structural absence is named with its OWN literal, not with a
+	// transport-gap one, and the #3042 NOT-ATTACHED block is suppressed.
+	for _, forbidden := range []string{
+		"Verify runs (committed-tree gate): NOT ATTACHED TO THIS ROUND",
+		"Compile/test state is UNVERIFIED for this head",
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("NOT-ATTACHED block must be suppressed on a decomposed parent; found %q\n---\n%s", forbidden, got)
+		}
+	}
+	// A passed slice's tail is bounded away; a failed slice's is kept.
+	if strings.Contains(got, "      green") {
+		t.Errorf("a passing slice's output tail must not reach the prompt\n---\n%s", got)
+	}
+}
+
+// The NEGATIVE CONTROL for the test above: an ordinary (non-decomposed) run
+// resolves no children, so its reviewer prompt carries no per-slice block at all
+// and the new literal never appears. Without this, an implementation that
+// rendered the block unconditionally would pass the positive case.
+func TestRunImplementReviews_OrdinaryRunPromptHasNoPerSliceVerify(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	for _, forbidden := range []string{
+		"Per-slice verify",
+		"decomposed_parent_no_parent_level_verify",
+	} {
+		if strings.Contains(reviewer.calls[0], forbidden) {
+			t.Errorf("ordinary run's prompt must not contain %q\n---\n%s", forbidden, reviewer.calls[0])
+		}
+	}
+}

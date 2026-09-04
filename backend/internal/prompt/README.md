@@ -479,14 +479,16 @@ the literal stamped onto it. Read the pair as: a non-empty reason with a
 `GateEvidence`); a non-empty reason with a **non-nil** evidence is the partial
 case, already stamped, nothing for the caller to allocate.
 
-THREE verify states, not two. The partial case splits, and the split is
-load-bearing rather than cosmetic:
+FOUR verify states, not two. The partial case splits, and the split is
+load-bearing rather than cosmetic; #3132 then added a fourth for the decomposed
+parent:
 
 | state | literal | render |
 |---|---|---|
 | verify runs present | (empty) | the runs + summary, unchanged |
 | no run, no summary | `no_verify_runs_in_gate_evidence` | `Verify runs … NOT ATTACHED`, tree **UNVERIFIED** |
 | no run, summary PRESENT | `no_verify_run_tail_in_gate_evidence` | the summary, plus `Verify run output tail … NOT ATTACHED` — the summary **STANDS** |
+| decomposed PARENT, `SliceVerify` populated | `decomposed_parent_no_parent_level_verify` | the per-slice block below; BOTH `NOT ATTACHED` blocks are SUPPRESSED |
 
 The third row is NOT folded into the second on purpose. The UNVERIFIED block
 asserts that compile/test state is unknown for this head; with a verify summary
@@ -496,11 +498,93 @@ passing summary would teach the reviewer to distrust a true signal. That
 over-correction would be a worse defect than the silent omission being fixed. So
 the summary-without-tail state carries its own literal and its own narrower
 note, which names only the missing per-command output and says the summary
-stands. The two render blocks are mutually exclusive on `VerifySummary`'s
-nil-ness, so exactly one of the three states renders;
+stands. The two `NOT ATTACHED` blocks are mutually exclusive on
+`VerifySummary`'s nil-ness, and BOTH additionally require an empty `SliceVerify`
+(#3132), so exactly one of the four states renders;
 `TestWriteGateEvidence_UnavailableReason_SummaryWithoutTail` asserts BOTH halves
 — the tail note present AND the UNVERIFIED wording absent — because the negative
-half is the whole reason the state exists separately.
+half is the whole reason the state exists separately, and
+`TestWriteGateEvidence_SliceVerifySuppressesNotAttachedBlock` pins the fourth.
+
+**The FOURTH state — `GateEvidence.SliceVerify`, the decomposed parent (#3132).**
+A decomposed parent's implement stage is a FAN-OUT: it spawns no agent, writes no
+commit and uploads no bundle, so there is no parent chain for
+`bundle.ExtractGateEvidence` to read and `DispatchConsolidatedReview` passed a
+nil `GateEvidence`. The reviewer therefore judged the LARGEST diff the loop
+produces — the consolidated fan-in — with the tree's compile and test state
+entirely unknown. The per-slice verify DID run, on each child's own branch;
+`server.childSliceVerifyEvidence` resolves it per child through the same
+`resolveStageGateEvidence` seam and hands it over as `[]GateSliceVerify`. Like
+`OperatorScopeUndelivered` and `ScopeProvenance` it is BACKEND-DERIVED, not
+bundle-carried, so a nil/empty slice keeps every ordinary run's prompt
+byte-identical (pinned by `TestBuildImplementReview_NilSliceVerifyByteIdentical`,
+which compares the WHOLE built prompt — not just the `### Gate evidence` suffix,
+because this change also routes the earlier review-criteria branch through
+`holdsHeadLevelGateEvidence` — against FROZEN pre-change bytes rather than a
+same-run re-render, since a golden derived from the code it checks is circular).
+
+`writeSliceVerify` renders one row per slice carrying the slice index, child run
+id, child implement-stage state, the `verified head` SHA the AUTHORITATIVE
+(terminal-most non-superseded) run recorded — `(not recorded)` when those runs
+carry none, never a superseded iteration's older commit — each non-superseded
+command with its outcome and exit code, and the verify summary. Four rules are BINDING in the block:
+
+- a slice whose TERMINAL verify failed, or whose summary outcome is `failed`, is
+  a `high`-severity concern named FIRST;
+- a row marked `EVIDENCE UNRESOLVED` is a BACKEND-side named absence, NOT an
+  agent omission — it is rendered as a ROW rather than dropped precisely because
+  a dropped slice reads as "this slice does not exist", the silent-absence class
+  the change closes;
+- **a PASSED row certifies that slice's OWN BRANCH and NOT the consolidated
+  fan-in tree.** No gate in the run ran against the merge result, so a
+  cross-slice integration break is squarely the reviewer's job. Showing three
+  PASSED rows without this qualifier would replace an under-informed reviewer
+  with an over-confident one, on exactly the large-diff shape that needs review
+  most;
+- a parent-level verify run, when one is also present (a parent fix-up
+  re-review), is authoritative for the consolidated head and these rows are
+  corroborating slice history.
+
+RESIDUAL, stated in the block itself rather than only here: each row reflects the
+CHILD'S PUSHED HEAD at the time that child's gate ran, which is normally but not
+necessarily the commit the fan-in integrated. Nothing cross-checks the two
+against the `integration_commit_recorded` ledger — carrying `VerifiedHeadSHA`
+plumbs the value a future cross-check would need.
+
+**ADR-059 INTERACTION, and why the lens does NOT weaken.** ADR-059 / #1883
+branches the review criteria on whether machine-verified gate evidence
+accompanies the diff: with evidence the correctness lens is deferred to it and
+the generic-bug-hunt suppression stands; without it the lens is ENABLED and the
+suppression withheld. Before #3132 a decomposed parent's `GateEvidence` was NIL,
+so it took the no-evidence branch. Attaching per-slice evidence makes it non-nil
+— and a naive `!= nil` predicate would silently flip that parent onto the
+with-evidence branch, switching OFF the correctness lens for the exact review
+whose job the block declares a cross-slice integration break to be: more evidence
+in the prompt, a weaker lens over it. So the branch is taken on
+`holdsHeadLevelGateEvidence`, which returns FALSE for evidence whose ONLY verify
+content is per-slice. A parent-level verify run or summary — a parent fix-up
+re-review — counts as before, and every other shape is unchanged, so ordinary
+prompts stay byte-identical. Pinned by
+`TestBuild_ImplementReview_SliceVerifyOnlyKeepsCorrectnessLens` and the
+`TestHoldsHeadLevelGateEvidence` table. The narrowing applies to the LENS branch
+only; `writeGateEvidence` is still called on any non-nil evidence, so the
+per-slice section itself always renders.
+
+BOUNDING: at most `MaxSliceVerifyRunsPerSlice` (6) runs per row, with no output
+tail at all for a `passed` run — `writeSliceVerify` suppresses a passed tail
+ITSELF rather than trusting the resolver to have blanked it, so the bound does
+not depend on a caller the renderer does not control
+(`TestWriteGateEvidence_PassedSliceRendersNoTail` supplies a NON-EMPTY passed
+tail plus a failing one, so it cannot pass vacuously either way).
+`MaxSliceVerifyEntries` (20) bounds the PASSING rows ONLY: every non-passing row
+is retained however many there are, so the bound can only ever drop PASSING rows
+— under a plain index ordering a failed slice at position 21 would be invisible,
+and that is the one row whose absence endangers a merge; and a non-passing-first
+ordering with an unconditional truncation would still drop non-passing rows once
+they outnumber the bound, while the block asserts every failed or unresolved
+slice is present. A fan-out with more non-passing slices than the bound therefore
+renders MORE than 20 rows and omits zero. The truncation line says exactly what
+it dropped, so an omission reads as safe rather than as a hidden failure.
 
 ORDERING is an accepted, named failure mode rather than something the resolver
 verifies. On the normal path the fix-up stage ships its trace BEFORE the push
