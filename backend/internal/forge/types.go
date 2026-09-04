@@ -261,6 +261,20 @@ type BranchProtection struct {
 	// still contribute. The dispatcher derives the union per
 	// ADR-017.
 	RequiredStatusCheckContexts []string
+	// EnforceAdmins mirrors classic protection's
+	// `enforce_admins.enabled`. TRUE means the branch's rules apply
+	// to repository admins too; FALSE means admins are EXEMPT and can
+	// merge past every required status check this row contributes.
+	//
+	// It is NOT a count and must never be coerced into one — the
+	// number of people it exempts is unknown to Fishhawk (#3161).
+	// Additive: zero-valued (false) for producers that do not populate
+	// it, so a consumer must not read `false` as a positive
+	// "admins are exempt" unless the producer is known to decode it.
+	// Only the GitHub client does; the GitLab adapter leaves it zero
+	// and its results are classified `unknown` by mergegate rather
+	// than read as a bypass finding.
+	EnforceAdmins bool
 }
 
 // RulesetRequiredCheck is one ruleset's contribution to a branch's
@@ -274,6 +288,18 @@ type RulesetRequiredCheck struct {
 	// requires. May be empty when the ruleset doesn't include a
 	// `required_status_checks` rule.
 	Contexts []string
+	// BypassEntries is the number of entries in THIS ruleset's
+	// top-level `bypass_actors` array. Zero means nothing bypasses
+	// this ruleset.
+	//
+	// An entry is a role, team, app or integration — NOT a person
+	// (#3161). One entry may cover many people or none, so this
+	// count must never be rendered as a number of humans, and counts
+	// from different rulesets must never be summed: each ruleset
+	// enforces independently, so a merger has to bypass EVERY
+	// requiring source, not any one of them. mergegate models that
+	// conjunction; this field is only the per-ruleset decode.
+	BypassEntries int
 }
 
 // ComparePatchFile is one changed file in a ComparePatchResult.

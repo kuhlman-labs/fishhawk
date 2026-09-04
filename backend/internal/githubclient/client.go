@@ -1007,6 +1007,11 @@ func (c *Client) AddIssueLabels(ctx context.Context, scope forge.CredentialScope
 // surfacing the error — protection-via-ruleset-only is a normal
 // shape on GitHub repos that have migrated.
 //
+// Also decodes `enforce_admins.enabled` into BranchProtection.
+// EnforceAdmins (#3161): false means repository admins are exempt
+// from the branch's required checks, which mergegate reports as the
+// classic source's bypass condition.
+//
 // Requires the App to hold `administration: read` (#252 / ADR-017).
 func (c *Client) GetBranchProtection(ctx context.Context, scope forge.CredentialScope, repo RepoRef, branch string) (*BranchProtection, error) {
 	installationID, err := installationIDForScope(scope)
@@ -1048,10 +1053,18 @@ func (c *Client) GetBranchProtection(ctx context.Context, scope forge.Credential
 	// only `contexts` — `checks` is the newer per-check-with-app-id
 	// shape that's a superset of `contexts` for our purposes (every
 	// check contributes its `context` to the contexts list).
+	//
+	// `enforce_admins` is a sibling object with an `enabled` bool
+	// (#3161). false — including the absent case, which GitHub
+	// returns when the branch has no such rule — means repository
+	// admins are exempt from every required check on the branch.
 	var body struct {
 		RequiredStatusChecks *struct {
 			Contexts []string `json:"contexts"`
 		} `json:"required_status_checks"`
+		EnforceAdmins *struct {
+			Enabled bool `json:"enabled"`
+		} `json:"enforce_admins"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("githubclient: decode branch protection: %w", err)
@@ -1059,6 +1072,9 @@ func (c *Client) GetBranchProtection(ctx context.Context, scope forge.Credential
 	out := &BranchProtection{}
 	if body.RequiredStatusChecks != nil {
 		out.RequiredStatusCheckContexts = body.RequiredStatusChecks.Contexts
+	}
+	if body.EnforceAdmins != nil {
+		out.EnforceAdmins = body.EnforceAdmins.Enabled
 	}
 	return out, nil
 }
@@ -1158,7 +1174,7 @@ func (c *Client) listRulesetRequiredChecks(ctx context.Context, scope forge.Cred
 		if s.Target != "branch" || s.Enforcement != "active" {
 			continue
 		}
-		contexts, auth, err := c.fetchRulesetContexts(ctx, installationID, repo, s.ID, branch, defaultBranch)
+		contexts, bypassEntries, auth, err := c.fetchRulesetContexts(ctx, installationID, repo, s.ID, branch, defaultBranch)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1168,7 +1184,11 @@ func (c *Client) listRulesetRequiredChecks(ctx context.Context, scope forge.Cred
 		if len(contexts) == 0 {
 			continue
 		}
-		out = append(out, RulesetRequiredCheck{RulesetID: s.ID, Contexts: contexts})
+		out = append(out, RulesetRequiredCheck{
+			RulesetID:     s.ID,
+			Contexts:      contexts,
+			BypassEntries: bypassEntries,
+		})
 	}
 	return out, authoritative, nil
 }
@@ -1184,29 +1204,37 @@ func (c *Client) listRulesetRequiredChecks(ctx context.Context, scope forge.Cred
 // complex match expressions land empty-handed; the operator's
 // fallback is to add a classic-protection row, which v0 does read.
 //
-// Returns the contexts, whether the ruleset's ref_name condition was
+// Returns the contexts, the number of entries in the ruleset's
+// top-level `bypass_actors` array (#3161 — a role/team/app count, not
+// a headcount), whether the ruleset's ref_name condition was
 // authoritatively evaluated (false when it carried an include token v0
 // cannot evaluate — see rulesetMatchesBranch), and any transport error.
-func (c *Client) fetchRulesetContexts(ctx context.Context, installationID int64, repo RepoRef, rulesetID int64, branch, defaultBranch string) ([]string, bool, error) {
+func (c *Client) fetchRulesetContexts(ctx context.Context, installationID int64, repo RepoRef, rulesetID int64, branch, defaultBranch string) ([]string, int, bool, error) {
 	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
 		"/" + url.PathEscape(repo.Name) +
 		"/rulesets/" + url.PathEscape(fmt.Sprintf("%d", rulesetID)))
 	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, false, fmt.Errorf("githubclient: get ruleset: %w", err)
+		return nil, 0, false, fmt.Errorf("githubclient: get ruleset: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if err := classifyStatus("get ruleset", resp); err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 
 	var body struct {
-		Conditions *struct {
+		// BypassActors is the ruleset's top-level bypass list; each
+		// element is an actor_id / actor_type / bypass_mode triple.
+		// Only its LENGTH is read (#3161) — the identities are not
+		// resolvable to people without further calls, and the count
+		// is reported as "bypass entries", never as a headcount.
+		BypassActors []json.RawMessage `json:"bypass_actors"`
+		Conditions   *struct {
 			RefName *struct {
 				Include []string `json:"include"`
 				Exclude []string `json:"exclude"`
@@ -1222,12 +1250,12 @@ func (c *Client) fetchRulesetContexts(ctx context.Context, installationID int64,
 		} `json:"rules"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil, false, fmt.Errorf("githubclient: decode ruleset: %w", err)
+		return nil, 0, false, fmt.Errorf("githubclient: decode ruleset: %w", err)
 	}
 
 	matches, authoritative := rulesetMatchesBranch(body.Conditions, branch, defaultBranch)
 	if !matches {
-		return nil, authoritative, nil
+		return nil, 0, authoritative, nil
 	}
 
 	var contexts []string
@@ -1242,7 +1270,7 @@ func (c *Client) fetchRulesetContexts(ctx context.Context, installationID int64,
 			contexts = append(contexts, c.Context)
 		}
 	}
-	return contexts, authoritative, nil
+	return contexts, len(body.BypassActors), authoritative, nil
 }
 
 // rulesetMatchesBranch is the v0 condition matcher for whether a
