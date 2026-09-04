@@ -4798,3 +4798,122 @@ func TestAddIssueLabels_DecodeError(t *testing.T) {
 		t.Fatalf("expected decode error")
 	}
 }
+
+// TestGetBranchProtection_EnforceAdmins pins the #3161 decode of
+// `enforce_admins.enabled`. FALSE means repository admins are exempt
+// from the branch's required checks; the absent-object case decodes to
+// false too, which is the same operator-facing meaning (no rule
+// applying the branch's protections to admins).
+func TestGetBranchProtection_EnforceAdmins(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "enabled true",
+			body: `{"required_status_checks":{"contexts":["ci/build"]},"enforce_admins":{"url":"https://api.github.com/x","enabled":true}}`,
+			want: true,
+		},
+		{
+			name: "enabled false: admins are exempt",
+			body: `{"required_status_checks":{"contexts":["ci/build"]},"enforce_admins":{"url":"https://api.github.com/x","enabled":false}}`,
+			want: false,
+		},
+		{
+			name: "object absent",
+			body: `{"required_status_checks":{"contexts":["ci/build"]}}`,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fg, srv := newFakeGitHub(t)
+			fg.getBranchProtectionBody = tc.body
+			c, _ := newTestClient(t, srv, nil)
+
+			got, err := c.GetBranchProtection(context.Background(), forge.FromGitHubInstallationID(42),
+				RepoRef{Owner: "x", Name: "y"}, "main")
+			if err != nil {
+				t.Fatalf("GetBranchProtection: %v", err)
+			}
+			if got.EnforceAdmins != tc.want {
+				t.Errorf("EnforceAdmins = %v, want %v", got.EnforceAdmins, tc.want)
+			}
+			// The pre-existing contexts decode must be unaffected.
+			if !slicesEq(got.RequiredStatusCheckContexts, []string{"ci/build"}) {
+				t.Errorf("contexts = %v, want [ci/build]", got.RequiredStatusCheckContexts)
+			}
+		})
+	}
+}
+
+// TestListRulesetRequiredChecks_BypassEntries pins the #3161 decode of
+// the ruleset's TOP-LEVEL `bypass_actors` array. Only its length is
+// read — the count is of roles/teams/apps, never of people — and it is
+// carried PER RULESET so mergegate can model the conjunction rather
+// than summing across independently-enforcing sources.
+func TestListRulesetRequiredChecks_BypassEntries(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listRulesetsBody = `[
+		{"id":11,"target":"branch","enforcement":"active"},
+		{"id":12,"target":"branch","enforcement":"active"}
+	]`
+	fg.getRulesetBody = map[int64]string{
+		// Two bypass entries: a repository role and an integration.
+		11: `{"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"},{"actor_id":9,"actor_type":"Integration","bypass_mode":"pull_request"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"fishhawk_audit_complete"}]}}]}`,
+		// No bypass_actors key at all -> 0, not a decode error.
+		12: `{"conditions":{"ref_name":{"include":["~ALL"]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"lint"}]}}]}`,
+	}
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ListRulesetRequiredChecks(context.Background(), forge.FromGitHubInstallationID(42),
+		RepoRef{Owner: "x", Name: "y"}, "main")
+	if err != nil {
+		t.Fatalf("ListRulesetRequiredChecks: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2: %+v", len(got), got)
+	}
+	if got[0].RulesetID != 11 || got[0].BypassEntries != 2 {
+		t.Errorf("ruleset[0] = %+v, want id 11 with 2 bypass entries", got[0])
+	}
+	if got[1].RulesetID != 12 || got[1].BypassEntries != 0 {
+		t.Errorf("ruleset[1] = %+v, want id 12 with 0 bypass entries", got[1])
+	}
+}
+
+// TestListRulesetRequiredChecks_BypassEntriesNotSummedAcrossRulesets
+// pins that the count stays PER RULESET. A single run-level integer
+// would lose which source each entry belongs to, and summing it would
+// invert the bypass logic (#3161, approval condition 1(a)).
+func TestListRulesetRequiredChecks_BypassEntriesNotSummedAcrossRulesets(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listRulesetsBody = `[
+		{"id":21,"target":"branch","enforcement":"active"},
+		{"id":22,"target":"branch","enforcement":"active"}
+	]`
+	fg.getRulesetBody = map[int64]string{
+		21: `{"bypass_actors":[{"actor_id":1,"actor_type":"Team"}],"conditions":null,"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"a"}]}}]}`,
+		22: `{"bypass_actors":[{"actor_id":2,"actor_type":"Team"},{"actor_id":3,"actor_type":"Team"},{"actor_id":4,"actor_type":"Team"}],"conditions":null,"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"b"}]}}]}`,
+	}
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ListRulesetRequiredChecks(context.Background(), forge.FromGitHubInstallationID(42),
+		RepoRef{Owner: "x", Name: "y"}, "main")
+	if err != nil {
+		t.Fatalf("ListRulesetRequiredChecks: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2: %+v", len(got), got)
+	}
+	if got[0].BypassEntries != 1 {
+		t.Errorf("ruleset 21 BypassEntries = %d, want 1 (its own entries only)", got[0].BypassEntries)
+	}
+	if got[1].BypassEntries != 3 {
+		t.Errorf("ruleset 22 BypassEntries = %d, want 3 (its own entries only)", got[1].BypassEntries)
+	}
+	if got[0].BypassEntries+got[1].BypassEntries != 4 {
+		t.Errorf("per-ruleset counts do not add up to the 4 entries served")
+	}
+}
