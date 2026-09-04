@@ -246,6 +246,88 @@ func TestShipAcceptance_HeadSHA_NoDispatchAnchor(t *testing.T) {
 	}
 }
 
+// TestHostDispatchAnchorAppendFailure_ShipClampsUndecidable is m2 (E64.53 /
+// #3174), the fail-closed statement turned into a fact: when the host-dispatch
+// marker's acceptance_dispatched append FAILS on a FIRST local dispatch, the
+// stage still dispatches (t4 in host_dispatch_test.go) but no anchor exists —
+// so a subsequently shipped `passed` verdict must be RECORDED `undecidable`
+// with undecidable_basis=head_unresolved, NOT bound to a stale head. Asserted
+// on the PERSISTED outcome entry, not the handler's return.
+//
+// The narrower RE-dispatch variant (an append failure that leaves a STALE
+// anchor in place) is deliberately NOT covered here — see the PR notes and the
+// emitHostDispatchAcceptanceAnchor doc comment.
+func TestHostDispatchAnchorAppendFailure_ShipClampsUndecidable(t *testing.T) {
+	// The two legs differ ONLY in whether the anchor append is injected to
+	// fail, so the differing verdict is attributable to the anchor and nothing
+	// else — the succeed leg is the discrimination control that stops the fail
+	// leg passing vacuously.
+	for _, tt := range []struct {
+		name        string
+		failAnchor  bool
+		wantEntries int
+		wantVerdict string
+		wantBasis   any
+		wantHeadSHA any
+	}{
+		{name: "anchor_append_fails", failAnchor: true, wantEntries: 0,
+			wantVerdict: acceptanceVerdictUndecidable,
+			wantBasis:   acceptanceUndecidableBasisHeadUnresolved, wantHeadSHA: ""},
+		{name: "anchor_append_succeeds", failAnchor: false, wantEntries: 1,
+			wantVerdict: "passed", wantBasis: nil, wantHeadSHA: "prhead"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			s, sf, _, au, rr := newAcceptanceServer(t, runID, stageID)
+
+			// A locked-local run whose acceptance stage is parked awaiting the
+			// host spawn — the marker's admissible shape.
+			rr.getRuns = map[uuid.UUID]*run.Run{runID: {
+				ID: runID, Repo: "x/y", State: run.StateRunning,
+				RunnerKind: run.RunnerKindLocal, RunnerKindResolved: true,
+			}}
+			rr.getStages[stageID] = &run.Stage{
+				ID: stageID, RunID: runID, Sequence: 4, Type: run.StageTypeAcceptance,
+				ExecutorKind: run.ExecutorAgent, State: run.StageStateAwaitingHostDispatch,
+			}
+			// A head IS on the chain at-or-before the anchor the marker writes
+			// (the auditFake stamps appended entries at sequence 0), so a
+			// RESOLVABLE anchor binds the verdict to it. The clamp in the fail
+			// leg is therefore attributable to the MISSING anchor, not to a
+			// missing head.
+			seedHeadEntry(au, runID, nil, "pull_request_opened", 0, map[string]any{"head_sha": "prhead"})
+
+			if tt.failAnchor {
+				// Inject the anchor-append failure, and ONLY that category, so
+				// the ship handler's own outcome append still lands.
+				au.appendErrCategory = CategoryAcceptanceDispatched
+			}
+
+			if w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator); w.Code != http.StatusOK {
+				t.Fatalf("host-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if got := len(acceptanceDispatchEntries(au, stageID)); got != tt.wantEntries {
+				t.Fatalf("acceptance_dispatched entries = %d, want %d", got, tt.wantEntries)
+			}
+
+			priv, _ := sf.issue(t, runID)
+			if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+				t.Fatalf("ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			payload := decodeAcceptanceOutcome(t, au)
+			if got := payload["verdict"]; got != tt.wantVerdict {
+				t.Errorf("verdict = %v, want %v", got, tt.wantVerdict)
+			}
+			if got := payload["undecidable_basis"]; got != tt.wantBasis {
+				t.Errorf("undecidable_basis = %v, want %v", got, tt.wantBasis)
+			}
+			if got := payload["head_sha"]; got != tt.wantHeadSHA {
+				t.Errorf("head_sha = %v, want %v", got, tt.wantHeadSHA)
+			}
+		})
+	}
+}
+
 // seedIntegrationCommit seeds one integration_commit_recorded entry — the
 // incremental fan-in record a DECOMPOSED PARENT's own chain carries (#1806),
 // and the only head-bearing entry such a parent ever writes for itself.

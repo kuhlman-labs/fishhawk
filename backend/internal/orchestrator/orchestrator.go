@@ -416,18 +416,27 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		r = updated
 	}
 
-	out, err := o.dispatchStage(ctx, r, next)
+	out, parked, err := o.dispatchStage(ctx, r, next)
 
 	// Acceptance dispatch audit (E31.6 / #1534, ADR-049): when an
 	// acceptance-typed stage was successfully advanced (the agent fireDispatch
 	// path OR the human awaiting_approval walk, both via dispatchStage), emit an
 	// acceptance_dispatched entry so the living anchor renders the dispatch line
-	// (E31.3 already registered the category + renderer). Unlike deploy,
-	// acceptance rides the ordinary pending→dispatched agent path — no
-	// pre-execution park branch — so this is placed AFTER a successful dispatch,
-	// not before. Best-effort: emitAcceptanceDispatched never unwinds the
-	// dispatch.
-	if err == nil && next.Type == run.StageTypeAcceptance {
+	// (E31.3 already registered the category + renderer). Best-effort:
+	// emitAcceptanceDispatched never unwinds the dispatch.
+	//
+	// The `!parked` gate (E64.53 / #3174) keeps this emit to the BACKEND-
+	// TRIGGERED dispatch. A runner_kind-locked-local stage does NOT spawn here:
+	// dispatchStage parks it at awaiting_host_dispatch and still returns
+	// (OutcomeDispatched, nil), so an emit on that branch would anchor a
+	// dispatch that may never happen — and, once the host-dispatch marker writes
+	// its own anchor at the moment of the spawn, would be a SECOND anchor for
+	// the same episode. The duplicate misreports the dispatch count on the
+	// living-anchor timeline and shifts the review→dispatch latency boundary
+	// (server/latency.go keys on this category). The local anchor is therefore
+	// owned solely by the host-dispatch marker (server.handleHostDispatchStage),
+	// which is what makes a re-opened stage's re-dispatch advance it.
+	if err == nil && !parked && next.Type == run.StageTypeAcceptance {
 		o.emitAcceptanceDispatched(ctx, r.ID, next.ID, next.Sequence, string(next.ExecutorKind))
 	}
 
@@ -3193,9 +3202,19 @@ func RunBranchRef(r *run.Run) string { return runBranchRef(r) }
 // take a third path: queue gh pr merge --auto and transition
 // straight to succeeded — there's no runner work to do, and GitHub
 // owns the merge gate.
-func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.Stage) (Outcome, error) {
+//
+// It also reports whether the stage was PARKED rather than spawned. parked is
+// true ONLY on the backend.HostDispatched() branch below, which transitions a
+// runner_kind-locked-local agent stage to awaiting_host_dispatch and returns
+// (OutcomeDispatched, nil) without any spawn having happened. Every other
+// return — auto-merge stage, human walk, agent dispatched + TriggerStage, and
+// every error path — reports parked=false. Advance reads it to keep the
+// acceptance_dispatched anchor on the site that actually marks a spawn
+// (E64.53 / #3174).
+func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.Stage) (Outcome, bool, error) {
 	if isAutoMergeStage(next) {
-		return o.dispatchAutoMergeStage(ctx, r, next)
+		out, err := o.dispatchAutoMergeStage(ctx, r, next)
+		return out, false, err
 	}
 	if next.ExecutorKind == run.ExecutorHuman {
 		// Human stages don't need workflow_dispatch — they go to
@@ -3211,7 +3230,7 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 			run.StageStateAwaitingApproval,
 		} {
 			if _, err := o.Runs.TransitionStage(ctx, next.ID, to, nil); err != nil {
-				return OutcomeNoOp, fmt.Errorf("orchestrator: transition human stage to %s: %w", to, err)
+				return OutcomeNoOp, false, fmt.Errorf("orchestrator: transition human stage to %s: %w", to, err)
 			}
 		}
 		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advanced to human stage",
@@ -3219,7 +3238,7 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 			slog.String("stage_id", next.ID.String()),
 			slog.Int("sequence", next.Sequence),
 		)
-		return OutcomeDispatched, nil
+		return OutcomeDispatched, false, nil
 	}
 
 	// #1912: a runner_kind-locked-local agent stage cannot be spawned by the
@@ -3241,7 +3260,7 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 	backend := o.backends().Resolve(ctx, r)
 	if backend.HostDispatched() {
 		if _, err := o.Runs.TransitionStage(ctx, next.ID, run.StageStateAwaitingHostDispatch, nil); err != nil {
-			return OutcomeNoOp, fmt.Errorf("orchestrator: park stage awaiting host dispatch: %w", err)
+			return OutcomeNoOp, false, fmt.Errorf("orchestrator: park stage awaiting host dispatch: %w", err)
 		}
 		attrs := []slog.Attr{
 			slog.String("run_id", r.ID.String()),
@@ -3256,12 +3275,12 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 			attrs = append(attrs, slog.String("decomposed_from", r.DecomposedFrom.String()))
 		}
 		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator parked agent stage awaiting host dispatch (runner_kind=local)", attrs...)
-		return OutcomeDispatched, nil
+		return OutcomeDispatched, true, nil
 	}
 
 	// Agent stage: transition to dispatched, then fire via the resolved backend.
 	if _, err := o.Runs.TransitionStage(ctx, next.ID, run.StageStateDispatched, nil); err != nil {
-		return OutcomeNoOp, fmt.Errorf("orchestrator: transition stage to dispatched: %w", err)
+		return OutcomeNoOp, false, fmt.Errorf("orchestrator: transition stage to dispatched: %w", err)
 	}
 
 	if err := backend.TriggerStage(ctx, o.triggerParams(r, next)); err != nil {
@@ -3271,7 +3290,7 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 		// but don't roll back — the runner CAN be triggered
 		// manually if needed, and a fresh Advance call will hit
 		// the same-state idempotency path.
-		return OutcomeDispatched, err
+		return OutcomeDispatched, false, err
 	}
 
 	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator dispatched next stage",
@@ -3280,7 +3299,7 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 		slog.Int("sequence", next.Sequence),
 		slog.String("executor", string(next.ExecutorKind)),
 	)
-	return OutcomeDispatched, nil
+	return OutcomeDispatched, false, nil
 }
 
 // isAutoMergeStage returns true when a stage's role is "queue auto-

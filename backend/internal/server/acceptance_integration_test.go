@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"sync"
@@ -1244,4 +1245,281 @@ func TestAcceptanceSeam_NoCriteriaRows_ShippedVerdictRecordedUnchanged(t *testin
 	if got["criteria_undecidable"] != float64(0) || got["criteria_total"] != float64(0) {
 		t.Errorf("tallies = %v undecidable of %v, want 0 of 0", got["criteria_undecidable"], got["criteria_total"])
 	}
+}
+
+// ---------------------------------------------------------------------------
+// E64.53 / #3174: the LOCAL fix-up re-dispatch seam.
+// ---------------------------------------------------------------------------
+
+// orderedAuditFake wraps auditFake with MONOTONIC audit sequences. The plain fake
+// stamps every appended entry at sequence 0, which cannot express the ordering
+// this seam turns on: an anchor written by the host-dispatch marker must land
+// at a HIGHER sequence than the fixup_pushed head that preceded it, so
+// acceptanceValidatedHeadSHA's `e.Sequence <= dispatchSeq` bound admits the new
+// head. Reads come from this fake's own sequenced store; the embedded fake
+// still owns error injection and the `appended` record every other helper reads.
+type orderedAuditFake struct {
+	*auditFake
+	seqMu   sync.Mutex
+	seq     int64
+	entries []*audit.Entry
+}
+
+func newOrderedAuditFake() *orderedAuditFake { return &orderedAuditFake{auditFake: newAuditFake()} }
+
+// record stores one entry at the next sequence and returns that sequence.
+func (a *orderedAuditFake) record(runID uuid.UUID, stageID *uuid.UUID, category string, payload []byte) int64 {
+	a.seqMu.Lock()
+	defer a.seqMu.Unlock()
+	a.seq++
+	rid := runID
+	a.entries = append(a.entries, &audit.Entry{
+		RunID: &rid, StageID: stageID, Category: category,
+		Sequence: a.seq, Timestamp: time.Now().UTC(), Payload: payload,
+	})
+	return a.seq
+}
+
+// seedEntry appends a pre-existing entry (a head report, say) at the next
+// sequence, so seeds and appends share ONE monotonic ordering.
+func (a *orderedAuditFake) seedEntry(runID uuid.UUID, category string, payload map[string]any) int64 {
+	p, _ := json.Marshal(payload)
+	return a.record(runID, nil, category, p)
+}
+
+func (a *orderedAuditFake) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	e, err := a.auditFake.AppendChained(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	a.record(p.RunID, p.StageID, p.Category, p.Payload)
+	return e, nil
+}
+
+func (a *orderedAuditFake) snapshot(runID uuid.UUID, category string) []*audit.Entry {
+	a.seqMu.Lock()
+	defer a.seqMu.Unlock()
+	var out []*audit.Entry
+	for _, e := range a.entries {
+		if e.RunID == nil || *e.RunID != runID {
+			continue
+		}
+		if category != "" && e.Category != category {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func (a *orderedAuditFake) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
+	return a.snapshot(runID, ""), nil
+}
+
+func (a *orderedAuditFake) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if a.listByCategoryErr != nil {
+		return nil, a.listByCategoryErr
+	}
+	if a.listByCategoryErrCategory != "" && category == a.listByCategoryErrCategory {
+		return nil, errors.New("orderedAuditFake: injected ListForRunByCategory error for " + category)
+	}
+	return a.snapshot(runID, category), nil
+}
+
+// localAcceptanceSeam is the LOCAL sibling of exampleAcceptanceSeam: the same
+// committed-example-derived run, but LOCKED to runner_kind=local (so
+// orchestrator.Advance PARKS the acceptance stage at awaiting_host_dispatch
+// rather than dispatching it) and wired to a sequencing audit fake.
+type localAcceptanceSeam struct {
+	s                                                  *Server
+	rr                                                 *promptRunRepo
+	ar                                                 *fakeArtifactRepo
+	au                                                 *orderedAuditFake
+	runID, planID, implementID, reviewID, acceptanceID uuid.UUID
+	priv                                               ed25519.PrivateKey
+}
+
+func buildLocalAcceptanceSeam(t *testing.T, exampleBytes []byte) *localAcceptanceSeam {
+	t.Helper()
+	runID := uuid.New()
+	planID, implementID, reviewID, acceptanceID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	au := newOrderedAuditFake()
+
+	rr.getRuns[runID] = &run.Run{
+		ID: runID, Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+		State: run.StateRunning, WorkflowSpec: exampleBytes,
+		RunnerKind: run.RunnerKindLocal, RunnerKindResolved: true,
+	}
+	planStage := &run.Stage{ID: planID, RunID: runID, Sequence: 1, Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded}
+	implementStage := &run.Stage{ID: implementID, RunID: runID, Sequence: 2, Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded}
+	reviewStage := &run.Stage{ID: reviewID, RunID: runID, Sequence: 3, Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStateSucceeded}
+	acceptanceStage := &run.Stage{ID: acceptanceID, RunID: runID, Sequence: 4, Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, State: run.StageStatePending}
+	for _, st := range []*run.Stage{planStage, implementStage, reviewStage, acceptanceStage} {
+		rr.getStages[st.ID] = st
+	}
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage, implementStage, reviewStage, acceptanceStage}}
+
+	v := "standard_v1"
+	ar.all = append(ar.all, &artifact.Artifact{
+		ID: uuid.New(), StageID: planID, Kind: artifact.KindPlan,
+		SchemaVersion: &v, Content: acceptancePlanArtifactContent(t), CreatedAt: time.Now().UTC(),
+	})
+
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: ar, AuditRepo: au})
+	priv, _ := sf.issue(t, runID)
+	return &localAcceptanceSeam{s: s, rr: rr, ar: ar, au: au, runID: runID, planID: planID,
+		implementID: implementID, reviewID: reviewID, acceptanceID: acceptanceID, priv: priv}
+}
+
+// lastOutcomePayload decodes the NEWEST acceptance_outcome_recorded payload.
+func lastOutcomePayload(t *testing.T, au *orderedAuditFake, runID uuid.UUID) map[string]any {
+	t.Helper()
+	entries := au.snapshot(runID, CategoryAcceptanceOutcomeRecorded)
+	if len(entries) == 0 {
+		t.Fatal("no acceptance_outcome_recorded entry recorded")
+	}
+	var p map[string]any
+	if err := json.Unmarshal(entries[len(entries)-1].Payload, &p); err != nil {
+		t.Fatalf("unmarshal outcome payload: %v", err)
+	}
+	return p
+}
+
+// TestAcceptanceSeam_LocalFixupRedispatch_BindsPostFixupHead is the E64.53 /
+// #3174 done-means, end to end across orchestrator dispatch → the server
+// host-dispatch marker → the audit ledger → the acceptance ship handler, on ONE
+// sequenced audit store.
+//
+// It drives the exact production shape from the issue: a LOCAL run's acceptance
+// stage is parked by Advance, marked by the host-dispatch marker, ships a passed
+// verdict bound to the OLD head; a fix-up then pushes a NEW head,
+// reopenAcceptanceOnFixupPush re-opens the settled stage (WITHOUT calling
+// Advance — the bypass that left the anchor stale), the marker marks the
+// re-dispatch, and the second verdict must bind to the NEW head.
+//
+// The fix-up leg is MANDATORY: without it the old and new heads are identical
+// and the test passes vacuously either way.
+//
+// Counterfactual (c1): deleting the marker's acceptance_dispatched emit makes
+// the second head_sha assertion go RED with the PRE-fix-up head.
+// Counterfactual (c2): deleting the `!parked` gate in orchestrator.Advance
+// makes the dispatch-count assertion go RED with 3 entries instead of 2.
+func TestAcceptanceSeam_LocalFixupRedispatch_BindsPostFixupHead(t *testing.T) {
+	const oldHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const newHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildLocalAcceptanceSeam(t, exampleBytes)
+	ctx := context.Background()
+
+	// 1) The PR opened at the OLD head — the head the first acceptance episode
+	//    validates.
+	seam.au.seedEntry(seam.runID, "pull_request_opened", map[string]any{"head_sha": oldHead})
+
+	// 2) Advance PARKS the acceptance stage (runner_kind is locked local): no
+	//    spawn has happened, so no anchor is written.
+	o := &orchestrator.Orchestrator{Runs: seam.rr, Audit: seam.au}
+	if _, err := o.Advance(ctx, seam.runID); err != nil {
+		t.Fatalf("orchestrator advance to acceptance: %v", err)
+	}
+	if got := seam.rr.getStages[seam.acceptanceID].State; got != run.StageStateAwaitingHostDispatch {
+		t.Fatalf("acceptance stage state after advance = %q, want awaiting_host_dispatch (the local park)", got)
+	}
+	if n := len(seam.au.snapshot(seam.runID, CategoryAcceptanceDispatched)); n != 0 {
+		t.Errorf("acceptance_dispatched entries after the park = %d, want 0 (a parked stage was never spawned)", n)
+	}
+
+	// 3) The host-dispatch marker records the spawn: anchor #1.
+	if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+		t.Fatalf("first host-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	anchors := seam.au.snapshot(seam.runID, CategoryAcceptanceDispatched)
+	if len(anchors) != 1 {
+		// Errorf, not Fatalf: the head_sha assertions at steps 4 and 8 are the
+		// real done-means, and a counterfactual that removes an anchor must be
+		// able to report the WRONG HEAD it causes, not just the count.
+		t.Errorf("acceptance_dispatched entries after the first marker = %d, want 1", len(anchors))
+	}
+
+	// 4) The runner ran; ship a passed verdict. It binds to the OLD head.
+	seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+		localSeamAcceptanceBody(t, "first episode"), ""); w.Code != 201 {
+		t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != oldHead {
+		t.Errorf("first verdict head_sha = %v, want the PR-open head %q", got, oldHead)
+	}
+
+	// 5) A fix-up lands a NEW head AFTER the first episode settled.
+	seam.au.seedEntry(seam.runID, "fixup_pushed", map[string]any{"head_sha": newHead})
+
+	// 6) The fix-up invalidation re-opens the settled acceptance stage. It calls
+	//    run.ReopenAcceptanceStage DIRECTLY — never Advance — which is precisely
+	//    why the orchestrator emit could not anchor the re-dispatch.
+	seam.s.reopenAcceptanceOnFixupPush(ctx, seam.runID, newHead)
+	if got := seam.rr.getStages[seam.acceptanceID].State; got != run.StageStatePending {
+		t.Fatalf("acceptance stage state after the fix-up reopen = %q, want pending", got)
+	}
+
+	// 7) The operator re-dispatches: the marker writes anchor #2, at a sequence
+	//    ABOVE the fixup_pushed head.
+	if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+		t.Fatalf("re-dispatch host-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	anchors = seam.au.snapshot(seam.runID, CategoryAcceptanceDispatched)
+	if len(anchors) != 2 {
+		t.Errorf("acceptance_dispatched entries after the re-dispatch = %d, want 2 (one per spawn; a third would mean Advance also anchored the park)", len(anchors))
+	}
+	if len(anchors) == 2 {
+		if anchors[1].Sequence <= anchors[0].Sequence {
+			t.Errorf("re-dispatch anchor sequence %d is not above the first anchor's %d", anchors[1].Sequence, anchors[0].Sequence)
+		}
+		// The resolver's anchor must be the LATER entry (the issue's explicit
+		// second case).
+		gotSeq, ok := seam.s.latestAcceptanceDispatchSeq(ctx, seam.runID, seam.acceptanceID)
+		if !ok || gotSeq != anchors[1].Sequence {
+			t.Errorf("latestAcceptanceDispatchSeq = (%d, %v), want (%d, true) — the LATER anchor wins", gotSeq, ok, anchors[1].Sequence)
+		}
+	}
+
+	// 8) The re-validated verdict binds to the POST-fix-up head. This is the
+	//    #3174 done-means: before the fix, the stale anchor bounded the head walk
+	//    below the fixup_pushed entry and this recorded the OLD head.
+	seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+	if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+		localSeamAcceptanceBody(t, "second episode, post fix-up"), ""); w.Code != 201 {
+		t.Fatalf("second ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := lastOutcomePayload(t, seam.au, seam.runID)
+	if got := payload["head_sha"]; got != newHead {
+		t.Errorf("second verdict head_sha = %v, want the POST-fix-up head %q (a stale anchor binds the verdict to a tree the fix-up replaced)", got, newHead)
+	}
+	if got := payload["verdict"]; got != "passed" {
+		t.Errorf("second verdict = %v, want passed (the head resolved, so the #3091 clamp must not fire)", got)
+	}
+}
+
+// localSeamAcceptanceBody builds a passed verdict for the committed example's
+// two criteria. The notes field varies per call so the ship handler's
+// (stage_id, content_hash) dedup treats the second episode as a fresh record
+// rather than an idempotent replay of the first.
+func localSeamAcceptanceBody(t *testing.T, notes string) []byte {
+	t.Helper()
+	body, err := json.Marshal(acceptanceBody{
+		Verdict: "passed",
+		Criteria: critRaw(
+			acceptanceCriterionResult{ID: "ac-create", Result: "passed", Observed: "201 returned"},
+			acceptanceCriterionResult{ID: "ac-list", Result: "passed"},
+		),
+		Notes: notes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
 }

@@ -3241,6 +3241,52 @@ func TestAdvance_AcceptanceStage_DispatchesAndEmits(t *testing.T) {
 	}
 }
 
+// TestAdvance_AcceptanceStage_LocalLocked_ParksAndEmitsNoAnchor pins the
+// `!parked` emit gate (E64.53 / #3174, failure mode m4): a run LOCKED to
+// runner_kind=local parks its acceptance stage at awaiting_host_dispatch — no
+// spawn has happened — so Advance must write ZERO acceptance_dispatched
+// entries. The anchor for a local run is owned solely by the host-dispatch
+// marker, which writes it at the moment of the spawn; an emit here would be a
+// second anchor for the same episode, misreporting the dispatch count and
+// shifting the review->dispatch latency boundary.
+//
+// Counterfactual (c2): deleting the `!parked` gate in Advance makes this test
+// report 1 entry instead of 0.
+func TestAdvance_AcceptanceStage_LocalLocked_ParksAndEmitsNoAnchor(t *testing.T) {
+	rs := newStubRuns()
+	gh := &stubGitHub{}
+	ra := &recordingAudit{}
+	o := &Orchestrator{Runs: rs, GitHub: gh, Audit: ra}
+	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	// Lock the run to the local channel: the acceptance stage parks rather than
+	// spawning.
+	r.RunnerKind = run.RunnerKindLocal
+	r.RunnerKindResolved = true
+
+	out, err := o.Advance(context.Background(), r.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDispatched {
+		t.Errorf("Outcome = %q, want dispatched (the stage still advances)", out)
+	}
+	if stages[1].State != run.StageStateAwaitingHostDispatch {
+		t.Fatalf("acceptance stage state = %q, want awaiting_host_dispatch (the #1912 local park)", stages[1].State)
+	}
+	var dispatched int
+	for _, p := range ra.appended {
+		if p.Category == "acceptance_dispatched" {
+			dispatched++
+		}
+	}
+	if dispatched != 0 {
+		t.Errorf("acceptance_dispatched entries = %d, want 0 (a parked stage was never spawned; the host-dispatch marker owns the local anchor)", dispatched)
+	}
+}
+
 // TestAdvance_AcceptanceStage_NilAudit_StillDispatches pins the best-effort
 // emit: a nil-Audit orchestrator still dispatches the acceptance stage (the
 // emit WARN-logs and never unwinds the dispatch).

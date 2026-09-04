@@ -124,7 +124,9 @@ Notes:
   terminals, `fixup_pushed`, `concern_waived` / `concern_deferred`,
   `scope_amendment_decided` — and an **informational** class
   (`informationalTimelineCategories`: `run_dispatched`, `acceptance_dispatched`,
-  `deployment_dispatched`, `model_resolved`). Under the cap it fills the slots
+  `deployment_dispatched`, `model_resolved`). `acceptance_dispatched` has TWO
+  emit sites since E64.53 / #3174 (see below); both render identically here —
+  the timeline keys on the CATEGORY, not the writer. Under the cap it fills the slots
   with retained rows first and only backfills the remaining slots with the
   most-recent informational rows, so informational rows are the FIRST dropped.
   The 12-row cap ALWAYS wins: when retained rows alone exceed it the oldest
@@ -1081,8 +1083,13 @@ Notes:
   Notifier method (the change that added the deploy kinds, PR #1395 / commit
   f227dbb, likewise never touched the notifier source). The payload tags
   (`{outcome, criteria_passed, criteria_total, criteria_live_validation, class,
-  disposition}`) DEFINE the contract the writers emit to: the E31.6
-  acceptance-outcome handler writes `acceptance_dispatched` /
+  disposition}`) DEFINE the contract the writers emit to:
+  `acceptance_dispatched` has TWO writers since E64.53 / #3174 —
+  `orchestrator.go::emitAcceptanceDispatched` for a BACKEND-TRIGGERED
+  (github_actions) dispatch, and
+  `server/host_dispatch.go::emitHostDispatchAcceptanceAnchor` for a LOCAL host
+  spawn (payload identical plus a `source: "host_dispatch"` discriminator, which
+  the render ignores) — the E31.6 acceptance-outcome handler writes
   `acceptance_outcome_recorded`, and the E31.8 triage
   (`server/acceptance.go::triageAcceptanceFailure`, #1536) writes
   `acceptance_triage_decided`. **`acceptance_triage_decided` is now WRITTEN by
