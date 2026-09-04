@@ -501,32 +501,45 @@ func TestAcceptanceReopenedWriters_AreExactlyTheKnownSites(t *testing.T) {
 }
 
 // functionsWritingCategory parses every non-test .go file in the package and
-// returns the names of top-level functions whose body BINDS the identifier
-// categoryConst to a `Category` FIELD. It matches the two writer shapes that are
-// statically distinguishable from a read, so a maintainer who uses either cannot
-// silently make the #3176 staleness guard inert:
-//   - a composite-literal `Category: categoryConst` KeyValueExpr (the shape both
-//     current writers use — `audit.ChainAppendParams{… Category: …}`), and
-//   - a field assignment `x.Category = categoryConst` (an AssignStmt whose LHS is
-//     a `.Category` selector and whose RHS is the identifier), the evasion shape
-//     a params-then-assign writer would take.
+// returns the names of top-level functions whose body REFERENCES the identifier
+// categoryConst, MINUS an explicit, by-name set of functions that only READ it.
 //
-// It targets the EMIT sites, not the const declaration (a plain `const` spec,
-// never a `Category` field binding) and not READS: a function that only PASSES
-// categoryConst as a plain argument (e.g. `ListForRunByCategory(…, categoryConst)`
-// in latestAcceptanceEpisodeRestartSeq) neither key-values nor assigns it to a
-// `.Category` field, so it is correctly NOT flagged.
+// Per the #3176 fix-up concern this match is deliberately BROAD: it flags ANY
+// *ast.Ident reference to categoryConst inside a non-test FuncDecl body, not just
+// a composite-literal `Category: categoryConst` key. The earlier composite-only
+// (and later composite-plus-assignment) match was an evadable middle ground — a
+// re-open path that bound the field by ASSIGNMENT (`params.Category = …`), or that
+// handed the constant to a helper as a plain call argument (`appendReopen(id,
+// categoryConst)`), produced no `Category:` KeyValueExpr and stayed invisible
+// while the staleness guard went inert for it. Flagging every reference is the
+// reviewer's first option, chosen over the documentation-only fallback; it closes
+// that residual by construction.
 //
-// KNOWN RESIDUAL (documented per the #3176 fix-up concern): the ONE writer shape
-// this gate cannot see is a category emitted only THROUGH AN OPAQUE HELPER
-// ARGUMENT — a hypothetical `appendReopen(runID, categoryConst)` whose body key-
-// values it out of view. That argument is byte-indistinguishable from the read
-// above, so flagging it would false-positive every reader; a maintainer adding a
-// re-open path via such an indirection must update this gate by hand. Both
-// current writers use the composite-literal shape, which IS detected in both
-// directions, so the guard's totality holds today.
+// EXCLUSIONS. The const DECLARATION is a plain const spec with no enclosing
+// FuncDecl, so it is naturally excluded. The one benign NON-writer reference in
+// this package is latestAcceptanceEpisodeRestartSeq, which passes categoryConst to
+// ListForRunByCategory to READ the reopen markers; it is excluded EXPLICITLY and
+// BY NAME (readerExemptions) rather than by narrowing the match back to a writer
+// shape, so adding an exemption is a recorded, reviewed decision. A NEW benign
+// reader added WITHOUT an exemption entry deliberately trips the gate as an
+// UNEXPECTED writer, forcing a look at every new reference to the constant. (The
+// by-name exemption's own residual: a write ADDED inside an exempted function
+// would be hidden — but that function's job is to read the reopen ledger, and
+// turning it into a writer is exactly the kind of change the exemption comment
+// asks a maintainer to reconsider.)
+//
+// SCAN SCOPE — package dir, BY DESIGN, not an accident of implementation:
+// CategoryAcceptanceReopened is UNEXPORTED and package-scoped, so any writer of it
+// MUST live in this package. A tree-wide scan over backend/ (as the #3176
+// verification grep used) would reach no additional writer and would parse
+// unrelated packages; the package-dir scan is both sufficient and minimal.
 func functionsWritingCategory(t *testing.T, categoryConst string) []string {
 	t.Helper()
+	// Functions that only READ categoryConst (pass it to a query), excluded BY
+	// NAME. Adding an entry here is a recorded decision — see the doc comment.
+	readerExemptions := map[string]struct{}{
+		"latestAcceptanceEpisodeRestartSeq": {},
+	}
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read package dir: %v", err)
@@ -534,17 +547,6 @@ func functionsWritingCategory(t *testing.T, categoryConst string) []string {
 	fset := token.NewFileSet()
 	var out []string
 	seen := map[string]struct{}{}
-	// isCategoryConstIdent reports whether n is the bare identifier categoryConst.
-	isCategoryConstIdent := func(n ast.Expr) bool {
-		id, ok := n.(*ast.Ident)
-		return ok && id.Name == categoryConst
-	}
-	// isCategorySelector reports whether n selects a field named `Category`
-	// (matching the composite-literal key check `key.Name == "Category"`).
-	isCategorySelector := func(n ast.Expr) bool {
-		sel, ok := n.(*ast.SelectorExpr)
-		return ok && sel.Sel != nil && sel.Sel.Name == "Category"
-	}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -559,30 +561,18 @@ func functionsWritingCategory(t *testing.T, categoryConst string) []string {
 			if !ok || fn.Body == nil {
 				continue
 			}
-			writes := false
+			if _, exempt := readerExemptions[fn.Name.Name]; exempt {
+				continue
+			}
+			references := false
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				switch node := n.(type) {
-				case *ast.KeyValueExpr:
-					// Composite-literal `Category: categoryConst`.
-					key, ok := node.Key.(*ast.Ident)
-					if ok && key.Name == "Category" && isCategoryConstIdent(node.Value) {
-						writes = true
-					}
-				case *ast.AssignStmt:
-					// Field assignment `x.Category = categoryConst` (index-parallel
-					// LHS/RHS; a multi-assign binds each field to its own RHS).
-					for i, lhs := range node.Lhs {
-						if i >= len(node.Rhs) {
-							break
-						}
-						if isCategorySelector(lhs) && isCategoryConstIdent(node.Rhs[i]) {
-							writes = true
-						}
-					}
+				if id, ok := n.(*ast.Ident); ok && id.Name == categoryConst {
+					references = true
+					return false
 				}
 				return true
 			})
-			if writes {
+			if references {
 				if _, dup := seen[fn.Name.Name]; !dup {
 					seen[fn.Name.Name] = struct{}{}
 					out = append(out, fn.Name.Name)
