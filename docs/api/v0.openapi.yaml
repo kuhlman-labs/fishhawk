@@ -4691,9 +4691,14 @@ components:
       type: object
       description: |
         Aggregated first-run readiness for a repository (E29.4), consumed by
-        `fishhawk doctor` (E29.5). The four checks cascade: a not-installed
-        repo yields an unavailable spec and no reviewers, each with an
-        explanatory note. Read-only; performs no writes.
+        `fishhawk doctor` (E29.5). The five checks cascade: a not-installed
+        repo yields an unavailable spec, no reviewers and an `unknown` merge
+        gate, each with an explanatory note. Read-only; performs no writes.
+
+        `merge_gate` (#3161) is deliberately OPTIONAL and absent from
+        `required`: a pre-#3161 fishhawkd serves no such key, and its response
+        must still validate. A client that sees no `merge_gate` has learned
+        nothing about the repo's protection and must not render a verdict.
       required: [repo, app, spec, reviewers, scopes]
       properties:
         repo:
@@ -4772,6 +4777,122 @@ components:
                 type: string
             note:
               type: string
+        merge_gate:
+          type: object
+          description: |
+            Whether the `fishhawk_audit_complete` Check Run Fishhawk PUBLISHES
+            is actually REQUIRED by the repository's protection on its REAL
+            default branch (#3161), reconciled from classic branch protection
+            plus repo rulesets.
+
+            OPTIONAL — a pre-#3161 fishhawkd omits it entirely, and that
+            absence is not a verdict.
+
+            Read `status` FAIL-CLOSED. `not_required` is a POSITIVE finding:
+            both protection surfaces answered definitively and neither
+            requires the check. `unknown` means the question could not be
+            settled — the App is not installed, a 403 from a missing
+            `administration: read` scope, a rulesets endpoint that 404s, a
+            `ref_name` condition this version cannot evaluate, a transport
+            error or a probe timeout — and `reason` names which. An `unknown`
+            is NOT evidence that the check is unrequired.
+
+            Reporting only: it gates no run, no merge and no exit code, and it
+            is a point-in-time read — a ruleset edited after the probe is not
+            reflected.
+          required: [status, check]
+          properties:
+            status:
+              type: string
+              enum: [required, not_required, unknown]
+            check:
+              type: string
+              description: The status-check context that was probed.
+              example: fishhawk_audit_complete
+            branch:
+              type: string
+              description: |
+                The repository's REAL default branch — the branch the probe
+                evaluated. Never a guessed "main"; absent when the probe could
+                not resolve it.
+              example: main
+            sources:
+              type: array
+              description: |
+                The protection surfaces observed requiring the check, each
+                with its OWN bypass posture. Bypass is never aggregated across
+                sources: each source enforces independently, so a merger must
+                get past every one of them.
+              items:
+                type: object
+                required: [identity, bypass_entries, bypassable]
+                properties:
+                  identity:
+                    type: string
+                    description: '`branch_protection` or `ruleset:<id>`.'
+                    example: 'ruleset:42'
+                  classic:
+                    type: boolean
+                    description: True for the classic branch-protection source.
+                  bypass_entries:
+                    type: integer
+                    description: |
+                      The number of entries in THIS ruleset's `bypass_actors`
+                      array — each a role, team, app or integration that may
+                      cover many people or none. Never a headcount. Always 0
+                      for the classic source, whose exemption is carried by
+                      `enforce_admins` instead.
+                  enforce_admins:
+                    type: boolean
+                    description: |
+                      Classic protection's `enforce_admins.enabled`, meaningful
+                      only when `classic` is true. False means repository
+                      admins are exempt from this source — its own named
+                      condition, never coerced into a bypass count of 1.
+                  bypassable:
+                    type: boolean
+                    description: Whether THIS source alone can be bypassed.
+            bypassable:
+              type: boolean
+              description: |
+                The conjunction over `sources` — true only when EVERY
+                requiring source is individually bypassable. One source with
+                no bypass path still enforces the check. False when `sources`
+                is empty.
+            authoritative:
+              type: boolean
+              description: |
+                True only when BOTH protection surfaces answered definitively
+                for the probed branch. `not_required` is reachable only when
+                this is true.
+            reason:
+              type: string
+              description: |
+                Machine code naming why the evaluation did not settle (or
+                settled only partially). Non-empty whenever status is
+                `unknown`.
+              enum:
+                - github_client_unconfigured
+                - app_not_installed
+                - default_branch_unresolved
+                - probe_failed
+                - rulesets_unqueryable
+                - non_authoritative
+                - administration_read_missing
+                - transport_error
+            detail:
+              type: string
+              description: The human sentence for `reason`.
+            remediation:
+              type: string
+              description: The operator's next step, when there is one.
+            required_contexts:
+              type: array
+              description: |
+                The union of every context the evaluated sources require —
+                what IS required, when the probed check is not.
+              items:
+                type: string
 
     ApiToken:
       type: object
@@ -5987,11 +6108,19 @@ paths:
       operationId: getOnboardingReadiness
       summary: First-run readiness for a repository
       description: |
-        Aggregates the four server-side-only checks a repo's first run needs
+        Aggregates the five server-side-only checks a repo's first run needs
         (E29.4), consumed by `fishhawk doctor` (E29.5): GitHub App
         installation, the committed workflow spec's parse/validate state,
-        per-reviewer availability on this deployment, and the caller token's
-        scope adequacy against the run-driving scope subset. Read-only.
+        per-reviewer availability on this deployment, the caller token's
+        scope adequacy against the run-driving scope subset, and — since
+        #3161 — `merge_gate`, whether the `fishhawk_audit_complete` check
+        Fishhawk publishes is actually REQUIRED by the repository's
+        protection on its default branch. Read-only.
+
+        `merge_gate` is OPTIONAL: a pre-#3161 fishhawkd omits it, and that
+        absence is not a verdict. Read its `status` fail-closed — `unknown`
+        means the question could not be settled, NOT that the check is
+        unrequired.
 
         Does NOT gate on a write scope, because scope adequacy is itself a
         reported field: a write-scope gate would lock out exactly the callers

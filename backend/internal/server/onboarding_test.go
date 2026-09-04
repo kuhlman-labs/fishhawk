@@ -2,18 +2,24 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergegate"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // onboardingReviewersSpecYAML is a valid feature_change spec whose plan stage
@@ -875,5 +881,573 @@ func TestCollectSpecReviewers_Dedup(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("tuple[%d] = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+// --- merge gate readiness, check (5) (#3161) ---
+//
+// The fixture below is a full GitHub stub — installation, contents, repository
+// metadata, classic branch protection and both ruleset endpoints — so these
+// tests drive the REAL handler through the REAL githubclient decode and the
+// REAL mergegate reconciliation. That is deliberate: scope.files for this
+// change spans the forge decode, the reconciliation engine, the HTTP response
+// and two client mirrors, so a per-layer unit test is insufficient (cf. #618)
+// — a break anywhere between the ruleset JSON and the response's json tag
+// fails one of these.
+
+// mergeGateFixture is a GitHub stub covering every endpoint the readiness
+// endpoint touches. Zero values are filled in by newMergeGateFixture; each
+// field is a knob one degrade test flips.
+type mergeGateFixture struct {
+	defaultBranch string
+
+	repoStatus int
+	repoBody   string
+
+	// protection is keyed by BRANCH NAME: a branch absent from the map draws
+	// a 404, which githubclient maps to ErrNotFound ("no classic protection").
+	// Keying by branch is what makes the default-branch resolve observable.
+	protection       map[string]string
+	protectionStatus int
+	protectionHang   time.Duration
+
+	rulesetsStatus int
+	rulesetsList   string
+	// rulesetBodies is keyed by ruleset id as a string.
+	rulesetBodies map[string]string
+
+	calls struct {
+		repo        int
+		protection  int
+		rulesetList int
+	}
+	// protectionBranches records every branch the protection endpoint was
+	// asked about, so a test can assert WHICH branch was probed.
+	protectionBranches []string
+}
+
+// newMergeGateFixture returns a fixture whose default posture is: App
+// installed, spec valid, default branch "main", no classic protection, one
+// active branch ruleset (id 42) covering ~DEFAULT_BRANCH and requiring
+// fishhawk_audit_complete with no bypass entries.
+func newMergeGateFixture() *mergeGateFixture {
+	return &mergeGateFixture{
+		defaultBranch:    "main",
+		repoStatus:       http.StatusOK,
+		protection:       map[string]string{},
+		protectionStatus: http.StatusOK,
+		rulesetsStatus:   http.StatusOK,
+		rulesetsList:     `[{"id":42,"target":"branch","enforcement":"active"}]`,
+		rulesetBodies: map[string]string{
+			"42": mergeGateRulesetBody([]string{"~DEFAULT_BRANCH"}, []string{"fishhawk_audit_complete"}, 0),
+		},
+	}
+}
+
+// mergeGateRulesetBody renders a repository-ruleset JSON body with the given
+// ref_name includes, required-status-check contexts and bypass_actors count —
+// the recorded shape of GET /repos/{o}/{r}/rulesets/{id}.
+func mergeGateRulesetBody(include, contexts []string, bypassActors int) string {
+	quoted := func(vals []string) string {
+		out := make([]string, 0, len(vals))
+		for _, v := range vals {
+			out = append(out, `"`+v+`"`)
+		}
+		return strings.Join(out, ",")
+	}
+	checks := make([]string, 0, len(contexts))
+	for _, c := range contexts {
+		checks = append(checks, `{"context":"`+c+`"}`)
+	}
+	actors := make([]string, 0, bypassActors)
+	for i := 0; i < bypassActors; i++ {
+		actors = append(actors,
+			`{"actor_id":`+strconv.Itoa(i+1)+`,"actor_type":"Team","bypass_mode":"always"}`)
+	}
+	return `{"bypass_actors":[` + strings.Join(actors, ",") + `],` +
+		`"conditions":{"ref_name":{"include":[` + quoted(include) + `],"exclude":[]}},` +
+		`"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[` +
+		strings.Join(checks, ",") + `]}}]}`
+}
+
+// mergeGateProtectionBody renders a classic branch-protection JSON body — the
+// recorded shape of GET /repos/{o}/{r}/branches/{b}/protection.
+func mergeGateProtectionBody(contexts []string, enforceAdmins bool) string {
+	quoted := make([]string, 0, len(contexts))
+	for _, c := range contexts {
+		quoted = append(quoted, `"`+c+`"`)
+	}
+	return `{"required_status_checks":{"contexts":[` + strings.Join(quoted, ",") + `]},` +
+		`"enforce_admins":{"enabled":` + strconv.FormatBool(enforceAdmins) + `}}`
+}
+
+// server wires the fixture onto an httptest mux. The spec + installation
+// endpoints reuse the same canned bodies the other readiness tests use, so
+// these tests only vary the protection surfaces.
+func (f *mergeGateFixture) server(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/installation", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":12345}`)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/contents/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, specContentsBody(onboardingReviewersSpecYAML))
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/branches/{branch}/protection", func(w http.ResponseWriter, r *http.Request) {
+		f.calls.protection++
+		branch := r.PathValue("branch")
+		f.protectionBranches = append(f.protectionBranches, branch)
+		if f.protectionHang > 0 {
+			// Outlive the (test-shrunk) probe timeout so the ctx deadline
+			// fires inside the reconciliation.
+			select {
+			case <-time.After(f.protectionHang):
+			case <-r.Context().Done():
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if f.protectionStatus != http.StatusOK {
+			w.WriteHeader(f.protectionStatus)
+			_, _ = io.WriteString(w, `{"message":"nope"}`)
+			return
+		}
+		body, ok := f.protection[branch]
+		if !ok {
+			// GitHub 404s a branch with no classic protection — not an error.
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"Branch not protected"}`)
+			return
+		}
+		_, _ = io.WriteString(w, body)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/rulesets/{id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		body, ok := f.rulesetBodies[r.PathValue("id")]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+			return
+		}
+		_, _ = io.WriteString(w, body)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/rulesets", func(w http.ResponseWriter, _ *http.Request) {
+		f.calls.rulesetList++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(f.rulesetsStatus)
+		if f.rulesetsStatus != http.StatusOK {
+			_, _ = io.WriteString(w, `{"message":"nope"}`)
+			return
+		}
+		_, _ = io.WriteString(w, f.rulesetsList)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}", func(w http.ResponseWriter, _ *http.Request) {
+		f.calls.repo++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(f.repoStatus)
+		switch {
+		case f.repoBody != "":
+			_, _ = io.WriteString(w, f.repoBody)
+		case f.repoStatus != http.StatusOK:
+			_, _ = io.WriteString(w, `{"message":"nope"}`)
+		default:
+			_, _ = io.WriteString(w, `{"default_branch":"`+f.defaultBranch+`"}`)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// specContentsBody renders the base64 contents payload the spec fetch decodes.
+func specContentsBody(yaml string) string {
+	return `{"path":".fishhawk/workflows.yaml","content":"` +
+		base64.StdEncoding.EncodeToString([]byte(yaml)) + `","encoding":"base64","sha":"deadbeef"}`
+}
+
+// mergeGateReadinessFor drives the handler against the fixture and returns the
+// decoded merge_gate object.
+func mergeGateReadinessFor(t *testing.T, f *mergeGateFixture) mergeGateReadiness {
+	t.Helper()
+	s := newOnboardingServer(t, f.server(t), nil)
+	id := testOperatorIdentity()
+	code, resp := decodeReadiness(t, s, onboardingReq("x/y", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	return resp.MergeGate
+}
+
+// TestOnboardingReadiness_MergeGate_EndToEnd is the CROSS-BOUNDARY test. It
+// drives the real handler over a GitHub stub serving actual protection and
+// ruleset JSON, and asserts the DECODED HTTP response's merge_gate object.
+//
+// The fixture is the conjunction case binding condition 1 turns on: TWO
+// independent sources require the check — classic protection with
+// enforce_admins TRUE (not bypassable) and a ruleset with two bypass entries
+// (bypassable). A summed bypass model would report the gate as bypassable;
+// the conjunction reports it as NOT bypassable, because a merger has to get
+// past both.
+func TestOnboardingReadiness_MergeGate_EndToEnd(t *testing.T) {
+	f := newMergeGateFixture()
+	f.protection["main"] = mergeGateProtectionBody(
+		[]string{"fishhawk_audit_complete", "ci"}, true)
+	f.rulesetBodies["42"] = mergeGateRulesetBody(
+		[]string{"~DEFAULT_BRANCH"}, []string{"fishhawk_audit_complete"}, 2)
+
+	mg := mergeGateReadinessFor(t, f)
+
+	if mg.Status != "required" {
+		t.Fatalf("Status = %q, want required (detail=%q reason=%q)", mg.Status, mg.Detail, mg.Reason)
+	}
+	if mg.Check != "fishhawk_audit_complete" {
+		t.Errorf("Check = %q, want fishhawk_audit_complete", mg.Check)
+	}
+	if mg.Branch != "main" {
+		t.Errorf("Branch = %q, want main", mg.Branch)
+	}
+	if !mg.Authoritative {
+		t.Errorf("Authoritative = false, want true (both surfaces answered)")
+	}
+	if len(mg.Sources) != 2 {
+		t.Fatalf("len(Sources) = %d, want 2: %+v", len(mg.Sources), mg.Sources)
+	}
+	classic, ruleset := mg.Sources[0], mg.Sources[1]
+	if classic.Identity != "branch_protection" || !classic.Classic {
+		t.Errorf("Sources[0] = %+v, want the classic branch_protection source", classic)
+	}
+	if !classic.EnforceAdmins {
+		t.Errorf("classic EnforceAdmins = false, want true (decoded from enforce_admins.enabled)")
+	}
+	if classic.Bypassable {
+		t.Errorf("classic Bypassable = true, want false (enforce_admins is on)")
+	}
+	if classic.BypassEntries != 0 {
+		t.Errorf("classic BypassEntries = %d, want 0 (the admin exemption is never a count)", classic.BypassEntries)
+	}
+	if ruleset.Identity != "ruleset:42" {
+		t.Errorf("Sources[1].Identity = %q, want ruleset:42", ruleset.Identity)
+	}
+	if ruleset.BypassEntries != 2 {
+		t.Errorf("ruleset BypassEntries = %d, want 2 (decoded from bypass_actors)", ruleset.BypassEntries)
+	}
+	if !ruleset.Bypassable {
+		t.Errorf("ruleset Bypassable = false, want true (it carries bypass entries)")
+	}
+	// The conjunction: one bypassable source does NOT make the gate bypassable.
+	if mg.Bypassable {
+		t.Errorf("Bypassable = true, want false: classic enforces with no bypass path, "+
+			"so the gate holds regardless of the ruleset's %d bypass entries", ruleset.BypassEntries)
+	}
+	if !containsString(mg.RequiredContexts, "ci") {
+		t.Errorf("RequiredContexts = %v, want it to carry the sibling 'ci' context", mg.RequiredContexts)
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_NoGitHubClient_Unknown asserts the
+// no-client degrade: unknown with the github_client_unconfigured reason, never
+// not_required.
+func TestOnboardingReadiness_MergeGate_NoGitHubClient_Unknown(t *testing.T) {
+	s := newOnboardingServer(t, nil, nil)
+	id := testOperatorIdentity()
+	code, resp := decodeReadiness(t, s, onboardingReq("x/y", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if resp.MergeGate.Status != "unknown" {
+		t.Fatalf("Status = %q, want unknown", resp.MergeGate.Status)
+	}
+	if resp.MergeGate.Reason != mergeGateReasonNoGitHubClient {
+		t.Errorf("Reason = %q, want %q", resp.MergeGate.Reason, mergeGateReasonNoGitHubClient)
+	}
+	if resp.MergeGate.Detail == "" {
+		t.Errorf("Detail empty, want a naming sentence")
+	}
+	if resp.MergeGate.Check != "fishhawk_audit_complete" {
+		t.Errorf("Check = %q, want the probed context even on a degrade", resp.MergeGate.Check)
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_AppNotInstalled_Unknown asserts the
+// not-installed degrade: both protection reads need an installation token, so
+// the probe cannot run — unknown, and NO forge protection call is made.
+func TestOnboardingReadiness_MergeGate_AppNotInstalled_Unknown(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	fake.installationStatus = http.StatusNotFound
+	fake.installationBody = `{"message":"Not Found"}`
+	s := newOnboardingServer(t, fake.server(t), nil)
+
+	id := testOperatorIdentity()
+	code, resp := decodeReadiness(t, s, onboardingReq("x/y", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if resp.MergeGate.Status != "unknown" {
+		t.Fatalf("Status = %q, want unknown", resp.MergeGate.Status)
+	}
+	if resp.MergeGate.Reason != mergeGateReasonAppNotInstalled {
+		t.Errorf("Reason = %q, want %q", resp.MergeGate.Reason, mergeGateReasonAppNotInstalled)
+	}
+	if resp.MergeGate.Remediation == "" {
+		t.Errorf("Remediation empty, want the install-the-App step")
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_DefaultBranchLookupFails_Unknown asserts
+// the default-branch degrade: a 500 from GET /repos/{o}/{r} yields unknown
+// with the default_branch_unresolved reason, and the probe never falls back to
+// guessing "main" (the protection endpoint is never called).
+func TestOnboardingReadiness_MergeGate_DefaultBranchLookupFails_Unknown(t *testing.T) {
+	f := newMergeGateFixture()
+	f.repoStatus = http.StatusInternalServerError
+
+	mg := mergeGateReadinessFor(t, f)
+	if mg.Status != "unknown" {
+		t.Fatalf("Status = %q, want unknown", mg.Status)
+	}
+	if mg.Reason != mergeGateReasonDefaultBranch {
+		t.Errorf("Reason = %q, want %q", mg.Reason, mergeGateReasonDefaultBranch)
+	}
+	if f.calls.protection != 0 {
+		t.Errorf("protection endpoint called %d times, want 0 (no fallback to a guessed branch)",
+			f.calls.protection)
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_NilRepositoryMetadata_Unknown drives the
+// defensive guard the concrete client cannot produce: githubclient's
+// GetRepository errors when `default_branch` is absent, so a (nil, nil) return
+// is unreachable through it — but removing the guard would leave a nil
+// dereference one interface swap away. The seam seeds that return BY
+// CONSTRUCTION, so the RED lands on the status assertion.
+func TestOnboardingReadiness_MergeGate_NilRepositoryMetadata_Unknown(t *testing.T) {
+	orig := mergeGateRepository
+	mergeGateRepository = func(_ context.Context, _ *githubclient.Client, _ forge.CredentialScope,
+		_ githubclient.RepoRef) (*githubclient.Repository, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { mergeGateRepository = orig })
+
+	mg := mergeGateReadinessFor(t, newMergeGateFixture())
+	if mg.Status != "unknown" {
+		t.Fatalf("Status = %q, want unknown", mg.Status)
+	}
+	if mg.Reason != mergeGateReasonDefaultBranch {
+		t.Errorf("Reason = %q, want %q", mg.Reason, mergeGateReasonDefaultBranch)
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_ReconcileRejects_Unknown drives the
+// caller-error branch of the reconciliation. mergegate.Reconcile reserves its
+// error return for caller mistakes, all of which probeMergeGate excludes, so
+// the branch is unreachable in production — the seam seeds the error BY
+// CONSTRUCTION to prove it fails closed rather than rendering a verdict.
+func TestOnboardingReadiness_MergeGate_ReconcileRejects_Unknown(t *testing.T) {
+	orig := mergeGateReconcile
+	mergeGateReconcile = func(_ context.Context, _ mergegate.ProtectionAPI, _ forge.CredentialScope,
+		_ forge.RepoRef, _, _, _ string) (mergegate.Reconciliation, error) {
+		return mergegate.Reconciliation{}, errors.New("mergegate: nil ProtectionAPI")
+	}
+	t.Cleanup(func() { mergeGateReconcile = orig })
+
+	mg := mergeGateReadinessFor(t, newMergeGateFixture())
+	if mg.Status != "unknown" {
+		t.Fatalf("Status = %q, want unknown", mg.Status)
+	}
+	if mg.Reason != mergeGateReasonProbeFailed {
+		t.Errorf("Reason = %q, want %q", mg.Reason, mergeGateReasonProbeFailed)
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_NonMainDefaultBranch_ResolvesRulesets is
+// the default-branch-resolve control. The fixture repo defaults to `trunk` and
+// carries TWO active rulesets: id 42 scoped by `~DEFAULT_BRANCH` and id 43 by
+// the literal `refs/heads/trunk`.
+//
+// Deleting the resolve so the probe hardcodes "main" is observable twice over:
+// the literal-ref ruleset stops matching (Sources drops to one) and the
+// reported branch changes. The `~DEFAULT_BRANCH` ruleset alone would NOT
+// discriminate — the probe passes the same value as both branch and
+// defaultBranch, so `~DEFAULT_BRANCH` self-matches under either — which is
+// exactly why the literal-ref sibling is in the fixture.
+func TestOnboardingReadiness_MergeGate_NonMainDefaultBranch_ResolvesRulesets(t *testing.T) {
+	f := newMergeGateFixture()
+	f.defaultBranch = "trunk"
+	f.rulesetsList = `[{"id":42,"target":"branch","enforcement":"active"},` +
+		`{"id":43,"target":"branch","enforcement":"active"}]`
+	f.rulesetBodies["43"] = mergeGateRulesetBody(
+		[]string{"refs/heads/trunk"}, []string{"fishhawk_audit_complete"}, 0)
+
+	mg := mergeGateReadinessFor(t, f)
+
+	if mg.Status != "required" {
+		t.Fatalf("Status = %q, want required (detail=%q)", mg.Status, mg.Detail)
+	}
+	if mg.Branch != "trunk" {
+		t.Errorf("Branch = %q, want trunk (the repo's REAL default branch, never a guessed main)", mg.Branch)
+	}
+	if len(mg.Sources) != 2 {
+		t.Fatalf("len(Sources) = %d, want 2 (both the ~DEFAULT_BRANCH and the refs/heads/trunk ruleset): %+v",
+			len(mg.Sources), mg.Sources)
+	}
+	if len(f.protectionBranches) == 0 || f.protectionBranches[0] != "trunk" {
+		t.Errorf("protection probed branches %v, want the first to be trunk", f.protectionBranches)
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_AuthoritativeAndAbsent_NotRequired is the
+// ONLY path that may report not_required: both surfaces answered definitively
+// (classic 404 = positively unprotected, rulesets listed and evaluated) and
+// neither requires the check.
+func TestOnboardingReadiness_MergeGate_AuthoritativeAndAbsent_NotRequired(t *testing.T) {
+	f := newMergeGateFixture()
+	f.rulesetBodies["42"] = mergeGateRulesetBody(
+		[]string{"~DEFAULT_BRANCH"}, []string{"ci"}, 0)
+
+	mg := mergeGateReadinessFor(t, f)
+	if mg.Status != "not_required" {
+		t.Fatalf("Status = %q, want not_required (detail=%q reason=%q)", mg.Status, mg.Detail, mg.Reason)
+	}
+	if !mg.Authoritative {
+		t.Errorf("Authoritative = false; not_required must never be reported off a partial read")
+	}
+	if mg.Remediation == "" {
+		t.Errorf("Remediation empty, want the add-the-check step")
+	}
+	if !containsString(mg.RequiredContexts, "ci") {
+		t.Errorf("RequiredContexts = %v, want the contexts that ARE required", mg.RequiredContexts)
+	}
+	if mg.Bypassable {
+		t.Errorf("Bypassable = true with no requiring source, want false")
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_RulesetsNotFound_Unknown asserts the
+// unread-surface degrade: a 404 from the rulesets endpoint (some GHES
+// versions) means that surface was never read, so its silence is not
+// evidence — unknown, not not_required.
+func TestOnboardingReadiness_MergeGate_RulesetsNotFound_Unknown(t *testing.T) {
+	f := newMergeGateFixture()
+	f.rulesetsStatus = http.StatusNotFound
+
+	mg := mergeGateReadinessFor(t, f)
+	if mg.Status != "unknown" {
+		t.Fatalf("Status = %q, want unknown (an unread surface is not an absence)", mg.Status)
+	}
+	if mg.Reason != mergegate.ReasonRulesetsUnqueryable {
+		t.Errorf("Reason = %q, want %q", mg.Reason, mergegate.ReasonRulesetsUnqueryable)
+	}
+	if mg.Authoritative {
+		t.Errorf("Authoritative = true, want false")
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_ForbiddenAdministrationRead_Unknown
+// asserts the missing-scope degrade: a 403 from the protection endpoint (the
+// App installation lacking `administration: read`, ADR-017 / #252) yields
+// unknown with a reason naming the scope.
+func TestOnboardingReadiness_MergeGate_ForbiddenAdministrationRead_Unknown(t *testing.T) {
+	f := newMergeGateFixture()
+	f.protectionStatus = http.StatusForbidden
+
+	mg := mergeGateReadinessFor(t, f)
+	if mg.Status != "unknown" {
+		t.Fatalf("Status = %q, want unknown", mg.Status)
+	}
+	if mg.Reason != mergegate.ReasonScopeMissing {
+		t.Errorf("Reason = %q, want %q", mg.Reason, mergegate.ReasonScopeMissing)
+	}
+	if !strings.Contains(mg.Detail, "administration: read") {
+		t.Errorf("Detail = %q, want it to name the administration: read scope", mg.Detail)
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_UnevaluatableRefName_Unknown asserts the
+// non-authoritative degrade: an active ruleset scoped by an fnmatch glob the
+// v0 matcher cannot evaluate could be hiding a requirement, so a nothing-found
+// sweep resolves to unknown rather than not_required.
+func TestOnboardingReadiness_MergeGate_UnevaluatableRefName_Unknown(t *testing.T) {
+	f := newMergeGateFixture()
+	f.rulesetBodies["42"] = mergeGateRulesetBody(
+		[]string{"refs/heads/release/*"}, []string{"ci"}, 0)
+
+	mg := mergeGateReadinessFor(t, f)
+	if mg.Status != "unknown" {
+		t.Fatalf("Status = %q, want unknown (an unevaluatable condition may hide a requirement)", mg.Status)
+	}
+	if mg.Reason != mergegate.ReasonNonAuthoritative {
+		t.Errorf("Reason = %q, want %q", mg.Reason, mergegate.ReasonNonAuthoritative)
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_TransportError_Unknown asserts a plain
+// forge failure (a 500 from the rulesets list) degrades to unknown with the
+// transport_error reason.
+func TestOnboardingReadiness_MergeGate_TransportError_Unknown(t *testing.T) {
+	f := newMergeGateFixture()
+	f.rulesetsStatus = http.StatusInternalServerError
+
+	mg := mergeGateReadinessFor(t, f)
+	if mg.Status != "unknown" {
+		t.Fatalf("Status = %q, want unknown", mg.Status)
+	}
+	if mg.Reason != mergegate.ReasonTransportError {
+		t.Errorf("Reason = %q, want %q", mg.Reason, mergegate.ReasonTransportError)
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_ProbeTimeout_Unknown asserts the bounded
+// probe: a forge that never answers within mergeGateProbeTimeout resolves to
+// unknown rather than hanging the readiness report.
+//
+// Every deadline-competing duration is derived via timescale.D so the
+// discrimination ratio (hang >> timeout) holds at any scale factor (#1984).
+func TestOnboardingReadiness_MergeGate_ProbeTimeout_Unknown(t *testing.T) {
+	orig := mergeGateProbeTimeout
+	mergeGateProbeTimeout = timescale.D(100 * time.Millisecond)
+	t.Cleanup(func() { mergeGateProbeTimeout = orig })
+
+	f := newMergeGateFixture()
+	f.protectionHang = timescale.D(3 * time.Second)
+
+	mg := mergeGateReadinessFor(t, f)
+	if mg.Status != "unknown" {
+		t.Fatalf("Status = %q, want unknown (a timed-out probe is not an absence)", mg.Status)
+	}
+	if mg.Reason != mergegate.ReasonTransportError {
+		t.Errorf("Reason = %q, want %q", mg.Reason, mergegate.ReasonTransportError)
+	}
+}
+
+// TestOnboardingReadiness_MergeGate_RequiredViaClassicBypassable asserts the
+// single-source classic case: classic protection requires the check with
+// enforce_admins FALSE, so the one requiring source is bypassable and the
+// conjunction is therefore true. The admin exemption is carried as its own
+// named condition — BypassEntries stays 0, never coerced to 1.
+func TestOnboardingReadiness_MergeGate_RequiredViaClassicBypassable(t *testing.T) {
+	f := newMergeGateFixture()
+	f.protection["main"] = mergeGateProtectionBody([]string{"fishhawk_audit_complete"}, false)
+	f.rulesetsList = `[]`
+
+	mg := mergeGateReadinessFor(t, f)
+	if mg.Status != "required" {
+		t.Fatalf("Status = %q, want required", mg.Status)
+	}
+	if len(mg.Sources) != 1 || !mg.Sources[0].Classic {
+		t.Fatalf("Sources = %+v, want the single classic source", mg.Sources)
+	}
+	if mg.Sources[0].EnforceAdmins {
+		t.Errorf("EnforceAdmins = true, want false (decoded from enforce_admins.enabled:false)")
+	}
+	if mg.Sources[0].BypassEntries != 0 {
+		t.Errorf("BypassEntries = %d, want 0: the admin exemption is a named condition, not a count",
+			mg.Sources[0].BypassEntries)
+	}
+	if !mg.Bypassable {
+		t.Errorf("Bypassable = false, want true (the only requiring source exempts admins)")
+	}
+	if mg.Remediation == "" {
+		t.Errorf("Remediation empty, want the narrow-the-bypass step")
 	}
 }

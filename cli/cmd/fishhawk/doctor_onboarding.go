@@ -44,13 +44,55 @@ type onboardingReadiness struct {
 		Missing  []string `json:"missing"`
 		Note     string   `json:"note"`
 	} `json:"scopes"`
+	// MergeGate is the #3161 merge-gate reconciliation. It is a POINTER on
+	// purpose: an older fishhawkd serves no `merge_gate` key at all, and the
+	// doctor must then emit NO rung rather than a bogus warning derived from a
+	// zero value. nil means "the backend did not answer this question",
+	// which is not the same claim as "unknown".
+	MergeGate *mergeGateReadiness `json:"merge_gate"`
+}
+
+// mergeGateReadiness mirrors the backend mergeGateReadiness sub-object
+// (backend/internal/server/onboarding.go, #3161): whether the
+// fishhawk_audit_complete Check Run Fishhawk publishes is actually REQUIRED by
+// the repo's protection on its REAL default branch.
+//
+// Read Status fail-closed: "unknown" means the question could not be settled,
+// NOT that the check is unrequired. Reason names which degrade.
+type mergeGateReadiness struct {
+	Status           string            `json:"status"`
+	Check            string            `json:"check"`
+	Branch           string            `json:"branch"`
+	Sources          []mergeGateSource `json:"sources"`
+	Bypassable       bool              `json:"bypassable"`
+	Authoritative    bool              `json:"authoritative"`
+	Reason           string            `json:"reason"`
+	Detail           string            `json:"detail"`
+	Remediation      string            `json:"remediation"`
+	RequiredContexts []string          `json:"required_contexts"`
+}
+
+// mergeGateSource mirrors one protection surface requiring the probed check.
+//
+// BypassEntries counts a ruleset's `bypass_actors` ENTRIES — roles, teams or
+// apps, each of which may cover multiple people — never a headcount. The
+// classic source's admin exemption is carried by EnforceAdmins as its own
+// named condition and is never coerced into a count of 1.
+type mergeGateSource struct {
+	Identity      string `json:"identity"`
+	Classic       bool   `json:"classic"`
+	BypassEntries int    `json:"bypass_entries"`
+	EnforceAdmins bool   `json:"enforce_admins"`
+	Bypassable    bool   `json:"bypassable"`
 }
 
 // checkOnboardingReadiness probes GET {backendURL}/v0/onboarding/readiness
 // (E29.4) for the target repo and expands the aggregated server-side-only
 // payload into one checkResult per precondition: GitHub App installation,
-// per-reviewer availability, caller-token scope adequacy, and the committed
-// workflow spec's validity. Each failing precondition carries an actionable
+// per-reviewer availability, caller-token scope adequacy, the committed
+// workflow spec's validity, and — when the backend serves it — whether the
+// published check is actually required by the repo's branch protection
+// (#3161). Each failing precondition carries an actionable
 // remediation. A repo that could not be resolved, or any transport / non-200
 // response, degrades to a single WARN — it never crashes the doctor.
 //
@@ -212,7 +254,118 @@ func checkOnboardingReadiness(backendURL, token, repo string) ([]checkResult, re
 		})
 	}
 
+	// (e) Merge gate — is the check Fishhawk publishes actually required by the
+	// repo's protection (#3161)? Absent entirely against an older fishhawkd,
+	// which draws NO rung: silence beats a warning derived from a zero value.
+	if rung, ok := mergeGateRung(body.MergeGate); ok {
+		out = append(out, rung)
+	}
+
 	return out, outcome
+}
+
+// mergeGateRung renders the merge-gate readiness rung, or reports ok=false
+// when there is no rung to render (#3161).
+//
+// Three states plus one absence:
+//
+//   - nil        — the backend served no `merge_gate` key (a pre-#3161
+//     fishhawkd). NO rung: the doctor has not learned that the
+//     check is unrequired, only that this backend cannot say.
+//     A warning here would be a claim the payload does not make.
+//   - required   — ok. The detail names each requiring source with ITS OWN
+//     bypass condition; when EVERY requiring source is
+//     bypassable the server's remediation rides along as a hint.
+//   - not_required — warn. Fishhawk requires the check to be required: with it
+//     unrequired, fishhawk_merge_run can queue an auto-merge that
+//     fires with the review verdict still pending. Non-fatal to
+//     the doctor's exit code (only "fail" counts), so an operator
+//     who opts out deliberately is informed, not blocked.
+//   - unknown    — warn naming the reason. NOT a claim the check is
+//     unrequired — the question could not be settled.
+func mergeGateRung(mg *mergeGateReadiness) (checkResult, bool) {
+	if mg == nil {
+		return checkResult{}, false
+	}
+	const label = "merge gate enforced"
+	check := mg.Check
+	if check == "" {
+		check = "fishhawk_audit_complete"
+	}
+
+	switch mg.Status {
+	case "required":
+		detail := "required on " + mg.Branch
+		if mg.Branch == "" {
+			detail = "required"
+		}
+		if names := mergeGateSourceSummary(mg.Sources); names != "" {
+			detail += " (" + names + ")"
+		}
+		return checkResult{
+			label: label, detail: detail, status: "ok",
+			// Non-empty only when every requiring source is bypassable — the
+			// server leaves it empty when the gate genuinely holds.
+			remediate: mg.Remediation,
+		}, true
+	case "not_required":
+		detail := check + " is not a required status check on " + mg.Branch
+		if mg.Branch == "" {
+			detail = check + " is not a required status check"
+		}
+		return checkResult{
+			label: label, detail: detail, status: "warn",
+			remediate: mg.Remediation,
+		}, true
+	default:
+		// "unknown", and any status this build does not recognise — both are
+		// unsettled, and neither licenses reporting the check as unrequired.
+		detail := "unknown"
+		if mg.Reason != "" {
+			detail = "unknown (" + mg.Reason + ")"
+		}
+		remediate := mg.Detail
+		if mg.Remediation != "" {
+			remediate = mg.Remediation
+		}
+		if remediate == "" {
+			remediate = "could not read the repository's branch protection; this is not evidence the check is unrequired"
+		}
+		return checkResult{
+			label: label, detail: detail, status: "warn", remediate: remediate,
+		}, true
+	}
+}
+
+// mergeGateSourceSummary renders each requiring source's bypass posture IN ITS
+// OWN TERMS.
+//
+// A ruleset bypass entry is a role, team, app or integration — it may cover
+// many people or none — so it is reported as "N bypass entries (roles, teams
+// or apps), each of which may cover multiple people", never as "bypassable by
+// N actors". Classic protection has no such list: its exemption is
+// enforce_admins:false, rendered as its own named condition ("repository
+// admins are exempt") and never coerced into a count of 1.
+func mergeGateSourceSummary(sources []mergeGateSource) string {
+	if len(sources) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(sources))
+	for _, src := range sources {
+		switch {
+		case src.Classic && !src.EnforceAdmins:
+			parts = append(parts, src.Identity+": repository admins are exempt")
+		case src.Classic:
+			parts = append(parts, src.Identity)
+		case src.BypassEntries > 0:
+			parts = append(parts, fmt.Sprintf(
+				"%s: %d bypass entries (roles, teams or apps), each of which may cover multiple people",
+				src.Identity, src.BypassEntries))
+		default:
+			parts = append(parts, src.Identity)
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 // checkExecutionPath verifies that the committed workflow spec declares an
