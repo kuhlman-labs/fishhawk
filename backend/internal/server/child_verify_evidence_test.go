@@ -304,7 +304,11 @@ func TestChildSliceVerifyEvidence_BundleWithoutVerifyRunsEmitsNoVerifyRunsInGate
 // --- per-run filtering ----------------------------------------------------
 
 // Superseded runs are dropped (an absorbed iteration is not the slice's
-// committed-tree result), while the head SHA is still read from the raw list.
+// committed-tree result), and the head SHA is NOT borrowed from one: the only
+// head-bearing run here is the superseded iteration, which ran against an OLDER
+// commit than the terminal PASSED run, so labelling the passed row with it would
+// misattribute which commit the authoritative gate certified. The row reports the
+// SHA as unrecorded instead.
 func TestChildSliceVerifyEvidence_SupersededRunsDropped(t *testing.T) {
 	f := newSliceVerifyFixture(t)
 	parent := uuid.New()
@@ -320,8 +324,52 @@ func TestChildSliceVerifyEvidence_SupersededRunsDropped(t *testing.T) {
 	if len(got[0].VerifyRuns) != 1 || got[0].VerifyRuns[0].Command != "scripts/test verify" {
 		t.Errorf("superseded run must be dropped, got %+v", got[0].VerifyRuns)
 	}
-	if got[0].VerifiedHeadSHA != "SHA_FROM_SUPERSEDED" {
-		t.Errorf("head SHA must be read from the RAW run list, got %q", got[0].VerifiedHeadSHA)
+	if got[0].VerifiedHeadSHA != "" {
+		t.Errorf("a SUPERSEDED run's head SHA must never label the terminal outcome, got %q",
+			got[0].VerifiedHeadSHA)
+	}
+}
+
+// The head SHA names the commit the AUTHORITATIVE (terminal, non-superseded)
+// evidence ran against. A verify-fix loop is exactly the shape that gets this
+// wrong: iteration 1 FAILED on head A and was superseded, a fix commit moved the
+// branch, iteration 2 PASSED on head B. Both runs carry a head_sha here — the
+// case a first-non-empty pick renders as "verified head: A, outcome passed",
+// misattributing the commit and pointing a future cross-check against the
+// integration_commit_recorded ledger at the wrong one.
+func TestChildSliceVerifyEvidence_HeadSHAIsTheTerminalRuns(t *testing.T) {
+	f := newSliceVerifyFixture(t)
+	parent := uuid.New()
+	f.seedSlice(parent, 0, `{"verify_runs":[`+
+		`{"command":"scripts/test verify","exit_code":1,"outcome":"failed","head_sha":"SHA_STALE_A","superseded":true},`+
+		`{"command":"scripts/test verify","exit_code":0,"outcome":"passed","head_sha":"SHA_TERMINAL_B"}],`+
+		`"verify_summary":{"outcome":"passed","iterations":2,"max_iterations":3}}`)
+
+	got, _ := f.server().childSliceVerifyEvidence(context.Background(), parent)
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1: %+v", len(got), got)
+	}
+	if got[0].VerifiedHeadSHA != "SHA_TERMINAL_B" {
+		t.Errorf("VerifiedHeadSHA = %q, want the TERMINAL run's SHA_TERMINAL_B", got[0].VerifiedHeadSHA)
+	}
+}
+
+// Within the authoritative runs the LAST head-bearing one wins, and an earlier
+// one is used only when the later runs recorded none — a gate-skipped or
+// infra-failure run emits an empty head_sha, so a strictly positional pick would
+// report no head where the authoritative evidence does carry one.
+func TestChildSliceVerifyEvidence_HeadSHAFallsBackWithinAuthoritativeRuns(t *testing.T) {
+	f := newSliceVerifyFixture(t)
+	parent := uuid.New()
+	f.seedSlice(parent, 0, `{"verify_runs":[`+
+		`{"command":"scripts/test verify","exit_code":0,"outcome":"passed","head_sha":"SHA_RECORDED"},`+
+		`{"command":"scripts/test verify","exit_code":0,"outcome":"skipped"}],`+
+		`"verify_summary":{"outcome":"passed","iterations":1,"max_iterations":3}}`)
+
+	got, _ := f.server().childSliceVerifyEvidence(context.Background(), parent)
+	if len(got) != 1 || got[0].VerifiedHeadSHA != "SHA_RECORDED" {
+		t.Fatalf("VerifiedHeadSHA = %q, want SHA_RECORDED (the last head-bearing authoritative run): %+v",
+			got[0].VerifiedHeadSHA, got)
 	}
 }
 
@@ -436,5 +484,58 @@ func TestChildSliceVerifyEvidence_CapNeverDropsANonPassingSlice(t *testing.T) {
 		if r.UnavailableReason != "" || r.VerifySummary == nil || r.VerifySummary.Outcome != "passed" {
 			t.Errorf("unexpected non-passing survivor: %+v", r)
 		}
+	}
+}
+
+// THE BOUNDARY the ordering alone does not cover: MORE non-passing children than
+// the entry bound. Ordering non-passing first and then truncating to the bound
+// would still DROP non-passing rows here — while the rendered block asserts that
+// every failed or unresolved slice is present, so the prompt would be lying about
+// exactly the rows that endanger a merge. The bound is therefore spent on PASSING
+// rows only: all cap+2 non-passing rows survive, the passing ones are all omitted,
+// and the row count deliberately EXCEEDS MaxSliceVerifyEntries.
+func TestChildSliceVerifyEvidence_MoreNonPassingThanTheCapAreAllRetained(t *testing.T) {
+	f := newSliceVerifyFixture(t)
+	parent := uuid.New()
+	failed := map[string]bool{}
+	for i := 0; i < prompt.MaxSliceVerifyEntries+1; i++ {
+		failed[f.seedSlice(parent, i, failingSliceGate).ID.String()] = true
+	}
+	// One UNRESOLVED slice too — the other non-passing shape.
+	unresolved := f.rr.seedDecomposedChild(parent, prompt.MaxSliceVerifyEntries+1, run.StateSucceeded)
+	f.rr.seedStage(unresolved.ID, 1, run.StageStateSucceeded) // plan stage only → unresolvable
+	// Plus three passing slices, which are the ONLY rows the bound may drop.
+	for i := 0; i < 3; i++ {
+		f.seedSlice(parent, prompt.MaxSliceVerifyEntries+2+i, passingSliceGate)
+	}
+
+	got, omitted := f.server().childSliceVerifyEvidence(context.Background(), parent)
+	wantRows := prompt.MaxSliceVerifyEntries + 2 // every failed row + the unresolved one
+	if len(got) != wantRows || omitted != 3 {
+		t.Fatalf("got %d rows / omitted %d, want %d / 3", len(got), omitted, wantRows)
+	}
+	seenFailed, seenUnresolved := 0, 0
+	for _, r := range got {
+		switch {
+		case failed[r.ChildRunID]:
+			seenFailed++
+			if r.VerifySummary == nil || r.VerifySummary.Outcome != "failed" {
+				t.Errorf("failed slice row lost its failed summary: %+v", r)
+			}
+		case r.ChildRunID == unresolved.ID.String():
+			seenUnresolved++
+			if r.UnavailableReason != "child_has_no_implement_stage" {
+				t.Errorf("unresolved slice row reason = %q", r.UnavailableReason)
+			}
+		default:
+			t.Errorf("a PASSING row survived while non-passing rows were dropped: %+v", r)
+		}
+	}
+	if seenFailed != prompt.MaxSliceVerifyEntries+1 {
+		t.Errorf("got %d failed rows, want all %d — the bound must never drop a non-passing slice",
+			seenFailed, prompt.MaxSliceVerifyEntries+1)
+	}
+	if seenUnresolved != 1 {
+		t.Errorf("the UNRESOLVED slice was dropped — the bound must never drop a non-passing slice")
 	}
 }

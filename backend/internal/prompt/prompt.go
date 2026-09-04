@@ -1074,11 +1074,12 @@ type GateEvidence struct {
 	// and for which per-slice evidence exists.
 	SliceVerify []GateSliceVerify
 	// SliceVerifyOmitted is how many PASSING slices the MaxSliceVerifyEntries cap
-	// dropped from SliceVerify. The resolver orders non-passing slices (a failed
-	// terminal verify, a `failed` summary, or an UnavailableReason) FIRST and
-	// caps AFTER that ordering, so the cap can only ever drop passing rows — the
-	// block states exactly that, so an omission reads as safe rather than as an
-	// unexplained gap. Zero (the byte-identical default) omits the line.
+	// dropped from SliceVerify. The resolver spends the cap on PASSING rows ONLY
+	// and retains every non-passing slice (a failed terminal verify, a `failed`
+	// summary, or an UnavailableReason) however many there are, so the cap can
+	// only ever drop passing rows — the block states exactly that, so an omission
+	// reads as safe rather than as an unexplained gap. Zero (the byte-identical
+	// default) omits the line.
 	SliceVerifyOmitted int
 	// ScopeProvenance decomposes the declared scope.files count into its
 	// provenance (#1914) so the implement reviewer can machine-classify a
@@ -1315,7 +1316,9 @@ type GateVerifyRun struct {
 	// which does not render it — the surrounding prompt already establishes
 	// which head is under review. It exists so childSliceVerifyEvidence can
 	// resolve a slice's GateSliceVerify.VerifiedHeadSHA out of the same seam
-	// without a second bundle fetch. Empty on every path that did not record one.
+	// without a second bundle fetch (from the non-superseded runs only, so the row
+	// names the head its own outcome is about). Empty on every path that did not
+	// record one.
 	HeadSHA    string
 	Outcome    string
 	OutputTail string
@@ -1337,9 +1340,14 @@ type GateVerifyRun struct {
 // (server.childSliceVerifyEvidence) applies them — the renderer prints whatever
 // it is handed — and the render-side doc below is written against them.
 //
-// The entry cap is applied AFTER a non-passing-first ordering, so it can only
-// ever drop PASSING slices: a failed slice at index 21 must never be the row the
-// bound silently eats, because it is the one row whose absence endangers a merge.
+// The entry cap bounds the PASSING slices ONLY: every non-passing slice (a failed
+// terminal verify, a `failed` summary, or an unresolved row) is retained however
+// many there are, so a failed slice at index 21 is never the row the bound
+// silently eats — it is the one row whose absence endangers a merge, and the
+// block asserts in as many words that every such row is present. A fan-out with
+// more non-passing slices than the cap therefore renders more than
+// MaxSliceVerifyEntries rows, which is the deliberate trade: the cap exists for a
+// wide GREEN fan-out, and yielding it beats a prompt that lies.
 const (
 	MaxSliceVerifyEntries      = 20
 	MaxSliceVerifyRunsPerSlice = 6
@@ -1362,9 +1370,14 @@ type GateSliceVerify struct {
 	ChildRunID string
 	// ChildStageState is the child implement stage's state at resolve time.
 	ChildStageState string
-	// VerifiedHeadSHA is the commit this slice's gate actually ran against, as
-	// recorded on the child's verify_run event. It is rendered per row so the
-	// block names WHICH commit each outcome refers to. RESIDUAL, stated in the
+	// VerifiedHeadSHA is the commit this slice's AUTHORITATIVE gate ran against, as
+	// recorded on the child's verify_run event: the resolver reads the LAST
+	// (terminal-most) non-empty head_sha among the NON-SUPERSEDED runs — the same
+	// runs whose outcomes this row renders — so a terminal PASSED outcome can never
+	// be labelled with a superseded failing iteration's older commit. It is
+	// rendered per row so the block names WHICH commit each outcome refers to, and
+	// is EMPTY (rendered "(not recorded)") when the authoritative runs recorded no
+	// head_sha rather than borrowing a superseded run's. RESIDUAL, stated in the
 	// block itself: this is the child's PUSHED head at the time its gate ran,
 	// which is normally but not necessarily the commit the fan-in integrated —
 	// nothing here cross-checks the two against the integration_commit_recorded
@@ -1373,7 +1386,8 @@ type GateSliceVerify struct {
 	// VerifyRuns are the slice's non-superseded verify runs, capped at
 	// MaxSliceVerifyRunsPerSlice, with the OutputTail blanked on any run whose
 	// outcome is `passed` (a green command's tail carries nothing a reviewer
-	// needs).
+	// needs). writeSliceVerify suppresses a `passed` tail INDEPENDENTLY, so the
+	// bound does not depend on the caller having blanked it.
 	VerifyRuns []GateVerifyRun
 	// VerifySummary is the slice's once-per-stage verify summary, when it has one.
 	VerifySummary *GateVerifySummary
@@ -5361,7 +5375,13 @@ func writeSliceVerify(b *strings.Builder, ev *GateEvidence) {
 		for _, vr := range sv.VerifyRuns {
 			fmt.Fprintf(b, "  command: %s\n", vr.Command)
 			fmt.Fprintf(b, "    outcome: %s (exit code %d)\n", vr.Outcome, vr.ExitCode)
-			if vr.OutputTail != "" {
+			// A `passed` run's tail is suppressed HERE, by the renderer, not only by
+			// the backend resolver that blanks it: N slices x ~4KB of green output is
+			// the bound this block exists to respect, and a renderer that prints
+			// whatever it is handed makes that bound depend on a caller it does not
+			// control (a second caller, or a resolver regression, would silently blow
+			// it). The failing tails — the ones a reviewer needs — are unaffected.
+			if vr.OutputTail != "" && vr.Outcome != "passed" {
 				truncNote := ""
 				if vr.TailTruncated {
 					truncNote = ", truncated"
@@ -5384,9 +5404,10 @@ func writeSliceVerify(b *strings.Builder, ev *GateEvidence) {
 	b.WriteString("\n")
 	if ev.SliceVerifyOmitted > 0 {
 		fmt.Fprintf(b, "%d further slice(s) are omitted to bound this prompt. The omitted slices are ALL PASSING: "+
-			"the rows are ordered non-passing FIRST and the bound is applied after that ordering, so every slice "+
-			"whose verify FAILED and every slice whose evidence could not be resolved is rendered above. The "+
-			"omission is therefore safe to read as \"more green slices\", never as a hidden failure.\n\n",
+			"the bound is spent on PASSING rows ONLY and every non-passing row is retained however many there "+
+			"are, so every slice whose verify FAILED and every slice whose evidence could not be resolved is "+
+			"rendered above. The omission is therefore safe to read as \"more green slices\", never as a hidden "+
+			"failure.\n\n",
 			ev.SliceVerifyOmitted)
 	}
 	b.WriteString("These rules are BINDING for the rows above:\n\n")

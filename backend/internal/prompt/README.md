@@ -518,13 +518,16 @@ entirely unknown. The per-slice verify DID run, on each child's own branch;
 `OperatorScopeUndelivered` and `ScopeProvenance` it is BACKEND-DERIVED, not
 bundle-carried, so a nil/empty slice keeps every ordinary run's prompt
 byte-identical (pinned by `TestBuildImplementReview_NilSliceVerifyByteIdentical`,
-which compares against FROZEN pre-change bytes rather than a same-run re-render —
-a golden derived from the code it checks is circular).
+which compares the WHOLE built prompt — not just the `### Gate evidence` suffix,
+because this change also routes the earlier review-criteria branch through
+`holdsHeadLevelGateEvidence` — against FROZEN pre-change bytes rather than a
+same-run re-render, since a golden derived from the code it checks is circular).
 
 `writeSliceVerify` renders one row per slice carrying the slice index, child run
-id, child implement-stage state, the `verified head` SHA the gate ran against,
-each non-superseded command with its outcome and exit code, and the verify
-summary. Four rules are BINDING in the block:
+id, child implement-stage state, the `verified head` SHA the AUTHORITATIVE
+(terminal-most non-superseded) run recorded — `(not recorded)` when those runs
+carry none, never a superseded iteration's older commit — each non-superseded
+command with its outcome and exit code, and the verify summary. Four rules are BINDING in the block:
 
 - a slice whose TERMINAL verify failed, or whose summary outcome is `failed`, is
   a `high`-severity concern named FIRST;
@@ -567,13 +570,21 @@ prompts stay byte-identical. Pinned by
 only; `writeGateEvidence` is still called on any non-nil evidence, so the
 per-slice section itself always renders.
 
-BOUNDING: at most `MaxSliceVerifyEntries` (20) rows and
-`MaxSliceVerifyRunsPerSlice` (6) runs per row, with no output tail at all for a
-`passed` run. The entry bound is applied AFTER a NON-PASSING-FIRST ordering, so
-it can only ever drop PASSING rows — under a plain index ordering a failed slice
-at position 21 would be invisible, and that is the one row whose absence
-endangers a merge. The truncation line says so explicitly, so an omission reads
-as safe rather than as a hidden failure.
+BOUNDING: at most `MaxSliceVerifyRunsPerSlice` (6) runs per row, with no output
+tail at all for a `passed` run — `writeSliceVerify` suppresses a passed tail
+ITSELF rather than trusting the resolver to have blanked it, so the bound does
+not depend on a caller the renderer does not control
+(`TestWriteGateEvidence_PassedSliceRendersNoTail` supplies a NON-EMPTY passed
+tail plus a failing one, so it cannot pass vacuously either way).
+`MaxSliceVerifyEntries` (20) bounds the PASSING rows ONLY: every non-passing row
+is retained however many there are, so the bound can only ever drop PASSING rows
+— under a plain index ordering a failed slice at position 21 would be invisible,
+and that is the one row whose absence endangers a merge; and a non-passing-first
+ordering with an unconditional truncation would still drop non-passing rows once
+they outnumber the bound, while the block asserts every failed or unresolved
+slice is present. A fan-out with more non-passing slices than the bound therefore
+renders MORE than 20 rows and omits zero. The truncation line says exactly what
+it dropped, so an omission reads as safe rather than as a hidden failure.
 
 ORDERING is an accepted, named failure mode rather than something the resolver
 verifies. On the normal path the fix-up stage ships its trace BEFORE the push

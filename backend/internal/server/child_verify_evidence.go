@@ -57,11 +57,17 @@ const (
 // ORDERING + BOUND (operator binding condition 1). Records are ordered
 // NON-PASSING FIRST — any slice whose terminal verify failed, whose summary
 // outcome is `failed`, or that carries an UnavailableReason — then passing
-// slices, each group stable in slice-index order. The MaxSliceVerifyEntries bound
-// is applied AFTER that ordering, so it can only ever drop PASSING rows. Under a
-// plain index ordering a failed slice at position 21 would be invisible, and the
-// one row whose absence actually endangers a merge is the one the bound would
-// silently eat. The rendered block states that the omitted rows are all passing.
+// slices, each group stable in slice-index order. EVERY non-passing record is
+// RETAINED, however many there are: MaxSliceVerifyEntries bounds the PASSING
+// rows only, so the bound can never drop a row whose absence endangers a merge.
+// A non-passing-first ordering with an unconditional trailing truncation would
+// still eat non-passing rows once they outnumber the bound — and the rendered
+// block asserts that every failed or unresolved slice is present, so that
+// truncation would make the prompt lie. A fan-out with more non-passing slices
+// than the bound therefore renders MORE than MaxSliceVerifyEntries rows and
+// omits zero; the prompt-size bound is honoured for the case it exists for (a
+// wide GREEN fan-out) and deliberately yielded when the alternative is a hidden
+// failure.
 func (s *Server) childSliceVerifyEvidence(ctx context.Context, parentRunID uuid.UUID) ([]prompt.GateSliceVerify, int) {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil || s.cfg.TraceStore == nil {
 		return nil, 0
@@ -105,22 +111,31 @@ func (s *Server) childSliceVerifyEvidence(ctx context.Context, parentRunID uuid.
 		return a.ID.String() < b.ID.String()
 	})
 
-	out := make([]prompt.GateSliceVerify, 0, len(children))
+	// Partition rather than sort-then-truncate: the bound is spent on the PASSING
+	// rows only (binding condition 1), so no non-passing row can ever be dropped —
+	// not even when the non-passing rows alone outnumber the bound. Appending in
+	// child order inside each group keeps the slice-index ordering the comparator
+	// above established.
+	nonPassing := make([]prompt.GateSliceVerify, 0, len(children))
+	passing := make([]prompt.GateSliceVerify, 0, len(children))
 	for _, child := range children {
-		out = append(out, s.sliceVerifyForChild(ctx, parentRunID, child))
+		rec := s.sliceVerifyForChild(ctx, parentRunID, child)
+		if sliceVerifyNonPassing(rec) {
+			nonPassing = append(nonPassing, rec)
+			continue
+		}
+		passing = append(passing, rec)
 	}
-
-	// Non-passing first, THEN the bound (binding condition 1). SliceStable keeps
-	// the slice-index ordering inside each group.
-	sort.SliceStable(out, func(i, j int) bool {
-		return sliceVerifyNonPassing(out[i]) && !sliceVerifyNonPassing(out[j])
-	})
+	budget := prompt.MaxSliceVerifyEntries - len(nonPassing)
+	if budget < 0 {
+		budget = 0
+	}
 	omitted := 0
-	if len(out) > prompt.MaxSliceVerifyEntries {
-		omitted = len(out) - prompt.MaxSliceVerifyEntries
-		out = out[:prompt.MaxSliceVerifyEntries]
+	if len(passing) > budget {
+		omitted = len(passing) - budget
+		passing = passing[:budget]
 	}
-	return out, omitted
+	return append(nonPassing, passing...), omitted
 }
 
 // sliceVerifyForChild resolves ONE child's record. It always returns a record —
@@ -173,24 +188,27 @@ func (s *Server) sliceVerifyForChild(ctx context.Context, parentRunID uuid.UUID,
 	}
 	rec.UnavailableReason = reason // "" on a full success; a partial literal otherwise
 
-	// The head SHA rides the verify runs, and the FIRST non-empty one wins — the
-	// gate-skipped / infra-failure paths emit an empty head_sha, so a positional
-	// pick could report none where one exists. Read from the RAW list, before the
-	// superseded/bound filtering below, so a slice whose only head-bearing run was
-	// superseded still names its commit.
-	for _, vr := range ev.VerifyRuns {
-		if vr.HeadSHA != "" {
-			rec.VerifiedHeadSHA = vr.HeadSHA
-			break
-		}
-	}
-
+	// The head SHA rides the verify runs, and it must name the commit the
+	// AUTHORITATIVE evidence ran against — the one the row's outcome is about. So
+	// it is resolved from the SAME non-superseded runs the row renders, taking the
+	// LAST (terminal-most) non-empty one: after a verify-fix iteration the earlier
+	// run ran against an OLDER commit, and reading the raw list would label a
+	// terminal PASSED outcome with the superseded FAILING iteration's SHA — the
+	// exact misattribution `verified head` exists to prevent, and one a future
+	// cross-check against the integration_commit_recorded ledger would compare
+	// against the wrong commit. When no non-superseded run recorded a head_sha
+	// (the gate-skipped / infra-failure paths emit an empty one) the field stays
+	// EMPTY and the row renders "(not recorded)" rather than borrowing a
+	// superseded iteration's SHA.
 	for _, vr := range ev.VerifyRuns {
 		if vr.Superseded {
 			// An earlier iteration the verify-fix loop absorbed and re-ran is NOT
 			// the committed-tree result for this slice; carrying it here would
 			// invite the reviewer to read an absorbed failure as a slice failure.
 			continue
+		}
+		if vr.HeadSHA != "" {
+			rec.VerifiedHeadSHA = vr.HeadSHA
 		}
 		if vr.Outcome == "passed" {
 			// A green command's tail carries nothing a reviewer needs, and N
