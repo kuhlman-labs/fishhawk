@@ -1637,8 +1637,20 @@ func acceptanceStageOf(stages []*run.Stage) *run.Stage {
 // stage never validated. Two residuals resolve to NO anchor and are therefore
 // clamped to `undecidable` by the #3091 head_unresolved path below — a local
 // ship that never went through the marker, and a FIRST-dispatch audit-append
-// failure at the marker. (A RE-dispatch append failure instead leaves the STALE
-// anchor in place; it is WARN-logged at the marker and is not clamped here.)
+// failure at the marker.
+//
+// The marker's anchor emit stays BEST-EFFORT and NEVER unwinds the dispatch. A
+// RE-dispatch whose append fails leaves the PREVIOUS episode's anchor on the
+// chain, but that stale anchor is now caught at RESOLUTION time by the
+// episode-restart staleness guard below (E64.54 / #3176): an acceptance episode
+// restart writes an acceptance_reopened marker BEFORE the re-dispatch, so an
+// anchor at or below the newest such marker predates the current episode and is
+// treated as no anchor — clamped to undecidable exactly like an absent one. The
+// remaining residual, strictly narrower than #3174's: an episode whose
+// acceptance_reopened append AND acceptance_dispatched append BOTH failed (the
+// same DB fault hitting both writes), for which no restart marker exists and the
+// stale anchor still answers. It cannot be closed by any write-based approach,
+// since a write is what is failing.
 //
 // Returns
 // ("", false) when no head is recorded at-or-before dispatch, or when the stage
@@ -1656,6 +1668,47 @@ func (s *Server) acceptanceValidatedHeadSHA(ctx context.Context, runID, stageID 
 	}
 	dispatchSeq, haveAnchor := s.latestAcceptanceDispatchSeq(ctx, runID, stageID)
 	if !haveAnchor {
+		return "", false
+	}
+	// EPISODE-RESTART STALENESS GUARD (E64.54 / #3176). The anchor above is the
+	// NEWEST acceptance_dispatched entry for the stage, but on a RE-dispatch whose
+	// anchor append FAILED (a DB fault at the host-dispatch marker), the newest
+	// anchor still on the chain is the PREVIOUS episode's — and the reported-head
+	// walk below would then resolve it and bind the verdict to the PRE-fix-up tree,
+	// a confident wrong answer where every sibling path is fail-closed (#3174's
+	// residual). Every acceptance episode restart writes an acceptance_reopened
+	// entry scoped to the stage FIRST (reopenAcceptanceOnFixupPush for the #1682
+	// fix-up invalidation, writeAcceptanceReopenAudit for the #1567 operator
+	// re-open — the two are asserted to be the only non-test writers by
+	// TestAcceptanceReopenedWriters_AreExactlyTheKnownSites). So an anchor at or
+	// below the newest restart marker PREDATES the current validation episode and
+	// is STALE: treat it exactly as an ABSENT anchor — return ("", false), which
+	// the #3091 clamp records as undecidable(basis=head_unresolved). The comparison
+	// is a pure within-chain SEQUENCE comparison, never a timestamp: a
+	// DB-stamped-vs-Go-side comparison here would be the #3048 cross-clock trap,
+	// and its near-tie direction would clamp EVERY verdict to undecidable since the
+	// anchor is appended microseconds after the transition. No new audit write is
+	// added on the failing path — a write is precisely what already failed.
+	restartSeq, haveRestart, rerr := s.latestAcceptanceEpisodeRestartSeq(ctx, runID, stageID)
+	if rerr != nil {
+		// Fail closed: an unreadable restart ledger is treated as "cannot resolve
+		// the validated head", never as "no restart, proceed on the newest anchor".
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance: episode-restart ledger unreadable — treating validated head as unresolvable",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", rerr.Error()))
+		return "", false
+	}
+	if haveRestart && restartSeq > dispatchSeq {
+		// The newest anchor predates the current validation episode's re-open: it is
+		// a prior episode's anchor left in place by a failed re-dispatch append.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance: newest dispatch anchor predates the current episode restart — treating validated head as unresolvable; the verdict will be clamped to undecidable",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.Int64("anchor_seq", dispatchSeq),
+			slog.Int64("restart_seq", restartSeq))
 		return "", false
 	}
 	var candidates []*audit.Entry
@@ -1707,6 +1760,38 @@ func (s *Server) latestAcceptanceDispatchSeq(ctx context.Context, runID, stageID
 		}
 	}
 	return seq, found
+}
+
+// latestAcceptanceEpisodeRestartSeq returns the highest audit sequence among the
+// run's acceptance_reopened entries scoped to stageID, whether any exist, and a
+// read error. The staleness anchor for acceptanceValidatedHeadSHA's
+// episode-restart guard (E64.54 / #3176): a reopen marker always precedes the
+// re-dispatch anchor on the chain, so an acceptance_dispatched entry at or below
+// the newest reopen marker belongs to a PRIOR validation episode.
+//
+// Unlike latestAcceptanceDispatchSeq this PROPAGATES the read error as a third
+// return rather than collapsing it into found=false: the caller must distinguish
+// "no restart markers" (a legacy / first-episode chain — proceed on the newest
+// anchor) from "unreadable ledger" (fail closed — the validated head cannot be
+// trusted), and folding both into found=false would silently PROCEED on an
+// unreadable chain, defeating the guard on exactly the DB-fault path it exists to
+// handle.
+func (s *Server) latestAcceptanceEpisodeRestartSeq(ctx context.Context, runID, stageID uuid.UUID) (int64, bool, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceReopened)
+	if err != nil {
+		return 0, false, err
+	}
+	var seq int64
+	found := false
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID {
+			if !found || e.Sequence > seq {
+				seq = e.Sequence
+				found = true
+			}
+		}
+	}
+	return seq, found, nil
 }
 
 // authorizeAcceptance resolves the request's auth method + actor, mirroring

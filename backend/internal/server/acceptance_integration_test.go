@@ -1504,6 +1504,119 @@ func TestAcceptanceSeam_LocalFixupRedispatch_BindsPostFixupHead(t *testing.T) {
 	}
 }
 
+// TestAcceptanceSeam_LocalRedispatchAnchorAppendFailure_ClampsUndecidable is the
+// E64.54 / #3176 end-to-end done-means: the SAME production shape as the #3174
+// seam test, but the RE-dispatch's acceptance_dispatched anchor append is
+// injected to fail. The re-open still wrote its acceptance_reopened marker, so
+// the resolver's episode-restart staleness guard sees the newest anchor (the
+// PRIOR episode's #1) sitting BELOW that marker and treats the validated head as
+// unresolvable — clamping the second verdict to undecidable/head_unresolved
+// rather than binding it to the pre-fix-up (old) head, which is #3174's original
+// wrong-head-passed symptom. The paired control leg removes ONLY the injection,
+// so the two legs differ solely in the injected append failure.
+//
+// Counterfactual: DELETE the step-2 staleness branch in acceptanceValidatedHeadSHA
+// and the injected leg goes RED reporting verdict=passed / head_sha=oldHead — the
+// #3174 symptom itself, and what distinguishes this from m2's ANCHORLESS first
+// dispatch (here a stale anchor DOES resolve, so the m2 no-anchor clamp does not
+// cover it).
+func TestAcceptanceSeam_LocalRedispatchAnchorAppendFailure_ClampsUndecidable(t *testing.T) {
+	const oldHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const newHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	for _, tt := range []struct {
+		name             string
+		injectAppendFail bool
+		wantVerdict      string
+		wantBasis        any
+		wantHeadSHA      string
+	}{
+		{name: "redispatch_anchor_append_fails", injectAppendFail: true,
+			wantVerdict: acceptanceVerdictUndecidable,
+			wantBasis:   acceptanceUndecidableBasisHeadUnresolved, wantHeadSHA: ""},
+		{name: "control_no_injection", injectAppendFail: false,
+			wantVerdict: "passed", wantBasis: nil, wantHeadSHA: newHead},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			exampleBytes, _ := readAcceptanceExampleSpec(t)
+			seam := buildLocalAcceptanceSeam(t, exampleBytes)
+			ctx := context.Background()
+
+			// 1) PR opened at the OLD head.
+			seam.au.seedEntry(seam.runID, "pull_request_opened", map[string]any{"head_sha": oldHead})
+
+			// 2) Advance PARKS the local acceptance stage (no spawn, no anchor).
+			o := &orchestrator.Orchestrator{Runs: seam.rr, Audit: seam.au}
+			if _, err := o.Advance(ctx, seam.runID); err != nil {
+				t.Fatalf("orchestrator advance to acceptance: %v", err)
+			}
+
+			// 3) First host-dispatch marker: anchor #1.
+			if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+				t.Fatalf("first host-dispatch status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+
+			// 4) Ship a passed verdict bound to the OLD head.
+			seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+			if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+				localSeamAcceptanceBody(t, "first episode"), ""); w.Code != 201 {
+				t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			if got := lastOutcomePayload(t, seam.au, seam.runID)["head_sha"]; got != oldHead {
+				t.Fatalf("first verdict head_sha = %v, want the PR-open head %q", got, oldHead)
+			}
+
+			// 5) A fix-up lands a NEW head.
+			seam.au.seedEntry(seam.runID, "fixup_pushed", map[string]any{"head_sha": newHead})
+
+			// 6) The fix-up invalidation re-opens the stage and writes the
+			//    acceptance_reopened marker — the marker the staleness guard keys on.
+			seam.s.reopenAcceptanceOnFixupPush(ctx, seam.runID, newHead)
+			if got := seam.rr.getStages[seam.acceptanceID].State; got != run.StageStatePending {
+				t.Fatalf("acceptance stage state after the fix-up reopen = %q, want pending", got)
+			}
+
+			// 7) Inject the re-dispatch anchor-append failure (ONLY this category),
+			//    then re-dispatch. The emit is best-effort: the marker must still
+			//    return 200 and transition the stage, and NO new anchor lands.
+			if tt.injectAppendFail {
+				seam.au.appendErrCategory = CategoryAcceptanceDispatched
+			}
+			if w := postHostDispatch(t, seam.s, seam.runID, seam.acceptanceID, withHostDispatchOperator); w.Code != 200 {
+				t.Fatalf("re-dispatch host-dispatch status = %d, want 200 (the emit must not unwind the dispatch):\n%s", w.Code, w.Body.String())
+			}
+			seam.au.appendErrCategory = "" // stop injecting so the outcome append below lands
+			wantAnchors := 2
+			if tt.injectAppendFail {
+				wantAnchors = 1 // the re-dispatch anchor never landed; only anchor #1 exists
+			}
+			if n := len(seam.au.snapshot(seam.runID, CategoryAcceptanceDispatched)); n != wantAnchors {
+				t.Fatalf("acceptance_dispatched entries after the re-dispatch = %d, want %d", n, wantAnchors)
+			}
+
+			// 8) Ship the second verdict. In the injected leg the newest anchor (#1)
+			//    predates the acceptance_reopened marker, so the guard clamps it to
+			//    undecidable; in the control leg the re-anchored episode binds to the
+			//    post-fix-up head.
+			seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
+			if w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv,
+				localSeamAcceptanceBody(t, "second episode, post fix-up"), ""); w.Code != 201 {
+				t.Fatalf("second ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			payload := lastOutcomePayload(t, seam.au, seam.runID)
+			if got := payload["verdict"]; got != tt.wantVerdict {
+				t.Errorf("second verdict = %v, want %v", got, tt.wantVerdict)
+			}
+			if got := payload["undecidable_basis"]; got != tt.wantBasis {
+				t.Errorf("second undecidable_basis = %v, want %v", got, tt.wantBasis)
+			}
+			if got := payload["head_sha"]; got != tt.wantHeadSHA {
+				t.Errorf("second verdict head_sha = %v, want %q", got, tt.wantHeadSHA)
+			}
+		})
+	}
+}
+
 // localSeamAcceptanceBody builds a passed verdict for the committed example's
 // two criteria. The notes field varies per call so the ship handler's
 // (stage_id, content_hash) dedup treats the second episode as a fresh record
