@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
@@ -2734,5 +2735,122 @@ func TestAutoFixup_PendingReviewObservesInsteadOfFailing(t *testing.T) {
 	}
 	if n := countAudit(au, CategoryStageFixupTriggered); n != 0 {
 		t.Errorf("%d %s entries appended, want 0 (nothing was routed)", n, CategoryStageFixupTriggered)
+	}
+}
+
+// --- E64.42 / #3159: pre-merge audit-check republish (delegated arm) --------
+//
+// dispatchAcceptanceGatedMerge is the SHARED merge-dispatch tail the delegated
+// may_merge arm routes through. handleMergeRun does NOT route through it (it
+// calls GateMerger.MergePullRequest directly and carries its own copy of the
+// control, pinned in merge_run_test.go), which is why both sites need the call
+// and both need their own counterfactual.
+//
+// The three tests below drive the seam DIRECTLY, one per enumerated branch.
+// The HTTP route that reaches this seam through the real auto-drive handler is
+// pinned separately by TestAutoDrive_Merge_RepublishesAuditCheckBeforeDispatch
+// in autodrive_http_test.go.
+
+// newGatedMergeRepublishServer builds a server with the audit stack and the
+// Check Run publisher wired, both feeding the SAME ordered call log as the
+// merge seam, and returns it with a merge-ready run and its stages.
+//
+// workflowSpec nil leaves the acceptance gate not-declared (admits the merge);
+// specWithAcceptanceStage with no recorded outcome leaves it PENDING (refuses).
+func newGatedMergeRepublishServer(t *testing.T, log *mergeOrderLog, workflowSpec []byte) (*Server, *run.Run, []*run.Stage) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	au := newAuditCompleteAuditFake()
+	arts := newFakeArtifactRepo()
+	r := seedPublishableRun(t, rr, au, arts, "abc12345")
+	prURL := "https://github.com/x/y/pull/7"
+	r.PullRequestURL = &prURL
+	r.WorkflowID = "feature_change"
+	r.WorkflowSpec = workflowSpec
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr,
+		AuditRepo:      au,
+		ArtifactRepo:   arts,
+		StageCheckRepo: newFakeStageCheckRepo(),
+		ExternalURL:    "https://app.fishhawk.example.com",
+	})
+	s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub:      &orderedPublishGitHub{log: log},
+		Runs:        rr,
+		Artifacts:   arts,
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	stages, err := rr.ListStagesForRun(context.Background(), r.ID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	return s, r, stages
+}
+
+// TestDispatchAcceptanceGatedMerge_RepublishesBeforeMerge asserts ORDER on the
+// shared log: the fishhawk_audit_complete republish is recorded strictly
+// BEFORE merger.MergePullRequest. A publish after the dispatch would satisfy a
+// presence-only assertion while healing nothing — the stranded in_progress
+// check is exactly what makes the dispatch fail.
+func TestDispatchAcceptanceGatedMerge_RepublishesBeforeMerge(t *testing.T) {
+	log := &mergeOrderLog{}
+	s, r, stages := newGatedMergeRepublishServer(t, log, nil)
+	merger := &orderedLogMerger{log: log}
+
+	outcome, gateState, err := s.dispatchAcceptanceGatedMerge(context.Background(), r, stages, merger)
+	if err != nil {
+		t.Fatalf("dispatchAcceptanceGatedMerge: %v", err)
+	}
+	if outcome != mergeDispatchMerged {
+		t.Fatalf("outcome = %v (gate %q), want mergeDispatchMerged", outcome, gateState)
+	}
+	if merger.called != 1 {
+		t.Fatalf("merge dispatched %d times, want 1", merger.called)
+	}
+	assertPublishPrecedesMerge(t, log)
+}
+
+// TestDispatchAcceptanceGatedMerge_AcceptanceNotReady_NoRepublish pins the
+// fail-closed acceptance-gate refusal: the workflow declares an acceptance
+// stage and no verdict has been recorded, so the gate reports pending, the
+// function returns before any dispatch — and, critically, before any publish.
+// The republish sits AFTER this guard on purpose: a genuinely mid-flight run
+// recomputes to pending, and refusing it is the acceptance gate's job, not a
+// Check Run's.
+func TestDispatchAcceptanceGatedMerge_AcceptanceNotReady_NoRepublish(t *testing.T) {
+	log := &mergeOrderLog{}
+	s, r, stages := newGatedMergeRepublishServer(t, log, specWithAcceptanceStage)
+	merger := &orderedLogMerger{log: log}
+
+	outcome, gateState, err := s.dispatchAcceptanceGatedMerge(context.Background(), r, stages, merger)
+	if err != nil {
+		t.Fatalf("dispatchAcceptanceGatedMerge: %v", err)
+	}
+	if outcome != mergeDispatchAcceptanceNotReady {
+		t.Fatalf("outcome = %v (gate %q), want mergeDispatchAcceptanceNotReady", outcome, gateState)
+	}
+	if got := log.snapshot(); len(got) != 0 {
+		t.Fatalf("acceptance-gate refusal recorded %v, want nothing (no publish, no merge)", got)
+	}
+}
+
+// TestDispatchAcceptanceGatedMerge_NilMerger_NoRepublish pins the second
+// refusal path: the merge seam is unconfigured, so the function fails closed
+// BEFORE the republish. A refusal must not pay for a publish.
+func TestDispatchAcceptanceGatedMerge_NilMerger_NoRepublish(t *testing.T) {
+	log := &mergeOrderLog{}
+	s, r, stages := newGatedMergeRepublishServer(t, log, nil)
+
+	outcome, gateState, err := s.dispatchAcceptanceGatedMerge(context.Background(), r, stages, nil)
+	if err != nil {
+		t.Fatalf("dispatchAcceptanceGatedMerge: %v", err)
+	}
+	if outcome != mergeDispatchNoMerger {
+		t.Fatalf("outcome = %v (gate %q), want mergeDispatchNoMerger", outcome, gateState)
+	}
+	if got := log.snapshot(); len(got) != 0 {
+		t.Fatalf("nil-merger fail-closed recorded %v, want nothing (no publish, no merge)", got)
 	}
 }

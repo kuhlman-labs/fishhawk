@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -490,4 +493,126 @@ func TestListStageChecks_ResolvedArray(t *testing.T) {
 		}
 		t.Fatalf("no %s row in %s", AuditCompleteCheckName, w.Body.String())
 	})
+}
+
+// --- E64.42 / #3159: the two republish helpers ------------------------------
+
+// mergeOrderLog is the SHARED, ordered call log the pre-merge tests assert on.
+// Both the Check Run publisher fake and the merge seam fake append to ONE log,
+// so a test can assert the publish was recorded strictly BEFORE the merge
+// dispatch rather than merely that both happened. Presence-only assertions are
+// satisfied by a publish that lands AFTER the dispatch — which heals nothing,
+// because the stranded in_progress check is precisely what makes the dispatch
+// fail 409 merge_checks_pending.
+type mergeOrderLog struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (l *mergeOrderLog) record(what string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.entries = append(l.entries, what)
+}
+
+func (l *mergeOrderLog) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.entries...)
+}
+
+// indexOf returns the position of the first `what` entry, or -1.
+func (l *mergeOrderLog) indexOf(what string) int {
+	for i, e := range l.snapshot() {
+		if e == what {
+			return i
+		}
+	}
+	return -1
+}
+
+const (
+	mergeOrderPublish = "publish"
+	mergeOrderMerge   = "merge"
+)
+
+// orderedPublishGitHub is a CheckRunCreator that appends to the shared ordered
+// log. err, when non-nil, makes every publish fail (the best-effort tests).
+type orderedPublishGitHub struct {
+	log *mergeOrderLog
+	err error
+}
+
+func (g *orderedPublishGitHub) CreateCheckRun(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
+	g.log.record(mergeOrderPublish)
+	if g.err != nil {
+		return nil, g.err
+	}
+	return &githubclient.CreateCheckRunResult{ID: 1, HTMLURL: "https://github.com/x/y/runs/1"}, nil
+}
+
+// orderedLogMerger is a GitHubMerger that appends to the same shared log.
+type orderedLogMerger struct {
+	log    *mergeOrderLog
+	called int
+	err    error
+}
+
+func (m *orderedLogMerger) MergePullRequest(_ context.Context, _ *run.Run) error {
+	m.log.record(mergeOrderMerge)
+	m.called++
+	return m.err
+}
+
+// assertPublishPrecedesMerge is the shared ordering assertion.
+func assertPublishPrecedesMerge(t *testing.T, log *mergeOrderLog) {
+	t.Helper()
+	pub, mrg := log.indexOf(mergeOrderPublish), log.indexOf(mergeOrderMerge)
+	if pub < 0 {
+		t.Fatalf("no audit-complete publish recorded before the merge; log = %v", log.snapshot())
+	}
+	if mrg < 0 {
+		t.Fatalf("no merge dispatch recorded; log = %v", log.snapshot())
+	}
+	if pub > mrg {
+		t.Fatalf("publish recorded AFTER the merge dispatch; log = %v (healing after the dispatch is useless: "+
+			"the stranded in_progress check is what makes the dispatch fail)", log.snapshot())
+	}
+}
+
+// TestRepublishAuditCheckBeforeMerge_NilPublisher_NoPanic pins the dev /
+// legacy posture: with no ExternalURL (and so no publisher) the helper is a
+// clean no-op rather than a nil-pointer panic on the merge path.
+func TestRepublishAuditCheckBeforeMerge_NilPublisher_NoPanic(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditCompleteAuditFake()
+	arts := newFakeArtifactRepo()
+	r := seedPublishableRun(t, rr, au, arts, "abc12345")
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ArtifactRepo: arts,
+		StageCheckRepo: newFakeStageCheckRepo(),
+		// No ExternalURL → no publisher.
+	})
+	if s.auditCheckPublisher != nil {
+		t.Fatal("publisher should be nil without ExternalURL/GitHub; test cannot discriminate")
+	}
+	s.republishAuditCheckBeforeMerge(context.Background(), r.ID)
+}
+
+// TestRepublishAuditCheckOnRunTerminal_NilPublisher_NoPanic is the sibling for
+// the run-termination helper. Two separately-named functions means two
+// separately-deletable controls, so each needs its own nil-publisher pin.
+func TestRepublishAuditCheckOnRunTerminal_NilPublisher_NoPanic(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditCompleteAuditFake()
+	arts := newFakeArtifactRepo()
+	r := seedPublishableRun(t, rr, au, arts, "abc12345")
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ArtifactRepo: arts,
+		StageCheckRepo: newFakeStageCheckRepo(),
+	})
+	if s.auditCheckPublisher != nil {
+		t.Fatal("publisher should be nil without ExternalURL/GitHub; test cannot discriminate")
+	}
+	s.republishAuditCheckOnRunTerminal(context.Background(), r.ID)
 }

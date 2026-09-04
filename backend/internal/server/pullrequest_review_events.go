@@ -296,6 +296,19 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 			if len(moved) > 0 || s.runHasSupersededStage(ctx, target.ID) {
 				s.advanceRunAfterReviewResolve(ctx, target.ID)
 			}
+			// E64.42 / #3159 — republish fishhawk_audit_complete now the run
+			// has reached its terminal state. Merging removes the run from the
+			// merge reconciler's heal sweep (it enumerates only review stages
+			// parked at awaiting_approval), so a check a fix-up push left at
+			// `in_progress` would stay in_progress on the merged head forever.
+			// AFTER the Advance, deliberately: ComputeResult reports pending
+			// while any non-review stage is non-terminal, so a hoist above it
+			// recomputes to pending, which the publisher dedups against the
+			// already-published in_progress — NOTHING is posted and the stale
+			// check rides. BEFORE the notify / audit / economics tail so a
+			// failure in one of those cannot skip it. Best-effort; never
+			// unwinds the merge.
+			s.republishAuditCheckOnRunTerminal(ctx, target.ID)
 			// Sticky status comment (E20.4 / #330) — the audit row
 			// reflects the merge; the comment should too.
 			s.notifyStatusUpdate(ctx, target.ID, "pr_merged_no_review")
@@ -372,6 +385,20 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		// approval handler (approvals.go): best-effort, log an Advance
 		// error but never roll back the stage transition or audit row.
 		s.advanceRunAfterReviewResolve(ctx, target.ID)
+		// E64.42 / #3159 — republish fishhawk_audit_complete now the run has
+		// reached its terminal state. Merging removes the run from the merge
+		// reconciler's heal sweep (it enumerates only review stages parked at
+		// awaiting_approval, and this one is now succeeded), so a check a
+		// fix-up push left at `in_progress` would stay in_progress on the
+		// merged head forever. AFTER the Advance, deliberately: ComputeResult
+		// reports pending while any non-review stage is non-terminal, so a
+		// hoist above it recomputes to pending, which the publisher dedups
+		// against the already-published in_progress — NOTHING is posted and
+		// the stale check rides. Observed, not argued: the hoist turns
+		// TestResolveReviewStageOnMerge_RepublishesAuditCheckOnTermination
+		// RED. BEFORE the notify / audit / economics tail so a failure in one
+		// of those cannot skip it. Best-effort; never unwinds the merge.
+		s.republishAuditCheckOnRunTerminal(ctx, target.ID)
 		// Sticky status comment (E20.4 / #330). The PR merging is the
 		// terminal state for review-gated workflows; this is one of the
 		// most operator-visible moments of the run lifecycle.

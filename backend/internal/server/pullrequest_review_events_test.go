@@ -2033,3 +2033,68 @@ func TestResolveReviewStageOnMerge_NoReviewStage_AlreadySuperseded_ReEvaluatesTo
 		t.Errorf("acceptance stage state = %q, want superseded (unchanged by the redelivery)", got)
 	}
 }
+
+// --- E64.42 / #3159: the closed-WITHOUT-merge arm publishes nothing ---------
+
+// TestResolveReviewStageOnMerge_ClosedWithoutMerge_DoesNotRepublish pins the
+// arm the #3159 republish is DELIBERATELY absent from.
+//
+// The republish exists because merging removes the run from the merge
+// reconciler's heal sweep while leaving a required check stranded at
+// in_progress on a head that is now on the base branch. A PR closed WITHOUT
+// merging strands nothing: the change was not accepted, the head is not on the
+// base branch, and no branch-protection gate is waiting on the context. So
+// resolveReviewStageOnMerge's closed-without-merge arm (and the
+// checkImplementReviewSettled early return, pinned separately) must publish
+// NOTHING — a republish there would post a terminal conclusion onto an
+// abandoned head for no gate.
+//
+// This is a per-branch control, not a happy-path variant: adding the call to
+// the third arm leaves every other #3159 test green and only fails here.
+func TestResolveReviewStageOnMerge_ClosedWithoutMerge_DoesNotRepublish(t *testing.T) {
+	s, rr, _, gh, r, impl, _ := fixupRepublishFixture(t, true)
+	ctx := context.Background()
+	impl.State = run.StageStateSucceeded
+
+	raw, err := json.Marshal(map[string]any{
+		"action": "closed",
+		"pull_request": map[string]any{
+			"html_url": fixupRepublishPRURL,
+			"number":   1,
+			"merged":   false,
+			"head":     map[string]any{"sha": fixupHeadSHA},
+			"base":     map[string]any{"sha": "base0"},
+		},
+		"sender": map[string]any{"login": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	s.handlePullRequestClosed(ctx, raw)
+
+	// The arm genuinely ran — the review stage was cancelled — so a zero-call
+	// assertion below cannot pass vacuously.
+	if got := stageStateOnOrchestratorRepo(t, rr, r.ID, findReviewStageID(t, rr, r.ID)); got != run.StageStateCancelled {
+		t.Fatalf("review stage state = %q, want cancelled (the closed-without-merge arm did not run)", got)
+	}
+	if got := gh.calls(); len(got) != 0 {
+		t.Fatalf("closed-without-merge published %d check runs, want 0; statuses=%v",
+			len(got), publishStatuses(got))
+	}
+}
+
+// findReviewStageID returns the run's review stage id from the fake repo.
+func findReviewStageID(t *testing.T, rr *orchestratorRepo, runID uuid.UUID) uuid.UUID {
+	t.Helper()
+	sts, err := rr.ListStagesForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	for _, st := range sts {
+		if st.Type == run.StageTypeReview {
+			return st.ID
+		}
+	}
+	t.Fatalf("no review stage on run %s", runID)
+	return uuid.Nil
+}

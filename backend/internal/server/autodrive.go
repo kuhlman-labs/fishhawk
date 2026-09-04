@@ -387,6 +387,18 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 	if merger == nil {
 		return mergeDispatchNoMerger, gateState, nil
 	}
+	// E64.42 / #3159: recompute and republish fishhawk_audit_complete
+	// immediately BEFORE the dispatch, the same control handleMergeRun
+	// (merge_run.go) carries on the operator path. A fix-up push publishes
+	// `in_progress` against the new head and nothing is guaranteed to
+	// recompute between that synchronize and this merge; now that the check is
+	// REQUIRED, GitHub refuses to queue the merge while it is in_progress.
+	//
+	// Placement: AFTER acceptanceGateAdmitsMerge and AFTER the nil-merger
+	// fail-closed return, so neither refusal path pays for a publish, and a
+	// genuinely mid-flight run is refused by the acceptance gate before a
+	// recompute could report pending. Best-effort: never unwinds the dispatch.
+	s.republishAuditCheckBeforeMerge(ctx, runRow.ID)
 	return mergeDispatchMerged, gateState, merger.MergePullRequest(ctx, runRow)
 }
 
