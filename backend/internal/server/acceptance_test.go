@@ -381,6 +381,24 @@ func TestShipAcceptance_StaleAnchorAfterReopen_ClampsUndecidable(t *testing.T) {
 			wantVerdict: "passed", wantBasis: nil, wantHeadSHA: "posthead",
 		},
 		{
+			// m-equal: the reopen marker and the newest anchor stamped at the SAME
+			// sequence (@2). The production append path never produces this — a
+			// reopen marker always precedes its re-dispatch on a unique-per-entry
+			// chain — but a store or fake stamping duplicate sequences could, and the
+			// documented "at or below is stale" contract says the equal case is
+			// STALE. It fails CLOSED (undecidable), and is the counterfactual vehicle
+			// for the `restartSeq >= dispatchSeq` comparison: reverting it to `>`
+			// would let this leg proceed on the ambiguous anchor and record `passed`.
+			name: "m-equal",
+			seed: func(au *auditFake, runID, stageID uuid.UUID) {
+				seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{"head_sha": "prehead"})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 2, map[string]any{"stage_id": stageID.String()})
+				seedHeadEntry(au, runID, &stageID, CategoryAcceptanceReopened, 2, map[string]any{"stage_id": stageID.String()})
+			},
+			wantVerdict: acceptanceVerdictUndecidable,
+			wantBasis:   acceptanceUndecidableBasisHeadUnresolved, wantHeadSHA: "",
+		},
+		{
 			// m-none: no acceptance_reopened entry — the legacy / first-episode
 			// shape, byte-identically unaffected. Binds to the PR-open head.
 			name: "m-none",
@@ -483,11 +501,30 @@ func TestAcceptanceReopenedWriters_AreExactlyTheKnownSites(t *testing.T) {
 }
 
 // functionsWritingCategory parses every non-test .go file in the package and
-// returns the names of top-level functions whose body contains an
-// `audit.ChainAppendParams` (or any composite literal) with a `Category:` field
-// whose value is the identifier categoryConst. This targets the EMIT sites, not
-// the const declaration itself (which is a plain `const` spec, never a
-// `Category:` key-value).
+// returns the names of top-level functions whose body BINDS the identifier
+// categoryConst to a `Category` FIELD. It matches the two writer shapes that are
+// statically distinguishable from a read, so a maintainer who uses either cannot
+// silently make the #3176 staleness guard inert:
+//   - a composite-literal `Category: categoryConst` KeyValueExpr (the shape both
+//     current writers use — `audit.ChainAppendParams{… Category: …}`), and
+//   - a field assignment `x.Category = categoryConst` (an AssignStmt whose LHS is
+//     a `.Category` selector and whose RHS is the identifier), the evasion shape
+//     a params-then-assign writer would take.
+//
+// It targets the EMIT sites, not the const declaration (a plain `const` spec,
+// never a `Category` field binding) and not READS: a function that only PASSES
+// categoryConst as a plain argument (e.g. `ListForRunByCategory(…, categoryConst)`
+// in latestAcceptanceEpisodeRestartSeq) neither key-values nor assigns it to a
+// `.Category` field, so it is correctly NOT flagged.
+//
+// KNOWN RESIDUAL (documented per the #3176 fix-up concern): the ONE writer shape
+// this gate cannot see is a category emitted only THROUGH AN OPAQUE HELPER
+// ARGUMENT — a hypothetical `appendReopen(runID, categoryConst)` whose body key-
+// values it out of view. That argument is byte-indistinguishable from the read
+// above, so flagging it would false-positive every reader; a maintainer adding a
+// re-open path via such an indirection must update this gate by hand. Both
+// current writers use the composite-literal shape, which IS detected in both
+// directions, so the guard's totality holds today.
 func functionsWritingCategory(t *testing.T, categoryConst string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(".")
@@ -497,6 +534,17 @@ func functionsWritingCategory(t *testing.T, categoryConst string) []string {
 	fset := token.NewFileSet()
 	var out []string
 	seen := map[string]struct{}{}
+	// isCategoryConstIdent reports whether n is the bare identifier categoryConst.
+	isCategoryConstIdent := func(n ast.Expr) bool {
+		id, ok := n.(*ast.Ident)
+		return ok && id.Name == categoryConst
+	}
+	// isCategorySelector reports whether n selects a field named `Category`
+	// (matching the composite-literal key check `key.Name == "Category"`).
+	isCategorySelector := func(n ast.Expr) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		return ok && sel.Sel != nil && sel.Sel.Name == "Category"
+	}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -513,16 +561,24 @@ func functionsWritingCategory(t *testing.T, categoryConst string) []string {
 			}
 			writes := false
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				kv, ok := n.(*ast.KeyValueExpr)
-				if !ok {
-					return true
-				}
-				key, ok := kv.Key.(*ast.Ident)
-				if !ok || key.Name != "Category" {
-					return true
-				}
-				if val, ok := kv.Value.(*ast.Ident); ok && val.Name == categoryConst {
-					writes = true
+				switch node := n.(type) {
+				case *ast.KeyValueExpr:
+					// Composite-literal `Category: categoryConst`.
+					key, ok := node.Key.(*ast.Ident)
+					if ok && key.Name == "Category" && isCategoryConstIdent(node.Value) {
+						writes = true
+					}
+				case *ast.AssignStmt:
+					// Field assignment `x.Category = categoryConst` (index-parallel
+					// LHS/RHS; a multi-assign binds each field to its own RHS).
+					for i, lhs := range node.Lhs {
+						if i >= len(node.Rhs) {
+							break
+						}
+						if isCategorySelector(lhs) && isCategoryConstIdent(node.Rhs[i]) {
+							writes = true
+						}
+					}
 				}
 				return true
 			})

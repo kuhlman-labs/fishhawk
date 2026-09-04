@@ -1700,9 +1700,17 @@ func (s *Server) acceptanceValidatedHeadSHA(ctx context.Context, runID, stageID 
 			slog.String("error", rerr.Error()))
 		return "", false
 	}
-	if haveRestart && restartSeq > dispatchSeq {
-		// The newest anchor predates the current validation episode's re-open: it is
-		// a prior episode's anchor left in place by a failed re-dispatch append.
+	if haveRestart && restartSeq >= dispatchSeq {
+		// The newest anchor is AT OR BELOW the current validation episode's re-open:
+		// it is a prior episode's anchor left in place by a failed re-dispatch
+		// append. The comparison is `>=`, not `>`, to match the documented "at or
+		// below is stale" contract in all three prose sites (this comment, the
+		// function doc, and the README) and to fail CLOSED on the equal case: a
+		// store that ever stamped a reopen marker and a dispatch anchor at the SAME
+		// sequence (the production append path never does — the marker always
+		// precedes the re-dispatch on a unique-per-entry chain, so equality is
+		// unreachable there — but the plain auditFake stamps appends at 0) is then
+		// treated as stale rather than proceeding on an ambiguous anchor.
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"acceptance: newest dispatch anchor predates the current episode restart — treating validated head as unresolvable; the verdict will be clamped to undecidable",
 			slog.String("run_id", runID.String()),
