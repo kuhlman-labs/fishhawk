@@ -20,13 +20,17 @@ import (
 // serves only GET /v0/onboarding/readiness. lastRepo captures the last repo
 // query so tests assert the env fallback; status drives the HTTP status
 // (default 200); errBody, when set, is written verbatim for the error-path
-// tests; resp overrides the default echoed report.
+// tests; rawBody, when set, is written verbatim as a 200 body so a test can
+// serve a payload the Go struct cannot express (a response that OMITS
+// merge_gate, as a pre-#3161 fishhawkd does); resp overrides the default
+// echoed report.
 type doctorFakeBackend struct {
 	mu       sync.Mutex
 	lastRepo string
 	calls    int
 	status   int
 	errBody  string
+	rawBody  string
 	resp     *OnboardingReadinessReport
 }
 
@@ -40,11 +44,16 @@ func newDoctorFakeBackend(t *testing.T) (*doctorFakeBackend, *httptest.Server) {
 		fb.lastRepo = r.URL.Query().Get("repo")
 		status := fb.status
 		errBody := fb.errBody
+		rawBody := fb.rawBody
 		resp := fb.resp
 		fb.mu.Unlock()
 		w.WriteHeader(status)
 		if errBody != "" {
 			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if rawBody != "" {
+			_, _ = w.Write([]byte(rawBody))
 			return
 		}
 		if resp == nil {
@@ -271,6 +280,9 @@ func TestOnboardingReadinessReport_MergeGateMirrorsBackendTags(t *testing.T) {
 	if err := json.Unmarshal([]byte(mergeGateServerBody), &got); err != nil {
 		t.Fatalf("decode backend body: %v", err)
 	}
+	if got.MergeGate == nil {
+		t.Fatalf("MergeGate = nil, want the decoded object")
+	}
 	mg := got.MergeGate
 	if mg.Status != "required" {
 		t.Errorf("Status = %q, want required", mg.Status)
@@ -317,7 +329,7 @@ func TestDoctor_MergeGate_ReachesToolOutput(t *testing.T) {
 		Scopes: OnboardingScopes{
 			Adequate: true, Required: []string{"read:runs"}, Missing: []string{},
 		},
-		MergeGate: OnboardingMergeGate{
+		MergeGate: &OnboardingMergeGate{
 			Status: "unknown",
 			Check:  "fishhawk_audit_complete",
 			Reason: "administration_read_missing",
@@ -330,6 +342,9 @@ func TestDoctor_MergeGate_ReachesToolOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("doctor: %v", err)
 	}
+	if out.Report.MergeGate == nil {
+		t.Fatalf("MergeGate = nil, want the served object")
+	}
 	if out.Report.MergeGate.Status != "unknown" {
 		t.Errorf("MergeGate.Status = %q, want unknown", out.Report.MergeGate.Status)
 	}
@@ -338,6 +353,91 @@ func TestDoctor_MergeGate_ReachesToolOutput(t *testing.T) {
 	}
 	if out.Report.MergeGate.Check != "fishhawk_audit_complete" {
 		t.Errorf("MergeGate.Check = %q, want fishhawk_audit_complete", out.Report.MergeGate.Check)
+	}
+}
+
+// preMergeGateReadinessBody is the LITERAL 200 body a PRE-#3161 fishhawkd
+// serves: every field this build knows EXCEPT merge_gate, which that backend
+// has no code to emit. The explicitly supported older-backend compatibility
+// path — the one the CLI mirror pins with
+// TestDoctorOnboarding_MergeGateAbsent_EmitsNoRung and its explicit-null
+// sibling, and the one the MCP mirror had no coverage for at all, which is
+// exactly why the value-vs-pointer asymmetry survived review.
+//
+// It is a raw string rather than an OnboardingReadinessReport because the
+// omission is the whole point: the Go struct cannot express "no key".
+const preMergeGateReadinessBody = `{
+  "repo": "kuhlman-labs/fishhawk",
+  "app": {"installed": true, "installation_id": 4242},
+  "spec": {"source": "fetched", "valid": true},
+  "reviewers": [],
+  "scopes": {"adequate": true, "required": ["read:runs"], "missing": []}
+}`
+
+// nullMergeGateReadinessBody is the sibling shape: the key is PRESENT but
+// JSON null. Absent, null and empty are three distinct states; the first two
+// must both resolve to the same "this backend made no claim" outcome, and
+// neither may become the third by way of an empty-status verdict.
+const nullMergeGateReadinessBody = `{
+  "repo": "kuhlman-labs/fishhawk",
+  "app": {"installed": true, "installation_id": 4242},
+  "spec": {"source": "fetched", "valid": true},
+  "reviewers": [],
+  "scopes": {"adequate": true, "required": ["read:runs"], "missing": []},
+  "merge_gate": null
+}`
+
+// TestDoctor_MergeGateAbsent_PreservesAbsence walks the whole MCP tool path
+// against a backend response that carries NO merge_gate verdict, and pins the
+// invariant the routed regression names: the fishhawk_doctor report NEVER
+// carries a merge_gate whose status is the empty string.
+//
+// The control under test is the POINTER on
+// OnboardingReadinessReport.MergeGate. With a value field the decode produces
+// a zero-valued struct and DoctorOutput re-emits
+// `"merge_gate":{"status":"","check":"",...}` — a verdict outside the
+// documented required|not_required|unknown enum that no forge read ever
+// established. So the assertion is made on the RE-EMITTED WIRE BYTES, not only
+// on the in-memory field: a value field cannot satisfy it, while the in-memory
+// check alone would not even compile under the mutation.
+func TestDoctor_MergeGateAbsent_PreservesAbsence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"key_omitted", preMergeGateReadinessBody},
+		{"key_explicit_null", nullMergeGateReadinessBody},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newDoctorFakeBackend(t)
+			fb.rawBody = tc.body
+			r := newResolver(srv, nil)
+
+			_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "kuhlman-labs/fishhawk"})
+			if err != nil {
+				t.Fatalf("doctor: %v", err)
+			}
+			// Prove the body decoded — otherwise an absent merge_gate would be
+			// indistinguishable from a wholesale decode failure and the
+			// assertion below would pass for the wrong reason.
+			if out.Report.Repo != "kuhlman-labs/fishhawk" || !out.Report.App.Installed {
+				t.Fatalf("report did not decode: %+v", out.Report)
+			}
+			if out.Report.MergeGate != nil {
+				t.Errorf("MergeGate = %+v, want nil: the backend served no verdict, and nil is not the same claim as status unknown", *out.Report.MergeGate)
+			}
+
+			encoded, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal DoctorOutput: %v", err)
+			}
+			if strings.Contains(string(encoded), "merge_gate") {
+				t.Errorf("DoctorOutput re-emits a merge_gate the backend never served:\n%s", encoded)
+			}
+			if strings.Contains(string(encoded), `"status":""`) {
+				t.Errorf("DoctorOutput carries an empty-string status - a verdict outside required|not_required|unknown:\n%s", encoded)
+			}
+		})
 	}
 }
 
@@ -394,6 +494,10 @@ func TestDoctorToolDescription_DescribesMergeGate(t *testing.T) {
 		"merge_gate",
 		"required | not_required | unknown",
 		"NOT evidence the check is unrequired",
+		// The corrected backward-compat claim: the key is omitted, not
+		// zero-valued, against a pre-#3161 fishhawkd.
+		"OMITTED ENTIRELY against an older fishhawkd",
+		"never emitted with an empty status",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_doctor description missing %q:\n%s", want, desc)

@@ -856,7 +856,16 @@ type OnboardingReadinessReport struct {
 	Spec      OnboardingSpec       `json:"spec" jsonschema:"committed workflow spec fetch/parse/validate readiness"`
 	Reviewers []OnboardingReviewer `json:"reviewers" jsonschema:"per spec-declared reviewer availability on this deployment; empty when the spec is unavailable or invalid"`
 	Scopes    OnboardingScopes     `json:"scopes" jsonschema:"caller-token run-driving scope adequacy"`
-	MergeGate OnboardingMergeGate  `json:"merge_gate" jsonschema:"whether the fishhawk_audit_complete check Fishhawk publishes is actually REQUIRED by the repo protection on its default branch; zero-valued against an older fishhawkd that does not serve the field"`
+	// MergeGate is a POINTER, mirroring the CLI's `*mergeGateReadiness`
+	// (cli/cmd/fishhawk/doctor_onboarding.go): a pre-#3161 fishhawkd serves no
+	// `merge_gate` key at all, and absence must stay absence. A value field
+	// would decode that response into a zero-valued object whose `status` is
+	// "" — a verdict outside the documented required|not_required|unknown enum
+	// that no forge read ever established, which is the exact class of
+	// over-claim #3161 exists to remove. nil ("the backend did not answer this
+	// question") is not the same claim as "unknown" ("the question was asked
+	// and could not be settled"), so it is rendered as neither.
+	MergeGate *OnboardingMergeGate `json:"merge_gate,omitempty" jsonschema:"whether the fishhawk_audit_complete check Fishhawk publishes is actually REQUIRED by the repo protection on its default branch; ABSENT (omitted, not zero-valued) against an older fishhawkd that does not serve the field - absence means this backend cannot answer, which is NOT the same as status unknown, and the object is never emitted with an empty status"`
 }
 
 // OnboardingMergeGate mirrors the backend mergeGateReadiness sub-object
@@ -869,6 +878,10 @@ type OnboardingReadinessReport struct {
 // `administration: read`, a rulesets endpoint that 404s, an unevaluatable
 // ref_name condition, a transport error) and `reason` names which. An unknown
 // is NOT evidence that the check is unrequired.
+//
+// A nil *OnboardingMergeGate is a FOURTH state, distinct from all three: the
+// backend served no `merge_gate` key (a pre-#3161 fishhawkd), so this report
+// makes no claim about the merge gate at all.
 type OnboardingMergeGate struct {
 	Status           string                   `json:"status" jsonschema:"'required' (a protection source requires the check), 'not_required' (both surfaces answered and neither does), or 'unknown' (the question could not be settled - reason names why; NOT evidence the check is unrequired)"`
 	Check            string                   `json:"check" jsonschema:"the status-check context that was probed (fishhawk_audit_complete)"`

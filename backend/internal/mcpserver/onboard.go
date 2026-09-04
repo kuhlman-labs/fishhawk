@@ -80,7 +80,11 @@ returns five server-side-only checks the first feature_change run needs:
               check is unrequired. When required, sources[] names each surface
               that requires it with its OWN bypass posture; bypassable is true
               only when EVERY requiring source can be bypassed, since a merger
-              has to get past all of them.
+              has to get past all of them. The key is OMITTED ENTIRELY against
+              an older fishhawkd that does not serve it — that absence means
+              this backend cannot answer, which is NOT the same claim as
+              status unknown, and merge_gate is never emitted with an empty
+              status.
 
 repo defaults to GITHUB_REPOSITORY env when omitted. The endpoint gates on
 AUTHENTICATION only, so a token with a scope gap still gets a report naming its
