@@ -193,6 +193,10 @@ type fakeClient struct {
 	createPRErr  error
 	createPRHead string
 	createPRBase string
+	// createPRBody captures the body the scaffolder actually SENDS, so the
+	// #3161 merge-gate step is asserted on shipped output rather than on the
+	// prBody const a no-op touch could leave unwired.
+	createPRBody string
 	createPRURL  string
 }
 
@@ -255,10 +259,11 @@ func (f *fakeClient) ForceUpdateRef(_ context.Context, _ forge.CredentialScope, 
 	return f.forceUpdateErr
 }
 
-func (f *fakeClient) CreatePullRequest(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, head, base, _, _ string) (*githubclient.PullRequest, error) {
+func (f *fakeClient) CreatePullRequest(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, head, base, _, body string) (*githubclient.PullRequest, error) {
 	f.calls = append(f.calls, "CreatePullRequest")
 	f.createPRHead = head
 	f.createPRBase = base
+	f.createPRBody = body
 	if f.createPRErr != nil {
 		return nil, f.createPRErr
 	}
@@ -334,6 +339,36 @@ func TestOpenScaffoldPR_HappyPath(t *testing.T) {
 	}
 	if f.createPRHead != OnboardingBranch || f.createPRBase != "main" {
 		t.Errorf("PR head/base = %q/%q, want %q/main", f.createPRHead, f.createPRBase, OnboardingBranch)
+	}
+	assertScaffoldPRBodyNamesMergeGateStep(t, f.createPRBody)
+}
+
+// assertScaffoldPRBodyNamesMergeGateStep is the E64.44 / #3161 done-means
+// assertion on the scaffold PR copy. Installing the App does NOT make the
+// published fishhawk_audit_complete check enforce anything: the scaffold
+// installation holds no `administration: write`, so adding the check to branch
+// protection is a manual operator step. The scaffold PR is where an operator
+// first meets the product, so it is where that step has to be named — and it is
+// prose, which no compiler enforces, so it is pinned here on the body the
+// scaffolder actually sends.
+func assertScaffoldPRBodyNamesMergeGateStep(t *testing.T, body string) {
+	t.Helper()
+	if body == "" {
+		t.Fatal("scaffold PR body is empty — nothing to assert on")
+	}
+	for _, want := range []string{
+		// the check by its wire name
+		"fishhawk_audit_complete",
+		// why the scaffold cannot do it
+		"administration: write",
+		// the action the operator must take
+		"required status checks",
+		// how to confirm it landed
+		"fishhawk doctor",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scaffold PR body no longer names %q — the manual merge-gate step is the one thing the scaffold cannot do for the operator (#3161)\n\nbody:\n%s", want, body)
+		}
 	}
 }
 

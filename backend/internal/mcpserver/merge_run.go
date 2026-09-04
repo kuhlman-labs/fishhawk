@@ -89,11 +89,16 @@ type MergeRunOutput struct {
 	// gh step under the operator's OWN GitHub identity (option a, App-identity
 	// approval deferred to E39). Queueing the merge before that approval is
 	// safe — GitHub fires the merge once branch protection is satisfied.
-	Note string `json:"note" jsonschema:"the PR-approval review stays a gh step under your own GitHub identity; queueing the merge before approval is safe — GitHub fires it once branch protection is satisfied"`
+	//
+	// It also states the audit check honestly (E64.44 / #3161): Fishhawk
+	// PUBLISHES fishhawk_audit_complete; whether that check gates the merge is
+	// a property of the repository's branch protection, which fishhawk_doctor's
+	// merge_gate rung reports. Nothing here may assert it is required.
+	Note string `json:"note" jsonschema:"the PR-approval review stays a gh step under your own GitHub identity; queueing the merge before approval is safe — GitHub fires it once branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check; whether it gates the merge depends on this repository's branch protection — fishhawk_doctor's merge_gate rung reports what the forge enforces"`
 }
 
 // mergeRunNote is the split-identity reminder surfaced on every response.
-const mergeRunNote = "The PR-approval review (gh pr review --approve) stays a step under your own GitHub identity — App-identity approval is deferred to E39. Queueing the merge before approval is safe: GitHub fires the squash merge once branch protection (required review + the fishhawk_audit_complete check) is satisfied."
+const mergeRunNote = "The PR-approval review (gh pr review --approve) stays a step under your own GitHub identity — App-identity approval is deferred to E39. Queueing the merge before approval is safe: GitHub fires the squash merge once this repository's branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check; whether that check gates the merge depends on the repository's branch protection — fishhawk_doctor's merge_gate rung reports what the forge actually enforces (E64.44 / #3161)."
 
 // registerMergeRun wires the fishhawk_merge_run tool (E48.7 / #1954): the
 // one operator verb that takes a gate-approved run from verdict to
@@ -122,8 +127,11 @@ on resume with NO client-side skip.
 
 The PR-approval review itself STAYS a gh step under your own GitHub identity
 (App-identity approval is deferred to E39); queueing the merge before that
-approval is safe — GitHub fires the merge once branch protection (required
-review + the fishhawk_audit_complete check) is satisfied.
+approval is safe — GitHub fires the merge once this repository's branch
+protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check
+but does not make it required: whether it gates the merge is a property of the
+repository's branch protection, and fishhawk_doctor's merge_gate rung reports
+what the forge actually enforces (E64.44 / #3161).
 
 There is no persisted 'merged' run state — terminal-on-merge is succeeded —
 so the await keys on the pr_merged / post_merge_observed audit categories

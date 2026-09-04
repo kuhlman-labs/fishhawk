@@ -239,6 +239,18 @@ func TestMergeRun_HappyPath_MergedWithPostMergeStep(t *testing.T) {
 	if out.Note == "" {
 		t.Error("note is empty, want the split-identity gh-approval reminder")
 	}
+	// E64.44 / #3161: the note reaching the WIRE must not assert the audit
+	// check is required — Fishhawk publishes it, and whether it gates the
+	// merge is what fishhawk_doctor's merge_gate rung reports. The const is
+	// pinned by audit_check_wording_test.go; this asserts the shipped
+	// response carries the corrected text rather than a stale copy.
+	if strings.Contains(out.Note, "required fishhawk_audit_complete") ||
+		strings.Contains(out.Note, "required review + the fishhawk_audit_complete") {
+		t.Errorf("note over-claims the audit check as required (#3161): %q", out.Note)
+	}
+	if !strings.Contains(out.Note, "merge_gate") {
+		t.Errorf("note must point at the merge_gate rung that reports what the forge enforces (#3161): %q", out.Note)
+	}
 	if fb.mergeCalls != 1 {
 		t.Errorf("merge POSTed %d times, want exactly 1", fb.mergeCalls)
 	}

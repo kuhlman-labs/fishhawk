@@ -445,6 +445,78 @@ gh pr view <pr-number> --json state,mergedAt
 
 That is one issue, driven through five gates, to a merged pull request.
 
+## Make the check enforce
+
+Throughout the run Fishhawk posts a `fishhawk_audit_complete` Check Run on the
+pull request. It carries the audit verdict: the plan is on file, the trace
+bundle shipped, the agent review landed. What it does not do, on its own, is
+stop a merge. A Check Run is a report until the repository's branch protection
+makes it a required status check, and Fishhawk cannot make it one for you — the
+App installation holds no `administration: write` permission.
+
+Until you add it, gate 5 has a real hole. `fishhawk_merge_run` queues a GitHub
+auto-merge, and an auto-merge on a branch that does not require the check will
+fire as soon as the other protections clear — including while the agent review
+verdict is still pending. The audit trail records what happened; nothing stopped
+it.
+
+Add the check to a repository ruleset on your default branch:
+
+```sh
+gh api -X POST "repos/<owner>/<repo>/rulesets" --input - <<'JSON'
+{
+  "name": "fishhawk audit gate",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] }
+  },
+  "rules": [
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "required_status_checks": [
+          { "context": "fishhawk_audit_complete" }
+        ]
+      }
+    }
+  ]
+}
+JSON
+```
+
+If you already run branch protection through a ruleset, add the context to that
+one instead of creating a second — two rulesets both requiring the check is
+harmless but confusing to read later.
+
+A required check is not automatically an enforced one. A ruleset can carry
+`bypass_actors`, and classic branch protection with `enforce_admins: false`
+exempts every repository admin. Either one is a legitimate escape hatch and
+either one means somebody can merge past the gate.
+
+Confirm what the forge actually enforces rather than assuming the API call took:
+
+```sh
+fishhawk doctor --repo <owner>/<repo>
+```
+
+The `merge gate enforced` rung reads your branch protection and reconciles it
+against the check Fishhawk publishes. It reports one of three things:
+
+- **ok** — the check is required on the default branch, naming each protection
+  source that requires it and that source's own bypass condition.
+- **warn, not required** — the check is published and nothing enforces it. The
+  remediation names the exact context to add.
+- **warn, unknown** — the question could not be settled, with a reason. The App
+  installation may predate the `administration: read` permission, or the
+  rulesets endpoint may be unavailable on your GitHub Enterprise version. This
+  is not evidence the check is unrequired; it is evidence the doctor could not
+  look.
+
+Both warnings are non-fatal to the doctor's exit code. If you have decided this
+repository does not need the gate, you stay informed and unblocked.
+
 ## Troubleshooting
 
 ### The run looks stuck and no runner log exists

@@ -3568,8 +3568,13 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 		return fmt.Errorf("campaign auto-merge: %w", err)
 	}
 	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
-	// Primary: queue GitHub auto-merge so the PR lands once branch protection
-	// (required review + the fishhawk_audit_complete check) clears. The webhook
+	// Primary: queue GitHub auto-merge so the PR lands once the repository's
+	// branch protection clears. What that protection actually requires is a
+	// repo property, not a Fishhawk one (E64.44 / #3161): Fishhawk PUBLISHES
+	// the fishhawk_audit_complete check but does not make it required, so an
+	// auto-merge on a repo that does not require it can fire with the review
+	// verdict still pending. The onboarding-readiness merge_gate rung
+	// (backend/internal/mergegate) reports what the forge enforces. The webhook
 	// / resolveReviewStageOnMerge path settles the review stage on the merge.
 	err = m.gh.EnableAutoMerge(ctx, scope, repo, number, forge.MergeMethodSquash)
 	if err == nil {
