@@ -1547,6 +1547,7 @@ The report arm (`reportMatrixProposals`) emits an `act:"report"` `run_auto_drive
 - **`409 dispatch_not_admissible`** on a `running`/terminal/`awaiting_*` gate state (and on a CAS-loss whose winner moved the stage to any such state) — a live or settled stage can never be re-marked as a fresh spawn.
 - **Auth** mirrors the reap-failure endpoint: an authenticated identity carrying `write:runs` (anonymous → 401; a token without the scope → 403), with the auth ladder running BEFORE the nil-`RunRepo` guard (the #1915 revive convention) so config state never leaks pre-auth. A `(run_id, stage_id)` handle mismatch is `404 stage_not_found`.
 - The prompt-fetch liveness flip (`prompt.go::markStageRunningOnPromptFetch`) defensively walks a still-parked `awaiting_host_dispatch → dispatched → running` on the authenticated prompt fetch, so a version-skewed spawn whose marker call was skipped/lost still converges.
+- **Acceptance spawn anchor (E64.53 / #3174):** on the `transitioned:true` arm ONLY, and only for an `acceptance`-typed stage, the handler appends an `acceptance_dispatched` audit entry (`emitHostDispatchAcceptanceAnchor`) INSIDE the held admission lock. This is the LOCAL anchor `acceptanceValidatedHeadSHA` binds the verdict to; `orchestrator.Advance` no longer emits one for a parked local stage. Best-effort — nil-`AuditRepo` skips with a WARN and an append failure WARNs without unwinding the CAS or the 200. See the acceptance section for the full provenance contract and its two anchorless residuals.
 - **Admission fence (#1936):** when an `Orchestrator` is wired, the handler acquires the SAME per-stage `orchestrator.LockStageAdmission` mutex the acceptance-admission short-circuit walk holds, across its stage-load → eligibility → CAS, so a marker call landing mid-walk cannot observe the walk-intermediate `dispatched` and return `{transitioned:false}` while the walk settles the stage — it serializes behind the walk and then 409s on the settled stage. With no orchestrator wired no lock is taken (behavior unchanged). See the admission section above for the full fence contract.
 
 ### Startup orphaned-review reconcile (`review_reconcile.go`, #1781)
@@ -1769,7 +1770,11 @@ The E31.6 ship-handler detail; the cross-component seam overview is the "Accepta
   It appends an `acceptance_outcome_recorded` chained audit entry whose payload carries `verdict` + `failure_mode` (the E31.8 error-vs-assertion_fail carry-through) alongside the issue-comment render tags `outcome` (accepted/rejected) / `criteria_passed` / `criteria_total` (consumed by `issuecomment/status_template.go::renderAcceptanceOutcomeLine`, E31.3).
   Finishes with `notifyStatusUpdate` so the living anchor re-renders; a `201 acceptanceResponse{id, stage_id, content_hash, verdict, failure_mode, idempotent}`.
 - **NO stage-state transition** — the stage settles via the ordinary agent trace-bundle path (E31.2 landed acceptance with no new states); failure routing/triage is E31.8. Audit categories (`acceptance_dispatched`, `acceptance_outcome_recorded`) live in this file.
-- **Dispatch emit** `orchestrator.go::emitAcceptanceDispatched` — fired from `Advance` after `dispatchStage` successfully advances an `acceptance`-typed stage (both the agent fireDispatch path and the human awaiting-approval walk): a best-effort `acceptance_dispatched` entry (system actor, `{stage_id, sequence, executor}` payload; nil-Audit guard, WARN-on-error, never unwinds the dispatch).
+- **Dispatch emit — TWO sites, split by how the stage is actually spawned (E64.53 / #3174).**
+  - `orchestrator.go::emitAcceptanceDispatched` — fired from `Advance` after `dispatchStage` successfully advances an `acceptance`-typed stage on a BACKEND-TRIGGERED (github_actions) dispatch, agent fireDispatch path or human awaiting-approval walk: a best-effort `acceptance_dispatched` entry (system actor, `{stage_id, sequence, executor}` payload; nil-Audit guard, WARN-on-error, never unwinds the dispatch). Gated on `!parked` — a runner_kind-locked-local stage is PARKED at `awaiting_host_dispatch` (no spawn), and an emit there would anchor a dispatch that may never happen and duplicate the marker's own anchor for the same episode.
+  - `host_dispatch.go::emitHostDispatchAcceptanceAnchor` — fired from the host-dispatch marker for a LOCAL host spawn, on the `transitioned:true` arm ONLY, inside the held stage-admission lock. Payload is compatible-PLUS-DISCRIMINATOR with the orchestrator's: the same `{stage_id, sequence, executor}` keys plus `source: "host_dispatch"`. Same best-effort posture (nil-AuditRepo skip + WARN, WARN-on-append-error, never unwinds the CAS or the 200).
+  - **Why the split.** `reopenAcceptanceOnFixupPush` re-opens a settled acceptance stage via `run.ReopenAcceptanceStage` and never calls `Advance`, so before #3174 a LOCAL acceptance RE-dispatch wrote no new anchor at all — `latestAcceptanceDispatchSeq` stayed pinned at the ORIGINAL dispatch and the verdict bound to the PRE-fix-up head. Anchoring at the marker makes every local dispatch that TRANSITIONS the stage (first spawn, re-open spawn, fix-up re-dispatch) advance it. Pinned end to end by `TestAcceptanceSeam_LocalFixupRedispatch_BindsPostFixupHead`.
+  - **Disclosed shifts.** For a local run the entry's TIMESTAMP now marks the spawn rather than the park, so `latency.go`'s review→dispatch boundary includes the operator's park→spawn think-time (advisory metric, no test asserted the old timing). A local ship that never went through the marker now resolves NO anchor and is clamped to `undecidable` — fail-closed by design.
 - **Deliberately NO deploy-style pre-execution park and NO `advanceForDecision` special-case**: acceptance rides the ordinary `pending → dispatched` agent path and the generic `awaiting_approval` approve→succeeded / reject→failed-D gate semantics (contrast the deploy `awaiting_deploy_approval` park + `triggerDeploy` dispatch).
   Regression-pinned in `orchestrator_test.go` (dispatch, not park) and `approvals_test.go` (`TestAdvanceForDecision_AcceptanceStage_GenericGate`).
 - **Prompt seam** `prompt.go::buildAcceptance` renders an independent-validator preamble (validate the RUNNING instance; the diff is withheld for independence, ADR-049 #4), the issue context, the approved plan's `verification.acceptance_criteria` + `out_of_scope`, a target-instance section, and the structured-verdict output contract.
@@ -3193,6 +3198,20 @@ Three properties are deliberate:
   recorded AFTER the acceptance dispatch can never re-bind the verdict to a tree
   the stage did not validate
   (`TestShipAcceptance_PostDispatchIntegrationCommitDoesNotBind`).
+
+**Anchor provenance and the retained sequence bound (E64.53 / #3174).** The
+`acceptance_dispatched` anchor is written by `Advance` for a backend-triggered
+dispatch and by the host-dispatch marker for a local host spawn (see "Dispatch
+emit" above), so a re-opened stage's RE-dispatch advances it. The
+`e.Sequence <= dispatchSeq` bound in `acceptanceValidatedHeadSHA` is UNCHANGED by
+that fix and must NOT be loosened: it is what excludes a post-dispatch head from
+a verdict the stage never validated. Two anchorless residuals fall through to the
+clamp below — a local ship that never went through the marker, and a
+FIRST-dispatch anchor-append failure at the marker
+(`TestHostDispatchAnchorAppendFailure_ShipClampsUndecidable`). A RE-dispatch
+anchor-append failure instead leaves the STALE anchor in place, so #3174's
+wrong-head symptom recurs for that episode rather than clamping; it is
+WARN-logged at the marker and is NOT covered by that test.
 
 **The unbound-head clamp.** Resolution can still legitimately answer `""` — a
 bare operator ship with no `acceptance_dispatched` anchor, an unreadable ledger,

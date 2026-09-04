@@ -1,14 +1,25 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 )
+
+// hostDispatchAnchorSource is the acceptance_dispatched payload discriminator
+// identifying the host-dispatch marker as the emit site, distinguishing it from
+// orchestrator.emitAcceptanceDispatched's backend-triggered entry (which carries
+// no `source` field).
+const hostDispatchAnchorSource = "host_dispatch"
 
 // hostDispatchResponse is the 200 body of the host-dispatch marker endpoint
 // (#1912). Transitioned is true when this call drove the stage
@@ -296,11 +307,93 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Acceptance spawn anchor (E64.53 / #3174). THIS is the site that marks a
+	// real local spawn, so it is where the acceptance_dispatched anchor belongs
+	// for a host-dispatched run. Before this, the only emit site was
+	// orchestrator.Advance, which for a locked-local run fires at PARK time —
+	// and the fix-up re-open path (reopenAcceptanceOnFixupPush →
+	// run.ReopenAcceptanceStage) never calls Advance at all, so the acceptance
+	// RE-dispatch wrote no new anchor and latestAcceptanceDispatchSeq stayed
+	// pinned at the ORIGINAL dispatch. The verdict then bound to the PRE-fix-up
+	// head, because acceptanceValidatedHeadSHA's `e.Sequence <= dispatchSeq`
+	// bound filtered out the later fixup_pushed head. Emitting here makes every
+	// local dispatch that TRANSITIONS the stage — first spawn, re-open spawn,
+	// fix-up re-dispatch — advance the anchor.
+	//
+	// Deliberately NOT emitted on either idempotent {transitioned:false} arm
+	// (the early already-dispatched arm above and the post-CAS
+	// StageStateChangedError re-load arm): an anchor already exists from the
+	// first mark, so that is not an anchorless spawn, and a fix-up re-opens the
+	// stage to 'pending' — which makes the NEXT mark a real transition that DOES
+	// emit.
+	//
+	// Runs INSIDE the held stage-admission lock (deferred through this response
+	// write), so no concurrent admission walk interleaves between the CAS and
+	// the anchor.
+	if stage.Type == run.StageTypeAcceptance {
+		s.emitHostDispatchAcceptanceAnchor(r.Context(), runID, stage)
+	}
+
 	s.writeJSON(w, r, http.StatusOK, hostDispatchResponse{
 		Transitioned: true,
 		StageState:   string(updated.State),
 		BaseBranch:   baseBranch,
 	})
+}
+
+// emitHostDispatchAcceptanceAnchor writes the acceptance_dispatched audit entry
+// that anchors a LOCAL acceptance dispatch to the moment of the spawn (E64.53 /
+// #3174). The payload is compatible-plus-discriminator with
+// orchestrator.emitAcceptanceDispatched's — the same stage_id/sequence/executor
+// keys, plus a `source: "host_dispatch"` field so the two emit sites are
+// distinguishable in the ledger.
+//
+// Best-effort, mirroring the orchestrator's posture: a nil AuditRepo skips with
+// a WARN, and a failed append is logged at WARN and NEVER unwinds the CAS or
+// changes the 200 response — the stage is genuinely dispatched, and refusing
+// here would wedge it. The residual is disclosed rather than silently fixed: a
+// FIRST dispatch whose append fails leaves the stage anchorless, so the #3091
+// head_unresolved clamp records `undecidable` (fail-closed); a RE-dispatch whose
+// append fails leaves the STALE anchor in place, so the #3174 symptom recurs for
+// that episode.
+func (s *Server) emitHostDispatchAcceptanceAnchor(ctx context.Context, runID uuid.UUID, stage *run.Stage) {
+	if s.cfg.AuditRepo == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"host-dispatch: AuditRepo not configured; skipping acceptance_dispatched anchor",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()))
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"stage_id": stage.ID.String(),
+		"sequence": stage.Sequence,
+		"executor": string(stage.ExecutorKind),
+		"source":   hostDispatchAnchorSource,
+	})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"host-dispatch: marshal acceptance_dispatched payload failed; anchor not written",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	stageID := stage.ID
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryAcceptanceDispatched,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"host-dispatch: append acceptance_dispatched anchor failed; the acceptance verdict may bind to a stale or unresolvable head",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+	}
 }
 
 // isAutoMergeReviewStage mirrors orchestrator.isAutoMergeStage (unexported in

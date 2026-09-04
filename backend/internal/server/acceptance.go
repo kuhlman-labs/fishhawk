@@ -40,10 +40,16 @@ const maxAcceptanceBundleBytes = 32 * 1024
 // issuecomment/status_template.go already renders (acceptance_dispatched /
 // acceptance_outcome_recorded / acceptance_triage_decided, E31.3).
 const (
-	// CategoryAcceptanceDispatched records that the orchestrator dispatched an
-	// acceptance stage. EMITTED by the orchestrator (emitAcceptanceDispatched),
-	// not by this handler; the constant lives here so the outcome and the
-	// dispatch categories are defined together.
+	// CategoryAcceptanceDispatched records that an acceptance stage was
+	// DISPATCHED. TWO emit sites since E64.53 / #3174, split by how the stage is
+	// actually spawned: orchestrator.emitAcceptanceDispatched for a
+	// backend-triggered (github_actions) dispatch, and this package's
+	// host_dispatch.go::emitHostDispatchAcceptanceAnchor for a LOCAL host spawn
+	// (marked at the host-dispatch endpoint, which is where the spawn actually
+	// happens — the orchestrator only PARKS a local stage). Neither is the
+	// acceptance-outcome handler below. The constant lives here so the outcome
+	// and the dispatch categories are defined together, and it is what
+	// latestAcceptanceDispatchSeq reads to anchor the validated head.
 	CategoryAcceptanceDispatched = "acceptance_dispatched"
 	// CategoryAcceptanceSkippedOutOfScope records that the orchestrator
 	// AUTO-TERMINATED an acceptance stage (E38.3 / #1657) because the approved
@@ -1615,7 +1621,26 @@ func acceptanceStageOf(stages []*run.Stage) *run.Stage {
 // anchor (#3091).
 //
 // A re-opened acceptance stage carries more than one acceptance_dispatched
-// entry; the highest-sequence one is the current validation episode. Returns
+// entry; the highest-sequence one is the current validation episode.
+//
+// ANCHOR PROVENANCE (E64.53 / #3174). The anchor has TWO emit sites, split by
+// how the stage was actually spawned: orchestrator.Advance writes it for a
+// BACKEND-TRIGGERED (github_actions) dispatch, and the host-dispatch marker
+// (handleHostDispatchStage) writes it for a LOCAL host spawn, on the
+// transitioned arm only. That split is what makes a re-opened stage's
+// RE-dispatch advance the anchor: reopenAcceptanceOnFixupPush re-opens the
+// settled stage via run.ReopenAcceptanceStage and never calls Advance, so
+// before #3174 the local re-dispatch wrote no new entry and the anchor stayed
+// pinned at the ORIGINAL dispatch — binding the verdict to the PRE-fix-up head.
+// The `e.Sequence <= dispatchSeq` bound below is UNCHANGED by that fix and must
+// NOT be loosened: it is what excludes a post-dispatch head from a verdict the
+// stage never validated. Two residuals resolve to NO anchor and are therefore
+// clamped to `undecidable` by the #3091 head_unresolved path below — a local
+// ship that never went through the marker, and a FIRST-dispatch audit-append
+// failure at the marker. (A RE-dispatch append failure instead leaves the STALE
+// anchor in place; it is WARN-logged at the marker and is not clamped here.)
+//
+// Returns
 // ("", false) when no head is recorded at-or-before dispatch, or when the stage
 // has no dispatch entry (a bare operator ship with no orchestrator dispatch, or
 // a read error) — the caller then CLAMPS the recorded verdict (#3091): any
@@ -1659,7 +1684,11 @@ func (s *Server) acceptanceValidatedHeadSHA(ctx context.Context, runID, stageID 
 
 // latestAcceptanceDispatchSeq returns the highest audit sequence among the
 // run's acceptance_dispatched entries scoped to stageID, and whether any exist.
-// The dispatch anchor for acceptanceValidatedHeadSHA. A read error is reported
+// The dispatch anchor for acceptanceValidatedHeadSHA. Returning the LATEST
+// entry is load-bearing for the re-dispatch case (E64.53 / #3174): a fix-up
+// re-open leaves the first episode's entry on the chain, and the host-dispatch
+// marker appends a second one at the re-spawn, so the newest is the current
+// validation episode. A read error is reported
 // as (0, false) so the caller treats an unreadable anchor as "no anchor" and
 // records an empty head_sha (fail-closed for Option C), never a wrong head.
 func (s *Server) latestAcceptanceDispatchSeq(ctx context.Context, runID, stageID uuid.UUID) (int64, bool) {

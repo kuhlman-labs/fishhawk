@@ -53,6 +53,12 @@ Since E45.7 (ADR-058 / #1851) this lineage decision lives in [`runnerbackend.Res
 
 A `github_actions` child (inherited kind not `local`) resolves to the github_actions backend and fires its `workflow_dispatch` byte-identically; a resolved top-level run keeps the exact `#1912`/`#1346` behavior. `Local.TriggerStage` is the residual defensive locked-local skip the old `fireDispatch` carried.
 
+### `dispatchStage` reports the park; the acceptance anchor keys on it (E64.53 / #3174)
+
+`dispatchStage` returns `(Outcome, parked bool, error)`. `parked` is true ONLY on the `backend.HostDispatched()` branch above — the one that transitions a locked-local agent stage to `awaiting_host_dispatch` and returns `(OutcomeDispatched, nil)` with **no spawn having happened**. Every other return (auto-merge stage, human walk, agent `dispatched` + `TriggerStage`, and every error path) reports `parked=false`.
+
+`Advance` reads it to gate the `acceptance_dispatched` emit: `err == nil && !parked && next.Type == acceptance`. Rationale — a parked stage was never spawned, so an anchor written there names a dispatch that may never happen and, once `server/host_dispatch.go`'s marker writes its own anchor at the moment of the spawn, would be a SECOND anchor for the same validation episode. The duplicate misreports the dispatch count on the living-anchor timeline and shifts the review→dispatch latency boundary (`internal/latency` keys on this category). The LOCAL anchor is therefore owned solely by the host-dispatch marker, which is what makes a fix-up re-open's RE-dispatch advance it (`reopenAcceptanceOnFixupPush` never calls `Advance`). Pinned by `TestAdvance_AcceptanceStage_LocalLocked_ParksAndEmitsNoAnchor` (zero entries on the park) alongside the unchanged `TestAdvance_AcceptanceStage_DispatchesAndEmits` (exactly one on the github_actions path).
+
 ## Actions decomposed-child dispatch (E24.5 / #1145)
 
 For the `github_actions` backend the concurrent dispatch above is realized through the [`runnerbackend.GitHubActions`](../runnerbackend/README.md) backend's `TriggerStage` (formerly `fireDispatch`) — each child auto-advances and fires its OWN `workflow_dispatch` carrying its own `run_id`/`stage_id` against the base ref (`o.DefaultRef`, fallback `main`), bounded by the same `DispatchDecomposedChildren` cap.

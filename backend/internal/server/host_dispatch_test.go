@@ -123,6 +123,172 @@ func TestHostDispatch_AwaitingHostDispatch_MarksDispatched(t *testing.T) {
 	}
 }
 
+// hostDispatchAcceptanceServer wires the shared orchestratorRepo fake PLUS an
+// auditFake and seeds an ACCEPTANCE-typed stage in the given state — the
+// scaffolding for the E64.53 / #3174 spawn-anchor cases. seedStage mints a
+// plan-typed stage, so the type is set here (the fake stores pointers, so the
+// handler's GetStage observes it).
+func hostDispatchAcceptanceServer(t *testing.T, stageState run.StageState, stageType run.StageType) (*Server, *orchestratorRepo, *auditFake, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, stageState)
+	stage.Type = stageType
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	return s, rr, au, runRow.ID, stage.ID
+}
+
+// acceptanceDispatchEntries returns every acceptance_dispatched entry the fake
+// recorded for stageID.
+func acceptanceDispatchEntries(au *auditFake, stageID uuid.UUID) []audit.ChainAppendParams {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for _, p := range au.appended {
+		if p.Category == CategoryAcceptanceDispatched && p.StageID != nil && *p.StageID == stageID {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// t1 (E64.53 / #3174): marking a LOCAL acceptance stage
+// awaiting_host_dispatch -> dispatched appends EXACTLY ONE acceptance_dispatched
+// entry scoped to that stage. This is the spawn anchor the acceptance verdict's
+// head binding reads; before #3174 the local marker wrote nothing at all, so a
+// fix-up re-dispatch left the anchor pinned at the original dispatch.
+//
+// The payload assertion names EVERY key including the `source` discriminator —
+// the marker's payload is compatible-PLUS-DISCRIMINATOR with the orchestrator's,
+// not byte-compatible, so a silent drop of `source` must fail here.
+//
+// Counterfactual (c1/c3 vehicle): deleting the marker's emit drops this to 0.
+func TestHostDispatch_AcceptanceStage_AppendsDispatchAnchor(t *testing.T) {
+	s, rr, au, runID, stageID := hostDispatchAcceptanceServer(t, run.StageStateAwaitingHostDispatch, run.StageTypeAcceptance)
+
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); !resp.Transitioned {
+		t.Fatalf("transitioned = false, want true (the CAS is what the anchor rides on)")
+	}
+	entries := acceptanceDispatchEntries(au, stageID)
+	if len(entries) != 1 {
+		t.Fatalf("acceptance_dispatched entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.ActorKind == nil || *e.ActorKind != audit.ActorSystem {
+		t.Errorf("actor_kind = %v, want system", e.ActorKind)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("decode anchor payload: %v (%s)", err, e.Payload)
+	}
+	stage, _ := rr.GetStage(context.Background(), stageID)
+	want := map[string]any{
+		"stage_id": stageID.String(),
+		"sequence": float64(stage.Sequence),
+		"executor": string(run.ExecutorAgent),
+		"source":   "host_dispatch",
+	}
+	if !reflect.DeepEqual(payload, want) {
+		t.Errorf("anchor payload = %#v, want %#v (compatible-plus-discriminator with the orchestrator's stage_id/sequence/executor, plus source)", payload, want)
+	}
+}
+
+// t2 / m1 (E64.53 / #3174): a REPEAT marker call against the now-dispatched
+// stage takes the idempotent arm — {transitioned:false} — and appends NO second
+// anchor. An anchor already exists from the first mark, so this is not an
+// anchorless spawn; a fix-up re-opens the stage to 'pending', which makes the
+// NEXT mark a real transition that DOES emit.
+//
+// Counterfactual (c4): emitting on the idempotent arm too makes this report 2.
+func TestHostDispatch_AcceptanceStage_RepeatMark_NoSecondAnchor(t *testing.T) {
+	s, _, au, runID, stageID := hostDispatchAcceptanceServer(t, run.StageStateAwaitingHostDispatch, run.StageTypeAcceptance)
+
+	if w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator); w.Code != http.StatusOK {
+		t.Fatalf("first mark status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("repeat mark status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); resp.Transitioned {
+		t.Errorf("repeat mark transitioned = true, want false (idempotent arm)")
+	}
+	if n := len(acceptanceDispatchEntries(au, stageID)); n != 1 {
+		t.Errorf("acceptance_dispatched entries after a repeat mark = %d, want 1 (the idempotent arm writes no second anchor)", n)
+	}
+}
+
+// t3 / m3 (E64.53 / #3174): marking a NON-acceptance stage appends ZERO
+// acceptance_dispatched entries — the anchor is acceptance-scoped, and an
+// implement/plan spawn must not fabricate one.
+//
+// Counterfactual (c3): deleting the stage-type filter makes this non-zero.
+func TestHostDispatch_NonAcceptanceStage_AppendsNoAnchor(t *testing.T) {
+	s, _, au, runID, stageID := hostDispatchAcceptanceServer(t, run.StageStateAwaitingHostDispatch, run.StageTypeImplement)
+
+	if w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(acceptanceDispatchEntries(au, stageID)); n != 0 {
+		t.Errorf("acceptance_dispatched entries for an implement stage = %d, want 0", n)
+	}
+}
+
+// t4 / m2 (server half) (E64.53 / #3174): an AuditRepo whose AppendChained
+// fails still yields 200 {transitioned:true} and leaves the stage dispatched.
+// The anchor is best-effort — the stage is genuinely dispatched, and unwinding
+// the CAS here would wedge it. The head-binding consequence of the missing
+// anchor (a shipped `passed` recorded `undecidable`) is asserted in
+// acceptance_test.go's TestHostDispatchAnchorAppendFailure_ShipClampsUndecidable.
+func TestHostDispatch_AcceptanceStage_AnchorAppendFails_StillDispatches(t *testing.T) {
+	s, rr, au, runID, stageID := hostDispatchAcceptanceServer(t, run.StageStateAwaitingHostDispatch, run.StageTypeAcceptance)
+	au.appendErrCategory = CategoryAcceptanceDispatched
+
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a failed anchor append never unwinds the CAS):\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+	}
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("persisted state = %q, want dispatched", cur.State)
+	}
+	if n := len(acceptanceDispatchEntries(au, stageID)); n != 0 {
+		t.Errorf("acceptance_dispatched entries = %d, want 0 (the append was injected to fail)", n)
+	}
+}
+
+// t5 (E64.53 / #3174): a server with NO AuditRepo still marks an acceptance
+// stage dispatched — the anchor emit's nil-repo guard WARN-skips and never
+// unwinds the CAS, mirroring the orchestrator's nil-Audit posture. Without the
+// guard this would nil-panic inside the handler.
+func TestHostDispatch_AcceptanceStage_NilAuditRepo_StillDispatches(t *testing.T) {
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingHostDispatch)
+	stage.Type = run.StageTypeAcceptance
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr}) // AuditRepo deliberately nil
+
+	w := postHostDispatch(t, s, runRow.ID, stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+	}
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("persisted state = %q, want dispatched", cur.State)
+	}
+}
+
 // Happy path (b): the first plan-stage spawn marks a still-pending stage
 // dispatched (the local first-stage sits at pending until trace time, #1030).
 func TestHostDispatch_Pending_MarksDispatched(t *testing.T) {
