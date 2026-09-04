@@ -135,9 +135,11 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 
 	// ADR-017 (#249, #253): the approval gate no longer reads
 	// stage_check state. Reviewers approve based on plan + diff;
-	// GitHub branch protection blocks the merge until the required
-	// checks (including fishhawk_audit_complete, published per
-	// #231) report green.
+	// GitHub branch protection blocks the merge until the repo's
+	// required checks report green. fishhawk_audit_complete is
+	// PUBLISHED (#231); whether it is among those required checks
+	// is the repository's own branch-protection configuration,
+	// reported by the merge_gate readiness rung (E64.44 / #3161).
 
 	// Over-cap approve-comment refusal (#2583). The slash-command channel
 	// records p.Comment as the approve decision's comment, which is injected

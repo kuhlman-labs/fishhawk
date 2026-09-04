@@ -46,7 +46,8 @@ type InitOutput struct {
 // counterpart to the CLI `fishhawk doctor` (E29.4/E29.5). It wraps
 // GET /v0/onboarding/readiness so a connecting Claude Code agent can drive a
 // conversational "help me onboard a repo" flow — one onboarding engine, another
-// frontend. Read-only per ADR-021.
+// frontend. Read-only per ADR-021. Five checks since #3161, the fifth being the
+// merge-gate reconciliation of the published check against the forge.
 func registerDoctor(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_doctor",
@@ -54,7 +55,7 @@ func registerDoctor(srv *mcp.Server, resolver *runResolver) {
 Use this when onboarding a repository to Fishhawk and you need its first-run
 readiness before starting a run — the in-band counterpart to the CLI
 ` + "`fishhawk doctor`" + ` (E29.4/E29.6). It wraps GET /v0/onboarding/readiness and
-returns four server-side-only checks the first feature_change run needs:
+returns five server-side-only checks the first feature_change run needs:
 
   - app     — is the GitHub App installed on the target repo (installation_id
               when it is, a reason when it is not).
@@ -68,6 +69,22 @@ returns four server-side-only checks the first feature_change run needs:
   - scopes  — whether the caller token holds the run-driving scope subset
               (adequate, required[], missing[]); a cookie-session caller
               bypasses scope enforcement and is adequate by construction.
+  - merge_gate — a FORGE-CONFIG read (#3161): does the repo's protection on its
+              REAL default branch actually REQUIRE the fishhawk_audit_complete
+              Check Run Fishhawk publishes? status is required | not_required |
+              unknown. Read it FAIL-CLOSED: "unknown" means the question could
+              NOT be settled — no installation, a 403 from a missing
+              ` + "`administration: read`" + ` scope, a rulesets endpoint that 404s, a
+              ref_name condition this version cannot evaluate, or a transport
+              error — and reason names which. An unknown is NOT evidence the
+              check is unrequired. When required, sources[] names each surface
+              that requires it with its OWN bypass posture; bypassable is true
+              only when EVERY requiring source can be bypassed, since a merger
+              has to get past all of them. The key is OMITTED ENTIRELY against
+              an older fishhawkd that does not serve it — that absence means
+              this backend cannot answer, which is NOT the same claim as
+              status unknown, and merge_gate is never emitted with an empty
+              status.
 
 repo defaults to GITHUB_REPOSITORY env when omitted. The endpoint gates on
 AUTHENTICATION only, so a token with a scope gap still gets a report naming its
@@ -114,7 +131,7 @@ tiers.
 
 // doctor is the fishhawk_doctor tool handler. It resolves repo from the env
 // when omitted (a fast local fail before the HTTP hop when neither is present)
-// and delegates the four readiness probes to the backend, mapping the two 4xx
+// and delegates the five readiness probes to the backend, mapping the two 4xx
 // surfaces onto clean tool errors.
 func (r *runResolver) doctor(ctx context.Context, _ *mcp.CallToolRequest, in DoctorInput) (*mcp.CallToolResult, DoctorOutput, error) {
 	repo := strings.TrimSpace(in.Repo)

@@ -76,11 +76,14 @@ onboarding-as-data).
 
 Two thin tools (E29.6) wrap the E29 onboarding engine so a connecting Claude Code agent can drive a conversational "help me onboard a repo" flow — **one engine, another frontend** (the CLI `fishhawk doctor` / `fishhawk init` and the App-PR path are the other frontends). Both live in `onboard.go`.
 
-- **`fishhawk_doctor`** (read-only) wraps `GET /v0/onboarding/readiness` (E29.4 / [#1511](https://github.com/kuhlman-labs/fishhawk/issues/1511)) and returns the `report` — the four server-side-only readiness checks a repo's first `feature_change` run needs, which the agent cannot introspect locally:
+- **`fishhawk_doctor`** (read-only) wraps `GET /v0/onboarding/readiness` (E29.4 / [#1511](https://github.com/kuhlman-labs/fishhawk/issues/1511)) and returns the `report` — the five server-side-only readiness checks a repo's first `feature_change` run needs, which the agent cannot introspect locally:
   - `app` — `{installed, installation_id?, reason?}`: is the GitHub App installed on the target repo.
   - `spec` — `{source, valid, error?, note?}`: the committed `.fishhawk/workflows.yaml` fetch + parse + validate state (`source` is `fetched` or `unavailable`; `valid` is only meaningful when fetched). Only checked once the app is installed.
   - `reviewers[]` — `{provider, model?, reasoning_effort?, available, missing_hint?}`: per spec-declared reviewer availability on **this** deployment, with the adapter's missing-env-var hint when a provider can't be resolved. Empty when the spec is unavailable or invalid.
   - `scopes` — `{adequate, required[], missing[], note?}`: whether the caller token holds the run-driving scope subset. A cookie-session caller bypasses scope enforcement and is adequate by construction.
+  - `merge_gate` — `{status, check, branch, required_contexts[], sources[], bypassable, reason?, remediation?}` (E64.44 / [#3161](https://github.com/kuhlman-labs/fishhawk/issues/3161)): whether the forge actually **requires** the `fishhawk_audit_complete` check Fishhawk publishes. `status` is `required` / `not_required` / `unknown`, and it is FAIL-CLOSED — every degrade (App not installed, no GitHub client, default branch unresolvable, rulesets 404, an un-evaluatable `ref_name` token, a 403 for a missing `administration: read`, a transport error, a probe timeout) resolves to `unknown` with a naming `reason`, NEVER to `not_required`. `unknown` is not a claim the check is unrequired; it is a statement that the question could not be settled. `sources[]` carries each requiring protection surface with ITS OWN bypass posture, and `bypassable` is the AND over them — a source with no bypass path still enforces the check. Reporting only: it gates no run and no exit code. Long-form: `backend/internal/mergegate/README.md` and `backend/internal/server/README.md`.
+
+    **The key is OPTIONAL, and absence is a FOURTH state.** A pre-#3161 fishhawkd serves no `merge_gate` key at all, so `OnboardingReadinessReport.MergeGate` is a `*OnboardingMergeGate` with `json:"merge_gate,omitempty"` — mirroring the CLI's `*mergeGateReadiness` — and the tool re-emits **no key** rather than a zero-valued object. A value field would decode the missing key into `{"status":"","check":"",…}`: a verdict outside the `required|not_required|unknown` enum that no forge read ever established, which is the same class of over-claim #3161 exists to remove, reappearing on the compatibility path. Absence means *this backend cannot answer* and is NOT the same claim as `unknown` (*the question was asked and could not be settled*), so it is rendered as neither. The invariant — the report never carries a `merge_gate` whose `status` is the empty string — is pinned on the re-emitted wire bytes by `TestDoctor_MergeGateAbsent_PreservesAbsence` (omitted key and explicit `null`), the MCP counterpart to the CLI's `TestDoctorOnboarding_MergeGateAbsent_EmitsNoRung`.
 
   `repo` falls back to `GITHUB_REPOSITORY` when omitted (a fast local fail when neither is present, before the HTTP hop). The endpoint gates on **authentication only** (401 anonymous) — scope adequacy is itself a reported field, so a scope-gapped token still gets a report naming its gap rather than a 403. Backend 4xx map onto clean tool errors: `authentication_required` (401, with a `FISHHAWK_API_TOKEN` pointer) and `validation_failed` (400, malformed repo).
 
@@ -94,6 +97,26 @@ house-style tool-count guard to 39; tests live in `onboard_test.go` (the low `cl
 coverage). The planned `.claude/skills/onboarding/SKILL.md` conversational-entry seed is DEFERRED — `.claude/` is
 gitignored repo-wide, so the skill file cannot be committed; the onboarding frontend ships in full via the two tools
 regardless, and the skill is a follow-up if the repo later tracks `.claude/`.
+
+## The audit-check wording sweep (E64.44 / [#3161](https://github.com/kuhlman-labs/fishhawk/issues/3161))
+
+Fishhawk **publishes** a `fishhawk_audit_complete` Check Run on every run's pull request. Whether that check *gates the merge* is a property of the repository's branch protection, not of Fishhawk — and nothing read the forge to find out until #3161. Five operator-facing strings in this package asserted the check was **required** anyway, and on this repository that claim was false for the entire dogfood period.
+
+The claim is not cosmetic. `backend/internal/server/merge_run.go` has no server-side implement-review gate (`resolveReviewStageOnMerge` settles the review stage ON the merge), and `auditcomplete` rule 6 — the pre-merge review-presence gate — is enforced ONLY by the published Check Run. With the check unrequired, `fishhawk_merge_run` queues an auto-merge that fires with the review verdict still pending.
+
+Every swept string now states what is true: Fishhawk publishes the check, and `fishhawk_doctor`'s `merge_gate` rung reports what the forge actually enforces.
+
+| Surface | Where |
+|---|---|
+| `mergeRunNote` — the note on every `fishhawk_merge_run` response | `merge_run.go` |
+| the `fishhawk_merge_run` tool description body | `merge_run.go` |
+| the `merge_pr` next-action `Precondition` (`mergeRunAction`) | `next_actions.go` |
+| `implementReviewMergeHint`'s returned hint | `review_action_hint.go` |
+| `ImplementReviewMergeHint`'s jsonschema description **and** the `fishhawk_get_run_status` description paragraph that restates it | `tools.go` |
+
+**This is prose, which no compiler enforces, so it is pinned by a done-means test.** `audit_check_wording_test.go` asserts on the SHIPPED strings — the registered tool descriptions walked over a real in-memory MCP session, plus the constant, the returned hint, the built `Precondition` and the two jsonschema struct tags — and fails on any banned over-claim (`required fishhawk_audit_complete`, `required review + the fishhawk_audit_complete`, `the fishhawk_audit_complete check is required`, `branch protection blocks the merge`). It ALSO asserts the positive half: each swept surface must still name `fishhawk_audit_complete` AND point at the `merge_gate` rung, so deleting the word "required" without pointing at the reconciliation fails too. Because it reads output rather than source, a comment-only or otherwise no-op touch of a swept file cannot satisfy it (the #1169 gap the scope-completeness gate leaves open).
+
+The `fishhawk_merge_run` description's `checks_pending` status text is deliberately NOT swept: "the pull request's required checks have not all passed" describes GitHub's own `mergeable_state` semantics, which is accurate whether or not our check is among them. `backend/internal/server/merge_run.go` was inspected for the same reason and left unchanged — its `required` references are all statements about GitHub, not about Fishhawk's check.
 
 ## Stage-execution wait contract ([ADR-037](https://github.com/kuhlman-labs/fishhawk/issues/879), #880)
 

@@ -1008,7 +1008,11 @@ func TestFixupRefundedPasses_OneRefundPerTriggerWindow(t *testing.T) {
 // display-only merge-readiness warning surfaced ONLY while the implement-stage
 // agent review is pending (dispatched, no verdict). It mirrors the backend's
 // review-pending presence gate; once the review reaches any terminal status
-// the hint is empty (the required fishhawk_audit_complete check flips green).
+// the hint is empty (the published fishhawk_audit_complete check flips green).
+//
+// The hint's WORDING — that it names the published check and the conditional
+// merge_gate rung rather than asserting the check is required — is pinned
+// separately by audit_check_wording_test.go (E64.44 / #3161).
 func TestImplementReviewMergeHint(t *testing.T) {
 	tests := []struct {
 		name     string

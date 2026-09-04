@@ -67,6 +67,16 @@ It seeds the files a repository needs to run changes through Fishhawk:
 - ` + "`CLAUDE.md`" + ` — imports AGENTS.md so Claude Code picks up the same instructions.
 - ` + "`.github/workflows/fishhawk.yml`" + ` — the GitHub Actions workflow Fishhawk dispatches to run a stage. It references the published ` + "`kuhlman-labs/fishhawk/runner`" + ` action.
 
+One step this pull request cannot perform for you: making the audit check
+enforce. Fishhawk posts a ` + "`fishhawk_audit_complete`" + ` Check Run on every run's
+pull request, but the scaffold App installation holds no ` + "`administration: write`" + `
+permission, so it cannot add that check to your branch protection. Until you add
+it yourself, the check reports its verdict and nothing stops a merge from landing
+while that verdict is still pending. Add ` + "`fishhawk_audit_complete`" + ` to the
+required status checks on your default branch, then run ` + "`fishhawk doctor`" + ` — its
+merge-gate rung reports what the forge actually enforces, including whether a
+bypass entry can get past it.
+
 Review the files, adjust the autonomy tier if needed, and merge to finish onboarding.
 `
 )

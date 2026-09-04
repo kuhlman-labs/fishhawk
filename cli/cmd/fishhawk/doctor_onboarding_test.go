@@ -575,3 +575,237 @@ func TestCheckExecutionPath_MalformedYAML(t *testing.T) {
 		t.Errorf("remediate = %q, want a `fishhawk validate` hint", r.remediate)
 	}
 }
+
+// --- merge gate rung, check (5) (#3161) ---
+
+// mergeGateBackendBody is the LITERAL body the backend's end-to-end server
+// test asserts on the wire (backend/internal/server/onboarding_test.go's
+// TestOnboardingReadiness_MergeGate_EndToEnd fixture). Feeding the SAME bytes
+// through checkOnboardingReadiness closes the mirror-drift seam: a json-tag
+// typo on the CLI side zero-values a field and the render assertions go red.
+const mergeGateBackendBody = `{
+  "repo": "kuhlman-labs/fishhawk",
+  "app": {"installed": true, "installation_id": 42},
+  "spec": {"source": "fetched", "valid": true},
+  "reviewers": [{"provider": "anthropic", "model": "claude-opus-4-8", "available": true}],
+  "scopes": {"adequate": true, "required": ["read:runs"], "missing": []},
+  "merge_gate": {
+    "status": "required",
+    "check": "fishhawk_audit_complete",
+    "branch": "main",
+    "sources": [
+      {"identity": "branch_protection", "classic": true, "bypass_entries": 0,
+       "enforce_admins": true, "bypassable": false},
+      {"identity": "ruleset:42", "bypass_entries": 2, "bypassable": true}
+    ],
+    "bypassable": false,
+    "authoritative": true,
+    "required_contexts": ["fishhawk_audit_complete", "ci"]
+  }
+}`
+
+// readinessRungs drives checkOnboardingReadiness against a canned body.
+func readinessRungs(t *testing.T, repo, body string) []checkResult {
+	t.Helper()
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, body), nil
+	})
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", repo)
+	return results
+}
+
+// TestCheckOnboardingReadiness_MergeGateRequired asserts the ok rung and the
+// per-source bypass rendering, driven off the backend's own literal body.
+//
+// The two rendering rules binding condition 1 turns on are asserted here: a
+// ruleset's bypass_actors are reported as "bypass entries (roles, teams or
+// apps)" and NEVER as a count of people, and the classic source's admin
+// exemption is a named condition, never a bypass count.
+func TestCheckOnboardingReadiness_MergeGateRequired(t *testing.T) {
+	results := readinessRungs(t, "kuhlman-labs/fishhawk", mergeGateBackendBody)
+	mg := findCheck(t, results, "merge gate enforced")
+	if mg.status != "ok" {
+		t.Errorf("merge gate status = %q, want ok (detail: %s)", mg.status, mg.detail)
+	}
+	if !strings.Contains(mg.detail, "required on main") {
+		t.Errorf("merge gate detail = %q, want it to name the branch", mg.detail)
+	}
+	if !strings.Contains(mg.detail, "branch_protection") ||
+		!strings.Contains(mg.detail, "ruleset:42") {
+		t.Errorf("merge gate detail = %q, want both requiring sources named", mg.detail)
+	}
+	if !strings.Contains(mg.detail, "2 bypass entries (roles, teams or apps)") {
+		t.Errorf("merge gate detail = %q, want the ruleset's bypass ENTRIES phrasing", mg.detail)
+	}
+	if !strings.Contains(mg.detail, "each of which may cover multiple people") {
+		t.Errorf("merge gate detail = %q, want the entry-is-not-a-person caveat", mg.detail)
+	}
+	// A bypass entry is never rendered as a headcount.
+	if strings.Contains(mg.detail, "bypassable by") || strings.Contains(mg.detail, "actors") {
+		t.Errorf("merge gate detail = %q, must not render entries as a count of actors/people", mg.detail)
+	}
+	// The classic source enforces admins here, so it carries no bypass note
+	// and is NOT coerced into a count of 1.
+	if strings.Contains(mg.detail, "branch_protection: 1 bypass") ||
+		strings.Contains(mg.detail, "branch_protection: repository admins are exempt") {
+		t.Errorf("merge gate detail = %q, classic enforces admins: no exemption should be rendered", mg.detail)
+	}
+}
+
+// TestCheckOnboardingReadiness_MergeGateClassicAdminsExempt asserts the
+// classic exemption renders as its OWN named condition — "repository admins
+// are exempt" — and never as a bypass-entry count.
+func TestCheckOnboardingReadiness_MergeGateClassicAdminsExempt(t *testing.T) {
+	body := `{
+	  "repo": "owner/name",
+	  "app": {"installed": true},
+	  "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [],
+	  "scopes": {"adequate": true},
+	  "merge_gate": {
+	    "status": "required", "check": "fishhawk_audit_complete", "branch": "main",
+	    "sources": [{"identity": "branch_protection", "classic": true,
+	                 "bypass_entries": 0, "enforce_admins": false, "bypassable": true}],
+	    "bypassable": true, "authoritative": true,
+	    "remediation": "Every source requiring this check can be bypassed."
+	  }
+	}`
+	mg := findCheck(t, readinessRungs(t, "owner/name", body), "merge gate enforced")
+	if mg.status != "ok" {
+		t.Errorf("status = %q, want ok (the check IS required)", mg.status)
+	}
+	if !strings.Contains(mg.detail, "branch_protection: repository admins are exempt") {
+		t.Errorf("detail = %q, want the admin exemption as its own named condition", mg.detail)
+	}
+	if strings.Contains(mg.detail, "1 bypass") {
+		t.Errorf("detail = %q, the admin exemption must never be coerced into a count of 1", mg.detail)
+	}
+	if mg.remediate == "" {
+		t.Errorf("remediate empty, want the server's narrow-the-bypass step to ride along")
+	}
+}
+
+// TestCheckOnboardingReadiness_MergeGateNotRequired asserts the warn rung and
+// that the server's remediation is surfaced as the hint. warn is non-fatal to
+// the doctor's exit code (only "fail" counts), so an operator who deliberately
+// opts out is informed rather than blocked.
+func TestCheckOnboardingReadiness_MergeGateNotRequired(t *testing.T) {
+	body := `{
+	  "repo": "owner/name",
+	  "app": {"installed": true},
+	  "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [],
+	  "scopes": {"adequate": true},
+	  "merge_gate": {
+	    "status": "not_required", "check": "fishhawk_audit_complete", "branch": "trunk",
+	    "authoritative": true,
+	    "remediation": "Add \"fishhawk_audit_complete\" to the required status checks for \"trunk\""
+	  }
+	}`
+	mg := findCheck(t, readinessRungs(t, "owner/name", body), "merge gate enforced")
+	if mg.status != "warn" {
+		t.Errorf("status = %q, want warn", mg.status)
+	}
+	if !strings.Contains(mg.detail, "fishhawk_audit_complete is not a required status check on trunk") {
+		t.Errorf("detail = %q, want it to name the check and the branch", mg.detail)
+	}
+	if !strings.Contains(mg.remediate, "required status checks") {
+		t.Errorf("remediate = %q, want the server's add-the-check step", mg.remediate)
+	}
+}
+
+// TestCheckOnboardingReadiness_MergeGateUnknown asserts the unsettled rung
+// warns naming the reason — and never claims the check is unrequired.
+func TestCheckOnboardingReadiness_MergeGateUnknown(t *testing.T) {
+	body := `{
+	  "repo": "owner/name",
+	  "app": {"installed": true},
+	  "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [],
+	  "scopes": {"adequate": true},
+	  "merge_gate": {
+	    "status": "unknown", "check": "fishhawk_audit_complete",
+	    "reason": "administration_read_missing",
+	    "detail": "reading branch protection was refused (403)",
+	    "remediation": "Re-install the Fishhawk GitHub App"
+	  }
+	}`
+	mg := findCheck(t, readinessRungs(t, "owner/name", body), "merge gate enforced")
+	if mg.status != "warn" {
+		t.Errorf("status = %q, want warn", mg.status)
+	}
+	if !strings.Contains(mg.detail, "unknown (administration_read_missing)") {
+		t.Errorf("detail = %q, want unknown naming the reason", mg.detail)
+	}
+	if strings.Contains(mg.detail, "not a required") || strings.Contains(mg.detail, "not_required") {
+		t.Errorf("detail = %q, an unknown must never read as 'not required'", mg.detail)
+	}
+	if !strings.Contains(mg.remediate, "Re-install") {
+		t.Errorf("remediate = %q, want the server's remediation", mg.remediate)
+	}
+}
+
+// TestCheckOnboardingReadiness_MergeGateUnrecognisedStatus asserts a status
+// string this build does not know falls to the UNSETTLED arm — not to a
+// required or not-required claim. A newer fishhawkd introducing a fourth state
+// must degrade to "we cannot say", never to a verdict.
+func TestCheckOnboardingReadiness_MergeGateUnrecognisedStatus(t *testing.T) {
+	body := `{
+	  "repo": "owner/name",
+	  "app": {"installed": true},
+	  "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [],
+	  "scopes": {"adequate": true},
+	  "merge_gate": {"status": "partially_required", "check": "fishhawk_audit_complete"}
+	}`
+	mg := findCheck(t, readinessRungs(t, "owner/name", body), "merge gate enforced")
+	if mg.status != "warn" {
+		t.Errorf("status = %q, want warn for an unrecognised state", mg.status)
+	}
+	if !strings.Contains(mg.detail, "unknown") {
+		t.Errorf("detail = %q, want the unsettled rendering", mg.detail)
+	}
+	if mg.remediate == "" {
+		t.Errorf("remediate empty, want the not-evidence caveat")
+	}
+}
+
+// TestDoctorOnboarding_MergeGateAbsent_EmitsNoRung is the BACKWARD-COMPAT
+// control: a pre-#3161 fishhawkd serves no `merge_gate` key at all, and the
+// doctor must then draw NO rung — not a warning derived from a zero value.
+// Absence is not a verdict.
+//
+// Deleting the nil guard in mergeGateRung makes this RED: the zero value falls
+// to the unsettled arm and a bogus "merge gate enforced: unknown" warning
+// appears against a backend that never made the claim.
+func TestDoctorOnboarding_MergeGateAbsent_EmitsNoRung(t *testing.T) {
+	// allGreenReadinessJSON predates this field and carries no merge_gate key.
+	results := readinessRungs(t, "kuhlman-labs/fishhawk", allGreenReadinessJSON)
+	for _, r := range results {
+		if r.label == "merge gate enforced" {
+			t.Fatalf("merge gate rung emitted against a response with no merge_gate key: %+v", r)
+		}
+	}
+	if len(results) == 0 {
+		t.Fatalf("no rungs at all: the fixture should still render the other four checks")
+	}
+}
+
+// TestDoctorOnboarding_MergeGateNullValue_EmitsNoRung asserts an explicit JSON
+// null decodes to a nil pointer and is treated the same as absence. `null` and
+// `{}` are different bytes but the same claim: the backend said nothing.
+func TestDoctorOnboarding_MergeGateNullValue_EmitsNoRung(t *testing.T) {
+	body := `{
+	  "repo": "owner/name",
+	  "app": {"installed": true},
+	  "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [],
+	  "scopes": {"adequate": true},
+	  "merge_gate": null
+	}`
+	for _, r := range readinessRungs(t, "owner/name", body) {
+		if r.label == "merge gate enforced" {
+			t.Fatalf("merge gate rung emitted for an explicit null: %+v", r)
+		}
+	}
+}

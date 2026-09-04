@@ -1600,7 +1600,7 @@ func mergeRunAction(run *Run) SuggestedAction {
 	return SuggestedAction{
 		Action:       "fishhawk_merge_run",
 		Params:       map[string]string{"run_id": run.ID, "verdict": "<operator merge verdict>"},
-		Precondition: "the PR is approved (gh pr review --approve under your own identity) and the required fishhawk_audit_complete check is green — queueing before approval is also safe (GitHub fires the merge once branch protection is satisfied)",
+		Precondition: "the PR is approved (gh pr review --approve under your own identity) and the published fishhawk_audit_complete check is green — queueing before approval is also safe (GitHub fires the merge once branch protection is satisfied). Fishhawk publishes that check but does not make it required: whether it gates the merge depends on this repository's branch protection, which fishhawk_doctor's merge_gate rung reports",
 		Consumes:     consumesNone,
 		Reason:       "records your operator merge verdict as a chained audit entry, queues the squash merge through the same seam drive_run's may_merge arm uses, awaits the terminal run state, and surfaces the post-merge dev-host step — one verb replacing the merge_pr + post_merge hand ceremony",
 	}

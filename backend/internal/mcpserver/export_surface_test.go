@@ -191,6 +191,9 @@ var exportBaseline = []string{
 	"NewServer",
 	"NextActions",
 	"OnboardingApp",
+	// The merge-gate mirror of the readiness report's new merge_gate rung (#3161).
+	"OnboardingMergeGate",
+	"OnboardingMergeGateSrc",
 	"OnboardingReadinessReport",
 	"OnboardingReviewer",
 	"OnboardingScopes",

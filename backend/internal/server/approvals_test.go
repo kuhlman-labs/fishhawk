@@ -1788,9 +1788,12 @@ func (f *fakeStageCheckRepo) FindMatchingStages(context.Context, int, string, st
 // TestSubmitApproval_Approve_SucceedsRegardlessOfCheckState pins
 // the post-#253 (ADR-017) contract: the approval handler does NOT
 // gate on stage_check state. Reviewers approve based on plan + diff;
-// GitHub branch protection blocks the merge until the required
-// checks (including fishhawk_audit_complete, published per #231)
-// report green. Both pre-#253 failure modes — a failing observed
+// GitHub branch protection blocks the merge until the repo's
+// required checks report green. fishhawk_audit_complete is
+// PUBLISHED as a Check Run (#231), but whether it is among those
+// required checks is the repository's own branch-protection
+// configuration — the merge_gate readiness rung reports it
+// (E64.44 / #3161). Both pre-#253 failure modes — a failing observed
 // check and a never-observed-yet check — now succeed at the
 // approval API; protection is the merge gate.
 func TestSubmitApproval_Approve_SucceedsRegardlessOfCheckState(t *testing.T) {
