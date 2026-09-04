@@ -352,6 +352,26 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// the row). The merge only ENABLES/queues GitHub's merge — the pr_merged /
 	// run-completion settle is left to the pull_request-closed webhook, which is
 	// why the MCP tool awaits the terminal state client-side.
+	// E64.42 / #3159: recompute and republish fishhawk_audit_complete
+	// immediately BEFORE the dispatch. A fix-up push publishes `in_progress`
+	// against the new head and nothing is guaranteed to recompute between that
+	// synchronize and this merge; now that the check is REQUIRED, GitHub
+	// refuses to queue the merge while it is in_progress and this handler
+	// returns 409 merge_checks_pending forever. Healing AFTER the dispatch
+	// would be useless — the stranded check is what makes the dispatch fail.
+	//
+	// Placement: AFTER the acceptance-gate guard (a genuinely mid-flight run
+	// recomputes to pending; refusing there is the acceptance gate's job, not
+	// this publish's), AFTER the conflict guard and the durable verdict
+	// append, and BEFORE the dispatch. The delegated may_merge arm does NOT
+	// route through here — it calls GitHubMerger.MergePullRequest via
+	// dispatchAcceptanceGatedMerge (autodrive.go), which carries the SAME call
+	// — which is why both sites need it.
+	//
+	// Best-effort and never unwinds: a publish failure logs at WARN inside the
+	// helper and the merge is dispatched regardless.
+	s.republishAuditCheckBeforeMerge(r.Context(), runID)
+
 	if merr := s.cfg.GateMerger.MergePullRequest(r.Context(), runRow); merr != nil {
 		// A checks-not-all-passed refusal (E67.56 / #2717) is an expected
 		// precondition, NOT a dispatch fault: GitHub reports the PR in UNSTABLE

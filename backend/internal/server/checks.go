@@ -430,6 +430,72 @@ func (s *Server) recomputeAndPublishAuditCompleteAtHead(ctx context.Context, run
 	return s.publishAuditCheckAtHead(ctx, runID, res.State, res.Missing, res.Resolved, headSHAOverride)
 }
 
+// republishAuditCheckBeforeMerge recomputes the run's audit-complete state and
+// republishes the fishhawk_audit_complete Check Run immediately BEFORE a merge
+// is dispatched (E64.42 / #3159).
+//
+// The hole it closes: a fix-up push publishes `in_progress` against the NEW
+// head (buildParams' default branch for a pending state), and none of the six
+// existing publish call sites is guaranteed to fire between that synchronize
+// and the merge — the merge reconciler's heal sweep visits only review stages
+// PARKED at awaiting_approval, so a run merged promptly after a fix-up push is
+// never swept. Now that #3160 made fishhawk_audit_complete a REQUIRED status
+// check, a stranded `in_progress` is a hard merge block: GitHub reports the
+// pull request in UNSTABLE status and refuses to queue the merge, which
+// handleMergeRun classifies as 409 merge_checks_pending. A republish placed
+// only on run TERMINATION is therefore unreachable for exactly the blocking
+// case — the merge that would trigger it can never happen. This one runs first.
+//
+// Both call sites — handleMergeRun (the operator merge endpoint) and
+// dispatchAcceptanceGatedMerge (the delegated may_merge arm) — invoke it AFTER
+// the acceptance gate has admitted the merge and BEFORE the dispatch, so a
+// genuinely mid-flight run is already refused by the gate and never reaches a
+// recompute that would report pending.
+//
+// Best-effort: it delegates to recomputeAndPublishAuditComplete, which is
+// nil-safe (no RunRepo / ArtifactRepo / AuditRepo, or no publisher, is a clean
+// no-op), logs a compute or publish failure at WARN, and NEVER unwinds the
+// merge or its durable verdict row.
+//
+// Deliberately a SEPARATE function from republishAuditCheckOnRunTerminal
+// rather than one shared helper: each is an independently deletable control
+// with its own counterfactual test, and each names the distinct hole it closes.
+func (s *Server) republishAuditCheckBeforeMerge(ctx context.Context, runID uuid.UUID) {
+	s.recomputeAndPublishAuditComplete(ctx, runID)
+}
+
+// republishAuditCheckOnRunTerminal recomputes the run's audit-complete state
+// and republishes the fishhawk_audit_complete Check Run once the run has
+// reached its terminal state on a merge (E64.42 / #3159).
+//
+// The hole it closes: merging REMOVES the run from the only retry path. The
+// merge reconciler's heal sweep enumerates review stages parked at
+// awaiting_approval, so once the merge resolves that stage the run is
+// permanently outside it — a check left at `in_progress` by a fix-up push
+// stays `in_progress` forever on the merged head. This republish keeps the
+// promise the in_progress check summary makes.
+//
+// ORDERING IS LOAD-BEARING at both call sites in resolveReviewStageOnMerge: it
+// must run AFTER advanceRunAfterReviewResolve. auditcomplete.ComputeResult
+// returns StatePending whenever any non-review stage is non-terminal, and the
+// Advance is what walks the run's remaining stages to terminal (a pending
+// acceptance stage short-circuits to succeeded inside Advance; the merge
+// supersede sweep that precedes it terminalizes a fix-up-re-parked one).
+//
+// That is not an argument, it was RUN: hoisting this call above the Advance
+// turns TestResolveReviewStageOnMerge_RepublishesAuditCheckOnTermination RED.
+// The OBSERVED failure is sharper than "it republishes pending" — the
+// recompute yields pending, which is the state already published at that head,
+// so the publisher's dedup cache suppresses it and NOTHING is posted at all.
+// The stale in_progress simply rides, which is the exact defect this closes.
+//
+// Best-effort, exactly like every other tail on the merge-resolution path: a
+// compute or publish failure logs at WARN and never unwinds the merge
+// resolution, its audit row, or the run completion.
+func (s *Server) republishAuditCheckOnRunTerminal(ctx context.Context, runID uuid.UUID) {
+	s.recomputeAndPublishAuditComplete(ctx, runID)
+}
+
 // RepublishAuditCheck re-derives a run's audit-complete state and republishes
 // the fishhawk_audit_complete Check Run (#973). Exported for the merge
 // reconciler's per-tick heal sweep — the same export-for-reconciler pattern as

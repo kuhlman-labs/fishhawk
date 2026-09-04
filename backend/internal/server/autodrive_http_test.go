@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
@@ -666,4 +667,61 @@ func TestAutoDrive_Reported_EndToEnd(t *testing.T) {
 	if n := countAudit(au, "approval_submitted"); n != 0 {
 		t.Errorf("approval_submitted rows = %d, want 0", n)
 	}
+}
+
+// --- (12, E64.42 / #3159) delegated merge republishes the audit check -------
+
+// TestAutoDrive_Merge_RepublishesAuditCheckBeforeDispatch is the HTTP-ROUTE
+// half of the pre-merge republish: it drives the real POST
+// /v0/runs/{run_id}/auto-drive handler through the delegated may_merge arm and
+// asserts, on the SHARED ordered call log, that the fishhawk_audit_complete
+// republish was recorded strictly BEFORE the merge dispatch.
+//
+// The seam-level branch coverage (acceptance-not-ready and nil-merger both
+// publishing nothing) lives with the three TestDispatchAcceptanceGatedMerge_*
+// tests in autodrive_test.go; this one exists so the route that REACHES that
+// seam is pinned too — a wiring change that stopped routing the delegated arm
+// through dispatchAcceptanceGatedMerge would leave those three green.
+func TestAutoDrive_Merge_RepublishesAuditCheckBeforeDispatch(t *testing.T) {
+	log := &mergeOrderLog{}
+	merger := &orderedLogMerger{log: log}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := seedMergeReadyRun(t, s, repo, au)
+
+	// Wire the audit-check publisher onto the same ordered log. The run needs
+	// an installation and a recorded head for the publisher to reach
+	// CreateCheckRun at all; a pull_request_opened head report supplies it
+	// through the same findHeadSHA path production uses (#1682).
+	runRow, err := repo.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	runRow.Repo = "x/y"
+	runRow.InstallationID = ptrInt64(99)
+	seedReviewEntry(t, au, runID, 6, "pull_request_opened", map[string]any{"head_sha": "abc12345"})
+	arts := newFakeArtifactRepo()
+	s.cfg.ArtifactRepo = arts
+	s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub:      &orderedPublishGitHub{log: log},
+		Runs:        repo,
+		Artifacts:   arts,
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	w := autoDrivePost(t, s, s.handleAutoDrive, runID, "", "{}", autoDriveOperatorIdentity())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var out autoDriveResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Acted || out.Action != delegation.ActionMerge {
+		t.Fatalf("outcome = %+v, want acted merge", out)
+	}
+	if merger.called != 1 {
+		t.Fatalf("merge dispatched %d times, want 1", merger.called)
+	}
+	assertPublishPrecedesMerge(t, log)
 }

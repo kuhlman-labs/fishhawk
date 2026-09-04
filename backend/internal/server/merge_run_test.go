@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1320,5 +1322,83 @@ func TestMergeRunConflictingRecordsNoVerdict(t *testing.T) {
 
 	if rows := mergeVerdictRows(au); len(rows) != 0 {
 		t.Errorf("merge_verdict_recorded rows = %d after a conflict refusal, want 0 (guard runs before the append)", len(rows))
+	}
+}
+
+// --- E64.42 / #3159: pre-merge audit-check republish ------------------------
+
+// newMergeRepublishServer builds the operator-merge server with the audit
+// stack AND the Check Run publisher wired, both fed by the SAME shared ordered
+// call log as the merge seam. Returns the server, the run, and the log.
+//
+// The run is seeded merge-ready with no workflow spec, so the acceptance gate
+// is not-declared and admits the merge — the pre-merge republish sits AFTER
+// that guard, so a fixture that failed it would never reach the control.
+func newMergeRepublishServer(t *testing.T, log *mergeOrderLog, publishErr error, mergeErr error) (*Server, *run.Run, *orderedLogMerger) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	au := newAuditCompleteAuditFake()
+	arts := newFakeArtifactRepo()
+	r := seedPublishableRun(t, rr, au, arts, "abc12345")
+	prURL := mergePR
+	r.PullRequestURL = &prURL
+
+	merger := &orderedLogMerger{log: log, err: mergeErr}
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr,
+		AuditRepo:      au,
+		ArtifactRepo:   arts,
+		StageCheckRepo: newFakeStageCheckRepo(),
+		ExternalURL:    "https://app.fishhawk.example.com",
+		GateMerger:     merger,
+	})
+	s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub:      &orderedPublishGitHub{log: log, err: publishErr},
+		Runs:        rr,
+		Artifacts:   arts,
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	return s, r, merger
+}
+
+// TestMergeRun_RepublishesAuditCheckBeforeDispatch is the operator-merge half
+// of the #3159 fix. It asserts ORDER, not presence: the fishhawk_audit_complete
+// republish must be recorded strictly BEFORE GateMerger.MergePullRequest on
+// one shared call log. Now that the check is REQUIRED, a stranded in_progress
+// is what makes the dispatch fail 409 merge_checks_pending — so a republish
+// after the dispatch would satisfy a presence-only assertion while healing
+// nothing.
+func TestMergeRun_RepublishesAuditCheckBeforeDispatch(t *testing.T) {
+	log := &mergeOrderLog{}
+	s, r, merger := newMergeRepublishServer(t, log, nil, nil)
+
+	w := postMergeRun(t, s, r.ID, mergeRunRequest{Verdict: "ship it"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 1 {
+		t.Fatalf("merge dispatched %d times, want 1", merger.called)
+	}
+	assertPublishPrecedesMerge(t, log)
+}
+
+// TestMergeRun_RepublishFailure_StillDispatchesMerge pins the best-effort
+// posture: CreateCheckRun fails, and the merge is still dispatched and the
+// endpoint still returns 200. The republish must never unwind the merge or its
+// durable verdict row.
+func TestMergeRun_RepublishFailure_StillDispatchesMerge(t *testing.T) {
+	log := &mergeOrderLog{}
+	s, r, merger := newMergeRepublishServer(t, log, errors.New("POST /repos/x/y/check-runs: 401 Bad credentials"), nil)
+
+	w := postMergeRun(t, s, r.ID, mergeRunRequest{Verdict: "ship it"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a publish failure must not fail the merge):\n%s", w.Code, w.Body.String())
+	}
+	if log.indexOf(mergeOrderPublish) < 0 {
+		t.Fatal("republish was never attempted; this test cannot discriminate")
+	}
+	if merger.called != 1 {
+		t.Errorf("merge dispatched %d times, want 1 (a publish failure must not skip the dispatch)", merger.called)
 	}
 }

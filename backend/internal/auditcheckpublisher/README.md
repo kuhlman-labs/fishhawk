@@ -25,6 +25,24 @@ The GitLab lookup is **nil-safe**: an unconfigured GitLab forge (not registered,
 
 `server/checks.go::publishAuditCheck` is called after every `auditcomplete.ComputeResult` in both the read endpoint (`handleListStageChecks`) and the recompute/republish path (`recomputeAndPublishAuditComplete`, which the merge reconciler reaches; the pull_request webhook handler `republishOnPullRequestEvent` calls `publishAuditCheck` directly). It forwards the resolutions to `PublishResultAtHead` with an empty override (via `publishAuditCheckAtHead`); `PublishResult` and `Publish` remain thin wrappers delegating with an empty override / `resolved=nil`. The operator-vouch path reaches the same seam with a non-empty override — see **Head override** below.
 
+### Publish-surface inventory
+
+Every server-side path that reaches this package, so a call-site audit does not have to re-derive the list:
+
+| Call site | Trigger |
+|---|---|
+| `server/checks.go::handleListStageChecks` | `GET /v0/stages/{id}/checks` — the SPA read (this is also the accidental HEALER: reading the endpoint republishes) |
+| `server/pullrequest_synchronize.go::republishOnPullRequestEvent` | `pull_request` `opened` / `reopened` / `synchronize` (a fix-up push lands here, publishing `in_progress` against the NEW head) |
+| `server/pullrequest.go` (fix-up push report) | the runner's `fixup_pushed` outcome report |
+| `server/trace.go` (implement-review loop) | an advisory implement review reaching a terminal verdict |
+| `server/review_reconcile.go` | review reconciliation |
+| `server/vouch.go` | the operator-vouch re-post (the one `PublishResultAtHead` override caller) |
+| `server/checks.go::RepublishAuditCheck` | the merge reconciler's per-tick heal sweep, over review stages parked at `awaiting_approval` |
+| **`server/checks.go::republishAuditCheckBeforeMerge`** (E64.42 / #3159) | **immediately before a merge dispatch**, from BOTH `merge_run.go::handleMergeRun` and `autodrive.go::dispatchAcceptanceGatedMerge` |
+| **`server/checks.go::republishAuditCheckOnRunTerminal`** (E64.42 / #3159) | **after the run reaches its terminal state on a merge**, from BOTH merged arms of `pullrequest_review_events.go::resolveReviewStageOnMerge` |
+
+The last two exist because none of the seven above is guaranteed to fire between a fix-up push's `synchronize` and the merge, and merging removes the run from the heal sweep (it enumerates only PARKED review stages) — so a check left at `in_progress` by the fix-up push stayed `in_progress` on the merged head forever. See `docs/architecture/audit-complete.md` § Reconcile sweep for the ordering constraint on the terminal half and the named stale-`success`-to-`failure` consequence of the pre-merge half.
+
 The dedup cache is UNCHANGED by #3092 — it still keys on `(forge, repo, head_sha, state)` only, so the resolution text lands with the FIRST pass publish at a given head; a pass already published at that head is not re-published merely because its summary would now name the child runs.
 
 ## Run-less not-applicable publish (E64.43 / #3160)
