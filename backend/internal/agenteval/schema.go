@@ -27,6 +27,28 @@ package agenteval
 // which may mutate the schema map in place during request marshaling) can never
 // corrupt a shared definition.
 func JudgeCardSchema() map[string]any {
+	return RubricCardSchema(judgeDimensions)
+}
+
+// RubricCardSchema returns the JSON Schema that constrains a Rubric judging
+// response to one closed object carrying exactly the named dimensions, in the
+// given order. JudgeCardSchema delegates to it with the fixed judgeDimensions
+// list, so there is exactly ONE schema builder in the package and the Tier-B
+// card's bound cannot diverge from a Rubric card's.
+//
+// Each dimension's score is {"type":"integer","enum":[...]} where the enum is
+// BUILT by looping scoreMin..scoreMax — the SAME constants decodeRubricScores
+// validates against — so the schema bound cannot silently diverge from the
+// validated bound (the #1324/#1326 single-source-of-truth discipline). Every
+// object is closed (additionalProperties:false): Anthropic's server-side schema
+// handling expects closed objects and it keeps the model from smuggling
+// unmodeled keys.
+//
+// A FRESH map is returned on every call (including fresh per-dimension
+// sub-objects) so a caller — e.g. the Anthropic SDK, which may mutate the
+// schema map in place during request marshaling — can never corrupt a shared
+// definition.
+func RubricCardSchema(dims []string) map[string]any {
 	dimensionSchema := func() map[string]any {
 		return map[string]any{
 			"type":                 "object",
@@ -42,15 +64,18 @@ func JudgeCardSchema() map[string]any {
 		}
 	}
 
+	required := make([]any, 0, len(dims))
+	props := make(map[string]any, len(dims))
+	for _, d := range dims {
+		required = append(required, d)
+		props[d] = dimensionSchema()
+	}
+
 	return map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
-		"required":             []any{"meaningful_evidence", "honest_uncertainty", "reasoning_quality"},
-		"properties": map[string]any{
-			"meaningful_evidence": dimensionSchema(),
-			"honest_uncertainty":  dimensionSchema(),
-			"reasoning_quality":   dimensionSchema(),
-		},
+		"required":             required,
+		"properties":           props,
 	}
 }
 

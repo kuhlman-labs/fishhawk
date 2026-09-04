@@ -17,6 +17,7 @@ verifies; we do not assert.
 |---|---|
 | [`fishhawk-dev-audit-export.json`](fishhawk-dev-audit-export.json) | The machine-verifiable `Export v1` audit log: every run in the window, each carrying its run-scoped public signing key and full chained audit trail. This is the file `fishhawk-verify` consumes. |
 | [`fishhawk-dev-agent-changes.md`](fishhawk-dev-agent-changes.md) | The human-readable agent-changes report generated from the same audit data: per change, who approved it, what reviewed it, and what validated it. |
+| [`prompt-injection-evidence.md`](prompt-injection-evidence.md) | What the #2290 untrusted-issue-body quarantine envelope is PROVEN to do (offline structural containment across five attack classes and four renders) and what remains UNMEASURED (behavioural resistance and the plan-quality delta — #3187), with the re-run recipe for both live arms (E60.2 / #2291). |
 
 Both files are **redacted-tier** evidence per ADR-054 (see the caveat below).
 
