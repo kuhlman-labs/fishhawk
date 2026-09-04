@@ -176,3 +176,5 @@ cloudflared path above.
 
 `scripts/dev` (helpers `_relay_*`, wired into `cmd_up`/`cmd_down`), pinned
 against stubs by `scripts/test-dev`. Long-form contract: `scripts/README.md`.
+
+<!-- relay live-validation probe for #3169; this PR is not for merge -->
