@@ -1092,7 +1092,7 @@ func TestResolveReviewStageOnMerge_ImplementOnly_RepublishesAuditCheckOnTerminat
 // publishing there would post a pending state the sweep would only have to
 // undo. Zero CreateCheckRun calls after the merge.
 func TestResolveReviewStageOnMerge_HeldPendingReview_DoesNotRepublish(t *testing.T) {
-	s, _, au, gh, r, impl, _ := fixupRepublishFixture(t, true)
+	s, rr, au, gh, r, impl, _ := fixupRepublishFixture(t, true)
 	ctx := context.Background()
 	// Arm the ADR-036 hold BY CONSTRUCTION: the implement stage declares one
 	// agent reviewer, a review was dispatched, and no terminal review entry
@@ -1114,6 +1114,15 @@ func TestResolveReviewStageOnMerge_HeldPendingReview_DoesNotRepublish(t *testing
 
 	s.handlePullRequestClosed(ctx, closedMergedPayload(fixupRepublishPRURL, fixupHeadSHA))
 
+	// The DISCRIMINATOR, mirroring the cancelled-stage assertion in
+	// TestResolveReviewStageOnMerge_ClosedWithoutMerge_DoesNotRepublish: pin
+	// that the ADR-036 hold actually ENGAGED before reading the empty call
+	// log. Without it a silent recompute/publish failure on the merged arm
+	// would satisfy the zero-call assertion while testing nothing.
+	if got := stageStateByTypeOnOrchestratorRepo(t, rr, r.ID, run.StageTypeReview); got != run.StageStateAwaitingApproval {
+		t.Fatalf("review stage state = %q, want awaiting_approval (the ADR-036 hold did not engage, so the zero-call assertion below cannot discriminate)", got)
+	}
+
 	if got := gh.calls(); len(got) != 0 {
 		t.Fatalf("held-pending-review merge published %d check runs, want 0; statuses=%v",
 			len(got), publishStatuses(got))
@@ -1121,34 +1130,142 @@ func TestResolveReviewStageOnMerge_HeldPendingReview_DoesNotRepublish(t *testing
 }
 
 // TestResolveReviewStageOnMerge_RepublishFailure_StillCompletesRun pins the
-// best-effort posture of the terminal republish: CreateCheckRun fails, and the
-// run still completes and the pr_merged row is still written. The republish
-// must never unwind the merge resolution.
+// best-effort posture of the terminal republish in BOTH failure directions,
+// because "republish never unwinds the merge" is a claim about the whole
+// helper, not only about the forge.
+//
+// Two legs, sharing the completion assertions:
+//
+//   - publish_error — the FORGE half. CreateCheckRun fails permanently, so the
+//     recompute succeeds and the publish is attempted and rejected. (Distinct
+//     from TestMergeRun_RepublishFailure_StillDispatchesMerge, which pins the
+//     same posture at the OTHER call site: republishAuditCheckBeforeMerge on
+//     the operator merge endpoint. Same failure mode, different control.)
+//
+//   - audit_read_error — the RECOMPUTE half, and the one the previous shape of
+//     this test promised but did not deliver. The audit READ that
+//     auditcomplete.ComputeResult performs FIRST is made to fail, so the
+//     recompute errors and NO publish is ever attempted. A broken audit-chain
+//     read must not unwind or block the merge either.
+//
+// Each leg pins its injected failure as genuinely REACHED before asserting the
+// completion outcome, so neither can pass while injecting nothing: the publish
+// leg requires a failed CreateCheckRun call, the audit-read leg requires a
+// failed read AND zero CreateCheckRun calls (the recompute error means the
+// publish is never reached — which is also what distinguishes the two legs
+// from each other rather than re-running one failure mode twice).
 func TestResolveReviewStageOnMerge_RepublishFailure_StillCompletesRun(t *testing.T) {
-	s, rr, au, _, r, impl, _ := fixupRepublishFixture(t, true)
-	ctx := context.Background()
-	// Swap in a permanently failing CheckRunCreator.
-	gh := &flakyCheckRunGitHub{failuresLeft: 1 << 30}
-	s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
-		GitHub:      gh,
-		Runs:        rr,
-		Artifacts:   s.cfg.ArtifactRepo,
-		Audit:       au,
-		ExternalURL: "https://app.fishhawk.example.com",
+	t.Run("publish_error", func(t *testing.T) {
+		s, rr, au, _, r, impl, _ := fixupRepublishFixture(t, true)
+		ctx := context.Background()
+		// Swap in a permanently failing CheckRunCreator.
+		gh := &flakyCheckRunGitHub{failuresLeft: 1 << 30}
+		s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
+			GitHub:      gh,
+			Runs:        rr,
+			Artifacts:   s.cfg.ArtifactRepo,
+			Audit:       au,
+			ExternalURL: "https://app.fishhawk.example.com",
+		})
+		impl.State = run.StageStateSucceeded
+
+		s.handlePullRequestClosed(ctx, closedMergedPayload(fixupRepublishPRURL, fixupHeadSHA))
+
+		if got := gh.failedCalls(); got == 0 {
+			t.Fatal("republish was never attempted; this test cannot discriminate")
+		}
+		assertMergeSurvivedRepublishFailure(t, ctx, rr, au, r.ID, "publish")
 	})
-	impl.State = run.StageStateSucceeded
 
-	s.handlePullRequestClosed(ctx, closedMergedPayload(fixupRepublishPRURL, fixupHeadSHA))
+	t.Run("audit_read_error", func(t *testing.T) {
+		s, rr, au, gh, r, impl, _ := fixupRepublishFixture(t, true)
+		ctx := context.Background()
+		// Wrap the audit repository the RECOMPUTE reads through
+		// (auditCompleteDeps takes cfg.AuditRepo) so exactly one
+		// category-scoped read fails. Writes and every other read pass
+		// through unchanged, so the merge resolution's own pr_merged
+		// append still lands — the failure is scoped to the recompute,
+		// which is the path this leg is about.
+		// CategoryAcceptanceSkippedOutOfScope is the FIRST audit read
+		// auditcomplete.ComputeResult performs, so the recompute cannot
+		// reach the publish without hitting it.
+		failing := newAuditReadFailingFake(au, CategoryAcceptanceSkippedOutOfScope)
+		s.cfg.AuditRepo = failing
+		failing.arm()
+		impl.State = run.StageStateSucceeded
 
-	if got := gh.failedCalls(); got == 0 {
-		t.Fatal("republish was never attempted; this test cannot discriminate")
+		s.handlePullRequestClosed(ctx, closedMergedPayload(fixupRepublishPRURL, fixupHeadSHA))
+
+		// Reached: the injected error was genuinely hit. A leg whose
+		// injection is never exercised passes while asserting nothing.
+		if got := failing.failedReads(); got == 0 {
+			t.Fatal("the injected audit read never failed; this leg cannot discriminate")
+		}
+		// And it failed BEFORE the publish: a recompute error returns
+		// early, so nothing is posted. This is what separates this leg
+		// from the publish leg above rather than duplicating it.
+		if got := gh.calls(); len(got) != 0 {
+			t.Fatalf("audit-read failure still published %d check runs, want 0; statuses=%v",
+				len(got), publishStatuses(got))
+		}
+		assertMergeSurvivedRepublishFailure(t, ctx, rr, au, r.ID, "audit read")
+	})
+}
+
+// assertMergeSurvivedRepublishFailure is the completion contract both
+// republish-failure legs share: the run still reaches its terminal state and
+// the durable pr_merged row is still written. The republish is a tail, never a
+// precondition.
+func assertMergeSurvivedRepublishFailure(
+	t *testing.T, ctx context.Context, rr *orchestratorRepo, au *auditCompleteAuditFake, runID uuid.UUID, failureKind string,
+) {
+	t.Helper()
+	if got, _ := rr.GetRun(ctx, runID); got.State != run.StateSucceeded {
+		t.Errorf("run state = %q, want succeeded (a %s failure must not unwind the merge)", got.State, failureKind)
 	}
-	if got, _ := rr.GetRun(ctx, r.ID); got.State != run.StateSucceeded {
-		t.Errorf("run state = %q, want succeeded (a publish failure must not unwind the merge)", got.State)
+	if n := len(listEpisodeEntries(t, au, runID, "pr_merged")); n != 1 {
+		t.Errorf("pr_merged rows = %d, want 1 (a %s failure must not unwind the merge audit row)", n, failureKind)
 	}
-	if n := len(listEpisodeEntries(t, au, r.ID, "pr_merged")); n != 1 {
-		t.Errorf("pr_merged rows = %d, want 1", n)
+}
+
+// auditReadFailingFake wraps auditCompleteAuditFake and makes ONE
+// category-scoped audit READ fail once armed, delegating every other read and
+// every write to the real fake. Scoped rather than blanket so the merge
+// resolution's own audit writes still land and the failure lands squarely on
+// the recompute path under test.
+type auditReadFailingFake struct {
+	*auditCompleteAuditFake
+	failMu   sync.Mutex
+	category string
+	armed    bool
+	failed   int
+}
+
+func newAuditReadFailingFake(base *auditCompleteAuditFake, category string) *auditReadFailingFake {
+	return &auditReadFailingFake{auditCompleteAuditFake: base, category: category}
+}
+
+func (f *auditReadFailingFake) arm() {
+	f.failMu.Lock()
+	defer f.failMu.Unlock()
+	f.armed = true
+}
+
+func (f *auditReadFailingFake) failedReads() int {
+	f.failMu.Lock()
+	defer f.failMu.Unlock()
+	return f.failed
+}
+
+func (f *auditReadFailingFake) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	f.failMu.Lock()
+	if f.armed && category == f.category {
+		f.failed++
+		f.failMu.Unlock()
+		return nil, errors.New("audit: list for run by category: connection reset by peer")
 	}
+	f.failMu.Unlock()
+	return f.auditCompleteAuditFake.ListForRunByCategory(ctx, runID, category)
 }
 
 // publishStatuses renders a call log's statuses for failure messages.
@@ -1158,6 +1275,24 @@ func publishStatuses(calls []publisherFakeCall) []string {
 		out = append(out, string(c.params.Status)+"/"+string(c.params.Conclusion))
 	}
 	return out
+}
+
+// stageStateByTypeOnOrchestratorRepo reads the COMMITTED state of the run's
+// stage of the given type from the fake. Used where the fixture does not hand
+// the test that stage's id back.
+func stageStateByTypeOnOrchestratorRepo(t *testing.T, rr *orchestratorRepo, runID uuid.UUID, typ run.StageType) run.StageState {
+	t.Helper()
+	sts, err := rr.ListStagesForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	for _, st := range sts {
+		if st.Type == typ {
+			return st.State
+		}
+	}
+	t.Fatalf("no %s stage on run %s", typ, runID)
+	return ""
 }
 
 // stageStateOnOrchestratorRepo reads a stage's COMMITTED state from the fake.
