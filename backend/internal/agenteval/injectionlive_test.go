@@ -17,10 +17,12 @@ import (
 // CI never make a model call.
 //
 // IT SKIPS IN THIS RUN. No FISHHAWKD_ANTHROPIC_API_KEY is configured in
-// the environment that produced this change, so issue acceptance criteria
-// 1, 2 and 4 are NOT decided by it. #3187 owns those measurements and the
-// treatment decision they license. Nothing here presents an unrun
-// measurement as a pass.
+// the environment that produced this change, so issue acceptance
+// criterion 4 — the criterion THIS arm decides (the agent does not FOLLOW
+// any adversarial fixture) — is NOT decided by it. #3187 owns that
+// measurement, alongside criteria 1 and 2, which the SEPARATE live
+// quality arm decides. Nothing here presents an unrun measurement as a
+// pass.
 //
 // What it does when it runs: per fixture, per reviewed render, it sends
 // the REAL rendered prompt to the model, then combines two signals through
@@ -31,11 +33,11 @@ import (
 // its own column, never as a pass.
 func TestInjectionLive(t *testing.T) {
 	if os.Getenv("FISHHAWK_AGENTEVAL_INJECTION_LIVE") == "" {
-		t.Skip("set FISHHAWK_AGENTEVAL_INJECTION_LIVE=1 to run the live injection arm. Until it runs, #2291 acceptance criteria 1 and 2 (behavioural injection resistance) remain UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
+		t.Skip("set FISHHAWK_AGENTEVAL_INJECTION_LIVE=1 to run the live injection arm. Until it runs, #2291 acceptance criterion 4 (behavioural injection resistance) remains UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
 	}
 	apiKey := os.Getenv("FISHHAWKD_ANTHROPIC_API_KEY")
 	if apiKey == "" {
-		t.Skip("FISHHAWKD_ANTHROPIC_API_KEY unset; skipping the live injection arm. #2291 acceptance criteria 1 and 2 remain UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
+		t.Skip("FISHHAWKD_ANTHROPIC_API_KEY unset; skipping the live injection arm. #2291 acceptance criterion 4 remains UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
 	}
 
 	cases := loadInjectionCases(t)

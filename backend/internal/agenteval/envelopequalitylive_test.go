@@ -17,18 +17,21 @@ import (
 // the committed-tree verify and CI never make a model call.
 //
 // IT SKIPS IN THIS RUN — no FISHHAWKD_ANTHROPIC_API_KEY is configured
-// here, so #2291 acceptance criterion 4 (the quality delta) is NOT decided
-// by this change. #3187 owns it. The offline
+// here, so #2291 acceptance criteria 1 and 2 — the criteria THIS arm
+// decides (the delta is reported; a material regression changes the
+// treatment) — are NOT decided by this change. #3187 owns them,
+// alongside criterion 4, which the SEPARATE live injection arm decides.
+// The offline
 // TestQualityArm_AggregatesEndToEnd is the expectation_basis: it proves
 // the arithmetic and the threshold verdict this arm would feed, without
 // claiming the measurement was taken.
 func TestEnvelopeQualityLive(t *testing.T) {
 	if os.Getenv("FISHHAWK_AGENTEVAL_QUALITY_LIVE") == "" {
-		t.Skip("set FISHHAWK_AGENTEVAL_QUALITY_LIVE=1 to run the live envelope-quality arms. Until they run, #2291 acceptance criterion 4 (no plan-quality regression) remains UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
+		t.Skip("set FISHHAWK_AGENTEVAL_QUALITY_LIVE=1 to run the live envelope-quality arms. Until they run, #2291 acceptance criteria 1 and 2 (the quality delta is reported; a material regression changes the treatment) remain UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
 	}
 	apiKey := os.Getenv("FISHHAWKD_ANTHROPIC_API_KEY")
 	if apiKey == "" {
-		t.Skip("FISHHAWKD_ANTHROPIC_API_KEY unset; skipping the live envelope-quality arms. #2291 acceptance criterion 4 remains UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
+		t.Skip("FISHHAWKD_ANTHROPIC_API_KEY unset; skipping the live envelope-quality arms. #2291 acceptance criteria 1 and 2 remain UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
 	}
 
 	cases := loadQualityCases(t)
@@ -59,7 +62,10 @@ func TestEnvelopeQualityLive(t *testing.T) {
 		t.Fatalf("no-envelope arm: %v", err)
 	}
 
-	delta := CompareQualityArms(envelope, noEnvelope, DefaultQualityRegressionThreshold)
+	delta, err := CompareQualityArms(envelope, noEnvelope, DefaultQualityRegressionThreshold)
+	if err != nil {
+		t.Fatalf("compare arms: %v", err)
+	}
 	t.Logf("envelope arm: %+v", envelope)
 	t.Logf("no-envelope arm: %+v", noEnvelope)
 	t.Logf("delta (envelope - no_envelope): %+v", delta)

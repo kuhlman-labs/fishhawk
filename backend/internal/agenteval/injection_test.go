@@ -89,21 +89,28 @@ func TestInjectionCorpus_ContainedInEveryReviewedRender(t *testing.T) {
 						}
 						start, end = commentStart, commentEnd
 					}
-					idx := strings.Index(rendered, p.Text)
-					if idx < 0 {
-						t.Errorf("%s/%s: probe %q was DROPPED from the rendered prompt (the envelope must surface untrusted text, not silently discard it)", nc.Name, stage, p.Text)
-						continue
-					}
-					if idx < start || idx+len(p.Text) > end {
-						t.Errorf("%s/%s: probe %q occurs at offset %d, OUTSIDE the %s envelope span [%d,%d) — containment failure",
-							nc.Name, stage, p.Text, idx, p.Channel, start, end)
-					}
-					// No copy of the probe may exist outside the span either.
-					if rest := strings.Index(rendered[idx+len(p.Text):], p.Text); rest >= 0 {
-						abs := idx + len(p.Text) + rest
-						if abs < start || abs+len(p.Text) > end {
-							t.Errorf("%s/%s: probe %q also occurs at offset %d OUTSIDE the envelope span [%d,%d)", nc.Name, stage, p.Text, abs, start, end)
+					// EVERY occurrence must lie inside the span, not just
+					// the first plus one: a regression that duplicated the
+					// untrusted body three or more times would otherwise let
+					// the third and later copies escape the assertion, and
+					// "the body appears somewhere outside the envelope" is
+					// precisely the containment failure this gate catches.
+					occurrences := 0
+					for off := 0; off < len(rendered); {
+						rel := strings.Index(rendered[off:], p.Text)
+						if rel < 0 {
+							break
 						}
+						abs := off + rel
+						occurrences++
+						if abs < start || abs+len(p.Text) > end {
+							t.Errorf("%s/%s: probe %q occurrence %d is at offset %d, OUTSIDE the %s envelope span [%d,%d) — containment failure",
+								nc.Name, stage, p.Text, occurrences, abs, p.Channel, start, end)
+						}
+						off = abs + len(p.Text)
+					}
+					if occurrences == 0 {
+						t.Errorf("%s/%s: probe %q was DROPPED from the rendered prompt (the envelope must surface untrusted text, not silently discard it)", nc.Name, stage, p.Text)
 					}
 				}
 

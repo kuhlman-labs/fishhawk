@@ -354,12 +354,32 @@ func meanRubricScore(card RubricCard, dims []string) (float64, error) {
 // below threshold. threshold is a PARAMETER (pass
 // DefaultQualityRegressionThreshold for the default) — never a hardcoded
 // gate.
-func CompareQualityArms(envelope, noEnvelope QualityArmReport, threshold float64) QualityDelta {
+//
+// It FAILS CLOSED on a fixture-name mismatch between the two arms, in
+// either direction: a name present in one arm's PerFixture and absent from
+// the other's is an error naming the fixture and the arm it is missing
+// from. Indexing an absent key would yield 0.0 and compute that fixture's
+// delta against a score no judge ever produced — inflating (or, reversed,
+// masking) the delta, and through the overall mean potentially
+// manufacturing or hiding a regression. RunQualityArm drives both arms from
+// the same case slice so the maps align in practice, but the function is
+// exported and must not silently compute a comparison against a phantom
+// arm.
+func CompareQualityArms(envelope, noEnvelope QualityArmReport, threshold float64) (QualityDelta, error) {
+	for name := range noEnvelope.PerFixture {
+		if _, ok := envelope.PerFixture[name]; !ok {
+			return QualityDelta{}, fmt.Errorf("agenteval: fixture %q is present in the no-envelope arm but absent from the envelope arm; the two arms are not comparable", name)
+		}
+	}
 	d := QualityDelta{PerFixture: make(map[string]float64, len(envelope.PerFixture)), Threshold: threshold}
 	for name, env := range envelope.PerFixture {
-		d.PerFixture[name] = env - noEnvelope.PerFixture[name]
+		noEnv, ok := noEnvelope.PerFixture[name]
+		if !ok {
+			return QualityDelta{}, fmt.Errorf("agenteval: fixture %q is present in the envelope arm but absent from the no-envelope arm; the two arms are not comparable", name)
+		}
+		d.PerFixture[name] = env - noEnv
 	}
 	d.Overall = envelope.Overall - noEnvelope.Overall
 	d.Regressed = d.Overall < threshold
-	return d
+	return d, nil
 }

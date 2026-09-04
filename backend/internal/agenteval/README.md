@@ -116,8 +116,10 @@ its own source text would pass containment **vacuously**.
 ### The offline gates
 
 - `TestInjectionCorpus_ContainedInEveryReviewedRender` — for every fixture and
-  every reviewed render (`plan`, `plan_review`, `implement_review`), each probe
-  must occur at an offset **strictly inside** its channel's envelope span.
+  every reviewed render (`plan`, `plan_review`, `implement_review`), EVERY
+  OCCURRENCE of each probe must fall at an offset **strictly inside** its
+  channel's envelope span — the loop enumerates all of them, so a third or
+  later stray copy cannot escape behind the contained ones.
   It asserts on OFFSETS, not substring presence, and that distinction is
   load-bearing: with `neutralizeEnvelopeDelimiters` deleted, the
   delimiter-breakout fixture's forged `<<<END …>>>` closes the envelope early
@@ -188,6 +190,15 @@ a measured value** — no data on this judge's dispersion over plan-quality
 rubrics exists yet, because the live arm has never run here. It is carried as a
 PARAMETER (`CompareQualityArms` takes it) so #3187 can retune it against real
 samples.
+
+**`CompareQualityArms` FAILS CLOSED on a fixture-name mismatch** (it returns
+`(QualityDelta, error)`). A fixture name present in one arm's `PerFixture` and
+absent from the other's — in either direction — is an error naming the fixture
+and the arm it is missing from. Indexing an absent key would compute that
+fixture's delta against `0.0`, a score no judge produced, which through the
+overall mean can manufacture a regression or mask a real one. `RunQualityArm`
+drives both arms from the same case slice so the maps align in practice, but
+the function is exported and must not compare against a phantom arm.
 
 ---
 

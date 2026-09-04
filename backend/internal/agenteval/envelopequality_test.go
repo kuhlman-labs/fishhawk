@@ -59,6 +59,11 @@ func TestStripBodyEnvelope_AcceptsRealPromptOutput(t *testing.T) {
 // TestStripBodyEnvelope_FailsClosed carries one case per named mode
 // (a)..(e). Each asserts a non-nil error AND that the message names the
 // mode, so a strip failing for an unrelated reason cannot green it.
+//
+// Modes (b) and (c) assert the LEADING delimiter by name, not the shared
+// "present without" phrase: both branches emit that phrase, so a shared
+// substring would leave the two cases indistinguishable and a swapped
+// implementation of (b) and (c) would pass both.
 func TestStripBodyEnvelope_FailsClosed(t *testing.T) {
 	built := realPlanPrompt(t)
 
@@ -69,14 +74,16 @@ func TestStripBodyEnvelope_FailsClosed(t *testing.T) {
 	}{
 		{"a_neither_delimiter", "a prompt with no envelope at all", "neither"},
 		{
+			// The message must name BEGIN as the delimiter that is present.
 			"b_begin_without_end",
 			strings.Replace(built, bodyEnvelopeEnd, "", 1),
-			"present without",
+			fmt.Sprintf("%q present without", bodyEnvelopeBegin),
 		},
 		{
+			// ...and here END, so swapping the two branches reddens both.
 			"c_end_without_begin",
 			strings.Replace(built, bodyEnvelopeBegin, "", 1),
-			"present without",
+			fmt.Sprintf("%q present without", bodyEnvelopeEnd),
 		},
 		{
 			// END BEFORE BEGIN. Constructed by swapping the two delimiter
@@ -325,7 +332,10 @@ func TestQualityArm_AggregatesEndToEnd(t *testing.T) {
 
 	// Signed delta: envelope minus no-envelope. Positive here, so NOT a
 	// regression at the default threshold.
-	d := CompareQualityArms(env, noEnv, DefaultQualityRegressionThreshold)
+	d, err := CompareQualityArms(env, noEnv, DefaultQualityRegressionThreshold)
+	if err != nil {
+		t.Fatalf("compare arms: %v", err)
+	}
 	if !nearly(d.Overall, 13.0/3.0-3.0) {
 		t.Errorf("delta Overall = %v, want %v", d.Overall, 13.0/3.0-3.0)
 	}
@@ -338,7 +348,11 @@ func TestQualityArm_AggregatesEndToEnd(t *testing.T) {
 
 	// Swap the arms: the same magnitude with the opposite sign IS a
 	// regression at the default threshold.
-	if rev := CompareQualityArms(noEnv, env, DefaultQualityRegressionThreshold); !rev.Regressed {
+	rev, err := CompareQualityArms(noEnv, env, DefaultQualityRegressionThreshold)
+	if err != nil {
+		t.Fatalf("compare arms (swapped): %v", err)
+	}
+	if !rev.Regressed {
 		t.Errorf("delta %v must be reported as a regression at threshold %v", rev.Overall, DefaultQualityRegressionThreshold)
 	}
 }
@@ -366,11 +380,59 @@ func TestCompareQualityArms_ThresholdBoundary(t *testing.T) {
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			d := CompareQualityArms(arm(tc.env), arm(tc.noEnv), DefaultQualityRegressionThreshold)
+			d, err := CompareQualityArms(arm(tc.env), arm(tc.noEnv), DefaultQualityRegressionThreshold)
+			if err != nil {
+				t.Fatalf("compare arms: %v", err)
+			}
 			if d.Regressed != tc.wantRegressed {
 				t.Fatalf("delta %v: Regressed = %v, want %v", d.Overall, d.Regressed, tc.wantRegressed)
 			}
 		})
+	}
+}
+
+// TestCompareQualityArms_FixtureMismatchFailsClosed: a fixture name present
+// in one arm and absent from the other is an ERROR naming that fixture, in
+// BOTH directions. Without the guard the absent side indexes to 0.0 and the
+// delta is computed against a score no judge produced — which through the
+// overall mean can manufacture a regression or mask a real one.
+//
+// The mismatched pair is deliberately self-consistent in every OTHER
+// respect (same threshold, same Overall arithmetic), so the RED under a
+// deleted guard lands on the mismatch itself and not on an unrelated
+// difference.
+func TestCompareQualityArms_FixtureMismatchFailsClosed(t *testing.T) {
+	both := QualityArmReport{PerFixture: map[string]float64{"f1": 4, "f2": 4}, Overall: 4}
+	one := QualityArmReport{PerFixture: map[string]float64{"f1": 4}, Overall: 4}
+
+	for _, tc := range []struct {
+		name             string
+		env, noEnv       QualityArmReport
+		wantErrSubstring string
+	}{
+		{"missing from the no-envelope arm", both, one, `fixture "f2" is present in the envelope arm but absent from the no-envelope arm`},
+		{"missing from the envelope arm", one, both, `fixture "f2" is present in the no-envelope arm but absent from the envelope arm`},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := CompareQualityArms(tc.env, tc.noEnv, DefaultQualityRegressionThreshold)
+			if err == nil {
+				t.Fatalf("a fixture-name mismatch must fail closed; got delta %+v and no error", d)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstring) {
+				t.Fatalf("error %q must contain %q", err.Error(), tc.wantErrSubstring)
+			}
+			// Fail-closed means NO usable delta escapes alongside the error.
+			if len(d.PerFixture) != 0 {
+				t.Fatalf("a failed comparison must return the zero QualityDelta; got %+v", d)
+			}
+		})
+	}
+
+	// Control: the SAME fixture set on both sides still compares cleanly, so
+	// the guard rejects the mismatch and not comparison in general.
+	if _, err := CompareQualityArms(both, both, DefaultQualityRegressionThreshold); err != nil {
+		t.Fatalf("aligned arms must compare without error; got %v", err)
 	}
 }
 
