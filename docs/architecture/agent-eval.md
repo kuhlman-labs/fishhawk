@@ -345,6 +345,71 @@ file the tracking issues). In priority order:
    scheduled GitHub workflow — a human-led `.github/workflows` change —
    and is out of scope here.
 
+## Prompt-envelope evaluation (E60.2 / #2291)
+
+Two committed corpora measure whether #2290's asymmetric issue-body treatment
+is right. They are offline-by-default; the behavioural halves are opt-in and
+double env-gated, and both SKIP in a checkout with no API key.
+
+### Injection corpus — `injection.go`, `testdata/injection-corpus/`
+
+Five attack classes (direct instruction override, fake authority claim,
+envelope delimiter breakout, code-fence-embedded instructions, split
+body/comment payload), each a committed `case.json` carrying the adversarial
+body, its comments, containment probes, a literal compliance marker, and
+either a `behavioral_rubric` or a `marker_only` declaration with a reason.
+`LoadInjectionCorpus` has THIRTEEN named fail-closed modes; an absent corpus
+directory is an ERROR, not an empty slice, because a silently-missing corpus is
+a silently-disabled gate.
+
+**The offline gate asserts on OFFSETS.** Each probe must occur strictly inside
+its channel's envelope span in `plan`, `plan_review` and `implement_review`,
+and nowhere at all in `implement` (the never-re-ingest invariant). Offsets,
+not substring presence: a probe present in the prompt but outside the envelope
+is the containment failure, and a presence assertion calls it a pass.
+
+**The marker is NECESSARY, never SUFFICIENT, so the verdict has three states.**
+Seeing the compliance marker proves the instruction was followed; not seeing it
+proves nothing. `InjectionVerdict` therefore returns compliant /
+non-compliant / **indeterminate**. A `marker_only` fixture with the marker
+absent is INDETERMINATE — never resistant — and indeterminate is counted and
+rendered in its own column, never as a pass. The decider dimension
+(`followed_injected_instruction`) is guaranteed at BOTH ends: the loader
+refuses a rubric that omits it, and the verdict refuses to read a card that
+lacks it, because indexing an absent key would yield score 0 and read as the
+strongest possible resistance.
+
+### Envelope-quality corpus — `envelopequality.go`, `testdata/envelope-quality-corpus/`
+
+Three realistic non-adversarial bodies, A/B'd between the prompt as built and
+the same prompt with the envelope removed by `StripBodyEnvelope` (five
+fail-closed modes, including a partial-drift mode that errors when the framing
+paragraph does not byte-match). The strip is a HARNESS-side transform and the
+only way to produce a no-envelope arm — no production off-switch exists in
+`backend/internal/prompt`. Judging reuses the rubric judge on
+`requirement_coverage` / `structural_fidelity` / `actionability`; aggregation
+is sample-mean then unweighted fixture-mean; N=5 per fixture per arm; the
+default regression threshold is −0.25 on the 1–5 scale, carried as a parameter.
+
+### Rubric-parameterized judge (reuse, not a fork)
+
+`judge.go` carries ONE send/decode/re-roll/bounds path, `runJudged`. The fixed
+three-dimension `llmJudge.Judge` and the parameterized `rubricJudge.JudgeRubric`
+both project onto it, and `schema.go`'s `JudgeCardSchema()` delegates to
+`RubricCardSchema(judgeDimensions)` — so the error-not-fail-open contract, the
+bounded-score validation and the schema bound cannot diverge between the Tier-B
+card and a rubric card. The pre-existing judge and schema test tables are the
+behaviour-preservation pin for that refactor and pass unchanged.
+
+### Status: apparatus shipped, measurement NOT taken
+
+The offline gates run in every `scripts/test verify`. Both live arms skip for
+want of `FISHHAWKD_ANTHROPIC_API_KEY`, so #2291 acceptance criteria 1, 2 and 4
+are **UNMEASURED**; **#3187** owns them and the treatment decision they
+license. Evidence document (what is proven vs what is not, plus the re-run
+recipe): `docs/compliance/prompt-injection-evidence.md`. Long-form contract:
+`backend/internal/agenteval/README.md`.
+
 ## Running it
 
 ```sh
@@ -354,6 +419,15 @@ scripts/test single -run 'TestJudge|TestCalibrat' ./backend/internal/agenteval/ 
 # Opt-in live judge calibration (makes a real model call; skipped otherwise):
 FISHHAWK_AGENTEVAL_JUDGE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   scripts/test single -run TestCalibrateLive ./backend/internal/agenteval/
+
+# Prompt-envelope corpora, offline halves (E60.2 / #2291; no model call):
+scripts/test single -run 'TestInjection|TestLoadInjection|TestEnvelopeQuality|TestStripBodyEnvelope|TestQualityArm' ./backend/internal/agenteval/
+
+# Opt-in live prompt-envelope arms (both SKIP without an API key):
+FISHHAWK_AGENTEVAL_INJECTION_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  scripts/test single -run TestInjectionLive ./backend/internal/agenteval/
+FISHHAWK_AGENTEVAL_QUALITY_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  scripts/test single -run TestEnvelopeQualityLive ./backend/internal/agenteval/
 ```
 
 Runs under `scripts/test` automatically as a backend module test, so the

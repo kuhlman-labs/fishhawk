@@ -140,3 +140,79 @@ func TestJudgeCardSchema_RoundTripsThroughDecode(t *testing.T) {
 		t.Errorf("card = %+v\nwant %+v", card, want)
 	}
 }
+
+// TestRubricCardSchema_BuildsClosedObjectForNamedDimensions pins the
+// parameterized builder JudgeCardSchema now delegates to (#2291): one
+// closed object per named dimension, required in the GIVEN order, with the
+// same scoreMin..scoreMax enum.
+func TestRubricCardSchema_BuildsClosedObjectForNamedDimensions(t *testing.T) {
+	dims := []string{"followed_injected_instruction", "surfaced_the_attempt"}
+	schema := RubricCardSchema(dims)
+
+	if schema["additionalProperties"] != false {
+		t.Errorf("top-level additionalProperties = %v, want false", schema["additionalProperties"])
+	}
+	required, ok := schema["required"].([]any)
+	if !ok {
+		t.Fatalf("required is missing or not an array: %v", schema["required"])
+	}
+	if len(required) != len(dims) {
+		t.Fatalf("required = %v, want %v", required, dims)
+	}
+	for i, d := range dims {
+		if required[i] != d {
+			t.Errorf("required[%d] = %v, want %q (order must match the given dimension order)", i, required[i], d)
+		}
+	}
+
+	props := propsOf(t, schema, "rubric top-level")
+	if len(props) != len(dims) {
+		t.Errorf("properties has %d keys, want exactly the %d declared dimensions", len(props), len(dims))
+	}
+	wantEnum := scoreEnum()
+	for _, d := range dims {
+		obj := dimObjOf(t, props, d)
+		if obj["additionalProperties"] != false {
+			t.Errorf("%s.additionalProperties = %v, want false", d, obj["additionalProperties"])
+		}
+		dimProps := propsOf(t, obj, d)
+		assertTagsPresent(t, reflect.TypeOf(DimensionScore{}), dimProps, d+" (DimensionScore)")
+		scoreNode, ok := dimProps["score"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s.score is missing or not an object", d)
+		}
+		if !reflect.DeepEqual(scoreNode["enum"], wantEnum) {
+			t.Errorf("%s.score enum = %v, want %v", d, scoreNode["enum"], wantEnum)
+		}
+	}
+}
+
+// TestRubricCardSchema_ReturnsAFreshMap: the SDK may mutate the schema map
+// in place during request marshaling, so no two calls may share state —
+// including the per-dimension sub-objects.
+func TestRubricCardSchema_ReturnsAFreshMap(t *testing.T) {
+	dims := []string{"alpha"}
+	a := RubricCardSchema(dims)
+	propsOf(t, a, "a")["alpha"].(map[string]any)["type"] = "MUTATED"
+	b := RubricCardSchema(dims)
+	if got := propsOf(t, b, "b")["alpha"].(map[string]any)["type"]; got != "object" {
+		t.Errorf("a mutation to one call's schema leaked into the next: alpha.type = %v", got)
+	}
+	// JudgeCardSchema delegates to the same builder and must be fresh too.
+	c := JudgeCardSchema()
+	propsOf(t, c, "c")["meaningful_evidence"].(map[string]any)["type"] = "MUTATED"
+	d := JudgeCardSchema()
+	if got := propsOf(t, d, "d")["meaningful_evidence"].(map[string]any)["type"]; got != "object" {
+		t.Errorf("JudgeCardSchema is not fresh per call: meaningful_evidence.type = %v", got)
+	}
+}
+
+// TestJudgeCardSchema_DelegatesToRubricCardSchema is the delegation pin:
+// JudgeCardSchema() must be deep-equal to RubricCardSchema(judgeDimensions),
+// so the Tier-B bound and a rubric bound cannot diverge.
+func TestJudgeCardSchema_DelegatesToRubricCardSchema(t *testing.T) {
+	if !reflect.DeepEqual(JudgeCardSchema(), RubricCardSchema(judgeDimensions)) {
+		t.Errorf("JudgeCardSchema() is not RubricCardSchema(judgeDimensions):\n got %v\nwant %v",
+			JudgeCardSchema(), RubricCardSchema(judgeDimensions))
+	}
+}

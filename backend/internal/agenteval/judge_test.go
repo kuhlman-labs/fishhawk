@@ -299,3 +299,168 @@ func TestExtractJSONObject(t *testing.T) {
 		t.Errorf("unexpected card from fenced response: %+v", card)
 	}
 }
+
+// --- Rubric judge (#2291) -------------------------------------------------
+//
+// The rubric judge shares ONE send/decode/re-roll/bounds path (runJudged)
+// with the Tier-B judge above, so these tests re-pin the same contract
+// through the parameterized surface. The EXISTING tests above are the
+// behaviour-preservation pin for the refactor and are byte-unchanged.
+
+// testRubric is a two-dimension rubric for the tests below.
+func testRubric() Rubric {
+	return Rubric{
+		Name:         "test",
+		SystemPrompt: "score these",
+		Dimensions:   []string{"alpha", "beta"},
+	}
+}
+
+const goodRubricBody = `{"alpha":{"score":4,"rationale":"a"},"beta":{"score":2,"rationale":"b"}}`
+
+// TestJudgeRubric_HappyPath: a well-formed roll decodes into a card keyed
+// by the rubric's dimensions, stamped with the sender's model name.
+func TestJudgeRubric_HappyPath(t *testing.T) {
+	s := &fakeSender{responses: []string{goodRubricBody}, modelName: "claude-sonnet-4-6"}
+	card, err := NewRubricJudge(s, "", 2).JudgeRubric(context.Background(), testRubric(), "text")
+	if err != nil {
+		t.Fatalf("JudgeRubric: %v", err)
+	}
+	if s.calls != 1 {
+		t.Errorf("calls = %d, want 1", s.calls)
+	}
+	if s.gotSystem[0] != "score these" {
+		t.Errorf("system text = %q, want the rubric's SystemPrompt", s.gotSystem[0])
+	}
+	alpha, ok := card.Score("alpha")
+	if !ok || alpha.Score != 4 || alpha.Rationale != "a" {
+		t.Errorf("alpha = %+v (found %v), want {4 a}", alpha, ok)
+	}
+	if card.Model != "claude-sonnet-4-6" {
+		t.Errorf("Model = %q, want the sender's reported model", card.Model)
+	}
+	// A dimension the rubric did not declare is NOT present — Score
+	// reports found=false rather than a zero score.
+	if _, ok := card.Score("gamma"); ok {
+		t.Error("Score reported an undeclared dimension as found")
+	}
+}
+
+// TestJudgeRubric_TransportErrorNotReRolled: a transport error returns
+// immediately and unchanged, with the ZERO card — never re-rolled, never a
+// fabricated score.
+func TestJudgeRubric_TransportErrorNotReRolled(t *testing.T) {
+	sentinel := errors.New("connection reset")
+	s := &fakeSender{err: sentinel, modelName: "m"}
+	card, err := NewRubricJudge(s, "", 3).JudgeRubric(context.Background(), testRubric(), "text")
+	if err == nil {
+		t.Fatal("want error on transport failure")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("want wrapped sentinel, got %v", err)
+	}
+	if card.Scores != nil || card.Model != "" {
+		t.Errorf("transport error must NOT yield a card, got %+v", card)
+	}
+	if s.calls != 1 {
+		t.Errorf("calls = %d, want 1 (transport error not re-rolled)", s.calls)
+	}
+}
+
+// TestJudgeRubric_ReRollsMalformedThenSucceeds proves the re-roll path.
+func TestJudgeRubric_ReRollsMalformedThenSucceeds(t *testing.T) {
+	s := &fakeSender{responses: []string{"garbage", goodRubricBody}, modelName: "m"}
+	card, err := NewRubricJudge(s, "", 3).JudgeRubric(context.Background(), testRubric(), "text")
+	if err != nil {
+		t.Fatalf("JudgeRubric: %v", err)
+	}
+	if s.calls != 2 {
+		t.Errorf("calls = %d, want 2", s.calls)
+	}
+	if beta, ok := card.Score("beta"); !ok || beta.Score != 2 {
+		t.Errorf("beta = %+v (found %v), want score 2", beta, ok)
+	}
+}
+
+// TestJudgeRubric_ExhaustedBudgetReturnsZeroCardAndError: a persistently
+// malformed response re-rolls to the bound then errors with no card.
+func TestJudgeRubric_ExhaustedBudgetReturnsZeroCardAndError(t *testing.T) {
+	s := &fakeSender{responses: []string{"not json at all"}, modelName: "m"}
+	card, err := NewRubricJudge(s, "", 2).JudgeRubric(context.Background(), testRubric(), "text")
+	if err == nil {
+		t.Fatal("want error on a persistently malformed response")
+	}
+	if card.Scores != nil {
+		t.Errorf("want zero card on error, got %+v", card)
+	}
+	if s.calls != 3 {
+		t.Errorf("calls = %d, want 3 (re-rolled to the bound)", s.calls)
+	}
+}
+
+// TestJudgeRubric_RejectsOutOfRangeScore: a score outside
+// [scoreMin, scoreMax] is a malformed verdict, on either bound.
+func TestJudgeRubric_RejectsOutOfRangeScore(t *testing.T) {
+	for _, bad := range []string{
+		`{"alpha":{"score":6,"rationale":"a"},"beta":{"score":2,"rationale":"b"}}`,
+		`{"alpha":{"score":0,"rationale":"a"},"beta":{"score":2,"rationale":"b"}}`,
+		`{"alpha":{"score":4,"rationale":"a"},"beta":{"score":-1,"rationale":"b"}}`,
+	} {
+		s := &fakeSender{responses: []string{bad}, modelName: "m"}
+		card, err := NewRubricJudge(s, "", 0).JudgeRubric(context.Background(), testRubric(), "text")
+		if err == nil {
+			t.Errorf("want error for out-of-range response %s", bad)
+		}
+		if card.Scores != nil {
+			t.Errorf("want zero card on error, got %+v", card)
+		}
+	}
+}
+
+// TestJudgeRubric_RejectsMissingDimension: a response omitting a declared
+// dimension errors rather than producing a card with a silent zero — the
+// decode-side half of the fail-closed rule InjectionVerdict enforces at
+// the verdict site.
+func TestJudgeRubric_RejectsMissingDimension(t *testing.T) {
+	s := &fakeSender{responses: []string{`{"alpha":{"score":4,"rationale":"a"}}`}, modelName: "m"}
+	card, err := NewRubricJudge(s, "", 0).JudgeRubric(context.Background(), testRubric(), "text")
+	if err == nil {
+		t.Fatal("want error for a missing dimension")
+	}
+	if !strings.Contains(err.Error(), "beta") {
+		t.Errorf("error should name the missing dimension, got %v", err)
+	}
+	if card.Scores != nil {
+		t.Errorf("want zero card on error, got %+v", card)
+	}
+}
+
+// TestJudgeRubric_RejectsEmptyRubricAndNilSender: the two construction
+// guards.
+func TestJudgeRubric_RejectsEmptyRubricAndNilSender(t *testing.T) {
+	s := &fakeSender{responses: []string{goodRubricBody}, modelName: "m"}
+	if _, err := NewRubricJudge(s, "", 0).JudgeRubric(context.Background(), Rubric{Name: "empty"}, "t"); err == nil {
+		t.Error("want error for a rubric declaring no dimensions")
+	}
+	if _, err := NewRubricJudge(nil, "", 0).JudgeRubric(context.Background(), testRubric(), "t"); err == nil {
+		t.Error("want error from a nil-sender rubric judge")
+	}
+}
+
+// TestRubricCard_ScoreDistinguishesAbsentFromZero is the type-level half
+// of the #2291 condition-2 fix: a missing key must be reported as ABSENT,
+// not as a zero score, because indexing Scores directly would silently
+// hand a caller score 0.
+func TestRubricCard_ScoreDistinguishesAbsentFromZero(t *testing.T) {
+	card := RubricCard{Scores: map[string]DimensionScore{"alpha": {Score: 3}}}
+	if _, ok := card.Score("missing"); ok {
+		t.Error("Score reported an absent dimension as found")
+	}
+	if s, ok := card.Score("alpha"); !ok || s.Score != 3 {
+		t.Errorf("alpha = %+v (found %v), want score 3", s, ok)
+	}
+	var zero RubricCard
+	if _, ok := zero.Score("alpha"); ok {
+		t.Error("a card with a nil Scores map must report every dimension absent")
+	}
+}

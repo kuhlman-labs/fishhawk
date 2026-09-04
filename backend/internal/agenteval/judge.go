@@ -138,34 +138,191 @@ func (j *llmJudge) Judge(ctx context.Context, lines []bundle.Line) (JudgeCard, e
 	if j.sender == nil {
 		return JudgeCard{}, fmt.Errorf("agenteval: judge has no MessageSender")
 	}
+	scores, modelName, err := runJudged(ctx, j.sender, j.maxRetries, judgeSystemPrompt, renderTrajectory(lines), judgeDimensions)
+	if err != nil {
+		return JudgeCard{}, err
+	}
+	return projectJudgeCard(scores, modelName), nil
+}
 
-	systemText := judgeSystemPrompt
-	userText := renderTrajectory(lines)
+// judgeDimensions is the fixed Tier-B dimension list, in the order
+// JudgeCardSchema declares them. It is the ONE place the three names are
+// enumerated: llmJudge.Judge, parseJudgeCard and JudgeCardSchema all read
+// it, so a rename cannot leave the decode and the schema bound disagreeing.
+var judgeDimensions = []string{"meaningful_evidence", "honest_uncertainty", "reasoning_quality"}
 
-	maxAttempts := j.maxRetries + 1
+// projectJudgeCard narrows a decoded rubric score map onto the fixed
+// three-dimension JudgeCard. Callers reach it only after runJudged /
+// decodeRubricScores validated every judgeDimensions entry, so each lookup
+// is present by construction.
+func projectJudgeCard(scores map[string]DimensionScore, modelName string) JudgeCard {
+	return JudgeCard{
+		MeaningfulEvidence: scores["meaningful_evidence"],
+		HonestUncertainty:  scores["honest_uncertainty"],
+		ReasoningQuality:   scores["reasoning_quality"],
+		Model:              modelName,
+	}
+}
+
+// Rubric is a parameterized judging contract: a named set of ordinal
+// dimensions plus the system instruction that defines them. It is the
+// generalization of the fixed three-dimension Tier-B judge above — the
+// #2291 eval corpora need to score OTHER dimension sets (an injection
+// fixture's behavioural rubric, the envelope-quality rubric) and forking a
+// second decode path would let the two drift, so the rubric judge and the
+// Tier-B judge share ONE send/decode/re-roll/bounds implementation
+// (runJudged).
+type Rubric struct {
+	// Name identifies the rubric in error text and reports.
+	Name string
+	// SystemPrompt is the fixed system instruction defining every
+	// dimension and the strict-JSON output contract.
+	SystemPrompt string
+	// Dimensions are the scored axes, in schema order. Every one must be
+	// present and in [scoreMin, scoreMax] for a card to decode.
+	Dimensions []string
+}
+
+// RubricCard is one rubric judging: a score per declared dimension plus
+// the model name the sender reported. Scores is keyed by dimension name.
+//
+// Read a dimension through Score, not by indexing Scores directly: a
+// missing key indexes to the ZERO DimensionScore, whose Score is 0, and a
+// caller that treats that as a real judgement fails OPEN. Score returns an
+// explicit found flag so the caller must decide what an absent dimension
+// means (#2291 operator condition 2).
+type RubricCard struct {
+	// Scores maps dimension name to its judged score.
+	Scores map[string]DimensionScore `json:"scores"`
+	// Model is the model name reported by the sender for the scoring call.
+	Model string `json:"model"`
+}
+
+// Score returns the DimensionScore for name and whether it was present.
+// found=false means the card carries NO judgement for that dimension —
+// never a zero score.
+func (c RubricCard) Score(name string) (DimensionScore, bool) {
+	if c.Scores == nil {
+		return DimensionScore{}, false
+	}
+	s, ok := c.Scores[name]
+	return s, ok
+}
+
+// RubricJudge scores free text against a parameterized Rubric. It carries
+// the SAME error-not-fail-open contract as Judge: every failure path
+// returns the zero RubricCard AND a non-nil error, never a fabricated
+// zero-score card.
+type RubricJudge interface {
+	JudgeRubric(ctx context.Context, r Rubric, userText string) (RubricCard, error)
+}
+
+// rubricJudge is the production RubricJudge over the same MessageSender
+// seam the Tier-B judge uses.
+type rubricJudge struct {
+	sender     MessageSender
+	model      string
+	maxRetries int
+}
+
+// NewRubricJudge constructs a RubricJudge over sender. model selects the
+// judge model (use DefaultJudgeModel for the default); maxRetries bounds
+// the re-rolls on a malformed/out-of-range/missing-dimension response
+// (0 = a single attempt). A nil sender yields a judge that errors on
+// first use rather than panicking.
+func NewRubricJudge(sender MessageSender, model string, maxRetries int) RubricJudge {
+	if model == "" {
+		model = DefaultJudgeModel
+	}
+	return &rubricJudge{sender: sender, model: model, maxRetries: maxRetries}
+}
+
+// JudgeRubric sends userText under r.SystemPrompt and decodes a card
+// carrying every dimension r declares.
+func (j *rubricJudge) JudgeRubric(ctx context.Context, r Rubric, userText string) (RubricCard, error) {
+	if j.sender == nil {
+		return RubricCard{}, fmt.Errorf("agenteval: rubric judge has no MessageSender")
+	}
+	if len(r.Dimensions) == 0 {
+		return RubricCard{}, fmt.Errorf("agenteval: rubric %q declares no dimensions", r.Name)
+	}
+	scores, modelName, err := runJudged(ctx, j.sender, j.maxRetries, r.SystemPrompt, userText, r.Dimensions)
+	if err != nil {
+		return RubricCard{}, err
+	}
+	return RubricCard{Scores: scores, Model: modelName}, nil
+}
+
+// runJudged is the ONE send/decode/re-roll/bounds path in this package.
+// Both llmJudge.Judge and rubricJudge.JudgeRubric project onto it, so the
+// error-not-fail-open contract, the transport-error-is-not-re-rolled rule
+// and the [scoreMin, scoreMax] bound cannot diverge between them.
+//
+// Contract, verbatim from the pre-refactor llmJudge.Judge:
+//
+//   - a sender transport error returns IMMEDIATELY and unchanged (never
+//     re-rolled — the adapter owns its own crash-retry);
+//   - a decode failure (malformed JSON, out-of-range score, missing
+//     dimension) is re-rolled up to maxRetries;
+//   - EVERY failure path returns a nil map AND a non-nil error, so no
+//     caller can mistake a fabricated zero-score card for a verdict.
+func runJudged(ctx context.Context, sender MessageSender, maxRetries int, systemText, userText string, dims []string) (map[string]DimensionScore, string, error) {
+	maxAttempts := maxRetries + 1
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
 
 	var lastDecodeErr error
 	for attempt := 1; ; attempt++ {
-		responseText, modelName, _, _, _, _, err := j.sender.Messages(ctx, systemText, userText)
+		responseText, modelName, _, _, _, _, err := sender.Messages(ctx, systemText, userText)
 		if err != nil {
 			// Transport/infer-stage fault: NOT a decode failure. Return
-			// verbatim with the zero card — never a fabricated score.
-			return JudgeCard{}, fmt.Errorf("agenteval: judge message call: %w", err)
+			// verbatim with no scores — never a fabricated score.
+			return nil, "", fmt.Errorf("agenteval: judge message call: %w", err)
 		}
 
-		card, decodeErr := parseJudgeCard(responseText, modelName)
+		scores, decodeErr := decodeRubricScores(responseText, dims)
 		if decodeErr == nil {
-			return card, nil
+			return scores, modelName, nil
 		}
 
 		lastDecodeErr = decodeErr
 		if attempt >= maxAttempts || ctx.Err() != nil {
-			return JudgeCard{}, fmt.Errorf("agenteval: judge decode failed after %d attempt(s): %w", attempt, lastDecodeErr)
+			return nil, "", fmt.Errorf("agenteval: judge decode failed after %d attempt(s): %w", attempt, lastDecodeErr)
 		}
 	}
+}
+
+// decodeRubricScores decodes responseText and validates that EVERY named
+// dimension is present with a Score in [scoreMin, scoreMax]. A missing
+// dimension decodes to Score 0, which fails the range check — so
+// missing-dimension and out-of-range collapse to one validation path, as
+// they did before the rubric refactor.
+//
+// Unknown top-level keys are tolerated (decoded into json.RawMessage and
+// ignored), matching the pre-refactor strict-then-lenient decode: a model
+// that adds an extra key is malformed-but-recoverable.
+func decodeRubricScores(responseText string, dims []string) (map[string]DimensionScore, error) {
+	raw := extractJSONObject(responseText)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		return nil, fmt.Errorf("decode judge JSON: %w", err)
+	}
+
+	out := make(map[string]DimensionScore, len(dims))
+	for _, d := range dims {
+		var s DimensionScore
+		if rawDim, ok := fields[d]; ok {
+			if err := json.Unmarshal(rawDim, &s); err != nil {
+				return nil, fmt.Errorf("decode judge JSON: dimension %q: %w", d, err)
+			}
+		}
+		if s.Score < scoreMin || s.Score > scoreMax {
+			return nil, fmt.Errorf("dimension %q score %d out of range [%d,%d] (missing or invalid)", d, s.Score, scoreMin, scoreMax)
+		}
+		out[d] = s
+	}
+	return out, nil
 }
 
 // judgeCardWire is the on-the-wire shape the model is asked to emit. It
@@ -178,44 +335,17 @@ type judgeCardWire struct {
 	ReasoningQuality   DimensionScore `json:"reasoning_quality"`
 }
 
-// parseJudgeCard decodes responseText into a JudgeCard and validates
-// that every dimension's Score is present and in [scoreMin, scoreMax].
-// A missing dimension decodes to Score 0, which fails the range check —
-// so missing-dimension and out-of-range collapse to one validation
-// path. modelName (from the sender) is stamped onto the returned card.
+// parseJudgeCard decodes responseText into a JudgeCard. It is a thin
+// projection over decodeRubricScores with the fixed judgeDimensions list,
+// so the Tier-B card and every Rubric card share one decode, one bounds
+// check and one error vocabulary. modelName (from the sender) is stamped
+// onto the returned card.
 func parseJudgeCard(responseText, modelName string) (JudgeCard, error) {
-	raw := extractJSONObject(responseText)
-	var w judgeCardWire
-	dec := json.NewDecoder(strings.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&w); err != nil {
-		// Retry tolerant of unknown fields too: a model that adds an
-		// extra key is malformed-but-recoverable, so fall back to a
-		// lenient decode before giving up.
-		if lerr := json.Unmarshal([]byte(raw), &w); lerr != nil {
-			return JudgeCard{}, fmt.Errorf("decode judge JSON: %w", lerr)
-		}
+	scores, err := decodeRubricScores(responseText, judgeDimensions)
+	if err != nil {
+		return JudgeCard{}, err
 	}
-
-	for _, d := range []struct {
-		name  string
-		score int
-	}{
-		{"meaningful_evidence", w.MeaningfulEvidence.Score},
-		{"honest_uncertainty", w.HonestUncertainty.Score},
-		{"reasoning_quality", w.ReasoningQuality.Score},
-	} {
-		if d.score < scoreMin || d.score > scoreMax {
-			return JudgeCard{}, fmt.Errorf("dimension %q score %d out of range [%d,%d] (missing or invalid)", d.name, d.score, scoreMin, scoreMax)
-		}
-	}
-
-	return JudgeCard{
-		MeaningfulEvidence: w.MeaningfulEvidence,
-		HonestUncertainty:  w.HonestUncertainty,
-		ReasoningQuality:   w.ReasoningQuality,
-		Model:              modelName,
-	}, nil
+	return projectJudgeCard(scores, modelName), nil
 }
 
 // extractJSONObject returns the substring from the first '{' to the last
