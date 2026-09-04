@@ -841,20 +841,60 @@ func (c *apiClient) GetRunLatency(ctx context.Context, runID uuid.UUID) (*RunLat
 // OnboardingReadinessReport mirrors the backend's GET
 // /v0/onboarding/readiness body
 // (`backend/internal/server/onboarding.go::onboardingReadinessResponse`, E29.4 /
-// #1511): the four server-side-only readiness checks a repo's first run needs —
+// #1511): the five server-side-only readiness checks a repo's first run needs —
 // GitHub App installation, the committed workflow spec's parse/validate state,
-// per-reviewer availability on this deployment, and the caller token's scope
-// adequacy. Repeated here rather than imported because the MCP server's
-// apiClient is a thin local copy (the import direction is `cli → backend`, not
-// the reverse). Every field is a scalar/string/slice — no UUID/raw-JSON field,
-// so the #371 reflection trap does not apply. MUST stay byte-identical with the
-// backend response's json tags.
+// per-reviewer availability on this deployment, the caller token's scope
+// adequacy, and whether the check Fishhawk publishes is actually required by
+// the repo's branch protection (#3161). Repeated here rather than imported
+// because the MCP server's apiClient is a thin local copy (the import direction
+// is `cli → backend`, not the reverse). Every field is a scalar/string/slice —
+// no UUID/raw-JSON field, so the #371 reflection trap does not apply. MUST stay
+// byte-identical with the backend response's json tags.
 type OnboardingReadinessReport struct {
 	Repo      string               `json:"repo" jsonschema:"the target repo as owner/name that was probed"`
 	App       OnboardingApp        `json:"app" jsonschema:"GitHub App installation readiness"`
 	Spec      OnboardingSpec       `json:"spec" jsonschema:"committed workflow spec fetch/parse/validate readiness"`
 	Reviewers []OnboardingReviewer `json:"reviewers" jsonschema:"per spec-declared reviewer availability on this deployment; empty when the spec is unavailable or invalid"`
 	Scopes    OnboardingScopes     `json:"scopes" jsonschema:"caller-token run-driving scope adequacy"`
+	MergeGate OnboardingMergeGate  `json:"merge_gate" jsonschema:"whether the fishhawk_audit_complete check Fishhawk publishes is actually REQUIRED by the repo protection on its default branch; zero-valued against an older fishhawkd that does not serve the field"`
+}
+
+// OnboardingMergeGate mirrors the backend mergeGateReadiness sub-object
+// (#3161): the reconciliation of the check Fishhawk PUBLISHES against the
+// protection the forge actually enforces on the repo's default branch.
+//
+// Read `status` fail-closed. "not_required" is a POSITIVE finding — both
+// protection surfaces answered and neither requires the check. "unknown" means
+// the question could not be settled (no installation, a 403 from a missing
+// `administration: read`, a rulesets endpoint that 404s, an unevaluatable
+// ref_name condition, a transport error) and `reason` names which. An unknown
+// is NOT evidence that the check is unrequired.
+type OnboardingMergeGate struct {
+	Status           string                   `json:"status" jsonschema:"'required' (a protection source requires the check), 'not_required' (both surfaces answered and neither does), or 'unknown' (the question could not be settled - reason names why; NOT evidence the check is unrequired)"`
+	Check            string                   `json:"check" jsonschema:"the status-check context that was probed (fishhawk_audit_complete)"`
+	Branch           string                   `json:"branch,omitempty" jsonschema:"the repo real default branch, the branch the probe evaluated"`
+	Sources          []OnboardingMergeGateSrc `json:"sources,omitempty" jsonschema:"the protection surfaces observed requiring the check, each with its OWN bypass posture; never aggregated across sources"`
+	Bypassable       bool                     `json:"bypassable" jsonschema:"true only when EVERY requiring source is individually bypassable - a merger must bypass all of them, so one un-bypassable source still enforces the check"`
+	Authoritative    bool                     `json:"authoritative" jsonschema:"true only when both protection surfaces answered definitively for the probed branch"`
+	Reason           string                   `json:"reason,omitempty" jsonschema:"machine code naming why the evaluation did not settle: app_not_installed, github_client_unconfigured, default_branch_unresolved, probe_failed, rulesets_unqueryable, non_authoritative, administration_read_missing, transport_error"`
+	Detail           string                   `json:"detail,omitempty" jsonschema:"the human sentence for reason"`
+	Remediation      string                   `json:"remediation,omitempty" jsonschema:"the operator next step when there is one"`
+	RequiredContexts []string                 `json:"required_contexts,omitempty" jsonschema:"the union of every context the evaluated sources require - what IS required, when the probed check is not"`
+}
+
+// OnboardingMergeGateSrc mirrors the backend mergeGateSource sub-object: one
+// protection surface requiring the probed check.
+//
+// bypass_entries counts a ruleset's `bypass_actors` ENTRIES — each a role,
+// team, app or integration that may cover many people or none. It is never a
+// headcount, and the classic source's admin exemption is carried by
+// enforce_admins as its own named condition, never coerced into a count of 1.
+type OnboardingMergeGateSrc struct {
+	Identity      string `json:"identity" jsonschema:"'branch_protection' or 'ruleset:<id>'"`
+	Classic       bool   `json:"classic,omitempty" jsonschema:"true for the classic branch-protection source"`
+	BypassEntries int    `json:"bypass_entries" jsonschema:"number of entries in THIS ruleset bypass_actors array - roles, teams or apps, each of which may cover multiple people; always 0 for the classic source"`
+	EnforceAdmins bool   `json:"enforce_admins,omitempty" jsonschema:"classic protection enforce_admins.enabled; false means repository admins are exempt from this source"`
+	Bypassable    bool   `json:"bypassable" jsonschema:"whether THIS source alone can be bypassed"`
 }
 
 // OnboardingApp mirrors the backend appInstallReadiness sub-object: whether the

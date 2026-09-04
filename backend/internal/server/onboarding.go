@@ -1,13 +1,17 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergegate"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -26,18 +30,21 @@ var requiredRunScopes = []string{
 	"read:runs", "read:audit", "write:runs", "write:approvals", "write:stages",
 }
 
-// onboardingReadinessResponse aggregates the four server-side-only checks
+// onboardingReadinessResponse aggregates the five server-side-only checks
 // `fishhawk doctor` (E29.5) needs before a repo's first run: GitHub App
 // installation, the committed workflow spec's parse/validate state, per
-// reviewer availability on this deployment, and the caller token's scope
-// adequacy. The checks cascade — a not-installed repo yields an unavailable
-// spec and empty reviewers — each with an explanatory note.
+// reviewer availability on this deployment, the caller token's scope
+// adequacy, and — since #3161 — whether the `fishhawk_audit_complete` check
+// Fishhawk publishes is actually REQUIRED by the repo's branch protection.
+// The checks cascade — a not-installed repo yields an unavailable spec, empty
+// reviewers and an `unknown` merge gate — each with an explanatory note.
 type onboardingReadinessResponse struct {
 	Repo      string              `json:"repo"`
 	App       appInstallReadiness `json:"app"`
 	Spec      specReadiness       `json:"spec"`
 	Reviewers []reviewerReadiness `json:"reviewers"`
 	Scopes    scopeReadiness      `json:"scopes"`
+	MergeGate mergeGateReadiness  `json:"merge_gate"`
 }
 
 // appInstallReadiness reports whether the GitHub App is installed on the
@@ -81,6 +88,204 @@ type scopeReadiness struct {
 	Required []string `json:"required"`
 	Missing  []string `json:"missing"`
 	Note     string   `json:"note,omitempty"`
+}
+
+// mergeGateReadiness reports whether the `fishhawk_audit_complete` Check Run
+// Fishhawk PUBLISHES is actually REQUIRED by the repo's protection
+// configuration on its default branch (#3161), reconciled by
+// backend/internal/mergegate.
+//
+// The invariant this field exists to carry: Status is `not_required` ONLY on a
+// fully authoritative read of BOTH protection surfaces. Every degrade — no
+// GitHub client, App not installed, default-branch lookup failure, a 403 from
+// a missing `administration: read`, a rulesets endpoint that 404s, a ref_name
+// token the v0 matcher cannot evaluate, a transport error or a probe timeout —
+// resolves to `unknown` with a naming Reason. A surface that was never read
+// must never render as "this repo requires nothing".
+//
+// It is REPORTING only: it gates no run, no merge and no exit code, and it is
+// a point-in-time read — a ruleset edited after the probe is not reflected.
+// Long-form contract: backend/internal/server/README.md.
+type mergeGateReadiness struct {
+	// Status is "required", "not_required" or "unknown".
+	Status string `json:"status"`
+	// Check is the context name that was probed.
+	Check string `json:"check"`
+	// Branch is the repo's REAL default branch, the branch the probe
+	// evaluated. Empty when the probe never got far enough to resolve it.
+	Branch string `json:"branch,omitempty"`
+	// Sources are the protection surfaces observed requiring Check, each
+	// with its OWN bypass posture. Never aggregated across sources: each
+	// source enforces independently, so a merger must bypass every one of
+	// them.
+	Sources []mergeGateSource `json:"sources,omitempty"`
+	// Bypassable is the conjunction over Sources — true only when EVERY
+	// requiring source is individually bypassable. False when Sources is
+	// empty.
+	Bypassable bool `json:"bypassable"`
+	// Authoritative is true only when both protection surfaces answered
+	// definitively for the probed branch.
+	Authoritative bool `json:"authoritative"`
+	// Reason is a machine code naming why the evaluation did not settle (or
+	// settled only partially). Non-empty whenever Status is "unknown".
+	Reason string `json:"reason,omitempty"`
+	// Detail is the human sentence for Reason.
+	Detail string `json:"detail,omitempty"`
+	// Remediation is the operator's next step, when there is one.
+	Remediation string `json:"remediation,omitempty"`
+	// RequiredContexts is the union of every context the evaluated sources
+	// require — what IS required, when the probed check is not.
+	RequiredContexts []string `json:"required_contexts,omitempty"`
+}
+
+// mergeGateSource is one protection surface requiring the probed check, with
+// its own bypass detail.
+//
+// BypassEntries counts a ruleset's `bypass_actors` ENTRIES — each a role, team,
+// app or integration that may cover many people or none. It is never a
+// headcount, and the classic source's admin exemption is NOT coerced into a
+// count of 1: that is carried by EnforceAdmins as its own named condition.
+type mergeGateSource struct {
+	// Identity is "branch_protection" or "ruleset:<id>".
+	Identity string `json:"identity"`
+	// Classic is true for the classic branch-protection source.
+	Classic bool `json:"classic,omitempty"`
+	// BypassEntries is the number of entries in THIS ruleset's bypass_actors
+	// array. Always 0 for the classic source.
+	BypassEntries int `json:"bypass_entries"`
+	// EnforceAdmins mirrors classic protection's enforce_admins.enabled;
+	// meaningful only when Classic is true. False means repository admins are
+	// exempt from this source.
+	EnforceAdmins bool `json:"enforce_admins,omitempty"`
+	// Bypassable is whether THIS source alone can be bypassed.
+	Bypassable bool `json:"bypassable"`
+}
+
+// Reason codes for the degrades that never reach mergegate.Reconcile — the
+// preconditions the server itself cannot satisfy. The forge-level codes
+// (rulesets_unqueryable, non_authoritative, administration_read_missing,
+// transport_error) come from the mergegate package and are surfaced verbatim.
+const (
+	// mergeGateReasonNoGitHubClient — this deployment has no GitHub client
+	// wired, so no protection surface can be read at all.
+	mergeGateReasonNoGitHubClient = "github_client_unconfigured"
+	// mergeGateReasonAppNotInstalled — both protection reads need an
+	// installation token, which an uninstalled App cannot mint.
+	mergeGateReasonAppNotInstalled = "app_not_installed"
+	// mergeGateReasonDefaultBranch — the repo's REAL default branch could not
+	// be resolved. The probe never guesses "main": a `~DEFAULT_BRANCH`
+	// ruleset evaluated against the wrong branch would silently mis-answer.
+	mergeGateReasonDefaultBranch = "default_branch_unresolved"
+	// mergeGateReasonProbeFailed — Reconcile rejected the call itself (a
+	// caller mistake such as an empty branch). Forge failures never land
+	// here; they resolve to a StatusUnknown reconciliation instead.
+	mergeGateReasonProbeFailed = "probe_failed"
+)
+
+// mergeGateRepository resolves the target repo's metadata (its REAL default
+// branch). It is a package var so a test can drive probeMergeGate's
+// nil/empty-default-branch guard: githubclient.GetRepository never returns
+// (nil, nil) — it errors when `default_branch` is absent — so that guard is
+// unreachable through the concrete client, yet removing it would leave a nil
+// dereference one interface change away.
+var mergeGateRepository = func(ctx context.Context, gh *githubclient.Client, scope forge.CredentialScope,
+	repo githubclient.RepoRef) (*githubclient.Repository, error) {
+	return gh.GetRepository(ctx, scope, repo)
+}
+
+// mergeGateReconcile is the reconciliation seam, a package var for the same
+// reason: mergegate.Reconcile reserves its error return for CALLER mistakes
+// (nil api, empty branch, empty check), all three of which probeMergeGate has
+// already excluded by the time it calls — so the error branch is unreachable
+// in production but must still fail closed rather than render a verdict.
+var mergeGateReconcile = mergegate.Reconcile
+
+// mergeGateProbeTimeout bounds the whole merge-gate probe — the default-branch
+// resolve plus both protection reads. Same 10s order as
+// requiredChecksCaptureTimeout (required_checks_capture.go): a readiness report
+// must not hang on a slow forge. Declared as a var so a test can shrink it.
+var mergeGateProbeTimeout = 10 * time.Second
+
+// probeMergeGate runs readiness check (5). It reads the repo's REAL default
+// branch and hands it to mergegate.Reconcile, which answers whether the
+// published check gates merges on it.
+//
+// Every failure path returns StatusUnknown with a naming Reason — the
+// fail-closed contract. `not_required` is reachable ONLY through a
+// Reconciliation that said so on an authoritative read.
+func (s *Server) probeMergeGate(ctx context.Context, repo string, repoRef githubclient.RepoRef,
+	installed bool, installationID int64) mergeGateReadiness {
+	out := mergeGateReadiness{
+		Status: string(mergegate.StatusUnknown),
+		Check:  auditcheckpublisher.CheckName,
+	}
+	switch {
+	case s.cfg.GitHub == nil:
+		out.Reason = mergeGateReasonNoGitHubClient
+		out.Detail = "github client not configured on this deployment; the repository's branch protection could not be read"
+		return out
+	case !installed:
+		out.Reason = mergeGateReasonAppNotInstalled
+		out.Detail = "GitHub App is not installed on the target repository; reading branch protection needs an installation token"
+		out.Remediation = "Install the Fishhawk GitHub App on " + repo + ", then re-run the check."
+		return out
+	}
+
+	scope := forge.FromGitHubInstallationID(installationID)
+	pctx, cancel := context.WithTimeout(ctx, mergeGateProbeTimeout)
+	defer cancel()
+
+	// The REAL default branch, never a guessed "main": the ruleset matcher
+	// evaluates `~DEFAULT_BRANCH` against it, so a repo defaulting to `trunk`
+	// resolves its rulesets only when the true name is supplied (#2506).
+	meta, err := mergeGateRepository(pctx, s.cfg.GitHub, scope, repoRef)
+	switch {
+	case err != nil:
+		out.Reason = mergeGateReasonDefaultBranch
+		out.Detail = "could not resolve the repository's default branch: " + err.Error()
+		out.Remediation = "Re-run the check once the forge is reachable."
+		s.cfg.Logger.Warn("onboarding readiness: merge gate default-branch resolve failed",
+			"repo", repo, "error", err.Error())
+		return out
+	case meta == nil || meta.DefaultBranch == "":
+		out.Reason = mergeGateReasonDefaultBranch
+		out.Detail = "the repository response carried no default branch, so the protection surfaces could not be evaluated"
+		out.Remediation = "Re-run the check once the forge is reachable."
+		return out
+	}
+
+	branch := meta.DefaultBranch
+	out.Branch = branch
+
+	rec, err := mergeGateReconcile(pctx, s.cfg.GitHub, scope, repoRef, branch, branch, auditcheckpublisher.CheckName)
+	if err != nil {
+		// Reserved for caller mistakes; forge failures come back as a
+		// StatusUnknown reconciliation with a nil error.
+		out.Reason = mergeGateReasonProbeFailed
+		out.Detail = "the merge-gate probe could not run: " + err.Error()
+		s.cfg.Logger.Warn("onboarding readiness: merge gate probe failed",
+			"repo", repo, "error", err.Error())
+		return out
+	}
+
+	out.Status = string(rec.Status)
+	out.Check = rec.Check
+	out.Bypassable = rec.Bypassable
+	out.Authoritative = rec.Authoritative
+	out.Reason = rec.Reason
+	out.Detail = rec.Detail
+	out.Remediation = rec.Remediation
+	out.RequiredContexts = rec.RequiredContexts
+	for _, src := range rec.Sources {
+		out.Sources = append(out.Sources, mergeGateSource{
+			Identity:      src.Identity,
+			Classic:       src.Classic,
+			BypassEntries: src.BypassEntries,
+			EnforceAdmins: src.EnforceAdmins,
+			Bypassable:    src.Bypassable,
+		})
+	}
+	return out
 }
 
 // handleGetOnboardingReadiness implements GET /v0/onboarding/readiness?repo=owner/name
@@ -224,6 +429,13 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 			resp.Reviewers = append(resp.Reviewers, out)
 		}
 	}
+
+	// (5) Merge gate: is the check Fishhawk publishes actually required by the
+	// repo's protection on its REAL default branch (#3161)? Needs an
+	// installation token, so it runs only once the App is installed; every
+	// other posture degrades to `unknown` with a naming reason rather than to
+	// `not_required`.
+	resp.MergeGate = s.probeMergeGate(r.Context(), repo, repoRef, resp.App.Installed, installationID)
 
 	// (4) Caller-token scope adequacy against the run-driving subset. Cookie
 	// -session callers (TokenID == "") authenticate via OAuth, carry no

@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -226,5 +228,178 @@ func TestInit_UnknownPreset_FailsCleanly(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "low, medium, high") {
 		t.Errorf("err = %v, want the valid-tiers hint", err)
+	}
+}
+
+// --- merge gate mirror, check (5) (#3161) ---
+
+// mergeGateServerBody is the LITERAL merge_gate JSON the backend serves — the
+// same shape backend/internal/server/onboarding_test.go's end-to-end test
+// asserts on the wire. Decoding this body through OnboardingReadinessReport is
+// the mirror-drift control: a json-tag typo on the MCP side zero-values the
+// field and the assertions below go red.
+//
+// It lives here rather than in client_test.go because that file carries no
+// readiness references at all, while this one already constructs
+// OnboardingReadinessReport (operator condition 4b).
+const mergeGateServerBody = `{
+  "repo": "kuhlman-labs/fishhawk",
+  "app": {"installed": true, "installation_id": 12345},
+  "spec": {"source": "fetched", "valid": true},
+  "reviewers": [],
+  "scopes": {"adequate": true, "required": ["read:runs"], "missing": []},
+  "merge_gate": {
+    "status": "required",
+    "check": "fishhawk_audit_complete",
+    "branch": "main",
+    "sources": [
+      {"identity": "branch_protection", "classic": true, "bypass_entries": 0,
+       "enforce_admins": true, "bypassable": false},
+      {"identity": "ruleset:42", "bypass_entries": 2, "bypassable": true}
+    ],
+    "bypassable": false,
+    "authoritative": true,
+    "required_contexts": ["fishhawk_audit_complete", "ci"]
+  }
+}`
+
+// TestOnboardingReadinessReport_MergeGateMirrorsBackendTags decodes the
+// literal backend body and asserts every merge_gate field lands. A tag typo
+// silently zero-values one — which is exactly the drift this asserts against.
+func TestOnboardingReadinessReport_MergeGateMirrorsBackendTags(t *testing.T) {
+	var got OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(mergeGateServerBody), &got); err != nil {
+		t.Fatalf("decode backend body: %v", err)
+	}
+	mg := got.MergeGate
+	if mg.Status != "required" {
+		t.Errorf("Status = %q, want required", mg.Status)
+	}
+	if mg.Check != "fishhawk_audit_complete" {
+		t.Errorf("Check = %q, want fishhawk_audit_complete", mg.Check)
+	}
+	if mg.Branch != "main" {
+		t.Errorf("Branch = %q, want main", mg.Branch)
+	}
+	if !mg.Authoritative {
+		t.Errorf("Authoritative = false, want true")
+	}
+	if mg.Bypassable {
+		t.Errorf("Bypassable = true, want false (one requiring source has no bypass path)")
+	}
+	if len(mg.RequiredContexts) != 2 {
+		t.Errorf("RequiredContexts = %v, want 2 entries", mg.RequiredContexts)
+	}
+	if len(mg.Sources) != 2 {
+		t.Fatalf("len(Sources) = %d, want 2: %+v", len(mg.Sources), mg.Sources)
+	}
+	classic, ruleset := mg.Sources[0], mg.Sources[1]
+	if classic.Identity != "branch_protection" || !classic.Classic || !classic.EnforceAdmins {
+		t.Errorf("Sources[0] = %+v, want the classic source with enforce_admins on", classic)
+	}
+	if classic.Bypassable {
+		t.Errorf("classic Bypassable = true, want false")
+	}
+	if ruleset.Identity != "ruleset:42" || ruleset.BypassEntries != 2 || !ruleset.Bypassable {
+		t.Errorf("Sources[1] = %+v, want ruleset:42 with 2 bypass entries, bypassable", ruleset)
+	}
+}
+
+// TestDoctor_MergeGate_ReachesToolOutput proves the field survives the whole
+// tool path — backend response → apiClient decode → DoctorOutput — rather than
+// only the struct decode above.
+func TestDoctor_MergeGate_ReachesToolOutput(t *testing.T) {
+	fb, srv := newDoctorFakeBackend(t)
+	fb.resp = &OnboardingReadinessReport{
+		Repo: "kuhlman-labs/fishhawk",
+		App:  OnboardingApp{Installed: true, InstallationID: 4242},
+		Spec: OnboardingSpec{Source: "fetched", Valid: true},
+		Scopes: OnboardingScopes{
+			Adequate: true, Required: []string{"read:runs"}, Missing: []string{},
+		},
+		MergeGate: OnboardingMergeGate{
+			Status: "unknown",
+			Check:  "fishhawk_audit_complete",
+			Reason: "administration_read_missing",
+			Detail: "reading branch protection was refused (403)",
+		},
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "kuhlman-labs/fishhawk"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if out.Report.MergeGate.Status != "unknown" {
+		t.Errorf("MergeGate.Status = %q, want unknown", out.Report.MergeGate.Status)
+	}
+	if out.Report.MergeGate.Reason != "administration_read_missing" {
+		t.Errorf("MergeGate.Reason = %q, want administration_read_missing", out.Report.MergeGate.Reason)
+	}
+	if out.Report.MergeGate.Check != "fishhawk_audit_complete" {
+		t.Errorf("MergeGate.Check = %q, want fishhawk_audit_complete", out.Report.MergeGate.Check)
+	}
+}
+
+// registeredToolDescription returns a tool's WIRE-VISIBLE description, read
+// back over an in-memory MCP session through the same registration path
+// tools_test.go walks. Reading the shipped string (rather than the source
+// literal) is what makes the assertion a done-means test: a comment-only touch
+// of onboard.go cannot satisfy it (#1169).
+func registeredToolDescription(t *testing.T, name string) string {
+	t.Helper()
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)})
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name == name {
+			return tool.Description
+		}
+	}
+	t.Fatalf("%s: not registered/visible over ListTools", name)
+	return ""
+}
+
+// TestDoctorToolDescription_DescribesMergeGate pins the SHIPPED tool
+// description: it must name the fifth check and state the fail-closed reading
+// of `unknown`. A prose-only surface no compiler enforces, so a comment-only
+// touch of onboard.go must not satisfy it (#1169).
+func TestDoctorToolDescription_DescribesMergeGate(t *testing.T) {
+	// Collapse the description's hard wrapping: the shipped string breaks
+	// lines at ~80 columns, so a claim is routinely split across two lines.
+	// Asserting on short load-bearing fragments of the collapsed text keeps
+	// the test from being deleted by the next copy-edit's rewrap.
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
+	for _, want := range []string{
+		"five server-side-only checks",
+		"merge_gate",
+		"required | not_required | unknown",
+		"NOT evidence the check is unrequired",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_doctor description missing %q:\n%s", want, desc)
+		}
+	}
+	if strings.Contains(desc, "returns four server-side-only checks") {
+		t.Errorf("fishhawk_doctor description still says four checks")
 	}
 }
