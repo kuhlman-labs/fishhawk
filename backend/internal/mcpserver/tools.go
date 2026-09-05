@@ -3401,8 +3401,24 @@ The advance:
   - re-parks the review gate so CI + the merge reconciler re-evaluate the
     new head;
   - records a branch_rebased audit entry and refreshes the status comment;
+  - attributes the merge commit into the ADR-035 reported-head ledger, so
+    the installation-authored merge is not classified as a FOREIGN commit
+    and does not wedge the very run this verb un-wedges;
   - re-posts the fishhawk_audit_complete Check Run AT the new head, so the
     required check is not left pinned to the stale pre-advance sha.
+
+EXACTLY ONE sha is ever attributed, chosen by PROVENANCE: the merge commit
+this call created. The lease re-check runs only BEFORE the merge, so a
+post-merge head that DIVERGES from the merge commit is a concurrent foreign
+push — it is deliberately NOT attributed, because vouching a commit this
+call did not create would launder into the ledger exactly the commit the
+ledger exists to catch.
+
+An INCOMPLETE attribution is always reported on lineage_attribution_warning
+— a divergent head, a failed attribution append, or nothing attributable at
+all (an undecodable merge sha AND a failed post-merge head re-read). A
+success carrying that warning must NOT be read as a clean recovery: the run
+stays wedged on the lineage check until you act.
 
 FAIL-CLOSED on a conflict: if the run branch CONFLICTS with the advanced
 base the call is refused (rebase_conflict) having written NOTHING — no
@@ -3416,9 +3432,12 @@ Sibling verb: fishhawk_reset_run_branch is the right verb for a FOREIGN
 COMMIT pushed ON TOP of the run's commits — a different problem. This one
 is for a BASE ADVANCE.
 
-Idempotent retry: if the check re-post fails, re-invoke this verb. The
+Idempotent retry: if the CHECK RE-POST fails, re-invoke this verb. The
 branch now contains the base, so the behind-probe short-circuits the merge
-and the call re-posts the check at the correct head.
+and the call re-posts the check at the correct head. That retry does NOT
+repair a failed LINEAGE ATTRIBUTION, because the short-circuit arm
+deliberately attributes nothing — when lineage_attribution_warning names
+fishhawk_vouch_commit, run that instead.
 
 Inputs:
   - run_id  : the run whose branch to advance.
@@ -3427,7 +3446,7 @@ Inputs:
 
 Returns the advance summary (prior_head_sha, new_head_sha,
 merge_commit_sha, already_up_to_date, mechanism_note,
-audit_check_republished) on success. Returns a tool error on:
+audit_check_republished, lineage_attribution_warning) on success. Returns a tool error on:
   - invalid UUID (caught before the HTTP hop)
   - confirmation_required (confirm not true, 400)
   - run_token_forbidden (a run-bound agent token, 403)

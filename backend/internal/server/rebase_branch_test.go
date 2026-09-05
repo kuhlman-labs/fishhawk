@@ -1226,3 +1226,261 @@ func TestRebaseRunBranch_ToCheckPublication_EndToEnd(t *testing.T) {
 		t.Errorf("check publications = %v, want exactly one at %q", got, rebaseNewHeadSHA)
 	}
 }
+
+// --- POST-MERGE ATTRIBUTION RACE (fix-up pass 1, concerns 98e012bd + bf777c15) ---
+
+// rebaseRacerSHA is a foreign commit pushed by someone else that lands in the
+// window BETWEEN the merges POST and the post-merge PR re-read. It is not the
+// commit this invocation created, and the ledger must keep saying so.
+const rebaseRacerSHA = "dddd444444444444444444444444444444444444"
+
+// attributedSHAs returns every sha admitted into the ADR-035 reported-head
+// ledger by an operator_commit_vouched entry — read back as COMMITTED STATE
+// rather than inferred from the response, because "was it attributed" is a
+// question about what was persisted.
+func attributedSHAs(au *auditFake) []string {
+	var out []string
+	for _, e := range auditEntries(au, CategoryOperatorCommitVouched) {
+		var p struct {
+			VouchedSHA string `json:"vouched_sha"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err == nil && p.VouchedSHA != "" {
+			out = append(out, p.VouchedSHA)
+		}
+	}
+	return out
+}
+
+// TestRebaseRunBranch_ConcurrentPushIntoPostMergeRead_IsNotAttributed is the
+// PRIORITY 1 security control. The lease re-check runs only BEFORE the merge,
+// so a foreign push landing between MergeBranch and the post-merge
+// GetPullRequest becomes newHeadSHA. Attributing it would admit a commit this
+// invocation did not create into the ADR-035 reported-head ledger — laundering
+// exactly the foreign commit
+// TestRebaseRunBranch_LedgerStillFlagsAnUnattributedForeignCommit exists to
+// prove the ledger catches, and defeating the fail-closed property that makes
+// reset-branch and vouch-commit meaningful.
+//
+// The race is seeded BY CONSTRUCTION, not by timing: the merges endpoint
+// returns a known merge sha and the SUBSEQUENT PR read returns a DIFFERENT,
+// unrelated sha. That is precisely the observable state a real concurrent push
+// produces, and it is in-band detectable — a post-merge head that differs from
+// the merge commit means something else landed.
+//
+// The assertions are committed-state read-backs, never error identity:
+//
+//  1. the ledger carries the merge commit and NOT the racer;
+//  2. the REAL ReverifyBranchLineage recompute still flags the racer FOREIGN;
+//  3. the response surfaces the divergence so the operator learns of it.
+//
+// COUNTERFACTUAL (recorded in the commit message): restoring the previous
+// `for _, sha := range []string{mergeCommitSHA, newHeadSHA}` loop attributes
+// the racer, ReverifyBranchLineage returns true, and assertions 1 and 2 both
+// go RED.
+func TestRebaseRunBranch_ConcurrentPushIntoPostMergeRead_IsNotAttributed(t *testing.T) {
+	stub := cleanRebaseStub()
+	// PR reads: 1 = handler head, 2 = lease re-check (still the prior head, so
+	// the merge proceeds), 3 = the post-merge re-read, which now observes a
+	// FOREIGN commit that raced in after the merge.
+	stub.headSHASeq = []string{rebasePriorHeadSHA, rebasePriorHeadSHA, rebaseRacerSHA}
+	sd := seedRebaseRun(t, stub, rebaseOpts{})
+	seedRunHeadEntry(sd.au, sd.runID, "pull_request_opened", rebasePriorHeadSHA, 1)
+
+	w := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Reason: "advance", Confirm: true}, withRebaseOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the merge completed):\n%s", w.Code, w.Body.String())
+	}
+	var resp rebaseBranchResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// Preconditions of the race, so a GREEN here can never be a mis-seeded stub.
+	if resp.MergeCommitSHA != rebaseNewHeadSHA {
+		t.Fatalf("merge_commit_sha = %q, want the merge this call created %q", resp.MergeCommitSHA, rebaseNewHeadSHA)
+	}
+	if resp.NewHeadSHA != rebaseRacerSHA {
+		t.Fatalf("new_head_sha = %q, want the raced-in foreign head %q — the race is not seeded",
+			resp.NewHeadSHA, rebaseRacerSHA)
+	}
+
+	// (1) COMMITTED STATE: exactly the merge commit was attributed, and the
+	// racer was not.
+	got := attributedSHAs(sd.au)
+	if len(got) != 1 || got[0] != rebaseNewHeadSHA {
+		t.Errorf("attributed shas = %v, want exactly [%s]: only the merge commit this invocation created has provable provenance",
+			got, rebaseNewHeadSHA)
+	}
+	for _, sha := range got {
+		if sha == rebaseRacerSHA {
+			t.Errorf("the raced-in foreign commit %s was attributed as run-authored; that launders exactly the commit the ADR-035 ledger exists to catch",
+				rebaseRacerSHA)
+		}
+	}
+
+	// (3) The operator is TOLD a concurrent push landed — an unreported
+	// divergence is the same silent-success defect as an unreported append
+	// failure.
+	if !strings.Contains(resp.LineageAttributionWarning, rebaseRacerSHA) {
+		t.Errorf("lineage_attribution_warning must name the divergent head %q: %q",
+			rebaseRacerSHA, resp.LineageAttributionWarning)
+	}
+	if !strings.Contains(resp.LineageAttributionWarning, "fishhawk_vouch_commit") {
+		t.Errorf("lineage_attribution_warning must name fishhawk_vouch_commit as the verb that can admit a legitimate pushed commit: %q",
+			resp.LineageAttributionWarning)
+	}
+
+	// (2) THE REAL RECOMPUTE, driven against the actual ledger builder rather
+	// than a stub: with the racer on the branch tip the run must STILL be
+	// flagged foreign.
+	sd.stub.mu.Lock()
+	sd.stub.headSHA = rebaseRacerSHA
+	sd.stub.headSHASeq = nil
+	sd.stub.behindCommits = []string{rebasePriorHeadSHA, rebaseNewHeadSHA, rebaseRacerSHA}
+	sd.stub.mu.Unlock()
+	if sd.s.ReverifyBranchLineage(context.Background(), sd.runID, 77) {
+		t.Error("the ADR-035 ledger ACCEPTED a foreign commit that raced into the post-merge read; the rebase attribution laundered it")
+	}
+}
+
+// TestRebaseRunBranch_AttributionAppendFails_WarnsAndNamesVouch is PRIORITY
+// 2(a). The attribution write is load-bearing — without it the
+// installation-authored merge commit sits in no head-report category and
+// buildReportedHeadLedger flags it FOREIGN — so "best-effort with only a Warn
+// log" made the handler able to return 200, publish fishhawk_audit_complete
+// and leave the run wedged with the operator told nothing.
+//
+// The failure is injected in ISOLATION (appendErrCategory targets only
+// operator_commit_vouched), so the branch_rebased entry still lands and the
+// test discriminates an attribution failure from a blanket audit outage.
+//
+// COUNTERFACTUAL: deleting the append-error warning branch (returning the
+// bare `warning` instead of `appendWarning`) turns the two response
+// assertions RED.
+func TestRebaseRunBranch_AttributionAppendFails_WarnsAndNamesVouch(t *testing.T) {
+	sd := seedRebaseRun(t, cleanRebaseStub(), rebaseOpts{})
+	sd.au.appendErrCategory = CategoryOperatorCommitVouched
+
+	w := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Reason: "advance", Confirm: true}, withRebaseOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the merge already completed; a refusal would misreport a durable write):\n%s",
+			w.Code, w.Body.String())
+	}
+	var resp rebaseBranchResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// The discriminator: the base advance itself IS recorded, so the warning
+	// is about the attribution alone.
+	if branchRebasedAudit(sd.au) == nil {
+		t.Fatal("no branch_rebased entry — the injected failure is not isolated to the attribution append")
+	}
+	// COMMITTED STATE: nothing was admitted into the ledger.
+	if got := attributedSHAs(sd.au); len(got) != 0 {
+		t.Fatalf("attributed shas = %v, want none — the append was injected to fail", got)
+	}
+
+	if resp.LineageAttributionWarning == "" {
+		t.Fatal("a 200 with NO lineage_attribution_warning reports a clean recovery while the run is wedged on the lineage check")
+	}
+	if !strings.Contains(resp.LineageAttributionWarning, "fishhawk_vouch_commit") {
+		t.Errorf("the warning must name fishhawk_vouch_commit as the required step: %q", resp.LineageAttributionWarning)
+	}
+	if !strings.Contains(resp.LineageAttributionWarning, "will NOT repair") {
+		t.Errorf("the warning must say re-invoking this verb will NOT repair the attribution — advertising a retry that cannot deliver is the defect this closes: %q",
+			resp.LineageAttributionWarning)
+	}
+}
+
+// TestRebaseRunBranch_NoAttributableSHA_ThroughReinvocation_NamesVouch is
+// PRIORITY 2(b): the COMBINED degraded path, driven THROUGH the reinvocation
+// the response used to advertise.
+//
+// Invocation 1 merges with an undecodable-201 (no merge sha) AND a failing
+// post-merge re-read, so there is no sha to attribute at all. The old response
+// directed the operator only to re-invoke this verb. Invocation 2 proves that
+// instruction was FALSE: the behind-probe short-circuits, the
+// already-contains-base arm deliberately attributes nothing, the check
+// publishes — and the run is STILL un-attributed and STILL flagged foreign by
+// the real recompute.
+//
+// So the contract asserted here is that invocation 1 says so up front and
+// names fishhawk_vouch_commit.
+//
+// COUNTERFACTUAL: deleting the `mergeCommitSHA == "" && newHeadSHA == ""`
+// nothing-attributable branch turns the invocation-1 warning assertions RED.
+func TestRebaseRunBranch_NoAttributableSHA_ThroughReinvocation_NamesVouch(t *testing.T) {
+	stub := cleanRebaseStub()
+	stub.mergeBody = `{"no_sha_here":true}`                                                // the benign undecodable 201
+	stub.prStatusSeq = []int{http.StatusOK, http.StatusOK, http.StatusInternalServerError} // post-merge re-read fails
+	sd := seedRebaseRun(t, stub, rebaseOpts{})
+	seedRunHeadEntry(sd.au, sd.runID, "pull_request_opened", rebasePriorHeadSHA, 1)
+
+	w1 := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Reason: "advance", Confirm: true}, withRebaseOperator)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("invocation 1 status = %d, want 200:\n%s", w1.Code, w1.Body.String())
+	}
+	var r1 rebaseBranchResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &r1); err != nil {
+		t.Fatalf("unmarshal 1: %v", err)
+	}
+	// Preconditions: neither sha is known, so nothing is attributable.
+	if r1.MergeCommitSHA != "" || r1.NewHeadSHA != "" {
+		t.Fatalf("invocation 1 merge_commit_sha/new_head_sha = %q/%q, want both empty — the combined degraded path is not seeded",
+			r1.MergeCommitSHA, r1.NewHeadSHA)
+	}
+	if got := attributedSHAs(sd.au); len(got) != 0 {
+		t.Fatalf("invocation 1 attributed %v, want nothing (no sha is known)", got)
+	}
+	if !strings.Contains(r1.LineageAttributionWarning, "fishhawk_vouch_commit") {
+		t.Errorf("invocation 1 must name fishhawk_vouch_commit — re-invocation cannot repair this: %q",
+			r1.LineageAttributionWarning)
+	}
+	if !strings.Contains(r1.LineageAttributionWarning, "will NOT repair") {
+		t.Errorf("invocation 1 must state plainly that re-invoking this verb will NOT repair the attribution: %q",
+			r1.LineageAttributionWarning)
+	}
+
+	// Move the world to the post-merge state and RE-INVOKE, exactly as an
+	// operator following a bare "re-invoke to retry" instruction would.
+	stub.mu.Lock()
+	stub.behindCommits = nil
+	stub.headSHA = rebaseNewHeadSHA
+	stub.headSHASeq = nil
+	stub.prStatusSeq = nil
+	stub.mergeBody = ""
+	stub.mu.Unlock()
+	mergesAfterFirst := len(stub.merges())
+
+	w2 := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Reason: "retry", Confirm: true}, withRebaseOperator)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("invocation 2 status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+	var r2 rebaseBranchResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &r2); err != nil {
+		t.Fatalf("unmarshal 2: %v", err)
+	}
+	if len(stub.merges()) != mergesAfterFirst || !r2.AlreadyUpToDate {
+		t.Fatalf("invocation 2 merges %d→%d, already_up_to_date=%v; want no second merge and the short-circuit arm",
+			mergesAfterFirst, len(stub.merges()), r2.AlreadyUpToDate)
+	}
+
+	// THE POINT, read back as committed state: the retry attributed NOTHING,
+	// so invocation 1's warning was truthful and a bare "re-invoke this verb"
+	// instruction would have been a false recovery contract.
+	if got := attributedSHAs(sd.au); len(got) != 0 {
+		t.Errorf("re-invocation attributed %v; the already-contains-base arm must attribute nothing, and if it ever does this test's premise must be revisited", got)
+	}
+	// THE REAL RECOMPUTE: the run is still wedged after the advertised retry.
+	sd.stub.mu.Lock()
+	sd.stub.behindCommits = []string{rebasePriorHeadSHA, rebaseNewHeadSHA}
+	sd.stub.mu.Unlock()
+	if sd.s.ReverifyBranchLineage(context.Background(), sd.runID, 77) {
+		t.Error("the ledger accepted the un-attributed merge commit after re-invocation; " +
+			"if that becomes true, invocation 1's fishhawk_vouch_commit instruction is no longer required and must be revisited")
+	}
+}

@@ -948,25 +948,62 @@ publication occurred.
 **LINEAGE ATTRIBUTION.** The merge commit is authored by the App
 installation but appears in NO head-report audit category, so
 `lineage.go::buildReportedHeadLedger` would read it as FOREIGN and wedge
-the very run this verb un-wedged. `writeRebaseLineageAttribution` unions
-the merge SHA and the new head into the ledger using the SAME mechanism
-the vouch path uses (an `operator_commit_vouched` entry whose
-`vouched_sha` field `addVouchedSHAs` reads). This was verified by
-EXECUTION, not asserted: `TestRebaseRunBranch_LedgerAttributesTheMergeCommit`
-drives the REAL `ReverifyBranchLineage` recompute and goes RED without the
-call. Attribution is written ONLY when THIS invocation performed the merge
-— the already-contains-base arm attributes nothing, because vouching
-whatever head happens to be live would silently launder a genuinely
-foreign operator-pushed commit and defeat the fail-closed property that
-makes reset-branch and vouch-commit meaningful
+the very run this verb un-wedged. `writeRebaseLineageAttribution` admits it
+into the ledger using the SAME mechanism the vouch path uses (an
+`operator_commit_vouched` entry whose `vouched_sha` field `addVouchedSHAs`
+reads). This was verified by EXECUTION, not asserted:
+`TestRebaseRunBranch_LedgerAttributesTheMergeCommit` drives the REAL
+`ReverifyBranchLineage` recompute and goes RED without the call.
+Attribution is written ONLY when THIS invocation performed the merge — the
+already-contains-base arm attributes nothing, because vouching whatever
+head happens to be live would silently launder a genuinely foreign
+operator-pushed commit and defeat the fail-closed property that makes
+reset-branch and vouch-commit meaningful
 (`TestRebaseRunBranch_LedgerStillFlagsAnUnattributedForeignCommit` pins
 that an unattributed foreign commit still violates).
 
+**EXACTLY ONE SHA is ever attributed, chosen by PROVENANCE not by
+availability.** The lease re-check runs only BEFORE the merge, so a foreign
+push landing in the window between `MergeBranch` and the post-merge
+`GetPullRequest` becomes `new_head_sha`. Attributing it would launder into
+the ledger precisely the commit the ledger exists to catch — the same
+laundering the already-contains-base arm refuses. So when the merge SHA
+decoded it is the ONLY sha attributed, and a non-empty `new_head_sha` that
+DIFFERS from it is treated as in-band evidence of a concurrent push: not
+attributed, logged, and surfaced on the response.
+`TestRebaseRunBranch_ConcurrentPushIntoPostMergeRead_IsNotAttributed`
+seeds that race BY CONSTRUCTION (the merges endpoint returns one sha, the
+subsequent PR read returns a different one) and asserts against committed
+state plus the REAL recompute. `new_head_sha` is attributed alone ONLY on
+the undecodable-201 shape, where the merge provably happened and there is
+nothing else to attribute.
+
+**An incomplete attribution is REPORTED, never silent.** The attribution is
+load-bearing — without it the merge commit is classified FOREIGN and the run
+stays wedged — so "best-effort with only a Warn log" would let the endpoint
+return 200, publish `fishhawk_audit_complete` and leave the run wedged with
+the operator told nothing. The append failure is still non-fatal to the
+already-completed merge, but the response carries
+`lineage_attribution_warning` in all three incomplete cases: a divergent
+post-merge head, a failed attribution append, and nothing attributable at
+all. Pinned by
+`TestRebaseRunBranch_AttributionAppendFails_WarnsAndNamesVouch` (the
+failure injected in isolation on the `operator_commit_vouched` category, so
+the `branch_rebased` entry still lands and the test discriminates an
+attribution failure from a blanket audit outage).
+
 **Residual, stated rather than papered over:** when the merge SHA is
-undecodable AND the post-merge re-read fails, that invocation has no SHA
-to attribute, and the retry invocation takes the already-contains-base arm,
-which attributes nothing. Such a run needs `fishhawk_vouch_commit`,
-exactly as it did before this verb existed.
+undecodable AND the post-merge re-read fails, that invocation has no SHA to
+attribute, and the retry invocation takes the already-contains-base arm,
+which attributes nothing. Such a run needs `fishhawk_vouch_commit`, exactly
+as it did before this verb existed — and the response now SAYS so rather
+than directing the operator only to re-invoke this verb, which would be a
+recovery instruction that cannot deliver.
+`TestRebaseRunBranch_NoAttributableSHA_ThroughReinvocation_NamesVouch`
+drives that sequence THROUGH the reinvocation and asserts the retry indeed
+attributes nothing and the real recompute still flags the run foreign, so
+the `fishhawk_vouch_commit` instruction is decidable from committed
+evidence rather than from reading the handler.
 
 Other invariants:
 

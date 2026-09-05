@@ -2065,6 +2065,19 @@ type RebaseBranchResult struct {
 	// to the stale sha this verb exists to move off.
 	AuditCheckRepublished      bool   `json:"audit_check_republished"`
 	AuditCheckRepublishWarning string `json:"audit_check_republish_warning,omitempty"`
+	// LineageAttributionWarning, when non-empty, reports that the merge
+	// SUCCEEDED but its ADR-035 reported-head attribution is INCOMPLETE, so
+	// this success must NOT be read as a clean recovery — the run stays
+	// wedged on the lineage check until the operator acts. It fires when a
+	// concurrent push made the post-merge head diverge from the merge commit
+	// (the divergent head is deliberately NOT attributed, because vouching a
+	// commit this call did not create would launder a foreign commit into the
+	// ledger), when the attribution append failed to persist, or when nothing
+	// was attributable at all. In the latter two cases re-invoking
+	// fishhawk_rebase_run_branch does NOT repair it — the retry takes the
+	// already-contains-base arm, which attributes nothing — so the warning
+	// names fishhawk_vouch_commit as the required step.
+	LineageAttributionWarning string `json:"lineage_attribution_warning,omitempty"`
 }
 
 // RebaseRunBranch has the RUNNER advance its own lineage branch onto the

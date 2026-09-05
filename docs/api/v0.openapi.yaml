@@ -7824,6 +7824,25 @@ paths:
                   mechanism_note: { type: string, description: 'Constant sentence stating the merge-commit mechanism, shipped on every 200.' }
                   audit_check_republished: { type: boolean, description: 'Whether the fishhawk_audit_complete Check Run re-posted at the new head.' }
                   audit_check_republish_warning: { type: string, description: 'Present when the re-post did not land; names the reason and the idempotent re-invocation retry.' }
+                  lineage_attribution_warning:
+                    type: string
+                    description: |
+                      Present when the merge SUCCEEDED but its ADR-035
+                      reported-head attribution is INCOMPLETE, so this 200 must
+                      NOT be read as a clean recovery — the run stays wedged on
+                      the lineage check until the operator acts. Three cases:
+                      (a) a CONCURRENT PUSH made new_head_sha diverge from the
+                      merge commit this call created, so the divergent head was
+                      deliberately NOT attributed (attributing a commit this
+                      invocation did not create would launder a foreign commit
+                      into the ledger); (b) the attribution append failed to
+                      persist; (c) nothing was attributable at all (an
+                      undecodable merge sha AND a failed post-merge re-read).
+                      In cases (b) and (c) re-invoking this endpoint does NOT
+                      repair the attribution — the retry takes the
+                      already-contains-base arm, which attributes nothing — so
+                      the warning names fishhawk_vouch_commit as the required
+                      step instead.
         '400':
           description: |
             Malformed body or `confirm` not `true`. Body's `error` is

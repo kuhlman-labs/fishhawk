@@ -83,6 +83,25 @@ type rebaseBranchResponse struct {
 	// AuditCheckRepublishWarning, when non-empty, names why the re-post did
 	// not land and names re-invoking this verb as the idempotent retry.
 	AuditCheckRepublishWarning string `json:"audit_check_republish_warning,omitempty"`
+	// LineageAttributionWarning, when non-empty, reports that the merge
+	// SUCCEEDED but its ADR-035 reported-head attribution is INCOMPLETE, so
+	// this 200 must NOT be read as a clean recovery. It covers three cases,
+	// each of which leaves the run wedged on the lineage check until the
+	// operator acts:
+	//
+	//   - a CONCURRENT PUSH: the post-merge head diverged from the merge
+	//     commit this invocation created, so the divergent head was
+	//     deliberately NOT attributed (attributing it would launder a foreign
+	//     commit into the ledger);
+	//   - the attribution APPEND FAILED to persist;
+	//   - NOTHING was attributable at all (an undecodable merge sha AND a
+	//     failed post-merge re-read).
+	//
+	// In the last two cases re-invoking this verb does NOT repair the
+	// attribution — the retry takes the already-contains-base arm, which
+	// deliberately attributes nothing — so the warning names
+	// fishhawk_vouch_commit as the required step instead.
+	LineageAttributionWarning string `json:"lineage_attribution_warning,omitempty"`
 }
 
 // handleRebaseRunBranch implements POST /v0/runs/{run_id}/rebase-branch.
@@ -341,13 +360,19 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 	// the ledger via an operator_commit_vouched declaration, which
 	// addVouchedSHAs reads.
 	//
-	// Attribution is written ONLY when THIS invocation performed the merge.
-	// The already-contains-base arm deliberately attributes NOTHING: vouching
-	// whatever head happens to be live would silently launder a genuinely
-	// foreign operator-pushed commit and defeat the fail-closed property that
-	// makes reset-branch and vouch-commit meaningful.
+	// Attribution is written ONLY when THIS invocation performed the merge,
+	// and covers EXACTLY ONE sha: the merge commit whose provenance this call
+	// can prove. The already-contains-base arm deliberately attributes
+	// NOTHING, and a post-merge head that DIVERGES from the merge commit is
+	// likewise not attributed — vouching whatever head happens to be live
+	// would silently launder a genuinely foreign pushed commit and defeat the
+	// fail-closed property that makes reset-branch and vouch-commit
+	// meaningful. An incomplete attribution is surfaced on the response as
+	// lineage_attribution_warning, so a 200 is never read as a clean recovery
+	// while the run is still wedged on the lineage check.
+	lineageWarning := ""
 	if mergePerformed {
-		s.writeRebaseLineageAttribution(r, runID, branch, baseRef, mergeSHA, newHead)
+		lineageWarning = s.writeRebaseLineageAttribution(r, runID, branch, baseRef, mergeSHA, newHead)
 	}
 
 	republished := false
@@ -374,6 +399,7 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 		MechanismNote:              rebaseMechanismNote,
 		AuditCheckRepublished:      republished,
 		AuditCheckRepublishWarning: republishWarning,
+		LineageAttributionWarning:  lineageWarning,
 	})
 }
 
@@ -435,26 +461,82 @@ func (s *Server) writeBranchRebasedAudit(r *http.Request, runID uuid.UUID, prNum
 	}
 }
 
-// writeRebaseLineageAttribution unions the SHAs this verb's merge introduced
-// into the ADR-035 reported-head ledger, using the SAME mechanism the vouch
-// path uses (an operator_commit_vouched entry whose lineageVouchedSHAField
-// addVouchedSHAs reads). Without it the installation-authored merge commit
-// is in no head-report category and buildReportedHeadLedger flags it foreign,
+// rebaseVouchRequiredNote is the shipped sentence appended to every
+// LineageAttributionWarning whose case re-invoking this verb CANNOT repair.
+// Re-invocation takes the already-contains-base arm, which deliberately
+// attributes nothing, so advertising it here would be the same false-retry
+// defect the republish warning was rejected for. fishhawk_vouch_commit is the
+// verb that actually admits a sha into the ADR-035 reported-head ledger.
+const rebaseVouchRequiredNote = " Re-invoking fishhawk_rebase_run_branch will NOT repair this: the retry takes the already-contains-base arm, which deliberately attributes nothing. Run fishhawk_vouch_commit against the run branch head to admit it into the ADR-035 ledger."
+
+// writeRebaseLineageAttribution admits THIS INVOCATION'S merge commit into
+// the ADR-035 reported-head ledger, using the SAME mechanism the vouch path
+// uses (an operator_commit_vouched entry whose lineageVouchedSHAField
+// addVouchedSHAs reads). Without it the installation-authored merge commit is
+// in no head-report category and buildReportedHeadLedger flags it foreign,
 // wedging the run on the very check this verb republishes.
 //
-// Both SHAs are attributed when known and distinct: mergeCommitSHA (which may
-// be empty on the benign undecodable-201 shape) and newHeadSHA (the
-// authoritative live head, empty when the post-merge re-read failed).
+// EXACTLY ONE SHA IS EVER ATTRIBUTED, and which one is decided by PROVENANCE
+// rather than by availability. This is the fix for the post-merge attribution
+// race: the lease re-check runs only BEFORE the merge, so a foreign push
+// landing in the window between MergeBranch and the post-merge GetPullRequest
+// becomes newHeadSHA. Vouching it would launder into the ledger precisely the
+// foreign commit the ledger exists to catch — the same laundering the
+// already-contains-base arm refuses, and that
+// TestRebaseRunBranch_LedgerStillFlagsAnUnattributedForeignCommit exists to
+// prevent.
 //
-// RESIDUAL, stated rather than papered over: when the merge SHA is
-// undecodable AND the post-merge re-read fails, this invocation has no SHA to
-// attribute, and the retry invocation takes the already-contains-base arm,
-// which deliberately attributes nothing. That run needs
-// fishhawk_vouch_commit, exactly as it did before this verb existed.
+//   - mergeCommitSHA NON-EMPTY: attribute ONLY mergeCommitSHA. It is the sha
+//     the merges endpoint returned for the commit THIS call created, so it is
+//     the only sha whose provenance this invocation can prove. A non-empty
+//     newHeadSHA that DIFFERS from it is positive in-band evidence that
+//     something else landed in the window: it is NOT attributed, and the
+//     divergence is logged AND surfaced on the response so the operator
+//     learns a concurrent push occurred.
+//   - mergeCommitSHA EMPTY (the deliberately benign undecodable-201 shape
+//     pinned by githubclient's TestMergeBranch_MergedMissingSHAIsBenign):
+//     fall back to attributing newHeadSHA alone, because the merge
+//     provably happened and there is nothing else to attribute.
+//   - BOTH empty: nothing is attributable at all.
 //
-// Best-effort: the merge already happened, so an append failure WARNs.
+// The returned string is EMPTY on a clean attribution and otherwise names why
+// the attribution is incomplete. It is surfaced on the response as
+// lineage_attribution_warning, because a completed merge whose attribution
+// did not land must NOT be reported as a clean recovery: the run stays wedged
+// on the lineage check. "Load-bearing" and "best-effort with only a Warn log"
+// are contradictory, so the append failure is still non-fatal to the already
+// completed merge but is no longer SILENT.
 func (s *Server) writeRebaseLineageAttribution(r *http.Request, runID uuid.UUID,
-	branch, baseRef, mergeCommitSHA, newHeadSHA string) {
+	branch, baseRef, mergeCommitSHA, newHeadSHA string) string {
+	// Nothing attributable: an undecodable merge sha AND a failed post-merge
+	// re-read. Re-invocation cannot repair this — say so rather than
+	// advertising a retry that cannot deliver.
+	if mergeCommitSHA == "" && newHeadSHA == "" {
+		warning := "the base merge SUCCEEDED, but NEITHER the merge commit sha nor the post-merge head could be resolved, so NO lineage attribution was recorded; the merge commit is authored by the App installation and carries no head-report entry, so the ADR-035 ledger classifies it as FOREIGN and the run stays wedged." + rebaseVouchRequiredNote
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"branch rebase: no sha available to attribute; run is left un-attributed",
+			slog.String("run_id", runID.String()))
+		return warning
+	}
+
+	warning := ""
+	// PROVENANCE, not availability: prefer the merge sha, and treat a
+	// divergent live head as evidence of a concurrent push rather than as a
+	// second sha to vouch.
+	sha := mergeCommitSHA
+	if sha == "" {
+		sha = newHeadSHA
+	} else if newHeadSHA != "" && newHeadSHA != mergeCommitSHA {
+		warning = "the base merge SUCCEEDED and its merge commit " + mergeCommitSHA +
+			" was attributed, but the post-merge head read back as " + newHeadSHA +
+			", which DIFFERS from it — a concurrent push landed after the merge. That head was deliberately NOT attributed: vouching a commit this invocation did not create would launder a foreign commit into the ADR-035 ledger. Review the pushed commit and, if it is legitimate, admit it with fishhawk_vouch_commit."
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"branch rebase: post-merge head diverged from the merge commit; the divergent head was NOT attributed (concurrent push)",
+			slog.String("run_id", runID.String()),
+			slog.String("merge_commit_sha", mergeCommitSHA),
+			slog.String("post_merge_head_sha", newHeadSHA))
+	}
+
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -462,34 +544,33 @@ func (s *Server) writeRebaseLineageAttribution(r *http.Request, runID uuid.UUID,
 	}
 	actorKind := audit.ActorUser
 
-	seen := map[string]struct{}{}
-	for _, sha := range []string{mergeCommitSHA, newHeadSHA} {
-		if sha == "" {
-			continue
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":               runID.String(),
+		lineageVouchedSHAField: sha,
+		"reason": "fishhawk_rebase_run_branch advanced " + branch + " onto " + baseRef +
+			"; this commit was created by the App installation on the operator's authorization (ADR-035 sole writer), not by a foreign pusher",
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        runID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryOperatorCommitVouched,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"branch rebase: append lineage attribution failed; run is left un-attributed",
+			slog.String("run_id", runID.String()),
+			slog.String("sha", sha),
+			slog.String("error", err.Error()))
+		// The merge already happened, so this does not unwind the response —
+		// but it is NOT reported as a clean success either.
+		appendWarning := "the base merge SUCCEEDED, but persisting the operator_commit_vouched lineage attribution for " + sha +
+			" FAILED (" + err.Error() + "), so the ADR-035 ledger still classifies the merge commit as FOREIGN and the run stays wedged." + rebaseVouchRequiredNote
+		if warning != "" {
+			return warning + " " + appendWarning
 		}
-		if _, dup := seen[sha]; dup {
-			continue
-		}
-		seen[sha] = struct{}{}
-		payload, _ := json.Marshal(map[string]any{
-			"run_id":               runID.String(),
-			lineageVouchedSHAField: sha,
-			"reason": "fishhawk_rebase_run_branch advanced " + branch + " onto " + baseRef +
-				"; this commit was created by the App installation on the operator's authorization (ADR-035 sole writer), not by a foreign pusher",
-		})
-		if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
-			RunID:        runID,
-			Timestamp:    time.Now().UTC(),
-			Category:     CategoryOperatorCommitVouched,
-			ActorKind:    &actorKind,
-			ActorSubject: &subject,
-			Payload:      payload,
-		}); err != nil {
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-				"branch rebase: append lineage attribution failed (best-effort)",
-				slog.String("run_id", runID.String()),
-				slog.String("sha", sha),
-				slog.String("error", err.Error()))
-		}
+		return appendWarning
 	}
+	return warning
 }
