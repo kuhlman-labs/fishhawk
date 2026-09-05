@@ -280,6 +280,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerCancelRun(srv, resolver)
 	registerConsolidateSlices(srv, resolver)
 	registerResetRunBranch(srv, resolver)
+	registerRebaseRunBranch(srv, resolver)
 	registerRetryStage(srv, resolver)
 	registerReapStage(srv, resolver)
 	registerReconcileReviews(srv, resolver)
@@ -3351,6 +3352,113 @@ func (r *runResolver) resetRunBranch(ctx context.Context, _ *mcp.CallToolRequest
 		return nil, ResetRunBranchOutput{}, fmt.Errorf("reset run branch: %w", err)
 	}
 	return nil, ResetRunBranchOutput{Result: *res}, nil
+}
+
+// RebaseRunBranchInput is the fishhawk_rebase_run_branch tool's input schema
+// (E64.23 / #3125). Mirrors `POST /v0/runs/{run_id}/rebase-branch`. Confirm
+// MUST be true — the advance moves the PR head and leaves a merge commit, so
+// it is never silent/auto.
+type RebaseRunBranchInput struct {
+	RunID   string `json:"run_id" jsonschema:"the Fishhawk run UUID whose branch is being advanced onto its declared base"`
+	Reason  string `json:"reason,omitempty" jsonschema:"optional operator rationale, recorded on the branch_rebased audit entry"`
+	Confirm bool   `json:"confirm" jsonschema:"MUST be true to proceed — this merges the declared base into the run branch, leaving a merge commit and moving the PR head; a missing/false confirm is refused"`
+}
+
+// RebaseRunBranchOutput surfaces the base-advance summary: the prior and new
+// heads, the merge commit, whether the branch already contained the base, the
+// mechanism note, and whether the required audit-complete check re-posted.
+type RebaseRunBranchOutput struct {
+	Result RebaseBranchResult `json:"result"`
+}
+
+// registerRebaseRunBranch wires the fishhawk_rebase_run_branch tool
+// (E64.23 / #3125).
+//
+// Auth: write tool, OPERATOR-ONLY. An operator-side fhk_* token carrying
+// `write:stages` succeeds; a run-bound MCP token is rejected outright
+// (run_token_forbidden) even for its own run — advancing a branch onto a new
+// base is a lineage-moving write the ADR-035 sole-writer invariant reserves
+// to an operator authorization.
+func registerRebaseRunBranch(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_rebase_run_branch",
+		Description: strings.TrimSpace(`
+Operator-gated: have the RUNNER advance its own run/PR branch onto the
+declared base, so an operator whose branch fell BEHIND never has to resolve
+in a worktree and push to a runner-owned branch (ADR-035 sole-writer
+invariant preserved — the operator authorizes, the App installation writes).
+
+MECHANISM, stated plainly because this verb's NAME is misleading: the forge
+REST API exposes no rebase primitive, so this
+merges the declared base INTO the run branch
+server-side, leaving a MERGE COMMIT; this is not a literal rebase and does
+not produce linear history. No force-push is involved.
+
+The advance:
+
+  - merges the base ref into the run branch (base=<run branch>,
+    head=<base ref>);
+  - re-parks the review gate so CI + the merge reconciler re-evaluate the
+    new head;
+  - records a branch_rebased audit entry and refreshes the status comment;
+  - re-posts the fishhawk_audit_complete Check Run AT the new head, so the
+    required check is not left pinned to the stale pre-advance sha.
+
+FAIL-CLOSED on a conflict: if the run branch CONFLICTS with the advanced
+base the call is refused (rebase_conflict) having written NOTHING — no
+merge commit, no audit entry, no check re-post. This first slice does not
+resolve conflicts; agent-driven resolution is tracked in #3202, and today's
+route (resolve in a worktree, push, then fishhawk_vouch_commit) remains the
+fallback. Every uncertain anchor is likewise fail-closed
+(rebase_not_determinable) rather than merged on a guess.
+
+Sibling verb: fishhawk_reset_run_branch is the right verb for a FOREIGN
+COMMIT pushed ON TOP of the run's commits — a different problem. This one
+is for a BASE ADVANCE.
+
+Idempotent retry: if the check re-post fails, re-invoke this verb. The
+branch now contains the base, so the behind-probe short-circuits the merge
+and the call re-posts the check at the correct head.
+
+Inputs:
+  - run_id  : the run whose branch to advance.
+  - reason  : optional operator note, recorded on the audit entry.
+  - confirm : MUST be true (confirmation_required otherwise).
+
+Returns the advance summary (prior_head_sha, new_head_sha,
+merge_commit_sha, already_up_to_date, mechanism_note,
+audit_check_republished) on success. Returns a tool error on:
+  - invalid UUID (caught before the HTTP hop)
+  - confirmation_required (confirm not true, 400)
+  - run_token_forbidden (a run-bound agent token, 403)
+  - insufficient_scope (no write:stages, 403)
+  - run_not_found (404)
+  - rebase_conflict (the branch conflicts with the base; nothing written, 422)
+  - rebase_not_determinable (fail-closed: unresolvable anchor, behind-probe
+    failure, or a concurrent push caught by the lease re-check, 422)
+  - rebase_merge_failed (the merge failed for a non-conflict reason, 502)
+  - rebase_unconfigured (503)
+`),
+	}, resolver.rebaseRunBranch)
+}
+
+// rebaseRunBranch is the tool handler. The behind-probe, the fail-closed
+// determinability ladder, the lease re-check, the merge direction and the
+// shared re-park/audit/republish tail all live server-side in
+// server/rebase_branch.go.
+func (r *runResolver) rebaseRunBranch(ctx context.Context, _ *mcp.CallToolRequest, in RebaseRunBranchInput) (*mcp.CallToolResult, RebaseRunBranchOutput, error) {
+	runID, err := uuid.Parse(in.RunID)
+	if err != nil {
+		return nil, RebaseRunBranchOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+	if !in.Confirm {
+		return nil, RebaseRunBranchOutput{}, fmt.Errorf("confirm must be true: fishhawk_rebase_run_branch merges the declared base INTO the run branch, leaving a merge commit and moving the PR head")
+	}
+	res, err := r.api.RebaseRunBranch(ctx, runID, in.Reason)
+	if err != nil {
+		return nil, RebaseRunBranchOutput{}, fmt.Errorf("rebase run branch: %w", err)
+	}
+	return nil, RebaseRunBranchOutput{Result: *res}, nil
 }
 
 // RetryStageInput is the fishhawk_retry_stage tool's input schema

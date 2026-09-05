@@ -3097,7 +3097,13 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// fishhawk_record_grooming_dispositions, the operator-only CAPTURE of
 	// per-entry grooming verdicts as auditable facts (consumed by nothing until
 	// #2991) — taking the total 51 -> 52.
-	const wantToolCount = 52
+	//
+	// E64.23 (#3125) adds exactly ONE tool — fishhawk_rebase_run_branch, the
+	// operator-gated verb that has the RUNNER advance its own lineage branch
+	// onto the declared base (a forge-side merge of the base INTO the run
+	// branch, leaving a merge commit) so a behind-base operator never pushes to
+	// a runner-owned branch — taking the total 52 -> 53.
+	const wantToolCount = 53
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3130,6 +3136,35 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawGateView {
 		t.Error("fishhawk_get_gate_view is not registered/visible over ListTools")
+	}
+
+	// fishhawk_rebase_run_branch (E64.23 / #3125) must be wire-visible, and its
+	// DESCRIPTION must carry the two claims that are not compiler-enforced
+	// anywhere: the merge-commit MECHANISM (the verb's name would otherwise
+	// imply linear history) and the fishhawk_reset_run_branch cross-link (an
+	// operator who reaches for the wrong sibling must be told which is right).
+	var sawRebase bool
+	for _, tool := range res.Tools {
+		if tool.Name != "fishhawk_rebase_run_branch" {
+			continue
+		}
+		sawRebase = true
+		if !strings.Contains(tool.Description, "merges the declared base INTO the run branch") ||
+			!strings.Contains(tool.Description, "MERGE COMMIT") {
+			t.Errorf("fishhawk_rebase_run_branch description must state the merge-commit mechanism:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "not a literal rebase") {
+			t.Errorf("fishhawk_rebase_run_branch description must say it is not a literal rebase:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "fishhawk_reset_run_branch") {
+			t.Errorf("fishhawk_rebase_run_branch description must cross-link the sibling verb:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "#3202") {
+			t.Errorf("fishhawk_rebase_run_branch description must name the deferred conflict-resolution issue:\n%s", tool.Description)
+		}
+	}
+	if !sawRebase {
+		t.Error("fishhawk_rebase_run_branch is not registered/visible over ListTools")
 	}
 
 	// fishhawk_record_grooming_dispositions (#2843) must be wire-visible — a

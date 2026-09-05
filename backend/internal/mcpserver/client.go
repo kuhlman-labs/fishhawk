@@ -2023,6 +2023,85 @@ func (c *apiClient) ResetRunBranch(ctx context.Context, runID uuid.UUID, reason 
 	return &res, nil
 }
 
+// rebaseBranchRequest mirrors the backend's
+// `POST /v0/runs/{run_id}/rebase-branch` body
+// (`backend/internal/server/rebase_branch.go::rebaseBranchRequest`).
+// Confirm MUST be true — the advance moves the PR head (leaving a merge
+// commit), so the backend refuses a missing/false confirm with 400.
+type rebaseBranchRequest struct {
+	Reason  string `json:"reason,omitempty"`
+	Confirm bool   `json:"confirm"`
+}
+
+// RebaseBranchResult mirrors the backend's rebase-branch 200 body: the
+// summary of a base advance. Every field is a plain string/bool/int per the
+// #371 reflection rule, so the MCP SDK's response-schema reflection sees the
+// wire types the JSON actually carries.
+//
+// MECHANISM, restated here because the verb's NAME is misleading: the forge
+// REST API exposes no rebase primitive, so this is a MERGE OF THE BASE INTO
+// THE RUN BRANCH. It leaves a MERGE COMMIT and does NOT produce linear
+// history. MechanismNote carries that sentence on every success.
+type RebaseBranchResult struct {
+	RunID          string `json:"run_id"`
+	PRNumber       int    `json:"pr_number"`
+	Branch         string `json:"branch"`
+	BaseRef        string `json:"base_ref"`
+	PriorHeadSHA   string `json:"prior_head_sha"`
+	NewHeadSHA     string `json:"new_head_sha"`
+	MergeCommitSHA string `json:"merge_commit_sha"`
+	// AlreadyUpToDate reports that the branch ALREADY contained the base, so
+	// no merge was attempted. It is still a success that re-parks the gate
+	// and republishes the check at the current head — which is what makes
+	// re-invoking this verb a real retry after a failed check re-post.
+	AlreadyUpToDate       bool   `json:"already_up_to_date"`
+	ReparkedReviewStageID string `json:"reparked_review_stage_id,omitempty"`
+	MechanismNote         string `json:"mechanism_note"`
+	// AuditCheckRepublished reports whether the fishhawk_audit_complete Check
+	// Run was re-posted at the new head. FALSE when it errored, when no
+	// publisher is wired, or when the new head could not be read back at all
+	// — in that last case publication is SKIPPED deliberately rather than
+	// falling back to the pre-merge head, which would pin the required check
+	// to the stale sha this verb exists to move off.
+	AuditCheckRepublished      bool   `json:"audit_check_republished"`
+	AuditCheckRepublishWarning string `json:"audit_check_republish_warning,omitempty"`
+}
+
+// RebaseRunBranch has the RUNNER advance its own lineage branch onto the
+// declared base via `POST /v0/runs/{run_id}/rebase-branch` (E64.23 / #3125),
+// so an operator whose branch fell behind never has to push to a
+// runner-owned branch. The App installation stays the sole writer under
+// ADR-035; the operator authorizes rather than performs the write.
+//
+// MECHANISM: a forge-side merge of the base INTO the run branch, leaving a
+// merge commit. Not a literal rebase; no linear history; no force-push.
+//
+// Operator-gated: confirm is always sent true (the tool layer requires the
+// operator's confirm). 4xx/5xx surfaces:
+//   - 400 confirmation_required (confirm not true)
+//   - 403 run_token_forbidden (a run-bound agent token, even for its own run)
+//   - 403 insufficient_scope (no write:stages)
+//   - 404 run_not_found
+//   - 422 rebase_conflict (fail-closed first slice: the branch conflicts with
+//     the advanced base; NOTHING was written — agent resolution is #3202)
+//   - 422 rebase_not_determinable (fail-closed: an anchor could not be
+//     resolved, the behind-probe failed, or the lease re-check saw a
+//     concurrent push)
+//   - 502 rebase_merge_failed (the merge itself failed for a non-conflict
+//     reason; nothing was written)
+//   - 503 rebase_unconfigured
+func (c *apiClient) RebaseRunBranch(ctx context.Context, runID uuid.UUID, reason string) (*RebaseBranchResult, error) {
+	body, err := json.Marshal(rebaseBranchRequest{Reason: reason, Confirm: true})
+	if err != nil {
+		return nil, fmt.Errorf("marshal rebase-branch: %w", err)
+	}
+	var res RebaseBranchResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/rebase-branch", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // ReviveRestoredStage mirrors the backend's reviveRestoredStage wire shape
 // (`backend/internal/server/revive.go`): one re-parked stage in a revive's
 // batch. StageID is typed `string` (not `uuid.UUID`) per the #371 reflection

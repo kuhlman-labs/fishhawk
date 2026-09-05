@@ -7711,6 +7711,163 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/rebase-branch:
+    post:
+      operationId: rebaseRunBranch
+      summary: Advance a run branch onto its declared base (operator-gated)
+      description: |
+        Operator-gated: has the RUNNER advance its own lineage branch onto the
+        declared base, so an operator whose run branch fell BEHIND never has to
+        resolve in a worktree and push to a branch ADR-035 declares
+        runner-owned. The App installation remains the sole writer; the
+        operator authorizes rather than performs the write (E64.23 / #3125).
+
+        **MECHANISM, stated plainly because the endpoint's NAME is
+        misleading.** The forge REST API exposes NO rebase primitive, so this
+        performs a forge-side MERGE OF THE BASE INTO THE RUN BRANCH
+        (`POST /repos/{owner}/{repo}/merges` with `base=<run branch>`,
+        `head=<base ref>`). It leaves a MERGE COMMIT and does NOT produce
+        linear history. There is no force-push. Every 200 carries a constant
+        `mechanism_note` restating this, so a reader of the response cannot
+        infer linear history from the route's name.
+
+        On success it also:
+
+        - re-parks the review gate so CI + the merge reconciler re-evaluate
+          the new head;
+        - records a `branch_rebased` audit entry and refreshes the sticky
+          status comment;
+        - attributes the merge commit into the ADR-035 reported-head ledger,
+          so the installation-authored merge does not flag foreign and wedge
+          the very run this endpoint un-wedged;
+        - re-posts the `fishhawk_audit_complete` Check Run AT the new head.
+
+        **FAIL-CLOSED FIRST SLICE.** A CONFLICTING merge is refused 422
+        (`rebase_conflict`) having written NOTHING — no merge commit, no audit
+        entry, no check re-post. This slice does not resolve conflicts;
+        agent-driven resolution is tracked in #3202, and the pre-existing
+        route (resolve on the run branch, `POST /v0/runs/{run_id}/vouch-commit`
+        the resulting commit, re-merge) remains the fallback. Every uncertain
+        anchor is likewise refused 422 (`rebase_not_determinable`) rather than
+        merged on a guess.
+
+        **"Already contains the base" is decided BEFORE any merge**, by a
+        three-dot `CompareCommits(base=<live run branch head>, head=<base
+        ref>)` probe: zero commits means the base is already an ancestor of the
+        run branch head. Nothing reads the merges API's ambiguous
+        already-merged return as a discriminator. That arm is still a 200 that
+        re-parks and republishes at the current head — which is what makes
+        re-invoking this endpoint a REAL retry after a failed check re-post.
+
+        **Degraded head read.** If the merge succeeds but the post-merge head
+        cannot be read back, the response is 200 with `new_head_sha` empty and
+        publication SKIPPED — deliberately NOT falling back to the pre-merge
+        head, which would pin the required check to exactly the stale sha this
+        endpoint exists to move off. The warning names re-invocation.
+
+        **Sibling endpoint.** `POST /v0/runs/{run_id}/reset-branch` is the
+        right verb for a FOREIGN COMMIT pushed ON TOP of the run's commits — a
+        different problem. Both refusals cross-link the other.
+
+        **Authorization.** Operator-token-only by design (ADR-035 sole-writer
+        invariant). Requires `write:stages`, enforced UNCONDITIONALLY with no
+        cookie-session bypass. A run-bound MCP token (subject
+        `mcp:run:<uuid>`) is REJECTED OUTRIGHT 403 (`run_token_forbidden`),
+        even for its own run — advancing a branch onto a new base is a
+        lineage-moving write reserved to an operator authorization.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        description: |
+          Confirms the head-moving base advance and carries an optional
+          operator rationale.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [confirm]
+              properties:
+                confirm:
+                  type: boolean
+                  description: |
+                    MUST be `true` to proceed — the advance merges the base
+                    into the run branch, leaving a merge commit and moving the
+                    PR head. A missing/false value is refused 400
+                    (`confirmation_required`).
+                reason:
+                  type: string
+                  description: |
+                    Optional operator rationale, recorded on the
+                    `branch_rebased` audit entry.
+      responses:
+        '200':
+          description: |
+            Base advance recorded (or the branch already contained the base);
+            advance summary in body.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  pr_number: { type: integer }
+                  branch: { type: string }
+                  base_ref: { type: string, description: 'The declared base ref that was merged in.' }
+                  prior_head_sha: { type: string, description: 'The run branch tip before the advance.' }
+                  new_head_sha: { type: string, description: 'The AUTHORITATIVE post-advance head, from a live PR re-read. Empty when the re-read failed, in which case the check re-post was deliberately skipped.' }
+                  merge_commit_sha: { type: string, description: 'The merge commit the merges API returned. May legitimately be EMPTY on an undecodable 201 body — the merge still happened; use new_head_sha as the authority.' }
+                  already_up_to_date: { type: boolean, description: 'The branch already contained the base, so no merge was attempted. Still re-parks and republishes.' }
+                  reparked_review_stage_id: { type: string, description: 'The re-parked review stage id; omitted on the commit-yourself shape.' }
+                  mechanism_note: { type: string, description: 'Constant sentence stating the merge-commit mechanism, shipped on every 200.' }
+                  audit_check_republished: { type: boolean, description: 'Whether the fishhawk_audit_complete Check Run re-posted at the new head.' }
+                  audit_check_republish_warning: { type: string, description: 'Present when the re-post did not land; names the reason and the idempotent re-invocation retry.' }
+        '400':
+          description: |
+            Malformed body or `confirm` not `true`. Body's `error` is
+            `validation_failed` or `confirmation_required`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of two cases: (1) a run-bound MCP token (subject
+            `mcp:run:<uuid>`) — REJECTED OUTRIGHT even for its own run, body
+            `error` is `run_token_forbidden`; (2) any identity without
+            `write:stages` — body `error` is `insufficient_scope`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: |
+            Advance refused, nothing written. One of: `rebase_conflict` (the
+            run branch conflicts with the advanced base; this slice fails
+            closed — see #3202) or `rebase_not_determinable` (fail-closed: an
+            anchor could not be resolved, the behind-probe failed, or the lease
+            re-check found a concurrent push). Body's `message` explains the
+            specific reason and cross-links `reset-branch`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            The base merge failed for a non-conflict reason
+            (`rebase_merge_failed`). Nothing was written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The endpoint is not configured (`rebase_unconfigured`): it requires
+            run + audit repositories and a GitHub client.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/runs/{run_id}/vouch-commit:
     post:
       operationId: vouchCommit
@@ -7751,9 +7908,12 @@ paths:
         swallowed; the merge reconciler's heal CANNOT retry it (it uses the same
         operator-vouched-blind head resolution), so re-invoking the vouch is the
         sanctioned idempotent retry (the publisher dedups on success). The
-        post-change route for a base-advance conflict is therefore still
-        operator-resolve-then-vouch — a sanctioned rebase verb is deferred to
-        #3125.
+        sanctioned route out of a base advance is now
+        `POST /v0/runs/{run_id}/rebase-branch` (E64.23 / #3125), which has the
+        RUNNER advance its own branch; operator-resolve-then-vouch survives
+        ONLY as the fallback for a CONFLICTING base merge, which that endpoint
+        fails closed on (`rebase_conflict`). Agent-driven conflict resolution
+        is deferred to #3202.
 
         **Authorization.** Operator-token-only by design (ADR-035 sole-writer
         invariant). Requires `write:stages`. A run-bound MCP token (subject
@@ -7890,9 +8050,13 @@ paths:
         GitHub signal (`mergeable_state == "dirty"` or a documented
         `mergeable == false`) and proceeds on every uncertainty (GitHub
         unwired, no installation, unparseable repo/PR, a PR-read error, or a
-        still-computing `mergeable: null`). The post-refusal route is
-        operator-resolve-the-conflict-then-`vouch-commit`-then-re-merge (a
-        sanctioned rebase verb is deferred to #3125). GitLab MRs are NOT
+        still-computing `mergeable: null`). The post-refusal route for a
+        genuine conflict is
+        operator-resolve-the-conflict-then-`vouch-commit`-then-re-merge; for a
+        branch that has merely fallen BEHIND a clean base,
+        `POST /v0/runs/{run_id}/rebase-branch` (E64.23 / #3125) now has the
+        runner advance it, and agent-driven resolution of the conflicting case
+        is deferred to #3202. GitLab MRs are NOT
         classified here (the mergeability fields are GitHub-only, so a
         conflicting GitLab MR falls through to today's queue-then-timeout
         behavior — `merge_status`/`detailed_merge_status` would be the signal).
