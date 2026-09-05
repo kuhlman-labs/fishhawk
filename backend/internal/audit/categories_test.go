@@ -362,6 +362,31 @@ func TestKnownCategories_GroomingApplyCompleted(t *testing.T) {
 	}
 }
 
+// TestKnownCategories_GroomingApplyWindowClosed pins E54.48 / #2991's watermark
+// category: the capture/apply concurrency protocol appends it at settlement to
+// close a grooming-report artifact's disposition-capture window. An unregistered
+// category is un-awaitable and unfilterable via GET /v0/runs/{id}/audit?category=,
+// and categories_completeness_test.go's AST sweep fails the build on a category
+// backend code emits but the registry omits.
+func TestKnownCategories_GroomingApplyWindowClosed(t *testing.T) {
+	if !IsKnownCategory("grooming_apply_window_closed") {
+		t.Fatal("grooming_apply_window_closed is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+	if GroomingApplyWindowClosedCategory != "grooming_apply_window_closed" {
+		t.Errorf("GroomingApplyWindowClosedCategory = %q, want %q", GroomingApplyWindowClosedCategory, "grooming_apply_window_closed")
+	}
+	var found bool
+	for _, c := range SuggestCategories("grooming_apply_window_close", 5) {
+		if c == "grooming_apply_window_closed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("SuggestCategories(%q) = %v, want it to surface grooming_apply_window_closed",
+			"grooming_apply_window_close", SuggestCategories("grooming_apply_window_close", 5))
+	}
+}
+
 func TestKnownCategories_RunRejectedMissingCharter(t *testing.T) {
 	if !IsKnownCategory("run_rejected_missing_charter") {
 		t.Fatal("run_rejected_missing_charter is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")

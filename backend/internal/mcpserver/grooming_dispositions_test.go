@@ -191,6 +191,8 @@ func TestRecordGroomingDispositions_SurfacesBackendRefusals(t *testing.T) {
 			"verdict must name one of the three grooming verdicts"},
 		{"no report", http.StatusConflict, "grooming_report_absent",
 			"this run carries no grooming_report artifact"},
+		{"window closed", http.StatusConflict, "grooming_window_closed",
+			"this grooming report's disposition-capture window has been settled"},
 		{"unconfigured", http.StatusServiceUnavailable, "grooming_dispositions_unconfigured",
 			"grooming-dispositions endpoint requires run + artifact + audit repositories"},
 	}
@@ -208,6 +210,34 @@ func TestRecordGroomingDispositions_SurfacesBackendRefusals(t *testing.T) {
 				t.Errorf("tool error = %q, want it to name the backend code %q", err, tc.code)
 			}
 		})
+	}
+}
+
+// TestRecordGroomingDispositions_DecodesWindowFields pins that the tool decodes
+// the #2991 window_closed / settlement fields off the same response shape the
+// backend emits — the mirror-drift guard for the passthrough struct.
+func TestRecordGroomingDispositions_DecodesWindowFields(t *testing.T) {
+	fb := newGDFakeBackend(t)
+	fb.respond = func(w http.ResponseWriter, _ *http.Request) bool {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(RecordGroomingDispositionsOutput{
+			RunID: uuid.NewString(), ArtifactID: uuid.NewString(),
+			WindowClosed: true,
+			Settlement:   &groomingWindowSettlement{Settlement: "approved", ClosedAt: "2026-09-05T00:00:00Z", AuditSequence: 42},
+		})
+		return true
+	}
+	_, out, err := fb.resolver().recordGroomingDispositions(context.Background(), nil,
+		RecordGroomingDispositionsInput{RunID: uuid.NewString(),
+			Dispositions: []GroomingDispositionEntry{{EntryID: "ordering:a", Verdict: "approved"}}})
+	if err != nil {
+		t.Fatalf("recordGroomingDispositions: %v", err)
+	}
+	if !out.WindowClosed {
+		t.Error("window_closed decoded false, want true")
+	}
+	if out.Settlement == nil || out.Settlement.Settlement != "approved" || out.Settlement.AuditSequence != 42 {
+		t.Errorf("settlement = %+v, want approved/seq 42", out.Settlement)
 	}
 }
 

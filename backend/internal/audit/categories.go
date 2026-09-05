@@ -127,8 +127,18 @@ import "sort"
 // grooming_mutation_applied and the two must not be conflated: this row is what
 // the OPERATOR DECIDED (approved / rejected / amended, with an optional
 // close_target) about one entry id; a grooming_mutation_applied row is what was
-// APPLIED, and the second derives from the first. Capture is operator-only and,
-// as of #2843, is consumed by NOTHING — the apply half is #2991.
+// APPLIED, and the second derives from the first. Capture is operator-only; as
+// of E54.48 / #2991 these rows are CONSUMED by the on-approval apply hook, which
+// settles the artifact's window (grooming_apply_window_closed) and applies the
+// recorded verdicts.
+// E54.48 / #2991 added grooming_apply_window_closed, the WATERMARK the
+// capture/apply concurrency protocol appends at settlement
+// (audit/grooming_window.go): one chained entry per grooming-report artifact
+// whose disposition-capture window has been settled, carrying the artifact id
+// and the settlement (approved / rejected). After it lands a capture for that
+// artifact is refused (409 grooming_window_closed) and the settlement consumes
+// exactly the dispositions recorded below it. It is INTERNAL, audit-only — it
+// renders no issue comment.
 // E54.6 / #2238 added campaign_grooming_source_resolved, written once per
 // campaign created from an approved grooming run's ratified order (the third
 // POST /v0/campaigns source): it carries the campaign id, the source
@@ -224,6 +234,7 @@ var KnownCategories = map[string]struct{}{
 	"fixup_no_changes":                        {},
 	"fixup_pushed":                            {},
 	"grooming_apply_completed":                {},
+	"grooming_apply_window_closed":            {},
 	"grooming_churn_filtered":                 {},
 	"grooming_disposition_recorded":           {},
 	"grooming_mutation_applied":               {},

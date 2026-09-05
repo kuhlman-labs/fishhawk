@@ -1773,6 +1773,18 @@ Notes:
   the apply still completes (continue-and-report) but nothing is silently
   unaudited. Listed here so a future reader grepping the audit categories
   doesn't mistake them for comment surfaces.
+- The grooming capture/apply WINDOW kind — `grooming_apply_window_closed`
+  (E54.48 / #2991) — is an **internal, audit-only category, not an issue-comment
+  surface**. Nothing in `issuecomment` posts it; it has no Notifier method. It is
+  the WATERMARK the capture/apply concurrency protocol appends at settlement
+  (`backend/internal/audit/grooming_window.go`, written through
+  `AppendChained` by the on-approval hook's `settleGroomingWindow`): one chained
+  entry per grooming-report artifact whose disposition-capture window has been
+  settled, carrying `{run_id, stage_id, artifact_id, settlement, closed_at}`
+  where `settlement` is `approved` or `rejected`. After it lands a capture for
+  that artifact is refused `409 grooming_window_closed` and the settlement
+  consumes exactly the dispositions recorded below it. Listed here so a future
+  reader grepping the audit categories doesn't mistake it for a comment surface.
 - The product-feedback egress kind — `product_report_filed` (#1006) — is an
   **internal, source-side audit-only category, not a run-thread comment
   surface**. Nothing in `issuecomment` posts it; it has no Notifier method. It

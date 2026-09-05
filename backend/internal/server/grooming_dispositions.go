@@ -14,11 +14,18 @@ package server
 // able from "the operator never decided", which is exactly the state the churn
 // guard's baseline reads.
 //
-// NOTHING CONSUMES THESE ROWS. This slice is capture only. The apply half — the
-// consumption ordering, the watermark/concurrency protocol between capture and
-// apply, and unlocking the gated destructive classes — is #2991, and this file
-// deliberately specifies no consumption ordering. A row written here is inert,
-// forward-compatible audit history.
+// THESE ROWS ARE NOW CONSUMED (E54.48 / #2991). The on-approval apply hook
+// (grooming_apply.go) reads the dispositions recorded here and applies them: an
+// explicit `approved` populates the per-entry gate approval that unlocks a gated
+// destructive class, `rejected` skips, `amended` is not an approval path, and an
+// undispositioned HYGIENE entry still auto-applies while an undispositioned
+// gated one does not. The capture WINDOW is closed at settlement: the apply hook
+// appends an artifact-bound grooming_apply_window_closed WATERMARK (audit layer),
+// after which a capture for that artifact is refused 409 grooming_window_closed.
+// The capture path here appends the whole batch in ONE transaction under the
+// run-row lock (audit.GroomingWindowAppender) so a capture returns success only
+// if its dispositions are still consumable; it falls back to a per-row loop for
+// in-memory repositories that lack the capability.
 //
 // CAPTURE IS OPERATOR-ONLY, AND THAT MEANS TWO REFUSALS:
 //
@@ -61,15 +68,17 @@ import (
 )
 
 // CategoryGroomingDispositionRecorded is the audit category appended once per
-// entry disposition an operator records (#2843). Registered in
-// audit.KnownCategories so GET /v0/runs/{id}/audit?category= and
-// fishhawk_await_audit can read the stream without a 400.
+// entry disposition an operator records (#2843). What is load-bearing is that
+// the VALUE is registered in audit.KnownCategories — GET /v0/runs/{id}/audit?category=
+// and fishhawk_await_audit reject an unregistered category with a 400, and
+// categories_completeness_test.go's AST sweep fails the build on any category
+// backend code emits but the registry omits.
 //
-// The `Category*` binding-name shape is load-bearing: audit's
-// categories_completeness_test.go AST-collects any constant whose name contains
-// "category" and asserts its value is registered, so an unregistered emit fails
-// the build rather than shipping an unreadable stream.
-const CategoryGroomingDispositionRecorded = "grooming_disposition_recorded"
+// It ALIASES audit.GroomingDispositionRecordedCategory so the capture handler
+// and the #2991 audit-layer settlement scan (which lists this category to build
+// a window's consumed set) share ONE source of truth rather than two literals
+// that could drift.
+const CategoryGroomingDispositionRecorded = audit.GroomingDispositionRecordedCategory
 
 // groomingDispositionInput is one requested disposition.
 type groomingDispositionInput struct {
@@ -102,11 +111,38 @@ type recordedGroomingDisposition struct {
 // POST returns the projection too, so the MCP verb gets its read-back in one
 // call.
 type groomingDispositionsResponse struct {
-	RunID        string                        `json:"run_id"`
-	ArtifactID   string                        `json:"artifact_id"`
-	StageID      string                        `json:"stage_id"`
-	ContentHash  string                        `json:"content_hash"`
+	RunID       string `json:"run_id"`
+	ArtifactID  string `json:"artifact_id"`
+	StageID     string `json:"stage_id"`
+	ContentHash string `json:"content_hash"`
+	// WindowClosed is true once the apply hook has settled this artifact's
+	// capture window (#2991). After it a capture for this artifact is refused.
+	WindowClosed bool `json:"window_closed"`
+	// Settlement carries the watermark's facts when WindowClosed is true, so an
+	// operator who recorded a rejection reads back the settlement rather than an
+	// empty set and concludes their capture failed. Nil while the window is open.
+	Settlement   *groomingWindowSettlement     `json:"settlement,omitempty"`
 	Dispositions []recordedGroomingDisposition `json:"dispositions"`
+}
+
+// groomingWindowSettlement is the read-back projection of the artifact's closing
+// watermark (#2991).
+type groomingWindowSettlement struct {
+	Settlement    string `json:"settlement"`
+	ClosedAt      string `json:"closed_at"`
+	AuditSequence int64  `json:"audit_sequence"`
+}
+
+// groomingWindowPayload is the audit-row payload of a grooming_apply_window_closed
+// watermark. Marshalled BARE, matching the disposition rows' shape, so the audit
+// layer decodes artifact_id / settlement straight off the payload
+// (audit.groomingWatermarkArtifactID / groomingWatermarkSettlement).
+type groomingWindowPayload struct {
+	RunID      string `json:"run_id"`
+	StageID    string `json:"stage_id"`
+	ArtifactID string `json:"artifact_id"`
+	Settlement string `json:"settlement"`
+	ClosedAt   string `json:"closed_at"`
 }
 
 // groomingDispositionPayload is the audit-row payload. Marshalled BARE (its own
@@ -412,16 +448,19 @@ func (s *Server) handleRecordGroomingDispositions(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Past all eight rungs: append one chained row per disposition. One row per
-	// entry mirrors grooming_mutation_applied's one-row-per-entry family, so a
-	// single category filter returns the whole capture.
+	// Past all eight rungs: MARSHAL EVERY payload first (so a marshal failure
+	// happens before any append), then drive the ATOMIC batch path when the repo
+	// carries the #2991 capability, falling back to the per-row loop for
+	// in-memory repositories that do not.
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
 	}
 	actorKind := audit.ActorUser
 	stageID := stage.ID
-	for n, d := range reqBody.Dispositions {
+	now := time.Now().UTC()
+	params := make([]audit.ChainAppendParams, 0, len(reqBody.Dispositions))
+	for _, d := range reqBody.Dispositions {
 		payload, merr := json.Marshal(groomingDispositionPayload{
 			RunID: runID.String(), StageID: stageID.String(),
 			ArtifactID: art.ID.String(), ContentHash: art.ContentHash,
@@ -433,36 +472,59 @@ func (s *Server) handleRecordGroomingDispositions(w http.ResponseWriter, r *http
 				"marshal disposition payload failed", map[string]any{"error": merr.Error()})
 			return
 		}
-		if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		params = append(params, audit.ChainAppendParams{
 			RunID:        runID,
 			StageID:      &stageID,
-			Timestamp:    time.Now().UTC(),
+			Timestamp:    now,
 			Category:     CategoryGroomingDispositionRecorded,
 			ActorKind:    &actorKind,
 			ActorSubject: &subject,
 			Payload:      payload,
-		}); aerr != nil {
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-				"grooming-dispositions: append grooming_disposition_recorded failed",
-				slog.String("run_id", runID.String()),
-				slog.String("entry_id", d.EntryID),
-				slog.String("error", aerr.Error()))
-			// The rows that DID land are durable, and a repeat POST is safe
-			// because capture is last-wins rather than additive-conflicting —
-			// so the count is reported rather than hidden.
-			//
-			// `recorded` / `requested` REACH THE CALLER only because both keys
-			// are members of errors.go's default-deny 5xx allow-list
-			// (redactableDetailKeys). They were not, and this comment claimed a
-			// count the shipped body never carried; the counts are the
-			// operator's only evidence of what survived, so
-			// TestGroomingDispositionsMidBatchAppendFailure asserts them off
-			// the RESPONSE BYTES — not off the map handed to writeError, which
-			// is the assertion that would keep a redacted count looking pinned.
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"recording the disposition batch failed part-way; the rows already appended are durable and a repeat POST is safe (capture is last-wins)",
-				map[string]any{"recorded": n, "requested": len(reqBody.Dispositions), "error": aerr.Error()})
+		})
+	}
+
+	if appender, ok := s.cfg.AuditRepo.(audit.GroomingWindowAppender); ok {
+		// ATOMIC BATCH: one capture is one transaction. A closed window refuses
+		// the whole batch (nothing recorded); any other append failure rolls the
+		// WHOLE batch back, so the 500 body says nothing was recorded rather than
+		// reporting a partial count.
+		_, aerr := appender.AppendChainedGroomingDispositionBatch(r.Context(), art.ID.String(), params)
+		var closed *audit.GroomingWindowClosedError
+		switch {
+		case errors.As(aerr, &closed):
+			s.writeError(w, r, http.StatusConflict, "grooming_window_closed",
+				"this grooming report's disposition-capture window has been settled; NO disposition was recorded and the dispositions you sent are not consumable",
+				map[string]any{
+					"artifact_id":        closed.ArtifactID,
+					"settlement":         closed.Settlement,
+					"watermark_sequence": closed.Sequence,
+				})
 			return
+		case aerr != nil:
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"grooming-dispositions: atomic disposition batch failed",
+				slog.String("run_id", runID.String()), slog.String("error", aerr.Error()))
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"recording the disposition batch failed; the capture is atomic, so NOTHING was recorded and a repeat POST is safe",
+				map[string]any{"error": aerr.Error()})
+			return
+		}
+	} else {
+		// FALLBACK (in-memory repos without the capability): per-row loop. This
+		// path is non-atomic, so a mid-batch failure can leave durable partial
+		// rows; `recorded`/`requested` reach the caller via errors.go's 5xx
+		// allow-list and are the operator's only evidence of what survived. A
+		// repeat POST is safe because capture is last-wins.
+		for n := range params {
+			if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), params[n]); aerr != nil {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+					"grooming-dispositions: append grooming_disposition_recorded failed",
+					slog.String("run_id", runID.String()), slog.String("error", aerr.Error()))
+				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+					"recording the disposition batch failed part-way; the rows already appended are durable and a repeat POST is safe (capture is last-wins)",
+					map[string]any{"recorded": n, "requested": len(params), "error": aerr.Error()})
+				return
+			}
 		}
 	}
 
@@ -515,13 +577,58 @@ func (s *Server) respondGroomingDispositions(w http.ResponseWriter, r *http.Requ
 			"listing recorded dispositions failed", map[string]any{"error": err.Error()})
 		return
 	}
+	// The capture window (#2991). Pre-watermark dispositions are still projected
+	// UNCHANGED below — nothing is voided or hidden — so an operator who recorded
+	// a rejection reads back their capture plus the settlement, never an empty set.
+	settlement, serr := s.groomingWindowSettlementFor(r.Context(), runID, art.ID.String())
+	if serr != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"listing the grooming capture window failed", map[string]any{"error": serr.Error()})
+		return
+	}
 	s.writeJSON(w, r, http.StatusOK, groomingDispositionsResponse{
 		RunID:        runID.String(),
 		ArtifactID:   art.ID.String(),
 		StageID:      stage.ID.String(),
 		ContentHash:  art.ContentHash,
+		WindowClosed: settlement != nil,
+		Settlement:   settlement,
 		Dispositions: projectGroomingDispositions(entries, art.ID.String(), plan.GroomingEntryClasses(report)),
 	})
+}
+
+// groomingWindowSettlementFor resolves the LOWEST-sequence grooming_apply_window_closed
+// watermark bound to artifactID (the permanent one), or nil when the window is
+// still open. It reads the same rows the audit-layer settlement writes, so the
+// read-back reflects a settlement whatever recorded it.
+func (s *Server) groomingWindowSettlementFor(ctx context.Context, runID uuid.UUID, artifactID string) (*groomingWindowSettlement, error) {
+	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, audit.GroomingApplyWindowClosedCategory)
+	if err != nil {
+		return nil, err
+	}
+	var best *audit.Entry
+	for _, e := range rows {
+		if e == nil {
+			continue
+		}
+		var p groomingWindowPayload
+		if json.Unmarshal(e.Payload, &p) != nil || p.ArtifactID != artifactID {
+			continue
+		}
+		if best == nil || e.Sequence < best.Sequence {
+			best = e
+		}
+	}
+	if best == nil {
+		return nil, nil
+	}
+	var p groomingWindowPayload
+	_ = json.Unmarshal(best.Payload, &p)
+	return &groomingWindowSettlement{
+		Settlement:    p.Settlement,
+		ClosedAt:      best.Timestamp.UTC().Format(time.RFC3339Nano),
+		AuditSequence: best.Sequence,
+	}, nil
 }
 
 // projectGroomingDispositions collapses the run's grooming_disposition_recorded

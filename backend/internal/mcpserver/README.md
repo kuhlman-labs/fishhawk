@@ -856,7 +856,7 @@ Error surfaces propagated as tool errors: `validation_failed` (400 / bad UUID, c
 
 `fishhawk_record_grooming_dispositions` **captures** an operator's verdicts on individual entries of a backlog_grooming run's `grooming_report` — one `{entry_id, verdict, close_target?}` per decided entry — and persists each as a chained `grooming_disposition_recorded` audit row. It wraps `POST /v0/runs/{run_id}/grooming-dispositions`.
 
-**Nothing consumes these dispositions yet.** The verb is CAPTURE only: recording an approval applies nothing, closes no duplicate, and re-ranks no backlog. The consumption half — the apply stage and its concurrency protocol — is [#2991](https://github.com/kuhlman-labs/fishhawk/issues/2991). Until that lands a recorded disposition is inert, forward-compatible audit history. Do not call this expecting a tracker mutation. The tool description says so on the wire, so an agent reading the tool list learns it before calling rather than after.
+**These dispositions are CONSUMED on approval** ([#2991](https://github.com/kuhlman-labs/fishhawk/issues/2991)). On the groom stage's approval the apply hook consumes them: an explicit `approved` applies the entry AND is the ONLY thing that unlocks a gated destructive class (a gated-mode duplicate close now dispatches); `rejected` does not apply; `amended` is NOT an approval path; an undispositioned HYGIENE entry still auto-applies and an undispositioned gated one does not. Asymmetry: `scoping` is report-mode in this repo, so an approved decomposition stays surface-only. The capture WINDOW closes at settlement — a capture after that returns `409 grooming_window_closed` and records nothing. The response carries `window_closed` / `settlement` so a reader who recorded a rejection sees the settlement rather than an empty set. The tool description states all of this on the wire.
 
 The audit category is **deliberately distinct** from `grooming_mutation_applied`: this row is what the OPERATOR DECIDED; that one is what was APPLIED, and the second derives from the first.
 
@@ -880,7 +880,7 @@ Semantics worth knowing before calling:
 
 The tool pre-validates the run UUID, a non-empty batch, and non-empty `entry_id`s **before** the HTTP hop; it deliberately does NOT duplicate the verdict or entry-id checks, because a second copy of a closed set is a drift source and the backend's refusal is the one that matters.
 
-Error surfaces propagated as tool errors: invalid UUID / empty `dispositions` / empty `entry_id` (caught locally), `validation_failed` (400), `grooming_verdict_invalid` (400), `run_token_forbidden` (403), `operator_agent_forbidden` (403), `insufficient_scope` (403), `grooming_report_absent` (409), `grooming_entry_unknown` (422), `grooming_dispositions_unconfigured` (503).
+Error surfaces propagated as tool errors: invalid UUID / empty `dispositions` / empty `entry_id` (caught locally), `validation_failed` (400), `grooming_verdict_invalid` (400), `run_token_forbidden` (403), `operator_agent_forbidden` (403), `insufficient_scope` (403), `grooming_report_absent` (409), `grooming_window_closed` (409, #2991: the report's capture window has been settled), `grooming_entry_unknown` (422), `grooming_dispositions_unconfigured` (503).
 
 ## Run-branch reset (`fishhawk_reset_run_branch`)
 

@@ -37,14 +37,32 @@ type RecordedGroomingDisposition struct {
 	AuditSequence int64  `json:"audit_sequence"`
 }
 
+// groomingWindowSettlement is the read-back of an artifact's closing watermark
+// (E54.48 / #2991): present once the apply hook has settled the capture window.
+// Deliberately unexported (like gateViewDispute / gateViewReviewDiffTruncated):
+// the MCP SDK's jsonschema reflection walks it through the exported Settlement
+// field, so it advertises the shape without widening the pinned export surface.
+type groomingWindowSettlement struct {
+	Settlement    string `json:"settlement"`
+	ClosedAt      string `json:"closed_at"`
+	AuditSequence int64  `json:"audit_sequence"`
+}
+
 // RecordGroomingDispositionsOutput is the capture's 200 body: the report
 // artifact the dispositions attached to plus the FULL current disposition set,
 // so the verb gets its read-back in the same call.
 type RecordGroomingDispositionsOutput struct {
-	RunID        string                        `json:"run_id"`
-	ArtifactID   string                        `json:"artifact_id"`
-	StageID      string                        `json:"stage_id"`
-	ContentHash  string                        `json:"content_hash"`
+	RunID       string `json:"run_id"`
+	ArtifactID  string `json:"artifact_id"`
+	StageID     string `json:"stage_id"`
+	ContentHash string `json:"content_hash"`
+	// WindowClosed is true once the apply hook has settled this artifact's
+	// capture window (#2991); after it a capture for this artifact is refused
+	// 409 grooming_window_closed.
+	WindowClosed bool `json:"window_closed"`
+	// Settlement carries the watermark's facts when WindowClosed is true, so a
+	// reader who recorded a rejection sees the settlement rather than an empty set.
+	Settlement   *groomingWindowSettlement     `json:"settlement,omitempty"`
 	Dispositions []RecordedGroomingDisposition `json:"dispositions"`
 }
 
@@ -74,11 +92,16 @@ optional close_target naming which item a duplicate pair collapses onto. Each
 disposition persists as one chained grooming_disposition_recorded audit row
 keyed by the entry's stable DERIVED id.
 
-NOTHING CONSUMES THESE DISPOSITIONS YET. This verb is CAPTURE only: recording an
-approval does NOT apply anything, does not close a duplicate, and does not
-re-rank a backlog. The consumption half — the apply stage and its concurrency
-protocol — is #2991. Until that lands, a recorded disposition is inert,
-forward-compatible audit history. Do not use this expecting a tracker mutation.
+WHAT CONSUMPTION DOES (E54.48 / #2991). On the groom stage's approval the apply
+hook consumes these dispositions: an explicit approved applies the entry AND is
+the ONLY thing that unlocks a gated destructive class (a gated-mode duplicate
+close now dispatches); rejected does not apply; amended is NOT an approval path;
+an undispositioned HYGIENE entry still auto-applies while an undispositioned
+gated entry does not. Note the asymmetry: scoping is report mode in this repo, so
+an approved decomposition stays surface-only — approving it does not icebox
+anything here. The capture WINDOW closes at settlement: after the hook settles, a
+further capture for that report returns 409 grooming_window_closed and records
+nothing.
 
 The audit category is DELIBERATELY distinct from grooming_mutation_applied:
 this row is what the OPERATOR DECIDED; that one is what was APPLIED.
@@ -109,6 +132,7 @@ read-back rides along, so no separate read is needed). Tool errors:
   - operator_agent_forbidden (a delegated operator-agent token attempted it, 403)
   - insufficient_scope (token lacks write:approvals, 403)
   - grooming_report_absent (the run shipped no grooming_report, 409)
+  - grooming_window_closed (this report's capture window has been settled; nothing recorded, 409)
   - grooming_entry_unknown (an id the newest report does not declare, 422)
   - grooming_dispositions_unconfigured (repositories not wired, 503)
 `),

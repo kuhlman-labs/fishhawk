@@ -816,6 +816,72 @@ func TestProjectGroomingDispositions_SkipsUndecodableAndForeignRows(t *testing.T
 	}
 }
 
+// TestProjectGroomingDispositions_LastWinsAndClassFallback covers the two
+// remaining branches: a lower-sequence row arriving after a higher one for the
+// same entry id does NOT overwrite it (last-wins by sequence), and a row with an
+// empty entry_class falls back to the classes map.
+func TestProjectGroomingDispositions_LastWinsAndClassFallback(t *testing.T) {
+	const artID = "11111111-1111-1111-1111-111111111111"
+	entry := func(seq int64, payload string) *audit.Entry {
+		return &audit.Entry{Sequence: seq, Payload: json.RawMessage(payload), Timestamp: time.Now().UTC()}
+	}
+	entries := []*audit.Entry{
+		// Higher sequence FIRST, then the older row: the older must not win.
+		entry(9, `{"artifact_id":"`+artID+`","entry_id":"ordering:a","entry_class":"ordering","verdict":"approved"}`),
+		entry(2, `{"artifact_id":"`+artID+`","entry_id":"ordering:a","entry_class":"ordering","verdict":"rejected"}`),
+		// Empty entry_class -> class fallback from the classes map.
+		entry(3, `{"artifact_id":"`+artID+`","entry_id":"duplicate:b","verdict":"amended"}`),
+	}
+	got := projectGroomingDispositions(entries, artID, map[string]string{"duplicate:b": "duplicate"})
+	byID := map[string]recordedGroomingDisposition{}
+	for _, d := range got {
+		byID[d.EntryID] = d
+	}
+	if byID["ordering:a"].Verdict != "approved" {
+		t.Errorf("ordering:a verdict = %q, want approved (last-wins keeps the higher sequence)", byID["ordering:a"].Verdict)
+	}
+	if byID["duplicate:b"].EntryClass != "duplicate" {
+		t.Errorf("duplicate:b class = %q, want the classes-map fallback 'duplicate'", byID["duplicate:b"].EntryClass)
+	}
+}
+
+// TestGroomingDispositionsReadBackExposesSettlement pins the #2991 read-back
+// window fields: after a settlement watermark lands, both verbs report
+// window_closed:true and the settlement facts, and pre-watermark dispositions
+// are STILL projected (nothing is voided) so an operator who recorded a rejection
+// never reads back an empty set.
+func TestGroomingDispositionsReadBackExposesSettlement(t *testing.T) {
+	f := newGDFixture(t, nil)
+	// Record a disposition (pre-watermark), then settle the window directly.
+	if w := postGD(t, f.s, f.runID, gdBatch(f.ids.hygiene, "approved"), gdOperator); w.Code != http.StatusOK {
+		t.Fatalf("capture status = %d: %s", w.Code, w.Body.String())
+	}
+	wp, _ := json.Marshal(groomingWindowPayload{
+		RunID: f.runID.String(), StageID: f.stageID.String(),
+		ArtifactID: f.art.ID.String(), Settlement: "approved",
+		ClosedAt: time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+	})
+	sysKind := audit.ActorSystem
+	if _, err := f.au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: f.runID, Timestamp: time.Now().UTC(),
+		Category: audit.GroomingApplyWindowClosedCategory, ActorKind: &sysKind, Payload: wp,
+	}); err != nil {
+		t.Fatalf("seed watermark: %v", err)
+	}
+
+	got := decodeGDResponse(t, getGD(t, f.s, f.runID))
+	if !got.WindowClosed {
+		t.Error("window_closed = false, want true after settlement")
+	}
+	if got.Settlement == nil || got.Settlement.Settlement != "approved" {
+		t.Errorf("settlement = %+v, want approved", got.Settlement)
+	}
+	// The pre-watermark disposition is STILL present.
+	if len(got.Dispositions) != 1 || got.Dispositions[0].EntryID != f.ids.hygiene {
+		t.Errorf("dispositions = %+v, want the one recorded hygiene row (not voided by settlement)", got.Dispositions)
+	}
+}
+
 // --- POSTGRES-BACKED cross-boundary + committed-state tests ------------------
 
 // gdPGFixture is a real Postgres run + plan stage + ingested grooming_report.
@@ -1012,62 +1078,47 @@ func TestGroomingDispositionsUnknownEntryLeavesNoRows(t *testing.T) {
 	}
 }
 
-// gdFailingAudit fails the k-th grooming_disposition_recorded AppendChained and
-// PASSES EVERY OTHER CALL THROUGH to the real repository, so the rows before
-// the failure genuinely land in Postgres. That pass-through is the point: the
-// branch under test is the one place the change knowingly weakens its own
-// "a partially-recorded capture is unreachable" claim, and only durable rows
-// can prove the reported count against what actually persisted.
-type gdFailingAudit struct {
+// gdFailingBatchAudit implements audit.GroomingWindowAppender by delegating to
+// the real postgres repository, but fails the WHOLE batch when failBatch is set —
+// modelling the atomic-rollback behaviour the capture path now relies on. It is
+// the vehicle for the #2991 BEHAVIOUR CHANGE: the pre-#2991 per-row path left
+// durable partial rows and reported a `recorded` count; the atomic path records
+// NOTHING on a batch failure.
+type gdFailingBatchAudit struct {
 	audit.Repository
-	failAt int // 1-based index among disposition appends; 0 never fails
-	calls  int
+	failBatch bool
 }
 
-func (f *gdFailingAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
-	if p.Category == CategoryGroomingDispositionRecorded {
-		f.calls++
-		if f.calls == f.failAt {
-			return nil, fmt.Errorf("gdFailingAudit: injected append failure on disposition %d", f.calls)
-		}
+func (f *gdFailingBatchAudit) AppendChainedGroomingDispositionBatch(ctx context.Context, artifactID string, ps []audit.ChainAppendParams) ([]*audit.Entry, error) {
+	if f.failBatch {
+		// A rolled-back transaction writes nothing — this is what the real Tx
+		// core does on a mid-batch failure (proven directly against Postgres in
+		// audit/grooming_window_test.go and grooming_window_pg_test.go).
+		return nil, fmt.Errorf("gdFailingBatchAudit: injected atomic batch failure")
 	}
-	return f.Repository.AppendChained(ctx, p)
+	return f.Repository.(audit.GroomingWindowAppender).AppendChainedGroomingDispositionBatch(ctx, artifactID, ps)
 }
 
-// gdErrorDetails decodes the error envelope's details map.
-func gdErrorDetails(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
-	t.Helper()
-	var env struct {
-		Error struct {
-			Details map[string]any `json:"details"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
-		t.Fatalf("decode error envelope: %v (body %s)", err, w.Body.String())
-	}
-	return env.Error.Details
+func (f *gdFailingBatchAudit) AppendChainedGroomingWindowClose(ctx context.Context, p audit.ChainAppendParams, artifactID string) (*audit.Entry, []*audit.Entry, error) {
+	return f.Repository.(audit.GroomingWindowAppender).AppendChainedGroomingWindowClose(ctx, p, artifactID)
 }
 
-// TestGroomingDispositionsMidBatchAppendFailure pins the ONE branch where the
-// batch-atomic guarantee is knowingly weakened: an AppendChained failure PART
-// WAY through the batch, after earlier rows have durably landed.
+// TestGroomingDispositionsMidBatchAppendFailure pins the #2991 BEHAVIOUR CHANGE
+// to the shipped #2843 surface: the capture is now ATOMIC, so a batch append
+// failure records ZERO rows rather than the durable partial rows (and `recorded`
+// count) the per-row path left. This is REWRITTEN to assert zero committed rows,
+// so the change is proven rather than assumed.
 //
-// Three things are asserted, and the third is the one that matters:
+// The assertion is on COMMITTED STATE read from Postgres AFTER the call returns:
+// the 500 bytes are identical whether or not a row leaked, so an error-identity
+// assertion alone would stay green with the atomicity removed.
 //
-//  1. the response is 500 internal_error;
-//  2. details.recorded / details.requested carry the counts;
-//  3. details.recorded EQUALS the number of rows that actually persisted —
-//     a body claiming 2 while 3 landed is worse than the failure itself, and
-//     that count is the operator's only evidence of what survived.
-//
-// Then the DOCUMENTED RECOVERY is exercised: the same batch is re-POSTed
-// against a healthy server and the read-back resolves last-wins to the retried
-// verdicts, which is what makes the error message's "a repeat POST is safe"
-// claim true rather than aspirational.
+// Then the DOCUMENTED RECOVERY is exercised: the same batch re-POSTed against a
+// healthy server records all three, which is what makes "a repeat POST is safe"
+// true rather than aspirational.
 func TestGroomingDispositionsMidBatchAppendFailure(t *testing.T) {
 	f := newGDPGFixture(t)
-	// Fail the THIRD disposition: two rows land, one does not.
-	failing := &gdFailingAudit{Repository: f.auditRepo, failAt: 3}
+	failing := &gdFailingBatchAudit{Repository: f.auditRepo, failBatch: true}
 	sick := New(Config{RunRepo: f.runRepo, ArtifactRepo: f.artRepo, AuditRepo: failing})
 
 	body := fmt.Sprintf(`{"dispositions":[
@@ -1079,46 +1130,12 @@ func TestGroomingDispositionsMidBatchAppendFailure(t *testing.T) {
 	w := postGD(t, sick, f.runID, body, gdOperator)
 	requireGDError(t, w, http.StatusInternalServerError, "internal_error")
 
-	details := gdErrorDetails(t, w)
-	recorded, okR := details["recorded"].(float64)
-	requested, okQ := details["requested"].(float64)
-	if !okR || !okQ {
-		t.Fatalf("details missing recorded/requested counts: %v", details)
-	}
-	if int(requested) != 3 {
-		t.Errorf("details.requested = %v, want 3", requested)
-	}
-	if int(recorded) != 2 {
-		t.Errorf("details.recorded = %v, want 2 (the two appends that preceded the injected failure)", recorded)
+	// COMMITTED STATE: the atomic batch recorded NOTHING.
+	if rows := f.pgDispositionRows(t); len(rows) != 0 {
+		t.Fatalf("a failed atomic batch left %d rows in the chain, want 0 — the capture is atomic", len(rows))
 	}
 
-	// (3) The reported count must match DURABLE STATE, not the loop counter's
-	// intent. Read the rows back from Postgres.
-	rows := f.pgDispositionRows(t)
-	if len(rows) != int(recorded) {
-		t.Fatalf("details.recorded = %d but %d rows actually persisted; the reported count is the operator's only evidence of what survived",
-			int(recorded), len(rows))
-	}
-	landed := map[string]string{}
-	for _, row := range rows {
-		var got groomingDispositionPayload
-		if err := json.Unmarshal(row.Payload, &got); err != nil {
-			t.Fatalf("decode persisted payload: %v", err)
-		}
-		landed[got.EntryID] = got.Verdict
-	}
-	if _, ok := landed[f.ids.ordering]; ok {
-		t.Error("the disposition whose append FAILED persisted anyway")
-	}
-	for _, id := range []string{f.ids.hygiene, f.ids.duplicate} {
-		if landed[id] != "approved" {
-			t.Errorf("entry %q did not durably land before the failure (got %q)", id, landed[id])
-		}
-	}
-
-	// RECOVERY: re-POST the whole batch with CORRECTING verdicts against a
-	// healthy server. Capture is last-wins, so the retry resolves cleanly and
-	// the partial capture leaves no stuck state.
+	// RECOVERY: re-POST against a healthy server records all three.
 	retry := fmt.Sprintf(`{"dispositions":[
 	  {"entry_id":%q,"verdict":"rejected"},
 	  {"entry_id":%q,"verdict":"rejected"},
@@ -1127,8 +1144,8 @@ func TestGroomingDispositionsMidBatchAppendFailure(t *testing.T) {
 	if w := postGD(t, f.s, f.runID, retry, gdOperator); w.Code != http.StatusOK {
 		t.Fatalf("retry status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	if n := len(f.pgDispositionRows(t)); n != 5 {
-		t.Errorf("chain holds %d rows, want 5 (2 partial + 3 retried) — every capture stays auditable", n)
+	if n := len(f.pgDispositionRows(t)); n != 3 {
+		t.Errorf("chain holds %d rows, want 3 (nothing from the failed batch + 3 retried)", n)
 	}
 	got := decodeGDResponse(t, getGD(t, f.s, f.runID))
 	if len(got.Dispositions) != 3 {

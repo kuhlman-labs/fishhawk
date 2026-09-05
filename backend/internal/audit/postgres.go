@@ -545,6 +545,48 @@ func (r *postgresRepo) findAnchoredDuplicate(ctx context.Context, p ChainAppendP
 	return entry, nil
 }
 
+// AppendChainedGroomingDispositionBatch implements GroomingWindowAppender: the
+// one-transaction batch capture (#2991). Thin pgx.BeginFunc wrapper delegating
+// to AppendChainedGroomingDispositionBatchTx, exactly as AppendChained wraps
+// AppendChainedTx. TxOptions are deliberately NOT set (see the Tx core's header).
+// A *GroomingWindowClosedError from the core rolls the tx back (nothing was
+// written) and surfaces to the caller's window-closed branch.
+func (r *postgresRepo) AppendChainedGroomingDispositionBatch(ctx context.Context, artifactID string, ps []ChainAppendParams) ([]*Entry, error) {
+	var out []*Entry
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		entries, aerr := AppendChainedGroomingDispositionBatchTx(ctx, tx, artifactID, ps)
+		if aerr != nil {
+			return aerr
+		}
+		out = entries
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// AppendChainedGroomingWindowClose implements GroomingWindowAppender: the
+// one-transaction settlement (#2991). Thin pgx.BeginFunc wrapper delegating to
+// AppendChainedGroomingWindowCloseTx. TxOptions are deliberately NOT set.
+func (r *postgresRepo) AppendChainedGroomingWindowClose(ctx context.Context, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error) {
+	var watermark *Entry
+	var consumed []*Entry
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		w, c, cerr := AppendChainedGroomingWindowCloseTx(ctx, tx, p, artifactID)
+		if cerr != nil {
+			return cerr
+		}
+		watermark, consumed = w, c
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return watermark, consumed, nil
+}
+
 func (r *postgresRepo) Get(ctx context.Context, id uuid.UUID) (*Entry, error) {
 	q := auditdb.New(r.pool)
 	row, err := q.GetAuditEntry(ctx, id)
@@ -711,3 +753,10 @@ var _ RetryBudgetAppender = (*postgresRepo)(nil)
 // non-atomic re-read-then-append leg, reopening the check-to-append window; this
 // turns that regression into a build failure rather than a runtime degrade.
 var _ AnchoredChainAppender = (*postgresRepo)(nil)
+
+// Compile-time check that the production repo carries the grooming capture/apply
+// window capability (#2991). A production repo that silently lost it would make
+// the capture handler and the apply-hook settlement fall back to their
+// non-atomic legs, reopening the capture/apply TOCTOU; this turns that
+// regression into a build failure rather than a runtime degrade.
+var _ GroomingWindowAppender = (*postgresRepo)(nil)
