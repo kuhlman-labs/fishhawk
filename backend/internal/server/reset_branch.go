@@ -196,13 +196,13 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isOnTop {
 		s.writeError(w, r, http.StatusUnprocessableEntity, "reset_out_of_scope",
-			"the foreign commit is an ancestor of (or interleaved with) the run's commits, not strictly on top; a reset cannot drop it — prevention (#861/#865) owns this case",
+			"the foreign commit is an ancestor of (or interleaved with) the run's commits, not strictly on top; a reset cannot drop it — prevention (#861/#865) owns this case. If the problem is instead that the BASE ADVANCED and this branch has fallen behind, fishhawk_rebase_run_branch is the right verb: it has the runner advance its own branch onto the declared base.",
 			map[string]any{"offending_sha": offendingSHA, "last_authored_sha": lastAuthoredSHA})
 		return
 	}
 	if lastAuthoredSHA == headSHA {
 		s.writeError(w, r, http.StatusUnprocessableEntity, "reset_not_applicable",
-			"the branch tip is already the last run-authored HEAD; there is no foreign commit on top to drop",
+			"the branch tip is already the last run-authored HEAD; there is no foreign commit on top to drop. If the problem is instead that the BASE ADVANCED and this branch has fallen behind, fishhawk_rebase_run_branch is the right verb: it has the runner advance its own branch onto the declared base.",
 			map[string]any{"head_sha": headSHA})
 		return
 	}
@@ -235,7 +235,7 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 	// pre-reset head can race to merge. Tolerate the commit-yourself
 	// shape with no separate review stage (nil re-park).
 	reparkedID := ""
-	if reparked, err := s.reparkReviewGateForReset(r.Context(), runID); err != nil {
+	if reparked, err := s.reparkReviewGateAfterHeadMove(r.Context(), runID); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"branch reset: re-park review gate failed (best-effort)",
 			slog.String("run_id", runID.String()),
@@ -271,8 +271,11 @@ func (s *Server) writeResetNotDeterminable(w http.ResponseWriter, r *http.Reques
 		nil)
 }
 
-// reparkReviewGateForReset re-arms the run's review gate after a rewind so
-// the merge reconciler re-runs ReverifyBranchLineage on the rewound tip.
+// reparkReviewGateAfterHeadMove re-arms the run's review gate after ANY
+// operator-gated head move so the merge reconciler re-runs
+// ReverifyBranchLineage on the new tip. Shared by handleResetRunBranch (a
+// force-rewind) and handleRebaseRunBranch (a base advance, E64.23 / #3125);
+// its body and semantics are byte-for-byte what the reset path always had.
 // It finds the run's review stage parked at awaiting_approval and re-parks
 // it awaiting_approval → pending → awaiting_approval (both edges admitted by
 // TransitionStage's fix-up tables) — synchronously, so the orchestrator
@@ -280,7 +283,7 @@ func (s *Server) writeResetNotDeterminable(w http.ResponseWriter, r *http.Reques
 // or (nil, nil) when the run has no separate review stage awaiting approval
 // (the commit-yourself shape) — a tolerated no-op, mirroring the fixup
 // handler's nil-review handling.
-func (s *Server) reparkReviewGateForReset(ctx context.Context, runID uuid.UUID) (*run.Stage, error) {
+func (s *Server) reparkReviewGateAfterHeadMove(ctx context.Context, runID uuid.UUID) (*run.Stage, error) {
 	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
 	if err != nil {
 		return nil, fmt.Errorf("list stages for run: %w", err)

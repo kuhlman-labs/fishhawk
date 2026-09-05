@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 270 names are tool I/O request/response structs. The MCP
+// The bulk of these 275 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -255,6 +255,12 @@ var exportBaseline = []string{
 	"ReleaseNotesPersistResult",
 	"ReportProductIssueInput",
 	"ReportProductIssueOutput",
+	// E64.23 / #3125: the fishhawk_rebase_run_branch surface. All three MUST
+	// be exported — the MCP SDK reflects over the tool input/output structs to
+	// build the wire schemas, so unexported types are not an option.
+	"RebaseBranchResult",
+	"RebaseRunBranchInput",
+	"RebaseRunBranchOutput",
 	"ResetBranchResult",
 	"ResetRunBranchInput",
 	"ResetRunBranchOutput",

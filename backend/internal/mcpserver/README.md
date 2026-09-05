@@ -38,10 +38,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 270 identifiers, not 3
+## Exported surface: why 275 identifiers, not 3
 
-The package presents **270** exported top-level identifiers, but only the three
-above are intended entry points. The other 267 are the tool I/O
+The package presents **275** exported top-level identifiers, but only the three
+above are intended entry points. The other 272 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema, so **unexporting them would break tool registration**. In `package
@@ -951,7 +951,30 @@ Safety (server-enforced):
 
 Returns the recorded declaration (`run_id`, `vouched_sha`, `reason`) on success, plus the audit-check re-post outcome (`audit_check_republished`, and `audit_check_republish_warning` when it did not land).
 
-- **Re-posts the `fishhawk_audit_complete` check at the vouched head (E64.14 / [#3109](https://github.com/kuhlman-labs/fishhawk/issues/3109)).** After the declaration is durable the endpoint republishes the required Check Run AT the vouched commit — an operator-pushed head is in no head-report audit category, so the publisher's normal head resolution would re-post at a STALE sha and leave the check absent from the live merge head (the base-advance wedge). The re-post is best-effort for the vouch's success but its outcome is **reported** on the response, not swallowed: `audit_check_republished:false` with a non-empty `audit_check_republish_warning` means the required check may be missing from the merge head. The merge reconciler's heal cannot recover it (it uses the same operator-vouched-blind head resolution), so **re-invoking the vouch is the sanctioned idempotent retry** — the publisher dedups on success, so a re-vouch re-posts exactly the dropped check and no-ops once it is live. This makes vouch the operator's route out of a **base-advance conflict**: resolve the conflict on the run branch, then vouch the resulting commit (a sanctioned rebase verb is deferred to [#3125](https://github.com/kuhlman-labs/fishhawk/issues/3125)).
+- **Re-posts the `fishhawk_audit_complete` check at the vouched head (E64.14 / [#3109](https://github.com/kuhlman-labs/fishhawk/issues/3109)).** After the declaration is durable the endpoint republishes the required Check Run AT the vouched commit — an operator-pushed head is in no head-report audit category, so the publisher's normal head resolution would re-post at a STALE sha and leave the check absent from the live merge head (the base-advance wedge). The re-post is best-effort for the vouch's success but its outcome is **reported** on the response, not swallowed: `audit_check_republished:false` with a non-empty `audit_check_republish_warning` means the required check may be missing from the merge head. The merge reconciler's heal cannot recover it (it uses the same operator-vouched-blind head resolution), so **re-invoking the vouch is the sanctioned idempotent retry** — the publisher dedups on success, so a re-vouch re-posts exactly the dropped check and no-ops once it is live. This keeps vouch the operator's route out of a **conflicting** base advance: resolve the conflict on the run branch, then vouch the resulting commit. It is no longer the route for a base advance that merely fell BEHIND — [`fishhawk_rebase_run_branch`](#run-branch-base-advance-fishhawk_rebase_run_branch) (E64.23 / [#3125](https://github.com/kuhlman-labs/fishhawk/issues/3125)) now has the RUNNER advance its own branch, and returns `rebase_conflict` — falling back to this route — when the merge conflicts. Agent-driven conflict resolution is deferred to [#3202](https://github.com/kuhlman-labs/fishhawk/issues/3202).
+
+
+## Run-branch base advance (`fishhawk_rebase_run_branch`)
+
+`fishhawk_rebase_run_branch` (E64.23 / [#3125](https://github.com/kuhlman-labs/fishhawk/issues/3125)) is the **operator-gated** verb that has the RUNNER advance its own lineage branch onto the declared base, so an operator whose branch fell **behind** never has to resolve in a worktree and push to a branch [ADR-035](https://github.com/kuhlman-labs/fishhawk/issues/857) declares runner-owned. The App installation stays the sole writer; the operator authorizes rather than performs the write. It wraps `POST /v0/runs/{run_id}/rebase-branch`.
+
+**MECHANISM, stated plainly because the verb's NAME is misleading.** The forge REST API exposes **no rebase primitive**, so this performs a forge-side **merge of the base INTO the run branch** (`base=<run branch>`, `head=<base ref>`). It leaves a **merge commit** and does **not** produce linear history. There is no force-push. The tool description, the HTTP response's constant `mechanism_note`, the OpenAPI text and both READMEs all say this, so no reader can infer a rebase from the name.
+
+| Input | Required | Meaning |
+|---|---|---|
+| `run_id` | **yes** | The run whose branch to advance. |
+| `reason` | no | Operator rationale, recorded on the `branch_rebased` audit entry. |
+| `confirm` | **yes** | MUST be `true` — the advance moves the PR head and leaves a merge commit. A missing/false value is refused client-side before the HTTP hop, and again server-side (`confirmation_required`, 400). |
+
+On success the verb also re-parks the review gate (so CI + the merge reconciler re-evaluate the new head), writes a `branch_rebased` audit entry, refreshes the sticky status comment, attributes the merge commit into the ADR-035 reported-head ledger, and re-posts the `fishhawk_audit_complete` Check Run **at the new head**.
+
+- **Exactly one sha is attributed, and an incomplete attribution is reported.** The lease re-check runs only BEFORE the merge, so a foreign push landing between the merge and the post-merge head re-read would arrive as `new_head_sha`. Vouching it would launder into the ADR-035 ledger precisely the commit the ledger exists to catch, so when the merge sha decoded it is the **only** sha attributed and a divergent `new_head_sha` is deliberately left un-attributed. `new_head_sha` is attributed alone only on the undecodable-201 shape. Because the attribution is load-bearing — without it the installation-authored merge commit is classified FOREIGN and the run stays wedged — an incomplete one is never silent: `lineage_attribution_warning` names it on the response for a divergent head, a failed attribution append, and the nothing-attributable case. In the latter two, re-invoking this verb does **not** repair the attribution (the retry takes the already-contains-base arm, which attributes nothing), so the warning names [`fishhawk_vouch_commit`](#operator-commit-vouch-fishhawk_vouch_commit) as the required step rather than advertising a retry that cannot deliver.
+- **Fail-closed on a conflict.** A CONFLICTING base merge is refused (`rebase_conflict`, 422) having written **nothing** — no merge commit, no audit entry, no check re-post. This first slice does not resolve conflicts; agent-driven resolution is tracked in [#3202](https://github.com/kuhlman-labs/fishhawk/issues/3202), and the pre-existing route (resolve on the run branch, `fishhawk_vouch_commit` the resulting commit, re-merge) remains the fallback. Every uncertain anchor is likewise refused (`rebase_not_determinable`, 422) rather than merged on a guess.
+- **Operator-token-only.** Requires `write:stages`, enforced unconditionally with no cookie-session bypass, and a run-bound `mcp:run:<uuid>` token is **rejected outright** (`run_token_forbidden`, 403) even for its own run — mirroring `fishhawk_vouch_commit`, not `fishhawk_reset_run_branch`'s softer subject-binding. Advancing a branch onto a new base is a lineage-moving write the sole-writer invariant reserves to an operator authorization.
+- **Idempotent retry.** "Already contains the base" is decided **before** any merge by a three-dot compare probe, and that arm is still a success that re-parks and republishes at the current head. So if the check re-post fails, **re-invoking the verb is a real retry**: the branch now contains the base, the probe short-circuits the merge, and the check re-posts at the correct head. The publisher's dedup cache records only successes, which is what keeps the second attempt reachable.
+- **Degraded head read skips publication deliberately.** If the merge succeeds but the post-merge head cannot be read back, the call returns success with `new_head_sha` empty and **no** check re-post — it does not fall back to publishing at the pre-merge head, which would pin the required check to exactly the stale sha this verb exists to move off. The warning names re-invocation.
+
+Sibling verb: [`fishhawk_reset_run_branch`](#run-branch-reset-fishhawk_reset_run_branch) is the right verb for a **foreign commit pushed ON TOP** of the run's commits — a different problem. Both verbs' refusals cross-link the other, so an operator who reaches for the wrong one is told which is right.
 
 ## One-verb operator merge (`fishhawk_merge_run`)
 

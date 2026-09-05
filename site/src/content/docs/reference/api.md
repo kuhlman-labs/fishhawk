@@ -25,7 +25,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **116 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **117 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -65,6 +65,7 @@ The v0 REST API exposes **116 operations** across the paths below, generated fro
 | `POST` | `/v0/runs/{run_id}/redrive` | Re-drive a failed decomposition child run |
 | `POST` | `/v0/runs/{run_id}/revive` | Revive a terminal-failed run (one-verb batch re-park) |
 | `POST` | `/v0/runs/{run_id}/reset-branch` | Force-reset a run branch off a foreign on-top commit |
+| `POST` | `/v0/runs/{run_id}/rebase-branch` | Advance a run branch onto its declared base (operator-gated) |
 | `POST` | `/v0/runs/{run_id}/vouch-commit` | Vouch a foreign commit as run-authored lineage |
 | `POST` | `/v0/runs/{run_id}/merge` | Record an operator merge verdict and queue the squash merge |
 | `POST` | `/v0/runs/{run_id}/grooming-dispositions` | Record per-entry grooming dispositions (operator-only) |

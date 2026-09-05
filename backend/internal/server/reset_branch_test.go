@@ -290,6 +290,12 @@ func TestResetRunBranch_AncestorRefusal(t *testing.T) {
 	if !bytes.Contains(w.Body.Bytes(), []byte("reset_out_of_scope")) {
 		t.Errorf("body missing reset_out_of_scope: %s", w.Body.String())
 	}
+	// BIDIRECTIONAL CROSS-LINK PIN (E64.23 / #3125): an operator who reaches
+	// for reset when the real problem is a BASE ADVANCE must be told which
+	// verb is right. Not compiler-enforced, so it is pinned here.
+	if !bytes.Contains(w.Body.Bytes(), []byte("fishhawk_rebase_run_branch")) {
+		t.Errorf("reset_out_of_scope must cross-link fishhawk_rebase_run_branch: %s", w.Body.String())
+	}
 	stub.mu.Lock()
 	if stub.forceCalled {
 		t.Error("force-update happened on an ancestor refusal")
@@ -312,6 +318,13 @@ func TestResetRunBranch_NotApplicable(t *testing.T) {
 	}
 	if !bytes.Contains(w.Body.Bytes(), []byte("reset_not_applicable")) {
 		t.Errorf("body missing reset_not_applicable: %s", w.Body.String())
+	}
+	// BIDIRECTIONAL CROSS-LINK PIN (E64.23 / #3125): see
+	// TestResetRunBranch_AncestorRefusal. A "nothing to drop" refusal is the
+	// most likely landing spot for an operator whose branch merely fell
+	// behind, so it must name the rebase verb.
+	if !bytes.Contains(w.Body.Bytes(), []byte("fishhawk_rebase_run_branch")) {
+		t.Errorf("reset_not_applicable must cross-link fishhawk_rebase_run_branch: %s", w.Body.String())
 	}
 	stub.mu.Lock()
 	if stub.forceCalled {

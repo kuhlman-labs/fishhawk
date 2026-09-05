@@ -186,6 +186,7 @@ var KnownCategories = map[string]struct{}{
 	"approval_submitted":                      {},
 	"audit_check_publish_degraded":            {},
 	"audit_check_publish_recovered":           {},
+	"branch_rebased":                          {},
 	"branch_reset":                            {},
 	"budget_alert":                            {},
 	"budget_alert_sent":                       {},

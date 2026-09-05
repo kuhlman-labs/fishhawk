@@ -27,8 +27,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -3097,7 +3099,13 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// fishhawk_record_grooming_dispositions, the operator-only CAPTURE of
 	// per-entry grooming verdicts as auditable facts (consumed by nothing until
 	// #2991) — taking the total 51 -> 52.
-	const wantToolCount = 52
+	//
+	// E64.23 (#3125) adds exactly ONE tool — fishhawk_rebase_run_branch, the
+	// operator-gated verb that has the RUNNER advance its own lineage branch
+	// onto the declared base (a forge-side merge of the base INTO the run
+	// branch, leaving a merge commit) so a behind-base operator never pushes to
+	// a runner-owned branch — taking the total 52 -> 53.
+	const wantToolCount = 53
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3130,6 +3138,35 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawGateView {
 		t.Error("fishhawk_get_gate_view is not registered/visible over ListTools")
+	}
+
+	// fishhawk_rebase_run_branch (E64.23 / #3125) must be wire-visible, and its
+	// DESCRIPTION must carry the two claims that are not compiler-enforced
+	// anywhere: the merge-commit MECHANISM (the verb's name would otherwise
+	// imply linear history) and the fishhawk_reset_run_branch cross-link (an
+	// operator who reaches for the wrong sibling must be told which is right).
+	var sawRebase bool
+	for _, tool := range res.Tools {
+		if tool.Name != "fishhawk_rebase_run_branch" {
+			continue
+		}
+		sawRebase = true
+		if !strings.Contains(tool.Description, "merges the declared base INTO the run branch") ||
+			!strings.Contains(tool.Description, "MERGE COMMIT") {
+			t.Errorf("fishhawk_rebase_run_branch description must state the merge-commit mechanism:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "not a literal rebase") {
+			t.Errorf("fishhawk_rebase_run_branch description must say it is not a literal rebase:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "fishhawk_reset_run_branch") {
+			t.Errorf("fishhawk_rebase_run_branch description must cross-link the sibling verb:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "#3202") {
+			t.Errorf("fishhawk_rebase_run_branch description must name the deferred conflict-resolution issue:\n%s", tool.Description)
+		}
+	}
+	if !sawRebase {
+		t.Error("fishhawk_rebase_run_branch is not registered/visible over ListTools")
 	}
 
 	// fishhawk_record_grooming_dispositions (#2843) must be wire-visible — a
@@ -13860,5 +13897,224 @@ func TestGetRunStatus_NextActions_ConcernsOpenAcceptancePending(t *testing.T) {
 	}
 	if !strings.Contains(out.ReviewActionHint.Message, "dispatch acceptance first") {
 		t.Errorf("hint message does not name the ordering remedy: %q", out.ReviewActionHint.Message)
+	}
+}
+
+// --- E64.23 / #3125: the fishhawk_rebase_run_branch MCP WIRE HOP ---
+
+// rebaseE2ETokens is a minimal githubapp.TokenProvider for the rebase
+// full-span test's GitHub stub. The stub does not check the Authorization
+// header; this exists only so githubclient.Client's non-nil Tokens
+// precondition is satisfied.
+type rebaseE2ETokens struct{}
+
+func (rebaseE2ETokens) Token(context.Context, int64) (string, error) { return "ghs_t", nil }
+
+// TestRebaseRunBranch_MCPToolToCheckPublication_EndToEnd closes the MCP WIRE
+// HOP that the server-side full-span test structurally cannot reach.
+//
+// WHY IT EXISTS AS A SEPARATE CASE. mcpserver.RebaseBranchResult is a HAND
+// MIRROR of the server's rebaseBranchResponse, not a shared type. Nothing in
+// backend/internal/server can decode through the mirror (runResolver and
+// apiClient are unexported there is no in-process path), and
+// TestRebaseRunBranch_ToCheckPublication_EndToEnd accordingly drives
+// s.Handler() and decodes the server's OWN struct — so a wrong or missing
+// json tag on either side of the mirror ships silently and green.
+//
+// The span here is genuinely every layer, with no fake in the middle:
+//
+//	RebaseRunBranchInput → runResolver.rebaseRunBranch (the registered tool
+//	handler) → apiClient.RebaseRunBranch (real JSON marshal + HTTP) →
+//	httptest.Server over the REAL server.Handler() → the real rebase handler
+//	→ a real githubclient.Client against a GitHub stub → REAL Postgres run and
+//	audit repositories → back through the mirror's JSON decode.
+//
+// THE LOAD-BEARING ASSERTION is that the decoded RebaseBranchResult fields are
+// POPULATED, not merely that the call returned no error: a json-tag typo
+// leaves a zero value and returns nil. Each field is compared against the
+// value the forge stub actually produced, so a tag that decodes to "" fails.
+func TestRebaseRunBranch_MCPToolToCheckPublication_EndToEnd(t *testing.T) {
+	const (
+		priorHead = "aaaa111111111111111111111111111111111111"
+		mergeHead = "bbbb222222222222222222222222222222222222"
+		baseAdv   = "cccc333333333333333333333333333333333333"
+		branchRef = "fishhawk/run/rebase-e2e"
+		baseRef   = "main"
+	)
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	tokenRepo := apitoken.NewPostgresRepository(pool)
+
+	// A real run row carrying the two anchors the determinability ladder
+	// requires: an installation and a tracked pull request.
+	installation := int64(99)
+	runRow, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "deadbeef",
+		TriggerSource:  runpkg.TriggerCLI,
+		RunnerKind:     runpkg.RunnerKindLocal,
+		InstallationID: &installation,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if _, err := runRepo.SetRunPullRequestURL(ctx, runRow.ID,
+		"https://github.com/kuhlman-labs/fishhawk/pull/77"); err != nil {
+		t.Fatalf("SetRunPullRequestURL: %v", err)
+	}
+
+	// The GitHub stub: three PR reads (handler head, lease re-check,
+	// post-merge authoritative re-read), a behind-probe compare reporting one
+	// commit the base advanced by, and a merges endpoint that CAPTURES its
+	// request body so the merge DIRECTION survives the wire hop too.
+	var (
+		ghMu      sync.Mutex
+		prReads   int
+		mergeBase string
+		mergeHd   string
+		mergeN    int
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}",
+		func(w http.ResponseWriter, _ *http.Request) {
+			ghMu.Lock()
+			prReads++
+			head := priorHead
+			if prReads >= 3 { // the post-merge re-read
+				head = mergeHead
+			}
+			ghMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"node_id":"PR_x","state":"open","head":{"sha":%q,"ref":%q},"base":{"ref":%q}}`,
+				head, branchRef, baseRef)
+		})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/compare/{basehead...}",
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"commits":[{"sha":%q}]}`, baseAdv)
+		})
+	mux.HandleFunc("POST /repos/{owner}/{repo}/merges",
+		func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			var call struct {
+				Base string `json:"base"`
+				Head string `json:"head"`
+			}
+			_ = json.Unmarshal(raw, &call)
+			ghMu.Lock()
+			mergeN++
+			mergeBase, mergeHd = call.Base, call.Head
+			ghMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"sha":%q}`, mergeHead)
+		})
+	ghSrv := httptest.NewServer(mux)
+	t.Cleanup(ghSrv.Close)
+
+	// A real operator bearer carrying write:stages — the only credential the
+	// rebase verb accepts, so the auth ladder is traversed for real too.
+	tok, err := tokenRepo.Issue(ctx, "github:ops", []string{"write:stages"})
+	if err != nil {
+		t.Fatalf("issue operator token: %v", err)
+	}
+
+	backend := server.New(server.Config{
+		RunRepo:      runRepo,
+		AuditRepo:    auditRepo,
+		APITokenRepo: tokenRepo,
+		GitHub: &githubclient.Client{
+			BaseURL: ghSrv.URL,
+			Tokens:  rebaseE2ETokens{},
+			HTTP:    &http.Client{Timeout: 5 * time.Second},
+			AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+		},
+	})
+	httpSrv := httptest.NewServer(backend.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// THE MCP HALF: the real resolver over the real api client.
+	resolver := &runResolver{
+		api:    newAPIClient(config{backendURL: httpSrv.URL, apiToken: tok.PlainText}),
+		getenv: envFuncFromMap(nil),
+	}
+	_, out, err := resolver.rebaseRunBranch(ctx, nil, RebaseRunBranchInput{
+		RunID:   runRow.ID.String(),
+		Reason:  "base advanced under review",
+		Confirm: true,
+	})
+	if err != nil {
+		t.Fatalf("rebaseRunBranch through the MCP tool handler: %v", err)
+	}
+
+	// THE POINT: every mirrored field DECODED and is POPULATED. A json-tag
+	// typo on either side of the hand mirror leaves a zero value here while
+	// the call itself still returns nil.
+	got := out.Result
+	for _, f := range []struct{ name, got, want string }{
+		{"run_id", got.RunID, runRow.ID.String()},
+		{"branch", got.Branch, branchRef},
+		{"base_ref", got.BaseRef, baseRef},
+		{"prior_head_sha", got.PriorHeadSHA, priorHead},
+		{"new_head_sha", got.NewHeadSHA, mergeHead},
+		{"merge_commit_sha", got.MergeCommitSHA, mergeHead},
+	} {
+		if f.got != f.want {
+			t.Errorf("decoded RebaseBranchResult.%s = %q, want %q (an empty value here is a json-tag mismatch across the hand mirror)",
+				f.name, f.got, f.want)
+		}
+	}
+	if got.PRNumber != 77 {
+		t.Errorf("decoded pr_number = %d, want 77", got.PRNumber)
+	}
+	if !strings.Contains(got.MechanismNote, "merge commit") {
+		t.Errorf("decoded mechanism_note = %q, want the merge-commit mechanism sentence", got.MechanismNote)
+	}
+	if got.AlreadyUpToDate {
+		t.Error("decoded already_up_to_date = true, want false (the branch was behind and a merge was performed)")
+	}
+	// The merge SUCCEEDED and its head matched the merge commit, so the
+	// attribution is clean and no warning is surfaced.
+	if got.LineageAttributionWarning != "" {
+		t.Errorf("decoded lineage_attribution_warning = %q, want empty on a clean attribution", got.LineageAttributionWarning)
+	}
+
+	// The merge DIRECTION survived the whole hop: base is the RUN BRANCH (the
+	// branch that RECEIVES the merge) and head is the BASE REF. An inversion
+	// would merge the run branch into main.
+	ghMu.Lock()
+	gotN, gotBase, gotHead := mergeN, mergeBase, mergeHd
+	ghMu.Unlock()
+	if gotN != 1 || gotBase != branchRef || gotHead != baseRef {
+		t.Fatalf("merges POSTs = %d with base=%q head=%q, want exactly 1 with base=%q head=%q",
+			gotN, gotBase, gotHead, branchRef, baseRef)
+	}
+
+	// Persistence, read back out of REAL Postgres: the branch_rebased record
+	// and the single lineage attribution for the merge commit.
+	entries, err := auditRepo.ListForRun(ctx, runRow.ID)
+	if err != nil {
+		t.Fatalf("ListForRun: %v", err)
+	}
+	var sawRebased, sawVouch bool
+	for _, e := range entries {
+		switch e.Category {
+		case "branch_rebased":
+			sawRebased = true
+		case "operator_commit_vouched":
+			sawVouch = true
+			if !strings.Contains(string(e.Payload), mergeHead) {
+				t.Errorf("operator_commit_vouched payload does not carry the merge commit %s: %s", mergeHead, e.Payload)
+			}
+		}
+	}
+	if !sawRebased {
+		t.Error("no branch_rebased audit entry persisted to Postgres")
+	}
+	if !sawVouch {
+		t.Error("no operator_commit_vouched lineage attribution persisted to Postgres; the run would be wedged as foreign")
 	}
 }

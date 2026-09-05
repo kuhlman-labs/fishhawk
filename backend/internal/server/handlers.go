@@ -71,6 +71,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/redrive", s.requireRunAccount(adminWrite, s.handleRedriveChild))
 	mux.HandleFunc("POST /v0/runs/{run_id}/revive", s.requireRunAccount(adminWrite, s.handleReviveRun))
 	mux.HandleFunc("POST /v0/runs/{run_id}/reset-branch", s.requireRunAccount(adminWrite, s.handleResetRunBranch))
+	mux.HandleFunc("POST /v0/runs/{run_id}/rebase-branch", s.requireRunAccount(adminWrite, s.handleRebaseRunBranch))
 	mux.HandleFunc("POST /v0/runs/{run_id}/consolidate", s.requireRunAccount(memberWrite, s.handleConsolidateRun))
 	mux.HandleFunc("POST /v0/runs/{run_id}/integrate-wave", s.requireRunAccount(memberWrite, s.handleIntegrateWave))
 	mux.HandleFunc("POST /v0/runs/{run_id}/vouch-commit", s.requireRunAccount(memberWrite, s.handleVouchCommit))
