@@ -8334,13 +8334,20 @@ paths:
         '409':
           description: |
             One of three cases, all leaving ZERO arbitration rows: the gate is
-            not parked at `acceptance_triage` or the correlated triage
+            not parked at `acceptance_triage` and no arbitration on the chain
+            already discharges the CURRENT outcome, or the correlated triage
             disposition did not page
             (`acceptance_arbitration_not_applicable`); the verdict carries
             failed criteria and `acknowledge_failed_criteria` was not set
             (`acceptance_arbitration_requires_acknowledgement`); or a newer
             acceptance outcome landed while the arbitration was being
             evaluated (`acceptance_outcome_superseded`).
+
+            An already-arbitrated gate is NOT by itself a `409`: the gate guard
+            re-runs the idempotence scan first, so the loser of two genuinely
+            concurrent first-POSTs receives `200 already_recorded: true` naming
+            the surviving row rather than this conflict. It refuses only when
+            the discharge on the chain names some OTHER outcome.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

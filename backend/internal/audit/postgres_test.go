@@ -1929,6 +1929,14 @@ func TestPostgres_AppendChainedAnchored_UnknownRun(t *testing.T) {
 
 // concurrentAnchoredAppends fires n concurrent AppendChainedAnchored calls for
 // the same (run, anchor) and returns how many succeeded.
+//
+// The workers are deliberately t-FREE (the testing package requires
+// FailNow/Fatalf to run on the goroutine running the test, where a worker-side
+// fatal can hang or misreport). Each loser's error is COLLECTED instead and
+// reported here, after wg.Wait(), on the test goroutine: an infrastructure
+// failure — a pool exhaustion, a lock timeout, a dropped connection — is then a
+// named test failure rather than an indistinguishable "granted = 0", which the
+// callers' `granted != 1` assertion would report as a concurrency defect.
 func concurrentAnchoredAppends(t *testing.T, pool *pgxpool.Pool, runID uuid.UUID, seq int64, n int) int {
 	t.Helper()
 	appender := audit.NewPostgresRepository(pool).(audit.AnchoredChainAppender)
@@ -1936,6 +1944,7 @@ func concurrentAnchoredAppends(t *testing.T, pool *pgxpool.Pool, runID uuid.UUID
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	granted := 0
+	var unexpected []error
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
@@ -1946,12 +1955,25 @@ func concurrentAnchoredAppends(t *testing.T, pool *pgxpool.Pool, runID uuid.UUID
 			}, anchoredSpec(seq))
 			mu.Lock()
 			defer mu.Unlock()
-			if err == nil && e != nil {
+			switch {
+			case err == nil && e != nil:
 				granted++
+			case err != nil:
+				// The only LEGAL loss is the duplicate branch — every other
+				// error is infrastructure and must be named.
+				var dup *audit.AnchoredDuplicateError
+				if !errors.As(err, &dup) {
+					unexpected = append(unexpected, err)
+				}
+			default:
+				unexpected = append(unexpected, fmt.Errorf("nil entry with nil error"))
 			}
 		}()
 	}
 	wg.Wait()
+	for _, err := range unexpected {
+		t.Errorf("concurrent anchored append failed for a reason other than the duplicate branch: %v", err)
+	}
 	return granted
 }
 

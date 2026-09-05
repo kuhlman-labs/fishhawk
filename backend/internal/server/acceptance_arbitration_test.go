@@ -929,3 +929,122 @@ func TestAcceptanceArbitrationRepoCarriesAnchoredCapability(t *testing.T) {
 		t.Fatal("the production audit.Repository must implement audit.AnchoredChainAppender; without it the arbitration endpoint silently degrades to the non-atomic re-read-then-append")
 	}
 }
+
+// lateArbitrationVisibilityFake models the CONCURRENT-LOSER interleaving
+// deterministically (#2536): a winner's arbitration commits BETWEEN the losing
+// request's idempotence fast path and its gate-state guard.
+//
+// It hides CategoryAcceptanceTriageArbitrated from the FIRST
+// ListForRunByCategory call and reveals it from the second onward. Nothing else
+// is touched — acceptanceGateState reads arbitrations through ListForRun, which
+// is delegated unchanged, so the gate reads acceptance_arbitrated exactly as it
+// would after a real concurrent commit. That is what makes this a pin on the
+// guard-4 re-scan rather than on the fast path: the fast path structurally
+// cannot see the row.
+//
+// failFromCall, when non-zero, makes the arbitration-category read FAIL from
+// that call onward — the fail-closed vehicle for the re-scan's own read error.
+type lateArbitrationVisibilityFake struct {
+	*auditFake
+	mu           sync.Mutex
+	calls        int
+	failFromCall int
+}
+
+func (l *lateArbitrationVisibilityFake) ListForRunByCategory(ctx context.Context, runID uuid.UUID,
+	category string) ([]*audit.Entry, error) {
+	entries, err := l.auditFake.ListForRunByCategory(ctx, runID, category)
+	if err != nil || category != CategoryAcceptanceTriageArbitrated {
+		return entries, err
+	}
+	l.mu.Lock()
+	l.calls++
+	n := l.calls
+	l.mu.Unlock()
+	if l.failFromCall > 0 && n >= l.failFromCall {
+		return nil, errors.New("lateArbitrationVisibilityFake: injected arbitration re-scan error")
+	}
+	if n == 1 {
+		return nil, nil
+	}
+	return entries, nil
+}
+
+// TestAcceptanceArbitration_ConcurrentLoserAfterFastPathGets200 is the
+// DETERMINISTIC pin for guard 4's idempotence re-check.
+//
+// The endpoint's documented wire contract (docs/api/v0.openapi.yaml) is that two
+// genuinely concurrent first POSTs commit exactly ONE row and BOTH responses
+// report it. A loser whose fast-path read predates the winner's commit reaches
+// guard 4 AFTER it and finds the gate at acceptance_arbitrated; without the
+// re-check that loser received 409 acceptance_arbitration_not_applicable for a
+// discharge that IS on the chain, making the documented contract false.
+//
+// TestAcceptanceArbitration_PG_ConcurrentDuplicatePosts exercises the same
+// branch through real Postgres, but only PROBABILISTICALLY — the fast-path-to-
+// guard-4 window is narrow and a given run may not land in it. This test forces
+// the interleaving, so the control is pinned regardless of scheduling.
+func TestAcceptanceArbitration_ConcurrentLoserAfterFastPathGets200(t *testing.T) {
+	repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	au := newAuditFake()
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: repo,
+		AuditRepo:    &lateArbitrationVisibilityFake{auditFake: au},
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+		GateMerger:   &fakeMerger{},
+	})
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+	// The winner's row, seeded BY CONSTRUCTION so the RED under deletion of the
+	// re-check lands on the response assertion, not on fixture setup.
+	seedAcceptanceArbitrationEntry(au, runID, arbitrationTriageSeq+1, arbitrationOutcomeSeq)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: the loser of two concurrent first POSTs must receive the idempotent 200, not a 409 for a discharge that is on the chain:\n%s",
+			w.Code, w.Body.String())
+	}
+	var resp acceptanceArbitrationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.AlreadyRecorded {
+		t.Error("already_recorded = false, want true (the winner's row is the surviving one)")
+	}
+	if resp.ArbitrationSequence != arbitrationTriageSeq+1 {
+		t.Errorf("arbitration_sequence = %d, want the winner's %d", resp.ArbitrationSequence, arbitrationTriageSeq+1)
+	}
+	if resp.AcceptanceGateState != acceptanceGateArbitrated {
+		t.Errorf("acceptance_gate_state = %q, want %q", resp.AcceptanceGateState, acceptanceGateArbitrated)
+	}
+	// COMMITTED STATE: no second row was appended.
+	if rows := arbitrationRows(au); len(rows) != 0 {
+		t.Errorf("appended arbitration rows = %d, want 0 (the winner's row must be reused, never duplicated)", len(rows))
+	}
+}
+
+// TestAcceptanceArbitration_ConcurrentLoserRescanErrorIs500 is the FAIL-CLOSED
+// half of guard 4's re-check: the re-scan is a READ, and a read that fails is
+// unknown evidence. It must surface as 500 — never a 409 claiming there is
+// nothing to arbitrate, and never a 200 claiming a discharge it could not see.
+func TestAcceptanceArbitration_ConcurrentLoserRescanErrorIs500(t *testing.T) {
+	repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	au := newAuditFake()
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: repo,
+		AuditRepo:    &lateArbitrationVisibilityFake{auditFake: au, failFromCall: 2},
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+		GateMerger:   &fakeMerger{},
+	})
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+	seedAcceptanceArbitrationEntry(au, runID, arbitrationTriageSeq+1, arbitrationOutcomeSeq)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 on an unreadable re-scan:\n%s", w.Code, w.Body.String())
+	}
+	if rows := arbitrationRows(au); len(rows) != 0 {
+		t.Errorf("appended arbitration rows = %d, want 0 (a read failure must never write)", len(rows))
+	}
+}

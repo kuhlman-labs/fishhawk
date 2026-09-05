@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // acceptance_arbitration_pg_test.go drives POST
@@ -89,19 +91,35 @@ func newArbFixture(t *testing.T) (*arbFixture, int64) {
 // sequence — the ANCHOR the arbitration binds to.
 func (f *arbFixture) appendOutcome(t *testing.T, verdict string, failed, skipped int) int64 {
 	t.Helper()
+	seq, err := f.tryAppendOutcome(verdict, failed, skipped)
+	if err != nil {
+		t.Fatalf("append acceptance outcome: %v", err)
+	}
+	return seq
+}
+
+// tryAppendOutcome is the t-FREE form of appendOutcome, for the concurrent tests
+// that append from a spawned goroutine. The testing package requires
+// FailNow/Fatalf to run on the goroutine running the test, so a fixture failure
+// inside a worker must be RETURNED and reported after wg.Wait() rather than
+// aborting the worker mid-flight (which can hang or misreport).
+func (f *arbFixture) tryAppendOutcome(verdict string, failed, skipped int) (int64, error) {
 	acc := f.accID
-	p, _ := json.Marshal(map[string]any{
+	p, err := json.Marshal(map[string]any{
 		"run_id": f.runID.String(), "stage_id": acc.String(), "verdict": verdict,
 		"criteria_failed": failed, "criteria_skipped": skipped,
 	})
+	if err != nil {
+		return 0, fmt.Errorf("marshal acceptance outcome payload: %w", err)
+	}
 	e, err := f.audit.AppendChained(context.Background(), audit.ChainAppendParams{
 		RunID: f.runID, StageID: &acc, Timestamp: time.Now().UTC(),
 		Category: CategoryAcceptanceOutcomeRecorded, Payload: p,
 	})
 	if err != nil {
-		t.Fatalf("append acceptance outcome: %v", err)
+		return 0, err
 	}
-	return e.Sequence
+	return e.Sequence, nil
 }
 
 // appendTriageDecision appends the correlated PAGED acceptance_triage_decided
@@ -120,7 +138,12 @@ func (f *arbFixture) appendTriageDecision(t *testing.T) {
 	}
 }
 
-// post drives one arbitration POST through the real handler.
+// post drives one arbitration POST through the real handler. It is deliberately
+// FailNow-free — postArbitration calls only t.Helper() — so the concurrent tests
+// may call it from a spawned goroutine without violating the testing package's
+// "FailNow must run on the test goroutine" contract. Keep it that way: any
+// t.Fatalf reachable from here would have to move behind a t-free variant, as
+// tryAppendOutcome does.
 func (f *arbFixture) post(t *testing.T) *httptest.ResponseRecorder {
 	t.Helper()
 	return postArbitration(t, f.s, f.runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
@@ -227,16 +250,18 @@ func TestAcceptanceArbitration_PG_IndexCollisionRecovery(t *testing.T) {
 // #2536 the two controls both sat outside the append transaction, so N POSTs
 // could each pass and each append.
 //
-// The per-RESPONSE assertion is deliberately a two-outcome ALLOW-LIST, not a
-// blanket 200, because the endpoint has a PRE-EXISTING benign race that this
-// change neither introduces nor is scoped to fix: the idempotence fast path runs
-// BEFORE the gate-state guard, so a loser whose fast-path read predates the
-// winner's commit can still reach guard 4 after it, find the gate already at
-// acceptance_arbitrated, and get `409
-// acceptance_arbitration_not_applicable`. That response writes nothing and the
-// discharge the caller asked for IS on the chain. So every response must be
-// EITHER 200 naming the one committed row OR that specific 409 — and at least
-// one 200 must occur, so the test cannot pass vacuously on an all-409 outcome.
+// The per-RESPONSE assertion is a HARD 200 for EVERY POST, matching the wire
+// contract docs/api/v0.openapi.yaml states ("two CONCURRENT first-POSTs behave
+// the same way: exactly one row is committed and both responses report it").
+// Reaching that required closing a third loser window in the handler: the
+// idempotence fast path runs BEFORE the gate-state guard, so a loser whose
+// fast-path read predated the winner's commit used to reach guard 4 after it,
+// find the gate at acceptance_arbitrated, and get 409
+// acceptance_arbitration_not_applicable for a discharge that IS on the chain.
+// Guard 4 now re-runs the idempotence scan on an arbitrated gate and returns the
+// same idempotent 200. So every response must be 200 naming the ONE committed
+// row, with EXACTLY ONE of them already_recorded:false (the winner that actually
+// appended) and every other one true.
 func TestAcceptanceArbitration_PG_ConcurrentDuplicatePosts(t *testing.T) {
 	f, _ := newArbFixture(t)
 
@@ -245,6 +270,7 @@ func TestAcceptanceArbitration_PG_ConcurrentDuplicatePosts(t *testing.T) {
 	codes := make([]int, n)
 	bodies := make([]string, n)
 	seqs := make([]int64, n)
+	already := make([]bool, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
@@ -256,6 +282,7 @@ func TestAcceptanceArbitration_PG_ConcurrentDuplicatePosts(t *testing.T) {
 				var got acceptanceArbitrationResponse
 				_ = json.Unmarshal(w.Body.Bytes(), &got)
 				seqs[i] = got.ArbitrationSequence
+				already[i] = got.AlreadyRecorded
 			}
 		}(i)
 	}
@@ -265,24 +292,22 @@ func TestAcceptanceArbitration_PG_ConcurrentDuplicatePosts(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("committed arbitrations = %d, want exactly 1 across %d concurrent POSTs", len(rows), n)
 	}
-	ok200 := 0
+	appended := 0
 	for i := 0; i < n; i++ {
-		switch codes[i] {
-		case http.StatusOK:
-			ok200++
-			if seqs[i] != rows[0].Sequence {
-				t.Errorf("POST %d arbitration_sequence = %d, want the single committed row's %d", i, seqs[i], rows[0].Sequence)
-			}
-		case http.StatusConflict:
-			if !strings.Contains(bodies[i], "acceptance_arbitration_not_applicable") {
-				t.Errorf("POST %d 409 is not the benign gate-already-arbitrated race: %s", i, bodies[i])
-			}
-		default:
-			t.Errorf("POST %d status = %d, want 200 or the benign 409:\n%s", i, codes[i], bodies[i])
+		if codes[i] != http.StatusOK {
+			t.Errorf("POST %d status = %d, want 200: every concurrent duplicate POST must receive the idempotent 200 naming the surviving row:\n%s",
+				i, codes[i], bodies[i])
+			continue
+		}
+		if seqs[i] != rows[0].Sequence {
+			t.Errorf("POST %d arbitration_sequence = %d, want the single committed row's %d", i, seqs[i], rows[0].Sequence)
+		}
+		if !already[i] {
+			appended++
 		}
 	}
-	if ok200 == 0 {
-		t.Error("no POST returned 200 — the test would be vacuous")
+	if appended != 1 {
+		t.Errorf("already_recorded:false responses = %d, want exactly 1 (only the winner appended the one committed row)", appended)
 	}
 }
 
@@ -377,34 +402,79 @@ func TestAcceptanceArbitration_ArbitrationFirstOrdering(t *testing.T) {
 // newer outcome's sequence ABOVE E.Sequence — which satisfies the invariant and
 // is a PASS, per TestAcceptanceArbitration_ArbitrationFirstOrdering.
 //
-// The both-orderings-observed check is a VACUITY GUARD on top of that
-// deterministic pin, not the only evidence for ordering B, so it is reported
-// rather than failed if a loaded runner always resolves the same way.
+// STATUS VALIDATION is load-bearing, not cosmetic: a concurrency regression that
+// made every POST return 500 and append nothing would otherwise satisfy the
+// invariant loop vacuously (no rows to check) and pass. So each round's status
+// must be one of exactly THREE legal outcomes, and each 409 is matched on its
+// specific error code before its ordering is counted:
+//
+//   - 200 — ordering B, the arbitration committed first;
+//   - 409 acceptance_outcome_superseded — the outcome landed AFTER the handler
+//     read it but BEFORE the append's in-transaction anchor re-read;
+//   - 409 acceptance_arbitration_not_applicable — the outcome landed BEFORE the
+//     handler's own reads, so the guards evaluate the NEW outcome, which carries
+//     no correlated paged triage decision yet and is refused at guard 5. Also
+//     ordering A, also fail-closed, also writes nothing — but a DIFFERENT branch,
+//     so it is counted separately rather than folded into "superseded".
+//
+// Anything else FAILS the round. The both-orderings-observed check is a VACUITY
+// GUARD on top of the deterministic pin, not the only evidence for ordering B, so
+// it is reported rather than failed if a loaded runner always resolves the same
+// way.
 func TestAcceptanceArbitration_PG_ConcurrentAnchorMove(t *testing.T) {
 	ctx := context.Background()
 	const rounds = 20
-	sawSuperseded, sawArbitrated := 0, 0
+	sawSuperseded, sawNotApplicable, sawArbitrated := 0, 0, 0
 
 	for i := 0; i < rounds; i++ {
 		f, _ := newArbFixture(t)
+		// The two workers are NOT symmetric in cost: the append is one INSERT
+		// while the POST first re-reads the run, its stages, the outcome, the
+		// prior arbitrations and the triage decision. Fired simultaneously the
+		// append wins essentially always, so half the rounds STAGGER it — the
+		// POST gets a head start and the outcome lands inside its
+		// guards-to-append window. That biases WHICH legal ordering occurs; it
+		// does not weaken the invariant, which is asserted over committed state
+		// and is scheduling-independent either way. The stagger is derived via
+		// timescale.D so a loaded CI runner scales it with everything else.
+		stagger := time.Duration(0)
+		if i%2 == 1 {
+			stagger = timescale.D(2 * time.Millisecond)
+		}
 		var wg sync.WaitGroup
 		var code int
+		var body string
+		var appendErr error
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			code = f.post(t).Code
+			w := f.post(t)
+			code, body = w.Code, w.Body.String()
 		}()
 		go func() {
 			defer wg.Done()
-			f.appendOutcome(t, acceptanceVerdictFailed, 0, 3)
+			if stagger > 0 {
+				time.Sleep(stagger)
+			}
+			// t.Fatalf is illegal off the test goroutine (testing package
+			// contract): record and report after wg.Wait().
+			_, appendErr = f.tryAppendOutcome(acceptanceVerdictFailed, 0, 3)
 		}()
 		wg.Wait()
+		if appendErr != nil {
+			t.Fatalf("round %d: concurrent outcome append: %v", i, appendErr)
+		}
 
-		switch code {
-		case http.StatusConflict:
-			sawSuperseded++
-		case http.StatusOK:
+		switch {
+		case code == http.StatusOK:
 			sawArbitrated++
+		case code == http.StatusConflict && strings.Contains(body, "acceptance_outcome_superseded"):
+			sawSuperseded++
+		case code == http.StatusConflict && strings.Contains(body, "acceptance_arbitration_not_applicable"):
+			sawNotApplicable++
+		default:
+			t.Errorf("round %d: status = %d with body %s; want 200, 409 acceptance_outcome_superseded, or 409 acceptance_arbitration_not_applicable",
+				i, code, body)
 		}
 
 		outcomes, err := f.audit.ListForRunByCategory(ctx, f.runID, CategoryAcceptanceOutcomeRecorded)
@@ -413,7 +483,10 @@ func TestAcceptanceArbitration_PG_ConcurrentAnchorMove(t *testing.T) {
 		}
 		arbs := f.committedArbitrations(t)
 		if code == http.StatusConflict && len(arbs) != 0 {
-			t.Errorf("round %d: 409 acceptance_outcome_superseded but %d arbitration rows committed", i, len(arbs))
+			t.Errorf("round %d: 409 (%s) but %d arbitration rows committed — every refusal must write nothing", i, body, len(arbs))
+		}
+		if code == http.StatusOK && len(arbs) != 1 {
+			t.Errorf("round %d: 200 but %d arbitration rows committed, want exactly 1", i, len(arbs))
 		}
 		for _, e := range arbs {
 			s, ok := arbitrationOutcomeSequence(e.Payload)
@@ -430,11 +503,13 @@ func TestAcceptanceArbitration_PG_ConcurrentAnchorMove(t *testing.T) {
 		}
 	}
 
+	t.Logf("interleavings observed across %d rounds: arbitrated(200)=%d superseded(409)=%d not_applicable(409)=%d",
+		rounds, sawArbitrated, sawSuperseded, sawNotApplicable)
 	// Vacuity guard, REPORTED not failed (the arbitration-first branch has its
 	// own deterministic pin).
-	if sawSuperseded == 0 || sawArbitrated == 0 {
-		t.Logf("only one interleaving observed across %d rounds (superseded=%d arbitrated=%d); the invariant still held, and the arbitration-first branch is pinned deterministically by TestAcceptanceArbitration_ArbitrationFirstOrdering",
-			rounds, sawSuperseded, sawArbitrated)
+	if sawSuperseded+sawNotApplicable == 0 || sawArbitrated == 0 {
+		t.Logf("only one interleaving observed across %d rounds (superseded=%d not_applicable=%d arbitrated=%d); the invariant still held, and the arbitration-first branch is pinned deterministically by TestAcceptanceArbitration_ArbitrationFirstOrdering",
+			rounds, sawSuperseded, sawNotApplicable, sawArbitrated)
 	}
 }
 
@@ -468,16 +543,36 @@ func TestAcceptanceArbitration_PG_AnchorMovedRefuses(t *testing.T) {
 		DedupePayloadKey: "outcome_sequence", DedupeValue: stale,
 		ConstraintName: audit.AcceptanceTriageArbitratedOnceIndex,
 	})
-	if entry != nil || err == nil {
-		t.Fatalf("entry = %+v, err = %v; want nil entry and a moved-anchor error", entry, err)
+	if entry != nil {
+		t.Fatalf("entry = %+v, want nil on a moved anchor", entry)
+	}
+	// Assert the TYPED error, not merely "some error": a lock failure, a list
+	// failure or a not-found would all satisfy `err != nil` and leave the
+	// moved-anchor refusal unpinned at this layer.
+	var moved *audit.AnchorMovedError
+	if !errors.As(err, &moved) {
+		t.Fatalf("err = %v (%T), want *audit.AnchorMovedError", err, err)
+	}
+	if moved.Expected != stale || moved.Current != newest || !moved.Recorded {
+		t.Errorf("AnchorMovedError = {Expected:%d Current:%d Recorded:%v}, want {Expected:%d Current:%d Recorded:true}",
+			moved.Expected, moved.Current, moved.Recorded, stale, newest)
 	}
 	if rows := f.committedArbitrations(t); len(rows) != 0 {
 		t.Errorf("committed arbitrations = %d, want 0 (a stale anchor must write nothing)", len(rows))
 	}
-	// And the endpoint itself still refuses this run: the gate reads triage on
-	// the NEW outcome, which carries no correlated paged triage decision yet.
+	// And the endpoint itself still refuses this run, DETERMINISTICALLY: the
+	// fixture's only acceptance_triage_decided entry sits BELOW the newer
+	// outcome, so no correlated paged disposition exists for it and guard 5
+	// refuses. Asserted as an exact status + error code — the earlier
+	// "200-without-already_recorded" conditional passed silently on any 4xx/5xx.
 	w := f.post(t)
-	if w.Code == http.StatusOK && !bytes.Contains(w.Body.Bytes(), []byte(`"already_recorded":true`)) {
-		t.Errorf("endpoint admitted an arbitration for an untriaged newer outcome: %s", w.Body.String())
+	if w.Code != http.StatusConflict {
+		t.Fatalf("endpoint status = %d, want 409 for an untriaged newer outcome:\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("acceptance_arbitration_not_applicable")) {
+		t.Errorf("endpoint 409 is not acceptance_arbitration_not_applicable: %s", w.Body.String())
+	}
+	if rows := f.committedArbitrations(t); len(rows) != 0 {
+		t.Errorf("committed arbitrations after the refused POST = %d, want 0", len(rows))
 	}
 }
