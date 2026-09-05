@@ -377,6 +377,57 @@ func TestCreateRun_OnDemandWithIssueContext(t *testing.T) {
 	}
 }
 
+// TestCreateRun_OnDemandWithoutIssueContext pins a DELIBERATE acceptance
+// (E54.24 / #2830, widening E54.22 / #2826): an on_demand run that carries
+// NEITHER issue_context NOR trigger_ref is still accepted 201, not refused.
+// IsIssueAnchored is a SOURCE-level predicate only — it says on_demand is a
+// source that MAY carry an issue reference, never that a given run must. Every
+// consumer (the notifier, the prompt renderer) independently re-checks
+// TriggerRef and InstallationID afterwards, so an issue-less on_demand run
+// simply posts no issue comments (pinned downstream by the on_demand-with-nil-
+// TriggerRef row in backend/internal/issuecomment/notifier_test.go's
+// TestNotify_IssueAnchoredSuppression) rather than erroring here.
+//
+// If a future change decides an on_demand run MUST be anchored at creation,
+// that is a real design reversal, not a bug fix — and THIS test is where it
+// should be argued.
+func TestCreateRun_OnDemandWithoutIssueContext(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	body := `{
+		"repo": "kuhlman-labs/fishhawk",
+		"workflow_id": "backlog_grooming",
+		"workflow_sha": "abc123",
+		"trigger_source": "on_demand"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got.TriggerSource != string(run.TriggerOnDemand) {
+		t.Errorf("TriggerSource = %q, want on_demand", got.TriggerSource)
+	}
+	persisted, ok := repo.runs[got.ID]
+	if !ok {
+		t.Fatalf("run %s was not persisted", got.ID)
+	}
+	if persisted.TriggerRef != nil {
+		t.Errorf("persisted TriggerRef = %v, want nil — an issue-less on_demand run is un-anchored, not silently defaulted", *persisted.TriggerRef)
+	}
+	if !persisted.IsIssueAnchored() {
+		t.Error("IsIssueAnchored() must stay true regardless of TriggerRef — it is a SOURCE-level predicate, not a ref check")
+	}
+}
+
 // TestCreateRun_IssueContextRejectedOnNonAnchoredSource is the RETAINED
 // control (counterfactual (a), E54.22 / #2826): relaxing the issue_context
 // coupling to the issue-anchored set must NOT make it accept cli or ui. Delete

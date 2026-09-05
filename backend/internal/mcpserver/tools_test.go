@@ -7950,6 +7950,43 @@ func TestStartRun_OnDemandWithIssueContext_PassesThrough(t *testing.T) {
 	}
 }
 
+// TestStartRun_OnDemandWithoutIssueContext_PassesThrough pins a DELIBERATE
+// acceptance at the MCP mirror (E54.24 / #2830, widening E54.22 / #2826): a
+// caller starting an on_demand run with NEITHER Issue NOR IssueContext is
+// still admitted, not refused. IsIssueAnchored is a SOURCE-level predicate —
+// it says on_demand MAY carry an issue reference, never that this run must —
+// and every consumer independently re-checks TriggerRef and InstallationID
+// afterwards, so the forwarded create body simply carries a nil TriggerRef.
+// The explicit trigger_source must also survive the step-(5) auto-flip
+// unchanged (the flip only fills an OMITTED source).
+//
+// If a future change decides an on_demand run MUST be anchored at start,
+// that is a real design reversal, not a bug fix — and THIS test is where it
+// should be argued.
+func TestStartRun_OnDemandWithoutIssueContext_PassesThrough(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:          "x/y",
+		WorkflowID:    "trivial",
+		WorkflowSpec:  validTrivialSpec,
+		TriggerSource: string(runpkg.TriggerOnDemand),
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunBody.TriggerSource != string(runpkg.TriggerOnDemand) {
+		t.Errorf("TriggerSource = %q, want on_demand", fb.createRunBody.TriggerSource)
+	}
+	if fb.createRunBody.IssueContext != nil {
+		t.Errorf("IssueContext = %+v, want nil for an issue-less on_demand run", fb.createRunBody.IssueContext)
+	}
+	if fb.createRunBody.TriggerRef != nil {
+		t.Errorf("TriggerRef = %v, want nil — un-anchored, not silently defaulted", *fb.createRunBody.TriggerRef)
+	}
+}
+
 // TestStartRun_GhMissing_DoesNotFail keeps the pre-#415 behavior
 // alive: a missing gh emits a warning on the tool result but the
 // run still mints. trigger_source still flips to github_issue

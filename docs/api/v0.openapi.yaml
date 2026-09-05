@@ -6663,11 +6663,17 @@ paths:
                     (ADR-065's `backlog_grooming`) routes on, and
                     without it that declaration matches no run. An
                     `on_demand` run is ISSUE-ANCHORED by design —
-                    the groom stage requires a `github_issue` input
-                    — so it carries an `issue:N` `trigger_ref` and
-                    may carry an `issue_context`. `scheduled` is
-                    deliberately NOT accepted: no scheduler exists
-                    to mint it.
+                    the groom stage requires a `github_issue` input,
+                    so it is INTENDED to carry an `issue:N`
+                    `trigger_ref` and an `issue_context` — but that
+                    is not enforced at creation (E54.24 / #2830):
+                    ISSUE-ANCHORED is a source-level property, not a
+                    creation-time requirement, so an `on_demand` run
+                    submitted with neither is still accepted (201)
+                    and simply posts no issue comments, because
+                    every consumer independently re-checks
+                    `trigger_ref`. `scheduled` is deliberately NOT
+                    accepted: no scheduler exists to mint it.
                 trigger_ref:
                   type: [string, "null"]
                 runner_kind:
@@ -6735,10 +6741,16 @@ paths:
                     ISSUE-ANCHORED `trigger_source` —
                     `github_issue` or `on_demand` (E54.22 / #2826)
                     — a 400 fires when shipped with `cli` or `ui`,
-                    which carry no originating issue.
-                    Webhook-dispatched runs leave this empty and
-                    the backend falls back to the existing
-                    GitHub-fetch path.
+                    which carry no originating issue. The converse
+                    does not hold: an ISSUE-ANCHORED source is not
+                    itself required to carry `issue_context` (or a
+                    `trigger_ref`) at creation (E54.24 / #2830) — an
+                    `on_demand` run submitted with neither is
+                    accepted (201) and simply posts no issue
+                    comments, because every consumer independently
+                    re-checks `trigger_ref`. Webhook-dispatched runs
+                    leave this empty and the backend falls back to
+                    the existing GitHub-fetch path.
                 drive:
                   type: boolean
                   description: |
