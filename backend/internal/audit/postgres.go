@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -411,6 +412,96 @@ func (r *postgresRepo) AppendChainedUnderBudget(ctx context.Context, p ChainAppe
 	return result, nil
 }
 
+// AppendChainedAnchored implements AnchoredChainAppender: the atomic
+// anchor-revalidate-and-append (#2536). It is a thin pgx.BeginFunc wrapper
+// delegating to AppendChainedAnchoredTx, exactly as AppendChained wraps
+// AppendChainedTx. TxOptions are deliberately NOT set — the atomic re-read is
+// correct ONLY at the server-default READ COMMITTED isolation (see
+// AppendChainedAnchoredTx's ordering note; a REPEATABLE READ snapshot would
+// predate the row lock and could observe the stale pre-append state).
+//
+// It also owns the BACKSTOP-INDEX RECOVERY. When the insert trips a 23505 on
+// spec.ConstraintName, BeginFunc has ALREADY ROLLED BACK, so no *Entry exists
+// from that transaction. The committed colliding row is then re-read OUTSIDE the
+// rolled-back transaction, on the pool, MATCHING ON THE INDEX'S OWN KEY
+// SEMANTICS — a TEXT comparison of payload->>'<key>' in SQL, NOT the typed Go
+// decode the in-transaction scan uses. That rule is load-bearing: the typed
+// decode is exactly what just MISSED a string-typed row, so re-running it here
+// could fail to find the very row the index collided with. The text rule always
+// finds it. Found → *AnchoredDuplicateError, so the caller's duplicate branch is
+// uniform across both duplicate paths.
+//
+// The not-found leg is DEFENSIVE CODE FOR AN UNREACHABLE STATE, and there is
+// deliberately NO test for it. A 23505 on the partial index PROVES a committed
+// row exists with the same textual (run_id, payload->>'<key>') key, and
+// audit_entries cannot be deleted — migration 0002's BEFORE UPDATE/DELETE
+// triggers RAISE. Because the re-read matches on those same index semantics, it
+// MUST find that row. Reaching this leg would mean the index and the append
+// disagree about identity, which no current code path can produce. It returns a
+// plain error (surfaced as a 500 integrity anomaly) rather than an unhandled
+// nil; manufacturing a vehicle to force it would test the vehicle, not the code.
+//
+// A 23505 on any OTHER constraint the insert can trip (entry-hash, (run_id,
+// sequence)) is NOT swallowed and propagates as a hard error, mirroring the
+// #1983 narrowing.
+func (r *postgresRepo) AppendChainedAnchored(ctx context.Context, p ChainAppendParams, spec AnchorSpec) (*Entry, error) {
+	var result *Entry
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		entry, aerr := AppendChainedAnchoredTx(ctx, tx, p, spec)
+		if aerr != nil {
+			return aerr
+		}
+		result = entry
+		return nil
+	})
+	if err == nil {
+		return result, nil
+	}
+	if spec.ConstraintName == "" || !IsDuplicateOnConstraint(err, spec.ConstraintName) {
+		return nil, err
+	}
+	existing, rerr := r.findAnchoredDuplicate(ctx, p, spec)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if existing == nil {
+		return nil, fmt.Errorf(
+			"audit: run %s: duplicate on %s but no committed entry for %s=%d",
+			p.RunID, spec.ConstraintName, spec.DedupePayloadKey, spec.DedupeValue)
+	}
+	return nil, &AnchoredDuplicateError{Existing: existing}
+}
+
+// findAnchoredDuplicate re-reads the committed entry that collided with the
+// backstop unique index, keyed EXACTLY as the index is: run_id, category, and a
+// TEXT comparison of payload->>'<DedupePayloadKey>' against the decimal
+// rendering of DedupeValue. Returns (nil, nil) when no such row exists.
+//
+// It runs on the pool, never inside the rolled-back transaction. The key
+// expression is parameterised (payload->>$3), so the caller-supplied key name is
+// a bind value and never interpolated SQL.
+func (r *postgresRepo) findAnchoredDuplicate(ctx context.Context, p ChainAppendParams, spec AnchorSpec) (*Entry, error) {
+	var id uuid.UUID
+	err := r.pool.QueryRow(ctx,
+		`SELECT id FROM audit_entries
+		 WHERE run_id = $1 AND category = $2 AND payload->>$3 = $4
+		 ORDER BY sequence ASC
+		 LIMIT 1`,
+		p.RunID, p.Category, spec.DedupePayloadKey, strconv.FormatInt(spec.DedupeValue, 10),
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("audit: re-read anchored duplicate: %w", err)
+	}
+	entry, gerr := r.Get(ctx, id)
+	if gerr != nil {
+		return nil, fmt.Errorf("audit: re-read anchored duplicate entry %s: %w", id, gerr)
+	}
+	return entry, nil
+}
+
 func (r *postgresRepo) Get(ctx context.Context, id uuid.UUID) (*Entry, error) {
 	q := auditdb.New(r.pool)
 	row, err := q.GetAuditEntry(ctx, id)
@@ -570,3 +661,10 @@ var _ Repository = (*postgresRepo)(nil)
 // non-atomic count-then-append leg; this turns that regression into a build
 // failure rather than a runtime degrade.
 var _ RetryBudgetAppender = (*postgresRepo)(nil)
+
+// Compile-time check that the production repo carries the atomic anchored-append
+// capability (#2536). A production repo that silently lost
+// AppendChainedAnchored would make the arbitration handler fall back to its
+// non-atomic re-read-then-append leg, reopening the check-to-append window; this
+// turns that regression into a build failure rather than a runtime degrade.
+var _ AnchoredChainAppender = (*postgresRepo)(nil)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -768,5 +770,162 @@ func TestAcceptanceArbitration_OutcomeSupersededBeforeAppend(t *testing.T) {
 	if rows := arbitrationRows(au); len(rows) != 0 {
 		t.Fatalf("arbitration rows = %d, want 0 — an arbitration naming superseded outcome %d was persisted",
 			len(rows), arbitrationOutcomeSeq)
+	}
+}
+
+// --- capability path (audit.AnchoredChainAppender, #2536) --------------------
+//
+// The atomic append (anchor re-read + dedupe scan under the run-row lock) lives
+// in the store, so its BEHAVIOUR is pinned by the real-Postgres suite in
+// acceptance_arbitration_pg_test.go. What these fake-backed cases pin is the
+// HANDLER's mapping of the primitive's two typed errors onto the UNCHANGED wire
+// contract, and the fallback for a repository that does not carry the capability
+// (every case above drives that fallback leg, since auditFake does not implement
+// AnchoredChainAppender).
+
+// anchoredAuditFake wraps auditFake with the AnchoredChainAppender capability,
+// returning a caller-supplied error from the anchored append. It is the ONLY
+// fake in this file that implements the capability, so every other case here
+// continues to exercise the non-capable fallback path.
+type anchoredAuditFake struct {
+	*auditFake
+	err error
+}
+
+func (a *anchoredAuditFake) AppendChainedAnchored(ctx context.Context, p audit.ChainAppendParams,
+	_ audit.AnchorSpec) (*audit.Entry, error) {
+	if a.err != nil {
+		return nil, a.err
+	}
+	return a.AppendChained(ctx, p)
+}
+
+// newAnchoredArbitrationServer wires a Server whose audit repo carries the
+// capability and returns anchoredErr from the anchored append.
+func newAnchoredArbitrationServer(t *testing.T, anchoredErr error) (*Server, *autoDriveRepo, *auditFake) {
+	t.Helper()
+	repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	au := newAuditFake()
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: repo,
+		AuditRepo:    &anchoredAuditFake{auditFake: au, err: anchoredErr},
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+		GateMerger:   &fakeMerger{},
+	})
+	return s, repo, au
+}
+
+// TestAcceptanceArbitration_CapabilityPath_AnchorMoved: the primitive's
+// *audit.AnchorMovedError maps to the SAME 409 acceptance_outcome_superseded
+// wire contract the pre-#2536 non-atomic re-read produced, naming both
+// sequences, with zero rows written.
+func TestAcceptanceArbitration_CapabilityPath_AnchorMoved(t *testing.T) {
+	moved := &audit.AnchorMovedError{
+		Expected: arbitrationOutcomeSeq, Current: arbitrationOutcomeSeq + 40, Recorded: true,
+	}
+	s, repo, au := newAnchoredArbitrationServer(t, moved)
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("acceptance_outcome_superseded")) {
+		t.Errorf("body missing acceptance_outcome_superseded: %s", w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"current_outcome_sequence":100`)) {
+		t.Errorf("body must name the CURRENT sequence from the primitive: %s", w.Body.String())
+	}
+	if rows := arbitrationRows(au); len(rows) != 0 {
+		t.Errorf("arbitration rows = %d, want 0", len(rows))
+	}
+}
+
+// TestAcceptanceArbitration_CapabilityPath_Duplicate: the primitive's
+// *audit.AnchoredDuplicateError maps to 200 already_recorded:true carrying the
+// SURVIVING entry's sequence — the branch a concurrent POST that passed the
+// endpoint fast path lands in.
+func TestAcceptanceArbitration_CapabilityPath_Duplicate(t *testing.T) {
+	const survivingSeq = int64(77)
+	dup := &audit.AnchoredDuplicateError{Existing: &audit.Entry{
+		Sequence: survivingSeq, Category: CategoryAcceptanceTriageArbitrated,
+	}}
+	s, repo, au := newAnchoredArbitrationServer(t, dup)
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var got acceptanceArbitrationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode %s: %v", w.Body.String(), err)
+	}
+	if !got.AlreadyRecorded {
+		t.Error("already_recorded = false, want true on a duplicate")
+	}
+	if got.ArbitrationSequence != survivingSeq {
+		t.Errorf("arbitration_sequence = %d, want the surviving entry's %d", got.ArbitrationSequence, survivingSeq)
+	}
+	if rows := arbitrationRows(au); len(rows) != 0 {
+		t.Errorf("arbitration rows = %d, want 0 (the duplicate branch writes nothing)", len(rows))
+	}
+}
+
+// TestAcceptanceArbitration_CapabilityPath_OtherErrorIs500: any error that is
+// neither typed error stays a hard 500 — a 23505 on an unrelated constraint (or
+// the vanished-row integrity anomaly) must NOT be mistaken for the benign
+// duplicate.
+func TestAcceptanceArbitration_CapabilityPath_OtherErrorIs500(t *testing.T) {
+	s, repo, au := newAnchoredArbitrationServer(t, errors.New("audit: duplicate on idx but no committed entry for outcome_sequence=60"))
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("internal_error")) {
+		t.Errorf("body missing internal_error: %s", w.Body.String())
+	}
+	if rows := arbitrationRows(au); len(rows) != 0 {
+		t.Errorf("arbitration rows = %d, want 0", len(rows))
+	}
+}
+
+// TestAcceptanceArbitration_CapabilityPath_HappyPath: with the capability
+// present and no error, the append still lands and the 200 reports it — so the
+// capability path is not merely an error-mapping shim.
+func TestAcceptanceArbitration_CapabilityPath_HappyPath(t *testing.T) {
+	s, repo, au := newAnchoredArbitrationServer(t, nil)
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rows := arbitrationRows(au)
+	if len(rows) != 1 {
+		t.Fatalf("arbitration rows = %d, want 1", len(rows))
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte(`"already_recorded":true`)) {
+		t.Errorf("already_recorded = true on a fresh append: %s", w.Body.String())
+	}
+}
+
+// TestAcceptanceArbitrationRepoCarriesAnchoredCapability pins the fallback's
+// PRECONDITION rather than asserting it in prose: the PRODUCTION audit
+// repository must carry audit.AnchoredChainAppender, so the handler's
+// non-capable fallback leg is reachable only by in-memory fakes. audit's own
+// compile-time `var _ AnchoredChainAppender = (*postgresRepo)(nil)` is the other
+// half; this asserts it across the package boundary the handler actually
+// type-asserts on.
+func TestAcceptanceArbitrationRepoCarriesAnchoredCapability(t *testing.T) {
+	repo := audit.NewPostgresRepository(nil)
+	if _, ok := repo.(audit.AnchoredChainAppender); !ok {
+		t.Fatal("the production audit.Repository must implement audit.AnchoredChainAppender; without it the arbitration endpoint silently degrades to the non-atomic re-read-then-append")
 	}
 }

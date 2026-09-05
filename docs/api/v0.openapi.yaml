@@ -8226,11 +8226,28 @@ paths:
         **Invalidated by construction.** Because the entry is bound to a
         verdict SEQUENCE, a later acceptance re-run records a new outcome at a
         higher sequence that no prior arbitration names — the gate returns to
-        `acceptance_triage` and a fresh arbitration is required.
+        `acceptance_triage` and a fresh arbitration is required. This applies
+        to an arbitration that was VALID when it was written, too: an
+        arbitration committing and a newer outcome landing afterwards is a
+        legal ordering, and the recorded arbitration is neither unwound nor
+        wrong — it is superseded, and the gate re-wedges so the operator
+        arbitrates the new outcome.
+
+        **Atomicity, at the strength the mechanism delivers (#2536).** The
+        guarantee is that no arbitration is ever persisted that named an
+        ALREADY-SUPERSEDED outcome AT APPEND TIME. It is NOT a guarantee that a
+        recorded arbitration always names the newest outcome forever — see
+        "Invalidated by construction" above. Both the supersede check and the
+        duplicate check run INSIDE the append's transaction under a row lock,
+        so two genuinely concurrent POSTs commit exactly ONE row (the loser
+        receives the idempotent `200 already_recorded: true`), and no
+        interleaving can persist an arbitration for an outcome that a newer one
+        had already replaced.
 
         **Idempotent.** A repeated POST that finds an arbitration already bound
         to the newest outcome appends NO duplicate row and responds
-        `already_recorded: true`.
+        `already_recorded: true`. Two CONCURRENT first-POSTs behave the same
+        way: exactly one row is committed and both responses report it.
 
         **Authorization.** Operator-token-only, mirroring the merge endpoint it
         admits. Requires `write:approvals`, enforced unconditionally (a
@@ -8245,9 +8262,9 @@ paths:
         `retry_dispatched` keeps its automatic route, and an absent or
         unreadable disposition is refused); a verdict carrying genuinely FAILED
         criteria additionally requires `acknowledge_failed_criteria: true`; and
-        the outcome is RE-READ immediately before the append, refusing
-        `409 acceptance_outcome_superseded` if a concurrent acceptance re-run
-        moved it in the meantime.
+        the outcome is RE-READ inside the append's own transaction under a row
+        lock, refusing `409 acceptance_outcome_superseded` if a concurrent
+        acceptance re-run moved it in the meantime.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -8294,7 +8311,7 @@ paths:
                   acceptance_gate_state: { type: string, description: 'The gate state after the discharge: acceptance_arbitrated.' }
                   outcome_sequence: { type: integer, format: int64, description: 'Audit sequence of the acceptance_outcome_recorded entry this arbitration is BOUND to. A later re-run at a higher sequence invalidates it.' }
                   arbitration_sequence: { type: integer, format: int64, description: 'Audit sequence of the acceptance_triage_arbitrated entry.' }
-                  already_recorded: { type: boolean, description: 'True when an arbitration for this outcome already existed (an idempotent re-POST); no fresh row was appended.' }
+                  already_recorded: { type: boolean, description: 'True when an arbitration for this outcome already existed (an idempotent re-POST, or the loser of two genuinely concurrent first-POSTs); no fresh row was appended, and arbitration_sequence names the surviving row.' }
         '400':
           description: |
             Malformed body, a non-UUID `run_id`, or an empty `reason`. Body's

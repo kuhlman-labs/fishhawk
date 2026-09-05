@@ -1684,3 +1684,444 @@ func TestPostgres_AppendChained_ApprovalConditionsTruncatedChainIntact(t *testin
 		prev = &h
 	}
 }
+
+// --- AnchoredChainAppender (#2536) -------------------------------------------
+//
+// The atomic anchor-revalidate-and-append primitive. Every REFUSAL case asserts
+// COMMITTED STATE (zero rows of the appended category) in addition to the error
+// identity: the control's real effect is committed state, and a control that
+// fires and rolls back returns a byte-identical error, so an error-identity-only
+// assertion would stay green with the control deleted.
+
+const (
+	anchorCategory = "acceptance_outcome_recorded"
+	anchoredCat    = "acceptance_triage_arbitrated"
+	anchorKey      = "outcome_sequence"
+)
+
+// seedAnchor appends one anchor-category entry and returns its sequence.
+func seedAnchor(t *testing.T, repo audit.Repository, runID uuid.UUID) int64 {
+	t.Helper()
+	e, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Now().UTC(), Category: anchorCategory,
+		Payload: json.RawMessage(`{"verdict":"failed"}`),
+	})
+	if err != nil {
+		t.Fatalf("seed anchor: %v", err)
+	}
+	return e.Sequence
+}
+
+// arbitrationPayload renders the appended entry's payload binding it to seq.
+func arbitrationPayload(seq int64) json.RawMessage {
+	p, _ := json.Marshal(map[string]any{"reason": "operator discharge", anchorKey: seq})
+	return p
+}
+
+// anchoredSpec is the acceptance-arbitration AnchorSpec at sequence seq.
+func anchoredSpec(seq int64) audit.AnchorSpec {
+	return audit.AnchorSpec{
+		AnchorCategory:   anchorCategory,
+		AnchorSequence:   seq,
+		DedupePayloadKey: anchorKey,
+		DedupeValue:      seq,
+		ConstraintName:   audit.AcceptanceTriageArbitratedOnceIndex,
+	}
+}
+
+// countAnchoredRows reports how many appended-category rows the run committed.
+func countAnchoredRows(t *testing.T, pool *pgxpool.Pool, runID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM audit_entries WHERE run_id = $1 AND category = $2`,
+		runID, anchoredCat).Scan(&n); err != nil {
+		t.Fatalf("count %s rows: %v", anchoredCat, err)
+	}
+	return n
+}
+
+// (a) happy path: the anchor matches, no duplicate exists, one chained entry
+// lands and links to the run's prior entry.
+func TestPostgres_AppendChainedAnchored_HappyPath(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	appender := repo.(audit.AnchoredChainAppender)
+	runID := makeRun(t, pool)
+	ctx := context.Background()
+
+	seq := seedAnchor(t, repo, runID)
+	entry, err := appender.AppendChainedAnchored(ctx, audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Now().UTC(), Category: anchoredCat,
+		Payload: arbitrationPayload(seq),
+	}, anchoredSpec(seq))
+	if err != nil {
+		t.Fatalf("AppendChainedAnchored: %v", err)
+	}
+	if entry == nil || entry.Sequence <= seq {
+		t.Fatalf("entry = %+v, want a chained entry above the anchor sequence %d", entry, seq)
+	}
+	if entry.PrevHash == nil {
+		t.Error("PrevHash = nil, want the anchor entry's hash (the append must chain)")
+	}
+	if n := countAnchoredRows(t, pool, runID); n != 1 {
+		t.Errorf("committed %s rows = %d, want 1", anchoredCat, n)
+	}
+}
+
+// (b) anchor moved: a NEWER anchor entry commits before the call. Asserts the
+// typed error AND — the load-bearing half — that ZERO rows committed.
+func TestPostgres_AppendChainedAnchored_AnchorMoved(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	appender := repo.(audit.AnchoredChainAppender)
+	runID := makeRun(t, pool)
+	ctx := context.Background()
+
+	stale := seedAnchor(t, repo, runID)
+	newest := seedAnchor(t, repo, runID) // supersedes `stale`
+
+	entry, err := appender.AppendChainedAnchored(ctx, audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Now().UTC(), Category: anchoredCat,
+		Payload: arbitrationPayload(stale),
+	}, anchoredSpec(stale))
+	if entry != nil {
+		t.Errorf("entry = %+v, want nil on a moved anchor", entry)
+	}
+	var moved *audit.AnchorMovedError
+	if !errors.As(err, &moved) {
+		t.Fatalf("err = %v, want *audit.AnchorMovedError", err)
+	}
+	if moved.Expected != stale || moved.Current != newest || !moved.Recorded {
+		t.Errorf("moved = %+v, want Expected=%d Current=%d Recorded=true", moved, stale, newest)
+	}
+	// COMMITTED STATE: the control's effect. A control that fired and rolled
+	// back would return a byte-identical error, so this is what discriminates.
+	if n := countAnchoredRows(t, pool, runID); n != 0 {
+		t.Errorf("committed %s rows = %d, want 0 (a refused append must write nothing)", anchoredCat, n)
+	}
+}
+
+// (b2) no anchor recorded at all: Recorded=false, nothing written.
+func TestPostgres_AppendChainedAnchored_NoAnchorRecorded(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	appender := repo.(audit.AnchoredChainAppender)
+	runID := makeRun(t, pool)
+
+	entry, err := appender.AppendChainedAnchored(context.Background(), audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Now().UTC(), Category: anchoredCat,
+		Payload: arbitrationPayload(7),
+	}, anchoredSpec(7))
+	if entry != nil {
+		t.Errorf("entry = %+v, want nil with no anchor recorded", entry)
+	}
+	var moved *audit.AnchorMovedError
+	if !errors.As(err, &moved) {
+		t.Fatalf("err = %v, want *audit.AnchorMovedError", err)
+	}
+	if moved.Recorded {
+		t.Errorf("moved.Recorded = true, want false (no anchor entry exists)")
+	}
+	if n := countAnchoredRows(t, pool, runID); n != 0 {
+		t.Errorf("committed %s rows = %d, want 0", anchoredCat, n)
+	}
+}
+
+// (c) in-transaction dedupe hit: a prior entry already binds this anchor, so the
+// scan inside the transaction returns it and nothing is appended.
+func TestPostgres_AppendChainedAnchored_InTransactionDuplicate(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	appender := repo.(audit.AnchoredChainAppender)
+	runID := makeRun(t, pool)
+	ctx := context.Background()
+
+	seq := seedAnchor(t, repo, runID)
+	first, err := appender.AppendChainedAnchored(ctx, audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Now().UTC(), Category: anchoredCat,
+		Payload: arbitrationPayload(seq),
+	}, anchoredSpec(seq))
+	if err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+
+	entry, err := appender.AppendChainedAnchored(ctx, audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Now().UTC(), Category: anchoredCat,
+		Payload: arbitrationPayload(seq),
+	}, anchoredSpec(seq))
+	if entry != nil {
+		t.Errorf("entry = %+v, want nil on a duplicate", entry)
+	}
+	var dup *audit.AnchoredDuplicateError
+	if !errors.As(err, &dup) {
+		t.Fatalf("err = %v, want *audit.AnchoredDuplicateError", err)
+	}
+	if dup.Existing == nil || dup.Existing.Sequence != first.Sequence {
+		t.Errorf("dup.Existing = %+v, want the first entry at sequence %d", dup.Existing, first.Sequence)
+	}
+	if n := countAnchoredRows(t, pool, runID); n != 1 {
+		t.Errorf("committed %s rows = %d, want 1", anchoredCat, n)
+	}
+}
+
+// (d) GENUINE backstop-index collision at the repo layer, driven through the
+// decode asymmetry rather than a race: a chain-valid prior entry writes the
+// dedupe key as a JSON STRING, so payload->>'outcome_sequence' collides on the
+// index while the typed in-transaction scan MISSES it. The append trips 23505,
+// BeginFunc rolls back, and the out-of-transaction recovery — which matches on
+// the INDEX's own TEXT semantics — finds the seeded row and returns it.
+func TestPostgres_AppendChainedAnchored_IndexCollisionRecovery(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	appender := repo.(audit.AnchoredChainAppender)
+	runID := makeRun(t, pool)
+	ctx := context.Background()
+
+	seq := seedAnchor(t, repo, runID)
+	// String-typed dedupe key: same index key ('7'), invisible to the *int64 scan.
+	stringTyped, _ := json.Marshal(map[string]any{
+		"reason": "seeded with a string-typed sequence", anchorKey: fmt.Sprintf("%d", seq),
+	})
+	seeded, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Now().UTC(), Category: anchoredCat,
+		Payload: stringTyped,
+	})
+	if err != nil {
+		t.Fatalf("seed string-typed prior arbitration: %v", err)
+	}
+
+	entry, err := appender.AppendChainedAnchored(ctx, audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Now().UTC(), Category: anchoredCat,
+		Payload: arbitrationPayload(seq),
+	}, anchoredSpec(seq))
+	if entry != nil {
+		t.Errorf("entry = %+v, want nil on an index collision", entry)
+	}
+	var dup *audit.AnchoredDuplicateError
+	if !errors.As(err, &dup) {
+		t.Fatalf("err = %v, want *audit.AnchoredDuplicateError from the 23505 recovery", err)
+	}
+	if dup.Existing == nil || dup.Existing.Sequence != seeded.Sequence {
+		t.Errorf("dup.Existing = %+v, want the SEEDED entry at sequence %d", dup.Existing, seeded.Sequence)
+	}
+	if n := countAnchoredRows(t, pool, runID); n != 1 {
+		t.Errorf("committed %s rows = %d, want 1 (only the seeded row)", anchoredCat, n)
+	}
+}
+
+// (e) unknown run: the run-row lock finds no row.
+func TestPostgres_AppendChainedAnchored_UnknownRun(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	appender := audit.NewPostgresRepository(pool).(audit.AnchoredChainAppender)
+
+	entry, err := appender.AppendChainedAnchored(context.Background(), audit.ChainAppendParams{
+		RunID: uuid.New(), Timestamp: time.Now().UTC(), Category: anchoredCat,
+		Payload: arbitrationPayload(1),
+	}, anchoredSpec(1))
+	if entry != nil {
+		t.Errorf("entry = %+v, want nil for an unknown run", entry)
+	}
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("err = %v, want a run-not-found error", err)
+	}
+}
+
+// concurrentAnchoredAppends fires n concurrent AppendChainedAnchored calls for
+// the same (run, anchor) and returns how many succeeded.
+func concurrentAnchoredAppends(t *testing.T, pool *pgxpool.Pool, runID uuid.UUID, seq int64, n int) int {
+	t.Helper()
+	appender := audit.NewPostgresRepository(pool).(audit.AnchoredChainAppender)
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	granted := 0
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e, err := appender.AppendChainedAnchored(ctx, audit.ChainAppendParams{
+				RunID: runID, Timestamp: time.Now().UTC(), Category: anchoredCat,
+				Payload: arbitrationPayload(seq),
+			}, anchoredSpec(seq))
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil && e != nil {
+				granted++
+			}
+		}()
+	}
+	wg.Wait()
+	return granted
+}
+
+// (f) N concurrent appends for the same (run, anchor) commit EXACTLY ONE row.
+func TestPostgres_AppendChainedAnchored_ConcurrentExactlyOne(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+	seq := seedAnchor(t, repo, runID)
+
+	if granted := concurrentAnchoredAppends(t, pool, runID, seq, 8); granted != 1 {
+		t.Errorf("granted = %d, want exactly 1", granted)
+	}
+	if n := countAnchoredRows(t, pool, runID); n != 1 {
+		t.Errorf("committed %s rows = %d, want exactly 1", anchoredCat, n)
+	}
+}
+
+// (g) the INDEX-DROPPED variant of (f), and the point of the whole design: with
+// the migration 0080 backstop index DROPPED in this test's OWN ephemeral
+// database, N concurrent appends must STILL commit exactly one row. That proves
+// the run-row lock + in-transaction dedupe scan is load-bearing on its own and
+// the index is a backstop, not the only control.
+func TestPostgres_AppendChainedAnchored_ConcurrentExactlyOne_IndexDropped(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+	seq := seedAnchor(t, repo, runID)
+
+	if _, err := pool.Exec(context.Background(),
+		`DROP INDEX `+audit.AcceptanceTriageArbitratedOnceIndex); err != nil {
+		t.Fatalf("drop backstop index: %v", err)
+	}
+	// Guard the SEAM: the index must actually be gone, or this test silently
+	// re-runs (f) and asserts nothing about the lock+scan layer.
+	var idx int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes WHERE tablename = 'audit_entries' AND indexname = $1`,
+		audit.AcceptanceTriageArbitratedOnceIndex).Scan(&idx); err != nil {
+		t.Fatalf("verify index dropped: %v", err)
+	}
+	if idx != 0 {
+		t.Fatalf("backstop index still present (count = %d) — this test would be vacuous", idx)
+	}
+
+	if granted := concurrentAnchoredAppends(t, pool, runID, seq, 8); granted != 1 {
+		t.Errorf("granted = %d, want exactly 1 WITHOUT the backstop index", granted)
+	}
+	if n := countAnchoredRows(t, pool, runID); n != 1 {
+		t.Errorf("committed %s rows = %d, want exactly 1 WITHOUT the backstop index — the lock + in-transaction scan must stand alone", anchoredCat, n)
+	}
+}
+
+// TestIsAcceptanceArbitrationDuplicate pins the #2536 NARROWING: only the
+// migration 0080 index's 23505 (or the fake sentinel) is the benign
+// already-recorded collision. A 23505 on ANY other constraint the anchored
+// insert can trip — the entry-hash or (run_id, sequence) uniqueness — must stay
+// a HARD error, because swallowing it would report an unrelated integrity
+// failure as a successful idempotent discharge.
+func TestIsAcceptanceArbitrationDuplicate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"sentinel", audit.ErrAcceptanceArbitrationDuplicate, true},
+		{"wrapped sentinel", fmt.Errorf("append: %w", audit.ErrAcceptanceArbitrationDuplicate), true},
+		{"23505 on the 0080 index", &pgconn.PgError{
+			Code: "23505", ConstraintName: audit.AcceptanceTriageArbitratedOnceIndex}, true},
+		{"wrapped 23505 on the 0080 index", fmt.Errorf("audit: append: %w", &pgconn.PgError{
+			Code: "23505", ConstraintName: audit.AcceptanceTriageArbitratedOnceIndex}), true},
+		{"23505 on the entry-hash constraint", &pgconn.PgError{
+			Code: "23505", ConstraintName: "audit_entries_entry_hash_key"}, false},
+		{"23505 on the (run_id, sequence) constraint", &pgconn.PgError{
+			Code: "23505", ConstraintName: "audit_entries_run_id_sequence_key"}, false},
+		{"23505 on the merge-verdict index", &pgconn.PgError{
+			Code: "23505", ConstraintName: audit.MergeVerdictRecordedOnceIndex}, false},
+		{"non-23505 on the 0080 index", &pgconn.PgError{
+			Code: "23503", ConstraintName: audit.AcceptanceTriageArbitratedOnceIndex}, false},
+		{"unrelated error", errors.New("boom"), false},
+		{"nil", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := audit.IsAcceptanceArbitrationDuplicate(tc.err); got != tc.want {
+				t.Errorf("IsAcceptanceArbitrationDuplicate(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAnchoredErrorMessages pins both typed errors' Error() strings, including
+// the no-anchor-recorded and nil-Existing branches an operator can actually see
+// in a 500 body or a server log.
+func TestAnchoredErrorMessages(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want []string
+	}{
+		{"anchor moved", &audit.AnchorMovedError{Expected: 7, Current: 9, Recorded: true},
+			[]string{"expected sequence 7", "current sequence 9"}},
+		{"no anchor recorded", &audit.AnchorMovedError{Expected: 7, Recorded: false},
+			[]string{"expected sequence 7", "no anchor entry recorded"}},
+		{"duplicate with entry", &audit.AnchoredDuplicateError{Existing: &audit.Entry{Sequence: 42}},
+			[]string{"duplicate", "sequence 42"}},
+		{"duplicate with nil entry", &audit.AnchoredDuplicateError{},
+			[]string{"anchored append duplicate"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := tc.err.Error()
+			for _, want := range tc.want {
+				if !strings.Contains(msg, want) {
+					t.Errorf("Error() = %q, want it to contain %q", msg, want)
+				}
+			}
+		})
+	}
+}
+
+// TestPostgres_AppendChainedAnchored_DedupeScanIgnoresUnusableKeys pins the
+// dedupe scan's three fail-to-match branches, each seeded BY CONSTRUCTION as a
+// real committed row rather than by calling the scan in the setup: a payload
+// that is not a JSON object at all, a payload missing the dedupe key, and a
+// payload whose key holds a non-integer JSON value. None of them binds this
+// anchor, so the append must SUCCEED — the scan must not treat "unreadable" as
+// "matches" (which would refuse a legitimate first discharge) nor as a decode
+// error that aborts the append.
+//
+// The string-typed key — the one case where this MISS diverges from the backstop
+// index's TEXT key — is covered separately by
+// TestPostgres_AppendChainedAnchored_IndexCollisionRecovery.
+func TestPostgres_AppendChainedAnchored_DedupeScanIgnoresUnusableKeys(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{"payload is not a JSON object", `"just a string"`},
+		{"payload missing the dedupe key", `{"reason":"no binding"}`},
+		{"dedupe key holds a JSON object", `{"outcome_sequence":{"nested":1}}`},
+		{"dedupe key holds JSON null", `{"outcome_sequence":null}`},
+		{"dedupe key holds a boolean", `{"outcome_sequence":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := pgtest.NewPool(t)
+			repo := audit.NewPostgresRepository(pool)
+			appender := repo.(audit.AnchoredChainAppender)
+			runID := makeRun(t, pool)
+			ctx := context.Background()
+			seq := seedAnchor(t, repo, runID)
+
+			if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+				RunID: runID, Timestamp: time.Now().UTC(), Category: anchoredCat,
+				Payload: json.RawMessage(tc.payload),
+			}); err != nil {
+				t.Fatalf("seed unusable-key row: %v", err)
+			}
+
+			entry, err := appender.AppendChainedAnchored(ctx, audit.ChainAppendParams{
+				RunID: runID, Timestamp: time.Now().UTC(), Category: anchoredCat,
+				Payload: arbitrationPayload(seq),
+			}, anchoredSpec(seq))
+			if err != nil {
+				t.Fatalf("AppendChainedAnchored over an unusable-key row: %v", err)
+			}
+			if entry == nil {
+				t.Fatal("entry = nil, want the fresh append to land")
+			}
+			if n := countAnchoredRows(t, pool, runID); n != 2 {
+				t.Errorf("committed %s rows = %d, want 2 (the seed plus the fresh append)", anchoredCat, n)
+			}
+		})
+	}
+}
