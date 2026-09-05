@@ -1201,27 +1201,10 @@ var boardCapabilityMatrixPath = filepath.Join("..", "..", "..", "docs", "board-c
 // It is a SOURCE-DERIVED sweep, which is the whole point: a hand-maintained
 // list of today's reasons verifies today's coverage and stays green on the day
 // a seventh reason is added — precisely the drift the caller is named for.
-//
-// Const blocks carry the preceding spec's type forward when a later spec omits
-// it, so lastType tracks that carry-over. Both the unqualified Ident
-// (in-package, where reader.go declares them) and a qualified SelectorExpr
-// (a sibling package declaring one as workmgmt.UnavailableReason) are matched,
-// so moving the declarations does not silently empty the sweep.
 func collectDeclaredUnavailableReasons(t *testing.T) map[string]string {
 	t.Helper()
 
-	const typeName = "UnavailableReason"
 	found := map[string]string{}
-
-	isReasonType := func(e ast.Expr) bool {
-		switch v := e.(type) {
-		case *ast.Ident:
-			return v.Name == typeName
-		case *ast.SelectorExpr:
-			return v.Sel != nil && v.Sel.Name == typeName
-		}
-		return false
-	}
 
 	fset := token.NewFileSet()
 	walkErr := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
@@ -1238,42 +1221,113 @@ func collectDeclaredUnavailableReasons(t *testing.T) map[string]string {
 		if perr != nil {
 			return perr
 		}
-		for _, decl := range f.Decls {
-			gd, ok := decl.(*ast.GenDecl)
-			if !ok || gd.Tok != token.CONST {
-				continue
-			}
-			var lastType ast.Expr
-			for _, spec := range gd.Specs {
-				vs, ok := spec.(*ast.ValueSpec)
-				if !ok {
-					continue
-				}
-				if vs.Type != nil {
-					lastType = vs.Type
-				}
-				if lastType == nil || !isReasonType(lastType) {
-					continue
-				}
-				for _, v := range vs.Values {
-					lit, ok := v.(*ast.BasicLit)
-					if !ok || lit.Kind != token.STRING {
-						continue
-					}
-					val, uerr := strconv.Unquote(lit.Value)
-					if uerr != nil {
-						return uerr
-					}
-					found[val] = path
-				}
-			}
-		}
-		return nil
+		return collectReasonsFromFile(f, path, found)
 	})
 	if walkErr != nil {
 		t.Fatalf("AST walk of the workmgmt package tree failed: %v", walkErr)
 	}
 	return found
+}
+
+// collectReasonsFromFile records every UnavailableReason string value declared
+// in one parsed file into found, keyed by value with path as the declaring
+// file. It is split out of collectDeclaredUnavailableReasons so the DECLARATION
+// STYLES it accepts can be pinned directly against synthetic source
+// (TestCollectReasonsFromFileAcceptsBothDeclarationStyles) rather than only
+// against whatever reader.go happens to look like today.
+//
+// Two declaration styles are accepted, because a sweep that only matched the
+// one reader.go uses today would silently skip a future reason and so fail
+// OPEN — the same vacuity the caller exists to prevent:
+//
+//	const ReasonX UnavailableReason = "x"     // typed spec, string BasicLit
+//	const ReasonX = UnavailableReason("x")    // conversion CallExpr, untyped spec
+//
+// Const blocks carry the preceding spec's type forward when a later spec omits
+// it, so lastType tracks that carry-over. VAR blocks are swept alongside CONST
+// for the same reason. Both the unqualified Ident (in-package, where reader.go
+// declares them) and a qualified SelectorExpr (a sibling package declaring one
+// as workmgmt.UnavailableReason) are matched as the type, so moving the
+// declarations does not silently empty the sweep.
+//
+// Residual, stated rather than implied: a value built from an expression that
+// is neither a string literal nor a conversion of one — a concatenation, or a
+// reference to another constant — is still skipped. Such a declaration would
+// have to clear the caller's vacuity floor to go unnoticed, and the escape is
+// the same one this helper closes: extend the accepted styles here.
+func collectReasonsFromFile(f *ast.File, path string, found map[string]string) error {
+	const typeName = "UnavailableReason"
+
+	isReasonType := func(e ast.Expr) bool {
+		switch v := e.(type) {
+		case *ast.Ident:
+			return v.Name == typeName
+		case *ast.SelectorExpr:
+			return v.Sel != nil && v.Sel.Name == typeName
+		}
+		return false
+	}
+
+	// stringLit unquotes a string BasicLit, reporting whether e was one.
+	stringLit := func(e ast.Expr) (string, bool, error) {
+		lit, ok := e.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return "", false, nil
+		}
+		val, uerr := strconv.Unquote(lit.Value)
+		if uerr != nil {
+			return "", false, uerr
+		}
+		return val, true, nil
+	}
+
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || (gd.Tok != token.CONST && gd.Tok != token.VAR) {
+			continue
+		}
+		var lastType ast.Expr
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			if vs.Type != nil {
+				lastType = vs.Type
+			}
+			typed := lastType != nil && isReasonType(lastType)
+			for _, v := range vs.Values {
+				// Style 2: an explicit conversion, which carries its own
+				// type and so needs no typed spec.
+				if call, isCall := v.(*ast.CallExpr); isCall {
+					if !isReasonType(call.Fun) || len(call.Args) != 1 {
+						continue
+					}
+					val, isStr, err := stringLit(call.Args[0])
+					if err != nil {
+						return err
+					}
+					if isStr {
+						found[val] = path
+					}
+					continue
+				}
+				// Style 1: a string literal under a spec typed (or
+				// type-carrying) as UnavailableReason.
+				if !typed {
+					continue
+				}
+				val, isStr, err := stringLit(v)
+				if err != nil {
+					return err
+				}
+				if isStr {
+					found[val] = path
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // TestBoardCapabilityMatrixDocumentsEveryDeclaredUnavailableReason is the
@@ -1310,12 +1364,68 @@ func TestBoardCapabilityMatrixDocumentsEveryDeclaredUnavailableReason(t *testing
 			"the AST walk is likely broken and this test would false-pass", len(declared), minDeclared)
 	}
 
+	// The containment check is a SUBSTRING match, which is sufficient for the
+	// machine-generated snake_case values this sweep collects but is not a
+	// structural one: a reason value that happened to appear in unrelated
+	// prose would satisfy it. Stated so the guarantee is not read as stronger
+	// than it is.
+	//
 	// sortedKeys is apply.go's existing helper, reused so the failure
 	// output is deterministic across map iterations.
 	for _, reason := range sortedKeys(declared) {
 		if !strings.Contains(doc, reason) {
 			t.Errorf("UnavailableReason %q (declared in %s) is absent from %s — every degradation reason must carry a row in the capability matrix",
 				reason, declared[reason], boardCapabilityMatrixPath)
+		}
+	}
+}
+
+// TestCollectReasonsFromFileAcceptsBothDeclarationStyles pins the DECLARATION
+// STYLES the drift sweep above accepts. Without it the sweep is only ever
+// exercised against reader.go, so its BasicLit-only behaviour before this test
+// existed looked correct while silently skipping a reason declared as a
+// conversion — a fail-OPEN in the very guard the drift test is named for.
+//
+// The synthetic source declares one reason in each accepted style plus two
+// non-reason constants that must NOT be collected, so the test discriminates
+// against a sweep that simply harvests every string constant.
+func TestCollectReasonsFromFileAcceptsBothDeclarationStyles(t *testing.T) {
+	const src = `package workmgmt
+
+type UnavailableReason string
+
+const (
+	ReasonTyped   UnavailableReason = "typed_style"
+	ReasonCarried                   = "carried_style"
+)
+
+const ReasonConverted = UnavailableReason("converted_style")
+
+var ReasonVarConverted = UnavailableReason("var_converted_style")
+
+const NotAReason = "unrelated_constant"
+
+const AlsoNotAReason SomeOtherType = "other_typed_constant"
+`
+
+	f, err := parser.ParseFile(token.NewFileSet(), "synthetic.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic source: %v", err)
+	}
+
+	found := map[string]string{}
+	if err := collectReasonsFromFile(f, "synthetic.go", found); err != nil {
+		t.Fatalf("collectReasonsFromFile: %v", err)
+	}
+
+	for _, want := range []string{"typed_style", "carried_style", "converted_style", "var_converted_style"} {
+		if _, ok := found[want]; !ok {
+			t.Errorf("declared reason %q was not collected; the sweep skips this declaration style and would fail OPEN on a future reason written that way (collected: %v)", want, sortedKeys(found))
+		}
+	}
+	for _, unwanted := range []string{"unrelated_constant", "other_typed_constant"} {
+		if _, ok := found[unwanted]; ok {
+			t.Errorf("non-reason constant %q was collected; the sweep is harvesting every string constant rather than UnavailableReason declarations", unwanted)
 		}
 	}
 }
