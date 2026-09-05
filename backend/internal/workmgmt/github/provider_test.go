@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"net/http"
@@ -69,6 +70,17 @@ type fakeAPI struct {
 
 	subParent, subChild string
 	subErr              error
+
+	// issueParents maps issue number -> its structural sub-issue PARENT number,
+	// the direction ListSubIssues walks the other way. IssueParent reads it, and
+	// AddSubIssue RECORDS into it (resolving the parent node id back through
+	// nodeIDs) so a re-apply observes the link exactly as the real forge does —
+	// the fake mirrors a SHIPPED write and nothing more (#2237's
+	// statefulGroomingForge lesson). issueParentErr, when set, is returned by
+	// IssueParent for every number (the forge-refusal / transport branch).
+	issueParents      map[int]int
+	issueParentErr    error
+	issueParentNumber int
 
 	listSubParent  string
 	listSubResults []githubclient.SubIssue
@@ -247,7 +259,47 @@ func (f *fakeAPI) SetProjectItemSingleSelect(ctx context.Context, _ forge.Creden
 
 func (f *fakeAPI) AddSubIssue(_ context.Context, _ forge.CredentialScope, parentNodeID, childNodeID string) error {
 	f.subParent, f.subChild = parentNodeID, childNodeID
-	return f.subErr
+	if f.subErr != nil {
+		return f.subErr
+	}
+	// Record the edge into issueParents so a re-apply's IssueParent observes it,
+	// exactly as the real forge would. Resolve BOTH node ids back to their issue
+	// numbers through nodeIDs (the inverse of IssueNodeID), so a genuinely
+	// missing edge stays missing and only a real write shows up on the read side.
+	child, childOK := f.numberForNode(childNodeID)
+	parent, parentOK := f.numberForNode(parentNodeID)
+	if childOK && parentOK {
+		if f.issueParents == nil {
+			f.issueParents = map[int]int{}
+		}
+		f.issueParents[child] = parent
+	}
+	return nil
+}
+
+// numberForNode inverts nodeIDs: node id -> issue number. It lets AddSubIssue
+// record the structural edge in the same number-keyed shape IssueParent reads.
+func (f *fakeAPI) numberForNode(nodeID string) (int, bool) {
+	for n, id := range f.nodeIDs {
+		if id == nodeID {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+// IssueParent resolves the structural sub-issue parent, mirroring
+// *githubclient.Client.IssueParent: a number with no recorded parent (or a
+// recorded parent <= 0) is the NORMAL nil answer, not a failure.
+func (f *fakeAPI) IssueParent(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) (*githubclient.IssueParent, error) {
+	f.issueParentNumber = number
+	if f.issueParentErr != nil {
+		return nil, f.issueParentErr
+	}
+	if parent, ok := f.issueParents[number]; ok && parent > 0 {
+		return &githubclient.IssueParent{Number: parent, Title: fmt.Sprintf("epic #%d", parent)}, nil
+	}
+	return nil, nil
 }
 
 func (f *fakeAPI) ListSubIssues(_ context.Context, _ forge.CredentialScope, parentNodeID string) ([]githubclient.SubIssue, error) {
@@ -296,6 +348,14 @@ func (f *fakeAPI) GetIssue(_ context.Context, _ forge.CredentialScope, _ githubc
 }
 
 func (f *fakeAPI) ProjectsTokenConfigured() bool { return f.projectsTokenConfigured }
+
+// noIssueParentAPI satisfies API by embedding it and deliberately does NOT
+// implement the optional issueParentReader extension — its promoted method set
+// is exactly API's, so IssueParent is absent and the reader/mutator must refuse
+// with ReasonNotImplemented rather than fall back to the body marker (#2952).
+// Mirrors noLabelAdderAPI. The embedded value is nil because no method is
+// reached: the refusal is decided by the failed type assertion before any call.
+type noIssueParentAPI struct{ API }
 
 func baseRequest() workmgmt.ProviderRequest {
 	return workmgmt.ProviderRequest{

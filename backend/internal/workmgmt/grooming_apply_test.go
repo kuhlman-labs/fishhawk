@@ -279,15 +279,22 @@ func (f *statefulGroomingForge) ApplyGroomingMutation(_ context.Context, req Gro
 	case GroomingKindLabelSet:
 		it.Labels = append(it.Labels, req.After.List...)
 	case GroomingKindEpicLink:
-		// ensureParentEpicMarker returns a body that ALREADY carries a marker
-		// UNCHANGED, and groomingLinkEpic reports that as a provider SKIP. The
-		// fake must do the same: appending a second marker line here would
-		// persist something production does not.
-		if bodyCarriesMarker(it.Body, "Parent epic:") {
-			return &GroomingMutationResult{Skipped: true, SkipReason: "parent epic marker already present"}, nil
+		// IDEMPOTENCE IS THE STRUCTURAL PARENT (#2952), not the marker. The real
+		// provider skips when the sub-issue edge already records the proposed
+		// parent; the fake mirrors that by keying on ParentRef, which its own
+		// AddSubIssue-equivalent write below sets. A body-marked-but-unlinked
+		// item (empty ParentRef with a marker present) is precisely the case that
+		// must NOT skip — the marker is a rendering, not the relationship.
+		want := "#" + strings.TrimPrefix(strings.TrimSpace(req.After.Scalar), "#")
+		if it.ParentRef == want {
+			return &GroomingMutationResult{Skipped: true, SkipReason: "parent epic already linked"}, nil
 		}
-		// Normalized to `#N`, as renderParentEpicMarker does.
-		it.Body += "\nParent epic: #" + strings.TrimPrefix(strings.TrimSpace(req.After.Scalar), "#")
+		// The write persists the STRUCTURAL edge (what AddSubIssue does) and
+		// stamps the marker only when absent (branch 4/5 of groomingLinkEpic).
+		it.ParentRef = want
+		if !bodyCarriesMarker(it.Body, "Parent epic:") {
+			it.Body += "\nParent epic: " + want
+		}
 	case GroomingKindDependsOnAdd:
 		// ADDITIVE, mirroring the provider's appendDependsOnRef (#2860): a
 		// second edge out of the same item MERGES into the existing marker
@@ -1473,6 +1480,173 @@ func TestApplyGrooming_ReApplyingAnAppliedReportIsANoOp(t *testing.T) {
 	}
 }
 
+// TestApplyGrooming_EpicLinkStructuralParentDecidesIdempotence is the #2952
+// core done-means: epic_link idempotence is decided by the STRUCTURAL parent,
+// not the body marker. A body-marked-but-structurally-unlinked item (#819/#821/
+// #930) dispatches; a structurally-linked one is already_applied. The divergent
+// `before` — structural parent empty, marker naming the ref — is reported so the
+// divergence is visible in the audit rather than collapsed.
+func TestApplyGrooming_EpicLinkStructuralParentDecidesIdempotence(t *testing.T) {
+	epic := hygieneEntry(1, "unlinked_parent_epic", "#389")
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{epic}}
+
+	// The #819 shape: the body carries `Parent epic: #389`, but there is NO
+	// structural sub-issue edge (ParentRef empty). It must DISPATCH, not skip.
+	t.Run("body marker without the structural edge dispatches", func(t *testing.T) {
+		mut := &fakeGroomingMutator{}
+		reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+			"#1": {Number: 1, State: "open", Body: "Summary\n\nParent epic: #389"},
+		}}
+		res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+			Target:    groomingTarget(),
+			Report:    report,
+			Decisions: approveAll(report),
+			Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+			States:    groomingStates(),
+		})
+		if err != nil {
+			t.Fatalf("ApplyGrooming: %v", err)
+		}
+		if len(mut.calls) != 1 {
+			t.Fatalf("dispatched %d, want exactly ONE — a body marker without the structural edge is NOT already_applied", len(mut.calls))
+		}
+		rec := recordFor(t, res, epic.ID)
+		if !rec.IdempotenceChecked {
+			t.Error("IdempotenceChecked = false, want the structural diff to have run")
+		}
+		if rec.Before.Scalar != "" {
+			t.Errorf("before.scalar = %q, want empty — there is no structural parent", rec.Before.Scalar)
+		}
+		if len(rec.Before.List) != 1 || rec.Before.List[0] != "#389" {
+			t.Errorf("before.list = %v, want [#389] — the body marker, reported SEPARATELY from the structural parent", rec.Before.List)
+		}
+	})
+
+	// True idempotence: the structural parent IS the proposed one -> zero dispatch.
+	t.Run("structural parent already set is already_applied", func(t *testing.T) {
+		mut := &fakeGroomingMutator{}
+		reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+			"#1": {Number: 1, State: "open", Body: "Summary\n\nParent epic: #389", ParentRef: "#389", ParentResolved: true},
+		}}
+		res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+			Target:    groomingTarget(),
+			Report:    report,
+			Decisions: approveAll(report),
+			Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+			States:    groomingStates(),
+		})
+		if err != nil {
+			t.Fatalf("ApplyGrooming: %v", err)
+		}
+		if len(mut.calls) != 0 {
+			t.Fatalf("dispatched %d, want ZERO — the structural parent already records the proposal: %+v", len(mut.calls), mut.calls)
+		}
+		rec := recordFor(t, res, epic.ID)
+		if rec.Outcome != GroomingOutcomeSkipped || rec.SkipReason != GroomingSkipAlreadyApplied {
+			t.Errorf("record outcome=%q reason=%q, want skipped/%s", rec.Outcome, rec.SkipReason, GroomingSkipAlreadyApplied)
+		}
+		if rec.Before.Scalar != "#389" {
+			t.Errorf("before.scalar = %q, want #389 — the structural parent is the authority", rec.Before.Scalar)
+		}
+	})
+}
+
+// TestApplyGrooming_EpicLinkReadRequestsTheStructuralParent proves the extra
+// round trip is scoped to epic_link ONLY (#2952): the read for an epic_link
+// candidate carries ResolveParent, and no other kind's read does.
+func TestApplyGrooming_EpicLinkReadRequestsTheStructuralParent(t *testing.T) {
+	epic := hygieneEntry(1, "unlinked_parent_epic", "#389")
+	label := hygieneEntry(4, "missing_label_namespace", "area:api")
+	board := hygieneEntry(5, "unboarded", "Backlog")
+	dep := dependencyEntry(2, 3)
+	report := &plan.GroomingReport{
+		HygieneDefects:  []plan.HygieneDefect{epic, label, board},
+		DependencyEdges: []plan.DependencyEdge{dep},
+	}
+	reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+		"#1": {Number: 1, State: "open", Body: "Summary"},
+		"#2": {Number: 2, State: "open", Body: "Summary"},
+		"#4": {Number: 4, State: "open"},
+		"#5": {Number: 5, State: "open", OnBoard: false},
+	}}
+	if _, err := ApplyGrooming(context.Background(), &fakeGroomingMutator{}, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+		Target:    groomingTarget(),
+		Report:    report,
+		Decisions: approveAll(report),
+		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:    groomingStates(),
+	}); err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	sawEpicRead := false
+	for _, rd := range reader.reads {
+		if rd.Ref == "#1" { // the epic_link candidate
+			sawEpicRead = true
+			if !rd.ResolveParent {
+				t.Errorf("epic_link read %+v did NOT request the structural parent", rd)
+			}
+			continue
+		}
+		if rd.ResolveParent {
+			t.Errorf("read for %q requested the structural parent; only epic_link should", rd.Ref)
+		}
+	}
+	if !sawEpicRead {
+		t.Errorf("the epic_link candidate was never read; reads = %+v", reader.reads)
+	}
+}
+
+// TestApplyGrooming_DependsOnAddIdempotenceUnchanged is the CONDITION-3
+// non-regression pin: splitting the shared epic_link/depends_on_add branch must
+// leave depends_on_add's already_applied behaviour exactly as it was — it keys
+// on BODY-MARKER membership (GitHub has no native depends_on edge), NOT on the
+// structural parent. A body already recording the proposed ref is already_applied
+// with ZERO dispatch; a body naming a DIFFERENT ref dispatches.
+func TestApplyGrooming_DependsOnAddIdempotenceUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		body         string
+		to           int
+		wantDispatch bool
+	}{
+		{"proposed ref already in the marker is already_applied", "Summary\n\nDepends on: #5", 5, false},
+		{"proposed ref absent from the marker dispatches", "Summary\n\nDepends on: #5", 6, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dep := dependencyEntry(1, tc.to)
+			report := &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{dep}}
+			mut := &fakeGroomingMutator{}
+			// ParentRef is deliberately UNSET: depends_on_add must not consult it.
+			reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
+				"#1": {Number: 1, State: "open", Body: tc.body},
+			}}
+			res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
+				Target:    groomingTarget(),
+				Report:    report,
+				Decisions: approveAll(report),
+				Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+				States:    groomingStates(),
+			})
+			if err != nil {
+				t.Fatalf("ApplyGrooming: %v", err)
+			}
+			rec := recordFor(t, res, dep.ID)
+			if tc.wantDispatch {
+				if len(mut.calls) != 1 || rec.Outcome != GroomingOutcomeApplied {
+					t.Fatalf("dispatched %d outcome=%q, want one dispatch / applied", len(mut.calls), rec.Outcome)
+				}
+				return
+			}
+			if len(mut.calls) != 0 {
+				t.Fatalf("dispatched %d, want ZERO — the marker already records the ref", len(mut.calls))
+			}
+			if rec.Outcome != GroomingOutcomeSkipped || rec.SkipReason != GroomingSkipAlreadyApplied {
+				t.Errorf("outcome=%q reason=%q, want skipped/%s", rec.Outcome, rec.SkipReason, GroomingSkipAlreadyApplied)
+			}
+		})
+	}
+}
+
 // TestApplyGrooming_MarkerRefShapeDoesNotDefeatIdempotence pins the other half
 // of the epic-link idempotence fix (#2237 review): the write and the read must
 // agree not only on WHERE the relationship is persisted but on its SHAPE.
@@ -1492,8 +1666,11 @@ func TestApplyGrooming_MarkerRefShapeDoesNotDefeatIdempotence(t *testing.T) {
 	}
 	mut := &fakeGroomingMutator{}
 	reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
-		// Already carrying the markers, in the '#N' shape the provider writes.
-		"#1": {Number: 1, State: "open", Body: "Summary\n\nParent epic: #1437"},
+		// epic_link now settles on the STRUCTURAL parent (#2952), so the
+		// already-applied epic row carries ParentRef, not merely the marker. The
+		// bare-ref proposal ("1437") must still match the normalized "#1437".
+		"#1": {Number: 1, State: "open", Body: "Summary\n\nParent epic: #1437", ParentRef: "#1437", ParentResolved: true},
+		// depends_on keeps its body-marker membership semantics UNCHANGED.
 		"#2": {Number: 2, State: "open", Body: "Summary\n\nDepends on: #3"},
 	}}
 	res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
@@ -1539,6 +1716,7 @@ func TestApplyGrooming_MarkerObservationMatchesTheProviderParse(t *testing.T) {
 		name         string
 		body         string
 		epicFix      string // non-empty selects the epic_link entry
+		parentRef    string // structural parent seeded on #1 for the epic rows (#2952)
 		depTo        int    // otherwise the depends_on edge target
 		wantDispatch bool
 	}{
@@ -1563,9 +1741,12 @@ func TestApplyGrooming_MarkerObservationMatchesTheProviderParse(t *testing.T) {
 			depTo: 5,
 		},
 		{
-			name:    "epic_link/upper-case marker, bare proposed ref",
-			body:    "Summary\n\nPARENT EPIC: #1437",
-			epicFix: "1437",
+			// epic_link now settles on the STRUCTURAL parent (#2952): a bare
+			// proposed ref must match the normalized `#N` structural parent.
+			name:      "epic_link/structural parent, bare proposed ref",
+			body:      "Summary\n\nPARENT EPIC: #1437",
+			epicFix:   "1437",
+			parentRef: "#1437",
 		},
 		{
 			name:         "depends_on/ref absent from the marker still dispatches",
@@ -1574,9 +1755,12 @@ func TestApplyGrooming_MarkerObservationMatchesTheProviderParse(t *testing.T) {
 			wantDispatch: true,
 		},
 		{
-			name:         "epic_link/different parent still dispatches",
+			// The structural parent is a DIFFERENT epic than the proposal, so the
+			// candidate dispatches even though the body marker names #1437.
+			name:         "epic_link/different structural parent still dispatches",
 			body:         "Summary\n\nParent epic: #1437",
 			epicFix:      "1438",
+			parentRef:    "#1437",
 			wantDispatch: true,
 		},
 	}
@@ -1595,7 +1779,7 @@ func TestApplyGrooming_MarkerObservationMatchesTheProviderParse(t *testing.T) {
 			}
 			mut := &fakeGroomingMutator{}
 			reader := &fakeGroomingReader{items: map[string]*WorkItemRecord{
-				"#1": {Number: 1, State: "open", Body: tc.body},
+				"#1": {Number: 1, State: "open", Body: tc.body, ParentRef: tc.parentRef, ParentResolved: tc.parentRef != ""},
 			}}
 			res, err := ApplyGrooming(context.Background(), mut, reader, &fakeGroomingSink{}, GroomingApplyRequest{
 				Target:    groomingTarget(),
