@@ -2184,7 +2184,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			res.Events = append(res.Events, fixupReportingObligationsEvent(cfg, selfReport.obligations))
 		}
 		// Counterfactual self-reports (#3042): carry the surviving
-		// {control_path, observed, restored} triples so the implement re-review
+		// {control_path, kind, observed, restored} quads (kind runner-DERIVED,
+		// #3107) so the implement re-review
 		// can weigh the agent's counterfactual CLAIM beside the runner's
 		// OBSERVED verify tail. EVIDENCE ONLY, same as the two siblings above —
 		// this block NEVER touches res.OK / res.FailureCategory / budget.
@@ -8992,6 +8993,13 @@ type fixupSelfReport struct {
 // honestly reported it did not restore the control. The pointer keeps
 // absent/false distinguishable so validateFixupCounterfactuals can DROP the
 // absent case (missing_restored) while RETAINING the honest false.
+//
+// There is deliberately NO Kind member (#3107): the counterfactual `kind`
+// (production | test) is RUNNER-DERIVED from ControlPath by
+// classifyCounterfactualControlKind, never declared by the agent. That is what
+// makes the field trustworthy rather than a self-assessment — an agent that
+// writes `"kind":"test"` into the sidecar cannot influence the derived value,
+// because encoding/json ignores an object key with no corresponding struct field.
 type fixupCounterfactualReport struct {
 	ControlPath string `json:"control_path"`
 	Observed    string `json:"observed"`
@@ -9134,6 +9142,52 @@ func validateFixupObligationReports(cfg config, in []fixupObligationReport, logS
 	return out
 }
 
+// counterfactualKindProduction / counterfactualKindTest are the two literals the
+// runner-DERIVED counterfactual `kind` may carry (#3107).
+const (
+	counterfactualKindProduction = "production"
+	counterfactualKindTest       = "test"
+)
+
+// classifyCounterfactualControlKind derives, from a scope-member control path,
+// whether the control it names is a TEST-side guard (counterfactualKindTest) or a
+// PRODUCTION-side control (counterfactualKindProduction) (#3107). The reviewer
+// uses it to tell an EXPECTED green — a test-side guard, where deleting an
+// assertion cannot redden the test that holds it — from an ANOMALOUS green on a
+// production control that is not pinned.
+//
+// A path classifies `test` ONLY when its BASE NAME matches the closed, documented
+// set of unambiguous test-file shapes: `*_test.go` (Go), and
+// `*.test.ts` / `*.test.tsx` / `*.spec.ts` / `*.spec.tsx` (the vitest naming this
+// repo's frontend uses, e.g. frontend/src/App.test.tsx). EVERYTHING else is
+// `production`.
+//
+// This is a cheap first cut that covers the observed case and is deliberately NOT
+// airtight: a test helper living in a NON-test file (e.g. runner/internal/agent/fakes.go)
+// classifies `production`. The fail-safe direction is over-reporting — a
+// production control misclassified `test` would tell the reviewer a real green is
+// EXPECTED and SUPPRESS a genuine defect signal, whereas a test-side control
+// misclassified `production` merely draws the concern we already get today. So
+// when unsure, classify `production`.
+//
+// The match is on the base name (filepath.Base), not the whole path, so a
+// directory literally named `foo_test.go/` cannot flip a production file. Nothing
+// is lowercased: the repo's paths are case-exact and a case-insensitive match
+// would widen the `test` class — the unsafe direction.
+func classifyCounterfactualControlKind(path string) string {
+	base := filepath.Base(path)
+	switch {
+	case strings.HasSuffix(base, "_test.go"),
+		strings.HasSuffix(base, ".test.ts"),
+		strings.HasSuffix(base, ".test.tsx"),
+		strings.HasSuffix(base, ".spec.ts"),
+		strings.HasSuffix(base, ".spec.tsx"):
+		return counterfactualKindTest
+	default:
+		return counterfactualKindProduction
+	}
+}
+
 // maxFixupCounterfactuals bounds the retained counterfactual set (#3042). A
 // fix-up pass adds a handful of controls at most, so twenty is far above any
 // real set while keeping a pathological sidecar from growing the reviewer
@@ -9194,7 +9248,14 @@ func safeFixupCounterfactualPath(path string, scope map[string]struct{}) string 
 // controls every byte of that text, and carrying it over the trace bundle into
 // the reviewer's prompt would be an egress path for repository content that
 // never appears in the committed diff. What crosses the boundary is the
-// scope-member path, the closed observed enum, and the restored bool.
+// scope-member path, the RUNNER-DERIVED kind, the closed observed enum, and the
+// restored bool.
+//
+// The retained `kind` (production | test) is DERIVED here from the scope-member
+// path — AFTER the scope check — by classifyCounterfactualControlKind, and is
+// NEVER read from the sidecar (#3107): the decode struct carries no Kind member,
+// so no new agent-controlled string crosses the upload boundary. This
+// derived-not-declared property is the security-relevant half.
 //
 // Dropping is the SAFE direction: a dropped entry simply is not shown to the
 // reviewer, whereas admitting a malformed one would present an unvalidated
@@ -9239,11 +9300,19 @@ func validateFixupCounterfactuals(cfg config, in []fixupCounterfactualReport, sc
 			drop("missing_record")
 			continue
 		}
-		// Only the scope-member path, the observed literal and the restored
-		// bool are retained; the agent-authored record text is deliberately
-		// dropped on the floor here.
+		// Only the scope-member path, the RUNNER-DERIVED kind, the observed
+		// literal and the restored bool are retained; the agent-authored record
+		// text is deliberately dropped on the floor here. Kind is derived from
+		// the control path AFTER the scope-membership check above, so it is only
+		// ever computed from a path the operator already declared, and it is
+		// derived — never read from the sidecar (#3107): fixupCounterfactualReport
+		// carries no Kind member, so an agent-supplied `kind` key is ignored by
+		// encoding/json exactly as any other unknown key is. This single shared
+		// append site is reached by BOTH channels (loadFixupSelfReport and
+		// loadCounterfactualReport), so both get the field with no fork.
 		out = append(out, fixupCounterfactualEvidence{
 			ControlPath: e.ControlPath,
+			Kind:        classifyCounterfactualControlKind(e.ControlPath),
 			Observed:    e.Observed,
 			Restored:    *e.Restored,
 		})
@@ -10025,12 +10094,14 @@ func fixupReportingObligationsEvent(cfg config, entries []fixupReportingObligati
 // (#3042) into the trace bundle so composeGateEvidence folds them into
 // gate_evidence for the implement re-review's prompt.
 //
-// Each entry is {control_path, observed, restored} and NOTHING else, matching
-// the backend's bundle.FixupCounterfactualEvidence mirror. The agent's `record`
-// narrative is validated on the runner and discarded there
+// Each entry is {control_path, kind, observed, restored} and NOTHING else,
+// matching the backend's bundle.FixupCounterfactualEvidence mirror. The agent's
+// `record` narrative is validated on the runner and discarded there
 // (validateFixupCounterfactuals) rather than transmitted: it is agent-controlled
 // free text that would otherwise reach the reviewer's prompt without ever
-// appearing in the committed diff.
+// appearing in the committed diff. `kind` (production | test) is RUNNER-DERIVED
+// from the scope-member control path (#3107), never read from the sidecar, so it
+// adds no agent-controlled string to what crosses the upload boundary.
 func fixupCounterfactualsEvent(cfg config, entries []fixupCounterfactualEvidence) agent.Event {
 	return agent.Event{
 		Kind: "fixup_counterfactuals",

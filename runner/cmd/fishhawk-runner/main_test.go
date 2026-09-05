@@ -24699,6 +24699,110 @@ func TestValidateFixupCounterfactuals_RecordDiscarded(t *testing.T) {
 	}
 }
 
+// TestClassifyCounterfactualControlKind is the classifier table (#3107): one case
+// per named outcome. Each case's input is a literal path constructed
+// independently of the classifier, so a RED under the counterfactual deletion
+// (invert the production default) lands on the behavioral assertion, not on
+// fixture setup.
+func TestClassifyCounterfactualControlKind(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"go test file", "runner/cmd/fishhawk-runner/main_test.go", counterfactualKindTest},
+		{"frontend .test.tsx", "frontend/src/App.test.tsx", counterfactualKindTest},
+		{"frontend .spec.ts", "frontend/src/lib/x.spec.ts", counterfactualKindTest},
+		{"plain go production", "runner/cmd/fishhawk-runner/main.go", counterfactualKindProduction},
+		// The AMBIGUOUS case the issue names: a test HELPER living in a NON-test
+		// .go file classifies production — the deliberate, fail-safe residual.
+		{"test helper in non-test go file", "runner/internal/agent/fakes.go", counterfactualKindProduction},
+		// Base-name match, not whole-path: a directory literally named `_test.go/`
+		// must NOT flip a production file below it.
+		{"parent segment looks like a test file", "pkg/foo_test.go/impl.go", counterfactualKindProduction},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyCounterfactualControlKind(tc.path); got != tc.want {
+				t.Errorf("classifyCounterfactualControlKind(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateFixupCounterfactuals_StampsKind: every RETAINED entry carries the
+// runner-derived kind, one production path and one _test.go path in the same
+// declared scope.
+func TestValidateFixupCounterfactuals_StampsKind(t *testing.T) {
+	cfg := fixupReportCfg()
+	scope := []string{"runner/cmd/fishhawk-runner/main.go", "runner/cmd/fishhawk-runner/main_test.go"}
+	var logSink strings.Builder
+	got := validateFixupCounterfactuals(cfg, []fixupCounterfactualReport{
+		{ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red", Restored: boolPtr(true), Record: "prod guard deleted, went red"},
+		{ControlPath: "runner/cmd/fishhawk-runner/main_test.go", Observed: "green", Restored: boolPtr(true), Record: "test-side guard deleted, still green"},
+	}, scope, &logSink)
+	if len(got) != 2 {
+		t.Fatalf("retained = %+v, want both entries (log %q)", got, logSink.String())
+	}
+	if got[0].Kind != counterfactualKindProduction {
+		t.Errorf("entry 0 Kind = %q, want production", got[0].Kind)
+	}
+	if got[1].Kind != counterfactualKindTest {
+		t.Errorf("entry 1 Kind = %q, want test", got[1].Kind)
+	}
+}
+
+// TestValidateFixupCounterfactuals_AgentSuppliedKindIsIgnored is the
+// derived-not-declared control (#3107 condition 4): the sidecar entry carries an
+// agent-authored `"kind":"test"` on a PRODUCTION path, decoded from real JSON so
+// the (absent) decode-struct member is exercised, and the retained entry still
+// reads `production` — the runner derives kind, the agent cannot declare it.
+func TestValidateFixupCounterfactuals_AgentSuppliedKindIsIgnored(t *testing.T) {
+	cfg := fixupReportCfg()
+	var in []fixupCounterfactualReport
+	if err := json.Unmarshal([]byte(
+		`[{"control_path":"runner/cmd/fishhawk-runner/main.go","kind":"test","observed":"red","restored":true,"record":"prod guard deleted, went red"}]`,
+	), &in); err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	got := validateFixupCounterfactuals(cfg, in, cfScope(), &logSink)
+	if len(got) != 1 {
+		t.Fatalf("retained = %+v, want the well-formed entry retained", got)
+	}
+	if got[0].Kind != counterfactualKindProduction {
+		t.Errorf("Kind = %q, want production — an agent-supplied kind must be IGNORED and the runner value derived", got[0].Kind)
+	}
+}
+
+// TestCounterfactualKindReachesBothChannels drives the INITIAL-pass
+// (loadCounterfactualReport) and the FIX-UP-pass (loadFixupSelfReport) loaders,
+// asserting each stamps the runner-derived kind — the single shared append site
+// gives both channels the field with no fork.
+func TestCounterfactualKindReachesBothChannels(t *testing.T) {
+	// Fix-up channel.
+	cfg := fixupReportCfg()
+	writeFixupReportSidecar(t, cfg,
+		`{"run_id":"run-cccc","stage_id":"stage-dddd","verify_status":"passed","counterfactuals":[`+
+			`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true,"record":"r"}]}`)
+	var fuLog strings.Builder
+	fu := loadFixupSelfReport(cfg, cfScope(), &fuLog)
+	if len(fu.counterfactuals) != 1 || fu.counterfactuals[0].Kind != counterfactualKindProduction {
+		t.Fatalf("fix-up channel kind not stamped: %+v (log %q)", fu.counterfactuals, fuLog.String())
+	}
+
+	// Initial-pass channel.
+	icfg := cfReportCfg()
+	writeCounterfactualSidecarFile(t, icfg,
+		`{"run_id":"run-eeee","stage_id":"stage-ffff","counterfactuals":[`+
+			`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true,"record":"r"}]}`)
+	var ipLog strings.Builder
+	ip := loadCounterfactualReport(icfg, cfScope(), &ipLog)
+	if len(ip) != 1 || ip[0].Kind != counterfactualKindProduction {
+		t.Fatalf("initial-pass channel kind not stamped: %+v (log %q)", ip, ipLog.String())
+	}
+}
+
 // cfScopeN returns n DISTINCT declared-scope paths. The cap test needs identity
 // per entry, and the wire enums cannot supply it: {observed, restored} has only
 // six combinations, so a marker built from them alone repeats every six entries
@@ -25129,9 +25233,12 @@ func TestLoadCounterfactualReport_Valid(t *testing.T) {
 
 	var logSink strings.Builder
 	got := loadCounterfactualReport(cfg, cfScope(), &logSink)
+	// Both paths are production files, so the runner-derived kind is production on
+	// each — proof that the INITIAL-pass channel (loadCounterfactualReport) stamps
+	// kind, the complement to the fix-up channel proved elsewhere (#3107).
 	want := []fixupCounterfactualEvidence{
-		{ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red", Restored: true},
-		{ControlPath: "backend/internal/prompt/prompt.go", Observed: "green", Restored: false},
+		{ControlPath: "runner/cmd/fishhawk-runner/main.go", Kind: "production", Observed: "red", Restored: true},
+		{ControlPath: "backend/internal/prompt/prompt.go", Kind: "production", Observed: "green", Restored: false},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %+v, want %+v", got, want)

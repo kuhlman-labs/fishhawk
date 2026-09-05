@@ -716,9 +716,15 @@ func TestComposeGateEvidence_FixupReportingObligationsMalformedPayloadSkipped(t 
 // reviewer prompt). No import can cross the module seam, so a one-sided json-tag
 // edit fails on the other side — the same lockstep defense this file already
 // applies to fixup_reporting_obligations.
+// The second entry's path is a `_test.go` path ON PURPOSE (#3107): the shared
+// literal itself then exercises BOTH runner-derived kinds end to end — the runner
+// half asserts the real composer EMITS `kind`, the bundle half asserts it
+// DECODES, the server half asserts it RENDERS. The member order (control_path,
+// kind, observed, restored) is the exact order encoding/json emits from the
+// struct field order.
 const fixupCounterfactualsWireFixture = `"fixup_counterfactuals":[` +
-	`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true},` +
-	`{"control_path":"backend/internal/prompt/prompt.go","observed":"green","restored":false}]`
+	`{"control_path":"runner/cmd/fishhawk-runner/main.go","kind":"production","observed":"red","restored":true},` +
+	`{"control_path":"backend/internal/prompt/prompt_test.go","kind":"test","observed":"green","restored":false}]`
 
 // TestFixupCounterfactuals_SelfReportToWire_EndToEnd is the RUNNER half of the
 // #3042 cross-boundary span (binding condition 2). It starts from the agent's
@@ -730,7 +736,7 @@ const fixupCounterfactualsWireFixture = `"fixup_counterfactuals":[` +
 // composer produced. The backend half consumes that exact literal.
 func TestFixupCounterfactuals_SelfReportToWire_EndToEnd(t *testing.T) {
 	cfg := config{runID: "run-cccc", stageID: "stage-dddd"}
-	scope := []string{"runner/cmd/fishhawk-runner/main.go", "backend/internal/prompt/prompt.go"}
+	scope := []string{"runner/cmd/fishhawk-runner/main.go", "backend/internal/prompt/prompt_test.go"}
 
 	dir := t.TempDir()
 	orig := fixupSelfReportDir
@@ -746,8 +752,8 @@ func TestFixupCounterfactuals_SelfReportToWire_EndToEnd(t *testing.T) {
 	  "verify_status": "passed",
 	  "counterfactuals": [
 	    {"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true,
-	     "record":"deleted the scope-membership check; the drop test went red; restored"},
-	    {"control_path":"backend/internal/prompt/prompt.go","observed":"green","restored":false,
+	     "kind":"i-tried-to-declare-test","record":"deleted the scope-membership check; the drop test went red; restored"},
+	    {"control_path":"backend/internal/prompt/prompt_test.go","observed":"green","restored":false,
 	     "record":"deleted the render branch; the prompt test still passed"},
 	    {"control_path":"never/declared/elsewhere.go","observed":"red","restored":true,
 	     "record":"out of scope, must be dropped"}
@@ -783,9 +789,16 @@ func TestFixupCounterfactuals_SelfReportToWire_EndToEnd(t *testing.T) {
 	}
 	p := decodeEvidence(t, ev)
 	if len(p.FixupCounterfactuals) != 2 ||
-		p.FixupCounterfactuals[0] != (fixupCounterfactualEvidence{ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red", Restored: true}) ||
-		p.FixupCounterfactuals[1] != (fixupCounterfactualEvidence{ControlPath: "backend/internal/prompt/prompt.go", Observed: "green", Restored: false}) {
-		t.Errorf("FixupCounterfactuals = %+v, want the two validated triples", p.FixupCounterfactuals)
+		p.FixupCounterfactuals[0] != (fixupCounterfactualEvidence{ControlPath: "runner/cmd/fishhawk-runner/main.go", Kind: "production", Observed: "red", Restored: true}) ||
+		p.FixupCounterfactuals[1] != (fixupCounterfactualEvidence{ControlPath: "backend/internal/prompt/prompt_test.go", Kind: "test", Observed: "green", Restored: false}) {
+		t.Errorf("FixupCounterfactuals = %+v, want the two validated quads with runner-derived kind", p.FixupCounterfactuals)
+	}
+	// Derived-not-declared, proven end to end: the first sidecar entry tried to
+	// declare its own `"kind"` on a PRODUCTION path, yet the emitted evidence
+	// reads `kind:production` — the agent-supplied value was ignored.
+	if p.FixupCounterfactuals[0].Kind != "production" {
+		t.Errorf("agent-supplied kind must be ignored; got %q, want the runner-derived production",
+			p.FixupCounterfactuals[0].Kind)
 	}
 }
 

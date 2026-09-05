@@ -285,7 +285,7 @@ pattern); assembly details in `backend/internal/planreview/README.md`: operator-
 (#695/#581), machine-verified `gate_evidence` (#963, with `superseded` verify-run marking #1205, drift A/B
 categories #991, fix-up self-report divergence #1210), fix-up re-review evidence (E68.20 / #3042 — the push-report
 dispatch loads the stage's own bundle via `resolveStageGateEvidence`, or names why it could not; plus the agent's
-counterfactual CLAIM triples, rendered under weaker authority than the runner's OBSERVED verify tail — a channel
+counterfactual quads — three members an agent CLAIM under weaker authority than the runner's OBSERVED verify tail, the fourth `kind` runner-DERIVED and carrying the runner's own authority (E64.13 / #3107) — a channel
 the INITIAL implement pass carries too since E68.9 / #2929, via its own keyed sidecar on the exactly
 complementary runner branch, plus implement-review standing rule 8 naming what the diff-only reviewer cannot
 see), binding

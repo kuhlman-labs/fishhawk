@@ -9486,9 +9486,12 @@ func TestEmitReviewDiffTruncated_NilAuditRepo_NoPanic(t *testing.T) {
 // RENDERED reviewer prompt, so the two halves join on identical bytes and
 // neither side hand-writes the evidence shape. No import can cross the module
 // seam, so a one-sided json-tag edit fails on the other side.
+// The second entry's path is a `_test.go` path so the shared literal carries
+// BOTH runner-derived kinds (#3107); member order (control_path, kind, observed,
+// restored) is encoding/json's struct-field order.
 const fixupCounterfactualsWireFixture = `"fixup_counterfactuals":[` +
-	`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true},` +
-	`{"control_path":"backend/internal/prompt/prompt.go","observed":"green","restored":false}]`
+	`{"control_path":"runner/cmd/fishhawk-runner/main.go","kind":"production","observed":"red","restored":true},` +
+	`{"control_path":"backend/internal/prompt/prompt_test.go","kind":"test","observed":"green","restored":false}]`
 
 // buildFixupReReviewBundle builds a gzipped JSONL redacted trace bundle whose
 // gate_evidence event carries a committed-tree verify run + verify summary
@@ -9496,11 +9499,20 @@ const fixupCounterfactualsWireFixture = `"fixup_counterfactuals":[` +
 // uploads before its push report reaches the backend (#794 forward gate).
 func buildFixupReReviewBundle(t *testing.T) []byte {
 	t.Helper()
+	return buildFixupReReviewBundleWithCounterfactuals(t, fixupCounterfactualsWireFixture)
+}
+
+// buildFixupReReviewBundleWithCounterfactuals is buildFixupReReviewBundle
+// parameterized on the `fixup_counterfactuals` JSON body, so a test can drive an
+// OLDER bundle whose counterfactual rows carry NO `kind` member (#3107 condition
+// 3) through the same decode→map→render path.
+func buildFixupReReviewBundleWithCounterfactuals(t *testing.T, counterfactualsJSON string) []byte {
+	t.Helper()
 	gate := `{"scope_facts":{"declared_files":1},` +
 		`"verify_runs":[{"command":"scripts/test verify","exit_code":0,"outcome":"passed",` +
 		`"output_tail":"ok  github.com/example/pkg\nFIXUP_VERIFY_TAIL_SENTINEL"}],` +
 		`"verify_summary":{"outcome":"passed","iterations":2,"max_iterations":3},` +
-		fixupCounterfactualsWireFixture + `}`
+		counterfactualsJSON + `}`
 	type line struct {
 		Seq  int             `json:"seq"`
 		Kind string          `json:"kind"`
@@ -9591,10 +9603,12 @@ func TestBackstopFixupReReview_GateEvidence_EndToEnd(t *testing.T) {
 		"FIXUP_VERIFY_TAIL_SENTINEL",
 		"Verify summary: outcome=passed (iterations 2/3)",
 		// Half B: the agent's CLAIMED counterfactual rows, under their own
-		// explicitly weaker authority framing.
+		// explicitly weaker authority framing. Each row carries the
+		// runner-DERIVED kind suffix appended at the row's end (#3107) —
+		// pinned in full here so a drift in either the path or the kind fails.
 		"### Counterfactual self-report (agent CLAIM — not a runner observation)",
-		"- runner/cmd/fishhawk-runner/main.go — observed: red, restored: yes",
-		"- backend/internal/prompt/prompt.go — observed: green, restored: NO",
+		"- runner/cmd/fishhawk-runner/main.go — observed: red, restored: yes, kind: production",
+		"- backend/internal/prompt/prompt_test.go — observed: green, restored: NO, kind: test",
 		"The verify runs above are what the RUNNER MEASURED",
 		"`observed: red` does NOT establish that the control discriminates",
 	} {
@@ -9649,13 +9663,13 @@ func TestBackstopFixupReReview_NoBundle_RendersNamedAbsence(t *testing.T) {
 func TestGateEvidenceForReview_MapsFixupCounterfactuals(t *testing.T) {
 	got := gateEvidenceForReview(bundle.GateEvidence{
 		FixupCounterfactuals: []bundle.FixupCounterfactualEvidence{
-			{ControlPath: "a/guard.go", Observed: "red", Restored: true},
-			{ControlPath: "b/guard.go", Observed: "green", Restored: false},
+			{ControlPath: "a/guard.go", Kind: "production", Observed: "red", Restored: true},
+			{ControlPath: "b/guard_test.go", Kind: "test", Observed: "green", Restored: false},
 		},
 	}, nil)
 	want := []prompt.GateFixupCounterfactual{
-		{ControlPath: "a/guard.go", Observed: "red", Restored: true},
-		{ControlPath: "b/guard.go", Observed: "green", Restored: false},
+		{ControlPath: "a/guard.go", Kind: "production", Observed: "red", Restored: true},
+		{ControlPath: "b/guard_test.go", Kind: "test", Observed: "green", Restored: false},
 	}
 	if len(got.FixupCounterfactuals) != len(want) {
 		t.Fatalf("FixupCounterfactuals = %+v, want %+v", got.FixupCounterfactuals, want)
@@ -10504,8 +10518,8 @@ func TestCounterfactualsWireToPrompt_PassAgnostic_EndToEnd(t *testing.T) {
 		t.Fatalf("resolveStageGateEvidence returned no evidence (reason=%q)", reason)
 	}
 	want := []prompt.GateFixupCounterfactual{
-		{ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red", Restored: true},
-		{ControlPath: "backend/internal/prompt/prompt.go", Observed: "green", Restored: false},
+		{ControlPath: "runner/cmd/fishhawk-runner/main.go", Kind: "production", Observed: "red", Restored: true},
+		{ControlPath: "backend/internal/prompt/prompt_test.go", Kind: "test", Observed: "green", Restored: false},
 	}
 	if !reflect.DeepEqual(ev.FixupCounterfactuals, want) {
 		t.Fatalf("FixupCounterfactuals = %+v, want %+v", ev.FixupCounterfactuals, want)
@@ -10525,8 +10539,11 @@ func TestCounterfactualsWireToPrompt_PassAgnostic_EndToEnd(t *testing.T) {
 	for _, w := range []string{
 		"### Counterfactual self-report (agent CLAIM — not a runner observation)",
 		"For each control this pass added or tightened",
-		"- runner/cmd/fishhawk-runner/main.go — observed: red, restored: yes",
-		"- backend/internal/prompt/prompt.go — observed: green, restored: NO",
+		"- runner/cmd/fishhawk-runner/main.go — observed: red, restored: yes, kind: production",
+		"- backend/internal/prompt/prompt_test.go — observed: green, restored: NO, kind: test",
+		// The kind-conditioned reading reaches the rendered prompt: a test-side
+		// green is EXPECTED, not a defect signal.
+		"For a `kind: test` row a `green` is the EXPECTED outcome",
 		"The verify runs above are what the RUNNER MEASURED",
 		// Standing rule 8: the reviewer is told where structured evidence
 		// lives AND that PR-body evidence is not in its material.
@@ -10539,6 +10556,57 @@ func TestCounterfactualsWireToPrompt_PassAgnostic_EndToEnd(t *testing.T) {
 	}
 	if strings.Contains(got, "### Fix-up counterfactual self-report") {
 		t.Errorf("the old fix-up-only title must not survive on the wire path:\n%s", got)
+	}
+}
+
+// TestCounterfactualsWireToPrompt_OlderBundleNoKind_RowUnchanged is #3107
+// condition 3: the empty-kind RENDER case is driven from a DECODED BUNDLE FIXTURE
+// that LACKS the `kind` member — not a struct literal with Kind:"" — so the
+// load-bearing "older bundles decode a missing member to the zero value"
+// assumption is exercised on the SAME decode→map→render path the assertion
+// checks. The contract is ROW-level (condition 1): the legacy row renders EXACTLY
+// as it did before the field existed, carrying NO kind annotation, even though the
+// surrounding block's prose now explains kind semantics.
+func TestCounterfactualsWireToPrompt_OlderBundleNoKind_RowUnchanged(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	// An OLDER runner's bundle: counterfactual rows with NO `kind` member.
+	const noKind = `"fixup_counterfactuals":[` +
+		`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"green","restored":true}]`
+	hash := strings.Repeat("f", 64)
+	s.cfg.TraceStore = &priorDiffTraceStore{body: buildFixupReReviewBundleWithCounterfactuals(t, noKind)}
+	seedTraceUploaded(t, au, runRow.ID, implStage.ID, hash)
+
+	ev, reason := s.resolveStageGateEvidence(context.Background(), runRow.ID, implStage.ID)
+	if ev == nil {
+		t.Fatalf("resolveStageGateEvidence returned no evidence (reason=%q)", reason)
+	}
+	// The missing member decoded to the empty string on the real path.
+	if len(ev.FixupCounterfactuals) != 1 || ev.FixupCounterfactuals[0].Kind != "" {
+		t.Fatalf("older-bundle counterfactual should decode to empty Kind, got %+v", ev.FixupCounterfactuals)
+	}
+
+	got, err := prompt.Build("implement_review", prompt.Trigger{
+		Repo:         "kuhlman-labs/example",
+		IssueNumber:  3107,
+		IssueTitle:   "older bundle without kind",
+		ApprovedPlan: &plan.Plan{PlanVersion: "standard_v1", Summary: "older-bundle back-compat"},
+		Diff:         "- M runner/cmd/fishhawk-runner/main.go\n",
+		GateEvidence: ev,
+	})
+	if err != nil {
+		t.Fatalf("prompt.Build: %v", err)
+	}
+	// ROW-level back-compat: pin the EXACT legacy row text — no `, kind:` suffix.
+	const legacyRow = "- runner/cmd/fishhawk-runner/main.go — observed: green, restored: yes\n"
+	if !strings.Contains(got, legacyRow) {
+		t.Errorf("older-bundle row must render byte-identically to the pre-#3107 format %q:\n%s", legacyRow, got)
+	}
+	// The row itself must carry no kind annotation. Assert against the row line,
+	// NOT a whole-block absence check — the block prose legitimately says `kind:`.
+	if strings.Contains(got, "restored: yes, kind:") {
+		t.Errorf("older-bundle row must carry no kind suffix:\n%s", got)
 	}
 }
 

@@ -1520,9 +1520,12 @@ func TestExtractGateEvidence_FixupReportingObligationCarriesNoAgentText(t *testi
 // composer is asserted to EMIT exactly this from the agent's raw self-report
 // JSON; here the backend is asserted to DECODE exactly this. No import can
 // cross the module seam, so a one-sided json-tag edit fails on the other side.
+// The second entry's path is a `_test.go` path so the shared literal carries
+// BOTH runner-derived kinds (#3107); member order (control_path, kind, observed,
+// restored) is encoding/json's struct-field order.
 const fixupCounterfactualsWireFixture = `"fixup_counterfactuals":[` +
-	`{"control_path":"runner/cmd/fishhawk-runner/main.go","observed":"red","restored":true},` +
-	`{"control_path":"backend/internal/prompt/prompt.go","observed":"green","restored":false}]`
+	`{"control_path":"runner/cmd/fishhawk-runner/main.go","kind":"production","observed":"red","restored":true},` +
+	`{"control_path":"backend/internal/prompt/prompt_test.go","kind":"test","observed":"green","restored":false}]`
 
 // TestExtractGateEvidence_DecodesFixupCounterfactuals is the backend half of the
 // #3042 lockstep pair: the shared literal decodes field-for-field, including the
@@ -1540,8 +1543,8 @@ func TestExtractGateEvidence_DecodesFixupCounterfactuals(t *testing.T) {
 		t.Fatalf("ExtractGateEvidence: %v", err)
 	}
 	want := []FixupCounterfactualEvidence{
-		{ControlPath: "runner/cmd/fishhawk-runner/main.go", Observed: "red", Restored: true},
-		{ControlPath: "backend/internal/prompt/prompt.go", Observed: "green", Restored: false},
+		{ControlPath: "runner/cmd/fishhawk-runner/main.go", Kind: "production", Observed: "red", Restored: true},
+		{ControlPath: "backend/internal/prompt/prompt_test.go", Kind: "test", Observed: "green", Restored: false},
 	}
 	if len(got.FixupCounterfactuals) != len(want) {
 		t.Fatalf("FixupCounterfactuals = %+v, want %+v", got.FixupCounterfactuals, want)

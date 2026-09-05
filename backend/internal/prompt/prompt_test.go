@@ -12693,6 +12693,81 @@ func TestWriteGateEvidence_FixupCounterfactuals_RenderPerObserved(t *testing.T) 
 	}
 }
 
+// TestWriteGateEvidence_FixupCounterfactuals_KindRender is the shipped-behavior
+// render test for the runner-derived kind (#3107). It pins, per case: the ROW
+// suffix, the kind-conditioned reading of a `green`, and — the load-bearing
+// back-compat contract (condition 1) — that an EMPTY or UNRECOGNISED kind renders
+// the ROW byte-identically to the pre-#3107 format, carrying NO kind annotation,
+// even though the surrounding block prose now explains kind semantics.
+func TestWriteGateEvidence_FixupCounterfactuals_KindRender(t *testing.T) {
+	const prodDefectSentence = "On a `kind: production` row"
+	const prodDefectTail = "the control is not pinned, and that is a defect signal worth naming"
+	const testExpectedLine = "For a `kind: test` row a `green` is the EXPECTED outcome"
+	const testDiscrimination = "BREAKING the production behaviour the guard protects"
+
+	t.Run("production", func(t *testing.T) {
+		got := implementReviewWithGateEvidence(t, &GateEvidence{
+			FixupCounterfactuals: []GateFixupCounterfactual{
+				{ControlPath: "a/guard.go", Kind: "production", Observed: "green", Restored: true},
+			},
+		})
+		if !strings.Contains(got, "- a/guard.go — observed: green, restored: yes, kind: production") {
+			t.Errorf("production row missing kind suffix:\n%s", got)
+		}
+		if !strings.Contains(got, prodDefectSentence) || !strings.Contains(got, prodDefectTail) {
+			t.Errorf("production-scoped defect-signal sentence missing:\n%s", got)
+		}
+	})
+
+	t.Run("test", func(t *testing.T) {
+		got := implementReviewWithGateEvidence(t, &GateEvidence{
+			FixupCounterfactuals: []GateFixupCounterfactual{
+				{ControlPath: "a/guard_test.go", Kind: "test", Observed: "green", Restored: true},
+			},
+		})
+		if !strings.Contains(got, "- a/guard_test.go — observed: green, restored: yes, kind: test") {
+			t.Errorf("test row missing kind suffix:\n%s", got)
+		}
+		if !strings.Contains(got, testExpectedLine) {
+			t.Errorf("kind:test 'green is EXPECTED' line missing:\n%s", got)
+		}
+		if !strings.Contains(got, testDiscrimination) {
+			t.Errorf("kind:test discrimination-by-breaking-production line missing:\n%s", got)
+		}
+	})
+
+	// (c) EMPTY kind and (d) UNRECOGNISED kind both take the UNCHANGED path: the
+	// ROW is byte-identical to the pre-#3107 format with NO kind suffix. Asserted
+	// on the ROW (condition 1), NOT a whole-block absence check — the block prose
+	// legitimately contains `kind:`.
+	for _, tc := range []struct {
+		name string
+		kind string
+	}{
+		{"empty", ""},
+		{"unrecognised", "flimflam"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := implementReviewWithGateEvidence(t, &GateEvidence{
+				FixupCounterfactuals: []GateFixupCounterfactual{
+					{ControlPath: "a/guard.go", Kind: tc.kind, Observed: "green", Restored: true},
+				},
+			})
+			const legacyRow = "- a/guard.go — observed: green, restored: yes\n"
+			if !strings.Contains(got, legacyRow) {
+				t.Errorf("row must render byte-identically to the pre-#3107 format %q:\n%s", legacyRow, got)
+			}
+			if strings.Contains(got, "restored: yes, kind:") {
+				t.Errorf("%s kind must render NO kind suffix on the row:\n%s", tc.name, got)
+			}
+			// The stricter reading still applies to an unclassified row.
+			if !strings.Contains(got, prodDefectSentence) {
+				t.Errorf("unclassified row must keep the stricter production reading:\n%s", got)
+			}
+		})
+	}
+}
+
 // TestWriteGateEvidence_FixupCounterfactuals_OmittedWhenEmpty: an empty slice
 // keeps the prompt byte-identical to the pre-change render.
 func TestWriteGateEvidence_FixupCounterfactuals_OmittedWhenEmpty(t *testing.T) {
@@ -12730,6 +12805,9 @@ func TestWriteFixupSelfReport_CounterfactualsInstruction(t *testing.T) {
 		"any entry past the first 20",
 		"`record` TEXT is checked on the runner and then discarded",
 		"\"counterfactuals\":[{\"control_path\"",
+		// The agent must NOT author kind (#3107): the runner derives it.
+		"Do NOT author a `kind` field",
+		"still report a TEST-side control",
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("fix-up self-report instruction missing %q:\n%s", w, got)
@@ -12872,6 +12950,9 @@ func TestBuild_Implement_CounterfactualSidecar_Rendered(t *testing.T) {
 		"an absent `restored` is NOT the same claim as `false`",
 		"any entry past the first 20",
 		"unwitnessed CLAIMS",
+		// The agent must NOT author kind (#3107): the runner derives it.
+		"Do NOT author a `kind` field",
+		"Still report a TEST-side control",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {

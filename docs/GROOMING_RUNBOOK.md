@@ -221,9 +221,11 @@ sidecar REACHES the reviewers. The committed-tree verify tail is attached automa
 from the fix-up stage's OWN uploaded bundle (or the round names the machine reason it
 could not be, so "no evidence attached" is never again an unresolvable agent-shaped
 concern), and counterfactual results ride the sidecar's `counterfactuals` array as
-`{control_path, observed, restored}` triples. Both the record narrative and the test name
-stay on the runner: only the triple crosses the upload boundary, and the reviewer is told
-plainly that it is an agent CLAIM, not a runner observation.
+`{control_path, kind, observed, restored}` quads, where `kind` (`production` | `test`) is
+DERIVED by the runner from `control_path` — the agent-facing decode struct carries no `kind`
+member, so the agent cannot declare it (E64.13 / #3107). Both the record narrative and the
+test name stay on the runner: only that quad crosses the upload boundary, and the reviewer is
+told plainly that the agent-supplied fields are a CLAIM, not a runner observation.
 
 ## 9. Open follow-ups
 

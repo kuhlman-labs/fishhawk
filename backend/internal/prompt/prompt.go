@@ -1104,8 +1104,14 @@ type GateEvidence struct {
 // agent's `record` text and discards it before the upload boundary (#2737's
 // rationale), so this carries nothing the operator's declared scope does not
 // already name.
+//
+// Kind is the runner-DERIVED classification of the control (production | test),
+// derived from ControlPath, never agent-authored (#3107). An older bundle
+// carries no kind and this is the empty string, which writeGateEvidence renders
+// exactly as it did before the field existed.
 type GateFixupCounterfactual struct {
 	ControlPath string
+	Kind        string
 	Observed    string
 	Restored    bool
 }
@@ -2380,6 +2386,10 @@ func writeCounterfactualSidecar(b *strings.Builder, t Trigger) {
 		"`record` TEXT is checked on the runner and then discarded — only `control_path`, `observed` and " +
 		"`restored` are transmitted — and the reviewer is told plainly that these are your unwitnessed CLAIMS, " +
 		"not runner observations.\n")
+	b.WriteString("- Do NOT author a `kind` field — the runner classifies each control (production or test) from " +
+		"its `control_path` and any `kind` you write is ignored. Still report a TEST-side control (an assertion " +
+		"you added to a test): silence would read as 'no control added', and the reviewer is told a `green` is " +
+		"EXPECTED for a test-side control, so carry the entry.\n")
 	b.WriteString("- This sidecar is ADVISORY evidence. It does NOT fail, re-open, or re-budget this pass — " +
 		"report truthfully.\n")
 }
@@ -2784,7 +2794,11 @@ func writeFixupSelfReport(b *strings.Builder, t Trigger) {
 		"`record` MUST be non-empty and holds what you mutated and what you observed. An entry breaking any of " +
 		"these rules is DROPPED, and so is any entry past the first 20. The `record` TEXT is checked on the " +
 		"runner and then discarded — only `control_path`, `observed` and `restored` are transmitted — and the " +
-		"reviewer is told plainly that these are your unwitnessed CLAIMS, not runner observations.\n")
+		"reviewer is told plainly that these are your unwitnessed CLAIMS, not runner observations. Do NOT author " +
+		"a `kind` field — the runner classifies each control (production or test) from its `control_path` and any " +
+		"`kind` you write is ignored; still report a TEST-side control (an assertion you added to a test), " +
+		"because silence would read as 'no control added' and the reviewer is told a `green` is EXPECTED for " +
+		"one.\n")
 	if len(t.FixupReportObligations) > 0 {
 		b.WriteString("- `obligations` MUST carry ONE entry per reporting obligation id listed in the section " +
 			"above — this same sidecar is the sanctioned record for them. Each entry is " +
@@ -5867,13 +5881,25 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		b.WriteString("### Counterfactual self-report (agent CLAIM — not a runner observation)\n\n")
 		b.WriteString("For each control this pass added or tightened, the agent reports below which " +
 			"declared-scope file it says it counterfactually tested (delete the control, re-run the guarding " +
-			"test), what it says it observed, and whether it says it restored the control.\n\n")
+			"test), what it says it observed, and whether it says it restored the control. Each row also carries " +
+			"the runner's classification of the control it names (`kind: production` or `kind: test`), derived " +
+			"from the file path — the agent does not author it.\n\n")
 		for _, cf := range ev.FixupCounterfactuals {
 			restored := "restored: yes"
 			if !cf.Restored {
 				restored = "restored: NO"
 			}
-			fmt.Fprintf(b, "- %s — observed: %s, %s\n", cf.ControlPath, cf.Observed, restored)
+			// Append the runner-derived classification to the END of the row.
+			// Appending — not inserting — keeps every existing row assertion a
+			// substring match, and renders the row BYTE-IDENTICAL to the
+			// pre-#3107 format when Kind is empty (an older bundle carrying no
+			// `kind`) or is not one of the two known literals: that older-bundle
+			// row carries NO kind annotation, exactly as it does today.
+			kindSuffix := ""
+			if cf.Kind == "production" || cf.Kind == "test" {
+				kindSuffix = ", kind: " + cf.Kind
+			}
+			fmt.Fprintf(b, "- %s — observed: %s, %s%s\n", cf.ControlPath, cf.Observed, restored, kindSuffix)
 		}
 		b.WriteString("\n")
 		b.WriteString("Read the authority of this block correctly, and do NOT confuse it with the verify " +
@@ -5885,11 +5911,16 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 			"treating it as machine-verified.\n\n")
 		b.WriteString("The agent's narrative of what it mutated and saw is deliberately NOT carried here: it is " +
 			"agent-authored free text, so it is validated on the runner and discarded rather than routed to you " +
-			"outside the committed diff. Judge each row against the diff. An `observed: green` row says the " +
+			"outside the committed diff. Judge each row against the diff. On a `kind: production` row — and on an " +
+			"UNCLASSIFIED row carrying no kind, which keeps this stricter reading — an `observed: green` says the " +
 			"agent deleted the control and the test still passed — the control is not pinned, and that is a " +
-			"defect signal worth naming. A `not_run` row says the counterfactual was never executed at all. A " +
-			"`restored: NO` row says the control may be missing from the committed tree — check the diff for it " +
-			"directly. This whole signal is ADVISORY: it did NOT fail, re-open, or re-budget the pass.\n\n")
+			"defect signal worth naming. For a `kind: test` row a `green` is the EXPECTED outcome and NOT a defect " +
+			"signal: deleting an assertion from a test cannot make that same test fail, it only makes it weaker, " +
+			"so the delete-observe-restore protocol asks a question whose only honest answer is green — " +
+			"discrimination for a test-side guard is instead shown by BREAKING the production behaviour the guard " +
+			"protects and confirming the guard fires. A `not_run` row says the counterfactual was never executed " +
+			"at all. A `restored: NO` row says the control may be missing from the committed tree — check the diff " +
+			"for it directly. This whole signal is ADVISORY: it did NOT fail, re-open, or re-budget the pass.\n\n")
 	}
 
 	if len(ev.FixupUnattemptedConcerns) > 0 || len(ev.FixupMentionedUntouchedFiles) > 0 {
