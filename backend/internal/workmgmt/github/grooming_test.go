@@ -526,6 +526,76 @@ func TestApplyGroomingMutation_EpicLinkWithoutTheParentPrimitiveIsRefused(t *tes
 	}
 }
 
+// TestApplyGroomingMutation_EpicLinkParentReadForbidden pins the mutator-side
+// forbidden branch (#2952 review): groomingLinkEpic resolves the STRUCTURAL
+// parent through its own IssueParent call, and a forge refusal there must be a
+// typed ReasonForbidden with the cause retained — NOT the generic wrap, and NOT
+// a fall-through to a write. This duplicates the mapping the reader path proves
+// in TestReadWorkItem_ResolveParentForbidden, but the mutator implements it
+// independently, so it needs its own pin: the parent read runs BEFORE any write,
+// so a lost ReasonForbidden here would change how a refused parent read is
+// audited with nothing reddening. The forbidden error is seeded BY
+// CONSTRUCTION via issueParentErr (not by calling the control under test), so
+// deleting the mapping lands the RED on the Reason assertion, not on setup.
+func TestApplyGroomingMutation_EpicLinkParentReadForbidden(t *testing.T) {
+	api := groomingAPI("Backlog", true)
+	api.issueParentErr = fmt.Errorf("read parent: %w", githubclient.ErrForbidden)
+
+	res, err := New(api).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
+	if res != nil {
+		t.Fatalf("result = %+v, want NIL alongside the refusal", res)
+	}
+	var unavailable *workmgmt.UnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("err = %v (%T), want *workmgmt.UnavailableError", err, err)
+	}
+	if unavailable.Reason != workmgmt.ReasonForbidden {
+		t.Errorf("Reason = %q, want %q", unavailable.Reason, workmgmt.ReasonForbidden)
+	}
+	if unavailable.Capability != workmgmt.GroomingCapability {
+		t.Errorf("Capability = %q, want %q", unavailable.Capability, workmgmt.GroomingCapability)
+	}
+	// The SAME value must still match the forge sentinel through Unwrap: a typed
+	// wrapper that dropped the cause would hide which permission was missing.
+	if !errors.Is(err, githubclient.ErrForbidden) {
+		t.Errorf("errors.Is(err, githubclient.ErrForbidden) = false; the typed wrapper dropped the cause: %v", err)
+	}
+	// Committed state: the refusal happened BEFORE any write. A provider that
+	// proceeded to link after a failed parent read would audit a refusal as work.
+	if len(api.updateIssueCalls) != 0 || api.subParent != "" || api.subChild != "" {
+		t.Errorf("a forbidden parent read still wrote: patches=%+v subParent=%q subChild=%q",
+			api.updateIssueCalls, api.subParent, api.subChild)
+	}
+}
+
+// TestApplyGroomingMutation_EpicLinkParentReadOtherErrorIsWrapped is the
+// mutator-side sibling to TestReadWorkItem_ResolveParentOtherErrorIsWrapped: a
+// NON-forbidden parent-read failure is wrapped naming the issue, NOT turned into
+// a typed capability degradation — a transport fault must not masquerade as a
+// permissions reason — and no write follows.
+func TestApplyGroomingMutation_EpicLinkParentReadOtherErrorIsWrapped(t *testing.T) {
+	api := groomingAPI("Backlog", true)
+	api.issueParentErr = errors.New("boom")
+
+	res, err := New(api).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
+	if res != nil {
+		t.Fatalf("result = %+v, want NIL alongside the error", res)
+	}
+	if err == nil || !strings.Contains(err.Error(), "resolve parent of #2237") {
+		t.Fatalf("err = %v, want a wrapped error naming the issue", err)
+	}
+	var ue *workmgmt.UnavailableError
+	if errors.As(err, &ue) {
+		t.Errorf("a transport fault was reported as a typed capability degradation: %v", err)
+	}
+	if len(api.updateIssueCalls) != 0 || api.subParent != "" || api.subChild != "" {
+		t.Errorf("a failed parent read still wrote: patches=%+v subParent=%q subChild=%q",
+			api.updateIssueCalls, api.subParent, api.subChild)
+	}
+}
+
 // TestApplyGroomingMutation_EpicLinkStructuralConflict is Branch 1: the
 // STRUCTURAL parent is a DIFFERENT epic than the proposal. The provider has no
 // re-parent primitive, so it refuses with a *ParentEpicConflictError naming the
