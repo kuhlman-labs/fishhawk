@@ -259,30 +259,45 @@ func (p *Provider) groomingSetLabels(ctx context.Context, req workmgmt.GroomingM
 }
 
 // groomingLinkEpic links the item as a sub-issue of the proposed parent epic
-// AND stamps the `Parent epic: #N` body marker.
+// AND stamps the `Parent epic: #N` body marker, keying its skip/conflict ladder
+// on the STRUCTURAL parent — the same question the write asks (#2952).
 //
-// BOTH writes, because the write and the pre-dispatch read must observe the
-// SAME persisted relationship (#2237 review). The sub-issue graph is the real
-// relationship, but it is not what the idempotence diff can see:
-// workmgmt.WorkItemRecord exposes labels, body, state and board column — no
-// parent edge — so groomingObserved reads the body marker. A write that
-// persisted the link ONLY through AddSubIssue would therefore be invisible to
-// the next apply's read, and a second apply would re-dispatch a link that
-// already exists — AC7 broken for this kind, with the audit row claiming a
-// mutation that changed nothing.
+// WHY THE STRUCTURAL PARENT, NOT THE MARKER. The write's real effect is the
+// sub-issue edge; the `Parent epic: #N` body marker is a RENDERING of it, and
+// the two can DISAGREE. A body-marked-but-structurally-unlinked item
+// (#819/#821/#930) keyed on the marker alone reported "already present" and
+// wrote nothing, auditing a genuine REFUSAL as success — and that masked that
+// E22 #389 sits at GitHub's hard 100 sub-issue cap. So this method reads the
+// structural parent through the optional issueParentReader extension (the
+// labelAdder pattern) and fails CLOSED with ReasonNotImplemented if the api
+// lacks it, NEVER degrading to the marker.
 //
-// So the marker is not decoration: it is the projection of the relationship
-// onto the surface the reader can observe, exactly as depends_on already does
-// (ADR-047 / #1437), and it matches the `Parent epic: #N` body convention this
-// repository's issue bodies already carry.
+// The marker is still WRITTEN (both writes on the link path) because the
+// depends_on idempotence read still keys on a body marker and the repository's
+// issue bodies carry the `Parent epic:` convention — but it is no longer what
+// this method DIFFS on.
 //
-// ORDER IS DELIBERATE: link first, marker second. A marker written before a
-// failed link would claim a relationship that does not exist and would
-// SUPPRESS the retry — the silent-wrong-state outcome. This way a failure
-// between the two is loud (an error, candidate recorded failed) and the next
-// apply re-attempts; the residual is that the re-attempted AddSubIssue may be
-// refused by GitHub as a duplicate edge, which surfaces as a failed candidate
-// rather than as a false "applied".
+// THE FIVE-BRANCH LADDER, in precedence:
+//  1. structural parent present, != proposal -> *ParentEpicConflictError naming
+//     the structural parent; zero writes.
+//  2. structural parent present, == proposal -> Skipped; zero writes.
+//  3. no structural parent, marker(s) present, none naming the proposal ->
+//     *ParentEpicConflictError (a STATED RESIDUAL, #2237's invariant: never
+//     leave the body claiming one parent while the graph holds another; the
+//     issue's own fixtures all carry a MATCHING marker, so this case is
+//     unaffected by #2952 and is preserved deliberately).
+//  4. no structural parent, marker already naming the proposal -> TAKE THE
+//     WRITE PATH (the #819/#821/#930 case): AddSubIssue runs, and the body PATCH
+//     is SKIPPED because the marker is already correct.
+//  5. no structural parent, no marker -> both writes.
+//
+// ORDER IS DELIBERATE on the write path: link first, marker second. A marker
+// written before a failed link would claim a relationship that does not exist
+// and would SUPPRESS the retry — the silent-wrong-state outcome. This way a
+// failure between the two is loud (an error, candidate recorded failed) and the
+// next apply re-attempts; the residual is that the re-attempted AddSubIssue may
+// be refused by GitHub (a duplicate edge, or the 100 sub-issue cap), which
+// surfaces as a failed candidate rather than as a false "applied".
 func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMutationRequest,
 	repo forge.RepoRef, number int) (*workmgmt.GroomingMutationResult, error) {
 	parent := strings.TrimSpace(req.After.Scalar)
@@ -290,37 +305,79 @@ func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMu
 	if want == "" {
 		return nil, &UnsupportedGroomingKindError{Kind: req.Kind, Detail: "no parent epic reference was proposed"}
 	}
+	wantRef := strings.TrimPrefix(want, "Parent epic: ")
+
+	// THE IDEMPOTENCE QUESTION IS THE STRUCTURAL PARENT (#2952). Read it through
+	// the optional extension, failing CLOSED rather than degrading to the marker.
+	pr, ok := p.api.(issueParentReader)
+	if !ok {
+		return nil, groomingUnavailable(workmgmt.ReasonNotImplemented,
+			"the api client does not implement the IssueParent primitive; an epic-link idempotence check must not fall back to the body marker", nil)
+	}
+	structural, err := pr.IssueParent(ctx, req.Target.Scope, repo, number)
+	if err != nil {
+		if errors.Is(err, forge.ErrForbidden) {
+			return nil, groomingUnavailable(workmgmt.ReasonForbidden,
+				"the forge refused the issue-parent read; the token needs read access to the repository's issues", err)
+		}
+		return nil, fmt.Errorf("workmgmt/github: resolve parent of #%d: %w", number, err)
+	}
+	structuralRef := ""
+	if structural != nil {
+		structuralRef = fmt.Sprintf("#%d", structural.Number)
+	}
+
 	issue, err := p.api.GetIssue(ctx, req.Target.Scope, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: read body of #%d: %w", number, err)
 	}
-	observed := workmgmt.GroomingValue{Scalar: parseParentEpicMarker(issue.Body)}
-	// THE ALREADY-PRESENT TEST IS PER-PARENT, NOT PER-MARKER (#2237 review).
-	// ensureParentEpicMarker is idempotent on the MARKER — it returns any
-	// marker-bearing body unchanged — so reading its unchanged return as
-	// "the requested relationship exists" conflates two different bodies: one
-	// naming the proposed parent, and one naming a DIFFERENT parent. The
-	// second is precisely the case the apply layer dispatches on (its
-	// pre-dispatch read diffs the marker value), so treating it as a skip
-	// reports the requested correction as already done.
-	//
-	// Every marker line is compared, not just the first, mirroring the read
-	// side's multi-marker observation; each is normalized through
-	// renderParentEpicMarker so `1437` and `#1437` are one parent, not two.
-	if existing := parentEpicMarkerValues(issue.Body); len(existing) > 0 {
-		for _, cur := range existing {
+	markers := parentEpicMarkerValues(issue.Body)
+	// Observed mirrors the read side's both-surfaces shape (#2952): Scalar the
+	// structural parent (the authority), List the body-marker refs (a rendering).
+	var markerRefs []string
+	for _, cur := range markers {
+		if r := workmgmt.NormalizeIssueRef(cur); r != "" {
+			markerRefs = append(markerRefs, r)
+		}
+	}
+	observed := workmgmt.GroomingValue{Scalar: structuralRef, List: markerRefs}
+
+	// Branches 1 & 2: a structural parent decides on its own.
+	if structuralRef != "" {
+		if renderParentEpicMarker(structuralRef) == want {
+			// The sub-issue edge already records the proposed parent, so
+			// re-linking would be a duplicate dispatch.
+			return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "parent epic already linked",
+				ProviderResponse: fmt.Sprintf("#%d is already a sub-issue of %s", number, structuralRef),
+				Observed:         observed}, nil
+		}
+		// A CORRECTION was requested but the graph holds a different parent, and
+		// this provider has no re-parent primitive (AddSubIssue only ADDS; there
+		// is no removal). Surface both and let a human decide.
+		return nil, &ParentEpicConflictError{Number: number, Current: structuralRef, Proposed: wantRef}
+	}
+
+	// No structural parent from here. Decide branches 3–5 from the marker.
+	markerAlreadyCorrect := false
+	if len(markers) > 0 {
+		for _, cur := range markers {
 			if renderParentEpicMarker(cur) == want {
-				// The relationship is already recorded on the surface the next
-				// read observes, so re-linking would be a duplicate dispatch.
-				return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "parent epic marker already present",
-					ProviderResponse: fmt.Sprintf("#%d already records parent epic %s", number, cur),
-					Observed:         observed}, nil
+				markerAlreadyCorrect = true // Branch 4
+				break
 			}
 		}
-		return nil, &ParentEpicConflictError{Number: number,
-			Current: strings.Join(existing, ", "), Proposed: strings.TrimPrefix(want, "Parent epic: ")}
+		if !markerAlreadyCorrect {
+			// Branch 3 (stated residual): a divergent marker with no structural
+			// parent is refused, not linked on the marker's authority — a marker
+			// is not the relationship, and #2237's invariant forbids leaving the
+			// body claiming one parent while the graph holds another.
+			return nil, &ParentEpicConflictError{Number: number,
+				Current: strings.Join(markers, ", "), Proposed: wantRef}
+		}
 	}
-	updated := ensureParentEpicMarker(issue.Body, parent)
+
+	// Branches 4 (marker already correct) and 5 (no marker) both WRITE the edge:
+	// the structural link is genuinely absent, so this is the real fix.
 	childNodeID, err := p.api.IssueNodeID(ctx, req.Target.Scope, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: resolve issue #%d: %w", number, err)
@@ -328,12 +385,18 @@ func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMu
 	if err := p.linkEpic(ctx, req.Target.Scope, repo, parent, childNodeID); err != nil {
 		return nil, err
 	}
-	if _, err := p.api.UpdateIssue(ctx, req.Target.Scope, repo, number,
-		githubclient.UpdateIssueParams{Body: &updated}); err != nil {
-		return nil, fmt.Errorf("workmgmt/github: record parent epic on #%d: %w", number, err)
+	if !markerAlreadyCorrect {
+		// Branch 5 only: the marker is absent, so stamp it. Branch 4's marker is
+		// already correct, so the body PATCH is SKIPPED — the edge was the
+		// missing half.
+		updated := ensureParentEpicMarker(issue.Body, parent)
+		if _, err := p.api.UpdateIssue(ctx, req.Target.Scope, repo, number,
+			githubclient.UpdateIssueParams{Body: &updated}); err != nil {
+			return nil, fmt.Errorf("workmgmt/github: record parent epic on #%d: %w", number, err)
+		}
 	}
 	return &workmgmt.GroomingMutationResult{Applied: true, Observed: observed,
-		ProviderResponse: fmt.Sprintf("linked #%d as a sub-issue of %s and recorded the parent-epic marker", number, parent)}, nil
+		ProviderResponse: fmt.Sprintf("linked #%d as a sub-issue of %s", number, parent)}, nil
 }
 
 // parentEpicMarkerRE matches the `Parent epic:` body marker line and captures
@@ -376,17 +439,6 @@ func ensureParentEpicMarker(body, ref string) string {
 		return marker
 	}
 	return strings.TrimRight(body, "\n") + "\n\n" + marker
-}
-
-// parseParentEpicMarker returns the reference on the FIRST `Parent epic:` body
-// line, or "" when the body carries none. Paired with renderParentEpicMarker
-// as the single source of truth for the marker round trip.
-func parseParentEpicMarker(body string) string {
-	m := parentEpicMarkerRE.FindStringSubmatch(body)
-	if m == nil {
-		return ""
-	}
-	return strings.TrimSpace(m[1])
 }
 
 // parentEpicMarkerValues returns the reference on EVERY `Parent epic:` body

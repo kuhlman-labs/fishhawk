@@ -29,6 +29,33 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
+// issueParentReader is the OPTIONAL sub-issue-PARENT read primitive, declared
+// as an extension of API rather than a member of it — the labelAdder pattern
+// (grooming.go), for its stated reason.
+//
+// Only the epic-link idempotence path needs it (#2952). Promoting IssueParent
+// into API would make it a compile-time obligation for EVERY API
+// implementation — including the filing and board-sync fakes in
+// backend/internal/server that never reach this path — so each would have to
+// grow a stub for a capability it cannot use. The optional shape keeps the
+// requirement where the requirement is.
+//
+// *githubclient.Client satisfies it (the signature matches Client.IssueParent
+// exactly), asserted at compile time below, so the production reader takes the
+// resolve path; an API that lacks it is refused with a typed
+// ReasonNotImplemented UnavailableError rather than degrading to the body
+// marker — the marker is a rendering of the relationship, not the relationship,
+// and a fall-through to it is the exact defect #2952 fixes.
+type issueParentReader interface {
+	IssueParent(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int) (*githubclient.IssueParent, error)
+}
+
+// Compile-time assertion that the production client still satisfies the
+// extension. If Client.IssueParent's signature ever drifts, this fails the
+// BUILD rather than letting the epic-link path silently fall through to the
+// ReasonNotImplemented refusal in production.
+var _ issueParentReader = (*githubclient.Client)(nil)
+
 // unavailable builds the typed capability-unavailable error for this provider.
 func unavailable(reason workmgmt.UnavailableReason, detail string, cause error) *workmgmt.UnavailableError {
 	return &workmgmt.UnavailableError{
@@ -91,6 +118,41 @@ func (p *Provider) resolveBoard(ctx context.Context, want bool, target workmgmt.
 		return boardContext{}, fmt.Errorf("workmgmt/github: resolve project fields: %w", err)
 	}
 	return boardContext{want: true, projectID: meta.ProjectID, ctx: ctx}, nil
+}
+
+// resolveParent resolves the STRUCTURAL sub-issue parent through the optional
+// issueParentReader extension and records it on rec (#2952). It FAILS CLOSED on
+// every degradation rather than falling back to the body marker:
+//
+//   - api lacks the primitive     -> ReasonNotImplemented (never a marker read)
+//   - forge refuses the read      -> ReasonForbidden (cause retained)
+//   - any other forge error       -> wrapped, not a typed capability degradation
+//   - nil parent (the NORMAL case for an unparented issue) -> ParentRef "",
+//     ParentResolved TRUE — the asked-and-none answer, distinct from not-asked.
+//
+// On any returned error the caller returns a NIL record, so a parent read that
+// could not be resolved is never mistaken for "this item has no parent".
+func (p *Provider) resolveParent(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int, rec *workmgmt.WorkItemRecord) error {
+	pr, ok := p.api.(issueParentReader)
+	if !ok {
+		return unavailable(workmgmt.ReasonNotImplemented,
+			"the api client does not implement the IssueParent primitive; the structural parent cannot be resolved and a grooming epic-link idempotence check must not fall back to the body marker", nil)
+	}
+	parent, err := pr.IssueParent(ctx, scope, repo, number)
+	if err != nil {
+		if errors.Is(err, forge.ErrForbidden) {
+			return unavailable(workmgmt.ReasonForbidden,
+				"the forge refused the issue-parent read; the token needs read access to the repository's issues", err)
+		}
+		return fmt.Errorf("workmgmt/github: resolve parent of #%d: %w", number, err)
+	}
+	// ParentResolved marks the asked-and-answered state whether or not a parent
+	// exists, so an empty ParentRef here reads as "asked, none" not "not asked".
+	rec.ParentResolved = true
+	if parent != nil {
+		rec.ParentRef = workmgmt.NormalizeIssueRef(fmt.Sprintf("%d", parent.Number))
+	}
+	return nil
 }
 
 // coordScope is a tiny readability shim: the credential scope every board call
@@ -258,6 +320,13 @@ func canonicalStateSet(states []string) map[string]bool {
 // board with no projects token, or a forge refusal — each returning a NIL
 // record with a typed *workmgmt.UnavailableError, never a zero-valued record a
 // caller would read as a real item.
+//
+// When ResolveParent is set it ALSO resolves the STRUCTURAL sub-issue parent
+// through the optional issueParentReader extension (#2952). That path fails
+// closed the same way: an api without the primitive is a typed
+// ReasonNotImplemented refusal and a forge denial a ReasonForbidden, each with a
+// NIL record — never a silent fall-back to the `Parent epic:` body marker,
+// which is a rendering of the relationship and can disagree with it.
 func (p *Provider) ReadWorkItem(ctx context.Context, req workmgmt.ReadWorkItemRequest) (*workmgmt.WorkItemRecord, error) {
 	repo, err := p.preflight(req.Target)
 	if err != nil {
@@ -292,6 +361,15 @@ func (p *Provider) ReadWorkItem(ctx context.Context, req workmgmt.ReadWorkItemRe
 		// ("closed"/"completed") — unlike the GraphQL enums the list path carries
 		// — so match case-insensitively, exactly as ResolveDependencies does.
 		Complete: strings.EqualFold(issue.State, "closed") && strings.EqualFold(issue.StateReason, "completed"),
+	}
+	// STRUCTURAL parent resolution (#2952), opt-in and independent of board
+	// state. It is deliberately NOT a body-marker read: the sub-issue edge is
+	// the relationship the write creates, and the marker can disagree with it,
+	// so the idempotence check must ask the forge the structural question.
+	if req.ResolveParent {
+		if err := p.resolveParent(ctx, req.Target.Scope, repo, number, rec); err != nil {
+			return nil, err
+		}
 	}
 	if !board.want {
 		return rec, nil

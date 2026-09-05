@@ -67,6 +67,16 @@ type WorkItemReader interface {
 // project/token preconditions ListWorkItems enforces apply, and a failure to
 // meet them is an *UnavailableError, not a silently-absent BoardState.
 //
+// ResolveParent opts the read into STRUCTURAL-parent resolution, exactly as
+// ResolveBoardState opts into board state: it is OFF by default because it
+// costs one extra forge round trip. When it is ON the provider resolves the
+// sub-issue PARENT edge and reports it on WorkItemRecord.ParentRef /
+// ParentResolved. A provider lacking the primitive is refused with a typed
+// *UnavailableError, NEVER degraded to the `Parent epic:` body marker — the
+// marker is a RENDERING of the relationship, and the two can disagree (#2952:
+// a body-marked-but-structurally-unlinked item), so the idempotence check must
+// ask the same STRUCTURAL question the write asks.
+//
 // States is the Conventions.States canonical-state -> provider-option map,
 // carried on the request exactly as TransitionRequest already carries it, so
 // the provider reverse-maps the board option to a canonical state without
@@ -75,6 +85,7 @@ type ReadWorkItemRequest struct {
 	Target            Target
 	Ref               string
 	ResolveBoardState bool
+	ResolveParent     bool
 	States            map[string]string
 }
 
@@ -142,18 +153,30 @@ type ListWorkItemsRequest struct {
 // needs it. Until then a caller MUST NOT treat an empty URL from ReadWorkItem
 // as "this item has no URL" — reconstruct it from Number and the target repo,
 // or read the item through ListWorkItems.
+//
+// ParentRef is the STRUCTURAL sub-issue parent normalized to `#N` (empty when
+// the item has no parent), and ParentResolved draws the not-asked /
+// asked-and-none distinction WorkItemPage.BoardStateResolved already draws one
+// layer out: false when ResolveParent was not set, true once the read actually
+// resolved the edge — so an empty ParentRef under ParentResolved==true is
+// unambiguously "asked, and there is no parent", never "not asked". The parent
+// EDGE is the relationship; the `Parent epic: #N` body marker is only a
+// RENDERING of it, and the two can DISAGREE (#2952). A caller deciding whether
+// a link is already applied must read ParentRef, not the marker.
 type WorkItemRecord struct {
-	Number      int
-	Title       string
-	URL         string
-	Body        string
-	Labels      []string
-	State       string
-	StateReason string
-	Complete    bool
-	OnBoard     bool
-	BoardColumn string
-	BoardState  string
+	Number         int
+	Title          string
+	URL            string
+	Body           string
+	Labels         []string
+	State          string
+	StateReason    string
+	Complete       bool
+	OnBoard        bool
+	BoardColumn    string
+	BoardState     string
+	ParentRef      string
+	ParentResolved bool
 }
 
 // WorkItemPage is the ListWorkItems result. BoardStateResolved reports whether

@@ -152,9 +152,9 @@ var boardPlacementKinds = map[GroomingMutationKind]bool{
 func (k GroomingMutationKind) BoardPlacement() bool { return boardPlacementKinds[k] }
 
 // valueSetKinds are the kinds whose CURRENT value the read capability cannot
-// observe: WorkItemRecord exposes labels, body, state and the board Status
-// column, but no arbitrary project FIELD value. See IdempotenceObservable for
-// what follows from that.
+// observe: WorkItemRecord exposes labels, body, state, the board Status column
+// and the STRUCTURAL parent (ParentRef, #2952), but no arbitrary project FIELD
+// value. See IdempotenceObservable for what follows from that.
 var valueSetKinds = map[GroomingMutationKind]bool{
 	GroomingKindFieldSet:    true,
 	GroomingKindRankSet:     true,
@@ -167,7 +167,10 @@ var valueSetKinds = map[GroomingMutationKind]bool{
 // It is true for every kind whose repetition would be observably harmful — a
 // second label add, a second epic link, a second depends_on marker, a second
 // close, a second board move — and those are diffed against current state and
-// never dispatched twice. It is FALSE for the three value-set kinds, and that
+// never dispatched twice. epic_link is diffed against the STRUCTURAL parent
+// (WorkItemRecord.ParentRef, #2952), NOT the `Parent epic:` body marker: the
+// marker is a rendering of the link and can disagree with it, so settling on it
+// audited a genuine refusal as already_applied. It is FALSE for the three value-set kinds, and that
 // residual is stated plainly rather than implied away: a project field value
 // is not carried on WorkItemRecord, so the apply layer cannot tell an
 // already-written rank from an unwritten one and re-dispatches it. Repeating a
@@ -217,6 +220,13 @@ func ResolveGroomingMode(m GroomingMode) GroomingMode {
 // single value (a board column, an epic ref, a rank); List holds a set (the
 // label set). Both are present on one type so a label mutation and a status
 // mutation share one record shape and the audit payload does not fork.
+//
+// epic_link is the one kind that populates BOTH members of its `before` at once
+// (#2952): Scalar is the STRUCTURAL parent (the authority the idempotence diff
+// settles on) and List is the `Parent epic:` body-marker refs (a rendering the
+// diff ignores). They are reported separately so a divergence — a body marker
+// with no structural parent, `{scalar: "", list: ["#389"]}` — is VISIBLE in the
+// audit row rather than collapsed into one verdict.
 type GroomingValue struct {
 	Scalar string   `json:"scalar,omitempty"`
 	List   []string `json:"list,omitempty"`

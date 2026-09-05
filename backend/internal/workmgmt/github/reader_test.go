@@ -439,6 +439,133 @@ func TestProvider_ReadWorkItem_OffBoardLeavesStateEmpty(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// ReadWorkItem: structural parent resolution (#2952)
+// One behavioral test per reader branch. Each asserts typed identity AND
+// record nilness / call counts, never the error string alone.
+// ---------------------------------------------------------------------------
+
+// TestReadWorkItem_ResolveParentUnsetMakesNoParentCall proves the opt-in is
+// genuinely opt-in: with ResolveParent unset, ZERO IssueParent calls are made
+// and ParentResolved stays false (unambiguously "not asked").
+func TestReadWorkItem_ResolveParentUnsetMakesNoParentCall(t *testing.T) {
+	api := readerAPI()
+	api.getIssues = map[int]*githubclient.Issue{2230: {Number: 2230, Title: "t", State: "open"}}
+	api.issueParents = map[int]int{2230: 1437} // a parent EXISTS, but we do not ask
+	rec, err := New(api).ReadWorkItem(context.Background(), workmgmt.ReadWorkItemRequest{
+		Target: readerTarget(), Ref: "#2230", States: canonicalStates,
+	})
+	if err != nil {
+		t.Fatalf("ReadWorkItem: %v", err)
+	}
+	if api.issueParentNumber != 0 {
+		t.Errorf("IssueParent was called for #%d; want ZERO calls when ResolveParent is unset", api.issueParentNumber)
+	}
+	if rec.ParentResolved || rec.ParentRef != "" {
+		t.Errorf("record parent = %q/resolved=%v, want unresolved (not asked)", rec.ParentRef, rec.ParentResolved)
+	}
+}
+
+// TestReadWorkItem_ResolveParentReturnsStructuralParent proves a real parent
+// yields the normalized `#N` ref with ParentResolved true.
+func TestReadWorkItem_ResolveParentReturnsStructuralParent(t *testing.T) {
+	api := readerAPI()
+	api.getIssues = map[int]*githubclient.Issue{2230: {Number: 2230, Title: "t", State: "open"}}
+	api.issueParents = map[int]int{2230: 1437}
+	rec, err := New(api).ReadWorkItem(context.Background(), workmgmt.ReadWorkItemRequest{
+		Target: readerTarget(), Ref: "#2230", ResolveParent: true, States: canonicalStates,
+	})
+	if err != nil {
+		t.Fatalf("ReadWorkItem: %v", err)
+	}
+	if rec.ParentRef != "#1437" || !rec.ParentResolved {
+		t.Errorf("record parent = %q/resolved=%v, want #1437 / true", rec.ParentRef, rec.ParentResolved)
+	}
+	if api.issueParentNumber != 2230 {
+		t.Errorf("IssueParent asked for #%d, want the target #2230", api.issueParentNumber)
+	}
+}
+
+// TestReadWorkItem_ResolveParentNilIsAskedAndNone proves a nil parent yields an
+// EMPTY ParentRef with ParentResolved TRUE — the asked-and-none answer, DISTINCT
+// from the not-asked case above. Conflating the two is what would let a
+// body-marked item read as already-linked.
+func TestReadWorkItem_ResolveParentNilIsAskedAndNone(t *testing.T) {
+	api := readerAPI()
+	api.getIssues = map[int]*githubclient.Issue{819: {Number: 819, Title: "t", State: "open"}}
+	// No entry in issueParents -> the fake returns (nil, nil), the normal answer.
+	rec, err := New(api).ReadWorkItem(context.Background(), workmgmt.ReadWorkItemRequest{
+		Target: readerTarget(), Ref: "#819", ResolveParent: true, States: canonicalStates,
+	})
+	if err != nil {
+		t.Fatalf("ReadWorkItem: %v", err)
+	}
+	if rec.ParentRef != "" {
+		t.Errorf("ParentRef = %q, want empty for an unparented issue", rec.ParentRef)
+	}
+	if !rec.ParentResolved {
+		t.Error("ParentResolved = false, want TRUE — asked-and-none must be distinct from not-asked")
+	}
+}
+
+// TestReadWorkItem_ResolveParentForbidden proves a forge refusal on the parent
+// read is a typed ReasonForbidden with a NIL record and the cause retained.
+func TestReadWorkItem_ResolveParentForbidden(t *testing.T) {
+	api := readerAPI()
+	api.getIssues = map[int]*githubclient.Issue{2230: {Number: 2230, Title: "t", State: "open"}}
+	api.issueParentErr = fmt.Errorf("read parent: %w", githubclient.ErrForbidden)
+	rec, err := New(api).ReadWorkItem(context.Background(), workmgmt.ReadWorkItemRequest{
+		Target: readerTarget(), Ref: "#2230", ResolveParent: true, States: canonicalStates,
+	})
+	if rec != nil {
+		t.Errorf("record = %+v, want NIL", rec)
+	}
+	assertUnavailable(t, err, workmgmt.ReasonForbidden)
+	if !errors.Is(err, githubclient.ErrForbidden) {
+		t.Errorf("errors.Is lost the sentinel through the typed wrapper: %v", err)
+	}
+}
+
+// TestReadWorkItem_ResolveParentOtherErrorIsWrapped proves a NON-forbidden
+// error is wrapped (naming the issue) rather than turned into a typed capability
+// degradation — a transport fault must not masquerade as a permissions reason.
+func TestReadWorkItem_ResolveParentOtherErrorIsWrapped(t *testing.T) {
+	api := readerAPI()
+	api.getIssues = map[int]*githubclient.Issue{2230: {Number: 2230, Title: "t", State: "open"}}
+	api.issueParentErr = errors.New("boom")
+	rec, err := New(api).ReadWorkItem(context.Background(), workmgmt.ReadWorkItemRequest{
+		Target: readerTarget(), Ref: "#2230", ResolveParent: true, States: canonicalStates,
+	})
+	if rec != nil {
+		t.Errorf("record = %+v, want NIL", rec)
+	}
+	if err == nil || !strings.Contains(err.Error(), "resolve parent of #2230") {
+		t.Fatalf("err = %v, want a wrapped error naming the issue", err)
+	}
+	var ue *workmgmt.UnavailableError
+	if errors.As(err, &ue) {
+		t.Errorf("a transport fault was reported as a typed capability degradation: %v", err)
+	}
+}
+
+// TestReadWorkItem_ParentWithoutTheIssueParentPrimitiveIsRefused is the
+// fail-closed guard the counterfactual targets: an api lacking the optional
+// issueParentReader extension must yield a typed ReasonNotImplemented with a NIL
+// record, NEVER a marker fallback. noIssueParentAPI embeds the API interface, so
+// IssueParent is not in its promoted method set and the type assertion fails.
+func TestReadWorkItem_ParentWithoutTheIssueParentPrimitiveIsRefused(t *testing.T) {
+	inner := readerAPI()
+	inner.getIssues = map[int]*githubclient.Issue{2230: {Number: 2230, Title: "t", State: "open",
+		Body: "## Summary\n\nbody\n\nParent epic: #1437"}}
+	rec, err := New(&noIssueParentAPI{API: inner}).ReadWorkItem(context.Background(), workmgmt.ReadWorkItemRequest{
+		Target: readerTarget(), Ref: "#2230", ResolveParent: true, States: canonicalStates,
+	})
+	if rec != nil {
+		t.Errorf("record = %+v, want NIL — a missing primitive must not fall back to the body marker", rec)
+	}
+	assertUnavailable(t, err, workmgmt.ReasonNotImplemented)
+}
+
+// ---------------------------------------------------------------------------
 // Failure modes (one behavioral test per enumerated degradation, #1182)
 // Every one asserts errors.As -> *workmgmt.UnavailableError with the EXACT
 // Reason AND a nil result — never an empty page or a zero-valued record.

@@ -1173,7 +1173,13 @@ func readGroomingObserved(ctx context.Context, reader WorkItemReader, c grooming
 		Target:            req.Target,
 		Ref:               ref,
 		ResolveBoardState: c.kind.BoardPlacement(),
-		States:            req.States,
+		// epic_link diffs against the STRUCTURAL parent, not the body marker
+		// (#2952): a body-marked-but-unlinked item must take the write path
+		// rather than read as already_applied. Only epic_link pays the extra
+		// round trip; depends_on keeps its body-marker membership semantics, so
+		// it does NOT ask for the structural parent.
+		ResolveParent: c.kind == GroomingKindEpicLink,
+		States:        req.States,
 	})
 	if err != nil {
 		return GroomingValue{}, nil, err
@@ -1195,7 +1201,15 @@ func groomingObserved(kind GroomingMutationKind, item *WorkItemRecord) GroomingV
 	case GroomingKindBoardPlace, GroomingKindIcebox:
 		return GroomingValue{Scalar: item.BoardColumn}
 	case GroomingKindEpicLink:
-		return groomingMarkerObserved(item.Body, "Parent epic:")
+		// BOTH surfaces, reported SEPARATELY so a divergence is visible in the
+		// audit `before` rather than collapsed into one verdict (#2952):
+		//   - Scalar = the STRUCTURAL parent (item.ParentRef), the authority the
+		//     idempotence diff settles on.
+		//   - List   = the `Parent epic:` body-marker refs, a RENDERING of the
+		//     link that groomingSatisfied deliberately does NOT settle on.
+		// For the #819 shape (marker "#389", no structural parent) this reads
+		// {scalar: "", list: ["#389"]} — divergent, so the candidate dispatches.
+		return GroomingValue{Scalar: item.ParentRef, List: groomingMarkerObserved(item.Body, "Parent epic:").List}
 	case GroomingKindDependsOnAdd:
 		return groomingMarkerObserved(item.Body, "Depends on:")
 	case GroomingKindCloseDuplicate, GroomingKindCloseNotPlanned:
@@ -1219,13 +1233,32 @@ func groomingSatisfied(kind GroomingMutationKind, observed, after GroomingValue)
 	if after.Scalar == "" && len(after.List) == 0 {
 		return false
 	}
-	// The two BODY-MARKER kinds ask a MEMBERSHIP question of NORMALIZED issue
-	// references: is the proposed ref already recorded by ANY marker line?
+	// epic_link and depends_on_add are SPLIT here (#2952). They used to share
+	// one body-marker membership branch, but they ask different questions of
+	// different surfaces, and collapsing them is exactly what audited a REFUSAL
+	// as success.
+	//
+	// epic_link settles on the STRUCTURAL parent ALONE. groomingObserved reports
+	// it as observed.Scalar (item.ParentRef); observed.List carries the body
+	// marker but is deliberately IGNORED here, because the marker is a rendering
+	// of the link, not the link. A body-marked-but-structurally-unlinked item
+	// (#819/#821/#930: Scalar "", List ["#389"]) is therefore NOT satisfied and
+	// takes the write path — where GitHub answers with the real error (the 100
+	// sub-issue cap on E22 #389) instead of a false already_applied. Refs are
+	// compared normalized so a suggested fix naming `1437` matches a persisted
+	// `#1437`.
+	if kind == GroomingKindEpicLink {
+		return NormalizeIssueRef(observed.Scalar) == NormalizeIssueRef(after.Scalar)
+	}
+	// depends_on_add keeps its MEMBERSHIP semantics UNCHANGED: GitHub has no
+	// native depends_on edge, so the body marker IS the relationship for this
+	// kind, and the question is "is the proposed ref already recorded by ANY
+	// marker line?".
 	//
 	// Two reasons it is membership and not equality. A suggested fix may name
-	// the parent as `1437` while the marker the provider persists is always
-	// `#1437`, so the refs are compared normalized — a raw string compare
-	// would miss the layer's OWN write and re-dispatch on the next apply, the
+	// the ref as `6` while the marker the provider persists is always `#6`, so
+	// the refs are compared normalized — a raw string compare would miss the
+	// layer's OWN write and re-dispatch on the next apply, the
 	// write-and-read-must-agree property the marker exists to give (#2237
 	// review). And a marker is not one ref: `renderDependsOnMarker` emits a
 	// COMMA-SEPARATED list (`Depends on: #5, #6`), so an item filed with two
@@ -1235,7 +1268,7 @@ func groomingSatisfied(kind GroomingMutationKind, observed, after GroomingValue)
 	// (#2237 fix-up). The value's own membership set is the authority;
 	// observed.Scalar is retained as the fallback so a marker whose value is
 	// not ref-shaped still compares as it did before.
-	if kind == GroomingKindEpicLink || kind == GroomingKindDependsOnAdd {
+	if kind == GroomingKindDependsOnAdd {
 		want := NormalizeIssueRef(after.Scalar)
 		for _, got := range observed.List {
 			if got == want {

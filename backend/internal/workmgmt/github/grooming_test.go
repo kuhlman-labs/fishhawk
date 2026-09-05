@@ -331,15 +331,15 @@ func TestApplyGroomingMutation_CloseKinds(t *testing.T) {
 }
 
 // TestApplyGroomingMutation_EpicLinkPersistsBothTheEdgeAndTheMarker pins the
-// epic link to the IssueNodeID + AddSubIssue path File's linkEpic uses AND to
-// the `Parent epic: #N` body marker.
+// GREENFIELD epic link (no structural parent, no marker — Branch 5) to the
+// IssueNodeID + AddSubIssue path File's linkEpic uses AND to the
+// `Parent epic: #N` body marker.
 //
-// BOTH, because the write and the pre-dispatch read must observe the same
-// persisted relationship (#2237 review). workmgmt.WorkItemRecord exposes no
-// parent edge, so the idempotence diff reads the body marker; a write that
-// persisted the link only through AddSubIssue is invisible to the next
-// apply's read and re-dispatches. The marker assertion is the proof that the
-// two agree.
+// BOTH writes. The sub-issue EDGE is now the authority the idempotence diff
+// reads (WorkItemRecord.ParentRef, #2952), not the marker — but the marker is
+// still written, because the depends_on read still keys on a body marker and
+// the repository's issue bodies carry the `Parent epic:` convention. The marker
+// assertion here is the proof the write still stamps it.
 func TestApplyGroomingMutation_EpicLinkPersistsBothTheEdgeAndTheMarker(t *testing.T) {
 	api := groomingAPI("Backlog", true)
 	res, err := New(api).ApplyGroomingMutation(context.Background(),
@@ -381,15 +381,16 @@ func TestApplyGroomingMutation_EpicLinkPersistsBothTheEdgeAndTheMarker(t *testin
 }
 
 // TestApplyGroomingMutation_EpicLinkReapplyIsANoOp is the REAL-PROVIDER
-// re-apply the review demanded (#2237 review). The first call's marker write
-// is fed back as the issue's body — a genuine round trip through the shipped
-// code, not a fake that appends a marker production never writes — and the
-// second call must dispatch NOTHING.
+// re-apply the review demanded (#2237 review), now keyed on the STRUCTURAL
+// parent (#2952). The first call links the edge — and the fake's AddSubIssue
+// RECORDS that edge into issueParents exactly as the real forge would, so the
+// second call's IssueParent read observes it — and the second call must
+// dispatch NOTHING.
 //
 // The previous idempotence coverage lived only in workmgmt's stateful fake,
 // which stamped the marker itself. That did not merely miss the defect; it
-// manufactured the evidence that the defect was absent. This test cannot: it
-// reads the body the provider ACTUALLY wrote.
+// manufactured the evidence that the defect was absent. This test cannot: the
+// re-apply skip is decided by the structural edge the first write actually made.
 func TestApplyGroomingMutation_EpicLinkReapplyIsANoOp(t *testing.T) {
 	api := groomingAPI("Backlog", true)
 	provider := New(api)
@@ -405,8 +406,13 @@ func TestApplyGroomingMutation_EpicLinkReapplyIsANoOp(t *testing.T) {
 	if len(api.updateIssueCalls) != 1 || api.updateIssueCalls[0].params.Body == nil {
 		t.Fatalf("first apply wrote no body: %+v", api.updateIssueCalls)
 	}
+	// The AddSubIssue write recorded the structural edge #2237 -> #1437.
+	if api.issueParents[2237] != 1437 {
+		t.Fatalf("first apply did not record the structural edge: issueParents=%+v", api.issueParents)
+	}
 
-	// Persist what the provider wrote — the round trip.
+	// Persist what the provider wrote — the round trip — and clear the recorded
+	// write calls (but NOT issueParents, which the forge keeps).
 	api.getIssues[2237].Body = *api.updateIssueCalls[0].params.Body
 	api.updateIssueCalls = nil
 	api.subParent, api.subChild = "", ""
@@ -430,15 +436,50 @@ func TestApplyGroomingMutation_EpicLinkReapplyIsANoOp(t *testing.T) {
 	}
 }
 
-// TestApplyGroomingMutation_EpicLinkAlreadyMarkedSkips seeds the
-// already-linked state BY CONSTRUCTION — the body carries the marker before
-// the first call — so the assertion that reddens when the pre-read skip is
-// removed is the BEHAVIOURAL one (nothing was written) rather than a fixture
-// step. It is the read half of the same write-and-read-must-agree property
-// TestApplyGroomingMutation_EpicLinkReapplyIsANoOp proves end to end.
-func TestApplyGroomingMutation_EpicLinkAlreadyMarkedSkips(t *testing.T) {
+// TestApplyGroomingMutation_EpicLinkBodyMarkerWithoutTheEdgeStillLinks is the
+// HEADLINE #2952 case (Branch 4): the body already carries `Parent epic: #1437`
+// but there is NO structural sub-issue edge — the #819/#821/#930 state on walk
+// ce80444b. The OLD behaviour keyed on the marker and reported this as
+// "already present", auditing a genuine refusal as success. The FIX keys on the
+// structural parent, sees it absent, and TAKES THE WRITE PATH: AddSubIssue runs
+// (linking the missing edge) and the body PATCH is SKIPPED because the marker is
+// already correct.
+//
+// Bad state is seeded BY CONSTRUCTION — the body carries the marker while
+// issueParents holds no edge — so the assertion that reddens when the fix is
+// reverted is the BEHAVIOURAL one (AddSubIssue was called), not a fixture step.
+func TestApplyGroomingMutation_EpicLinkBodyMarkerWithoutTheEdgeStillLinks(t *testing.T) {
 	api := groomingAPI("Backlog", true)
 	api.getIssues[2237].Body = "## Summary\n\nbody\n\nParent epic: #1437"
+	// issueParents is empty: the marker exists but the structural edge does not.
+
+	res, err := New(api).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
+	if err != nil {
+		t.Fatalf("ApplyGroomingMutation: %v", err)
+	}
+	if !res.Applied || res.Skipped {
+		t.Fatalf("result = %+v, want APPLIED — a body marker without the edge must take the write path, not skip", res)
+	}
+	// The edge WAS written, in the right direction.
+	if api.subParent != "PARENT_EPIC_NODE" || api.subChild != "CHILD_NODE" {
+		t.Errorf("AddSubIssue got parent=%q child=%q, want PARENT_EPIC_NODE/CHILD_NODE — the missing edge must be linked",
+			api.subParent, api.subChild)
+	}
+	// The body PATCH was SKIPPED: the marker was already correct.
+	if len(api.updateIssueCalls) != 0 {
+		t.Errorf("a correct marker was re-PATCHed: %+v — the body write must be skipped when the marker already names the proposal",
+			api.updateIssueCalls)
+	}
+}
+
+// TestApplyGroomingMutation_EpicLinkStructuralParentAlreadyLinkedSkips is the
+// genuine-idempotence sibling (Branch 2): the STRUCTURAL edge already records
+// the proposed parent, so re-linking is a no-op and NOTHING is written. Seeded
+// by construction via issueParents.
+func TestApplyGroomingMutation_EpicLinkStructuralParentAlreadyLinkedSkips(t *testing.T) {
+	api := groomingAPI("Backlog", true)
+	api.issueParents = map[int]int{2237: 1437}
 
 	res, err := New(api).ApplyGroomingMutation(context.Background(),
 		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
@@ -446,7 +487,7 @@ func TestApplyGroomingMutation_EpicLinkAlreadyMarkedSkips(t *testing.T) {
 		t.Fatalf("ApplyGroomingMutation: %v", err)
 	}
 	if !res.Skipped || res.Applied {
-		t.Errorf("result = %+v, want skipped — the relationship is already recorded", res)
+		t.Errorf("result = %+v, want skipped — the structural edge already records the parent", res)
 	}
 	if len(api.updateIssueCalls) != 0 {
 		t.Errorf("an already-linked epic still PATCHed the issue: %+v", api.updateIssueCalls)
@@ -455,27 +496,144 @@ func TestApplyGroomingMutation_EpicLinkAlreadyMarkedSkips(t *testing.T) {
 		t.Errorf("an already-linked epic still called AddSubIssue (parent=%q child=%q)", api.subParent, api.subChild)
 	}
 	if res.Observed.Scalar != "#1437" {
-		t.Errorf("Observed = %+v, want the already-persisted parent #1437", res.Observed)
+		t.Errorf("Observed = %+v, want the already-linked structural parent #1437", res.Observed)
 	}
 }
 
-// TestApplyGroomingMutation_EpicLinkRefusesADifferentExistingParent is the
-// conflicting-parent gap (#2237 review).
+// TestApplyGroomingMutation_EpicLinkWithoutTheParentPrimitiveIsRefused pins the
+// fail-closed refusal (#2952): an api lacking the optional issueParentReader
+// extension must fail LOUD with a typed ReasonNotImplemented, never fall back to
+// the body marker. noIssueParentAPI embeds the API interface, so IssueParent is
+// absent and the type assertion in groomingLinkEpic fails before any write.
+func TestApplyGroomingMutation_EpicLinkWithoutTheParentPrimitiveIsRefused(t *testing.T) {
+	res, err := New(&noIssueParentAPI{}).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
+	if err == nil {
+		t.Fatalf("ApplyGroomingMutation = %+v, want a refusal", res)
+	}
+	if res != nil {
+		t.Errorf("result = %+v, want nil alongside the error", res)
+	}
+	var unavailable *workmgmt.UnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("error = %v (%T), want *workmgmt.UnavailableError", err, err)
+	}
+	if unavailable.Reason != workmgmt.ReasonNotImplemented {
+		t.Errorf("Reason = %q, want %q", unavailable.Reason, workmgmt.ReasonNotImplemented)
+	}
+	if unavailable.Capability != workmgmt.GroomingCapability {
+		t.Errorf("Capability = %q, want %q", unavailable.Capability, workmgmt.GroomingCapability)
+	}
+}
+
+// TestApplyGroomingMutation_EpicLinkParentReadForbidden pins the mutator-side
+// forbidden branch (#2952 review): groomingLinkEpic resolves the STRUCTURAL
+// parent through its own IssueParent call, and a forge refusal there must be a
+// typed ReasonForbidden with the cause retained — NOT the generic wrap, and NOT
+// a fall-through to a write. This duplicates the mapping the reader path proves
+// in TestReadWorkItem_ResolveParentForbidden, but the mutator implements it
+// independently, so it needs its own pin: the parent read runs BEFORE any write,
+// so a lost ReasonForbidden here would change how a refused parent read is
+// audited with nothing reddening. The forbidden error is seeded BY
+// CONSTRUCTION via issueParentErr (not by calling the control under test), so
+// deleting the mapping lands the RED on the Reason assertion, not on setup.
+func TestApplyGroomingMutation_EpicLinkParentReadForbidden(t *testing.T) {
+	api := groomingAPI("Backlog", true)
+	api.issueParentErr = fmt.Errorf("read parent: %w", githubclient.ErrForbidden)
+
+	res, err := New(api).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
+	if res != nil {
+		t.Fatalf("result = %+v, want NIL alongside the refusal", res)
+	}
+	var unavailable *workmgmt.UnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("err = %v (%T), want *workmgmt.UnavailableError", err, err)
+	}
+	if unavailable.Reason != workmgmt.ReasonForbidden {
+		t.Errorf("Reason = %q, want %q", unavailable.Reason, workmgmt.ReasonForbidden)
+	}
+	if unavailable.Capability != workmgmt.GroomingCapability {
+		t.Errorf("Capability = %q, want %q", unavailable.Capability, workmgmt.GroomingCapability)
+	}
+	// The SAME value must still match the forge sentinel through Unwrap: a typed
+	// wrapper that dropped the cause would hide which permission was missing.
+	if !errors.Is(err, githubclient.ErrForbidden) {
+		t.Errorf("errors.Is(err, githubclient.ErrForbidden) = false; the typed wrapper dropped the cause: %v", err)
+	}
+	// Committed state: the refusal happened BEFORE any write. A provider that
+	// proceeded to link after a failed parent read would audit a refusal as work.
+	if len(api.updateIssueCalls) != 0 || api.subParent != "" || api.subChild != "" {
+		t.Errorf("a forbidden parent read still wrote: patches=%+v subParent=%q subChild=%q",
+			api.updateIssueCalls, api.subParent, api.subChild)
+	}
+}
+
+// TestApplyGroomingMutation_EpicLinkParentReadOtherErrorIsWrapped is the
+// mutator-side sibling to TestReadWorkItem_ResolveParentOtherErrorIsWrapped: a
+// NON-forbidden parent-read failure is wrapped naming the issue, NOT turned into
+// a typed capability degradation — a transport fault must not masquerade as a
+// permissions reason — and no write follows.
+func TestApplyGroomingMutation_EpicLinkParentReadOtherErrorIsWrapped(t *testing.T) {
+	api := groomingAPI("Backlog", true)
+	api.issueParentErr = errors.New("boom")
+
+	res, err := New(api).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
+	if res != nil {
+		t.Fatalf("result = %+v, want NIL alongside the error", res)
+	}
+	if err == nil || !strings.Contains(err.Error(), "resolve parent of #2237") {
+		t.Fatalf("err = %v, want a wrapped error naming the issue", err)
+	}
+	var ue *workmgmt.UnavailableError
+	if errors.As(err, &ue) {
+		t.Errorf("a transport fault was reported as a typed capability degradation: %v", err)
+	}
+	if len(api.updateIssueCalls) != 0 || api.subParent != "" || api.subChild != "" {
+		t.Errorf("a failed parent read still wrote: patches=%+v subParent=%q subChild=%q",
+			api.updateIssueCalls, api.subParent, api.subChild)
+	}
+}
+
+// TestApplyGroomingMutation_EpicLinkStructuralConflict is Branch 1: the
+// STRUCTURAL parent is a DIFFERENT epic than the proposal. The provider has no
+// re-parent primitive, so it refuses with a *ParentEpicConflictError naming the
+// STRUCTURAL parent (#999) and writes nothing. Seeded by construction via
+// issueParents.
+func TestApplyGroomingMutation_EpicLinkStructuralConflict(t *testing.T) {
+	api := groomingAPI("Backlog", true)
+	api.issueParents = map[int]int{2237: 999}
+
+	res, err := New(api).ApplyGroomingMutation(context.Background(),
+		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
+	if res != nil {
+		t.Fatalf("result = %+v, want NO result — a structural re-parent conflict must refuse", res)
+	}
+	var conflict *ParentEpicConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("err = %v (%T), want *ParentEpicConflictError", err, err)
+	}
+	if conflict.Current != "#999" || conflict.Proposed != "#1437" {
+		t.Errorf("conflict = %+v, want current=#999 (the STRUCTURAL parent) proposed=#1437", conflict)
+	}
+	if len(api.updateIssueCalls) != 0 || api.subParent != "" || api.subChild != "" {
+		t.Errorf("a refused structural conflict still wrote: patches=%+v subParent=%q subChild=%q",
+			api.updateIssueCalls, api.subParent, api.subChild)
+	}
+}
+
+// TestApplyGroomingMutation_EpicLinkRefusesADifferentExistingParent is Branch 3,
+// the STATED RESIDUAL (#2952): NO structural parent, but a body marker naming a
+// DIFFERENT epic (#999) than the proposal (#1437).
 //
-// ensureParentEpicMarker is idempotent on the MARKER, not on the PARENT: it
-// returns ANY marker-bearing body unchanged. Reading that unchanged return as
-// "the requested relationship exists" made the provider report a body naming
-// parent #999 as already linked to the proposed #1437 — and #999 is exactly
-// the state the apply layer dispatches ON, because its pre-dispatch read diffs
-// the marker VALUE. So the one case where a correction was genuinely requested
-// was the one case reported as needing no correction, on every re-apply.
-//
-// The defined behaviour is an explicit typed REFUSAL, not a silent skip and
-// not an overwrite: this provider has no primitive to re-parent with
-// (AddSubIssue only ADDS an edge; there is no removal and no replace-parent),
-// so rewriting the marker would leave the body claiming one parent while the
-// sub-issue graph held another. The candidate fails loud, naming both, and a
-// human decides.
+// A marker is not the relationship, so this could in principle be linked on the
+// structural authority — but #2237's invariant forbids leaving the body
+// claiming one parent while the graph holds another, and this provider has no
+// re-parent primitive (AddSubIssue only ADDS; there is no removal). The issue's
+// own fixtures (#819/#821/#930) all carry a marker that MATCHES the proposal, so
+// this divergent-marker case is unaffected by #2952 and is preserved
+// deliberately: an explicit typed REFUSAL naming both, and a human decides.
 //
 // The seeded body IS the conflict, by construction — the test never calls the
 // control to set up its own fixture — so removing the discrimination reddens
@@ -483,6 +641,7 @@ func TestApplyGroomingMutation_EpicLinkAlreadyMarkedSkips(t *testing.T) {
 func TestApplyGroomingMutation_EpicLinkRefusesADifferentExistingParent(t *testing.T) {
 	api := groomingAPI("Backlog", true)
 	api.getIssues[2237].Body = "## Summary\n\nbody\n\nParent epic: #999"
+	// No issueParents entry: the marker diverges but there is no structural edge.
 
 	res, err := New(api).ApplyGroomingMutation(context.Background(),
 		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
@@ -513,26 +672,28 @@ func TestApplyGroomingMutation_EpicLinkRefusesADifferentExistingParent(t *testin
 }
 
 // TestApplyGroomingMutation_EpicLinkMatchesTheParentAcrossRefShapes is the
-// CONTROL for the refusal above: the discrimination must be on the parent's
-// VALUE, normalized, not on the marker's raw text. A body written `Parent
-// epic: 1437` (no hash — the shape a suggested_fix may carry) names the SAME
-// parent as a proposed `#1437`, so it is an already-present SKIP, not a
-// conflict. Without this, a normalization regression would turn every
-// unhashed marker into a permanent failure.
+// CONTROL for the structural skip: discrimination must be on the parent's
+// VALUE, normalized, not on raw text. The STRUCTURAL parent comes back as the
+// bare number 1437, and a proposal written either `1437` or `#1437` names the
+// SAME parent, so both are an already-linked SKIP. Without normalization a
+// suggested_fix carrying the unhashed shape would re-link forever.
 func TestApplyGroomingMutation_EpicLinkMatchesTheParentAcrossRefShapes(t *testing.T) {
-	api := groomingAPI("Backlog", true)
-	api.getIssues[2237].Body = "## Summary\n\nbody\n\nParent epic: 1437"
+	for _, proposed := range []string{"#1437", "1437"} {
+		api := groomingAPI("Backlog", true)
+		api.issueParents = map[int]int{2237: 1437} // structural parent, bare number
 
-	res, err := New(api).ApplyGroomingMutation(context.Background(),
-		groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: "#1437"}))
-	if err != nil {
-		t.Fatalf("ApplyGroomingMutation: %v", err)
-	}
-	if !res.Skipped || res.Applied {
-		t.Errorf("result = %+v, want skipped — `1437` and `#1437` are the same parent", res)
-	}
-	if len(api.updateIssueCalls) != 0 || api.subParent != "" {
-		t.Errorf("an already-linked epic still wrote: patches=%+v subParent=%q", api.updateIssueCalls, api.subParent)
+		res, err := New(api).ApplyGroomingMutation(context.Background(),
+			groomingRequest(workmgmt.GroomingKindEpicLink, workmgmt.GroomingValue{Scalar: proposed}))
+		if err != nil {
+			t.Fatalf("ApplyGroomingMutation(%q): %v", proposed, err)
+		}
+		if !res.Skipped || res.Applied {
+			t.Errorf("proposed %q: result = %+v, want skipped — `1437` and `#1437` name the same parent", proposed, res)
+		}
+		if len(api.updateIssueCalls) != 0 || api.subParent != "" {
+			t.Errorf("proposed %q: an already-linked epic still wrote: patches=%+v subParent=%q",
+				proposed, api.updateIssueCalls, api.subParent)
+		}
 	}
 }
 
@@ -1677,5 +1838,170 @@ func TestAppendDependsOnRef_DoesNotCollapseNonNumericShapes(t *testing.T) {
 		if got, changed := appendDependsOnRef(body, tc.seeded); changed || got != body {
 			t.Errorf("appending %q to itself changed the body: changed=%t body=%q", tc.seeded, changed, got)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CROSS-BOUNDARY: epic_link idempotence over read -> diff -> write (#2952)
+// ---------------------------------------------------------------------------
+
+// epicLinkForge is an httptest GitHub for the epic-link end-to-end: it serves
+// the REST issue read (body + node id), the IssueParent GraphQL query, the
+// AddSubIssue mutation, and any body PATCH — recording which mutations ran.
+type epicLinkForge struct {
+	patches     []string
+	addSubCalls int
+	parentCalls int
+}
+
+// newEpicLinkForge stands up the surface an epic-link apply touches over ONE
+// issue whose body is seeded by construction. structuralParent > 0 makes
+// IssueParent answer that parent; 0 makes it answer null. capError makes
+// AddSubIssue reject with GitHub's own 100-sub-issue-cap message.
+func newEpicLinkForge(t *testing.T, number int, body string, structuralParent int, capError bool) (*githubclient.Client, *epicLinkForge) {
+	t.Helper()
+	fx := &epicLinkForge{}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(r.PathValue("number"))
+		bodyJSON := `""`
+		if n == number {
+			enc, _ := json.Marshal(body)
+			bodyJSON = string(enc)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"number":%d,"node_id":"NODE_%d","title":"t","body":%s,"state":"open","labels":[{"name":"type:feature"}]}`,
+			n, n, bodyJSON))
+	})
+	mux.HandleFunc("PATCH /repos/{owner}/{repo}/issues/{number}", func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		fx.patches = append(fx.patches, string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"number":1,"state":"open"}`)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		var b struct{ Query string }
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(b.Query, "IssueParent"):
+			fx.parentCalls++
+			if structuralParent > 0 {
+				_, _ = io.WriteString(w, fmt.Sprintf(
+					`{"data":{"repository":{"issue":{"parent":{"number":%d,"title":"epic"}}}}}`, structuralParent))
+			} else {
+				_, _ = io.WriteString(w, `{"data":{"repository":{"issue":{"parent":null}}}}`)
+			}
+		case strings.Contains(b.Query, "AddSubIssue"):
+			fx.addSubCalls++
+			if capError {
+				_, _ = io.WriteString(w, `{"errors":[{"message":"Parent cannot have more than 100 sub-issues"}]}`)
+			} else {
+				_, _ = io.WriteString(w, `{"data":{"addSubIssue":{"issue":{"id":"X"}}}}`)
+			}
+		default:
+			_, _ = io.WriteString(w, `{"data":{}}`)
+		}
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := githubclient.New(stubTokenProvider{token: "ghs_install"})
+	c.BaseURL = srv.URL
+	c.HTTP = &http.Client{Timeout: 5 * time.Second}
+	return c, fx
+}
+
+// epicLinkApplyRequest builds a whole-report apply for ONE approved epic-link
+// hygiene defect against `number`, driving the REAL core.
+func epicLinkApplyRequest(number int, parentEpic string) (workmgmt.GroomingApplyRequest, string) {
+	itemRef := groomingItemRef(number)
+	defect := plan.HygieneDefect{
+		ID:      plan.GroomingEntryID(plan.GroomingClassHygiene, "unlinked_parent_epic", itemRef),
+		ItemRef: itemRef,
+		Defect:  "unlinked_parent_epic",
+		Detail:  "no parent epic link recorded",
+		Fix:     &plan.HygieneFix{ParentEpic: parentEpic},
+	}
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{defect}}
+	return workmgmt.GroomingApplyRequest{
+		Target: workmgmt.Target{
+			Scope: forge.FromGitHubInstallationID(99),
+			Repo:  workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"},
+		},
+		Report:    report,
+		Decisions: []workmgmt.GroomingDecision{{EntryID: defect.ID, Verdict: workmgmt.GroomingApproved}},
+		Modes:     map[string]workmgmt.GroomingMode{"hygiene": workmgmt.GroomingModeAuto},
+		States:    groomingStates,
+	}, defect.ID
+}
+
+// TestApplyGrooming_EpicLinkBodyMarkedButUnlinkedFailsOnTheCap is the #2952
+// cross-boundary done-means, driven END TO END through the REAL core, the REAL
+// provider and a REAL *githubclient.Client against an httptest forge. Per-layer
+// units would each pass while the read/diff/write seam disagreed — which is
+// exactly the shipped defect: a body-marked-but-structurally-unlinked item read
+// as already_applied.
+//
+// CAP ARM: body carries `Parent epic: #389`, IssueParent answers NULL, and
+// addSubIssue rejects with GitHub's own 100-sub-issue-cap message. The audited
+// row must be outcome=FAILED carrying that message, with the divergent
+// before={scalar:"", list:["#389"]} — NOT skipped/already_applied.
+//
+// SIBLING ARM: IssueParent answers #389 (the parent IS linked). The row must be
+// skipped/already_applied with ZERO forge writes.
+func TestApplyGrooming_EpicLinkBodyMarkedButUnlinkedFailsOnTheCap(t *testing.T) {
+	const markedBody = "## Summary\n\nWork item.\n\nParent epic: #389"
+
+	// CAP ARM: marker present, no structural parent, addSubIssue hits the cap.
+	c, fx := newEpicLinkForge(t, 819, markedBody, 0, true)
+	provider := New(c)
+	req, entryID := epicLinkApplyRequest(819, "#389")
+
+	res, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req)
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	rec := dependsOnRecord(t, res, entryID)
+	if rec.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Fatalf("outcome=%q skip=%q, want FAILED — a body-marked-but-unlinked item must ATTEMPT the write, not report already_applied",
+			rec.Outcome, rec.SkipReason)
+	}
+	if !strings.Contains(rec.Error, "Parent cannot have more than 100 sub-issues") {
+		t.Errorf("error = %q, want the forge's own 100-sub-issue-cap message", rec.Error)
+	}
+	// The DIVERGENCE is visible in the audited before: no structural parent, but
+	// the body marker names #389.
+	if rec.Before.Scalar != "" {
+		t.Errorf("before.scalar = %q, want empty — there is no structural parent", rec.Before.Scalar)
+	}
+	if len(rec.Before.List) != 1 || rec.Before.List[0] != "#389" {
+		t.Errorf("before.list = %v, want [#389] — the body marker, reported separately from the structural parent", rec.Before.List)
+	}
+	if fx.addSubCalls == 0 {
+		t.Error("addSubIssue was never attempted; the marker-but-no-edge case must take the write path")
+	}
+
+	// SIBLING ARM: the parent IS structurally linked -> already_applied, ZERO writes.
+	c2, fx2 := newEpicLinkForge(t, 819, markedBody, 389, false)
+	provider2 := New(c2)
+	req2, entryID2 := epicLinkApplyRequest(819, "#389")
+
+	res2, err := workmgmt.ApplyGrooming(context.Background(), provider2, provider2, &recordingSink{}, req2)
+	if err != nil {
+		t.Fatalf("ApplyGrooming (sibling): %v", err)
+	}
+	rec2 := dependsOnRecord(t, res2, entryID2)
+	if rec2.Outcome != workmgmt.GroomingOutcomeSkipped || rec2.SkipReason != workmgmt.GroomingSkipAlreadyApplied {
+		t.Fatalf("sibling outcome=%q reason=%q, want skipped/%s",
+			rec2.Outcome, rec2.SkipReason, workmgmt.GroomingSkipAlreadyApplied)
+	}
+	if fx2.addSubCalls != 0 || len(fx2.patches) != 0 {
+		t.Errorf("an already-linked epic still wrote: addSubIssue=%d patches=%v", fx2.addSubCalls, fx2.patches)
+	}
+	if rec2.Before.Scalar != "#389" {
+		t.Errorf("sibling before.scalar = %q, want #389 — the structural parent is the authority", rec2.Before.Scalar)
 	}
 }
