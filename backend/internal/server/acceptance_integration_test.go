@@ -893,7 +893,19 @@ func gateStateOf(t *testing.T, s *Server, seam *exampleAcceptanceSeam) string {
 func TestAcceptanceSeam_ArbitrationDischargesPagedTriageAndAdmitsMerge(t *testing.T) {
 	exampleBytes, _ := readAcceptanceExampleSpec(t)
 	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
-	s, _, merger := arbitrationSeamServer(t, seam)
+	s, sa, merger := arbitrationSeamServer(t, seam)
+
+	// #2536: this cross-boundary seam deliberately exercises the endpoint's
+	// NON-CAPABLE FALLBACK leg. seqAuditRepo is an in-memory projection and does
+	// not implement audit.AnchoredChainAppender, so the handler takes the prior
+	// non-atomic re-read-then-append path — which is exactly what keeps this
+	// walk (and the ~20 hand-written full-interface fakes elsewhere) working
+	// without the capability being on audit.Repository. Asserted rather than
+	// assumed: if a future change put the capability on the interface, this walk
+	// would silently stop covering the fallback.
+	if _, capable := audit.Repository(sa).(audit.AnchoredChainAppender); capable {
+		t.Fatal("the in-memory seam repo now implements audit.AnchoredChainAppender; this walk no longer covers the handler's non-capable fallback leg")
+	}
 
 	w := shipAcceptanceRequest(t, s, seam.runID, seam.acceptanceID, seam.priv, allSkipVerdictBytes(t, ""), "")
 	if w.Code != 201 {

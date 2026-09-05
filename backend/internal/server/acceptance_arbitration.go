@@ -92,7 +92,10 @@ type acceptanceArbitrationResponse struct {
 //  3. 404 run_not_found;
 //  4. 409 acceptance_arbitration_not_applicable unless the gate currently reads
 //     acceptance_triage (a read error is a 500, never a write). A passed /
-//     pending / not-declared / already-arbitrated gate has nothing to discharge;
+//     pending / not-declared gate has nothing to discharge. An ALREADY-ARBITRATED
+//     gate first re-runs the idempotence scan (#2536) and returns the idempotent
+//     200 when the discharge on the chain is THIS outcome's, refusing only when
+//     it names some other one;
 //  5. 409 acceptance_arbitration_not_applicable unless the triage disposition
 //     CORRELATED with that outcome is one acceptanceDispositionPages classifies
 //     as PAGED. A class-1/2 verdict that auto-routed to fixup_dispatched /
@@ -102,15 +105,38 @@ type acceptanceArbitrationResponse struct {
 //  6. 409 acceptance_arbitration_requires_acknowledgement when the outcome
 //     carries criteria_failed > 0 and acknowledge_failed_criteria is not true;
 //  7. 409 acceptance_outcome_superseded when a concurrent acceptance re-run
-//     landed a NEWER outcome between the guards and the append (binding
-//     approval condition 1 — WRITE-SIDE REVALIDATION). Without it the endpoint
-//     could persist an arbitration naming an outcome already superseded.
+//     landed a NEWER outcome between the guards and the append (WRITE-SIDE
+//     REVALIDATION). Since #2536 this guard runs INSIDE the append transaction,
+//     under the run-row lock, via audit.AnchoredChainAppender — not as a
+//     separate re-read before AppendChained.
 //
 // Idempotence lives on the ENDPOINT and is evaluated BETWEEN guard 3 and guard
 // 4: a repeated POST that finds an arbitration already bound to the newest
 // outcome returns 200 already_recorded:true with no second row. It must precede
 // the gate-state guard, because after the first POST the gate reads
-// acceptance_arbitrated and a later-placed check could never match.
+// acceptance_arbitrated and a later-placed check could never match. Since #2536
+// that endpoint scan is a cheap FAST PATH, not the control: the authoritative
+// dedupe is the in-transaction scan inside the anchored append, so two
+// concurrent POSTs that both pass the fast path still commit exactly one row and
+// the loser gets the same 200 already_recorded:true.
+//
+// A CONCURRENT loser can lose that race at THREE points, and all three return
+// the idempotent 200 (the documented wire contract: two concurrent first POSTs
+// commit one row and BOTH responses report it):
+//   - before the fast-path scan → the fast path finds the winner's row;
+//   - between the fast path and guard 4 → guard 4 would otherwise 409 on an
+//     acceptance_arbitrated gate, so it RE-SCANS for an arbitration bound to
+//     THIS outcome and reports it (fail-closed: a scan error is a 500, and a
+//     gate arbitrated for some OTHER outcome still falls through to the 409);
+//   - after guard 4, inside the append transaction → *audit.AnchoredDuplicateError.
+//
+// ATOMICITY, at the strength the mechanism delivers (#2536): no arbitration is
+// ever persisted that named an ALREADY-SUPERSEDED outcome AT APPEND TIME. It is
+// NOT a permanent-newest property. Arbitration-commits-then-newer-outcome-lands
+// is a legal, unpreventable interleaving and is NOT a defect: the arbitration
+// was valid when written, the newer outcome supersedes it, and
+// acceptanceGateState re-wedges to acceptance_triage so the operator arbitrates
+// the new outcome — fail-closed. See backend/internal/audit/anchored.go.
 //
 // Admission is keyed on whether the disposition PAGED, not on the triage class
 // number (binding approval condition 6): a class-1 that auto-routed is refused,
@@ -211,23 +237,21 @@ func (s *Server) handleAcceptanceArbitration(w http.ResponseWriter, r *http.Requ
 	// no outcome is recorded, so a zero-valued sequence can never alias a real
 	// arbitration's binding.
 	if outcome.Recorded {
-		existing, lerr := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryAcceptanceTriageArbitrated)
+		existing, lerr := s.existingArbitrationFor(r.Context(), runID, outcome.Sequence)
 		if lerr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"read prior acceptance arbitration failed", map[string]any{"error": lerr.Error()})
 			return
 		}
-		for _, e := range existing {
-			if seq, ok := arbitrationOutcomeSequence(e.Payload); ok && seq == outcome.Sequence {
-				s.writeJSON(w, r, http.StatusOK, acceptanceArbitrationResponse{
-					RunID:               runID.String(),
-					AcceptanceGateState: acceptanceGateArbitrated,
-					OutcomeSequence:     outcome.Sequence,
-					ArbitrationSequence: e.Sequence,
-					AlreadyRecorded:     true,
-				})
-				return
-			}
+		if existing != nil {
+			s.writeJSON(w, r, http.StatusOK, acceptanceArbitrationResponse{
+				RunID:               runID.String(),
+				AcceptanceGateState: acceptanceGateArbitrated,
+				OutcomeSequence:     outcome.Sequence,
+				ArbitrationSequence: existing.Sequence,
+				AlreadyRecorded:     true,
+			})
+			return
 		}
 	}
 
@@ -240,6 +264,35 @@ func (s *Server) handleAcceptanceArbitration(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if gateState != acceptanceGateTriage {
+		// IDEMPOTENCE RE-CHECK (#2536): the fast path above ran at an earlier
+		// instant, so a CONCURRENT first POST can commit between it and this
+		// guard — the loser would then read acceptance_arbitrated here and get a
+		// 409 for an arbitration the caller asked for and which IS on the chain.
+		// That contradicted the documented wire contract ("two concurrent first
+		// POSTs commit exactly one row and BOTH responses report it"). So an
+		// arbitrated gate re-scans for an arbitration bound to THIS outcome and
+		// reports it as the same idempotent 200 already_recorded:true. It stays
+		// FAIL-CLOSED: a scan error is a 500, and finding none (the gate is
+		// arbitrated because a NEWER outcome is discharged, or the gate is
+		// passed / pending / not-declared) falls through to the 409 unchanged.
+		if gateState == acceptanceGateArbitrated && outcome.Recorded {
+			existing, lerr := s.existingArbitrationFor(r.Context(), runID, outcome.Sequence)
+			if lerr != nil {
+				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+					"read prior acceptance arbitration failed", map[string]any{"error": lerr.Error()})
+				return
+			}
+			if existing != nil {
+				s.writeJSON(w, r, http.StatusOK, acceptanceArbitrationResponse{
+					RunID:               runID.String(),
+					AcceptanceGateState: acceptanceGateArbitrated,
+					OutcomeSequence:     outcome.Sequence,
+					ArbitrationSequence: existing.Sequence,
+					AlreadyRecorded:     true,
+				})
+				return
+			}
+		}
 		s.writeError(w, r, http.StatusConflict, "acceptance_arbitration_not_applicable",
 			"the acceptance gate is not parked at acceptance_triage; there is no paged triage to arbitrate",
 			map[string]any{"run_id": runID.String(), "acceptance_gate_state": gateState})
@@ -284,36 +337,6 @@ func (s *Server) handleAcceptanceArbitration(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Guard 7 — WRITE-SIDE REVALIDATION (binding approval condition 1). Every
-	// guard above read the chain at some earlier instant; a concurrent acceptance
-	// re-run (or the delegated auto-driver's own path) can land a NEWER
-	// acceptance_outcome_recorded entry in between. Persisting an arbitration
-	// that names a superseded outcome would be a durable fail-OPEN artifact: it
-	// records an operator discharge of a verdict nobody evaluated. Re-read the
-	// latest outcome IMMEDIATELY before appending and refuse 409 naming both
-	// sequences if it moved.
-	current, err := s.latestAcceptanceOutcome(r.Context(), runID)
-	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"re-read acceptance outcome before recording failed", map[string]any{"error": err.Error()})
-		return
-	}
-	if !current.Recorded || current.Sequence != outcome.Sequence {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
-			"acceptance arbitration: outcome superseded between guard evaluation and append; refusing",
-			slog.String("run_id", runID.String()),
-			slog.Int64("evaluated_outcome_sequence", outcome.Sequence),
-			slog.Int64("current_outcome_sequence", current.Sequence))
-		s.writeError(w, r, http.StatusConflict, "acceptance_outcome_superseded",
-			"a newer acceptance outcome was recorded while this arbitration was being evaluated; re-read the acceptance verdict and arbitrate the current one",
-			map[string]any{
-				"run_id":                     runID.String(),
-				"evaluated_outcome_sequence": outcome.Sequence,
-				"current_outcome_sequence":   current.Sequence,
-			})
-		return
-	}
-
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
@@ -335,7 +358,7 @@ func (s *Server) handleAcceptanceArbitration(w http.ResponseWriter, r *http.Requ
 		payloadMap["stage_id"] = outcome.StageID.String()
 	}
 	payload, _ := json.Marshal(payloadMap)
-	entry, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	params := audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      outcome.StageID,
 		Timestamp:    time.Now().UTC(),
@@ -343,7 +366,49 @@ func (s *Server) handleAcceptanceArbitration(w http.ResponseWriter, r *http.Requ
 		ActorKind:    &actorKind,
 		ActorSubject: &subject,
 		Payload:      payload,
-	})
+	}
+
+	// Guard 7 — WRITE-SIDE REVALIDATION, now ATOMIC (#2536). Every guard above
+	// read the chain at some earlier instant; a concurrent acceptance re-run (or
+	// the delegated auto-driver's own path) can land a NEWER
+	// acceptance_outcome_recorded entry in between, and two concurrent valid
+	// POSTs could each pass the endpoint idempotence scan above. Both windows
+	// close by moving the anchor re-read AND the dedupe scan INSIDE the append's
+	// transaction, under the run-row lock every chained append already takes.
+	entry, aerr := s.appendArbitrationAnchored(r.Context(), params, outcome.Sequence)
+
+	var moved *audit.AnchorMovedError
+	if errors.As(aerr, &moved) {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
+			"acceptance arbitration: outcome superseded between guard evaluation and append; refusing",
+			slog.String("run_id", runID.String()),
+			slog.Int64("evaluated_outcome_sequence", outcome.Sequence),
+			slog.Int64("current_outcome_sequence", moved.Current))
+		s.writeError(w, r, http.StatusConflict, "acceptance_outcome_superseded",
+			"a newer acceptance outcome was recorded while this arbitration was being evaluated; re-read the acceptance verdict and arbitrate the current one",
+			map[string]any{
+				"run_id":                     runID.String(),
+				"evaluated_outcome_sequence": outcome.Sequence,
+				"current_outcome_sequence":   moved.Current,
+			})
+		return
+	}
+
+	// A concurrent POST (or a backstop-index collision recovered out of
+	// transaction) already discharged THIS outcome: report its sequence as the
+	// idempotent already_recorded:true, exactly as the endpoint fast path does.
+	var dup *audit.AnchoredDuplicateError
+	if errors.As(aerr, &dup) && dup.Existing != nil {
+		s.writeJSON(w, r, http.StatusOK, acceptanceArbitrationResponse{
+			RunID:               runID.String(),
+			AcceptanceGateState: acceptanceGateArbitrated,
+			OutcomeSequence:     outcome.Sequence,
+			ArbitrationSequence: dup.Existing.Sequence,
+			AlreadyRecorded:     true,
+		})
+		return
+	}
+
 	if aerr != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"acceptance arbitration: append acceptance_triage_arbitrated audit entry failed",
@@ -372,6 +437,68 @@ func (s *Server) handleAcceptanceArbitration(w http.ResponseWriter, r *http.Requ
 		ArbitrationSequence: entry.Sequence,
 		AlreadyRecorded:     false,
 	})
+}
+
+// existingArbitrationFor returns the committed acceptance_triage_arbitrated
+// entry BOUND to outcomeSequence, or nil when none exists. It is the ONE scan
+// both idempotence sites share — the fast path before guard 4 and guard 4's own
+// re-check for the concurrent loser (#2536) — so the two can never diverge on
+// what "already recorded" means.
+func (s *Server) existingArbitrationFor(ctx context.Context, runID uuid.UUID, outcomeSequence int64) (*audit.Entry, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceTriageArbitrated)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range entries {
+		if seq, ok := arbitrationOutcomeSequence(e.Payload); ok && seq == outcomeSequence {
+			return e, nil
+		}
+	}
+	return nil, nil
+}
+
+// appendArbitrationAnchored performs the arbitration append with the anchor
+// re-read and the dedupe scan INSIDE the append transaction (#2536), when the
+// wired audit repository carries the audit.AnchoredChainAppender capability
+// (production postgresRepo; a compile-time assertion in audit/postgres.go keeps
+// it from being lost silently).
+//
+// The capability is deliberately OFF audit.Repository so the ~20 hand-written
+// full-interface fakes still compile, so a non-capable repository (in-memory
+// fakes, any non-Postgres wiring) FALLS BACK to the pre-#2536 non-atomic
+// re-read-then-append. Read that residual honestly: the atomicity guarantee
+// holds only for the Postgres repository.
+//
+// Errors are returned unwrapped so the caller's errors.As branches see
+// *audit.AnchorMovedError / *audit.AnchoredDuplicateError directly; the fallback
+// leg synthesises the same *audit.AnchorMovedError for a moved anchor so BOTH
+// legs map onto one 409 branch.
+func (s *Server) appendArbitrationAnchored(ctx context.Context, params audit.ChainAppendParams,
+	outcomeSequence int64) (*audit.Entry, error) {
+	if anchored, ok := s.cfg.AuditRepo.(audit.AnchoredChainAppender); ok {
+		return anchored.AppendChainedAnchored(ctx, params, audit.AnchorSpec{
+			AnchorCategory:   CategoryAcceptanceOutcomeRecorded,
+			AnchorSequence:   outcomeSequence,
+			DedupePayloadKey: "outcome_sequence",
+			DedupeValue:      outcomeSequence,
+			ConstraintName:   audit.AcceptanceTriageArbitratedOnceIndex,
+		})
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
+		"acceptance arbitration: audit repository does not implement AnchoredChainAppender; falling back to the non-atomic re-read-then-append",
+		slog.String("run_id", params.RunID.String()))
+	current, err := s.latestAcceptanceOutcome(ctx, params.RunID)
+	if err != nil {
+		return nil, err
+	}
+	if !current.Recorded || current.Sequence != outcomeSequence {
+		return nil, &audit.AnchorMovedError{
+			Expected: outcomeSequence,
+			Current:  current.Sequence,
+			Recorded: current.Recorded,
+		}
+	}
+	return s.cfg.AuditRepo.AppendChained(ctx, params)
 }
 
 // acceptanceTriageForOutcome returns the class + disposition of the

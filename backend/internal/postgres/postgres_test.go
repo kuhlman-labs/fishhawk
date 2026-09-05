@@ -5117,3 +5117,169 @@ func TestMigrateDown_StagesSupersededReversal(t *testing.T) {
 		t.Error("INSERT of a superseded stage succeeded after rollback; the 0053 CHECK was not restored")
 	}
 }
+
+// TestMigrateDown_AcceptanceArbitrationUniqueReversal pins 0080 (#2536, E48.91):
+// the partial unique index audit_entries_acceptance_triage_arbitrated_once_idx
+// must be PRESENT after MigrateUp — UNIQUE, partial on the
+// acceptance_triage_arbitrated category, and keyed on BOTH run_id and
+// payload->>'outcome_sequence' — and ABSENT after one MigrateDown (index-only,
+// clean DROP INDEX). 0080 is the head, so no preparatory step-downs are needed.
+// Re-applying 0080 afterwards must succeed (idempotent re-application). Mirrors
+// TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal.
+//
+// The key must NOT be run_id alone: one run legitimately carries one arbitration
+// per DISTINCT discharged outcome as acceptance re-runs supersede each other.
+func TestMigrateDown_AcceptanceArbitrationUniqueReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	var idxDef string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT indexdef FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_acceptance_triage_arbitrated_once_idx'`,
+	).Scan(&idxDef); err != nil {
+		t.Fatalf("query audit_entries_acceptance_triage_arbitrated_once_idx after MigrateUp (missing?): %v", err)
+	}
+	if !strings.Contains(idxDef, "UNIQUE") {
+		t.Errorf("index def = %q, want a UNIQUE index (0080)", idxDef)
+	}
+	if !strings.Contains(idxDef, "acceptance_triage_arbitrated") {
+		t.Errorf("index def = %q, want partial WHERE category = 'acceptance_triage_arbitrated' (0080)", idxDef)
+	}
+	if !strings.Contains(idxDef, "run_id") {
+		t.Errorf("index def = %q, want run_id as a key expression (0080)", idxDef)
+	}
+	if !strings.Contains(idxDef, "outcome_sequence") {
+		t.Errorf("index def = %q, want payload->>'outcome_sequence' as a key expression — a run_id-only key would refuse the legitimate arbitration of a SECOND, superseding outcome (0080)", idxDef)
+	}
+
+	// Roll back through 0080: one clean index-only DROP INDEX. downThrough names
+	// 0080 and lands the schema on version 79, so migrations added above 0080
+	// need no edit here.
+	downThrough(t, url, "0080")
+	var idxCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_acceptance_triage_arbitrated_once_idx'`,
+	).Scan(&idxCount); err != nil {
+		t.Fatalf("query index after MigrateDown: %v", err)
+	}
+	if idxCount != 0 {
+		t.Errorf("audit_entries_acceptance_triage_arbitrated_once_idx count after MigrateDown = %d, want 0 (0080 reverted)", idxCount)
+	}
+	// audit_entries itself survives (0080 is index-only; the table predates it).
+	var auditTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'audit_entries'`,
+	).Scan(&auditTable); err != nil {
+		t.Fatalf("query audit_entries table after MigrateDown: %v", err)
+	}
+	if auditTable != 1 {
+		t.Errorf("'audit_entries' table count after MigrateDown = %d, want 1 (0080 is index-only)", auditTable)
+	}
+
+	// Re-apply: idempotent, and the DO-block pre-flight leaves no residue.
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp (re-apply 0080): %v", err)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_acceptance_triage_arbitrated_once_idx'`,
+	).Scan(&idxCount); err != nil {
+		t.Fatalf("query index after re-apply: %v", err)
+	}
+	if idxCount != 1 {
+		t.Errorf("index count after re-apply = %d, want 1", idxCount)
+	}
+}
+
+// TestMigrateUp_AcceptanceArbitrationUnique_FailsLoudOnPreExistingDuplicates is
+// the DISTINCT fixture for migration 0080's DO-block pre-flight (#2536): when
+// audit_entries already carries two acceptance_triage_arbitrated rows sharing a
+// (run_id, payload->>'outcome_sequence') key, MigrateUp must fail with an
+// explicit message NAMING the offending run_id and outcome_sequence — not with
+// an opaque index-build error.
+//
+// Two-phase setup: MigrateUp to the head, step DOWN through 0080 so the index is
+// absent, seed the two colliding rows (the append-only triggers block UPDATE and
+// DELETE only, so a plain INSERT is permitted), then step UP again.
+func TestMigrateUp_AcceptanceArbitrationUnique_FailsLoudOnPreExistingDuplicates(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	downThrough(t, url, "0080")
+
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Guard the SEAM: 0080's index must actually be ABSENT here, or phase 2
+	// re-applies nothing over the seeded rows and this test asserts nothing.
+	var preIdx int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_acceptance_triage_arbitrated_once_idx'`,
+	).Scan(&preIdx); err != nil {
+		t.Fatalf("query index after stepping down through 0080: %v", err)
+	}
+	if preIdx != 0 {
+		t.Fatalf("0080's index is still present after the step-down (count = %d, want 0) — add a preparatory rollback for each migration landed above 0080", preIdx)
+	}
+
+	runID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'pending', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	for i, hash := range []string{"a1", "a2"} {
+		if _, err := pool.Exec(context.Background(),
+			`INSERT INTO audit_entries (id, run_id, category, payload, entry_hash)
+			 VALUES ($1, $2, 'acceptance_triage_arbitrated', '{"outcome_sequence":42}'::jsonb, $3)`,
+			uuid.New(), runID, hash,
+		); err != nil {
+			t.Fatalf("seed colliding row %d: %v", i, err)
+		}
+	}
+	pool.Close()
+
+	// Phase 2: re-apply 0080. It MUST fail, and the message must NAME the
+	// offending (run_id, outcome_sequence).
+	upErr := postgres.MigrateUp(url)
+	if upErr == nil {
+		t.Fatal("MigrateUp succeeded over two colliding acceptance_triage_arbitrated rows; the DO-block pre-flight must RAISE")
+	}
+	msg := upErr.Error()
+	if !strings.Contains(msg, runID.String()) {
+		t.Errorf("MigrateUp error does not NAME the offending run_id %s: %v", runID, upErr)
+	}
+	if !strings.Contains(msg, "42") {
+		t.Errorf("MigrateUp error does not NAME the offending outcome_sequence 42: %v", upErr)
+	}
+	if !strings.Contains(msg, "acceptance_triage_arbitrated") {
+		t.Errorf("MigrateUp error does not name the category: %v", upErr)
+	}
+	// DISCRIMINATION: the two assertions above are satisfied by Postgres's OWN
+	// index-build failure too ("Key (run_id, (payload->>'outcome_sequence'))=(…,
+	// 42) is duplicated", on an index whose NAME carries the category) — that is
+	// exactly the opaque error the DO-block pre-flight exists to replace. So
+	// assert on text ONLY the pre-flight can emit: the migration's own prefix
+	// and the append-only/hash-chain REMEDY hint. Without the DO block this
+	// test goes RED here.
+	if !strings.Contains(msg, "migration 0080") {
+		t.Errorf("MigrateUp error is not the DO-block pre-flight's explicit diagnostic (missing the 'migration 0080' prefix); it looks like Postgres's opaque index-build error: %v", upErr)
+	}
+	if !strings.Contains(msg, "append-only") {
+		t.Errorf("MigrateUp error does not carry the pre-flight's remedy HINT (append-only / hash-chained / recreate the database): %v", upErr)
+	}
+}

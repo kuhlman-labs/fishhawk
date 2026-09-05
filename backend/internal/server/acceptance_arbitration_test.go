@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -768,5 +770,281 @@ func TestAcceptanceArbitration_OutcomeSupersededBeforeAppend(t *testing.T) {
 	if rows := arbitrationRows(au); len(rows) != 0 {
 		t.Fatalf("arbitration rows = %d, want 0 — an arbitration naming superseded outcome %d was persisted",
 			len(rows), arbitrationOutcomeSeq)
+	}
+}
+
+// --- capability path (audit.AnchoredChainAppender, #2536) --------------------
+//
+// The atomic append (anchor re-read + dedupe scan under the run-row lock) lives
+// in the store, so its BEHAVIOUR is pinned by the real-Postgres suite in
+// acceptance_arbitration_pg_test.go. What these fake-backed cases pin is the
+// HANDLER's mapping of the primitive's two typed errors onto the UNCHANGED wire
+// contract, and the fallback for a repository that does not carry the capability
+// (every case above drives that fallback leg, since auditFake does not implement
+// AnchoredChainAppender).
+
+// anchoredAuditFake wraps auditFake with the AnchoredChainAppender capability,
+// returning a caller-supplied error from the anchored append. It is the ONLY
+// fake in this file that implements the capability, so every other case here
+// continues to exercise the non-capable fallback path.
+type anchoredAuditFake struct {
+	*auditFake
+	err error
+}
+
+func (a *anchoredAuditFake) AppendChainedAnchored(ctx context.Context, p audit.ChainAppendParams,
+	_ audit.AnchorSpec) (*audit.Entry, error) {
+	if a.err != nil {
+		return nil, a.err
+	}
+	return a.AppendChained(ctx, p)
+}
+
+// newAnchoredArbitrationServer wires a Server whose audit repo carries the
+// capability and returns anchoredErr from the anchored append.
+func newAnchoredArbitrationServer(t *testing.T, anchoredErr error) (*Server, *autoDriveRepo, *auditFake) {
+	t.Helper()
+	repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	au := newAuditFake()
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: repo,
+		AuditRepo:    &anchoredAuditFake{auditFake: au, err: anchoredErr},
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+		GateMerger:   &fakeMerger{},
+	})
+	return s, repo, au
+}
+
+// TestAcceptanceArbitration_CapabilityPath_AnchorMoved: the primitive's
+// *audit.AnchorMovedError maps to the SAME 409 acceptance_outcome_superseded
+// wire contract the pre-#2536 non-atomic re-read produced, naming both
+// sequences, with zero rows written.
+func TestAcceptanceArbitration_CapabilityPath_AnchorMoved(t *testing.T) {
+	moved := &audit.AnchorMovedError{
+		Expected: arbitrationOutcomeSeq, Current: arbitrationOutcomeSeq + 40, Recorded: true,
+	}
+	s, repo, au := newAnchoredArbitrationServer(t, moved)
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("acceptance_outcome_superseded")) {
+		t.Errorf("body missing acceptance_outcome_superseded: %s", w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"current_outcome_sequence":100`)) {
+		t.Errorf("body must name the CURRENT sequence from the primitive: %s", w.Body.String())
+	}
+	if rows := arbitrationRows(au); len(rows) != 0 {
+		t.Errorf("arbitration rows = %d, want 0", len(rows))
+	}
+}
+
+// TestAcceptanceArbitration_CapabilityPath_Duplicate: the primitive's
+// *audit.AnchoredDuplicateError maps to 200 already_recorded:true carrying the
+// SURVIVING entry's sequence — the branch a concurrent POST that passed the
+// endpoint fast path lands in.
+func TestAcceptanceArbitration_CapabilityPath_Duplicate(t *testing.T) {
+	const survivingSeq = int64(77)
+	dup := &audit.AnchoredDuplicateError{Existing: &audit.Entry{
+		Sequence: survivingSeq, Category: CategoryAcceptanceTriageArbitrated,
+	}}
+	s, repo, au := newAnchoredArbitrationServer(t, dup)
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var got acceptanceArbitrationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode %s: %v", w.Body.String(), err)
+	}
+	if !got.AlreadyRecorded {
+		t.Error("already_recorded = false, want true on a duplicate")
+	}
+	if got.ArbitrationSequence != survivingSeq {
+		t.Errorf("arbitration_sequence = %d, want the surviving entry's %d", got.ArbitrationSequence, survivingSeq)
+	}
+	if rows := arbitrationRows(au); len(rows) != 0 {
+		t.Errorf("arbitration rows = %d, want 0 (the duplicate branch writes nothing)", len(rows))
+	}
+}
+
+// TestAcceptanceArbitration_CapabilityPath_OtherErrorIs500: any error that is
+// neither typed error stays a hard 500 — a 23505 on an unrelated constraint (or
+// the vanished-row integrity anomaly) must NOT be mistaken for the benign
+// duplicate.
+func TestAcceptanceArbitration_CapabilityPath_OtherErrorIs500(t *testing.T) {
+	s, repo, au := newAnchoredArbitrationServer(t, errors.New("audit: duplicate on idx but no committed entry for outcome_sequence=60"))
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("internal_error")) {
+		t.Errorf("body missing internal_error: %s", w.Body.String())
+	}
+	if rows := arbitrationRows(au); len(rows) != 0 {
+		t.Errorf("arbitration rows = %d, want 0", len(rows))
+	}
+}
+
+// TestAcceptanceArbitration_CapabilityPath_HappyPath: with the capability
+// present and no error, the append still lands and the 200 reports it — so the
+// capability path is not merely an error-mapping shim.
+func TestAcceptanceArbitration_CapabilityPath_HappyPath(t *testing.T) {
+	s, repo, au := newAnchoredArbitrationServer(t, nil)
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rows := arbitrationRows(au)
+	if len(rows) != 1 {
+		t.Fatalf("arbitration rows = %d, want 1", len(rows))
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte(`"already_recorded":true`)) {
+		t.Errorf("already_recorded = true on a fresh append: %s", w.Body.String())
+	}
+}
+
+// TestAcceptanceArbitrationRepoCarriesAnchoredCapability pins the fallback's
+// PRECONDITION rather than asserting it in prose: the PRODUCTION audit
+// repository must carry audit.AnchoredChainAppender, so the handler's
+// non-capable fallback leg is reachable only by in-memory fakes. audit's own
+// compile-time `var _ AnchoredChainAppender = (*postgresRepo)(nil)` is the other
+// half; this asserts it across the package boundary the handler actually
+// type-asserts on.
+func TestAcceptanceArbitrationRepoCarriesAnchoredCapability(t *testing.T) {
+	repo := audit.NewPostgresRepository(nil)
+	if _, ok := repo.(audit.AnchoredChainAppender); !ok {
+		t.Fatal("the production audit.Repository must implement audit.AnchoredChainAppender; without it the arbitration endpoint silently degrades to the non-atomic re-read-then-append")
+	}
+}
+
+// lateArbitrationVisibilityFake models the CONCURRENT-LOSER interleaving
+// deterministically (#2536): a winner's arbitration commits BETWEEN the losing
+// request's idempotence fast path and its gate-state guard.
+//
+// It hides CategoryAcceptanceTriageArbitrated from the FIRST
+// ListForRunByCategory call and reveals it from the second onward. Nothing else
+// is touched — acceptanceGateState reads arbitrations through ListForRun, which
+// is delegated unchanged, so the gate reads acceptance_arbitrated exactly as it
+// would after a real concurrent commit. That is what makes this a pin on the
+// guard-4 re-scan rather than on the fast path: the fast path structurally
+// cannot see the row.
+//
+// failFromCall, when non-zero, makes the arbitration-category read FAIL from
+// that call onward — the fail-closed vehicle for the re-scan's own read error.
+type lateArbitrationVisibilityFake struct {
+	*auditFake
+	mu           sync.Mutex
+	calls        int
+	failFromCall int
+}
+
+func (l *lateArbitrationVisibilityFake) ListForRunByCategory(ctx context.Context, runID uuid.UUID,
+	category string) ([]*audit.Entry, error) {
+	entries, err := l.auditFake.ListForRunByCategory(ctx, runID, category)
+	if err != nil || category != CategoryAcceptanceTriageArbitrated {
+		return entries, err
+	}
+	l.mu.Lock()
+	l.calls++
+	n := l.calls
+	l.mu.Unlock()
+	if l.failFromCall > 0 && n >= l.failFromCall {
+		return nil, errors.New("lateArbitrationVisibilityFake: injected arbitration re-scan error")
+	}
+	if n == 1 {
+		return nil, nil
+	}
+	return entries, nil
+}
+
+// TestAcceptanceArbitration_ConcurrentLoserAfterFastPathGets200 is the
+// DETERMINISTIC pin for guard 4's idempotence re-check.
+//
+// The endpoint's documented wire contract (docs/api/v0.openapi.yaml) is that two
+// genuinely concurrent first POSTs commit exactly ONE row and BOTH responses
+// report it. A loser whose fast-path read predates the winner's commit reaches
+// guard 4 AFTER it and finds the gate at acceptance_arbitrated; without the
+// re-check that loser received 409 acceptance_arbitration_not_applicable for a
+// discharge that IS on the chain, making the documented contract false.
+//
+// TestAcceptanceArbitration_PG_ConcurrentDuplicatePosts exercises the same
+// branch through real Postgres, but only PROBABILISTICALLY — the fast-path-to-
+// guard-4 window is narrow and a given run may not land in it. This test forces
+// the interleaving, so the control is pinned regardless of scheduling.
+func TestAcceptanceArbitration_ConcurrentLoserAfterFastPathGets200(t *testing.T) {
+	repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	au := newAuditFake()
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: repo,
+		AuditRepo:    &lateArbitrationVisibilityFake{auditFake: au},
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+		GateMerger:   &fakeMerger{},
+	})
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+	// The winner's row, seeded BY CONSTRUCTION so the RED under deletion of the
+	// re-check lands on the response assertion, not on fixture setup.
+	seedAcceptanceArbitrationEntry(au, runID, arbitrationTriageSeq+1, arbitrationOutcomeSeq)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: the loser of two concurrent first POSTs must receive the idempotent 200, not a 409 for a discharge that is on the chain:\n%s",
+			w.Code, w.Body.String())
+	}
+	var resp acceptanceArbitrationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.AlreadyRecorded {
+		t.Error("already_recorded = false, want true (the winner's row is the surviving one)")
+	}
+	if resp.ArbitrationSequence != arbitrationTriageSeq+1 {
+		t.Errorf("arbitration_sequence = %d, want the winner's %d", resp.ArbitrationSequence, arbitrationTriageSeq+1)
+	}
+	if resp.AcceptanceGateState != acceptanceGateArbitrated {
+		t.Errorf("acceptance_gate_state = %q, want %q", resp.AcceptanceGateState, acceptanceGateArbitrated)
+	}
+	// COMMITTED STATE: no second row was appended.
+	if rows := arbitrationRows(au); len(rows) != 0 {
+		t.Errorf("appended arbitration rows = %d, want 0 (the winner's row must be reused, never duplicated)", len(rows))
+	}
+}
+
+// TestAcceptanceArbitration_ConcurrentLoserRescanErrorIs500 is the FAIL-CLOSED
+// half of guard 4's re-check: the re-scan is a READ, and a read that fails is
+// unknown evidence. It must surface as 500 — never a 409 claiming there is
+// nothing to arbitrate, and never a 200 claiming a discharge it could not see.
+func TestAcceptanceArbitration_ConcurrentLoserRescanErrorIs500(t *testing.T) {
+	repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	au := newAuditFake()
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: repo,
+		AuditRepo:    &lateArbitrationVisibilityFake{auditFake: au, failFromCall: 2},
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+		GateMerger:   &fakeMerger{},
+	})
+	runID := uuid.New()
+	seedPagedTriageRun(t, repo, au, runID, acceptanceClass5, acceptanceDispositionUnvalidatable, 0, 3)
+	seedAcceptanceArbitrationEntry(au, runID, arbitrationTriageSeq+1, arbitrationOutcomeSeq)
+
+	w := postArbitration(t, s, runID, acceptanceArbitrationRequest{Reason: class5Reason}, withMergeOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 on an unreadable re-scan:\n%s", w.Code, w.Body.String())
+	}
+	if rows := arbitrationRows(au); len(rows) != 0 {
+		t.Errorf("appended arbitration rows = %d, want 0 (a read failure must never write)", len(rows))
 	}
 }

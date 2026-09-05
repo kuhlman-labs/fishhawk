@@ -79,6 +79,98 @@ RetryBudgetAppender = (*postgresRepo)(nil)` compile-time assertion so a
 production repo silently losing the capability is a build failure, and the
 server's fallback for a non-capable repo (in-memory fakes only) is loud-logged.
 
+## Atomic anchored append (`AnchoredChainAppender`, #2536)
+
+`AppendChainedAnchored` / `AppendChainedAnchoredTx` are an **atomic
+anchor-revalidate-and-append**: they re-read the newest entry of an ANCHOR
+category and scan for a prior entry already bound to that anchor, then append —
+all in ONE transaction, under the run-row lock. They back POST
+`/v0/runs/{run_id}/acceptance-arbitration`, whose two controls both sat OUTSIDE
+the append's transaction before #2536: the endpoint idempotence scan listed
+prior arbitrations several reads earlier, and guard 7 re-read the newest
+acceptance outcome immediately before `AppendChained`. So (mode 1) two
+concurrent valid POSTs could each pass and each append, and (mode 2) a newer
+`acceptance_outcome_recorded` entry could commit between the final re-read and
+the append, persisting an arbitration that named an already-superseded outcome
+while returning 200.
+
+**Ordering is load-bearing** and must stay: `LockRunForUpdate(run)` FIRST, THEN
+the anchor re-read, THEN the dedupe scan, THEN `AppendChainedTx`. Because the
+reads run *after* the row lock is granted, and Postgres READ COMMITTED takes a
+fresh snapshot per statement, they observe any competing append that committed
+before the lock was granted. The transaction MUST run at the server-default READ
+COMMITTED isolation (`AppendChainedAnchored` sets no `TxOptions`): a REPEATABLE
+READ snapshot would predate the lock and could observe the stale pre-append
+state, reopening the race.
+
+**THE GUARANTEE, at the strength the mechanism delivers.** No entry is ever
+persisted that named an ALREADY-SUPERSEDED anchor **at append time**. It is
+explicitly **NOT** a permanent-newest property.
+Anchored-append-commits-then-newer-anchor-lands is a legal, unpreventable
+interleaving, and it is not a defect: the entry was valid when written, the
+newer anchor supersedes it, and the authoritative gate — which requires the
+entry to name the NEWEST anchor — re-wedges. For acceptance arbitration that
+means `acceptanceGateState` flips back from `acceptance_arbitrated` to
+`acceptance_triage` and the operator arbitrates the new outcome. Fail-closed,
+and pinned deterministically by
+`server.TestAcceptanceArbitration_ArbitrationFirstOrdering`.
+
+**Two duplicate paths, one caller branch.** `*AnchoredDuplicateError` carrying
+the surviving `*Entry` is returned BOTH by the in-transaction dedupe scan and by
+the out-of-transaction recovery after a backstop-index 23505 (below), so the
+caller has one already-recorded branch.
+
+**Which control carries mode 1.** The migration 0080 index is a genuine
+BACKSTOP, not the primary control — and on today's code paths its collision
+branch is near-unreachable for a same-run duplicate. `AppendChainedTx` holds
+`SELECT … FOR UPDATE` on the run row, and `audit_entries.run_id` REFERENCES
+`runs`, so the FK check's `FOR KEY SHARE` on the referenced row conflicts with
+that `FOR UPDATE`: while the anchored transaction holds the lock, no other
+transaction can insert ANY audit row for that run. The control that actually
+carries mode 1 is therefore the **lock + in-transaction dedupe scan**, and it is
+pinned standing ALONE by
+`TestPostgres_AppendChainedAnchored_ConcurrentExactlyOne_IndexDropped`, which
+DROPs the index in its own ephemeral database and still requires exactly one
+committed row.
+
+**The 23505 recovery matches on INDEX semantics, deliberately.** On a collision
+`pgx.BeginFunc` has already rolled back, so the committed colliding row is
+re-read on the pool with a TEXT comparison of `payload->>'<key>'` in SQL — NOT
+the typed Go decode the in-transaction scan uses. That rule is load-bearing: the
+index key is the TEXT projection, so a JSON number `7` and a JSON string `"7"`
+share the key `'7'` while the `*int64` decode misses the string. Re-running the
+typed decode could fail to find the very row the index collided with; the text
+rule always finds it.
+
+**The not-found leg after a collision is UNREACHABLE BY CONSTRUCTION, and there
+is deliberately no test for it.** A 23505 on the partial index PROVES a
+committed row exists with the same textual `(run_id, payload->>'<key>')` key,
+and audit rows cannot be deleted (migration 0002's BEFORE UPDATE/DELETE triggers
+RAISE). Because the re-read matches on those same index semantics, it MUST find
+that row. Reaching the leg would mean the index and the append disagree about
+identity, which no current code path can produce. It is kept as defensive code
+returning a plain error (surfaced as a 500 integrity anomaly) rather than an
+unhandled nil — inventing a vehicle to force it would test the vehicle, not the
+code.
+
+`AnchoredChainAppender` is an OPTIONAL capability kept OFF the `Repository`
+interface (mirroring `RetryBudgetAppender` above), so the ~20 manually-written
+full-interface fakes don't break; `postgres.go` carries a `var _
+AnchoredChainAppender = (*postgresRepo)(nil)` compile-time assertion so a
+production repo silently losing the capability is a build failure. The handler's
+fallback for a non-capable repo (in-memory fakes only) is the prior non-atomic
+re-read-then-append and is debug-logged — a real residual: **the atomicity
+guarantee holds only for the Postgres repository.**
+
+The primitive is authored generically (anchor category + sequence + dedupe
+payload key). #2178 was the same shape but is CLOSED as NOT_PLANNED, so there is
+no second consumer today and no live coordination — the genericity is
+speculative-but-cheap. Compare the store-enforced idiom in
+`backend/internal/webhook/postgres.go` (`INSERT … ON CONFLICT DO NOTHING
+RETURNING`, an empty result meaning already-seen) and the
+`IsDuplicateOnConstraint` narrowings for #1983 / #2594 / #2622 below;
+`IsAcceptanceArbitrationDuplicate` is the #2536 member of that family.
+
 ## At-most-one merge_verdict_recorded per run (0062 / #1983)
 
 The `merge_verdict_recorded` category (POST `/v0/runs/{run_id}/merge`) is
@@ -181,6 +273,44 @@ the `source_entry_id` payload key, so `payload->>'source_entry_id'` yields SQL
 NULL and — NULLs being distinct in a PostgreSQL unique index — any number of
 key-less rows coexist. `CREATE UNIQUE INDEX` therefore never sees a collision
 among the pre-existing accumulated rows and cannot fail loud at migrate time.
+
+## At-most-one acceptance_triage_arbitrated per (run, discharged outcome) (0080 / #2536)
+
+The `acceptance_triage_arbitrated` category (POST
+`/v0/runs/{run_id}/acceptance-arbitration`) is gated to **at most one row per
+(run, discharged acceptance outcome)** by migration 0080's partial unique index
+`audit_entries_acceptance_triage_arbitrated_once_idx` (`ON audit_entries
+(run_id, (payload->>'outcome_sequence')) WHERE category =
+'acceptance_triage_arbitrated'`).
+
+Unlike 0062 / 0067 / 0068, this index is explicitly a **backstop, not the
+primary control** — see the anchored-append section above for why (the FK
+`KEY SHARE` / `FOR UPDATE` conflict makes a same-run collision near-unreachable)
+and for which control actually carries mode 1.
+
+The key is `(run_id, outcome_sequence)`, NOT `run_id` alone: ONE run
+legitimately carries ONE arbitration PER DISTINCT discharged outcome, because a
+later acceptance re-run records a higher-sequence outcome that no prior
+arbitration names and the operator arbitrates that one too. A `run_id`-only key
+would refuse the second, legitimate discharge.
+
+`IsAcceptanceArbitrationDuplicate(err)` (in `anchored.go`) matches ONLY a
+`unique_violation` on `AcceptanceTriageArbitratedOnceIndex` — or the
+`ErrAcceptanceArbitrationDuplicate` sentinel for fakes — mirroring the three
+narrowings above; a 23505 on any OTHER constraint stays a hard error.
+
+**The migration FAILS LOUD** on a pre-existing duplicate: a DO-block pre-flight
+detects them and RAISEs naming the offending `(run_id, outcome_sequence)` and
+entry ids, rather than surfacing an opaque index-build error. Its documented
+remedy is chain-integrity-safe, and the obvious remedy is WRONG: there is no
+routine "delete the redundant row". Migration 0002's append-only triggers refuse
+a DELETE outright, and even with them dropped, removing a hash-chained row
+breaks continuity for every later entry in that run and breaks the SHIPPED
+verification surface in the separate `verifier/internal/audit` module. In this
+PRE-ALPHA repo the honest remedy is to **recreate the database**; for a
+hypothetical real deployment it is a chain-aware rewrite that re-hashes the
+affected run's whole chain (invalidating any published export) or an explicitly
+recorded, accepted chain break.
 
 ## Frozen HashInputs (deliberate)
 
