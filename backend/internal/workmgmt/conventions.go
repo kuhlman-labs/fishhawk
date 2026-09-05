@@ -59,6 +59,7 @@ type Conventions struct {
 	Transitions      map[string]string   `json:"transitions,omitempty"`
 	Charter          *Charter            `json:"charter,omitempty"`
 	Grooming         *Grooming           `json:"grooming,omitempty"`
+	Selection        *Selection          `json:"selection,omitempty"`
 }
 
 // Charter declares where the repo's checked-in charter document lives
@@ -111,6 +112,49 @@ type GroomingThresholdSpec struct {
 	MinRankMovement           *int     `json:"min_rank_movement,omitempty"`
 	MinScoreDelta             *float64 `json:"min_score_delta,omitempty"`
 	SignificantHygieneDefects []string `json:"significant_hygiene_defects,omitempty"`
+}
+
+// Selection declares WHICH board view feeds work selection for this tenant
+// (E45.24 / #2231) — the per-tenant answer to "where does the backlog this
+// repo works from actually come from?".
+//
+// POINTER for the same reason Charter and Grooming are: absent (nil) must stay
+// distinguishable from present-but-empty, so a consumer can tell "no selection
+// source declared" from "declared, with nothing set".
+//
+// DECLARATION ONLY — there is no consumer. Nothing in production reads
+// Conventions.Selection; the board-view-as-selection-source feature is
+// deferred post-alpha by ADR-064, and this slice reserves the declaration so
+// a tenant's intent has one recorded home. There is deliberately NO resolver
+// (no ResolveSelection): an unused resolver would have to invent a default
+// ordering, which is a policy #2231 does not decide.
+//
+// It lives in the work-management conventions rather than as a `board:` block
+// in the workflow spec (ADR-064 fork 1) because the provider, project ref,
+// states and transitions the selection source is read against already live
+// here, and the workflow spec stays a pure governance surface.
+//
+// NO *SemanticError rule is added. Structural validation — required
+// source_view, minLength 1, the closed order_by enum, additionalProperties
+// false — is its whole declaration-time contract, the same posture Charter
+// takes. A cross-check tying SourceView to a States value would be a second
+// owner of a rule no consumer enforces yet, and it would reject a legitimate
+// view that is not a status column at all (a saved GitHub Projects view, a
+// GitLab board list). Per-forge readability constraints on a declared source
+// are documented in docs/board-capability-matrix.md.
+type Selection struct {
+	// SourceView is the PROVIDER-side board view or column name whose
+	// membership feeds selection (e.g. "Up Next" — the provider option, not
+	// the canonical state up_next). The schema requires it and enforces
+	// minLength 1, so a parsed Selection always carries a non-empty view.
+	SourceView string `json:"source_view"`
+	// OrderBy is one of priority, rank, created_at — enforced by the schema's
+	// closed enum. EMPTY means UNSET: no ordering policy is declared, and
+	// nothing populates it. The schema deliberately carries no `default`
+	// annotation, because a JSON Schema default populates nothing and would
+	// advertise behaviour no code implements. The future consumer of this
+	// block is what will have to decide what unset resolves to.
+	OrderBy string `json:"order_by,omitempty"`
 }
 
 // The conservative shipped defaults, declared as named constants so

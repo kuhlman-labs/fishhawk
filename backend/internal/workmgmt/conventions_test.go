@@ -2,6 +2,10 @@ package workmgmt
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -443,6 +447,17 @@ types: {feature: {body_skeleton: [Summary], default_labels: ["NOT VALID"]}}
 		"charter missing required path": {cfg: minimalConfig + "charter: {}\n", wantPath: "/charter"},
 		"charter empty path":            {cfg: minimalConfig + "charter:\n  path: \"\"\n", wantPath: "/charter/path"},
 		"charter unknown nested key":    {cfg: minimalConfig + "charter:\n  path: docs/charter.md\n  extra: nope\n", wantPath: "/charter"},
+		// The selection block's whole declaration-time contract is structural
+		// (E45.24 / #2231): required:["source_view"] + minLength:1 + the
+		// nested additionalProperties:false + the closed order_by enum. Each
+		// of the four is pinned by its own case asserting the JSON Pointer, so
+		// a passing case cannot be some unrelated construct rejecting the
+		// config. Deleting required/enum from the EMBEDDED mirror (the copy
+		// //go:embed compiles) reddens the first and the last.
+		"selection missing required source_view": {cfg: minimalConfig + "selection: {}\n", wantPath: "/selection"},
+		"selection empty source_view":            {cfg: minimalConfig + "selection:\n  source_view: \"\"\n", wantPath: "/selection/source_view"},
+		"selection unknown nested key":           {cfg: minimalConfig + "selection:\n  source_view: \"Up Next\"\n  bogus: 1\n", wantPath: "/selection"},
+		"selection invalid order_by":             {cfg: minimalConfig + "selection:\n  source_view: \"Up Next\"\n  order_by: whatever\n", wantPath: "/selection/order_by"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1090,5 +1105,327 @@ func TestSchemaRejectsSubFloorThresholds(t *testing.T) {
 				t.Errorf("SchemaError.Path = %q, want %q", serr.Path, tc.wantPath)
 			}
 		})
+	}
+}
+
+// --- E45.24 / #2231: the board-selection source declaration ----------------
+
+// TestParseSelection is the AC2-positive half: a config declaring the full
+// block round-trips into the typed struct. It FAILS if either half of the
+// declaration is missing — a schema without the property rejects the config
+// as an unknown key under additionalProperties:false, and a Go struct without
+// the field silently drops the value.
+func TestParseSelection(t *testing.T) {
+	cfg := minimalConfig + "selection:\n  source_view: \"Up Next\"\n  order_by: priority\n"
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(selection) = %v, want nil", err)
+	}
+	if c.Selection == nil {
+		t.Fatal("Selection is nil; the block did not round-trip into the struct")
+	}
+	if c.Selection.SourceView != "Up Next" {
+		t.Errorf("Selection.SourceView = %q, want %q", c.Selection.SourceView, "Up Next")
+	}
+	if c.Selection.OrderBy != "priority" {
+		t.Errorf("Selection.OrderBy = %q, want %q", c.Selection.OrderBy, "priority")
+	}
+}
+
+// TestParseSelectionOrderByOmittedIsUnset pins the omission contract settled
+// by #2231's approval condition 1: order_by carries NO schema `default`
+// annotation, so an omitted order_by parses to the EMPTY value and nothing
+// populates it. Omission means "unset — no ordering policy declared", not
+// "resolved to rank". A JSON Schema default is an annotation that populates
+// nothing, so declaring one would have advertised behaviour no code
+// implements while this assertion still held — which is exactly why the
+// annotation was removed rather than the test weakened. The future consumer
+// of this block is what decides what unset resolves to; this test goes red if
+// anything here starts deciding it instead.
+func TestParseSelectionOrderByOmittedIsUnset(t *testing.T) {
+	cfg := minimalConfig + "selection:\n  source_view: \"Up Next\"\n"
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(selection without order_by) = %v, want nil", err)
+	}
+	if c.Selection == nil {
+		t.Fatal("Selection is nil; the block did not round-trip into the struct")
+	}
+	if c.Selection.SourceView != "Up Next" {
+		t.Errorf("Selection.SourceView = %q, want %q", c.Selection.SourceView, "Up Next")
+	}
+	if c.Selection.OrderBy != "" {
+		t.Errorf("Selection.OrderBy = %q, want the empty value: an omitted order_by is UNSET, and nothing may populate it", c.Selection.OrderBy)
+	}
+}
+
+// TestParseWithoutSelection is the AC2 no-behaviour-change pin: the block is
+// additive-optional, so a config omitting it parses exactly as it did before
+// — and the POINTER field is what keeps absent (nil) distinguishable from
+// present-but-empty. A value-typed field could not satisfy the nil assertion.
+func TestParseWithoutSelection(t *testing.T) {
+	c, err := Parse(strings.NewReader(minimalConfig))
+	if err != nil {
+		t.Fatalf("Parse(no selection) = %v, want nil", err)
+	}
+	if c.Selection != nil {
+		t.Errorf("Selection = %+v, want nil for a config that declares no selection block", c.Selection)
+	}
+}
+
+// TestDefaultDeclaresNoSelection is the DONE-MEANS test for the comment-only
+// edit to docs/spec/work-management-default.yaml and its mirror. A YAML
+// comment is invisible to compilation and a presence-of-file check cannot
+// tell a commented example from a live key, so this asserts the SHIPPED
+// OBSERVABLE value: the product default declares NO live selection block.
+// Nothing consumes Conventions.Selection, so a live declaration in the
+// product default would assert a behaviour that does not exist. This goes RED
+// the moment someone uncomments the block, making a product-default
+// declaration a deliberate decision rather than a side effect.
+func TestDefaultDeclaresNoSelection(t *testing.T) {
+	if s := Default().Selection; s != nil {
+		t.Errorf("Default().Selection = %+v, want nil: the shipped default declares the selection block as a COMMENT only, because nothing consumes it yet", s)
+	}
+}
+
+// boardCapabilityMatrixPath is the repo-root-relative capability matrix, read
+// from the package directory the same way TestDefaultCharterPath reaches
+// .fishhawk/charter.md: backend/internal/workmgmt -> repo root is three
+// levels up.
+var boardCapabilityMatrixPath = filepath.Join("..", "..", "..", "docs", "board-capability-matrix.md")
+
+// collectDeclaredUnavailableReasons AST-walks the workmgmt package tree and
+// returns every string value declared as an UnavailableReason constant, keyed
+// by value with the declaring file recorded for the failure message.
+//
+// It is a SOURCE-DERIVED sweep, which is the whole point: a hand-maintained
+// list of today's reasons verifies today's coverage and stays green on the day
+// a seventh reason is added — precisely the drift the caller is named for.
+func collectDeclaredUnavailableReasons(t *testing.T) map[string]string {
+	t.Helper()
+
+	found := map[string]string{}
+
+	fset := token.NewFileSet()
+	walkErr := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return perr
+		}
+		return collectReasonsFromFile(f, path, found)
+	})
+	if walkErr != nil {
+		t.Fatalf("AST walk of the workmgmt package tree failed: %v", walkErr)
+	}
+	return found
+}
+
+// collectReasonsFromFile records every UnavailableReason string value declared
+// in one parsed file into found, keyed by value with path as the declaring
+// file. It is split out of collectDeclaredUnavailableReasons so the DECLARATION
+// STYLES it accepts can be pinned directly against synthetic source
+// (TestCollectReasonsFromFileAcceptsBothDeclarationStyles) rather than only
+// against whatever reader.go happens to look like today.
+//
+// Two declaration styles are accepted, because a sweep that only matched the
+// one reader.go uses today would silently skip a future reason and so fail
+// OPEN — the same vacuity the caller exists to prevent:
+//
+//	const ReasonX UnavailableReason = "x"     // typed spec, string BasicLit
+//	const ReasonX = UnavailableReason("x")    // conversion CallExpr, untyped spec
+//
+// Const blocks carry the preceding spec's type forward when a later spec omits
+// it, so lastType tracks that carry-over. VAR blocks are swept alongside CONST
+// for the same reason. Both the unqualified Ident (in-package, where reader.go
+// declares them) and a qualified SelectorExpr (a sibling package declaring one
+// as workmgmt.UnavailableReason) are matched as the type, so moving the
+// declarations does not silently empty the sweep.
+//
+// Residual, stated rather than implied: a value built from an expression that
+// is neither a string literal nor a conversion of one — a concatenation, or a
+// reference to another constant — is still skipped. Such a declaration would
+// have to clear the caller's vacuity floor to go unnoticed, and the escape is
+// the same one this helper closes: extend the accepted styles here.
+func collectReasonsFromFile(f *ast.File, path string, found map[string]string) error {
+	const typeName = "UnavailableReason"
+
+	isReasonType := func(e ast.Expr) bool {
+		switch v := e.(type) {
+		case *ast.Ident:
+			return v.Name == typeName
+		case *ast.SelectorExpr:
+			return v.Sel != nil && v.Sel.Name == typeName
+		}
+		return false
+	}
+
+	// stringLit unquotes a string BasicLit, reporting whether e was one.
+	stringLit := func(e ast.Expr) (string, bool, error) {
+		lit, ok := e.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return "", false, nil
+		}
+		val, uerr := strconv.Unquote(lit.Value)
+		if uerr != nil {
+			return "", false, uerr
+		}
+		return val, true, nil
+	}
+
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || (gd.Tok != token.CONST && gd.Tok != token.VAR) {
+			continue
+		}
+		var lastType ast.Expr
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			if vs.Type != nil {
+				lastType = vs.Type
+			}
+			typed := lastType != nil && isReasonType(lastType)
+			for _, v := range vs.Values {
+				// Style 2: an explicit conversion, which carries its own
+				// type and so needs no typed spec.
+				if call, isCall := v.(*ast.CallExpr); isCall {
+					if !isReasonType(call.Fun) || len(call.Args) != 1 {
+						continue
+					}
+					val, isStr, err := stringLit(call.Args[0])
+					if err != nil {
+						return err
+					}
+					if isStr {
+						found[val] = path
+					}
+					continue
+				}
+				// Style 1: a string literal under a spec typed (or
+				// type-carrying) as UnavailableReason.
+				if !typed {
+					continue
+				}
+				val, isStr, err := stringLit(v)
+				if err != nil {
+					return err
+				}
+				if isStr {
+					found[val] = path
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// TestBoardCapabilityMatrixDocumentsEveryDeclaredUnavailableReason is the
+// coverage guard for docs/board-capability-matrix.md (E45.24 / #2231 AC1). It
+// AST-walks the workmgmt package source for every DECLARED UnavailableReason
+// constant and asserts each declared string value appears in the matrix, so
+// AC1's "covers every row, including the degradation posture for each" is
+// machine-enforced rather than asserted in prose.
+//
+// It enforces DRIFT, not a snapshot: the reason set comes from the source, so
+// a seventh reason added to reader.go reddens this test on the day it is
+// added, with nobody having to remember this document exists. A hand-written
+// list of the six current values would verify today's coverage and stay green
+// in exactly the situation the test is named for.
+func TestBoardCapabilityMatrixDocumentsEveryDeclaredUnavailableReason(t *testing.T) {
+	raw, err := os.ReadFile(boardCapabilityMatrixPath)
+	if err != nil {
+		t.Fatalf("read %s: %v — the capability matrix ADR-064 requires is missing", boardCapabilityMatrixPath, err)
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		t.Fatalf("%s is empty, want the per-forge board capability matrix", boardCapabilityMatrixPath)
+	}
+	doc := string(raw)
+
+	declared := collectDeclaredUnavailableReasons(t)
+
+	// Vacuity floor: a walk or parse regression that collected nothing would
+	// make the loop below iterate zero times and pass having proven nothing.
+	// The closed set has six members today; a floor below that still catches a
+	// sweep that found ~nothing, without freezing the count.
+	const minDeclared = 5
+	if len(declared) < minDeclared {
+		t.Fatalf("sweep collected only %d UnavailableReason constants from workmgmt source (< %d); "+
+			"the AST walk is likely broken and this test would false-pass", len(declared), minDeclared)
+	}
+
+	// The containment check is a SUBSTRING match, which is sufficient for the
+	// machine-generated snake_case values this sweep collects but is not a
+	// structural one: a reason value that happened to appear in unrelated
+	// prose would satisfy it. Stated so the guarantee is not read as stronger
+	// than it is.
+	//
+	// sortedKeys is apply.go's existing helper, reused so the failure
+	// output is deterministic across map iterations.
+	for _, reason := range sortedKeys(declared) {
+		if !strings.Contains(doc, reason) {
+			t.Errorf("UnavailableReason %q (declared in %s) is absent from %s — every degradation reason must carry a row in the capability matrix",
+				reason, declared[reason], boardCapabilityMatrixPath)
+		}
+	}
+}
+
+// TestCollectReasonsFromFileAcceptsBothDeclarationStyles pins the DECLARATION
+// STYLES the drift sweep above accepts. Without it the sweep is only ever
+// exercised against reader.go, so its BasicLit-only behaviour before this test
+// existed looked correct while silently skipping a reason declared as a
+// conversion — a fail-OPEN in the very guard the drift test is named for.
+//
+// The synthetic source declares one reason in each accepted style plus two
+// non-reason constants that must NOT be collected, so the test discriminates
+// against a sweep that simply harvests every string constant.
+func TestCollectReasonsFromFileAcceptsBothDeclarationStyles(t *testing.T) {
+	const src = `package workmgmt
+
+type UnavailableReason string
+
+const (
+	ReasonTyped   UnavailableReason = "typed_style"
+	ReasonCarried                   = "carried_style"
+)
+
+const ReasonConverted = UnavailableReason("converted_style")
+
+var ReasonVarConverted = UnavailableReason("var_converted_style")
+
+const NotAReason = "unrelated_constant"
+
+const AlsoNotAReason SomeOtherType = "other_typed_constant"
+`
+
+	f, err := parser.ParseFile(token.NewFileSet(), "synthetic.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic source: %v", err)
+	}
+
+	found := map[string]string{}
+	if err := collectReasonsFromFile(f, "synthetic.go", found); err != nil {
+		t.Fatalf("collectReasonsFromFile: %v", err)
+	}
+
+	for _, want := range []string{"typed_style", "carried_style", "converted_style", "var_converted_style"} {
+		if _, ok := found[want]; !ok {
+			t.Errorf("declared reason %q was not collected; the sweep skips this declaration style and would fail OPEN on a future reason written that way (collected: %v)", want, sortedKeys(found))
+		}
+	}
+	for _, unwanted := range []string{"unrelated_constant", "other_typed_constant"} {
+		if _, ok := found[unwanted]; ok {
+			t.Errorf("non-reason constant %q was collected; the sweep is harvesting every string constant rather than UnavailableReason declarations", unwanted)
+		}
 	}
 }
