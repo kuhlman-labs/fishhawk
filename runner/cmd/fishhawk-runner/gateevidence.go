@@ -88,8 +88,9 @@ type gateEvidencePayload struct {
 	FixupReportingObligations []fixupReportingObligationEvidence `json:"fixup_reporting_obligations,omitempty"`
 	// FixupCounterfactuals digests the agent's VALIDATED counterfactual
 	// self-report for a fix-up pass (#3042): one
-	// {control_path, observed, restored} triple per control the pass added or
-	// tightened and then deleted, re-ran and restored. Already fail-closed
+	// {control_path, kind, observed, restored} quad per control the pass added or
+	// tightened and then deleted, re-ran and restored (kind is runner-DERIVED,
+	// #3107). Already fail-closed
 	// validated by validateFixupCounterfactuals, which retains NO agent-authored
 	// free text — the required `record` narrative is checked on the runner and
 	// discarded there, exactly as #2737 does for obligation record/reason.
@@ -184,13 +185,28 @@ type fixupReportingObligationEvidence struct {
 // witnessed the mutation, so `observed: red` does NOT close the
 // no-op-mutation class. The reviewer prompt says so explicitly.
 //
+// Kind is the ONE exception to that agent-CLAIM framing: it is RUNNER-DERIVED
+// from the already-scope-validated ControlPath by classifyCounterfactualControlKind,
+// never authored by the agent (fixupCounterfactualReport carries no Kind member,
+// so an agent-supplied `kind` key is ignored by encoding/json). It lets the
+// reviewer tell an EXPECTED green on a test-side guard from an ANOMALOUS green on
+// an unpinned production control.
+//
 // The json tags MUST stay identical to the backend's
 // bundle.FixupCounterfactualEvidence mirror — the same lockstep runner↔backend
 // wire contract as the parent payload.
 type fixupCounterfactualEvidence struct {
 	ControlPath string `json:"control_path"`
-	Observed    string `json:"observed"`
-	Restored    bool   `json:"restored"`
+	// Kind is RUNNER-DERIVED (production | test) from the scope-member control
+	// path, NEVER agent-authored — see the type doc. omitempty is deliberate: it
+	// keeps a stage with no counterfactuals byte-identical and lets an older
+	// bundle carrying no `kind` decode to the empty string, which downstream
+	// treats as unclassified and renders exactly as it does today. The json tag
+	// MUST stay identical to backend/internal/bundle's mirror, the same lockstep
+	// contract the sibling fields carry.
+	Kind     string `json:"kind,omitempty"`
+	Observed string `json:"observed"`
+	Restored bool   `json:"restored"`
 }
 
 // scopeExemptionEvidence is one validated scope self-exemption (#1153): a

@@ -596,9 +596,10 @@ the reviewer gets the named-absence block instead of the verify tail. That is
 honest-about-what-it-lacks, which is the whole point of the named literal.
 
 **Half B — agent CLAIM.** `GateEvidence.FixupCounterfactuals` carries the
-`{control_path, observed, restored}` triples the runner validated out of the
-counterfactual sidecars (`runner/README.md` for the fail-closed drop rules).
-Since #2929 the carrier covers BOTH passes — the fix-up self-report sidecar and
+`{control_path, kind, observed, restored}` quads the runner validated out of the
+counterfactual sidecars (`runner/README.md` for the fail-closed drop rules and
+the runner-DERIVED `kind`). Since #2929 the carrier covers BOTH passes — the
+fix-up self-report sidecar and
 the initial implement pass's own `/tmp/fishhawk-counterfactuals-<run>-<stage>.json`,
 read through exactly complementary runner branches so a claim can never be
 double-counted — so the block is titled pass-agnostically,
@@ -613,13 +614,31 @@ the mutation and cannot tell a real counterfactual from a no-op one, so
 deliberately no test name and no narrative on the wire — the agent's `record`
 text is validated on the runner and discarded before the upload boundary (#2737's
 rationale), so the block carries nothing the operator's declared scope does not
-already name. `green`, `not_run` and `restored: NO` are each named as defect
-signals for the reviewer to weigh against the diff. ADVISORY: it never failed,
+already name.
+
+**The reading of a `green` is kind-conditioned (E64.13 / #3107).** Each row also
+carries the runner's `kind: production` | `kind: test` classification (derived
+from `control_path`, NOT agent-authored). On a `kind: production` row — and on an
+UNCLASSIFIED row from an older bundle carrying no `kind`, which keeps the stricter
+reading — an `observed: green` is a defect signal: the agent deleted the control
+and the test still passed, so the control is not pinned. For a `kind: test` row a
+`green` is the EXPECTED outcome and NOT a defect signal, because deleting an
+assertion from a test cannot make that same test fail — it only weakens it — so
+the delete-observe-restore protocol asks a question whose only honest answer is
+green; discrimination for a test-side guard is shown instead by BREAKING the
+production behaviour the guard protects and confirming the guard fires. `not_run`
+and `restored: NO` remain defect signals regardless of kind. The row appends
+`, kind: <k>` only for a known literal, so an empty/unrecognised kind (an older
+bundle) renders the ROW byte-identically to the pre-#3107 format —
+`writeGateEvidence` renders no kind annotation on that row even though the
+surrounding block prose now explains kind semantics. ADVISORY: it never failed,
 re-opened or re-budgeted the pass.
 
-`writeFixupSelfReport` gains the matching agent-facing `counterfactuals` rules
-bullet, including that an absent `restored` is NOT the same claim as `false` and
-that the `record` text is discarded on the runner.
+`writeFixupSelfReport` and `writeCounterfactualSidecar` gain the matching
+agent-facing `counterfactuals` rules, including that an absent `restored` is NOT
+the same claim as `false`, that the `record` text is discarded on the runner, and
+that the agent must NOT author `kind` (the runner derives it) while still
+reporting a test-side control so the row is present for the reviewer.
 
 ## Injected repo-authored documents (E55.1 / #2242)
 

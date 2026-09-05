@@ -326,8 +326,9 @@ type GateEvidence struct {
 	FixupReportingObligations []FixupReportingObligationEvidence `json:"fixup_reporting_obligations,omitempty"`
 	// FixupCounterfactuals carries the agent's VALIDATED counterfactual
 	// self-report for a fix-up pass (#3042): one
-	// {control_path, observed, restored} triple per control the pass added or
-	// tightened and then counterfactually tested, each already fail-closed
+	// {control_path, kind, observed, restored} quad per control the pass added or
+	// tightened and then counterfactually tested (kind runner-DERIVED, #3107),
+	// each already fail-closed
 	// validated by the runner (control_path a member of the declared scope.files
 	// set, observed one of red|green|not_run, restored PRESENT in the sidecar,
 	// and a required `record` narrative that is checked on the runner and NOT
@@ -402,13 +403,22 @@ type FixupReportingObligationEvidence struct {
 // required on the runner and never transmitted, because a fix-up agent running
 // arbitrary repository commands controls every byte of that text and it would
 // otherwise reach the reviewer's prompt without ever appearing in the committed
-// diff. Everything here is an agent CLAIM the runner never witnessed. Mirrors
-// the runner's fixupCounterfactualEvidence — the json tags MUST stay identical
-// to the composer, same lockstep wire contract as the parent payload.
+// diff. Everything here is an agent CLAIM the runner never witnessed — EXCEPT
+// Kind, which is RUNNER-DERIVED from the scope-member control path (#3107) and
+// never agent-authored. Mirrors the runner's fixupCounterfactualEvidence — the
+// json tags MUST stay identical to the composer, same lockstep wire contract as
+// the parent payload.
 type FixupCounterfactualEvidence struct {
 	ControlPath string `json:"control_path"`
-	Observed    string `json:"observed"`
-	Restored    bool   `json:"restored"`
+	// Kind is the runner's classification of the control (production | test),
+	// derived from ControlPath, never declared by the agent (#3107). An OLDER
+	// bundle carries no `kind` member and decodes to the empty string, which
+	// downstream MUST treat as 'unclassified' and render exactly as it does
+	// today. omitempty keeps that back-compat and keeps a no-counterfactual
+	// stage byte-identical.
+	Kind     string `json:"kind,omitempty"`
+	Observed string `json:"observed"`
+	Restored bool   `json:"restored"`
 }
 
 // ScopeExemptionEvidence is one validated scope self-exemption (#1153): a

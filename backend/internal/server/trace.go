@@ -6876,6 +6876,7 @@ func gateEvidenceForReview(ev bundle.GateEvidence, folded []string) *prompt.Gate
 	for _, cf := range ev.FixupCounterfactuals {
 		out.FixupCounterfactuals = append(out.FixupCounterfactuals, prompt.GateFixupCounterfactual{
 			ControlPath: cf.ControlPath,
+			Kind:        cf.Kind,
 			Observed:    cf.Observed,
 			Restored:    cf.Restored,
 		})
