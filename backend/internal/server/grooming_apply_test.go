@@ -1315,9 +1315,9 @@ func TestApplyApprovedGrooming_AuditSinkErrorSurfaced(t *testing.T) {
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 	// Fail ONLY the per-mutation sink categories, so the window settlement's
 	// watermark append still lands and the apply proceeds — the audit-SINK
-	// failure is what must not abort dispatch. A blanket audit outage is a
-	// different case (settlement can't record the watermark): see
-	// TestApplyApprovedGrooming_WindowUnsettledDegrade.
+	// failure is what must not abort dispatch. A watermark append failure is a
+	// different case (settlement can't record the watermark, so nothing is
+	// consumed): see TestApplyApprovedGrooming_WindowUnsettledDegrade.
 	f.audit.failCategories = map[string]bool{
 		workmgmt.GroomingMutationAppliedCategory: true,
 		workmgmt.GroomingApplyCompletedCategory:  true,
@@ -1338,13 +1338,16 @@ func TestApplyApprovedGrooming_AuditSinkErrorSurfaced(t *testing.T) {
 // nothing is consumed, nothing dispatches, and the degrade names
 // grooming_apply_window_unsettled.
 //
-// COUNTERFACTUAL / defensive branch: a blanket audit outage fails the watermark
-// AppendChained. Because the completed-summary row cannot be written either, the
-// degrade marker itself is best-effort; the observable is that NOTHING dialed.
+// COUNTERFACTUAL / defensive branch: the watermark AppendChained fails, so the
+// settlement cannot record it. Only the window category is failed, so the
+// completed-summary row STILL lands and names the reason — which is what makes the
+// degrade-reason assertion below non-vacuous (a blanket outage would leave no row
+// to read).
 func TestApplyApprovedGrooming_WindowUnsettledDegrade(t *testing.T) {
 	f := newGroomingApplyFixture(t, groomingApplyOpts{})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
-	// Fail the watermark append specifically; the settlement cannot record it.
+	// Fail ONLY the watermark append; the settlement cannot record it, but the
+	// completed-summary row is writable so the named degrade reason is observable.
 	f.audit.failCategories = map[string]bool{
 		audit.GroomingApplyWindowClosedCategory: true,
 	}
@@ -1356,6 +1359,9 @@ func TestApplyApprovedGrooming_WindowUnsettledDegrade(t *testing.T) {
 	}
 	if rows := f.windowRows(t); len(rows) != 0 {
 		t.Errorf("window rows = %d, want 0 — the watermark did not land, so the window stays open", len(rows))
+	}
+	if got := f.degradeReason(t); got != groomingApplyWindowUnsettled {
+		t.Errorf("degrade_reason = %q, want %q", got, groomingApplyWindowUnsettled)
 	}
 }
 

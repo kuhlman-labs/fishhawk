@@ -14,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // grooming_window_test.go drives the #2991 capture/apply concurrency protocol
@@ -213,30 +214,58 @@ func TestGroomingWindow_RepeatedSettlementDoesNotReopen(t *testing.T) {
 	}
 }
 
-// TestGroomingWindow_ConcurrentCaptureAndSettlementSerialize races one 3-entry
-// capture against one settlement and asserts one of the two legal interleavings
-// over committed state — never a partial. Determinism comes from the run-row
-// lock, so no sleeps.
+// TestGroomingWindow_ConcurrentCaptureAndSettlementSerialize runs one 3-entry
+// capture concurrently with one settlement and asserts one of the two legal
+// interleavings over committed state — never a partial, AND (the consumed half of
+// the invariant) that a capture that WON was actually swept into the settlement's
+// consumed set rather than committed-but-inert (an off-by-one on the below-
+// watermark bound). Both goroutines are always in flight and contend on the same
+// run-row lock; a small alternating stagger only decides which acquires it first,
+// so BOTH arms — and thus the consumed-set assertion — are exercised every run
+// rather than at the mercy of the scheduler (a pure race lands capture-first only
+// ~1 round in 40 here, which would leave the consumed half all but untested).
 func TestGroomingWindow_ConcurrentCaptureAndSettlementSerialize(t *testing.T) {
 	const rounds = 12
+	const (
+		idA = "ordering:a"
+		idB = "ordering:b"
+		idC = "ordering:c"
+	)
+	stagger := timescale.D(3 * time.Millisecond)
 	for i := 0; i < rounds; i++ {
 		f := newGWFixture(t)
+		captureFirst := i%2 == 0
 		var wg sync.WaitGroup
 		var captureErr, settleErr error
+		var consumed []*audit.Entry
+		start := make(chan struct{})
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
+			<-start
+			if !captureFirst {
+				time.Sleep(stagger)
+			}
 			_, captureErr = f.win.AppendChainedGroomingDispositionBatch(context.Background(), f.artA,
 				[]audit.ChainAppendParams{
-					f.dispositionParams(f.artA, "ordering:a", "approved"),
-					f.dispositionParams(f.artA, "ordering:b", "approved"),
-					f.dispositionParams(f.artA, "ordering:c", "approved"),
+					f.dispositionParams(f.artA, idA, "approved"),
+					f.dispositionParams(f.artA, idB, "approved"),
+					f.dispositionParams(f.artA, idC, "approved"),
 				})
 		}()
 		go func() {
 			defer wg.Done()
-			_, _, settleErr = f.win.AppendChainedGroomingWindowClose(context.Background(), f.watermarkParams(f.artA, "approved"), f.artA)
+			<-start
+			if captureFirst {
+				time.Sleep(stagger)
+			}
+			// Keep the settlement's returned consumed set: the never-partial half of
+			// the invariant is the row count, but the consumed half — that a landed
+			// capture is actually SWEPT INTO the settlement, not left inert — is only
+			// observable here.
+			_, consumed, settleErr = f.win.AppendChainedGroomingWindowClose(context.Background(), f.watermarkParams(f.artA, "approved"), f.artA)
 		}()
+		close(start)
 		wg.Wait()
 		if settleErr != nil {
 			t.Fatalf("round %d: settle: %v", i, settleErr)
@@ -246,19 +275,46 @@ func TestGroomingWindow_ConcurrentCaptureAndSettlementSerialize(t *testing.T) {
 		var closed *audit.GroomingWindowClosedError
 		switch {
 		case captureErr == nil:
-			// Capture landed first: all three rows present.
+			// Capture landed first: all three rows present AND all three appear in
+			// the settlement's consumed set.
 			if len(rows) != 3 {
 				t.Errorf("round %d: capture succeeded but %d rows committed, want 3 — never a partial", i, len(rows))
 			}
+			got := groomingEntryIDSet(t, consumed)
+			for _, id := range []string{idA, idB, idC} {
+				if !got[id] {
+					t.Errorf("round %d: capture landed but entry %q is absent from the consumed set %v — its committed row is inert", i, id, got)
+				}
+			}
 		case errors.As(captureErr, &closed):
-			// Settlement landed first: capture refused, ZERO rows.
+			// Settlement landed first: capture refused, ZERO rows, and the
+			// settlement consumed nothing.
 			if len(rows) != 0 {
 				t.Errorf("round %d: capture refused but %d rows committed, want 0 — never a partial", i, len(rows))
+			}
+			if len(consumed) != 0 {
+				t.Errorf("round %d: settlement landed first but consumed %d dispositions, want 0", i, len(consumed))
 			}
 		default:
 			t.Errorf("round %d: capture err = %v, want nil or GroomingWindowClosedError", i, captureErr)
 		}
 	}
+}
+
+// groomingEntryIDSet decodes the entry_id of each consumed disposition into a set.
+func groomingEntryIDSet(t *testing.T, entries []*audit.Entry) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	for _, e := range entries {
+		var p struct {
+			EntryID string `json:"entry_id"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode consumed payload: %v", err)
+		}
+		out[p.EntryID] = true
+	}
+	return out
 }
 
 // TestGroomingWindow_TwoArtifacts is the CONDITION 1 pin: dispositions captured

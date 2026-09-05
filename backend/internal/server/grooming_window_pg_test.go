@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
@@ -104,6 +107,37 @@ func (f *gwPGFixture) rowsOf(t *testing.T, category string) []*audit.Entry {
 		t.Fatalf("list %s: %v", category, err)
 	}
 	return rows
+}
+
+// mutationOutcomes indexes the grooming_mutation_applied chain by entry id. It is
+// how a race test observes what the settlement actually CONSUMED: a consumed
+// disposition drives its entry's decision (and thus its outcome), whereas an
+// UNconsumed entry falls to its undispositioned default — so the outcome, not the
+// mere row count, discriminates the consumed set.
+func (f *gwPGFixture) mutationOutcomes(t *testing.T) map[string]workmgmt.GroomingMutationRecord {
+	t.Helper()
+	out := map[string]workmgmt.GroomingMutationRecord{}
+	for _, e := range f.rowsOf(t, workmgmt.GroomingMutationAppliedCategory) {
+		var rec workmgmt.GroomingMutationRecord
+		if err := json.Unmarshal(e.Payload, &rec); err != nil {
+			t.Fatalf("decode mutation: %v", err)
+		}
+		out[rec.EntryID] = rec
+	}
+	return out
+}
+
+// postGDNoT posts a disposition batch WITHOUT touching *testing.T, so it is safe
+// to call from a spawned goroutine (a t-method from a non-test goroutine misroutes
+// FailNow/Goexit). The caller records the response and asserts after wg.Wait.
+func postGDNoT(s *Server, runID uuid.UUID, raw string,
+	withID func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost,
+		"/v0/runs/"+runID.String()+"/grooming-dispositions", strings.NewReader(raw))
+	req.SetPathValue("run_id", runID.String())
+	w := httptest.NewRecorder()
+	s.handleRecordGroomingDispositions(w, withID(req))
+	return w
 }
 
 // TestGroomingDispositionsConsumedEndToEnd is the CROSS-BOUNDARY done-means: a
@@ -203,10 +237,19 @@ func TestRecordGroomingDispositions_RefusedAfterWindowClosed(t *testing.T) {
 
 // TestGroomingWindow_MultiEntryCaptureVsApprovalSettlement races a 3-entry HTTP
 // capture against the on-approval settlement and asserts the capture either
-// landed all three (and they were consumed) or was refused 409 having landed
+// landed all three (and they were CONSUMED) or was refused 409 having landed
 // ZERO — never a partial. Multi-entry is required to observe a split.
+//
+// The consumed half is observed through the mutation outcomes, not the row count:
+// the raced dispositions carry verdicts that DIFFER from each entry's
+// undispositioned default (hygiene/dependency default to a synthesized `approved`;
+// an undispositioned gated `ordering` gets no decision at all), so a consumed
+// disposition yields a distinct skip reason. An off-by-one that committed the
+// rows but left them inert would fall to the defaults and redden the outcome
+// assertions while the never-partial row count stayed green.
 func TestGroomingWindow_MultiEntryCaptureVsApprovalSettlement(t *testing.T) {
 	const rounds = 10
+	stagger := timescale.D(3 * time.Millisecond)
 	for i := 0; i < rounds; i++ {
 		f := newGWPGFixture(t)
 		if _, err := f.appr.Submit(context.Background(), approval.SubmitParams{
@@ -215,37 +258,71 @@ func TestGroomingWindow_MultiEntryCaptureVsApprovalSettlement(t *testing.T) {
 			t.Fatalf("round %d: submit approval: %v", i, err)
 		}
 		body := fmt.Sprintf(`{"dispositions":[
-		  {"entry_id":%q,"verdict":"approved"},
-		  {"entry_id":%q,"verdict":"approved"},
+		  {"entry_id":%q,"verdict":"rejected"},
+		  {"entry_id":%q,"verdict":"rejected"},
 		  {"entry_id":%q,"verdict":"amended"}
 		]}`, f.ids.hygiene, f.ids.dependency, f.ids.ordering)
 
+		// Both operations are always in flight and contend on the run-row lock; the
+		// alternating stagger only decides which acquires it first, so the
+		// capture-wins (200) arm — where the consumed set is asserted — is exercised
+		// deterministically every other round instead of at the scheduler's mercy.
+		captureFirst := i%2 == 0
 		var wg sync.WaitGroup
-		var code int
+		var w *httptest.ResponseRecorder
+		start := make(chan struct{})
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			w := postGD(t, f.s, f.runID, body, gdOperator)
-			code = w.Code
+			<-start
+			if !captureFirst {
+				time.Sleep(stagger)
+			}
+			w = postGDNoT(f.s, f.runID, body, gdOperator)
 		}()
 		go func() {
 			defer wg.Done()
+			<-start
+			if captureFirst {
+				time.Sleep(stagger)
+			}
 			f.s.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
 		}()
+		close(start)
 		wg.Wait()
 
 		rows := f.rowsOf(t, CategoryGroomingDispositionRecorded)
-		switch code {
+		switch w.Code {
 		case http.StatusOK:
 			if len(rows) != 3 {
 				t.Errorf("round %d: capture 200 but %d disposition rows committed, want 3 — never a partial", i, len(rows))
+			}
+			// The capture landed before the settlement, so all three dispositions
+			// were consumed: each entry's outcome reflects its recorded verdict, not
+			// its undispositioned default.
+			out := f.mutationOutcomes(t)
+			wantSkip := map[string]string{
+				f.ids.hygiene:    workmgmt.GroomingSkipNotApproved,
+				f.ids.dependency: workmgmt.GroomingSkipNotApproved,
+				f.ids.ordering:   workmgmt.GroomingSkipAmended,
+			}
+			for id, reason := range wantSkip {
+				rec, ok := out[id]
+				if !ok {
+					t.Errorf("round %d: entry %q captured but absent from mutation outcomes — its disposition was not consumed", i, id)
+					continue
+				}
+				if rec.Outcome != workmgmt.GroomingOutcomeSkipped || rec.SkipReason != reason {
+					t.Errorf("round %d: entry %q outcome = %s/%s, want skipped/%s — its disposition was not consumed (fell to the undispositioned default)",
+						i, id, rec.Outcome, rec.SkipReason, reason)
+				}
 			}
 		case http.StatusConflict:
 			if len(rows) != 0 {
 				t.Errorf("round %d: capture 409 but %d disposition rows committed, want 0 — never a partial", i, len(rows))
 			}
 		default:
-			t.Errorf("round %d: capture status = %d, want 200 or 409", i, code)
+			t.Errorf("round %d: capture status = %d, want 200 or 409", i, w.Code)
 		}
 	}
 }
@@ -257,6 +334,7 @@ func TestGroomingWindow_MultiEntryCaptureVsApprovalSettlement(t *testing.T) {
 // reject path settles in C1 before any ratification, so no approval is submitted.
 func TestGroomingWindow_MultiEntryCaptureVsRejectionSettlement(t *testing.T) {
 	const rounds = 10
+	stagger := timescale.D(3 * time.Millisecond)
 	for i := 0; i < rounds; i++ {
 		f := newGWPGFixture(t)
 		body := fmt.Sprintf(`{"dispositions":[
@@ -265,32 +343,75 @@ func TestGroomingWindow_MultiEntryCaptureVsRejectionSettlement(t *testing.T) {
 		  {"entry_id":%q,"verdict":"amended"}
 		]}`, f.ids.hygiene, f.ids.dependency, f.ids.ordering)
 
+		// Deterministic alternating bias (see the approval sibling): both operations
+		// contend on the run-row lock; the stagger only picks the winner so the
+		// capture-wins (200) arm and its below-watermark re-derivation run every
+		// other round.
+		captureFirst := i%2 == 0
 		var wg sync.WaitGroup
-		var code int
+		var w *httptest.ResponseRecorder
+		start := make(chan struct{})
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			w := postGD(t, f.s, f.runID, body, gdOperator)
-			code = w.Code
+			<-start
+			if !captureFirst {
+				time.Sleep(stagger)
+			}
+			w = postGDNoT(f.s, f.runID, body, gdOperator)
 		}()
 		go func() {
 			defer wg.Done()
+			<-start
+			if captureFirst {
+				time.Sleep(stagger)
+			}
 			f.s.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionReject)
 		}()
+		close(start)
 		wg.Wait()
 
 		rows := f.rowsOf(t, CategoryGroomingDispositionRecorded)
-		switch code {
+		switch w.Code {
 		case http.StatusOK:
 			if len(rows) != 3 {
 				t.Errorf("round %d: capture 200 but %d disposition rows committed, want 3 — never a partial", i, len(rows))
+			}
+			// A reject dispatches nothing, so the consumed set is NOT surfaced
+			// through mutation outcomes as it is on the approval path; re-derive it
+			// instead. The settlement wrote exactly one watermark, and all three
+			// committed rows must sit strictly BELOW it — i.e. inside the range the
+			// settlement swept — with every raced entry id accounted for. An
+			// off-by-one that committed a boundary row outside the swept range
+			// reddens here.
+			wms := f.rowsOf(t, audit.GroomingApplyWindowClosedCategory)
+			if len(wms) != 1 {
+				t.Fatalf("round %d: window rows = %d, want exactly 1", i, len(wms))
+			}
+			wmSeq := wms[0].Sequence
+			seen := map[string]bool{}
+			for _, r := range rows {
+				var dp groomingDispositionPayload
+				if err := json.Unmarshal(r.Payload, &dp); err != nil {
+					t.Fatalf("round %d: decode disposition: %v", i, err)
+				}
+				if r.Sequence >= wmSeq {
+					t.Errorf("round %d: disposition %q at seq %d is not below the watermark seq %d — outside the consumed set",
+						i, dp.EntryID, r.Sequence, wmSeq)
+				}
+				seen[dp.EntryID] = true
+			}
+			for _, id := range []string{f.ids.hygiene, f.ids.dependency, f.ids.ordering} {
+				if !seen[id] {
+					t.Errorf("round %d: entry %q captured but absent from the swept (below-watermark) set", i, id)
+				}
 			}
 		case http.StatusConflict:
 			if len(rows) != 0 {
 				t.Errorf("round %d: capture 409 but %d disposition rows committed, want 0 — never a partial", i, len(rows))
 			}
 		default:
-			t.Errorf("round %d: capture status = %d, want 200 or 409", i, code)
+			t.Errorf("round %d: capture status = %d, want 200 or 409", i, w.Code)
 		}
 		// A reject dispatches nothing regardless of the interleaving.
 		if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
