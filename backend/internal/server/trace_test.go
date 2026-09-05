@@ -9603,10 +9603,12 @@ func TestBackstopFixupReReview_GateEvidence_EndToEnd(t *testing.T) {
 		"FIXUP_VERIFY_TAIL_SENTINEL",
 		"Verify summary: outcome=passed (iterations 2/3)",
 		// Half B: the agent's CLAIMED counterfactual rows, under their own
-		// explicitly weaker authority framing.
+		// explicitly weaker authority framing. Each row carries the
+		// runner-DERIVED kind suffix appended at the row's end (#3107) —
+		// pinned in full here so a drift in either the path or the kind fails.
 		"### Counterfactual self-report (agent CLAIM — not a runner observation)",
-		"- runner/cmd/fishhawk-runner/main.go — observed: red, restored: yes",
-		"- backend/internal/prompt/prompt.go — observed: green, restored: NO",
+		"- runner/cmd/fishhawk-runner/main.go — observed: red, restored: yes, kind: production",
+		"- backend/internal/prompt/prompt_test.go — observed: green, restored: NO, kind: test",
 		"The verify runs above are what the RUNNER MEASURED",
 		"`observed: red` does NOT establish that the control discriminates",
 	} {
