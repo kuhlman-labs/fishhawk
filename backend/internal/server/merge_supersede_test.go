@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1184,5 +1186,167 @@ func TestReconcileMergeStillRefusesWithNoEvidence(t *testing.T) {
 	}
 	if got := f.stageState(t, f.stages[run.StageTypeReview].ID); got != run.StageStateAwaitingApproval {
 		t.Errorf("review stage = %q, want untouched awaiting_approval: an unevidenced reconcile must move nothing", got)
+	}
+}
+
+// msDuplicateAppendAudit wraps the REAL pg-backed chain and returns the
+// audit.ErrStageSupersededByMergeDuplicate SENTINEL from every AppendChained,
+// modelling migration 0081's index refusing the second row because a concurrent
+// writer — another fishhawkd process — already recorded it. Reads still delegate,
+// so only the append branch differs from a passing run.
+type msDuplicateAppendAudit struct {
+	audit.Repository
+	appends int
+}
+
+func (a *msDuplicateAppendAudit) AppendChained(context.Context, audit.ChainAppendParams) (*audit.Entry, error) {
+	a.appends++
+	return nil, audit.ErrStageSupersededByMergeDuplicate
+}
+
+// TestRepairMissingSupersedeRows_DuplicateOmitsStageFromRepaired pins the NEW
+// benign-duplicate branch (E64.29 / #3133) at the exact level the OpenAPI text
+// claims it: when migration 0081's index refuses the repair's append because a
+// concurrent replica already wrote the row, the stage is OMITTED from Repaired
+// and NOTHING is written by this invocation. `Repaired` means "this invocation
+// restored the row", and a row a peer wrote was not restored by us.
+//
+// COUNTERFACTUAL (run by deletion). Deleting the
+// `if audit.IsStageSupersededByMergeDuplicate(aerr)` branch in
+// repairMissingSupersedeRows changes NOTHING observable here (the fall-through
+// also omits the stage), which is why this test's job is the CONTRACT and the
+// index's own counterfactual lives in merge_supersede_pg_test.go
+// (TestSupersedeAudit_PG_ExactlyOneRowRequiresTheIndex, an index DROP against
+// real Postgres). What this case DOES discriminate is the opposite regression:
+// treating the duplicate as a success and reporting it as repaired.
+func TestRepairMissingSupersedeRows_DuplicateOmitsStageFromRepaired(t *testing.T) {
+	f := newSupersedeFixture(t, map[run.StageType]run.StageState{
+		run.StageTypeAcceptance: run.StageStateAwaitingHostDispatch,
+	})
+	f.observeMerge(t)
+	accID := f.seedSupersededAcceptanceNoRow(t)
+
+	dup := &msDuplicateAppendAudit{Repository: f.audit}
+	f.s.cfg.AuditRepo = dup
+
+	repaired := f.s.repairMissingSupersedeRows(context.Background(), f.runID,
+		map[uuid.UUID]struct{}{}, map[uuid.UUID]struct{}{})
+	for _, r := range repaired {
+		if r.StageID == accID {
+			t.Fatalf("acceptance stage reported in Repaired after a duplicate collision; Repaired means THIS invocation restored the row, and this one wrote nothing: %+v", repaired)
+		}
+	}
+	if dup.appends != 1 {
+		t.Errorf("AppendChained calls = %d, want exactly 1 (the repair tried once and took the duplicate branch)", dup.appends)
+	}
+
+	// And the durable truth: this invocation wrote no row.
+	f.s.cfg.AuditRepo = f.audit
+	if rows := f.supersedeRows(t); len(rows) != 0 {
+		t.Errorf("supersede rows = %d, want 0 (the duplicate branch must write nothing)", len(rows))
+	}
+}
+
+// TestRepairMissingSupersedeRows_NonDuplicateErrorAlsoOmitsStage re-asserts the
+// PRE-EXISTING durability branch alongside the new one, so the duplicate branch
+// added above cannot have swallowed it: an append that fails for ANY OTHER reason
+// still leaves the stage out of Repaired, for a later reconcile to retry.
+func TestRepairMissingSupersedeRows_NonDuplicateErrorAlsoOmitsStage(t *testing.T) {
+	f := newSupersedeFixture(t, map[run.StageType]run.StageState{
+		run.StageTypeAcceptance: run.StageStateAwaitingHostDispatch,
+	})
+	f.observeMerge(t)
+	accID := f.seedSupersededAcceptanceNoRow(t)
+
+	f.s.cfg.AuditRepo = &msAppendErrAudit{Repository: f.audit, err: errors.New("chain down")}
+	repaired := f.s.repairMissingSupersedeRows(context.Background(), f.runID,
+		map[uuid.UUID]struct{}{}, map[uuid.UUID]struct{}{})
+	for _, r := range repaired {
+		if r.StageID == accID {
+			t.Fatalf("acceptance stage reported in Repaired after a NON-duplicate append failure: %+v", repaired)
+		}
+	}
+	f.s.cfg.AuditRepo = f.audit
+	if rows := f.supersedeRows(t); len(rows) != 0 {
+		t.Errorf("supersede rows = %d, want 0", len(rows))
+	}
+}
+
+// TestSupersedeParkedStages_DuplicateAppendStillReportsStageMoved pins the SWEEP
+// side of the duplicate branch (#3133): the compare-and-swap has ALREADY
+// committed by the time the audit append runs, so a stage whose append collides
+// with the 0081 index is still a stage this sweep MOVED and must still appear in
+// the returned `moved` list. Suppressing it would make the response deny a
+// transition that durably happened — the mirror-image lie of reporting an
+// unwritten row as repaired.
+func TestSupersedeParkedStages_DuplicateAppendStillReportsStageMoved(t *testing.T) {
+	f := newSupersedeFixture(t, map[run.StageType]run.StageState{
+		run.StageTypeAcceptance: run.StageStateAwaitingHostDispatch,
+	})
+	accID := f.stages[run.StageTypeAcceptance].ID
+	dup := &msDuplicateAppendAudit{Repository: f.audit}
+	f.s.cfg.AuditRepo = dup
+
+	moved := f.s.supersedeParkedStagesOnMerge(context.Background(), f.runID, nil, supersedeReasonMergeObserved)
+
+	found := false
+	for _, m := range moved {
+		if m.StageID == accID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("acceptance stage absent from the moved list after a duplicate audit collision; the CAS already committed, so the stage IS moved: %+v", moved)
+	}
+	f.s.cfg.AuditRepo = f.audit
+	if got := f.stageState(t, accID); got != run.StageStateSuperseded {
+		t.Errorf("acceptance stage state = %q, want %q (the CAS committed regardless of the audit collision)", got, run.StageStateSuperseded)
+	}
+}
+
+// TestAppendStageSupersededAudit_DuplicateLogsInfoNotMissingRowWarn makes the
+// emitter's benign-duplicate branch DELETION-DISCRIMINABLE (#3133). The branch's
+// only observable effect is the log record it emits, and that record's CLAIM is
+// the point: without the branch a duplicate collision falls through to the WARN
+// that says the row is "MISSING (repairable via reconcile-merge)" — which is
+// FALSE on this path. The row is durable; it was simply written by a peer. An
+// operator or an alert reading that WARN would chase a repair that is already
+// done.
+//
+// COUNTERFACTUAL (run by deletion). Deleting the
+// `if audit.IsStageSupersededByMergeDuplicate(err)` branch in
+// appendStageSupersededAudit makes the duplicate fall through to the WARN, so
+// the "must not claim the row is MISSING" assertion goes RED.
+func TestAppendStageSupersededAudit_DuplicateLogsInfoNotMissingRowWarn(t *testing.T) {
+	f := newSupersedeFixture(t, map[run.StageType]run.StageState{
+		run.StageTypeAcceptance: run.StageStateAwaitingHostDispatch,
+	})
+	var logBuf bytes.Buffer
+	f.s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	f.s.cfg.AuditRepo = &msDuplicateAppendAudit{Repository: f.audit}
+
+	acc := f.stages[run.StageTypeAcceptance]
+	err := f.s.appendStageSupersededAudit(context.Background(), f.runID, supersededStage{
+		StageID:   acc.ID,
+		StageType: string(acc.Type),
+		FromState: string(run.StageStateAwaitingHostDispatch),
+		Reason:    supersedeReasonRepair,
+	})
+	// The error is returned UNCHANGED, not converted to nil: "the row exists"
+	// and "this invocation wrote it" are different claims, and the repair scan
+	// reads this return to decide which one to report.
+	if !audit.IsStageSupersededByMergeDuplicate(err) {
+		t.Fatalf("err = %v, want the duplicate returned UNCHANGED (an audit.IsStageSupersededByMergeDuplicate-recognized error)", err)
+	}
+
+	logged := logBuf.String()
+	if strings.Contains(logged, "MISSING") {
+		t.Errorf("the duplicate collision logged the missing-row WARN, which is FALSE on this path — the row is durable, it was written by a concurrent writer or replica:\n%s", logged)
+	}
+	if !strings.Contains(logged, "already recorded by a concurrent writer or replica") {
+		t.Errorf("the duplicate collision did not log the benign already-recorded message:\n%s", logged)
+	}
+	if !strings.Contains(logged, `"level":"INFO"`) {
+		t.Errorf("the duplicate collision was not logged at INFO:\n%s", logged)
 	}
 }

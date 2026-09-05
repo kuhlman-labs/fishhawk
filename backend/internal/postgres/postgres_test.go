@@ -5123,7 +5123,9 @@ func TestMigrateDown_StagesSupersededReversal(t *testing.T) {
 // must be PRESENT after MigrateUp — UNIQUE, partial on the
 // acceptance_triage_arbitrated category, and keyed on BOTH run_id and
 // payload->>'outcome_sequence' — and ABSENT after one MigrateDown (index-only,
-// clean DROP INDEX). 0080 is the head, so no preparatory step-downs are needed.
+// clean DROP INDEX). downThrough names 0080 and computes its step count from
+// the LANDED version, so migrations landed above it (0081, #3133) shift `from`
+// with no edit here — the earlier "0080 is the head" note no longer holds.
 // Re-applying 0080 afterwards must succeed (idempotent re-application). Mirrors
 // TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal.
 //
@@ -5278,6 +5280,186 @@ func TestMigrateUp_AcceptanceArbitrationUnique_FailsLoudOnPreExistingDuplicates(
 	// test goes RED here.
 	if !strings.Contains(msg, "migration 0080") {
 		t.Errorf("MigrateUp error is not the DO-block pre-flight's explicit diagnostic (missing the 'migration 0080' prefix); it looks like Postgres's opaque index-build error: %v", upErr)
+	}
+	if !strings.Contains(msg, "append-only") {
+		t.Errorf("MigrateUp error does not carry the pre-flight's remedy HINT (append-only / hash-chained / recreate the database): %v", upErr)
+	}
+}
+
+// TestMigrations_StageSupersededByMergeUnique pins 0081 (#3133, E64.29): the
+// partial unique index audit_entries_stage_superseded_by_merge_once_idx must be
+// PRESENT after MigrateUp — UNIQUE, partial on the stage_superseded_by_merge
+// category, and keyed on BOTH run_id and stage_id — and ABSENT after one
+// MigrateDown (index-only, clean DROP INDEX). Re-applying afterwards must
+// succeed (idempotent re-application). Mirrors
+// TestMigrateDown_AcceptanceArbitrationUniqueReversal.
+//
+// The key must NOT be run_id alone: one run legitimately supersedes SEVERAL
+// stages (a merge can strand an acceptance stage at awaiting_host_dispatch AND a
+// review stage at awaiting_approval), so a run_id-only key would refuse the
+// second, legitimate supersession.
+//
+// Asserting the RENDERED index DEFINITION — not merely that some index exists —
+// is the done-means test for a change whose correctness compilation does not
+// enforce: a comment-only or no-op touch of the migration would satisfy the
+// scope-completeness presence gate but fails here.
+func TestMigrations_StageSupersededByMergeUnique(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	var idxDef string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT indexdef FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_stage_superseded_by_merge_once_idx'`,
+	).Scan(&idxDef); err != nil {
+		t.Fatalf("query audit_entries_stage_superseded_by_merge_once_idx after MigrateUp (missing?): %v", err)
+	}
+	if !strings.Contains(idxDef, "UNIQUE") {
+		t.Errorf("index def = %q, want a UNIQUE index (0081)", idxDef)
+	}
+	if !strings.Contains(idxDef, "stage_superseded_by_merge") {
+		t.Errorf("index def = %q, want partial WHERE category = 'stage_superseded_by_merge' (0081)", idxDef)
+	}
+	if !strings.Contains(idxDef, "run_id") {
+		t.Errorf("index def = %q, want run_id as a key column (0081)", idxDef)
+	}
+	if !strings.Contains(idxDef, "stage_id") {
+		t.Errorf("index def = %q, want stage_id as a key column — a run_id-only key would refuse the legitimate supersession of a SECOND stage of the same run (0081)", idxDef)
+	}
+
+	// Roll back through 0081: one clean index-only DROP INDEX. downThrough names
+	// 0081 and lands the schema on version 80, so migrations added above 0081
+	// need no edit here.
+	downThrough(t, url, "0081")
+	var idxCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_stage_superseded_by_merge_once_idx'`,
+	).Scan(&idxCount); err != nil {
+		t.Fatalf("query index after MigrateDown: %v", err)
+	}
+	if idxCount != 0 {
+		t.Errorf("audit_entries_stage_superseded_by_merge_once_idx count after MigrateDown = %d, want 0 (0081 reverted)", idxCount)
+	}
+	// audit_entries itself survives (0081 is index-only; the table predates it).
+	var auditTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'audit_entries'`,
+	).Scan(&auditTable); err != nil {
+		t.Fatalf("query audit_entries table after MigrateDown: %v", err)
+	}
+	if auditTable != 1 {
+		t.Errorf("'audit_entries' table count after MigrateDown = %d, want 1 (0081 is index-only)", auditTable)
+	}
+
+	// Re-apply: idempotent, and the DO-block pre-flight leaves no residue.
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp (re-apply 0081): %v", err)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_stage_superseded_by_merge_once_idx'`,
+	).Scan(&idxCount); err != nil {
+		t.Fatalf("query index after re-apply: %v", err)
+	}
+	if idxCount != 1 {
+		t.Errorf("index count after re-apply = %d, want 1", idxCount)
+	}
+}
+
+// TestMigrateUp_StageSupersededByMergeUnique_FailsLoudOnPreExistingDuplicates is
+// the DISTINCT fixture for migration 0081's DO-block pre-flight (#3133): when
+// audit_entries already carries two stage_superseded_by_merge rows sharing a
+// (run_id, stage_id) key, MigrateUp must fail with an explicit message NAMING
+// the offending run_id and stage_id — not with an opaque index-build error.
+//
+// Two-phase setup: MigrateUp to the head, step DOWN through 0081 so the index is
+// absent, seed the two colliding rows (the append-only triggers block UPDATE and
+// DELETE only, so a plain INSERT is permitted), then step UP again.
+func TestMigrateUp_StageSupersededByMergeUnique_FailsLoudOnPreExistingDuplicates(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	downThrough(t, url, "0081")
+
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Guard the SEAM: 0081's index must actually be ABSENT here, or phase 2
+	// re-applies nothing over the seeded rows and this test asserts nothing.
+	var preIdx int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_stage_superseded_by_merge_once_idx'`,
+	).Scan(&preIdx); err != nil {
+		t.Fatalf("query index after stepping down through 0081: %v", err)
+	}
+	if preIdx != 0 {
+		t.Fatalf("0081's index is still present after the step-down (count = %d, want 0) — add a preparatory rollback for each migration landed above 0081", preIdx)
+	}
+
+	runID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'pending', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	// The index keys on the stage_id COLUMN, so the colliding rows need a real
+	// stage row to reference (audit_entries.stage_id REFERENCES stages).
+	stageID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 0, 'acceptance', 'agent', 'claude-code', 'pending')`, stageID, runID,
+	); err != nil {
+		t.Fatalf("seed stage: %v", err)
+	}
+	for i, hash := range []string{"s1", "s2"} {
+		if _, err := pool.Exec(context.Background(),
+			`INSERT INTO audit_entries (id, run_id, stage_id, category, payload, entry_hash)
+			 VALUES ($1, $2, $3, 'stage_superseded_by_merge', '{"reason":"repair"}'::jsonb, $4)`,
+			uuid.New(), runID, stageID, hash,
+		); err != nil {
+			t.Fatalf("seed colliding row %d: %v", i, err)
+		}
+	}
+	pool.Close()
+
+	// Phase 2: re-apply 0081. It MUST fail, and the message must NAME the
+	// offending (run_id, stage_id).
+	upErr := postgres.MigrateUp(url)
+	if upErr == nil {
+		t.Fatal("MigrateUp succeeded over two colliding stage_superseded_by_merge rows; the DO-block pre-flight must RAISE")
+	}
+	msg := upErr.Error()
+	if !strings.Contains(msg, runID.String()) {
+		t.Errorf("MigrateUp error does not NAME the offending run_id %s: %v", runID, upErr)
+	}
+	if !strings.Contains(msg, stageID.String()) {
+		t.Errorf("MigrateUp error does not NAME the offending stage_id %s: %v", stageID, upErr)
+	}
+	if !strings.Contains(msg, "stage_superseded_by_merge") {
+		t.Errorf("MigrateUp error does not name the category: %v", upErr)
+	}
+	// DISCRIMINATION: the assertions above are satisfied by Postgres's OWN
+	// index-build failure too ("Key (run_id, stage_id)=(…, …) is duplicated", on
+	// an index whose NAME carries the category) — exactly the opaque error the
+	// DO-block pre-flight exists to replace. So assert on text ONLY the
+	// pre-flight can emit: the migration's own prefix and the
+	// append-only/hash-chain REMEDY hint. Without the DO block this test goes
+	// RED here.
+	if !strings.Contains(msg, "migration 0081") {
+		t.Errorf("MigrateUp error is not the DO-block pre-flight's explicit diagnostic (missing the 'migration 0081' prefix); it looks like Postgres's opaque index-build error: %v", upErr)
 	}
 	if !strings.Contains(msg, "append-only") {
 		t.Errorf("MigrateUp error does not carry the pre-flight's remedy HINT (append-only / hash-chained / recreate the database): %v", upErr)

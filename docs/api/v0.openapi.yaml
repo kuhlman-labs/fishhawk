@@ -16106,7 +16106,15 @@ paths:
         sweep whose transition committed and whose append then failed — is
         REPAIRED with a row carrying `reason: repair`, transitioning nothing.
         Exactly one row exists per swept stage no matter how often the verb is
-        called.
+        called AND no matter how many fishhawkd instances serve the concurrent
+        calls: since #3133 the exactly-one property is enforced by a partial
+        unique index on `(run_id, stage_id)` in the store, not by an in-process
+        lock, so it holds across replicas.
+
+        `repaired` lists ONLY the rows THIS invocation restored. A stage whose
+        row a concurrent replica wrote in the same window is omitted from
+        `repaired` even though the row is durable — the field claims authorship,
+        not existence.
 
         Read `completion_blocked` on GET `/v0/runs/{run_id}` first: it names the
         blocking stage and reads `recovery: "reconcile-merge"` only when this
@@ -16119,8 +16127,10 @@ paths:
           description: |
             What the reconcile did. `superseded` lists the stages THIS
             invocation moved; `repaired` lists already-superseded stages whose
-            missing audit row was restored. Both are empty on an idempotent
-            repeat. `run_state` is the run's state after the completion
+            missing audit row THIS invocation restored — a stage whose row a
+            concurrent fishhawkd instance wrote is omitted, because the row is
+            durable but this invocation did not restore it. Both are empty on an
+            idempotent repeat. `run_state` is the run's state after the completion
             re-evaluation, so a caller sees whether the run actually settled.
           content:
             application/json:

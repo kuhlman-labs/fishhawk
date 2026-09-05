@@ -136,6 +136,49 @@ func IsApprovalConditionsTruncatedDuplicate(err error) bool {
 		IsDuplicateOnConstraint(err, ApprovalConditionsTruncatedOnceIndex)
 }
 
+// StageSupersededByMergeOnceIndex is the name of the partial unique index
+// (migration 0081, #3133) enforcing at most one stage_superseded_by_merge audit
+// entry per (run, stage): CREATE UNIQUE INDEX ... ON audit_entries (run_id,
+// stage_id) WHERE category = 'stage_superseded_by_merge'. The reconcile-merge
+// repair (server/merge_supersede.go) is a read-then-append that #3083's fix-up
+// serialized only under a PACKAGE-LEVEL mutex, so two fishhawkd PROCESSES could
+// each observe the row missing and each append one; this index is the durable,
+// cross-process control that refuses the second write, and the mutex demotes to
+// a same-process fast path. The emitter scopes its benign already-recorded catch
+// to a collision on THIS index specifically (see
+// IsStageSupersededByMergeDuplicate), so an unrelated 23505 stays a hard error.
+//
+// The key is the TYPED (run_id, stage_id) COLUMN pair rather than the
+// payload->>'stage_id' text projection 0067 / 0068 / 0080 use, because
+// audit_entries carries a real stage_id column that the writer always populates
+// and the repair scan's supersededStageIDsWithAuditRow reads FIRST — so the
+// index key IS the reader's primary identity, with no TEXT-projection decode
+// asymmetry to reconcile.
+const StageSupersededByMergeOnceIndex = "audit_entries_stage_superseded_by_merge_once_idx"
+
+// ErrStageSupersededByMergeDuplicate is a sentinel a fake Repository can return
+// from AppendChained to simulate the already-recorded outcome (the deterministic
+// loser of the StageSupersededByMergeOnceIndex collision).
+// IsStageSupersededByMergeDuplicate recognizes it alongside a real
+// driver-surfaced unique_violation on that index, so the sweep's and the repair
+// scan's benign paths can be exercised without importing pgconn or standing up
+// real Postgres.
+var ErrStageSupersededByMergeDuplicate = errors.New("audit: duplicate stage_superseded_by_merge entry")
+
+// IsStageSupersededByMergeDuplicate reports whether err is the SPECIFIC benign
+// already-recorded collision: a unique_violation on the
+// StageSupersededByMergeOnceIndex partial unique index, or the
+// ErrStageSupersededByMergeDuplicate sentinel (for fakes). It deliberately does
+// NOT match a 23505 on any OTHER constraint touched by the AppendChained insert
+// (the entry-hash / (run_id, sequence) uniqueness): swallowing those would treat
+// an unrelated integrity failure as the benign concurrent-repair case and
+// silently drop a real error (mirrors the #1983 merge-verdict, #2594
+// parent-awaiting and #2622 approval-conditions narrowings above).
+func IsStageSupersededByMergeDuplicate(err error) bool {
+	return errors.Is(err, ErrStageSupersededByMergeDuplicate) ||
+		IsDuplicateOnConstraint(err, StageSupersededByMergeOnceIndex)
+}
+
 type postgresRepo struct {
 	pool *pgxpool.Pool
 }

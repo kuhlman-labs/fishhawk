@@ -2147,3 +2147,42 @@ func TestPostgres_AppendChainedAnchored_DedupeScanIgnoresUnusableKeys(t *testing
 		})
 	}
 }
+
+// TestIsStageSupersededByMergeDuplicate pins each recognition branch of the
+// constraint-specific helper (#3133), mirroring TestIsMergeVerdictDuplicate,
+// TestIsParentAwaitingChildScopeDecisionDuplicate and
+// TestIsApprovalConditionsTruncatedDuplicate: the sentinel and its wrapped form,
+// a real pgconn 23505 on the 0081 index (bare and wrapped) → true; nil, an
+// unrelated error, a 23505 on a DIFFERENT constraint, and a non-23505 on the
+// index → false. A pure unit test (no Postgres).
+//
+// The two FALSE pgconn cases are the counterfactual vehicle for the NARROWING:
+// broadening the helper to match ANY 23505 turns them RED. Each synthetic
+// PgError is constructed directly here — definitionally an unrelated constraint —
+// rather than produced by calling the control in setup, so the RED lands on the
+// behavioural assertion and not on a fixture failure.
+func TestIsStageSupersededByMergeDuplicate(t *testing.T) {
+	idx := audit.StageSupersededByMergeOnceIndex
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"unrelated error", errors.New("boom"), false},
+		{"sentinel", audit.ErrStageSupersededByMergeDuplicate, true},
+		{"wrapped sentinel", fmt.Errorf("audit: append: %w", audit.ErrStageSupersededByMergeDuplicate), true},
+		{"pg 23505 on the index", &pgconn.PgError{Code: "23505", ConstraintName: idx}, true},
+		{"wrapped pg 23505 on the index", fmt.Errorf("audit: append: %w", &pgconn.PgError{Code: "23505", ConstraintName: idx}), true},
+		{"pg 23505 on the entry-hash constraint", &pgconn.PgError{Code: "23505", ConstraintName: "audit_entries_entry_hash_key"}, false},
+		{"pg 23505 on the (run_id, sequence) constraint", &pgconn.PgError{Code: "23505", ConstraintName: "audit_entries_run_id_sequence_key"}, false},
+		{"pg non-23505 on the index", &pgconn.PgError{Code: "23503", ConstraintName: idx}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := audit.IsStageSupersededByMergeDuplicate(tt.err); got != tt.want {
+				t.Errorf("IsStageSupersededByMergeDuplicate(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
