@@ -24,13 +24,24 @@ import (
 // the process: the second request's re-read observes the first's committed row
 // and skips it.
 //
+// SINCE E64.29 / #3133 THIS IS A SAME-PROCESS FAST PATH, NOT THE GUARANTEE.
+// Process memory cannot arbitrate between PROCESSES, so two fishhawkd instances
+// (two replicas, or a rolling restart's overlap) could each hold their own copy
+// of this mutex, each observe the row missing and each append. The durable,
+// cross-process control is now migration 0081's partial unique index
+// audit_entries_stage_superseded_by_merge_once_idx on (run_id, stage_id) WHERE
+// category = 'stage_superseded_by_merge': the DATABASE refuses the second
+// append, and appendStageSupersededAudit recognizes that collision as the benign
+// already-recorded outcome via audit.IsStageSupersededByMergeDuplicate. This
+// mutex is RETAINED because it still spares the common same-process race a
+// round-trip that ends in a constraint violation, and because it keeps the
+// in-process guarantee intact if the index is ever rolled back.
+//
 // It is a package-level lock (not a Server field) so the whole change stays
 // within the files this fix-up owns; there is one fishhawkd Server per process,
 // so this is equivalent to a per-Server lock in practice. It serializes repair
 // across ALL runs (a single lock, not keyed by run) — acceptable because
-// reconcile-merge is a rare operator recovery path — and does NOT serialize
-// across separate fishhawkd replicas, which would need a DB-level guard
-// (advisory lock or a per-stage unique constraint) tracked separately.
+// reconcile-merge is a rare operator recovery path.
 var supersedeRepairMu sync.Mutex
 
 // CategoryStageSupersededByMerge is the audit-log category for the chained
@@ -195,6 +206,17 @@ func (s *Server) supersedeParkedStagesOnMerge(ctx context.Context, runID uuid.UU
 // swallowed failure must not let the reconcile response claim a repair that
 // never persisted (#3083 fix-up — the Repaired list is confirmed durable
 // repairs only).
+//
+// BENIGN DUPLICATE (E64.29 / #3133). Migration 0081's partial unique index makes
+// the database refuse a SECOND row for the same (run_id, stage_id) in this
+// category, which is what makes exactly-one hold across PROCESSES and not merely
+// within one. That collision is not a failure: the row is durable, it just was
+// not written by THIS invocation, so it logs at INFO rather than the WARN that
+// (correctly, for every other error) claims the row is MISSING and repairable.
+// The error is returned UNCHANGED rather than converted to nil, because the
+// return value is load-bearing for the Repaired list — "the row exists" and
+// "this invocation restored it" are different claims, and only the second
+// belongs in the response.
 func (s *Server) appendStageSupersededAudit(ctx context.Context, runID uuid.UUID, rec supersededStage) error {
 	if s.cfg.AuditRepo == nil {
 		return nil
@@ -216,6 +238,13 @@ func (s *Server) appendStageSupersededAudit(ctx context.Context, runID uuid.UUID
 		ActorKind: &actorKind,
 		Payload:   payload,
 	}); err != nil {
+		if audit.IsStageSupersededByMergeDuplicate(err) {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"merge supersede: stage_superseded_by_merge row already recorded by a concurrent writer or replica; no second row appended",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", rec.StageID.String()))
+			return err
+		}
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge supersede: append stage_superseded_by_merge audit entry failed; row is MISSING (repairable via reconcile-merge)",
 			slog.String("run_id", runID.String()),
@@ -397,13 +426,21 @@ func (s *Server) handleReconcileMerge(w http.ResponseWriter, r *http.Request) {
 // priorRows is the PRE-sweep snapshot the handler read; it is one of the two
 // membership guards (a stage recorded before the sweep is never repaired).
 //
-// ATOMICITY (#3083 fix-up). The check-then-append is serialized under
-// s.supersedeRepairMu AND re-reads the CURRENT audit rows inside the lock, so
-// two concurrent reconcile-merge requests can no longer both observe a missing
-// row and both append: the second acquires the lock after the first commits,
-// its fresh read sees the row, and it skips the stage. The pre-sweep priorRows
-// snapshot alone could not close this — both requests captured it before either
-// wrote — so the fresh under-lock read is what makes the guarantee hold.
+// ATOMICITY (#3083 fix-up, hardened by E64.29 / #3133). The check-then-append is
+// serialized under supersedeRepairMu AND re-reads the CURRENT audit rows inside
+// the lock, so two concurrent reconcile-merge requests in ONE PROCESS can no
+// longer both observe a missing row and both append: the second acquires the
+// lock after the first commits, its fresh read sees the row, and it skips the
+// stage. The pre-sweep priorRows snapshot alone could not close this — both
+// requests captured it before either wrote — so the fresh under-lock read is
+// what makes the same-process guarantee hold.
+//
+// ACROSS PROCESSES the mutex is no guarantee at all (each fishhawkd holds its
+// own), so the durable control is migration 0081's partial unique index on
+// (run_id, stage_id): the losing append is REFUSED by the database and its error
+// satisfies audit.IsStageSupersededByMergeDuplicate. That loser records the
+// stage as present and omits it from the returned Repaired list — the row is
+// durable, but this invocation did not restore it.
 //
 // DURABILITY (#3083 fix-up). A stage is added to the returned Repaired list
 // ONLY when its audit append SUCCEEDS. appendStageSupersededAudit swallows the
@@ -454,6 +491,17 @@ func (s *Server) repairMissingSupersedeRows(ctx context.Context, runID uuid.UUID
 			Reason:    supersedeReasonRepair,
 		}
 		if aerr := s.appendStageSupersededAudit(ctx, runID, rec); aerr != nil {
+			if audit.IsStageSupersededByMergeDuplicate(aerr) {
+				// Migration 0081's index refused the second row: a concurrent
+				// writer — in this process or another fishhawkd — already
+				// recorded this supersession. The row demonstrably EXISTS, so
+				// record it in the in-scan set (nothing later in this scan may
+				// try again), but it is NOT reported as repaired: Repaired
+				// means "this invocation restored the row", and this invocation
+				// wrote nothing.
+				current[st.ID] = struct{}{}
+				continue
+			}
 			// The append failed and swallowed the error; the row is NOT
 			// durable, so it must not be reported as repaired. Leave it for a
 			// later reconcile to retry.

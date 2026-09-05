@@ -312,6 +312,76 @@ hypothetical real deployment it is a chain-aware rewrite that re-hashes the
 affected run's whole chain (invalidating any published export) or an explicitly
 recorded, accepted chain break.
 
+## At-most-one stage_superseded_by_merge per (run, stage) (0081 / #3133)
+
+The `stage_superseded_by_merge` category (`server/merge_supersede.go`'s
+`appendStageSupersededAudit`, #3083) is gated to **at most one row per
+(run, stage)** by migration 0081's partial unique index
+`audit_entries_stage_superseded_by_merge_once_idx` (`ON audit_entries
+(run_id, stage_id) WHERE category = 'stage_superseded_by_merge'`).
+
+Unlike 0080's backstop, this index is the **PRIMARY cross-process control**.
+`POST /v0/runs/{run_id}/reconcile-merge`'s repair scan is a read-then-append
+(is a row present? if not, write one), and #3083's fix-up serialized it only
+under a PACKAGE-LEVEL mutex — so two fishhawkd PROCESSES (two replicas, or a
+rolling restart's overlap) could each observe the row missing and each append.
+Process memory cannot arbitrate between processes; the database can. The
+in-process `supersedeRepairMu` is RETAINED and demotes to a **same-process fast
+path**.
+
+**The key is the TYPED `(run_id, stage_id)` COLUMN pair**, NOT the
+`payload->>'stage_id'` text projection 0067 / 0068 / 0080 use. `audit_entries`
+carries a real `stage_id` UUID column, the writer always populates it, and the
+repair scan's `supersededStageIDsWithAuditRow` reads that COLUMN first (falling
+back to the payload only when the column is nil). So the index key IS the
+reader's primary identity — with no `IMMUTABLE`-expression argument to make and
+none of 0080's documented TEXT-projection decode asymmetry (a JSON number `7`
+and a JSON string `"7"` collapsing to the same key `'7'`) to reconcile.
+
+The key is `(run_id, stage_id)`, NOT `run_id` alone: ONE run legitimately
+supersedes SEVERAL stages — a merge can strand an `acceptance` stage at
+`awaiting_host_dispatch` AND a `review` stage at `awaiting_approval`, and a
+fan-out can park more than one child. A `run_id`-only key would refuse the
+second, legitimate supersession
+(`TestSupersedeAudit_PG_IndexPermitsASecondStageOfTheSameRun`).
+
+**Honest residual.** `audit_entries.stage_id` is NULLABLE (migration 0002) and
+PostgreSQL treats NULLs as DISTINCT in a unique index (`NULLS NOT DISTINCT` is
+opt-in and is NOT used), so a hypothetical stage-less entry in this category is
+unconstrained. The only non-test writer sets `StageID` unconditionally from the
+swept stage, so the residual is hypothetical; a future writer that set the
+payload key but left the column NULL would evade the index.
+
+`IsStageSupersededByMergeDuplicate(err)` in `postgres.go` matches ONLY a
+`unique_violation` on `StageSupersededByMergeOnceIndex` — or the
+`ErrStageSupersededByMergeDuplicate` sentinel for fakes — mirroring the
+narrowings above; a 23505 on the entry-hash or `(run_id, sequence)` constraint
+stays a hard error. On that collision the emitter logs INFO (the row is durable,
+it just was not written by THIS invocation) instead of the WARN that claims the
+row is MISSING and repairable, and returns the error UNCHANGED so the repair
+scan can omit the stage from its `Repaired` list.
+
+**The guarantee is pinned against real Postgres, not argued.**
+`TestSupersedeAudit_PG_TwoPoolsWriteExactlyOneRow` races the same
+`(run, stage)` append from TWO INDEPENDENT pgxpool pools — what a second
+fishhawkd replica actually is — and asserts exactly one committed row;
+`TestSupersedeAudit_PG_ExactlyOneRowRequiresTheIndex` runs that identical race
+with the index DROPPED and asserts TWO rows land, so the index is empirically
+the control rather than presumed to be.
+
+**The migration FAILS LOUD** on a pre-existing duplicate: a DO-block pre-flight
+detects them and RAISEs naming the offending `(run_id, stage_id)` and entry ids,
+rather than surfacing an opaque index-build error. Its documented remedy is
+chain-integrity-safe, and the obvious remedy is WRONG: there is no routine
+"delete the redundant row". Migration 0002's append-only triggers refuse a
+DELETE outright, and even with them dropped, removing a hash-chained row breaks
+continuity for every later entry in that run and breaks the SHIPPED verification
+surface in the separate `verifier/internal/audit` module. In this PRE-ALPHA repo
+the honest remedy is to **recreate the database**; for a hypothetical real
+deployment it is a chain-aware rewrite that re-hashes the affected run's whole
+chain (invalidating any published export) or an explicitly recorded, accepted
+chain break.
+
 ## Frozen HashInputs (deliberate)
 
 `account_id` is **not** part of the canonical hash (`chain.go`
