@@ -101,6 +101,31 @@ components:
         content_hash:
           type: string
           description: The resolved artifact's content hash.
+        window_closed:
+          type: boolean
+          description: |
+            True once the on-approval apply hook has SETTLED this artifact's
+            capture window (E54.48 / #2991). After it, a capture for this
+            artifact is refused with `grooming_window_closed`.
+        settlement:
+          type: object
+          description: |
+            The closing watermark's facts, present only when window_closed is
+            true — so an operator who recorded a rejection reads back the
+            settlement rather than an empty set. Pre-watermark dispositions are
+            still returned in `dispositions` unchanged.
+          properties:
+            settlement:
+              type: string
+              enum: [approved, rejected]
+              description: How the window was settled.
+            closed_at:
+              type: string
+              format: date-time
+            audit_sequence:
+              type: integer
+              format: int64
+              description: Chain sequence of the watermark row.
         dispositions:
           type: array
           description: |
@@ -8007,11 +8032,16 @@ paths:
         this row is what the OPERATOR DECIDED; that one is what was APPLIED, and
         the second derives from the first.
 
-        **Nothing consumes these dispositions.** This endpoint is CAPTURE only:
-        recording an approval applies nothing, closes no duplicate and re-ranks
-        no backlog. The consumption half — the apply stage and its concurrency
-        protocol — is #2991. Until it lands, a recorded disposition is inert,
-        forward-compatible audit history.
+        **What consumption does (E54.48 / #2991).** On the groom stage's
+        approval the apply hook consumes these dispositions: an explicit
+        `approved` applies the entry AND is the ONLY thing that unlocks a gated
+        destructive class (a gated-mode duplicate close now dispatches);
+        `rejected` does not apply; `amended` is NOT an approval path; an
+        undispositioned HYGIENE entry still auto-applies while an undispositioned
+        gated entry does not. Note the asymmetry: `scoping` is report-mode in
+        this repo, so an approved decomposition stays surface-only. The capture
+        WINDOW closes at settlement — after the hook settles, a capture for that
+        report is refused (`409 grooming_window_closed`).
 
         **Which report.** The dispositions attach to the run's NEWEST
         `grooming_report` artifact, resolved server-side as the maximum by
@@ -8020,12 +8050,14 @@ paths:
         every audit payload. GET uses the same resolver, so capture and
         read-back agree on WHICH report by construction.
 
-        **Batch-atomic.** The WHOLE batch is validated before ANY row is
-        appended: a request naming one unknown `entry_id` records NOTHING, so a
-        partially-recorded capture is unreachable. The one exception is an audit
-        append that fails PART WAY through a batch: the rows already appended are
-        durable, so the `500` reports `details.recorded` / `details.requested`
-        and a repeat POST is safe (capture is last-wins).
+        **Batch-atomic (one capture is one transaction).** The WHOLE batch is
+        validated before ANY row is appended AND appended in ONE transaction
+        under the run-row lock, after checking for a closing watermark. A request
+        naming one unknown `entry_id`, or a batch whose append fails part-way,
+        records NOTHING — a partially-recorded capture is unreachable. (An
+        in-memory deployment without the atomic capability falls back to a
+        per-row append whose mid-batch `500` reports `details.recorded` /
+        `details.requested`; the production store never does.)
 
         **One JSON document per request.** Trailing content after the
         dispositions object — a second batch, or garbage — is
@@ -8118,9 +8150,13 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
-            The run carries no `grooming_report` artifact, so there is nothing
-            to disposition (`grooming_report_absent`). Distinct from a report
-            that exists but cannot be read, which is a 500.
+            One of two cases. (1) `grooming_report_absent` — the run carries no
+            `grooming_report` artifact, so there is nothing to disposition
+            (distinct from a report that exists but cannot be read, which is a
+            500). (2) `grooming_window_closed` (E54.48 / #2991) — the report's
+            capture window has already been SETTLED by the apply hook, so NOTHING
+            was recorded and the dispositions sent are not consumable;
+            `details` carry `artifact_id`, `settlement` and `watermark_sequence`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

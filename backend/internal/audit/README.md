@@ -171,6 +171,35 @@ RETURNING`, an empty result meaning already-seen) and the
 `IsDuplicateOnConstraint` narrowings for #1983 / #2594 / #2622 below;
 `IsAcceptanceArbitrationDuplicate` is the #2536 member of that family.
 
+## Grooming capture/apply window (`GroomingWindowAppender`, #2991)
+
+`grooming_window.go` carries the capture/apply CONCURRENCY PROTOCOL that lets the
+on-approval grooming apply hook safely CONSUME the per-entry dispositions #2843
+captures. Two atomic operations, both taking `LockRunForUpdate(RunID)` FIRST then
+reading under the lock at READ COMMITTED (no `TxOptions`, the same reason
+`AppendChainedAnchoredTx` documents):
+
+- `AppendChainedGroomingDispositionBatch` appends a whole capture batch in ONE
+  transaction after scanning for an artifact-bound closing WATERMARK
+  (`grooming_apply_window_closed`). A closed window returns
+  `*GroomingWindowClosedError` writing NOTHING; a mid-batch failure rolls the
+  WHOLE batch back — **one capture is one transaction**.
+- `AppendChainedGroomingWindowClose` settles the window: it returns an EXISTING
+  artifact-bound watermark UNCHANGED (**the first watermark is permanent**), else
+  appends the watermark and returns it with the consumed dispositions. The
+  consumed set is **artifact-scoped and below the watermark** — a run may carry
+  multiple grooming reports, so a disposition against a different artifact never
+  enters another's consumed set.
+
+`GroomingWindowAppender` is an OPTIONAL capability kept OFF the `Repository`
+interface (mirroring `AnchoredChainAppender` / `RetryBudgetAppender`), with a
+`var _ GroomingWindowAppender = (*postgresRepo)(nil)` compile-time assertion so a
+production repo silently losing it is a build failure. The server's fallback for
+a non-capable repo (in-memory fakes only) is a non-atomic read-then-append —
+**the atomicity guarantee holds only for the Postgres repository.** Concurrency,
+rollback, permanence and the two-artifact scoping are pinned in
+`grooming_window_test.go` against real Postgres.
+
 ## At-most-one merge_verdict_recorded per run (0062 / #1983)
 
 The `merge_verdict_recorded` category (POST `/v0/runs/{run_id}/merge`) is

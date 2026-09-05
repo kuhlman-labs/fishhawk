@@ -1857,6 +1857,7 @@ type groomingDispositionRequestBody struct {
 //   - 403 operator_agent_forbidden (a delegated operator-agent token)
 //   - 403 insufficient_scope (token lacks write:approvals)
 //   - 409 grooming_report_absent (the run shipped no grooming_report)
+//   - 409 grooming_window_closed (the report's capture window has been settled; nothing recorded)
 //   - 422 grooming_entry_unknown (an id the newest report does not declare)
 //   - 503 grooming_dispositions_unconfigured
 func (c *apiClient) RecordGroomingDispositions(ctx context.Context, runID uuid.UUID,

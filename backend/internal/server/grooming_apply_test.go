@@ -262,6 +262,97 @@ func (r *groomingApplyReader) ListWorkItems(context.Context, workmgmt.ListWorkIt
 	return nil, errors.New("not used by the apply layer")
 }
 
+// groomingApplyAuditFake decorates the shared approvalAuditFake (unmodified,
+// binding condition C2) with a FUNCTIONAL ListForRunByCategory and a SEQUENCED
+// AppendChained, which the #2991 window settlement's non-atomic fallback needs
+// (the base fake's ListForRunByCategory returns an error and its AppendChained
+// returns a zero Sequence). It does NOT implement audit.GroomingWindowAppender,
+// so the apply-hook unit tests exercise the fallback; the atomic capability path
+// is covered by the pgtest suites.
+type groomingApplyAuditFake struct {
+	*approvalAuditFake
+	// failCategories fails AppendChained for exactly these categories, sparing
+	// every other (notably the window watermark), so a test can model a SINK
+	// outage that must not abort dispatch while the settlement still lands.
+	failCategories map[string]bool
+}
+
+func (a *groomingApplyAuditFake) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if a.failCategories[p.Category] {
+		return nil, errors.New("groomingApplyAuditFake: injected append failure for " + p.Category)
+	}
+	e, err := a.approvalAuditFake.AppendChained(ctx, p)
+	if err != nil || e == nil {
+		return e, err
+	}
+	a.mu.Lock()
+	// This row was just appended last, so its 1-based position is len(appended).
+	e.Sequence = int64(len(a.appended))
+	e.Payload, e.Category, e.Timestamp, e.StageID = p.Payload, p.Category, p.Timestamp, p.StageID
+	a.mu.Unlock()
+	return e, nil
+}
+
+func (a *groomingApplyAuditFake) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []*audit.Entry
+	for i := range a.appended {
+		p := a.appended[i]
+		if p.RunID != runID || p.Category != category {
+			continue
+		}
+		rid := p.RunID
+		out = append(out, &audit.Entry{
+			Sequence: int64(i + 1), RunID: &rid, StageID: p.StageID,
+			Category: p.Category, Payload: p.Payload, Timestamp: p.Timestamp,
+		})
+	}
+	return out, nil
+}
+
+// seedDisposition appends a grooming_disposition_recorded row DIRECTLY, so an
+// apply-hook test can hand the settlement a recorded verdict to consume. Bad/
+// good state is seeded by construction rather than by driving the capture verb.
+func (f *groomingApplyFixture) seedDisposition(t *testing.T, artifactID, entryID, entryClass, verdict, closeTarget string) {
+	t.Helper()
+	payload, err := json.Marshal(groomingDispositionPayload{
+		RunID: f.stage.RunID.String(), StageID: f.stage.ID.String(),
+		ArtifactID: artifactID, EntryID: entryID, EntryClass: entryClass,
+		Verdict: verdict, CloseTarget: closeTarget,
+	})
+	if err != nil {
+		t.Fatalf("marshal disposition: %v", err)
+	}
+	stageID := f.stage.ID
+	if _, err := f.audit.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: f.stage.RunID, StageID: &stageID, Timestamp: time.Now().UTC(),
+		Category: CategoryGroomingDispositionRecorded, Payload: payload,
+	}); err != nil {
+		t.Fatalf("seed disposition: %v", err)
+	}
+}
+
+// windowRows returns the grooming_apply_window_closed rows for the run.
+func (f *groomingApplyFixture) windowRows(t *testing.T) []*audit.Entry {
+	t.Helper()
+	rows, err := f.audit.ListForRunByCategory(context.Background(), f.stage.RunID, audit.GroomingApplyWindowClosedCategory)
+	if err != nil {
+		t.Fatalf("list window rows: %v", err)
+	}
+	return rows
+}
+
+// reportArtifactID returns the id of the seeded grooming_report artifact.
+func (f *groomingApplyFixture) reportArtifactID(t *testing.T) string {
+	t.Helper()
+	arts := f.artifacts.byStage[f.stage.ID]
+	if len(arts) == 0 {
+		t.Fatal("fixture has no grooming_report artifact")
+	}
+	return arts[0].ID.String()
+}
+
 // ---------------------------------------------------------------------------
 // Local harness (binding condition C2)
 // ---------------------------------------------------------------------------
@@ -319,7 +410,7 @@ type groomingApplyFixture struct {
 	server    *Server
 	runs      *approvalRunRepo
 	approvals *groomingApplyApprovalRepo
-	audit     *approvalAuditFake
+	audit     *groomingApplyAuditFake
 	artifacts *groomingSourceArtifactRepo
 	mutator   *groomingApplyMutator
 	reader    *groomingApplyReader
@@ -334,7 +425,7 @@ func newGroomingApplyFixture(t *testing.T, opts groomingApplyOpts) *groomingAppl
 
 	ar := &groomingApplyApprovalRepo{fakeApprovalRepo: newFakeApprovalRepo()}
 	rr := newApprovalRunRepo()
-	au := newApprovalAuditFake()
+	au := &groomingApplyAuditFake{approvalAuditFake: newApprovalAuditFake()}
 	arts := &groomingSourceArtifactRepo{byStage: map[uuid.UUID][]*artifact.Artifact{}}
 
 	stage := rr.seedStage(run.StageStateAwaitingApproval)
@@ -495,58 +586,190 @@ func (f *groomingApplyFixture) degradeReason(t *testing.T) string {
 	return got.DegradeReason
 }
 
-// ---------------------------------------------------------------------------
-// The hygiene class filter (COUNTERFACTUAL 3)
-// ---------------------------------------------------------------------------
+// TestGroomingModesForRun_GatedClassesNeverAuto asserts the delegation boundary
+// did not widen (#2991): over this repo's shipped-shape grooming spec, the hook's
+// own projection resolves ordering/dedup to gated and scoping to report — NEVER
+// auto — so consuming dispositions cannot silently make a destructive class
+// self-dispatch. The parse-time refusals
+// (spec.TestValidateAutonomy_GroomingNonDelegableClassesRefuseAuto,
+// spec.TestShippedGroomingExample_MatrixDefaults) keep `mode: auto` unwritable on
+// these classes and stay green and unedited.
+func TestGroomingModesForRun_GatedClassesNeverAuto(t *testing.T) {
+	f := newGroomingApplyFixture(t, groomingApplyOpts{})
+	modes := f.server.groomingModesForRun(context.Background(), f.run)
 
-// TestHygieneOnlyGroomingDecisions_ExcludesDestructiveClasses is the pure
-// class-boundary assertion. This is the control that keeps `dedup` and
-// `scoping` from closing or iceboxing real issues on a single gate approval.
-//
-// COUNTERFACTUAL: widen the filter (drop the GroomingActionClassFor ==
-// ActionGroomHygiene test, or add the other four arrays to the loop) and this
-// reddens on the exact-set comparison.
-func TestHygieneOnlyGroomingDecisions_ExcludesDestructiveClasses(t *testing.T) {
-	report, ids := groomingApplyFullReport()
-
-	got := hygieneOnlyGroomingDecisions(report)
-	want := map[string]bool{ids.hygiene: true, ids.dependency: true}
-
-	if len(got) != len(want) {
-		t.Fatalf("decisions = %d (%+v), want exactly %d (the hygiene defect and the dependency edge)",
-			len(got), got, len(want))
+	if modes["ordering"] != workmgmt.GroomingModeGated {
+		t.Errorf("ordering mode = %q, want gated", modes["ordering"])
 	}
-	for _, d := range got {
-		if !want[d.EntryID] {
-			t.Errorf("decision for %q is not a hygiene-class entry; the filter has widened", d.EntryID)
-		}
-		if d.Verdict != workmgmt.GroomingApproved {
-			t.Errorf("verdict for %q = %q, want approved", d.EntryID, d.Verdict)
-		}
-		if d.CloseTarget != "" {
-			t.Errorf("decision for %q carries CloseTarget %q; no hygiene kind is a duplicate close",
-				d.EntryID, d.CloseTarget)
-		}
+	if modes["dedup"] != workmgmt.GroomingModeGated {
+		t.Errorf("dedup mode = %q, want gated", modes["dedup"])
 	}
-	for _, forbidden := range []string{ids.ordering, ids.duplicate, ids.decomposition, ids.visionDrift} {
-		if want[forbidden] {
-			t.Fatalf("fixture bug: %q is both a destructive id and an expected hygiene id", forbidden)
+	if modes["scoping"] != workmgmt.GroomingModeReport {
+		t.Errorf("scoping mode = %q, want report", modes["scoping"])
+	}
+	for _, c := range []string{"ordering", "dedup", "scoping"} {
+		if modes[c] == workmgmt.GroomingModeAuto {
+			t.Errorf("action class %q resolved auto; the delegation boundary has widened", c)
 		}
 	}
 }
 
-// TestHygieneOnlyGroomingDecisions_EdgeCases pins the two defensive branches of
-// the synthesizer: a nil report, and an entry with an empty id (dropped rather
-// than decided, because an empty id would fail the apply layer's join check and
-// refuse the WHOLE apply).
-func TestHygieneOnlyGroomingDecisions_EdgeCases(t *testing.T) {
-	if got := hygieneOnlyGroomingDecisions(nil); got != nil {
-		t.Errorf("nil report yielded %+v, want nil", got)
+// ---------------------------------------------------------------------------
+// mergeGroomingDecisions — the merge policy (#2991)
+// ---------------------------------------------------------------------------
+
+// decisionByID indexes a decision slice for assertions.
+func decisionByID(ds []workmgmt.GroomingDecision) map[string]workmgmt.GroomingDecision {
+	out := map[string]workmgmt.GroomingDecision{}
+	for _, d := range ds {
+		out[d.EntryID] = d
 	}
+	return out
+}
+
+// TestMergeGroomingDecisions_UndispositionedHygieneApprovedNoGate is the base
+// layer + the SynthesizedHygieneDoesNotGrantGateApproval control: with NO
+// dispositions, the hygiene defect and dependency edge get a synthesized
+// `approved` decision, and GateApproved is populated for NEITHER.
+//
+// COUNTERFACTUAL (hygiene-action-class filter): widen the base layer (drop the
+// GroomingActionClassFor == ActionGroomHygiene test, or add the other arrays)
+// and the exact-set assertion reddens. COUNTERFACTUAL (explicit-approved-only on
+// GateApproved): populate the gate map from a synthesized approval and the
+// gate-nil assertion reddens.
+func TestMergeGroomingDecisions_UndispositionedHygieneApprovedNoGate(t *testing.T) {
+	report, ids := groomingApplyFullReport()
+
+	got, gate := mergeGroomingDecisions(report, nil)
+	byID := decisionByID(got)
+
+	want := map[string]bool{ids.hygiene: true, ids.dependency: true}
+	if len(got) != len(want) {
+		t.Fatalf("decisions = %d (%+v), want exactly %d (hygiene defect + dependency edge)", len(got), got, len(want))
+	}
+	for id := range want {
+		d, ok := byID[id]
+		if !ok {
+			t.Errorf("hygiene-class entry %q missing a decision", id)
+			continue
+		}
+		if d.Verdict != workmgmt.GroomingApproved {
+			t.Errorf("verdict for %q = %q, want approved", id, d.Verdict)
+		}
+	}
+	// A synthesized hygiene approval must NOT grant a per-entry gate approval.
+	if len(gate) != 0 {
+		t.Errorf("GateApproved = %v, want empty/nil: an undispositioned hygiene default must not unlock a destructive class", gate)
+	}
+}
+
+// TestMergeGroomingDecisions_UndispositionedGatedEntryGetsNoDecision is the
+// COUNTERFACTUAL for the hygiene-action-class filter's exclusion half: an
+// undispositioned DEDUP entry is absent from Decisions entirely, so ApplyGrooming
+// records it no_decision.
+func TestMergeGroomingDecisions_UndispositionedGatedEntryGetsNoDecision(t *testing.T) {
+	report, ids := groomingApplyFullReport()
+	got, _ := mergeGroomingDecisions(report, nil)
+	if _, ok := decisionByID(got)[ids.duplicate]; ok {
+		t.Errorf("undispositioned dedup entry %q got a decision; a gated class must reach rule 2 with no decision", ids.duplicate)
+	}
+}
+
+// TestMergeGroomingDecisions_RecordedApprovedDedupGrantsGate pins that an
+// explicit `approved` dedup disposition produces an approved decision WITH
+// GateApproved true and the close_target threaded — the destructive unlock.
+func TestMergeGroomingDecisions_RecordedApprovedDedupGrantsGate(t *testing.T) {
+	report, ids := groomingApplyFullReport()
+	got, gate := mergeGroomingDecisions(report, map[string]consumedDisposition{
+		ids.duplicate: {Verdict: "approved", CloseTarget: "kuhlman-labs/fishhawk#16"},
+	})
+	d, ok := decisionByID(got)[ids.duplicate]
+	if !ok {
+		t.Fatalf("approved dedup disposition produced no decision; got %+v", got)
+	}
+	if d.Verdict != workmgmt.GroomingApproved || d.CloseTarget != "kuhlman-labs/fishhawk#16" {
+		t.Errorf("decision = %+v, want approved with close_target threaded", d)
+	}
+	if !gate[ids.duplicate] {
+		t.Errorf("GateApproved[%q] = false, want true — an explicit approved disposition unlocks the gated class", ids.duplicate)
+	}
+}
+
+// TestMergeGroomingDecisions_RecordedRejectedHygieneOverrides pins that a
+// recorded `rejected` on a hygiene entry OVERRIDES the synthesized approval and
+// grants no gate approval.
+func TestMergeGroomingDecisions_RecordedRejectedHygieneOverrides(t *testing.T) {
+	report, ids := groomingApplyFullReport()
+	got, gate := mergeGroomingDecisions(report, map[string]consumedDisposition{
+		ids.hygiene: {Verdict: "rejected"},
+	})
+	d := decisionByID(got)[ids.hygiene]
+	if d.Verdict != workmgmt.GroomingRejected {
+		t.Errorf("verdict for %q = %q, want rejected (the recorded verdict overrides the synthesized approval)", ids.hygiene, d.Verdict)
+	}
+	if gate[ids.hygiene] {
+		t.Errorf("GateApproved[%q] = true, want false — a rejection grants nothing", ids.hygiene)
+	}
+}
+
+// TestMergeGroomingDecisions_AmendedDoesNotGrantGateApproval is the
+// COUNTERFACTUAL for the explicit-approved-only condition on GateApproved: a
+// recorded `amended` becomes an amended decision and grants NO gate approval, so
+// amended is not an approval path.
+//
+// The disposition is on a HYGIENE entry so the byte-identical clean pairing is
+// avoided: the base layer would synthesize `approved` for it, so the amended
+// overlay must both change the verdict AND leave the gate empty.
+func TestMergeGroomingDecisions_AmendedDoesNotGrantGateApproval(t *testing.T) {
+	report, ids := groomingApplyFullReport()
+	got, gate := mergeGroomingDecisions(report, map[string]consumedDisposition{
+		ids.hygiene: {Verdict: "amended"},
+	})
+	if d := decisionByID(got)[ids.hygiene]; d.Verdict != workmgmt.GroomingAmended {
+		t.Errorf("verdict for %q = %q, want amended", ids.hygiene, d.Verdict)
+	}
+	if len(gate) != 0 {
+		t.Errorf("GateApproved = %v, want empty: amended must not grant a gate approval", gate)
+	}
+}
+
+// TestMergeGroomingDecisions_DropsUnjoinableDisposition is the COUNTERFACTUAL for
+// the report-declares-this-entry overlay filter: a disposition naming an entry
+// the report does NOT declare is dropped, so it never reaches ApplyGrooming's
+// rule-1 join (which would refuse the WHOLE apply on an unjoined id).
+func TestMergeGroomingDecisions_DropsUnjoinableDisposition(t *testing.T) {
+	report, _ := groomingApplyFullReport()
+	unknown := "ordering:github/acme/app#" + uuid.NewString()
+	got, gate := mergeGroomingDecisions(report, map[string]consumedDisposition{
+		unknown: {Verdict: "approved"},
+	})
+	if _, ok := decisionByID(got)[unknown]; ok {
+		t.Errorf("an unjoinable disposition %q produced a decision; it must be dropped", unknown)
+	}
+	if gate[unknown] {
+		t.Errorf("GateApproved[%q] = true; an unjoinable disposition must grant nothing", unknown)
+	}
+}
+
+// TestMergeGroomingDecisions_NilReport pins the nil-report guard.
+func TestMergeGroomingDecisions_NilReport(t *testing.T) {
+	got, gate := mergeGroomingDecisions(nil, map[string]consumedDisposition{"x": {Verdict: "approved"}})
+	if got != nil || gate != nil {
+		t.Errorf("nil report yielded (%+v, %+v), want (nil, nil)", got, gate)
+	}
+}
+
+// TestMergeGroomingDecisions_BlankHygieneIDDropped pins the empty-id fail-safe:
+// a schema-validated report always carries an id, but a blank one would fail the
+// apply layer's join and refuse the WHOLE apply, so it is dropped from the base.
+func TestMergeGroomingDecisions_BlankHygieneIDDropped(t *testing.T) {
 	report, ids := groomingApplyFullReport()
 	report.HygieneDefects[0].ID = "   "
-	got := hygieneOnlyGroomingDecisions(report)
-	if len(got) != 1 || got[0].EntryID != ids.dependency {
+	got, _ := mergeGroomingDecisions(report, nil)
+	if _, ok := decisionByID(got)[ids.dependency]; !ok {
+		t.Errorf("dependency edge missing; got %+v", got)
+	}
+	if len(got) != 1 {
 		t.Errorf("decisions = %+v, want only the dependency edge (the blank-id hygiene entry is dropped)", got)
 	}
 }
@@ -577,8 +800,13 @@ func TestApplyApprovedGrooming_RejectDispatchesNothing(t *testing.T) {
 		t.Errorf("mutator dialed %v on a REJECT; a rejected report must apply nothing", dialed)
 	}
 	if rows := f.groomingAudit(); len(rows) != 0 {
-		t.Errorf("grooming audit rows = %d (%v), want 0 — a reject must not even enter the apply",
+		t.Errorf("grooming audit rows = %d (%v), want 0 — a reject dispatches nothing and writes no apply/mutation row",
 			len(rows), f.groomingAuditCategories())
+	}
+	// #2991: the reject now SETTLES the window (a grooming_apply_window_closed
+	// row), which is not part of the apply/mutation audit family above.
+	if rows := f.windowRows(t); len(rows) != 1 {
+		t.Errorf("window rows = %d, want 1 — a reject settles the capture window", len(rows))
 	}
 }
 
@@ -600,6 +828,123 @@ func TestSubmitApproval_RejectOnGroomStageAppliesNothing(t *testing.T) {
 	}
 	if rows := f.groomingAudit(); len(rows) != 0 {
 		t.Errorf("grooming audit rows = %d, want 0", len(rows))
+	}
+}
+
+// TestApplyApprovedGrooming_RejectClosesWindowAndAppliesNothing is the
+// counterfactual vehicle for the C1 REJECT-PATH SETTLEMENT (#2991): a reject
+// applies nothing AND settles the window `rejected`, as decisively as approval
+// closes it.
+//
+// THE STAGE IS RATIFIED BY CONSTRUCTION (one approve row, no rejections), so C3
+// would pass — C1 is the only thing standing between this call and both a
+// dispatch and an `approved` settlement.
+//
+// COUNTERFACTUAL: delete the settleGroomingWindow call in C1 and the watermark
+// assertion reddens (no window row). Delete the whole C1 return and the
+// zero-dispatch assertion reddens (hygiene dispatches on the reject path).
+func TestApplyApprovedGrooming_RejectClosesWindowAndAppliesNothing(t *testing.T) {
+	f := newGroomingApplyFixture(t, groomingApplyOpts{})
+	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
+
+	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionReject)
+
+	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
+		t.Errorf("mutator dialed %v on a REJECT; a rejected report must apply nothing", dialed)
+	}
+	rows := f.windowRows(t)
+	if len(rows) != 1 {
+		t.Fatalf("window rows = %d, want 1 — a reject must settle the window", len(rows))
+	}
+	var wp groomingWindowPayload
+	if err := json.Unmarshal(rows[0].Payload, &wp); err != nil {
+		t.Fatalf("decode window payload: %v", err)
+	}
+	if wp.Settlement != "rejected" || wp.ArtifactID != f.reportArtifactID(t) {
+		t.Errorf("watermark = %+v, want settlement=rejected artifact=%s", wp, f.reportArtifactID(t))
+	}
+}
+
+// TestApplyApprovedGrooming_RejectSettlementFailureLoggedAppliesNothing exercises
+// the reject-path settlement ERROR branch: the watermark append fails, so
+// settleGroomingWindow returns an error the hook logs and swallows — nothing is
+// dispatched and no watermark lands. (The failCategories map fails ONLY the
+// window category, seeding the outage by construction.)
+func TestApplyApprovedGrooming_RejectSettlementFailureLoggedAppliesNothing(t *testing.T) {
+	f := newGroomingApplyFixture(t, groomingApplyOpts{})
+	f.audit.failCategories = map[string]bool{audit.GroomingApplyWindowClosedCategory: true}
+
+	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionReject)
+
+	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
+		t.Errorf("mutator dialed %v on a REJECT with a failed settlement", dialed)
+	}
+	if rows := f.windowRows(t); len(rows) != 0 {
+		t.Errorf("window rows = %d, want 0 — the watermark append failed", len(rows))
+	}
+}
+
+// TestApplyApprovedGrooming_ApprovedDedupDispatchesWithGate is the merge+ladder
+// integration on the fake harness: an explicitly approved DEDUP disposition
+// dispatches its close (dedup is gated in the fixture spec), while an
+// undispositioned dedup would not.
+func TestApplyApprovedGrooming_ApprovedDedupDispatchesWithGate(t *testing.T) {
+	f := newGroomingApplyFixture(t, groomingApplyOpts{})
+	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
+	// Record an approved dedup disposition against the report artifact, with a
+	// close target that is one of the pair (issue #16).
+	f.seedDisposition(t, f.reportArtifactID(t), f.ids.duplicate, plan.GroomingClassDuplicate,
+		"approved", groomingApplyRepo+"#16")
+
+	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+
+	dialed := f.mutator.dialedEntryIDs()
+	sawDup := false
+	for _, id := range dialed {
+		if id == f.ids.duplicate {
+			sawDup = true
+		}
+	}
+	if !sawDup {
+		t.Errorf("dialed = %v, want it to include the approved dedup entry %q — an explicit approved disposition unlocks the gated class", dialed, f.ids.duplicate)
+	}
+	// And the window is settled `approved`.
+	if rows := f.windowRows(t); len(rows) != 1 {
+		t.Errorf("window rows = %d, want 1 (settled on approve)", len(rows))
+	}
+}
+
+// TestApplyApprovedGrooming_PostRatificationDegradeLeavesWindowClosed pins the
+// asymmetry: a POST-ratification degrade (mutator unavailable) leaves the window
+// CLOSED — the dispositions were already consumed.
+func TestApplyApprovedGrooming_PostRatificationDegradeLeavesWindowClosed(t *testing.T) {
+	f := newGroomingApplyFixture(t, groomingApplyOpts{mutatorErr: errors.New("mutator down")})
+	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
+
+	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+
+	if got := f.degradeReason(t); got != groomingApplyMutatorUnavailable {
+		t.Errorf("degrade_reason = %q, want %q", got, groomingApplyMutatorUnavailable)
+	}
+	if rows := f.windowRows(t); len(rows) != 1 {
+		t.Errorf("window rows = %d, want 1 — a post-ratification degrade leaves the window CLOSED", len(rows))
+	}
+}
+
+// TestApplyApprovedGrooming_PreRatificationDegradeLeavesWindowOpen pins the other
+// half: a PRE-ratification degrade (ungranted gate) does NOT close the window —
+// nothing was decided, so a legitimate later capture must still be accepted.
+func TestApplyApprovedGrooming_PreRatificationDegradeLeavesWindowOpen(t *testing.T) {
+	f := newGroomingApplyFixture(t, groomingApplyOpts{})
+	// No approval rows: C3 fails ungranted BEFORE settlement.
+
+	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+
+	if got := f.degradeReason(t); got != groomingApplyNotRatified {
+		t.Errorf("degrade_reason = %q, want %q", got, groomingApplyNotRatified)
+	}
+	if rows := f.windowRows(t); len(rows) != 0 {
+		t.Errorf("window rows = %d, want 0 — a pre-ratification degrade must NOT close the window", len(rows))
 	}
 }
 
@@ -968,9 +1313,15 @@ func TestApplyApprovedGrooming_DetachedFromRequestCancellation(t *testing.T) {
 func TestApplyApprovedGrooming_AuditSinkErrorSurfaced(t *testing.T) {
 	f := newGroomingApplyFixture(t, groomingApplyOpts{})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
-	f.audit.mu.Lock()
-	f.audit.appendErr = errors.New("audit chain unavailable")
-	f.audit.mu.Unlock()
+	// Fail ONLY the per-mutation sink categories, so the window settlement's
+	// watermark append still lands and the apply proceeds — the audit-SINK
+	// failure is what must not abort dispatch. A watermark append failure is a
+	// different case (settlement can't record the watermark, so nothing is
+	// consumed): see TestApplyApprovedGrooming_WindowUnsettledDegrade.
+	f.audit.failCategories = map[string]bool{
+		workmgmt.GroomingMutationAppliedCategory: true,
+		workmgmt.GroomingApplyCompletedCategory:  true,
+	}
 
 	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
 
@@ -979,6 +1330,38 @@ func TestApplyApprovedGrooming_AuditSinkErrorSurfaced(t *testing.T) {
 	}
 	if rows := f.groomingAudit(); len(rows) != 0 {
 		t.Errorf("grooming audit rows = %d, want 0 — the sink was failing throughout", len(rows))
+	}
+}
+
+// TestApplyApprovedGrooming_WindowUnsettledDegrade pins the POST-RATIFICATION
+// settlement-failure branch (#2991): C3 passed but the watermark append fails, so
+// nothing is consumed, nothing dispatches, and the degrade names
+// grooming_apply_window_unsettled.
+//
+// COUNTERFACTUAL / defensive branch: the watermark AppendChained fails, so the
+// settlement cannot record it. Only the window category is failed, so the
+// completed-summary row STILL lands and names the reason — which is what makes the
+// degrade-reason assertion below non-vacuous (a blanket outage would leave no row
+// to read).
+func TestApplyApprovedGrooming_WindowUnsettledDegrade(t *testing.T) {
+	f := newGroomingApplyFixture(t, groomingApplyOpts{})
+	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
+	// Fail ONLY the watermark append; the settlement cannot record it, but the
+	// completed-summary row is writable so the named degrade reason is observable.
+	f.audit.failCategories = map[string]bool{
+		audit.GroomingApplyWindowClosedCategory: true,
+	}
+
+	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+
+	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
+		t.Errorf("dialed = %v, want 0 — a failed window settlement must not dispatch", dialed)
+	}
+	if rows := f.windowRows(t); len(rows) != 0 {
+		t.Errorf("window rows = %d, want 0 — the watermark did not land, so the window stays open", len(rows))
+	}
+	if got := f.degradeReason(t); got != groomingApplyWindowUnsettled {
+		t.Errorf("degrade_reason = %q, want %q", got, groomingApplyWindowUnsettled)
 	}
 }
 
@@ -1441,5 +1824,28 @@ func TestApplyApprovedGrooming_DegradePayloadCarriesRefusedZero(t *testing.T) {
 	}
 	if summary.Refused != 0 {
 		t.Errorf("summary-decoded refused = %d, want 0", summary.Refused)
+	}
+}
+
+// TestCollapseGroomingConsumed_SkipsAndLastWins covers the defensive branches of
+// the pure collapse: a nil entry, a malformed/empty-entry-id payload, and the
+// last-wins ordering when a lower-sequence row arrives AFTER a higher one.
+func TestCollapseGroomingConsumed_SkipsAndLastWins(t *testing.T) {
+	mk := func(entryID, verdict string, seq int64) *audit.Entry {
+		p, _ := json.Marshal(groomingDispositionPayload{EntryID: entryID, Verdict: verdict})
+		return &audit.Entry{Sequence: seq, Payload: p}
+	}
+	// Highest sequence first, then an older (lower-sequence) row for the same id:
+	// the older one must NOT overwrite the newer verdict (the cur.s > e.Sequence skip).
+	high := mk("e1", "approved", 5)
+	low := mk("e1", "rejected", 2)
+	bad := &audit.Entry{Sequence: 3, Payload: []byte(`{"entry_id":""}`)} // empty id -> skipped
+	got := collapseGroomingConsumed([]*audit.Entry{nil, high, low, bad})
+
+	if len(got) != 1 {
+		t.Fatalf("collapsed = %v, want exactly one entry (e1)", got)
+	}
+	if got["e1"].Verdict != "approved" {
+		t.Errorf("e1 verdict = %q, want approved (last-wins keeps the higher sequence)", got["e1"].Verdict)
 	}
 }
