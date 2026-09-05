@@ -26,6 +26,7 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `product_feedback` | no | object `{enabled: boolean}` | Per-repo kill-switch for upstream product-feedback egress (ADR-029, #1006). Absent means enabled (the default). `enabled: false` → `POST /v0/runs/{id}/product-reports` returns 403 `product_feedback_disabled` and files nothing. Set it as the object form (`product_feedback:` / `  enabled: false`), **not** a bare string. |
 | `charter` | no | object `{path: string}` | Declares the repo-relative path of the checked-in charter document a backlog-grooming run reads (E54.1 / #2233), e.g. `.fishhawk/charter.md`. `path` is required and non-empty **when the block is present**; the block itself is optional. Schema-optional but **feature-mandatory**: `backlog_grooming` fails closed when no charter resolves, enforced in #2234/#2236 — never a fail-open. See [Charter](#charter). |
 | `grooming` | no | object `{thresholds: {...}}` | Operator-declarable controls on what a backlog-grooming run PROPOSES (E54.8 / #2240) — the churn guard ADR-065 names as the mitigation for its own sharpest adoption risk. Every field is optional and resolves to a conservative package default. See [Grooming churn thresholds](#grooming-churn-thresholds). |
+| `selection` | no | object `{source_view: string, order_by?: enum}` | Declares which board view feeds work selection for this tenant (E45.24 / #2231). `source_view` is required and non-empty **when the block is present**; the block itself is optional. **Declaration only** — nothing reads it, and the feature is deferred post-alpha by ADR-064. See [Selection](#selection). |
 
 ### Per-type fields (`types.<name>`)
 
@@ -313,6 +314,57 @@ A charter content-hash change lifts suppression for the **charter-anchored** cla
 Like `charter`, the block adds no `*SemanticError` rule: structural validation (`additionalProperties: false` at both levels, the two numeric floors, the defect enum, `uniqueItems`, `minItems`) is its whole declaration-time contract.
 
 
+## Selection
+
+The `selection` block (optional, additive within v0) declares **which board view feeds work selection** for this tenant — the per-tenant answer to "where does the backlog this repo works from actually come from?".
+
+```yaml
+selection:
+  source_view: "Up Next"
+  order_by: priority
+```
+
+### This is a declaration only
+
+Nothing reads `selection`. The board-view-as-selection-source feature is **deferred post-alpha by ADR-064**; this slice reserves the declaration so a tenant's intent has one recorded home, and adds no provider behaviour, no resolver, and no runtime consumer. The shipped default declares the block only as a **comment**, not a live key — declaring it live in the product default would assert a behaviour that does not exist. A repo that wants a selection source declares it in its own `.fishhawk/work-management.yaml`.
+
+### Why it extends work-management-v0 rather than adding a `board:` block to the workflow spec
+
+ADR-064 fork 1. The provider, project ref, `states` and `transitions` that a selection source is read *against* already live in this config; a `board:` block in `.fishhawk/workflows.yaml` would split one coherent declaration across two specs and would have to name a provider that is only knowable here. The workflow spec stays a **pure governance surface** — stages, gates, approvers, constraints — and does not grow a forge-integration surface.
+
+### Fields
+
+| Field | Required | Shape | Meaning |
+|---|---|---|---|
+| `source_view` | yes (when the block is present) | non-empty string | The **provider-side** board view or column name whose membership feeds selection, e.g. `"Up Next"` — the provider option, not the canonical state `up_next`. When the named view does correspond to a canonical state it should be that state's `states` **value**, but no cross-field rule enforces it. |
+| `order_by` | no | enum `priority` \| `rank` \| `created_at` | How the source is ordered. `priority` = the provider's priority field; `rank` = the board's own manual ordering; `created_at` = issue creation order. |
+
+### Omitting `order_by` means UNSET, not a default
+
+`order_by` carries **no** schema `default` annotation, and nothing populates it: an omitted `order_by` parses to the empty string and stays empty. This is deliberate and is the whole contract.
+
+A JSON Schema `default` is an **annotation, not behaviour** — it populates nothing in any validator this product uses. Declaring `default: "rank"` would therefore advertise an ordering policy that no code implements, while the parsed struct still came back empty. Worse, it would smuggle in a policy decision: **#2231 does not decide an ordering policy**, and picking one through a schema annotation would settle it without anyone deciding it.
+
+So omission means exactly *"unset — no ordering policy declared"*. **The future consumer of this block is the thing that will have to decide what unset resolves to**, at the point where it actually orders something and can be tested doing so. `TestParseSelectionOrderByOmittedIsUnset` pins that an omitted `order_by` parses to the empty value and that nothing populates it.
+
+### The `order_by` vocabulary is deliberately closed, and expected to widen
+
+`order_by` is a closed enum rather than a free string. Every other closed vocabulary in this schema — canonical `states`, `transitions` events, `provider` — is closed for the same stated reason: it keeps a future Jira provider tractable by making the set of things a provider must be able to express finite and enumerable.
+
+`priority` is the value #2231's own example names; `rank` and `created_at` are added as the two orderings every forge board can express. **The vocabulary is expected to widen.** A forge-specific ordering outside the set needs a schema addition, which is the additive-optional direction and cheap; the reverse — narrowing a free string once repos have written arbitrary values into it — is breaking. `TestParseSchemaErrors`' `/selection/order_by` case pins the enum.
+
+### Per-forge readability is a separate question
+
+Declaring a `source_view` does not make it readable. Whether Fishhawk can read a given board at all depends on the forge, the project's ownership and the credential: a user-owned GitHub Projects v2 board needs the `project`-scoped `FISHHAWKD_PROJECTS_TOKEN` (#1114), and GitLab and Jira have no `WorkItemReader` in v0 at all. [`docs/board-capability-matrix.md`](../board-capability-matrix.md) is the per-forge constraint reference a declared selection source must be read against, including the typed degradation reason each unreadable case produces.
+
+### No semantic rule is added for `selection`
+
+Like `charter` and `grooming`, the block adds **no** `*SemanticError` rule: structural validation (`required: ["source_view"]`, `minLength: 1`, the closed `order_by` enum, `additionalProperties: false`) is its whole declaration-time contract.
+
+No cross-field rule ties `source_view` to a `states` value, for two reasons. It would be a **second owner** of a rule no consumer enforces yet, free to drift from whatever the consuming feature eventually enforces. And it would be **wrong**: a selection source need not be a status column at all — a saved GitHub Projects view or a GitLab board list is a legitimate source with no `states` entry.
+
+**Consequence, stated rather than hidden: a typo'd view name is not caught at parse time.** That is acceptable while nothing consumes the field, and the consuming feature will own resolve-time validation — the same declaration-structural / resolution-fail-closed split `charter` already uses with `repodoc.validatePath`.
+
 ## Validation
 
 `workmgmt.Parse` validates in two stages and returns a typed error:
@@ -322,6 +374,8 @@ Like `charter`, the block adds no `*SemanticError` rule: structural validation (
 - `*YAMLError` — unparseable, empty, or multi-document input (the config must be a single YAML document; a trailing document would bypass validation).
 
 The `charter` block deliberately adds no `*SemanticError` rule — structural validation (`required: ["path"]` + `minLength: 1` + `additionalProperties: false`) is its whole declaration-time contract, and path shape is owned fail-closed by `repodoc.validatePath` at resolve time. See [No semantic rule is added for `charter`](#no-semantic-rule-is-added-for-charter).
+
+The `selection` block likewise adds no `*SemanticError` rule — structural validation (`required: ["source_view"]` + `minLength: 1` + the closed `order_by` enum + `additionalProperties: false`) is its whole declaration-time contract, and no cross-field rule ties `source_view` to a `states` value. See [No semantic rule is added for `selection`](#no-semantic-rule-is-added-for-selection).
 
 The shipped default is validated against the schema at backend package init, so the product artifact can never drift from its own schema.
 
@@ -334,4 +388,5 @@ The shipped default is validated against the schema at backend package init, so 
 ## See also
 
 - `docs/spec/operator-role.md` — the `.fishhawk/operator.yaml` overlay carries the `work_management` pointer at this config.
+- [`docs/board-capability-matrix.md`](../board-capability-matrix.md) — the per-forge board read/write capability matrix and the typed degradation vocabulary a declared `selection` source must be read against (E45.24 / #2231, ADR-064).
 - Parent epic #389; triggering issue #1005.

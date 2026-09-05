@@ -207,6 +207,24 @@
           }
         }
       }
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_view"],
+      "description": "Declares WHICH board view feeds work selection for this tenant (E45.24 / #2231). This is a DECLARATION ONLY: nothing reads it, and the board-view-as-selection-source feature is deferred post-alpha by ADR-064. It lives here rather than as a `board:` block in the workflow spec (ADR-064 fork 1) because the provider, project ref, states and transitions the selection source is read against already live in this config, and the workflow spec stays a pure governance surface. A declared source view is only as readable as the forge allows — see docs/board-capability-matrix.md for the per-forge constraints (a user-owned GitHub project needs FISHHAWKD_PROJECTS_TOKEN; GitLab and Jira have no reader in v0). Validation is STRUCTURAL ONLY: no cross-field rule ties source_view to a `states` value, because a selection source need not be a status column at all.",
+      "properties": {
+        "source_view": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The PROVIDER-side board view or column name whose membership feeds work selection, e.g. \"Up Next\" (the provider option, not the canonical state `up_next`). When the named view does correspond to a canonical state it should be that state's `states` VALUE, but no cross-field rule enforces it — a saved GitHub Projects view or a GitLab board list is a legitimate source that is not a status column. Consequence, stated rather than hidden: a typo'd view name is not caught at parse time; the consuming feature will own resolve-time validation, the same declaration-structural / resolution-fail-closed split `charter` uses."
+        },
+        "order_by": {
+          "type": "string",
+          "enum": ["priority", "rank", "created_at"],
+          "description": "How the selection source is ordered. `priority` = the provider's priority field; `rank` = the board's own manual ordering; `created_at` = issue creation order. OMITTING this field means UNSET — no ordering policy is declared. It deliberately carries NO schema `default`: a JSON Schema default is an annotation that populates nothing, so advertising one would promise behaviour no code implements and leave the parsed struct empty anyway. #2231 does not decide an ordering policy, so the future consumer of this block is what will have to decide what unset resolves to. The vocabulary is deliberately CLOSED and is expected to WIDEN: every other closed vocabulary here (canonical states, transition events, provider) is closed to keep a future Jira provider tractable, and widening a closed enum later is additive while narrowing a free string is breaking."
+        }
+      }
     }
   },
 

@@ -109,6 +109,33 @@ grooming:
     min_rank_movement: 2
     min_score_delta: 0.05
 
+# Which board view feeds work selection (E45.24 / #2231) — DECLARED as a
+# comment on purpose, NOT as a live key.
+#
+# Nothing consumes `selection` yet: the board-view-as-selection-source feature
+# is deferred post-alpha by ADR-064, and this slice ships the declaration only.
+# Declaring it live in the SHIPPED PRODUCT DEFAULT would assert a behaviour
+# that does not exist — every repo resolving through this default would appear
+# to have named a selection source that nothing reads. A repo that wants to
+# declare its own selection source adds the block to its own
+# .fishhawk/work-management.yaml, where it reads as the operator's recorded
+# intent rather than as a product default.
+#
+# `source_view` is the PROVIDER-side view or column name ("Up Next", the
+# provider option, not the canonical state up_next) and is required when the
+# block is present. `order_by` is optional and closed to priority / rank /
+# created_at; OMITTING it means UNSET — no ordering policy is declared, and
+# nothing populates a default. Whether a declared source is readable at all
+# depends on the forge and the credential: see docs/board-capability-matrix.md.
+#
+#   selection:
+#     source_view: "Up Next"
+#     order_by: priority
+#
+# TestDefaultDeclaresNoSelection pins that this stays a comment: it goes red
+# the moment the block is uncommented, so declaring a product default becomes a
+# deliberate decision rather than a side effect.
+
 # Per-repo kill-switch for upstream product-feedback egress (ADR-029,
 # #1006). Shipped in its enabled (egress-on) position. To hard-disable the
 # product-report endpoint for a repo, set the object's enabled to false:

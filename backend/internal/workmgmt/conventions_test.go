@@ -2,6 +2,10 @@ package workmgmt
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -443,6 +447,17 @@ types: {feature: {body_skeleton: [Summary], default_labels: ["NOT VALID"]}}
 		"charter missing required path": {cfg: minimalConfig + "charter: {}\n", wantPath: "/charter"},
 		"charter empty path":            {cfg: minimalConfig + "charter:\n  path: \"\"\n", wantPath: "/charter/path"},
 		"charter unknown nested key":    {cfg: minimalConfig + "charter:\n  path: docs/charter.md\n  extra: nope\n", wantPath: "/charter"},
+		// The selection block's whole declaration-time contract is structural
+		// (E45.24 / #2231): required:["source_view"] + minLength:1 + the
+		// nested additionalProperties:false + the closed order_by enum. Each
+		// of the four is pinned by its own case asserting the JSON Pointer, so
+		// a passing case cannot be some unrelated construct rejecting the
+		// config. Deleting required/enum from the EMBEDDED mirror (the copy
+		// //go:embed compiles) reddens the first and the last.
+		"selection missing required source_view": {cfg: minimalConfig + "selection: {}\n", wantPath: "/selection"},
+		"selection empty source_view":            {cfg: minimalConfig + "selection:\n  source_view: \"\"\n", wantPath: "/selection/source_view"},
+		"selection unknown nested key":           {cfg: minimalConfig + "selection:\n  source_view: \"Up Next\"\n  bogus: 1\n", wantPath: "/selection"},
+		"selection invalid order_by":             {cfg: minimalConfig + "selection:\n  source_view: \"Up Next\"\n  order_by: whatever\n", wantPath: "/selection/order_by"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1090,5 +1105,217 @@ func TestSchemaRejectsSubFloorThresholds(t *testing.T) {
 				t.Errorf("SchemaError.Path = %q, want %q", serr.Path, tc.wantPath)
 			}
 		})
+	}
+}
+
+// --- E45.24 / #2231: the board-selection source declaration ----------------
+
+// TestParseSelection is the AC2-positive half: a config declaring the full
+// block round-trips into the typed struct. It FAILS if either half of the
+// declaration is missing — a schema without the property rejects the config
+// as an unknown key under additionalProperties:false, and a Go struct without
+// the field silently drops the value.
+func TestParseSelection(t *testing.T) {
+	cfg := minimalConfig + "selection:\n  source_view: \"Up Next\"\n  order_by: priority\n"
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(selection) = %v, want nil", err)
+	}
+	if c.Selection == nil {
+		t.Fatal("Selection is nil; the block did not round-trip into the struct")
+	}
+	if c.Selection.SourceView != "Up Next" {
+		t.Errorf("Selection.SourceView = %q, want %q", c.Selection.SourceView, "Up Next")
+	}
+	if c.Selection.OrderBy != "priority" {
+		t.Errorf("Selection.OrderBy = %q, want %q", c.Selection.OrderBy, "priority")
+	}
+}
+
+// TestParseSelectionOrderByOmittedIsUnset pins the omission contract settled
+// by #2231's approval condition 1: order_by carries NO schema `default`
+// annotation, so an omitted order_by parses to the EMPTY value and nothing
+// populates it. Omission means "unset — no ordering policy declared", not
+// "resolved to rank". A JSON Schema default is an annotation that populates
+// nothing, so declaring one would have advertised behaviour no code
+// implements while this assertion still held — which is exactly why the
+// annotation was removed rather than the test weakened. The future consumer
+// of this block is what decides what unset resolves to; this test goes red if
+// anything here starts deciding it instead.
+func TestParseSelectionOrderByOmittedIsUnset(t *testing.T) {
+	cfg := minimalConfig + "selection:\n  source_view: \"Up Next\"\n"
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(selection without order_by) = %v, want nil", err)
+	}
+	if c.Selection == nil {
+		t.Fatal("Selection is nil; the block did not round-trip into the struct")
+	}
+	if c.Selection.SourceView != "Up Next" {
+		t.Errorf("Selection.SourceView = %q, want %q", c.Selection.SourceView, "Up Next")
+	}
+	if c.Selection.OrderBy != "" {
+		t.Errorf("Selection.OrderBy = %q, want the empty value: an omitted order_by is UNSET, and nothing may populate it", c.Selection.OrderBy)
+	}
+}
+
+// TestParseWithoutSelection is the AC2 no-behaviour-change pin: the block is
+// additive-optional, so a config omitting it parses exactly as it did before
+// — and the POINTER field is what keeps absent (nil) distinguishable from
+// present-but-empty. A value-typed field could not satisfy the nil assertion.
+func TestParseWithoutSelection(t *testing.T) {
+	c, err := Parse(strings.NewReader(minimalConfig))
+	if err != nil {
+		t.Fatalf("Parse(no selection) = %v, want nil", err)
+	}
+	if c.Selection != nil {
+		t.Errorf("Selection = %+v, want nil for a config that declares no selection block", c.Selection)
+	}
+}
+
+// TestDefaultDeclaresNoSelection is the DONE-MEANS test for the comment-only
+// edit to docs/spec/work-management-default.yaml and its mirror. A YAML
+// comment is invisible to compilation and a presence-of-file check cannot
+// tell a commented example from a live key, so this asserts the SHIPPED
+// OBSERVABLE value: the product default declares NO live selection block.
+// Nothing consumes Conventions.Selection, so a live declaration in the
+// product default would assert a behaviour that does not exist. This goes RED
+// the moment someone uncomments the block, making a product-default
+// declaration a deliberate decision rather than a side effect.
+func TestDefaultDeclaresNoSelection(t *testing.T) {
+	if s := Default().Selection; s != nil {
+		t.Errorf("Default().Selection = %+v, want nil: the shipped default declares the selection block as a COMMENT only, because nothing consumes it yet", s)
+	}
+}
+
+// boardCapabilityMatrixPath is the repo-root-relative capability matrix, read
+// from the package directory the same way TestDefaultCharterPath reaches
+// .fishhawk/charter.md: backend/internal/workmgmt -> repo root is three
+// levels up.
+var boardCapabilityMatrixPath = filepath.Join("..", "..", "..", "docs", "board-capability-matrix.md")
+
+// collectDeclaredUnavailableReasons AST-walks the workmgmt package tree and
+// returns every string value declared as an UnavailableReason constant, keyed
+// by value with the declaring file recorded for the failure message.
+//
+// It is a SOURCE-DERIVED sweep, which is the whole point: a hand-maintained
+// list of today's reasons verifies today's coverage and stays green on the day
+// a seventh reason is added — precisely the drift the caller is named for.
+//
+// Const blocks carry the preceding spec's type forward when a later spec omits
+// it, so lastType tracks that carry-over. Both the unqualified Ident
+// (in-package, where reader.go declares them) and a qualified SelectorExpr
+// (a sibling package declaring one as workmgmt.UnavailableReason) are matched,
+// so moving the declarations does not silently empty the sweep.
+func collectDeclaredUnavailableReasons(t *testing.T) map[string]string {
+	t.Helper()
+
+	const typeName = "UnavailableReason"
+	found := map[string]string{}
+
+	isReasonType := func(e ast.Expr) bool {
+		switch v := e.(type) {
+		case *ast.Ident:
+			return v.Name == typeName
+		case *ast.SelectorExpr:
+			return v.Sel != nil && v.Sel.Name == typeName
+		}
+		return false
+	}
+
+	fset := token.NewFileSet()
+	walkErr := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return perr
+		}
+		for _, decl := range f.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
+			}
+			var lastType ast.Expr
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				if vs.Type != nil {
+					lastType = vs.Type
+				}
+				if lastType == nil || !isReasonType(lastType) {
+					continue
+				}
+				for _, v := range vs.Values {
+					lit, ok := v.(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						continue
+					}
+					val, uerr := strconv.Unquote(lit.Value)
+					if uerr != nil {
+						return uerr
+					}
+					found[val] = path
+				}
+			}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("AST walk of the workmgmt package tree failed: %v", walkErr)
+	}
+	return found
+}
+
+// TestBoardCapabilityMatrixDocumentsEveryDeclaredUnavailableReason is the
+// coverage guard for docs/board-capability-matrix.md (E45.24 / #2231 AC1). It
+// AST-walks the workmgmt package source for every DECLARED UnavailableReason
+// constant and asserts each declared string value appears in the matrix, so
+// AC1's "covers every row, including the degradation posture for each" is
+// machine-enforced rather than asserted in prose.
+//
+// It enforces DRIFT, not a snapshot: the reason set comes from the source, so
+// a seventh reason added to reader.go reddens this test on the day it is
+// added, with nobody having to remember this document exists. A hand-written
+// list of the six current values would verify today's coverage and stay green
+// in exactly the situation the test is named for.
+func TestBoardCapabilityMatrixDocumentsEveryDeclaredUnavailableReason(t *testing.T) {
+	raw, err := os.ReadFile(boardCapabilityMatrixPath)
+	if err != nil {
+		t.Fatalf("read %s: %v — the capability matrix ADR-064 requires is missing", boardCapabilityMatrixPath, err)
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		t.Fatalf("%s is empty, want the per-forge board capability matrix", boardCapabilityMatrixPath)
+	}
+	doc := string(raw)
+
+	declared := collectDeclaredUnavailableReasons(t)
+
+	// Vacuity floor: a walk or parse regression that collected nothing would
+	// make the loop below iterate zero times and pass having proven nothing.
+	// The closed set has six members today; a floor below that still catches a
+	// sweep that found ~nothing, without freezing the count.
+	const minDeclared = 5
+	if len(declared) < minDeclared {
+		t.Fatalf("sweep collected only %d UnavailableReason constants from workmgmt source (< %d); "+
+			"the AST walk is likely broken and this test would false-pass", len(declared), minDeclared)
+	}
+
+	// sortedKeys is apply.go's existing helper, reused so the failure
+	// output is deterministic across map iterations.
+	for _, reason := range sortedKeys(declared) {
+		if !strings.Contains(doc, reason) {
+			t.Errorf("UnavailableReason %q (declared in %s) is absent from %s — every degradation reason must carry a row in the capability matrix",
+				reason, declared[reason], boardCapabilityMatrixPath)
+		}
 	}
 }
