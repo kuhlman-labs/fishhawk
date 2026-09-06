@@ -3971,6 +3971,6 @@ curl -sS -X POST "$FISHHAWK_BACKEND_URL/v0/runs/$RUN_ID/record-merge-observation
 # Confirm EXACTLY ONE merge_observation_recorded row carrying the MR's SHA and merged_at:
 curl -sS "$FISHHAWK_BACKEND_URL/v0/runs/$RUN_ID/audit?category=merge_observation_recorded" \
   -H "Authorization: Bearer $FISHHAWK_API_TOKEN" \
-  | jq '.items | length, .items[0].payload.merge_commit_sha, .items[0].payload.merged_at'
+  | jq '.items | length, .[0].payload.merge_commit_sha, .[0].payload.merged_at'
 # -> 1, "<sha>", "<forge time>"
 ```

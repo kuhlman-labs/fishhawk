@@ -392,3 +392,31 @@ type CreateCheckRunResult struct {
 	ID      int64
 	HTMLURL string
 }
+
+// SnapshotRegistry returns a shallow copy of the process-global forge
+// registry (registry.go). Paired with RestoreRegistry in a t.Cleanup, it
+// lets a test register a fake forge and restore the registry afterwards, so
+// a fake never leaks into a later test in the same package process — the
+// registry is a single global map shared across every test in a run, and
+// Register offers no removal.
+func SnapshotRegistry() map[string]Forge {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	snap := make(map[string]Forge, len(registry))
+	for id, f := range registry {
+		snap[id] = f
+	}
+	return snap
+}
+
+// RestoreRegistry replaces the registry contents with snap (a prior
+// SnapshotRegistry result), INCLUDING removing any ids registered since the
+// snapshot was taken. See SnapshotRegistry.
+func RestoreRegistry(snap map[string]Forge) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	registry = make(map[string]Forge, len(snap))
+	for id, f := range snap {
+		registry[id] = f
+	}
+}

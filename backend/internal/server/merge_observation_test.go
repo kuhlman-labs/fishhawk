@@ -997,6 +997,8 @@ func TestRecordMergeObservationUnknownForgeRefused(t *testing.T) {
 // availability must never change a GitHub outcome, so the registered forge is
 // never dialed.
 func TestRecordMergeObservationGitHubNeverFallsToRegistry(t *testing.T) {
+	registrySnap := forge.SnapshotRegistry()
+	t.Cleanup(func() { forge.RestoreRegistry(registrySnap) })
 	registered := &fakeForgeReader{name: observationForgeGitHub, pr: mergedPR()}
 	forge.Register(registered)
 
@@ -1041,10 +1043,35 @@ func TestRecordMergeObservationResolverErrorFailsClosed(t *testing.T) {
 	}
 }
 
+// A ForgeResolver that returns a TYPED-NIL forge (a nil *fakeForgeReader
+// wrapped in a non-nil forge.Forge interface) must fail closed to 503, never
+// panic on the first GetPullRequest dispatch. isNilForge guards the typed-nil
+// case a bare `f == nil` misses; without it this run would dispatch against a
+// nil pointer and crash the handler.
+func TestRecordMergeObservationResolverTypedNilFailsClosed(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+	f.s.cfg.PRStateReader = nil
+	f.s.cfg.ForgeResolver = func(string) (forge.Forge, error) {
+		var typedNil *fakeForgeReader // (*fakeForgeReader)(nil)
+		return typedNil, nil          // non-nil interface wrapping a nil pointer
+	}
+	id := f.seedObservationRun(t, run.CreateRunParams{
+		Repo: "group/project", InstallationRef: ptrString("gitlab:5"),
+	}, "https://gitlab.com/group/project/-/merge_requests/7")
+
+	w := f.postObserveID(t, id.String())
+	assertObserveRefusal(t, w, http.StatusServiceUnavailable, "record_merge_observation_unconfigured")
+	if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0: a typed-nil resolver forge must not license a write", len(rows))
+	}
+}
+
 // The DEFAULT resolver (nil ForgeResolver -> forge.Get) dispatches a gitlab run
 // through the process registry. Registers a fake under "gitlab" and leaves
 // ForgeResolver nil, proving the production default reaches the registered forge.
 func TestRecordMergeObservationDefaultResolverUsesRegistry(t *testing.T) {
+	registrySnap := forge.SnapshotRegistry()
+	t.Cleanup(func() { forge.RestoreRegistry(registrySnap) })
 	registered := &fakeForgeReader{name: observationForgeGitLab, pr: mergedPR()}
 	forge.Register(registered)
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -325,7 +326,12 @@ func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Req
 //     NON-nil interface holding a nil pointer.
 //   - any other forge family resolves through cfg.ForgeResolver (defaulting to
 //     forge.Get). A resolver error or a nil forge yields (nil, …), which the
-//     caller turns into the 503 rung.
+//     caller turns into the 503 rung. "nil forge" here means BOTH a nil
+//     interface AND a typed-nil pointer wrapped in a non-nil interface (a
+//     resolver returning e.g. (*someForge)(nil) inside a non-nil forge.Forge):
+//     a bare `f == nil` catches only the former and would then panic on the
+//     first GetPullRequest dispatch, so isNilForge guards both — the analogue
+//     of the load-bearing explicit nil check on the concrete cfg.GitHub above.
 //
 // It returns (nil, nil) rather than panicking when no reader is wired, so the
 // caller's 503 fires instead of a nil-interface dispatch.
@@ -347,10 +353,28 @@ func (s *Server) prStateReaderFor(forgeID string) (PullRequestStateReader, error
 	if err != nil {
 		return nil, err
 	}
-	if f == nil {
+	if isNilForge(f) {
 		return nil, nil
 	}
 	return f, nil
+}
+
+// isNilForge reports whether f is effectively nil — a nil interface OR a
+// non-nil interface wrapping a typed-nil pointer. A ForgeResolver that
+// returns a typed nil (e.g. (*someForge)(nil)) passes a bare `f == nil`
+// check yet panics on the first method dispatch, so prStateReaderFor guards
+// both, mirroring the concrete nil check on cfg.GitHub.
+func isNilForge(f forge.Forge) bool {
+	if f == nil {
+		return true
+	}
+	v := reflect.ValueOf(f)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return v.IsNil()
+	default:
+		return false
+	}
 }
 
 // obsTargetReason discriminates how resolveObservationTarget classified a run's

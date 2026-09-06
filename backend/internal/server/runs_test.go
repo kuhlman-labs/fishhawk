@@ -1480,11 +1480,24 @@ func TestCompletionBlocked_RecoveryDiscrimination(t *testing.T) {
 			observeMerge: false, wantRecovery: completionBlockedRecoveryNone,
 		},
 		{
-			// Admissible + no evidence + a MALFORMED / cross-forge PR URL: the
-			// observe verb's target does not resolve, so still no verb.
+			// Admissible + no evidence + a MALFORMED PR URL (an /issues/ URL that
+			// resolves under NO forge family): obsTargetMalformed, so no verb.
 			name:    "merge-supersedable park with a malformed PR URL and no evidence names no verb",
 			blocker: run.StageTypeAcceptance, state: run.StageStateAwaitingHostDispatch,
 			observeMerge: false, prURL: "https://github.com/x/y/issues/1",
+			wantRecovery: completionBlockedRecoveryNone,
+		},
+		{
+			// Admissible + no evidence + a well-formed CROSS-FORGE PR URL: the
+			// fixture run is github-family (no InstallationRef) but the URL is a
+			// gitlab /-/merge_requests/ shape naming the SAME repo — it resolves,
+			// but under the wrong forge family, so obsTargetMismatch and recovery
+			// stays none. This exercises the mismatch arm the /issues/ case above
+			// (which is obsTargetMalformed) does not, so a future refactor that
+			// splits the GET path's reason handling from the handler's is caught.
+			name:    "merge-supersedable park with a cross-forge PR URL and no evidence names no verb",
+			blocker: run.StageTypeAcceptance, state: run.StageStateAwaitingHostDispatch,
+			observeMerge: false, prURL: "https://gitlab.com/x/y/-/merge_requests/1",
 			wantRecovery: completionBlockedRecoveryNone,
 		},
 		{
