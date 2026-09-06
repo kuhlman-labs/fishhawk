@@ -21,7 +21,7 @@ import "strings"
 // AsOf is the date the price table was last reconciled against
 // published vendor pricing. Surfaced alongside any rolled cost so
 // consumers can label the figure as an estimate of a known vintage.
-const AsOf = "2026-07-12"
+const AsOf = "2026-09-06"
 
 // rate is the per-token price for a single model family, in US
 // dollars. Vendors publish per-million-token prices; we store the
@@ -84,6 +84,7 @@ func perMillionCache(input, output, cacheRead, cacheWrite float64) rate {
 //	gpt-5.6-sol   5   / 30 / 0.5  / 6.25   (OpenAI 5.6 flagship)
 //	gpt-5.6-terra 2.5 / 15 / 0.25 / 3.125  (OpenAI 5.6 balanced)
 //	gpt-5.6-luna  1   / 6  / 0.1  / 1.25   (OpenAI 5.6 cost-optimized)
+//	gpt-6-astra   10  / 50 / 1.0  / 12.5   (OpenAI 6 flagship)
 //
 // The Anthropic cache rates are the 5-minute-TTL baseline (#1343):
 // cache READ = 0.1x the family input rate, cache WRITE = 1.25x the
@@ -95,19 +96,38 @@ func perMillionCache(input, output, cacheRead, cacheWrite float64) rate {
 // WRITE is set to the input rate because that model charges no separate
 // cache-write premium; the entire gpt-5.6 family (Sol / Terra / Luna)
 // DID introduce the premium (1.25x input, same multiplier as Anthropic),
-// so their cacheWrite carries the real rate. Either way the codex adapter
-// maps cache writes to 0, so every gpt cacheWrite rate is effectively
-// unexercised in the reviewer path. Note gpt-5.6-sol's headline
-// input/output ($5/$30) matches gpt-5.5 but its cache WRITE differs
-// (6.25 vs 5) because 5.6 added the write premium.
+// so their cacheWrite carries the real rate. gpt-6-astra keeps both
+// conventions: its cache READ is the published 0.1x cached-input
+// discount ($1/1M against $10/1M input) and its cache WRITE the 1.25x
+// premium ($12.50/1M). Either way the codex adapter maps cache writes
+// to 0, so every gpt cacheWrite rate is effectively unexercised in the
+// reviewer path. Note gpt-5.6-sol's headline input/output ($5/$30)
+// matches gpt-5.5 but its cache WRITE differs (6.25 vs 5) because 5.6
+// added the write premium.
 //
 // Family-key convention: Anthropic keys are the tier stem (claude-opus,
 // claude-fable) so every dated point release inherits the tier price.
 // OpenAI's gpt-5.6 splits into distinctly-priced tiers, so each is keyed
 // by its full tier id (gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna) — a
-// bare gpt-5.6 would mis-price the other two. Only gpt-5.6-terra is
-// dispatched today (the codex reviewer); Sol and Luna are priced so a
-// future model swap can't silently record $0.
+// bare gpt-5.6 would mis-price the other two. gpt-6-astra is the OpenAI
+// model dispatched today (.fishhawk/workflows.yaml pins it at both codex
+// reviewer sites since #3234); the whole gpt-5.6 tier set (Sol / Terra /
+// Luna) and gpt-5.5 are retained as future-swap insurance so a model
+// swap back can't silently record $0.
+//
+// LONG-CONTEXT SURCHARGE — stated, NOT implemented. GPT-6 Astra bills
+// any request whose input exceeds 272K tokens at 2x the input and cache
+// rates and 1.5x the output rate, applied to the FULL request. This
+// registry prices every request at the base rate, so a hypothetical
+// over-threshold request would be UNDER-priced by those multipliers.
+// Observed evidence (not a universal claim): the only Astra call sites
+// in the shipped workflow are the two reviewer stages; the observed
+// plan-review request on run 12aaac69 was 26,853 input tokens; implement
+// reviews carry a diff and are larger, but have not been measured.
+// Implementing the surcharge correctly needs a per-provider-request
+// usage split that the codex/claudecode/anthropic adapters do not yet
+// report — an invocation-wide aggregate spanning several turns cannot
+// decide the per-request threshold.
 var familyRates = map[string]rate{
 	"claude-opus":   perMillionCache(5, 25, 0.5, 6.25),
 	"claude-fable":  perMillionCache(10, 50, 1, 12.5),
@@ -117,6 +137,7 @@ var familyRates = map[string]rate{
 	"gpt-5.6-sol":   perMillionCache(5, 30, 0.5, 6.25),
 	"gpt-5.6-terra": perMillionCache(2.5, 15, 0.25, 3.125),
 	"gpt-5.6-luna":  perMillionCache(1, 6, 0.1, 1.25),
+	"gpt-6-astra":   perMillionCache(10, 50, 1, 12.5),
 }
 
 // Cost returns the estimated US-dollar cost of an invocation that
