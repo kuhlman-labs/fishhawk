@@ -630,11 +630,27 @@ Notes:
   leaves an OPERATOR-DELIBERATELY-added scope path (an `add_scope_files` path
   folded at plan approval, or an approved mid-stage scope amendment) UNTOUCHED —
   the deterministic detection is untouched-only: a path ABSENT from the
-  committed diff's file set. (A path the commit DID touch but with the wrong
+  evaluated committed file set. (A path the commit DID touch but with the wrong
   content is undecidable deterministically and stays a review concern — e.g. the
   E23.9 never-created case is caught here, the E23.10 wrong-content case is a
   review catch.) Payload `{undelivered_paths, undelivered_count,
-  operator_added_count}`. Advisory + best-effort — a nil `ScopeAmendmentRepo` or
+  operator_added_count, indeterminate, evaluated_against, history_complete,
+  incomplete_reason, cumulative_base_sha, head_sha}`. Since #3029 the file set is
+  the implement stage's CUMULATIVE committed state (`stage_base..head`, resolved
+  by a second forge compare) rather than the current pass's delta — so a grant
+  delivered by an EARLIER pass of the same stage is no longer reported
+  undelivered. `evaluated_against` is `stage-cumulative` or `this-pass` and
+  `history_complete` its boolean twin; when the cumulative state cannot be
+  established the entry FAILS CLOSED to the per-pass set with
+  `history_complete:false` and a machine `incomplete_reason` (one of
+  `push_ledger_unreadable`, `stage_push_ledger_empty`,
+  `stage_base_sha_unavailable`, `stage_base_equals_head`,
+  `forge_compare_unavailable`, `cumulative_compare_failed`,
+  `cumulative_compare_truncated`), and the reviewer wording downgrades with it.
+  The check is STAGE-scoped: a grant delivered in a DIFFERENT implement stage
+  still fires. Older rows decode with `evaluated_against` empty and
+  `history_complete` false, which is the honest reading — they were computed
+  per-pass. Advisory + best-effort — a nil `ScopeAmendmentRepo` or
   a `ListByRun` error contributes nothing and never blocks the review, and the
   entry is written only when the undelivered set is non-empty (an all-delivered
   commit keeps the prompt byte-identical and emits no entry). The same set is

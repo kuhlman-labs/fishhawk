@@ -3164,6 +3164,21 @@ type operatorScopeUndeliveredPayload struct {
 	// omitempty keeps a determinable-diff payload byte-identical to before the
 	// field existed and older rows decode to false.
 	Indeterminate bool `json:"indeterminate,omitempty"`
+	// EvaluatedAgainst names the file set the undelivered decision was made
+	// against (#3029): "stage-cumulative" (every commit this implement stage has
+	// pushed, CumulativeBaseSHA..HeadSHA) or "this-pass" (this pass's committed
+	// diff only). HistoryComplete is its boolean twin and IncompleteReason names
+	// the machine reason the cumulative state could not be established. Older
+	// rows decode with EvaluatedAgainst "" and HistoryComplete false, which is
+	// the honest reading: they were computed per-pass.
+	EvaluatedAgainst string `json:"evaluated_against"`
+	HistoryComplete  bool   `json:"history_complete"`
+	IncompleteReason string `json:"incomplete_reason,omitempty"`
+	// CumulativeBaseSHA is the stage base the cumulative compare spanned; HeadSHA
+	// is the head it spanned to. Both omitted when unset so a degrade path adds
+	// no empty keys.
+	CumulativeBaseSHA string `json:"cumulative_base_sha,omitempty"`
+	HeadSHA           string `json:"head_sha,omitempty"`
 }
 
 // fixupReportingObligationUndeliveredCategory is the audit-log category for the
@@ -4062,9 +4077,22 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// trading the #2820 false drift signal for a false miss signal. It is folded
 	// only into the review-facing provenance (scopeProvenanceForReview), never the
 	// operator-scope-undelivered union.
+	//
+	// #3029: the DELIVERY question is "has this implement STAGE committed the
+	// path", not "did THIS PASS touch it" — a fix-up re-review's diff is the
+	// fix-up DELTA, so a path delivered by an earlier pass reads as untouched.
+	// Resolve the stage's CUMULATIVE committed state (stageBase..head) ONCE here
+	// and classify both this signal and the sibling scope-provenance surface
+	// against the SAME set, so the two can never contradict each other. Every
+	// degrade returns the current pass diff with a named machine reason, and the
+	// audit payload + reviewer wording downgrade to the this-pass hedge with it.
+	// The reviewed DIFF (reviewedDiff, the #1725 delta framing) is deliberately
+	// untouched: this moves the evaluation set only, never what the reviewer reads.
+	eval := s.resolveStageCumulativeEval(ctx, runRow, runID, stageID, headSHA, diff)
+	evalDiff := eval.Diff
 	operatorAdded := append([]string(nil), trig.AmendedScopeFiles...)
 	operatorAdded = append(operatorAdded, s.approvedAmendmentScopePaths(ctx, runID)...)
-	if undelivered, undeliveredIndeterminate := operatorScopeUndelivered(operatorAdded, diff); len(undelivered) > 0 {
+	if undelivered, undeliveredIndeterminate := operatorScopeUndelivered(operatorAdded, evalDiff); len(undelivered) > 0 {
 		// Populate the prompt signal so the reviewer sees the miss as a
 		// high-priority gate-evidence warning. Allocate gateEvidence if the
 		// bundle carried none (mirrors the existing allocate-if-needed
@@ -4080,6 +4108,12 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		}
 		gateEvidence.OperatorScopeUndelivered = undelivered
 		gateEvidence.OperatorScopeUndeliveredIndeterminate = undeliveredIndeterminate
+		// #3029: name the set the decision was made against, so the reviewer is
+		// never handed an unqualified "absent from the committed file set".
+		gateEvidence.OperatorScopeUndeliveredStageCumulative = eval.StageCumulative
+		gateEvidence.OperatorScopeUndeliveredIncompleteReason = eval.IncompleteReason
+		gateEvidence.OperatorScopeUndeliveredCumulativeBaseSHA = eval.StageBaseSHA
+		gateEvidence.OperatorScopeUndeliveredCumulativeHeadSHA = eval.HeadSHA
 
 		// Append the deterministic advisory audit entry so the miss is
 		// visible on the run surface BEFORE any reviewer verdict. Best-effort
@@ -4091,6 +4125,11 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 				UndeliveredCount:   len(undelivered),
 				OperatorAddedCount: len(operatorAdded),
 				Indeterminate:      undeliveredIndeterminate,
+				EvaluatedAgainst:   eval.evaluatedAgainst(),
+				HistoryComplete:    eval.StageCumulative,
+				IncompleteReason:   eval.IncompleteReason,
+				CumulativeBaseSHA:  eval.StageBaseSHA,
+				HeadSHA:            eval.HeadSHA,
 			})
 			systemKind := audit.ActorKind("system")
 			if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -4234,6 +4273,11 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		// realized as a rename is never a false untouched signal (#2398); a diff
 		// whose R rows carry no source path is rename-INDETERMINATE and the
 		// untouched label is not determinable at all, so the signal is suppressed.
+		// #3029 DELIBERATE OMISSION: this check keeps the PER-PASS `diff`, not the
+		// stage-cumulative evalDiff. "Was this routed concern attempted in THIS
+		// pass" is genuinely a per-pass question — a concern attempted two passes
+		// ago and NOT attempted in this one is exactly what the signal reports —
+		// so widening it to the cumulative set would break it.
 		committed, _, renameIndeterminate := committedPathSet(diff)
 		candidates := fixupAttemptCandidates(approvedPlan, committed)
 		if !renameIndeterminate && len(candidates) > 0 {
@@ -4331,11 +4375,17 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// machine-classify a fold-only divergence as NON-drift. Adjacent to the
 	// #1407 block and using the same allocate-if-nil gateEvidence pattern; the
 	// #1407 operator_scope_path_undelivered signal is deliberately unchanged.
-	if prov := s.scopeProvenanceForReview(ctx, runID, stageID, approvedPlan, trig, diff, gateEvidence); prov != nil {
+	// #3029: classify TOUCHED/UNTOUCHED against the SAME stage-cumulative set the
+	// operator-scope-undelivered signal used, so the two surfaces can never
+	// contradict each other, and carry the set label onto the block so the
+	// reviewer is told which set the labels were derived from.
+	if prov := s.scopeProvenanceForReview(ctx, runID, stageID, approvedPlan, trig, evalDiff, gateEvidence); prov != nil {
 		if gateEvidence == nil {
 			gateEvidence = &prompt.GateEvidence{}
 			trig.GateEvidence = gateEvidence
 		}
+		prov.CommittedSetStageCumulative = eval.StageCumulative
+		prov.CommittedSetIncompleteReason = eval.IncompleteReason
 		gateEvidence.ScopeProvenance = prov
 	}
 
@@ -5425,6 +5475,231 @@ func (s *Server) resolveFixupDeltaDiff(ctx context.Context, runRow *run.Run, run
 		return policy.Diff{}, false
 	}
 	return consolidatedReviewDiff(cmp), true
+}
+
+// Machine reasons a stage-CUMULATIVE evaluation could not be established
+// (#3029). Each is recorded verbatim on the operator_scope_path_undelivered
+// audit payload (incomplete_reason) and named in the reviewer-facing hedge, so
+// an operator reading a hedged block can tell WHICH precondition failed rather
+// than only that one did.
+const (
+	// cumulativeReasonLedgerUnreadable: no AuditRepo, or a ListForRunByCategory
+	// error over the push ledger.
+	cumulativeReasonLedgerUnreadable = "push_ledger_unreadable"
+	// cumulativeReasonLedgerEmpty: the ledger read succeeded but carries NO
+	// stage-scoped entry. Deliberately INCOMPLETE rather than "this pass is the
+	// whole stage" (#3029 binding condition 1): an absent row and a row whose
+	// StageID does not match are indistinguishable here, so the empty read does
+	// NOT establish that the pass diff spans the stage base.
+	cumulativeReasonLedgerEmpty = "stage_push_ledger_empty"
+	// cumulativeReasonBaseUnavailable: the oldest stage-scoped entry carries no
+	// decodable, non-empty base_sha.
+	cumulativeReasonBaseUnavailable = "stage_base_sha_unavailable"
+	// cumulativeReasonBaseEqualsHead: the resolved stage base IS the current
+	// head, so the cumulative compare would be empty and report every granted
+	// path undelivered — the exact false positive this resolver exists to close.
+	cumulativeReasonBaseEqualsHead = "stage_base_equals_head"
+	// cumulativeReasonForgeUnavailable: no GitHub client, no installation, no
+	// current head, or an unparseable repo (the CLI/dev posture).
+	cumulativeReasonForgeUnavailable = "forge_compare_unavailable"
+	// cumulativeReasonCompareFailed: ComparePatch returned an error.
+	cumulativeReasonCompareFailed = "cumulative_compare_failed"
+	// cumulativeReasonCompareTruncated: the forge capped the compare's file
+	// inventory, so a delivered path can be MISSING from the response.
+	cumulativeReasonCompareTruncated = "cumulative_compare_truncated"
+)
+
+// evaluatedAgainstStageCumulative / evaluatedAgainstThisPass are the two
+// `evaluated_against` labels carried on the operator_scope_path_undelivered
+// audit payload (#3029).
+const (
+	evaluatedAgainstStageCumulative = "stage-cumulative"
+	evaluatedAgainstThisPass        = "this-pass"
+)
+
+// stageCumulativeEval is the file set the operator-scope-DELIVERY and
+// scope-PROVENANCE surfaces classify against (#3029), plus an honest label of
+// what that set actually spans.
+//
+// Diff is ALWAYS usable: on every degrade it is the caller's current-pass diff,
+// so the signal keeps working — only the claim it licenses weakens.
+// StageCumulative is true ONLY when the cumulative state was actually
+// established by a forge compare over stageBase..head; otherwise
+// IncompleteReason names the machine reason and both the audit payload and the
+// reviewer wording downgrade to the this-pass hedge.
+type stageCumulativeEval struct {
+	Diff             policy.Diff
+	StageBaseSHA     string
+	HeadSHA          string
+	StageCumulative  bool
+	IncompleteReason string
+}
+
+// evaluatedAgainst is the machine label for the set Diff spans.
+func (e stageCumulativeEval) evaluatedAgainst() string {
+	if e.StageCumulative {
+		return evaluatedAgainstStageCumulative
+	}
+	return evaluatedAgainstThisPass
+}
+
+// resolveStageCumulativeEval resolves the implement stage's CUMULATIVE committed
+// state — every commit the stage has pushed, stageBase..head — for the
+// operator-scope-undelivered (#1407) and scope-provenance (#1914) surfaces
+// (#3029).
+//
+// WHY it exists. Since #2884 a post-fix-up re-review is dispatched from
+// maybeBackstopFixupReReview, whose diff is ComparePatch(fixupBase, head) — the
+// fix-up DELTA — and runImplementReviews feeds that delta straight into
+// committedPathSet. Both surfaces then ask "did THIS PASS touch the path" while
+// their evidence text asserts "absent from the committed file set", so every
+// operator-granted path delivered by an EARLIER pass of the same stage is
+// reported undelivered (#3029: six occurrences, three reject verdicts on correct
+// work).
+//
+// WHY NOT a union of per-pass touched paths. A union is an EVER-TOUCHED set: a
+// path delivered in pass 1 and reverted in pass 2 has NO row in stageBase..head
+// but DOES have an M row in the pass-2 delta, so no fold of per-pass deltas can
+// detect the revert. That trades a false positive for a false NEGATIVE (a silent
+// gate), which is strictly worse. There is no forge-free route to the true
+// cumulative state, so the second round-trip is taken deliberately.
+//
+// COMPLETENESS IS FAIL-CLOSED (#3029 binding condition 1). The stage-cumulative
+// label is asserted ONLY when the compare actually succeeded over a resolved
+// stage base. Every other outcome — including a ledger read that returned no
+// stage-scoped entries — returns the caller's PASS diff with StageCumulative
+// false and a named IncompleteReason. In particular there is deliberately NO
+// "complete by construction" first-review shortcut: an absent row and a row
+// whose StageID does not match are indistinguishable to this read, so an empty
+// stage-scoped set does not establish that the pass diff spans the stage base.
+//
+// SCOPE BOUNDARY: stage-scoped. The ledger is filtered to THIS stage, so a grant
+// delivered in a DIFFERENT implement stage of the same run (a decomposition
+// child, a re-run stage) still reports undelivered. That is the operator-ratified
+// boundary, recorded in backend/internal/server/README.md.
+//
+// ASSUMPTION (verified in-repo): the base_sha on the OLDEST stage-scoped push
+// ledger entry is the commit the implement stage started from. The pull-request
+// report handler requires base_sha on every pushed / fixup_pushed outcome
+// (pullrequest.go, the Outcome validation block) and stamps the entry with the
+// stage id, and maybeBackstopFixupReReview is already called with that value as
+// the fix-up base.
+func (s *Server) resolveStageCumulativeEval(ctx context.Context, runRow *run.Run, runID, stageID uuid.UUID, headSHA string, passDiff policy.Diff) stageCumulativeEval {
+	incomplete := func(reason string) stageCumulativeEval {
+		return stageCumulativeEval{Diff: passDiff, HeadSHA: headSHA, IncompleteReason: reason}
+	}
+
+	// (a) Push ledger unreadable.
+	if s.cfg.AuditRepo == nil {
+		return incomplete(cumulativeReasonLedgerUnreadable)
+	}
+	type ledgerEntry struct {
+		ts      time.Time
+		seq     int64
+		baseSHA string
+	}
+	var entries []ledgerEntry
+	for _, cat := range lineageLedgerCategories {
+		rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"implement review: list push ledger for cumulative evaluation failed — evaluating against this pass only",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("category", cat),
+				slog.String("error", err.Error()),
+			)
+			return incomplete(cumulativeReasonLedgerUnreadable)
+		}
+		// (b) Filter to THIS stage.
+		for _, e := range rows {
+			if e.StageID == nil || *e.StageID != stageID {
+				continue
+			}
+			var payload struct {
+				BaseSHA string `json:"base_sha"`
+			}
+			// An undecodable payload still counts as a stage-scoped entry: it is
+			// evidence a pass happened, and dropping it would silently shrink the
+			// history. It simply carries no base_sha.
+			_ = json.Unmarshal(e.Payload, &payload)
+			entries = append(entries, ledgerEntry{ts: e.Timestamp, seq: e.Sequence, baseSHA: payload.BaseSHA})
+		}
+	}
+	// (c) No stage-scoped entry — INCOMPLETE, never "complete by construction".
+	if len(entries) == 0 {
+		return incomplete(cumulativeReasonLedgerEmpty)
+	}
+	// Oldest-first by (timestamp, sequence) — the mirror of
+	// resolveSecondNewestReportedHeadSHA's newest-first sort.
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].ts.Equal(entries[j].ts) {
+			return entries[i].seq < entries[j].seq
+		}
+		return entries[i].ts.Before(entries[j].ts)
+	})
+	// (d) The stage base is the OLDEST stage-scoped entry's base_sha.
+	stageBase := entries[0].baseSHA
+	if stageBase == "" {
+		return incomplete(cumulativeReasonBaseUnavailable)
+	}
+	// (d') A degenerate base==head compare returns an EMPTY file inventory, which
+	// would report every granted path undelivered under a stage-cumulative label.
+	if stageBase == headSHA {
+		return incomplete(cumulativeReasonBaseEqualsHead)
+	}
+	// (e) Forge preconditions — the CLI/dev posture, INFO-logged, no WARN.
+	if s.cfg.GitHub == nil || runRow == nil || runRow.InstallationID == nil || *runRow.InstallationID == 0 || headSHA == "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"implement review: forge compare not wired for cumulative evaluation — evaluating against this pass only",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+		)
+		return incomplete(cumulativeReasonForgeUnavailable)
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"implement review: parse repo for cumulative evaluation failed — evaluating against this pass only",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return incomplete(cumulativeReasonForgeUnavailable)
+	}
+	// (f) Compare error.
+	cmp, err := s.cfg.GitHub.ComparePatch(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, stageBase, headSHA)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"implement review: cumulative compare failed — evaluating against this pass only",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("stage_base", stageBase),
+			slog.String("head", headSHA),
+			slog.String("error", err.Error()),
+		)
+		return incomplete(cumulativeReasonCompareFailed)
+	}
+	// (g) A TRUNCATED inventory can omit a delivered path (GitHub caps the
+	// compare files array at 300 and paginates beyond it), which would reproduce
+	// the exact false positive this resolver closes. Treat it as incomplete.
+	if cmp.Truncated {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"implement review: cumulative compare truncated — evaluating against this pass only",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("stage_base", stageBase),
+			slog.String("head", headSHA),
+		)
+		return incomplete(cumulativeReasonCompareTruncated)
+	}
+	// (h) Established.
+	return stageCumulativeEval{
+		Diff:            consolidatedReviewDiff(cmp),
+		StageBaseSHA:    stageBase,
+		HeadSHA:         headSHA,
+		StageCumulative: true,
+	}
 }
 
 // resolvePriorReviewedHeadSHA returns the head_sha the PREVIOUS implement review

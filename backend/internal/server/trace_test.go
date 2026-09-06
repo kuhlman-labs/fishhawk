@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -5769,7 +5770,7 @@ func TestRunImplementReviews_OperatorScopeUndelivered_BothChannels_AuditAndPromp
 	}
 	got := reviewer.calls[0]
 	for _, want := range []string{
-		"operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):",
+		"operator_scope_path_undelivered (THIS PASS ONLY — operator-added scope path absent from this pass's committed diff):",
 		"- " + addPath,
 		"- " + amendPath,
 	} {
@@ -5815,10 +5816,11 @@ func TestRunImplementReviews_OperatorScopeUndelivered_AllDelivered_NoSignal(t *t
 	reviewer.mu.Lock()
 	defer reviewer.mu.Unlock()
 	got := reviewer.calls[0]
-	if strings.Contains(got, "operator_scope_path_undelivered (operator-added scope path left UNTOUCHED") {
+	if strings.Contains(got, "operator_scope_path_undelivered (") {
 		t.Errorf("all-delivered prompt must NOT render the undelivered section:\n%s", got)
 	}
-	if strings.Contains(got, "An `operator_scope_path_undelivered` warning below") {
+	if strings.Contains(got, "`operator_scope_path_undelivered` block below") ||
+		strings.Contains(got, "`operator_scope_path_undelivered` warning below") {
 		t.Errorf("all-delivered prompt must NOT render the BINDING bullet:\n%s", got)
 	}
 }
@@ -6725,7 +6727,7 @@ func TestRunImplementReviews_OperatorScopeUndelivered_Indeterminate(t *testing.T
 	if !strings.Contains(got, "operator_scope_path_undelivered (INDETERMINATE") {
 		t.Errorf("prompt must render the hedged INDETERMINATE header:\n%s", got)
 	}
-	if strings.Contains(got, "operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):") {
+	if strings.Contains(got, "operator_scope_path_undelivered (THIS PASS ONLY — operator-added scope path absent from this pass's committed diff):") {
 		t.Errorf("prompt must NOT assert the undelivered miss as fact under indeterminate mode:\n%s", got)
 	}
 	if strings.Contains(got, "This is a deterministic, machine-verified signal") {
@@ -10737,5 +10739,484 @@ func TestRunImplementReviews_OrdinaryRunPromptHasNoPerSliceVerify(t *testing.T) 
 		if strings.Contains(reviewer.calls[0], forbidden) {
 			t.Errorf("ordinary run's prompt must not contain %q\n---\n%s", forbidden, reviewer.calls[0])
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #3029: the operator-scope-undelivered and scope-provenance surfaces are
+// evaluated against the implement stage's CUMULATIVE committed state
+// (stageBase..head), not the current pass's delta.
+// ---------------------------------------------------------------------------
+
+// cumulativeCompareBody builds a ComparePatch response listing each named file
+// as modified, so a test can serve the stage-base..head span and the fix-up
+// delta span DIFFERENT file inventories and prove which one the delivery
+// evaluation read.
+func cumulativeCompareBody(files ...string) string {
+	var b strings.Builder
+	b.WriteString(`{"total_commits":1,"commits":[{"sha":"h3"}],"files":[`)
+	for i, f := range files {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"filename":%q,"status":"modified","changes":2,"patch":"@@ -1 +1 @@\n-a\n+b"}`, f)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+// truncatedCompareBody builds a ComparePatch response whose single changed file
+// reports changes>0 with NO patch body — the shape githubclient maps to
+// Truncated=true (an oversized-diff omission). Seeding truncation BY
+// CONSTRUCTION here (rather than by calling the guard in the setup) keeps a
+// counterfactual RED landing on the behavioural assertion.
+func truncatedCompareBody(file string) string {
+	return `{"total_commits":1,"commits":[{"sha":"h3"}],"files":[` +
+		`{"filename":"` + file + `","status":"modified","changes":9}]}`
+}
+
+// seedStageCumulativeLedger wires the push ledger the cumulative resolver reads:
+// a stage-scoped pull_request_opened entry carrying the STAGE BASE, then a
+// later stage-scoped fixup_pushed entry carrying the fix-up's own base. The
+// resolver must take the OLDEST entry's base_sha (the stage base), so a
+// resolver that took the newest would span only the fix-up.
+func seedStageCumulativeLedger(au *auditFake, runID, stageID uuid.UUID, stageBase, fixupBase string) {
+	sid := stageID
+	seedHeadEntry(au, runID, &sid, "pull_request_opened", 10,
+		map[string]any{"head_sha": "h2", "base_sha": stageBase})
+	seedHeadEntry(au, runID, &sid, "fixup_pushed", 20,
+		map[string]any{"head_sha": "h3", "base_sha": fixupBase})
+}
+
+// wireCumulativeForge points the run at an installation + a span-aware compare
+// client so resolveStageCumulativeEval can reach the forge. It returns a
+// counter reporting how many compare requests that client has SERVED, so a
+// caller can make "this degrade issues no forge request" load-bearing rather
+// than asserted in a comment. Callers that do not care read it as a statement.
+func wireCumulativeForge(t *testing.T, s *Server, runRow *run.Run, bySpan map[string]string) (compares func() int) {
+	t.Helper()
+	inst := int64(55)
+	runRow.InstallationID = &inst
+	prURL := "https://github.com/kuhlman-labs/example/pull/7"
+	runRow.PullRequestURL = &prURL
+	var n atomic.Int64
+	s.cfg.GitHub = spanAwareComparePatchClient(t, bySpan, func() { n.Add(1) })
+	return func() int { return int(n.Load()) }
+}
+
+// operatorScopeUndeliveredAuditPayload returns the single
+// operator_scope_path_undelivered payload appended during the test, or ok=false
+// when none was appended.
+func operatorScopeUndeliveredAuditPayload(t *testing.T, au *auditFake) (operatorScopeUndeliveredPayload, bool) {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out operatorScopeUndeliveredPayload
+	n := 0
+	for i := range au.appended {
+		if au.appended[i].Category != operatorScopeUndeliveredCategory {
+			continue
+		}
+		n++
+		if err := json.Unmarshal(au.appended[i].Payload, &out); err != nil {
+			t.Fatalf("unmarshal operator_scope_path_undelivered payload: %v", err)
+		}
+	}
+	if n > 1 {
+		t.Fatalf("operator_scope_path_undelivered emitted %d times, want at most 1", n)
+	}
+	return out, n == 1
+}
+
+// TestRunImplementReviews_OperatorScopeUndelivered_StageCumulative is the #3029
+// done-means test: an add_scope_files grant DELIVERED by an earlier pass of the
+// same implement stage is NOT reported undelivered on a later fix-up pass whose
+// own delta does not touch it. The pass diff deliberately omits the granted path
+// (it is what the reviewer reads), while the stage-base..head compare contains
+// it — so a per-pass evaluation reports the miss and a stage-cumulative one does
+// not.
+func TestRunImplementReviews_OperatorScopeUndelivered_StageCumulative(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const addPath = "frontend/src/components/stage-detail.test.tsx"
+	au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
+	seedStageCumulativeLedger(au, runRow.ID, implStage.ID, "stagebase", "h2")
+	wireCumulativeForge(t, s, runRow, map[string]string{
+		// The stage-cumulative span CONTAINS the granted path (pass 1 delivered it).
+		"stagebase...h3": cumulativeCompareBody("backend/internal/foo/foo.go", addPath),
+	})
+
+	// THIS pass's committed diff — the fix-up delta — does NOT touch the grant.
+	passDiff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, passDiff, nil, "h3", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	if payload, ok := operatorScopeUndeliveredAuditPayload(t, au); ok {
+		t.Errorf("a grant delivered by an earlier pass must NOT be reported undelivered; got %v", payload.UndeliveredPaths)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	if got := reviewer.calls[0]; strings.Contains(got, "operator_scope_path_undelivered (") {
+		t.Errorf("prompt must render no undelivered block for a prior-pass delivery:\n%s", got)
+	}
+}
+
+// TestRunImplementReviews_OperatorScopeUndelivered_NeverDelivered_StillReported
+// is the #3029 anti-disable control: a grant absent from BOTH the pass delta and
+// the stage-cumulative compare still fires, labelled stage-cumulative with a
+// complete history. Without it the fix could be "stop reporting on fix-ups".
+func TestRunImplementReviews_OperatorScopeUndelivered_NeverDelivered_StillReported(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const addPath = "frontend/src/components/stage-detail.test.tsx"
+	au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
+	seedStageCumulativeLedger(au, runRow.ID, implStage.ID, "stagebase", "h2")
+	wireCumulativeForge(t, s, runRow, map[string]string{
+		// Delivered in NO pass of the stage.
+		"stagebase...h3": cumulativeCompareBody("backend/internal/foo/foo.go"),
+	})
+
+	passDiff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, passDiff, nil, "h3", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	payload, ok := operatorScopeUndeliveredAuditPayload(t, au)
+	if !ok {
+		t.Fatal("a never-delivered grant must still be reported undelivered")
+	}
+	if len(payload.UndeliveredPaths) != 1 || payload.UndeliveredPaths[0] != addPath {
+		t.Errorf("undelivered paths = %v, want exactly [%q]", payload.UndeliveredPaths, addPath)
+	}
+	if payload.EvaluatedAgainst != evaluatedAgainstStageCumulative || !payload.HistoryComplete {
+		t.Errorf("evaluated_against=%q history_complete=%v, want %q/true",
+			payload.EvaluatedAgainst, payload.HistoryComplete, evaluatedAgainstStageCumulative)
+	}
+	if payload.IncompleteReason != "" {
+		t.Errorf("incomplete_reason = %q, want empty on an established history", payload.IncompleteReason)
+	}
+	if payload.CumulativeBaseSHA != "stagebase" || payload.HeadSHA != "h3" {
+		t.Errorf("payload span = %q..%q, want stagebase..h3", payload.CumulativeBaseSHA, payload.HeadSHA)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"operator_scope_path_undelivered (operator-added scope path left UNTOUCHED across the whole implement stage):",
+		"base stagebase .. head h3",
+		"- " + addPath,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stage-cumulative prompt missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunImplementReviews_OperatorScopeUndelivered_AmendmentChannel covers the
+// APPROVED mid-stage scope-amendment channel (#3029 occurrences 5 and 6): a path
+// that entered the effective scope via an amendment and was delivered in the
+// pass that requested it is not reported undelivered on a later fix-up pass.
+func TestRunImplementReviews_OperatorScopeUndelivered_AmendmentChannel(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const amendPath = "backend/internal/reactionpoller/poller_test.go"
+	sa := newFakeScopeAmendmentRepo()
+	s.cfg.ScopeAmendmentRepo = sa
+	seedApprovedAmendment(t, sa, runRow.ID, implStage.ID, amendPath)
+	seedStageCumulativeLedger(au, runRow.ID, implStage.ID, "stagebase", "h2")
+	wireCumulativeForge(t, s, runRow, map[string]string{
+		"stagebase...h3": cumulativeCompareBody("backend/internal/foo/foo.go", amendPath),
+	})
+
+	passDiff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, passDiff, nil, "h3", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	if payload, ok := operatorScopeUndeliveredAuditPayload(t, au); ok {
+		t.Errorf("an amendment path delivered by an earlier pass must NOT be reported undelivered; got %v",
+			payload.UndeliveredPaths)
+	}
+}
+
+// TestRunImplementReviews_OperatorScopeUndelivered_ProvenanceLabelsStageCumulative
+// pins that the SIBLING scope-provenance surface moved to the same set (#3029):
+// a plan scope.files path delivered by an earlier pass renders as TOUCHED rather
+// than appearing in the untouched plan-path list, and the block states which set
+// its labels came from. Without the move the two surfaces would disagree — the
+// exact contradiction that made reviewers reject correct work.
+func TestRunImplementReviews_OperatorScopeUndelivered_ProvenanceLabelsStageCumulative(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	// A fold keeps the provenance block non-nil; the PLAN path is the subject.
+	const addPath = "frontend/src/components/stage-detail.test.tsx"
+	const planPath = "backend/internal/foo/foo.go"
+	au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
+	seedStageCumulativeLedger(au, runRow.ID, implStage.ID, "stagebase", "h2")
+	wireCumulativeForge(t, s, runRow, map[string]string{
+		// Both the plan path and the grant were delivered across the stage.
+		"stagebase...h3": cumulativeCompareBody(planPath, addPath),
+	})
+
+	// This pass touched NEITHER — a per-pass evaluation would label both untouched.
+	passDiff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/other/other.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, passDiff, nil, "h3", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	got := reviewer.calls[0]
+	if strings.Contains(got, planPath+" (plan scope, UNTOUCHED") {
+		t.Errorf("a plan path delivered by an earlier pass must NOT render UNTOUCHED:\n%s", got)
+	}
+	if strings.Contains(got, addPath+" (folded: approval-add-scope-files) — folded, UNTOUCHED") {
+		t.Errorf("a fold delivered by an earlier pass must NOT render UNTOUCHED:\n%s", got)
+	}
+	if !strings.Contains(got, "TOUCHED/UNTOUCHED below are evaluated against the STAGE-CUMULATIVE committed file set") {
+		t.Errorf("provenance block must name the stage-cumulative set:\n%s", got)
+	}
+}
+
+// TestResolveStageCumulativeEval_FailClosedModes is the #3029 per-failure-mode
+// gate: ONE sub-case per named degrade. Each asserts (i) the resolver returns
+// the CURRENT PASS diff so the signal keeps working, (ii) StageCumulative is
+// false, (iii) the exact machine reason, and (iv) that the emitted audit payload
+// carries evaluated_against="this-pass" with history_complete=false and the
+// rendered prompt carries the hedged wording naming that reason.
+//
+// stage_push_ledger_empty is deliberately one of them (binding condition 1): a
+// successful ledger read returning no stage-scoped rows does NOT establish that
+// this pass spans the stage base — an absent row and a row whose StageID does
+// not match are indistinguishable — so it is INCOMPLETE, not complete by
+// construction.
+//
+// Every sub-case ALSO pins the cost assumption, and does so load-bearingly: the
+// compare client counts the requests it serves and each sub-case declares the
+// exact number the resolver may issue, so a pre-forge degrade that started
+// reaching the forge (0 -> 1) fails here rather than passing on a comment.
+func TestResolveStageCumulativeEval_FailClosedModes(t *testing.T) {
+	const addPath = "frontend/src/components/stage-detail.test.tsx"
+	passDiff := func() policy.Diff {
+		return policy.Diff{ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		}}
+	}
+
+	cases := []struct {
+		name       string
+		wantReason string
+		// setup wires the degrade. It returns the number of compares the test
+		// expects the resolver to issue (0 when it must not reach the forge)
+		// and a counter reporting how many the wired client actually served.
+		setup func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (wantCompares int, compares func() int)
+	}{
+		{
+			name:       "push_ledger_unreadable",
+			wantReason: cumulativeReasonLedgerUnreadable,
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
+				// Fail ONLY the ledger read, leaving every other category readable.
+				// listByCategoryErr would short-circuit EVERY category; the
+				// category-scoped hook fails only the ledger read.
+				au.listByCategoryErrCategory = "pull_request_opened"
+				seedStageCumulativeLedger(au, runRow.ID, stageID, "stagebase", "h2")
+				// A REACHABLE, correctly-configured forge: the 0 below is then
+				// the resolver declining to call it, not a wiring accident.
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{
+					"stagebase...h3": cumulativeCompareBody("backend/internal/foo/foo.go", addPath),
+				})
+				return 0, compares
+			},
+		},
+		{
+			name:       "stage_push_ledger_empty",
+			wantReason: cumulativeReasonLedgerEmpty,
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
+				// Ledger entries exist for the RUN but none is scoped to this
+				// stage — the state the removed complete-by-construction branch
+				// would have labelled stage-cumulative.
+				seedHeadEntry(au, runRow.ID, nil, "pull_request_opened", 10,
+					map[string]any{"head_sha": "h2", "base_sha": "stagebase"})
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{
+					"stagebase...h3": cumulativeCompareBody("backend/internal/foo/foo.go", addPath),
+				})
+				return 0, compares
+			},
+		},
+		{
+			name:       "stage_base_sha_unavailable",
+			wantReason: cumulativeReasonBaseUnavailable,
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
+				sid := stageID
+				// A literally EMPTY base_sha, seeded by construction.
+				seedHeadEntry(au, runRow.ID, &sid, "pull_request_opened", 10,
+					map[string]any{"head_sha": "h2", "base_sha": ""})
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{
+					"stagebase...h3": cumulativeCompareBody("backend/internal/foo/foo.go", addPath),
+				})
+				return 0, compares
+			},
+		},
+		{
+			name:       "stage_base_equals_head",
+			wantReason: cumulativeReasonBaseEqualsHead,
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
+				sid := stageID
+				// A degenerate base==head compare returns an EMPTY inventory,
+				// which would report every grant undelivered as "cumulative".
+				// The span IS wired, so the 0 proves the resolver refuses the
+				// degenerate span rather than issuing a useless round-trip.
+				seedHeadEntry(au, runRow.ID, &sid, "pull_request_opened", 10,
+					map[string]any{"head_sha": "h3", "base_sha": "h3"})
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{
+					"h3...h3": cumulativeCompareBody(),
+				})
+				return 0, compares
+			},
+		},
+		{
+			name:       "forge_compare_unavailable",
+			wantReason: cumulativeReasonForgeUnavailable,
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
+				seedStageCumulativeLedger(au, runRow.ID, stageID, "stagebase", "h2")
+				// The CLI/dev posture: no GitHub client wired at all, so no
+				// client can serve a request and the count is 0 by construction.
+				s.cfg.GitHub = nil
+				return 0, func() int { return 0 }
+			},
+		},
+		{
+			name:       "cumulative_compare_failed",
+			wantReason: cumulativeReasonCompareFailed,
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
+				seedStageCumulativeLedger(au, runRow.ID, stageID, "stagebase", "h2")
+				// No span configured → the span-aware client answers 500. This
+				// is a POST-forge degrade, so exactly ONE compare is expected —
+				// which is also what proves the 0s above are discriminating.
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{})
+				return 1, compares
+			},
+		},
+		{
+			name:       "cumulative_compare_truncated",
+			wantReason: cumulativeReasonCompareTruncated,
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
+				seedStageCumulativeLedger(au, runRow.ID, stageID, "stagebase", "h2")
+				// A truncated inventory can OMIT a delivered path, reproducing
+				// the exact false positive this resolver closes — so it must be
+				// treated as an incomplete history even though it "succeeded".
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{
+					"stagebase...h3": truncatedCompareBody(addPath),
+				})
+				return 1, compares
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewer := &fakePlanReviewer{
+				verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+				model:   "claude-opus-4-7",
+			}
+			s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+			au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
+			wantCompares, compares := tc.setup(t, s, au, runRow, implStage.ID)
+
+			// (i)-(iii): the resolver's own contract.
+			eval := s.resolveStageCumulativeEval(t.Context(), runRow, runRow.ID, implStage.ID, "h3", passDiff())
+
+			// The cost assumption, made load-bearing: a PRE-forge degrade must
+			// short-circuit before the round-trip, a POST-forge one must issue
+			// exactly the one compare it degraded on. Counted around the direct
+			// resolver call only, so the runImplementReviews pass below (which
+			// resolves again) cannot mask an extra request here.
+			if got := compares(); got != wantCompares {
+				t.Errorf("resolver issued %d ComparePatch request(s) on the %s degrade, want %d",
+					got, tc.name, wantCompares)
+			}
+			if eval.StageCumulative {
+				t.Errorf("StageCumulative = true, want false on the %s degrade", tc.name)
+			}
+			if eval.IncompleteReason != tc.wantReason {
+				t.Errorf("IncompleteReason = %q, want %q", eval.IncompleteReason, tc.wantReason)
+			}
+			if eval.evaluatedAgainst() != evaluatedAgainstThisPass {
+				t.Errorf("evaluatedAgainst() = %q, want %q", eval.evaluatedAgainst(), evaluatedAgainstThisPass)
+			}
+			if !reflect.DeepEqual(eval.Diff, passDiff()) {
+				t.Errorf("degrade must return the CURRENT PASS diff so the signal keeps working; got %+v", eval.Diff)
+			}
+
+			// (iv): the emitted audit payload + the rendered prompt.
+			if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, passDiff(), nil, "h3", nil) {
+				t.Fatal("gating approve must not gate")
+			}
+			payload, ok := operatorScopeUndeliveredAuditPayload(t, au)
+			if !ok {
+				t.Fatal("the signal must still fire on a degrade — it is only labelled honestly")
+			}
+			if payload.EvaluatedAgainst != evaluatedAgainstThisPass {
+				t.Errorf("evaluated_against = %q, want %q", payload.EvaluatedAgainst, evaluatedAgainstThisPass)
+			}
+			if payload.HistoryComplete {
+				t.Error("history_complete = true, want false on an unestablished cumulative state")
+			}
+			if payload.IncompleteReason != tc.wantReason {
+				t.Errorf("payload incomplete_reason = %q, want %q", payload.IncompleteReason, tc.wantReason)
+			}
+			if payload.CumulativeBaseSHA != "" {
+				t.Errorf("cumulative_base_sha = %q, want empty on a degrade", payload.CumulativeBaseSHA)
+			}
+			reviewer.mu.Lock()
+			defer reviewer.mu.Unlock()
+			got := reviewer.calls[0]
+			for _, want := range []string{
+				"operator_scope_path_undelivered (THIS PASS ONLY — operator-added scope path absent from this pass's committed diff):",
+				"could not be established (reason: " + tc.wantReason + ")",
+			} {
+				if !strings.Contains(got, want) {
+					t.Errorf("hedged prompt missing %q:\n%s", want, got)
+				}
+			}
+			if strings.Contains(got, "deterministic, machine-verified signal") {
+				t.Errorf("a hedged block must NOT carry the machine-verified framing:\n%s", got)
+			}
+		})
 	}
 }

@@ -5798,10 +5798,12 @@ func TestBuild_ImplementReview_OperatorScopeUndelivered_RendersWarningAndBinding
 		t.Fatalf("Build: %v", err)
 	}
 	for _, w := range []string{
-		// The BINDING preamble bullet next to the scope-divergence bullet.
-		"An `operator_scope_path_undelivered` warning below (an operator-added scope path the commit left",
+		// #3029: a carrier that does NOT claim a stage-cumulative evaluation
+		// lands on the hedged THIS-PASS branch — the block still renders and
+		// still names every path, but the machine-verified framing is gone.
+		"The `operator_scope_path_undelivered` block below was evaluated against THIS PASS's committed diff ONLY",
 		// The warning block header + each named undelivered path.
-		"operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):",
+		"operator_scope_path_undelivered (THIS PASS ONLY — operator-added scope path absent from this pass's committed diff):",
 		"- frontend/src/components/stage-detail.test.tsx",
 		"- backend/internal/reactionpoller/poller_test.go",
 		// The untouched-only limitation is stated explicitly (binding condition 1).
@@ -5810,6 +5812,11 @@ func TestBuild_ImplementReview_OperatorScopeUndelivered_RendersWarningAndBinding
 		if !strings.Contains(got, w) {
 			t.Errorf("implement_review prompt missing %q:\n%s", w, got)
 		}
+	}
+	// The machine-verified HIGH-priority framing is reserved for the
+	// stage-cumulative branch (#3029) and must NOT appear here.
+	if strings.Contains(got, "deterministic, machine-verified signal") {
+		t.Errorf("this-pass branch must NOT carry the machine-verified framing:\n%s", got)
 	}
 }
 
@@ -5842,10 +5849,11 @@ func TestBuild_ImplementReview_OperatorScopeUndelivered_EmptyByteIdentical(t *te
 	if gotNil != gotEmpty {
 		t.Errorf("empty OperatorScopeUndelivered must be byte-identical to nil")
 	}
-	if strings.Contains(gotNil, "operator_scope_path_undelivered (operator-added scope path left UNTOUCHED") {
+	if strings.Contains(gotNil, "operator_scope_path_undelivered (") {
 		t.Errorf("nil/empty OperatorScopeUndelivered must NOT render the warning block:\n%s", gotNil)
 	}
-	if strings.Contains(gotNil, "An `operator_scope_path_undelivered` warning below") {
+	if strings.Contains(gotNil, "`operator_scope_path_undelivered` block below") ||
+		strings.Contains(gotNil, "`operator_scope_path_undelivered` warning below") {
 		t.Errorf("nil/empty OperatorScopeUndelivered must NOT render the BINDING bullet:\n%s", gotNil)
 	}
 }
@@ -7816,7 +7824,7 @@ func TestBuild_ImplementReview_ScopeProvenance_NilByteIdentical(t *testing.T) {
 		t.Errorf("nil ScopeProvenance must render the legacy scope-divergence bullet:\n%s", got)
 	}
 	// #1407 rendering unchanged in the presence of a nil provenance.
-	if !strings.Contains(got, "operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):") {
+	if !strings.Contains(got, "operator_scope_path_undelivered (THIS PASS ONLY — operator-added scope path absent from this pass's committed diff):") {
 		t.Errorf("operator_scope_path_undelivered rendering must be unchanged:\n%s", got)
 	}
 	// Byte-identity guard (#1914 fix-up): the marker assertions above only pin
@@ -7851,7 +7859,7 @@ const wantNilProvenanceGateEvidence = "### Gate evidence (machine-verified — o
 	"- A TERMINAL (non-superseded) FAILED verify run (e.g. a tail naming [build failed]), OR a verify_summary outcome of `failed`, means the committed tree does NOT pass the named command. You MUST record it as a `high`-severity concern, name it FIRST in `concerns`, and you MAY shortcut the remaining review lenses — a head that does not build or test green cannot be salvaged by stylistic findings.\n" +
 	"- The verify_summary outcome (and the LAST/terminal verify run) is authoritative for the committed tree. A verify run marked SUPERSEDED is an earlier iteration the verify-fix loop absorbed and re-ran on a newer tree — its failure MUST NOT be treated as a committed-tree blocker. An absorbed-then-passed iteration is NOT a blocker; a terminal failure still is.\n" +
 	"- A divergence between the declared and staged scope (counts below, or drift-excluded paths) likewise outranks stylistic findings — name it before them.\n" +
-	"- An `operator_scope_path_undelivered` warning below (an operator-added scope path the commit left UNTOUCHED) is a high-priority miss — a likely dropped operator-required edit. Treat it as outranking stylistic findings and name it before them.\n" +
+	"- The `operator_scope_path_undelivered` block below was evaluated against THIS PASS's committed diff ONLY — earlier passes of this implement stage, if any, were NOT evaluated. Do NOT treat the listed paths as machine-verified misses; verify each against the PR's cumulative base..head diff before raising it.\n" +
 	"- A SKIPPED verify run means compile/test state is UNVERIFIED. Do NOT assume the change is CI-green; state the unverified status in a concern or in `free_form`.\n" +
 	"- A PASSED verify run certifies ONLY that the named command exited 0 against the committed tree. It does NOT certify test quality — the test-vacuity and untested-path lenses still apply in full.\n" +
 	"- Escape valve: the evidence above is ground truth ABOUT WHAT THE GATES MEASURED and outranks text-level reading, but it can itself be wrong. When the committed diff under review DIRECTLY and VERIFIABLY contradicts a specific evidence claim above (e.g. the diff plainly contains an edit the evidence reports dropped/undelivered), you MUST report the CONTRADICTION as a `high`-severity concern with category `evidence_conflict` — naming BOTH the evidence claim AND the contradicting observation in the diff — instead of asserting the (wrong) evidence claim as a defect. This fires ONLY on a direct, verifiable contradiction; absent one, the binding rules above stand unchanged.\n" +
@@ -7861,9 +7869,9 @@ const wantNilProvenanceGateEvidence = "### Gate evidence (machine-verified — o
 	"- declared scope.files: 2\n" +
 	"- files staged into the commit: (not recorded — no git_diff event)\n" +
 	"\n" +
-	"operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):\n" +
+	"operator_scope_path_undelivered (THIS PASS ONLY — operator-added scope path absent from this pass's committed diff):\n" +
 	"\n" +
-	"The operator DELIBERATELY added the scope path(s) below — either an add_scope_files path folded at plan approval or an approved mid-stage scope amendment (often a binding-condition test) — yet the committed tree did NOT touch them. This is a deterministic, machine-verified signal: each path is absent from the committed file set. Treat it as a HIGH-priority miss — a likely dropped operator-required edit, not a stylistic finding — and name it before stylistic concerns. (Scope here is untouched-only: a path the commit DID touch but with the wrong content is not detected deterministically and remains for you to judge on the diff.)\n" +
+	"The operator DELIBERATELY added the scope path(s) below — either an add_scope_files path folded at plan approval or an approved mid-stage scope amendment (often a binding-condition test) — and they are absent from THIS PASS's committed diff. This is NOT a machine-verified miss: the implement stage's CUMULATIVE committed state could not be established, so any EARLIER pass of this stage was not evaluated and a listed path may ALREADY be present at the PR head. Verify each against the PR's cumulative base..head diff before raising it, and do NOT report one as a dropped edit on this evidence alone. (Scope here is untouched-only: a path the pass DID touch but with the wrong content is not detected deterministically and remains for you to judge on the diff.)\n" +
 	"\n" +
 	"- backend/internal/foo/extra.go\n" +
 	"\n"
@@ -7893,8 +7901,8 @@ func TestBuild_ImplementReview_ScopeProvenance_CoexistsWithOperatorUndelivered(t
 	}
 	for _, w := range []string{
 		"Declared-scope provenance (decomposition of the declared scope.files count",
-		"operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):",
-		"An `operator_scope_path_undelivered` warning below",
+		"operator_scope_path_undelivered (THIS PASS ONLY — operator-added scope path absent from this pass's committed diff):",
+		"The `operator_scope_path_undelivered` block below was evaluated against THIS PASS's committed diff ONLY",
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("coexisting render missing %q:\n%s", w, got)
@@ -13855,4 +13863,210 @@ func TestHoldsHeadLevelGateEvidence(t *testing.T) {
 			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
 		}
 	}
+}
+
+// TestWriteGateEvidence_OperatorScopeUndelivered is the #3029 render half: one
+// sub-case per wording branch of the operator_scope_path_undelivered block, plus
+// the byte-identical control. The load-bearing property across every branch is
+// that the evidence NAMES the file set the absence was measured against — an
+// unqualified "absent from the committed file set" is what let a fix-up DELTA
+// masquerade as the implement stage's whole committed history and produced six
+// false undelivered reports on correct work.
+func TestWriteGateEvidence_OperatorScopeUndelivered(t *testing.T) {
+	const undelivered = "backend/internal/foo/extra.go"
+	build := func(t *testing.T, ev *GateEvidence) string {
+		t.Helper()
+		got, err := Build("implement_review", Trigger{
+			Repo:         "kuhlman-labs/example",
+			ApprovedPlan: fixturePlan(),
+			Diff:         "- M pkg/bar/bar.go\n",
+			GateEvidence: ev,
+		})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+
+	t.Run("stage_cumulative_determinate", func(t *testing.T) {
+		got := build(t, &GateEvidence{
+			OperatorScopeUndelivered:                  []string{undelivered},
+			OperatorScopeUndeliveredStageCumulative:   true,
+			OperatorScopeUndeliveredCumulativeBaseSHA: "basesha111",
+			OperatorScopeUndeliveredCumulativeHeadSHA: "headsha999",
+		})
+		for _, w := range []string{
+			// The block names the set AND the span it was measured over
+			// (binding condition 2: the renderer must print base..head).
+			"the STAGE-CUMULATIVE committed file set (every commit this implement stage has pushed, " +
+				"base basesha111 .. head headsha999)",
+			"NOT merely from this pass's delta",
+			// The machine-verified HIGH-priority framing is licensed here only.
+			"deterministic, machine-verified signal",
+			"- An `operator_scope_path_undelivered` warning below (an operator-added scope path left " +
+				"UNTOUCHED across the WHOLE implement stage) is a high-priority miss",
+			"- " + undelivered,
+		} {
+			if !strings.Contains(got, w) {
+				t.Errorf("stage-cumulative render missing %q:\n%s", w, got)
+			}
+		}
+		if strings.Contains(got, "THIS PASS ONLY") {
+			t.Errorf("stage-cumulative render must NOT carry the this-pass hedge:\n%s", got)
+		}
+	})
+
+	t.Run("stage_cumulative_without_span_names_the_set_span_less", func(t *testing.T) {
+		// The backend can label a set stage-cumulative while carrying no span
+		// (a cumulative evaluation whose SHAs did not propagate). The renderer
+		// must then name the set WITHOUT a span rather than printing an empty
+		// one: "base  .. head )" reads as a reproducible span and is not.
+		got := build(t, &GateEvidence{
+			OperatorScopeUndelivered:                []string{undelivered},
+			OperatorScopeUndeliveredStageCumulative: true,
+		})
+		if !strings.Contains(got, "absent from the STAGE-CUMULATIVE committed file set (every commit this "+
+			"implement stage has pushed) — NOT merely from this pass's delta") {
+			t.Errorf("span-less cumulative render missing the set-naming phrase:\n%s", got)
+		}
+		// The span-bearing wording must not appear with empty SHAs.
+		for _, absent := range []string{"base  .. head", "pushed, base"} {
+			if strings.Contains(got, absent) {
+				t.Errorf("span-less cumulative render must NOT print an empty span %q:\n%s", absent, got)
+			}
+		}
+	})
+
+	t.Run("this_pass_hedged_without_reason_omits_the_clause", func(t *testing.T) {
+		// A this-pass hedge that carries NO machine reason must render
+		// grammatical prose — "could not be established, so any EARLIER" —
+		// never an empty parenthetical "(reason: )".
+		got := build(t, &GateEvidence{
+			OperatorScopeUndelivered: []string{undelivered},
+		})
+		if !strings.Contains(got, "CUMULATIVE committed state could not be established, so any EARLIER") {
+			t.Errorf("reason-less hedge must omit the clause entirely:\n%s", got)
+		}
+		if strings.Contains(got, "(reason:") {
+			t.Errorf("reason-less hedge must not render an empty reason clause:\n%s", got)
+		}
+	})
+
+	t.Run("this_pass_hedged_names_machine_reason", func(t *testing.T) {
+		got := build(t, &GateEvidence{
+			OperatorScopeUndelivered:                 []string{undelivered},
+			OperatorScopeUndeliveredIncompleteReason: "cumulative_compare_truncated",
+		})
+		for _, w := range []string{
+			"operator_scope_path_undelivered (THIS PASS ONLY — operator-added scope path absent from this " +
+				"pass's committed diff):",
+			"absent from THIS PASS's committed diff",
+			// The machine reason is named so a reader can tell WHICH
+			// precondition failed, not merely that one did.
+			"could not be established (reason: cumulative_compare_truncated)",
+			"may ALREADY be present at the PR head",
+			"Verify each against the PR's cumulative base..head diff before raising it",
+			"The `operator_scope_path_undelivered` block below was evaluated against THIS PASS's committed diff ONLY",
+		} {
+			if !strings.Contains(got, w) {
+				t.Errorf("this-pass render missing %q:\n%s", w, got)
+			}
+		}
+		// The hedged branch must NOT be handed established-fact authority.
+		for _, absent := range []string{"deterministic, machine-verified signal", "is a high-priority miss"} {
+			if strings.Contains(got, absent) {
+				t.Errorf("this-pass render must NOT carry %q:\n%s", absent, got)
+			}
+		}
+	})
+
+	t.Run("rename_indeterminate_keeps_hedge_and_names_set", func(t *testing.T) {
+		got := build(t, &GateEvidence{
+			OperatorScopeUndelivered:                  []string{undelivered},
+			OperatorScopeUndeliveredIndeterminate:     true,
+			OperatorScopeUndeliveredStageCumulative:   true,
+			OperatorScopeUndeliveredCumulativeBaseSHA: "basesha111",
+			OperatorScopeUndeliveredCumulativeHeadSHA: "headsha999",
+		})
+		for _, w := range []string{
+			"operator_scope_path_undelivered (INDETERMINATE — operator-added scope path possibly left UNTOUCHED):",
+			"NOT DETERMINABLE",
+			// The pre-existing #2398 hedge now ALSO names the evaluated set.
+			"absent from the STAGE-CUMULATIVE committed file set (every commit this implement stage has pushed, " +
+				"base basesha111 .. head headsha999)",
+		} {
+			if !strings.Contains(got, w) {
+				t.Errorf("indeterminate render missing %q:\n%s", w, got)
+			}
+		}
+	})
+
+	t.Run("empty_is_byte_identical_and_renders_nothing", func(t *testing.T) {
+		base := Trigger{
+			Repo:         "kuhlman-labs/example",
+			ApprovedPlan: fixturePlan(),
+			Diff:         "- M pkg/bar/bar.go\n",
+			GateEvidence: &GateEvidence{ScopeFacts: &GateScopeFacts{DeclaredFiles: 2}},
+		}
+		gotNil, err := Build("implement_review", base)
+		if err != nil {
+			t.Fatalf("Build nil: %v", err)
+		}
+		// An empty undelivered set with EVERY new #3029 field populated must
+		// still render byte-identically to the nil case: the new fields can
+		// never introduce bytes on the all-delivered (happy) path.
+		withFields := base
+		withFields.GateEvidence = &GateEvidence{
+			ScopeFacts:                                &GateScopeFacts{DeclaredFiles: 2},
+			OperatorScopeUndelivered:                  []string{},
+			OperatorScopeUndeliveredStageCumulative:   true,
+			OperatorScopeUndeliveredIncompleteReason:  "push_ledger_unreadable",
+			OperatorScopeUndeliveredCumulativeBaseSHA: "basesha111",
+			OperatorScopeUndeliveredCumulativeHeadSHA: "headsha999",
+		}
+		gotEmpty, err := Build("implement_review", withFields)
+		if err != nil {
+			t.Fatalf("Build empty: %v", err)
+		}
+		if gotNil != gotEmpty {
+			t.Error("an empty OperatorScopeUndelivered carrying the #3029 fields must be byte-identical to nil")
+		}
+		if strings.Contains(gotNil, "operator_scope_path_undelivered (") {
+			t.Errorf("empty set must render no undelivered block:\n%s", gotNil)
+		}
+		// A nil ScopeProvenance likewise renders no set-naming line.
+		if strings.Contains(gotNil, "TOUCHED/UNTOUCHED below are evaluated against") {
+			t.Errorf("nil ScopeProvenance must render no provenance set-naming line:\n%s", gotNil)
+		}
+	})
+
+	t.Run("provenance_names_the_set_on_both_branches", func(t *testing.T) {
+		cumulative := build(t, &GateEvidence{
+			ScopeProvenance: &GateScopeProvenance{
+				PlanFiles:                   1,
+				PlanUntouched:               []string{"backend/internal/foo/foo.go"},
+				CommittedSetStageCumulative: true,
+			},
+		})
+		if !strings.Contains(cumulative, "TOUCHED/UNTOUCHED below are evaluated against the STAGE-CUMULATIVE "+
+			"committed file set (every commit this implement stage has pushed), NOT merely this pass's delta.") {
+			t.Errorf("cumulative provenance must name the stage-cumulative set:\n%s", cumulative)
+		}
+		thisPass := build(t, &GateEvidence{
+			ScopeProvenance: &GateScopeProvenance{
+				PlanFiles:                    1,
+				PlanUntouched:                []string{"backend/internal/foo/foo.go"},
+				CommittedSetIncompleteReason: "stage_push_ledger_empty",
+			},
+		})
+		for _, w := range []string{
+			"TOUCHED/UNTOUCHED below are evaluated against THIS PASS's committed diff ONLY " +
+				"(reason: stage_push_ledger_empty)",
+			"a path labelled UNTOUCHED may have been delivered by a pass this evaluation could not see",
+		} {
+			if !strings.Contains(thisPass, w) {
+				t.Errorf("this-pass provenance missing %q:\n%s", w, thisPass)
+			}
+		}
+	})
 }
