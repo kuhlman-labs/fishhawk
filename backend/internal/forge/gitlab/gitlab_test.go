@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
@@ -260,6 +261,59 @@ func TestErrorMapping(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGetPullRequest_DecodesMergeEvidence pins the E64.40 / #3151 merge-evidence
+// mapping through the real newForge mux: mergeRequestToPR must carry BOTH the
+// MR's merged_at and merge_commit_sha onto forge.PullRequest, and a null pair
+// must leave MergedAt NIL (not the zero time) and MergeCommitSHA empty. These
+// two fields are the whole payload of the record-merge-observation verb, so a
+// mapping that dropped one passes every presence gate and records an observation
+// carrying no evidence.
+func TestGetPullRequest_DecodesMergeEvidence(t *testing.T) {
+	t.Run("merged: merged_at and merge_commit_sha reach the PR", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /api/v4/projects/5/merge_requests/1", func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusOK,
+				`{"iid":1,"state":"merged","merge_commit_sha":"mc-cafebabe","merged_at":"2026-08-30T12:34:56Z","target_branch":"main"}`)
+		})
+		f, _ := newForge(t, mux)
+		pr, err := f.GetPullRequest(context.Background(), gitlabScope("5"), forge.RepoRef{}, 1)
+		if err != nil {
+			t.Fatalf("GetPullRequest: %v", err)
+		}
+		if !pr.Merged {
+			t.Errorf("Merged = false, want true on a merged MR")
+		}
+		if pr.MergeCommitSHA != "mc-cafebabe" {
+			t.Errorf("MergeCommitSHA = %q, want mc-cafebabe", pr.MergeCommitSHA)
+		}
+		if pr.MergedAt == nil {
+			t.Fatalf("MergedAt = nil, want the decoded merge timestamp")
+		}
+		want := time.Date(2026, 8, 30, 12, 34, 56, 0, time.UTC)
+		if !pr.MergedAt.Equal(want) {
+			t.Errorf("MergedAt = %v, want %v", pr.MergedAt.UTC(), want)
+		}
+	})
+	t.Run("opened: null merge evidence stays nil/empty", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /api/v4/projects/5/merge_requests/1", func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusOK,
+				`{"iid":1,"state":"opened","merge_commit_sha":null,"merged_at":null,"target_branch":"main"}`)
+		})
+		f, _ := newForge(t, mux)
+		pr, err := f.GetPullRequest(context.Background(), gitlabScope("5"), forge.RepoRef{}, 1)
+		if err != nil {
+			t.Fatalf("GetPullRequest: %v", err)
+		}
+		if pr.MergedAt != nil {
+			t.Errorf("MergedAt = %v, want nil (a null merged_at must not become the zero time)", pr.MergedAt.UTC())
+		}
+		if pr.MergeCommitSHA != "" {
+			t.Errorf("MergeCommitSHA = %q, want empty on an unmerged MR", pr.MergeCommitSHA)
+		}
+	})
 }
 
 // TestResolveRepoScopeNotInstalled pins the ResolveRepoScope-specific 404

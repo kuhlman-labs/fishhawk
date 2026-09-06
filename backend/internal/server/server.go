@@ -405,14 +405,29 @@ type Config struct {
 	// recovery verb (POST /v0/runs/{run_id}/record-merge-observation, E64.32 /
 	// #3136) reads the live merge state through. It is the ONLY new way onto a
 	// run's evidence chain, so it is the seam a test must be able to drive
-	// without a live forge.
+	// without a live forge. Set, it OVERRIDES the whole per-forge fallback
+	// ladder below (the test seam wins for every run, any forge family).
 	//
-	// nil in production: the handler falls back to cfg.GitHub, which satisfies
-	// this interface (the signature mirrors mergereconciler.PRGetter). When
-	// BOTH are nil the endpoint returns 503 rather than degrading — a verb that
-	// records forge evidence must never record evidence it did not read. Same
-	// nil-means-test-seam posture as the sibling seams in this file.
+	// The production fallback ladder (E64.40 / #3151) is FORGE-FAMILY-AWARE and
+	// UNAMBIGUOUS:
+	//   - a github-family run  -> cfg.GitHub when non-nil, else 503. It NEVER
+	//     falls through to ForgeResolver or the process registry, so registry
+	//     availability can never change a GitHub outcome.
+	//   - a non-github-family run -> ForgeResolver(forgeID) (defaulting to
+	//     forge.Get), a resolver error or nil forge yielding 503.
+	// When the resolved reader is nil the endpoint returns 503 rather than
+	// degrading — a verb that records forge evidence must never record evidence
+	// it did not read. Same nil-means-test-seam posture as the sibling seams.
 	PRStateReader PullRequestStateReader
+
+	// ForgeResolver is the injectable forge-registry lookup the
+	// merge-observation verb dispatches a NON-GitHub run's pull-request read
+	// through (E64.40 / #3151). Nil defaults to forge.Get, so production needs
+	// no serve.go wiring — serve.go already registers both forges at startup.
+	// It is the seam a test injects its own resolver through rather than
+	// depending on ambient global registration. A github-family run NEVER
+	// reaches it (see PRStateReader): it exists solely for the other forges.
+	ForgeResolver func(id string) (forge.Forge, error)
 
 	// AuthRepo persists users + sessions for the OAuth
 	// sign-in flow (E4.2). Wired by the /v0/auth/* handlers; nil

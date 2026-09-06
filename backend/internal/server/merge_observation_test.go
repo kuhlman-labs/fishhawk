@@ -13,8 +13,55 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
+
+// fakeForgeReader is a full forge.Forge whose GetPullRequest is the only
+// implemented method (the rest embed a nil forge.Forge, unreachable in these
+// tests). It is what the ForgeResolver / process-registry dispatch resolves for
+// a NON-github run, and it counts calls so a test can prove a github run never
+// reaches it.
+type fakeForgeReader struct {
+	forge.Forge
+	name  string
+	pr    *forge.PullRequest
+	err   error
+	calls int
+}
+
+func (f *fakeForgeReader) Name() string { return f.name }
+
+func (f *fakeForgeReader) GetPullRequest(_ context.Context, _ forge.CredentialScope,
+	_ forge.RepoRef, _ int) (*forge.PullRequest, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.pr, nil
+}
+
+// ptrString is a tiny helper for the *string InstallationRef fields the
+// cross-forge tests set.
+func ptrString(s string) *string { return &s }
+
+// realGitLabForge builds a real *forgegitlab.Forge (satisfying
+// PullRequestStateReader) pointed at an httptest GitLab mux serving the single
+// MR read the observe verb performs. It is what proves the adapter's merge
+// fields reach the recorded row end to end, rather than only a fake's.
+func realGitLabForge(t *testing.T, body string, status int) *forgegitlab.Forge {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v4/projects/5/merge_requests/7", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return forgegitlab.New(srv.URL, forgegitlab.NewStaticCredentialProvider("glpat-test"),
+		forgegitlab.WithHTTPClient(srv.Client()))
+}
 
 // fakePRStateReader is the injected forge seam. It is DEFINITIONAL bad state:
 // a reader constructed with pr.Merged=false IS a not-merged forge answer, so a
@@ -822,4 +869,303 @@ func TestRecordMergeObservationRouteRegistered(t *testing.T) {
 	if w.Code == http.StatusNotFound || w.Code == http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want the route to resolve (any non-404/405):\n%s", w.Code, w.Body.String())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Forge-family resolution (E64.40 / #3151). The handler was GitHub-URL-shaped
+// end to end; these tests pin the widened family-aware resolution + per-forge
+// reader dispatch, without which the GitLab acceptance criterion is unreachable.
+// ---------------------------------------------------------------------------
+
+// A GitLab run resolves its canonical /-/merge_requests/<n> URL, dispatches
+// through the (fake) reader, and records ONE row carrying the forge's SHA and
+// merged_at. Before the widening a gitlab:<id> run drew a 409 at rung 5b BEFORE
+// the forge was ever read.
+func TestRecordMergeObservationGitLabHappyPath(t *testing.T) {
+	reader := &fakePRStateReader{pr: mergedPR()}
+	f := newObservationFixture(t, reader)
+	id := f.seedObservationRun(t, run.CreateRunParams{
+		Repo: "group/project", InstallationRef: ptrString("gitlab:5"),
+	}, "https://gitlab.com/group/project/-/merge_requests/7")
+
+	w := f.postObserveID(t, id.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if reader.calls != 1 {
+		t.Errorf("forge calls = %d, want 1", reader.calls)
+	}
+	if reader.lastNum != 7 {
+		t.Errorf("forge merge-request number = %d, want 7 (the iid from the URL)", reader.lastNum)
+	}
+	rows := f.observationRowsFor(t, id)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want exactly 1", len(rows))
+	}
+	var p struct {
+		MergeCommitSHA string `json:"merge_commit_sha"`
+		MergedAt       string `json:"merged_at"`
+	}
+	if err := json.Unmarshal(rows[0].Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if p.MergeCommitSHA != "cafebabe1234" || p.MergedAt == "" {
+		t.Errorf("payload sha=%q merged_at=%q, want the forge's values", p.MergeCommitSHA, p.MergedAt)
+	}
+}
+
+// Binding approval condition 1: a run whose persisted URL uses the LEGACY bare
+// /merge_requests/<n> shape (no /-/ separator) must also resolve and record.
+func TestRecordMergeObservationGitLabLegacyURLShape(t *testing.T) {
+	reader := &fakePRStateReader{pr: mergedPR()}
+	f := newObservationFixture(t, reader)
+	id := f.seedObservationRun(t, run.CreateRunParams{
+		Repo: "group/project", InstallationRef: ptrString("gitlab:5"),
+	}, "https://gitlab.com/group/project/merge_requests/7")
+
+	w := f.postObserveID(t, id.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the legacy /merge_requests/ shape must resolve):\n%s", w.Code, w.Body.String())
+	}
+	if reader.lastNum != 7 {
+		t.Errorf("forge merge-request number = %d, want 7", reader.lastNum)
+	}
+	if rows := f.observationRowsFor(t, id); len(rows) != 1 {
+		t.Errorf("rows = %d, want exactly 1", len(rows))
+	}
+}
+
+// Cross-forge refusals, both directions. The URL shape's forge family must
+// match the run's forge family; if it does not, the handler confirms a pull
+// request that is not this run's — refused at 409 BEFORE the reader is dialed.
+func TestRecordMergeObservationCrossForgeRefused(t *testing.T) {
+	cases := []struct {
+		name  string
+		repo  string
+		ref   *string
+		prURL string
+	}{
+		{
+			"github ref + gitlab merge-request url", "group/project", nil,
+			"https://gitlab.com/group/project/-/merge_requests/7",
+		},
+		{
+			"gitlab ref + github pull url", "x/y", ptrString("gitlab:5"),
+			"https://github.com/x/y/pull/7",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := &fakePRStateReader{pr: mergedPR()}
+			f := newObservationFixture(t, reader)
+			id := f.seedObservationRun(t, run.CreateRunParams{Repo: tc.repo, InstallationRef: tc.ref}, tc.prURL)
+
+			w := f.postObserveID(t, id.String())
+			assertObserveRefusal(t, w, http.StatusConflict, "record_merge_observation_pr_url_repo_mismatch")
+			if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+				t.Errorf("rows = %d, want 0: a cross-forge URL must never gain merge evidence", len(rows))
+			}
+			if reader.calls != 0 {
+				t.Errorf("forge calls = %d, want 0: a family mismatch must be refused BEFORE the forge read", reader.calls)
+			}
+		})
+	}
+}
+
+// An UNKNOWN forge id has no recognised URL shape, so it fails closed at the
+// mismatch rung rather than dispatching a github/gitlab reader at it.
+func TestRecordMergeObservationUnknownForgeRefused(t *testing.T) {
+	reader := &fakePRStateReader{pr: mergedPR()}
+	f := newObservationFixture(t, reader)
+	id := f.seedObservationRun(t, run.CreateRunParams{
+		Repo: "x/y", InstallationRef: ptrString("bitbucket:9"),
+	}, "https://github.com/x/y/pull/7")
+
+	w := f.postObserveID(t, id.String())
+	assertObserveRefusal(t, w, http.StatusConflict, "record_merge_observation_pr_url_repo_mismatch")
+	if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0", len(rows))
+	}
+	if reader.calls != 0 {
+		t.Errorf("forge calls = %d, want 0: an unimplemented forge must not reach the reader", reader.calls)
+	}
+}
+
+// Reader fallback contract, GitHub half (binding approval condition 2): a
+// github-family run resolves ONLY through cfg.GitHub. With cfg.GitHub nil and
+// cfg.PRStateReader nil it returns 503 EVEN WITH a populated registry — registry
+// availability must never change a GitHub outcome, so the registered forge is
+// never dialed.
+func TestRecordMergeObservationGitHubNeverFallsToRegistry(t *testing.T) {
+	registrySnap := forge.SnapshotRegistry()
+	t.Cleanup(func() { forge.RestoreRegistry(registrySnap) })
+	registered := &fakeForgeReader{name: observationForgeGitHub, pr: mergedPR()}
+	forge.Register(registered)
+
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+	f.s.cfg.PRStateReader = nil // cfg.GitHub is already nil in the fixture
+	// The fixture run carries no InstallationRef, so it is a github-family run.
+	w := f.postObserve(t)
+	assertObserveRefusal(t, w, http.StatusServiceUnavailable, "record_merge_observation_unconfigured")
+	if rows := f.observationRows(t); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0", len(rows))
+	}
+	if registered.calls != 0 {
+		t.Errorf("registered forge calls = %d, want 0: a github run must never fall through to the registry", registered.calls)
+	}
+}
+
+// Reader fallback contract, non-github half: a gitlab-family run with
+// cfg.PRStateReader nil and a ForgeResolver that ERRORS fails closed to 503 with
+// no rows, never a nil dispatch.
+func TestRecordMergeObservationResolverErrorFailsClosed(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+	f.s.cfg.PRStateReader = nil
+	// The resolver returns a WORKING reader ALONGSIDE the error, so the
+	// error-return arm is the SOLE control: if it is deleted the merged reader
+	// is dialed and a row lands. The fake counts calls, so the counterfactual
+	// RED cannot pass for the wrong reason (an unreachable reader).
+	resolved := &fakeForgeReader{name: observationForgeGitLab, pr: mergedPR()}
+	f.s.cfg.ForgeResolver = func(string) (forge.Forge, error) {
+		return resolved, errors.New("resolver down")
+	}
+	id := f.seedObservationRun(t, run.CreateRunParams{
+		Repo: "group/project", InstallationRef: ptrString("gitlab:5"),
+	}, "https://gitlab.com/group/project/-/merge_requests/7")
+
+	w := f.postObserveID(t, id.String())
+	assertObserveRefusal(t, w, http.StatusServiceUnavailable, "record_merge_observation_unconfigured")
+	if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0: a resolver error must not license a write", len(rows))
+	}
+	if resolved.calls != 0 {
+		t.Errorf("resolved forge calls = %d, want 0: a resolver error must not dial the reader", resolved.calls)
+	}
+}
+
+// A ForgeResolver that returns a TYPED-NIL forge (a nil *fakeForgeReader
+// wrapped in a non-nil forge.Forge interface) must fail closed to 503, never
+// panic on the first GetPullRequest dispatch. isNilForge guards the typed-nil
+// case a bare `f == nil` misses; without it this run would dispatch against a
+// nil pointer and crash the handler.
+func TestRecordMergeObservationResolverTypedNilFailsClosed(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+	f.s.cfg.PRStateReader = nil
+	f.s.cfg.ForgeResolver = func(string) (forge.Forge, error) {
+		var typedNil *fakeForgeReader // (*fakeForgeReader)(nil)
+		return typedNil, nil          // non-nil interface wrapping a nil pointer
+	}
+	id := f.seedObservationRun(t, run.CreateRunParams{
+		Repo: "group/project", InstallationRef: ptrString("gitlab:5"),
+	}, "https://gitlab.com/group/project/-/merge_requests/7")
+
+	w := f.postObserveID(t, id.String())
+	assertObserveRefusal(t, w, http.StatusServiceUnavailable, "record_merge_observation_unconfigured")
+	if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0: a typed-nil resolver forge must not license a write", len(rows))
+	}
+}
+
+// The DEFAULT resolver (nil ForgeResolver -> forge.Get) dispatches a gitlab run
+// through the process registry. Registers a fake under "gitlab" and leaves
+// ForgeResolver nil, proving the production default reaches the registered forge.
+func TestRecordMergeObservationDefaultResolverUsesRegistry(t *testing.T) {
+	registrySnap := forge.SnapshotRegistry()
+	t.Cleanup(func() { forge.RestoreRegistry(registrySnap) })
+	registered := &fakeForgeReader{name: observationForgeGitLab, pr: mergedPR()}
+	forge.Register(registered)
+
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+	f.s.cfg.PRStateReader = nil // force the fallback ladder
+	f.s.cfg.ForgeResolver = nil // and the forge.Get default within it
+	id := f.seedObservationRun(t, run.CreateRunParams{
+		Repo: "group/project", InstallationRef: ptrString("gitlab:5"),
+	}, "https://gitlab.com/group/project/-/merge_requests/7")
+
+	w := f.postObserveID(t, id.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 via the registry default:\n%s", w.Code, w.Body.String())
+	}
+	if registered.calls != 1 {
+		t.Errorf("registered forge calls = %d, want 1", registered.calls)
+	}
+	if rows := f.observationRowsFor(t, id); len(rows) != 1 {
+		t.Errorf("rows = %d, want exactly 1", len(rows))
+	}
+}
+
+// Cross-layer end to end through the REAL *forgegitlab.Forge against an httptest
+// GitLab mux — proving the adapter's merged_at + merge_commit_sha decode reaches
+// the recorded row, not only a fake's. Per-layer units each pass while the seam
+// (a handler that refused the URL before the adapter ran) stays broken.
+func TestRecordMergeObservationGitLabRealAdapterEndToEnd(t *testing.T) {
+	f := newObservationFixture(t, nil)
+	f.s.cfg.PRStateReader = realGitLabForge(t,
+		`{"iid":7,"state":"merged","merge_commit_sha":"gl-mc-7","merged_at":"2026-08-30T12:34:56Z","target_branch":"main"}`,
+		http.StatusOK)
+	id := f.seedObservationRun(t, run.CreateRunParams{
+		Repo: "group/project", InstallationRef: ptrString("gitlab:5"),
+	}, "https://gitlab.com/group/project/-/merge_requests/7")
+
+	w := f.postObserveID(t, id.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rows := f.observationRowsFor(t, id)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want exactly 1", len(rows))
+	}
+	var p struct {
+		MergeCommitSHA string `json:"merge_commit_sha"`
+		MergedAt       string `json:"merged_at"`
+	}
+	if err := json.Unmarshal(rows[0].Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if p.MergeCommitSHA != "gl-mc-7" {
+		t.Errorf("payload merge_commit_sha = %q, want gl-mc-7 (read off the real adapter)", p.MergeCommitSHA)
+	}
+	gotMerged, err := time.Parse(time.RFC3339Nano, p.MergedAt)
+	if err != nil {
+		t.Fatalf("parse merged_at %q: %v", p.MergedAt, err)
+	}
+	if want := time.Date(2026, 8, 30, 12, 34, 56, 0, time.UTC); !gotMerged.Equal(want) {
+		t.Errorf("payload merged_at = %v, want %v", gotMerged, want)
+	}
+}
+
+// The partial-evidence rungs (no merge commit, no merge timestamp) fire for a
+// GitLab run too, driven through the real adapter — the refusal is now generic,
+// not a GitHub-only guard.
+func TestRecordMergeObservationGitLabPartialEvidenceRefused(t *testing.T) {
+	t.Run("merged with null merge_commit_sha -> no_merge_commit", func(t *testing.T) {
+		f := newObservationFixture(t, nil)
+		f.s.cfg.PRStateReader = realGitLabForge(t,
+			`{"iid":7,"state":"merged","merge_commit_sha":null,"merged_at":"2026-08-30T12:34:56Z","target_branch":"main"}`,
+			http.StatusOK)
+		id := f.seedObservationRun(t, run.CreateRunParams{
+			Repo: "group/project", InstallationRef: ptrString("gitlab:5"),
+		}, "https://gitlab.com/group/project/-/merge_requests/7")
+
+		w := f.postObserveID(t, id.String())
+		assertObserveRefusal(t, w, http.StatusConflict, "record_merge_observation_no_merge_commit")
+		if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+			t.Errorf("rows = %d, want 0", len(rows))
+		}
+	})
+	t.Run("merged with a SHA but null merged_at -> no_merge_timestamp", func(t *testing.T) {
+		f := newObservationFixture(t, nil)
+		f.s.cfg.PRStateReader = realGitLabForge(t,
+			`{"iid":7,"state":"merged","merge_commit_sha":"gl-mc-7","merged_at":null,"target_branch":"main"}`,
+			http.StatusOK)
+		id := f.seedObservationRun(t, run.CreateRunParams{
+			Repo: "group/project", InstallationRef: ptrString("gitlab:5"),
+		}, "https://gitlab.com/group/project/-/merge_requests/7")
+
+		w := f.postObserveID(t, id.String())
+		assertObserveRefusal(t, w, http.StatusConflict, "record_merge_observation_no_merge_timestamp")
+		if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+			t.Errorf("rows = %d, want 0", len(rows))
+		}
+	})
 }

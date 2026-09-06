@@ -216,19 +216,20 @@ type PullRequest struct {
 	// stay distinguishable from the zero time. A nil MergedAt means UNKNOWN
 	// and NEVER a merge at the Unix epoch.
 	//
-	// Populated by GetPullRequest; nil on CreatePullRequest /
-	// ListOpenPullRequestsByHead results (they don't read it back) and nil on
-	// the GitLab adapter (gitlab.go), whose merge-request payload carries no
-	// merged_at field yet. Every consumer MUST treat nil as unknown — the
-	// record-merge-observation endpoint refuses rather than recording a fact
-	// it cannot carry.
+	// Populated by GetPullRequest on BOTH the GitHub and GitLab adapters
+	// (gitlab.go's mergeRequestToPR passes the MR's merged_at through as of
+	// E64.40 / #3151); nil on CreatePullRequest / ListOpenPullRequestsByHead
+	// results (they don't read it back). Every consumer MUST treat nil as
+	// unknown — the record-merge-observation endpoint refuses rather than
+	// recording a fact it cannot carry.
 	MergedAt *time.Time
 	// MergeCommitSHA is the commit the merge produced (`merge_commit_sha`) —
 	// the durable forge-side artifact a merge observation points at
 	// (E64.32 / #3136). Empty means UNKNOWN, never "merged with no commit":
-	// it is "" on CreatePullRequest / ListOpenPullRequestsByHead results and
-	// "" on the GitLab adapter until its half lands, so a consumer that needs
-	// it must refuse on the zero value rather than record an empty SHA.
+	// populated by GetPullRequest on BOTH the GitHub and GitLab adapters
+	// (E64.40 / #3151) and "" on CreatePullRequest / ListOpenPullRequestsByHead
+	// results, so a consumer that needs it must refuse on the zero value rather
+	// than record an empty SHA.
 	MergeCommitSHA string
 }
 
@@ -390,4 +391,32 @@ type CreateCheckRunParams struct {
 type CreateCheckRunResult struct {
 	ID      int64
 	HTMLURL string
+}
+
+// SnapshotRegistry returns a shallow copy of the process-global forge
+// registry (registry.go). Paired with RestoreRegistry in a t.Cleanup, it
+// lets a test register a fake forge and restore the registry afterwards, so
+// a fake never leaks into a later test in the same package process — the
+// registry is a single global map shared across every test in a run, and
+// Register offers no removal.
+func SnapshotRegistry() map[string]Forge {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	snap := make(map[string]Forge, len(registry))
+	for id, f := range registry {
+		snap[id] = f
+	}
+	return snap
+}
+
+// RestoreRegistry replaces the registry contents with snap (a prior
+// SnapshotRegistry result), INCLUDING removing any ids registered since the
+// snapshot was taken. See SnapshotRegistry.
+func RestoreRegistry(snap map[string]Forge) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	registry = make(map[string]Forge, len(snap))
+	for id, f := range snap {
+		registry[id] = f
+	}
 }

@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Commit is the subset of a GitLab commit object the forge adapter reads:
@@ -56,18 +57,26 @@ type Branch struct {
 // forge.PullRequest. State is the GitLab lifecycle word (opened|closed|
 // merged|locked); the adapter derives Merged from state=="merged". SHA is
 // the MR's diff-head commit; MergeCommitSHA is populated once merged.
+//
+// MergedAt is a POINTER, deliberately — the three-state carrier exactly as
+// githubclient's merged_at decode is (E64.32 / #3136): GitLab returns
+// merged_at as JSON null (or omits it) on an unmerged MR, so absent/null must
+// stay distinguishable from the zero time. A nil *time.Time means UNKNOWN and
+// NEVER a merge at the Unix epoch; a value-typed time.Time field would decode
+// a null to the epoch and silently satisfy a merged-timestamp presence gate.
 type MergeRequest struct {
-	ID             int    `json:"id"`
-	IID            int    `json:"iid"`
-	ProjectID      int    `json:"project_id"`
-	Title          string `json:"title"`
-	Description    string `json:"description"`
-	State          string `json:"state"`
-	SourceBranch   string `json:"source_branch"`
-	TargetBranch   string `json:"target_branch"`
-	SHA            string `json:"sha"`
-	MergeCommitSHA string `json:"merge_commit_sha"`
-	WebURL         string `json:"web_url"`
+	ID             int        `json:"id"`
+	IID            int        `json:"iid"`
+	ProjectID      int        `json:"project_id"`
+	Title          string     `json:"title"`
+	Description    string     `json:"description"`
+	State          string     `json:"state"`
+	SourceBranch   string     `json:"source_branch"`
+	TargetBranch   string     `json:"target_branch"`
+	SHA            string     `json:"sha"`
+	MergeCommitSHA string     `json:"merge_commit_sha"`
+	MergedAt       *time.Time `json:"merged_at"`
+	WebURL         string     `json:"web_url"`
 }
 
 // CommitStatus is the subset of a GitLab commit status the adapter reads

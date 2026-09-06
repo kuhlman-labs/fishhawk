@@ -273,12 +273,16 @@ type Run struct {
 // runCompletionBlockedPayload): which stage is holding a `running` run open, and
 // whether anything can move it.
 //
-// Recovery is a CLOSED two-value set — "reconcile-merge" or "none" — and it
-// DISCRIMINATES: it names the verb ONLY when the blocking stage is one the
-// default-deny merge-supersede pair table admits AND the run's PR is observably
-// merged. Reason names the state otherwise. Pointing an operator at a verb
-// guaranteed to refuse is the defect #3083 reports against merge_run, so a
-// consumer must branch on Recovery rather than always suggesting the endpoint.
+// Recovery is a CLOSED THREE-value set — "reconcile-merge",
+// "record-merge-observation" or "none" — and it DISCRIMINATES: it names
+// reconcile-merge ONLY when the blocking stage is one the default-deny
+// merge-supersede pair table admits AND the run's PR is observably merged; it
+// names record-merge-observation when such a stage's PR merge has NOT been
+// observed yet but the run carries a resolvable PR URL (observe off the forge
+// first, then reconcile — E64.40 / #3151). Reason names the state otherwise.
+// Pointing an operator at a verb guaranteed to refuse is the defect #3083
+// reports against merge_run, so a consumer must branch on Recovery rather than
+// always suggesting the endpoint.
 //
 // The json tags MUST stay byte-identical with the backend field or the mirror
 // decodes to nil silently (the #371-class hand-maintained-wire-mirror trap).
@@ -293,7 +297,7 @@ type runCompletionBlocked struct {
 	StageType  string `json:"stage_type" jsonschema:"the blocking stage's type (plan | implement | review | deploy | acceptance)"`
 	StageState string `json:"stage_state" jsonschema:"the blocking stage's RAW backend state (e.g. awaiting_host_dispatch, awaiting_approval, running)"`
 	Reason     string `json:"reason" jsonschema:"why the run cannot complete, naming the stage and its state"`
-	Recovery   string `json:"recovery" jsonschema:"'reconcile-merge' when POST /v0/runs/{run_id}/reconcile-merge can supersede this stage and complete the run (a merge-supersedable park on an observably merged PR), otherwise 'none' — no verb applies and reason says what the stage needs instead"`
+	Recovery   string `json:"recovery" jsonschema:"'reconcile-merge' when POST /v0/runs/{run_id}/reconcile-merge can supersede this stage and complete the run (a merge-supersedable park on an observably merged PR); 'record-merge-observation' when the run's PR merge has not been observed yet — POST /v0/runs/{run_id}/record-merge-observation records it off the forge, after which recovery flips to reconcile-merge; otherwise 'none' — no verb applies and reason says what the stage needs instead"`
 }
 
 // init classifies the decomposition-lineage Run fields this change adds

@@ -1756,11 +1756,14 @@ poll_interval_seconds (30s) — re-call get_run_status on that cadence until
 the status goes terminal. (The interval is dropped once the run itself is
 terminal, so the wait never strands.) When a 'running' run is held open by a
 non-terminal stage, run.completion_blocked names that stage and DISCRIMINATES
-the recovery: recovery='reconcile-merge' means POST
-/v0/runs/{run_id}/reconcile-merge can supersede it and complete the run (a
-merge-supersedable park on an observably merged PR), while recovery='none' means
-no verb applies and reason says what the stage needs instead — branch on it
-rather than suggesting the endpoint unconditionally. A non-terminal StageWaitStatus also
+the recovery across three values, and an operator applies them IN ORDER:
+recovery='record-merge-observation' means the PR merge is unrecorded — POST
+/v0/runs/{run_id}/record-merge-observation FIRST to record it off the forge;
+recovery='reconcile-merge' means the merge is already on the chain, so POST
+/v0/runs/{run_id}/reconcile-merge can supersede the stage and complete the run
+(a merge-supersedable park on an observably merged PR); recovery='none' means no
+verb applies and reason says what the stage needs instead — branch on it rather
+than suggesting an endpoint unconditionally. A non-terminal StageWaitStatus also
 carries the stage's remaining agent budget when the wall clock is known —
 elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining — so an
 operator can see how much runtime is left; a mid-stage scope amendment needs at
