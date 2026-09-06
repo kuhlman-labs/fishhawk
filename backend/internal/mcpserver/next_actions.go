@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/failuresig"
+	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // next_actions (#1024) generalizes the review_action_hint pattern
@@ -1650,6 +1651,118 @@ func acceptanceSkippedOutOfScopeIn(recent []AuditEntry) bool {
 		}
 	}
 	return false
+}
+
+// acceptanceReopenedIn reports whether the recent-audit slice carries an
+// acceptance_reopened entry SCOPED TO stageID (E64.63 / #3222) — the server's
+// marker that a fix-up push invalidated that stage's settled acceptance
+// verdict (#1682).
+//
+// The stage id is a PARAMETER, never inferred: a run can carry more than one
+// acceptance stage in its history, and matching on the category alone would let
+// a stale entry from an earlier stage draw the stronger "a fix-up re-opened
+// this" claim about a stage nothing re-opened (#3222 binding condition 1). An
+// entry with no stage id is likewise no evidence about THIS stage.
+//
+// Degrades to false — which renders the GENERIC advisory wording rather than
+// nothing — when the entry has aged out of the recent-audit window or the slice
+// was never fetched. The stage is still non-terminal and still blocking; we just
+// cannot say a fix-up is why.
+func acceptanceReopenedIn(recent []AuditEntry, stageID string) bool {
+	if stageID == "" {
+		return false
+	}
+	for _, e := range recent {
+		if e.Category == categoryAcceptanceReopened && e.StageID != nil && *e.StageID == stageID {
+			return true
+		}
+	}
+	return false
+}
+
+// naOffersMerge reports whether the classified block still offers the merge
+// verb. It is the fold guard below: the acceptance advisory belongs on the
+// merge-ritual arms and nowhere else — succeeded_merged (the ritual is done)
+// and every non-merge arm must stay byte-identical.
+func naOffersMerge(na *NextActions) bool {
+	if na == nil {
+		return false
+	}
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_merge_run" {
+			return true
+		}
+	}
+	return false
+}
+
+// foldAcceptanceRedispatchAdvisory folds the shared acceptance-blocker advisory
+// onto the merge-ritual arms of the next_actions block (E64.63 / #3222).
+//
+// The gap it closes: a run whose acceptance stage was re-opened by a fix-up
+// push sits succeeded with its PR open, so the classifier reports
+// succeeded_pr_open and offers the merge — while the merge cannot fire, because
+// the audit-complete check is pending on that very stage. next_actions said
+// nothing about it. Keying on a NON-TERMINAL acceptance stage rather than on
+// the audit entry is the operator's ruling: a merge blocked by an acceptance
+// stage that was never dispatched is blocked exactly as hard, and the advisory
+// is exactly as true; the entry only sharpens the wording.
+//
+// DISPLAY-ONLY and ADDITIVE, in the foldLiveValidationAdvisory idiom. It
+// RETAINS the existing merge actions in both branches — the merge stays legal
+// to attempt and the server remains the authority on whether it fires — and
+// only relabels the state and adds ONE action:
+//
+//   - dispatchable (pending / awaiting_host_dispatch): PREPENDS
+//     fishhawk_dispatch_stage, because that is the move that actually unblocks
+//     the merge.
+//   - in flight (dispatched / running / any other awaiting_*): APPENDS a
+//     WAIT-shaped poll action instead, and NEVER a dispatch. Naming a remedy
+//     the operator cannot take sends them to redo work with false authority —
+//     the defect #3224 fixed on the audit-complete surface and #3116 on the
+//     fix-up surface (#3222 binding condition 2).
+//
+// A no-op — leaving na deep-equal to its unfolded value — when na is nil, when
+// the block no longer offers the merge (naOffersMerge), when the run declares
+// no acceptance stage, or when its acceptance stage is TERMINAL. That last
+// guard is what keeps a HEALTHY merge byte-identical.
+func foldAcceptanceRedispatchAdvisory(run *Run, stages []Stage, recent []AuditEntry, na *NextActions) {
+	if run == nil || na == nil || !naOffersMerge(na) {
+		return
+	}
+	acc := stageByType(stages, "acceptance")
+	if acc == nil || runpkg.StageState(acc.State).IsTerminal() {
+		return
+	}
+	state := runpkg.StageState(acc.State)
+	reopened := acceptanceReopenedIn(recent, acc.ID)
+	advisory := runpkg.AcceptanceBlockerAdvisory(shortStageID(acc.ID), state, reopened, mergeAdvisoryTail)
+
+	// The label is keyed on the AUDIT evidence (what happened to the stage),
+	// the action shape on the STATE (what the operator can do about it).
+	if reopened {
+		na.State = "succeeded_acceptance_reopened"
+	} else {
+		na.State = "succeeded_acceptance_pending"
+	}
+
+	if runpkg.AcceptanceIsDispatchable(state) {
+		na.Actions = append([]SuggestedAction{{
+			Action:       "fishhawk_dispatch_stage",
+			Params:       map[string]string{"run_id": run.ID, "stage_id": acc.ID, "stage": "acceptance"},
+			Precondition: "the run's acceptance stage has not been dispatched (state pending or awaiting_host_dispatch), so no re-run is in flight",
+			Consumes:     consumesNone,
+			Reason:       advisory,
+		}}, na.Actions...)
+		return
+	}
+	na.Actions = append(na.Actions, SuggestedAction{
+		Action:       "fishhawk_await_stage",
+		Params:       map[string]string{"run_id": run.ID, "stage_id": acc.ID},
+		Precondition: "the acceptance stage is already in flight (dispatched / running / any other awaiting_*), so there is no dispatch to take — only the settle to wait on",
+		Consumes:     consumesNone,
+		Reason:       advisory,
+	})
 }
 
 // acceptanceArbitratedIn reports whether the recent-audit slice carries an

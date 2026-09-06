@@ -2013,6 +2013,14 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 		release = r.releaseSignalsFor(ctx, stages, recent)
 	}
 	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, release)
+	// E64.63 (#3222): a merge-ritual arm whose acceptance stage is still
+	// NON-TERMINAL cannot actually merge — the fishhawk_audit_complete check is
+	// pending on that stage — so name the stage and the move. Display-only and
+	// folded LAST off the SAME stages + recent slices already fetched, so it
+	// costs no extra round-trip and cannot fail the snapshot. Wired at BOTH
+	// nextActionsFor call sites (here and run_stage.go) so the two snapshot
+	// surfaces cannot diverge.
+	foldAcceptanceRedispatchAdvisory(runRow, stages, recent, nextActions)
 
 	// Best-effort decomposed-parent children status (#1147). Cost-gated so an
 	// ordinary run pays nothing: only a decomposed parent (no parent_run_id,

@@ -8,6 +8,8 @@ import (
 	"sort"
 
 	"github.com/google/uuid"
+
+	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // maxFixupPasses mirrors backend server.defaultMaxFixupPasses
@@ -256,14 +258,21 @@ func blockingAcceptanceStage(stages []Stage) *Stage {
 
 // acceptanceIsDispatchable reports whether a blocking acceptance stage is one
 // the operator can still DISPATCH (no spawn attempt exists yet) rather than one
-// already in flight, which they can only WAIT on. Mirrors
-// run.acceptanceIsDispatchable (backend/internal/run/fixup.go). KEEP IN SYNC:
-// the endpoint refusal and this hint must name the SAME remedy for the same
+// already in flight, which they can only WAIT on.
+//
+// The endpoint refusal and this hint must name the SAME remedy for the same
 // acceptance state, because naming a remedy the operator cannot act on is the
 // very defect #3116 exists to stop — and "dispatch acceptance first" is exactly
 // that once a runner is already in flight.
+//
+// E64.63 / #3222: that agreement is no longer a KEEP-IN-SYNC comment over a
+// duplicated predicate. This is now a thin string-typed adapter over the ONE
+// exported owner, run.AcceptanceIsDispatchable — the same function the fix-up
+// refusal, the audit-complete check, the merge checkpoints and the next_actions
+// fold read. The adapter survives only because this surface holds the MCP wire
+// Stage.State as a plain string. #3225 tracks retiring the remaining copies.
 func acceptanceIsDispatchable(state string) bool {
-	return state == "pending" || state == "awaiting_host_dispatch"
+	return runpkg.AcceptanceIsDispatchable(runpkg.StageState(state))
 }
 
 // gateClosedActions is the action set for the two #3116 arms: open implement

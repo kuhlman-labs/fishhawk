@@ -487,16 +487,17 @@ func findOpenReviewStage(ctx context.Context, repo Repository, runID uuid.UUID) 
 		// (a) A not-yet-terminal acceptance stage runs ahead of review, so the
 		// review gate cannot open until it settles. Split the guidance by what
 		// the operator can actually DO about it.
-		if acceptanceIsDispatchable(acc.State) {
-			// pending / awaiting_host_dispatch: no spawn attempt exists yet, so
-			// the operator's move is to dispatch it.
-			return nil, fmt.Errorf("%w: implement stage succeeded but the review gate has not opened yet: the acceptance stage (state %q) must settle first. Dispatch the acceptance stage, let it settle, then route the fix-up — the fix-up budget is not consumed by waiting",
-				ErrFixupNotApplicable, acc.State)
-		}
-		// dispatched / running / awaiting_* : a spawn attempt already exists, so
-		// "dispatch acceptance" would be advice the operator cannot act on.
-		return nil, fmt.Errorf("%w: implement stage succeeded but the review gate has not opened yet: the acceptance stage is already in flight (state %q). Wait for acceptance to settle, then route the fix-up — the fix-up budget is not consumed by waiting",
-			ErrFixupNotApplicable, acc.State)
+		//
+		// E64.63 / #3222: the split itself, and both sentences, now come from
+		// the shared AcceptanceBlockerAdvisory renderer — the same wording the
+		// audit-complete check, fishhawk_merge_run and next_actions emit. The
+		// dispatchable/in-flight distinction is unchanged; only the phrasing is
+		// now single-sourced (it names the fishhawk_dispatch_stage verb
+		// explicitly and renders the state unquoted).
+		return nil, fmt.Errorf("%w: implement stage succeeded but the review gate has not opened yet: %s",
+			ErrFixupNotApplicable,
+			AcceptanceBlockerAdvisory("", acc.State, false,
+				", then route the fix-up — the fix-up budget is not consumed by waiting"))
 	}
 
 	// (b) The review stage is not open and no acceptance stage is holding it:
@@ -518,14 +519,6 @@ func blockingAcceptanceStage(stages []*Stage) *Stage {
 		}
 	}
 	return nil
-}
-
-// acceptanceIsDispatchable reports whether a blocking acceptance stage is one
-// the operator can still DISPATCH (no spawn attempt exists yet) rather than
-// one already in flight, which they can only wait on. The split exists so the
-// refusal never names a remedy that does not apply (#3116 binding condition 1).
-func acceptanceIsDispatchable(s StageState) bool {
-	return s == StageStatePending || s == StageStateAwaitingHostDispatch
 }
 
 // findReviewStageForAcceptanceReopen locates the run's review stage for an

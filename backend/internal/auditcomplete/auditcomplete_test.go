@@ -399,6 +399,75 @@ func TestCompute_ReopenedAcceptanceDetailNamesRedispatch(t *testing.T) {
 	}
 }
 
+// TestStageNotTerminalDetail_SingleSourcedFromRunRenderer is the E64.63 / #3222
+// single-sourcing PIN. The three #3190/#3224 tests around it assert the SHIPPED
+// PHRASES and pass UNCHANGED — that is the byte-identity proof the refactor
+// changed no operator-facing text. This test asserts the stronger property they
+// cannot: that the detail is EQUAL to what run.AcceptanceBlockerAdvisory
+// renders, so a future edit to either copy cannot silently reintroduce the
+// duplication that acceptanceAwaitsRedispatch used to be.
+func TestStageNotTerminalDetail_SingleSourcedFromRunRenderer(t *testing.T) {
+	const checkTail = " — this check clears on its own once acceptance settles."
+	for _, st := range []run.StageState{
+		run.StageStatePending,
+		run.StageStateAwaitingHostDispatch,
+		run.StageStateDispatched,
+		run.StageStateRunning,
+	} {
+		t.Run(string(st), func(t *testing.T) {
+			runID, runs, arts, ar := happyPath(t)
+			acc := mkStage(runID, 4, run.StageTypeAcceptance, st)
+			runs.stages = append(runs.stages, acc)
+			ar.appendChained(t, runID, &acc.ID, "acceptance_reopened",
+				json.RawMessage(`{"prior_state":"succeeded","head_sha":"f1xuphead"}`))
+
+			_, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+			if err != nil {
+				t.Fatalf("Compute: %v", err)
+			}
+			if len(missing) != 1 {
+				t.Fatalf("missing = %+v, want exactly one item", missing)
+			}
+			want := run.AcceptanceBlockerAdvisory(acc.ID.String()[:8], st, true, checkTail)
+			if missing[0].Detail != want {
+				t.Fatalf("detail is not the shared renderer's output:\n got %q\nwant %q", missing[0].Detail, want)
+			}
+		})
+	}
+}
+
+// TestCompute_ReopenedAcceptanceScopedToStage is the #3222 binding-condition-1
+// assertion on this surface. A NON-MATCHING scoped entry is present — an
+// acceptance_reopened entry whose stage id belongs to a DIFFERENT stage — so
+// the detail must draw the GENERIC wording, never the stronger "a fix-up
+// re-opened this" claim. An absence-only test passes just as happily against an
+// implementation that matches on the category alone.
+func TestCompute_ReopenedAcceptanceScopedToStage(t *testing.T) {
+	runID, runs, arts, ar := happyPath(t)
+	acc := mkStage(runID, 4, run.StageTypeAcceptance, run.StageStatePending)
+	runs.stages = append(runs.stages, acc)
+	// A stale entry from an EARLIER, already-terminal acceptance stage of the
+	// same run. Terminal, so it is not itself a stage_not_terminal item.
+	stale := mkStage(runID, 3, run.StageTypeAcceptance, run.StageStateSucceeded)
+	runs.stages = append(runs.stages, stale)
+	ar.appendChained(t, runID, &stale.ID, "acceptance_reopened",
+		json.RawMessage(`{"prior_state":"succeeded","head_sha":"0ldhead"}`))
+
+	_, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if len(missing) != 1 || missing[0].Kind != auditcomplete.MissingStageNotTerminal {
+		t.Fatalf("missing = %+v, want one stage_not_terminal item", missing)
+	}
+	if strings.Contains(missing[0].Detail, "re-opened by a fix-up push") {
+		t.Errorf("a non-matching scoped entry drew the re-opened claim: %q", missing[0].Detail)
+	}
+	if !strings.Contains(missing[0].Detail, "the run is not terminal") {
+		t.Errorf("detail is not the generic shape: %q", missing[0].Detail)
+	}
+}
+
 // TestCompute_ReopenedAcceptanceInFlight_DoesNotNameRedispatch pins the
 // TRUTHFULNESS of the action-bearing shape once the operator has FOLLOWED it.
 // The `acceptance_reopened` entry is history and never goes away, so keying the
