@@ -37,11 +37,11 @@ Why a GitHub App installation token can't board Project #7:
 | Kind | Primitive | Notes |
 |---|---|---|
 | `label_set` | `GetIssue` → `AddIssueLabels` (POST `.../labels`) | **Additive, not a union PATCH — see below.** The payload carries only the labels being added; GitHub merges server-side. A label already present is a provider-side skip, not a write. |
-| `epic_link` | `IssueParent` → `GetIssue` → `IssueNodeID` ×2 → `AddSubIssue` → `UpdateIssue(body)` | Idempotence keys on the STRUCTURAL parent (`IssueParent`), NOT the body marker (#2952) — see below. A structural parent = the proposal is a skip; ≠ the proposal is a typed `*ParentEpicConflictError`; NO structural parent takes the write path (`AddSubIssue`, marker stamped only when absent). |
+| `epic_link` | `IssueParent` → `GetIssue` → `IssueNodeID` ×2 → `AddSubIssue` → `UpdateIssue(body)` | Idempotence keys on the STRUCTURAL parent (`IssueParent`), NOT the body marker (#2952) — see below. A structural parent = the proposal is a skip (**unless the #2810 ledger authorizes resuming the marker** — see below); ≠ the proposal is a typed `*ParentEpicConflictError`; NO structural parent takes the write path (`AddSubIssue`, marker stamped only when absent). |
 | `depends_on_add` | `GetIssue` → `appendDependsOnRef` → `UpdateIssue(body)` | **ADDITIVE (#2860) — see below.** Merges the ref into an existing `Depends on:` line; only a ref the body ALREADY records is a skip. The filing path's `ensureDependsOnMarker` is untouched and keeps its never-double-stamp contract. |
 | `close_duplicate` | `UpdateIssue(state=closed, state_reason=duplicate)` | **Destructive.** |
 | `close_not_planned` | `UpdateIssue(state=closed, state_reason=not_planned)` | **Destructive.** Never `completed`, which would misreport a descoped item as delivered work. |
-| `board_place` | `ProjectFields` → `IssueNodeID` → `ProjectItemStatus` → `placeIssueOnBoard` | Empty expected-source set ⇒ proceeds only while the item is genuinely OFF-board. |
+| `board_place` | `ProjectFields` → `IssueNodeID` → `ProjectItemStatus` → `placeIssueOnBoard` | Empty expected-source set ⇒ proceeds only while the item is genuinely OFF-board — **or while the #2810 ledger proves we half-placed it** (on-board, column unset), in which case the column is set directly against the known item id and `placeIssueOnBoard` is NOT re-entered. |
 | `icebox` | the same board path, targeting the conventions' icebox column | **Destructive.** Routed through the SAME placement guard and idempotence check as `board_place` (approval condition I2) — an icebox move must not override a placement a human chose. |
 | `field_set` | `ProjectFields("Estimate")` → `SetProjectItemSingleSelect` | The `missing_estimate` hygiene defect's fix. |
 | `priority_set` | `ProjectFields("Priority")` → `SetProjectItemSingleSelect` | |
@@ -233,6 +233,110 @@ was already correct — so since #2860 they return `Refused: true` with a
 `RefuseReason` rather than `Skipped`. `labels already present`,
 `parent epic already linked`, `already at target column` and
 `depends_on ref already present` stay SKIPS: those are states the provider
-OBSERVED as already-satisfied. The core reports the same refusal for its own
+OBSERVED as already-satisfied. Two of these are now CONDITIONAL on the #2810
+partial-write ledger — `manual_placement_preserved` and
+`parent epic already linked` are widened by exactly one evidence-gated case each
+(see "Partial-write evidence and the resume write path"); with no evidence both
+behave exactly as this section describes. The core reports the same refusal for its own
 pre-dispatch placement guard, so the audit reads the same whichever layer
 noticed first.
+
+## Partial-write evidence and the resume write path (E54.15 / #2810)
+
+This provider is where both multi-step grooming mutations half-write, so it is
+where the evidence is PRODUCED and where the resume is EXECUTED. The
+provider-neutral rule that decides whether to resume lives in
+`backend/internal/workmgmt` — see that package's README for the ledger's
+semantics and its stated residual.
+
+**The two producing sites.**
+
+- `placeIssueOnBoard` (`provider.go`): when `AddProjectItem` SUCCEEDED and
+  `SetProjectItemSingleSelect` failed, it returns the unexported
+  `boardPlacementStepError`. Its `Error()` is byte-identical to the message the
+  bare wrap produced and `Unwrap()` returns the cause, so the two OTHER callers
+  of this shared routine — the filing path (`Provider.File`) and the
+  product-feedback path — which only render the message, are behaviourally
+  unchanged. `groomingMoveCard` `errors.As`-es it and converts it to a
+  `*workmgmt.PartialGroomingWriteError{Steps: [board_item_added]}`; every other
+  error is returned unchanged.
+- `groomingLinkEpic` branch 4/5 (`grooming.go`): when `linkEpic` SUCCEEDED and
+  the marker `UpdateIssue` failed, it returns
+  `*workmgmt.PartialGroomingWriteError{Steps: [epic_edge_added]}` instead of the
+  bare wrap.
+
+**The two resume write paths.**
+
+- BOARD: `groomingResumeAllows` mirrors the core's board arm — empty
+  `ExpectedFrom`, on-board, status unset, and `ResumeSteps` naming
+  `board_item_added` — and is OR-ed into the `groomingSourceAllows` refusal.
+  `groomingSourceAllows` ITSELF is not edited, so the icebox arm and the
+  human-placement arm are byte-identical. The resume then writes the column with
+  `SetProjectItemSingleSelect` **against the item id the pre-write
+  `ProjectItemStatus` read already returned** — it does NOT re-enter
+  `placeIssueOnBoard`. That is deliberate: the card is already on the board, so
+  re-adding it would be a new third-party semantic claim (that
+  `addProjectV2ItemById` is idempotent for an already-added card) this change
+  does not make. `TestApplyGrooming_BoardPlacePartialWriteConvergesOnRetry`
+  asserts NO second `AddItem` call.
+- EPIC: `groomingLinkEpic` **branch 1** (structural parent already records the
+  proposal) writes ONLY the marker when `ResumeSteps` names `epic_edge_added`
+  AND no marker already carries the proposal — no `IssueNodeID`, no second
+  `AddSubIssue`. Without that evidence branch 1 is byte-identical to its
+  pre-#2810 shape (skip, `parent epic already linked`).
+
+**Unchanged, deliberately**: branches 2, 3 and 5. In particular branch 3 — a
+DIVERGENT marker with no structural parent — keeps its `ParentEpicConflictError`
+refusal, which is the correct fail-closed answer when the body and the graph
+disagree. Its resurfacing cost is stated in the `workmgmt` README.
+
+### Live-validation walk for the partial-write resume (#2810)
+
+Everything above is proven OFFLINE, against an httptest forge. What that proves
+is the request SHAPE and the call sequence; it does NOT prove GitHub's real
+GraphQL surface behaves as the fixture does. This is the executable walk that
+closes that gap. Run it once, by hand, before treating the resume as validated.
+
+**Target**: repository `kuhlman-labs/fishhawk`, board **Project #7**
+(user-owned, so `FISHHAWKD_PROJECTS_TOKEN` must be a `project`-scoped PAT/UAT —
+an App installation token cannot reach it, #1114). Use a THROWAWAY issue you
+file for the walk, never a live backlog item, and pick an issue that is NOT
+already on the board and has NO parent epic.
+
+**Half-write A — board_place.** Induce it by making the column write fail while
+the card add succeeds: set the report's `hygiene.fix.board_state` to a canonical
+state whose board option you then RENAME on Project #7 between the
+`ProjectFields` read and the write (or, more simply, revoke the projects token's
+write scope after the add lands). READ BACK to confirm the half-written state:
+the card appears on Project #7 with an EMPTY Status cell, and the run's
+`grooming_mutation_applied` audit row for that entry id carries
+`"outcome":"failed"` with `"steps_landed":["board_item_added"]`
+(`GET /v0/runs/{run_id}/audit?category=grooming_mutation_applied`).
+
+**Half-write B — epic_link.** Induce it by making the body PATCH fail while
+`AddSubIssue` succeeds: lock the issue (or revoke `issues:write`) after the
+sub-issue edge lands. READ BACK: the issue shows as a sub-issue of the parent
+epic in the GitHub UI, its body carries NO `Parent epic:` line, and its audit row
+carries `"outcome":"failed"` with `"steps_landed":["epic_edge_added"]`.
+
+**The resume.** Restore the broken permission/option, then run a SECOND grooming
+run on the same repo and workflow proposing the SAME entry (the entry id is
+content-derived, so an unchanged proposal recomputes the same id), and approve it.
+
+**PASS** — A: the card's Status cell now holds the proposed column, and the
+second run's audit row for that entry id reads `"outcome":"applied"`. B: the
+issue body now carries exactly ONE `Parent epic: #N` line naming the proposed
+epic, the sub-issue edge is unchanged (still exactly one parent), and the row
+reads `"outcome":"applied"`.
+
+**FAIL** — any of: the second row reads `refused`/`manual_placement_preserved`
+(A) or `skipped`/`already_applied` (B), meaning the evidence did not reach the
+resume; the card is added to the board a SECOND time or the issue gains a second
+parent edge, meaning the resume re-ran step one; or the body gains two
+`Parent epic:` lines.
+
+**Negative control, and do not skip it** — it is the half that proves the
+resume is evidence-gated rather than simply permissive. Repeat half-write A,
+then BEFORE the second run, manually append an `applied` outcome for that entry
+(or simply let a run settle it) so the ledger is superseded; the second run must
+REFUSE with `manual_placement_preserved` and leave the Status cell untouched.

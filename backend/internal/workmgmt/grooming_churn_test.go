@@ -1086,3 +1086,67 @@ func TestGroomingHygieneBasis_LabelOrderDoesNotChangeBasis(t *testing.T) {
 	// (binding condition C1) — and staticcheck rejects it outright as SA4000.
 	// The order-insensitivity assertion above is the AC4 evidence.
 }
+
+// TestNewGroomingBaseline_FailedRecordsResurface pins the ABSENT classification
+// #2810 depends on and states the cost of (step 11).
+//
+// A FAILED apply record contributes NO baseline entry, so the entry is
+// classified never-decided and RESURFACES on the next grooming run. Three failure
+// shapes are asserted separately, because they are three DIFFERENT things an
+// operator reads and only one of them converges on its own:
+//
+//   - a PARTIAL WRITE carrying steps_landed — resurfaces AND, with the ledger,
+//     the next apply finishes it;
+//   - the branch-3 divergent-marker ParentEpicConflictError refusal — resurfaces
+//     on EVERY run until a human reconciles the body and the graph. That cost is
+//     accepted (refusing is right when the two disagree) and is stated in the
+//     package README where an operator reads it;
+//   - an ordinary provider failure.
+//
+// Deleting the ABSENT default — treating `failed` as applied — turns this RED.
+func TestNewGroomingBaseline_FailedRecordsResurface(t *testing.T) {
+	partial := gcHygiene("1", "unboarded", "backlog")
+	divergent := gcHygiene("2", "unlinked_parent_epic", "#389")
+	plain := gcHygiene("3", "missing_estimate", "5")
+	landed := gcHygiene("4", "missing_estimate", "8")
+	prior := gcReport("h", func(gr *plan.GroomingReport) {
+		gr.HygieneDefects = []plan.HygieneDefect{partial, divergent, plain, landed}
+	})
+	applied := &GroomingApplyResult{
+		Applied: []GroomingMutationRecord{{EntryID: landed.ID, Outcome: GroomingOutcomeApplied}},
+		Failed: []GroomingMutationRecord{
+			{EntryID: partial.ID, Outcome: GroomingOutcomeFailed, Error: "set status field: 500",
+				StepsLanded: []GroomingMutationStep{GroomingStepBoardItemAdded}},
+			{EntryID: divergent.ID, Outcome: GroomingOutcomeFailed,
+				Error: "workmgmt/github: #2237 records parent epic #12 but #389 was proposed"},
+			{EntryID: plain.ID, Outcome: GroomingOutcomeFailed, Error: "provider 500"},
+		},
+	}
+	base := NewGroomingBaseline(prior, nil, applied)
+
+	for _, id := range []string{partial.ID, divergent.ID, plain.ID} {
+		if _, ok := base.Entries[id]; ok {
+			t.Errorf("a FAILED apply record produced a baseline entry for %q; the entry must be ABSENT so it resurfaces", id)
+		}
+	}
+	// The control arm: an APPLIED record DOES produce an entry, so the assertion
+	// above discriminates rather than passing on an always-empty baseline.
+	if e, ok := base.Entries[landed.ID]; !ok || e.Disposition != GroomingDispositionApplied {
+		t.Fatalf("applied entry = %+v (present=%t), want an applied disposition", e, ok)
+	}
+
+	// The observable consequence, at the real filter: all three failures are
+	// re-proposed, the applied one is not.
+	report := gcReport("h", func(gr *plan.GroomingReport) {
+		gr.HygieneDefects = []plan.HygieneDefect{partial, divergent, plain, landed}
+	})
+	res := FilterGroomingChurn(report, base, gcDefaultThresholds())
+	for _, id := range []string{partial.ID, divergent.ID, plain.ID} {
+		if !containsID(proposedIDs(res), id) {
+			t.Errorf("failed entry %q was SUPPRESSED; unfinished work must resurface", id)
+		}
+	}
+	if containsID(proposedIDs(res), landed.ID) {
+		t.Error("an APPLIED entry was proposed again")
+	}
+}

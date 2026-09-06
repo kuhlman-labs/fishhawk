@@ -3663,3 +3663,58 @@ func TestFetchIssuesBoundedIndexesByRequestOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestPlaceIssueOnBoard_SetFailureIsTypedButRendersUnchanged pins the #2810
+// board evidence at its PRODUCING site, in both directions.
+//
+// The set-status failure is now a TYPED *boardPlacementStepError so
+// groomingMoveCard can convert it into ledger evidence — but placeIssueOnBoard
+// is SHARED with the filing path and the product-feedback path, which only
+// RENDER the error. So the assertions are: the rendered message is byte-identical
+// to what the bare wrap produced, errors.Is still reaches the underlying cause
+// through the wrap, the type is recoverable by errors.As, and File's
+// best-effort BoardingError text is unchanged.
+func TestPlaceIssueOnBoard_SetFailureIsTypedButRendersUnchanged(t *testing.T) {
+	cause := errors.New("graphql: field write refused")
+	api := &fakeAPI{
+		created: &githubclient.CreatedIssue{Number: 7, NodeID: "N7", HTMLURL: "https://x/7"},
+		meta:    &githubclient.ProjectMeta{ProjectID: "P", FieldID: "F", StatusOptions: map[string]string{"Backlog": "OPT"}},
+		itemID:  "ITEM",
+		setErr:  cause,
+	}
+	err := placeIssueOnBoard(context.Background(), api, forge.FromGitHubInstallationID(99),
+		&workmgmt.Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7}, "Backlog",
+		&githubclient.CreatedIssue{Number: 7, NodeID: "N7"})
+	if err == nil {
+		t.Fatal("err = nil, want the set-status failure")
+	}
+	const want = "workmgmt/github: set status field: graphql: field write refused"
+	if err.Error() != want {
+		t.Errorf("rendered message = %q, want the UNCHANGED %q — the filing and feedback paths only render this", err.Error(), want)
+	}
+	if !errors.Is(err, cause) {
+		t.Error("errors.Is no longer reaches the underlying cause through the wrap")
+	}
+	var step *boardPlacementStepError
+	if !errors.As(err, &step) {
+		t.Fatal("errors.As did not recover *boardPlacementStepError; groomingMoveCard cannot produce ledger evidence")
+	}
+	if step.Landed != workmgmt.GroomingStepBoardItemAdded {
+		t.Errorf("landed step = %q, want %q", step.Landed, workmgmt.GroomingStepBoardItemAdded)
+	}
+
+	// The FILING path, which must be behaviourally unchanged: best-effort, the
+	// issue is still returned, and BoardingError carries the same text.
+	req := baseRequest()
+	req.Item.Relations = workmgmt.Relations{}
+	created, ferr := New(api).File(context.Background(), req)
+	if ferr != nil {
+		t.Fatalf("File should stay best-effort on a board failure: %v", ferr)
+	}
+	if created == nil || created.Boarded {
+		t.Fatalf("created = %+v, want the issue returned with boarded=false", created)
+	}
+	if created.BoardingError != want {
+		t.Errorf("BoardingError = %q, want the UNCHANGED %q", created.BoardingError, want)
+	}
+}

@@ -550,10 +550,43 @@ func placeIssueOnBoard(ctx context.Context, api boardAPI, scope forge.Credential
 			status, statusFieldName, strings.Join(sortedKeys(meta.StatusOptions), ", "))
 	}
 	if err := api.SetProjectItemSingleSelect(ctx, scope, meta.ProjectID, itemID, meta.FieldID, optionID); err != nil {
-		return fmt.Errorf("workmgmt/github: set status field: %w", err)
+		// HALF-WRITTEN (#2810): AddProjectItem SUCCEEDED, so the card IS on the
+		// board, and only the column write failed. The typed wrap is what lets
+		// groomingMoveCard convert this into the ledger evidence a later apply
+		// resumes on — without it, the next apply sees an on-board column-less
+		// card indistinguishable from one a human placed and refuses forever.
+		//
+		// Error() returns the IDENTICAL string it returned before the type
+		// existed, and Unwrap returns the cause, so the two OTHER callers of
+		// this routine — the filing path (Provider.File) and the feedback path,
+		// both of which only render the message — are behaviourally unchanged.
+		return &boardPlacementStepError{
+			Landed: workmgmt.GroomingStepBoardItemAdded,
+			Cause:  fmt.Errorf("workmgmt/github: set status field: %w", err),
+		}
 	}
 	return nil
 }
+
+// boardPlacementStepError reports that placeIssueOnBoard's ADD landed and its
+// SET did not — the board half-write #2810 records as ledger evidence.
+//
+// It is UNEXPORTED and its Error() is byte-identical to the message the bare
+// wrap produced, so it is invisible to every caller that only renders the error
+// and visible only to the one that errors.As-es it.
+type boardPlacementStepError struct {
+	Landed workmgmt.GroomingMutationStep
+	Cause  error
+}
+
+func (e *boardPlacementStepError) Error() string {
+	if e.Cause == nil {
+		return "workmgmt/github: board placement partially landed"
+	}
+	return e.Cause.Error()
+}
+
+func (e *boardPlacementStepError) Unwrap() error { return e.Cause }
 
 // linkEpic resolves the parent-epic reference (#N or N) to its node id
 // and links the new issue as its sub-issue.

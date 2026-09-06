@@ -1759,7 +1759,15 @@ Notes:
   applied, failed AND skipped alike, so one category filter returns the whole
   apply — carrying `{entry_id, class, report_class, kind, item_ref, before,
   after, outcome, skip_reason | refuse_reason | error, provider_response,
-  idempotence_checked}`. The name reflects the family, not the outcome; read
+  idempotence_checked, steps_landed}`. **`steps_landed` (E54.15 / #2810)** is the
+  PARTIAL-WRITE LEDGER: on a `failed` record for a MULTI-step mutation whose
+  FIRST step landed, it names that step (`board_item_added` for a board_place
+  whose card was added but whose column write failed; `epic_edge_added` for an
+  epic_link whose sub-issue edge landed but whose `Parent epic:` marker write
+  failed). It is what a LATER apply reads back as proof that this system — not a
+  human — produced the half-written tracker state, which is the only thing that
+  authorizes resuming step two; the key is absent on every other outcome and on
+  every row written before #2810, and its absence means no resume. The name reflects the family, not the outcome; read
   `outcome` — one of `applied`, `failed`, `skipped`, `refused` — to tell a
   landed mutation from a containment refusal, and `skip_reason` (the closed set
   in `grooming_apply.go`: `not_approved`, `mode_report_surface_only`,

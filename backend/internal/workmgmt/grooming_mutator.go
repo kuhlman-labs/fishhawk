@@ -181,6 +181,72 @@ var valueSetKinds = map[GroomingMutationKind]bool{
 // row rather than only in this comment.
 func (k GroomingMutationKind) IdempotenceObservable() bool { return !valueSetKinds[k] }
 
+// GroomingMutationStep names ONE step of a MULTI-STEP tracker mutation, and
+// the set is CLOSED (#2810).
+//
+// Two of the ten mutation kinds are not a single forge write: a board_place is
+// add-the-card THEN set-the-column, and an epic_link is add-the-sub-issue-edge
+// THEN stamp the `Parent epic:` body marker. When step one lands and step two
+// fails, the tracker is left half-written — a card on the board with no column,
+// or a structural edge with no marker — and the NEXT apply cannot tell that
+// shape apart from a state a human produced. Refusing forever (the board case)
+// or settling as already-applied (the epic case) is what #2810 exists to fix.
+//
+// The members below are the FIRST step of each multi-step mutation, because the
+// first step is what the ledger must prove THIS SYSTEM landed for a resume to be
+// authorized on evidence rather than on an inference about tracker state.
+//
+// THE CLOSURE RULE: a provider that grows a NEW multi-step mutation adds its
+// first-step member HERE and nowhere else, so groomingResumeStep in
+// grooming_apply.go stays ONE rule with one arm per step rather than fanning out
+// into per-path resume logic. The issue's own warning is the reason: answering
+// the convergence question per path "would produce two answers to one question".
+type GroomingMutationStep string
+
+// The closed step vocabulary. See GroomingMutationStep for the closure rule.
+const (
+	// GroomingStepBoardItemAdded reports that a board_place's AddProjectItem
+	// landed — the card IS on the board — while the subsequent column write did
+	// not. The half-written shape is on-board with the status field unset.
+	GroomingStepBoardItemAdded GroomingMutationStep = "board_item_added"
+	// GroomingStepEpicEdgeAdded reports that an epic_link's AddSubIssue landed —
+	// the structural parent IS recorded — while the `Parent epic:` marker write
+	// did not. The half-written shape is linked with no marker naming the parent.
+	GroomingStepEpicEdgeAdded GroomingMutationStep = "epic_edge_added"
+)
+
+// PartialGroomingWriteError is the typed error a provider returns when a
+// multi-step mutation landed its FIRST step and FAILED its second. It is the
+// EVIDENCE-PRODUCING half of #2810: settleGroomingCandidate errors.As-es it and
+// stamps Steps onto the audit record's steps_landed, which a later apply reads
+// back as proof that THIS SYSTEM produced the half-written tracker state.
+//
+// It is an ERROR, not a fourth GroomingMutationResult state, deliberately: a
+// half-written mutation is a FAILURE (the requested change did not happen), and
+// a fourth state would break GroomingMutationResult.WellFormed's
+// exactly-one-of-three contract that the audit outcome depends on.
+//
+// Unwrap returns Cause so errors.Is/As against the underlying forge error keeps
+// working through the wrap.
+type PartialGroomingWriteError struct {
+	Steps []GroomingMutationStep
+	Cause error
+}
+
+func (e *PartialGroomingWriteError) Error() string {
+	names := make([]string, 0, len(e.Steps))
+	for _, s := range e.Steps {
+		names = append(names, string(s))
+	}
+	cause := "<nil>"
+	if e.Cause != nil {
+		cause = e.Cause.Error()
+	}
+	return "workmgmt: partial grooming write (landed: " + strings.Join(names, ", ") + "): " + cause
+}
+
+func (e *PartialGroomingWriteError) Unwrap() error { return e.Cause }
+
 // GroomingMode is the provider-neutral auto|gated|report mirror of
 // spec.ActionMode. It is deliberately NOT an import of backend/internal/spec:
 // the provider layer stays free of the workflow-spec dependency, and the
@@ -294,6 +360,26 @@ type GroomingMutationRequest struct {
 	After        GroomingValue
 	ExpectedFrom []string
 	States       map[string]string
+	// ResumeSteps are the steps the CORE decided are PROVEN LANDED for this
+	// candidate, from the audit ledger (#2810). It is carried so a provider's
+	// defence-in-depth re-check MIRRORS the core's resume decision rather than
+	// inventing a second one — the same posture ExpectedFrom already holds for
+	// the never-fight-the-human courtesy. Empty means no resume is authorized,
+	// and a provider must then behave exactly as it did before #2810.
+	ResumeSteps []GroomingMutationStep
+}
+
+// ResumeAuthorized reports whether step is named by ResumeSteps — the ONE
+// question a provider's resume mirror asks of this request. A method rather
+// than an inline loop so the core's groomingStepLanded and the provider's
+// mirror ask it the same way.
+func (r GroomingMutationRequest) ResumeAuthorized(step GroomingMutationStep) bool {
+	for _, s := range r.ResumeSteps {
+		if s == step {
+			return true
+		}
+	}
+	return false
 }
 
 // GroomingMutationResult is what a provider reports for one dispatched

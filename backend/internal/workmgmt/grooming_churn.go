@@ -269,6 +269,21 @@ func NewGroomingBaseline(prior *plan.GroomingReport, decisions []GroomingDecisio
 
 	// Dispositions first, so the entry walk can look each one up. Applied wins
 	// over rejected: a landed mutation is a fact, a verdict is an intent.
+	//
+	// THE DISPOSITION TABLE, and what is ABSENT from it BY DESIGN:
+	//   applied / already_applied skip -> GroomingDispositionApplied
+	//   rejected / amended verdict     -> GroomingDispositionRejected
+	//   FAILED                         -> NOTHING. A failed apply record —
+	//     including a PARTIAL WRITE carrying steps_landed (#2810) and the
+	//     divergent-marker `ParentEpicConflictError` refusal — contributes no
+	//     disposition at all, so the entry is classified ABSENT and RESURFACES
+	//     on the next grooming run. That is correct: a failed mutation did not
+	//     land, so suppressing its entry would hide unfinished work. The COST is
+	//     real and stated in the package README: a divergent-marker refusal is
+	//     not self-healing and resurfaces EVERY run until a human reconciles the
+	//     body and the graph. A partial write, by contrast, now converges — the
+	//     ledger lets the next apply finish it, after which it records applied
+	//     and stops resurfacing.
 	disp := map[string]GroomingDisposition{}
 	for _, d := range decisions {
 		switch d.Verdict {

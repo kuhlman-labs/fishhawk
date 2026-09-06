@@ -14,7 +14,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -25,11 +27,14 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 )
 
 // ---------------------------------------------------------------------------
@@ -275,6 +280,10 @@ type groomingApplyAuditFake struct {
 	// every other (notably the window watermark), so a test can model a SINK
 	// outage that must not abort dispatch while the settlement still lands.
 	failCategories map[string]bool
+	// listErr fails ListForRunByCategory, which the #2810 evidence scan's
+	// fail-closed branch needs. Nil by default, so every existing caller is
+	// byte-for-byte unchanged.
+	listErr error
 }
 
 func (a *groomingApplyAuditFake) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
@@ -296,6 +305,9 @@ func (a *groomingApplyAuditFake) AppendChained(ctx context.Context, p audit.Chai
 func (a *groomingApplyAuditFake) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.listErr != nil {
+		return nil, a.listErr
+	}
 	var out []*audit.Entry
 	for i := range a.appended {
 		p := a.appended[i]
@@ -1847,5 +1859,392 @@ func TestCollapseGroomingConsumed_SkipsAndLastWins(t *testing.T) {
 	}
 	if got["e1"].Verdict != "approved" {
 		t.Errorf("e1 verdict = %q, want approved (last-wins keeps the higher sequence)", got["e1"].Verdict)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #2810: the partial-write evidence scan, and the seam it sits in
+// ---------------------------------------------------------------------------
+
+// groomingStepsRunRepo COMPOSES approvals_test.go's approvalRunRepo rather than
+// modifying it (binding condition C2): it delegates every method and adds only
+// a controllable ListRuns, which the shared fake hard-codes to an error.
+type groomingStepsRunRepo struct {
+	*approvalRunRepo
+	listRuns []*run.Run
+	listErr  error
+}
+
+func (r *groomingStepsRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	return r.listRuns, nil
+}
+
+// stepsScanHarness stands up a Server whose RunRepo and AuditRepo the evidence
+// scan can be driven against, plus a `current` run and one PRIOR run that
+// precedes it in the same tenant.
+type stepsScanHarness struct {
+	server  *Server
+	runs    *groomingStepsRunRepo
+	audit   *groomingApplyAuditFake
+	current *run.Run
+	prior   *run.Run
+}
+
+func newStepsScanHarness(t *testing.T) *stepsScanHarness {
+	t.Helper()
+	au := &groomingApplyAuditFake{approvalAuditFake: newApprovalAuditFake()}
+	rr := &groomingStepsRunRepo{approvalRunRepo: newApprovalRunRepo()}
+	acct := uuid.NewString()
+	now := time.Now().UTC()
+	prior := &run.Run{ID: uuid.New(), Repo: "kuhlman-labs/fishhawk", AccountID: acct, CreatedAt: now.Add(-time.Hour)}
+	current := &run.Run{ID: uuid.New(), Repo: "kuhlman-labs/fishhawk", AccountID: acct, CreatedAt: now}
+	rr.listRuns = []*run.Run{prior}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	return &stepsScanHarness{server: s, runs: rr, audit: au, current: current, prior: prior}
+}
+
+// seedMutationRow appends a grooming_mutation_applied payload for runID, in the
+// BARE shape groomingApplyAuditSink writes.
+func (h *stepsScanHarness) seedMutationRow(t *testing.T, runID uuid.UUID, rec workmgmt.GroomingMutationRecord) {
+	t.Helper()
+	payload, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("marshal record: %v", err)
+	}
+	if _, err := h.audit.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Now().UTC(),
+		Category: workmgmt.GroomingMutationAppliedCategory, Payload: payload,
+	}); err != nil {
+		t.Fatalf("seed mutation row: %v", err)
+	}
+}
+
+// TestPriorGroomingPartialSteps_LatestFailedRowYieldsEvidence is the server
+// scan's POSITIVE ARM, named explicitly (approval condition 4) rather than left
+// to be inferred from another test's counterfactual: a latest failed-with-steps
+// audit row survives the run-scan filters and yields evidence keyed to the
+// CORRECT entry id.
+func TestPriorGroomingPartialSteps_LatestFailedRowYieldsEvidence(t *testing.T) {
+	h := newStepsScanHarness(t)
+	const wanted, other = "hygiene:github/kuhlman-labs/fishhawk#2237:unboarded", "hygiene:github/kuhlman-labs/fishhawk#9999:unboarded"
+	h.seedMutationRow(t, h.prior.ID, workmgmt.GroomingMutationRecord{
+		EntryID: wanted, Outcome: workmgmt.GroomingOutcomeFailed,
+		StepsLanded: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepBoardItemAdded},
+	})
+	// A neighbouring entry that landed cleanly, so the assertion below shows the
+	// evidence is KEYED rather than blanket.
+	h.seedMutationRow(t, h.prior.ID, workmgmt.GroomingMutationRecord{
+		EntryID: other, Outcome: workmgmt.GroomingOutcomeApplied,
+	})
+
+	steps, reason := h.server.priorGroomingPartialSteps(context.Background(), h.current)
+	if reason != "" {
+		t.Fatalf("degrade reason = %q, want none", reason)
+	}
+	if len(steps) != 1 {
+		t.Fatalf("evidence = %v, want exactly the one half-written entry", steps)
+	}
+	got := steps[wanted]
+	if len(got) != 1 || got[0] != workmgmt.GroomingStepBoardItemAdded {
+		t.Errorf("evidence[%q] = %v, want [%s]", wanted, got, workmgmt.GroomingStepBoardItemAdded)
+	}
+	if _, ok := steps[other]; ok {
+		t.Errorf("an APPLIED entry produced evidence: %v", steps)
+	}
+}
+
+// TestPriorGroomingPartialSteps_LaterSettlementErasesEvidence is COUNTERFACTUAL
+// (f): the STALENESS BOUND. A `failed`+steps row followed by a LATER settled row
+// for the SAME entry id yields NO evidence — the half-write it described has been
+// superseded, and resuming on it would write against state somebody else settled.
+func TestPriorGroomingPartialSteps_LaterSettlementErasesEvidence(t *testing.T) {
+	const entryID = "hygiene:github/kuhlman-labs/fishhawk#2237:unboarded"
+	for _, later := range []workmgmt.GroomingMutationRecord{
+		{EntryID: entryID, Outcome: workmgmt.GroomingOutcomeApplied},
+		{EntryID: entryID, Outcome: workmgmt.GroomingOutcomeSkipped, SkipReason: workmgmt.GroomingSkipAlreadyApplied},
+		{EntryID: entryID, Outcome: workmgmt.GroomingOutcomeRefused, RefuseReason: workmgmt.GroomingSkipManualPlacementPreserved},
+	} {
+		t.Run(string(later.Outcome), func(t *testing.T) {
+			h := newStepsScanHarness(t)
+			h.seedMutationRow(t, h.prior.ID, workmgmt.GroomingMutationRecord{
+				EntryID: entryID, Outcome: workmgmt.GroomingOutcomeFailed,
+				StepsLanded: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepBoardItemAdded},
+			})
+			h.seedMutationRow(t, h.prior.ID, later)
+
+			steps, reason := h.server.priorGroomingPartialSteps(context.Background(), h.current)
+			if reason != "" {
+				t.Fatalf("degrade reason = %q, want none", reason)
+			}
+			if len(steps) != 0 {
+				t.Errorf("evidence = %v, want NONE: a later %s record supersedes the half-write claim",
+					steps, later.Outcome)
+			}
+		})
+	}
+}
+
+// TestPriorGroomingPartialSteps_NewerRunWinsOverOlder is the run-granularity
+// half of the same bound: a NEWER run's settled record beats an OLDER run's
+// failed-with-steps record for the same entry id.
+func TestPriorGroomingPartialSteps_NewerRunWinsOverOlder(t *testing.T) {
+	h := newStepsScanHarness(t)
+	const entryID = "hygiene:github/kuhlman-labs/fishhawk#2237:unboarded"
+	older := &run.Run{ID: uuid.New(), Repo: h.current.Repo, AccountID: h.current.AccountID,
+		CreatedAt: h.current.CreatedAt.Add(-2 * time.Hour)}
+	h.runs.listRuns = []*run.Run{older, h.prior}
+	h.seedMutationRow(t, older.ID, workmgmt.GroomingMutationRecord{
+		EntryID: entryID, Outcome: workmgmt.GroomingOutcomeFailed,
+		StepsLanded: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepBoardItemAdded},
+	})
+	h.seedMutationRow(t, h.prior.ID, workmgmt.GroomingMutationRecord{
+		EntryID: entryID, Outcome: workmgmt.GroomingOutcomeApplied,
+	})
+
+	steps, _ := h.server.priorGroomingPartialSteps(context.Background(), h.current)
+	if len(steps) != 0 {
+		t.Errorf("evidence = %v, want NONE: the NEWER run settled this entry", steps)
+	}
+}
+
+// TestPriorGroomingPartialSteps_FailsClosedOnDegrade is COUNTERFACTUAL (g) plus
+// the scan's other fail-closed branches, one assertion each. Every one yields an
+// EMPTY map, so NOTHING resumes anywhere — the only safe direction for evidence
+// that authorizes overriding a containment rule.
+func TestPriorGroomingPartialSteps_FailsClosedOnDegrade(t *testing.T) {
+	const entryID = "hygiene:github/kuhlman-labs/fishhawk#2237:unboarded"
+	seedHalfWrite := func(h *stepsScanHarness, runID uuid.UUID) {
+		h.seedMutationRow(t, runID, workmgmt.GroomingMutationRecord{
+			EntryID: entryID, Outcome: workmgmt.GroomingOutcomeFailed,
+			StepsLanded: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepBoardItemAdded},
+		})
+	}
+	for _, tc := range []struct {
+		name       string
+		arrange    func(*stepsScanHarness)
+		wantReason string
+	}{
+		{"list runs fails", func(h *stepsScanHarness) {
+			seedHalfWrite(h, h.prior.ID)
+			h.runs.listErr = errors.New("db down")
+		}, groomingApplyPriorStepsUnreadable},
+		{"audit read fails", func(h *stepsScanHarness) {
+			seedHalfWrite(h, h.prior.ID)
+			h.audit.listErr = errors.New("audit down")
+		}, groomingApplyPriorStepsUnreadable},
+		{"nil run", func(h *stepsScanHarness) { h.current = nil }, groomingApplyPriorStepsUnreadable},
+		{"repo unknown", func(h *stepsScanHarness) { h.current.Repo = "" }, groomingApplyPriorStepsUnreadable},
+		// Not degrades — correct empty answers, so the reason stays empty:
+		{"different tenant", func(h *stepsScanHarness) {
+			seedHalfWrite(h, h.prior.ID)
+			h.prior.AccountID = uuid.NewString()
+		}, ""},
+		{"candidate does not precede", func(h *stepsScanHarness) {
+			seedHalfWrite(h, h.prior.ID)
+			h.prior.CreatedAt = h.current.CreatedAt.Add(time.Hour)
+		}, ""},
+		{"undecodable payload", func(h *stepsScanHarness) {
+			if _, err := h.audit.AppendChained(context.Background(), audit.ChainAppendParams{
+				RunID: h.prior.ID, Timestamp: time.Now().UTC(),
+				Category: workmgmt.GroomingMutationAppliedCategory, Payload: []byte(`{not json`),
+			}); err != nil {
+				t.Fatalf("seed bad row: %v", err)
+			}
+		}, ""},
+		{"failed row carrying NO steps", func(h *stepsScanHarness) {
+			h.seedMutationRow(t, h.prior.ID, workmgmt.GroomingMutationRecord{
+				EntryID: entryID, Outcome: workmgmt.GroomingOutcomeFailed, Error: "provider 500",
+			})
+		}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newStepsScanHarness(t)
+			tc.arrange(h)
+			steps, reason := h.server.priorGroomingPartialSteps(context.Background(), h.current)
+			if reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", reason, tc.wantReason)
+			}
+			if len(steps) != 0 {
+				t.Errorf("evidence = %v, want an EMPTY map so nothing resumes", steps)
+			}
+		})
+	}
+}
+
+// stepsSeamForge is a STATE-BEARING GitHub for the cross-boundary seam test:
+// board membership and the column PERSIST across requests, and the column write
+// can be failed exactly once.
+type stepsSeamForge struct {
+	onBoard      bool
+	column       string
+	failSetField bool
+	addItems     int
+}
+
+func newStepsSeamForge(t *testing.T, fx *stepsSeamForge) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"number":%s,"node_id":"NODE_%s","title":"t","body":"## Summary","state":"open","labels":[{"name":"type:feature"}]}`,
+			r.PathValue("number"), r.PathValue("number")))
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string
+			Variables map[string]any
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(body.Query, "ProjectFields"):
+			_, _ = io.WriteString(w, `{"data":{"user":{"projectV2":{"id":"PROJ","field":{"id":"FIELD","options":[`+
+				`{"id":"OPT_BACKLOG","name":"Backlog"},{"id":"OPT_ICEBOX","name":"Icebox"}]}}}}}`)
+		case strings.Contains(body.Query, "projectItems"):
+			if !fx.onBoard {
+				_, _ = io.WriteString(w, `{"data":{"node":{"projectItems":{"nodes":[]}}}}`)
+				return
+			}
+			field := "null"
+			if fx.column != "" {
+				field = `{"name":"` + fx.column + `"}`
+			}
+			_, _ = io.WriteString(w, `{"data":{"node":{"projectItems":{"nodes":[`+
+				`{"id":"ITEM","project":{"id":"PROJ"},"fieldValueByName":`+field+`}]}}}}`)
+		case strings.Contains(body.Query, "AddItem"):
+			fx.addItems++
+			fx.onBoard = true
+			_, _ = io.WriteString(w, `{"data":{"addProjectV2ItemById":{"item":{"id":"ITEM"}}}}`)
+		case strings.Contains(body.Query, "SetField"):
+			if fx.failSetField {
+				fx.failSetField = false
+				_, _ = io.WriteString(w, `{"errors":[{"message":"injected column write failure"}]}`)
+				return
+			}
+			if id, _ := body.Variables["optionId"].(string); id == "OPT_BACKLOG" {
+				fx.column = "Backlog"
+			}
+			_, _ = io.WriteString(w, `{"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM"}}}}`)
+		default:
+			_, _ = io.WriteString(w, `{"data":{}}`)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := githubclient.New(seamTokenProvider{})
+	c.BaseURL = srv.URL
+	c.HTTP = &http.Client{Timeout: 5 * time.Second}
+	c.ProjectsToken = "pat_projects"
+	return c
+}
+
+type seamTokenProvider struct{}
+
+func (seamTokenProvider) Token(context.Context, int64) (string, error) {
+	return "ghs_install", nil
+}
+
+// TestGroomingPartialWriteEvidenceCrossesTheAuditSeam is APPROVAL CONDITION 1:
+// the ONE flow, end to end, that no per-layer test covers —
+//
+//	provider error -> steps_landed on the record -> the REAL audit sink's JSON
+//	-> a PERSISTED audit row -> priorGroomingPartialSteps -> PriorSteps ->
+//	the RESUMED provider mutation.
+//
+// The second apply's evidence is obtained THROUGH priorGroomingPartialSteps, not
+// by hand, which is the whole point: every layer could pass its own test while a
+// wrong json tag, a filter that drops the row, or an entry-id mismatch makes the
+// feature not work. Two sibling issues in this campaign (#2558 among them) had
+// exactly that defect — a test that stopped at the boundary it claimed to cross.
+func TestGroomingPartialWriteEvidenceCrossesTheAuditSeam(t *testing.T) {
+	ctx := context.Background()
+	fx := &stepsSeamForge{failSetField: true}
+	provider := github.New(newStepsSeamForge(t, fx))
+
+	h := newStepsScanHarness(t)
+	// The REAL sink, writing onto the PRIOR run's audit chain exactly as the
+	// on-approval hook does — bare marshal, no envelope.
+	sink := &groomingApplyAuditSink{s: h.server, runID: h.prior.ID, stageID: uuid.New()}
+
+	target := workmgmt.Target{
+		Scope:   forge.FromGitHubInstallationID(99),
+		Repo:    workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"},
+		Project: &workmgmt.Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7},
+	}
+	ref := plan.ItemRef{Type: "github_issue", ID: "kuhlman-labs/fishhawk#2237"}
+	entryID := plan.GroomingEntryID(plan.GroomingClassHygiene, "unboarded", ref)
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{{
+		ID: entryID, ItemRef: ref, Defect: "unboarded", Detail: "off board",
+		SuggestedFix: "board it",
+		Fix:          &plan.HygieneFix{BoardState: workmgmt.CanonicalStateBacklog},
+	}}}
+	applyReq := func(prior map[string][]workmgmt.GroomingMutationStep) workmgmt.GroomingApplyRequest {
+		return workmgmt.GroomingApplyRequest{
+			Target:     target,
+			Report:     report,
+			Decisions:  []workmgmt.GroomingDecision{{EntryID: entryID, Verdict: workmgmt.GroomingApproved}},
+			Modes:      map[string]workmgmt.GroomingMode{"hygiene": workmgmt.GroomingModeAuto},
+			States:     map[string]string{workmgmt.CanonicalStateBacklog: "Backlog"},
+			PriorSteps: prior,
+		}
+	}
+
+	// APPLY 1 — lands AddItem, fails the column write. The record it settles is
+	// written through the REAL sink, so the ledger crosses JSON.
+	res1, err := workmgmt.ApplyGrooming(ctx, provider, provider, sink, applyReq(nil))
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	if len(res1.Failed) != 1 || len(res1.Failed[0].StepsLanded) != 1 {
+		t.Fatalf("apply 1 result = %+v, want one failed record carrying a landed step", res1)
+	}
+	if !fx.onBoard || fx.column != "" {
+		t.Fatalf("after apply 1: onBoard=%t column=%q, want the half-written shape", fx.onBoard, fx.column)
+	}
+
+	// THE PERSISTED ROW carries the key, in the shape the scan decodes. Asserted
+	// here so a tag/serialization defect names itself rather than surfacing as a
+	// mysterious non-resume three layers later.
+	rows, err := h.audit.ListForRunByCategory(ctx, h.prior.ID, workmgmt.GroomingMutationAppliedCategory)
+	if err != nil {
+		t.Fatalf("list persisted rows: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("persisted rows = %d, want 1", len(rows))
+	}
+	if !strings.Contains(string(rows[0].Payload), `"steps_landed":["board_item_added"]`) {
+		t.Fatalf("persisted payload = %s, want a steps_landed key", rows[0].Payload)
+	}
+
+	// THE SEAM: the evidence for apply 2 comes back THROUGH the production
+	// lookup, keyed by the entry id the report recomputed — never by hand.
+	priorSteps, reason := h.server.priorGroomingPartialSteps(ctx, h.current)
+	if reason != "" {
+		t.Fatalf("evidence degrade reason = %q, want none", reason)
+	}
+	if got := priorSteps[entryID]; len(got) != 1 || got[0] != workmgmt.GroomingStepBoardItemAdded {
+		t.Fatalf("evidence[%q] = %v (whole map %v), want [%s] — the run-over-run join did not land",
+			entryID, got, priorSteps, workmgmt.GroomingStepBoardItemAdded)
+	}
+
+	// APPLY 2 — the resumed mutation, driven by evidence the system produced.
+	addsBefore := fx.addItems
+	res2, err := workmgmt.ApplyGrooming(ctx, provider, provider, sink, applyReq(priorSteps))
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	if len(res2.Applied) != 1 {
+		t.Fatalf("apply 2 result = %+v, want the half-written placement to converge", res2)
+	}
+	if fx.column != "Backlog" {
+		t.Errorf("column after apply 2 = %q, want %q", fx.column, "Backlog")
+	}
+	if fx.addItems != addsBefore {
+		t.Errorf("AddItem calls = %d, want %d (the resume must not re-add an already-boarded card)",
+			fx.addItems, addsBefore)
 	}
 }

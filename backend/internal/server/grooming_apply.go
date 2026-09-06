@@ -127,6 +127,13 @@ const (
 	// consumed dispositions) failed, so nothing was consumed and the window was
 	// NOT closed. Nothing is dispatched; a later approve can settle it (#2991).
 	groomingApplyWindowUnsettled = "grooming_apply_window_unsettled"
+
+	// groomingApplyPriorStepsUnreadable names the ONE degrade of the #2810
+	// partial-write evidence lookup: a run-scan or audit-read failure. It
+	// yields an EMPTY evidence map, so no candidate resumes anywhere — the
+	// fail-closed direction, since the alternative is resuming on unknown
+	// provenance. It never aborts the apply.
+	groomingApplyPriorStepsUnreadable = "grooming_apply_prior_steps_unreadable"
 )
 
 // groomingApplyDegradePayload is the server-authored grooming_apply_completed
@@ -338,6 +345,131 @@ func (k *groomingApplyAuditSink) RecordGroomingApplyCompleted(ctx context.Contex
 	return k.append(ctx, workmgmt.GroomingApplyCompletedCategory, sum)
 }
 
+// priorGroomingPartialSteps assembles the #2810 PARTIAL-WRITE LEDGER: for each
+// grooming entry id, the steps a PRIOR run's apply proved it landed before the
+// mutation failed. It returns the evidence map and a NAMED degrade reason
+// (empty when clean).
+//
+// It reuses the churn baseline's scan shape exactly — the same ListRuns filter
+// (repo + account + workflow, groomingBaselineRunScanLimit), the same
+// sameGroomingTenant / groomingRunPrecedes filters, the same (created_at, id)
+// newest-first total order — so evidence and suppression are read out of the
+// same window and cannot disagree about which runs are in scope.
+//
+// THE STALENESS BOUND IS A CONTROL, not bookkeeping. Per entry id ONLY the
+// LATEST record decides: the newest run carrying any record for that id wins,
+// and within it the highest audit sequence. Evidence is emitted ONLY when that
+// latest record is `failed` AND carries a non-empty steps_landed. A later
+// `applied`, `skipped` or `refused` record for the same id ERASES the evidence —
+// the half-write it described has since been superseded, and resuming on it
+// would write against state somebody else already settled.
+//
+// FAIL-CLOSED ON EVERY READ FAILURE. A ListRuns or ListForRunByCategory error
+// returns an EMPTY map plus a named reason, which means no resume anywhere. The
+// alternative — resuming on partial or unknown provenance — is the one direction
+// this evidence must never fail in, because what it authorizes is overriding a
+// containment rule. An undecodable row is skipped, contributing no evidence,
+// which is the same direction.
+//
+// Rows written before #2810 carry no steps_landed key at all; the tolerant
+// projection reads that as an absent slice, so they yield no evidence and
+// degrade to pre-#2810 behaviour rather than to a wrong one.
+func (s *Server) priorGroomingPartialSteps(ctx context.Context, current *run.Run) (map[string][]workmgmt.GroomingMutationStep, string) {
+	if current == nil || current.Repo == "" || s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
+		return nil, groomingApplyPriorStepsUnreadable
+	}
+	runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+		Repo:       current.Repo,
+		AccountID:  current.AccountID,
+		WorkflowID: current.WorkflowID,
+		Limit:      groomingBaselineRunScanLimit,
+	})
+	if err != nil {
+		return nil, groomingApplyPriorStepsUnreadable
+	}
+	candidates := make([]*run.Run, 0, len(runs))
+	for _, rn := range runs {
+		if rn == nil || !sameGroomingTenant(rn, current) || !groomingRunPrecedes(rn, current) {
+			continue
+		}
+		candidates = append(candidates, rn)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if !candidates[i].CreatedAt.Equal(candidates[j].CreatedAt) {
+			return candidates[i].CreatedAt.After(candidates[j].CreatedAt)
+		}
+		return candidates[i].ID.String() > candidates[j].ID.String()
+	})
+
+	out := map[string][]workmgmt.GroomingMutationStep{}
+	// decided holds every entry id the scan has already settled from a NEWER
+	// run, so an older run's record can never overwrite it. Walking newest-first
+	// and refusing to revisit an id IS the latest-record-wins bound at run
+	// granularity; the per-run sequence sort below is the same bound within one
+	// run.
+	decided := map[string]struct{}{}
+	for _, rn := range candidates {
+		entries, aerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, rn.ID, workmgmt.GroomingMutationAppliedCategory)
+		if aerr != nil {
+			// A retrieval failure is not an absence: abandon the whole scan
+			// rather than emit evidence assembled from a partial read.
+			return nil, groomingApplyPriorStepsUnreadable
+		}
+		// Highest sequence LAST, so a later record in the same run overwrites an
+		// earlier one for the same entry id.
+		ordered := make([]*audit.Entry, 0, len(entries))
+		for _, e := range entries {
+			if e != nil {
+				ordered = append(ordered, e)
+			}
+		}
+		sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Sequence < ordered[j].Sequence })
+
+		latest := map[string]groomingStepsProjection{}
+		for _, e := range ordered {
+			var rec groomingStepsProjection
+			if json.Unmarshal(e.Payload, &rec) != nil || rec.EntryID == "" {
+				continue
+			}
+			latest[rec.EntryID] = rec
+		}
+		for id, rec := range latest {
+			if _, seen := decided[id]; seen {
+				continue
+			}
+			decided[id] = struct{}{}
+			// ONLY a failed record carrying steps is evidence. Every other
+			// outcome — applied, skipped, refused, or failed with no steps —
+			// settles the id with NO evidence, which is what makes a later
+			// settlement ERASE a prior half-write claim.
+			if rec.Outcome != string(workmgmt.GroomingOutcomeFailed) || len(rec.StepsLanded) == 0 {
+				continue
+			}
+			steps := make([]workmgmt.GroomingMutationStep, 0, len(rec.StepsLanded))
+			for _, st := range rec.StepsLanded {
+				steps = append(steps, workmgmt.GroomingMutationStep(st))
+			}
+			out[id] = steps
+		}
+	}
+	if len(out) == 0 {
+		return nil, ""
+	}
+	return out, ""
+}
+
+// groomingStepsProjection is the TOLERANT projection of a
+// grooming_mutation_applied payload the evidence scan needs — the same posture
+// priorGroomingDispositions takes, carrying only the three fields that decide a
+// resume. It reads a record marshalled BARE (which is what
+// groomingApplyAuditSink writes) and ignores every other key, so an older row
+// with no steps_landed decodes cleanly with an empty slice.
+type groomingStepsProjection struct {
+	EntryID     string   `json:"entry_id"`
+	Outcome     string   `json:"outcome"`
+	StepsLanded []string `json:"steps_landed"`
+}
+
 // applyApprovedGrooming is the on-approval hook. See the file header for the
 // three-rung ladder and the best-effort contract.
 func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, decision approval.Decision) {
@@ -480,6 +612,14 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 		}
 	}
 
+	priorSteps, stepsDegrade := s.priorGroomingPartialSteps(ctx, rn)
+	if stepsDegrade != "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "grooming apply: partial-write evidence unavailable; no candidate will resume",
+			slog.String("run_id", stage.RunID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("reason", stepsDegrade))
+	}
+
 	req := workmgmt.GroomingApplyRequest{
 		Target:    target,
 		Report:    report,
@@ -492,6 +632,11 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 		// destructive.
 		GateApproved: gateApproved,
 		States:       conv.States,
+		// PriorSteps is the #2810 partial-write ledger: which steps a PRIOR
+		// grooming run's apply proved it landed before failing. Best-effort like
+		// every sibling in this block — an unreadable scan degrades to NO
+		// evidence, which reproduces pre-#2810 refuse/skip behaviour exactly.
+		PriorSteps: priorSteps,
 		// IceboxColumn stays empty: no conventions source declares one, and the
 		// issue forbids touching the work-management schema — so an approved
 		// decomposition entry records GroomingSkipIceboxColumnUnavailable rather
