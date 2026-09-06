@@ -22,9 +22,14 @@ package workmgmt
 //
 //	1. JOIN            a decision naming an entry that is not in the report —
 //	                   or a REPEATED decision for one entry, whose last-write-wins
-//	                   collapse would let array order decide authorization —
-//	                   REFUSES the whole apply (*GroomingJoinError), before any
-//	                   dispatch. AC1.
+//	                   collapse would let array order decide authorization — or a
+//	                   REPEATED ENTRY ID in the report itself, or one id carried by
+//	                   two DERIVED candidates, either of which would let one
+//	                   approval authorize two writes — REFUSES the whole apply
+//	                   (*GroomingJoinError), before any dispatch. AC1. The two
+//	                   id-repeat refusals are a deliberate fail-closed BEHAVIOUR
+//	                   CHANGE (#2809): an input that previously executed now
+//	                   refuses the whole apply and dispatches nothing.
 //	2. NOT APPROVED    a rejected/amended/undecided entry is recorded skipped
 //	                   and never dispatched. AC2.
 //	3. REPORT MODE     a report-mode class SURFACES its proposal and acts on
@@ -786,12 +791,121 @@ func groomingReportEntryIDs(report *plan.GroomingReport) map[string]struct{} {
 	return ids
 }
 
+// duplicateGroomingReportEntryID reports the first entry id the report carries
+// TWICE, walking the same six arrays groomingReportEntryIDs walks, in the same
+// order.
+//
+// It is a SEPARATE function from groomingReportEntryIDs on purpose: that
+// function returns a SET, and collapsing the ids into a set is exactly the step
+// that erases the repeat. The detection cannot live inside it without changing
+// its contract, so it lives beside it instead.
+func duplicateGroomingReportEntryID(report *plan.GroomingReport) (string, bool) {
+	if report == nil {
+		return "", false
+	}
+	seen := map[string]struct{}{}
+	check := func(id string) bool {
+		if _, dup := seen[id]; dup {
+			return true
+		}
+		seen[id] = struct{}{}
+		return false
+	}
+	for _, e := range report.Ordering {
+		if check(e.ID) {
+			return e.ID, true
+		}
+	}
+	for _, e := range report.Duplicates {
+		if check(e.ID) {
+			return e.ID, true
+		}
+	}
+	for _, e := range report.HygieneDefects {
+		if check(e.ID) {
+			return e.ID, true
+		}
+	}
+	for _, e := range report.DependencyEdges {
+		if check(e.ID) {
+			return e.ID, true
+		}
+	}
+	for _, e := range report.VisionDrift {
+		if check(e.ID) {
+			return e.ID, true
+		}
+	}
+	for _, e := range report.DecompositionSuggestions {
+		if check(e.ID) {
+			return e.ID, true
+		}
+	}
+	return "", false
+}
+
+// duplicateGroomingCandidateID reports the first entry id carried by TWO
+// derived candidates.
+//
+// Kept separate from duplicateGroomingReportEntryID rather than folded into one
+// pass so each control has a test that reddens on ITS OWN deletion; a single
+// merged check would be one control with two justifications and no way to tell
+// which side fired.
+func duplicateGroomingCandidateID(candidates []groomingCandidate) (string, bool) {
+	seen := make(map[string]struct{}, len(candidates))
+	for _, c := range candidates {
+		if _, dup := seen[c.entryID]; dup {
+			return c.entryID, true
+		}
+		seen[c.entryID] = struct{}{}
+	}
+	return "", false
+}
+
 // validateGroomingJoin is containment rule 1 (AC1). It refuses the WHOLE apply
 // — before any dispatch — when a decision names an entry id absent from the
-// report, when the SAME entry id carries more than one decision, or when a
-// derived candidate carries an id the report does not contain (a derivation
-// bug). Fail-closed by design: an unjoined or ambiguous mutation is a bug, not
-// a convenience, so there is no partial-execution path.
+// report, when the SAME entry id carries more than one decision, when the
+// REPORT carries one entry id twice, when a derived candidate carries an id the
+// report does not contain (a derivation bug), or when TWO derived candidates
+// carry one id. Fail-closed by design: an unjoined or ambiguous mutation is a
+// bug, not a convenience, so there is no partial-execution path.
+//
+// ORDER, as built (#2809). The function is two loops with a check between and a
+// check after: (i) the per-DECISION loop (unknown id, repeated decision),
+// unchanged; (ii) the REPORT-side duplicate-id check; (iii) the per-CANDIDATE
+// membership loop, unchanged; (iv) the CANDIDATE-side duplicate-id check. Only
+// one ordering constraint is load-bearing: REPORT-side must precede
+// CANDIDATE-side, because a duplicated report id makes every later membership
+// answer ambiguous — "is this candidate's id in the report" has no useful
+// meaning once the report says one id twice, so that must be reported as the
+// report defect it is rather than as whatever downstream symptom it produces.
+//
+// ONE ENTRY, ONE APPROVAL (#2809). An operator approves an entry ID, and the
+// apply layer turns that one approval into one write. Both new refusals defend
+// that arithmetic from opposite sides: a report carrying two entries under one
+// id would join ONE approved decision to TWO dispatches, and so would a
+// derivation that minted one id for two candidates.
+//
+// HONEST FRAMING, and the reason this is worth having: plan rule (a)
+// (backend/internal/plan/groomingreport.go) already refuses a duplicate-id
+// report at INGEST, so the production path cannot deliver such a report today.
+// This is a SECOND line of defence, not an open door. It earns its place
+// because the upstream control lives in a DIFFERENT PACKAGE, was written in a
+// different slice, and has its own future edits — trusting it is a DEPENDENCY,
+// not a control, and an authorization property must be established here rather
+// than inherited. Do not delete either check as redundant on the strength of
+// the upstream rule; TestValidateGroomingReport_RejectsHygieneCollisionDifferingOnlyInSuggestedFix
+// pins the two layers to AGREE rather than one to trust the other.
+//
+// REACHABILITY, stated rather than glossed: deriveGroomingMutations assigns
+// candidate.entryID = e.ID VERBATIM, so today every candidate collision is also
+// a report collision and the report-side check (ordered first) always wins —
+// check (iv) is NOT reachable through ApplyGrooming in the shipped tree. It is
+// deliberate defence in depth against a FUTURE derivation that mints or
+// transforms an id: the same scepticism this rule applies to trusting the
+// upstream validator, applied to trusting the derivation. It is pinned by a
+// direct unit test (TestValidateGroomingJoin_CandidateSideDuplicateIsRefused)
+// for exactly that reason.
 //
 // THE DUPLICATE CHECK IS AN AUTHORIZATION BOUNDARY, not tidiness (#2237
 // review). Decisions are indexed into a map keyed by entry id, and a map
@@ -816,10 +930,25 @@ func validateGroomingJoin(report *plan.GroomingReport, decisions []GroomingDecis
 		}
 		seen[d.EntryID] = struct{}{}
 	}
+	// (ii) REPORT-side: one entry id used by two entries. Ordered ahead of
+	// every candidate-side answer below because a repeated report id makes
+	// membership itself ambiguous.
+	if id, dup := duplicateGroomingReportEntryID(report); dup {
+		return &GroomingJoinError{EntryID: id,
+			Reason: "appears more than once in the report; one entry id carries one approval, so a repeated id would join a single approved decision to more than one dispatch"}
+	}
 	for _, c := range candidates {
 		if _, ok := ids[c.entryID]; !ok {
 			return &GroomingJoinError{EntryID: c.entryID, Reason: "derived a mutation but is not in the grooming report"}
 		}
+	}
+	// (iv) CANDIDATE-side: one id carried by two derived candidates. Not
+	// reachable through ApplyGrooming today (see the reachability note above);
+	// kept as defence in depth against a derivation that mints or transforms
+	// an id, and pinned directly.
+	if id, dup := duplicateGroomingCandidateID(candidates); dup {
+		return &GroomingJoinError{EntryID: id,
+			Reason: "derived more than one mutation under a single entry id; one approval must not authorize two writes"}
 	}
 	return nil
 }

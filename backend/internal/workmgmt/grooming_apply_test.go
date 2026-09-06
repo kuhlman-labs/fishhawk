@@ -637,6 +637,236 @@ func TestApplyGrooming_ContradictoryDuplicateDecisionsAreRefused(t *testing.T) {
 	}
 }
 
+// TestApplyGrooming_DuplicateReportEntryIDsAreRefused is the REPORT-side half
+// of the one-entry/one-approval boundary (#2809).
+//
+// The report carries TWO hygiene entries under ONE id and the operator sends
+// ONE approved decision for it. Without the check, derivation produces two
+// candidates, the single approval joins to BOTH, and one approval authorizes
+// two tracker writes.
+//
+// COMMITTED STATE FIRST, and never behind a t.Fatalf on the error: a refusal
+// that happened and a no-op that happened return a byte-identical envelope, so
+// the mutator call log is the discriminating assertion and the typed error is
+// the corroboration.
+func TestApplyGrooming_DuplicateReportEntryIDsAreRefused(t *testing.T) {
+	// Seeded BY CONSTRUCTION: two literal entries written with one id, rather
+	// than by calling the control in the test's own setup.
+	dup := hygieneEntry(1, "missing_label_namespace", "area:api")
+	second := hygieneEntry(1, "missing_label_namespace", "area:cli")
+	second.ID = dup.ID
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{dup, second}}
+
+	mut := &fakeGroomingMutator{}
+	sink := &fakeGroomingSink{}
+	res, err := ApplyGrooming(context.Background(), mut, &fakeGroomingReader{}, sink, GroomingApplyRequest{
+		Target:    groomingTarget(),
+		Report:    report,
+		Decisions: []GroomingDecision{{EntryID: dup.ID, Verdict: GroomingApproved}},
+		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:    groomingStates(),
+	})
+	if len(mut.calls) != 0 {
+		t.Errorf("mutator recorded %d dispatch(es) %v, want 0 — one approval must never authorize two writes",
+			len(mut.calls), mut.kinds())
+	}
+	if len(sink.records) != 0 {
+		t.Errorf("sink recorded %d rows, want 0 — nothing settled", len(sink.records))
+	}
+	if res != nil {
+		t.Errorf("result = %+v, want nil: a duplicate-id report runs nothing", res)
+	}
+	var je *GroomingJoinError
+	if !errors.As(err, &je) {
+		t.Fatalf("err = %v (%T), want *GroomingJoinError for a repeated report entry id", err, err)
+	}
+	if je.EntryID != dup.ID {
+		t.Errorf("join error names %q, want the repeated entry id %q", je.EntryID, dup.ID)
+	}
+	// The Reason string is the ONLY thing telling an operator WHICH control
+	// fired, so each control's reason is asserted by its own test.
+	if !strings.Contains(je.Reason, "appears more than once in the report") {
+		t.Errorf("Reason = %q, want the REPORT-side rule", je.Reason)
+	}
+}
+
+// TestValidateGroomingJoin_ReportSideDuplicateIsRefused discriminates the
+// report-side control directly.
+//
+// The end-to-end test above is caught by EITHER new check (a duplicate report
+// id also produces two candidates under one id), so it cannot tell them apart.
+// This vehicle is SINGLE-CAUSE: exactly ONE candidate is handed in for the
+// repeated id, so the candidate-side check cannot fire and only the
+// report-side one can.
+func TestValidateGroomingJoin_ReportSideDuplicateIsRefused(t *testing.T) {
+	dup := hygieneEntry(1, "missing_label_namespace", "area:api")
+	second := hygieneEntry(1, "missing_label_namespace", "area:cli")
+	second.ID = dup.ID
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{dup, second}}
+
+	err := validateGroomingJoin(report, nil, []groomingCandidate{
+		{entryID: dup.ID, reportClass: plan.GroomingClassHygiene, kind: GroomingKindLabelSet},
+	})
+	var je *GroomingJoinError
+	if !errors.As(err, &je) {
+		t.Fatalf("err = %v (%T), want *GroomingJoinError", err, err)
+	}
+	if je.EntryID != dup.ID {
+		t.Errorf("join error names %q, want %q", je.EntryID, dup.ID)
+	}
+	if !strings.Contains(je.Reason, "appears more than once in the report") {
+		t.Errorf("Reason = %q, want the REPORT-side rule", je.Reason)
+	}
+}
+
+// TestValidateGroomingJoin_ReportSideDuplicateIsRefusedInEveryClass walks the
+// SAME six arrays groomingReportEntryIDs walks. The claim being pinned is that
+// the report-side check covers ALL SIX — a check that only walked
+// hygiene_defects would pass the discriminating test above and still leave five
+// classes able to carry a repeated id into the join.
+//
+// Each row hands in exactly ONE candidate for the repeated id, so the
+// candidate-side check cannot fire and the row is single-cause.
+func TestValidateGroomingJoin_ReportSideDuplicateIsRefusedInEveryClass(t *testing.T) {
+	dupHygiene := hygieneEntry(1, "missing_label_namespace", "area:api")
+	dupHygieneB := hygieneEntry(1, "missing_label_namespace", "area:cli")
+	dupHygieneB.ID = dupHygiene.ID
+
+	cases := []struct {
+		name   string
+		report *plan.GroomingReport
+		id     string
+	}{
+		{
+			name:   "ordering",
+			report: &plan.GroomingReport{Ordering: []plan.OrderingEntry{orderingEntry(1, 1), orderingEntry(1, 2)}},
+			id:     orderingEntry(1, 1).ID,
+		},
+		{
+			name:   "duplicates",
+			report: &plan.GroomingReport{Duplicates: []plan.DuplicateCandidate{duplicateEntry(1, 2), duplicateEntry(1, 2)}},
+			id:     duplicateEntry(1, 2).ID,
+		},
+		{
+			name:   "hygiene_defects",
+			report: &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{dupHygiene, dupHygieneB}},
+			id:     dupHygiene.ID,
+		},
+		{
+			name:   "dependency_edges",
+			report: &plan.GroomingReport{DependencyEdges: []plan.DependencyEdge{dependencyEntry(1, 2), dependencyEntry(1, 2)}},
+			id:     dependencyEntry(1, 2).ID,
+		},
+		{
+			name:   "vision_drift",
+			report: &plan.GroomingReport{VisionDrift: []plan.VisionDriftFlag{visionDriftEntry(1), visionDriftEntry(1)}},
+			id:     visionDriftEntry(1).ID,
+		},
+		{
+			name:   "decomposition_suggestions",
+			report: &plan.GroomingReport{DecompositionSuggestions: []plan.DecompositionSuggestion{decompositionEntry(1), decompositionEntry(1)}},
+			id:     decompositionEntry(1).ID,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateGroomingJoin(tc.report, nil, []groomingCandidate{{entryID: tc.id}})
+			var je *GroomingJoinError
+			if !errors.As(err, &je) {
+				t.Fatalf("err = %v (%T), want *GroomingJoinError — %s is one of the six arrays the check must walk", err, err, tc.name)
+			}
+			if je.EntryID != tc.id {
+				t.Errorf("join error names %q, want %q", je.EntryID, tc.id)
+			}
+			if !strings.Contains(je.Reason, "appears more than once in the report") {
+				t.Errorf("Reason = %q, want the REPORT-side rule", je.Reason)
+			}
+		})
+	}
+
+	// NARROWNESS for the helper's own guards: a nil report and a report whose
+	// six arrays each carry a DISTINCT id must both pass the join, so neither
+	// the nil guard nor the six-array walk can be satisfied by refusing.
+	t.Run("nil report joins cleanly", func(t *testing.T) {
+		if err := validateGroomingJoin(nil, nil, nil); err != nil {
+			t.Errorf("validateGroomingJoin(nil, nil, nil) = %v, want nil", err)
+		}
+	})
+	t.Run("distinct ids across all six classes join cleanly", func(t *testing.T) {
+		report := &plan.GroomingReport{
+			Ordering:                 []plan.OrderingEntry{orderingEntry(1, 1), orderingEntry(2, 2)},
+			Duplicates:               []plan.DuplicateCandidate{duplicateEntry(3, 4)},
+			HygieneDefects:           []plan.HygieneDefect{hygieneEntry(5, "missing_label_namespace", "area:api")},
+			DependencyEdges:          []plan.DependencyEdge{dependencyEntry(6, 7)},
+			VisionDrift:              []plan.VisionDriftFlag{visionDriftEntry(8)},
+			DecompositionSuggestions: []plan.DecompositionSuggestion{decompositionEntry(9)},
+		}
+		if err := validateGroomingJoin(report, nil, deriveGroomingMutations(report)); err != nil {
+			t.Errorf("validateGroomingJoin over six distinct-id classes = %v, want nil", err)
+		}
+	})
+}
+
+// TestValidateGroomingJoin_CandidateSideDuplicateIsRefused discriminates the
+// candidate-side control.
+//
+// The candidates slice is HAND-BUILT and the colliding id appears exactly ONCE
+// in the report, so the report-side check passes and only the candidate-side
+// one can fire. This is the only construction that reaches it: the derivation
+// passes declared ids through verbatim, so through ApplyGrooming every
+// candidate collision is also a report collision and the report-side check
+// (ordered first) always wins. That unreachability is the reason the check is
+// unexported-but-same-package rather than exercised only end to end.
+func TestValidateGroomingJoin_CandidateSideDuplicateIsRefused(t *testing.T) {
+	entry := hygieneEntry(1, "missing_label_namespace", "area:api")
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{entry}}
+
+	err := validateGroomingJoin(report, nil, []groomingCandidate{
+		{entryID: entry.ID, reportClass: plan.GroomingClassHygiene, kind: GroomingKindLabelSet},
+		{entryID: entry.ID, reportClass: plan.GroomingClassHygiene, kind: GroomingKindLabelSet},
+	})
+	var je *GroomingJoinError
+	if !errors.As(err, &je) {
+		t.Fatalf("err = %v (%T), want *GroomingJoinError", err, err)
+	}
+	if je.EntryID != entry.ID {
+		t.Errorf("join error names %q, want %q", je.EntryID, entry.ID)
+	}
+	if !strings.Contains(je.Reason, "derived more than one mutation under a single entry id") {
+		t.Errorf("Reason = %q, want the CANDIDATE-side rule", je.Reason)
+	}
+}
+
+// TestApplyGrooming_DistinctEntryIDsStillApply is the NARROWNESS control for
+// the two refusals above. Without it a refuse-everything implementation passes
+// every other test in this set.
+func TestApplyGrooming_DistinctEntryIDsStillApply(t *testing.T) {
+	report := &plan.GroomingReport{
+		HygieneDefects: []plan.HygieneDefect{
+			hygieneEntry(1, "missing_label_namespace", "area:api"),
+			hygieneEntry(2, "missing_label_namespace", "area:cli"),
+		},
+	}
+	mut := &fakeGroomingMutator{}
+	res, err := ApplyGrooming(context.Background(), mut, &fakeGroomingReader{}, &fakeGroomingSink{}, GroomingApplyRequest{
+		Target:    groomingTarget(),
+		Report:    report,
+		Decisions: approveAll(report),
+		Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+		States:    groomingStates(),
+	})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	if len(mut.calls) != 2 {
+		t.Fatalf("mutator recorded %d dispatch(es) %v, want 2 — two DISTINCT approved entries must still both apply",
+			len(mut.calls), mut.kinds())
+	}
+	if res == nil || res.Summary.Applied != 2 {
+		t.Errorf("summary = %+v, want two applied", res)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // AC2 — rejected / amended / undecided
 // ---------------------------------------------------------------------------
