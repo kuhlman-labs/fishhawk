@@ -43,11 +43,20 @@ package workmgmt
 //	5. IDEMPOTENCE     every observable candidate is diffed against current
 //	                   state read through the WorkItemReader capability BEFORE
 //	                   dispatch, so re-applying an applied report dispatches
-//	                   nothing. AC7.
+//	                   nothing. AC7. ONE EXCEPTION, and it is evidence-gated
+//	                   (#2810): a candidate the PARTIAL-WRITE LEDGER proves this
+//	                   system half-wrote — and whose observed state is exactly
+//	                   the shape that half-write leaves — dispatches to finish
+//	                   step two. See groomingResumeStep.
 //	6. MANUAL PLACEMENT a board move whose card sits outside the expected
 //	                   source set is left alone — the same never-fight-the-human
 //	                   courtesy Transitioner honors, and icebox is routed
-//	                   through it (approval condition I2). AC6.
+//	                   through it (approval condition I2). AC6. The SAME
+//	                   evidence-gated exception applies (#2810): only positive
+//	                   ledger evidence that WE placed the card widens this, and
+//	                   only for a card left column-unset; absent that evidence
+//	                   this refuses exactly as before, which is what keeps a
+//	                   human's placement safe.
 //	7. AUDIT           every candidate — applied, failed AND skipped — produces
 //	                   an audit record, and a sink error surfaces AFTER the loop
 //	                   so nothing is silently unaudited. AC3.
@@ -174,6 +183,18 @@ type GroomingApplyRequest struct {
 	GateApproved map[string]bool
 	States       map[string]string
 	IceboxColumn string
+	// PriorSteps is EVIDENCE THIS SYSTEM PRODUCED (#2810), keyed by grooming
+	// entry id: the steps the MOST RECENT settled audit record for that entry
+	// reports as landed. It is the discriminator that makes a resume legitimate
+	// — the layer knows IT half-wrote the tracker, rather than inferring so from
+	// a state a human could equally have produced.
+	//
+	// ABSENT EVIDENCE CHANGES NOTHING. A nil or empty map reproduces pre-#2810
+	// behaviour exactly: a board move whose card a human already boarded still
+	// REFUSES with manual_placement_preserved, and a structurally-linked epic
+	// still settles as already_applied. Resume fires ONLY on positive evidence,
+	// never on the absence of contrary evidence.
+	PriorSteps map[string][]GroomingMutationStep
 }
 
 // GroomingOutcome is what happened to one candidate.
@@ -285,6 +306,13 @@ type GroomingMutationRecord struct {
 	Error              string               `json:"error,omitempty"`
 	ProviderResponse   string               `json:"provider_response,omitempty"`
 	IdempotenceChecked bool                 `json:"idempotence_checked"`
+	// StepsLanded names the steps of a MULTI-STEP mutation that DID land before
+	// the mutation failed (#2810) — the ledger a later apply reads back as proof
+	// that this system produced the half-written tracker state. It is populated
+	// ONLY on the failed arm, and only from a *PartialGroomingWriteError; every
+	// other outcome leaves it empty. The outcome stays `failed`: a half-written
+	// mutation is not an applied one.
+	StepsLanded []GroomingMutationStep `json:"steps_landed,omitempty"`
 }
 
 // GroomingApplySummary is the once-per-apply audit payload: the counts and the
@@ -1153,10 +1181,23 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 		rec.Before = observed
 		rec.IdempotenceChecked = true
 		mreq.Before = observed
-		if groomingSatisfied(c.kind, observed, mreq.After) {
+		// THE RESUME DECISION, COMPUTED ONCE (#2810) and consumed at BOTH of the
+		// two decision points below, so the board path and the epic path reach
+		// it through the SAME rule rather than through two rules that could
+		// answer one question differently.
+		resume, resuming := groomingResumeStep(c, item, observed, req)
+		if resuming {
+			// Mirrored to the provider so its own defence-in-depth re-check
+			// reproduces this decision instead of inventing a second one.
+			mreq.ResumeSteps = []GroomingMutationStep{resume}
+		}
+		if groomingSatisfied(c.kind, observed, mreq.After) && !resuming {
+			// An epic_link that is STRUCTURALLY satisfied but whose marker this
+			// system provably failed to write dispatches instead of settling —
+			// the write half that is genuinely missing is the marker.
 			return groomingSkipped(rec, GroomingSkipAlreadyApplied)
 		}
-		if c.kind.BoardPlacement() && !groomingPlacementAllowed(c.expectedFrom, item, req.States) {
+		if c.kind.BoardPlacement() && !groomingPlacementAllowed(c.expectedFrom, item, req.States) && !resuming {
 			// REFUSED, not skipped (#2860). This is the SAME refusal the
 			// provider makes in its own defence-in-depth re-check, decided one
 			// layer earlier; the two must agree in the audit or the outcome
@@ -1170,6 +1211,19 @@ func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req Groom
 	case err != nil:
 		rec.Outcome = GroomingOutcomeFailed
 		rec.Error = err.Error()
+		// THE LEDGER WRITE (#2810). A provider that landed step one and failed
+		// step two says so through a typed *PartialGroomingWriteError; stamping
+		// its steps here is what lets the NEXT apply resume on evidence instead
+		// of on an inference about tracker state. The outcome stays `failed` —
+		// the requested mutation did not happen — and Error carries the CAUSE's
+		// message so the audit reads as it did before, not as a wrapper string.
+		var partial *PartialGroomingWriteError
+		if errors.As(err, &partial) {
+			rec.StepsLanded = append([]GroomingMutationStep(nil), partial.Steps...)
+			if partial.Cause != nil {
+				rec.Error = partial.Cause.Error()
+			}
+		}
 	case res == nil:
 		// A provider that returns neither a result nor an error told us
 		// nothing; recording it applied would be a fabrication.
@@ -1485,6 +1539,96 @@ func groomingBodyMarkerValues(body, marker string) []string {
 		out = append(out, strings.TrimSpace(trimmed[len(marker):]))
 	}
 	return out
+}
+
+// groomingStepLanded reports whether the ledger positively names step as landed
+// for entryID. It is the ONE place PriorSteps is consulted, and it fails CLOSED
+// on every degenerate input — nil map, absent entry, empty slice — because the
+// resume it authorizes overrides a containment rule.
+func groomingStepLanded(req GroomingApplyRequest, entryID string, step GroomingMutationStep) bool {
+	for _, s := range req.PriorSteps[entryID] {
+		if s == step {
+			return true
+		}
+	}
+	return false
+}
+
+// groomingResumeStep is THE resume rule (#2810), shared by both multi-step
+// paths: it returns the step to resume and whether a resume is authorized at
+// all. One function with one arm per step, rather than a resume decision made
+// separately on each path — the issue's own warning is that answering the
+// convergence question per path "would produce two answers to one question".
+//
+// The OBSERVABLE consequence of that sharing, which is what the tests assert:
+// deleting the SAME evidence predicate below reddens BOTH paths' resume tests,
+// and the same shape of evidence record drives both.
+//
+// EVERY CONDITION IS LOAD-BEARING and each has its own counterfactual test:
+//
+//   - board (a): the kind moves a card, the expected-from set is EMPTY, the item
+//     is ON the board, its column is UNSET, and the ledger names
+//     board_item_added. That conjunction is EXACTLY the shape a failed
+//     add-then-set leaves.
+//   - epic (b): the structural parent already records the proposal, the proposed
+//     ref is ABSENT from the observed marker refs, and the ledger names
+//     epic_edge_added. That conjunction is exactly the shape a failed
+//     link-then-mark leaves.
+//
+// ABSENT AND DIVERGENT ARE NOT THE SAME MARKER STATE, and arm (b) does not
+// separate them: "the proposed ref is absent from the observed refs" is also
+// true of a body naming a DIFFERENT parent. The discrimination is made at the
+// WRITE site instead, where the marker values are read fresh under the same
+// request that patches them — groomingLinkEpic refuses a divergent marker with
+// a *ParentEpicConflictError rather than stamping over it. Deciding it here off
+// the pre-dispatch read would decide it on a stale snapshot, and the resume it
+// authorizes is a write.
+//
+// WHY THE BOARD ARM REQUIRES AN EMPTY EXPECTED-FROM SET. A NON-empty set is the
+// icebox arm: a SINGLE-step move of a card that is ALREADY on the board, which
+// has no partial-write shape to resume at all. Admitting it would reroute icebox
+// moves this change deliberately does not touch — an icebox card sitting outside
+// its expected source set must keep refusing, evidence or not.
+//
+// WHAT THE LEDGER PROVES AND DOES NOT. It proves this system STARTED the
+// mutation; it does not prove nothing else touched the item since. The residual
+// (a human who removes our half-placed card and re-adds it column-unset between
+// the failed apply and the retry) is bounded by the latest-record-wins staleness
+// rule the server applies to the evidence and by the requirement that the
+// observed shape match the half-write EXACTLY, and is stated in the package
+// README rather than implied away.
+func groomingResumeStep(c groomingCandidate, item *WorkItemRecord, observed GroomingValue,
+	req GroomingApplyRequest) (GroomingMutationStep, bool) {
+	// (a) BOARD: a half-placed card — on the board, no column.
+	if c.kind.BoardPlacement() && len(c.expectedFrom) == 0 && item != nil &&
+		item.OnBoard && strings.TrimSpace(item.BoardColumn) == "" &&
+		groomingStepLanded(req, c.entryID, GroomingStepBoardItemAdded) {
+		return GroomingStepBoardItemAdded, true
+	}
+	// (b) EPIC: a half-linked item — structural edge present, marker absent.
+	if c.kind == GroomingKindEpicLink &&
+		NormalizeIssueRef(observed.Scalar) != "" &&
+		NormalizeIssueRef(observed.Scalar) == NormalizeIssueRef(c.after.Scalar) &&
+		!groomingMarkerNames(observed.List, c.after.Scalar) &&
+		groomingStepLanded(req, c.entryID, GroomingStepEpicEdgeAdded) {
+		return GroomingStepEpicEdgeAdded, true
+	}
+	return "", false
+}
+
+// groomingMarkerNames reports whether any observed marker ref normalizes to
+// want — the "is the marker already correct?" half of the epic resume arm.
+func groomingMarkerNames(markers []string, want string) bool {
+	w := NormalizeIssueRef(want)
+	if w == "" {
+		return false
+	}
+	for _, m := range markers {
+		if NormalizeIssueRef(m) == w {
+			return true
+		}
+	}
+	return false
 }
 
 // groomingPlacementAllowed is the never-fight-the-human courtesy (AC6),

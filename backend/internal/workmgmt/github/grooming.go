@@ -280,7 +280,10 @@ func (p *Provider) groomingSetLabels(ctx context.Context, req workmgmt.GroomingM
 // THE FIVE-BRANCH LADDER, in precedence:
 //  1. structural parent present, != proposal -> *ParentEpicConflictError naming
 //     the structural parent; zero writes.
-//  2. structural parent present, == proposal -> Skipped; zero writes.
+//  2. structural parent present, == proposal -> Skipped; zero writes. With
+//     #2810 ledger evidence and NO marker this is instead the marker-only
+//     RESUME; with evidence and a DIVERGENT marker it is a
+//     *ParentEpicConflictError, never a resume (see the branch).
 //  3. no structural parent, marker(s) present, none naming the proposal ->
 //     *ParentEpicConflictError (a STATED RESIDUAL, #2237's invariant: never
 //     leave the body claiming one parent while the graph holds another; the
@@ -345,6 +348,54 @@ func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMu
 	// Branches 1 & 2: a structural parent decides on its own.
 	if structuralRef != "" {
 		if renderParentEpicMarker(structuralRef) == want {
+			// THE EPIC RESUME (#2810): the edge records the proposed parent but
+			// no marker names it, AND the ledger proves THIS SYSTEM landed the
+			// edge and failed the marker. Write ONLY the marker — no
+			// IssueNodeID, no second AddSubIssue — and report Applied.
+			//
+			// Without that evidence this branch is byte-identical to its
+			// pre-#2810 shape: skip, `parent epic already linked`. A marker a
+			// human removed is indistinguishable from one we never wrote, and
+			// settling is the fail-closed answer there.
+			if req.ResumeAuthorized(workmgmt.GroomingStepEpicEdgeAdded) && !markerNames(markers, want) {
+				// A DIVERGENT marker is not the half-write's shape and must not
+				// be resumed over. `!markerNames` is true for BOTH an absent
+				// marker and one naming a different parent, and the two need
+				// opposite answers: ensureParentEpicMarker is idempotent on the
+				// MARKER, not on the parent, so a body already carrying
+				// `Parent epic: #other` comes back UNCHANGED — the PATCH would
+				// write the same bytes and this branch would report Applied
+				// while the body still claims a different parent. Refuse with
+				// the same typed conflict branch 3 uses for the mirror-image
+				// state, so #2237's invariant (never leave the body claiming one
+				// parent while the graph holds another) holds on the resume path
+				// too. The candidate is recorded FAILED with no steps_landed,
+				// which also erases the stale evidence — the ledger proved we
+				// landed the edge, not that this body is ours to overwrite.
+				if len(markers) > 0 {
+					return nil, &ParentEpicConflictError{Number: number,
+						Current: strings.Join(markers, ", "), Proposed: wantRef}
+				}
+				updated := ensureParentEpicMarker(issue.Body, parent)
+				if _, uerr := p.api.UpdateIssue(ctx, req.Target.Scope, repo, number,
+					githubclient.UpdateIssueParams{Body: &updated}); uerr != nil {
+					// A FAILED RESUME IS STILL A HALF-WRITE (the board arm
+					// carries the mirror of this comment). A plain error would
+					// settle the entry failed-WITHOUT-steps, and latest-record-
+					// wins would erase the evidence that got us here — every
+					// later apply would then read an empty ledger and take the
+					// already-linked skip, never converging to a marker. The
+					// edge is still recorded and the marker still absent, so the
+					// honest record is the SAME landed step as before.
+					return nil, &workmgmt.PartialGroomingWriteError{
+						Steps: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepEpicEdgeAdded},
+						Cause: fmt.Errorf("workmgmt/github: record parent epic on #%d: %w", number, uerr),
+					}
+				}
+				return &workmgmt.GroomingMutationResult{Applied: true, Observed: observed,
+					ProviderResponse: fmt.Sprintf("resumed the half-written epic link of #%d: stamped the %s marker (%s)",
+						number, want, workmgmt.GroomingStepEpicEdgeAdded)}, nil
+			}
 			// The sub-issue edge already records the proposed parent, so
 			// re-linking would be a duplicate dispatch.
 			return &workmgmt.GroomingMutationResult{Skipped: true, SkipReason: "parent epic already linked",
@@ -358,14 +409,8 @@ func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMu
 	}
 
 	// No structural parent from here. Decide branches 3–5 from the marker.
-	markerAlreadyCorrect := false
+	markerAlreadyCorrect := markerNames(markers, want)
 	if len(markers) > 0 {
-		for _, cur := range markers {
-			if renderParentEpicMarker(cur) == want {
-				markerAlreadyCorrect = true // Branch 4
-				break
-			}
-		}
 		if !markerAlreadyCorrect {
 			// Branch 3 (stated residual): a divergent marker with no structural
 			// parent is refused, not linked on the marker's authority — a marker
@@ -392,7 +437,15 @@ func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMu
 		updated := ensureParentEpicMarker(issue.Body, parent)
 		if _, err := p.api.UpdateIssue(ctx, req.Target.Scope, repo, number,
 			githubclient.UpdateIssueParams{Body: &updated}); err != nil {
-			return nil, fmt.Errorf("workmgmt/github: record parent epic on #%d: %w", number, err)
+			// HALF-WRITTEN (#2810): linkEpic SUCCEEDED above, so the structural
+			// edge IS recorded and only the marker write failed. The typed error
+			// carries that as ledger evidence, so the next apply resumes the
+			// marker instead of settling the candidate as already-linked and
+			// never converging to a marker-bearing body.
+			return nil, &workmgmt.PartialGroomingWriteError{
+				Steps: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepEpicEdgeAdded},
+				Cause: fmt.Errorf("workmgmt/github: record parent epic on #%d: %w", number, err),
+			}
 		}
 	}
 	return &workmgmt.GroomingMutationResult{Applied: true, Observed: observed,
@@ -439,6 +492,19 @@ func ensureParentEpicMarker(body, ref string) string {
 		return marker
 	}
 	return strings.TrimRight(body, "\n") + "\n\n" + marker
+}
+
+// markerNames reports whether any of the body's `Parent epic:` marker values
+// renders to the SAME marker line as want. It is the one marker-vs-proposal
+// comparison, shared by the branch-4 discrimination and the branch-1 resume so
+// the two cannot answer "is the marker already correct?" differently.
+func markerNames(markers []string, want string) bool {
+	for _, cur := range markers {
+		if renderParentEpicMarker(cur) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // parentEpicMarkerValues returns the reference on EVERY `Parent epic:` body
@@ -559,7 +625,15 @@ func (p *Provider) groomingMoveCard(ctx context.Context, req workmgmt.GroomingMu
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: resolve project fields: %w", err)
 	}
-	if _, ok := meta.StatusOptions[column]; !ok {
+	// THE ONE COLUMN VALIDATION, and it is deliberately the ONLY one: the
+	// resolved option id is BOUND here and reused by the resume write below,
+	// rather than looked up a second time at that write. A second lookup could
+	// go unguarded (and did, until this was hoisted), sending an EMPTY optionId
+	// to SetProjectItemSingleSelect against a board whose option was renamed
+	// away — the induction the live-validation walk in README.md recommends.
+	// Binding once makes that unrepresentable instead of merely checked twice.
+	optionID, ok := meta.StatusOptions[column]
+	if !ok {
 		return nil, &UnsupportedGroomingKindError{Kind: req.Kind,
 			Detail: fmt.Sprintf("target column %q is not a %s option on the project; available: %s",
 				column, statusFieldName, strings.Join(sortedKeys(meta.StatusOptions), ", "))}
@@ -573,7 +647,12 @@ func (p *Provider) groomingMoveCard(ctx context.Context, req workmgmt.GroomingMu
 		return nil, fmt.Errorf("workmgmt/github: read project item status for #%d: %w", number, err)
 	}
 	observed := workmgmt.GroomingValue{Scalar: item.Status}
-	if !groomingSourceAllows(req.ExpectedFrom, item, req.States) {
+	// THE RESUME MIRROR (#2810). groomingSourceAllows itself is NOT edited — the
+	// icebox arm and the never-fight-the-human arm stay byte-identical — and the
+	// resume is OR-ed in alongside it, so a refusal is widened only by POSITIVE
+	// ledger evidence that this system left the card half-placed.
+	resuming := groomingResumeAllows(req, item)
+	if !groomingSourceAllows(req.ExpectedFrom, item, req.States) && !resuming {
 		// REFUSED, not skipped (#2860): a board move the provider DECLINED to
 		// perform because a human placed the card elsewhere. That is not an
 		// idempotent no-op and must not read as one in the audit.
@@ -595,12 +674,79 @@ func (p *Provider) groomingMoveCard(ctx context.Context, req workmgmt.GroomingMu
 	// been raised as one. TestApplyGroomingMutation_BoardWriteUsesTheProjectsToken
 	// asserts the write actually receives the opt-in, so this is a covered
 	// claim rather than a comment asserting its own correctness.
+	if resuming {
+		// THE RESUME WRITE: set the column DIRECTLY against the item id the
+		// pre-write ProjectItemStatus read already returned — the same primitive
+		// groomingSetField uses in production — instead of re-entering
+		// placeIssueOnBoard.
+		//
+		// WHY NOT RE-ADD. The card is already on the board, so re-adding it is
+		// both unnecessary and a NEW third-party semantic claim (that
+		// addProjectV2ItemById is idempotent for an already-added card) that
+		// #2810 deliberately does not make. The convergence test asserts NO
+		// AddItem call is made on the resuming apply, so that is a covered
+		// property rather than a comment asserting its own correctness.
+		//
+		// optionID is the one the pre-write validation above already resolved
+		// and PROVED present, so this write can never carry an empty option id.
+		if err := p.api.SetProjectItemSingleSelect(boardCtx, req.Target.Scope, meta.ProjectID, item.ItemID, meta.FieldID, optionID); err != nil {
+			// A FAILED RESUME IS STILL A HALF-WRITE, and must say so. Returning
+			// a plain error here would settle the entry with a
+			// failed-WITHOUT-steps record, and under the latest-record-wins
+			// bound that erases the very evidence this resume depends on —
+			// every later apply would then see an empty ledger and fall back to
+			// the permanent manual_placement_preserved refusal, reintroducing
+			// the non-convergence #2810 exists to fix. The shape on the forge is
+			// UNCHANGED (still on-board, still column-unset), so the honest
+			// record is the SAME landed step the first failure recorded.
+			return nil, &workmgmt.PartialGroomingWriteError{
+				Steps: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepBoardItemAdded},
+				Cause: fmt.Errorf("workmgmt/github: resume column write on #%d: %w", number, err),
+			}
+		}
+		return &workmgmt.GroomingMutationResult{Applied: true, Observed: observed,
+			ProviderResponse: fmt.Sprintf("resumed the half-written board placement of #%d: set the column to %q (%s)",
+				number, column, workmgmt.GroomingStepBoardItemAdded)}, nil
+	}
 	if err := placeIssueOnBoard(ctx, p.api, req.Target.Scope, proj, column,
 		&githubclient.CreatedIssue{Number: number, NodeID: nodeID}); err != nil {
+		// CONVERT the board half-write into the provider-neutral ledger
+		// evidence the apply layer stamps onto the audit row (#2810). Any other
+		// error is returned UNCHANGED.
+		var step *boardPlacementStepError
+		if errors.As(err, &step) {
+			return nil, &workmgmt.PartialGroomingWriteError{
+				Steps: []workmgmt.GroomingMutationStep{step.Landed},
+				Cause: step.Cause,
+			}
+		}
 		return nil, err
 	}
 	return &workmgmt.GroomingMutationResult{Applied: true, Observed: observed,
 		ProviderResponse: fmt.Sprintf("moved #%d to %q", number, column)}, nil
+}
+
+// groomingResumeAllows is the PROVIDER-SIDE mirror of the core's board resume
+// arm (#2810): the same four conditions, asked of the provider's own read.
+//
+// It is defence in depth, not a second decision: the core has already decided,
+// and mirroring rather than re-deriving is what keeps the two layers from
+// disagreeing about the same question. It fails CLOSED on every degenerate
+// input, and — critically — requires POSITIVE ledger evidence in ResumeSteps, so
+// a direct ApplyGroomingMutation call that bypasses the core cannot resume.
+func groomingResumeAllows(req workmgmt.GroomingMutationRequest, item *githubclient.ProjectItemStatus) bool {
+	if item == nil || !req.Kind.BoardPlacement() {
+		return false
+	}
+	if len(req.ExpectedFrom) != 0 {
+		// The icebox arm: a single-step move of an already-boarded card, which
+		// has no partial-write shape to resume. Never rerouted.
+		return false
+	}
+	if !item.OnBoard || strings.TrimSpace(item.Status) != "" {
+		return false
+	}
+	return req.ResumeAuthorized(workmgmt.GroomingStepBoardItemAdded)
 }
 
 // groomingSourceAllows is the provider-side expected-source re-check, applied

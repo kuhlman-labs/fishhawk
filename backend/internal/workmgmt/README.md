@@ -98,7 +98,7 @@ The per-forge board capability matrix ADR-064 requires lives in ONE referenceabl
 | 2 | **Not approved** (AC2) | `rejected` / `amended` / no-decision / an unrecognized verdict are recorded skipped and never dispatched | `TestApplyGrooming_RejectedAndAmendedEntriesAreNotApplied`, `..._UnrecognizedVerdictIsNotAnApproval` |
 | 3 | **Report mode** (inherited #2236 AC7) | A `report`-mode class SURFACES its proposal and acts on nothing. Surfacing is BOTH sides: it still performs the pre-dispatch READ so `Before` carries the current value next to the proposed `After`, and the resolved item ref is recorded even when resolution itself ended in a skip. Checked **BEFORE** any gate-approval check — see below. It never parks: `ApplyGrooming` has no awaiting-decision return path | `TestApplyGrooming_ReportModeSurfacesAndDoesNotAct`, `..._ReportModeSurfacesBeforeDespiteAReadFailure`, `..._SurfacedRecordNamesItsSubjectWhenResolutionSkips`, the report-mode row of `..._EveryMutationIsAudited`, and the `report+gate-approved` rows of the destructive table |
 | 4 | **Destructive authorization** (AC5) | `close_duplicate` / `close_not_planned` / `icebox` dispatch only under mode `auto` + an approved entry, or an explicit per-entry `GateApproved`. An absent or unrecognized class mode resolves to `gated` | `TestApplyGrooming_DestructiveKindRequiresAutoOrGateApproval` (table over both destructive kinds) |
-| 5 | **Idempotence** (AC7) | Every OBSERVABLE candidate is diffed against current state read through `WorkItemReader` before dispatch; an already-satisfied proposal is skipped `already_applied`. A reader degradation fails the candidate CLOSED — never a blind dispatch | `TestApplyGrooming_ReApplyingAnAppliedReportIsANoOp`, `..._ReaderUnavailableFailsCandidateClosed`, `..._NilReaderFailsObservableCandidatesClosed`, `..._MarkerObservationMatchesTheProviderParse`, `..._SecondDependencyEdgeIsSettledByTheProviderSkip` |
+| 5 | **Idempotence** (AC7) | Every OBSERVABLE candidate is diffed against current state read through `WorkItemReader` before dispatch; an already-satisfied proposal is skipped `already_applied`. A reader degradation fails the candidate CLOSED — never a blind dispatch. **One evidence-gated exception (#2810)**: a candidate the partial-write ledger proves this system half-wrote dispatches to finish step two — see "Convergence after a partial write" | `TestApplyGrooming_ReApplyingAnAppliedReportIsANoOp`, `..._ReaderUnavailableFailsCandidateClosed`, `..._NilReaderFailsObservableCandidatesClosed`, `..._MarkerObservationMatchesTheProviderParse`, `..._SecondDependencyEdgeIsSettledByTheProviderSkip` |
 | 6 | **Manual placement** (AC6) | A board move whose card sits outside the expected source set is left alone — the same never-fight-the-human courtesy `Transitioner` honors. **Icebox is routed through it** | `TestApplyGrooming_ManualBoardPlacementIsPreserved` (paired refuse/dispatch cases for `board_place` AND `icebox`) |
 | 7 | **Audit** (AC3) | One record per SETTLED candidate — applied, failed AND skipped — written immediately so a mid-run failure leaves everything before it audited; a sink error is collected and surfaced as `*GroomingAuditError` AFTER the loop | `TestApplyGrooming_EveryMutationIsAudited`, `..._AuditSinkErrorSurfacesAfterLoop`, `..._SummarySinkErrorSurfaces` |
 | 8 | **Delegation tier** (#2855) | A hygiene `label_set` proposing a label in the `autonomy:` DELEGATION-TIER namespace — the label deciding whether an agent may drive the item AT ALL — dispatches ONLY under an explicit per-entry `GateApproved`. Unlike rule 4 it does **NOT** accept mode `auto`: auto is exactly the authority this repository grants `hygiene`, and a tier write is exactly what that authority must not extend to. The refusal is an AUDITED skip (`delegation_tier_not_authorized`) carrying every proposed label on `After`, so the suggestion stays visible and the entry resurfaces. LADDER POSITION: between rule 4 and the pre-dispatch read — AFTER rule 3 so report mode still short-circuits first, BEFORE the resolution-skip return so a resolution skip cannot mask it | `TestGroomingApply_DelegationTierLabelRefusedUnderModeAuto`, `..._DelegationTierLabelAppliedUnderPerEntryGateApproval`, `..._DelegationTierRefusalIsCaseInsensitive`, `..._ReportModeBeatsDelegationTierRefusal` (the ungranted sub-case discriminates the AFTER-rule-3 half of the POSITION), `..._DelegationTierRefusalBeatsResolutionSkip` (the BEFORE-the-resolution-skip half — a tier proposal on an unresolvable ref must report the tier reason, not `item_ref_unresolvable`; its non-tier sub-case is the fixture control), `..._NonDelegationLabelsUnaffected` (narrowness control), `..._DelegationTierRefusalLeavesBaselineUnaffected`, `TestLabelsSetDelegationTier`, and the cross-boundary `server.TestApproveGroomStage_DelegationTierLabelNotApplied` |
@@ -134,7 +134,7 @@ The label rule is deliberately **stricter than the forge** — GitHub accepts `g
 
 **Exactly one of `Applied`/`Skipped`/`Refused` must be true, and the apply layer VALIDATES it.** `settleGroomingCandidate` turns `GroomingMutationResult` straight into the load-bearing audit outcome, so a malformed result becomes a false audit row. An ALL-FALSE result previously fell through to the applied-by-default arm and recorded a tracker write that provably did not happen; a multi-true result was recorded skipped, hiding a provider that believes it wrote. Every non-single-true combination is now recorded FAILED with an error naming all three booleans, pinned by `TestApplyGrooming_MalformedProviderResultIsFailedNotFabricated`, by `TestApplyGrooming_MalformedResultFailsForEachRejectedCombination` (one case per rejected combination: all-false, applied+skipped, applied+refused, skipped+refused, all-true) and by `TestGroomingMutationResult_ExactlyOneOfThree`, an exhaustive eight-row table driving the SAME `WellFormed` predicate the validator consults so the rule and its test cannot drift.
 
-**`refused` is a FOURTH outcome, distinct from `skipped` (#2860).** A skip is a no-op the layer OBSERVED as already-satisfied; a refusal is a requested write the provider DECLINED, leaving nothing changed and nothing already correct. Folding the two together is how an 0/8 grooming apply rate went unnoticed across three walks: every refused edge was audited as an ordinary no-op. `GroomingMutationRecord.RefuseReason`, the `GroomingApplyResult.Refused` bucket and `GroomingApplySummary.Refused` / `RefusedIDs` carry the distinction into the audit, and `refused_ids` NAMES which entries were declined rather than only counting them. The provider-side refusals are `manual_placement_preserved` and `not on board`; the core's pre-dispatch placement guard reports the SAME refusal one layer earlier, so the two agree whichever notices first. The containment ladder (`not_approved`, `mode_report_surface_only`, `destructive_not_authorized`, `delegation_tier_not_authorized`, `already_applied`, …) is UNCHANGED and stays `skipped` — this adds an outcome for provider-side write refusals, it does not re-classify authorization.
+**`refused` is a FOURTH outcome, distinct from `skipped` (#2860).** A skip is a no-op the layer OBSERVED as already-satisfied; a refusal is a requested write the provider DECLINED, leaving nothing changed and nothing already correct. Folding the two together is how an 0/8 grooming apply rate went unnoticed across three walks: every refused edge was audited as an ordinary no-op. `GroomingMutationRecord.RefuseReason`, the `GroomingApplyResult.Refused` bucket and `GroomingApplySummary.Refused` / `RefusedIDs` carry the distinction into the audit, and `refused_ids` NAMES which entries were declined rather than only counting them. The provider-side refusals are `manual_placement_preserved` and `not on board`; the core's pre-dispatch placement guard reports the SAME refusal one layer earlier, so the two agree whichever notices first. Since #2810 `manual_placement_preserved` is widened by exactly one evidence-gated case — a card the partial-write ledger proves WE boarded and left column-unset resumes instead of refusing — and both layers apply that same widening, so they still agree. The containment ladder (`not_approved`, `mode_report_surface_only`, `destructive_not_authorized`, `delegation_tier_not_authorized`, `already_applied`, …) is UNCHANGED and stays `skipped` — this adds an outcome for provider-side write refusals, it does not re-classify authorization.
 
 **Continue and report, never abort (AC4).** A provider error records the candidate FAILED and the loop moves on; there is no abort path. Abort was rejected because a half-executed apply that stops at the first forge hiccup leaves the tracker in a state nobody enumerated, while continue-and-report leaves a complete, audited account of what landed and what did not. `TestApplyGrooming_ContinuesPastAMidRunProviderFailure` errors on the third of five candidates and asserts all five settled and were audited.
 
@@ -147,7 +147,7 @@ The label rule is deliberately **stricter than the forge** — GitHub accepts `g
 
 - **The `already_applied` fix RE-SURFACES the masked entries — that is the intended direction.** Removing a false `already_applied` skip means `docs/spec/work-management-v0.md`'s three-state churn baseline (which counts an `already_applied` skip as `applied`, suppressing re-proposal) no longer suppresses these entries: a now-failed row is `absent` from the baseline, so the six #389 entries correctly re-surface on the next groom until the 100 sub-issue cap itself is decided (out of scope here).
 - **A SECOND `depends_on` edge out of the same item is now WRITTEN ADDITIVELY (#2860).** It used to be settled by the PROVIDER's presence check: `ensureDependsOnMarker` writes a marker only when the body carries NONE, so once `#1` recorded `Depends on: #5` every later approved edge out of `#1` came back `depends_on marker already present` — a REFUSAL audited as an indistinguishable no-op, which is how a MEASURED 0/8 apply rate survived three grooming walks. The amend path now calls the separately-named `github.appendDependsOnRef`, which merges the ref into the existing marker line, and the presence-vs-MEMBERSHIP question is decided in ONE place: `NormalizeIssueRef` (exported from `grooming_apply.go`) is the single cross-layer normalizer both `workmgmt` and `workmgmt/github` call, so the layer that writes and the layer that reads can no longer disagree about ref shape. A ref genuinely already recorded is still a skip — but that provider-side skip is reachable only when the two layers DISAGREE (a body mutated between read and write), because `groomingSatisfied` asks the same membership question first and short-circuits to `already_applied`. The filing path's `ensureDependsOnMarker` is UNCHANGED and keeps its never-double-stamp contract (E34.3 / #1594): two named helpers, not one helper with a mode flag. Pinned by `TestApplyGrooming_SecondDependencyEdgeIsWrittenAdditively` here and by `github/grooming_test.go::TestApplyGroomingMutation_SecondDependsOnEdgeIsWrittenThenSettles` (real provider, one PATCH, then a re-apply settling at `already_applied` with ZERO dispatch). **The one-normalizer property itself is pinned AT THE SEAM, not at either layer alone**: a non-numeric ref cannot be DISPATCHED at all (`groomingResolveItemRef` refuses an out-of-repo target and emits `#N` for an in-repo one), so no apply's OUTCOME can turn on how a non-numeric PROPOSAL normalizes and no such test can exist; what is reachable is a body already CARRYING non-numeric refs being READ by both layers, so `github/grooming_test.go::TestApplyGroomingMutation_MembershipVerdictAgreesAcrossLayersForNonNumericRefs` asserts the CORE's membership set (end to end, out of the audited record's `Before.List`) and the PROVIDER's (`dependsOnMarkerRefs`) against ONE hard-coded literal over the same bytes and then against each other. Each seeded body carries BOTH collapsible shapes of one cross-repo ref (`other/repo#1639` and `#other/repo#1639`), so the rejected two-normalizer design collapses them onto one value and reddens both rows — which the outcome and persisted-body assertions alone do NOT catch, since the proposal is numeric and the splice preserves the surrounding bytes.
-- **An `epic_link` onto an item that already names a DIFFERENT parent is REFUSED, not corrected and not skipped.** `github.groomingLinkEpic` runs a five-branch ladder keyed on the STRUCTURAL parent (#2952): (1) structural parent present and ≠ proposal → typed `*github.ParentEpicConflictError` naming the STRUCTURAL parent, zero writes; (2) structural parent present and = proposal → skipped, zero writes; (3) no structural parent, a marker naming a DIFFERENT epic → `*ParentEpicConflictError` (a STATED RESIDUAL — the issue's own fixtures all carry a matching marker, and #2237's invariant forbids leaving the body claiming one parent while the graph holds another); (4) no structural parent, a marker already naming the proposal → TAKE THE WRITE PATH (`AddSubIssue` links the missing edge, the body PATCH is skipped since the marker is correct) — this is the #819/#821/#930 case; (5) no structural parent, no marker → both writes. It refuses rather than re-parents in branches 1 and 3 because the provider has no primitive to re-parent with — `AddSubIssue` only ADDS an edge, and there is no removal or replace-parent option. Pinned by `github/grooming_test.go`'s `..._EpicLinkStructuralConflict` (branch 1), `..._EpicLinkStructuralParentAlreadyLinkedSkips` (branch 2), `..._EpicLinkRefusesADifferentExistingParent` (branch 3), `..._EpicLinkBodyMarkerWithoutTheEdgeStillLinks` (branch 4), `..._EpicLinkPersistsBothTheEdgeAndTheMarker` (branch 5), `..._EpicLinkWithoutTheParentPrimitiveIsRefused` (the `ReasonNotImplemented` fail-closed) and `..._EpicLinkMatchesTheParentAcrossRefShapes` as the normalization control.
+- **An `epic_link` onto an item that already names a DIFFERENT parent is REFUSED, not corrected and not skipped.** `github.groomingLinkEpic` runs a five-branch ladder keyed on the STRUCTURAL parent (#2952): (1) structural parent present and ≠ proposal → typed `*github.ParentEpicConflictError` naming the STRUCTURAL parent, zero writes; (2) structural parent present and = proposal → skipped, zero writes — **UNLESS the #2810 partial-write ledger proves this system landed the edge and failed the marker AND the body carries NO marker at all, in which case the marker ALONE is written (no second `AddSubIssue`) and the candidate reports applied; a body carrying a marker naming a DIFFERENT epic is REFUSED with the same `*ParentEpicConflictError` as branch 3, never stamped over — `ensureParentEpicMarker` is idempotent on the MARKER, not on the parent, so resuming would PATCH identical bytes and audit `applied` over a divergent body**; (3) no structural parent, a marker naming a DIFFERENT epic → `*ParentEpicConflictError` (a STATED RESIDUAL — the issue's own fixtures all carry a matching marker, and #2237's invariant forbids leaving the body claiming one parent while the graph holds another); (4) no structural parent, a marker already naming the proposal → TAKE THE WRITE PATH (`AddSubIssue` links the missing edge, the body PATCH is skipped since the marker is correct) — this is the #819/#821/#930 case; (5) no structural parent, no marker → both writes. It refuses rather than re-parents in branches 1 and 3 because the provider has no primitive to re-parent with — `AddSubIssue` only ADDS an edge, and there is no removal or replace-parent option. Pinned by `github/grooming_test.go`'s `..._EpicLinkStructuralConflict` (branch 1), `..._EpicLinkStructuralParentAlreadyLinkedSkips` (branch 2), `..._EpicLinkRefusesADifferentExistingParent` (branch 3), `..._EpicLinkBodyMarkerWithoutTheEdgeStillLinks` (branch 4), `..._EpicLinkPersistsBothTheEdgeAndTheMarker` (branch 5), `..._EpicLinkWithoutTheParentPrimitiveIsRefused` (the `ReasonNotImplemented` fail-closed) and `..._EpicLinkMatchesTheParentAcrossRefShapes` as the normalization control.
 - **Which item of a duplicate pair to close is NOT derivable.** The report states that two items overlap, with no direction, so `GroomingDecision.CloseTarget` carries the operator's choice; an absent or out-of-pair choice skips rather than closing an arbitrary member.
 - **Two vocabulary members have no v0 derivation source**: `close_not_planned` (no report entry class carries a not-planned signal — vision drift is a FINDING and derives nothing) and `priority_set`. Both remain provider-executable kinds for an explicit future source; `TestDeriveGroomingMutations_MapsEveryEntryClass` asserts the derivation emits neither, so the gap is machine-checked rather than asserted here.
 - **The `GroomingMode` mirror is not an import of `backend/internal/spec`.** The provider layer stays free of the workflow-spec dependency and the runtime consumer does the one-line mapping. If spec ever adds a fourth mode, `ResolveGroomingMode` under-approximates it in the FAIL-CLOSED direction (`gated`), pinned by a table row asserting an unrecognized mode never authorizes a dispatch.
@@ -269,3 +269,96 @@ Every row below was run empirically (control deleted in the working tree, named 
 3. **A rejected proposal whose only change is re-worded justification does not resurface.** That is the direct consequence of excluding prose, and excluding prose is what makes the guard work at all.
 4. **`GroomingProposalSet` is a projection, not a `grooming_report_v1` document.** That schema requires `ordering` with `minItems: 1`, and an EMPTY proposal set is precisely the outcome AC1 demands, so the empty case cannot be expressed as a valid report artifact. Making it one is a grooming-report-v1 change belonging to #2235.
 5. **The guard does not alter what is persisted.** The report artifact is stored as the agent emitted it; the guard's verdict is a separate audit record. Nothing here mutates a tracker or rewrites an artifact.
+
+## Convergence after a partial write (E54.15 / #2810)
+
+Two of the ten grooming mutation kinds are not a single forge write:
+
+| kind | step 1 | step 2 | the shape a step-2 failure leaves |
+|---|---|---|---|
+| `board_place` | add the card to the project | set its Status column | on-board, column UNSET |
+| `epic_link` | add the sub-issue edge | stamp the `Parent epic: #N` body marker | linked, NO marker |
+
+Before #2810 neither shape converged. The board half-write was refused forever
+by the never-fight-the-human placement rule (which cannot distinguish our
+half-placed card from one a human boarded and left column-less); the epic
+half-write settled as `already_applied` on every later apply, because the
+idempotence diff keys on the structural parent (#2952) — so the item stayed
+LINKED but never became MARKER-BEARING.
+
+**The discriminator is a ledger, not an inference about tracker state.** A
+provider that lands step one and fails step two returns a typed
+`*PartialGroomingWriteError` naming the landed step; `settleGroomingCandidate`
+stamps it onto the audit record's `steps_landed` (the outcome stays `failed` — a
+half-written mutation is not applied). A later apply's `PriorSteps` carries that
+evidence back, and ONE rule — `groomingResumeStep` — decides both paths:
+
+- **board**: `expectedFrom` EMPTY **and** on-board **and** column unset **and**
+  the ledger names `board_item_added`;
+- **epic**: the structural parent matches the proposal **and** no marker names it
+  **and** the ledger names `epic_edge_added`.
+
+The epic arm does NOT separate an ABSENT marker from a DIVERGENT one — "no
+marker names the proposal" is true of both. That discrimination is made at the
+WRITE site, where the marker values are read fresh under the same request that
+patches them: `github.groomingLinkEpic` refuses a divergent marker with a
+`*ParentEpicConflictError` rather than stamping over it. Deciding it here would
+decide it off the stale pre-dispatch snapshot, and what it authorizes is a write.
+
+Both arms consult the same `groomingStepLanded` predicate, so deleting the
+evidence requirement reddens BOTH paths' resume tests — that shared-failure
+property is what "one rule" means observably, rather than a claim about code
+structure.
+
+**What the ledger proves, and what it does not.** It proves this SYSTEM started
+the mutation. It does NOT prove nothing else touched the item since. The
+residual, stated rather than implied away: a human who removed our half-placed
+card and re-added it leaving the column unset, BETWEEN the failed apply and the
+retry, is indistinguishable from our own half-write and WOULD be resumed over.
+Two things bound it — the evidence is ERASED by any later settled record for the
+same entry id (latest-record-wins, enforced server-side), and the resume fires
+only when the observed state matches the half-write shape EXACTLY. The
+alternative, refusing everything forever, is the defect this exists to fix.
+
+**Absent evidence changes nothing.** A nil or empty `PriorSteps` reproduces
+pre-#2810 behaviour byte for byte: the board move REFUSES with
+`manual_placement_preserved`, and the epic link skips as `already_applied`. That
+is the fail-closed answer for the case where the two actors are genuinely
+indistinguishable. Evidence that is unreadable, superseded or outside the
+server's run-scan window degrades to the same place — and "unreadable" is scan
+WIDE: a single audit row the server's evidence scan cannot decode abandons the
+WHOLE scan (`grooming_apply_prior_steps_unreadable`, no evidence anywhere)
+rather than being skipped as one absent row, because the row it cannot read is
+exactly the row whose content is unknown. Skipping it would be fail-OPEN in the
+two directions the staleness bound depends on: an unreadable NEWER row would let
+the walk fall through to an OLDER `failed`+steps record, and an unreadable
+SUPERSEDING row inside one run would leave that run's older `failed`+steps record
+standing as its latest, EMITTING evidence a settled record should have erased.
+
+**The icebox path is untouched.** A non-empty `expectedFrom` set is a SINGLE-step
+move of a card already on the board, so it has no partial-write shape to resume;
+the board arm requires an empty set precisely so an icebox move is never
+rerouted, and a test pins that with evidence present.
+
+### The resurfacing cost of a divergent-marker refusal
+
+A `failed` apply record contributes NO churn-baseline disposition, so its entry
+is classified ABSENT and RESURFACES on the next grooming run. For a partial
+write that is now benign: the ledger lets the next apply finish it, after which
+it records `applied` and stops resurfacing. That holds even when the RESUME
+write itself fails — the provider returns another `*PartialGroomingWriteError`
+carrying the same landed step, so `settleGroomingCandidate` re-stamps the
+evidence and the entry converges on a later apply instead of settling
+evidence-less under latest-record-wins.
+
+For the **divergent-marker refusal** — the body names one parent while the graph
+holds none or another — it is not benign and does not self-heal. (Branch 3 is
+the no-structural-parent case; branch 1 answers the same way when ledger
+evidence would otherwise authorize a resume over a divergent marker, and the
+`failed` record it writes ERASES that evidence.) That
+entry resurfaces on EVERY grooming run until a human reconciles the body and the
+graph. Refusing is the right direction when the two disagree (linking on the
+marker's authority would leave the body claiming one parent while the graph
+holds another), but the operator noise is real, so it is stated here rather than
+discovered: if a grooming report keeps re-proposing the same epic link, check
+whether the item's body marker and its sub-issue edge actually agree.

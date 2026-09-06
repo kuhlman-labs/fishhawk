@@ -2005,3 +2005,729 @@ func TestApplyGrooming_EpicLinkBodyMarkedButUnlinkedFailsOnTheCap(t *testing.T) 
 		t.Errorf("sibling before.scalar = %q, want #389 — the structural parent is the authority", rec2.Before.Scalar)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #2810: convergence after a PARTIAL WRITE (epic-link + board-place)
+//
+// The headline coverage is TWO GENUINE TWO-APPLY SEQUENCES driven through the
+// REAL workmgmt.ApplyGrooming core and the REAL Provider against a STATEFUL
+// httptest forge that PERSISTS step one between the applies. Asserting only the
+// first apply's error is exactly what let this defect ship: the tracker was left
+// half-written and no test ever asked what the NEXT apply did with it.
+// ---------------------------------------------------------------------------
+
+// partialWriteForge is a STATE-BEARING GitHub: the board membership, the column,
+// the issue body and the structural parent all PERSIST across requests, and each
+// second-step write can be failed ONCE. That is what makes the second apply a
+// real retry against the state the first apply actually left, rather than a
+// canned reply chosen by the test.
+type partialWriteForge struct {
+	onBoard          bool
+	column           string
+	body             string
+	structuralParent string // "#389" or ""
+
+	// One-shot failure injectors for the SECOND step of each multi-step
+	// mutation. Each fires at most once, so apply 2 runs against a healthy forge.
+	failSetField bool
+	failPatch    bool
+
+	// dropOption, when non-empty, OMITS that column from every subsequent
+	// ProjectFields response — the renamed/removed-option induction the
+	// live-validation walk in README.md recommends. It is a forge-side change,
+	// so it can be flipped BETWEEN applies to model a human renaming the column
+	// after this system left a card half-placed.
+	dropOption string
+
+	graphql []string // one operation name per GraphQL call
+	patches int
+}
+
+// newPartialWriteForge stands up the REST + GraphQL surface both multi-step
+// grooming mutations touch, over mutable state.
+func newPartialWriteForge(t *testing.T, fx *partialWriteForge) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	// The board options the two board tests use, and the reverse map SetField
+	// needs to turn an option id back into the column name it persists.
+	options := map[string]string{"Backlog": "OPT_BACKLOG", "In Progress": "OPT_IN_PROGRESS", "Icebox": "OPT_ICEBOX"}
+	names := map[string]string{}
+	for name, id := range options {
+		names[id] = name
+	}
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}", func(w http.ResponseWriter, r *http.Request) {
+		enc, _ := json.Marshal(fx.body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			// The node id CARRIES the number, so AddSubIssue below can record
+			// WHICH parent the edge was written against rather than a constant.
+			`{"number":%s,"node_id":"NODE_%s","title":"t","body":%s,"state":"open","labels":[{"name":"type:feature"}]}`,
+			r.PathValue("number"), r.PathValue("number"), enc))
+	})
+	mux.HandleFunc("PATCH /repos/{owner}/{repo}/issues/{number}", func(w http.ResponseWriter, r *http.Request) {
+		fx.patches++
+		if fx.failPatch {
+			fx.failPatch = false
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"message":"injected marker write failure"}`)
+			return
+		}
+		var params struct {
+			Body *string `json:"body"`
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &params)
+		if params.Body != nil {
+			fx.body = *params.Body
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"number":1,"state":"open","labels":[{"name":"type:feature"}]}`)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string
+			Variables map[string]any
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(body.Query, "ProjectFields"):
+			fx.graphql = append(fx.graphql, "ProjectFields")
+			// Rendered from `options` (minus fx.dropOption) rather than a fixed
+			// literal, so a column can disappear from the board mid-sequence.
+			var opts []string
+			for _, name := range sortedKeys(options) {
+				if name == fx.dropOption {
+					continue
+				}
+				opts = append(opts, `{"id":"`+options[name]+`","name":"`+name+`"}`)
+			}
+			_, _ = io.WriteString(w, `{"data":{"user":{"projectV2":{"id":"PROJ","field":{"id":"FIELD","options":[`+
+				strings.Join(opts, ",")+`]}}}}}`)
+		case strings.Contains(body.Query, "projectItems"):
+			fx.graphql = append(fx.graphql, "ProjectItemStatus")
+			if !fx.onBoard {
+				_, _ = io.WriteString(w, `{"data":{"node":{"projectItems":{"nodes":[]}}}}`)
+				return
+			}
+			// An UNSET column is a NULL fieldValueByName — the half-written
+			// shape, distinct from a column whose value happens to be empty.
+			field := "null"
+			if fx.column != "" {
+				field = `{"name":"` + fx.column + `"}`
+			}
+			_, _ = io.WriteString(w, `{"data":{"node":{"projectItems":{"nodes":[`+
+				`{"id":"ITEM","project":{"id":"PROJ"},"fieldValueByName":`+field+`}]}}}}`)
+		case strings.Contains(body.Query, "AddItem"):
+			fx.graphql = append(fx.graphql, "AddItem")
+			fx.onBoard = true
+			_, _ = io.WriteString(w, `{"data":{"addProjectV2ItemById":{"item":{"id":"ITEM"}}}}`)
+		case strings.Contains(body.Query, "SetField"):
+			fx.graphql = append(fx.graphql, "SetField")
+			if fx.failSetField {
+				fx.failSetField = false
+				_, _ = io.WriteString(w, `{"errors":[{"message":"injected column write failure"}]}`)
+				return
+			}
+			if id, ok := body.Variables["optionId"].(string); ok {
+				fx.column = names[id]
+			}
+			_, _ = io.WriteString(w, `{"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM"}}}}`)
+		case strings.Contains(body.Query, "IssueParent"):
+			fx.graphql = append(fx.graphql, "IssueParent")
+			if fx.structuralParent == "" {
+				_, _ = io.WriteString(w, `{"data":{"repository":{"issue":{"parent":null}}}}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"data":{"repository":{"issue":{"parent":{"number":`+
+				strings.TrimPrefix(fx.structuralParent, "#")+`,"title":"epic"}}}}}`)
+		case strings.Contains(body.Query, "AddSubIssue"):
+			fx.graphql = append(fx.graphql, "AddSubIssue")
+			if v, ok := body.Variables["issueId"].(string); ok {
+				fx.structuralParent = "#" + strings.TrimPrefix(v, "NODE_")
+			}
+			_, _ = io.WriteString(w, `{"data":{"addSubIssue":{"issue":{"id":"NODE_389"}}}}`)
+		default:
+			fx.graphql = append(fx.graphql, "unknown")
+			_, _ = io.WriteString(w, `{"data":{}}`)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := githubclient.New(stubTokenProvider{token: "ghs_install"})
+	c.BaseURL = srv.URL
+	c.HTTP = &http.Client{Timeout: 5 * time.Second}
+	c.ProjectsToken = "pat_projects"
+	return c
+}
+
+// partialWriteTarget is the apply target both #2810 sequences use.
+func partialWriteTarget() workmgmt.Target {
+	return workmgmt.Target{
+		Scope:   forge.FromGitHubInstallationID(99),
+		Repo:    workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"},
+		Project: &workmgmt.Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7},
+	}
+}
+
+// boardPlaceApply builds a whole-report apply for ONE approved board_place of
+// item `number` into the CANONICAL state `column` (which resolveGroomingRequest
+// maps through the States map to the board's own option), with the entry id
+// RECOMPUTED through
+// plan.GroomingEntryID — never a hand-copied string — so the run-over-run join
+// the ledger depends on is EXERCISED rather than assumed.
+func boardPlaceApply(number int, column string, prior map[string][]workmgmt.GroomingMutationStep) (workmgmt.GroomingApplyRequest, string) {
+	ref := groomingItemRef(number)
+	id := plan.GroomingEntryID(plan.GroomingClassHygiene, "unboarded", ref)
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{{
+		ID: id, ItemRef: ref, Defect: "unboarded", Detail: "off board",
+		SuggestedFix: "board it", Fix: &plan.HygieneFix{BoardState: column},
+	}}}
+	return workmgmt.GroomingApplyRequest{
+		Target:     partialWriteTarget(),
+		Report:     report,
+		Decisions:  []workmgmt.GroomingDecision{{EntryID: id, Verdict: workmgmt.GroomingApproved}},
+		Modes:      map[string]workmgmt.GroomingMode{"hygiene": workmgmt.GroomingModeAuto},
+		States:     groomingStates,
+		PriorSteps: prior,
+	}, id
+}
+
+// epicLinkApply builds a whole-report apply for ONE approved epic_link, with the
+// entry id likewise recomputed through plan.GroomingEntryID.
+func epicLinkApply(number int, parent string, prior map[string][]workmgmt.GroomingMutationStep) (workmgmt.GroomingApplyRequest, string) {
+	ref := groomingItemRef(number)
+	id := plan.GroomingEntryID(plan.GroomingClassHygiene, "unlinked_parent_epic", ref)
+	report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{{
+		ID: id, ItemRef: ref, Defect: "unlinked_parent_epic", Detail: "no parent",
+		SuggestedFix: "link it", Fix: &plan.HygieneFix{ParentEpic: parent},
+	}}}
+	return workmgmt.GroomingApplyRequest{
+		Target:     partialWriteTarget(),
+		Report:     report,
+		Decisions:  []workmgmt.GroomingDecision{{EntryID: id, Verdict: workmgmt.GroomingApproved}},
+		Modes:      map[string]workmgmt.GroomingMode{"hygiene": workmgmt.GroomingModeAuto},
+		States:     groomingStates,
+		PriorSteps: prior,
+	}, id
+}
+
+// ledgerFromRecord builds the PriorSteps map from the FIRST apply's RECORDED
+// audit row — not from a hand-written literal — so the evidence the second apply
+// consumes is the evidence the first apply actually produced.
+func ledgerFromRecord(rec workmgmt.GroomingMutationRecord) map[string][]workmgmt.GroomingMutationStep {
+	return map[string][]workmgmt.GroomingMutationStep{rec.EntryID: rec.StepsLanded}
+}
+
+// TestApplyGrooming_BoardPlacePartialWriteConvergesOnRetry is #2810's board
+// half, end to end: apply 1 lands AddItem and fails the column write, leaving an
+// on-board column-less card; apply 2, holding the ledger apply 1 recorded,
+// FINISHES it — and does so WITHOUT re-adding the card.
+func TestApplyGrooming_BoardPlacePartialWriteConvergesOnRetry(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", failSetField: true}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req1, entryID := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, nil)
+	sink1 := &recordingSink{}
+	res1, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, sink1, req1)
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	rec1 := dependsOnRecord(t, res1, entryID)
+	if rec1.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Fatalf("apply 1 outcome = %q, want failed (the column write was injected to fail)", rec1.Outcome)
+	}
+	if len(rec1.StepsLanded) != 1 || rec1.StepsLanded[0] != workmgmt.GroomingStepBoardItemAdded {
+		t.Fatalf("apply 1 steps_landed = %v, want [%s]", rec1.StepsLanded, workmgmt.GroomingStepBoardItemAdded)
+	}
+	// STATE READ-BACK, not error identity: the card IS on the board and the
+	// column is STILL unset — the half-written shape the resume must recognize.
+	if !fx.onBoard || fx.column != "" {
+		t.Fatalf("after apply 1: onBoard=%t column=%q, want on-board with an unset column", fx.onBoard, fx.column)
+	}
+
+	adds := countOp(fx.graphql, "AddItem")
+	req2, entryID2 := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, ledgerFromRecord(rec1))
+	if entryID2 != entryID {
+		t.Fatalf("entry id changed across runs (%q -> %q); the ledger join is not run-stable", entryID, entryID2)
+	}
+	res2, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req2)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	rec2 := dependsOnRecord(t, res2, entryID)
+	if rec2.Outcome != workmgmt.GroomingOutcomeApplied {
+		t.Fatalf("apply 2 outcome = %q (%+v), want applied — the half-written placement must converge", rec2.Outcome, rec2)
+	}
+	if fx.column != "Backlog" {
+		t.Errorf("column after apply 2 = %q, want %q", fx.column, "Backlog")
+	}
+	// NO SECOND AddItem: the resume writes the column against the item id the
+	// pre-write read returned, making no idempotence claim about
+	// addProjectV2ItemById.
+	if got := countOp(fx.graphql, "AddItem"); got != adds {
+		t.Errorf("AddItem calls = %d, want %d (the resume must not re-add an already-boarded card)", got, adds)
+	}
+}
+
+// TestApplyGrooming_EpicLinkPartialWriteConvergesOnRetry is #2810's epic half:
+// apply 1 lands AddSubIssue and fails the marker PATCH; apply 2 stamps ONLY the
+// marker, with no second AddSubIssue.
+func TestApplyGrooming_EpicLinkPartialWriteConvergesOnRetry(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", failPatch: true}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req1, entryID := epicLinkApply(2237, "#389", nil)
+	res1, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req1)
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	rec1 := dependsOnRecord(t, res1, entryID)
+	if rec1.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Fatalf("apply 1 outcome = %q, want failed (the marker write was injected to fail)", rec1.Outcome)
+	}
+	if len(rec1.StepsLanded) != 1 || rec1.StepsLanded[0] != workmgmt.GroomingStepEpicEdgeAdded {
+		t.Fatalf("apply 1 steps_landed = %v, want [%s]", rec1.StepsLanded, workmgmt.GroomingStepEpicEdgeAdded)
+	}
+	// STATE READ-BACK: the structural edge landed and the body carries NO marker.
+	if fx.structuralParent != "#389" {
+		t.Fatalf("structural parent after apply 1 = %q, want #389", fx.structuralParent)
+	}
+	if strings.Contains(fx.body, "Parent epic:") {
+		t.Fatalf("body after apply 1 = %q, want no marker (the PATCH was injected to fail)", fx.body)
+	}
+
+	links := countOp(fx.graphql, "AddSubIssue")
+	req2, _ := epicLinkApply(2237, "#389", ledgerFromRecord(rec1))
+	res2, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req2)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	rec2 := dependsOnRecord(t, res2, entryID)
+	if rec2.Outcome != workmgmt.GroomingOutcomeApplied {
+		t.Fatalf("apply 2 outcome = %q (%+v), want applied — the half-written link must converge to a marker", rec2.Outcome, rec2)
+	}
+	if n := strings.Count(fx.body, "Parent epic:"); n != 1 {
+		t.Errorf("marker lines after apply 2 = %d in %q, want exactly 1", n, fx.body)
+	}
+	if !strings.Contains(fx.body, "Parent epic: #389") {
+		t.Errorf("body after apply 2 = %q, want the #389 marker", fx.body)
+	}
+	if got := countOp(fx.graphql, "AddSubIssue"); got != links {
+		t.Errorf("AddSubIssue calls = %d, want %d (the resume must not re-link an existing edge)", got, links)
+	}
+}
+
+// TestApplyGrooming_EpicLinkResumeRefusesADivergentMarker is the fix-up pass's
+// control for the edge the resume newly made reachable: a body whose marker
+// names a DIFFERENT parent.
+//
+// It is a GENUINE two-apply sequence over the stateful forge — apply 1 lands the
+// edge and fails the marker PATCH, then a HUMAN stamps `Parent epic: #390`
+// between the applies — because that is the only way this state arises.
+//
+// WHY IT MUST NOT RESUME. `!markerNames` is true of an absent marker AND of a
+// divergent one, but ensureParentEpicMarker is idempotent on the MARKER, not on
+// the parent: it would return the #390 body UNCHANGED, the PATCH would write the
+// same bytes back, and the branch would report APPLIED over a body still
+// claiming #390. The assertions are therefore the AUDIT OUTCOME plus the PATCH
+// COUNT, not the body alone — the body is byte-identical either way, which is
+// precisely the defect (a control whose effect is a write that changes nothing
+// is invisible to a body diff).
+func TestApplyGrooming_EpicLinkResumeRefusesADivergentMarker(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", failPatch: true}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req1, entryID := epicLinkApply(2237, "#389", nil)
+	res1, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req1)
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	rec1 := dependsOnRecord(t, res1, entryID)
+	if len(rec1.StepsLanded) != 1 || rec1.StepsLanded[0] != workmgmt.GroomingStepEpicEdgeAdded {
+		t.Fatalf("apply 1 steps_landed = %v, want [%s]", rec1.StepsLanded, workmgmt.GroomingStepEpicEdgeAdded)
+	}
+
+	// A HUMAN records a DIFFERENT parent in the body between the two applies.
+	const humanBody = "## Summary\n\nParent epic: #390"
+	fx.body = humanBody
+	patchesBefore := fx.patches
+
+	req2, _ := epicLinkApply(2237, "#389", ledgerFromRecord(rec1))
+	res2, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req2)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	rec2 := dependsOnRecord(t, res2, entryID)
+	if rec2.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Errorf("apply 2 outcome = %q (%+v), want failed: a divergent marker must not be resumed over",
+			rec2.Outcome, rec2)
+	}
+	if !strings.Contains(rec2.Error, "#390") || !strings.Contains(rec2.Error, "already records parent epic") {
+		t.Errorf("apply 2 error = %q, want the typed parent-epic conflict naming #390", rec2.Error)
+	}
+	if len(rec2.StepsLanded) != 0 {
+		t.Errorf("apply 2 steps_landed = %v, want none: the refusal ERASES the stale evidence", rec2.StepsLanded)
+	}
+	// COMMITTED STATE: the human's marker is untouched, and no PATCH was sent at
+	// all — the discriminator, since a resumed PATCH would have written these
+	// same bytes back and audited itself as applied.
+	if fx.body != humanBody {
+		t.Errorf("body after apply 2 = %q, want the human's %q", fx.body, humanBody)
+	}
+	if fx.patches != patchesBefore {
+		t.Errorf("body PATCHes = %d, want %d (the refusal must write nothing)", fx.patches, patchesBefore)
+	}
+	if n := countOp(fx.graphql, "AddSubIssue"); n != 1 {
+		t.Errorf("AddSubIssue calls = %d, want 1 (only apply 1's edge)", n)
+	}
+}
+
+// TestApplyGrooming_BoardPlaceWithoutLedgerEvidenceRefuses is COUNTERFACTUAL (a),
+// and the case the whole design exists to protect: an on-board column-less card
+// with NO ledger evidence is a HUMAN's placement, and must be left alone.
+//
+// It asserts COMMITTED STATE (the column is still unset when read back AFTER the
+// call), not error identity — a control that fires and one that is rolled back
+// return the same envelope.
+func TestApplyGrooming_BoardPlaceWithoutLedgerEvidenceRefuses(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", onBoard: true, column: ""}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req, entryID := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, nil) // NO evidence.
+	res, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	rec := dependsOnRecord(t, res, entryID)
+	if rec.Outcome != workmgmt.GroomingOutcomeRefused || rec.RefuseReason != workmgmt.GroomingSkipManualPlacementPreserved {
+		t.Errorf("outcome/reason = %q/%q, want refused/%s", rec.Outcome, rec.RefuseReason,
+			workmgmt.GroomingSkipManualPlacementPreserved)
+	}
+	if fx.column != "" {
+		t.Errorf("column after the refusal = %q, want it STILL unset — a human's placement was overwritten", fx.column)
+	}
+	if n := countOp(fx.graphql, "SetField"); n != 0 {
+		t.Errorf("SetField calls = %d, want 0", n)
+	}
+}
+
+// TestApplyGrooming_BoardPlaceResumeRequiresAnUnsetColumn is COUNTERFACTUAL (b):
+// evidence present, but the card sits at a REAL column — so it is NOT the shape
+// our half-write leaves, and the resume must not fire.
+func TestApplyGrooming_BoardPlaceResumeRequiresAnUnsetColumn(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", onBoard: true, column: "In Progress"}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req, entryID := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog,
+		map[string][]workmgmt.GroomingMutationStep{})
+	// Evidence keyed to the real entry id, present and correct.
+	req.PriorSteps[entryID] = []workmgmt.GroomingMutationStep{workmgmt.GroomingStepBoardItemAdded}
+	res, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	rec := dependsOnRecord(t, res, entryID)
+	if rec.Outcome != workmgmt.GroomingOutcomeRefused {
+		t.Errorf("outcome = %q (%+v), want refused: a card at a real column is not a half-write", rec.Outcome, rec)
+	}
+	if fx.column != "In Progress" {
+		t.Errorf("column after the call = %q, want it unchanged at %q", fx.column, "In Progress")
+	}
+}
+
+// TestApplyGrooming_IceboxIsNotReroutedByLedgerEvidence is COUNTERFACTUAL (c):
+// an ICEBOX candidate (a NON-empty expected-from set) sitting outside that set,
+// with board_item_added evidence present, must STILL refuse. The icebox arm is a
+// single-step move of an already-boarded card; it has no partial-write shape,
+// and #2810 does not touch it.
+//
+// THE CARD IS DELIBERATELY COLUMN-UNSET, not parked at some other real column:
+// an unset column is EXACTLY the shape the board resume arm matches, so the ONLY
+// thing refusing here is the non-empty expected-from set. Seeding a real column
+// instead would leave the test green under the deletion of that condition —
+// refused by the unset-column check for an unrelated reason.
+func TestApplyGrooming_IceboxIsNotReroutedByLedgerEvidence(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", onBoard: true, column: ""}
+	provider := New(newPartialWriteForge(t, fx))
+
+	ref := groomingItemRef(2241)
+	id := plan.GroomingEntryID(plan.GroomingClassDecomposition, "", ref)
+	report := &plan.GroomingReport{DecompositionSuggestions: []plan.DecompositionSuggestion{{
+		ID: id, ItemRef: ref, Rationale: "too big",
+		ProposedChildren: []plan.DecompositionChild{{Title: "a", ScopeHint: "x"}, {Title: "b", ScopeHint: "y"}},
+	}}}
+	res, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{},
+		workmgmt.GroomingApplyRequest{
+			Target:       partialWriteTarget(),
+			Report:       report,
+			Decisions:    []workmgmt.GroomingDecision{{EntryID: id, Verdict: workmgmt.GroomingApproved}},
+			Modes:        map[string]workmgmt.GroomingMode{"scoping": workmgmt.GroomingModeAuto},
+			States:       groomingStates,
+			IceboxColumn: "Icebox",
+			PriorSteps: map[string][]workmgmt.GroomingMutationStep{
+				id: {workmgmt.GroomingStepBoardItemAdded},
+			},
+		})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	rec := dependsOnRecord(t, res, id)
+	if rec.Outcome != workmgmt.GroomingOutcomeRefused {
+		t.Errorf("outcome = %q (%+v), want refused: an icebox move must not be rerouted by board_item_added evidence",
+			rec.Outcome, rec)
+	}
+	// COMMITTED STATE, not error identity: the card must not have been moved to
+	// the icebox column behind the refusal.
+	if fx.column != "" {
+		t.Errorf("column after the call = %q, want it STILL unset", fx.column)
+	}
+}
+
+// TestApplyGrooming_EpicLinkWithoutLedgerEvidenceSkips is COUNTERFACTUAL (d): a
+// structurally-linked item with no marker and NO evidence settles as
+// already_applied with ZERO body PATCHes — the fail-closed answer when a human
+// could equally have removed the marker.
+func TestApplyGrooming_EpicLinkWithoutLedgerEvidenceSkips(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", structuralParent: "#389"}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req, entryID := epicLinkApply(2237, "#389", nil) // NO evidence.
+	res, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	rec := dependsOnRecord(t, res, entryID)
+	if rec.Outcome != workmgmt.GroomingOutcomeSkipped || rec.SkipReason != workmgmt.GroomingSkipAlreadyApplied {
+		t.Errorf("outcome/reason = %q/%q, want skipped/%s", rec.Outcome, rec.SkipReason,
+			workmgmt.GroomingSkipAlreadyApplied)
+	}
+	if fx.patches != 0 {
+		t.Errorf("body PATCHes = %d, want 0", fx.patches)
+	}
+	if strings.Contains(fx.body, "Parent epic:") {
+		t.Errorf("body = %q, want the marker STILL absent", fx.body)
+	}
+}
+
+// TestApplyGroomingMutation_ProviderResumeMirrorRequiresEvidence is
+// COUNTERFACTUAL (e): the provider's OWN defence-in-depth mirror, called
+// DIRECTLY (bypassing the core) with EMPTY ResumeSteps, must refuse.
+func TestApplyGroomingMutation_ProviderResumeMirrorRequiresEvidence(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", onBoard: true, column: ""}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req := groomingRequest(workmgmt.GroomingKindBoardPlace, workmgmt.GroomingValue{Scalar: "Backlog"})
+	res, err := provider.ApplyGroomingMutation(context.Background(), req) // no ResumeSteps
+	if err != nil {
+		t.Fatalf("ApplyGroomingMutation: %v", err)
+	}
+	if res == nil || !res.Refused || res.RefuseReason != "manual_placement_preserved" {
+		t.Fatalf("result = %+v, want a manual_placement_preserved refusal", res)
+	}
+	if fx.column != "" {
+		t.Errorf("column after the refusal = %q, want it still unset", fx.column)
+	}
+
+	// The POSITIVE arm, so the mirror is shown to be evidence-gated rather than
+	// simply broken: the SAME request carrying the evidence writes the column.
+	req.ResumeSteps = []workmgmt.GroomingMutationStep{workmgmt.GroomingStepBoardItemAdded}
+	res, err = provider.ApplyGroomingMutation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ApplyGroomingMutation (resuming): %v", err)
+	}
+	if res == nil || !res.Applied {
+		t.Fatalf("result = %+v, want applied", res)
+	}
+	if fx.column != "Backlog" {
+		t.Errorf("column = %q, want %q", fx.column, "Backlog")
+	}
+}
+
+// TestApplyGrooming_BoardResumeRefusesAColumnMissingFromTheBoard is the fix-up
+// pass's control for the resume write's option-id lookup.
+//
+// It is a GENUINE two-apply sequence over the stateful forge, with the board's
+// option set changed BETWEEN the applies — the renamed-column induction the
+// live-validation walk recommends — because that is how this state actually
+// arises: apply 1 leaves the card on-board and column-unset against a board that
+// HAS the column, and only then does the column go away.
+//
+// WHAT IT PINS. The resume write must not send an EMPTY option id: the resolved
+// option is validated (and bound) BEFORE the resume arm, so a column absent from
+// the board draws the named refusal and writes nothing. The assertions are the
+// audit outcome, the SetField COUNT and the read-back column — not error
+// identity alone, because an unguarded lookup would send `optionId: ""` and the
+// forge would answer 200, leaving no error to identify.
+func TestApplyGrooming_BoardResumeRefusesAColumnMissingFromTheBoard(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", failSetField: true}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req1, entryID := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, nil)
+	res1, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req1)
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	rec1 := dependsOnRecord(t, res1, entryID)
+	if len(rec1.StepsLanded) != 1 || rec1.StepsLanded[0] != workmgmt.GroomingStepBoardItemAdded {
+		t.Fatalf("apply 1 steps_landed = %v, want [%s]", rec1.StepsLanded, workmgmt.GroomingStepBoardItemAdded)
+	}
+	if !fx.onBoard || fx.column != "" {
+		t.Fatalf("after apply 1: onBoard=%t column=%q, want on-board with an unset column", fx.onBoard, fx.column)
+	}
+
+	// A HUMAN renames the target column away between the applies.
+	fx.dropOption = "Backlog"
+	setsBefore := countOp(fx.graphql, "SetField")
+
+	req2, _ := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, ledgerFromRecord(rec1))
+	res2, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req2)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	rec2 := dependsOnRecord(t, res2, entryID)
+	if rec2.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Errorf("apply 2 outcome = %q (%+v), want failed: the target column is no longer on the board", rec2.Outcome, rec2)
+	}
+	if !strings.Contains(rec2.Error, `"Backlog" is not a Status option`) || !strings.Contains(rec2.Error, "available:") {
+		t.Errorf("apply 2 error = %q, want the named unknown-column refusal listing the valid options", rec2.Error)
+	}
+	// COMMITTED STATE: no write was attempted at all. An unguarded lookup would
+	// have called SetField with an empty option id.
+	if got := countOp(fx.graphql, "SetField"); got != setsBefore {
+		t.Errorf("SetField calls = %d, want %d (the refusal must write nothing)", got, setsBefore)
+	}
+	if fx.column != "" {
+		t.Errorf("column after apply 2 = %q, want it STILL unset", fx.column)
+	}
+}
+
+// TestApplyGrooming_BoardPlaceResumeWriteFailureStillConverges pins the board
+// arm of the fix-up's second control: a RESUME write that itself fails must
+// record the SAME landed step, so the ledger survives and a THIRD apply
+// converges.
+//
+// WHY IT MATTERS. settleGroomingCandidate stamps steps_landed only from a
+// *PartialGroomingWriteError, and priorGroomingPartialSteps is latest-record-
+// wins — so a failed-WITHOUT-steps record here would settle the entry with an
+// empty ledger and every later apply would take the permanent
+// manual_placement_preserved refusal. One transient forge error during the
+// resume would reintroduce exactly the non-convergence #2810 fixes.
+//
+// The THIRD apply is the discriminating assertion: apply 2's steps_landed alone
+// could be read as bookkeeping, while a third apply that converges proves the
+// evidence was still usable.
+func TestApplyGrooming_BoardPlaceResumeWriteFailureStillConverges(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", failSetField: true}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req1, entryID := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, nil)
+	res1, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req1)
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	rec1 := dependsOnRecord(t, res1, entryID)
+	if len(rec1.StepsLanded) != 1 || rec1.StepsLanded[0] != workmgmt.GroomingStepBoardItemAdded {
+		t.Fatalf("apply 1 steps_landed = %v, want [%s]", rec1.StepsLanded, workmgmt.GroomingStepBoardItemAdded)
+	}
+
+	// The RESUME write fails too (a second transient forge error).
+	fx.failSetField = true
+	adds := countOp(fx.graphql, "AddItem")
+
+	req2, _ := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, ledgerFromRecord(rec1))
+	res2, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req2)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	rec2 := dependsOnRecord(t, res2, entryID)
+	if rec2.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Fatalf("apply 2 outcome = %q (%+v), want failed (the resume write was injected to fail)", rec2.Outcome, rec2)
+	}
+	if len(rec2.StepsLanded) != 1 || rec2.StepsLanded[0] != workmgmt.GroomingStepBoardItemAdded {
+		t.Fatalf("apply 2 steps_landed = %v, want [%s]: a failed resume must not erase the ledger",
+			rec2.StepsLanded, workmgmt.GroomingStepBoardItemAdded)
+	}
+	// STATE READ-BACK: the half-written shape is unchanged, which is what makes
+	// re-recording the same landed step the HONEST record rather than a guess.
+	if !fx.onBoard || fx.column != "" {
+		t.Fatalf("after apply 2: onBoard=%t column=%q, want the half-write unchanged", fx.onBoard, fx.column)
+	}
+
+	// APPLY 3 consumes apply 2's OWN record — not apply 1's — so the ledger
+	// under test is the one the failed resume produced.
+	req3, _ := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, ledgerFromRecord(rec2))
+	res3, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req3)
+	if err != nil {
+		t.Fatalf("apply 3: %v", err)
+	}
+	rec3 := dependsOnRecord(t, res3, entryID)
+	if rec3.Outcome != workmgmt.GroomingOutcomeApplied {
+		t.Fatalf("apply 3 outcome = %q (%+v), want applied — a failed resume must not end convergence", rec3.Outcome, rec3)
+	}
+	if fx.column != "Backlog" {
+		t.Errorf("column after apply 3 = %q, want %q", fx.column, "Backlog")
+	}
+	if got := countOp(fx.graphql, "AddItem"); got != adds {
+		t.Errorf("AddItem calls = %d, want %d (no resume may re-add an already-boarded card)", got, adds)
+	}
+}
+
+// TestApplyGrooming_EpicLinkResumeWriteFailureStillConverges is the epic mirror
+// of the board case above: the marker PATCH fails on the RESUME too, and the
+// third apply still stamps the marker. Without the typed error on that site the
+// entry settles evidence-less and every later apply takes the already-linked
+// skip, leaving the body permanently marker-less.
+func TestApplyGrooming_EpicLinkResumeWriteFailureStillConverges(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", failPatch: true}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req1, entryID := epicLinkApply(2237, "#389", nil)
+	res1, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req1)
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	rec1 := dependsOnRecord(t, res1, entryID)
+	if len(rec1.StepsLanded) != 1 || rec1.StepsLanded[0] != workmgmt.GroomingStepEpicEdgeAdded {
+		t.Fatalf("apply 1 steps_landed = %v, want [%s]", rec1.StepsLanded, workmgmt.GroomingStepEpicEdgeAdded)
+	}
+
+	// The RESUME marker write fails too.
+	fx.failPatch = true
+	links := countOp(fx.graphql, "AddSubIssue")
+
+	req2, _ := epicLinkApply(2237, "#389", ledgerFromRecord(rec1))
+	res2, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req2)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	rec2 := dependsOnRecord(t, res2, entryID)
+	if rec2.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Fatalf("apply 2 outcome = %q (%+v), want failed (the resume PATCH was injected to fail)", rec2.Outcome, rec2)
+	}
+	if len(rec2.StepsLanded) != 1 || rec2.StepsLanded[0] != workmgmt.GroomingStepEpicEdgeAdded {
+		t.Fatalf("apply 2 steps_landed = %v, want [%s]: a failed resume must not erase the ledger",
+			rec2.StepsLanded, workmgmt.GroomingStepEpicEdgeAdded)
+	}
+	// STATE READ-BACK: the edge is still recorded and the marker still absent.
+	if fx.structuralParent != "#389" || strings.Contains(fx.body, "Parent epic:") {
+		t.Fatalf("after apply 2: parent=%q body=%q, want the half-write unchanged", fx.structuralParent, fx.body)
+	}
+
+	req3, _ := epicLinkApply(2237, "#389", ledgerFromRecord(rec2))
+	res3, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req3)
+	if err != nil {
+		t.Fatalf("apply 3: %v", err)
+	}
+	rec3 := dependsOnRecord(t, res3, entryID)
+	if rec3.Outcome != workmgmt.GroomingOutcomeApplied {
+		t.Fatalf("apply 3 outcome = %q (%+v), want applied — a failed resume must not end convergence", rec3.Outcome, rec3)
+	}
+	if n := strings.Count(fx.body, "Parent epic:"); n != 1 || !strings.Contains(fx.body, "Parent epic: #389") {
+		t.Errorf("body after apply 3 = %q, want exactly one #389 marker", fx.body)
+	}
+	if got := countOp(fx.graphql, "AddSubIssue"); got != links {
+		t.Errorf("AddSubIssue calls = %d, want %d (no resume may re-link an existing edge)", got, links)
+	}
+}

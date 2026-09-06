@@ -2,6 +2,7 @@ package workmgmt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -3601,5 +3602,173 @@ func TestNormalizeIssueRef_IsTheOnlyNormalizer(t *testing.T) {
 	}
 	if NormalizeIssueRef("owner/repo#123") == NormalizeIssueRef("#owner/repo#123") {
 		t.Error("normalization collapsed two different non-numeric refs — the two-normalizer defect")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #2810: the partial-write ledger — plumbing and the shared resume rule
+// ---------------------------------------------------------------------------
+
+// TestSettleGroomingCandidate_PartialWriteErrorRecordsStepsLanded is
+// COUNTERFACTUAL (h): the errors.As plumbing that turns a provider's typed
+// partial-write error into the audit row's steps_landed.
+//
+// Both arms are asserted, not just the positive one: a *PartialGroomingWriteError
+// records the steps AND surfaces the CAUSE's message (not the wrapper's), while
+// a plain error records NO steps. A test carrying only the first arm would stay
+// green if the code stamped every failure with a step.
+func TestSettleGroomingCandidate_PartialWriteErrorRecordsStepsLanded(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantSteps []GroomingMutationStep
+		wantErr   string
+	}{
+		{
+			name: "typed partial write",
+			err: &PartialGroomingWriteError{
+				Steps: []GroomingMutationStep{GroomingStepEpicEdgeAdded},
+				Cause: errors.New("record parent epic on #2237: 500"),
+			},
+			wantSteps: []GroomingMutationStep{GroomingStepEpicEdgeAdded},
+			wantErr:   "record parent epic on #2237: 500",
+		},
+		{
+			name:      "plain error",
+			err:       errors.New("record parent epic on #2237: 500"),
+			wantSteps: nil,
+			wantErr:   "record parent epic on #2237: 500",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := hygieneEntry(2237, "unlinked_parent_epic", "#389")
+			report := &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{entry}}
+			mut := &fakeGroomingMutator{errOn: func(GroomingMutationRequest) error { return tc.err }}
+			res, err := ApplyGrooming(context.Background(), mut,
+				&fakeGroomingReader{items: map[string]*WorkItemRecord{"#2237": {State: "open"}}},
+				&fakeGroomingSink{}, GroomingApplyRequest{
+					Target:    groomingTarget(),
+					Report:    report,
+					Decisions: approveAll(report),
+					Modes:     map[string]GroomingMode{"hygiene": GroomingModeAuto},
+					States:    groomingStates(),
+				})
+			if err != nil {
+				t.Fatalf("ApplyGrooming: %v", err)
+			}
+			if len(res.Failed) != 1 {
+				t.Fatalf("failed = %+v, want exactly one", res.Failed)
+			}
+			rec := res.Failed[0]
+			if rec.Outcome != GroomingOutcomeFailed {
+				t.Errorf("outcome = %q, want failed — a half-written mutation is not applied", rec.Outcome)
+			}
+			if len(rec.StepsLanded) != len(tc.wantSteps) {
+				t.Fatalf("steps_landed = %v, want %v", rec.StepsLanded, tc.wantSteps)
+			}
+			for i := range tc.wantSteps {
+				if rec.StepsLanded[i] != tc.wantSteps[i] {
+					t.Errorf("steps_landed[%d] = %q, want %q", i, rec.StepsLanded[i], tc.wantSteps[i])
+				}
+			}
+			if rec.Error != tc.wantErr {
+				t.Errorf("error = %q, want the CAUSE's message %q", rec.Error, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestGroomingMutationRecord_StepsLandedSerializesAsStepsLanded pins the JSON
+// TAG, which is the wire contract the server's evidence scan decodes off the
+// audit payload. A tag rename is exactly the serialization defect that would let
+// every layer pass its own test while the feature does not work.
+func TestGroomingMutationRecord_StepsLandedSerializesAsStepsLanded(t *testing.T) {
+	body, err := json.Marshal(GroomingMutationRecord{
+		EntryID: "e1", Outcome: GroomingOutcomeFailed,
+		StepsLanded: []GroomingMutationStep{GroomingStepBoardItemAdded},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"steps_landed":["board_item_added"]`) {
+		t.Errorf("payload = %s, want a steps_landed key carrying board_item_added", body)
+	}
+	// omitempty: a record with no steps must not grow the key, so pre-#2810
+	// readers see exactly the payload shape they saw before.
+	body, _ = json.Marshal(GroomingMutationRecord{EntryID: "e1", Outcome: GroomingOutcomeApplied})
+	if strings.Contains(string(body), "steps_landed") {
+		t.Errorf("payload = %s, want NO steps_landed key on a record that landed no partial step", body)
+	}
+}
+
+// TestGroomingResumeStep_OneRuleServesBothPaths asserts the OBSERVABLE property
+// the shared rule buys (approval condition 3): the SAME evidence record shape
+// drives both paths, and the SAME predicate — groomingStepLanded — decides both.
+// Deleting that predicate's evidence requirement reddens the board resume test
+// AND the epic resume test, which is what makes "one rule" checkable rather than
+// a claim about code structure.
+func TestGroomingResumeStep_OneRuleServesBothPaths(t *testing.T) {
+	const boardID, epicID = "board-entry", "epic-entry"
+	req := GroomingApplyRequest{PriorSteps: map[string][]GroomingMutationStep{
+		boardID: {GroomingStepBoardItemAdded},
+		epicID:  {GroomingStepEpicEdgeAdded},
+	}}
+	board := groomingCandidate{entryID: boardID, kind: GroomingKindBoardPlace}
+	epic := groomingCandidate{entryID: epicID, kind: GroomingKindEpicLink,
+		after: GroomingValue{Scalar: "#389"}}
+	halfPlaced := &WorkItemRecord{OnBoard: true, BoardColumn: ""}
+	halfLinked := GroomingValue{Scalar: "#389"}
+
+	if step, ok := groomingResumeStep(board, halfPlaced, GroomingValue{}, req); !ok || step != GroomingStepBoardItemAdded {
+		t.Errorf("board arm = (%q, %t), want (%q, true)", step, ok, GroomingStepBoardItemAdded)
+	}
+	if step, ok := groomingResumeStep(epic, nil, halfLinked, req); !ok || step != GroomingStepEpicEdgeAdded {
+		t.Errorf("epic arm = (%q, %t), want (%q, true)", step, ok, GroomingStepEpicEdgeAdded)
+	}
+	// SUPERSEDED / ABSENT evidence authorizes NEITHER — one empty map, both arms
+	// closed. That is the shared-predicate property, observed.
+	empty := GroomingApplyRequest{}
+	if _, ok := groomingResumeStep(board, halfPlaced, GroomingValue{}, empty); ok {
+		t.Error("board arm resumed with NO ledger evidence")
+	}
+	if _, ok := groomingResumeStep(epic, nil, halfLinked, empty); ok {
+		t.Error("epic arm resumed with NO ledger evidence")
+	}
+	// A ledger naming the WRONG step for the path authorizes nothing either.
+	crossed := GroomingApplyRequest{PriorSteps: map[string][]GroomingMutationStep{
+		boardID: {GroomingStepEpicEdgeAdded},
+		epicID:  {GroomingStepBoardItemAdded},
+	}}
+	if _, ok := groomingResumeStep(board, halfPlaced, GroomingValue{}, crossed); ok {
+		t.Error("board arm resumed on epic_edge_added evidence")
+	}
+	if _, ok := groomingResumeStep(epic, nil, halfLinked, crossed); ok {
+		t.Error("epic arm resumed on board_item_added evidence")
+	}
+	// The board arm requires the observed SHAPE to match the half-write, not just
+	// the ledger to name the step. A card at a REAL column, or one that is
+	// OFF-board, is not what our failed add-then-set leaves.
+	//
+	// This case lives HERE, on the pure rule, rather than only on the end-to-end
+	// board test: the PROVIDER's own mirror re-checks the same condition, so an
+	// end-to-end test stays GREEN under the core deletion (defence in depth
+	// masking it) and would not discriminate this control.
+	if _, ok := groomingResumeStep(board, &WorkItemRecord{OnBoard: true, BoardColumn: "In Progress"}, GroomingValue{}, req); ok {
+		t.Error("board arm resumed against a card sitting at a REAL column")
+	}
+	if _, ok := groomingResumeStep(board, &WorkItemRecord{OnBoard: false}, GroomingValue{}, req); ok {
+		t.Error("board arm resumed against an OFF-board card")
+	}
+	// The icebox arm (a NON-empty expected-from set) is never rerouted, evidence
+	// or not: a single-step move of an already-boarded card has no half-write.
+	icebox := groomingCandidate{entryID: boardID, kind: GroomingKindIcebox,
+		expectedFrom: []string{CanonicalStateBacklog}}
+	if _, ok := groomingResumeStep(icebox, halfPlaced, GroomingValue{}, req); ok {
+		t.Error("icebox arm resumed; a non-empty expected-from set must never be rerouted")
+	}
+	// The epic arm also requires the marker to be ABSENT: an already-correct
+	// marker is not a half-write, whatever the ledger says.
+	if _, ok := groomingResumeStep(epic, nil, GroomingValue{Scalar: "#389", List: []string{"#389"}}, req); ok {
+		t.Error("epic arm resumed against a body that already carries the marker")
 	}
 }
