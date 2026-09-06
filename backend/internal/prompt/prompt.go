@@ -1033,6 +1033,29 @@ type GateEvidence struct {
 	// hedges its untouched labels under the same diff mode, so the two surfaces
 	// never contradict. False keeps the render byte-identical.
 	OperatorScopeUndeliveredIndeterminate bool
+	// OperatorScopeUndeliveredStageCumulative reports that the undelivered set
+	// was evaluated against the implement stage's CUMULATIVE committed state —
+	// every commit the stage has pushed, OperatorScopeUndeliveredCumulativeBaseSHA
+	// .. OperatorScopeUndeliveredCumulativeHeadSHA — rather than only the current
+	// pass's committed diff (#3029). True licenses the machine-verified
+	// high-priority framing; FALSE renders the hedged branch, which names the set
+	// explicitly, drops the machine-verified framing and tells the reviewer to
+	// verify against the cumulative PR diff before raising it.
+	OperatorScopeUndeliveredStageCumulative bool
+	// OperatorScopeUndeliveredIncompleteReason is the BACKEND machine literal
+	// (never agent text) naming why the cumulative state could not be
+	// established — push_ledger_unreadable, stage_push_ledger_empty,
+	// stage_base_sha_unavailable, stage_base_equals_head,
+	// forge_compare_unavailable, cumulative_compare_failed,
+	// cumulative_compare_truncated. Rendered inside the hedged branch; empty
+	// omits the reason clause.
+	OperatorScopeUndeliveredIncompleteReason string
+	// OperatorScopeUndeliveredCumulativeBaseSHA and
+	// OperatorScopeUndeliveredCumulativeHeadSHA are the span the cumulative
+	// compare covered, printed as "base <sha> .. head <sha>" so the reviewer can
+	// reproduce the set. Populated only on the stage-cumulative branch.
+	OperatorScopeUndeliveredCumulativeBaseSHA string
+	OperatorScopeUndeliveredCumulativeHeadSHA string
 	// FixupCounterfactuals carries the agent's VALIDATED counterfactual
 	// self-report for a fix-up pass (#3042), mapped from the runner's
 	// gate_evidence `fixup_counterfactuals`. writeGateEvidence renders it as a
@@ -1173,6 +1196,17 @@ type GateScopeProvenance struct {
 	// UNTOUCHED label as NOT DETERMINABLE rather than asserting it as fact.
 	// False for a determinable diff, keeping the prompt byte-identical.
 	RenameProvenanceIndeterminate bool
+	// CommittedSetStageCumulative reports that every TOUCHED/UNTOUCHED label in
+	// this block was derived from the implement stage's CUMULATIVE committed
+	// state (every commit the stage has pushed), not merely the current pass's
+	// committed diff (#3029). writeGateEvidence names the set either way, so an
+	// UNTOUCHED label is never handed to the reviewer without saying which set
+	// it is absent from.
+	CommittedSetStageCumulative bool
+	// CommittedSetIncompleteReason is the BACKEND machine literal naming why the
+	// cumulative state could not be established, rendered inside the this-pass
+	// clause. Empty omits the reason.
+	CommittedSetIncompleteReason string
 }
 
 // GateScopeRename is one declared-path rename (#2398): the SOURCE side
@@ -5490,15 +5524,28 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 	// the signal is present (#1407), so an empty/nil OperatorScopeUndelivered
 	// keeps the prompt byte-identical to the pre-change render.
 	if len(ev.OperatorScopeUndelivered) > 0 {
-		if ev.OperatorScopeUndeliveredIndeterminate {
+		switch {
+		case ev.OperatorScopeUndeliveredIndeterminate:
 			b.WriteString("- The `operator_scope_path_undelivered` block below is INDETERMINATE under this diff mode " +
 				"(the diff carries rename rows with no source path, so an absent path cannot be distinguished from a " +
 				"rename source). Do NOT treat the listed paths as definitively undelivered; verify each against the " +
 				"changed-file list before raising it.\n")
-		} else {
-			b.WriteString("- An `operator_scope_path_undelivered` warning below (an operator-added scope path the commit left " +
-				"UNTOUCHED) is a high-priority miss — a likely dropped operator-required edit. Treat it as outranking " +
-				"stylistic findings and name it before them.\n")
+		case ev.OperatorScopeUndeliveredStageCumulative:
+			// The machine-verified framing is licensed ONLY here: the set spans
+			// every commit the implement stage has pushed, so absence from it is
+			// a real miss rather than an artifact of which pass is being reviewed.
+			b.WriteString("- An `operator_scope_path_undelivered` warning below (an operator-added scope path left " +
+				"UNTOUCHED across the WHOLE implement stage) is a high-priority miss — a likely dropped " +
+				"operator-required edit. Treat it as outranking stylistic findings and name it before them.\n")
+		default:
+			// #3029 hedged branch: the cumulative state could not be established,
+			// so the block is evidence about THIS PASS only and deliberately does
+			// NOT carry the machine-verified high-priority framing — an earlier
+			// pass of this stage may be the one that delivered the path.
+			b.WriteString("- The `operator_scope_path_undelivered` block below was evaluated against THIS PASS's " +
+				"committed diff ONLY — earlier passes of this implement stage, if any, were NOT evaluated. Do NOT " +
+				"treat the listed paths as machine-verified misses; verify each against the PR's cumulative " +
+				"base..head diff before raising it.\n")
 		}
 	}
 	b.WriteString("- A SKIPPED verify run means compile/test state is UNVERIFIED. Do NOT assume the change is " +
@@ -5662,6 +5709,20 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 	if p := ev.ScopeProvenance; p != nil {
 		b.WriteString("Declared-scope provenance (decomposition of the declared scope.files count — makes " +
 			"\"fully explained\" machine-derived on both sides of the divergence):\n\n")
+		// #3029: name the file set every TOUCHED/UNTOUCHED label below was
+		// derived from. On a fix-up re-review the pass diff is the fix-up DELTA,
+		// so an UNTOUCHED label derived from it says nothing about earlier passes
+		// — state that rather than letting the label read as stage-wide.
+		if p.CommittedSetStageCumulative {
+			b.WriteString("- TOUCHED/UNTOUCHED below are evaluated against the STAGE-CUMULATIVE committed file set " +
+				"(every commit this implement stage has pushed), NOT merely this pass's delta.\n")
+		} else {
+			b.WriteString("- TOUCHED/UNTOUCHED below are evaluated against THIS PASS's committed diff ONLY" +
+				operatorScopeIncompleteReasonClause(p.CommittedSetIncompleteReason) + "; earlier passes of this " +
+				"implement stage, if any, were NOT evaluated, so a path labelled UNTOUCHED may have been delivered by " +
+				"a pass this evaluation could not see. Verify against the PR's cumulative base..head diff before " +
+				"raising an untouched label as a finding.\n")
+		}
 		fmt.Fprintf(b, "- plan scope.files: %d entries\n", p.PlanFiles)
 		// Declared paths TOUCHED as the SOURCE side of a rename (#2398). git
 		// records a single R row keyed on the destination, so the old path has
@@ -5760,24 +5821,41 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 	}
 
 	if len(ev.OperatorScopeUndelivered) > 0 {
-		if ev.OperatorScopeUndeliveredIndeterminate {
+		// Every branch NAMES the file set the absence was measured against
+		// (#3029 Done-means): an unqualified "absent from the committed file set"
+		// is what let a fix-up delta masquerade as the stage's whole history.
+		switch {
+		case ev.OperatorScopeUndeliveredIndeterminate:
 			b.WriteString("operator_scope_path_undelivered (INDETERMINATE — operator-added scope path possibly left " +
 				"UNTOUCHED):\n\n")
 			b.WriteString("The operator DELIBERATELY added the scope path(s) below — either an add_scope_files path " +
 				"folded at plan approval or an approved mid-stage scope amendment (often a binding-condition test). " +
-				"They are absent from the committed file set, BUT this diff carries rename rows with NO source path, " +
-				"so an absent path cannot be distinguished from a rename source — the undelivered status is NOT " +
-				"DETERMINABLE. Do NOT assert these as definitively undelivered; verify each against the changed-file " +
-				"list (a path shown as a rename source WAS delivered) before raising it.\n\n")
-		} else {
-			b.WriteString("operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):\n\n")
+				"They are absent from " + operatorScopeEvaluatedSetPhrase(ev) + ", BUT this diff carries rename rows " +
+				"with NO source path, so an absent path cannot be distinguished from a rename source — the " +
+				"undelivered status is NOT DETERMINABLE. Do NOT assert these as definitively undelivered; verify each " +
+				"against the changed-file list (a path shown as a rename source WAS delivered) before raising it.\n\n")
+		case ev.OperatorScopeUndeliveredStageCumulative:
+			b.WriteString("operator_scope_path_undelivered (operator-added scope path left UNTOUCHED across the whole " +
+				"implement stage):\n\n")
 			b.WriteString("The operator DELIBERATELY added the scope path(s) below — either an add_scope_files path folded " +
 				"at plan approval or an approved mid-stage scope amendment (often a binding-condition test) — yet the " +
-				"committed tree did NOT touch them. This is a deterministic, machine-verified signal: each path is absent " +
-				"from the committed file set. Treat it as a HIGH-priority miss — a likely dropped operator-required edit, " +
-				"not a stylistic finding — and name it before stylistic concerns. (Scope here is untouched-only: a path " +
-				"the commit DID touch but with the wrong content is not detected deterministically and remains for you to " +
-				"judge on the diff.)\n\n")
+				"stage did NOT touch them. This is a deterministic, machine-verified signal: each path is absent from " +
+				operatorScopeEvaluatedSetPhrase(ev) + " — NOT merely from this pass's delta. Treat it as a HIGH-priority " +
+				"miss — a likely dropped operator-required edit, not a stylistic finding — and name it before stylistic " +
+				"concerns. (Scope here is untouched-only: a path the stage DID touch but with the wrong content is not " +
+				"detected deterministically and remains for you to judge on the diff.)\n\n")
+		default:
+			b.WriteString("operator_scope_path_undelivered (THIS PASS ONLY — operator-added scope path absent from this " +
+				"pass's committed diff):\n\n")
+			b.WriteString("The operator DELIBERATELY added the scope path(s) below — either an add_scope_files path folded " +
+				"at plan approval or an approved mid-stage scope amendment (often a binding-condition test) — and they " +
+				"are absent from " + operatorScopeEvaluatedSetPhrase(ev) + ". This is NOT a machine-verified miss: the " +
+				"implement stage's CUMULATIVE committed state could not be established" +
+				operatorScopeIncompleteReasonClause(ev.OperatorScopeUndeliveredIncompleteReason) + ", so any EARLIER " +
+				"pass of this stage was not evaluated and a listed path may ALREADY be present at the PR head. Verify " +
+				"each against the PR's cumulative base..head diff before raising it, and do NOT report one as a " +
+				"dropped edit on this evidence alone. (Scope here is untouched-only: a path the pass DID touch but " +
+				"with the wrong content is not detected deterministically and remains for you to judge on the diff.)\n\n")
 		}
 		for _, p := range ev.OperatorScopeUndelivered {
 			fmt.Fprintf(b, "- %s\n", p)
@@ -6884,4 +6962,32 @@ func quoteRepo(repo string) string {
 		return "this repository"
 	}
 	return "`" + repo + "`"
+}
+
+// operatorScopeEvaluatedSetPhrase names, in prose, the file set the
+// operator-scope-undelivered decision was measured against (#3029). The
+// stage-cumulative branch prints the span so the reviewer can reproduce the set;
+// every other branch says plainly that only the current pass was evaluated. It
+// is never empty, so no branch can assert absence from an unnamed set.
+func operatorScopeEvaluatedSetPhrase(ev *GateEvidence) string {
+	if !ev.OperatorScopeUndeliveredStageCumulative {
+		return "THIS PASS's committed diff"
+	}
+	base, head := ev.OperatorScopeUndeliveredCumulativeBaseSHA, ev.OperatorScopeUndeliveredCumulativeHeadSHA
+	if base == "" || head == "" {
+		return "the STAGE-CUMULATIVE committed file set (every commit this implement stage has pushed)"
+	}
+	return "the STAGE-CUMULATIVE committed file set (every commit this implement stage has pushed, base " +
+		base + " .. head " + head + ")"
+}
+
+// operatorScopeIncompleteReasonClause renders the backend machine reason a
+// cumulative evaluation could not be established as a parenthetical clause
+// (#3029). An empty reason renders nothing, so a caller that carries no reason
+// still produces grammatical prose.
+func operatorScopeIncompleteReasonClause(reason string) string {
+	if reason == "" {
+		return ""
+	}
+	return " (reason: " + reason + ")"
 }

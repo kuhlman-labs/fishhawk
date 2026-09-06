@@ -5049,3 +5049,113 @@ func TestPriorConcernsForReview_BlankNoteThreadsPointer(t *testing.T) {
 		t.Error("the settled ledger threaded an EMPTY note — a blank ledger row cannot stop a re-raise")
 	}
 }
+
+// TestMaybeBackstopFixupReReview_EvaluatesStageCumulativeDelivery is the #3029
+// CROSS-BOUNDARY test: it drives the REAL emission path end to end —
+// maybeBackstopFixupReReview -> runImplementReviews -> writeGateEvidence + the
+// operator_scope_path_undelivered audit append — rather than seeding a
+// GateEvidence fixture, because per-layer units pass while the seam that
+// actually mis-scoped the set stays broken.
+//
+// The span-aware compare client serves the two spans DISTINCTLY: the fix-up
+// delta (fixupbase...h3, the diff the reviewer reads) omits the granted path,
+// while the stage-cumulative span (stagebase...h3) contains it. That is exactly
+// the shape that produced #3029's six false reports.
+func TestMaybeBackstopFixupReReview_EvaluatesStageCumulativeDelivery(t *testing.T) {
+	const (
+		addPath   = "frontend/src/components/stage-detail.test.tsx"
+		newHead   = "h3"
+		fixupBase = "fixupbase"
+		stageBase = "stagebase"
+	)
+
+	// newBackstopServer builds the backstop harness with a span-aware compare
+	// client, an approved add_scope_files grant, and the stage's push ledger.
+	newBackstopServer := func(t *testing.T, bySpan map[string]string) (*Server, *auditFake, *run.Run, *run.Stage, *fakePlanReviewer) {
+		t.Helper()
+		reviewer := &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+			model:   "claude-opus-4-8",
+		}
+		s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, "", false)
+		s.cfg.GitHub = spanAwareComparePatchClient(t, bySpan)
+		au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
+		sid := implStage.ID
+		seedHeadEntry(au, runRow.ID, &sid, "pull_request_opened", 10,
+			map[string]any{"head_sha": "h2", "base_sha": stageBase})
+		seedHeadEntry(au, runRow.ID, &sid, "fixup_pushed", 20,
+			map[string]any{"head_sha": newHead, "base_sha": fixupBase})
+		return s, au, runRow, implStage, reviewer
+	}
+
+	t.Run("prior_pass_delivery_is_not_reported", func(t *testing.T) {
+		s, au, runRow, implStage, reviewer := newBackstopServer(t, map[string]string{
+			// The reviewed diff: the fix-up delta, WITHOUT the granted path.
+			fixupBase + "..." + newHead: deltaCompareBodyFor("DELTA_MARKER", "delta/only.go"),
+			// The evaluation set: the stage's cumulative committed state, WITH it.
+			stageBase + "..." + newHead: cumulativeCompareBody("cumulative/only.go", addPath),
+		})
+
+		s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, newHead, fixupBase)
+		s.waitBackgroundReviews()
+
+		if payload, ok := operatorScopeUndeliveredAuditPayload(t, au); ok {
+			t.Errorf("a grant delivered by an earlier pass must NOT be reported undelivered; got %v",
+				payload.UndeliveredPaths)
+		}
+		reviewer.mu.Lock()
+		defer reviewer.mu.Unlock()
+		if len(reviewer.calls) != 1 {
+			t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+		}
+		got := reviewer.calls[0]
+		if strings.Contains(got, "operator_scope_path_undelivered (") {
+			t.Errorf("prompt must render no undelivered block:\n%s", got)
+		}
+		// The #1725 delta framing is UNCHANGED by this fix: the reviewer still
+		// reads the FIX-UP DELTA, not the cumulative span. Only the evaluation
+		// set moved.
+		if !strings.Contains(got, "delta/only.go") {
+			t.Errorf("reviewed diff must still be the fix-up delta:\n%s", got)
+		}
+		if strings.Contains(got, "cumulative/only.go") {
+			t.Errorf("the cumulative span must NOT become the reviewed diff:\n%s", got)
+		}
+	})
+
+	t.Run("truncated_cumulative_compare_hedges_to_this_pass", func(t *testing.T) {
+		s, au, runRow, implStage, reviewer := newBackstopServer(t, map[string]string{
+			fixupBase + "..." + newHead: deltaCompareBodyFor("DELTA_MARKER", "delta/only.go"),
+			// A forge-TRUNCATED cumulative inventory can omit a delivered path,
+			// so the cumulative state is NOT established.
+			stageBase + "..." + newHead: truncatedCompareBody(addPath),
+		})
+
+		s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, newHead, fixupBase)
+		s.waitBackgroundReviews()
+
+		payload, ok := operatorScopeUndeliveredAuditPayload(t, au)
+		if !ok {
+			t.Fatal("the signal must still fire on a truncated compare — it is only labelled honestly")
+		}
+		if payload.EvaluatedAgainst != evaluatedAgainstThisPass || payload.HistoryComplete {
+			t.Errorf("evaluated_against=%q history_complete=%v, want %q/false",
+				payload.EvaluatedAgainst, payload.HistoryComplete, evaluatedAgainstThisPass)
+		}
+		if payload.IncompleteReason != cumulativeReasonCompareTruncated {
+			t.Errorf("incomplete_reason = %q, want %q", payload.IncompleteReason, cumulativeReasonCompareTruncated)
+		}
+		reviewer.mu.Lock()
+		defer reviewer.mu.Unlock()
+		got := reviewer.calls[0]
+		for _, want := range []string{
+			"operator_scope_path_undelivered (THIS PASS ONLY — operator-added scope path absent from this pass's committed diff):",
+			"could not be established (reason: " + cumulativeReasonCompareTruncated + ")",
+			"- " + addPath,
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("hedged prompt missing %q:\n%s", want, got)
+			}
+		}
+	})
+}
