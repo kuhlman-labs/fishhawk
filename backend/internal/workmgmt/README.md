@@ -345,7 +345,11 @@ rerouted, and a test pins that with evidence present.
 A `failed` apply record contributes NO churn-baseline disposition, so its entry
 is classified ABSENT and RESURFACES on the next grooming run. For a partial
 write that is now benign: the ledger lets the next apply finish it, after which
-it records `applied` and stops resurfacing.
+it records `applied` and stops resurfacing. That holds even when the RESUME
+write itself fails — the provider returns another `*PartialGroomingWriteError`
+carrying the same landed step, so `settleGroomingCandidate` re-stamps the
+evidence and the entry converges on a later apply instead of settling
+evidence-less under latest-record-wins.
 
 For the **divergent-marker refusal** — the body names one parent while the graph
 holds none or another — it is not benign and does not self-heal. (Branch 3 is

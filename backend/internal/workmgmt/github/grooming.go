@@ -379,7 +379,18 @@ func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMu
 				updated := ensureParentEpicMarker(issue.Body, parent)
 				if _, uerr := p.api.UpdateIssue(ctx, req.Target.Scope, repo, number,
 					githubclient.UpdateIssueParams{Body: &updated}); uerr != nil {
-					return nil, fmt.Errorf("workmgmt/github: record parent epic on #%d: %w", number, uerr)
+					// A FAILED RESUME IS STILL A HALF-WRITE (the board arm
+					// carries the mirror of this comment). A plain error would
+					// settle the entry failed-WITHOUT-steps, and latest-record-
+					// wins would erase the evidence that got us here — every
+					// later apply would then read an empty ledger and take the
+					// already-linked skip, never converging to a marker. The
+					// edge is still recorded and the marker still absent, so the
+					// honest record is the SAME landed step as before.
+					return nil, &workmgmt.PartialGroomingWriteError{
+						Steps: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepEpicEdgeAdded},
+						Cause: fmt.Errorf("workmgmt/github: record parent epic on #%d: %w", number, uerr),
+					}
 				}
 				return &workmgmt.GroomingMutationResult{Applied: true, Observed: observed,
 					ProviderResponse: fmt.Sprintf("resumed the half-written epic link of #%d: stamped the %s marker (%s)",
@@ -614,7 +625,15 @@ func (p *Provider) groomingMoveCard(ctx context.Context, req workmgmt.GroomingMu
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: resolve project fields: %w", err)
 	}
-	if _, ok := meta.StatusOptions[column]; !ok {
+	// THE ONE COLUMN VALIDATION, and it is deliberately the ONLY one: the
+	// resolved option id is BOUND here and reused by the resume write below,
+	// rather than looked up a second time at that write. A second lookup could
+	// go unguarded (and did, until this was hoisted), sending an EMPTY optionId
+	// to SetProjectItemSingleSelect against a board whose option was renamed
+	// away — the induction the live-validation walk in README.md recommends.
+	// Binding once makes that unrepresentable instead of merely checked twice.
+	optionID, ok := meta.StatusOptions[column]
+	if !ok {
 		return nil, &UnsupportedGroomingKindError{Kind: req.Kind,
 			Detail: fmt.Sprintf("target column %q is not a %s option on the project; available: %s",
 				column, statusFieldName, strings.Join(sortedKeys(meta.StatusOptions), ", "))}
@@ -667,9 +686,23 @@ func (p *Provider) groomingMoveCard(ctx context.Context, req workmgmt.GroomingMu
 		// #2810 deliberately does not make. The convergence test asserts NO
 		// AddItem call is made on the resuming apply, so that is a covered
 		// property rather than a comment asserting its own correctness.
-		optionID := meta.StatusOptions[column]
+		//
+		// optionID is the one the pre-write validation above already resolved
+		// and PROVED present, so this write can never carry an empty option id.
 		if err := p.api.SetProjectItemSingleSelect(boardCtx, req.Target.Scope, meta.ProjectID, item.ItemID, meta.FieldID, optionID); err != nil {
-			return nil, fmt.Errorf("workmgmt/github: resume column write on #%d: %w", number, err)
+			// A FAILED RESUME IS STILL A HALF-WRITE, and must say so. Returning
+			// a plain error here would settle the entry with a
+			// failed-WITHOUT-steps record, and under the latest-record-wins
+			// bound that erases the very evidence this resume depends on —
+			// every later apply would then see an empty ledger and fall back to
+			// the permanent manual_placement_preserved refusal, reintroducing
+			// the non-convergence #2810 exists to fix. The shape on the forge is
+			// UNCHANGED (still on-board, still column-unset), so the honest
+			// record is the SAME landed step the first failure recorded.
+			return nil, &workmgmt.PartialGroomingWriteError{
+				Steps: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepBoardItemAdded},
+				Cause: fmt.Errorf("workmgmt/github: resume column write on #%d: %w", number, err),
+			}
 		}
 		return &workmgmt.GroomingMutationResult{Applied: true, Observed: observed,
 			ProviderResponse: fmt.Sprintf("resumed the half-written board placement of #%d: set the column to %q (%s)",

@@ -249,7 +249,15 @@ provider-neutral rule that decides whether to resume lives in
 `backend/internal/workmgmt` — see that package's README for the ledger's
 semantics and its stated residual.
 
-**The two producing sites.**
+**The four producing sites** — two FIRST-attempt sites and two RESUME sites. A
+resume write that itself fails is still a half-write and must say so: a plain
+error there would settle the entry `failed` with NO `steps_landed`, which under
+the core's latest-record-wins bound ERASES the very evidence the resume ran on,
+and every later apply would fall back to the permanent refusal (board) or
+already-applied skip (epic) — the non-convergence #2810 exists to fix, one
+transient forge error away. The forge shape is unchanged at that point (still
+on-board column-unset; still edge-with-no-marker), so the honest record is the
+SAME landed step the first failure carried.
 
 - `placeIssueOnBoard` (`provider.go`): when `AddProjectItem` SUCCEEDED and
   `SetProjectItemSingleSelect` failed, it returns the unexported
@@ -264,6 +272,14 @@ semantics and its stated residual.
   the marker `UpdateIssue` failed, it returns
   `*workmgmt.PartialGroomingWriteError{Steps: [epic_edge_added]}` instead of the
   bare wrap.
+- The BOARD RESUME write (`groomingMoveCard`) and the EPIC RESUME write
+  (`groomingLinkEpic` branch 1), when they fail, return the same typed error
+  carrying the same step — `board_item_added` and `epic_edge_added`
+  respectively.
+  `TestApplyGrooming_BoardPlaceResumeWriteFailureStillConverges` and
+  `TestApplyGrooming_EpicLinkResumeWriteFailureStillConverges` drive three
+  applies each (fail, fail-the-resume, converge), consuming apply 2's OWN
+  recorded ledger rather than apply 1's.
 
 **The two resume write paths.**
 
@@ -322,10 +338,17 @@ file for the walk, never a live backlog item, and pick an issue that is NOT
 already on the board and has NO parent epic.
 
 **Half-write A — board_place.** Induce it by making the column write fail while
-the card add succeeds: set the report's `hygiene.fix.board_state` to a canonical
-state whose board option you then RENAME on Project #7 between the
-`ProjectFields` read and the write (or, more simply, revoke the projects token's
-write scope after the add lands). READ BACK to confirm the half-written state:
+the card add succeeds: revoke the projects token's WRITE scope after the add
+lands (`ProjectFields` and the add are reads/writes that already happened; the
+`SetProjectItemSingleSelect` that follows then fails). Do NOT try to induce it
+by renaming the target column: `groomingMoveCard` resolves and VALIDATES the
+option id once, before any write, so a rename that lands before the
+`ProjectFields` read draws the typed `is not a Status option` refusal with zero
+writes on BOTH the first attempt and the resume — the correct behaviour, but not
+a half-write. (That refusal is itself pinned offline by
+`TestApplyGrooming_BoardResumeRefusesAColumnMissingFromTheBoard`, which renames
+the column BETWEEN the two applies; you do not need to walk it.) READ BACK to
+confirm the half-written state:
 the card appears on Project #7 with an EMPTY Status cell, and the run's
 `grooming_mutation_applied` audit row for that entry id carries
 `"outcome":"failed"` with `"steps_landed":["board_item_added"]`

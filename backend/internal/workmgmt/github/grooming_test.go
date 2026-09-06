@@ -2032,6 +2032,13 @@ type partialWriteForge struct {
 	failSetField bool
 	failPatch    bool
 
+	// dropOption, when non-empty, OMITS that column from every subsequent
+	// ProjectFields response — the renamed/removed-option induction the
+	// live-validation walk in README.md recommends. It is a forge-side change,
+	// so it can be flipped BETWEEN applies to model a human renaming the column
+	// after this system left a card half-placed.
+	dropOption string
+
 	graphql []string // one operation name per GraphQL call
 	patches int
 }
@@ -2087,9 +2094,17 @@ func newPartialWriteForge(t *testing.T, fx *partialWriteForge) *githubclient.Cli
 		switch {
 		case strings.Contains(body.Query, "ProjectFields"):
 			fx.graphql = append(fx.graphql, "ProjectFields")
+			// Rendered from `options` (minus fx.dropOption) rather than a fixed
+			// literal, so a column can disappear from the board mid-sequence.
+			var opts []string
+			for _, name := range sortedKeys(options) {
+				if name == fx.dropOption {
+					continue
+				}
+				opts = append(opts, `{"id":"`+options[name]+`","name":"`+name+`"}`)
+			}
 			_, _ = io.WriteString(w, `{"data":{"user":{"projectV2":{"id":"PROJ","field":{"id":"FIELD","options":[`+
-				`{"id":"OPT_BACKLOG","name":"Backlog"},{"id":"OPT_IN_PROGRESS","name":"In Progress"},`+
-				`{"id":"OPT_ICEBOX","name":"Icebox"}]}}}}}`)
+				strings.Join(opts, ",")+`]}}}}}`)
 		case strings.Contains(body.Query, "projectItems"):
 			fx.graphql = append(fx.graphql, "ProjectItemStatus")
 			if !fx.onBoard {
@@ -2527,5 +2542,192 @@ func TestApplyGroomingMutation_ProviderResumeMirrorRequiresEvidence(t *testing.T
 	}
 	if fx.column != "Backlog" {
 		t.Errorf("column = %q, want %q", fx.column, "Backlog")
+	}
+}
+
+// TestApplyGrooming_BoardResumeRefusesAColumnMissingFromTheBoard is the fix-up
+// pass's control for the resume write's option-id lookup.
+//
+// It is a GENUINE two-apply sequence over the stateful forge, with the board's
+// option set changed BETWEEN the applies — the renamed-column induction the
+// live-validation walk recommends — because that is how this state actually
+// arises: apply 1 leaves the card on-board and column-unset against a board that
+// HAS the column, and only then does the column go away.
+//
+// WHAT IT PINS. The resume write must not send an EMPTY option id: the resolved
+// option is validated (and bound) BEFORE the resume arm, so a column absent from
+// the board draws the named refusal and writes nothing. The assertions are the
+// audit outcome, the SetField COUNT and the read-back column — not error
+// identity alone, because an unguarded lookup would send `optionId: ""` and the
+// forge would answer 200, leaving no error to identify.
+func TestApplyGrooming_BoardResumeRefusesAColumnMissingFromTheBoard(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", failSetField: true}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req1, entryID := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, nil)
+	res1, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req1)
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	rec1 := dependsOnRecord(t, res1, entryID)
+	if len(rec1.StepsLanded) != 1 || rec1.StepsLanded[0] != workmgmt.GroomingStepBoardItemAdded {
+		t.Fatalf("apply 1 steps_landed = %v, want [%s]", rec1.StepsLanded, workmgmt.GroomingStepBoardItemAdded)
+	}
+	if !fx.onBoard || fx.column != "" {
+		t.Fatalf("after apply 1: onBoard=%t column=%q, want on-board with an unset column", fx.onBoard, fx.column)
+	}
+
+	// A HUMAN renames the target column away between the applies.
+	fx.dropOption = "Backlog"
+	setsBefore := countOp(fx.graphql, "SetField")
+
+	req2, _ := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, ledgerFromRecord(rec1))
+	res2, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req2)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	rec2 := dependsOnRecord(t, res2, entryID)
+	if rec2.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Errorf("apply 2 outcome = %q (%+v), want failed: the target column is no longer on the board", rec2.Outcome, rec2)
+	}
+	if !strings.Contains(rec2.Error, `"Backlog" is not a Status option`) || !strings.Contains(rec2.Error, "available:") {
+		t.Errorf("apply 2 error = %q, want the named unknown-column refusal listing the valid options", rec2.Error)
+	}
+	// COMMITTED STATE: no write was attempted at all. An unguarded lookup would
+	// have called SetField with an empty option id.
+	if got := countOp(fx.graphql, "SetField"); got != setsBefore {
+		t.Errorf("SetField calls = %d, want %d (the refusal must write nothing)", got, setsBefore)
+	}
+	if fx.column != "" {
+		t.Errorf("column after apply 2 = %q, want it STILL unset", fx.column)
+	}
+}
+
+// TestApplyGrooming_BoardPlaceResumeWriteFailureStillConverges pins the board
+// arm of the fix-up's second control: a RESUME write that itself fails must
+// record the SAME landed step, so the ledger survives and a THIRD apply
+// converges.
+//
+// WHY IT MATTERS. settleGroomingCandidate stamps steps_landed only from a
+// *PartialGroomingWriteError, and priorGroomingPartialSteps is latest-record-
+// wins — so a failed-WITHOUT-steps record here would settle the entry with an
+// empty ledger and every later apply would take the permanent
+// manual_placement_preserved refusal. One transient forge error during the
+// resume would reintroduce exactly the non-convergence #2810 fixes.
+//
+// The THIRD apply is the discriminating assertion: apply 2's steps_landed alone
+// could be read as bookkeeping, while a third apply that converges proves the
+// evidence was still usable.
+func TestApplyGrooming_BoardPlaceResumeWriteFailureStillConverges(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", failSetField: true}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req1, entryID := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, nil)
+	res1, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req1)
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	rec1 := dependsOnRecord(t, res1, entryID)
+	if len(rec1.StepsLanded) != 1 || rec1.StepsLanded[0] != workmgmt.GroomingStepBoardItemAdded {
+		t.Fatalf("apply 1 steps_landed = %v, want [%s]", rec1.StepsLanded, workmgmt.GroomingStepBoardItemAdded)
+	}
+
+	// The RESUME write fails too (a second transient forge error).
+	fx.failSetField = true
+	adds := countOp(fx.graphql, "AddItem")
+
+	req2, _ := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, ledgerFromRecord(rec1))
+	res2, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req2)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	rec2 := dependsOnRecord(t, res2, entryID)
+	if rec2.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Fatalf("apply 2 outcome = %q (%+v), want failed (the resume write was injected to fail)", rec2.Outcome, rec2)
+	}
+	if len(rec2.StepsLanded) != 1 || rec2.StepsLanded[0] != workmgmt.GroomingStepBoardItemAdded {
+		t.Fatalf("apply 2 steps_landed = %v, want [%s]: a failed resume must not erase the ledger",
+			rec2.StepsLanded, workmgmt.GroomingStepBoardItemAdded)
+	}
+	// STATE READ-BACK: the half-written shape is unchanged, which is what makes
+	// re-recording the same landed step the HONEST record rather than a guess.
+	if !fx.onBoard || fx.column != "" {
+		t.Fatalf("after apply 2: onBoard=%t column=%q, want the half-write unchanged", fx.onBoard, fx.column)
+	}
+
+	// APPLY 3 consumes apply 2's OWN record — not apply 1's — so the ledger
+	// under test is the one the failed resume produced.
+	req3, _ := boardPlaceApply(2237, workmgmt.CanonicalStateBacklog, ledgerFromRecord(rec2))
+	res3, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req3)
+	if err != nil {
+		t.Fatalf("apply 3: %v", err)
+	}
+	rec3 := dependsOnRecord(t, res3, entryID)
+	if rec3.Outcome != workmgmt.GroomingOutcomeApplied {
+		t.Fatalf("apply 3 outcome = %q (%+v), want applied — a failed resume must not end convergence", rec3.Outcome, rec3)
+	}
+	if fx.column != "Backlog" {
+		t.Errorf("column after apply 3 = %q, want %q", fx.column, "Backlog")
+	}
+	if got := countOp(fx.graphql, "AddItem"); got != adds {
+		t.Errorf("AddItem calls = %d, want %d (no resume may re-add an already-boarded card)", got, adds)
+	}
+}
+
+// TestApplyGrooming_EpicLinkResumeWriteFailureStillConverges is the epic mirror
+// of the board case above: the marker PATCH fails on the RESUME too, and the
+// third apply still stamps the marker. Without the typed error on that site the
+// entry settles evidence-less and every later apply takes the already-linked
+// skip, leaving the body permanently marker-less.
+func TestApplyGrooming_EpicLinkResumeWriteFailureStillConverges(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", failPatch: true}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req1, entryID := epicLinkApply(2237, "#389", nil)
+	res1, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req1)
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	rec1 := dependsOnRecord(t, res1, entryID)
+	if len(rec1.StepsLanded) != 1 || rec1.StepsLanded[0] != workmgmt.GroomingStepEpicEdgeAdded {
+		t.Fatalf("apply 1 steps_landed = %v, want [%s]", rec1.StepsLanded, workmgmt.GroomingStepEpicEdgeAdded)
+	}
+
+	// The RESUME marker write fails too.
+	fx.failPatch = true
+	links := countOp(fx.graphql, "AddSubIssue")
+
+	req2, _ := epicLinkApply(2237, "#389", ledgerFromRecord(rec1))
+	res2, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req2)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	rec2 := dependsOnRecord(t, res2, entryID)
+	if rec2.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Fatalf("apply 2 outcome = %q (%+v), want failed (the resume PATCH was injected to fail)", rec2.Outcome, rec2)
+	}
+	if len(rec2.StepsLanded) != 1 || rec2.StepsLanded[0] != workmgmt.GroomingStepEpicEdgeAdded {
+		t.Fatalf("apply 2 steps_landed = %v, want [%s]: a failed resume must not erase the ledger",
+			rec2.StepsLanded, workmgmt.GroomingStepEpicEdgeAdded)
+	}
+	// STATE READ-BACK: the edge is still recorded and the marker still absent.
+	if fx.structuralParent != "#389" || strings.Contains(fx.body, "Parent epic:") {
+		t.Fatalf("after apply 2: parent=%q body=%q, want the half-write unchanged", fx.structuralParent, fx.body)
+	}
+
+	req3, _ := epicLinkApply(2237, "#389", ledgerFromRecord(rec2))
+	res3, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req3)
+	if err != nil {
+		t.Fatalf("apply 3: %v", err)
+	}
+	rec3 := dependsOnRecord(t, res3, entryID)
+	if rec3.Outcome != workmgmt.GroomingOutcomeApplied {
+		t.Fatalf("apply 3 outcome = %q (%+v), want applied — a failed resume must not end convergence", rec3.Outcome, rec3)
+	}
+	if n := strings.Count(fx.body, "Parent epic:"); n != 1 || !strings.Contains(fx.body, "Parent epic: #389") {
+		t.Errorf("body after apply 3 = %q, want exactly one #389 marker", fx.body)
+	}
+	if got := countOp(fx.graphql, "AddSubIssue"); got != links {
+		t.Errorf("AddSubIssue calls = %d, want %d (no resume may re-link an existing edge)", got, links)
 	}
 }
