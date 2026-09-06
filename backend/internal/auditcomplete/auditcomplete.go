@@ -98,7 +98,30 @@ const (
 	// review_pending holds the merge today. Emitted only in place of the
 	// parent implement stage's own trace_missing items, never alongside them.
 	MissingChildrenPending MissingKind = "children_pending"
+	// MissingStageNotTerminal marks a non-review stage that has not reached a
+	// terminal state (E64.59 / #3190). Pending-flavored like review_pending: a
+	// mid-flight run is "wait", not "broken", so the overall state is exactly
+	// what it was before this kind existed — StatePending, never fail.
+	//
+	// It exists because the mid-flight branch was the ONLY pending return in
+	// Compute that carried no evidence at all. An empty missing list renders a
+	// Check Run whose output.text is null, so an operator staring at a
+	// permanently in_progress fishhawk_audit_complete has nothing to read and
+	// no action to take. The detail NAMES the stage and its state, and for the
+	// fix-up-re-opened acceptance case (#1682) it names the re-dispatch that
+	// clears it.
+	MissingStageNotTerminal MissingKind = "stage_not_terminal"
 )
+
+// categoryAcceptanceReopened is the audit category server.reopenAcceptanceOnFixupPush
+// writes when a fix-up push invalidates a settled acceptance verdict (#1682).
+// Spelled as a literal because auditcomplete cannot import package server (the
+// server depends on auditcomplete), duplicating server.CategoryAcceptanceReopened
+// — the same reason "acceptance_outcome_recorded" is a literal a few rules down.
+// The duplication is unguarded by the compiler; the mitigation is that the
+// server-side integration tests drive the entry through the SERVER's own reopen
+// path, so a rename on either side reddens them.
+const categoryAcceptanceReopened = "acceptance_reopened"
 
 // TerminalImplementReviewCategories is the set of audit categories that count
 // as a settled agent implement-review verdict (#947 / ADR-027). ANY of them
@@ -431,10 +454,24 @@ func ComputeResult(ctx context.Context, runID uuid.UUID, deps Deps) (Result, err
 	// Mid-flight: if any non-review stage hasn't terminated, the
 	// run isn't "done" — so neither is the audit. Pending rather
 	// than fail; the reviewer waits.
+	//
+	// E64.59 / #3190: the pending now CARRIES ITS CAUSE. This branch used to
+	// return an empty missing list, which is why a run stranded here published
+	// a Check Run with a null output.text and nothing an operator could act on.
+	// The state and the early-return placement are unchanged — no rule below
+	// starts running on a mid-flight run — the ONLY difference is that the
+	// pending names the stage holding it.
+	var notTerminal []MissingItem
 	for _, s := range nonReview {
 		if !s.State.IsTerminal() {
-			return Result{State: stagecheck.StatePending}, nil
+			notTerminal = append(notTerminal, MissingItem{
+				Kind:   MissingStageNotTerminal,
+				Detail: stageNotTerminalDetail(ctx, deps, runID, s),
+			})
 		}
+	}
+	if len(notTerminal) > 0 {
+		return Result{State: stagecheck.StatePending, Missing: notTerminal}, nil
 	}
 
 	var missing []MissingItem
@@ -1263,19 +1300,82 @@ func resolveImplementTracesFromChildren(ctx context.Context, deps Deps, runID uu
 	return out, nil
 }
 
+// stageNotTerminalDetail renders the operator-facing detail for a non-terminal
+// non-review stage (E64.59 / #3190).
+//
+// The generic shape names the stage TYPE, its short id and its current STATE.
+// For an ACCEPTANCE stage that a fix-up push RE-OPENED (#1682) it renders an
+// action-bearing shape instead: that stage is not merely waiting, it is waiting
+// on an operator to re-dispatch it, and nothing else in the product says so.
+// The `acceptance_reopened` entry is HISTORY and never goes away, so the shape
+// is additionally split on the stage's CURRENT state: only a still-dispatchable
+// stage is told to re-dispatch, while a re-run already in flight is told to
+// wait. Keying on the entry alone would keep recommending a re-dispatch the
+// operator has already performed.
+//
+// The acceptance_reopened lookup FAILS OPEN: a read error degrades to the
+// generic detail and is never returned as a Compute error. This lookup exists
+// only to sharpen wording — turning a legible pending into a 500 would be the
+// opposite of what #3190 is for.
+func stageNotTerminalDetail(ctx context.Context, deps Deps, runID uuid.UUID, s *run.Stage) string {
+	generic := fmt.Sprintf("%s stage %s is in state %s; the run is not terminal, so the audit chain cannot be assembled yet",
+		s.Type, shortID(s.ID), s.State)
+	if s.Type != run.StageTypeAcceptance || deps.Audit == nil {
+		return generic
+	}
+	entries, err := deps.Audit.ListForRunByCategory(ctx, runID, categoryAcceptanceReopened)
+	if err != nil {
+		return generic
+	}
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == s.ID {
+			if !acceptanceAwaitsRedispatch(s.State) {
+				// The re-run the operator was told to start is ALREADY in
+				// flight. The audit entry is history and never goes away, so
+				// keying only on its presence would keep telling them to
+				// re-dispatch a stage that is running (#3190 fix-up).
+				return fmt.Sprintf("acceptance stage %s was re-opened by a fix-up push and its re-run is already in flight "+
+					"(state %s); the prior acceptance verdict is invalidated. Wait for the re-run to settle — "+
+					"this check clears on its own once acceptance settles.",
+					shortID(s.ID), s.State)
+			}
+			return fmt.Sprintf("acceptance stage %s was re-opened by a fix-up push and has not been re-run; "+
+				"the prior acceptance verdict is invalidated. Re-dispatch the acceptance stage "+
+				"(fishhawk_dispatch_stage, stage acceptance) — this check clears on its own once acceptance settles.",
+				shortID(s.ID))
+		}
+	}
+	return generic
+}
+
+// acceptanceAwaitsRedispatch reports whether a re-opened acceptance stage is
+// one the operator can still DISPATCH, rather than one whose re-run is already
+// under way and can only be waited on. Mirrors run.acceptanceIsDispatchable
+// (unexported, and `auditcomplete` does not import it): the two pre-dispatch
+// park states are `pending` (the state run.ReopenAcceptanceStage writes) and
+// `awaiting_host_dispatch` (a local run parked for the host spawn). Every
+// other non-terminal state — `dispatched`, `running`, any `awaiting_*` — means
+// the re-run exists, so naming a re-dispatch there would be untrue (#3116
+// draws the same split on the fix-up refusal).
+func acceptanceAwaitsRedispatch(s run.StageState) bool {
+	return s == run.StageStatePending || s == run.StageStateAwaitingHostDispatch
+}
+
 // onlyPendingFlavored returns true when every entry in `missing` is a
 // pending-flavored row — `head_fetch_failed` (we couldn't read the live
 // PR HEAD), `review_pending` (a dispatched agent review hasn't landed
 // yet), `security_findings_unverified` (we couldn't read/decode the
-// code-scanning signal), or `children_pending` (a decomposition child's
-// implement stage hasn't terminated, #3092). Used to demote the overall state from fail to
+// code-scanning signal), `children_pending` (a decomposition child's
+// implement stage hasn't terminated, #3092), or `stage_not_terminal` (a
+// non-review stage is mid-flight, #3190). Used to demote the overall state from fail to
 // pending: none is an audit GAP, just "wait / we don't know." A mix with
 // any hard gap (plan_missing, trace_missing, foreign_commit,
 // security_findings_unresolved, …) still fails.
 func onlyPendingFlavored(missing []MissingItem) bool {
 	for _, m := range missing {
 		switch m.Kind {
-		case MissingHeadFetchFail, MissingReviewPending, MissingSecurityScanUnverified, MissingChildrenPending:
+		case MissingHeadFetchFail, MissingReviewPending, MissingSecurityScanUnverified, MissingChildrenPending,
+			MissingStageNotTerminal:
 			// pending-flavored — keep scanning
 		default:
 			return false

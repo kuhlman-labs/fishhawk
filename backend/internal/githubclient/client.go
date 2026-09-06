@@ -3355,7 +3355,7 @@ func (c *Client) CreateCheckRun(ctx context.Context, scope forge.CredentialScope
 	if p.DetailsURL != "" {
 		body["details_url"] = p.DetailsURL
 	}
-	if p.OutputTitle != "" || p.OutputSummary != "" {
+	if p.OutputTitle != "" || p.OutputSummary != "" || p.OutputText != "" {
 		// GitHub requires both `title` and `summary` when `output`
 		// is present. Default the title when only a summary is set
 		// so callers can pass just the body without ceremony.
@@ -3363,10 +3363,17 @@ func (c *Client) CreateCheckRun(ctx context.Context, scope forge.CredentialScope
 		if title == "" {
 			title = p.Name
 		}
-		body["output"] = map[string]string{
+		out := map[string]string{
 			"title":   title,
 			"summary": p.OutputSummary,
 		}
+		// `output.text` is the long-form body (#3190). Emitted only when
+		// non-empty, so a caller that sets no text sends the pre-#3190
+		// two-key object byte-identically.
+		if p.OutputText != "" {
+			out["text"] = p.OutputText
+		}
+		body["output"] = out
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

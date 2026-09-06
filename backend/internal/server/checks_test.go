@@ -616,3 +616,98 @@ func TestRepublishAuditCheckOnRunTerminal_NilPublisher_NoPanic(t *testing.T) {
 	}
 	s.republishAuditCheckOnRunTerminal(context.Background(), r.ID)
 }
+
+// --- E64.59 / #3190: force is scoped to the strand-clearing republishes ------
+
+// TestRepublishAuditCheck_ReconcilerPathIsNotForced is the ANTI-NOISE pin. The
+// merge reconciler's heal sweep runs RepublishAuditCheck on every parked review
+// stage every 60 seconds; forcing it would post a new check run per minute per
+// parked run, which is noise replacing legibility. An identical state must
+// still dedup to nothing on that path.
+//
+// The DISCRIMINATOR is the sibling assertion in the same test: the
+// strand-clearing republishAuditCheckBeforeMerge, driven against the SAME
+// server and the SAME already-published state, DOES post. Without it a silently
+// broken publish would satisfy the zero-second-call assertion while testing
+// nothing.
+func TestRepublishAuditCheck_ReconcilerPathIsNotForced(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditCompleteAuditFake()
+	arts := newFakeArtifactRepo()
+	r := seedPublishableRun(t, rr, au, arts, "abc12345")
+	gh := newPublisherFakeGitHub()
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ArtifactRepo: arts,
+		StageCheckRepo: newFakeStageCheckRepo(),
+		ExternalURL:    "https://app.fishhawk.example.com",
+	})
+	wireEpisodePublisher(s, gh, rr, arts)
+	ctx := context.Background()
+
+	// Tick one: publishes and warms the dedup cache.
+	s.RepublishAuditCheck(ctx, r.ID)
+	if got := len(gh.calls()); got != 1 {
+		t.Fatalf("first reconciler tick published %d check runs, want 1", got)
+	}
+	// Ticks two and three: identical state, nothing posted.
+	s.RepublishAuditCheck(ctx, r.ID)
+	s.RepublishAuditCheck(ctx, r.ID)
+	if got := len(gh.calls()); got != 1 {
+		t.Fatalf("the 60s reconciler sweep published %d check runs across 3 ticks, want 1 — "+
+			"a forced publish on a timer posts a check run per minute per parked run", got)
+	}
+
+	// The discriminator: the strand-clearing path DOES force past the same
+	// dedup entry, on the same server and the same state.
+	if _, ok := s.republishAuditCheckBeforeMerge(ctx, r.ID); !ok {
+		t.Fatal("the before-merge republish did not compute a result; the zero-call assertion above cannot discriminate")
+	}
+	if got := len(gh.calls()); got != 2 {
+		t.Fatalf("the before-merge republish published %d check runs total, want 2 (it must force past the dedup)", got)
+	}
+}
+
+// TestRecomputeAndForcePublishAuditComplete_NilRepos_ReportsNotComputed pins the
+// dev-posture degrade of the forcing sibling: with no repos wired it must report
+// "we never got to look" (ok=false) rather than a zero Result the merge handler
+// would read as a decided not-pending state.
+func TestRecomputeAndForcePublishAuditComplete_NilRepos_ReportsNotComputed(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", StageCheckRepo: newFakeStageCheckRepo()})
+	if _, ok := s.recomputeAndForcePublishAuditComplete(context.Background(), uuid.New()); ok {
+		t.Fatal("with no RunRepo/ArtifactRepo/AuditRepo the forcing republish must report not-computed")
+	}
+}
+
+// TestRecomputeAndForcePublishAuditComplete_ComputeError_ReportsNotComputed is
+// the other not-computed branch: a failing audit read makes ComputeResult error,
+// which must degrade to ok=false (and no publish), never to a decided state.
+func TestRecomputeAndForcePublishAuditComplete_ComputeError_ReportsNotComputed(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditCompleteAuditFake()
+	arts := newFakeArtifactRepo()
+	r := seedPublishableRun(t, rr, au, arts, "abc12345")
+	gh := newPublisherFakeGitHub()
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ArtifactRepo: arts,
+		StageCheckRepo: newFakeStageCheckRepo(),
+		ExternalURL:    "https://app.fishhawk.example.com",
+	})
+	wireEpisodePublisher(s, gh, rr, arts)
+	// CategoryAcceptanceSkippedOutOfScope is the FIRST audit read
+	// auditcomplete.ComputeResult performs, so the recompute cannot reach the
+	// publish without hitting it.
+	failing := newAuditReadFailingFake(au, CategoryAcceptanceSkippedOutOfScope)
+	s.cfg.AuditRepo = failing
+	failing.arm()
+
+	res, ok := s.recomputeAndForcePublishAuditComplete(context.Background(), r.ID)
+	if failing.failedReads() == 0 {
+		t.Fatal("the injected audit read never failed; this test cannot discriminate")
+	}
+	if ok {
+		t.Fatalf("a compute error must report not-computed; got ok=true res=%+v", res)
+	}
+	if got := len(gh.calls()); got != 0 {
+		t.Errorf("a failed recompute published %d check runs, want 0", got)
+	}
+}

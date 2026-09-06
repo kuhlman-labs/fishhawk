@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
 
 // CategoryMergeVerdictRecorded is the audit-log category for the chained entry
@@ -370,7 +371,13 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	//
 	// Best-effort and never unwinds: a publish failure logs at WARN inside the
 	// helper and the merge is dispatched regardless.
-	s.republishAuditCheckBeforeMerge(r.Context(), runID)
+	// The returned Result is what lets the 409 below NAME the blocking
+	// audit-complete item instead of describing "required checks" generically
+	// (E64.59 / #3190). `auditRecomputed` distinguishes "the recompute ran and
+	// the state is not pending" from "we never got to look" (dev posture or a
+	// compute error), so the generic wording is used for the second case rather
+	// than a misleading claim about a state nothing derived.
+	auditRes, auditRecomputed := s.republishAuditCheckBeforeMerge(r.Context(), runID)
 
 	if merr := s.cfg.GateMerger.MergePullRequest(r.Context(), runRow); merr != nil {
 		// A checks-not-all-passed refusal (E67.56 / #2717) is an expected
@@ -386,9 +393,24 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(merr, forge.ErrPullRequestUnstableStatus) {
 			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: checks not all passed (unstable status)",
 				slog.String("run_id", runID.String()), slog.String("error", merr.Error()))
-			s.writeError(w, r, http.StatusConflict, "merge_checks_pending",
-				"the merge verdict is recorded and durable, but the squash merge cannot be queued because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request instead of waiting.",
-				map[string]any{"run_id": runID.String(), "verdict_sequence": verdictSequence, "pr_url": prURL, "reason": "checks_pending"})
+			details := map[string]any{"run_id": runID.String(), "verdict_sequence": verdictSequence, "pr_url": prURL, "reason": "checks_pending"}
+			msg := "the merge verdict is recorded and durable, but the squash merge cannot be queued because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request instead of waiting."
+			// E64.59 / #3190: when the blocking check is OUR OWN
+			// fishhawk_audit_complete sitting at pending, say WHY and WHAT TO
+			// DO. Purely additive — the existing keys are untouched, and a
+			// recompute that produced nothing, or a non-pending state, keeps
+			// the generic wording so a genuinely unrelated failing required
+			// check is never mislabelled.
+			if auditRecomputed && auditRes.State == stagecheck.StatePending && len(auditRes.Missing) > 0 {
+				items := make([]map[string]any, 0, len(auditRes.Missing))
+				for _, m := range auditRes.Missing {
+					items = append(items, map[string]any{"kind": string(m.Kind), "detail": m.Detail})
+				}
+				details["audit_complete_state"] = string(auditRes.State)
+				details["audit_complete_missing"] = items
+				msg += " fishhawk_audit_complete is pending because: " + auditRes.Missing[0].Detail
+			}
+			s.writeError(w, r, http.StatusConflict, "merge_checks_pending", msg, details)
 			return
 		}
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: dispatch merge failed",

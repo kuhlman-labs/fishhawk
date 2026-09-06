@@ -259,9 +259,47 @@ func (p *Publisher) PublishResult(ctx context.Context, runID uuid.UUID, state st
 // commit is not on. Passing the vouched sha as the override re-posts the check
 // on the live head.
 func (p *Publisher) PublishResultAtHead(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution, headSHAOverride string) (bool, error) {
+	return p.PublishWithOptions(ctx, runID, state, missing, resolved, PublishOptions{HeadSHAOverride: headSHAOverride})
+}
+
+// PublishOptions carries the optional knobs of a publish (E64.59 / #3190).
+// The zero value reproduces PublishResultAtHead's pre-#3190 behavior exactly,
+// which is how every existing caller reaches this path unchanged.
+type PublishOptions struct {
+	// HeadSHAOverride publishes AT that sha instead of the head findHeadSHA
+	// would resolve (the operator-vouch path, #3109). Empty = normal
+	// resolution.
+	HeadSHAOverride string
+	// Force skips the state-equality dedup consult so the Check Run is posted
+	// even when the same state is already published at this head.
+	//
+	// It exists for the two republish paths that exist to CLEAR a strand —
+	// republishAuditCheckBeforeMerge and republishAuditCheckOnRunTerminal. A
+	// run stranded mid-flight recomputes to the SAME pending state the fix-up
+	// synchronize already published, so the dedup cache suppresses the
+	// republish and the enriched output.text never lands (#3190's "deployed,
+	// ran twice, moved nothing" observation).
+	//
+	// Force is deliberately NOT wired to the merge reconciler's 60s heal
+	// sweep: a forced publish on a timer would post a new check run every
+	// minute on every parked run, which is noise replacing legibility.
+	//
+	// It only ever ADDS a publish. A cache MISS already publishes, and Force
+	// must never suppress that — pinned by
+	// TestPublishWithOptions_ForceOverColdCachePublishes. A forced publish
+	// still calls recordPublished, so the cache stays accurate and a later
+	// non-forced call dedups normally.
+	Force bool
+}
+
+// PublishWithOptions is PublishResultAtHead with the PublishOptions knobs
+// (E64.59 / #3190). PublishResultAtHead delegates here with Force unset, so
+// every pre-#3190 call site is byte-identical.
+func (p *Publisher) PublishWithOptions(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution, opts PublishOptions) (bool, error) {
 	if p == nil {
 		return false, nil
 	}
+	headSHAOverride := opts.HeadSHAOverride
 
 	runRow, err := p.runs.GetRun(ctx, runID)
 	if err != nil {
@@ -335,7 +373,7 @@ func (p *Publisher) PublishResultAtHead(ctx context.Context, runID uuid.UUID, st
 		forgeKind = "gitlab"
 	}
 
-	if !p.shouldPublish(repo, headSHA, forgeKind, state) {
+	if !opts.Force && !p.shouldPublish(repo, headSHA, forgeKind, state) {
 		// The dedup cache records only successful publishes, so a hit
 		// means this (repo, head_sha) already carries `state` on GitHub
 		// — posted by this run or by another run sharing the head
@@ -682,6 +720,7 @@ func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, re
 		params.Status = forge.CheckRunStatusCompleted
 		params.Conclusion = forge.CheckRunConclusionFailure
 		params.OutputSummary = renderFailureSummary(missing)
+		params.OutputText = renderMissingText(missing)
 	default:
 		// Anything else (pending, not_tracked, empty) is
 		// in_progress with no conclusion. The "" -> in_progress
@@ -689,6 +728,13 @@ func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, re
 		// publishing nothing would let a stale prior state ride.
 		params.Status = forge.CheckRunStatusInProgress
 		params.OutputSummary = "Audit chain is still being assembled. Fishhawk will update this check when the run terminates."
+		// E64.59 / #3190: a pending check used to carry a one-line summary and
+		// a NULL output.text, so a run stranded on the mid-flight branch gave
+		// the operator nothing to read. The one-line summary keeps its shape;
+		// the DETAIL — which stage, in which state, and what to do about it —
+		// rides in output.text.
+		params.OutputTitle = CheckName
+		params.OutputText = renderMissingText(missing)
 	}
 	return params
 }
@@ -720,6 +766,22 @@ func shortID(id uuid.UUID) string {
 		return s[:8]
 	}
 	return s
+}
+
+// renderMissingText renders the structured missing list into the check run's
+// long-form output.text body (E64.59 / #3190), one line per item. Empty for an
+// empty list, so a check with nothing to report omits `output.text` entirely
+// rather than publishing a bare lead line.
+func renderMissingText(missing []auditcomplete.MissingItem) string {
+	if len(missing) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Outstanding audit-completeness items:\n\n")
+	for _, m := range missing {
+		fmt.Fprintf(&b, "- **%s** — %s\n", m.Kind, m.Detail)
+	}
+	return b.String()
 }
 
 func renderFailureSummary(missing []auditcomplete.MissingItem) string {

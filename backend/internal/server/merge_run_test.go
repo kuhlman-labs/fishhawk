@@ -1402,3 +1402,135 @@ func TestMergeRun_RepublishFailure_StillDispatchesMerge(t *testing.T) {
 		t.Errorf("merge dispatched %d times, want 1 (a publish failure must not skip the dispatch)", merger.called)
 	}
 }
+
+// --- E64.59 / #3190: the 409 names the blocking audit-complete item ----------
+
+// TestHandleMergeRun_ChecksPending409NamesAuditCompleteMissing pins the enriched
+// 409: when the pre-merge recompute yields a PENDING fishhawk_audit_complete
+// with a non-empty missing list, the response names the cause and the remedy —
+// in details.audit_complete_missing AND inline in the message. Counterfactual:
+// deleting the details injection in the ErrPullRequestUnstableStatus branch
+// makes this RED.
+func TestHandleMergeRun_ChecksPending409NamesAuditCompleteMissing(t *testing.T) {
+	merger := &fakeMerger{err: unstableMergeErr()}
+	s, rr, _, _, r, acc := reopenedAcceptanceStrandFixture(t, "", merger)
+	ctx := context.Background()
+	s.reopenAcceptanceOnFixupPush(ctx, r.ID, fixupHeadSHA)
+	if got := stageStateOnOrchestratorRepo(t, rr, r.ID, acc.ID); got != run.StageStatePending {
+		t.Fatalf("acceptance stage state = %q, want pending (fixture did not seed the strand)", got)
+	}
+
+	w := postMergeRun(t, s, r.ID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if env.Error.Details["audit_complete_state"] != "pending" {
+		t.Errorf("details.audit_complete_state = %v, want pending", env.Error.Details["audit_complete_state"])
+	}
+	items, ok := env.Error.Details["audit_complete_missing"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("details.audit_complete_missing = %v, want one item", env.Error.Details["audit_complete_missing"])
+	}
+	item, _ := items[0].(map[string]any)
+	if item["kind"] != "stage_not_terminal" {
+		t.Errorf("missing[0].kind = %v, want stage_not_terminal", item["kind"])
+	}
+	if detail, _ := item["detail"].(string); !strings.Contains(detail, "fishhawk_dispatch_stage") {
+		t.Errorf("missing[0].detail = %q, want it to name the re-dispatch action", detail)
+	}
+	if !strings.Contains(env.Error.Message, "fishhawk_audit_complete is pending because:") ||
+		!strings.Contains(env.Error.Message, "fishhawk_dispatch_stage") {
+		t.Errorf("message must state the cause and the remedy inline: %q", env.Error.Message)
+	}
+	// Purely ADDITIVE: every pre-#3190 key survives unchanged.
+	if env.Error.Details["reason"] != "checks_pending" {
+		t.Errorf("details.reason = %v, want checks_pending", env.Error.Details["reason"])
+	}
+	if env.Error.Details["pr_url"] != fixupRepublishPRURL {
+		t.Errorf("details.pr_url = %v, want %q", env.Error.Details["pr_url"], fixupRepublishPRURL)
+	}
+	if _, ok := env.Error.Details["verdict_sequence"]; !ok {
+		t.Errorf("details missing verdict_sequence: %v", env.Error.Details)
+	}
+}
+
+// TestHandleMergeRun_ChecksPending409UnchangedWhenAuditCompleteNotPending is the
+// FALLBACK branch: the very same fixture with NO fix-up reopen recomputes to a
+// PASS, so the blocking required check is something else entirely — a CI job, a
+// CodeQL run. The 409 must keep its generic wording and add no audit-complete
+// keys, so an unrelated failing check is never mislabelled as ours.
+func TestHandleMergeRun_ChecksPending409UnchangedWhenAuditCompleteNotPending(t *testing.T) {
+	merger := &fakeMerger{err: unstableMergeErr()}
+	s, _, _, _, r, _ := reopenedAcceptanceStrandFixture(t, "", merger)
+	// NO reopen: every non-review stage is terminal, so the recompute passes.
+
+	w := postMergeRun(t, s, r.ID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, present := env.Error.Details["audit_complete_missing"]; present {
+		t.Errorf("a non-pending audit-complete must add NO audit_complete_missing key: %v", env.Error.Details)
+	}
+	if _, present := env.Error.Details["audit_complete_state"]; present {
+		t.Errorf("a non-pending audit-complete must add NO audit_complete_state key: %v", env.Error.Details)
+	}
+	if strings.Contains(env.Error.Message, "fishhawk_audit_complete is pending because") {
+		t.Errorf("a non-pending audit-complete must keep the generic wording: %q", env.Error.Message)
+	}
+	if !strings.Contains(env.Error.Message, "have not all passed") {
+		t.Errorf("the generic wording must survive: %q", env.Error.Message)
+	}
+}
+
+// TestHandleMergeRun_ChecksPending409GenericWhenRecomputeUnavailable is the
+// third arm: the recompute never RAN (dev posture — no ArtifactRepo, so the
+// forcing republish reports not-computed). "We never got to look" must read as
+// the generic message, never as a decided not-pending state.
+func TestHandleMergeRun_ChecksPending409GenericWhenRecomputeUnavailable(t *testing.T) {
+	merger := &fakeMerger{err: unstableMergeErr()}
+	s, repo, _ := newAutoDriveMergeServer(t, merger)
+	if s.cfg.ArtifactRepo != nil {
+		t.Fatal("fixture wires an ArtifactRepo; this arm cannot discriminate")
+	}
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, present := env.Error.Details["audit_complete_missing"]; present {
+		t.Errorf("an un-run recompute must add NO audit_complete_missing key: %v", env.Error.Details)
+	}
+	if strings.Contains(env.Error.Message, "fishhawk_audit_complete is pending because") {
+		t.Errorf("an un-run recompute must keep the generic wording: %q", env.Error.Message)
+	}
+}

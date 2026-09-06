@@ -1933,3 +1933,188 @@ func TestPublishNotApplicable_SuccessOpensNoEpisode(t *testing.T) {
 		t.Errorf("OnDegraded fired %d time(s); want 0", len(got))
 	}
 }
+
+// --- E64.59 / #3190: the missing list rides in output.text ---------------------
+
+// TestBuildParams_PendingCarriesMissingTextInOutputText pins the field #3190
+// observed as NULL on the stranded check. Counterfactual: deleting
+// params.OutputText in buildParams' pending branch makes this RED.
+func TestBuildParams_PendingCarriesMissingTextInOutputText(t *testing.T) {
+	runID, gh, pub := happyDeps(t)
+	missing := []auditcomplete.MissingItem{{
+		Kind:   auditcomplete.MissingStageNotTerminal,
+		Detail: "acceptance stage 88538e1a was re-opened by a fix-up push and has not been re-run",
+	}}
+	if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePending, missing); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	p := gh.calls[0].params
+	if p.Status != forge.CheckRunStatusInProgress {
+		t.Fatalf("status = %q want in_progress", p.Status)
+	}
+	if !strings.Contains(p.OutputText, "stage_not_terminal") ||
+		!strings.Contains(p.OutputText, "88538e1a") ||
+		!strings.Contains(p.OutputText, "re-opened by a fix-up push") {
+		t.Errorf("output.text = %q, want the missing kind AND its detail rendered", p.OutputText)
+	}
+	// GitHub requires a title alongside a summary whenever `output` is sent.
+	if p.OutputTitle == "" {
+		t.Error("pending output must carry a title")
+	}
+	if p.OutputSummary == "" {
+		t.Error("the one-line summary must keep its shape; the DETAIL rides in output.text")
+	}
+}
+
+// TestBuildParams_FailCarriesMissingTextInOutputText is the fail-branch twin:
+// the same rendering must reach a FAILING check, not only a pending one.
+func TestBuildParams_FailCarriesMissingTextInOutputText(t *testing.T) {
+	runID, gh, pub := happyDeps(t)
+	missing := []auditcomplete.MissingItem{
+		{Kind: auditcomplete.MissingTrace, Detail: "implement stage missing redacted bundle"},
+	}
+	if _, err := pub.Publish(context.Background(), runID, stagecheck.StateFail, missing); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	p := gh.calls[0].params
+	if !strings.Contains(p.OutputText, "trace_missing") ||
+		!strings.Contains(p.OutputText, "missing redacted bundle") {
+		t.Errorf("output.text = %q, want the missing kind AND its detail rendered", p.OutputText)
+	}
+}
+
+// TestBuildParams_NoMissing_OmitsOutputText pins the empty-list branch: a check
+// with nothing to report must omit output.text entirely rather than publishing
+// a bare lead line. This is also the no-`output`-regression guard for the pass
+// branch, which never carried text and still must not.
+func TestBuildParams_NoMissing_OmitsOutputText(t *testing.T) {
+	runID, gh, pub := happyDeps(t)
+	if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePending, nil); err != nil {
+		t.Fatalf("Publish(pending): %v", err)
+	}
+	if got := gh.calls[0].params.OutputText; got != "" {
+		t.Errorf("pending output.text with no missing items = %q, want empty", got)
+	}
+	if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err != nil {
+		t.Fatalf("Publish(pass): %v", err)
+	}
+	if got := gh.calls[1].params.OutputText; got != "" {
+		t.Errorf("pass output.text = %q, want empty", got)
+	}
+}
+
+// --- E64.59 / #3190: Force publishes past the state-equality dedup ------------
+
+// TestPublishWithOptions_ForcePublishesOverIdenticalState is THE dedup
+// counterfactual. The publisher's cache keys on the last published STATE, so a
+// stranded run — which recomputes to the same `pending` the fix-up synchronize
+// already published — is suppressed and the enriched text never lands. Force
+// posts anyway, carrying the NEW text.
+//
+// Counterfactual: deleting the `!opts.Force &&` guard on the shouldPublish
+// consult makes this RED (one call, not two).
+func TestPublishWithOptions_ForcePublishesOverIdenticalState(t *testing.T) {
+	runID, gh, pub := happyDeps(t)
+	ctx := context.Background()
+
+	// The fix-up synchronize: pending with no detail. Warms the dedup cache.
+	if _, err := pub.Publish(ctx, runID, stagecheck.StatePending, nil); err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+	// Prove the strand exists: an UNFORCED republish of the same state is
+	// suppressed. Without this the forced assertion below could not
+	// discriminate.
+	republished, err := pub.PublishResultAtHead(ctx, runID, stagecheck.StatePending, nil, nil, "")
+	if err != nil {
+		t.Fatalf("unforced republish: %v", err)
+	}
+	if republished {
+		t.Fatal("an unforced republish of an identical state must be dedup-suppressed (fixture cannot discriminate)")
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("calls after the unforced republish = %d, want 1", len(gh.calls))
+	}
+
+	missing := []auditcomplete.MissingItem{{
+		Kind:   auditcomplete.MissingStageNotTerminal,
+		Detail: "acceptance stage 88538e1a was re-opened by a fix-up push",
+	}}
+	forced, err := pub.PublishWithOptions(ctx, runID, stagecheck.StatePending, missing, nil,
+		auditcheckpublisher.PublishOptions{Force: true})
+	if err != nil {
+		t.Fatalf("forced republish: %v", err)
+	}
+	if !forced {
+		t.Fatal("a forced republish must publish past the state-equality dedup")
+	}
+	if len(gh.calls) != 2 {
+		t.Fatalf("calls after the forced republish = %d, want 2", len(gh.calls))
+	}
+	if !strings.Contains(gh.calls[1].params.OutputText, "re-opened by a fix-up push") {
+		t.Errorf("forced republish output.text = %q, want the NEW detail", gh.calls[1].params.OutputText)
+	}
+
+	// The cache stays accurate: a later UNFORCED call still dedups.
+	after, err := pub.Publish(ctx, runID, stagecheck.StatePending, missing)
+	if err != nil {
+		t.Fatalf("post-force unforced publish: %v", err)
+	}
+	if after {
+		t.Error("a forced publish must still recordPublished, so a later unforced call dedups")
+	}
+}
+
+// TestPublishWithOptions_ForceOverColdCachePublishes is a REGRESSION PIN of the
+// daemon-restart path, NOT a counterfactual vehicle — and it is declared as such
+// rather than listed among the counterfactuals and hoped about.
+//
+// Under the plain deletion of the Force short-circuit it is GREEN BY
+// CONSTRUCTION: a cache MISS publishes either way, so removing the control
+// changes nothing here. Its DISCRIMINATING mutation is different — make Force
+// short-circuit to `return false` on a cache miss (i.e. let Force SUPPRESS a
+// publish that would otherwise land) — and that mutation was run and observed
+// RED.
+//
+// What it protects: after a daemon restart the dedup cache is empty, so a
+// forced republish of a stranded run must still post. Force may only ever ADD a
+// publish.
+func TestPublishWithOptions_ForceOverColdCachePublishes(t *testing.T) {
+	runID, gh, pub := happyDeps(t)
+	missing := []auditcomplete.MissingItem{{
+		Kind:   auditcomplete.MissingStageNotTerminal,
+		Detail: "acceptance stage 88538e1a was re-opened by a fix-up push",
+	}}
+	forced, err := pub.PublishWithOptions(context.Background(), runID, stagecheck.StatePending, missing, nil,
+		auditcheckpublisher.PublishOptions{Force: true})
+	if err != nil {
+		t.Fatalf("forced publish on a cold cache: %v", err)
+	}
+	if !forced {
+		t.Fatal("a forced publish over an ABSENT dedup entry must still land")
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(gh.calls))
+	}
+	if !strings.Contains(gh.calls[0].params.OutputText, "re-opened by a fix-up push") {
+		t.Errorf("output.text = %q, want the detail", gh.calls[0].params.OutputText)
+	}
+}
+
+// TestPublishResultAtHead_UnforcedByDefault pins that the pre-#3190 entry point
+// reaches PublishWithOptions with Force UNSET — the invariant that keeps every
+// existing caller (including the merge reconciler's 60s heal sweep) byte-
+// identical.
+func TestPublishResultAtHead_UnforcedByDefault(t *testing.T) {
+	runID, gh, pub := happyDeps(t)
+	ctx := context.Background()
+	if _, err := pub.PublishResultAtHead(ctx, runID, stagecheck.StatePending, nil, nil, ""); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	again, err := pub.PublishResultAtHead(ctx, runID, stagecheck.StatePending, nil, nil, "")
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if again || len(gh.calls) != 1 {
+		t.Fatalf("PublishResultAtHead must not force: published=%v calls=%d, want false/1", again, len(gh.calls))
+	}
+}

@@ -328,8 +328,216 @@ func TestCompute_PendingWhenStageMidFlight(t *testing.T) {
 	if state != stagecheck.StatePending {
 		t.Fatalf("state = %s want pending", state)
 	}
-	if len(missing) != 0 {
-		t.Fatalf("missing should be empty during pending; got %+v", missing)
+	// E64.59 / #3190: this branch used to return an EMPTY missing list, which
+	// is the whole reason a stranded fishhawk_audit_complete published a check
+	// run with a null output.text. It now carries its cause. The STATE is
+	// unchanged — that is the invariant this assertion still pins.
+	if len(missing) != 1 || missing[0].Kind != auditcomplete.MissingStageNotTerminal {
+		t.Fatalf("missing = %+v, want exactly one stage_not_terminal item", missing)
+	}
+}
+
+// TestCompute_MidFlightPendingNamesNonTerminalStage pins the #3190 detail
+// shape: the mid-flight pending NAMES the stage type, its short id and its
+// current state. Counterfactual: deleting the MissingItem construction in
+// Compute's mid-flight branch makes this RED.
+func TestCompute_MidFlightPendingNamesNonTerminalStage(t *testing.T) {
+	runID, runs, arts, ar := happyPath(t)
+	runs.stages[1].State = run.StageStateRunning
+	implID := runs.stages[1].ID.String()[:8]
+
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending", state)
+	}
+	if len(missing) != 1 {
+		t.Fatalf("missing = %+v, want exactly one item", missing)
+	}
+	if missing[0].Kind != auditcomplete.MissingStageNotTerminal {
+		t.Errorf("kind = %q, want stage_not_terminal", missing[0].Kind)
+	}
+	for _, want := range []string{"implement", implID, "running"} {
+		if !strings.Contains(missing[0].Detail, want) {
+			t.Errorf("detail = %q, want it to contain %q", missing[0].Detail, want)
+		}
+	}
+}
+
+// TestCompute_ReopenedAcceptanceDetailNamesRedispatch pins the ACTION-bearing
+// shape: an acceptance stage that a fix-up push re-opened (#1682) draws the
+// re-dispatch instruction, not the generic wording. Counterfactual: deleting
+// the acceptance_reopened lookup in stageNotTerminalDetail makes this RED.
+func TestCompute_ReopenedAcceptanceDetailNamesRedispatch(t *testing.T) {
+	runID, runs, arts, ar := happyPath(t)
+	acc := mkStage(runID, 4, run.StageTypeAcceptance, run.StageStatePending)
+	runs.stages = append(runs.stages, acc)
+	ar.appendChained(t, runID, &acc.ID, "acceptance_reopened",
+		json.RawMessage(`{"prior_state":"succeeded","head_sha":"f1xuphead"}`))
+
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending", state)
+	}
+	if len(missing) != 1 || missing[0].Kind != auditcomplete.MissingStageNotTerminal {
+		t.Fatalf("missing = %+v, want one stage_not_terminal item", missing)
+	}
+	for _, want := range []string{
+		acc.ID.String()[:8],
+		"re-opened by a fix-up push",
+		"fishhawk_dispatch_stage",
+		"clears on its own once acceptance settles",
+	} {
+		if !strings.Contains(missing[0].Detail, want) {
+			t.Errorf("detail = %q, want it to contain %q", missing[0].Detail, want)
+		}
+	}
+}
+
+// TestCompute_ReopenedAcceptanceInFlight_DoesNotNameRedispatch pins the
+// TRUTHFULNESS of the action-bearing shape once the operator has FOLLOWED it.
+// The `acceptance_reopened` entry is history and never goes away, so keying the
+// re-dispatch instruction on its presence alone kept telling the operator to
+// re-dispatch a stage whose re-run was already running. Counterfactual:
+// deleting the acceptanceAwaitsRedispatch split in stageNotTerminalDetail makes
+// this RED on the "fishhawk_dispatch_stage" assertion.
+func TestCompute_ReopenedAcceptanceInFlight_DoesNotNameRedispatch(t *testing.T) {
+	// Every state a re-opened acceptance stage can be in once its re-run
+	// exists. `pending` and `awaiting_host_dispatch` are the dispatchable
+	// pair covered by TestCompute_ReopenedAcceptanceDetailNamesRedispatch.
+	for _, st := range []run.StageState{
+		run.StageStateDispatched,
+		run.StageStateRunning,
+	} {
+		t.Run(string(st), func(t *testing.T) {
+			runID, runs, arts, ar := happyPath(t)
+			acc := mkStage(runID, 4, run.StageTypeAcceptance, st)
+			runs.stages = append(runs.stages, acc)
+			ar.appendChained(t, runID, &acc.ID, "acceptance_reopened",
+				json.RawMessage(`{"prior_state":"succeeded","head_sha":"f1xuphead"}`))
+
+			state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+			if err != nil {
+				t.Fatalf("Compute: %v", err)
+			}
+			if state != stagecheck.StatePending {
+				t.Fatalf("state = %s want pending", state)
+			}
+			if len(missing) != 1 || missing[0].Kind != auditcomplete.MissingStageNotTerminal {
+				t.Fatalf("missing = %+v, want one stage_not_terminal item", missing)
+			}
+			// The defect: a re-run already in flight must NOT be told to
+			// re-dispatch, and must not claim it "has not been re-run".
+			for _, unwanted := range []string{"fishhawk_dispatch_stage", "has not been re-run"} {
+				if strings.Contains(missing[0].Detail, unwanted) {
+					t.Errorf("detail = %q, want it NOT to contain %q for an in-flight re-run", missing[0].Detail, unwanted)
+				}
+			}
+			// It still says WHY the stage is non-terminal (the re-open), names
+			// the live state, and keeps the self-clearing promise.
+			for _, want := range []string{
+				acc.ID.String()[:8],
+				"re-opened by a fix-up push",
+				"already in flight",
+				string(st),
+				"clears on its own once acceptance settles",
+			} {
+				if !strings.Contains(missing[0].Detail, want) {
+					t.Errorf("detail = %q, want it to contain %q", missing[0].Detail, want)
+				}
+			}
+		})
+	}
+}
+
+// TestCompute_ReopenedAcceptanceAwaitingHostDispatch_NamesRedispatch pins the
+// OTHER half of the split: `awaiting_host_dispatch` is a local run's
+// pre-dispatch park, so it is still the operator's move and keeps the
+// action-bearing wording. Without this, narrowing the dispatchable set to
+// `pending` alone would go unnoticed.
+func TestCompute_ReopenedAcceptanceAwaitingHostDispatch_NamesRedispatch(t *testing.T) {
+	runID, runs, arts, ar := happyPath(t)
+	acc := mkStage(runID, 4, run.StageTypeAcceptance, run.StageStateAwaitingHostDispatch)
+	runs.stages = append(runs.stages, acc)
+	ar.appendChained(t, runID, &acc.ID, "acceptance_reopened", nil)
+
+	_, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if len(missing) != 1 {
+		t.Fatalf("missing = %+v, want one item", missing)
+	}
+	if !strings.Contains(missing[0].Detail, "fishhawk_dispatch_stage") {
+		t.Errorf("detail = %q, want the re-dispatch instruction for a stage parked at awaiting_host_dispatch", missing[0].Detail)
+	}
+}
+
+// TestCompute_ReopenedLookupReadError_DegradesToGenericDetail pins the FAIL-OPEN
+// posture of the acceptance_reopened lookup: a read error must degrade to the
+// generic detail and NEVER surface as a Compute error. This whole change is
+// about making a block readable — it must not become a new way to fail.
+//
+// Deliberately distinct from TestCompute_AcceptanceOutcomeReadError_Transient
+// and TestCompute_AcceptanceSkipMarkerReadError_Transient, which pin the
+// OPPOSITE posture on the two reads that gate the exemption sets: those reads
+// decide whether a stage is in scope at all, so failing them silently would
+// under- or over-gate. This one only sharpens wording.
+func TestCompute_ReopenedLookupReadError_DegradesToGenericDetail(t *testing.T) {
+	runID, runs, arts, ar := happyPath(t)
+	acc := mkStage(runID, 4, run.StageTypeAcceptance, run.StageStatePending)
+	runs.stages = append(runs.stages, acc)
+	ar.appendChained(t, runID, &acc.ID, "acceptance_reopened", nil)
+	ar.catErr = map[string]error{"acceptance_reopened": errors.New("boom")}
+
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute must NOT error when the acceptance_reopened read fails: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending", state)
+	}
+	if len(missing) != 1 {
+		t.Fatalf("missing = %+v, want one item", missing)
+	}
+	if strings.Contains(missing[0].Detail, "fishhawk_dispatch_stage") {
+		t.Errorf("detail = %q, want the GENERIC detail when the reopen lookup fails", missing[0].Detail)
+	}
+	if !strings.Contains(missing[0].Detail, "the run is not terminal") {
+		t.Errorf("detail = %q, want the generic mid-flight wording", missing[0].Detail)
+	}
+}
+
+// TestCompute_MidFlightPendingIsNotFail pins the STATE invariant: a mid-flight
+// run was pending before this change and is pending after. Turning a benign
+// wait into a RED required check on every in-flight run in the fleet is the one
+// way this change could do real damage.
+//
+// HONEST SCOPE, measured rather than asserted. The mid-flight branch returns
+// StatePending DIRECTLY, so onlyPendingFlavored is not consulted on this path.
+// Removing MissingStageNotTerminal from that switch was RUN and observed GREEN
+// here — the registration is a defensive CLASSIFICATION (correct if a future
+// refactor ever routes this kind through the fail→pending demotion), and there
+// is no reachable mutation that discriminates it today. What this test DOES
+// discriminate was also run: flipping the mid-flight return to StateFail turns
+// it RED.
+func TestCompute_MidFlightPendingIsNotFail(t *testing.T) {
+	runID, runs, arts, ar := happyPath(t)
+	runs.stages[1].State = run.StageStateRunning
+	state, _, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state == stagecheck.StateFail {
+		t.Fatal("a mid-flight run must never be FAIL: the mid-flight branch stopped returning StatePending")
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending", state)
 	}
 }
 

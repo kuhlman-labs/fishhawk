@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -202,10 +203,20 @@ func (s *Server) publishAuditCheck(ctx context.Context, runID uuid.UUID, state s
 // unwinds the caller — but is now also RETURNED so a caller that wants to
 // report it can.
 func (s *Server) publishAuditCheckAtHead(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution, headSHAOverride string) (bool, error) {
+	return s.publishAuditCheckWithOptions(ctx, runID, state, missing, resolved,
+		auditcheckpublisher.PublishOptions{HeadSHAOverride: headSHAOverride})
+}
+
+// publishAuditCheckWithOptions is publishAuditCheckAtHead carrying the
+// publisher's PublishOptions (E64.59 / #3190) — today just the head override
+// and the strand-clearing Force. publishAuditCheckAtHead delegates here with
+// Force unset, so every pre-#3190 caller is byte-identical. Best-effort
+// semantics and the WARN log are unchanged.
+func (s *Server) publishAuditCheckWithOptions(ctx context.Context, runID uuid.UUID, state stagecheck.State, missing []auditcomplete.MissingItem, resolved []auditcomplete.Resolution, opts auditcheckpublisher.PublishOptions) (bool, error) {
 	if s.auditCheckPublisher == nil {
 		return false, nil
 	}
-	published, err := s.auditCheckPublisher.PublishResultAtHead(ctx, runID, state, missing, resolved, headSHAOverride)
+	published, err := s.auditCheckPublisher.PublishWithOptions(ctx, runID, state, missing, resolved, opts)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"audit-complete check-run publish failed",
@@ -430,6 +441,46 @@ func (s *Server) recomputeAndPublishAuditCompleteAtHead(ctx context.Context, run
 	return s.publishAuditCheckAtHead(ctx, runID, res.State, res.Missing, res.Resolved, headSHAOverride)
 }
 
+// recomputeAndForcePublishAuditComplete is recomputeAndPublishAuditComplete's
+// FORCING sibling (E64.59 / #3190): it re-derives the audit-complete state and
+// publishes it PAST the publisher's state-equality dedup, returning the Result
+// it computed so the caller can name the missing items without a second
+// recompute. The bool reports whether a Result was computed at all (false on a
+// disabled/dev posture or a compute error), so a caller can tell "not pending"
+// from "we never got to look".
+//
+// It is a SIBLING rather than a force PARAMETER on recomputeAndPublishAuditComplete
+// by binding approval condition 1: four test files in this package call that
+// function directly and none is in this change's declared scope, so widening
+// its signature would break their compilation with no legal way to fix them.
+// The existing function and every one of its callers stay byte-identical.
+//
+// Force is scoped to the two republish paths that exist to CLEAR a strand. A
+// run stranded on auditcomplete's mid-flight branch recomputes to the SAME
+// pending state the fix-up synchronize already published, so the unforced
+// republish is dedup-suppressed and posts NOTHING — #3190's "#3186 is deployed,
+// ran twice, and moved nothing". The merge reconciler's 60s heal sweep is
+// deliberately NOT forced (see RepublishAuditCheck).
+//
+// Best-effort exactly like the unforced sibling: a compute or publish failure
+// logs at WARN and never unwinds the caller.
+func (s *Server) recomputeAndForcePublishAuditComplete(ctx context.Context, runID uuid.UUID) (auditcomplete.Result, bool) {
+	if s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil || s.cfg.AuditRepo == nil {
+		return auditcomplete.Result{}, false
+	}
+	res, err := auditcomplete.ComputeResult(ctx, runID, s.auditCompleteDeps())
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"audit-complete recompute failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return auditcomplete.Result{}, false
+	}
+	_, _ = s.publishAuditCheckWithOptions(ctx, runID, res.State, res.Missing, res.Resolved,
+		auditcheckpublisher.PublishOptions{Force: true})
+	return res, true
+}
+
 // republishAuditCheckBeforeMerge recomputes the run's audit-complete state and
 // republishes the fishhawk_audit_complete Check Run immediately BEFORE a merge
 // is dispatched (E64.42 / #3159).
@@ -460,8 +511,15 @@ func (s *Server) recomputeAndPublishAuditCompleteAtHead(ctx context.Context, run
 // Deliberately a SEPARATE function from republishAuditCheckOnRunTerminal
 // rather than one shared helper: each is an independently deletable control
 // with its own counterfactual test, and each names the distinct hole it closes.
-func (s *Server) republishAuditCheckBeforeMerge(ctx context.Context, runID uuid.UUID) {
-	s.recomputeAndPublishAuditComplete(ctx, runID)
+// E64.59 / #3190: it FORCES the publish past the state-equality dedup and
+// RETURNS the Result it computed. Both matter for the exact case this closes.
+// The strand it has to clear is a run whose acceptance stage a fix-up push
+// re-opened (#1682): the recompute yields the same `pending` the synchronize
+// already published, so the unforced republish posted nothing at all. And the
+// returned Result lets handleMergeRun name the blocking stage in its 409
+// merge_checks_pending body without recomputing.
+func (s *Server) republishAuditCheckBeforeMerge(ctx context.Context, runID uuid.UUID) (auditcomplete.Result, bool) {
+	return s.recomputeAndForcePublishAuditComplete(ctx, runID)
 }
 
 // republishAuditCheckOnRunTerminal recomputes the run's audit-complete state
@@ -484,16 +542,25 @@ func (s *Server) republishAuditCheckBeforeMerge(ctx context.Context, runID uuid.
 //
 // That is not an argument, it was RUN: hoisting this call above the Advance
 // turns TestResolveReviewStageOnMerge_RepublishesAuditCheckOnTermination RED.
-// The OBSERVED failure is sharper than "it republishes pending" — the
-// recompute yields pending, which is the state already published at that head,
-// so the publisher's dedup cache suppresses it and NOTHING is posted at all.
-// The stale in_progress simply rides, which is the exact defect this closes.
+// The OBSERVED failure CHANGED with E64.59 / #3190, and the earlier recorded
+// explanation no longer holds. It was "the recompute yields the state already
+// published at that head, so the dedup cache suppresses it and NOTHING is
+// posted at all" — true while this republish was unforced. Now that it forces
+// past the dedup the hoist was re-run, and the observation is that the
+// republish DOES post, carrying pending: the terminal publish is in_progress
+// with no conclusion instead of completed/success, so the stale check is
+// replaced by a fresh in_progress and the green never lands. Same ordering
+// constraint, same RED, different mechanism — re-run the mutation rather than
+// trusting either sentence.
 //
 // Best-effort, exactly like every other tail on the merge-resolution path: a
 // compute or publish failure logs at WARN and never unwinds the merge
 // resolution, its audit row, or the run completion.
+// E64.59 / #3190: FORCED, for the same reason as the before-merge sibling — a
+// run that reaches terminal carrying a stranded pending must re-post even when
+// the recomputed state equals the last published one.
 func (s *Server) republishAuditCheckOnRunTerminal(ctx context.Context, runID uuid.UUID) {
-	s.recomputeAndPublishAuditComplete(ctx, runID)
+	_, _ = s.recomputeAndForcePublishAuditComplete(ctx, runID)
 }
 
 // RepublishAuditCheck re-derives a run's audit-complete state and republishes
@@ -509,6 +576,12 @@ func (s *Server) republishAuditCheckOnRunTerminal(ctx context.Context, runID uui
 // audit_check_publish_degraded entry after
 // auditcheckpublisher.DefaultDegradedThreshold consecutive attempts
 // (#993) — see publishAuditCheck.
+//
+// Deliberately NOT forced (E64.59 / #3190), unlike the two strand-clearing
+// republishes: this runs on the reconciler's 60s tick for every parked review
+// stage, so forcing it would post a new check run per minute per parked run.
+// That is noise replacing legibility. Pinned by
+// TestRepublishAuditCheck_ReconcilerPathIsNotForced.
 func (s *Server) RepublishAuditCheck(ctx context.Context, runID uuid.UUID) {
 	s.recomputeAndPublishAuditComplete(ctx, runID)
 }

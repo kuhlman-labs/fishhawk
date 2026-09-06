@@ -1023,3 +1023,112 @@ func TestMergeRunToolConflictingReturnsImmediately(t *testing.T) {
 		t.Errorf("mergeRun took %s, want an immediate return well inside the 600s budget", elapsed)
 	}
 }
+
+// --- E64.59 / #3190: the checks_pending message names the audit-complete cause
+
+// mergeChecksPendingBodyWithAuditDetail is the backend's ENRICHED 409
+// (E64.59 / #3190): details carries the audit_complete_missing list naming the
+// fix-up-re-opened acceptance stage and the re-dispatch action.
+const mergeChecksPendingBodyWithAuditDetail = `{"error":{"code":"merge_checks_pending",` +
+	`"message":"required checks have not all passed",` +
+	`"details":{"verdict_sequence":61595,"reason":"checks_pending",` +
+	`"audit_complete_state":"pending",` +
+	`"audit_complete_missing":[{"kind":"stage_not_terminal",` +
+	`"detail":"acceptance stage 88538e1a was re-opened by a fix-up push and has not been re-run; ` +
+	`re-dispatch the acceptance stage (fishhawk_dispatch_stage, stage acceptance)"}]}}}`
+
+// TestChecksPendingOutput_CarriesAuditCompleteDetail is the LAST hop of the
+// serialization boundary: fishhawk_merge_run is where an operator first observes
+// the strand, so the resumable checkpoint must name the blocking stage and the
+// action rather than describing "required checks" generically. Counterfactual:
+// deleting the auditCompleteDetailSuffix call in checksPendingOutput makes this
+// RED.
+func TestChecksPendingOutput_CarriesAuditCompleteDetail(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:             "https://github.com/x/y/pull/7",
+		stateBeforeMerge:  "running",
+		stateAfterMerge:   "running",
+		mergeStickyStatus: http.StatusConflict,
+		mergeErrBody:      mergeChecksPendingBodyWithAuditDetail,
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	_, out, err := r.mergeRun(ctx, nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	if out.Status != "checks_pending" {
+		t.Fatalf("status = %q, want checks_pending", out.Status)
+	}
+	for _, want := range []string{
+		"fishhawk_audit_complete is pending because:",
+		"88538e1a",
+		"re-opened by a fix-up push",
+		"fishhawk_dispatch_stage",
+	} {
+		if !strings.Contains(out.Message, want) {
+			t.Errorf("message = %q, want it to contain %q", out.Message, want)
+		}
+	}
+	// The pre-#3190 wording survives — this is purely additive.
+	if !strings.Contains(out.Message, "have not all passed") {
+		t.Errorf("the generic wording must survive: %q", out.Message)
+	}
+}
+
+// TestChecksPendingOutput_MalformedAuditDetail_DegradesToFixedMessage pins the
+// DEFENSIVE branch. details crossed an HTTP JSON boundary, so every wrong shape
+// must degrade to today's fixed message and never to a tool error — the tool
+// must not fail to report a merge block because the block's explanation was
+// malformed.
+//
+// One case per rejected shape, so a guard that only handles some of them fails
+// here rather than panicking in front of an operator.
+func TestChecksPendingOutput_MalformedAuditDetail_DegradesToFixedMessage(t *testing.T) {
+	const prefix = `{"error":{"code":"merge_checks_pending","message":"required checks have not all passed","details":{"reason":"checks_pending",`
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"absent", `{"error":{"code":"merge_checks_pending","message":"m","details":{"reason":"checks_pending"}}}`},
+		{"null", prefix + `"audit_complete_missing":null}}}`},
+		{"not_an_array", prefix + `"audit_complete_missing":"stage_not_terminal"}}}`},
+		{"empty_array", prefix + `"audit_complete_missing":[]}}}`},
+		{"items_not_objects", prefix + `"audit_complete_missing":["stage_not_terminal",7]}}}`},
+		{"detail_not_a_string", prefix + `"audit_complete_missing":[{"kind":"stage_not_terminal","detail":42}]}}}`},
+		{"detail_blank", prefix + `"audit_complete_missing":[{"kind":"stage_not_terminal","detail":"   "}]}}}`},
+		{"detail_absent", prefix + `"audit_complete_missing":[{"kind":"stage_not_terminal"}]}}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb := &mergeRunFakeBackend{
+				prURL:             "https://github.com/x/y/pull/7",
+				stateBeforeMerge:  "running",
+				stateAfterMerge:   "running",
+				mergeStickyStatus: http.StatusConflict,
+				mergeErrBody:      tc.body,
+			}
+			srv := newMergeRunFakeBackend(t, fb)
+			r := newMergeRunResolver(srv)
+			ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			defer cancel()
+
+			_, out, err := r.mergeRun(ctx, nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+			if err != nil {
+				t.Fatalf("mergeRun: %v — a malformed detail must never become a tool error", err)
+			}
+			if out.Status != "checks_pending" {
+				t.Fatalf("status = %q, want checks_pending", out.Status)
+			}
+			if strings.Contains(out.Message, "fishhawk_audit_complete is pending because") {
+				t.Errorf("a malformed detail must degrade to the fixed message: %q", out.Message)
+			}
+			if !strings.Contains(out.Message, "have not all passed") {
+				t.Errorf("the fixed message must survive: %q", out.Message)
+			}
+		})
+	}
+}
