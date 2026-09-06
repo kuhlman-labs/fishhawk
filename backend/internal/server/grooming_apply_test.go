@@ -2010,6 +2010,67 @@ func TestPriorGroomingPartialSteps_NewerRunWinsOverOlder(t *testing.T) {
 	}
 }
 
+// TestPriorGroomingPartialSteps_UnreadableRowBlocksOlderEvidence is the fix-up
+// pass's control for the two ways a SKIPPED undecodable row would be fail-OPEN.
+// Both arms seed a MALFORMED NEWER row alongside VALID OLDER failed+steps
+// evidence for the SAME logical entry id, which is the pairing that
+// discriminates: with the row skipped the scan walks past it and emits the older
+// evidence, authorizing a resume that bypasses manual-placement/idempotence
+// containment; with the scan abandoned it emits nothing.
+//
+// The two arms are the two directions the concern named — a newer RUN whose row
+// cannot be read, and a superseding row WITHIN one run whose `latest` slot the
+// older failed+steps record would otherwise keep.
+func TestPriorGroomingPartialSteps_UnreadableRowBlocksOlderEvidence(t *testing.T) {
+	const entryID = "hygiene:github/kuhlman-labs/fishhawk#2237:unboarded"
+	seedMalformed := func(t *testing.T, h *stepsScanHarness, runID uuid.UUID) {
+		t.Helper()
+		if _, err := h.audit.AppendChained(context.Background(), audit.ChainAppendParams{
+			RunID: runID, Timestamp: time.Now().UTC(),
+			Category: workmgmt.GroomingMutationAppliedCategory, Payload: []byte(`{"entry_id":`),
+		}); err != nil {
+			t.Fatalf("seed malformed row: %v", err)
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		arrange func(*testing.T, *stepsScanHarness)
+	}{
+		{"malformed row in a NEWER run", func(t *testing.T, h *stepsScanHarness) {
+			older := &run.Run{ID: uuid.New(), Repo: h.current.Repo, AccountID: h.current.AccountID,
+				CreatedAt: h.current.CreatedAt.Add(-2 * time.Hour)}
+			h.runs.listRuns = []*run.Run{older, h.prior}
+			h.seedMutationRow(t, older.ID, workmgmt.GroomingMutationRecord{
+				EntryID: entryID, Outcome: workmgmt.GroomingOutcomeFailed,
+				StepsLanded: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepBoardItemAdded},
+			})
+			seedMalformed(t, h, h.prior.ID)
+		}},
+		{"malformed SUPERSEDING row in the same run", func(t *testing.T, h *stepsScanHarness) {
+			// Seeded FIRST, so the malformed row carries the HIGHER sequence and
+			// is the one `latest` would have to overwrite the half-write with.
+			h.seedMutationRow(t, h.prior.ID, workmgmt.GroomingMutationRecord{
+				EntryID: entryID, Outcome: workmgmt.GroomingOutcomeFailed,
+				StepsLanded: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepBoardItemAdded},
+			})
+			seedMalformed(t, h, h.prior.ID)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newStepsScanHarness(t)
+			tc.arrange(t, h)
+
+			steps, reason := h.server.priorGroomingPartialSteps(context.Background(), h.current)
+			if reason != groomingApplyPriorStepsUnreadable {
+				t.Errorf("reason = %q, want %q", reason, groomingApplyPriorStepsUnreadable)
+			}
+			if len(steps) != 0 {
+				t.Errorf("evidence = %v, want NONE: an unreadable row must not let OLDER evidence authorize a resume", steps)
+			}
+		})
+	}
+}
+
 // TestPriorGroomingPartialSteps_FailsClosedOnDegrade is COUNTERFACTUAL (g) plus
 // the scan's other fail-closed branches, one assertion each. Every one yields an
 // EMPTY map, so NOTHING resumes anywhere — the only safe direction for evidence
@@ -2046,6 +2107,8 @@ func TestPriorGroomingPartialSteps_FailsClosedOnDegrade(t *testing.T) {
 			seedHalfWrite(h, h.prior.ID)
 			h.prior.CreatedAt = h.current.CreatedAt.Add(time.Hour)
 		}, ""},
+		// An undecodable row is a DEGRADE, not an absence: the scan cannot show
+		// it is not a superseding record, so it abandons the whole scan.
 		{"undecodable payload", func(h *stepsScanHarness) {
 			if _, err := h.audit.AppendChained(context.Background(), audit.ChainAppendParams{
 				RunID: h.prior.ID, Timestamp: time.Now().UTC(),
@@ -2053,7 +2116,13 @@ func TestPriorGroomingPartialSteps_FailsClosedOnDegrade(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("seed bad row: %v", err)
 			}
-		}, ""},
+		}, groomingApplyPriorStepsUnreadable},
+		{"payload with no entry id", func(h *stepsScanHarness) {
+			h.seedMutationRow(t, h.prior.ID, workmgmt.GroomingMutationRecord{
+				Outcome:     workmgmt.GroomingOutcomeFailed,
+				StepsLanded: []workmgmt.GroomingMutationStep{workmgmt.GroomingStepBoardItemAdded},
+			})
+		}, groomingApplyPriorStepsUnreadable},
 		{"failed row carrying NO steps", func(h *stepsScanHarness) {
 			h.seedMutationRow(t, h.prior.ID, workmgmt.GroomingMutationRecord{
 				EntryID: entryID, Outcome: workmgmt.GroomingOutcomeFailed, Error: "provider 500",

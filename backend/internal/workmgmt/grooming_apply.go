@@ -1575,6 +1575,15 @@ func groomingStepLanded(req GroomingApplyRequest, entryID string, step GroomingM
 //     epic_edge_added. That conjunction is exactly the shape a failed
 //     link-then-mark leaves.
 //
+// ABSENT AND DIVERGENT ARE NOT THE SAME MARKER STATE, and arm (b) does not
+// separate them: "the proposed ref is absent from the observed refs" is also
+// true of a body naming a DIFFERENT parent. The discrimination is made at the
+// WRITE site instead, where the marker values are read fresh under the same
+// request that patches them — groomingLinkEpic refuses a divergent marker with
+// a *ParentEpicConflictError rather than stamping over it. Deciding it here off
+// the pre-dispatch read would decide it on a stale snapshot, and the resume it
+// authorizes is a write.
+//
 // WHY THE BOARD ARM REQUIRES AN EMPTY EXPECTED-FROM SET. A NON-empty set is the
 // icebox arm: a SINGLE-step move of a card that is ALREADY on the board, which
 // has no partial-write shape to resume at all. Admitting it would reroute icebox

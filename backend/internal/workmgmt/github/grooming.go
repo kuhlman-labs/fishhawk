@@ -280,7 +280,10 @@ func (p *Provider) groomingSetLabels(ctx context.Context, req workmgmt.GroomingM
 // THE FIVE-BRANCH LADDER, in precedence:
 //  1. structural parent present, != proposal -> *ParentEpicConflictError naming
 //     the structural parent; zero writes.
-//  2. structural parent present, == proposal -> Skipped; zero writes.
+//  2. structural parent present, == proposal -> Skipped; zero writes. With
+//     #2810 ledger evidence and NO marker this is instead the marker-only
+//     RESUME; with evidence and a DIVERGENT marker it is a
+//     *ParentEpicConflictError, never a resume (see the branch).
 //  3. no structural parent, marker(s) present, none naming the proposal ->
 //     *ParentEpicConflictError (a STATED RESIDUAL, #2237's invariant: never
 //     leave the body claiming one parent while the graph holds another; the
@@ -355,6 +358,24 @@ func (p *Provider) groomingLinkEpic(ctx context.Context, req workmgmt.GroomingMu
 			// human removed is indistinguishable from one we never wrote, and
 			// settling is the fail-closed answer there.
 			if req.ResumeAuthorized(workmgmt.GroomingStepEpicEdgeAdded) && !markerNames(markers, want) {
+				// A DIVERGENT marker is not the half-write's shape and must not
+				// be resumed over. `!markerNames` is true for BOTH an absent
+				// marker and one naming a different parent, and the two need
+				// opposite answers: ensureParentEpicMarker is idempotent on the
+				// MARKER, not on the parent, so a body already carrying
+				// `Parent epic: #other` comes back UNCHANGED — the PATCH would
+				// write the same bytes and this branch would report Applied
+				// while the body still claims a different parent. Refuse with
+				// the same typed conflict branch 3 uses for the mirror-image
+				// state, so #2237's invariant (never leave the body claiming one
+				// parent while the graph holds another) holds on the resume path
+				// too. The candidate is recorded FAILED with no steps_landed,
+				// which also erases the stale evidence — the ledger proved we
+				// landed the edge, not that this body is ours to overwrite.
+				if len(markers) > 0 {
+					return nil, &ParentEpicConflictError{Number: number,
+						Current: strings.Join(markers, ", "), Proposed: wantRef}
+				}
 				updated := ensureParentEpicMarker(issue.Body, parent)
 				if _, uerr := p.api.UpdateIssue(ctx, req.Target.Scope, repo, number,
 					githubclient.UpdateIssueParams{Body: &updated}); uerr != nil {

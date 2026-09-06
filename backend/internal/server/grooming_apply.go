@@ -129,10 +129,11 @@ const (
 	groomingApplyWindowUnsettled = "grooming_apply_window_unsettled"
 
 	// groomingApplyPriorStepsUnreadable names the ONE degrade of the #2810
-	// partial-write evidence lookup: a run-scan or audit-read failure. It
-	// yields an EMPTY evidence map, so no candidate resumes anywhere — the
-	// fail-closed direction, since the alternative is resuming on unknown
-	// provenance. It never aborts the apply.
+	// partial-write evidence lookup: a run-scan failure, an audit-read failure,
+	// or a row in the scanned window this scan cannot decode. It yields an
+	// EMPTY evidence map, so no candidate resumes anywhere — the fail-closed
+	// direction, since the alternative is resuming on unknown provenance. It
+	// never aborts the apply.
 	groomingApplyPriorStepsUnreadable = "grooming_apply_prior_steps_unreadable"
 )
 
@@ -364,12 +365,25 @@ func (k *groomingApplyAuditSink) RecordGroomingApplyCompleted(ctx context.Contex
 // the half-write it described has since been superseded, and resuming on it
 // would write against state somebody else already settled.
 //
-// FAIL-CLOSED ON EVERY READ FAILURE. A ListRuns or ListForRunByCategory error
-// returns an EMPTY map plus a named reason, which means no resume anywhere. The
-// alternative — resuming on partial or unknown provenance — is the one direction
-// this evidence must never fail in, because what it authorizes is overriding a
-// containment rule. An undecodable row is skipped, contributing no evidence,
-// which is the same direction.
+// FAIL-CLOSED ON EVERY READ FAILURE, AND ON EVERY ROW IT CANNOT READ. A
+// ListRuns or ListForRunByCategory error returns an EMPTY map plus a named
+// reason, which means no resume anywhere. The alternative — resuming on partial
+// or unknown provenance — is the one direction this evidence must never fail in,
+// because what it authorizes is overriding a containment rule.
+//
+// AN UNDECODABLE ROW ABANDONS THE WHOLE SCAN for the same reason, rather than
+// being skipped as contributing no evidence. Skipping it is fail-OPEN in two
+// directions the staleness bound depends on, because the row that fails to
+// decode is exactly the row whose CONTENT is unknown: (i) a skipped NEWER row
+// lets the walk fall through to an OLDER failed+steps record for the same
+// logical entry and authorize a resume the newer row might have settled, and
+// (ii) a skipped SUPERSEDING row inside one run leaves the per-run `latest` map
+// holding the older failed+steps record, EMITTING evidence a settled record
+// should have erased. Neither can be told apart from a benign row without
+// decoding it, so the only sound reading of an undecodable row is that the scan
+// does not know what the window contains. A payload carrying no entry_id is the
+// same case: it cannot be attributed, so it cannot be shown not to be a
+// superseding record.
 //
 // Rows written before #2810 carry no steps_landed key at all; the tolerant
 // projection reads that as an absent slice, so they yield no evidence and
@@ -429,7 +443,12 @@ func (s *Server) priorGroomingPartialSteps(ctx context.Context, current *run.Run
 		for _, e := range ordered {
 			var rec groomingStepsProjection
 			if json.Unmarshal(e.Payload, &rec) != nil || rec.EntryID == "" {
-				continue
+				// A row this scan cannot read is not an absent row: abandon the
+				// whole scan rather than let an unknown row fall through to
+				// older evidence (cross-run) or leave an older failed+steps
+				// record standing as the run's latest (within-run). See the
+				// method comment's fail-closed paragraph.
+				return nil, groomingApplyPriorStepsUnreadable
 			}
 			latest[rec.EntryID] = rec
 		}

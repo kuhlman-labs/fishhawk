@@ -2304,6 +2304,71 @@ func TestApplyGrooming_EpicLinkPartialWriteConvergesOnRetry(t *testing.T) {
 	}
 }
 
+// TestApplyGrooming_EpicLinkResumeRefusesADivergentMarker is the fix-up pass's
+// control for the edge the resume newly made reachable: a body whose marker
+// names a DIFFERENT parent.
+//
+// It is a GENUINE two-apply sequence over the stateful forge — apply 1 lands the
+// edge and fails the marker PATCH, then a HUMAN stamps `Parent epic: #390`
+// between the applies — because that is the only way this state arises.
+//
+// WHY IT MUST NOT RESUME. `!markerNames` is true of an absent marker AND of a
+// divergent one, but ensureParentEpicMarker is idempotent on the MARKER, not on
+// the parent: it would return the #390 body UNCHANGED, the PATCH would write the
+// same bytes back, and the branch would report APPLIED over a body still
+// claiming #390. The assertions are therefore the AUDIT OUTCOME plus the PATCH
+// COUNT, not the body alone — the body is byte-identical either way, which is
+// precisely the defect (a control whose effect is a write that changes nothing
+// is invisible to a body diff).
+func TestApplyGrooming_EpicLinkResumeRefusesADivergentMarker(t *testing.T) {
+	fx := &partialWriteForge{body: "## Summary", failPatch: true}
+	provider := New(newPartialWriteForge(t, fx))
+
+	req1, entryID := epicLinkApply(2237, "#389", nil)
+	res1, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req1)
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	rec1 := dependsOnRecord(t, res1, entryID)
+	if len(rec1.StepsLanded) != 1 || rec1.StepsLanded[0] != workmgmt.GroomingStepEpicEdgeAdded {
+		t.Fatalf("apply 1 steps_landed = %v, want [%s]", rec1.StepsLanded, workmgmt.GroomingStepEpicEdgeAdded)
+	}
+
+	// A HUMAN records a DIFFERENT parent in the body between the two applies.
+	const humanBody = "## Summary\n\nParent epic: #390"
+	fx.body = humanBody
+	patchesBefore := fx.patches
+
+	req2, _ := epicLinkApply(2237, "#389", ledgerFromRecord(rec1))
+	res2, err := workmgmt.ApplyGrooming(context.Background(), provider, provider, &recordingSink{}, req2)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	rec2 := dependsOnRecord(t, res2, entryID)
+	if rec2.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Errorf("apply 2 outcome = %q (%+v), want failed: a divergent marker must not be resumed over",
+			rec2.Outcome, rec2)
+	}
+	if !strings.Contains(rec2.Error, "#390") || !strings.Contains(rec2.Error, "already records parent epic") {
+		t.Errorf("apply 2 error = %q, want the typed parent-epic conflict naming #390", rec2.Error)
+	}
+	if len(rec2.StepsLanded) != 0 {
+		t.Errorf("apply 2 steps_landed = %v, want none: the refusal ERASES the stale evidence", rec2.StepsLanded)
+	}
+	// COMMITTED STATE: the human's marker is untouched, and no PATCH was sent at
+	// all — the discriminator, since a resumed PATCH would have written these
+	// same bytes back and audited itself as applied.
+	if fx.body != humanBody {
+		t.Errorf("body after apply 2 = %q, want the human's %q", fx.body, humanBody)
+	}
+	if fx.patches != patchesBefore {
+		t.Errorf("body PATCHes = %d, want %d (the refusal must write nothing)", fx.patches, patchesBefore)
+	}
+	if n := countOp(fx.graphql, "AddSubIssue"); n != 1 {
+		t.Errorf("AddSubIssue calls = %d, want 1 (only apply 1's edge)", n)
+	}
+}
+
 // TestApplyGrooming_BoardPlaceWithoutLedgerEvidenceRefuses is COUNTERFACTUAL (a),
 // and the case the whole design exists to protect: an on-board column-less card
 // with NO ledger evidence is a HUMAN's placement, and must be left alone.

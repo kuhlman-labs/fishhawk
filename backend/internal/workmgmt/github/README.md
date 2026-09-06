@@ -281,14 +281,32 @@ semantics and its stated residual.
   asserts NO second `AddItem` call.
 - EPIC: `groomingLinkEpic` **branch 1** (structural parent already records the
   proposal) writes ONLY the marker when `ResumeSteps` names `epic_edge_added`
-  AND no marker already carries the proposal — no `IssueNodeID`, no second
+  AND the body carries NO marker at all — no `IssueNodeID`, no second
   `AddSubIssue`. Without that evidence branch 1 is byte-identical to its
   pre-#2810 shape (skip, `parent epic already linked`).
+
+  **A DIVERGENT marker under that same evidence is REFUSED, not resumed over**
+  (the fix-up pass on #2810). "No marker carries the proposal" is true of an
+  ABSENT marker and of one naming a DIFFERENT parent, and the two need opposite
+  answers: `ensureParentEpicMarker` is idempotent on the MARKER, not on the
+  parent, so a body already reading `Parent epic: #390` comes back UNCHANGED, the
+  PATCH writes the same bytes, and the branch would report `applied` over a body
+  still claiming #390 — a fabricated audit row, which is the one outcome the
+  typed-refusal discipline exists to prevent. So branch 1 returns the same
+  `*ParentEpicConflictError` branch 3 returns for the mirror-image state, with
+  zero writes; `TestApplyGrooming_EpicLinkResumeRefusesADivergentMarker` drives
+  the genuine two-apply sequence (a human stamps the divergent marker between the
+  applies) and asserts the audit outcome AND the PATCH count, since the body is
+  byte-identical either way. The candidate is recorded `failed` with no
+  `steps_landed`, which also ERASES the stale evidence.
 
 **Unchanged, deliberately**: branches 2, 3 and 5. In particular branch 3 — a
 DIVERGENT marker with no structural parent — keeps its `ParentEpicConflictError`
 refusal, which is the correct fail-closed answer when the body and the graph
-disagree. Its resurfacing cost is stated in the `workmgmt` README.
+disagree. Branch 1's divergent-marker case above answers the same way for the
+same reason, so the divergent-marker verdict does not depend on whether a
+structural edge happens to exist. Its resurfacing cost is stated in the
+`workmgmt` README.
 
 ### Live-validation walk for the partial-write resume (#2810)
 
