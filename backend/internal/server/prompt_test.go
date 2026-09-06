@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -9162,24 +9164,35 @@ func TestResolveDiffCoverageConfig_MostRestrictiveWins(t *testing.T) {
 	}
 }
 
-// goldenExemptPromptJSON is the CROSS-MODULE GOLDEN FIXTURE for the
-// scope-completeness exempt prompt-response fields (#2501).
+// goldenExemptPromptJSON reads the CROSS-MODULE GOLDEN FIXTURE for the
+// scope-completeness exempt prompt-response fields (#2501) from the SINGLE
+// shared file testdata/wire/exempt_prompt_fields.json.
 //
-// PEER COPY: runner/cmd/fishhawk-runner/main_test.go holds a BYTE-IDENTICAL
-// literal under the same name. THIS test asserts the four-key projection of
-// the marshalled promptResponse EQUALS these bytes; the runner test DECODES the
-// same literal as its fetched prompt. A single-process end-to-end that carries
-// the payload the whole way is impossible here — the runner and the backend are
-// separate Go modules and neither may import the other (import direction is
-// one-way and there is no shared wire package) — so the shared BYTES are the
-// seam. Keep the two literals verbatim-identical: a tag change here forces an
-// edit to this copy, and the runner's copy then fails to decode, so the drift
-// surfaces in the RUNNER test rather than only in a backend assertion.
+// ONE SOURCE OF TRUTH (#2558): the runner's decode test
+// (runner/cmd/fishhawk-runner/main_test.go) reads the SAME file. There is no
+// backend-local golden left to update in isolation — THIS test asserts the
+// four-key projection of the marshalled promptResponse EQUALS these bytes, and
+// updating the fixture to match a backend tag change then reddens the runner's
+// decode of the same bytes. A single-process end-to-end is impossible (the
+// runner and backend are separate Go modules, import direction one-way, no
+// shared wire package), so the shared BYTES are the seam. The struct-level TAG
+// parity these bytes stand in for is now ALSO pinned by
+// backend/internal/wirecontract's TestCrossModuleWireParity.
 //
-// held_commit_base_sha (#2563) is the fourth exempt field; alphabetically it
-// sorts first in the map-marshalled projection. exemptPark() carries the
-// matching BaseSHA so the emission gate resolves it from the park field.
-const goldenExemptPromptJSON = `{"held_commit_base_sha":"3333333333333333333333333333333333333333","held_commit_branch":"fishhawk/run-11112222/stage-99990000","held_commit_sha":"1111111111111111111111111111111111111111","open_pr_from_held_commit":true}`
+// This helper REQUIRES the full repo tree (it walks to the go.work marker) and
+// FAILS CLOSED on a read error — a missing fixture must never degrade to a
+// skipped comparison. It trims a single trailing newline (operator condition 2)
+// so the fixture is correct whether or not whitespace tooling appends one; the
+// comparison is byte-for-byte in every other respect.
+func goldenExemptPromptJSON(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(repoRoot(t), "testdata", "wire", "exempt_prompt_fields.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared exempt prompt fixture %s: %v", path, err)
+	}
+	return strings.TrimSuffix(string(b), "\n")
+}
 
 // exemptAuditFake serves ListForRunByCategory from an in-memory,
 // sequence-ordered entry list so the emission-gate tests can compose any
@@ -9306,12 +9319,13 @@ func exemptRenderKeys(t *testing.T, park *run.ScopeCompletenessPark, entries []*
 // copy then fails to decode.
 func assertGoldenExemptProjection(t *testing.T, keys map[string]json.RawMessage, surface string) {
 	t.Helper()
-	var golden map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(goldenExemptPromptJSON), &golden); err != nil {
+	golden := goldenExemptPromptJSON(t)
+	var goldenKeys map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(golden), &goldenKeys); err != nil {
 		t.Fatal(err)
 	}
 	projection := map[string]json.RawMessage{}
-	for k := range golden {
+	for k := range goldenKeys {
 		if raw, ok := keys[k]; ok {
 			projection[k] = raw
 		}
@@ -9320,8 +9334,8 @@ func assertGoldenExemptProjection(t *testing.T, keys map[string]json.RawMessage,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != goldenExemptPromptJSON {
-		t.Errorf("%s: emitted exempt-field projection drifted from the cross-module golden fixture:\n got: %s\nwant: %s", surface, got, goldenExemptPromptJSON)
+	if string(got) != golden {
+		t.Errorf("%s: emitted exempt-field projection drifted from the cross-module golden fixture:\n got: %s\nwant: %s", surface, got, golden)
 	}
 }
 
