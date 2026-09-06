@@ -398,7 +398,10 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 	// fail-closed return, so neither refusal path pays for a publish, and a
 	// genuinely mid-flight run is refused by the acceptance gate before a
 	// recompute could report pending. Best-effort: never unwinds the dispatch.
-	s.republishAuditCheckBeforeMerge(ctx, runRow.ID)
+	// The returned Result is the operator-merge endpoint's affordance (it names
+	// the blocking stage in its 409 body); this delegated arm has no 409 to
+	// enrich, so it discards it.
+	_, _ = s.republishAuditCheckBeforeMerge(ctx, runRow.ID)
 	return mergeDispatchMerged, gateState, merger.MergePullRequest(ctx, runRow)
 }
 

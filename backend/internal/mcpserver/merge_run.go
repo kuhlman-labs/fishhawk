@@ -279,7 +279,11 @@ func mergeVerdictSequenceFrom(details map[string]any) int64 {
 // claim plus the honest wording condition 1 requires — the checks have not all
 // passed, an immediate retry cannot succeed, and a check that has already FAILED
 // means inspecting the PR rather than waiting.
-func checksPendingOutput(seq int64, start time.Time) MergeRunOutput {
+// E64.59 / #3190: `details` is the server's 409 detail map. When it carries an
+// audit_complete_missing list, the message NAMES the blocking audit-complete
+// item and its action, because fishhawk_merge_run is where an operator first
+// observes the strand — the last hop of the same serialization boundary.
+func checksPendingOutput(seq int64, start time.Time, details map[string]any) MergeRunOutput {
 	return MergeRunOutput{
 		Status:          "checks_pending",
 		MergeQueued:     false,
@@ -288,8 +292,44 @@ func checksPendingOutput(seq int64, start time.Time) MergeRunOutput {
 		VerdictSequence: seq,
 		WaitedSeconds:   time.Since(start).Seconds(),
 		Note:            mergeRunNote,
-		Message:         "the merge verdict is recorded and durable, but GitHub will not queue the squash merge because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke fishhawk_merge_run once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request rather than waiting.",
+		Message: "the merge verdict is recorded and durable, but GitHub will not queue the squash merge because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke fishhawk_merge_run once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request rather than waiting." +
+			auditCompleteDetailSuffix(details),
 	}
+}
+
+// auditCompleteDetailSuffix renders the server's details.audit_complete_missing
+// list into the operator-facing message tail (E64.59 / #3190).
+//
+// DEFENSIVE by contract: this decodes a map that crossed an HTTP JSON boundary,
+// so an absent, wrong-typed, empty or item-shape-mismatched value degrades to
+// the empty string — today's fixed message — and is NEVER an error. The tool
+// must not fail to report a merge block because the block's explanation was
+// malformed.
+func auditCompleteDetailSuffix(details map[string]any) string {
+	raw, ok := details["audit_complete_missing"]
+	if !ok {
+		return ""
+	}
+	items, ok := raw.([]any)
+	if !ok || len(items) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, it := range items {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		detail, _ := m["detail"].(string)
+		if strings.TrimSpace(detail) == "" {
+			continue
+		}
+		if b.Len() == 0 {
+			b.WriteString(" fishhawk_audit_complete is pending because:")
+		}
+		b.WriteString(" " + detail)
+	}
+	return b.String()
 }
 
 // mergeRun is the tool handler. It validates locally, refuses fast when the run
@@ -366,13 +406,16 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 	var res *MergeRunResult
 	var checksSeq int64
 	var sawChecksPending bool
+	// checksDetails carries the LAST checks-pending 409's detail map so the
+	// resumable checkpoint can name the blocking audit-complete item (#3190).
+	var checksDetails map[string]any
 	for {
 		// Check expiry before every (re-)POST: the timer below is clamped to the
 		// deadline, so it can fire AT the deadline and loop back here — re-POSTing
 		// then would issue a doomed HTTP call past the tool's promised timeout. On
 		// exhaustion return the resumable checkpoint instead of POSTing again.
 		if sawChecksPending && !time.Now().Before(deadline) {
-			return nil, checksPendingOutput(checksSeq, start), nil
+			return nil, checksPendingOutput(checksSeq, start, checksDetails), nil
 		}
 		var merr error
 		res, merr = r.api.MergeRun(deadlineCtx, runID, verdict)
@@ -393,18 +436,19 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 			// genuine dispatch failure. Return the resumable checkpoint rather than
 			// a spurious tool error.
 			if sawChecksPending && deadlineCtx.Err() != nil {
-				return nil, checksPendingOutput(checksSeq, start), nil
+				return nil, checksPendingOutput(checksSeq, start, checksDetails), nil
 			}
 			return nil, MergeRunOutput{}, fmt.Errorf("merge run: %w", merr)
 		}
 		sawChecksPending = true
+		checksDetails = ae.Details
 		if seq := mergeVerdictSequenceFrom(ae.Details); seq != 0 {
 			checksSeq = seq
 		}
 		// Wait one poll tick, bounded by the shared deadline and ctx. On
 		// exhaustion return the resumable checks_pending checkpoint.
 		if !time.Now().Before(deadline) {
-			return nil, checksPendingOutput(checksSeq, start), nil
+			return nil, checksPendingOutput(checksSeq, start, checksDetails), nil
 		}
 		wait := interval
 		if d := time.Until(deadline); d < wait {
@@ -414,7 +458,7 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 		select {
 		case <-deadlineCtx.Done():
 			timer.Stop()
-			return nil, checksPendingOutput(checksSeq, start), nil
+			return nil, checksPendingOutput(checksSeq, start, checksDetails), nil
 		case <-timer.C:
 		}
 	}

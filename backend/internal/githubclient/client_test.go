@@ -1106,6 +1106,103 @@ func TestCreateCheckRun_InProgress_OmitsConclusion(t *testing.T) {
 	}
 }
 
+// TestCreateCheckRun_SendsOutputText is the WIRE hop for E64.59 / #3190: it
+// drives the REAL marshalled request body through the httptest server and reads
+// output.text out of it, so a rename or re-nesting of the JSON key fails HERE
+// rather than silently dropping the audit-complete missing list on the way to
+// GitHub. Counterfactual: deleting the body["output"]["text"] assignment in
+// CreateCheckRun makes this RED.
+func TestCreateCheckRun_SendsOutputText(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	const text = "- **stage_not_terminal** — acceptance stage 88538e1a was re-opened by a fix-up push\n"
+	_, err := c.CreateCheckRun(context.Background(), forge.FromGitHubInstallationID(42),
+		RepoRef{Owner: "x", Name: "y"},
+		CreateCheckRunParams{
+			Name:          "fishhawk_audit_complete",
+			HeadSHA:       "abc123",
+			Status:        CheckRunStatusInProgress,
+			OutputTitle:   "fishhawk_audit_complete",
+			OutputSummary: "Audit chain is still being assembled.",
+			OutputText:    text,
+		})
+	if err != nil {
+		t.Fatalf("CreateCheckRun: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("body decode: %v", err)
+	}
+	output, ok := body["output"].(map[string]any)
+	if !ok {
+		t.Fatalf("output not a map: %v", body["output"])
+	}
+	if output["text"] != text {
+		t.Errorf("output.text = %v, want %q", output["text"], text)
+	}
+	// GitHub requires title + summary whenever `output` is present.
+	if output["title"] == "" || output["summary"] == "" {
+		t.Errorf("output must still carry title+summary: %v", output)
+	}
+}
+
+// TestCreateCheckRun_OutputTextOnly_DefaultsTitle pins that OutputText ALONE is
+// enough to emit `output`, and that the title still defaults to the check name —
+// so a caller that sets only text cannot produce a request missing a required
+// member.
+func TestCreateCheckRun_OutputTextOnly_DefaultsTitle(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.CreateCheckRun(context.Background(), forge.FromGitHubInstallationID(42),
+		RepoRef{Owner: "x", Name: "y"},
+		CreateCheckRunParams{
+			Name:       "fishhawk_audit_complete",
+			HeadSHA:    "abc123",
+			Status:     CheckRunStatusInProgress,
+			OutputText: "body only",
+		})
+	if err != nil {
+		t.Fatalf("CreateCheckRun: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("body decode: %v", err)
+	}
+	output, ok := body["output"].(map[string]any)
+	if !ok {
+		t.Fatalf("output not a map: %v", body["output"])
+	}
+	if output["title"] != "fishhawk_audit_complete" {
+		t.Errorf("output.title = %v (should default to name)", output["title"])
+	}
+	if output["text"] != "body only" {
+		t.Errorf("output.text = %v", output["text"])
+	}
+}
+
+// TestCreateCheckRun_NoOutputFields_OmitsOutput pins the no-regression side: a
+// params carrying NO output fields at all must send no `output` member.
+func TestCreateCheckRun_NoOutputFields_OmitsOutput(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	_, err := c.CreateCheckRun(context.Background(), forge.FromGitHubInstallationID(42),
+		RepoRef{Owner: "x", Name: "y"},
+		CreateCheckRunParams{Name: "n", HeadSHA: "abc123", Status: CheckRunStatusInProgress})
+	if err != nil {
+		t.Fatalf("CreateCheckRun: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("body decode: %v", err)
+	}
+	if _, present := body["output"]; present {
+		t.Errorf("output should be absent when no output field is set; got %v", body["output"])
+	}
+}
+
 func TestCreateCheckRun_RejectsCompletedWithoutConclusion(t *testing.T) {
 	_, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)

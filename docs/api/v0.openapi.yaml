@@ -8183,6 +8183,17 @@ paths:
             retry CANNOT succeed. If the checks are still pending, re-invoke once
             they complete; but if a required check has already FAILED the merge
             will never queue — inspect the pull request instead of waiting.
+            When the blocking check is Fishhawk's own `fishhawk_audit_complete`
+            sitting at `pending`, `details` additionally carry
+            `audit_complete_state` (`"pending"`) and `audit_complete_missing`
+            (an array of `{kind, detail}` objects, the same shape as the
+            stage-checks `missing` list), and the message states the first
+            detail inline (E64.59 / #3190). Both keys are ADDITIVE and are
+            omitted when the pre-merge recompute did not run or did not yield a
+            pending audit-complete, so an unrelated failing required check is
+            never mislabelled. A `stage_not_terminal` item naming a
+            fix-up-re-opened acceptance stage means the merge clears by
+            re-dispatching that acceptance stage.
             (4) The pull request has a merge conflict against its base
             (`merge_conflicting`, E64.14 / #3109). NO verdict row is recorded
             (the guard runs before the append) and `details` carry
@@ -12571,6 +12582,7 @@ paths:
                                   - security_findings_unresolved
                                   - security_findings_unverified
                                   - children_pending
+                                  - stage_not_terminal
                               detail:
                                 type: string
                         resolved:

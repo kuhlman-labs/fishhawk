@@ -303,9 +303,12 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 			// `in_progress` would stay in_progress on the merged head forever.
 			// AFTER the Advance, deliberately: ComputeResult reports pending
 			// while any non-review stage is non-terminal, so a hoist above it
-			// recomputes to pending, which the publisher dedups against the
-			// already-published in_progress — NOTHING is posted and the stale
-			// check rides. BEFORE the notify / audit / economics tail so a
+			// recomputes to pending. Since E64.59 / #3190 this republish FORCES
+			// past the publisher's state dedup, so the hoist's observed failure
+			// is that a PENDING check run IS posted — the stale in_progress is
+			// replaced by a fresh in_progress and the terminal green never
+			// lands. (Before #3190 it was dedup-suppressed and nothing was
+			// posted at all.) BEFORE the notify / audit / economics tail so a
 			// failure in one of those cannot skip it. Best-effort; never
 			// unwinds the merge.
 			s.republishAuditCheckOnRunTerminal(ctx, target.ID)
@@ -392,11 +395,15 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		// fix-up push left at `in_progress` would stay in_progress on the
 		// merged head forever. AFTER the Advance, deliberately: ComputeResult
 		// reports pending while any non-review stage is non-terminal, so a
-		// hoist above it recomputes to pending, which the publisher dedups
-		// against the already-published in_progress — NOTHING is posted and
-		// the stale check rides. Observed, not argued: the hoist turns
-		// TestResolveReviewStageOnMerge_RepublishesAuditCheckOnTermination
-		// RED. BEFORE the notify / audit / economics tail so a failure in one
+		// hoist above it recomputes to pending. Observed, not argued — and
+		// RE-observed after E64.59 / #3190 made this republish FORCE past the
+		// publisher's state dedup: the hoist still turns
+		// TestResolveReviewStageOnMerge_RepublishesAuditCheckOnTermination RED,
+		// but now because the forced republish DOES post a pending check run
+		// ("terminal publish status = in_progress, want completed"), replacing
+		// the stale in_progress with a fresh one so the green never lands.
+		// Before #3190 the same hoist was dedup-suppressed and posted NOTHING.
+		// BEFORE the notify / audit / economics tail so a failure in one
 		// of those cannot skip it. Best-effort; never unwinds the merge.
 		s.republishAuditCheckOnRunTerminal(ctx, target.ID)
 		// Sticky status comment (E20.4 / #330). The PR merging is the

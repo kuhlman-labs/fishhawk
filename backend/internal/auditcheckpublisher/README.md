@@ -79,6 +79,34 @@ A PERSISTENT failure (`auditcheckpublisher.DefaultDegradedThreshold` = 5 consecu
 
 Dedup is process-lifetime in-memory keyed by `(repo, head_sha)` → most-recent published state — re-publishing identical state on every read would be wasteful.
 
+## `PublishOptions.Force` (E64.59 / #3190)
+
+`PublishWithOptions(ctx, runID, state, missing, resolved, PublishOptions{HeadSHAOverride, Force})` is the widened entry point; `PublishResultAtHead` delegates to it with `Force` unset, so **every** pre-#3190 caller is byte-identical (pinned by `TestPublishResultAtHead_UnforcedByDefault`).
+
+`Force` skips the state-equality dedup consult. It exists because the dedup cache keys on the last published STATE: a run stranded on `auditcomplete`'s mid-flight branch recomputes to the SAME `pending` the fix-up synchronize already published, so the republish is suppressed and the enriched `output.text` never lands — #3190's "#3186 is deployed, ran twice, and moved nothing".
+
+Scope, deliberately narrow. `Force` is wired ONLY to the two republishes that exist to CLEAR a strand, both via `server/checks.go::recomputeAndForcePublishAuditComplete`:
+
+| Path | Forced? | Why |
+|---|---|---|
+| `republishAuditCheckBeforeMerge` | yes | the stranded check is what makes the merge dispatch fail; an unforced republish posts nothing |
+| `republishAuditCheckOnRunTerminal` | yes | merging removes the run from every retry path, so the last republish must land |
+| `RepublishAuditCheck` (merge reconciler's 60s heal sweep) | **no** | a forced publish on a timer posts a new check run every minute per parked run — noise replacing legibility. Pinned by `server.TestRepublishAuditCheck_ReconcilerPathIsNotForced` |
+| the stage-checks read path (`publishAuditCheck`) | no | unchanged |
+
+Two invariants:
+
+- `Force` only ever ADDS a publish. A cache MISS already publishes and `Force` must never suppress that — the daemon-restart path, pinned by `TestPublishWithOptions_ForceOverColdCachePublishes`.
+- A forced publish still calls `recordPublished`, so the cache stays accurate and a later unforced call dedups normally.
+
+The alternative considered and rejected: a CONTENT fingerprint in the dedup cache instead of a state value. It would disturb the documented, test-pinned #3092 invariant that resolution text lands only with the FIRST pass publish at a head.
+
+## `output.text` carries the missing list (E64.59 / #3190)
+
+`buildParams` renders the structured `missing` list into `forge.CreateCheckRunParams.OutputText` (GitHub's `output.text`) on BOTH the pending and fail branches, via the shared `renderMissingText` helper — one `- **kind** — detail` line per item under a lead line. The pending branch also sets `OutputTitle`, because GitHub requires `title` + `summary` whenever `output` is present.
+
+The one-line `OutputSummary` keeps its existing shape; the DETAIL rides in `output.text`, which is exactly the field #3190 observed as `null` on the stranded check. An empty missing list omits `output.text` entirely rather than publishing a bare lead line.
+
 ## Configuration
 
 New `Config.ExternalURL` (env `FISHHAWKD_EXTERNAL_URL`) is required for the publisher to wire up; absent it, `auditcheckpublisher.New` returns nil and `publishAuditCheck` is a no-op.

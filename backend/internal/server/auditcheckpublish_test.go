@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
@@ -1309,4 +1310,319 @@ func stageStateOnOrchestratorRepo(t *testing.T, rr *orchestratorRepo, runID, sta
 	}
 	t.Fatalf("stage %s not found on run %s", stageID, runID)
 	return ""
+}
+
+// --- E64.59 / #3190: the fix-up-re-opened acceptance strand -------------------
+//
+// The shape this issue names, reproduced end to end through the real
+// derivation → publisher → forge path:
+//
+//  1. A run's acceptance stage SUCCEEDS and records a verdict.
+//  2. A fix-up push lands. reopenAcceptanceOnFixupPush (#1682) flips that
+//     stage back to `pending`, and the synchronize's recompute therefore takes
+//     auditcomplete.Compute's mid-flight branch → StatePending → an
+//     `in_progress` Check Run.
+//  3. Every later republish recomputes the SAME pending, and the publisher's
+//     dedup cache keys on the last published STATE — so nothing is posted and
+//     the required check stays stranded at in_progress with an empty missing
+//     list and a null output.text.
+//
+// The CONTROL sibling below changes exactly ONE variable — the recorded
+// acceptance outcome carries basis=all-skip-with-basis, so the stage is
+// SHORT-CIRCUITED and auditcomplete excludes it from `nonReview` entirely —
+// and must clear to a terminal success. That pair is what pins the two-variable
+// explanation (a REAL acceptance stage PLUS a fix-up) rather than asserting it
+// in prose.
+
+// fixupReopenTransitioner gives orchestratorRepo the production repo's fix-up
+// transition edge. The base fake validates ONLY run.ValidStageTransition, which
+// refuses succeeded → pending, so run.ReopenAcceptanceStage would be refused
+// inside reopenAcceptanceOnFixupPush and the strand would never be seeded. The
+// production postgres repo permits the edge (run.ValidStageFixupTransition);
+// this wrapper mirrors exactly that and nothing else, so the test drives the
+// REAL reopen path rather than hand-seeding a pending stage.
+type fixupReopenTransitioner struct {
+	*orchestratorRepo
+}
+
+func (r *fixupReopenTransitioner) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	st, err := r.GetStage(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if run.ValidStageFixupTransition(st.State, to) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		s, ok := r.stagesByID[id]
+		if !ok {
+			return nil, run.ErrNotFound
+		}
+		s.State = to
+		return s, nil
+	}
+	return r.orchestratorRepo.TransitionStage(ctx, id, to, c)
+}
+
+// reopenedAcceptanceStrandFixture seeds the pre-fix-up shape: plan + implement
+// succeeded with their traces, a review stage parked at awaiting_approval, and
+// an acceptance stage SUCCEEDED carrying a recorded acceptance_outcome_recorded
+// verdict. `basis` selects the discriminating variable: "" is a REAL acceptance
+// run (the strand), plan.AcceptanceBasisAllSkipWithBasis is a SHORT-CIRCUITED
+// one (the control).
+func reopenedAcceptanceStrandFixture(t *testing.T, basis string, merger GitHubMerger) (
+	*Server, *orchestratorRepo, *auditCompleteAuditFake, *publisherFakeGitHub, *run.Run, *run.Stage,
+) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+	prURL := fixupRepublishPRURL
+	r.PullRequestURL = &prURL
+
+	planStage := rr.seedStage(r.ID, 0, run.StageStateSucceeded)
+	planStage.Type = run.StageTypePlan
+	impl := rr.seedStage(r.ID, 1, run.StageStateSucceeded)
+	impl.Type = run.StageTypeImplement
+	rev := rr.seedStage(r.ID, 2, run.StageStateAwaitingApproval)
+	rev.Type = run.StageTypeReview
+	rev.Gate = &run.Gate{Kind: run.GateKindApproval}
+	acc := rr.seedStage(r.ID, 3, run.StageStateSucceeded)
+	acc.Type = run.StageTypeAcceptance
+
+	au := newAuditCompleteAuditFake()
+	au.appendTrace(t, r.ID, planStage.ID, "raw")
+	au.appendTrace(t, r.ID, planStage.ID, "redacted")
+	au.appendTrace(t, r.ID, impl.ID, "raw")
+	au.appendTrace(t, r.ID, impl.ID, "redacted")
+	if basis == "" {
+		// A REAL acceptance run also ships its trace bundle.
+		au.appendTrace(t, r.ID, acc.ID, "raw")
+		au.appendTrace(t, r.ID, acc.ID, "redacted")
+	}
+	outcome := map[string]any{"verdict": "passed"}
+	if basis != "" {
+		outcome[plan.AcceptanceBasisKey] = basis
+	}
+	outcomePayload, _ := json.Marshal(outcome)
+	au.appendChained(t, r.ID, &acc.ID, CategoryAcceptanceOutcomeRecorded, outcomePayload)
+	fixupPayload, _ := json.Marshal(map[string]any{"head_sha": fixupHeadSHA, "branch": "feat"})
+	au.appendChained(t, r.ID, &impl.ID, "fixup_pushed", fixupPayload)
+
+	arts := newFakeArtifactRepo()
+	seedPlanArtifact(arts, planStage.ID)
+	arts.all = append(arts.all, &artifact.Artifact{
+		ID: uuid.New(), StageID: impl.ID,
+		Kind:    artifact.KindPullRequest,
+		Content: pullRequestArtifactBody(prOpenHeadSHA),
+	})
+
+	gh := newPublisherFakeGitHub()
+	repo := &fixupReopenTransitioner{orchestratorRepo: rr}
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: repo,
+		AuditRepo:      au,
+		ArtifactRepo:   arts,
+		StageCheckRepo: newFakeStageCheckRepo(),
+		ExternalURL:    "https://app.fishhawk.example.com",
+		GateMerger:     merger,
+	})
+	s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub:      gh,
+		Runs:        rr,
+		Artifacts:   arts,
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	return s, rr, au, gh, r, acc
+}
+
+// TestAuditComplete_FixupReopenedAcceptance_StrandsCheckAtInProgress is the
+// step-1 reproduction. Before the fix it asserted the DEFECT (one in_progress
+// check carrying the default "still being assembled" summary, and a
+// before-merge republish that posts nothing); after the fix it asserts the
+// REMEDY on the same fixture.
+//
+// It asserts the CHECK RUNS THE FORGE RECEIVED — the recorded
+// CreateCheckRunParams — never that republishAuditCheckBeforeMerge was called.
+// That call-level assertion is exactly what #3186's tests stopped at and is why
+// this defect survived them.
+func TestAuditComplete_FixupReopenedAcceptance_StrandsCheckAtInProgress(t *testing.T) {
+	s, rr, _, gh, r, acc := reopenedAcceptanceStrandFixture(t, "", nil)
+	ctx := context.Background()
+
+	// The fix-up push: invalidate + re-open the settled acceptance stage, then
+	// recompute and publish — the production ordering in handleFixupPushed.
+	s.reopenAcceptanceOnFixupPush(ctx, r.ID, fixupHeadSHA)
+	if got := stageStateOnOrchestratorRepo(t, rr, r.ID, acc.ID); got != run.StageStatePending {
+		t.Fatalf("acceptance stage state = %q, want pending (the fix-up reopen did not land, so this fixture cannot reproduce the strand)", got)
+	}
+	s.recomputeAndPublishAuditComplete(ctx, r.ID)
+
+	first := gh.calls()
+	if len(first) != 1 {
+		t.Fatalf("after fix-up synchronize: %d check runs, want 1; statuses=%v", len(first), publishStatuses(first))
+	}
+	if first[0].params.Status != githubclient.CheckRunStatusInProgress {
+		t.Fatalf("first publish status = %q, want in_progress (fixture did not seed the stranding state)", first[0].params.Status)
+	}
+
+	// The operator merges. The pre-merge republish recomputes the SAME pending
+	// state — which is what the dedup cache already holds — so before #3190 it
+	// posted nothing at all.
+	s.republishAuditCheckBeforeMerge(ctx, r.ID)
+
+	calls := gh.calls()
+	if len(calls) != 2 {
+		t.Fatalf("check runs after the pre-merge republish = %d, want 2 (the forced republish did not land); statuses=%v",
+			len(calls), publishStatuses(calls))
+	}
+	last := calls[len(calls)-1]
+	if last.params.Status != githubclient.CheckRunStatusInProgress {
+		t.Errorf("republished status = %q, want in_progress (the run is legitimately mid-flight)", last.params.Status)
+	}
+	if !strings.Contains(last.params.OutputText, shortStageID(acc.ID)) {
+		t.Errorf("republished output.text = %q, want it to NAME the re-opened acceptance stage %s",
+			last.params.OutputText, shortStageID(acc.ID))
+	}
+	if !strings.Contains(last.params.OutputText, "re-opened by a fix-up push") {
+		t.Errorf("republished output.text = %q, want it to say the stage was re-opened by a fix-up push", last.params.OutputText)
+	}
+	if !strings.Contains(last.params.OutputText, "fishhawk_dispatch_stage") {
+		t.Errorf("republished output.text = %q, want it to name the re-dispatch action", last.params.OutputText)
+	}
+}
+
+// TestAuditComplete_FixupReopenedShortCircuitAcceptance_Clears is the
+// single-variable CONTROL: the SAME fixture and the SAME fix-up reopen, with
+// only the recorded outcome's basis changed to all-skip-with-basis. A
+// short-circuited acceptance stage is excluded from auditcomplete's `nonReview`
+// set, so the reopen is invisible to the mid-flight guard and the run clears to
+// a terminal success — which is why the three short-circuit runs in the issue's
+// dataset cleared despite their fix-ups.
+func TestAuditComplete_FixupReopenedShortCircuitAcceptance_Clears(t *testing.T) {
+	s, rr, _, gh, r, acc := reopenedAcceptanceStrandFixture(t, plan.AcceptanceBasisAllSkipWithBasis, nil)
+	ctx := context.Background()
+
+	s.reopenAcceptanceOnFixupPush(ctx, r.ID, fixupHeadSHA)
+	if got := stageStateOnOrchestratorRepo(t, rr, r.ID, acc.ID); got != run.StageStatePending {
+		t.Fatalf("acceptance stage state = %q, want pending (the control must run the SAME reopen as the reproduction)", got)
+	}
+	s.recomputeAndPublishAuditComplete(ctx, r.ID)
+
+	calls := gh.calls()
+	if len(calls) != 1 {
+		t.Fatalf("check runs = %d, want 1; statuses=%v", len(calls), publishStatuses(calls))
+	}
+	if calls[0].params.Status != githubclient.CheckRunStatusCompleted ||
+		calls[0].params.Conclusion != githubclient.CheckRunConclusionSuccess {
+		t.Fatalf("publish = %q/%q, want completed/success (a short-circuited acceptance stage is excluded from the mid-flight guard)",
+			calls[0].params.Status, calls[0].params.Conclusion)
+	}
+}
+
+// shortStageID renders the first 8 characters of a stage uuid — the same
+// convention auditcomplete's detail strings use.
+func shortStageID(id uuid.UUID) string {
+	s := id.String()
+	if len(s) >= 8 {
+		return s[:8]
+	}
+	return s
+}
+
+// TestFixupStrandedMerge_DerivedDetailReachesForgeAndOperator is the END-TO-END
+// SEAM test (E64.59 / #3190). One derived detail crosses FOUR boundaries in a
+// single pass:
+//
+//	auditcomplete.Compute (derivation)
+//	  → auditcheckpublisher.buildParams (rendering)
+//	    → forge.CreateCheckRunParams.OutputText (the forge params the check run carries)
+//	    → the 409 merge_checks_pending JSON body (the operator-facing response)
+//
+// A rename on ANY one hop reddens it. Combined with
+// githubclient.TestCreateCheckRun_SendsOutputText (which crosses forge params →
+// the ACTUAL marshalled GitHub request body), the whole chain is covered with no
+// untested seam — the #2558 gap.
+//
+// It also drives the acceptance_reopened audit entry through the SERVER's own
+// reopenAcceptanceOnFixupPush, so the string literal auditcomplete duplicates
+// (it cannot import package server) is bound to server.CategoryAcceptanceReopened
+// by a test rather than by convention.
+func TestFixupStrandedMerge_DerivedDetailReachesForgeAndOperator(t *testing.T) {
+	merger := &fakeMerger{err: unstableMergeErr()}
+	s, rr, _, gh, r, acc := reopenedAcceptanceStrandFixture(t, "", merger)
+	ctx := context.Background()
+
+	// The fix-up push strands the check: reopen, then publish pending.
+	s.reopenAcceptanceOnFixupPush(ctx, r.ID, fixupHeadSHA)
+	if got := stageStateOnOrchestratorRepo(t, rr, r.ID, acc.ID); got != run.StageStatePending {
+		t.Fatalf("acceptance stage state = %q, want pending (the fixture did not seed the strand)", got)
+	}
+	s.recomputeAndPublishAuditComplete(ctx, r.ID)
+	if got := len(gh.calls()); got != 1 {
+		t.Fatalf("after the fix-up synchronize: %d check runs, want 1", got)
+	}
+
+	// The operator merges. GitHub refuses on the required in_progress check.
+	w := postMergeRun(t, s, r.ID, mergeRunRequest{Verdict: "ship it"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 merge_checks_pending:\n%s", w.Code, w.Body.String())
+	}
+
+	// (i) The FORGE received a check run whose output.text names the re-opened
+	//     acceptance stage. Asserted on the recorded CreateCheckRunParams — the
+	//     check run state the forge holds — never on a call count.
+	calls := gh.calls()
+	if len(calls) != 2 {
+		t.Fatalf("check runs = %d, want 2 (the pre-merge republish must force past the dedup); statuses=%v",
+			len(calls), publishStatuses(calls))
+	}
+	forgeText := calls[len(calls)-1].params.OutputText
+	wantStage := shortStageID(acc.ID)
+	for _, want := range []string{"stage_not_terminal", wantStage, "re-opened by a fix-up push", "fishhawk_dispatch_stage"} {
+		if !strings.Contains(forgeText, want) {
+			t.Errorf("forge output.text = %q, want it to contain %q", forgeText, want)
+		}
+	}
+
+	// (ii) The 409 body carries the SAME kind and detail.
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if env.Error.Code != "merge_checks_pending" {
+		t.Fatalf("error code = %q, want merge_checks_pending", env.Error.Code)
+	}
+	if env.Error.Details["audit_complete_state"] != "pending" {
+		t.Errorf("details.audit_complete_state = %v, want pending", env.Error.Details["audit_complete_state"])
+	}
+	items, ok := env.Error.Details["audit_complete_missing"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("details.audit_complete_missing = %v, want one item", env.Error.Details["audit_complete_missing"])
+	}
+	item, _ := items[0].(map[string]any)
+	if item["kind"] != "stage_not_terminal" {
+		t.Errorf("missing[0].kind = %v, want stage_not_terminal", item["kind"])
+	}
+	detail, _ := item["detail"].(string)
+	for _, want := range []string{wantStage, "re-opened by a fix-up push", "fishhawk_dispatch_stage"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("missing[0].detail = %q, want it to contain %q", detail, want)
+		}
+	}
+	// The SAME derived detail on both hops — that identity is what makes this a
+	// seam test rather than two independent assertions that happen to agree.
+	if !strings.Contains(forgeText, detail) {
+		t.Errorf("the forge output.text does not carry the 409's detail verbatim:\n forge = %q\n 409   = %q", forgeText, detail)
+	}
+	if !strings.Contains(env.Error.Message, "fishhawk_audit_complete is pending because:") {
+		t.Errorf("409 message must state the cause inline: %q", env.Error.Message)
+	}
 }

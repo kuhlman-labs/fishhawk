@@ -374,6 +374,13 @@ type CreateCheckRunParams struct {
 	DetailsURL    string             // where the "Details" link on the forge points (typically a Fishhawk run URL)
 	OutputTitle   string
 	OutputSummary string
+	// OutputText is the check run's LONG-FORM output body (GitHub's
+	// `output.text`, rendered under the summary in the checks panel). Empty
+	// omits it, so every pre-#3190 caller's request body is byte-identical.
+	// Fishhawk uses it to carry the audit-complete MISSING list, which the
+	// one-line summary has no room for — the field #3190 observed as null on a
+	// stranded fishhawk_audit_complete check.
+	OutputText string
 }
 
 // CreateCheckRunResult carries the bits of the forge's response we
