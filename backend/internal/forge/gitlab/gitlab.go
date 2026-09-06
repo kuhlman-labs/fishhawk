@@ -768,19 +768,27 @@ func diffStatus(d *gitlabclient.CompareDiff) string {
 // vocabulary: State collapses GitLab's lifecycle word to open|closed, Merged
 // is derived from state=="merged", and the source/target branches become
 // Head/BaseRef.
+//
+// It also carries the merge evidence (E64.32 / #3136): MergedAt and
+// MergeCommitSHA are STRAIGHT PASS-THROUGHS of the MR payload — never derived
+// from State — so a merged-but-not-yet-populated MR stays UNKNOWN (nil MergedAt,
+// empty SHA) rather than being synthesised into a merge the payload does not
+// yet report. The record-merge-observation verb refuses on those zero values.
 func mergeRequestToPR(mr *gitlabclient.MergeRequest) *forge.PullRequest {
 	state := "closed"
 	if mr.State == "opened" {
 		state = "open"
 	}
 	return &forge.PullRequest{
-		HeadSHA: mr.SHA,
-		State:   state,
-		Merged:  mr.State == "merged",
-		BaseRef: mr.TargetBranch,
-		HeadRef: mr.SourceBranch,
-		Number:  mr.IID,
-		HTMLURL: mr.WebURL,
-		Body:    mr.Description,
+		HeadSHA:        mr.SHA,
+		State:          state,
+		Merged:         mr.State == "merged",
+		BaseRef:        mr.TargetBranch,
+		HeadRef:        mr.SourceBranch,
+		Number:         mr.IID,
+		HTMLURL:        mr.WebURL,
+		Body:           mr.Description,
+		MergedAt:       mr.MergedAt,
+		MergeCommitSHA: mr.MergeCommitSHA,
 	}
 }

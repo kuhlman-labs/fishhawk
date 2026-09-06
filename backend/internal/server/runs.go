@@ -251,12 +251,14 @@ type runResponse struct {
 	// never pays the per-row stage + audit reads). omitempty, so every run that
 	// is not blocked keeps a byte-identical response.
 	//
-	// Recovery DISCRIMINATES rather than pointing at a verb and hoping: it reads
-	// "reconcile-merge" ONLY when the blocker is a pair-table-admissible (type,
-	// state) on a run whose PR is observably merged — i.e. when the sweep can
-	// genuinely move it — and "none" otherwise, with Reason naming the state.
-	// Pointing at a verb guaranteed to refuse is this issue's own complaint
-	// about merge_run.
+	// Recovery DISCRIMINATES rather than pointing at a verb and hoping, across a
+	// closed THREE-value set: "reconcile-merge" when a pair-table-admissible
+	// blocker sits on a run whose PR is observably merged (the sweep can move
+	// it); "record-merge-observation" when such a blocker's PR merge has NOT
+	// been observed yet but the run carries a resolvable PR URL (observe first,
+	// then reconcile — E64.40 / #3151); and "none" otherwise, with Reason naming
+	// the state. Pointing at a verb guaranteed to refuse is this issue's own
+	// complaint about merge_run.
 	CompletionBlocked *runCompletionBlockedPayload `json:"completion_blocked,omitempty"`
 }
 
@@ -273,15 +275,23 @@ type runCompletionBlockedPayload struct {
 	Recovery   string `json:"recovery"`
 }
 
-// The two values of runCompletionBlockedPayload.Recovery. A closed set on
+// The three values of runCompletionBlockedPayload.Recovery. A closed set on
 // purpose: an operator (or the MCP surface) branches on it, and a free-form
 // hint would be unbranchable.
 const (
 	// completionBlockedRecoveryReconcileMerge — POST
 	// /v0/runs/{run_id}/reconcile-merge will supersede this stage and let the
-	// run complete.
+	// run complete (a merge-supersedable park whose PR merge is already on the
+	// chain).
 	completionBlockedRecoveryReconcileMerge = "reconcile-merge"
-	// completionBlockedRecoveryNone — no reconcile applies. Reason names the
+	// completionBlockedRecoveryRecordMergeObservation — the run's PR merge has
+	// not been observed yet, so POST /v0/runs/{run_id}/record-merge-observation
+	// records it off the forge FIRST; recovery then flips to reconcile-merge
+	// (E64.40 / #3151). Emitted only when the blocker is admissible, the run
+	// carries a PR URL that resolves under its forge family, and the chain
+	// carries NO merge evidence.
+	completionBlockedRecoveryRecordMergeObservation = "record-merge-observation"
+	// completionBlockedRecoveryNone — no verb applies. Reason names the
 	// state and says what the stage needs instead.
 	completionBlockedRecoveryNone = "none"
 )
@@ -1790,24 +1800,35 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 // order, so the answer is stable across calls and names the stage an operator
 // would reach for first.
 //
-// Recovery is `reconcile-merge` ONLY when BOTH hold: the blocker's (type, state)
-// is a row of the DEFAULT-DENY run.MergeSupersedable pair table, AND the run's
-// PR is observably merged (the same pr_merged / post_merge_observed /
-// merge_observation_recorded evidence handleReconcileMerge's own precondition
-// reads — both call runPRObservablyMerged, so the surface and the verb can never
-// disagree; the third category, E64.32 / #3136, is why this surface flips from
-// `none` to `reconcile-merge` once an operator records a merge observation, with
-// no change here). Every other blocker — `running`, `dispatched`,
-// `awaiting_children`, the deploy park states, `awaiting_scope_decision`, and an
-// admissible park on a run whose PR has NOT merged — reads `none` with a Reason
-// naming the state, because pointing an operator at a verb guaranteed to refuse
-// is exactly the defect this issue reports against merge_run.
+// Recovery DISCRIMINATES across THREE arms (E64.40 / #3151), all requiring the
+// blocker's (type, state) to be a row of the DEFAULT-DENY run.MergeSupersedable
+// pair table:
+//
+//   - `reconcile-merge` when the run's PR is observably merged (the same
+//     pr_merged / post_merge_observed / merge_observation_recorded evidence
+//     handleReconcileMerge's own precondition reads — both call
+//     runPRObservablyMerged, so surface and verb can never disagree).
+//   - `record-merge-observation` when the evidence read SUCCEEDED with NO merge
+//     evidence AND the run carries a PR URL that resolves under its forge family
+//     (resolveObservationTarget). The observe verb records the merge off the
+//     forge; recovery then flips to reconcile-merge. This mirrors ONLY the
+//     verb's CHAIN-LOCAL preconditions — it deliberately does NOT re-check the
+//     forge-side rungs (is the PR actually merged, does it carry a SHA and a
+//     timestamp), because a GET must not perform a forge read. So the surface
+//     can name the verb and the verb can still refuse with pr_not_merged; that
+//     residual is the honest cost of the no-forge-read constraint and is
+//     strictly better than `none`, which names no verb for a shape where one
+//     applies.
+//   - `none` for every other blocker — `running`, `dispatched`,
+//     `awaiting_children`, the deploy park states, `awaiting_scope_decision`, an
+//     admissible park with no PR URL or an unresolvable/mismatched one, and (per
+//     below) an evidence-read failure — with a Reason naming the state.
 //
 // Best-effort: a stage-list failure warn-logs and omits the field. A merge-
-// evidence read failure does NOT omit the field — it degrades Recovery to
-// `none` (fail closed on unknown evidence: never advertise a verb we cannot
-// confirm would work) and still names the blocking stage, which is the half of
-// the answer that does not depend on the chain.
+// evidence read failure does NOT omit the field — it FAILS CLOSED to `none`
+// (never advertise a verb we cannot confirm applies — including the new observe
+// verb) and still names the blocking stage, the half of the answer that does not
+// depend on the chain.
 func (s *Server) completionBlockedForRun(ctx context.Context, got *run.Run) *runCompletionBlockedPayload {
 	if got == nil || got.State != run.StateRunning || s.cfg.RunRepo == nil {
 		return nil
@@ -1844,23 +1865,39 @@ func (s *Server) completionBlockedForRun(ctx context.Context, got *run.Run) *run
 		return out
 	}
 	merged := false
+	evidenceReadOK := false
 	if s.cfg.AuditRepo != nil {
-		var merr error
-		if merged, merr = s.runPRObservablyMerged(ctx, got.ID); merr != nil {
+		if m, merr := s.runPRObservablyMerged(ctx, got.ID); merr != nil {
 			s.cfg.Logger.Warn("read merge observation failed; completion_blocked recovery degraded to none",
 				"run_id", got.ID.String(), "error", merr.Error())
-			merged = false
+		} else {
+			merged = m
+			evidenceReadOK = true
 		}
 	}
-	if !merged {
+	if merged {
+		out.Recovery = completionBlockedRecoveryReconcileMerge
 		out.Reason = fmt.Sprintf(
-			"the run cannot complete while stage %s is parked at %q, and this run's pull request is not observably merged, so no reconcile applies yet",
+			"the merge made stage %s (parked at %q) unreachable; POST /v0/runs/{run_id}/reconcile-merge supersedes it and completes the run",
 			blocker.Type, blocker.State)
 		return out
 	}
-	out.Recovery = completionBlockedRecoveryReconcileMerge
+	// The evidence read SUCCEEDED with no merge on the chain. If the run carries
+	// a PR URL that resolves under its forge family, the observe verb can record
+	// the merge off the forge — name it so the operator observes FIRST, then
+	// reconciles. An evidence-read FAILURE never reaches here (evidenceReadOK is
+	// false), so an unknown chain fails closed to `none` below.
+	if evidenceReadOK {
+		if _, _, _, reason := resolveObservationTarget(got); reason == obsTargetOK {
+			out.Recovery = completionBlockedRecoveryRecordMergeObservation
+			out.Reason = fmt.Sprintf(
+				"the run cannot complete while stage %s is parked at %q, and this run's pull request merge has not been observed yet; POST /v0/runs/{run_id}/record-merge-observation records it off the forge, after which reconcile-merge completes the run",
+				blocker.Type, blocker.State)
+			return out
+		}
+	}
 	out.Reason = fmt.Sprintf(
-		"the merge made stage %s (parked at %q) unreachable; POST /v0/runs/{run_id}/reconcile-merge supersedes it and completes the run",
+		"the run cannot complete while stage %s is parked at %q, and this run's pull request is not observably merged, so no reconcile applies yet",
 		blocker.Type, blocker.State)
 	return out
 }

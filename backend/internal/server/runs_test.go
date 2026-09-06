@@ -1441,6 +1441,7 @@ func TestCompletionBlocked_RecoveryDiscrimination(t *testing.T) {
 		blocker      run.StageType
 		state        run.StageState
 		observeMerge bool
+		prURL        string
 		wantRecovery string
 	}{
 		{
@@ -1454,11 +1455,37 @@ func TestCompletionBlocked_RecoveryDiscrimination(t *testing.T) {
 			observeMerge: true, wantRecovery: completionBlockedRecoveryReconcileMerge,
 		},
 		{
-			// The SAME admissible pair with no merge evidence: the verb would
-			// refuse its own precondition, so the surface must not name it.
-			name:    "merge-supersedable park on an UNMERGED run names no verb",
+			// Admissible + a resolvable PR URL + a merge_observation_recorded row
+			// -> reconcile-merge, proving the widening ADDED a value rather than
+			// stealing the merged arm.
+			name:    "merge-supersedable park on a merged run WITH a PR URL still names reconcile",
+			blocker: run.StageTypeAcceptance, state: run.StageStateAwaitingHostDispatch,
+			observeMerge: true, prURL: "https://github.com/x/y/pull/1",
+			wantRecovery: completionBlockedRecoveryReconcileMerge,
+		},
+		{
+			// Admissible + a resolvable PR URL + NO merge evidence -> the observe
+			// verb applies: record the merge off the forge first (E64.40 / #3151).
+			name:    "merge-supersedable park with a resolvable PR URL and no evidence names the observe verb",
+			blocker: run.StageTypeAcceptance, state: run.StageStateAwaitingHostDispatch,
+			observeMerge: false, prURL: "https://github.com/x/y/pull/1",
+			wantRecovery: completionBlockedRecoveryRecordMergeObservation,
+		},
+		{
+			// The SAME admissible pair with no merge evidence AND no PR URL: the
+			// observe verb cannot resolve a target, so the surface must not name
+			// it — the no-URL control.
+			name:    "merge-supersedable park on an UNMERGED run with no PR URL names no verb",
 			blocker: run.StageTypeAcceptance, state: run.StageStateAwaitingHostDispatch,
 			observeMerge: false, wantRecovery: completionBlockedRecoveryNone,
+		},
+		{
+			// Admissible + no evidence + a MALFORMED / cross-forge PR URL: the
+			// observe verb's target does not resolve, so still no verb.
+			name:    "merge-supersedable park with a malformed PR URL and no evidence names no verb",
+			blocker: run.StageTypeAcceptance, state: run.StageStateAwaitingHostDispatch,
+			observeMerge: false, prURL: "https://github.com/x/y/issues/1",
+			wantRecovery: completionBlockedRecoveryNone,
 		},
 		{
 			name: "running implement", blocker: run.StageTypeImplement, state: run.StageStateRunning,
@@ -1487,6 +1514,11 @@ func TestCompletionBlocked_RecoveryDiscrimination(t *testing.T) {
 			if tc.observeMerge {
 				f.observeMerge(t)
 			}
+			if tc.prURL != "" {
+				if _, err := f.runRepo.SetRunPullRequestURL(context.Background(), f.runID, tc.prURL); err != nil {
+					t.Fatalf("set pr url: %v", err)
+				}
+			}
 			got, body := decodeCompletionBlocked(t, f.s, f.runID)
 			if got == nil {
 				t.Fatalf("completion_blocked omitted on a blocked run:\n%s", body)
@@ -1513,7 +1545,36 @@ func TestCompletionBlocked_RecoveryDiscrimination(t *testing.T) {
 				!strings.Contains(got.Reason, "reconcile-merge") {
 				t.Errorf("reason does not name the recovery endpoint: %s", got.Reason)
 			}
+			if tc.wantRecovery == completionBlockedRecoveryRecordMergeObservation &&
+				!strings.Contains(got.Reason, "record-merge-observation") {
+				t.Errorf("reason does not name the observe endpoint: %s", got.Reason)
+			}
 		})
+	}
+}
+
+// TestCompletionBlocked_EvidenceReadFailureFailsClosed pins the fail-closed arm:
+// an AuditRepo whose category read ERRORS must yield `none` on an admissible
+// parked run WITH a resolvable PR URL — never the new record-merge-observation
+// value, since an unknown chain must not advertise a verb we cannot confirm
+// applies. Without the evidenceReadOK guard this run would name the observe verb.
+func TestCompletionBlocked_EvidenceReadFailureFailsClosed(t *testing.T) {
+	f := newSupersedeFixture(t, parkedShape())
+	if _, err := f.runRepo.SetRunPullRequestURL(context.Background(), f.runID,
+		"https://github.com/x/y/pull/1"); err != nil {
+		t.Fatalf("set pr url: %v", err)
+	}
+	f.s.cfg.AuditRepo = &msListCategoryErrAudit{
+		Repository: f.audit, failCategory: CategoryPRMerged, err: errors.New("chain unreadable"),
+	}
+
+	got, body := decodeCompletionBlocked(t, f.s, f.runID)
+	f.s.cfg.AuditRepo = f.audit
+	if got == nil {
+		t.Fatalf("completion_blocked omitted; the blocker half must survive an evidence-read failure:\n%s", body)
+	}
+	if got.Recovery != completionBlockedRecoveryNone {
+		t.Errorf("recovery = %q, want none: an unreadable chain must not advertise the observe verb", got.Recovery)
 	}
 }
 

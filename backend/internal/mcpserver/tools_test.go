@@ -13638,6 +13638,34 @@ func TestRunMirror_DecodesCompletionBlockedWireBytes(t *testing.T) {
 		t.Errorf("completion_blocked = %+v on a run that omits the key, want nil", unblocked.CompletionBlocked)
 	}
 
+	// The THIRD recovery value (E64.40 / #3151) must survive the mirror too: a
+	// decode that silently dropped an unmirrored enum member would strand an
+	// operator on a shape where the observe verb applies.
+	const observeBytes = `{
+	  "id": "0f4b4a5e-6d51-4f2f-9f0d-2b7c3d4e5f60",
+	  "state": "running",
+	  "completion_blocked": {
+	    "stage_id": "11111111-2222-3333-4444-555555555555",
+	    "stage_type": "review",
+	    "stage_state": "awaiting_approval",
+	    "reason": "the run cannot complete while stage review is parked at \"awaiting_approval\", and this run's pull request merge has not been observed yet; POST /v0/runs/{run_id}/record-merge-observation records it off the forge, after which reconcile-merge completes the run",
+	    "recovery": "record-merge-observation"
+	  }
+	}`
+	var observe Run
+	if err := json.Unmarshal([]byte(observeBytes), &observe); err != nil {
+		t.Fatalf("decode observe run: %v", err)
+	}
+	if observe.CompletionBlocked == nil {
+		t.Fatal("completion_blocked decoded to nil on the record-merge-observation shape (#371-class mirror trap)")
+	}
+	if got := observe.CompletionBlocked.Recovery; got != "record-merge-observation" {
+		t.Errorf("recovery = %q, want the literal record-merge-observation", got)
+	}
+	if observe.CompletionBlocked.Reason == "" {
+		t.Errorf("reason decoded empty on the observe shape: %+v", observe.CompletionBlocked)
+	}
+
 	// Re-serialization must reproduce the SAME wire keys, so a value that
 	// round-trips through this mirror stays decodable by the backend's own
 	// contract.

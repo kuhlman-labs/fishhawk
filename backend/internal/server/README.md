@@ -3911,6 +3911,66 @@ After the sweep the handler re-runs `advanceRunAfterReviewResolve`, so the now-a
 
 The read half (`runs.go`'s `completionBlockedForRun`). Populated on the single-run read ONLY — the same best-effort posture as `Concerns` / `DerivedStatus` / `SliceDependsOn`, so the list endpoint pays no per-row stage + audit reads — and `omitempty`, so every unblocked run keeps a byte-identical response.
 
-It names the **lowest-sequence** non-terminal stage (the run's own order, so the answer is stable and names the stage an operator reaches for first) and DISCRIMINATES the recovery: `reconcile-merge` ONLY when the blocker is pair-table-admissible AND the run's PR is observably merged — the endpoint's own preconditions, read through the same helper, so the surface and the verb cannot disagree — and `none` otherwise, with `reason` naming the state. Pointing an operator at a verb guaranteed to refuse is #3083's own complaint about `merge_run`.
+It names the **lowest-sequence** non-terminal stage (the run's own order, so the answer is stable and names the stage an operator reaches for first) and DISCRIMINATES the recovery across a closed THREE-value set (E64.40 / #3151): `reconcile-merge` when the blocker is pair-table-admissible AND the run's PR is observably merged — the endpoint's own preconditions, read through the same helper, so the surface and the verb cannot disagree; `record-merge-observation` when such a blocker's PR merge has NOT been observed yet but the run carries a PR URL that resolves under its forge family (`resolveObservationTarget`) — observe off the forge first, then reconcile; and `none` otherwise, with `reason` naming the state. Pointing an operator at a verb guaranteed to refuse is #3083's own complaint about `merge_run`.
 
-A merge-evidence read failure does NOT omit the field: it degrades `recovery` to `none` (fail closed — never advertise a verb we cannot confirm would work) and still names the blocking stage, the half of the answer that does not depend on the chain.
+The `record-merge-observation` arm mirrors ONLY the observe verb's CHAIN-LOCAL preconditions (admissible blocker, resolvable PR URL, no merge evidence) — it deliberately does NOT re-check the forge-side rungs (is the PR actually merged, does it carry a SHA and a timestamp), because a GET must not perform a forge read. So the surface can name the verb and the verb can still refuse with `record_merge_observation_pr_not_merged`; that residual is the honest cost of the no-forge-read constraint and is strictly better than `none`, which names no verb for a shape where one applies.
+
+A merge-evidence read failure does NOT omit the field: it FAILS CLOSED to `none` (never advertise a verb we cannot confirm applies — including the observe verb) and still names the blocking stage, the half of the answer that does not depend on the chain.
+
+## Merge-observation verb (`merge_observation.go`, E64.32 / #3136, E64.40 / #3151)
+
+`POST /v0/runs/{run_id}/record-merge-observation` is the OBSERVE half of the #3083 recovery pair. `reconcile-merge`'s evidence gate reads the run's audit CHAIN and never the forge, so a run whose PR genuinely merged but whose merge was never recorded (a webhook that never arrived, an observation lost when fishhawkd restarted mid-write) is unreconcilable — the evidence it needs can never appear. This verb is the ONLY new way onto that chain, and it requires a live `merged=true` forge answer to use it.
+
+**The observe/settle split is load-bearing.** This verb OBSERVES and records a fact; it settles nothing, transitions no stage and completes no run. `reconcile-merge` SETTLES and still reads only the chain. So the fail-closed posture #3083 established is preserved exactly: evidence is still REQUIRED, and the settling verb still never re-observes. The category `merge_observation_recorded` is DELIBERATELY DISTINCT from `pr_merged` — `pr_merged` carries a live-observation timestamp the latency/cost surfaces read as "when Fishhawk knew", so back-dating one would corrupt those series; recording `merged_at` (the forge's merge time) alongside `observed_at` (when Fishhawk learned it) plus `reconciled_after_the_fact:true` lets a reader see the gap without anything being back-dated.
+
+### The rung ladder
+
+Every refusal is evaluated BEFORE any write, so a refused call leaves ZERO rows:
+
+| status | code | condition |
+| --- | --- | --- |
+| 400 | `validation_failed` | non-UUID `run_id` |
+| 503 | `record_merge_observation_unconfigured` | run/audit repositories unwired (rung 2), OR the per-forge reader could not be resolved (rung 7) |
+| 404 | `run_not_found` | — |
+| 409 | `record_merge_observation_no_pull_request` | the run carries no PR URL |
+| 400 | `record_merge_observation_malformed_pr_url` | the recorded URL is structurally unresolvable under ANY forge shape, or the run's `repo` is not owner/name |
+| 409 | `record_merge_observation_pr_url_repo_mismatch` | the URL resolves but names another repository, or a DIFFERENT forge family than the run authenticates against |
+| 500 | `internal_error` | a chain read failed — fails CLOSED, never a write on unknown evidence (rung 6); or the audit append failed |
+| 502 | `record_merge_observation_forge_unavailable` | `GetPullRequest` errored |
+| 409 | `record_merge_observation_pr_not_merged` | the forge answers NOT merged (or a nil PR) — the guard against manufacturing evidence for a change that never shipped |
+| 409 | `record_merge_observation_no_merge_commit` | merged but an empty merge commit SHA — a generic partial-evidence guard on BOTH forges |
+| 409 | `record_merge_observation_no_merge_timestamp` | merged with a SHA but a nil `merged_at` — refuse the partial fact rather than claim a merge time it does not carry |
+
+A rung-6 idempotent 200 (`already_recorded:true`, appending NOTHING) fires when the chain already carries `pr_merged` / `post_merge_observed` / `merge_observation_recorded`.
+
+### Forge-family URL resolution + per-forge reader dispatch (E64.40 / #3151)
+
+The original verb was GitHub-URL-shaped end to end — it resolved the PR number only from a `/pull/` segment and refused any run whose credential ref named a non-GitHub forge — so a GitLab run drew a 409 BEFORE the forge was ever read, and acceptance criterion 2 was unreachable without widening it. `resolveObservationTarget` replaces that with a forge-FAMILY-aware resolution, WIDENED without being weakened:
+
+- the forge id is derived from the run's `InstallationRef` (bare decimal or absent = `github`, `<id>:...` = that forge);
+- the recorded URL is classified family-AGNOSTICALLY (`/pull/<n>` = github; `/-/merge_requests/<n>` canonical or `/merge_requests/<n>` legacy = gitlab), and the URL's OWN family must equal the run's forge family — a github-ref run can never present a GitLab URL, and vice versa, and any unimplemented forge fails closed to a mismatch;
+- the URL's project path must equal the run's `repo` case-insensitively.
+
+The reader is then resolved per-forge (`prStateReaderFor`) with an UNAMBIGUOUS ladder (binding approval condition 2): `cfg.PRStateReader` overrides everything (test seam); a **github**-family run resolves ONLY through `cfg.GitHub`, else 503 — it NEVER falls through to the forge resolver or the process registry, so registry availability can never change a GitHub outcome; any other family resolves through `cfg.ForgeResolver` (defaulting to `forge.Get`), a resolver error or nil forge yielding 503. This keeps the rung-5b security property (the verb can never confirm a DIFFERENT pull request and then write a trusted row asserting this run's URL was observed merged) by construction: the URL shape and the reader are both bound to the SAME forge id.
+
+### Idempotence — the honest (weak) claim
+
+The rung-6 guard is a READ-THEN-APPEND and is NOT atomic: two CONCURRENT posts can both read an empty chain and both append. This code does NOT serialize them. A SEQUENTIAL repeat POST appends nothing (the test pins that); a concurrent duplicate is POSSIBLE and HARMLESS, because the evidence gate asks only whether AT LEAST ONE qualifying row exists — a second row is inert. The stronger `supersedeRepairMu` mechanism was deliberately NOT adopted here: it would buy nothing a caller can observe.
+
+### Live-validation operator walk (binding approval condition 3)
+
+The `requires_live_validation` criterion — a merged GitLab MR records exactly one observation carrying the MR's SHA and `merged_at` — is validated by this exact walk against a live deployment:
+
+```sh
+# A run whose InstallationRef is "gitlab:<project_id>" and whose PR URL is a
+# merged merge request, e.g. https://gitlab.com/group/project/-/merge_requests/7
+curl -sS -X POST "$FISHHAWK_BACKEND_URL/v0/runs/$RUN_ID/record-merge-observation" \
+  -H "Authorization: Bearer $FISHHAWK_API_TOKEN"
+# -> 200 {"run_id":"...","already_recorded":false,"observation":{...,"merge_commit_sha":"<sha>","merged_at":"<forge time>",...}}
+
+# Confirm EXACTLY ONE merge_observation_recorded row carrying the MR's SHA and merged_at:
+curl -sS "$FISHHAWK_BACKEND_URL/v0/runs/$RUN_ID/audit?category=merge_observation_recorded" \
+  -H "Authorization: Bearer $FISHHAWK_API_TOKEN" \
+  | jq '.items | length, .items[0].payload.merge_commit_sha, .items[0].payload.merged_at'
+# -> 1, "<sha>", "<forge time>"
+```

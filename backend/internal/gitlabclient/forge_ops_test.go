@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
+	"time"
 )
 
 // opRequest is a snapshot of a request the forge-ops stub saw, with the
@@ -347,6 +348,56 @@ func TestGetMergeRequest_ValidatesArgs(t *testing.T) {
 	if _, err := c.GetMergeRequest(context.Background(), 42, 0); err == nil {
 		t.Error("want error for missing iid")
 	}
+}
+
+// TestGetMergeRequest_DecodesMergedAt pins the E64.40 / #3151 merge-evidence
+// decode: merged_at is a *time.Time so an unmerged (or timestamp-omitting) MR
+// stays a NIL pointer, distinguishable from the zero time. A value-typed field
+// would decode a null/absent merged_at to the Unix epoch and silently satisfy
+// the observe verb's rung-10 merged-timestamp presence gate.
+func TestGetMergeRequest_DecodesMergedAt(t *testing.T) {
+	t.Run("merged: merged_at decodes to a non-nil timestamp", func(t *testing.T) {
+		c := clientWith(t, func(*opRequest) (*http.Response, error) {
+			return jsonResponse(http.StatusOK,
+				`{"iid":7,"state":"merged","merge_commit_sha":"mc1","merged_at":"2026-08-30T12:34:56Z"}`), nil
+		})
+		mr, err := c.GetMergeRequest(context.Background(), 42, 7)
+		if err != nil {
+			t.Fatalf("GetMergeRequest: %v", err)
+		}
+		if mr.MergedAt == nil {
+			t.Fatalf("MergedAt = nil, want the decoded merge timestamp")
+		}
+		want := time.Date(2026, 8, 30, 12, 34, 56, 0, time.UTC)
+		if !mr.MergedAt.Equal(want) {
+			t.Errorf("MergedAt = %v, want %v", mr.MergedAt.UTC(), want)
+		}
+	})
+	t.Run("null merged_at stays nil, not the zero time", func(t *testing.T) {
+		c := clientWith(t, func(*opRequest) (*http.Response, error) {
+			return jsonResponse(http.StatusOK,
+				`{"iid":7,"state":"opened","merge_commit_sha":null,"merged_at":null}`), nil
+		})
+		mr, err := c.GetMergeRequest(context.Background(), 42, 7)
+		if err != nil {
+			t.Fatalf("GetMergeRequest: %v", err)
+		}
+		if mr.MergedAt != nil {
+			t.Errorf("MergedAt = %v, want nil (a null merged_at must not decode to the zero time)", mr.MergedAt.UTC())
+		}
+	})
+	t.Run("absent merged_at key stays nil", func(t *testing.T) {
+		c := clientWith(t, func(*opRequest) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `{"iid":7,"state":"opened"}`), nil
+		})
+		mr, err := c.GetMergeRequest(context.Background(), 42, 7)
+		if err != nil {
+			t.Fatalf("GetMergeRequest: %v", err)
+		}
+		if mr.MergedAt != nil {
+			t.Errorf("MergedAt = %v, want nil when the key is absent", mr.MergedAt.UTC())
+		}
+	})
 }
 
 // --- UpdateMergeRequest -----------------------------------------------------

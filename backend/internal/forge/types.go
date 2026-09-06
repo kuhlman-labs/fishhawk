@@ -216,19 +216,20 @@ type PullRequest struct {
 	// stay distinguishable from the zero time. A nil MergedAt means UNKNOWN
 	// and NEVER a merge at the Unix epoch.
 	//
-	// Populated by GetPullRequest; nil on CreatePullRequest /
-	// ListOpenPullRequestsByHead results (they don't read it back) and nil on
-	// the GitLab adapter (gitlab.go), whose merge-request payload carries no
-	// merged_at field yet. Every consumer MUST treat nil as unknown — the
-	// record-merge-observation endpoint refuses rather than recording a fact
-	// it cannot carry.
+	// Populated by GetPullRequest on BOTH the GitHub and GitLab adapters
+	// (gitlab.go's mergeRequestToPR passes the MR's merged_at through as of
+	// E64.40 / #3151); nil on CreatePullRequest / ListOpenPullRequestsByHead
+	// results (they don't read it back). Every consumer MUST treat nil as
+	// unknown — the record-merge-observation endpoint refuses rather than
+	// recording a fact it cannot carry.
 	MergedAt *time.Time
 	// MergeCommitSHA is the commit the merge produced (`merge_commit_sha`) —
 	// the durable forge-side artifact a merge observation points at
 	// (E64.32 / #3136). Empty means UNKNOWN, never "merged with no commit":
-	// it is "" on CreatePullRequest / ListOpenPullRequestsByHead results and
-	// "" on the GitLab adapter until its half lands, so a consumer that needs
-	// it must refuse on the zero value rather than record an empty SHA.
+	// populated by GetPullRequest on BOTH the GitHub and GitLab adapters
+	// (E64.40 / #3151) and "" on CreatePullRequest / ListOpenPullRequestsByHead
+	// results, so a consumer that needs it must refuse on the zero value rather
+	// than record an empty SHA.
 	MergeCommitSHA string
 }
 

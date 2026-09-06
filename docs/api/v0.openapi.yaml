@@ -1349,14 +1349,24 @@ components:
             half of the answer that does not depend on the audit chain.
         recovery:
           type: string
-          enum: [reconcile-merge, none]
+          enum: [reconcile-merge, record-merge-observation, none]
           description: |
-            DISCRIMINATES rather than always naming a verb. `reconcile-merge`
-            means POST `/v0/runs/{run_id}/reconcile-merge` will supersede this
-            stage and complete the run — emitted ONLY when the blocker's
+            DISCRIMINATES rather than always naming a verb, across a closed
+            three-value set. `reconcile-merge` means POST
+            `/v0/runs/{run_id}/reconcile-merge` will supersede this stage and
+            complete the run — emitted ONLY when the blocker's
             `(stage_type, state)` is a row of the default-deny merge-supersede
             pair table AND the run's PR is observably merged, i.e. exactly the
-            endpoint's own preconditions. `none` means no verb applies and
+            endpoint's own preconditions. `record-merge-observation` means the
+            run's PR merge has NOT been observed yet, so POST
+            `/v0/runs/{run_id}/record-merge-observation` records it off the forge
+            FIRST, after which recovery flips to `reconcile-merge` (E64.40 /
+            #3151) — emitted ONLY when the blocker is admissible, the run carries
+            a PR URL that resolves under its forge family, and the chain carries
+            no merge evidence. It mirrors the observe verb's CHAIN-LOCAL
+            preconditions only (this read performs no forge call), so the named
+            verb can still refuse with `record_merge_observation_pr_not_merged`
+            if the PR is not actually merged. `none` means no verb applies and
             `reason` says what the stage needs instead. Pointing an operator at
             a verb guaranteed to refuse is the defect #3083 reports against the
             merge verb, so a client must branch on this field. A merge-evidence
@@ -16486,10 +16496,16 @@ paths:
         the evidence gate asks only whether AT LEAST ONE qualifying row exists —
         a second row is inert and changes no decision.
 
-        GitLab: the GitLab adapter does not populate the merge commit SHA or
-        merge timestamp yet, so a GitLab run draws the named
-        `record_merge_observation_no_merge_commit` refusal rather than an
-        observation recorded with empty evidence.
+        GitLab: the GitLab adapter now populates BOTH the merge commit SHA and
+        the merge timestamp (E64.40 / #3151), so a merged GitLab merge request
+        records an observation exactly as a GitHub run does. The URL resolution
+        is forge-FAMILY-aware — a `gitlab:<project_id>` run's canonical
+        `/-/merge_requests/<n>` (or legacy `/merge_requests/<n>`) URL resolves,
+        while a forge-family mismatch is refused at
+        `record_merge_observation_pr_url_repo_mismatch`. The named
+        `record_merge_observation_no_merge_commit` /
+        `record_merge_observation_no_merge_timestamp` refusals remain the
+        generic partial-evidence guards on BOTH forges.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -16544,8 +16560,10 @@ paths:
             `validation_failed` — malformed run_id.
 
             `record_merge_observation_malformed_pr_url` — the run's recorded
-            pull request URL does not resolve to a repository and pull request
-            number, so there is nothing to read from the forge.
+            pull request URL is structurally unresolvable: it names no
+            repository and pull/merge request number under ANY forge shape, or
+            the run's own `repo` is not owner/name. There is nothing to read
+            from the forge.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -16576,8 +16594,8 @@ paths:
 
             `record_merge_observation_no_merge_commit` — the forge reports the
             pull request merged but carries no merge commit SHA. Refused rather
-            than recording an observation with no commit. This is also the
-            truthful refusal a GitLab run draws today.
+            than recording an observation with no commit — a generic
+            partial-evidence guard on BOTH the GitHub and GitLab forges.
 
             `record_merge_observation_no_merge_timestamp` — the forge reports
             the pull request merged with a SHA but no merge timestamp. Refused
@@ -16586,17 +16604,20 @@ paths:
 
             `record_merge_observation_pr_url_repo_mismatch` — the run's
             recorded pull request URL resolves, but it does not name THIS run's
-            repository on THIS run's forge. The forge read is scoped by the
-            run's `repo` while the pull request NUMBER comes from that URL, and
-            the appended row records the URL as the pull request observed
-            merged; without this refusal the verb would confirm a different
-            repository's pull request and then write trusted evidence naming
-            this run's URL. Refused BEFORE the forge read, so a mismatch costs
-            no forge request. Owner/name are compared case-insensitively (a
-            case-differing spelling is the same repository) and the host is not
-            compared (the run row records none), but a run whose credential ref
-            names a non-GitHub forge cannot own a GitHub-style `/pull/` URL and
-            is refused here too.
+            repository ON THIS RUN'S FORGE FAMILY. Two conflicting well-formed
+            facts: the forge read is scoped by the run's `repo` + forge while the
+            pull/merge request NUMBER comes from that URL, and the appended row
+            records the URL as the pull request observed merged; without this
+            refusal the verb would confirm a different pull request and then
+            write trusted evidence naming this run's URL. The FAMILY-MISMATCH
+            meaning is explicit: the URL's shape must match the run's forge
+            family — a `github` run must present a `/pull/<n>` URL and a `gitlab`
+            run a `/-/merge_requests/<n>` (or legacy `/merge_requests/<n>`) URL —
+            so a github-ref run presenting a GitLab URL (or vice versa), or any
+            unimplemented forge, is refused here. Owner/project names are
+            compared case-insensitively (a case-differing spelling is the same
+            repository). Refused BEFORE the forge read, so a mismatch costs no
+            forge request.
 
             Every refusal is evaluated BEFORE any write: no audit row is
             appended.
