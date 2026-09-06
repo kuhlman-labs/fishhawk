@@ -4191,6 +4191,66 @@ func TestFoldAcceptanceRedispatchAdvisory_ScopedToStage(t *testing.T) {
 	}
 }
 
+// TestFoldAcceptanceRedispatchAdvisory_MultipleAcceptanceStages is the
+// load-bearing selector assertion (#3222 fix-up). Two acceptance stage ROWS are
+// seeded into the stages slice — an earlier terminal one, then the live
+// non-terminal one, in sequence order — the shape a first-match-on-type
+// selector (stageByType) resolves to the TERMINAL row, taking the no-op guard
+// and staying silent on a merge the later stage genuinely blocks.
+func TestFoldAcceptanceRedispatchAdvisory_MultipleAcceptanceStages(t *testing.T) {
+	for _, staleState := range []string{"succeeded", "superseded", "failed"} {
+		t.Run("stale_"+staleState+"_first", func(t *testing.T) {
+			r, na := naMergeRitual(t)
+			stale := naStage("acceptance", staleState)
+			acc := naStage("acceptance", "pending")
+
+			foldAcceptanceRedispatchAdvisory(r, []Stage{stale, acc},
+				[]AuditEntry{naReopenedEntry(acc.ID)}, na)
+
+			if na.State != "succeeded_acceptance_reopened" {
+				t.Fatalf("state = %q, want succeeded_acceptance_reopened — the stale terminal row must not mask the live one", na.State)
+			}
+			d := findAction(t, na, "fishhawk_dispatch_stage")
+			if d.Params["stage_id"] != acc.ID {
+				t.Errorf("params = %v, want the LIVE acceptance stage_id %s", d.Params, acc.ID)
+			}
+			if !strings.Contains(d.Reason, shortStageID(acc.ID)) {
+				t.Errorf("reason = %q, want it to name the live acceptance stage", d.Reason)
+			}
+			if strings.Contains(d.Reason, shortStageID(stale.ID)) {
+				t.Errorf("the advisory named the STALE terminal acceptance stage: %q", d.Reason)
+			}
+		})
+	}
+
+	// The two guards compose: two acceptance rows AND the only
+	// acceptance_reopened entry scoped to the stale one still draws an
+	// advisory for the live stage, in the GENERIC wording.
+	t.Run("reopened_entry_scoped_to_stale_row", func(t *testing.T) {
+		r, na := naMergeRitual(t)
+		stale := naStage("acceptance", "succeeded")
+		acc := naStage("acceptance", "running")
+
+		foldAcceptanceRedispatchAdvisory(r, []Stage{stale, acc},
+			[]AuditEntry{naReopenedEntry(stale.ID)}, na)
+
+		if na.State != "succeeded_acceptance_pending" {
+			t.Fatalf("state = %q, want succeeded_acceptance_pending", na.State)
+		}
+		w := findAction(t, na, "fishhawk_await_stage")
+		if w.Params["stage_id"] != acc.ID {
+			t.Errorf("params = %v, want the LIVE acceptance stage_id %s", w.Params, acc.ID)
+		}
+		if strings.Contains(w.Reason, "re-opened by a fix-up push") {
+			t.Errorf("an entry scoped to the STALE stage drew the re-opened claim: %q", w.Reason)
+		}
+		// Binding condition 2: the in-flight arm never names a dispatch.
+		if strings.Contains(w.Reason, "fishhawk_dispatch_stage") {
+			t.Errorf("the in-flight reason names a dispatch the operator cannot take: %q", w.Reason)
+		}
+	})
+}
+
 // TestFoldAcceptanceRedispatchAdvisory_NoOps is the byte-identity half: every
 // guard leaves na DEEP-EQUAL to its unfolded value.
 func TestFoldAcceptanceRedispatchAdvisory_NoOps(t *testing.T) {
@@ -4205,6 +4265,16 @@ func TestFoldAcceptanceRedispatchAdvisory_NoOps(t *testing.T) {
 		{
 			name:   "acceptance stage is terminal",
 			stages: []Stage{{ID: accID, Type: "acceptance", State: "succeeded"}},
+			recent: []AuditEntry{naReopenedEntry(accID)},
+		},
+		{
+			// Two acceptance ROWS, both terminal: selecting by
+			// non-terminality must not manufacture noise on a healthy merge.
+			name: "every acceptance stage row is terminal",
+			stages: []Stage{
+				naStage("acceptance", "superseded"),
+				{ID: accID, Type: "acceptance", State: "succeeded"},
+			},
 			recent: []AuditEntry{naReopenedEntry(accID)},
 		},
 		{

@@ -1325,6 +1325,79 @@ func TestMergeRun_Timeout_AcceptanceReopenedScopedToStage(t *testing.T) {
 	}
 }
 
+// TestMergeRun_Timeout_MultipleAcceptanceStages is the load-bearing selector
+// assertion (#3222 fix-up). A run can carry more than one acceptance stage ROW
+// in its history — an earlier one superseded or succeeded, a later one
+// non-terminal — and a first-match-on-type selector lands on the TERMINAL
+// earlier row, takes the D2 guard and stays SILENT on a merge the later stage is
+// genuinely blocking. The stage list is sequence-ordered with the stale row
+// FIRST, which is the ordering that discriminates.
+func TestMergeRun_Timeout_MultipleAcceptanceStages(t *testing.T) {
+	const staleAccStageID = "11111111-2222-3333-4444-555555555555"
+
+	// twoAcceptanceRows builds the multi-acceptance shape: a stale acceptance
+	// row in staleState, then the live non-terminal one, plus an
+	// acceptance_reopened entry scoped to reopenedStageID.
+	twoAcceptanceRows := func(staleState, reopenedStageID string) *mergeRunFakeBackend {
+		fb := mergeAdvisoryFake("pending", reopenedStageID)
+		fb.stages = []Stage{
+			{ID: uuid.NewString(), Type: "implement", State: "succeeded"},
+			{ID: staleAccStageID, Type: "acceptance", State: staleState},
+			{ID: advisoryAccStageID, Type: "acceptance", State: "pending"},
+		}
+		return fb
+	}
+
+	for _, staleState := range []string{"succeeded", "superseded", "failed"} {
+		t.Run("stale_"+staleState+"_first", func(t *testing.T) {
+			out := runMergeAdvisory(t, twoAcceptanceRows(staleState, advisoryAccStageID))
+			for _, want := range []string{
+				advisoryAccStageID[:8],
+				"re-opened by a fix-up push",
+				"fishhawk_dispatch_stage, stage acceptance",
+			} {
+				if !strings.Contains(out.Message, want) {
+					t.Errorf("message = %q, want it to contain %q", out.Message, want)
+				}
+			}
+			if strings.Contains(out.Message, staleAccStageID[:8]) {
+				t.Errorf("the advisory named the STALE terminal acceptance stage: %q", out.Message)
+			}
+		})
+	}
+
+	// The two guards compose: with two acceptance rows present AND the only
+	// acceptance_reopened entry scoped to the stale one, the live stage still
+	// draws an advisory, and it is the GENERIC wording.
+	t.Run("reopened_entry_scoped_to_stale_row", func(t *testing.T) {
+		out := runMergeAdvisory(t, twoAcceptanceRows("succeeded", staleAccStageID))
+		if !strings.Contains(out.Message, advisoryAccStageID[:8]) {
+			t.Errorf("message = %q, want it to name the live acceptance stage", out.Message)
+		}
+		if strings.Contains(out.Message, "re-opened by a fix-up push") {
+			t.Errorf("an entry scoped to the STALE stage drew the re-opened claim: %q", out.Message)
+		}
+		if !strings.Contains(out.Message, "must settle first") {
+			t.Errorf("message = %q, want the generic wording", out.Message)
+		}
+	})
+
+	// Every acceptance row terminal keeps the D2 byte-identity control: more
+	// than one row must not manufacture noise on a healthy merge.
+	t.Run("all_terminal", func(t *testing.T) {
+		control := controlTimeoutMessage(t)
+		fb := mergeAdvisoryFake("succeeded", advisoryAccStageID)
+		fb.stages = []Stage{
+			{ID: staleAccStageID, Type: "acceptance", State: "superseded"},
+			{ID: advisoryAccStageID, Type: "acceptance", State: "succeeded"},
+		}
+		out := runMergeAdvisory(t, fb)
+		if out.Message != control {
+			t.Fatalf("two terminal acceptance rows must ship the byte-identical message:\n got %q\nwant %q", out.Message, control)
+		}
+	})
+}
+
 func TestMergeRun_ChecksPending_CarriesAcceptanceAdvisory(t *testing.T) {
 	fb := mergeAdvisoryFake("pending", advisoryAccStageID)
 	// Every POST refuses with the checks-not-all-passed 409, so the shared

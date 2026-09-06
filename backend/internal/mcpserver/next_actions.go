@@ -1723,15 +1723,21 @@ func naOffersMerge(na *NextActions) bool {
 //     fix-up surface (#3222 binding condition 2).
 //
 // A no-op — leaving na deep-equal to its unfolded value — when na is nil, when
-// the block no longer offers the merge (naOffersMerge), when the run declares
-// no acceptance stage, or when its acceptance stage is TERMINAL. That last
-// guard is what keeps a HEALTHY merge byte-identical.
+// the block no longer offers the merge (naOffersMerge), or when the run carries
+// no NON-TERMINAL acceptance stage (none at all, or every one of them already
+// settled). That last guard is what keeps a HEALTHY merge byte-identical.
 func foldAcceptanceRedispatchAdvisory(run *Run, stages []Stage, recent []AuditEntry, na *NextActions) {
 	if run == nil || na == nil || !naOffersMerge(na) {
 		return
 	}
-	acc := stageByType(stages, "acceptance")
-	if acc == nil || runpkg.StageState(acc.State).IsTerminal() {
+	// Selected by NON-TERMINALITY (blockingAcceptanceStage), not by
+	// first-match-on-type: a run can carry more than one acceptance stage row in
+	// its history, and stageByType would land on an earlier SUPERSEDED/succeeded
+	// one, take the terminal guard and stay silent on a merge the LATER stage is
+	// genuinely blocking. The same selector now backs merge_run's advisory and
+	// mirrors run.blockingAcceptanceStage.
+	acc := blockingAcceptanceStage(stages)
+	if acc == nil {
 		return
 	}
 	state := runpkg.StageState(acc.State)

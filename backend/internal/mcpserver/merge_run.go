@@ -392,8 +392,11 @@ func shortStageID(id string) string {
 //
 //	D1  the stages read FAILS            → "" (byte-identical message; we know
 //	                                       nothing, so we say nothing)
-//	D2  no acceptance stage, or TERMINAL → "" (byte-identical; no new noise on
-//	                                       a healthy merge)
+//	D2  no NON-TERMINAL acceptance stage  → "" (byte-identical; no new noise on
+//	                                       a healthy merge). The stage is
+//	                                       selected by non-terminality, so an
+//	                                       older terminal acceptance row never
+//	                                       masks a later blocking one.
 //	D3  the audit read FAILS             → the GENERIC wording (a non-terminal
 //	                                       acceptance stage does block the
 //	                                       merge; we just cannot claim a fix-up
@@ -425,14 +428,15 @@ func (r *runResolver) acceptanceBlockerAdvisoryFor(ctx context.Context, runID uu
 	if err != nil {
 		return "" // D1
 	}
-	var acc *Stage
-	for i := range stages {
-		if stages[i].Type == "acceptance" {
-			acc = &stages[i]
-			break
-		}
-	}
-	if acc == nil || run.StageState(acc.State).IsTerminal() {
+	// Selected by NON-TERMINALITY, not by first-match-on-type: a run can carry
+	// more than one acceptance stage row in its history, and a first-match
+	// selector lands on an earlier SUPERSEDED/succeeded one, hits the D2 guard
+	// and silences the advisory on a merge the LATER stage is genuinely
+	// blocking. blockingAcceptanceStage is the package's existing owner of that
+	// idiom (it mirrors run.blockingAcceptanceStage), so both MCP surfaces and
+	// the fix-up refusal now agree on which stage "the" acceptance stage is.
+	acc := blockingAcceptanceStage(stages)
+	if acc == nil {
 		return "" // D2
 	}
 
