@@ -13916,6 +13916,42 @@ func TestWriteGateEvidence_OperatorScopeUndelivered(t *testing.T) {
 		}
 	})
 
+	t.Run("stage_cumulative_without_span_names_the_set_span_less", func(t *testing.T) {
+		// The backend can label a set stage-cumulative while carrying no span
+		// (a cumulative evaluation whose SHAs did not propagate). The renderer
+		// must then name the set WITHOUT a span rather than printing an empty
+		// one: "base  .. head )" reads as a reproducible span and is not.
+		got := build(t, &GateEvidence{
+			OperatorScopeUndelivered:                []string{undelivered},
+			OperatorScopeUndeliveredStageCumulative: true,
+		})
+		if !strings.Contains(got, "absent from the STAGE-CUMULATIVE committed file set (every commit this "+
+			"implement stage has pushed) — NOT merely from this pass's delta") {
+			t.Errorf("span-less cumulative render missing the set-naming phrase:\n%s", got)
+		}
+		// The span-bearing wording must not appear with empty SHAs.
+		for _, absent := range []string{"base  .. head", "pushed, base"} {
+			if strings.Contains(got, absent) {
+				t.Errorf("span-less cumulative render must NOT print an empty span %q:\n%s", absent, got)
+			}
+		}
+	})
+
+	t.Run("this_pass_hedged_without_reason_omits_the_clause", func(t *testing.T) {
+		// A this-pass hedge that carries NO machine reason must render
+		// grammatical prose — "could not be established, so any EARLIER" —
+		// never an empty parenthetical "(reason: )".
+		got := build(t, &GateEvidence{
+			OperatorScopeUndelivered: []string{undelivered},
+		})
+		if !strings.Contains(got, "CUMULATIVE committed state could not be established, so any EARLIER") {
+			t.Errorf("reason-less hedge must omit the clause entirely:\n%s", got)
+		}
+		if strings.Contains(got, "(reason:") {
+			t.Errorf("reason-less hedge must not render an empty reason clause:\n%s", got)
+		}
+	})
+
 	t.Run("this_pass_hedged_names_machine_reason", func(t *testing.T) {
 		got := build(t, &GateEvidence{
 			OperatorScopeUndelivered:                 []string{undelivered},

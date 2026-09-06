@@ -3059,10 +3059,17 @@ func deltaCompareBodyFor(marker, file string) string {
 // can prove round N's compare spans priorReviewedHead(N-1)..currentHead. A path
 // matching no configured span returns 500 (a compare error → the caller degrades
 // to the full diff, which the test would catch).
-func spanAwareComparePatchClient(t *testing.T, bySpan map[string]string) *githubclient.Client {
+//
+// onRequest, when supplied, fires once per SERVED compare request (matched or
+// 500) so a caller can count forge round-trips — which is what makes a "this
+// degrade must not reach the forge" claim load-bearing (#3029 fix-up).
+func spanAwareComparePatchClient(t *testing.T, bySpan map[string]string, onRequest ...func()) *githubclient.Client {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		for _, fn := range onRequest {
+			fn()
+		}
 		for span, body := range bySpan {
 			if strings.Contains(r.URL.Path, span) {
 				w.Header().Set("Content-Type", "application/json")

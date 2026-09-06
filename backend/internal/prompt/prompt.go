@@ -6969,6 +6969,11 @@ func quoteRepo(repo string) string {
 // stage-cumulative branch prints the span so the reviewer can reproduce the set;
 // every other branch says plainly that only the current pass was evaluated. It
 // is never empty, so no branch can assert absence from an unnamed set.
+//
+// The empty-SHA fallback below is load-bearing, not defensive: a cumulative
+// evaluation whose SHAs did not propagate would otherwise print "base  .. head )"
+// — an empty span that READS reproducible. It is pinned by
+// TestWriteGateEvidence_OperatorScopeUndelivered/stage_cumulative_without_span_names_the_set_span_less.
 func operatorScopeEvaluatedSetPhrase(ev *GateEvidence) string {
 	if !ev.OperatorScopeUndeliveredStageCumulative {
 		return "THIS PASS's committed diff"
@@ -6984,7 +6989,8 @@ func operatorScopeEvaluatedSetPhrase(ev *GateEvidence) string {
 // operatorScopeIncompleteReasonClause renders the backend machine reason a
 // cumulative evaluation could not be established as a parenthetical clause
 // (#3029). An empty reason renders nothing, so a caller that carries no reason
-// still produces grammatical prose.
+// still produces grammatical prose — never a hollow "(reason: )". Pinned by
+// TestWriteGateEvidence_OperatorScopeUndelivered/this_pass_hedged_without_reason_omits_the_clause.
 func operatorScopeIncompleteReasonClause(reason string) string {
 	if reason == "" {
 		return ""

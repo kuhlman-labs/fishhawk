@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10788,14 +10789,19 @@ func seedStageCumulativeLedger(au *auditFake, runID, stageID uuid.UUID, stageBas
 }
 
 // wireCumulativeForge points the run at an installation + a span-aware compare
-// client so resolveStageCumulativeEval can reach the forge.
-func wireCumulativeForge(t *testing.T, s *Server, runRow *run.Run, bySpan map[string]string) {
+// client so resolveStageCumulativeEval can reach the forge. It returns a
+// counter reporting how many compare requests that client has SERVED, so a
+// caller can make "this degrade issues no forge request" load-bearing rather
+// than asserted in a comment. Callers that do not care read it as a statement.
+func wireCumulativeForge(t *testing.T, s *Server, runRow *run.Run, bySpan map[string]string) (compares func() int) {
 	t.Helper()
 	inst := int64(55)
 	runRow.InstallationID = &inst
 	prURL := "https://github.com/kuhlman-labs/example/pull/7"
 	runRow.PullRequestURL = &prURL
-	s.cfg.GitHub = spanAwareComparePatchClient(t, bySpan)
+	var n atomic.Int64
+	s.cfg.GitHub = spanAwareComparePatchClient(t, bySpan, func() { n.Add(1) })
+	return func() int { return int(n.Load()) }
 }
 
 // operatorScopeUndeliveredAuditPayload returns the single
@@ -11018,8 +11024,12 @@ func TestRunImplementReviews_OperatorScopeUndelivered_ProvenanceLabelsStageCumul
 // successful ledger read returning no stage-scoped rows does NOT establish that
 // this pass spans the stage base — an absent row and a row whose StageID does
 // not match are indistinguishable — so it is INCOMPLETE, not complete by
-// construction. That sub-case also pins the cost assumption in the other
-// direction: no second ComparePatch is issued when the ledger yields no base.
+// construction.
+//
+// Every sub-case ALSO pins the cost assumption, and does so load-bearingly: the
+// compare client counts the requests it serves and each sub-case declares the
+// exact number the resolver may issue, so a pre-forge degrade that started
+// reaching the forge (0 -> 1) fails here rather than passing on a comment.
 func TestResolveStageCumulativeEval_FailClosedModes(t *testing.T) {
 	const addPath = "frontend/src/components/stage-detail.test.tsx"
 	passDiff := func() policy.Diff {
@@ -11032,100 +11042,108 @@ func TestResolveStageCumulativeEval_FailClosedModes(t *testing.T) {
 		name       string
 		wantReason string
 		// setup wires the degrade. It returns the number of compares the test
-		// expects the resolver to issue (0 when it must not reach the forge).
-		setup func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (wantCompares int)
+		// expects the resolver to issue (0 when it must not reach the forge)
+		// and a counter reporting how many the wired client actually served.
+		setup func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (wantCompares int, compares func() int)
 	}{
 		{
 			name:       "push_ledger_unreadable",
 			wantReason: cumulativeReasonLedgerUnreadable,
-			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) int {
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
 				// Fail ONLY the ledger read, leaving every other category readable.
 				// listByCategoryErr would short-circuit EVERY category; the
 				// category-scoped hook fails only the ledger read.
 				au.listByCategoryErrCategory = "pull_request_opened"
 				seedStageCumulativeLedger(au, runRow.ID, stageID, "stagebase", "h2")
-				wireCumulativeForge(t, s, runRow, map[string]string{
+				// A REACHABLE, correctly-configured forge: the 0 below is then
+				// the resolver declining to call it, not a wiring accident.
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{
 					"stagebase...h3": cumulativeCompareBody("backend/internal/foo/foo.go", addPath),
 				})
-				return 0
+				return 0, compares
 			},
 		},
 		{
 			name:       "stage_push_ledger_empty",
 			wantReason: cumulativeReasonLedgerEmpty,
-			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) int {
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
 				// Ledger entries exist for the RUN but none is scoped to this
 				// stage — the state the removed complete-by-construction branch
 				// would have labelled stage-cumulative.
 				seedHeadEntry(au, runRow.ID, nil, "pull_request_opened", 10,
 					map[string]any{"head_sha": "h2", "base_sha": "stagebase"})
-				wireCumulativeForge(t, s, runRow, map[string]string{
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{
 					"stagebase...h3": cumulativeCompareBody("backend/internal/foo/foo.go", addPath),
 				})
-				return 0
+				return 0, compares
 			},
 		},
 		{
 			name:       "stage_base_sha_unavailable",
 			wantReason: cumulativeReasonBaseUnavailable,
-			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) int {
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
 				sid := stageID
 				// A literally EMPTY base_sha, seeded by construction.
 				seedHeadEntry(au, runRow.ID, &sid, "pull_request_opened", 10,
 					map[string]any{"head_sha": "h2", "base_sha": ""})
-				wireCumulativeForge(t, s, runRow, map[string]string{
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{
 					"stagebase...h3": cumulativeCompareBody("backend/internal/foo/foo.go", addPath),
 				})
-				return 0
+				return 0, compares
 			},
 		},
 		{
 			name:       "stage_base_equals_head",
 			wantReason: cumulativeReasonBaseEqualsHead,
-			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) int {
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
 				sid := stageID
 				// A degenerate base==head compare returns an EMPTY inventory,
 				// which would report every grant undelivered as "cumulative".
+				// The span IS wired, so the 0 proves the resolver refuses the
+				// degenerate span rather than issuing a useless round-trip.
 				seedHeadEntry(au, runRow.ID, &sid, "pull_request_opened", 10,
 					map[string]any{"head_sha": "h3", "base_sha": "h3"})
-				wireCumulativeForge(t, s, runRow, map[string]string{
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{
 					"h3...h3": cumulativeCompareBody(),
 				})
-				return 0
+				return 0, compares
 			},
 		},
 		{
 			name:       "forge_compare_unavailable",
 			wantReason: cumulativeReasonForgeUnavailable,
-			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) int {
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
 				seedStageCumulativeLedger(au, runRow.ID, stageID, "stagebase", "h2")
-				// The CLI/dev posture: no GitHub client wired at all.
+				// The CLI/dev posture: no GitHub client wired at all, so no
+				// client can serve a request and the count is 0 by construction.
 				s.cfg.GitHub = nil
-				return 0
+				return 0, func() int { return 0 }
 			},
 		},
 		{
 			name:       "cumulative_compare_failed",
 			wantReason: cumulativeReasonCompareFailed,
-			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) int {
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
 				seedStageCumulativeLedger(au, runRow.ID, stageID, "stagebase", "h2")
-				// No span configured → the span-aware client answers 500.
-				wireCumulativeForge(t, s, runRow, map[string]string{})
-				return 1
+				// No span configured → the span-aware client answers 500. This
+				// is a POST-forge degrade, so exactly ONE compare is expected —
+				// which is also what proves the 0s above are discriminating.
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{})
+				return 1, compares
 			},
 		},
 		{
 			name:       "cumulative_compare_truncated",
 			wantReason: cumulativeReasonCompareTruncated,
-			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) int {
+			setup: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) (int, func() int) {
 				seedStageCumulativeLedger(au, runRow.ID, stageID, "stagebase", "h2")
 				// A truncated inventory can OMIT a delivered path, reproducing
 				// the exact false positive this resolver closes — so it must be
 				// treated as an incomplete history even though it "succeeded".
-				wireCumulativeForge(t, s, runRow, map[string]string{
+				compares := wireCumulativeForge(t, s, runRow, map[string]string{
 					"stagebase...h3": truncatedCompareBody(addPath),
 				})
-				return 1
+				return 1, compares
 			},
 		},
 	}
@@ -11138,10 +11156,20 @@ func TestResolveStageCumulativeEval_FailClosedModes(t *testing.T) {
 			}
 			s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
 			au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
-			tc.setup(t, s, au, runRow, implStage.ID)
+			wantCompares, compares := tc.setup(t, s, au, runRow, implStage.ID)
 
 			// (i)-(iii): the resolver's own contract.
 			eval := s.resolveStageCumulativeEval(t.Context(), runRow, runRow.ID, implStage.ID, "h3", passDiff())
+
+			// The cost assumption, made load-bearing: a PRE-forge degrade must
+			// short-circuit before the round-trip, a POST-forge one must issue
+			// exactly the one compare it degraded on. Counted around the direct
+			// resolver call only, so the runImplementReviews pass below (which
+			// resolves again) cannot mask an extra request here.
+			if got := compares(); got != wantCompares {
+				t.Errorf("resolver issued %d ComparePatch request(s) on the %s degrade, want %d",
+					got, tc.name, wantCompares)
+			}
 			if eval.StageCumulative {
 				t.Errorf("StageCumulative = true, want false on the %s degrade", tc.name)
 			}
