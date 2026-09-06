@@ -64,6 +64,10 @@ const (
 //
 // Every key here MUST be a key in familyRates; a missing/extra key fails
 // TestDriftReferenceMapMatchesFamilies.
+//
+// The alarm compares BASE per-token rates only — it has no notion of a
+// long-context surcharge tier, so a vendor changing only gpt-6-astra's
+// over-272K multipliers is invisible to this check.
 var familyToLiteLLM = map[string]string{
 	"claude-opus":   "claude-opus-4-7",
 	"claude-fable":  "claude-fable-5",
@@ -73,6 +77,7 @@ var familyToLiteLLM = map[string]string{
 	"gpt-5.6-sol":   "gpt-5.6-sol",
 	"gpt-5.6-terra": "gpt-5.6-terra",
 	"gpt-5.6-luna":  "gpt-5.6-luna",
+	"gpt-6-astra":   "gpt-6-astra",
 }
 
 // DriftFinding is one priced-field comparison between our table and LiteLLM.

@@ -5,10 +5,11 @@ import (
 	"testing"
 )
 
-// fixtureNoDrift prices every family's reference id to match familyRates
-// exactly (per-token). Includes a non-model key (sample_spec) and an
-// unreferenced model to prove they are ignored. gpt-5.5 omits
-// cache_creation_input_token_cost (LiteLLM leaves it null), matching reality.
+// fixtureNoDrift prices every one of the nine families' reference ids to
+// match familyRates exactly (per-token). Includes a non-model key
+// (sample_spec) and an unreferenced model to prove they are ignored.
+// gpt-5.5 omits cache_creation_input_token_cost (LiteLLM leaves it null),
+// matching reality.
 const fixtureNoDrift = `{
   "sample_spec": {"note": "not a real model — must be ignored"},
   "claude-opus-4-7":   {"input_cost_per_token": 5e-6, "output_cost_per_token": 25e-6, "cache_read_input_token_cost": 0.5e-6, "cache_creation_input_token_cost": 6.25e-6},
@@ -19,6 +20,7 @@ const fixtureNoDrift = `{
   "gpt-5.6-sol":       {"input_cost_per_token": 5e-6, "output_cost_per_token": 30e-6, "cache_read_input_token_cost": 0.5e-6, "cache_creation_input_token_cost": 6.25e-6},
   "gpt-5.6-terra":     {"input_cost_per_token": 2.5e-6, "output_cost_per_token": 15e-6, "cache_read_input_token_cost": 0.25e-6, "cache_creation_input_token_cost": 3.125e-6},
   "gpt-5.6-luna":      {"input_cost_per_token": 1e-6, "output_cost_per_token": 6e-6, "cache_read_input_token_cost": 0.1e-6, "cache_creation_input_token_cost": 1.25e-6},
+  "gpt-6-astra":       {"input_cost_per_token": 10e-6, "output_cost_per_token": 50e-6, "cache_read_input_token_cost": 1e-6, "cache_creation_input_token_cost": 12.5e-6},
   "some-unreferenced-model": {"input_cost_per_token": 9e-6, "output_cost_per_token": 9e-6}
 }`
 
@@ -50,7 +52,7 @@ func TestCheckDrift_NoDrift(t *testing.T) {
 
 // fixtureDrift: opus input is +/- in the warn band (ours 5 vs 5.2 -> -3.85%,
 // ours_lower) and opus output is in the high band (ours 25 vs 20 -> +25%,
-// ours_higher). Other families match.
+// ours_higher). The other eight of the nine families match.
 const fixtureDrift = `{
   "claude-opus-4-7":   {"input_cost_per_token": 5.2e-6, "output_cost_per_token": 20e-6, "cache_read_input_token_cost": 0.5e-6, "cache_creation_input_token_cost": 6.25e-6},
   "claude-fable-5":    {"input_cost_per_token": 10e-6, "output_cost_per_token": 50e-6, "cache_read_input_token_cost": 1e-6, "cache_creation_input_token_cost": 12.5e-6},
@@ -59,7 +61,8 @@ const fixtureDrift = `{
   "gpt-5.5":           {"input_cost_per_token": 5e-6, "output_cost_per_token": 30e-6, "cache_read_input_token_cost": 0.5e-6},
   "gpt-5.6-sol":       {"input_cost_per_token": 5e-6, "output_cost_per_token": 30e-6, "cache_read_input_token_cost": 0.5e-6, "cache_creation_input_token_cost": 6.25e-6},
   "gpt-5.6-terra":     {"input_cost_per_token": 2.5e-6, "output_cost_per_token": 15e-6, "cache_read_input_token_cost": 0.25e-6, "cache_creation_input_token_cost": 3.125e-6},
-  "gpt-5.6-luna":      {"input_cost_per_token": 1e-6, "output_cost_per_token": 6e-6, "cache_read_input_token_cost": 0.1e-6, "cache_creation_input_token_cost": 1.25e-6}
+  "gpt-5.6-luna":      {"input_cost_per_token": 1e-6, "output_cost_per_token": 6e-6, "cache_read_input_token_cost": 0.1e-6, "cache_creation_input_token_cost": 1.25e-6},
+  "gpt-6-astra":       {"input_cost_per_token": 10e-6, "output_cost_per_token": 50e-6, "cache_read_input_token_cost": 1e-6, "cache_creation_input_token_cost": 12.5e-6}
 }`
 
 func TestCheckDrift_WarnAndHigh(t *testing.T) {
