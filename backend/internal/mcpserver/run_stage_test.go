@@ -3888,3 +3888,53 @@ func TestRunStage_ReviewActionHint_CarriesGateOrderingSentence(t *testing.T) {
 		t.Errorf("hint.RemainingFixupBudget = %d, want 1 — waiting must not consume budget", out.ReviewActionHint.RemainingFixupBudget)
 	}
 }
+
+// TestRunStage_NextActions_AcceptanceBlockerFold is the E64.63 / #3222
+// call-site pin: the post-stage snapshot carries the SAME acceptance-blocker
+// fold getRunStatus applies, so the two snapshot surfaces cannot diverge on
+// what is blocking a merge. It drives the REAL runStage handler — the fold's
+// wiring at the nextActionsFor call site is the thing under test, not the fold
+// itself (next_actions_test.go owns that).
+func TestRunStage_NextActions_AcceptanceBlockerFold(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	acceptanceID := uuid.New()
+	seedAcceptanceArmRun(fb, runID, acceptanceID, "pending")
+	prURL := "https://github.com/x/y/pull/42"
+	fb.mu.Lock()
+	row := fb.getRunByID[runID]
+	row.State = "succeeded"
+	row.PullRequestURL = &prURL
+	fb.getRunByID[runID] = row
+	sid := acceptanceID.String()
+	fb.auditByRun[runID] = []AuditEntry{{Category: categoryAcceptanceReopened, Sequence: 9, StageID: &sid}}
+	fb.mu.Unlock()
+
+	out := runAcceptanceStage(t, r, runID, acceptanceID)
+	if out.NextActions.State != "succeeded_acceptance_reopened" {
+		t.Fatalf("next_actions.state = %q, want succeeded_acceptance_reopened — the fold is not wired at the run_stage call site",
+			out.NextActions.State)
+	}
+	// The fold reads the POST-stage snapshot, so the acceptance stage this call
+	// just dispatched is in flight by the time it runs — which is exactly the
+	// #3222 binding-condition-2 shape: offer the wait, never a dispatch the
+	// operator cannot take.
+	if !nextActionOffered(out.NextActions, "fishhawk_await_stage") {
+		t.Fatalf("the fold must offer the wait-shaped poll; got %+v", out.NextActions.Actions)
+	}
+	if nextActionOffered(out.NextActions, "fishhawk_dispatch_stage") {
+		t.Errorf("an in-flight acceptance stage was offered a dispatch; got %+v", out.NextActions.Actions)
+	}
+	if !nextActionOffered(out.NextActions, "fishhawk_merge_run") {
+		t.Errorf("the fold is ADDITIVE — the merge ritual must survive; got %+v", out.NextActions.Actions)
+	}
+	w := findAction(t, out.NextActions, "fishhawk_await_stage")
+	for _, want := range []string{acceptanceID.String()[:8], "re-opened by a fix-up push", "the queued merge cannot fire"} {
+		if !strings.Contains(w.Reason, want) {
+			t.Errorf("reason = %q, want it to contain %q", w.Reason, want)
+		}
+	}
+}

@@ -83,6 +83,18 @@ type mergeRunFakeBackend struct {
 	// (default 200 when exhausted) — a test injects a transient 500 to drive
 	// the poll loop's "keep polling on a transient transport error" branch.
 	auditStatuses []int
+
+	// stages / stagesStatus back the GET /v0/runs/{run_id}/stages handler the
+	// E64.63 (#3222) acceptance-blocker advisory reads. stagesStatus non-zero
+	// forces that status on every stages GET, which is how degrade D1 (the
+	// stages read FAILS -> the message is byte-identical) is driven.
+	stages       []Stage
+	stagesStatus int
+	// acceptanceAuditStatus non-zero forces that status on the
+	// category=acceptance_reopened audit GET ONLY, leaving the terminal-merge
+	// poll's own reads alone — degrade D3 (the audit read FAILS -> the GENERIC
+	// wording still ships).
+	acceptanceAuditStatus int
 }
 
 func (fb *mergeRunFakeBackend) runState() string {
@@ -148,6 +160,23 @@ func newMergeRunFakeBackend(t *testing.T, fb *mergeRunFakeBackend) *httptest.Ser
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
+	mux.HandleFunc("GET /v0/runs/{run_id}/stages", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, perr := uuid.Parse(r.PathValue("run_id")); perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		status := fb.stagesStatus
+		items := append([]Stage(nil), fb.stages...)
+		fb.mu.Unlock()
+		if status != 0 {
+			w.WriteHeader(status)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(listStagesResult{Items: items})
+	})
+
 	mux.HandleFunc("GET /v0/runs/{run_id}/audit", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if _, perr := uuid.Parse(r.PathValue("run_id")); perr != nil {
@@ -159,7 +188,30 @@ func newMergeRunFakeBackend(t *testing.T, fb *mergeRunFakeBackend) *httptest.Ser
 		if s := r.URL.Query().Get("since_sequence"); s != "" {
 			since, _ = strconv.ParseInt(s, 10, 64)
 		}
+		limit := 1
+		if l := r.URL.Query().Get("limit"); l != "" {
+			limit, _ = strconv.Atoi(l)
+		}
 		fb.mu.Lock()
+		// The acceptance-blocker advisory's read is counted and gated
+		// SEPARATELY from the terminal-merge poll's: it is not part of the
+		// poll sequence auditStatuses / auditEntriesAfterReads describe.
+		if category == categoryAcceptanceReopened {
+			status := fb.acceptanceAuditStatus
+			matches := make([]AuditEntry, 0, len(fb.auditEntries))
+			for _, e := range fb.auditEntries {
+				if e.Category == category {
+					matches = append(matches, e)
+				}
+			}
+			fb.mu.Unlock()
+			if status != 0 {
+				w.WriteHeader(status)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(listAuditResult{Items: matches})
+			return
+		}
 		fb.auditReadCalls++
 		status := http.StatusOK
 		if fb.auditReadCalls <= len(fb.auditStatuses) {
@@ -180,8 +232,8 @@ func newMergeRunFakeBackend(t *testing.T, fb *mergeRunFakeBackend) *httptest.Ser
 			return
 		}
 		sort.Slice(matches, func(i, j int) bool { return matches[i].Sequence < matches[j].Sequence })
-		if len(matches) > 1 {
-			matches = matches[:1] // the tool passes Limit=1
+		if limit > 0 && len(matches) > limit {
+			matches = matches[:limit]
 		}
 		_ = json.NewEncoder(w).Encode(listAuditResult{Items: matches})
 	})
@@ -1130,5 +1182,313 @@ func TestChecksPendingOutput_MalformedAuditDetail_DegradesToFixedMessage(t *test
 				t.Errorf("the fixed message must survive: %q", out.Message)
 			}
 		})
+	}
+}
+
+// --- E64.63 / #3222: the acceptance-blocker advisory on the merge surface ---
+//
+// A merge blocked by a NON-TERMINAL acceptance stage cannot fire: the
+// fishhawk_audit_complete check is pending on that very stage. Before #3222
+// fishhawk_merge_run reported only "nothing landed within Ns" and the operator,
+// with no way to see the cause, reached for an admin bypass twice. These tests
+// drive one case per named branch and one per named DEGRADE.
+
+const advisoryAccStageID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+// mergeAdvisoryFake builds the stranded shape: a run with an open PR, a
+// non-terminal acceptance stage, and (optionally) an acceptance_reopened entry
+// scoped to reopenedStageID. Nothing ever settles the merge, so the tool takes
+// the timeout arm.
+func mergeAdvisoryFake(accState string, reopenedStageID string) *mergeRunFakeBackend {
+	fb := &mergeRunFakeBackend{
+		prURL:            "https://github.com/x/y/pull/7",
+		stateBeforeMerge: "running",
+		stateAfterMerge:  "running", // never terminal
+		mergeResp:        MergeRunResult{MergeQueued: true, VerdictSequence: 5},
+	}
+	if accState != "" {
+		fb.stages = []Stage{
+			{ID: uuid.NewString(), Type: "implement", State: "succeeded"},
+			{ID: advisoryAccStageID, Type: "acceptance", State: accState},
+		}
+	}
+	if reopenedStageID != "" {
+		sid := reopenedStageID
+		fb.auditEntries = append(fb.auditEntries, AuditEntry{
+			Category: categoryAcceptanceReopened, Sequence: 3, StageID: &sid,
+		})
+	}
+	return fb
+}
+
+func runMergeAdvisory(t *testing.T, fb *mergeRunFakeBackend) MergeRunOutput {
+	t.Helper()
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	_, out, err := r.mergeRun(ctx, nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("status = %q, want timeout", out.Status)
+	}
+	return out
+}
+
+// controlTimeoutMessage is the message the timeout arm ships with NO advisory —
+// the byte-identity control the D1/D2 degrades are compared against. It is
+// captured from a real run of the tool against a fake with no acceptance stage
+// at all, not hand-written, so a future edit to the base sentence moves the
+// control with it.
+func controlTimeoutMessage(t *testing.T) string {
+	t.Helper()
+	out := runMergeAdvisory(t, mergeAdvisoryFake("", ""))
+	if strings.Contains(out.Message, "acceptance stage") {
+		t.Fatalf("the control message already names an acceptance stage: %q", out.Message)
+	}
+	return out.Message
+}
+
+func TestMergeRun_Timeout_AcceptanceReopenedDispatchable(t *testing.T) {
+	for _, st := range []string{"pending", "awaiting_host_dispatch"} {
+		t.Run(st, func(t *testing.T) {
+			out := runMergeAdvisory(t, mergeAdvisoryFake(st, advisoryAccStageID))
+			for _, want := range []string{
+				advisoryAccStageID[:8],
+				"re-opened by a fix-up push",
+				"fishhawk_dispatch_stage, stage acceptance",
+				"the queued merge cannot fire",
+			} {
+				if !strings.Contains(out.Message, want) {
+					t.Errorf("message = %q, want it to contain %q", out.Message, want)
+				}
+			}
+			// The base sentence is untouched — the advisory is APPENDED.
+			if !strings.Contains(out.Message, "no pr_merged / post_merge_observed entry landed within") {
+				t.Errorf("the existing timeout sentence was modified: %q", out.Message)
+			}
+		})
+	}
+}
+
+// TestMergeRun_Timeout_AcceptanceReopenedInFlight is #3222 binding condition 2
+// on this surface: an in-flight re-run is not one the operator can dispatch, so
+// the message must never name a dispatch.
+func TestMergeRun_Timeout_AcceptanceReopenedInFlight(t *testing.T) {
+	for _, st := range []string{"dispatched", "running"} {
+		t.Run(st, func(t *testing.T) {
+			out := runMergeAdvisory(t, mergeAdvisoryFake(st, advisoryAccStageID))
+			if !strings.Contains(out.Message, "already in flight") {
+				t.Errorf("message = %q, want the in-flight wording", out.Message)
+			}
+			for _, banned := range []string{"fishhawk_dispatch_stage", "Dispatch the acceptance stage", "Re-dispatch"} {
+				if strings.Contains(out.Message, banned) {
+					t.Errorf("in-flight message names the inapplicable remedy %q: %q", banned, out.Message)
+				}
+			}
+		})
+	}
+}
+
+// TestMergeRun_Timeout_AcceptanceGenericNonTerminal is the widened behaviour the
+// operator ratified: an acceptance stage that was NEVER dispatched blocks the
+// merge exactly as hard as a re-opened one, so the advisory still ships — just
+// without the re-opened claim.
+func TestMergeRun_Timeout_AcceptanceGenericNonTerminal(t *testing.T) {
+	out := runMergeAdvisory(t, mergeAdvisoryFake("pending", ""))
+	if strings.Contains(out.Message, "re-opened by a fix-up push") {
+		t.Errorf("no acceptance_reopened entry exists, yet the message claims one: %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "must settle first") {
+		t.Errorf("message = %q, want the generic wording", out.Message)
+	}
+	if !strings.Contains(out.Message, "fishhawk_dispatch_stage, stage acceptance") {
+		t.Errorf("a dispatchable acceptance stage must name the dispatch: %q", out.Message)
+	}
+}
+
+// TestMergeRun_Timeout_AcceptanceReopenedScopedToStage is the #3222
+// binding-condition-1 assertion on this surface. A NON-MATCHING scoped entry is
+// present — an acceptance_reopened entry belonging to a DIFFERENT stage — so
+// the generic wording must ship. An absence-only test (degrade D4 below) passes
+// just as happily against an implementation that matches on the category alone.
+func TestMergeRun_Timeout_AcceptanceReopenedScopedToStage(t *testing.T) {
+	other := uuid.NewString()
+	out := runMergeAdvisory(t, mergeAdvisoryFake("pending", other))
+	if strings.Contains(out.Message, "re-opened by a fix-up push") {
+		t.Errorf("an entry scoped to a DIFFERENT stage drew the re-opened claim: %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "must settle first") {
+		t.Errorf("message = %q, want the generic wording", out.Message)
+	}
+}
+
+// TestMergeRun_Timeout_MultipleAcceptanceStages is the load-bearing selector
+// assertion (#3222 fix-up). A run can carry more than one acceptance stage ROW
+// in its history — an earlier one superseded or succeeded, a later one
+// non-terminal — and a first-match-on-type selector lands on the TERMINAL
+// earlier row, takes the D2 guard and stays SILENT on a merge the later stage is
+// genuinely blocking. The stage list is sequence-ordered with the stale row
+// FIRST, which is the ordering that discriminates.
+func TestMergeRun_Timeout_MultipleAcceptanceStages(t *testing.T) {
+	const staleAccStageID = "11111111-2222-3333-4444-555555555555"
+
+	// twoAcceptanceRows builds the multi-acceptance shape: a stale acceptance
+	// row in staleState, then the live non-terminal one, plus an
+	// acceptance_reopened entry scoped to reopenedStageID.
+	twoAcceptanceRows := func(staleState, reopenedStageID string) *mergeRunFakeBackend {
+		fb := mergeAdvisoryFake("pending", reopenedStageID)
+		fb.stages = []Stage{
+			{ID: uuid.NewString(), Type: "implement", State: "succeeded"},
+			{ID: staleAccStageID, Type: "acceptance", State: staleState},
+			{ID: advisoryAccStageID, Type: "acceptance", State: "pending"},
+		}
+		return fb
+	}
+
+	for _, staleState := range []string{"succeeded", "superseded", "failed"} {
+		t.Run("stale_"+staleState+"_first", func(t *testing.T) {
+			out := runMergeAdvisory(t, twoAcceptanceRows(staleState, advisoryAccStageID))
+			for _, want := range []string{
+				advisoryAccStageID[:8],
+				"re-opened by a fix-up push",
+				"fishhawk_dispatch_stage, stage acceptance",
+			} {
+				if !strings.Contains(out.Message, want) {
+					t.Errorf("message = %q, want it to contain %q", out.Message, want)
+				}
+			}
+			if strings.Contains(out.Message, staleAccStageID[:8]) {
+				t.Errorf("the advisory named the STALE terminal acceptance stage: %q", out.Message)
+			}
+		})
+	}
+
+	// The two guards compose: with two acceptance rows present AND the only
+	// acceptance_reopened entry scoped to the stale one, the live stage still
+	// draws an advisory, and it is the GENERIC wording.
+	t.Run("reopened_entry_scoped_to_stale_row", func(t *testing.T) {
+		out := runMergeAdvisory(t, twoAcceptanceRows("succeeded", staleAccStageID))
+		if !strings.Contains(out.Message, advisoryAccStageID[:8]) {
+			t.Errorf("message = %q, want it to name the live acceptance stage", out.Message)
+		}
+		if strings.Contains(out.Message, "re-opened by a fix-up push") {
+			t.Errorf("an entry scoped to the STALE stage drew the re-opened claim: %q", out.Message)
+		}
+		if !strings.Contains(out.Message, "must settle first") {
+			t.Errorf("message = %q, want the generic wording", out.Message)
+		}
+	})
+
+	// Every acceptance row terminal keeps the D2 byte-identity control: more
+	// than one row must not manufacture noise on a healthy merge.
+	t.Run("all_terminal", func(t *testing.T) {
+		control := controlTimeoutMessage(t)
+		fb := mergeAdvisoryFake("succeeded", advisoryAccStageID)
+		fb.stages = []Stage{
+			{ID: staleAccStageID, Type: "acceptance", State: "superseded"},
+			{ID: advisoryAccStageID, Type: "acceptance", State: "succeeded"},
+		}
+		out := runMergeAdvisory(t, fb)
+		if out.Message != control {
+			t.Fatalf("two terminal acceptance rows must ship the byte-identical message:\n got %q\nwant %q", out.Message, control)
+		}
+	})
+}
+
+func TestMergeRun_ChecksPending_CarriesAcceptanceAdvisory(t *testing.T) {
+	fb := mergeAdvisoryFake("pending", advisoryAccStageID)
+	// Every POST refuses with the checks-not-all-passed 409, so the shared
+	// deadline expires into the resumable checks_pending checkpoint.
+	fb.mergeStickyStatus = http.StatusConflict
+	fb.mergeErrBody = mergeChecksPendingBody
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+
+	_, out, err := r.mergeRun(ctx, nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	if out.Status != "checks_pending" {
+		t.Fatalf("status = %q, want checks_pending", out.Status)
+	}
+	for _, want := range []string{
+		advisoryAccStageID[:8],
+		"re-opened by a fix-up push",
+		"fishhawk_dispatch_stage, stage acceptance",
+	} {
+		if !strings.Contains(out.Message, want) {
+			t.Errorf("message = %q, want it to contain %q", out.Message, want)
+		}
+	}
+	if !strings.Contains(out.Message, "GitHub will not queue the squash merge") {
+		t.Errorf("the existing checks_pending sentence was modified: %q", out.Message)
+	}
+}
+
+// TestMergeRun_AcceptanceAdvisory_D1_StagesReadFails: we know NOTHING, so we say
+// nothing — the message is BYTE-IDENTICAL to the no-advisory control.
+func TestMergeRun_AcceptanceAdvisory_D1_StagesReadFails(t *testing.T) {
+	control := controlTimeoutMessage(t)
+	fb := mergeAdvisoryFake("pending", advisoryAccStageID)
+	fb.stagesStatus = http.StatusInternalServerError
+	out := runMergeAdvisory(t, fb)
+	if out.Message != control {
+		t.Fatalf("D1 must ship the byte-identical message:\n got %q\nwant %q", out.Message, control)
+	}
+}
+
+// TestMergeRun_AcceptanceAdvisory_D2_TerminalOrAbsent: no new noise on a healthy
+// merge. Both shapes — a TERMINAL acceptance stage, and no acceptance stage at
+// all — are byte-identical to the control.
+func TestMergeRun_AcceptanceAdvisory_D2_TerminalOrAbsent(t *testing.T) {
+	control := controlTimeoutMessage(t)
+	t.Run("terminal", func(t *testing.T) {
+		// The acceptance_reopened entry is HISTORY and never goes away, so it is
+		// present here too: a terminal stage must stay silent regardless.
+		out := runMergeAdvisory(t, mergeAdvisoryFake("succeeded", advisoryAccStageID))
+		if out.Message != control {
+			t.Fatalf("a terminal acceptance stage must ship the byte-identical message:\n got %q\nwant %q", out.Message, control)
+		}
+	})
+	t.Run("absent", func(t *testing.T) {
+		out := runMergeAdvisory(t, mergeAdvisoryFake("", ""))
+		if out.Message != control {
+			t.Fatalf("a run with no acceptance stage must ship the byte-identical message:\n got %q\nwant %q", out.Message, control)
+		}
+	})
+}
+
+// TestMergeRun_AcceptanceAdvisory_D3_AuditReadFails: the stages read succeeded,
+// so we KNOW a non-terminal acceptance stage blocks the merge — we just cannot
+// claim a fix-up re-opened it. The GENERIC wording still ships.
+func TestMergeRun_AcceptanceAdvisory_D3_AuditReadFails(t *testing.T) {
+	fb := mergeAdvisoryFake("pending", advisoryAccStageID)
+	fb.acceptanceAuditStatus = http.StatusInternalServerError
+	out := runMergeAdvisory(t, fb)
+	if strings.Contains(out.Message, "re-opened by a fix-up push") {
+		t.Errorf("an unreadable audit must not yield the re-opened claim: %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "must settle first") {
+		t.Errorf("message = %q, want the generic wording", out.Message)
+	}
+	if !strings.Contains(out.Message, advisoryAccStageID[:8]) {
+		t.Errorf("message = %q, want it to name the acceptance stage", out.Message)
+	}
+}
+
+// TestMergeRun_AcceptanceAdvisory_D4_NoMatchingEntry: the audit read SUCCEEDS
+// and matches nothing — the same generic wording as D3.
+func TestMergeRun_AcceptanceAdvisory_D4_NoMatchingEntry(t *testing.T) {
+	out := runMergeAdvisory(t, mergeAdvisoryFake("running", ""))
+	if strings.Contains(out.Message, "re-opened by a fix-up push") {
+		t.Errorf("zero entries must not yield the re-opened claim: %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "already in flight") {
+		t.Errorf("message = %q, want the generic in-flight wording", out.Message)
 	}
 }

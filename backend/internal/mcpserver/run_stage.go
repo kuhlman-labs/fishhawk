@@ -849,6 +849,13 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// here — and releaseSignalsFor costs extra cost-gated round-trips that
 		// getRunStatus owns.
 		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, releaseSignals{})
+		// E64.63 (#3222): the same display-only acceptance-blocker fold
+		// getRunStatus applies, off the SAME postStages + recentAudit slices,
+		// so the post-stage snapshot and the status snapshot cannot diverge on
+		// what is blocking a merge. Fail-open like every other derivation here:
+		// an un-fetched recent slice degrades the wording from re-opened to
+		// generic, never to silence.
+		foldAcceptanceRedispatchAdvisory(&runView.Run, postStages, recentAudit, nextActions)
 	}
 
 	out := RunStageOutput{

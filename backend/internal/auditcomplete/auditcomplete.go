@@ -1329,37 +1329,30 @@ func stageNotTerminalDetail(ctx context.Context, deps Deps, runID uuid.UUID, s *
 	}
 	for _, e := range entries {
 		if e.StageID != nil && *e.StageID == s.ID {
-			if !acceptanceAwaitsRedispatch(s.State) {
-				// The re-run the operator was told to start is ALREADY in
-				// flight. The audit entry is history and never goes away, so
-				// keying only on its presence would keep telling them to
-				// re-dispatch a stage that is running (#3190 fix-up).
-				return fmt.Sprintf("acceptance stage %s was re-opened by a fix-up push and its re-run is already in flight "+
-					"(state %s); the prior acceptance verdict is invalidated. Wait for the re-run to settle — "+
-					"this check clears on its own once acceptance settles.",
-					shortID(s.ID), s.State)
-			}
-			return fmt.Sprintf("acceptance stage %s was re-opened by a fix-up push and has not been re-run; "+
-				"the prior acceptance verdict is invalidated. Re-dispatch the acceptance stage "+
-				"(fishhawk_dispatch_stage, stage acceptance) — this check clears on its own once acceptance settles.",
-				shortID(s.ID))
+			// The dispatchable/in-flight split and both sentences come from
+			// run.AcceptanceBlockerAdvisory (E64.63 / #3222), the single owner
+			// of this wording across the fix-up refusal, this check, the merge
+			// checkpoints and next_actions. The rendered strings are BYTE-
+			// IDENTICAL to what #3190/#3224 shipped — the three pre-existing
+			// tests in auditcomplete_test.go are that proof, and
+			// TestStageNotTerminalDetail_SingleSourcedFromRunRenderer pins the
+			// equality so the copy cannot drift back.
+			//
+			// The entry is correlated with THIS stage's id above, never matched
+			// by category alone: a run can carry more than one acceptance stage
+			// in its history and a stale entry from an earlier one must not draw
+			// the stronger "a fix-up re-opened this" claim.
+			return run.AcceptanceBlockerAdvisory(shortID(s.ID), s.State, true,
+				checkClearsTail)
 		}
 	}
 	return generic
 }
 
-// acceptanceAwaitsRedispatch reports whether a re-opened acceptance stage is
-// one the operator can still DISPATCH, rather than one whose re-run is already
-// under way and can only be waited on. Mirrors run.acceptanceIsDispatchable
-// (unexported, and `auditcomplete` does not import it): the two pre-dispatch
-// park states are `pending` (the state run.ReopenAcceptanceStage writes) and
-// `awaiting_host_dispatch` (a local run parked for the host spawn). Every
-// other non-terminal state — `dispatched`, `running`, any `awaiting_*` — means
-// the re-run exists, so naming a re-dispatch there would be untrue (#3116
-// draws the same split on the fix-up refusal).
-func acceptanceAwaitsRedispatch(s run.StageState) bool {
-	return s == run.StageStatePending || s == run.StageStateAwaitingHostDispatch
-}
+// checkClearsTail is stageNotTerminalDetail's surface-specific tail clause,
+// appended verbatim by run.AcceptanceBlockerAdvisory: the audit-complete check
+// needs no operator action to re-publish once acceptance settles.
+const checkClearsTail = " — this check clears on its own once acceptance settles."
 
 // onlyPendingFlavored returns true when every entry in `missing` is a
 // pending-flavored row — `head_fetch_failed` (we couldn't read the live

@@ -714,6 +714,13 @@ func TestFixupStage_RefusalNamesDispatchAcceptance(t *testing.T) {
 			if strings.Contains(msg, "already in flight") {
 				t.Errorf("dispatchable acceptance drew the in-flight wording: %q", msg)
 			}
+			// E64.63 / #3222: the refusal now routes through the shared
+			// run.AcceptanceBlockerAdvisory renderer, which names the VERB, not
+			// just the noun — the same sentence the audit-complete check, the
+			// merge checkpoints and next_actions emit.
+			if !strings.Contains(msg, "fishhawk_dispatch_stage, stage acceptance") {
+				t.Errorf("refusal does not name the fishhawk_dispatch_stage verb: %q", msg)
+			}
 			if cur, _ := repo.GetStage(ctx, impl.ID); cur.State != run.StageStateSucceeded {
 				t.Errorf("implement state = %q, want unchanged (succeeded)", cur.State)
 			}
@@ -745,6 +752,13 @@ func TestFixupStage_RefusalNamesWaitForInFlightAcceptance(t *testing.T) {
 			}
 			if strings.Contains(msg, "Dispatch the acceptance stage") {
 				t.Errorf("in-flight acceptance drew the inapplicable dispatch remedy: %q", msg)
+			}
+			// #3222 binding condition 2: the in-flight variant must never carry
+			// a dispatch INSTRUCTION, in any spelling — not the prose remedy
+			// above and not the tool name the shared renderer now emits on the
+			// dispatchable branch.
+			if strings.Contains(msg, "fishhawk_dispatch_stage") {
+				t.Errorf("in-flight acceptance named the fishhawk_dispatch_stage verb: %q", msg)
 			}
 		})
 	}

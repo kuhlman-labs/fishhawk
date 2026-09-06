@@ -194,7 +194,33 @@ It refuses with `ErrFixupNotApplicable` (non-implement stage / wrong state / no 
 | (c) review already resolved | review terminal (`succeeded`/`failed`/`cancelled`/`superseded`) | today's already-resolved wording — the gate is closed for good, so the remedy is a fresh run |
 | (d) no review stage | the run declares none | says so, and points at a fresh run |
 
-`blockingAcceptanceStage` (a non-terminal acceptance stage, else nil) and `acceptanceIsDispatchable` (spawn-attempt-free states) are the two predicates the split reads. The MCP surfaces mirror this rule in `mcpserver.fixupGateOpen` under a KEEP IN SYNC comment; `backend/internal/integration/mcp/fixup_test.go` is the machine check that the mirror and this endpoint still agree.
+`blockingAcceptanceStage` (a non-terminal acceptance stage, else nil) and `AcceptanceIsDispatchable` (spawn-attempt-free states) are the two predicates the split reads. The MCP surfaces mirror this rule in `mcpserver.fixupGateOpen` under a KEEP IN SYNC comment; `backend/internal/integration/mcp/fixup_test.go` is the machine check that the mirror and this endpoint still agree.
+
+**Branches (a) and (a\') no longer spell their own sentences (E64.63 / [#3222](https://github.com/kuhlman-labs/fishhawk/issues/3222)).** Both now compose `AcceptanceBlockerAdvisory` (below), which is why the refusal text CHANGED in one visible way: it names the verb — `fishhawk_dispatch_stage, stage acceptance` — where it previously said only "Dispatch the acceptance stage", and renders the state unquoted. That is the intended consequence of single-sourcing, not drift. The split, the sentinel and the 422 code are unchanged.
+
+## `AcceptanceBlockerAdvisory` / `AcceptanceIsDispatchable` (E64.63 / [#3222](https://github.com/kuhlman-labs/fishhawk/issues/3222))
+
+`acceptance_advisory.go` is the SINGLE OWNER of the wording for "a non-terminal acceptance stage is blocking this." Before #3222 that wording existed as independent copies on the two surfaces that bothered to speak, while the two that did not — `fishhawk_merge_run` and `next_actions` — said nothing at all, and the operator reached for an admin bypass twice.
+
+`AcceptanceBlockerAdvisory(shortStageID, state, reopened, tail)` renders exactly one of four shapes and appends `tail` verbatim; a TERMINAL state renders `""`, which is what keeps every composing surface byte-identical on a healthy run. The two axes:
+
+| Axis | Values | Why it is load-bearing |
+|---|---|---|
+| `reopened` | a stage-scoped `acceptance_reopened` entry exists (#1682), or not | The caller selects the stage by NON-TERMINALITY (the `blockingAcceptanceStage` idiom above — never first-match-on-type, which an earlier settled acceptance row would win) and correlates the entry with THAT stage's id, never by category alone: a run can carry more than one acceptance stage in its history, and a stale entry from an earlier one would draw the stronger "a fix-up re-opened this" claim with nothing supporting it (#3222 binding condition 1). Unestablished → the GENERIC shape, still true, just less sharp. |
+| `dispatchable` | `AcceptanceIsDispatchable(state)` — `pending` / `awaiting_host_dispatch` only | The in-flight shapes NEVER name a dispatch. Naming a remedy the operator cannot take sends them to redo work with false authority — the defect #3116 fixed on the fix-up refusal and #3224 on the audit-complete check (#3222 binding condition 2). |
+
+`AcceptanceIsDispatchable` is the one exported owner of that split. It replaced `run.acceptanceIsDispatchable` (#3116) and `auditcomplete.acceptanceAwaitsRedispatch` (#3190/#3224), which were byte-identical copies the compiler could not keep in step.
+
+The four consumers, each composing the renderer with its own tail clause:
+
+| Consumer | Surface | Tail says |
+|---|---|---|
+| `run/fixup.go` `findOpenReviewStage` | the `fixup_not_applicable` refusal | ", then route the fix-up — the fix-up budget is not consumed by waiting" |
+| `auditcomplete.stageNotTerminalDetail` | the `fishhawk_audit_complete` `stage_not_terminal` detail | " — this check clears on its own once acceptance settles." |
+| `mcpserver/merge_run.go` `acceptanceBlockerAdvisoryFor` | the `timeout` / `checks_pending` merge checkpoints | " — the queued merge cannot fire until the acceptance stage settles and the fishhawk_audit_complete check clears." |
+| `mcpserver/next_actions.go` `foldAcceptanceRedispatchAdvisory` | the merge-ritual arms of the next_actions block | the same merge tail |
+
+Residual, stated honestly: `mcpserver/review_action_hint.go` keeps its OWN `acceptanceIsDispatchable` copy under a KEEP IN SYNC comment. It is a string-typed predicate over the MCP wire `Stage.State` on a different surface (the review-action hint), was not in #3222's scope, and is not covered by this single-sourcing.
 
 **#860 bounded operator override**: the request's `force_additional_pass: bool` (threaded into `FixupOptions.ForceAdditionalPass`, with `HardCeiling: defaultFixupCeiling == 3` supplied by the handler) grants ONE pass beyond the normal budget — audited via a `forced` flag on the `stage_fixup_triggered` entry — hard-capped at 3 total passes. At the ceiling `FixupStage` returns the DISTINCT `ErrFixupCeilingReached` → 422 `fixup_ceiling_reached` (the handler arm is ordered before `fixup_budget_exhausted` so it is not masked).
 

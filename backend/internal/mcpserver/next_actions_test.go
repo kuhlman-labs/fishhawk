@@ -4043,3 +4043,279 @@ func TestNextActions_GateClosedNeverOffersFixup(t *testing.T) {
 		}
 	}
 }
+
+// --- E64.63 / #3222: the acceptance-blocker fold on next_actions ---
+//
+// A run whose acceptance stage is still NON-TERMINAL sits succeeded with its PR
+// open, so the classifier reports succeeded_pr_open and offers the merge — while
+// the merge cannot fire, because fishhawk_audit_complete is pending on that very
+// stage. next_actions said nothing about it. These tests drive the fold directly.
+
+// naMergeRitual builds the unfolded succeeded_pr_open block the fold operates on.
+func naMergeRitual(t *testing.T) (*Run, *NextActions) {
+	t.Helper()
+	prURL := "https://github.com/x/y/pull/42"
+	r := naRun("succeeded")
+	r.PullRequestURL = &prURL
+	na := nextActionsFor(r, []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")},
+		nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil || na.State != "succeeded_pr_open" {
+		t.Fatalf("precondition: state = %+v, want succeeded_pr_open", na)
+	}
+	return r, na
+}
+
+func naReopenedEntry(stageID string) AuditEntry {
+	return AuditEntry{Category: categoryAcceptanceReopened, Sequence: 9, StageID: &stageID}
+}
+
+func TestFoldAcceptanceRedispatchAdvisory_ReopenedDispatchable(t *testing.T) {
+	for _, st := range []string{"pending", "awaiting_host_dispatch"} {
+		t.Run(st, func(t *testing.T) {
+			r, na := naMergeRitual(t)
+			acc := naStage("acceptance", st)
+			before := actionNames(na)
+
+			foldAcceptanceRedispatchAdvisory(r, []Stage{acc}, []AuditEntry{naReopenedEntry(acc.ID)}, na)
+
+			if na.State != "succeeded_acceptance_reopened" {
+				t.Fatalf("state = %q, want succeeded_acceptance_reopened", na.State)
+			}
+			got := actionNames(na)
+			if len(got) != len(before)+1 || got[0] != "fishhawk_dispatch_stage" {
+				t.Fatalf("actions = %v, want the dispatch PREPENDED to %v", got, before)
+			}
+			// The merge stays offered — the fold is additive, and the server
+			// remains the authority on whether the merge fires.
+			if got[1] != before[0] || got[2] != before[1] {
+				t.Errorf("actions = %v, want the existing ritual %v retained in order", got, before)
+			}
+			d := findAction(t, na, "fishhawk_dispatch_stage")
+			if d.Params["stage"] != "acceptance" || d.Params["stage_id"] != acc.ID || d.Params["run_id"] != r.ID {
+				t.Errorf("params = %v, want run_id/stage_id/stage=acceptance", d.Params)
+			}
+			if d.Consumes != consumesNone {
+				t.Errorf("consumes = %q, want none", d.Consumes)
+			}
+			for _, want := range []string{acc.ID[:8], "re-opened by a fix-up push", "fishhawk_dispatch_stage, stage acceptance"} {
+				if !strings.Contains(d.Reason, want) {
+					t.Errorf("reason = %q, want it to contain %q", d.Reason, want)
+				}
+			}
+		})
+	}
+}
+
+// TestFoldAcceptanceRedispatchAdvisory_InFlightOffersAPollNotADispatch is #3222
+// binding condition 2 on this surface.
+func TestFoldAcceptanceRedispatchAdvisory_InFlightOffersAPollNotADispatch(t *testing.T) {
+	for _, st := range []string{"dispatched", "running", "awaiting_input"} {
+		t.Run(st, func(t *testing.T) {
+			r, na := naMergeRitual(t)
+			acc := naStage("acceptance", st)
+
+			foldAcceptanceRedispatchAdvisory(r, []Stage{acc}, []AuditEntry{naReopenedEntry(acc.ID)}, na)
+
+			if na.State != "succeeded_acceptance_reopened" {
+				t.Fatalf("state = %q, want succeeded_acceptance_reopened", na.State)
+			}
+			got := actionNames(na)
+			for _, name := range got {
+				if name == "fishhawk_dispatch_stage" {
+					t.Fatalf("an in-flight acceptance stage offered a dispatch: %v", got)
+				}
+			}
+			if got[len(got)-1] != "fishhawk_await_stage" {
+				t.Fatalf("actions = %v, want the wait-shaped poll APPENDED", got)
+			}
+			w := findAction(t, na, "fishhawk_await_stage")
+			if !strings.Contains(w.Reason, "already in flight") {
+				t.Errorf("reason = %q, want the in-flight wording", w.Reason)
+			}
+			if strings.Contains(w.Reason, "fishhawk_dispatch_stage") {
+				t.Errorf("the in-flight reason names a dispatch the operator cannot take: %q", w.Reason)
+			}
+			if w.Params["stage_id"] != acc.ID {
+				t.Errorf("params = %v, want the acceptance stage_id", w.Params)
+			}
+		})
+	}
+}
+
+// TestFoldAcceptanceRedispatchAdvisory_GenericWhenNotReopened: the operator's
+// ruling — an acceptance stage that was never dispatched blocks the merge
+// exactly as hard, so the fold still fires, with the generic wording and the
+// succeeded_acceptance_pending label.
+func TestFoldAcceptanceRedispatchAdvisory_GenericWhenNotReopened(t *testing.T) {
+	r, na := naMergeRitual(t)
+	acc := naStage("acceptance", "pending")
+
+	foldAcceptanceRedispatchAdvisory(r, []Stage{acc}, nil, na)
+
+	if na.State != "succeeded_acceptance_pending" {
+		t.Fatalf("state = %q, want succeeded_acceptance_pending", na.State)
+	}
+	d := findAction(t, na, "fishhawk_dispatch_stage")
+	if strings.Contains(d.Reason, "re-opened by a fix-up push") {
+		t.Errorf("no acceptance_reopened entry exists, yet the reason claims one: %q", d.Reason)
+	}
+	if !strings.Contains(d.Reason, "must settle first") {
+		t.Errorf("reason = %q, want the generic wording", d.Reason)
+	}
+}
+
+// TestFoldAcceptanceRedispatchAdvisory_ScopedToStage is #3222 binding condition
+// 1 on this surface: a NON-MATCHING scoped entry is present — an
+// acceptance_reopened entry belonging to a DIFFERENT stage — so the generic
+// wording must ship. An absence-only test (the case above) passes just as
+// happily against an implementation that matches on the category alone.
+func TestFoldAcceptanceRedispatchAdvisory_ScopedToStage(t *testing.T) {
+	r, na := naMergeRitual(t)
+	acc := naStage("acceptance", "pending")
+	stale := naStage("acceptance", "succeeded")
+
+	foldAcceptanceRedispatchAdvisory(r, []Stage{acc}, []AuditEntry{naReopenedEntry(stale.ID)}, na)
+
+	if na.State != "succeeded_acceptance_pending" {
+		t.Fatalf("state = %q, want succeeded_acceptance_pending (an entry scoped elsewhere is no evidence here)", na.State)
+	}
+	d := findAction(t, na, "fishhawk_dispatch_stage")
+	if strings.Contains(d.Reason, "re-opened by a fix-up push") {
+		t.Errorf("an entry scoped to a DIFFERENT stage drew the re-opened claim: %q", d.Reason)
+	}
+	// An entry with NO stage id is likewise no evidence about this stage.
+	_, na2 := naMergeRitual(t)
+	foldAcceptanceRedispatchAdvisory(r, []Stage{acc}, []AuditEntry{{Category: categoryAcceptanceReopened, Sequence: 9}}, na2)
+	if na2.State != "succeeded_acceptance_pending" {
+		t.Errorf("state = %q, want succeeded_acceptance_pending for a stage-id-less entry", na2.State)
+	}
+}
+
+// TestFoldAcceptanceRedispatchAdvisory_MultipleAcceptanceStages is the
+// load-bearing selector assertion (#3222 fix-up). Two acceptance stage ROWS are
+// seeded into the stages slice — an earlier terminal one, then the live
+// non-terminal one, in sequence order — the shape a first-match-on-type
+// selector (stageByType) resolves to the TERMINAL row, taking the no-op guard
+// and staying silent on a merge the later stage genuinely blocks.
+func TestFoldAcceptanceRedispatchAdvisory_MultipleAcceptanceStages(t *testing.T) {
+	for _, staleState := range []string{"succeeded", "superseded", "failed"} {
+		t.Run("stale_"+staleState+"_first", func(t *testing.T) {
+			r, na := naMergeRitual(t)
+			stale := naStage("acceptance", staleState)
+			acc := naStage("acceptance", "pending")
+
+			foldAcceptanceRedispatchAdvisory(r, []Stage{stale, acc},
+				[]AuditEntry{naReopenedEntry(acc.ID)}, na)
+
+			if na.State != "succeeded_acceptance_reopened" {
+				t.Fatalf("state = %q, want succeeded_acceptance_reopened — the stale terminal row must not mask the live one", na.State)
+			}
+			d := findAction(t, na, "fishhawk_dispatch_stage")
+			if d.Params["stage_id"] != acc.ID {
+				t.Errorf("params = %v, want the LIVE acceptance stage_id %s", d.Params, acc.ID)
+			}
+			if !strings.Contains(d.Reason, shortStageID(acc.ID)) {
+				t.Errorf("reason = %q, want it to name the live acceptance stage", d.Reason)
+			}
+			if strings.Contains(d.Reason, shortStageID(stale.ID)) {
+				t.Errorf("the advisory named the STALE terminal acceptance stage: %q", d.Reason)
+			}
+		})
+	}
+
+	// The two guards compose: two acceptance rows AND the only
+	// acceptance_reopened entry scoped to the stale one still draws an
+	// advisory for the live stage, in the GENERIC wording.
+	t.Run("reopened_entry_scoped_to_stale_row", func(t *testing.T) {
+		r, na := naMergeRitual(t)
+		stale := naStage("acceptance", "succeeded")
+		acc := naStage("acceptance", "running")
+
+		foldAcceptanceRedispatchAdvisory(r, []Stage{stale, acc},
+			[]AuditEntry{naReopenedEntry(stale.ID)}, na)
+
+		if na.State != "succeeded_acceptance_pending" {
+			t.Fatalf("state = %q, want succeeded_acceptance_pending", na.State)
+		}
+		w := findAction(t, na, "fishhawk_await_stage")
+		if w.Params["stage_id"] != acc.ID {
+			t.Errorf("params = %v, want the LIVE acceptance stage_id %s", w.Params, acc.ID)
+		}
+		if strings.Contains(w.Reason, "re-opened by a fix-up push") {
+			t.Errorf("an entry scoped to the STALE stage drew the re-opened claim: %q", w.Reason)
+		}
+		// Binding condition 2: the in-flight arm never names a dispatch.
+		if strings.Contains(w.Reason, "fishhawk_dispatch_stage") {
+			t.Errorf("the in-flight reason names a dispatch the operator cannot take: %q", w.Reason)
+		}
+	})
+}
+
+// TestFoldAcceptanceRedispatchAdvisory_NoOps is the byte-identity half: every
+// guard leaves na DEEP-EQUAL to its unfolded value.
+func TestFoldAcceptanceRedispatchAdvisory_NoOps(t *testing.T) {
+	accID := uuid.NewString()
+	cases := []struct {
+		name   string
+		stages []Stage
+		recent []AuditEntry
+		// merged builds the succeeded_merged block instead of succeeded_pr_open.
+		merged bool
+	}{
+		{
+			name:   "acceptance stage is terminal",
+			stages: []Stage{{ID: accID, Type: "acceptance", State: "succeeded"}},
+			recent: []AuditEntry{naReopenedEntry(accID)},
+		},
+		{
+			// Two acceptance ROWS, both terminal: selecting by
+			// non-terminality must not manufacture noise on a healthy merge.
+			name: "every acceptance stage row is terminal",
+			stages: []Stage{
+				naStage("acceptance", "superseded"),
+				{ID: accID, Type: "acceptance", State: "succeeded"},
+			},
+			recent: []AuditEntry{naReopenedEntry(accID)},
+		},
+		{
+			name:   "run declares no acceptance stage",
+			stages: []Stage{naStage("plan", "succeeded")},
+			recent: []AuditEntry{naReopenedEntry(accID)},
+		},
+		{
+			name:   "the block no longer offers the merge (succeeded_merged)",
+			stages: []Stage{{ID: accID, Type: "acceptance", State: "pending"}},
+			recent: []AuditEntry{naReopenedEntry(accID)},
+			merged: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prURL := "https://github.com/x/y/pull/42"
+			r := naRun("succeeded")
+			r.PullRequestURL = &prURL
+			base := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+			build := func() *NextActions {
+				return nextActionsFor(r, base, nil, naReviewStatus("implement", "complete"), nil, nil,
+					tc.merged, false, false, "", "", releaseSignals{})
+			}
+			want := build()
+			got := build()
+			foldAcceptanceRedispatchAdvisory(r, append(append([]Stage(nil), base...), tc.stages...), tc.recent, got)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("fold was not a no-op:\n got %+v\nwant %+v", got, want)
+			}
+		})
+	}
+	t.Run("nil next actions", func(t *testing.T) {
+		foldAcceptanceRedispatchAdvisory(naRun("succeeded"), []Stage{{ID: accID, Type: "acceptance", State: "pending"}}, nil, nil)
+	})
+	t.Run("nil run", func(t *testing.T) {
+		_, na := naMergeRitual(t)
+		want := *na
+		foldAcceptanceRedispatchAdvisory(nil, []Stage{{ID: accID, Type: "acceptance", State: "pending"}}, nil, na)
+		if !reflect.DeepEqual(*na, want) {
+			t.Fatalf("fold mutated na on a nil run: %+v", na)
+		}
+	})
+}

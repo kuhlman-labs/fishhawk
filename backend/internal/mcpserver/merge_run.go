@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // mergeRunCategories are the audit categories the tool's post-POST poll
@@ -297,6 +299,21 @@ func checksPendingOutput(seq int64, start time.Time, details map[string]any) Mer
 	}
 }
 
+// checksPendingCheckpoint wraps checksPendingOutput with the E64.63 / #3222
+// acceptance-blocker advisory. checksPendingOutput stays a PURE function over
+// its inputs (it is the shape a reviewer reads to see what the checkpoint
+// claims); this method is the one place the two extra HTTP reads are paid, and
+// only on the checks_pending arm — a path already at least the clamped timeout
+// deep by construction, so the happy merge path pays nothing.
+//
+// An empty advisory (degrades D1/D2) leaves the message BYTE-IDENTICAL to
+// checksPendingOutput's.
+func (r *runResolver) checksPendingCheckpoint(ctx context.Context, runID uuid.UUID, seq int64, start time.Time, details map[string]any) MergeRunOutput {
+	out := checksPendingOutput(seq, start, details)
+	out.Message = appendAcceptanceAdvisory(out.Message, r.acceptanceBlockerAdvisoryFor(ctx, runID))
+	return out
+}
+
 // auditCompleteDetailSuffix renders the server's details.audit_complete_missing
 // list into the operator-facing message tail (E64.59 / #3190).
 //
@@ -330,6 +347,125 @@ func auditCompleteDetailSuffix(details map[string]any) string {
 		b.WriteString(" " + detail)
 	}
 	return b.String()
+}
+
+// acceptanceAdvisoryReadTimeout bounds the two extra reads the acceptance
+// advisory costs. Short by design: it is paid only on the timeout /
+// checks_pending arms, and a backend too slow to answer it within the budget
+// degrades to D1 (say nothing) rather than extending the tool's wall clock.
+const acceptanceAdvisoryReadTimeout = 10 * time.Second
+
+// mergeAdvisoryTail is the merge surface's tail clause, appended verbatim by
+// run.AcceptanceBlockerAdvisory: on this surface what the blocked acceptance
+// stage is holding back is the QUEUED MERGE, via the audit-complete check.
+const mergeAdvisoryTail = " — the queued merge cannot fire until the acceptance stage settles and the fishhawk_audit_complete check clears."
+
+// categoryAcceptanceReopened is the audit category the server writes when a
+// fix-up push invalidates a settled acceptance verdict (#1682). Spelled as a
+// literal here for the same reason auditcomplete spells it as one: the MCP tool
+// layer decodes audit rows off the HTTP surface and does not import package
+// server.
+const categoryAcceptanceReopened = "acceptance_reopened"
+
+// shortStageID renders a stage id the way the audit-complete detail does — the
+// first 8 characters — so the same stage reads identically on both surfaces.
+func shortStageID(id string) string {
+	if len(id) >= 8 {
+		return id[:8]
+	}
+	return id
+}
+
+// acceptanceBlockerAdvisoryFor renders the shared acceptance-blocker advisory
+// for a run whose merge did not settle (E64.63 / #3222).
+//
+// WHY this surface says anything at all: a merge blocked by a non-terminal
+// acceptance stage is exactly the shape the fix-up path has described precisely
+// since #3116, while fishhawk_merge_run reported only "nothing landed within
+// Ns" — and the operator, with no way to see the cause, reached for an admin
+// bypass twice. The advisory keys on a NON-TERMINAL acceptance stage rather
+// than on the acceptance_reopened entry: a merge blocked by an acceptance stage
+// that was never dispatched is blocked exactly as hard. The entry only SHARPENS
+// the wording.
+//
+// THE FAILURE CONTRACT — four degrades, each with its own outcome:
+//
+//	D1  the stages read FAILS            → "" (byte-identical message; we know
+//	                                       nothing, so we say nothing)
+//	D2  no NON-TERMINAL acceptance stage  → "" (byte-identical; no new noise on
+//	                                       a healthy merge). The stage is
+//	                                       selected by non-terminality, so an
+//	                                       older terminal acceptance row never
+//	                                       masks a later blocking one.
+//	D3  the audit read FAILS             → the GENERIC wording (a non-terminal
+//	                                       acceptance stage does block the
+//	                                       merge; we just cannot claim a fix-up
+//	                                       re-opened it)
+//	D4  the audit read matches no entry
+//	    SCOPED TO THIS STAGE             → the same GENERIC wording
+//
+// So a failed STAGES read says nothing while a failed or empty AUDIT read still
+// says the true generic thing; the two never both apply.
+//
+// D4 is correlated on the entry's STAGE ID, never on the category alone (#3222
+// binding condition 1): a run carrying more than one acceptance stage in its
+// history, or a stale entry from an earlier one, must not draw the stronger "a
+// fix-up re-opened this" claim with nothing supporting it.
+//
+// Best-effort by construction: every path returns a string, never an error, so
+// this can never turn a resolved merge status into a tool error.
+func (r *runResolver) acceptanceBlockerAdvisoryFor(ctx context.Context, runID uuid.UUID) string {
+	// DETACHED from the caller's cancellation, with its own bound. Every arm
+	// that renders this advisory is reached BECAUSE a bounded wait expired, and
+	// on the checks-pending arms that wait is the shared deadlineCtx — so
+	// inheriting cancellation would silence the explanation on exactly the paths
+	// that exist to explain a wait that ran out. The tool is returning a
+	// response either way; what remains is a bounded pair of reads to say WHY.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), acceptanceAdvisoryReadTimeout)
+	defer cancel()
+
+	stages, err := r.api.ListRunStages(ctx, runID)
+	if err != nil {
+		return "" // D1
+	}
+	// Selected by NON-TERMINALITY, not by first-match-on-type: a run can carry
+	// more than one acceptance stage row in its history, and a first-match
+	// selector lands on an earlier SUPERSEDED/succeeded one, hits the D2 guard
+	// and silences the advisory on a merge the LATER stage is genuinely
+	// blocking. blockingAcceptanceStage is the package's existing owner of that
+	// idiom (it mirrors run.blockingAcceptanceStage), so both MCP surfaces and
+	// the fix-up refusal now agree on which stage "the" acceptance stage is.
+	acc := blockingAcceptanceStage(stages)
+	if acc == nil {
+		return "" // D2
+	}
+
+	// D3/D4 both render the generic shape; only a stage-CORRELATED entry
+	// sharpens it to the re-opened wording.
+	reopened := false
+	entries, _, aerr := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: categoryAcceptanceReopened,
+		Limit:    200,
+	})
+	if aerr == nil {
+		for _, e := range entries {
+			if e.StageID != nil && *e.StageID == acc.ID {
+				reopened = true
+				break
+			}
+		}
+	}
+	return run.AcceptanceBlockerAdvisory(shortStageID(acc.ID), run.StageState(acc.State), reopened, mergeAdvisoryTail)
+}
+
+// appendAcceptanceAdvisory appends a non-empty advisory to an existing message,
+// leaving the existing sentence unmodified (and the whole message byte-identical
+// when the advisory is empty).
+func appendAcceptanceAdvisory(msg, advisory string) string {
+	if advisory == "" {
+		return msg
+	}
+	return msg + " " + advisory
 }
 
 // mergeRun is the tool handler. It validates locally, refuses fast when the run
@@ -415,7 +551,7 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 		// then would issue a doomed HTTP call past the tool's promised timeout. On
 		// exhaustion return the resumable checkpoint instead of POSTing again.
 		if sawChecksPending && !time.Now().Before(deadline) {
-			return nil, checksPendingOutput(checksSeq, start, checksDetails), nil
+			return nil, r.checksPendingCheckpoint(ctx, runID, checksSeq, start, checksDetails), nil
 		}
 		var merr error
 		res, merr = r.api.MergeRun(deadlineCtx, runID, verdict)
@@ -436,7 +572,7 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 			// genuine dispatch failure. Return the resumable checkpoint rather than
 			// a spurious tool error.
 			if sawChecksPending && deadlineCtx.Err() != nil {
-				return nil, checksPendingOutput(checksSeq, start, checksDetails), nil
+				return nil, r.checksPendingCheckpoint(ctx, runID, checksSeq, start, checksDetails), nil
 			}
 			return nil, MergeRunOutput{}, fmt.Errorf("merge run: %w", merr)
 		}
@@ -448,7 +584,7 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 		// Wait one poll tick, bounded by the shared deadline and ctx. On
 		// exhaustion return the resumable checks_pending checkpoint.
 		if !time.Now().Before(deadline) {
-			return nil, checksPendingOutput(checksSeq, start, checksDetails), nil
+			return nil, r.checksPendingCheckpoint(ctx, runID, checksSeq, start, checksDetails), nil
 		}
 		wait := interval
 		if d := time.Until(deadline); d < wait {
@@ -458,7 +594,7 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 		select {
 		case <-deadlineCtx.Done():
 			timer.Stop()
-			return nil, checksPendingOutput(checksSeq, start, checksDetails), nil
+			return nil, r.checksPendingCheckpoint(ctx, runID, checksSeq, start, checksDetails), nil
 		case <-timer.C:
 		}
 	}
@@ -490,7 +626,9 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 		step := postMergeStep(run)
 		out.NextAction = &step
 	case "timeout":
-		out.Message = fmt.Sprintf("no pr_merged / post_merge_observed entry landed within %ds. The merge is queued; re-invoke fishhawk_merge_run to resume the wait (the endpoint is idempotent — the re-POST records no duplicate verdict row), or poll fishhawk_get_run_status.", clampAwaitTimeout(in.TimeoutSeconds))
+		out.Message = appendAcceptanceAdvisory(
+			fmt.Sprintf("no pr_merged / post_merge_observed entry landed within %ds. The merge is queued; re-invoke fishhawk_merge_run to resume the wait (the endpoint is idempotent — the re-POST records no duplicate verdict row), or poll fishhawk_get_run_status.", clampAwaitTimeout(in.TimeoutSeconds)),
+			r.acceptanceBlockerAdvisoryFor(ctx, runID))
 	case "run_terminal":
 		out.Message = fmt.Sprintf("run %s reached terminal state %q while awaiting the merge and no pr_merged / post_merge_observed entry landed — the merge will most likely never settle. Check fishhawk_get_run_status before re-invoking.", runID, runState)
 	}
