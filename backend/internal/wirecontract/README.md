@@ -91,7 +91,8 @@ can silently cover nothing is the vacuity class #2558 exists to close.
 | endpoint names an absent type | error `type "X" not found` | `TestCheck_MissingTypeFailsClosed` |
 | type resolves to a non-struct | error `is not a struct` | `TestCheck_NonStructTypeFailsClosed` |
 | embedded type unresolvable in the same file | error naming it | `TestExtract_UnresolvableEmbeddedFailsClosed` |
-| a `CoveredFiles` entry does not parse | error | (covered by the real-tree sweep) |
+| an endpoint file does not parse | error naming the parse failure | `TestExtract_MalformedSourceFailsClosed` |
+| a `CoveredFiles` entry does not parse | error naming the parse failure | `TestCompleteness_MalformedSourceFailsClosed` |
 
 ## Whole-repo-tree requirement (condition 1)
 

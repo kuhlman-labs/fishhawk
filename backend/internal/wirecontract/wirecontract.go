@@ -80,14 +80,17 @@ func repoRootFrom(start string) (string, error) {
 //
 //   - the file does not parse -> error
 //   - typeName is absent, or names a non-struct type -> error
-//   - an embedded (anonymous) field's type cannot be resolved in the SAME file
-//     -> error naming it (a non-flattening extractor would silently omit the
-//     embedded fields, the vacuity class this guard exists to close)
+//   - an embedded (anonymous) field with no json NAME (no tag, or a tag with an
+//     empty name) whose type cannot be resolved in the SAME file -> error naming
+//     it (a non-flattening extractor would silently omit the embedded fields,
+//     the vacuity class this guard exists to close)
 //
 // Field semantics mirror encoding/json: a `json:"-"` field is skipped; an
 // unexported field is skipped (not marshalled); an exported field with no json
-// name takes its Go field name; an anonymous struct field with no json tag is
-// flattened in place.
+// name takes its Go field name; an anonymous struct field is flattened in place
+// UNLESS its json tag supplies a non-empty name — a tag with an empty name such
+// as `json:",omitempty"` leaves it anonymous and promoted, since tag OPTIONS
+// alone never make an embedded field named.
 func ExtractStruct(path, typeName string) ([]Field, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
@@ -107,19 +110,21 @@ func extractFromFile(path string, file *ast.File, typeName string) ([]Field, err
 	var out []Field
 	for _, f := range st.Fields.List {
 		if len(f.Names) == 0 {
-			// Anonymous (embedded) field. With no json tag it is flattened in
-			// place; with a json tag encoding/json treats it as a named field.
+			// Anonymous (embedded) field. encoding/json treats it as a NAMED
+			// wire field only when its json tag supplies a NON-EMPTY name; a
+			// tag with an empty name (e.g. `json:",omitempty"`) leaves it
+			// anonymous and PROMOTES its fields exactly as no tag would — tag
+			// OPTIONS alone never make an embedded field named.
 			name, options, hasName := jsonTag(f)
-			if hasName {
-				if name == "" {
-					name = embeddedTypeName(f.Type)
-				}
-				if name == "-" {
-					continue
-				}
+			if hasName && name == "-" {
+				continue // json:"-" ignores the field entirely
+			}
+			if hasName && name != "" {
 				out = append(out, Field{JSONName: name, Options: options})
 				continue
 			}
+			// No json name given: flatten. The embedded field's own options
+			// (an omitempty here) never reach the wire, so they are dropped.
 			embName := embeddedTypeName(f.Type)
 			if embName == "" {
 				return nil, fmt.Errorf("wirecontract: %s: embedded field of type %s in %q is not a same-file named struct and cannot be resolved", path, exprString(f.Type), typeName)

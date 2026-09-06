@@ -267,6 +267,72 @@ func TestExtract_UntaggedFieldUsesGoName(t *testing.T) {
 	}
 }
 
+// --- Concern (high): an anonymous embedded field with an EMPTY-name json tag
+// (`json:",omitempty"`) is flattened, NOT treated as a named field using the Go
+// type name — matching encoding/json, where tag OPTIONS alone never make an
+// embedded field named. This is the discriminating regression for the guard
+// bug: before the fix "Inner" appeared as a named wire field and "title" (the
+// promoted field) vanished. ---
+
+func TestExtract_EmptyNameTaggedEmbeddedIsFlattened(t *testing.T) {
+	dir := t.TempDir()
+	path := writeGo(t, dir, "emit.go", "package p\ntype Inner struct{ Title string `json:\"title\"` }\ntype Outer struct{\n Outcome string `json:\"outcome\"`\n Inner `json:\",omitempty\"` }\n")
+	fields, err := ExtractStruct(path, "Outer")
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	names := jsonNames(fields)
+	if !contains(names, "title") {
+		t.Fatalf("an empty-name-tagged embedded struct must be flattened, promoting %q; got %v", "title", names)
+	}
+	if contains(names, "Inner") {
+		t.Fatalf("an empty json name must NOT make the embedded field named %q; got %v", "Inner", names)
+	}
+}
+
+// The kept-behavior counterpart: a NON-EMPTY embedded tag name still makes it a
+// named field (not flattened), so the fix narrows only the empty-name case.
+func TestExtract_NonEmptyNameTaggedEmbeddedIsNamed(t *testing.T) {
+	dir := t.TempDir()
+	path := writeGo(t, dir, "emit.go", "package p\ntype Inner struct{ Title string `json:\"title\"` }\ntype Outer struct{ Inner `json:\"inner\"` }\n")
+	fields, err := ExtractStruct(path, "Outer")
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	names := jsonNames(fields)
+	if !contains(names, "inner") {
+		t.Fatalf("a non-empty embedded tag name must make it a named field %q; got %v", "inner", names)
+	}
+	if contains(names, "title") {
+		t.Fatalf("a named embedded field must NOT be flattened; got %v", names)
+	}
+}
+
+// --- Concern (medium): the fail-closed parse-error branches in ExtractStruct
+// and markerBearingStructs are exercised by malformed-source fixtures. The
+// real-tree tests parse only valid committed files, so these hold the branches
+// honest. ---
+
+func TestExtract_MalformedSourceFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	// An illegal token (@) makes the file unparseable.
+	path := writeGo(t, dir, "bad.go", "package p\nvar x = @\n")
+	if _, err := ExtractStruct(path, "E"); err == nil {
+		t.Fatal("a syntactically invalid source must fail closed in ExtractStruct")
+	} else if !strings.Contains(err.Error(), "parse") {
+		t.Errorf("error must name the parse failure, got %v", err)
+	}
+}
+
+func TestCompleteness_MalformedSourceFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	writeGo(t, dir, "bad.go", "package p\nvar x = @\n")
+	m := Manifest{CoveredFiles: []string{"bad.go"}}
+	if errs := checkCompleteness(dir, m); !hasErrContaining(errs, "parse") {
+		t.Fatalf("a syntactically invalid covered file must fail closed in the completeness sweep, got %v", errs)
+	}
+}
+
 // --- Positive against the REAL tree: embedded flattening contributes the
 // HeldCommitPRText names, so the subset check is not vacuously satisfied ---
 
