@@ -437,10 +437,13 @@ func TestDecideScopeCompleteness_ExemptAuditAppendFailure_RefusesAndLeavesParked
 //
 // The one hop this test cannot make is the runner's DECODE — the runner and the
 // backend are separate Go modules and neither may import the other. That hop is
-// pinned by the shared bytes: goldenExemptPromptJSON, duplicated verbatim in
+// pinned by the SINGLE shared fixture testdata/wire/exempt_prompt_fields.json,
+// read here via goldenExemptPromptJSON(t) and read verbatim by
 // runner/cmd/fishhawk-runner/main_test.go, which decodes it into
-// upload.FetchedPrompt. Any drift in what the backend emits breaks the RUNNER
-// test, not merely a backend assertion.
+// upload.FetchedPrompt. One source of truth (#2558): any drift in what the
+// backend emits forces a fixture edit, which then breaks the RUNNER decode test,
+// not merely a backend assertion. The struct-level tag parity is additionally
+// pinned by backend/internal/wirecontract's TestCrossModuleWireParity.
 func TestScopeCompleteness_ParkToPromptEmission_EndToEnd(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	ctx := context.Background()
@@ -552,12 +555,13 @@ func TestScopeCompleteness_ParkToPromptEmission_EndToEnd(t *testing.T) {
 	if err := json.Unmarshal(pw.Body.Bytes(), &keys); err != nil {
 		t.Fatalf("decode prompt body: %v", err)
 	}
-	var golden map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(goldenExemptPromptJSON), &golden); err != nil {
+	golden := goldenExemptPromptJSON(t)
+	var goldenKeys map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(golden), &goldenKeys); err != nil {
 		t.Fatal(err)
 	}
 	projection := map[string]json.RawMessage{}
-	for k := range golden {
+	for k := range goldenKeys {
 		if raw, ok := keys[k]; ok {
 			projection[k] = raw
 		}
@@ -566,9 +570,9 @@ func TestScopeCompleteness_ParkToPromptEmission_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != goldenExemptPromptJSON {
+	if string(got) != golden {
 		t.Errorf("prompt emitted after a REAL park→exempt walk drifted from the cross-module golden fixture:\n got: %s\nwant: %s",
-			got, goldenExemptPromptJSON)
+			got, golden)
 	}
 }
 

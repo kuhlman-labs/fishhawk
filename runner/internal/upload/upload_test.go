@@ -963,6 +963,14 @@ func TestFetchPrompt_PlanModelOmittedWhenAbsent(t *testing.T) {
 // backend shape and decoding it through FetchedPrompt must reproduce the
 // declaration field-for-field; a silent zero value means a tag drifted across
 // the module boundary that per-side unit tests cannot catch.
+//
+// backendBindingAssertion below only RESTATES the backend's tags; it cannot fail
+// if the REAL backend struct drifts, because it is a hand-mirror. That residual
+// is now closed by backend/internal/wirecontract's TestCrossModuleWireParity,
+// which parses the REAL server.bindingAssertion and this package's
+// BindingAssertion and asserts their tags agree (the "binding_assertion"
+// ModeExact manifest pair). This test still earns its place as the decode-side
+// round-trip; the guard is what pins the tags the mirror only assumes.
 func TestBindingAssertions_BackendEmitRunnerDecodeRoundTrip(t *testing.T) {
 	// Mirror of backend server.bindingAssertion (json: type/path/literal).
 	type backendBindingAssertion struct {

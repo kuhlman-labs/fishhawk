@@ -20600,24 +20600,42 @@ func TestRun_NoDiffCoverage_EmitsNoEvent(t *testing.T) {
 	}
 }
 
-// goldenExemptPromptJSON is the CROSS-MODULE GOLDEN FIXTURE for the
-// scope-completeness exempt prompt-response fields (#2501).
+// goldenExemptPromptJSON reads the CROSS-MODULE GOLDEN FIXTURE for the
+// scope-completeness exempt prompt-response fields (#2501) from the SINGLE
+// shared file testdata/wire/exempt_prompt_fields.json.
 //
-// PEER COPY: backend/internal/server/prompt_test.go holds a BYTE-IDENTICAL
-// literal under the same name. The backend test asserts the three-key
-// projection of its marshalled promptResponse EQUALS this JSON; the runner test
-// below DECODES it as a fetched prompt. A single-process end-to-end that
-// carries the payload the whole way is impossible here — the runner and the
-// backend are separate Go modules and neither may import the other (import
-// direction is one-way and there is no shared wire package) — so the shared
-// BYTES are the seam. Keep the two literals verbatim-identical: a backend tag
-// change forces an edit to the backend copy, and this copy then fails to
-// decode, so the drift surfaces in the RUNNER test rather than only in a
-// backend assertion.
+// ONE SOURCE OF TRUTH (#2558): backend/internal/server/prompt_test.go reads the
+// SAME file. There is no per-module golden left to update in isolation — the
+// backend projection test asserts its marshalled promptResponse EQUALS these
+// bytes, so a backend json-tag change reddens THAT test; updating the fixture to
+// match then reddens THIS decode test. That is precisely the load-bearing
+// property the two duplicated literals CLAIMED and did not have: a one-sided
+// backend golden update could previously leave this decode green. A
+// single-process end-to-end is impossible (the runner and backend are separate
+// Go modules, import direction one-way, no shared wire package), so the shared
+// BYTES are the seam. The struct-level TAG parity these bytes stand in for is
+// now ALSO pinned by backend/internal/wirecontract's TestCrossModuleWireParity.
 //
-// held_commit_base_sha (#2563) is the fourth exempt field; it sorts first in
-// the map-marshalled backend projection.
-const goldenExemptPromptJSON = `{"held_commit_base_sha":"3333333333333333333333333333333333333333","held_commit_branch":"fishhawk/run-11112222/stage-99990000","held_commit_sha":"1111111111111111111111111111111111111111","open_pr_from_held_commit":true}`
+// This helper REQUIRES the full repo tree (it resolves the fixture from THIS
+// test's source file, anchored on runtime.Caller because the suite's TestMain
+// chdirs into a throwaway temp dir) and FAILS CLOSED on a read error — a missing
+// fixture must never degrade to a skipped comparison. It trims a single trailing
+// newline (operator condition 2) so the fixture is correct whether or not
+// whitespace tooling appends one; the decode is byte-for-byte in every other
+// respect.
+func goldenExemptPromptJSON(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve the shared exempt prompt fixture path")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "exempt_prompt_fields.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared exempt prompt fixture %s: %v", path, err)
+	}
+	return strings.TrimSuffix(string(b), "\n")
+}
 
 // TestGoldenExemptPrompt_DecodesIntoFetchedPrompt is the runner half of the
 // #2501 cross-module seam: the exact bytes the backend emits for an
@@ -20625,7 +20643,7 @@ const goldenExemptPromptJSON = `{"held_commit_base_sha":"33333333333333333333333
 // zero-re-run branch keys off. A tag drift on either side breaks THIS test.
 func TestGoldenExemptPrompt_DecodesIntoFetchedPrompt(t *testing.T) {
 	var fp upload.FetchedPrompt
-	if err := json.Unmarshal([]byte(goldenExemptPromptJSON), &fp); err != nil {
+	if err := json.Unmarshal([]byte(goldenExemptPromptJSON(t)), &fp); err != nil {
 		t.Fatalf("decode golden exempt prompt: %v", err)
 	}
 	if !fp.OpenPRFromHeldCommit {
@@ -20709,7 +20727,7 @@ func TestAssertionShortfall_ParksThenExemptOpensPRWithNoAgentReRun(t *testing.T)
 
 	// ---- PHASE 2: the exempt re-dispatch, driven through run(). ----
 	var golden upload.FetchedPrompt
-	if uerr := json.Unmarshal([]byte(goldenExemptPromptJSON), &golden); uerr != nil {
+	if uerr := json.Unmarshal([]byte(goldenExemptPromptJSON(t)), &golden); uerr != nil {
 		t.Fatalf("decode golden exempt prompt: %v", uerr)
 	}
 	if !golden.OpenPRFromHeldCommit || golden.HeldCommitBranch != branch {
