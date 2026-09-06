@@ -399,6 +399,85 @@ func TestCompute_ReopenedAcceptanceDetailNamesRedispatch(t *testing.T) {
 	}
 }
 
+// TestCompute_ReopenedAcceptanceInFlight_DoesNotNameRedispatch pins the
+// TRUTHFULNESS of the action-bearing shape once the operator has FOLLOWED it.
+// The `acceptance_reopened` entry is history and never goes away, so keying the
+// re-dispatch instruction on its presence alone kept telling the operator to
+// re-dispatch a stage whose re-run was already running. Counterfactual:
+// deleting the acceptanceAwaitsRedispatch split in stageNotTerminalDetail makes
+// this RED on the "fishhawk_dispatch_stage" assertion.
+func TestCompute_ReopenedAcceptanceInFlight_DoesNotNameRedispatch(t *testing.T) {
+	// Every state a re-opened acceptance stage can be in once its re-run
+	// exists. `pending` and `awaiting_host_dispatch` are the dispatchable
+	// pair covered by TestCompute_ReopenedAcceptanceDetailNamesRedispatch.
+	for _, st := range []run.StageState{
+		run.StageStateDispatched,
+		run.StageStateRunning,
+	} {
+		t.Run(string(st), func(t *testing.T) {
+			runID, runs, arts, ar := happyPath(t)
+			acc := mkStage(runID, 4, run.StageTypeAcceptance, st)
+			runs.stages = append(runs.stages, acc)
+			ar.appendChained(t, runID, &acc.ID, "acceptance_reopened",
+				json.RawMessage(`{"prior_state":"succeeded","head_sha":"f1xuphead"}`))
+
+			state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+			if err != nil {
+				t.Fatalf("Compute: %v", err)
+			}
+			if state != stagecheck.StatePending {
+				t.Fatalf("state = %s want pending", state)
+			}
+			if len(missing) != 1 || missing[0].Kind != auditcomplete.MissingStageNotTerminal {
+				t.Fatalf("missing = %+v, want one stage_not_terminal item", missing)
+			}
+			// The defect: a re-run already in flight must NOT be told to
+			// re-dispatch, and must not claim it "has not been re-run".
+			for _, unwanted := range []string{"fishhawk_dispatch_stage", "has not been re-run"} {
+				if strings.Contains(missing[0].Detail, unwanted) {
+					t.Errorf("detail = %q, want it NOT to contain %q for an in-flight re-run", missing[0].Detail, unwanted)
+				}
+			}
+			// It still says WHY the stage is non-terminal (the re-open), names
+			// the live state, and keeps the self-clearing promise.
+			for _, want := range []string{
+				acc.ID.String()[:8],
+				"re-opened by a fix-up push",
+				"already in flight",
+				string(st),
+				"clears on its own once acceptance settles",
+			} {
+				if !strings.Contains(missing[0].Detail, want) {
+					t.Errorf("detail = %q, want it to contain %q", missing[0].Detail, want)
+				}
+			}
+		})
+	}
+}
+
+// TestCompute_ReopenedAcceptanceAwaitingHostDispatch_NamesRedispatch pins the
+// OTHER half of the split: `awaiting_host_dispatch` is a local run's
+// pre-dispatch park, so it is still the operator's move and keeps the
+// action-bearing wording. Without this, narrowing the dispatchable set to
+// `pending` alone would go unnoticed.
+func TestCompute_ReopenedAcceptanceAwaitingHostDispatch_NamesRedispatch(t *testing.T) {
+	runID, runs, arts, ar := happyPath(t)
+	acc := mkStage(runID, 4, run.StageTypeAcceptance, run.StageStateAwaitingHostDispatch)
+	runs.stages = append(runs.stages, acc)
+	ar.appendChained(t, runID, &acc.ID, "acceptance_reopened", nil)
+
+	_, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if len(missing) != 1 {
+		t.Fatalf("missing = %+v, want one item", missing)
+	}
+	if !strings.Contains(missing[0].Detail, "fishhawk_dispatch_stage") {
+		t.Errorf("detail = %q, want the re-dispatch instruction for a stage parked at awaiting_host_dispatch", missing[0].Detail)
+	}
+}
+
 // TestCompute_ReopenedLookupReadError_DegradesToGenericDetail pins the FAIL-OPEN
 // posture of the acceptance_reopened lookup: a read error must degrade to the
 // generic detail and NEVER surface as a Compute error. This whole change is

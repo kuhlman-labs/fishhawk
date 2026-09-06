@@ -8193,7 +8193,8 @@ paths:
             pending audit-complete, so an unrelated failing required check is
             never mislabelled. A `stage_not_terminal` item naming a
             fix-up-re-opened acceptance stage means the merge clears by
-            re-dispatching that acceptance stage.
+            re-dispatching that acceptance stage — or, when the item reports
+            the re-run as already in flight, by waiting for it to settle.
             (4) The pull request has a merge conflict against its base
             (`merge_conflicting`, E64.14 / #3109). NO verdict row is recorded
             (the guard runs before the append) and `details` carry

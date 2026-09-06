@@ -1304,9 +1304,14 @@ func resolveImplementTracesFromChildren(ctx context.Context, deps Deps, runID uu
 // non-review stage (E64.59 / #3190).
 //
 // The generic shape names the stage TYPE, its short id and its current STATE.
-// For an ACCEPTANCE stage that a fix-up push RE-OPENED (#1682) it renders the
+// For an ACCEPTANCE stage that a fix-up push RE-OPENED (#1682) it renders an
 // action-bearing shape instead: that stage is not merely waiting, it is waiting
 // on an operator to re-dispatch it, and nothing else in the product says so.
+// The `acceptance_reopened` entry is HISTORY and never goes away, so the shape
+// is additionally split on the stage's CURRENT state: only a still-dispatchable
+// stage is told to re-dispatch, while a re-run already in flight is told to
+// wait. Keying on the entry alone would keep recommending a re-dispatch the
+// operator has already performed.
 //
 // The acceptance_reopened lookup FAILS OPEN: a read error degrades to the
 // generic detail and is never returned as a Compute error. This lookup exists
@@ -1324,6 +1329,16 @@ func stageNotTerminalDetail(ctx context.Context, deps Deps, runID uuid.UUID, s *
 	}
 	for _, e := range entries {
 		if e.StageID != nil && *e.StageID == s.ID {
+			if !acceptanceAwaitsRedispatch(s.State) {
+				// The re-run the operator was told to start is ALREADY in
+				// flight. The audit entry is history and never goes away, so
+				// keying only on its presence would keep telling them to
+				// re-dispatch a stage that is running (#3190 fix-up).
+				return fmt.Sprintf("acceptance stage %s was re-opened by a fix-up push and its re-run is already in flight "+
+					"(state %s); the prior acceptance verdict is invalidated. Wait for the re-run to settle — "+
+					"this check clears on its own once acceptance settles.",
+					shortID(s.ID), s.State)
+			}
 			return fmt.Sprintf("acceptance stage %s was re-opened by a fix-up push and has not been re-run; "+
 				"the prior acceptance verdict is invalidated. Re-dispatch the acceptance stage "+
 				"(fishhawk_dispatch_stage, stage acceptance) — this check clears on its own once acceptance settles.",
@@ -1331,6 +1346,19 @@ func stageNotTerminalDetail(ctx context.Context, deps Deps, runID uuid.UUID, s *
 		}
 	}
 	return generic
+}
+
+// acceptanceAwaitsRedispatch reports whether a re-opened acceptance stage is
+// one the operator can still DISPATCH, rather than one whose re-run is already
+// under way and can only be waited on. Mirrors run.acceptanceIsDispatchable
+// (unexported, and `auditcomplete` does not import it): the two pre-dispatch
+// park states are `pending` (the state run.ReopenAcceptanceStage writes) and
+// `awaiting_host_dispatch` (a local run parked for the host spawn). Every
+// other non-terminal state — `dispatched`, `running`, any `awaiting_*` — means
+// the re-run exists, so naming a re-dispatch there would be untrue (#3116
+// draws the same split on the fix-up refusal).
+func acceptanceAwaitsRedispatch(s run.StageState) bool {
+	return s == run.StageStatePending || s == run.StageStateAwaitingHostDispatch
 }
 
 // onlyPendingFlavored returns true when every entry in `missing` is a
