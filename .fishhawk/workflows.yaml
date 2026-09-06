@@ -255,7 +255,7 @@ workflows:
             - provider: claudecode
               model: claude-fable-5
             - provider: codex
-              model: gpt-5.6-sol
+              model: gpt-6-astra
               reasoning_effort: high
           human: 1
         inputs:
@@ -319,7 +319,7 @@ workflows:
             - provider: claudecode
               model: claude-fable-5
             - provider: codex
-              model: gpt-5.6-sol
+              model: gpt-6-astra
               reasoning_effort: high
           human: 1
         inputs:
