@@ -228,6 +228,65 @@ func TestValidateGroomingReport_DuplicateEntryID_Rejected(t *testing.T) {
 	}
 }
 
+// TestValidateGroomingReport_RejectsHygieneCollisionDifferingOnlyInSuggestedFix
+// pins the agreement the APPLY layer's join check rests on (#2809).
+//
+// backend/internal/workmgmt's grooming apply layer now establishes
+// one-entry/one-approval itself rather than inheriting it, and its honest
+// framing says the production path cannot deliver a duplicate-id report today
+// because rule (a) refuses one at ingest. The reviewer's example is the sharp
+// case: two hygiene defects for the SAME item and the SAME defect differing
+// ONLY in `suggested_fix`. GroomingEntryID reads class, item key and defect and
+// NOTHING else — `suggested_fix` is not a derivation input — so both entries
+// derive the IDENTICAL id, rule (c) forces each declared id to equal its
+// derived id, and rule (a) then rejects the pair report-wide.
+//
+// This test CONFIRMS that rather than assuming it: if the derivation ever grew
+// to read `suggested_fix`, the two ids would diverge, this test would go GREEN
+// in the wrong direction (no rejection) and the apply layer's second line of
+// defence would become the only one. The offending value is paired with ITSELF
+// — both entries declare the same derived id — so the case cannot pass on a
+// byte-exact comparison that would refuse it whether or not rule (a) exists.
+func TestValidateGroomingReport_RejectsHygieneCollisionDifferingOnlyInSuggestedFix(t *testing.T) {
+	const id = "hygiene:github/kuhlman-labs/fishhawk#2235:missing_label_namespace"
+	// Assert the id the DERIVATION produces, so the fixture cannot silently
+	// stop being the collision this test is about.
+	derived := plan.GroomingEntryID(plan.GroomingClassHygiene, "missing_label_namespace",
+		plan.ItemRef{Type: "github_issue", ID: "kuhlman-labs/fishhawk#2235",
+			URL: "https://github.com/kuhlman-labs/fishhawk/issues/2235"})
+	if derived != id {
+		t.Fatalf("GroomingEntryID = %q, want %q — `suggested_fix` must not be a derivation input", derived, id)
+	}
+
+	body := groomingDocWithHygiene(
+		`[{"id":"` + id + `","item_ref":` + gr2235Ref + `,"defect":"missing_label_namespace",` +
+			`"detail":"no area: label","suggested_fix":"Add area:server-api."},` +
+			`{"id":"` + id + `","item_ref":` + gr2235Ref + `,"defect":"missing_label_namespace",` +
+			`"detail":"no area: label","suggested_fix":"Apply the area:server-api label to this issue."}]`)
+
+	var se *plan.SemanticError
+	err := plan.ValidateGroomingReport(body)
+	if !errors.As(err, &se) {
+		t.Fatalf("ValidateGroomingReport: err = %v (%T), want *SemanticError — two hygiene entries differing only in suggested_fix collide on id", err, err)
+	}
+	if !strings.Contains(se.Error(), "duplicate entry id") {
+		t.Errorf("SemanticError should be the report-wide UNIQUENESS rejection (rule a), not another rule that happens to fire first; got %v", se)
+	}
+	if !strings.Contains(se.Error(), id) {
+		t.Errorf("SemanticError should name the duplicated id %q; got %v", id, se)
+	}
+	// The JSON pointer of the SECOND entry — the one that is refused.
+	if !strings.Contains(se.Error(), "/hygiene_defects/1/id") {
+		t.Errorf("SemanticError should name the second entry's JSON pointer; got %v", se)
+	}
+	// ParseGroomingReport runs the same validation, so the typed decode of this
+	// document is refused too rather than yielding a report the apply layer
+	// would then have to catch.
+	if _, perr := plan.ParseGroomingReport(body); !errors.As(perr, &se) {
+		t.Errorf("ParseGroomingReport: err = %v (%T), want the same *SemanticError", perr, perr)
+	}
+}
+
 // TestValidateGroomingReport_EntryIDClassMismatch_Rejected: an `ordering:`
 // -prefixed id inside `duplicates` is a routing bug.
 func TestValidateGroomingReport_EntryIDClassMismatch_Rejected(t *testing.T) {
