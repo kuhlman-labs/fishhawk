@@ -73,10 +73,13 @@ func TestDispatchWatchdog_FailsWedgedButHeartbeatingStage(t *testing.T) {
 		s.ID, (2 * timeout).String()); err != nil {
 		t.Fatalf("backdate dispatched_at: %v", err)
 	}
+	// No ReportedAt: since #3084 the ingest UPDATE stamps it from the DATABASE
+	// clock and discards any caller value. That still lands AFTER the
+	// deliberately backdated dispatched_at above (the same-state UPDATE does not
+	// re-stamp it), so this stage stays wedged_after_checkin.
 	for i := 0; i < 3; i++ {
 		if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{
-			LastEvent:  "assistant",
-			ReportedAt: time.Now().UTC(),
+			LastEvent: "assistant",
 		}); err != nil {
 			t.Fatalf("record heartbeat %d: %v", i, err)
 		}
@@ -145,7 +148,8 @@ func TestDispatchWatchdog_DoesNotFailHealthyStageWithinBudget(t *testing.T) {
 	}
 
 	_, s := pgDispatchedStage(t, repo)
-	if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{LastEvent: "assistant", ReportedAt: time.Now().UTC()}); err != nil {
+	// No ReportedAt: the DATABASE stamps it (#3084).
+	if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{LastEvent: "assistant"}); err != nil {
 		t.Fatalf("record heartbeat: %v", err)
 	}
 

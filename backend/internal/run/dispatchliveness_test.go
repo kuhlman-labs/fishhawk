@@ -47,16 +47,32 @@ func rawDispatchedAt(t *testing.T, pool *pgxpool.Pool, stageID uuid.UUID) *time.
 	return ts
 }
 
-// dbAnchoredHeartbeat returns a heartbeat instant derived from the stage row's
-// OWN DB-stamped dispatched_at, offset by the caller's (timescale-scaled)
-// delta. It is the fix for #3048: seeding a comparative heartbeat from the Go
-// process's time.Now() puts the two sides of ListDispatchedStageLiveness's
-// attempt-relative hb.Before(*l.DispatchedAt) comparison in DIFFERENT clock
-// domains — the host's and the Postgres container's — and host/container skew
-// is unbounded, so no margin makes the ordering safe. Anchoring the seed to the
-// value it will be compared against puts both sides in ONE clock domain, and
-// the ordering then holds BY CONSTRUCTION at any skew; timescale.D supplies the
-// offset per the AGENTS.md rule.
+// rawReportedAt reads the committed stages.progress -> reported_at directly,
+// bypassing the domain decode, so a test can assert against the value Postgres
+// actually stored rather than one a caller supplied.
+func rawReportedAt(t *testing.T, pool *pgxpool.Pool, stageID uuid.UUID) time.Time {
+	t.Helper()
+	var ts time.Time
+	if err := pool.QueryRow(context.Background(),
+		`SELECT (progress->>'reported_at')::timestamptz FROM stages WHERE id = $1`, stageID).Scan(&ts); err != nil {
+		t.Fatalf("read stored reported_at: %v", err)
+	}
+	return ts.UTC()
+}
+
+// dbAnchoredHeartbeat returns an instant derived from the stage row's OWN
+// DB-stamped dispatched_at, offset by the caller's (timescale-scaled) delta,
+// so both sides of any comparison against dispatched_at sit in ONE clock domain
+// and the ordering holds BY CONSTRUCTION at any host/container skew (#3048;
+// timescale.D supplies the offset per the AGENTS.md rule).
+//
+// ITS ROLE NARROWED with #3084. The PRODUCTION write is now DB-stamped, so
+// routing an anchored instant through store.RecordStageProgress no longer seeds
+// anything — jsonb_set overwrites it. What remains is two uses: supplying
+// DB-anchored instants to the RAW seeder (seedProgressAt) for the boundary and
+// prior-attempt fixtures, and supplying a deliberately SKEWED caller value to
+// the real store in the skew tests, where the point is precisely that it is
+// discarded.
 //
 // NO TRUNCATION is applied to the anchor, and that is deliberate. Measured
 // inside pgtest's own postgres:16-alpine container: Postgres now() stamps at
@@ -165,16 +181,12 @@ func TestDispatchedAt_NotBumpedByProgressHeartbeat(t *testing.T) {
 	// Force a distinct transaction clock so the updated_at advance is
 	// unambiguous, then heartbeat.
 	time.Sleep(2 * time.Millisecond)
-	// This ReportedAt is deliberately NOT DB-anchored (#3048 leaves it alone).
-	// It is a NON-COMPARATIVE fixture: this test never reads LastHeartbeatAt and
-	// never compares the seeded value against dispatched_at — it asserts only
-	// that updated_at advanced and dispatched_at did not. There is no
-	// cross-clock dependency here, so anchoring it would be churn in code that
-	// was never at risk. A future blanket "no time.Now() in this file" grep
-	// should read this comment rather than "fix" the line.
+	// No ReportedAt is passed: since #3084 the write stamps it in the DATABASE
+	// and any caller value is discarded. This test never reads LastHeartbeatAt
+	// anyway — it asserts only that updated_at advanced and dispatched_at did
+	// not, which the jsonb_set does not touch.
 	applied, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{
-		LastEvent:  "assistant",
-		ReportedAt: time.Now().UTC(),
+		LastEvent: "assistant",
 	})
 	if err != nil {
 		t.Fatalf("RecordStageProgress: %v", err)
@@ -254,16 +266,14 @@ func TestDispatchedAt_RedispatchWithStaleHeartbeatReportsNeverCheckedIn(t *testi
 	r := makeRun(t, repo)
 	s := makeStage(t, repo, r.ID, 0)
 
-	// Attempt 1: dispatch and check in with a heartbeat stamped in the past.
+	// Attempt 1: dispatch and check in NATURALLY — no backdated seed. Since
+	// #3084 the write stamps reported_at from the DATABASE clock, and the
+	// re-dispatch below re-stamps dispatched_at forward from that SAME clock, so
+	// the prior-attempt ordering (heartbeat < second dispatch) holds BY
+	// CONSTRUCTION. The #3048 anchoring this used to need is subsumed: there is
+	// no longer a second clock to anchor against.
 	dispatchStage(t, repo, s.ID)
-	// #3048: DB-anchored, against ATTEMPT 1's stamp — taken BEFORE the
-	// re-dispatch below re-stamps dispatched_at forward, which is exactly the
-	// ordering this test needs (the seed must predate the SECOND stamp, and it
-	// predates the FIRST by a scaled hour). A one-hour margin dwarfs any
-	// plausible skew, but skew is unbounded in principle, so the anchor makes
-	// the stale direction hold by construction rather than by margin.
-	staleHeartbeat := dbAnchoredHeartbeat(t, pool, s.ID, -timescale.D(time.Hour))
-	if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{LastEvent: "assistant", ReportedAt: staleHeartbeat}); err != nil {
+	if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{LastEvent: "assistant"}); err != nil {
 		t.Fatalf("record attempt-1 heartbeat: %v", err)
 	}
 
@@ -294,8 +304,14 @@ func TestDispatchedAt_RedispatchWithStaleHeartbeatReportsNeverCheckedIn(t *testi
 }
 
 // TestListDispatchedStageLiveness_MapsHeartbeatReportedAt: a heartbeat recorded
-// AFTER the current dispatch surfaces as LastHeartbeatAt equal to its
-// ReportedAt, alongside both timestamps and the run id.
+// AFTER the current dispatch surfaces as LastHeartbeatAt, alongside both
+// timestamps and the run id.
+//
+// Since #3084 it can no longer assert equality against a CALLER-supplied value
+// (the DB stamps it), so it asserts against the row's OWN stored reported_at
+// read straight out of the JSONB. That doubles as the round-trip proof that
+// Postgres's to_jsonb(now()) rendering parses back into a Go time.Time without
+// loss — an offset-less rendering would fail the decode and read back nil.
 func TestListDispatchedStageLiveness_MapsHeartbeatReportedAt(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.NewPool(t)
@@ -307,13 +323,14 @@ func TestListDispatchedStageLiveness_MapsHeartbeatReportedAt(t *testing.T) {
 	s := makeStage(t, repo, r.ID, 0)
 	dispatchStage(t, repo, s.ID)
 
-	// #3048: the seed is DB-ANCHORED — derived from this row's own DB-stamped
-	// dispatched_at rather than the host's time.Now() — so the assertion below
-	// no longer depends on host/container clock agreement.
-	reportedAt := dbAnchoredHeartbeat(t, pool, s.ID, timescale.D(time.Second))
-	if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{LastEvent: "tool_use", ReportedAt: reportedAt}); err != nil {
+	if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{LastEvent: "tool_use"}); err != nil {
 		t.Fatalf("record heartbeat: %v", err)
 	}
+	dispatchedAt := rawDispatchedAt(t, pool, s.ID)
+	if dispatchedAt == nil {
+		t.Fatal("dispatched_at nil after dispatch")
+	}
+	stored := rawReportedAt(t, pool, s.ID)
 
 	rows, err := lister.ListDispatchedStageLiveness(ctx)
 	if err != nil {
@@ -323,10 +340,11 @@ func TestListDispatchedStageLiveness_MapsHeartbeatReportedAt(t *testing.T) {
 	if l.LastHeartbeatAt == nil {
 		t.Fatal("LastHeartbeatAt = nil after a fresh heartbeat")
 	}
-	// Doubles as an in-test proof that the stages.progress JSONB round-trip is
-	// lossless: reportedAt carries the row's full microsecond-resolution stamp.
-	if !l.LastHeartbeatAt.Equal(reportedAt) {
-		t.Errorf("LastHeartbeatAt = %v, want %v (the recorded ReportedAt)", l.LastHeartbeatAt, reportedAt)
+	if l.LastHeartbeatAt.Before(*dispatchedAt) {
+		t.Errorf("LastHeartbeatAt = %v is before dispatched_at = %v", l.LastHeartbeatAt, dispatchedAt)
+	}
+	if !l.LastHeartbeatAt.Equal(stored) {
+		t.Errorf("LastHeartbeatAt = %v, want the row's stored reported_at %v (the to_jsonb(now()) rendering must round-trip losslessly)", l.LastHeartbeatAt, stored)
 	}
 	if l.RunID != r.ID {
 		t.Errorf("RunID = %s, want %s", l.RunID, r.ID)
@@ -349,12 +367,16 @@ func TestListDispatchedStageLiveness_MapsHeartbeatReportedAt(t *testing.T) {
 // untested. Offset 0 is only expressible because the round-trip is lossless (see
 // dbAnchoredHeartbeat). Proof of discriminating power is the manual
 // counterfactual recorded in the PR body: weakening the production filter to
-// `hb.After` turns THIS test red while the stale-heartbeat test stays green.
+// `hb.After` turns THIS test red while the prior-attempt tests stay green.
+//
+// SEEDED RAW since #3084. The production write now stamps reported_at from the
+// database, so it can no longer land at EXACTLY the dispatch instant and no
+// caller can ask it to. seedProgressAt writes the row's own dispatched_at into
+// reported_at directly — both sides still DB-clocked, offset still exactly zero.
 func TestListDispatchedStageLiveness_HeartbeatEqualToDispatchIsCurrent(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
-	store := progressStore(t, repo)
 	lister := livenessLister(t, repo)
 
 	r := makeRun(t, repo)
@@ -362,9 +384,7 @@ func TestListDispatchedStageLiveness_HeartbeatEqualToDispatchIsCurrent(t *testin
 	dispatchStage(t, repo, s.ID)
 
 	hb := dbAnchoredHeartbeat(t, pool, s.ID, 0)
-	if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{LastEvent: "tool_use", ReportedAt: hb}); err != nil {
-		t.Fatalf("record equal-instant heartbeat: %v", err)
-	}
+	seedProgressAt(t, pool, s.ID, hb)
 
 	rows, err := lister.ListDispatchedStageLiveness(ctx)
 	if err != nil {
@@ -433,5 +453,149 @@ func TestListDispatchedStageLiveness_UndecodableProgressDegradesToNil(t *testing
 	}
 	if l := livenessFor(t, rows, s.ID); l.LastHeartbeatAt != nil {
 		t.Errorf("LastHeartbeatAt = %v for an undecodable payload, want nil (fail-open read)", l.LastHeartbeatAt)
+	}
+}
+
+// seedProgressAt writes a progress payload with a caller-named reported_at
+// DIRECTLY to the column, bypassing store.RecordStageProgress.
+//
+// It exists because the production write is now DATABASE-stamped (#3084):
+// RecordStageProgress's jsonb_set overwrites reported_at with Postgres now(),
+// so no caller — including a test — can name a heartbeat instant through the
+// domain method any more. That is the point of the change, but two controls in
+// this file NEED to name one (the equal-instant boundary, and a prior-attempt
+// fixture). Both seed through here instead. The instant is written as a
+// timestamptz rendered by to_jsonb, i.e. the same rendering the production
+// UPDATE produces, so the read-side decode under test is the real one.
+func seedProgressAt(t *testing.T, pool *pgxpool.Pool, stageID uuid.UUID, instant time.Time) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE stages
+		    SET progress = jsonb_build_object(
+		          'last_event', 'assistant',
+		          'turns_this_attempt', 0,
+		          'tokens_this_attempt', 0,
+		          'reported_at', to_jsonb($2::timestamptz))
+		  WHERE id = $1`, stageID, instant); err != nil {
+		t.Fatalf("seed progress at %v: %v", instant, err)
+	}
+}
+
+// TestListDispatchedStageLiveness_BackendClockLagDoesNotHideAFreshHeartbeat is
+// the #3084 acceptance criterion: a backend host whose clock LAGS the database
+// must not make a genuinely fresh heartbeat read as absent.
+//
+// The caller stamps an hour BEFORE the row's own dispatch instant — exactly the
+// shape a lagging backend produces at ingest (the magnitude is exaggerated from
+// ordinary NTP skew for determinism; the DIRECTION is the faithful part). With
+// the stamp taken in the DATABASE the caller's value is discarded, so the
+// heartbeat lands at-or-after dispatched_at and the stage classifies
+// wedged_after_checkin rather than never_checked_in.
+//
+// Observed RED against pre-change code (the -1h value persisted verbatim,
+// hb.Before was true, LastHeartbeatAt was nil).
+func TestListDispatchedStageLiveness_BackendClockLagDoesNotHideAFreshHeartbeat(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	store := progressStore(t, repo)
+	lister := livenessLister(t, repo)
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0)
+	dispatchStage(t, repo, s.ID)
+
+	lagging := dbAnchoredHeartbeat(t, pool, s.ID, -timescale.D(time.Hour))
+	if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{
+		LastEvent:  "assistant",
+		ReportedAt: lagging,
+	}); err != nil {
+		t.Fatalf("record heartbeat from a lagging backend clock: %v", err)
+	}
+
+	rows, err := lister.ListDispatchedStageLiveness(ctx)
+	if err != nil {
+		t.Fatalf("ListDispatchedStageLiveness: %v", err)
+	}
+	l := livenessFor(t, rows, s.ID)
+	if l.DispatchedAt == nil {
+		t.Fatal("DispatchedAt = nil after dispatch")
+	}
+	if l.LastHeartbeatAt == nil {
+		t.Fatalf("LastHeartbeatAt = nil for a FRESH heartbeat ingested under a backend clock lagging the database by %v — the process stamp reached the column and the attempt-relative filter discarded a live check-in (never_checked_in reported for a wedged_after_checkin stage)", timescale.D(time.Hour))
+	}
+	if l.LastHeartbeatAt.Before(*l.DispatchedAt) {
+		t.Errorf("LastHeartbeatAt = %v is BEFORE dispatched_at = %v: the heartbeat was not stamped by the database", l.LastHeartbeatAt, l.DispatchedAt)
+	}
+	if !l.LastHeartbeatAt.After(lagging) {
+		t.Errorf("LastHeartbeatAt = %v, want the DATABASE instant (the caller's lagging %v must be discarded)", l.LastHeartbeatAt, lagging)
+	}
+}
+
+// TestListDispatchedStageLiveness_PriorAttemptHeartbeatStaysNeverCheckedInUnderSkewEitherDirection
+// is the anti-blanket-weakening pin for #3084: the fix must NOT be "stop
+// comparing". A heartbeat from a PREVIOUS dispatch attempt must still read as
+// absent after a re-dispatch, under skew in BOTH directions.
+//
+// The backend-AHEAD arm is the load-bearing one: a fix that weakened or removed
+// the attempt-relative comparison would report wedged_after_checkin there, since
+// the caller's +1h value would sit after the re-dispatch stamp. With the DB
+// stamp, the caller's value never reaches the column at all and the heartbeat
+// carries its real (pre-re-dispatch) instant in both arms.
+func TestListDispatchedStageLiveness_PriorAttemptHeartbeatStaysNeverCheckedInUnderSkewEitherDirection(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		offset time.Duration
+	}{
+		{"backend behind the database", -timescale.D(time.Hour)},
+		{"backend ahead of the database", timescale.D(time.Hour)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := pgtest.NewPool(t)
+			repo := run.NewPostgresRepository(pool)
+			store := progressStore(t, repo)
+			lister := livenessLister(t, repo)
+
+			r := makeRun(t, repo)
+			s := makeStage(t, repo, r.ID, 0)
+
+			// Attempt 1: dispatch and check in, with the caller's process clock
+			// skewed by tc.offset relative to the database.
+			dispatchStage(t, repo, s.ID)
+			skewed := dbAnchoredHeartbeat(t, pool, s.ID, tc.offset)
+			if _, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{
+				LastEvent:  "assistant",
+				ReportedAt: skewed,
+			}); err != nil {
+				t.Fatalf("record attempt-1 heartbeat: %v", err)
+			}
+
+			// Attempt 2: re-dispatch WITHOUT a new heartbeat, so the 0072
+			// trigger re-stamps dispatched_at forward past the recorded one.
+			time.Sleep(2 * time.Millisecond)
+			for _, to := range []run.StageState{
+				run.StageStateRunning,
+				run.StageStateAwaitingInput,
+				run.StageStatePending,
+				run.StageStateDispatched,
+			} {
+				if _, err := repo.TransitionStage(ctx, s.ID, to, nil); err != nil {
+					t.Fatalf("transition to %s: %v", to, err)
+				}
+			}
+
+			rows, err := lister.ListDispatchedStageLiveness(ctx)
+			if err != nil {
+				t.Fatalf("ListDispatchedStageLiveness: %v", err)
+			}
+			l := livenessFor(t, rows, s.ID)
+			if l.DispatchedAt == nil {
+				t.Fatal("re-dispatched stage DispatchedAt nil")
+			}
+			if l.LastHeartbeatAt != nil {
+				t.Errorf("LastHeartbeatAt = %v on a fresh un-checked-in attempt (caller skew %v), want nil — a prior-attempt heartbeat must not read as the current attempt's check-in", l.LastHeartbeatAt, tc.offset)
+			}
+		})
 	}
 }

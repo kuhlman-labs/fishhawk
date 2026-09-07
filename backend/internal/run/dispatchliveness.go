@@ -22,6 +22,8 @@ import (
 // degrades to UpdatedAt for that one row. LastHeartbeatAt is nil when the stage
 // has never reported, when its stored payload is undecodable, OR when the
 // stored heartbeat PREDATES the current dispatch — see ListDispatchedStageLiveness.
+// LastHeartbeatAt carries a DATABASE-stamped instant (#3084): RecordStageProgress
+// writes reported_at with Postgres now(), the same clock DispatchedAt comes from.
 type DispatchedStageLiveness struct {
 	StageID         uuid.UUID
 	RunID           uuid.UUID
@@ -62,6 +64,21 @@ var _ DispatchLivenessLister = (*postgresRepo)(nil)
 // (legacy row on the updated_at fallback) skips the comparison and trusts the
 // decoded heartbeat as-is. A nil/undecodable/zero payload yields nil, the same
 // fail-open-on-READ posture progress.go documents.
+//
+// SINGLE CLOCK DOMAIN (#3084). Both operands are stamped by POSTGRES: dispatched_at
+// by migration 0072's transition-keyed trigger, reported_at by
+// RecordStageProgress's jsonb_set(now()). The comparison is therefore correct BY
+// CONSTRUCTION and needs NO skew tolerance — and deliberately has none. A
+// tolerance band would have to pick an arbitrary bound, would still misclassify
+// silently once real skew exceeded it, and would trade this change's sharp
+// failure for a quiet one. It previously spanned two domains (the backend
+// process's ingest clock against the DB's dispatch stamp), so host lag could
+// swap never_checked_in and wedged_after_checkin; that dependency is gone.
+//
+// ONE LEGACY EXPOSURE remains, stated rather than papered over: a heartbeat row
+// PERSISTED BEFORE that change still carries a backend-clock reported_at and so
+// stays skew-exposed until the stage's next (~15s) heartbeat overwrites it. No
+// backfill is warranted for a value with a 15-second half-life.
 func (r *postgresRepo) ListDispatchedStageLiveness(ctx context.Context) ([]DispatchedStageLiveness, error) {
 	q := rundb.New(r.pool)
 	rows, err := q.ListDispatchedStageLiveness(ctx)

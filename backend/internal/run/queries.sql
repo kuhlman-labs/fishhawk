@@ -289,11 +289,34 @@ RETURNING *;
 -- 'superseded' (#3083) is part of that terminal set: a stage a merge made
 -- unreachable has settled, so a late heartbeat must be refused exactly like one
 -- against a succeeded stage rather than silently mutating a terminal row. This
--- .sql is the AUTHORITY for the predicate; the generated constant in
--- db/queries.sql.go carries a hand-mirrored copy (see the preserve-on-
--- regeneration note there) and the two MUST match.
+-- .sql is the AUTHORITY for both the predicate AND the jsonb_set expression
+-- below; the generated constant in db/queries.sql.go carries a hand-mirrored
+-- copy (see the preserve-on-regeneration note there) and the two MUST match.
+--
+-- reported_at is stamped by the DATABASE, not by the backend process (#3084):
+-- the jsonb_set below OVERWRITES whatever reported_at the caller marshalled
+-- into $2. That puts it in the SAME clock domain as stages.dispatched_at (also
+-- Postgres now(), via migration 0072's transition-keyed trigger), which is what
+-- makes ListDispatchedStageLiveness's attempt-relative hb.Before(dispatched_at)
+-- comparison single-domain and correct BY CONSTRUCTION — no skew tolerance
+-- band, so no arbitrary bound beyond which the classification degrades.
+--
+-- The `to_jsonb(now())` SPELLING IS LOAD-BEARING. Measured in postgres:16-alpine
+-- (the image pgtest uses): to_jsonb(now()) renders ISO-8601 WITH an offset
+-- ("2026-09-07T15:57:09.858512+00:00"), which Go's time.Time RFC3339 unmarshal
+-- accepts and .UTC() normalises regardless of session TimeZone (under
+-- TimeZone=America/New_York it renders "...-04:00" and still parses). But
+-- to_jsonb(now() AT TIME ZONE 'UTC') renders WITHOUT an offset
+-- ("2026-09-07T15:57:20.770743"), which RFC3339 REJECTS — every heartbeat would
+-- become an undecodable payload the fail-open read degrades to nil. Do NOT
+-- substitute the AT TIME ZONE spelling as a "normalisation" cleanup;
+-- TestRecordStageProgress_ReportedAtIsDatabaseStamped is the guard.
+--
+-- now() rather than clock_timestamp() for symmetry with the 0072 trigger, which
+-- also uses now(); heartbeat ingest is a single-statement transaction, so the
+-- two are equivalent here.
 UPDATE stages
-   SET progress = $2
+   SET progress = jsonb_set($2::jsonb, '{reported_at}', to_jsonb(now()))
  WHERE id = $1
    AND state NOT IN ('succeeded', 'failed', 'cancelled', 'superseded');
 
