@@ -1570,6 +1570,8 @@ _tls_up() {
 
   print "TLS front end up (pid ${proxy_pid}) — $(_tls_healthz_url)"
   print "  export NODE_EXTRA_CA_CERTS=$(_tls_ca_file)"
+  print "  not sufficient for FIRST-TIME MCP OAuth (Bun/BoringSSL, upstream claude-code#55760) —"
+  print "  see docs/local-tls.md for the one-time bootstrap and the tunnel alternative"
   print "  see docs/local-tls.md for the AS config recipe and the audience-port foot-gun"
   return 0
 }
