@@ -185,16 +185,22 @@ type acceptanceVerdict struct {
 // An oversize keyed or legacy verdict returns a wrapped non-nil error — NOT
 // errAcceptanceVerdictMissing, since the verdict is present-but-oversize, and
 // conflating the two would let the stage report the wrong failure — and emits
-// the named acceptance_verdict_oversize event through warn. DEVIATION, called
-// out deliberately: unlike the six other sidecar loaders this does NOT remove
-// the oversize file. captureAcceptanceVerdict has never removed on read;
-// removal is owned by the pre-invoke sweepStaleAcceptanceVerdict, which fails
-// the stage category-C when it cannot unlink. This stage's oversize verdict is
-// therefore NOT removed here and NOT removed by this stage at all — it survives
-// on disk until the NEXT acceptance stage's pre-invoke sweep clears it. Folding
-// a removal in here would move that ownership and could mask a sweep failure,
-// so the issue's sidecar-removed requirement is satisfied for this site by the
-// pre-existing sweep, not at read time.
+// the named acceptance_verdict_oversize event through warn. Both oversize
+// branches also REMOVE the offending file, with the CHECKED-removal shape the
+// rest of the sidecar family adopted in the #3106 fix-up (E64.36 / #3142): the
+// os.Remove result is captured and, when it fails, a named
+// acceptance_verdict_unremovable event is emitted BESIDE the oversize event —
+// never instead of it, since an over-ceiling path and an unremovable path are
+// two distinct facts an operator needs both of. Removal here does NOT conflict
+// with sweepStaleAcceptanceVerdict's ownership: the sweep runs PRE-invoke
+// (main.go, before the agent spawns) and its unlink-failure verdict already
+// failed the stage category-C by the time this post-invoke capture runs, so a
+// removal here cannot mask a sweep failure. Removing an oversize LEGACY verdict
+// is the same fixed-path clearing that pre-invoke sweep already performs, so it
+// introduces no new concurrent-run hazard — and the file it clears is already
+// over the ceiling and therefore unreadable by any consumer. Only the
+// fail-closed oversize branches gain this side effect: the successful-read,
+// empty-file, not-exist and generic-read-error paths are unchanged readers.
 func captureAcceptanceVerdict(res agent.Result, keyedPath, legacyPath string, warn func(event, detail string)) ([]byte, error) {
 	if len(res.StructuredOutput) > 0 {
 		return res.StructuredOutput, nil
@@ -202,9 +208,17 @@ func captureAcceptanceVerdict(res agent.Result, keyedPath, legacyPath string, wa
 	b, err := readSidecarBounded(keyedPath)
 	if err != nil {
 		if errors.Is(err, errSidecarTooLarge) {
+			// Removal is CHECKED: a readable-but-unremovable oversize verdict
+			// would otherwise survive silently, so a failed removal gets its own
+			// acceptance_verdict_unremovable event BESIDE the oversize one.
+			rmErr := os.Remove(keyedPath)
 			if warn != nil {
 				warn("acceptance_verdict_oversize",
 					"keyed verdict exceeds size ceiling: "+keyedPath)
+				if rmErr != nil {
+					warn("acceptance_verdict_unremovable",
+						"keyed verdict removal failed: "+keyedPath+": "+rmErr.Error())
+				}
 			}
 			return nil, fmt.Errorf("acceptance verdict keyed oversize: %w", err)
 		}
@@ -215,9 +229,16 @@ func captureAcceptanceVerdict(res agent.Result, keyedPath, legacyPath string, wa
 		lb, lerr := readSidecarBounded(legacyPath)
 		if lerr != nil {
 			if errors.Is(lerr, errSidecarTooLarge) {
+				// Distinct removal site from the keyed branch above, same
+				// checked-removal shape naming the LEGACY path.
+				rmErr := os.Remove(legacyPath)
 				if warn != nil {
 					warn("acceptance_verdict_oversize",
 						"legacy verdict exceeds size ceiling: "+legacyPath)
+					if rmErr != nil {
+						warn("acceptance_verdict_unremovable",
+							"legacy verdict removal failed: "+legacyPath+": "+rmErr.Error())
+					}
 				}
 				return nil, fmt.Errorf("acceptance verdict legacy oversize: %w", lerr)
 			}
