@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/cli/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/credstore"
@@ -49,6 +50,13 @@ var doctorRunOutput = func(name string, arg ...string) (string, error) {
 // doctorHTTPDo / doctorLookPath / doctorRunOutput seam pattern.
 var doctorCredLoad = credstore.Load
 
+// doctorCredRefresh is the refresh seam for doctor's credential ladder
+// (#2393): production runs credstore's locked load → refresh → store
+// sequence; tests swap it.
+var doctorCredRefresh = func(backendURL string) (credstore.Credential, error) {
+	return credRefresh(backendURL)
+}
+
 // doctorExecutable is the os.Executable seam for the runner sibling rung.
 // Tests swap it to point at a directory whose fishhawk-runner sibling they
 // control; production delegates to os.Executable.
@@ -61,6 +69,12 @@ type doctorCredential struct {
 	token  string
 	source string // where it came from, for the rung detail
 	class  string // display class by prefix
+	// resolveErr is set when a stored credential was found but could
+	// not be made usable — a failed refresh, or an expired credential
+	// with nothing to refresh with. Doctor is the diagnostic surface, so
+	// this is surfaced as a FAIL on the token rung naming the login
+	// command, never degraded to "no credential" (binding condition 1).
+	resolveErr error
 }
 
 // classifyCredential names a credential class by its prefix, for display.
@@ -84,6 +98,12 @@ func classifyCredential(token string) string {
 // minted by `fishhawk token login` and keyed by the backend URL. Returns a
 // zero doctorCredential (empty token) when no tier resolves one — the token
 // rung degrades that to a warn, never a hard fail.
+//
+// A refreshable stored credential inside its derived skew is refreshed
+// first (doctorCredRefresh) and the source detail says so, so the
+// operator can see a rotation happened. A refresh failure, or an
+// expired credential that cannot be refreshed, is carried as
+// resolveErr and reported on the token rung — visible, not silent.
 func resolveDoctorCredential(backendURL, flagToken string) doctorCredential {
 	if flagToken != "" {
 		return doctorCredential{
@@ -92,14 +112,28 @@ func resolveDoctorCredential(backendURL, flagToken string) doctorCredential {
 			class:  classifyCredential(flagToken),
 		}
 	}
-	if cred, err := doctorCredLoad(backendURL); err == nil && cred.Token != "" {
-		return doctorCredential{
-			token:  cred.Token,
-			source: "stored credential (fishhawk token login)",
-			class:  classifyCredential(cred.Token),
-		}
+	cred, err := doctorCredLoad(backendURL)
+	if err != nil || cred.Token == "" {
+		return doctorCredential{}
 	}
-	return doctorCredential{}
+	now := time.Now()
+	source := "stored credential (fishhawk token login)"
+	if credstore.NeedsRefresh(cred, now) {
+		fresh, err := doctorCredRefresh(backendURL)
+		if err != nil {
+			return doctorCredential{resolveErr: fmt.Errorf("the stored Fishhawk credential for %s could not be refreshed (%v): re-run `fishhawk token login --backend-url %s`", backendURL, err, backendURL)}
+		}
+		cred = fresh
+		source = "stored credential (refreshed at " + cred.TokenEndpoint + ")"
+	}
+	if cred.Expired(now) {
+		return doctorCredential{resolveErr: fmt.Errorf("the stored Fishhawk credential for %s expired at %s and cannot be refreshed: re-run `fishhawk token login --backend-url %s`", backendURL, cred.ExpiresAt.Format(time.RFC3339), backendURL)}
+	}
+	return doctorCredential{
+		token:  cred.Token,
+		source: source,
+		class:  classifyCredential(cred.Token),
+	}
 }
 
 // readinessOutcome carries the authoritative server-side readiness verdict
@@ -364,6 +398,13 @@ func checkBackend(backendURL string) checkResult {
 //	    legitimately 403 on /v0/runs while being fully adequate per readiness.
 func checkToken(backendURL string, cred doctorCredential, readiness readinessOutcome) checkResult {
 	label := "token valid"
+	// (e) a stored credential that could not be made usable (refresh
+	// failed, or expired with nothing to refresh with) -> FAIL naming
+	// the login command; never downgraded to the no-credential warn.
+	if cred.resolveErr != nil {
+		return checkResult{label: label, detail: cred.resolveErr.Error(), status: "fail",
+			remediate: "re-run `fishhawk token login --backend-url " + backendURL + "`"}
+	}
 	if cred.token == "" {
 		return checkResult{label: label, detail: "no CLI credential configured", status: "warn",
 			remediate: "run `fishhawk token login`, or set --token / $FISHHAWK_TOKEN; " +

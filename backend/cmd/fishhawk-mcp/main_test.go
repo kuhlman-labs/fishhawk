@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,18 @@ func noCred(t *testing.T) func(string) (credstore.Credential, error) {
 	t.Helper()
 	return func(string) (credstore.Credential, error) {
 		t.Fatalf("loadCred must not be called when FISHHAWK_API_TOKEN is set")
+		return credstore.Credential{}, nil
+	}
+}
+
+// noRefresh is a refreshCred seam that must never be called — used by
+// every test whose credential is outside its refresh skew (or not
+// refreshable at all) to prove the ladder never dials a token endpoint
+// it has no business dialing.
+func noRefresh(t *testing.T) func(string) (credstore.Credential, error) {
+	t.Helper()
+	return func(string) (credstore.Credential, error) {
+		t.Fatalf("refreshCred must not be called for a credential outside its refresh skew")
 		return credstore.Credential{}, nil
 	}
 }
@@ -71,7 +85,7 @@ func TestLoadConfig_HappyPath(t *testing.T) {
 		"FISHHAWK_BACKEND_URL": "https://app.fishhawk.example.com",
 		"FISHHAWK_API_TOKEN":   "tok_abc123",
 	}
-	cfg, err := loadConfig(envFunc(env), noCred(t))
+	cfg, err := loadConfig(envFunc(env), noCred(t), noRefresh(t))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
@@ -89,7 +103,7 @@ func TestLoadConfig_BackendURLDefaultsToLocalhost(t *testing.T) {
 	env := map[string]string{
 		"FISHHAWK_API_TOKEN": "tok",
 	}
-	cfg, err := loadConfig(envFunc(env), noCred(t))
+	cfg, err := loadConfig(envFunc(env), noCred(t), noRefresh(t))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
@@ -107,7 +121,7 @@ func TestLoadConfig_BackendURLTrailingSlashStripped(t *testing.T) {
 		"FISHHAWK_BACKEND_URL": "https://app.fishhawk.example.com/",
 		"FISHHAWK_API_TOKEN":   "tok",
 	}
-	cfg, err := loadConfig(envFunc(env), noCred(t))
+	cfg, err := loadConfig(envFunc(env), noCred(t), noRefresh(t))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
@@ -125,7 +139,7 @@ func TestLoadConfig_EnvTokenWins_StoreUntouched(t *testing.T) {
 		"FISHHAWK_BACKEND_URL": "http://localhost:8080",
 		"FISHHAWK_API_TOKEN":   "tok_env",
 	}
-	cfg, err := loadConfig(envFunc(env), noCred(t))
+	cfg, err := loadConfig(envFunc(env), noCred(t), noRefresh(t))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
@@ -137,7 +151,7 @@ func TestLoadConfig_EnvTokenWins_StoreUntouched(t *testing.T) {
 // M2: env empty → the credential stored for the backend URL is used.
 func TestLoadConfig_StoreHitResolvesToken(t *testing.T) {
 	env := map[string]string{"FISHHAWK_BACKEND_URL": "http://localhost:8080"}
-	cfg, err := loadConfig(envFunc(env), credFunc(credstore.Credential{Token: "fhk_stored"}, nil))
+	cfg, err := loadConfig(envFunc(env), credFunc(credstore.Credential{Token: "fhk_stored"}, nil), noRefresh(t))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
@@ -157,7 +171,7 @@ func TestLoadConfig_StoreLookupUsesNormalizedURL(t *testing.T) {
 		gotURL = u
 		return credstore.Credential{Token: "fhk_norm"}, nil
 	}
-	cfg, err := loadConfig(envFunc(env), loadCred)
+	cfg, err := loadConfig(envFunc(env), loadCred, noRefresh(t))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
@@ -194,7 +208,7 @@ func ladderEnv() map[string]string {
 // M3: no credential stored → a fail-closed error carrying a substring
 // UNIQUE to the not-found branch.
 func TestLoadConfig_NotFound(t *testing.T) {
-	_, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{}, credstore.ErrNotFound))
+	_, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{}, credstore.ErrNotFound), noRefresh(t))
 	assertRemediation(t, err, ladderURL)
 	if !strings.Contains(err.Error(), "no Fishhawk credential stored") {
 		t.Errorf("not-found error missing its unique substring; got %q", err.Error())
@@ -205,7 +219,7 @@ func TestLoadConfig_NotFound(t *testing.T) {
 // with a substring UNIQUE to the empty-token branch, never a config
 // carrying an empty bearer.
 func TestLoadConfig_EmptyStoredToken(t *testing.T) {
-	cfg, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: ""}, nil))
+	cfg, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: ""}, nil), noRefresh(t))
 	assertRemediation(t, err, ladderURL)
 	if !strings.Contains(err.Error(), "empty token") {
 		t.Errorf("empty-token error missing its unique substring; got %q", err.Error())
@@ -219,8 +233,8 @@ func TestLoadConfig_EmptyStoredToken(t *testing.T) {
 // provably DISTINCT — a suite that would still pass if the empty-token
 // branch reused the not-found wording does not satisfy the condition.
 func TestLoadConfig_NotFoundAndEmptyTokenErrorsDiffer(t *testing.T) {
-	_, notFound := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{}, credstore.ErrNotFound))
-	_, empty := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: ""}, nil))
+	_, notFound := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{}, credstore.ErrNotFound), noRefresh(t))
+	_, empty := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: ""}, nil), noRefresh(t))
 	if notFound == nil || empty == nil {
 		t.Fatalf("both branches must error: notFound=%v empty=%v", notFound, empty)
 	}
@@ -233,7 +247,7 @@ func TestLoadConfig_NotFoundAndEmptyTokenErrorsDiffer(t *testing.T) {
 // UNIQUE to the expiry branch, naming the expiry.
 func TestLoadConfig_ExpiredCredential(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
-	_, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: "fhk_old", ExpiresAt: &past}, nil))
+	_, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: "fhk_old", ExpiresAt: &past}, nil), noRefresh(t))
 	assertRemediation(t, err, ladderURL)
 	if !strings.Contains(err.Error(), "expired at") {
 		t.Errorf("expired error missing its unique substring; got %q", err.Error())
@@ -244,7 +258,7 @@ func TestLoadConfig_ExpiredCredential(t *testing.T) {
 // expire) and MUST be accepted — reading nil as expired would refuse
 // every field credential.
 func TestLoadConfig_NilExpiryAccepted(t *testing.T) {
-	cfg, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: "fhk_live", ExpiresAt: nil}, nil))
+	cfg, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: "fhk_live", ExpiresAt: nil}, nil), noRefresh(t))
 	if err != nil {
 		t.Fatalf("nil expiry must be accepted as non-expiring, got %v", err)
 	}
@@ -256,7 +270,7 @@ func TestLoadConfig_NilExpiryAccepted(t *testing.T) {
 // A future expiry is also accepted — only a past, non-nil expiry fails.
 func TestLoadConfig_FutureExpiryAccepted(t *testing.T) {
 	future := time.Now().Add(time.Hour)
-	cfg, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: "fhk_future", ExpiresAt: &future}, nil))
+	cfg, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: "fhk_future", ExpiresAt: &future}, nil), noRefresh(t))
 	if err != nil {
 		t.Fatalf("future expiry must be accepted, got %v", err)
 	}
@@ -271,7 +285,7 @@ func TestLoadConfig_FutureExpiryAccepted(t *testing.T) {
 // silently re-read as "no credential".
 func TestLoadConfig_CorruptStore(t *testing.T) {
 	parseErr := errors.New("credstore: parse /home/x/.config/fishhawk/credentials: unexpected end of JSON input")
-	_, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{}, parseErr))
+	_, err := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{}, parseErr), noRefresh(t))
 	assertRemediation(t, err, ladderURL)
 	if !strings.Contains(err.Error(), "cannot read the Fishhawk credential store") {
 		t.Errorf("corrupt-store error missing its unique substring; got %q", err.Error())
@@ -311,7 +325,7 @@ func TestLoadConfig_StoredCredentialReachesAPIClient(t *testing.T) {
 		}
 		return ""
 	}
-	cfg, err := loadConfig(getenv, credstore.Load)
+	cfg, err := loadConfig(getenv, credstore.Load, noRefresh(t))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
@@ -353,5 +367,201 @@ func TestMcpServerConfig(t *testing.T) {
 	}
 	if stdioCfg.BackendURL != "http://127.0.0.1:9090" || stdioCfg.APIToken != "fhk_y" {
 		t.Errorf("stdio branch: passthrough wrong: %+v", stdioCfg)
+	}
+}
+
+// --- proactive refresh (#2393 / ADR-076) ------------------------------------
+
+// expiringRefreshable builds a credential 90s from expiry on a 15m
+// lifetime — inside the derived 2m skew — carrying everything a refresh
+// needs, keyed to the given token endpoint.
+func expiringRefreshable(tokenEndpoint string) credstore.Credential {
+	now := time.Now()
+	issued := now.Add(-13*time.Minute - 30*time.Second)
+	exp := issued.Add(15 * time.Minute)
+	return credstore.Credential{
+		Token:         "fho_stale",
+		RefreshToken:  "fhr_seed",
+		ClientID:      "fishhawk-cli",
+		TokenEndpoint: tokenEndpoint,
+		IssuedAt:      &issued,
+		ExpiresAt:     &exp,
+	}
+}
+
+// TestLoadConfigRefreshesExpiringCredential drives the ladder through
+// the loadCred/refreshCred seams: a credential inside its skew is
+// refreshed, and the RESOLVED apiToken is the refreshed one, never the
+// stale bearer.
+func TestLoadConfigRefreshesExpiringCredential(t *testing.T) {
+	stale := expiringRefreshable("http://localhost:8080/v0/oauth/token")
+	var refreshedURL string
+	refresh := func(u string) (credstore.Credential, error) {
+		refreshedURL = u
+		fresh := stale
+		fresh.Token = "fho_fresh"
+		fresh.RefreshToken = "fhr_rotated"
+		exp := time.Now().Add(15 * time.Minute)
+		fresh.ExpiresAt = &exp
+		return fresh, nil
+	}
+	cfg, err := loadConfig(envFunc(ladderEnv()), credFunc(stale, nil), refresh)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.apiToken != "fho_fresh" {
+		t.Fatalf("apiToken = %q, want the REFRESHED fho_fresh, not the stale bearer", cfg.apiToken)
+	}
+	if refreshedURL != ladderURL {
+		t.Errorf("refreshCred called with %q, want the normalized backend key %q", refreshedURL, ladderURL)
+	}
+}
+
+// A credential OUTSIDE its skew is used as-is and refreshCred is never
+// called (noRefresh t.Fatals) — the control against a ladder that
+// refreshes on every start and burns rotations.
+func TestLoadConfigOutsideSkewDoesNotRefresh(t *testing.T) {
+	c := expiringRefreshable("http://localhost:8080/v0/oauth/token")
+	issued := time.Now().Add(-5 * time.Minute)
+	exp := issued.Add(15 * time.Minute) // 10m left, well outside the 2m skew
+	c.IssuedAt, c.ExpiresAt = &issued, &exp
+	cfg, err := loadConfig(envFunc(ladderEnv()), credFunc(c, nil), noRefresh(t))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.apiToken != "fho_stale" {
+		t.Errorf("apiToken = %q, want the still-valid stored token", cfg.apiToken)
+	}
+}
+
+// An EXPIRED but refreshable credential is refreshed, not refused: the
+// refresh token outlives the access token, so the pre-#2393 hard fail
+// on rung 3c must not fire ahead of the refresh.
+func TestLoadConfigExpiredRefreshableIsRefreshedNotRefused(t *testing.T) {
+	c := expiringRefreshable("http://localhost:8080/v0/oauth/token")
+	issued := time.Now().Add(-time.Hour)
+	exp := issued.Add(15 * time.Minute)
+	c.IssuedAt, c.ExpiresAt = &issued, &exp
+	refresh := func(string) (credstore.Credential, error) {
+		fresh := c
+		fresh.Token = "fho_after_expiry"
+		e := time.Now().Add(15 * time.Minute)
+		fresh.ExpiresAt = &e
+		return fresh, nil
+	}
+	cfg, err := loadConfig(envFunc(ladderEnv()), credFunc(c, nil), refresh)
+	if err != nil {
+		t.Fatalf("an expired refreshable credential must be refreshed, got %v", err)
+	}
+	if cfg.apiToken != "fho_after_expiry" {
+		t.Errorf("apiToken = %q, want fho_after_expiry", cfg.apiToken)
+	}
+}
+
+// TestLoadConfigRefreshFailureNamesLogin: a failed refresh is FATAL
+// (binding condition 1) — a distinct actionable error naming the login
+// command and the backend URL, and NEVER the stale bearer. The wording
+// is asserted distinct from every other rung's so no two collapse.
+func TestLoadConfigRefreshFailureNamesLogin(t *testing.T) {
+	stale := expiringRefreshable("http://localhost:8080/v0/oauth/token")
+	refuse := func(string) (credstore.Credential, error) {
+		return credstore.Credential{}, &credstore.RefreshError{StatusCode: 400, Code: "invalid_grant", Description: "refresh token revoked"}
+	}
+	cfg, err := loadConfig(envFunc(ladderEnv()), credFunc(stale, nil), refuse)
+	assertRemediation(t, err, ladderURL)
+	if cfg.apiToken != "" {
+		t.Fatalf("a failed refresh must not resolve a token; got %q", cfg.apiToken)
+	}
+	if !strings.Contains(err.Error(), "could not be refreshed") {
+		t.Errorf("refresh-failure error missing its unique substring; got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "invalid_grant") {
+		t.Errorf("refresh-failure error should carry the AS's error code; got %q", err.Error())
+	}
+
+	// Distinctness against every sibling rung.
+	_, notFound := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{}, credstore.ErrNotFound), noRefresh(t))
+	_, empty := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: ""}, nil), noRefresh(t))
+	past := time.Now().Add(-time.Hour)
+	_, expired := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{Token: "fhk_old", ExpiresAt: &past}, nil), noRefresh(t))
+	_, corrupt := loadConfig(envFunc(ladderEnv()), credFunc(credstore.Credential{}, errors.New("credstore: parse x: bad")), noRefresh(t))
+	for name, other := range map[string]error{"not-found": notFound, "empty-token": empty, "expired": expired, "corrupt": corrupt} {
+		if other == nil {
+			t.Fatalf("%s rung must error", name)
+		}
+		if other.Error() == err.Error() {
+			t.Errorf("refresh-failure wording collapses into the %s rung: %q", name, err.Error())
+		}
+		if strings.Contains(other.Error(), "could not be refreshed") {
+			t.Errorf("%s rung must not claim a refresh was attempted: %q", name, other.Error())
+		}
+	}
+}
+
+// A refresh that returns an empty token is refused like any empty bearer.
+func TestLoadConfigRefreshedEmptyTokenRefused(t *testing.T) {
+	stale := expiringRefreshable("http://localhost:8080/v0/oauth/token")
+	empty := func(string) (credstore.Credential, error) { return credstore.Credential{}, nil }
+	cfg, err := loadConfig(envFunc(ladderEnv()), credFunc(stale, nil), empty)
+	assertRemediation(t, err, ladderURL)
+	if cfg.apiToken != "" {
+		t.Fatalf("an empty refreshed token must not resolve; got %q", cfg.apiToken)
+	}
+	if !strings.Contains(err.Error(), "refreshed Fishhawk credential") || !strings.Contains(err.Error(), "empty token") {
+		t.Errorf("empty-refreshed-token error missing its unique wording; got %q", err.Error())
+	}
+}
+
+// TestLoadConfigPersistsRotatedRefreshToken crosses the module seam with
+// the REAL credstore and the PRODUCTION refresh seam against an httptest
+// token endpoint: after loadConfig returns, the store on disk carries
+// the ROTATED refresh token (committed state, read back), and the
+// resolved token is the new access token. Deleting the persist step in
+// credstore leaves the OLD refresh token on disk → RED.
+func TestLoadConfigPersistsRotatedRefreshToken(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	as := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.Header.Get("Authorization") != "" || r.PostForm.Get("client_secret") != "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid_client"}`))
+			return
+		}
+		if r.PostForm.Get("grant_type") != "refresh_token" || r.PostForm.Get("refresh_token") != "fhr_seed" || r.PostForm.Get("client_id") != "fishhawk-cli" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"fho_rotated","token_type":"Bearer","expires_in":900,"refresh_token":"fhr_rotated"}`))
+	}))
+	t.Cleanup(as.Close)
+
+	const url = "http://localhost:8080"
+	if err := credstore.Store(url, expiringRefreshable(as.URL+"/v0/oauth/token")); err != nil {
+		t.Fatalf("credstore.Store: %v", err)
+	}
+	getenv := func(k string) string {
+		if k == "FISHHAWK_BACKEND_URL" {
+			return url
+		}
+		return ""
+	}
+	cfg, err := loadConfig(getenv, credstore.Load, refreshStoredCredential)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.apiToken != "fho_rotated" {
+		t.Fatalf("cfg.apiToken = %q, want fho_rotated", cfg.apiToken)
+	}
+	stored, err := credstore.Load(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.RefreshToken != "fhr_rotated" {
+		t.Fatalf("stored RefreshToken = %q, want the ROTATED fhr_rotated (an unpersisted rotation is burned)", stored.RefreshToken)
+	}
+	if stored.Token != "fho_rotated" {
+		t.Errorf("stored Token = %q, want fho_rotated", stored.Token)
 	}
 }

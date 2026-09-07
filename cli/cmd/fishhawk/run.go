@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -71,6 +72,23 @@ func bindCommonFlags(fs *flag.FlagSet) commonFlags {
 	}
 }
 
+// credLoad / credRefresh are the credstore seams for newClient's
+// ladder. Tests swap them; production delegates to credstore.Load and
+// to credstore's locked load → RFC 6749 §6 refresh → store sequence
+// (#2393). Matches doctor.go's doctorCredLoad pattern.
+var (
+	credLoad    = credstore.Load
+	credRefresh = func(backendURL string) (credstore.Credential, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), credRefreshTimeout)
+		defer cancel()
+		return credstore.RefreshStored(ctx, &http.Client{Timeout: credRefreshTimeout}, backendURL)
+	}
+)
+
+// credRefreshTimeout bounds the refresh round-trip so an unreachable
+// token endpoint fails the verb promptly.
+const credRefreshTimeout = 30 * time.Second
+
 // newClient builds the API client, resolving the bearer token across
 // tiers: an explicit --token / FISHHAWK_TOKEN (already folded into
 // *cf.token by bindCommonFlags) ALWAYS wins; when that is empty the
@@ -79,16 +97,62 @@ func bindCommonFlags(fs *flag.FlagSet) commonFlags {
 // degrades silently to an empty token (dev backends with stubbed
 // auth still work). We resolve the token here rather than in
 // httpclient so the fallback lives in one seam.
+//
+// A stored credential that is refreshable and inside its derived skew
+// (credstore.NeedsRefresh) is refreshed first and the rotation
+// persisted (credRefresh). A refresh that FAILS, or a stored credential
+// that is expired with nothing to refresh with, is FATAL for the verb
+// (binding condition 1): rather than degrading to an unauthenticated
+// or stale-bearer client, the returned client's transport refuses every
+// request with the actionable `fishhawk token login` error, so the
+// caller's ordinary error path prints it and no request ever reaches
+// the backend. newClient keeps its no-error signature because 25 call
+// sites consume it; the refusal rides on the client instead.
 func newClient(cf commonFlags) *httpclient.Client {
 	token := *cf.token
+	var resolveErr error
 	if token == "" {
-		if cred, err := credstore.Load(*cf.backendURL); err == nil {
-			token = cred.Token
-		}
+		token, resolveErr = resolveStoredToken(*cf.backendURL, time.Now())
 	}
 	c := httpclient.New(*cf.backendURL, token)
 	c.HTTP.Timeout = *cf.timeout
+	if resolveErr != nil {
+		c.HTTP.Transport = credentialRefusal{err: resolveErr}
+	}
 	return c
+}
+
+// resolveStoredToken is the credstore rung of newClient's ladder. A
+// missing or unreadable store is ("", nil) — the pre-existing silent
+// degrade for dev backends. A refreshable credential inside its skew
+// is refreshed via credRefresh and the NEW token returned; a refresh
+// failure, or an expired credential that cannot be refreshed, returns
+// the actionable login error and never the stale token.
+func resolveStoredToken(backendURL string, now time.Time) (string, error) {
+	cred, err := credLoad(backendURL)
+	if err != nil {
+		return "", nil //nolint:nilerr // missing/unreadable store degrades silently by design
+	}
+	if credstore.NeedsRefresh(cred, now) {
+		fresh, err := credRefresh(backendURL)
+		if err != nil {
+			return "", fmt.Errorf("the stored Fishhawk credential for %s could not be refreshed (%v): re-run `fishhawk token login --backend-url %s`", backendURL, err, backendURL)
+		}
+		cred = fresh
+	}
+	if cred.Expired(now) {
+		return "", fmt.Errorf("the stored Fishhawk credential for %s expired at %s and cannot be refreshed: re-run `fishhawk token login --backend-url %s`", backendURL, cred.ExpiresAt.Format(time.RFC3339), backendURL)
+	}
+	return cred.Token, nil
+}
+
+// credentialRefusal is the RoundTripper newClient installs when the
+// credential ladder failed: every request fails with the ladder's
+// actionable error before any connection is dialed.
+type credentialRefusal struct{ err error }
+
+func (r credentialRefusal) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, r.err
 }
 
 // runStart implements `fishhawk run start`.
