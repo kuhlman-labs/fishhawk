@@ -1295,11 +1295,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		if trigger.RevisionConstraint != nil {
 			trigger.RevisionBasePlan = s.loadRevisionBasePlan(r.Context(), runRow.ID)
 		}
-		// Scope carry-forward + restoration (#2516): the revision base rides
-		// above as raw JSON TRUNCATED at 4000 bytes, so on a large plan the
-		// planner cannot see the scope it is told to preserve. Thread the
-		// ENUMERATED carry-forward path set (and, after a refusal, the
-		// dropped-path restoration notice) as their own channels. Best-effort:
+		// Scope carry-forward + restoration (#2516): thread the ENUMERATED
+		// carry-forward path set (and, after a refusal, the dropped-path
+		// restoration notice) as their own channels. The revision base above
+		// now rides WHOLE under prompt.MaxRevisionBasePlanBytes and, above that
+		// cap, as a step-complete digest (#3087) — it is no longer cut at 4000
+		// bytes. This list is authoritative for an INDEPENDENT reason, not as a
+		// workaround for a truncated blob: it is derived from the newest
+		// plan_scope_retry entry, which on a corrective re-dispatch is NOT the
+		// newest plan artifact. Best-effort:
 		// both stay nil when nothing is recorded, keeping first-pass plan
 		// prompts byte-unchanged. Set on BOTH prompt handlers so the signed
 		// prompt and the render preview stay byte-identical.
@@ -1903,11 +1907,15 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		if trigger.RevisionConstraint != nil {
 			trigger.RevisionBasePlan = s.loadRevisionBasePlan(r.Context(), runRow.ID)
 		}
-		// Scope carry-forward + restoration (#2516): the revision base rides
-		// above as raw JSON TRUNCATED at 4000 bytes, so on a large plan the
-		// planner cannot see the scope it is told to preserve. Thread the
-		// ENUMERATED carry-forward path set (and, after a refusal, the
-		// dropped-path restoration notice) as their own channels. Best-effort:
+		// Scope carry-forward + restoration (#2516): thread the ENUMERATED
+		// carry-forward path set (and, after a refusal, the dropped-path
+		// restoration notice) as their own channels. The revision base above
+		// now rides WHOLE under prompt.MaxRevisionBasePlanBytes and, above that
+		// cap, as a step-complete digest (#3087) — it is no longer cut at 4000
+		// bytes. This list is authoritative for an INDEPENDENT reason, not as a
+		// workaround for a truncated blob: it is derived from the newest
+		// plan_scope_retry entry, which on a corrective re-dispatch is NOT the
+		// newest plan artifact. Best-effort:
 		// both stay nil when nothing is recorded, keeping first-pass plan
 		// prompts byte-unchanged. Set on BOTH prompt handlers so the signed
 		// prompt and the render preview stay byte-identical.

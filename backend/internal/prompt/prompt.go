@@ -574,15 +574,22 @@ type Trigger struct {
 	// the planner revises the existing plan rather than starting over. Nil
 	// on a normal plan dispatch and tolerated nil even on a revise (the
 	// section then omits the base block and still binds the constraint).
+	//
+	// It rides WHOLE under MaxRevisionBasePlanBytes (#3087) — which on every
+	// realistic plan means the entire prior document — and, above that cap, as
+	// a STEP-COMPLETE digest naming every approach step plus an elision
+	// manifest and byte accounting. It is no longer cut at 4000 bytes with a
+	// bare marker. writeRevisionBase owns both renderers.
 	RevisionBasePlan *string
 	// RevisionBaseScopeFiles is the ENUMERATED carry-forward set for a
 	// `revise` re-open (#2516): every path the revision base scoped (top-level
 	// scope.files UNION each decomposition sub-plan and split-phase scope),
-	// derived SERVER-SIDE and never asserted by the planner. RevisionBasePlan
-	// above rides as raw JSON TRUNCATED at 4000 bytes, so on a large plan the
-	// planner told to preserve the untouched parts literally cannot see the
-	// scope it must keep; this list is the authoritative scope set the
-	// Revision constraint section binds the planner to. Nil/empty on a normal
+	// derived SERVER-SIDE and never asserted by the planner. It remains the
+	// AUTHORITATIVE scope set the Revision constraint section binds the planner
+	// to for a reason INDEPENDENT of how much of the base blob is visible
+	// (#3087): it is resolved from the newest plan_scope_retry entry, which on
+	// a corrective re-dispatch is NOT the newest artifact — so it supersedes
+	// the blob even now that the blob is delivered whole. Nil/empty on a normal
 	// plan dispatch, so those prompts stay byte-unchanged.
 	RevisionBaseScopeFiles []string
 	// ScopeRestoration is set when the plan gate REFUSED the previous revision
@@ -2502,9 +2509,33 @@ func sanitizeScopePath(p string) string {
 	if len(p) > maxScopePathBytes {
 		p = strings.ToValidUTF8(p[:maxScopePathBytes], "") + "...[truncated]"
 	}
+	s := neutralizeLineStructure(p)
+	if strings.TrimSpace(s) == "" {
+		return "(empty path)"
+	}
+	return s
+}
+
+// neutralizeLineStructure is the line-safety transform sanitizeScopePath is
+// built on, factored out so any OTHER renderer that lands document-supplied
+// text inside a trusted prompt section escapes it IDENTICALLY rather than
+// growing a second, subtly weaker escaper. It escapes every line terminator and
+// control character to a visible two-character form and breaks
+// triple-backtick/tilde fences exactly as neutralizeLine breaks them.
+//
+// It neutralizes STRUCTURE, not content: text carrying no control character and
+// no fence passes through byte-unchanged, so every existing render is untouched.
+// It is pure and deterministic, so the package's byte-identical replay
+// invariant holds.
+//
+// Second caller: the over-cap revision-base digest (revisionbase.go), which
+// decodes the prior plan and renders its bodies as literal text — a decoded
+// `\n` inside a step description would otherwise become a real newline and put
+// planner-authored text at column 0 inside a binding section (#3087).
+func neutralizeLineStructure(in string) string {
 	var sb strings.Builder
-	sb.Grow(len(p))
-	for _, r := range p {
+	sb.Grow(len(in))
+	for _, r := range in {
 		switch {
 		case r == '\n':
 			sb.WriteString(`\n`)
@@ -2522,11 +2553,7 @@ func sanitizeScopePath(p string) string {
 		}
 	}
 	s := strings.ReplaceAll(sb.String(), "```", "`` `")
-	s = strings.ReplaceAll(s, "~~~", "~~ ~")
-	if strings.TrimSpace(s) == "" {
-		return "(empty path)"
-	}
-	return s
+	return strings.ReplaceAll(s, "~~~", "~~ ~")
 }
 
 // maxScopeCarryForwardPaths caps how many paths the Revision-base-scope
@@ -3644,22 +3671,27 @@ func buildPlan(t Trigger) string {
 		// constraint itself — so a cut that removes the constraint's tail
 		// cannot also remove the instruction to notice the missing terminator.
 		b.WriteString(revisionConstraintEndMarkerExpectation)
+		baseRendered, baseElided := false, false
 		if t.RevisionBasePlan != nil && *t.RevisionBasePlan != "" {
-			base := *t.RevisionBasePlan
-			const maxBaseBytes = 4000
-			if len(base) > maxBaseBytes {
-				base = base[:maxBaseBytes] + "...[truncated]"
-			}
-			b.WriteString("Prior plan (the revision base):\n\n")
-			b.WriteString(base)
-			b.WriteString("\n\n")
+			baseRendered = true
+			baseElided = writeRevisionBase(&b, *t.RevisionBasePlan, "Prior plan (the revision base):")
 		}
-		// Enumerated carry-forward set (#2516). The base-plan blob above is
-		// TRUNCATED, so on a large plan the planner cannot see the scope it is
-		// being told to preserve — the mechanism the observed silent drops are
-		// consistent with. This list is derived server-side from the revision
-		// base and is the AUTHORITATIVE scope set: say so plainly, right after
-		// the blob it supersedes. Capped like the sibling channels.
+		// Enumerated carry-forward set (#2516). This list is derived
+		// server-side from the revision base and is the AUTHORITATIVE scope
+		// set: say so plainly, right after the blob it supersedes. Capped like
+		// the sibling channels.
+		//
+		// Its LEAD SENTENCE is conditional on whether the blob above was
+		// actually elided (#3087). It used to assert unconditionally that the
+		// blob is "TRUNCATED at 4000 bytes" — after the cap raise that claim is
+		// false on every realistic revise, and a prompt asserting a truncation
+		// that did not happen is its own credibility defect. Only the
+		// truncation claim varies: the BINDING carry-forward obligation and the
+		// scope_removals / scope-regression language are identical in all three
+		// branches, and the list stays authoritative for a reason independent
+		// of the blob's completeness (it is derived from the newest
+		// plan_scope_retry entry, which on a corrective re-dispatch is NOT the
+		// newest artifact).
 		if len(t.RevisionBaseScopeFiles) > 0 {
 			paths := t.RevisionBaseScopeFiles
 			truncated := false
@@ -3669,12 +3701,15 @@ func buildPlan(t Trigger) string {
 			}
 			fmt.Fprintf(&b, "Revision base scope (BINDING — %d paths, the authoritative scope set):\n\n",
 				len(t.RevisionBaseScopeFiles))
-			b.WriteString("The prior-plan blob above is TRUNCATED at 4000 bytes, so it may not show the whole " +
-				"scope. THIS LIST — not that blob — is the revision base's scope. The revised plan MUST carry " +
-				"EVERY path below forward into scope.files (or into the owning decomposition sub-plan / " +
-				"split_proposal phase scope), unless it DECLARES the drop in the top-level scope_removals " +
-				"array with a reason. A path that simply disappears is a scope regression: the plan gate " +
-				"refuses it and re-dispatches this stage.\n\n")
+			switch {
+			case baseElided:
+				b.WriteString(scopeCarryForwardElidedLead)
+			case baseRendered:
+				b.WriteString(scopeCarryForwardWholeLead)
+			default:
+				b.WriteString(scopeCarryForwardNoBaseLead)
+			}
+			b.WriteString(scopeCarryForwardObligation)
 			for _, p := range paths {
 				b.WriteString("- ")
 				b.WriteString(sanitizeScopePath(p))
@@ -4144,14 +4179,7 @@ func buildGroomingPropose(t Trigger) (string, error) {
 		// the terminator cannot remove the instruction to expect it.
 		b.WriteString(revisionConstraintEndMarkerExpectation)
 		if t.RevisionBasePlan != nil && *t.RevisionBasePlan != "" {
-			base := *t.RevisionBasePlan
-			const maxBaseBytes = 4000
-			if len(base) > maxBaseBytes {
-				base = base[:maxBaseBytes] + "...[truncated]"
-			}
-			b.WriteString("Prior report (the revision base):\n\n")
-			b.WriteString(base)
-			b.WriteString("\n\n")
+			writeRevisionBase(&b, *t.RevisionBasePlan, "Prior report (the revision base):")
 		}
 		// The grooming revise rides the SAME loader and the same gate-refused
 		// handler as the plan revise, so it must share the same cap owner:

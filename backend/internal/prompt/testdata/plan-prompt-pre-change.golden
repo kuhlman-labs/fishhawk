@@ -41,7 +41,7 @@ Prior plan (the revision base):
 
 Revision base scope (BINDING — 2 paths, the authoritative scope set):
 
-The prior-plan blob above is TRUNCATED at 4000 bytes, so it may not show the whole scope. THIS LIST — not that blob — is the revision base's scope. The revised plan MUST carry EVERY path below forward into scope.files (or into the owning decomposition sub-plan / split_proposal phase scope), unless it DECLARES the drop in the top-level scope_removals array with a reason. A path that simply disappears is a scope regression: the plan gate refuses it and re-dispatches this stage.
+The prior-plan blob above is the COMPLETE prior plan — it was delivered whole, not truncated. THIS LIST nonetheless remains the authoritative binding scope set: it is derived server-side from the newest plan_scope_retry entry, which on a corrective re-dispatch is NOT the newest plan artifact, so it supersedes the blob regardless of the blob's completeness. The revised plan MUST carry EVERY path below forward into scope.files (or into the owning decomposition sub-plan / split_proposal phase scope), unless it DECLARES the drop in the top-level scope_removals array with a reason. A path that simply disappears is a scope regression: the plan gate refuses it and re-dispatches this stage.
 
 - backend/internal/prompt/prompt.go
 - backend/internal/prompt/prompt_test.go
