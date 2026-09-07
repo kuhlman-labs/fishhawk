@@ -2150,9 +2150,13 @@ func TestListClients_OrdersAndRoundTrips(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := newRepo(t)
 
-	// Insert out of client_id order so ORDER BY is doing real work.
-	upsertClientFor(t, repo, testClientID)    // https://client.example.com/...
-	upsertClientFor(t, repo, testAltClientID) // https://other.example.com/... (sorts after)
+	// Insert in DESCENDING client_id order, so insertion order is the REVERSE of
+	// the sorted order. A query that returned rows in insertion order (no ORDER
+	// BY) would hand back [alt, client] and fail the assertion below — only
+	// `ORDER BY client_id` can satisfy it, so the ordering claim is distinguished
+	// from insertion order rather than accidentally agreeing with it.
+	upsertClientFor(t, repo, testAltClientID) // https://other.example.com/... (sorts LAST)
+	upsertClientFor(t, repo, testClientID)    // https://client.example.com/... (sorts FIRST)
 
 	got, err := repo.ListClients(ctx)
 	if err != nil {

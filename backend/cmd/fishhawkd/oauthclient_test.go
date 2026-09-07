@@ -49,6 +49,7 @@ func TestRunOAuthClientRegister_MissingFlags(t *testing.T) {
 	}{
 		{"missing db", []string{"register", "--client-id", "cli", "--redirect-uri", "http://127.0.0.1:8765/cb"}, "--db"},
 		{"missing client-id", []string{"register", "--db", dummyDBURL, "--redirect-uri", "http://127.0.0.1:8765/cb"}, "--client-id required"},
+		{"whitespace client-id", []string{"register", "--db", dummyDBURL, "--client-id", " cli ", "--redirect-uri", "http://127.0.0.1:8765/cb"}, "surrounding whitespace"},
 		{"zero redirect-uri", []string{"register", "--db", dummyDBURL, "--client-id", "cli"}, "at least one --redirect-uri required"},
 	}
 	for _, tc := range cases {
@@ -294,8 +295,8 @@ func TestRunOAuthClientList_RendersSourceAndColumns(t *testing.T) {
 	}
 
 	const clientID = "https://client.example.com/oauth/client"
-	// Register twice so updated_at moves past first_seen_at — the two timestamps
-	// are then distinct and BOTH must appear.
+	// Register twice so updated_at moves past first_seen_at and the second
+	// registration's 9999 redirect URI proves the refresh landed.
 	mustRegisterOAuthClient(t, url, clientID)
 	mustRegisterOAuthClient(t, url, clientID, "--redirect-uri", "http://127.0.0.1:9999/callback")
 
@@ -304,12 +305,27 @@ func TestRunOAuthClientList_RendersSourceAndColumns(t *testing.T) {
 		t.Fatalf("pool: %v", err)
 	}
 	defer pool.Close()
+
+	// Two back-to-back registrations stamp first_seen_at and updated_at within the
+	// same wall-clock second, and both columns render to SECOND precision — so the
+	// two would format IDENTICALLY and a SINGLE rendered timestamp would satisfy
+	// both Contains assertions below (the vacuity the review names). Age
+	// first_seen_at an hour behind updated_at so the two are DISTINCT to the
+	// second, then require distinctness explicitly: each Contains assertion then
+	// discriminates its OWN column.
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE oauth_clients SET first_seen_at = updated_at - interval '1 hour' WHERE client_id = $1`, clientID); err != nil {
+		t.Fatalf("age first_seen_at: %v", err)
+	}
 	var firstSeen, updated string
 	if err := pool.QueryRow(context.Background(),
 		`SELECT to_char(first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
 		        to_char(updated_at    AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 		   FROM oauth_clients WHERE client_id = $1`, clientID).Scan(&firstSeen, &updated); err != nil {
 		t.Fatalf("read timestamps: %v", err)
+	}
+	if firstSeen == updated {
+		t.Fatalf("first_seen_at and updated_at rendered identically (%q); the two timestamp assertions would be vacuous", firstSeen)
 	}
 
 	listed := captureStdout(t, func() {
@@ -318,7 +334,12 @@ func TestRunOAuthClientList_RendersSourceAndColumns(t *testing.T) {
 			t.Fatalf("list exit; log:\n%s", log.String())
 		}
 	})
-	for _, want := range []string{clientID, sourcePreRegistered, "http://127.0.0.1:9999/callback", firstSeen, updated} {
+	// The SOURCE column is asserted against the LITERAL "pre-registered", not the
+	// production sourcePreRegistered constant: a wrong constant would move actual
+	// and expected together and pass vacuously, so the expected value is pinned
+	// independent of the code under test. firstSeen and updated are now distinct
+	// (guarded above), so requiring BOTH discriminates each timestamp column.
+	for _, want := range []string{clientID, "pre-registered", "http://127.0.0.1:9999/callback", firstSeen, updated} {
 		if !strings.Contains(listed, want) {
 			t.Errorf("list output missing %q:\n%s", want, listed)
 		}
