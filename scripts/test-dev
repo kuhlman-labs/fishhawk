@@ -2941,7 +2941,10 @@ else
     export FISHHAWK_DEV_TLS_PROXY_BIN="$bc_wd/proxy"
     _tls_ensure_certs() { mkdir -p "$1"; : > "$1/ca.pem"; : > "$1/server.pem"; : > "$1/server.key"; return 0 }
     PATH="$bc_wd/bin:$PATH" _tls_up 2>/dev/null
-    [[ -f "$TLS_PID_FILE" ]] && kill "$(cat "$TLS_PID_FILE")" 2>/dev/null
+    if [[ -f "$TLS_PID_FILE" ]]; then
+      kill "$(cat "$TLS_PID_FILE")" 2>/dev/null
+    fi
+    :
   )"
   bc_flat="$(print -r -- "$bc_cap" | tr '\n' ' ')"
   if [[ "$bc_flat" == *"export NODE_EXTRA_CA_CERTS=$bc_wd/tls/ca.pem"* ]]; then
@@ -2949,7 +2952,7 @@ else
   else
     fail "_tls_up banner should carry 'export NODE_EXTRA_CA_CERTS=<ca.pem>' unchanged (got: $bc_flat)"
   fi
-  if [[ "$bc_flat" == *"FIRST-TIME MCP OAuth"* ]]; then
+  if [[ "$bc_flat" == *"not sufficient for FIRST-TIME MCP OAuth"* ]]; then
     pass "_tls_up banner names the first-time-MCP-OAuth insufficiency"
   else
     fail "_tls_up banner should name the first-time-MCP-OAuth insufficiency (got: $bc_flat)"
