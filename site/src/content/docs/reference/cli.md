@@ -69,6 +69,7 @@ Every command below is rendered from the `cli/internal/cmdinfo` inventory, which
 | `fishhawk file-issue` | — | File a work item (issue/bug/chore/adr) via repo conventions. |
 | `fishhawk diagnose` | `<run-id>` | Show a run's product-facts diagnostic bundle. |
 | `fishhawk report-issue` | `<run-id>` | File an upstream Fishhawk product bug/feature with a redacted, deduped bundle. |
+| `fishhawk approve-review-gate` | `<run-id>` | Approve a human-executor review gate with a forge-check attestation (human credential only). |
 | `fishhawk export` | — | Assemble a complete compliance export (JSON or --csv) for external verification. |
 
 ### Flags per command
@@ -208,6 +209,10 @@ Flags: `--backend-url`, `--token`, `--timeout`, `--output`, `--o`
 #### `fishhawk report-issue`
 
 Flags: `--backend-url`, `--token`, `--timeout`, `--kind`, `--description`, `--include-free-text`, `--output`, `--o`
+
+#### `fishhawk approve-review-gate`
+
+Flags: `--backend-url`, `--token`, `--timeout`, `--attest`, `--output`, `--o`
 
 #### `fishhawk export`
 

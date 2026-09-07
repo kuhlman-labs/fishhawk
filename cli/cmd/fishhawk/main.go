@@ -11,6 +11,7 @@
 //	fishhawk run retry    <stage-id> [--output text|json]
 //	fishhawk plan approve <run-id> [--reason ...] [--output text|json]
 //	fishhawk plan reject  <run-id> [--reason ...] [--output text|json]
+//	fishhawk approve-review-gate <run-id> --attest A [--output text|json]
 //	fishhawk token login  [--provider github] [--client-id ID]
 //	fishhawk token list
 
@@ -82,6 +83,8 @@ var dispatch = map[string]func([]string, io.Writer, io.Writer) int{
 	"diagnose":     runDiagnose,
 	"report-issue": runReportIssue,
 	"export":       runExport,
+
+	"approve-review-gate": runApproveReviewGate,
 }
 
 const (

@@ -168,6 +168,8 @@ func Commands() []Command {
 			Flags: withCommon("output", "o")},
 		{Key: "report-issue", Synopsis: "File an upstream Fishhawk product bug/feature with a redacted, deduped bundle.", Args: "<run-id>",
 			Flags: withCommon("kind", "description", "include-free-text", "output", "o")},
+		{Key: "approve-review-gate", Synopsis: "Approve a human-executor review gate with a forge-check attestation (human credential only).", Args: "<run-id>",
+			Flags: withCommon("attest", "output", "o")},
 		{Key: "export", Synopsis: "Assemble a complete compliance export (JSON or --csv) for external verification.", Args: "",
 			Flags: withCommon("from", "to", "repo", "run", "limit", "csv", "out")},
 	}

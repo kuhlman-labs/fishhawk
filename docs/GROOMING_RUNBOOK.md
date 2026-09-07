@@ -99,8 +99,25 @@ approval endpoint refused EVERY review stage with 409 `review_stage_managed_by_g
 (ADR-018), which is correct for a PR-merge-managed review gate and wrong here — a
 grooming run could be started but never finished, parking in `running` indefinitely.
 
-**There is no MCP verb and no CLI verb for this gate. A human runs the curl.** That is
-the gate working as declared, not a gap:
+**There is no MCP verb for this gate, and there never will be.** An MCP tool is invoked
+under the delegated operator-agent identity the gate refuses (403
+`operator_agent_forbidden`) — that is the gate working as declared, not a gap. There IS a
+CLI verb (E54.55 / #3051), run by a human with a human-held credential:
+
+```
+fishhawk approve-review-gate <run-id> \
+  --attest "checked the forge: #2801 carries area:runner and the parent link; #2799 label landed"
+```
+
+It takes the RUN id and resolves the run's `review` stage parked at `awaiting_approval`
+itself, refuses an empty or whitespace-only `--attest` locally before any HTTP hop, and
+renders each named refusal (`attestation_required`, `self_decision`,
+`operator_agent_forbidden`) and the 409 `admission_reason` ladder below with its
+operator-readable meaning. Re-running it after a successful approval is a labeled no-op:
+the stage has left `awaiting_approval`, so nothing is submitted.
+
+The raw curl remains the documented fallback for an environment without the CLI on PATH
+(it needs the STAGE id, which the verb resolves for you):
 
 ```
 curl -sS -X POST "$FISHHAWK_BACKEND_URL/v0/stages/<confirm_stage_id>/approvals" \
@@ -119,8 +136,9 @@ curl -sS -X POST "$FISHHAWK_BACKEND_URL/v0/stages/<confirm_stage_id>/approvals" 
   `reject` needs no comment — it fails the stage category D.
 - Approving takes the run **terminal** (`succeeded`); the orchestrator finds no remaining
   stage and completes the run.
-- Get `<confirm_stage_id>` from `fishhawk_get_run_status` — it is the `review` stage
-  sitting at `awaiting_approval`.
+- `fishhawk approve-review-gate` resolves the stage from the run id; only the curl
+  fallback needs `<confirm_stage_id>`, which you get from `fishhawk_get_run_status` — it
+  is the `review` stage sitting at `awaiting_approval`.
 - **An approval is bound to the STAGE ROW, not to the run's intent.** Retrying or
   re-running creates new stage rows, so a prior approval cannot be reused; you approve
   the new row.
