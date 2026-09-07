@@ -519,10 +519,14 @@ components:
           type: array
           items: { type: string }
           description: >-
-            Every label the system added that the caller did not supply (#1616): per-namespace
-            defaults from the type's `label_defaults` (e.g. `autonomy:medium`) plus any `area:*`
-            label derived from the parent epic. Reported loudly so the operator sees exactly what
-            filing-time completeness added. Absent/empty when nothing was defaulted.
+            Every label the system added that the caller did not supply (#1616, #3179):
+            per-namespace defaults from the type's `label_defaults` (e.g. `autonomy:medium`), any
+            `area:*` label derived from the parent epic, and any `phase:*` label derived from the
+            parent epic or — when the epic carries none — from the originating run's triggering
+            issue (resolved from `relations.evidence_runs`, and only when that run's repo equals
+            the filing target repo). A caller-supplied `phase:*` is never rewritten. Reported
+            loudly so the operator sees exactly what filing-time completeness added, and so a
+            wrong inherit is challengeable at filing time. Absent/empty when nothing was defaulted.
         missing_label_namespaces:
           type: array
           items: { type: string }
@@ -2875,9 +2879,11 @@ components:
               type: array
               items: { type: string }
               description: >-
-                Labels the system added that were not supplied (#1616), e.g. the `autonomy:medium`
-                namespace default. The auto-drafted follow-up flows through the same filing core as
-                POST /v0/work-items, so its label-completeness report is identical.
+                Labels the system added that were not supplied (#1616, #3179), e.g. the
+                `autonomy:medium` namespace default or a `phase:*` derived from the parent epic —
+                or, when the epic carries none, from the deferring run's own triggering issue. The
+                auto-drafted follow-up flows through the same filing core as POST /v0/work-items,
+                so its label-completeness report is identical.
             missing_label_namespaces:
               type: array
               items: { type: string }

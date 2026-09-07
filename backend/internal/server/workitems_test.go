@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -2017,24 +2018,48 @@ func TestFileWorkItem_DependsOn_EndToEnd(t *testing.T) {
 // parent epic issue carries the given labels (object form) — the stub for the
 // area-derivation path (#1616). The title carries an [E22] token so {epic}
 // derivation is unaffected; labels drive area derivation.
+//
+// It is a thin wrapper over newPerIssueLabeledGitHubClient (#3179), so the two
+// #1616 area tests keep the exact stub behavior they were written against.
 func newLabeledEpicGitHubClient(t *testing.T, installID int64, labels []string, getIssueErr bool) *githubclient.Client {
+	t.Helper()
+	return newPerIssueLabeledGitHubClient(t, installID, map[int][]string{389: labels}, getIssueErr)
+}
+
+// newPerIssueLabeledGitHubClient serves GetRepoInstallation + a PER-ISSUE-NUMBER
+// GetIssue, so a test can give the parent epic and the originating run's
+// triggering issue DIFFERENT labels — the precedence and fallback cases of the
+// #3179 phase ladder need exactly that. An issue number absent from the map is
+// served with NO labels (a real issue that simply carries none), not a 404, so
+// a derivation that consults the wrong issue derives nothing rather than
+// erroring for an unrelated reason.
+//
+// Every issue's title carries the [E22] token, so {epic} derivation is
+// unaffected regardless of which issue a test points the ladder at.
+func newPerIssueLabeledGitHubClient(t *testing.T, installID int64, byIssue map[int][]string, getIssueErr bool) *githubclient.Client {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/{owner}/{name}/installation", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"id":%d}`, installID)
 	})
-	mux.HandleFunc("GET /repos/{owner}/{name}/issues/{number}", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /repos/{owner}/{name}/issues/{number}", func(w http.ResponseWriter, r *http.Request) {
 		if getIssueErr {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		number, err := strconv.Atoi(r.PathValue("number"))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
+		labels := byIssue[number]
 		labelObjs := make([]map[string]any, 0, len(labels))
 		for _, l := range labels {
 			labelObjs = append(labelObjs, map[string]any{"name": l})
 		}
-		body, _ := json.Marshal(map[string]any{"number": 389, "title": "[E22] The parent epic", "state": "open", "labels": labelObjs})
+		body, _ := json.Marshal(map[string]any{"number": number, "title": "[E22] The parent epic", "state": "open", "labels": labelObjs})
 		_, _ = w.Write(body)
 	})
 	srv := httptest.NewServer(mux)
@@ -2051,7 +2076,8 @@ func newLabeledEpicGitHubClient(t *testing.T, installID int64, labels []string, 
 // for #1616 (verification 6): a feature filing with NO autonomy label and no
 // area (no GitHub client to derive it) drives request -> conventions Apply ->
 // provider -> response + audit. The response carries defaulted_labels
-// [autonomy:medium] and missing_label_namespaces [area]; the filed item's
+// [autonomy:medium] and missing_label_namespaces [area phase] (#3179 added the
+// phase namespace and it is likewise underivable here); the filed item's
 // labels include autonomy:medium; and the run-bound work_item_filed audit
 // payload carries both fields.
 func TestFileWorkItem_LabelCompleteness_Integration(t *testing.T) {
@@ -2086,8 +2112,10 @@ func TestFileWorkItem_LabelCompleteness_Integration(t *testing.T) {
 	if strings.Join(resp.DefaultedLabels, ",") != "autonomy:medium" {
 		t.Errorf("response defaulted_labels = %v, want [autonomy:medium]", resp.DefaultedLabels)
 	}
-	if strings.Join(resp.MissingLabelNamespaces, ",") != "area" {
-		t.Errorf("response missing_label_namespaces = %v, want [area]", resp.MissingLabelNamespaces)
+	// Widened for #3179: phase joined the shipped default's required namespaces
+	// and, with no GitHub client, is no more derivable than area.
+	if strings.Join(resp.MissingLabelNamespaces, ",") != "area,phase" {
+		t.Errorf("response missing_label_namespaces = %v, want [area phase]", resp.MissingLabelNamespaces)
 	}
 	// The filed item's labels (as the provider received them) include the default.
 	if !containsString(fp.captured.Item.Classification.Labels, "autonomy:medium") {
@@ -2159,16 +2187,18 @@ func TestFileWorkItem_AreaDerivedFromParentEpic(t *testing.T) {
 }
 
 // TestFileWorkItem_AreaDerivation_FailsOpen is the area-derivation fail-open
-// sibling (#1616, verification 7): a GetIssue error must NOT fail the filing —
-// it succeeds with area listed in missing_label_namespaces (derivation derived
-// nothing). Uses a feature type whose title_format needs no {epic}, so the
-// GetIssue failure does not also fail title rendering.
+// sibling (#1616, verification 7; widened for phase in #3179 per binding
+// approval condition 1): a GetIssue error must NOT fail the filing — it
+// succeeds with BOTH area and phase listed in missing_label_namespaces (each
+// derivation derived nothing off the same failed fetch). Uses a feature type
+// whose title_format needs no {epic}, so the GetIssue failure does not also
+// fail title rendering.
 func TestFileWorkItem_AreaDerivation_FailsOpen(t *testing.T) {
 	fp := &fakeWorkProvider{}
 	registerFakeProvider(t, fp)
 
-	// A conventions type that requires area + autonomy but whose title needs no
-	// {epic}, so a GetIssue error only affects area derivation.
+	// A conventions type that requires area + autonomy + phase but whose title
+	// needs no {epic}, so a GetIssue error only affects label derivation.
 	conv := workmgmt.Conventions{
 		Provider: workmgmt.Default().Provider,
 		Types: map[string]workmgmt.ItemType{
@@ -2177,7 +2207,7 @@ func TestFileWorkItem_AreaDerivation_FailsOpen(t *testing.T) {
 				BodySkeleton:            []string{"Summary"},
 				DefaultLabels:           []string{"type:feature"},
 				LabelDefaults:           map[string]string{"autonomy": "autonomy:medium"},
-				RequiredLabelNamespaces: []string{"area", "autonomy"},
+				RequiredLabelNamespaces: []string{"area", "autonomy", "phase"},
 				DefaultFields:           workmgmt.DefaultFields{Status: "Backlog", Complexity: "medium"},
 				EpicLink:                "optional",
 			},
@@ -2201,8 +2231,426 @@ func TestFileWorkItem_AreaDerivation_FailsOpen(t *testing.T) {
 		t.Fatalf("status = %d, want 201 — area derivation must fail OPEN (body=%s)", rec.Code, rec.Body.String())
 	}
 	resp := decodeWorkItem(t, rec)
-	if strings.Join(resp.MissingLabelNamespaces, ",") != "area" {
-		t.Errorf("missing_label_namespaces = %v, want [area] (derivation failed open)", resp.MissingLabelNamespaces)
+	if strings.Join(resp.MissingLabelNamespaces, ",") != "area,phase" {
+		t.Errorf("missing_label_namespaces = %v, want [area phase] (both derivations failed open)", resp.MissingLabelNamespaces)
+	}
+}
+
+// --- phase derivation (#3179) ---
+
+// phaseDerivationServer wires the pieces every phase-derivation case needs: a
+// registered capture provider, a per-issue-number GitHub stub, and (optionally)
+// a run repository holding the originating run row the evidence-run fallback
+// reads. Passing a nil runs map leaves s.cfg.RunRepo NIL — the nil-RunRepo
+// fail-open branch.
+func phaseDerivationServer(t *testing.T, byIssue map[int][]string, getIssueErr bool, runs map[uuid.UUID]*run.Run) (*Server, *fakeWorkProvider) {
+	t.Helper()
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+	gh := newPerIssueLabeledGitHubClient(t, 7788, byIssue, getIssueErr)
+	cfg := Config{GitHub: gh}
+	if runs != nil {
+		rr := newPromptRunRepo()
+		for id, row := range runs {
+			rr.getRuns[id] = row
+		}
+		cfg.RunRepo = rr
+	}
+	return New(cfg), fp
+}
+
+// seedTriggerRun builds a run row for the evidence-run fallback: repo + an
+// `issue:<n>` TriggerRef, the two fields originatingRunIssue reads.
+func seedTriggerRun(id uuid.UUID, repo string, issueNumber int) *run.Run {
+	ref := "issue:" + strconv.Itoa(issueNumber)
+	inst := int64(7788)
+	return &run.Run{
+		ID:             id,
+		Repo:           repo,
+		State:          run.StateRunning,
+		InstallationID: &inst,
+		TriggerRef:     &ref,
+	}
+}
+
+func missingNamespacesInclude(resp workItemResponse, ns string) bool {
+	return containsString(resp.MissingLabelNamespaces, ns)
+}
+
+// TestFileWorkItem_PhaseDerivedFromParentEpic is the phase happy path and rung
+// 2 of the #3179 ladder: the parent epic carries phase:alpha, so the filed
+// item's labels include it, it appears in the response defaulted_labels (a
+// system-added label the caller did not supply, so a wrong inherit is
+// challengeable at filing time), and phase is absent from
+// missing_label_namespaces.
+func TestFileWorkItem_PhaseDerivedFromParentEpic(t *testing.T) {
+	s, fp := phaseDerivationServer(t, map[int][]string{
+		389: {"epic", "area:backend", "phase:alpha"},
+	}, false, nil)
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Fix the widget",
+		TitleVars: map[string]string{"n": "1"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if !containsString(fp.captured.Item.Classification.Labels, "phase:alpha") {
+		t.Errorf("filed item labels %v missing derived phase:alpha", fp.captured.Item.Classification.Labels)
+	}
+	if !containsString(resp.DefaultedLabels, "phase:alpha") {
+		t.Errorf("response defaulted_labels = %v, want it to include phase:alpha", resp.DefaultedLabels)
+	}
+	if missingNamespacesInclude(resp, "phase") {
+		t.Errorf("missing_label_namespaces = %v, must omit phase (it was derived)", resp.MissingLabelNamespaces)
+	}
+}
+
+// TestFileWorkItem_PhaseFallsBackToRunIssue is rung 3: the parent epic carries
+// area but NO phase, so the ladder falls through to the originating run's
+// triggering issue (#3100), which carries phase:alpha. This is the shape the
+// epic_link:optional types (bug, chore — the defer-concern shape) file in, and
+// is what makes the ladder more than a naive inherit-from-epic.
+func TestFileWorkItem_PhaseFallsBackToRunIssue(t *testing.T) {
+	runID := uuid.New()
+	s, fp := phaseDerivationServer(t, map[int][]string{
+		389:  {"epic", "area:backend"}, // no phase on the epic
+		3100: {"phase:alpha"},          // the run's triggering issue
+	}, false, map[uuid.UUID]*run.Run{
+		runID: seedTriggerRun(runID, "kuhlman-labs/fishhawk", 3100),
+	})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Fix the widget",
+		TitleVars: map[string]string{"n": "1"},
+		Relations: &workItemRelations{ParentEpic: "#389", EvidenceRuns: []string{runID.String()}},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if !containsString(fp.captured.Item.Classification.Labels, "phase:alpha") {
+		t.Errorf("filed item labels %v missing phase:alpha derived via the evidence-run fallback", fp.captured.Item.Classification.Labels)
+	}
+	if !containsString(resp.DefaultedLabels, "phase:alpha") {
+		t.Errorf("response defaulted_labels = %v, want it to include phase:alpha", resp.DefaultedLabels)
+	}
+	if missingNamespacesInclude(resp, "phase") {
+		t.Errorf("missing_label_namespaces = %v, must omit phase (the fallback derived it)", resp.MissingLabelNamespaces)
+	}
+}
+
+// TestFileWorkItem_PhaseEpicWinsOverRunIssue is the PRECEDENCE case #3179
+// names: the epic carries phase:beta and the run's triggering issue carries
+// phase:alpha, and the epic wins — phase:beta only, with phase:alpha nowhere on
+// the item. phase:* describes WHEN an item is scheduled, which follows its
+// scheduling home (the epic it rolls up to), not where it was discovered.
+//
+// The two issues carry DELIBERATELY DIFFERENT phase values by construction, so
+// reversing the ladder lands the assertion on the behavioral comparison rather
+// than on fixture setup.
+func TestFileWorkItem_PhaseEpicWinsOverRunIssue(t *testing.T) {
+	runID := uuid.New()
+	s, fp := phaseDerivationServer(t, map[int][]string{
+		389:  {"epic", "area:backend", "phase:beta"},
+		3100: {"phase:alpha"},
+	}, false, map[uuid.UUID]*run.Run{
+		runID: seedTriggerRun(runID, "kuhlman-labs/fishhawk", 3100),
+	})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Fix the widget",
+		TitleVars: map[string]string{"n": "1"},
+		Relations: &workItemRelations{ParentEpic: "#389", EvidenceRuns: []string{runID.String()}},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	labels := fp.captured.Item.Classification.Labels
+	if !containsString(labels, "phase:beta") {
+		t.Errorf("filed item labels %v missing the epic's phase:beta", labels)
+	}
+	if containsString(labels, "phase:alpha") {
+		t.Errorf("filed item labels %v carry the RUN ISSUE's phase:alpha; the parent epic must win the ladder", labels)
+	}
+}
+
+// TestFileWorkItem_CallerPhaseSuppressesDerivation is rung 1: a caller-supplied
+// phase:beta is never rewritten, even though the parent epic carries
+// phase:alpha. Exactly one phase label survives, it is the caller's, and phase
+// is absent from defaulted_labels — the system added nothing.
+//
+// The caller's value and the epic's are DIFFERENT by construction, so deleting
+// the suppression guard produces a visibly different label set rather than a
+// byte-identical one.
+func TestFileWorkItem_CallerPhaseSuppressesDerivation(t *testing.T) {
+	s, fp := phaseDerivationServer(t, map[int][]string{
+		389: {"epic", "area:backend", "phase:alpha"},
+	}, false, nil)
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Fix the widget",
+		TitleVars: map[string]string{"n": "1"},
+		Labels:    []string{"phase:beta"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	var phases []string
+	for _, l := range fp.captured.Item.Classification.Labels {
+		if strings.HasPrefix(l, "phase:") {
+			phases = append(phases, l)
+		}
+	}
+	if strings.Join(phases, ",") != "phase:beta" {
+		t.Errorf("filed item phase labels = %v, want exactly [phase:beta] — a caller-supplied phase is never rewritten or duplicated", phases)
+	}
+	for _, d := range resp.DefaultedLabels {
+		if strings.HasPrefix(d, "phase:") {
+			t.Errorf("response defaulted_labels = %v reports a phase the system did not add", resp.DefaultedLabels)
+		}
+	}
+}
+
+// TestFileWorkItem_PhaseDerivation_FailsOpen_GetIssueError is the fetch-error
+// fail-open branch: GetIssue 500s, so nothing is derived and the filing STILL
+// returns 201 with phase reported in missing_label_namespaces. A filing is
+// never rejected on labels.
+func TestFileWorkItem_PhaseDerivation_FailsOpen_GetIssueError(t *testing.T) {
+	s, _ := phaseDerivationServer(t, map[int][]string{
+		389: {"epic", "area:backend", "phase:alpha"},
+	}, true /* GetIssue 500s */, nil)
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Fix the widget",
+		TitleVars: map[string]string{"epic": "22", "n": "1"}, // supplied: {epic} derivation also fails
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — phase derivation must fail OPEN (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if !missingNamespacesInclude(resp, "phase") {
+		t.Errorf("missing_label_namespaces = %v, want it to include phase (derivation failed open)", resp.MissingLabelNamespaces)
+	}
+}
+
+// TestFileWorkItem_PhaseDerivation_RefusesForeignRun is the SAME-REPO GUARD.
+// Relations.EvidenceRuns is caller-supplied on POST /v0/work-items and is NOT
+// entitlement-checked, so a run row belonging to a DIFFERENT repository must
+// derive NOTHING — reading a foreign run's triggering issue number and applying
+// its phase against this target repo would derive a wrong label from an unowned
+// row.
+//
+// Seeded BY CONSTRUCTION: the run row's Repo is other-org/other-repo while the
+// filing targets kuhlman-labs/fishhawk, and issue 3100 in the stub carries
+// phase:alpha — so with the guard deleted the derivation SUCCEEDS and the
+// assertion goes red on the behavioral outcome, not on a fetch failure.
+func TestFileWorkItem_PhaseDerivation_RefusesForeignRun(t *testing.T) {
+	runID := uuid.New()
+	s, fp := phaseDerivationServer(t, map[int][]string{
+		389:  {"epic", "area:backend"}, // no phase on the epic -> the ladder reaches rung 3
+		3100: {"phase:alpha"},
+	}, false, map[uuid.UUID]*run.Run{
+		runID: seedTriggerRun(runID, "other-org/other-repo", 3100),
+	})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Fix the widget",
+		TitleVars: map[string]string{"n": "1"},
+		Relations: &workItemRelations{ParentEpic: "#389", EvidenceRuns: []string{runID.String()}},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if containsString(fp.captured.Item.Classification.Labels, "phase:alpha") {
+		t.Errorf("filed item labels %v derived a phase from a run in a DIFFERENT repository; the same-repo guard must refuse it", fp.captured.Item.Classification.Labels)
+	}
+	if !missingNamespacesInclude(resp, "phase") {
+		t.Errorf("missing_label_namespaces = %v, want it to include phase (nothing was derivable)", resp.MissingLabelNamespaces)
+	}
+}
+
+// TestFileWorkItem_PhaseDerivation_NoEvidenceRun is the no-fallback-signal
+// branch: no evidence_runs and an epic carrying no phase, so both rungs yield
+// nothing and phase is reported LOUDLY rather than silently absent.
+func TestFileWorkItem_PhaseDerivation_NoEvidenceRun(t *testing.T) {
+	s, _ := phaseDerivationServer(t, map[int][]string{
+		389: {"epic", "area:backend"},
+	}, false, map[uuid.UUID]*run.Run{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Fix the widget",
+		TitleVars: map[string]string{"n": "1"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if !missingNamespacesInclude(resp, "phase") {
+		t.Errorf("missing_label_namespaces = %v, want it to include phase", resp.MissingLabelNamespaces)
+	}
+}
+
+// TestFileWorkItem_PhaseDerivation_NilRunRepo is the unwired-dependency
+// fail-open branch: an evidence run IS supplied but s.cfg.RunRepo is nil, so
+// the fallback cannot resolve the run and derives nothing — 201, with phase
+// reported missing. Issue 3100 carries phase:alpha in the stub, so this cannot
+// pass merely because there was no phase to find.
+func TestFileWorkItem_PhaseDerivation_NilRunRepo(t *testing.T) {
+	s, fp := phaseDerivationServer(t, map[int][]string{
+		389:  {"epic", "area:backend"},
+		3100: {"phase:alpha"},
+	}, false, nil /* RunRepo left NIL */)
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Fix the widget",
+		TitleVars: map[string]string{"n": "1"},
+		Relations: &workItemRelations{ParentEpic: "#389", EvidenceRuns: []string{uuid.NewString()}},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — a nil run repository must fail OPEN (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if containsString(fp.captured.Item.Classification.Labels, "phase:alpha") {
+		t.Errorf("filed item labels %v derived a phase with no run repository wired", fp.captured.Item.Classification.Labels)
+	}
+	if !missingNamespacesInclude(resp, "phase") {
+		t.Errorf("missing_label_namespaces = %v, want it to include phase", resp.MissingLabelNamespaces)
+	}
+}
+
+// TestFileWorkItem_PhaseDerivation_UnparseableEvidenceRun covers the remaining
+// two rung-3 refusals in one behavioral pass: an evidence_runs entry that is
+// not a UUID, and a well-formed id naming a run the repository does not hold
+// (GetRun error). Both derive nothing and both return 201 with phase reported.
+func TestFileWorkItem_PhaseDerivation_UnparseableEvidenceRun(t *testing.T) {
+	for name, ref := range map[string]string{
+		"not_a_uuid":  "run-42",
+		"unknown_run": uuid.NewString(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, fp := phaseDerivationServer(t, map[int][]string{
+				389:  {"epic", "area:backend"},
+				3100: {"phase:alpha"},
+			}, false, map[uuid.UUID]*run.Run{})
+
+			rec := fileWorkItem(t, s, workItemRequest{
+				Repo:      "kuhlman-labs/fishhawk",
+				Type:      "feature",
+				Summary:   "Fix the widget",
+				TitleVars: map[string]string{"n": "1"},
+				Relations: &workItemRelations{ParentEpic: "#389", EvidenceRuns: []string{ref}},
+			}, "github:operator")
+
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+			}
+			resp := decodeWorkItem(t, rec)
+			if containsString(fp.captured.Item.Classification.Labels, "phase:alpha") {
+				t.Errorf("filed item labels %v derived a phase from an unresolvable evidence run", fp.captured.Item.Classification.Labels)
+			}
+			if !missingNamespacesInclude(resp, "phase") {
+				t.Errorf("missing_label_namespaces = %v, want it to include phase", resp.MissingLabelNamespaces)
+			}
+		})
+	}
+}
+
+// TestFileWorkItem_PhaseDerivation_NoTriggerIssue is the run-without-an-issue
+// refusal: the run row is same-repo and resolvable but its TriggerRef is nil
+// (a non-issue-triggered run), so originatingRunIssue reports not-ok and
+// nothing is derived.
+func TestFileWorkItem_PhaseDerivation_NoTriggerIssue(t *testing.T) {
+	runID := uuid.New()
+	row := seedTriggerRun(runID, "kuhlman-labs/fishhawk", 3100)
+	row.TriggerRef = nil
+	s, fp := phaseDerivationServer(t, map[int][]string{
+		389:  {"epic", "area:backend"},
+		3100: {"phase:alpha"},
+	}, false, map[uuid.UUID]*run.Run{runID: row})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Fix the widget",
+		TitleVars: map[string]string{"n": "1"},
+		Relations: &workItemRelations{ParentEpic: "#389", EvidenceRuns: []string{runID.String()}},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if containsString(fp.captured.Item.Classification.Labels, "phase:alpha") {
+		t.Errorf("filed item labels %v derived a phase from a run with no issue TriggerRef", fp.captured.Item.Classification.Labels)
+	}
+	if !missingNamespacesInclude(resp, "phase") {
+		t.Errorf("missing_label_namespaces = %v, want it to include phase", resp.MissingLabelNamespaces)
+	}
+}
+
+// TestFileWorkItem_PhaseNotDerivedForExemptType is the type-gate branch: the
+// adr type declares NO phase namespace (neither required_label_namespaces nor
+// label_defaults), so derivation must not run for it even when a phase:alpha
+// label is in reach — the #1616 type-exemption posture, unchanged by #3179.
+// The signal is put on the EVIDENCE-RUN rung, since the adr type refuses a
+// parent-epic relation outright.
+func TestFileWorkItem_PhaseNotDerivedForExemptType(t *testing.T) {
+	runID := uuid.New()
+	s, fp := phaseDerivationServer(t, map[int][]string{
+		3100: {"phase:alpha"},
+	}, false, map[uuid.UUID]*run.Run{
+		runID: seedTriggerRun(runID, "kuhlman-labs/fishhawk", 3100),
+	})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:            "kuhlman-labs/fishhawk",
+		Type:            "adr",
+		Summary:         "Choose the derivation ladder",
+		ExistingNumbers: []int{0},
+		Relations:       &workItemRelations{EvidenceRuns: []string{runID.String()}},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if containsString(fp.captured.Item.Classification.Labels, "phase:alpha") {
+		t.Errorf("adr filing labels %v gained a derived phase; adr declares no phase namespace", fp.captured.Item.Classification.Labels)
+	}
+	if len(resp.MissingLabelNamespaces) != 0 {
+		t.Errorf("missing_label_namespaces = %v, want none for an exempt type", resp.MissingLabelNamespaces)
 	}
 }
 

@@ -38,8 +38,11 @@ func TestRenderChild_ConventionsComplete(t *testing.T) {
 		Proposal:           "connect A to B",
 		DoneMeans:          "A talks to B",
 		AcceptanceCriteria: []string{"A calls B", "B replies"},
-		// Only area supplied — autonomy:medium must be DEFAULTED in.
-		Labels: []string{"area:backend"},
+		// Only area + phase supplied — autonomy:medium must be DEFAULTED in.
+		// phase joined the shipped default's required_label_namespaces in #3179
+		// and, like area, carries no label_default; RenderChild calls the pure
+		// Apply, which performs no derivation, so it must be supplied here.
+		Labels: []string{"area:backend", "phase:alpha"},
 	}
 	item, err := RenderChild(child, 1, RenderOptions{}, conv)
 	if err != nil {
@@ -56,7 +59,7 @@ func TestRenderChild_ConventionsComplete(t *testing.T) {
 		t.Errorf("labels %v missing defaulted autonomy:medium", item.Classification.Labels)
 	}
 	if len(item.Classification.MissingLabelNamespaces) != 0 {
-		t.Errorf("missing label namespaces = %v, want none (area + autonomy present)", item.Classification.MissingLabelNamespaces)
+		t.Errorf("missing label namespaces = %v, want none (area + autonomy + phase present)", item.Classification.MissingLabelNamespaces)
 	}
 
 	// Skeleton section order, with Acceptance criteria populated as bullets and

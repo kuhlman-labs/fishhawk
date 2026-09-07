@@ -715,14 +715,17 @@ func TestApply_AutonomyDefaultApplied(t *testing.T) {
 	conv := Default()
 	for _, typ := range []string{"feature", "bug", "chore"} {
 		t.Run(typ, func(t *testing.T) {
-			// Supply an area label so the filing is otherwise complete; only the
-			// autonomy namespace is left to the default.
+			// Supply area AND phase so the filing is otherwise complete; only the
+			// autonomy namespace is left to the default. phase joined the shipped
+			// default's required_label_namespaces in #3179 and, like area, carries
+			// NO label_default — it is required-or-DERIVED, and Apply is pure, so
+			// an unsupplied phase would report as missing here.
 			item, _, err := Apply(FilingRequest{
 				Type:      typ,
 				Summary:   "x",
 				Body:      "## Summary\n\nx\n",
 				TitleVars: map[string]string{"epic": "1", "n": "1"},
-				Labels:    []string{"area:backend"},
+				Labels:    []string{"area:backend", "phase:alpha"},
 				Relations: Relations{ParentEpic: "#1"},
 			}, conv)
 			if err != nil {
@@ -775,9 +778,11 @@ func TestApply_AutonomyPassthroughSuppressesDefault(t *testing.T) {
 
 // TestApply_ExplicitLabelsRegressionPin proves the completeness pass ONLY
 // consults prefixes and never rewrites or reorders existing labels (#1616,
-// verification 2): a filing with explicit area:* + autonomy:* produces the
-// identical merged set (content AND order) as mergeLabels alone would have —
-// nothing appended, nothing defaulted, nothing missing.
+// verification 2): a filing with explicit area:* + autonomy:* + phase:*
+// produces the identical merged set (content AND order) as mergeLabels alone
+// would have — nothing appended, nothing defaulted, nothing missing. phase
+// joined the required set in #3179, so an explicit phase is supplied here for
+// the same reason area always was.
 func TestApply_ExplicitLabelsRegressionPin(t *testing.T) {
 	conv := Default()
 	item, _, err := Apply(FilingRequest{
@@ -785,7 +790,7 @@ func TestApply_ExplicitLabelsRegressionPin(t *testing.T) {
 		Summary:   "x",
 		Body:      "## Summary\n\nx\n",
 		TitleVars: map[string]string{"epic": "1", "n": "1"},
-		Labels:    []string{"area:cli", "autonomy:low"},
+		Labels:    []string{"area:cli", "autonomy:low", "phase:beta"},
 		Relations: Relations{ParentEpic: "#1"},
 	}, conv)
 	if err != nil {
@@ -793,7 +798,7 @@ func TestApply_ExplicitLabelsRegressionPin(t *testing.T) {
 	}
 	// Byte-identical to the pre-change merge: default_labels first, then caller
 	// labels, in order, with no completeness additions.
-	want := "type:feature,area:cli,autonomy:low"
+	want := "type:feature,area:cli,autonomy:low,phase:beta"
 	if got := strings.Join(item.Classification.Labels, ","); got != want {
 		t.Errorf("labels = %q, want %q (no reorder/rewrite)", got, want)
 	}
@@ -835,10 +840,11 @@ func TestApply_TypeExemption(t *testing.T) {
 }
 
 // TestApply_MissingNamespaceReportedNeverRejected is the fail-open pin (#1616,
-// verification 4): a feature filing with no area label SUCCEEDS (never a
-// rejection) with area listed in MissingLabelNamespaces. Apply is pure — it
-// performs no parent-epic area derivation — so an area-less filing reports the
-// gap; the handler's deriveAreaLabel is what fills it before Apply.
+// verification 4; widened for phase in #3179): a feature filing with no area
+// and no phase label SUCCEEDS (never a rejection) with BOTH listed in
+// MissingLabelNamespaces. Apply is pure — it performs no parent-epic
+// derivation — so a filing missing either reports the gap; the handler's
+// deriveAreaLabel / derivePhaseLabel are what fill them before Apply.
 func TestApply_MissingNamespaceReportedNeverRejected(t *testing.T) {
 	conv := Default()
 	item, _, err := Apply(FilingRequest{
@@ -851,8 +857,8 @@ func TestApply_MissingNamespaceReportedNeverRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply must not reject on a missing label namespace: %v", err)
 	}
-	if got := strings.Join(item.Classification.MissingLabelNamespaces, ","); got != "area" {
-		t.Errorf("MissingLabelNamespaces = %q, want area", got)
+	if got := strings.Join(item.Classification.MissingLabelNamespaces, ","); got != "area,phase" {
+		t.Errorf("MissingLabelNamespaces = %q, want area,phase", got)
 	}
 	// autonomy was defaulted, so it is NOT reported missing.
 	if !hasLabelInNamespace(item.Classification.Labels, "autonomy") {

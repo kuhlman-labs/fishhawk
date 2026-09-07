@@ -258,6 +258,12 @@ func TestFileIssue_ProviderUnimplemented_PropagatesError(t *testing.T) {
 // defaulted_labels + missing_label_namespaces reaches FileIssueOutput.Item so
 // the operator sees exactly what filing-time completeness added and what is
 // still missing.
+//
+// Widened for #3179: `phase` joined the shipped default's
+// required_label_namespaces, so a filing with no derivable phase now reports
+// BOTH area and phase. The pass-through is the claim — the tool must not drop,
+// truncate or reorder namespaces the backend reported — so the expectation is
+// the full list, not a membership check.
 func TestFileIssue_SurfacesLabelCompleteness(t *testing.T) {
 	fb, srv := newFileIssueFakeBackend(t)
 	fb.resp = &FiledWorkItem{
@@ -268,7 +274,7 @@ func TestFileIssue_SurfacesLabelCompleteness(t *testing.T) {
 		Provider:               "github_projects",
 		AppliedLabels:          []string{"type:feature", "autonomy:medium"},
 		DefaultedLabels:        []string{"autonomy:medium"},
-		MissingLabelNamespaces: []string{"area"},
+		MissingLabelNamespaces: []string{"area", "phase"},
 	}
 	r := newResolver(srv, nil)
 
@@ -283,8 +289,8 @@ func TestFileIssue_SurfacesLabelCompleteness(t *testing.T) {
 	if strings.Join(out.Item.DefaultedLabels, ",") != "autonomy:medium" {
 		t.Errorf("DefaultedLabels = %v, want [autonomy:medium]", out.Item.DefaultedLabels)
 	}
-	if strings.Join(out.Item.MissingLabelNamespaces, ",") != "area" {
-		t.Errorf("MissingLabelNamespaces = %v, want [area]", out.Item.MissingLabelNamespaces)
+	if strings.Join(out.Item.MissingLabelNamespaces, ",") != "area,phase" {
+		t.Errorf("MissingLabelNamespaces = %v, want [area phase]", out.Item.MissingLabelNamespaces)
 	}
 }
 
@@ -374,6 +380,62 @@ func TestFileIssueToolDescribesIntakeAsAdvisory(t *testing.T) {
 	} {
 		if !strings.Contains(desc, reason) {
 			t.Errorf("degrade reason %q is not enumerated in the tool description", reason)
+		}
+	}
+}
+
+// TestFileIssueToolDescribesPhaseDerivation is the DONE-MEANS test for this
+// file's other half of the #3179 change: the shipped tool description is the
+// driving agent's only instruction about where a phase:* label comes from, and
+// prose is a convention no compiler enforces. A comment-only or no-op touch of
+// file_issue.go would satisfy a scope-presence check and fail here.
+//
+// The claims pinned are the ones an agent acts on: that phase:* is derived at
+// all, from the parent epic, with a fallback to the originating run's issue,
+// and that a phase the agent supplies itself is never rewritten (so it need
+// not work around the derivation). Substring-level, not full sentences, so a
+// copy-edit does not silently delete the control.
+func TestFileIssueToolDescribesPhaseDerivation(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, cerr := client.Connect(ctx, clientTransport, nil)
+	if cerr != nil {
+		t.Fatalf("client connect: %v", cerr)
+	}
+	defer clientSession.Close()
+
+	res, lerr := clientSession.ListTools(ctx, nil)
+	if lerr != nil {
+		t.Fatalf("ListTools: %v", lerr)
+	}
+	var desc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_file_issue" {
+			desc = tool.Description
+		}
+	}
+	if desc == "" {
+		t.Fatal("fishhawk_file_issue is not registered")
+	}
+	for _, want := range []string{
+		"phase:*",
+		"derived from the parent epic",
+		"originating run's triggering issue",
+		"never rewritten",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_file_issue description does not state %q; the #3179 phase-derivation posture is not stated to the agent:\n%s", want, desc)
 		}
 	}
 }

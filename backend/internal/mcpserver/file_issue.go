@@ -106,11 +106,14 @@ Returns the created item: type, title, number, url, provider, the resolved
 applied_labels / complexity / status / board_column, boarded / epic_linked
 (whether the best-effort board placement and epic link landed; false with a
 boarding_error / epic_link_error when they did not — the issue is still
-filed), and audited. It also reports label completeness (#1616):
+filed), and audited. It also reports label completeness (#1616, #3179):
 defaulted_labels lists every label the system added that you did not supply
-(namespace defaults like autonomy:medium, plus an area:* label derived from the
-parent epic), and missing_label_namespaces lists any required namespace still
-absent — reported loudly, never a filing rejection.
+(namespace defaults like autonomy:medium, an area:* label derived from the
+parent epic, and a phase:* label derived from the parent epic or — when the
+epic carries none — from the originating run's triggering issue; a
+phase:* you supply yourself is never rewritten), and missing_label_namespaces
+lists any required namespace still absent — reported loudly, never a filing
+rejection.
 
 The response also carries an optional intake object: ADVISORY intake-groom
 signals the backend derived at filing time (#2239) — possible duplicate
