@@ -11,11 +11,15 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
-// resolveInjectedDocuments resolves, attributes and renders the repo-authored
-// documents declared for this run/stage (E55.1 / #2242), returning them as the
-// plain-data prompt.InjectedDocument values buildPlan / buildPlanReview /
-// buildImplement / buildImplementReview render at the head of the cache-stable
-// prefix.
+// resolveDeclaredDocuments is the shared resolve/render core behind BOTH
+// prompt endpoints: it resolves, optionally attributes, and renders the
+// repo-authored documents declared for this run/stage (E55.1 / #2242),
+// returning them as the plain-data prompt.InjectedDocument values buildPlan /
+// buildPlanReview / buildImplement / buildImplementReview render at the head of
+// the cache-stable prefix. `attribute` gates the audit write and NOTHING else,
+// so the served wrapper (resolveInjectedDocuments) and the preview wrapper
+// (previewInjectedDocuments) cannot diverge on rendered bytes or on any refusal
+// (E54.12 / #2804).
 //
 // INERT BY DEFAULT. Config.DocumentDeclarations and Config.DocumentResolver are
 // both nil in production today — no consumer declares a document yet (E55's
@@ -55,7 +59,7 @@ import (
 // as an inexplicably unconstrained agent rather than as a fault. So it is an
 // error, raised BEFORE the seam is consulted: the mismatch is a wiring defect
 // whatever the seam would have returned.
-func (s *Server) resolveInjectedDocuments(ctx context.Context, runRow *run.Run, stage *run.Stage) ([]prompt.InjectedDocument, error) {
+func (s *Server) resolveDeclaredDocuments(ctx context.Context, runRow *run.Run, stage *run.Stage, attribute bool) ([]prompt.InjectedDocument, error) {
 	if runRow == nil || stage == nil {
 		return nil, nil
 	}
@@ -112,8 +116,15 @@ func (s *Server) resolveInjectedDocuments(ctx context.Context, runRow *run.Run, 
 	// orders its own appends so a failure cannot leave a successful-injection
 	// claim behind (truncations first, injection claims last, all tagged with
 	// one injection_set_id).
-	if err := repodoc.Attribute(ctx, s.cfg.AuditRepo, runRow.ID, stage.ID, docs...); err != nil {
-		return nil, err
+	//
+	// THE ONE PHASE THE PREVIEW SKIPS. Everything above this point is shared
+	// verbatim between the served and preview wrappers, so the rendered bytes
+	// and every refusal are computed by identical code; `attribute` gates this
+	// call alone. See previewInjectedDocuments for why.
+	if attribute {
+		if err := repodoc.Attribute(ctx, s.cfg.AuditRepo, runRow.ID, stage.ID, docs...); err != nil {
+			return nil, err
+		}
 	}
 
 	out := make([]prompt.InjectedDocument, 0, len(docs))
@@ -121,6 +132,39 @@ func (s *Server) resolveInjectedDocuments(ctx context.Context, runRow *run.Run, 
 		out = append(out, repodoc.ToPromptDocument(doc, decls[i].Framing))
 	}
 	return out, nil
+}
+
+// resolveInjectedDocuments is the SERVED path's wrapper (GET
+// /v0/stages/{id}/prompt): it resolves, ATTRIBUTES and renders. Behaviour is
+// byte-identical to the pre-split single function — this is the only caller
+// that writes document_injected / document_truncated entries.
+func (s *Server) resolveInjectedDocuments(ctx context.Context, runRow *run.Run, stage *run.Stage) ([]prompt.InjectedDocument, error) {
+	return s.resolveDeclaredDocuments(ctx, runRow, stage, true)
+}
+
+// previewInjectedDocuments is the PREVIEW path's wrapper (GET
+// /v0/stages/{id}/prompt-render): the same resolve/render core with
+// ATTRIBUTION SUPPRESSED (E54.12 / #2804).
+//
+// WHY ATTRIBUTION IS SUPPRESSED. A document_injected entry is a claim that a
+// specific revision of a document CONSTRAINED AN AGENT on this run
+// (backend/internal/repodoc/README.md). A preview constrains no agent — no
+// agent ever reads its bytes — so attributing it would falsify the claim the
+// entry is made of. And /prompt-render is an unsigned read-access GET the SPA
+// re-fetches on every session view, so attributing it would let a pure READ
+// surface append unbounded chained rows to an append-only audit log.
+//
+// RESIDUAL, STATED PLAINLY. The preview therefore leaves NO audit trace at
+// all: the audit log answers "which revision constrained the run", never
+// "which revision did the operator preview". A preview served from a document
+// that was later edited is not reconstructible after the fact.
+//
+// EVERYTHING ELSE IS SHARED. Resolution, base-ref pinning, the credential
+// scope, the fail-closed ordering and every error this can return come from
+// resolveDeclaredDocuments unchanged, so the two prompt endpoints agree on the
+// rendered document block and on every refusal.
+func (s *Server) previewInjectedDocuments(ctx context.Context, runRow *run.Run, stage *run.Stage) ([]prompt.InjectedDocument, error) {
+	return s.resolveDeclaredDocuments(ctx, runRow, stage, false)
 }
 
 // documentInjectionErrorDetails extracts the operator-actionable identifiers

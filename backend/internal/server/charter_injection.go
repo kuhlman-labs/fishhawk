@@ -85,14 +85,20 @@ import (
 // no charter is REFUSED — the case an any-document-present check would wave
 // through in exactly the situation the control exists to catch.
 //
-// # Preview divergence (approval condition H5, tracked as #2804)
+// # Preview convergence (E54.12 / #2804)
 //
-// handleGetStagePromptRender — the unsigned preview surface — does NOT inject
-// documents at all (a pre-existing #2242 divergence), and L2 is deliberately
-// NOT wired there: asserting on a handler that never injects would refuse
-// every grooming preview. So a preview and a served prompt for the same stage
-// differ in exactly the security-relevant block. Widening the preview to
-// resolve documents is #2804's, not this slice's.
+// BOTH prompt handlers now run L1 and L2. handleGetStagePromptRender — the
+// unsigned preview surface — resolves through previewInjectedDocuments, which
+// is the SAME resolve/render core as the served path with attribution
+// suppressed, and then calls this function with the resulting set. So the two
+// paths agree on the rendered document block and on every refusal (same
+// status, same error code, same `reason`), and diverge ONLY in whether a
+// document_injected / document_truncated audit claim is written.
+//
+// This function needs no change to serve both: it takes runRow, stage and the
+// injected set as PARAMETERS and holds no Server state (the receiver is
+// deliberately unused), so one function produces the identical determination
+// for either handler.
 
 // charterDeclarationSite is the fixed provenance string repodoc echoes into
 // every error message and audit payload for this consumer. The mechanism never

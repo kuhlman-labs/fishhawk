@@ -373,10 +373,59 @@ then counted. All three refusals fail CLOSED and reach only storage-corrupted sp
 each is pinned as DELIBERATE by a row in `TestSpecCouldBeGrooming_Attribution` so a later
 edit to either branch cannot silently widen or narrow it.
 
-**Preview divergence (#2804).** `handleGetStagePromptRender` injects no documents at all
-(a pre-existing #2242 divergence), so L2 is deliberately NOT wired there — asserting on a
-handler that never injects would refuse every grooming preview. A preview and a served
-prompt for the same stage therefore differ in exactly the security-relevant block.
+**Preview convergence (E54.12 / #2804).** BOTH prompt handlers now run L1 and L2.
+`handleGetStagePromptRender` resolves through `previewInjectedDocuments` — the same
+resolve/render core as the served path, with attribution suppressed — and then calls the
+same `assertCharterInjected`, using the same error code, message and details builder. So
+the preview and the served prompt for the same stage carry IDENTICAL bytes and an
+identical `prompt_hash`, and refuse identically (same HTTP status, same `error.code`, same
+`error.details.reason`, and for a `repodoc.ResolveError` the same `path` /
+`declaration_site` on the error the log record carries). `TestGroomingPrompt_PreviewMatchesServed`
+compares the two RESPONSES rather than asserting each in isolation.
+
+The ONE ratified divergence is ATTRIBUTION: the preview writes NO `document_injected` /
+`document_truncated` entries. A `document_injected` entry claims a revision CONSTRAINED AN
+AGENT; a preview constrains none, and `/prompt-render` is an unsigned read-access GET the
+SPA re-fetches on every session view, so attributing it would both falsify the claim and
+let a pure read surface append unbounded chained rows to an append-only log. **Residual:**
+the audit log answers *"which revision constrained the run"*, never *"which revision did
+the operator preview"* — a preview is not reconstructible after the fact. Pinned by
+`TestPreviewInjectedDocuments_WritesNoAttribution` (preview writes zero) paired with
+`TestResolveInjectedDocuments_StillAttributes` (served still writes exactly one per
+document).
+
+Two costs the convergence buys, stated plainly: a grooming preview on a deployment whose
+seam is unwired or whose charter is missing now returns 500 instead of a 200 carrying an
+unanchored plan prompt (that IS the point), and a grooming preview now performs forge
+calls — a default-branch resolution plus a file fetch at the pinned commit — on an
+unsigned endpoint, so a repeatedly-refreshed session view consumes forge quota it
+previously did not. No caching layer is added.
+
+**Operator walk (live validation).** The three `requires_live_validation` criteria are not
+provable from the test suite; run this against a deployment whose grooming workflow
+declares a charter, with `$B` the backend base URL, `$S` a backlog-grooming PLAN stage id
+and `$R` its run id.
+
+1. `curl -s "$B/v0/stages/$S/prompt-render" > /tmp/preview.json` — **expect** HTTP 200 and
+   a body whose `prompt` contains the heading `### Product charter — the prioritization
+   anchor for this grooming run`.
+2. `curl -s -H "X-Fishhawk-Signature: <sig>" "$B/v0/stages/$S/prompt" > /tmp/served.json` —
+   **expect** HTTP 200 and the same charter heading.
+3. `diff <(jq -r .prompt /tmp/preview.json) <(jq -r .prompt /tmp/served.json)` — **expect**
+   NO output: the two prompt texts are byte-identical.
+4. `jq -r .prompt_hash /tmp/preview.json /tmp/served.json` — **expect** two identical hex
+   digests.
+5. Rename or remove the charter at its declared path ON THE BASE REF (a commit to the
+   default branch; the read is pinned to that branch's head commit), then re-issue steps 1
+   and 2 — **expect** BOTH to return HTTP 500 with `error.code` =
+   `document_injection_failed` and the SAME `error.details.reason` (`charter_absent` when
+   the `charter.path` declaration is removed, or a `repodoc` missing-document refusal when
+   only the file is gone). Compare the two `reason` values directly; they must be equal.
+6. `curl -s "$B/v0/runs/$R/audit?limit=500" | jq -r '.items[] | select(.category=="document_injected") | .id'`
+   — **expect** exactly as many `document_injected` entries as SIGNED `/prompt` fetches you
+   made (one, from step 2), and none attributable to the step-1 preview. Re-issue step 1
+   five more times and re-read: **expect** the count to be UNCHANGED, which is the
+   attribution-suppression claim.
 
 **Wiring.** `cmd/fishhawkd`'s `wireDocumentInjection` installs the four `Config` members
 (resolver, scope, base ref, declarations) TOGETHER or leaves all four nil, because

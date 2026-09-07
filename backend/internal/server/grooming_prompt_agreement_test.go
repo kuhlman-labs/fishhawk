@@ -1,13 +1,27 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
+
+// chUnrelatedDocumentDeclarations is a declaration seam that resolves SOMETHING
+// — just not the charter. It is the M7 / condition-H2 bad state, seeded by
+// construction: L1 succeeds, so only L2 can refuse.
+func chUnrelatedDocumentDeclarations(context.Context, *run.Run, *run.Stage) ([]repodoc.Declaration, string, error) {
+	return []repodoc.Declaration{{
+		Path:            chOtherPath,
+		DeclarationSite: "some other consumer",
+		Framing:         repodoc.Framing{Heading: "Unrelated document"},
+	}}, chDefaultBranch, nil
+}
 
 // TestGroomingPrompt_CrossLayerAgreement is criterion 3 (approval note "Step 11
 // is the test the issue actually asks for"). It drives the REAL prompt handler
@@ -121,4 +135,193 @@ func TestGroomingPrompt_CrossLayerAgreement(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGroomingPrompt_PreviewMatchesServed is E54.12 / #2804's criterion 3 and
+// the operator's binding condition 3 (exact refusal parity). It drives BOTH
+// real HTTP handlers — handleGetStagePromptRender and handleGetStagePrompt —
+// for the SAME stage on ONE server, and COMPARES the two responses rather than
+// asserting each in isolation:
+//
+//   - success rows: identical prompt TEXT, identical prompt_hash, and agreement
+//     on whether the injected charter block is present.
+//   - refusal rows: identical HTTP status, identical error.code and identical
+//     error.details.reason.
+//
+// Per-layer units would pass while the seam between them diverged, which is
+// exactly the defect this issue names: before the change the preview resolved
+// no documents, wired neither charter layer and set no grooming context, so it
+// rendered a groom stage as an ordinary unanchored plan and refused nothing.
+//
+// The PREVIEW is fetched FIRST and the signed prompt SECOND, so the served
+// path's markStageRunningOnPromptFetch side effect cannot perturb the
+// comparison. The fixture stages carry no dispatched state today, so the flip
+// no-ops; the ordering makes the test robust if that changes.
+//
+// Counterfactuals: deleting the preview's previewInjectedDocuments call reddens
+// the success rows (the preview loses the charter block, so the hashes differ);
+// deleting its assertCharterInjected call reddens the refusal rows (preview 200
+// against a served 500).
+func TestGroomingPrompt_PreviewMatchesServed(t *testing.T) {
+	charterBlockMarker := "### " + charterFraming().Heading
+
+	rows := []struct {
+		name        string
+		spec        string
+		workflowID  string // override when non-empty (the workflow-absent rows)
+		charterPath string // conventions charter path; chCharterPath unless overridden
+		noCharter   bool   // conventions declare NO charter block at all
+		baseRef     func(ctx context.Context, repo forge.RepoRef) (string, error)
+		decls       func(context.Context, *run.Run, *run.Stage) ([]repodoc.Declaration, string, error)
+		noSeam      bool // wire NO declaration seam and no resolver at all
+		stageIsPlan bool
+		wantRefusal string // "" = both must serve 200; else the expected reason
+	}{
+		// Success rows: both endpoints must agree byte-for-byte.
+		{name: "grooming spec on a plan stage", spec: chGroomingSpec, stageIsPlan: true},
+		{name: "plain spec on a plan stage", spec: chPlainSpec, stageIsPlan: true},
+		{name: "grooming spec on a non-plan stage", spec: chGroomingSpec, stageIsPlan: false},
+		{name: "nil workflow spec", spec: "", stageIsPlan: true},
+		{name: "M8b unparseable and plain", spec: chCorruptPlainSpec, stageIsPlan: true},
+
+		// Refusal rows: both endpoints must refuse identically.
+		{name: "M8a unparseable grooming-attributable", spec: chCorruptGroomingSpec,
+			stageIsPlan: true, wantRefusal: reasonGroomingSpecUnreadable},
+		{name: "M8c workflow absent but grooming-shaped", spec: chGroomingSpec, workflowID: "not_declared",
+			stageIsPlan: true, wantRefusal: reasonGroomingSpecUnreadable},
+		{name: "declared charter does not resolve", spec: chGroomingSpec, charterPath: "docs/no-such-charter.md",
+			stageIsPlan: true, wantRefusal: ""},
+		{name: "charter path empty", spec: chGroomingSpec, charterPath: "   ",
+			stageIsPlan: true, wantRefusal: reasonCharterPathEmpty},
+		{name: "charter absent from conventions", spec: chGroomingSpec, noCharter: true,
+			stageIsPlan: true, wantRefusal: reasonCharterAbsent},
+		{name: "base ref unresolved", spec: chGroomingSpec, stageIsPlan: true,
+			baseRef:     func(context.Context, forge.RepoRef) (string, error) { return "", nil },
+			wantRefusal: reasonCharterBaseRefUnresolved},
+
+		// The two L2-ONLY refusals. Every row above is refused by L1 as well
+		// (charterDeclarations calls stageRequiresCharter and charterDeclaredPath
+		// itself), so these two are what discriminate the preview's
+		// assertCharterInjected call specifically: L1 either cannot run at all or
+		// resolves a document that is NOT the charter.
+		{name: "M6 declaration seam entirely unwired", spec: chGroomingSpec, noSeam: true,
+			stageIsPlan: true, wantRefusal: reasonCharterNotInjected},
+		{name: "M7 an unrelated document injected, no charter", spec: chGroomingSpec,
+			decls:       chUnrelatedDocumentDeclarations,
+			stageIsPlan: true, wantRefusal: reasonCharterNotInjected},
+	}
+
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			conv := chConventions(chCharterPath)
+			switch {
+			case tc.noCharter:
+				conv = chConventionsWithoutCharter()
+			case tc.charterPath != "":
+				conv = chConventions(tc.charterPath)
+			}
+			installConventions(t, conv, nil)
+
+			baseRef := chDefaultBaseRef
+			if tc.baseRef != nil {
+				baseRef = tc.baseRef
+			}
+			ff := newCHFetcher()
+			ff.extra[chOtherPath] = chOtherContent
+			opts := chServerOpts{
+				specYAML:    tc.spec,
+				resolver:    &repodoc.Resolver{Fetcher: ff, Commits: &chCommits{sha: chPinnedCommit}},
+				baseRef:     baseRef,
+				useCharter:  true,
+				stageIsPlan: tc.stageIsPlan,
+			}
+			switch {
+			case tc.noSeam:
+				// The no-forge deployment: no resolver, no base ref, no seam.
+				opts.resolver, opts.baseRef, opts.useCharter = nil, nil, false
+			case tc.decls != nil:
+				opts.decls, opts.useCharter = tc.decls, false
+			}
+			s, runID, stageID, priv, _ := newCharterServer(t, opts)
+			rr := s.cfg.RunRepo.(*promptRunRepo)
+			if tc.workflowID != "" {
+				rr.getRuns[runID].WorkflowID = tc.workflowID
+			}
+			if tc.spec == "" {
+				rr.getRuns[runID].WorkflowSpec = nil
+			}
+
+			// PREVIEW FIRST, then the signed prompt.
+			pw := promptRenderRequest(t, s, stageID)
+			sw := promptRequest(t, s, runID, stageID, priv, "")
+
+			// (1) Status parity, on every row.
+			if pw.Code != sw.Code {
+				t.Fatalf("status divergence: preview = %d, served = %d\npreview body: %s\nserved body: %s",
+					pw.Code, sw.Code, pw.Body.String(), sw.Body.String())
+			}
+
+			if sw.Code != http.StatusOK {
+				// (2) Refusal parity: same code, same reason.
+				pCode, pReason := chErrCodeReason(t, pw.Body.Bytes())
+				sCode, sReason := chErrCodeReason(t, sw.Body.Bytes())
+				if pCode != sCode {
+					t.Errorf("error.code divergence: preview = %q, served = %q", pCode, sCode)
+				}
+				if pReason != sReason {
+					t.Errorf("error.details.reason divergence: preview = %q, served = %q", pReason, sReason)
+				}
+				if sCode != "document_injection_failed" {
+					t.Errorf("error.code = %q, want document_injection_failed\n%s", sCode, sw.Body.String())
+				}
+				if tc.wantRefusal != "" && sReason != tc.wantRefusal {
+					t.Errorf("refusal reason = %q, want %q — a DIFFERENT control refused\n%s",
+						sReason, tc.wantRefusal, sw.Body.String())
+				}
+				return
+			}
+
+			// (3) Success parity: identical bytes, identical hash, agreeing on
+			// whether the charter block is present.
+			var pResp, sResp promptResponse
+			if err := json.Unmarshal(pw.Body.Bytes(), &pResp); err != nil {
+				t.Fatalf("decode preview: %v\n%s", err, pw.Body.String())
+			}
+			if err := json.Unmarshal(sw.Body.Bytes(), &sResp); err != nil {
+				t.Fatalf("decode served: %v\n%s", err, sw.Body.String())
+			}
+			if pResp.Prompt != sResp.Prompt {
+				t.Errorf("preview and served prompt TEXT diverge\n--- preview ---\n%s\n--- served ---\n%s",
+					pResp.Prompt, sResp.Prompt)
+			}
+			if pResp.PromptHash != sResp.PromptHash {
+				t.Errorf("prompt_hash divergence: preview = %q, served = %q", pResp.PromptHash, sResp.PromptHash)
+			}
+			pCharter := strings.Contains(pResp.Prompt, charterBlockMarker)
+			sCharter := strings.Contains(sResp.Prompt, charterBlockMarker)
+			if pCharter != sCharter {
+				t.Errorf("charter block present: preview = %v, served = %v — the endpoints disagree on the "+
+					"security-relevant block", pCharter, sCharter)
+			}
+		})
+	}
+}
+
+// chErrCodeReason digs the error code and the details.reason out of an error
+// envelope ({"error": {"code", "message", "details"}}).
+func chErrCodeReason(t *testing.T, body []byte) (code, reason string) {
+	t.Helper()
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("decode error body: %v\n%s", err, string(body))
+	}
+	env, _ := decoded["error"].(map[string]any)
+	if env == nil {
+		t.Fatalf("body carries no error envelope: %s", string(body))
+	}
+	code, _ = env["code"].(string)
+	if details, ok := env["details"].(map[string]any); ok {
+		reason, _ = details["reason"].(string)
+	}
+	return code, reason
 }

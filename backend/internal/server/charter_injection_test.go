@@ -1453,3 +1453,118 @@ func TestGroomingPrompt_CharterCheckPrecedesBuild(t *testing.T) {
 		t.Errorf("the pre-Build guard is not L2 (message = %q)", err.Error())
 	}
 }
+
+// TestGroomingPromptRender_PreviewRefusals is the PREVIEW twin of the served
+// per-failure-mode tests above (E54.12 / #2804): one behavioral case per named
+// fail-closed reason, driven through GET /v0/stages/{id}/prompt-render.
+//
+// Reason IDENTITY is what makes each row a working counterfactual vehicle:
+// deleting one branch lets a NEIGHBOURING control refuse instead — with a
+// different reason, or with no charter reason at all — which these assertions
+// catch and an error-occurred-only assertion would not. Each row asserts BOTH
+// the 500 status AND the error code AND the exact reason, so a preview failing
+// for an unrelated cause cannot green it.
+func TestGroomingPromptRender_PreviewRefusals(t *testing.T) {
+	rows := []struct {
+		name   string
+		build  func(t *testing.T) (*Server, uuid.UUID)
+		reason string
+	}{
+		{
+			name:   "charter_absent",
+			reason: reasonCharterAbsent,
+			build: func(t *testing.T) (*Server, uuid.UUID) {
+				installConventions(t, chConventionsWithoutCharter(), nil)
+				s, _, stageID, _, _ := chWiredServer(t, chGroomingSpec, newCHFetcher(), 0)
+				return s, stageID
+			},
+		},
+		{
+			name:   "charter_path_empty",
+			reason: reasonCharterPathEmpty,
+			build: func(t *testing.T) (*Server, uuid.UUID) {
+				installConventions(t, chConventions("   "), nil)
+				s, _, stageID, _, _ := chWiredServer(t, chGroomingSpec, newCHFetcher(), 0)
+				return s, stageID
+			},
+		},
+		{
+			name:   "conventions_unavailable",
+			reason: reasonConventionsUnavailable,
+			build: func(t *testing.T) (*Server, uuid.UUID) {
+				installConventions(t, workmgmt.Conventions{}, errors.New("forge unavailable"))
+				s, _, stageID, _, _ := chWiredServer(t, chGroomingSpec, newCHFetcher(), 0)
+				return s, stageID
+			},
+		},
+		{
+			name:   "charter_base_ref_unresolved",
+			reason: reasonCharterBaseRefUnresolved,
+			build: func(t *testing.T) (*Server, uuid.UUID) {
+				installConventions(t, chConventions(chCharterPath), nil)
+				s, _, stageID, _, _ := newCharterServer(t, chServerOpts{
+					specYAML:    chGroomingSpec,
+					resolver:    &repodoc.Resolver{Fetcher: newCHFetcher(), Commits: &chCommits{sha: chPinnedCommit}},
+					baseRef:     func(context.Context, forge.RepoRef) (string, error) { return "", nil },
+					useCharter:  true,
+					stageIsPlan: true,
+				})
+				return s, stageID
+			},
+		},
+		{
+			// L2-ONLY: L1 resolves a document successfully — just not the
+			// charter — so only assertCharterInjected can refuse this.
+			name:   "charter_not_injected",
+			reason: reasonCharterNotInjected,
+			build: func(t *testing.T) (*Server, uuid.UUID) {
+				installConventions(t, chConventions(chCharterPath), nil)
+				ff := newCHFetcher()
+				ff.extra[chOtherPath] = chOtherContent
+				s, _, stageID, _, _ := newCharterServer(t, chServerOpts{
+					specYAML:    chGroomingSpec,
+					resolver:    &repodoc.Resolver{Fetcher: ff, Commits: &chCommits{sha: chPinnedCommit}},
+					decls:       chUnrelatedDocumentDeclarations,
+					baseRef:     chDefaultBaseRef,
+					stageIsPlan: true,
+				})
+				return s, stageID
+			},
+		},
+		{
+			name:   "grooming_workflow_spec_unreadable",
+			reason: reasonGroomingSpecUnreadable,
+			build: func(t *testing.T) (*Server, uuid.UUID) {
+				installConventions(t, chConventions(chCharterPath), nil)
+				s, _, stageID, _, _ := chWiredServer(t, chCorruptGroomingSpec, newCHFetcher(), 0)
+				return s, stageID
+			},
+		},
+	}
+
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			s, stageID := tc.build(t)
+			w := promptRenderRequest(t, s, stageID)
+			if w.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode error body: %v\n%s", err, w.Body.String())
+			}
+			env, _ := body["error"].(map[string]any)
+			if env == nil {
+				t.Fatalf("no error envelope: %s", w.Body.String())
+			}
+			if code, _ := env["code"].(string); code != "document_injection_failed" {
+				t.Errorf("error.code = %q, want document_injection_failed\n%s", code, w.Body.String())
+			}
+			chAssertReason(t, body, tc.reason)
+			// A refused preview must never leak the charter text.
+			if strings.Contains(w.Body.String(), chBaseContent) || strings.Contains(w.Body.String(), chSoftContent) {
+				t.Errorf("a refused preview served charter content:\n%s", w.Body.String())
+			}
+		})
+	}
+}

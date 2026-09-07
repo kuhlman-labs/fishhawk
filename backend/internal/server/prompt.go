@@ -1345,8 +1345,10 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// deployment that never wired DocumentDeclarations is exactly the
 	// configuration in which L1 cannot run, and it is still refused here.
 	// Every non-grooming stage returns nil from the first line of the check,
-	// so this adds nothing to any other prompt. NOT wired on the
-	// /prompt-render preview, which injects no documents at all (#2804).
+	// so this adds nothing to any other prompt. BOTH prompt handlers run L1+L2
+	// (E54.12 / #2804): the /prompt-render preview runs this same sequence and
+	// differs ONLY in that its L1 wrapper suppresses attribution, so the two
+	// endpoints agree on the rendered bytes and on every refusal.
 	// assertCharterInjected is BOTH the fail-closed check AND the sole producer
 	// of the prompt layer's grooming determination (E54.28 / #2834): it returns
 	// a non-nil *prompt.GroomingContext for a grooming propose stage and (nil,
@@ -1364,33 +1366,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
-		if errors.Is(err, prompt.ErrUnsupportedStage) {
-			s.writeError(w, r, http.StatusNotImplemented, "unsupported_stage_type",
-				"prompt construction not yet implemented for this stage type",
-				map[string]any{"stage_type": string(stage.Type)})
-			return
-		}
-		// DEFENCE IN DEPTH (E54.28 / #2834): prompt.buildGroomingPropose fails
-		// closed with ErrCharterNotInjected if a grooming propose stage reaches
-		// it with no charter among the injected documents. This is practically
-		// UNREACHABLE through this handler — assertCharterInjected above refuses
-		// on the same condition FIRST — but the prompt layer keeps its own copy
-		// of the policy so buildGroomingPropose cannot emit a report prompt
-		// without a charter EVEN IF a future caller forgets L2. This mapping is
-		// its server-side translation for that case: surface it as the same
-		// charter refusal shape L2 produces, not a generic internal_error. The
-		// error itself IS covered (prompt package test
-		// TestBuild_GroomingPropose_NoCharterInjected_Refuses); what is untested
-		// is this mapping, because the L2 refusal above makes it unreachable —
-		// unreachable here is not uncovered nor unimportant.
-		if errors.Is(err, prompt.ErrCharterNotInjected) {
-			s.writeError(w, r, http.StatusInternalServerError, "document_injection_failed",
-				"required charter document was not injected",
-				map[string]any{"reason": reasonCharterNotInjected, "error": err.Error()})
-			return
-		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"build prompt failed", map[string]any{"error": err.Error()})
+		s.writePromptBuildError(w, r, string(stage.Type), err)
 		return
 	}
 
@@ -1585,11 +1561,54 @@ func (s *Server) markStageRunningOnPromptFetch(ctx context.Context, stage *run.S
 	}
 }
 
+// writePromptBuildError is the ONE prompt.Build error mapping, shared by
+// handleGetStagePrompt and handleGetStagePromptRender so the two endpoints
+// cannot answer the same build failure differently (E54.12 / #2804). It carries
+// three branches:
+//
+//   - prompt.ErrUnsupportedStage -> 501 unsupported_stage_type, naming the type.
+//   - prompt.ErrCharterNotInjected -> 500 document_injection_failed with
+//     reason=charter_not_injected. DEFENCE IN DEPTH (E54.28 / #2834):
+//     prompt.buildGroomingPropose fails closed if a grooming propose stage
+//     reaches it with no charter among the injected documents. It is practically
+//     UNREACHABLE through either handler — assertCharterInjected refuses on the
+//     same condition FIRST — but the prompt layer keeps its own copy of the
+//     policy so buildGroomingPropose cannot emit a report prompt without a
+//     charter EVEN IF a future caller forgets L2, and this is its server-side
+//     translation: the same charter refusal shape L2 produces, not a generic
+//     internal_error. Extracting it here is also what makes it directly
+//     testable (TestPromptBuildError_Mapping) rather than a second unreachable
+//     copy — unreachable is not uncovered nor unimportant.
+//   - anything else -> 500 internal_error.
+func (s *Server) writePromptBuildError(w http.ResponseWriter, r *http.Request, stageType string, err error) {
+	if errors.Is(err, prompt.ErrUnsupportedStage) {
+		s.writeError(w, r, http.StatusNotImplemented, "unsupported_stage_type",
+			"prompt construction not yet implemented for this stage type",
+			map[string]any{"stage_type": stageType})
+		return
+	}
+	if errors.Is(err, prompt.ErrCharterNotInjected) {
+		s.writeError(w, r, http.StatusInternalServerError, "document_injection_failed",
+			"required charter document was not injected",
+			map[string]any{"reason": reasonCharterNotInjected, "error": err.Error()})
+		return
+	}
+	s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+		"build prompt failed", map[string]any{"error": err.Error()})
+}
+
 // handleGetStagePromptRender implements GET /v0/stages/{stage_id}/prompt-render.
 //
 // SPA-readable counterpart of handleGetStagePrompt: same response
 // shape, same construction, but no X-Fishhawk-Signature requirement.
 // The runner contract on the signature-authed path stays untouched.
+//
+// It runs the SAME repo-authored document injection and charter fail-closed
+// sequence as the signed handler (E54.12 / #2804), so the preview bytes equal
+// the served bytes and both endpoints refuse on the same conditions with the
+// same status / code / reason. The one divergence is that the preview does NOT
+// write document_injected / document_truncated attribution — see
+// previewInjectedDocuments.
 //
 // Read access tracks the existing stage/audit read endpoints — no
 // auth gate at the handler level today; the surrounding middleware
@@ -1937,24 +1956,38 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
 	trigger.ImplementStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypeImplement)) * time.Second
 
-	// This PREVIEW handler deliberately sets NO grooming context (trigger.Grooming
-	// stays nil), because — unlike handleGetStagePrompt — it injects NO documents
-	// at all (a pre-existing #2242 divergence). Forking to buildGroomingPropose
-	// here would render the grooming report contract with no charter among the
-	// injected set — the exact report-without-a-charter shape #2834's fail-closed
-	// forbids — so the preview stays byte-identical to today and renders a groom
-	// stage as an ordinary plan. Widening the preview to resolve documents (and
-	// then set Grooming) is #2804's, not this slice's.
+	// Repo-authored document injection + the charter fail-closed layer, run on
+	// the PREVIEW exactly as handleGetStagePrompt runs them (E54.12 / #2804).
+	// Placed at the same point (after both trigger-construction branches, after
+	// the stage timeouts, immediately before prompt.Build) and using the same
+	// error codes, messages and details builder, so the two endpoints agree on
+	// the rendered document block AND are indistinguishable to a caller on every
+	// refusal.
+	//
+	// The ONE deliberate divergence is previewInjectedDocuments in place of
+	// resolveInjectedDocuments: same resolve/render core, attribution
+	// SUPPRESSED. A preview constrains no agent, and this is an unsigned
+	// read-access GET the SPA re-fetches at will, so it must not append
+	// document_injected / document_truncated claims to the append-only audit
+	// log. Rationale and residual: previewInjectedDocuments' doc comment.
+	injected, err := s.previewInjectedDocuments(r.Context(), runRow, stage)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "document_injection_failed",
+			"resolve declared repo document failed", charterAwareInjectionErrorDetails(err))
+		return
+	}
+	groomingCtx, err := s.assertCharterInjected(r.Context(), runRow, stage, injected)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "document_injection_failed",
+			"required charter document was not injected", charterAwareInjectionErrorDetails(err))
+		return
+	}
+	trigger.InjectedDocuments = injected
+	trigger.Grooming = groomingCtx
+
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
-		if errors.Is(err, prompt.ErrUnsupportedStage) {
-			s.writeError(w, r, http.StatusNotImplemented, "unsupported_stage_type",
-				"prompt construction not yet implemented for this stage type",
-				map[string]any{"stage_type": string(stage.Type)})
-			return
-		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"build prompt failed", map[string]any{"error": err.Error()})
+		s.writePromptBuildError(w, r, string(stage.Type), err)
 		return
 	}
 

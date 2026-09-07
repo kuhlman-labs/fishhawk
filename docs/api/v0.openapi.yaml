@@ -12266,6 +12266,38 @@ paths:
                       `error.code` is one of:
                       - `stage_not_runnable` — the stage is awaiting_approval, awaiting_children, succeeded, failed, or cancelled. `error.details.current_state` holds the stage's current state string and `error.details.stage_id` holds the stage UUID.
                       - `decomposed_scope_unresolved` — the run is a decomposed child of a plan that declares a decomposition, but its slice scope could not be resolved (its persisted `slice_index` is out of range for the parent plan's sub_plans, or the matched sub-plan declares no scope files). The dispatch fails closed rather than serving the parent's full scope (#1721). `error.details.run_id` holds the child run UUID, `error.details.slice_index` the child's 0-based slice index (`-1` when the row carries none), and `error.details.parent_run_id` the parent (decomposed_from) run UUID.
+        '500':
+          description: |
+            Repo-declared document injection failed. Both prompt endpoints
+            resolve the documents a repository declares for this run/stage and
+            fail CLOSED rather than serving a prompt whose declared governance
+            document silently went missing (E55.1 / #2242, E54.2 / #2234). The
+            two endpoints refuse IDENTICALLY — same status, same `error.code`,
+            same `error.details.reason` (E54.12 / #2804).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/Error' }
+                  - description: |
+                      `error.code` is `document_injection_failed`.
+                      `error.details.reason` carries the machine-readable
+                      branch when the refusal comes from the charter consumer:
+                      - `charter_absent` — the repository conventions declare no `charter.path`.
+                      - `charter_path_empty` — a charter block whose path is empty or whitespace.
+                      - `charter_base_ref_unresolved` — no base-ref resolver is wired, the forge call failed, or it returned an empty ref (which a forge reads as the default branch: a mutable read, refused rather than defaulted).
+                      - `charter_not_injected` — a backlog-grooming propose prompt reached the post-resolution check with no document resolved from the declared charter path.
+                      - `conventions_unavailable` — the repository conventions could not be loaded at all.
+                      - `grooming_workflow_spec_unreadable` — the run's cached workflow spec cannot be re-parsed AND the `grooming_report` artifact is attributable to this run's workflow, so whether this is a grooming propose stage is undecidable.
+
+                      For a `repodoc` resolution failure the details also carry
+                      `path` (the declared document path) and
+                      `declaration_site` (the knob an operator has to turn).
+                      NOTE: 5xx responses are passed through the default-deny
+                      detail redactor (E67.15 / #2587), which admits `reason`
+                      but not `path` / `declaration_site` / `error`; those
+                      reach the operator through the log record keyed by
+                      `error_ref`.
         '501':
           description: Prompt construction not implemented for this stage type.
           content:
@@ -12499,6 +12531,38 @@ paths:
                       `error.code` is one of:
                       - `stage_not_runnable` — the stage is awaiting_approval, awaiting_children, succeeded, failed, or cancelled. `error.details.current_state` holds the stage's current state string and `error.details.stage_id` holds the stage UUID.
                       - `decomposed_scope_unresolved` — the run is a decomposed child of a plan that declares a decomposition, but its slice scope could not be resolved (its persisted `slice_index` is out of range for the parent plan's sub_plans, or the matched sub-plan declares no scope files). The dispatch fails closed rather than serving the parent's full scope (#1721). `error.details.run_id` holds the child run UUID, `error.details.slice_index` the child's 0-based slice index (`-1` when the row carries none), and `error.details.parent_run_id` the parent (decomposed_from) run UUID.
+        '500':
+          description: |
+            Repo-declared document injection failed. Both prompt endpoints
+            resolve the documents a repository declares for this run/stage and
+            fail CLOSED rather than serving a prompt whose declared governance
+            document silently went missing (E55.1 / #2242, E54.2 / #2234). The
+            two endpoints refuse IDENTICALLY — same status, same `error.code`,
+            same `error.details.reason` (E54.12 / #2804).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/Error' }
+                  - description: |
+                      `error.code` is `document_injection_failed`.
+                      `error.details.reason` carries the machine-readable
+                      branch when the refusal comes from the charter consumer:
+                      - `charter_absent` — the repository conventions declare no `charter.path`.
+                      - `charter_path_empty` — a charter block whose path is empty or whitespace.
+                      - `charter_base_ref_unresolved` — no base-ref resolver is wired, the forge call failed, or it returned an empty ref (which a forge reads as the default branch: a mutable read, refused rather than defaulted).
+                      - `charter_not_injected` — a backlog-grooming propose prompt reached the post-resolution check with no document resolved from the declared charter path.
+                      - `conventions_unavailable` — the repository conventions could not be loaded at all.
+                      - `grooming_workflow_spec_unreadable` — the run's cached workflow spec cannot be re-parsed AND the `grooming_report` artifact is attributable to this run's workflow, so whether this is a grooming propose stage is undecidable.
+
+                      For a `repodoc` resolution failure the details also carry
+                      `path` (the declared document path) and
+                      `declaration_site` (the knob an operator has to turn).
+                      NOTE: 5xx responses are passed through the default-deny
+                      detail redactor (E67.15 / #2587), which admits `reason`
+                      but not `path` / `declaration_site` / `error`; those
+                      reach the operator through the log record keyed by
+                      `error_ref`.
         '501':
           description: Prompt construction not implemented for this stage type.
           content:
