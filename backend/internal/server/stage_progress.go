@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -40,8 +39,12 @@ type stageProgressStore interface {
 }
 
 // stageProgressReport is the request body of the ingest endpoint. reported_at
-// is NOT accepted from the client — it is stamped server-side from the request
-// clock, so the runner cannot backdate or forge a heartbeat's time.
+// is NOT accepted from the client — it is stamped by the DATABASE in the ingest
+// UPDATE (Postgres now(), see run.RecordStageProgress), so the runner cannot
+// backdate or forge a heartbeat's time. Stamping in the DB rather than from
+// this process's request clock additionally removes the backend host's clock
+// from the dispatch watchdog's attempt-relative liveness comparison (#3084):
+// reported_at then shares a clock domain with stages.dispatched_at.
 type stageProgressReport struct {
 	LastEvent         string `json:"last_event"`
 	TurnsThisAttempt  int    `json:"turns_this_attempt"`
@@ -124,11 +127,15 @@ func (s *Server) handleReportStageProgress(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// No ReportedAt: the ingest UPDATE stamps it from the DATABASE clock and
+	// would overwrite anything set here (#3084). This is a SIMPLIFICATION, not a
+	// control — re-adding a process stamp would be behaviourally invisible — so
+	// its absence is pinned STRUCTURALLY by the capturing-fake test in
+	// stage_progress_test.go, which asserts the handler passes a ZERO ReportedAt.
 	p := run.StageProgress{
 		LastEvent:         clampRunes(body.LastEvent, progressLastEventMaxLen),
 		TurnsThisAttempt:  body.TurnsThisAttempt,
 		TokensThisAttempt: body.TokensThisAttempt,
-		ReportedAt:        time.Now().UTC(),
 	}
 	applied, err := store.RecordStageProgress(r.Context(), stageID, p)
 	if err != nil {

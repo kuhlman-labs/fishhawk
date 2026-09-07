@@ -487,3 +487,68 @@ func (r *erroringProgressRepo) StageProgressByID(context.Context, uuid.UUID) (*r
 func (r *erroringProgressRepo) StageProgressForRun(context.Context, uuid.UUID) (map[uuid.UUID]run.StageProgress, error) {
 	return nil, nil
 }
+
+// TestReportStageProgress_HandlerContributesNoProcessTimestamp closes the
+// HANDLER leg of the #3084 seam. The stamp now comes from the DATABASE
+// (RecordStageProgress's jsonb_set(now())), so re-adding a time.Now() to the
+// handler's run.StageProgress literal would be behaviourally INVISIBLE — the SQL
+// overwrites it, and no end-to-end assertion could go red. This capturing fake
+// records what the handler actually passed and asserts ReportedAt is the ZERO
+// value, making the handler's non-contribution a STRUCTURAL pin.
+func TestReportStageProgress_HandlerContributesNoProcessTimestamp(t *testing.T) {
+	stageID := uuid.New()
+	runID := uuid.New()
+	repo := &capturingProgressRepo{
+		stageGetRepo: &stageGetRepo{stagesRunRepo: newStagesRunRepo()},
+		stage:        &run.Stage{ID: stageID, RunID: runID, State: run.StageStateRunning},
+	}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	w := postProgressDirect(t, s, runID.String(), stageID.String(),
+		progressBody(t, stageProgressReport{LastEvent: "assistant", TurnsThisAttempt: 4, TokensThisAttempt: 99}))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204:\n%s", w.Code, w.Body.String())
+	}
+	if repo.calls != 1 {
+		t.Fatalf("RecordStageProgress called %d times, want 1", repo.calls)
+	}
+	if !repo.captured.ReportedAt.IsZero() {
+		t.Errorf("handler passed ReportedAt = %v, want the ZERO value — the process clock must contribute nothing; the database stamps reported_at (#3084)", repo.captured.ReportedAt)
+	}
+	// The fields the handler IS responsible for still arrive, so a zero
+	// ReportedAt cannot be an artifact of the handler passing an empty struct.
+	if repo.captured.LastEvent != "assistant" || repo.captured.TurnsThisAttempt != 4 || repo.captured.TokensThisAttempt != 99 {
+		t.Errorf("captured progress = %+v, want the decoded body fields", repo.captured)
+	}
+}
+
+// capturingProgressRepo satisfies run.Repository (via stageGetRepo) AND
+// stageProgressStore, recording the run.StageProgress the handler passed so a
+// test can assert on the handler's OWN contribution rather than on persisted
+// state the SQL would have overwritten.
+type capturingProgressRepo struct {
+	*stageGetRepo
+	stage    *run.Stage
+	captured run.StageProgress
+	calls    int
+}
+
+func (r *capturingProgressRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	if r.stage != nil && r.stage.ID == id {
+		return r.stage, nil
+	}
+	return nil, run.ErrNotFound
+}
+
+func (r *capturingProgressRepo) RecordStageProgress(_ context.Context, _ uuid.UUID, p run.StageProgress) (bool, error) {
+	r.calls++
+	r.captured = p
+	return true, nil
+}
+
+func (r *capturingProgressRepo) StageProgressByID(context.Context, uuid.UUID) (*run.StageProgress, error) {
+	return nil, nil
+}
+
+func (r *capturingProgressRepo) StageProgressForRun(context.Context, uuid.UUID) (map[uuid.UUID]run.StageProgress, error) {
+	return nil, nil
+}

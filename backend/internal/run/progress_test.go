@@ -7,6 +7,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // progressStore type-asserts the concrete postgres repo to the optional
@@ -167,5 +168,60 @@ func TestStageProgressByID_UndecodablePayloadDegradesToNil(t *testing.T) {
 	}
 	if _, present := m[s.ID]; present {
 		t.Errorf("undecodable stage present in run map: %+v", m)
+	}
+}
+
+// TestRecordStageProgress_ReportedAtIsDatabaseStamped is the DONE-MEANS pin for
+// #3084: the stored reported_at is the DATABASE's instant, and a caller-supplied
+// value is DISCARDED.
+//
+// The caller seeds the 1970 epoch — an instant no clock in any deployment
+// produces — so a pass cannot be a coincidence of the two clocks happening to
+// agree. It also doubles as the to_jsonb RENDERING guard (approval condition 3):
+// Postgres renders a timestamptz inside jsonb as ISO-8601 WITH an offset, which
+// Go's RFC3339 unmarshal accepts. Were the spelling changed to
+// `to_jsonb(now() AT TIME ZONE 'UTC')` the rendering would carry NO offset,
+// RFC3339 would reject it, and the fail-open decode would degrade the read to
+// nil — which this test fails on.
+func TestRecordStageProgress_ReportedAtIsDatabaseStamped(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	store := progressStore(t, repo)
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0)
+
+	epoch := time.Unix(0, 0).UTC()
+	applied, err := store.RecordStageProgress(ctx, s.ID, run.StageProgress{
+		LastEvent:  "assistant",
+		ReportedAt: epoch,
+	})
+	if err != nil {
+		t.Fatalf("RecordStageProgress: %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false on a non-terminal stage, want true")
+	}
+
+	// The database's own clock, read in the same domain the stamp came from.
+	var dbNow time.Time
+	if err := pool.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
+		t.Fatalf("read database now(): %v", err)
+	}
+
+	got, err := store.StageProgressByID(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("StageProgressByID: %v", err)
+	}
+	if got == nil {
+		t.Fatal("StageProgressByID = nil after a recorded heartbeat — the stored reported_at did not decode (to_jsonb rendering must stay RFC3339-parseable; `to_jsonb(now() AT TIME ZONE 'UTC')` renders without an offset and fails here)")
+	}
+	if got.ReportedAt.Equal(epoch) {
+		t.Fatalf("stored ReportedAt = %v, the caller's value verbatim — the database did not stamp it", got.ReportedAt)
+	}
+	window := timescale.D(time.Minute)
+	if d := got.ReportedAt.Sub(dbNow.UTC()); d > window || d < -window {
+		t.Errorf("stored ReportedAt = %v is %v from the database's own now() = %v (want within %v) — it is not the database's instant", got.ReportedAt, d, dbNow.UTC(), window)
 	}
 }

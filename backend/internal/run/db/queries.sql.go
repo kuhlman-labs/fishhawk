@@ -1087,17 +1087,28 @@ func (q *Queries) ParkScopeCompleteness(ctx context.Context, arg ParkScopeComple
 	return i, err
 }
 
-// PRESERVE ON REGENERATION (#3083): the terminal-state predicate below is a
-// HAND-MIRRORED copy of backend/internal/run/queries.sql's RecordStageProgress,
-// which is the AUTHORITY. `sqlc generate` regenerates every package in this
-// repo and produces out-of-scope churn, so the .sql and this constant are
-// edited in lockstep by hand. If a future regeneration drops 'superseded' from
-// this IN-list, re-add it from the .sql — the drift is caught behaviorally by
-// the run/postgres_test.go case asserting a heartbeat against a superseded
-// stage matches ZERO rows, not by inspection.
+// PRESERVE ON REGENERATION (#3083, #3084): TWO elements of the statement below
+// are HAND-MIRRORED copies of backend/internal/run/queries.sql's
+// RecordStageProgress, which is the AUTHORITY — (1) the terminal-state IN-list
+// and (2) the jsonb_set(...) SET expression. `sqlc generate` regenerates every
+// package in this repo and produces out-of-scope churn, so the .sql and this
+// constant are edited in lockstep by hand, and THIS constant is the copy that
+// actually executes. If a future regeneration drops 'superseded' from the
+// IN-list, or reverts the SET expression to a bare `progress = $2`, re-add both
+// from the .sql — each drift is caught behaviorally, not by inspection: the
+// IN-list by the run/postgres_test.go case asserting a heartbeat against a
+// superseded stage matches ZERO rows, and the jsonb_set by
+// TestRecordStageProgress_ReportedAtIsDatabaseStamped plus
+// TestListDispatchedStageLiveness_BackendClockLagDoesNotHideAFreshHeartbeat.
+//
+// The jsonb_set stamps reported_at from the DATABASE clock so it shares a clock
+// domain with stages.dispatched_at (migration 0072's trigger, also now()). The
+// `to_jsonb(now())` spelling is load-bearing — `to_jsonb(now() AT TIME ZONE
+// 'UTC')` renders without an offset and Go's RFC3339 unmarshal rejects it. See
+// the .sql comment for the measured renderings.
 const recordStageProgress = `-- name: RecordStageProgress :execrows
 UPDATE stages
-   SET progress = $2
+   SET progress = jsonb_set($2::jsonb, '{reported_at}', to_jsonb(now()))
  WHERE id = $1
    AND state NOT IN ('succeeded', 'failed', 'cancelled', 'superseded')
 `

@@ -3164,15 +3164,17 @@ components:
           type: string
           format: date-time
           description: |
-            Server-stamped ingest time of this heartbeat. The runner does not
-            set it.
+            Ingest time of this heartbeat, stamped by the DATABASE (Postgres
+            `now()`, in the ingest UPDATE) — so it shares a clock domain with
+            the dispatch stamp the dispatch watchdog compares it against
+            (#3084). Neither the runner nor the backend process sets it.
 
     StageProgressReport:
       type: object
       description: |
         The request body of `POST /v0/runs/{run_id}/stages/{stage_id}/progress`
-        (#2541). `reported_at` is NOT accepted — it is stamped server-side.
-        Unknown fields are rejected.
+        (#2541). `reported_at` is NOT accepted — it is stamped by the DATABASE
+        at ingest (Postgres `now()`). Unknown fields are rejected.
       required: [last_event, turns_this_attempt, tokens_this_attempt]
       properties:
         last_event:
@@ -9550,7 +9552,9 @@ paths:
         The reporter is fail-open by construction on the runner side: a lost
         heartbeat is superseded ~15s later and can never fail a stage.
 
-        `reported_at` is stamped server-side; the runner does not set it.
+        `reported_at` is stamped by the DATABASE at ingest (Postgres `now()`),
+        so it shares a clock domain with the dispatch stamp the dispatch
+        watchdog compares it against (#3084); the runner does not set it.
         `last_event` is clamped to 128 runes and negative counters are
         rejected, so an unbounded or nonsensical payload can never be
         persisted. Unknown body fields are rejected.
