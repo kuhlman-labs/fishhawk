@@ -267,6 +267,28 @@ func (h *harness) pollTick() { h.tick <- time.Time{} }
 // logs returns everything the supervisor has written to its stderr writer.
 func (h *harness) logs() string { return h.log.String() }
 
+// barrier establishes a real happens-before between the event loop's PREVIOUS
+// iteration and the caller, so a test that drove the loop can read a sink the
+// loop writes LAST without racing it (#3004).
+//
+// Mechanism, not a timing margin: supervisor.run is a SINGLE goroutine that
+// re-enters its select only after the current iteration — handler plus the
+// maybeSwap re-entry — has fully returned, and h.in is UNBUFFERED, so this send
+// completes only once the loop RECEIVES the frame. Go's memory model makes the
+// receive synchronized before the completion of the send on an unbuffered
+// channel, so barrier() returning proves every earlier iteration finished,
+// including the s.logf that noteDeferral runs AFTER its publishState — which is
+// exactly the ordering the published-snapshot wait does not give.
+//
+// The frame is inert for every assertion here. It is a NOTIFICATION (method, no
+// id), so handleUpstream registers no in-flight entry, and in the
+// quiesce-expired passive-wait arm maybeSwap gates its noteDeferral on
+// fromTick, so a proxied frame neither publishes nor logs.
+func (h *harness) barrier() {
+	h.t.Helper()
+	h.send(`{"jsonrpc":"2.0","method":"notifications/progress"}`)
+}
+
 // expect returns the next client-facing frame or fails on timeout.
 func (h *harness) expect() string {
 	h.t.Helper()
@@ -1351,6 +1373,10 @@ func TestDeferralLogRateLimited(t *testing.T) {
 	isDeferral := func(st swapState) bool { return st.LastSwapOutcome == outcomeDeferredInFlight }
 	h.pub.waitFor(t, "deferred_in_flight", isDeferral)
 	countLogs := func() int { return strings.Count(h.logs(), "swap deferred: quiesce timeout") }
+	// The wait above is on the PUBLISH sink, but noteDeferral publishes BEFORE it
+	// logs, so observing the snapshot does not imply the log write happened. The
+	// barrier supplies the missing happens-before; the count stays EXACT (#3004).
+	h.barrier()
 	if got := countLogs(); got != 1 {
 		t.Fatalf("log lines after the first deferral = %d, want 1", got)
 	}
@@ -1360,14 +1386,24 @@ func TestDeferralLogRateLimited(t *testing.T) {
 	h.pollTick()
 	h.pollTick()
 	waitFor(t, func() bool { return h.pub.count(isDeferral) >= before+2 })
+	// A NEGATIVE assertion cannot be fixed by polling the log: there is no state
+	// to wait FOR, only completion to wait ON. The second pollTick returning
+	// proves only that tick 1's iteration finished, so tick 2's would-be log
+	// write may still be pending. The barrier waits on that completion.
+	h.barrier()
 	if got := countLogs(); got != 1 {
 		t.Fatalf("log lines while rate-limited = %d, want 1", got)
 	}
 
-	// Past the interval: the same persistent denial logs once more.
+	// Past the interval: the same persistent denial logs once more. clock.advance
+	// happens-before the pollTick send, which happens-before the loop's s.now()
+	// read, so the tick observes the advanced clock unambiguously. The barrier
+	// replaces a waitFor(countLogs() == 2): such a poll LATCHES on a transient
+	// value and would still pass if a regression logged three times, silently
+	// removing the exactly-once-per-interval control this test exists to pin.
 	clock.advance(deferralLogInterval + time.Second)
 	h.pollTick()
-	waitFor(t, func() bool { return countLogs() == 2 })
+	h.barrier()
 	if got := countLogs(); got != 2 {
 		t.Fatalf("log lines after the interval elapsed = %d, want 2", got)
 	}
