@@ -10686,7 +10686,10 @@ func TestRunImplementReviews_DecomposedParentPromptCarriesPerSliceVerify(t *test
 		"- slice 1 (child run " + child1.ID.String() + ", child implement stage: succeeded)",
 		"  verified head: SLICE1_HEAD_SENTINEL",
 		"  command: go test ./internal/slice1/...",
-		"      SLICE1_FAILURE_SENTINEL",
+		// #3192: the failing slice's tail renders VERBATIM inside a column-0
+		// verify-output envelope, not 6-space indented. Anchoring on the sentinel
+		// wrapped by both delimiters proves it lands inside the span.
+		"<<<BEGIN UNTRUSTED VERIFY OUTPUT>>>\nSLICE1_FAILURE_SENTINEL\n<<<END UNTRUSTED VERIFY OUTPUT>>>",
 		"It does NOT certify the consolidated fan-in tree under review here",
 	} {
 		if !strings.Contains(got, want) {
@@ -10703,8 +10706,11 @@ func TestRunImplementReviews_DecomposedParentPromptCarriesPerSliceVerify(t *test
 			t.Errorf("NOT-ATTACHED block must be suppressed on a decomposed parent; found %q\n---\n%s", forbidden, got)
 		}
 	}
-	// A passed slice's tail is bounded away; a failed slice's is kept.
-	if strings.Contains(got, "      green") {
+	// A passed slice's tail is bounded away; a failed slice's is kept. The
+	// passing tail "green" is suppressed, so it never appears as its OWN line
+	// anywhere in the prompt (the inline "CI-green" in the framing is not a
+	// "\ngreen\n" line, so this anchor cannot false-positive on it).
+	if strings.Contains(got, "\ngreen\n") {
 		t.Errorf("a passing slice's output tail must not reach the prompt\n---\n%s", got)
 	}
 }

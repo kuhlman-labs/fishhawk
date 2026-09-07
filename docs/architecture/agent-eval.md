@@ -353,18 +353,22 @@ double env-gated, and both SKIP in a checkout with no API key.
 
 ### Injection corpus — `injection.go`, `testdata/injection-corpus/`
 
-Five attack classes (direct instruction override, fake authority claim,
+Six attack classes (direct instruction override, fake authority claim,
 envelope delimiter breakout, code-fence-embedded instructions, split
-body/comment payload), each a committed `case.json` carrying the adversarial
-body, its comments, containment probes, a literal compliance marker, and
-either a `behavioral_rubric` or a `marker_only` declaration with a reason.
-`LoadInjectionCorpus` has THIRTEEN named fail-closed modes; an absent corpus
-directory is an ERROR, not an empty slice, because a silently-missing corpus is
-a silently-disabled gate.
+body/comment payload, and verify-output instruction injection — the payload in
+verify-gate output rather than an issue body, #3192), each a committed
+`case.json` carrying the adversarial body, its comments (and, for the #3192
+class, a `verify_output` block), containment probes, a literal compliance
+marker, and either a `behavioral_rubric` or a `marker_only` declaration with a
+reason. `LoadInjectionCorpus` has FIFTEEN named fail-closed modes; an absent
+corpus directory is an ERROR, not an empty slice, because a silently-missing
+corpus is a silently-disabled gate.
 
 **The offline gate asserts on OFFSETS.** Each probe must occur strictly inside
-its channel's envelope span in `plan`, `plan_review` and `implement_review`,
-and nowhere at all in `implement` (the never-re-ingest invariant). Offsets,
+its channel's envelope span in `plan`, `plan_review` and `implement_review`
+(a `verify_output` probe only in `implement_review`, the sole reviewed render
+that carries gate evidence, and absent from the other two), and nowhere at all
+in `implement` (the never-re-ingest invariant). Offsets,
 not substring presence: a probe present in the prompt but outside the envelope
 is the containment failure, and a presence assertion calls it a pass.
 

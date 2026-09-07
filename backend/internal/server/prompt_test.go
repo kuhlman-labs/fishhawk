@@ -12397,8 +12397,10 @@ func TestResolveStageGateEvidence_ParsedButNoVerifyRuns(t *testing.T) {
 			wantIn: []string{
 				tailOnlyNote,
 				"`no_verify_run_tail_in_gate_evidence`",
-				// The summary itself still renders, verbatim.
-				"Verify summary: outcome=passed (iterations 1/3) — detail: SUMMARY_ONLY_DETAIL_SENTINEL",
+				// The summary line still renders; its detail moved into an
+				// UNTRUSTED VERIFY OUTPUT envelope (#3192).
+				"Verify summary: outcome=passed (iterations 1/3)\n",
+				"<<<BEGIN UNTRUSTED VERIFY OUTPUT>>>\nSUMMARY_ONLY_DETAIL_SENTINEL\n<<<END UNTRUSTED VERIFY OUTPUT>>>",
 				"IS committed-tree evidence and STANDS",
 			},
 			wantNotIn: []string{

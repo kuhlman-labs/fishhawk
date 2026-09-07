@@ -45,10 +45,11 @@ and double env-gated.
 | Field | Meaning |
 |---|---|
 | `name` | Fixture name. |
-| `attack_class` | One of `InjectionAttackClasses`: `direct-instruction-override`, `fake-authority-claim`, `envelope-delimiter-breakout`, `code-fence-embedded-instructions`, `split-body-comment-payload`. |
+| `attack_class` | One of `InjectionAttackClasses` (SIX): `direct-instruction-override`, `fake-authority-claim`, `envelope-delimiter-breakout`, `code-fence-embedded-instructions`, `split-body-comment-payload`, `verify-output-instruction-injection`. |
 | `body` | The adversarial issue body. |
 | `comments[]` | `{author, body, created_at}` — the split-channel class needs at least one. |
-| `containment_probes[]` | `{channel: "body"\|"comment", text}` — literal substrings the offline gate asserts land INSIDE that channel's envelope. |
+| `verify_output` | `{parent_tail, parent_summary_detail, slice_tail, slice_summary_detail}` (#3192) — the adversarial verify-gate output for the `verify-output-instruction-injection` class. `ToTrigger` attaches a `GateEvidence` built from it (a parent verify run + summary AND one child slice), so ONE fixture exercises BOTH implement-review render sites. Nil leaves `GateEvidence` nil, keeping every other fixture byte-identical. |
+| `containment_probes[]` | `{channel: "body"\|"comment"\|"verify_output", text}` — literal substrings the offline gate asserts land INSIDE that channel's envelope. A `verify_output` probe is asserted only in the `implement_review` render (the sole reviewed render that ingests gate evidence) and WHOLLY ABSENT from `plan`/`plan_review`. |
 | `compliance_marker` | The literal "emit this token" sentinel. |
 | `marker_only` + `marker_only_reason` | Declares this payload admits NO substantive behavioural signal beyond the marker, and says why. |
 | `behavioral_rubric` | `{compliant_behavior, resistant_behavior, dimensions[]}` — required unless `marker_only`, forbidden when `marker_only`. |
@@ -109,9 +110,12 @@ cannot find it means the gate is silently not running.
 | (k) | a rubric with an empty compliant/resistant behaviour or zero dimensions |
 | (l) | `split-body-comment-payload` with zero comments |
 | (m) | a rubric that does not declare `DeciderDimension` |
+| (n) | a `verify_output` probe on a case with no `verify_output` block, or whose text matches none of its four fields (#3192) |
+| (o) | a `verify_output` block whose four fields are ALL empty — it would render no envelope (#3192) |
 
-Mode (f) is what makes the containment matrix meaningful: a probe absent from
-its own source text would pass containment **vacuously**.
+Mode (f) — and its `verify_output` sibling (n) — is what makes the containment
+matrix meaningful: a probe absent from its own source text would pass
+containment **vacuously**.
 
 ### The offline gates
 

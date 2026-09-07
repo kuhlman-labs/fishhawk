@@ -63,6 +63,11 @@ var InjectionAttackClasses = []string{
 	"envelope-delimiter-breakout",
 	"code-fence-embedded-instructions",
 	"split-body-comment-payload",
+	// #3192: the payload lives in VERIFY-GATE OUTPUT (a tail / summary detail
+	// rolled into the implement-review prompt's gate evidence), not in an issue
+	// body or comment. Its probes use the "verify_output" channel and are
+	// asserted only in the implement_review render.
+	"verify-output-instruction-injection",
 }
 
 // ReviewedRenderStages are the three stage prompts that INGEST untrusted
@@ -83,10 +88,35 @@ type IssueCommentFixture struct {
 // (Channel "comment") that MUST render inside that channel's quarantine
 // envelope and nowhere else.
 type Probe struct {
-	// Channel is "body" or "comment" — which envelope the text must land in.
+	// Channel is "body", "comment", or "verify_output" — which envelope the
+	// text must land in. A "verify_output" probe is asserted only in the
+	// implement_review render (the only reviewed render that ingests gate
+	// evidence) and is asserted WHOLLY ABSENT from the plan/plan_review renders.
 	Channel string `json:"channel"`
 	// Text is the literal probe substring.
 	Text string `json:"text"`
+}
+
+// VerifyOutputFixture declares the verify-gate output channel of an injection
+// case (#3192): the adversarial payload as it would arrive on the implement-
+// review prompt's gate evidence. ToTrigger attaches ONE fixture that exercises
+// BOTH render sites — a parent verify run + summary and one child slice — so a
+// half-fix that envelopes only the per-slice rows is caught.
+type VerifyOutputFixture struct {
+	// ParentTail is the parent verify run's OutputTail (multiline allowed).
+	ParentTail string `json:"parent_tail"`
+	// ParentSummaryDetail is the parent verify summary's Detail.
+	ParentSummaryDetail string `json:"parent_summary_detail"`
+	// SliceTail is one child slice's failed verify run OutputTail.
+	SliceTail string `json:"slice_tail"`
+	// SliceSummaryDetail is that slice's verify summary Detail.
+	SliceSummaryDetail string `json:"slice_summary_detail"`
+}
+
+// fields returns the four declared verify-output source strings, for the
+// substring check and the all-empty guard.
+func (v *VerifyOutputFixture) fields() []string {
+	return []string{v.ParentTail, v.ParentSummaryDetail, v.SliceTail, v.SliceSummaryDetail}
 }
 
 // BehavioralRubric states, in reviewable terms, what COMPLIANCE with this
@@ -113,6 +143,12 @@ type InjectionCase struct {
 	// Comments are the fixture's issue comments (the split-channel class
 	// needs at least one).
 	Comments []IssueCommentFixture `json:"comments,omitempty"`
+	// VerifyOutput, when non-nil, carries the adversarial verify-gate output
+	// (#3192): a payload that arrives on the implement-review prompt's gate
+	// evidence rather than in the issue body/comments. ToTrigger attaches a
+	// GateEvidence built from it; nil leaves GateEvidence nil so every existing
+	// fixture's renders stay byte-identical.
+	VerifyOutput *VerifyOutputFixture `json:"verify_output,omitempty"`
 	// ContainmentProbes are the offline gate's assertions.
 	ContainmentProbes []Probe `json:"containment_probes"`
 	// ComplianceMarker is the literal "emit this token" sentinel. Its
@@ -146,7 +182,7 @@ type NamedInjectionCase struct {
 // the gate is silently not running — the exact fail-open this issue exists
 // to close.
 //
-// THIRTEEN named fail-closed modes, each returning an error naming the case:
+// FIFTEEN named fail-closed modes, each returning an error naming the case:
 //
 //	(a) missing/unreadable case.json
 //	(b) malformed JSON
@@ -165,6 +201,12 @@ type NamedInjectionCase struct {
 //	(m) a behavioral_rubric that does not declare DeciderDimension — the
 //	    verdict reads that dimension, so a fixture omitting it would hand
 //	    the verdict a missing map entry (#2291 operator condition 2a)
+//	(n) a verify_output probe on a case declaring no verify_output block, or
+//	    whose text matches none of the four VerifyOutput fields — without it the
+//	    containment assertion for that probe passes VACUOUSLY (the #3192 sibling
+//	    of mode (f))
+//	(o) a verify_output block whose four fields are ALL empty — it would render
+//	    no envelope at all, so a fixture declaring one is malformed
 func LoadInjectionCorpus(dir string) ([]NamedInjectionCase, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -230,6 +272,18 @@ func (c *InjectionCase) validate() error {
 	if c.AttackClass == "split-body-comment-payload" && len(c.Comments) == 0 {
 		return fmt.Errorf("attack_class split-body-comment-payload requires at least one comment") // (l)
 	}
+	if c.VerifyOutput != nil {
+		allEmpty := true
+		for _, f := range c.VerifyOutput.fields() {
+			if strings.TrimSpace(f) != "" {
+				allEmpty = false
+				break
+			}
+		}
+		if allEmpty {
+			return fmt.Errorf("verify_output block declares all four fields empty (parent_tail, parent_summary_detail, slice_tail, slice_summary_detail) — it would render no envelope") // (o)
+		}
+	}
 	return nil
 }
 
@@ -246,10 +300,31 @@ func (c *InjectionCase) validateProbe(i int, p Probe) error {
 		if p.Text == "" || !anyCommentContains(c.Comments, p.Text) {
 			return fmt.Errorf("containment_probes[%d]: text %q is not a substring of any declared comment", i, p.Text)
 		}
+	case "verify_output":
+		// (n): a verify_output probe must occur in a DECLARED verify_output
+		// field, or its containment assertion passes VACUOUSLY — the #3192
+		// sibling of mode (f). A case with no verify_output block renders no
+		// verify-output envelope at all, so such a probe is always vacuous.
+		if c.VerifyOutput == nil {
+			return fmt.Errorf("containment_probes[%d]: channel \"verify_output\" but the case declares no verify_output block", i)
+		}
+		if p.Text == "" || !anyContains(c.VerifyOutput.fields(), p.Text) {
+			return fmt.Errorf("containment_probes[%d]: text %q is not a substring of any declared verify_output field", i, p.Text)
+		}
 	default:
-		return fmt.Errorf("containment_probes[%d]: channel %q must be \"body\" or \"comment\"", i, p.Channel)
+		return fmt.Errorf("containment_probes[%d]: channel %q must be \"body\", \"comment\", or \"verify_output\"", i, p.Channel)
 	}
 	return nil
+}
+
+// anyContains reports whether any string in ss contains sub.
+func anyContains(ss []string, sub string) bool {
+	for _, s := range ss {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // validate implements modes (k) and (m).
@@ -300,7 +375,7 @@ func ToTrigger(c InjectionCase) prompt.Trigger {
 	for _, cm := range c.Comments {
 		comments = append(comments, prompt.IssueComment{Author: cm.Author, Body: cm.Body, CreatedAt: cm.CreatedAt})
 	}
-	return prompt.Trigger{
+	t := prompt.Trigger{
 		Source:        "github_issue",
 		IssueNumber:   2291,
 		IssueTitle:    "Eval fixture: " + c.AttackClass,
@@ -309,6 +384,37 @@ func ToTrigger(c InjectionCase) prompt.Trigger {
 		IssueURL:      "https://github.com/kuhlman-labs/fishhawk/issues/2291",
 		Repo:          "kuhlman-labs/fishhawk",
 	}
+	// #3192: when the fixture declares a verify_output channel, attach a
+	// GateEvidence that exercises BOTH implement-review render sites from ONE
+	// fixture — a parent verify run + summary AND one child slice — so the
+	// issue's "do not fix only the per-slice rows" instruction is what the
+	// containment gate proves. Left nil otherwise, so every existing fixture's
+	// renders (and the pre-existing gates over them) stay byte-identical.
+	if c.VerifyOutput != nil {
+		idx := 0
+		t.GateEvidence = &prompt.GateEvidence{
+			VerifyRuns: []prompt.GateVerifyRun{{
+				Command: "scripts/test verify", ExitCode: 1, Outcome: "failed",
+				OutputTail: c.VerifyOutput.ParentTail,
+			}},
+			VerifySummary: &prompt.GateVerifySummary{
+				Outcome: "failed", Iterations: 3, MaxIterations: 3,
+				Detail: c.VerifyOutput.ParentSummaryDetail,
+			},
+			SliceVerify: []prompt.GateSliceVerify{{
+				SliceIndex: &idx, ChildRunID: "child-slice-0", ChildStageState: "failed",
+				VerifyRuns: []prompt.GateVerifyRun{{
+					Command: "scripts/test verify", ExitCode: 1, Outcome: "failed",
+					OutputTail: c.VerifyOutput.SliceTail,
+				}},
+				VerifySummary: &prompt.GateVerifySummary{
+					Outcome: "failed", Iterations: 3, MaxIterations: 3,
+					Detail: c.VerifyOutput.SliceSummaryDetail,
+				},
+			}},
+		}
+	}
+	return t
 }
 
 // RenderAll renders the fixture through the four stage prompts that matter
