@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2140,17 +2141,40 @@ func TestStartCampaign_GroomingUnreadableUnparsableToken_NamesTokenAndExplanatio
 type unparsableE2EGHAPI struct {
 	issues   map[int]*githubclient.Issue
 	getCalls map[int]int
+
+	// mu guards getCalls, the fake's own bookkeeping state. ResolveDependencies
+	// fetches with bounded CONCURRENCY since #3113 (fetchIssuesBounded), so
+	// concurrent GetIssue calls race on the lazy-init and the increment without
+	// it (#3226). This is the fake's OWN bookkeeping lock, not a lock standing
+	// in for anything in the production path — the production path has no
+	// shared mutable state across goroutines at all (workers return values over
+	// a channel and the parent merges).
+	mu sync.Mutex
 }
 
 func (f *unparsableE2EGHAPI) GetIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) (*githubclient.Issue, error) {
+	f.mu.Lock()
 	if f.getCalls == nil {
 		f.getCalls = map[int]int{}
 	}
 	f.getCalls[number]++
+	f.mu.Unlock()
 	if iss, ok := f.issues[number]; ok {
 		return iss, nil
 	}
 	return nil, fmt.Errorf("githubclient: issue #%d not found", number)
+}
+
+// callSnapshot returns a copy of getCalls taken under mu, so callers never
+// touch the fake's bookkeeping map directly.
+func (f *unparsableE2EGHAPI) callSnapshot() map[int]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[int]int, len(f.getCalls))
+	for k, v := range f.getCalls {
+		out[k] = v
+	}
+	return out
 }
 
 func (f *unparsableE2EGHAPI) CreateIssue(context.Context, forge.CredentialScope, githubclient.RepoRef, githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
@@ -2211,7 +2235,7 @@ func TestStartCampaign_UnparseableDependsOnToken_ReachesOperatorMessageEndToEnd(
 		// they still classify as dangling — and are READ by classifyOutOfSetTarget.
 		1639: {Number: 1639, Title: "num a", State: "open"},
 		42:   {Number: 42, Title: "num b", State: "open"},
-	}}
+	}, getCalls: map[int]int{}}
 
 	// Drive the REAL provider path — the marker is parsed by production code.
 	res, err := wmgithub.New(stub).ResolveDependencies(context.Background(), workmgmt.IssueSetRequest{
@@ -2224,14 +2248,15 @@ func TestStartCampaign_UnparseableDependsOnToken_ReachesOperatorMessageEndToEnd(
 
 	// Operator condition 4: GetIssue reached the two out-of-set numbers and the
 	// in-set fetch, and NEVER the reduced cross-repo number 12.
-	if stub.getCalls[1639] == 0 || stub.getCalls[42] == 0 {
-		t.Errorf("GetIssue calls = %v, want a read for both out-of-set numeric targets 1639 and 42", stub.getCalls)
+	calls := stub.callSnapshot()
+	if calls[1639] == 0 || calls[42] == 0 {
+		t.Errorf("GetIssue calls = %v, want a read for both out-of-set numeric targets 1639 and 42", calls)
 	}
-	if got := stub.getCalls[12]; got != 0 {
+	if got := calls[12]; got != 0 {
 		t.Errorf("GetIssue(#12) called %d times — the cross-repo token other/repo#12 must NEVER reach a local lookup", got)
 	}
-	if len(stub.getCalls) != 3 { // 2032 (in-set), 1639, 42
-		t.Errorf("GetIssue call set = %v, want exactly {2032,1639,42}", stub.getCalls)
+	if len(calls) != 3 { // 2032 (in-set), 1639, 42
+		t.Errorf("GetIssue call set = %v, want exactly {2032,1639,42}", calls)
 	}
 
 	// Carry the provider-produced result through Assemble (fails closed on the
@@ -2270,6 +2295,57 @@ func TestStartCampaign_UnparseableDependsOnToken_ReachesOperatorMessageEndToEnd(
 	}
 	if strings.Contains(msg, "issue:0") {
 		t.Errorf("operator message %q renders issue:0 for the unresolvable target — forbidden (#2956)", msg)
+	}
+}
+
+// TestUnparsableE2EGHAPI_GetIssueIsConcurrencySafe is the DETERMINISTIC -race
+// counterfactual vehicle for unparsableE2EGHAPI's mu (#3226): 64 goroutines
+// hammer GetIssue 16 times each across a small number set, so a removed mutex
+// races on the very first run — where the end-to-end test above only races
+// intermittently at fetchIssuesBounded's 8-way fan-out.
+func TestUnparsableE2EGHAPI_GetIssueIsConcurrencySafe(t *testing.T) {
+	numbers := []int{2032, 1639, 42}
+	stub := &unparsableE2EGHAPI{
+		issues: map[int]*githubclient.Issue{
+			2032: {Number: 2032, Title: "a", State: "open"},
+			1639: {Number: 1639, Title: "b", State: "open"},
+			42:   {Number: 42, Title: "c", State: "open"},
+		},
+		getCalls: map[int]int{},
+	}
+
+	const goroutines = 64
+	const perGoroutine = 16
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				n := numbers[i%len(numbers)]
+				if _, err := stub.GetIssue(context.Background(), forge.CredentialScope{}, githubclient.RepoRef{}, n); err != nil {
+					t.Errorf("GetIssue(#%d): %v", n, err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	calls := stub.callSnapshot()
+	// wantCounts mirrors the goroutine body's own i%len(numbers) cycling, so the
+	// expected per-number total is exact regardless of whether perGoroutine
+	// divides evenly by len(numbers).
+	wantCounts := make(map[int]int, len(numbers))
+	for i := 0; i < perGoroutine; i++ {
+		wantCounts[numbers[i%len(numbers)]]++
+	}
+	for n := range wantCounts {
+		wantCounts[n] *= goroutines
+	}
+	for _, n := range numbers {
+		if got, want := calls[n], wantCounts[n]; got != want {
+			t.Errorf("GetIssue(#%d) called %d times, want exactly %d", n, got, want)
+		}
 	}
 }
 
