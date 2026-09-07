@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -4436,6 +4437,20 @@ func TestHumanReviewGateNextActions_ImplementRow_ReturnsNil(t *testing.T) {
 // (kept alongside the direct unit above, per approval condition 2): the same
 // human review row WITH a succeeded implement stage still classifies through
 // implementStageNextActions exactly as it did before this arm existed.
+//
+// It asserts the POSITIVE pre-#3014 output — the implement_gate_settled state
+// and its exact [approve_pr, fishhawk_merge_run] action list — not merely that
+// the state is not human_review_gate_parked. A negative-only assertion would
+// still pass if this fixture's classification silently drifted to
+// `unclassified` or to any other arm, so it would guard the hijack defect but
+// not the preservation claim this test's name makes.
+//
+// COUNTERFACTUAL (executed, #3014 fix-up): rewriting the implement_gate_settled
+// arm's state literal to "unclassified" turns this RED with
+// `state = "unclassified", want implement_gate_settled` — the exact drift the
+// earlier negative-only assertion stayed GREEN under. Renaming the arm's first
+// action turns it RED with `actions = [approve_pr_DROPPED fishhawk_merge_run],
+// want [approve_pr fishhawk_merge_run]`. Both restored byte-identically.
 func TestNextActions_HumanReviewGate_FeatureChangeUnaffected(t *testing.T) {
 	run := naRun("running")
 	stages := []Stage{
@@ -4446,6 +4461,17 @@ func TestNextActions_HumanReviewGate_FeatureChangeUnaffected(t *testing.T) {
 	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
 	if na.State == "human_review_gate_parked" {
 		t.Fatalf("state = human_review_gate_parked — the new arm hijacked feature_change's post-implement review gate, which implementStageNextActions owns")
+	}
+	if na.State != "implement_gate_settled" {
+		t.Fatalf("state = %q, want implement_gate_settled — the pre-#3014 classification for a feature_change run past its implement stage", na.State)
+	}
+	var got []string
+	for _, a := range na.Actions {
+		got = append(got, a.Action)
+	}
+	want := []string{"approve_pr", "fishhawk_merge_run"}
+	if !slices.Equal(got, want) {
+		t.Errorf("actions = %v, want %v — the pre-#3014 action list for this fixture, unchanged", got, want)
 	}
 }
 

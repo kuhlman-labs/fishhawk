@@ -90,14 +90,19 @@ func (f *fakeApprovalRepo) ListForStage(_ context.Context, stageID uuid.UUID) ([
 // tests: GetStage returns the seeded stage, TransitionStage records
 // the transition.
 type approvalRunRepo struct {
-	mu             sync.Mutex
-	stages         map[uuid.UUID]*run.Stage
-	runs           map[uuid.UUID]*run.Run
-	getErr         error
-	listStagesErr  error
-	transitionErr  error
-	transitions    []approvalTransition
-	rejectionFails bool
+	mu            sync.Mutex
+	stages        map[uuid.UUID]*run.Stage
+	runs          map[uuid.UUID]*run.Run
+	getErr        error
+	listStagesErr error
+	// listStagesEmpty makes ListStagesForRun return a successfully-read but
+	// EMPTY list (#3014): the other leg of recordDrivePlanApproved's
+	// `listErr != nil || len(stages) == 0` fail-open, which no fixture can
+	// reach naturally because every seeded run carries at least its plan row.
+	listStagesEmpty bool
+	transitionErr   error
+	transitions     []approvalTransition
+	rejectionFails  bool
 
 	// transitionRunEnabled makes TransitionRun functional (E48.55 / #2328).
 	// It defaults false so TransitionRun returns the same errors.New("not
@@ -338,6 +343,9 @@ func (r *approvalRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) (
 	defer r.mu.Unlock()
 	if r.listStagesErr != nil {
 		return nil, r.listStagesErr
+	}
+	if r.listStagesEmpty {
+		return []*run.Stage{}, nil
 	}
 	var out []*run.Stage
 	for _, st := range r.stages {
@@ -4934,6 +4942,38 @@ func TestRecordDrivePlanApproved_StageListError_FailsOpen(t *testing.T) {
 	advances := driveAdvanceFor(t, au)
 	if len(advances) != 1 || advances[0].Rule != drive.RulePlanApprovedDispatch {
 		t.Fatalf("run_auto_advanced = %+v, want one plan_approved_dispatch entry (fail-open on a stage-list read error)", advances)
+	}
+}
+
+// TestRecordDrivePlanApproved_EmptyStageList_FailsOpen is the SECOND leg of the
+// same fail-open: `listErr != nil || len(stages) == 0` also treats a
+// successfully-read but EMPTY list as no-evidence and keeps today's
+// plan_approved_dispatch stamp. The error leg above pins the error half; this
+// pins the DIRECTION of the length half, which no other fixture reaches because
+// every seeded run carries at least its plan row (the branch is defensive — a
+// created run never has zero rows — so the fake is given an explicit knob
+// rather than the test contorting the fixture).
+//
+// Like the error leg, the fixture seeds a HUMAN-review successor that WOULD
+// resolve to plan_approved_human_gate if the list were visible, so a pass
+// cannot be explained by the fixture's own shape.
+//
+// COUNTERFACTUAL (executed, #3014 fix-up): narrowing the guard to
+// `if listErr != nil` turns this RED with `run_auto_advanced = [], want one
+// plan_approved_dispatch entry (fail-open on an empty stage list)`. Restored
+// byte-identically afterwards.
+func TestRecordDrivePlanApproved_EmptyStageList_FailsOpen(t *testing.T) {
+	s, rr, au, stage := seedPlanApprovedSuccessorRun(t, run.RunnerKindLocal)
+	rr.seedSiblingStage(stage.RunID, run.StageTypeReview, run.ExecutorHuman, run.StageStateAwaitingApproval)
+	rr.listStagesEmpty = true
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	advances := driveAdvanceFor(t, au)
+	if len(advances) != 1 || advances[0].Rule != drive.RulePlanApprovedDispatch {
+		t.Fatalf("run_auto_advanced = %+v, want one plan_approved_dispatch entry (fail-open on an empty stage list)", advances)
 	}
 }
 

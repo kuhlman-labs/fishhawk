@@ -6616,7 +6616,6 @@ func TestGetRunStatus_StageWaitStatus_RunTerminalBackstop(t *testing.T) {
 	}
 }
 
-// TestGetRunStatus_DriveStatus_PropagatesEndToEnd drives the full
 // TestGetRunStatus_DriveStatus_HumanGateRuleDecodes is the #3014 twin of the
 // seam test below, for the shape that carries NO next_action: a
 // backlog_grooming run whose plan gate stamped plan_approved_human_gate
@@ -6667,6 +6666,7 @@ func TestGetRunStatus_DriveStatus_HumanGateRuleDecodes(t *testing.T) {
 	}
 }
 
+// TestGetRunStatus_DriveStatus_PropagatesEndToEnd drives the full
 // getRunStatus handler against the fake backend to cover the
 // cross-layer seam (#1023, cf. #618): backend drive read surfaces
 // (drive / derived_status / next_action / auto_advanced on
