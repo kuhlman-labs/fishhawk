@@ -2113,12 +2113,12 @@ func TestBuild_Plan_RevisionConstraint_BindsWithoutBase(t *testing.T) {
 	}
 }
 
-// TestBuild_Plan_RevisionBase_Truncated pins the revision BASE plan's unchanged
-// 4000-byte cap. The base blob is a server-derived convenience (superseded by
-// the enumerated carry-forward scope list), not an operator instruction, so it
-// keeps the historical bare-marker cut — unlike the CONSTRAINT, which #2871
-// moved to MaxRevisionConstraintBytes with a loud elision block.
-func TestBuild_Plan_RevisionBase_Truncated(t *testing.T) {
+// TestBuild_Plan_RevisionBase_DeliveredWhole is the Build-level whole-delivery
+// pin (#3087). A 5000-byte base — over the RETIRED 4000-byte cap, far under
+// MaxRevisionBasePlanBytes — reaches the assembled prompt INTACT, with neither
+// marker shape and without the renderer's elided notice. This is the test that
+// reddens if the cap is reverted to 4000.
+func TestBuild_Plan_RevisionBase_DeliveredWhole(t *testing.T) {
 	constraint := "keep the change additive"
 	longBase := strings.Repeat("z", 5000)
 	got, err := Build("plan", Trigger{
@@ -2130,11 +2130,54 @@ func TestBuild_Plan_RevisionBase_Truncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if !strings.Contains(got, longBase[:4000]+"...[truncated]") {
-		t.Errorf("plan prompt missing the base-plan cap+marker fragment:\n%s", got)
+	if !strings.Contains(got, "Prior plan (the revision base):\n\n"+longBase+"\n\n") {
+		t.Errorf("the 5000-byte base was not delivered whole into the plan prompt")
 	}
-	if strings.Contains(got, longBase) {
-		t.Errorf("untruncated long base plan appeared in prompt")
+	if strings.Contains(got, longBase[:4000]+"...[truncated]") {
+		t.Errorf("the retired 4000-byte cut is back in the plan prompt")
+	}
+	if strings.Contains(got, revisionBaseElidedNotice) {
+		t.Errorf("a base that fit whole drew the elided notice")
+	}
+}
+
+// TestBuild_Plan_RevisionBase_OverCap_DigestAtTheSeam is the sibling over-cap
+// pin, asserted END TO END rather than only in the unit: an oversized DECODABLE
+// eleven-step plan must reach the assembled prompt as a step-complete digest
+// carrying every step identity, the document accounting, the elision manifest,
+// AND the renderer-emitted risks_and_assumptions declaration notice — which is
+// written OUTSIDE the elidable text so a cut cannot remove it.
+func TestBuild_Plan_RevisionBase_OverCap_DigestAtTheSeam(t *testing.T) {
+	constraint := "keep the change additive"
+	base := overCapBase(t, basePlanFixture(11, 6000))
+	got, err := Build("plan", Trigger{
+		IssueNumber:        7,
+		Repo:               "x/y",
+		RevisionConstraint: &constraint,
+		RevisionBasePlan:   &base,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{
+		revisionBaseElidedNotice,
+		"record in the plan's risks_and_assumptions",
+		"Prior plan (the revision base):",
+		"STEP-COMPLETE DIGEST",
+		"Revision base accounting (whole document):",
+		"Elision manifest",
+		"\nStep 11: ",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan prompt missing over-cap digest anchor %q", want)
+		}
+	}
+	if strings.Contains(got, base) {
+		t.Errorf("the whole over-cap base appeared inline in the prompt")
+	}
+	// The elided notice must precede the base block it warns about.
+	if strings.Index(got, revisionBaseElidedNotice) > strings.Index(got, "Prior plan (the revision base):") {
+		t.Errorf("the elided notice was written AFTER the base block it warns about")
 	}
 }
 
@@ -2375,8 +2418,10 @@ func TestBuild_Plan_RevisionBaseScopeFiles_Rendered(t *testing.T) {
 	}
 	wants := []string{
 		"Revision base scope (BINDING — 3 paths, the authoritative scope set):",
-		"TRUNCATED at 4000 bytes",
-		"THIS LIST — not that blob — is the revision base's scope",
+		// The base FIT, so the lead sentence must say so — and must NOT
+		// assert a truncation that did not happen (#3087).
+		scopeCarryForwardWholeLead,
+		scopeCarryForwardObligation,
 		"scope_removals",
 		"- a/one.go",
 		"- a/two.go",
@@ -2386,6 +2431,69 @@ func TestBuild_Plan_RevisionBaseScopeFiles_Rendered(t *testing.T) {
 		if !strings.Contains(got, w) {
 			t.Errorf("plan prompt missing carry-forward anchor %q:\n%s", w, got)
 		}
+	}
+	for _, unwanted := range []string{"TRUNCATED at 4000 bytes", scopeCarryForwardElidedLead, scopeCarryForwardNoBaseLead} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("a whole-delivery revise prompt asserts %q", unwanted)
+		}
+	}
+}
+
+// TestBuild_Plan_RevisionBaseScopeFiles_ConditionalLead pins the OTHER two
+// branches of the carry-forward lead sentence (#3087). Restoring the
+// unconditional "TRUNCATED at 4000 bytes" sentence reddens this test AND its
+// whole-delivery sibling above, because both branches are asserted.
+func TestBuild_Plan_RevisionBaseScopeFiles_ConditionalLead(t *testing.T) {
+	constraint := "route the retry through the existing httpclient helper."
+	overCap := overCapBase(t, basePlanFixture(11, 6000))
+	cases := []struct {
+		name       string
+		base       *string
+		wantLead   string
+		absentLead []string
+	}{
+		{
+			name:       "base elided",
+			base:       &overCap,
+			wantLead:   scopeCarryForwardElidedLead,
+			absentLead: []string{scopeCarryForwardWholeLead, scopeCarryForwardNoBaseLead},
+		},
+		{
+			name:       "no base rendered",
+			base:       nil,
+			wantLead:   scopeCarryForwardNoBaseLead,
+			absentLead: []string{scopeCarryForwardWholeLead, scopeCarryForwardElidedLead},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Build("plan", Trigger{
+				IssueNumber:            7,
+				Repo:                   "x/y",
+				RevisionConstraint:     &constraint,
+				RevisionBasePlan:       tc.base,
+				RevisionBaseScopeFiles: []string{"a/one.go", "a/two.go"},
+			})
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			if !strings.Contains(got, tc.wantLead) {
+				t.Errorf("missing the %s lead sentence", tc.name)
+			}
+			for _, a := range tc.absentLead {
+				if strings.Contains(got, a) {
+					t.Errorf("the %s case rendered a competing lead sentence: %q", tc.name, a)
+				}
+			}
+			// The BINDING obligation is identical in every branch — no branch
+			// may drift into a weaker instruction.
+			if !strings.Contains(got, scopeCarryForwardObligation) {
+				t.Errorf("the %s case dropped the shared carry-forward obligation", tc.name)
+			}
+			if strings.Contains(got, "TRUNCATED at 4000 bytes") {
+				t.Errorf("the %s case asserts the retired 4000-byte truncation", tc.name)
+			}
+		})
 	}
 }
 
@@ -11448,10 +11556,18 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 		// gets an over-12000 payload and is asserted on the LOUD elision block
 		// below instead. Leaving it in the 4000 table would have re-opened the
 		// silent-drop hole for every constraint the revise gate now accepts.
+		//
+		// The revision BASE report left the table for the same reason (#3087):
+		// it is no longer a 4000-byte channel. It now rides whole under
+		// MaxRevisionBasePlanBytes and, above it, draws the ADR-077 loud
+		// elision — a grooming report is NOT a decodable standard_v1 plan, so
+		// the digest declines and the CapTextWithRetrieval fallback renders.
+		// Both properties are asserted below.
 		const cap4000 = 4000
 		const marker = "...[truncated]"
 		schemaErr := strings.Repeat("s", 5000)
-		revBase := strings.Repeat("b", 5000)
+		revBase := `{"kind":"grooming_report","report_version":"grooming_report_v1","notes":"` +
+			strings.Repeat("b", MaxRevisionBasePlanBytes) + `"}`
 		revConstraint := strings.Repeat("c", MaxRevisionConstraintBytes+1)
 		answers := strings.Repeat("a", 5000)
 		tr.PriorRejectionFeedback = &big
@@ -11474,7 +11590,6 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 			payload string
 		}{
 			{"prior schema-validation failure", schemaErr},
-			{"revision base report", revBase},
 			{"clarification answers", answers},
 		} {
 			want := ch.payload[:cap4000] + marker
@@ -11507,6 +11622,31 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 		}
 		if strings.Contains(got, revConstraint) {
 			t.Errorf("the grooming revision-constraint channel rendered its full untruncated payload")
+		}
+		// The revision BASE report takes the #3087 treatment: the ADR-077 loud
+		// elision with byte accounting and the fishhawk_get_plan retrieval
+		// pointer, plus the renderer-emitted incomplete-base notice — never the
+		// bare 4000-byte cut this channel used to take here, and never a
+		// step-complete digest (a grooming report carries no approach steps).
+		for _, want := range []string{
+			revBase[:MaxRevisionBasePlanBytes] + "\n\n...[ELIDED",
+			fmt.Sprintf("bytes dropped at the %d-byte cap", MaxRevisionBasePlanBytes),
+			"fishhawk_get_plan",
+			revisionBaseElidedNotice,
+			"Prior report (the revision base):",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("the grooming revision-base channel missing %q", want)
+			}
+		}
+		if strings.Contains(got, revBase[:cap4000]+marker) {
+			t.Errorf("the grooming revision base took the retired bare 4000-byte cut")
+		}
+		if strings.Contains(got, "STEP-COMPLETE DIGEST") {
+			t.Errorf("a grooming report wrongly took the standard_v1 digest path")
+		}
+		if strings.Contains(got, revBase) {
+			t.Errorf("the grooming revision-base channel rendered its full untruncated payload")
 		}
 	})
 }
