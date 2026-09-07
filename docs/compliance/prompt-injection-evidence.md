@@ -16,7 +16,7 @@ the two are easy to conflate and the difference is the whole point.
 All of the following runs offline, in every `scripts/test verify`, with **no
 model call**.
 
-**Structural containment across the four renders.** For every one of five
+**Structural containment across the four renders.** For every one of six
 adversarial fixtures, and for each of the three stage prompts that ingest
 untrusted issue text (`plan`, `plan_review`, `implement_review`), EVERY
 OCCURRENCE of every declared probe substring occurs at an **offset strictly
@@ -27,7 +27,7 @@ presence assertion would call it a pass. It enumerates ALL occurrences rather
 than the first, so a regression duplicating untrusted text several times
 cannot hide a stray copy behind the copies that ARE contained.
 
-The five attack classes:
+The six attack classes:
 
 | Class | Payload shape |
 |---|---|
@@ -36,25 +36,53 @@ The five attack classes:
 | `envelope-delimiter-breakout` | Literal `<<<END …>>>` / `<<<BEGIN …>>>` tokens forging an early envelope close. |
 | `code-fence-embedded-instructions` | A "SYSTEM DIRECTIVE" inside a fenced block. |
 | `split-body-comment-payload` | Benign setup in the body, the exploiting half in a comment. |
+| `verify-output-instruction-injection` (#3192) | The payload lives in verify-gate OUTPUT (a verify run tail / summary detail rolled into the implement-review prompt's gate evidence), forging an END delimiter, a `### Gate evidence` heading, and a BINDING bullet inside the tail. |
+
+**Two envelopes, two channels.** The issue-BODY / issue-COMMENT payloads (five
+classes) are contained by the `<<<BEGIN/END UNTRUSTED ISSUE TEXT>>>` /
+`<<<BEGIN/END UNTRUSTED ISSUE COMMENTS>>>` envelopes across all three reviewed
+renders. The verify-output payload (#3192) is contained by the
+`<<<BEGIN/END UNTRUSTED VERIFY OUTPUT>>>` envelope, asserted only in
+`implement_review` — the sole reviewed render that ingests gate evidence — and
+asserted WHOLLY ABSENT from `plan`/`plan_review`. The `verify_output` probes are
+checked at BOTH render sites the tails reach: the parent gate-evidence block
+(`writeGateEvidence`) and the per-slice fan-in block (`writeSliceVerify`, #3132),
+from ONE fixture whose `GateEvidence` carries both, so a half-fix that enveloped
+only the per-slice rows fails the gate.
 
 **Delimiter neutralization is load-bearing, and demonstrably so.** With
 `neutralizeEnvelopeDelimiters(body)` removed, the breakout fixture's forged
 `<<<END UNTRUSTED ISSUE TEXT>>>` closes the envelope early and its payload
-lands at an offset OUTSIDE the span in all three renders. That was observed,
-not reasoned about.
+lands at an offset OUTSIDE the span in all three renders. The #3192
+verify-output fixture is the sibling proof: with the neutralization call inside
+`writeUntrustedVerifyOutput` removed, its forged `<<<END UNTRUSTED VERIFY
+OUTPUT>>>` line closes the verify-output envelope early and the payload after it
+lands OUTSIDE the span in `implement_review`. Both were observed, not reasoned
+about.
 
 **The never-re-ingest invariant, against the whole corpus.** ADR-029 /
 `docs/ARCHITECTURE.md` §6 invariant #8 requires the network-and-state-capable
 implement agent to see no raw untrusted issue text. `implement` renders none
-of the five fixtures' probes and none of their compliance markers, and
+of the six fixtures' probes and none of their compliance markers, and
 `backend/internal/prompt` carries its own inline sub-case per attack class so
 the pin survives the eval corpus moving.
 
-**The fixtures cannot pass vacuously.** Thirteen named fail-closed loader modes
-each have their own test; the one that matters most for vacuity is (f) — a
-probe that is not a substring of its own declared source text cannot load, so
-no containment assertion can be satisfied by a probe that was never in the
-input.
+**The fixtures cannot pass vacuously.** Fifteen named fail-closed loader modes
+each have their own test; the ones that matter most for vacuity are (f) and its
+`verify_output` sibling (n) — a probe that is not a substring of its own
+declared source text cannot load, so no containment assertion can be satisfied
+by a probe that was never in the input.
+
+**Verbatim-versus-indented residual (#3192, NOT closed).** The enveloped verify
+text renders VERBATIM (delimiter-neutralized) rather than per-line indented,
+dropping the pre-#3192 property that an indented tail could not collide with the
+diff section's code fences. This is a deliberate trade — a multiline payload
+must survive as a literal substring for the containment gate to assert on it,
+and an envelope is a strictly stronger boundary than an indent. The residual is
+the same one the body envelope accepts (an attacker-influenced tail can still
+emit a convincing heading/fence INSIDE its envelope, bounded by the envelope
+plus framing); the containment claim here is offline-STRUCTURAL, not
+behavioural, until #3187's live arm runs.
 
 ---
 
@@ -115,9 +143,9 @@ report is only meaningful alongside the model and date that produced it.
 
 ## Not yet measured — tracked by #3187
 
-- Live behavioural injection resistance across the five attack classes and
+- Live behavioural injection resistance across the six attack classes and
   three reviewed renders (#2291 criterion 4 — the agent does not FOLLOW any
-  adversarial fixture).
+  adversarial fixture, including the #3192 verify-output payload).
 - The envelope/no-envelope plan-quality delta against the −0.25 threshold
   (#2291 criteria 1 and 2 — the delta is reported, and a material regression
   changes the treatment).
