@@ -8011,9 +8011,25 @@ paths:
         commit still fails category-B at the report boundary and still blocks
         merge resolution.
 
-        **Re-posts the `fishhawk_audit_complete` check (E64.14 / #3109).**
+        **Re-posts the `fishhawk_audit_complete` check (E64.14 / #3109),
+        BOUND to the run's own live pull-request head (E64.26 / #3129).**
         After the declaration is durable, the endpoint recomputes audit-complete
-        and republishes the required Check Run AT the vouched commit. An
+        and republishes the required Check Run — but ONLY at the run's OWN live
+        PR head. Before publishing it resolves that head through the same
+        determinability ladder `rebase-branch` uses (installation → repo → PR
+        number from the run's tracked pull request → live head sha) and stamps
+        the check only when the vouched sha equals it (a case-insensitive
+        FULL-string compare, so an ABBREVIATED sha takes the mismatch arm).
+        Three arms: MATCH publishes; MISMATCH skips the publish and names BOTH
+        shas on `audit_check_republish_warning`; an UNRESOLVABLE head fails
+        closed the same way, naming the resolution failure. The check is never
+        posted at an unverified sha. Without this bound an operator carrying
+        `write:stages` could have this run's recomputed check state stamped
+        onto any commit in the repository, including the head of an unrelated
+        pull request. WHAT DID NOT CHANGE: the record stays verbatim for any
+        sha — the `operator_commit_vouched` append and the 200 are identical
+        for a matching and a non-matching sha, and there is no new response
+        field, error code or status code. An
         operator-pushed commit appears in no head-report audit category, so the
         publisher's normal head resolution would re-post against a stale sha and
         leave the check absent from the live merge head — the exact base-advance
@@ -8079,15 +8095,24 @@ paths:
                       True when the `fishhawk_audit_complete` Check Run was
                       successfully re-posted at the vouched head (E64.14 /
                       #3109). False when the re-post did not land — see
-                      `audit_check_republish_warning` — or when no publisher is
-                      wired. Re-invoke the vouch to retry the re-post idempotently.
+                      `audit_check_republish_warning` — when no publisher is
+                      wired, or when the publish bound declined to stamp the
+                      check because the vouched sha is not the run's own live
+                      pull-request head, or that head could not be resolved
+                      (E64.26 / #3129). Re-invoke the vouch at the live head to
+                      retry the re-post idempotently.
                   audit_check_republish_warning:
                     type: string
                     description: |
                       Present only when the audit-complete re-post did NOT land:
                       names the failure so the operator knows the required check
                       may be absent from the merge head rather than discovering
-                      it at a blocked merge. Omitted when the re-post succeeded.
+                      it at a blocked merge. Carries three kinds of non-landing
+                      — a publish that errored; a vouched sha that is not the
+                      run's live PR head, naming BOTH shas; and a live head that
+                      could not be resolved, naming the resolution failure (the
+                      latter two are the E64.26 / #3129 publish bound). Omitted
+                      when the re-post succeeded and when no publisher is wired.
         '400':
           description: |
             Malformed body or an empty `sha`/`reason`. Body's `error` is
