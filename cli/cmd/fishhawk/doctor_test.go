@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/cli/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/credstore"
@@ -1654,5 +1655,126 @@ func TestRunDoctor_SpecOnlyExcludesVerifyRung(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("--spec-only spawned the verify command (marker %s exists)", marker)
+	}
+}
+
+// --- token rung: proactive refresh + fatal refresh failure (#2393) ----------
+
+func withFakeDoctorCredRefresh(t *testing.T, fn func(string) (credstore.Credential, error)) {
+	t.Helper()
+	orig := doctorCredRefresh
+	doctorCredRefresh = fn
+	t.Cleanup(func() { doctorCredRefresh = orig })
+}
+
+func doctorExpiringRefreshable() credstore.Credential {
+	now := time.Now()
+	issued := now.Add(-13*time.Minute - 30*time.Second)
+	exp := issued.Add(15 * time.Minute)
+	return credstore.Credential{
+		Token: "fho_stale", RefreshToken: "fhr_seed", ClientID: "fishhawk-cli",
+		TokenEndpoint: "http://localhost:8080/v0/oauth/token", IssuedAt: &issued, ExpiresAt: &exp,
+	}
+}
+
+// A stored credential inside its skew is refreshed and the source detail
+// says so, so the operator can see a rotation happened.
+func TestResolveDoctorCredential_RefreshedSourceIsVisible(t *testing.T) {
+	withFakeDoctorCredLoad(t, func(string) (credstore.Credential, error) { return doctorExpiringRefreshable(), nil })
+	withFakeDoctorCredRefresh(t, func(string) (credstore.Credential, error) {
+		fresh := doctorExpiringRefreshable()
+		fresh.Token = "fho_fresh"
+		exp := time.Now().Add(15 * time.Minute)
+		fresh.ExpiresAt = &exp
+		return fresh, nil
+	})
+	cred := resolveDoctorCredential("http://localhost:8080", "")
+	if cred.resolveErr != nil {
+		t.Fatalf("resolveErr = %v, want nil", cred.resolveErr)
+	}
+	if cred.token != "fho_fresh" {
+		t.Fatalf("token = %q, want the refreshed fho_fresh", cred.token)
+	}
+	if !strings.Contains(cred.source, "refreshed") {
+		t.Errorf("source = %q, want it to say the credential was refreshed", cred.source)
+	}
+	if !strings.Contains(cred.class, "OAuth") {
+		t.Errorf("class = %q, want the OAuth class", cred.class)
+	}
+}
+
+// Outside the skew the stored credential is used as-is and the refresh
+// seam is never called; the source keeps the plain stored wording.
+func TestResolveDoctorCredential_OutsideSkewNotRefreshed(t *testing.T) {
+	c := doctorExpiringRefreshable()
+	issued := time.Now().Add(-5 * time.Minute)
+	exp := issued.Add(15 * time.Minute)
+	c.IssuedAt, c.ExpiresAt = &issued, &exp
+	withFakeDoctorCredLoad(t, func(string) (credstore.Credential, error) { return c, nil })
+	withFakeDoctorCredRefresh(t, func(string) (credstore.Credential, error) {
+		t.Fatal("refresh must not run outside the skew")
+		return credstore.Credential{}, nil
+	})
+	cred := resolveDoctorCredential("http://localhost:8080", "")
+	if cred.token != "fho_stale" || cred.resolveErr != nil {
+		t.Fatalf("got %+v, want the stored token unrefreshed", cred)
+	}
+	if strings.Contains(cred.source, "refreshed") {
+		t.Errorf("source = %q must not claim a refresh", cred.source)
+	}
+}
+
+// A failed refresh is carried as resolveErr (never degraded to "no
+// credential") and checkToken reports it as a FAIL naming the login
+// command — binding condition 1 on the doctor ladder.
+func TestResolveDoctorCredential_RefreshFailureFailsTokenRung(t *testing.T) {
+	withFakeDoctorCredLoad(t, func(string) (credstore.Credential, error) { return doctorExpiringRefreshable(), nil })
+	withFakeDoctorCredRefresh(t, func(string) (credstore.Credential, error) {
+		return credstore.Credential{}, &credstore.RefreshError{StatusCode: 400, Code: "invalid_grant"}
+	})
+	probed := false
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		probed = true
+		return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
+	})
+	cred := resolveDoctorCredential("http://localhost:8080", "")
+	if cred.resolveErr == nil {
+		t.Fatalf("resolveErr = nil, want the refresh failure; cred=%+v", cred)
+	}
+	if cred.token != "" {
+		t.Errorf("token = %q, want empty on a failed refresh", cred.token)
+	}
+	r := checkToken("http://localhost:8080", cred, readinessOutcome{answered: true, scopesAdequate: true})
+	if r.status != "fail" {
+		t.Fatalf("status = %q, want fail (a failed refresh must never read as the no-credential warn); detail: %s", r.status, r.detail)
+	}
+	if !strings.Contains(r.detail, "could not be refreshed") || !strings.Contains(r.detail, "invalid_grant") {
+		t.Errorf("detail = %q, want the refresh failure and the AS code", r.detail)
+	}
+	if !strings.Contains(r.remediate, "fishhawk token login --backend-url http://localhost:8080") {
+		t.Errorf("remediate = %q, want the login command with the backend URL", r.remediate)
+	}
+	if probed {
+		t.Error("the backend must not be probed with a credential that failed to refresh")
+	}
+}
+
+// An expired credential with nothing to refresh with is a FAIL too.
+func TestResolveDoctorCredential_ExpiredNotRefreshableFailsTokenRung(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	withFakeDoctorCredLoad(t, func(string) (credstore.Credential, error) {
+		return credstore.Credential{Token: "fhk_old", ExpiresAt: &past}, nil
+	})
+	withFakeDoctorCredRefresh(t, func(string) (credstore.Credential, error) {
+		t.Fatal("a non-refreshable credential must never be refreshed")
+		return credstore.Credential{}, nil
+	})
+	cred := resolveDoctorCredential("http://localhost:8080", "")
+	if cred.resolveErr == nil || cred.token != "" {
+		t.Fatalf("got %+v, want resolveErr set and no token", cred)
+	}
+	r := checkToken("http://localhost:8080", cred, readinessOutcome{})
+	if r.status != "fail" || !strings.Contains(r.detail, "expired at") {
+		t.Fatalf("status=%q detail=%q, want fail naming the expiry", r.status, r.detail)
 	}
 }

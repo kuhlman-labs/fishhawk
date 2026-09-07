@@ -121,7 +121,7 @@ issuer or resource **refuses to start**. Full state machine and handler contract
 | `FISHHAWKD_OAUTH_ISSUER` | `--oauth-issuer` | RFC 8414 issuer — an **https origin-only** URL (no path); the sole AS enablement signal. An invalid value refuses startup | empty (AS off) |
 | `FISHHAWKD_OAUTH_RESOURCE` | `--oauth-resource` | RFC 8707 resource indicator the AS binds tokens to | empty → `<issuer>/mcp` |
 | `FISHHAWKD_OAUTH_CODE_TTL` | `--oauth-code-ttl` | authorization-code lifetime | `60s` |
-| `FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL` | `--oauth-access-token-ttl` | issued access-token lifetime (`expires_in`) | `1h` |
+| `FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL` | `--oauth-access-token-ttl` | issued access-token lifetime (`expires_in`). **Short by design** (E66.5 / #2393): a session rides the refresh grant (rotation + reuse detection), so a leaked bearer is useful for minutes, not an hour. A deployment that needs the old lifetime sets `1h` explicitly; a client refreshing proactively derives its margin from this value (`credstore.RefreshSkew`), pinned together by `oauthttlskew_test.go` | `15m` |
 | `FISHHAWKD_OAUTH_REFRESH_TOKEN_TTL` | `--oauth-refresh-token-ttl` | issued refresh-token lifetime | `336h` |
 | `FISHHAWKD_OAUTH_CIMD_RATE_BURST` | `--oauth-cimd-rate-burst` | per-source burst for the CIMD outbound-fetch limiter (#2441); zero/negative → default. There is no off switch — raise the burst to loosen it | `5` |
 | `FISHHAWKD_OAUTH_CIMD_RATE_INTERVAL` | `--oauth-cimd-rate-interval` | per-source refill interval (one token per interval) | `10s` |
@@ -141,7 +141,7 @@ These are the AS ISSUER-side knobs and are unrelated to the GitHub sign-in
 OAuth-CLIENT endpoints below (`FISHHAWKD_OAUTH_AUTHORIZE_URL` et al.), which
 point fishhawkd AT a forge's OAuth endpoints for user sign-in.
 
-## OAuth client pre-registration (`oauth client`, E66.21 / #2438)
+## OAuth client pre-registration and token revocation (`oauth client` / `oauth token`, E66.21 / #2438, E66.5 / #2393)
 
 The operator write path for `oauth_clients` rows — the only caller of
 `oauthstore.UpsertClient`. `resolveOAuthClient` (E66.19 / #2436) prefers a
@@ -157,6 +157,7 @@ operator would otherwise hand-write SQL and get `redirect_uris` or
 | `oauth client register` | `--db`, `--client-id` (**required**), `--redirect-uri` (**repeatable, ≥1 required**), `--token-endpoint-auth-method` (default `none`), `--grant-type` (repeatable; default `authorization_code`+`refresh_token`), `--response-type` (repeatable; default `code`), `--client-name`, `--client-uri`, `--logo-uri`, `--scope`, `--provider`+`--account-key` (owning **tenant**) | Upsert one `oauth_clients` row (idempotent on `client_id`, refresh-on-fetch). Validates every field the AS enforces AT REGISTRATION TIME. Prints `created` on a fresh row and `refreshed` on a re-register (read from the returned row's `first_seen_at`/`updated_at`). |
 | `oauth client list` | `--db` | Render every registration with `SOURCE`, `ACCOUNT_ID`, `AUTH_METHOD`, both timestamps and `REDIRECT_URIS`. Empty table prints `no oauth client registrations`. |
 | `oauth client remove` | `--db`, `--client-id` (**required**) | Delete the registration. **FAILS CLOSED** naming the id when no row carried it — a no-op delete reported as success would tell an operator they had revoked access when they had not. |
+| `oauth token revoke` | `--db`, `--subject` (**required**), `--client-id` (optional filter; default every client) | Revoke every still-live AS-issued **access AND refresh** token for the subject via `oauthstore.RevokeGrantsForSubject` — one transaction, refresh tokens first, serialized with any in-flight rotation of the subject's lineages (E66.5 / #2393). Prints `access_revoked=N refresh_revoked=M` plus the resolved filter (`client_id=*` when unfiltered). A subject with nothing live is a **successful no-op** (`0`/`0`), unlike `client remove`: the already-revoked state IS the desired end state. Whitespace-padded `--subject` / `--client-id` are **refused naming the flag**, never trimmed into a different subject. This verb is the operator revocation surface; the RFC 7009 endpoint is deliberately NOT shipped (no public unauthenticated AS route in this slice). |
 
 **Validation, each refusal naming the offending input:** every `--redirect-uri`
 is run through `oauthas.MatchRedirectURI(uri, uri)` **self-paired** — exactly the

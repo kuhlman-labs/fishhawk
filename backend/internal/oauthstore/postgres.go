@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -253,6 +254,67 @@ func (r *postgresRepo) RevokeGrantsForCode(ctx context.Context, codeID uuid.UUID
 		return 0, err
 	}
 	return n, nil
+}
+
+func (r *postgresRepo) RevokeGrantsForSubject(ctx context.Context, subject string, clientID string) (int64, int64, error) {
+	// Refused BEFORE the pool is touched: an empty subject predicate would match
+	// zero rows and report a "nothing to revoke" the operator would believe.
+	if strings.TrimSpace(subject) == "" {
+		return 0, 0, ErrSubjectRequired
+	}
+	// An empty filter is NULL at the query, which the predicates read as "every
+	// client"; anything else is an exact client_id match.
+	filter := nilIfEmpty(clientID)
+
+	var access, refresh int64
+	// ONE transaction, in this order — the ordering is the contract documented
+	// on Repository.RevokeGrantsForSubject:
+	//
+	//  1. FOR UPDATE on every lineage root for the subject (id order), so a
+	//     concurrent rotation of any of them is serialized with this sweep
+	//     rather than able to commit a successor the UPDATE snapshots below
+	//     cannot see. Same lock, same point, as RotateRefreshToken /
+	//     RevokeGrantsForCode (lockLineage); pinned by
+	//     TestRevokeGrantsForSubject_SerializesOnLineage.
+	//  2. refresh tokens FIRST — the credential that can mint more;
+	//  3. access tokens;
+	//  4. commit.
+	//
+	// A failure at any step rolls back every step, so the operator never sees a
+	// half-revoked subject (a live refresh token behind revoked access tokens,
+	// or the reverse). Pinned by TestRevokeGrantsForSubject_PartialSweepRollsBack.
+	txErr := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := oauthstoredb.New(tx)
+		if _, err := q.LockAuthorizationCodesForSubject(ctx, oauthstoredb.LockAuthorizationCodesForSubjectParams{
+			Subject:  subject,
+			ClientID: filter,
+		}); err != nil {
+			return fmt.Errorf("oauthstore: lock lineages for subject: %w", err)
+		}
+		at := tstz(r.now())
+		var err error
+		refresh, err = q.RevokeRefreshTokensForSubject(ctx, oauthstoredb.RevokeRefreshTokensForSubjectParams{
+			RevokedAt: at,
+			Subject:   subject,
+			ClientID:  filter,
+		})
+		if err != nil {
+			return fmt.Errorf("oauthstore: revoke refresh tokens for subject: %w", err)
+		}
+		access, err = q.RevokeAccessTokensForSubject(ctx, oauthstoredb.RevokeAccessTokensForSubjectParams{
+			RevokedAt: at,
+			Subject:   subject,
+			ClientID:  filter,
+		})
+		if err != nil {
+			return fmt.Errorf("oauthstore: revoke access tokens for subject: %w", err)
+		}
+		return nil
+	})
+	if txErr != nil {
+		return 0, 0, txErr
+	}
+	return access, refresh, nil
 }
 
 // lockLineage takes the authorization-code row's FOR UPDATE lock, which is the

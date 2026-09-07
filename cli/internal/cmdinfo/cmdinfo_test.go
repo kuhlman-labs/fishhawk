@@ -59,3 +59,29 @@ func TestGroupsMatchCommandKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestTokenLoginListsBothLoginPaths pins the `token login` flag inventory:
+// the device-flow flags AND the --oauth pair (E66.5 / #2393). The
+// executable-surface test in package main binds this set to the live
+// flag.FlagSet in both directions; this pin makes a dropped entry fail
+// here, next to the table, with the missing name.
+func TestTokenLoginListsBothLoginPaths(t *testing.T) {
+	var flags []string
+	for _, c := range Commands() {
+		if c.Key == "token login" {
+			flags = c.Flags
+		}
+	}
+	if flags == nil {
+		t.Fatal("no `token login` command")
+	}
+	have := map[string]bool{}
+	for _, f := range flags {
+		have[f] = true
+	}
+	for _, want := range []string{"provider", "client-id", "oauth", "oauth-client-id"} {
+		if !have[want] {
+			t.Errorf("token login omits flag %q", want)
+		}
+	}
+}

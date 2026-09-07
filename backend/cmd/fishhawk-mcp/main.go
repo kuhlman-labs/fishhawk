@@ -40,6 +40,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -111,7 +112,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: %v\n", err)
 		return exitFailure
 	}
-	cfg, err := loadConfig(os.Getenv, credstore.Load)
+	cfg, err := loadConfig(os.Getenv, credstore.Load, refreshStoredCredential)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: %v\n", err)
 		return exitFailure
@@ -166,6 +167,22 @@ func mcpServerConfig(cfg config, httpTransport bool) mcpserver.Config {
 	}
 }
 
+// refreshStoredCredential is the production refreshCred seam for
+// loadConfig: it runs credstore's locked load → RFC 6749 §6 refresh →
+// store sequence for the backend URL and hands back the credential
+// this process should use (#2393). The lock + re-read live in
+// credstore, so a CLI invocation racing this startup rotates at most
+// once between them.
+func refreshStoredCredential(backendURL string) (credstore.Credential, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+	defer cancel()
+	return credstore.RefreshStored(ctx, &http.Client{Timeout: refreshTimeout}, backendURL)
+}
+
+// refreshTimeout bounds the startup refresh round-trip so an unreachable
+// token endpoint fails startup promptly instead of hanging the client.
+const refreshTimeout = 30 * time.Second
+
 // config captures the validated startup environment. Kept tiny on
 // purpose — tools that need additional state read from the same env
 // at registration time rather than threading a giant struct.
@@ -198,15 +215,29 @@ type config struct {
 //     tests to keep the table hermetic and parallel-safe).
 //  3. Nothing usable → return an error, NEVER an empty token. Every
 //     not-usable case (no credential stored, a stored-but-empty
-//     token, an expired credential, a corrupt/unreadable store) is a
-//     distinct, precisely-worded STARTUP failure naming both the
-//     backend URL that was looked up and `fishhawk token login`, so
-//     a mis-registration fails loudly at startup instead of
-//     degrading to an empty bearer that becomes a mid-session 401
-//     storm. A NIL ExpiresAt means non-expiring and IS accepted —
-//     v0 tokens do not expire (cli/README.md, E39.3 / #1708), so
-//     reading nil as expired would refuse every field credential.
-func loadConfig(getenv func(string) string, loadCred func(string) (credstore.Credential, error)) (config, error) {
+//     token, a refresh that failed, an expired credential, a
+//     corrupt/unreadable store) is a distinct, precisely-worded
+//     STARTUP failure naming both the backend URL that was looked up
+//     and `fishhawk token login`, so a mis-registration fails loudly
+//     at startup instead of degrading to an empty bearer that becomes
+//     a mid-session 401 storm. A NIL ExpiresAt means non-expiring and
+//     IS accepted — v0 tokens do not expire (cli/README.md, E39.3 /
+//     #1708), so reading nil as expired would refuse every field
+//     credential.
+//
+// Proactive refresh (#2393 / ADR-076) sits between rungs 2 and 3:
+// when the stored credential is refreshable and within its derived
+// skew of expiry (credstore.NeedsRefresh — 2 minutes at the shipped
+// 15-minute access-token TTL, and also when already expired, since the
+// refresh token outlives the access token), refreshCred runs
+// credstore's locked load → refresh → store sequence and the REFRESHED
+// access token is used. The rotation is persisted inside that call: a
+// rotated refresh token that is not on disk is burned, because the
+// next start would present the consumed token and trip the AS's
+// reuse-detection lineage revocation. A refresh failure is FATAL — it
+// falls through to a distinct actionable login error, never to the
+// stale bearer (binding condition 1).
+func loadConfig(getenv func(string) string, loadCred func(string) (credstore.Credential, error), refreshCred func(string) (credstore.Credential, error)) (config, error) {
 	c := config{
 		backendURL: strings.TrimRight(getenv("FISHHAWK_BACKEND_URL"), "/"),
 		apiToken:   getenv("FISHHAWK_API_TOKEN"),
@@ -240,9 +271,26 @@ func loadConfig(getenv func(string) string, loadCred func(string) (credstore.Cre
 	if cred.Token == "" {
 		return config{}, fmt.Errorf("the stored Fishhawk credential for %s has an empty token: re-run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, c.backendURL)
 	}
-	// Rung 3c: an expired credential. A nil ExpiresAt means non-
-	// expiring (v0 tokens do not expire) and is accepted.
-	if cred.ExpiresAt != nil && cred.ExpiresAt.Before(time.Now()) {
+	// Rung 2b: proactive refresh. Runs BEFORE the expiry check so an
+	// expired-but-refreshable credential is refreshed, not refused.
+	now := time.Now()
+	if credstore.NeedsRefresh(cred, now) {
+		fresh, err := refreshCred(c.backendURL)
+		if err != nil {
+			// Rung 3e: refresh failed. Fatal, worded distinctly from every
+			// other rung; the stale bearer is never used.
+			return config{}, fmt.Errorf("the stored Fishhawk credential for %s could not be refreshed (%v): re-run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, err, c.backendURL)
+		}
+		if fresh.Token == "" {
+			return config{}, fmt.Errorf("the refreshed Fishhawk credential for %s has an empty token: re-run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, c.backendURL)
+		}
+		cred = fresh
+	}
+	// Rung 3c: an expired credential that could NOT be refreshed —
+	// reached only when rung 2b did not fire (nothing to refresh with,
+	// e.g. an fhk_ record carrying an expiry). A nil ExpiresAt means
+	// non-expiring (v0 device-flow tokens do not expire) and is accepted.
+	if cred.ExpiresAt != nil && cred.ExpiresAt.Before(now) {
 		return config{}, fmt.Errorf("the stored Fishhawk credential for %s expired at %s: re-run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, cred.ExpiresAt.Format(time.RFC3339), c.backendURL)
 	}
 	c.apiToken = cred.Token

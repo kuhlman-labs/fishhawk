@@ -2222,3 +2222,391 @@ func containsStr(ss []string, want string) bool {
 	}
 	return false
 }
+
+// --- RevokeGrantsForSubject (E66.5 / #2393) ---------------------------------
+
+// liveRowsForSubject counts the still-active (revoked_at IS NULL) rows in one
+// token table for a subject, read over RAW SQL on a connection outside the
+// repository. Every RevokeGrantsForSubject assertion below is a COMMITTED-STATE
+// read of this shape rather than an error-identity check, because a control
+// that fires and is rolled back returns byte-identical counts.
+func liveRowsForSubject(t *testing.T, pool *pgxpool.Pool, table, subject string) int {
+	t.Helper()
+	return scanInt(t, pool, `SELECT count(*) FROM `+table+` WHERE subject = $1 AND revoked_at IS NULL`, subject)
+}
+
+// redeemFor mints one grant for the given subject/client through the real
+// redemption path, so every token under test descends from a real lineage root
+// (the row the subject sweep must lock).
+func redeemFor(t *testing.T, repo oauthstore.Repository, subject, clientID string) *oauthstore.IssuedGrant {
+	t.Helper()
+	spec := codeSpec(clientID, time.Now().UTC().Add(time.Minute))
+	spec.Subject = subject
+	code := newCodeSpec(t, repo, spec)
+	grant, err := repo.RedeemAuthorizationCode(context.Background(), code.PlainText, nil, redeemReq())
+	if err != nil {
+		t.Fatalf("RedeemAuthorizationCode for %s/%s: %v", subject, clientID, err)
+	}
+	return grant
+}
+
+// TestRevokeGrantsForSubject_EndToEnd is the CROSS-BOUNDARY walk for the
+// operator revocation primitive: a grant minted through RedeemAuthorizationCode
+// is revoked by subject, and BOTH consuming paths — AuthenticateAccessToken and
+// RotateRefreshToken — must then refuse their credential with ErrRevoked (an
+// observable state, not ErrNotFound). The counts come back split so the verb
+// can report them separately.
+func TestRevokeGrantsForSubject_EndToEnd(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := newRepo(t)
+	grant := redeemFor(t, repo, testSubject, testClientID)
+
+	if _, err := repo.AuthenticateAccessToken(ctx, grant.Access.PlainText); err != nil {
+		t.Fatalf("access token not live before the sweep: %v", err)
+	}
+	access, refresh, err := repo.RevokeGrantsForSubject(ctx, testSubject, "")
+	if err != nil {
+		t.Fatalf("RevokeGrantsForSubject: %v", err)
+	}
+	if access != 1 || refresh != 1 {
+		t.Errorf("counts = (access %d, refresh %d), want (1, 1)", access, refresh)
+	}
+	if _, err := repo.AuthenticateAccessToken(ctx, grant.Access.PlainText); !errors.Is(err, oauthstore.ErrRevoked) {
+		t.Errorf("AuthenticateAccessToken after the subject sweep = %v, want ErrRevoked", err)
+	}
+	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq()); !errors.Is(err, oauthstore.ErrRevoked) {
+		t.Errorf("RotateRefreshToken after the subject sweep = %v, want ErrRevoked", err)
+	}
+}
+
+// TestRevokeGrantsForSubject_LeavesOtherSubjectsLive is the counterfactual
+// vehicle for the `subject = $1` predicate. Because the control's effect is
+// COMMITTED STATE, the assertion READS the other subject's rows back after the
+// call and requires revoked_at IS NULL — deleting the predicate revokes them
+// while returning the same shape of counts, and this goes red on the read-back.
+func TestRevokeGrantsForSubject_LeavesOtherSubjectsLive(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+	const other = "github:hubot"
+	target := redeemFor(t, repo, testSubject, testClientID)
+	bystander := redeemFor(t, repo, other, testClientID)
+
+	access, refresh, err := repo.RevokeGrantsForSubject(ctx, testSubject, "")
+	if err != nil {
+		t.Fatalf("RevokeGrantsForSubject: %v", err)
+	}
+	if access != 1 || refresh != 1 {
+		t.Errorf("counts = (access %d, refresh %d), want (1, 1) — only the target subject's pair", access, refresh)
+	}
+	if n := liveRowsForSubject(t, pool, "oauth_access_tokens", other); n != 1 {
+		t.Errorf("%d live access tokens for the OTHER subject after the sweep, want 1 (it must be untouched)", n)
+	}
+	if n := liveRowsForSubject(t, pool, "oauth_refresh_tokens", other); n != 1 {
+		t.Errorf("%d live refresh tokens for the OTHER subject after the sweep, want 1 (it must be untouched)", n)
+	}
+	if _, err := repo.AuthenticateAccessToken(ctx, bystander.Access.PlainText); err != nil {
+		t.Errorf("the other subject's access token was caught by the sweep: %v", err)
+	}
+	if _, err := repo.AuthenticateAccessToken(ctx, target.Access.PlainText); !errors.Is(err, oauthstore.ErrRevoked) {
+		t.Errorf("target's access token = %v, want ErrRevoked", err)
+	}
+}
+
+// TestRevokeGrantsForSubject_ClientFilterSparesOtherClients is the
+// counterfactual vehicle for the optional client_id filter, same
+// read-back-after shape: the SAME subject holds grants under two clients, the
+// sweep names one, and the other client's rows must still be live afterwards.
+func TestRevokeGrantsForSubject_ClientFilterSparesOtherClients(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+	filtered := redeemFor(t, repo, testSubject, testClientID)
+	spared := redeemFor(t, repo, testSubject, testAltClientID)
+
+	access, refresh, err := repo.RevokeGrantsForSubject(ctx, testSubject, testClientID)
+	if err != nil {
+		t.Fatalf("RevokeGrantsForSubject: %v", err)
+	}
+	if access != 1 || refresh != 1 {
+		t.Errorf("counts = (access %d, refresh %d), want (1, 1) — only the named client's pair", access, refresh)
+	}
+	liveAccess := scanInt(t, pool,
+		`SELECT count(*) FROM oauth_access_tokens WHERE subject = $1 AND client_id = $2 AND revoked_at IS NULL`,
+		testSubject, testAltClientID)
+	liveRefresh := scanInt(t, pool,
+		`SELECT count(*) FROM oauth_refresh_tokens WHERE subject = $1 AND client_id = $2 AND revoked_at IS NULL`,
+		testSubject, testAltClientID)
+	if liveAccess != 1 || liveRefresh != 1 {
+		t.Errorf("live rows under the OTHER client after a filtered sweep = (access %d, refresh %d), want (1, 1)", liveAccess, liveRefresh)
+	}
+	if _, err := repo.AuthenticateAccessToken(ctx, spared.Access.PlainText); err != nil {
+		t.Errorf("the other client's access token was caught by the filtered sweep: %v", err)
+	}
+	if _, err := repo.AuthenticateAccessToken(ctx, filtered.Access.PlainText); !errors.Is(err, oauthstore.ErrRevoked) {
+		t.Errorf("the named client's access token = %v, want ErrRevoked", err)
+	}
+
+	// An empty filter is "every client": the spared pair falls now.
+	access, refresh, err = repo.RevokeGrantsForSubject(ctx, testSubject, "")
+	if err != nil {
+		t.Fatalf("unfiltered RevokeGrantsForSubject: %v", err)
+	}
+	if access != 1 || refresh != 1 {
+		t.Errorf("unfiltered counts = (access %d, refresh %d), want (1, 1) — the remaining pair only", access, refresh)
+	}
+}
+
+// TestRevokeGrantsForSubject_AlreadyRevokedNotDoubleCounted pins the
+// `AND revoked_at IS NULL` predicate on both sweep UPDATEs: a second sweep of
+// the same subject transitions nothing and reports (0, 0, nil), and the first
+// sweep's revoked_at stamp is preserved rather than re-stamped.
+func TestRevokeGrantsForSubject_AlreadyRevokedNotDoubleCounted(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+	grant := redeemFor(t, repo, testSubject, testClientID)
+
+	if a, r, err := repo.RevokeGrantsForSubject(ctx, testSubject, ""); err != nil || a != 1 || r != 1 {
+		t.Fatalf("first sweep = (%d, %d, %v), want (1, 1, nil)", a, r, err)
+	}
+	first := scanTimestamp(t, pool, `SELECT revoked_at FROM oauth_access_tokens WHERE id = $1`, grant.Access.ID)
+
+	time.Sleep(timescale.D(20 * time.Millisecond)) // so a re-stamp would be observable
+	if a, r, err := repo.RevokeGrantsForSubject(ctx, testSubject, ""); err != nil || a != 0 || r != 0 {
+		t.Errorf("second sweep = (%d, %d, %v), want (0, 0, nil) — already-revoked rows must not be double-counted", a, r, err)
+	}
+	second := scanTimestamp(t, pool, `SELECT revoked_at FROM oauth_access_tokens WHERE id = $1`, grant.Access.ID)
+	if !first.Valid || !second.Valid || !first.Time.Equal(second.Time) {
+		t.Errorf("revoked_at moved from %v to %v across the second sweep, want it preserved", first.Time, second.Time)
+	}
+}
+
+// TestRevokeGrantsForSubject_UnknownSubjectReturnsZeroNotError pins that a
+// subject with no rows is a committed no-op, not a lookup failure: the operator
+// verb reports "0 revoked" rather than failing on a subject that never logged
+// in.
+func TestRevokeGrantsForSubject_UnknownSubjectReturnsZeroNotError(t *testing.T) {
+	repo, _ := newRepo(t)
+	access, refresh, err := repo.RevokeGrantsForSubject(context.Background(), "github:never-logged-in", "")
+	if err != nil {
+		t.Fatalf("RevokeGrantsForSubject(unknown) error = %v, want nil", err)
+	}
+	if access != 0 || refresh != 0 {
+		t.Errorf("counts = (%d, %d), want (0, 0)", access, refresh)
+	}
+}
+
+// TestRevokeGrantsForSubject_RefreshRevokedBeforeAccess pins the ORDER inside
+// the transaction: refresh tokens are swept BEFORE access tokens. A BEFORE
+// UPDATE trigger on oauth_access_tokens records, at the instant the access
+// sweep fires, how many of the subject's refresh tokens are ALREADY revoked
+// inside the same transaction; it must see the refresh sweep's stamp. Swap the
+// two UPDATEs and the probe records zero → red. (The trigger does not raise, so
+// this test proves order, not atomicity — see _PartialSweepRollsBack for that.)
+func TestRevokeGrantsForSubject_RefreshRevokedBeforeAccess(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+	redeemFor(t, repo, testSubject, testClientID)
+
+	for _, ddl := range []string{
+		`CREATE TABLE sweep_order_probe (refresh_already_revoked integer NOT NULL)`,
+		`CREATE FUNCTION probe_sweep_order() RETURNS trigger LANGUAGE plpgsql AS $$
+		 BEGIN
+		   IF NEW.revoked_at IS NOT NULL AND OLD.revoked_at IS NULL THEN
+		     INSERT INTO sweep_order_probe
+		       SELECT count(*) FROM oauth_refresh_tokens
+		        WHERE subject = NEW.subject AND revoked_at IS NOT NULL;
+		   END IF;
+		   RETURN NEW;
+		 END $$`,
+		`CREATE TRIGGER probe_sweep_order BEFORE UPDATE ON oauth_access_tokens
+		   FOR EACH ROW EXECUTE FUNCTION probe_sweep_order()`,
+	} {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			t.Fatalf("install order probe: %v\n%s", err, ddl)
+		}
+	}
+
+	if a, r, err := repo.RevokeGrantsForSubject(ctx, testSubject, ""); err != nil || a != 1 || r != 1 {
+		t.Fatalf("sweep = (%d, %d, %v), want (1, 1, nil)", a, r, err)
+	}
+	probes := scanInt(t, pool, `SELECT count(*) FROM sweep_order_probe`)
+	if probes != 1 {
+		t.Fatalf("order probe fired %d times, want exactly 1 (one access row transitioned)", probes)
+	}
+	if seen := scanInt(t, pool, `SELECT refresh_already_revoked FROM sweep_order_probe`); seen != 1 {
+		t.Errorf("at the instant the access sweep fired, %d of the subject's refresh tokens were already revoked, want 1 — refresh tokens must be swept FIRST", seen)
+	}
+}
+
+// TestRevokeGrantsForSubject_PartialSweepRollsBack is the counterfactual vehicle
+// for the SINGLE TRANSACTION. A BEFORE UPDATE trigger on oauth_access_tokens
+// raises the moment the access sweep (the SECOND statement) tries to stamp a
+// row, so the refresh sweep has already run inside the transaction; the call
+// must fail AND the read-back must show the subject's refresh tokens STILL
+// LIVE. Replace the transaction with two pool-direct statements and the refresh
+// revocation commits on its own → red on the read-back, not on the error.
+func TestRevokeGrantsForSubject_PartialSweepRollsBack(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+	grant := redeemFor(t, repo, testSubject, testClientID)
+
+	for _, ddl := range []string{
+		`CREATE FUNCTION fail_access_sweep() RETURNS trigger LANGUAGE plpgsql AS $$
+		 BEGIN
+		   IF NEW.revoked_at IS NOT NULL AND OLD.revoked_at IS NULL THEN
+		     RAISE EXCEPTION 'forced mid-sweep failure';
+		   END IF;
+		   RETURN NEW;
+		 END $$`,
+		`CREATE TRIGGER fail_access_sweep BEFORE UPDATE ON oauth_access_tokens
+		   FOR EACH ROW EXECUTE FUNCTION fail_access_sweep()`,
+	} {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			t.Fatalf("install failing trigger: %v\n%s", err, ddl)
+		}
+	}
+
+	_, _, err := repo.RevokeGrantsForSubject(ctx, testSubject, "")
+	if err == nil || !strings.Contains(err.Error(), "forced mid-sweep failure") {
+		t.Fatalf("RevokeGrantsForSubject under the failing trigger = %v, want the forced failure surfaced", err)
+	}
+	if n := liveRowsForSubject(t, pool, "oauth_refresh_tokens", testSubject); n != 1 {
+		t.Errorf("%d live refresh tokens after the failed sweep, want 1 — the refresh half must roll back with the access half", n)
+	}
+	if n := liveRowsForSubject(t, pool, "oauth_access_tokens", testSubject); n != 1 {
+		t.Errorf("%d live access tokens after the failed sweep, want 1", n)
+	}
+	// Both consuming paths still accept the pair: nothing was half-revoked.
+	if _, err := repo.AuthenticateAccessToken(ctx, grant.Access.PlainText); err != nil {
+		t.Errorf("access token after the rolled-back sweep = %v, want live", err)
+	}
+	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq()); err != nil {
+		t.Errorf("refresh token after the rolled-back sweep = %v, want a successful rotation", err)
+	}
+}
+
+// TestRevokeGrantsForSubject_SerializesOnLineage is the counterfactual vehicle
+// for approval condition 2 (the subject sweep locks every lineage root FOR
+// UPDATE, in the order rotation already uses). Mirroring
+// TestRotateRefreshToken_ReuseSweepSerializesOnLineage, it asserts the
+// MECHANISM deterministically: an outside transaction holds one of the
+// subject's authorization-code rows FOR UPDATE — standing in for a rotation
+// that is mid-flight and has not committed — and the sweep must BLOCK on it.
+// Delete LockAuthorizationCodesForSubject from the transaction and the sweep
+// sails straight through (its UPDATEs never touch the code row) → red on the
+// first assertion.
+func TestRevokeGrantsForSubject_SerializesOnLineage(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+	spec := codeSpec(testClientID, time.Now().UTC().Add(time.Minute))
+	code := newCodeSpec(t, repo, spec)
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
+	if err != nil {
+		t.Fatalf("RedeemAuthorizationCode: %v", err)
+	}
+
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin blocking transaction: %v", err)
+	}
+	defer func() { _ = blocker.Rollback(ctx) }()
+	if _, err := blocker.Exec(ctx,
+		`SELECT id FROM oauth_authorization_codes WHERE id = $1 FOR UPDATE`, code.ID); err != nil {
+		t.Fatalf("lock the lineage row: %v", err)
+	}
+
+	type result struct {
+		access, refresh int64
+		err             error
+	}
+	done := make(chan result, 1)
+	go func() {
+		a, r, e := repo.RevokeGrantsForSubject(ctx, testSubject, "")
+		done <- result{a, r, e}
+	}()
+
+	select {
+	case res := <-done:
+		t.Fatalf("the subject sweep completed (%+v) while an outside transaction held a lineage row lock — "+
+			"RevokeGrantsForSubject does not serialize on the subject's lineage roots, so a concurrent rotation can "+
+			"commit a successor pair the sweep's snapshot never sees", res)
+	case <-time.After(timescale.D(500 * time.Millisecond)):
+		// Still blocked: the lineage locks are real.
+	}
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("release the lineage lock: %v", err)
+	}
+	select {
+	case res := <-done:
+		if res.err != nil || res.access != 1 || res.refresh != 1 {
+			t.Fatalf("sweep after the lock was released = %+v, want (1, 1, nil)", res)
+		}
+	case <-time.After(timescale.D(15 * time.Second)):
+		t.Fatal("the subject sweep never completed after the lineage lock was released — it is deadlocked, not serialized")
+	}
+	if _, err := repo.AuthenticateAccessToken(ctx, grant.Access.PlainText); !errors.Is(err, oauthstore.ErrRevoked) {
+		t.Errorf("access token after the serialized sweep = %v, want ErrRevoked", err)
+	}
+}
+
+// TestRevokeGrantsForSubject_RacesRotationLeavesNoLiveToken is approval
+// condition 2's committed-state assertion under a REAL race: a legitimate
+// rotation chain of the subject's refresh token runs concurrently with the
+// subject sweep, several rounds over. After both settle, NO live access or
+// refresh token may remain for the subject — whichever side committed first,
+// the lineage locks force the other to observe it (the sweep's later snapshot
+// includes the successor, or the rotation reads revoked_at and mints nothing).
+// A racing test cannot pin the losing interleaving deterministically — that is
+// _SerializesOnLineage's job — so this is the invariant the lock delivers,
+// asserted end to end.
+func TestRevokeGrantsForSubject_RacesRotationLeavesNoLiveToken(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+
+	const rounds = 5
+	for round := 0; round < rounds; round++ {
+		subject := "github:racer-" + uuid.NewString()
+		grant := redeemFor(t, repo, subject, testClientID)
+
+		var wg sync.WaitGroup
+		var lastMinted *oauthstore.IssuedGrant
+		var rotateErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			refresh := grant.Refresh.PlainText
+			for {
+				next, err := repo.RotateRefreshToken(ctx, refresh, nil, rotateReq())
+				if err != nil {
+					rotateErr = err
+					return
+				}
+				lastMinted = next
+				refresh = next.Refresh.PlainText
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			time.Sleep(timescale.D(time.Duration(round) * 5 * time.Millisecond))
+			if _, _, err := repo.RevokeGrantsForSubject(ctx, subject, ""); err != nil {
+				t.Errorf("round %d: RevokeGrantsForSubject: %v", round, err)
+			}
+		}()
+		wg.Wait()
+
+		if !errors.Is(rotateErr, oauthstore.ErrRevoked) {
+			t.Errorf("round %d: the rotation chain stopped with %v, want ErrRevoked once the sweep committed", round, rotateErr)
+		}
+		if n := liveRowsForSubject(t, pool, "oauth_access_tokens", subject); n != 0 {
+			t.Errorf("round %d: %d live access tokens survived the sweep, want 0", round, n)
+		}
+		if n := liveRowsForSubject(t, pool, "oauth_refresh_tokens", subject); n != 0 {
+			t.Errorf("round %d: %d live refresh tokens survived the sweep, want 0", round, n)
+		}
+		if lastMinted != nil {
+			if _, err := repo.AuthenticateAccessToken(ctx, lastMinted.Access.PlainText); !errors.Is(err, oauthstore.ErrRevoked) {
+				t.Errorf("round %d: the last successor minted by the racing rotation = %v, want ErrRevoked", round, err)
+			}
+		}
+	}
+}

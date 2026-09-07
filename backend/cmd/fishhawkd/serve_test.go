@@ -3381,11 +3381,39 @@ func TestResolveOAuthTTLs_DefaultsApplied(t *testing.T) {
 	if got := envOrDuration("FISHHAWKD_OAUTH_CODE_TTL", 60*time.Second); got != 60*time.Second {
 		t.Errorf("code ttl default = %v", got)
 	}
-	if got := envOrDuration("FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL", time.Hour); got != time.Hour {
+	if got := envOrDuration("FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL", 15*time.Minute); got != 15*time.Minute {
 		t.Errorf("access ttl default = %v", got)
 	}
 	if got := envOrDuration("FISHHAWKD_OAUTH_REFRESH_TOKEN_TTL", 336*time.Hour); got != 336*time.Hour {
 		t.Errorf("refresh ttl default = %v", got)
+	}
+}
+
+// TestServeFlagDefault_OAuthAccessTokenTTL pins the REGISTERED default of
+// --oauth-access-token-ttl at 15m (E66.5 / #2393) by driving runServe's own
+// usage output, the way TestServeRegistersRepoACLTTLFlag does: the literal in
+// serve.go is the value under test, not a copy the test supplies itself. The
+// server-side resolved default is pinned separately by
+// TestResolveOAuthASState_DefaultAccessTokenTTLIsFifteenMinutes; both must
+// agree, and the credstore refresh skew is derived from this value.
+func TestServeFlagDefault_OAuthAccessTokenTTL(t *testing.T) {
+	t.Setenv("FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL", "")
+	var logSink bytes.Buffer
+	if code := runServe([]string{"-h"}, &logSink); code != exitFailure {
+		t.Fatalf("runServe(-h) = %d, want %d (parse aborts before serving)", code, exitFailure)
+	}
+	usage := logSink.String()
+	const header = "  -oauth-access-token-ttl duration\n"
+	i := strings.Index(usage, header)
+	if i < 0 {
+		t.Fatalf("runServe usage does not register --oauth-access-token-ttl as a duration flag; got:\n%s", usage)
+	}
+	entry := usage[i+len(header):]
+	if j := strings.Index(entry, "\n  -"); j >= 0 {
+		entry = entry[:j]
+	}
+	if want := "(default 15m0s)"; !strings.Contains(entry, want) {
+		t.Errorf("--oauth-access-token-ttl entry = %q, want it to carry %s", entry, want)
 	}
 }
 

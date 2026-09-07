@@ -107,8 +107,8 @@ func Commands() []Command {
 			Flags: withCommon("constraint", "force", "output", "o")},
 
 		// token
-		{Key: "token login", Synopsis: "Log in via the OAuth device flow; mint + store a user-bound token.", Args: "",
-			Flags: withCommon("provider", "client-id")},
+		{Key: "token login", Synopsis: "Log in via the OAuth device flow, or --oauth for the OAuth 2.1 browser flow; mint + store a user-bound token.", Args: "",
+			Flags: withCommon("provider", "client-id", "oauth", "oauth-client-id")},
 		{Key: "token list", Synopsis: "List locally stored credentials (per backend URL).", Args: "",
 			Flags: []string{}},
 
