@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -113,6 +114,33 @@ func (f *fakeOAuthStore) GetClientByID(_ context.Context, clientID string) (*oau
 		return &cp, nil
 	}
 	return nil, oauthstore.ErrNotFound
+}
+
+// ListClients mirrors the real store: copies sorted by client_id, an empty map
+// yielding an empty (non-nil) slice rather than ErrNotFound — so a future
+// server-side consumer cannot be written against a fake laxer than Postgres.
+func (f *fakeOAuthStore) ListClients(_ context.Context) ([]*oauthstore.Client, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*oauthstore.Client, 0, len(f.clients))
+	for _, c := range f.clients {
+		cp := *c
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ClientID < out[j].ClientID })
+	return out, nil
+}
+
+// DeleteClient mirrors the real store: ErrNotFound on a miss, so a caller can
+// never observe a false success on a typo'd client_id.
+func (f *fakeOAuthStore) DeleteClient(_ context.Context, clientID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.clients[clientID]; !ok {
+		return oauthstore.ErrNotFound
+	}
+	delete(f.clients, clientID)
+	return nil
 }
 
 func (f *fakeOAuthStore) CreateAuthorizationCode(_ context.Context, in oauthstore.NewAuthorizationCode) (*oauthstore.AuthorizationCode, error) {

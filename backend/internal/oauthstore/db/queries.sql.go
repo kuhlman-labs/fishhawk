@@ -285,6 +285,23 @@ func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshToken
 	return i, err
 }
 
+const deleteClientByClientID = `-- name: DeleteClientByClientID :execrows
+DELETE FROM oauth_clients
+ WHERE client_id = $1
+`
+
+// Backs ` + "`fishhawkd oauth client remove`" + `. Keyed on client_id ALONE per 0064 (the
+// table's only key), and :execrows so the CLI can distinguish a real deletion
+// (1 row) from a typo'd id (0 rows) and report the miss instead of a false
+// success.
+func (q *Queries) DeleteClientByClientID(ctx context.Context, clientID string) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteClientByClientID, clientID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getAccessTokenByHash = `-- name: GetAccessTokenByHash :one
 SELECT id, token_hash, subject, client_id, audience, scopes, provider, account_id, authorization_code_id, issued_at, expires_at, last_used_at, revoked_at FROM oauth_access_tokens
  WHERE token_hash = $1
@@ -409,6 +426,50 @@ func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (
 		&i.RevokedAt,
 	)
 	return i, err
+}
+
+const listClients = `-- name: ListClients :many
+SELECT id, client_id, redirect_uris, grant_types, response_types, token_endpoint_auth_method, client_name, client_uri, logo_uri, scope, account_id, first_seen_at, updated_at FROM oauth_clients
+ ORDER BY client_id
+`
+
+// The operator inventory read, backing ` + "`fishhawkd oauth client list`" + `. Ordered by
+// client_id for a stable render. Carries NO account_id filter DELIBERATELY,
+// consistent with 0063's header part (c): a registration read is not a
+// database-level tenant decision — that authorization belongs to the
+// already-authenticated caller. An empty table is an empty result, not an error.
+func (q *Queries) ListClients(ctx context.Context) ([]OauthClient, error) {
+	rows, err := q.db.Query(ctx, listClients)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []OauthClient
+	for rows.Next() {
+		var i OauthClient
+		if err := rows.Scan(
+			&i.ID,
+			&i.ClientID,
+			&i.RedirectUris,
+			&i.GrantTypes,
+			&i.ResponseTypes,
+			&i.TokenEndpointAuthMethod,
+			&i.ClientName,
+			&i.ClientUri,
+			&i.LogoUri,
+			&i.Scope,
+			&i.AccountID,
+			&i.FirstSeenAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const lockAuthorizationCodeByHash = `-- name: LockAuthorizationCodeByHash :one
