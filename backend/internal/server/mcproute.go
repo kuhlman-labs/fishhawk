@@ -1,7 +1,10 @@
 package server
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -532,6 +535,17 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-tool authorization (E66.30 / #2459), POST only: GET and DELETE
+	// carry no JSON-RPC message to authorize and must keep reaching the SDK
+	// so it answers them with the spec-prescribed 405 + Allow: POST.
+	//
+	// This runs BEFORE mcpHandler.ServeHTTP, which is what makes the refusal
+	// precede the per-request MCPServerFactory — no tool registry is built
+	// and no inner REST call is dialled for a request refused here.
+	if r.Method == http.MethodPost && !s.authorizeMCPToolCall(w, r, id) {
+		return
+	}
+
 	s.mcpHandler.ServeHTTP(w, r)
 }
 
@@ -547,4 +561,250 @@ func (s *Server) writeMCPAuthChallenge(w http.ResponseWriter, r *http.Request) {
 	s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
 		"the MCP route requires a Fishhawk bearer token (Authorization: Bearer fhk_… or fhm_…); "+
 			"a browser cookie session is not accepted", nil)
+}
+
+// ---------------------------------------------------------------------------
+// SEP-2243 header-driven per-tool authorization (E66.30 / #2459)
+// ---------------------------------------------------------------------------
+
+const (
+	// mcpProtocolVersionHeader, mcpMethodHeader and mcpNameHeader are the
+	// SEP-2243 standard request headers go-sdk v1.7.0 mirrors onto every
+	// outbound request (mcp/streamable_headers.go setStandardHeaders) and
+	// validates against the body on the way in (validateMcpHeaders).
+	mcpProtocolVersionHeader = "Mcp-Protocol-Version"
+	mcpMethodHeader          = "Mcp-Method"
+	mcpNameHeader            = "Mcp-Name"
+
+	// mcpToolCallMethod is the ONE JSON-RPC method this gate authorizes by
+	// name. Every other method is passed through to the SDK, which answers
+	// it from the per-request registry under the caller's own token.
+	mcpToolCallMethod = "tools/call"
+
+	// mcpMinProtocolVersion is the floor this route requires, and it is
+	// LOAD-BEARING rather than a nicety.
+	//
+	// go-sdk v1.7.0 mcp/streamable_headers.go validateMcpHeaders returns nil
+	// IMMEDIATELY when Mcp-Protocol-Version is empty or lexically below
+	// minVersionForStandardHeaders ("2026-07-28"):
+	//
+	//	protocolVersion := header.Get(protocolVersionHeader)
+	//	if protocolVersion == "" || protocolVersion < minVersionForStandardHeaders {
+	//		return nil
+	//	}
+	//
+	// So BELOW this version the SDK checks NO header against the body, and
+	// Mcp-Method / Mcp-Name are unauthenticated hints a caller may set to
+	// anything. AT or ABOVE it, a missing or disagreeing Mcp-Method or
+	// Mcp-Name is answered with CodeHeaderMismatch (-32020, mcp/shared.go)
+	// and HTTP 400 — which is what makes a header-derived authorization
+	// decision sound: a forged Mcp-Name that satisfies this gate is still
+	// refused by the SDK before the tool runs.
+	//
+	// It must therefore NEVER be relaxed to "enforce only when the headers
+	// happen to be present": that is a complete bypass, since a header-less
+	// tools/call is indistinguishable at the header layer from a header-less
+	// initialize.
+	//
+	// The lexical comparison is the ordering test the SDK itself performs.
+	// MCP protocol versions are ISO-8601 dates, whose lexical and
+	// chronological orders coincide.
+	mcpMinProtocolVersion = "2026-07-28"
+
+	// mcpBodyProbeLimit bounds how many leading bytes the batch probe reads
+	// before giving up. A JSON-RPC message's first non-whitespace byte is its
+	// opening delimiter, so this only ever has to skip leading whitespace;
+	// the cap keeps a body of pure whitespace from being read to exhaustion.
+	mcpBodyProbeLimit = 4096
+)
+
+// mcpRestoredBody re-presents an already-read prefix of a request body to the
+// next reader while keeping the ORIGINAL Close. Reading a bounded prefix for
+// the batch probe must not consume the body the SDK then decodes, and simply
+// assigning an io.NopCloser would drop net/http's own body cleanup.
+type mcpRestoredBody struct {
+	io.Reader
+	io.Closer
+}
+
+// mcpFirstNonSpaceByte returns the first non-whitespace byte of r's body,
+// RESTORING everything it read so the SDK still sees the complete body.
+//
+// found=false with a nil error means the body carried no non-whitespace byte
+// within mcpBodyProbeLimit — an empty or whitespace-only body. The caller
+// treats that as unauthorizable and fails closed rather than guessing.
+func mcpFirstNonSpaceByte(r *http.Request) (b byte, found bool, err error) {
+	if r.Body == nil {
+		return 0, false, nil
+	}
+	buf := make([]byte, 0, 64)
+	tmp := make([]byte, 64)
+	for len(buf) < mcpBodyProbeLimit {
+		n, rerr := r.Body.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			for _, c := range buf {
+				switch c {
+				case ' ', '\t', '\r', '\n':
+					continue
+				default:
+					b, found = c, true
+				}
+				if found {
+					break
+				}
+			}
+		}
+		if found || rerr != nil {
+			// Restore unconditionally, INCLUDING on the error path: the SDK
+			// must observe the same body (and the same read error) it would
+			// have seen had the probe never run.
+			r.Body = mcpRestoredBody{
+				Reader: io.MultiReader(bytes.NewReader(buf), r.Body),
+				Closer: r.Body,
+			}
+			if rerr != nil && !errors.Is(rerr, io.EOF) {
+				return 0, false, rerr
+			}
+			return b, found, nil
+		}
+	}
+	r.Body = mcpRestoredBody{
+		Reader: io.MultiReader(bytes.NewReader(buf), r.Body),
+		Closer: r.Body,
+	}
+	return 0, false, nil
+}
+
+// authorizeMCPToolCall is the per-tool authorization gate. It runs on POST
+// /mcp AFTER the bearer-identity and OAuth-audience gates in handleMCP and
+// BEFORE mcpHandler.ServeHTTP — so a refusal happens before the per-request
+// MCPServerFactory is invoked, i.e. before any tool registry exists and before
+// any inner REST call could be made. Returning false means a response has
+// already been written.
+//
+// Two preconditions this gate silently depends on, recorded because a later
+// change could break either without a compile error:
+//
+//   - newMCPHandler passes Stateless: true. The streamable transport accepts
+//     protocol 2026-07-28 ONLY on a stateless server; a stateful route would
+//     negotiate down to 2025-11-25, never carry these headers, and make this
+//     gate refuse EVERY request.
+//   - the ladder's version rung is not a warning. See mcpMinProtocolVersion.
+//
+// The ladder, each rung with its own error identity:
+//
+//	(0) a JSON-RPC BATCH                       -> 403 mcp_batch_not_supported
+//	(1) version header absent or below floor   -> 403 mcp_standard_headers_required
+//	(2) Mcp-Method absent                      -> 403 mcp_standard_headers_required
+//	(3) Mcp-Method is not tools/call           -> pass through
+//	(4) Mcp-Name absent                        -> 403 mcp_tool_name_required
+//	(5) tool not in mcpToolScopes              -> 403 mcp_tool_not_authorized
+//	(6) required scope not held                -> 403 insufficient_scope
+func (s *Server) authorizeMCPToolCall(w http.ResponseWriter, r *http.Request, id Identity) bool {
+	// (0) BATCH. The SDK validates header/body agreement only for a SINGLE
+	// non-batch message — mcp/streamable.go guards the validateMcpHeaders
+	// call with `if !isBatch && len(incoming) == 1`. A batch's Mcp-Name
+	// therefore describes at most one of its elements and is checked against
+	// none of them, so a batch CANNOT be authorized from headers at all: a
+	// batch naming an allowed tool in its header could carry an
+	// under-scoped tools/call in an element. Refuse it here, with its own
+	// identity, rather than pretending the headers speak for it. Batching is
+	// unsupported on this route.
+	//
+	// Detection reads a BOUNDED prefix and restores it, so the SDK still
+	// decodes the whole body: the first non-whitespace byte of a JSON-RPC
+	// batch is '['.
+	first, found, err := mcpFirstNonSpaceByte(r)
+	switch {
+	case err != nil:
+		// details.reason DISCRIMINATES the two fail-closed branches. They
+		// share an error identity on purpose (both mean "unclassifiable"),
+		// and without a distinguishing detail a test asserting the identity
+		// alone would stay GREEN with either branch deleted — the other one
+		// catches the same input and returns a byte-identical code.
+		s.writeError(w, r, http.StatusBadRequest, "mcp_request_unreadable",
+			"the MCP request body could not be read far enough to classify it as a single message or a batch; "+
+				"the request is refused rather than forwarded unauthorized",
+			map[string]any{"reason": "read_error"})
+		return false
+	case !found:
+		s.writeError(w, r, http.StatusBadRequest, "mcp_request_unreadable",
+			"the MCP request body is empty or contains only whitespace, so it cannot be classified as a single message or a batch; "+
+				"the request is refused rather than forwarded unauthorized",
+			map[string]any{"reason": "no_content"})
+		return false
+	case first == '[':
+		s.writeError(w, r, http.StatusForbidden, "mcp_batch_not_supported",
+			"JSON-RPC batch requests are not supported on this route: the standard MCP headers describe a single message, "+
+				"so a batch cannot be authorized from them; send one message per request", nil)
+		return false
+	}
+
+	// (1) Protocol version floor.
+	if v := r.Header.Get(mcpProtocolVersionHeader); v == "" || v < mcpMinProtocolVersion {
+		s.writeMCPStandardHeadersRequired(w, r, v)
+		return false
+	}
+
+	// (2) Mcp-Method. Above the floor the SDK REQUIRES this header and
+	// rejects a disagreement, so its absence means the request is not one
+	// this gate can authorize.
+	method := r.Header.Get(mcpMethodHeader)
+	if method == "" {
+		s.writeMCPStandardHeadersRequired(w, r, r.Header.Get(mcpProtocolVersionHeader))
+		return false
+	}
+
+	// (3) Anything that is not a tool call is not per-tool authorized.
+	if method != mcpToolCallMethod {
+		return true
+	}
+
+	// (4) Mcp-Name.
+	name := r.Header.Get(mcpNameHeader)
+	if name == "" {
+		s.writeError(w, r, http.StatusForbidden, "mcp_tool_name_required",
+			"a tools/call request must carry the Mcp-Name header naming the tool it invokes; "+
+				"without it the call cannot be authorized before the tool registry is built", nil)
+		return false
+	}
+
+	// (5) Unmapped tool. Fail CLOSED: a tool registered without a
+	// mcpToolScopes entry is refused rather than defaulted to
+	// authenticated-only.
+	rule, ok := mcpToolScopeFor(name)
+	if !ok {
+		s.writeError(w, r, http.StatusForbidden, "mcp_tool_not_authorized",
+			"tool "+strconv.Quote(name)+" has no authorization entry on this deployment and is refused",
+			map[string]any{"tool": name})
+		return false
+	}
+
+	// (6) Scope.
+	if !rule.satisfiedBy(id) {
+		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
+			"token is missing required scope: "+rule.requiredScopeDescription(),
+			map[string]any{
+				"required_scope": rule.requiredScopeDescription(),
+				"tool":           name,
+			})
+		return false
+	}
+	return true
+}
+
+// writeMCPStandardHeadersRequired emits the refusal shared by ladder rungs (1)
+// and (2). Both mean the same thing — the request does not carry SEP-2243
+// standard headers the SDK will validate against the body — so they carry one
+// error identity, with the observed version echoed for diagnosis.
+func (s *Server) writeMCPStandardHeadersRequired(w http.ResponseWriter, r *http.Request, observed string) {
+	s.writeError(w, r, http.StatusForbidden, "mcp_standard_headers_required",
+		"POST /mcp requires an MCP client speaking protocol "+mcpMinProtocolVersion+" or later, "+
+			"carrying the Mcp-Protocol-Version and Mcp-Method standard headers; below that version the headers are not "+
+			"validated against the request body, so a tool call cannot be authorized from them",
+		map[string]any{
+			"minimum_protocol_version":  mcpMinProtocolVersion,
+			"observed_protocol_version": observed,
+		})
 }

@@ -2555,7 +2555,98 @@ leave the 503 branch unreachable.
 | 5 | listener host is not loopback | `403 mcp_route_loopback_only` (ADR-033) |
 | 6 | `MCPSelfURL` is set but is not a loopback base URL | `503 mcp_route_misconfigured` (names the bearer-forwarding risk) |
 | 7 | no bearer identity on the request | `401 authentication_required` |
+| 8 | lifted off loopback for OAuth, bare `fhk_`/`fhm_` token (no validated audience) | `401 authentication_required` (byte-identical challenge) |
+| 9 | **POST only** — JSON-RPC batch body | `403 mcp_batch_not_supported` |
+| 10 | **POST only** — body unclassifiable (unreadable, or no non-whitespace byte) | `400 mcp_request_unreadable` (`details.reason` = `read_error` \| `no_content`) |
+| 11 | **POST only** — `Mcp-Protocol-Version` absent or `< 2026-07-28` | `403 mcp_standard_headers_required` |
+| 12 | **POST only** — `Mcp-Method` absent | `403 mcp_standard_headers_required` |
+| 13 | **POST only** — `Mcp-Method` is not `tools/call` | pass through to the streamable handler |
+| 14 | **POST only** — `tools/call` with no `Mcp-Name` | `403 mcp_tool_name_required` |
+| 15 | **POST only** — the named tool has no `mcpToolScopes` entry | `403 mcp_tool_not_authorized` (`details.tool`) |
+| 16 | **POST only** — the identity does not satisfy the tool's rule | `403 insufficient_scope` (`details.required_scope`, `details.tool`) |
 | — | otherwise | delegate to the streamable handler |
+
+### Per-tool authorization at the HTTP layer (`mcpscopes.go`, E66.30 / #2459)
+
+Rungs 9–16 are `authorizeMCPToolCall`, which runs on **POST only** (GET and
+DELETE carry no JSON-RPC message and must keep reaching the SDK for its
+spec-prescribed `405 Allow: POST`) and — the load-bearing placement — runs
+BEFORE `mcpHandler.ServeHTTP`, so a refusal precedes the per-request
+`MCPServerFactory`: no tool registry is built and no inner REST call is dialled.
+`TestHandleMCP_RefusalPrecedesServerFactory` and
+`TestMCPRoute_ScopeRefusalIsCrossLayer` assert exactly that (a factory-call
+counter of zero, and zero recorded inner `/v0/` requests), because a status code
+alone cannot distinguish a gate refusal from one raised inside an
+already-constructed registry.
+
+**The 2026-07-28 client floor is a DELIBERATE NARROWING, and it is forced, not
+chosen.** go-sdk v1.7.0 `mcp/streamable_headers.go` `validateMcpHeaders` returns
+`nil` immediately when `Mcp-Protocol-Version` is empty or lexically below
+`minVersionForStandardHeaders` (`"2026-07-28"`), so BELOW that version the SDK
+validates NO header against the body and `Mcp-Method` / `Mcp-Name` are
+unauthenticated hints. AT or ABOVE it, a missing or disagreeing header is
+answered `-32020 CodeHeaderMismatch` + HTTP 400 — which is what makes a
+header-derived authorization decision sound, and is what
+`TestMCPRoute_ForgedMcpNameRejected` demonstrates end to end. Enforcing only
+when the headers HAPPEN to be present would be a complete bypass, since a
+header-less `tools/call` is indistinguishable at the header layer from a
+header-less `initialize`. **Symptom of the narrowing:** a pre-2026-07-28 MCP
+client's first request carries no version header, so it draws `403
+mcp_standard_headers_required` and never connects. Any client already pointed at
+a deployment's `/mcp` must be confirmed to negotiate 2026-07-28 before this
+ships.
+
+**Batching is UNSUPPORTED on this route.** The SDK validates header/body
+agreement only for a SINGLE non-batch message — `mcp/streamable.go` guards the
+`validateMcpHeaders` call with `if !isBatch && len(incoming) == 1` — so a
+batch's `Mcp-Name` is checked against none of its elements and the request
+cannot be authorized from its headers at all. The gate detects a batch from the
+first non-whitespace byte of a BOUNDED body prefix (`mcpBodyProbeLimit`),
+restores everything it read so the SDK still decodes the whole body, and refuses
+with its own identity.
+
+**`Stateless: true` is a silent precondition.** The streamable transport accepts
+protocol 2026-07-28 only on a stateless server, so flipping this route to
+stateful would negotiate down to 2025-11-25, strip the standard headers, and
+make this gate refuse EVERY request. Recorded as a comment on both
+`newMCPHandler` and the gate.
+
+**The table lives HERE, not beside the registrations.** `mcpToolScopes` maps
+every tool `mcpserver.NewServer` registers onto the scope its underlying REST
+endpoint enforces. It cannot live in `backend/internal/mcpserver` for the same
+reason `MCPServerFactory` is an injected seam: that import edge closes a cycle
+in `mcpserver`'s TEST binary. The REVERSE edge is legal and already in use
+(`mcproute_test.go` imports `mcpserver` for `TestMCPRoute_ToolRegistryParity`),
+which is what makes `TestMCPToolScopeTable_CoversRegistry` possible — it asserts
+SET EQUALITY IN BOTH DIRECTIONS against the live registry, so a tool added
+without an entry AND a stale entry are each RED.
+
+**Derivation rule, per entry:** find the REST endpoint the tool dials and mirror
+its predicate. `requireWriteScope(w, r, X)` → `anyOf{X}`; `retry.go` /
+`revive.go`'s `write:stages OR write:retries` and `fixup.go` /
+`waive.go` / `defer_concern.go`'s `write:stages OR write:fixups` → both members;
+a handler enforcing nothing beyond authentication → the named sentinel
+`mcpScopeAuthenticatedOnly`. Where a tool dials several endpoints the entry
+mirrors the one performing its PRIMARY action, any-of across them when it
+performs several — the gate must never be STRICTER than the endpoints, because
+each inner REST call still enforces its own predicate. An unmapped name fails
+CLOSED.
+
+**The `fhm_` interaction is the sharpest hazard.** A run-bound MCP token
+(subject `mcp:run:<uuid>`, minted by `handleIssueMCPToken`) carries only
+`mcp:read`, plus `write:retries` when the stage's spec sets
+`executor.agent_self_retry`, plus `write:scope-amendments` on implement stages.
+An entry demanding an operator-vocabulary scope for a tool the in-run agent
+calls would break the agent loop with no compile error — mapping
+`fishhawk_retry_stage` to `write:stages` alone would refuse a self-retrying
+implement agent `retry.go` admits today. Two shapes guard it: any-of rules, and
+`runBoundSubjectOK` for handlers that authorize a run-bound token by its SUBJECT
+rather than by scope (`gateview.go`, `product_report.go`).
+`TestMCPToolScopeTable_RunBoundAgentLoopIntact` pins it.
+
+`TestMCPToolScopeTable_VocabularyIsNotParallel` additionally pins every `anyOf`
+member to `oauthas.SupportedScopes`, the three run-bound `fhm_` scopes, or an
+existing named constant, so no parallel MCP-only scope language can appear.
 
 The verdict is computed ONCE at `New()` from the immutable `Config` and stored
 on the `Server`. It is a pure function of that config, and resolving it per

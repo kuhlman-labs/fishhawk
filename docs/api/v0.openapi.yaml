@@ -5171,11 +5171,37 @@ paths:
         NOT accepted — the route is bearer-only, which is what makes its CSRF
         exemption safe.
 
+        Then the per-tool authorization gate (E66.30, #2459), which runs
+        BEFORE the per-request tool registry is constructed: a JSON-RPC batch
+        → `403 mcp_batch_not_supported`; a body that cannot be classified as a
+        single message or a batch → `400 mcp_request_unreadable`; an absent or
+        pre-`2026-07-28` `Mcp-Protocol-Version`, or an absent `Mcp-Method` →
+        `403 mcp_standard_headers_required`; a `tools/call` with no `Mcp-Name`
+        → `403 mcp_tool_name_required`; a tool with no authorization entry →
+        `403 mcp_tool_not_authorized`; an identity not holding the tool's
+        required scope → `403 insufficient_scope`. A method other than
+        `tools/call` passes the gate and is answered by the SDK.
+
+        REQUIRED REQUEST HEADERS (SEP-2243): `POST /mcp` requires an MCP
+        client speaking protocol **2026-07-28** or later. Every POST must
+        carry `Mcp-Protocol-Version: 2026-07-28` (or later) and `Mcp-Method`;
+        a `tools/call` must additionally carry `Mcp-Name`. This is a
+        DELIBERATE NARROWING: below that version the MCP SDK validates no
+        header against the request body, so the headers are unauthenticated
+        hints and a tool call cannot be authorized from them. A
+        pre-2026-07-28 client draws `403 mcp_standard_headers_required` on its
+        first request and never connects. JSON-RPC BATCHING IS UNSUPPORTED for
+        the same reason — header/body agreement is proven only for a single
+        non-batch message, so a batch's `Mcp-Name` speaks for none of its
+        elements.
+
         Tool calls carry exactly the privilege of the equivalent REST call:
         each tool reaches data by calling this same API with the caller's
-        token, so a denial there is the denial here. Clients present a
-        Fishhawk bearer token (`fhk_`/`fhm_`) or, when the OAuth AS is enabled,
-        an AS-issued audience-validated `fho_` access token (RFC 8707).
+        token, so a denial there is the denial here — the gate above MIRRORS
+        each tool's underlying REST predicate and relocates the refusal
+        earlier, it does not add policy. Clients present a Fishhawk bearer
+        token (`fhk_`/`fhm_`) or, when the OAuth AS is enabled, an AS-issued
+        audience-validated `fho_` access token (RFC 8707).
 
         The `401` carries an RFC 6750 §3 `WWW-Authenticate: Bearer` challenge
         with the RFC 9728 §5.1 `resource_metadata` discovery pointer when the AS
@@ -5191,7 +5217,9 @@ paths:
       tags: [mcp]
       requestBody:
         required: true
-        description: A JSON-RPC request, notification, or batch per the MCP specification.
+        description: |
+          A single JSON-RPC request or notification per the MCP specification.
+          A BATCH is refused `403 mcp_batch_not_supported` (#2459).
         content:
           application/json:
             schema:
@@ -5213,9 +5241,15 @@ paths:
                 additionalProperties: true
         '400':
           description: |
-            Malformed JSON-RPC body, an unsupported `MCP-Protocol-Version`
-            header, or — unreachable through the ladder above — a request
-            the tool-server factory declined to build.
+            `mcp_request_unreadable` — the body could not be read far enough
+            to classify as a single message or a batch, or carried no
+            non-whitespace byte (`details.reason` is `read_error` or
+            `no_content`). Also: a malformed JSON-RPC body; a header that
+            disagrees with the body, which the MCP SDK answers with JSON-RPC
+            error code `-32020` (`CodeHeaderMismatch`) — this is what makes a
+            forged `Mcp-Name` unusable even when it satisfies the scope gate;
+            or — unreachable through the ladder above — a request the
+            tool-server factory declined to build.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -5234,7 +5268,19 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '403': { $ref: '#/components/responses/MCPLoopbackOnly' }
+        '403':
+          description: |
+            `mcp_route_loopback_only` — the daemon listens off-host and the
+            route is loopback-only (ADR-033) — or one of the per-tool
+            authorization refusals (#2459), each with its own error code:
+            `mcp_batch_not_supported`, `mcp_standard_headers_required`
+            (`details.minimum_protocol_version`,
+            `details.observed_protocol_version`), `mcp_tool_name_required`,
+            `mcp_tool_not_authorized` (`details.tool`), or
+            `insufficient_scope` (`details.required_scope`, `details.tool`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/MCPRouteDisabled' }
         '415':
           description: '`Content-Type` was not `application/json`.'
