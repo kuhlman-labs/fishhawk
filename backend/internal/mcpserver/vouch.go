@@ -59,12 +59,28 @@ Fail-closed is preserved: vouching records your declaration verbatim
 without verifying the SHA, so an UN-vouched foreign commit still fails
 category-B at the report boundary and still blocks merge resolution.
 
+The audit-complete check RE-POST, however, is BOUND to the run's own live
+pull-request head (#3129): only the RECORD is verbatim for any sha. The
+backend resolves the run's live PR head and stamps the
+fishhawk_audit_complete check ONLY when the vouched sha equals it, so this
+verb can never post the run's recomputed check state onto an unrelated
+commit. A mismatch or an unresolvable head records the vouch and SKIPS the
+publish, naming both shas (or the resolution failure) on the warning; an
+ABBREVIATED sha takes the mismatch arm, so vouch the FULL sha.
+
 Inputs:
   - run_id : the run whose branch carries the commit.
   - sha    : the commit SHA to vouch.
   - reason : required operator rationale, recorded on the audit entry.
 
-Returns the recorded declaration (run_id, vouched_sha, reason). Tool errors:
+Returns the recorded declaration (run_id, vouched_sha, reason) plus the
+audit-check re-post outcome: audit_check_republished, and
+audit_check_republish_warning when it did not land — a publish that errored,
+a vouched sha that is not the run's live PR head (naming both shas), or a
+live head that could not be resolved. A skipped publish is still a 200 and
+the vouch is still durable; re-invoke naming the live head to re-post.
+
+Tool errors:
   - invalid UUID (caught before the HTTP hop)
   - validation_failed (empty sha or reason, 400)
   - run_token_forbidden (a run-bound agent token attempted the vouch, 403)

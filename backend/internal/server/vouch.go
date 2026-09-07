@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -51,9 +53,12 @@ type vouchCommitResponse struct {
 	Reason     string `json:"reason"`
 	// AuditCheckRepublished reports whether the fishhawk_audit_complete Check
 	// Run was successfully re-posted at the vouched head (E64.14 / #3109).
-	// FALSE when the re-post did not land — either it errored (see
-	// AuditCheckRepublishWarning) or no publisher is wired (dev/CLI posture, no
-	// check to post). The vouch itself always succeeds regardless; this field
+	// FALSE when the re-post did not land — it errored (see
+	// AuditCheckRepublishWarning), no publisher is wired (dev/CLI posture, no
+	// check to post), or the PUBLISH BOUND declined to stamp the check (E64.26
+	// / #3129: the vouched sha is not the run's own live pull-request head, or
+	// that head could not be resolved at all). The vouch itself always succeeds
+	// regardless — the declaration is recorded verbatim for ANY sha; this field
 	// makes a swallowed re-post failure VISIBLE (binding condition 1b) so the
 	// operator learns the required check is missing HERE rather than at a later
 	// blocked merge. The reconciler heal does NOT retry it (normal head
@@ -64,8 +69,12 @@ type vouchCommitResponse struct {
 	AuditCheckRepublished bool `json:"audit_check_republished"`
 	// AuditCheckRepublishWarning, when non-empty, names why the re-post did not
 	// land, so the failure is legible in the response body rather than only in
-	// the daemon log (E64.14 / #3109, binding condition 1b). Empty when the
-	// re-post succeeded or when no publisher is wired.
+	// the daemon log (E64.14 / #3109, binding condition 1b). It carries THREE
+	// kinds of non-landing: a publish that errored, a vouched sha that is not
+	// the run's own live PR head (naming BOTH shas), and a live head that could
+	// not be resolved (naming the resolution failure) — the latter two are the
+	// E64.26 / #3129 publish bound. Empty when the re-post succeeded or when no
+	// publisher is wired.
 	AuditCheckRepublishWarning string `json:"audit_check_republish_warning,omitempty"`
 }
 
@@ -105,13 +114,32 @@ type vouchCommitResponse struct {
 // The vouch is ALSO the re-post trigger for the fishhawk_audit_complete Check
 // Run on the operator's head (E64.14 / #3109). After the declaration is
 // durable the handler recomputes audit-complete and republishes the Check Run
-// AT the vouched sha via the head override, because an operator-pushed commit
-// is in no head-report audit category and the publisher's normal head
-// resolution would otherwise re-post against a stale sha — leaving the required
-// check absent from the live merge head. The re-post is best-effort for the
-// vouch's success but its outcome is REPORTED on the response
-// (audit_check_republished / audit_check_republish_warning) rather than
-// swallowed, and re-invoking the vouch idempotently retries the re-post.
+// via the head override, because an operator-pushed commit is in no
+// head-report audit category and the publisher's normal head resolution would
+// otherwise re-post against a stale sha — leaving the required check absent
+// from the live merge head. The re-post is best-effort for the vouch's success
+// but its outcome is REPORTED on the response (audit_check_republished /
+// audit_check_republish_warning) rather than swallowed, and re-invoking the
+// vouch idempotently retries the re-post.
+//
+// THE PUBLISH IS BOUND TO THE RUN'S OWN LIVE PR HEAD (E64.26 / #3129). The
+// re-post used to be stamped at WHATEVER sha the operator named, so an
+// operator carrying write:stages could recompute this run's check state onto
+// any commit in the repository — including the head of an unrelated pull
+// request. The bound narrows only WHERE the check is stamped: before
+// republishing, the handler resolves the run's live pull-request head through
+// the same determinability ladder rebase-branch uses
+// (resolveVouchPublishHead) and publishes ONLY when the vouched sha equals
+// that head. On a mismatch it SKIPS the publish and names BOTH shas on
+// audit_check_republish_warning; when the head cannot be resolved at all it
+// fails closed the way the rebase verb does — skip the publish, never stamp
+// the check at an unverified sha.
+//
+// What did NOT change: the RECORD stays verbatim for any sha. The
+// operator_commit_vouched append and the 200 are byte-identical for a matching
+// and a non-matching sha, the ADR-035 escape hatch is untouched, and vouching
+// a wrong sha still un-wedges nothing. No new response field, no new error
+// code, no status-code change.
 func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
@@ -185,7 +213,8 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.cfg.RunRepo.GetRun(r.Context(), runID); err != nil {
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if err != nil {
 		if errors.Is(err, run.ErrNotFound) {
 			s.writeError(w, r, http.StatusNotFound, "run_not_found",
 				"no run with that id", map[string]any{"run_id": runID.String()})
@@ -232,7 +261,8 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 	// (fixup_pushed > child_pushed > pull_request_opened) would republish
 	// against a STALE sha and leave the required check absent from the live
 	// merge head — the exact wedge this endpoint closes. The head override
-	// targets the vouched sha directly.
+	// targets the vouched sha directly — but ONLY once the publish bound below
+	// has confirmed that sha IS the run's own live pull-request head.
 	//
 	// A re-post failure does NOT fail the vouch — the declaration is already
 	// durable. But it is NOT swallowed either (binding condition 1b): the
@@ -242,15 +272,86 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 	// head resolution), so re-invoking fishhawk_vouch_commit is the sanctioned
 	// idempotent retry (condition 1c): the publisher dedups on success, so a
 	// re-vouch re-posts exactly the dropped check and no-ops once it is live.
-	republished, pubErr := s.recomputeAndPublishAuditCompleteAtHead(r.Context(), runID, sha)
+	//
+	// THE PUBLISH BOUND (E64.26 / #3129). The re-post is stamped ONLY at the
+	// run's OWN live pull-request head. Without it an operator carrying
+	// write:stages could name any commit in the repository — including the head
+	// of an unrelated PR — and have this run's recomputed check state stamped
+	// there. The three arms below run AFTER the append, so they can only affect
+	// WHERE the check is posted: the record is already durable and the 200 is
+	// byte-identical for a matching and a non-matching sha.
 	resp := vouchCommitResponse{
-		RunID:                 runID.String(),
-		VouchedSHA:            sha,
-		Reason:                reason,
-		AuditCheckRepublished: republished,
+		RunID:      runID.String(),
+		VouchedSHA: sha,
+		Reason:     reason,
 	}
-	if pubErr != nil {
-		resp.AuditCheckRepublishWarning = "the vouch is recorded and durable, but re-posting the fishhawk_audit_complete check at the vouched commit failed; the required check may be absent from the merge head — re-invoke fishhawk_vouch_commit to retry the re-post: " + pubErr.Error()
+	// ARM (a): no publisher wired (dev/CLI posture). Checked FIRST so this
+	// posture keeps its documented silent, warning-free skip — resolving a live
+	// PR head we would never publish to would newly warn on every dev vouch.
+	// publishAuditCheckWithOptions already returns (false, nil) here.
+	if s.auditCheckPublisher != nil {
+		liveHead, headErr := s.resolveVouchPublishHead(r.Context(), runRow)
+		switch {
+		case headErr != nil:
+			// FAIL CLOSED, mirroring the rebase verb: an unresolvable head is
+			// never a licence to stamp the check at an unverified sha.
+			resp.AuditCheckRepublishWarning = "the vouch is recorded and durable, but the fishhawk_audit_complete check was NOT re-posted: the run's live pull-request head could not be resolved, and publishing at an unverified commit is refused (" + headErr.Error() + "); re-invoke fishhawk_vouch_commit once the pull request is readable"
+		case !shaEqualsHead(sha, liveHead):
+			// MISMATCH. Name BOTH shas so the operator can see what was vouched
+			// versus what is live — this is also what tells an operator who
+			// pasted an ABBREVIATED sha to re-vouch with the full one.
+			resp.AuditCheckRepublishWarning = "the vouch IS recorded and durable, but the fishhawk_audit_complete check was NOT re-posted: the vouched commit " + sha + " is not the run's live pull-request head " + liveHead + ", and the check is only ever stamped on the run's own head (#3129); re-invoke fishhawk_vouch_commit naming the live head to re-post the check"
+		default:
+			republished, pubErr := s.recomputeAndPublishAuditCompleteAtHead(r.Context(), runID, sha)
+			resp.AuditCheckRepublished = republished
+			if pubErr != nil {
+				resp.AuditCheckRepublishWarning = "the vouch is recorded and durable, but re-posting the fishhawk_audit_complete check at the vouched commit failed; the required check may be absent from the merge head — re-invoke fishhawk_vouch_commit to retry the re-post: " + pubErr.Error()
+			}
+		}
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// shaEqualsHead reports whether a vouched sha names the same commit as the
+// run's live pull-request head. The compare is a case-insensitive FULL-string
+// compare on the trimmed spellings: forge shas are lowercase hex, so folding
+// case only tolerates an operator pasting mixed case and can never widen the
+// bound past the run's own head. An ABBREVIATED sha deliberately does NOT
+// match — the mismatch warning names both shas, which is what tells the
+// operator to re-vouch with the full sha.
+func shaEqualsHead(vouched, liveHead string) bool {
+	return strings.EqualFold(strings.TrimSpace(vouched), strings.TrimSpace(liveHead))
+}
+
+// resolveVouchPublishHead resolves the run's own live pull-request head sha,
+// which is the ONLY commit the vouch's audit-complete re-post may be stamped
+// at (E64.26 / #3129). It mirrors the determinability ladder the rebase verb
+// already uses (rebase_branch.go) rather than inventing a second one, and
+// every rung returns an ERROR — there is no empty-string-means-ok result, so a
+// caller cannot fall through to publishing on an uncertain read. It performs
+// NO writes.
+func (s *Server) resolveVouchPublishHead(ctx context.Context, runRow *run.Run) (string, error) {
+	if runRow == nil || runRow.InstallationID == nil || *runRow.InstallationID == 0 {
+		return "", errors.New("run has no installation to read its pull request")
+	}
+	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		return "", errors.New("run repo is unparseable: " + err.Error())
+	}
+	prNumber := parsePRNumberFromURL(runRow.PullRequestURL)
+	if prNumber <= 0 {
+		return "", errors.New("run has no tracked pull request")
+	}
+	if s.cfg.GitHub == nil {
+		return "", errors.New("no GitHub client is wired to read the pull request")
+	}
+	pr, err := s.cfg.GitHub.GetPullRequest(ctx, scope, repo, prNumber)
+	if err != nil {
+		return "", errors.New("read live pull request head failed: " + err.Error())
+	}
+	if strings.TrimSpace(pr.HeadSHA) == "" {
+		return "", errors.New("the pull request returned an empty head sha")
+	}
+	return pr.HeadSHA, nil
 }

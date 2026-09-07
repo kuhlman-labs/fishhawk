@@ -811,9 +811,11 @@ Mechanics:
 - **Re-posts the `fishhawk_audit_complete` check at the vouched head
   (E64.14 / #3109).** After the `operator_commit_vouched` entry is
   durable, the handler calls
-  `checks.go::recomputeAndPublishAuditCompleteAtHead(runID, vouchedSHA)`,
-  which republishes the required Check Run AT the vouched commit via the
-  publisher's head override. This is load-bearing for the base-advance
+  `checks.go::recomputeAndPublishAuditCompleteAtHead(runID, vouchedSHA)`
+  — but ONLY once the publish bound below has confirmed the vouched sha
+  IS the run's own live pull-request head — which republishes the
+  required Check Run AT that commit via the publisher's head override.
+  This is load-bearing for the base-advance
   wedge: an operator-pushed head appears in NO head-report audit category
   (`fixup_pushed` / `child_pushed` / `pull_request_opened`), so the
   publisher's normal `findHeadSHA` resolution would recompute correctly
@@ -832,6 +834,34 @@ Mechanics:
   as the fallback for the case that verb fails closed on — a CONFLICTING
   base merge (`rebase_conflict`); agent-driven conflict resolution is
   deferred to #3202.
+
+- **The re-post is BOUND to the run's own live PR head (E64.26 /
+  #3129).** Read this together with the record-verbatim bullet below —
+  the two properties are deliberately different. The RECORD is verbatim
+  and unbounded: any sha the operator names is appended and the response
+  is a 200. The PUBLISH is bounded: before republishing, the handler
+  resolves the run's live pull-request head via
+  `resolveVouchPublishHead` — the same determinability ladder
+  `rebase_branch.go` uses (installation → `parseRepoOwnerName` →
+  `parsePRNumberFromURL` → `GetPullRequest` → non-empty head sha, every
+  rung an ERROR, never an empty-string-means-ok) — and stamps the check
+  ONLY when the vouched sha equals that head (`shaEqualsHead`, a
+  case-insensitive FULL-string compare on the trimmed spellings; an
+  ABBREVIATED sha therefore takes the mismatch arm by design). A
+  MISMATCH skips the publish and reports it on
+  `audit_check_republish_warning` naming BOTH shas; an UNRESOLVABLE head
+  fails closed the same way, naming the resolution failure. The check is
+  NEVER posted at an unverified sha. Arm ORDERING is load-bearing: a nil
+  `auditCheckPublisher` (dev/CLI posture) is checked FIRST and keeps its
+  silent, warning-free skip, so a dev vouch is not newly warned about a
+  check it was never going to post. Without the bound an operator
+  carrying `write:stages` could have this run's recomputed check state
+  stamped onto ANY commit in the repository — including the head of an
+  unrelated pull request (the widening #3129 records).
+  - **Residual, stated honestly**: the bound narrows WHERE the check is
+    stamped, not what a vouch MEANS. An operator can still record a
+    declaration for any sha, and the ledger union it feeds is unchanged
+    — this is not a validity check on the vouched commit.
 
 Invariants:
 
