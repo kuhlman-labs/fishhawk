@@ -117,6 +117,22 @@ and the load-bearing one is the refresh under tenant B that leaves the row on
 tenant A. When a later child adds the RLS policy 0063's header anticipates, a
 regression there is a cross-tenant move rather than a cosmetic change.
 
+**The table's only writer is the operator CLI.** `resolveOAuthClient` prefers a
+pre-registered row over a CIMD fetch but deliberately performs no `UpsertClient`
+on the authorize hot path (that would make the store-first branch shadow every
+later refresh and turn the fetcher's bounded TTL into a permanent pin), so the
+sole caller of `UpsertClient` is `fishhawkd oauth client register` (E66.21 /
+#2438). `ListClients` and `DeleteClient` back its `list` / `remove` verbs.
+`ListClients` returns every registration ordered by `client_id` — an empty table
+is an **empty slice, not `ErrNotFound`** (absence of any registration is not a
+lookup failure) — and carries no tenant filter (0063 header part (c): a
+registration read is not a database-level tenant decision). `DeleteClient`
+returns **`ErrNotFound`** when no row carried that `client_id`, so a caller that
+believes it revoked a registration is never handed a success on a typo;
+`TestDeleteClient_UnknownIDDeletesNothing` counts rows before and after a miss,
+because an error-identity assertion alone cannot distinguish a fired guard from a
+rolled-back over-broad delete.
+
 `first_seen_at` is preserved across refreshes (it is not in the `DO UPDATE` SET
 list); `updated_at` moves.
 `TestUpsertClient_RefreshesOnClientIDConflict` asserts that a changed

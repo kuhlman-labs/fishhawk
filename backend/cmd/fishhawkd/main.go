@@ -8,6 +8,7 @@
 //	fishhawkd account create|list   register / inventory tenancy accounts (GitLab authz gate)
 //	fishhawkd installation register|list  register / inventory installations (GitLab authz gate)
 //	fishhawkd member invite|list    invite / inventory account membership grants (first-user bootstrap)
+//	fishhawkd oauth client register|list|remove  pre-register / inventory / remove OAuth clients (#2438)
 //
 // E3.2 (#42) wired the HTTP serve path. E3.3 (#43) added the run state
 // machine, the Postgres pool, and the migrate subcommand.
@@ -51,6 +52,8 @@ func run(args []string, logSink io.Writer) int {
 		return runInstallation(rest, logSink)
 	case "member":
 		return runMember(rest, logSink)
+	case "oauth":
+		return runOAuth(rest, logSink)
 	case "-h", "--help", "help":
 		printUsage(logSink)
 		return exitOK
@@ -76,7 +79,7 @@ func splitCommand(args []string) (cmd string, rest []string) {
 
 func printUsage(w io.Writer) {
 	for _, line := range []string{
-		"Usage: fishhawkd [serve|migrate|token|account|installation|member] [flags]",
+		"Usage: fishhawkd [serve|migrate|token|account|installation|member|oauth] [flags]",
 		"",
 		"Subcommands:",
 		"  serve                  Run the HTTP server (default).",
@@ -91,6 +94,9 @@ func printUsage(w io.Writer) {
 		"  installation list      Inventory registered installations with their owning account_key.",
 		"  member invite          Invite a forge member into an account (the first-user bootstrap; writes an origin='invited' grant).",
 		"  member list            Inventory membership grants with their origin and owning account.",
+		"  oauth client register  Pre-register an OAuth client (the operator write path for oauth_clients; #2438).",
+		"  oauth client list      Inventory pre-registered OAuth clients.",
+		"  oauth client remove    Remove a pre-registered OAuth client by client_id.",
 	} {
 		_, _ = fmt.Fprintln(w, line)
 	}

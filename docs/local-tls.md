@@ -160,8 +160,21 @@ most common way to misconfigure the local AS.
 
 A Client ID Metadata Document (CIMD) cannot be hosted on loopback: the dialguard
 (`backend/internal/oauthas/dialguard.go`, #2427/#2433) blocks `127.0.0.0/8` and
-`::1/128` **by design**. So #2438 client pre-registration is the offline local
-path for exercising the AS.
+`::1/128` **by design**. So client pre-registration is the offline local path for
+exercising the AS — `fishhawkd oauth client register` (E66.21 / #2438) writes an
+`oauth_clients` row directly via `--db`/`FISHHAWKD_DATABASE_URL`, which
+`resolveOAuthClient` then prefers over a CIMD fetch. For example:
+
+```sh
+fishhawkd oauth client register \
+  --db "$FISHHAWKD_DATABASE_URL" \
+  --client-id https://client.example.com/oauth/client \
+  --redirect-uri http://127.0.0.1:8765/callback
+```
+
+`fishhawkd oauth client list` inventories the registrations and
+`fishhawkd oauth client remove --client-id <id>` deletes one. Full flag and
+exit-code contract: `backend/cmd/fishhawkd/README.md`.
 
 ## Non-goal — no http-issuer escape hatch
 

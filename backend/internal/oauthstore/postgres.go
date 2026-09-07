@@ -70,6 +70,38 @@ func (r *postgresRepo) GetClientByID(ctx context.Context, clientID string) (*Cli
 	return rowToClient(row), nil
 }
 
+func (r *postgresRepo) ListClients(ctx context.Context) ([]*Client, error) {
+	q := oauthstoredb.New(r.pool)
+	rows, err := q.ListClients(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("oauthstore: list clients: %w", err)
+	}
+	// A nil slice (empty table) maps to an empty, non-nil slice: absence of any
+	// registration is not ErrNotFound, and a caller ranging over the result must
+	// see zero rows rather than a nil it has to special-case.
+	clients := make([]*Client, 0, len(rows))
+	for _, row := range rows {
+		clients = append(clients, rowToClient(row))
+	}
+	return clients, nil
+}
+
+func (r *postgresRepo) DeleteClient(ctx context.Context, clientID string) error {
+	q := oauthstoredb.New(r.pool)
+	n, err := q.DeleteClientByClientID(ctx, clientID)
+	if err != nil {
+		return fmt.Errorf("oauthstore: delete client: %w", err)
+	}
+	// Zero rows affected means no registration carried that client_id — a typo,
+	// or an already-removed row. Reporting ErrNotFound rather than a silent
+	// success is what stops an operator believing they revoked a client they did
+	// not.
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (r *postgresRepo) CreateAuthorizationCode(ctx context.Context, in NewAuthorizationCode) (*AuthorizationCode, error) {
 	if in.Subject == "" {
 		return nil, errors.New("oauthstore: subject required")

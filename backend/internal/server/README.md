@@ -3118,12 +3118,16 @@ signal and the body is advisory. Substituting a §5.2-conformant code would be w
 — `invalid_client` would tell the client its credentials are wrong (they are not),
 inviting it to discard a valid registration rather than retry after the interval.
 
+Operator write path for pre-registration, now SHIPPED (E66.21 / #2438):
+`fishhawkd oauth client register|list|remove` is the operator surface that calls
+`oauthstore.UpsertClient` — the documented path for a Codex-style client that
+hosts no CIMD document (#2394). Registration-free CIMD clients remain the
+default; this verb is for the offline/no-CIMD case, and `resolveOAuthClient`
+prefers a pre-registered row over a CIMD fetch. Contract:
+`backend/cmd/fishhawkd/README.md`.
+
 Still recorded, not acted on:
 
-- **No operator write path for pre-registration.** `oauth_clients` rows are
-  hand-written SQL today — `oauthstore.UpsertClient` exists but has NO caller.
-  Registration-free CIMD clients are the supported path; a pre-registration
-  admin surface is future work.
 - **No negative cache for failed `client_id` validations.** Caching a TRANSIENT
   failure would pin a briefly-unreachable legitimate CIMD host as invalid for the
   whole TTL; the limiter already bounds repeated bad ids. Filed as its own design

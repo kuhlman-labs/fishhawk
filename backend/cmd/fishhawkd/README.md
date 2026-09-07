@@ -1,7 +1,7 @@
 # fishhawkd
 
 Fishhawk control-plane daemon binary: the backend HTTP API server plus its operational subcommands
-(`serve.go`, `migrate.go`, `token.go`, `audit_rehash.go`, `account.go`, `installation.go`, `member.go`).
+(`serve.go`, `migrate.go`, `token.go`, `audit_rehash.go`, `account.go`, `installation.go`, `member.go`, `oauthclient.go`).
 
 ## Tenancy registration subcommands (`account` / `installation` / `member`, E45.33 / #2923, E44.34 / #2924)
 
@@ -140,6 +140,69 @@ pre-registered `client_id` is never throttled. See
 These are the AS ISSUER-side knobs and are unrelated to the GitHub sign-in
 OAuth-CLIENT endpoints below (`FISHHAWKD_OAUTH_AUTHORIZE_URL` et al.), which
 point fishhawkd AT a forge's OAuth endpoints for user sign-in.
+
+## OAuth client pre-registration (`oauth client`, E66.21 / #2438)
+
+The operator write path for `oauth_clients` rows — the only caller of
+`oauthstore.UpsertClient`. `resolveOAuthClient` (E66.19 / #2436) prefers a
+pre-registered row over a CIMD fetch, so this verb is the documented path for a
+client that hosts **no CIMD document** (Codex, #2394) and the surface where an
+operator would otherwise hand-write SQL and get `redirect_uris` or
+`token_endpoint_auth_method` subtly wrong. Direct DB via `--db` /
+`FISHHAWKD_DATABASE_URL`, side-stepping the running server (the
+`account`/`installation`/`member` precedent).
+
+| Command | Flags | Behavior |
+|---|---|---|
+| `oauth client register` | `--db`, `--client-id` (**required**), `--redirect-uri` (**repeatable, ≥1 required**), `--token-endpoint-auth-method` (default `none`), `--grant-type` (repeatable; default `authorization_code`+`refresh_token`), `--response-type` (repeatable; default `code`), `--client-name`, `--client-uri`, `--logo-uri`, `--scope`, `--provider`+`--account-key` (owning **tenant**) | Upsert one `oauth_clients` row (idempotent on `client_id`, refresh-on-fetch). Validates every field the AS enforces AT REGISTRATION TIME. Prints `created` on a fresh row and `refreshed` on a re-register (read from the returned row's `first_seen_at`/`updated_at`). |
+| `oauth client list` | `--db` | Render every registration with `SOURCE`, `ACCOUNT_ID`, `AUTH_METHOD`, both timestamps and `REDIRECT_URIS`. Empty table prints `no oauth client registrations`. |
+| `oauth client remove` | `--db`, `--client-id` (**required**) | Delete the registration. **FAILS CLOSED** naming the id when no row carried it — a no-op delete reported as success would tell an operator they had revoked access when they had not. |
+
+**Validation, each refusal naming the offending input:** every `--redirect-uri`
+is run through `oauthas.MatchRedirectURI(uri, uri)` **self-paired** — exactly the
+registered-side component rules the live authorize path applies (no userinfo, no
+query, no fragment, absolute with a host), and unforgeable by the byte-equality
+branch because both sides are the same string. `--token-endpoint-auth-method`
+must be **`none`** — the only method the AS supports (a public-client-only token
+endpoint that rejects any Authorization header). The resolved grant-type set must
+contain **`authorization_code`**. `--provider` and `--account-key` must be
+supplied **together or not at all**.
+
+**`--client-id` is deliberately NOT validated as an https CIMD URL.**
+Pre-registration exists precisely for a client that hosts no CIMD document, and
+`resolveOAuthClient` URL-checks the id only on the store-MISS fall-through — so a
+pre-registered non-URL id resolves store-first and is never URL-checked. Only
+non-emptiness and absence of surrounding whitespace are enforced.
+
+**Grant types default to `authorization_code`+`refresh_token`** (not an empty
+set): the read-time default in `registeredGrantTypes` is `authorization_code`
+ONLY, so a registration persisted with an empty set could never use
+`grant_type=refresh_token` at the token endpoint — a pre-registered MCP client
+would break on its first token refresh.
+
+**`--provider`/`--account-key` name the owning TENANT, not a client-registration
+forge.** `oauth_clients` has no `provider` column since 0064 (#2437); the flag
+names deliberately match `account create` for operator muscle memory. The pair is
+resolved to an `accounts` row and **FAILS CLOSED** naming the `account create`
+remedy when it does not exist — never materialized. An untenanted registration is
+legal (the column is nullable). `UpsertClient`'s `COALESCE` account stickiness
+(#2433) is preserved: a refresh can adopt an untenanted row once but can never
+MOVE a registration between tenants.
+
+**`SOURCE` renders the constant `pre-registered` for every row, and that is the
+truth, not a stub.** `resolveOAuthClient` deliberately performs no `UpsertClient`
+on the authorize hot path (persisting a CIMD-fetched document there would make the
+store-first branch shadow every later refresh and convert the fetcher's bounded
+TTL into a permanent pin), so this CLI is the table's ONLY writer and every row is
+pre-registered by construction. A `source` COLUMN is deliberately not added — it
+could hold only that one value, the defect 0064 called out when it dropped
+`provider`. Revisit if any future code path outside this CLI ever calls
+`UpsertClient`.
+
+**Exit codes:** a mis-typed/missing flag and any registration-validation refusal
+exit `2` (usage); an unknown-account refusal, an unknown-client removal and any
+database fault exit `1` (failure). Rendered output goes to stdout; every
+diagnostic to stderr. Long-form store contract: `backend/internal/oauthstore/README.md`.
 
 ## Configurable GitHub / OAuth endpoints (E44.2 / #1826)
 

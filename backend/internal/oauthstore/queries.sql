@@ -55,6 +55,23 @@ RETURNING *;
 SELECT * FROM oauth_clients
  WHERE client_id = $1;
 
+-- name: ListClients :many
+-- The operator inventory read, backing `fishhawkd oauth client list`. Ordered by
+-- client_id for a stable render. Carries NO account_id filter DELIBERATELY,
+-- consistent with 0063's header part (c): a registration read is not a
+-- database-level tenant decision — that authorization belongs to the
+-- already-authenticated caller. An empty table is an empty result, not an error.
+SELECT * FROM oauth_clients
+ ORDER BY client_id;
+
+-- name: DeleteClientByClientID :execrows
+-- Backs `fishhawkd oauth client remove`. Keyed on client_id ALONE per 0064 (the
+-- table's only key), and :execrows so the CLI can distinguish a real deletion
+-- (1 row) from a typo'd id (0 rows) and report the miss instead of a false
+-- success.
+DELETE FROM oauth_clients
+ WHERE client_id = $1;
+
 -- name: CreateAuthorizationCode :one
 -- code_hash is the hex sha256 of the plaintext; the plaintext itself is never
 -- persisted and is returned to the caller exactly once, here.

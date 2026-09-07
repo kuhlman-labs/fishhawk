@@ -2105,3 +2105,116 @@ func TestSchema_OAuthClientsKeyedOnClientIDAlone(t *testing.T) {
 			"ambiguity guard existed for", clientIDOnly, shapes)
 	}
 }
+
+// upsertClientFor registers a minimal client under clientID, returning the
+// persisted row. A test helper so the ListClients/DeleteClient tests do not
+// hand-roll an INSERT and drift from the store's own column mapping.
+func upsertClientFor(t *testing.T, repo oauthstore.Repository, clientID string) *oauthstore.Client {
+	t.Helper()
+	c, err := repo.UpsertClient(context.Background(), oauthstore.NewClient{
+		Metadata: oauthas.ClientMetadata{
+			ClientID:                clientID,
+			RedirectURIs:            []string{"http://127.0.0.1:8765/callback"},
+			GrantTypes:              []string{"authorization_code", "refresh_token"},
+			ResponseTypes:           []string{"code"},
+			TokenEndpointAuthMethod: "none",
+			ClientName:              "Fishhawk CLI",
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpsertClient(%s): %v", clientID, err)
+	}
+	return c
+}
+
+// TestListClients_EmptyIsEmptySlice pins the empty-table contract: no rows is an
+// empty slice and no error, NOT ErrNotFound — absence of any registration is not
+// a lookup failure.
+func TestListClients_EmptyIsEmptySlice(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := newRepo(t)
+
+	got, err := repo.ListClients(ctx)
+	if err != nil {
+		t.Fatalf("ListClients on empty table: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ListClients on empty table = %d rows, want 0", len(got))
+	}
+}
+
+// TestListClients_OrdersAndRoundTrips seeds two registrations and asserts they
+// come back ordered by client_id with metadata intact, and that an untenanted
+// row renders account_id as the empty string (the NULL → "" mapping).
+func TestListClients_OrdersAndRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := newRepo(t)
+
+	// Insert out of client_id order so ORDER BY is doing real work.
+	upsertClientFor(t, repo, testClientID)    // https://client.example.com/...
+	upsertClientFor(t, repo, testAltClientID) // https://other.example.com/... (sorts after)
+
+	got, err := repo.ListClients(ctx)
+	if err != nil {
+		t.Fatalf("ListClients: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListClients = %d rows, want 2", len(got))
+	}
+	if got[0].ClientID != testClientID || got[1].ClientID != testAltClientID {
+		t.Errorf("ListClients order = [%q, %q], want [%q, %q]", got[0].ClientID, got[1].ClientID, testClientID, testAltClientID)
+	}
+	if got[0].TokenEndpointAuthMethod != "none" || len(got[0].RedirectURIs) != 1 {
+		t.Errorf("ListClients[0] metadata = %+v, want the seeded document's", got[0])
+	}
+	if !containsStr(got[0].GrantTypes, "refresh_token") {
+		t.Errorf("ListClients[0] grant_types = %v, want to include refresh_token", got[0].GrantTypes)
+	}
+	// Untenanted rows: NULL account_id maps to the empty string via accountIDString.
+	if got[0].AccountID != "" {
+		t.Errorf("ListClients[0] account_id = %q, want empty for an untenanted row", got[0].AccountID)
+	}
+}
+
+// TestDeleteClient_RemovesRowThenNotFound removes a seeded registration and
+// asserts the following GetClientByID returns ErrNotFound.
+func TestDeleteClient_RemovesRowThenNotFound(t *testing.T) {
+	ctx := context.Background()
+	repo, _ := newRepo(t)
+	upsertClientFor(t, repo, testClientID)
+
+	if err := repo.DeleteClient(ctx, testClientID); err != nil {
+		t.Fatalf("DeleteClient: %v", err)
+	}
+	if _, err := repo.GetClientByID(ctx, testClientID); !errors.Is(err, oauthstore.ErrNotFound) {
+		t.Errorf("GetClientByID after delete = %v, want ErrNotFound", err)
+	}
+}
+
+// TestDeleteClient_UnknownIDDeletesNothing pins the fail-closed miss: an unknown
+// client_id returns ErrNotFound AND removes nothing. The row count before and
+// after is what distinguishes a fired guard from an over-broad DELETE that
+// happened to also error — an error-identity assertion alone cannot.
+func TestDeleteClient_UnknownIDDeletesNothing(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+	upsertClientFor(t, repo, testClientID)
+
+	before := scanInt(t, pool, `SELECT count(*) FROM oauth_clients`)
+	if err := repo.DeleteClient(ctx, "https://nonexistent.example.com/oauth/client"); !errors.Is(err, oauthstore.ErrNotFound) {
+		t.Errorf("DeleteClient(unknown) = %v, want ErrNotFound", err)
+	}
+	after := scanInt(t, pool, `SELECT count(*) FROM oauth_clients`)
+	if before != after {
+		t.Errorf("DeleteClient(unknown) changed the row count %d → %d, want it unchanged", before, after)
+	}
+}
+
+func containsStr(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}

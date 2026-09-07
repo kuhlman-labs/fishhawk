@@ -345,6 +345,18 @@ type Repository interface {
 	// could have to arbitrate.
 	GetClientByID(ctx context.Context, clientID string) (*Client, error)
 
+	// ListClients returns every registration ordered by client_id. An empty
+	// table is an EMPTY SLICE, not ErrNotFound: the absence of any registration
+	// is not a lookup failure. Backs the operator inventory read
+	// (`fishhawkd oauth client list`). Carries no tenant filter — see the query.
+	ListClients(ctx context.Context) ([]*Client, error)
+
+	// DeleteClient removes the registration for clientID. It returns ErrNotFound
+	// when NO row carried that client_id, so a caller that believes it revoked a
+	// registration can never be handed a success on a typo. Backs
+	// `fishhawkd oauth client remove`.
+	DeleteClient(ctx context.Context, clientID string) error
+
 	// CreateAuthorizationCode mints a code and returns the row with PlainText
 	// set — the only time that value exists outside the client.
 	CreateAuthorizationCode(ctx context.Context, in NewAuthorizationCode) (*AuthorizationCode, error)
