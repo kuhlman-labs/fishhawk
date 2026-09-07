@@ -118,8 +118,9 @@ type workItemResponse struct {
 	EpicLinkError string `json:"epic_link_error,omitempty"`
 	Audited       bool   `json:"audited"`
 	// DefaultedLabels / MissingLabelNamespaces are the LOUD label-completeness
-	// report (#1616): every label the system added that the caller did not
-	// supply (namespace defaults + handler-derived area), and any required
+	// report (#1616, phase added #3179): every label the system added that the
+	// caller did not supply (namespace defaults + handler-derived area and
+	// phase), and any required
 	// namespace still absent after merge/derivation/defaulting. A missing
 	// namespace is reported, never a rejection (fail-open). Both omitempty.
 	DefaultedLabels        []string `json:"defaulted_labels,omitempty"`
@@ -463,6 +464,16 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 	// DefaultedLabels after Apply for the single LOUD reporting field.
 	derivedArea := s.deriveAreaLabel(ctx, &filing, conv, target.Scope, owner, name)
 
+	// Derive the phase:* label the same way and for the same reason (#3179),
+	// immediately after area and likewise BEFORE Apply so the completeness pass
+	// sees phase as present. The ladder is caller-supplied > parent epic >
+	// originating run's triggering issue (same-repo only) > nothing; it fails
+	// OPEN at every guard, leaving Apply to report 'phase' in
+	// missing_label_namespaces. This is the ONE chokepoint every auto-file path
+	// funnels through, so the defer-concern path that left 48 children
+	// phase-unlabelled is closed here with no per-call-site edit.
+	derivedPhase := s.derivePhaseLabel(ctx, &filing, conv, target.Scope, owner, name)
+
 	// Discover the in-use sequential numbers server-side for a numbered type
 	// that omitted existing_numbers (#1269), so the caller no longer has to
 	// scan the tracker. Runs BEFORE the pure Apply (mirroring deriveEpicTitleVar)
@@ -503,6 +514,13 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 	// defaults there; derived area joins them.
 	if len(derivedArea) > 0 {
 		item.Classification.DefaultedLabels = append(item.Classification.DefaultedLabels, derivedArea...)
+	}
+	// Same for the derived phase (#3179): a system-added label the caller did
+	// not supply, so it rides the SINGLE LOUD reporting field alongside area
+	// and the namespace defaults. A wrong inherit is therefore visible and
+	// challengeable at filing time rather than silent.
+	if len(derivedPhase) > 0 {
+		item.Classification.DefaultedLabels = append(item.Classification.DefaultedLabels, derivedPhase...)
 	}
 	// Fail-open visibility: a required namespace that could be neither merged,
 	// derived, nor defaulted is WARN-logged (mirroring the #1107
@@ -853,6 +871,13 @@ func (s *Server) deriveEpicTitleVar(ctx context.Context, filing *workmgmt.Filing
 // areaNamespace is the label namespace derived from the parent epic (#1616).
 const areaNamespace = "area"
 
+// phaseNamespace is the label namespace derived by derivePhaseLabel (#3179).
+// Unlike area it has a SECOND rung below the parent epic — the originating
+// run's triggering issue — because the epic_link:optional types (bug, chore)
+// routinely file with no parent epic at all, which is exactly the defer-concern
+// shape that left 48 children phase-unlabelled.
+const phaseNamespace = "phase"
+
 // deriveAreaLabel copies the parent epic's area:* label(s) onto the filing
 // when the resolved type wants an area namespace (declares 'area' in
 // required_label_namespaces or label_defaults), a parent epic is set, and no
@@ -867,15 +892,19 @@ const areaNamespace = "area"
 // missing_label_namespaces rather than the filing failing. It issues its own
 // GetIssue (a second fetch alongside deriveEpicTitleVar) deliberately, to keep
 // that derivation's fail-closed {epic} contract untouched.
+//
+// It is a thin wrapper over the namespace-parameterized core (#3179): the
+// #1616 area behavior and every one of its fail-open modes is preserved
+// byte-for-byte, which TestFileWorkItem_AreaDerivedFromParentEpic pins.
 func (s *Server) deriveAreaLabel(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, scope forge.CredentialScope, owner, name string) []string {
 	itemType, ok := conv.Types[filing.Type]
-	if !ok || !typeWantsAreaNamespace(itemType) {
+	if !ok || !typeWantsNamespace(itemType, areaNamespace) {
 		return nil
 	}
 	if strings.TrimSpace(filing.Relations.ParentEpic) == "" {
 		return nil
 	}
-	if hasAreaLabel(filing.Labels) || hasAreaLabel(itemType.DefaultLabels) {
+	if hasLabelInNamespace(filing.Labels, areaNamespace) || hasLabelInNamespace(itemType.DefaultLabels, areaNamespace) {
 		return nil
 	}
 	if s.cfg.GitHub == nil || scope.IsZero() {
@@ -885,13 +914,124 @@ func (s *Server) deriveAreaLabel(ctx context.Context, filing *workmgmt.FilingReq
 	if err != nil {
 		return nil
 	}
-	issue, err := s.cfg.GitHub.GetIssue(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, number)
+	return s.deriveLabelFromIssue(ctx, filing, scope, owner, name, areaNamespace, number)
+}
+
+// derivePhaseLabel copies a phase:* label onto the filing when the resolved
+// type wants a phase namespace and the caller supplied none (#3179). Every
+// auto-file path funnels through applyAndFileWorkItemWithIntake, so this is the
+// single site that closes the gap the defer-concern path left: an item filed
+// with area/autonomy/type but no phase is structurally unrankable by a
+// phase-scoped grooming window.
+//
+// DERIVATION LADDER, in order, first hit wins:
+//
+//  1. A caller-supplied phase:* label (or one in the type's default_labels)
+//     WINS outright — derivation never rewrites an explicit choice.
+//  2. The PARENT EPIC's phase:* label(s). phase:* describes WHEN an item will
+//     be worked, which follows its scheduling home — the epic it rolls up to —
+//     not where it was discovered. So a concern deferred out of an alpha run
+//     onto a beta epic correctly lands phase:beta.
+//  3. The ORIGINATING RUN's triggering issue's phase:* label(s), resolved from
+//     filing.Relations.EvidenceRuns[0]. This rung exists because the
+//     epic_link:optional types (bug, chore — the defer-concern shape) routinely
+//     carry no parent epic, and the run's own issue is a strictly better signal
+//     than nothing.
+//  4. Nothing — reported LOUDLY in missing_label_namespaces, never a rejection.
+//
+// SAME-REPO GUARD on rung 3: Relations.EvidenceRuns is CALLER-SUPPLIED on
+// POST /v0/work-items and is NOT entitlement-checked (unlike the request's own
+// run_id, which handleFileWorkItem gates). So the run row's Repo must equal the
+// filing target owner/name or NOTHING is derived — reading a foreign run's
+// triggering issue number and applying its phase against this target repo would
+// derive a wrong label from an unowned row.
+//
+// It fails OPEN at every guard (returns nil): no GitHub client, no
+// installation, no run repository, an unparseable run id or parent ref, a
+// GetRun or GetIssue error, a cross-repo run, a run with no issue TriggerRef,
+// or an issue carrying no phase:* label. Derived labels are system-added, so
+// the caller folds them into DefaultedLabels — a wrong inherit is visible and
+// challengeable at filing time rather than silent.
+func (s *Server) derivePhaseLabel(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, scope forge.CredentialScope, owner, name string) []string {
+	itemType, ok := conv.Types[filing.Type]
+	if !ok || !typeWantsNamespace(itemType, phaseNamespace) {
+		return nil
+	}
+	// Rung 1: an explicit phase wins and is never rewritten.
+	if hasLabelInNamespace(filing.Labels, phaseNamespace) || hasLabelInNamespace(itemType.DefaultLabels, phaseNamespace) {
+		return nil
+	}
+	if s.cfg.GitHub == nil || scope.IsZero() {
+		return nil
+	}
+	// Rung 2: the parent epic.
+	if strings.TrimSpace(filing.Relations.ParentEpic) != "" {
+		if number, err := parseEpicRef(filing.Relations.ParentEpic); err == nil {
+			if derived := s.deriveLabelFromIssue(ctx, filing, scope, owner, name, phaseNamespace, number); len(derived) > 0 {
+				return derived
+			}
+		}
+	}
+	// Rung 3: the originating run's triggering issue, same-repo only.
+	number, ok := s.originatingRunIssue(ctx, filing, owner, name)
+	if !ok {
+		return nil
+	}
+	return s.deriveLabelFromIssue(ctx, filing, scope, owner, name, phaseNamespace, number)
+}
+
+// originatingRunIssue resolves the issue number that triggered the filing's
+// first evidence run, for the phase-derivation fallback (#3179). It returns
+// ok=false — deriving nothing — when there is no evidence run, no run
+// repository, an unparseable id, a GetRun error, a run whose Repo is NOT the
+// filing target repo (the same-repo guard on a caller-supplied, un-entitled
+// id), or a run with no `issue:<n>` TriggerRef.
+func (s *Server) originatingRunIssue(ctx context.Context, filing *workmgmt.FilingRequest, owner, name string) (int, bool) {
+	if len(filing.Relations.EvidenceRuns) == 0 || s.cfg.RunRepo == nil {
+		return 0, false
+	}
+	runID, err := uuid.Parse(strings.TrimSpace(filing.Relations.EvidenceRuns[0]))
+	if err != nil {
+		return 0, false
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil || runRow == nil {
+		return 0, false
+	}
+	// SAME-REPO GUARD. See derivePhaseLabel's doc comment: the evidence-run id
+	// is caller-supplied and un-entitled, so a run belonging to a different
+	// repository derives NOTHING.
+	if !strings.EqualFold(runRow.Repo, owner+"/"+name) {
+		return 0, false
+	}
+	if runRow.TriggerRef == nil {
+		return 0, false
+	}
+	number, ok := parseIssueRef(*runRow.TriggerRef)
+	if !ok {
+		return 0, false
+	}
+	return number, true
+}
+
+// deriveLabelFromIssue is the namespace-parameterized derivation core shared by
+// deriveAreaLabel and derivePhaseLabel (#3179, generalizing #1616): it fetches
+// the named issue in the filing target repo, collects every label carrying the
+// `<ns>:` prefix, appends them to filing.Labels in place, and returns what it
+// derived so the caller can fold them into DefaultedLabels for LOUD reporting.
+//
+// It fails OPEN — returns nil, deriving nothing — on a GetIssue error or an
+// issue carrying no label in the namespace. It reads ONLY the label list of an
+// issue in the repo the caller already has filing access to; no body, no
+// private field.
+func (s *Server) deriveLabelFromIssue(ctx context.Context, filing *workmgmt.FilingRequest, scope forge.CredentialScope, owner, name, ns string, issueNumber int) []string {
+	issue, err := s.cfg.GitHub.GetIssue(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, issueNumber)
 	if err != nil {
 		return nil
 	}
 	var derived []string
 	for _, l := range issue.Labels {
-		if strings.HasPrefix(l, areaNamespace+":") {
+		if strings.HasPrefix(l, ns+":") {
 			derived = append(derived, l)
 		}
 	}
@@ -902,25 +1042,27 @@ func (s *Server) deriveAreaLabel(ctx context.Context, filing *workmgmt.FilingReq
 	return derived
 }
 
-// typeWantsAreaNamespace reports whether the type declares 'area' in its
-// required_label_namespaces or label_defaults — the trigger for area
-// derivation from the parent epic.
-func typeWantsAreaNamespace(it workmgmt.ItemType) bool {
-	if _, ok := it.LabelDefaults[areaNamespace]; ok {
+// typeWantsNamespace reports whether the type declares ns in its
+// required_label_namespaces or label_defaults — the trigger for deriving that
+// namespace from an issue. Generalized from typeWantsAreaNamespace (#3179).
+func typeWantsNamespace(it workmgmt.ItemType, ns string) bool {
+	if _, ok := it.LabelDefaults[ns]; ok {
 		return true
 	}
-	for _, ns := range it.RequiredLabelNamespaces {
-		if ns == areaNamespace {
+	for _, declared := range it.RequiredLabelNamespaces {
+		if declared == ns {
 			return true
 		}
 	}
 	return false
 }
 
-// hasAreaLabel reports whether any label carries the "area:" namespace prefix.
-func hasAreaLabel(labels []string) bool {
+// hasLabelInNamespace reports whether any label carries the "<ns>:" prefix. A
+// server-local copy of the workmgmt predicate of the same name, deliberately
+// NOT exported from workmgmt so the two packages stay decoupled.
+func hasLabelInNamespace(labels []string, ns string) bool {
 	for _, l := range labels {
-		if strings.HasPrefix(l, areaNamespace+":") {
+		if strings.HasPrefix(l, ns+":") {
 			return true
 		}
 	}

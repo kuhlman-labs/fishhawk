@@ -196,16 +196,21 @@ types:
       - Where to look
     default_labels:
       - type:feature
-    # Label completeness (#1616): autonomy defaults to autonomy:medium when the
-    # filing supplies no autonomy:* label, so no feature is ever filed
-    # autonomy-unset. area has no universally-correct default (it is
-    # component-specific), so it is required-or-DERIVED from the parent epic;
-    # an underivable area is reported loudly in missing_label_namespaces.
+    # Label completeness (#1616, phase added #3179): autonomy defaults to
+    # autonomy:medium when the filing supplies no autonomy:* label, so no
+    # feature is ever filed autonomy-unset. area and phase each have NO
+    # universally-correct default (area is component-specific; phase is
+    # schedule-specific), so both are required-or-DERIVED — area from the
+    # parent epic, phase from the parent epic and then the originating run's
+    # issue — and NEITHER carries a label_defaults entry: a blanket phase
+    # default would mislabel every filing it did not fit. An underivable area
+    # or phase is reported loudly in missing_label_namespaces, never rejected.
     label_defaults:
       autonomy: autonomy:medium
     required_label_namespaces:
       - area
       - autonomy
+      - phase
     default_fields:
       status: Backlog
       complexity: medium
@@ -231,6 +236,7 @@ types:
     required_label_namespaces:
       - area
       - autonomy
+      - phase
     default_fields:
       status: Backlog
       complexity: medium
@@ -248,6 +254,7 @@ types:
     required_label_namespaces:
       - area
       - autonomy
+      - phase
     default_fields:
       status: Backlog
       complexity: low

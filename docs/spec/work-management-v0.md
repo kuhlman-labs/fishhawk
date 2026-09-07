@@ -122,7 +122,7 @@ Give paths and names, never toolchain commands — the register is language-agno
 Two per-type fields make label completeness a **conventions-level guarantee at filing time** (E34.9, #1616), so no filed item is ever missing a namespace it must carry:
 
 - **`label_defaults`** maps a label namespace to the full default label to apply when the merged label set carries nothing in that namespace. The shipped default gives `feature`, `bug`, and `chore` `{autonomy: autonomy:medium}`, so no filing of those types is ever left autonomy-unset. `epic` and `adr` carry no autonomy default — they have their own conventions.
-- **`required_label_namespaces`** names the namespaces a filed item *should* carry after merge, derivation, and defaulting. The shipped default declares `[area, autonomy]` on `feature`/`bug`/`chore`.
+- **`required_label_namespaces`** names the namespaces a filed item *should* carry after merge, derivation, and defaulting. The shipped default declares `[area, autonomy, phase]` on `feature`/`bug`/`chore` (`phase` added by #3179).
 
 `workmgmt.Apply` runs a **fail-open completeness pass** over the merged label set (type `default_labels` + caller labels):
 
@@ -131,7 +131,25 @@ Two per-type fields make label completeness a **conventions-level guarantee at f
 
 **This pass never rejects a filing.** A required namespace that could be neither merged, derived, nor defaulted is reported loudly in `missing_label_namespaces` (and WARN-logged server-side), never turned into an error.
 
-**`area` derivation.** `area` has no universally-correct default (it is component-specific: `area:backend`, `area:cli`, …), so the shipped config declares NO area default. Instead, when a type requires `area`, a parent epic is set, and no `area:*` label is already present, the filing handler fetches the parent epic and copies its `area:*` label(s) onto the item before Apply runs — reported in `defaulted_labels` like any other system-added label. Derivation **fails open** on every failure mode (no client/installation, unparseable ref, fetch error, epic with no area label), leaving `area` to surface in `missing_label_namespaces`.
+### Parent-epic label derivation
+
+Two namespaces — `area` and `phase` — have **no universally-correct default**, so the shipped config declares NO `label_defaults` entry for either. `area` is component-specific (`area:backend`, `area:cli`, …); `phase` is schedule-specific (`phase:alpha`, `phase:beta`, …). A blanket default for either would mislabel every filing it did not fit, which is worse than a loud gap. Both are therefore **required-or-DERIVED**: the filing handler copies the label off an issue already in the target repo before `Apply` runs, and reports what it copied in `defaulted_labels` like any other system-added label — so a wrong inherit is visible and challengeable at filing time rather than silent. Both derivations **fail open** at every guard, leaving the namespace to surface in `missing_label_namespaces`.
+
+**`area`** derives from the parent epic only: when a type requires `area`, a parent epic is set, and no `area:*` label is already present in the caller's labels or the type's `default_labels`, the handler fetches the parent epic and copies its `area:*` label(s). It derives nothing on no client/installation, an unparseable ref, a fetch error, or an epic carrying no `area:*` label.
+
+**`phase`** (#3179) follows a three-rung ladder, first hit wins:
+
+1. A **caller-supplied** `phase:*` label (or one in the type's `default_labels`) wins outright — derivation never rewrites an explicit choice.
+2. The **parent epic**'s `phase:*` label(s). `phase:*` describes *when* an item will be worked, which follows its scheduling home — the epic it rolls up to — not where it was discovered. So a concern deferred out of an alpha run onto a beta epic correctly lands `phase:beta`.
+3. The **originating run's triggering issue**'s `phase:*` label(s), resolved from the filing's first `relations.evidence_runs` entry. This rung exists because the `epic_link: optional` types (`bug`, `chore` — the defer-concern shape) routinely carry no parent epic, and the run's own issue is a strictly better signal than nothing.
+
+Rung 3 carries a **same-repo guard**. `relations.evidence_runs` is caller-supplied on `POST /v0/work-items` and is *not* entitlement-checked (unlike the request's own `run_id`, which the handler gates), so the named run's repo must equal the filing target `owner/name` or nothing is derived — reading a foreign run's triggering issue number and applying its phase against this target repo would derive a wrong label from an unowned row. Only the issue's label list is read; no body, no private field, and only in a repo the caller already has filing access to.
+
+Beyond the guard, rung 3 derives nothing on: no evidence run, no run repository wired, an unparseable run id, a `GetRun` error, a run with no `issue:<n>` trigger ref, or a triggering issue carrying no `phase:*` label.
+
+The derivation runs at the single filing chokepoint every auto-file path funnels through (`POST /v0/work-items`, the defer-concern filing, product reports, live-validation walks, split-proposal children, refinement drafts), so no path files phase-less without saying so. A filing with no epic and no epic-linked run — a product report, say — correctly derives nothing and reports `phase` loudly; that is the fail-open outcome, not a rejection.
+
+Types that declare neither namespace (`epic`, `adr`) are exempt from both derivations.
 
 The `label_defaults` prefix rule is a semantic check (`workmgmt.Parse`): **every `label_defaults` value must begin with `<its key>:`** (e.g. key `autonomy` → value `autonomy:medium`). A misconfigured default (`autonomy → high`) is rejected fail-closed with a `*SemanticError` naming the type, key, and value.
 

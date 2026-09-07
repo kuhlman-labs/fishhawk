@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -554,5 +555,148 @@ func TestDeferConcern_BlankNoteBodyAndTitleCarryPointer(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("filed body missing %q:\n%s", want, body)
 		}
+	}
+}
+
+// deferPhaseServer is deferServer with a PER-ISSUE-NUMBER GitHub stub, so the
+// parent epic and the originating run's triggering issue can carry different
+// phase labels — what the #3179 ladder's two derivation rungs need to be told
+// apart on the defer path.
+func deferPhaseServer(t *testing.T, byIssue map[int][]string) (*Server, *approvalRunRepo, *fakeConcernRepo, *fakeWorkProvider) {
+	t.Helper()
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+	repo := newApprovalRunRepo()
+	cr := newFakeConcernRepo()
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		RunRepo:     repo,
+		AuditRepo:   newAuditFake(),
+		ConcernRepo: cr,
+		GitHub:      newPerIssueLabeledGitHubClient(t, 7788, byIssue, false),
+	})
+	return s, repo, cr, fp
+}
+
+// seedDeferRunWithTrigger is seedDeferRun plus the `issue:<n>` TriggerRef the
+// evidence-run rung of the phase ladder resolves. The run's Repo is the filing
+// target repo, so the same-repo guard admits it.
+func seedDeferRunWithTrigger(repo *approvalRunRepo, runID uuid.UUID, issueNumber int) {
+	inst := int64(7788)
+	prURL := "https://github.com/kuhlman-labs/fishhawk/pull/1202"
+	ref := "issue:" + strconv.Itoa(issueNumber)
+	repo.seedRun(&run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/fishhawk",
+		State:          run.StateRunning,
+		InstallationID: &inst,
+		PullRequestURL: &prURL,
+		TriggerRef:     &ref,
+	})
+}
+
+func deferPhaseLabels(labels []string) []string {
+	var out []string
+	for _, l := range labels {
+		if strings.HasPrefix(l, "phase:") {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// TestDeferConcern_FiledFollowUpCarriesAllFourLabelNamespaces is the #3179
+// CROSS-BOUNDARY done-means test, and the one the issue names. It drives the
+// REAL POST /v0/concerns/{id}/defer handler end to end — fake concern repo ->
+// fake run repo carrying Repo + TriggerRef=issue:3100 -> stub GitHub issue
+// client -> registered fakeWorkProvider -> HTTP response — and asserts the
+// FILED item carries a label in each of the FOUR namespaces (area, autonomy,
+// phase, type) and that the derived phase is reported in the response's
+// defaulted_labels.
+//
+// Per-layer unit tests alone would not catch this: the seam that matters is
+// filing.Relations reaching derivePhaseLabel through the shared
+// applyAndFileWorkItemWithIntake chokepoint, which only an end-to-end drive of
+// the defer handler exercises. This is also the highest-volume auto-file path —
+// the one that left 48 open children phase-unlabelled.
+func TestDeferConcern_FiledFollowUpCarriesAllFourLabelNamespaces(t *testing.T) {
+	s, repo, cr, fp := deferPhaseServer(t, map[int][]string{
+		389:  {"epic", "area:backend", "phase:alpha"},
+		3100: {"phase:beta"}, // deliberately DIFFERENT, so precedence is observable
+	})
+	runID, stageID := uuid.New(), uuid.New()
+	seedDeferRunWithTrigger(repo, runID, 3100)
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, "the retry loop can spin without a backoff")
+
+	w := postDefer(t, s, row.ID.String(), deferConcernRequest{
+		ParentEpic: "#389",
+		N:          "3",
+	}, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp deferConcernResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	labels := fp.captured.Item.Classification.Labels
+	for _, ns := range []string{"area:", "autonomy:", "phase:", "type:"} {
+		var found bool
+		for _, l := range labels {
+			if strings.HasPrefix(l, ns) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("filed item labels %v carry no %s label — a deferred follow-up must be filed with all four namespaces (#3179)", labels, ns)
+		}
+	}
+	// The epic's phase wins the ladder over the run issue's.
+	if got := strings.Join(deferPhaseLabels(labels), ","); got != "phase:alpha" {
+		t.Errorf("filed item phase labels = %q, want phase:alpha (the parent epic's)", got)
+	}
+	if !containsStr2(resp.Issue.DefaultedLabels, "phase:alpha") {
+		t.Errorf("response issue defaulted_labels = %v, want it to include the system-added phase:alpha", resp.Issue.DefaultedLabels)
+	}
+	for _, ns := range resp.Issue.MissingLabelNamespaces {
+		if ns == "phase" {
+			t.Errorf("missing_label_namespaces = %v, must omit phase (it was derived)", resp.Issue.MissingLabelNamespaces)
+		}
+	}
+}
+
+// TestDeferConcern_PhaseFallsBackToOriginatingRunIssue proves the evidence-run
+// rung of the ladder REACHES the defer path: the parent epic carries area but
+// no phase, and the phase is derived instead from the originating run's
+// triggering issue (#3100). handleDeferConcern populates
+// Relations.EvidenceRuns from the concern's own run row, so this is the rung
+// that covers the epic-less / phase-less-epic defers.
+func TestDeferConcern_PhaseFallsBackToOriginatingRunIssue(t *testing.T) {
+	s, repo, cr, fp := deferPhaseServer(t, map[int][]string{
+		389:  {"epic", "area:backend"}, // no phase on the epic
+		3100: {"phase:beta"},
+	})
+	runID, stageID := uuid.New(), uuid.New()
+	seedDeferRunWithTrigger(repo, runID, 3100)
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, "flush the buffer on shutdown")
+
+	w := postDefer(t, s, row.ID.String(), deferConcernRequest{
+		ParentEpic: "#389",
+		N:          "4",
+	}, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp deferConcernResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := strings.Join(deferPhaseLabels(fp.captured.Item.Classification.Labels), ","); got != "phase:beta" {
+		t.Errorf("filed item phase labels = %q, want phase:beta derived from the originating run's issue", got)
+	}
+	if !containsStr2(resp.Issue.DefaultedLabels, "phase:beta") {
+		t.Errorf("response issue defaulted_labels = %v, want it to include phase:beta", resp.Issue.DefaultedLabels)
 	}
 }

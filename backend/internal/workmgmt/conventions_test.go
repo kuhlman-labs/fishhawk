@@ -1429,3 +1429,44 @@ const AlsoNotAReason SomeOtherType = "other_typed_constant"
 		}
 	}
 }
+
+// TestDefaultRequiresFourLabelNamespaces is the DONE-MEANS test for the
+// shipped default's phase declaration (#3179). The YAML value is not
+// compiler-enforced — a comment-only or no-op touch of
+// docs/spec/work-management-default.yaml (and its embedded mirror) would
+// satisfy a scope-presence check and change nothing — so the SHIPPED behavior
+// is asserted here directly off workmgmt.Default().
+//
+// Three claims, each load-bearing:
+//
+//   - feature/bug/chore each declare EXACTLY {area, autonomy, phase} in
+//     required_label_namespaces, so an item filed through the auto-file path
+//     with no derivable phase is reported LOUDLY in missing_label_namespaces
+//     rather than being silently phase-less.
+//   - phase has NO label_defaults entry. phase describes WHEN an item is
+//     scheduled and has no universally-correct default; a blanket default
+//     would mislabel every filing it did not fit, which is exactly the
+//     mislabelling #3179 forbids. It is required-or-DERIVED, never defaulted.
+//   - the autonomy default is still exactly autonomy:medium. #2855 established
+//     that nothing may quietly alter an autonomy value; this change adds a
+//     namespace and touches no autonomy setting.
+func TestDefaultRequiresFourLabelNamespaces(t *testing.T) {
+	c := Default()
+	for _, typ := range []string{"feature", "bug", "chore"} {
+		t.Run(typ, func(t *testing.T) {
+			it, ok := c.Types[typ]
+			if !ok {
+				t.Fatalf("shipped default declares no %q type", typ)
+			}
+			if got := strings.Join(it.RequiredLabelNamespaces, ","); got != "area,autonomy,phase" {
+				t.Errorf("%s RequiredLabelNamespaces = %q, want area,autonomy,phase — a filing with no derivable phase must report it in missing_label_namespaces (#3179)", typ, got)
+			}
+			if v, ok := it.LabelDefaults["phase"]; ok {
+				t.Errorf("%s LabelDefaults[phase] = %q, want NO phase default — phase is required-or-DERIVED; a blanket default mislabels every filing it does not fit (#3179)", typ, v)
+			}
+			if got := it.LabelDefaults["autonomy"]; got != "autonomy:medium" {
+				t.Errorf("%s LabelDefaults[autonomy] = %q, want autonomy:medium — #3179 adds a namespace and must alter no autonomy value (#2855)", typ, got)
+			}
+		})
+	}
+}
