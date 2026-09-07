@@ -348,8 +348,11 @@ components:
           example: Bearer
         expires_in:
           type: integer
-          description: Access-token lifetime in seconds (`--oauth-access-token-ttl`).
-          example: 3600
+          description: >-
+            Access-token lifetime in seconds, stamped per token at mint time
+            from `--oauth-access-token-ttl` (default 15m = 900s since E66.5 /
+            #2393 — short by design; a session rides the `refresh_token` grant).
+          example: 900
         refresh_token:
           type: string
           description: Present when a refresh token was issued or rotated.

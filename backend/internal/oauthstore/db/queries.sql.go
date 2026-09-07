@@ -534,6 +534,56 @@ func (q *Queries) LockAuthorizationCodeByID(ctx context.Context, id uuid.UUID) e
 	return err
 }
 
+const lockAuthorizationCodesForSubject = `-- name: LockAuthorizationCodesForSubject :many
+SELECT id FROM oauth_authorization_codes
+ WHERE subject = $1
+   AND ($2::text IS NULL OR client_id = $2::text)
+ ORDER BY id
+   FOR UPDATE
+`
+
+type LockAuthorizationCodesForSubjectParams struct {
+	Subject  string  `json:"subject"`
+	ClientID *string `json:"client_id"`
+}
+
+// THE SUBJECT SWEEP'S LINEAGE LOCKS (E66.5 / #2393). RevokeGrantsForSubject
+// takes FOR UPDATE on EVERY lineage root (authorization-code row) for the
+// subject BEFORE mutating any descendant — the same lock, taken at the same
+// point, that RotateRefreshToken and RevokeGrantsForCode take
+// (LockAuthorizationCodeByID). That is what serializes a subject revocation
+// against a concurrent rotation of any of that subject's lineages: either the
+// rotation commits first and the sweep's later statement snapshot includes its
+// successor pair, or the sweep commits first and the rotation's post-lock
+// re-read observes revoked_at set and mints nothing. Without these locks the
+// sweep UPDATEs below fix their snapshot when the statement starts, and a
+// successor inserted after that instant survives.
+//
+// ORDER BY id makes two concurrent subject sweeps of overlapping subjects take
+// their locks in one global order, so they queue rather than deadlock.
+// Selecting only id keeps this a pure lock acquisition; a subject with no codes
+// locks nothing and is not an error. The optional client_id filter mirrors the
+// sweep predicates: a NULL filter means every client.
+func (q *Queries) LockAuthorizationCodesForSubject(ctx context.Context, arg LockAuthorizationCodesForSubjectParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockAuthorizationCodesForSubject, arg.Subject, arg.ClientID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockRefreshTokenByHash = `-- name: LockRefreshTokenByHash :one
 SELECT id, token_hash, subject, client_id, audience, scopes, provider, account_id, authorization_code_id, access_token_id, replaced_by_id, issued_at, expires_at, last_used_at, consumed_at, revoked_at FROM oauth_refresh_tokens
  WHERE token_hash = $1
@@ -625,6 +675,32 @@ func (q *Queries) RevokeAccessTokensForCode(ctx context.Context, arg RevokeAcces
 	return result.RowsAffected(), nil
 }
 
+const revokeAccessTokensForSubject = `-- name: RevokeAccessTokensForSubject :execrows
+UPDATE oauth_access_tokens
+   SET revoked_at = $1
+ WHERE subject = $2
+   AND ($3::text IS NULL OR client_id = $3::text)
+   AND revoked_at IS NULL
+`
+
+type RevokeAccessTokensForSubjectParams struct {
+	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
+	Subject   string             `json:"subject"`
+	ClientID  *string            `json:"client_id"`
+}
+
+// The other half of the subject revocation, run AFTER the refresh sweep in the
+// same transaction. AND revoked_at IS NULL keeps the returned count honest: an
+// already-revoked row is never double-counted, and an operator's second
+// invocation reports zero rather than re-stamping.
+func (q *Queries) RevokeAccessTokensForSubject(ctx context.Context, arg RevokeAccessTokensForSubjectParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeAccessTokensForSubject, arg.RevokedAt, arg.Subject, arg.ClientID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const revokeRefreshToken = `-- name: RevokeRefreshToken :one
 UPDATE oauth_refresh_tokens
    SET revoked_at = COALESCE(revoked_at, $2)
@@ -678,6 +754,33 @@ type RevokeRefreshTokensForCodeParams struct {
 // oauth_refresh_tokens_authorization_code_id_idx.
 func (q *Queries) RevokeRefreshTokensForCode(ctx context.Context, arg RevokeRefreshTokensForCodeParams) (int64, error) {
 	result, err := q.db.Exec(ctx, revokeRefreshTokensForCode, arg.AuthorizationCodeID, arg.RevokedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeRefreshTokensForSubject = `-- name: RevokeRefreshTokensForSubject :execrows
+UPDATE oauth_refresh_tokens
+   SET revoked_at = $1
+ WHERE subject = $2
+   AND ($3::text IS NULL OR client_id = $3::text)
+   AND revoked_at IS NULL
+`
+
+type RevokeRefreshTokensForSubjectParams struct {
+	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
+	Subject   string             `json:"subject"`
+	ClientID  *string            `json:"client_id"`
+}
+
+// Half of the operator subject revocation (fishhawkd oauth token revoke). Runs
+// FIRST inside RevokeGrantsForSubject's transaction: a refresh token is the
+// credential that can mint MORE, so it is never left live behind an
+// already-revoked access token. Callers MUST hold the subject's lineage locks
+// (LockAuthorizationCodesForSubject) first. A NULL client_id means every client.
+func (q *Queries) RevokeRefreshTokensForSubject(ctx context.Context, arg RevokeRefreshTokensForSubjectParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeRefreshTokensForSubject, arg.RevokedAt, arg.Subject, arg.ClientID)
 	if err != nil {
 		return 0, err
 	}

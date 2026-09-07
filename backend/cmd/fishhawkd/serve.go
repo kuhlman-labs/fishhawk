@@ -1471,8 +1471,8 @@ func runServe(args []string, logSink io.Writer) int {
 		"RFC 8707 resource identifier the AS mints token audiences for; empty defaults to <issuer>/mcp")
 	oauthCodeTTL := fs.Duration("oauth-code-ttl", envOrDuration("FISHHAWKD_OAUTH_CODE_TTL", 60*time.Second),
 		"authorization-code lifetime for the OAuth AS")
-	oauthAccessTokenTTL := fs.Duration("oauth-access-token-ttl", envOrDuration("FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL", time.Hour),
-		"access-token lifetime for the OAuth AS")
+	oauthAccessTokenTTL := fs.Duration("oauth-access-token-ttl", envOrDuration("FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL", 15*time.Minute),
+		"access-token lifetime for the OAuth AS (short by design — sessions ride the refresh grant, #2393)")
 	oauthRefreshTokenTTL := fs.Duration("oauth-refresh-token-ttl", envOrDuration("FISHHAWKD_OAUTH_REFRESH_TOKEN_TTL", 336*time.Hour),
 		"refresh-token lifetime for the OAuth AS")
 	oauthLimiterFlags := registerOAuthCIMDLimiterFlags(fs)

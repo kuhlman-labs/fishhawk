@@ -17,19 +17,23 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 )
 
-// runOAuth dispatches the `oauth` subcommand group. Today it carries only the
-// `client` verb group (ADR-076 slice 3, E66.21 / #2438) — the operator write
-// path for OAuth client pre-registration.
+// runOAuth dispatches the `oauth` subcommand group: the `client` verb group
+// (ADR-076 slice 3, E66.21 / #2438) — the operator write path for OAuth client
+// pre-registration — and the `token` verb group (ADR-076 slice 4, E66.5 /
+// #2393) — the operator revocation surface for AS-issued credentials.
 func runOAuth(args []string, logSink io.Writer) int {
 	cmd, rest := splitCommand(args)
 	switch cmd {
 	case "client":
 		return runOAuthClient(rest, logSink)
+	case "token":
+		return runOAuthToken(rest, logSink)
 	default:
 		_, _ = fmt.Fprintf(logSink, "fishhawkd oauth: unknown subcommand %q\n", cmd)
 		_, _ = fmt.Fprintln(logSink, "Usage: fishhawkd oauth client register --client-id <id> --redirect-uri <uri> [--redirect-uri <uri>...] [flags]")
 		_, _ = fmt.Fprintln(logSink, "       fishhawkd oauth client list")
 		_, _ = fmt.Fprintln(logSink, "       fishhawkd oauth client remove --client-id <id>")
+		_, _ = fmt.Fprintln(logSink, "       fishhawkd oauth token revoke --subject <s> [--client-id <c>]")
 		return exitUsage
 	}
 }

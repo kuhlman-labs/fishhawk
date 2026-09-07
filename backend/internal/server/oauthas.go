@@ -20,11 +20,20 @@ import (
 // oauthauthorize.go and oauthtoken.go; they compose the helpers here.
 
 // Default credential lifetimes, applied when the corresponding Config TTL is
-// zero. A short code, a working-session access token, and a two-week refresh
+// zero. A short code, a SHORT-LIVED access token, and a two-week refresh
 // window.
+//
+// The access token is deliberately short (E66.5 / #2393): the refresh grant
+// (oauthstore.RotateRefreshToken — rotation + reuse detection + committed
+// lineage revocation) is what carries a session, so a leaked bearer is useful
+// for minutes, not an hour. Operators who need a longer lifetime set
+// --oauth-access-token-ttl explicitly; resolveOAuthASState applies this default
+// only when the configured TTL is zero or negative. A client refreshing
+// proactively derives its margin from this lifetime (credstore.RefreshSkew), and
+// the cross-module pin in oauthttlskew_test.go fails if the two ever disagree.
 const (
 	defaultOAuthCodeTTL         = 60 * time.Second
-	defaultOAuthAccessTokenTTL  = time.Hour
+	defaultOAuthAccessTokenTTL  = 15 * time.Minute
 	defaultOAuthRefreshTokenTTL = 336 * time.Hour // 14 days
 )
 

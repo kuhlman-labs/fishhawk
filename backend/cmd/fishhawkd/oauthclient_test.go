@@ -39,6 +39,43 @@ func TestRunOAuthClient_UnknownSubcommand(t *testing.T) {
 	}
 }
 
+// TestRunOAuth_UnknownSubcommandPrintsUsageIncludingTokenRevoke pins the
+// `oauth` group dispatcher: an unknown verb reaches the group's usage banner,
+// which must list BOTH verb groups — the `client` trio and `token revoke`
+// (E66.5 / #2393) — so an operator who mistypes discovers the revocation verb.
+func TestRunOAuth_UnknownSubcommandPrintsUsageIncludingTokenRevoke(t *testing.T) {
+	var out strings.Builder
+	if got := runOAuth([]string{"frobnicate"}, &out); got != exitUsage {
+		t.Fatalf("exit = %d, want %d", got, exitUsage)
+	}
+	usage := out.String()
+	if !strings.Contains(usage, "unknown subcommand") {
+		t.Errorf("output missing usage error: %s", usage)
+	}
+	for _, want := range []string{
+		"fishhawkd oauth client register",
+		"fishhawkd oauth client list",
+		"fishhawkd oauth client remove",
+		"fishhawkd oauth token revoke --subject <s> [--client-id <c>]",
+	} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("oauth usage does not list %q:\n%s", want, usage)
+		}
+	}
+}
+
+// TestRunOAuth_DispatchesTokenGroup pins that `oauth token` routes to the token
+// verb group rather than the group-level unknown-subcommand banner.
+func TestRunOAuth_DispatchesTokenGroup(t *testing.T) {
+	var out strings.Builder
+	if got := runOAuth([]string{"token", "frobnicate"}, &out); got != exitUsage {
+		t.Fatalf("exit = %d, want %d", got, exitUsage)
+	}
+	if !strings.Contains(out.String(), "fishhawkd oauth token: unknown subcommand") {
+		t.Errorf("`oauth token frobnicate` did not reach the token group's banner: %s", out.String())
+	}
+}
+
 // TestRunOAuthClientRegister_MissingFlags covers the flag-presence guards that
 // return exitUsage BEFORE any database dial (the dummy --db is never connected).
 func TestRunOAuthClientRegister_MissingFlags(t *testing.T) {

@@ -91,6 +91,13 @@ var (
 	// again. When RotateRefreshToken returns this, the whole-lineage revocation
 	// is already COMMITTED — see RotateRefreshToken.
 	ErrRefreshReused = errors.New("oauthstore: refresh token reused")
+
+	// ErrSubjectRequired means RevokeGrantsForSubject was handed an empty (or
+	// whitespace-only) subject. Refused BEFORE any database round-trip: an
+	// empty subject predicate would match nothing and report (0, 0, nil), which
+	// an operator would read as "nothing to revoke" rather than "you passed no
+	// subject".
+	ErrSubjectRequired = errors.New("oauthstore: subject required")
 )
 
 // GeneratePlaintext produces a fresh credential string with the given prefix
@@ -402,6 +409,33 @@ type Repository interface {
 	// successor past the sweep. An unknown codeID revokes zero rows without
 	// erroring.
 	RevokeGrantsForCode(ctx context.Context, codeID uuid.UUID) (int64, error)
+
+	// RevokeGrantsForSubject revokes every still-active access AND refresh token
+	// issued to subject, optionally narrowed to one client_id (an empty clientID
+	// means EVERY client), and returns the two counts separately. It backs the
+	// operator verb `fishhawkd oauth token revoke` (E66.5 / #2393).
+	//
+	// ONE TRANSACTION, REFRESH FIRST. A refresh token is the credential that can
+	// mint MORE, so the sweep revokes refresh tokens before access tokens and
+	// commits both together: a partial sweep can never leave a live refresh
+	// token behind an already-revoked access token, and a failure anywhere
+	// leaves BOTH tables untouched.
+	//
+	// SERIALIZED WITH ROTATION. Before mutating any descendant the transaction
+	// takes FOR UPDATE on every lineage root (authorization-code row) for the
+	// subject, in id order — the same lock RotateRefreshToken and
+	// RevokeGrantsForCode take, at the same point — so a rotation racing this
+	// sweep cannot insert a successor pair the sweep's statement snapshot never
+	// sees. Either the rotation commits first and the sweep revokes its
+	// successor, or the sweep commits first and the rotation observes
+	// ErrRevoked and mints nothing.
+	//
+	// COUNTS are of rows this call transitioned from live to revoked: an
+	// already-revoked row is not double-counted, so a second invocation reports
+	// (0, 0, nil). An unknown subject likewise returns (0, 0, nil) — that is a
+	// committed no-op, not an error. Only an empty/whitespace subject is refused,
+	// with ErrSubjectRequired and no database round-trip.
+	RevokeGrantsForSubject(ctx context.Context, subject string, clientID string) (accessRevoked int64, refreshRevoked int64, err error)
 
 	// AuthenticateAccessToken resolves a bearer plaintext to its token row.
 	//
