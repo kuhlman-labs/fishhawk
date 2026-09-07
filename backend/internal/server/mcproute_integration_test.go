@@ -147,6 +147,12 @@ func (f *mcpFixture) seedRun(t *testing.T) *run.Run {
 // postMCP sends one raw streamable-HTTP POST to /mcp bearing token, with a
 // FABRICATED Mcp-Session-Id. Stateless mode ignores the header entirely; a
 // raw POST (rather than an SDK client session) is what lets a test control it.
+//
+// It also sets the SEP-2243 standard headers a conforming go-sdk v1.7.0 client
+// sets on every request, DERIVED FROM THE BODY (setMCPHeaders' own rule), so
+// these cross-layer cases keep exercising what they were written for rather
+// than stopping at the per-tool authorization gate (E66.30 / #2459). A test
+// that wants a header-less request builds its own request instead.
 func (f *mcpFixture) postMCP(t *testing.T, token, sessionID, body string) (int, string) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, f.ts.URL+"/mcp", strings.NewReader(body))
@@ -156,6 +162,7 @@ func (f *mcpFixture) postMCP(t *testing.T, token, sessionID, body string) (int, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+token)
+	setStandardMCPHeaders(t, req, body)
 	if sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", sessionID)
 	}
@@ -172,17 +179,65 @@ func (f *mcpFixture) postMCP(t *testing.T, token, sessionID, body string) (int, 
 }
 
 // callToolBody renders a tools/call JSON-RPC request.
+//
+// params._meta carries the protocol version because go-sdk rejects a request
+// bearing Mcp-Protocol-Version >= 2026-07-28 whose _meta does not carry the
+// SAME value (mcp/streamable.go, SEP-2575). postMCP sets that header, so
+// omitting the _meta here would turn every raw POST into an unrelated 400.
 func callToolBody(id int, name string, args map[string]any) string {
 	payload, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"method":  "tools/call",
-		"params":  map[string]any{"name": name, "arguments": args},
+		"params": map[string]any{
+			"name":      name,
+			"arguments": args,
+			"_meta":     newProtocolMeta(),
+		},
 	})
 	if err != nil {
 		panic(err)
 	}
 	return string(payload)
+}
+
+// newProtocolMeta renders the params._meta a 2026-07-28 request must carry.
+// go-sdk validateRequestMeta (mcp/shared.go) requires BOTH the protocol
+// version AND clientCapabilities once the version is at or above the floor:
+// in the sessionless protocol these fields replace the initialize handshake,
+// so a request omitting them is answered -32602 rather than served.
+func newProtocolMeta() map[string]any {
+	return map[string]any{
+		"io.modelcontextprotocol/protocolVersion":    mcpMinProtocolVersion,
+		"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+	}
+}
+
+// setStandardMCPHeaders mirrors go-sdk's setMCPHeaders
+// (mcp/streamable_headers.go): the protocol version, the body's method, and —
+// for tools/call — the tool name from params.name. Deriving them FROM THE BODY
+// rather than hardcoding them is what keeps a test that changes the body from
+// silently sending a mismatched header the SDK would reject with -32020.
+func setStandardMCPHeaders(t *testing.T, req *http.Request, body string) {
+	t.Helper()
+	var msg struct {
+		Method string `json:"method"`
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		// A body that is not a single JSON object (a batch, or malformed) has
+		// no headers to derive; leave them unset and let the route decide.
+		return
+	}
+	req.Header.Set("Mcp-Protocol-Version", mcpMinProtocolVersion)
+	if msg.Method != "" {
+		req.Header.Set("Mcp-Method", msg.Method)
+	}
+	if msg.Method == "tools/call" && msg.Params.Name != "" {
+		req.Header.Set("Mcp-Name", msg.Params.Name)
+	}
 }
 
 // lastInboundFor returns the most recent recorded inner call to path.
@@ -398,7 +453,12 @@ func TestMCPRoute_DenialParity(t *testing.T) {
 		t.Fatalf("REST cancel body = %s, want insufficient_scope", restBody)
 	}
 
-	// The MCP route refuses identically.
+	// The MCP route refuses too — and since E66.30 (#2459) it refuses EARLIER,
+	// at the HTTP layer, before the per-request tool registry exists. A go-sdk
+	// client sees that as a transport-level Forbidden rather than a tool
+	// result carrying the REST envelope, so the parity claim is now checked in
+	// two halves: the SDK call must FAIL, and the raw HTTP envelope for the
+	// same tools/call must be the same 403 insufficient_scope REST returned.
 	cs := mcpClientSession(t, ctx, f.ts.URL, readOnly, nil)
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
 		Name: "fishhawk_cancel_run", Arguments: map[string]any{"run_id": seeded.ID.String()},
@@ -407,9 +467,91 @@ func TestMCPRoute_DenialParity(t *testing.T) {
 		t.Fatal("fishhawk_cancel_run SUCCEEDED through /mcp with a token REST refuses: " +
 			"the route granted privilege the REST surface does not")
 	}
-	denial := toolFailureText(res, err)
-	if !strings.Contains(denial, "403") || !strings.Contains(denial, "insufficient_scope") {
-		t.Errorf("tool denial = %q, want the same 403 insufficient_scope REST returned", denial)
+
+	status, envelope := f.postMCP(t, readOnly, "",
+		callToolBody(1, "fishhawk_cancel_run", map[string]any{"run_id": seeded.ID.String()}))
+	if status != http.StatusForbidden {
+		t.Errorf("/mcp cancel status = %d, want the 403 REST returned:\n%s", status, envelope)
+	}
+	if !strings.Contains(envelope, "insufficient_scope") {
+		t.Errorf("/mcp cancel envelope = %s, want the same insufficient_scope REST returned", envelope)
+	}
+}
+
+// TestMCPRoute_ScopeRefusalIsCrossLayer is the cross-boundary assertion the
+// per-layer unit tests cannot make: authorization now spans HTTP middleware,
+// the per-tool gate, the SDK transport, the registry seam and the inner REST
+// call, so this drives a REAL tools/call against a real loopback fishhawkd
+// with an under-scoped token and asserts BOTH the insufficient_scope envelope
+// AND that the inboundRecorder saw NO inner /v0/ request at all — no registry
+// was built and no dial-back happened.
+func TestMCPRoute_ScopeRefusalIsCrossLayer(t *testing.T) {
+	f := newMCPFixture(t, nil)
+	readOnly := f.issueToken(t, "svc:readonly", "read:runs")
+	seeded := f.seedRun(t)
+
+	f.recorder.reset()
+	status, envelope := f.postMCP(t, readOnly, "",
+		callToolBody(1, "fishhawk_cancel_run", map[string]any{"run_id": seeded.ID.String()}))
+	if status != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", status, envelope)
+	}
+	if !strings.Contains(envelope, "insufficient_scope") {
+		t.Errorf("envelope = %s, want insufficient_scope", envelope)
+	}
+	if calls := f.recorder.snapshot(); len(calls) != 0 {
+		t.Errorf("the refused tools/call reached %d inner /v0/ request(s) (%v); "+
+			"the refusal must precede the tool registry entirely", len(calls), calls)
+	}
+}
+
+// TestMCPRoute_ForgedMcpNameRejected is the test that makes header-based
+// authorization sound rather than forgeable. It sends an Mcp-Name naming an
+// ALLOWED read tool while the BODY names a write tool the token may not call.
+// At 2026-07-28 the SDK proves header/body agreement
+// (mcp/streamable_headers.go validateMcpHeaders), so the disagreement is
+// answered -32020 CodeHeaderMismatch and the body's tool never runs — zero
+// inner /v0/ calls.
+func TestMCPRoute_ForgedMcpNameRejected(t *testing.T) {
+	f := newMCPFixture(t, nil)
+	readOnly := f.issueToken(t, "svc:readonly", "read:runs")
+	seeded := f.seedRun(t)
+
+	body := callToolBody(1, "fishhawk_cancel_run", map[string]any{"run_id": seeded.ID.String()})
+	req, err := http.NewRequest(http.MethodPost, f.ts.URL+"/mcp", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+readOnly)
+	req.Header.Set("Mcp-Protocol-Version", mcpMinProtocolVersion)
+	req.Header.Set("Mcp-Method", "tools/call")
+	// The FORGERY: a tool this token IS allowed to call, over a body naming
+	// one it is not. This header alone satisfies the per-tool scope gate.
+	req.Header.Set("Mcp-Name", "fishhawk_list_runs")
+	if rule, ok := mcpToolScopeFor("fishhawk_list_runs"); !ok || !rule.satisfiedBy(
+		Identity{Subject: "svc:readonly", TokenID: "tok", Scopes: []string{"read:runs"}}) {
+		t.Fatal("the forged Mcp-Name does not pass the scope gate; this test's premise is gone")
+	}
+
+	f.recorder.reset()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /mcp: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("a forged Mcp-Name was SERVED (200): %s", raw)
+	}
+	if !strings.Contains(string(raw), "-32020") {
+		t.Errorf("body = %s, want the SDK's -32020 HeaderMismatch rejection", raw)
+	}
+	if calls := f.recorder.snapshot(); len(calls) != 0 {
+		t.Errorf("the forged call reached %d inner /v0/ request(s) (%v); "+
+			"the body's tool must never run", len(calls), calls)
 	}
 }
 

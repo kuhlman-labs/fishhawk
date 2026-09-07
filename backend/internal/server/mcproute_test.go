@@ -3,13 +3,16 @@ package server
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/google/uuid"
@@ -768,8 +771,15 @@ func TestMCPRoute_CookieSessionReachesHandlerNotCSRF(t *testing.T) {
 func TestMCPRoute_BearerBypassesCSRF(t *testing.T) {
 	s, token := mcpTestServer(t, Config{Addr: "127.0.0.1:8080"})
 
-	post := newMCPPost(mcpInitializeBody)
+	// A conforming 2026-07-28 tools/list POST: the per-tool authorization gate
+	// (E66.30 / #2459) refuses a POST that carries no standard headers, so a
+	// header-less body here would draw mcp_standard_headers_required and this
+	// test could no longer distinguish that from a CSRF rejection.
+	post := newMCPPost(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":` +
+		`{"_meta":` + mcpProtocolMetaJSON + `}}`)
 	post.Header.Set("Authorization", "Bearer "+token)
+	post.Header.Set("Mcp-Protocol-Version", mcpMinProtocolVersion)
+	post.Header.Set("Mcp-Method", "tools/list")
 	postRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(postRec, post)
 	if postRec.Code == http.StatusForbidden || strings.Contains(postRec.Body.String(), "csrf_required") {
@@ -1370,5 +1380,339 @@ func TestHandleMCP_LiftedRefusesBareBearerToken(t *testing.T) {
 	})
 	if okStatus == http.StatusUnauthorized {
 		t.Fatalf("fho_ status = 401, want admitted to the tool surface:\n%s", okBody)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SEP-2243 header-driven per-tool authorization (E66.30 / #2459)
+// ---------------------------------------------------------------------------
+
+// countingMCPFactory wraps the production factory with an atomic call counter.
+// It is the SEAM that makes "the refusal precedes the tool registry" an
+// OBSERVABLE claim: a status code alone cannot distinguish a gate refusal from
+// a refusal raised inside an already-constructed registry, so every refusal
+// test below asserts the counter is ZERO as well as the error identity.
+type countingMCPFactory struct{ calls atomic.Int64 }
+
+func (f *countingMCPFactory) factory(backendURL, apiToken string) *mcp.Server {
+	f.calls.Add(1)
+	return testMCPServerFactory(backendURL, apiToken)
+}
+
+// mcpGateServer builds a loopback /mcp deployment whose factory is counted and
+// whose bearer holds exactly scopes.
+func mcpGateServer(t *testing.T, scopes ...string) (*Server, string, *countingMCPFactory) {
+	t.Helper()
+	repo := newFakeTokenRepo()
+	tok, err := repo.Issue(context.Background(), "svc:mcp-gate-test", scopes)
+	if err != nil {
+		t.Fatalf("issue test token: %v", err)
+	}
+	f := &countingMCPFactory{}
+	s := New(Config{Addr: "127.0.0.1:8080", APITokenRepo: repo, MCPServerFactory: f.factory})
+	return s, tok.PlainText, f
+}
+
+// mcpProtocolMetaJSON is the params._meta a 2026-07-28 request must carry:
+// go-sdk validateRequestMeta (mcp/shared.go) requires BOTH the protocol
+// version AND clientCapabilities at or above the floor, because in the
+// sessionless protocol these replace the initialize handshake.
+const mcpProtocolMetaJSON = `{"io.modelcontextprotocol/protocolVersion":"` + mcpMinProtocolVersion +
+	`","io.modelcontextprotocol/clientCapabilities":{}}`
+
+// mcpToolCallBody is a minimal, valid tools/call JSON-RPC request naming tool.
+func mcpToolCallBody(tool string) string {
+	// _meta.protocolVersion is REQUIRED at or above 2026-07-28: go-sdk
+	// mcp/streamable.go rejects a request carrying the header without a
+	// matching _meta value (CodeHeaderMismatch / CodeInvalidParams). Carrying
+	// it keeps an ADMITTED request a real end-to-end call rather than one the
+	// SDK rejects for an unrelated reason.
+	return `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tool +
+		`","arguments":{},"_meta":` + mcpProtocolMetaJSON + `}}`
+}
+
+// newMCPToolCall builds a conforming 2026-07-28 tools/call POST: body plus the
+// three SEP-2243 standard headers a go-sdk v1.7.0 client would set.
+func newMCPToolCall(tool, bearer string) *http.Request {
+	req := newMCPPost(mcpToolCallBody(tool))
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	req.Header.Set("Mcp-Protocol-Version", "2026-07-28")
+	req.Header.Set("Mcp-Method", "tools/call")
+	req.Header.Set("Mcp-Name", tool)
+	return req
+}
+
+// mcpGateResult drives one request and returns status + body.
+func mcpGateResult(t *testing.T, s *Server, req *http.Request) (int, string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	return rec.Code, rec.Body.String()
+}
+
+// assertMCPGateRefusal asserts BOTH halves of every refusal claim: the 4xx
+// error IDENTITY, and that the per-request MCPServerFactory was never invoked.
+func assertMCPGateRefusal(t *testing.T, s *Server, f *countingMCPFactory, req *http.Request, wantStatus int, wantCode string) string {
+	t.Helper()
+	status, body := mcpGateResult(t, s, req)
+	if status != wantStatus {
+		t.Errorf("status = %d, want %d:\n%s", status, wantStatus, body)
+	}
+	if !strings.Contains(body, wantCode) {
+		t.Errorf("body = %s, want error code %q", body, wantCode)
+	}
+	if n := f.calls.Load(); n != 0 {
+		t.Errorf("MCPServerFactory was invoked %d time(s); the refusal did NOT precede the tool registry", n)
+	}
+	return body
+}
+
+// TestHandleMCP_RefusesWithoutStandardHeaders covers rung (1) for an ABSENT
+// Mcp-Protocol-Version: below the floor the SDK validates no header against
+// the body, so the headers are unauthenticated hints and the call cannot be
+// authorized from them.
+func TestHandleMCP_RefusesWithoutStandardHeaders(t *testing.T) {
+	s, bearer, f := mcpGateServer(t, "write:runs")
+	req := newMCPToolCall("fishhawk_start_run", bearer)
+	// ISOLATE rung (1): Mcp-Method and Mcp-Name stay SET, so rung (2) and
+	// rung (4) cannot produce this refusal and a green here could not be
+	// another rung standing in for the version check.
+	req.Header.Del("Mcp-Protocol-Version")
+	body := assertMCPGateRefusal(t, s, f, req, http.StatusForbidden, "mcp_standard_headers_required")
+	if !strings.Contains(body, "minimum_protocol_version") {
+		t.Errorf("body = %s, want the floor named for diagnosis", body)
+	}
+}
+
+// TestHandleMCP_RefusesStaleProtocolVersion covers rung (1) for a version
+// BELOW the floor. It is also the test that would fail if the lexical
+// comparison against "2026-07-28" were not a correct ordering test.
+func TestHandleMCP_RefusesStaleProtocolVersion(t *testing.T) {
+	s, bearer, f := mcpGateServer(t, "write:runs")
+	req := newMCPToolCall("fishhawk_start_run", bearer)
+	req.Header.Set("Mcp-Protocol-Version", "2025-11-25")
+	body := assertMCPGateRefusal(t, s, f, req, http.StatusForbidden, "mcp_standard_headers_required")
+	if !strings.Contains(body, "2025-11-25") {
+		t.Errorf("body = %s, want the observed version echoed for diagnosis", body)
+	}
+}
+
+// TestHandleMCP_RefusesMissingMcpMethod covers rung (2): at or above the floor
+// the SDK REQUIRES Mcp-Method, so its absence leaves nothing to authorize.
+func TestHandleMCP_RefusesMissingMcpMethod(t *testing.T) {
+	s, bearer, f := mcpGateServer(t, "write:runs")
+	req := newMCPToolCall("fishhawk_start_run", bearer)
+	req.Header.Del("Mcp-Method")
+	assertMCPGateRefusal(t, s, f, req, http.StatusForbidden, "mcp_standard_headers_required")
+}
+
+// TestHandleMCP_RefusesToolCallWithoutMcpName covers rung (4).
+func TestHandleMCP_RefusesToolCallWithoutMcpName(t *testing.T) {
+	s, bearer, f := mcpGateServer(t, "write:runs")
+	req := newMCPToolCall("fishhawk_start_run", bearer)
+	req.Header.Del("Mcp-Name")
+	assertMCPGateRefusal(t, s, f, req, http.StatusForbidden, "mcp_tool_name_required")
+}
+
+// TestHandleMCP_RefusesUnmappedTool covers rung (5). The tool name is
+// DEFINITIONALLY unregistered, so the bad state is seeded by construction and
+// the red lands on the behavioral assertion.
+func TestHandleMCP_RefusesUnmappedTool(t *testing.T) {
+	s, bearer, f := mcpGateServer(t, "write:runs")
+	const unmapped = "fishhawk_definitely_not_a_registered_tool"
+	if _, ok := mcpToolScopeFor(unmapped); ok {
+		t.Fatalf("%q resolved in the table; this test's premise is gone", unmapped)
+	}
+	body := assertMCPGateRefusal(t, s, f, newMCPToolCall(unmapped, bearer),
+		http.StatusForbidden, "mcp_tool_not_authorized")
+	if !strings.Contains(body, unmapped) {
+		t.Errorf("body = %s, want details.tool naming the refused tool", body)
+	}
+}
+
+// TestHandleMCP_RefusesInsufficientScope covers rung (6). The token is minted
+// with a scope set DISJOINT from the requirement, so no fixture-setup guard is
+// involved in producing the refusal.
+func TestHandleMCP_RefusesInsufficientScope(t *testing.T) {
+	s, bearer, f := mcpGateServer(t, "read:runs")
+	rule, ok := mcpToolScopeFor("fishhawk_start_run")
+	if !ok {
+		t.Fatal("fishhawk_start_run has no table entry; this test's premise is gone")
+	}
+	for _, sc := range rule.anyOf {
+		if sc == "read:runs" {
+			t.Fatalf("the seeded scope set is not disjoint from the requirement %v", rule.anyOf)
+		}
+	}
+	body := assertMCPGateRefusal(t, s, f, newMCPToolCall("fishhawk_start_run", bearer),
+		http.StatusForbidden, "insufficient_scope")
+	if !strings.Contains(body, "required_scope") || !strings.Contains(body, "write:runs") {
+		t.Errorf("body = %s, want details.required_scope naming write:runs", body)
+	}
+}
+
+// TestHandleMCP_RefusesBatch covers rung (0), the operator's binding condition
+// 1. The SDK validates header/body agreement only for a SINGLE non-batch
+// message (`if !isBatch && len(incoming) == 1` in mcp/streamable.go), so a
+// batch's Mcp-Name is checked against nothing: here the header names an
+// ALLOWED read tool while a batched element carries an under-scoped
+// tools/call. The gate must refuse the whole request by its own identity, with
+// the factory never invoked.
+func TestHandleMCP_RefusesBatch(t *testing.T) {
+	s, bearer, f := mcpGateServer(t, "read:runs")
+	batch := `[` + mcpToolCallBody("fishhawk_get_run_status") + `,` +
+		mcpToolCallBody("fishhawk_start_run") + `]`
+	req := newMCPPost(batch)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	req.Header.Set("Mcp-Protocol-Version", "2026-07-28")
+	req.Header.Set("Mcp-Method", "tools/call")
+	// The header names a tool this token IS allowed to call; the batch's
+	// second element is the one it is not.
+	req.Header.Set("Mcp-Name", "fishhawk_get_run_status")
+	assertMCPGateRefusal(t, s, f, req, http.StatusForbidden, "mcp_batch_not_supported")
+}
+
+// TestHandleMCP_RefusesBatchWithLeadingWhitespace pins the probe's whitespace
+// skip: JSON permits leading whitespace, so a batch indented past the first
+// byte must still be classified as a batch.
+func TestHandleMCP_RefusesBatchWithLeadingWhitespace(t *testing.T) {
+	s, bearer, f := mcpGateServer(t, "read:runs")
+	req := newMCPPost("\n\t  \r\n[" + mcpToolCallBody("fishhawk_get_run_status") + "]")
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	req.Header.Set("Mcp-Protocol-Version", "2026-07-28")
+	req.Header.Set("Mcp-Method", "tools/call")
+	req.Header.Set("Mcp-Name", "fishhawk_get_run_status")
+	assertMCPGateRefusal(t, s, f, req, http.StatusForbidden, "mcp_batch_not_supported")
+}
+
+// TestHandleMCP_RefusesUnclassifiableBody covers the probe's two fail-closed
+// branches: a body that cannot be READ, and one carrying no non-whitespace
+// byte at all. Neither can be classified as a single message or a batch, so
+// both are refused rather than forwarded unauthorized.
+func TestHandleMCP_RefusesUnclassifiableBody(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body io.Reader
+		// reason discriminates the two branches, which deliberately share
+		// one error identity. Asserting the identity alone would stay GREEN
+		// with either branch deleted, because the other catches the same
+		// input and returns a byte-identical code.
+		reason string
+	}{
+		{"unreadable body", iotest.ErrReader(errors.New("boom")), "read_error"},
+		{"whitespace-only body", strings.NewReader("   \n\t "), "no_content"},
+		{"empty body", strings.NewReader(""), "no_content"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, bearer, f := mcpGateServer(t, "write:runs")
+			req := httptest.NewRequest(http.MethodPost, "/mcp", tc.body)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			req.Header.Set("Authorization", "Bearer "+bearer)
+			req.Header.Set("Mcp-Protocol-Version", "2026-07-28")
+			req.Header.Set("Mcp-Method", "tools/call")
+			req.Header.Set("Mcp-Name", "fishhawk_start_run")
+			body := assertMCPGateRefusal(t, s, f, req, http.StatusBadRequest, "mcp_request_unreadable")
+			if !strings.Contains(body, `"reason":"`+tc.reason+`"`) {
+				t.Errorf("body = %s, want details.reason = %q", body, tc.reason)
+			}
+		})
+	}
+}
+
+// TestHandleMCP_RefusalPrecedesServerFactory is the SEAM test named by the
+// plan and by binding condition 2, stated once on its own: for a refusal the
+// factory counter must be exactly zero, and for an ADMITTED request it must be
+// non-zero — the positive control that proves the counter is wired at all and
+// that a zero is therefore evidence rather than an artifact.
+func TestHandleMCP_RefusalPrecedesServerFactory(t *testing.T) {
+	s, bearer, f := mcpGateServer(t, "read:runs")
+	assertMCPGateRefusal(t, s, f, newMCPToolCall("fishhawk_start_run", bearer),
+		http.StatusForbidden, "insufficient_scope")
+
+	admitted, bearer2, f2 := mcpGateServer(t, "write:runs")
+	if _, body := mcpGateResult(t, admitted, newMCPToolCall("fishhawk_start_run", bearer2)); body == "" {
+		t.Fatal("admitted request produced no body")
+	}
+	if n := f2.calls.Load(); n == 0 {
+		t.Fatal("the factory counter stayed zero on an ADMITTED request; " +
+			"a zero on a refusal would then be an artifact, not evidence")
+	}
+}
+
+// TestHandleMCP_AllowsGrantedScope is the positive control for rung (6): a
+// token holding the required scope reaches the SDK, so the response is a
+// JSON-RPC answer rather than the gate's error envelope.
+func TestHandleMCP_AllowsGrantedScope(t *testing.T) {
+	s, bearer, f := mcpGateServer(t, "write:runs")
+	status, body := mcpGateResult(t, s, newMCPToolCall("fishhawk_start_run", bearer))
+	if status == http.StatusForbidden {
+		t.Fatalf("a granted-scope tools/call was refused %d: %s", status, body)
+	}
+	for _, code := range []string{"mcp_standard_headers_required", "mcp_tool_name_required",
+		"mcp_tool_not_authorized", "insufficient_scope", "mcp_batch_not_supported"} {
+		if strings.Contains(body, code) {
+			t.Errorf("granted-scope call drew gate refusal %q: %s", code, body)
+		}
+	}
+	if f.calls.Load() == 0 {
+		t.Error("the granted-scope call never reached the per-request tool registry")
+	}
+}
+
+// TestHandleMCP_AnyOfSatisfiedByEitherMember is the positive control for the
+// any-of shape and the fhm_ non-regression at the HTTP layer: a token holding
+// ONLY write:retries must still reach fishhawk_retry_stage, exactly as
+// retry.go's `write:stages OR write:retries` admits it.
+func TestHandleMCP_AnyOfSatisfiedByEitherMember(t *testing.T) {
+	for _, scope := range []string{"write:stages", "write:retries"} {
+		s, bearer, f := mcpGateServer(t, scope)
+		status, body := mcpGateResult(t, s, newMCPToolCall("fishhawk_retry_stage", bearer))
+		if strings.Contains(body, "insufficient_scope") {
+			t.Errorf("scope %q was refused (%d) for fishhawk_retry_stage: %s", scope, status, body)
+		}
+		if f.calls.Load() == 0 {
+			t.Errorf("scope %q never reached the tool registry", scope)
+		}
+	}
+}
+
+// TestHandleMCP_NonToolCallMethodPasses is the positive control for rung (3):
+// a non-tools/call method carries no tool to authorize, so it passes the gate
+// and is answered by the SDK.
+func TestHandleMCP_NonToolCallMethodPasses(t *testing.T) {
+	s, bearer, f := mcpGateServer(t, "read:runs")
+	req := newMCPPost(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":` +
+		`{"_meta":` + mcpProtocolMetaJSON + `}}`)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	req.Header.Set("Mcp-Protocol-Version", mcpMinProtocolVersion)
+	req.Header.Set("Mcp-Method", "tools/list")
+	status, body := mcpGateResult(t, s, req)
+	if status == http.StatusForbidden {
+		t.Fatalf("tools/list was refused by the per-tool gate (%d): %s", status, body)
+	}
+	if f.calls.Load() == 0 {
+		t.Error("tools/list never reached the per-request tool registry")
+	}
+}
+
+// TestHandleMCP_GateIsPOSTOnly proves GET and DELETE still reach the SDK and
+// draw its spec-prescribed 405 + Allow: POST, rather than the gate's own
+// refusal — they carry no JSON-RPC message to authorize.
+func TestHandleMCP_GateIsPOSTOnly(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		s, bearer, _ := mcpGateServer(t, "read:runs")
+		req := httptest.NewRequest(method, "/mcp", nil)
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		status, body := mcpGateResult(t, s, req)
+		if status != http.StatusMethodNotAllowed {
+			t.Errorf("%s /mcp: status = %d, want 405:\n%s", method, status, body)
+		}
+		for _, code := range []string{"mcp_standard_headers_required", "mcp_request_unreadable"} {
+			if strings.Contains(body, code) {
+				t.Errorf("%s /mcp drew the POST-only gate refusal %q: %s", method, code, body)
+			}
+		}
 	}
 }
