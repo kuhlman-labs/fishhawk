@@ -827,9 +827,11 @@ operator can tell an oversize sidecar from a malformed one — and (2) at the
 loaders that return on the read-error path BEFORE their deferred delete-after-read
 is installed (`loadFixupSelfReport`, `loadScopeExemptions`,
 `loadFixupCommitMessage`, `loadImplementCommitMessage`, `loadAgentAuthoredPR`),
-the removal the early return would otherwise skip. Deleting a branch therefore
+the removal the early return would otherwise skip — plus
+`captureAcceptanceVerdict`, which has no delete-after-read at all, so its
+oversize removal is the ONLY removal it performs. Deleting a branch therefore
 costs the named event everywhere, and additionally the on-disk cleanup at those
-five; it never re-opens the fail-closed hole.
+six; it never re-opens the fail-closed hole.
 
 The seven governed loaders and their events: `loadCounterfactualReport`
 (`counterfactual_report_oversize`), `loadFixupSelfReport`
@@ -838,18 +840,29 @@ The seven governed loaders and their events: `loadCounterfactualReport`
 (`fixup_commitmsg_oversize`), `loadImplementCommitMessage`
 (`implement_commitmsg_oversize`), `loadAgentAuthoredPR` (keyed AND legacy paths,
 `pr_description_oversize`), and `captureAcceptanceVerdict` (keyed AND legacy
-paths, `acceptance_verdict_oversize`). All except the acceptance loader REMOVE the
-oversize file (`loadAgentAuthoredPR` reuses `prBodyReasonHandoffUnreadable` — an
-oversize handoff is a present-but-unusable one, so no sixth wire reason is
-added; the distinct log event carries the discrimination).
+paths, `acceptance_verdict_oversize`). All SEVEN REMOVE the oversize file
+(`loadAgentAuthoredPR` reuses `prBodyReasonHandoffUnreadable` — an oversize
+handoff is a present-but-unusable one, so no sixth wire reason is added; the
+distinct log event carries the discrimination).
 
-ONE documented deviation: `captureAcceptanceVerdict` does NOT remove the oversize
-verdict. It has never removed on read — removal for the acceptance verdict is
-owned by the PRE-INVOKE `sweepStaleAcceptanceVerdict`, which fails the stage
-category-C when it cannot unlink. So this stage's oversize verdict survives on
-disk until the NEXT acceptance stage's pre-invoke sweep clears it; folding a
-removal in here would move that ownership and could mask a sweep failure. The
-oversize verdict returns a wrapped non-`nil` error that is NOT
+Every removal is CHECKED (the #3106 fix-up): the `os.Remove` result is captured
+and a failed removal gets its own named event BESIDE the `*_oversize` one, never
+instead of it — `counterfactual_report_unremovable`,
+`fixup_selfreport_unremovable`, `scope_justification_unremovable`,
+`fixup_commitmsg_unremovable`, `implement_commitmsg_unremovable`,
+`pr_description_unremovable`, and `acceptance_verdict_unremovable` (E64.36 /
+[#3142](https://github.com/kuhlman-labs/fishhawk/issues/3142), naming the keyed
+or legacy path that failed). A readable-but-unremovable file would otherwise
+survive silently and be re-read by a later pass; an over-ceiling path and an
+unremovable path are two distinct facts an operator needs both of.
+
+`captureAcceptanceVerdict`'s removal does NOT displace
+`sweepStaleAcceptanceVerdict`'s ownership: that sweep runs PRE-invoke and its
+unlink-failure verdict already failed the stage category-C before the agent
+spawned, so a post-invoke removal here cannot mask a sweep failure — and clearing
+the oversize LEGACY verdict is the same fixed-path clearing the sweep already
+performs, so it introduces no new concurrent-run hazard. The oversize verdict
+still returns a wrapped non-`nil` error that is NOT
 `errAcceptanceVerdictMissing` (the verdict is present-but-oversize, not missing),
 so the stage fails closed exactly as for any other verdict read error.
 

@@ -125,10 +125,11 @@ func TestCaptureAcceptanceVerdict_ReadErrorNotMissing(t *testing.T) {
 // TestCaptureAcceptanceVerdict_OversizeKeyed (E64.12 / #3106): a valid-but-
 // oversize KEYED verdict returns a wrapped non-nil error that is NOT
 // errAcceptanceVerdictMissing (the verdict is present-but-oversize, not
-// missing), emits the acceptance_verdict_oversize warn, and — the documented
-// ownership DEVIATION — the file SURVIVES on disk (removal is owned by the
-// next stage's pre-invoke sweepStaleAcceptanceVerdict, not by read-time). With
-// the ceiling deleted the padded-but-valid verdict is returned instead.
+// missing), emits the acceptance_verdict_oversize warn, and the offending file
+// is REMOVED (E64.36 / #3142). The removal assertion reads COMMITTED FILESYSTEM
+// STATE after the call returns: the returned error is byte-identical with the
+// removal deleted, so an error-identity assertion alone could not discriminate.
+// With the ceiling deleted the padded-but-valid verdict is returned instead.
 func TestCaptureAcceptanceVerdict_OversizeKeyed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "verdict.json")
 	mustWrite(t, path, `{"verdict":"passed","notes":"`+oversizePad()+`"}`)
@@ -148,15 +149,15 @@ func TestCaptureAcceptanceVerdict_OversizeKeyed(t *testing.T) {
 	if !slices.Contains(warned, "acceptance_verdict_oversize") {
 		t.Errorf("expected acceptance_verdict_oversize warn, got %v", warned)
 	}
-	// Ownership deviation: the file is NOT removed at read time.
-	if _, statErr := os.Stat(path); statErr != nil {
-		t.Errorf("oversize keyed verdict must SURVIVE on disk (sweep owns removal), stat err = %v", statErr)
+	if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+		t.Errorf("oversize keyed verdict must be REMOVED, lstat err = %v", statErr)
 	}
 }
 
 // TestCaptureAcceptanceVerdict_OversizeLegacy (E64.12 / #3106): with the keyed
 // path ABSENT, a valid-but-oversize LEGACY verdict returns the same non-missing
-// wrapped error, emits acceptance_verdict_oversize, and SURVIVES on disk.
+// wrapped error, emits acceptance_verdict_oversize, and is REMOVED from disk —
+// a DISTINCT removal site from the keyed branch, asserted on committed state.
 func TestCaptureAcceptanceVerdict_OversizeLegacy(t *testing.T) {
 	legacy := filepath.Join(t.TempDir(), "legacy.json")
 	mustWrite(t, legacy, `{"verdict":"passed","notes":"`+oversizePad()+`"}`)
@@ -176,8 +177,86 @@ func TestCaptureAcceptanceVerdict_OversizeLegacy(t *testing.T) {
 	if !slices.Contains(warned, "acceptance_verdict_oversize") {
 		t.Errorf("expected acceptance_verdict_oversize warn, got %v", warned)
 	}
-	if _, statErr := os.Stat(legacy); statErr != nil {
-		t.Errorf("oversize legacy verdict must SURVIVE on disk (sweep owns removal), stat err = %v", statErr)
+	if _, statErr := os.Lstat(legacy); !os.IsNotExist(statErr) {
+		t.Errorf("oversize legacy verdict must be REMOVED, lstat err = %v", statErr)
+	}
+}
+
+// TestCaptureAcceptanceVerdict_OversizeKeyedUnremovable (E64.36 / #3142): an
+// oversize KEYED verdict whose parent directory denies write emits BOTH
+// acceptance_verdict_oversize AND acceptance_verdict_unremovable — the second
+// BESIDE the first, never instead of it — with the unremovable detail naming
+// the keyed path, and the fail-closed error identities unchanged. The bad state
+// is seeded BY CONSTRUCTION (mustDenyParentWrites, which self-SKIPs on a
+// filesystem that does not enforce directory write permission), never by
+// calling the control in the test's own setup.
+func TestCaptureAcceptanceVerdict_OversizeKeyedUnremovable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "verdict.json")
+	mustWrite(t, path, `{"verdict":"passed","notes":"`+oversizePad()+`"}`)
+	mustDenyParentWrites(t, path)
+
+	var events, details []string
+	_, err := captureAcceptanceVerdict(agent.Result{}, path, absentPath(t, "legacy.json"),
+		func(event, detail string) { events = append(events, event); details = append(details, detail) })
+	if err == nil {
+		t.Fatal("expected a non-nil error for an oversize keyed verdict")
+	}
+	if errors.Is(err, errAcceptanceVerdictMissing) {
+		t.Errorf("oversize verdict must NOT be errAcceptanceVerdictMissing, got %v", err)
+	}
+	if !errors.Is(err, errSidecarTooLarge) {
+		t.Errorf("err = %v, want a wrapped errSidecarTooLarge", err)
+	}
+	if !slices.Contains(events, "acceptance_verdict_oversize") {
+		t.Errorf("expected acceptance_verdict_oversize warn, got %v", events)
+	}
+	if !slices.Contains(events, "acceptance_verdict_unremovable") {
+		t.Errorf("a cleanup failure must be surfaced BESIDE the oversize event, got %v", events)
+	}
+	if !slices.ContainsFunc(details, func(d string) bool {
+		return strings.Contains(d, "keyed verdict removal failed") && strings.Contains(d, path)
+	}) {
+		t.Errorf("expected an unremovable detail naming the keyed path %q, got %v", path, details)
+	}
+	if _, statErr := os.Lstat(path); statErr != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, lstat err = %v", statErr)
+	}
+}
+
+// TestCaptureAcceptanceVerdict_OversizeLegacyUnremovable (E64.36 / #3142): the
+// LEGACY branch is a distinct removal site, so it earns its own case. With the
+// keyed path ABSENT, an oversize legacy verdict whose parent denies write emits
+// both events with the unremovable detail naming the LEGACY path.
+func TestCaptureAcceptanceVerdict_OversizeLegacyUnremovable(t *testing.T) {
+	legacy := filepath.Join(t.TempDir(), "legacy.json")
+	mustWrite(t, legacy, `{"verdict":"passed","notes":"`+oversizePad()+`"}`)
+	mustDenyParentWrites(t, legacy)
+
+	var events, details []string
+	_, err := captureAcceptanceVerdict(agent.Result{}, absentPath(t, "keyed.json"), legacy,
+		func(event, detail string) { events = append(events, event); details = append(details, detail) })
+	if err == nil {
+		t.Fatal("expected a non-nil error for an oversize legacy verdict")
+	}
+	if errors.Is(err, errAcceptanceVerdictMissing) {
+		t.Errorf("oversize legacy verdict must NOT be errAcceptanceVerdictMissing, got %v", err)
+	}
+	if !errors.Is(err, errSidecarTooLarge) {
+		t.Errorf("err = %v, want a wrapped errSidecarTooLarge", err)
+	}
+	if !slices.Contains(events, "acceptance_verdict_oversize") {
+		t.Errorf("expected acceptance_verdict_oversize warn, got %v", events)
+	}
+	if !slices.Contains(events, "acceptance_verdict_unremovable") {
+		t.Errorf("a cleanup failure must be surfaced BESIDE the oversize event, got %v", events)
+	}
+	if !slices.ContainsFunc(details, func(d string) bool {
+		return strings.Contains(d, "legacy verdict removal failed") && strings.Contains(d, legacy)
+	}) {
+		t.Errorf("expected an unremovable detail naming the legacy path %q, got %v", legacy, details)
+	}
+	if _, statErr := os.Lstat(legacy); statErr != nil {
+		t.Errorf("fixture invariant: the path was expected to survive, lstat err = %v", statErr)
 	}
 }
 
