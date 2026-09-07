@@ -78,14 +78,16 @@ Two env vars; both honored from the OS environment when the binary launches.
 
 ### Token-resolution ladder ([#2389](https://github.com/kuhlman-labs/fishhawk/issues/2389) / ADR-076)
 
-The bearer is resolved at startup through three rungs, mirroring the CLI:
+The bearer is resolved at startup through three rungs plus a proactive-refresh step, mirroring the CLI:
 
 1. **`FISHHAWK_API_TOKEN` non-empty** → use it; the credential store is not touched at all. This is the rung the **in-runner agent** always hits — the runner stamps the per-run token onto the agent env — so the credstore rung never fires there.
 2. **Env empty** → load the credential stored (via [`credstore`](../../../credstore/README.md)) for the resolved backend URL.
-3. **Nothing usable** → fail at startup, never degrade to an empty bearer that becomes a mid-session 401 storm. Four distinct, precisely-worded errors, each naming the backend URL that was looked up and `fishhawk token login`:
+   - **Proactive refresh ([#2393](https://github.com/kuhlman-labs/fishhawk/issues/2393) / ADR-076).** When the stored credential is refreshable (it carries `refresh_token`, `client_id` and `token_endpoint` — an OAuth credential written by `fishhawk token login --oauth`) and is inside its derived refresh skew (`credstore.NeedsRefresh`: 2 minutes before expiry at the shipped 15-minute access-token TTL, and also when already expired, since the refresh token outlives the access token), the binary runs credstore's locked load → RFC 6749 §6 refresh → store sequence and uses the **refreshed** access token. The rotated refresh token is persisted inside that call — an unpersisted rotation is burned, because the next start would present the consumed token and trip the AS's reuse-detection lineage revocation. The lock and post-lock re-read make a CLI invocation racing this startup rotate at most once between them. A credential outside its skew, a non-refreshable one, or one with a nil `expires_at` is used as-is with no dial.
+3. **Nothing usable** → fail at startup, never degrade to an empty or stale bearer that becomes a mid-session 401 storm. Five distinct, precisely-worded errors, each naming the backend URL that was looked up and `fishhawk token login`:
    - **no credential stored** for the backend URL;
    - a stored credential whose **token is empty** (a truncated store);
-   - an **expired** credential (a non-nil `expires_at` in the past — a **nil** `expires_at` means non-expiring and is accepted, since v0 tokens do not expire);
+   - a credential whose **refresh failed** (the AS's error code, e.g. `invalid_grant`, is carried in the message; the stale bearer is never used — a refresh failure is FATAL);
+   - an **expired** credential that cannot be refreshed (a non-nil `expires_at` in the past on a credential with nothing to refresh with — a **nil** `expires_at` means non-expiring and is accepted, since v0 device-flow tokens do not expire);
    - a **corrupt/unreadable store** (surfaced wrapped, worded distinctly from not-found so a corrupt store is loud rather than silently read as "no credential").
 
 The binary exits non-zero on startup when rung 3 is reached. On the loopback-HTTP transport the per-request bearer clients must send is the **resolved** token — so a credstore-sourced token is what `Authorization: Bearer …` must carry.

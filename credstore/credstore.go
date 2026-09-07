@@ -40,15 +40,109 @@ const (
 var ErrNotFound = errors.New("credstore: no credential for backend URL")
 
 // Credential is the record stored per backend URL. Token is the live
-// bearer secret; the rest are display metadata captured at login so
-// `token list` can show who the token belongs to without a backend
-// round-trip.
+// bearer secret; Subject/Scopes/Provider are display metadata captured
+// at login so `token list` can show who the token belongs to without a
+// backend round-trip.
+//
+// The refresh fields (#2393 / ADR-076) are what let a consumer perform
+// an RFC 6749 §6 refresh on its own: RefreshToken is the rotating
+// secret, ClientID the public OAuth client it was issued to, and
+// TokenEndpoint the AS token endpoint to present it at. IssuedAt lets
+// the proactive-refresh margin be derived from the credential's OWN
+// lifetime (see RefreshSkew). Every one is json-omitempty so a store
+// written before they existed (a device-flow fhk_ credential) still
+// decodes unchanged, and a nil ExpiresAt still means non-expiring.
 type Credential struct {
 	Token     string     `json:"token"`
 	Subject   string     `json:"subject,omitempty"`
 	Scopes    []string   `json:"scopes,omitempty"`
 	Provider  string     `json:"provider,omitempty"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
+	RefreshToken  string     `json:"refresh_token,omitempty"`
+	ClientID      string     `json:"client_id,omitempty"`
+	TokenEndpoint string     `json:"token_endpoint,omitempty"`
+	IssuedAt      *time.Time `json:"issued_at,omitempty"`
+}
+
+// DefaultLifetime is the access-token lifetime assumed when a
+// credential carries an ExpiresAt but no IssuedAt, so its lifetime
+// cannot be measured. It MUST equal the authorization server's shipped
+// default access-token TTL (backend/internal/server
+// defaultOAuthAccessTokenTTL); the cross-module pin
+// backend/internal/server/oauthttlskew_test.go fails if the two drift.
+const DefaultLifetime = 15 * time.Minute
+
+// minRefreshSkew floors the proactive-refresh margin so a very short
+// TTL can never leave a margin thinner than one refresh round-trip.
+const minRefreshSkew = 30 * time.Second
+
+// RefreshSkew returns the proactive-refresh margin for a credential of
+// the given lifetime: refresh once the credential is within this much
+// of its expiry. It is DERIVED from the lifetime rather than fixed —
+// lifetime*2/15, which is exactly 2 minutes at the shipped 15-minute
+// default — floored at 30s (a margin thinner than a refresh round-trip
+// would expire the token mid-refresh) and capped at lifetime/2 (the
+// floor must never exceed the credential's own life, or a very short
+// token would be "always refreshing"). A non-positive lifetime has no
+// margin and returns 0.
+func RefreshSkew(lifetime time.Duration) time.Duration {
+	if lifetime <= 0 {
+		return 0
+	}
+	skew := lifetime * 2 / 15
+	if skew < minRefreshSkew {
+		skew = minRefreshSkew
+	}
+	if half := lifetime / 2; skew > half {
+		skew = half
+	}
+	return skew
+}
+
+// Refreshable reports whether the credential carries everything an
+// RFC 6749 §6 refresh needs: a refresh token, the public client it was
+// issued to, and the token endpoint to present it at. A device-flow
+// fhk_ credential carries none of these and is never refreshable.
+func (c Credential) Refreshable() bool {
+	return c.RefreshToken != "" && c.ClientID != "" && c.TokenEndpoint != ""
+}
+
+// Lifetime returns the credential's access-token lifetime: ExpiresAt
+// minus IssuedAt when both are known, DefaultLifetime when only the
+// expiry is known, and 0 for a non-expiring credential.
+func (c Credential) Lifetime() time.Duration {
+	if c.ExpiresAt == nil {
+		return 0
+	}
+	if c.IssuedAt == nil {
+		return DefaultLifetime
+	}
+	return c.ExpiresAt.Sub(*c.IssuedAt)
+}
+
+// Expired reports whether the credential's access token is past its
+// expiry at now. A nil ExpiresAt is non-expiring and never expired.
+func (c Credential) Expired(now time.Time) bool {
+	return c.ExpiresAt != nil && !now.Before(*c.ExpiresAt)
+}
+
+// NeedsRefresh reports whether a consumer should refresh c before
+// using it at now: false for a non-expiring credential (nil
+// ExpiresAt), false when there is nothing to refresh WITH (see
+// Refreshable — an fhk_ credential must never be presented at a token
+// endpoint it does not have), otherwise true once now is within
+// RefreshSkew(Lifetime()) of ExpiresAt. An already-expired refreshable
+// credential also needs refresh: the refresh token outlives the access
+// token, so the right move is to refresh, not to fail.
+func NeedsRefresh(c Credential, now time.Time) bool {
+	if c.ExpiresAt == nil {
+		return false
+	}
+	if !c.Refreshable() {
+		return false
+	}
+	return !now.Before(c.ExpiresAt.Add(-RefreshSkew(c.Lifetime())))
 }
 
 // configDir returns the fishhawk config directory, honoring
