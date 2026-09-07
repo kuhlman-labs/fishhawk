@@ -2111,6 +2111,12 @@ components:
         `run_auto_advanced` audit entry: the named rule that fired and
         the from/to edge it stamps. Rule names are a closed set
         (`backend/internal/drive`): `plan_approved_dispatch`,
+        `plan_approved_human_gate` (the plan-approved successor rule for a
+        workflow that declares NO implement stage, #3014: the run advanced
+        to its human-executor review gate, so the entry names the
+        `plan:approved` -> `review:awaiting_approval` edge, is parked, and
+        carries no `next_action` — the gate is approved by a human-held
+        credential through the `fishhawk approve-review-gate` CLI verb),
         `revise_replan` (a plan-gate revise re-opened the plan stage,
         #1256), `retry_reopen` (a failed stage was retried back into
         pending and re-dispatched, #1271), `recover_redispatch` (a failed

@@ -44,6 +44,26 @@ const (
 	// where the runner is host-spawned per ADR-024 and the backend has
 	// no execution channel to it).
 	RulePlanApprovedDispatch Rule = "plan_approved_dispatch"
+	// RulePlanApprovedHumanGate covers the SAME plan-gate approval on a
+	// workflow that declares NO implement stage (backlog_grooming, #3014),
+	// whose declared successor is a human-executor review gate: the audit
+	// entry names the real plan:approved → review:awaiting_approval edge
+	// instead of synthesizing a transition to an implement stage the run
+	// does not have. It carries NO NextAction, deliberately: the gate is
+	// approved by a HUMAN-held operator credential through the CLI verb
+	// (`fishhawk approve-review-gate <run-id> --attest "..."`, E54.55 /
+	// #3051) rather than by a host dispatch the operator could run — a
+	// delegated operator-agent token is refused 403
+	// operator_agent_forbidden by design. The MCP next-actions classifier
+	// owns the richer operator-facing entry for this shape
+	// (human_review_gate_parked), so stamping a drive next_action here
+	// would only duplicate it.
+	//
+	// The identifier is deliberately Rule* and not category* so
+	// backend/internal/audit's completeness scanner does not read it as a
+	// new audit-category emission: the audit category for this entry stays
+	// drive.Category (run_auto_advanced), exactly like every rule above.
+	RulePlanApprovedHumanGate Rule = "plan_approved_human_gate"
 	// RuleReviseReplan covers the plan-gate revise verdict re-opening the
 	// plan stage (awaiting_approval → pending) for a re-plan in place. Like
 	// RulePlanApprovedDispatch it is mechanical: the operator already
@@ -179,6 +199,7 @@ const (
 // auto-advance under drive; false rules always park for the operator.
 var mechanical = map[Rule]bool{
 	RulePlanApprovedDispatch:     true,
+	RulePlanApprovedHumanGate:    true,
 	RuleReviseReplan:             true,
 	RuleRetryReopen:              true,
 	RuleRecoverRedispatch:        true,

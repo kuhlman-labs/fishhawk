@@ -2485,9 +2485,26 @@ func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Ent
 // SUPPRESSES (returns true) when the named stage exists and its state is outside
 // the host-spawnable set {pending, awaiting_host_dispatch} — i.e.
 // dispatched/running/terminal. Every other action (await_acceptance, merge_pr,
-// classify_ci_failure, fishhawk_approve_deploy, read_acceptance_*), a not-found
-// stage, and a nil stage list are never suppressed (fail toward surfacing); a
-// retried stage re-opened to pending naturally re-surfaces the action.
+// classify_ci_failure, fishhawk_approve_deploy, read_acceptance_*) is never
+// suppressed; a retried stage re-opened to pending naturally re-surfaces the
+// action.
+//
+// The NO-MATCHING-ROW fall-through splits on whether the stage list carries any
+// evidence at all (#3014), and the two branches point OPPOSITE ways on purpose:
+//
+//   - A NON-EMPTY list with no stage of the named type is positive evidence
+//     that this workflow DECLARES no such stage — the backlog_grooming shape,
+//     whose run rows are materialized one-per-declared-spec-stage at
+//     run-create. Naming a host dispatch of a stage the run will never have is
+//     never actionable, so it is SUPPRESSED. This is what makes the two
+//     grooming runs already carrying a historical run_implement_stage stamp
+//     (1499bdb0, 7bd6c6d3) read correctly — the emission-side fix cannot
+//     retroactively repair an entry already written.
+//   - A NIL or EMPTY list is NOT evidence about the workflow's shape: it is the
+//     caller's documented read-error degrade (applyDriveSurfaces and
+//     stageNextAction both pass nil when ListStagesForRun errors). It keeps
+//     failing OPEN toward surfacing, so a degraded read never silently hides a
+//     dispatch the operator genuinely owes.
 func nextActionStale(action string, stages []*run.Stage) bool {
 	var wantType run.StageType
 	switch action {
@@ -2509,7 +2526,10 @@ func nextActionStale(action string, stages []*run.Stage) bool {
 			return true // advanced past the spawnable states → the recorded action is stale
 		}
 	}
-	return false // no matching stage row → fail toward surfacing
+	if len(stages) == 0 {
+		return false // no evidence (read-error degrade) → fail toward surfacing
+	}
+	return true // the run declares no stage of this type → the action names a stage that will never exist
 }
 
 const (

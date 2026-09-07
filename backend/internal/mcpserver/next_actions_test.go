@@ -2,7 +2,10 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -4318,4 +4321,202 @@ func TestFoldAcceptanceRedispatchAdvisory_NoOps(t *testing.T) {
 			t.Fatalf("fold mutated na on a nil run: %+v", na)
 		}
 	})
+}
+
+// --- human review-gate arm (E54.52 / #3014) ---------------------------------
+
+// humanReviewGateWire is the shared cross-boundary wire fixture, decoded
+// through the REAL MCP wire types. The bytes are the backend's own serialized
+// GET /v0/runs/{id} and GET /v0/runs/{id}/stages bodies —
+// server.TestGetRun_HumanReviewGate_MatchesWireFixture asserts the file IS what
+// the handlers emit — so a json-tag rename or drop on EITHER side reddens the
+// pair: the server test if the backend drifts, these tests if Run / Stage /
+// StageExecutor drift (executor.kind decoding to "" makes the arm return nil,
+// which is the whole classification).
+func humanReviewGateWire(t *testing.T) (*Run, []Stage) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "server", "testdata", "human_review_gate_wire.json"))
+	if err != nil {
+		t.Fatalf("read shared wire fixture: %v", err)
+	}
+	var fixture struct {
+		Run    Run `json:"run"`
+		Stages struct {
+			Items []Stage `json:"items"`
+		} `json:"stages"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("decode shared wire fixture through the MCP wire types: %v", err)
+	}
+	if fixture.Run.ID == "" || len(fixture.Stages.Items) != 2 {
+		t.Fatalf("fixture decoded to run %q with %d stages, want a run id and 2 stages — a json-tag drift on either side of the wire",
+			fixture.Run.ID, len(fixture.Stages.Items))
+	}
+	return &fixture.Run, fixture.Stages.Items
+}
+
+// TestNextActions_HumanReviewGateParked is the headline #3014 behaviour, driven
+// off the SERVER'S OWN serialized bytes rather than a hand-built mirror of them
+// (approval condition 3): a backlog_grooming run past its plan gate and parked
+// at the human `confirm` gate classifies as human_review_gate_parked — NOT
+// unclassified, the issue's first acceptance criterion — naming the review
+// stage's id and the CLI verb, and naming NO implement dispatch.
+//
+// COUNTERFACTUAL (executed, #3014): deleting the humanReviewGateNextActions arm
+// from classifyNextActions turns this RED with
+// `State = "unclassified", want human_review_gate_parked`. Restored
+// byte-identically afterwards.
+func TestNextActions_HumanReviewGateParked(t *testing.T) {
+	run, stages := humanReviewGateWire(t)
+	review := stageByType(stages, "review")
+	if review == nil || review.Executor.Kind != "human" {
+		t.Fatalf("fixture review stage = %+v, want executor.kind human (a wire drift breaks the pairing)", review)
+	}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if na.State == "unclassified" {
+		t.Fatalf("state = unclassified — the classifier still has no arm for the grooming confirm gate (#3014)")
+	}
+	if na.State != "human_review_gate_parked" {
+		t.Fatalf("state = %q, want human_review_gate_parked", na.State)
+	}
+	if len(na.Actions) == 0 {
+		t.Fatal("actions = 0, want the approve_review_gate entry first")
+	}
+	first := na.Actions[0]
+	if first.Action != "approve_review_gate" {
+		t.Errorf("actions[0].action = %q, want approve_review_gate", first.Action)
+	}
+	if first.Params["stage_id"] != review.ID {
+		t.Errorf("actions[0].params[stage_id] = %q, want the review stage id %q", first.Params["stage_id"], review.ID)
+	}
+	if first.Consumes != consumesApprovalSlot {
+		t.Errorf("actions[0].consumes = %q, want %q", first.Consumes, consumesApprovalSlot)
+	}
+	if !strings.Contains(first.Reason, "fishhawk approve-review-gate") {
+		t.Errorf("actions[0].reason = %q, want it to name the CLI verb `fishhawk approve-review-gate`", first.Reason)
+	}
+	if !strings.Contains(first.Precondition, "operator_agent_forbidden") {
+		t.Errorf("actions[0].precondition = %q, want it to name the 403 operator_agent_forbidden refusal", first.Precondition)
+	}
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_run_stage" || a.Action == "fishhawk_dispatch_stage" {
+			t.Errorf("action %q offered on a run that declares no implement stage", a.Action)
+		}
+		if strings.Contains(a.Params["stage_type"], "implement") {
+			t.Errorf("action %+v names an implement stage the workflow does not declare", a)
+		}
+	}
+}
+
+// TestHumanReviewGateNextActions_ImplementRow_ReturnsNil is the DIRECT unit the
+// impl == nil guard's deletion must redden (binding approval condition 2). It
+// calls humanReviewGateNextActions itself rather than the classifier, because
+// through nextActionsFor the implement arm runs FIRST and owns this fixture —
+// so the classifier-level test below cannot serve as that counterfactual
+// vehicle.
+//
+// COUNTERFACTUAL (executed, #3014): deleting the `if stageByType(stages,
+// "implement") != nil { return nil }` guard turns this RED with
+// `humanReviewGateNextActions = &{human_review_gate_parked ...}, want nil`.
+// Restored byte-identically afterwards.
+func TestHumanReviewGateNextActions_ImplementRow_ReturnsNil(t *testing.T) {
+	run := naRun("running")
+	stages := []Stage{
+		naStage("plan", "succeeded"),
+		naStage("implement", "succeeded"),
+		{ID: uuid.NewString(), Type: "review", State: "awaiting_approval", Executor: StageExecutor{Kind: "human"}},
+	}
+	if got := humanReviewGateNextActions(run, stages); got != nil {
+		t.Errorf("humanReviewGateNextActions = %+v, want nil: a run WITH an implement stage is implementStageNextActions' shape", got)
+	}
+}
+
+// TestNextActions_HumanReviewGate_FeatureChangeUnaffected is the ORDERING guard
+// (kept alongside the direct unit above, per approval condition 2): the same
+// human review row WITH a succeeded implement stage still classifies through
+// implementStageNextActions exactly as it did before this arm existed.
+func TestNextActions_HumanReviewGate_FeatureChangeUnaffected(t *testing.T) {
+	run := naRun("running")
+	stages := []Stage{
+		naStage("plan", "succeeded"),
+		naStage("implement", "succeeded"),
+		{ID: uuid.NewString(), Type: "review", State: "awaiting_approval", Executor: StageExecutor{Kind: "human"}},
+	}
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if na.State == "human_review_gate_parked" {
+		t.Fatalf("state = human_review_gate_parked — the new arm hijacked feature_change's post-implement review gate, which implementStageNextActions owns")
+	}
+}
+
+// TestNextActions_HumanReviewGate_PRManagedNotClassified pins the
+// no-pull_request_url guard: the SAME shape carrying a PR is ADR-018
+// PR-merge-managed, where approve-review-gate would be refused 409
+// review_stage_managed_by_github / pull_request_managed — so the arm declines
+// and the run falls through rather than naming a call the backend refuses.
+//
+// COUNTERFACTUAL (executed, #3014): deleting the PullRequestURL guard turns
+// this RED with `state = human_review_gate_parked, want the arm to decline on a
+// PR-managed review gate`. Restored byte-identically afterwards.
+func TestNextActions_HumanReviewGate_PRManagedNotClassified(t *testing.T) {
+	run, stages := humanReviewGateWire(t)
+	pr := "https://github.com/x/y/pull/7"
+	run.PullRequestURL = &pr
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if na.State == "human_review_gate_parked" {
+		t.Errorf("state = human_review_gate_parked, want the arm to decline on a PR-managed review gate")
+	}
+	for _, a := range na.Actions {
+		if a.Action == "approve_review_gate" {
+			t.Errorf("approve_review_gate offered on a PR-managed gate the backend refuses 409 pull_request_managed")
+		}
+	}
+}
+
+// TestNextActions_HumanReviewGate_AgentExecutorNotClassified pins the
+// Executor.Kind == "human" check: an AGENT-executor review stage is not a human
+// gate and there is nothing for the operator to attest to.
+//
+// COUNTERFACTUAL (executed, #3014): deleting the Executor.Kind check turns this
+// RED with `state = human_review_gate_parked, want the arm to decline on an
+// agent-executor review stage`. Restored byte-identically afterwards.
+func TestNextActions_HumanReviewGate_AgentExecutorNotClassified(t *testing.T) {
+	run, stages := humanReviewGateWire(t)
+	for i := range stages {
+		if stages[i].Type == "review" {
+			stages[i].Executor = StageExecutor{Kind: "agent", Ref: "claude-code"}
+		}
+	}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if na.State == "human_review_gate_parked" {
+		t.Errorf("state = human_review_gate_parked, want the arm to decline on an agent-executor review stage")
+	}
+}
+
+// TestHumanReviewGateNextActions_ReviewStateGuard pins the last guard: a review
+// stage that is NOT parked at awaiting_approval (still pending) is not a gate
+// the operator can approve yet.
+func TestHumanReviewGateNextActions_ReviewStateGuard(t *testing.T) {
+	run := naRun("running")
+	for _, state := range []string{"pending", "succeeded"} {
+		t.Run(state, func(t *testing.T) {
+			stages := []Stage{
+				naStage("plan", "succeeded"),
+				{ID: uuid.NewString(), Type: "review", State: state, Executor: StageExecutor{Kind: "human"}},
+			}
+			if got := humanReviewGateNextActions(run, stages); got != nil {
+				t.Errorf("humanReviewGateNextActions = %+v, want nil for a review stage in %q", got, state)
+			}
+		})
+	}
+}
+
+// TestHumanReviewGateNextActions_NoReviewRow_ReturnsNil: a run with neither an
+// implement stage nor a review stage has no gate to name.
+func TestHumanReviewGateNextActions_NoReviewRow_ReturnsNil(t *testing.T) {
+	if got := humanReviewGateNextActions(naRun("running"), []Stage{naStage("plan", "succeeded")}); got != nil {
+		t.Errorf("humanReviewGateNextActions = %+v, want nil with no review row", got)
+	}
 }

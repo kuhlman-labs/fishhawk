@@ -6617,6 +6617,56 @@ func TestGetRunStatus_StageWaitStatus_RunTerminalBackstop(t *testing.T) {
 }
 
 // TestGetRunStatus_DriveStatus_PropagatesEndToEnd drives the full
+// TestGetRunStatus_DriveStatus_HumanGateRuleDecodes is the #3014 twin of the
+// seam test below, for the shape that carries NO next_action: a
+// backlog_grooming run whose plan gate stamped plan_approved_human_gate
+// propagates the rule and the real review:awaiting_approval edge through the
+// runDriveView decode, and drive_status.next_action stays nil — the drive fold
+// therefore contributes nothing to next_actions, which is what lets the
+// classifier's human_review_gate_parked arm own the operator-facing entry with
+// no de-duplication logic. It also pins that the RunAutoAdvance.rule schema
+// description NAMES the new rule, since that description is the closed set an
+// agent reads to know what a rule value can be.
+func TestGetRunStatus_DriveStatus_HumanGateRuleDecodes(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.getRunExtraByID[runID] = map[string]any{
+		"drive": true,
+		"auto_advanced": []map[string]any{
+			{"rule": "plan_approved_human_gate", "from": "plan:approved", "to": "review:awaiting_approval", "parked": true, "ts": "2026-06-12T10:00:00Z"},
+		},
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	ds := out.DriveStatus
+	if ds == nil || len(ds.AutoAdvanced) != 1 {
+		t.Fatalf("drive_status = %+v, want one auto_advanced entry", ds)
+	}
+	adv := ds.AutoAdvanced[0]
+	if adv.Rule != "plan_approved_human_gate" {
+		t.Errorf("auto_advanced[0].rule = %q, want plan_approved_human_gate", adv.Rule)
+	}
+	if adv.To != "review:awaiting_approval" || !adv.Parked {
+		t.Errorf("auto_advanced[0] = %+v, want the parked review:awaiting_approval edge", adv)
+	}
+	if ds.NextAction != nil {
+		t.Errorf("drive_status.next_action = %+v, want nil: the human gate stamps none, so the fold contributes nothing", ds.NextAction)
+	}
+
+	field, ok := reflect.TypeOf(RunAutoAdvance{}).FieldByName("Rule")
+	if !ok {
+		t.Fatal("RunAutoAdvance has no Rule field")
+	}
+	if desc := field.Tag.Get("jsonschema"); !strings.Contains(desc, "plan_approved_human_gate") {
+		t.Errorf("RunAutoAdvance.Rule jsonschema description = %q, want it to name plan_approved_human_gate", desc)
+	}
+}
+
 // getRunStatus handler against the fake backend to cover the
 // cross-layer seam (#1023, cf. #618): backend drive read surfaces
 // (drive / derived_status / next_action / auto_advanced on

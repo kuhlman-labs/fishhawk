@@ -1,0 +1,95 @@
+{
+  "run": {
+    "auto_advanced": [
+      {
+        "from": "plan:approved",
+        "parked": true,
+        "rule": "plan_approved_human_gate",
+        "to": "review:awaiting_approval",
+        "ts": "2026-01-01T00:00:00Z"
+      }
+    ],
+    "completion_blocked": {
+      "reason": "the run cannot complete while stage review is parked at \"awaiting_approval\", and this run's pull request is not observably merged, so no reconcile applies yet",
+      "recovery": "none",
+      "stage_id": "00000000-0000-0000-0000-000000000003",
+      "stage_state": "awaiting_approval",
+      "stage_type": "review"
+    },
+    "cost_usd_total": 0,
+    "created_at": "2026-01-01T00:00:00Z",
+    "drive": true,
+    "id": "00000000-0000-0000-0000-000000000001",
+    "lineage_complete": false,
+    "max_retries_snapshot": 1,
+    "repo": "x/y",
+    "resolved_model": "",
+    "retry_attempt": 0,
+    "runner_kind": "local",
+    "runner_kind_resolved": false,
+    "state": "running",
+    "trigger_ref": null,
+    "trigger_source": "cli",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "workflow_id": "backlog_grooming",
+    "workflow_sha": "abc"
+  },
+  "stages": {
+    "items": [
+      {
+        "agent_timeout_seconds": 900,
+        "created_at": "2026-01-01T00:00:00Z",
+        "ended_at": null,
+        "executor": {
+          "kind": "agent",
+          "ref": "claude-code"
+        },
+        "failure_category": null,
+        "failure_reason": null,
+        "gate": {
+          "approvers": {
+            "any_of": [
+              "operator"
+            ]
+          },
+          "type": "approval"
+        },
+        "id": "00000000-0000-0000-0000-000000000002",
+        "resolved_model": "",
+        "run_id": "00000000-0000-0000-0000-000000000001",
+        "sequence": 0,
+        "started_at": null,
+        "state": "succeeded",
+        "type": "plan",
+        "updated_at": "2026-01-01T00:00:00Z"
+      },
+      {
+        "agent_timeout_seconds": 900,
+        "created_at": "2026-01-01T00:00:00Z",
+        "ended_at": null,
+        "executor": {
+          "kind": "human",
+          "ref": "human"
+        },
+        "failure_category": null,
+        "failure_reason": null,
+        "gate": {
+          "approvers": {
+            "any_of": [
+              "operator"
+            ]
+          },
+          "type": "approval"
+        },
+        "id": "00000000-0000-0000-0000-000000000003",
+        "resolved_model": "",
+        "run_id": "00000000-0000-0000-0000-000000000001",
+        "sequence": 1,
+        "started_at": null,
+        "state": "awaiting_approval",
+        "type": "review",
+        "updated_at": "2026-01-01T00:00:00Z"
+      }
+    ]
+  }
+}
