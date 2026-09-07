@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1007,6 +1009,107 @@ func TestTokenLogin_HelpDescribesDeviceFlow(t *testing.T) {
 			if !strings.Contains(out, want) {
 				t.Errorf("%s: help missing %q:\n%s", arg, want, out)
 			}
+		}
+	}
+}
+
+// neverDialedBackend is an httptest server that counts EVERY request,
+// so a refusal that must happen "before any dial" is provable.
+func neverDialedBackend(t *testing.T) (*httptest.Server, *int32) {
+	t.Helper()
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &calls
+}
+
+// TestTokenLogin_OAuthRefusesDeviceFlowFlags pins the flag-combination
+// refusal: --oauth with an explicitly set --provider or --client-id is a
+// usage error naming the offending flag, and NOTHING is dialed.
+func TestTokenLogin_OAuthRefusesDeviceFlowFlags(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FISHHAWK_OAUTH_CLIENT_ID", "")
+	srv, calls := neverDialedBackend(t)
+	prev := oauthOpenBrowser
+	oauthOpenBrowser = func(string) error { t.Error("browser launched despite a refused flag combination"); return nil }
+	t.Cleanup(func() { oauthOpenBrowser = prev })
+
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"provider", []string{"--oauth", "--provider", "gitlab"}, "--provider"},
+		{"provider-default-value-still-explicit", []string{"--oauth", "--provider", "github"}, "--provider"},
+		{"client-id", []string{"--oauth", "--client-id", "Iv1.device"}, "--client-id"},
+		{"oauth-client-id-without-oauth", []string{"--oauth-client-id", "fishhawk-cli"}, "--oauth-client-id only applies with --oauth"},
+		{"empty-oauth-client-id", []string{"--oauth", "--oauth-client-id", "  "}, "--oauth-client-id must not be empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr strings.Builder
+			args := append([]string{"login", "--backend-url", srv.URL}, tc.args...)
+			got := runToken(args, &stdout, &stderr)
+			if got != exitUsage {
+				t.Fatalf("exit=%d, want exitUsage\nstderr=%s", got, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Errorf("stderr does not name %q:\n%s", tc.want, stderr.String())
+			}
+		})
+	}
+	if n := atomic.LoadInt32(calls); n != 0 {
+		t.Errorf("backend dialed %d times across refused flag combinations, want 0", n)
+	}
+}
+
+// TestTokenLogin_OAuthClientIDEnvDefaultIsNotAConflict pins that the
+// device-flow --client-id's FISHHAWK_OAUTH_CLIENT_ID env default does not
+// count as an explicit flag, so an operator with that env set can still
+// run --oauth.
+func TestTokenLogin_OAuthClientIDEnvDefaultIsNotAConflict(t *testing.T) {
+	t.Setenv("FISHHAWK_OAUTH_CLIENT_ID", "Iv1.device-from-env")
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	fs.String("provider", "github", "")
+	fs.String("client-id", envOr("FISHHAWK_OAUTH_CLIENT_ID", ""), "")
+	fs.Bool("oauth", false, "")
+	fs.String("oauth-client-id", defaultOAuthClientID, "")
+	if err := fs.Parse([]string{"--oauth"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkOAuthFlagCombination(fs, true); err != nil {
+		t.Errorf("env-defaulted --client-id counted as a conflict: %v", err)
+	}
+}
+
+func TestTokenLogin_DeviceFlowUnchangedWithoutOAuthFlag(t *testing.T) {
+	// The default path must remain the device flow byte-for-byte: with
+	// --oauth absent, no AS discovery document is ever fetched.
+	ts := newTokenTestServer(t)
+	setupTokenTest(t, ts)
+	prev := oauthOpenBrowser
+	oauthOpenBrowser = func(string) error { t.Error("OAuth browser flow launched without --oauth"); return nil }
+	t.Cleanup(func() { oauthOpenBrowser = prev })
+	var stdout, stderr strings.Builder
+	if got := runToken([]string{"login", "--backend-url", ts.srv.URL}, &stdout, &stderr); got != exitOK {
+		t.Fatalf("exit=%d: %s", got, stderr.String())
+	}
+	if len(ts.mintRequests) != 1 {
+		t.Errorf("device-flow mint requests = %d, want 1", len(ts.mintRequests))
+	}
+}
+
+func TestTokenLogin_HelpDescribesOAuthPath(t *testing.T) {
+	var stdout, stderr strings.Builder
+	if got := runToken([]string{"login", "-h"}, &stdout, &stderr); got != exitOK {
+		t.Fatalf("exit=%d, want 0", got)
+	}
+	for _, want := range []string{"--oauth", "-oauth-client-id", "fishhawkd oauth client register", "loopback"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("help lacks %q:\n%s", want, stderr.String())
 		}
 	}
 }

@@ -45,7 +45,7 @@ Every command below is rendered from the `cli/internal/cmdinfo` inventory, which
 | `fishhawk plan approve` | `<run-id>` | Approve the plan stage on a run. |
 | `fishhawk plan reject` | `<run-id>` | Reject the plan stage on a run (category-D failure). |
 | `fishhawk plan revise` | `<run-id>` | Force a constrained replan pass. |
-| `fishhawk token login` | — | Log in via the OAuth device flow; mint + store a user-bound token. |
+| `fishhawk token login` | — | Log in via the OAuth device flow, or --oauth for the OAuth 2.1 browser flow; mint + store a user-bound token. |
 | `fishhawk token list` | — | List locally stored credentials (per backend URL). |
 | `fishhawk deploy status` | `<run-id>` | Show the deploy stage state and the deployment artifact. |
 | `fishhawk deploy approve` | `<run-id>` | Approve the deploy stage's pre-execution gate (needs write:deploy). |
@@ -115,7 +115,7 @@ Flags: `--backend-url`, `--token`, `--timeout`, `--constraint`, `--force`, `--ou
 
 #### `fishhawk token login`
 
-Flags: `--backend-url`, `--token`, `--timeout`, `--provider`, `--client-id`
+Flags: `--backend-url`, `--token`, `--timeout`, `--provider`, `--client-id`, `--oauth`, `--oauth-client-id`
 
 #### `fishhawk token list`
 

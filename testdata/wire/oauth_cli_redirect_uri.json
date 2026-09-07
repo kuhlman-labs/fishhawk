@@ -1,0 +1,15 @@
+{
+  "description": "The redirect_uri shape `fishhawk token login --oauth` generates (cli/cmd/fishhawk/oauthlogin.go loopbackRedirectURI) and the PORTLESS loopback URI the operator registers for it. Shared across modules (E66.5 / #2393, approval condition 4): the CLI test asserts it GENERATES this shape and that cli/README.md documents this register command; the backend test drives the shape through oauthas.MatchRedirectURI / ResolveRedirectURI so the RFC 8252 §7.3 port relaxation is proven on the matcher that actually runs, without the CLI module importing backend internals.",
+  "host": "127.0.0.1",
+  "path": "/callback",
+  "registered_redirect_uri": "http://127.0.0.1/callback",
+  "generated_redirect_uri_template": "http://127.0.0.1:{port}/callback",
+  "sample_ports": [1024, 3118, 51000, 65535],
+  "refused_variants": [
+    "http://0.0.0.0:3118/callback",
+    "http://localhost:3118/callback",
+    "http://127.0.0.1:3118/callback/",
+    "https://127.0.0.1:3118/callback"
+  ],
+  "register_command": "fishhawkd oauth client register --client-id fishhawk-cli --redirect-uri http://127.0.0.1/callback --token-endpoint-auth-method none --grant-type authorization_code --grant-type refresh_token"
+}
