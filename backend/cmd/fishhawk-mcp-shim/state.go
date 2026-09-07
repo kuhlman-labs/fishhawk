@@ -69,6 +69,13 @@ type swapState struct {
 	HandshakePresumed bool `json:"handshake_presumed"`
 	ServedResults     int  `json:"served_results"`
 
+	// SessionProtocol is "legacy" (initialize handshake, replayed on swap) or
+	// "stateless" (SEP-2575 / 2026-07-28, re-subscribed on swap). ListenStreamID
+	// is the raw JSON-RPC id of the client's subscriptions/listen stream, or ""
+	// when none was opened (#2460). Both are additive on schema v1.
+	SessionProtocol string `json:"session_protocol"`
+	ListenStreamID  string `json:"listen_stream_id"`
+
 	InFlight            int    `json:"in_flight"`
 	OldestInFlightID    string `json:"oldest_in_flight_id"`
 	OldestInFlightSince string `json:"oldest_in_flight_since"`
@@ -381,8 +388,8 @@ func renderStatus(w, errw io.Writer, dir string, staleOnly bool, grace time.Dura
 // writeStateBlock renders one snapshot as an operator-readable block. Every
 // field the issue's AC2 names is present: the verdict, both pids, the child
 // path, both hashes, how long the swap has been pending, the handshake status,
-// served-result evidence, in-flight pressure, and the last swap attempt with
-// its outcome.
+// served-result evidence, the session protocol and listen stream id (#2460),
+// in-flight pressure, and the last swap attempt with its outcome.
 func writeStateBlock(w io.Writer, st swapState, verdict stateVerdict, onDiskHash []byte, now time.Time) {
 	handshake := "NEVER OBSERVED"
 	switch {
@@ -396,6 +403,7 @@ func writeStateBlock(w io.Writer, st swapState, verdict stateVerdict, onDiskHash
 	_, _ = fmt.Fprintf(w, "  baseline hash %s  on-disk hash %s\n", shortHash(st.ChildLaunchHash), shortHash(hex.EncodeToString(onDiskHash)))
 	_, _ = fmt.Fprintf(w, "  pending swap hash %s  pending for %s\n", shortHash(st.PendingSwapHash), pendingAge(st.PendingSince, now))
 	_, _ = fmt.Fprintf(w, "  handshake %s  served results %d\n", handshake, st.ServedResults)
+	_, _ = fmt.Fprintf(w, "  session protocol %s  listen stream id %s\n", orNone(st.SessionProtocol), orNone(st.ListenStreamID))
 	_, _ = fmt.Fprintf(w, "  in-flight %d  oldest in-flight id %s age %s\n",
 		st.InFlight, orNone(st.OldestInFlightID), pendingAge(st.OldestInFlightSince, now))
 	_, _ = fmt.Fprintf(w, "  last swap at %s  outcome %s  (snapshot %s)\n",

@@ -607,3 +607,101 @@ func TestWriteStateFailsWhenDirUnusable(t *testing.T) {
 	// removeState is best-effort: an absent file is not an error and must not panic.
 	removeState(filepath.Join(base, "nope"), 7)
 }
+
+// --- #2460: session protocol + listen stream id reach the operator ---
+
+// TestRenderStatusNamesSessionProtocolAndListenStream pins the render of the
+// two additive v1 fields: a stateless fixture names both values, and a legacy
+// snapshot written before the fields existed renders them as (none) rather
+// than an empty column.
+func TestRenderStatusNamesSessionProtocolAndListenStream(t *testing.T) {
+	dir := t.TempDir()
+	st := staleFixture(t, dir, "child")
+	st.SessionProtocol = sessionProtocolStateless
+	st.ListenStreamID = `"sub-7"`
+	stateDir := filepath.Join(dir, "state")
+	writeStateFile(t, stateDir, stateName(st.ShimPid), st)
+
+	var out, errOut bytes.Buffer
+	renderStatus(&out, &errOut, stateDir, false, time.Minute, time.Now)
+	for _, want := range []string{"session protocol stateless", `listen stream id "sub-7"`} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("status output missing %q\n---\n%s", want, out.String())
+		}
+	}
+
+	// A pre-#2460 snapshot carries neither field.
+	old := staleFixture(t, dir, "old")
+	stateDir = filepath.Join(dir, "state-old")
+	writeStateFile(t, stateDir, stateName(old.ShimPid), old)
+	out.Reset()
+	renderStatus(&out, &errOut, stateDir, false, time.Minute, time.Now)
+	if !strings.Contains(out.String(), "session protocol (none)  listen stream id (none)") {
+		t.Fatalf("absent fields must render as (none):\n%s", out.String())
+	}
+}
+
+// TestStatelessSessionValuesRenderFromTheWire is the DATA-PATH test approval
+// condition 2 names: a stateless session's request-derived values (the
+// protocol version stamped in _meta, the listen request's id) are driven
+// through the supervisor's state, the published snapshot, the on-disk
+// serialization and the rendered status output, and the rendered values are
+// asserted equal to what was observed on the wire. The listen id is a STRING
+// id so the raw-token rendering (quotes included) is pinned end to end.
+func TestStatelessSessionValuesRenderFromTheWire(t *testing.T) {
+	const (
+		wireVersion  = "2026-07-28"
+		wireListenID = `"sub-7"`
+	)
+	child0 := newFake("A", false)
+	h := newHarness(t, child0)
+	h.start()
+	h.send(`{"jsonrpc":"2.0","method":"server/discover","id":1,"params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"` + wireVersion + `"}}}`)
+	h.send(`{"jsonrpc":"2.0","method":"subscriptions/listen","id":` + wireListenID + `,"params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"` + wireVersion + `"}}}`)
+	h.barrier()
+	h.pollTick() // publishes a snapshot through the real tick path
+
+	// 1. Supervisor state → published snapshot.
+	st := h.pub.waitFor(t, "a stateless snapshot", func(st swapState) bool {
+		return st.SessionProtocol == sessionProtocolStateless
+	})
+	if !isStatelessVersion(wireVersion) || st.SessionProtocol != sessionProtocolStateless {
+		t.Fatalf("published session_protocol = %q for wire version %q", st.SessionProtocol, wireVersion)
+	}
+	if st.ListenStreamID != wireListenID {
+		t.Fatalf("published listen_stream_id = %q, want the wire id %q", st.ListenStreamID, wireListenID)
+	}
+
+	// 2. Snapshot → on-disk serialization, read back by field NAME (the shell
+	// reader greps these names, so the tag spelling is part of the contract).
+	stateDir := filepath.Join(t.TempDir(), "state")
+	if err := writeState(stateDir, st); err != nil {
+		t.Fatalf("writeState: %v", err)
+	}
+	raw, err := os.ReadFile(stateFilePath(stateDir, st.ShimPid))
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &doc); err != nil {
+		t.Fatalf("snapshot does not parse: %v", err)
+	}
+	var proto, listenID string
+	if err := json.Unmarshal(doc["session_protocol"], &proto); err != nil || proto != sessionProtocolStateless {
+		t.Fatalf("session_protocol on disk = %s (err %v), want %q", doc["session_protocol"], err, sessionProtocolStateless)
+	}
+	if err := json.Unmarshal(doc["listen_stream_id"], &listenID); err != nil || listenID != wireListenID {
+		t.Fatalf("listen_stream_id on disk = %s (err %v), want %q", doc["listen_stream_id"], err, wireListenID)
+	}
+
+	// 3. On-disk snapshot → rendered status (the shim pid is this process, so
+	// loadStates accepts it as live).
+	var out, errOut bytes.Buffer
+	if rc := renderStatus(&out, &errOut, stateDir, false, time.Minute, time.Now); rc != exitOK {
+		t.Fatalf("renderStatus rc = %d", rc)
+	}
+	want := "session protocol " + sessionProtocolStateless + "  listen stream id " + wireListenID
+	if !strings.Contains(out.String(), want) {
+		t.Fatalf("rendered status missing %q:\n%s", want, out.String())
+	}
+}

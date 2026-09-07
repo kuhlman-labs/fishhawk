@@ -1411,3 +1411,404 @@ func TestDeferralLogRateLimited(t *testing.T) {
 		t.Fatal("the child must still be alive: the request never completed")
 	}
 }
+
+// --- #2460: SEP-2575 (protocol 2026-07-28) stateless sessions ---
+//
+// Under 2026-07-28 a client never sends initialize: it opens with
+// server/discover, stamps the negotiated version into every request's
+// params._meta, and receives list-changed notifications over a long-lived
+// subscriptions/listen REQUEST that is never answered for the life of the
+// subscription. The frames below are the shape the go-sdk v1.7.0 client emits;
+// the listen frame is deliberately never answered by any fake because that is
+// the real protocol's own behaviour.
+
+const (
+	statelessMeta      = `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}`
+	statelessDiscover  = `{"jsonrpc":"2.0","method":"server/discover","id":1,"params":{` + statelessMeta + `}}`
+	statelessListen    = `{"jsonrpc":"2.0","method":"subscriptions/listen","id":2,"params":{` + statelessMeta + `}}`
+	statelessToolCall  = `{"jsonrpc":"2.0","method":"tools/call","id":3,"params":{` + statelessMeta + `,"name":"alpha"}}`
+	statelessDiscovery = `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2026-07-28","serverInfo":{"name":"fake"},"capabilities":{"tools":{"listChanged":true}}}}`
+	taggedListChanged  = `{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}` + "\n"
+)
+
+// discover drives the SEP-2575 opening against a MANUAL child: the discover
+// request is answered under its own id, so the session is classified stateless
+// and the child has served one result.
+func (h *harness) discover(child *fakeChild) {
+	h.t.Helper()
+	h.send(statelessDiscover)
+	waitFor(h.t, func() bool { return len(child.sentFrames()) > 0 })
+	child.pushFrame(statelessDiscovery + "\n")
+	if r := h.expect(); !strings.Contains(r, `"id":1`) || !strings.Contains(r, `"protocolVersion"`) {
+		h.t.Fatalf("expected the discover result for id 1, got %q", r)
+	}
+}
+
+// TestStatelessVersionClassification pins the version branch directly (AC3):
+// the per-request _meta decode and the lexicographic ISO-8601 compare, one row
+// per way the version can be absent or unreadable — every one of which must
+// classify LEGACY, so a frame the shim cannot read never flips a session.
+func TestStatelessVersionClassification(t *testing.T) {
+	cases := []struct {
+		name      string
+		frame     string
+		version   string
+		stateless bool
+	}{
+		{"absent params", `{"jsonrpc":"2.0","method":"tools/call","id":1}`, "", false},
+		{"absent _meta", `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"x"}}`, "", false},
+		{"absent key", `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"_meta":{"other":"2026-07-28"}}}`, "", false},
+		{"legacy 2025-11-25", `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}}`, "2025-11-25", false},
+		{"stateless 2026-07-28", statelessToolCall, "2026-07-28", true},
+		{"later 2027-03-01", `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2027-03-01"}}}`, "2027-03-01", true},
+		{"non-string value", `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"_meta":{"io.modelcontextprotocol/protocolVersion":20260728}}}`, "", false},
+		{"non-object _meta", `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"_meta":"2026-07-28"}}`, "", false},
+		{"malformed params", `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":"2026-07-28"}`, "", false},
+		{"garbage frame", "not json at all", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := peek([]byte(c.frame + "\n"))
+			if got := p.metaProtocolVersion(); got != c.version {
+				t.Errorf("metaProtocolVersion = %q, want %q", got, c.version)
+			}
+			if got := isStatelessVersion(p.metaProtocolVersion()); got != c.stateless {
+				t.Errorf("isStatelessVersion = %v, want %v", got, c.stateless)
+			}
+		})
+	}
+	// The constant is the SDK's own boundary: exactly that version is stateless.
+	if !isStatelessVersion(statelessProtocolVersion) {
+		t.Fatalf("statelessProtocolVersion %q must classify stateless", statelessProtocolVersion)
+	}
+}
+
+// TestListChangedFrameTagging pins the emitted frame as a correctness property
+// (approval condition 1): with a listen id the notification carries it under
+// _meta subscriptionId spliced as the raw id token; without one it is the
+// untagged legacy frame byte-for-byte.
+func TestListChangedFrameTagging(t *testing.T) {
+	if got := string(listChangedFrame("2")); got != taggedListChanged {
+		t.Fatalf("numeric id: got %q, want %q", got, taggedListChanged)
+	}
+	wantStr := `{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"sub-7"}}}` + "\n"
+	if got := string(listChangedFrame(`"sub-7"`)); got != wantStr {
+		t.Fatalf("string id: got %q, want %q", got, wantStr)
+	}
+	if got := string(listChangedFrame("")); got != string(listChangedNotification) {
+		t.Fatalf("no listen stream: got %q, want the untagged frame %q", got, listChangedNotification)
+	}
+	// The tagged frame must parse as a notification whose params carry the id —
+	// a client decoding it must never see a request.
+	p := peek(listChangedFrame("2"))
+	if !p.hasMethod() || p.hasID() {
+		t.Fatal("the tagged frame must be a notification (method, no id)")
+	}
+}
+
+// TestStatelessSwapProceedsWithoutInitialize is the AC1 done-means for the
+// gate: a session that never sent initialize (only server/discover and a tool
+// call, both stamped 2026-07-28) must SWAP, recording `swapped` with
+// session_protocol stateless — not park forever in
+// deferred_no_initialize_recorded, which is what the legacy ladder does with
+// no initialize on record.
+func TestStatelessSwapProceedsWithoutInitialize(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", false)
+	h := newHarness(t, child0, child1)
+	h.start()
+	h.discover(child0)
+
+	h.send(statelessToolCall)
+	waitFor(t, func() bool { return len(child0.sentFrames()) > 1 })
+	child0.pushFrame(`{"jsonrpc":"2.0","id":3,"result":{"marker":"A"}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, `"marker":"A"`) {
+		t.Fatalf("tool result: %q", r)
+	}
+
+	h.triggerSwap("hash-B")
+	if lc := h.expect(); lc != string(listChangedNotification) {
+		t.Fatalf("expected the untagged list_changed (no listen stream), got %q", lc)
+	}
+	st := h.pub.waitFor(t, "swapped", func(st swapState) bool { return st.LastSwapOutcome == outcomeSwapped })
+	if st.SessionProtocol != sessionProtocolStateless {
+		t.Fatalf("session_protocol = %q, want %q", st.SessionProtocol, sessionProtocolStateless)
+	}
+	if st.HandshakeDone || st.HandshakePresumed {
+		t.Fatalf("a stateless session has no handshake to report done/presumed: %+v", st)
+	}
+	if n := h.pub.count(func(st swapState) bool { return st.LastSwapOutcome == outcomeDeferredNoInitialize }); n != 0 {
+		t.Fatalf("stateless swap must never be deferred for a missing initialize; saw %d such snapshots", n)
+	}
+	if !child0.isTerminated() {
+		t.Fatal("the old child must be terminated by the stateless swap")
+	}
+	// The fresh child received NO initialize replay — there is none to replay.
+	for _, f := range child1.sentFrames() {
+		if strings.Contains(f, `"initialize"`) {
+			t.Fatalf("a stateless swap must not replay an initialize, got %q", f)
+		}
+	}
+}
+
+// TestMalformedMetaClassifiesLegacy drives the fail-safe direction end to end:
+// a request whose _meta cannot be read (a non-string version) and one whose
+// params are not an object leave the session LEGACY, so the swap is refused
+// with deferred_no_initialize_recorded exactly as before — a malformed frame
+// can never open the gate.
+func TestMalformedMetaClassifiesLegacy(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", true)
+	h := newHarness(t, child0, child1)
+	h.start()
+
+	h.send(`{"jsonrpc":"2.0","method":"server/discover","id":1,"params":{"_meta":{"io.modelcontextprotocol/protocolVersion":20260728}}}`)
+	h.send(`{"jsonrpc":"2.0","method":"tools/call","id":5,"params":"2026-07-28"}`)
+	waitFor(t, func() bool { return len(child0.sentFrames()) > 1 })
+	child0.pushFrame(`{"jsonrpc":"2.0","id":1,"result":{}}` + "\n")
+	child0.pushFrame(`{"jsonrpc":"2.0","id":5,"result":{"marker":"A"}}` + "\n")
+	h.expect()
+	h.expect()
+
+	h.triggerSwap("hash-B")
+	st := h.pub.waitFor(t, "deferred_no_initialize_recorded", func(st swapState) bool {
+		return st.LastSwapOutcome == outcomeDeferredNoInitialize
+	})
+	if st.SessionProtocol != sessionProtocolLegacy {
+		t.Fatalf("session_protocol = %q, want %q", st.SessionProtocol, sessionProtocolLegacy)
+	}
+	if child0.isTerminated() {
+		t.Fatal("an unreadable _meta must not open the swap gate")
+	}
+}
+
+// TestListenStreamDoesNotPinQuiesce pins the quiesce carve-out: an unanswered
+// subscriptions/listen is the protocol's steady state, not outstanding work.
+// The quiesce timer is pre-fired so that, were the stream counted in-flight,
+// the swap would record deferred_in_flight instead of completing.
+func TestListenStreamDoesNotPinQuiesce(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", false)
+	h := newHarness(t, child0, child1)
+	timeoutCh := make(chan time.Time, 1)
+	timeoutCh <- time.Time{}
+	h.sup.after = func(time.Duration) <-chan time.Time { return timeoutCh }
+	h.start()
+	h.discover(child0)
+
+	h.send(statelessListen) // never answered
+	h.barrier()
+
+	h.triggerSwap("hash-B")
+	if lc := h.expect(); lc != taggedListChanged {
+		t.Fatalf("expected the swap to complete with a tagged list_changed, got %q", lc)
+	}
+	st := h.pub.waitFor(t, "swapped", func(st swapState) bool { return st.LastSwapOutcome == outcomeSwapped })
+	if st.InFlight != 0 || st.OldestInFlightID != "" {
+		t.Fatalf("the listen stream must not be counted in-flight: %+v", st)
+	}
+	if st.ListenStreamID != "2" {
+		t.Fatalf("listen_stream_id = %q, want %q", st.ListenStreamID, "2")
+	}
+	if n := h.pub.count(func(st swapState) bool { return st.LastSwapOutcome == outcomeDeferredInFlight }); n != 0 {
+		t.Fatalf("an open listen stream must never defer a swap as in-flight; saw %d deferred_in_flight snapshots", n)
+	}
+	if !child0.isTerminated() {
+		t.Fatal("the swap must have terminated the old child")
+	}
+}
+
+// TestStatelessSwapReplaysListenStream is the subscription-continuity
+// assertion (approval condition 1): the fresh child receives the recorded
+// subscriptions/listen BYTE-VERBATIM under its ORIGINAL client id, as its first
+// frame, before any client traffic is flushed to it.
+func TestStatelessSwapReplaysListenStream(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", false)
+	h := newHarness(t, child0, child1)
+	h.start()
+	h.discover(child0)
+
+	h.send(statelessListen)
+	h.barrier()
+
+	h.triggerSwap("hash-B")
+	if lc := h.expect(); !strings.Contains(lc, "notifications/tools/list_changed") {
+		t.Fatalf("expected list_changed after the swap, got %q", lc)
+	}
+	sent := child1.sentFrames()
+	if len(sent) == 0 {
+		t.Fatal("the fresh child received nothing; the listen stream was not re-sent")
+	}
+	if sent[0] != statelessListen+"\n" {
+		t.Fatalf("listen re-send is not byte-verbatim under the original id:\n got %q\nwant %q", sent[0], statelessListen+"\n")
+	}
+	if len(sent) != 1 {
+		t.Fatalf("the fresh child should have received exactly the listen re-send, got %v", sent)
+	}
+	// Continuity: a notification the fresh child routes under the stream id
+	// still reaches the client through the ordinary downstream path.
+	child1.pushFrame(`{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, "subscriptions/acknowledged") {
+		t.Fatalf("the fresh child's acknowledgement must flow to the client, got %q", r)
+	}
+}
+
+// TestStatelessSwapEmitsSubscriptionTaggedListChanged asserts the SHIPPED
+// client-facing frame after a stateless swap carries the listen stream's id.
+func TestStatelessSwapEmitsSubscriptionTaggedListChanged(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", false)
+	h := newHarness(t, child0, child1)
+	h.start()
+	h.discover(child0)
+	h.send(statelessListen)
+	h.barrier()
+
+	h.triggerSwap("hash-B")
+	if lc := h.expect(); lc != taggedListChanged {
+		t.Fatalf("post-swap notification:\n got %q\nwant %q", lc, taggedListChanged)
+	}
+	h.expectNone()
+}
+
+// TestStatelessSwapEmitsUntaggedListChangedWithoutListenStream is the sibling:
+// a stateless client that never opened a listen stream (no
+// ToolListChangedHandler) gets the untagged legacy frame.
+func TestStatelessSwapEmitsUntaggedListChangedWithoutListenStream(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", false)
+	h := newHarness(t, child0, child1)
+	h.start()
+	h.discover(child0)
+
+	h.triggerSwap("hash-B")
+	if lc := h.expect(); lc != string(listChangedNotification) {
+		t.Fatalf("post-swap notification:\n got %q\nwant %q", lc, listChangedNotification)
+	}
+	if got := child1.sentFrames(); len(got) != 0 {
+		t.Fatalf("with no listen stream the fresh child must receive nothing, got %v", got)
+	}
+	st := h.pub.waitFor(t, "swapped", func(st swapState) bool { return st.LastSwapOutcome == outcomeSwapped })
+	if st.ListenStreamID != "" {
+		t.Fatalf("listen_stream_id must be empty, got %q", st.ListenStreamID)
+	}
+}
+
+// TestStatelessCrashDoesNotOrphanListenStream: a child crash must orphan the
+// real in-flight request but NEVER the listen stream — an error response under
+// the listen id would tear the client's subscription down for good — and the
+// respawn must re-establish the stream on the fresh child.
+func TestStatelessCrashDoesNotOrphanListenStream(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", false)
+	h := newHarness(t, child0, child1)
+	h.sup.sleep = func(time.Duration) {}
+	h.start()
+	h.discover(child0)
+	h.send(statelessListen)
+	h.send(statelessToolCall) // genuinely in flight
+	waitFor(t, func() bool { return len(child0.sentFrames()) == 3 })
+
+	child0.crash(errors.New("boom"))
+	orphan := h.expect()
+	if !strings.Contains(orphan, `"id":3`) || !strings.Contains(orphan, "-32603") {
+		t.Fatalf("expected an orphan error for the in-flight tool call (id 3), got %q", orphan)
+	}
+	lc := h.expect()
+	if lc != taggedListChanged {
+		t.Fatalf("expected the tagged list_changed after the crash respawn, got %q", lc)
+	}
+	h.expectNone() // in particular: no orphan error under the listen id 2
+
+	sent := child1.sentFrames()
+	if len(sent) != 1 || sent[0] != statelessListen+"\n" {
+		t.Fatalf("the respawned child must receive the listen re-send verbatim, got %v", sent)
+	}
+	st := h.pub.waitFor(t, "crash_respawn", func(st swapState) bool { return st.LastSwapOutcome == outcomeCrashRespawn })
+	if st.SessionProtocol != sessionProtocolStateless || st.ListenStreamID != "2" {
+		t.Fatalf("session facts must survive a crash: %+v", st)
+	}
+}
+
+// TestStatelessReplayListenSendFailureRespawns: a fresh child whose stdin is
+// broken during the listen re-send is terminated and drained, and the bounded
+// respawn loop retries on the next child — the client never hangs.
+func TestStatelessReplayListenSendFailureRespawns(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", false)
+	child2 := newFake("C", false)
+	child1.failSend = true
+	h := newHarness(t, child0, child1, child2)
+	h.sup.sleep = func(time.Duration) {}
+	h.start()
+	h.discover(child0)
+	h.send(statelessListen)
+	h.barrier()
+
+	h.triggerSwap("hash-B")
+	if lc := h.expect(); lc != taggedListChanged {
+		t.Fatalf("expected the tagged list_changed once the retry child is up, got %q", lc)
+	}
+	if !child1.isTerminated() {
+		t.Fatal("the replacement with broken stdin must be terminated")
+	}
+	if sent := child2.sentFrames(); len(sent) != 1 || sent[0] != statelessListen+"\n" {
+		t.Fatalf("the retry child must receive the listen re-send, got %v", sent)
+	}
+	waitFor(t, func() bool { return strings.Contains(h.logs(), "stateless listen re-send failed") })
+}
+
+// TestStatelessListenUpstreamSendFailureReestablishes: the client's ORIGINAL
+// listen request meets a broken child stdin. It must not be answered with an
+// orphan error (the client never awaits it and an error would kill the
+// stream); the child is terminated and the respawn re-sends the recorded
+// stream, so the client's subscription lands on the fresh child.
+func TestStatelessListenUpstreamSendFailureReestablishes(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", false)
+	h := newHarness(t, child0, child1)
+	h.sup.sleep = func(time.Duration) {}
+	h.start()
+	h.discover(child0)
+
+	child0.setFailSend(true)
+	h.send(statelessListen)
+	waitFor(t, child0.isTerminated)
+	h.expectNone() // no orphan error under the listen id
+
+	child0.crash(nil) // the Terminate would fire Exited on a real child
+	if lc := h.expect(); lc != taggedListChanged {
+		t.Fatalf("expected the tagged list_changed after the respawn, got %q", lc)
+	}
+	if sent := child1.sentFrames(); len(sent) != 1 || sent[0] != statelessListen+"\n" {
+		t.Fatalf("the respawned child must receive the recorded listen stream, got %v", sent)
+	}
+}
+
+// TestLegacySessionIgnoresStatelessArm is the negative control for the gate
+// arm: a legacy 2025-11-25 client stamping its own version into _meta still
+// takes the handshake-replay ladder — the synthetic-id initialize replay, not
+// the stateless re-subscribe — and reports session_protocol legacy.
+func TestLegacySessionIgnoresStatelessArm(t *testing.T) {
+	child0 := newFake("A", true)
+	child1 := newFake("B", true)
+	h := newHarness(t, child0, child1)
+	h.start()
+	h.handshake()
+	h.send(`{"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}}`)
+	h.expect()
+
+	h.triggerSwap("hash-B")
+	if lc := h.expect(); lc != string(listChangedNotification) {
+		t.Fatalf("legacy swap must emit the untagged frame, got %q", lc)
+	}
+	sent := child1.sentFrames()
+	if len(sent) < 2 || !strings.Contains(sent[0], "fishhawk-shim/replay/") {
+		t.Fatalf("legacy swap must replay the initialize with a synthetic id, got %v", sent)
+	}
+	st := h.pub.waitFor(t, "swapped", func(st swapState) bool { return st.LastSwapOutcome == outcomeSwapped })
+	if st.SessionProtocol != sessionProtocolLegacy || st.ListenStreamID != "" {
+		t.Fatalf("legacy session facts: %+v", st)
+	}
+}

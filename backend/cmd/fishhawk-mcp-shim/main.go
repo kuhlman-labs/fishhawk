@@ -7,10 +7,14 @@
 // `/mcp` by hand. The shim closes that gap by sitting between the client and
 // fishhawk-mcp. It spawns bin/fishhawk-mcp as a child over pipes and passes
 // newline-delimited JSON-RPC frames byte-verbatim in both directions, parsing
-// ONLY the client's initialize handshake and message ids (for in-flight
-// tracking). A content poller (sha-256, never mtime) watches the child binary;
-// on a confirmed rebuild it quiesces to zero in-flight requests, swaps in the
-// new binary, replays the recorded handshake, and synthesizes
+// ONLY what session survival needs: the client's initialize handshake (legacy
+// protocols), the per-request _meta protocol version and the
+// subscriptions/listen stream (SEP-2575 / 2026-07-28, #2460), and message ids
+// (for in-flight tracking). A content poller (sha-256, never mtime) watches the
+// child binary; on a confirmed rebuild it quiesces to zero in-flight requests,
+// swaps in the new binary, re-establishes the session — a legacy session by
+// replaying the recorded handshake, a stateless one by re-sending the listen
+// stream under its original id — and synthesizes
 // notifications/tools/list_changed so the client re-reads the tool set — no
 // manual /mcp reconnect.
 //

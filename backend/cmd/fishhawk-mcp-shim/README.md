@@ -25,12 +25,26 @@ changes the shim.
 
 ## How it works
 
-The shim spawns `fishhawk-mcp` as a child over pipes and passes newline-delimited JSON-RPC frames **byte-verbatim** in both directions. It parses only (a) the client's `initialize` request (recorded with the child's response) and (b) message ids, for in-flight request tracking.
+The shim spawns `fishhawk-mcp` as a child over pipes and passes newline-delimited JSON-RPC frames **byte-verbatim** in both directions. It parses only (a) the client's `initialize` request (recorded with the child's response), (b) the protocol version a client stamps into each request's `params._meta` and the client's `subscriptions/listen` request (both SEP-2575, see the two-protocol contract below), and (c) message ids, for in-flight request tracking.
 
 - **Content poller** — a sha-256 poll (never mtime; a reload rebuild can be a byte-identical no-op) over the child binary path, with a settle debounce so a half-written `go build -o` output never triggers a swap.
-- **Swap** — on a confirmed content change the shim quiesces (waits for zero in-flight client requests up to `--quiesce-timeout`; on timeout it defers the swap to the next idle moment — it never kills a child mid-request), SIGTERMs the old child (SIGKILL-escalated to its process group after a grace period), spawns the new binary, replays the recorded `initialize` with a synthetic collision-proof id (swallowing the response), sends `notifications/initialized`, and synthesizes `notifications/tools/list_changed` upstream so the client re-reads the tool set.
-- **Crash recovery** — a crashed child is respawned with capped exponential backoff through the same replay path; any requests orphaned by the crash get synthesized JSON-RPC error responses so the client is never stranded.
-- **Swap gate** — a swap needs a re-establishable session. The gate allows it when the handshake completed; when the handshake was never MATCHED but an `initialize` **is** recorded and the child has served at least one result-bearing response, it **presumes** the handshake and allows the swap (recording `handshake_presumed`); and it refuses — saying which — when no `initialize` was ever recorded, or when there is no served-result evidence yet.
+- **Swap** — on a confirmed content change the shim quiesces (waits for zero in-flight client requests up to `--quiesce-timeout`; on timeout it defers the swap to the next idle moment — it never kills a child mid-request), SIGTERMs the old child (SIGKILL-escalated to its process group after a grace period), spawns the new binary and **re-establishes the session per the protocol the client negotiated** (the two-protocol contract below), then synthesizes `notifications/tools/list_changed` upstream so the client re-reads the tool set.
+- **Crash recovery** — a crashed child is respawned with capped exponential backoff through the same re-establishment path; any requests orphaned by the crash get synthesized JSON-RPC error responses so the client is never stranded. A stateless session's listen stream is never orphan-errored (an error under its id would tear the client's subscription down for good) — it is re-sent to the respawned child instead.
+- **Swap gate** — a swap needs a re-establishable session. A **stateless** session always has one (nothing to replay), so the gate opens on it directly. For a **legacy** session the gate allows the swap when the handshake completed; when the handshake was never MATCHED but an `initialize` **is** recorded and the child has served at least one result-bearing response, it **presumes** the handshake and allows the swap (recording `handshake_presumed`); and it refuses — saying which — when no `initialize` was ever recorded, or when there is no served-result evidence yet.
+
+### The two-protocol contract (#2460)
+
+MCP protocol **2026-07-28** ([SEP-2575](https://modelcontextprotocol.io/seps/2575-stateless-mcp)) removed both things the original swap was built on: a client on it never sends `initialize` (it opens with `server/discover`, stamps the negotiated version into every request's `params._meta` under `io.modelcontextprotocol/protocolVersion`, and re-sends its capabilities on each request), and it receives list-changed notifications only over a long-lived `subscriptions/listen` **request** that is answered by notifications, never by a response, for the life of the subscription. Left unhandled, such a session would never swap — the gate would refuse forever with `deferred_no_initialize_recorded`, and even past the gate the unanswered listen request would pin quiesce in `deferred_in_flight`. The shim therefore keeps two session models, chosen once per session and never revisited:
+
+| | **legacy** (`≤ 2025-11-25`) | **stateless** (`≥ 2026-07-28`, SEP-2575) |
+|---|---|---|
+| Classified from | the absence of a stateless version in any request's `_meta` (the default) | the first upstream request whose `params._meta` carries a protocol version `≥ 2026-07-28` (the go-sdk client stamps every request, so `server/discover` sets it); sticky for the life of the shim |
+| Recorded | the client's `initialize` request and the child's response | the client's `subscriptions/listen` request, byte-verbatim, and its JSON-RPC id (`listen_stream_id`); the listen request is **never** counted as in-flight, so quiesce does not wait on it |
+| Re-established on swap / respawn by | replaying the recorded `initialize` under a synthetic collision-proof id (response swallowed), then `notifications/initialized` | re-sending the recorded `subscriptions/listen` to the fresh child **under its original id** — that id is what the child stamps into every notification it routes over the stream (`io.modelcontextprotocol/subscriptionId`), so subscription correlation survives the swap |
+| Client told the tool set changed by | an untagged `notifications/tools/list_changed` | the same notification tagged with the listen id in `params._meta` (untagged when the client opened no listen stream) |
+| Swap gate | handshake done / presumed / refused, as above | always open |
+
+The legacy ladder is byte-for-byte the pre-#2460 behaviour; the stateless arm sits in front of it. The end-to-end proof drives a real go-sdk v1.7.0 `mcp.Client` through the supervisor against two real `mcp.Server` children (`protocol_stateless_e2e_test.go`): the client's `ListTools` reflects the new child after a swap, a tool added to the fresh child afterwards is announced under the original subscription id, the negotiated version equals the shim's `statelessProtocolVersion` constant (so a go-sdk bump that moves the latest protocol reddens `TestNegotiatedVersionMatchesShimConstant` by name), and a legacy-handshake client still gets the full replay.
 
 The child connection sits behind a small `childTransport` seam so a later phase can substitute a streamable-HTTP upstream — the [#655](https://github.com/kuhlman-labs/fishhawk/issues/655) gateway phase-0 constraint.
 
@@ -55,13 +69,15 @@ Every running shim writes `<state-dir>/<shim-pid>.json` on each watcher tick and
 | `child_pid`, `child_path` | the running child — the same pid a `ps` table shows |
 | `child_launch_hash` | sha-256 of the bytes the child was launched from |
 | `pending_swap_hash`, `pending_since` | the confirmed content change waiting to be applied, and since when |
-| `handshake_done`, `handshake_presumed` | whether the session can be replayed, and whether that was inferred rather than observed |
+| `session_protocol` | `legacy` (initialize handshake, replayed on swap) or `stateless` (SEP-2575, re-subscribed on swap) — see the two-protocol contract |
+| `listen_stream_id` | the raw JSON-RPC id of the client's recorded `subscriptions/listen` request; empty for a legacy session or a stateless client that opened no stream |
+| `handshake_done`, `handshake_presumed` | whether a legacy session can be replayed, and whether that was inferred rather than observed (both stay `false` for a stateless session, which needs neither) |
 | `served_results` | result-bearing child responses — the evidence the presumption keys on |
 | `in_flight`, `oldest_in_flight_id`, `oldest_in_flight_since` | what is holding a swap off, and for how long |
 | `quiesce_expired` | the active quiesce timed out; the swap is waiting passively for idle |
 | `last_swap_at`, `last_swap_outcome`, `updated_at` | the last attempt, its verdict, and snapshot freshness |
 
-`last_swap_outcome` is one of `swapped`, `crash_respawn`, `deferred_no_initialize_recorded`, `deferred_handshake_not_observed`, `deferred_in_flight`. Each deferral is ALSO logged to stderr — on the transition, then at most once every 5 minutes while the same denial persists.
+`last_swap_outcome` is one of `swapped`, `crash_respawn`, `deferred_no_initialize_recorded`, `deferred_handshake_not_observed`, `deferred_in_flight`. Each deferral is ALSO logged to stderr — on the transition, then at most once every 5 minutes while the same denial persists. A stateless swap records the same `swapped`; the two handshake deferrals can only occur on a legacy session. `session_protocol` and `listen_stream_id` are additive on the unchanged `v1` schema — a reader binds only on an unrecognised schema string, and `--status` renders an absent field as `(none)`.
 
 A snapshot is classified against the binary currently on disk: **current** (hashes equal), **pending** (hashes differ but the swap is younger than `--stale-grace`, or its age/path cannot be read — the fail-safe direction, so a just-rebuilt binary never draws a false alarm), or **stale** (hashes differ AND the swap has been pending at least the grace period).
 
@@ -125,8 +141,11 @@ Registration is detected via the `FISHHAWK_MCP_SHIM_REGISTERED` env override (so
 A separate binary built from the **backend module**, sibling to `fishhawk-mcp` per ADR-021.
 
 - `watcher.go` — the sha-256 content poller (never mtime, settle-debounced).
-- `supervisor.go` — quiesce, swap gate, handshake replay with a synthetic id, crash respawn with
-  capped backoff, orphaned-request error synthesis, swap-state publication.
+- `supervisor.go` — quiesce, swap gate, session re-establishment (legacy handshake replay with a
+  synthetic id; SEP-2575 listen-stream re-send under the original id), crash respawn with capped
+  backoff, orphaned-request error synthesis, swap-state publication.
+- `protocol_stateless_e2e_test.go` — the end-to-end proof with a real go-sdk client and real
+  `mcp.Server` children (self-contained; hoists nothing from the `supervisor_test.go` harness).
 - `state.go` — the swap-state snapshot, its atomic file transport, the liveness/staleness
   classifier and the `--status` renderer (#2831).
 - `transport.go` (+ `transport_unix.go` / `transport_other.go`) — the `childTransport` seam a
@@ -139,4 +158,7 @@ A separate binary built from the **backend module**, sibling to `fishhawk-mcp` p
 - **A pid-reuse false positive is possible.** Liveness is a `signal 0` probe, which cannot tell a reused pid from the original. The worst case is one spurious advisory line; nothing destructive keys off it.
 - **An unsignalable live pid is reported, never pruned.** The other direction of the same probe: `signal 0` against a live process owned by another user returns `EPERM`, which means *exists but not yours*, not *gone*. Because `--status` **deletes** the snapshots of pids it calls dead, `EPERM` is deliberately classified **alive** — a foreign shim writing into a shared state dir (or a reused pid now held by another user's process) has its snapshot reported rather than destroyed. The cost is one extra line for a pid the caller could not signal anyway; the alternative loses a running shim's diagnostic file.
 - **A state-file write failure degrades the diagnostic, not the proxy.** A read-only or full `TMPDIR` logs once and the shim keeps serving frames.
+- **Session classification comes from the client's own `_meta`.** A client that stamps no protocol version into its requests is treated as legacy — the fail-safe direction: that path still refuses a swap loudly (`deferred_no_initialize_recorded`) rather than swapping blind onto an uninitialised child.
+- **A `server/discover` probe that the child refuses still classifies the session stateless.** The go-sdk v1.7.0 client stamps `2026-07-28` into its `server/discover` request *before* it knows whether the server supports it; if the child answers method-not-found (a pre-SEP-2575 server) the client falls back to `initialize`, but the shim has already latched `stateless` from the probe and the next swap skips the handshake replay — the client's next call then fails with `method "tools/list" is invalid during session initialization`. Observed in-repo with a real client against a pre-SEP-2575 server emulation; not reachable with the shipped `fishhawk-mcp`, which is built from the same go-sdk and always accepts the probe, so it needs a version-skewed child. Tracked as a follow-up to #2460: an `initialize` arriving after the classification should reclassify the session legacy.
+- **Claude Code's client is not the go-sdk client.** How it handles an unsolicited or subscription-tagged `tools/list_changed` under 2026-07-28 cannot be observed from this repository, so the operator-visible confirmation of a swap stays what it was: a version-returning tool call reflecting the new GitSHA, **re-reading the tool description** rather than relying on a cached one (a cached description is exactly what a missed notification leaves behind).
 - **Shim-binary changes still need one manual `/mcp`.** The shim swaps the *child*; a rebuild of the shim itself is still owned by the harness, so a change to `fishhawk-mcp-shim` needs a one-time `/mcp` reconnect like any MCP server change.
