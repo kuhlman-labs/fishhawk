@@ -21,6 +21,59 @@ var (
 	listChangedNotification = []byte(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}` + "\n")
 )
 
+// SEP-2575 (MCP protocol 2026-07-28) removed the initialize handshake: a client
+// on that protocol opens with server/discover, stamps the negotiated version
+// into every request's params._meta, and receives list-changed notifications
+// over a long-lived subscriptions/listen REQUEST that is never answered for the
+// life of the subscription. The shim classifies a session from that per-request
+// _meta and, for such a session, swaps with nothing to replay (#2460).
+const (
+	// statelessProtocolVersion is the first protocol version with no initialize
+	// lifecycle. Versions are fixed-width ISO-8601 dates, so the lexicographic
+	// compare in isStatelessVersion is the same ordering the go-sdk uses.
+	statelessProtocolVersion  = "2026-07-28"
+	metaKeyProtocolVersion    = "io.modelcontextprotocol/protocolVersion"
+	metaKeySubscriptionID     = "io.modelcontextprotocol/subscriptionId"
+	methodSubscriptionsListen = "subscriptions/listen"
+
+	// Values of swapState.SessionProtocol.
+	sessionProtocolLegacy    = "legacy"
+	sessionProtocolStateless = "stateless"
+)
+
+// isStatelessVersion reports whether a protocol version read from a request's
+// _meta selects the SEP-2575 session model. An empty version (absent params,
+// absent _meta, absent key, non-string value, malformed params) is legacy: a
+// frame the shim cannot read can never flip a session into the stateless mode.
+func isStatelessVersion(v string) bool {
+	return v != "" && v >= statelessProtocolVersion
+}
+
+// isLongLivedStream reports whether an upstream request opens a SEP-2575
+// subscriptions/listen stream. Such a request receives no JSON-RPC response for
+// the life of the subscription (the server handler blocks until the stream is
+// cancelled), so it must NOT be counted as in-flight work: registered, it would
+// park every swap in deferred_in_flight forever. It is the one method carved
+// out of quiesce accounting; a legitimately long-lived tool call still defers a
+// swap by design.
+func isLongLivedStream(p rpcPeek) bool {
+	return p.hasMethod() && p.hasID() && p.method() == methodSubscriptionsListen
+}
+
+// listChangedFrame renders the client-facing tools/list_changed the shim
+// synthesizes after a swap. With a recorded listen stream it tags the frame
+// with that stream's id under _meta subscriptionId — the same stamp the child
+// itself applies to every notification it routes over the stream (go-sdk
+// injectMetaSubscriptionID), so the client can correlate it. listenIDKey is the
+// raw id token (a number or a quoted string), valid JSON in place. Without a
+// listen stream it is the untagged legacy frame unchanged.
+func listChangedFrame(listenIDKey string) []byte {
+	if listenIDKey == "" {
+		return listChangedNotification
+	}
+	return []byte(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"` + metaKeySubscriptionID + `":` + listenIDKey + `}}}` + "\n")
+}
+
 // Backoff bounds for crash respawn (capped exponential, reset after a healthy
 // interval).
 const (
@@ -77,6 +130,20 @@ type supervisor struct {
 	// but the child demonstrably served results, so the swap gate presumed the
 	// handshake rather than deferring forever (#2831).
 	handshakePresumed bool
+
+	// stateless is set once any upstream frame carries a SEP-2575 protocol
+	// version in its params._meta (the go-sdk client stamps every request, so
+	// the opening server/discover sets it). It is a SESSION fact, sticky for the
+	// life of the shim and untouched by crash recovery: a stateless session has
+	// no handshake to replay, so the swap gate opens on it directly (#2460).
+	stateless bool
+	// listenReq / listenIDKey record the client's subscriptions/listen request
+	// verbatim and its raw id. The stream is re-sent to every fresh child under
+	// that ORIGINAL id, which is what the child stamps into the notifications it
+	// routes — so subscription correlation survives a swap or a crash respawn.
+	// Never registered as in-flight (see isLongLivedStream).
+	listenReq   []byte
+	listenIDKey string
 	// servedResults counts result-bearing child responses — the evidence the
 	// presumption keys on. Error-only responses deliberately do not count.
 	servedResults int
@@ -170,7 +237,22 @@ func (s *supervisor) run(ctx context.Context) error {
 // method) are forwarded but never tracked as in-flight.
 func (s *supervisor) handleUpstream(frame []byte) {
 	p := peek(frame)
+	if !s.stateless && isStatelessVersion(p.metaProtocolVersion()) {
+		s.stateless = true
+		s.logf("client negotiated protocol %s (SEP-2575): session classified stateless; swaps re-subscribe instead of replaying a handshake (#2460)", p.metaProtocolVersion())
+	}
 	isReq := p.hasMethod() && p.hasID()
+	// The listen stream is recorded BEFORE the send and never tracked as
+	// in-flight: it is answered by notifications for the life of the session,
+	// not by a response, so quiesce must not wait on it. Recording ahead of the
+	// send is deliberate — if the child's stdin is broken the respawn below
+	// re-sends the recorded stream to the fresh child, which is exactly what the
+	// client (which never awaits the listen response) needs.
+	if isLongLivedStream(p) {
+		s.listenReq = cloneBytes(frame)
+		s.listenIDKey = p.idKey()
+		isReq = false
+	}
 	var key string
 	if isReq {
 		key = p.idKey()
@@ -257,6 +339,13 @@ func (s *supervisor) armSwap(h []byte) {
 // which the gate would open onto a permanently non-empty in-flight set and the
 // swap would simply defer forever one arm later instead.
 func (s *supervisor) swapGate() (bool, string) {
+	if s.stateless {
+		// SEP-2575: there is no initialize lifecycle, so there is no handshake
+		// to observe, presume or replay. Every arm below keys on initReq, which a
+		// stateless client never sends — without this arm the gate would refuse
+		// every swap forever with deferred_no_initialize_recorded (#2460).
+		return true, ""
+	}
 	if s.handshakeDone {
 		return true, ""
 	}
@@ -407,6 +496,8 @@ func (s *supervisor) snapshot() swapState {
 		HandshakeDone:     s.handshakeDone,
 		HandshakePresumed: s.handshakePresumed,
 		ServedResults:     s.servedResults,
+		SessionProtocol:   s.sessionProtocol(),
+		ListenStreamID:    s.listenIDKey,
 		InFlight:          len(s.inFlight),
 		QuiesceExpired:    s.quiesceExpired,
 		LastSwapOutcome:   s.lastSwapOutcome,
@@ -430,6 +521,14 @@ func (s *supervisor) snapshot() swapState {
 		st.OldestInFlightSince = at.UTC().Format(time.RFC3339)
 	}
 	return st
+}
+
+// sessionProtocol names the session model the snapshot reports.
+func (s *supervisor) sessionProtocol() string {
+	if s.stateless {
+		return sessionProtocolStateless
+	}
+	return sessionProtocolLegacy
 }
 
 // publishState records the outcome (an empty outcome keeps the previous one)
@@ -509,6 +608,13 @@ func (s *supervisor) reapCrash(err error) {
 		if !s.handshakeDone && s.initReq != nil && id == s.initIDKey {
 			continue
 		}
+		// The listen stream is never registered as in-flight (isLongLivedStream),
+		// so this guard is defence in depth: an error response under the listen
+		// id would permanently tear down the client's subscription stream, while
+		// spawnAndReplay's stateless arm re-establishes it on the fresh child.
+		if s.listenIDKey != "" && id == s.listenIDKey {
+			continue
+		}
 		s.sendClient(orphanError(id))
 	}
 	s.inFlight = map[string]bool{}
@@ -543,6 +649,9 @@ func (s *supervisor) terminateAndDrain(c childTransport) {
 // spawnAndReplay starts a fresh child and re-establishes the session per the
 // pre-initialization-safe-restart rules:
 //
+//   - stateless (SEP-2575) session      → re-send the recorded
+//     subscriptions/listen (if any) under its original id, then synthesize
+//     tools/list_changed upstream tagged with that id (no handshake exists);
 //   - no initialize recorded            → plain passthrough (nothing to replay);
 //   - initialize recorded, no response  → re-send the ORIGINAL initialize with
 //     its original client id so the response flows to the waiting client
@@ -593,6 +702,8 @@ func (s *supervisor) spawnAndReplay(ctx context.Context, newHash []byte) {
 		// backoff instead of recursing.
 		done := false
 		switch {
+		case s.stateless:
+			done = s.replayStatelessSession()
 		case s.initReq == nil:
 			// Nothing recorded yet — resume plain passthrough.
 			done = true
@@ -622,6 +733,28 @@ func (s *supervisor) spawnAndReplay(ctx context.Context, newHash []byte) {
 		s.applyCrashBackoff()
 		newHash = nil // recompute the launch hash from the next child
 	}
+}
+
+// replayStatelessSession re-establishes a SEP-2575 session on a fresh child.
+// There is no handshake: the recorded subscriptions/listen (when the client
+// opened one) is re-sent VERBATIM under its ORIGINAL client id — the fresh child
+// has no prior request under that id, and it is the id the child stamps into
+// every notification it routes over the stream, so correlation is preserved.
+// The child's subscriptions/acknowledged then flows to the client through the
+// main loop. Finally the client is told the tool list changed, tagged with the
+// stream id (untagged when no stream was opened). Returns false on a send
+// failure, having terminated and drained the child, so the caller's bounded
+// respawn loop retries — the same contract as replayHandshake.
+func (s *supervisor) replayStatelessSession() bool {
+	if s.listenReq != nil {
+		if err := s.child.Send(s.listenReq); err != nil {
+			s.logf("stateless listen re-send failed: %v; respawning", err)
+			s.terminateAndDrain(s.child)
+			return false
+		}
+	}
+	s.sendClient(listChangedFrame(s.listenIDKey))
+	return true
 }
 
 // replayHandshake performs the full (post-handshake) replay against a fresh
@@ -726,6 +859,32 @@ type rpcPeek struct {
 	ID     json.RawMessage `json:"id"`
 	Result json.RawMessage `json:"result"`
 	Error  json.RawMessage `json:"error"`
+	Params json.RawMessage `json:"params"`
+}
+
+// metaProtocolVersion returns the SEP-2575 protocol version a request carries
+// in params._meta, or "" when params, _meta or the key is absent, the value is
+// not a string, or params does not decode. "" classifies legacy, so a malformed
+// frame can never flip a session into the stateless mode.
+func (p rpcPeek) metaProtocolVersion() string {
+	if len(p.Params) == 0 {
+		return ""
+	}
+	var params struct {
+		Meta map[string]json.RawMessage `json:"_meta"`
+	}
+	if err := json.Unmarshal(p.Params, &params); err != nil {
+		return ""
+	}
+	raw, ok := params.Meta[metaKeyProtocolVersion]
+	if !ok {
+		return ""
+	}
+	var v string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return ""
+	}
+	return v
 }
 
 func peek(frame []byte) rpcPeek {
