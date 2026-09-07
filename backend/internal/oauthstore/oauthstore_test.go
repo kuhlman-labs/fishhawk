@@ -1,6 +1,7 @@
 package oauthstore_test
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -175,5 +176,21 @@ func TestTokenPredicates(t *testing.T) {
 	refresh.ConsumedAt = &at
 	if !refresh.IsRevoked() || !refresh.IsConsumed() {
 		t.Error("RefreshToken predicates on set stamps = false, want true")
+	}
+}
+
+// TestRevokeGrantsForSubject_RefusesEmptySubject pins the argument guard
+// WITHOUT Postgres: the repository is built over a nil pool, so any attempt to
+// touch the database panics — a refusal that reaches the pool (or a deleted
+// guard) fails here rather than reporting a plausible (0, 0, nil). The error is
+// asserted by IDENTITY (ErrSubjectRequired) so the verb can switch on it.
+func TestRevokeGrantsForSubject_RefusesEmptySubject(t *testing.T) {
+	t.Parallel()
+	repo := oauthstore.NewPostgresRepository(nil)
+	for _, subject := range []string{"", " ", "\t\n"} {
+		_, _, err := repo.RevokeGrantsForSubject(context.Background(), subject, "")
+		if !errors.Is(err, oauthstore.ErrSubjectRequired) {
+			t.Errorf("RevokeGrantsForSubject(%q) = %v, want ErrSubjectRequired", subject, err)
+		}
 	}
 }

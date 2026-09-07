@@ -383,6 +383,47 @@ rotation returns `ErrRevoked`.
 | `TestRotateRefreshToken_ReuseSweepSerializesOnLineage` | **counterfactual vehicle.** An outside transaction holds the code row's `FOR UPDATE` lock and the reuse call must BLOCK. Delete `lockLineage` and it sails through (the sweep's UPDATEs never touch the code row) → RED, deterministically |
 | `TestRotateRefreshToken_ReuseLeavesNoLiveDescendantUnderConcurrency` | the end-to-end **invariant** under a real race: after a concurrent rotate + replay, zero live rows remain in the lineage and a winning rotation's access token does not authenticate. Deliberately *not* the counterfactual vehicle — the losing interleaving is timing dependent, so removing the lock would make it flaky rather than reliably red |
 
+### `RevokeGrantsForSubject` — the operator sweep rides the same lock (E66.5 / #2393)
+
+`RevokeGrantsForSubject(ctx, subject, clientID) (accessRevoked, refreshRevoked,
+err)` backs `fishhawkd oauth token revoke`: every still-live access AND refresh
+token issued to `subject`, optionally narrowed to one `client_id` (empty means
+every client), is stamped `revoked_at`. Three properties are the contract:
+
+- **One transaction, refresh FIRST.** A refresh token is the credential that
+  can mint more, so `RevokeRefreshTokensForSubject` runs before
+  `RevokeAccessTokensForSubject` and both commit together. A failure anywhere
+  rolls back everything: an operator never observes a half-revoked subject (a
+  live refresh token behind revoked access tokens, or the reverse).
+- **Serialized with rotation.** Before either UPDATE, the transaction takes `FOR
+  UPDATE` on EVERY lineage root for the subject
+  (`LockAuthorizationCodesForSubject`, `ORDER BY id` so two overlapping sweeps
+  queue rather than deadlock) — the same lock, at the same point, that
+  `RotateRefreshToken` and `RevokeGrantsForCode` take. Without it the sweep
+  UPDATEs fix their snapshot at statement start and a successor pair a
+  concurrent rotation inserts after that instant survives. With it only two
+  interleavings remain: the rotation commits first and the sweep's later
+  snapshot includes its successor, or the sweep commits first and the rotation's
+  post-lock re-read observes `revoked_at` and mints nothing.
+- **Counts are transitions, and zero is not an error.** `AND revoked_at IS
+  NULL` on both UPDATEs means an already-revoked row is never double-counted
+  (a second sweep reports `(0, 0, nil)` and the first stamp is preserved), and an
+  unknown subject is a committed no-op, `(0, 0, nil)`. Only an empty or
+  whitespace-only subject is refused — `ErrSubjectRequired`, before any
+  round-trip — because an empty predicate would match nothing and report a
+  "nothing to revoke" the operator would believe.
+
+| Test | Role |
+|---|---|
+| `TestRevokeGrantsForSubject_EndToEnd` | cross-boundary walk: mint through `RedeemAuthorizationCode`, revoke by subject, then BOTH `AuthenticateAccessToken` and `RotateRefreshToken` refuse with `ErrRevoked` |
+| `TestRevokeGrantsForSubject_LeavesOtherSubjectsLive` | **counterfactual vehicle for the `subject = $1` predicate** — reads the OTHER subject's rows back after the call (committed state, not error identity) |
+| `TestRevokeGrantsForSubject_ClientFilterSparesOtherClients` | **counterfactual vehicle for the client filter**, same read-back shape |
+| `TestRevokeGrantsForSubject_RefreshRevokedBeforeAccess` | pins the ORDER: a `BEFORE UPDATE` trigger on `oauth_access_tokens` records how many refresh rows were already revoked inside the same transaction when the access sweep fired |
+| `TestRevokeGrantsForSubject_PartialSweepRollsBack` | **counterfactual vehicle for the single transaction** — a trigger raises on the SECOND statement; the refresh rows must read back live |
+| `TestRevokeGrantsForSubject_SerializesOnLineage` | **counterfactual vehicle for the lineage locks** — an outside transaction holds one code row `FOR UPDATE` and the sweep must BLOCK, exactly as `TestRotateRefreshToken_ReuseSweepSerializesOnLineage` pins rotation |
+| `TestRevokeGrantsForSubject_RacesRotationLeavesNoLiveToken` | the end-to-end invariant under a real race: a rotation chain vs. the sweep, five rounds; no live row survives for the subject and the last successor is `ErrRevoked` |
+| `TestRevokeGrantsForSubject_AlreadyRevokedNotDoubleCounted` / `_UnknownSubjectReturnsZeroNotError` / `_RefusesEmptySubject` | the counts contract and the one refusal (the last is pool-free: a nil pool panics if the guard ever reaches the database) |
+
 ### Classification order: revoked → REUSED → expired
 
 `revoked` first, so a third presentation of an already-swept token reports

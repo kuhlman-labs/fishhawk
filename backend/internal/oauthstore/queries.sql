@@ -243,3 +243,50 @@ UPDATE oauth_refresh_tokens
    SET revoked_at = $2
  WHERE authorization_code_id = $1
    AND revoked_at IS NULL;
+
+-- name: LockAuthorizationCodesForSubject :many
+-- THE SUBJECT SWEEP'S LINEAGE LOCKS (E66.5 / #2393). RevokeGrantsForSubject
+-- takes FOR UPDATE on EVERY lineage root (authorization-code row) for the
+-- subject BEFORE mutating any descendant — the same lock, taken at the same
+-- point, that RotateRefreshToken and RevokeGrantsForCode take
+-- (LockAuthorizationCodeByID). That is what serializes a subject revocation
+-- against a concurrent rotation of any of that subject's lineages: either the
+-- rotation commits first and the sweep's later statement snapshot includes its
+-- successor pair, or the sweep commits first and the rotation's post-lock
+-- re-read observes revoked_at set and mints nothing. Without these locks the
+-- sweep UPDATEs below fix their snapshot when the statement starts, and a
+-- successor inserted after that instant survives.
+--
+-- ORDER BY id makes two concurrent subject sweeps of overlapping subjects take
+-- their locks in one global order, so they queue rather than deadlock.
+-- Selecting only id keeps this a pure lock acquisition; a subject with no codes
+-- locks nothing and is not an error. The optional client_id filter mirrors the
+-- sweep predicates: a NULL filter means every client.
+SELECT id FROM oauth_authorization_codes
+ WHERE subject = sqlc.arg(subject)
+   AND (sqlc.narg(client_id)::text IS NULL OR client_id = sqlc.narg(client_id)::text)
+ ORDER BY id
+   FOR UPDATE;
+
+-- name: RevokeRefreshTokensForSubject :execrows
+-- Half of the operator subject revocation (fishhawkd oauth token revoke). Runs
+-- FIRST inside RevokeGrantsForSubject's transaction: a refresh token is the
+-- credential that can mint MORE, so it is never left live behind an
+-- already-revoked access token. Callers MUST hold the subject's lineage locks
+-- (LockAuthorizationCodesForSubject) first. A NULL client_id means every client.
+UPDATE oauth_refresh_tokens
+   SET revoked_at = sqlc.arg(revoked_at)
+ WHERE subject = sqlc.arg(subject)
+   AND (sqlc.narg(client_id)::text IS NULL OR client_id = sqlc.narg(client_id)::text)
+   AND revoked_at IS NULL;
+
+-- name: RevokeAccessTokensForSubject :execrows
+-- The other half of the subject revocation, run AFTER the refresh sweep in the
+-- same transaction. AND revoked_at IS NULL keeps the returned count honest: an
+-- already-revoked row is never double-counted, and an operator's second
+-- invocation reports zero rather than re-stamping.
+UPDATE oauth_access_tokens
+   SET revoked_at = sqlc.arg(revoked_at)
+ WHERE subject = sqlc.arg(subject)
+   AND (sqlc.narg(client_id)::text IS NULL OR client_id = sqlc.narg(client_id)::text)
+   AND revoked_at IS NULL;

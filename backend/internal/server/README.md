@@ -3055,6 +3055,43 @@ from the request — the derived-authority invariant. The handler cannot widen a
 token's authority by what it passes; the authority is whatever the original
 authorization persisted.
 
+### Token lifecycle: 15-minute access tokens, refresh rotation, operator revocation (E66.5 / #2393)
+
+| Credential | Default lifetime | Knob |
+|---|---|---|
+| authorization code | `60s` | `--oauth-code-ttl` |
+| access token | **`15m`** (`defaultOAuthAccessTokenTTL`) | `--oauth-access-token-ttl` |
+| refresh token | `336h` (14 days, unchanged) | `--oauth-refresh-token-ttl` |
+
+The access token is deliberately SHORT-LIVED: a session rides the refresh grant,
+so a leaked bearer is useful for minutes rather than an hour. `expires_in` is
+stamped per token at mint time from the row (`writeTokenResponse`), never read
+from config at validation time — so a TTL change affects only tokens minted
+after it, and a revert leaves already-minted tokens on their own expiry.
+`resolveOAuthASState` applies the default only when the configured TTL is zero
+or negative; an operator who pinned `1h` explicitly is unaffected.
+
+**Rotation and reuse detection already live in the store.** `grant_type=
+refresh_token` calls `oauthstore.RotateRefreshToken`, which consumes the
+presented token, mints a successor pair chained via `replaced_by_id`, and — on a
+REPLAYED (already-rotated) token — revokes the WHOLE lineage inside the same
+transaction, committed before `ErrRefreshReused` returns. Nothing on that path
+moved in #2393. A client that refreshes proactively derives its margin from the
+credential's own lifetime (`credstore.RefreshSkew`: 2 minutes at the 15-minute
+default), and `oauthttlskew_test.go` pins the server default and that derived
+skew TOGETHER, so a future TTL change that would leave the margin thinner than a
+refresh round-trip fails in-loop rather than in production.
+
+**Operator revocation is a `fishhawkd` verb, not an endpoint.** `fishhawkd
+oauth token revoke --subject <s> [--client-id <c>]` calls
+`oauthstore.RevokeGrantsForSubject`: one transaction, refresh tokens first (the
+credential that can mint more), every lineage root for the subject locked `FOR
+UPDATE` in the order rotation already uses, so a rotation racing the sweep
+cannot slip a successor past it. The RFC 7009 `/revoke` endpoint is
+**deliberately NOT shipped** in this slice — it would be a new public,
+unauthenticated AS route, and the operator refused that scope; it is tracked as
+an operator-filed follow-up. Contract and tests: `backend/internal/oauthstore/README.md`.
+
 ### Client resolution: store-first, no `UpsertClient` on the hot path
 
 `client_id` resolves store-first, in **one** store read: **a `client_id`

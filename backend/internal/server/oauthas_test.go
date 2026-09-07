@@ -211,6 +211,35 @@ func (f *fakeOAuthStore) RevokeGrantsForCode(_ context.Context, codeID uuid.UUID
 	return f.revokeLineageLocked(codeID), nil
 }
 
+// RevokeGrantsForSubject is the in-memory subject sweep (E66.5 / #2393): every
+// live access and refresh token for subject — narrowed to clientID when
+// non-empty — is stamped revoked, and the two counts are returned separately.
+// The real store refuses an empty subject before any round-trip; the fake
+// mirrors that so a server-side caller cannot pass a check here it would fail
+// in production.
+func (f *fakeOAuthStore) RevokeGrantsForSubject(_ context.Context, subject string, clientID string) (int64, int64, error) {
+	if strings.TrimSpace(subject) == "" {
+		return 0, 0, oauthstore.ErrSubjectRequired
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := f.now()
+	var access, refresh int64
+	for _, t := range f.refresh {
+		if t.Subject == subject && (clientID == "" || t.ClientID == clientID) && t.RevokedAt == nil {
+			t.RevokedAt = &now
+			refresh++
+		}
+	}
+	for _, t := range f.access {
+		if t.Subject == subject && (clientID == "" || t.ClientID == clientID) && t.RevokedAt == nil {
+			t.RevokedAt = &now
+			access++
+		}
+	}
+	return access, refresh, nil
+}
+
 func (f *fakeOAuthStore) AuthenticateAccessToken(_ context.Context, plaintext string) (*oauthstore.AccessToken, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -968,5 +997,39 @@ func TestResolveOAuthASState_MisconfiguredWhenPRMURLUnderivable(t *testing.T) {
 	}
 	if !strings.Contains(st.reason, "protected-resource metadata URL") {
 		t.Errorf("reason = %q, want it to name the PRM derivation failure", st.reason)
+	}
+}
+
+// TestResolveOAuthASState_DefaultAccessTokenTTLIsFifteenMinutes is the
+// DONE-MEANS pin for E66.5 / #2393's short-lived access tokens: with
+// Config.OAuthAccessTokenTTL ZERO, the RESOLVED state's accessTokenTTL — the
+// value every minted token's expires_in is stamped from — is 15 minutes. It
+// reads the shipped value through resolveOAuthASState rather than the
+// constant's spelling, so a comment-only touch of the constant block, or a
+// resolver that stopped applying the default, both fail here. The refresh
+// default is asserted alongside as UNCHANGED (336h): the ticket shortens the
+// bearer, not the session. An explicit operator TTL still wins, so a
+// deployment that pinned 1h is unaffected by the new default.
+func TestResolveOAuthASState_DefaultAccessTokenTTLIsFifteenMinutes(t *testing.T) {
+	base := Config{
+		OAuthASIssuer:    testIssuer,
+		OAuthStore:       newFakeOAuthStore(),
+		OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	}
+	st := resolveOAuthASState(base, nil)
+	if st.mode != oauthASEnabled {
+		t.Fatalf("mode = %v, want oauthASEnabled (reason %q)", st.mode, st.reason)
+	}
+	if st.accessTokenTTL != 15*time.Minute {
+		t.Errorf("resolved accessTokenTTL with a zero Config TTL = %v, want 15m — the shipped default every expires_in derives from", st.accessTokenTTL)
+	}
+	if st.refreshTokenTTL != 336*time.Hour {
+		t.Errorf("resolved refreshTokenTTL = %v, want 336h (unchanged by #2393)", st.refreshTokenTTL)
+	}
+
+	pinned := base
+	pinned.OAuthAccessTokenTTL = time.Hour
+	if got := resolveOAuthASState(pinned, nil).accessTokenTTL; got != time.Hour {
+		t.Errorf("an explicitly configured 1h TTL resolved to %v — the default must apply only when the configured TTL is zero", got)
 	}
 }
