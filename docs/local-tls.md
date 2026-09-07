@@ -53,6 +53,17 @@ read from `.env`, so the switch survives the daily loop. `down` tears the proxy
 down **unconditionally** (guarded on the pid file, never on the flag), so
 disabling the flag between `up` and `down` never orphans the proxy.
 
+### Which local story to use
+
+Self-signed CA plus the one-time `NODE_TLS_REJECT_UNAUTHORIZED=0` bootstrap
+(below) **remains the primary, supported local story**: it works, the bypass
+is needed exactly once, and nothing is exposed off-host. Reach for
+[the tunnel](#publicly-trusted-certificate-via-a-tunnel) only in the two
+cases where self-signed cannot win — the one-time bootstrap fails, or you
+genuinely need a publicly-trusted issuer. See "`NODE_EXTRA_CA_CERTS` is NOT
+sufficient for first-time MCP OAuth" below for the bootstrap, and
+"Publicly-trusted certificate via a tunnel" for the fallback and its costs.
+
 ## Client trust — `NODE_EXTRA_CA_CERTS`
 
 Certificates land in the already-gitignored `.fishhawk/cache/tls/`:
@@ -127,8 +138,52 @@ relaunch normally, **without** the variable.
 **Forward path:** the OAuth issuer is only an identifier, and TLS terminates
 at the front proxy — so swapping the self-signed leaf for a publicly-trusted
 certificate removes this problem entirely, with no code change on our side.
-Publicly-trusted-cert / deployment posture is out of scope here; see #2301
-above for the deployed-posture answer.
+See the next section for the recipe, and #2301 above for the deployed-posture
+answer.
+
+### Publicly-trusted certificate via a tunnel
+
+When the one-time bootstrap above isn't an option, or you need a genuinely
+publicly-trusted issuer, front the **plain-http** `fishhawkd` with a tunnel
+instead of the local TLS proxy:
+
+```sh
+cloudflared tunnel --url http://localhost:8080
+```
+
+In tunnel mode `FISHHAWK_DEV_TLS` is **not needed at all** — the tunnel
+terminates TLS itself, so the Caddy front end and the whole local-CA problem
+drop out entirely.
+
+**Config delta.** Both `FISHHAWKD_OAUTH_ISSUER` and `FISHHAWKD_OAUTH_RESOURCE`
+must become the tunnel hostname cloudflared prints (e.g.
+`https://random-words.trycloudflare.com`), not `https://localhost:8443`. A
+quick-tunnel hostname is served on the default TLS port, so it is
+**portless** — the inverse of the `:8443` case in
+[Audience-port foot-gun](#audience-port-foot-gun) below; carry the hostname
+exactly, with no port, on every resource identifier and audience string.
+
+**Three costs, stated plainly, none of them softened:**
+
+- **The issuer identity churns.** A Cloudflare quick tunnel assigns a random
+  hostname that is not stable across restarts — a new hostname on every
+  `cloudflared` restart means any registered client's expectations and any
+  stored token audience go stale, because the OAuth issuer is an identity,
+  not just a transport detail.
+- **The AS is publicly reachable for the tunnel's lifetime.** Unlike the
+  loopback-only TLS proxy, a quick tunnel exposes the endpoint to the
+  internet for as long as it runs.
+- **`FISHHAWKD_OAUTH_REQUIRE_LOOPBACK` does NOT protect against that.** In
+  `backend/internal/server/oauthas.go`, `resolveOAuthASState`'s loopback gate
+  classifies `cfg.Addr` — the listen address — never the issuer. `fishhawkd`
+  keeps listening on `127.0.0.1:8080` under a tunnel, so the gate stays
+  satisfied while the AS it fronts is reachable from anywhere the tunnel
+  hostname resolves. Do not read `REQUIRE_LOOPBACK=true` as protection in
+  this configuration — it isn't providing any.
+
+No CI or local harness exercises a real tunnel; treat the hostname
+cloudflared prints as the operator-verifiable issuer, not a Fishhawk-tested
+path.
 
 Certificates are regenerated only when **missing, within 7 days of expiry, or
 mismatched** (the leaf no longer verifies against the CA). A routine `reload`

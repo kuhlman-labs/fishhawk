@@ -556,8 +556,10 @@ terminates TLS on `:8443` and forwards to the **unmodified** plain-http
 `fishhawkd` on `127.0.0.1:8080`, so the OAuth 2.1 AS can be exercised
 over `https` on a workstation with no Go code changes. Enabled by
 `FISHHAWK_DEV_TLS=1` in `.env`. Operator quickstart, the client-trust
-(`NODE_EXTRA_CA_CERTS`) step, the AS config recipe and the
-audience-port foot-gun: `docs/local-tls.md`.
+(`NODE_EXTRA_CA_CERTS`) step -- not sufficient on its own for first-time
+MCP OAuth; see the doc for the one-time bootstrap and the tunnel
+alternative -- the AS config recipe and the audience-port foot-gun:
+`docs/local-tls.md`.
 
 ### Helper inventory
 

@@ -2918,6 +2918,50 @@ else
   rm -rf "$nv_wd"
 fi
 
+# 16d2. Banner content (#2469 residual): the success banner must still carry
+# the NODE_EXTRA_CA_CERTS export UNCHANGED (the no-regression half — this
+# goes red if the edit mangles the existing line rather than adding to it)
+# and must ALSO name the first-time-MCP-OAuth insufficiency and point at
+# docs/local-tls.md, so an operator reading the banner (not the doc) sees the
+# known gap and where to read about it. Reuses 16d's fixture shape but
+# captures _tls_up's stdout instead of discarding it. Each assertion is
+# checked against the WHOLE captured output with newlines flattened to
+# spaces — never one physical `print` line — so wrapping the banner text
+# across multiple lines cannot make a phrase spuriously pass or fail for the
+# wrong reason.
+if [[ -n "$(_port_listeners 8443)" ]]; then
+  print "skip: port 8443 already has a listener — skipping the banner-content case"
+else
+  bc_wd="$(mktemp -d -t test-dev-tlsbc.XXXXXX)"
+  print '#!/bin/sh\nsleep 30\n' > "$bc_wd/proxy"; chmod +x "$bc_wd/proxy"
+  mkdir -p "$bc_wd/bin"
+  print "#!/bin/sh\nexit 0\n" > "$bc_wd/bin/curl"; chmod +x "$bc_wd/bin/curl"
+  bc_cap="$(
+    TLS_DIR="$bc_wd/tls"; TLS_PID_FILE="$bc_wd/tls.pid"; TLS_LOG_FILE="$bc_wd/tls.log"; LOG_DIR="$bc_wd"
+    export FISHHAWK_DEV_TLS_PROXY_BIN="$bc_wd/proxy"
+    _tls_ensure_certs() { mkdir -p "$1"; : > "$1/ca.pem"; : > "$1/server.pem"; : > "$1/server.key"; return 0 }
+    PATH="$bc_wd/bin:$PATH" _tls_up 2>/dev/null
+    [[ -f "$TLS_PID_FILE" ]] && kill "$(cat "$TLS_PID_FILE")" 2>/dev/null
+  )"
+  bc_flat="$(print -r -- "$bc_cap" | tr '\n' ' ')"
+  if [[ "$bc_flat" == *"export NODE_EXTRA_CA_CERTS=$bc_wd/tls/ca.pem"* ]]; then
+    pass "_tls_up banner still carries the NODE_EXTRA_CA_CERTS export with the derived ca.pem path (no regression)"
+  else
+    fail "_tls_up banner should carry 'export NODE_EXTRA_CA_CERTS=<ca.pem>' unchanged (got: $bc_flat)"
+  fi
+  if [[ "$bc_flat" == *"FIRST-TIME MCP OAuth"* ]]; then
+    pass "_tls_up banner names the first-time-MCP-OAuth insufficiency"
+  else
+    fail "_tls_up banner should name the first-time-MCP-OAuth insufficiency (got: $bc_flat)"
+  fi
+  if [[ "$bc_flat" == *"docs/local-tls.md"* ]]; then
+    pass "_tls_up banner points at docs/local-tls.md"
+  else
+    fail "_tls_up banner should name docs/local-tls.md (got: $bc_flat)"
+  fi
+  rm -rf "$bc_wd"
+fi
+
 # 16e. Failure mode: proxy binary absent. FISHHAWK_DEV_TLS_PROXY_BIN unset and a
 # PATH with no caddy → non-zero, stderr names 'brew install caddy', NO pid file
 # written (the never-silently-skip proof). _tls_resolve_proxy_bin uses only
