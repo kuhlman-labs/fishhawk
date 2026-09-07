@@ -197,18 +197,32 @@ type revisionBaseRender struct {
 	fieldCap    int
 }
 
-// capField renders one variable-length body, accumulating the bytes carried
-// and appending a NAMED elision (the field it belongs to plus its byte
+// capField renders one variable-length body, accumulating the SOURCE bytes
+// carried and appending a NAMED elision (the field it belongs to plus its byte
 // accounting) when it cuts. label names the field so a shortened body always
 // says which body it is.
+//
+// Every rendered body goes through neutralizeLineStructure — the SAME transform
+// sanitizeScopePath applies to the manifest's key names. The digest decodes the
+// prior plan and renders its string bodies as LITERAL text, so without this a
+// decoded `\n` inside a summary, a step description, a criterion statement or a
+// risks_and_assumptions entry becomes a REAL newline and lands planner-authored
+// text at column 0 inside a trusted, binding prompt section — the same
+// impersonation the manifest already guards against. The plan is
+// planner-authored, but the planner consumes untrusted issue text, so plan
+// bodies are untrusted-influenced under Fishhawk's threat model (#3087).
+//
+// The cut and the accounting are taken on the ORIGINAL bytes, before escaping:
+// sourceBytes counts bytes of the prior DOCUMENT carried forward, and escaping
+// only expands the rendered form of those same bytes.
 func (r *revisionBaseRender) capField(label, s string) string {
 	if len(s) <= r.fieldCap {
 		r.sourceBytes += len(s)
-		return s
+		return neutralizeLineStructure(s)
 	}
 	kept := strings.ToValidUTF8(s[:r.fieldCap], "")
 	r.sourceBytes += len(kept)
-	return kept + fmt.Sprintf("...[ELIDED — %s: %d of %d bytes shown, %d bytes dropped]",
+	return neutralizeLineStructure(kept) + fmt.Sprintf("...[ELIDED — %s: %d of %d bytes shown, %d bytes dropped]",
 		label, len(kept), len(s), len(s)-len(kept))
 }
 
@@ -257,9 +271,15 @@ func renderRevisionBaseDigest(base string, p *plan.Plan, doc map[string]json.Raw
 	r.b.WriteString("Approach steps:\n")
 	for i := 0; i < listed; i++ {
 		s := p.Approach[i]
-		body := r.capField(fmt.Sprintf("approach step %d body", s.Step), s.Description)
-		if dropBodies {
-			body = droppedBody(fmt.Sprintf("approach step %d body", s.Step), s.Description)
+		// capField is called ONLY when the body is rendered: it accumulates
+		// sourceBytes, so calling it and then discarding its result would count
+		// withheld content as carried and make the shrink pass UNDER-report
+		// elided bytes — the opposite of the conservative direction the
+		// accounting line claims.
+		label := fmt.Sprintf("approach step %d body", s.Step)
+		body := droppedBody(label, s.Description)
+		if !dropBodies {
+			body = r.capField(label, s.Description)
 		}
 		fmt.Fprintf(&r.b, "Step %d: %s\n", s.Step, body)
 	}
@@ -279,9 +299,10 @@ func renderRevisionBaseDigest(base string, p *plan.Plan, doc map[string]json.Raw
 		for i := 0; i < critListed; i++ {
 			c := crit[i]
 			id := r.capField("acceptance criterion id", c.ID)
-			stmt := r.capField(fmt.Sprintf("acceptance criterion %q statement", c.ID), c.Statement)
-			if dropBodies {
-				stmt = droppedBody(fmt.Sprintf("acceptance criterion %q statement", c.ID), c.Statement)
+			stmtLabel := fmt.Sprintf("acceptance criterion %q statement", c.ID)
+			stmt := droppedBody(stmtLabel, c.Statement)
+			if !dropBodies {
+				stmt = r.capField(stmtLabel, c.Statement)
 			}
 			fmt.Fprintf(&r.b, "- %s: %s\n", id, stmt)
 		}

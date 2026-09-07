@@ -2509,9 +2509,33 @@ func sanitizeScopePath(p string) string {
 	if len(p) > maxScopePathBytes {
 		p = strings.ToValidUTF8(p[:maxScopePathBytes], "") + "...[truncated]"
 	}
+	s := neutralizeLineStructure(p)
+	if strings.TrimSpace(s) == "" {
+		return "(empty path)"
+	}
+	return s
+}
+
+// neutralizeLineStructure is the line-safety transform sanitizeScopePath is
+// built on, factored out so any OTHER renderer that lands document-supplied
+// text inside a trusted prompt section escapes it IDENTICALLY rather than
+// growing a second, subtly weaker escaper. It escapes every line terminator and
+// control character to a visible two-character form and breaks
+// triple-backtick/tilde fences exactly as neutralizeLine breaks them.
+//
+// It neutralizes STRUCTURE, not content: text carrying no control character and
+// no fence passes through byte-unchanged, so every existing render is untouched.
+// It is pure and deterministic, so the package's byte-identical replay
+// invariant holds.
+//
+// Second caller: the over-cap revision-base digest (revisionbase.go), which
+// decodes the prior plan and renders its bodies as literal text — a decoded
+// `\n` inside a step description would otherwise become a real newline and put
+// planner-authored text at column 0 inside a binding section (#3087).
+func neutralizeLineStructure(in string) string {
 	var sb strings.Builder
-	sb.Grow(len(p))
-	for _, r := range p {
+	sb.Grow(len(in))
+	for _, r := range in {
 		switch {
 		case r == '\n':
 			sb.WriteString(`\n`)
@@ -2529,11 +2553,7 @@ func sanitizeScopePath(p string) string {
 		}
 	}
 	s := strings.ReplaceAll(sb.String(), "```", "`` `")
-	s = strings.ReplaceAll(s, "~~~", "~~ ~")
-	if strings.TrimSpace(s) == "" {
-		return "(empty path)"
-	}
-	return s
+	return strings.ReplaceAll(s, "~~~", "~~ ~")
 }
 
 // maxScopeCarryForwardPaths caps how many paths the Revision-base-scope
