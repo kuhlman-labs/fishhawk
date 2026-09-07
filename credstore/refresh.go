@@ -46,6 +46,65 @@ var ErrNotRefreshable = errors.New("credstore: credential carries no refresh tok
 // misbehaving endpoint cannot make the client buffer without limit.
 const maxRefreshBody = 1 << 20
 
+// RedirectRefusedError is what RefuseRedirect returns: a token-endpoint
+// hop that a secret-bearing request refused to follow. From/To carry
+// only scheme://host/path — a redirect target's query is attacker-chosen
+// and never echoed into an error a caller may log.
+type RedirectRefusedError struct {
+	From string
+	To   string
+}
+
+func (e *RedirectRefusedError) Error() string {
+	return fmt.Sprintf("credstore: refusing to follow a redirect from %s to %s: the request body carries an OAuth secret and may only reach the endpoint the credential names", e.From, e.To)
+}
+
+// RefuseRedirect is the http.Client CheckRedirect policy every
+// secret-bearing OAuth request in Fishhawk uses — credstore's refresh
+// here, and the CLI's authorization-code exchange, which imports it so
+// the two halves cannot drift.
+//
+// It follows NOTHING. A 301/302/303 would re-issue the POST as a GET
+// against a destination the credential does not name; a 307/308 replays
+// the form BODY verbatim, so a refresh token, a client_id, an
+// authorization code or a PKCE code_verifier would be delivered to
+// another origin, and an https→http hop would deliver them in the
+// clear. Enforcing "the intended destination and secure transport
+// across redirects" by allowing ZERO redirects makes the destination
+// exactly the configured endpoint by construction: there is no hop to
+// same-origin- or scheme-check.
+//
+// The refusal happens before the redirected request is sent, so the
+// unauthorized destination receives no bytes at all.
+func RefuseRedirect(req *http.Request, via []*http.Request) error {
+	e := &RedirectRefusedError{To: redirectOrigin(req.URL)}
+	if len(via) > 0 {
+		e.From = redirectOrigin(via[len(via)-1].URL)
+	}
+	return e
+}
+
+func redirectOrigin(u *url.URL) string {
+	if u == nil {
+		return "an unparseable URL"
+	}
+	return u.Scheme + "://" + u.Host + u.Path
+}
+
+// withRedirectRefusal returns hc with RefuseRedirect installed, copying
+// the client rather than mutating the caller's: hc is owned by the CLI
+// or fishhawk-mcp and may be shared with unrelated requests. The policy
+// is set UNCONDITIONALLY, overriding any CheckRedirect the caller
+// supplied — a caller cannot opt a refresh out of the control.
+func withRedirectRefusal(hc *http.Client) *http.Client {
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	clone := *hc
+	clone.CheckRedirect = RefuseRedirect
+	return &clone
+}
+
 // tokenResponse is the RFC 6749 §5.1 success body plus the §5.2
 // error envelope, decoded from one shape so a non-2xx carrying either
 // is read the same way.
@@ -83,9 +142,7 @@ func refreshAt(ctx context.Context, hc *http.Client, c Credential, now time.Time
 	if !c.Refreshable() {
 		return Credential{}, ErrNotRefreshable
 	}
-	if hc == nil {
-		hc = http.DefaultClient
-	}
+	hc = withRedirectRefusal(hc)
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", c.RefreshToken)
@@ -191,14 +248,7 @@ func RefreshStored(ctx context.Context, hc *http.Client, backendURL string) (Cre
 }
 
 func refreshStoredAt(ctx context.Context, hc *http.Client, backendURL string, now time.Time) (Credential, error) {
-	d, err := configDir()
-	if err != nil {
-		return Credential{}, err
-	}
-	if err := os.MkdirAll(d, dirPerm); err != nil {
-		return Credential{}, fmt.Errorf("credstore: create %s: %w", d, err)
-	}
-	unlock, err := lockExclusive(filepath.Join(d, fileName+".lock"))
+	unlock, err := lockStore(ctx)
 	if err != nil {
 		return Credential{}, err
 	}
@@ -218,28 +268,87 @@ func refreshStoredAt(ctx context.Context, hc *http.Client, backendURL string, no
 	if err != nil {
 		return Credential{}, err
 	}
-	if err := Store(backendURL, fresh); err != nil {
+	// storeLocked, not Store: the lock is already held on this
+	// goroutine's file description and flock would block on a second one.
+	if err := storeLocked(backendURL, fresh); err != nil {
 		return Credential{}, fmt.Errorf("credstore: persist rotated credential: %w", err)
 	}
 	return fresh, nil
 }
 
-// lockExclusive takes a blocking exclusive flock on path (created
-// 0600 if absent) and returns the release func. flock is advisory and
-// process-scoped, which is exactly the multi-process serialization
-// RefreshStored needs; within one process the kernel still serializes
-// distinct file descriptors, so concurrent goroutines are covered too.
-func lockExclusive(path string) (func(), error) {
+// lockWait bounds how long any credential-store operation waits for
+// the shared lock before failing loud, and lockPollInterval is how
+// often the non-blocking acquire is retried. The bound matters because
+// flock has no timeout: a SUSPENDED peer holding credentials.lock would
+// otherwise wedge every consumer forever, and the CLI/MCP 30s refresh
+// deadline could not be honored.
+const (
+	lockWait         = 10 * time.Second
+	lockPollInterval = 20 * time.Millisecond
+)
+
+// lockPath returns the sibling lock file for the credential store,
+// creating the config dir if needed.
+func lockPath() (string, error) {
+	d, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(d, dirPerm); err != nil {
+		return "", fmt.Errorf("credstore: create %s: %w", d, err)
+	}
+	return filepath.Join(d, fileName+".lock"), nil
+}
+
+// lockExclusive takes an exclusive flock on path (created 0600 if
+// absent) and returns the release func. flock is advisory and
+// process-scoped, which is exactly the multi-process serialization the
+// store needs; within one process the kernel still serializes distinct
+// file descriptors, so concurrent goroutines are covered too.
+//
+// The wait is BOUNDED and CANCELLABLE: syscall.Flock offers no timeout
+// and no way to abort, so a blocking LOCK_EX under a peer that is
+// suspended (SIGSTOP, a debugger, a swapped-out process) would ignore
+// ctx entirely and outlive the caller's deadline. Instead the acquire
+// is LOCK_NB and retried on ctx's schedule, so cancellation and the
+// caller's deadline are honored while contended, and the returned error
+// wraps ctx.Err() so errors.Is(err, context.DeadlineExceeded) holds.
+func lockExclusive(ctx context.Context, path string) (func(), error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, filePerm) //nolint:gosec // path is under the 0700 config dir
 	if err != nil {
 		return nil, fmt.Errorf("credstore: open lock %s: %w", path, err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("credstore: lock %s: %w", path, err)
-	}
-	return func() {
+	release := func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		_ = f.Close()
-	}, nil
+	}
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return release, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			_ = f.Close()
+			return nil, fmt.Errorf("credstore: lock %s: %w", path, err)
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, fmt.Errorf("credstore: waiting for the credential lock %s (another fishhawk process is holding it): %w", path, ctx.Err())
+		case <-time.After(lockPollInterval):
+		}
+	}
+}
+
+// lockStore acquires the credential-store lock, bounding the wait at
+// lockWait and honoring ctx. Every read-modify-write of the credential
+// file — a refresh rotation AND a login write — runs under it.
+func lockStore(ctx context.Context) (func(), error) {
+	path, err := lockPath()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, lockWait)
+	defer cancel()
+	return lockExclusive(ctx, path)
 }

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -648,5 +649,62 @@ func TestOAuthLogin_RedirectURIShapeMatchesSharedFixture(t *testing.T) {
 	}
 	if !strings.Contains(string(readme), fx.RegisterCommand) {
 		t.Errorf("cli/README.md does not document the one-time register command the fixture names:\n%s", fx.RegisterCommand)
+	}
+}
+
+// TestOAuthLogin_TokenExchangeRefusesRedirectAndLeaksNothing is the
+// behavioral half of the credential-exfiltration concern on the CLI's
+// authorization-code leg: the exchange POST carries the code, the PKCE
+// code_verifier and the client_id, and a 307/308 replays that body at
+// whatever origin the response names.
+//
+// The hop is a REACHABLE in-test server (an unreachable address would
+// produce a dial error indistinguishable from the refusal), it records
+// every request and body it sees, and the assertion is that it saw
+// ZERO — plus no credential was stored.
+func TestOAuthLogin_TokenExchangeRefusesRedirectAndLeaksNothing(t *testing.T) {
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect, http.StatusFound} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			var hopHits atomic.Int32
+			var hopMu sync.Mutex
+			var hopBodies []string
+			hop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hopHits.Add(1)
+				b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+				hopMu.Lock()
+				hopBodies = append(hopBodies, r.URL.RawQuery+" "+string(b))
+				hopMu.Unlock()
+				writeJSON(w, http.StatusOK, oauthTokenExchangeResponse{AccessToken: "stolen", ExpiresIn: 900})
+			}))
+			defer hop.Close()
+
+			as := newOAuthTestAS(t)
+			setupOAuthLoginTest(t)
+			redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, hop.URL+"/v0/oauth/token", status)
+			}))
+			defer redirector.Close()
+			as.mu.Lock()
+			as.metaDoc.TokenEndpoint = redirector.URL + "/v0/oauth/token"
+			as.mu.Unlock()
+
+			browserThatCallsBack(t, nil, callbackWithCode(as.srv.URL))
+			code, _, stderr := runOAuthLoginCmd(t, as)
+			if code != exitFailure {
+				t.Fatalf("exit=%d, want 1 (the redirect must be refused)\nstderr=%s", code, stderr)
+			}
+			if n := hopHits.Load(); n != 0 {
+				hopMu.Lock()
+				bodies := hopBodies
+				hopMu.Unlock()
+				t.Fatalf("the redirect destination received %d request(s): %q — the authorization code and PKCE verifier were exfiltrated", n, bodies)
+			}
+			if !strings.Contains(stderr, "refusing to follow a redirect") {
+				t.Errorf("stderr does not name the redirect refusal:\n%s", stderr)
+			}
+			if _, err := credstore.Load(as.srv.URL); err == nil {
+				t.Errorf("a credential was stored after a refused exchange")
+			}
+		})
 	}
 }

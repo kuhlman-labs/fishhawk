@@ -104,8 +104,14 @@ var (
 	}
 	oauthOpenBrowser = func(u string) error { return openBrowser(u) }
 	oauthLoginWindow = 10 * time.Minute
-	oauthHTTPClient  = &http.Client{Timeout: 60 * time.Second}
-	oauthNow         = time.Now
+	// The exchange client follows NO redirects: the POST body carries the
+	// authorization code, the PKCE code_verifier and the client_id, and a
+	// 307/308 replays that body verbatim against whatever origin the
+	// response names — including an https→http downgrade. credstore's
+	// RefuseRedirect is the SAME policy the refresh path installs, imported
+	// rather than re-declared so the two halves cannot drift.
+	oauthHTTPClient = &http.Client{Timeout: 60 * time.Second, CheckRedirect: credstore.RefuseRedirect}
+	oauthNow        = time.Now
 )
 
 // oauthLoginParams is everything runOAuthLogin needs from tokenLogin.

@@ -13,6 +13,7 @@
 package credstore
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -219,7 +220,37 @@ func Load(backendURL string) (Credential, error) {
 // store. The write is atomic (temp file + rename) so a crash mid-
 // write never truncates an existing credential set, and the file is
 // left mode 0600.
+//
+// The read-merge-write runs under the SAME exclusive `credentials.lock`
+// RefreshStored uses. Without it a login write racing a refresh would
+// read the store before the rotation landed and rename its stale merge
+// over it — restoring a refresh token the authorization server has
+// already consumed, so the next use trips reuse detection and revokes
+// the lineage. The races are cross-BACKEND too (a login for one backend
+// clobbering another's rotation), because the store is ONE JSON file.
+//
+// The wait is bounded at lockWait and fails loud rather than blocking
+// forever behind a suspended peer. Callers already holding the lock
+// call storeLocked instead — flock would block on a second descriptor.
 func Store(backendURL string, cred Credential) error {
+	unlock, err := lockStore(context.Background())
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return storeLocked(backendURL, cred)
+}
+
+// storeMergeBarrier is a TEST SEAM, nil in production. storeLocked calls
+// it (with the backend URL being written) between reading the existing
+// store and writing the merged result, which is exactly the window the
+// lock closes — it lets the credstore tests hold a writer inside that
+// window deterministically instead of racing the clock.
+var storeMergeBarrier func(backendURL string)
+
+// storeLocked is Store's body with the caller responsible for holding
+// the credential-store lock.
+func storeLocked(backendURL string, cred Credential) error {
 	d, err := configDir()
 	if err != nil {
 		return err
@@ -230,6 +261,9 @@ func Store(backendURL string, cred Credential) error {
 	all, err := List()
 	if err != nil {
 		return err
+	}
+	if storeMergeBarrier != nil {
+		storeMergeBarrier(normalizeURL(backendURL))
 	}
 	all[normalizeURL(backendURL)] = cred
 
