@@ -1589,6 +1589,33 @@ The guard returns immediately for every non-agent identity, so the common operat
 
 **Consequence, stated plainly: after this change an agent still cannot approve the grooming confirm gate. A human must.** That is the gate working as declared, not a gap — which is also why no MCP verb was added: an MCP tool is invoked under exactly the delegated operator-agent identity the second rung refuses, so the verb would be refused by its own handler on every real call. The human path is documented in `docs/GROOMING_RUNBOOK.md` §5: since E54.55 / #3051 it leads with the CLI verb `fishhawk approve-review-gate <run-id> --attest "..."` (which resolves the parked review stage from the run id and, being a CLI verb run under a human-held credential, is refused by neither rung), with the exact `curl` kept as the documented fallback. Neither is an MCP tool, so the paragraph above is unchanged by it.
 
+### What the plan-gate approval stamps on a run with no implement stage (E54.52 / #3014)
+
+`recordDrivePlanApproved` used to call `drive.EvaluatePlanApproved` unconditionally, so EVERY plan-gate approval on a drive run synthesized an implement-stage transition — including on `backlog_grooming`, which declares no implement stage. Two observed grooming runs (1499bdb0, 7bd6c6d3) were left pointing at a stage their workflow never declares. It now resolves the plan gate's DECLARED successor first, via the pure `planApprovedSuccessor(stages []*run.Stage)`:
+
+| Resolved successor | Condition | What is stamped |
+|---|---|---|
+| `planSuccessorImplement` | an implement-typed row exists ANYWHERE in the list, in any state | `plan_approved_dispatch`, byte-identical to pre-#3014: `implement:dispatched` on `github_actions`, parked `implement:awaiting_host_dispatch` + a `run_implement_stage` next action on `local` (ADR-024) |
+| `planSuccessorHumanReviewGate` | no implement row, and a review row whose `executor_kind` is `human` | `plan_approved_human_gate`: `plan:approved` -> `review:awaiting_approval`, parked, **no next action** — the gate is approved by a human-held credential through `fishhawk approve-review-gate`, and the MCP classifier owns the operator-facing entry (`human_review_gate_parked`) |
+| `planSuccessorUnknown` | neither | NOTHING is recorded, plus a WARN. A rule that cannot name a real edge stays inert rather than synthesizing a transition to a stage that does not exist |
+
+The implement row winning UNCONDITIONALLY is what makes the founder's regression guard structural rather than incidental — `TestRecordDrivePlanApproved_FeatureChangeShape_Unchanged` drives both runner kinds against a fixture that carries the human review row TOO, so it proves precedence and not merely absence.
+
+The successor is read from the run's stage ROWS, never by re-parsing the cached spec: `webhook.CreateStagesFromSpec` materializes one row per declared spec stage at run-create and `mapExecutor` writes `executor_kind` straight from that stage's own `executor`, so the row IS the cached spec's declaration — the same leg `reviewGateAdmitNotHumanRow` trusts.
+
+**The fail-open is deliberately narrow.** `run.Repository.ListStagesForRun` returns `(nil, error)` on a read failure (the Postgres adapter wraps the query error and returns a nil slice; it never substitutes an empty list for one), and a non-nil EMPTY slice only for a run with genuinely zero rows. So ONLY `err != nil` or `len(stages) == 0` falls back to today's `plan_approved_dispatch` stamp — this surface is display-only attribution and must not go silent because a read broke. A successfully read, NON-EMPTY list is trusted and decides the rule; the fail-open is not widened past those two cases. `TestRecordDrivePlanApproved_StageListError_FailsOpen` pins the error branch and `TestRecordDrivePlanApproved_EmptyStageList_FailsOpen` the length branch — each with a fixture that WOULD resolve to the human gate if the list were visible, so a pass cannot be explained by the fixture. The empty leg is defensive (a created run never has zero rows), so its fake is given an explicit knob rather than the test contorting the fixture; without it that leg's DIRECTION would be untested.
+
+### The read side: a next_action naming an undeclared stage (E54.52 / #3014)
+
+The emission fix cannot repair an entry already written, so `nextActionStale` (`runs.go`) tightened its no-matching-row fall-through, and the two branches point OPPOSITE ways on purpose:
+
+- **NON-EMPTY list, no stage of the named type → SUPPRESS.** The list is positive evidence that the workflow declares no such stage, so a `run_implement_stage` action names a dispatch that will never become legal. This is what makes the two already-stamped grooming runs read correctly.
+- **NIL or EMPTY list → still fail OPEN.** That is not evidence about the workflow's shape; it is the caller's documented read-error degrade (`applyDriveSurfaces` and `stageNextAction` both pass nil when `ListStagesForRun` errors), so a degraded read never hides a dispatch the operator genuinely owes.
+
+`TestGetRun_NextAction_HostDispatchNamesUndeclaredStage_Suppressed` and `TestGetRun_NextAction_EmptyStageList_FailsOpen` pin the pair; the former REPLACES the pre-#3014 `..._NoMatchingStage_Surfaces`, whose assertion was the opposite. The `{pending, awaiting_host_dispatch}` per-state branch (#1961) and every non-dispatch action string are untouched.
+
+The whole seam is pinned end to end by the shared wire fixture `backend/internal/server/testdata/human_review_gate_wire.json`: `TestGetRun_HumanReviewGate_MatchesWireFixture` asserts the file IS the server's own canonicalized `GET /v0/runs/{id}` + `GET /v0/runs/{id}/stages` bodies, and `backend/internal/mcpserver`'s classifier tests read that same file and decode it through the real MCP wire types, so a json-tag drift on either side reddens the pair.
+
 ### The attestation is required on an approve
 
 `requireReviewGateAttestation` refuses an `approve` carrying an empty or whitespace-only comment with `400 attestation_required`. The confirm gate exists because an audit row saying `applied` is not the same claim as the tracker CARRYING the change (walk #2844 / #2847) — the attestation IS what the gate records. The guard is DECISION-SCOPED: a `reject` is itself the judgment and needs no attestation, and plan-gate / deploy-gate approve comments are untouched. `TestRequireReviewGateAttestation_DecisionScoped` and the paired `TestSubmitApproval_HumanReviewGate_RejectNeedsNoAttestation` pin both directions — deleting the decision scoping reddens the reject case, neutralizing the emptiness check reddens the approve cases.

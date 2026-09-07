@@ -90,6 +90,17 @@ stage was removed (#2851).
 reported eight applied while every applied VALUE was garbage. An audit row saying
 `applied` is not the same claim as the tracker carrying the change.
 
+**What the run reports the moment you approve (E54.52 / #3014).** `backlog_grooming`
+declares no implement stage, so the plan-gate approval stamps `plan_approved_human_gate`
+— `plan:approved` -> `review:awaiting_approval`, parked, with **no** `next_action` —
+rather than the `plan_approved_dispatch` / `run_implement_stage` park an
+implement-declaring workflow gets. `fishhawk_get_run_status` correspondingly classifies
+the run `human_review_gate_parked`, names the `confirm` stage's `stage_id`, and offers
+`approve_review_gate` (and a `fishhawk_list_audit` read) — so the surface points at §5's
+CLI verb at exactly the moment this section tells you to go check the forge. Before
+#3014 it reported `unclassified` while `drive_status` named an implement stage the
+workflow never declares.
+
 ## 5. Confirming is the second write
 
 The `confirm` stage is a `type: review` gate declaring `executor: human` with
@@ -142,6 +153,20 @@ curl -sS -X POST "$FISHHAWK_BACKEND_URL/v0/stages/<confirm_stage_id>/approvals" 
 - **An approval is bound to the STAGE ROW, not to the run's intent.** Retrying or
   re-running creates new stage rows, so a prior approval cannot be reused; you approve
   the new row.
+**Verify hint — the executable operator walk (#3014).** The sandbox cannot produce a
+plan-gate approval on a spec-created `backlog_grooming` run against the preview, so this
+is the walk that validates the surface end to end on a real run:
+
+1. Start a `backlog_grooming` run and let the plan stage settle.
+2. `fishhawk_approve_plan` the plan gate (§4).
+3. `fishhawk_get_run_status` — **expect** `next_actions.state` `human_review_gate_parked`,
+   its first action `approve_review_gate` carrying the `confirm` stage's `stage_id`, and
+   `drive_status.auto_advanced` ending in `plan_approved_human_gate`
+   (`to: review:awaiting_approval`) with **no** `drive_status.next_action`. A reported
+   `unclassified`, or any action naming `run_implement_stage`, refutes it.
+4. `bin/fishhawk approve-review-gate <run-id> --attest "<what you checked on the forge>"`
+   — **expect** the run to advance to `succeeded`.
+
 - A 409 with `details.admission_reason` means the gate was not admitted. `pull_request_managed`
   means you are looking at a PR-merge review stage (approve it by merging the PR);
   anything else (`workflow_spec_unparseable`, `multiple_review_spec_stages`,

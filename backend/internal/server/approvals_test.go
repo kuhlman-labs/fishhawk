@@ -90,14 +90,19 @@ func (f *fakeApprovalRepo) ListForStage(_ context.Context, stageID uuid.UUID) ([
 // tests: GetStage returns the seeded stage, TransitionStage records
 // the transition.
 type approvalRunRepo struct {
-	mu             sync.Mutex
-	stages         map[uuid.UUID]*run.Stage
-	runs           map[uuid.UUID]*run.Run
-	getErr         error
-	listStagesErr  error
-	transitionErr  error
-	transitions    []approvalTransition
-	rejectionFails bool
+	mu            sync.Mutex
+	stages        map[uuid.UUID]*run.Stage
+	runs          map[uuid.UUID]*run.Run
+	getErr        error
+	listStagesErr error
+	// listStagesEmpty makes ListStagesForRun return a successfully-read but
+	// EMPTY list (#3014): the other leg of recordDrivePlanApproved's
+	// `listErr != nil || len(stages) == 0` fail-open, which no fixture can
+	// reach naturally because every seeded run carries at least its plan row.
+	listStagesEmpty bool
+	transitionErr   error
+	transitions     []approvalTransition
+	rejectionFails  bool
 
 	// transitionRunEnabled makes TransitionRun functional (E48.55 / #2328).
 	// It defaults false so TransitionRun returns the same errors.New("not
@@ -163,6 +168,28 @@ func (r *approvalRunRepo) seedGatelessStage(state run.StageState) *run.Stage {
 	r.mu.Lock()
 	st.RequiresApproval = false
 	st.Type = run.StageTypeImplement
+	r.mu.Unlock()
+	return st
+}
+
+// seedSiblingStage appends another stage row to an EXISTING run so
+// ListStagesForRun reports the run's declared shape (#3014): the plan-approved
+// successor resolution reads the run's stage rows, so a test that wants
+// feature_change semantics must seed the implement row the workflow declares.
+func (r *approvalRunRepo) seedSiblingStage(runID uuid.UUID, typ run.StageType, kind run.ExecutorKind, state run.StageState) *run.Stage {
+	st := &run.Stage{
+		ID:           uuid.New(),
+		RunID:        runID,
+		Sequence:     1,
+		Type:         typ,
+		ExecutorKind: kind,
+		ExecutorRef:  "claude-code",
+		State:        state,
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
+	}
+	r.mu.Lock()
+	r.stages[st.ID] = st
 	r.mu.Unlock()
 	return st
 }
@@ -316,6 +343,9 @@ func (r *approvalRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) (
 	defer r.mu.Unlock()
 	if r.listStagesErr != nil {
 		return nil, r.listStagesErr
+	}
+	if r.listStagesEmpty {
+		return []*run.Stage{}, nil
 	}
 	var out []*run.Stage
 	for _, st := range r.stages {
@@ -4687,6 +4717,9 @@ func TestSubmitApproval_Drive_GitHubActions_StampsAutoAdvance(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	stage := rr.seedStage(run.StageStateAwaitingApproval)
 	rr.seedRun(&run.Run{ID: stage.RunID, Drive: true, RunnerKind: run.RunnerKindGitHubActions})
+	// #3014: the rule now fires only for a run that DECLARES an implement
+	// stage, so the implement row is part of the fixture rather than implied.
+	rr.seedSiblingStage(stage.RunID, run.StageTypeImplement, run.ExecutorAgent, run.StageStatePending)
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	if w.Code != http.StatusOK {
@@ -4720,6 +4753,9 @@ func TestSubmitApproval_Drive_Local_ParksWithNextAction(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	stage := rr.seedStage(run.StageStateAwaitingApproval)
 	rr.seedRun(&run.Run{ID: stage.RunID, Drive: true, RunnerKind: run.RunnerKindLocal})
+	// #3014: see the sibling github_actions test — the implement row is what
+	// makes this the feature_change shape the plan_approved_dispatch rule owns.
+	rr.seedSiblingStage(stage.RunID, run.StageTypeImplement, run.ExecutorAgent, run.StageStatePending)
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	if w.Code != http.StatusOK {
@@ -4744,6 +4780,233 @@ func TestSubmitApproval_Drive_Local_ParksWithNextAction(t *testing.T) {
 	}
 	if adv.NextAction == nil || adv.NextAction.Action != "run_implement_stage" {
 		t.Fatalf("NextAction = %+v, want action run_implement_stage", adv.NextAction)
+	}
+}
+
+// --- plan-approved successor resolution (E54.52 / #3014) --------------------
+
+// seedPlanApprovedSuccessorRun wires a drive-enabled run of the given runner
+// kind whose plan stage is parked at its gate, and returns the server, the
+// audit fake and the plan stage. Callers seed the successor rows themselves so
+// each shape is built BY CONSTRUCTION — the RED lands on the payload assertion,
+// never on fixture setup.
+func seedPlanApprovedSuccessorRun(t *testing.T, runnerKind string) (*Server, *approvalRunRepo, *approvalAuditFake, *run.Stage) {
+	t.Helper()
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.seedRun(&run.Run{ID: stage.RunID, Drive: true, RunnerKind: runnerKind})
+	return s, rr, au, stage
+}
+
+// TestRecordDrivePlanApproved_NoImplementStage_StampsHumanGate is the #3014
+// defect itself: a backlog_grooming-shaped run — a plan stage plus a
+// HUMAN-executor review gate, no implement stage — approved at its plan gate
+// stamps plan_approved_human_gate naming the real review:awaiting_approval
+// edge, parked, with NO next action. The second assertion is the issue's own
+// acceptance criterion: the string "implement" appears in NEITHER the to edge
+// NOR any next_action, because the workflow declares no implement stage.
+//
+// COUNTERFACTUAL (executed, #3014): deleting the successor switch in
+// recordDrivePlanApproved and calling recordDrivePlanApprovedDispatch
+// unconditionally turns this RED with
+// `Rule = "plan_approved_dispatch", want plan_approved_human_gate` plus
+// `To = "implement:awaiting_host_dispatch" names an implement stage the
+// workflow does not declare`. Restored byte-identically afterwards.
+func TestRecordDrivePlanApproved_NoImplementStage_StampsHumanGate(t *testing.T) {
+	s, rr, au, stage := seedPlanApprovedSuccessorRun(t, run.RunnerKindLocal)
+	rr.seedSiblingStage(stage.RunID, run.StageTypeReview, run.ExecutorHuman, run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	advances := driveAdvanceFor(t, au)
+	if len(advances) != 1 {
+		t.Fatalf("run_auto_advanced entries = %d, want 1 (%+v)", len(advances), advances)
+	}
+	adv := advances[0]
+	if adv.Rule != drive.RulePlanApprovedHumanGate {
+		t.Errorf("Rule = %q, want plan_approved_human_gate", adv.Rule)
+	}
+	if adv.From != "plan:approved" || adv.To != "review:awaiting_approval" {
+		t.Errorf("edge = %q -> %q, want plan:approved -> review:awaiting_approval", adv.From, adv.To)
+	}
+	if !adv.Parked {
+		t.Error("Parked = false, want true: the run parks at a gate the backend cannot advance")
+	}
+	if adv.NextAction != nil {
+		t.Errorf("NextAction = %+v, want nil: the gate is approved by a human-held credential via the CLI verb, not a host dispatch", adv.NextAction)
+	}
+	// The issue's acceptance criterion: nothing in the stamp names an
+	// implement stage the workflow never declared.
+	if strings.Contains(adv.To, "implement") {
+		t.Errorf("To = %q names an implement stage the workflow does not declare", adv.To)
+	}
+	if adv.NextAction != nil && strings.Contains(adv.NextAction.Action, "implement") {
+		t.Errorf("NextAction.Action = %q names an implement stage the workflow does not declare", adv.NextAction.Action)
+	}
+}
+
+// TestRecordDrivePlanApproved_FeatureChangeShape_Unchanged is the founder's
+// binding regression guard (approval condition 1): a run that DOES declare an
+// implement stage still stamps plan_approved_dispatch exactly as before #3014,
+// on BOTH runner kinds — local parks at implement:awaiting_host_dispatch with
+// the run_implement_stage next action, github_actions records the executed
+// implement:dispatched advance unparked. The fixture carries the human review
+// stage TOO, so it proves the implement row WINS over a human review gate
+// rather than merely testing a run that has no review stage.
+func TestRecordDrivePlanApproved_FeatureChangeShape_Unchanged(t *testing.T) {
+	cases := []struct {
+		name           string
+		runnerKind     string
+		wantTo         string
+		wantParked     bool
+		wantNextAction string
+	}{
+		{"local", run.RunnerKindLocal, "implement:awaiting_host_dispatch", true, "run_implement_stage"},
+		{"github_actions", run.RunnerKindGitHubActions, "implement:dispatched", false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, au, stage := seedPlanApprovedSuccessorRun(t, tc.runnerKind)
+			rr.seedSiblingStage(stage.RunID, run.StageTypeImplement, run.ExecutorAgent, run.StageStatePending)
+			rr.seedSiblingStage(stage.RunID, run.StageTypeReview, run.ExecutorHuman, run.StageStatePending)
+
+			w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+
+			advances := driveAdvanceFor(t, au)
+			if len(advances) != 1 {
+				t.Fatalf("run_auto_advanced entries = %d, want 1 (%+v)", len(advances), advances)
+			}
+			adv := advances[0]
+			if adv.Rule != drive.RulePlanApprovedDispatch {
+				t.Errorf("Rule = %q, want plan_approved_dispatch (the implement row must win)", adv.Rule)
+			}
+			if adv.To != tc.wantTo {
+				t.Errorf("To = %q, want %q", adv.To, tc.wantTo)
+			}
+			if adv.Parked != tc.wantParked {
+				t.Errorf("Parked = %v, want %v", adv.Parked, tc.wantParked)
+			}
+			if tc.wantNextAction == "" {
+				if adv.NextAction != nil {
+					t.Errorf("NextAction = %+v, want nil", adv.NextAction)
+				}
+			} else if adv.NextAction == nil || adv.NextAction.Action != tc.wantNextAction {
+				t.Errorf("NextAction = %+v, want action %q", adv.NextAction, tc.wantNextAction)
+			}
+		})
+	}
+}
+
+// TestRecordDrivePlanApproved_NoSuccessor_RecordsNothing pins the third
+// resolver outcome: a run whose only stage row is the plan stage declares
+// neither an implement stage nor a human review gate, so NOTHING is recorded —
+// a rule that cannot name a real edge stays inert rather than synthesizing a
+// transition to a stage that does not exist.
+//
+// COUNTERFACTUAL (executed, #3014): with the successor switch deleted this goes
+// RED with `run_auto_advanced entries = [{plan_approved_dispatch plan:approved
+// implement:awaiting_host_dispatch ...}], want none`. Restored afterwards.
+func TestRecordDrivePlanApproved_NoSuccessor_RecordsNothing(t *testing.T) {
+	s, _, au, stage := seedPlanApprovedSuccessorRun(t, run.RunnerKindLocal)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if advances := driveAdvanceFor(t, au); len(advances) != 0 {
+		t.Errorf("run_auto_advanced entries = %+v, want none on a run declaring no successor stage", advances)
+	}
+}
+
+// TestRecordDrivePlanApproved_StageListError_FailsOpen pins the degrade
+// direction: run.Repository.ListStagesForRun returns (nil, error) on a read
+// failure, and the stamp must not go silent because a display-only read broke —
+// it keeps today's plan_approved_dispatch behaviour. The fixture seeds a
+// HUMAN-review successor that WOULD resolve to plan_approved_human_gate if the
+// list were readable, so a passing test cannot be explained by the fixture.
+func TestRecordDrivePlanApproved_StageListError_FailsOpen(t *testing.T) {
+	s, rr, au, stage := seedPlanApprovedSuccessorRun(t, run.RunnerKindLocal)
+	rr.seedSiblingStage(stage.RunID, run.StageTypeReview, run.ExecutorHuman, run.StageStateAwaitingApproval)
+	rr.listStagesErr = errors.New("stage store down")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	advances := driveAdvanceFor(t, au)
+	if len(advances) != 1 || advances[0].Rule != drive.RulePlanApprovedDispatch {
+		t.Fatalf("run_auto_advanced = %+v, want one plan_approved_dispatch entry (fail-open on a stage-list read error)", advances)
+	}
+}
+
+// TestRecordDrivePlanApproved_EmptyStageList_FailsOpen is the SECOND leg of the
+// same fail-open: `listErr != nil || len(stages) == 0` also treats a
+// successfully-read but EMPTY list as no-evidence and keeps today's
+// plan_approved_dispatch stamp. The error leg above pins the error half; this
+// pins the DIRECTION of the length half, which no other fixture reaches because
+// every seeded run carries at least its plan row (the branch is defensive — a
+// created run never has zero rows — so the fake is given an explicit knob
+// rather than the test contorting the fixture).
+//
+// Like the error leg, the fixture seeds a HUMAN-review successor that WOULD
+// resolve to plan_approved_human_gate if the list were visible, so a pass
+// cannot be explained by the fixture's own shape.
+//
+// COUNTERFACTUAL (executed, #3014 fix-up): narrowing the guard to
+// `if listErr != nil` turns this RED with `run_auto_advanced = [], want one
+// plan_approved_dispatch entry (fail-open on an empty stage list)`. Restored
+// byte-identically afterwards.
+func TestRecordDrivePlanApproved_EmptyStageList_FailsOpen(t *testing.T) {
+	s, rr, au, stage := seedPlanApprovedSuccessorRun(t, run.RunnerKindLocal)
+	rr.seedSiblingStage(stage.RunID, run.StageTypeReview, run.ExecutorHuman, run.StageStateAwaitingApproval)
+	rr.listStagesEmpty = true
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	advances := driveAdvanceFor(t, au)
+	if len(advances) != 1 || advances[0].Rule != drive.RulePlanApprovedDispatch {
+		t.Fatalf("run_auto_advanced = %+v, want one plan_approved_dispatch entry (fail-open on an empty stage list)", advances)
+	}
+}
+
+// TestPlanApprovedSuccessor_Table is the direct unit on the pure resolver, one
+// case per outcome including the two orderings that would break a
+// first-row-wins implementation.
+func TestPlanApprovedSuccessor_Table(t *testing.T) {
+	runID := uuid.New()
+	stageOf := func(typ run.StageType, kind run.ExecutorKind) *run.Stage {
+		return &run.Stage{ID: uuid.New(), RunID: runID, Type: typ, ExecutorKind: kind}
+	}
+	cases := []struct {
+		name   string
+		stages []*run.Stage
+		want   planSuccessor
+	}{
+		{"implement_only", []*run.Stage{stageOf(run.StageTypeImplement, run.ExecutorAgent)}, planSuccessorImplement},
+		{"implement_after_human_review", []*run.Stage{
+			stageOf(run.StageTypeReview, run.ExecutorHuman),
+			stageOf(run.StageTypeImplement, run.ExecutorAgent),
+		}, planSuccessorImplement},
+		{"human_review_only", []*run.Stage{stageOf(run.StageTypeReview, run.ExecutorHuman)}, planSuccessorHumanReviewGate},
+		{"agent_review_only", []*run.Stage{stageOf(run.StageTypeReview, run.ExecutorAgent)}, planSuccessorUnknown},
+		{"plan_only", []*run.Stage{stageOf(run.StageTypePlan, run.ExecutorAgent)}, planSuccessorUnknown},
+		{"nil_entry_skipped", []*run.Stage{nil, stageOf(run.StageTypeReview, run.ExecutorHuman)}, planSuccessorHumanReviewGate},
+		{"empty", nil, planSuccessorUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := planApprovedSuccessor(tc.stages); got != tc.want {
+				t.Errorf("planApprovedSuccessor = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

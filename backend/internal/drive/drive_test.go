@@ -51,6 +51,7 @@ func (a *auditStub) ListForRunByCategory(_ context.Context, runID uuid.UUID, cat
 func TestMechanical_RuleTable(t *testing.T) {
 	for _, rule := range []Rule{
 		RulePlanApprovedDispatch,
+		RulePlanApprovedHumanGate,
 		RuleReviseReplan,
 		RuleRetryReopen,
 		RuleRecoverRedispatch,
@@ -396,5 +397,21 @@ func TestEngineLatestRuleIs(t *testing.T) {
 	// a malformed newest entry cannot be treated as the latest rule.
 	if (&Engine{Audit: auMalformedLatest}).LatestRuleIs(ctx, runID, RuleFixupRereviewRepark) {
 		t.Error("LatestRuleIs = true for a rule not named by any decodable entry; want false")
+	}
+}
+
+// TestRulePlanApprovedHumanGate_Literal pins the persisted rule string and its
+// DISTINCTNESS from RulePlanApprovedDispatch (#3014). Rule names are persisted
+// in run_auto_advanced payloads and are read by the GET /v0/runs serializer and
+// the MCP surface, so renaming one is a breaking change for readers; and the
+// whole point of the new rule is that a workflow declaring no implement stage
+// stamps a DIFFERENT edge than the implement-dispatch one, which a copy/paste
+// collision between the two constants would silently undo.
+func TestRulePlanApprovedHumanGate_Literal(t *testing.T) {
+	if got := string(RulePlanApprovedHumanGate); got != "plan_approved_human_gate" {
+		t.Errorf("RulePlanApprovedHumanGate = %q, want plan_approved_human_gate", got)
+	}
+	if RulePlanApprovedHumanGate == RulePlanApprovedDispatch {
+		t.Errorf("RulePlanApprovedHumanGate == RulePlanApprovedDispatch (%q) — the two plan-approved successor rules must stay distinct", RulePlanApprovedDispatch)
 	}
 }

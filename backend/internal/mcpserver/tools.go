@@ -1468,7 +1468,7 @@ type RunNextAction struct {
 // auto-advanced (or parked with a next action), distilled from the
 // run's run_auto_advanced audit trail.
 type RunAutoAdvance struct {
-	Rule      string    `json:"rule" jsonschema:"the named drive rule that fired: plan_approved_dispatch, reviews_settled_gate, fixup_rereview_repark, checks_green_awaiting_merge, or ci_failed (its negative mirror: a required PR check concluded red)"`
+	Rule      string    `json:"rule" jsonschema:"the named drive rule that fired: plan_approved_dispatch, plan_approved_human_gate (the plan-approved successor for a workflow declaring NO implement stage — the run advanced to its human-executor review gate, so no host dispatch is owed), reviews_settled_gate, fixup_rereview_repark, checks_green_awaiting_merge, or ci_failed (its negative mirror: a required PR check concluded red)"`
 	From      string    `json:"from" jsonschema:"the transition's from edge"`
 	To        string    `json:"to" jsonschema:"the transition's to edge"`
 	Parked    bool      `json:"parked,omitempty" jsonschema:"true when the mechanical rule could not be backend-executed (runner_kind local dispatch, ADR-024) and recorded a park-with-next-action instead of an executed advance"`

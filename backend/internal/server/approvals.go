@@ -1647,12 +1647,75 @@ func (s *Server) recordPlanPredictedRuntime(ctx context.Context, stage *run.Stag
 	}
 }
 
-// recordDrivePlanApproved stamps the drive engine's
-// plan_approved_dispatch rule (#1023) after a plan-gate approval.
-// No-ops for non-drive runs, when no engine is wired, or on a run
-// read failure (best-effort: the approval already landed; a missing
-// stamp degrades attribution, never the run). The entry is keyed to
-// the approved plan stage.
+// planSuccessor names which stage the plan gate's approval actually hands
+// off to on THIS run, resolved from the run's stage rows (#3014).
+type planSuccessor int
+
+const (
+	// planSuccessorImplement: the run declares an implement stage — the
+	// feature_change / routine_change shape, and the ONLY shape that stamps
+	// drive.RulePlanApprovedDispatch.
+	planSuccessorImplement planSuccessor = iota
+	// planSuccessorHumanReviewGate: no implement stage, but a review stage
+	// whose executor is HUMAN — the backlog_grooming confirm-gate shape.
+	planSuccessorHumanReviewGate
+	// planSuccessorUnknown: neither — nothing is stamped rather than
+	// synthesizing a transition to a stage the run does not have.
+	planSuccessorUnknown
+)
+
+// planApprovedSuccessor resolves the plan gate's declared successor from the
+// run's stage ROWS (#3014). It is pure and total: it never reads the workflow
+// spec, because webhook.CreateStagesFromSpec materializes one row per declared
+// spec stage at run-create time and mapExecutor writes executor_kind straight
+// from that spec stage's own executor — so the ROW IS the cached spec's
+// declaration. That is the same leg reviewGateAdmitNotHumanRow trusts.
+//
+// An implement-typed row ANYWHERE in the list wins, unconditionally and
+// regardless of its state: that is what keeps every implement-declaring
+// workflow byte-identical to pre-#3014 behaviour (the founder's regression
+// guard, TestRecordDrivePlanApproved_FeatureChangeShape_Unchanged).
+func planApprovedSuccessor(stages []*run.Stage) planSuccessor {
+	var humanReview bool
+	for _, st := range stages {
+		if st == nil {
+			continue
+		}
+		if st.Type == run.StageTypeImplement {
+			return planSuccessorImplement
+		}
+		if st.Type == run.StageTypeReview && st.ExecutorKind == run.ExecutorHuman {
+			humanReview = true
+		}
+	}
+	if humanReview {
+		return planSuccessorHumanReviewGate
+	}
+	return planSuccessorUnknown
+}
+
+// recordDrivePlanApproved stamps the drive engine's plan-approved successor
+// rule (#1023) after a plan-gate approval. No-ops for non-drive runs, when no
+// engine is wired, or on a run read failure (best-effort: the approval already
+// landed; a missing stamp degrades attribution, never the run). The entry is
+// keyed to the approved plan stage.
+//
+// WHICH rule is stamped depends on the run's DECLARED successor (#3014), not
+// on the runner kind alone:
+//
+//   - planSuccessorImplement → drive.RulePlanApprovedDispatch, exactly as
+//     before: EvaluatePlanApproved(runner_kind) picks the executed
+//     implement:dispatched advance (github_actions) or the parked
+//     implement:awaiting_host_dispatch + run_implement_stage next action
+//     (local, ADR-024).
+//   - planSuccessorHumanReviewGate → drive.RulePlanApprovedHumanGate naming
+//     the real review:awaiting_approval edge, parked, with NO next action (the
+//     gate is approved by a human-held credential via the CLI verb; the MCP
+//     classifier owns the operator-facing entry).
+//   - planSuccessorUnknown → NOTHING is recorded. Stamping an
+//     implement:awaiting_host_dispatch transition on a run that declares no
+//     implement stage is what pointed two grooming runs at a nonexistent stage
+//     (#3014); a rule that cannot name a real edge stays inert.
 func (s *Server) recordDrivePlanApproved(ctx context.Context, stage *run.Stage) {
 	if s.drive == nil || s.cfg.RunRepo == nil {
 		return
@@ -1661,6 +1724,54 @@ func (s *Server) recordDrivePlanApproved(ctx context.Context, stage *run.Stage) 
 	if err != nil || !runRow.Drive {
 		return
 	}
+	// FAIL OPEN on a degraded stage read, and ONLY on a degraded stage read.
+	// run.Repository.ListStagesForRun returns (nil, error) on a read failure —
+	// the Postgres adapter wraps the query error and returns a nil slice, and
+	// never an empty list standing in for one — and returns a non-nil EMPTY
+	// slice only for a run with genuinely zero rows, which a created run never
+	// has. So nil/empty is read as "no evidence about this run's shape" and
+	// keeps today's plan_approved_dispatch stamp: this surface is display-only
+	// attribution, and it must not go silent because a read failed. The
+	// fail-open is deliberately NOT widened past those two cases — a
+	// successfully read, non-empty list is TRUSTED and decides the rule.
+	stages, listErr := s.cfg.RunRepo.ListStagesForRun(ctx, stage.RunID)
+	if listErr != nil || len(stages) == 0 {
+		if listErr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"drive plan-approved stamp: list stages failed, falling back to the implement-dispatch rule",
+				slog.String("run_id", stage.RunID.String()),
+				slog.String("error", listErr.Error()),
+			)
+		}
+		s.recordDrivePlanApprovedDispatch(ctx, stage, runRow)
+		return
+	}
+
+	switch planApprovedSuccessor(stages) {
+	case planSuccessorImplement:
+		s.recordDrivePlanApprovedDispatch(ctx, stage, runRow)
+	case planSuccessorHumanReviewGate:
+		s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
+			Rule:   drive.RulePlanApprovedHumanGate,
+			From:   "plan:approved",
+			To:     "review:awaiting_approval",
+			Event:  "plan gate approved; the workflow declares no implement stage — the run advanced to its human-executor review gate",
+			Parked: true,
+		})
+	default:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"drive plan-approved stamp: run declares neither an implement stage nor a human review gate — recording nothing",
+			slog.String("run_id", stage.RunID.String()),
+			slog.Int("stage_rows", len(stages)),
+		)
+	}
+}
+
+// recordDrivePlanApprovedDispatch stamps the pre-#3014 plan_approved_dispatch
+// rule for a run that declares an implement stage. Extracted verbatim so the
+// implement-declaring path is BYTE-IDENTICAL to what it was before the
+// successor resolution above was introduced.
+func (s *Server) recordDrivePlanApprovedDispatch(ctx context.Context, stage *run.Stage, runRow *run.Run) {
 	out := drive.EvaluatePlanApproved(runRow.RunnerKind)
 	adv := drive.Advance{
 		Rule: drive.RulePlanApprovedDispatch,

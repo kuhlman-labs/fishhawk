@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -1739,17 +1741,49 @@ func TestGetRun_Drive_NonHostDispatchAction_NeverSuppressed(t *testing.T) {
 	}
 }
 
-// TestGetRun_Drive_HostDispatchNextAction_NoMatchingStage_Surfaces: a
-// run_implement_stage action with NO implement stage row surfaces (fail toward
-// surfacing on a not-found stage).
-func TestGetRun_Drive_HostDispatchNextAction_NoMatchingStage_Surfaces(t *testing.T) {
+// TestGetRun_NextAction_HostDispatchNamesUndeclaredStage_Suppressed pins the
+// tightened no-matching-row fall-through (#3014). It REPLACES the pre-#3014
+// TestGetRun_Drive_HostDispatchNextAction_NoMatchingStage_Surfaces, whose
+// assertion was the opposite: a run_implement_stage next_action on a run whose
+// NON-EMPTY stage list declares no implement stage used to be surfaced, which
+// is exactly what kept pointing the two observed grooming runs (1499bdb0,
+// 7bd6c6d3) at a stage their workflow never declares. A non-empty list is
+// positive evidence about the run's shape, so the action is now SUPPRESSED —
+// while auto_advanced still lists the historical entry, because the surface
+// must stay honest about what was actually recorded.
+//
+// COUNTERFACTUAL (executed, #3014): restoring nextActionStale's bare
+// `return false` final statement turns this RED with
+// `next_action present (&{run_implement_stage ...}), want suppressed`.
+// Restored byte-identically afterwards.
+func TestGetRun_NextAction_HostDispatchNamesUndeclaredStage_Suppressed(t *testing.T) {
 	s, repo, au, seeded := newDriveStaleServer(t)
 	seedHostDispatchNextAction(t, au, seeded.ID, "run_implement_stage")
-	seedStageRow(repo, seeded.ID, run.StageTypePlan, run.StageStateSucceeded) // no implement row
+	// The backlog_grooming shape: a plan stage and a review gate, no implement.
+	seedStageRow(repo, seeded.ID, run.StageTypePlan, run.StageStateSucceeded)
+	seedStageRow(repo, seeded.ID, run.StageTypeReview, run.StageStateAwaitingApproval)
 
 	resp, raw := getRunResponse(t, s, seeded.ID)
-	if _, present := raw["next_action"]; !present || resp.NextAction == nil {
-		t.Errorf("next_action = %+v (present=%v), want surfaced when no matching stage row exists", resp.NextAction, present)
+	if _, present := raw["next_action"]; present {
+		t.Errorf("next_action present (%+v), want suppressed: the run declares no implement stage", resp.NextAction)
+	}
+	if len(resp.AutoAdvanced) != 1 {
+		t.Errorf("auto_advanced = %+v, want the historical entry still listed (the surface stays honest about what was recorded)", resp.AutoAdvanced)
+	}
+}
+
+// TestGetRun_NextAction_EmptyStageList_FailsOpen pins the carve-out that keeps
+// the original fail-open intent: an EMPTY stage list is not evidence about the
+// workflow's shape, it is the read-error degrade applyDriveSurfaces and
+// stageNextAction both pass, so the same seeded action still surfaces.
+func TestGetRun_NextAction_EmptyStageList_FailsOpen(t *testing.T) {
+	s, _, au, seeded := newDriveStaleServer(t)
+	seedHostDispatchNextAction(t, au, seeded.ID, "run_implement_stage")
+	// No stage rows seeded at all → ListStagesForRun returns an empty list.
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if _, present := raw["next_action"]; !present || resp.NextAction == nil || resp.NextAction.Action != "run_implement_stage" {
+		t.Errorf("next_action = %+v (present=%v), want fail-open surfaced on an empty (no-evidence) stage list", resp.NextAction, present)
 	}
 }
 
@@ -1766,6 +1800,229 @@ func TestGetRun_Drive_StageListError_FailsOpen(t *testing.T) {
 	if _, present := raw["next_action"]; !present || resp.NextAction == nil || resp.NextAction.Action != "run_implement_stage" {
 		t.Errorf("next_action = %+v (present=%v), want fail-open surfaced on a stage-list read error", resp.NextAction, present)
 	}
+}
+
+// --- human review-gate wire fixture (E54.52 / #3014) ------------------------
+
+// groomingShapedSpecYAML is the backlog_grooming shape this issue is about: a
+// gated plan stage whose declared successor is a HUMAN-executor review gate,
+// with NO implement stage anywhere in the workflow.
+const groomingShapedSpecYAML = `version: "1.0"
+roles:
+  operator:
+    members: ["@kuhlman-labs"]
+workflows:
+  backlog_grooming:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [operator]
+      - id: confirm
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvers:
+              any_of: [operator]
+`
+
+// humanReviewGateWireFixturePath is the SHARED cross-boundary wire fixture
+// (approval condition 3 / #3014). This test writes nothing: it canonicalizes
+// the server's OWN GET /v0/runs/{id} and GET /v0/runs/{id}/stages bodies and
+// asserts they equal the committed file, and
+// backend/internal/mcpserver/next_actions_test.go reads the SAME file, decodes
+// it through the real MCP wire types (Run / Stage / StageExecutor) and feeds
+// the result to nextActionsFor. One file, two readers: a json-tag rename or
+// drop on EITHER side reddens the pair, which two consts hoping to agree
+// cannot do.
+const humanReviewGateWireFixturePath = "human_review_gate_wire.json"
+
+// canonicalizeWireBody makes a response body comparable to a committed fixture
+// without giving up the "these are the server's own bytes" property. Only the
+// two genuinely volatile classes are rewritten, both by VALUE not by key, so a
+// renamed or dropped key still changes the canonical form and still reddens:
+// every uuid-shaped string is mapped to its PRE-SEEDED placeholder, and every
+// RFC3339 timestamp to a fixed instant. Everything else — every key name, every
+// enum, every structural nesting — is compared verbatim.
+//
+// The id map is pre-seeded by the CALLER from the ids it knows, never assigned
+// in first-seen order: JSON object iteration is map-ordered in Go, so
+// first-seen numbering is non-deterministic across runs and would make the
+// fixture comparison flaky. An unrecognized uuid is collected and reported by
+// the caller as a hard failure — a new id-bearing field must be seeded
+// deliberately, not absorbed into a shifting numbering.
+func canonicalizeWireBody(t *testing.T, raw []byte, ids map[string]string, unknown *[]string) any {
+	t.Helper()
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode response for canonicalization: %v\n%s", err, raw)
+	}
+	return canonicalizeWireValue(decoded, ids, unknown)
+}
+
+func canonicalizeWireValue(v any, ids map[string]string, unknown *[]string) any {
+	switch typed := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for k, val := range typed {
+			out[k] = canonicalizeWireValue(val, ids, unknown)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, val := range typed {
+			out[i] = canonicalizeWireValue(val, ids, unknown)
+		}
+		return out
+	case string:
+		if _, err := uuid.Parse(typed); err == nil {
+			placeholder, ok := ids[typed]
+			if !ok {
+				*unknown = append(*unknown, typed)
+				return "UNSEEDED-UUID"
+			}
+			return placeholder
+		}
+		if _, err := time.Parse(time.RFC3339, typed); err == nil {
+			return "2026-01-01T00:00:00Z"
+		}
+		return typed
+	default:
+		return v
+	}
+}
+
+// TestGetRun_HumanReviewGate_MatchesWireFixture is the CROSS-BOUNDARY half of
+// #3014 (the plan's seam requirement, cf. #618/#627): one flow crossing
+// POST /v0/runs (a grooming-shaped spec) -> plan-gate approval -> the drive
+// stamp -> GET /v0/runs/{id} + GET /v0/runs/{id}/stages. It asserts the
+// emission contract on the serialized JSON the MCP client actually decodes —
+// rule plan_approved_human_gate on the review:awaiting_approval edge and NO
+// next_action — and then pins those exact bytes into the shared wire fixture
+// the mcpserver classifier test consumes.
+func TestGetRun_HumanReviewGate_MatchesWireFixture(t *testing.T) {
+	s, repo, au := newDriveE2EServer(t)
+
+	raw, _ := json.Marshal(map[string]any{
+		"repo": "x/y", "workflow_id": "backlog_grooming", "workflow_sha": "abc",
+		"trigger_source": "cli", "runner_kind": "local",
+		"workflow_spec": groomingShapedSpecYAML, "drive": true,
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	s.handleCreateRun(w, withAuth(req))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	stages := repo.stagesFor(created.ID)
+	if len(stages) != 2 || stages[0].Type != run.StageTypePlan || stages[1].Type != run.StageTypeReview {
+		t.Fatalf("stages = %+v, want [plan review]", stages)
+	}
+	if stages[1].ExecutorKind != run.ExecutorHuman {
+		t.Fatalf("review executor kind = %q, want human", stages[1].ExecutorKind)
+	}
+	stages[0].State = run.StageStateAwaitingApproval
+
+	if aw := submitApproval(t, s, stages[0].ID, `{"decision":"approve"}`); aw.Code != http.StatusOK {
+		t.Fatalf("approval status = %d:\n%s", aw.Code, aw.Body.String())
+	}
+	// Stand in for the orchestrator's advance of the human gate, which is not
+	// what this seam is testing: the run parks at its review gate.
+	stages[1].State = run.StageStateAwaitingApproval
+
+	// The emission contract, read off the audit trail.
+	var advances []drive.Advance
+	for _, e := range au.appended {
+		if e.Category != drive.Category {
+			continue
+		}
+		var adv drive.Advance
+		if err := json.Unmarshal(e.Payload, &adv); err != nil {
+			t.Fatalf("run_auto_advanced payload unmarshal: %v", err)
+		}
+		advances = append(advances, adv)
+	}
+	if len(advances) != 1 || advances[0].Rule != drive.RulePlanApprovedHumanGate {
+		t.Fatalf("run_auto_advanced = %+v, want one plan_approved_human_gate entry", advances)
+	}
+
+	// The serialized surfaces the MCP client decodes.
+	runBody := getRawBody(t, s, fmt.Sprintf("/v0/runs/%s", created.ID))
+	stagesBody := getRawBody(t, s, fmt.Sprintf("/v0/runs/%s/stages", created.ID))
+
+	var runResp runResponse
+	if err := json.Unmarshal(runBody, &runResp); err != nil {
+		t.Fatalf("decode run body: %v", err)
+	}
+	if len(runResp.AutoAdvanced) != 1 || runResp.AutoAdvanced[0].Rule != string(drive.RulePlanApprovedHumanGate) {
+		t.Fatalf("auto_advanced = %+v, want [plan_approved_human_gate]", runResp.AutoAdvanced)
+	}
+	if runResp.AutoAdvanced[0].To != "review:awaiting_approval" {
+		t.Errorf("auto_advanced[0].to = %q, want review:awaiting_approval", runResp.AutoAdvanced[0].To)
+	}
+	var rawRun map[string]any
+	if err := json.Unmarshal(runBody, &rawRun); err != nil {
+		t.Fatalf("decode raw run body: %v", err)
+	}
+	if _, present := rawRun["next_action"]; present {
+		t.Errorf("next_action present (%v) — the human gate stamps none", rawRun["next_action"])
+	}
+
+	// Seeded in DECLARED order — run, then each stage by sequence — so the
+	// canonical form is identical on every run regardless of map iteration.
+	ids := map[string]string{
+		created.ID.String():   "00000000-0000-0000-0000-000000000001",
+		stages[0].ID.String(): "00000000-0000-0000-0000-000000000002",
+		stages[1].ID.String(): "00000000-0000-0000-0000-000000000003",
+	}
+	var unknown []string
+	got := map[string]any{
+		"run":    canonicalizeWireBody(t, runBody, ids, &unknown),
+		"stages": canonicalizeWireBody(t, stagesBody, ids, &unknown),
+	}
+	if len(unknown) > 0 {
+		t.Fatalf("unseeded uuid(s) in the serialized bodies: %v — seed them above so the fixture stays deterministic", unknown)
+	}
+	gotJSON, err := json.MarshalIndent(got, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal canonical wire bodies: %v", err)
+	}
+	gotJSON = append(gotJSON, '\n')
+
+	path := filepath.Join("testdata", humanReviewGateWireFixturePath)
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read wire fixture %s: %v\n\nthe canonical bodies are:\n%s", path, err, gotJSON)
+	}
+	if !bytes.Equal(gotJSON, want) {
+		t.Errorf("canonicalized wire bodies differ from %s — regenerate it from this output:\n%s", path, gotJSON)
+	}
+}
+
+// getRawBody issues an authenticated GET through the real mux and returns the
+// raw 200 body.
+func getRawBody(t *testing.T, s *Server, path string) []byte {
+	t.Helper()
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET %s status = %d, want 200:\n%s", path, w.Code, w.Body.String())
+	}
+	return w.Body.Bytes()
 }
 
 // --- Drive end-to-end (#1023) ----------------------------------------------

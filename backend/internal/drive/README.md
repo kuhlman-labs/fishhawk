@@ -4,7 +4,7 @@ Drive mode: the rule engine classifying a drive-enabled run's named transition p
 
 ## Rule table
 
-- **Mechanical** (auto-advance or auto-detect): `plan_approved_dispatch`, `reviews_settled_gate`, `fixup_rereview_repark`, `checks_green_awaiting_merge`, `ci_failed`, `children_dispatch`, `deploy_initialization`.
+- **Mechanical** (auto-advance or auto-detect): `plan_approved_dispatch`, `plan_approved_human_gate` (#3014 — the plan-approved successor rule for a workflow declaring NO implement stage: it names the real `plan:approved` -> `review:awaiting_approval` edge, parks, and carries NO next action because the human-executor gate is approved via the `fishhawk approve-review-gate` CLI verb, not a host dispatch), `reviews_settled_gate`, `fixup_rereview_repark`, `checks_green_awaiting_merge`, `ci_failed`, `children_dispatch`, `deploy_initialization`.
 - **Judgment** (always park): `gate_approval`, `concern_routing`, `merge` — absent ADR-040 delegation.
 
 The package also owns the `run_auto_advanced` audit emission (`Engine.Record`) and two idempotency reads:
@@ -18,7 +18,7 @@ Deliberate scoping (#2122): the `ci_failed` / `checks_green_awaiting_merge` stam
 
 The engine never performs a state transition — the hook points that stamp it live with the transitions they document:
 
-- **Plan approval**: `backend/internal/server/approvals.go::recordDrivePlanApproved` — the orchestrator `Advance` handoff IS the dispatch for `runner_kind github_actions`; `local` parks with a `run_implement_stage` next action per ADR-024.
+- **Plan approval**: `backend/internal/server/approvals.go::recordDrivePlanApproved` — which rule it stamps depends on the plan gate's DECLARED successor, resolved from the run's stage rows (#3014). With an implement stage row: `plan_approved_dispatch`, where the orchestrator `Advance` handoff IS the dispatch for `runner_kind github_actions` and `local` parks with a `run_implement_stage` next action per ADR-024. With NO implement stage but a human-executor review row (`backlog_grooming`): `plan_approved_human_gate`, parked on the `review:awaiting_approval` edge with no next action, host-independent — the gate is approved by a human-held credential through the `fishhawk approve-review-gate` CLI verb, so there is no dispatch to park for. With neither: nothing is stamped. A `ListStagesForRun` error or an empty list fails open to the `plan_approved_dispatch` path.
 - **Fix-up re-park**: `fixup.go::recordDriveFixupRepark` — stamps the #780 review re-park.
 - **Deploy initialization**: `runs.go::recordDriveDeployInitialization` — the deploy-first creation park (E23.13 / #1429 / ADR-038). When a created run's FIRST stage is a `deploy` stage, `handleCreateRun` calls `orchestrator.Advance` to park it `pending → awaiting_deploy_approval` at its pre-execution gate — there is no agent/runner and thus no operator-driven `run_stage` entry to trigger it.
   Best-effort: an `Advance` error WARN-logs and never unwinds the 201. `drive.EvaluateDeployInitialization` carries a host-independent `fishhawk_approve_plan` next action since the deploy approval pages the human regardless of runner kind.
