@@ -21,7 +21,10 @@ import (
 // The command group drives the user-bound OAuth login: `token login`
 // runs the selected forge's OAuth device flow — GitHub or, since
 // E66.4 / #2392, GitLab — mints a user-bound Fishhawk token via the
-// backend, and stores it in the local credential store; `token list`
+// backend, and stores it in the local credential store; `token login
+// --oauth` (E66.5 / #2393) instead logs in as an OAuth 2.1 public
+// client against the fishhawkd authorization server and stores a
+// short-lived, refreshable credential (oauthlogin.go); `token list`
 // shows the stored credentials.
 func runToken(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
@@ -171,10 +174,24 @@ func tokenLogin(args []string, stdout, stderr io.Writer) int {
 	clientID := fs.String("client-id",
 		envOr("FISHHAWK_OAUTH_CLIENT_ID", ""),
 		"OAuth App client_id; overrides backend discovery")
+	oauth := fs.Bool("oauth", false,
+		"log in as an OAuth 2.1 public client against the backend's authorization server (PKCE + loopback redirect + browser) instead of the forge device flow")
+	oauthClientID := fs.String("oauth-client-id", defaultOAuthClientID,
+		"client_id registered with `fishhawkd oauth client register` for the --oauth path")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintln(stderr, "Usage: fishhawk token login [--provider github|gitlab] [--client-id ID]")
+		_, _ = fmt.Fprintln(stderr, "       fishhawk token login --oauth [--oauth-client-id ID]")
 		_, _ = fmt.Fprintln(stderr, "")
 		_, _ = fmt.Fprintln(stderr, "Log in via the forge's OAuth device flow and mint a user-bound Fishhawk token.")
+		_, _ = fmt.Fprintln(stderr, "")
+		_, _ = fmt.Fprintln(stderr, "With --oauth, log in instead as an OAuth 2.1 public client against the backend's")
+		_, _ = fmt.Fprintln(stderr, "own authorization server: the command discovers the server (RFC 8414), opens a")
+		_, _ = fmt.Fprintln(stderr, "browser (and always prints the URL for headless terminals) with a PKCE S256")
+		_, _ = fmt.Fprintln(stderr, "challenge and an ephemeral 127.0.0.1 loopback redirect, accepts exactly one")
+		_, _ = fmt.Fprintln(stderr, "callback, exchanges the code, and stores a short-lived access token plus its")
+		_, _ = fmt.Fprintln(stderr, "refresh token; later commands refresh it automatically. --oauth-client-id names")
+		_, _ = fmt.Fprintln(stderr, "the client the operator registered once with `fishhawkd oauth client register`.")
+		_, _ = fmt.Fprintln(stderr, "--oauth cannot be combined with the device-flow flags --provider / --client-id.")
 		_, _ = fmt.Fprintln(stderr, "")
 		_, _ = fmt.Fprintln(stderr, "The command prints a short user code and a verification URL, waits")
 		_, _ = fmt.Fprintln(stderr, "for you to authorize in the browser, then hands the resulting access token to")
@@ -196,12 +213,24 @@ func tokenLogin(args []string, stdout, stderr io.Writer) int {
 		}
 		return exitUsage
 	}
+	// The two login paths never mix: an explicitly set device-flow flag
+	// alongside --oauth (or --oauth-client-id without --oauth) is a usage
+	// error, refused BEFORE any dial, rather than one flag being silently
+	// ignored. Explicit-ness is read from the parsed set (fs.Visit), so a
+	// FISHHAWK_OAUTH_CLIENT_ID env default does not count as a conflict.
+	if err := checkOAuthFlagCombination(fs, *oauth); err != nil {
+		_, _ = fmt.Fprintf(stderr, "%s: %v\n", name, err)
+		return exitUsage
+	}
+	backend := strings.TrimRight(*cf.backendURL, "/")
+	if *oauth {
+		return tokenLoginOAuth(backend, *oauthClientID, *cf.timeout, stdout, stderr)
+	}
 	if !isSupportedProvider(*provider) {
 		_, _ = fmt.Fprintf(stderr, "%s: unsupported --provider %q (supported: %s)\n",
 			name, *provider, strings.Join(supportedProviders, ", "))
 		return exitUsage
 	}
-	backend := strings.TrimRight(*cf.backendURL, "/")
 
 	// Resolve the provider's device client_id and (for gitlab) its
 	// instance base URL. An explicit --client-id / FISHHAWK_OAUTH_CLIENT_ID
@@ -270,6 +299,55 @@ func tokenLogin(args []string, stdout, stderr io.Writer) int {
 	_, _ = fmt.Fprintf(stdout, "subject: %s\n", minted.Subject)
 	_, _ = fmt.Fprintf(stdout, "scope:   %s\n", scopeDisplay(minted.Scopes))
 	_, _ = fmt.Fprintf(stdout, "expiry:  %s\n", expiryDisplay(minted.ExpiresAt))
+	if path != "" {
+		_, _ = fmt.Fprintf(stdout, "stored:  %s\n", path)
+	}
+	return exitOK
+}
+
+// checkOAuthFlagCombination refuses --oauth together with an explicitly
+// set device-flow-only flag (--provider, --client-id), and
+// --oauth-client-id without --oauth. Each message names the flags.
+func checkOAuthFlagCombination(fs *flag.FlagSet, oauth bool) error {
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	if oauth {
+		for _, deviceOnly := range []string{"provider", "client-id"} {
+			if set[deviceOnly] {
+				return fmt.Errorf("--oauth cannot be combined with --%s (a device-flow flag); the OAuth 2.1 login is verified by the backend's authorization server, not by a forge", deviceOnly)
+			}
+		}
+		return nil
+	}
+	if set["oauth-client-id"] {
+		return errors.New("--oauth-client-id only applies with --oauth")
+	}
+	return nil
+}
+
+// tokenLoginOAuth is the --oauth branch of `token login`: it runs the
+// OAuth 2.1 public-client flow (oauthlogin.go) and prints the stored
+// credential the same way the device-flow branch does.
+func tokenLoginOAuth(backend, clientID string, timeout time.Duration, stdout, stderr io.Writer) int {
+	const name = "fishhawk token login"
+	if strings.TrimSpace(clientID) == "" {
+		_, _ = fmt.Fprintf(stderr, "%s: --oauth-client-id must not be empty\n", name)
+		return exitUsage
+	}
+	cred, err := runOAuthLogin(context.Background(), oauthLoginParams{
+		backend:  backend,
+		clientID: clientID,
+		timeout:  timeout,
+	}, stderr)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%s: %v\n", name, err)
+		return exitFailure
+	}
+	path, _ := credstore.Path()
+	_, _ = fmt.Fprintf(stdout, "Logged in to %s\n", backend)
+	_, _ = fmt.Fprintf(stdout, "client:  %s\n", cred.ClientID)
+	_, _ = fmt.Fprintf(stdout, "scope:   %s\n", scopeDisplay(cred.Scopes))
+	_, _ = fmt.Fprintf(stdout, "expiry:  %s (refreshed automatically)\n", expiryDisplay(cred.ExpiresAt))
 	if path != "" {
 		_, _ = fmt.Fprintf(stdout, "stored:  %s\n", path)
 	}

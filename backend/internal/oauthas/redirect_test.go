@@ -1,8 +1,14 @@
 package oauthas
 
 import (
+	"encoding/json"
 	"errors"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -345,5 +351,73 @@ func assertRedirectRefused(t *testing.T, err error) {
 	assertCode(t, err, ErrCodeInvalidRequest)
 	if !errors.Is(err, ErrRedirectMismatch) {
 		t.Fatalf("refusal %v does not wrap ErrRedirectMismatch", err)
+	}
+}
+
+// cliRedirectFixture is the shared testdata/wire/oauth_cli_redirect_uri.json
+// document: the redirect_uri shape `fishhawk token login --oauth` generates and
+// the portless URI the operator registers for it (E66.5 / #2393, condition 4).
+// The CLI module cannot import this package, so the fixture is what binds the
+// CLI's generator to this matcher: the CLI test proves it generates the shape,
+// this test proves the shape matches.
+type cliRedirectFixture struct {
+	Host           string   `json:"host"`
+	Path           string   `json:"path"`
+	Registered     string   `json:"registered_redirect_uri"`
+	Template       string   `json:"generated_redirect_uri_template"`
+	SamplePorts    []int    `json:"sample_ports"`
+	RefusedVariant []string `json:"refused_variants"`
+}
+
+func loadCLIRedirectFixture(t *testing.T) cliRedirectFixture {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "oauth_cli_redirect_uri.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared fixture: %v", err)
+	}
+	var fx cliRedirectFixture
+	if err := json.Unmarshal(raw, &fx); err != nil {
+		t.Fatalf("decode shared fixture: %v", err)
+	}
+	if fx.Registered == "" || fx.Template == "" || len(fx.SamplePorts) == 0 {
+		t.Fatalf("shared fixture is incomplete: %+v", fx)
+	}
+	return fx
+}
+
+// TestMatchRedirectURI_CLIGeneratedLoopbackMatchesRegistered drives the CLI's
+// generated http://127.0.0.1:<port>/callback (every sample port) through both
+// the predicate and the delivery resolver against the portless registration:
+// the match must succeed and the DELIVERY URI must carry the CLI's ephemeral
+// port (#2470), or the CLI never receives its code.
+func TestMatchRedirectURI_CLIGeneratedLoopbackMatchesRegistered(t *testing.T) {
+	t.Parallel()
+	fx := loadCLIRedirectFixture(t)
+	for _, port := range fx.SamplePorts {
+		generated := strings.ReplaceAll(fx.Template, "{port}", strconv.Itoa(port))
+		if err := MatchRedirectURI(fx.Registered, generated); err != nil {
+			t.Errorf("MatchRedirectURI(%q, %q) = %v, want match", fx.Registered, generated, err)
+		}
+		delivery, err := ResolveRedirectURI([]string{fx.Registered}, generated)
+		if err != nil {
+			t.Errorf("ResolveRedirectURI(%q, %q) = %v, want the CLI's URI", fx.Registered, generated, err)
+			continue
+		}
+		if delivery != generated {
+			t.Errorf("delivery URI = %q, want the CLI's %q (the ephemeral port must cross over)", delivery, generated)
+		}
+	}
+	// The fixture's refused variants (wildcard host, localhost vs 127.0.0.1,
+	// trailing slash, scheme) must NOT match the same registration — so the
+	// fixture pins the shape, not merely "something loopback-ish".
+	for _, bad := range fx.RefusedVariant {
+		if err := MatchRedirectURI(fx.Registered, bad); err == nil {
+			t.Errorf("MatchRedirectURI(%q, %q) matched, want refusal", fx.Registered, bad)
+		}
 	}
 }
