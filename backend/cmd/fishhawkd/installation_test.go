@@ -98,6 +98,11 @@ func TestRunInstallationRegister_ValidationErrors(t *testing.T) {
 		{"missing project path", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242"}, "--project-path"},
 		{"namespaceless project path", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "widgets"}, "<namespace>/<project>"},
 		{"namespace-inconsistent project path", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "other/widgets"}, `"acme"`},
+		// #3097: a whitespace-only interior component is the same defect as
+		// an empty one — GitLab never canonicalises it, so a bound row would
+		// permanently refuse every trigger. This proves the refusal reaches
+		// the operator-facing CLI, not just the domain function.
+		{"whitespace-only project path component", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "acme/ /widgets"}, "<namespace>/<project>"},
 		{"non-https forge base url", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "acme/widgets", "--forge-base-url", "http://insecure.example"}, "https"},
 		{"non-https oauth base url", []string{"--provider", "gitlab", "--account-key", "acme", "--installation-ref", "gitlab:4242", "--project-path", "acme/widgets", "--oauth-base-url", "http://insecure.example"}, "https"},
 	}

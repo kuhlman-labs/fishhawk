@@ -366,6 +366,27 @@ func TestRegisterInstallation_GitLabProjectPath(t *testing.T) {
 			wantSub: "every component non-empty",
 		},
 		{
+			// A whitespace-only INTERIOR component is the same defect as an
+			// empty one: GitLab never canonicalises it either, so the row
+			// would bind and then permanently refuse every trigger.
+			name: "whitespace_only_interior_component_refuses", provider: "gitlab", projectPath: "acme/ /widgets",
+			wantSub: "every component non-empty",
+		},
+		{
+			// unicode.IsSpace covers tab, not just ASCII space.
+			name: "tab_only_interior_component_refuses", provider: "gitlab", projectPath: "acme/\t/widgets",
+			wantSub: "every component non-empty",
+		},
+		{
+			// The TERMINAL component, whitespace-only rather than empty.
+			name: "whitespace_only_terminal_component_refuses", provider: "gitlab", projectPath: "acme/platform/ ",
+			wantSub: "every component non-empty",
+		},
+		{
+			name: "mixed_whitespace_component_refuses", provider: "gitlab", projectPath: "acme/ \t /widgets",
+			wantSub: "every component non-empty",
+		},
+		{
 			// The namespace-consistency check: a path outside the owning
 			// account's namespace is the mis-registration the authorizer's
 			// retained tenancy invariant exists to catch. Refuse it at the
@@ -388,6 +409,15 @@ func TestRegisterInstallation_GitLabProjectPath(t *testing.T) {
 		},
 		{
 			name: "deeply_nested_group_writes", provider: "gitlab", projectPath: "acme/platform/infra/widgets",
+			wantWrite: true,
+		},
+		{
+			// Anti-over-narrowing: interior whitespace WITHIN an otherwise
+			// well-formed component is not the defect being closed — only a
+			// component that trims to nothing is. This reddens if the fix is
+			// over-generalised into a no-whitespace-anywhere rule, or if it
+			// rewrites the stored path instead of persisting it untransformed.
+			name: "interior_whitespace_in_component_writes", provider: "gitlab", projectPath: "acme/my widgets",
 			wantWrite: true,
 		},
 		{

@@ -210,13 +210,15 @@ type RegisterInstallationRequest struct {
 // owner-segment convention account.Resolver uses, so splitting any other way
 // here would validate a shape the gate then rejects.
 //
-// Nesting is NOT a licence for empty components. EVERY component — the
-// namespace, each intermediate group, and the terminal project — must be
-// non-empty, so 'acme//widgets', 'acme/platform//widgets' and 'acme/widgets/'
-// are all refused. GitLab never canonicalises a path_with_namespace with an
-// empty component, so such a row could never match a payload: accepting one
-// would let a SUPPORTED registration mint a binding that permanently refuses
-// every trigger while reporting success.
+// Nesting is NOT a licence for empty or whitespace-only components. EVERY
+// component — the namespace, each intermediate group, and the terminal
+// project — must be non-empty after trimming, so 'acme//widgets',
+// 'acme/platform//widgets', 'acme/widgets/', 'acme/ /widgets' and
+// 'acme/platform/ ' are all refused. GitLab never canonicalises a
+// path_with_namespace with an empty OR whitespace-only component, so such a
+// row could never match a payload: accepting one would let a SUPPORTED
+// registration mint a binding that permanently refuses every trigger while
+// reporting success.
 //
 // Comparison is EXACT and case-SENSITIVE, matching the authorizer. GitLab
 // canonicalises project path case, so a case difference means the payload does
@@ -241,15 +243,19 @@ func ValidateGitLabProjectPath(accountKey, projectPath string) error {
 }
 
 // allComponentsNonEmpty reports whether remainder is a "/"-joined sequence of
-// non-empty components. An empty remainder (a trailing separator, as in
-// 'acme/'), an empty interior component ('acme/platform//widgets') and an
-// empty terminal component ('acme/platform/widgets/') all report false.
+// components that are non-empty after trimming whitespace. An empty
+// remainder (a trailing separator, as in 'acme/'), an empty or
+// whitespace-only interior component ('acme/platform//widgets',
+// 'acme/ /widgets') and an empty or whitespace-only terminal component
+// ('acme/platform/widgets/', 'acme/platform/ ') all report false. Interior
+// whitespace within an otherwise non-empty component ('acme/my widgets') is
+// untouched — this only refuses a component that trims to nothing.
 func allComponentsNonEmpty(remainder string) bool {
 	if remainder == "" {
 		return false
 	}
 	for _, component := range strings.Split(remainder, "/") {
-		if component == "" {
+		if strings.TrimSpace(component) == "" {
 			return false
 		}
 	}
