@@ -1694,6 +1694,10 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 				MissingTests: f.MissingTests,
 				OmittedCount: f.OmittedCount,
 				SubPlanTitle: f.SubPlanTitle,
+				// #3203: the generator is what makes a generated_surface
+				// finding actionable — dropping it here would render a
+				// finding naming derived files with no command to run.
+				Generator: f.Generator,
 			})
 		}
 		ev.TestSweep = ts

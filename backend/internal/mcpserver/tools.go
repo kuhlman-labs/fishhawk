@@ -639,7 +639,7 @@ type GetPlanOutput struct {
 	// TestSweep surfaces the plan-gate test-sweep advisory (#942):
 	// scope.files evaluated against the repository's existing *_test.go
 	// files via the Contents API.
-	TestSweep *TestSweep `json:"test_sweep,omitempty" jsonschema:"plan-gate test sweep (#942): heuristic advisory flagging EXISTING test files the plan omitted — a stem-sibling test of a scoped production .go file, existing tests in a package where the plan creates a new test file, or a path-trigger rule's pinned test (migration_walk: a scoped migrations/*.sql requires the postgres_test.go that pins the latest migration). Judge whether the changed behavior's tests or shared harness live in the flagged files; if so the plan must scope them or the runner will scope_drift-exclude the agent's edits to them. Present (possibly with empty findings) when the plan stage ran the sweep; absent on older runs, non-GitHub triggers, and fail-open paths. listed_dirs below scanned directories means some listings failed and findings may be incomplete"`
+	TestSweep *TestSweep `json:"test_sweep,omitempty" jsonschema:"plan-gate test sweep (#942): heuristic advisory flagging EXISTING test files the plan omitted — a stem-sibling test of a scoped production .go file, existing tests in a package where the plan creates a new test file, or a path-trigger rule's pinned test (migration_walk: a scoped migrations/*.sql requires the postgres_test.go that pins the latest migration); plus generated_surface (#3203), which flags a scoped CANONICAL source whose DERIVED files (a generated site Reference region, an embedded schema/preset/fixture mirror) are absent from scope.files and names the generator to run. Judge whether the changed behavior's tests or shared harness live in the flagged files; if so the plan must scope them or the runner will scope_drift-exclude the agent's edits to them. Present (possibly with empty findings) when the plan stage ran the sweep; absent on older runs, non-GitHub triggers, and fail-open paths. listed_dirs below scanned directories means some listings failed and findings may be incomplete"`
 	// PlanWarnings surfaces the plan-gate soft-advisory pass (#1684):
 	// plan.Warnings() evaluated against the uploaded plan — notably the
 	// multi-slice decomposition with every sub_plan omitting depends_on
@@ -773,22 +773,25 @@ type PlanReachability struct {
 }
 
 // TestSweepFinding is one test-sweep result decoded from a plan_test_sweep
-// audit entry (#942): the plan touches TriggerPath but omits the existing
-// test files MissingTests the named Rule (stem_sibling |
-// new_test_in_tested_package | migration_walk) associates with it.
-// OmittedCount carries the number of additional existing test files
-// truncated from MissingTests. Mirrors the server-side TestSweepFinding
-// shape exactly.
+// audit entry (#942): the plan touches TriggerPath but omits the files
+// MissingTests the named Rule (stem_sibling | new_test_in_tested_package |
+// migration_walk | generated_surface) associates with it. OmittedCount
+// carries the number of additional existing test files truncated from
+// MissingTests. For generated_surface (#3203) MissingTests are DERIVED
+// files rather than test files and Generator names the command that
+// rewrites them. Mirrors the server-side TestSweepFinding shape exactly.
 type TestSweepFinding struct {
 	Rule         string   `json:"rule"`
 	TriggerPath  string   `json:"trigger_path"`
 	MissingTests []string `json:"missing_tests"`
 	OmittedCount int      `json:"omitted_count,omitempty"`
+	Generator    string   `json:"generator,omitempty" jsonschema:"command that regenerates or mirrors the missing_tests paths from trigger_path (scripts/gen-site-reference or scripts/sync-schemas); set only on generated_surface findings, where missing_tests are DERIVED files rather than test files"`
 }
 
 // TestSweep is the plan-gate test-sweep result decoded from the newest
 // plan_test_sweep audit entry (#942). Findings is empty when no existing
-// test file adjacent to the scoped change was left out of scope;
+// test file adjacent to the scoped change — and, since #3203, no derived
+// file generated from a scoped canonical source — was left out of scope;
 // ScannedFiles is the number of scope.files evaluated; ListedDirs counts
 // the directories successfully listed via the Contents API.
 type TestSweep struct {

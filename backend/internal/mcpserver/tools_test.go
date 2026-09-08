@@ -6042,6 +6042,79 @@ func TestGetPlan_TestSweep_CrossBoundarySeam(t *testing.T) {
 	}
 }
 
+// TestGetPlan_TestSweep_GeneratedSurface_ConsumesServerWireFixture is the
+// CONSUMER half of the producer-to-consumer seam (binding approval
+// condition 1 / #3203). It does NOT hand-build a payload: it reads the
+// SAME bytes backend/internal/server/test_sweep_test.go asserts the
+// server persisted — backend/internal/server/testdata/
+// plan_test_sweep_wire.json, pinned by
+// TestShipPlan_TestSweep_GeneratedSurface_EndToEnd — and feeds them
+// verbatim through the real fishhawk_get_plan decode path. A json-tag
+// rename or drop on EITHER side reddens one of the pair; two hand-built
+// fixtures hoping to agree could not do that. Precedent: #2660, #3014.
+func TestGetPlan_TestSweep_GeneratedSurface_ConsumesServerWireFixture(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "server", "testdata", "plan_test_sweep_wire.json"))
+	if err != nil {
+		t.Fatalf("read shared server wire fixture: %v", err)
+	}
+
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	// Seed the RAW server-persisted bytes, not a re-marshalled struct.
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode shared fixture: %v", err)
+	}
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: 1,
+		RunID:    runID.String(),
+		Category: "plan_test_sweep",
+		Payload:  decoded,
+	})
+	fb.mu.Unlock()
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.TestSweep == nil {
+		t.Fatal("TestSweep is nil; want the decoded fixture")
+	}
+	if len(out.TestSweep.Findings) != 2 {
+		t.Fatalf("len(Findings) = %d, want 2 (one per generator)", len(out.TestSweep.Findings))
+	}
+	gens := map[string][]string{}
+	for _, f := range out.TestSweep.Findings {
+		if f.Rule != "generated_surface" {
+			t.Errorf("Rule = %q, want generated_surface", f.Rule)
+		}
+		if f.TriggerPath != "docs/spec/workflow-v2.schema.json" {
+			t.Errorf("TriggerPath = %q", f.TriggerPath)
+		}
+		if f.Generator == "" {
+			t.Errorf("Generator empty on %+v — the generator field did not cross the seam", f)
+		}
+		gens[f.Generator] = f.MissingTests
+	}
+	if got := gens["scripts/gen-site-reference"]; len(got) != 1 || got[0] != "site/src/content/docs/reference/workflow-spec.md" {
+		t.Errorf("site-reference finding missing_tests = %v", got)
+	}
+	if got := gens["scripts/sync-schemas"]; len(got) != 2 ||
+		got[0] != "backend/internal/spec/schemas/workflow-v2.schema.json" ||
+		got[1] != "cli/internal/spec/schemas/workflow-v2.schema.json" {
+		t.Errorf("sync-schemas finding missing_tests = %v", got)
+	}
+}
+
 func TestGetPlan_TestSweep_AbsentWhenNoEntry(t *testing.T) {
 	// An older run predating the test sweep (or a fail-open no-op: non-
 	// GitHub trigger, no GitHub client) has no plan_test_sweep entry —

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -844,7 +845,78 @@ func crossSlicePlan(subs []subPlanScope) *plan.Plan {
 const (
 	wmCanonical = "docs/spec/work-management-v0.schema.json"
 	wmMirror    = "backend/internal/workmgmt/schemas/work-management-v0.schema.json"
+	wmCLIMirror = "cli/internal/spec/schemas/work-management-v0.schema.json"
 )
+
+// Counterfactual record for the #3203 registry rider (binding approval
+// condition 3), EXECUTED not reasoned: the
+// cli/internal/spec/schemas/work-management-v0.schema.json entry was
+// REMOVED from both Triggers and Siblings in surface_sweep.go (restoring
+// the stale pre-#3203 pattern), then restored byte-identically.
+//
+//	go test ./internal/server/ -run TestWorkManagementPatternCoversBothSyncSchemasMirrors -v
+//	RED:
+//	  surface_sweep_test.go:881: Triggers missing "cli/internal/spec/schemas/work-management-v0.schema.json" — a canonical edit skipping it would draw no finding
+//	  surface_sweep_test.go:884: Siblings missing "cli/internal/spec/schemas/work-management-v0.schema.json" — a canonical edit skipping it would draw no finding
+//	  surface_sweep_test.go:902: want a work-management finding naming the unscoped CLI mirror; got []
+//
+// The third line is the behavioral half: with the stale pattern the sweep
+// returned NO finding at all for a plan scoping the canonical schema and
+// the backend mirror but not the CLI one — which is the exact gap.
+// TestWorkManagementPatternCoversBothSyncSchemasMirrors is the SEPARATE
+// attestation of the in-loop rider ratified as binding approval condition
+// 2 (#3203): the registry's "work-management schema requires every
+// mirror" pattern was STALE — it carried only the backend mirror, while
+// the scripts/sync-schemas case arm it mirrors,
+//
+//	work-management-v*.schema.json)
+//	  cp "$schema" "$REPO_ROOT/backend/internal/workmgmt/schemas/$base"
+//	  cp "$schema" "$REPO_ROOT/cli/internal/spec/schemas/$base"   # E54.11 / #2801
+//
+// routes TWO mirrors. Before this change a plan touching the canonical
+// schema and the backend mirror but NOT the CLI mirror drew no
+// missing-sibling finding. The assertion is on the ARM's own routing, so
+// a future third mirror added to the arm without a registry update is
+// what a reader is pointed at, not a count that happens to be 3.
+func TestWorkManagementPatternCoversBothSyncSchemasMirrors(t *testing.T) {
+	var pat *surfacePattern
+	for i := range surfacePatterns {
+		if surfacePatterns[i].Name == "work-management schema requires every mirror" {
+			pat = &surfacePatterns[i]
+		}
+	}
+	if pat == nil {
+		t.Fatal("work-management pattern absent from the registry")
+	}
+	// Every path the sync-schemas work-management-v* arm writes, plus the
+	// canonical source it reads, must be BOTH a trigger and a sibling —
+	// the pattern is self-referential like its operator-role peers.
+	for _, want := range []string{wmCanonical, wmMirror, wmCLIMirror} {
+		if !slices.Contains(pat.Triggers, want) {
+			t.Errorf("Triggers missing %q — a canonical edit skipping it would draw no finding", want)
+		}
+		if !slices.Contains(pat.Siblings, want) {
+			t.Errorf("Siblings missing %q — a canonical edit skipping it would draw no finding", want)
+		}
+	}
+
+	// Behavioral half: the canonical + backend mirror in scope, CLI mirror
+	// absent, must now flag exactly the CLI mirror.
+	got, _ := evaluateSurfaceSweep([]string{wmCanonical, wmMirror}, surfacePatterns, nil)
+	var found bool
+	for _, f := range got {
+		if f.Pattern != "work-management schema requires every mirror" {
+			continue
+		}
+		found = true
+		if len(f.MissingSiblings) != 1 || f.MissingSiblings[0] != wmCLIMirror {
+			t.Errorf("MissingSiblings = %v, want [%s]", f.MissingSiblings, wmCLIMirror)
+		}
+	}
+	if !found {
+		t.Errorf("want a work-management finding naming the unscoped CLI mirror; got %+v", got)
+	}
+}
 
 // TestEvaluateCrossSliceCoupling is the pure detector test (#1102): a
 // lockstep pattern split across slices is flagged (a); consolidated into one

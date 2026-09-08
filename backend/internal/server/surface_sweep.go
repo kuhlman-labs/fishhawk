@@ -269,20 +269,28 @@ var surfacePatterns = []surfacePattern{
 	},
 	{
 		// #1101/#1006 case 2: the work-management-v0 schema's canonical and
-		// embedded-mirror copies must move in lockstep (scripts/sync-schemas'
-		// work-management-v* case routes the canonical to exactly the one
-		// backend/internal/workmgmt/schemas mirror). Self-referential
+		// embedded-mirror copies must move in lockstep. Self-referential
 		// (Triggers == Siblings): a field-add touching the canonical without
 		// its mirror flags within a slice; canonical and mirror split across
 		// decomposition slices flags as a cross-slice coupling finding (#1102).
+		//
+		// #3203: the CLI mirror was MISSING from this pattern. The
+		// scripts/sync-schemas work-management-v* case arm has copied the
+		// canonical schema to cli/internal/spec/schemas/ since E54.11 /
+		// #2801 (`fishhawk validate` checks a repo's conventions file
+		// against it before the charter read), so the arm routes TWO
+		// mirrors, not one; the registry carried only the backend copy and
+		// would not have flagged a canonical edit that skipped the CLI one.
 		Name: "work-management schema requires every mirror",
 		Triggers: []string{
 			"docs/spec/work-management-v0.schema.json",
 			"backend/internal/workmgmt/schemas/work-management-v0.schema.json",
+			"cli/internal/spec/schemas/work-management-v0.schema.json",
 		},
 		Siblings: []string{
 			"docs/spec/work-management-v0.schema.json",
 			"backend/internal/workmgmt/schemas/work-management-v0.schema.json",
+			"cli/internal/spec/schemas/work-management-v0.schema.json",
 		},
 	},
 }

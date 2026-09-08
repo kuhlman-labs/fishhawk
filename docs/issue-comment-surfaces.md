@@ -555,8 +555,15 @@ Notes:
   creates a new test file (`new_test_in_tested_package`, capped at 10 names
   + `omitted_count`), or a path-trigger rule's pinned test
   (`migration_walk`: a scoped `migrations/*.sql` requires
-  `backend/internal/postgres/postgres_test.go`, scope-set only, #1031) —
-  with payload `{findings, scanned_files, listed_dirs}`.
+  `backend/internal/postgres/postgres_test.go`, scope-set only, #1031). A
+  fourth rule id, `generated_surface` (#3203), flags a scoped CANONICAL
+  source whose DERIVED files are absent from scope.files — a generated site
+  Reference region or an embedded schema/preset/fixture mirror — and is the
+  one rule whose `missing_tests` are not test files. Payload
+  `{findings, scanned_files, listed_dirs}`; each finding carries the
+  optional `generator` field naming the command that rewrites those derived
+  files (`scripts/gen-site-reference` or `scripts/sync-schemas`), omitted on
+  the three test-file rules.
   Advisory + fail-open (nil GitHub client, nil installation, every listing
   failing → no entry, never a block) and written even on a clean sweep
   (empty `findings`) so a reader can distinguish "checked and clean" from

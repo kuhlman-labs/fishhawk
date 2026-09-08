@@ -1678,7 +1678,10 @@ type CrossSliceClaimEvidence struct {
 
 // TestSweepEvidence is the plan_test_sweep result (#942): the plan's
 // scope.files evaluated against the repository's existing *_test.go
-// files via the Contents API. Empty Findings means "checked and clean";
+// files via the Contents API, plus the scope-set-only path-trigger rules
+// (migration_walk and, since #3203, generated_surface — whose missing
+// paths are DERIVED files rather than test files, and which therefore
+// fire with no listing at all). Empty Findings means "checked and clean";
 // ListedDirs counts the directories actually listed (0 means every
 // listing failed open — findings may be incomplete).
 type TestSweepEvidence struct {
@@ -1688,9 +1691,10 @@ type TestSweepEvidence struct {
 }
 
 // TestSweepFindingEvidence is one test-sweep finding: the plan touches
-// TriggerPath but omits the existing test files MissingTests the named
-// Rule associates with it; OmittedCount is the number of additional
-// existing test files truncated from MissingTests.
+// TriggerPath but omits the files MissingTests the named Rule associates
+// with it — existing TEST files for the three test-file rules, DERIVED
+// files for generated_surface (#3203); OmittedCount is the number of
+// additional existing test files truncated from MissingTests.
 type TestSweepFindingEvidence struct {
 	Rule         string
 	TriggerPath  string
@@ -1699,6 +1703,12 @@ type TestSweepFindingEvidence struct {
 	// SubPlanTitle, when set, names the decomposition sub-plan whose own
 	// scope produced the finding (#1077); empty for parent-scope findings.
 	SubPlanTitle string
+	// Generator, when set, names the command that regenerates or mirrors
+	// MissingTests from TriggerPath (#3203). It is set only on
+	// generated_surface findings, where MissingTests are DERIVED files
+	// rather than test files; empty for the three test-file rules, whose
+	// rendered line stays byte-identical to the pre-#3203 output.
+	Generator string
 }
 
 // PriorConcern is one previously recorded concern rendered into the
@@ -4604,7 +4614,18 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 		if len(ts.Findings) == 0 {
 			b.WriteString("- findings: none (checked and clean)\n")
 		} else {
+			generatedSurface := false
 			for _, f := range ts.Findings {
+				if f.Generator != "" {
+					// #3203 generated_surface: MissingTests are DERIVED files a
+					// generator rewrites, not test files — a distinct line, so
+					// the reviewer is not told to judge "tests" that are a
+					// rendered site region or an embedded schema mirror.
+					generatedSurface = true
+					fmt.Fprintf(b, "- %sGENERATED SURFACE NOT IN SCOPE (%s): %s is a canonical source in scope but these DERIVED files it generates are absent from scope.files: %s (regenerate with `%s`)\n",
+						subPlanPrefix(f.SubPlanTitle), f.Rule, f.TriggerPath, strings.Join(f.MissingTests, ", "), f.Generator)
+					continue
+				}
 				fmt.Fprintf(b, "- %sEXISTING TESTS NOT IN SCOPE (%s): %s is in scope but these existing test files are absent from scope.files: %s",
 					subPlanPrefix(f.SubPlanTitle), f.Rule, f.TriggerPath, strings.Join(f.MissingTests, ", "))
 				if f.OmittedCount > 0 {
@@ -4617,6 +4638,13 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 				"If so, the plan must scope them or the runner will scope_drift-exclude the agent's edits to them " +
 				"— record a concern naming the files. If the flagged tests are unrelated to the changed behavior, " +
 				"no concern is needed.\n")
+			if generatedSurface {
+				b.WriteString("For a GENERATED SURFACE finding the judgement is narrower: the derived region is " +
+					"rendered byte-exactly from the canonical source and its freshness is enforced by " +
+					"`scripts/test verify`, so an unscoped derived file cannot go green — the implement stage " +
+					"would have to spend one of its two scope amendments mid-stage. Unless the canonical edit " +
+					"provably cannot change the derived output, the plan should scope the derived files now.\n")
+			}
 		}
 		b.WriteString("\n")
 	}

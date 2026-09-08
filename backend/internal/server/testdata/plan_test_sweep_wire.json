@@ -1,0 +1,23 @@
+{
+  "findings": [
+    {
+      "rule": "generated_surface",
+      "trigger_path": "docs/spec/workflow-v2.schema.json",
+      "missing_tests": [
+        "site/src/content/docs/reference/workflow-spec.md"
+      ],
+      "generator": "scripts/gen-site-reference"
+    },
+    {
+      "rule": "generated_surface",
+      "trigger_path": "docs/spec/workflow-v2.schema.json",
+      "missing_tests": [
+        "backend/internal/spec/schemas/workflow-v2.schema.json",
+        "cli/internal/spec/schemas/workflow-v2.schema.json"
+      ],
+      "generator": "scripts/sync-schemas"
+    }
+  ],
+  "scanned_files": 1,
+  "listed_dirs": 0
+}

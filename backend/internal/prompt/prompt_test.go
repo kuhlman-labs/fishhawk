@@ -4128,6 +4128,136 @@ func TestBuild_PlanReview_GateEvidence_TestSweepRenders(t *testing.T) {
 	}
 }
 
+// Counterfactual record for the #3203 render branch (binding approval
+// condition 3), EXECUTED not reasoned: the `if f.Generator != ""` branch
+// and its closing paragraph were DELETED from writePlanGateEvidence in
+// prompt.go (so every finding fell through to the pre-#3203 test-file
+// wording), then restored byte-identically.
+//
+//	go test ./internal/prompt/ -run 'GeneratedSurface|NoGeneratedSurfaceParagraph' -v
+//	--- FAIL: TestBuild_PlanReview_GateEvidence_GeneratedSurfaceRenders
+//	--- PASS: TestBuild_PlanReview_GateEvidence_NoGeneratedSurfaceParagraph
+//
+// The PASS on the second test is CORRECT and is stated rather than hidden:
+// that test asserts the generated-surface text is ABSENT with no
+// Generator-bearing finding, so deleting the branch cannot redden it. It
+// is the guard against the branch firing when it must not, and its
+// counterfactual is the FIRST test — which does go red. Together they pin
+// both directions.
+// TestBuild_PlanReview_GateEvidence_GeneratedSurfaceRenders pins the
+// #3203 branch: a finding carrying a Generator renders the DISTINCT
+// generated-surface line (derived files, not test files) naming both the
+// derived file and the command to run, plus the closing paragraph about
+// the byte-exact regeneration gate. It ALSO pins the regression half of
+// binding condition 5 in the same render: a Generator-less
+// stem_sibling / new_test_in_tested_package / migration_walk finding in
+// the SAME block keeps its pre-#3203 line byte-identical, so the new
+// branch cannot have leaked into the old one.
+func TestBuild_PlanReview_GateEvidence_GeneratedSurfaceRenders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			TestSweep: &TestSweepEvidence{
+				ScannedFiles: 2,
+				ListedDirs:   1,
+				Findings: []TestSweepFindingEvidence{
+					{
+						// Generator empty: must render the pre-#3203 wording.
+						Rule:         "stem_sibling",
+						TriggerPath:  "backend/internal/server/upload.go",
+						MissingTests: []string{"backend/internal/server/upload_test.go"},
+					},
+					{
+						Rule:         "migration_walk",
+						TriggerPath:  "backend/internal/postgres/migrations/0032_x.up.sql",
+						MissingTests: []string{"backend/internal/postgres/postgres_test.go"},
+					},
+					{
+						Rule:         "generated_surface",
+						TriggerPath:  "docs/spec/workflow-v2.schema.json",
+						MissingTests: []string{"site/src/content/docs/reference/workflow-spec.md"},
+						Generator:    "scripts/gen-site-reference",
+					},
+					{
+						Rule:         "generated_surface",
+						TriggerPath:  "docs/spec/workflow-v2.schema.json",
+						MissingTests: []string{"backend/internal/spec/schemas/workflow-v2.schema.json", "cli/internal/spec/schemas/workflow-v2.schema.json"},
+						Generator:    "scripts/sync-schemas",
+						SubPlanTitle: "schema slice",
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		// The new branch: derived files + the generator, per finding.
+		"- GENERATED SURFACE NOT IN SCOPE (generated_surface): docs/spec/workflow-v2.schema.json is a canonical source in scope but these DERIVED files it generates are absent from scope.files: site/src/content/docs/reference/workflow-spec.md (regenerate with `scripts/gen-site-reference`)",
+		"cli/internal/spec/schemas/workflow-v2.schema.json (regenerate with `scripts/sync-schemas`)",
+		// The sub-plan prefix still applies to the new line.
+		"(sub-plan: schema slice) GENERATED SURFACE NOT IN SCOPE",
+		// The closing generated-surface paragraph.
+		"rendered byte-exactly from the canonical source",
+		"the implement stage would have to spend one of its two scope amendments mid-stage",
+		// Binding condition 5: the pre-#3203 lines, byte-identical.
+		"- EXISTING TESTS NOT IN SCOPE (stem_sibling): backend/internal/server/upload.go is in scope but these existing test files are absent from scope.files: backend/internal/server/upload_test.go",
+		"- EXISTING TESTS NOT IN SCOPE (migration_walk): backend/internal/postgres/migrations/0032_x.up.sql is in scope but these existing test files are absent from scope.files: backend/internal/postgres/postgres_test.go",
+		"these findings are advisories, not violations",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing generated-surface element %q:\n%s", w, got)
+		}
+	}
+	// The generated_surface findings must NOT be rendered with the
+	// test-file wording, and the two branches must not cross-contaminate.
+	if strings.Contains(got, "EXISTING TESTS NOT IN SCOPE (generated_surface)") {
+		t.Errorf("generated_surface finding rendered with the test-file wording:\n%s", got)
+	}
+	if strings.Contains(got, "(stem_sibling): backend/internal/server/upload.go is in scope but these existing test files are absent from scope.files: backend/internal/server/upload_test.go (regenerate with") {
+		t.Errorf("the generator suffix leaked onto a Generator-less finding:\n%s", got)
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_NoGeneratedSurfaceParagraph is the
+// other half of the #3203 branch: with NO Generator-bearing finding the
+// closing generated-surface paragraph must be absent entirely, so a
+// pre-#3203 render is byte-identical to today's.
+func TestBuild_PlanReview_GateEvidence_NoGeneratedSurfaceParagraph(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			TestSweep: &TestSweepEvidence{
+				ScannedFiles: 1,
+				ListedDirs:   1,
+				Findings: []TestSweepFindingEvidence{
+					{
+						Rule:         "stem_sibling",
+						TriggerPath:  "backend/internal/server/upload.go",
+						MissingTests: []string{"backend/internal/server/upload_test.go"},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, unwanted := range []string{
+		"GENERATED SURFACE NOT IN SCOPE",
+		"rendered byte-exactly from the canonical source",
+		"(regenerate with `",
+	} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("generated-surface text %q rendered with no Generator-bearing finding:\n%s", unwanted, got)
+		}
+	}
+}
+
 // TestBuild_PlanReview_GateEvidence_ScopeRegressionRenders pins the #1257
 // block: when ScopeRegression has dropped files, the HIGH-severity block
 // lists RemovedFiles (and AddedFiles for context) with the scope_drift
