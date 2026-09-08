@@ -31,8 +31,47 @@ func NewPostgresRepository(pool *pgxpool.Pool) Repository {
 
 func (r *postgresRepo) CreateCampaign(ctx context.Context, p CreateCampaignParams) (*Campaign, error) {
 	q := campaigndb.New(r.pool)
+	id := uuid.New()
+	// GROOMING-CURRENCY GUARD (E54.17 / #2817). A non-nil GroomingGuard routes to
+	// the guarded INSERT, which decides currency INSIDE the campaign row's own
+	// statement rather than in a check-then-act window ahead of it. A zero-row
+	// result — the ONLY way an otherwise-unconditional INSERT returns no row —
+	// means a strictly-newer approved grooming run was VISIBLE to the guard's
+	// snapshot, so it maps to ErrGroomingOrderSuperseded. Nil (every epic_ref /
+	// explicit-items / allow_superseded campaign) keeps the byte-identical
+	// unguarded q.CreateCampaign path below.
+	if p.GroomingGuard != nil {
+		row, err := q.CreateCampaignGuardedByGroomingCurrency(ctx, campaigndb.CreateCampaignGuardedByGroomingCurrencyParams{
+			ID:             id,
+			Repo:           p.Repo,
+			EpicRef:        p.EpicRef,
+			State:          string(StatePending),
+			PausePolicy:    string(normalizePausePolicy(p.PausePolicy)),
+			OperatorAgent:  p.OperatorAgent,
+			IdempotencyKey: p.IdempotencyKey,
+			WorkingDir:     p.WorkingDir,
+			GroomingSource: p.GroomingSource,
+			// The six guard params. AccountID is the domain "" (untenanted) / UUID
+			// string; accountIDArg maps "" -> nil (SQL NULL), which the query's
+			// `IS NOT DISTINCT FROM $13::uuid` matches only against another
+			// untenanted run — the exact-match tenancy sameGroomingTenant enforces.
+			SourceRunID:          p.GroomingGuard.SourceRunID,
+			SourceRepo:           p.GroomingGuard.Repo,
+			SourceWorkflowID:     p.GroomingGuard.WorkflowID,
+			SourceAccountID:      accountIDArg(p.GroomingGuard.AccountID),
+			SourceInstallationID: p.GroomingGuard.SourceInstallationID,
+			SourceCreatedAt:      p.GroomingGuard.SourceCreatedAt,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrGroomingOrderSuperseded
+		}
+		if err != nil {
+			return nil, fmt.Errorf("create campaign: %w", err)
+		}
+		return rowToCampaign(row), nil
+	}
 	row, err := q.CreateCampaign(ctx, campaigndb.CreateCampaignParams{
-		ID:      uuid.New(),
+		ID:      id,
 		Repo:    p.Repo,
 		EpicRef: p.EpicRef,
 		State:   string(StatePending),

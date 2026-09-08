@@ -1469,3 +1469,177 @@ func TestCreateCampaign_GroomingSource_ZeroTimestampedReportIsNotAbsent(t *testi
 		t.Fatalf("persisted queue order = %v, want [issue:20 issue:10]", gotRefs)
 	}
 }
+
+// --- Grooming-currency guard: resolver + handler mapping (E54.17 / #2817) ---
+
+// TestResolveGroomingOrder_GuardPopulatedForNormalSource pins step 10(i): a
+// normal (not allow_superseded) grooming source yields a fully populated
+// GroomingCurrencyGuard built from the SOURCE run, which is what the guarded
+// INSERT needs to decide currency atomically.
+func TestResolveGroomingOrder_GuardPopulatedForNormalSource(t *testing.T) {
+	f := newGroomingSourceFixture(t, groomingSourceOpts{approvals: []approval.Decision{approval.DecisionApprove}}, 10, 20)
+	ctx := context.WithValue(context.Background(), ctxKeyIdentity, Identity{AccountID: testOperatorAccountID})
+	_, _, guard, gerr := f.server.resolveGroomingOrder(ctx, "kuhlman-labs", "fishhawk", "kuhlman-labs/fishhawk",
+		&groomingSourceRequest{RunID: f.runID.String()})
+	if gerr != nil {
+		t.Fatalf("resolveGroomingOrder err = %v, want nil", gerr)
+	}
+	if guard == nil {
+		t.Fatal("guard = nil, want a populated GroomingCurrencyGuard for a normal grooming source")
+	}
+	src := f.runs.runs[f.runID]
+	if guard.SourceRunID != f.runID {
+		t.Errorf("guard.SourceRunID = %s, want %s", guard.SourceRunID, f.runID)
+	}
+	if guard.Repo != src.Repo || guard.WorkflowID != src.WorkflowID || guard.AccountID != src.AccountID {
+		t.Errorf("guard scope = {repo:%q wf:%q acct:%q}, want {repo:%q wf:%q acct:%q}",
+			guard.Repo, guard.WorkflowID, guard.AccountID, src.Repo, src.WorkflowID, src.AccountID)
+	}
+	if !guard.SourceCreatedAt.Equal(src.CreatedAt) {
+		t.Errorf("guard.SourceCreatedAt = %v, want %v", guard.SourceCreatedAt, src.CreatedAt)
+	}
+	if guard.SourceInstallationID != nil {
+		t.Errorf("guard.SourceInstallationID = %v, want nil (source run has none)", *guard.SourceInstallationID)
+	}
+}
+
+// TestResolveGroomingOrder_NilGuardWhenAllowSuperseded pins step 10(ii):
+// allow_superseded threads a NIL guard, because re-imposing the check at insert
+// time would refuse exactly the case the operator acknowledged.
+func TestResolveGroomingOrder_NilGuardWhenAllowSuperseded(t *testing.T) {
+	f := newGroomingSourceFixture(t, groomingSourceOpts{approvals: []approval.Decision{approval.DecisionApprove}}, 10, 20)
+	ctx := context.WithValue(context.Background(), ctxKeyIdentity, Identity{AccountID: testOperatorAccountID})
+	_, _, guard, gerr := f.server.resolveGroomingOrder(ctx, "kuhlman-labs", "fishhawk", "kuhlman-labs/fishhawk",
+		&groomingSourceRequest{RunID: f.runID.String(), AllowSuperseded: true})
+	if gerr != nil {
+		t.Fatalf("resolveGroomingOrder err = %v, want nil", gerr)
+	}
+	if guard != nil {
+		t.Fatalf("guard = %+v, want nil under allow_superseded", guard)
+	}
+}
+
+// TestCreateCampaign_GroomingCurrencyGuard_MapsSupersededTo422 pins step 10(iii):
+// a Persist that returns campaign.ErrGroomingOrderSuperseded (the guarded INSERT
+// declined) maps to 422 grooming_order_superseded, NOT the blanket 500
+// persist-campaign-failed. The sentinel is injected through the fake's createErr,
+// so this asserts the HANDLER mapping (the postgres.go translation has its own
+// counterfactual vehicle in campaign/postgres_test.go case (a)).
+func TestCreateCampaign_GroomingCurrencyGuard_MapsSupersededTo422(t *testing.T) {
+	f := newGroomingSourceFixture(t, groomingSourceOpts{approvals: []approval.Decision{approval.DecisionApprove}}, 10, 20)
+	f.campaigns.createErr = campaign.ErrGroomingOrderSuperseded
+
+	w := postCampaign(t, f.server, groomingSourceBody(f.runID, ""))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	code, _ := decodeGroomingErr(t, w.Body.Bytes())
+	if code != codeGroomingSuperseded {
+		t.Fatalf("error code = %q, want %q", code, codeGroomingSuperseded)
+	}
+	// COMMITTED STATE: no campaign row exists (the guard wrote nothing; the fake
+	// returns the error before inserting).
+	if n := f.campaigns.countCampaigns(); n != 0 {
+		t.Fatalf("committed campaigns = %d, want 0 on a superseded refusal", n)
+	}
+}
+
+// TestCreateCampaign_GroomingCurrencyGuard_DiagnosticFailureOmitsSupersededBy
+// pins step 10(iv): when the best-effort superseded_by diagnostic read FAILS, the
+// response is STILL the 422 grooming_order_superseded (the atomic INSERT already
+// decided — the read is a label, not the decision) and simply carries no
+// superseded_by key. The diagnostic's ListRuns is failed only on its SECOND call
+// so the initial supersession scan still succeeds and the request reaches Persist.
+func TestCreateCampaign_GroomingCurrencyGuard_DiagnosticFailureOmitsSupersededBy(t *testing.T) {
+	f := newGroomingSourceFixture(t, groomingSourceOpts{approvals: []approval.Decision{approval.DecisionApprove}}, 10, 20)
+	f.campaigns.createErr = campaign.ErrGroomingOrderSuperseded
+
+	calls := 0
+	f.runs.listRuns = func(filter run.ListRunsFilter) ([]*run.Run, error) {
+		calls++
+		if calls >= 2 {
+			// The diagnostic re-scan fails; the refusal must survive it.
+			return nil, fmt.Errorf("list runs boom")
+		}
+		// First call (the pre-Persist scan): the default one-short-page behaviour,
+		// naming no superseding run so the request reaches Persist.
+		var out []*run.Run
+		for _, r := range f.runs.runs {
+			if r.Repo == filter.Repo && r.WorkflowID == filter.WorkflowID && r.AccountID == filter.AccountID {
+				out = append(out, r)
+			}
+		}
+		if filter.Offset > 0 {
+			return nil, nil
+		}
+		return out, nil
+	}
+
+	w := postCampaign(t, f.server, groomingSourceBody(f.runID, ""))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeGroomingErr(t, w.Body.Bytes())
+	if code != codeGroomingSuperseded {
+		t.Fatalf("error code = %q, want %q", code, codeGroomingSuperseded)
+	}
+	if _, ok := details["superseded_by"]; ok {
+		t.Fatalf("details carry superseded_by = %v, want it OMITTED when the diagnostic read failed", details["superseded_by"])
+	}
+	// The error path is only exercised if the diagnostic re-scan (the SECOND
+	// ListRuns) was actually reached — otherwise the omitted superseded_by proves
+	// nothing (the lookup could have been skipped entirely). Assert the injected
+	// failure was hit so this remains an error-path test, not a vacuous pass.
+	if calls < 2 {
+		t.Fatalf("ListRuns calls = %d, want >= 2 (diagnostic re-scan never reached; error path unexercised)", calls)
+	}
+	// COUNTERFACTUAL OBSERVED (run, not reasoned): replacing the
+	// newerApprovedGroomingRun diagnostic call in groomingSupersededRefusal
+	// (campaign_grooming_source.go) with `_ = sourceRun` — so no second ListRuns is
+	// issued — turns this test RED at the assertion above (ListRuns calls = 1, want
+	// >= 2) while the 422 + omitted superseded_by assertions still pass, proving
+	// those two alone were vacuous. Restored byte-identically → GREEN.
+}
+
+// TestCreateCampaign_GroomingSource_ThreadsGuardOntoCreateParams pins step
+// 10 (recorder): a grooming source that is NOT allow_superseded threads a
+// populated GroomingCurrencyGuard onto CreateCampaignParams — the wiring the
+// atomic guarded INSERT depends on. A handler that dropped it would leave the
+// guard nil and silently reopen the check-to-persist race.
+func TestCreateCampaign_GroomingSource_ThreadsGuardOntoCreateParams(t *testing.T) {
+	f := newGroomingSourceFixture(t, groomingSourceOpts{approvals: []approval.Decision{approval.DecisionApprove}}, 10, 20)
+
+	w := postCampaign(t, f.server, groomingSourceBody(f.runID, ""))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if !f.campaigns.lastCreateParamsSet {
+		t.Fatal("no CreateCampaign recorded")
+	}
+	guard := f.campaigns.lastCreateParams.GroomingGuard
+	if guard == nil {
+		t.Fatal("CreateCampaignParams.GroomingGuard = nil, want the grooming-currency guard threaded through")
+	}
+	if guard.SourceRunID != f.runID {
+		t.Errorf("guard.SourceRunID = %s, want %s", guard.SourceRunID, f.runID)
+	}
+}
+
+// TestCreateCampaign_GroomingSource_AllowSupersededThreadsNilGuard pins that the
+// allow_superseded path threads a NIL guard onto CreateCampaignParams — the
+// operator acknowledged a possibly-stale order, so the guarded INSERT must not
+// re-impose the check.
+func TestCreateCampaign_GroomingSource_AllowSupersededThreadsNilGuard(t *testing.T) {
+	f := newGroomingSourceFixture(t, groomingSourceOpts{approvals: []approval.Decision{approval.DecisionApprove}}, 10, 20)
+
+	w := postCampaign(t, f.server, groomingSourceBody(f.runID, `,"allow_superseded":true`))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if !f.campaigns.lastCreateParamsSet {
+		t.Fatal("no CreateCampaign recorded")
+	}
+	if guard := f.campaigns.lastCreateParams.GroomingGuard; guard != nil {
+		t.Fatalf("CreateCampaignParams.GroomingGuard = %+v, want nil under allow_superseded", guard)
+	}
+}

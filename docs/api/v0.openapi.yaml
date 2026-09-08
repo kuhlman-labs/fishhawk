@@ -10907,6 +10907,18 @@ paths:
                         refused regardless of this flag — an operator can
                         knowingly accept a NAMED stale order, but nobody can
                         acknowledge a check that never completed.
+
+                        The currency check is ALSO evaluated ATOMICALLY WITH THE
+                        campaign INSERT (E54.17 / #2817), so `grooming_order_superseded`
+                        can also fire for a run approved DURING the request: any
+                        superseding approval COMMITTED BEFORE THE GUARDED INSERT
+                        STATEMENT BEGAN prevents creation and NO campaign row
+                        exists when it does. (This closes the check-to-persist
+                        window; it is not whole-request serializability — an
+                        approval that commits after the statement began is later
+                        than the campaign, not a supersession of it.) Passing
+                        `allow_superseded` skips this atomic check too, exactly as
+                        it skips the pre-flight one.
                 working_dir:
                   type: string
                   description: >-

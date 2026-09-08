@@ -13,6 +13,49 @@ INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, 
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING *;
 
+-- name: CreateCampaignGuardedByGroomingCurrency :one
+-- The GROOMING-CURRENCY guard (E54.17 / #2817). Identical to CreateCampaign in
+-- what it writes, but the row is inserted ONLY WHERE NOT EXISTS a strictly-newer
+-- approved grooming run of the same (repo, workflow, account, installation) as
+-- the source run. Guard evaluation and the row's commit are ONE statement in one
+-- transaction under ONE snapshot, which is what removes the check-to-persist
+-- window handleCreateCampaign otherwise leaves open between its supersession scan
+-- and this INSERT: any superseding approval COMMITTED BEFORE THIS STATEMENT BEGAN
+-- prevents creation, while one that commits after the statement began is LATER
+-- than the campaign, not a supersession of it (Read Committed: the SELECT sees a
+-- snapshot as of the instant the statement begins, and the INSERT ... SELECT's
+-- search condition is evaluated under that same snapshot). This is NOT
+-- whole-request serializability.
+--
+-- `IS NOT DISTINCT FROM` is what makes an UNSET account/installation match only
+-- another unset one rather than every row — the exact-match tenancy the server's
+-- sameGroomingTenant enforces (an empty account and a nil installation are
+-- distinct tenancy states, not wildcards). The (created_at, id) tuple comparison
+-- is the strict total order groomingRunPrecedes declares, so the source run never
+-- supersedes itself. This SQL predicate DUPLICATES that Go predicate and the two
+-- must change together. A zero-row result means the guard refused (the INSERT is
+-- otherwise unconditional, so no other outcome yields no row); the adapter maps
+-- it to campaign.ErrGroomingOrderSuperseded.
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source)
+SELECT
+    sqlc.arg(id), sqlc.arg(repo), sqlc.arg(epic_ref), sqlc.arg(state), sqlc.arg(pause_policy),
+    sqlc.arg(operator_agent), sqlc.narg(idempotency_key), sqlc.arg(working_dir), sqlc.arg(grooming_source)
+WHERE NOT EXISTS (
+    SELECT 1
+      FROM runs newer
+      JOIN stages st ON st.run_id = newer.id AND st.stage_type = 'plan'
+      JOIN artifacts a ON a.stage_id = st.id AND a.kind = 'grooming_report'
+     WHERE newer.id <> sqlc.arg(source_run_id)
+       AND newer.repo = sqlc.arg(source_repo)
+       AND newer.workflow_id = sqlc.arg(source_workflow_id)
+       AND newer.account_id IS NOT DISTINCT FROM sqlc.narg(source_account_id)::uuid
+       AND newer.installation_id IS NOT DISTINCT FROM sqlc.narg(source_installation_id)::bigint
+       AND (newer.created_at, newer.id) > (sqlc.arg(source_created_at)::timestamptz, sqlc.arg(source_run_id)::uuid)
+       AND EXISTS (SELECT 1 FROM approvals ap WHERE ap.stage_id = st.id AND ap.decision = 'approve')
+       AND NOT EXISTS (SELECT 1 FROM approvals ap WHERE ap.stage_id = st.id AND ap.decision = 'reject')
+)
+RETURNING *;
+
 -- name: GetCampaign :one
 SELECT * FROM campaigns WHERE id = $1;
 

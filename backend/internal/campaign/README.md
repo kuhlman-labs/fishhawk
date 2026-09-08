@@ -173,6 +173,51 @@ This is the opposite posture to `groomingChurnBaseline`, and deliberately so:
 that guard is a SUPPRESSOR, so an unreadable baseline makes it propose. This one
 is authorization-shaped, so it refuses.
 
+### The currency decision is atomic with the campaign INSERT (E54.17 / #2817)
+
+The pre-flight supersession scan above runs BEFORE work-management provider
+resolution — a forge round-trip bounded by a multi-second budget — and then
+assembly and persistence. Deciding currency only in that scan leaves a
+seconds-wide check-then-act window: a grooming run approved anywhere inside it
+would yield a `201` campaign whose source order was already superseded. So the
+currency decision is ALSO made INSIDE the campaign row's own INSERT.
+`CreateCampaignGuardedByGroomingCurrency` (a SECOND query alongside an untouched
+`CreateCampaign`) inserts the row only `WHERE NOT EXISTS` a strictly-newer
+approved grooming run of the same `(repo, workflow, account, installation)` as
+the source run; a zero-row result maps to `ErrGroomingOrderSuperseded`, which the
+handler renders as the SAME `422 grooming_order_superseded` (with a best-effort
+`superseded_by` label — an unreadable diagnostic omits the key and keeps the
+`422`, never upgrading it to a `502`, because the atomic INSERT already decided).
+
+**State the guarantee honestly.** The guard is evaluated under the INSERT
+statement's Read Committed snapshot, so the contract is: any superseding approval
+COMMITTED BEFORE THE GUARDED STATEMENT BEGAN prevents creation and leaves no
+campaign row; an approval that commits AFTER the statement began is LATER than the
+campaign, not a supersession of it. This collapses the window from seconds (a
+forge round-trip) to the duration of one statement — it does NOT make the whole
+HTTP request one serializable transaction, and it does NOT claim that no approval
+can land between predicate evaluation and the row write. A reviewer expecting
+whole-request serializability should read this as "the check-to-persist window is
+closed", not "the request is a serializable transaction".
+
+The predicate DUPLICATES the Go predicate in `newerApprovedGroomingRun` /
+`groomingRunPrecedes` / `sameGroomingTenant` in SQL — the same strict
+`(created_at, id)` total order (so the source never supersedes itself) and the
+same exact-match tenancy, where `IS NOT DISTINCT FROM` makes an unset account or a
+nil installation match only another unset one rather than every row. A future
+change to one side must move the other. `allow_superseded` deliberately threads a
+NIL guard: re-imposing the check at insert time would refuse exactly the order the
+operator acknowledged, and by extension any OTHER newer run that becomes approved
+during the request — the widened acknowledgement is the cost of the flag.
+
+RESIDUAL (RLS): migration `0057` puts row-level-security policies on `runs`/`stages`
+keyed to the per-transaction `app.account_id` GUC, and `Persist` does not run
+inside a tenant transaction. Today the policies are INERT (the runtime role is a
+superuser) and the guard scopes by account explicitly regardless; if the runtime
+ever moves to the non-superuser role `0057` describes, the guard's subquery could
+be filtered to NULL-account runs and would then fail OPEN (miss a superseding run)
+rather than closed. This is a known coupling to the RLS rollout, not fixed here.
+
 ### The order is read exactly once
 
 At assembly, and nowhere else. Nothing in the campaign engine or the campaign

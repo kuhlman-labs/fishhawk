@@ -135,6 +135,14 @@ type Assembly struct {
 	// grooming-sourced (every epic_ref / explicit-items campaign). The server
 	// marshals it; the campaign package never interprets these bytes.
 	GroomingSource []byte
+	// GroomingGuard is the OPTIONAL grooming-currency guard (E54.17 / #2817),
+	// threaded straight through Persist onto CreateCampaignParams. It rides the
+	// campaign's OWN INSERT for the SAME reason GroomingSource does: Persist is not
+	// transactional, so anything checked OUTSIDE that one statement is checked in a
+	// window a concurrent approval can slip through. Nil = unguarded (every
+	// epic_ref / explicit-items / allow_superseded campaign); the server builds it
+	// only for a grooming source it did not allow to be superseded.
+	GroomingGuard *GroomingCurrencyGuard
 	// SatisfiedDependencies are the depends_on edges elided during assembly
 	// because their out-of-set target was already closed-and-completed (#2953),
 	// carried verbatim from the resolved EpicChildrenResult.SatisfiedEdges. It is
@@ -349,6 +357,13 @@ func Persist(ctx context.Context, repo Repository, repoName string, a *Assembly)
 		// provenance record written after the fact could be lost while the
 		// campaign survived. Nil = not grooming-sourced.
 		GroomingSource: a.GroomingSource,
+		// Thread the optional grooming-currency guard straight through (E54.17 /
+		// #2817). Non-nil selects the guarded INSERT, which decides currency in the
+		// campaign row's own statement — no window between the check and the row
+		// write, for the same reason GroomingSource rides that statement. Nil =
+		// unguarded. A guard refusal surfaces as ErrGroomingOrderSuperseded, which
+		// this function returns wrapped like any other CreateCampaign error.
+		GroomingGuard: a.GroomingGuard,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("campaign: create campaign for %s: %w", a.EpicRef, err)

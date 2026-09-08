@@ -52,6 +52,14 @@ type fakeCampaignRepo struct {
 	campaigns  map[uuid.UUID]*campaign.Campaign
 	itemsByCmp map[uuid.UUID][]*campaign.Item
 
+	// lastCreateParams records the most recent CreateCampaign params so a test
+	// can assert the grooming-currency guard (E54.17 / #2817) was actually
+	// THREADED onto CreateCampaignParams — a handler that dropped it would leave
+	// GroomingGuard nil and the guarded INSERT would never run. lastCreateParamsSet
+	// distinguishes "no create yet" from a zero-value params.
+	lastCreateParams    campaign.CreateCampaignParams
+	lastCreateParamsSet bool
+
 	// error injections so the 5xx surfaces are reachable.
 	createErr    error
 	getErr       error
@@ -124,6 +132,10 @@ func newFakeCampaignRepo() *fakeCampaignRepo {
 func (f *fakeCampaignRepo) CreateCampaign(_ context.Context, p campaign.CreateCampaignParams) (*campaign.Campaign, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Record BEFORE the error injection so a superseded-mapping test can still
+	// assert the guard was threaded even when createErr forces a refusal.
+	f.lastCreateParams = p
+	f.lastCreateParamsSet = true
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
@@ -1113,6 +1125,11 @@ type fakeIssueSetProvider struct {
 	// capturedCallTime is when the resolver was ENTERED, the second candidate
 	// anchor the budget could have been measured from.
 	capturedCallTime time.Time
+	// beforeResolve, when set, runs INSIDE ResolveDependencies — after the
+	// handler's supersession scan and before campaign.Persist. It is the injection
+	// seam the grooming-currency window test (E54.17 / #2817) uses to commit a
+	// superseding approval strictly inside the check-to-persist window.
+	beforeResolve func()
 }
 
 func (f *fakeIssueSetProvider) Name() string { return f.name }
@@ -1124,6 +1141,9 @@ func (f *fakeIssueSetProvider) File(_ context.Context, _ workmgmt.ProviderReques
 func (f *fakeIssueSetProvider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSetRequest) (*workmgmt.EpicChildrenResult, error) {
 	f.resolveCalled = true
 	f.captured = req
+	if f.beforeResolve != nil {
+		f.beforeResolve()
+	}
 	// The DEADLINE is captured, not the ctx: the effective issue-set budget is
 	// only observable as the deadline the handler hands the resolver, and
 	// storing a context in a struct is what containedctx flags.
@@ -8087,5 +8107,27 @@ func TestDanglingDependencyDetails_UnparsableRefsUnderStateUnreadable(t *testing
 	}
 	if !strings.Contains(string(b), `unparsable:0123456789abcdef:\"other/repo#12\"`) {
 		t.Errorf("marshaled details %s missing the quoted unparsable ref", b)
+	}
+}
+
+// TestCreateCampaign_EpicRef_ThreadsNilGuard pins that a non-grooming (epic_ref)
+// campaign threads a NIL guard, so its create takes the byte-identical unguarded
+// CreateCampaign path.
+func TestCreateCampaign_EpicRef_ThreadsNilGuard(t *testing.T) {
+	fake := newFakeCampaignRepo()
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	gh := recordingInstallGitHubClient(t, 7788, &installRecorder{})
+	s := New(Config{CampaignRepo: fake, GitHub: gh})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if !fake.lastCreateParamsSet {
+		t.Fatal("no CreateCampaign recorded")
+	}
+	if guard := fake.lastCreateParams.GroomingGuard; guard != nil {
+		t.Fatalf("epic_ref campaign threaded GroomingGuard = %+v, want nil", guard)
 	}
 }

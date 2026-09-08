@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -28,6 +29,61 @@ var (
 	ErrCampaignNotFound     = fmt.Errorf("campaign: %w", ErrNotFound)
 	ErrCampaignItemNotFound = fmt.Errorf("campaign item: %w", ErrNotFound)
 )
+
+// ErrGroomingOrderSuperseded is returned by CreateCampaign when a
+// GroomingGuard was supplied and the guarded INSERT wrote no row — i.e. a
+// strictly-newer approved grooming run of the same (repo, workflow, account,
+// installation) as the source run was VISIBLE to the guard's subquery, so the
+// campaign's source order had already been superseded (E54.17 / #2817).
+//
+// HONEST GUARANTEE (the guard is evaluated under the INSERT statement's Read
+// Committed snapshot): any superseding approval COMMITTED BEFORE THE GUARDED
+// STATEMENT BEGAN prevents creation and leaves no campaign row; an approval that
+// commits AFTER the statement began is LATER than the campaign, not a
+// supersession of it. This is NOT whole-request serializability, and it does NOT
+// claim that no approval can land between predicate evaluation and the row
+// write — the point is narrower and true: guard evaluation and the row commit
+// are ONE statement under ONE snapshot, so the seconds-wide check-to-persist
+// window (a forge round-trip) is collapsed to the duration of that one
+// statement.
+var ErrGroomingOrderSuperseded = errors.New("campaign: grooming order superseded before the campaign was created")
+
+// GroomingCurrencyGuard carries the source grooming run's identity so
+// CreateCampaign can decide the campaign's currency INSIDE the campaign row's
+// own INSERT rather than in a check-then-act window ahead of it (E54.17 /
+// #2817). When CreateCampaignParams.GroomingGuard is non-nil the guarded INSERT
+// creates the row only WHERE NOT EXISTS a strictly-newer approved grooming run
+// of the same (Repo, WorkflowID, AccountID, InstallationID); a zero-row result
+// maps to ErrGroomingOrderSuperseded.
+//
+// THIS PREDICATE MIRRORS THE SERVER'S newerApprovedGroomingRun EXACTLY and the
+// two must change together: the same strict (created_at, id) total order as
+// groomingRunPrecedes (so the source run never supersedes itself), and the same
+// exact-match tenancy as sameGroomingTenant — an empty AccountID matches only
+// another unset account and a nil InstallationID matches only another nil
+// installation (SQL `IS NOT DISTINCT FROM`), NOT every row. A drift between the
+// two definitions would let the handler's pre-scan and the atomic guard disagree
+// about what "superseded" means.
+type GroomingCurrencyGuard struct {
+	// SourceRunID is the grooming run whose ratified order this campaign is
+	// built from. It is excluded from the superseding set (a run never
+	// supersedes itself) and anchors the strict (created_at, id) comparison.
+	SourceRunID uuid.UUID
+	// Repo / WorkflowID scope the superseding set: only a run of the SAME
+	// grooming workflow on the SAME repo can supersede this order.
+	Repo       string
+	WorkflowID string
+	// AccountID is the source run's tenant account ("" for an untenanted run).
+	// Matched EXACTLY: "" matches only another untenanted run, never every row.
+	AccountID string
+	// SourceInstallationID is the source run's forge installation (nil for none),
+	// a mirror of the run row's nullable installation_id column (ADR-057 owns the
+	// column's type; this follows it). Matched EXACTLY the same way, via SQL
+	// `IS NOT DISTINCT FROM`.
+	SourceInstallationID *int64
+	// SourceCreatedAt anchors the strict (created_at, id) newer-than comparison.
+	SourceCreatedAt time.Time
+}
 
 // CreateCampaignParams are the inputs needed to insert a new campaign.
 //
@@ -63,6 +119,13 @@ type CreateCampaignParams struct {
 	// and its provenance are created atomically. Nil persists as NULL — not
 	// grooming-sourced. The campaign package never interprets these bytes.
 	GroomingSource []byte
+	// GroomingGuard is the OPTIONAL grooming-currency guard (E54.17 / #2817).
+	// Nil (the unchanged default for every epic_ref / explicit-items /
+	// allow_superseded campaign) takes the byte-identical unguarded CreateCampaign
+	// path. Non-nil routes to the guarded INSERT, which creates the row only when
+	// no strictly-newer approved grooming run has superseded the source order;
+	// a refusal returns ErrGroomingOrderSuperseded and writes NOTHING.
+	GroomingGuard *GroomingCurrencyGuard
 }
 
 // CreateCampaignItemParams are the inputs needed to insert a new campaign

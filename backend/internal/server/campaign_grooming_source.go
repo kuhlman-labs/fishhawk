@@ -178,9 +178,18 @@ const (
 // definitions would let one act on an order the other refuses. Tightening both
 // to a real gate-satisfaction count (they coincide only under `count: 1`) is a
 // follow-up that must move them together.
-func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFullName string, gs *groomingSourceRequest) (*campaign.GroomingOrder, *campaignGroomingSourcePayload, error) {
+// It ALSO returns a *campaign.GroomingCurrencyGuard (E54.17 / #2817): the source
+// run's identity, threaded onto the campaign row's OWN guarded INSERT so the
+// currency decision is atomic with the row write rather than left in the
+// seconds-wide check-to-persist window between this scan and campaign.Persist.
+// The guard is NIL when gs.AllowSuperseded is true — that flag is the operator's
+// deliberate acknowledgement that the order may be stale, so re-imposing the
+// check at insert time would refuse the case they explicitly asked for (and, by
+// extension, any OTHER newer run that becomes approved during the request; the
+// widened acknowledgement is documented on the campaign README).
+func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFullName string, gs *groomingSourceRequest) (*campaign.GroomingOrder, *campaignGroomingSourcePayload, *campaign.GroomingCurrencyGuard, error) {
 	if s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil || s.cfg.ApprovalRepo == nil {
-		return nil, nil, &groomingSourceError{
+		return nil, nil, nil, &groomingSourceError{
 			Status: http.StatusServiceUnavailable, Code: "grooming_source_unconfigured",
 			Message: "campaign creation from a grooming order requires configured run, artifact and approval repositories",
 		}
@@ -188,7 +197,7 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 
 	runID, err := uuid.Parse(gs.RunID)
 	if err != nil {
-		return nil, nil, &groomingSourceError{
+		return nil, nil, nil, &groomingSourceError{
 			Status: http.StatusBadRequest, Code: "validation_failed",
 			Message: "grooming_source.run_id must be a UUID",
 			Details: map[string]any{"field": "grooming_source.run_id", "got": gs.RunID},
@@ -202,7 +211,7 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 	}
 	sourceRun, err := s.cfg.RunRepo.GetRun(ctx, runID)
 	if errors.Is(err, run.ErrNotFound) {
-		return nil, nil, notFound
+		return nil, nil, nil, notFound
 	}
 	if err != nil {
 		// THE CAUSE RIDES internalCauseKey, NEVER A PLAIN DETAIL KEY (E67.15 /
@@ -211,7 +220,7 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 		// reading; writeError strips this channel from the body at ANY status
 		// and folds it into the ONE operator log record keyed by error_ref. The
 		// client keeps the static message and the product-owned run_id.
-		return nil, nil, &groomingSourceError{
+		return nil, nil, nil, &groomingSourceError{
 			Status: http.StatusInternalServerError, Code: "internal_error",
 			Message: "could not read the grooming run",
 			Details: map[string]any{"run_id": runID.String(), internalCauseKey: err.Error()},
@@ -230,10 +239,10 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 	// consume its approved order. An untenanted run is reachable only by an
 	// untenanted caller (both sides empty).
 	if sourceRun.AccountID != IdentityFrom(ctx).AccountID {
-		return nil, nil, notFound
+		return nil, nil, nil, notFound
 	}
 	if sourceRun.Repo != repoFullName {
-		return nil, nil, &groomingSourceError{
+		return nil, nil, nil, &groomingSourceError{
 			Status: http.StatusUnprocessableEntity, Code: codeGroomingRepoMismatch,
 			Message: fmt.Sprintf("the grooming run groomed %s, not %s", sourceRun.Repo, repoFullName),
 			Details: map[string]any{"run_id": runID.String(), "grooming_repo": sourceRun.Repo, "campaign_repo": repoFullName},
@@ -242,21 +251,21 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 
 	found, err := s.approvedGroomingReport(ctx, runID)
 	if err != nil {
-		return nil, nil, &groomingSourceError{
+		return nil, nil, nil, &groomingSourceError{
 			Status: http.StatusBadGateway, Code: codeGroomingSupersessionUnreadable,
 			Message: "could not read the grooming run's stages, artifacts or approvals",
 			Details: map[string]any{"run_id": runID.String(), internalCauseKey: err.Error()},
 		}
 	}
 	if found == nil {
-		return nil, nil, &groomingSourceError{
+		return nil, nil, nil, &groomingSourceError{
 			Status: http.StatusUnprocessableEntity, Code: codeGroomingOrderAbsent,
 			Message: "the grooming run shipped no grooming_report artifact",
 			Details: map[string]any{"run_id": runID.String()},
 		}
 	}
 	if !found.approved {
-		return nil, nil, &groomingSourceError{
+		return nil, nil, nil, &groomingSourceError{
 			Status: http.StatusUnprocessableEntity, Code: codeGroomingNotApproved,
 			Message: "the grooming run's report was not ratified: its plan stage carries no granted approval, or carries a rejection",
 			Details: map[string]any{
@@ -267,7 +276,7 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 	}
 	report, perr := plan.ParseGroomingReport(found.content)
 	if perr != nil {
-		return nil, nil, &groomingSourceError{
+		return nil, nil, nil, &groomingSourceError{
 			Status: http.StatusUnprocessableEntity, Code: codeGroomingOrderInvalid,
 			Message: "the grooming run's report artifact does not parse as a grooming_report",
 			Details: map[string]any{"run_id": runID.String(), "error": perr.Error()},
@@ -276,7 +285,7 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 
 	superseded, undetermined, serr := s.newerApprovedGroomingRun(ctx, sourceRun)
 	if serr != nil {
-		return nil, nil, serr
+		return nil, nil, nil, serr
 	}
 	// AN UNDETERMINED SCAN IS AN UNCONDITIONAL REFUSAL — allow_superseded does
 	// NOT reach it. The flag acknowledges a POSITIVELY IDENTIFIED superseding
@@ -285,14 +294,14 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 	// acknowledgement of it would turn a caller-controlled request field into a
 	// bypass of an authorization-shaped check (K2).
 	if undetermined {
-		return nil, nil, &groomingSourceError{
+		return nil, nil, nil, &groomingSourceError{
 			Status: http.StatusUnprocessableEntity, Code: codeGroomingSupersessionUndetermined,
 			Message: "the supersession scan could not establish that no newer approved grooming run exists; narrow the workflow's run history so the scan can reach the end of it",
 			Details: map[string]any{"source_run_id": runID.String(), "scanned_pages": groomingSupersessionMaxPages},
 		}
 	}
 	if superseded != nil && !gs.AllowSuperseded {
-		return nil, nil, &groomingSourceError{
+		return nil, nil, nil, &groomingSourceError{
 			Status: http.StatusUnprocessableEntity, Code: codeGroomingSuperseded,
 			Message: "a newer approved grooming run has superseded this order; groom from the newer run, or pass allow_superseded to build from this one deliberately",
 			Details: map[string]any{"source_run_id": runID.String(), "superseded_by": superseded.String()},
@@ -306,7 +315,7 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 		if errors.As(oerr, &goe) && goe.Code == campaign.GroomingOrderErrEmpty {
 			code = codeGroomingOrderEmpty
 		}
-		return nil, nil, &groomingSourceError{
+		return nil, nil, nil, &groomingSourceError{
 			Status: http.StatusUnprocessableEntity, Code: code,
 			Message: oerr.Error(), Details: map[string]any{"run_id": runID.String()},
 		}
@@ -315,10 +324,60 @@ func (s *Server) resolveGroomingOrder(ctx context.Context, owner, name, repoFull
 	order.StageID = found.stageID
 	order.ArtifactID = found.artifactID
 	order.ContentHash = found.contentHash
+	// Build the grooming-currency guard from the SOURCE run (E54.17 / #2817). It
+	// rides the campaign's own INSERT so the currency decision is atomic with the
+	// row write. AllowSuperseded threads a NIL guard: the operator acknowledged a
+	// possibly-stale order, and re-imposing the check would refuse exactly that.
+	var guard *campaign.GroomingCurrencyGuard
 	if gs.AllowSuperseded {
 		order.SupersededBy = superseded
+	} else {
+		guard = &campaign.GroomingCurrencyGuard{
+			SourceRunID:          sourceRun.ID,
+			Repo:                 sourceRun.Repo,
+			WorkflowID:           sourceRun.WorkflowID,
+			AccountID:            sourceRun.AccountID,
+			SourceInstallationID: sourceRun.InstallationID,
+			SourceCreatedAt:      sourceRun.CreatedAt,
+		}
 	}
-	return order, groomingSourcePayload(order), nil
+	return order, groomingSourcePayload(order), guard, nil
+}
+
+// groomingSupersededRefusal builds the 422 grooming_order_superseded refusal for
+// a campaign the guarded INSERT declined (E54.17 / #2817): a strictly-newer
+// approved grooming run had superseded the order by the time the atomic INSERT
+// ran, so no campaign row exists. It enriches the details with superseded_by from
+// a BEST-EFFORT re-run of newerApprovedGroomingRun.
+//
+// THAT READ IS A LABEL, NOT THE DECISION. The atomic INSERT already decided and
+// wrote nothing; this diagnostic only names WHICH newer run for the operator. So
+// an unreadable or undetermined diagnostic OMITS the superseded_by key and keeps
+// the 422 — it never upgrades the refusal to a 502, because the currency decision
+// did not depend on this read.
+func (s *Server) groomingSupersededRefusal(ctx context.Context, guard *campaign.GroomingCurrencyGuard) *groomingSourceError {
+	// Reconstruct the source run from the guard: newerApprovedGroomingRun reads
+	// only ID / Repo / WorkflowID / AccountID (via the scan filter) and
+	// CreatedAt / ID / AccountID / InstallationID (via groomingRunPrecedes +
+	// sameGroomingTenant), all of which the guard carries — so the handler need
+	// not retain the original *run.Run.
+	sourceRun := &run.Run{
+		ID:             guard.SourceRunID,
+		Repo:           guard.Repo,
+		WorkflowID:     guard.WorkflowID,
+		AccountID:      guard.AccountID,
+		InstallationID: guard.SourceInstallationID,
+		CreatedAt:      guard.SourceCreatedAt,
+	}
+	details := map[string]any{"source_run_id": guard.SourceRunID.String()}
+	if superseded, undetermined, serr := s.newerApprovedGroomingRun(ctx, sourceRun); serr == nil && !undetermined && superseded != nil {
+		details["superseded_by"] = superseded.String()
+	}
+	return &groomingSourceError{
+		Status: http.StatusUnprocessableEntity, Code: codeGroomingSuperseded,
+		Message: "a newer approved grooming run superseded this order before the campaign was created; groom from the newer run, or pass allow_superseded to build from this one deliberately",
+		Details: details,
+	}
 }
 
 // groomingSourcePayload projects a resolved order into the durable provenance

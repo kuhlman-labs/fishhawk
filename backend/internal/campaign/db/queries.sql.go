@@ -7,6 +7,7 @@ package campaigndb
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -45,6 +46,94 @@ func (q *Queries) CreateCampaign(ctx context.Context, arg CreateCampaignParams) 
 		arg.IdempotencyKey,
 		arg.WorkingDir,
 		arg.GroomingSource,
+	)
+	var i Campaign
+	err := row.Scan(
+		&i.ID,
+		&i.Repo,
+		&i.EpicRef,
+		&i.State,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.PausePolicy,
+		&i.OperatorAgent,
+		&i.IdempotencyKey,
+		&i.WorkingDir,
+		&i.GroomingSource,
+	)
+	return i, err
+}
+
+const createCampaignGuardedByGroomingCurrency = `-- name: CreateCampaignGuardedByGroomingCurrency :one
+
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source)
+SELECT
+    $1, $2, $3, $4, $5,
+    $6, $7, $8, $9
+WHERE NOT EXISTS (
+    SELECT 1
+      FROM runs newer
+      JOIN stages st ON st.run_id = newer.id AND st.stage_type = 'plan'
+      JOIN artifacts a ON a.stage_id = st.id AND a.kind = 'grooming_report'
+     WHERE newer.id <> $10
+       AND newer.repo = $11
+       AND newer.workflow_id = $12
+       AND newer.account_id IS NOT DISTINCT FROM $13::uuid
+       AND newer.installation_id IS NOT DISTINCT FROM $14::bigint
+       AND (newer.created_at, newer.id) > ($15::timestamptz, $10::uuid)
+       AND EXISTS (SELECT 1 FROM approvals ap WHERE ap.stage_id = st.id AND ap.decision = 'approve')
+       AND NOT EXISTS (SELECT 1 FROM approvals ap WHERE ap.stage_id = st.id AND ap.decision = 'reject')
+)
+RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source
+`
+
+type CreateCampaignGuardedByGroomingCurrencyParams struct {
+	ID                   uuid.UUID  `json:"id"`
+	Repo                 string     `json:"repo"`
+	EpicRef              string     `json:"epic_ref"`
+	State                string     `json:"state"`
+	PausePolicy          string     `json:"pause_policy"`
+	OperatorAgent        []byte     `json:"operator_agent"`
+	IdempotencyKey       *string    `json:"idempotency_key"`
+	WorkingDir           string     `json:"working_dir"`
+	GroomingSource       []byte     `json:"grooming_source"`
+	SourceRunID          uuid.UUID  `json:"source_run_id"`
+	SourceRepo           string     `json:"source_repo"`
+	SourceWorkflowID     string     `json:"source_workflow_id"`
+	SourceAccountID      *uuid.UUID `json:"source_account_id"`
+	SourceInstallationID *int64     `json:"source_installation_id"`
+	SourceCreatedAt      time.Time  `json:"source_created_at"`
+}
+
+// HAND-MAINTAINED BINDING (E54.17 / #2817). This method is NOT emitted by the
+// last `sqlc generate` in this file (that run predates the guarded query); it is
+// hand-written alongside the CreateCampaignGuardedByGroomingCurrency query in
+// queries.sql and must match it byte-for-byte. `sqlc generate` regenerates every
+// package and drags out-of-scope churn into a scoped diff, which is why the
+// binding is maintained by hand — a FUTURE `sqlc generate` must PRESERVE this
+// method (re-emit it identically) rather than drop it. It is proven correct by
+// execution against a real database in the campaign postgres tests: a binding
+// that does not match the query fails there, not silently. RETURNING is the exact
+// column list CreateCampaign uses, so the scan below and rowToCampaign are
+// byte-identical to the unguarded path; a zero-row result surfaces as
+// pgx.ErrNoRows, which the adapter maps to campaign.ErrGroomingOrderSuperseded.
+func (q *Queries) CreateCampaignGuardedByGroomingCurrency(ctx context.Context, arg CreateCampaignGuardedByGroomingCurrencyParams) (Campaign, error) {
+	row := q.db.QueryRow(ctx, createCampaignGuardedByGroomingCurrency,
+		arg.ID,
+		arg.Repo,
+		arg.EpicRef,
+		arg.State,
+		arg.PausePolicy,
+		arg.OperatorAgent,
+		arg.IdempotencyKey,
+		arg.WorkingDir,
+		arg.GroomingSource,
+		arg.SourceRunID,
+		arg.SourceRepo,
+		arg.SourceWorkflowID,
+		arg.SourceAccountID,
+		arg.SourceInstallationID,
+		arg.SourceCreatedAt,
 	)
 	var i Campaign
 	err := row.Scan(
