@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# check-site-ia: fail the build when the Starlight sidebar in site/astro.config.mjs
+# and the content pages under site/src/content/docs/ disagree, in EITHER direction:
+# a sidebar slug that resolves to no page (a dangling entry), or a content page that
+# no sidebar entry references (an orphan the reader cannot reach).
+#
+# Astro's own build catches a dangling slug, but that build runs ONLY in the
+# operator-installed Pages workflow (site/README.md) — never in `scripts/test
+# verify`. This gate is the in-loop substitute, so a misfiled or unreferenced page
+# fails in-loop rather than only at deploy time. It is generic (sidebar <-> pages,
+# both directions), not fitted to any one page.
+#
+# Usage: scripts/check-site-ia [CONTENT_ROOT [ASTRO_CONFIG]]
+#   CONTENT_ROOT   defaults to <repo>/site/src/content/docs
+#   ASTRO_CONFIG   defaults to <repo>/site/astro.config.mjs
+#   scripts/test-site-ia injects fixture paths so the harness never depends on
+#   committed content.
+#
+# SLUG RESOLUTION mirrors Starlight's: a page at <root>/a/b.md(x) has slug 'a/b';
+# a group-landing page <root>/g/index.md(x) has slug 'g'; the site-root
+# <root>/index.md(x) has slug 'index' and is EXEMPT from the reverse (must-be-in-
+# sidebar) direction, since the homepage is not itself a sidebar entry.
+#
+# PARSER LIMITATION — READ BEFORE RELYING ON THIS GATE. The sidebar is parsed by
+# TEXT-MATCHING literal `{ slug: '...' }` entries (single- or double-quoted) out of
+# astro.config.mjs. It does NOT parse JavaScript. Consequently:
+#   * a COMMENTED-OUT slug line (`// { slug: '...' }`) is still matched as if it
+#     were live — it is NOT understood as a comment (harness case c10 pins this);
+#   * a slug behind a VARIABLE or a SPREAD (`...group.items`, `{ slug: NAME }`) is
+#     NOT seen at all;
+#   * an AUTOGENERATE-style sidebar entry (`{ autogenerate: { directory: '...' } }`)
+#     is NOT understood.
+# A future config refactor to any of those forms HOLLOWS THIS GATE OUT silently —
+# the current explicit-literal sidebar in astro.config.mjs is what makes it work.
+# The same limitation is recorded in scripts/README.md's contract for this gate.
+#
+# EXIT CODES: 0 = consistent (or a documented fail-open), 1 = violations found,
+# 2 = a FAILED page enumeration (distinct from 1 — a failed walk means we do not
+# KNOW what is there, so reporting a clean tree would silently bypass the gate).
+#
+# FAIL-OPEN (exit 0, printed reason), mirroring scripts/check-site-voice: a missing
+# content root, a missing astro config, or a content root with no pages. This gate
+# runs in `scripts/test verify` unconditionally and must never red-line a checkout
+# that has no site/ yet.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CONTENT_ROOT="${1:-$ROOT/site/src/content/docs}"
+ASTRO_CONFIG="${2:-$ROOT/site/astro.config.mjs}"
+
+if [ ! -d "$CONTENT_ROOT" ]; then
+  echo "check-site-ia: content root $CONTENT_ROOT does not exist — nothing to check"
+  exit 0
+fi
+if [ ! -f "$ASTRO_CONFIG" ]; then
+  echo "check-site-ia: astro config $ASTRO_CONFIG does not exist — nothing to check"
+  exit 0
+fi
+
+# Enumeration runs into a FILE whose exit status IS checked, not a process
+# substitution whose status the surrounding loop cannot see — the same fail-CLOSED
+# posture scripts/check-site-voice documents. A failed walk exits 2.
+listing="$(mktemp "${TMPDIR:-/tmp}/check-site-ia.XXXXXX")" || {
+  echo "check-site-ia: could not create a temp file for the page listing" >&2
+  exit 2
+}
+trap 'rm -f "$listing"' EXIT
+
+if ! find "$CONTENT_ROOT" -type f \( -name '*.md' -o -name '*.mdx' \) | LC_ALL=C sort > "$listing"; then
+  echo "check-site-ia: enumerating pages under $CONTENT_ROOT FAILED — refusing to report a clean tree" >&2
+  exit 2
+fi
+
+# --- content slugs -------------------------------------------------------------
+# Accumulated newline-delimited (macOS bash is 3.2 — no associative arrays).
+content_slugs=""
+page_count=0
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  page_count=$((page_count + 1))
+  rel="${f#"$CONTENT_ROOT"/}"
+  case "$rel" in
+    *.mdx) rel="${rel%.mdx}" ;;
+    *.md) rel="${rel%.md}" ;;
+  esac
+  case "$rel" in
+    index) slug="index" ;;
+    */index) slug="${rel%/index}" ;;
+    *) slug="$rel" ;;
+  esac
+  content_slugs="$content_slugs$slug
+"
+done < "$listing"
+
+if [ "$page_count" -eq 0 ]; then
+  echo "check-site-ia: no .md/.mdx pages under $CONTENT_ROOT — nothing to check"
+  exit 0
+fi
+
+# --- sidebar slugs (TEXT-MATCH; see PARSER LIMITATION above) --------------------
+sidebar_slugs="$(grep -oE "slug:[[:space:]]*['\"][^'\"]*['\"]" "$ASTRO_CONFIG" \
+  | sed -E "s/slug:[[:space:]]*['\"]//; s/['\"]\$//")"
+
+violations=0
+
+# --- forward: every sidebar slug must resolve to a content page -----------------
+while IFS= read -r s; do
+  [ -n "$s" ] || continue
+  if ! printf '%s' "$content_slugs" | grep -Fxq -- "$s"; then
+    echo "check-site-ia: sidebar slug '$s' resolves to no content page under $CONTENT_ROOT"
+    violations=$((violations + 1))
+  fi
+done <<< "$sidebar_slugs"
+
+# --- reverse: every content page must appear in the sidebar ---------------------
+# slug 'index' (the site root) is exempt — the homepage is not a sidebar entry.
+# Deleting THIS block makes an orphaned page invisible; test-site-ia case c3 pins it.
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  rel="${f#"$CONTENT_ROOT"/}"
+  case "$rel" in
+    *.mdx) rel="${rel%.mdx}" ;;
+    *.md) rel="${rel%.md}" ;;
+  esac
+  case "$rel" in
+    index) continue ;;
+    */index) slug="${rel%/index}" ;;
+    *) slug="$rel" ;;
+  esac
+  if ! printf '%s\n' "$sidebar_slugs" | grep -Fxq -- "$slug"; then
+    echo "check-site-ia: content page $f (slug '$slug') is not referenced by the sidebar"
+    violations=$((violations + 1))
+  fi
+done < "$listing"
+
+if [ "$violations" -gt 0 ]; then
+  echo "check-site-ia: $violations IA violation(s) — sidebar ($ASTRO_CONFIG) and content pages disagree" >&2
+  exit 1
+fi
+
+echo "check-site-ia: $page_count page(s) consistent with the sidebar in $ASTRO_CONFIG"
+exit 0

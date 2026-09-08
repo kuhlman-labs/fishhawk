@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/check-site-ia. Drives the REAL script against temp-dir
+# fixture content roots + astro configs, one case per named behavior of the
+# control, each asserting that branch's observable OUTPUT rather than only the exit
+# code. House style follows scripts/test-site-voice: PASS/FAIL counters, non-zero
+# exit on any FAIL, no network, no Docker. Run by `scripts/test verify` via
+# _verify_gate_harnesses, and standalone.
+#
+# ---------------------------------------------------------------------------
+# COUNTERFACTUALS — run EMPIRICALLY (operator binding condition 7), restoring
+# byte-identically between each. Observed REDs, not reasoned:
+#
+#   (i) Deleted `{ slug: 'operating/tracing' }` from site/astro.config.mjs, ran
+#       scripts/check-site-ia against the REAL tree:
+#         exit 1 — "content page .../operating/tracing.md (slug 'operating/tracing')
+#         is not referenced by the sidebar". Restored → exit 0.
+#
+#  (ii) Renamed site/src/content/docs/operating/tracing.md aside, ran
+#       scripts/check-site-ia against the REAL tree:
+#         exit 1 — "sidebar slug 'operating/tracing' resolves to no content page".
+#         Restored → exit 0.
+#
+# (iii) Deleted check-site-ia's REVERSE-direction loop (the `# --- reverse:` block),
+#       ran scripts/test-site-ia:
+#         case c3 went RED — "c3: orphaned page exited 0 (expected 1)"; and c4 also
+#         RED (its orphan half no longer reported). Restored → all cases PASS.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CHECK="$REPO_ROOT/scripts/check-site-ia"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+tmproot=$(mktemp -d)
+trap 'rm -rf "$tmproot"' EXIT
+
+# Run the real control against a fixture (content root $1, astro config $2);
+# capture stdout+stderr and status.
+out=""
+status=0
+run_check() {
+  out="$("$CHECK" "$1" "$2" 2>&1)"
+  status=$?
+}
+
+# Write a minimal Starlight-style config carrying the given `{ slug: '...' }`
+# lines. $1 = config path, remaining args = raw lines to place in the items array.
+write_config() {
+  local cfg="$1"; shift
+  {
+    echo "export default {"
+    echo "  sidebar: ["
+    echo "    { label: 'Group', items: ["
+    local line
+    for line in "$@"; do
+      echo "      $line"
+    done
+    echo "    ] },"
+    echo "  ],"
+    echo "};"
+  } > "$cfg"
+}
+
+# A page with frontmatter at $1.
+write_page() {
+  mkdir -p "$(dirname "$1")"
+  cat > "$1" <<EOF
+---
+title: Page
+---
+Body.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# c1 — a consistent fixture exits 0. Root index.md is present and exempt from the
+# reverse direction; a group-landing concepts/index.md resolves to slug 'concepts'.
+# ---------------------------------------------------------------------------
+c1="$tmproot/c1"; c1cfg="$tmproot/c1.mjs"
+write_page "$c1/index.md"
+write_page "$c1/start/what.md"
+write_page "$c1/concepts/index.md"
+write_config "$c1cfg" "{ slug: 'start/what' }," "{ slug: 'concepts' },"
+run_check "$c1" "$c1cfg"
+if [ "$status" -ne 0 ]; then
+  fail "c1: consistent fixture exited $status (expected 0); output: $out"
+else
+  pass "c1: consistent sidebar/content exits 0"
+fi
+
+# ---------------------------------------------------------------------------
+# c2 — a sidebar slug with no matching page exits 1 naming that slug (forward
+# direction). Seeded BY CONSTRUCTION: the config carries a slug for which no page
+# is written, so a RED lands on this assertion and not on setup.
+# ---------------------------------------------------------------------------
+c2="$tmproot/c2"; c2cfg="$tmproot/c2.mjs"
+write_page "$c2/start/what.md"
+write_config "$c2cfg" "{ slug: 'start/what' }," "{ slug: 'operating/ghost' },"
+run_check "$c2" "$c2cfg"
+if [ "$status" -ne 1 ]; then
+  fail "c2: dangling sidebar slug exited $status (expected 1); output: $out"
+elif ! printf '%s\n' "$out" | grep -q "operating/ghost"; then
+  fail "c2: report does not name the dangling slug; output: $out"
+else
+  pass "c2: a dangling sidebar slug exits 1 naming the slug"
+fi
+
+# ---------------------------------------------------------------------------
+# c3 — a content page absent from the sidebar exits 1 naming that path (reverse
+# direction). This is the case the reverse-loop counterfactual (iii) reddens.
+# ---------------------------------------------------------------------------
+c3="$tmproot/c3"; c3cfg="$tmproot/c3.mjs"
+write_page "$c3/start/what.md"
+write_page "$c3/operating/orphan.md"
+write_config "$c3cfg" "{ slug: 'start/what' },"
+run_check "$c3" "$c3cfg"
+if [ "$status" -ne 1 ]; then
+  fail "c3: orphaned page exited $status (expected 1); output: $out"
+elif ! printf '%s\n' "$out" | grep -q "operating/orphan\.md"; then
+  fail "c3: report does not name the orphaned page path; output: $out"
+else
+  pass "c3: an orphaned content page exits 1 naming the path"
+fi
+
+# ---------------------------------------------------------------------------
+# c4 — BOTH a dangling slug AND an orphaned page present: BOTH reported before the
+# single non-zero exit (the no-first-hit-and-stop pin). Distinctly named so the
+# assertion cannot be satisfied by one alone.
+# ---------------------------------------------------------------------------
+c4="$tmproot/c4"; c4cfg="$tmproot/c4.mjs"
+write_page "$c4/start/what.md"
+write_page "$c4/operating/orphan.md"
+write_config "$c4cfg" "{ slug: 'start/what' }," "{ slug: 'operating/ghost' },"
+run_check "$c4" "$c4cfg"
+if [ "$status" -ne 1 ]; then
+  fail "c4: both-violations fixture exited $status (expected 1); output: $out"
+elif ! printf '%s\n' "$out" | grep -q "operating/ghost"; then
+  fail "c4: dangling slug not reported; output: $out"
+elif ! printf '%s\n' "$out" | grep -q "operating/orphan\.md"; then
+  fail "c4: orphaned page not reported — first-hit-and-stop; output: $out"
+else
+  pass "c4: both violations reported before a single exit"
+fi
+
+# ---------------------------------------------------------------------------
+# c5 — an .mdx page resolves like an .md one.
+# ---------------------------------------------------------------------------
+c5="$tmproot/c5"; c5cfg="$tmproot/c5.mjs"
+write_page "$c5/reference/api.mdx"
+write_config "$c5cfg" "{ slug: 'reference/api' },"
+run_check "$c5" "$c5cfg"
+if [ "$status" -ne 0 ]; then
+  fail "c5: .mdx page exited $status (expected 0); output: $out"
+else
+  pass "c5: an .mdx page resolves like an .md page"
+fi
+
+# ---------------------------------------------------------------------------
+# c6 — a group-landing slug resolving to <slug>/index.md is accepted.
+# ---------------------------------------------------------------------------
+c6="$tmproot/c6"; c6cfg="$tmproot/c6.mjs"
+write_page "$c6/concepts/index.md"
+write_config "$c6cfg" "{ slug: 'concepts' },"
+run_check "$c6" "$c6cfg"
+if [ "$status" -ne 0 ]; then
+  fail "c6: group-landing slug exited $status (expected 0); output: $out"
+else
+  pass "c6: a group-landing slug resolves to <slug>/index.md"
+fi
+
+# ---------------------------------------------------------------------------
+# c7 — a missing content root prints a reason and exits 0 (documented fail-open).
+# ---------------------------------------------------------------------------
+c7cfg="$tmproot/c7.mjs"
+write_config "$c7cfg" "{ slug: 'x' },"
+run_check "$tmproot/c7-does-not-exist" "$c7cfg"
+if [ "$status" -ne 0 ]; then
+  fail "c7: absent content root exited $status (expected 0); output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'does not exist'; then
+  fail "c7: absent content root printed no reason; output: $out"
+else
+  pass "c7: absent content root exits 0 with a printed reason"
+fi
+
+# ---------------------------------------------------------------------------
+# c8 — a missing astro config prints a reason and exits 0 (documented fail-open).
+# ---------------------------------------------------------------------------
+c8="$tmproot/c8"
+write_page "$c8/start/what.md"
+run_check "$c8" "$tmproot/c8-no-config.mjs"
+if [ "$status" -ne 0 ]; then
+  fail "c8: absent astro config exited $status (expected 0); output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'does not exist'; then
+  fail "c8: absent astro config printed no reason; output: $out"
+else
+  pass "c8: absent astro config exits 0 with a printed reason"
+fi
+
+# ---------------------------------------------------------------------------
+# c9 — a FAILED enumeration exits 2 (distinct from 1) and refuses to report a
+# clean tree. The failure is injected with a PATH-stubbed `find` (the seam
+# scripts/test-site-voice / scripts/test-container-lease use), not an unreadable
+# directory — a harness running as root would walk that fine and produce a silent
+# false PASS. The fixture holds a real, CONSISTENT page + config, so a checker
+# that ignored the enumeration status would exit 0 here.
+# ---------------------------------------------------------------------------
+c9="$tmproot/c9"; c9cfg="$tmproot/c9.mjs"
+write_page "$c9/start/what.md"
+write_config "$c9cfg" "{ slug: 'start/what' },"
+mkdir -p "$tmproot/c9-stub"
+cat > "$tmproot/c9-stub/find" <<'EOF'
+#!/usr/bin/env bash
+echo "find: stubbed traversal failure" >&2
+exit 1
+EOF
+chmod +x "$tmproot/c9-stub/find"
+c9out="$(PATH="$tmproot/c9-stub:$PATH" "$CHECK" "$c9" "$c9cfg" 2>&1)"
+c9status=$?
+if [ "$c9status" -eq 0 ]; then
+  fail "c9: enumeration failure exited 0 — the gate was silently bypassed; output: $c9out"
+elif [ "$c9status" -ne 2 ]; then
+  fail "c9: enumeration failure exited $c9status (expected 2, distinct from 1); output: $c9out"
+elif ! printf '%s\n' "$c9out" | grep -q 'FAILED'; then
+  fail "c9: enumeration failure printed no reason; output: $c9out"
+elif printf '%s\n' "$c9out" | grep -q 'consistent with the sidebar'; then
+  fail "c9: enumeration failure still reported a clean tree; output: $c9out"
+else
+  pass "c9: a failed page enumeration exits 2 with a reason, never a clean report"
+fi
+
+# ---------------------------------------------------------------------------
+# c10 — PARSER LIMITATION pin (operator binding condition 3). check-site-ia
+# TEXT-MATCHES `{ slug: '...' }` and does NOT parse JavaScript, so a COMMENTED-OUT
+# slug line is treated as a LIVE entry. The fixture comments out a slug whose page
+# does not exist; the documented behaviour is that it is STILL flagged dangling.
+# This pins the limitation rather than leaving it latent: if a future change taught
+# the parser to skip comments, this case would go RED and force the header + the
+# scripts/README.md contract to be updated in lockstep.
+# ---------------------------------------------------------------------------
+c10="$tmproot/c10"; c10cfg="$tmproot/c10.mjs"
+write_page "$c10/start/what.md"
+write_config "$c10cfg" "{ slug: 'start/what' }," "// { slug: 'operating/ghost' },"
+run_check "$c10" "$c10cfg"
+if [ "$status" -ne 1 ]; then
+  fail "c10: commented-out slug exited $status (expected 1 — comment treated as live); output: $out"
+elif ! printf '%s\n' "$out" | grep -q "operating/ghost"; then
+  fail "c10: commented-out slug not treated as a live entry; output: $out"
+else
+  pass "c10: a commented-out slug is text-matched as live (documented parser limitation)"
+fi
+
+# ---------------------------------------------------------------------------
+# c11 — the verify-wiring guard in scripts/test. `_verify_site_ia` skips with a
+# printed reason (return 0) when scripts/check-site-ia is missing or non-executable,
+# so a checkout predating the gate cannot red-line verify. Sourced lib-only
+# (FISHHAWK_TEST_LIB_ONLY=1) with ROOT repointed at a fixture, in a subshell so
+# scripts/test's `set -e` and traps stay contained — the seam c8 of
+# scripts/test-site-voice uses.
+# ---------------------------------------------------------------------------
+c11="$tmproot/c11"
+mkdir -p "$c11/scripts"
+c11out="$(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  set +e
+  ROOT="$c11"
+  _verify_site_ia 2>&1
+  printf 'STATUS=%s\n' "$?"
+)"
+if ! printf '%s\n' "$c11out" | grep -q 'STATUS=0'; then
+  fail "c11: _verify_site_ia did not return 0 with the gate absent; output: $c11out"
+elif ! printf '%s\n' "$c11out" | grep -q 'missing or not executable'; then
+  fail "c11: _verify_site_ia printed no skip reason; output: $c11out"
+else
+  pass "c11: verify skips the gate with a reason when check-site-ia is absent"
+fi
+
+echo
+echo "scripts/test-site-ia: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

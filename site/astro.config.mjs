@@ -60,6 +60,7 @@ export default defineConfig({
             { slug: 'operating/approvals' },
             { slug: 'operating/reviews' },
             { slug: 'operating/when-a-run-fails' },
+            { slug: 'operating/tracing' },
             { slug: 'operating/autonomy' },
           ],
         },

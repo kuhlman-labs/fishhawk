@@ -935,6 +935,9 @@ _verify_patch_coverage() {
 # test-site-voice (#2261) pins scripts/check-site-voice, the banned-vocabulary
 # gate over site/src/content/docs/; it is bash and adds well under a second
 # (ten temp-dir fixture cases, no network, no Docker), so it needs no zsh guard.
+# test-site-ia (E12.7 / #2318) pins scripts/check-site-ia, the sidebar<->pages IA
+# gate over site/; same shape (bash, temp-dir fixtures, no network/Docker, no zsh
+# guard), eleven cases including the parser-limitation pin and both fail-opens.
 # test-helm-render (E62.2 / #2301) is the render gate for deploy/helm/fishhawk:
 # it drives the real chart through `helm template`/`helm lint` and asserts on
 # shipped rendered output — the only machine check that the chart's YAML
@@ -953,7 +956,7 @@ _verify_patch_coverage() {
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-helm-render test-site-reference; do
+  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue
@@ -989,11 +992,30 @@ _verify_site_voice() {
   "$ROOT/scripts/check-site-voice"
 }
 
+# _verify_site_ia: run the sidebar<->pages IA gate over the COMMITTED site content.
+# _verify_gate_harnesses above proves the CONTROL still works against fixtures;
+# this proves the shipped sidebar and pages still agree, so a docs child that adds
+# a page without a sidebar entry (or a sidebar entry with no page) fails verify
+# in-loop rather than only in the operator-installed Pages build (E12.7 / #2318).
+# The script fail-OPENs with a printed reason on a tree with no site/ — mirroring
+# _verify_site_voice — so it can never red-line a checkout that predates the site.
+# A real violation exits 1 and, under set -e, fails verify. Long form:
+# scripts/README.md.
+_verify_site_ia() {
+  if [ ! -x "$ROOT/scripts/check-site-ia" ]; then
+    echo "scripts/test: scripts/check-site-ia missing or not executable — skipping the site IA gate" >&2
+    return 0
+  fi
+  printf '>>> scripts/check-site-ia\n'
+  "$ROOT/scripts/check-site-ia"
+}
+
 # verify: the runner's committed-tree implement gate. Lint FIRST so a fast
 # format/lint failure leads the captured output and aborts (set -e) before the
 # slow test loop. The doc line budget and schema-sync drift are checked NEXT
 # (each <1s) so a docs defect fails in-loop, still ahead of the slow test loop,
-# as are the gate harnesses and the site voice gate (#2261).
+# as are the gate harnesses, the site voice gate (#2261), and the site IA gate
+# (E12.7 / #2318).
 # The AGGREGATE coverage gate is still intentionally omitted to bound in-loop
 # runtime — it stays on `coverage` and in CI. What runs here instead is the
 # PATCH-scoped gate (#1887), folded into the same test loop via -coverpkg so no
@@ -1005,6 +1027,7 @@ cmd_verify() {
   _verify_schema_sync
   _verify_gate_harnesses
   _verify_site_voice
+  _verify_site_ia
   local base="" mods=""
   if [ -n "${FISHHAWK_SKIP_PATCH_COVERAGE:-}" ]; then
     echo "scripts/test: FISHHAWK_SKIP_PATCH_COVERAGE set — skipping the patch-coverage gate" >&2
