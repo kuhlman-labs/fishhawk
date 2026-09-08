@@ -243,6 +243,159 @@ against an unmigrated database, so its FAILURE path is the one worth knowing.
   and hides the migration error. Full derivation:
   [the chart README](../../deploy/helm/fishhawk/README.md).
 
+## When the build fails with `x509: certificate signed by unknown authority`
+
+This covers a host behind a TLS-inspecting corporate egress proxy, where
+`docker build -f backend/Dockerfile` (step 1 of `## Bring up`, above) fails
+before the image is even built. The certificate that fixes it is
+site-specific and is deliberately NOT vendored into this repo or into
+`backend/Dockerfile`.
+
+### Symptom
+
+The builder stage's dependency-download layer fails:
+
+```
+ > [builder 5/9] RUN cd backend && go mod download:
+------
+failed to solve: process "/bin/sh -c cd backend && go mod download" did not complete successfully: exit code: 1
+go: github.com/...: reading github.com/...: tls: failed to verify certificate: x509: certificate signed by unknown authority
+```
+
+This looks like a network or Go module-proxy outage, but it is not. Registry
+pulls are UNAFFECTED — the Docker daemon reads the HOST's trust store to pull
+base images, so `FROM golang:${GO_VERSION}-bookworm` and
+`FROM gcr.io/distroless/static-debian12:nonroot` succeed normally. Only
+in-container egress (the `RUN cd backend && go mod download` layer talking to
+the Go module proxy over TLS) breaks, because that TLS handshake is verified
+against the trust store baked into the `golang:${GO_VERSION}-bookworm`
+builder image, not the host's.
+
+### Diagnostic: compare the issuer inside vs. outside the container
+
+The decisive tell is the certificate issuer observed FROM INSIDE THE
+CONTAINER, not a host/container comparison in the abstract — the host-side
+check below is corroborating only. Compare:
+
+```sh
+# Outside the container (on the host):
+echo | openssl s_client -connect storage.googleapis.com:443 2>/dev/null | openssl x509 -noout -issuer
+```
+
+```sh
+# Inside the container — use the builder image, which already ships openssl
+# (verified: `docker run --rm golang:1.25-bookworm sh -c 'command -v openssl'`
+# prints `/usr/bin/openssl`). Do NOT reach for alpine + `apk add openssl` here:
+# the package download itself goes through the same untrusted egress path, so
+# its failure would be mistaken for evidence rather than recognized as the
+# same failure mode compounding.
+docker run --rm golang:1.25-bookworm sh -c \
+  "echo | openssl s_client -connect storage.googleapis.com:443 2>/dev/null | openssl x509 -noout -issuer"
+```
+
+Decision rule:
+
+- **Container shows a corporate/non-public CA, host shows the public
+  issuer:** interception that only the container's egress path sees — this is
+  the failure mode this section documents.
+- **Both host and container show the same corporate CA:** still interception.
+  The host succeeds anyway because it already trusts that CA through its own
+  system trust store — that's why the corroborating host-side check below
+  passes even though the host is *also* behind the proxy.
+- **Container shows the public issuer:** not this failure mode; look
+  elsewhere (a genuine module-proxy outage, DNS, etc.).
+
+What differs between host and container is TRUST, not the certificate
+presented — the proxy presents the same interception certificate to both; the
+host's OS trust store is configured to accept it (via IT-managed MDM/config)
+and the container's is not.
+
+Corroborating check: `cd backend && go mod download` run directly on the host
+(outside any container) succeeds, because it uses the host's trust store.
+
+### Build-side fix: inject the corporate CA via a BuildKit named context
+
+Add two lines to `backend/Dockerfile`'s `builder` stage, placed BEFORE the
+`RUN cd backend && go mod download` line — a copy placed after it does not
+help the layer that fails:
+
+```dockerfile
+COPY --from=cacontext corp-root-ca.crt /usr/local/share/ca-certificates/corp-root-ca.crt
+RUN update-ca-certificates
+```
+
+Feed the context at build time:
+
+```sh
+docker build --build-context cacontext=/path/to/ca-dir \
+  --build-arg GIT_SHA=<sha> \
+  -t ghcr.io/kuhlman-labs/fishhawkd:dev-local \
+  -f backend/Dockerfile .
+```
+
+Use a named context (`--build-context`), not a path inside the repo, because
+it keeps the certificate out of the REPOSITORY and out of the DEFAULT build
+context (`.`) — it is never committed and never accidentally picked up by an
+unrelated `COPY`. It is NOT invisible to the build, though: the `COPY
+--from=cacontext` line places it in a builder-stage image layer, and (per the
+runtime half below) the runtime `COPY` places the augmented CA bundle in the
+final image. **The resulting image therefore trusts the corporate CA and must
+not be pushed to a shared registry.**
+
+`--build-context` requires the BuildKit builder (the default in current
+Docker Desktop). Check availability with:
+
+```sh
+docker build --help | grep -- --build-context
+```
+
+### Runtime half — easy to miss
+
+The build-side fix above only fixes `go mod download` in the `builder` stage.
+The runtime stage is `gcr.io/distroless/static-debian12:nonroot`, which ships
+no shell and no package manager, so `update-ca-certificates` CANNOT run
+there. If fishhawkd itself makes outbound TLS calls (GitHub, Anthropic)
+through the same intercepting proxy at runtime, carry the builder's augmented
+bundle forward into the runtime stage:
+
+```dockerfile
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+```
+
+This OVERWRITES the bundle distroless already ships at that path — it is a
+replacement, not an addition, but the replacement carries the upstream public
+roots forward along with the interception CA (`update-ca-certificates` merges
+rather than replaces), so the runtime image still trusts everything it did
+before, plus the corporate CA. The failure this prevents shows up at a
+completely different surface than the build-side one — a runtime outbound-call
+TLS failure long after a green build — which is why fixing only the build
+half leaves half the problem live.
+
+### Residual: `scripts/dev k8s` cannot carry the certificate
+
+`scripts/dev k8s` builds the image with exactly (`scripts/dev:2263`; `_k8s_image_ref`
+resolves to `ghcr.io/kuhlman-labs/fishhawkd:dev-local`, per `## Bring up`
+step 1 above):
+
+```sh
+docker build --build-arg GIT_SHA="$(_dev_git_sha)" -t "$(_k8s_image_ref)" -f backend/Dockerfile .
+```
+
+It passes no `--build-context` and exposes no hook for extra build
+arguments, so the one-command `## Bring up` path CANNOT carry the
+certificate through on a host behind a TLS-inspecting proxy. On such a host:
+
+1. Run the `docker build --build-context cacontext=...` command above by
+   hand (with the local, uncommitted Dockerfile edit from the build-side fix
+   section), or make the equivalent local, uncommitted edit to `scripts/dev`.
+2. Then run the `helm upgrade --install` command from `## Bring up` step 2
+   directly.
+
+Both the Dockerfile CA-injection lines and the certificate file are a LOCAL,
+UNCOMMITTED edit — the certificate is site-specific and must not be vendored.
+An optional empty-by-default named context wired into the committed
+Dockerfile is a possible follow-up if this recurs, not part of this change.
+
 ## Chart render gate
 
 `scripts/test-helm-render` drives the chart through `helm template` / `helm lint`
