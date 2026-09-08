@@ -4328,6 +4328,83 @@ func writeReviewRepoAccess(b *strings.Builder, t Trigger) {
 	b.WriteString("\n")
 }
 
+// writeGroundedCalibrationCriteria writes standing criteria 9 and 10 of the
+// implement-review prompt (#2119): the baseline check that must precede a
+// severity assignment on a PATTERN-based finding, and the requirement that a
+// MECHANICAL prediction be traced to the definitions that govern it.
+//
+// Both criteria branch on the review's grounding posture via
+// Trigger.ReviewTreeCommit — the same signal writeReviewToolClause and
+// writeReviewRepoAccess key on. GROUNDED (non-empty): resolve the baseline /
+// the prediction against the exported tree and cite it. UNGROUNDED (empty, the
+// DEFAULT posture — ADR-078's operator correction ships grounding dormant with
+// FISHHAWKD_REVIEW_GROUNDING defaulting false): say plainly that the baseline
+// is unestablished / the prediction untraced and calibrate the severity down,
+// rather than asserting a regression the reviewer structurally cannot check.
+// An unconditional "go read the sibling file" instruction would be
+// unsatisfiable on the diff-only path, which is the failure mode ADR-078
+// records against the pre-#2486 prompt.
+//
+// The closing carve-out sentence renders in BOTH postures and is what keeps
+// these rules from suppressing adversarial reasoning — a threat model, a
+// privilege-escalation path, a fail-open, a cross-tenant leak — which is a
+// claim about what COULD happen and is not citable to a line. #2119's
+// "Explicitly NOT the ask" section names that class as the one a broadly
+// written grounding rule would wrongly withhold, so the sentence carries its
+// own test pin (TestImplementReview_CalibrationCriteria_AdversarialCarveOut).
+func writeGroundedCalibrationCriteria(b *strings.Builder, t Trigger) {
+	b.WriteString("9. **Baseline check before severity (standing rule)**: Before assigning a severity to a " +
+		"PATTERN-based finding — an unbounded read or decode, a missing cap or limit, an absent guard or check — " +
+		"first establish whether sibling or surrounding code already exhibits the same pattern. If it does, say so " +
+		"explicitly and calibrate the severity DOWN: report it as pre-existing convention this diff MATCHES, not " +
+		"as a regression this diff INTRODUCED. ")
+	if t.ReviewTreeCommit != "" {
+		b.WriteString("Resolve the baseline against the exported tree and CITE the file (and the line, where the " +
+			"tree makes one available) — an unresolved question about a sibling's behavior is a search you must " +
+			"actually run, not a hedge.\n")
+	} else {
+		b.WriteString("No repository tree is available for this review, so state plainly in the concern note that " +
+			"the baseline is UNESTABLISHED and calibrate the severity DOWN accordingly — do NOT assert that this " +
+			"diff INTRODUCED a pattern whose surroundings you could not check.\n")
+	}
+	b.WriteString("10. **Trace mechanical predictions (standing rule)**: Any claim about what a specific code " +
+		"path, test, or handler WILL DO — a status code returned, an error surfaced, a branch taken — must be " +
+		"traced to the actual definitions that govern it: the fake, the override, the wiring, the fixture. NEVER " +
+		"infer that behavior from a type or function name; a test fake routinely overrides the base behavior its " +
+		"name implies. ")
+	if t.ReviewTreeCommit != "" {
+		b.WriteString("Resolve the prediction against the exported tree and CITE the definition you read.\n")
+	} else {
+		b.WriteString("No repository tree is available for this review, so where the governing definition is not " +
+			"itself in the diff, say the prediction is UNTRACED and calibrate the severity DOWN — do NOT assert " +
+			"what a fake or a fixture does when you cannot read it.\n")
+	}
+	b.WriteString("These two standing rules apply to PATTERN-based and MECHANICAL-PREDICTION findings ONLY. They " +
+		"are NOT a requirement to cite a line for every claim. Adversarial reasoning about implications — a threat " +
+		"model, a privilege-escalation path, a fail-open, a cross-tenant leak — is a claim about what COULD happen " +
+		"and is not citable to a line: do NOT withhold such a finding for want of a citation, and do NOT downgrade " +
+		"its severity on that ground.\n\n")
+}
+
+// writeSeverityCalibration writes the "### Severity calibration" subsection of
+// the implement-review prompt (#2119) — the rubric that was previously absent
+// entirely, leaving each reviewer to invent its own severity scale and leaving
+// the operator to arbitrate the resulting disagreements. It renders
+// unconditionally on both gate-evidence branches and takes no Trigger: the
+// rubric is posture-independent.
+func writeSeverityCalibration(b *strings.Builder) {
+	b.WriteString("### Severity calibration\n\n")
+	b.WriteString("Assign every concern's `severity` from this rubric, and state in the note WHICH tier you " +
+		"applied and why — the operator reconciling two reviewers' verdicts must be able to read the basis of a " +
+		"disagreement rather than re-derive it:\n\n")
+	b.WriteString("- `high`: the defect is REACHABLE in a supported configuration.\n")
+	b.WriteString("- `medium`: reaching it requires a misconfiguration or an unusual wiring.\n")
+	b.WriteString("- `low`: defense-in-depth hardening, documentation accuracy, or test hardening, with no " +
+		"reachable defect behind it.\n\n")
+	b.WriteString("A standing-rule-9 baseline finding — a pattern already present in sibling or surrounding code, " +
+		"which this diff merely matches — is a `low`, not a `high`.\n\n")
+}
+
 // reviewTreeShortCommit renders a commit SHA for the REPOSITORY ACCESS section,
 // truncated to 12 hex characters when longer so the prompt names a readable
 // short SHA while a caller that already passed a short value is left as-is.
@@ -4935,7 +5012,7 @@ func buildImplementReview(t Trigger) string {
 			"certified that this diff compiles or passes its tests, so this lens is in scope. Record each defect " +
 			"found as a concern.\n\n")
 	}
-	b.WriteString("Three standing criteria orthogonal to the lenses above also apply:\n\n")
+	b.WriteString("The standing criteria below, orthogonal to the lenses above, also apply:\n\n")
 	b.WriteString("4. **Scope adherence (flag-only)**: Does the diff touch files outside the plan's scope.files? " +
 		"If so, record a `{category: \"scope\"}` concern naming the out-of-scope files. " +
 		"Files listed in the 'Scope amended at approval', 'Scope amended mid-stage', and 'Scope authorized by " +
@@ -4971,6 +5048,14 @@ func buildImplementReview(t Trigger) string {
 		"evidence-PLACEMENT observation naming the condition and the surface, addressed to the operator. Do NOT " +
 		"count it against the change, do NOT treat it as a confirmed gap, and do NOT reject on it.\n\n")
 
+	// Standing criteria 9 and 10 (#2119): the baseline check before severity and
+	// the trace-mechanical-predictions rule, plus the adversarial-reasoning
+	// carve-out that bounds both. Appended AFTER standing rule 8 and BEFORE the
+	// verdict decision rule, so criteria 1-8 and the numbered lenses above stay
+	// byte-identical and the verdict rule's "standing rule 7" cross-reference
+	// still resolves.
+	writeGroundedCalibrationCriteria(&b, t)
+
 	// Verdict decision rule.
 	b.WriteString("### Verdict decision rule\n\n")
 	b.WriteString("- `approve`: low-risk diff; the lenses are clear (or the security lens self-gated as no " +
@@ -4995,6 +5080,15 @@ func buildImplementReview(t Trigger) string {
 		"A required file merely APPEARING absent from the scope-bounded diff is ALSO never grounds for reject (it " +
 		"may be a drift path the operator stages); per standing rule 7, treat an absence you cannot positively " +
 		"confirm as unverifiable and emit approve_with_concerns, not a confirmed-missing reject.\n\n")
+
+	// Severity calibration rubric (#2119). Rendered UNCONDITIONALLY on BOTH
+	// gate-evidence branches: the rubric governs severity assignment on every
+	// path, and the no-evidence branch — whose enabled correctness lens produces
+	// MORE findings — needs it at least as much. Placed after the verdict
+	// decision rule and ahead of the approved-plan section, so it sits in the
+	// cache-stable prefix well before ImplementReviewSplitMarker and adds
+	// nothing to the per-round variable payload.
+	writeSeverityCalibration(&b)
 
 	// Approved plan section — what the diff is being measured against.
 	if t.ApprovedPlan != nil {
@@ -5227,7 +5321,18 @@ func buildImplementReview(t Trigger) string {
 		b.WriteString("- Concerns in state `waived` are context only: the operator waived them with the audited " +
 			"reason shown. You MUST NOT re-raise or re-litigate a waived concern absent genuinely new evidence.\n")
 		b.WriteString("- `concerns[]` is ONLY for genuinely NEW findings. NEVER re-mint a concern already listed " +
-			"here — address it via `concern_resolutions` (or leave it alone if it is not addressed_pending).\n\n")
+			"here — address it via `concern_resolutions` (or leave it alone if it is not addressed_pending).\n")
+		// Re-read-before-reopen bullet (#2119). A stale reopen — restating the
+		// round-N finding without checking the round-N+1 diff — is one of the
+		// operator-arbitration cost centres the E44 campaign measured. Rendered
+		// INSIDE the len(t.PriorConcerns) > 0 guard, so the empty case stays
+		// byte-identical to the pre-#984 output.
+		b.WriteString("- Before emitting a `reopened` resolution, READ the CURRENT diff state for that " +
+			"concern's subject. If a prior resolution or the fix-up claims the fix landed, either CONFIRM it " +
+			"against the diff in front of you or state SPECIFICALLY what remains missing and where. Reopening " +
+			"on prior-round reasoning — restating the round-N finding without checking the round-N+1 diff — is " +
+			"a defect in the review; on the delta path the diff shown is exactly the fix-up change the " +
+			"resolution refers to.\n\n")
 		for _, c := range t.PriorConcerns {
 			fmt.Fprintf(&b, "- id: %s\n  state: %s\n  severity: %s\n  category: %s\n  note: %s\n",
 				c.ID, c.State, c.Severity, c.Category, c.Note)
