@@ -626,6 +626,230 @@ func TestUnevaluableCriteria_NonNilOnCleanPlan(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// verify_hint exemption (#3163)
+// ---------------------------------------------------------------------------
+//
+// motivatingHermeticHint is the verify_hint quoted VERBATIM from #3163's
+// evidence run: the criterion 'opened-and-reopened-reach-the-publish-path' whose
+// statement named a "signed pull_request webhook delivery" yet whose verify_hint
+// says the test is a hermetic in-process one. This is the fixture case (a) uses,
+// so if the shipped marker set does not in fact match it, this test fails and
+// the assumption is discharged by the test rather than asserted.
+const motivatingHermeticHint = "signs its own body against the configured secret and drives the real POST /webhooks/github route, so no live forge is involved"
+
+// TestUnevaluableCriteria_VerifyHintExemption is the DONE-MEANS behavioral table
+// for #3163, one row per named branch (approach step 5, a–i). It asserts the
+// emitted undecidable_criterion count per fixture AND — side by side — that the
+// missing_live_validation_marker output is UNCHANGED, so a cross-rule regression
+// is visible in the same table (case i). A comment-only or no-op touch of
+// acceptance_check.go leaves case (a) RED.
+//
+// COUNTERFACTUAL ATTAINABILITY (approach step 6 — three deletions, each RUN and
+// observed, never reasoned about; restored byte-identically after each):
+//
+//	Direction 1 (whole suppression is the control): delete the
+//	`if !uc.liveTarget && verifyHintDeclaresInRepo(c) { continue }` block in
+//	UnevaluableCriteria.
+//	  $ go test ./internal/plan/ -run TestUnevaluableCriteria_VerifyHintExemption
+//	  --- FAIL: .../a_motivating_hermetic_webhook (0.00s)
+//	      acceptance_check_test.go:NNN: case (a): undecidable_criterion count = 1, want 0
+//	  Case (a) RED (h also reddens — the MCP match fires first and names the
+//	  wrong capability with no suppression). Every other row green. Restored.
+//
+//	Direction 2 (the !uc.liveTarget conjunct is the control): delete only
+//	`!uc.liveTarget &&` so the hint alone suppresses.
+//	  --- FAIL: .../b_live_target_same_hint_still_fires (0.00s)
+//	      acceptance_check_test.go:NNN: case (b): undecidable_criterion count = 0, want 1
+//	  Case (b) RED — #2845 would regress (h also reddens: the liveTarget forge is
+//	  now wrongly suppressed too, yielding 0). Every other row green. Restored.
+//
+//	Direction 3 (the field restriction is the control): widen
+//	verifyHintDeclaresInRepo to read
+//	`c.VerifyHint + " " + c.ExpectationBasis + " " + c.Statement`.
+//	  --- FAIL: .../e_statement_only_harness_words_fire (0.00s)
+//	      acceptance_check_test.go:NNN: case (e): undecidable_criterion count = 0, want 1
+//	  --- FAIL: .../f_expectation_basis_only_fires (0.00s)
+//	      acceptance_check_test.go:NNN: case (f): undecidable_criterion count = 0, want 1
+//	  Cases (e) and (f) RED, every other row green. Restored.
+//
+// Each fixture seeds its state BY CONSTRUCTION (a literal criterion struct with
+// the field set or empty), so the RED lands on the finding assertion, not on
+// setup. Cases (b)–(f) ARE the retained controls: they go red if the suppression
+// over-fires.
+func TestUnevaluableCriteria_VerifyHintExemption(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		statement     string
+		verifyHint    string
+		basis         string
+		skipExpected  bool
+		requiresLive  bool
+		wantUndecid   int
+		wantMLLV      int
+		wantDetailHas string // asserted on the undecidable finding when non-empty
+	}{
+		{
+			// (a) MOTIVATING: a non-liveTarget (webhook) capability whose
+			// verify_hint names a hermetic in-repository harness -> suppressed.
+			name:        "a_motivating_hermetic_webhook",
+			statement:   "a signed pull_request webhook delivery opened and reopened reaches the publish path",
+			verifyHint:  motivatingHermeticHint,
+			wantUndecid: 0,
+			wantMLLV:    0,
+		},
+		{
+			// (b) #2845 PRESERVATION: a liveTarget capability with the SAME
+			// in-repository verify_hint STILL fires — conjunct L alone blocks
+			// suppression, regardless of the hint.
+			name:        "b_live_target_same_hint_still_fires",
+			statement:   "a live GitHub round-trip closes the issue",
+			verifyHint:  motivatingHermeticHint,
+			wantUndecid: 1,
+			wantMLLV:    1,
+		},
+		{
+			// (c) non-liveTarget capability with an EMPTY verify_hint -> fires.
+			name:        "c_empty_verify_hint_fires",
+			statement:   "a real webhook delivery reopens the run",
+			verifyHint:  "",
+			wantUndecid: 1,
+			wantMLLV:    0,
+		},
+		{
+			// (d) non-liveTarget capability whose verify_hint carries NO harness
+			// marker -> fires.
+			name:        "d_verify_hint_without_harness_marker_fires",
+			statement:   "a real webhook delivery reopens the run",
+			verifyHint:  "confirmed manually by the operator during the demo",
+			wantUndecid: 1,
+			wantMLLV:    0,
+		},
+		{
+			// (e) statement-only evidence: the harness markers appear in the
+			// STATEMENT, verify_hint empty -> fires, proving the statement is
+			// never read as evidence.
+			name:        "e_statement_only_harness_words_fire",
+			statement:   "a real webhook delivery is verified by go test in webhook_test.go, an in-repository hermetic harness",
+			verifyHint:  "",
+			wantUndecid: 1,
+			wantMLLV:    0,
+		},
+		{
+			// (f) expectation_basis-only evidence with skip_expected FALSE ->
+			// fires, proving the basis field is not read by verifyHintDeclaresInRepo.
+			// (skip_expected false keeps criterionDeclaresUnevaluable from
+			// exempting it, so the RED lands on the #3163 path.)
+			name:         "f_expectation_basis_only_fires",
+			statement:    "a real webhook delivery reopens the run",
+			basis:        "validated in webhook_integration_test.go with a fake",
+			skipExpected: false,
+			wantUndecid:  1,
+			wantMLLV:     0,
+		},
+		{
+			// (g1) pre-existing exemption: skip_expected + basis still exempts
+			// undecidable_criterion, unchanged.
+			name:         "g1_skip_expected_with_basis_still_exempt",
+			statement:    "a real webhook delivery reopens the run",
+			basis:        "validated in webhook_integration_test.go with a fake",
+			skipExpected: true,
+			wantUndecid:  0,
+			wantMLLV:     0,
+		},
+		{
+			// (g2) pre-existing exemption: requires_live_validation still exempts
+			// both rules, unchanged.
+			name:         "g2_requires_live_validation_still_exempt",
+			statement:    "a live GitHub round-trip closes the issue",
+			requiresLive: true,
+			wantUndecid:  0,
+			wantMLLV:     0,
+		},
+		{
+			// (h) THE continue-not-break ORDERING CONSEQUENCE. The statement
+			// carries a SUPPRESSED non-liveTarget phrase (an MCP client, corpus
+			// index 0) BEFORE a liveTarget phrase (a live forge, corpus index 3),
+			// with an in-repository verify_hint. The MCP match is suppressed via
+			// `continue`, so the scan reaches the forge match and emits EXACTLY
+			// one finding naming the liveTarget capability. Under `break` the MCP
+			// suppression would abort the scan and yield ZERO findings — this row
+			// is the vehicle that pins `continue`.
+			name:          "h_mixed_suppressed_then_livetarget_fires_once",
+			statement:     "a live MCP client drives a live GitHub round-trip",
+			verifyHint:    "hermetic go test in webhook_test.go",
+			wantUndecid:   1,
+			wantMLLV:      1,
+			wantDetailHas: "a live forge round-trip",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{
+						ID: "a1", Statement: tc.statement,
+						Source: CriterionSourceExplicit, SourceRef: "#3163",
+						VerifyHint:             tc.verifyHint,
+						ExpectationBasis:       tc.basis,
+						SkipExpected:           tc.skipExpected,
+						RequiresLiveValidation: tc.requiresLive,
+					},
+				},
+			}
+			findings := EvaluateAcceptanceCriteria(v)
+			if got := findingsFor(findings, RuleUndecidableCriterion); len(got) != tc.wantUndecid {
+				t.Fatalf("case %q: undecidable_criterion count = %d, want %d: %+v", tc.name, len(got), tc.wantUndecid, got)
+			}
+			// (i) missing_live_validation_marker output side by side — a
+			// cross-rule regression shows up here rather than silently.
+			if got := findingsFor(findings, RuleMissingLiveValidationMarker); len(got) != tc.wantMLLV {
+				t.Fatalf("case %q: missing_live_validation_marker count = %d, want %d: %+v", tc.name, len(got), tc.wantMLLV, got)
+			}
+			if tc.wantDetailHas != "" {
+				f := findingFor(findings, RuleUndecidableCriterion)
+				if f == nil {
+					t.Fatalf("case %q: want an undecidable_criterion finding to assert detail on", tc.name)
+				}
+				if !strings.Contains(f.Detail, tc.wantDetailHas) {
+					t.Errorf("case %q: Detail = %q, want it to name %q", tc.name, f.Detail, tc.wantDetailHas)
+				}
+			}
+		})
+	}
+}
+
+// TestUnevaluableCriteria_VerifyHintExemption_DetailGuidance pins the #3163
+// conditional guidance sentence: a NON-liveTarget finding that was NOT suppressed
+// carries the "name that harness in verify_hint rather than marking it
+// skip_expected" advice, while a liveTarget finding's Detail stays BYTE-IDENTICAL
+// to the pre-#3163 text (no appended sentence), so a live-target plan's audit
+// payload bytes do not move.
+func TestUnevaluableCriteria_VerifyHintExemption_DetailGuidance(t *testing.T) {
+	const liveTargetDetail = "criterion statement requires a live forge round-trip, which the sandboxed acceptance executor does not have; mark it skip_expected with an expectation_basis (or requires_live_validation) so it is declared up front rather than reported undecidable at acceptance"
+
+	nonLive := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		{ID: "a1", Statement: "a real webhook delivery reopens the run", Source: CriterionSourceExplicit, SourceRef: "#3163"},
+	}}
+	f := findingFor(EvaluateAcceptanceCriteria(nonLive), RuleUndecidableCriterion)
+	if f == nil {
+		t.Fatal("want an undecidable_criterion finding on the non-liveTarget fixture")
+	}
+	if !strings.Contains(f.Detail, "name that harness in verify_hint rather than marking it skip_expected") {
+		t.Errorf("non-liveTarget Detail must carry the #3163 guidance; got %q", f.Detail)
+	}
+
+	live := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		{ID: "a1", Statement: "a live GitHub round-trip closes the issue", Source: CriterionSourceExplicit, SourceRef: "#3163"},
+	}}
+	lf := findingFor(EvaluateAcceptanceCriteria(live), RuleUndecidableCriterion)
+	if lf == nil {
+		t.Fatal("want an undecidable_criterion finding on the liveTarget fixture")
+	}
+	if lf.Detail != liveTargetDetail {
+		t.Errorf("liveTarget Detail must be byte-identical to the pre-#3163 text\n got: %q\nwant: %q", lf.Detail, liveTargetDetail)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // missing_live_validation_marker (#2845, E54.31)
 //
 // FIXTURE-COLLISION SWEEP (run BEFORE any production edit, per the approved

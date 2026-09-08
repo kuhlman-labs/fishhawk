@@ -568,6 +568,89 @@ func TestShipPlan_UndecidableCriterion_IsAdvisoryNotARefusal(t *testing.T) {
 	}
 }
 
+// TestShipPlan_UndecidableCriterion_VerifyHintExemption is the #3163 plan-gate
+// end-to-end proof, following the #3089 precedent: it ships a REAL plan through
+// handleShipPlan and asserts the persisted plan_acceptance_precheck audit
+// payload's undecidable_count for BOTH the hermetic-webhook shape (0) and a
+// liveTarget control shape (1), plus that each plan is ADMITTED (the stage
+// reaches awaiting_approval, no failure category) — so the gate-level test
+// DISCRIMINATES rather than merely passing, and proves the rule stayed advisory
+// across the seam. The hermetic criterion is the motivating #3163 case: its
+// statement names a "signed pull_request webhook delivery" (a webhook corpus
+// phrase, non-liveTarget) while its verify_hint names a hermetic in-process
+// harness, so the suppression fires and undecidable_count is 0.
+func TestShipPlan_UndecidableCriterion_VerifyHintExemption(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		criterion   map[string]any
+		wantUndecid int
+	}{
+		{
+			name: "hermetic_webhook_suppressed",
+			criterion: map[string]any{
+				"id":          "opened-and-reopened-reach-the-publish-path",
+				"statement":   "a signed pull_request webhook delivery opened and reopened reaches the publish path",
+				"source":      "explicit",
+				"source_ref":  "#3163",
+				"verify_hint": "signs its own body against the configured secret and drives the real POST /webhooks/github route, so no live forge is involved",
+			},
+			wantUndecid: 0,
+		},
+		{
+			name: "live_target_control_still_fires",
+			criterion: map[string]any{
+				"id":          "closes-via-live-forge",
+				"statement":   "a live GitHub round-trip closes the originating issue",
+				"source":      "explicit",
+				"source_ref":  "#3163",
+				"verify_hint": "signs its own body against the configured secret, so no live forge is involved",
+			},
+			wantUndecid: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, _, sf, au := newPlanSequenceServer(t)
+			runRow := rr.seedRun()
+			runRow.WorkflowID = "feature_change"
+			runRow.WorkflowSpec = specWithAcceptanceStage
+			planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+			planStage.RequiresApproval = true
+			priv, _ := sf.issue(t, runRow.ID)
+
+			body := acceptancePlanBody(t, []map[string]any{tc.criterion}, nil)
+			w := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, body, "")
+			if w.Code != http.StatusCreated {
+				t.Fatalf("plan status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+
+			// ADMISSION (committed state): the plan reached the operator gate,
+			// was never re-opened or failed, whatever the finding.
+			if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+				t.Errorf("stage state = %q, want awaiting_approval (an advisory finding must never refuse the plan)\ntransitions: %+v",
+					got, rr.stageTransitions)
+			}
+			if got := rr.stagesByID[planStage.ID].FailureCategory; got != nil {
+				t.Errorf("stage carries failure category %q; an advisory acceptance rule must never fail a plan", *got)
+			}
+
+			if n := countAcceptancePrecheckEntries(au.auditFake); n != 1 {
+				t.Fatalf("plan_acceptance_precheck entries = %d, want 1", n)
+			}
+			entry := lastAcceptancePrecheckEntry(t, au.auditFake)
+			if entry.UndecidableCount != tc.wantUndecid {
+				t.Errorf("persisted undecidable_count = %d, want %d\nfindings: %+v", entry.UndecidableCount, tc.wantUndecid, entry.Findings)
+			}
+			f := hasAcceptanceFinding(entry, acceptanceRuleUndecidableCriterion)
+			if tc.wantUndecid == 0 && f != nil {
+				t.Errorf("the hermetic criterion must draw NO undecidable_criterion finding; got %+v", *f)
+			}
+			if tc.wantUndecid == 1 && f == nil {
+				t.Errorf("the liveTarget control must draw an undecidable_criterion finding; got %+v", entry.Findings)
+			}
+		})
+	}
+}
+
 // (#2512 layer 3, exemption) A criterion already marked skip_expected with an
 // expectation_basis is the sanctioned declaration for undecidable_criterion —
 // no finding from THAT rule and undecidable_count stays 0.
