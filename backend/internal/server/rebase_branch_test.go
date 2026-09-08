@@ -876,24 +876,255 @@ func TestRebaseRunBranch_Conflict(t *testing.T) {
 
 	w := postRebaseBranch(t, sd.s, sd.runID,
 		rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	var got rebaseBranchResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode 202 body: %v\n%s", err, w.Body.String())
+	}
+	if !got.ConflictResolutionTriggered {
+		t.Error("conflict_resolution_triggered = false, want true on the 202 trigger arm")
+	}
+	if got.ConflictResolutionStageID == "" {
+		t.Error("conflict_resolution_stage_id is empty; the operator cannot await the pass")
+	}
+	// THE BRANCH IS UNCHANGED. new_head_sha deliberately equals
+	// prior_head_sha rather than being empty, so a reader cannot mistake the
+	// 202 for a head that failed to read back.
+	if got.NewHeadSHA != got.PriorHeadSHA || got.NewHeadSHA != rebasePriorHeadSHA {
+		t.Errorf("new_head_sha = %q / prior_head_sha = %q; want both %q (the branch is unchanged)",
+			got.NewHeadSHA, got.PriorHeadSHA, rebasePriorHeadSHA)
+	}
+	if got.MergeCommitSHA != "" {
+		t.Errorf("merge_commit_sha = %q, want empty — no merge commit exists on the 202 arm", got.MergeCommitSHA)
+	}
+	// SHIPPED-MESSAGE PIN: not compiler-enforced anywhere.
+	if !strings.Contains(got.ConflictResolutionNote, "NO merge commit exists yet") {
+		t.Errorf("conflict_resolution_note must state that no merge commit exists: %q", got.ConflictResolutionNote)
+	}
+	// The durable authorization record, carrying the merge the runner must
+	// perform locally.
+	trig := auditEntries(sd.au, CategoryStageConflictResolutionTriggered)
+	if len(trig) != 1 {
+		t.Fatalf("stage_conflict_resolution_triggered entries = %d, want 1", len(trig))
+	}
+	var payload conflictResolutionTriggerAudit
+	if err := json.Unmarshal(trig[0].Payload, &payload); err != nil {
+		t.Fatalf("decode trigger payload: %v", err)
+	}
+	if payload.Branch != rebaseBranchName || payload.BaseRef != rebaseBaseRef {
+		t.Errorf("trigger payload branch/base = %q/%q, want %q/%q",
+			payload.Branch, payload.BaseRef, rebaseBranchName, rebaseBaseRef)
+	}
+	if payload.Pass != 1 {
+		t.Errorf("trigger payload pass = %d, want 1", payload.Pass)
+	}
+	if payload.PriorState == "" {
+		t.Error("trigger payload prior_state is empty; the failure arm has no anchor to restore from")
+	}
+	// Nothing was written to the BRANCH. Rule (b)'s branch-write half holds on
+	// the 202 arm; its re-park half deliberately does NOT — re-parking the
+	// review gate IS what the trigger does, so it is asserted here as an
+	// intended effect rather than inherited as a prohibition.
+	if m := sd.stub.merges(); len(m) != 1 {
+		t.Errorf("merge POSTs = %d, want exactly 1 (the conflict is discovered BY the merges endpoint)", len(m))
+	}
+	if a := branchRebasedAudit(sd.au); a != nil {
+		t.Error("branch_rebased audit entry written on the 202 trigger arm; no advance happened")
+	}
+	if p := checkPublications(sd.creator); len(p) != 0 {
+		t.Errorf("check publications = %v, want none on the 202 trigger arm", p)
+	}
+	if !transitionedTo(sd.rr, run.StageStatePending) {
+		t.Error("the implement stage was not re-opened to pending; no pass will run")
+	}
+}
+
+// TestRebaseConflict_SecondPassRefusedWhenBudgetSpent is COUNTERFACTUAL (g)'s
+// vehicle: with one stage_conflict_resolution_triggered entry already recorded
+// for the stage the ceiling-1 budget is SPENT, so the same conflict takes the
+// fail-closed 422 rebase_conflict arm naming the spent budget, the failed
+// pass's confinement-gate reason, and the resolve-push-vouch fallback.
+//
+// The prior trigger and the prior failure are seeded BY CONSTRUCTION (appended
+// directly to the audit fake), not by driving a first pass through the
+// handler, so the RED lands on the behavioral assertion rather than on a
+// fixture-setup failure.
+func TestRebaseConflict_SecondPassRefusedWhenBudgetSpent(t *testing.T) {
+	stub := cleanRebaseStub()
+	stub.mergeStatus = http.StatusConflict
+	stub.mergeBody = `{"message":"Merge conflict"}`
+	sd := seedRebaseRun(t, stub, rebaseOpts{})
+
+	implStage := rebaseImplementStage(t, sd)
+	seedConflictResolutionTrigger(t, sd, implStage.ID)
+	seedConflictResolutionFailure(t, sd, implStage.ID,
+		"non_conflicted_index_entry_changed")
+
+	w := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 once the conflict-resolution budget is spent:\n%s",
+			w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"rebase_conflict",
+		"NOTHING was written",
+		"budget (1 pass) is SPENT",
+		"non_conflicted_index_entry_changed",
+		"fishhawk_vouch_commit",
+		"fishhawk_reset_run_branch",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("budget-spent refusal must contain %q:\n%s", want, body)
+		}
+	}
+	// A SECOND trigger must NOT have been written.
+	if n := len(auditEntries(sd.au, CategoryStageConflictResolutionTriggered)); n != 1 {
+		t.Errorf("stage_conflict_resolution_triggered entries = %d, want 1 (no second pass authorized)", n)
+	}
+	assertMergeAttemptedNothingWritten(t, sd)
+}
+
+// TestRebaseConflict_NoImplementStage_FailsClosed: a conflict on a run with no
+// implement stage to run a pass on is refused, never left as a 202 the
+// operator would wait on forever.
+func TestRebaseConflict_NoImplementStage_FailsClosed(t *testing.T) {
+	stub := cleanRebaseStub()
+	stub.mergeStatus = http.StatusConflict
+	stub.mergeBody = `{"message":"Merge conflict"}`
+	sd := seedRebaseRun(t, stub, rebaseOpts{})
+	// Drop every implement stage from the run's stage list.
+	var kept []*run.Stage
+	for _, st := range sd.rr.stagesByRunID[sd.runID] {
+		if st.Type != run.StageTypeImplement {
+			kept = append(kept, st)
+		}
+	}
+	sd.rr.stagesByRunID[sd.runID] = kept
+
+	w := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator)
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
 	}
-	body := w.Body.String()
-	if !strings.Contains(body, "rebase_conflict") {
-		t.Errorf("body missing rebase_conflict: %s", body)
+	if !strings.Contains(w.Body.String(), "no implement stage") {
+		t.Errorf("refusal must name the missing implement stage:\n%s", w.Body.String())
 	}
-	// SHIPPED-MESSAGE / CROSS-LINK PINS — none of these is compiler-enforced.
-	if !strings.Contains(body, "fishhawk_reset_run_branch") {
-		t.Errorf("the conflict refusal must cross-link the sibling verb: %s", body)
+	if n := len(auditEntries(sd.au, CategoryStageConflictResolutionTriggered)); n != 0 {
+		t.Errorf("stage_conflict_resolution_triggered entries = %d, want 0", n)
 	}
-	if !strings.Contains(body, "#3202") {
-		t.Errorf("the conflict refusal must name the deferred agent-resolution issue: %s", body)
+}
+
+// TestRebaseConflict_StageNotReopenable_FailsClosed: run.FixupStage's own gate
+// refuses an implement stage that is neither awaiting_approval nor succeeded
+// with an open review gate. The handler must surface that as the 422, not as a
+// 202 promising a pass that was never started.
+func TestRebaseConflict_StageNotReopenable_FailsClosed(t *testing.T) {
+	stub := cleanRebaseStub()
+	stub.mergeStatus = http.StatusConflict
+	stub.mergeBody = `{"message":"Merge conflict"}`
+	sd := seedRebaseRun(t, stub, rebaseOpts{})
+	rebaseImplementStage(t, sd).State = run.StageStateRunning
+
+	w := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(body, "NOTHING was written") {
-		t.Errorf("the conflict refusal must state that nothing was written: %s", body)
+	if !strings.Contains(w.Body.String(), "not re-openable") {
+		t.Errorf("refusal must say the stage is not re-openable:\n%s", w.Body.String())
 	}
-	assertMergeAttemptedNothingWritten(t, sd)
+}
+
+// TestConflictResolutionConsumesNoFixupBudget is COUNTERFACTUAL (h)'s vehicle
+// and the issue's explicit criterion: a triggered conflict-resolution pass
+// leaves the FIX-UP counter untouched. It reads the stage_fixup_triggered
+// entry count back after a 202 and asserts it is unchanged, so wiring the
+// trigger onto the fix-up counter goes RED here.
+func TestConflictResolutionConsumesNoFixupBudget(t *testing.T) {
+	stub := cleanRebaseStub()
+	stub.mergeStatus = http.StatusConflict
+	stub.mergeBody = `{"message":"Merge conflict"}`
+	sd := seedRebaseRun(t, stub, rebaseOpts{})
+
+	before := len(auditEntries(sd.au, CategoryStageFixupTriggered))
+
+	w := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	if after := len(auditEntries(sd.au, CategoryStageFixupTriggered)); after != before {
+		t.Errorf("stage_fixup_triggered entries %d → %d; a conflict-resolution pass must consume NO fix-up budget",
+			before, after)
+	}
+	// And the conflict-resolution counter DID move — otherwise the assertion
+	// above would pass on a trigger that never happened.
+	if n := len(auditEntries(sd.au, CategoryStageConflictResolutionTriggered)); n != 1 {
+		t.Fatalf("stage_conflict_resolution_triggered entries = %d, want 1", n)
+	}
+}
+
+// rebaseImplementStage returns the run's implement stage from the seeded repo.
+func rebaseImplementStage(t *testing.T, sd *rebaseSeed) *run.Stage {
+	t.Helper()
+	for _, st := range sd.rr.stagesByRunID[sd.runID] {
+		if st.Type == run.StageTypeImplement {
+			return st
+		}
+	}
+	t.Fatal("seeded run has no implement stage")
+	return nil
+}
+
+// seedConflictResolutionTrigger appends a stage_conflict_resolution_triggered
+// entry BY CONSTRUCTION, so a budget-spent test does not depend on a first
+// pass having been driven through the handler.
+func seedConflictResolutionTrigger(t *testing.T, sd *rebaseSeed, stageID uuid.UUID) {
+	t.Helper()
+	payload, err := json.Marshal(conflictResolutionTriggerAudit{
+		conflictResolutionTrigger: conflictResolutionTrigger{
+			Branch: rebaseBranchName, BaseRef: rebaseBaseRef, Pass: 1,
+		},
+		RunID: sd.runID.String(), StageID: stageID.String(),
+		PriorState: string(run.StageStateSucceeded),
+	})
+	if err != nil {
+		t.Fatalf("marshal trigger payload: %v", err)
+	}
+	if _, err := sd.au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:    sd.runID,
+		StageID:  &stageID,
+		Category: CategoryStageConflictResolutionTriggered,
+		Payload:  payload,
+	}); err != nil {
+		t.Fatalf("seed trigger entry: %v", err)
+	}
+}
+
+// seedConflictResolutionFailure appends a stage_conflict_resolution_failed
+// entry carrying the runner's named confinement-gate reason.
+func seedConflictResolutionFailure(t *testing.T, sd *rebaseSeed, stageID uuid.UUID, reason string) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"stage_id":              stageID.String(),
+		"source_failure_reason": reason,
+	})
+	if err != nil {
+		t.Fatalf("marshal failure payload: %v", err)
+	}
+	if _, err := sd.au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:    sd.runID,
+		StageID:  &stageID,
+		Category: CategoryStageConflictResolutionFailed,
+		Payload:  payload,
+	}); err != nil {
+		t.Fatalf("seed failure entry: %v", err)
+	}
 }
 
 // TestRebaseRunBranch_MergeFailed: any non-conflict merge error → 502

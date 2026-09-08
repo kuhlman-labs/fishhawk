@@ -2083,6 +2083,20 @@ type RebaseBranchResult struct {
 	// already-contains-base arm, which attributes nothing — so the warning
 	// names fishhawk_vouch_commit as the required step.
 	LineageAttributionWarning string `json:"lineage_attribution_warning,omitempty"`
+	// ConflictResolutionTriggered reports that the base merge CONFLICTED and
+	// the backend authorized a bounded, agent-driven conflict-resolution pass
+	// ON the run branch (E64.62 / #3202) instead of refusing outright. It rides
+	// the backend's 202 arm, which apiClient.do decodes exactly like the 200 —
+	// so WITHOUT this field a triggered pass would decode into a
+	// success-shaped result carrying no signal at all. When it is true NO
+	// merge commit exists yet and the branch is UNCHANGED: await the named
+	// stage, then re-invoke the verb.
+	ConflictResolutionTriggered bool `json:"conflict_resolution_triggered,omitempty"`
+	// ConflictResolutionStageID is the implement stage the pass re-opened.
+	ConflictResolutionStageID string `json:"conflict_resolution_stage_id,omitempty"`
+	// ConflictResolutionNote is the constant sentence stating that nothing was
+	// written and naming the await-then-re-invoke route.
+	ConflictResolutionNote string `json:"conflict_resolution_note,omitempty"`
 }
 
 // RebaseRunBranch has the RUNNER advance its own lineage branch onto the
@@ -2100,8 +2114,14 @@ type RebaseBranchResult struct {
 //   - 403 run_token_forbidden (a run-bound agent token, even for its own run)
 //   - 403 insufficient_scope (no write:stages)
 //   - 404 run_not_found
-//   - 422 rebase_conflict (fail-closed first slice: the branch conflicts with
-//     the advanced base; NOTHING was written — agent resolution is #3202)
+//   - 202 (not an error): the branch CONFLICTS with the advanced base and a
+//     bounded agent conflict-resolution pass was triggered on the run's
+//     implement stage (E64.62 / #3202). Nothing was written to the branch;
+//     the result carries conflict_resolution_triggered plus the re-opened
+//     stage id.
+//   - 422 rebase_conflict (fail-closed: the branch conflicts AND the single
+//     conflict-resolution pass is SPENT, or no pass could be started at all;
+//     NOTHING was written — resolve-push-vouch is the fallback)
 //   - 422 rebase_not_determinable (fail-closed: an anchor could not be
 //     resolved, the behind-probe failed, or the lease re-check saw a
 //     concurrent push)

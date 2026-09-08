@@ -856,6 +856,13 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// an un-fetched recent slice degrades the wording from re-opened to
 		// generic, never to silence.
 		foldAcceptanceRedispatchAdvisory(&runView.Run, postStages, recentAudit, nextActions)
+		// E64.62 (#3202): the same display-only conflict-resolution fold
+		// getRunStatus applies, off the SAME recentAudit slice. It matters most
+		// HERE: on the local loop the conflict-resolution pass executes through
+		// this very verb, so a refused pass surfaces on this snapshot first.
+		// Fail-open like every other derivation here — an un-fetched recent
+		// slice degrades to silence, never to a false advisory.
+		foldConflictResolutionAdvisory(&runView.Run, recentAudit, nextActions)
 	}
 
 	out := RunStageOutput{

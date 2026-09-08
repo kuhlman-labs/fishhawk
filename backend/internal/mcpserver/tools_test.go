@@ -3140,11 +3140,12 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 		t.Error("fishhawk_get_gate_view is not registered/visible over ListTools")
 	}
 
-	// fishhawk_rebase_run_branch (E64.23 / #3125) must be wire-visible, and its
-	// DESCRIPTION must carry the two claims that are not compiler-enforced
-	// anywhere: the merge-commit MECHANISM (the verb's name would otherwise
-	// imply linear history) and the fishhawk_reset_run_branch cross-link (an
-	// operator who reaches for the wrong sibling must be told which is right).
+	// fishhawk_rebase_run_branch (E64.23 / #3125, E64.62 / #3202) must be
+	// wire-visible, and its DESCRIPTION must carry the claims that are not
+	// compiler-enforced anywhere: the merge-commit MECHANISM (the verb's name
+	// would otherwise imply linear history), the fishhawk_reset_run_branch
+	// cross-link (an operator who reaches for the wrong sibling must be told
+	// which is right), and the #3202 conflict behaviour.
 	var sawRebase bool
 	for _, tool := range res.Tools {
 		if tool.Name != "fishhawk_rebase_run_branch" {
@@ -3161,8 +3162,25 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 		if !strings.Contains(tool.Description, "fishhawk_reset_run_branch") {
 			t.Errorf("fishhawk_rebase_run_branch description must cross-link the sibling verb:\n%s", tool.Description)
 		}
-		if !strings.Contains(tool.Description, "#3202") {
-			t.Errorf("fishhawk_rebase_run_branch description must name the deferred conflict-resolution issue:\n%s", tool.Description)
+		// E64.62 / #3202 REPLACED the unconditional fail-closed conflict
+		// refusal with a bounded agent pass. The description is the only
+		// operator-facing statement of that behaviour that nothing else
+		// compiles against, so it is pinned in BOTH directions: the new
+		// behaviour must be stated, and the superseded sentence must be GONE.
+		// A comment-only touch of tools.go fails these.
+		if !strings.Contains(tool.Description, "conflict_resolution_triggered") ||
+			!strings.Contains(tool.Description, "AGENT PASS") {
+			t.Errorf("fishhawk_rebase_run_branch description must state that a conflict triggers a bounded agent pass:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "consumes NO fix-up budget") {
+			t.Errorf("fishhawk_rebase_run_branch description must state the pass consumes no fix-up budget:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "fishhawk_vouch_commit") {
+			t.Errorf("fishhawk_rebase_run_branch description must name the resolve-push-vouch fallback:\n%s", tool.Description)
+		}
+		if strings.Contains(tool.Description, "This first slice does not") ||
+			strings.Contains(tool.Description, "agent-driven resolution is tracked in") {
+			t.Errorf("fishhawk_rebase_run_branch description still carries the superseded pre-#3202 fail-closed sentence:\n%s", tool.Description)
 		}
 	}
 	if !sawRebase {
