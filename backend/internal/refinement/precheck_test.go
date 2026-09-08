@@ -192,6 +192,37 @@ func TestEvaluateDraftCriteria_MissingLiveValidationMarker_SurfacedAtIntake(t *t
 	}
 }
 
+// (#3163, shared rule set) The verify_hint exemption is STRUCTURALLY INERT at
+// intake. EvaluateDraftCriteria maps a child's []string criteria into a
+// synthetic plan.Verification setting only ID and Statement — VerifyHint is
+// empty for every possible draft — so verifyHintDeclaresInRepo can never be
+// true here and the #3163 suppression cannot fire. A drafted child whose
+// criterion text carries BOTH a corpus phrase ("a real webhook delivery") AND
+// in-repository harness words ("verified by go test in webhook_test.go") still
+// draws its undecidable_criterion finding, because the harness words live in the
+// STATEMENT and the suppression reads only VerifyHint (the same discipline #3026
+// used for its intake-inert rule). This proves the single-evaluator claim
+// empirically: precheck.go needs NO edit and the suppression stays off at intake.
+func TestEvaluateDraftCriteria_VerifyHintExemptionInertAtIntake(t *testing.T) {
+	d := EpicDraft{
+		Epic: EpicSpec{Summary: "e", Scope: "s", OutOfScope: "perf deferred"},
+		Children: []ChildDraft{
+			{Summary: "c1", Proposal: "p1", AcceptanceCriteria: []string{
+				"a real webhook delivery reopens the run, verified by go test in webhook_test.go, an in-repository hermetic harness",
+			}},
+		},
+	}
+	pc := EvaluateDraftCriteria(d)
+
+	if f := childFinding(pc, 1, plan.RuleUndecidableCriterion); f == nil {
+		t.Fatalf("child 1 must still surface undecidable_criterion at intake — the suppression reads only VerifyHint, which the intake mapping never populates; got %+v", pc.Children)
+	}
+	// Advisory: the finding renders without setting NeedsAttention.
+	if c := childCheck(pc, 1); c == nil || c.NeedsAttention {
+		t.Errorf("undecidable_criterion must render without setting NeedsAttention; got %+v", c)
+	}
+}
+
 // TestEvaluateDraftCriteria_AllSkipShapedDraft_NotBlocked is CONDITION 1's
 // refinement half (#3026): the second consumer of the shared rule set must not
 // be BLOCKED by the new advisory. It asserts the non-blocked OUTCOME directly —

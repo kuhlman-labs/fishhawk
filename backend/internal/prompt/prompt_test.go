@@ -10972,6 +10972,13 @@ func TestBuild_Plan_UndecidableCriteriaGuardrail(t *testing.T) {
 		"`skip_expected: true` with an `expectation_basis`",
 		"ADVISORY finding",
 		"is exempt from the check",
+		// #3163: the verify_hint exemption for a hermetic external-trigger check,
+		// and the not-exemptible live TARGET.
+		"The check ALSO consults your `verify_hint`",
+		"exempts a criterion whose statement names an external TRIGGER",
+		"a live MCP client, a real operator session, a real webhook delivery",
+		"A LIVE forge/deploy/external TARGET is NOT exemptible that way",
+		"never mark a sandbox-decidable check `skip_expected`",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("plan prompt missing undecidable-criteria guardrail %q:\n%s", want, got)

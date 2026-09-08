@@ -3987,7 +3987,13 @@ func buildPlan(t Trigger) string {
 		"ADVISORY finding on the plan-review gate evidence; it does not reject the plan (a criterion may name a capability in prose " +
 		"and still be drivable), but a finding you left unaddressed is a question the approver will ask. A criterion you already " +
 		"marked `skip_expected` with a basis, or `requires_live_validation`, is exempt from the check — the marking IS the " +
-		"declaration.\n")
+		"declaration. The check ALSO consults your `verify_hint`: a hint that names an in-repository / repository-local harness " +
+		"(a `_test.go` file, `go test`, a hermetic same-process test) exempts a criterion whose statement names an external TRIGGER " +
+		"capability — a live MCP client, a real operator session, a real webhook delivery — because a hermetic in-process test " +
+		"genuinely CAN fabricate that trigger. A LIVE forge/deploy/external TARGET is NOT exemptible that way: no in-repository " +
+		"harness stands one up, so it keeps firing regardless of the hint. So for a hermetic check the correct fix is to NAME its " +
+		"harness in `verify_hint` — never mark a sandbox-decidable check `skip_expected`, which skips verification the executor " +
+		"could actually perform.\n")
 	b.WriteString("\n")
 	b.WriteString("Cross-boundary test rule: when scope.files spans multiple architectural layers (request/response " +
 		"payload, domain type, persistence, render/consumer), verification.test_strategy MUST name an " +

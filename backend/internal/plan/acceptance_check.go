@@ -39,10 +39,13 @@ const (
 	// capability the sandboxed acceptance executor does not have (#2512,
 	// layer 3). It is ADVISORY: it never refuses a plan, because a criterion
 	// may legitimately name a capability in prose while still being drivable.
-	// Its purpose is preventive — an author who sees it up front marks the
-	// criterion skip_expected + expectation_basis (or
-	// requires_live_validation) instead of shipping it to an executor that
-	// can only report it undecidable.
+	// Its purpose is preventive — an author who sees it up front declares the
+	// criterion up front. For a genuinely undecidable capability that means
+	// skip_expected + expectation_basis (or requires_live_validation); but for
+	// a hermetic in-process check of an external TRIGGER the correct fix is to
+	// NAME its in-repository harness in verify_hint (#3163), which suppresses
+	// the finding rather than skipping a check the executor could actually
+	// perform. See UnevaluableCriteria for the conjunctive suppression.
 	RuleUndecidableCriterion = "undecidable_criterion"
 	// RuleMissingLiveValidationMarker flags a criterion whose STATEMENT names a
 	// LIVE forge/deploy/external TARGET but which is NOT marked
@@ -112,7 +115,15 @@ const (
 //     the sandboxed acceptance executor lacks (a live MCP client, a real
 //     operator session, a running external instance, a live forge round-trip, a
 //     real webhook delivery), and which is NOT already marked skip_expected
-//     with a basis or requires_live_validation. Advisory only.
+//     with a basis or requires_live_validation. As of #3163 it ALSO exempts a
+//     NON-liveTarget capability match whose verify_hint (verify_hint alone —
+//     never expectation_basis, never the statement) names an in-repository /
+//     repository-local harness: a hermetic in-process test genuinely CAN drive
+//     an external TRIGGER (an MCP client, an operator session, a webhook
+//     delivery), so a named harness is positive evidence the executor can
+//     decide the criterion. A liveTarget capability (a live forge/deploy/
+//     external instance) is never exempted this way — no in-repository harness
+//     stands one up (#2845 preserved). Advisory only.
 //   - missing_live_validation_marker — a criterion whose statement names a LIVE
 //     forge/deploy/external TARGET and which is NOT marked
 //     requires_live_validation. Its exemption is that marker ALONE:
@@ -502,7 +513,26 @@ var unevaluableCapabilities = []unevaluableCapability{
 // ExpectationBasis, or RequiresLiveValidation, is NOT flagged: those are the
 // SANCTIONED declarations of exactly this condition. Re-flagging a criterion
 // whose author already did the right thing trains the operator to ignore the
-// rule, which is how an advisory rule dies.
+// rule, which is how an advisory rule dies. criterionDeclaresUnevaluable runs
+// first and applies that exemption unchanged.
+//
+// VERIFY-HINT SUPPRESSION (#3163). After a corpus phrase matches, the finding
+// is additionally suppressed when the matched capability is NOT a liveTarget
+// AND the criterion's verify_hint names an in-repository / repository-local
+// harness (verifyHintDeclaresInRepo). The conjunction is load-bearing:
+//   - !liveTarget preserves #2845 — no in-repository harness can stand up a
+//     live forge/deploy/external instance, so those keep firing regardless of
+//     the hint. Only the external-TRIGGER classes (a live MCP client, a real
+//     operator session, a real webhook delivery), which a hermetic in-process
+//     test genuinely can fabricate, become suppressible.
+//   - verifyHintDeclaresInRepo reads verify_hint ALONE — positive evidence the
+//     sandboxed executor CAN decide the criterion (buildAcceptance's Posture B
+//     sanctions repository-local validation on exactly that signal).
+//
+// The suppression uses `continue`, NOT `break`: a suppressed non-liveTarget
+// match must not stop the scan, so a LATER liveTarget capability in the SAME
+// statement still fires. The emit path keeps the original `break` (one
+// criterion, one finding, first capability in corpus order).
 //
 // ADVISORY ONLY. The finding never refuses a plan — a criterion may
 // legitimately name a capability in prose while being perfectly drivable.
@@ -518,11 +548,24 @@ func UnevaluableCriteria(v Verification) []AcceptanceFinding {
 			if !containsAnyPhrase(statement, uc.phrases) {
 				continue
 			}
+			// #3163: a non-liveTarget capability whose verify_hint names an
+			// in-repository harness is sandbox-decidable. continue (not break)
+			// so a later liveTarget capability in the same statement still fires.
+			if !uc.liveTarget && verifyHintDeclaresInRepo(c) {
+				continue
+			}
+			detail := "criterion statement requires " + uc.capability +
+				", which the sandboxed acceptance executor does not have; mark it skip_expected with an expectation_basis (or requires_live_validation) so it is declared up front rather than reported undecidable at acceptance"
+			if !uc.liveTarget {
+				// #3163 conditional guidance, mirroring the #3016 precedent on the
+				// sibling rule. Left BYTE-IDENTICAL for a liveTarget match so a
+				// live-target plan's audit payload bytes do not move.
+				detail += ". If this criterion is in fact verified by an in-repository / in-process harness, name that harness in verify_hint rather than marking it skip_expected — marking a sandbox-decidable check skips verification the executor could actually perform (#3163)"
+			}
 			findings = append(findings, AcceptanceFinding{
 				Rule:        RuleUndecidableCriterion,
 				CriterionID: c.ID,
-				Detail: "criterion statement requires " + uc.capability +
-					", which the sandboxed acceptance executor does not have; mark it skip_expected with an expectation_basis (or requires_live_validation) so it is declared up front rather than reported undecidable at acceptance",
+				Detail:      detail,
 			})
 			break
 		}
@@ -949,9 +992,55 @@ func everyLiveTargetAnchorNegated(anchors []int, tokens []string) bool {
 // ExpectationBasis joined — NEVER the statement, whose prose is what the
 // matchers already judged and which an author could otherwise use to talk the
 // rule out of firing.
+//
+// DELIBERATELY NOT SHARED with verifyHintDeclaresInRepo (#3163). The two answer
+// different questions: this one asks whether a polarity-NEGATED live-target
+// assertion is verified in-repository (a both-fields question — a negated live
+// dependency is legitimately documented in either verify_hint or
+// expectation_basis), while verifyHintDeclaresInRepo asks whether a
+// sandbox-decidable external TRIGGER's harness is NAMED in the hint (a
+// hint-only question — reading expectation_basis there would let an unmarked,
+// genuinely-undecidable criterion escape the finding by citing a test). Merging
+// them would import expectation_basis into the #3163 evidence and reopen that
+// hole, so they are kept separate and independently listed.
 func hasInRepoVerification(c AcceptanceCriterion) bool {
 	stated := strings.ToLower(c.VerifyHint + " " + c.ExpectationBasis)
 	return containsAnyPhrase(stated, inRepoVerificationMarkers)
+}
+
+// verifyHintHarnessMarkers name an in-repository / repository-local harness in
+// HINT-SHAPED prose that inRepoVerificationMarkers (a list of concrete
+// test-harness tokens) does not carry. They are a SEPARATE list, consulted only
+// by verifyHintDeclaresInRepo (#3163), so the #3016 conjunct-S list
+// inRepoVerificationMarkers does not silently grow to carry them and change that
+// rule's suppression surface.
+var verifyHintHarnessMarkers = []string{
+	"scripts/test", "in-repository", "repository-local", "hermetic",
+	"signs its own", "no live forge", "no live network", "same-process",
+}
+
+// verifyHintDeclaresInRepo is the #3163 evidence predicate: the criterion's
+// verify_hint — and ONLY verify_hint — names an in-repository / repository-local
+// verification harness. It is what UnevaluableCriteria consults to suppress a
+// NON-liveTarget undecidable_criterion finding.
+//
+// WHY IT READS ONLY VerifyHint:
+//   - expectation_basis is the field that ACCOMPANIES a skip DECLARATION, and
+//     that shape is already exempt via criterionDeclaresUnevaluable. Reading it
+//     here would let an unmarked, genuinely-undecidable criterion cite an
+//     integration test and escape the very finding that exists to force its
+//     marking.
+//   - the STATEMENT is the prose the matcher already judged; admitting it as
+//     evidence would let an author talk the rule out of firing in the same text
+//     the rule keys on.
+//
+// It is DELIBERATELY NOT hasInRepoVerification and shares nothing with it beyond
+// the inRepoVerificationMarkers list — see that predicate's comment for why the
+// two answer different questions and must not be merged.
+func verifyHintDeclaresInRepo(c AcceptanceCriterion) bool {
+	hint := strings.ToLower(c.VerifyHint)
+	return containsAnyPhrase(hint, inRepoVerificationMarkers) ||
+		containsAnyPhrase(hint, verifyHintHarnessMarkers)
 }
 
 // liveTargetCorpusMatch is M1: the statement names a live TARGET via a phrase
