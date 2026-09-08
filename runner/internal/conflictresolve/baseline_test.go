@@ -1,6 +1,9 @@
 package conflictresolve
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const resolvedTwoWay = "alpha\nbeta\nours\ngamma\n"
 
@@ -18,7 +21,7 @@ func fixture() (Baseline, Observed) {
 			"autostaged.go": {Mode: "100644", OID: "oid-autostaged"},
 		},
 		Conflicted: map[string]ConflictedFile{
-			"conflict.go": {Kind: KindContent, MarkerBytes: []byte(twoWay)},
+			"conflict.go": {Kind: KindContent, MarkerBytes: []byte(twoWay), Mode: ModeRegular},
 		},
 	}
 	obs := Observed{
@@ -35,6 +38,9 @@ func fixture() (Baseline, Observed) {
 		Unstaged:  []string{"conflict.go"},
 		Untracked: nil,
 		Working:   map[string][]byte{"conflict.go": []byte(resolvedTwoWay)},
+		// The mode git left on the conflicted path, read back in the same
+		// pass as its bytes.
+		WorkingMode: map[string]string{"conflict.go": ModeRegular},
 	}
 	return base, obs
 }
@@ -152,6 +158,7 @@ func TestVerify_NamesOneReasonPerRule(t *testing.T) {
 				b.Conflicted["conflict.go"] = ConflictedFile{
 					Kind:        KindContent,
 					MarkerBytes: []byte("alpha\n<<<<<<< HEAD\nours\n"),
+					Mode:        ModeRegular,
 				}
 			},
 			reason: ReasonMalformedMarkers,
@@ -160,7 +167,7 @@ func TestVerify_NamesOneReasonPerRule(t *testing.T) {
 		{
 			name: "binary conflict is refused whatever the bytes",
 			mutate: func(b *Baseline, o *Observed) {
-				b.Conflicted["conflict.go"] = ConflictedFile{Kind: KindBinary}
+				b.Conflicted["conflict.go"] = ConflictedFile{Kind: KindBinary, Mode: ModeRegular}
 				o.Working["conflict.go"] = []byte("\x00\x01ours")
 			},
 			reason: ReasonBinaryConflict,
@@ -172,6 +179,7 @@ func TestVerify_NamesOneReasonPerRule(t *testing.T) {
 				b.Conflicted["conflict.go"] = ConflictedFile{
 					Kind:  KindDeleteModify,
 					Sides: [][]byte{[]byte("modified\n")},
+					Mode:  ModeRegular,
 				}
 				o.Working["conflict.go"] = []byte("invented\n")
 			},
@@ -215,11 +223,13 @@ func TestVerify_AcceptsDeleteModifyResolutions(t *testing.T) {
 			base.Conflicted["conflict.go"] = ConflictedFile{
 				Kind:  KindDeleteModify,
 				Sides: [][]byte{[]byte("modified\n")},
+				Mode:  ModeRegular,
 			}
 			if tc.present {
 				obs.Working["conflict.go"] = []byte(tc.content)
 			} else {
 				delete(obs.Working, "conflict.go")
+				delete(obs.WorkingMode, "conflict.go")
 			}
 			if got := Verify(base, obs); len(got) != 0 {
 				t.Fatalf("Verify returned %v, want no violations", got)
@@ -314,5 +324,66 @@ func TestVerify_ReportsEveryBrokenRuleInDeterministicOrder(t *testing.T) {
 				t.Fatalf("violation %d = {%q %q}, want {%q %q}", j, got[j].Reason, got[j].Path, want[j].Reason, want[j].Path)
 			}
 		}
+	}
+}
+
+// TestVerify_RefusesAnExecutableBitOnAConflictedPath is the BEHAVIORAL refusal
+// test for the mode rule (#3202 review). The agent resolves the conflict
+// perfectly — the bytes are the accepted `keeps ours` resolution — and only
+// chmods the file executable WITHOUT staging it. Every other gate input is
+// identical to the clean fixture: HEAD, MERGE_HEAD, the merge message and the
+// index all match, the path is still unmerged, and its unstaged working-tree
+// change is permitted because it is IN the conflicted set. So nothing but the
+// mode rule can refuse, and the scoped `git add` would otherwise commit the
+// executable bit.
+func TestVerify_RefusesAnExecutableBitOnAConflictedPath(t *testing.T) {
+	base, obs := fixture()
+	obs.WorkingMode["conflict.go"] = ModeExecutable
+
+	got := Verify(base, obs)
+	if len(got) != 1 || got[0].Reason != ReasonConflictedModeChanged || got[0].Path != "conflict.go" {
+		t.Fatalf("Verify = %v, want one %q on conflict.go", got, ReasonConflictedModeChanged)
+	}
+	if !strings.Contains(got[0].Detail, ModeExecutable) || !strings.Contains(got[0].Detail, ModeRegular) {
+		t.Fatalf("detail %q names neither the observed nor the baseline mode", got[0].Detail)
+	}
+}
+
+// TestVerify_RefusesASymlinkSwapOnAConflictedPath covers the other mode shape:
+// a conflicted regular file replaced by a symlink. The bytes are refused too,
+// so the assertion is that the METADATA reason is reported ALONGSIDE the
+// content one rather than being masked by it.
+func TestVerify_RefusesASymlinkSwapOnAConflictedPath(t *testing.T) {
+	base, obs := fixture()
+	obs.Working["conflict.go"] = []byte("/etc/passwd")
+	obs.WorkingMode["conflict.go"] = ModeSymlink
+
+	got := Verify(base, obs)
+	var sawMode bool
+	for _, v := range got {
+		if v.Reason == ReasonConflictedModeChanged && v.Path == "conflict.go" {
+			sawMode = true
+		}
+	}
+	if !sawMode {
+		t.Fatalf("Verify = %v, want a %q on conflict.go", got, ReasonConflictedModeChanged)
+	}
+}
+
+// TestVerify_AcceptsAnUnchangedModeOnADeleteModifyDeletion pins the rule's
+// SKIP: a path resolved by deletion has no working-tree mode to compare, and
+// the absent observation must not read as a mode change.
+func TestVerify_AcceptsAnUnchangedModeOnADeleteModifyDeletion(t *testing.T) {
+	base, obs := fixture()
+	base.Conflicted["conflict.go"] = ConflictedFile{
+		Kind:  KindDeleteModify,
+		Sides: [][]byte{[]byte("modified\n")},
+		Mode:  ModeRegular,
+	}
+	delete(obs.Working, "conflict.go")
+	delete(obs.WorkingMode, "conflict.go")
+
+	if got := Verify(base, obs); len(got) != 0 {
+		t.Fatalf("Verify returned %v, want no violations", got)
 	}
 }

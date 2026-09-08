@@ -490,6 +490,39 @@ func TestConflictResolve_RefusesResidualMarker(t *testing.T) {
 	}, string(conflictresolve.ReasonResidualMarker))
 }
 
+// TestConflictResolve_RefusesExecutableBitOnConflictedPath is the BEHAVIORAL
+// refusal test for the file-mode rule (#3202 review).
+//
+// The stub agent resolves the conflict HONESTLY — the bytes it writes are the
+// same accepted resolution the happy-path test commits — and additionally
+// chmods the file executable without staging it. Every other gate input is
+// therefore identical to the accepted case: HEAD, MERGE_HEAD and the merge
+// message are untouched, no index entry moved, the path is still unmerged, and
+// its working-tree change is permitted because the path IS the conflicted set.
+// Only the mode rule can refuse, and without it the scoped `git add` would
+// stage the executable bit into the merge commit.
+func TestConflictResolve_RefusesExecutableBitOnConflictedPath(t *testing.T) {
+	r := newConflictRepo(t, "file.txt")
+	runRefusalCase(t, r, func(_ context.Context, dir string) error {
+		resolveConflictedFile(t, dir, r.conflictPath)
+		return os.Chmod(filepath.Join(dir, r.conflictPath), 0o755)
+	}, string(conflictresolve.ReasonConflictedModeChanged))
+}
+
+// TestConflictResolve_RefusesSymlinkSwapOnConflictedPath covers the other mode
+// shape an unstaged working-tree write can reach: the conflicted regular file
+// is replaced by a symlink, which `git add` would commit as a 120000 entry.
+func TestConflictResolve_RefusesSymlinkSwapOnConflictedPath(t *testing.T) {
+	r := newConflictRepo(t, "file.txt")
+	runRefusalCase(t, r, func(_ context.Context, dir string) error {
+		full := filepath.Join(dir, r.conflictPath)
+		if err := os.Remove(full); err != nil {
+			return err
+		}
+		return os.Symlink("/etc/passwd", full)
+	}, string(conflictresolve.ReasonConflictedModeChanged))
+}
+
 // TestConflictResolve_RefusesConflictedPathMissing pins the deletion rule for a
 // CONTENT conflict: only a delete/modify conflict may be resolved by deletion.
 func TestConflictResolve_RefusesConflictedPathMissing(t *testing.T) {

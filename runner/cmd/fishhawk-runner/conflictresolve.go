@@ -296,10 +296,11 @@ func captureConflictedFile(ctx context.Context, repoDir, path string, stages []i
 		}
 		return false
 	}
-	content, present, err := readWorkingFile(repoDir, path)
+	content, mode, present, err := readWorkingFile(repoDir, path)
 	if err != nil {
 		return cf, err
 	}
+	cf.Mode = mode
 	if has(2) && has(3) {
 		if present && conflictresolve.ContainsMarkerLine(content) {
 			cf.Kind = conflictresolve.KindContent
@@ -366,13 +367,15 @@ func observeState(ctx context.Context, repoDir string, base conflictresolve.Base
 	}
 	sort.Strings(obs.Unmerged)
 	obs.Working = make(map[string][]byte, len(base.Conflicted))
+	obs.WorkingMode = make(map[string]string, len(base.Conflicted))
 	for path := range base.Conflicted {
-		content, present, err := readWorkingFile(repoDir, path)
+		content, mode, present, err := readWorkingFile(repoDir, path)
 		if err != nil {
 			return obs, err
 		}
 		if present {
 			obs.Working[path] = content
+			obs.WorkingMode[path] = mode
 		}
 	}
 	return obs, nil
@@ -401,15 +404,47 @@ func readMergeMessage(ctx context.Context, repoDir string) (string, error) {
 // unreadable — the deletion side of a delete/modify conflict is expressed by
 // absence, so collapsing the two would accept a deletion of any conflicted
 // path.
-func readWorkingFile(repoDir, path string) ([]byte, bool, error) {
-	b, err := os.ReadFile(filepath.Join(repoDir, filepath.FromSlash(path)))
+//
+// It returns the path's FILE MODE alongside its bytes, from the same pass, so
+// the gate can hold the metadata the scoped `git add` will stage to the
+// baseline as well: the resolution contract is bytes-only, and an execute bit
+// set on a conflicted file (or a regular file swapped for a symlink) never
+// reaches the index or the content check, yet is committed by the add.
+//
+// The stat is an Lstat, so a symlink is reported AS a symlink rather than
+// followed. A path that is neither a regular file nor a symlink is an error,
+// not an absence: it is not a resolution shape the gate can authorize.
+func readWorkingFile(repoDir, path string) ([]byte, string, bool, error) {
+	full := filepath.Join(repoDir, filepath.FromSlash(path))
+	fi, err := os.Lstat(full)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, false, nil
+			return nil, "", false, nil
 		}
-		return nil, false, fmt.Errorf("read %s: %w", path, err)
+		return nil, "", false, fmt.Errorf("stat %s: %w", path, err)
 	}
-	return b, true, nil
+	switch {
+	case fi.Mode()&os.ModeSymlink != 0:
+		target, err := os.Readlink(full)
+		if err != nil {
+			return nil, "", false, fmt.Errorf("read link %s: %w", path, err)
+		}
+		return []byte(target), conflictresolve.ModeSymlink, true, nil
+	case !fi.Mode().IsRegular():
+		return nil, "", false, fmt.Errorf("read %s: not a regular file (%s)", path, fi.Mode())
+	}
+	b, err := os.ReadFile(full)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, "", false, nil
+		}
+		return nil, "", false, fmt.Errorf("read %s: %w", path, err)
+	}
+	mode := conflictresolve.ModeRegular
+	if fi.Mode().Perm()&0o111 != 0 {
+		mode = conflictresolve.ModeExecutable
+	}
+	return b, mode, true, nil
 }
 
 // gitUnmergedPaths returns every unmerged path with the index stages git

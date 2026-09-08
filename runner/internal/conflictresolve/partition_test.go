@@ -29,6 +29,14 @@ const (
 	crlf = "alpha\r\n" +
 		"<<<<<<< HEAD\r\nours\r\n=======\r\ntheirs\r\n>>>>>>> origin/main\r\n" +
 		"gamma\r\n"
+	// nearMarkerTail ends with a SIX-character run, which is ordinary content
+	// and so belongs to the trailing non-conflict segment. It is the fixture
+	// for the boundary-crossing residual marker: a replacement contributing a
+	// single `<` immediately before it completes a seven-character opening
+	// marker across the replacement/segment boundary.
+	nearMarkerTail = "before\n" +
+		"<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> base\n" +
+		"<<<<<< HEAD\n"
 )
 
 func TestPartition(t *testing.T) {
@@ -122,6 +130,8 @@ func TestAcceptResolution(t *testing.T) {
 		{"no conflict block, any edit at all", "alpha\nbeta\n", "alpha\nbeta\ngamma\n", ReasonOutsideHunk},
 
 		{"leaves the file exactly as git wrote it", twoWay, twoWay, ReasonResidualMarker},
+		{"completes a marker across the replacement/segment boundary", nearMarkerTail, "before\n<<<<<<< HEAD\n", ReasonResidualMarker},
+		{"preserved six-character run is content, not a marker", nearMarkerTail, "before\nours\n<<<<<< HEAD\n", ReasonNone},
 		{"leaves a separator inside the hunk", twoWay, "alpha\nbeta\nours\n=======\ntheirs\ngamma\n", ReasonResidualMarker},
 		{"leaves a diff3 base marker inside the hunk", diff3, diff3, ReasonResidualMarker},
 	}
@@ -149,6 +159,49 @@ func TestAcceptResolution_RejectsMutatedNonConflictSegment(t *testing.T) {
 func TestAcceptResolution_RejectsResidualMarker(t *testing.T) {
 	if got := AcceptResolution([]byte(twoWay), []byte(twoWay)); got != ReasonResidualMarker {
 		t.Fatalf("AcceptResolution = %q, want %q", got, ReasonResidualMarker)
+	}
+}
+
+// TestAcceptResolution_RejectsMarkerFormedAcrossASegmentBoundary is the
+// dedicated counterfactual vehicle for the boundary-crossing residual-marker
+// rule (#3202 review).
+//
+// The resolution is `seg0 + "<" + seg1`: it preserves every non-conflict
+// segment verbatim and in order, so the partition rule accepts it, and the
+// replacement region is the single byte `<`, which carries no marker line of
+// its own. Only a rule that classifies the marker lines of the RESULTING FILE
+// — and asks whether one INTERSECTS the replacement — can refuse it. The
+// resulting file's second line is `<<<<<<< HEAD`, an opening conflict marker,
+// which is exactly the artifact the gate exists to keep out of the commit.
+func TestAcceptResolution_RejectsMarkerFormedAcrossASegmentBoundary(t *testing.T) {
+	segs, err := Partition([]byte(nearMarkerTail))
+	if err != nil {
+		t.Fatalf("Partition: unexpected error %v", err)
+	}
+	resolved := string(segs[0]) + "<" + string(segs[1])
+	if !ContainsMarkerLine([]byte(resolved)) {
+		t.Fatalf("fixture is wrong: %q carries no marker line", resolved)
+	}
+	if ContainsMarkerLine([]byte("<")) {
+		t.Fatalf("fixture is wrong: the replacement region itself carries a marker line")
+	}
+	if got := AcceptResolution([]byte(nearMarkerTail), []byte(resolved)); got != ReasonResidualMarker {
+		t.Fatalf("AcceptResolution(%q) = %q, want %q", resolved, got, ReasonResidualMarker)
+	}
+}
+
+// TestAcceptResolution_AcceptsAMarkerLineWhollyInsideAPreservedSegment pins
+// the other half of the boundary rule: tightening it must not start refusing
+// a marker-shaped line the repository legitimately owns. `leadingSep` opens
+// with a line of seven equals signs OUTSIDE any conflict block, and the
+// accepted resolution preserves it.
+func TestAcceptResolution_AcceptsAMarkerLineWhollyInsideAPreservedSegment(t *testing.T) {
+	resolved := "=======\nalpha\nours\nend\n"
+	if !ContainsMarkerLine([]byte(resolved)) {
+		t.Fatalf("fixture is wrong: %q carries no marker-shaped line", resolved)
+	}
+	if got := AcceptResolution([]byte(leadingSep), []byte(resolved)); got != ReasonNone {
+		t.Fatalf("AcceptResolution = %q, want %q", got, ReasonNone)
 	}
 }
 

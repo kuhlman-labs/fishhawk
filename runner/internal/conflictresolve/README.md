@@ -53,6 +53,16 @@ A passing gate proves:
   change and no untracked path outside it.
 - **Each conflicted file changed only inside its conflicted hunks** — the
   partition check below.
+- **Each conflicted file's MODE is the one git left.** The resolution contract
+  is bytes-only, but the scoped `git add` stages mode alongside content, so an
+  execute bit set on a conflicted file — or a regular file swapped for a
+  symlink — would reach the commit without ever appearing in the index or in
+  the content check. The mode is captured in the same pass as the bytes and
+  compared per path. Residual, stated: the comparison is over the filesystem
+  mode, not over `core.fileMode`, so on a repository configured with
+  `core.fileMode=false` a mode change git would NOT have recorded still
+  refuses. That direction is deliberate — the refusal aborts the merge and
+  hands the conflict back to the operator, which is the fail-closed side.
 
 ## What the gate deliberately does NOT prove
 
@@ -99,16 +109,24 @@ equals signs partitions as ordinary content rather than as a malformed file.
 resolvedBytes == seg0 + X1 + seg1 + ... + XN + segN
 ```
 
-for some replacement regions `X1..XN`, and **no Xi carries a residual marker
-line**. That is hunk-level confinement: every byte the agent wrote lies inside
-a region git itself marked as conflicted, and every byte git did not mark is
-preserved verbatim and in order.
+for some replacement regions `X1..XN`, and **no conflict-marker line of the
+RESULTING FILE intersects any Xi**. That is hunk-level confinement: every byte
+the agent wrote lies inside a region git itself marked as conflicted, every
+byte git did not mark is preserved verbatim and in order, and no opening
+marker survives into the committed file.
 
 Two details are load-bearing:
 
-- **The residual-marker check applies to the Xi, not to the whole file.** A
-  repository may legitimately contain a line of seven equals signs; it lives
-  in a segment and survives into every accepted resolution.
+- **The residual-marker check is over the PHYSICAL LINES OF THE RESULTING
+  FILE, restricted to the lines an Xi INTERSECTS — not over the substring Xi
+  in isolation, and not over the whole file.** Checking `Xi` in isolation
+  misses a marker line assembled ACROSS a boundary: a replacement contributing
+  a lone `<` immediately before a preserved `<<<<<< HEAD` line yields
+  `<<<<<<< HEAD` in the committed file while neither piece carries a marker on
+  its own. Checking the whole file would instead refuse content a repository
+  legitimately owns — a line of seven equals signs lying WHOLLY inside a
+  preserved segment is still accepted, and survives into every accepted
+  resolution.
 - **The match is a reachable-position sweep, not a greedy scan.** A segment
   may occur again inside a resolution, and the earliest match can be the wrong
   one. The sweep is bounded by a step budget and **fails closed** with
@@ -143,8 +161,9 @@ backend which rule refused rather than reporting a generic failure.
 | `conflict_resolution_unstaged_change_outside_set` | a working-tree change outside the conflicted set |
 | `conflict_resolution_untracked_path_outside_set` | an untracked path outside the conflicted set |
 | `conflict_resolution_conflicted_path_missing` | a textually conflicted path was deleted |
+| `conflict_resolution_conflicted_mode_changed` | a conflicted path's file mode differs from the one git left (an execute bit, or a symlink swap) |
 | `conflict_resolution_outside_hunk` | the resolution does not preserve the non-conflict segments in order |
-| `conflict_resolution_residual_marker` | a replacement region still carries a marker line |
+| `conflict_resolution_residual_marker` | a marker line of the resulting file intersects a replacement region |
 | `conflict_resolution_malformed_markers` | the captured file is not a well-formed sequence of conflict blocks |
 | `conflict_resolution_partition_undecidable` | the segment match exhausted its step budget |
 | `conflict_resolution_binary_conflict` | git could not merge the file textually |

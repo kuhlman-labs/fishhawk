@@ -21,6 +21,18 @@ const (
 	KindBinary
 )
 
+// The git file modes a working-tree path may carry into a commit. The gate
+// compares these STRINGS rather than an os.FileMode so a captured baseline and
+// a later observation are comparable as plain data.
+const (
+	// ModeRegular is a non-executable regular file.
+	ModeRegular = "100644"
+	// ModeExecutable is a regular file carrying any execute bit.
+	ModeExecutable = "100755"
+	// ModeSymlink is a symbolic link.
+	ModeSymlink = "120000"
+)
+
 // IndexEntry is a stage-0 index entry: the mode and object id git recorded.
 type IndexEntry struct {
 	Mode string
@@ -37,6 +49,11 @@ type ConflictedFile struct {
 	// deletion itself is expressed by the path being absent from the working
 	// tree, not by an entry here.
 	Sides [][]byte
+	// Mode is the working-tree file mode git left on the path, empty when the
+	// path is absent. The agent's authority over a conflicted path is over its
+	// BYTES only, so the mode the scoped `git add` will stage must still be
+	// the one git itself produced.
+	Mode string
 }
 
 // Baseline is the merge state git produced, captured in ONE read immediately
@@ -79,6 +96,9 @@ type Observed struct {
 	// Working holds the working-tree bytes of each path present on disk that
 	// the caller read back for the conflicted set.
 	Working map[string][]byte
+	// WorkingMode holds the file mode of those same paths, read back in the
+	// SAME pass as their bytes.
+	WorkingMode map[string]string
 }
 
 // Baseline-verification reasons.
@@ -118,6 +138,12 @@ const (
 	// from the working tree. Only a delete/modify conflict may be resolved by
 	// deletion.
 	ReasonConflictedPathMissing Reason = "conflict_resolution_conflicted_path_missing"
+	// ReasonConflictedModeChanged means a conflicted path's FILE MODE differs
+	// from the one git left. The resolution contract is bytes-only, and the
+	// scoped `git add` stages mode alongside content, so an executable bit or
+	// a regular-file-to-symlink swap would otherwise reach the commit without
+	// ever appearing in the index or in a content check.
+	ReasonConflictedModeChanged Reason = "conflict_resolution_conflicted_mode_changed"
 )
 
 // Violation is one refusal: a named reason plus the path it concerns (empty
@@ -205,6 +231,16 @@ func Verify(base Baseline, obs Observed) []Violation {
 	for _, path := range sortedKeys(base.Conflicted) {
 		cf := base.Conflicted[path]
 		content, present := obs.Working[path]
+		if present {
+			// The mode is checked SEPARATELY from the content: a conflicted
+			// path may legitimately carry unstaged working-tree changes, so
+			// the non-conflicted index sweep above never sees it, and an
+			// accepted byte-level resolution says nothing about the metadata
+			// the scoped `git add` will stage with it.
+			if mode := obs.WorkingMode[path]; mode != cf.Mode {
+				add(ReasonConflictedModeChanged, path, fmt.Sprintf("file mode %s != baseline %s", displayMode(mode), displayMode(cf.Mode)))
+			}
+		}
 		if r := acceptConflict(cf, content, present); r != ReasonNone {
 			add(r, path, "resolution refused by the hunk-level partition check")
 		}
@@ -237,6 +273,15 @@ func acceptConflict(cf ConflictedFile, content []byte, present bool) Reason {
 		}
 		return AcceptResolution(cf.MarkerBytes, content)
 	}
+}
+
+// displayMode renders a captured mode for a refusal message, naming an
+// UNREADABLE or absent mode explicitly rather than printing an empty string.
+func displayMode(mode string) string {
+	if mode == "" {
+		return "(none)"
+	}
+	return mode
 }
 
 func sortedKeys[V any](m map[string]V) []string {
