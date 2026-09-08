@@ -39,7 +39,7 @@ failure instead of a silent reordering.
 |---|---|
 | Start here | what Fishhawk is · what it is not · your first run |
 | Concepts | glossary · workflow · stage · gate · constraint · plan · audit log |
-| Operating | driving a run · deciding at a gate · advisory reviews · when a run fails · tuning autonomy |
+| Operating | driving a run · deciding at a gate · advisory reviews · when a run fails · tracing a run · tuning autonomy |
 | Reference | landing + spec-major support table · workflow spec · plan schema · CLI · API · versioning |
 
 The four Reference **surface** pages — workflow spec, plan schema, CLI, API — are
@@ -59,7 +59,12 @@ the IA is unchanged. The Operating section is no longer among the stubs: [E12.3
 stubs with full pages and added advisory reviews and tuning autonomy, so all five
 Operating subjects are written. `start/first-run.md` was filled earlier by [E12.2
 (#2262)](https://github.com/kuhlman-labs/fishhawk/issues/2262) with the full
-install-to-merge walkthrough.
+install-to-merge walkthrough. [E12.7
+(#2318)](https://github.com/kuhlman-labs/fishhawk/issues/2318) added
+`operating/tracing.md`, documenting the runner's OpenTelemetry export as a
+vendor-neutral capability and which runner kinds the collector endpoint is
+reachable from; this is the one Operating page added to the sidebar since the
+section was written, so the IA gains a row rather than being unchanged.
 
 ## Versioning and spec majors, in one line
 

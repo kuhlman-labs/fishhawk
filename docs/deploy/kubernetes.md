@@ -274,6 +274,13 @@ scope (decided against on #853), keeping the chart image-build-free per #846.
 
 ## Tracing (Jaeger)
 
+This section is the **local dev / dogfooding** tracing path — running Jaeger in
+your Docker-Desktop cluster to inspect your own runs. For the vendor-neutral
+capability itself — the single `OTEL_EXPORTER_OTLP_ENDPOINT` switch, export to
+any OTLP-compatible backend, and the runner-kind reachability matrix — see the
+public [Operating >
+Tracing](https://kuhlman-labs.github.io/fishhawk/operating/tracing/) page.
+
 `values-local.yaml` enables an in-cluster **Jaeger all-in-one** (`jaeger.enabled`)
 — the k8s analog of the opt-in `otel` profile in `docker-compose.yml`, and the
 local OTLP collector for the runner's per-run GenAI trace spans (the `stage`/`chat`

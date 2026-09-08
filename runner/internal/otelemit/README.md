@@ -8,7 +8,9 @@ Emission is gated by `OTEL_EXPORTER_OTLP_ENDPOINT`: unset = a no-op disabled Emi
 
 ## Span shape
 
-Per run: a `stage <name>` parent span (attrs `fishhawk.run_id`, `fishhawk.stage`) with a `chat <model>` child carrying GenAI-semconv attrs (`gen_ai.system=anthropic`, `gen_ai.operation.name=chat`, `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens`, optional `gen_ai.request.temperature`) plus `fishhawk.*` cost/repro attrs (`cost.usd`, `cost.estimated`, `cost.priced`, `pricing.as_of`, `latency_ms`, `repro.temperature_available`).
+Per run: a `stage <name>` parent span (attrs `fishhawk.run_id`, `fishhawk.stage`) with a `chat <model>` child carrying GenAI-semconv attrs (`gen_ai.system=anthropic`, `gen_ai.operation.name=chat`, `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens`, optional `gen_ai.request.temperature`) plus `fishhawk.*` cost/repro attrs (`fishhawk.cost.usd`, `fishhawk.cost.estimated`, `fishhawk.cost.priced`, `fishhawk.pricing.as_of`, `fishhawk.latency_ms`, `fishhawk.repro.temperature_available`). The keys are spelled fully qualified because that is exactly what `EmitStage` emits and what `otelemit_test.go` asserts (`a["fishhawk.cost.usd"]`, `a["fishhawk.cost.priced"]`); the resource attribute `service.name` is `fishhawk-runner`.
+
+This README is the implementation reference. The customer-facing description of the export — the single `OTEL_EXPORTER_OTLP_ENDPOINT` switch, the vendor-neutral OTLP posture, and which runner kinds the endpoint is reachable from — is the public [Operating > Tracing](https://kuhlman-labs.github.io/fishhawk/operating/tracing/) page.
 
 Every stage of a run stitches under one deterministic trace id (`otelemit.TraceIDFromRunID`, a sha256-prefix of the run id) since each `fishhawk_run_stage` spawns a fresh short-lived runner process.
 
@@ -30,8 +32,10 @@ Operator quickstart: `docs/deploy/kubernetes.md` ("Tracing (Jaeger)").
 
 ## Execution-locality caveat
 
-The endpoint must be reachable from where the runner ACTUALLY executes. The standard dogfood loop fires `workflow_dispatch` and the runner executes on a GitHub-hosted runner (`.github/workflows/fishhawk.yml`, `runs-on: ubuntu-latest`, `uses: ./runner`), where `localhost:4318` is the CI host's loopback, not the operator's.
+The endpoint must be reachable from where the runner ACTUALLY executes, across the closed set of three runner kinds (`backend/internal/run/run.go` `ValidRunnerKinds`):
 
-End-to-end local viewing therefore requires the runner to run on a host that can reach the local collector — invoke `fishhawk-runner` locally against the local backend + collector (the documented verification path; note the `runner_kind=local` flow spawns the runner on the operator's host and so CAN reach `localhost:4318`).
+- **`local`** — the runner runs on the operator's host, so it reaches a collector on that host or network (`localhost:4318` works). This is the documented end-to-end viewing path: the `runner_kind=local` flow spawns the runner on the operator's host.
+- **`github_actions`** — the standard dogfood loop fires `workflow_dispatch` and the runner executes on a GitHub-hosted runner (`.github/workflows/fishhawk.yml`, `runs-on: ubuntu-latest`, `uses: ./runner`), where `localhost:4318` is the CI host's loopback, not the operator's. It needs a collector reachable from the CI job plus a job-level `OTEL_EXPORTER_OTLP_ENDPOINT` in the caller's own workflow file.
+- **`gitlab_ci`** — the same shape and the same requirement: the runner executes in the GitLab CI job, so the endpoint must be reachable from that job. This is a reachability consequence of where the runner runs, not an exercised end-to-end result (GitLab go-live is #2043).
 
 Exporting from the GHA job (a job-level `OTEL_EXPORTER_OTLP_ENDPOINT` + a reachable/tunneled collector) is deferred human-led `.github/workflows/**` work.
