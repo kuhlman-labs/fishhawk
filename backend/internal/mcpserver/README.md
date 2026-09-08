@@ -57,6 +57,30 @@ The sections below are the full per-tool reference, the onboarding contract,
 the operator-surface playbooks, and the package internals — moved verbatim from
 the binary README with the code.
 
+## `fishhawk_get_plan` test-sweep block: the `generated_surface` rule ([E54.67 / #3203](https://github.com/kuhlman-labs/fishhawk/issues/3203))
+
+`fishhawk_get_plan`'s `test_sweep` block decodes the newest `plan_test_sweep`
+audit entry. It carries a fourth rule id, `generated_surface`, and each finding
+carries an optional `generator` field.
+
+Read it as an operator instruction, not a note. `generated_surface` is the ONE
+rule whose `missing_tests` are **not test files**: they are DERIVED files a
+generator rewrites from the canonical source the plan scoped — a byte-exact
+generated site Reference region (`scripts/gen-site-reference`) or an embedded
+schema / preset / fixture mirror (`scripts/sync-schemas`), whichever the
+`generator` field names. Their freshness is enforced by `scripts/test verify`,
+so an unscoped derived file **cannot go green**: the implement stage would have
+to stop mid-run and spend one of its two scope amendments to touch it.
+
+So when a finding has a `generator`, scope the named derived files **at the plan
+gate** — `fishhawk_approve_plan` with `add_scope_files`, or a rejection asking
+for a replan — rather than letting the implement stage discover it. One
+canonical source can legitimately draw TWO findings with different generators
+(`docs/spec/workflow-v2.schema.json` feeds both); scope the union.
+
+The three test-file rules (`stem_sibling`, `new_test_in_tested_package`,
+`migration_walk`) omit `generator` and are unchanged.
+
 ## In-band onboarding (server `instructions` + `fishhawk://runbook`, [#1356](https://github.com/kuhlman-labs/fishhawk/issues/1356))
 
 A connecting client whose agent holds no operator memory gets enough to drive a run without a CLI alt-tab, delivered over the protocol itself:

@@ -4877,6 +4877,57 @@ func TestPlanGateEvidence_SurfaceSweepExemptionSeam(t *testing.T) {
 	}
 }
 
+// TestPlanGateEvidence_GeneratedSurfaceSeam is the second half of binding
+// approval condition 1 (#3203): it drives the REAL planGateEvidence path
+// — a serialized plan through runTestSweep, its computed payload mapped by
+// planGateEvidence, that evidence rendered by prompt.Build — and asserts
+// the rendered plan-review line names BOTH the derived file and the
+// generator. A dropped Generator copy in planGateEvidence fails here at
+// the rendered string, not merely at a struct field.
+func TestPlanGateEvidence_GeneratedSurfaceSeam(t *testing.T) {
+	cf := &contentsFake{dirs: map[string][]string{}}
+	s, _, runID := newTestSweepServer(t, cf)
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "docs/api/v0.openapi.yaml", Operation: plan.FileOpModify},
+	})
+
+	sweep := s.runTestSweep(context.Background(), runID, runID, body)
+	if sweep == nil {
+		t.Fatal("runTestSweep returned nil (fail-open) — expected a computed payload")
+	}
+	if len(sweep.Findings) != 1 || sweep.Findings[0].Generator != testSweepGeneratorSiteReference {
+		t.Fatalf("sweep payload Findings = %+v, want one finding carrying the site-reference generator", sweep.Findings)
+	}
+
+	// Payload -> evidence mapping (the server/plan.go seam under test).
+	ev := planGateEvidence(nil, nil, sweep, nil, nil)
+	if ev == nil || ev.TestSweep == nil || len(ev.TestSweep.Findings) != 1 {
+		t.Fatalf("planGateEvidence produced no TestSweep evidence: %+v", ev)
+	}
+	if got := ev.TestSweep.Findings[0].Generator; got != testSweepGeneratorSiteReference {
+		t.Fatalf("TestSweepFindingEvidence.Generator = %q, want %q (a drop in planGateEvidence)", got, testSweepGeneratorSiteReference)
+	}
+
+	// Evidence -> rendered prompt: the line must name the derived file AND
+	// the generator, which is what makes the advisory actionable.
+	parsedPlan, err := plan.Parse(body)
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	rendered, err := prompt.Build("plan_review", prompt.Trigger{
+		Repo:             "x/y",
+		ApprovedPlan:     parsedPlan,
+		PlanGateEvidence: ev,
+	})
+	if err != nil {
+		t.Fatalf("prompt.Build: %v", err)
+	}
+	const wantLine = "GENERATED SURFACE NOT IN SCOPE (generated_surface): docs/api/v0.openapi.yaml is a canonical source in scope but these DERIVED files it generates are absent from scope.files: site/src/content/docs/reference/api.md (regenerate with `scripts/gen-site-reference`)"
+	if !strings.Contains(rendered, wantLine) {
+		t.Errorf("plan-review prompt missing the generated_surface line:\nwant substring: %s\n\ngot:\n%s", wantLine, rendered)
+	}
+}
+
 // stageTransitionSummary reports whether rr recorded a transition of stageID to
 // failed carrying FailureCategory B, and whether any advancement transition
 // (awaiting_approval or succeeded) was recorded for it.

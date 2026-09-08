@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -20,6 +22,50 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 )
 
+// Counterfactual record for #3203 (binding approval condition 3 — every
+// counterfactual EXECUTED, with the observed RED recorded here rather than
+// reasoned about). Each mutation was applied to the working tree, the named
+// test run, the output below observed, and the file restored byte-identically.
+//
+//	(a) DELETED every generated_surface row from testSweepPathTriggerRules
+//	    (backend/internal/server/test_sweep.go), kept the tests.
+//	    go test ./internal/server/ -run TestEvaluateTestSweep -v
+//	    RED — 6 subtests failed:
+//	      openapi_document_without_the_api.md_region_flags_generated_surface
+//	      work-management_schema_without_either_mirror_names_both_and_the_generator
+//	      partially_scoped_mirror_set_reports_only_the_missing_mirror
+//	      canonical_schema_feeding_two_generators_draws_one_finding_per_generator
+//	      cmdinfo_inventory_flags_the_cli.md_region
+//	      generated_surface_fires_with_an_empty_listings_map
+//
+//	(b) THE LOAD-BEARING ONE. Reverted dedupTestSweepFindings' key to
+//	    (rule, trigger, sub) — dropping Generator — with every row left in
+//	    place. go test ./internal/server/ -run
+//	    'TestEvaluateTestSweep|TestShipPlan_TestSweep_GeneratedSurface_EndToEnd' -v
+//	    RED on exactly the two-generator case and the end-to-end pin:
+//	      --- FAIL: TestEvaluateTestSweep/canonical_schema_feeding_two_generators_draws_one_finding_per_generator
+//	      --- FAIL: TestShipPlan_TestSweep_GeneratedSurface_EndToEnd
+//	    Every other TestEvaluateTestSweep subtest stayed GREEN, which is the
+//	    proof that the widened key is load-bearing for the new rule and inert
+//	    for the three pre-existing ones.
+//
+//	(c) DELETED the `Generator: f.Generator` copy in planGateEvidence
+//	    (backend/internal/server/plan.go).
+//	    go test ./internal/server/ -run TestPlanGateEvidence_GeneratedSurfaceSeam -v
+//	    RED: plan_test.go:4908: TestSweepFindingEvidence.Generator = "",
+//	    want "scripts/gen-site-reference" (a drop in planGateEvidence)
+//
+//	(d) RENAMED one required path in a row (site/.../api.md ->
+//	    site/.../api-RENAMED.md).
+//	    go test ./internal/server/ -run TestGeneratedSurfaceRowsExistOnDisk -v
+//	    RED: test_sweep_test.go:959: path-trigger row path
+//	    "site/src/content/docs/reference/api-RENAMED.md" does not exist on
+//	    disk (...) — a rename would silently disable the row
+//
+// Two further controls this pass ADDED are recorded next to their own
+// tests: the prompt render branch (backend/internal/prompt/prompt_test.go)
+// and the surface-sweep registry fix
+// (backend/internal/server/surface_sweep_test.go).
 func TestEvaluateTestSweep(t *testing.T) {
 	const dir = "backend/internal/server"
 	// manyTests builds n existing test-file names for the rule-2 cap case.
@@ -307,6 +353,144 @@ func TestEvaluateTestSweep(t *testing.T) {
 					MissingTests: []string{"tests/test_alpha.py"},
 				},
 			},
+		},
+		// --- #3203 generated_surface rows. Each case is one shipped
+		// behavior of the canonical-source -> derived-file table.
+		{
+			// AC1: the OpenAPI document is rendered into the site api.md
+			// Reference region by scripts/gen-site-reference.
+			name:     "openapi document without the api.md region flags generated_surface",
+			scope:    []plan.ScopeFile{{Path: "docs/api/v0.openapi.yaml", Operation: plan.FileOpModify}},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleGeneratedSurface,
+					TriggerPath:  "docs/api/v0.openapi.yaml",
+					MissingTests: []string{"site/src/content/docs/reference/api.md"},
+					Generator:    testSweepGeneratorSiteReference,
+				},
+			},
+		},
+		{
+			// AC2: the work-management schema's sync-schemas case arm routes
+			// TWO mirrors (backend since #1005, cli since E54.11 / #2801);
+			// both must be named in one finding.
+			name:     "work-management schema without either mirror names both and the generator",
+			scope:    []plan.ScopeFile{{Path: "docs/spec/work-management-v0.schema.json", Operation: plan.FileOpModify}},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:        testSweepRuleGeneratedSurface,
+					TriggerPath: "docs/spec/work-management-v0.schema.json",
+					MissingTests: []string{
+						"backend/internal/workmgmt/schemas/work-management-v0.schema.json",
+						"cli/internal/spec/schemas/work-management-v0.schema.json",
+					},
+					Generator: testSweepGeneratorSyncSchemas,
+				},
+			},
+		},
+		{
+			// AC3a: no false positive — a plan already scoping the derived
+			// site region draws nothing.
+			name: "openapi with the api.md region in scope draws no finding",
+			scope: []plan.ScopeFile{
+				{Path: "docs/api/v0.openapi.yaml", Operation: plan.FileOpModify},
+				{Path: "site/src/content/docs/reference/api.md", Operation: plan.FileOpModify},
+			},
+			listings: map[string][]string{},
+			want:     nil,
+		},
+		{
+			// AC3b: a PARTIALLY scoped mirror set reports only the mirror
+			// still missing, not the one already scoped.
+			name: "partially scoped mirror set reports only the missing mirror",
+			scope: []plan.ScopeFile{
+				{Path: "docs/spec/work-management-v0.schema.json", Operation: plan.FileOpModify},
+				{Path: "backend/internal/workmgmt/schemas/work-management-v0.schema.json", Operation: plan.FileOpModify},
+			},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleGeneratedSurface,
+					TriggerPath:  "docs/spec/work-management-v0.schema.json",
+					MissingTests: []string{"cli/internal/spec/schemas/work-management-v0.schema.json"},
+					Generator:    testSweepGeneratorSyncSchemas,
+				},
+			},
+		},
+		{
+			// The DEDUP-KEY case: workflow-v2.schema.json feeds BOTH
+			// generators, so one trigger legitimately draws TWO findings.
+			// A (rule, trigger, sub-plan) dedup key would silently drop the
+			// second and hide half the gap.
+			name:     "canonical schema feeding two generators draws one finding per generator",
+			scope:    []plan.ScopeFile{{Path: "docs/spec/workflow-v2.schema.json", Operation: plan.FileOpModify}},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleGeneratedSurface,
+					TriggerPath:  "docs/spec/workflow-v2.schema.json",
+					MissingTests: []string{"site/src/content/docs/reference/workflow-spec.md"},
+					Generator:    testSweepGeneratorSiteReference,
+				},
+				{
+					Rule:        testSweepRuleGeneratedSurface,
+					TriggerPath: "docs/spec/workflow-v2.schema.json",
+					MissingTests: []string{
+						"backend/internal/spec/schemas/workflow-v2.schema.json",
+						"cli/internal/spec/schemas/workflow-v2.schema.json",
+					},
+					Generator: testSweepGeneratorSyncSchemas,
+				},
+			},
+		},
+		{
+			// The cmdinfo inventory row: the trigger is cmdinfo.go itself,
+			// not the directory, so cmdinfo_test.go draws nothing.
+			name:     "cmdinfo inventory flags the cli.md region",
+			scope:    []plan.ScopeFile{{Path: "cli/internal/cmdinfo/cmdinfo.go", Operation: plan.FileOpModify}},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleGeneratedSurface,
+					TriggerPath:  "cli/internal/cmdinfo/cmdinfo.go",
+					MissingTests: []string{"site/src/content/docs/reference/cli.md"},
+					Generator:    testSweepGeneratorSiteReference,
+				},
+			},
+		},
+		{
+			// cmdinfo_test.go is a recognized Go test file, so it never
+			// triggers the row; with no listing it draws nothing at all.
+			name:     "cmdinfo test file is not a generated_surface trigger",
+			scope:    []plan.ScopeFile{{Path: "cli/internal/cmdinfo/cmdinfo_test.go", Operation: plan.FileOpModify}},
+			listings: map[string][]string{},
+			want:     nil,
+		},
+		{
+			// Scope-set-only: the path-trigger rules consult no directory
+			// listing, so a generated_surface row fires with an EMPTY
+			// listings map (every Contents API call having failed open).
+			name:     "generated_surface fires with an empty listings map",
+			scope:    []plan.ScopeFile{{Path: "docs/spec/operator-role-default.yaml", Operation: plan.FileOpModify}},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleGeneratedSurface,
+					TriggerPath:  "docs/spec/operator-role-default.yaml",
+					MissingTests: []string{"backend/internal/operatorrole/defaults/operator-role-default.yaml"},
+					Generator:    testSweepGeneratorSyncSchemas,
+				},
+			},
+		},
+		{
+			// A docs/spec/ path with no row draws no generated_surface
+			// finding — the triggers are literals, not a docs/spec/* glob.
+			name:     "unrelated docs/spec path draws no generated_surface finding",
+			scope:    []plan.ScopeFile{{Path: "docs/spec/workflow-v2.md", Operation: plan.FileOpModify}},
+			listings: map[string][]string{},
+			want:     nil,
 		},
 		{
 			// #1004 amendment 2: a declared convention overlapping a default
@@ -794,6 +978,111 @@ func TestRunTestSweep_SubPlanScopeAttributed(t *testing.T) {
 	}
 }
 
+// TestGeneratedSurfaceRowsExistOnDisk is binding condition 4: EVERY
+// trigger and EVERY required path of EVERY testSweepPathTriggerRules row
+// must exist on disk (#3203). The rows are a hand-maintained mirror of
+// two generators this package cannot import — cli/internal/docgen (cli
+// module) and the scripts/sync-schemas shell script — so a rename of a
+// canonical source, a docgen page constant or an embedded mirror would
+// otherwise silently disable a row. Modelled on
+// TestSurfacePatternsExistOnDisk; paths are repo-relative and this test
+// runs from backend/internal/server, so the repo root is three levels up.
+//
+// Residual, stated rather than papered over: this catches a RENAME, not
+// a canonical source ADDED to a generator with no matching row here.
+func TestGeneratedSurfaceRowsExistOnDisk(t *testing.T) {
+	const repoRoot = "../../.."
+	seen := map[string]bool{}
+	check := func(p string) {
+		if seen[p] {
+			return
+		}
+		seen[p] = true
+		abs := filepath.Join(repoRoot, filepath.FromSlash(p))
+		if _, err := os.Stat(abs); err != nil {
+			t.Errorf("path-trigger row path %q does not exist on disk (%v) — a rename would silently disable the row", p, err)
+		}
+	}
+	rows := 0
+	for _, r := range testSweepPathTriggerRules {
+		rows++
+		// The migration_walk row's trigger is a GLOB (migrations/*.sql), the
+		// only non-literal in the table; its required path is still checked.
+		if !strings.ContainsAny(r.TriggerGlob, "*?[") {
+			check(r.TriggerGlob)
+		}
+		for _, req := range r.RequiredPaths {
+			check(req)
+		}
+	}
+	if rows != len(testSweepPathTriggerRules) || rows == 0 {
+		t.Fatalf("swept %d rows, table has %d", rows, len(testSweepPathTriggerRules))
+	}
+	// Every generated_surface row must carry a generator, and it must be
+	// one of the two shipped commands — a row with an empty or unknown
+	// generator would render as an unactionable finding.
+	for _, r := range testSweepPathTriggerRules {
+		if r.Rule != testSweepRuleGeneratedSurface {
+			if r.Generator != "" {
+				t.Errorf("non-generated_surface row %q carries generator %q — that would change its rendered line", r.TriggerGlob, r.Generator)
+			}
+			continue
+		}
+		switch r.Generator {
+		case testSweepGeneratorSiteReference, testSweepGeneratorSyncSchemas:
+		default:
+			t.Errorf("generated_surface row %q has generator %q, want one of the two shipped commands", r.TriggerGlob, r.Generator)
+		}
+	}
+}
+
+// TestRunTestSweep_SubPlanGeneratedSurfaceAttributed is the sub-plan
+// attribution case for the new rule (#3203): a decomposition slice that
+// scopes the OpenAPI document without the derived site region draws a
+// generated_surface finding tagged with the slice title. Like
+// migration_walk the rule is scope-set-only, so it fires with no
+// directory listing.
+func TestRunTestSweep_SubPlanGeneratedSurfaceAttributed(t *testing.T) {
+	cf := &contentsFake{dirs: map[string][]string{}}
+	s, au, runID := newTestSweepServer(t, cf)
+	body := decomposedScopePlanBody(t,
+		[]plan.ScopeFile{{Path: "docs/ARCHITECTURE.md", Operation: plan.FileOpModify}},
+		[]subPlanScope{
+			{
+				title: "api slice",
+				files: []plan.ScopeFile{{Path: "docs/api/v0.openapi.yaml", Operation: plan.FileOpModify}},
+			},
+			{
+				title: "doc slice",
+				files: []plan.ScopeFile{{Path: "README.md", Operation: plan.FileOpModify}},
+			},
+		},
+	)
+
+	if got := s.runTestSweep(context.Background(), runID, runID, body); got == nil {
+		t.Fatal("want a non-nil result when the sweep ran")
+	}
+	recorded := lastTestSweepEntry(t, au)
+	var found *TestSweepFinding
+	for i := range recorded.Findings {
+		if recorded.Findings[i].SubPlanTitle == "api slice" {
+			found = &recorded.Findings[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("want a finding attributed to the api sub-plan; got %+v", recorded.Findings)
+	}
+	if found.Rule != testSweepRuleGeneratedSurface {
+		t.Errorf("Rule = %q, want %s", found.Rule, testSweepRuleGeneratedSurface)
+	}
+	if found.Generator != testSweepGeneratorSiteReference {
+		t.Errorf("Generator = %q, want %s", found.Generator, testSweepGeneratorSiteReference)
+	}
+	if len(found.MissingTests) != 1 || found.MissingTests[0] != "site/src/content/docs/reference/api.md" {
+		t.Errorf("MissingTests = %v", found.MissingTests)
+	}
+}
+
 // TestShipPlan_TestSweep_EndToEnd is the #618-rule cross-boundary check
 // for this feature: a plan POSTed through handleShipPlan, with an
 // httptest-fake Contents API wired into cfg.GitHub, must (a) append a
@@ -847,6 +1136,129 @@ func TestShipPlan_TestSweep_EndToEnd(t *testing.T) {
 	for _, want := range wants {
 		if !strings.Contains(got, want) {
 			t.Errorf("plan-review prompt missing test-sweep element %q — threading seam broken:\n%s", want, got)
+		}
+	}
+}
+
+// planTestSweepWireFixturePath is the SHARED cross-boundary wire fixture
+// for the #3203 generated_surface finding (binding approval condition 1,
+// the #2660/#3014 precedent). This test writes nothing at run time: it
+// asserts the RAW plan_test_sweep audit payload the server persisted
+// equals the committed file, and
+// backend/internal/mcpserver/tools_test.go reads the SAME file and
+// decodes it through the real MCP wire types. One file, two readers: a
+// json-tag rename or drop on EITHER side reddens the pair, which two
+// hand-built fixtures hoping to agree cannot do.
+const planTestSweepWireFixturePath = "testdata/plan_test_sweep_wire.json"
+
+// rawTestSweepPayload returns the RAW bytes of the single plan_test_sweep
+// audit payload the fake captured — not a decoded struct, because the
+// fixture's whole point is that the persisted BYTES are what the MCP side
+// decodes.
+func rawTestSweepPayload(t *testing.T, au *auditFake) []byte {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out [][]byte
+	for _, ap := range au.appended {
+		if ap.Category == categoryPlanTestSweep {
+			out = append(out, ap.Payload)
+		}
+	}
+	if len(out) != 1 {
+		t.Fatalf("want exactly 1 plan_test_sweep entry, got %d", len(out))
+	}
+	return out[0]
+}
+
+// TestShipPlan_TestSweep_GeneratedSurface_EndToEnd is the cross-boundary
+// half for #3203: a plan POSTed through handleShipPlan scoping the
+// canonical workflow-v2 schema — the TWO-GENERATOR trigger — must
+// (a) persist a plan_test_sweep payload carrying both generated_surface
+// findings with their generators, (b) pin those exact bytes into the
+// shared wire fixture the mcpserver decode test consumes, and (c) surface
+// the generated_surface line, naming the derived file AND the generator,
+// in the captured plan-review prompt. Upload -> sweep -> audit -> prompt
+// and upload -> audit -> MCP, each asserted end to end.
+func TestShipPlan_TestSweep_GeneratedSurface_EndToEnd(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewersWithConstraints)
+	// No directory listings at all: the path-trigger rules are
+	// scope-set-only, so the finding must fire regardless.
+	cf := &contentsFake{dirs: map[string][]string{}}
+	instID := int64(42)
+	rr.getRuns[runID].InstallationID = &instID
+	s.cfg.GitHub = newTestSweepGitHub(t, cf)
+	priv, _ := sf.issue(t, runID)
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "docs/spec/workflow-v2.schema.json", Operation: plan.FileOpModify},
+	})
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// (a) both generated_surface findings landed, one per generator.
+	recorded := lastTestSweepEntry(t, au)
+	if len(recorded.Findings) != 2 {
+		t.Fatalf("Findings = %+v, want two generated_surface findings (one per generator)", recorded.Findings)
+	}
+	gens := map[string]string{}
+	for _, f := range recorded.Findings {
+		if f.Rule != testSweepRuleGeneratedSurface {
+			t.Errorf("Rule = %q, want %s", f.Rule, testSweepRuleGeneratedSurface)
+		}
+		gens[f.Generator] = strings.Join(f.MissingTests, ",")
+	}
+	if got := gens[testSweepGeneratorSiteReference]; got != "site/src/content/docs/reference/workflow-spec.md" {
+		t.Errorf("site-reference finding missing_tests = %q", got)
+	}
+	if got := gens[testSweepGeneratorSyncSchemas]; got != "backend/internal/spec/schemas/workflow-v2.schema.json,cli/internal/spec/schemas/workflow-v2.schema.json" {
+		t.Errorf("sync-schemas finding missing_tests = %q", got)
+	}
+
+	// (b) the persisted BYTES equal the committed shared fixture, which is
+	// the same file the mcpserver decode test reads.
+	raw := rawTestSweepPayload(t, au)
+	wantFixture, err := os.ReadFile(planTestSweepWireFixturePath)
+	if err != nil {
+		t.Fatalf("read wire fixture: %v", err)
+	}
+	var gotCompact, wantCompact bytes.Buffer
+	if err := json.Compact(&gotCompact, raw); err != nil {
+		t.Fatalf("compact persisted payload: %v", err)
+	}
+	if err := json.Compact(&wantCompact, wantFixture); err != nil {
+		t.Fatalf("compact fixture: %v", err)
+	}
+	if gotCompact.String() != wantCompact.String() {
+		t.Errorf("persisted plan_test_sweep payload does not match %s\n got: %s\nwant: %s",
+			planTestSweepWireFixturePath, gotCompact.String(), wantCompact.String())
+	}
+
+	// (c) the plan-review prompt renders the generated_surface line with
+	// the derived file and the generator.
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	wants := []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		"GENERATED SURFACE NOT IN SCOPE (generated_surface)",
+		"site/src/content/docs/reference/workflow-spec.md (regenerate with `scripts/gen-site-reference`)",
+		"cli/internal/spec/schemas/workflow-v2.schema.json (regenerate with `scripts/sync-schemas`)",
+		"the implement stage would have to spend one of its two scope amendments mid-stage",
+	}
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan-review prompt missing generated_surface element %q — threading seam broken:\n%s", want, got)
 		}
 	}
 }

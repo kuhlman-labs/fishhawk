@@ -47,6 +47,13 @@ const (
 	// needs its own reversal test there) is absent from scope.files — the
 	// #1031 class, missed by planners three times (migrations 0029/0030/0031).
 	testSweepRuleMigrationWalk = "migration_walk"
+	// testSweepRuleGeneratedSurface flags a scoped CANONICAL source whose
+	// DERIVED files — a byte-exact generated site Reference region, or an
+	// embedded schema/preset/fixture mirror — are absent from scope.files
+	// (#3203). Unlike the three rules above the missing paths are not test
+	// files: they are outputs a generator rewrites, so the finding also
+	// names the Generator command that closes the gap.
+	testSweepRuleGeneratedSurface = "generated_surface"
 )
 
 // testSweepPathTriggerRule is one row of the path-trigger rule table: a
@@ -63,15 +70,255 @@ type testSweepPathTriggerRule struct {
 	Rule          string
 	TriggerGlob   string
 	RequiredPaths []string
+	// Generator, when set, names the command that rewrites RequiredPaths
+	// from the trigger (#3203) — the generated_surface rows carry it so a
+	// finding tells the planner what to RUN, not merely what to scope. It
+	// is empty on the migration_walk row (whose required path is a
+	// hand-written test), which keeps that row's finding and its rendered
+	// prompt line byte-identical to the pre-#3203 output.
+	Generator string
 }
+
+// Generator command names carried by the generated_surface rows (#3203).
+// Stable strings: they appear in audit payloads, the plan-review prompt
+// and the fishhawk_get_plan MCP surface.
+const (
+	testSweepGeneratorSiteReference = "scripts/gen-site-reference"
+	testSweepGeneratorSyncSchemas   = "scripts/sync-schemas"
+)
 
 // testSweepPathTriggerRules is the curated rule table. The single
 // migrations glob covers both .up.sql and .down.sql.
+//
+// The generated_surface rows below are a HAND-MAINTAINED MIRROR of two
+// generators this package cannot import: cli/internal/docgen lives in the
+// cli module (there is no cross-module import path from backend/) and
+// scripts/sync-schemas is a shell script. Every row is derived from those
+// sources — the docgen page/source constants (docgen.go pageFiles,
+// spec_pages.go schemaV{0,1,2}Rel / planSchemaRel / example*Rel,
+// openapi.go openapiRelPath, cli_page.go's cmdinfo inventory read) and
+// scripts/sync-schemas' case arms and explicit cp lines — not from prose.
+// TestGeneratedSurfaceRowsExistOnDisk os.Stats every trigger and required
+// path so a RENAME on either side breaks loudly; it cannot catch a NEW
+// canonical source added to a generator without a matching row here, so
+// the table under-reports until updated. That residual is stated in
+// backend/internal/server/README.md rather than papered over.
+//
+// Every trigger is a LITERAL path (path.Match on a literal is an exact
+// match), so the required set is exact rather than glob-derived.
 var testSweepPathTriggerRules = []testSweepPathTriggerRule{
 	{
 		Rule:          testSweepRuleMigrationWalk,
 		TriggerGlob:   "backend/internal/postgres/migrations/*.sql",
 		RequiredPaths: []string{"backend/internal/postgres/postgres_test.go"},
+	},
+
+	// --- scripts/gen-site-reference: canonical source -> generated site
+	// Reference region (E12.4 / #2264). Sources: cli/internal/docgen.
+	{
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/api/v0.openapi.yaml",
+		RequiredPaths: []string{"site/src/content/docs/reference/api.md"},
+		Generator:     testSweepGeneratorSiteReference,
+	},
+	{
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/workflow-v0.schema.json",
+		RequiredPaths: []string{"site/src/content/docs/reference/workflow-spec.md"},
+		Generator:     testSweepGeneratorSiteReference,
+	},
+	{
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/workflow-v1.schema.json",
+		RequiredPaths: []string{"site/src/content/docs/reference/workflow-spec.md"},
+		Generator:     testSweepGeneratorSiteReference,
+	},
+	{
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/workflow-v2.schema.json",
+		RequiredPaths: []string{"site/src/content/docs/reference/workflow-spec.md"},
+		Generator:     testSweepGeneratorSiteReference,
+	},
+	{
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/examples/workflow-v2-reuse.yaml",
+		RequiredPaths: []string{"site/src/content/docs/reference/workflow-spec.md"},
+		Generator:     testSweepGeneratorSiteReference,
+	},
+	{
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/examples/workflow-v2-backlog-grooming.yaml",
+		RequiredPaths: []string{"site/src/content/docs/reference/workflow-spec.md"},
+		Generator:     testSweepGeneratorSiteReference,
+	},
+	{
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/plan-standard-v1.schema.json",
+		RequiredPaths: []string{"site/src/content/docs/reference/plan-schema.md"},
+		Generator:     testSweepGeneratorSiteReference,
+	},
+	{
+		// cmdinfo.go, not the whole cli/internal/cmdinfo directory:
+		// cmdinfo_test.go holds no inventory and would draw a spurious
+		// finding. A flag added in cli/cmd/fishhawk without a cmdinfo
+		// update is caught by TestCLIFlagsMatchExecutableSurface instead.
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "cli/internal/cmdinfo/cmdinfo.go",
+		RequiredPaths: []string{"site/src/content/docs/reference/cli.md"},
+		Generator:     testSweepGeneratorSiteReference,
+	},
+
+	// --- scripts/sync-schemas: canonical docs/spec/ artifact -> embedded
+	// mirrors. One row per case arm / explicit cp block of the script.
+	{
+		// plan-standard-*.schema.json case arm.
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/plan-standard-v1.schema.json",
+		RequiredPaths: []string{
+			"backend/internal/plan/schemas/plan-standard-v1.schema.json",
+			"runner/internal/plan/schemas/plan-standard-v1.schema.json",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
+	},
+	{
+		// clarification-request-*.schema.json case arm: backend only (the
+		// runner handles the outcome semantically and embeds no copy).
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/clarification-request-v1.schema.json",
+		RequiredPaths: []string{"backend/internal/plan/schemas/clarification-request-v1.schema.json"},
+		Generator:     testSweepGeneratorSyncSchemas,
+	},
+	{
+		// grooming-report-*.schema.json case arm: backend only.
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/grooming-report-v1.schema.json",
+		RequiredPaths: []string{"backend/internal/plan/schemas/grooming-report-v1.schema.json"},
+		Generator:     testSweepGeneratorSyncSchemas,
+	},
+	{
+		// workflow-v*.schema.json case arm, one row per shipped major.
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/workflow-v0.schema.json",
+		RequiredPaths: []string{
+			"backend/internal/spec/schemas/workflow-v0.schema.json",
+			"cli/internal/spec/schemas/workflow-v0.schema.json",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
+	},
+	{
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/workflow-v1.schema.json",
+		RequiredPaths: []string{
+			"backend/internal/spec/schemas/workflow-v1.schema.json",
+			"cli/internal/spec/schemas/workflow-v1.schema.json",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
+	},
+	{
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/workflow-v2.schema.json",
+		RequiredPaths: []string{
+			"backend/internal/spec/schemas/workflow-v2.schema.json",
+			"cli/internal/spec/schemas/workflow-v2.schema.json",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
+	},
+	{
+		// operator-role*.schema.json case arm (two canonical files).
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/operator-role.schema.json",
+		RequiredPaths: []string{"backend/internal/operatorrole/schemas/operator-role.schema.json"},
+		Generator:     testSweepGeneratorSyncSchemas,
+	},
+	{
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/operator-role-overlay.schema.json",
+		RequiredPaths: []string{"backend/internal/operatorrole/schemas/operator-role-overlay.schema.json"},
+		Generator:     testSweepGeneratorSyncSchemas,
+	},
+	{
+		// work-management-v*.schema.json case arm: the CLI is a second
+		// CONSUMER since E54.11 / #2801, so both mirrors are required.
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/work-management-v0.schema.json",
+		RequiredPaths: []string{
+			"backend/internal/workmgmt/schemas/work-management-v0.schema.json",
+			"cli/internal/spec/schemas/work-management-v0.schema.json",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
+	},
+	{
+		// Explicit cp: the shipped default operator role spec (ADR-040 D1).
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/operator-role-default.yaml",
+		RequiredPaths: []string{"backend/internal/operatorrole/defaults/operator-role-default.yaml"},
+		Generator:     testSweepGeneratorSyncSchemas,
+	},
+	{
+		// Explicit cp: the shipped default work-management conventions (#1005).
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/work-management-default.yaml",
+		RequiredPaths: []string{"backend/internal/workmgmt/defaults/work-management-default.yaml"},
+		Generator:     testSweepGeneratorSyncSchemas,
+	},
+	{
+		// workflow-preset-*.yaml cp loop (ADR-048 / E29.1), one row per preset.
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/workflow-preset-low.yaml",
+		RequiredPaths: []string{
+			"backend/internal/spec/presets/workflow-preset-low.yaml",
+			"cli/internal/spec/presets/workflow-preset-low.yaml",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
+	},
+	{
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/workflow-preset-medium.yaml",
+		RequiredPaths: []string{
+			"backend/internal/spec/presets/workflow-preset-medium.yaml",
+			"cli/internal/spec/presets/workflow-preset-medium.yaml",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
+	},
+	{
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/workflow-preset-high.yaml",
+		RequiredPaths: []string{
+			"backend/internal/spec/presets/workflow-preset-high.yaml",
+			"cli/internal/spec/presets/workflow-preset-high.yaml",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
+	},
+	{
+		// Explicit cp: the shared path-predicate fixture corpus (E53.1 / #2224).
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/predicate-fixtures.json",
+		RequiredPaths: []string{
+			"backend/internal/spec/testdata/predicate-fixtures.json",
+			"cli/internal/spec/testdata/predicate-fixtures.json",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
+	},
+	{
+		// Explicit cp: the shared acceptance-verdict fixture corpus
+		// (#2512 / E48.78) — note the runner mirror is under cmd/, not internal/.
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/acceptance-verdict-fixtures.json",
+		RequiredPaths: []string{
+			"backend/internal/server/testdata/acceptance-verdict-fixtures.json",
+			"runner/cmd/fishhawk-runner/testdata/acceptance-verdict-fixtures.json",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
+	},
+	{
+		// Explicit cp: the shared tier-expansion fixture corpus (E52.18 / #2341).
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/tier-expansion-fixtures.json",
+		RequiredPaths: []string{
+			"backend/internal/spec/testdata/tier-expansion-fixtures.json",
+			"cli/internal/spec/testdata/tier-expansion-fixtures.json",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
 	},
 }
 
@@ -102,12 +349,17 @@ const testSweepMaxDirs = 20
 // SubPlanTitle attributes the finding to a decomposition sub-plan when the
 // trigger came from that sub-plan's own scope.files rather than the flat
 // parent scope (#1077). Empty for parent-scope findings.
+// Generator, set only on generated_surface findings (#3203), names the
+// command that regenerates or mirrors the MissingTests paths from
+// TriggerPath. It is empty for the three test-file rules, which keeps
+// their audit payload and rendered prompt line byte-identical.
 type TestSweepFinding struct {
 	Rule         string   `json:"rule"`
 	TriggerPath  string   `json:"trigger_path"`
 	MissingTests []string `json:"missing_tests"`
 	OmittedCount int      `json:"omitted_count,omitempty"`
 	SubPlanTitle string   `json:"sub_plan_title,omitempty"`
+	Generator    string   `json:"generator,omitempty"`
 }
 
 // TestSweepPayload is the audit-payload shape for a plan_test_sweep
@@ -216,19 +468,27 @@ func isTestFileBasename(recognizers []string, name string) bool {
 }
 
 // dedupTestSweepFindings collapses findings sharing (rule, trigger path,
-// sub-plan title) to the first occurrence (#1004 amendment 2): an
-// overlapping declared+default convention can otherwise double-report the
-// same trigger. The candidate set is also deduped per production file
+// sub-plan title, generator) to the first occurrence (#1004 amendment 2):
+// an overlapping declared+default convention can otherwise double-report
+// the same trigger. The candidate set is also deduped per production file
 // (in the rule-1 loop) so MissingTests never lists a path twice.
+//
+// The generator is part of the key (#3203) because one canonical source
+// legitimately feeds TWO generators — docs/spec/workflow-v2.schema.json
+// is rendered into the site workflow-spec region by
+// scripts/gen-site-reference AND mirrored into the two embedded schema
+// copies by scripts/sync-schemas — so a (rule, trigger, sub) key would
+// silently drop the second finding and hide half the gap. Adding it is
+// inert for the three pre-existing rules, whose Generator is empty.
 func dedupTestSweepFindings(findings []TestSweepFinding) []TestSweepFinding {
 	if len(findings) < 2 {
 		return findings
 	}
-	type key struct{ rule, trigger, sub string }
+	type key struct{ rule, trigger, sub, generator string }
 	seen := make(map[key]bool, len(findings))
 	out := findings[:0]
 	for _, f := range findings {
-		k := key{f.Rule, f.TriggerPath, f.SubPlanTitle}
+		k := key{f.Rule, f.TriggerPath, f.SubPlanTitle, f.Generator}
 		if seen[k] {
 			continue
 		}
@@ -255,10 +515,12 @@ func dedupTestSweepFindings(findings []TestSweepFinding) []TestSweepFinding {
 //     other recognized test files — those existing files (minus any
 //     already in scope) are reported sorted, capped at
 //     testSweepMaxMissingTests with OmittedCount carrying the remainder.
-//   - path-trigger table rows (testSweepPathTriggerRules, currently
-//     migration_walk): a scoped path matching a row's trigger glob whose
-//     required paths are not all in scope — evaluated against the scope
-//     set only, never dirListings.
+//   - path-trigger table rows (testSweepPathTriggerRules: migration_walk
+//     plus the #3203 generated_surface rows): a scoped path matching a
+//     row's trigger glob whose required paths are not all in scope —
+//     evaluated against the scope set only, never dirListings, so a row
+//     fires even when every directory listing failed open. A
+//     generated_surface finding additionally carries the row's Generator.
 //
 // Paths are slash-normalized like evaluateSurfaceSweep; a scoped test
 // file never flags itself; findings are deduped by (rule, trigger path)
@@ -315,6 +577,7 @@ func evaluateTestSweep(scopeFiles []plan.ScopeFile, dirListings map[string][]str
 					Rule:         rule.Rule,
 					TriggerPath:  p,
 					MissingTests: missing,
+					Generator:    rule.Generator,
 				})
 			}
 		}
@@ -398,7 +661,13 @@ func evaluateTestSweep(scopeFiles []plan.ScopeFile, dirListings map[string][]str
 		if findings[i].Rule != findings[j].Rule {
 			return findings[i].Rule < findings[j].Rule
 		}
-		return findings[i].TriggerPath < findings[j].TriggerPath
+		if findings[i].TriggerPath != findings[j].TriggerPath {
+			return findings[i].TriggerPath < findings[j].TriggerPath
+		}
+		// One trigger can legitimately draw two generated_surface findings
+		// with different generators (#3203); order them by generator so the
+		// audit payload stays deterministic. Inert for the other rules.
+		return findings[i].Generator < findings[j].Generator
 	})
 	return findings
 }
@@ -510,8 +779,8 @@ func (s *Server) runTestSweep(ctx context.Context, runID, stageID uuid.UUID, pla
 	// the empty path, which ListDirectory rejects. Collect from the parent
 	// scope AND every decomposition sub-plan scope (#1077): an
 	// under-scoped slice's directory must be listed so its coupling gaps
-	// surface at the parent plan gate. The migration_walk path-trigger
-	// rule needs no listing.
+	// surface at the parent plan gate. The path-trigger rules
+	// (migration_walk, generated_surface) need no listing.
 	dirSet := map[string]bool{}
 	addDir := func(dir string) {
 		if dir != "" && dir != "." {
