@@ -2452,3 +2452,53 @@ func TestCreateCampaignDecodesServerTimeout504(t *testing.T) {
 		}
 	})
 }
+
+// TestRebaseRunBranch_202ConflictResolutionDecodes pins the E64.62 / #3202
+// wire hop. apiClient.do decodes ANY 2xx into RebaseBranchResult, so a 202
+// trigger receipt is decoded exactly like a 200 advance — WITHOUT the three
+// conflict_resolution_* fields the operator would be handed a success-shaped
+// result carrying no signal that a pass was started and no merge commit
+// exists. The json tags must byte-match the backend's rebaseBranchResponse or
+// each field silently decodes to its zero value (the #371-class wire-mirror
+// trap), which is exactly the failure this test exists to catch.
+func TestRebaseRunBranch_202ConflictResolutionDecodes(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	var gotStatusPath string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotStatusPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"run_id":"` + runID.String() + `","pr_number":7,` +
+			`"branch":"fishhawk/run/x","base_ref":"main",` +
+			`"prior_head_sha":"aaa111","new_head_sha":"aaa111","merge_commit_sha":"",` +
+			`"mechanism_note":"note",` +
+			`"conflict_resolution_triggered":true,` +
+			`"conflict_resolution_stage_id":"` + stageID.String() + `",` +
+			`"conflict_resolution_note":"NO merge commit exists yet"}`))
+	}))
+	defer ts.Close()
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+	res, err := c.RebaseRunBranch(context.Background(), runID, "advance")
+	if err != nil {
+		t.Fatalf("RebaseRunBranch on a 202: %v", err)
+	}
+	if gotStatusPath != "/v0/runs/"+runID.String()+"/rebase-branch" {
+		t.Errorf("path = %q", gotStatusPath)
+	}
+	if !res.ConflictResolutionTriggered {
+		t.Error("conflict_resolution_triggered decoded false; the operator gets no signal a pass was started")
+	}
+	if res.ConflictResolutionStageID != stageID.String() {
+		t.Errorf("conflict_resolution_stage_id = %q, want %q", res.ConflictResolutionStageID, stageID)
+	}
+	if res.ConflictResolutionNote == "" {
+		t.Error("conflict_resolution_note decoded empty")
+	}
+	// The branch is unchanged, and that must survive the hop unambiguously.
+	if res.NewHeadSHA != res.PriorHeadSHA || res.MergeCommitSHA != "" {
+		t.Errorf("new_head_sha=%q prior=%q merge=%q; want an unchanged branch and no merge commit",
+			res.NewHeadSHA, res.PriorHeadSHA, res.MergeCommitSHA)
+	}
+}

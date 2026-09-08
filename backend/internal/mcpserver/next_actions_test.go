@@ -4546,3 +4546,124 @@ func TestHumanReviewGateNextActions_NoReviewRow_ReturnsNil(t *testing.T) {
 		t.Errorf("humanReviewGateNextActions = %+v, want nil with no review row", got)
 	}
 }
+
+// --- E64.62 / #3202: conflict-resolution advisory ---------------------------
+
+// TestConflictResolutionCategoryStringsMatchBackend pins the two re-declared
+// audit-category literals against the backend constants they mirror. The MCP
+// surface reads categories off the wire as plain strings, so nothing else
+// would fail if the backend renamed one — the fold would simply stop firing.
+func TestConflictResolutionCategoryStringsMatchBackend(t *testing.T) {
+	if categoryStageConflictResolutionTriggered != server.CategoryStageConflictResolutionTriggered {
+		t.Errorf("triggered category = %q, backend says %q",
+			categoryStageConflictResolutionTriggered, server.CategoryStageConflictResolutionTriggered)
+	}
+	if categoryStageConflictResolutionFailed != server.CategoryStageConflictResolutionFailed {
+		t.Errorf("failed category = %q, backend says %q",
+			categoryStageConflictResolutionFailed, server.CategoryStageConflictResolutionFailed)
+	}
+}
+
+// TestConflictResolutionPassFailed covers the SEQUENCE rule and each case that
+// must answer false: no entries at all, a trigger with no failure, and a
+// failure that PRECEDES the newest trigger (a later pass that has not failed).
+func TestConflictResolutionPassFailed(t *testing.T) {
+	trig := func(seq int64) AuditEntry {
+		return AuditEntry{Category: categoryStageConflictResolutionTriggered, Sequence: seq}
+	}
+	fail := func(seq int64) AuditEntry {
+		return AuditEntry{Category: categoryStageConflictResolutionFailed, Sequence: seq}
+	}
+	cases := []struct {
+		name string
+		in   []AuditEntry
+		want bool
+	}{
+		{"no entries", nil, false},
+		{"trigger only", []AuditEntry{trig(5)}, false},
+		{"failure after trigger", []AuditEntry{trig(5), fail(6)}, true},
+		{"failure before the newest trigger", []AuditEntry{trig(5), fail(6), trig(9)}, false},
+		{"second pass also failed", []AuditEntry{trig(5), fail(6), trig(9), fail(11)}, true},
+		{"failure with no trigger at all", []AuditEntry{fail(6)}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := conflictResolutionPassFailed(tc.in); got != tc.want {
+				t.Errorf("conflictResolutionPassFailed = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFoldConflictResolutionAdvisory_AppendsFallbackAction: a failed pass adds
+// exactly one action naming the resolve-push-vouch route, consuming NOTHING —
+// deliberately not fixup_budget, which the pass never touches.
+func TestFoldConflictResolutionAdvisory_AppendsFallbackAction(t *testing.T) {
+	r := naRun("running")
+	na := &NextActions{State: "implement_review_gate_parked", Actions: []SuggestedAction{
+		{Action: "fishhawk_await_review", Consumes: consumesNone},
+	}}
+	recent := []AuditEntry{
+		{Category: categoryStageConflictResolutionTriggered, Sequence: 3},
+		{Category: categoryStageConflictResolutionFailed, Sequence: 4},
+	}
+	foldConflictResolutionAdvisory(r, recent, na)
+
+	if len(na.Actions) != 2 {
+		t.Fatalf("actions = %d, want 2 (the fold APPENDS, it never replaces)", len(na.Actions))
+	}
+	if na.Actions[0].Action != "fishhawk_await_review" {
+		t.Errorf("the pre-existing action was reordered or dropped: %+v", na.Actions[0])
+	}
+	got := na.Actions[1]
+	if got.Action != "fishhawk_vouch_commit" {
+		t.Errorf("action = %q, want fishhawk_vouch_commit", got.Action)
+	}
+	if got.Consumes != consumesNone {
+		t.Errorf("consumes = %q, want %q — a conflict-resolution pass never spends fix-up budget",
+			got.Consumes, consumesNone)
+	}
+	if got.Consumes == consumesFixupBudget {
+		t.Error("consumes must never be fixup_budget on the conflict-resolution fallback")
+	}
+	if !strings.Contains(got.Precondition, "SPENT") {
+		t.Errorf("precondition must name the spent budget: %q", got.Precondition)
+	}
+	if !strings.Contains(got.Reason, "NO fix-up budget") {
+		t.Errorf("reason must state that no fix-up budget was consumed: %q", got.Reason)
+	}
+	if got.Params["run_id"] != r.ID {
+		t.Errorf("params run_id = %q, want %q", got.Params["run_id"], r.ID)
+	}
+}
+
+// TestFoldConflictResolutionAdvisory_NoOps: every guard leaves the block
+// deep-equal to its unfolded value, so a healthy run is byte-identical.
+func TestFoldConflictResolutionAdvisory_NoOps(t *testing.T) {
+	base := func() *NextActions {
+		return &NextActions{State: "succeeded_pr_open", Actions: []SuggestedAction{
+			{Action: "fishhawk_merge_run", Consumes: consumesNone},
+		}}
+	}
+	failed := []AuditEntry{
+		{Category: categoryStageConflictResolutionTriggered, Sequence: 3},
+		{Category: categoryStageConflictResolutionFailed, Sequence: 4},
+	}
+	t.Run("no failed pass", func(t *testing.T) {
+		na, want := base(), base()
+		foldConflictResolutionAdvisory(naRun("succeeded"), nil, na)
+		if !reflect.DeepEqual(na, want) {
+			t.Errorf("block changed with no failed pass: %+v", na)
+		}
+	})
+	t.Run("nil run", func(t *testing.T) {
+		na, want := base(), base()
+		foldConflictResolutionAdvisory(nil, failed, na)
+		if !reflect.DeepEqual(na, want) {
+			t.Errorf("block changed on a nil run: %+v", na)
+		}
+	})
+	t.Run("nil block does not panic", func(t *testing.T) {
+		foldConflictResolutionAdvisory(naRun("succeeded"), failed, nil)
+	})
+}

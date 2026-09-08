@@ -2027,6 +2027,11 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// nextActionsFor call sites (here and run_stage.go) so the two snapshot
 	// surfaces cannot diverge.
 	foldAcceptanceRedispatchAdvisory(runRow, stages, recent, nextActions)
+	// E64.62 (#3202): a conflict-resolution pass that REFUSED is recovered back
+	// to the pre-pass gate, so the run looks unchanged and the classifier would
+	// say nothing about the now-SPENT budget. Folded off the SAME recent slice,
+	// display-only and additive, and wired at BOTH nextActionsFor call sites.
+	foldConflictResolutionAdvisory(runRow, recent, nextActions)
 
 	// Best-effort decomposed-parent children status (#1147). Cost-gated so an
 	// ordinary run pays nothing: only a decomposed parent (no parent_run_id,
@@ -3434,13 +3439,24 @@ all (an undecodable merge sha AND a failed post-merge head re-read). A
 success carrying that warning must NOT be read as a clean recovery: the run
 stays wedged on the lineage check until you act.
 
-FAIL-CLOSED on a conflict: if the run branch CONFLICTS with the advanced
-base the call is refused (rebase_conflict) having written NOTHING — no
-merge commit, no audit entry, no check re-post. This first slice does not
-resolve conflicts; agent-driven resolution is tracked in #3202, and today's
-route (resolve in a worktree, push, then fishhawk_vouch_commit) remains the
-fallback. Every uncertain anchor is likewise fail-closed
-(rebase_not_determinable) rather than merged on a guess.
+ON A CONFLICT the merge is NEVER forced and the branch is never written to.
+With the conflict-resolution budget intact the call TRIGGERS a bounded,
+operator-authorized AGENT PASS that resolves the conflict ON the run branch
+and returns conflict_resolution_triggered=true (HTTP 202) — so you never
+have to resolve in a worktree and push to a runner-owned branch. NO merge
+commit exists at that point and the branch is UNCHANGED: await the named
+conflict_resolution_stage_id, then re-invoke this verb, which short-circuits
+the merge and re-parks + republishes at the resolved head. The pass runs
+against a SEPARATE ceiling-1 counter and consumes NO fix-up budget.
+
+FAIL-CLOSED once that single pass is SPENT: the call is refused
+(rebase_conflict) having written NOTHING — no merge commit, no audit entry,
+no check re-post — naming the spent budget, the failed pass's
+confinement-gate reason, and today's fallback (resolve in a worktree, push,
+then fishhawk_vouch_commit). The same refusal covers a run with no
+re-openable implement stage to run a pass on. Every uncertain anchor is
+likewise fail-closed (rebase_not_determinable) rather than merged on a
+guess.
 
 Sibling verb: fishhawk_reset_run_branch is the right verb for a FOREIGN
 COMMIT pushed ON TOP of the run's commits — a different problem. This one
@@ -3460,13 +3476,18 @@ Inputs:
 
 Returns the advance summary (prior_head_sha, new_head_sha,
 merge_commit_sha, already_up_to_date, mechanism_note,
-audit_check_republished, lineage_attribution_warning) on success. Returns a tool error on:
+audit_check_republished, lineage_attribution_warning) on success, or the
+trigger receipt (conflict_resolution_triggered,
+conflict_resolution_stage_id, conflict_resolution_note) on a conflict that
+started a pass. Returns a tool error on:
   - invalid UUID (caught before the HTTP hop)
   - confirmation_required (confirm not true, 400)
   - run_token_forbidden (a run-bound agent token, 403)
   - insufficient_scope (no write:stages, 403)
   - run_not_found (404)
-  - rebase_conflict (the branch conflicts with the base; nothing written, 422)
+  - rebase_conflict (the branch conflicts AND the ceiling-1
+    conflict-resolution pass is spent, or no pass could be started; nothing
+    written, 422)
   - rebase_not_determinable (fail-closed: unresolvable anchor, behind-probe
     failure, or a concurrent push caught by the lease re-check, 422)
   - rebase_merge_failed (the merge failed for a non-conflict reason, 502)

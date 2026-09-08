@@ -11226,3 +11226,71 @@ func TestResolveStageCumulativeEval_FailClosedModes(t *testing.T) {
 		})
 	}
 }
+
+// --- E64.62 / #3202: conflict-resolution recovery at advanceAfterFailure ---
+
+// TestAdvanceAfterFailure_ConflictResolutionRecoveryTakesPrecedence pins the
+// ORDERING at the trace-side recovery chokepoint. The stage carries BOTH a
+// STALE stage_fixup_triggered entry and a NEWER
+// stage_conflict_resolution_triggered entry, seeded with DIFFERENT anchors, so
+// the two recoveries are DISCRIMINABLE by their observable effect: only the
+// conflict-resolution anchor names the review stage to restore. Running the
+// fix-up recovery first would restore from the stale anchor, leave the review
+// gate un-restored, and write the wrong audit category.
+func TestAdvanceAfterFailure_ConflictResolutionRecoveryTakesPrecedence(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newStoringAuditFake()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	ctx := context.Background()
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	// STALE fix-up anchor: names NO review stage, so a fix-up recovery leaves
+	// the review gate exactly where the pass left it.
+	seedFixupTriggered(t, au, runRow.ID, impl.ID, run.StageStateSucceeded, nil)
+	// NEWER conflict-resolution anchor: names the review stage.
+	crPayload, err := json.Marshal(conflictResolutionTriggerAudit{
+		conflictResolutionTrigger: conflictResolutionTrigger{Branch: "b", BaseRef: "main", Pass: 1},
+		RunID:                     runRow.ID.String(), StageID: impl.ID.String(),
+		PriorState:            string(run.StageStateSucceeded),
+		ReparkedReviewStageID: review.ID.String(),
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := au.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: runRow.ID, StageID: &impl.ID,
+		Category: CategoryStageConflictResolutionTriggered, Payload: crPayload,
+	}); err != nil {
+		t.Fatalf("append conflict-resolution trigger: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	s.advanceAfterFailure(req, runRow.ID, impl.ID)
+
+	// The CONFLICT-RESOLUTION recovery ran, not the fix-up one.
+	crEntries, _ := au.ListForRunByCategory(ctx, runRow.ID, CategoryStageConflictResolutionFailed)
+	if len(crEntries) != 1 {
+		t.Fatalf("stage_conflict_resolution_failed entries = %d, want 1", len(crEntries))
+	}
+	fxEntries, _ := au.ListForRunByCategory(ctx, runRow.ID, CategoryStageFixupRecovered)
+	if len(fxEntries) != 0 {
+		t.Errorf("stage_fixup_recovered entries = %d, want 0 — the stale fix-up anchor must not win", len(fxEntries))
+	}
+	// Its anchor is what got applied: the review gate is restored.
+	if curReview, _ := rr.GetStage(ctx, review.ID); curReview.State != run.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want awaiting_approval (restored from the conflict-resolution anchor)",
+			curReview.State)
+	}
+	// The run-failing Advance was skipped.
+	if curRun, _ := rr.GetRun(ctx, runRow.ID); curRun.State != run.StateRunning {
+		t.Errorf("run state = %q, want running (Advance skipped on recovery)", curRun.State)
+	}
+	if curImpl, _ := rr.GetStage(ctx, impl.ID); curImpl.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want succeeded (restored)", curImpl.State)
+	}
+}

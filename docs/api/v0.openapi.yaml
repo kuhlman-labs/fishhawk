@@ -7881,14 +7881,27 @@ paths:
           the very run this endpoint un-wedged;
         - re-posts the `fishhawk_audit_complete` Check Run AT the new head.
 
-        **FAIL-CLOSED FIRST SLICE.** A CONFLICTING merge is refused 422
-        (`rebase_conflict`) having written NOTHING — no merge commit, no audit
-        entry, no check re-post. This slice does not resolve conflicts;
-        agent-driven resolution is tracked in #3202, and the pre-existing
-        route (resolve on the run branch, `POST /v0/runs/{run_id}/vouch-commit`
-        the resulting commit, re-merge) remains the fallback. Every uncertain
-        anchor is likewise refused 422 (`rebase_not_determinable`) rather than
-        merged on a guess.
+        **ON A CONFLICT (E64.62 / #3202)** the merge is never forced and the
+        branch is never written to. With the conflict-resolution budget intact
+        the endpoint TRIGGERS a bounded, operator-authorized agent pass that
+        resolves the conflict ON the run branch, and returns **202 Accepted**
+        carrying `conflict_resolution_triggered: true` plus the re-opened
+        implement stage id. At that point NO merge commit exists, the branch is
+        UNCHANGED, and nothing was re-parked onto a new head: await the named
+        stage, then re-invoke this endpoint, which takes the
+        already-contains-base short-circuit and re-parks + republishes at the
+        resolved head. The pass is counted against its OWN ceiling-1 counter
+        (`stage_conflict_resolution_triggered`) and consumes NO fix-up budget.
+
+        **FAIL-CLOSED once that single pass is SPENT.** A conflict whose
+        conflict-resolution budget is exhausted — or a run with no re-openable
+        implement stage to run a pass on — is refused 422 (`rebase_conflict`)
+        having written NOTHING: no merge commit, no audit entry, no check
+        re-post. The message names the spent budget, the failed pass's named
+        confinement-gate reason, and the fallback route (resolve on the run
+        branch, `POST /v0/runs/{run_id}/vouch-commit` the resulting commit,
+        re-merge). Every uncertain anchor is likewise refused 422
+        (`rebase_not_determinable`) rather than merged on a guess.
 
         **"Already contains the base" is decided BEFORE any merge**, by a
         three-dot `CompareCommits(base=<live run branch head>, head=<base
@@ -7982,6 +7995,31 @@ paths:
                       already-contains-base arm, which attributes nothing — so
                       the warning names fishhawk_vouch_commit as the required
                       step instead.
+        '202':
+          description: |
+            The base merge CONFLICTED and a bounded, operator-authorized agent
+            conflict-resolution pass was triggered on the run's implement stage
+            (E64.62 / #3202). NOTHING was written to the branch: no merge
+            commit, no `branch_rebased` entry, no check re-post, no re-park onto
+            a new head. `new_head_sha` deliberately equals `prior_head_sha` (the
+            branch is unchanged) rather than being empty, so this cannot be
+            mistaken for a head that could not be read back. Await
+            `conflict_resolution_stage_id`, then re-invoke this endpoint.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  pr_number: { type: integer }
+                  branch: { type: string }
+                  base_ref: { type: string }
+                  prior_head_sha: { type: string, description: 'The run branch tip; UNCHANGED by this call.' }
+                  new_head_sha: { type: string, description: 'Equal to prior_head_sha — the branch was not written to.' }
+                  mechanism_note: { type: string }
+                  conflict_resolution_triggered: { type: boolean, description: 'Always true on a 202. A bounded agent pass was authorized; no merge commit exists yet.' }
+                  conflict_resolution_stage_id: { type: string, description: 'The implement stage the pass re-opened. Await exactly this stage.' }
+                  conflict_resolution_note: { type: string, description: 'Constant sentence stating that nothing was written and naming the await-then-re-invoke route.' }
         '400':
           description: |
             Malformed body or `confirm` not `true`. Body's `error` is
@@ -8003,11 +8041,15 @@ paths:
         '422':
           description: |
             Advance refused, nothing written. One of: `rebase_conflict` (the
-            run branch conflicts with the advanced base; this slice fails
-            closed — see #3202) or `rebase_not_determinable` (fail-closed: an
-            anchor could not be resolved, the behind-probe failed, or the lease
-            re-check found a concurrent push). Body's `message` explains the
-            specific reason and cross-links `reset-branch`.
+            run branch conflicts with the advanced base AND no agent
+            conflict-resolution pass could be started — its ceiling-1 budget is
+            SPENT, or the run has no re-openable implement stage; the message
+            names which, plus the failed pass's confinement-gate reason and the
+            resolve-push-vouch fallback — E64.62 / #3202) or
+            `rebase_not_determinable` (fail-closed: an anchor could not be
+            resolved, the behind-probe failed, or the lease re-check found a
+            concurrent push). Body's `message` explains the specific reason and
+            cross-links `reset-branch`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -8084,10 +8126,12 @@ paths:
         sanctioned idempotent retry (the publisher dedups on success). The
         sanctioned route out of a base advance is now
         `POST /v0/runs/{run_id}/rebase-branch` (E64.23 / #3125), which has the
-        RUNNER advance its own branch; operator-resolve-then-vouch survives
-        ONLY as the fallback for a CONFLICTING base merge, which that endpoint
-        fails closed on (`rebase_conflict`). Agent-driven conflict resolution
-        is deferred to #3202.
+        RUNNER advance its own branch. A CONFLICTING base merge is now handled
+        there too: it triggers a bounded agent conflict-resolution pass
+        (E64.62 / #3202) rather than refusing outright, so the operator does
+        not push to a runner-owned branch. Operator-resolve-then-vouch survives
+        ONLY as the fallback once that single pass is SPENT, which is when the
+        endpoint falls back to `rebase_conflict`.
 
         **Authorization.** Operator-token-only by design (ADR-035 sole-writer
         invariant). Requires `write:stages`. A run-bound MCP token (subject
@@ -8238,8 +8282,10 @@ paths:
         operator-resolve-the-conflict-then-`vouch-commit`-then-re-merge; for a
         branch that has merely fallen BEHIND a clean base,
         `POST /v0/runs/{run_id}/rebase-branch` (E64.23 / #3125) now has the
-        runner advance it, and agent-driven resolution of the conflicting case
-        is deferred to #3202. GitLab MRs are NOT
+        runner advance it, and a CONFLICTING base advance now triggers a
+        bounded agent conflict-resolution pass on that same endpoint
+        (E64.62 / #3202) — the resolve-then-vouch route above survives as the
+        fallback once that single pass is spent. GitLab MRs are NOT
         classified here (the mergeability fields are GitHub-only, so a
         conflicting GitLab MR falls through to today's queue-then-timeout
         behavior — `merge_status`/`detailed_merge_status` would be the signal).

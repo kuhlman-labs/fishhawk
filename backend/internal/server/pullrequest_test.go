@@ -3323,3 +3323,138 @@ func TestNormalizePRBodyFallbackReason_ClosedSet(t *testing.T) {
 		}
 	}
 }
+
+// --- E64.62 / #3202: conflict-resolution recovery at the ship-failure path ---
+
+// TestShipPullRequestFailure_RecoversConflictResolutionPass drives a REAL
+// failure report through the shipped /pull-request route for an implement
+// stage that a conflict-resolution pass had re-opened. The pass's confinement
+// gate refused, so the runner reports the failure — and the run must be
+// restored to its pre-pass review gate rather than left terminal-failed with
+// its intact, mergeable PR orphaned.
+//
+// It also pins the ORDERING at THIS chokepoint: the stage carries a STALE
+// stage_fixup_triggered entry naming NO review stage alongside the newer
+// conflict-resolution anchor that names one, so only the conflict-resolution
+// recovery restores the review gate.
+func TestShipPullRequestFailure_RecoversConflictResolutionPass(t *testing.T) {
+	// fixupRecoveryRepo (not the bare orchestratorRepo) because the recovery
+	// edges failed→succeeded and pending→awaiting_approval are admitted by
+	// ValidStageFixupRecoveryTransition, which only that wrapper consults —
+	// the same repo the sibling fix-up recovery tests drive.
+	sf := newSigningFake()
+	au := newAuditFake()
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		ArtifactRepo: newFakeArtifactRepo(),
+		AuditRepo:    au,
+		RunRepo:      rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	review := rr.seedStage(runRow.ID, 1, run.StageStatePending)
+	review.Type = run.StageTypeReview
+	priv, _ := sf.issue(t, runRow.ID)
+	ctx := t.Context()
+
+	// STALE fix-up anchor (no review stage named).
+	fxPayload, err := json.Marshal(map[string]any{
+		"prior_state": string(run.StageStateSucceeded),
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := au.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: runRow.ID, StageID: &implStage.ID,
+		Category: CategoryStageFixupTriggered, Payload: fxPayload,
+	}); err != nil {
+		t.Fatalf("append fix-up trigger: %v", err)
+	}
+	// NEWER conflict-resolution anchor (names the review stage).
+	crPayload, err := json.Marshal(conflictResolutionTriggerAudit{
+		conflictResolutionTrigger: conflictResolutionTrigger{Branch: "b", BaseRef: "main", Pass: 1},
+		RunID:                     runRow.ID.String(), StageID: implStage.ID.String(),
+		PriorState:            string(run.StageStateSucceeded),
+		ReparkedReviewStageID: review.ID.String(),
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := au.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: runRow.ID, StageID: &implStage.ID,
+		Category: CategoryStageConflictResolutionTriggered, Payload: crPayload,
+	}); err != nil {
+		t.Fatalf("append conflict-resolution trigger: %v", err)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"outcome":  "failed",
+		"category": "C",
+		"reason":   "conflict resolution refused: non_conflicted_index_entry_changed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// The implement stage is RESTORED, not terminal-failed.
+	got, err := rr.GetStage(ctx, implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want succeeded (restored to the pre-pass state)", got.State)
+	}
+	// The conflict-resolution recovery ran, not the fix-up one.
+	var sawCR, sawFixup bool
+	var reason string
+	au.mu.Lock()
+	for _, e := range au.appended {
+		switch e.Category {
+		case CategoryStageConflictResolutionFailed:
+			sawCR = true
+			var p struct {
+				SourceFailureReason string `json:"source_failure_reason"`
+			}
+			if uerr := json.Unmarshal(e.Payload, &p); uerr == nil {
+				reason = p.SourceFailureReason
+			}
+		case CategoryStageFixupRecovered:
+			sawFixup = true
+		}
+	}
+	au.mu.Unlock()
+	if !sawCR {
+		t.Error("no stage_conflict_resolution_failed audit entry recorded")
+	}
+	if sawFixup {
+		t.Error("stage_fixup_recovered written; the stale fix-up anchor must not win at this chokepoint")
+	}
+	if !strings.Contains(reason, "non_conflicted_index_entry_changed") {
+		t.Errorf("source_failure_reason = %q, want the runner's named confinement-gate reason", reason)
+	}
+	// Its anchor is what got applied: the review gate is restored.
+	curReview, err := rr.GetStage(ctx, review.ID)
+	if err != nil {
+		t.Fatalf("GetStage(review): %v", err)
+	}
+	if curReview.State != run.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want awaiting_approval (restored from the conflict-resolution anchor)",
+			curReview.State)
+	}
+	// The run was NOT failed.
+	gotRun, err := rr.GetRun(ctx, runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.State == run.StateFailed {
+		t.Error("run state = failed; a refused conflict-resolution pass is an assist, never an escalation")
+	}
+}

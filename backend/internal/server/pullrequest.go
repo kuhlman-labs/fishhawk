@@ -1488,7 +1488,17 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	// case) returns false and the orchestrator Advance runs unchanged. The
 	// pull_request_failed audit entry is still written either way — it is the
 	// honest record that the commit/push/PR-open step failed.
-	recovered := s.maybeRecoverFixupFailure(r.Context(), runID, stage.ID)
+	// Conflict-resolution recovery (E64.62 / #3202) is tried FIRST, for the
+	// same ordering reason as in advanceAfterFailure: a stage carrying BOTH
+	// trigger categories must restore from the conflict-resolution anchor, not
+	// the stale fix-up one. A pass whose confinement gate REFUSED reaches here
+	// with the implement stage `failed`; restoring it keeps the intact,
+	// mergeable PR from being orphaned over a merge the operator can still
+	// perform by hand.
+	recovered := s.maybeRecoverConflictResolutionFailure(r.Context(), runID, stage.ID)
+	if !recovered {
+		recovered = s.maybeRecoverFixupFailure(r.Context(), runID, stage.ID)
+	}
 
 	// Advance the run so the orchestrator walks it forward — without this the
 	// run stays pending/running after the stage fails. Best-effort, mirroring

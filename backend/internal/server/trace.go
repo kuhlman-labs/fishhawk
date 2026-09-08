@@ -1404,6 +1404,16 @@ func (s *Server) advanceAfterFailure(r *http.Request, runID, stageID uuid.UUID) 
 	// implement-review gating-reject path, and failStageCategoryB/C — all
 	// funnel through here. A non-recovery failure (the common case) returns
 	// false and the orchestrator Advance below runs unchanged.
+	// Conflict-resolution recovery (E64.62 / #3202) runs FIRST, and the order
+	// is load-bearing: a stage that consumed a fix-up pass EARLIER and a
+	// conflict-resolution pass LATER carries both trigger categories, and
+	// maybeRecoverFixupFailure keys on its own now-STALE stage_fixup_triggered
+	// entry — restoring from the wrong anchor. A stage with no
+	// conflict-resolution trigger returns false here and falls straight through
+	// to the unchanged fix-up path below.
+	if s.maybeRecoverConflictResolutionFailure(r.Context(), runID, stageID) {
+		return
+	}
 	if s.maybeRecoverFixupFailure(r.Context(), runID, stageID) {
 		return
 	}

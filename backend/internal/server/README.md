@@ -900,10 +900,11 @@ Mechanics:
   only successes, so a re-vouch re-posts exactly the dropped check and
   no-ops once it is live). The sanctioned route out of a base advance is
   now `fishhawk_rebase_run_branch` (E64.23 / #3125, below), which has the
-  RUNNER advance its own branch. Operator-resolve-then-vouch survives ONLY
-  as the fallback for the case that verb fails closed on — a CONFLICTING
-  base merge (`rebase_conflict`); agent-driven conflict resolution is
-  deferred to #3202.
+  RUNNER advance its own branch. Since E64.62 / #3202 a CONFLICTING base
+  merge is handled there too — it triggers a bounded agent
+  conflict-resolution pass rather than refusing outright — so
+  operator-resolve-then-vouch survives ONLY as the fallback once that
+  single pass is SPENT and the verb falls back to `rebase_conflict`.
 
 - **The re-post is BOUND to the run's own live PR head (E64.26 /
   #3129).** Read this together with the record-verbatim bullet below —
@@ -1007,13 +1008,44 @@ Flow:
   consequence of losing that race is benign HERE (a merge commit on a head
   one commit newer than classified), which is why a merge is acceptable
   where a force-update would not be.
-- **FAIL-CLOSED ON CONFLICT.** `errors.Is(err, githubclient.ErrMergeConflict)`
-  → 422 `rebase_conflict` having written NOTHING: no merge commit, no
-  audit entry, no check re-post, no re-park. The message says so, names
-  #3202 as where agent-driven conflict resolution is tracked, and
-  cross-links `fishhawk_reset_run_branch` (the right verb for a FOREIGN
+- **ON CONFLICT: TRIGGER, THEN FAIL CLOSED (E64.62 / #3202).**
+  `errors.Is(err, githubclient.ErrMergeConflict)` routes to
+  `handleRebaseMergeConflict`, which never forces the merge and never
+  writes to the branch. With the ceiling-1 conflict-resolution budget
+  intact it re-opens the run's implement stage for ONE bounded,
+  operator-authorized agent pass (`triggerConflictResolutionPass`) and
+  returns **202** with `conflict_resolution_triggered`, the re-opened
+  stage id, and a constant note stating that no merge commit exists yet;
+  `new_head_sha` deliberately equals `prior_head_sha` so the 202 cannot be
+  misread as a head that failed to read back. Once that pass is SPENT — or
+  when the run has no implement stage, or the stage is not re-openable, or
+  any repository read fails — the arm is the unchanged fail-closed 422
+  `rebase_conflict` having written NOTHING (no merge commit, no audit
+  entry, no check re-post, no re-park), naming which case applied, the
+  failed pass's confinement-gate reason (read back from
+  `stage_conflict_resolution_failed`), the resolve-push-vouch fallback, and
+  cross-linking `fishhawk_reset_run_branch` (the right verb for a FOREIGN
   COMMIT pushed ON TOP — a different problem). Any other merge error →
   502 `rebase_merge_failed`, likewise nothing written.
+- **THE PASS BUDGET IS ITS OWN COUNTER, NOT THE FIX-UP BUDGET.**
+  `conflictresolution_trigger.go` counts
+  `stage_conflict_resolution_triggered` entries against
+  `conflictResolutionMaxPasses` (1) and hands that count to
+  `run.FixupStage` as the caller-supplied `PriorPassCount` /
+  `MaxPasses` / `HardCeiling`. Nothing on the path reads or writes
+  `stage_fixup_triggered`, which is what makes "a conflict-resolution pass
+  consumes no fix-up budget" STRUCTURALLY true rather than asserted.
+- **A REFUSED PASS RESTORES, IT DOES NOT ESCALATE.**
+  `maybeRecoverConflictResolutionFailure` mirrors
+  `maybeRecoverFixupFailure` and is wired at the SAME two recovery
+  chokepoints (`trace.go`'s `advanceAfterFailure` and
+  `pullrequest.go`'s ship-failure path), **ahead** of it: a stage carrying
+  BOTH trigger categories must restore from the conflict-resolution anchor,
+  not the now-stale fix-up one. It writes
+  `stage_conflict_resolution_failed` (carrying the runner's named
+  confinement-gate reason) and restores the pre-pass implement state +
+  review gate, so a pass that only ever was an assist never lands the run
+  terminal-failed over a merge the operator can still do by hand.
 - **The AUTHORITATIVE new head is a live PR RE-READ**, never
   `MergeBranch`'s return. That is what makes a decoded-201 and an
   undecodable-201 behave IDENTICALLY: the live head is the truth in both
@@ -1808,7 +1840,7 @@ The operator recovery action that re-admits ANY terminal-`failed` run for anothe
 
 - **Auth ladder** (operator-only, mirrors `vouch.go`): anonymous → `401`; a run-bound `mcp:run:<uuid>` token → `403 run_token_forbidden` (even for its own run — an agent self-merging its PR would bypass the operator gate); any identity missing `write:approvals` → `403 insufficient_scope`, enforced UNCONDITIONALLY (no cookie-session bypass, since the verb queues a real squash merge).
 - **Fail-closed guards, all BEFORE any write**: `404 run_not_found`; `409 run_not_mergeable` when the run has no PR url OR is `failed`/`cancelled`; `409 acceptance_gate_not_passed` when the acceptance gate is pending/failed/outcome-unknown or unreadable (ADR-049 decision #6 — passed / not-declared / skipped-out-of-scope proceed); `503 merge_seam_unconfigured` when `GateMerger` is nil; `409 merge_conflicting` when the PR has a merge conflict against its base. It deliberately does NOT block on a review stage parked at `awaiting_approval` — in `feature_change` that stage settles ON merge via `resolveReviewStageOnMerge`, so blocking would deadlock the human merge.
-- **Conflict precondition (E64.14 / #3109)**: `prMergeConflicting` runs AFTER the `GateMerger` guard and BEFORE the `merge_verdict_recorded` append (a durable verdict for a merge that structurally cannot queue is a false record). A conflicting PR can never fire GitHub's auto-merge, so queuing it would only time out at 360s with a message that says nothing about conflicts. The guard is BEST-EFFORT and FAIL-OPEN — it reuses the `lineage.go` resolution idiom (nil `GitHub`, nil/zero installation, unparseable repo/PR, or a `GetPullRequest` error all proceed) and refuses ONLY on an explicit forge signal: `MergeableState == "dirty"` OR a documented `Mergeable == false` (the `mergeable` boolean is kept load-bearing alongside the advisory `mergeable_state`, so the latter can never quietly become the only path). `mergeable_state` `blocked`/`behind`/`unstable`/`draft`/`unknown`/`""` and a `nil` `Mergeable` (GitHub's background mergeability job still running, returning JSON `null`) all proceed. Response `409 merge_conflicting` carries `details {run_id, pr_url, mergeable_state}`; the resolution path for a CONFLICTING base is operator-resolve-the-conflict-then-`vouch-commit`-then-re-merge; for a branch that has merely fallen BEHIND a clean base, `fishhawk_rebase_run_branch` (E64.23 / #3125) now has the runner advance the branch itself, and agent-driven resolution of the conflicting case is deferred to #3202. GitLab MRs are NOT classified — the `forge.PullRequest` mergeability fields are zero on that adapter, so a conflicting GitLab MR falls through to today's queue-then-timeout behavior (`merge_status`/`detailed_merge_status` would be the GitLab signal).
+- **Conflict precondition (E64.14 / #3109)**: `prMergeConflicting` runs AFTER the `GateMerger` guard and BEFORE the `merge_verdict_recorded` append (a durable verdict for a merge that structurally cannot queue is a false record). A conflicting PR can never fire GitHub's auto-merge, so queuing it would only time out at 360s with a message that says nothing about conflicts. The guard is BEST-EFFORT and FAIL-OPEN — it reuses the `lineage.go` resolution idiom (nil `GitHub`, nil/zero installation, unparseable repo/PR, or a `GetPullRequest` error all proceed) and refuses ONLY on an explicit forge signal: `MergeableState == "dirty"` OR a documented `Mergeable == false` (the `mergeable` boolean is kept load-bearing alongside the advisory `mergeable_state`, so the latter can never quietly become the only path). `mergeable_state` `blocked`/`behind`/`unstable`/`draft`/`unknown`/`""` and a `nil` `Mergeable` (GitHub's background mergeability job still running, returning JSON `null`) all proceed. Response `409 merge_conflicting` carries `details {run_id, pr_url, mergeable_state}`; the resolution path for a CONFLICTING base is operator-resolve-the-conflict-then-`vouch-commit`-then-re-merge; for a branch that has merely fallen BEHIND a clean base, `fishhawk_rebase_run_branch` (E64.23 / #3125) now has the runner advance the branch itself, and a CONFLICTING base advance there now triggers a bounded agent conflict-resolution pass (E64.62 / #3202) — the resolve-then-vouch route above survives as the fallback once that single pass is spent. GitLab MRs are NOT classified — the `forge.PullRequest` mergeability fields are zero on that adapter, so a conflicting GitLab MR falls through to today's queue-then-timeout behavior (`merge_status`/`detailed_merge_status` would be the GitLab signal).
 - **Endpoint-side idempotence** (binding condition, #1954): a repeated POST that finds an existing `merge_verdict_recorded` row appends NO duplicate and responds `already_recorded:true`, but ALWAYS re-dispatches the merge helper — so a `502`-then-reinvoke re-queues the merge without ever duplicating the verdict. On a merge-helper error the handler branches on the cause: a checks-not-all-passed refusal (`forge.ErrPullRequestUnstableStatus` — GitHub reports the PR in UNSTABLE status, E67.56 / #2717) returns `409 merge_checks_pending` (`details` `{verdict_sequence, pr_url, reason:"checks_pending"}`) — an expected precondition, not a fault, whose message says the required checks have NOT all passed, that an immediate retry cannot succeed, and that a check which has already FAILED means inspecting the PR rather than waiting; EVERY other error returns `502 merge_dispatch_failed` stating the verdict row is durable and the queue step is retryable, so a genuine dispatch failure is never masked as "just waiting". The verdict row is durable across a `merge_checks_pending` refusal, so `fishhawk_merge_run` re-POSTs across a bounded wait with no duplicate row. Response `{run_id, merge_queued, verdict_sequence, already_recorded, pr_url}`.
 - The endpoint does NOT wait for the merge to land: the merge only ENABLES/queues GitHub's merge, and the `pr_merged` / run-completion settle is left to the `pull_request`-closed webhook — the MCP `fishhawk_merge_run` tool awaits the terminal state client-side.
 - `merge_verdict_recorded` is registered in `audit.KnownCategories` and is an internal, non-comment audit kind (see `docs/issue-comment-surfaces.md`).

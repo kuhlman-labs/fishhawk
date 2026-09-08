@@ -2531,3 +2531,80 @@ func campaignUnclassifiedNextActions(na CampaignNextAction) *NextActions {
 		},
 	}
 }
+
+// --- conflict-resolution advisory (E64.62 / #3202) -------------------------
+
+// categoryStageConflictResolutionTriggered / categoryStageConflictResolutionFailed
+// mirror the backend's audit category strings
+// (backend/internal/server/conflictresolution.go). They are re-declared here
+// rather than imported because the MCP surface reads categories off the wire as
+// plain strings; TestConflictResolutionCategoryStringsMatchBackend pins them
+// against the backend constants so the two cannot drift.
+const (
+	categoryStageConflictResolutionTriggered = "stage_conflict_resolution_triggered"
+	categoryStageConflictResolutionFailed    = "stage_conflict_resolution_failed"
+)
+
+// conflictResolutionPassFailed reports whether the run's NEWEST
+// conflict-resolution pass REFUSED (E64.62 / #3202).
+//
+// Decided by SEQUENCE, not by mere presence: with a ceiling-1 budget there is
+// at most one of each entry today, but a future ceiling raise would make
+// presence-of-a-failure wrong the moment a later pass succeeded. The rule is
+// the one that stays true under a raise — the newest
+// stage_conflict_resolution_failed must come AFTER the newest
+// stage_conflict_resolution_triggered. A run with no trigger at all returns
+// false, so every run that never hit a base conflict is byte-identical.
+func conflictResolutionPassFailed(recent []AuditEntry) bool {
+	var newestTrigger, newestFailure int64 = -1, -1
+	for _, e := range recent {
+		switch e.Category {
+		case categoryStageConflictResolutionTriggered:
+			if e.Sequence > newestTrigger {
+				newestTrigger = e.Sequence
+			}
+		case categoryStageConflictResolutionFailed:
+			if e.Sequence > newestFailure {
+				newestFailure = e.Sequence
+			}
+		}
+	}
+	return newestTrigger >= 0 && newestFailure > newestTrigger
+}
+
+// foldConflictResolutionAdvisory folds the spent-conflict-resolution-budget
+// advisory onto the next_actions block (E64.62 / #3202), in the
+// foldAcceptanceRedispatchAdvisory idiom: display-only, additive, computed off
+// the recent-audit slice the caller already fetched, and applied at BOTH
+// nextActionsFor call sites so the status snapshot and the post-stage snapshot
+// cannot disagree.
+//
+// The gap it closes: a conflict-resolution pass that REFUSED is recovered back
+// to the pre-pass review gate, so the run looks exactly as it did before — the
+// classifier reports the same parked state and says nothing about the fact that
+// fishhawk_rebase_run_branch will now fail closed. The operator would re-invoke
+// the verb, take a 422, and only then learn the budget is spent.
+//
+// It APPENDS exactly one action naming the manual route, and never removes or
+// reorders an existing one: the pass is an assist, so every other move that was
+// legal before it ran is still legal.
+//
+// CONSUMES IS "none" — deliberately NOT consumesFixupBudget. A
+// conflict-resolution pass is counted against its own ceiling-1 counter and
+// touches no fix-up budget, so naming fixup_budget here would contradict the
+// property the trigger is built to guarantee.
+//
+// A no-op — leaving na deep-equal to its unfolded value — when na is nil, when
+// run is nil, or when the newest pass did not fail.
+func foldConflictResolutionAdvisory(run *Run, recent []AuditEntry, na *NextActions) {
+	if run == nil || na == nil || !conflictResolutionPassFailed(recent) {
+		return
+	}
+	na.Actions = append(na.Actions, SuggestedAction{
+		Action:       "fishhawk_vouch_commit",
+		Params:       map[string]string{"run_id": run.ID},
+		Precondition: "the run's conflict-resolution pass REFUSED and its ceiling-1 budget is SPENT, so fishhawk_rebase_run_branch now fails closed on this conflict",
+		Consumes:     consumesNone,
+		Reason:       "the agent pass could not resolve the base conflict within its confinement gate; the branch was left exactly as it was. Resolve the conflict in a worktree, push the run branch, then vouch the resulting head into the ADR-035 reported-head ledger. This pass consumed NO fix-up budget.",
+	})
+}
