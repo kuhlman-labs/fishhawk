@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -594,6 +596,34 @@ func TestPersist_ThreadsGroomingSource(t *testing.T) {
 	}
 	if string(f.campaignGot.GroomingSource) != string(provenance) {
 		t.Errorf("GroomingSource persisted as %s, want %s", f.campaignGot.GroomingSource, provenance)
+	}
+}
+
+// TestPersist_ThreadsGroomingGuard is the E54.17 / #2817 seam assertion: the
+// grooming-currency guard must reach the CAMPAIGN's create params so it rides the
+// campaign row's own guarded INSERT — the same reason GroomingSource does, since
+// Persist is not transactional. A nil guard stays nil (the unguarded default for
+// every epic_ref / explicit-items / allow_superseded campaign).
+func TestPersist_ThreadsGroomingGuard(t *testing.T) {
+	fNone := &itemCapturingFake{}
+	if _, err := campaign.Persist(context.Background(), fNone, "kuhlman-labs/fishhawk",
+		&campaign.Assembly{EpicRef: "issue:2817"}); err != nil {
+		t.Fatalf("Persist (no guard): %v", err)
+	}
+	if fNone.campaignGot.GroomingGuard != nil {
+		t.Errorf("unguarded campaign persisted GroomingGuard %+v, want nil", fNone.campaignGot.GroomingGuard)
+	}
+
+	guard := &campaign.GroomingCurrencyGuard{
+		SourceRunID: uuid.New(), Repo: "kuhlman-labs/fishhawk", WorkflowID: "backlog_grooming",
+	}
+	f := &itemCapturingFake{}
+	if _, err := campaign.Persist(context.Background(), f, "kuhlman-labs/fishhawk",
+		&campaign.Assembly{EpicRef: "", GroomingGuard: guard}); err != nil {
+		t.Fatalf("Persist (guarded): %v", err)
+	}
+	if f.campaignGot.GroomingGuard != guard {
+		t.Errorf("GroomingGuard persisted as %+v, want the threaded guard %+v", f.campaignGot.GroomingGuard, guard)
 	}
 }
 

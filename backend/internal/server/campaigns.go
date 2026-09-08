@@ -720,10 +720,11 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// report or a board.
 	var groomingOrder *campaign.GroomingOrder
 	var groomingProvenance *campaignGroomingSourcePayload
+	var groomingGuard *campaign.GroomingCurrencyGuard
 	itemRefs := req.Items
 	if req.GroomingSource != nil {
 		var gerr error
-		groomingOrder, groomingProvenance, gerr = s.resolveGroomingOrder(r.Context(), owner, name, req.Repo, req.GroomingSource)
+		groomingOrder, groomingProvenance, groomingGuard, gerr = s.resolveGroomingOrder(r.Context(), owner, name, req.Repo, req.GroomingSource)
 		if gerr != nil {
 			var gse *groomingSourceError
 			if errors.As(gerr, &gse) {
@@ -926,8 +927,26 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		assembly.GroomingSource = raw
 	}
 
+	// Thread the grooming-currency guard onto the assembly so it rides the
+	// campaign's OWN INSERT (E54.17 / #2817): the currency decision then commits
+	// atomically with the row, closing the check-to-persist window between
+	// resolveGroomingOrder's supersession scan above and this Persist. Nil for
+	// every non-grooming source and for an allow_superseded grooming source
+	// (resolveGroomingOrder returns a nil guard there deliberately).
+	assembly.GroomingGuard = groomingGuard
+
 	created, err := campaign.Persist(r.Context(), s.cfg.CampaignRepo, req.Repo, assembly)
 	if err != nil {
+		// The guarded INSERT declined: a strictly-newer approved grooming run
+		// superseded the order between the scan and this atomic write, so no
+		// campaign row exists. Mapped to the SAME 422 grooming_order_superseded the
+		// pre-scan returns (with a best-effort superseded_by label), checked FIRST
+		// so every other Persist failure keeps its existing 500 byte-for-byte.
+		if errors.Is(err, campaign.ErrGroomingOrderSuperseded) && groomingGuard != nil {
+			gse := s.groomingSupersededRefusal(r.Context(), groomingGuard)
+			s.writeError(w, r, gse.Status, gse.Code, gse.Message, gse.Details)
+			return
+		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"persist campaign failed", map[string]any{"error": err.Error()})
 		return

@@ -8,9 +8,13 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	campaigndb "github.com/kuhlman-labs/fishhawk/backend/internal/campaign/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -2096,3 +2100,275 @@ func TestPostgres_Campaign_GroomingSourceRoundTrip(t *testing.T) {
 		t.Fatalf("read-back non-grooming grooming_source = %s, want nil", plainRead.GroomingSource)
 	}
 }
+
+// --- Grooming-currency guard (E54.17 / #2817) ---
+//
+// These cases pin CreateCampaignGuardedByGroomingCurrency against REAL Postgres,
+// one behavioral case per NAMED branch of the guard predicate. The SOURCE run is
+// described entirely by the campaign.GroomingCurrencyGuard passed to
+// CreateCampaign — the guard's subquery only scans for NEWER candidate runs — so
+// the fixtures seed only the candidate run(s) + plan stage + grooming_report
+// artifact + approval rows BY CONSTRUCTION, never by calling the control. Each
+// case reads COMMITTED state (a follow-up ListCampaigns) rather than only the
+// returned error, because a guard whose effect is a not-written row cannot be
+// pinned by error identity alone.
+//
+// COUNTERFACTUALS OBSERVED (run, not reasoned — condition 2):
+//   - Deleting the whole `WHERE NOT EXISTS (...)` clause from
+//     createCampaignGuardedByGroomingCurrency in db/queries.sql.go and re-running
+//     TestPostgres_GroomingCurrencyGuard/newer_approved: RED — the campaign row is
+//     created (ListCampaigns returns 1, err is nil) instead of the expected
+//     ErrGroomingOrderSuperseded + zero rows. Restored byte-identically → GREEN.
+//   - Deleting the pgx.ErrNoRows -> ErrGroomingOrderSuperseded translation in
+//     postgres.go (case a is the vehicle that traverses the real repository, since
+//     the handler-mapping unit injects the sentinel through a fake and cannot see
+//     this translation) and re-running the same case: RED — the call returns a
+//     bare wrapped "create campaign: no rows in result set" that
+//     errors.Is(err, ErrGroomingOrderSuperseded) does not match. Restored → GREEN.
+
+// groomingCandidateSpec describes one seeded NEWER grooming run for the guard
+// table. accountID nil = untenanted (NULL account_id); installationID nil = NULL.
+type groomingCandidateSpec struct {
+	repo           string
+	workflowID     string
+	accountID      *uuid.UUID
+	installationID *int64
+	createdAt      time.Time
+	kind           artifact.Kind
+	approve        bool
+	reject         bool
+	explicitID     *uuid.UUID // when set, the run row is given this id (id-order cases)
+}
+
+// seedGroomingCandidate inserts a candidate run + plan stage + artifact + the
+// requested approval rows directly through the real repos, then forces the row's
+// created_at (and account_id) via raw SQL — CreateRun stamps now() and a NULL
+// account, neither of which the ordering/tenancy cases can control otherwise.
+func seedGroomingCandidate(t *testing.T, pool *pgxpool.Pool, runRepo run.Repository, artRepo artifact.Repository, apprRepo approval.Repository, spec groomingCandidateSpec) uuid.UUID {
+	t.Helper()
+	ctx := context.Background()
+	rn, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: spec.repo, WorkflowID: spec.workflowID, WorkflowSHA: "sha",
+		TriggerSource: run.TriggerCLI, InstallationID: spec.installationID,
+	})
+	if err != nil {
+		t.Fatalf("seed candidate run: %v", err)
+	}
+	runID := rn.ID
+	// Force created_at + account_id (and the run id itself for the id-order cases).
+	if spec.explicitID != nil {
+		if _, err := pool.Exec(ctx, "UPDATE runs SET id=$1 WHERE id=$2", *spec.explicitID, runID); err != nil {
+			t.Fatalf("seed candidate id: %v", err)
+		}
+		runID = *spec.explicitID
+	}
+	if _, err := pool.Exec(ctx, "UPDATE runs SET created_at=$1, account_id=$2 WHERE id=$3", spec.createdAt, spec.accountID, runID); err != nil {
+		t.Fatalf("seed candidate created_at/account: %v", err)
+	}
+	stage, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID: runID, Sequence: 0, Type: run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("seed candidate stage: %v", err)
+	}
+	kind := spec.kind
+	if kind == "" {
+		kind = artifact.KindGroomingReport
+	}
+	body := json.RawMessage(`{"grooming_report":true}`)
+	if _, err := artRepo.Create(ctx, artifact.CreateParams{
+		StageID: stage.ID, Kind: kind, Content: body, ContentHash: "sha256:candidate",
+	}); err != nil {
+		t.Fatalf("seed candidate artifact: %v", err)
+	}
+	if spec.approve {
+		if _, err := apprRepo.Submit(ctx, approval.SubmitParams{
+			StageID: stage.ID, ApproverSubject: "op-approve", Decision: approval.DecisionApprove, Surface: "cli",
+		}); err != nil {
+			t.Fatalf("seed candidate approve: %v", err)
+		}
+	}
+	if spec.reject {
+		if _, err := apprRepo.Submit(ctx, approval.SubmitParams{
+			StageID: stage.ID, ApproverSubject: "op-reject", Decision: approval.DecisionReject, Surface: "cli",
+		}); err != nil {
+			t.Fatalf("seed candidate reject: %v", err)
+		}
+	}
+	return runID
+}
+
+func TestPostgres_GroomingCurrencyGuard(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	campRepo := campaign.NewPostgresRepository(pool)
+	runRepo := run.NewPostgresRepository(pool)
+	artRepo := artifact.NewPostgresRepository(pool)
+	apprRepo := approval.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	const workflow = "backlog_grooming"
+	acctA := uuid.New()
+	var install7 int64 = 7
+	// runs.account_id carries an FK to accounts (migration 0055), so a candidate
+	// row bearing acctA needs the account to exist first.
+	if _, err := pool.Exec(ctx, "INSERT INTO accounts (id, account_key) VALUES ($1, $2)", acctA, "acct-a"); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	// maxUUID sorts lexically after every candidate id, so at an EQUAL created_at
+	// the candidate always PRECEDES the source (candidate.id < source.id) — the
+	// strict (created_at, id) order's id tiebreak, proving a same-instant
+	// lexically-smaller candidate does NOT supersede.
+	maxUUID := uuid.MustParse("ffffffff-ffff-ffff-ffff-ffffffffffff")
+
+	type tc struct {
+		name        string
+		guard       func(repo string) *campaign.GroomingCurrencyGuard // nil = unguarded
+		candidates  []groomingCandidateSpec
+		wantRefused bool
+	}
+	cases := []tc{
+		{
+			name: "newer_approved", // case (a): superseded → refused, zero rows
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates:  []groomingCandidateSpec{{workflowID: workflow, createdAt: base.Add(time.Hour), approve: true}},
+			wantRefused: true,
+		},
+		{
+			name: "newer_no_approval", // case (b): report but no grant → created
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates: []groomingCandidateSpec{{workflowID: workflow, createdAt: base.Add(time.Hour)}},
+		},
+		{
+			name: "newer_approve_and_reject", // case (c): contested → not ratified → created
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates: []groomingCandidateSpec{{workflowID: workflow, createdAt: base.Add(time.Hour), approve: true, reject: true}},
+		},
+		{
+			name: "different_repo", // case (d): candidate on another repo → created
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates: []groomingCandidateSpec{{repo: "someone/else", workflowID: workflow, createdAt: base.Add(time.Hour), approve: true}},
+		},
+		{
+			name: "different_account", // case (d): candidate tenanted, source untenanted → created
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates: []groomingCandidateSpec{{workflowID: workflow, accountID: &acctA, createdAt: base.Add(time.Hour), approve: true}},
+		},
+		{
+			name: "different_workflow", // case (d): candidate on another workflow → created
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates: []groomingCandidateSpec{{workflowID: "feature_change", createdAt: base.Add(time.Hour), approve: true}},
+		},
+		{
+			name: "different_installation", // case (d): candidate installed, source nil → created
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates: []groomingCandidateSpec{{workflowID: workflow, installationID: &install7, createdAt: base.Add(time.Hour), approve: true}},
+		},
+		{
+			name: "both_null_account_and_installation_match", // (d): NULL IS NOT DISTINCT FROM NULL → superseded
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates:  []groomingCandidateSpec{{workflowID: workflow, createdAt: base.Add(time.Hour), approve: true}},
+			wantRefused: true,
+		},
+		{
+			name: "both_set_equal_account_and_installation_match", // (d): equal set values match → superseded
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, AccountID: acctA.String(), SourceInstallationID: &install7, SourceCreatedAt: base}
+			},
+			candidates:  []groomingCandidateSpec{{workflowID: workflow, accountID: &acctA, installationID: &install7, createdAt: base.Add(time.Hour), approve: true}},
+			wantRefused: true,
+		},
+		{
+			name: "older_approved", // case (e): candidate older → not newer → created
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates: []groomingCandidateSpec{{workflowID: workflow, createdAt: base.Add(-time.Hour), approve: true}},
+		},
+		{
+			name: "same_created_at_smaller_id", // case (e): equal instant, candidate id < source id → created
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: maxUUID, Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates: []groomingCandidateSpec{{workflowID: workflow, createdAt: base, approve: true, explicitID: uuidPtr(uuid.MustParse("00000000-0000-0000-0000-000000000001"))}},
+		},
+		{
+			name:       "nil_guard_with_newer_approved", // case (f): allow_superseded path → created
+			guard:      func(string) *campaign.GroomingCurrencyGuard { return nil },
+			candidates: []groomingCandidateSpec{{workflowID: workflow, createdAt: base.Add(time.Hour), approve: true}},
+		},
+		{
+			name: "newer_approved_plan_artifact", // case (g): approved but artifact kind=plan → created
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates: []groomingCandidateSpec{{workflowID: workflow, createdAt: base.Add(time.Hour), approve: true, kind: artifact.KindPlan}},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// A unique campaign repo per case isolates both the candidate scan (scoped
+			// by source_repo) and the committed-state count (ListCampaigns by repo).
+			campaignRepo := "kuhlman-labs/case-" + c.name
+			for _, spec := range c.candidates {
+				if spec.repo == "" {
+					spec.repo = campaignRepo
+				}
+				seedGroomingCandidate(t, pool, runRepo, artRepo, apprRepo, spec)
+			}
+			var guard *campaign.GroomingCurrencyGuard
+			if g := c.guard(campaignRepo); g != nil {
+				guard = g
+			}
+			created, err := campRepo.CreateCampaign(ctx, campaign.CreateCampaignParams{
+				Repo: campaignRepo, EpicRef: "", GroomingGuard: guard,
+			})
+			listed, lerr := campRepo.ListCampaigns(ctx, campaign.ListCampaignsFilter{Repo: campaignRepo, Limit: 10})
+			if lerr != nil {
+				t.Fatalf("list campaigns: %v", lerr)
+			}
+			if c.wantRefused {
+				if !errors.Is(err, campaign.ErrGroomingOrderSuperseded) {
+					t.Fatalf("err = %v, want ErrGroomingOrderSuperseded", err)
+				}
+				if created != nil {
+					t.Fatalf("created = %+v, want nil on refusal", created)
+				}
+				if len(listed) != 0 {
+					t.Fatalf("committed campaigns = %d, want 0 (no row on refusal)", len(listed))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CreateCampaign err = %v, want created", err)
+			}
+			if created == nil {
+				t.Fatalf("created = nil, want a campaign")
+			}
+			if len(listed) != 1 {
+				t.Fatalf("committed campaigns = %d, want 1", len(listed))
+			}
+		})
+	}
+}
+
+func uuidPtr(u uuid.UUID) *uuid.UUID { return &u }
