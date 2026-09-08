@@ -635,9 +635,18 @@ func (s *Server) groomingWindowSettlementFor(ctx context.Context, runID uuid.UUI
 // rows into the current disposition set for ONE artifact.
 //
 //   - Each row is decoded through a TOLERANT struct; an undecodable row is
-//     SKIPPED, contributing no disposition. That is the fail-safe direction and
-//     mirrors priorGroomingDispositions: a junk row must not manufacture a
-//     verdict the operator never recorded.
+//     SKIPPED, contributing no disposition. That is the fail-safe direction
+//     HERE: a junk row must not manufacture a verdict the operator never
+//     recorded.
+//   - It deliberately does NOT mirror priorGroomingDispositions, which since
+//     #2813 REFUSES an unattributable row. The difference is principled, not
+//     drift: this projection is a READ-BACK for display against ONE resolved
+//     artifact, where a skipped row suppresses nothing and the operator simply
+//     does not see a disposition they never recorded. The churn baseline's read
+//     DECIDES SUPPRESSION across runs, where a skipped row on the newest
+//     candidate makes that run look dispositionless and lets the scan adopt an
+//     OLDER settled baseline — so there, skipping is fail-OPEN and the read must
+//     refuse.
 //   - Only rows whose artifact_id matches the resolved artifact are kept, so a
 //     capture against an older report never leaks into a newer report's
 //     read-back.

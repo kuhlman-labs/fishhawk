@@ -1119,8 +1119,19 @@ func (f *churnFixture) seedPriorGroomingRunAs(t *testing.T, tweak func(*run.Run)
 		t.Fatalf("seed prior artifact: %v", cerr)
 	}
 
-	record := func(entryID, outcome, skip string) {
-		p, _ := json.Marshal(map[string]any{"entry_id": entryID, "outcome": outcome, "skip_reason": skip})
+	// The seeded rows are marshalled from the WRITER's own struct (#2813), not a
+	// hand-rolled map: groomingApplyAuditSink marshals
+	// workmgmt.GroomingMutationRecord BARE, so the unit corpus and the
+	// production writer now share ONE serialization by construction. A
+	// writer-side json-tag rename moves these fixtures with it instead of
+	// leaving them agreeing with a stale literal that the reader no longer reads.
+	record := func(entryID string, outcome workmgmt.GroomingOutcome, skip string) {
+		p, merr := json.Marshal(workmgmt.GroomingMutationRecord{
+			EntryID: entryID, Outcome: outcome, SkipReason: skip,
+		})
+		if merr != nil {
+			t.Fatalf("marshal apply record: %v", merr)
+		}
 		if _, aerr := f.au.AppendChained(context.Background(), audit.ChainAppendParams{
 			RunID: priorRun, Category: workmgmt.GroomingMutationAppliedCategory, Payload: p,
 		}); aerr != nil {
@@ -1128,10 +1139,10 @@ func (f *churnFixture) seedPriorGroomingRunAs(t *testing.T, tweak func(*run.Run)
 		}
 	}
 	for _, id := range applied {
-		record(id, string(workmgmt.GroomingOutcomeApplied), "")
+		record(id, workmgmt.GroomingOutcomeApplied, "")
 	}
 	for _, id := range rejected {
-		record(id, string(workmgmt.GroomingOutcomeSkipped), workmgmt.GroomingSkipNotApproved)
+		record(id, workmgmt.GroomingOutcomeSkipped, workmgmt.GroomingSkipNotApproved)
 	}
 	return priorRun
 }
@@ -1983,7 +1994,7 @@ func TestGroomingIngest_ChurnDegradeModes(t *testing.T) {
 		}
 	})
 
-	t.Run("an undecodable apply record contributes no disposition", func(t *testing.T) {
+	t.Run("an undecodable apply record degrades the baseline by name", func(t *testing.T) {
 		withConventions(t, workmgmt.Default(), nil)
 		runID, stageID := uuid.New(), uuid.New()
 		f := newChurnFixture(t, runID, stageID)
@@ -2004,6 +2015,13 @@ func TestGroomingIngest_ChurnDegradeModes(t *testing.T) {
 		v := churnVerdict(t, f.au)
 		if v.Summary.Proposed != 2 {
 			t.Errorf("proposed = %v, want everything: an undecodable apply row records no disposition", v.Summary.ProposedIDs)
+		}
+		// The OUTCOME CHANGED with #2813: this row used to be silently skipped,
+		// which was indistinguishable in the audit record from a run that
+		// genuinely settled nothing. It is now a NAMED degrade, which is the
+		// whole point — the operator can see the baseline was unreadable.
+		if !churnDegradedHas(v.Degraded, "baseline_dispositions_unreadable") {
+			t.Errorf("degraded = %v, want baseline_dispositions_unreadable named: an unattributable row is no longer a silent skip", v.Degraded)
 		}
 	})
 }
@@ -2245,6 +2263,173 @@ func TestGroomingIngest_AnUnreadableBaselineInputDoesNotFallBackToAnOlderRun(t *
 			t.Errorf("baseline_entries=%d proposed=%v no_changes=%v; a failed disposition query must not read as an unsettled run and fall back to an older baseline",
 				v.Summary.BaselineEntries, v.Summary.ProposedIDs, v.Summary.NoChangesProposed)
 		}
+	})
+}
+
+// seedGroomingApplyRow appends a RAW grooming_mutation_applied payload to a
+// prior run's audit chain, so a test can seed a row the reader cannot attribute
+// BY CONSTRUCTION rather than by driving the control it is trying to discriminate.
+func (f *churnFixture) seedGroomingApplyRow(t *testing.T, priorRun uuid.UUID, payload string) {
+	t.Helper()
+	if _, err := f.au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: priorRun, Category: workmgmt.GroomingMutationAppliedCategory, Payload: []byte(payload),
+	}); err != nil {
+		t.Fatalf("seed apply audit row: %v", err)
+	}
+}
+
+// TestGroomingChurnBaseline_UnreadableDispositionsDoNotFallThroughToStaleBaseline
+// is the #2813 fall-through proof, and the counterfactual vehicle for
+// priorGroomingDispositions' unattributable-row refusal.
+//
+// The hazard is independent of nesting and was LIVE before this change: the
+// reader `continue`d on an undecodable payload or an empty entry_id, so ONE
+// corrupt row on the NEWEST prior candidate made that whole run resolve
+// dispositionless, groomingChurnBaseline walked PAST it, and the current report
+// was suppressed against an OLDER settled run's dispositions — decisions the
+// operator may since have superseded. That is the same unreadable-vs-absent
+// conflation the #2240 fix-up closed for retrieval failures.
+//
+// The older run's SETTLED dispositions are seeded by construction through
+// seedPriorGroomingRunAs, so the RED lands on the suppression assertion rather
+// than on fixture setup.
+//
+// COUNTERFACTUAL, RUN EMPIRICALLY (binding condition C2). With the step-2
+// control deleted in grooming_report.go — the two error returns replaced by the
+// original `if json.Unmarshal(e.Payload, &rec) != nil || rec.EntryID == "" {
+// continue }` — this test was run and went RED on the suppression assertion:
+//
+//	--- FAIL: TestGroomingChurnBaseline_UnreadableDispositionsDoNotFallThroughToStaleBaseline (0.01s)
+//	    grooming_report_test.go:2338: baseline_entries=3 proposed=[] no_changes=true suppressed=3;
+//	        a corrupt row on the NEWEST candidate must NOT resolve as
+//	        "dispositionless" and let the scan adopt the OLDER settled baseline
+//	    grooming_report_test.go:2342: degraded = []; want baseline_dispositions_unreadable named
+//
+// TestGroomingChurnBaseline_UnattributableDispositionRowDegrades reddened in the
+// same run on all three of its seeded-row subtests, each reporting
+// `suppressed = [...3 entries...], want ZERO` — which is the fail-safe direction
+// (binding condition C1) failing, not merely a missing degrade name.
+//
+// The file was then restored byte-identically and the test observed GREEN.
+func TestGroomingChurnBaseline_UnreadableDispositionsDoNotFallThroughToStaleBaseline(t *testing.T) {
+	withConventions(t, workmgmt.Default(), nil)
+	runID, stageID := uuid.New(), uuid.New()
+	f := newChurnFixture(t, runID, stageID)
+
+	report := churnReport([]int{1, 2}, []float64{9.5, 8.0}, "missing_estimate")
+	var ids []string
+	for _, e := range report.Ordering {
+		ids = append(ids, e.ID)
+	}
+	ids = append(ids, report.HygieneDefects[0].ID)
+
+	// OLDER: settled every entry. Adopted as a baseline it suppresses the whole
+	// report — which is exactly what must NOT happen.
+	f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+		r.CreatedAt = churnCurrentRunTime.Add(-48 * time.Hour)
+	}, report, ids, nil)
+	// NEWER: shipped the same report, and its only disposition row is corrupt.
+	newer := f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+		r.CreatedAt = churnCurrentRunTime.Add(-time.Hour)
+	}, report, nil, nil)
+	f.seedGroomingApplyRow(t, newer, `{"entry_id":"`+ids[0]+`","outcome":"applied","skip_reason":42}`)
+
+	if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: an unreadable baseline input must not fail the ingest", code)
+	}
+	v := churnVerdict(t, f.au)
+	if v.Summary.BaselineEntries != 0 || v.Summary.Proposed != len(ids) || v.Summary.NoChangesProposed ||
+		len(v.Suppressed) != 0 {
+		t.Errorf("baseline_entries=%d proposed=%v no_changes=%v suppressed=%d; a corrupt row on the NEWEST candidate must NOT resolve as \"dispositionless\" and let the scan adopt the OLDER settled baseline",
+			v.Summary.BaselineEntries, v.Summary.ProposedIDs, v.Summary.NoChangesProposed, len(v.Suppressed))
+	}
+	if !churnDegradedHas(v.Degraded, "baseline_dispositions_unreadable") {
+		t.Errorf("degraded = %v; want baseline_dispositions_unreadable named", v.Degraded)
+	}
+}
+
+// TestGroomingChurnBaseline_UnattributableDispositionRowDegrades covers each
+// NAMED failure mode of the #2813 control, one subtest per branch, and asserts
+// on each that the guard fell toward PROPOSING with ZERO suppressed entries —
+// binding condition C1's fail-safe direction, checked rather than argued.
+//
+// The single-prior-run shape here is deliberate: it isolates the branch. The
+// two-run fall-through consequence is pinned separately above.
+func TestGroomingChurnBaseline_UnattributableDispositionRowDegrades(t *testing.T) {
+	report := churnReport([]int{1, 2}, []float64{9.5, 8.0}, "missing_estimate")
+	var ids []string
+	for _, e := range report.Ordering {
+		ids = append(ids, e.ID)
+	}
+	ids = append(ids, report.HygieneDefects[0].ID)
+
+	// assertProposesEverything is the shared fail-safe assertion: the named
+	// degrade, an empty baseline, every entry proposed, and NOTHING suppressed.
+	assertProposesEverything := func(t *testing.T, v churnPayload) {
+		t.Helper()
+		if !churnDegradedHas(v.Degraded, "baseline_dispositions_unreadable") {
+			t.Errorf("degraded = %v, want baseline_dispositions_unreadable named", v.Degraded)
+		}
+		if len(v.Suppressed) != 0 {
+			t.Errorf("suppressed = %v, want ZERO: a baseline that cannot be read must suppress nothing", v.Suppressed)
+		}
+		if v.Summary.BaselineEntries != 0 || v.Summary.Proposed != len(ids) || v.Summary.NoChangesProposed {
+			t.Errorf("baseline_entries=%d proposed=%v no_changes=%v; want an EMPTY baseline proposing all %d entries",
+				v.Summary.BaselineEntries, v.Summary.ProposedIDs, v.Summary.NoChangesProposed, len(ids))
+		}
+	}
+
+	// row seeds ONE raw payload onto an otherwise-settled prior run, so with the
+	// control deleted that run resolves as a real suppressing baseline and the
+	// subtest reddens on the suppression assertion.
+	row := func(t *testing.T, payload string) churnPayload {
+		t.Helper()
+		withConventions(t, workmgmt.Default(), nil)
+		runID, stageID := uuid.New(), uuid.New()
+		f := newChurnFixture(t, runID, stageID)
+		prior := f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+			r.CreatedAt = churnCurrentRunTime.Add(-time.Hour)
+		}, report, ids, nil)
+		f.seedGroomingApplyRow(t, prior, payload)
+		if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201: an unreadable baseline input must not fail the ingest", code)
+		}
+		return churnVerdict(t, f.au)
+	}
+
+	t.Run("an undecodable payload degrades", func(t *testing.T) {
+		// entry_id and outcome decode cleanly; skip_reason is the wrong TYPE, so
+		// encoding/json returns an UnmarshalTypeError with the earlier fields
+		// already populated — the half-decoded row a `continue` absorbed.
+		assertProposesEverything(t, row(t, `{"entry_id":"`+ids[0]+`","outcome":"applied","skip_reason":42}`))
+	})
+
+	t.Run("a decodable payload with an empty entry_id degrades", func(t *testing.T) {
+		// A DISTINCT branch, pinned separately: this row decodes without error,
+		// so only the entry_id check can refuse it. An enveloped record — the
+		// shape the reader's doc comment used to claim it tolerated — decodes to
+		// exactly this state.
+		assertProposesEverything(t, row(t, `{"run_id":"x","record":{"entry_id":"`+ids[0]+`","outcome":"applied"}}`))
+	})
+
+	t.Run("a bare empty entry_id degrades", func(t *testing.T) {
+		assertProposesEverything(t, row(t, `{"entry_id":"","outcome":"applied"}`))
+	})
+
+	t.Run("the disposition query failing still degrades the same way", func(t *testing.T) {
+		// The pre-existing #2240 branch, re-asserted here beside the new ones so
+		// all three modes of baseline_dispositions_unreadable read together.
+		withConventions(t, workmgmt.Default(), nil)
+		runID, stageID := uuid.New(), uuid.New()
+		f := newChurnFixture(t, runID, stageID)
+		prior := f.seedPriorGroomingRunAs(t, func(r *run.Run) {
+			r.CreatedAt = churnCurrentRunTime.Add(-time.Hour)
+		}, report, ids, nil)
+		f.s.cfg.AuditRepo = &churnAuditListFailFake{auditFake: f.au, failRun: prior}
+		if _, code := shipGrooming(t, f, runID, stageID, report); code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", code)
+		}
+		assertProposesEverything(t, churnVerdict(t, f.au))
 	})
 }
 

@@ -17,6 +17,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1409,6 +1411,87 @@ func TestGroomingApplyAuditSink_MarshalsBare(t *testing.T) {
 	if rows[0].RunID != f.stage.RunID {
 		t.Errorf("audit row RunID = %v, want %v", rows[0].RunID, f.stage.RunID)
 	}
+}
+
+// TestGroomingMutationProjections_MatchWriterTags is the STRUCTURAL half of the
+// #2813 payload-shape pin: the reader's projections and the writer's struct must
+// agree BY CONSTRUCTION, not by a doc comment.
+//
+// groomingApplyAuditSink marshals workmgmt.GroomingMutationRecord BARE, and two
+// readers decode that payload by json tag — groomingDispositionProjection
+// (grooming_report.go, the churn baseline) and groomingStepsProjection
+// (grooming_apply.go, the #2810 partial-write ledger). Neither is bound to the
+// writer by the compiler: rename a writer tag and both readers keep compiling
+// and start decoding nothing, which surfaces in production as a silently empty
+// baseline or a silently absent resume ledger, not as a failure.
+//
+// The assertion is made against the WRITER'S JSON TAGS, not its field names, and
+// it reddens on a rename in EITHER direction: a writer-side rename removes the
+// tag from the set, and a reader-side rename introduces one that is not in it.
+func TestGroomingMutationProjections_MatchWriterTags(t *testing.T) {
+	writer := jsonTagNames(t, reflect.TypeOf(workmgmt.GroomingMutationRecord{}))
+	if len(writer) == 0 {
+		t.Fatal("workmgmt.GroomingMutationRecord exposes no json tags; the pin would be vacuous")
+	}
+	for _, tc := range []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{"groomingDispositionProjection", reflect.TypeOf(groomingDispositionProjection{})},
+		{"groomingStepsProjection", reflect.TypeOf(groomingStepsProjection{})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tags := jsonTagNames(t, tc.typ)
+			if len(tags) == 0 {
+				t.Fatalf("%s exposes no json tags; it cannot read a bare record", tc.name)
+			}
+			for _, tag := range sortedTagNames(tags) {
+				if _, ok := writer[tag]; !ok {
+					t.Errorf("%s reads json key %q, which workmgmt.GroomingMutationRecord does not write (writer tags: %v). "+
+						"A reader and writer that disagree decode to nothing and degrade silently — move both together.",
+						tc.name, tag, sortedTagNames(writer))
+				}
+			}
+		})
+	}
+}
+
+// jsonTagNames collects the json key each exported field of a struct marshals
+// to, dropping options like ",omitempty" and skipping `json:"-"`.
+func jsonTagNames(t *testing.T, typ reflect.Type) map[string]struct{} {
+	t.Helper()
+	if typ.Kind() != reflect.Struct {
+		t.Fatalf("jsonTagNames: %s is not a struct", typ)
+	}
+	out := map[string]struct{}{}
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		tag := f.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		name, _, _ := strings.Cut(tag, ",")
+		if name == "" {
+			// No tag: encoding/json marshals under the FIELD NAME, which is the
+			// shape neither side intends. Record it so a dropped tag is visible
+			// rather than silently matching nothing.
+			name = f.Name
+		}
+		out[name] = struct{}{}
+	}
+	return out
+}
+
+func sortedTagNames(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ---------------------------------------------------------------------------
