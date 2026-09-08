@@ -2616,6 +2616,96 @@ func assertRefEqual(t *testing.T, path string, got, want *string) {
 	}
 }
 
+// TestCreateRun_PersistsRequiresCharter pins the runs.requires_charter column
+// (migration 0082, E54.13 / #2806) across all THREE Run read paths —
+// CreateRun's own return, GetRun, and ListRuns — against a real Postgres, for
+// all THREE persisted states.
+//
+// The nil arm is the load-bearing one: it proves SQL NULL scans back as nil
+// rather than being coerced to false, which is what keeps a row with NO
+// persisted determination distinguishable from a persisted NON-grooming row.
+// A repo layer that promoted nil → false on write (the max_retries /
+// runner_kind default-substitution pattern next to it) or a mapper that
+// coerced NULL → false on read would collapse two of the three states and
+// pass a two-state test.
+//
+// Three read paths because each is a distinct sqlc column-list/scan expansion
+// site in the hand-edited generated package: a query whose SELECT/RETURNING
+// list or Scan targets missed the column fails at runtime (pgx column-count
+// or scan error), never at compile time, so the ListRuns arm is what makes a
+// missed site fail loudly instead of silently dropping the fact on one path.
+func TestCreateRun_PersistsRequiresCharter(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	yes, no := true, false
+	cases := []struct {
+		name string
+		val  *bool
+	}{
+		{"persisted grooming (true) round-trips as true", &yes},
+		{"persisted non-grooming (false) round-trips as false, NOT nil", &no},
+		{"no persisted determination (nil) round-trips as nil, NOT false", nil},
+	}
+
+	created := make(map[uuid.UUID]*bool, len(cases))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := repo.CreateRun(ctx, run.CreateRunParams{
+				Repo:            "kuhlman-labs/fishhawk-requires-charter",
+				WorkflowID:      "backlog_grooming",
+				WorkflowSHA:     "deadbeef",
+				TriggerSource:   run.TriggerCLI,
+				RequiresCharter: tc.val,
+			})
+			if err != nil {
+				t.Fatalf("create run: %v", err)
+			}
+			assertBoolPtrEqual(t, "CreateRun", r.RequiresCharter, tc.val)
+
+			got, err := repo.GetRun(ctx, r.ID)
+			if err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			assertBoolPtrEqual(t, "GetRun", got.RequiresCharter, tc.val)
+			created[r.ID] = tc.val
+		})
+	}
+
+	list, err := repo.ListRuns(ctx, run.ListRunsFilter{Repo: "kuhlman-labs/fishhawk-requires-charter", Limit: 100})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	seen := 0
+	for _, r := range list {
+		want, ok := created[r.ID]
+		if !ok {
+			continue
+		}
+		seen++
+		assertBoolPtrEqual(t, "ListRuns", r.RequiresCharter, want)
+	}
+	if seen != len(created) {
+		t.Errorf("ListRuns returned %d of the %d created runs", seen, len(created))
+	}
+}
+
+// assertBoolPtrEqual compares two *bool values, distinguishing nil from a
+// pointer to false — the distinction the requires_charter tri-state rests on.
+func assertBoolPtrEqual(t *testing.T, path string, got, want *bool) {
+	t.Helper()
+	switch {
+	case want == nil && got == nil:
+	case want == nil:
+		t.Errorf("%s RequiresCharter = %v, want nil (NULL must not be coerced to a bool)", path, *got)
+	case got == nil:
+		t.Errorf("%s RequiresCharter = nil, want %v", path, *want)
+	case *got != *want:
+		t.Errorf("%s RequiresCharter = %v, want %v", path, *got, *want)
+	}
+}
+
 // TestCreateRun_RetryChildOnceIndexIsBenignDuplicate is the persistence-layer
 // half of the constraint-based retry dedup (#2043, C1/BC3): a SECOND child run
 // at the same (parent_run_id, retry_attempt) with retry_attempt > 0 must come

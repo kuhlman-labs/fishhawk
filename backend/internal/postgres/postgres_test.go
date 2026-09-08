@@ -3193,6 +3193,93 @@ func TestMigrateDown_RunsInstallationRefReversal(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_RunsRequiresCharterReversal pins 0082 (E54.13 / #2806) in
+// BOTH directions and on the column's SHAPE, not just its existence:
+// runs.requires_charter EXISTS after MigrateUp, is NULLABLE, and carries NO
+// column default; it is GONE after rolling back through 0082 with the runs
+// table surviving (0082 is a single ALTER, never a DROP TABLE); and it RETURNS
+// on a second MigrateUp. Mirrors the 0076 column-reversal shape.
+//
+// The nullable + no-default assertions are the done-means no compiler checks:
+// the tri-state (TRUE / FALSE / NULL = no persisted determination) collapses if
+// the column is NOT NULL, and a `DEFAULT false` regression would silently
+// assert non-grooming for every legacy grooming row and fall the prompt-serve
+// control open. Both are asserted from information_schema so that regression
+// fails HERE rather than surfacing as a served-without-charter prompt.
+func TestMigrateDown_RunsRequiresCharterReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+
+	requiresCharterColumn := func() int {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = 'runs' AND column_name = 'requires_charter'`).Scan(&n); err != nil {
+			t.Fatalf("query runs.requires_charter: %v", err)
+		}
+		return n
+	}
+	assertShape := func(phase string) {
+		t.Helper()
+		var nullable, dataType string
+		var columnDefault *string
+		if err := pool.QueryRow(ctx,
+			`SELECT is_nullable, data_type, column_default FROM information_schema.columns
+			  WHERE table_name = 'runs' AND column_name = 'requires_charter'`).Scan(&nullable, &dataType, &columnDefault); err != nil {
+			t.Fatalf("%s: query runs.requires_charter shape: %v", phase, err)
+		}
+		if nullable != "YES" {
+			t.Errorf("%s: runs.requires_charter is_nullable = %q, want YES (NULL = no persisted determination is load-bearing)", phase, nullable)
+		}
+		if columnDefault != nil {
+			t.Errorf("%s: runs.requires_charter column_default = %q, want none (a DEFAULT would assert a determination for rows nothing decided)", phase, *columnDefault)
+		}
+		if dataType != "boolean" {
+			t.Errorf("%s: runs.requires_charter data_type = %q, want boolean", phase, dataType)
+		}
+	}
+
+	if n := requiresCharterColumn(); n != 1 {
+		t.Fatalf("runs.requires_charter count after MigrateUp = %d, want 1 (0082 added it)", n)
+	}
+	assertShape("after MigrateUp")
+
+	// Roll back through 0082, the reversal under test. downThrough names 0082
+	// (rather than a single MigrateDown at the tip) so this stays a one-line
+	// target when a migration lands above it.
+	downThrough(t, url, "0082")
+	if n := requiresCharterColumn(); n != 0 {
+		t.Errorf("runs.requires_charter count after MigrateDown = %d, want 0 (0082 reverted)", n)
+	}
+	var runsTable int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'runs'`).Scan(&runsTable); err != nil {
+		t.Fatalf("query runs table: %v", err)
+	}
+	if runsTable != 1 {
+		t.Errorf("'runs' table count after MigrateDown = %d, want 1 (0082 is a single ALTER)", runsTable)
+	}
+
+	// Re-apply: the column returns with the same shape, so the up migration
+	// is re-runnable after a rollback (IF NOT EXISTS keeps it idempotent).
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp (re-apply after rollback): %v", err)
+	}
+	if n := requiresCharterColumn(); n != 1 {
+		t.Fatalf("runs.requires_charter count after re-apply = %d, want 1 (0082 re-added it)", n)
+	}
+	assertShape("after re-apply")
+}
+
 // TestMigrateDown_InstallationsProjectPathReversal pins 0078 (E45.26 / #2877)
 // in BOTH directions: installations.project_path EXISTS after MigrateUp and is
 // GONE after rolling back through 0078, with the installations table surviving

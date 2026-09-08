@@ -49,6 +49,22 @@ Reconciliation: the trace handler reconciles via `trace.go::reconcileRunnerKind`
 
 **sqlc.** Unlike `working_dir` (#2482), the `db` package was REGENERATED rather than hand-edited: `sqlc generate` was run from `backend/` against a config narrowed to the `internal/run` entry (the full config aborts on pre-existing errors in the unrelated `account` / `audit` query files) and only `internal/run/db/` was kept. That regeneration also restored column-list expansions a prior hand-edit had let drift — `account_id` on the non-`GetRun` Run-returning queries, `progress` / `dispatched_at` on `ParkScopeCompleteness` — so those columns are now populated on every read path.
 
+## `requires_charter` — the persisted grooming determination (E54.13 / #2806)
+
+`runs.requires_charter` (migration `0082_runs_requires_charter`, `BOOLEAN` NULLABLE, NO column default, NO backfill) records, at run creation, whether the workflow the run was minted from produces a `grooming_report` — the same pure structural predicate the #2236 charter admission gate evaluates at that exact moment, when the workflow spec is known-parseable. Persisting it lets the prompt-serve path READ a fact instead of re-deriving it from a cached `workflow_spec` that may since have been corrupted (the two #2805 residuals). This package only carries the column; nothing in it reads or decides on the value.
+
+**Three states, deliberately distinguishable.** `true` = grooming, the plan prompt must carry a charter. `false` = non-grooming. `nil` (SQL `NULL`) = **no persisted determination** — NOT "pre-migration row" exclusively: it covers a row minted before 0082 AND a child minted via `ChildParamsFrom` from such a parent, because children inherit the value verbatim, including `nil` (a child's spec IS the parent's spec, so the consumer's legacy branch decides both from the same cached bytes). The `nil` population is therefore bounded and non-growing except by descent from legacy parents. A consumer derives the determination for a `nil` row from the cached spec and fails closed when that spec is undecidable.
+
+**No default, no promotion.** The column deliberately has no `DEFAULT false`: that would assert non-grooming for every legacy grooming row and fall the prompt-serve control open for exactly the rows it cannot decide. For the same reason `postgresRepo.CreateRun` passes `CreateRunParams.RequiresCharter` VERBATIM — unlike the `max_retries` / `runner_kind` zero-value substitution beside it — so `nil` persists as `NULL`, and `rowToRun` never coerces `NULL` to `false`.
+
+No backfill: the determination is a property of the PARSED spec, and computing it in SQL would reintroduce the byte scan the change exists to delete. `TestCreateRun_PersistsRequiresCharter` asserts all three states round-trip distinctly across `CreateRun` / `GetRun` / `ListRuns`; `TestMigrateDown_RunsRequiresCharterReversal` (`internal/postgres`) asserts the column is nullable with no default from `information_schema`, is dropped by the down migration, and returns on re-apply.
+
+**Rollback.** `MigrateDown` through 0082 drops the column cleanly (no index, no constraint, no backfill).
+
+Read the consequence honestly: a rollback RESTORES the spec-derived behaviour — every consumer goes back to deciding the determination from the cached `workflow_spec` bytes — and LOSES the corruption protection this column adds, because a row whose cached spec has since been corrupted can no longer be decided from a fact recorded when the spec was known-parseable. The column carries real information for exactly that row class; it is only redundant with `workflow_spec` while that spec still parses.
+
+**sqlc.** Hand-edited like `working_dir` (#2482), not regenerated: every Run-returning query in `db/queries.sql.go` (`CreateRun`, `GetRun`, `GetRunByIdempotencyKey`, `ListRuns`, `LockRunForUpdate`, and the `Update*` / `AddRunCost` / `SetRun*` set) gained `requires_charter` at the END of its SELECT/RETURNING list and `&i.RequiresCharter` at the end of its scan block, `CreateRun`'s explicit column list gained it as `$23`, and `db.Run` gained `RequiresCharter *bool`. A missed site is a runtime pgx column-count error, not a compile error — which is what the `ListRuns` arm of the round-trip test exists to catch.
+
 ## `runs_retry_child_once_idx` — atomic CI-failure-retry dedup (E45.22 / #2043)
 
 The same migration creates `CREATE UNIQUE INDEX runs_retry_child_once_idx ON runs (parent_run_id, retry_attempt) WHERE parent_run_id IS NOT NULL AND retry_attempt > 0`. Both CI-failure retry paths (the pre-existing GitHub `check_run` path and the GitLab pipeline path) previously deduplicated with a read followed by a write and no atomicity between them, so two concurrent deliveries for one failure could both observe "no child yet" and both insert.
@@ -354,7 +370,7 @@ The other two non-test `CreateRunParams` literals — `server.(*Server).CreateRu
 
 `childParamsInheritance` in `childparams.go` carries one row per `CreateRunParams` field: a mode and a one-sentence reason. It is the decision record, and it is enforced.
 
-- **`inherited`** — copied verbatim from the parent row. `Repo`, `WorkflowID`, `WorkflowSHA`, `TriggerSource`, `TriggerRef`, `InstallationID`, `InstallationRef`, `RunnerKind`, `WorkflowSpec`, `WorkingDir`, `RequiredChecksSnapshot`, `MaxRetriesSnapshot`, `IssueContext`.
+- **`inherited`** — copied verbatim from the parent row. `Repo`, `WorkflowID`, `WorkflowSHA`, `TriggerSource`, `TriggerRef`, `InstallationID`, `InstallationRef`, `RunnerKind`, `WorkflowSpec`, `WorkingDir`, `RequiredChecksSnapshot`, `MaxRetriesSnapshot`, `IssueContext`, `RequiresCharter` (verbatim INCLUDING `nil` — see the `requires_charter` section above).
 - **`derived`** — computed from the parent, never copied. Today only `ParentRunID = &parent.ID`; a verbatim copy of `parent.ParentRunID` would point the child at its GRANDparent.
 - **`notInherited`** — deliberately left zero for the site to set. `RetryAttempt`, `DecomposedFrom`, `SliceIndex`, `IdempotencyKey`, `UpstreamRunID`, `Drive`.
 

@@ -107,6 +107,15 @@ type CreateRunParams struct {
 	// migration 0065 '' default. Persisted verbatim; the MCP layer, not this
 	// layer, owns the transport-conditional absolute-path validation.
 	WorkingDir string
+	// RequiresCharter is the grooming determination to persist on the run
+	// row (migration 0082, E54.13 / #2806). A root mint site stamps a
+	// pointer to the WorkflowRequiresCharter verdict for the resolved
+	// workflow; a child mint inherits the parent's value verbatim via
+	// ChildParamsFrom. nil means "no persisted determination" and is
+	// persisted as SQL NULL — the repo layer never promotes it to false,
+	// because NULL and FALSE are different states to the consumer (see
+	// Run.RequiresCharter for the full tri-state contract).
+	RequiresCharter *bool
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.

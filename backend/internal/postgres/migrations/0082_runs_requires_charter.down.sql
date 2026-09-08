@@ -1,0 +1,12 @@
+-- Down-migration for 0082: drop runs.requires_charter.
+--
+-- Column-only and additive (no index, no constraint, no backfill), so the drop
+-- is clean. Read the consequence honestly: a rollback RESTORES the
+-- spec-derived behaviour — every consumer goes back to deciding the grooming
+-- determination from the cached workflow_spec bytes — and LOSES the corruption
+-- protection 0082 adds, because a row whose cached spec has since been
+-- corrupted can no longer be decided from a fact recorded when the spec was
+-- known-parseable. The column carries real information for exactly that row
+-- class; it is only redundant with workflow_spec while that spec still parses.
+-- IF EXISTS keeps the rollback idempotent.
+ALTER TABLE runs DROP COLUMN IF EXISTS requires_charter;

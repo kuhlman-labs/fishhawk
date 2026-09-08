@@ -579,9 +579,35 @@ type Run struct {
 	// wildly wrong prediction costs at most a coarser or finer poll interval,
 	// never a run's progress.
 	PredictedRuntimeMinutes int
-	State                   State
-	CreatedAt               time.Time
-	UpdatedAt               time.Time
+	// RequiresCharter is the persisted grooming determination (migration
+	// 0082, E54.13 / #2806): whether the workflow this run was minted from
+	// produces a grooming_report, as decided by the pure structural predicate
+	// the #2236 charter admission gate evaluates at creation, when the spec
+	// is known-parseable. Persisting it lets the prompt-serve path read a
+	// fact instead of re-deriving it from a cached WorkflowSpec that may
+	// since have been corrupted.
+	//
+	// THREE STATES, deliberately distinguishable — do NOT collapse them:
+	//   pointer to true   grooming; the plan prompt must carry a charter.
+	//   pointer to false  non-grooming.
+	//   nil               NO persisted determination. Covers a row minted
+	//                     before migration 0082 AND a child minted via
+	//                     ChildParamsFrom from such a parent (children
+	//                     inherit the value verbatim, including nil, because
+	//                     a child's spec IS the parent's spec). The
+	//                     population is bounded and non-growing except by
+	//                     descent from legacy parents; a consumer derives
+	//                     the determination from the cached spec and fails
+	//                     closed when that spec is undecidable.
+	//
+	// The repo layer passes it through verbatim in BOTH directions: nil is
+	// persisted as SQL NULL (never promoted to false, unlike the
+	// max_retries / runner_kind default substitution next to it) and NULL
+	// scans back as nil.
+	RequiresCharter *bool
+	State           State
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // IssueContext is the cached payload from `gh issue view --json

@@ -75,6 +75,8 @@ var childParamsInheritance = map[string]childFieldDecision{
 		"A child inherits the parent's snapshotted on_ci_failure cap so every row in one chain reports the same N/M (#280)."},
 	"IssueContext": {modeInherited,
 		"The child works the same issue as its parent, so it reuses the cached context rather than re-fetching it (#415); a site needing a narrowed context overrides after the call."},
+	"RequiresCharter": {modeInherited,
+		"A child executes the same workflow definition as its parent, so it carries the same grooming determination (migration 0082 / #2806) — verbatim, INCLUDING nil: a child of a parent with no persisted determination has none either, and the consumer's legacy branch derives it from the (shared) cached spec."},
 
 	// --- derived: computed from the parent, never copied.
 	"ParentRunID": {modeDerived,
@@ -129,6 +131,7 @@ func ChildParamsFrom(parent *Run) CreateRunParams {
 		RequiredChecksSnapshot: parent.RequiredChecksSnapshot,
 		MaxRetriesSnapshot:     parent.MaxRetriesSnapshot,
 		IssueContext:           parent.IssueContext,
+		RequiresCharter:        parent.RequiresCharter,
 
 		// derived
 		ParentRunID: &parentID,
