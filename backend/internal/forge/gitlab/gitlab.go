@@ -90,6 +90,11 @@ var _ forge.Forge = (*Forge)(nil)
 // file-read capability the per-repo conventions loader consumes (#2022).
 var _ forge.FileFetcher = (*Forge)(nil)
 
+// Compile-time assertion that the adapter provides the standalone
+// issue-thread capability the split-parent auto-close watcher consumes
+// (E50.17 / #2900).
+var _ forge.IssueOperations = (*Forge)(nil)
+
 // Option customises a Forge at construction.
 type Option func(*forgeConfig)
 
@@ -738,6 +743,133 @@ func (f *Forge) FetchFile(ctx context.Context, scope forge.CredentialScope, repo
 		return nil, mapError(err)
 	}
 	return &forge.FileContent{Path: file.FilePath, Content: file.Content, SHA: file.BlobID}, nil
+}
+
+// --- forge.IssueOperations (E50.17 / #2900) -----------------------------
+
+// GitLab's issue lifecycle words and the state_event verbs that move
+// between them (https://docs.gitlab.com/ee/api/issues.html#edit-issue).
+const (
+	gitlabIssueStateOpened = "opened"
+	gitlabIssueStateClosed = "closed"
+	gitlabStateEventClose  = "close"
+	gitlabStateEventReopen = "reopen"
+)
+
+// FetchIssue reads an issue by its project-scoped iid and NORMALIZES its
+// state onto the forge-neutral vocabulary: GitLab's "opened" becomes
+// "open", "closed" stays "closed", and any other value passes through
+// unchanged. Without the normalization the watcher's already-closed
+// short-circuit (which compares against "closed") would still work, but a
+// consumer comparing against "open" would silently never match — and the
+// failure mode of a missed match is a duplicate comment, not an error.
+//
+// StateReason is left EMPTY on purpose: GitLab's issue object has no
+// state_reason field, so there is nothing to carry and fabricating
+// "completed" for every closed issue would turn the watcher's
+// not-planned gate into a lie. This is a named gap, documented in the
+// forge README.
+func (f *Forge) FetchIssue(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, number int) (*forge.Issue, error) {
+	c, pid, err := f.resolve(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	is, err := c.GetIssue(ctx, pid, number)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &forge.Issue{
+		Number: is.IID,
+		Title:  is.Title,
+		Body:   is.Description,
+		State:  normalizeIssueState(is.State),
+		Labels: is.Labels,
+	}, nil
+}
+
+// normalizeIssueState maps GitLab's native issue state onto the
+// forge-neutral "open"|"closed" words, passing an unrecognized value
+// through so a consumer sees it rather than a guessed mapping.
+func normalizeIssueState(s string) string {
+	switch s {
+	case gitlabIssueStateOpened:
+		return "open"
+	case gitlabIssueStateClosed:
+		return "closed"
+	default:
+		return s
+	}
+}
+
+// FetchIssueComments lists the issue's notes, paged to exhaustion by the
+// client, and maps them onto forge.IssueComment. GitLab `system` notes
+// (label/milestone activity) are INCLUDED: they never carry a Fishhawk
+// marker, so filtering them would add a branch with no behavioral effect.
+func (f *Forge) FetchIssueComments(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, number int) ([]forge.IssueComment, error) {
+	c, pid, err := f.resolve(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	notes, err := c.ListIssueNotes(ctx, pid, number)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	out := make([]forge.IssueComment, 0, len(notes))
+	for _, n := range notes {
+		out = append(out, forge.IssueComment{ID: n.ID, Author: n.Author, Body: n.Body, CreatedAt: n.CreatedAt})
+	}
+	return out, nil
+}
+
+// PostIssueComment posts body as a new note on the issue.
+func (f *Forge) PostIssueComment(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, number int, body string) error {
+	c, pid, err := f.resolve(ctx, scope)
+	if err != nil {
+		return err
+	}
+	if _, err := c.CreateIssueNote(ctx, pid, number, body); err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
+// SetIssueState translates the forge-neutral target state onto GitLab's
+// state_event verb — "closed" -> "close", "open" -> "reopen" — because the
+// edit-issue endpoint changes state only through state_event, never by
+// writing `state` directly. A nil State, or a State that is neither word,
+// is refused with forge.ErrValidation BEFORE any HTTP call. u.StateReason
+// is IGNORED per the interface's best-effort contract: GitLab has no
+// state_reason concept, so the state change is recorded and the reason is
+// dropped rather than the call failing.
+func (f *Forge) SetIssueState(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, number int, u forge.IssueStateUpdate) error {
+	event, err := issueStateEvent(u.State)
+	if err != nil {
+		return err
+	}
+	c, pid, err := f.resolve(ctx, scope)
+	if err != nil {
+		return err
+	}
+	if _, err := c.UpdateIssue(ctx, pid, number, gitlabclient.UpdateIssueParams{StateEvent: event}); err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
+// issueStateEvent maps a forge-neutral target state onto GitLab's
+// state_event verb, refusing (ErrValidation) an absent or unknown state.
+func issueStateEvent(state *string) (string, error) {
+	if state == nil {
+		return "", fmt.Errorf("%w: set issue state requires a target state", forge.ErrValidation)
+	}
+	switch *state {
+	case "closed":
+		return gitlabStateEventClose, nil
+	case "open":
+		return gitlabStateEventReopen, nil
+	default:
+		return "", fmt.Errorf("%w: set issue state: unknown target state %q (want \"open\" or \"closed\")", forge.ErrValidation, *state)
+	}
 }
 
 // changedPath returns the path a compare diff entry reports as changed — the
