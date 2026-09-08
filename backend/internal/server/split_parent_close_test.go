@@ -17,6 +17,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
@@ -24,9 +26,12 @@ import (
 )
 
 // This file is the END-TO-END seam suite for the E50.6 parent-close watcher
-// (#2062). Every behavioral test drives the REAL signed-webhook path —
-// postWebhook -> s.Handler() -> handleWebhook -> handleContractChildClosed ->
-// a genuine *githubclient.Client -> a STATEFUL httptest GitHub fake — and NO
+// (#2062), for BOTH forges since E50.17 / #2900. Every behavioral test drives
+// the REAL signed-webhook path — postWebhook -> s.Handler() -> handleWebhook
+// -> handleContractChildClosed -> forgegithub.Forge over a genuine
+// *githubclient.Client -> a STATEFUL httptest GitHub fake; or postGitLab ->
+// handleWebhookGitLab -> handleContractChildClosed -> a real *forgegitlab.Forge
+// (injected via cfg.ForgeResolver) -> a STATEFUL httptest GitLab fake — and NO
 // test calls handleContractChildClosed directly.
 //
 // That is deliberate. The change spans four layers: the webhook payload decode,
@@ -247,6 +252,237 @@ func writeFakeJSON(t *testing.T, w http.ResponseWriter, code int, v any) {
 	}
 }
 
+// --- stateful GitLab fake -------------------------------------------------
+
+// splitParentGitLab is an httptest GitLab serving the four endpoints the
+// watcher touches through the real *forgegitlab.Forge —
+// GET/PUT /api/v4/projects/:id/issues/:iid and GET/POST .../notes — keyed by
+// "<project-id>#<iid>". Issue state is held in GitLab's NATIVE vocabulary
+// ("opened" | "closed") so the adapter's normalization is exercised, and a PUT
+// changes state ONLY through `state_event` ("close" -> closed, "reopen" ->
+// opened), as the real API does. Like the GitHub fake it records every request
+// in arrival ORDER and injects a per-endpoint failure that is then CLEARED.
+// pageSize > 0 makes the notes list PAGINATE with an RFC 8288 rel="next" Link
+// header, so the adapter's page-to-exhaustion walk is exercised end to end.
+type splitParentGitLab struct {
+	mu      sync.Mutex
+	baseURL string
+	issues  map[string]*fakeIssueState
+	notes   map[string][]string
+	calls   []string
+
+	pageSize int
+
+	failGetIssue  bool
+	failListNotes bool
+	failPostNote  bool
+	failPutIssue  bool
+}
+
+func newSplitParentGitLab() *splitParentGitLab {
+	return &splitParentGitLab{
+		issues: map[string]*fakeIssueState{},
+		notes:  map[string][]string{},
+	}
+}
+
+func gitlabIssueKey(projectID, iid int) string {
+	return strconv.Itoa(projectID) + "#" + strconv.Itoa(iid)
+}
+
+// seedIssue seeds an issue in GitLab's NATIVE state vocabulary ("opened" or
+// "closed").
+func (g *splitParentGitLab) seedIssue(projectID, iid int, nativeState string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.issues[gitlabIssueKey(projectID, iid)] = &fakeIssueState{number: iid, state: nativeState}
+}
+
+func (g *splitParentGitLab) seedNote(projectID, iid int, body string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	k := gitlabIssueKey(projectID, iid)
+	g.notes[k] = append(g.notes[k], body)
+}
+
+func (g *splitParentGitLab) issue(t *testing.T, projectID, iid int) fakeIssueState {
+	t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	is, ok := g.issues[gitlabIssueKey(projectID, iid)]
+	if !ok {
+		t.Fatalf("no seeded gitlab issue %s", gitlabIssueKey(projectID, iid))
+	}
+	return *is
+}
+
+func (g *splitParentGitLab) noteBodies(projectID, iid int) []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.notes[gitlabIssueKey(projectID, iid)]...)
+}
+
+func (g *splitParentGitLab) callLog() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.calls...)
+}
+
+func (g *splitParentGitLab) callsFor(projectID, iid int) []string {
+	suffix := " " + gitlabIssueKey(projectID, iid)
+	var out []string
+	for _, c := range g.callLog() {
+		if strings.HasSuffix(c, suffix) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func (g *splitParentGitLab) countCall(op string, projectID, iid int) int {
+	want := op + " " + gitlabIssueKey(projectID, iid)
+	n := 0
+	for _, c := range g.callLog() {
+		if c == want {
+			n++
+		}
+	}
+	return n
+}
+
+func (g *splitParentGitLab) clearInjections() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.failGetIssue, g.failListNotes, g.failPostNote, g.failPutIssue = false, false, false, false
+}
+
+func (g *splitParentGitLab) handler(t *testing.T) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// /api/v4/projects/{pid}/issues/{iid}[/notes]
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 6 || parts[0] != "api" || parts[1] != "v4" || parts[2] != "projects" || parts[4] != "issues" {
+			t.Errorf("unexpected fake GitLab path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		pid, err1 := strconv.Atoi(parts[3])
+		iid, err2 := strconv.Atoi(parts[5])
+		if err1 != nil || err2 != nil {
+			t.Errorf("unparseable project/issue id in %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		isNotes := len(parts) == 7 && parts[6] == "notes"
+
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		key := gitlabIssueKey(pid, iid)
+		record := func(op string) { g.calls = append(g.calls, op+" "+key) }
+		issueJSON := func(is *fakeIssueState) map[string]any {
+			return map[string]any{
+				"iid": is.number, "title": "parent", "description": "", "state": is.state, "labels": []string{},
+			}
+		}
+
+		switch {
+		case isNotes && r.Method == http.MethodGet:
+			record("GET notes")
+			if g.failListNotes {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			all := g.notes[key]
+			from, to := 0, len(all)
+			if g.pageSize > 0 {
+				page := 1
+				if p := r.URL.Query().Get("page"); p != "" {
+					page, _ = strconv.Atoi(p)
+				}
+				from = (page - 1) * g.pageSize
+				if from > len(all) {
+					from = len(all)
+				}
+				to = from + g.pageSize
+				if to > len(all) {
+					to = len(all)
+				}
+				if to < len(all) {
+					w.Header().Set("Link", fmt.Sprintf(`<%s/api/v4/projects/%d/issues/%d/notes?per_page=%d&page=%d>; rel="next"`,
+						g.baseURL, pid, iid, g.pageSize, page+1))
+				}
+			}
+			out := []map[string]any{}
+			for i := from; i < to; i++ {
+				out = append(out, map[string]any{
+					"id": i + 1, "body": all[i], "system": false,
+					"created_at": "2026-08-01T12:00:00Z", "author": map[string]any{"username": "fishhawk"},
+				})
+			}
+			writeFakeJSON(t, w, http.StatusOK, out)
+		case isNotes && r.Method == http.MethodPost:
+			record("POST note")
+			if g.failPostNote {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			var body struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode note body: %v", err)
+			}
+			g.notes[key] = append(g.notes[key], body.Body)
+			writeFakeJSON(t, w, http.StatusCreated, map[string]any{
+				"id": len(g.notes[key]), "body": body.Body, "system": false,
+				"created_at": "2026-08-01T12:00:00Z", "author": map[string]any{"username": "fishhawk"},
+			})
+		case r.Method == http.MethodGet:
+			record("GET issue")
+			if g.failGetIssue {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			is, ok := g.issues[key]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writeFakeJSON(t, w, http.StatusOK, issueJSON(is))
+		case r.Method == http.MethodPut:
+			record("PUT issue")
+			if g.failPutIssue {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			var body struct {
+				StateEvent string `json:"state_event"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode put body: %v", err)
+			}
+			is, ok := g.issues[key]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			// The real API moves state ONLY through state_event.
+			switch body.StateEvent {
+			case "close":
+				is.state = "closed"
+			case "reopen":
+				is.state = "opened"
+			default:
+				t.Errorf("PUT carried state_event %q, want close|reopen", body.StateEvent)
+			}
+			writeFakeJSON(t, w, http.StatusOK, issueJSON(is))
+		default:
+			t.Errorf("unexpected fake GitLab %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+}
+
 // --- audit store ----------------------------------------------------------
 
 // splitParentCloseAudit reproduces the production ListAll contract the watcher
@@ -368,12 +604,17 @@ func (splitParentTokens) Token(_ context.Context, _ int64) (string, error) {
 type splitParentCloseHarness struct {
 	s  *Server
 	gh *splitParentGitHub
+	gl *splitParentGitLab
 	au *splitParentCloseAudit
 }
 
 // newSplitParentCloseHarness wires a Server whose ONLY GitHub is the stateful
-// fake and whose ONLY audit store is the ordering-faithful one, reachable
-// through the genuine signed webhook endpoint.
+// GitHub fake, whose ONLY GitLab is a real *forgegitlab.Forge over the stateful
+// GitLab fake (injected through cfg.ForgeResolver for the "gitlab" family, every
+// other id an error), and whose ONLY audit store is the ordering-faithful one —
+// all reachable through the genuine signed/tokened webhook endpoints. BOTH
+// forges are always wired so the cross-forge binding test can assert that a
+// delivery for one forge makes ZERO calls against the other.
 func newSplitParentCloseHarness(t *testing.T, opts ...func(*Config)) *splitParentCloseHarness {
 	t.Helper()
 	// The sibling #1817 board-sync reconciler runs on this same event. Stub its
@@ -389,10 +630,18 @@ func newSplitParentCloseHarness(t *testing.T, opts ...func(*Config)) *splitParen
 	srv := httptest.NewServer(gh.handler(t))
 	t.Cleanup(srv.Close)
 
+	gl := newSplitParentGitLab()
+	glSrv := httptest.NewServer(gl.handler(t))
+	gl.baseURL = glSrv.URL
+	t.Cleanup(glSrv.Close)
+	glForge := forgegitlab.New(glSrv.URL, forgegitlab.NewStaticCredentialProvider("test-gitlab-token"),
+		forgegitlab.WithHTTPClient(glSrv.Client()))
+
 	au := newSplitParentCloseAudit()
 	cfg := Config{
 		Addr:                "127.0.0.1:0",
 		GitHubWebhookSecret: []byte(testSecret),
+		GitLabWebhookSecret: []byte(gitlabTestToken),
 		WebhookDeliveries:   webhook.NewMemoryStore(0),
 		AuditRepo:           au,
 		GitHub: &githubclient.Client{
@@ -400,11 +649,48 @@ func newSplitParentCloseHarness(t *testing.T, opts ...func(*Config)) *splitParen
 			Tokens:  splitParentTokens{},
 			HTTP:    &http.Client{Timeout: 5 * time.Second},
 		},
+		ForgeResolver: func(id string) (forge.Forge, error) {
+			if id == webhook.ForgeGitLab {
+				return glForge, nil
+			}
+			return nil, fmt.Errorf("no forge registered for %q in this test", id)
+		},
 	}
 	for _, o := range opts {
 		o(&cfg)
 	}
-	return &splitParentCloseHarness{s: New(cfg), gh: gh, au: au}
+	return &splitParentCloseHarness{s: New(cfg), gh: gh, gl: gl, au: au}
+}
+
+// deliverGitLabIssue posts a tokened GitLab Issue Hook delivery through the
+// real /webhooks/gitlab endpoint and asserts the 202 the webhook contract
+// promises (this consumer never influences the response).
+func (h *splitParentCloseHarness) deliverGitLabIssue(t *testing.T, eventUUID string, body []byte) {
+	t.Helper()
+	w := postGitLab(t, h.s, gitlabHeaders("Issue Hook", eventUUID), body)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("gitlab status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// gitlabIssueBody renders a GitLab Issue Hook payload
+// (https://docs.gitlab.com/user/project/integrations/webhook_events/#issue-events):
+// object_kind "issue", the project's numeric id + path_with_namespace, and
+// object_attributes.{iid,action}. projectID 0 OMITS project.id so
+// webhook.ParseGitLabEvent stamps NO CredentialRef — the zero-scope shape. There
+// is deliberately no state_reason anywhere: GitLab's issue object has none.
+func gitlabIssueBody(projectID int, path string, iid int, action string) []byte {
+	pid := ""
+	if projectID != 0 {
+		pid = fmt.Sprintf(`"id": %d, `, projectID)
+	}
+	return []byte(fmt.Sprintf(`{
+		"object_kind": "issue",
+		"event_type": "issue",
+		"user": {"username": "someone"},
+		"project": {%s"path_with_namespace": %q},
+		"object_attributes": {"iid": %d, "action": %q, "state": "closed"}
+	}`, pid, path, iid, action))
 }
 
 // deliverIssueClosed posts a SIGNED issues.closed delivery through the real
@@ -995,7 +1281,7 @@ func TestContractChildClosed_ConflictingLinkage_SkipsAndAudits(t *testing.T) {
 	}
 }
 
-// --- C5: malformed payload and non-GitHub forge --------------------------
+// --- C5: malformed payload --------------------------------------------------
 
 // TestContractChildClosed_MalformedIssuePayload_NoOp: the `issue` object is
 // present but its `number` is a string, so the consumer's decode fails. 202, no
@@ -1028,36 +1314,6 @@ func TestContractChildClosed_MalformedIssuePayload_NoOp(t *testing.T) {
 	}
 	if n := h.au.globalCount(); n != 0 {
 		t.Errorf("wrote %d audit entries for a malformed payload, want 0", n)
-	}
-	if got := h.gh.issue(t, splitCloseRepo, splitCloseParent); got.state != "open" {
-		t.Errorf("parent state = %q, want open", got.state)
-	}
-}
-
-// TestContractChildClosed_NonGitHubForge_NoOp: s.cfg.GitHub is a
-// *githubclient.Client and cannot serve a GitLab project, so a GitLab-sourced
-// event is a defined skip. GitLab parity is deferred to #2900. This drives the
-// handler directly because the signed GitHub webhook endpoint cannot produce a
-// GitLab-forged Event — the forge gate is what is under test, not the routing.
-func TestContractChildClosed_NonGitHubForge_NoOp(t *testing.T) {
-	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseRepo, splitCloseParent, splitCloseContract, splitCloseTime())
-	h.gh.seedIssue(splitCloseRepo, splitCloseParent, "open")
-
-	h.s.handleContractChildClosed(context.Background(), webhook.Event{
-		Type:           "issues",
-		Action:         "closed",
-		Repo:           splitCloseRepo,
-		Forge:          webhook.ForgeGitLab,
-		InstallationID: splitCloseInstallID,
-		RawBody:        closedBody(splitCloseRepo, splitCloseContract, `"completed"`, splitCloseInstallID),
-	})
-
-	if calls := h.gh.callLog(); len(calls) != 0 {
-		t.Errorf("expected ZERO forge calls for a GitLab event, got %v", calls)
-	}
-	if n := h.au.globalCount(); n != 0 {
-		t.Errorf("wrote %d audit entries for a GitLab event, want 0", n)
 	}
 	if got := h.gh.issue(t, splitCloseRepo, splitCloseParent); got.state != "open" {
 		t.Errorf("parent state = %q, want open", got.state)
@@ -1245,5 +1501,700 @@ func TestSplitFiling_ProducerToConsumer_ParentCloseEndToEnd(t *testing.T) {
 	key := splitfiling.ParentCloseCommentKey("o/r", splitParentIssue, contractChild)
 	if !splitfiling.ThreadHasComment([]string{linking}, key) {
 		t.Errorf("linking comment must carry the parent-close marker: %q", linking)
+	}
+}
+
+// =============================================================================
+// GitLab parity suite (E50.17 / #2900)
+// =============================================================================
+//
+// Every test below drives the REAL tokened GitLab receiver — postGitLab ->
+// s.Handler() -> handleWebhookGitLab -> isIssueClosedDelivery ->
+// handleContractChildClosed -> splitParentIssueOpsFor -> a real
+// *forgegitlab.Forge -> the stateful GitLab fake — and asserts COMMITTED STATE
+// on the fake (native issue state, note count and BODIES, call ORDER), never an
+// error value. The GitLab issue object has no state_reason, so every payload
+// here is the plain-close shape.
+
+const (
+	splitCloseGitLabRepo    = "grp/proj"
+	splitCloseGitLabProject = 77
+	// splitCloseGitLabNestedRepo is a nested-group path (group/subgroup/project),
+	// legal on GitLab and rejected by the shared splitRepoFullName.
+	splitCloseGitLabNestedRepo    = "grp/sub/proj"
+	splitCloseGitLabNestedProject = 78
+)
+
+// gitlabParentCloseBody is the plain contract-child close for the default
+// GitLab project.
+func gitlabParentCloseBody() []byte {
+	return gitlabIssueBody(splitCloseGitLabProject, splitCloseGitLabRepo, splitCloseContract, "close")
+}
+
+// assertGitLabCommentThenClose pins the COMMENT-FIRST invariant on the GitLab
+// fake's arrival order: the POST note strictly precedes the PUT issue.
+func assertGitLabCommentThenClose(t *testing.T, gl *splitParentGitLab, projectID, iid int) {
+	t.Helper()
+	calls := gl.callsFor(projectID, iid)
+	postIdx := indexOf(calls, "POST note "+gitlabIssueKey(projectID, iid))
+	putIdx := indexOf(calls, "PUT issue "+gitlabIssueKey(projectID, iid))
+	if postIdx < 0 || putIdx < 0 {
+		t.Fatalf("expected both a POST note and a PUT issue, got %v", calls)
+	}
+	if postIdx > putIdx {
+		t.Errorf("note must be posted BEFORE the close; gitlab call order was %v", calls)
+	}
+}
+
+// TestSplitParentClose_GitLab_ClosesParent is the GitLab done-means end to end:
+// the contract child closes (object_kind issue / action close), the parent is
+// linked and closed through state_event, exactly one marker-stamped note is
+// posted, and the note lands BEFORE the PUT (asserted on call ORDER — inverting
+// comment-then-close in the watcher reddens the order assertion).
+func TestSplitParentClose_GitLab_ClosesParent(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+
+	h.deliverGitLabIssue(t, "gl-t1", gitlabParentCloseBody())
+
+	if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "closed" {
+		t.Errorf("parent native state = %q, want closed", got.state)
+	}
+	bodies := h.gl.noteBodies(splitCloseGitLabProject, splitCloseParent)
+	if len(bodies) != 1 {
+		t.Fatalf("parent thread has %d notes, want exactly 1: %v", len(bodies), bodies)
+	}
+	if !strings.Contains(bodies[0], "#103") {
+		t.Errorf("linking note must name the landed contract child #103: %q", bodies[0])
+	}
+	key := splitfiling.ParentCloseCommentKey(splitCloseGitLabRepo, splitCloseParent, splitCloseContract)
+	if !splitfiling.ThreadHasComment(bodies, key) {
+		t.Errorf("linking note must carry the parent-close idempotency marker: %q", bodies[0])
+	}
+	assertGitLabCommentThenClose(t, h.gl, splitCloseGitLabProject, splitCloseParent)
+
+	obs := h.au.observations(t)
+	if len(obs) != 1 {
+		t.Fatalf("wrote %d split_parent_closed observations, want 1: %v", len(obs), obs)
+	}
+	if obs[0]["outcome"] != splitParentOutcomeClosed || obs[0]["commented"] != true {
+		t.Errorf("observation = %v, want outcome=closed commented=true", obs[0])
+	}
+	if obs[0]["parent_repo"] != splitCloseGitLabRepo {
+		t.Errorf("observation parent_repo = %v, want %q", obs[0]["parent_repo"], splitCloseGitLabRepo)
+	}
+	// Cross-forge binding, half one: a GitLab delivery touches the GitHub fake
+	// NOT AT ALL (the fuller two-way case is TestSplitParentClose_ForgeFamilyBinding).
+	if calls := h.gh.callLog(); len(calls) != 0 {
+		t.Errorf("GitLab delivery made GitHub calls: %v", calls)
+	}
+}
+
+// TestSplitParentClose_GitLab_ClosedChildWithNoStateReason_ClosesParent names
+// the GitLab state_reason residual as a fact: the payload carries no
+// state_reason (GitLab has none), the watcher records "" and PROCEEDS — the same
+// rule the GitHub path applies to the missing/null form
+// (TestContractChildClosed_NullStateReason_ClosesParent). The GitHub gate itself
+// is still live: TestContractChildClosed_NotLandedStateReasons_LeaveParentOpen.
+func TestSplitParentClose_GitLab_ClosedChildWithNoStateReason_ClosesParent(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+
+	body := gitlabParentCloseBody()
+	if strings.Contains(string(body), "state_reason") {
+		t.Fatalf("fixture must carry NO state_reason: %s", body)
+	}
+	h.deliverGitLabIssue(t, "gl-t1b", body)
+
+	if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "closed" {
+		t.Errorf("parent native state = %q, want closed", got.state)
+	}
+	obs := h.au.observations(t)
+	if len(obs) != 1 || obs[0]["outcome"] != splitParentOutcomeClosed || obs[0]["state_reason"] != "" {
+		t.Errorf("observations = %v, want one closed with state_reason \"\"", obs)
+	}
+}
+
+// TestSplitParentClose_GitLab_RedeliverySkipsComment is THE MARKER COUNTERFACTUAL
+// VEHICLE (approval condition 1). It seeds the parent OPEN with the
+// marker-stamped note ALREADY PRESENT — the exact state a torn delivery (note
+// posted, PUT failed) leaves behind — then delivers. That is the only shape
+// that reaches splitfiling.ThreadHasComment PAST the already-closed
+// short-circuit: the watcher must find the marker, post NOTHING, and close.
+// Deleting the ThreadHasComment check makes the note count 2 (RED). It also
+// proves the marker round-tripped through GET .../notes byte-intact.
+func TestSplitParentClose_GitLab_RedeliverySkipsComment(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+	key := splitfiling.ParentCloseCommentKey(splitCloseGitLabRepo, splitCloseParent, splitCloseContract)
+	h.gl.seedNote(splitCloseGitLabProject, splitCloseParent,
+		splitfiling.StampComment(splitParentCloseCommentBody(splitCloseParent, splitCloseContract), key))
+
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t2")
+
+	if bodies := h.gl.noteBodies(splitCloseGitLabProject, splitCloseParent); len(bodies) != 1 {
+		t.Errorf("thread has %d notes, want exactly 1 (marker must suppress the second post): %v", len(bodies), bodies)
+	}
+	if n := h.gl.countCall("POST note", splitCloseGitLabProject, splitCloseParent); n != 0 {
+		t.Errorf("POST note called %d times, want 0", n)
+	}
+	if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "closed" {
+		t.Errorf("parent native state = %q, want closed", got.state)
+	}
+	obs := h.au.observations(t)
+	if len(obs) != 1 || obs[0]["outcome"] != splitParentOutcomeClosed || obs[0]["commented"] != false {
+		t.Errorf("observations = %v, want one closed with commented=false", obs)
+	}
+}
+
+// deliverIssueClosedGitLabRedelivery delivers the default GitLab contract-child
+// close under a fresh event UUID (so the delivery store does not dedup it).
+func (h *splitParentCloseHarness) deliverIssueClosedGitLabRedelivery(t *testing.T, eventUUID string) {
+	t.Helper()
+	h.deliverGitLabIssue(t, eventUUID, gitlabParentCloseBody())
+}
+
+// TestSplitParentClose_GitLab_MarkerOnSecondPage_SkipsComment puts the marker
+// note on PAGE TWO of a paginated notes list (pageSize 1, Link rel="next"). The
+// adapter's page-to-exhaustion walk must still find it, so no second note is
+// posted. This is the end-to-end consequence of gitlabclient.ListIssueNotes's
+// paging loop (owned by slice 1); a single-page read would post a duplicate.
+func TestSplitParentClose_GitLab_MarkerOnSecondPage_SkipsComment(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.gl.pageSize = 1
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+	key := splitfiling.ParentCloseCommentKey(splitCloseGitLabRepo, splitCloseParent, splitCloseContract)
+	h.gl.seedNote(splitCloseGitLabProject, splitCloseParent, "an unrelated earlier note")
+	h.gl.seedNote(splitCloseGitLabProject, splitCloseParent,
+		splitfiling.StampComment(splitParentCloseCommentBody(splitCloseParent, splitCloseContract), key))
+
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t2b")
+
+	if n := h.gl.countCall("GET notes", splitCloseGitLabProject, splitCloseParent); n != 2 {
+		t.Errorf("GET notes called %d times, want 2 (two pages walked)", n)
+	}
+	if bodies := h.gl.noteBodies(splitCloseGitLabProject, splitCloseParent); len(bodies) != 2 {
+		t.Errorf("thread has %d notes, want the seeded 2 (marker on page 2 must suppress the post): %v", len(bodies), bodies)
+	}
+	if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "closed" {
+		t.Errorf("parent native state = %q, want closed", got.state)
+	}
+}
+
+// TestSplitParentClose_GitLab_RedeliveryAfterClose_NoSecondNote: a second
+// delivery AFTER a successful close short-circuits at already_closed — one note,
+// still closed, no further writes. This is the sequential exactly-once claim; it
+// is NOT the marker counterfactual (the short-circuit fires first), which is why
+// TestSplitParentClose_GitLab_RedeliverySkipsComment exists separately.
+func TestSplitParentClose_GitLab_RedeliveryAfterClose_NoSecondNote(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t3a")
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t3b")
+
+	if bodies := h.gl.noteBodies(splitCloseGitLabProject, splitCloseParent); len(bodies) != 1 {
+		t.Errorf("thread has %d notes after two deliveries, want 1", len(bodies))
+	}
+	if n := h.gl.countCall("PUT issue", splitCloseGitLabProject, splitCloseParent); n != 1 {
+		t.Errorf("PUT issue called %d times, want 1", n)
+	}
+	obs := h.au.observations(t)
+	if len(obs) != 2 || obs[0]["outcome"] != splitParentOutcomeClosed || obs[1]["outcome"] != splitParentOutcomeAlreadyClosed {
+		t.Errorf("observations = %v, want [closed, already_closed]", obs)
+	}
+}
+
+// TestSplitParentClose_GitLab_AlreadyClosedParent: the fake reports the parent
+// closed (native "closed", normalized by the adapter), so zero POST, zero PUT,
+// and an already_closed observation. Deleting the short-circuit posts a note on
+// a closed parent (RED on the note count).
+func TestSplitParentClose_GitLab_AlreadyClosedParent(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "closed")
+
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t4")
+
+	if bodies := h.gl.noteBodies(splitCloseGitLabProject, splitCloseParent); len(bodies) != 0 {
+		t.Errorf("posted %d notes on an already-closed parent, want 0: %v", len(bodies), bodies)
+	}
+	if n := h.gl.countCall("POST note", splitCloseGitLabProject, splitCloseParent); n != 0 {
+		t.Errorf("POST note called %d times, want 0", n)
+	}
+	if n := h.gl.countCall("PUT issue", splitCloseGitLabProject, splitCloseParent); n != 0 {
+		t.Errorf("PUT issue called %d times, want 0", n)
+	}
+	obs := h.au.observations(t)
+	if len(obs) != 1 || obs[0]["outcome"] != splitParentOutcomeAlreadyClosed {
+		t.Errorf("observations = %v, want one already_closed", obs)
+	}
+}
+
+// TestSplitParentClose_GitLab_ListNotesFailure_PostsNothing: the notes GET
+// fails, so the fail-CLOSED posture holds — nothing posted, parent still opened,
+// no observation. Deleting the return after a failed FetchIssueComments posts
+// blind (RED on the note count).
+func TestSplitParentClose_GitLab_ListNotesFailure_PostsNothing(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+	h.gl.failListNotes = true
+
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t5")
+
+	if bodies := h.gl.noteBodies(splitCloseGitLabProject, splitCloseParent); len(bodies) != 0 {
+		t.Errorf("posted %d notes after a failed notes list, want 0 (fail-closed): %v", len(bodies), bodies)
+	}
+	if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "opened" {
+		t.Errorf("parent native state = %q, want opened", got.state)
+	}
+	if n := h.gl.countCall("PUT issue", splitCloseGitLabProject, splitCloseParent); n != 0 {
+		t.Errorf("PUT issue called %d times, want 0", n)
+	}
+	if n := h.au.globalCount(); n != 0 {
+		t.Errorf("wrote %d audit entries after a failed notes list, want 0", n)
+	}
+
+	// Transient, not terminal: clear and redeliver -> converges.
+	h.gl.clearInjections()
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t5b")
+	if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "closed" {
+		t.Errorf("after the transient cleared, parent native state = %q, want closed", got.state)
+	}
+	if bodies := h.gl.noteBodies(splitCloseGitLabProject, splitCloseParent); len(bodies) != 1 {
+		t.Errorf("thread has %d notes after convergence, want 1", len(bodies))
+	}
+}
+
+// TestSplitParentClose_GitLab_PostNoteFailure_DoesNotClose: the note POST fails,
+// so the watcher NEVER closes — parent still opened, zero PUT. Deleting the
+// return after a failed PostIssueComment commits the parent to closed (RED).
+func TestSplitParentClose_GitLab_PostNoteFailure_DoesNotClose(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+	h.gl.failPostNote = true
+
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t6")
+
+	if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "opened" {
+		t.Errorf("parent native state = %q, want opened (never close after a failed comment)", got.state)
+	}
+	if n := h.gl.countCall("PUT issue", splitCloseGitLabProject, splitCloseParent); n != 0 {
+		t.Errorf("PUT issue called %d times after a failed note, want 0", n)
+	}
+	if n := h.au.globalCount(); n != 0 {
+		t.Errorf("wrote %d audit entries after a failed note, want 0", n)
+	}
+}
+
+// TestSplitParentClose_GitLab_CloseFailure_RecordsCloseFailed: the note lands,
+// the PUT fails -> close_failed with commented=true and the parent still opened
+// WITH the note. A later redelivery (failure cleared) finds the marker, posts
+// nothing, and closes — exactly one note at the end.
+func TestSplitParentClose_GitLab_CloseFailure_RecordsCloseFailed(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+	h.gl.failPutIssue = true
+
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t7a")
+
+	if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "opened" {
+		t.Errorf("parent native state = %q, want opened after a failed PUT", got.state)
+	}
+	if bodies := h.gl.noteBodies(splitCloseGitLabProject, splitCloseParent); len(bodies) != 1 {
+		t.Fatalf("thread has %d notes, want 1 (the note landed before the failed close)", len(bodies))
+	}
+	obs := h.au.observations(t)
+	if len(obs) != 1 || obs[0]["outcome"] != splitParentOutcomeCloseFailed || obs[0]["commented"] != true {
+		t.Fatalf("observations = %v, want one close_failed with commented=true", obs)
+	}
+
+	h.gl.clearInjections()
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t7b")
+
+	if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "closed" {
+		t.Errorf("parent native state = %q, want closed after redelivery", got.state)
+	}
+	if bodies := h.gl.noteBodies(splitCloseGitLabProject, splitCloseParent); len(bodies) != 1 {
+		t.Errorf("thread has %d notes after convergence, want STILL exactly 1", len(bodies))
+	}
+	obs = h.au.observations(t)
+	if len(obs) != 2 || obs[1]["outcome"] != splitParentOutcomeClosed || obs[1]["commented"] != false {
+		t.Errorf("observations = %v, want [close_failed, closed(commented=false)]", obs)
+	}
+}
+
+// TestSplitParentClose_GitLab_GetIssueFailure_NothingWedged: the issue GET
+// fails -> WARN, return, nothing written, nothing wedged; the cleared redelivery
+// converges.
+func TestSplitParentClose_GitLab_GetIssueFailure_NothingWedged(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+	h.gl.failGetIssue = true
+
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t8a")
+	if n := h.gl.countCall("POST note", splitCloseGitLabProject, splitCloseParent); n != 0 {
+		t.Errorf("POST note called %d times after a failed GET issue, want 0", n)
+	}
+	if n := h.au.globalCount(); n != 0 {
+		t.Errorf("wrote %d audit entries after a failed GET issue, want 0", n)
+	}
+
+	h.gl.clearInjections()
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t8b")
+	if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "closed" {
+		t.Errorf("parent native state = %q, want closed after redelivery", got.state)
+	}
+}
+
+// TestSplitParentClose_GitLab_NoCredentialRef_RecordsNoInstallation is the
+// ZERO-SCOPE COUNTERFACTUAL (approval condition 2). The payload omits
+// project.id, so webhook.ParseGitLabEvent stamps NO CredentialRef and the
+// derived forge.CredentialScope is ZERO. Linkage resolves (path_with_namespace
+// is present), so the watcher records no_installation and makes ZERO HTTP calls.
+//
+// Which assertion the deletion reddens: DELETING THE ZERO-SCOPE GATE reddens
+// the OBSERVATION assertion — the no_installation entry DISAPPEARS (the watcher
+// falls through to the adapter, whose scope parse refuses the empty ref BEFORE
+// any HTTP call, so the delivery ends in a WARN log with no observation at all).
+// The zero-HTTP-calls assertion stays GREEN under the deletion for that same
+// reason, so it is asserted here as the invariant it is, NOT as the
+// counterfactual observable.
+func TestSplitParentClose_GitLab_NoCredentialRef_RecordsNoInstallation(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+
+	h.deliverGitLabIssue(t, "gl-t9", gitlabIssueBody(0, splitCloseGitLabRepo, splitCloseContract, "close"))
+
+	obs := h.au.observations(t)
+	if len(obs) != 1 || obs[0]["outcome"] != splitParentOutcomeNoInstallation {
+		t.Errorf("observations = %v, want exactly one no_installation (this is the assertion the gate's deletion reddens)", obs)
+	}
+	if len(obs) == 1 && obs[0]["parent_issue"] != float64(splitCloseParent) {
+		t.Errorf("no_installation observation must name the resolved parent: %v", obs[0])
+	}
+	if calls := h.gl.callLog(); len(calls) != 0 {
+		t.Errorf("expected ZERO GitLab calls with no credential ref, got %v", calls)
+	}
+	if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "opened" {
+		t.Errorf("parent native state = %q, want opened", got.state)
+	}
+}
+
+// TestSplitParentClose_GitLab_UnrelatedIssue_NoCredentialRef_WritesNothing is
+// the GitLab re-run of the linkage-before-scope ordering: a zero-scope delivery
+// for an issue that is NOT a contract child writes ZERO audit entries. Hoisting
+// the scope gate ahead of linkage reddens it with a false no_installation.
+func TestSplitParentClose_GitLab_UnrelatedIssue_NoCredentialRef_WritesNothing(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+
+	h.deliverGitLabIssue(t, "gl-t9b", gitlabIssueBody(0, splitCloseGitLabRepo, 999, "close"))
+
+	if n := h.au.globalCount(); n != 0 {
+		t.Errorf("wrote %d audit entries for an unrelated zero-scope close, want 0", n)
+	}
+	if calls := h.gl.callLog(); len(calls) != 0 {
+		t.Errorf("expected ZERO GitLab calls, got %v", calls)
+	}
+}
+
+// TestSplitParentClose_GitLab_NestedGroupPath: a nested-group project path
+// (group/subgroup/project) — which the shared splitRepoFullName REJECTS — must
+// still close the parent, and the calls must reach the project addressed by the
+// scope's numeric id. Deleting splitParentRepoRef in favour of the shared helper
+// reddens it (silent unsplittable skip, parent stays opened).
+func TestSplitParentClose_GitLab_NestedGroupPath(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabNestedRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabNestedProject, splitCloseParent, "opened")
+
+	h.deliverGitLabIssue(t, "gl-t10",
+		gitlabIssueBody(splitCloseGitLabNestedProject, splitCloseGitLabNestedRepo, splitCloseContract, "close"))
+
+	if got := h.gl.issue(t, splitCloseGitLabNestedProject, splitCloseParent); got.state != "closed" {
+		t.Errorf("nested-group parent native state = %q, want closed", got.state)
+	}
+	if bodies := h.gl.noteBodies(splitCloseGitLabNestedProject, splitCloseParent); len(bodies) != 1 {
+		t.Errorf("nested-group parent has %d notes, want 1", len(bodies))
+	}
+	for _, c := range h.gl.callLog() {
+		if !strings.HasSuffix(c, " "+gitlabIssueKey(splitCloseGitLabNestedProject, splitCloseParent)) {
+			t.Errorf("call addressed the wrong project: %q (want project %d)", c, splitCloseGitLabNestedProject)
+		}
+	}
+	// The shared helper's refusal is what makes the local split load-bearing.
+	if _, _, ok := splitRepoFullName(splitCloseGitLabNestedRepo); ok {
+		t.Errorf("splitRepoFullName unexpectedly accepts %q; the local split would be redundant", splitCloseGitLabNestedRepo)
+	}
+}
+
+// TestSplitParentRepoRef pins the last-slash split: two-segment GitHub names
+// are unchanged from splitRepoFullName, nested GitLab paths split on the LAST
+// slash, and either half empty is unsplittable.
+func TestSplitParentRepoRef(t *testing.T) {
+	cases := []struct {
+		in          string
+		wantOwner   string
+		wantName    string
+		wantOK      bool
+		description string
+	}{
+		{"o/r", "o", "r", true, "two segments"},
+		{"grp/sub/proj", "grp/sub", "proj", true, "nested group splits on the LAST slash"},
+		{" o/r ", "o", "r", true, "surrounding whitespace trimmed"},
+		{"noslash", "", "", false, "no slash"},
+		{"/r", "", "", false, "empty owner"},
+		{"o/", "", "", false, "empty name"},
+		{"", "", "", false, "empty"},
+	}
+	for _, tc := range cases {
+		got, ok := splitParentRepoRef(tc.in)
+		if ok != tc.wantOK || got.Owner != tc.wantOwner || got.Name != tc.wantName {
+			t.Errorf("%s: splitParentRepoRef(%q) = (%+v, %v), want (%q/%q, %v)",
+				tc.description, tc.in, got, ok, tc.wantOwner, tc.wantName, tc.wantOK)
+		}
+	}
+}
+
+// TestSplitParentClose_GitLab_AmbiguousLinkage_SkipsAndAudits re-runs the
+// conflicting-linkage skip on the GitLab path: two same-project entries naming
+// different parents for the same contract child -> ambiguous_linkage, zero
+// forge calls.
+func TestSplitParentClose_GitLab_AmbiguousLinkage_SkipsAndAudits(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkage(t, splitCloseGitLabRepo, 200, splitCloseContract, splitCloseTime().Add(time.Minute))
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+	h.gl.seedIssue(splitCloseGitLabProject, 200, "opened")
+
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t11")
+
+	if calls := h.gl.callLog(); len(calls) != 0 {
+		t.Errorf("expected ZERO GitLab calls on ambiguous linkage, got %v", calls)
+	}
+	obs := h.au.observations(t)
+	if len(obs) != 1 || obs[0]["outcome"] != splitParentOutcomeAmbiguousLinkage {
+		t.Errorf("observations = %v, want one ambiguous_linkage", obs)
+	}
+}
+
+// TestSplitParentClose_GitLab_NoLinkage_NoOp: a GitLab close with no linkage is
+// silent — zero calls, zero audit entries.
+func TestSplitParentClose_GitLab_NoLinkage_NoOp(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-t12")
+
+	if calls := h.gl.callLog(); len(calls) != 0 {
+		t.Errorf("expected ZERO GitLab calls with no linkage, got %v", calls)
+	}
+	if n := h.au.globalCount(); n != 0 {
+		t.Errorf("wrote %d audit entries with no linkage, want 0", n)
+	}
+}
+
+// TestSplitParentClose_GitLab_NonCloseActions_NotRouted drives the REAL GitLab
+// receiver with the non-close issue actions (open / update / reopen) and a
+// merge_request close, each with linkage seeded and the parent open, and
+// asserts the watcher never fires — the end-to-end form of the predicate
+// negatives in TestIsIssueClosedDelivery_ForgeVocabulary.
+func TestSplitParentClose_GitLab_NonCloseActions_NotRouted(t *testing.T) {
+	for _, action := range []string{"open", "update", "reopen"} {
+		t.Run("issue/"+action, func(t *testing.T) {
+			h := newSplitParentCloseHarness(t)
+			h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+			h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+
+			h.deliverGitLabIssue(t, "gl-t13-"+action,
+				gitlabIssueBody(splitCloseGitLabProject, splitCloseGitLabRepo, splitCloseContract, action))
+
+			if calls := h.gl.callLog(); len(calls) != 0 {
+				t.Errorf("issue/%s must not reach the watcher; got GitLab calls %v", action, calls)
+			}
+			if n := h.au.globalCount(); n != 0 {
+				t.Errorf("issue/%s wrote %d audit entries, want 0", action, n)
+			}
+			if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "opened" {
+				t.Errorf("parent native state = %q, want opened", got.state)
+			}
+		})
+	}
+}
+
+// TestSplitParentClose_GitHub_ReopenedNotRouted is the GitHub-side routing
+// negative through the real signed receiver: issues.reopened with linkage
+// seeded must make ZERO forge calls and write nothing.
+func TestSplitParentClose_GitHub_ReopenedNotRouted(t *testing.T) {
+	h := newSplitParentCloseHarness(t)
+	h.au.seedLinkage(t, splitCloseRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gh.seedIssue(splitCloseRepo, splitCloseParent, "open")
+
+	body := []byte(fmt.Sprintf(`{
+		"action": "reopened",
+		"repository": {"full_name": %q},
+		"sender": {"login": "someone"},
+		"installation": {"id": %d},
+		"issue": {"number": %d}
+	}`, splitCloseRepo, splitCloseInstallID, splitCloseContract))
+	h.deliverIssueClosed(t, "gh-reopened", body)
+
+	if calls := h.gh.callLog(); len(calls) != 0 {
+		t.Errorf("issues.reopened must not reach the watcher; got GitHub calls %v", calls)
+	}
+	if n := h.au.globalCount(); n != 0 {
+		t.Errorf("issues.reopened wrote %d audit entries, want 0", n)
+	}
+}
+
+// TestSplitParentClose_ForgeFamilyBinding is the per-family ladder
+// counterfactual, constructed so deleting the binding in splitParentIssueOpsFor
+// CANNOT pass for an unrelated reason: BOTH fakes are reachable in-test servers
+// wired simultaneously, each seeded with an OPEN parent at the SAME issue
+// number under the SAME repo path "o/r" (GitLab project 77 has
+// path_with_namespace "o/r"), and ONE linkage entry for "o/r" serves both. A
+// wrong-forge call therefore SUCCEEDS against the wrong server, and the
+// assertion lands on WHICH server's committed state changed — not on a
+// connection error.
+func TestSplitParentClose_ForgeFamilyBinding(t *testing.T) {
+	seed := func(t *testing.T) *splitParentCloseHarness {
+		h := newSplitParentCloseHarness(t)
+		h.au.seedLinkage(t, splitCloseRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+		h.gh.seedIssue(splitCloseRepo, splitCloseParent, "open")
+		h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+		return h
+	}
+
+	t.Run("gitlab delivery touches only the gitlab forge", func(t *testing.T) {
+		h := seed(t)
+		h.deliverGitLabIssue(t, "bind-gl", gitlabIssueBody(splitCloseGitLabProject, splitCloseRepo, splitCloseContract, "close"))
+
+		if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "closed" {
+			t.Errorf("gitlab parent native state = %q, want closed", got.state)
+		}
+		if got := h.gh.issue(t, splitCloseRepo, splitCloseParent); got.state != "open" {
+			t.Errorf("GitHub parent state = %q, want open (a GitLab delivery must not close it)", got.state)
+		}
+		if calls := h.gh.callLog(); len(calls) != 0 {
+			t.Errorf("GitLab delivery made GitHub calls: %v", calls)
+		}
+		if bodies := h.gh.commentBodies(splitCloseRepo, splitCloseParent); len(bodies) != 0 {
+			t.Errorf("GitLab delivery posted %d GitHub comments, want 0", len(bodies))
+		}
+	})
+
+	t.Run("github delivery touches only the github forge", func(t *testing.T) {
+		h := seed(t)
+		h.deliverIssueClosed(t, "bind-gh", closedBody(splitCloseRepo, splitCloseContract, `"completed"`, splitCloseInstallID))
+
+		if got := h.gh.issue(t, splitCloseRepo, splitCloseParent); got.state != "closed" {
+			t.Errorf("GitHub parent state = %q, want closed", got.state)
+		}
+		if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "opened" {
+			t.Errorf("gitlab parent native state = %q, want opened (a GitHub delivery must not close it)", got.state)
+		}
+		if calls := h.gl.callLog(); len(calls) != 0 {
+			t.Errorf("GitHub delivery made GitLab calls: %v", calls)
+		}
+	})
+
+	t.Run("github delivery never consults the resolver", func(t *testing.T) {
+		// Registry availability must not change a GitHub outcome: a resolver
+		// that FAILS for every id leaves the GitHub path untouched.
+		h := newSplitParentCloseHarness(t, func(c *Config) {
+			c.ForgeResolver = func(id string) (forge.Forge, error) {
+				t.Errorf("GitHub delivery consulted ForgeResolver(%q)", id)
+				return nil, errors.New("resolver must not be reached")
+			}
+		})
+		h.au.seedLinkage(t, splitCloseRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+		h.gh.seedIssue(splitCloseRepo, splitCloseParent, "open")
+
+		h.deliverIssueClosed(t, "bind-gh2", closedBody(splitCloseRepo, splitCloseContract, `"completed"`, splitCloseInstallID))
+
+		if got := h.gh.issue(t, splitCloseRepo, splitCloseParent); got.state != "closed" {
+			t.Errorf("GitHub parent state = %q, want closed", got.state)
+		}
+	})
+}
+
+// splitParentNoIssueOpsForge is a forge.Forge that does NOT implement
+// forge.IssueOperations (the embedded nil interface satisfies Forge for the
+// type assertion; no method is ever called).
+type splitParentNoIssueOpsForge struct{ forge.Forge }
+
+// TestSplitParentClose_GitLab_ResolverNilRungs pins each fail-closed nil rung
+// of splitParentIssueOpsFor for a non-github family: a resolver error, a nil
+// forge, a TYPED-nil forge wrapped in a non-nil interface, and a forge lacking
+// the capability. Each is the pre-#2900 nil-GitHub posture — INFO log, ZERO
+// forge calls, NO observation (a server misconfiguration is not a fact about the
+// split) — and never a panic. Deleting the isNilForge guard panics on the
+// typed-nil case; deleting the type assertion's ok check panics on the
+// no-capability case.
+func TestSplitParentClose_GitLab_ResolverNilRungs(t *testing.T) {
+	rungs := map[string]func(string) (forge.Forge, error){
+		"resolver error": func(string) (forge.Forge, error) { return nil, errors.New("registry unavailable") },
+		"nil forge":      func(string) (forge.Forge, error) { return nil, nil },
+		"typed-nil forge": func(string) (forge.Forge, error) {
+			var f *forgegitlab.Forge
+			return f, nil
+		},
+		"forge without IssueOperations": func(string) (forge.Forge, error) { return splitParentNoIssueOpsForge{}, nil },
+	}
+	for name, resolver := range rungs {
+		t.Run(name, func(t *testing.T) {
+			h := newSplitParentCloseHarness(t, func(c *Config) { c.ForgeResolver = resolver })
+			h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+			h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+
+			h.deliverIssueClosedGitLabRedelivery(t, "gl-rung-"+strings.ReplaceAll(name, " ", "-"))
+
+			if calls := h.gl.callLog(); len(calls) != 0 {
+				t.Errorf("expected ZERO GitLab calls, got %v", calls)
+			}
+			if n := h.au.globalCount(); n != 0 {
+				t.Errorf("wrote %d audit entries, want 0 (misconfiguration is not a fact about the split)", n)
+			}
+			if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "opened" {
+				t.Errorf("parent native state = %q, want opened", got.state)
+			}
+		})
+	}
+}
+
+// TestSplitParentClose_GitLab_DefaultResolverIsRegistry: with cfg.ForgeResolver
+// nil the ladder falls back to forge.Get. The process registry has no "gitlab"
+// forge registered in this test binary, so the rung resolves to nil and the
+// delivery is the same defined skip — pinning that the default is the registry
+// and not, say, a fall-through to cfg.GitHub (which would make GitHub calls).
+func TestSplitParentClose_GitLab_DefaultResolverIsRegistry(t *testing.T) {
+	h := newSplitParentCloseHarness(t, func(c *Config) { c.ForgeResolver = nil })
+	if _, err := forge.Get(webhook.ForgeGitLab); err == nil {
+		t.Skip("a gitlab forge is registered in this process; the registry fallback is not observable here")
+	}
+	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+
+	h.deliverIssueClosedGitLabRedelivery(t, "gl-default-resolver")
+
+	if calls := h.gh.callLog(); len(calls) != 0 {
+		t.Errorf("a gitlab delivery with the default resolver fell through to GitHub: %v", calls)
+	}
+	if calls := h.gl.callLog(); len(calls) != 0 {
+		t.Errorf("expected ZERO GitLab calls (nothing registered), got %v", calls)
+	}
+	if n := h.au.globalCount(); n != 0 {
+		t.Errorf("wrote %d audit entries, want 0", n)
 	}
 }

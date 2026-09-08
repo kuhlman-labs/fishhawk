@@ -189,12 +189,41 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// step the #2057 acceptance-carrier comment asks the operator to perform.
 	// It is a SIBLING of — not a replacement for — the board-sync reconciler
 	// above on the same event: that one moves a card, this one closes a parent.
-	// Best-effort; it never influences the 202.
-	if ev.Type == "issues" && ev.Action == "closed" {
+	// Routed through isIssueClosedDelivery, the forge-neutral predicate the
+	// GitLab receiver shares (E50.17 / #2900); on this GitHub receiver it
+	// reduces to the `issues` / `closed` pair. Best-effort; it never
+	// influences the 202.
+	if isIssueClosedDelivery(ev) {
 		s.handleContractChildClosed(r.Context(), ev)
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// isIssueClosedDelivery reports whether ev is an issue-CLOSED delivery in its
+// source forge's vocabulary — the routing predicate for the E50.6 parent-close
+// watcher (handleContractChildClosed), shared by both webhook receivers
+// (E50.17 / #2900):
+//
+//   - GitHub: Forge empty (ParseEvent's legacy default) or "github", event
+//     `issues`, action `closed`.
+//   - GitLab: Forge webhook.ForgeGitLab, object_kind `issue` (SINGULAR — Type
+//     is the payload's object_kind), action `close` (GitLab's verb is the
+//     bare imperative, not GitHub's past participle).
+//
+// The literal `issues`/`closed` comparison the GitHub path used could never
+// fire for a GitLab delivery. Every other action — GitLab `open`/`update`/
+// `reopen`, GitHub `reopened`/`labeled`/… — is refused; the sibling board-sync
+// reconciler keeps its OWN routing and is deliberately not widened here.
+func isIssueClosedDelivery(ev webhook.Event) bool {
+	switch ev.Forge {
+	case "", forgeNameGitHub:
+		return ev.Type == "issues" && ev.Action == "closed"
+	case webhook.ForgeGitLab:
+		return ev.Type == "issue" && ev.Action == "close"
+	default:
+		return false
+	}
 }
 
 // isAuditRepublishAction reports whether a pull_request action should

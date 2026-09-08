@@ -420,13 +420,19 @@ type Config struct {
 	// it did not read. Same nil-means-test-seam posture as the sibling seams.
 	PRStateReader PullRequestStateReader
 
-	// ForgeResolver is the injectable forge-registry lookup the
-	// merge-observation verb dispatches a NON-GitHub run's pull-request read
-	// through (E64.40 / #3151). Nil defaults to forge.Get, so production needs
-	// no serve.go wiring — serve.go already registers both forges at startup.
-	// It is the seam a test injects its own resolver through rather than
-	// depending on ambient global registration. A github-family run NEVER
-	// reaches it (see PRStateReader): it exists solely for the other forges.
+	// ForgeResolver is the injectable forge-registry lookup a NON-GitHub
+	// forge family is resolved through. Two consumers share it: the
+	// merge-observation verb's pull-request read (E64.40 / #3151, see
+	// PRStateReader) and the E50.6 split-parent auto-close watcher's
+	// forge.IssueOperations resolution (E50.17 / #2900, see
+	// splitParentIssueOpsFor), which additionally type-asserts the resolved
+	// forge to the capability and treats a forge lacking it as nil. Nil
+	// defaults to forge.Get, so production needs no serve.go wiring —
+	// serve.go already registers both forges at startup. It is the seam a
+	// test injects its own resolver through rather than depending on ambient
+	// global registration. A github-family run or delivery NEVER reaches it
+	// in either consumer — both resolve GitHub ONLY through cfg.GitHub — so
+	// registry availability can never change a GitHub outcome.
 	ForgeResolver func(id string) (forge.Forge, error)
 
 	// AuthRepo persists users + sessions for the OAuth

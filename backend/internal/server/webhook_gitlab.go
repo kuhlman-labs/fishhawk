@@ -126,6 +126,18 @@ func (s *Server) handleWebhookGitLab(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// An issue close (object_kind `issue`, action `close`) drives the E50.6
+	// parent-close watcher (#2062), forge-neutral since E50.17 / #2900: when
+	// the closed issue is the contract-phase child of a filed split proposal,
+	// the parent issue is linked and closed through forge.IssueOperations,
+	// resolved for the gitlab family via cfg.ForgeResolver. Same predicate the
+	// GitHub receiver routes through; best-effort, never influences the 202.
+	// (The #1817 board-sync reconciler is NOT routed here — GitLab has no
+	// Projects-v2 board, and widening it is not #2900.)
+	if isIssueClosedDelivery(ev) {
+		s.handleContractChildClosed(r.Context(), ev)
+	}
+
 	w.WriteHeader(http.StatusAccepted)
 }
 
