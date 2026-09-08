@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1055,5 +1056,294 @@ func TestForge_PerInstallation_BackwardCompat_NilResolver(t *testing.T) {
 	}
 	if *gotToken != "glpat-test" {
 		t.Errorf("default host saw PRIVATE-TOKEN = %q, want glpat-test", *gotToken)
+	}
+}
+
+// --- forge.IssueOperations (E50.17 / #2900) -----------------------------
+
+// issueCall is one request the issue mux recorded: method, path, query and
+// the decoded JSON body (nil for a bodiless GET).
+type issueCall struct {
+	Method string
+	Path   string
+	Query  string
+	Body   map[string]any
+}
+
+// issueForge is a *forgegitlab.Forge over an httptest GitLab whose mux the
+// caller populates; every request is recorded in arrival order so a case
+// asserts the exact wire shape the adapter produced.
+type issueForge struct {
+	f   *forgegitlab.Forge
+	srv *httptest.Server
+	mux *http.ServeMux
+	mu  sync.Mutex
+	log []issueCall
+}
+
+func newIssueForge(t *testing.T) *issueForge {
+	t.Helper()
+	a := &issueForge{mux: http.NewServeMux()}
+	a.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := issueCall{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery}
+		raw, _ := io.ReadAll(r.Body)
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &call.Body)
+		}
+		a.mu.Lock()
+		a.log = append(a.log, call)
+		a.mu.Unlock()
+		a.mux.ServeHTTP(w, r)
+	}))
+	t.Cleanup(a.srv.Close)
+	a.f = forgegitlab.New(a.srv.URL, staticToken{}, forgegitlab.WithHTTPClient(a.srv.Client()))
+	return a
+}
+
+func (a *issueForge) calls() []issueCall {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]issueCall, len(a.log))
+	copy(out, a.log)
+	return out
+}
+
+// TestGitLabForge_FetchIssue_NormalizesState is the named counterfactual
+// vehicle for the state normalization: GitLab's native "opened" must land
+// as the forge-neutral "open", "closed" stays "closed", and an unknown
+// native word passes through. Deleting normalizeIssueState reddens the
+// "opened" row. It also pins the named gap: StateReason is EMPTY because
+// GitLab's issue object carries no such field.
+func TestGitLabForge_FetchIssue_NormalizesState(t *testing.T) {
+	for _, tc := range []struct{ native, want string }{
+		{"opened", "open"},
+		{"closed", "closed"},
+		{"locked", "locked"},
+	} {
+		t.Run(tc.native, func(t *testing.T) {
+			a := newIssueForge(t)
+			a.mux.HandleFunc("GET /api/v4/projects/5/issues/7", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, http.StatusOK, `{"iid":7,"title":"Parent","description":"text","state":"`+tc.native+`","labels":["type:epic"]}`)
+			})
+			var ops forge.IssueOperations = a.f
+			is, err := ops.FetchIssue(context.Background(), gitlabScope("5"), forge.RepoRef{Owner: "g/sub", Name: "p"}, 7)
+			if err != nil {
+				t.Fatalf("FetchIssue: %v", err)
+			}
+			if is.State != tc.want {
+				t.Errorf("State = %q, want %q (native %q)", is.State, tc.want, tc.native)
+			}
+			if is.StateReason != "" {
+				t.Errorf("StateReason = %q, want empty: GitLab carries no state_reason and the adapter must not fabricate one", is.StateReason)
+			}
+			if is.Number != 7 || is.Title != "Parent" || is.Body != "text" || len(is.Labels) != 1 || is.Labels[0] != "type:epic" {
+				t.Errorf("Issue = %+v, want iid 7 / Parent / text / [type:epic]", *is)
+			}
+			calls := a.calls()
+			if len(calls) != 1 || calls[0].Method != http.MethodGet || calls[0].Path != "/api/v4/projects/5/issues/7" {
+				t.Errorf("calls = %+v, want one GET /api/v4/projects/5/issues/7 (addressed by the scope's project id, not RepoRef)", calls)
+			}
+		})
+	}
+}
+
+// TestGitLabForge_FetchIssueComments_MapsNotes pins the note→IssueComment
+// mapping through the client's Link-header walk: both pages land in order,
+// a system note is INCLUDED (not filtered), and a marker body round-trips
+// byte-intact.
+func TestGitLabForge_FetchIssueComments_MapsNotes(t *testing.T) {
+	a := newIssueForge(t)
+	a.mux.HandleFunc("GET /api/v4/projects/5/issues/7/notes", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "2" {
+			writeJSON(w, http.StatusOK, `[{"id":3,"body":"<!-- fishhawk:key -->\nlinked","system":false,"created_at":"2026-09-01T00:02:00Z","author":{"username":"bot"}}]`)
+			return
+		}
+		w.Header().Set("Link", `<`+a.srv.URL+`/api/v4/projects/5/issues/7/notes?page=2&per_page=100>; rel="next"`)
+		writeJSON(w, http.StatusOK, `[
+			{"id":1,"body":"first","system":false,"created_at":"2026-09-01T00:00:00Z","author":{"username":"alice"}},
+			{"id":2,"body":"added ~type:epic label","system":true,"created_at":"2026-09-01T00:01:00Z","author":{"username":"alice"}}
+		]`)
+	})
+
+	var ops forge.IssueOperations = a.f
+	comments, err := ops.FetchIssueComments(context.Background(), gitlabScope("5"), forge.RepoRef{}, 7)
+	if err != nil {
+		t.Fatalf("FetchIssueComments: %v", err)
+	}
+	if len(comments) != 3 {
+		t.Fatalf("len(comments) = %d, want 3 (both pages, system note included)", len(comments))
+	}
+	if comments[0].ID != 1 || comments[0].Author != "alice" || comments[0].Body != "first" || comments[0].CreatedAt != "2026-09-01T00:00:00Z" {
+		t.Errorf("comments[0] = %+v", comments[0])
+	}
+	if comments[1].ID != 2 || comments[1].Body != "added ~type:epic label" {
+		t.Errorf("comments[1] = %+v, want the system note surfaced", comments[1])
+	}
+	if comments[2].ID != 3 || comments[2].Author != "bot" || comments[2].Body != "<!-- fishhawk:key -->\nlinked" {
+		t.Errorf("comments[2] = %+v, want the page-2 marker note byte-intact", comments[2])
+	}
+	if calls := a.calls(); len(calls) != 2 || !strings.Contains(calls[0].Query, "per_page=100") {
+		t.Errorf("calls = %+v, want two paged GETs with per_page=100", calls)
+	}
+}
+
+// TestGitLabForge_PostIssueComment pins the delegation to CreateIssueNote:
+// POST .../issues/{iid}/notes carrying the body byte-intact.
+func TestGitLabForge_PostIssueComment(t *testing.T) {
+	a := newIssueForge(t)
+	a.mux.HandleFunc("POST /api/v4/projects/5/issues/7/notes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusCreated, `{"id":99,"body":"x","author":{"username":"bot"}}`)
+	})
+	var ops forge.IssueOperations = a.f
+	if err := ops.PostIssueComment(context.Background(), gitlabScope("5"), forge.RepoRef{}, 7, "<!-- k -->\nhello"); err != nil {
+		t.Fatalf("PostIssueComment: %v", err)
+	}
+	calls := a.calls()
+	if len(calls) != 1 || calls[0].Method != http.MethodPost || calls[0].Path != "/api/v4/projects/5/issues/7/notes" {
+		t.Fatalf("calls = %+v, want one POST .../issues/7/notes", calls)
+	}
+	if got := calls[0].Body["body"]; got != "<!-- k -->\nhello" {
+		t.Errorf("body.body = %v, want the note text byte-intact", got)
+	}
+}
+
+// TestGitLabForge_SetIssueState_TranslatesStateEvent pins the
+// state→state_event translation: "closed" sends state_event "close",
+// "open" sends "reopen", the body never carries a `state` key (GitLab
+// refuses direct state writes), and StateReason is IGNORED — no
+// state_reason key — per the interface's best-effort contract.
+func TestGitLabForge_SetIssueState_TranslatesStateEvent(t *testing.T) {
+	for _, tc := range []struct{ state, wantEvent string }{
+		{"closed", "close"},
+		{"open", "reopen"},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			a := newIssueForge(t)
+			a.mux.HandleFunc("PUT /api/v4/projects/5/issues/7", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, http.StatusOK, `{"iid":7,"state":"closed"}`)
+			})
+			state, reason := tc.state, "completed"
+			var ops forge.IssueOperations = a.f
+			if err := ops.SetIssueState(context.Background(), gitlabScope("5"), forge.RepoRef{}, 7, forge.IssueStateUpdate{State: &state, StateReason: &reason}); err != nil {
+				t.Fatalf("SetIssueState: %v", err)
+			}
+			calls := a.calls()
+			if len(calls) != 1 || calls[0].Method != http.MethodPut || calls[0].Path != "/api/v4/projects/5/issues/7" {
+				t.Fatalf("calls = %+v, want one PUT /api/v4/projects/5/issues/7", calls)
+			}
+			body := calls[0].Body
+			if got := body["state_event"]; got != tc.wantEvent {
+				t.Errorf("body.state_event = %v, want %q", got, tc.wantEvent)
+			}
+			if v, has := body["state"]; has {
+				t.Errorf("body carries state = %v; GitLab changes state only through state_event", v)
+			}
+			if v, has := body["state_reason"]; has {
+				t.Errorf("body carries state_reason = %v; GitLab has no state_reason and the adapter must drop it, not send it", v)
+			}
+		})
+	}
+}
+
+// TestGitLabForge_SetIssueState_RefusesBeforeHTTP pins the local
+// refusal: a nil State and an unknown State are both forge.ErrValidation
+// with ZERO HTTP calls. Deleting the guard lets the unknown-state case reach
+// the wire with an empty state_event (which the client then refuses with a
+// plain error) — the errors.Is assertion is what reddens.
+func TestGitLabForge_SetIssueState_RefusesBeforeHTTP(t *testing.T) {
+	bogus := "resolved"
+	for _, tc := range []struct {
+		name string
+		u    forge.IssueStateUpdate
+	}{
+		{"nil state", forge.IssueStateUpdate{}},
+		{"unknown state", forge.IssueStateUpdate{State: &bogus}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newIssueForge(t)
+			a.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, http.StatusOK, `{"iid":7}`)
+			})
+			err := a.f.SetIssueState(context.Background(), gitlabScope("5"), forge.RepoRef{}, 7, tc.u)
+			if !errors.Is(err, forge.ErrValidation) {
+				t.Errorf("err = %v, want forge.ErrValidation", err)
+			}
+			if n := len(a.calls()); n != 0 {
+				t.Errorf("refusal made %d HTTP calls, want 0", n)
+			}
+		})
+	}
+}
+
+// issueOpsCalls enumerates the four capability methods so the scope and
+// error-mapping cases below run each one.
+func issueOpsCalls() []struct {
+	name string
+	call func(ops forge.IssueOperations, scope forge.CredentialScope) error
+} {
+	closed := "closed"
+	return []struct {
+		name string
+		call func(ops forge.IssueOperations, scope forge.CredentialScope) error
+	}{
+		{"FetchIssue", func(ops forge.IssueOperations, scope forge.CredentialScope) error {
+			_, err := ops.FetchIssue(context.Background(), scope, forge.RepoRef{}, 7)
+			return err
+		}},
+		{"FetchIssueComments", func(ops forge.IssueOperations, scope forge.CredentialScope) error {
+			_, err := ops.FetchIssueComments(context.Background(), scope, forge.RepoRef{}, 7)
+			return err
+		}},
+		{"PostIssueComment", func(ops forge.IssueOperations, scope forge.CredentialScope) error {
+			return ops.PostIssueComment(context.Background(), scope, forge.RepoRef{}, 7, "x")
+		}},
+		{"SetIssueState", func(ops forge.IssueOperations, scope forge.CredentialScope) error {
+			return ops.SetIssueState(context.Background(), scope, forge.RepoRef{}, 7, forge.IssueStateUpdate{State: &closed})
+		}},
+	}
+}
+
+// TestGitLabForge_IssueOperations_NonGitLabScopeRejected pins that every
+// capability method fails closed on a non-gitlab-shaped scope (a GitHub
+// installation id) BEFORE any HTTP call.
+func TestGitLabForge_IssueOperations_NonGitLabScopeRejected(t *testing.T) {
+	for _, tc := range issueOpsCalls() {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newIssueForge(t)
+			a.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, http.StatusOK, `{}`)
+			})
+			err := tc.call(a.f, forge.FromGitHubInstallationID(12345))
+			if err == nil || !strings.Contains(err.Error(), "not gitlab-shaped") {
+				t.Errorf("err = %v, want a not-gitlab-shaped rejection", err)
+			}
+			if n := len(a.calls()); n != 0 {
+				t.Errorf("a wrong-forge scope reached the wire (%d calls), want 0", n)
+			}
+		})
+	}
+}
+
+// TestGitLabForge_IssueOperations_ErrorMapping pins the base mapper on
+// every capability method: 404 → forge.ErrNotFound, 403 → forge.ErrForbidden.
+func TestGitLabForge_IssueOperations_ErrorMapping(t *testing.T) {
+	for _, tc := range issueOpsCalls() {
+		for _, sc := range []struct {
+			status int
+			want   error
+		}{
+			{http.StatusNotFound, forge.ErrNotFound},
+			{http.StatusForbidden, forge.ErrForbidden},
+		} {
+			t.Run(tc.name+"/"+http.StatusText(sc.status), func(t *testing.T) {
+				a := newIssueForge(t)
+				a.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+					writeJSON(w, sc.status, `{"message":"x"}`)
+				})
+				if err := tc.call(a.f, gitlabScope("5")); !errors.Is(err, sc.want) {
+					t.Errorf("err = %v, want errors.Is %v", err, sc.want)
+				}
+			})
+		}
 	}
 }
