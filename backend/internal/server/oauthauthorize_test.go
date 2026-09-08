@@ -1076,6 +1076,116 @@ func TestAuthorize_WriteDeployIsPreRegistrationOnly(t *testing.T) {
 	})
 }
 
+// TestAuthorize_CIMDClientCannotSelfPinWriteDeploy is the fix-up pass's
+// adversarial half of the #2477 bound: the CIMD resolution path is the
+// DOCUMENTED, SUPPORTED way a client connects (it is how Claude Code connects),
+// and a CIMD document's `scope` member is authored by the client itself and
+// never validated. Before this pass, "the client's registration pins it"
+// admitted that self-authored value, so a client with NO store row could declare
+// write:deploy in its own metadata and satisfy the very gate the scope sits
+// behind — the bound held in wording, not as an operator gate.
+//
+// Both request forms are driven, because the two enforcement sites are distinct:
+// the EXPLICIT path refuses whole, the DEFAULTED path drops. Each is driven
+// through the REAL authorize/consent routes against a REAL CIMD fetch (no store
+// row exists, so resolveOAuthClient falls through), and the refusal is asserted
+// on COMMITTED STATE as well as the error code — a control that fires and rolls
+// back returns a byte-identical redirect.
+//
+// The operator arm (iii) is the discrimination control: the SAME registered
+// scope string, resolved from a STORE row instead of a CIMD document, still
+// grants. So a green here cannot come from write:deploy having become
+// unreachable — only from the authority distinction.
+func TestAuthorize_CIMDClientCannotSelfPinWriteDeploy(t *testing.T) {
+	const selfPinnedClientID = "https://selfpin.example/cimd"
+	const selfPinnedRedirect = "https://selfpin.example/cb"
+	// The adversarial document: a client declaring the FULL eight-scope
+	// vocabulary, write:deploy included, in its own metadata.
+	selfPinned := oauthas.ScopeString(oauthas.SupportedScopes)
+
+	// cimdServer stands up an AS with NO store row for selfPinnedClientID, so
+	// the resolver must fall through to the CIMD document served here.
+	cimdServer := func(t *testing.T) (*Server, *fakeOAuthStore, *cimdRoundTripper, Identity) {
+		t.Helper()
+		store := newFakeOAuthStore()
+		rt := newCIMD()
+		rt.docs[selfPinnedClientID] = cimdDoc(selfPinnedClientID, []string{selfPinnedRedirect}, nil, nil, selfPinned)
+		repo := newFakeAuthRepo()
+		srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(rt), AuthRepo: repo})
+		return srv, store, rt, signedInIdentity(repo, "github")
+	}
+	cimdQuery := func(extra map[string]string) map[string]string {
+		q := map[string]string{"client_id": selfPinnedClientID, "redirect_uri": selfPinnedRedirect}
+		for k, v := range extra {
+			q[k] = v
+		}
+		return q
+	}
+
+	// (i) EXPLICIT: the self-pinning client asks for write:deploy by name and is
+	// refused, exactly as a client pinning nothing would be.
+	t.Run("explicit_self_pinned_write_deploy_refused", func(t *testing.T) {
+		srv, store, rt, id := cimdServer(t)
+		rr := postConsent(srv, consentForm(cimdQuery(map[string]string{"scope": "read:runs write:deploy"})), &id)
+		if got := redirectQuery(t, rr).Get("error"); got != "invalid_scope" {
+			t.Fatalf("error = %q, want invalid_scope — a client-authored CIMD scope must not unlock write:deploy", got)
+		}
+		// NON-VACUITY: the CIMD document really was fetched and really did
+		// carry write:deploy, so the refusal is the authority gate and not an
+		// unresolvable client.
+		if rt.fetches() == 0 {
+			t.Fatal("no CIMD fetch happened; the test never exercised the self-pinning resolution path")
+		}
+		// COMMITTED STATE: a fired-and-rolled-back refusal and a refusal that
+		// never fired render identically, so read the store.
+		store.mu.Lock()
+		n := len(store.codes)
+		store.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("the self-pinned request minted %d code(s); want 0", n)
+		}
+	})
+
+	// (ii) DEFAULTED: the same client sends NO scope token. The default is its
+	// registered set, so an ungated implementation hands it write:deploy without
+	// the client ever naming it. It must be dropped — and the rest granted.
+	t.Run("scope_less_default_drops_the_self_pinned_write_deploy", func(t *testing.T) {
+		srv, _, _, id := cimdServer(t)
+		rr := getAuthorize(srv, authorizeQuery(cimdQuery(map[string]string{"scope": "\x00"})), &id)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("the scope-less CIMD request must reach consent; status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		shown := consentScopeListItems(t, rr.Body.String())
+		if containsOAuth(shown, "write:deploy") {
+			t.Fatalf("consent displayed write:deploy from a client-authored pin: %v", shown)
+		}
+		// NON-VACUITY: dropping write:deploy must not have emptied the grant —
+		// the other seven declared scopes are still granted.
+		if !equalStrings(shown, oauthas.DefaultScopes) {
+			t.Fatalf("consent displayed %v, want the self-declared set minus write:deploy %v", shown, oauthas.DefaultScopes)
+		}
+	})
+
+	// (iii) DISCRIMINATION: the SAME registered scope string written by an
+	// OPERATOR into the store still grants write:deploy on both forms. Without
+	// this arm, (i) and (ii) would also pass if the fix had simply made
+	// write:deploy unreachable everywhere.
+	t.Run("the_same_scope_string_from_an_operator_store_row_still_grants", func(t *testing.T) {
+		srv, store, id := scopeDefaultServer(t, selfPinned)
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": "read:runs write:deploy"}), &id)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("an operator-written pin must still grant write:deploy; status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		hidden := consentHiddenScope(t, rr.Body.String())
+		if code := redirectQuery(t, postConsent(srv, consentForm(map[string]string{"scope": hidden}), &id)).Get("code"); code == "" {
+			t.Fatal("the operator pre-registration path did not mint a code")
+		}
+		if got := mintedCodeScopes(t, store); !containsOAuth(got, "write:deploy") {
+			t.Fatalf("minted code scopes = %v, want write:deploy carried through the operator path", got)
+		}
+	})
+}
+
 // TestAuthorizeConsent_GrantMatchesDisplayedScopeWhenRegistrationChanges is the
 // #2466 CONDITION B pin: the consent form's hidden scope field carries the
 // RESOLVED scope set (the same values rendered to the user), not the raw request

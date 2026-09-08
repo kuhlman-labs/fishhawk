@@ -5560,8 +5560,10 @@ paths:
             MINUS `write:deploy`, not the whole vocabulary (#2477). A registration naming no supported scope is refused
             `invalid_scope`. Every present value still validates: an unknown scope, a whitespace-only value, and a scope
             exceeding the client's registration all fail `invalid_scope`. A request NAMING `write:deploy` is refused
-            `invalid_scope` unless the client's registration pins it — and a mixed request naming it alongside valid
-            scopes is refused WHOLE, never silently stripped.
+            `invalid_scope` unless an OPERATOR-AUTHORED registration pins it — and a mixed request naming it
+            alongside valid scopes is refused WHOLE, never silently stripped. Only a registration an operator wrote
+            into this deployment counts: a client that self-declares `write:deploy` in its own client-ID metadata
+            document does not unlock it, and a client-authored pin is instead DROPPED from the defaulted set.
           schema: { type: string }
         - name: state
           in: query

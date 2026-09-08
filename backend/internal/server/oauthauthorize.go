@@ -158,8 +158,17 @@ func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req 
 	// SOLE production resolution path for an authorization request's scope set,
 	// so one chokepoint covers both the explicit and the defaulted route and is
 	// unit-testable without a server.
+	//
+	// The registration's AUTHORITY travels with it. resolveOAuthClient resolves
+	// STORE-FIRST and falls through to the client's own CIMD document, so
+	// "the registration pins it" is an operator authorization only on the store
+	// branch; a CIMD `scope` member is unvalidated client-authored input. Passing
+	// client.ScopeAuthority is what stops a client with no store row from
+	// self-declaring write:deploy in its own metadata and satisfying the very
+	// bound that scope exists behind — on the explicit path it is refused as
+	// though it pinned nothing, on the defaulted path it is dropped.
 	registered := registeredScopeSet(client)
-	scopes, err := oauthas.ResolveRequestedScope(req.scope, registered)
+	scopes, err := oauthas.ResolveRequestedScope(req.scope, registered, registeredScopeAuthority(client))
 	if err != nil {
 		s.redirectOAuthError(w, r, responseRedirect, req.state, toOAuthError(err))
 		return authorizeResolved{}, false

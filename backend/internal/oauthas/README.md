@@ -65,15 +65,35 @@ on the explicit path — a client could not re-request what it was granted.
 This is the ONE place the advertised set and the mintable set intentionally
 disagree **at request time**. `write:deploy` stays in `SupportedScopes` — fully
 mintable, fully carryable on an operator token — but an authorization request
-naming it is refused `invalid_scope` UNLESS the client's registration PINS it.
-A **mixed** request naming it alongside valid scopes is refused **whole**, never
-silently stripped: stripping would mint a grant narrower than the one the client
-asked for and the consent page displayed.
+naming it is refused `invalid_scope` UNLESS an **operator-authored** registration
+PINS it. A **mixed** request naming it alongside valid scopes is refused
+**whole**, never silently stripped: stripping would mint a grant narrower than
+the one the client asked for and the consent page displayed.
 
 Enforcement is a single chokepoint inside `ResolveRequestedScope`, applied AFTER
 `ParseScope` succeeds so no existing error identity moves, and covering both the
 explicit and the defaulted route. The authorize ladder's step-7 registered-scope
 restriction is **unchanged** and still bounds both sets.
+
+**Only an operator-authored registration can pin it.** `ResolveRequestedScope`
+takes a `RegistrationAuthority` alongside the registered scope set, and honours
+the pin only for `OperatorAuthoredRegistration`. The two request forms enforce it
+differently because they mean different things:
+
+| Request form | Client-authored pin on `write:deploy` |
+|---|---|
+| EXPLICIT (`scope=... write:deploy`) | refused `invalid_scope`, whole request, exactly as no pin at all |
+| DEFAULTED (no scope token) | **dropped** from the resolved set; the rest of the registration is still granted |
+
+The defaulted path drops rather than refuses because a defaulted request named
+nothing — there is no asked-for set for the grant to diverge from, and that branch
+already drops registered scopes outside the vocabulary the same way. A
+registration whose whole intersection is emptied that way still fails CLOSED with
+`invalid_scope` rather than minting an empty grant.
+
+`ClientAuthoredRegistration` is the **zero value**, so a caller that omits the
+authority fails closed rather than promoting client metadata to an operator act;
+`TestRegistrationAuthority_ZeroValueCannotPin` pins that ordering.
 
 **FORWARD RULE**: a future scope needing the same treatment is added to
 `PreRegistrationOnlyScopes`. Never reuse `DefaultScopes` as an enforcement bound
@@ -88,16 +108,30 @@ The operator write path **has shipped**: `fishhawkd oauth client register
 fetch. So a deploy-capable OAuth client is reachable today, as a deliberate
 operator act.
 
-**RESIDUAL, stated plainly.** "The client's registration" is whatever
-`registeredScopeSet` reads off the RESOLVED client, and resolution is
+**A CIMD document cannot open the hatch.** "The client's registration" is
+whatever `registeredScopeSet` reads off the RESOLVED client, and resolution is
 store-first with a fall-through to the client's own **CIMD document**, whose
-`scope` member is unvalidated passthrough. So for a **CIMD-resolved** client this
-bound is NOT an operator gate — such a client can self-declare `write:deploy` in
-its own metadata and pin itself. What #2477 ratified and this change delivers is
-the *posture*: `write:deploy` is no longer the DEFAULT and no longer ADVERTISED,
-so it is never granted by accident or by echoing discovery. Narrowing the pin to
-store-resolved registrations only is a deliberate follow-up, not part of this
-change.
+`scope` member is unvalidated passthrough. That fall-through is the SUPPORTED way
+a client connects (it is how Claude Code connects), so honouring its `scope`
+member here would have made the bound a naming convention rather than an operator
+gate: a client with no store row could declare `write:deploy` in its own metadata
+and satisfy its own condition. It cannot. `resolvedFromStore` stamps
+`OperatorAuthoredRegistration`, `resolvedFromCIMD` stamps
+`ClientAuthoredRegistration`, and only the former unlocks the scope — so the
+escape hatch is the operator write path and nothing else.
+`TestAuthorize_CIMDClientCannotSelfPinWriteDeploy` and
+`TestOAuthFlow_CIMDSelfPinnedWriteDeployNeverReachesAToken` drive the adversarial
+self-pinning document through BOTH request forms, and each carries a
+discrimination arm proving the SAME scope string from a STORE row still grants.
+
+**RESIDUAL, stated plainly.** Provenance is decided by which resolution branch
+produced the client, so it is exactly as trustworthy as `resolveOAuthClient`'s
+store-first ordering: anything that can WRITE an `oauth_clients` row counts as an
+operator here. Today only `fishhawkd oauth client register` and direct database
+access can — this server never persists a CIMD-derived row (deliberately: that
+would make the store branch shadow later refreshes). If an RFC 7591 dynamic
+client-registration endpoint is ever added it would write store rows from
+client-supplied input, and this gate would have to exclude those rows explicitly.
 
 ## Scope vocabulary mirror (single source of truth)
 
@@ -117,9 +151,10 @@ in-loop verify gate. Publishing `scopes_supported` makes later narrowing additiv
 
 RFC 6749 §3.3 permits exactly two behaviours when an authorization request omits
 `scope`: process it with a **pre-defined default**, or fail `invalid_scope`. This
-server takes the FIRST branch, via `ResolveRequestedScope(requested, registered)`
-— a scope-omitting client (the shape of Claude Code's CIMD document) previously
-could not get past the first authorize.
+server takes the FIRST branch, via
+`ResolveRequestedScope(requested, registered, authority)` — a scope-omitting
+client (the shape of Claude Code's CIMD document) previously could not get past
+the first authorize.
 
 The contract is keyed on whether the request **carries a scope token**, not on
 whether the parameter is present: `url.Values.Get` returns `""` for both an
@@ -136,7 +171,10 @@ would be exactly the onboarding trap this removes.
 - **An empty `requested`** defaults to the client's REGISTERED scope when the
   registration pins one, otherwise to `DefaultScopes` — the advertised POSTURE
   (what the PRM and AS metadata publish as `scopes_supported`), which is the
-  vocabulary MINUS `write:deploy`, NOT the whole vocabulary (#2477).
+  vocabulary MINUS `write:deploy`, NOT the whole vocabulary (#2477). A
+  `PreRegistrationOnlyScopes` member carried by a CLIENT-AUTHORED registration is
+  dropped from that default (see the bound above), so a CIMD document declaring
+  `write:deploy` defaults to the rest of its declared set.
 
 The registered default is **intersected** with `SupportedScopes` (registration
 order preserved, de-duplicated) rather than taken verbatim. A registration may

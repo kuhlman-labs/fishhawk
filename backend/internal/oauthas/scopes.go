@@ -72,17 +72,53 @@ var DefaultScopes = []string{
 // (what we advertise and default to), not a boundary; conflating them would mean
 // that advertising a scope more narrowly silently made it unrequestable.
 //
-// RESIDUAL, stated plainly: "the client's registration" is whatever
-// registeredScopeSet reads off the resolved client, and resolveOAuthClient
-// resolves STORE-FIRST then falls through to the client's own CIMD document
-// (backend/internal/server/oauthas.go). A store row is an operator act — the
-// `fishhawkd oauth client register --scope` write path (E66.21 / #2438), which
-// has SHIPPED. A CIMD document is authored by the CLIENT, and its `scope` member
-// is unvalidated passthrough. So for a CIMD-resolved client this bound is NOT an
-// operator gate: such a client can self-declare write:deploy in its own metadata
-// and pin itself. Narrowing the pin to store-resolved registrations only is a
-// deliberate follow-up, not part of #2477's ratified posture.
+// WHOSE registration counts: only an OPERATOR-AUTHORED one. "The client's
+// registration" is whatever registeredScopeSet reads off the resolved client,
+// and resolveOAuthClient resolves STORE-FIRST then falls through to the client's
+// own CIMD document (backend/internal/server/oauthas.go). A store row is an
+// operator act — the `fishhawkd oauth client register --scope` write path
+// (E66.21 / #2438), which has SHIPPED. A CIMD document is authored by the CLIENT
+// and its `scope` member is unvalidated passthrough, so honouring it here would
+// let any client self-declare write:deploy and satisfy its own gate. It does
+// not: the pin is honoured ONLY for OperatorAuthoredRegistration, and a
+// client-authored registration naming a member of this list is treated as though
+// it named nothing — refused on the EXPLICIT path, dropped on the DEFAULTED one.
+// That is what makes this bound an operator gate rather than a naming
+// convention.
 var PreRegistrationOnlyScopes = []string{"write:deploy"}
+
+// RegistrationAuthority names WHO authored the client registration a request is
+// resolved against. It exists because "the registration pins it" is an OPERATOR
+// authorization only when an OPERATOR wrote the registration; a client that
+// authors its own metadata document pins nothing this server should honour as a
+// grant of privileged authority.
+//
+// The ZERO VALUE is ClientAuthoredRegistration — the UNTRUSTED one — so a caller
+// that forgets to supply an authority fails CLOSED rather than silently
+// promoting client-authored metadata to an operator act.
+type RegistrationAuthority int
+
+const (
+	// ClientAuthoredRegistration is a registration the CLIENT authored: a CIMD
+	// document fetched from the client_id URL, whose `scope` member is
+	// unvalidated passthrough. It cannot unlock a PreRegistrationOnlyScopes
+	// member.
+	ClientAuthoredRegistration RegistrationAuthority = iota
+
+	// OperatorAuthoredRegistration is a registration an OPERATOR wrote into
+	// this deployment's oauth_clients store (`fishhawkd oauth client register
+	// --scope`, E66.21 / #2438). It is the ONLY authority that can unlock a
+	// PreRegistrationOnlyScopes member.
+	OperatorAuthoredRegistration
+)
+
+// canPinPreRegistrationOnlyScope reports whether a registration of this
+// authority may unlock a PreRegistrationOnlyScopes member. Deliberately an
+// equality test against the OPERATOR value rather than an inequality against the
+// client one, so a future third authority defaults to NOT authorizing.
+func (a RegistrationAuthority) canPinPreRegistrationOnlyScope() bool {
+	return a == OperatorAuthoredRegistration
+}
 
 // isPreRegistrationOnlyScope reports whether s is a member of
 // PreRegistrationOnlyScopes.
@@ -167,6 +203,19 @@ func ParseScope(raw string) ([]string, error) {
 // SupportedScopes vocabulary (#2477): the least-effort path for a first-time
 // client must not be authority to ship.
 //
+// authority says WHO wrote that registration, and it gates BOTH request forms
+// against a PreRegistrationOnlyScopes member. Only OperatorAuthoredRegistration
+// counts: on the EXPLICIT path a client-authored pin is refused invalid_scope
+// exactly as no pin at all would be, and on the DEFAULTED path a client-authored
+// pin is DROPPED from the resolved set. Without this, a client with no store row
+// could self-declare write:deploy in its own CIMD document and satisfy the very
+// gate that bound is supposed to be — the resolution fall-through makes the
+// document client-authored input, not an operator act. The DEFAULTED path drops
+// rather than refuses because a defaulted request named nothing: there is no
+// asked-for set to diverge from, and the existing branch already drops registered
+// scopes outside the vocabulary the same way. The EXPLICIT path still refuses the
+// whole request, never strips it.
+//
 // The registered default is INTERSECTED with SupportedScopes rather than taken
 // verbatim: a registration may pin scopes outside this server's vocabulary
 // (registeredScopeSet splits the raw registration string and never validates its
@@ -175,7 +224,7 @@ func ParseScope(raw string) ([]string, error) {
 // reached. Defaulting to it verbatim would grant through the default what the
 // explicit path refuses. A registration whose intersection is EMPTY fails CLOSED
 // with invalid_scope rather than minting a code carrying an empty grant.
-func ResolveRequestedScope(requested string, registered []string) ([]string, error) {
+func ResolveRequestedScope(requested string, registered []string, authority RegistrationAuthority) ([]string, error) {
 	if requested != "" {
 		scopes, err := ParseScope(requested)
 		if err != nil {
@@ -184,10 +233,14 @@ func ResolveRequestedScope(requested string, registered []string) ([]string, err
 		// The pre-registration bound. Applied AFTER ParseScope so an unknown or
 		// whitespace-only request keeps its existing error identity, and applied
 		// to the WHOLE request so a mixed one is refused rather than stripped.
+		// The pin counts only when an OPERATOR wrote the registration: a
+		// client-authored CIMD `scope` member naming this scope is its author's
+		// own claim, not an authorization, so it is refused identically to no
+		// pin at all.
 		for _, s := range scopes {
-			if isPreRegistrationOnlyScope(s) && !containsScope(registered, s) {
+			if isPreRegistrationOnlyScope(s) && (!authority.canPinPreRegistrationOnlyScope() || !containsScope(registered, s)) {
 				return nil, newError(ErrCodeInvalidScope,
-					"scope %q is reachable only through a client registration that pins it, not through an authorization request", s)
+					"scope %q is reachable only through an operator-written client registration that pins it, not through an authorization request or client-authored client metadata", s)
 			}
 		}
 		return scopes, nil
@@ -203,6 +256,15 @@ func ResolveRequestedScope(requested string, registered []string) ([]string, err
 	out := make([]string, 0, len(registered))
 	for _, s := range registered {
 		if !IsSupportedScope(s) || seen[s] {
+			continue
+		}
+		// Same operator gate as the explicit path, in the form the defaulted
+		// path can take: a client-authored pin on a PreRegistrationOnlyScopes
+		// member is DROPPED, so a CIMD document self-declaring write:deploy
+		// defaults to the rest of its declared set and never to write:deploy.
+		// A registration whose whole intersection is emptied this way falls
+		// through to the fail-closed invalid_scope below.
+		if isPreRegistrationOnlyScope(s) && !authority.canPinPreRegistrationOnlyScope() {
 			continue
 		}
 		seen[s] = true

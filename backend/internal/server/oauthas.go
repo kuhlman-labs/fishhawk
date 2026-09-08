@@ -284,6 +284,20 @@ type resolvedOAuthClient struct {
 	ClientURI               string
 	LogoURI                 string
 	Scope                   string
+
+	// ScopeAuthority records WHO authored Scope: an operator (a store row this
+	// deployment's `fishhawkd oauth client register --scope` wrote) or the
+	// CLIENT (its own CIMD document, whose `scope` member is unvalidated
+	// passthrough). It is set by the two constructors below and read ONLY by
+	// the authorize ladder's scope resolution, which honours a
+	// PreRegistrationOnlyScopes pin exclusively from an operator-authored
+	// registration. Carrying provenance on the projection — rather than
+	// re-deriving it at the call site — is what keeps the ONE chokepoint from
+	// needing to know which resolution branch produced the client.
+	//
+	// The zero value is oauthas.ClientAuthoredRegistration, the untrusted one,
+	// so a future third constructor that forgets to set it fails closed.
+	ScopeAuthority oauthas.RegistrationAuthority
 }
 
 func resolvedFromStore(c *oauthstore.Client) resolvedOAuthClient {
@@ -296,6 +310,8 @@ func resolvedFromStore(c *oauthstore.Client) resolvedOAuthClient {
 		ClientURI:               c.ClientURI,
 		LogoURI:                 c.LogoURI,
 		Scope:                   c.Scope,
+		// A store row exists only because an operator wrote it.
+		ScopeAuthority: oauthas.OperatorAuthoredRegistration,
 	}
 }
 
@@ -309,6 +325,10 @@ func resolvedFromCIMD(m *oauthas.ClientMetadata) resolvedOAuthClient {
 		ClientURI:               m.ClientURI,
 		LogoURI:                 m.LogoURI,
 		Scope:                   m.Scope,
+		// A CIMD document is authored by the client it describes. Set
+		// EXPLICITLY rather than left to the zero value, so the contrast with
+		// the store branch is legible at the two sites that decide it.
+		ScopeAuthority: oauthas.ClientAuthoredRegistration,
 	}
 }
 
@@ -427,6 +447,14 @@ func registeredGrantTypes(c *resolvedOAuthClient) []string {
 // a client that DID pin a narrow scope is bounded to it.
 func registeredScopeSet(c *resolvedOAuthClient) []string {
 	return strings.Fields(c.Scope)
+}
+
+// registeredScopeAuthority reports who authored the registration that
+// registeredScopeSet just read. Paired with it at the ONE call site so the two
+// halves of "what does the registration pin, and who said so" are always read
+// together.
+func registeredScopeAuthority(c *resolvedOAuthClient) oauthas.RegistrationAuthority {
+	return c.ScopeAuthority
 }
 
 func containsOAuth(ss []string, want string) bool {

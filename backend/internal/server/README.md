@@ -3319,7 +3319,7 @@ that DID pin a narrow scope is bounded to it.
 An **absent REQUEST `scope`** now defaults too (#2466), which makes the two sides
 consistent — an absent registration already meant "no restriction", so failing
 closed on an absent request parameter was the odd one out. The ladder's step 6
-calls `oauthas.ResolveRequestedScope(req.scope, registeredScopeSet(client))`: a
+calls `oauthas.ResolveRequestedScope(req.scope, registeredScopeSet(client), registeredScopeAuthority(client))`: a
 request that CARRIES NO SCOPE TOKEN (the key absent, or a present-but-empty
 `scope=` — `url.Values.Get` cannot tell them apart and they are deliberately
 equivalent) is granted the client's registered scope INTERSECTED with the server
@@ -3348,16 +3348,32 @@ validates against `SupportedScopes`, and no operator token changes —
 `write:deploy` is additionally refused on the ordinary authorization-request path
 (`oauthas.PreRegistrationOnlyScopes`, enforced at the single
 `ResolveRequestedScope` chokepoint so it covers both the explicit and the
-defaulted route): a request naming it is `invalid_scope` unless the client's
-registration PINS it, and a MIXED request naming it alongside valid scopes is
-refused WHOLE rather than silently stripped — stripping would grant less than the
-consent page displayed. The operator write path for such a registration has
-SHIPPED: `fishhawkd oauth client register --scope "... write:deploy"` (#2438),
-which `resolveOAuthClient` prefers over a CIMD fetch. **Residual:** a
-CIMD-resolved client authors its own `scope` member, so for that resolution
-branch the pin is client-declared rather than operator-granted; the posture
-change (never advertised, never defaulted) holds regardless. Full contract and
-the forward rule for adding a scope to the bound:
+defaulted route): a request naming it is `invalid_scope` unless an
+OPERATOR-AUTHORED registration PINS it, and a MIXED request naming it alongside
+valid scopes is refused WHOLE rather than silently stripped — stripping would
+grant less than the consent page displayed. The operator write path for such a
+registration has SHIPPED: `fishhawkd oauth client register --scope
+"... write:deploy"` (#2438), which `resolveOAuthClient` prefers over a CIMD fetch.
+
+**Only the STORE branch is an operator act, and the resolver says which branch it
+was.** `resolveOAuthClient` falls through to the client's own CIMD document on a
+store miss, and that document's `scope` member is unvalidated client-authored
+input — so honouring it would let a client with no store row declare
+`write:deploy` about itself and satisfy the very bound the scope sits behind, on
+the supported connection path. It does not: `resolvedOAuthClient.ScopeAuthority`
+carries the provenance (`resolvedFromStore` →
+`oauthas.OperatorAuthoredRegistration`, `resolvedFromCIMD` →
+`oauthas.ClientAuthoredRegistration`, the untrusted ZERO value), the ladder passes
+it to the chokepoint, and only the operator value unlocks the scope. A
+client-authored pin is refused WHOLE on the explicit path and DROPPED from the
+defaulted one (a defaulted request named nothing, so there is no asked-for set to
+diverge from; an intersection emptied that way still fails closed). Driven
+adversarially end to end by `TestAuthorize_CIMDClientCannotSelfPinWriteDeploy` and
+`TestOAuthFlow_CIMDSelfPinnedWriteDeployNeverReachesAToken`, each with a
+discrimination arm proving the SAME scope string from a store row still grants.
+Residual: anything able to WRITE an `oauth_clients` row counts as an operator, so
+a future RFC 7591 dynamic-registration endpoint would have to be excluded
+explicitly. Full contract and the forward rule for adding a scope to the bound:
 `backend/internal/oauthas/README.md`.
 
 Step 7's registered-scope restriction is **unchanged** by #2477 and still bounds

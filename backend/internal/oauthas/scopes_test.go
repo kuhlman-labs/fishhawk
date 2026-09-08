@@ -149,6 +149,24 @@ func TestParseScope(t *testing.T) {
 //     TestOAuthPRM_ServedAndSelfConsistentWithASMetadata — each reporting the
 //     eight-member list where the seven-member posture was wanted.
 //
+//  4. THE OPERATOR-AUTHORITY GATE (fix-up pass). Deleted the authority half of
+//     both enforcement sites — the explicit path's
+//     `!authority.canPinPreRegistrationOnlyScope() ||` disjunct and the defaulted
+//     path's `isPreRegistrationOnlyScope(s) && !authority...` continue — so the
+//     bound honoured ANY registration again. RED, both altitudes and both
+//     request forms:
+//     TestResolveRequestedScope/{explicit_write:deploy_with_a_CLIENT-authored_pin_refused,
+//     mixed_explicit_request_with_a_CLIENT-authored_pin_refused_whole} each
+//     `= [write:deploy], want error`;
+//     TestResolveRequestedScope/{no_token_with_a_CLIENT-authored_pin_drops_write:deploy
+//     `= [read:runs write:deploy write:runs], want [read:runs write:runs]`,
+//     no_token_with_a_CLIENT-authored_write:deploy-only_pin_fails_closed
+//     `= [write:deploy], want error`}; and in package server
+//     TestAuthorize_CIMDClientCannotSelfPinWriteDeploy/{explicit_self_pinned_write_deploy_refused
+//     `error = "", want invalid_scope` with a code minted, and
+//     scope_less_default_drops_the_self_pinned_write_deploy, whose consent page
+//     listed write:deploy}.
+//
 //  3. THE STRICT-SUBSET INVARIANT. Added "bogus:scope" to DefaultScopes. RED:
 //     TestDefaultScopes_IsStrictSubsetOfSupportedScopes,
 //     `DefaultScopes member "bogus:scope" is absent from SupportedScopes`. (The
@@ -165,8 +183,13 @@ func TestResolveRequestedScope(t *testing.T) {
 		name       string
 		requested  string
 		registered []string
-		want       []string
-		wantErr    bool
+		// authority defaults to ClientAuthoredRegistration (the zero value, the
+		// UNTRUSTED one), so every case that does not name it is asserting the
+		// fail-closed side. The pre-#2477-fixup cases that DO pin write:deploy
+		// name OperatorAuthoredRegistration explicitly.
+		authority RegistrationAuthority
+		want      []string
+		wantErr   bool
 	}{
 		// PRESENT path — delegated to ParseScope, unchanged.
 		{name: "present valid passes through", requested: "read:runs write:runs", want: []string{"read:runs", "write:runs"}},
@@ -182,14 +205,14 @@ func TestResolveRequestedScope(t *testing.T) {
 		// (CONDITION A); the handler-level pin for the `scope=` wire form is
 		// TestAuthorize_AbsentScopeDefaults/present_but_empty_scope_takes_default.
 		{name: "no token and no registration defaults to the advertised posture", requested: "", registered: nil, want: DefaultScopes},
-		{name: "no token and a registration pinning write:deploy grants it", requested: "", registered: []string{"read:runs", "write:deploy"}, want: []string{"read:runs", "write:deploy"}},
+		{name: "no token and an operator registration pinning write:deploy grants it", requested: "", registered: []string{"read:runs", "write:deploy"}, authority: OperatorAuthoredRegistration, want: []string{"read:runs", "write:deploy"}},
 
 		// #2477 — the write:deploy request-time bound. write:deploy stays in the
 		// VOCABULARY (ParseScope accepts it, `fishhawkd token issue` mints it),
 		// but an authorization request reaches it only via a registration pin.
 		{name: "explicit write:deploy with no registration refused", requested: "write:deploy", registered: nil, wantErr: true},
-		{name: "explicit write:deploy with a pinning registration granted", requested: "write:deploy", registered: []string{"read:runs", "write:deploy"}, want: []string{"write:deploy"}},
-		{name: "explicit write:deploy with a narrower registration refused", requested: "write:deploy", registered: []string{"read:runs", "write:runs"}, wantErr: true},
+		{name: "explicit write:deploy with a pinning operator registration granted", requested: "write:deploy", registered: []string{"read:runs", "write:deploy"}, authority: OperatorAuthoredRegistration, want: []string{"write:deploy"}},
+		{name: "explicit write:deploy with a narrower operator registration refused", requested: "write:deploy", registered: []string{"read:runs", "write:runs"}, authority: OperatorAuthoredRegistration, wantErr: true},
 		// REFUSED WHOLE, never stripped: a mixed request must not mint a grant
 		// narrower than the one the client asked for and consent displayed.
 		{name: "mixed request naming write:deploy refused whole not stripped", requested: "read:runs write:runs write:deploy", registered: nil, wantErr: true},
@@ -199,24 +222,42 @@ func TestResolveRequestedScope(t *testing.T) {
 		{name: "no token defaults to a fully supported registration", requested: "", registered: []string{"read:runs", "write:runs"}, want: []string{"read:runs", "write:runs"}},
 		{name: "no token drops registered scopes outside the vocabulary", requested: "", registered: []string{"openid", "read:runs"}, want: []string{"read:runs"}},
 		{name: "no token and a wholly unsupported registration fails closed", requested: "", registered: []string{"openid", "profile"}, wantErr: true},
-		{name: "no token dedups a duplicate-bearing registration", requested: "", registered: []string{"write:runs", "read:runs", "write:runs"}, want: []string{"write:runs", "read:runs"}},
+		{name: "no token dedups a duplicate-bearing registration", requested: "", registered: []string{"write:runs", "read:runs", "write:runs"}, authority: OperatorAuthoredRegistration, want: []string{"write:runs", "read:runs"}},
+
+		// #2477 fix-up — WHOSE registration counts. The bound is an OPERATOR
+		// gate, so a CLIENT-AUTHORED registration (a CIMD document's unvalidated
+		// `scope` member) pinning write:deploy must not unlock it on EITHER
+		// request form. These are the adversarial self-pinning cases: same
+		// registration bytes as the granting cases above, only the authority
+		// differs — so a pass here cannot come from the registration contents.
+		{name: "explicit write:deploy with a CLIENT-authored pin refused", requested: "write:deploy", registered: []string{"read:runs", "write:deploy"}, authority: ClientAuthoredRegistration, wantErr: true},
+		{name: "mixed explicit request with a CLIENT-authored pin refused whole", requested: "read:runs write:deploy", registered: []string{"read:runs", "write:deploy"}, authority: ClientAuthoredRegistration, wantErr: true},
+		{name: "no token with a CLIENT-authored pin drops write:deploy", requested: "", registered: []string{"read:runs", "write:deploy", "write:runs"}, authority: ClientAuthoredRegistration, want: []string{"read:runs", "write:runs"}},
+		// A self-pin naming ONLY write:deploy empties the intersection, which
+		// falls through to the existing fail-closed branch rather than minting
+		// an empty grant.
+		{name: "no token with a CLIENT-authored write:deploy-only pin fails closed", requested: "", registered: []string{"write:deploy"}, authority: ClientAuthoredRegistration, wantErr: true},
+		// The gate is NARROW: a client-authored registration still bounds and
+		// grants every ordinary scope exactly as before.
+		{name: "no token with a CLIENT-authored ordinary pin is unaffected", requested: "", registered: []string{"read:runs", "write:runs"}, authority: ClientAuthoredRegistration, want: []string{"read:runs", "write:runs"}},
+		{name: "explicit ordinary scope with a CLIENT-authored registration granted", requested: "read:runs", registered: []string{"read:runs", "write:deploy"}, authority: ClientAuthoredRegistration, want: []string{"read:runs"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := ResolveRequestedScope(tc.requested, tc.registered)
+			got, err := ResolveRequestedScope(tc.requested, tc.registered, tc.authority)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("ResolveRequestedScope(%q, %v) = %v, want error", tc.requested, tc.registered, got)
+					t.Fatalf("ResolveRequestedScope(%q, %v, %v) = %v, want error", tc.requested, tc.registered, tc.authority, got)
 				}
 				assertCode(t, err, ErrCodeInvalidScope)
 				return
 			}
 			if err != nil {
-				t.Fatalf("ResolveRequestedScope(%q, %v) unexpected error: %v", tc.requested, tc.registered, err)
+				t.Fatalf("ResolveRequestedScope(%q, %v, %v) unexpected error: %v", tc.requested, tc.registered, tc.authority, err)
 			}
 			if !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("ResolveRequestedScope(%q, %v) = %v, want %v", tc.requested, tc.registered, got, tc.want)
+				t.Fatalf("ResolveRequestedScope(%q, %v, %v) = %v, want %v", tc.requested, tc.registered, tc.authority, got, tc.want)
 			}
 		})
 	}
@@ -230,7 +271,7 @@ func TestResolveRequestedScope(t *testing.T) {
 // additionally asserts SupportedScopes is untouched.
 func TestResolveRequestedScope_DefaultDoesNotAliasDefaultScopes(t *testing.T) {
 	// NOT parallel: it mutates its own copy and then re-reads the package vars.
-	got, err := ResolveRequestedScope("", nil)
+	got, err := ResolveRequestedScope("", nil, ClientAuthoredRegistration)
 	if err != nil {
 		t.Fatalf("ResolveRequestedScope: %v", err)
 	}
@@ -245,7 +286,7 @@ func TestResolveRequestedScope_DefaultDoesNotAliasDefaultScopes(t *testing.T) {
 	if SupportedScopes[0] != firstSupported {
 		t.Fatalf("mutating the returned default corrupted SupportedScopes[0] = %q, want %q", SupportedScopes[0], firstSupported)
 	}
-	again, err := ResolveRequestedScope("", nil)
+	again, err := ResolveRequestedScope("", nil, ClientAuthoredRegistration)
 	if err != nil {
 		t.Fatalf("second ResolveRequestedScope: %v", err)
 	}
@@ -323,5 +364,27 @@ func TestScopeString(t *testing.T) {
 	}
 	if !reflect.DeepEqual(back, in) {
 		t.Fatalf("round-trip = %v, want %v", back, in)
+	}
+}
+
+// TestRegistrationAuthority_ZeroValueCannotPin is the fail-closed pin on the
+// #2477 fix-up's authority type: the UNTRUSTED value must be the ZERO value, so
+// a caller that constructs a resolved client without setting provenance — or a
+// future third constructor that forgets it — cannot silently promote
+// client-authored metadata to an operator act.
+//
+// COUNTERFACTUAL (run, observed RED): swapping the iota order so
+// OperatorAuthoredRegistration is 0 turns this RED on the first assertion.
+func TestRegistrationAuthority_ZeroValueCannotPin(t *testing.T) {
+	t.Parallel()
+	var zero RegistrationAuthority
+	if zero != ClientAuthoredRegistration {
+		t.Fatalf("the zero RegistrationAuthority = %v, want ClientAuthoredRegistration (%v) — the untrusted value must be the default", zero, ClientAuthoredRegistration)
+	}
+	if zero.canPinPreRegistrationOnlyScope() {
+		t.Fatal("the zero RegistrationAuthority can pin a pre-registration-only scope; it must fail closed")
+	}
+	if !OperatorAuthoredRegistration.canPinPreRegistrationOnlyScope() {
+		t.Fatal("OperatorAuthoredRegistration cannot pin a pre-registration-only scope; the operator escape hatch is gone")
 	}
 }
