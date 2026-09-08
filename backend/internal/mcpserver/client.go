@@ -3066,7 +3066,11 @@ type campaignGroomingSource struct {
 //   - 403 insufficient_scope (token lacks write:campaigns)
 //   - 422 repo_not_installed (the GitHub App is not on the target repo)
 //   - 422 campaign_dangling_dependency (a depends_on target is outside the assembled set)
-//   - 422 campaign_item_not_child (a requested items ref is not a child of the epic)
+//   - 422 campaign_item_not_child (a parseable items ref is not a child of the epic)
+//   - 422 campaign_item_ref_invalid (an items ref is not a valid issue reference —
+//     not N / #N / issue:N; fires on BOTH the epic subset-filter path and the
+//     no-epic path, and REPLACES the old 502 issue_set_resolution_failed for a
+//     typo'd no-epic ref)
 //   - 501 issue_set_resolution_unsupported (no-epic variant on a provider that
 //     cannot resolve an arbitrary issue set)
 //   - 504 issue_set_resolution_timeout (the no-epic resolution exceeded the

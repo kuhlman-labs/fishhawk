@@ -10991,8 +10991,15 @@ paths:
             `dangling_source: grooming_order`, `grooming_run_id` and
             `grooming_order_limit` so the remedy can name the widen-the-batch /
             drop-the-edge choice;
-            `campaign_item_not_child` — an `items` entry is not a child of the
-            epic.
+            `campaign_item_not_child` — an `items` entry PARSES as an issue ref
+            but is not a child of the epic; `campaign_item_ref_invalid` (#2176)
+            — an `items` entry is not a valid issue reference at all (not `N`,
+            `#N` or `issue:N`), with `details` echoing `items`. It fires on BOTH
+            assembly paths: the epic subset-filter path (where it REPLACES the
+            imprecise `campaign_item_not_child` for a ref that names no issue)
+            and the no-epic `items` path, where it REPLACES the transport-class
+            `502 issue_set_resolution_failed` a typo'd ref used to draw — a
+            malformed ref is caller input, not a provider fault.
 
             E54.6 / #2238 `grooming_source` refusals, each actionable:
             `grooming_order_repo_mismatch` — that grooming run groomed a
@@ -11022,7 +11029,9 @@ paths:
             the App installation; `epic_children_query_failed` — the provider
             could not query the epic's children (epic_ref path);
             `issue_set_resolution_failed` — the provider could not resolve the
-            named issue set (no-epic `items`-only path);
+            named issue set (no-epic `items`-only path). It is a FETCH/transport
+            failure only: a malformed `items` ref now answers `422
+            campaign_item_ref_invalid` instead (#2176);
             `grooming_order_supersession_unreadable` (E54.6 / #2238) — a read
             the currency decision depends on failed. It covers BOTH such reads:
             the SOURCE run's own stages/artifacts/approvals and the supersession

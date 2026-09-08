@@ -284,6 +284,12 @@ The ladder is resolved SERVER-SIDE, in `handleStartCampaignItemRun`:
 
 A closed-AND-completed target never reaches this path — the backend elides it and reports it in the create response's `satisfied_dependencies` block (mirrored on the MCP `Campaign` as `SatisfiedDependencies`). Pinned by `TestStartCampaignGroomingClosedTargetOmitsLimitRemedy` (a closed-only refusal omits `grooming_order_limit`), `TestStartCampaignGroomingMixedCausesRenderBoth` (mixed causes render both the widen and closed clauses), and the source-to-consumer tests threading the REAL `server.DanglingDependencyDetails` map into the renderer.
 
+### `campaign_item_ref_invalid` remedy ([#2176](https://github.com/kuhlman-labs/fishhawk/issues/2176))
+
+`startCampaign` maps a `422 campaign_item_ref_invalid` — an `items` entry that is not a valid issue reference (not `N`, `#N` or `issue:N`) — onto one message naming the ACCEPTED ref forms. It is ONE arm for BOTH assembly paths, so the wording must NOT assume an `epic_ref` is present: the no-epic variant has none. The offending ref reaches the operator via the backend message, which is the server's own parse error.
+
+This is the tool-side half of the backend's classification split. Before it, a malformed ref on the no-epic path surfaced as `502 issue_set_resolution_failed` and fell through to the generic `apiError` surface with no remedy at all; on the epic path it surfaced as `campaign_item_not_child`, whose remedy ("pass only issue refs that are children of the epic") is the wrong advice for a ref that names no issue. `campaign_item_not_child` now fires only for a PARSEABLE ref that is not a child. Pinned by `TestStartCampaign_InvalidItemRef_MapsActionableError` (driven with NO `EpicRef`, so the message cannot depend on one) alongside the retained `TestStartCampaign_ItemNotChild_MapsActionableError`.
+
 ### `issue_set_resolution_timeout` and the issue-set client ([#3113](https://github.com/kuhlman-labs/fishhawk/issues/3113))
 
 A **no-epic** campaign (an explicit `items` list, or a `grooming_run_id` order) resolves each named issue's `depends_on` through the forge one issue at a time, so a full ratified order of sixty items costs sixty-plus round-trips. The epic path is unaffected — `EpicChildren` reads the sibling set in one `ListSubIssues` call.
@@ -1878,7 +1884,8 @@ per-tool contract). Internals not covered there:
   item must be a child of the epic). WITHOUT `epic_ref`, `items` is the #2051 no-epic issue list the campaign assembles
   over directly. The no-epic path fails-dangling for EVERY out-of-set `depends_on` target (it does NOT apply the #2120
   completion-satisfied refinement), and `issue_set_resolution_unsupported` (501) maps when the provider cannot resolve
-  an arbitrary issue set.
+  an arbitrary issue set. A malformed ref on EITHER path maps `campaign_item_ref_invalid` (422, #2176) — on the no-epic
+  path it REPLACES `issue_set_resolution_failed` (502), which now means a genuine forge fetch failure only.
 - **`operator_agent` override (E25.12 / #1451).** `fishhawk_start_campaign`'s optional `operator_agent` — the
   campaign-level delegation override — is typed `map[string]any` on `StartCampaignInput` so the SDK's reflection-built
   input schema sees an unconstrained object; it is marshalled to opaque JSON the backend validates against

@@ -52,21 +52,46 @@ func TestFilterToSubset_ValidSubset_FiltersChildrenAndKeepsIntraEdges(t *testing
 }
 
 // TestFilterToSubset_NonChildItem_ReturnsErrItemNotChild is the fail-closed
-// branch: a requested ref that is not among the epic's children is rejected.
+// branch: a requested ref that PARSES but is not among the epic's children is
+// rejected as ErrItemNotChild — and, the mirrored half of the #2176 split, is
+// NOT workmgmt.ErrInvalidItemRef. The negative assertion is what makes the two
+// sentinels discriminating in BOTH directions: a wrap that matched everything
+// would fail here rather than pass.
 func TestFilterToSubset_NonChildItem_ReturnsErrItemNotChild(t *testing.T) {
 	_, err := campaign.FilterToSubset(fullDAG(), []string{"issue:100", "issue:999"})
 	if !errors.Is(err, campaign.ErrItemNotChild) {
 		t.Fatalf("err = %v, want ErrItemNotChild", err)
 	}
+	if errors.Is(err, workmgmt.ErrInvalidItemRef) {
+		t.Fatalf("err = %v, want NOT ErrInvalidItemRef (issue:999 parses fine; it is simply not a child)", err)
+	}
 }
 
-// TestFilterToSubset_UnparseableItem_ReturnsErrItemNotChild covers the ref-parse
-// failure branch: a ref that is neither a number nor issue:N is an unresolvable
-// subset item and maps onto the same fail-closed error.
-func TestFilterToSubset_UnparseableItem_ReturnsErrItemNotChild(t *testing.T) {
+// TestFilterToSubset_UnparseableItem_ReturnsErrInvalidItemRef covers the
+// ref-parse failure branch: a ref that is neither a number nor issue:N names no
+// issue at all, so it is workmgmt.ErrInvalidItemRef and NOT ErrItemNotChild
+// (#2176) — a ref that resolves to nothing cannot be claimed to be "not a child
+// of the epic". "not-a-ref" is unparseable BY CONSTRUCTION (a literal, not a
+// value produced by calling the control under test), so the RED lands on the
+// behavioral assertion rather than on fixture setup.
+//
+// COUNTERFACTUAL (operator condition 4, plan step 8-iv) — OBSERVED, not
+// reasoned: reverting campaign.parseItemRef's wrap from
+// workmgmt.ErrInvalidItemRef back to ErrItemNotChild and running
+// `go test -run TestFilterToSubset ./internal/campaign/` produced:
+//
+//	--- FAIL: TestFilterToSubset_UnparseableItem_ReturnsErrInvalidItemRef
+//	    subset_test.go:91: err = campaign: subset item is not a child of the epic: "not-a-ref" is not a valid issue ref (want a number or issue:N), want ErrInvalidItemRef
+//	--- FAIL: TestFilterToSubset_NonChildItem_ReturnsErrItemNotChild  (unaffected — still green)
+//
+// Restored byte-identically; both tests green again.
+func TestFilterToSubset_UnparseableItem_ReturnsErrInvalidItemRef(t *testing.T) {
 	_, err := campaign.FilterToSubset(fullDAG(), []string{"not-a-ref"})
-	if !errors.Is(err, campaign.ErrItemNotChild) {
-		t.Fatalf("err = %v, want ErrItemNotChild", err)
+	if !errors.Is(err, workmgmt.ErrInvalidItemRef) {
+		t.Fatalf("err = %v, want ErrInvalidItemRef", err)
+	}
+	if errors.Is(err, campaign.ErrItemNotChild) {
+		t.Fatalf("err = %v, want NOT ErrItemNotChild (an unparseable ref names no issue, so the not-a-child claim does not apply)", err)
 	}
 }
 

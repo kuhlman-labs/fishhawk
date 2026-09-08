@@ -2,6 +2,7 @@ package workmgmt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -138,6 +139,24 @@ type IssueSetRequest struct {
 	Target Target
 	Items  []string
 }
+
+// ErrInvalidItemRef is PART OF THE RESOLVER CONTRACT: a named item ref is not a
+// valid issue reference (it is not `N`, `#N` or `issue:N`). It is returned
+// WRAPPED — by IssueSetDependencyResolver.ResolveDependencies on the no-epic
+// path and by the campaign package's subset ref parser on the epic path — so a
+// caller errors.Is matches it to classify a CLIENT-INPUT failure apart from a
+// provider/transport failure, and answers a 4xx instead of the transport-class
+// 502 an unclassified resolver error draws (#2176).
+//
+// It deliberately carries NO counts (unlike *IssueSetResolutionTimeout): the
+// offending ref is already named in the wrapped message, so a caller renders the
+// refusal from the error text plus the request's own item list.
+//
+// It lives HERE, in workmgmt, rather than in workmgmt/github, so both ref
+// parsers — the github resolver's and campaign's — can wrap the SAME sentinel:
+// campaign already imports workmgmt for EpicChildrenResult, so this adds no
+// dependency edge and no import cycle.
+var ErrInvalidItemRef = errors.New("workmgmt: item ref is not a valid issue reference")
 
 // IssueSetResolutionTimeout is the typed deadline outcome of an issue-set
 // dependency resolution (#3113): the caller's context expired before the

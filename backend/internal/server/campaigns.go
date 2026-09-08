@@ -773,11 +773,25 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		// dependency. Empty/omitted items is a no-op that sweeps every child.
 		result, err = campaign.FilterToSubset(result, req.Items)
 		if err != nil {
+			// A ref that does not PARSE is caller input, and a DIFFERENT claim
+			// from "is not a child of the epic" — it names no issue at all
+			// (#2176). It is classified FIRST, on the shared
+			// workmgmt.ErrInvalidItemRef sentinel the no-epic resolver also
+			// wraps, so both assembly paths answer one code for one cause.
+			// Status is unchanged at 422; only the code gains precision.
+			if errors.Is(err, workmgmt.ErrInvalidItemRef) {
+				s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_item_ref_invalid",
+					err.Error(), map[string]any{"epic_ref": req.EpicRef, "items": req.Items})
+				return
+			}
 			if errors.Is(err, campaign.ErrItemNotChild) {
 				s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_item_not_child",
 					err.Error(), map[string]any{"epic_ref": req.EpicRef, "items": req.Items})
 				return
 			}
+			// Neither sentinel: the only remaining FilterToSubset failure is its
+			// nil epic-children result invariant, which is a server bug rather
+			// than caller input — correctly a 500.
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"filter campaign items to subset failed", map[string]any{"error": err.Error()})
 			return
@@ -832,6 +846,20 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 				}
 				s.writeError(w, r, http.StatusGatewayTimeout, "issue_set_resolution_timeout",
 					"resolving the campaign's issue set exceeded the server's budget", details)
+				return
+			}
+			// A ref that does not PARSE is caller input, not a provider fault:
+			// an operator typo in items used to triage as 502
+			// issue_set_resolution_failed, sending the reader after a transport
+			// problem that never happened (#2176). Classified AFTER the typed
+			// timeout (whose counts must not be shadowed) and BEFORE the generic
+			// 502, which stays byte-identical for every other resolver error.
+			// The message is the resolver's own error, which names the offending
+			// ref: it is OUR parse error, carrying no third-party response text,
+			// and writeError's default-deny detail redactor applies to 5xx only.
+			if errors.Is(err, workmgmt.ErrInvalidItemRef) {
+				s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_item_ref_invalid",
+					err.Error(), map[string]any{"items": itemRefs})
 				return
 			}
 			s.writeError(w, r, http.StatusBadGateway, "issue_set_resolution_failed",

@@ -517,14 +517,19 @@ wave-orders the DAG, and persists the campaign — the batch counterpart to
 `fishhawk_start_run`. Two ways to scope the batch:
 - **WITH `epic_ref`** it resolves the epic's children. Pass optional `items`
   (issue refs — bare number or `issue:N`) to scope to a SUBSET of the epic's
-  children instead of all of them (#2003): every item must be a child of the epic
-  (a non-child fails `campaign_item_not_child`), the DAG is built over just those
+  children instead of all of them (#2003): every item must parse and be a child of
+  the epic (a parseable non-child fails `campaign_item_not_child`; a ref that is
+  not a valid issue reference at all fails `campaign_item_ref_invalid`, #2176),
+  the DAG is built over just those
   items, and an included item whose `depends_on` points at an EXCLUDED item fails
   `campaign_dangling_dependency` (omit `items` to sweep every child).
 - **WITHOUT `epic_ref`** (`items` alone, #2051) it assembles over exactly the
   named issues — the NO-EPIC variant. An included item whose `depends_on` points
   at an OPEN, closed-but-not-completed, or unreadable issue OUTSIDE the list fails
-  `campaign_dangling_dependency`. A closed-AND-completed out-of-set target is
+  `campaign_dangling_dependency`. A ref that is not a valid issue reference fails
+  `campaign_item_ref_invalid` (#2176) — it no longer surfaces as the
+  transport-class `issue_set_resolution_failed`, which now means a genuine forge
+  fetch failure only. A closed-AND-completed out-of-set target is
   instead treated as a SATISFIED dependency (#2953): the edge is elided and
   reported in the create response's `satisfied_dependencies` block, so a batch
   whose prerequisite already landed assembles. The refusal message names the

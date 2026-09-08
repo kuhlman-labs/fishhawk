@@ -833,6 +833,90 @@ func TestCreateCampaign_ItemNotChild_422(t *testing.T) {
 	}
 }
 
+// TestCreateCampaign_EpicPath_MalformedItemRef_422 is the epic-path half of the
+// #2176 split, driven CROSS-BOUNDARY: request JSON -> handleCreateCampaign ->
+// the REAL campaign.FilterToSubset (no fake sits on that seam) -> writeError ->
+// the decoded HTTP body. A ref that does not PARSE now answers 422
+// campaign_item_ref_invalid instead of claiming it "is not a child of the epic";
+// the STATUS is unchanged, only the code gains precision.
+//
+// The assertion is on the SHIPPED body (status + code + details.items + the
+// message), so a comment-only or no-op touch of campaigns.go leaves it RED. Per
+// operator condition 3 it also pins that the message NAMES the offending ref and
+// carries no third-party text: the cause is our own parse error.
+//
+// COUNTERFACTUAL (operator condition 4, plan step 8-i) — OBSERVED, not reasoned:
+// deleting the epic-branch `errors.Is(err, workmgmt.ErrInvalidItemRef)` arm in
+// campaigns.go and running this test produced:
+//
+//	--- FAIL: TestCreateCampaign_EpicPath_MalformedItemRef_422
+//	    campaigns_test.go:865: status = 500, want 422 (body={"error":{"code":"internal_error","message":"filter campaign items to subset failed",...}})
+//
+// (500, not 422 campaign_item_not_child — parseItemRef no longer wraps
+// ErrItemNotChild, so the deleted arm falls through to the invariant 500 arm.)
+// Restored byte-identically; green again.
+func TestCreateCampaign_EpicPath_MalformedItemRef_422(t *testing.T) {
+	fp := &fakeEpicProvider{result: threeChildDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["not-a-ref"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v (body=%s)", err, w.Body.String())
+	}
+	if env.Error.Code != "campaign_item_ref_invalid" {
+		t.Fatalf("error code = %q, want campaign_item_ref_invalid (body=%s)", env.Error.Code, w.Body.String())
+	}
+	assertShippedItemsEcho(t, env.Error.Details, "not-a-ref")
+	assertOwnParseMessage(t, env.Error.Message, "not-a-ref")
+	if epicRef, _ := env.Error.Details["epic_ref"].(string); epicRef != "issue:99" {
+		t.Errorf("details.epic_ref = %q, want issue:99", epicRef)
+	}
+}
+
+// assertShippedItemsEcho asserts the SHIPPED details map echoes the request's
+// items, so the operator can see which set drew the refusal. It reads the
+// decoded body, not the map the handler built, so a future redaction change
+// covering 4xx would redden every caller.
+func assertShippedItemsEcho(t *testing.T, details map[string]any, want string) {
+	t.Helper()
+	items, ok := details["items"].([]any)
+	if !ok {
+		t.Fatalf("details.items missing or not a list in the SHIPPED body: %+v", details)
+	}
+	for _, it := range items {
+		if s, _ := it.(string); s == want {
+			return
+		}
+	}
+	t.Fatalf("details.items = %v, want it to contain %q", items, want)
+}
+
+// assertOwnParseMessage is operator condition 3: err.Error() is only acceptable
+// in the 422 message because the cause is OUR OWN parse error naming the
+// caller's ref. It pins both halves — the offending ref IS named, and no
+// third-party (forge/API response) text rides along.
+func assertOwnParseMessage(t *testing.T, msg, ref string) {
+	t.Helper()
+	if !strings.Contains(msg, ref) {
+		t.Errorf("message %q does not name the offending ref %q", msg, ref)
+	}
+	if !strings.Contains(msg, "is not a valid issue ref") && !strings.Contains(msg, "not a numeric issue reference") {
+		t.Errorf("message %q is not our own parse error text", msg)
+	}
+	// A third-party cause would arrive as a forge/HTTP response fragment. None
+	// of these may appear: the message is ours end to end.
+	for _, forbidden := range []string{"github rejected", "api.github.com", "status code", "HTTP "} {
+		if strings.Contains(msg, forbidden) {
+			t.Errorf("message %q carries third-party text %q", msg, forbidden)
+		}
+	}
+}
+
 // TestCreateCampaign_SubsetIncludedDependsOnExcludedIncomplete_422 is the
 // re-classified DroppedEdges path: including 101 (depends on 100) while
 // excluding the INCOMPLETE 100 makes 101's dependency dangling, surfaced as 422
@@ -1316,6 +1400,57 @@ func TestCreateCampaign_NoEpic_ResolverError_502(t *testing.T) {
 	}
 	if code := decodeCampaignError(t, w); code != "issue_set_resolution_failed" {
 		t.Errorf("error code = %q, want issue_set_resolution_failed", code)
+	}
+}
+
+// TestCreateCampaign_NoEpic_MalformedItemRef_422 is the DEFECT the issue names:
+// an operator typo in items used to triage as 502 issue_set_resolution_failed —
+// a transport-class code sending the reader after a provider problem that never
+// happened. It now answers 422 campaign_item_ref_invalid (#2176).
+//
+// RESIDUAL, stated rather than papered over: this test necessarily substitutes
+// fakeIssueSetProvider (the real github provider needs an installation and a
+// package-private fake API client), so no single test crosses the whole
+// provider->handler boundary. The seam is pinned by a PAIR: this test proves the
+// HANDLER classifies the sentinel, and
+// TestProvider_ResolveDependencies_FailClosed in
+// backend/internal/workmgmt/github proves the REAL ResolveDependencies WRAPS it.
+// The fake therefore returns the exact sentinel-wrapped SHAPE the real resolver
+// now produces.
+//
+// COUNTERFACTUAL (operator condition 4, plan step 8-ii) — OBSERVED, not
+// reasoned: deleting the no-epic `errors.Is(err, workmgmt.ErrInvalidItemRef)`
+// arm in campaigns.go and running this test produced:
+//
+//	--- FAIL: TestCreateCampaign_NoEpic_MalformedItemRef_422
+//	    campaigns_test.go:1439: status = 502, want 422 (body={"error":{"code":"issue_set_resolution_failed",...}})
+//
+// Restored byte-identically; green again.
+func TestCreateCampaign_NoEpic_MalformedItemRef_422(t *testing.T) {
+	// The shape the real resolver returns: multi-%w carrying BOTH the shared
+	// sentinel and the underlying parse cause, with the ref named.
+	fp := &fakeIssueSetProvider{resolveErr: fmt.Errorf("workmgmt/github: item %q: %w: %w",
+		"not-a-ref", workmgmt.ErrInvalidItemRef, errors.New("not a numeric issue reference"))}
+	registerIssueSetProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["not-a-ref"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v (body=%s)", err, w.Body.String())
+	}
+	if env.Error.Code != "campaign_item_ref_invalid" {
+		t.Fatalf("error code = %q, want campaign_item_ref_invalid (body=%s)", env.Error.Code, w.Body.String())
+	}
+	assertShippedItemsEcho(t, env.Error.Details, "not-a-ref")
+	assertOwnParseMessage(t, env.Error.Message, "not-a-ref")
+	// No-epic: the epic_ref key must be ABSENT — the message and details must not
+	// assume an epic that does not exist on this path.
+	if _, ok := env.Error.Details["epic_ref"]; ok {
+		t.Errorf("details = %+v, want NO epic_ref key on the no-epic path", env.Error.Details)
 	}
 }
 
