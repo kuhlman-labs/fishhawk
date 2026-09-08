@@ -113,14 +113,12 @@ const conventionsPathForMessage = ".fishhawk/work-management.yaml"
 // Pure: no I/O, no receiver, no request context. That is what lets a later
 // static-validation pass call it directly.
 func WorkflowRequiresCharter(wf spec.Workflow) bool {
-	for _, st := range wf.Stages {
-		for _, p := range st.Produces {
-			if p.Artifact == spec.ArtifactGroomingReport {
-				return true
-			}
-		}
-	}
-	return false
+	// One-line delegation (E54.13 / #2806): the predicate itself moved down
+	// to backend/internal/spec so the webhook dispatchers — which server
+	// imports, so they cannot import server — stamp the SAME verdict onto
+	// the run row (requires_charter) that this gate evaluates. This wrapper
+	// keeps the exported surface, its tests and the README contract intact.
+	return spec.WorkflowRequiresCharter(wf)
 }
 
 // errCharterRequired is the sentinel the ctx/error arm wraps, so a caller (and

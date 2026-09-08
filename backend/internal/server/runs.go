@@ -123,9 +123,20 @@ type runResponse struct {
 	// gates on it. The MCP client mirror decodes this field; the json tag
 	// MUST byte-match its counterpart or the cadence silently degrades to the
 	// elapsed-based fallback with no error.
-	PredictedRuntimeMinutes int       `json:"predicted_runtime_minutes,omitempty"`
-	CreatedAt               time.Time `json:"created_at"`
-	UpdatedAt               time.Time `json:"updated_at"`
+	PredictedRuntimeMinutes int `json:"predicted_runtime_minutes,omitempty"`
+	// RequiresCharter is the run's persisted grooming determination (E54.13
+	// / #2806, migration 0082), read-only: true when the workflow this run
+	// was minted from produces a grooming_report (so its plan prompt must
+	// carry a charter), false when it does not. Omitted (omitempty on the
+	// pointer, so an explicit false still renders) when the row carries NO
+	// persisted determination — a row minted before the column existed, or
+	// a child inheriting nil from such a parent — in which case the
+	// prompt-serve path derives it from the cached spec and refuses
+	// (grooming_workflow_spec_unreadable) when that spec is undecidable.
+	// Surfaced so an operator can see which fact decided a refusal.
+	RequiresCharter *bool     `json:"requires_charter,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 	// Concerns is the run's OPEN review-concern summary (#964): count,
 	// per-state breakdown, and the stable IDs fishhawk_fixup_stage's
 	// concern_ids addressing needs. Populated by handleGetRun ONLY —
@@ -623,6 +634,7 @@ func toRunResponse(r *run.Run) runResponse {
 		ResolvedModel:           r.ResolvedModel,
 		WorkingDir:              r.WorkingDir,
 		PredictedRuntimeMinutes: r.PredictedRuntimeMinutes,
+		RequiresCharter:         r.RequiresCharter,
 		CreatedAt:               r.CreatedAt,
 		UpdatedAt:               r.UpdatedAt,
 	}
@@ -1556,6 +1568,19 @@ func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerP
 		// the pre-#2506 posture, honestly unresolved rather than falsely green.
 		RequiredChecksSnapshot: s.captureRequiredChecks(ctx, p.Repo, checksScope),
 	}
+	// Persist the grooming determination (E54.13 / #2806): the SAME pure
+	// structural predicate the charter admission gate just evaluated, recorded
+	// while the spec is known-parseable, so the prompt-serve path reads a fact
+	// instead of re-deriving it from a cached spec that may since have been
+	// corrupted. Stamped UNCONDITIONALLY — outside the HaveStageDefs block —
+	// so a row minted here NEVER carries NULL: HaveStageDefs == false means no
+	// workflow definition was resolved at all, WorkflowDef is the zero
+	// spec.Workflow, and the predicate is false by construction (the argument
+	// charter_gate.go records), so FALSE is the honest value there. NULL is
+	// left to mean "no persisted determination" — a row minted before
+	// migration 0082, or a child inheriting nil from such a parent.
+	requiresCharter := WorkflowRequiresCharter(p.WorkflowDef)
+	createParams.RequiresCharter = &requiresCharter
 	if p.HaveStageDefs {
 		// Cache the validated spec bytes on the row so the trace handler's
 		// policy re-evaluation reads constraints from storage instead of

@@ -865,3 +865,131 @@ func TestCharterRefusalMessage_Golden(t *testing.T) {
 		})
 	}
 }
+
+// --- the requires_charter STAMP at the CreateRunForTrigger seam (E54.13 / #2806)
+
+// stampRecordingRepo is driveE2ERepo plus a field-by-field copy of the
+// persisted grooming determination onto the STORED row, mirroring what the
+// Postgres adapter does (the shared fakeRepo predates the column and drops
+// it, which would make every stamp assertion pass vacuously — or fail
+// spuriously — against the row it reads back).
+type stampRecordingRepo struct{ *driveE2ERepo }
+
+func (r *stampRecordingRepo) CreateRun(ctx context.Context, p run.CreateRunParams) (*run.Run, error) {
+	created, err := r.driveE2ERepo.CreateRun(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	created.RequiresCharter = p.RequiresCharter
+	return created, nil
+}
+
+// mintViaCreateRunForTrigger drives the single integrating mint seam both the
+// HTTP handler and the campaign item-run start route through, and returns the
+// row READ BACK from the repository — not the create return value — so the
+// assertion is on committed state (a stamp that fired and was dropped would
+// hand back a byte-identical *run.Run).
+func mintViaCreateRunForTrigger(t *testing.T, p CreateRunForTriggerParams) *run.Run {
+	t.Helper()
+	repo := &stampRecordingRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: newAuditFake()})
+	created, err := s.CreateRunForTrigger(context.Background(), p)
+	if err != nil {
+		t.Fatalf("CreateRunForTrigger: %v", err)
+	}
+	stored, err := repo.GetRun(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("GetRun(%s): %v", created.ID, err)
+	}
+	return stored
+}
+
+// TestCharterGate_CreateRunPersistsGroomingDetermination pins the stamp on the
+// CreateRunForTrigger seam: the persisted row carries a NON-NIL determination
+// equal to WorkflowRequiresCharter over the resolved workflow — true for a
+// grooming workflow, false for an ordinary one, and FALSE (not NULL) on the
+// HaveStageDefs==false path, where no workflow definition was resolved at all
+// and the zero spec.Workflow is false by construction. Stamping that path is
+// what keeps NULL meaning "no persisted determination" (a row minted before
+// migration 0082, or a child inheriting nil from such a parent) rather than
+// "minted through a branch that forgot".
+//
+// COUNTERFACTUAL: delete `createParams.RequiresCharter = &requiresCharter` in
+// CreateRunForTrigger and every cell goes RED on the nil check.
+func TestCharterGate_CreateRunPersistsGroomingDetermination(t *testing.T) {
+	grooming := mustParseWorkflow(t, groomingSpecYAML, "tidy_the_backlog")
+	ordinary := mustParseWorkflow(t, nonGroomingSpecYAML, "feature_change")
+	ref := "issue:2806"
+	base := CreateRunForTriggerParams{
+		Repo: "x/y", WorkflowSHA: "abc", TriggerSource: run.TriggerCLI, TriggerRef: &ref,
+		RunnerKind: run.RunnerKindLocal, WorkingDir: "/tmp/x",
+	}
+	cases := []struct {
+		name   string
+		mutate func(p *CreateRunForTriggerParams)
+		want   bool
+	}{
+		{name: "grooming workflow stamps true", want: true, mutate: func(p *CreateRunForTriggerParams) {
+			p.WorkflowID, p.WorkflowDef, p.WorkflowSpec, p.HaveStageDefs = "tidy_the_backlog", grooming, []byte(groomingSpecYAML), true
+		}},
+		{name: "ordinary workflow stamps false", want: false, mutate: func(p *CreateRunForTriggerParams) {
+			p.WorkflowID, p.WorkflowDef, p.WorkflowSpec, p.HaveStageDefs = "feature_change", ordinary, []byte(nonGroomingSpecYAML), true
+		}},
+		{name: "no stage defs stamps false, never NULL", want: false, mutate: func(p *CreateRunForTriggerParams) {
+			// The name IS backlog_grooming: the name does not make a run
+			// grooming-capable, the resolved stages do, and there are none.
+			p.WorkflowID, p.HaveStageDefs = "backlog_grooming", false
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := base
+			tc.mutate(&p)
+			stored := mintViaCreateRunForTrigger(t, p)
+			if stored.RequiresCharter == nil {
+				t.Fatalf("persisted requires_charter = nil, want %v — a row minted here must never carry NULL", tc.want)
+			}
+			if *stored.RequiresCharter != tc.want {
+				t.Errorf("persisted requires_charter = %v, want %v", *stored.RequiresCharter, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunResponse_RequiresCharterRendersTriState pins the read-only API
+// exposure: true and false both RENDER (omitempty on a *bool omits only nil,
+// so a persisted non-grooming determination is visible as `false`), and a row
+// with no persisted determination omits the key entirely rather than
+// rendering `null` or a fabricated `false` — the operator-visible distinction
+// between "decided non-grooming" and "no determination recorded".
+func TestRunResponse_RequiresCharterRendersTriState(t *testing.T) {
+	tr, fa := true, false
+	cases := []struct {
+		name string
+		val  *bool
+		want string
+	}{
+		{name: "true renders", val: &tr, want: `"requires_charter":true`},
+		{name: "false renders", val: &fa, want: `"requires_charter":false`},
+		{name: "nil omitted", val: nil, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &run.Run{ID: uuid.New(), Repo: "x/y", WorkflowID: "feature_change", RequiresCharter: tc.val}
+			b, err := json.Marshal(toRunResponse(r))
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			body := string(b)
+			if tc.want == "" {
+				if strings.Contains(body, "requires_charter") {
+					t.Errorf("requires_charter present on a row with no persisted determination:\n%s", body)
+				}
+				return
+			}
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("response lacks %s:\n%s", tc.want, body)
+			}
+		})
+	}
+}

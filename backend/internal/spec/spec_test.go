@@ -7365,3 +7365,76 @@ func TestVersionMajor_ExportedDelegates(t *testing.T) {
 		})
 	}
 }
+
+// TestWorkflowRequiresCharter_Pin is the direct pin on the pure structural
+// grooming discriminator now living in this package (E54.13 / #2806, moved
+// down from server so the webhook dispatchers can stamp the same verdict).
+// Four legs: a grooming workflow, an ordinary one, the zero Workflow (what the
+// server's HaveStageDefs==false path hands it — must be false, so that seam
+// stamps FALSE rather than needing its own gate), and a workflow NAMED
+// backlog_grooming that produces no report (the name is not the discriminator).
+func TestWorkflowRequiresCharter_Pin(t *testing.T) {
+	parse := func(t *testing.T, doc, name string) spec.Workflow {
+		t.Helper()
+		s, err := spec.ParseBytes([]byte(doc))
+		if err != nil {
+			t.Fatalf("ParseBytes: %v", err)
+		}
+		wf, ok := s.Workflows[name]
+		if !ok {
+			t.Fatalf("workflow %q not in %v", name, s.Workflows)
+		}
+		return wf
+	}
+	const grooming = `version: "2"
+workflows:
+  tidy_the_backlog:
+    stages:
+      - id: groom
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: grooming_report
+            schema: grooming_report_v1
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+`
+	const ordinaryNamedGrooming = `version: "2"
+workflows:
+  backlog_grooming:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	cases := []struct {
+		name string
+		wf   spec.Workflow
+		want bool
+	}{
+		{name: "stage producing grooming_report", wf: parse(t, grooming, "tidy_the_backlog"), want: true},
+		{name: "ordinary workflow named backlog_grooming", wf: parse(t, ordinaryNamedGrooming, "backlog_grooming"), want: false},
+		{name: "zero Workflow", wf: spec.Workflow{}, want: false},
+		{name: "stages without produces", wf: spec.Workflow{Stages: []spec.Stage{{ID: "plan", Type: spec.StageTypePlan}}}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := spec.WorkflowRequiresCharter(tc.wf); got != tc.want {
+				t.Errorf("WorkflowRequiresCharter = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

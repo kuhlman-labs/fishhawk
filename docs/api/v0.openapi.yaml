@@ -1147,6 +1147,32 @@ components:
             and nothing gates on it. A stale, absent or wrong value costs
             at most a coarser or finer poll interval.
           example: 115
+        requires_charter:
+          type: boolean
+          description: |
+            The run's persisted grooming determination (E54.13 / #2806),
+            read-only. Recorded at run creation, when the workflow spec is
+            known-parseable, from the same structural predicate the charter
+            admission gate evaluates: `true` when the workflow this run was
+            minted from declares a stage producing `grooming_report` (so
+            its plan prompt must carry the repository charter), `false`
+            when it does not. Every root mint seam stamps it — `POST
+            /v0/runs`, the campaign item-run start, and the GitHub / GitLab
+            webhook dispatchers — and a child run inherits its parent's
+            value verbatim.
+
+            Tri-state: ABSENT means the row carries NO persisted
+            determination — a row minted before the column existed, or a
+            child inheriting that absence from such a parent (a bounded,
+            non-growing population except by descent from legacy parents).
+            For such a run the prompt-serve path derives the determination
+            from the cached workflow spec and refuses with
+            `grooming_workflow_spec_unreadable` when that spec is
+            undecidable. An explicit `false` is always rendered, so
+            "decided non-grooming" and "no determination recorded" are
+            distinguishable. Surfaced so an operator can see which fact
+            decided a charter refusal.
+          example: true
         concerns:
           $ref: '#/components/schemas/RunConcerns'
           description: |
@@ -12288,7 +12314,7 @@ paths:
                       - `charter_base_ref_unresolved` — no base-ref resolver is wired, the forge call failed, or it returned an empty ref (which a forge reads as the default branch: a mutable read, refused rather than defaulted).
                       - `charter_not_injected` — a backlog-grooming propose prompt reached the post-resolution check with no document resolved from the declared charter path.
                       - `conventions_unavailable` — the repository conventions could not be loaded at all.
-                      - `grooming_workflow_spec_unreadable` — the run's cached workflow spec cannot be re-parsed AND the `grooming_report` artifact is attributable to this run's workflow, so whether this is a grooming propose stage is undecidable.
+                      - `grooming_workflow_spec_unreadable` — the run carries NO persisted grooming determination (`requires_charter` absent: a row minted before the determination was persisted, or a child inheriting that absence) AND its cached workflow spec cannot be parsed, is empty, or names no such workflow, so whether this is a grooming propose stage is undecidable and the prompt is refused rather than served unanchored. A run whose `requires_charter` is present is decided by that fact and never draws this reason; recover by starting a new run, whose determination is recorded at creation.
 
                       For a `repodoc` resolution failure the details also carry
                       `path` (the declared document path) and
@@ -12553,7 +12579,7 @@ paths:
                       - `charter_base_ref_unresolved` — no base-ref resolver is wired, the forge call failed, or it returned an empty ref (which a forge reads as the default branch: a mutable read, refused rather than defaulted).
                       - `charter_not_injected` — a backlog-grooming propose prompt reached the post-resolution check with no document resolved from the declared charter path.
                       - `conventions_unavailable` — the repository conventions could not be loaded at all.
-                      - `grooming_workflow_spec_unreadable` — the run's cached workflow spec cannot be re-parsed AND the `grooming_report` artifact is attributable to this run's workflow, so whether this is a grooming propose stage is undecidable.
+                      - `grooming_workflow_spec_unreadable` — the run carries NO persisted grooming determination (`requires_charter` absent: a row minted before the determination was persisted, or a child inheriting that absence) AND its cached workflow spec cannot be parsed, is empty, or names no such workflow, so whether this is a grooming propose stage is undecidable and the prompt is refused rather than served unanchored. A run whose `requires_charter` is present is decided by that fact and never draws this reason; recover by starting a new run, whose determination is recorded at creation.
 
                       For a `repodoc` resolution failure the details also carry
                       `path` (the declared document path) and

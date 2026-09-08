@@ -339,6 +339,9 @@ func (d *Dispatcher) handleGitLabCreateRun(ctx context.Context, ev Event, m Matc
 	// has no GitHub App installation id.
 	triggerRef := m.TriggerRef
 	credentialRef := ev.CredentialRef
+	// Persisted grooming determination (E54.13 / #2806) — a stamp, not a
+	// gate; see the GitHub dispatcher's twin for the rationale.
+	requiresCharter := spec.WorkflowRequiresCharter(workflow)
 	created, err := d.Runs.CreateRun(ctx, run.CreateRunParams{
 		Repo:               ev.Repo,
 		WorkflowID:         m.WorkflowID,
@@ -353,7 +356,8 @@ func (d *Dispatcher) handleGitLabCreateRun(ctx context.Context, ev Event, m Matc
 		// column default (false) — CreateRunParams carries no field for it —
 		// so the runner's signed self-report remains authoritative and can
 		// still contradict this hint without a lock conflict.
-		RunnerKind: run.RunnerKindGitLabCI,
+		RunnerKind:      run.RunnerKindGitLabCI,
+		RequiresCharter: &requiresCharter,
 	})
 	if err != nil {
 		return fmt.Errorf("dispatcher: create gitlab run: %w", err)
