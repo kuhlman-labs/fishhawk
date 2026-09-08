@@ -82,10 +82,17 @@ entry is inert. A non-numeric, zero, negative or `> 65535` value is rejected
 with a diagnostic naming the variable, the value and the accepted range
 (`1..65535`) before `kubectl` is ever invoked.
 
+Setting `FISHHAWK_K8S_JAEGER_UI_PORT` and `FISHHAWK_K8S_JAEGER_OTLP_PORT` to the
+**same** value is rejected up front, even when that port is free: one host port
+cannot carry both mappings, so `kubectl` would bind the UI forward and fail the
+OTLP one. The bring-up names both variables and the shared value, skips the
+Jaeger forward, and advertises no Jaeger endpoint.
+
 The two forwards have **different collision policies, by design**: a squatted
-fishhawkd port is fatal (fishhawkd is unreachable without it), while a squatted
-Jaeger port prints a warning, skips the Jaeger forward, and leaves the command
-exit code 0 — tracing is optional and fishhawkd is already healthy by then.
+fishhawkd port is fatal (fishhawkd is unreachable without it), while an
+unusable Jaeger port — squatted, or equal to the other Jaeger port — prints a
+warning, skips the Jaeger forward, and leaves the command exit code 0. Tracing
+is optional and fishhawkd is already healthy by then.
 
 **Caveat — OAuth callback.** `values-local.yaml` pins
 `config.oauthCallbackUrl` to `http://localhost:8080/v0/auth/github/callback`. A
@@ -101,13 +108,49 @@ FISHHAWK_K8S_PF_PORT=18080 scripts/dev k8s
 # 2. fishhawkd answers on the overridden port.
 curl -sS http://localhost:18080/healthz
 
-# 3. Hold the port, then re-run: the preflight must abort BEFORE the image
-#    build, naming the nc pid and pointing at the override variable.
-nc -l 127.0.0.1 18080 &          # note the printed pid
+# 3. Tear the stack down FIRST. Step 1 left a live `kubectl port-forward` bound
+#    to 18080; without this, nc below cannot acquire the port and step 5 would
+#    identify that forward instead of the intended squatter — a collision the
+#    walk did not stage.
+scripts/dev k8s-down
+
+# 4. Now hold the port with nc, and PROVE nc owns it before asserting anything.
+#    lsof must print exactly one pid, and it must be nc's.
+nc -l 127.0.0.1 18080 &
+nc_pid=$!
+sleep 1
+lsof -nP -iTCP:18080 -sTCP:LISTEN
+# expected: a single LISTEN row whose PID column equals $nc_pid and whose
+# COMMAND column is `nc`. If it is empty, nc failed to bind (something else
+# still holds 18080) and the collision assertion below would be meaningless —
+# stop and clear the port first.
+
+# 5. Re-run: the preflight must abort BEFORE the image build, naming the nc pid
+#    and pointing at the override variable.
 FISHHAWK_K8S_PF_PORT=18080 scripts/dev k8s
-# expected: error: port 18080 already has a listener: pid <nc-pid> (nc) — run
+# expected: error: port 18080 already has a listener: pid <nc_pid> (nc) — run
 # 'scripts/dev k8s-down', kill the pid, or set FISHHAWK_K8S_PF_PORT to a free
 # port, then retry
+# and NO `building image ...` line above it.
+
+# 6. Release the port.
+kill "$nc_pid"
+```
+
+The equal-port variant of the same walk exercises the Jaeger leg's divergent
+policy — no squatter needed, because the collision is between the two overrides
+themselves:
+
+```sh
+FISHHAWK_K8S_JAEGER_UI_PORT=26686 FISHHAWK_K8S_JAEGER_OTLP_PORT=26686 \
+  scripts/dev k8s
+# expected, AFTER fishhawkd is healthy (exit code 0, fishhawkd usable):
+# warning: FISHHAWK_K8S_JAEGER_UI_PORT and FISHHAWK_K8S_JAEGER_OTLP_PORT both
+# resolve to port 26686 — one host port cannot carry both forwards
+#   set one of them to a different free port; skipping the jaeger forward
+# fishhawkd is up and usable; tracing is unavailable this session
+# and NO `jaeger UI at ...` line — a forward that was not opened is never
+# advertised.
 ```
 
 The `/healthz` poll is the authoritative readiness signal. With the in-cluster
@@ -246,11 +289,13 @@ While the bring-up's Jaeger forward is alive:
   target; `FISHHAWK_K8S_JAEGER_OTLP_PORT`)
 
 Both host ports are overridable — see [Overriding the forwarded host
-ports](#overriding-the-forwarded-host-ports). If either is already held, the
-bring-up warns naming the squatting pid and the override variable, skips the
-Jaeger forward, and still exits 0 with fishhawkd usable; tracing is simply
-unavailable that session. The command prints the endpoints it actually forwarded,
-so the printed guidance can never disagree with the live forward.
+ports](#overriding-the-forwarded-host-ports). If either is already held, or if
+the two overrides resolve to the same port (which no per-port check can catch,
+since one free port passes a free-port test twice), the bring-up warns naming
+the offending port and the override variable, skips the Jaeger forward, and
+still exits 0 with fishhawkd usable; tracing is simply unavailable that session.
+The endpoint lines are printed only on the branch that actually spawned the
+forward, so the printed guidance can never disagree with the live forward.
 
 **Execution-locality caveat.** fishhawkd does *not* emit these spans — the
 `fishhawk-runner` does, and under the dogfood loop the runner is spawned by

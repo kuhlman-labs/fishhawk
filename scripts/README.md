@@ -596,16 +596,40 @@ preflighted like the fishhawkd one; the trailing endpoint lines and the
 `OTEL_EXPORTER_OTLP_ENDPOINT` hint interpolate the RESOLVED ports, so
 the printed guidance can never disagree with the live forward.
 
+The whole refusal decision — and only the refusal decision — lives in
+`_k8s_jaeger_decide <ui> <otlp>` (0 = forward it, 1 = skip it); the
+endpoint lines live in `_k8s_jaeger_endpoints`, reachable ONLY from
+that success branch, so a forward that was not opened can never be
+advertised as live. Both are pure with respect to the cluster, so
+`scripts/test-dev` drives the same composition `cmd_k8s_up` does.
+
+`_k8s_jaeger_decide` refuses on either of two conditions:
+
+- **The two host ports resolve to the SAME value.** The per-port
+  preflights cannot see this — each asks only "is port N free?", and
+  one free port answers yes twice — yet `kubectl port-forward
+  svc/fishhawk-jaeger 9000:16686 9000:4318` binds the first mapping and
+  fails the second. Refused up front by `_k8s_ports_distinct`, which
+  names both variables and the shared value. It SHORT-CIRCUITS ahead of
+  the preflights: nothing holds the port, so an "already has a
+  listener" line here would be a false diagnosis.
+- **Either port is squatted**, reported per-port from
+  `PREFLIGHT_SQUATTER_DESC`.
+
+A Jaeger port colliding with the FISHHAWKD forward port needs no third
+check: that forward is already listening by then, so the preflight
+reports it as an ordinary squatter (naming the kubectl pid).
+
 **Collision policy DIVERGES from the fishhawkd leg, by design
 (operator-ratified, #2917).** A squatted fishhawkd port is FATAL —
-fishhawkd is unreachable without that forward. A squatted Jaeger port
-instead prints a warning naming the squatting pid(s) and the override
-variable, SKIPS the Jaeger forward, and leaves the command's exit code
-**0** with fishhawkd healthy and usable: this leg runs only after the
-`/healthz` gate has already passed, so aborting here would tear down a
-working stack over an OPTIONAL tracing forward. `scripts/test-dev`
-carries the same attestation next to the assertions that pin both
-policies, so a later edit unifying them goes red.
+fishhawkd is unreachable without that forward. Either Jaeger refusal
+above instead prints a warning naming the offending port(s) and the
+override variable(s), SKIPS the Jaeger forward, and leaves the
+command's exit code **0** with fishhawkd healthy and usable: this leg
+runs only after the `/healthz` gate has already passed, so aborting
+here would tear down a working stack over an OPTIONAL tracing forward.
+`scripts/test-dev` carries the same attestation next to the assertions
+that pin both policies, so a later edit unifying them goes red.
 
 ### Teardown
 
@@ -625,7 +649,13 @@ that an override reaches BOTH the printed `/healthz` URL and the
 `cmd_k8s_up` uses, and body-greps `cmd_k8s_up` for the absence of the
 `8080:8080` / `16686:16686` / `4318:4318` host-side literals — the
 done-means tripwire, since these are shell strings no compiler
-checks. Operator quickstart + the values-local-vs-prod
+checks. Section 19g drives the Jaeger refusal end to end without a
+cluster: equal free ports (refused, no phantom-squatter line, and the
+decide-then-report composition advertises NO endpoint), distinct free
+ports as the control (forwarded, both resolved ports in the endpoint
+lines), and a distinct-but-`nc`-squatted port (warn-and-skip). Section
+19h records the observed counterfactual RED for every control in this
+area. Operator quickstart + the values-local-vs-prod
 split: `docs/deploy/kubernetes.md`. The true end-to-end path (image
 build → chart install → `/healthz` green) is an operator smoke test
 against a Docker-Desktop cluster, not run in CI.

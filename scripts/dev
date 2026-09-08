@@ -452,6 +452,72 @@ _k8s_validate_port() {
   return 0
 }
 
+# Two host ports that resolve to the SAME value cannot both be bound: `kubectl
+# port-forward svc/fishhawk-jaeger 9000:16686 9000:4318` binds the first mapping
+# and fails the second. The per-port preflights above cannot see this — each one
+# asks only "is port N free?", and one free port answers yes TWICE — so without
+# this check the command would spawn a half-dead forward and then print BOTH
+# endpoints as available while discarding kubectl's error (E69.6 / #2917).
+# Pure predicate: 0 when the two ports differ, otherwise a one-line stderr
+# warning naming both variables and the shared value, and 1. Never exits, so
+# callers use an `if !` tested context (#631 discipline).
+_k8s_ports_distinct() {
+  local var_a="$1" port_a="$2" var_b="$3" port_b="$4"
+  if [[ "$port_a" == "$port_b" ]]; then
+    print -u2 "warning: ${var_a} and ${var_b} both resolve to port ${port_a} — one host port cannot carry both forwards"
+    return 1
+  fi
+  return 0
+}
+
+# Decide whether the jaeger forward can run, and emit the operator-facing
+# diagnostics for a refusal. Pure with respect to the cluster (no kubectl, no
+# spawn, no exit), so scripts/test-dev drives the SAME function cmd_k8s_up does.
+# Returns 0 = forward it, 1 = skip it. The distinctness check short-circuits:
+# when both ports are equal there is exactly one collision to report, and
+# running the preflights would add two misleading "already has a listener"
+# lines for a port nothing holds.
+#
+# COLLISION POLICY DIVERGENCE (ratified by the operator, E69.6 / #2917): the
+# fishhawkd leg is FATAL on a squatted port, this one WARNS AND SKIPS with exit
+# 0. The asymmetry is deliberate — this forward runs only AFTER fishhawkd is
+# already healthy, so aborting here would tear down a working stack over an
+# OPTIONAL tracing forward. The preflight is called in silent-detection mode
+# (empty remediation) because an 'error:' prefix would misdescribe a non-fatal
+# skip; the warnings below compose the roster from PREFLIGHT_SQUATTER_DESC.
+# A jaeger port colliding with the FISHHAWKD forward port needs no separate
+# check: that forward is already listening by the time this runs, so the
+# preflight reports it as an ordinary squatter (naming the kubectl pid).
+_k8s_jaeger_decide() {
+  local ui_port="$1" otlp_port="$2"
+  if ! _k8s_ports_distinct FISHHAWK_K8S_JAEGER_UI_PORT "$ui_port" \
+    FISHHAWK_K8S_JAEGER_OTLP_PORT "$otlp_port"; then
+    print -u2 "  set one of them to a different free port; skipping the jaeger forward"
+    return 1
+  fi
+
+  local skip=0
+  if ! _preflight_port_free "$ui_port"; then
+    print -u2 "warning: jaeger UI port ${ui_port} already has a listener: ${PREFLIGHT_SQUATTER_DESC}— set FISHHAWK_K8S_JAEGER_UI_PORT to a free port, or kill the pid; skipping the jaeger forward"
+    skip=1
+  fi
+  if ! _preflight_port_free "$otlp_port"; then
+    print -u2 "warning: jaeger OTLP port ${otlp_port} already has a listener: ${PREFLIGHT_SQUATTER_DESC}— set FISHHAWK_K8S_JAEGER_OTLP_PORT to a free port, or kill the pid; skipping the jaeger forward"
+    skip=1
+  fi
+  return $skip
+}
+
+# The endpoint lines cmd_k8s_up prints once the jaeger forward is live. Factored
+# out so the reporting is reachable ONLY through _k8s_jaeger_decide's success
+# branch, and so scripts/test-dev can run the whole decide→report composition
+# and assert that a refused forward advertises no endpoints (#2917).
+_k8s_jaeger_endpoints() {
+  local ui_port="$1" otlp_port="$2" pid="$3"
+  print "jaeger UI at http://localhost:${ui_port}, OTLP HTTP at http://localhost:${otlp_port} (port-forward pid ${pid})"
+  print "  to capture runner spans, set OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:${otlp_port} on this host (unset = no-op)"
+}
+
 # _k8s_dump_hook_diagnostics — on a helm failure, surface WHY. Helm blocks on a
 # hook resource until it is ready and reports only a --timeout on failure, hiding
 # an ImagePullBackOff on a hook pod. The minio bucket-bootstrap Job is a
@@ -2360,9 +2426,10 @@ cmd_post_merge() {
 # All three HOST ports are overridable via FISHHAWK_K8S_PF_PORT /
 # FISHHAWK_K8S_JAEGER_UI_PORT / FISHHAWK_K8S_JAEGER_OTLP_PORT (E69.6 / #2917),
 # settable in .env; each is validated and preflighted before use, and an empty
-# value means the default. The two legs' collision policies differ BY DESIGN:
-# the fishhawkd forward is fatal on a squatted port, the jaeger forward warns
-# and skips (see the inline note at that leg).
+# value means the default, and the two JAEGER ports must additionally differ from
+# each other. The two legs' collision policies differ BY DESIGN: the fishhawkd
+# forward is fatal on a squatted port, the jaeger forward warns and skips (the
+# policy and both of its refusal conditions live in _k8s_jaeger_decide).
 cmd_k8s_up() {
   print "k8s: starting"
 
@@ -2487,33 +2554,18 @@ cmd_k8s_up() {
       exit 1
     fi
 
-    # COLLISION POLICY DIVERGENCE (ratified by the operator, E69.6 / #2917):
-    # the fishhawkd leg above is FATAL on a squatted port, this one WARNS AND
-    # SKIPS with exit 0. The asymmetry is deliberate — this forward runs only
-    # AFTER fishhawkd is already healthy, so aborting here would tear down a
-    # working stack over an OPTIONAL tracing forward. The preflight is called in
-    # silent-detection mode (empty remediation) because an 'error:' prefix would
-    # misdescribe a non-fatal skip; the warning below composes the roster from
-    # PREFLIGHT_SQUATTER_DESC itself.
-    local jaeger_squatted=0
-    if ! _preflight_port_free "$ui_port"; then
-      print -u2 "warning: jaeger UI port ${ui_port} already has a listener: ${PREFLIGHT_SQUATTER_DESC}— set FISHHAWK_K8S_JAEGER_UI_PORT to a free port, or kill the pid; skipping the jaeger forward"
-      jaeger_squatted=1
-    fi
-    if ! _preflight_port_free "$otlp_port"; then
-      print -u2 "warning: jaeger OTLP port ${otlp_port} already has a listener: ${PREFLIGHT_SQUATTER_DESC}— set FISHHAWK_K8S_JAEGER_OTLP_PORT to a free port, or kill the pid; skipping the jaeger forward"
-      jaeger_squatted=1
-    fi
-
-    if (( jaeger_squatted )); then
-      print "fishhawkd is up and usable; tracing is unavailable this session"
-    else
+    # _k8s_jaeger_decide owns the whole refusal policy (equal-ports collision +
+    # the two squatter preflights) and its warn-and-skip divergence from the
+    # fishhawkd leg; see its comment. The endpoint lines are reachable ONLY from
+    # its success branch, so a refused forward can never be advertised as live.
+    if _k8s_jaeger_decide "$ui_port" "$otlp_port"; then
       kubectl port-forward "svc/fishhawk-jaeger" "$(_k8s_forward_arg "$ui_port" 16686)" "$(_k8s_forward_arg "$otlp_port" 4318)" >/dev/null 2>&1 &
       local jaeger_pf_pid=$!
       disown
       print "$jaeger_pf_pid" > "$K8S_JAEGER_PF_PID_FILE"
-      print "jaeger UI at http://localhost:${ui_port}, OTLP HTTP at http://localhost:${otlp_port} (port-forward pid ${jaeger_pf_pid})"
-      print "  to capture runner spans, set OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:${otlp_port} on this host (unset = no-op)"
+      _k8s_jaeger_endpoints "$ui_port" "$otlp_port" "$jaeger_pf_pid"
+    else
+      print "fishhawkd is up and usable; tracing is unavailable this session"
     fi
   fi
 }
