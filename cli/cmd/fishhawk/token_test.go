@@ -1286,3 +1286,430 @@ func TestCheckAPIStatus_NoDetails(t *testing.T) {
 		t.Errorf("error = %q, want %q", got, want)
 	}
 }
+
+// --- redirect policy (E66.47 / #2864) ------------------------------
+//
+// tokenHTTPClient carries a CheckRedirect that refuses any redirect
+// leaving the original request's origin. These tests drive that policy
+// end to end through run() and the REAL tokenHTTPClient — not a
+// hand-built client — because the control is a struct field on a
+// package-level var whose omission no compiler catches.
+//
+// Both origins in every test are REAL reachable in-test httptest
+// servers, so a refusal can never be confused with an unreachable-host
+// dial failure (counterfactual attainability).
+
+// recordedTokenRequest is one request the attacker origin observed.
+type recordedTokenRequest struct {
+	Method string
+	Path   string
+	Query  string
+	Body   string
+}
+
+// tokenRedirectRecorder plays the redirect TARGET ("attacker") origin:
+// it records every request it receives, body included, so a test can
+// assert a credential either did or did not reach it.
+type tokenRedirectRecorder struct {
+	srv *httptest.Server
+	mu  sync.Mutex
+	got []recordedTokenRequest
+}
+
+func newTokenRedirectRecorder(t *testing.T) *tokenRedirectRecorder {
+	t.Helper()
+	r := &tokenRedirectRecorder{}
+	r.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		raw, _ := io.ReadAll(io.LimitReader(req.Body, 1<<16))
+		r.mu.Lock()
+		r.got = append(r.got, recordedTokenRequest{
+			Method: req.Method,
+			Path:   req.URL.Path,
+			Query:  req.URL.RawQuery,
+			Body:   string(raw),
+		})
+		r.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]string{})
+	}))
+	t.Cleanup(r.srv.Close)
+	return r
+}
+
+func (r *tokenRedirectRecorder) observed() []recordedTokenRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]recordedTokenRequest, len(r.got))
+	copy(out, r.got)
+	return out
+}
+
+// sawSecret reports whether any observed request body carried s.
+func (r *tokenRedirectRecorder) sawSecret(s string) bool {
+	for _, req := range r.observed() {
+		if strings.Contains(req.Body, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// tokenRedirectBed is the origin under test: one server playing both
+// the forge and the Fishhawk backend, which answers redirectStatus at
+// redirectPath with a Location pointing at redirectTarget (defaulting
+// to the recorder origin).
+type tokenRedirectBed struct {
+	srv      *httptest.Server
+	recorder *tokenRedirectRecorder
+
+	provider       string
+	redirectPath   string
+	redirectStatus int
+	redirectMethod string // "" => any method
+	// redirectTarget is an absolute URL; "" means the recorder origin,
+	// "self" means this server's own origin at the same path, and
+	// "self:<path>" means this server's own origin at <path>.
+	redirectTarget string
+
+	hops atomic.Int32
+}
+
+// newTokenRedirectBed wires the two origins and points the CLI's
+// device-flow seam + credential store at them.
+func newTokenRedirectBed(t *testing.T, provider, redirectPath string, redirectStatus int) *tokenRedirectBed {
+	t.Helper()
+	b := &tokenRedirectBed{
+		recorder:       newTokenRedirectRecorder(t),
+		provider:       provider,
+		redirectPath:   redirectPath,
+		redirectStatus: redirectStatus,
+	}
+	mux := http.NewServeMux()
+	// GitHub device-flow legs.
+	mux.HandleFunc("/login/device/code", func(w http.ResponseWriter, r *http.Request) {
+		if b.maybeRedirect(w, r) {
+			return
+		}
+		writeJSON(w, http.StatusOK, deviceCodeResponse{
+			DeviceCode: "gh-devcode-secret", UserCode: "WXYZ-1234",
+			VerificationURI: "https://github.com/login/device", ExpiresIn: 900, Interval: 5,
+		})
+	})
+	mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, r *http.Request) {
+		if b.maybeRedirect(w, r) {
+			return
+		}
+		writeJSON(w, http.StatusOK, accessTokenResponse{AccessToken: "gho_useraccess"})
+	})
+	// Same-origin redirect target for the PERMITTED branch.
+	mux.HandleFunc("/login/oauth/access_token2", func(w http.ResponseWriter, r *http.Request) {
+		if b.maybeRedirect(w, r) {
+			return
+		}
+		writeJSON(w, http.StatusOK, accessTokenResponse{AccessToken: "gho_useraccess"})
+	})
+	// GitLab device-flow legs (form bodies; poll states on 400).
+	mux.HandleFunc("/oauth/authorize_device", func(w http.ResponseWriter, r *http.Request) {
+		if b.maybeRedirect(w, r) {
+			return
+		}
+		writeJSON(w, http.StatusOK, deviceCodeResponse{
+			DeviceCode: "gl-devcode-secret", UserCode: "GLAB-5678",
+			VerificationURI: "https://gitlab.example.com/oauth/device", ExpiresIn: 900, Interval: 5,
+		})
+	})
+	mux.HandleFunc("/oauth/token", func(w http.ResponseWriter, r *http.Request) {
+		if b.maybeRedirect(w, r) {
+			return
+		}
+		writeJSON(w, http.StatusOK, accessTokenResponse{AccessToken: "glpat_useraccess"})
+	})
+	// Backend discovery + mint.
+	mux.HandleFunc("/v0/tokens/login", func(w http.ResponseWriter, r *http.Request) {
+		if b.maybeRedirect(w, r) {
+			return
+		}
+		if r.Method == http.MethodGet {
+			entry := tokenLoginProviderEntry{Provider: b.provider, ClientID: "Iv1.testclient"}
+			if b.provider == providerGitLab {
+				entry.BaseURL = b.srv.URL
+			}
+			writeJSON(w, http.StatusOK, tokenLoginDiscovery{
+				Provider:  b.provider,
+				ClientID:  "Iv1.testclient",
+				Providers: []tokenLoginProviderEntry{entry},
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, tokenLoginResponse{
+			Token: "fhk_minted", Subject: "github:octocat",
+			Scopes: []string{"read:runs"}, AuthMethod: "oauth", Provider: b.provider,
+		})
+	})
+	b.srv = httptest.NewServer(mux)
+	t.Cleanup(b.srv.Close)
+
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FISHHAWK_OAUTH_CLIENT_ID", "")
+	t.Setenv("FISHHAWK_TOKEN", "")
+	prevBase, prevInterval := githubDeviceBaseURL, deviceFlowInterval
+	githubDeviceBaseURL = b.srv.URL
+	deviceFlowInterval = time.Microsecond
+	t.Cleanup(func() {
+		githubDeviceBaseURL = prevBase
+		deviceFlowInterval = prevInterval
+	})
+	return b
+}
+
+// maybeRedirect answers the configured redirect when the request hits
+// the configured path, counting hops so the cap can be asserted.
+func (b *tokenRedirectBed) maybeRedirect(w http.ResponseWriter, r *http.Request) bool {
+	if b.redirectStatus == 0 || r.URL.Path != b.redirectPath {
+		return false
+	}
+	if b.redirectMethod != "" && r.Method != b.redirectMethod {
+		return false
+	}
+	b.hops.Add(1)
+	target := b.redirectTarget
+	switch {
+	case target == "":
+		target = b.recorder.srv.URL + "/steal"
+	case target == "self":
+		target = b.srv.URL + r.URL.Path
+	case strings.HasPrefix(target, "self:"):
+		target = b.srv.URL + strings.TrimPrefix(target, "self:")
+	}
+	http.Redirect(w, r, target, b.redirectStatus)
+	return true
+}
+
+// login drives the real CLI entry point against the bed.
+func (b *tokenRedirectBed) login(t *testing.T) (int, string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--provider", b.provider, "--backend-url", b.srv.URL}, &stdout, &stderr)
+	return code, stderr.String()
+}
+
+// assertNamesBothOrigins checks the surfaced CLI error names the
+// original origin and the redirect target's origin.
+func assertNamesBothOrigins(t *testing.T, stderr, from, to string) {
+	t.Helper()
+	if !strings.Contains(stderr, from) {
+		t.Errorf("stderr does not name the original origin %q: %s", from, stderr)
+	}
+	if !strings.Contains(stderr, to) {
+		t.Errorf("stderr does not name the redirect target origin %q: %s", to, stderr)
+	}
+}
+
+// Mode 1: cross-origin 302 on the GitLab token poll. A 302 is re-issued
+// as a BODYLESS GET, so the evidence here is that the attacker origin
+// received A REQUEST at all — not that it received a credential body.
+// (The credential-body evidence is modes 2-4, which use 307.)
+func TestTokenHTTPClient_RefusesCrossOriginRedirect_GitLabPoll302(t *testing.T) {
+	b := newTokenRedirectBed(t, providerGitLab, "/oauth/token", http.StatusFound)
+
+	code, stderr := b.login(t)
+	if code == exitOK {
+		// Errorf, not Fatalf: the credential-observation assertions
+		// below carry the real evidence and must still run.
+		t.Errorf("login succeeded across a cross-origin redirect; stderr=%s", stderr)
+	}
+	assertNamesBothOrigins(t, stderr, b.srv.URL, b.recorder.srv.URL)
+	if got := b.recorder.observed(); len(got) != 0 {
+		t.Errorf("attacker origin received %d request(s), want 0: %+v", len(got), got)
+	}
+}
+
+// Mode 2: cross-origin 307 on the GitLab token poll. 307 preserves
+// method AND body, so this is the mode that would actually forward
+// device_code.
+func TestTokenHTTPClient_RefusesCrossOriginRedirect_GitLabPoll307(t *testing.T) {
+	b := newTokenRedirectBed(t, providerGitLab, "/oauth/token", http.StatusTemporaryRedirect)
+
+	code, stderr := b.login(t)
+	if code == exitOK {
+		// Errorf, not Fatalf: the credential-observation assertions
+		// below carry the real evidence and must still run.
+		t.Errorf("login succeeded across a cross-origin redirect; stderr=%s", stderr)
+	}
+	assertNamesBothOrigins(t, stderr, b.srv.URL, b.recorder.srv.URL)
+	if got := b.recorder.observed(); len(got) != 0 {
+		t.Errorf("attacker origin received %d request(s), want 0: %+v", len(got), got)
+	}
+	if b.recorder.sawSecret("gl-devcode-secret") {
+		t.Errorf("attacker origin observed the device_code: %+v", b.recorder.observed())
+	}
+}
+
+// Mode 3: cross-origin 307 on the GitHub device-flow poll (the
+// postForJSON leg, driven through githubDeviceBaseURL).
+func TestTokenHTTPClient_RefusesCrossOriginRedirect_GitHubPoll307(t *testing.T) {
+	b := newTokenRedirectBed(t, providerGitHub, "/login/oauth/access_token", http.StatusTemporaryRedirect)
+
+	code, stderr := b.login(t)
+	if code == exitOK {
+		// Errorf, not Fatalf: the credential-observation assertions
+		// below carry the real evidence and must still run.
+		t.Errorf("login succeeded across a cross-origin redirect; stderr=%s", stderr)
+	}
+	assertNamesBothOrigins(t, stderr, b.srv.URL, b.recorder.srv.URL)
+	if got := b.recorder.observed(); len(got) != 0 {
+		t.Errorf("attacker origin received %d request(s), want 0: %+v", len(got), got)
+	}
+	if b.recorder.sawSecret("gh-devcode-secret") {
+		t.Errorf("attacker origin observed the device_code: %+v", b.recorder.observed())
+	}
+}
+
+// Mode 4: cross-origin 307 on the mint POST to /v0/tokens/login, whose
+// body carries the forge ACCESS TOKEN.
+func TestTokenHTTPClient_RefusesCrossOriginRedirect_MintPost307(t *testing.T) {
+	b := newTokenRedirectBed(t, providerGitHub, "/v0/tokens/login", http.StatusTemporaryRedirect)
+	// Discovery (GET) on the same path must succeed so the flow reaches
+	// the mint POST; only the POST redirects.
+	b.redirectMethod = http.MethodPost
+
+	code, stderr := b.login(t)
+	if code == exitOK {
+		// Errorf, not Fatalf: the credential-observation assertions
+		// below carry the real evidence and must still run.
+		t.Errorf("login succeeded across a cross-origin redirect; stderr=%s", stderr)
+	}
+	assertNamesBothOrigins(t, stderr, b.srv.URL, b.recorder.srv.URL)
+	if got := b.recorder.observed(); len(got) != 0 {
+		t.Errorf("attacker origin received %d request(s), want 0: %+v", len(got), got)
+	}
+	if b.recorder.sawSecret("gho_useraccess") {
+		t.Errorf("attacker origin observed the forge access token: %+v", b.recorder.observed())
+	}
+}
+
+// Mode 5 (scheme downgrade) is TestTokenRefuseCrossOriginRedirect_SchemeDowngrade below.
+
+// Mode 6: the cap. A same-origin server that redirects to itself
+// forever must be stopped by tokenMaxRedirects, which the stdlib no
+// longer supplies once CheckRedirect is set.
+func TestTokenHTTPClient_RedirectCapExhausted(t *testing.T) {
+	b := newTokenRedirectBed(t, providerGitLab, "/oauth/token", http.StatusTemporaryRedirect)
+	b.redirectTarget = "self"
+
+	code, stderr := b.login(t)
+	if code == exitOK {
+		t.Fatalf("login succeeded through an unbounded redirect loop; stderr=%s", stderr)
+	}
+	if !strings.Contains(stderr, "exceeded 10 redirects") {
+		t.Errorf("stderr does not name the redirect cap: %s", stderr)
+	}
+	if hops := b.hops.Load(); hops > int32(tokenMaxRedirects)+1 {
+		t.Errorf("server served %d hops, want <= %d", hops, tokenMaxRedirects+1)
+	}
+	if got := b.recorder.observed(); len(got) != 0 {
+		t.Errorf("attacker origin received %d request(s), want 0: %+v", len(got), got)
+	}
+}
+
+// Mode 7 (the PERMITTED branch): a SAME-ORIGIN 307 is followed, so the
+// login succeeds and stores a credential. This is what would go red if
+// the policy reached for credstore.RefuseRedirect's refuse-everything
+// semantics instead of the server-side same-origin shape.
+func TestTokenHTTPClient_FollowsSameOriginRedirect(t *testing.T) {
+	b := newTokenRedirectBed(t, providerGitHub, "/login/oauth/access_token", http.StatusTemporaryRedirect)
+	b.redirectTarget = "self:/login/oauth/access_token2"
+
+	code, stderr := b.login(t)
+	if code != exitOK {
+		t.Fatalf("same-origin redirect was not followed: exit=%d stderr=%s", code, stderr)
+	}
+	if b.hops.Load() == 0 {
+		t.Fatalf("the redirect leg was never exercised")
+	}
+	cred, err := credstore.Load(b.srv.URL)
+	if err != nil {
+		t.Fatalf("no credential stored after a same-origin redirect: %v", err)
+	}
+	if cred.Token != "fhk_minted" {
+		t.Errorf("stored token = %q, want fhk_minted", cred.Token)
+	}
+}
+
+// Mode 5: the SCHEME DOWNGRADE (https -> http on the SAME host).
+//
+// CARVE-OUT (operator binding condition 1): unlike every other mode,
+// this one is NOT driven end to end through run() and the real
+// tokenHTTPClient against a TLS httptest server. It calls
+// tokenRefuseCrossOriginRedirect directly with synthetic *http.Request
+// values — an https origin in via[0], an http target — because the end
+// to end shape would need a TLS server whose certificate the CLI's
+// client trusts, which the shared package-level tokenHTTPClient has no
+// seam for. The policy function IS the control, so testing it directly
+// still exercises the branch that refuses the downgrade.
+func TestTokenRefuseCrossOriginRedirect_SchemeDowngrade(t *testing.T) {
+	via := []*http.Request{{URL: mustParseTokenURL(t, "https://forge.example.com/oauth/token")}}
+	req := &http.Request{URL: mustParseTokenURL(t, "http://forge.example.com/oauth/token")}
+
+	err := tokenRefuseCrossOriginRedirect(req, via)
+	if err == nil {
+		t.Fatal("scheme downgrade https -> http was permitted, want refusal")
+	}
+	assertNamesBothOrigins(t, err.Error(), "https://forge.example.com", "http://forge.example.com")
+}
+
+// The refusal error must NOT carry the redirect target's query: net/http
+// wraps a CheckRedirect error in a *url.Error whose message embeds the
+// full target URL, and that URL is attacker-chosen (operator binding
+// condition 3). The helpers unwrap it and surface origins only.
+func TestTokenHTTPClient_RefusalOmitsRedirectTargetQuery(t *testing.T) {
+	const marker = "leak-marker-9f3a"
+	b := newTokenRedirectBed(t, providerGitLab, "/oauth/token", http.StatusTemporaryRedirect)
+	b.redirectTarget = b.recorder.srv.URL + "/steal?exfil=" + marker
+
+	code, stderr := b.login(t)
+	if code == exitOK {
+		// Errorf, not Fatalf: the credential-observation assertions
+		// below carry the real evidence and must still run.
+		t.Errorf("login succeeded across a cross-origin redirect; stderr=%s", stderr)
+	}
+	if strings.Contains(stderr, marker) || strings.Contains(stderr, "exfil") {
+		t.Errorf("surfaced error carries the redirect target's query: %s", stderr)
+	}
+	assertNamesBothOrigins(t, stderr, b.srv.URL, b.recorder.srv.URL)
+}
+
+// Mode 8: the pure origin-rendering table.
+func TestTokenRequestOrigin(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"https://gitlab.example.com/oauth/token", "https://gitlab.example.com"},
+		{"HTTPS://GitLab.Example.COM/oauth/token", "https://gitlab.example.com"},
+		{"https://gitlab.example.com:443/oauth/token", "https://gitlab.example.com"},
+		{"http://gitlab.example.com:80/oauth/token", "http://gitlab.example.com"},
+		{"https://gitlab.example.com:8443/oauth/token", "https://gitlab.example.com:8443"},
+		{"http://gitlab.example.com:443/oauth/token", "http://gitlab.example.com:443"},
+		{"https://gitlab.example.com:80/oauth/token", "https://gitlab.example.com:80"},
+		{"https://gitlab.example.com/other/path?q=1", "https://gitlab.example.com"},
+	}
+	for _, tc := range cases {
+		if got := tokenRequestOrigin(mustParseTokenURL(t, tc.raw)); got != tc.want {
+			t.Errorf("tokenRequestOrigin(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+	// https and http on the same host are DISTINCT origins.
+	if tokenRequestOrigin(mustParseTokenURL(t, "https://h.example.com")) ==
+		tokenRequestOrigin(mustParseTokenURL(t, "http://h.example.com")) {
+		t.Error("https and http on one host rendered as the same origin")
+	}
+}
+
+func mustParseTokenURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse %q: %v", raw, err)
+	}
+	return u
+}
