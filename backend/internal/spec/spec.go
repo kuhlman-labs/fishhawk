@@ -902,6 +902,35 @@ const (
 	ArtifactGroomingReport ArtifactKind = "grooming_report"
 )
 
+// WorkflowRequiresCharter is the STRUCTURAL discriminator for a backlog-
+// grooming workflow: true when any stage declares the grooming_report
+// artifact in its produces list (ADR-065 / E54.4 / #2236). Not the workflow's
+// NAME (`backlog_grooming`), which a rename evades, and not a `kind:` field,
+// which the epic's AC1 forbids — a grooming workflow is built on the standard
+// stage types and is recognised by what it PRODUCES.
+//
+// It is PURE (no receiver, no I/O) and lives in this package rather than in
+// server (which wraps it, keeping its exported surface) because it is
+// evaluated at EVERY seam that mints a run: the charter admission gate in
+// server, and the requires_charter stamp on the run row (E54.13 / #2806) at
+// CreateRunForTrigger AND the GitHub / GitLab webhook dispatchers — and
+// server imports webhook, so the dispatchers cannot import server. One
+// predicate, evaluated where the spec is known-parseable, is what the
+// prompt-serve path later reads back as a persisted fact instead of
+// re-deriving from a cached spec that may since have been corrupted. The CLI
+// reruns an independent structural twin over its raw YAML tree (separate Go
+// module); TestCharterMessageParityAcrossModules holds the two together.
+func WorkflowRequiresCharter(wf Workflow) bool {
+	for _, st := range wf.Stages {
+		for _, p := range st.Produces {
+			if p.Artifact == ArtifactGroomingReport {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // GroomingReportSchemaVersion is the `schema:` token a grooming_report-producing
 // stage must declare, mirroring the plan artifact's standard_v1 rule
 // (MVP_SPEC §4.3: artifacts are schema-versioned for forward compatibility).

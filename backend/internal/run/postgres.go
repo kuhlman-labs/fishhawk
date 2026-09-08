@@ -137,6 +137,11 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		SliceIndex:             intPtrToInt32Ptr(p.SliceIndex),
 		UpstreamRunID:          p.UpstreamRunID,
 		WorkingDir:             p.WorkingDir,
+		// Passed VERBATIM — deliberately NOT the max_retries / runner_kind
+		// zero-value promotion above. nil must persist as SQL NULL ("no
+		// persisted determination"); promoting it to false would assert
+		// non-grooming for a row nothing decided (migration 0082, #2806).
+		RequiresCharter: p.RequiresCharter,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -935,6 +940,7 @@ func rowToRun(r rundb.Run) *Run {
 		TriggerRef:         r.TriggerRef,
 		InstallationID:     r.InstallationID,
 		InstallationRef:    r.InstallationRef,
+		RequiresCharter:    r.RequiresCharter,
 		IdempotencyKey:     r.IdempotencyKey,
 		ParentRunID:        r.ParentRunID,
 		PullRequestURL:     r.PullRequestUrl,
@@ -1005,6 +1011,14 @@ func rowToRun(r rundb.Run) *Run {
 	// verbatim — this mapper deliberately does NOT normalize a
 	// pointer-to-empty-string to nil, because the two states mean different
 	// things to the credential-resolution and forge-derivation consumers.
+	//
+	// RequiresCharter (migration 0082, #2806) rides the same shared mapper
+	// and is assigned in the struct literal above: every Run-returning sqlc
+	// query carries requires_charter in its RETURNING/SELECT list and scans
+	// it, so the persisted determination is populated on every read path.
+	// The tri-state is preserved verbatim — SQL NULL scans back as nil and is
+	// never coerced to false, which is what keeps a "no persisted
+	// determination" row distinguishable from a persisted non-grooming one.
 	return out
 }
 

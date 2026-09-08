@@ -1035,9 +1035,14 @@ func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		// that drops the field makes the assertion pass vacuously.
 		IssueContext: p.IssueContext,
 		WorkingDir:   p.WorkingDir,
-		State:        run.StatePending,
-		CreatedAt:    time.Now().UTC(),
-		UpdatedAt:    time.Now().UTC(),
+		// Carry the persisted grooming determination (E54.13 / #2806)
+		// verbatim — nil stays nil — so the stamp assertions read the
+		// STORED row rather than passing vacuously against a fake that
+		// dropped the field.
+		RequiresCharter: p.RequiresCharter,
+		State:           run.StatePending,
+		CreatedAt:       time.Now().UTC(),
+		UpdatedAt:       time.Now().UTC(),
 	}
 	s.created = append(s.created, r)
 	return r, nil
@@ -4743,4 +4748,68 @@ func TestWriteReviewerMisconfiguredAudit_StampsInstallationAccount(t *testing.T)
 // tenant account, matching its pre-promotion effective behavior.
 func (*stubRuns) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", nil
+}
+
+// groomingV2Spec is a workflow-v2 document whose `feature_change` (the
+// dispatcher's DefaultWorkflowID) PRODUCES a grooming_report. The key is
+// deliberately the ordinary one: the determination is decided by the produced
+// artifact, never by the workflow's name.
+const groomingV2Spec = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: groom
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: grooming_report
+            schema: grooming_report_v1
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+`
+
+// TestDispatcher_PersistsGroomingDetermination pins the requires_charter STAMP
+// on the GitHub webhook root mint seam (E54.13 / #2806): the run row the
+// dispatcher mints carries a NON-NIL determination equal to the spec's
+// grooming-ness. Both directions are asserted (grooming → true, ordinary →
+// false) so a stamp hard-wired to either value fails; nil is a distinct
+// failure ("no persisted determination"), never conflated with false.
+//
+// COMMITTED STATE: the assertion reads the run the fake STORED (runs.created),
+// not a returned value — a stamp that fired and was dropped would hand back a
+// byte-identical success.
+//
+// COUNTERFACTUAL: delete the `RequiresCharter: &requiresCharter` field in
+// dispatcher.go's CreateRun call and both cells go RED on the nil check.
+func TestDispatcher_PersistsGroomingDetermination(t *testing.T) {
+	cases := []struct {
+		name string
+		spec string
+		want bool
+	}{
+		{name: "grooming workflow stamps true", spec: groomingV2Spec, want: true},
+		{name: "ordinary workflow stamps false", spec: validSpec, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, gh, runs, _ := newDispatcherWithStubs(t)
+			gh.specContent = []byte(tc.spec)
+			if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(runs.created) != 1 {
+				t.Fatalf("runs.created = %d, want 1", len(runs.created))
+			}
+			got := runs.created[0].RequiresCharter
+			if got == nil {
+				t.Fatalf("stored requires_charter = nil, want %v — the dispatcher must stamp a determination, never leave NULL", tc.want)
+			}
+			if *got != tc.want {
+				t.Errorf("stored requires_charter = %v, want %v", *got, tc.want)
+			}
+		})
+	}
 }

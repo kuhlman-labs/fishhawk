@@ -309,7 +309,7 @@ func TestAnswerClarification_CrossLayer_ParkAnswerResumePrompt(t *testing.T) {
 	rr := newPromptRunRepo()
 	au := newAuditFake()
 	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingInput}
-	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI, RequiresCharter: chFalse()}
 	seedClarificationRequested(au, runID, stageID)
 
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, SigningRepo: sf})

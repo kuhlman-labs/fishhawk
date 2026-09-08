@@ -411,6 +411,7 @@ func TestShipPlan_SchemaRetry_SeamToPromptRender(t *testing.T) {
 	s, rr, _, sf, au := newPlanSequenceServer(t)
 	s.promptIssueGetterOverride = &stubIssueGetter{}
 	runRow := rr.seedRun()
+	runRow.RequiresCharter = chFalse() // the persisted non-grooming determination a row minted after migration 0082 carries
 	planStage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
 	planStage.RequiresApproval = true
 	priv, _ := sf.issue(t, runRow.ID)
@@ -1067,6 +1068,7 @@ func TestShipPlan_ScopeRetry_SeamToPromptRender(t *testing.T) {
 	s, rr, art, sf, au := newPlanSequenceServer(t)
 	s.promptIssueGetterOverride = &stubIssueGetter{}
 	runRow := rr.seedRun()
+	runRow.RequiresCharter = chFalse() // the persisted non-grooming determination a row minted after migration 0082 carries
 	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
 	planStage.RequiresApproval = true
 	priv, _ := sf.issue(t, runRow.ID)

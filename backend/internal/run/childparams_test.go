@@ -29,6 +29,7 @@ func childParamsParentFixture(t *testing.T) *Run {
 	upstream := uuid.New()
 	decomposedFrom := uuid.New()
 	sliceIdx := 3
+	requiresCharter := true
 	return &Run{
 		ID:              uuid.New(),
 		Repo:            "kuhlman-labs/fishhawk",
@@ -59,6 +60,10 @@ func childParamsParentFixture(t *testing.T) *Run {
 		Drive:          true,
 		SliceIndex:     &sliceIdx,
 		WorkingDir:     "/tmp/fishhawk-parent-checkout",
+		// pointer-to-true, not pointer-to-false: a false pointer is
+		// non-zero to reflect but would let a helper that MANUFACTURED
+		// &false pass the inherited-equality check for the wrong reason.
+		RequiresCharter: &requiresCharter,
 	}
 }
 
@@ -225,5 +230,49 @@ func TestChildParamsFrom_InheritsInstallationRef(t *testing.T) {
 	noRef := ChildParamsFrom(&Run{ID: uuid.New(), Repo: "x/y"})
 	if noRef.InstallationRef != nil {
 		t.Errorf("child InstallationRef = %q, want nil when the parent has none", *noRef.InstallationRef)
+	}
+}
+
+// TestChildParamsFrom_InheritsRequiresCharter is the named failure mode behind
+// the RequiresCharter row in the inheritance table (migration 0082, E54.13 /
+// #2806): a child executes the same workflow definition as its parent, so it
+// must carry the parent's persisted grooming determination — the SAME pointer
+// value, in all three states. A child that dropped a TRUE would be minted with
+// no persisted determination and force the prompt-serve consumer back onto
+// the spec-derived legacy branch it exists to retire; a child that manufactured
+// a FALSE from nil would assert non-grooming for a row nothing decided.
+//
+// The reflection pin in TestChildParamsFrom_TableModesMatchBehavior already
+// checks the MODE agrees with the helper on the non-nil fixture; this test
+// names the consequence and covers the false and nil states the fixture
+// (which is always pointer-to-true) cannot.
+func TestChildParamsFrom_InheritsRequiresCharter(t *testing.T) {
+	yes, no := true, false
+	cases := []struct {
+		name   string
+		parent *bool
+	}{
+		{"persisted grooming (true) is inherited as true", &yes},
+		{"persisted non-grooming (false) is inherited as false, not nil", &no},
+		{"no persisted determination (nil) is inherited as nil, not manufactured into false", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := &Run{
+				ID:              uuid.New(),
+				Repo:            "kuhlman-labs/fishhawk",
+				WorkflowID:      "backlog_grooming",
+				RequiresCharter: tc.parent,
+			}
+			child := ChildParamsFrom(parent)
+			switch {
+			case tc.parent == nil && child.RequiresCharter != nil:
+				t.Fatalf("child RequiresCharter = %v, want nil when the parent has no persisted determination", *child.RequiresCharter)
+			case tc.parent != nil && child.RequiresCharter == nil:
+				t.Fatalf("child dropped the parent's RequiresCharter (%v); the child would fall back to the spec-derived legacy branch", *tc.parent)
+			case tc.parent != nil && *child.RequiresCharter != *tc.parent:
+				t.Errorf("child RequiresCharter = %v, want %v", *child.RequiresCharter, *tc.parent)
+			}
+		})
 	}
 }

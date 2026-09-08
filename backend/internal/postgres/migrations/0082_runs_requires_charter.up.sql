@@ -1,0 +1,27 @@
+-- 0082: persist the grooming determination on the run row (E54.13 / #2806).
+--
+-- runs.requires_charter records, at run creation, whether the workflow this
+-- run was minted from produces a grooming_report — the same pure structural
+-- predicate the #2236 charter admission gate evaluates at that exact moment,
+-- when the workflow spec is known-parseable. Recording it lets the prompt-serve
+-- path READ a fact instead of re-deriving it from a cached workflow_spec that
+-- may since have been corrupted (the two #2805 residuals).
+--
+-- TRI-STATE, deliberately distinguishable — do NOT collapse them:
+--   TRUE   the workflow produces a grooming_report (charter required)
+--   FALSE  it does not
+--   NULL   NO persisted determination. Covers a row minted before this
+--          migration AND a child minted from such a parent via
+--          run.ChildParamsFrom (children inherit the parent's value verbatim,
+--          including NULL, because a child's spec IS the parent's spec).
+--          The population is bounded and non-growing except by descent from
+--          legacy parents; a consumer derives the determination for it from
+--          the cached spec, failing closed when that spec is undecidable.
+--
+-- NULLABLE and with NO column default ON PURPOSE. A `DEFAULT false` would
+-- assert non-grooming for every legacy grooming row and fall the prompt-serve
+-- control open for exactly the rows it cannot decide.
+--
+-- NO BACKFILL. The determination is a property of the PARSED spec; computing
+-- it in SQL would reintroduce the byte scan this change exists to delete.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS requires_charter BOOLEAN;

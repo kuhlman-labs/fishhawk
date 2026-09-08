@@ -697,3 +697,39 @@ func TestHandle_GitLabTrigger_TransitionFails_StillAudits(t *testing.T) {
 		t.Errorf("audit rows = %+v, want one run_dispatched", au.appended)
 	}
 }
+
+// TestGitLabDispatch_PersistsGroomingDetermination is the GitLab twin of
+// TestDispatcher_PersistsGroomingDetermination (E54.13 / #2806): the root mint
+// seam in handleGitLabCreateRun stamps a NON-NIL requires_charter equal to the
+// spec's grooming-ness, asserted in both directions on the STORED row.
+//
+// COUNTERFACTUAL: delete the `RequiresCharter: &requiresCharter` field in
+// gitlab_dispatch.go's CreateRun call and both cells go RED on the nil check.
+func TestGitLabDispatch_PersistsGroomingDetermination(t *testing.T) {
+	cases := []struct {
+		name string
+		spec string
+		want bool
+	}{
+		{name: "grooming workflow stamps true", spec: groomingV2Spec, want: true},
+		{name: "ordinary workflow stamps false", spec: validSpec, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _, _, runs, _ := newGitLabDispatcher(t, tc.spec)
+			if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(runs.created) != 1 {
+				t.Fatalf("runs.created = %d, want 1", len(runs.created))
+			}
+			got := runs.created[0].RequiresCharter
+			if got == nil {
+				t.Fatalf("stored requires_charter = nil, want %v — the GitLab dispatcher must stamp a determination, never leave NULL", tc.want)
+			}
+			if *got != tc.want {
+				t.Errorf("stored requires_charter = %v, want %v", *got, tc.want)
+			}
+		})
+	}
+}

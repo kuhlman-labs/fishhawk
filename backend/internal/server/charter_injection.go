@@ -1,13 +1,10 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
@@ -118,11 +115,14 @@ const (
 	// forge call failed, or it returned an empty default branch. All three are
 	// refusals — an empty ref is a mutable read.
 	reasonCharterBaseRefUnresolved = "charter_base_ref_unresolved"
-	// reasonGroomingSpecUnreadable: the run's cached workflow spec cannot be
-	// re-parsed (or names no known workflow) AND the grooming_report artifact
-	// is attributable to this run's workflow, so whether this is a grooming
-	// propose stage is undecidable. See specCouldBeGrooming for why this is
-	// narrowed to grooming-attributable specs only.
+	// reasonGroomingSpecUnreadable: the run carries NO persisted grooming
+	// determination (runs.requires_charter is NULL — a row minted before the
+	// determination was recorded at creation, or a child inheriting nil from
+	// such a parent) AND its cached workflow spec is undecidable: empty,
+	// unparseable, or naming no such workflow. Whether this is a grooming
+	// propose stage cannot be decided, so the prompt is refused. A row
+	// carrying a persisted determination never reaches this reason: the fact
+	// decides and the spec bytes are not read. See stageRequiresCharter.
 	reasonGroomingSpecUnreadable = "grooming_workflow_spec_unreadable"
 )
 
@@ -179,210 +179,52 @@ func charterFraming() repodoc.Framing {
 	}
 }
 
-// specCouldBeGrooming reports whether a cached workflow spec that
-// spec.ParseBytes REJECTED could still be THIS run's grooming spec.
-//
-// THIS IS THE H4 NARROWING, and it is a NARROWING of a refusal, never a
-// widening. stageRequiresCharter has to decide "is this a grooming propose
-// stage" before it can enforce the fail-closed rule, and an unparseable spec
-// makes that undecidable. Refusing every undecidable spec would change
-// prompt-serve behaviour for EVERY run — the neighbouring readers
-// (resolveImplementConstraints, resolveImplementRequiredOutcomes) fail OPEN on
-// the same input, and flipping a repo-wide failure mode is not this feature's
-// to make.
-//
-// The first cut of this check was a raw bytes.Contains over the whole
-// document, which refused a corrupt NON-grooming spec whose bytes carried the
-// token incidentally — in a comment, in an unrelated scalar, or in a DIFFERENT
-// workflow. That is precisely the non-grooming behaviour change H4 forbids, so
-// the evidence is now ATTRIBUTED wherever attribution is possible:
-//
-//   - The document DECODES as YAML (the dominant corruption class: a spec that
-//     is well-formed YAML but fails schema validation). A decoded document has
-//     exactly ONE parse, so "under any parse" ambiguity is gone and the
-//     evidence test is exact: some scalar (or key) EQUAL to the artifact kind,
-//     searched inside THIS run's workflow subtree only. A comment is not a node
-//     and cannot match; an unrelated scalar ("ranked in the grooming_report")
-//     is not equal and does not match; another workflow's grooming_report is
-//     outside the subtree. Each of those now falls open, byte-identically.
-//     Workflow ABSENT from the document is still undecidable, so the search
-//     widens to the whole document — as does a document using workflow-v2's
-//     same-document reuse (`defaults` / `extends`), where a produces block can
-//     be inherited from outside the subtree and attribution is not sound.
-//
-//   - The document does NOT decode (YAML syntax corruption). There is no
-//     structure to attribute against, so the fallback is the byte scan, minus
-//     FULL-LINE comments: a line whose first non-blank byte is `#` is a comment
-//     under any parse of that line and cannot become an artifact declaration.
-//
-// The residuals are stated rather than hidden. (a) In the non-decoding branch a
-// token in an inline comment or an unrelated scalar still refuses a corrupt
-// NON-grooming spec. (b) A corruption that also destroys the token — a
-// truncation before the produces block, say — falls open on what may have been
-// a grooming run. Closing (b) in general would mean refusing every plan prompt
-// whose cached spec is corrupt, which is exactly the repo-wide flip H4 rules
-// out; the cached bytes were validated at run-create, so a parse failure is
-// storage corruption rather than a normal or adversarial state.
-func specCouldBeGrooming(specBytes []byte, workflowID string) bool {
-	var raw any
-	dec := yaml.NewDecoder(bytes.NewReader(specBytes))
-	dec.KnownFields(false)
-	if err := dec.Decode(&raw); err != nil {
-		return groomingTokenInDataLines(specBytes)
-	}
-	wf, found := yamlWorkflowNode(raw, workflowID)
-	if !found {
-		// Which workflow this run refers to is not in the document at all:
-		// nothing to attribute to, so any grooming evidence anywhere counts.
-		return yamlDeclaresGroomingArtifact(raw)
-	}
-	if yamlDeclaresGroomingArtifact(wf) {
-		return true
-	}
-	if yamlUsesSameDocumentReuse(raw) {
-		// A `defaults` / `extends` document can hand this workflow a produces
-		// block from outside its own subtree, so the subtree is not the whole
-		// story and attribution is not sound. Widen rather than fall open.
-		return yamlDeclaresGroomingArtifact(raw)
-	}
-	return false
-}
-
-// yamlWorkflowNode returns the decoded node for workflows[workflowID].
-func yamlWorkflowNode(raw any, workflowID string) (any, bool) {
-	workflows, ok := yamlMapValue(raw, "workflows")
-	if !ok {
-		return nil, false
-	}
-	return yamlMapValue(workflows, workflowID)
-}
-
-// yamlMapValue reads one key out of a decoded YAML mapping. yaml.v3 decodes a
-// mapping into map[string]any when every key is a string and into
-// map[any]any otherwise, so both shapes are read.
-func yamlMapValue(node any, key string) (any, bool) {
-	switch m := node.(type) {
-	case map[string]any:
-		v, ok := m[key]
-		return v, ok
-	case map[any]any:
-		v, ok := m[key]
-		return v, ok
-	}
-	return nil, false
-}
-
-// yamlDeclaresGroomingArtifact reports whether any scalar or key inside the
-// decoded node EQUALS the grooming_report artifact kind. Equality, not
-// containment: in a decoded document the values are decided, and the only way
-// grooming_report becomes an artifact declaration is as a scalar equal to it.
-func yamlDeclaresGroomingArtifact(node any) bool {
-	return yamlAnyString(node, func(s string) bool {
-		return strings.TrimSpace(s) == string(spec.ArtifactGroomingReport)
-	})
-}
-
-// yamlUsesSameDocumentReuse reports whether the document carries workflow-v2's
-// same-document reuse primitives (E52.4 / #2216), whose resolution can move a
-// produces block into a workflow from outside its own subtree.
-func yamlUsesSameDocumentReuse(node any) bool {
-	return yamlAnyKey(node, func(k string) bool {
-		k = strings.TrimSpace(k)
-		return k == "defaults" || k == "extends"
-	})
-}
-
-// yamlAnyString walks a decoded YAML value, reporting whether pred holds for
-// any scalar string or mapping key in it.
-func yamlAnyString(node any, pred func(string) bool) bool {
-	switch t := node.(type) {
-	case string:
-		return pred(t)
-	case map[string]any:
-		for k, v := range t {
-			if pred(k) || yamlAnyString(v, pred) {
-				return true
-			}
-		}
-	case map[any]any:
-		for k, v := range t {
-			if ks, ok := k.(string); ok && pred(ks) {
-				return true
-			}
-			if yamlAnyString(v, pred) {
-				return true
-			}
-		}
-	case []any:
-		for _, item := range t {
-			if yamlAnyString(item, pred) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// yamlAnyKey walks a decoded YAML value, reporting whether pred holds for any
-// MAPPING KEY in it (a scalar equal to the key name is not a key).
-func yamlAnyKey(node any, pred func(string) bool) bool {
-	switch t := node.(type) {
-	case map[string]any:
-		for k, v := range t {
-			if pred(k) || yamlAnyKey(v, pred) {
-				return true
-			}
-		}
-	case map[any]any:
-		for k, v := range t {
-			if ks, ok := k.(string); ok && pred(ks) {
-				return true
-			}
-			if yamlAnyKey(v, pred) {
-				return true
-			}
-		}
-	case []any:
-		for _, item := range t {
-			if yamlAnyKey(item, pred) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// groomingTokenInDataLines is the no-structure fallback: the artifact token on
-// a line that is not a FULL-LINE comment. Used only when the document does not
-// decode as YAML at all.
-func groomingTokenInDataLines(specBytes []byte) bool {
-	for _, line := range bytes.Split(specBytes, []byte("\n")) {
-		if bytes.HasPrefix(bytes.TrimLeft(line, " \t"), []byte("#")) {
-			continue
-		}
-		if bytes.Contains(line, []byte(spec.ArtifactGroomingReport)) {
-			return true
-		}
-	}
-	return false
-}
-
 // stageRequiresCharter reports whether this stage is a BACKLOG-GROOMING
 // PROPOSE stage, the one stage kind that must never serve a prompt without its
 // charter.
 //
-// The discriminator is STRUCTURAL and reuses the shipped predicate:
-// a `plan`-typed run stage (ADR-067 §2's PROPOSE stage — and the only stage
-// type on which spec validation permits the artifact) whose resolved workflow
-// satisfies WorkflowRequiresCharter, i.e. declares the grooming_report
-// artifact. Deliberately NOT the workflow's NAME (renaming would evade it) and
-// deliberately NOT a `kind:` field (AC1 forbids a workflow-type
+// # The determination is a PERSISTED RUN-LEVEL FACT (E54.13 / #2806)
+//
+// Whether a run is a grooming run is decided ONCE, at run creation, by the
+// pure structural predicate the #2236 charter admission gate evaluates at
+// that exact moment — WorkflowRequiresCharter over the workflow the run was
+// minted from, when the spec was known-parseable — and stored on the run row
+// as runs.requires_charter (migration 0082). Every root mint seam stamps it
+// and run.ChildParamsFrom inherits it, so this function READS a fact rather
+// than re-deriving it from a cached WorkflowSpec that may since have been
+// corrupted in storage. Deliberately NOT the workflow's NAME (renaming would
+// evade it) and deliberately NOT a `kind:` field (AC1 forbids a workflow-type
 // discriminator).
 //
-// A nil WorkflowSpec is the LEGACY-ROW case and returns (false, nil): a
-// grooming run always carries the spec it was minted from. An unparseable spec
-// or an absent workflow returns an error ONLY when the spec could be THIS
-// run's grooming spec — see specCouldBeGrooming for the H4 narrowing.
+// Reading the fact is what makes the corrupt-spec corner disappear for every
+// row carrying a determination: a corrupt NON-grooming spec whose bytes carry
+// the grooming_report token incidentally is served byte-identically (the
+// persisted false decides, and the spec bytes are never read), and a corrupt
+// GROOMING spec whose token was destroyed is still refused without its charter
+// (the persisted true decides). The earlier attributed byte-scanning fallback
+// existed only to answer a question that is no longer asked, and is gone.
+//
+// # The legacy branch: NULL means NO PERSISTED DETERMINATION
+//
+// A nil RequiresCharter covers a row minted before migration 0082 AND a child
+// minted via run.ChildParamsFrom from such a parent (children inherit the
+// value verbatim, including nil, because a child's spec IS the parent's
+// spec). That population is bounded and non-growing except by descent from
+// legacy parents. For it the determination is derived from the cached spec
+// exactly as the parsed path always has: a spec that parses and names this
+// run's workflow decides via WorkflowRequiresCharter. An UNDECIDABLE cached
+// spec — EMPTY, unparseable, or naming no such workflow — is REFUSED with
+// reasonGroomingSpecUnreadable rather than falling open: refusal is the
+// recoverable direction (repair the row, or start a new run whose
+// determination is recorded at creation), and the class is reachable only by
+// storage corruption of a row that carries no persisted fact. The empty-spec
+// case is refused on purpose (approval condition 1): with no persisted fact
+// and no bytes there is nothing to decide from, and a legacy grooming row
+// whose spec was wiped must not be served an unanchored prompt.
+//
+// The stage-type early return precedes everything, including the persisted
+// fact: grooming_report is valid only on a plan-typed (PROPOSE) stage, so no
+// other stage type can be a grooming propose stage whatever the row says.
 func stageRequiresCharter(runRow *run.Run, stage *run.Stage) (bool, error) {
 	if runRow == nil || stage == nil {
 		return false, nil
@@ -394,35 +236,35 @@ func stageRequiresCharter(runRow *run.Run, stage *run.Stage) (bool, error) {
 	if stage.Type != run.StageTypePlan {
 		return false, nil
 	}
+	// The persisted fact DECIDES. The cached spec is not read at all.
+	if runRow.RequiresCharter != nil {
+		return *runRow.RequiresCharter, nil
+	}
+	// Legacy row: no persisted determination. Derive from the cached spec,
+	// and refuse when it is undecidable.
 	if len(runRow.WorkflowSpec) == 0 {
-		return false, nil
+		return false, charterRefusal(reasonGroomingSpecUnreadable, fmt.Sprintf(
+			"run %s carries no persisted grooming determination (a row minted before the determination was "+
+				"recorded at creation, or a child of one) and no cached workflow spec, so whether this is a "+
+				"backlog-grooming propose stage is undecidable and the prompt is refused rather than served without "+
+				"a charter. Start a new run, whose determination is recorded at creation.", runRow.ID))
 	}
 	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
 	if err != nil {
-		if !specCouldBeGrooming(runRow.WorkflowSpec, runRow.WorkflowID) {
-			return false, nil // not attributable to a grooming spec — fail open like the neighbours
-		}
 		return false, charterRefusal(reasonGroomingSpecUnreadable, fmt.Sprintf(
-			"the cached workflow spec for run %s cannot be parsed and the %s artifact is attributable to workflow "+
-				"%s, so whether this is a "+
-				"backlog-grooming propose stage is undecidable and the prompt is refused rather than served without a "+
-				"charter: %v", runRow.ID, spec.ArtifactGroomingReport, runRow.WorkflowID, err))
+			"run %s carries no persisted grooming determination (a row minted before the determination was "+
+				"recorded at creation, or a child of one) and its cached workflow spec cannot be parsed, so whether "+
+				"this is a backlog-grooming propose stage is undecidable and the prompt is refused rather than served "+
+				"without a charter. Start a new run, whose determination is recorded at creation: %v", runRow.ID, err))
 	}
 	wf, ok := parsed.Workflows[runRow.WorkflowID]
 	if !ok {
-		// The spec parsed but names no such workflow. Same narrowing: refuse
-		// only when SOME workflow in the document is grooming-shaped, so the
-		// undecidable case cannot be resolved as non-grooming.
-		for _, candidate := range parsed.Workflows {
-			if WorkflowRequiresCharter(candidate) {
-				return false, charterRefusal(reasonGroomingSpecUnreadable, fmt.Sprintf(
-					"the cached workflow spec for run %s does not declare workflow %q, and another workflow in it "+
-						"produces a %s, so whether this is a backlog-grooming propose stage is undecidable and the "+
-						"prompt is refused rather than served without a charter",
-					runRow.ID, runRow.WorkflowID, spec.ArtifactGroomingReport))
-			}
-		}
-		return false, nil
+		return false, charterRefusal(reasonGroomingSpecUnreadable, fmt.Sprintf(
+			"run %s carries no persisted grooming determination (a row minted before the determination was "+
+				"recorded at creation, or a child of one) and its cached workflow spec does not declare workflow %q, "+
+				"so whether this is a backlog-grooming propose stage is undecidable and the prompt is refused rather "+
+				"than served without a charter. Start a new run, whose determination is recorded at creation.",
+			runRow.ID, runRow.WorkflowID))
 	}
 	return WorkflowRequiresCharter(wf), nil
 }

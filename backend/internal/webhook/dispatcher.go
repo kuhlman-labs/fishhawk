@@ -1592,6 +1592,14 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	triggerRef := m.TriggerRef
 	installationID := ev.InstallationID
 	parentRunID := d.findParentRunID(ctx, ev.Repo, triggerRef)
+	// The persisted grooming determination (E54.13 / #2806): the same pure
+	// structural predicate the server-side charter admission gate evaluates,
+	// recorded here while the spec is known-parseable so the prompt-serve
+	// path reads a fact rather than re-deriving it from cached bytes. This is
+	// a STAMP, not an admission gate — the webhook seams are not charter-gated
+	// today, and leaving them NULL would keep a live trigger class on the
+	// spec-derived legacy path.
+	requiresCharter := spec.WorkflowRequiresCharter(workflow)
 	created, err := d.Runs.CreateRun(ctx, run.CreateRunParams{
 		Repo:                   ev.Repo,
 		WorkflowID:             m.WorkflowID,
@@ -1614,7 +1622,8 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		// mode (Phase C of E22 / #389) takes a different code
 		// path through handleCreateRun and stamps `local`
 		// itself.
-		RunnerKind: run.RunnerKindGitHubActions,
+		RunnerKind:      run.RunnerKindGitHubActions,
+		RequiresCharter: &requiresCharter,
 	})
 	if err != nil {
 		return fmt.Errorf("dispatcher: create run: %w", err)

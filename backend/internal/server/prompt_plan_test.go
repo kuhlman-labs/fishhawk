@@ -258,12 +258,13 @@ func seedRunWithStages(rr *planPromptRunRepo) (runID, planStageID, implStageID u
 	triggerRef := "issue:42"
 	installation := int64(99)
 	rn := &run.Run{
-		ID:             runID,
-		Repo:           "kuhlman-labs/example",
-		WorkflowID:     "feature_change",
-		TriggerSource:  run.TriggerGitHubIssue,
-		TriggerRef:     &triggerRef,
-		InstallationID: &installation,
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   run.TriggerGitHubIssue,
+		TriggerRef:      &triggerRef,
+		InstallationID:  &installation,
 	}
 	rr.seedRun(rn)
 	rr.seedStages(runID,

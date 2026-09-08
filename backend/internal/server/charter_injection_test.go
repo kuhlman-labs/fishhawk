@@ -14,7 +14,6 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"gopkg.in/yaml.v3"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -27,22 +26,34 @@ import (
 
 // COUNTERFACTUAL EVIDENCE (observed, not reasoned). Each control below was
 // DELETED, the named test RUN, the RED observed, and the file restored
-// byte-identically; every RED was re-run WITHOUT -race and failed the same way
-// (these tests start no goroutines, so no RED here is a -race artifact). A
-// fix-up pass cannot rewrite the PR body, so the record lives here, in the
-// diff:
+// byte-identically (cmp against a pristine copy); every RED was re-run
+// WITHOUT -race and failed the same way (these tests start no goroutines, so
+// no RED here is a -race artifact). A fix-up pass cannot rewrite the PR body,
+// so the record lives here, in the diff. E54.13 / #2806 (the persisted
+// determination replacing the deleted specCouldBeGrooming heuristic):
 //
-//   - specCouldBeGrooming attribution → raw document-wide bytes.Contains:
-//     M8f/M8g/M8h/M8j RED (`status = 500, want 200`, reason
-//     grooming_workflow_spec_unreadable) + 4 TestSpecCouldBeGrooming_Attribution
-//     rows RED.
-//   - specCouldBeGrooming call site → `if false` (H4 narrowing removed
-//     entirely): M8b RED alongside M8f/g/h/j — the repo-wide refusal H4 forbids.
-//   - the byte-scan fallback's bytes.Contains → deleted: M8a RED (a
-//     syntax-broken spec declaring the artifact in DATA fell open) +
-//     TestSpecCouldBeGrooming_Attribution/syntax-broken_with_the_token_in_data.
-//   - the reuse widening → `if false`: TestSpecCouldBeGrooming_ReuseWidensThe-
-//     Search RED ("a reuse-bearing document ... fell open").
+//   - the `runRow.RequiresCharter != nil` early return → deleted:
+//     TestCharterDetermination_PersistedNonGrooming_CorruptSpecWithIncidentalToken_Served
+//     RED (`status = 500, want 200`, the legacy branch refused the corrupt
+//     spec) AND TestCharterDetermination_PersistedGrooming_SpecTokenDestroyed_
+//     StillAnchored RED (`status = 200, want a refusal`, the spec-derived
+//     verdict served an unanchored prompt) — both directions.
+//   - the legacy unparseable-spec refusal → `return false, nil`:
+//     TestCharterDetermination_LegacyRow_UnparseableSpec_Refuses RED
+//     (`status = 200, want a refusal`).
+//   - the legacy EMPTY-spec refusal (approval condition 1) → `return false,
+//     nil`: TestCharterDetermination_LegacyRow_EmptySpec_Refuses RED
+//     (`status = 200, want a refusal`).
+//   - the legacy unknown-workflow refusal → `return false, nil`:
+//     TestCharterDetermination_LegacyRow_UnknownWorkflow_Refuses RED on both
+//     subtests (`status = 200, want a refusal`).
+//   - the stage-type early return → deleted:
+//     TestCharterDetermination_NonPlanStage_NeverGrooming RED ("an implement
+//     stage of a persisted-grooming row was treated as a charter-requiring
+//     propose stage" + the legacy-row implement stage reached the refusal).
+//
+// Earlier controls in this file, still standing (E54.2 / #2234):
+//
 //   - L2's charter-identity loop → any-document-present: H2 RED and
 //     L2Divergence/L2_sees_a_different_charter_path RED.
 //   - documentForgeOwnershipGuard → unwrapped (cmd/fishhawkd): 5 of the 7
@@ -107,7 +118,9 @@ workflows:
 `
 
 // chCorruptGroomingSpec is unparseable YAML that STILL carries the
-// grooming_report token — the undecidable case that must fail closed.
+// grooming_report token. On a LEGACY row (no persisted determination) it is
+// undecidable and refused; on a row carrying a persisted determination the
+// fact decides and these bytes are never read.
 const chCorruptGroomingSpec = `version: "2"
 workflows:
   backlog_grooming:
@@ -119,9 +132,7 @@ workflows:
           schema: [unclosed
 `
 
-// chCorruptPlainSpec is unparseable YAML with no grooming_report token — the
-// case that must fall OPEN, keeping non-grooming prompt behaviour unchanged
-// (approval condition H4).
+// chCorruptPlainSpec is unparseable YAML with no grooming_report token.
 const chCorruptPlainSpec = `version: "2"
 workflows:
   feature_change:
@@ -133,72 +144,16 @@ workflows:
           schema: [unclosed
 `
 
-// The H4 BOUNDARY fixtures. Every one of these is YAML that DECODES but fails
-// spec.ParseBytes (the dominant corruption class), carrying the
-// grooming_report token somewhere that is NOT this run's workflow's produces
-// block. A raw bytes.Contains over the document refuses all of them — the
-// non-grooming behaviour change H4 forbids.
-
-// chSchemaInvalidTokenInComment: the token lives in a YAML COMMENT, which is
-// not a node in any parse of a decodable document.
-const chSchemaInvalidTokenInComment = `version: "2"
-# this workflow used to emit a grooming_report; it no longer does
-workflows:
-  feature_change:
-    stages: "not-a-list"
-`
-
-// chSchemaInvalidTokenInScalar: the token appears inside an unrelated prose
-// scalar, which is not an artifact declaration.
-const chSchemaInvalidTokenInScalar = `version: "2"
+// chCorruptPlainSpecIncidentalToken is the issue's residual (a), pinned by
+// hand: a syntactically corrupt NON-grooming spec whose bytes carry the
+// literal grooming_report token in an INLINE comment AND in an unrelated
+// prose scalar. The deleted byte-scanning fallback refused this; a row whose
+// persisted determination is false serves it byte-identically, because the
+// fact decides and the bytes are never inspected.
+const chCorruptPlainSpecIncidentalToken = `version: "2"
 workflows:
   feature_change:
     description: "items ranked earlier in a grooming_report by hand"
-    stages: "not-a-list"
-`
-
-// chSchemaInvalidOtherWorkflowGrooms: ANOTHER workflow in the same document
-// declares the artifact. Attribution decides this, not document-wide presence:
-// served unchanged for feature_change, REFUSED for backlog_grooming.
-const chSchemaInvalidOtherWorkflowGrooms = `version: "2"
-workflows:
-  feature_change:
-    stages: "not-a-list"
-  backlog_grooming:
-    stages:
-      - id: groom
-        type: plan
-        produces:
-          - artifact: grooming_report
-`
-
-// chSyntaxBrokenTokenInComment does NOT decode as YAML at all, so there is no
-// structure to attribute against — the fallback byte scan runs, and it must
-// still skip a FULL-LINE comment.
-const chSyntaxBrokenTokenInComment = `version: "2"
-# produces: grooming_report
-workflows:
-  feature_change:
-    stages:
-      - id: plan
-        type: plan
-        produces:
-       - artifact: plan
-          schema: [unclosed
-`
-
-// chSyntaxBrokenTokenInline and chSyntaxBrokenTokenInProse are the RESIDUAL
-// fixtures for the non-decoding branch. groomingTokenInDataLines can only skip
-// a FULL-LINE comment — a line whose first non-blank byte is `#` is a comment
-// under any parse of that line. A token in a TRAILING comment, or in an
-// unrelated prose scalar, sits on a data line, so a corrupt NON-grooming spec
-// carrying it is still REFUSED. That is a documented non-grooming behaviour
-// change; it fails CLOSED (a refusal, never an unanchored serve) and reaches
-// only storage-corrupted specs, and these fixtures pin it as DELIBERATE so a
-// later edit to the fallback cannot silently widen or narrow it.
-const chSyntaxBrokenTokenInline = `version: "2"
-workflows:
-  feature_change:
     stages:
       - id: plan
         type: plan  # this stage no longer emits a grooming_report
@@ -207,43 +162,33 @@ workflows:
           schema: [unclosed
 `
 
-const chSyntaxBrokenTokenInProse = `version: "2"
+// chGroomingSpecTokenDestroyed is the issue's residual (b), pinned by hand: a
+// spec that parses CLEANLY and is decidably NON-grooming — the run's own
+// workflow, with its produces block rewritten so no grooming_report is
+// declared anywhere in the document. Read for a row whose persisted
+// determination is TRUE it is still a grooming run: the fact decides, and a
+// corruption that destroyed the token cannot fall the control open.
+const chGroomingSpecTokenDestroyed = `version: "2"
 workflows:
-  feature_change:
-    description: "items ranked earlier in a grooming_report by hand"
-    stages:
-      - id: plan
-        type: plan
-        produces:
-       - artifact: plan
-          schema: [unclosed
-`
-
-// chSchemaInvalidReuseKeyOtherWorkflowGrooms is the RESIDUAL fixture for the
-// decoding branch's widening. yamlUsesSameDocumentReuse keys on the NAME of a
-// mapping key anywhere in the document, not on a resolvable inheritance edge,
-// so an unrelated `defaults` map (here a plain inputs default) widens the
-// search document-wide and ANOTHER workflow's grooming_report is then counted
-// against feature_change. Without the reuse key this exact document serves
-// unchanged (chSchemaInvalidOtherWorkflowGrooms / M8h). The widening is
-// deliberate — a real reuse edge can move a produces block into a workflow
-// from outside its subtree and a name-only check cannot tell the two apart —
-// and it fails CLOSED, so this fixture pins the over-approximation rather than
-// treating it as a defect.
-const chSchemaInvalidReuseKeyOtherWorkflowGrooms = `version: "2"
-workflows:
-  feature_change:
-    inputs:
-      defaults:
-        reviewer: someone
-    stages: "not-a-list"
   backlog_grooming:
+    applies_to:
+      trigger: [scheduled, on_demand]
+    autonomy: low
     stages:
       - id: groom
         type: plan
+        executor:
+          agent: claude-code
         produces:
-          - artifact: grooming_report
+          - artifact: plan
+            schema: standard_v1
 `
+
+// chTrue / chFalse are the two persisted determinations; nil is the legacy
+// row (no persisted determination — a row minted before migration 0082, or a
+// child inheriting nil from such a parent).
+func chTrue() *bool  { b := true; return &b }
+func chFalse() *bool { b := false; return &b }
 
 // chFetcher serves the charter keyed by ref. The SOFTENED text is seeded at
 // every mutable ref a broken implementation could reach — the default BRANCH
@@ -355,6 +300,10 @@ type chServerOpts struct {
 	useCharter  bool // install the real charterDeclarations as the seam
 	auditRepo   audit.Repository
 	stageIsPlan bool
+	// requiresCharter is the row's persisted grooming determination
+	// (runs.requires_charter): nil is the LEGACY row with no persisted
+	// determination.
+	requiresCharter *bool
 }
 
 // newCharterServer builds a server serving a PLAN-stage prompt for a run whose
@@ -375,8 +324,9 @@ func newCharterServer(t *testing.T, opts chServerOpts) (*Server, uuid.UUID, uuid
 	}
 	rr.getRuns[runID] = &run.Run{
 		ID: runID, Repo: "o/r", WorkflowID: workflowID,
-		TriggerSource: run.TriggerCLI,
-		WorkflowSpec:  []byte(opts.specYAML),
+		TriggerSource:   run.TriggerCLI,
+		WorkflowSpec:    []byte(opts.specYAML),
+		RequiresCharter: opts.requiresCharter,
 	}
 	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: stageType}
 	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {rr.getStages[stageID]}}
@@ -415,15 +365,50 @@ func chDefaultBaseRef(context.Context, forge.RepoRef) (string, error) {
 }
 
 // chWiredServer is the fully-wired happy path: real charter declarations, a
-// forge fake, a commit resolver and the default-branch base ref.
+// forge fake, a commit resolver and the default-branch base ref, for a run row
+// carrying the persisted determination the mint seam would have stamped from
+// specYAML. It therefore REQUIRES a parseable spec naming the run's workflow;
+// a corrupt-spec or legacy-row test must say what the row carries through
+// chWiredServerRow.
 func chWiredServer(t *testing.T, specYAML string, ff *chFetcher, maxBytes int) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey, *storingAuditRepo) {
 	t.Helper()
+	return chWiredServerRow(t, specYAML, ff, maxBytes, chDeterminationOf(t, specYAML))
+}
+
+// chDeterminationOf is the stamp the mint seam records: the structural
+// predicate over the parsed spec. Fatal on a spec that does not parse or does
+// not name the fixture's workflow, so a test cannot silently become a legacy
+// row.
+func chDeterminationOf(t *testing.T, specYAML string) *bool {
+	t.Helper()
+	parsed, err := spec.ParseBytes([]byte(specYAML))
+	if err != nil {
+		t.Fatalf("chWiredServer needs a parseable spec (use chWiredServerRow for a corrupt or legacy row): %v", err)
+	}
+	workflowID := "backlog_grooming"
+	if strings.Contains(specYAML, "feature_change") {
+		workflowID = "feature_change"
+	}
+	wf, ok := parsed.Workflows[workflowID]
+	if !ok {
+		t.Fatalf("chWiredServer spec does not declare %s", workflowID)
+	}
+	requires := WorkflowRequiresCharter(wf)
+	return &requires
+}
+
+// chWiredServerRow is chWiredServer with the row's persisted determination
+// stated explicitly: chTrue() / chFalse() for a row minted after migration
+// 0082, nil for a LEGACY row.
+func chWiredServerRow(t *testing.T, specYAML string, ff *chFetcher, maxBytes int, requires *bool) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey, *storingAuditRepo) {
+	t.Helper()
 	return newCharterServer(t, chServerOpts{
-		specYAML:    specYAML,
-		resolver:    &repodoc.Resolver{Fetcher: ff, Commits: &chCommits{sha: chPinnedCommit}, MaxBytes: maxBytes},
-		baseRef:     chDefaultBaseRef,
-		useCharter:  true,
-		stageIsPlan: true,
+		specYAML:        specYAML,
+		resolver:        &repodoc.Resolver{Fetcher: ff, Commits: &chCommits{sha: chPinnedCommit}, MaxBytes: maxBytes},
+		baseRef:         chDefaultBaseRef,
+		useCharter:      true,
+		stageIsPlan:     true,
+		requiresCharter: requires,
 	})
 }
 
@@ -856,7 +841,7 @@ func TestGroomingPrompt_M7_NonGroomingPlanStage_ByteIdentical(t *testing.T) {
 func TestGroomingPrompt_M7b_NonPlanStage_NotCharterRequiring(t *testing.T) {
 	calls := installConventions(t, chConventions(chCharterPath), nil)
 	required, err := stageRequiresCharter(
-		&run.Run{ID: uuid.New(), Repo: "o/r", WorkflowID: "backlog_grooming", WorkflowSpec: []byte(chGroomingSpec)},
+		&run.Run{ID: uuid.New(), Repo: "o/r", WorkflowID: "backlog_grooming", WorkflowSpec: []byte(chGroomingSpec), RequiresCharter: chTrue()},
 		&run.Stage{Type: run.StageTypeImplement})
 	if err != nil {
 		t.Fatalf("stageRequiresCharter: %v", err)
@@ -869,95 +854,22 @@ func TestGroomingPrompt_M7b_NonPlanStage_NotCharterRequiring(t *testing.T) {
 	}
 }
 
-// M8a: an unparseable WorkflowSpec that CARRIES the grooming_report token.
-// Undecidable → refused, never silently treated as non-grooming.
-func TestGroomingPrompt_M8a_UnparseableGroomingSpec_Refused(t *testing.T) {
-	installConventions(t, chConventions(chCharterPath), nil)
-	s, runID, stageID, priv, _ := chWiredServer(t, chCorruptGroomingSpec, newCHFetcher(), 0)
+// ---------------------------------------------------------------------------
+// The persisted-fact determination (E54.13 / #2806): one behavioural test per
+// branch of stageRequiresCharter, each asserting SHIPPED behaviour — a served
+// or refused prompt, by reason IDENTITY — never a comment or a symbol.
+// ---------------------------------------------------------------------------
 
-	chAssertReason(t, chRefusal(t, s, runID, stageID, priv), reasonGroomingSpecUnreadable)
-}
-
-// M8b is approval condition H4: an unparseable WorkflowSpec with NO
-// grooming_report token cannot be a grooming spec under any parse, so it must
-// fall OPEN exactly as the neighbouring spec readers do and serve a
-// byte-identical prompt. Without this narrowing the corrupt-spec refusal would
-// reach EVERY run.
-func TestGroomingPrompt_M8b_UnparseableNonGroomingSpec_ServesUnchanged(t *testing.T) {
-	calls := installConventions(t, chConventions(chCharterPath), nil)
-
-	wired, runID, stageID, priv, ar := chWiredServer(t, chCorruptPlainSpec, newCHFetcher(), 0)
-	got := chDecodePrompt(t, wired, runID, stageID, priv)
-
-	off, offRun, offStage, offPriv, _ := newCharterServer(t, chServerOpts{
-		specYAML: chCorruptPlainSpec, stageIsPlan: true,
-	})
-	want := chDecodePrompt(t, off, offRun, offStage, offPriv)
-
-	if got.Prompt != want.Prompt {
-		t.Errorf("a corrupt NON-grooming spec changed the served prompt:\n--- wired ---\n%s\n--- disabled ---\n%s",
-			got.Prompt, want.Prompt)
-	}
-	if cats := chAuditCategories(ar, runID); len(cats) != 0 {
-		t.Errorf("audit entries %v written for a corrupt non-grooming spec, want none", cats)
-	}
-	if *calls != 0 {
-		t.Errorf("the conventions loader was consulted %d times on a corrupt non-grooming spec, want 0", *calls)
-	}
-}
-
-// M8c: the spec parses but names no such workflow, and ANOTHER workflow in it
-// is grooming-shaped — still undecidable, still refused.
-func TestGroomingPrompt_M8c_WorkflowAbsentButGroomingShaped_Refused(t *testing.T) {
-	installConventions(t, chConventions(chCharterPath), nil)
-	s, runID, stageID, priv, _ := chWiredServer(t, chGroomingSpec, newCHFetcher(), 0)
-	// Point the run at a workflow the spec does not declare.
-	rr := s.cfg.RunRepo.(*promptRunRepo)
-	rr.getRuns[runID].WorkflowID = "not_declared"
-
-	chAssertReason(t, chRefusal(t, s, runID, stageID, priv), reasonGroomingSpecUnreadable)
-}
-
-// M8d: the spec parses, names no such workflow, and NOTHING in it is
-// grooming-shaped — decidably non-grooming, so it falls open.
-func TestGroomingPrompt_M8d_WorkflowAbsentAndPlain_NotCharterRequiring(t *testing.T) {
-	required, err := stageRequiresCharter(
-		&run.Run{ID: uuid.New(), Repo: "o/r", WorkflowID: "not_declared", WorkflowSpec: []byte(chPlainSpec)},
-		&run.Stage{Type: run.StageTypePlan})
-	if err != nil {
-		t.Fatalf("stageRequiresCharter returned an error for a decidably non-grooming spec: %v", err)
-	}
-	if required {
-		t.Errorf("a plain spec with an unknown workflow was treated as charter-requiring")
-	}
-}
-
-// M8e: a legacy run row with NO cached spec is not charter-requiring.
-func TestGroomingPrompt_M8e_NilWorkflowSpec_NotCharterRequiring(t *testing.T) {
-	required, err := stageRequiresCharter(
-		&run.Run{ID: uuid.New(), Repo: "o/r", WorkflowID: "backlog_grooming"},
-		&run.Stage{Type: run.StageTypePlan})
-	if err != nil {
-		t.Fatalf("stageRequiresCharter: %v", err)
-	}
-	if required {
-		t.Errorf("a legacy row with no cached spec was treated as charter-requiring")
-	}
-}
-
-// chServesUnchanged asserts that a spec serves a prompt BYTE-IDENTICAL to the
-// same spec with the whole feature disabled, writes no injection audit entry,
-// and never consults the conventions loader. This is the H4 claim, and the
-// three-way assertion is what makes it a counterfactual vehicle: widening the
-// grooming evidence back to a document-wide byte scan reddens the loader-call
-// assertion first and the refusal (a non-200) immediately after.
-func chServesUnchanged(t *testing.T, specYAML, workflowID string) {
+// chServesUnchangedRow asserts that a run row serves a prompt BYTE-IDENTICAL to
+// the same row with the whole feature disabled, writes no injection audit
+// entry, and never consults the conventions loader.
+func chServesUnchangedRow(t *testing.T, specYAML, workflowID string, requires *bool) {
 	t.Helper()
 	calls := installConventions(t, chConventions(chCharterPath), nil)
 
-	wired, runID, stageID, priv, ar := chWiredServer(t, specYAML, newCHFetcher(), 0)
+	wired, runID, stageID, priv, ar := chWiredServerRow(t, specYAML, newCHFetcher(), 0, requires)
 	off, offRun, offStage, offPriv, _ := newCharterServer(t, chServerOpts{
-		specYAML: specYAML, stageIsPlan: true,
+		specYAML: specYAML, stageIsPlan: true, requiresCharter: requires,
 	})
 	if workflowID != "" {
 		wired.cfg.RunRepo.(*promptRunRepo).getRuns[runID].WorkflowID = workflowID
@@ -967,136 +879,283 @@ func chServesUnchanged(t *testing.T, specYAML, workflowID string) {
 	got := chDecodePrompt(t, wired, runID, stageID, priv)
 	want := chDecodePrompt(t, off, offRun, offStage, offPriv)
 	if got.Prompt != want.Prompt {
-		t.Errorf("a corrupt NON-grooming spec changed the served prompt:\n--- wired ---\n%s\n--- disabled ---\n%s",
+		t.Errorf("a NON-grooming row changed the served prompt with the charter seam wired:\n--- wired ---\n%s\n--- disabled ---\n%s",
 			got.Prompt, want.Prompt)
 	}
 	if cats := chAuditCategories(ar, runID); len(cats) != 0 {
-		t.Errorf("audit entries %v written for a corrupt non-grooming spec, want none", cats)
+		t.Errorf("audit entries %v written for a non-grooming row, want none", cats)
 	}
 	if *calls != 0 {
-		t.Errorf("the conventions loader was consulted %d times on a corrupt non-grooming spec, want 0", *calls)
+		t.Errorf("the conventions loader was consulted %d times on a non-grooming row, want 0", *calls)
 	}
 }
 
-// TestCharterFixtures_AreActuallyUnparseable is the PRECONDITION for every M8
-// test below it. Each fixture must be a spec the shipped parser REJECTS — if
-// one silently started parsing, its M8 test would take the ordinary structural
-// path and pass without exercising the unparseable-spec narrowing at all. It
-// also pins WHICH branch each fixture drives: `decodes` says whether the
-// document is well-formed YAML (the attribution branch) or not (the byte-scan
-// fallback).
-func TestCharterFixtures_AreActuallyUnparseable(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		spec    string
-		decodes bool
-	}{
-		{"token in a comment", chSchemaInvalidTokenInComment, true},
-		{"token in an unrelated scalar", chSchemaInvalidTokenInScalar, true},
-		{"token in another workflow", chSchemaInvalidOtherWorkflowGrooms, true},
-		{"syntax broken, token in a comment", chSyntaxBrokenTokenInComment, false},
-		{"syntax broken, token in data", chCorruptGroomingSpec, false},
-		{"syntax broken, no token", chCorruptPlainSpec, false},
-		{"syntax broken, token in a trailing comment", chSyntaxBrokenTokenInline, false},
-		{"syntax broken, token in an unrelated scalar", chSyntaxBrokenTokenInProse, false},
-		{"reuse key plus another workflow's artifact", chSchemaInvalidReuseKeyOtherWorkflowGrooms, true},
+// TestCharterFixtures_HaveTheShapeTheirTestsNeed is the PRECONDITION for the
+// determination tests: the corrupt fixtures must be specs the shipped parser
+// REJECTS (or the persisted-fact tests would take the ordinary path and prove
+// nothing), the incidental-token fixture must actually carry the token, and
+// the token-destroyed fixture must parse cleanly AND be decidably non-grooming
+// under the structural predicate — otherwise residual (b)'s test would pass
+// for the wrong reason.
+func TestCharterFixtures_HaveTheShapeTheirTestsNeed(t *testing.T) {
+	for name, s := range map[string]string{
+		"corrupt grooming":               chCorruptGroomingSpec,
+		"corrupt plain":                  chCorruptPlainSpec,
+		"corrupt plain incidental token": chCorruptPlainSpecIncidentalToken,
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := spec.ParseBytes([]byte(tc.spec)); err == nil {
-				t.Fatalf("fixture parses cleanly; it must be REJECTED for its M8 test to mean anything:\n%s", tc.spec)
-			}
-			var raw any
-			decodes := yaml.Unmarshal([]byte(tc.spec), &raw) == nil
-			if decodes != tc.decodes {
-				t.Errorf("fixture decodes as YAML = %v, want %v — it drives the wrong specCouldBeGrooming branch", decodes, tc.decodes)
-			}
-		})
+		if _, err := spec.ParseBytes([]byte(s)); err == nil {
+			t.Errorf("%s fixture parses cleanly; it must be REJECTED for its test to mean anything:\n%s", name, s)
+		}
+	}
+	if !strings.Contains(chCorruptPlainSpecIncidentalToken, string(spec.ArtifactGroomingReport)) {
+		t.Errorf("the incidental-token fixture carries no %s token", spec.ArtifactGroomingReport)
+	}
+	parsed, err := spec.ParseBytes([]byte(chGroomingSpecTokenDestroyed))
+	if err != nil {
+		t.Fatalf("the token-destroyed fixture must parse cleanly: %v", err)
+	}
+	wf, ok := parsed.Workflows["backlog_grooming"]
+	if !ok {
+		t.Fatalf("the token-destroyed fixture must declare backlog_grooming")
+	}
+	if WorkflowRequiresCharter(wf) {
+		t.Errorf("the token-destroyed fixture is still grooming-shaped under the structural predicate; residual (b)'s test needs it to be decidably NON-grooming")
+	}
+	if strings.Contains(chGroomingSpecTokenDestroyed, string(spec.ArtifactGroomingReport)) {
+		t.Errorf("the token-destroyed fixture still carries the %s token", spec.ArtifactGroomingReport)
 	}
 }
 
-// M8f/g/h are approval condition H4's INCIDENTAL-TOKEN boundary, the case the
-// first cut of this check got wrong: a corrupt NON-grooming spec whose bytes
-// carry `grooming_report` in a comment, in an unrelated scalar, or in a
-// DIFFERENT workflow is still a non-grooming run, and its prompt must be
-// byte-identical to the feature-disabled build.
-func TestGroomingPrompt_M8f_TokenInComment_ServesUnchanged(t *testing.T) {
-	chServesUnchanged(t, chSchemaInvalidTokenInComment, "")
+// (i) Residual (a) closed: persisted FALSE + a syntactically corrupt spec
+// whose bytes carry grooming_report in an inline comment AND an unrelated
+// scalar → SERVED, byte-identical to the same row with the feature disabled.
+// The persisted fact decides and the bytes are never read.
+//
+// COUNTERFACTUAL: delete the `runRow.RequiresCharter != nil` early return and
+// this goes RED (the legacy branch refuses the undecidable spec).
+func TestCharterDetermination_PersistedNonGrooming_CorruptSpecWithIncidentalToken_Served(t *testing.T) {
+	chServesUnchangedRow(t, chCorruptPlainSpecIncidentalToken, "", chFalse())
 }
 
-func TestGroomingPrompt_M8g_TokenInUnrelatedScalar_ServesUnchanged(t *testing.T) {
-	chServesUnchanged(t, chSchemaInvalidTokenInScalar, "")
+// (i-b) The intact-spec CONTROL for (i): the same persisted FALSE row with a
+// clean non-grooming spec serves the same way, so (i) is not green because
+// the corrupt row happened to serve SOME prompt.
+func TestCharterDetermination_PersistedNonGrooming_IntactSpec_Served(t *testing.T) {
+	chServesUnchangedRow(t, chPlainSpec, "", chFalse())
 }
 
-func TestGroomingPrompt_M8h_TokenInAnotherWorkflow_ServesUnchanged(t *testing.T) {
-	chServesUnchanged(t, chSchemaInvalidOtherWorkflowGrooms, "feature_change")
+// (ii) Residual (b) closed: persisted TRUE + a spec that parses cleanly and is
+// decidably NON-grooming (the produces block no longer declares the artifact)
+// → still a grooming run: REFUSED with the charter reason when no charter
+// resolves. The spec-derived verdict would say non-grooming and serve an
+// unanchored prompt; the persisted fact overrides it.
+//
+// COUNTERFACTUAL: delete the persisted-fact early return and this goes RED
+// (the spec-derived verdict serves a 200).
+func TestCharterDetermination_PersistedGrooming_SpecTokenDestroyed_StillAnchored(t *testing.T) {
+	installConventions(t, chConventionsWithoutCharter(), nil)
+	s, runID, stageID, priv, _ := chWiredServerRow(t, chGroomingSpecTokenDestroyed, newCHFetcher(), 0, chTrue())
+
+	chAssertReason(t, chRefusal(t, s, runID, stageID, priv), reasonCharterAbsent)
 }
 
-// M8i is the other half of M8h and the reason attribution is not just "always
-// fall open": the SAME corrupt document, read for the workflow that actually
-// declares the artifact, is REFUSED.
-func TestGroomingPrompt_M8i_TokenInOwnWorkflow_Refused(t *testing.T) {
+// (ii-b) And with a charter declared, the same persisted-TRUE row is SERVED
+// WITH the charter block: the fact decides grooming-ness in both directions.
+func TestCharterDetermination_PersistedGrooming_SpecTokenDestroyed_ServedWithCharter(t *testing.T) {
 	installConventions(t, chConventions(chCharterPath), nil)
-	s, runID, stageID, priv, _ := chWiredServer(t, chSchemaInvalidOtherWorkflowGrooms, newCHFetcher(), 0)
-	s.cfg.RunRepo.(*promptRunRepo).getRuns[runID].WorkflowID = "backlog_grooming"
+	s, runID, stageID, priv, _ := chWiredServerRow(t, chGroomingSpecTokenDestroyed, newCHFetcher(), 0, chTrue())
+
+	resp := chDecodePrompt(t, s, runID, stageID, priv)
+	if !strings.Contains(resp.Prompt, "### "+charterFraming().Heading) {
+		t.Errorf("a persisted-grooming row served a prompt with no charter block:\n%s", resp.Prompt)
+	}
+}
+
+// (iii) Persisted TRUE + an UNPARSEABLE spec → refused for the CHARTER reason,
+// never grooming_workflow_spec_unreadable. Both branches refuse, so only the
+// reason IDENTITY distinguishes "the fact decided grooming, then the charter
+// was missing" from "the spec was consulted and found undecidable".
+func TestCharterDetermination_PersistedGrooming_UnparseableSpec_RefusedForCharterNotSpec(t *testing.T) {
+	installConventions(t, chConventionsWithoutCharter(), nil)
+	s, runID, stageID, priv, _ := chWiredServerRow(t, chCorruptGroomingSpec, newCHFetcher(), 0, chTrue())
+
+	body := chRefusal(t, s, runID, stageID, priv)
+	if got, _ := chDetails(t, body)["reason"].(string); got == reasonGroomingSpecUnreadable {
+		t.Fatalf("a row carrying a persisted determination was refused for the SPEC (%s); the fact must decide and the spec must not be read", got)
+	}
+	chAssertReason(t, body, reasonCharterAbsent)
+}
+
+// (iii-b) Persisted TRUE + an unparseable spec, charter declared and resolvable
+// → SERVED with the charter. The corrupt bytes are never consulted.
+func TestCharterDetermination_PersistedGrooming_UnparseableSpec_ServedWithCharter(t *testing.T) {
+	installConventions(t, chConventions(chCharterPath), nil)
+	s, runID, stageID, priv, _ := chWiredServerRow(t, chCorruptGroomingSpec, newCHFetcher(), 0, chTrue())
+
+	resp := chDecodePrompt(t, s, runID, stageID, priv)
+	if !strings.Contains(resp.Prompt, "### "+charterFraming().Heading) {
+		t.Errorf("a persisted-grooming row with a corrupt spec served a prompt with no charter block:\n%s", resp.Prompt)
+	}
+}
+
+// (iv) LEGACY NULL + an unparseable spec → refused with
+// grooming_workflow_spec_unreadable: no fact, no decidable bytes.
+//
+// COUNTERFACTUAL: replace the legacy refusal branch with `return false, nil`
+// and this goes RED (a 200 is served).
+func TestCharterDetermination_LegacyRow_UnparseableSpec_Refuses(t *testing.T) {
+	installConventions(t, chConventions(chCharterPath), nil)
+	s, runID, stageID, priv, _ := chWiredServerRow(t, chCorruptGroomingSpec, newCHFetcher(), 0, nil)
 
 	chAssertReason(t, chRefusal(t, s, runID, stageID, priv), reasonGroomingSpecUnreadable)
 }
 
-// M8j: the document does not decode as YAML at all, so there is no structure
-// to attribute against and the byte-scan fallback runs — it must still skip a
-// FULL-LINE comment. Its positive counterpart is M8a, whose token is in data.
-func TestGroomingPrompt_M8j_SyntaxBrokenTokenInComment_ServesUnchanged(t *testing.T) {
-	chServesUnchanged(t, chSyntaxBrokenTokenInComment, "")
+// (iv-b) The refusal is on UNDECIDABILITY, not on the token: a legacy row with
+// a corrupt spec carrying NO grooming_report token is refused the same way.
+// Before #2806 this fell open; the persisted fact is what makes a corrupt
+// non-grooming row servable, and a legacy row has none.
+func TestCharterDetermination_LegacyRow_UnparseablePlainSpec_Refuses(t *testing.T) {
+	installConventions(t, chConventions(chCharterPath), nil)
+	s, runID, stageID, priv, _ := chWiredServerRow(t, chCorruptPlainSpec, newCHFetcher(), 0, nil)
+
+	chAssertReason(t, chRefusal(t, s, runID, stageID, priv), reasonGroomingSpecUnreadable)
 }
 
-// M8k pins specCouldBeGrooming directly, so the attribution branches are
-// readable one line at a time rather than only through an HTTP fixture.
-func TestSpecCouldBeGrooming_Attribution(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		spec       string
-		workflowID string
-		want       bool
-	}{
-		{"token in a comment is not a node", chSchemaInvalidTokenInComment, "feature_change", false},
-		{"token in an unrelated scalar is not an artifact", chSchemaInvalidTokenInScalar, "feature_change", false},
-		{"another workflow's artifact is not mine", chSchemaInvalidOtherWorkflowGrooms, "feature_change", false},
-		{"my own workflow's artifact is mine", chSchemaInvalidOtherWorkflowGrooms, "backlog_grooming", true},
-		{"an absent workflow cannot be attributed", chSchemaInvalidOtherWorkflowGrooms, "not_declared", true},
-		{"syntax-broken with the token in a comment", chSyntaxBrokenTokenInComment, "feature_change", false},
-		{"syntax-broken with the token in data", chCorruptGroomingSpec, "backlog_grooming", true},
-		{"syntax-broken with no token at all", chCorruptPlainSpec, "feature_change", false},
-		// The two documented RESIDUALS, pinned as deliberate. Both refuse a
-		// corrupt NON-grooming spec, so both are non-grooming behaviour
-		// changes; both fail CLOSED and reach only storage-corrupted specs.
-		{"syntax-broken residual: token in a trailing comment", chSyntaxBrokenTokenInline, "feature_change", true},
-		{"syntax-broken residual: token in an unrelated scalar", chSyntaxBrokenTokenInProse, "feature_change", true},
-		{"reuse-key residual: any defaults key widens past attribution", chSchemaInvalidReuseKeyOtherWorkflowGrooms, "feature_change", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := specCouldBeGrooming([]byte(tc.spec), tc.workflowID); got != tc.want {
-				t.Errorf("specCouldBeGrooming = %v, want %v", got, tc.want)
-			}
+// (v) LEGACY NULL + a spec that parses but names no such workflow → the same
+// refusal, whatever shape the OTHER workflows have (the earlier narrowing to
+// grooming-shaped documents is gone with the heuristic).
+func TestCharterDetermination_LegacyRow_UnknownWorkflow_Refuses(t *testing.T) {
+	for name, specYAML := range map[string]string{"grooming-shaped document": chGroomingSpec, "plain document": chPlainSpec} {
+		t.Run(name, func(t *testing.T) {
+			installConventions(t, chConventions(chCharterPath), nil)
+			s, runID, stageID, priv, _ := chWiredServerRow(t, specYAML, newCHFetcher(), 0, nil)
+			s.cfg.RunRepo.(*promptRunRepo).getRuns[runID].WorkflowID = "not_declared"
+
+			chAssertReason(t, chRefusal(t, s, runID, stageID, priv), reasonGroomingSpecUnreadable)
 		})
 	}
 }
 
-// TestSpecCouldBeGrooming_ReuseWidensTheSearch: workflow-v2 same-document reuse
-// (`defaults` / `extends`) can hand a workflow a produces block from OUTSIDE
-// its own subtree, so attribution to the subtree alone is unsound there and the
-// search widens to the whole document rather than falling open.
-func TestSpecCouldBeGrooming_ReuseWidensTheSearch(t *testing.T) {
-	const reuseSpec = `version: "2"
-defaults:
-  stage:
-    produces:
-      - artifact: grooming_report
-workflows:
-  feature_change:
-    stages: "not-a-list"
-`
-	if !specCouldBeGrooming([]byte(reuseSpec), "feature_change") {
-		t.Error("a reuse-bearing document whose defaults declare the artifact fell open; inheritance can move it into this workflow")
+// (v-b) Approval condition 1: LEGACY NULL + an EMPTY cached spec on a PLAN
+// stage is undecidable and REFUSED exactly like an unparseable one. There is
+// no fact and there are no bytes; a legacy grooming row whose spec was wiped
+// must not be served an unanchored prompt.
+//
+// COUNTERFACTUAL: restore an `empty spec → (false, nil)` branch ahead of the
+// refusal and this goes RED (a 200 is served).
+func TestCharterDetermination_LegacyRow_EmptySpec_Refuses(t *testing.T) {
+	installConventions(t, chConventions(chCharterPath), nil)
+	s, runID, stageID, priv, _ := chWiredServerRow(t, "", newCHFetcher(), 0, nil)
+	s.cfg.RunRepo.(*promptRunRepo).getRuns[runID].WorkflowSpec = nil
+
+	chAssertReason(t, chRefusal(t, s, runID, stageID, priv), reasonGroomingSpecUnreadable)
+}
+
+// (v-c) The empty-spec refusal is scoped to the LEGACY row: a persisted FALSE
+// row with no cached spec at all (the HaveStageDefs==false mint path stamps
+// false, never NULL) is served unchanged.
+func TestCharterDetermination_PersistedNonGrooming_EmptySpec_Served(t *testing.T) {
+	chServesUnchangedRow(t, "", "", chFalse())
+}
+
+// (vi) LEGACY NULL + a parseable grooming spec → grooming, decided from the
+// cached spec exactly as before: served WITH the charter when it resolves.
+func TestCharterDetermination_LegacyRow_ParseableGroomingSpec_Anchored(t *testing.T) {
+	installConventions(t, chConventions(chCharterPath), nil)
+	s, runID, stageID, priv, _ := chWiredServerRow(t, chGroomingSpec, newCHFetcher(), 0, nil)
+
+	resp := chDecodePrompt(t, s, runID, stageID, priv)
+	if !strings.Contains(resp.Prompt, "### "+charterFraming().Heading) {
+		t.Errorf("a legacy grooming row served a prompt with no charter block:\n%s", resp.Prompt)
+	}
+	// And refused for the charter reason when none is declared.
+	installConventions(t, chConventionsWithoutCharter(), nil)
+	s2, runID2, stageID2, priv2, _ := chWiredServerRow(t, chGroomingSpec, newCHFetcher(), 0, nil)
+	chAssertReason(t, chRefusal(t, s2, runID2, stageID2, priv2), reasonCharterAbsent)
+}
+
+// (vii) LEGACY NULL + a parseable non-grooming spec → served unchanged. This
+// is what falsifies a refusal that widened beyond the undecidable case.
+func TestCharterDetermination_LegacyRow_ParseableOrdinarySpec_Served(t *testing.T) {
+	chServesUnchangedRow(t, chPlainSpec, "", nil)
+}
+
+// (viii) Persisted TRUE on a NON-plan stage → not grooming: the stage-type
+// early return precedes the fact.
+func TestCharterDetermination_NonPlanStage_NeverGrooming(t *testing.T) {
+	calls := installConventions(t, chConventions(chCharterPath), nil)
+	required, err := stageRequiresCharter(
+		&run.Run{ID: uuid.New(), Repo: "o/r", WorkflowID: "backlog_grooming", WorkflowSpec: []byte(chGroomingSpec), RequiresCharter: chTrue()},
+		&run.Stage{Type: run.StageTypeImplement})
+	if err != nil {
+		t.Fatalf("stageRequiresCharter: %v", err)
+	}
+	if required {
+		t.Errorf("an implement stage of a persisted-grooming row was treated as a charter-requiring propose stage")
+	}
+	// And a legacy row with an EMPTY spec on a non-plan stage is NOT refused:
+	// the early return precedes the legacy branch too.
+	required, err = stageRequiresCharter(
+		&run.Run{ID: uuid.New(), Repo: "o/r", WorkflowID: "backlog_grooming"},
+		&run.Stage{Type: run.StageTypeImplement})
+	if err != nil || required {
+		t.Errorf("a non-plan stage on a legacy row reached the legacy branch: required=%v err=%v", required, err)
+	}
+	if *calls != 0 {
+		t.Errorf("the conventions loader was consulted %d times, want 0", *calls)
+	}
+}
+
+// TestCharterDetermination_DirectTable pins stageRequiresCharter one row at a
+// time, so the decision order (stage type → persisted fact → legacy
+// derivation → refusal) is readable without an HTTP fixture.
+func TestCharterDetermination_DirectTable(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		spec       string
+		workflowID string
+		requires   *bool
+		plan       bool
+		want       bool
+		wantRefuse bool
+	}{
+		{"persisted true, corrupt spec", chCorruptGroomingSpec, "backlog_grooming", chTrue(), true, true, false},
+		{"persisted true, token destroyed", chGroomingSpecTokenDestroyed, "backlog_grooming", chTrue(), true, true, false},
+		{"persisted false, corrupt spec with incidental token", chCorruptPlainSpecIncidentalToken, "feature_change", chFalse(), true, false, false},
+		{"persisted false, empty spec", "", "feature_change", chFalse(), true, false, false},
+		{"persisted true, non-plan stage", chGroomingSpec, "backlog_grooming", chTrue(), false, false, false},
+		{"legacy, parseable grooming", chGroomingSpec, "backlog_grooming", nil, true, true, false},
+		{"legacy, parseable plain", chPlainSpec, "feature_change", nil, true, false, false},
+		{"legacy, unparseable", chCorruptGroomingSpec, "backlog_grooming", nil, true, false, true},
+		{"legacy, unparseable plain", chCorruptPlainSpec, "feature_change", nil, true, false, true},
+		{"legacy, unknown workflow", chPlainSpec, "not_declared", nil, true, false, true},
+		{"legacy, empty spec", "", "backlog_grooming", nil, true, false, true},
+		{"legacy, empty spec, non-plan stage", "", "backlog_grooming", nil, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stageType := run.StageTypeImplement
+			if tc.plan {
+				stageType = run.StageTypePlan
+			}
+			row := &run.Run{ID: uuid.New(), Repo: "o/r", WorkflowID: tc.workflowID, RequiresCharter: tc.requires}
+			if tc.spec != "" {
+				row.WorkflowSpec = []byte(tc.spec)
+			}
+			got, err := stageRequiresCharter(row, &run.Stage{Type: stageType})
+			if tc.wantRefuse {
+				var ce *charterInjectionError
+				if !errors.As(err, &ce) || ce.Reason != reasonGroomingSpecUnreadable {
+					t.Fatalf("err = %v, want a %s refusal", err, reasonGroomingSpecUnreadable)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected refusal: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("stageRequiresCharter = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1351,9 +1410,9 @@ func TestGroomingPrompt_RefusalsCarryNoReportContract(t *testing.T) {
 			})
 			return s, runID, stageID, priv
 		}, reasonCharterNotInjected},
-		{"M8a unparseable grooming spec", func(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+		{"legacy row, unparseable spec", func(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
 			installConventions(t, chConventions(chCharterPath), nil)
-			s, runID, stageID, priv, _ := chWiredServer(t, chCorruptGroomingSpec, newCHFetcher(), 0)
+			s, runID, stageID, priv, _ := chWiredServerRow(t, chCorruptGroomingSpec, newCHFetcher(), 0, nil)
 			return s, runID, stageID, priv
 		}, reasonGroomingSpecUnreadable},
 	}
@@ -1536,7 +1595,7 @@ func TestGroomingPromptRender_PreviewRefusals(t *testing.T) {
 			reason: reasonGroomingSpecUnreadable,
 			build: func(t *testing.T) (*Server, uuid.UUID) {
 				installConventions(t, chConventions(chCharterPath), nil)
-				s, _, stageID, _, _ := chWiredServer(t, chCorruptGroomingSpec, newCHFetcher(), 0)
+				s, _, stageID, _, _ := chWiredServerRow(t, chCorruptGroomingSpec, newCHFetcher(), 0, nil)
 				return s, stageID
 			},
 		},

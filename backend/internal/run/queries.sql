@@ -7,8 +7,12 @@
 -- (migration 0076). Nullable by design: a caller with no ref passes NULL and
 -- the consumer falls back to installation_id, which is a DIFFERENT state from
 -- a recorded-but-empty string.
-INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, installation_ref, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, drive, slice_index, upstream_run_id, working_dir)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+-- requires_charter is the persisted grooming determination (migration 0082,
+-- E54.13 / #2806). Tri-state: TRUE / FALSE are a recorded determination, NULL
+-- is "no persisted determination" and is passed through verbatim — the repo
+-- layer never promotes it to FALSE.
+INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, installation_ref, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, drive, slice_index, upstream_run_id, working_dir, requires_charter)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 RETURNING *;
 
 -- name: GetRun :one
