@@ -790,11 +790,14 @@ than extracted from `buildPlan` because the wording genuinely differs
 (grooming_report_v1 vs standard_v1, backlog-window vs scope framing) and
 extraction risks perturbing `buildPlan`'s golden-pinned bytes.
 
-**Preview divergence residual (#2804).** The unsigned preview handler
-(`handleGetStagePromptRender`) injects no documents at all, so it sets NO grooming
-context and renders a groom stage as an ordinary plan. Widening the preview to
-resolve documents (and then fork) is #2804's, not this slice's; the preview stays
-byte-identical to today.
+**Preview convergence (E54.12 / #2804).** The unsigned preview handler
+(`handleGetStagePromptRender`) now resolves documents and sets `trigger.Grooming` from
+the SAME `assertCharterInjected` determination the signed handler uses, so
+`buildGroomingPropose` is reached from both handlers and there is still exactly ONE
+grooming determination per rendered prompt. A preview and a served prompt for the same
+stage are byte-identical. The two handlers differ only in that the preview writes no
+`document_injected` / `document_truncated` attribution — a fact about the audit log, not
+about the rendered bytes.
 
 ## Live-validation markers in the review prompt (#2978)
 

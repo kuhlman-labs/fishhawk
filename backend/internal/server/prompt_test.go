@@ -12640,3 +12640,121 @@ func TestResolveFixupExpectedHeadSHA_UnaffectedByIntegrationEntry(t *testing.T) 
 		t.Errorf("resolveAcceptanceExpectedHeadSHA = %q, want %q (fixture sanity)", got, merge)
 	}
 }
+
+// TestPromptRender_NonGrooming_ByteIdenticalWithInertSeam is E54.12 / #2804's
+// criterion 4 (operator condition 4): with NO document seam wired — the
+// production default today — a non-grooming preview renders exactly what
+// prompt.Build renders with an EMPTY injected set and NO grooming context. The
+// convergence added an inert path, not a rendering change.
+//
+// The golden is CAPTURED FROM prompt.Build, not hand-written: the test
+// constructs the trigger the handler builds for this fixture and calls
+// prompt.Build itself, so a rendering change on either side is caught rather
+// than baked into a literal that the next copy-edit silently invalidates.
+// InjectedDocuments and Grooming are left at their zero values on the golden —
+// the two fields the preview handler now populates — so any non-inert
+// contribution from them fails this test.
+func TestPromptRender_NonGrooming_ByteIdenticalWithInertSeam(t *testing.T) {
+	for _, stageType := range []run.StageType{run.StageTypePlan, run.StageTypeImplement} {
+		t.Run(string(stageType), func(t *testing.T) {
+			s, rr, _, _ := newPromptServer(t)
+			// No DocumentDeclarations, no DocumentResolver: the inert seam.
+			if s.cfg.DocumentDeclarations != nil || s.cfg.DocumentResolver != nil {
+				t.Fatal("fixture is not the inert-seam deployment")
+			}
+			runID, stageID := uuid.New(), uuid.New()
+			rr.getRuns[runID] = &run.Run{
+				ID: runID, Repo: "o/r", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI,
+			}
+			rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: stageType}
+			rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {rr.getStages[stageID]}}
+
+			w := promptRenderRequest(t, s, stageID)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v\n%s", err, w.Body.String())
+			}
+
+			golden := prompt.Trigger{
+				Source:                string(run.TriggerCLI),
+				Repo:                  "o/r",
+				PlanStageTimeout:      15 * time.Minute,
+				ImplementStageTimeout: 15 * time.Minute,
+				// InjectedDocuments and Grooming stay at their zero values:
+				// this IS the empty-injected-set golden.
+			}
+			if stageType == run.StageTypeImplement {
+				golden.ImplementRunID = runID.String()
+				golden.ImplementStageID = stageID.String()
+			} else {
+				golden.SurfaceCouplingPatterns = surfaceCouplingPatternsForPrompt()
+			}
+			want, err := prompt.Build(string(stageType), golden)
+			if err != nil {
+				t.Fatalf("prompt.Build golden: %v", err)
+			}
+			if resp.Prompt != want {
+				t.Errorf("inert-seam %s preview diverges from the empty-injected-set prompt.Build golden "+
+					"(got %d bytes, want %d)\n--- got ---\n%s\n--- want ---\n%s",
+					stageType, len(resp.Prompt), len(want), resp.Prompt, want)
+			}
+		})
+	}
+}
+
+// TestPromptBuildError_Mapping is the direct unit on writePromptBuildError, the
+// ONE prompt.Build error mapping both prompt handlers now share (E54.12 /
+// #2804). Extracting it is what makes the ErrCharterNotInjected branch testable
+// at all: through either handler it is UNREACHABLE (assertCharterInjected
+// refuses on the same condition first), and before the extraction it existed as
+// two unreachable copies with only one of them carrying the charter branch.
+//
+// Counterfactual: delete the ErrCharterNotInjected branch and the middle row
+// goes RED — it falls through to 500 internal_error with no reason.
+func TestPromptBuildError_Mapping(t *testing.T) {
+	rows := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+		wantReason string
+	}{
+		{"unsupported stage", prompt.ErrUnsupportedStage, http.StatusNotImplemented, "unsupported_stage_type", ""},
+		{"charter not injected", prompt.ErrCharterNotInjected, http.StatusInternalServerError,
+			"document_injection_failed", reasonCharterNotInjected},
+		{"anything else", errors.New("boom"), http.StatusInternalServerError, "internal_error", ""},
+	}
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Config{Addr: "127.0.0.1:0"})
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodGet, "/v0/stages/x/prompt", nil)
+			s.writePromptBuildError(w, r, "plan", fmt.Errorf("wrapped: %w", tc.err))
+
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d:\n%s", w.Code, tc.wantStatus, w.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v\n%s", err, w.Body.String())
+			}
+			env, _ := body["error"].(map[string]any)
+			if env == nil {
+				t.Fatalf("no error envelope: %s", w.Body.String())
+			}
+			if code, _ := env["code"].(string); code != tc.wantCode {
+				t.Errorf("error.code = %q, want %q\n%s", code, tc.wantCode, w.Body.String())
+			}
+			reason := ""
+			if details, ok := env["details"].(map[string]any); ok {
+				reason, _ = details["reason"].(string)
+			}
+			if reason != tc.wantReason {
+				t.Errorf("error.details.reason = %q, want %q\n%s", reason, tc.wantReason, w.Body.String())
+			}
+		})
+	}
+}

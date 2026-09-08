@@ -182,13 +182,18 @@ Selecting one forge is therefore not the control. The control is
 review-conventions consumer inherits this hazard unchanged — it is a property of the
 identifier, not of the charter.
 
-### Preview divergence (#2804)
+### Preview convergence (E54.12 / #2804)
 
-`GET /v0/stages/{id}/prompt-render` — the unsigned preview surface — does not
-resolve or inject documents at all, and no consumer's fail-closed refusal runs
-there. So a preview and a served prompt for the same stage can differ in
-exactly the injected-document block and in whether the request is refused.
-Tracked as **#2804**; widening the preview is that issue's, not a consumer's.
+`GET /v0/stages/{id}/prompt-render` — the unsigned preview surface — now
+resolves and injects documents through the SAME resolve/render core as the
+signed `/prompt` path (`server.resolveDeclaredDocuments`), and every consumer's
+fail-closed refusal runs there too. A preview and a served prompt for the same
+stage therefore carry identical bytes and refuse identically.
+
+The one divergence is ATTRIBUTION, and it is deliberate: the preview wrapper
+passes `attribute=false`, so `Attribute` is never called and no
+`document_injected` / `document_truncated` entry is written. See the
+attribution-domain note below.
 
 ## Content-hash byte domain
 
@@ -200,6 +205,14 @@ and that question must have the same answer whether or not the document
 happened to exceed the cap or to contain a forged delimiter line. What was
 actually **shown** is described by the sibling fields — `OriginalBytes`,
 `RenderedBytes`, `DroppedBytes`, `CapBytes`, `Truncated` — not by the hash.
+
+**The claim is scoped to a SERVE, not to a render.** `Attribute` is called only
+on the SIGNED `/prompt` path; the `/prompt-render` preview resolves and renders
+the identical bytes but writes nothing (E54.12 / #2804). So the audit log
+answers *"which revision constrained the run"* and NEVER *"which revision an
+operator previewed"* — a preview leaves no trace, by design and as a stated
+residual, because a preview constrains no agent and an unsigned read-access GET
+must not append claims to an append-only log.
 
 `RenderedBytes` is the **actually-shown** domain and is therefore measured
 POST-truncation and POST-neutralization: `Resolve` neutralizes forged delimiter

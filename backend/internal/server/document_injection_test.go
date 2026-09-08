@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -619,5 +622,310 @@ func TestResolveInjectedDocuments_ScopeResolutionError_FailsClosed(t *testing.T)
 	}
 	if len(ff.refs) != 0 {
 		t.Errorf("fetched %v despite an unresolvable credential scope", ff.refs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// E54.12 / #2804: preview convergence, and the ONE ratified divergence.
+// ---------------------------------------------------------------------------
+
+// countInjectionAudit returns how many document_injected / document_truncated
+// entries the fake audit repo holds for runID. The suppressed-attribution
+// control's effect is COMMITTED STATE — a write that never happens returns no
+// distinguishable error — so the paired tests below read the repository AFTER
+// the call returns rather than inspecting an error value.
+func countInjectionAudit(ar *storingAuditRepo, runID uuid.UUID) (injected, truncated int) {
+	for _, e := range ar.byRunID[runID] {
+		switch e.Category {
+		case "document_injected":
+			injected++
+		case "document_truncated":
+			truncated++
+		}
+	}
+	return injected, truncated
+}
+
+// TestPreviewInjectedDocuments_WritesNoAttribution is the RATIFIED divergence
+// (operator condition 1): the preview resolves and renders the declared
+// documents but writes NO attribution, because a document_injected entry claims
+// a document constrained an agent and a preview constrains none.
+//
+// Counterfactual: flip previewInjectedDocuments to attribute=true and this goes
+// RED on the committed audit state.
+func TestPreviewInjectedDocuments_WritesNoAttribution(t *testing.T) {
+	ar := newStoringAuditRepo()
+	s, runID, stageID, _ := newInjectionServer(t, ar,
+		&repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}}, injDeclarations)
+
+	runRow := &run.Run{ID: runID, Repo: "o/r"}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	docs, err := s.previewInjectedDocuments(context.Background(), runRow, stage)
+	if err != nil {
+		t.Fatalf("previewInjectedDocuments: %v", err)
+	}
+	// The document IS resolved and rendered — suppression is attribution-only.
+	if len(docs) != 1 {
+		t.Fatalf("resolved %d documents, want 1", len(docs))
+	}
+	if !strings.Contains(docs[0].Body, injBaseContent) {
+		t.Errorf("preview document does not carry the base-ref content %q", injBaseContent)
+	}
+
+	injected, truncated := countInjectionAudit(ar, runID)
+	if injected != 0 || truncated != 0 {
+		t.Errorf("preview wrote %d document_injected and %d document_truncated entries, want 0 and 0 — "+
+			"a read-access preview must not append injection claims", injected, truncated)
+	}
+}
+
+// TestPreviewEndpoint_WritesNoAttribution is the HTTP half: driving the real
+// /prompt-render endpoint end to end leaves the audit log empty of injection
+// claims, so the suppression holds through the handler and not only at the seam.
+func TestPreviewEndpoint_WritesNoAttribution(t *testing.T) {
+	ar := newStoringAuditRepo()
+	s, runID, stageID, _ := newInjectionServer(t, ar,
+		&repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}}, injDeclarations)
+
+	w := promptRenderRequest(t, s, stageID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(resp.Prompt, injBaseContent) {
+		t.Errorf("preview prompt does not carry the injected base-ref content %q", injBaseContent)
+	}
+	if injected, truncated := countInjectionAudit(ar, runID); injected != 0 || truncated != 0 {
+		t.Errorf("the /prompt-render endpoint wrote %d document_injected and %d document_truncated entries, want 0 and 0",
+			injected, truncated)
+	}
+}
+
+// TestResolveInjectedDocuments_StillAttributes is the paired assertion
+// (operator condition 1): the SERVED wrapper still writes exactly ONE
+// document_injected entry per document, so splitting the core did not silently
+// disarm the attributing path.
+//
+// Counterfactual: flip resolveInjectedDocuments to attribute=false and this
+// goes RED.
+func TestResolveInjectedDocuments_StillAttributes(t *testing.T) {
+	ar := newStoringAuditRepo()
+	s, runID, stageID, _ := newInjectionServer(t, ar,
+		&repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}}, injDeclarations)
+
+	docs, err := s.resolveInjectedDocuments(context.Background(),
+		&run.Run{ID: runID, Repo: "o/r"},
+		&run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement})
+	if err != nil {
+		t.Fatalf("resolveInjectedDocuments: %v", err)
+	}
+	injected, _ := countInjectionAudit(ar, runID)
+	if injected != len(docs) || injected != 1 {
+		t.Errorf("served wrapper wrote %d document_injected entries for %d documents, want exactly 1 per document",
+			injected, len(docs))
+	}
+}
+
+// injErrorLogDetails returns the `details` map of the LAST "http error response"
+// record in a captured JSON log stream. writeError redacts every non-allow-listed
+// key out of a 5xx BODY (#2587) and puts the FULL pre-redaction details in that
+// one log record, so this is the only place a branch-identifying cause — or a
+// *repodoc.ResolveError's path / declaration_site — is observable from outside
+// the handler. It is also what makes the assertion a PROPAGATION assertion: the
+// identifiers are read where the handler put them, not off the wrapper's error.
+func injErrorLogDetails(t *testing.T, logged string) map[string]any {
+	t.Helper()
+	var details map[string]any
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(logged), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue // not a JSON record (should not happen with a JSON handler)
+		}
+		if rec["msg"] != "http error response" {
+			continue
+		}
+		found = true
+		details, _ = rec["details"].(map[string]any)
+	}
+	if !found {
+		t.Fatalf("no \"http error response\" log record was emitted:\n%s", logged)
+	}
+	if details == nil {
+		t.Fatalf("the \"http error response\" record carries no details attribute:\n%s", logged)
+	}
+	return details
+}
+
+// TestPromptRender_DocumentInjection_FailClosedModes re-drives #2242's named
+// fail-closed modes through the PREVIEW endpoint, so each has a preview twin of
+// the served-path assertion above it. Every row asserts BOTH the status AND the
+// error code, so a preview failing for an unrelated reason cannot green it.
+//
+// STATUS + CODE ALONE DO NOT DISCRIMINATE THE BRANCH. All three refusal rows
+// below produce the SAME 500 document_injection_failed, so an unrelated
+// injection failure (or one row's failure mode silently taking another's path)
+// satisfies them. Each refusal row therefore also names branch-specific
+// observable evidence — wantCause, a substring unique to that branch's error,
+// and for the *repodoc.ResolveError row wantLoggedDetails, the identifiers only
+// that error type produces. Both are read out of the un-redacted
+// "http error response" log record, which is what establishes that the details
+// PROPAGATE through the handler rather than merely being produced by the
+// wrapper (TestPromptEndpoints_ResolveErrorDetails_Agree covers the wrapper).
+func TestPromptRender_DocumentInjection_FailClosedModes(t *testing.T) {
+	missingAtPinned := func() *injFetcher {
+		ff := newInjFetcher()
+		delete(ff.byRef, injPinnedCommit) // declared but absent at the pinned commit
+		return ff
+	}
+	emptyDecls := func(context.Context, *run.Run, *run.Stage) ([]repodoc.Declaration, string, error) {
+		return nil, injBaseBranch, nil
+	}
+	seamErr := func(context.Context, *run.Run, *run.Stage) ([]repodoc.Declaration, string, error) {
+		return nil, "", errors.New("declaration seam unavailable")
+	}
+
+	rows := []struct {
+		name     string
+		resolver *repodoc.Resolver
+		decls    func(context.Context, *run.Run, *run.Stage) ([]repodoc.Declaration, string, error)
+		wantCode int
+		wantErr  string
+		// wantCause is a substring UNIQUE to this row's failure branch, asserted
+		// on the logged (un-redacted) details.error. Required on every refusal
+		// row: without it the row is satisfied by any other injection failure.
+		wantCause string
+		// wantNotCause is a substring that must be ABSENT — a sibling branch's
+		// identifying wording, so a row cannot be greened by the wrong control
+		// firing.
+		wantNotCause string
+		// wantLoggedDetails are exact logged detail values required on this row.
+		// Only a *repodoc.ResolveError produces path / declaration_site, so this
+		// both discriminates M3's branch and pins that those identifiers reach
+		// the operator log through the handler.
+		wantLoggedDetails map[string]string
+	}{
+		// M1: declarations wired, resolver nil — a wiring defect, not an inert state.
+		{name: "misconfigured seam", decls: injDeclarations,
+			wantCode: http.StatusInternalServerError, wantErr: "document_injection_failed",
+			wantCause:    "DocumentDeclarations is configured but DocumentResolver is nil",
+			wantNotCause: "resolve document declarations"},
+		// M2: the declaration seam itself fails.
+		{name: "declaration seam error",
+			resolver: &repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}},
+			decls:    seamErr,
+			wantCode: http.StatusInternalServerError, wantErr: "document_injection_failed",
+			wantCause:    "resolve document declarations: declaration seam unavailable",
+			wantNotCause: "DocumentResolver is nil"},
+		// M3: declared-but-absent document at the pinned commit. Its cause is a
+		// *repodoc.ResolveError, so it is the one row carrying path /
+		// declaration_site identifiers.
+		{name: "resolution failure",
+			resolver: &repodoc.Resolver{Fetcher: missingAtPinned(), Commits: &injCommits{sha: injPinnedCommit}},
+			decls:    injDeclarations,
+			wantCode: http.StatusInternalServerError, wantErr: "document_injection_failed",
+			wantCause:         "repodoc: declared document not found",
+			wantNotCause:      "resolve document declarations:",
+			wantLoggedDetails: map[string]string{"path": injPath, "declaration_site": injDeclSite}},
+		// M9: a configured seam declaring nothing injects nothing and serves 200.
+		{name: "empty declaration list",
+			resolver: &repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}},
+			decls:    emptyDecls, wantCode: http.StatusOK},
+		// M10: fully inert — no declaration seam at all.
+		{name: "inert seam",
+			resolver: &repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}},
+			wantCode: http.StatusOK},
+	}
+
+	for _, tc := range rows {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, stageID, _ := newInjectionServer(t, newStoringAuditRepo(), tc.resolver, tc.decls)
+			// Capture the server's error log: the 5xx body is redacted down to
+			// the allow-listed keys, so the branch-identifying cause and the
+			// ResolveError identifiers are observable ONLY here.
+			var logBuf bytes.Buffer
+			s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+			w := promptRenderRequest(t, s, stageID)
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d:\n%s", w.Code, tc.wantCode, w.Body.String())
+			}
+			if tc.wantErr != "" {
+				if !strings.Contains(w.Body.String(), tc.wantErr) {
+					t.Errorf("error body missing %q:\n%s", tc.wantErr, w.Body.String())
+				}
+				if strings.Contains(w.Body.String(), injBaseContent) || strings.Contains(w.Body.String(), injSoftContent) {
+					t.Errorf("a refused preview still served document content:\n%s", w.Body.String())
+				}
+
+				// Branch discrimination. status + code are identical across all
+				// three refusal rows, so the assertion that identifies WHICH
+				// control refused is made on the logged cause.
+				if tc.wantCause == "" {
+					t.Fatalf("row declares no wantCause — a refusal row must name its own branch")
+				}
+				details := injErrorLogDetails(t, logBuf.String())
+				cause, _ := details["error"].(string)
+				if !strings.Contains(cause, tc.wantCause) {
+					t.Errorf("logged details.error = %q, want it to contain %q — a DIFFERENT injection failure refused",
+						cause, tc.wantCause)
+				}
+				if tc.wantNotCause != "" && strings.Contains(cause, tc.wantNotCause) {
+					t.Errorf("logged details.error = %q carries a sibling branch's wording %q",
+						cause, tc.wantNotCause)
+				}
+				for k, want := range tc.wantLoggedDetails {
+					if got, _ := details[k].(string); got != want {
+						t.Errorf("logged details[%q] = %q, want %q — the ResolveError identifiers did not "+
+							"propagate through the handler into the log record", k, got, want)
+					}
+				}
+				return
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v\n%s", err, w.Body.String())
+			}
+			if strings.Contains(resp.Prompt, "### "+injFraming().Heading) {
+				t.Errorf("preview carries an injected block with nothing declared:\n%s", resp.Prompt)
+			}
+		})
+	}
+}
+
+// TestPromptEndpoints_ResolveErrorDetails_Agree is the M3 half of refusal parity
+// (operator condition 3): a *repodoc.ResolveError must carry the SAME
+// details.path and details.declaration_site on both endpoints. The 5xx redactor
+// (#2587) keeps both keys out of the client body and puts them in the log
+// record, so the comparison is made at that seam — on the two wrappers' errors,
+// which is where the identifiers are produced.
+func TestPromptEndpoints_ResolveErrorDetails_Agree(t *testing.T) {
+	ff := newInjFetcher()
+	delete(ff.byRef, injPinnedCommit)
+	s, runID, stageID, _ := newInjectionServer(t, newStoringAuditRepo(),
+		&repodoc.Resolver{Fetcher: ff, Commits: &injCommits{sha: injPinnedCommit}}, injDeclarations)
+
+	runRow := &run.Run{ID: runID, Repo: "o/r"}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+
+	_, servedErr := s.resolveInjectedDocuments(context.Background(), runRow, stage)
+	_, previewErr := s.previewInjectedDocuments(context.Background(), runRow, stage)
+	if servedErr == nil || previewErr == nil {
+		t.Fatalf("served err = %v, preview err = %v; want both to refuse", servedErr, previewErr)
+	}
+
+	served := documentInjectionErrorDetails(servedErr)
+	preview := documentInjectionErrorDetails(previewErr)
+	if !reflect.DeepEqual(served, preview) {
+		t.Fatalf("resolve-failure details diverge:\n served  = %v\n preview = %v", served, preview)
+	}
+	if served["path"] != injPath || served["declaration_site"] != injDeclSite {
+		t.Errorf("details = %v, want path=%q declaration_site=%q", served, injPath, injDeclSite)
 	}
 }
