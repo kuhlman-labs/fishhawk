@@ -162,6 +162,16 @@ import "sort"
 // within_budget. It is written on EVERY one of those branches — including the
 // two that let the approval proceed — and is INTERNAL, audit-only: it renders
 // no issue comment and gates nothing.
+// E64.62 / #3202 added the conflict-resolution pair written by
+// backend/internal/server/conflictresolution.go —
+// stage_conflict_resolution_triggered (the operator-authorized agent pass that
+// resolves a conflicting base merge ON the run branch, carrying its OWN
+// ceiling-1 counter that is never the fix-up budget) and
+// stage_conflict_resolution_failed (the pass refused or errored; the reader
+// treats the trigger as CONSUMED, so the next rebase invocation is the
+// fail-closed 422). They are deliberately distinct from the stage_fixup_*
+// pair: conflating them would spend fix-up budget on a merge assist and make
+// "consumes no fix-up budget" unassertable.
 // When a new
 // canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
@@ -345,6 +355,8 @@ var KnownCategories = map[string]struct{}{
 	"split_parent_closed":                     {},
 	"spend_alert":                             {},
 	"stage_budget_exceeded":                   {},
+	"stage_conflict_resolution_failed":        {},
+	"stage_conflict_resolution_triggered":     {},
 	"stage_fixup_recovered":                   {},
 	"stage_fixup_triggered":                   {},
 	"stage_override_retried":                  {},

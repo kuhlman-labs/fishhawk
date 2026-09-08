@@ -12776,3 +12776,111 @@ func TestPromptBuildError_Mapping(t *testing.T) {
 		})
 	}
 }
+
+// TestGetStagePrompt_Implement_ConflictResolutionFieldsServed is the
+// cross-boundary assertion for the E64.62 / #3202 conflict-resolution pass: a
+// seeded stage_conflict_resolution_triggered audit entry must surface on the
+// GET /v0/stages/{id}/prompt response as the four conflict_resolution* wire
+// fields the runner decodes.
+//
+// It asserts on the RAW JSON field NAMES as well as the decoded struct, because
+// the backend and the runner are separate Go modules that agree only by tag: a
+// tag drift would leave this green on the struct alone while silently routing
+// the runner down the ordinary implement path on a repository sitting mid-merge.
+func TestGetStagePrompt_Implement_ConflictResolutionFieldsServed(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+
+	runID := uuid.New()
+	implStageID := uuid.New()
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	const head = "0123456789abcdef0123456789abcdef01234567"
+	branch := fmt.Sprintf("fishhawk/run-%s/stage-%s", runID.String()[:8], implStageID.String()[:8])
+	auditByRun := map[uuid.UUID][]*audit.Entry{
+		runID: {makeConflictResolutionEntry(runID, implStageID, conflictTriggerFields(branch, "main", head))},
+	}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		RunRepo:     rr,
+		SigningRepo: sf,
+		AuditRepo:   &feedbackAuditRepo{byRunID: auditByRun},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.ConflictResolution {
+		t.Error("conflict_resolution = false, want true for a stage with a trigger entry")
+	}
+	if resp.ConflictResolutionBranch != branch {
+		t.Errorf("conflict_resolution_branch = %q, want %q", resp.ConflictResolutionBranch, branch)
+	}
+	if resp.ConflictResolutionBaseRef != "main" {
+		t.Errorf("conflict_resolution_base_ref = %q, want main", resp.ConflictResolutionBaseRef)
+	}
+	if resp.ConflictResolutionExpectedHeadSHA != head {
+		t.Errorf("conflict_resolution_expected_head_sha = %q, want %q", resp.ConflictResolutionExpectedHeadSHA, head)
+	}
+	// A conflict-resolution pass is NOT a fix-up: conflating the two would
+	// spend fix-up budget on a merge assist.
+	if resp.Fixup {
+		t.Error("fixup = true on a conflict-resolution dispatch; the two must never both be set")
+	}
+	for _, key := range []string{
+		`"conflict_resolution":true`,
+		`"conflict_resolution_branch":`,
+		`"conflict_resolution_base_ref":"main"`,
+		`"conflict_resolution_expected_head_sha":"` + head + `"`,
+	} {
+		if !strings.Contains(w.Body.String(), key) {
+			t.Errorf("response body missing wire key %s:\n%s", key, w.Body.String())
+		}
+	}
+}
+
+// TestGetStagePrompt_Implement_ConflictResolutionOmittedWithoutTrigger pins the
+// inert default: an ordinary implement dispatch omits all four fields, so the
+// runner's routing branch is a no-op and the response is byte-identical to what
+// it was before #3202.
+func TestGetStagePrompt_Implement_ConflictResolutionOmittedWithoutTrigger(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+
+	runID := uuid.New()
+	implStageID := uuid.New()
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		RunRepo:     rr,
+		SigningRepo: sf,
+		AuditRepo:   &feedbackAuditRepo{},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "conflict_resolution") {
+		t.Errorf("ordinary implement dispatch leaked a conflict_resolution field:\n%s", w.Body.String())
+	}
+}

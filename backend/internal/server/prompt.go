@@ -171,6 +171,41 @@ type promptResponse struct {
 	// down the unchanged agent fix-up path. Omitted on a normal implement
 	// dispatch and on a non-eligible fix-up — byte-identical to today.
 	FixupApplyPatches []fixupApplyPatch `json:"fixup_apply_patches,omitempty"`
+	// ConflictResolution is true when this implement stage is an
+	// operator-authorized conflict-resolution pass (E64.62 / #3202): an
+	// unconsumed stage_conflict_resolution_triggered audit entry authorized the
+	// agent to resolve a CONFLICTING base merge on the run branch, so the
+	// operator never pushes to a branch ADR-035 declares runner-owned. The
+	// runner takes its local-merge + confinement-gate path instead of the
+	// ordinary implement path, and never opens a PR.
+	//
+	// It is DISTINCT from Fixup and the two are never both true: a fix-up
+	// re-runs the implement agent against review concerns, a
+	// conflict-resolution pass only picks sides inside conflicted hunks.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the four `conflict_resolution*` json tags MUST
+	// stay byte-identical to the runner's upload.FetchedPrompt decoder
+	// (runner/internal/upload/upload.go). The wirecontract prompt_response Pair
+	// is ModeSubset with the runner as CONSUMER, so a field on one side alone
+	// fails TestCrossModuleWireParity — which is why both sides land together.
+	// A tag drift here silently routes the runner down the ORDINARY implement
+	// path on a repository sitting mid-merge.
+	ConflictResolution bool `json:"conflict_resolution,omitempty"`
+	// ConflictResolutionBranch is the run branch the merge lands on. Non-empty
+	// only when ConflictResolution is true. Served from the trigger payload, not
+	// re-derived, so the pass targets exactly what the trigger authorized.
+	ConflictResolutionBranch string `json:"conflict_resolution_branch,omitempty"`
+	// ConflictResolutionBaseRef is the base BRANCH name the run branch merges
+	// FROM. The runner qualifies it with its own remote — the backend does not
+	// assume the runner's remote name.
+	ConflictResolutionBaseRef string `json:"conflict_resolution_base_ref,omitempty"`
+	// ConflictResolutionExpectedHeadSHA is the run's recorded head at trigger
+	// time (the same ADR-035 lineage source FixupExpectedHeadSHA resolves from).
+	// The runner refuses the pass when the checked-out tip is not this commit,
+	// so a base that advanced under the pass cannot be merged unnoticed. Empty
+	// when the trigger recorded none — the runner then skips the comparison
+	// rather than blocking the pass, mirroring FixupExpectedHeadSHA.
+	ConflictResolutionExpectedHeadSHA string `json:"conflict_resolution_expected_head_sha,omitempty"`
 	// ScopeExemptions is the operator's exempt_scope_files list (#1229) echoed
 	// on a recovery run's implement stage so the runner's #1151 MissingScopeFiles
 	// shortfall gate subtracts each operator-justified-unchanged declared path —
@@ -1022,7 +1057,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	var fixupBranch string
 	var fixupExpectedHeadSHA string
 	var fixupApplyPatches []fixupApplyPatch
+	// Conflict-resolution pass (E64.62 / #3202): resolved from the stage's
+	// newest stage_conflict_resolution_triggered audit entry, exactly as the
+	// fix-up fields are resolved from stage_fixup_triggered. Absent on every
+	// ordinary implement dispatch, which leaves the four wire fields omitted and
+	// the response byte-identical to today.
+	var conflictResolution conflictResolutionTrigger
+	var conflictResolutionServed bool
 	if stage.Type == run.StageTypeImplement {
+		conflictResolution, conflictResolutionServed = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
 		// Run/stage ids for the implement prompt's scope self-exempt sidecar
 		// path (#1153). Populated only on the implement path; plan/review
 		// triggers leave them empty so buildImplement omits the section.
@@ -1397,6 +1440,12 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		FixupBranch:          fixupBranch,
 		FixupExpectedHeadSHA: fixupExpectedHeadSHA,
 		FixupApplyPatches:    fixupApplyPatches,
+	}
+	if conflictResolutionServed {
+		resp.ConflictResolution = true
+		resp.ConflictResolutionBranch = conflictResolution.Branch
+		resp.ConflictResolutionBaseRef = conflictResolution.BaseRef
+		resp.ConflictResolutionExpectedHeadSHA = conflictResolution.ExpectedHeadSHA
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()

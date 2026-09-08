@@ -3285,3 +3285,69 @@ func TestShrinkParkBodyFields_Ladder(t *testing.T) {
 		t.Errorf("the exhausted ladder must have dropped the PR text: %+v", over)
 	}
 }
+
+// TestFetchPrompt_DecodesConflictResolution confirms the client decodes the
+// backend's four conflict_resolution* response fields (E64.62 / #3202). The
+// literal json field NAMES here are the backend's, deliberately: the runner and
+// the backend are separate Go modules that agree only by tag, so a tag drift on
+// either side would silently route the runner down the ORDINARY implement path
+// on a repository sitting mid-merge.
+func TestFetchPrompt_DecodesConflictResolution(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"conflict_resolution": true,
+		"conflict_resolution_branch": "fishhawk/run-1a5c4201/stage-4ecee120",
+		"conflict_resolution_base_ref": "main",
+		"conflict_resolution_expected_head_sha": "0123456789abcdef0123456789abcdef01234567"
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if !got.ConflictResolution {
+		t.Error("ConflictResolution = false, want true")
+	}
+	if got.ConflictResolutionBranch != "fishhawk/run-1a5c4201/stage-4ecee120" {
+		t.Errorf("ConflictResolutionBranch = %q", got.ConflictResolutionBranch)
+	}
+	if got.ConflictResolutionBaseRef != "main" {
+		t.Errorf("ConflictResolutionBaseRef = %q, want main", got.ConflictResolutionBaseRef)
+	}
+	if got.ConflictResolutionExpectedHeadSHA != "0123456789abcdef0123456789abcdef01234567" {
+		t.Errorf("ConflictResolutionExpectedHeadSHA = %q", got.ConflictResolutionExpectedHeadSHA)
+	}
+}
+
+// TestFetchPrompt_ConflictResolutionOmittedWhenAbsent confirms the ordinary
+// implement dispatch decodes to the inert zero value, which is what keeps the
+// runner's routing branch a no-op on every run that is not a conflict-resolution
+// pass.
+func TestFetchPrompt_ConflictResolutionOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.ConflictResolution || got.ConflictResolutionBranch != "" ||
+		got.ConflictResolutionBaseRef != "" || got.ConflictResolutionExpectedHeadSHA != "" {
+		t.Errorf("conflict-resolution fields = %v/%q/%q/%q, want all zero when absent",
+			got.ConflictResolution, got.ConflictResolutionBranch,
+			got.ConflictResolutionBaseRef, got.ConflictResolutionExpectedHeadSHA)
+	}
+}

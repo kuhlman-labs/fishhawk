@@ -27188,3 +27188,92 @@ func TestLoadAgentAuthoredPR_OversizeLegacyUnremovable(t *testing.T) {
 		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
 	}
 }
+
+// TestRun_ConflictResolution_RoutesToThePassAndCommits drives run() end to end
+// over a REAL conflicting repository with the four conflict_resolution* prompt
+// fields set (E64.62 / #3202), and asserts the routing branch took the
+// conflict-resolution path rather than the ordinary implement path: the merge
+// stopped, the gate passed, and a merge commit landed with both parents.
+//
+// It is the cross-boundary integration assertion this slice owes — the backend
+// HTTP payload's field names, the runner's decoder, and the runner's git
+// execution are three separate layers that agree only by wire tag.
+func TestRun_ConflictResolution_RoutesToThePassAndCommits(t *testing.T) {
+	r := newConflictRepo(t, "file.txt")
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, inv agent.Invocation) {
+			resolveConflictedFile(t, inv.WorkingDir, r.conflictPath)
+		},
+	})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:                           "22222222-3333-4444-5555-666666666666",
+		StageType:                         "implement",
+		Prompt:                            "Resolve the conflict; edit the working tree only.",
+		PromptHash:                        "deadbeef",
+		ConflictResolution:                true,
+		ConflictResolutionBranch:          "work",
+		ConflictResolutionBaseRef:         "base",
+		ConflictResolutionExpectedHeadSHA: r.preTip,
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--working-dir", r.dir,
+		"--fetch-prompt",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"conflict_resolution_committed"`) {
+		t.Errorf("missing conflict_resolution_committed log; the routing branch did not take the pass:\n%s", stderr.String())
+	}
+	parents := strings.Fields(gitT(t, r.dir, "rev-list", "--parents", "-n", "1", "HEAD"))
+	if len(parents) != 3 || parents[1] != r.preTip || parents[2] != r.baseTip {
+		t.Errorf("parents = %v, want a merge of %s and %s", parents, r.preTip, r.baseTip)
+	}
+}
+
+// TestRun_ConflictResolution_RefusalExitsFailureAndRestores pins the refusal
+// arm of the same routing branch: an agent that touches nothing leaves the
+// markers in place, the gate refuses, run() exits non-zero with the NAMED
+// reason on the log, and the repository is back where it started.
+func TestRun_ConflictResolution_RefusalExitsFailureAndRestores(t *testing.T) {
+	r := newConflictRepo(t, "file.txt")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:                           "22222222-3333-4444-5555-666666666666",
+		StageType:                         "implement",
+		Prompt:                            "Resolve the conflict.",
+		PromptHash:                        "deadbeef",
+		ConflictResolution:                true,
+		ConflictResolutionBranch:          "work",
+		ConflictResolutionBaseRef:         "base",
+		ConflictResolutionExpectedHeadSHA: r.preTip,
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--working-dir", r.dir,
+		"--fetch-prompt",
+	}, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"reason":"conflict_resolution_residual_marker"`) {
+		t.Errorf("missing the named refusal reason on the runner log:\n%s", stderr.String())
+	}
+	assertPreMergeStateRestored(t, r)
+}
