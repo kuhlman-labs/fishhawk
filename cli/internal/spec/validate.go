@@ -31,6 +31,11 @@ import (
 // raw tree), tolerating any shape mismatch by skipping: the schema layer
 // already rejected genuinely malformed structure, so a non-map/non-string node
 // here is simply not a value to check.
+//
+// Workflows are swept in sorted name order (via sortedKeys, v2reuse.go:141)
+// so `fishhawk validate` reports the same entry sequence across runs over
+// the same bytes, deterministic-report-order the package convention already
+// establishes for walkV2RemovedForms' sorted-key sweep (validate.go:733).
 func validateAgentVersions(raw any) error {
 	var errs []ValidationErrorEntry
 	root, ok := raw.(map[string]any)
@@ -41,7 +46,8 @@ func validateAgentVersions(raw any) error {
 	if !ok {
 		return nil
 	}
-	for wfName, wfRaw := range workflows {
+	for _, wfName := range sortedKeys(workflows) {
+		wfRaw := workflows[wfName]
 		wf, ok := wfRaw.(map[string]any)
 		if !ok {
 			continue

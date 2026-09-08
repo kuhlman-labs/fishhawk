@@ -64,7 +64,11 @@ const PathFmtNeeds = "/workflows/%s/stages/%d/needs/%d"
 // collect-all convention — appending ValidationErrorEntry values — so a
 // document defective in several places reports them together. Acceptance and
 // rejection are identical to the backend; only ordering can differ, the same
-// divergence the applies_to and escalations ports already carry.
+// divergence the applies_to and escalations ports already carry. Workflows
+// are swept in sorted name order (via sortedKeys, E52.13's own convention,
+// v2reuse.go:141), so repeated ValidateBytes calls over the same bytes emit
+// the same entry sequence — intra-CLI ordering is now deterministic, matching
+// walkV2RemovedForms' sorted-key sweep (validate.go:733).
 //
 // Every shape mismatch is tolerated by SKIPPING: the schema layer has already
 // rejected genuinely malformed structure, so a non-map / non-slice node here is
@@ -79,7 +83,8 @@ func validateGraphShape(raw any, major int) error {
 	if !ok {
 		return nil
 	}
-	for wfName, wfRaw := range workflows {
+	for _, wfName := range sortedKeys(workflows) {
+		wfRaw := workflows[wfName]
 		wf, ok := wfRaw.(map[string]any)
 		if !ok {
 			continue
