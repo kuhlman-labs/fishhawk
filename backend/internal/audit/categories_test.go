@@ -480,3 +480,28 @@ func TestKnownCategories_MergeObservationRecorded(t *testing.T) {
 		t.Fatal("merge_observation_recorded is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_StageConflictResolutionTriggered pins the E64.62 / #3202
+// category the conflict-resolution trigger writes
+// (backend/internal/server/conflictresolution.go). It carries its OWN ceiling-1
+// budget counter, so an operator awaiting the pass arms fishhawk_await_audit on
+// THIS string and never on stage_fixup_triggered — an unregistered category is
+// un-awaitable, and categories_completeness_test.go's AST sweep would fail the
+// build on the emit site regardless.
+func TestKnownCategories_StageConflictResolutionTriggered(t *testing.T) {
+	if !IsKnownCategory("stage_conflict_resolution_triggered") {
+		t.Fatal("stage_conflict_resolution_triggered is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_StageConflictResolutionFailed pins the E64.62 / #3202
+// failure marker. It is the entry that makes the ceiling-1 budget SPENT: the
+// trigger reader treats a failed pass as having consumed its trigger, so the
+// next fishhawk_rebase_run_branch invocation is the fail-closed 422 naming the
+// failed pass. An unregistered category would leave that transition invisible
+// to an operator reading the run's audit stream.
+func TestKnownCategories_StageConflictResolutionFailed(t *testing.T) {
+	if !IsKnownCategory("stage_conflict_resolution_failed") {
+		t.Fatal("stage_conflict_resolution_failed is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

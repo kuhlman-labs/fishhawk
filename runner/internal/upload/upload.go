@@ -539,6 +539,37 @@ type FetchedPrompt struct {
 	// a non-eligible fix-up — byte-identical to today. The wire tag
 	// (fixup_apply_patches / patch) matches the backend's fixupApplyPatch shape.
 	FixupApplyPatches []FixupApplyPatch `json:"fixup_apply_patches,omitempty"`
+	// ConflictResolution is true when this implement stage is an
+	// operator-authorized conflict-resolution pass (E64.62 / #3202): the backend
+	// triggered the pass instead of refusing a CONFLICTING base merge with a 422,
+	// so the conflict is resolved ON the run branch and the operator never pushes
+	// to a branch ADR-035 declares runner-owned. The runner performs the merge
+	// LOCALLY, invokes the agent under a working-tree-edits-only contract, and
+	// admits the resulting commit only through the confinement gate; it never
+	// opens a PR on this path.
+	//
+	// It is DISTINCT from Fixup and the two are never both true. False/empty on
+	// every ordinary implement dispatch, which leaves the runner's routing
+	// byte-identical to today.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the four `conflict_resolution*` json tags MUST
+	// stay byte-identical to the backend's promptResponse
+	// (backend/internal/server/prompt.go). The wirecontract prompt_response Pair
+	// is ModeSubset with this struct as CONSUMER, so a field present on one side
+	// alone fails TestCrossModuleWireParity. A tag drift silently routes the
+	// runner down the ORDINARY implement path on a repository sitting mid-merge.
+	ConflictResolution bool `json:"conflict_resolution,omitempty"`
+	// ConflictResolutionBranch is the run branch the merge lands on. Non-empty
+	// only when ConflictResolution is true.
+	ConflictResolutionBranch string `json:"conflict_resolution_branch,omitempty"`
+	// ConflictResolutionBaseRef is the base BRANCH name the run branch merges
+	// FROM; the runner qualifies it with its own remote.
+	ConflictResolutionBaseRef string `json:"conflict_resolution_base_ref,omitempty"`
+	// ConflictResolutionExpectedHeadSHA is the run's recorded head at trigger
+	// time. The runner refuses the pass when the checked-out tip is not this
+	// commit. Empty means the backend resolved none — the runner then skips the
+	// comparison rather than blocking the pass, mirroring FixupExpectedHeadSHA.
+	ConflictResolutionExpectedHeadSHA string `json:"conflict_resolution_expected_head_sha,omitempty"`
 	// OpenPRFromHeldCommit is true on an operator EXEMPT resolution of a
 	// scope-completeness park (#1231): the implement stage previously parked
 	// because the missing-declared-scope-file gate was its sole failure, and the
