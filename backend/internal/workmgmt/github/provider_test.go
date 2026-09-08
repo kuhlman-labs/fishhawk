@@ -979,15 +979,53 @@ func TestProvider_ResolveDependencies_FailClosed(t *testing.T) {
 			t.Fatalf("want missing-installation error, got %v", err)
 		}
 	})
+	// COUNTERFACTUAL (operator condition 4, plan step 8-iii) — OBSERVED, not
+	// reasoned: dropping the `%w` ErrInvalidItemRef operand from the
+	// ResolveDependencies parse-loop wrap and running
+	// `go test -run TestProvider_ResolveDependencies_FailClosed ./internal/workmgmt/github/` produced:
+	//
+	//	--- FAIL: TestProvider_ResolveDependencies_FailClosed/unparseable_item_ref
+	//	    provider_test.go:991: err = workmgmt/github: item "not-a-ref": not a numeric issue reference, want errors.Is ErrInvalidItemRef (the handler classifies 422 on it)
+	//	--- FAIL: TestProvider_ResolveDependencies_FailClosed/non-positive_item_ref
+	//	    provider_test.go:1003: err = workmgmt/github: item "0": issue number must be > 0, want errors.Is ErrInvalidItemRef
+	//
+	// Restored byte-identically; green again. The get-issue-error sub-test stayed
+	// GREEN under the deletion, which is exactly its discrimination claim.
+	//
+	// Two NAMED parse modes, one assertion each. Each asserts the shared
+	// classification sentinel (workmgmt.ErrInvalidItemRef, #2176) AND keeps the
+	// rendered-cause assertion, so the multi-%w wrap cannot drop either half.
 	t.Run("unparseable item ref", func(t *testing.T) {
-		if _, err := New(&fakeAPI{}).ResolveDependencies(context.Background(), resolveReq("not-a-ref")); err == nil || !strings.Contains(err.Error(), "not a numeric issue reference") {
+		_, err := New(&fakeAPI{}).ResolveDependencies(context.Background(), resolveReq("not-a-ref"))
+		if err == nil || !strings.Contains(err.Error(), "not a numeric issue reference") {
 			t.Fatalf("want malformed-item error, got %v", err)
+		}
+		if !errors.Is(err, workmgmt.ErrInvalidItemRef) {
+			t.Fatalf("err = %v, want errors.Is ErrInvalidItemRef (the handler classifies 422 on it)", err)
+		}
+		if !strings.Contains(err.Error(), `item "not-a-ref"`) {
+			t.Errorf("err = %v, want the offending ref named", err)
+		}
+	})
+	t.Run("non-positive item ref", func(t *testing.T) {
+		_, err := New(&fakeAPI{}).ResolveDependencies(context.Background(), resolveReq("0"))
+		if err == nil || !strings.Contains(err.Error(), "issue number must be > 0") {
+			t.Fatalf("want non-positive-item error, got %v", err)
+		}
+		if !errors.Is(err, workmgmt.ErrInvalidItemRef) {
+			t.Fatalf("err = %v, want errors.Is ErrInvalidItemRef", err)
 		}
 	})
 	t.Run("get issue error", func(t *testing.T) {
 		api := &fakeAPI{getIssueErr: errors.New("github rejected the request")}
-		if _, err := New(api).ResolveDependencies(context.Background(), good); err == nil || !strings.Contains(err.Error(), "get issue #100") {
+		_, err := New(api).ResolveDependencies(context.Background(), good)
+		if err == nil || !strings.Contains(err.Error(), "get issue #100") {
 			t.Fatalf("want get-issue error, got %v", err)
+		}
+		// DISCRIMINATION: a phase-1 TRANSPORT failure is neither sentinel — it
+		// must keep drawing the handler's 502, not the new 422 (#2176).
+		if errors.Is(err, workmgmt.ErrInvalidItemRef) {
+			t.Fatalf("err = %v, want NOT ErrInvalidItemRef (a fetch failure is a provider fault, not caller input)", err)
 		}
 	})
 }

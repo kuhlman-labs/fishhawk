@@ -226,6 +226,42 @@ func TestStartCampaign_ItemNotChild_MapsActionableError(t *testing.T) {
 	}
 }
 
+// TestStartCampaign_InvalidItemRef_MapsActionableError covers the new
+// campaign_item_ref_invalid wire code (#2176): a malformed items ref maps to an
+// actionable client-side message naming the code and the ACCEPTED ref forms —
+// and, because the code fires on the no-epic path too, WITHOUT assuming an
+// epic_ref is present. Driven with NO EpicRef for exactly that reason.
+//
+// COUNTERFACTUAL (operator condition 4, plan step 8-v) — OBSERVED, not reasoned:
+// deleting the `case "campaign_item_ref_invalid":` arm from the startCampaign
+// code switch in campaign.go and running this test produced:
+//
+//	--- FAIL: TestStartCampaign_InvalidItemRef_MapsActionableError
+//	campaign_test.go:260: err "create campaign: fishhawk: HTTP 422 (campaign_item_ref_invalid): ...not-a-ref... is not a valid issue ref" missing "101", missing "#101", missing "issue:101"
+//
+// (the generic apiError surface, with no remedy naming the accepted ref forms).
+// Restored byte-identically; green again.
+func TestStartCampaign_InvalidItemRef_MapsActionableError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_item_ref_invalid","message":"\"not-a-ref\" is not a valid issue ref"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo: "x/y", Items: []string{"not-a-ref"},
+	})
+	if err == nil {
+		t.Fatal("err = nil, want campaign_item_ref_invalid mapping")
+	}
+	// The code, the offending ref (from the backend message), and every accepted
+	// ref form the remedy names.
+	for _, want := range []string{"campaign_item_ref_invalid", "not-a-ref", "101", "#101", "issue:101"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+}
+
 // TestStartCampaign_OmittedPausePolicy_LeavesBodyEmpty pins the optional
 // pause_policy: omitting it sends an empty value (the backend normalizes it).
 func TestStartCampaign_OmittedPausePolicy_LeavesBodyEmpty(t *testing.T) {

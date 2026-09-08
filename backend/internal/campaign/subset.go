@@ -10,11 +10,18 @@ import (
 )
 
 // ErrItemNotChild is returned (wrapped) by FilterToSubset when a requested
-// subset item is not among the epic's children. Callers errors.Is against it
-// to map the failure onto a typed 422 (campaign_item_not_child) without
-// depending on the underlying message. It fails closed: a subset that names a
-// non-child issue is rejected rather than silently assembled over the children
-// that DO match, so a typo or a stale ref surfaces loudly.
+// subset item PARSES as an issue ref but is not among the epic's children.
+// Callers errors.Is against it to map the failure onto a typed 422
+// (campaign_item_not_child) without depending on the underlying message. It
+// fails closed: a subset that names a non-child issue is rejected rather than
+// silently assembled over the children that DO match, so a typo or a stale ref
+// surfaces loudly.
+//
+// It covers ONLY the not-a-child claim (#2176). A ref that does not PARSE is a
+// different claim — it cannot be said to be "not a child of the epic" when it
+// names no issue at all — and is returned wrapped around
+// workmgmt.ErrInvalidItemRef, which the handler maps onto 422
+// campaign_item_ref_invalid.
 var ErrItemNotChild = errors.New("campaign: subset item is not a child of the epic")
 
 // FilterToSubset narrows an epic-children result to the named subset of items,
@@ -26,8 +33,10 @@ var ErrItemNotChild = errors.New("campaign: subset item is not a child of the ep
 //
 // items are issue refs in either the bare-number ("101") or issue:N
 // ("issue:101") form, mirroring the ref convention Assemble emits. Every
-// requested ref MUST resolve to a child in res.Children; the FIRST miss returns
-// a wrapped ErrItemNotChild naming the offending ref (fail closed).
+// requested ref MUST parse AND resolve to a child in res.Children; the FIRST
+// miss fails closed naming the offending ref — a ref that does not parse returns
+// a wrapped workmgmt.ErrInvalidItemRef, a parseable ref that is not a child
+// returns a wrapped ErrItemNotChild (#2176).
 //
 // The edge set is re-partitioned against the included item set:
 //   - an edge with BOTH endpoints included is kept in Edges;
@@ -165,14 +174,17 @@ func FilterToSubset(res *workmgmt.EpicChildrenResult, items []string) (*workmgmt
 // parseItemRef parses a subset item ref into a child issue number. It accepts
 // both the bare-number ("101") and issue:N ("issue:101") forms, mirroring the
 // issue:N ref convention Assemble emits. A ref in any other shape is a caller
-// error (an unresolvable subset item), returned as a wrapped ErrItemNotChild so
-// it maps onto the same fail-closed 422 as a non-child number.
+// error (an unresolvable subset item), returned as a wrapped
+// workmgmt.ErrInvalidItemRef — the SHARED sentinel the no-epic resolver also
+// wraps — so the handler answers 422 campaign_item_ref_invalid. It is
+// deliberately NOT ErrItemNotChild (#2176): a ref that names no issue cannot be
+// claimed to be "not a child of the epic".
 func parseItemRef(ref string) (int, error) {
 	s := strings.TrimSpace(ref)
 	s = strings.TrimPrefix(s, "issue:")
 	num, err := strconv.Atoi(strings.TrimSpace(s))
 	if err != nil {
-		return 0, fmt.Errorf("%w: %q is not a valid issue ref (want a number or issue:N)", ErrItemNotChild, ref)
+		return 0, fmt.Errorf("%w: %q is not a valid issue ref (want a number or issue:N)", workmgmt.ErrInvalidItemRef, ref)
 	}
 	return num, nil
 }

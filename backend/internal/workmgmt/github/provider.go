@@ -960,7 +960,12 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 		// the number parse stays a single helper — no regex duplication.
 		n, err := parseIssueRef(strings.TrimPrefix(strings.TrimSpace(ref), "issue:"))
 		if err != nil {
-			return nil, fmt.Errorf("workmgmt/github: item %q: %w", ref, err)
+			// Multi-%w so BOTH the classification sentinel and the underlying
+			// parse cause stay reachable: the handler errors.Is the sentinel to
+			// answer 422 campaign_item_ref_invalid instead of the transport-class
+			// 502 an unclassified resolver error draws (#2176), while the rendered
+			// message keeps naming the ref and the parse mode byte-for-byte.
+			return nil, fmt.Errorf("workmgmt/github: item %q: %w: %w", ref, workmgmt.ErrInvalidItemRef, err)
 		}
 		if inSet[n] {
 			continue // tolerate a duplicate ref: resolve each named issue once.

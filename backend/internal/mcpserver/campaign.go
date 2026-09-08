@@ -232,6 +232,12 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 			case "repo_not_installed":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"repo_not_installed: %s — install the Fishhawk GitHub App on %s before starting a campaign", ae.Message, repo)
+			case "campaign_item_ref_invalid":
+				// One message for BOTH assembly paths (#2176): it must not assume
+				// an epic_ref is present, since the no-epic variant has none. The
+				// backend message names the offending ref.
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"campaign_item_ref_invalid: %s — an items ref is not a valid issue reference; pass a bare number (101), #101, or issue:101 for every items entry", ae.Message)
 			case "campaign_item_not_child":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"campaign_item_not_child: %s — an items ref is not a child of epic %s; pass only issue refs that are children of the epic, or omit items to sweep every child", ae.Message, in.EpicRef)
