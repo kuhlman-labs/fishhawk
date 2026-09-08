@@ -693,7 +693,109 @@ func mintToken(ctx context.Context, backend string, timeout time.Duration, req t
 // tokenHTTPClient is the shared client for token.go's calls. A modest
 // per-call timeout is applied by the callers via context; the client
 // timeout is a backstop.
-var tokenHTTPClient = &http.Client{Timeout: 60 * time.Second}
+//
+// CheckRedirect refuses any redirect that leaves the ORIGINAL request's
+// origin, and it covers every call in this file rather than only the
+// obviously credential-bearing ones. Go replays the request BODY on a
+// 307/308, so a redirect on the GitLab poll (POST {base}/oauth/token)
+// forwards device_code — the bearer of the device flow — to the
+// redirect target; the GitHub poll body carries device_code likewise;
+// and the mint POST body carries the forge ACCESS TOKEN. Discovery
+// (GET /v0/tokens/login) carries no credential, but it decides the
+// base_url the credential-bearing calls then dial, so a redirect there
+// redirects the flow itself. One policy on the shared client is
+// therefore the whole surface — this client has no unrelated consumers.
+//
+// Same-origin hops are still FOLLOWED: a forge or backend behind a
+// path-normalizing proxy legitimately redirects within its own origin,
+// and the credential never leaves the origin it was addressed to. That
+// is the shape of the server-side sibling,
+// backend/internal/identity/gitlab.go's refuseCrossOriginRedirect,
+// which this mirrors (ADR-014 keeps cli independent of the backend
+// module, so the helper is reimplemented rather than imported). The
+// other sibling, credstore.RefuseRedirect, refuses ALL redirects and is
+// installed on oauthlogin.go's client and credstore's refresh, where
+// the request carries an OAuth secret and no same-origin hop is
+// expected at all.
+//
+// This is defense in depth, not a live exploit fix: base_url reaches
+// the CLI from the operator's own backend discovery response, so an
+// attacker who controls that value can already point the CLI at a host
+// they own directly.
+var tokenHTTPClient = &http.Client{
+	Timeout:       60 * time.Second,
+	CheckRedirect: tokenRefuseCrossOriginRedirect,
+}
+
+// tokenMaxRedirects bounds a redirect chain. Setting CheckRedirect
+// DISPLACES the stdlib's default policy, and that default policy is
+// what caps redirects at 10 — so the cap is restated here deliberately:
+// without it a same-origin-permitting policy would follow same-origin
+// hops without bound.
+const tokenMaxRedirects = 10
+
+// tokenRedirectError is a redirect refusal from the policy below.
+//
+// It exists as its OWN type so the callers can unwrap it: net/http
+// wraps a CheckRedirect error in a *url.Error whose URL field is the
+// full REDIRECT TARGET, query string included. That target is
+// attacker-chosen and ends up in whatever the CLI prints (and in
+// whatever collects the CLI's stderr), so the helpers surface this
+// error's own message — which names only origins (scheme://host) —
+// rather than the url.Error wrapper.
+type tokenRedirectError struct{ msg string }
+
+func (e *tokenRedirectError) Error() string { return e.msg }
+
+// tokenRefuseCrossOriginRedirect is tokenHTTPClient's CheckRedirect
+// policy: same-origin hops proceed (bounded by tokenMaxRedirects),
+// any other origin is an error naming both origins and nothing else.
+func tokenRefuseCrossOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= tokenMaxRedirects {
+		return &tokenRedirectError{msg: fmt.Sprintf("refused: exceeded %d redirects", tokenMaxRedirects)}
+	}
+	if len(via) == 0 {
+		return nil
+	}
+	origin := tokenRequestOrigin(via[0].URL)
+	if target := tokenRequestOrigin(req.URL); target != origin {
+		return &tokenRedirectError{msg: fmt.Sprintf(
+			"refused cross-origin redirect from %s to %s", origin, target)}
+	}
+	return nil
+}
+
+// tokenRequestOrigin renders a URL's origin (scheme + host) for
+// comparison, lowercasing both and dropping the DEFAULT port so an
+// explicit :443 on an https URL is not read as a different origin than
+// the same host without it. A scheme downgrade (https -> http) IS a
+// different origin and is refused: sending a bearer in clear is a leak
+// too. Deliberately no path and no query — the query is attacker-chosen
+// and this string is what the refusal message carries.
+func tokenRequestOrigin(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Host)
+	switch {
+	case scheme == "https" && strings.HasSuffix(host, ":443"):
+		host = strings.TrimSuffix(host, ":443")
+	case scheme == "http" && strings.HasSuffix(host, ":80"):
+		host = strings.TrimSuffix(host, ":80")
+	}
+	return scheme + "://" + host
+}
+
+// tokenRequestError renders a *http.Client.Do failure for the user. A
+// redirect refusal is UNWRAPPED out of net/http's *url.Error before it
+// is surfaced, because that wrapper's message embeds the full redirect
+// target URL including its query; the refusal's own message names only
+// the two origins. Every other transport failure is wrapped unchanged.
+func tokenRequestError(err error) error {
+	var refused *tokenRedirectError
+	if errors.As(err, &refused) {
+		return fmt.Errorf("request: %w", refused)
+	}
+	return fmt.Errorf("request: %w", err)
+}
 
 // apiErrorEnvelope mirrors the backend's error wire shape so a failed
 // mint/discovery surfaces the server's code + message.
@@ -728,7 +830,7 @@ func postForJSON(ctx context.Context, url string, body any, out any) error {
 	req.Header.Set("Accept", "application/json")
 	resp, err := tokenHTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("request: %w", err)
+		return tokenRequestError(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -755,7 +857,7 @@ func postFormForJSON(ctx context.Context, endpoint string, form url.Values, out 
 	req.Header.Set("Accept", "application/json")
 	resp, err := tokenHTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("request: %w", err)
+		return tokenRequestError(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -783,7 +885,7 @@ func getForJSON(ctx context.Context, url string, out any) error {
 	req.Header.Set("Accept", "application/json")
 	resp, err := tokenHTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("request: %w", err)
+		return tokenRequestError(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if err := checkAPIStatus(resp); err != nil {
@@ -810,7 +912,7 @@ func postJSONForJSON(ctx context.Context, url string, body any, out any) error {
 	req.Header.Set("Accept", "application/json")
 	resp, err := tokenHTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("request: %w", err)
+		return tokenRequestError(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if err := checkAPIStatus(resp); err != nil {
