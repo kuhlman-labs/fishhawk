@@ -114,6 +114,21 @@ func TestOAuthPRM_ServedAndSelfConsistentWithASMetadata(t *testing.T) {
 	if !slices.Equal(prm.ScopesSupported, asMeta.ScopesSupported) {
 		t.Errorf("PRM scopes_supported %v != AS metadata scopes_supported %v", prm.ScopesSupported, asMeta.ScopesSupported)
 	}
+	// #2477, asserted on the SERVED document rather than on the package var:
+	// what a discovering client is invited to request is the advertised POSTURE
+	// (DefaultScopes), never the whole mintable vocabulary. The positive half is
+	// what keeps this from passing on an empty or truncated list.
+	if !slices.Equal(prm.ScopesSupported, oauthas.DefaultScopes) {
+		t.Errorf("PRM scopes_supported = %v, want the advertised posture %v (by value AND order)", prm.ScopesSupported, oauthas.DefaultScopes)
+	}
+	for _, want := range []string{"read:runs", "write:approvals"} {
+		if !slices.Contains(prm.ScopesSupported, want) {
+			t.Errorf("PRM scopes_supported %v is missing %q", prm.ScopesSupported, want)
+		}
+	}
+	if slices.Contains(prm.ScopesSupported, "write:deploy") {
+		t.Errorf("PRM scopes_supported %v advertises write:deploy; it is reachable only through a registration that pins it", prm.ScopesSupported)
+	}
 	if !slices.Equal(prm.BearerMethodsSupported, []string{"header"}) {
 		t.Errorf("bearer_methods_supported = %v, want [header]", prm.BearerMethodsSupported)
 	}

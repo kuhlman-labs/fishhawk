@@ -30,7 +30,76 @@ response. `errors.Is` works on both the code axis
 (`errors.Is(err, &Error{Code: ErrCodeInvalidGrant})`) and the sentinel axis
 (`errors.Is(err, ErrPKCEMismatch)`).
 
-## Scope vocabulary (single source of truth)
+## Scope vocabulary and scope posture (two lists, deliberately)
+
+Three lists live in `scopes.go` and answer different questions. Conflating them
+is the maintenance hazard this section exists to prevent.
+
+| List | Role | Contents |
+|---|---|---|
+| `SupportedScopes` | **VOCABULARY** — what `ParseScope` validates against and what `fishhawkd token issue` mints | all eight operator scopes |
+| `DefaultScopes` | **POSTURE** — what the PRM and AS metadata advertise as `scopes_supported`, and what a scope-less request is granted when the registration pins nothing | `SupportedScopes` **minus** `write:deploy` |
+| `PreRegistrationOnlyScopes` | **BOUND** — scopes unreachable through an ordinary authorization request | `write:deploy` |
+
+### The posture (#2477)
+
+`DefaultScopes` exists because the least-effort path for a first-time MCP client
+should not be authority to approve gates and ship. Before #2477 the PRM
+advertised all eight, so a client echoing `scopes_supported` back verbatim — or
+omitting `scope` entirely — was granted `write:deploy` (#2471).
+
+The vocabulary is **unchanged**: nothing is deleted or renamed, `ParseScope`
+still validates against `SupportedScopes`, and `fishhawkd token issue` still puts
+`write:deploy` on every operator token. `TestSupportedScopes_MatchesOperatorDefault`
+and `token_test.go`'s `write:deploy` assertion are both green with no edit, which
+is the proof the operator-token default did not move.
+
+`TestDefaultScopes_IsStrictSubsetOfSupportedScopes` pins the invariant that keeps
+the two from diverging unsafely: every advertised scope must be mintable, and the
+sole exclusion must be `write:deploy`. A member of `DefaultScopes` absent from
+`SupportedScopes` would be advertised and defaulted while `ParseScope` refuses it
+on the explicit path — a client could not re-request what it was granted.
+
+### The request-time bound (`PreRegistrationOnlyScopes`)
+
+This is the ONE place the advertised set and the mintable set intentionally
+disagree **at request time**. `write:deploy` stays in `SupportedScopes` — fully
+mintable, fully carryable on an operator token — but an authorization request
+naming it is refused `invalid_scope` UNLESS the client's registration PINS it.
+A **mixed** request naming it alongside valid scopes is refused **whole**, never
+silently stripped: stripping would mint a grant narrower than the one the client
+asked for and the consent page displayed.
+
+Enforcement is a single chokepoint inside `ResolveRequestedScope`, applied AFTER
+`ParseScope` succeeds so no existing error identity moves, and covering both the
+explicit and the defaulted route. The authorize ladder's step-7 registered-scope
+restriction is **unchanged** and still bounds both sets.
+
+**FORWARD RULE**: a future scope needing the same treatment is added to
+`PreRegistrationOnlyScopes`. Never reuse `DefaultScopes` as an enforcement bound
+— it is posture, not a boundary; conflating them would mean advertising a scope
+more narrowly silently made it unrequestable.
+
+### The escape hatch, and what it actually gates
+
+The operator write path **has shipped**: `fishhawkd oauth client register
+--client-id <id> --scope "... write:deploy"` (E66.21 / #2438) persists an
+`oauth_clients` row, and `resolveOAuthClient` prefers a store row over a CIMD
+fetch. So a deploy-capable OAuth client is reachable today, as a deliberate
+operator act.
+
+**RESIDUAL, stated plainly.** "The client's registration" is whatever
+`registeredScopeSet` reads off the RESOLVED client, and resolution is
+store-first with a fall-through to the client's own **CIMD document**, whose
+`scope` member is unvalidated passthrough. So for a **CIMD-resolved** client this
+bound is NOT an operator gate — such a client can self-declare `write:deploy` in
+its own metadata and pin itself. What #2477 ratified and this change delivers is
+the *posture*: `write:deploy` is no longer the DEFAULT and no longer ADVERTISED,
+so it is never granted by accident or by echoing discovery. Narrowing the pin to
+store-resolved registrations only is a deliberate follow-up, not part of this
+change.
+
+## Scope vocabulary mirror (single source of truth)
 
 `SupportedScopes` is a read-only **mirror** of `operatorDefaultScopes` in
 `backend/cmd/fishhawkd/token.go` (the single source of truth): #2391 ratified one
@@ -65,8 +134,9 @@ would be exactly the onboarding trap this removes.
   scope; so does a scope exceeding the client's registered set (enforced one step
   later, in the server's authorize ladder).
 - **An empty `requested`** defaults to the client's REGISTERED scope when the
-  registration pins one, otherwise to the whole `SupportedScopes` vocabulary
-  (what the PRM and AS metadata advertise as `scopes_supported`).
+  registration pins one, otherwise to `DefaultScopes` — the advertised POSTURE
+  (what the PRM and AS metadata publish as `scopes_supported`), which is the
+  vocabulary MINUS `write:deploy`, NOT the whole vocabulary (#2477).
 
 The registered default is **intersected** with `SupportedScopes` (registration
 order preserved, de-duplicated) rather than taken verbatim. A registration may

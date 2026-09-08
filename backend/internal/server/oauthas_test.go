@@ -517,11 +517,18 @@ func TestOAuthASMetadata_CompleteRFC8414FieldSet(t *testing.T) {
 	}
 }
 
-func TestOAuthASMetadata_ScopesSupportedMirrorsOperatorVocabulary(t *testing.T) {
+// TestOAuthASMetadata_ScopesSupportedMirrorsAdvertisedPosture asserts the AS
+// metadata advertises the POSTURE (oauthas.DefaultScopes), not the whole
+// mintable vocabulary. #2477 split the two: what a client is invited to request
+// is deliberately narrower than what the server can mint.
+func TestOAuthASMetadata_ScopesSupportedMirrorsAdvertisedPosture(t *testing.T) {
 	srv := newEnabledOAuthServer(newFakeOAuthStore(), newCIMDFetcher(newCIMD()))
 	_, doc := getMetadata(t, srv)
-	if !equalStrings(doc.ScopesSupported, oauthas.SupportedScopes) {
-		t.Fatalf("scopes_supported = %v, want %v (equal by value AND order)", doc.ScopesSupported, oauthas.SupportedScopes)
+	if !equalStrings(doc.ScopesSupported, oauthas.DefaultScopes) {
+		t.Fatalf("scopes_supported = %v, want %v (equal by value AND order)", doc.ScopesSupported, oauthas.DefaultScopes)
+	}
+	if containsOAuth(doc.ScopesSupported, "write:deploy") {
+		t.Error("the AS metadata advertises write:deploy; it is reachable only through a registration that pins it")
 	}
 }
 

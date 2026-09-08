@@ -236,7 +236,7 @@ func (s *Server) handleOAuthASMetadata(w http.ResponseWriter, r *http.Request) {
 		TokenEndpoint:                 st.tokenEndpoint,
 		ResponseTypesSupported:        []string{"code"},
 		GrantTypesSupported:           []string{"authorization_code", "refresh_token"},
-		ScopesSupported:               append([]string(nil), oauthas.SupportedScopes...),
+		ScopesSupported:               append([]string(nil), oauthas.DefaultScopes...),
 		CodeChallengeMethodsSupported: []string{"S256"},
 		AuthorizationResponseISSParameterSupported: true,
 		ClientIDMetadataDocumentSupported:          true,

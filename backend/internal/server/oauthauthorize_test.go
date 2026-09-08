@@ -869,8 +869,12 @@ func TestAuthorize_AbsentScopeDefaults(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Fatalf("a scope-less request must authorize; status=%d body=%s", rr.Code, rr.Body.String())
 		}
-		if got := consentScopeListItems(t, rr.Body.String()); !equalStrings(got, oauthas.SupportedScopes) {
-			t.Fatalf("consent listed %v, want the full vocabulary %v", got, oauthas.SupportedScopes)
+		if got := consentScopeListItems(t, rr.Body.String()); !equalStrings(got, oauthas.DefaultScopes) {
+			t.Fatalf("consent listed %v, want the advertised posture %v", got, oauthas.DefaultScopes)
+		}
+		// NON-VACUITY (#2477): the scope-less default must not offer write:deploy.
+		if strings.Contains(rr.Body.String(), "write:deploy") {
+			t.Fatal("the scope-less default offered write:deploy; the advertised posture excludes it")
 		}
 	})
 
@@ -953,8 +957,8 @@ func TestAuthorize_AbsentScopeDefaults(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Fatalf("`scope=` must take the default like an absent key; status=%d body=%s", rr.Code, rr.Body.String())
 		}
-		if got := consentScopeListItems(t, rr.Body.String()); !equalStrings(got, oauthas.SupportedScopes) {
-			t.Fatalf("consent listed %v, want the full vocabulary %v", got, oauthas.SupportedScopes)
+		if got := consentScopeListItems(t, rr.Body.String()); !equalStrings(got, oauthas.DefaultScopes) {
+			t.Fatalf("consent listed %v, want the advertised posture %v", got, oauthas.DefaultScopes)
 		}
 	})
 
@@ -968,6 +972,106 @@ func TestAuthorize_AbsentScopeDefaults(t *testing.T) {
 		q := redirectQuery(t, rr)
 		if q.Get("error") != "invalid_scope" {
 			t.Fatalf("error = %q, want invalid_scope — a whitespace-only scope is PRESENT and must not be defaulted", q.Get("error"))
+		}
+	})
+}
+
+// TestAuthorize_WriteDeployIsPreRegistrationOnly is the #2477 request-time
+// bound, driven through the REAL authorize and consent routes rather than
+// against oauthas.ResolveRequestedScope directly — so a SECOND resolution path
+// that bypassed the chokepoint would surface here as a granted consent page
+// where the test expects an invalid_scope redirect.
+//
+// COUNTERFACTUAL (run, observed RED): deleting the isPreRegistrationOnlyScope
+// loop from ResolveRequestedScope makes (i) and (iv) fail with
+// `error = "", want invalid_scope` — the all-eight request is GRANTED a 200
+// consent page where it must be refused.
+func TestAuthorize_WriteDeployIsPreRegistrationOnly(t *testing.T) {
+	// The verbatim #2471 shape: a client asking for scopes_supported as it was
+	// advertised before this change — all eight, write:deploy included.
+	allEight := oauthas.ScopeString(oauthas.SupportedScopes)
+
+	// (i) The #2471 request from a client that pins NOTHING is refused, and the
+	// assertion is on the ERROR CODE, not merely a non-200.
+	t.Run("all_eight_scopes_with_no_registration_refused", func(t *testing.T) {
+		srv, store, id := scopeDefaultServer(t, "")
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": allEight}), &id)
+		q := redirectQuery(t, rr)
+		if q.Get("error") != "invalid_scope" {
+			t.Fatalf("error = %q, want invalid_scope — write:deploy must not be reachable from an unpinned request", q.Get("error"))
+		}
+		// COMMITTED STATE: a refusal that fired and rolled back and one that
+		// never fired return a byte-identical redirect, so read the store.
+		store.mu.Lock()
+		n := len(store.codes)
+		store.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("a refused authorization minted %d code(s); want 0", n)
+		}
+	})
+
+	// (ii) THE ESCAPE HATCH, end to end: a registration that PINS all eight
+	// renders consent listing all eight and the POST mints a code. This is the
+	// `fishhawkd oauth client register --scope` (#2438) operator path.
+	t.Run("registration_pinning_write_deploy_grants_it", func(t *testing.T) {
+		srv, store, id := scopeDefaultServer(t, allEight)
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": allEight}), &id)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("a pinned client must reach consent; status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		got := consentScopeListItems(t, rr.Body.String())
+		if !equalStrings(got, oauthas.SupportedScopes) {
+			t.Fatalf("consent listed %v, want all eight %v", got, oauthas.SupportedScopes)
+		}
+		hidden := consentHiddenScope(t, rr.Body.String())
+		if code := redirectQuery(t, postConsent(srv, consentForm(map[string]string{"scope": hidden}), &id)).Get("code"); code == "" {
+			t.Fatal("the pre-registration path did not mint a code")
+		}
+		if got := mintedCodeScopes(t, store); !containsOAuth(got, "write:deploy") {
+			t.Fatalf("minted code scopes = %v, want write:deploy carried through", got)
+		}
+	})
+
+	// (iii) NARROWNESS: the seven advertised scopes requested EXPLICITLY by name
+	// from a client that pins nothing are granted. The bound is write:deploy
+	// alone, not a blanket refusal of explicit requests.
+	t.Run("explicit_default_scopes_with_no_registration_granted", func(t *testing.T) {
+		srv, _, id := scopeDefaultServer(t, "")
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": oauthas.ScopeString(oauthas.DefaultScopes)}), &id)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("the advertised set must be requestable verbatim; status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		if got := consentScopeListItems(t, rr.Body.String()); !equalStrings(got, oauthas.DefaultScopes) {
+			t.Fatalf("consent listed %v, want %v", got, oauthas.DefaultScopes)
+		}
+	})
+
+	// (iv) A registration that pins a NARROWER set does not unlock write:deploy.
+	t.Run("narrower_registration_does_not_unlock_write_deploy", func(t *testing.T) {
+		srv, _, id := scopeDefaultServer(t, "read:runs write:runs")
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": "read:runs write:deploy"}), &id)
+		q := redirectQuery(t, rr)
+		if q.Get("error") != "invalid_scope" {
+			t.Fatalf("error = %q, want invalid_scope", q.Get("error"))
+		}
+	})
+
+	// (v) REFUSED WHOLE, not stripped: a mixed request naming write:deploy
+	// alongside valid scopes must not silently mint the remainder. Asserted on
+	// COMMITTED STATE via the consent POST — a stripping implementation returns
+	// a 200/code where this wants a refusal.
+	t.Run("mixed_request_refused_whole_not_stripped", func(t *testing.T) {
+		srv, store, id := scopeDefaultServer(t, "")
+		rr := postConsent(srv, consentForm(map[string]string{"scope": "read:runs write:deploy"}), &id)
+		q := redirectQuery(t, rr)
+		if q.Get("error") != "invalid_scope" {
+			t.Fatalf("error = %q, want invalid_scope — the whole request must be refused, not stripped to [read:runs]", q.Get("error"))
+		}
+		store.mu.Lock()
+		n := len(store.codes)
+		store.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("a stripped grant was minted (%d code(s)); the request must be refused whole", n)
 		}
 	})
 }
