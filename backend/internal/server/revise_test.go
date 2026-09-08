@@ -260,7 +260,7 @@ func TestRevisePlan_CrossLayer_ReviseResumePrompt(t *testing.T) {
 	rr := newPromptRunRepo()
 	au := newAuditFake()
 	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
-	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI, RequiresCharter: chFalse()}
 
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, SigningRepo: sf})
 	s.promptIssueGetterOverride = &stubIssueGetter{}

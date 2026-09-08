@@ -306,17 +306,23 @@ plus the instruction to cite rubric lines BY ID — the uppercase `V*/R*/U*/S*` 
 charter's rubric tables carry, matching the citation contract #2235 validates), and the
 **fail-closed policy**.
 
-**Stage discriminator — STRUCTURAL.** `stageRequiresCharter` is true for a `plan`-typed
-(PROPOSE, ADR-067 §2) run stage whose resolved workflow satisfies the shipped
-`WorkflowRequiresCharter` predicate, i.e. declares the `grooming_report` artifact. Not
-the workflow's NAME (renaming would evade it) and not a `kind:` field.
+**Stage discriminator — a PERSISTED RUN-LEVEL FACT (E54.13 / #2806).** `stageRequiresCharter`
+is true for a `plan`-typed (PROPOSE, ADR-067 §2) run stage whose run carries
+`requires_charter = true`. That column (migration 0082, `backend/internal/run/README.md`) is
+stamped at every root mint seam from the same pure structural predicate the #2236 admission
+gate evaluates at that exact moment — `spec.WorkflowRequiresCharter` over the workflow the
+run was minted from, when the spec was known-parseable — and inherited verbatim by
+`run.ChildParamsFrom`. The prompt-serve path READS the fact; it does not re-derive it from
+the cached `WorkflowSpec`, which may since have been corrupted in storage. Not the
+workflow's NAME (renaming would evade it) and not a `kind:` field. The stage-type early
+return precedes the fact: a persisted-grooming row's implement stage is not a propose stage.
 
 **Two fail-closed layers.**
 
 | Layer | Where | Refuses when |
 |---|---|---|
-| L1 `charterDeclarations` | `Config.DocumentDeclarations` | conventions unreadable (`conventions_unavailable`), no `charter:` block (`charter_absent`), empty `path:` (`charter_path_empty`), base ref unresolvable (`charter_base_ref_unresolved`) |
-| L2 `assertCharterInjected` | `handleGetStagePrompt`, after `resolveInjectedDocuments` | the injected set carries no document resolved from the declared charter path (`charter_not_injected`) |
+| L1 `charterDeclarations` | `Config.DocumentDeclarations` | the determination is undecidable on a legacy row (`grooming_workflow_spec_unreadable`, below), conventions unreadable (`conventions_unavailable`), no `charter:` block (`charter_absent`), empty `path:` (`charter_path_empty`), base ref unresolvable (`charter_base_ref_unresolved`) |
+| L2 `assertCharterInjected` | `handleGetStagePrompt`, after `resolveInjectedDocuments` | the same undecidable-determination refusal (L2 calls `stageRequiresCharter` independently of L1), then: the injected set carries no document resolved from the declared charter path (`charter_not_injected`) |
 
 L2 is what makes the guarantee unbypassable by a deployment that simply leaves the seam
 unwired — the one configuration in which L1 cannot run. **L2 verifies charter IDENTITY,
@@ -341,37 +347,37 @@ reusable** by E55's review-conventions consumer, which still needs the per-run s
 
 **Non-grooming prompts are byte-identical.** The declarations func returns zero
 declarations for every other stage (and never touches the conventions loader), and
-`resolveInjectedDocuments` short-circuits on an empty set. The one place that could have
-leaked is a cached `WorkflowSpec` that cannot be re-parsed, where whether the stage is a
-grooming propose stage is undecidable. `specCouldBeGrooming` narrows the refusal, and the
-narrowing is ATTRIBUTED rather than a document-wide byte scan — a raw `bytes.Contains`
-refused a corrupt NON-grooming spec whose bytes carried `grooming_report` incidentally,
-which is exactly the non-grooming behaviour change H4 forbids:
+`resolveInjectedDocuments` short-circuits on an empty set. Because the fact decides, a
+persisted non-grooming row is served byte-identically whatever its cached spec bytes
+contain — including a syntactically corrupt spec carrying `grooming_report` in an inline
+comment and an unrelated scalar (the #2805 residual (a), pinned by
+`TestCharterDetermination_PersistedNonGrooming_CorruptSpecWithIncidentalToken_Served`) —
+and a persisted grooming row is still refused without its charter even when a corruption
+destroyed the token or the spec now parses as decidably non-grooming (residual (b),
+`TestCharterDetermination_PersistedGrooming_SpecTokenDestroyed_StillAnchored`). The earlier
+attributed byte-scanning fallback (`specCouldBeGrooming` and its seven helpers) existed only
+to answer a question the prompt-serve path no longer asks, and is deleted; the corrupt-spec
+corner in which H4 and AC5 contradicted each other does not exist for any row carrying a
+determination.
 
-- **The document decodes as YAML** (the dominant corruption class: well-formed YAML that
-  fails schema validation). A decoded document has exactly ONE parse, so the test is
-  exact — some scalar or key EQUAL to the artifact kind, searched inside THIS run's
-  workflow subtree only. A comment is not a node; an unrelated prose scalar is not equal;
-  another workflow's `grooming_report` is outside the subtree. All three fall OPEN,
-  byte-identically. The search widens to the whole document when the run's workflow is
-  absent (nothing to attribute to) or the document uses workflow-v2 `defaults` / `extends`
-  reuse, where an inherited `produces` block can come from outside the subtree.
-- **The document does not decode at all** (YAML syntax corruption). No structure to
-  attribute against, so the fallback is the byte scan minus FULL-LINE comments.
-
-A spec with no grooming evidence falls OPEN exactly as `resolveImplementConstraints` and
-`resolveImplementRequiredOutcomes` do. Residuals, stated: in the non-decoding branch a
-token in an INLINE comment or an unrelated scalar still refuses a corrupt non-grooming
-spec; and a corruption that also destroys the token falls open on what may have been a
-grooming run. Closing the second in general means refusing every plan prompt whose cached
-spec is corrupt — the repo-wide flip H4 rules out — and the cached bytes were validated at
-run-create, so a parse failure is storage corruption, not a normal or adversarial state.
-A third: `yamlUsesSameDocumentReuse` keys on the NAME of a `defaults` / `extends` mapping
-key ANYWHERE in the document rather than on a resolvable inheritance edge, so an unrelated
-`defaults` map widens the search document-wide and another workflow's `grooming_report` is
-then counted. All three refusals fail CLOSED and reach only storage-corrupted specs, and
-each is pinned as DELIBERATE by a row in `TestSpecCouldBeGrooming_Attribution` so a later
-edit to either branch cannot silently widen or narrow it.
+**The legacy branch, and its bounded residual.** A row whose `requires_charter` is NULL
+carries NO persisted determination: a row minted before migration 0082, or a child minted
+via `ChildParamsFrom` from such a parent (children inherit the value verbatim, including
+nil, because a child's spec IS the parent's spec). That population is bounded and
+non-growing except by descent from legacy parents. For it the determination is derived
+from the cached spec exactly as the parsed path always was — a spec that parses and names
+the run's workflow decides via `WorkflowRequiresCharter` — and an UNDECIDABLE cached spec
+is REFUSED with `grooming_workflow_spec_unreadable` rather than falling open: **empty**
+(approval condition 1 — no fact and no bytes; a legacy grooming row whose spec was wiped
+must not be served unanchored), **unparseable**, or **naming no such workflow**. Refusal is
+the recoverable direction (repair the row, or start a new run, whose determination is
+recorded at creation) and the class is reachable only by storage corruption of a row that
+carries no fact. Stated honestly: for that narrow class this changes non-grooming prompt
+behaviour (the pre-#2806 posture fell a corrupt token-free spec open); the reason VALUE is
+unchanged, so no client contract moves.
+`TestCharterDetermination_LegacyRow_ParseableOrdinarySpec_Served` is what falsifies a
+refusal that ever widens beyond the undecidable case. A rollback of the column restores
+spec-derived behaviour for every row and LOSES the corruption protection the fact adds.
 
 **Preview convergence (E54.12 / #2804).** BOTH prompt handlers now run L1 and L2.
 `handleGetStagePromptRender` resolves through `previewInjectedDocuments` — the same
@@ -454,13 +460,23 @@ construction while the implementation needs the constructed Server.
 
 Tests: `charter_injection_test.go` (cross-boundary end-to-end plus one behavioural test
 per refusal branch, each asserting the reason IDENTITY so a deleted branch reddens rather
-than passing on a neighbouring control; the M8 H4-boundary set — token in a comment, in an
-unrelated scalar, in ANOTHER workflow, and the same document read for the workflow that
-DOES declare it; `TestCharterFixtures_AreActuallyUnparseable`, which pins that each M8
-fixture is genuinely parser-rejected and which branch it drives; and
-`TestGroomingPrompt_L2Divergence_FailsClosed`, which drives a conventions loader that
-answers differently within one request — L2 re-resolves independently of L1 by design, so
-it must fail closed on a divergence), `cmd/fishhawkd/serve_test.go` (forge preference, the
+than passing on a neighbouring control; the `TestCharterDetermination_*` set — one test per
+branch of `stageRequiresCharter`: persisted false + corrupt spec with an incidental token
+SERVED, persisted true + token destroyed / unparseable spec still ANCHORED and refused for
+the CHARTER reason not the spec, legacy NULL + empty / unparseable / unknown-workflow spec
+REFUSED, legacy NULL + parseable spec decided as before, non-plan stage never grooming,
+plus `TestCharterDetermination_DirectTable` over the decision order;
+`TestCharterFixtures_HaveTheShapeTheirTestsNeed`, which pins that each corrupt fixture is
+genuinely parser-rejected and the token-destroyed fixture parses as decidably
+non-grooming; and `TestGroomingPrompt_L2Divergence_FailsClosed`, which drives a
+conventions loader that answers differently within one request — L2 re-resolves
+independently of L1 by design, so it must fail closed on a divergence),
+`charter_determination_pg_test.go` (the layer-crossing seam against REAL Postgres: `POST
+/v0/runs` → the persisted column → `GET /v0/runs/{id}` → a direct UPDATE corrupting the
+stored spec → the prompt-serve verdict, for a grooming and an ordinary run),
+`grooming_prompt_agreement_test.go` (every row carries an explicit persisted determination
+or is a declared legacy row, and the served prompt's grooming-ness must equal
+`stageRequiresCharter` on each), `cmd/fishhawkd/serve_test.go` (forge preference, the
 all-four-or-none invariant, the base-ref adapter, and the cross-forge collision: ONE
 owner/name registered on both forges, refused through the non-owning one with zero forge
 calls). The counterfactual RED observations for each control are recorded at the top of
