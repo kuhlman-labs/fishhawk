@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"reflect"
 	"strings"
@@ -727,10 +729,55 @@ func TestResolveInjectedDocuments_StillAttributes(t *testing.T) {
 	}
 }
 
+// injErrorLogDetails returns the `details` map of the LAST "http error response"
+// record in a captured JSON log stream. writeError redacts every non-allow-listed
+// key out of a 5xx BODY (#2587) and puts the FULL pre-redaction details in that
+// one log record, so this is the only place a branch-identifying cause — or a
+// *repodoc.ResolveError's path / declaration_site — is observable from outside
+// the handler. It is also what makes the assertion a PROPAGATION assertion: the
+// identifiers are read where the handler put them, not off the wrapper's error.
+func injErrorLogDetails(t *testing.T, logged string) map[string]any {
+	t.Helper()
+	var details map[string]any
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(logged), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue // not a JSON record (should not happen with a JSON handler)
+		}
+		if rec["msg"] != "http error response" {
+			continue
+		}
+		found = true
+		details, _ = rec["details"].(map[string]any)
+	}
+	if !found {
+		t.Fatalf("no \"http error response\" log record was emitted:\n%s", logged)
+	}
+	if details == nil {
+		t.Fatalf("the \"http error response\" record carries no details attribute:\n%s", logged)
+	}
+	return details
+}
+
 // TestPromptRender_DocumentInjection_FailClosedModes re-drives #2242's named
 // fail-closed modes through the PREVIEW endpoint, so each has a preview twin of
 // the served-path assertion above it. Every row asserts BOTH the status AND the
 // error code, so a preview failing for an unrelated reason cannot green it.
+//
+// STATUS + CODE ALONE DO NOT DISCRIMINATE THE BRANCH. All three refusal rows
+// below produce the SAME 500 document_injection_failed, so an unrelated
+// injection failure (or one row's failure mode silently taking another's path)
+// satisfies them. Each refusal row therefore also names branch-specific
+// observable evidence — wantCause, a substring unique to that branch's error,
+// and for the *repodoc.ResolveError row wantLoggedDetails, the identifiers only
+// that error type produces. Both are read out of the un-redacted
+// "http error response" log record, which is what establishes that the details
+// PROPAGATE through the handler rather than merely being produced by the
+// wrapper (TestPromptEndpoints_ResolveErrorDetails_Agree covers the wrapper).
 func TestPromptRender_DocumentInjection_FailClosedModes(t *testing.T) {
 	missingAtPinned := func() *injFetcher {
 		ff := newInjFetcher()
@@ -750,30 +797,61 @@ func TestPromptRender_DocumentInjection_FailClosedModes(t *testing.T) {
 		decls    func(context.Context, *run.Run, *run.Stage) ([]repodoc.Declaration, string, error)
 		wantCode int
 		wantErr  string
+		// wantCause is a substring UNIQUE to this row's failure branch, asserted
+		// on the logged (un-redacted) details.error. Required on every refusal
+		// row: without it the row is satisfied by any other injection failure.
+		wantCause string
+		// wantNotCause is a substring that must be ABSENT — a sibling branch's
+		// identifying wording, so a row cannot be greened by the wrong control
+		// firing.
+		wantNotCause string
+		// wantLoggedDetails are exact logged detail values required on this row.
+		// Only a *repodoc.ResolveError produces path / declaration_site, so this
+		// both discriminates M3's branch and pins that those identifiers reach
+		// the operator log through the handler.
+		wantLoggedDetails map[string]string
 	}{
 		// M1: declarations wired, resolver nil — a wiring defect, not an inert state.
-		{"misconfigured seam", nil, injDeclarations, http.StatusInternalServerError, "document_injection_failed"},
+		{name: "misconfigured seam", decls: injDeclarations,
+			wantCode: http.StatusInternalServerError, wantErr: "document_injection_failed",
+			wantCause:    "DocumentDeclarations is configured but DocumentResolver is nil",
+			wantNotCause: "resolve document declarations"},
 		// M2: the declaration seam itself fails.
-		{"declaration seam error",
-			&repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}},
-			seamErr, http.StatusInternalServerError, "document_injection_failed"},
-		// M3: declared-but-absent document at the pinned commit.
-		{"resolution failure",
-			&repodoc.Resolver{Fetcher: missingAtPinned(), Commits: &injCommits{sha: injPinnedCommit}},
-			injDeclarations, http.StatusInternalServerError, "document_injection_failed"},
+		{name: "declaration seam error",
+			resolver: &repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}},
+			decls:    seamErr,
+			wantCode: http.StatusInternalServerError, wantErr: "document_injection_failed",
+			wantCause:    "resolve document declarations: declaration seam unavailable",
+			wantNotCause: "DocumentResolver is nil"},
+		// M3: declared-but-absent document at the pinned commit. Its cause is a
+		// *repodoc.ResolveError, so it is the one row carrying path /
+		// declaration_site identifiers.
+		{name: "resolution failure",
+			resolver: &repodoc.Resolver{Fetcher: missingAtPinned(), Commits: &injCommits{sha: injPinnedCommit}},
+			decls:    injDeclarations,
+			wantCode: http.StatusInternalServerError, wantErr: "document_injection_failed",
+			wantCause:         "repodoc: declared document not found",
+			wantNotCause:      "resolve document declarations:",
+			wantLoggedDetails: map[string]string{"path": injPath, "declaration_site": injDeclSite}},
 		// M9: a configured seam declaring nothing injects nothing and serves 200.
-		{"empty declaration list",
-			&repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}},
-			emptyDecls, http.StatusOK, ""},
+		{name: "empty declaration list",
+			resolver: &repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}},
+			decls:    emptyDecls, wantCode: http.StatusOK},
 		// M10: fully inert — no declaration seam at all.
-		{"inert seam",
-			&repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}},
-			nil, http.StatusOK, ""},
+		{name: "inert seam",
+			resolver: &repodoc.Resolver{Fetcher: newInjFetcher(), Commits: &injCommits{sha: injPinnedCommit}},
+			wantCode: http.StatusOK},
 	}
 
 	for _, tc := range rows {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, stageID, _ := newInjectionServer(t, newStoringAuditRepo(), tc.resolver, tc.decls)
+			// Capture the server's error log: the 5xx body is redacted down to
+			// the allow-listed keys, so the branch-identifying cause and the
+			// ResolveError identifiers are observable ONLY here.
+			var logBuf bytes.Buffer
+			s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
 			w := promptRenderRequest(t, s, stageID)
 			if w.Code != tc.wantCode {
 				t.Fatalf("status = %d, want %d:\n%s", w.Code, tc.wantCode, w.Body.String())
@@ -784,6 +862,29 @@ func TestPromptRender_DocumentInjection_FailClosedModes(t *testing.T) {
 				}
 				if strings.Contains(w.Body.String(), injBaseContent) || strings.Contains(w.Body.String(), injSoftContent) {
 					t.Errorf("a refused preview still served document content:\n%s", w.Body.String())
+				}
+
+				// Branch discrimination. status + code are identical across all
+				// three refusal rows, so the assertion that identifies WHICH
+				// control refused is made on the logged cause.
+				if tc.wantCause == "" {
+					t.Fatalf("row declares no wantCause — a refusal row must name its own branch")
+				}
+				details := injErrorLogDetails(t, logBuf.String())
+				cause, _ := details["error"].(string)
+				if !strings.Contains(cause, tc.wantCause) {
+					t.Errorf("logged details.error = %q, want it to contain %q — a DIFFERENT injection failure refused",
+						cause, tc.wantCause)
+				}
+				if tc.wantNotCause != "" && strings.Contains(cause, tc.wantNotCause) {
+					t.Errorf("logged details.error = %q carries a sibling branch's wording %q",
+						cause, tc.wantNotCause)
+				}
+				for k, want := range tc.wantLoggedDetails {
+					if got, _ := details[k].(string); got != want {
+						t.Errorf("logged details[%q] = %q, want %q — the ResolveError identifiers did not "+
+							"propagate through the handler into the log record", k, got, want)
+					}
 				}
 				return
 			}

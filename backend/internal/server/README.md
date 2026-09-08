@@ -381,7 +381,12 @@ the preview and the served prompt for the same stage carry IDENTICAL bytes and a
 identical `prompt_hash`, and refuse identically (same HTTP status, same `error.code`, same
 `error.details.reason`, and for a `repodoc.ResolveError` the same `path` /
 `declaration_site` on the error the log record carries). `TestGroomingPrompt_PreviewMatchesServed`
-compares the two RESPONSES rather than asserting each in isolation.
+compares the two RESPONSES rather than asserting each in isolation — AND every row declares
+its own expected outcome (`wantStatus`, plus `wantCharter` on a 200 row) with the
+success-vs-refusal branch selected by that declared outcome, never by the status the served
+endpoint returned. Comparison alone is vacuous against a SHARED regression: two endpoints
+that both stopped refusing agree with each other, and would also agree on the then-absent
+charter block.
 
 The ONE ratified divergence is ATTRIBUTION: the preview writes NO `document_injected` /
 `document_truncated` entries. A `document_injected` entry claims a revision CONSTRAINED AN
