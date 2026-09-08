@@ -708,10 +708,11 @@ func TestGetStagePrompt_Plan_CarriesResolvedModel(t *testing.T) {
 	priv, _ := sf.issue(t, runID)
 
 	rr.runRow = &run.Run{
-		ID:            runID,
-		Repo:          "kuhlman-labs/example",
-		WorkflowID:    "feature_change",
-		TriggerSource: "manual",
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   "manual",
 		WorkflowSpec: []byte("workflows:\n" +
 			"  feature_change:\n" +
 			"    stages:\n" +
@@ -771,10 +772,11 @@ func TestGetStagePrompt_Plan_EmptyModelOmitted(t *testing.T) {
 	priv, _ := sf.issue(t, runID)
 
 	rr.runRow = &run.Run{
-		ID:            runID,
-		Repo:          "kuhlman-labs/example",
-		WorkflowID:    "feature_change",
-		TriggerSource: "manual",
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   "manual",
 		// No WorkflowSpec plan executor.model, no default.
 	}
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
@@ -841,10 +843,11 @@ func TestGetStagePrompt_PlanStage_DoesNotFetchIssue_WhenNotIssueTriggered(t *tes
 	priv, _ := sf.issue(t, runID)
 
 	rr.runRow = &run.Run{
-		ID:            runID,
-		Repo:          "x/y",
-		WorkflowID:    "feature_change",
-		TriggerSource: "manual",
+		ID:              runID,
+		Repo:            "x/y",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   "manual",
 		// TriggerRef nil → no issue fetch
 	}
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
@@ -909,11 +912,12 @@ func TestGetStagePrompt_PrefersCachedIssueContext(t *testing.T) {
 
 	triggerRef := "issue:42"
 	rr.runRow = &run.Run{
-		ID:            runID,
-		Repo:          "kuhlman-labs/example",
-		WorkflowID:    "feature_change",
-		TriggerSource: run.TriggerGitHubIssue,
-		TriggerRef:    &triggerRef,
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   run.TriggerGitHubIssue,
+		TriggerRef:      &triggerRef,
 		// No InstallationID — the local-runner shape. The cache
 		// MUST work without one.
 		IssueContext: &run.IssueContext{
@@ -959,11 +963,12 @@ func TestGetStagePrompt_CachedIssueContext_PreferredOverGitHubFetch(t *testing.T
 	installation := int64(99)
 	triggerRef := "issue:42"
 	rr.runRow = &run.Run{
-		ID:             runID,
-		Repo:           "kuhlman-labs/example",
-		TriggerSource:  run.TriggerGitHubIssue,
-		TriggerRef:     &triggerRef,
-		InstallationID: &installation,
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		TriggerSource:   run.TriggerGitHubIssue,
+		RequiresCharter: chFalse(),
+		TriggerRef:      &triggerRef,
+		InstallationID:  &installation,
 		IssueContext: &run.IssueContext{
 			Number: 42,
 			Title:  "Cached",
@@ -1004,11 +1009,12 @@ func TestGetStagePrompt_CachedIssueComments_MappedIntoTrigger(t *testing.T) {
 
 	triggerRef := "issue:42"
 	rr.runRow = &run.Run{
-		ID:            runID,
-		Repo:          "kuhlman-labs/example",
-		WorkflowID:    "feature_change",
-		TriggerSource: run.TriggerGitHubIssue,
-		TriggerRef:    &triggerRef,
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   run.TriggerGitHubIssue,
+		TriggerRef:      &triggerRef,
 		IssueContext: &run.IssueContext{
 			Number: 42,
 			Title:  "Cached title",
@@ -1071,7 +1077,8 @@ func TestFillIssueContext_OverCapCommentWarn(t *testing.T) {
 		triggerRef := "issue:42"
 		rr.runRow = &run.Run{
 			ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change",
-			TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+			RequiresCharter: chFalse(),
+			TriggerSource:   run.TriggerGitHubIssue, TriggerRef: &triggerRef,
 			IssueContext: &run.IssueContext{
 				Number: 42, Title: "T", Body: "B", URL: "https://github.com/kuhlman-labs/example/issues/42",
 				Comments: []run.IssueComment{
@@ -1102,7 +1109,8 @@ func TestFillIssueContext_OverCapCommentWarn(t *testing.T) {
 		triggerRef := "issue:42"
 		rr.runRow = &run.Run{
 			ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change",
-			TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+			RequiresCharter: chFalse(),
+			TriggerSource:   run.TriggerGitHubIssue, TriggerRef: &triggerRef,
 			IssueContext: &run.IssueContext{
 				Number: 42, Title: "T", Body: "B", URL: "https://github.com/kuhlman-labs/example/issues/42",
 				Comments: []run.IssueComment{
@@ -1128,7 +1136,8 @@ func TestFillIssueContext_OverCapCommentWarn(t *testing.T) {
 		triggerRef := "issue:42"
 		rr.runRow = &run.Run{
 			ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change",
-			TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+			RequiresCharter: chFalse(),
+			TriggerSource:   run.TriggerGitHubIssue, TriggerRef: &triggerRef,
 			InstallationID: &installation,
 			// No cached IssueContext → branch 2 fetches.
 		}
@@ -1164,11 +1173,12 @@ func TestGetStagePrompt_CachedIssueContext_NoComments(t *testing.T) {
 
 	triggerRef := "issue:42"
 	rr.runRow = &run.Run{
-		ID:            runID,
-		Repo:          "kuhlman-labs/example",
-		WorkflowID:    "feature_change",
-		TriggerSource: run.TriggerGitHubIssue,
-		TriggerRef:    &triggerRef,
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   run.TriggerGitHubIssue,
+		TriggerRef:      &triggerRef,
 		IssueContext: &run.IssueContext{
 			Number: 42,
 			Title:  "Cached title",
@@ -1208,12 +1218,13 @@ func TestGetStagePrompt_WebhookFetchedComments_MappedIntoTrigger(t *testing.T) {
 	var installation int64 = 555
 	triggerRef := "issue:42"
 	rr.runRow = &run.Run{
-		ID:             runID,
-		Repo:           "kuhlman-labs/example",
-		WorkflowID:     "feature_change",
-		TriggerSource:  run.TriggerGitHubIssue,
-		TriggerRef:     &triggerRef,
-		InstallationID: &installation,
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   run.TriggerGitHubIssue,
+		TriggerRef:      &triggerRef,
+		InstallationID:  &installation,
 		// No IssueContext — forces branch 2 (webhook fetch).
 	}
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
@@ -1260,12 +1271,13 @@ func TestGetStagePrompt_WebhookCommentsFetchError_DegradesToBody(t *testing.T) {
 	var installation int64 = 555
 	triggerRef := "issue:42"
 	rr.runRow = &run.Run{
-		ID:             runID,
-		Repo:           "kuhlman-labs/example",
-		WorkflowID:     "feature_change",
-		TriggerSource:  run.TriggerGitHubIssue,
-		TriggerRef:     &triggerRef,
-		InstallationID: &installation,
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   run.TriggerGitHubIssue,
+		TriggerRef:      &triggerRef,
+		InstallationID:  &installation,
 	}
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
 	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "Body text", State: "open"}
@@ -1501,12 +1513,13 @@ func TestGetStagePromptRender_MatchesSignatureAuthedPath(t *testing.T) {
 	installation := int64(99)
 	triggerRef := "issue:42"
 	rr.runRow = &run.Run{
-		ID:             runID,
-		Repo:           "kuhlman-labs/example",
-		WorkflowID:     "feature_change",
-		TriggerSource:  run.TriggerGitHubIssue,
-		TriggerRef:     &triggerRef,
-		InstallationID: &installation,
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   run.TriggerGitHubIssue,
+		TriggerRef:      &triggerRef,
+		InstallationID:  &installation,
 	}
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
 	gh.issue = &githubclient.Issue{Number: 42, Title: "T", Body: "B", State: "open"}
@@ -1661,11 +1674,12 @@ func TestGetStagePrompt_PlanBudget_NilSpecFallsBackTo15m(t *testing.T) {
 	stageID := uuid.New()
 
 	rr.runRow = &run.Run{
-		ID:            runID,
-		Repo:          "x/y",
-		WorkflowID:    "feature_change",
-		TriggerSource: run.TriggerCLI,
-		WorkflowSpec:  nil,
+		ID:              runID,
+		Repo:            "x/y",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   run.TriggerCLI,
+		WorkflowSpec:    nil,
 	}
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
 
@@ -2415,11 +2429,12 @@ func TestPromptHandler_PriorRejectionFeedback_OverCap_MarkerNamesPriorRun(t *tes
 	}
 	tr := triggerRef
 	rr.runRow = &run.Run{
-		ID:            currentID,
-		Repo:          "kuhlman-labs/example",
-		WorkflowID:    "feature_change",
-		TriggerSource: "manual",
-		TriggerRef:    &tr,
+		ID:              currentID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   "manual",
+		TriggerRef:      &tr,
 	}
 	rr.stage = &run.Stage{ID: stageID, RunID: currentID, Type: run.StageTypePlan}
 
@@ -2675,7 +2690,7 @@ func seedNarrowedPlanArtifact(t *testing.T, stageID uuid.UUID, paths []string) *
 func TestGetStagePrompt_Plan_NonRevise_NoCarryForwardSection(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	rr := newPromptRunRepo()
-	rr.runRow = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change", TriggerSource: "manual"}
+	rr.runRow = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change", TriggerSource: "manual", RequiresCharter: chFalse()}
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
 	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {rr.stage}}
 	art := seedNarrowedPlanArtifact(t, stageID, []string{"b/a.go", "b/b.go"})
@@ -8415,12 +8430,13 @@ func TestGetStagePrompt_NonAcceptanceStages_OmitAcceptanceFields(t *testing.T) {
 			installation := int64(99)
 			triggerRef := "issue:42"
 			rr.runRow = &run.Run{
-				ID:             runID,
-				Repo:           "kuhlman-labs/example",
-				WorkflowID:     "feature_change",
-				TriggerSource:  run.TriggerGitHubIssue,
-				TriggerRef:     &triggerRef,
-				InstallationID: &installation,
+				ID:              runID,
+				Repo:            "kuhlman-labs/example",
+				WorkflowID:      "feature_change",
+				RequiresCharter: chFalse(),
+				TriggerSource:   run.TriggerGitHubIssue,
+				TriggerRef:      &triggerRef,
+				InstallationID:  &installation,
 			}
 			rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: stageType}
 			gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "Body text", State: "open"}
@@ -8590,10 +8606,11 @@ func seedFlipRun(t *testing.T, rr *promptRunRepo, sf *signingFake, state run.Sta
 	stageID = uuid.New()
 	priv, _ = sf.issue(t, runID)
 	rr.runRow = &run.Run{
-		ID:            runID,
-		Repo:          "kuhlman-labs/example",
-		WorkflowID:    "feature_change",
-		TriggerSource: "manual",
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   "manual",
 	}
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan, State: state}
 	return runID, stageID, priv
@@ -12665,6 +12682,7 @@ func TestPromptRender_NonGrooming_ByteIdenticalWithInertSeam(t *testing.T) {
 			runID, stageID := uuid.New(), uuid.New()
 			rr.getRuns[runID] = &run.Run{
 				ID: runID, Repo: "o/r", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI,
+				RequiresCharter: chFalse(),
 			}
 			rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: stageType}
 			rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {rr.getStages[stageID]}}

@@ -52,31 +52,40 @@ func TestGroomingPrompt_CrossLayerAgreement(t *testing.T) {
 		name            string
 		spec            string
 		workflowID      string // override when non-empty (the workflow-absent rows)
+		requires        *bool  // the row's persisted determination; nil is the LEGACY row
 		stageIsPlan     bool
 		wantUndecidable bool // stageRequiresCharter returns an error → handler refuses
 	}{
-		{"grooming spec on a plan stage", chGroomingSpec, "", true, false},
-		{"plain spec on a plan stage", chPlainSpec, "", true, false},
-		{"grooming spec on a non-plan stage", chGroomingSpec, "", false, false},
-		{"nil workflow spec", "", "", true, false},
-		// The M8 family.
-		{"M8a unparseable grooming-attributable", chCorruptGroomingSpec, "", true, true},
-		{"M8b unparseable and plain", chCorruptPlainSpec, "", true, false},
-		{"M8c workflow absent but grooming-shaped", chGroomingSpec, "not_declared", true, true},
-		{"token in a comment", chSchemaInvalidTokenInComment, "", true, false},
-		{"token in an unrelated scalar", chSchemaInvalidTokenInScalar, "", true, false},
-		{"token in another workflow", chSchemaInvalidOtherWorkflowGrooms, "", true, false},
+		// Rows carrying a persisted determination: the FACT decides, and the
+		// cached spec is never read — corrupt or not.
+		{"persisted grooming on a plan stage", chGroomingSpec, "", chTrue(), true, false},
+		{"persisted non-grooming on a plan stage", chPlainSpec, "", chFalse(), true, false},
+		{"persisted grooming on a non-plan stage", chGroomingSpec, "", chTrue(), false, false},
+		{"persisted non-grooming, nil workflow spec", "", "", chFalse(), true, false},
+		{"persisted grooming, unparseable spec", chCorruptGroomingSpec, "", chTrue(), true, false},
+		{"persisted grooming, spec token destroyed", chGroomingSpecTokenDestroyed, "", chTrue(), true, false},
+		{"persisted non-grooming, corrupt spec with incidental token", chCorruptPlainSpecIncidentalToken, "", chFalse(), true, false},
+		// Legacy rows (no persisted determination): derived from the cached
+		// spec, refused when undecidable.
+		{"legacy grooming spec on a plan stage", chGroomingSpec, "", nil, true, false},
+		{"legacy plain spec on a plan stage", chPlainSpec, "", nil, true, false},
+		{"legacy grooming spec on a non-plan stage", chGroomingSpec, "", nil, false, false},
+		{"legacy nil workflow spec", "", "", nil, true, true},
+		{"legacy unparseable grooming spec", chCorruptGroomingSpec, "", nil, true, true},
+		{"legacy unparseable plain spec", chCorruptPlainSpec, "", nil, true, true},
+		{"legacy workflow absent", chGroomingSpec, "not_declared", nil, true, true},
 	}
 
 	for _, tc := range rows {
 		t.Run(tc.name, func(t *testing.T) {
 			installConventions(t, chConventions(chCharterPath), nil)
 			s, runID, stageID, priv, _ := newCharterServer(t, chServerOpts{
-				specYAML:    tc.spec,
-				resolver:    &repodoc.Resolver{Fetcher: newCHFetcher(), Commits: &chCommits{sha: chPinnedCommit}},
-				baseRef:     chDefaultBaseRef,
-				useCharter:  true,
-				stageIsPlan: tc.stageIsPlan,
+				specYAML:        tc.spec,
+				resolver:        &repodoc.Resolver{Fetcher: newCHFetcher(), Commits: &chCommits{sha: chPinnedCommit}},
+				baseRef:         chDefaultBaseRef,
+				useCharter:      true,
+				stageIsPlan:     tc.stageIsPlan,
+				requiresCharter: tc.requires,
 			})
 			rr := s.cfg.RunRepo.(*promptRunRepo)
 			if tc.workflowID != "" {
@@ -179,6 +188,7 @@ func TestGroomingPrompt_PreviewMatchesServed(t *testing.T) {
 		name        string
 		spec        string
 		workflowID  string // override when non-empty (the workflow-absent rows)
+		requires    *bool  // the row's persisted determination; nil is the LEGACY row
 		charterPath string // conventions charter path; chCharterPath unless overridden
 		noCharter   bool   // conventions declare NO charter block at all
 		baseRef     func(ctx context.Context, repo forge.RepoRef) (string, error)
@@ -206,36 +216,45 @@ func TestGroomingPrompt_PreviewMatchesServed(t *testing.T) {
 	}{
 		// Success rows: both endpoints must agree byte-for-byte, and each row
 		// pins whether the charter block is expected in those bytes.
-		{name: "grooming spec on a plan stage", spec: chGroomingSpec, stageIsPlan: true,
+		{name: "grooming spec on a plan stage", spec: chGroomingSpec, requires: chTrue(), stageIsPlan: true,
 			wantStatus: http.StatusOK, wantCharter: true},
-		{name: "plain spec on a plan stage", spec: chPlainSpec, stageIsPlan: true,
+		{name: "plain spec on a plan stage", spec: chPlainSpec, requires: chFalse(), stageIsPlan: true,
 			wantStatus: http.StatusOK, wantCharter: false},
-		{name: "grooming spec on a non-plan stage", spec: chGroomingSpec, stageIsPlan: false,
+		{name: "grooming spec on a non-plan stage", spec: chGroomingSpec, requires: chTrue(), stageIsPlan: false,
 			wantStatus: http.StatusOK, wantCharter: false},
-		{name: "nil workflow spec", spec: "", stageIsPlan: true,
+		{name: "persisted non-grooming, nil workflow spec", spec: "", requires: chFalse(), stageIsPlan: true,
 			wantStatus: http.StatusOK, wantCharter: false},
-		{name: "M8b unparseable and plain", spec: chCorruptPlainSpec, stageIsPlan: true,
+		{name: "persisted non-grooming, corrupt spec with incidental token", spec: chCorruptPlainSpecIncidentalToken,
+			requires: chFalse(), stageIsPlan: true, wantStatus: http.StatusOK, wantCharter: false},
+		{name: "persisted grooming, unparseable spec", spec: chCorruptGroomingSpec, requires: chTrue(),
+			stageIsPlan: true, wantStatus: http.StatusOK, wantCharter: true},
+		{name: "legacy grooming spec on a plan stage", spec: chGroomingSpec, stageIsPlan: true,
+			wantStatus: http.StatusOK, wantCharter: true},
+		{name: "legacy plain spec on a plan stage", spec: chPlainSpec, stageIsPlan: true,
 			wantStatus: http.StatusOK, wantCharter: false},
 
 		// Refusal rows: both endpoints must refuse, and refuse identically.
-		{name: "M8a unparseable grooming-attributable", spec: chCorruptGroomingSpec,
+		{name: "legacy row, unparseable spec", spec: chCorruptGroomingSpec,
 			stageIsPlan: true, wantStatus: http.StatusInternalServerError,
 			wantRefusal: reasonGroomingSpecUnreadable},
-		{name: "M8c workflow absent but grooming-shaped", spec: chGroomingSpec, workflowID: "not_declared",
+		{name: "legacy row, nil workflow spec", spec: "",
+			stageIsPlan: true, wantStatus: http.StatusInternalServerError,
+			wantRefusal: reasonGroomingSpecUnreadable},
+		{name: "legacy row, workflow absent", spec: chGroomingSpec, workflowID: "not_declared",
 			stageIsPlan: true, wantStatus: http.StatusInternalServerError,
 			wantRefusal: reasonGroomingSpecUnreadable},
 		// A *repodoc.ResolveError refusal: no `reason` key exists to compare, so
 		// wantStatus carries the "must refuse" half and the reason assertion
 		// degrades to parity.
-		{name: "declared charter does not resolve", spec: chGroomingSpec, charterPath: "docs/no-such-charter.md",
+		{name: "declared charter does not resolve", spec: chGroomingSpec, requires: chTrue(), charterPath: "docs/no-such-charter.md",
 			stageIsPlan: true, wantStatus: http.StatusInternalServerError, wantRefusal: ""},
-		{name: "charter path empty", spec: chGroomingSpec, charterPath: "   ",
+		{name: "charter path empty", spec: chGroomingSpec, requires: chTrue(), charterPath: "   ",
 			stageIsPlan: true, wantStatus: http.StatusInternalServerError,
 			wantRefusal: reasonCharterPathEmpty},
-		{name: "charter absent from conventions", spec: chGroomingSpec, noCharter: true,
+		{name: "charter absent from conventions", spec: chGroomingSpec, requires: chTrue(), noCharter: true,
 			stageIsPlan: true, wantStatus: http.StatusInternalServerError,
 			wantRefusal: reasonCharterAbsent},
-		{name: "base ref unresolved", spec: chGroomingSpec, stageIsPlan: true,
+		{name: "base ref unresolved", spec: chGroomingSpec, requires: chTrue(), stageIsPlan: true,
 			baseRef:     func(context.Context, forge.RepoRef) (string, error) { return "", nil },
 			wantStatus:  http.StatusInternalServerError,
 			wantRefusal: reasonCharterBaseRefUnresolved},
@@ -245,10 +264,10 @@ func TestGroomingPrompt_PreviewMatchesServed(t *testing.T) {
 		// itself), so these two are what discriminate the preview's
 		// assertCharterInjected call specifically: L1 either cannot run at all or
 		// resolves a document that is NOT the charter.
-		{name: "M6 declaration seam entirely unwired", spec: chGroomingSpec, noSeam: true,
+		{name: "M6 declaration seam entirely unwired", spec: chGroomingSpec, requires: chTrue(), noSeam: true,
 			stageIsPlan: true, wantStatus: http.StatusInternalServerError,
 			wantRefusal: reasonCharterNotInjected},
-		{name: "M7 an unrelated document injected, no charter", spec: chGroomingSpec,
+		{name: "M7 an unrelated document injected, no charter", spec: chGroomingSpec, requires: chTrue(),
 			decls:       chUnrelatedDocumentDeclarations,
 			stageIsPlan: true, wantStatus: http.StatusInternalServerError,
 			wantRefusal: reasonCharterNotInjected},
@@ -272,11 +291,12 @@ func TestGroomingPrompt_PreviewMatchesServed(t *testing.T) {
 			ff := newCHFetcher()
 			ff.extra[chOtherPath] = chOtherContent
 			opts := chServerOpts{
-				specYAML:    tc.spec,
-				resolver:    &repodoc.Resolver{Fetcher: ff, Commits: &chCommits{sha: chPinnedCommit}},
-				baseRef:     baseRef,
-				useCharter:  true,
-				stageIsPlan: tc.stageIsPlan,
+				specYAML:        tc.spec,
+				resolver:        &repodoc.Resolver{Fetcher: ff, Commits: &chCommits{sha: chPinnedCommit}},
+				baseRef:         baseRef,
+				useCharter:      true,
+				stageIsPlan:     tc.stageIsPlan,
+				requiresCharter: tc.requires,
 			}
 			switch {
 			case tc.noSeam:

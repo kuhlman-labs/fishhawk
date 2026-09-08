@@ -108,11 +108,17 @@ func newFixture(t *testing.T) *e2eFixture {
 	// We bypass the HTTP signing-key endpoint (which would need
 	// OIDC) — the test already has the pool and the runner-side
 	// flow at production runtime is the same: issue, then sign.
+	// The fixture run carries no WorkflowSpec, so it is stamped with the
+	// persisted non-grooming determination a row minted after migration 0082
+	// carries (E54.13 / #2806): without it the plan prompt-render below would
+	// be refused as an undecidable legacy row.
+	requiresCharter := false
 	r, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
-		Repo:          "kuhlman-labs/fishhawk",
-		WorkflowID:    "feature_change",
-		WorkflowSHA:   "deadbeef",
-		TriggerSource: runpkg.TriggerCLI,
+		Repo:            "kuhlman-labs/fishhawk",
+		WorkflowID:      "feature_change",
+		WorkflowSHA:     "deadbeef",
+		TriggerSource:   runpkg.TriggerCLI,
+		RequiresCharter: &requiresCharter,
 	})
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
