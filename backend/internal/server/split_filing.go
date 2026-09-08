@@ -114,6 +114,16 @@ type splitChildrenFiledPayload struct {
 	// the correct fail-quiet direction for a best-effort watcher.
 	ParentRepo  string `json:"parent_repo,omitempty"`
 	ParentIssue int    `json:"parent_issue,omitempty"`
+	// ParentForge is the forge FAMILY the split was filed under ("github" |
+	// "gitlab"), so the E50.6 parent-close watcher can bind a linkage to the
+	// DELIVERING forge (#2900 fix-up). Without it, a GitHub and a GitLab
+	// repository sharing an identical path and issue number are
+	// indistinguishable, and a GitHub-filed linkage could close an unrelated
+	// GitLab parent (or vice versa). `omitempty` and additive: a marker written
+	// before this field decodes fine and is read as the github family (the
+	// pre-parity default — every historical marker was GitHub), so existing
+	// GitHub linkages keep matching. See splitParentForgeFamilyFromRef.
+	ParentForge string `json:"parent_forge,omitempty"`
 }
 
 // SplitChildrenFiledPayload is an exported alias of the completion-marker payload
@@ -688,6 +698,10 @@ func (s *Server) writeSplitChildFiledMarker(ctx context.Context, runRow *run.Run
 // writeSplitChildrenFiledAudit emits the ONE completion marker after every child
 // is filed. Best-effort: an append failure logs but never unwinds the approval.
 func (s *Server) writeSplitChildrenFiledAudit(ctx context.Context, runRow *run.Run, classification splitfiling.ContractClassification, children []splitFilingChild, contractChildNumber int, draft *splitfiling.CapExceptionDraft, parentRepo string, parentIssue int) {
+	installationRef := ""
+	if runRow.InstallationRef != nil {
+		installationRef = *runRow.InstallationRef
+	}
 	payload := splitChildrenFiledPayload{
 		ContractClassification: string(classification),
 		Children:               children,
@@ -695,6 +709,10 @@ func (s *Server) writeSplitChildrenFiledAudit(ctx context.Context, runRow *run.R
 		DeferralIssue:          splitfiling.DeferralIssue,
 		ParentRepo:             parentRepo,
 		ParentIssue:            parentIssue,
+		// Bind the linkage to the forge FAMILY this run filed under so the
+		// parent-close watcher can never close a same-path/same-number parent on
+		// the WRONG forge (#2900 fix-up).
+		ParentForge: splitParentForgeFamilyFromRef(installationRef),
 	}
 	if draft != nil {
 		payload.CapException = &splitCapExceptionDraft{SpecDiff: draft.SpecDiff, PRBody: draft.PRBody}

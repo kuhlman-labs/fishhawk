@@ -36,9 +36,13 @@ import (
 // nothing.
 //
 // LINKAGE IS A PURE PAYLOAD READ. The split_children_filed completion marker
-// carries parent_repo + parent_issue + contract_child_number (#2062 widened it
-// additively), so resolving "which parent does this closed issue belong to?"
-// needs NO run and NO forge call. That is what structurally eliminates the
+// carries parent_repo + parent_issue + contract_child_number + parent_forge
+// (#2062 added the first three additively; #2900 added parent_forge), so
+// resolving "which parent does this closed issue belong to?" needs NO run and
+// NO forge call. parent_forge is LOAD-BEARING across forges: a GitHub and a
+// GitLab repository can share an identical path AND issue number, so a linkage
+// is bound to the forge FAMILY it was filed under and never drives a close on
+// the other forge (an absent value on a pre-#2900 marker reads as github). That is what structurally eliminates the
 // *run.InstallationID nil-deref class rather than merely guarding it: the
 // credential identity comes off the webhook.Event itself — InstallationID (an
 // int64 that is ZERO when the event isn't installation-scoped) for GitHub,
@@ -154,6 +158,34 @@ func splitParentForgeID(ev webhook.Event) string {
 		return forgeNameGitHub
 	}
 	return ev.Forge
+}
+
+// splitParentForgeFamilyFromRef maps a run's forge-neutral installation_ref to
+// the forge FAMILY string the linkage read compares against — the SAME
+// vocabulary splitParentForgeID emits for a delivery. A "gitlab:<project-id>"
+// ref (ADR-058) is the gitlab family; every other ref — a bare GitHub App
+// installation id, or an empty/absent ref on a legacy GitHub run — is the
+// github family. Recorded on the split_children_filed marker (#2900 fix-up) so
+// the parent-close watcher binds a linkage to the DELIVERING forge and never
+// closes a same-path/same-number parent on the wrong forge.
+func splitParentForgeFamilyFromRef(ref string) string {
+	if strings.HasPrefix(ref, webhook.ForgeGitLab+":") {
+		return webhook.ForgeGitLab
+	}
+	return forgeNameGitHub
+}
+
+// normalizeSplitParentForge maps a marker's recorded parent_forge onto the
+// forge FAMILY vocabulary, defaulting an ABSENT value to the github family: a
+// marker written before parent_forge existed (#2900 fix-up) was necessarily
+// GitHub (GitLab parity is newer), so an empty value reads as github and every
+// pre-existing GitHub linkage keeps matching. Operator-confirmed backward-compat
+// rule on the amendment approving this fix.
+func normalizeSplitParentForge(recorded string) string {
+	if recorded == "" {
+		return forgeNameGitHub
+	}
+	return recorded
 }
 
 // splitParentClosedIssue decodes the closed issue's number and (GitHub-only)
@@ -287,7 +319,7 @@ func (s *Server) handleContractChildClosed(ctx context.Context, ev webhook.Event
 	// LINKAGE FIRST (see the file comment): a pure payload read needing no
 	// credential and no forge call. Every outcome below this point is ABOUT a
 	// real split; an unrelated issue closing exits here having written nothing.
-	link := s.resolveSplitParentLinkage(ctx, ev.Repo, closedNumber)
+	link := s.resolveSplitParentLinkage(ctx, forgeID, ev.Repo, closedNumber)
 	switch {
 	case link.readErr != nil:
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "split parent close: list split_children_filed failed",
@@ -426,6 +458,12 @@ func (s *Server) handleContractChildClosed(ctx context.Context, ev webhook.Event
 //
 // A split_children_filed entry survives the filter only when ALL of these hold:
 //
+//   - parent_forge equals the DELIVERING forge family (#2900 fix-up). LOAD-
+//     BEARING across forges: a GitHub and a GitLab repository can share an
+//     identical path AND issue number, so matching on repo + number alone would
+//     let a GitHub-filed linkage close an unrelated GitLab parent (or vice
+//     versa). An absent parent_forge on a pre-parity marker reads as github
+//     (normalizeSplitParentForge), so historical GitHub linkages keep matching.
 //   - parent_repo equals the closed issue's repo. LOAD-BEARING: issue numbers
 //     are PER-REPO, so matching on number alone would let an unrelated repo's
 //     issue #N trigger (or, via the ambiguity rule below, suppress) a close in
@@ -440,7 +478,7 @@ func (s *Server) handleContractChildClosed(ctx context.Context, ev webhook.Event
 // pick: a same-repo, same-child pair naming different parents cannot both be
 // right, and closing the wrong parent is unrecoverable and operator-visible. A
 // defined skip with an audited reason beats an arbitrary choice.
-func (s *Server) resolveSplitParentLinkage(ctx context.Context, repoFullName string, closedNumber int) splitParentLinkage {
+func (s *Server) resolveSplitParentLinkage(ctx context.Context, deliveryForge, repoFullName string, closedNumber int) splitParentLinkage {
 	cat := splitChildrenFiledCategory
 	entries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &cat})
 	if err != nil {
@@ -455,6 +493,9 @@ func (s *Server) resolveSplitParentLinkage(ctx context.Context, repoFullName str
 		var p splitChildrenFiledPayload
 		if json.Unmarshal(e.Payload, &p) != nil {
 			continue // undecodable entry: skip, never abort the whole read.
+		}
+		if normalizeSplitParentForge(p.ParentForge) != deliveryForge {
+			continue // linkage filed under a DIFFERENT forge: not this delivery's.
 		}
 		if p.ParentRepo != repoFullName || p.ContractChildNumber != closedNumber {
 			continue

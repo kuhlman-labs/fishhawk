@@ -238,6 +238,49 @@ func TestGitLabClient_ListIssueNotes_RefusesOffOriginNextLink(t *testing.T) {
 	}
 }
 
+// TestGitLabClient_ListIssueNotes_RefusesOffOriginRedirect pins the guard the
+// off-origin-Link case above does NOT reach: a SAME-origin notes endpoint that
+// answers with an HTTP 302 to a foreign host. sameOrigin validated the initial
+// URL, so without a redirect boundary the default *http.Client would follow the
+// 302 and carry the custom PRIVATE-TOKEN header there (the stdlib strips only
+// Authorization/Cookie on a cross-host hop, not a custom header). The foreign
+// host is a reachable in-test server that RECORDS any token it receives, so
+// deleting the CheckRedirect guard in doNoOffOriginRedirect SUCCEEDS against it
+// and reddens BOTH the zero-hit and zero-token-disclosure assertions rather
+// than failing on a connection error.
+func TestGitLabClient_ListIssueNotes_RefusesOffOriginRedirect(t *testing.T) {
+	var foreignHits atomic.Int64
+	var leakedToken atomic.Value // string
+	leakedToken.Store("")
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		foreignHits.Add(1)
+		leakedToken.Store(r.Header.Get("PRIVATE-TOKEN"))
+		writeIssueJSON(w, http.StatusOK, `[]`)
+	}))
+	t.Cleanup(foreign.Close)
+
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7/notes", func(w http.ResponseWriter, r *http.Request) {
+		// Same-origin endpoint that 302s off-instance. A default client would
+		// chase this and re-attach PRIVATE-TOKEN to the foreign request.
+		http.Redirect(w, r, foreign.URL+"/api/v4/projects/42/issues/7/notes?page=2", http.StatusFound)
+	})
+
+	notes, err := s.client().ListIssueNotes(context.Background(), 42, 7)
+	if err == nil {
+		t.Fatalf("ListIssueNotes = %v, nil; want a refusal of the off-origin redirect", notes)
+	}
+	if !strings.Contains(err.Error(), "refusing next-page link") {
+		t.Errorf("err = %v, want the same-origin refusal from CheckRedirect", err)
+	}
+	if got := foreignHits.Load(); got != 0 {
+		t.Errorf("foreign host received %d requests, want 0 (token must not follow a redirect off-instance)", got)
+	}
+	if tok := leakedToken.Load().(string); tok != "" {
+		t.Errorf("foreign host saw PRIVATE-TOKEN %q, want it never disclosed", tok)
+	}
+}
+
 func TestGitLabClient_ListIssueNotes_APIError(t *testing.T) {
 	s := newIssueServer(t)
 	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7/notes", func(w http.ResponseWriter, r *http.Request) {

@@ -503,9 +503,20 @@ type splitParentCloseAudit struct {
 
 func newSplitParentCloseAudit() *splitParentCloseAudit { return &splitParentCloseAudit{} }
 
-// seedLinkage appends one split_children_filed entry in the shape
-// writeSplitChildrenFiledAudit produces, at the given timestamp.
+// seedLinkage appends one split_children_filed entry in the shape a PRE-PARITY
+// (#2900) writeSplitChildrenFiledAudit produced: NO parent_forge field. The
+// watcher reads an absent value as the github family, so every GitHub case
+// relies on this default and seedLinkage keeps producing the legacy shape. A
+// GitLab case opts into an explicit family via seedLinkageForge.
 func (a *splitParentCloseAudit) seedLinkage(t *testing.T, parentRepo string, parentIssue, contractChild int, ts time.Time) {
+	t.Helper()
+	a.seedLinkageForge(t, "", parentRepo, parentIssue, contractChild, ts)
+}
+
+// seedLinkageForge appends one split_children_filed entry attributed to the
+// given forge FAMILY ("github" | "gitlab"; "" reproduces a pre-parity marker
+// with the field omitted), in the shape writeSplitChildrenFiledAudit produces.
+func (a *splitParentCloseAudit) seedLinkageForge(t *testing.T, forge, parentRepo string, parentIssue, contractChild int, ts time.Time) {
 	t.Helper()
 	payload, err := json.Marshal(splitChildrenFiledPayload{
 		ContractClassification: "delete-only",
@@ -513,6 +524,7 @@ func (a *splitParentCloseAudit) seedLinkage(t *testing.T, parentRepo string, par
 		DeferralIssue:          splitfiling.DeferralIssue,
 		ParentRepo:             parentRepo,
 		ParentIssue:            parentIssue,
+		ParentForge:            forge,
 	})
 	if err != nil {
 		t.Fatalf("marshal linkage payload: %v", err)
@@ -1553,7 +1565,7 @@ func assertGitLabCommentThenClose(t *testing.T, gl *splitParentGitLab, projectID
 // comment-then-close in the watcher reddens the order assertion).
 func TestSplitParentClose_GitLab_ClosesParent(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 
 	h.deliverGitLabIssue(t, "gl-t1", gitlabParentCloseBody())
@@ -1599,7 +1611,7 @@ func TestSplitParentClose_GitLab_ClosesParent(t *testing.T) {
 // is still live: TestContractChildClosed_NotLandedStateReasons_LeaveParentOpen.
 func TestSplitParentClose_GitLab_ClosedChildWithNoStateReason_ClosesParent(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 
 	body := gitlabParentCloseBody()
@@ -1627,7 +1639,7 @@ func TestSplitParentClose_GitLab_ClosedChildWithNoStateReason_ClosesParent(t *te
 // proves the marker round-tripped through GET .../notes byte-intact.
 func TestSplitParentClose_GitLab_RedeliverySkipsComment(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 	key := splitfiling.ParentCloseCommentKey(splitCloseGitLabRepo, splitCloseParent, splitCloseContract)
 	h.gl.seedNote(splitCloseGitLabProject, splitCloseParent,
@@ -1665,7 +1677,7 @@ func (h *splitParentCloseHarness) deliverIssueClosedGitLabRedelivery(t *testing.
 func TestSplitParentClose_GitLab_MarkerOnSecondPage_SkipsComment(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
 	h.gl.pageSize = 1
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 	key := splitfiling.ParentCloseCommentKey(splitCloseGitLabRepo, splitCloseParent, splitCloseContract)
 	h.gl.seedNote(splitCloseGitLabProject, splitCloseParent, "an unrelated earlier note")
@@ -1692,7 +1704,7 @@ func TestSplitParentClose_GitLab_MarkerOnSecondPage_SkipsComment(t *testing.T) {
 // TestSplitParentClose_GitLab_RedeliverySkipsComment exists separately.
 func TestSplitParentClose_GitLab_RedeliveryAfterClose_NoSecondNote(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 
 	h.deliverIssueClosedGitLabRedelivery(t, "gl-t3a")
@@ -1716,7 +1728,7 @@ func TestSplitParentClose_GitLab_RedeliveryAfterClose_NoSecondNote(t *testing.T)
 // a closed parent (RED on the note count).
 func TestSplitParentClose_GitLab_AlreadyClosedParent(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "closed")
 
 	h.deliverIssueClosedGitLabRedelivery(t, "gl-t4")
@@ -1742,7 +1754,7 @@ func TestSplitParentClose_GitLab_AlreadyClosedParent(t *testing.T) {
 // blind (RED on the note count).
 func TestSplitParentClose_GitLab_ListNotesFailure_PostsNothing(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 	h.gl.failListNotes = true
 
@@ -1777,7 +1789,7 @@ func TestSplitParentClose_GitLab_ListNotesFailure_PostsNothing(t *testing.T) {
 // return after a failed PostIssueComment commits the parent to closed (RED).
 func TestSplitParentClose_GitLab_PostNoteFailure_DoesNotClose(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 	h.gl.failPostNote = true
 
@@ -1800,7 +1812,7 @@ func TestSplitParentClose_GitLab_PostNoteFailure_DoesNotClose(t *testing.T) {
 // nothing, and closes — exactly one note at the end.
 func TestSplitParentClose_GitLab_CloseFailure_RecordsCloseFailed(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 	h.gl.failPutIssue = true
 
@@ -1837,7 +1849,7 @@ func TestSplitParentClose_GitLab_CloseFailure_RecordsCloseFailed(t *testing.T) {
 // converges.
 func TestSplitParentClose_GitLab_GetIssueFailure_NothingWedged(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 	h.gl.failGetIssue = true
 
@@ -1871,7 +1883,7 @@ func TestSplitParentClose_GitLab_GetIssueFailure_NothingWedged(t *testing.T) {
 // counterfactual observable.
 func TestSplitParentClose_GitLab_NoCredentialRef_RecordsNoInstallation(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 
 	h.deliverGitLabIssue(t, "gl-t9", gitlabIssueBody(0, splitCloseGitLabRepo, splitCloseContract, "close"))
@@ -1897,7 +1909,7 @@ func TestSplitParentClose_GitLab_NoCredentialRef_RecordsNoInstallation(t *testin
 // the scope gate ahead of linkage reddens it with a false no_installation.
 func TestSplitParentClose_GitLab_UnrelatedIssue_NoCredentialRef_WritesNothing(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 
 	h.deliverGitLabIssue(t, "gl-t9b", gitlabIssueBody(0, splitCloseGitLabRepo, 999, "close"))
 
@@ -1916,7 +1928,7 @@ func TestSplitParentClose_GitLab_UnrelatedIssue_NoCredentialRef_WritesNothing(t 
 // reddens it (silent unsplittable skip, parent stays opened).
 func TestSplitParentClose_GitLab_NestedGroupPath(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabNestedRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabNestedRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabNestedProject, splitCloseParent, "opened")
 
 	h.deliverGitLabIssue(t, "gl-t10",
@@ -1967,14 +1979,60 @@ func TestSplitParentRepoRef(t *testing.T) {
 	}
 }
 
+// TestSplitParentForgeFamily pins the two forge-family mappers the #2900 fix-up
+// added: splitParentForgeFamilyFromRef derives the marker's family from a run's
+// installation_ref, and normalizeSplitParentForge reads a recorded (or absent)
+// family back. The pair MUST land a GitLab ref and a GitLab-recorded marker on
+// the SAME "gitlab" token and everything else on "github", or the read-side
+// filter would mis-bind a linkage.
+func TestSplitParentForgeFamily(t *testing.T) {
+	refCases := []struct {
+		ref  string
+		want string
+	}{
+		{"gitlab:77", webhook.ForgeGitLab},
+		{"gitlab:0", webhook.ForgeGitLab},
+		{"4242", forgeNameGitHub},      // bare GitHub App installation id
+		{"", forgeNameGitHub},          // legacy GitHub run with no ref
+		{"gitlab", forgeNameGitHub},    // no ":" — not the gitlab scheme
+		{"github:1", forgeNameGitHub},  // unknown scheme falls to github
+		{"GITLAB:77", forgeNameGitHub}, // case-sensitive: not the gitlab prefix
+	}
+	for _, tc := range refCases {
+		if got := splitParentForgeFamilyFromRef(tc.ref); got != tc.want {
+			t.Errorf("splitParentForgeFamilyFromRef(%q) = %q, want %q", tc.ref, got, tc.want)
+		}
+	}
+
+	recordedCases := []struct {
+		recorded string
+		want     string
+	}{
+		{"", forgeNameGitHub}, // absent field on a pre-parity marker reads as github
+		{forgeNameGitHub, forgeNameGitHub},
+		{webhook.ForgeGitLab, webhook.ForgeGitLab},
+	}
+	for _, tc := range recordedCases {
+		if got := normalizeSplitParentForge(tc.recorded); got != tc.want {
+			t.Errorf("normalizeSplitParentForge(%q) = %q, want %q", tc.recorded, got, tc.want)
+		}
+	}
+
+	// The round trip the marker relies on: a run's ref stamps a family that reads
+	// back as the SAME family a delivery on that forge computes.
+	if a, b := splitParentForgeFamilyFromRef("gitlab:77"), normalizeSplitParentForge(webhook.ForgeGitLab); a != b {
+		t.Errorf("gitlab round trip: ref->%q vs recorded->%q, want equal", a, b)
+	}
+}
+
 // TestSplitParentClose_GitLab_AmbiguousLinkage_SkipsAndAudits re-runs the
 // conflicting-linkage skip on the GitLab path: two same-project entries naming
 // different parents for the same contract child -> ambiguous_linkage, zero
 // forge calls.
 func TestSplitParentClose_GitLab_AmbiguousLinkage_SkipsAndAudits(t *testing.T) {
 	h := newSplitParentCloseHarness(t)
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
-	h.au.seedLinkage(t, splitCloseGitLabRepo, 200, splitCloseContract, splitCloseTime().Add(time.Minute))
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, 200, splitCloseContract, splitCloseTime().Add(time.Minute))
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 	h.gl.seedIssue(splitCloseGitLabProject, 200, "opened")
 
@@ -2014,7 +2072,7 @@ func TestSplitParentClose_GitLab_NonCloseActions_NotRouted(t *testing.T) {
 	for _, action := range []string{"open", "update", "reopen"} {
 		t.Run("issue/"+action, func(t *testing.T) {
 			h := newSplitParentCloseHarness(t)
-			h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+			h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 			h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 
 			h.deliverGitLabIssue(t, "gl-t13-"+action,
@@ -2058,54 +2116,68 @@ func TestSplitParentClose_GitHub_ReopenedNotRouted(t *testing.T) {
 	}
 }
 
-// TestSplitParentClose_ForgeFamilyBinding is the per-family ladder
-// counterfactual, constructed so deleting the binding in splitParentIssueOpsFor
-// CANNOT pass for an unrelated reason: BOTH fakes are reachable in-test servers
-// wired simultaneously, each seeded with an OPEN parent at the SAME issue
-// number under the SAME repo path "o/r" (GitLab project 77 has
-// path_with_namespace "o/r"), and ONE linkage entry for "o/r" serves both. A
-// wrong-forge call therefore SUCCEEDS against the wrong server, and the
-// assertion lands on WHICH server's committed state changed — not on a
-// connection error.
+// TestSplitParentClose_ForgeFamilyBinding pins that a split-parent linkage is
+// bound to the forge FAMILY it was FILED under (#2900 fix-up), NOT merely to a
+// repo path + issue number. Colliding identities are wired simultaneously:
+// GitHub repo "o/r" and GitLab project 77 whose path_with_namespace is ALSO
+// "o/r", each with an OPEN parent #100 and contract child #103, both fakes
+// reachable in-test. A single linkage is filed under ONE family; the delivery on
+// that SAME family closes its own parent, and the COLLIDING delivery on the
+// OTHER family must find no linkage and leave its parent untouched. Deleting the
+// read-side forge filter (normalizeSplitParentForge in resolveSplitParentLinkage)
+// lets the wrong-forge delivery match and close the colliding parent — reddening
+// the "stays open" assertion on a real committed-state change, not a connection
+// error. This subsumes the earlier adapter-isolation shape, which a single
+// forge-less linkage "serving both" could not distinguish from linkage
+// ownership.
 func TestSplitParentClose_ForgeFamilyBinding(t *testing.T) {
-	seed := func(t *testing.T) *splitParentCloseHarness {
+	t.Run("github-filed linkage closes only the github parent, never the colliding gitlab one", func(t *testing.T) {
 		h := newSplitParentCloseHarness(t)
-		h.au.seedLinkage(t, splitCloseRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+		h.au.seedLinkageForge(t, forgeNameGitHub, splitCloseRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 		h.gh.seedIssue(splitCloseRepo, splitCloseParent, "open")
 		h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
-		return h
-	}
 
-	t.Run("gitlab delivery touches only the gitlab forge", func(t *testing.T) {
-		h := seed(t)
-		h.deliverGitLabIssue(t, "bind-gl", gitlabIssueBody(splitCloseGitLabProject, splitCloseRepo, splitCloseContract, "close"))
-
-		if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "closed" {
-			t.Errorf("gitlab parent native state = %q, want closed", got.state)
-		}
-		if got := h.gh.issue(t, splitCloseRepo, splitCloseParent); got.state != "open" {
-			t.Errorf("GitHub parent state = %q, want open (a GitLab delivery must not close it)", got.state)
-		}
-		if calls := h.gh.callLog(); len(calls) != 0 {
-			t.Errorf("GitLab delivery made GitHub calls: %v", calls)
-		}
-		if bodies := h.gh.commentBodies(splitCloseRepo, splitCloseParent); len(bodies) != 0 {
-			t.Errorf("GitLab delivery posted %d GitHub comments, want 0", len(bodies))
-		}
-	})
-
-	t.Run("github delivery touches only the github forge", func(t *testing.T) {
-		h := seed(t)
+		// GitHub delivery: the linkage is github-owned, so the GitHub parent closes.
 		h.deliverIssueClosed(t, "bind-gh", closedBody(splitCloseRepo, splitCloseContract, `"completed"`, splitCloseInstallID))
-
 		if got := h.gh.issue(t, splitCloseRepo, splitCloseParent); got.state != "closed" {
 			t.Errorf("GitHub parent state = %q, want closed", got.state)
 		}
+
+		// Colliding GitLab delivery for path "o/r" #103: a github-owned linkage is
+		// NOT this delivery's, so the GitLab parent stays open and no GitLab write
+		// happens. This is the assertion the read-side forge filter guards.
+		h.deliverGitLabIssue(t, "bind-gl", gitlabIssueBody(splitCloseGitLabProject, splitCloseRepo, splitCloseContract, "close"))
 		if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "opened" {
-			t.Errorf("gitlab parent native state = %q, want opened (a GitHub delivery must not close it)", got.state)
+			t.Errorf("gitlab parent native state = %q, want opened (a github-filed linkage must not close a gitlab parent)", got.state)
 		}
 		if calls := h.gl.callLog(); len(calls) != 0 {
-			t.Errorf("GitHub delivery made GitLab calls: %v", calls)
+			t.Errorf("github-filed linkage drove GitLab calls: %v", calls)
+		}
+	})
+
+	t.Run("gitlab-filed linkage closes only the gitlab parent, never the colliding github one", func(t *testing.T) {
+		h := newSplitParentCloseHarness(t)
+		h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+		h.gh.seedIssue(splitCloseRepo, splitCloseParent, "open")
+		h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
+
+		// GitLab delivery: the linkage is gitlab-owned, so the GitLab parent closes.
+		h.deliverGitLabIssue(t, "bind-gl2", gitlabIssueBody(splitCloseGitLabProject, splitCloseRepo, splitCloseContract, "close"))
+		if got := h.gl.issue(t, splitCloseGitLabProject, splitCloseParent); got.state != "closed" {
+			t.Errorf("gitlab parent native state = %q, want closed", got.state)
+		}
+
+		// Colliding GitHub delivery: a gitlab-owned linkage is not this delivery's,
+		// so the GitHub parent stays open and no GitHub write happens.
+		h.deliverIssueClosed(t, "bind-gh2", closedBody(splitCloseRepo, splitCloseContract, `"completed"`, splitCloseInstallID))
+		if got := h.gh.issue(t, splitCloseRepo, splitCloseParent); got.state != "open" {
+			t.Errorf("GitHub parent state = %q, want open (a gitlab-filed linkage must not close a github parent)", got.state)
+		}
+		if calls := h.gh.callLog(); len(calls) != 0 {
+			t.Errorf("gitlab-filed linkage drove GitHub calls: %v", calls)
+		}
+		if bodies := h.gh.commentBodies(splitCloseRepo, splitCloseParent); len(bodies) != 0 {
+			t.Errorf("gitlab-filed linkage posted %d GitHub comments, want 0", len(bodies))
 		}
 	})
 
@@ -2155,7 +2227,7 @@ func TestSplitParentClose_GitLab_ResolverNilRungs(t *testing.T) {
 	for name, resolver := range rungs {
 		t.Run(name, func(t *testing.T) {
 			h := newSplitParentCloseHarness(t, func(c *Config) { c.ForgeResolver = resolver })
-			h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+			h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 			h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 
 			h.deliverIssueClosedGitLabRedelivery(t, "gl-rung-"+strings.ReplaceAll(name, " ", "-"))
@@ -2183,7 +2255,7 @@ func TestSplitParentClose_GitLab_DefaultResolverIsRegistry(t *testing.T) {
 	if _, err := forge.Get(webhook.ForgeGitLab); err == nil {
 		t.Skip("a gitlab forge is registered in this process; the registry fallback is not observable here")
 	}
-	h.au.seedLinkage(t, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
+	h.au.seedLinkageForge(t, webhook.ForgeGitLab, splitCloseGitLabRepo, splitCloseParent, splitCloseContract, splitCloseTime())
 	h.gl.seedIssue(splitCloseGitLabProject, splitCloseParent, "opened")
 
 	h.deliverIssueClosedGitLabRedelivery(t, "gl-default-resolver")
