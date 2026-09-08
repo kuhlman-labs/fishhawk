@@ -13608,6 +13608,319 @@ func TestImplementReview_StandingRule8_Rendered(t *testing.T) {
 	}
 }
 
+// --- #2119 grounding criteria + severity calibration ----------------------
+
+// COUNTERFACTUAL RECORD (#2119, operator binding condition 5). Each control
+// this pass adds was DELETED, the guarding test RUN, the RED observed, and the
+// file restored byte-identically. Verified with `git diff --stat` after each
+// restore (0 lines changed) and with a pre-run grep proving the mutation
+// landed. Observed, not reasoned:
+//
+//  1. GROUNDING BRANCH — writeGroundedCalibrationCriteria: both if/else pairs
+//     collapsed to the GROUNDED arm rendered unconditionally (the else bodies
+//     deleted). Mutation proven landed: `grep -c "baseline is UNESTABLISHED"
+//     prompt.go` went 1 -> 0.
+//       go test -run TestImplementReview_CalibrationCriteria ./internal/prompt/
+//       --- FAIL: TestImplementReview_CalibrationCriteria_UngroundedVariant
+//           prompt_test.go: ungrounded render missing "the baseline is
+//           UNESTABLISHED and calibrate the severity DOWN accordingly"
+//           prompt_test.go: ungrounded render must NOT carry the grounded text
+//           "Resolve the baseline against the exported tree and CITE the file"
+//       FAIL
+//     The grounded half stayed GREEN, which is exactly what self-pairing buys:
+//     a collapsed branch cannot pass both halves.
+//
+//  2. CARVE-OUT SENTENCE — the final b.WriteString in
+//     writeGroundedCalibrationCriteria (the adversarial-reasoning carve-out)
+//     deleted outright. Mutation proven landed: `grep -c "not citable to a
+//     line" prompt.go` went 1 -> 0.
+//       go test -run TestImplementReview_CalibrationCriteria_AdversarialCarveOut ./internal/prompt/
+//       --- FAIL: TestImplementReview_CalibrationCriteria_AdversarialCarveOut/ungrounded
+//           prompt_test.go: carve-out missing from the ungrounded posture: "is
+//           a claim about what COULD happen and is not citable to a line"
+//       --- FAIL: TestImplementReview_CalibrationCriteria_AdversarialCarveOut/grounded
+//           (same three wants)
+//       FAIL
+//
+//  3. PriorConcerns GUARD — the re-read-before-reopen b.WriteString HOISTED
+//     out of the `if len(t.PriorConcerns) > 0` block to render
+//     unconditionally. Mutation proven landed: the bullet's WriteString moved
+//     below the closing brace of that block (indentation went 2 tabs -> 1).
+//       go test -run TestImplementReview_PriorConcerns ./internal/prompt/
+//       --- FAIL: TestImplementReview_PriorConcerns_EmptyByteIdentical
+//           prompt_test.go: empty PriorConcerns must render NO fragment of the
+//           re-read bullet; found "Before emitting a `reopened` resolution"
+//       FAIL
+//     TestBuildImplementReview_NilSliceVerifyByteIdentical also went RED under
+//     this mutation (that trigger carries no prior concerns), a second
+//     independent witness on the #984 empty-case byte-identity.
+//
+// Each mutation was reverted and the full package re-run GREEN afterwards.
+
+// groundedImplementReview renders the implement-review prompt with the given
+// review-tree commit, so a test can drive the two grounding postures over one
+// otherwise-identical trigger. An empty sha is the UNGROUNDED (diff-only)
+// posture, which is the DEFAULT since ADR-078's operator correction ships
+// grounding dormant.
+func groundedImplementReview(t *testing.T, treeCommit string) string {
+	t.Helper()
+	got, err := Build("implement_review", Trigger{
+		Repo:             "kuhlman-labs/example",
+		IssueNumber:      2119,
+		IssueTitle:       "grounding + calibration",
+		ApprovedPlan:     fixturePlan(),
+		Diff:             "- M pkg/bar/bar.go\n",
+		ReviewTreeCommit: treeCommit,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return got
+}
+
+const (
+	// The two grounded-only sentences and the two ungrounded-only sentences.
+	// The self-paired tests below assert each posture CONTAINS its own pair and
+	// does NOT contain the other's, so collapsing the branch reddens a half.
+	groundedBaselineText   = "Resolve the baseline against the exported tree and CITE the file"
+	groundedPredictionText = "Resolve the prediction against the exported tree and CITE the definition you read."
+	ungroundedBaselineText = "the baseline is UNESTABLISHED and calibrate the severity DOWN accordingly"
+	ungroundedTraceText    = "say the prediction is UNTRACED and calibrate the severity DOWN"
+)
+
+// TestImplementReview_BaselineAndTraceCriteria_Rendered: standing criteria 9
+// and 10 render, ORDERED after standing rule 8, and criteria 4-8 plus the
+// verdict rule's "standing rule 7" cross-reference are unmoved — the
+// regression guard on the untouched-criteria claim (operator binding
+// condition 1).
+func TestImplementReview_BaselineAndTraceCriteria_Rendered(t *testing.T) {
+	got := implementReviewWithGateEvidence(t, &GateEvidence{
+		VerifyRuns: []GateVerifyRun{{Command: "scripts/test", ExitCode: 0, Outcome: "passed", OutputTail: "ok\n"}},
+	})
+	const (
+		rule8  = "8. **Evidence you cannot see is an evidence-PLACEMENT observation, never a change defect (standing rule)**"
+		rule9  = "9. **Baseline check before severity (standing rule)**"
+		rule10 = "10. **Trace mechanical predictions (standing rule)**"
+		verdid = "### Verdict decision rule"
+	)
+	i8, i9, i10, iv := strings.Index(got, rule8), strings.Index(got, rule9), strings.Index(got, rule10), strings.Index(got, verdid)
+	if i8 < 0 || i9 < 0 || i10 < 0 || iv < 0 {
+		t.Fatalf("criteria 8/9/10 and the verdict rule must all render (8=%d 9=%d 10=%d verdict=%d)\n---\n%s",
+			i8, i9, i10, iv, got)
+	}
+	if i8 >= i9 || i9 >= i10 || i10 >= iv {
+		t.Errorf("criteria 9/10 must be appended after rule 8 and before the verdict rule (8=%d 9=%d 10=%d verdict=%d)",
+			i8, i9, i10, iv)
+	}
+	// Criteria 1-8 and the numbered lenses are unmoved and byte-identical.
+	for _, w := range []string{
+		"1. **Security / authz**",
+		"2. **Test vacuity**",
+		"3. **Untested error / edge / concurrency paths**",
+		"4. **Scope adherence (flag-only)**",
+		"5. **Grounded citations**",
+		"6. **Style is out of scope**",
+		"7. **Do NOT reject on an unconfirmable absence (standing rule)**",
+		"standing rule 7",
+		// The reworded, count-neutral lead-in (the literal "Three" went stale
+		// when standing rules 7 and 8 landed).
+		"The standing criteria below, orthogonal to the lenses above, also apply:",
+		// The substance of each new criterion, so a heading-only edit is red.
+		"first establish whether sibling or surrounding code already exhibits the same pattern",
+		"report it as pre-existing convention this diff MATCHES, not as a regression this diff INTRODUCED",
+		"must be traced to the actual definitions that govern it: the fake, the override, the wiring, the fixture",
+		"a test fake routinely overrides the base behavior its name implies",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement-review prompt missing %q\n---\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "Three standing criteria orthogonal to the lenses above") {
+		t.Errorf("the stale count-bearing lead-in must not survive\n---\n%s", got)
+	}
+}
+
+// TestImplementReview_CalibrationCriteria_GroundedVariant is the first half of
+// the self-paired pair: with ReviewTreeCommit SET the grounded sentences render
+// and the ungrounded ones must NOT. Pairing presence with the other variant's
+// ABSENCE is what makes this a real counterfactual — collapsing the branch to
+// render one variant unconditionally reddens whichever half then sees the wrong
+// text, so neither half can pass vacuously.
+func TestImplementReview_CalibrationCriteria_GroundedVariant(t *testing.T) {
+	got := groundedImplementReview(t, "0123456789abcdef0123456789abcdef01234567")
+	for _, w := range []string{groundedBaselineText, groundedPredictionText} {
+		if !strings.Contains(got, w) {
+			t.Errorf("grounded render missing %q\n---\n%s", w, got)
+		}
+	}
+	for _, w := range []string{ungroundedBaselineText, ungroundedTraceText} {
+		if strings.Contains(got, w) {
+			t.Errorf("grounded render must NOT carry the ungrounded text %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestImplementReview_CalibrationCriteria_UngroundedVariant is the second half:
+// with ReviewTreeCommit EMPTY (the DEFAULT posture — ADR-078's operator
+// correction ships grounding dormant with FISHHAWKD_REVIEW_GROUNDING false) the
+// ungrounded sentences render and the grounded ones must NOT.
+func TestImplementReview_CalibrationCriteria_UngroundedVariant(t *testing.T) {
+	got := groundedImplementReview(t, "")
+	for _, w := range []string{ungroundedBaselineText, ungroundedTraceText} {
+		if !strings.Contains(got, w) {
+			t.Errorf("ungrounded render missing %q\n---\n%s", w, got)
+		}
+	}
+	for _, w := range []string{groundedBaselineText, groundedPredictionText} {
+		if strings.Contains(got, w) {
+			t.Errorf("ungrounded render must NOT carry the grounded text %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestImplementReview_CalibrationCriteria_AdversarialCarveOut: the carve-out
+// bounding criteria 9/10 to pattern-based and mechanical-prediction findings
+// renders in BOTH grounding postures. This is the guard #2119's "Explicitly NOT
+// the ask" section demands — deleting the sentence, which is exactly the
+// over-broadening that would suppress the adversarial-reasoning class the E44
+// campaign's highest-value findings came from, turns this test RED.
+func TestImplementReview_CalibrationCriteria_AdversarialCarveOut(t *testing.T) {
+	wants := []string{
+		"These two standing rules apply to PATTERN-based and MECHANICAL-PREDICTION findings ONLY.",
+		"They are NOT a requirement to cite a line for every claim.",
+		"is a claim about what COULD happen and is not citable to a line",
+		"do NOT withhold such a finding for want of a citation, and do NOT downgrade its severity on that ground",
+	}
+	for _, tc := range []struct {
+		name string
+		sha  string
+	}{
+		{"grounded", "0123456789abcdef0123456789abcdef01234567"},
+		{"ungrounded", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := groundedImplementReview(t, tc.sha)
+			for _, w := range wants {
+				if !strings.Contains(got, w) {
+					t.Errorf("carve-out missing from the %s posture: %q\n---\n%s", tc.name, w, got)
+				}
+			}
+		})
+	}
+}
+
+// TestImplementReview_SeverityRubric_Rendered: the three tier definitions
+// render on BOTH gate-evidence branches, and the block sits AFTER the verdict
+// decision rule and BEFORE ImplementReviewSplitMarker — pinning its placement
+// in the cache-stable prefix, which a later move below the boundary would
+// otherwise silently break.
+func TestImplementReview_SeverityRubric_Rendered(t *testing.T) {
+	withEvidence := implementReviewWithGateEvidence(t, &GateEvidence{
+		VerifyRuns: []GateVerifyRun{{Command: "scripts/test", ExitCode: 0, Outcome: "passed", OutputTail: "ok\n"}},
+	})
+	noEvidence := implementReviewWithGateEvidence(t, nil)
+	wants := []string{
+		"### Severity calibration",
+		"- `high`: the defect is REACHABLE in a supported configuration.",
+		"- `medium`: reaching it requires a misconfiguration or an unusual wiring.",
+		"- `low`: defense-in-depth hardening, documentation accuracy, or test hardening, with no reachable defect behind it.",
+		"state in the note WHICH tier you applied and why",
+		"is a `low`, not a `high`.",
+	}
+	for _, tc := range []struct {
+		name string
+		got  string
+	}{
+		{"gate_evidence", withEvidence},
+		{"no_gate_evidence", noEvidence},
+	} {
+		for _, w := range wants {
+			if !strings.Contains(tc.got, w) {
+				t.Errorf("[%s] severity rubric missing %q\n---\n%s", tc.name, w, tc.got)
+			}
+		}
+		iv := strings.Index(tc.got, "### Verdict decision rule")
+		ir := strings.Index(tc.got, "### Severity calibration")
+		is := strings.Index(tc.got, ImplementReviewSplitMarker)
+		if iv < 0 || ir < 0 || is < 0 {
+			t.Fatalf("[%s] verdict rule / rubric / split marker must all render (v=%d r=%d s=%d)", tc.name, iv, ir, is)
+		}
+		if iv >= ir || ir >= is {
+			t.Errorf("[%s] rubric must follow the verdict rule and precede ImplementReviewSplitMarker (v=%d r=%d s=%d)",
+				tc.name, iv, ir, is)
+		}
+	}
+}
+
+// priorConcernFragments are the substrings of the re-read-before-reopen bullet.
+// The presence half asserts them all render with PriorConcerns non-empty; the
+// absence half asserts NONE of them renders when it is empty.
+var priorConcernFragments = []string{
+	"Before emitting a `reopened` resolution, READ the CURRENT diff state",
+	"either CONFIRM it against the diff in front of you or state SPECIFICALLY what remains missing and where",
+	"Reopening on prior-round reasoning",
+	"restating the round-N finding without checking the round-N+1 diff",
+	"is a defect in the review",
+}
+
+// TestImplementReview_PriorConcerns_ReReadBeforeReopen: the fourth binding
+// bullet renders when PriorConcerns is non-empty.
+func TestImplementReview_PriorConcerns_ReReadBeforeReopen(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		PriorConcerns: []PriorConcern{{
+			ID: "c1", State: "addressed_pending", Severity: "medium", Category: "correctness", Note: "n",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### Prior concerns (delta verification)") {
+		t.Fatalf("prior-concerns section must render\n---\n%s", got)
+	}
+	for _, w := range priorConcernFragments {
+		if !strings.Contains(got, w) {
+			t.Errorf("re-read-before-reopen bullet missing %q\n---\n%s", w, got)
+		}
+	}
+	// The three pre-existing binding bullets are unmoved.
+	for _, w := range []string{
+		"you MUST emit exactly one entry in the verdict's `concern_resolutions` array",
+		"Concerns in state `waived` are context only",
+		"`concerns[]` is ONLY for genuinely NEW findings.",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("pre-existing prior-concerns bullet missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestImplementReview_PriorConcerns_EmptyByteIdentical is the absence half —
+// the counterfactual on the conditional render. With PriorConcerns EMPTY the
+// prompt must contain NO fragment of the new bullet, so hoisting it out of the
+// `len(t.PriorConcerns) > 0` guard (and thereby breaking the #984 empty-case
+// byte-identity) turns this RED.
+func TestImplementReview_PriorConcerns_EmptyByteIdentical(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Prior concerns (delta verification)") {
+		t.Fatalf("empty PriorConcerns must render no prior-concerns section\n---\n%s", got)
+	}
+	for _, w := range priorConcernFragments {
+		if strings.Contains(got, w) {
+			t.Errorf("empty PriorConcerns must render NO fragment of the re-read bullet; found %q\n---\n%s", w, got)
+		}
+	}
+}
+
 // --- #3132 decomposed-parent per-slice verify evidence --------------------
 
 // sliceVerifyEvidence builds a GateEvidence carrying the given per-slice records
@@ -13877,6 +14190,30 @@ func TestWriteGateEvidence_SliceVerifySuppressesNotAttachedBlock(t *testing.T) {
 // A golden derived from the same run it checks is circular and cannot detect the
 // perturbation this pin exists to catch; a vacuous pin is worse than none because
 // it reads as protection. Operator binding condition 3.
+//
+// SECOND DELIBERATE EDIT (#2119, operator binding condition 4). The #2119
+// additions change this render, so the golden was HAND-EDITED line by line —
+// NOT regenerated from post-change code, which would make it vacuous. The
+// tree was grepped repo-wide for a second pin of the "Three standing criteria"
+// lead-in before editing; this const was the only hit, so it is the only pin
+// that needed the reworded lead-in. Exactly these lines changed, and nothing
+// else:
+//   - REWORDED (1 line, in place): the standing-criteria lead-in, from
+//     "Three standing criteria orthogonal to the lenses above also apply:" to
+//     the count-neutral "The standing criteria below, orthogonal to the lenses
+//     above, also apply:" (the literal count went stale when standing rules 7
+//     and 8 landed).
+//   - ADDED (3 lines, after standing rule 8's trailing blank line and before
+//     "### Verdict decision rule"): the criterion-9 line, the criterion-10 line
+//     (both in their UNGROUNDED variant — this trigger has an empty
+//     ReviewTreeCommit), and the adversarial-reasoning carve-out line.
+//   - ADDED (10 lines, after the verdict decision rule's `reject` line and
+//     before "### Plan artifact"): a blank line, the "### Severity calibration"
+//     heading, a blank line, the rubric lead-in line, a blank line, the three
+//     tier lines (`high`/`medium`/`low`), a blank line, and the
+//     standing-rule-9-baseline-is-a-low line.
+//
+// It remains FROZEN against post-change regeneration.
 const nilSliceVerifyPromptGolden = "You are an implement-review agent for the repository `kuhlman-labs/example`.\n" +
 	"\n" +
 	"ROLE CONSTRAINT (binding — read before writing any output)\n" +
@@ -13929,7 +14266,7 @@ const nilSliceVerifyPromptGolden = "You are an implement-review agent for the re
 	"2. **Test vacuity**: For each added or changed test, does it actually ASSERT the behavior it claims to cover, or is it a tautology that passes regardless of what the code does? CI passes a vacuous test; only a reviewer reading the test body catches it. Flag tests that assert nothing load-bearing.\n" +
 	"3. **Untested error / edge / concurrency paths**: Does the change add happy-path code plus a happy-path test that silently skips the error branch, a boundary condition, or a race / concurrency path the change introduces? Flag the specific untested path.\n" +
 	"\n" +
-	"Three standing criteria orthogonal to the lenses above also apply:\n" +
+	"The standing criteria below, orthogonal to the lenses above, also apply:\n" +
 	"\n" +
 	"4. **Scope adherence (flag-only)**: Does the diff touch files outside the plan's scope.files? If so, record a `{category: \"scope\"}` concern naming the out-of-scope files. Files listed in the 'Scope amended at approval', 'Scope amended mid-stage', and 'Scope authorized by child slice amendments' sections below (when present) ARE in-scope — the operator authorized them at approval time, mid-stage, or on a fan-out child slice — and must NOT be flagged as drift. Only files the diff touches that are in NONE of scope.files, the approval-amended list, the mid-stage-amended list, or the child-slice-amended list are drift. Do NOT reject solely for scope drift — drift is a flag, not a blocker.\n" +
 	"5. **Grounded citations**: Any rule you cite — from CLAUDE.md, a style guide, or a project convention — MUST be one you can quote verbatim from the context provided in this prompt or from a repository file you actually read during this review. Do NOT assert rules from memory. If you cannot verify the rule exists, do NOT raise the concern. Ground every concern in the plan, issue, and diff actually provided.\n" +
@@ -13937,11 +14274,25 @@ const nilSliceVerifyPromptGolden = "You are an implement-review agent for the re
 	"7. **Do NOT reject on an unconfirmable absence (standing rule)**: The diff shown below is scope-bounded — it excludes any scope-drift paths the operator may stage into the final commit (see the Scope drift section when present). So a required test, doc, or other file appearing absent from the diff is NOT proof it is missing: it may be a drift path or otherwise outside this scoped view. Do NOT reject on the grounds that such a file is 'missing from the committed diff/artifact' unless you positively confirmed its absence by reading the repository. Treat an absence you cannot positively confirm as unverifiable and downgrade to approve_with_concerns — do not assert the absence of a file you could not actually inspect. (This is distinct from lens 2: a test that is PRESENT but vacuous is still a valid reject; this rule only forbids rejecting on a test that merely APPEARS absent.)\n" +
 	"8. **Evidence you cannot see is an evidence-PLACEMENT observation, never a change defect (standing rule)**: Verification evidence the agent reported in the PULL-REQUEST BODY — counterfactual RED transcripts, grep results, delete-observe-restore outputs — is NOT part of the material available to this review. Your material is scope-bounded and diff-only; you do not receive the PR body. Where the agent supplied STRUCTURED counterfactual evidence it appears in the gate-evidence 'Counterfactual self-report' block above, and that IS in your material — read it there. But where an operator condition asks you to confirm something whose evidence lives on a surface you cannot read, record it as an evidence-PLACEMENT observation naming the condition and the surface, addressed to the operator. Do NOT count it against the change, do NOT treat it as a confirmed gap, and do NOT reject on it.\n" +
 	"\n" +
+	"9. **Baseline check before severity (standing rule)**: Before assigning a severity to a PATTERN-based finding — an unbounded read or decode, a missing cap or limit, an absent guard or check — first establish whether sibling or surrounding code already exhibits the same pattern. If it does, say so explicitly and calibrate the severity DOWN: report it as pre-existing convention this diff MATCHES, not as a regression this diff INTRODUCED. No repository tree is available for this review, so state plainly in the concern note that the baseline is UNESTABLISHED and calibrate the severity DOWN accordingly — do NOT assert that this diff INTRODUCED a pattern whose surroundings you could not check.\n" +
+	"10. **Trace mechanical predictions (standing rule)**: Any claim about what a specific code path, test, or handler WILL DO — a status code returned, an error surfaced, a branch taken — must be traced to the actual definitions that govern it: the fake, the override, the wiring, the fixture. NEVER infer that behavior from a type or function name; a test fake routinely overrides the base behavior its name implies. No repository tree is available for this review, so where the governing definition is not itself in the diff, say the prediction is UNTRACED and calibrate the severity DOWN — do NOT assert what a fake or a fixture does when you cannot read it.\n" +
+	"These two standing rules apply to PATTERN-based and MECHANICAL-PREDICTION findings ONLY. They are NOT a requirement to cite a line for every claim. Adversarial reasoning about implications — a threat model, a privilege-escalation path, a fail-open, a cross-tenant leak — is a claim about what COULD happen and is not citable to a line: do NOT withhold such a finding for want of a citation, and do NOT downgrade its severity on that ground.\n" +
+	"\n" +
 	"### Verdict decision rule\n" +
 	"\n" +
 	"- `approve`: low-risk diff; the lenses are clear (or the security lens self-gated as no sensitive surface) and any concerns are cosmetic.\n" +
 	"- `approve_with_concerns`: diff is acceptable but has non-blocking gaps (including any scope drift); record each gap as a concern with appropriate severity.\n" +
 	"- `reject`: diff has one or more blocking problems — a security / authz regression, a vacuous test that does not assert the behavior it claims, or an unhandled error / edge path the change introduces — that must be resolved; record each blocker as a `high`-severity concern. Scope drift ALONE is never grounds for reject; emit approve_with_concerns instead. A required file merely APPEARING absent from the scope-bounded diff is ALSO never grounds for reject (it may be a drift path the operator stages); per standing rule 7, treat an absence you cannot positively confirm as unverifiable and emit approve_with_concerns, not a confirmed-missing reject.\n" +
+	"\n" +
+	"### Severity calibration\n" +
+	"\n" +
+	"Assign every concern's `severity` from this rubric, and state in the note WHICH tier you applied and why — the operator reconciling two reviewers' verdicts must be able to read the basis of a disagreement rather than re-derive it:\n" +
+	"\n" +
+	"- `high`: the defect is REACHABLE in a supported configuration.\n" +
+	"- `medium`: reaching it requires a misconfiguration or an unusual wiring.\n" +
+	"- `low`: defense-in-depth hardening, documentation accuracy, or test hardening, with no reachable defect behind it.\n" +
+	"\n" +
+	"A standing-rule-9 baseline finding — a pattern already present in sibling or surrounding code, which this diff merely matches — is a `low`, not a `high`.\n" +
 	"\n" +
 	"### Plan artifact\n" +
 	"\n" +
