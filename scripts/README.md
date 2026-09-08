@@ -500,23 +500,136 @@ Helm chart on Docker Desktop's Kubernetes.
   (overriding values-local's `main`/`Always` so the local build is
   used).
 - Waits for the rollout, then opens a
-  `kubectl port-forward svc/fishhawk 8080:8080` and gates on `/healthz`
+  `kubectl port-forward svc/fishhawk <host>:8080` and gates on `/healthz`
   via the same `_await_healthz` poll `cmd_up` uses — the authoritative
   readiness signal, since the in-cluster migrate Job runs as a
   `post-install` hook and rollout-status can go green before it
   finishes.
 - Fails loud on a stuck rollout or `/healthz` timeout: kubectl
   pods + logs tail to stderr, non-zero exit.
+- Sources `.env` first (mirroring `cmd_up` / `cmd_preview`), so the port
+  overrides below can live there.
+- Logs the fishhawkd forward to `logs/k8s-pf.log` rather than
+  `/dev/null`: `kubectl port-forward` writes its `bind: address already
+  in use` failure there, which is the log tail the post-gate
+  `_verify_listener_identity` check prints (#965, now also on the k8s
+  path — a healthy `/healthz` through a DEAD forward is proof of
+  nothing, since a squatter that raced in after the preflight answers
+  the same gate).
+
+### Overridable host ports (E69.6 / [#2917](https://github.com/kuhlman-labs/fishhawk/issues/2917))
+
+All three forwarded HOST ports are overridable; the in-cluster side is
+chart-owned and never moves.
+
+| Variable | Getter | Default |
+|---|---|---|
+| `FISHHAWK_K8S_PF_PORT` | `_k8s_pf_port` | `8080` |
+| `FISHHAWK_K8S_JAEGER_UI_PORT` | `_k8s_jaeger_ui_port` | `16686` |
+| `FISHHAWK_K8S_JAEGER_OTLP_PORT` | `_k8s_jaeger_otlp_port` | `4318` |
+
+**EMPTY MEANS DEFAULT.** Each getter is a bare `${VAR:-default}`, the
+same derivation as `_healthz_port` / `_preview_port` / `_tls_port`, so
+an empty value is indistinguishable from unset and resolves to the
+default — `FISHHAWK_K8S_PF_PORT=` in `.env` is inert, not an empty
+port. That is also why "empty" is NOT a rejection mode of the
+validator: the getter can never hand it one.
+
+The getters are pure and TOTAL (no cluster access, no `_die`, always
+exit 0) so `scripts/test-dev` can assert them in a command
+substitution — and deliberately NOT self-validating, because a `_die`
+inside a `$( )` exits only the subshell and yields an EMPTY string,
+which would then be substituted straight into the `kubectl` argument.
+Validation is therefore a separate, directly-called predicate,
+`_k8s_validate_port <var-name> <value>`: it returns 0 for a decimal
+integer in `1..65535` and otherwise prints a one-line stderr diagnostic
+naming the variable, the offending value and the accepted range, then
+returns 1 (it never exits, so callers use an `if !` tested context per
+the #631 discipline). Rejected: non-numeric (`abc`), partially numeric
+(`80a`), negative, `0`, and anything `> 65535`.
+
+Before the docker build, `cmd_k8s_up` preflights the fishhawkd port via
+the shared `_preflight_port_free` (see below) and aborts on a
+collision — in seconds, rather than after a multi-minute image build
+and a misleading 60s `/healthz` timeout, which is the failure shape
+#2917 reports.
+
+**Caveat, printed at the point of use.** `values-local.yaml` pins
+`config.oauthCallbackUrl` to
+`http://localhost:8080/v0/auth/github/callback`, so a non-default
+`FISHHAWK_K8S_PF_PORT` needs a matching `--set` for OAuth sign-in to
+complete. `cmd_k8s_up` prints the exact line when the resolved port is
+not 8080; it does NOT auto-pass the override, which would couple
+`scripts/dev` to the chart's value surface.
+
+### Shared port preflight (`_preflight_port_free`)
+
+The #965 pre-spawn squatter check that was inline in `cmd_up` is now a
+shared helper both `cmd_up` and `cmd_k8s_up` compose (E69.6 extracted
+it rather than reimplementing the detection). It reuses
+`_port_listeners`; `cmd_up`'s operator-facing text is unchanged — the
+remediation suffix and the lsof degrade warning are passed in by the
+caller verbatim. Contract:
+
+- **lsof absent** → print the caller's degrade warning, return 0. Never
+  fatal; on such a host the port is simply unguarded.
+- **port free** → return 0, silent.
+- **port squatted** → set `PREFLIGHT_SQUATTER_DESC` to the
+  `pid N (comm) ` roster and return 1. With a NON-EMPTY remediation
+  argument it also prints the composed fatal line
+  (`error: port N already has a listener: <roster><remediation>`); with
+  an EMPTY one it prints nothing and the caller composes its own
+  message from `PREFLIGHT_SQUATTER_DESC` — the warn-and-skip shape,
+  where an `error:` prefix would lie.
 
 ### Jaeger port-forward
 
 When the dev-only in-cluster Jaeger is present (`values-local.yaml`
 enables `jaeger.enabled`), `cmd_k8s_up` opens a second
-`kubectl port-forward svc/fishhawk-jaeger 16686:16686 4318:4318` AFTER
+`kubectl port-forward svc/fishhawk-jaeger <ui>:16686 <otlp>:4318` AFTER
 the `/healthz` gate — Service-guarded, so a jaeger-disabled override is
 a clean skip; pid tracked in `.fishhawk/k8s-jaeger-pf.pid` — so the
-host-spawned runner can emit spans to `localhost:4318` and the operator
-can view the Jaeger UI at `localhost:16686`.
+host-spawned runner can emit spans to the OTLP port and the operator
+can view the Jaeger UI on the UI port. Both host ports come from
+`_k8s_jaeger_ui_port` / `_k8s_jaeger_otlp_port` and are validated and
+preflighted like the fishhawkd one; the trailing endpoint lines and the
+`OTEL_EXPORTER_OTLP_ENDPOINT` hint interpolate the RESOLVED ports, so
+the printed guidance can never disagree with the live forward.
+
+The whole refusal decision — and only the refusal decision — lives in
+`_k8s_jaeger_decide <ui> <otlp>` (0 = forward it, 1 = skip it); the
+endpoint lines live in `_k8s_jaeger_endpoints`, reachable ONLY from
+that success branch, so a forward that was not opened can never be
+advertised as live. Both are pure with respect to the cluster, so
+`scripts/test-dev` drives the same composition `cmd_k8s_up` does.
+
+`_k8s_jaeger_decide` refuses on either of two conditions:
+
+- **The two host ports resolve to the SAME value.** The per-port
+  preflights cannot see this — each asks only "is port N free?", and
+  one free port answers yes twice — yet `kubectl port-forward
+  svc/fishhawk-jaeger 9000:16686 9000:4318` binds the first mapping and
+  fails the second. Refused up front by `_k8s_ports_distinct`, which
+  names both variables and the shared value. It SHORT-CIRCUITS ahead of
+  the preflights: nothing holds the port, so an "already has a
+  listener" line here would be a false diagnosis.
+- **Either port is squatted**, reported per-port from
+  `PREFLIGHT_SQUATTER_DESC`.
+
+A Jaeger port colliding with the FISHHAWKD forward port needs no third
+check: that forward is already listening by then, so the preflight
+reports it as an ordinary squatter (naming the kubectl pid).
+
+**Collision policy DIVERGES from the fishhawkd leg, by design
+(operator-ratified, #2917).** A squatted fishhawkd port is FATAL —
+fishhawkd is unreachable without that forward. Either Jaeger refusal
+above instead prints a warning naming the offending port(s) and the
+override variable(s), SKIPS the Jaeger forward, and leaves the
+command's exit code **0** with fishhawkd healthy and usable: this leg
+runs only after the `/healthz` gate has already passed, so aborting
+here would tear down a working stack over an OPTIONAL tracing forward.
+`scripts/test-dev` carries the same attestation next to the assertions
+that pin both policies, so a later edit unifying them goes red.
 
 ### Teardown
 
@@ -526,8 +639,23 @@ mirroring `PID_FILE`) and `helm uninstall`s (idempotent).
 
 ### Testing and docs
 
-The pure helpers `_k8s_image_ref` / `_k8s_healthz_url` are unit-tested
-by `scripts/test-dev`. Operator quickstart + the values-local-vs-prod
+The pure helpers `_k8s_image_ref` / `_k8s_healthz_url` / `_k8s_pf_port`
+/ `_k8s_jaeger_ui_port` / `_k8s_jaeger_otlp_port` / `_k8s_forward_arg`
+/ `_k8s_validate_port` are unit-tested by `scripts/test-dev`, which
+also drives `_preflight_port_free` behaviorally against a real `nc -l`
+squatter (free / squatted / silent-detection / lsof-absent), asserts
+that an override reaches BOTH the printed `/healthz` URL and the
+`kubectl port-forward` argument through the same composition
+`cmd_k8s_up` uses, and body-greps `cmd_k8s_up` for the absence of the
+`8080:8080` / `16686:16686` / `4318:4318` host-side literals — the
+done-means tripwire, since these are shell strings no compiler
+checks. Section 19g drives the Jaeger refusal end to end without a
+cluster: equal free ports (refused, no phantom-squatter line, and the
+decide-then-report composition advertises NO endpoint), distinct free
+ports as the control (forwarded, both resolved ports in the endpoint
+lines), and a distinct-but-`nc`-squatted port (warn-and-skip). Section
+19h records the observed counterfactual RED for every control in this
+area. Operator quickstart + the values-local-vs-prod
 split: `docs/deploy/kubernetes.md`. The true end-to-end path (image
 build → chart install → `/healthz` green) is an operator smoke test
 against a Docker-Desktop cluster, not run in CI.

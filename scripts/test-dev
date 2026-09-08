@@ -27,6 +27,29 @@ set +e
 orig_repo_root="$REPO_ROOT"
 orig_pwd="$PWD"
 
+# A high port with no LISTEN socket, for the port-preflight fixtures (#965,
+# E69.6 / #2917). Prints nothing when it cannot find one in five tries, so
+# callers assert on emptiness rather than proceeding on a squatted port.
+# _port_listeners is invoked in a tested context (its free-port exit is
+# lsof's no-match non-zero).
+# An optional <exclude> port is never returned, so two calls can be composed
+# into a distinct pair. NB: each `$( )` call forks, and a forked zsh inherits
+# the parent's RNG state — two substitutions would otherwise draw the SAME
+# candidate — so the caller passes the first result as the exclusion.
+_free_high_port() {
+  local exclude="${1:-}"
+  local cand _try
+  for _try in 1 2 3 4 5 6 7 8; do
+    cand=$(( 20000 + (RANDOM % 40000) ))
+    if [[ "$cand" == "$exclude" ]]; then continue; fi
+    if [[ -z "$(_port_listeners "$cand")" ]]; then
+      print "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # 1. _signal_mcp_activation is now KIND-form (ADR-060 / #1922): one banner per
 # kind (schema_major | schema_major_shim | shim_rebuilt | reconnect | auto_swap
 # | none). Assert the shipped text of each, not mere helper presence.
@@ -1111,9 +1134,16 @@ fi
 # (c) return non-zero. cmd_k8s_up's helm-fail branch runs before any port-forward
 # or mkdir, so the stubbed run has no side effects on the real repo. Same
 # subshell-exit-status contract as the fixtures above.
+#
+# E69.6 / #2917: cmd_k8s_up now preflights the forward port BEFORE the docker
+# build, so this fixture pins the forward to a port proven free rather than
+# inheriting the default 8080 — on a host already running `scripts/dev up` the
+# preflight would (correctly) abort before helm ever ran.
 if (
   set +e
   kstub="$(mktemp -d)"
+  FISHHAWK_K8S_PF_PORT="$(_free_high_port)"
+  export FISHHAWK_K8S_PF_PORT
   bad_img="minio/mc:RELEASE.2025-01-20T14-49-07Z"
   print -r -- $'#!/usr/bin/env zsh\nexit 0' > "${kstub}/docker"   # docker build succeeds
   print -r -- $'#!/usr/bin/env zsh\nexit 1' > "${kstub}/helm"     # helm upgrade fails
@@ -1437,10 +1467,20 @@ rm -rf "$stray_dir"
 # behaviorally covered above. cmd_up must run the pre-spawn preflight
 # (_port_listeners) and the post-gate identity check; cmd_down must compose
 # _down_port_fallback and keep the refuse-success exit; both sweep strays.
-if print -r -- "$up_body" | grep -q '_port_listeners'; then
-  pass "cmd_up runs the pre-spawn port preflight (_port_listeners)"
+# E69.6 / #2917 extracted the inline detection into _preflight_port_free, so the
+# call-site assertion is re-pointed at the composed helper; the companion grep
+# below pins the REUSE CHAIN (the helper itself still consults _port_listeners),
+# so both endpoints AND the link between them stay asserted rather than only the
+# endpoints.
+if print -r -- "$up_body" | grep -q '_preflight_port_free'; then
+  pass "cmd_up runs the pre-spawn port preflight (_preflight_port_free)"
 else
-  fail "cmd_up should preflight the port via _port_listeners before spawning"
+  fail "cmd_up should preflight the port via _preflight_port_free before spawning"
+fi
+if print -r -- "$(typeset -f _preflight_port_free)" | grep -q '_port_listeners'; then
+  pass "_preflight_port_free reuses _port_listeners (no reimplemented detection)"
+else
+  fail "_preflight_port_free should detect listeners via _port_listeners"
 fi
 if print -r -- "$up_body" | grep -q '_verify_listener_identity'; then
   pass "cmd_up runs the post-gate listener-identity check"
@@ -3846,6 +3886,506 @@ if print -r -- "$relay_down_body" | grep -q '_relay_enabled'; then
 else
   pass "cmd_down tears down the relay unconditionally (no _relay_enabled guard — condition 2)"
 fi
+
+# 19. Overridable local-k8s port-forward ports (E69.6 / #2917).
+#
+# ATTESTATION — collision-policy divergence. cmd_k8s_up runs TWO preflights with
+# DELIBERATELY DIFFERENT policies, ratified by the operator on the approved
+# plan: the fishhawkd forward is FATAL on a squatted port (exit before the
+# docker build), while the jaeger forward WARNS AND SKIPS, leaving the command's
+# exit code 0. The asymmetry is not an oversight — the jaeger forward runs only
+# after fishhawkd is already healthy, so aborting there would tear down a
+# working stack over an optional tracing forward. Both policies are pinned by
+# 19d below (the fatal leg behaviorally, the skip leg by body-grep on the
+# warn-and-skip branch), so a later edit that unified them would go red.
+#
+# 19a. The three getters. EMPTY MEANS DEFAULT (binding condition 1): `${VAR:-d}`
+# treats unset and empty identically, matching every other override knob in
+# scripts/dev — so the getter can never yield an empty string and 'empty' is NOT
+# a rejection mode of the validator (19b).
+unset FISHHAWK_K8S_PF_PORT FISHHAWK_K8S_JAEGER_UI_PORT FISHHAWK_K8S_JAEGER_OTLP_PORT
+if [[ "$(_k8s_pf_port)" == "8080" ]]; then
+  pass "_k8s_pf_port defaults to 8080 when FISHHAWK_K8S_PF_PORT unset"
+else
+  fail "_k8s_pf_port should default to 8080 (got: $(_k8s_pf_port))"
+fi
+if [[ "$(_k8s_jaeger_ui_port)" == "16686" ]]; then
+  pass "_k8s_jaeger_ui_port defaults to 16686 when unset"
+else
+  fail "_k8s_jaeger_ui_port should default to 16686 (got: $(_k8s_jaeger_ui_port))"
+fi
+if [[ "$(_k8s_jaeger_otlp_port)" == "4318" ]]; then
+  pass "_k8s_jaeger_otlp_port defaults to 4318 when unset"
+else
+  fail "_k8s_jaeger_otlp_port should default to 4318 (got: $(_k8s_jaeger_otlp_port))"
+fi
+
+FISHHAWK_K8S_PF_PORT=18080
+if [[ "$(_k8s_pf_port)" == "18080" ]]; then
+  pass "_k8s_pf_port honors the FISHHAWK_K8S_PF_PORT override"
+else
+  fail "_k8s_pf_port should yield 18080 (got: $(_k8s_pf_port))"
+fi
+FISHHAWK_K8S_JAEGER_UI_PORT=26686
+if [[ "$(_k8s_jaeger_ui_port)" == "26686" ]]; then
+  pass "_k8s_jaeger_ui_port honors the FISHHAWK_K8S_JAEGER_UI_PORT override"
+else
+  fail "_k8s_jaeger_ui_port should yield 26686 (got: $(_k8s_jaeger_ui_port))"
+fi
+FISHHAWK_K8S_JAEGER_OTLP_PORT=24318
+if [[ "$(_k8s_jaeger_otlp_port)" == "24318" ]]; then
+  pass "_k8s_jaeger_otlp_port honors the FISHHAWK_K8S_JAEGER_OTLP_PORT override"
+else
+  fail "_k8s_jaeger_otlp_port should yield 24318 (got: $(_k8s_jaeger_otlp_port))"
+fi
+
+# Binding condition 1: an EMPTY value resolves to the default through the
+# getter. This is the rule that makes 'empty' a non-mode for the validator.
+FISHHAWK_K8S_PF_PORT=''
+if [[ "$(_k8s_pf_port)" == "8080" ]]; then
+  pass "_k8s_pf_port resolves an EMPTY FISHHAWK_K8S_PF_PORT to the default 8080"
+else
+  fail "an empty FISHHAWK_K8S_PF_PORT must mean 'use the default' (got: $(_k8s_pf_port))"
+fi
+FISHHAWK_K8S_JAEGER_UI_PORT=''
+FISHHAWK_K8S_JAEGER_OTLP_PORT=''
+if [[ "$(_k8s_jaeger_ui_port)" == "16686" && "$(_k8s_jaeger_otlp_port)" == "4318" ]]; then
+  pass "empty jaeger port overrides resolve to their defaults (16686/4318)"
+else
+  fail "empty jaeger overrides must resolve to 16686/4318 (got: $(_k8s_jaeger_ui_port)/$(_k8s_jaeger_otlp_port))"
+fi
+unset FISHHAWK_K8S_PF_PORT FISHHAWK_K8S_JAEGER_UI_PORT FISHHAWK_K8S_JAEGER_OTLP_PORT
+
+# 19b. _k8s_validate_port — one case per REJECTION MODE, each asserted on BOTH
+# the non-zero return AND a stderr diagnostic naming the env var and the
+# offending value, so a validator failing for an unrelated reason cannot green
+# the case. 'empty' is deliberately absent: see 19a.
+for bad in abc 80a -1 0 65536 8080.5; do
+  vout="$(_k8s_validate_port FISHHAWK_K8S_PF_PORT "$bad" 2>&1)"
+  vrc=$?
+  if (( vrc != 0 )); then
+    pass "_k8s_validate_port rejects '${bad}'"
+  else
+    fail "_k8s_validate_port should reject '${bad}'"
+  fi
+  if [[ "$vout" == *"FISHHAWK_K8S_PF_PORT"* && "$vout" == *"${bad}"* && "$vout" == *"1..65535"* ]]; then
+    pass "_k8s_validate_port diagnostic names the var, the value '${bad}' and the range"
+  else
+    fail "_k8s_validate_port should name the var, '${bad}' and 1..65535 (got: $vout)"
+  fi
+done
+for good in 1 8080 16686 65535; do
+  if _k8s_validate_port FISHHAWK_K8S_PF_PORT "$good" 2>/dev/null; then
+    pass "_k8s_validate_port accepts '${good}'"
+  else
+    fail "_k8s_validate_port should accept '${good}'"
+  fi
+done
+# It must never EXIT (it is called from an `if !` in a tested context): a _die
+# here would kill cmd_k8s_up's caller instead of returning.
+if ( _k8s_validate_port FISHHAWK_K8S_PF_PORT abc >/dev/null 2>&1; print "returned" ) | grep -q returned; then
+  pass "_k8s_validate_port returns rather than exiting on a rejection"
+else
+  fail "_k8s_validate_port must return non-zero, never exit"
+fi
+
+# 19c. COMMAND-LEVEL EVIDENCE (binding condition 3): drive the SAME helper
+# composition cmd_k8s_up uses and assert the overridden port reaches BOTH the
+# printed healthz URL and the kubectl port-forward argument string. No cluster
+# needed — the composition is pure.
+cond3_port="$(_free_high_port)"
+if [[ -z "$cond3_port" ]]; then
+  fail "could not find a free high port for the command-level composition case"
+else
+  FISHHAWK_K8S_PF_PORT="$cond3_port"
+  cond3_resolved="$(_k8s_pf_port)"
+  cond3_url="$(_k8s_healthz_url "$cond3_resolved")"
+  cond3_arg="$(_k8s_forward_arg "$cond3_resolved" 8080)"
+  if [[ "$cond3_url" == "http://localhost:${cond3_port}/healthz" ]]; then
+    pass "an overridden FISHHAWK_K8S_PF_PORT reaches the printed healthz URL"
+  else
+    fail "healthz URL should carry port ${cond3_port} (got: $cond3_url)"
+  fi
+  if [[ "$cond3_arg" == "${cond3_port}:8080" ]]; then
+    pass "an overridden FISHHAWK_K8S_PF_PORT reaches the port-forward argument (<host>:8080)"
+  else
+    fail "port-forward arg should be ${cond3_port}:8080 (got: $cond3_arg)"
+  fi
+  unset FISHHAWK_K8S_PF_PORT
+fi
+# The jaeger arguments compose the same way, cluster side pinned by the chart.
+if [[ "$(_k8s_forward_arg 26686 16686)" == "26686:16686" && "$(_k8s_forward_arg 24318 4318)" == "24318:4318" ]]; then
+  pass "_k8s_forward_arg maps <host>:<cluster> for both jaeger ports"
+else
+  fail "_k8s_forward_arg should map host:cluster for the jaeger ports"
+fi
+
+# 19d. cmd_k8s_up wiring. The DONE-MEANS greps: these are shell strings no
+# compiler checks, so a comment-only touch of cmd_k8s_up must not pass. The
+# host-side literals must be GONE (reverting any of them to '8080:8080' /
+# '16686:16686' / '4318:4318' goes red here).
+k8s_up_body="$(typeset -f cmd_k8s_up)"
+for lit in '8080:8080' '16686:16686' '4318:4318'; do
+  if print -r -- "$k8s_up_body" | grep -qF -- "$lit"; then
+    fail "cmd_k8s_up must not hardcode the host-side port mapping '${lit}'"
+  else
+    pass "cmd_k8s_up no longer hardcodes '${lit}'"
+  fi
+done
+for hook in _k8s_pf_port _k8s_jaeger_ui_port _k8s_jaeger_otlp_port _k8s_validate_port _preflight_port_free _k8s_forward_arg _verify_listener_identity K8S_PF_LOG_FILE; do
+  if print -r -- "$k8s_up_body" | grep -qF -- "$hook"; then
+    pass "cmd_k8s_up wires ${hook}"
+  else
+    fail "cmd_k8s_up should call/use ${hook}"
+  fi
+done
+if print -r -- "$k8s_up_body" | grep -q 'source "\${REPO_ROOT}/\.env"'; then
+  pass "cmd_k8s_up sources .env so the FISHHAWK_K8S_* overrides can live there"
+else
+  fail "cmd_k8s_up should source .env before resolving the port overrides"
+fi
+if print -r -- "$k8s_up_body" | grep -q 'oauthCallbackUrl'; then
+  pass "cmd_k8s_up advises on the values-local oauthCallbackUrl coupling for a non-default port"
+else
+  fail "cmd_k8s_up should print the oauthCallbackUrl advisory when the port is not 8080"
+fi
+# The jaeger leg's warn-and-skip policy (attested above): a squatted jaeger port
+# must NOT abort. The policy now lives in _k8s_jaeger_decide, so the grep is
+# split — cmd_k8s_up must COMPOSE the decision helper (never inline its own
+# preflight for the jaeger ports), and the helper must carry the skip wording.
+# 19g exercises both behaviorally; these two are the done-means tripwires.
+if print -r -- "$k8s_up_body" | grep -q '_k8s_jaeger_decide'; then
+  pass "cmd_k8s_up delegates the jaeger forward decision to _k8s_jaeger_decide"
+else
+  fail "cmd_k8s_up should gate the jaeger forward on _k8s_jaeger_decide"
+fi
+if print -r -- "$(typeset -f _k8s_jaeger_decide)" | grep -q 'skipping the jaeger forward'; then
+  pass "_k8s_jaeger_decide warns and SKIPS rather than aborting (divergent-by-design policy)"
+else
+  fail "_k8s_jaeger_decide should warn-and-skip, not abort, when a jaeger port is unusable"
+fi
+# Accurate endpoint reporting is STRUCTURAL: the endpoint lines live in
+# _k8s_jaeger_endpoints, which cmd_k8s_up may only reach from the decide
+# success branch. If the literal endpoint text reappeared inline, a refused
+# forward could be advertised as live again.
+if print -r -- "$k8s_up_body" | grep -qF 'jaeger UI at http://localhost:'; then
+  fail "cmd_k8s_up must not inline the jaeger endpoint lines (they belong behind _k8s_jaeger_decide)"
+else
+  pass "cmd_k8s_up reports jaeger endpoints only via _k8s_jaeger_endpoints"
+fi
+# Ordering: the fatal fishhawkd preflight must precede the docker build, or a
+# collision costs a multi-minute image build before it is reported.
+if print -r -- "$k8s_up_body" | awk '/_preflight_port_free/{if(!p) p=NR} /building image/{if(!b) b=NR} END{exit !(p && b && p < b)}'; then
+  pass "cmd_k8s_up preflights the forward port BEFORE the docker build"
+else
+  fail "cmd_k8s_up should preflight the port before building the image"
+fi
+
+# 19e. _preflight_port_free behavioral contract, driven with a REAL `nc -l`
+# squatter (mirrors section 13's fixture posture). Bad state is seeded BY
+# CONSTRUCTION — an actual listener on a port _port_listeners proved free
+# immediately before — not by calling the control under test in its own setup.
+if ! command -v nc &>/dev/null || ! command -v lsof &>/dev/null; then
+  print "skip: nc or lsof not found — skipping the _preflight_port_free squatter fixture"
+else
+  pf_squat_port="$(_free_high_port)"
+  pf_free_port="$(_free_high_port "$pf_squat_port")"
+  if [[ -z "$pf_squat_port" || -z "$pf_free_port" || "$pf_squat_port" == "$pf_free_port" ]]; then
+    fail "could not find two distinct free high ports for the _preflight_port_free fixture"
+  else
+    nc -l 127.0.0.1 "$pf_squat_port" >/dev/null 2>&1 &
+    pf_nc_pid=$!
+    i=0
+    while (( i < 20 )); do
+      if [[ -n "$(_port_listeners "$pf_squat_port")" ]]; then break; fi
+      sleep 0.1
+      (( ++i ))
+    done
+
+    # Mode 1: free port -> return 0, silent.
+    pfout="$(_preflight_port_free "$pf_free_port" "— remediation" 2>&1)"
+    pfrc=$?
+    if (( pfrc == 0 )); then
+      pass "_preflight_port_free returns 0 for a free port"
+    else
+      fail "_preflight_port_free should return 0 for free port ${pf_free_port}"
+    fi
+    if [[ -z "$pfout" ]]; then
+      pass "_preflight_port_free is silent for a free port"
+    else
+      fail "_preflight_port_free should print nothing for a free port (got: $pfout)"
+    fi
+
+    # Mode 2: squatted port, fatal-style caller (non-empty remediation) ->
+    # non-zero AND a stderr diagnostic naming the port, the squatting pid and
+    # the caller's remediation.
+    pfout="$(_preflight_port_free "$pf_squat_port" "— set FISHHAWK_K8S_PF_PORT to a free port" 2>&1)"
+    pfrc=$?
+    if (( pfrc != 0 )); then
+      pass "_preflight_port_free returns non-zero for a squatted port"
+    else
+      fail "_preflight_port_free should return non-zero when port ${pf_squat_port} is held"
+    fi
+    if [[ "$pfout" == *"$pf_nc_pid"* ]]; then
+      pass "_preflight_port_free diagnostic names the squatting pid"
+    else
+      fail "_preflight_port_free should name squatter pid ${pf_nc_pid} (got: $pfout)"
+    fi
+    if [[ "$pfout" == *"$pf_squat_port"* ]]; then
+      pass "_preflight_port_free diagnostic names the port"
+    else
+      fail "_preflight_port_free should name port ${pf_squat_port} (got: $pfout)"
+    fi
+    if [[ "$pfout" == *"FISHHAWK_K8S_PF_PORT"* ]]; then
+      pass "_preflight_port_free diagnostic carries the caller's remediation"
+    else
+      fail "_preflight_port_free should append the caller's remediation (got: $pfout)"
+    fi
+
+    # Mode 3: silent-detection (empty remediation) — the warn-and-skip shape the
+    # jaeger leg uses. No stderr line, but PREFLIGHT_SQUATTER_DESC carries the
+    # roster so the caller can compose a WARNING rather than an 'error:'.
+    PREFLIGHT_SQUATTER_DESC=""
+    pfout="$(_preflight_port_free "$pf_squat_port" 2>&1)"
+    pfrc=$?
+    _preflight_port_free "$pf_squat_port" >/dev/null 2>&1
+    if (( pfrc != 0 )) && [[ -z "$pfout" ]]; then
+      pass "_preflight_port_free is silent with an empty remediation (warn-and-skip callers compose their own line)"
+    else
+      fail "_preflight_port_free should print nothing when remediation is empty (rc=$pfrc out: $pfout)"
+    fi
+    if [[ "$PREFLIGHT_SQUATTER_DESC" == *"$pf_nc_pid"* ]]; then
+      pass "_preflight_port_free exports the squatter roster via PREFLIGHT_SQUATTER_DESC"
+    else
+      fail "PREFLIGHT_SQUATTER_DESC should name pid ${pf_nc_pid} (got: $PREFLIGHT_SQUATTER_DESC)"
+    fi
+
+    # Mode 4: lsof absent -> the caller's exact degrade warning + return 0.
+    # PATH is narrowed to a stub dir holding everything the helper needs EXCEPT
+    # lsof, so the `command -v lsof` guard is the only thing that differs.
+    lsof_stub="$(mktemp -d -t test-dev-nolsof.XXXXXX)"
+    pfout="$(PATH="$lsof_stub" _preflight_port_free "$pf_squat_port" "— remediation" "warning: lsof not found — custom degrade text" 2>&1)"
+    pfrc=$?
+    if (( pfrc == 0 )); then
+      pass "_preflight_port_free degrades to success when lsof is absent"
+    else
+      fail "_preflight_port_free should return 0 (degraded) with lsof unavailable"
+    fi
+    if [[ "$pfout" == *"custom degrade text"* ]]; then
+      pass "_preflight_port_free prints the CALLER'S degrade warning verbatim (cmd_up text preserved)"
+    else
+      fail "_preflight_port_free should print the caller-supplied lsof warning (got: $pfout)"
+    fi
+    rm -rf "$lsof_stub"
+
+    kill "$pf_nc_pid" 2>/dev/null
+    wait "$pf_nc_pid" 2>/dev/null
+  fi
+fi
+
+# 19f. cmd_up regression guard for the extraction (binding condition 5): the
+# operator-facing text must be byte-identical to the pre-extraction inline
+# block. Assert the remediation suffix and the degrade warning are passed
+# through verbatim rather than reworded by the helper.
+if print -r -- "$up_body" | grep -qF -- "— run 'scripts/dev down', or kill the pid, then retry"; then
+  pass "cmd_up keeps its byte-identical squatter remediation text"
+else
+  fail "cmd_up's squatter remediation text changed during the preflight extraction"
+fi
+if print -r -- "$up_body" | grep -qF -- 'warning: lsof not found — skipping port preflight and listener-identity check (degraded)'; then
+  pass "cmd_up keeps its byte-identical lsof degrade warning"
+else
+  fail "cmd_up's lsof degrade warning changed during the preflight extraction"
+fi
+
+# 19g. EQUAL JAEGER HOST PORTS (fix-up, #2917 review). FISHHAWK_K8S_JAEGER_UI_PORT
+# and FISHHAWK_K8S_JAEGER_OTLP_PORT can both resolve to the SAME free port. The
+# per-port preflights cannot see that — each asks only "is port N free?", and one
+# free port answers yes twice — so kubectl would bind the first mapping, fail the
+# second, and the command would advertise BOTH endpoints as live while discarding
+# the forward's stderr. Driven behaviorally through the SAME composition
+# cmd_k8s_up uses (_k8s_jaeger_decide, then _k8s_jaeger_endpoints only on
+# success); no cluster needed.
+jd_port="$(_free_high_port)"
+jd_other="$(_free_high_port "$jd_port")"
+if [[ -z "$jd_port" || -z "$jd_other" || "$jd_port" == "$jd_other" ]]; then
+  fail "could not find two distinct free high ports for the equal-jaeger-ports fixture"
+else
+  # (i) The pure predicate: equal -> non-zero + a warning naming BOTH variables
+  # and the shared value; distinct -> 0 and silent.
+  jd_out="$(_k8s_ports_distinct FISHHAWK_K8S_JAEGER_UI_PORT "$jd_port" FISHHAWK_K8S_JAEGER_OTLP_PORT "$jd_port" 2>&1)"
+  jd_rc=$?
+  if (( jd_rc != 0 )); then
+    pass "_k8s_ports_distinct rejects two ports that resolve to the same value"
+  else
+    fail "_k8s_ports_distinct should reject ${jd_port} == ${jd_port}"
+  fi
+  if [[ "$jd_out" == *"FISHHAWK_K8S_JAEGER_UI_PORT"* && "$jd_out" == *"FISHHAWK_K8S_JAEGER_OTLP_PORT"* && "$jd_out" == *"$jd_port"* ]]; then
+    pass "_k8s_ports_distinct names both variables and the shared port"
+  else
+    fail "_k8s_ports_distinct should name both vars and ${jd_port} (got: $jd_out)"
+  fi
+  jd_out="$(_k8s_ports_distinct FISHHAWK_K8S_JAEGER_UI_PORT "$jd_port" FISHHAWK_K8S_JAEGER_OTLP_PORT "$jd_other" 2>&1)"
+  jd_rc=$?
+  if (( jd_rc == 0 )) && [[ -z "$jd_out" ]]; then
+    pass "_k8s_ports_distinct accepts two distinct ports, silently"
+  else
+    fail "_k8s_ports_distinct should accept ${jd_port} != ${jd_other} silently (rc=$jd_rc out: $jd_out)"
+  fi
+
+  # (ii) The decision helper on EQUAL FREE ports: refuse. It must short-circuit
+  # on the collision rather than reporting a squatter — nothing holds the port,
+  # so an "already has a listener" line here would be a false diagnosis.
+  jd_out="$(_k8s_jaeger_decide "$jd_port" "$jd_port" 2>&1)"
+  jd_rc=$?
+  if (( jd_rc != 0 )); then
+    pass "_k8s_jaeger_decide refuses the forward when both jaeger ports are equal"
+  else
+    fail "_k8s_jaeger_decide should refuse equal jaeger host ports (${jd_port})"
+  fi
+  if [[ "$jd_out" == *"both resolve to port ${jd_port}"* && "$jd_out" == *"skipping the jaeger forward"* ]]; then
+    pass "_k8s_jaeger_decide's equal-port refusal names the collision and the skip"
+  else
+    fail "_k8s_jaeger_decide should name the equal-port collision and the skip (got: $jd_out)"
+  fi
+  if [[ "$jd_out" == *"already has a listener"* ]]; then
+    fail "_k8s_jaeger_decide must not misreport a free equal port as squatted (got: $jd_out)"
+  else
+    pass "_k8s_jaeger_decide short-circuits on equality instead of reporting a phantom squatter"
+  fi
+
+  # (iii) ACCURATE ENDPOINT REPORTING. Run the whole decide-then-report
+  # composition cmd_k8s_up runs and assert the refused forward advertises NO
+  # endpoint, and says so.
+  if _k8s_jaeger_decide "$jd_port" "$jd_port" >/dev/null 2>&1; then
+    jd_report="$(_k8s_jaeger_endpoints "$jd_port" "$jd_port" 4242)"
+  else
+    jd_report="$(print 'fishhawkd is up and usable; tracing is unavailable this session')"
+  fi
+  if [[ "$jd_report" != *"jaeger UI at"* && "$jd_report" != *"OTEL_EXPORTER_OTLP_ENDPOINT"* ]]; then
+    pass "equal jaeger ports advertise NO endpoint (no 'jaeger UI at', no OTLP hint)"
+  else
+    fail "equal jaeger ports must not print endpoints (got: $jd_report)"
+  fi
+  if [[ "$jd_report" == *"tracing is unavailable this session"* ]]; then
+    pass "equal jaeger ports report tracing as unavailable, fishhawkd still usable"
+  else
+    fail "the equal-port path should report tracing unavailable (got: $jd_report)"
+  fi
+
+  # (iv) Control: DISTINCT free ports take the success branch and the endpoint
+  # lines carry the RESOLVED ports. Without this the three assertions above
+  # would also pass against a helper that refused unconditionally.
+  if _k8s_jaeger_decide "$jd_port" "$jd_other" >/dev/null 2>&1; then
+    jd_report="$(_k8s_jaeger_endpoints "$jd_port" "$jd_other" 4242)"
+  else
+    jd_report="$(print 'refused')"
+  fi
+  if [[ "$jd_report" == *"jaeger UI at http://localhost:${jd_port}"* && "$jd_report" == *"http://localhost:${jd_other}"* ]]; then
+    pass "distinct free jaeger ports forward, and the endpoint lines carry both resolved ports"
+  else
+    fail "distinct jaeger ports should report both endpoints (got: $jd_report)"
+  fi
+
+  # (v) Distinct but SQUATTED (real nc listener): refuse, and again advertise no
+  # endpoint. This is the pre-existing warn-and-skip policy, now asserted
+  # behaviorally rather than only by body-grep.
+  if ! command -v nc &>/dev/null || ! command -v lsof &>/dev/null; then
+    print "skip: nc or lsof not found — skipping the squatted-jaeger-port fixture"
+  else
+    nc -l 127.0.0.1 "$jd_other" >/dev/null 2>&1 &
+    jd_nc_pid=$!
+    i=0
+    while (( i < 20 )); do
+      if [[ -n "$(_port_listeners "$jd_other")" ]]; then break; fi
+      sleep 0.1
+      (( ++i ))
+    done
+    jd_out="$(_k8s_jaeger_decide "$jd_port" "$jd_other" 2>&1)"
+    jd_rc=$?
+    if (( jd_rc != 0 )) && [[ "$jd_out" == *"jaeger OTLP port ${jd_other}"* && "$jd_out" == *"skipping the jaeger forward"* ]]; then
+      pass "_k8s_jaeger_decide warns and skips when a distinct jaeger port is squatted"
+    else
+      fail "_k8s_jaeger_decide should warn-and-skip on a squatted port (rc=$jd_rc out: $jd_out)"
+    fi
+    kill "$jd_nc_pid" 2>/dev/null
+    wait "$jd_nc_pid" 2>/dev/null
+  fi
+fi
+
+# 19h. COUNTERFACTUAL RECORD (binding condition 6 — the operator mandated this
+# recording surface be a test-comment block; the implement review found it absent
+# from the diff, so the fix-up pass RE-RAN every cycle and recorded it here).
+# Method for each row: mutate scripts/dev in the working tree, run
+# `scripts/test-dev`, capture the FAIL lines VERBATIM, restore the file and
+# confirm it is byte-identical (`cmp -s`). Baseline before every cycle:
+# 485 passed, 0 failed. These are OBSERVED outputs, not predictions.
+#
+#  1. _k8s_validate_port — deleted the `[[ "$value" != <-> ]]` non-numeric
+#     branch  ->  479 passed, 6 failed:
+#       FAIL: _k8s_validate_port should reject 'abc'
+#       FAIL: _k8s_validate_port should name the var, 'abc' and 1..65535 (got: _k8s_validate_port:3: abc: parameter not set)
+#       FAIL: _k8s_validate_port should reject '80a'
+#       FAIL: _k8s_validate_port should name the var, '80a' and 1..65535 (got: _k8s_validate_port:3: bad math expression: operator expected at `a')
+#       FAIL: _k8s_validate_port should reject '8080.5'
+#       FAIL: _k8s_validate_port should name the var, '8080.5' and 1..65535 (got: )
+#     NB '-1' survives this deletion — the range branch below catches it — which
+#     is why the two branches are separate counterfactual cycles.
+#  2. _k8s_validate_port — deleted the `(( value < 1 || value > 65535 ))` range
+#     branch  ->  481 passed, 4 failed:
+#       FAIL: _k8s_validate_port should reject '0'
+#       FAIL: _k8s_validate_port should name the var, '0' and 1..65535 (got: )
+#       FAIL: _k8s_validate_port should reject '65536'
+#       FAIL: _k8s_validate_port should name the var, '65536' and 1..65535 (got: )
+#  3. _k8s_pf_port — `${FISHHAWK_K8S_PF_PORT:-8080}` -> `${FISHHAWK_K8S_PF_PORT-8080}`
+#     (empty stops meaning default)  ->  484 passed, 1 failed:
+#       FAIL: an empty FISHHAWK_K8S_PF_PORT must mean 'use the default' (got: )
+#  4. _preflight_port_free — deleted the `command -v lsof` degrade guard
+#     ->  484 passed, 1 failed:
+#       FAIL: _preflight_port_free should print the caller-supplied lsof warning (got: )
+#  5. _preflight_port_free — deleted the `[[ -n "$remediation" ]]` guard so it
+#     always prints  ->  484 passed, 1 failed:
+#       FAIL: _preflight_port_free should print nothing when remediation is empty (rc=1 out: error: port 26088 already has a listener: pid 72690 (nc) )
+#  6. _preflight_port_free — squatted-port `return 1` -> `return 0`
+#     ->  482 passed, 3 failed:
+#       FAIL: _preflight_port_free should return non-zero when port 21468 is held
+#       FAIL: _preflight_port_free should print nothing when remediation is empty (rc=0 out: )
+#       FAIL: _k8s_jaeger_decide should warn-and-skip on a squatted port (rc=0 out: )
+#  7. cmd_k8s_up — moved the fishhawkd `_preflight_port_free` call to AFTER the
+#     docker build  ->  484 passed, 1 failed:
+#       FAIL: cmd_k8s_up should preflight the port before building the image
+#  8. cmd_k8s_up — replaced the post-gate `_verify_listener_identity` condition
+#     with `if false`  ->  484 passed, 1 failed:
+#       FAIL: cmd_k8s_up should call/use _verify_listener_identity
+#  9. cmd_k8s_up — restored the hardcoded host-side literal
+#     `$(_k8s_forward_arg "$pf_port" 8080)` -> `"8080:8080"`
+#     ->  484 passed, 1 failed:
+#       FAIL: cmd_k8s_up must not hardcode the host-side port mapping '8080:8080'
+# 10. cmd_up — reworded the extracted remediation suffix (binding condition 5,
+#     byte-identical operator text)  ->  484 passed, 1 failed:
+#       FAIL: cmd_up's squatter remediation text changed during the preflight extraction
+#
+# The three below are the controls this FIX-UP pass added (equal jaeger ports).
+#
+# 11. _k8s_ports_distinct — deleted the `[[ "$port_a" == "$port_b" ]]` equality
+#     branch  ->  479 passed, 6 failed. Note rows 5-6: with the guard gone the
+#     command advertises BOTH endpoints on one port, which is exactly the defect
+#     the review reported:
+#       FAIL: _k8s_ports_distinct should reject 31202 == 31202
+#       FAIL: _k8s_ports_distinct should name both vars and 31202 (got: )
+#       FAIL: _k8s_jaeger_decide should refuse equal jaeger host ports (31202)
+#       FAIL: _k8s_jaeger_decide should name the equal-port collision and the skip (got: )
+#       FAIL: equal jaeger ports must not print endpoints (got: jaeger UI at http://localhost:31202, OTLP HTTP at http://localhost:31202 (port-forward pid 4242)
+#       FAIL: the equal-port path should report tracing unavailable (got: jaeger UI at http://localhost:31202, OTLP HTTP at http://localhost:31202 (port-forward pid 4242)
+# 12. cmd_k8s_up — inlined the endpoint line back in place of the
+#     `_k8s_jaeger_endpoints` call  ->  484 passed, 1 failed:
+#       FAIL: cmd_k8s_up must not inline the jaeger endpoint lines (they belong behind _k8s_jaeger_decide)
+# 13. _k8s_jaeger_decide — deleted the `_k8s_ports_distinct` call block (the
+#     WIRING, as distinct from the predicate in row 11)  ->  481 passed, 4 failed:
+#       FAIL: _k8s_jaeger_decide should refuse equal jaeger host ports (35000)
+#       FAIL: _k8s_jaeger_decide should name the equal-port collision and the skip (got: )
+#       FAIL: equal jaeger ports must not print endpoints (got: jaeger UI at http://localhost:35000, OTLP HTTP at http://localhost:35000 (port-forward pid 4242)
+#       FAIL: the equal-port path should report tracing unavailable (got: jaeger UI at http://localhost:35000, OTLP HTTP at http://localhost:35000 (port-forward pid 4242)
 
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
