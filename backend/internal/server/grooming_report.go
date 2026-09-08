@@ -486,7 +486,12 @@ func (s *Server) recordGroomingChurn(r *http.Request, runID, stageID uuid.UUID, 
 // whose reason is not_approved or amended is a REJECTED one. Anything else —
 // a failed apply, any other containment skip — records NO disposition, so the
 // entry is absent from the baseline and resurfaces. That is AC4's requirement
-// and the fail-safe direction in one rule.
+// and the fail-safe direction in one rule. A row that cannot be ATTRIBUTED at
+// all — an undecodable payload, or one carrying no entry_id — is a different
+// state and is NOT read as "no disposition": priorGroomingDispositions returns
+// an error and this scan degrades to baseline_dispositions_unreadable with an
+// empty baseline, rather than letting one corrupt row make the newest candidate
+// look dispositionless and fall through to an OLDER settled one (#2813).
 //
 // THE PRODUCTION WRITER IS THE GROOM-GATE APPROVAL HOOK (E54.19 / #2822):
 // grooming_apply.go's applyApprovedGrooming calls workmgmt.ApplyGrooming on the
@@ -682,21 +687,55 @@ func (s *Server) priorGroomingReport(ctx context.Context, runID uuid.UUID) (*pla
 	return nil, nil
 }
 
+// groomingDispositionProjection is the BARE-ONLY projection of a
+// grooming_mutation_applied payload the churn baseline needs — the three fields
+// that decide a disposition.
+//
+// THE SHAPE IS PINNED, NOT ASPIRATIONAL (#2813). groomingApplyAuditSink
+// (grooming_apply.go) is the sole production writer of this category and it
+// marshals workmgmt.GroomingMutationRecord BARE — its own json tags, NOT
+// wrapped in a run/stage envelope, which ride the audit row's own columns. So
+// these three keys are read off the TOP level of the payload and a nested or
+// enveloped record is NOT tolerated: it decodes to an empty entry_id, which is
+// a row this reader cannot attribute, and an unattributable row is treated as
+// UNREADABLE rather than as an absent disposition. See
+// priorGroomingDispositions for why that direction is the safe one, and
+// TestGroomingMutationProjections_MatchWriterTags for the structural pin that
+// reddens on a writer-side tag rename.
+type groomingDispositionProjection struct {
+	EntryID    string `json:"entry_id"`
+	Outcome    string `json:"outcome"`
+	SkipReason string `json:"skip_reason"`
+}
+
 // priorGroomingDispositions reads the prior run's grooming_mutation_applied
 // audit rows and projects them back into the two inputs NewGroomingBaseline
 // takes: the operator's rejections and the apply's landed mutations.
 //
-// The payload is decoded through a TOLERANT projection carrying only the three
-// fields that matter (entry_id, outcome, skip_reason), so it reads a record
-// marshalled bare as well as one nested under the run/stage envelope the other
-// grooming categories use. An undecodable row is skipped, which contributes no
-// disposition and therefore resurfaces its entry — the fail-safe direction.
+// The payload is decoded through groomingDispositionProjection, which reads the
+// BARE record groomingApplyAuditSink writes — the only production writer of this
+// category — off the top level of the payload.
 //
-// A failure of the QUERY ITSELF is different in kind and is returned as an
-// error (#2240 fix-up): "this run recorded no dispositions" and "this run's
-// dispositions could not be read" are distinct states, and returning nil for
-// both let the caller treat the newest candidate as unsettled and walk on to
-// an OLDER run's dispositions — suppressing against superseded state.
+// A failure of the QUERY ITSELF is returned as an error (#2240 fix-up): "this
+// run recorded no dispositions" and "this run's dispositions could not be read"
+// are distinct states, and returning nil for both let the caller treat the
+// newest candidate as unsettled and walk on to an OLDER run's dispositions —
+// suppressing against superseded state.
+//
+// FAIL CLOSED ON EVERY ROW IT CANNOT ATTRIBUTE (#2813), for exactly the same
+// reason. An undecodable payload, or one that decodes cleanly but carries no
+// entry_id, used to be SKIPPED — which reads as "this row contributed no
+// disposition" and is fail-safe only if the row is the sole input. It is not:
+// one corrupt row on the NEWEST prior candidate can make that whole run resolve
+// dispositionless, and groomingChurnBaseline then walks PAST it to an OLDER
+// settled run and suppresses the current report against dispositions the
+// operator may since have superseded. That is the unreadable-vs-absent
+// conflation the #2240 fix-up closed for retrieval failures, reopened through a
+// different door. So an unattributable row now returns an error naming the
+// offending audit sequence and the reason, the caller degrades to the named
+// baseline_dispositions_unreadable with an EMPTY baseline, and everything is
+// proposed. priorGroomingPartialSteps (#2810) already fails closed on its own
+// scan for the same argument; the two halves of the apply-family read agree.
 func (s *Server) priorGroomingDispositions(ctx context.Context, runID uuid.UUID) ([]workmgmt.GroomingDecision, *workmgmt.GroomingApplyResult, error) {
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, workmgmt.GroomingMutationAppliedCategory)
 	if err != nil {
@@ -708,13 +747,14 @@ func (s *Server) priorGroomingDispositions(ctx context.Context, runID uuid.UUID)
 		if e == nil {
 			continue
 		}
-		var rec struct {
-			EntryID    string `json:"entry_id"`
-			Outcome    string `json:"outcome"`
-			SkipReason string `json:"skip_reason"`
+		var rec groomingDispositionProjection
+		if uerr := json.Unmarshal(e.Payload, &rec); uerr != nil {
+			return nil, nil, fmt.Errorf("run %s: %s audit entry %d has an undecodable payload: %w",
+				runID, workmgmt.GroomingMutationAppliedCategory, e.Sequence, uerr)
 		}
-		if json.Unmarshal(e.Payload, &rec) != nil || rec.EntryID == "" {
-			continue
+		if rec.EntryID == "" {
+			return nil, nil, fmt.Errorf("run %s: %s audit entry %d carries no entry_id, so it cannot be attributed",
+				runID, workmgmt.GroomingMutationAppliedCategory, e.Sequence)
 		}
 		switch {
 		case rec.Outcome == string(workmgmt.GroomingOutcomeApplied):

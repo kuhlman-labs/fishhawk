@@ -314,6 +314,15 @@ func collapseGroomingConsumed(entries []*audit.Entry) map[string]consumedDisposi
 // outcome / skip_reason directly off the payload, and the churn guard's whole
 // idempotence baseline reads it. The run and stage identity ride the audit
 // row's own columns, which is where they belong.
+//
+// THAT READER NOW REFUSES A NON-BARE ROW RATHER THAN SKIPPING IT (#2813). An
+// enveloped record decodes to an empty entry_id, and priorGroomingDispositions
+// treats an unattributable row as UNREADABLE — the churn verdict degrades to
+// baseline_dispositions_unreadable and proposes everything — instead of
+// silently contributing no disposition. So a future change that wraps this
+// payload is LOUD in the audit record on the first run after it ships, not a
+// baseline that quietly empties out. TestGroomingMutationProjections_MatchWriterTags
+// pins the tag side of the same contract.
 type groomingApplyAuditSink struct {
 	s       *Server
 	runID   uuid.UUID
@@ -477,12 +486,17 @@ func (s *Server) priorGroomingPartialSteps(ctx context.Context, current *run.Run
 	return out, ""
 }
 
-// groomingStepsProjection is the TOLERANT projection of a
-// grooming_mutation_applied payload the evidence scan needs — the same posture
-// priorGroomingDispositions takes, carrying only the three fields that decide a
-// resume. It reads a record marshalled BARE (which is what
-// groomingApplyAuditSink writes) and ignores every other key, so an older row
-// with no steps_landed decodes cleanly with an empty slice.
+// groomingStepsProjection is the BARE-ONLY projection of a
+// grooming_mutation_applied payload the evidence scan needs, carrying only the
+// three fields that decide a resume. It reads a record marshalled BARE (which is
+// what groomingApplyAuditSink writes) and ignores every other key, so an older
+// row with no steps_landed decodes cleanly with an empty slice.
+//
+// It takes the SAME posture priorGroomingDispositions takes, and since #2813
+// that posture is FAIL-CLOSED on both sides rather than merely tolerant of
+// unknown keys: a row this projection cannot decode, or one carrying no
+// entry_id, abandons the scan instead of being skipped. Tolerance is of EXTRA
+// keys, never of an unattributable row.
 type groomingStepsProjection struct {
 	EntryID     string   `json:"entry_id"`
 	Outcome     string   `json:"outcome"`
