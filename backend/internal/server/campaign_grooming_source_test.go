@@ -1586,6 +1586,19 @@ func TestCreateCampaign_GroomingCurrencyGuard_DiagnosticFailureOmitsSupersededBy
 	if _, ok := details["superseded_by"]; ok {
 		t.Fatalf("details carry superseded_by = %v, want it OMITTED when the diagnostic read failed", details["superseded_by"])
 	}
+	// The error path is only exercised if the diagnostic re-scan (the SECOND
+	// ListRuns) was actually reached — otherwise the omitted superseded_by proves
+	// nothing (the lookup could have been skipped entirely). Assert the injected
+	// failure was hit so this remains an error-path test, not a vacuous pass.
+	if calls < 2 {
+		t.Fatalf("ListRuns calls = %d, want >= 2 (diagnostic re-scan never reached; error path unexercised)", calls)
+	}
+	// COUNTERFACTUAL OBSERVED (run, not reasoned): replacing the
+	// newerApprovedGroomingRun diagnostic call in groomingSupersededRefusal
+	// (campaign_grooming_source.go) with `_ = sourceRun` — so no second ListRuns is
+	// issued — turns this test RED at the assertion above (ListRuns calls = 1, want
+	// >= 2) while the 422 + omitted superseded_by assertions still pass, proving
+	// those two alone were vacuous. Restored byte-identically → GREEN.
 }
 
 // TestCreateCampaign_GroomingSource_ThreadsGuardOntoCreateParams pins step

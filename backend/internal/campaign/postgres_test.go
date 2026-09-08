@@ -2125,6 +2125,17 @@ func TestPostgres_Campaign_GroomingSourceRoundTrip(t *testing.T) {
 //     this translation) and re-running the same case: RED — the call returns a
 //     bare wrapped "create campaign: no rows in result set" that
 //     errors.Is(err, ErrGroomingOrderSuperseded) does not match. Restored → GREEN.
+//   - Replacing the `(newer.created_at, newer.id) > ($15, $10)` tuple comparison in
+//     db/queries.sql.go with a timestamp-only `newer.created_at > $15` and
+//     re-running same_created_at_larger_id: RED — err = <nil>, want
+//     ErrGroomingOrderSuperseded (the same-instant larger-id candidate no longer
+//     counts as newer). same_created_at_smaller_id stays GREEN either way — proving
+//     the id tiebreak, not the timestamp, is what this pair pins. Restored → GREEN.
+//   - Widening `newer.account_id IS NOT DISTINCT FROM $13` to
+//     `(... OR newer.account_id IS NULL)` (the hypothetical NULL-candidate-as-
+//     wildcard predicate) and re-running source_account_set_candidate_null_account:
+//     RED — CreateCampaign returned ErrGroomingOrderSuperseded, want created (the
+//     set-source guard wrongly matched the NULL-account candidate). Restored → GREEN.
 
 // groomingCandidateSpec describes one seeded NEWER grooming run for the guard
 // table. accountID nil = untenanted (NULL account_id); installationID nil = NULL.
@@ -2217,11 +2228,15 @@ func TestPostgres_GroomingCurrencyGuard(t *testing.T) {
 		t.Fatalf("seed account: %v", err)
 	}
 
-	// maxUUID sorts lexically after every candidate id, so at an EQUAL created_at
-	// the candidate always PRECEDES the source (candidate.id < source.id) — the
-	// strict (created_at, id) order's id tiebreak, proving a same-instant
-	// lexically-smaller candidate does NOT supersede.
+	// maxUUID sorts lexically after every candidate id and minUUID before it, so at
+	// an EQUAL created_at the (created_at, id) tiebreak is exercised in BOTH
+	// directions: with the source id = maxUUID a candidate is lexically SMALLER and
+	// does NOT supersede (same_created_at_smaller_id), and with the source id =
+	// minUUID a candidate id = maxUUID is lexically LARGER and DOES supersede
+	// (same_created_at_larger_id) — proving the tiebreak is a real strict ordering,
+	// not a timestamp-only comparison.
 	maxUUID := uuid.MustParse("ffffffff-ffff-ffff-ffff-ffffffffffff")
+	minUUID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
 
 	type tc struct {
 		name        string
@@ -2281,7 +2296,33 @@ func TestPostgres_GroomingCurrencyGuard(t *testing.T) {
 			candidates: []groomingCandidateSpec{{workflowID: workflow, installationID: &install7, createdAt: base.Add(time.Hour), approve: true}},
 		},
 		{
-			name: "both_null_account_and_installation_match", // (d): NULL IS NOT DISTINCT FROM NULL → superseded
+			// case (d) REVERSE of different_account: source tenanted, candidate NULL
+			// account → distinct → created. Pins IS NOT DISTINCT FROM in the
+			// set-vs-NULL direction — a predicate treating a NULL candidate column as
+			// a wildcard when the source side is SET would wrongly refuse here.
+			name: "source_account_set_candidate_null_account",
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, AccountID: acctA.String(), SourceCreatedAt: base}
+			},
+			candidates: []groomingCandidateSpec{{workflowID: workflow, createdAt: base.Add(time.Hour), approve: true}},
+		},
+		{
+			// case (d) REVERSE of different_installation: source installed, candidate
+			// NULL installation → distinct → created. The installation-column mirror
+			// of the case above.
+			name: "source_installation_set_candidate_null_installation",
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceInstallationID: &install7, SourceCreatedAt: base}
+			},
+			candidates: []groomingCandidateSpec{{workflowID: workflow, createdAt: base.Add(time.Hour), approve: true}},
+		},
+		{
+			// (d): NULL IS NOT DISTINCT FROM NULL → superseded. Documentary — shares
+			// its setup with newer_approved; the created-direction discrimination of
+			// the NULL-vs-set tenancy semantics lives in the two reverse cases above
+			// (source_account_set_candidate_null_account /
+			// source_installation_set_candidate_null_installation).
+			name: "both_null_account_and_installation_match",
 			guard: func(repo string) *campaign.GroomingCurrencyGuard {
 				return &campaign.GroomingCurrencyGuard{SourceRunID: uuid.New(), Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
 			},
@@ -2308,7 +2349,15 @@ func TestPostgres_GroomingCurrencyGuard(t *testing.T) {
 			guard: func(repo string) *campaign.GroomingCurrencyGuard {
 				return &campaign.GroomingCurrencyGuard{SourceRunID: maxUUID, Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
 			},
-			candidates: []groomingCandidateSpec{{workflowID: workflow, createdAt: base, approve: true, explicitID: uuidPtr(uuid.MustParse("00000000-0000-0000-0000-000000000001"))}},
+			candidates: []groomingCandidateSpec{{workflowID: workflow, createdAt: base, approve: true, explicitID: uuidPtr(minUUID)}},
+		},
+		{
+			name: "same_created_at_larger_id", // case (a): equal instant, candidate id > source id → newer → refused
+			guard: func(repo string) *campaign.GroomingCurrencyGuard {
+				return &campaign.GroomingCurrencyGuard{SourceRunID: minUUID, Repo: repo, WorkflowID: workflow, SourceCreatedAt: base}
+			},
+			candidates:  []groomingCandidateSpec{{workflowID: workflow, createdAt: base, approve: true, explicitID: uuidPtr(maxUUID)}},
+			wantRefused: true,
 		},
 		{
 			name:       "nil_guard_with_newer_approved", // case (f): allow_superseded path → created
