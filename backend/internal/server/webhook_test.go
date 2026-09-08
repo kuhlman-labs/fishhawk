@@ -400,3 +400,44 @@ func TestWebhook_PullRequestActionRouting_NotApplicable(t *testing.T) {
 		})
 	}
 }
+
+// TestIsIssueClosedDelivery_ForgeVocabulary pins the forge-neutral routing
+// predicate the E50.6 parent-close watcher hangs off (E50.17 / #2900) in BOTH
+// directions: the two positive shapes (GitHub `issues`/`closed`, GitLab
+// `issue`/`close`) and the negatives that keep it from silently over-matching —
+// a GitLab `open`/`update`/`reopen`, a GitHub `reopened`, each forge's
+// vocabulary presented under the OTHER forge's id, and an unknown forge.
+// Deleting the GitLab arm reddens the two `gitlab` positives; collapsing the
+// switch into `Type has prefix "issue" && Action has prefix "close"` reddens
+// the cross-vocabulary negatives.
+func TestIsIssueClosedDelivery_ForgeVocabulary(t *testing.T) {
+	cases := []struct {
+		name   string
+		forge  string
+		typ    string
+		action string
+		want   bool
+	}{
+		{"github legacy empty forge, issues.closed", "", "issues", "closed", true},
+		{"github explicit forge, issues.closed", forgeNameGitHub, "issues", "closed", true},
+		{"github issues.reopened is not a close", "", "issues", "reopened", false},
+		{"github issues.labeled is not a close", "", "issues", "labeled", false},
+		{"github forge must not accept gitlab vocabulary", "", "issue", "close", false},
+		{"gitlab issue/close", webhook.ForgeGitLab, "issue", "close", true},
+		{"gitlab issue/open is not a close", webhook.ForgeGitLab, "issue", "open", false},
+		{"gitlab issue/update is not a close", webhook.ForgeGitLab, "issue", "update", false},
+		{"gitlab issue/reopen is not a close", webhook.ForgeGitLab, "issue", "reopen", false},
+		{"gitlab forge must not accept github vocabulary", webhook.ForgeGitLab, "issues", "closed", false},
+		{"gitlab merge_request/close is not an issue close", webhook.ForgeGitLab, "merge_request", "close", false},
+		{"unknown forge never routes", "bitbucket", "issues", "closed", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isIssueClosedDelivery(webhook.Event{Forge: tc.forge, Type: tc.typ, Action: tc.action})
+			if got != tc.want {
+				t.Errorf("isIssueClosedDelivery(forge=%q type=%q action=%q) = %v, want %v",
+					tc.forge, tc.typ, tc.action, got, tc.want)
+			}
+		})
+	}
+}
