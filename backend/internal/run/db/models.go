@@ -310,6 +310,7 @@ type Run struct {
 	WorkingDir              string             `json:"working_dir"`
 	PredictedRuntimeMinutes int32              `json:"predicted_runtime_minutes"`
 	InstallationRef         *string            `json:"installation_ref"`
+	RequiresCharter         *bool              `json:"requires_charter"`
 }
 
 type ScopeAmendment struct {
