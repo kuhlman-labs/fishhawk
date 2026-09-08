@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
@@ -397,8 +398,8 @@ func TestOAuthFlow_ScopeOmittedClientOnboardsEndToEnd(t *testing.T) {
 		t.Fatalf("scope-less consent page status = %d, want 200; body=%s", page.Code, page.Body.String())
 	}
 	shown := consentScopeListItems(t, page.Body.String())
-	if !equalStrings(shown, oauthas.SupportedScopes) {
-		t.Fatalf("consent displayed %v, want the advertised vocabulary %v", shown, oauthas.SupportedScopes)
+	if !equalStrings(shown, oauthas.DefaultScopes) {
+		t.Fatalf("consent displayed %v, want the advertised posture %v", shown, oauthas.DefaultScopes)
 	}
 	hidden := consentHiddenScope(t, page.Body.String())
 
@@ -410,7 +411,7 @@ func TestOAuthFlow_ScopeOmittedClientOnboardsEndToEnd(t *testing.T) {
 
 	// Token exchange: the §5.1 response echoes the defaulted scope string.
 	resp := decodeToken(t, postToken(srv, codeExchangeForm(code), nil))
-	if want := oauthas.ScopeString(oauthas.SupportedScopes); resp.Scope != want {
+	if want := oauthas.ScopeString(oauthas.DefaultScopes); resp.Scope != want {
 		t.Errorf("token response scope = %q, want %q", resp.Scope, want)
 	}
 
@@ -420,12 +421,247 @@ func TestOAuthFlow_ScopeOmittedClientOnboardsEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate the minted access token: %v", err)
 	}
-	if !equalStrings(at.Scopes, oauthas.SupportedScopes) {
-		t.Fatalf("access token scopes = %v, want the defaulted vocabulary %v", at.Scopes, oauthas.SupportedScopes)
+	if !equalStrings(at.Scopes, oauthas.DefaultScopes) {
+		t.Fatalf("access token scopes = %v, want the defaulted posture %v", at.Scopes, oauthas.DefaultScopes)
+	}
+	// #2477: the far end of the chain must not carry write:deploy. An
+	// assertion on the consent page alone could not see a widening at the
+	// token or persistence seam.
+	if containsOAuth(at.Scopes, "write:deploy") {
+		t.Fatalf("access token scopes = %v carry write:deploy; the scope-less default must not grant it", at.Scopes)
 	}
 	if at.Audience != testResource {
 		t.Errorf("access token audience = %q, want %q", at.Audience, testResource)
 	}
+}
+
+// oauthFlowScopeServer stands up a REAL-repository AS with one client whose
+// registered scope is registeredScope (empty = pins nothing), and returns a
+// signed-in identity. Shared by the two #2477 walks so each differs only in the
+// scope it requests.
+func oauthFlowScopeServer(t *testing.T, registeredScope string) (*Server, oauthstore.Repository, *pgxpool.Pool, Identity) {
+	t.Helper()
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	store := oauthstore.NewPostgresRepository(pool)
+	if _, err := store.UpsertClient(ctx, oauthstore.NewClient{
+		Metadata: oauthas.ClientMetadata{
+			ClientID:                "client-x",
+			ClientName:              "Claude Code",
+			RedirectURIs:            []string{"https://app.example/cb"},
+			GrantTypes:              []string{"authorization_code", "refresh_token"},
+			TokenEndpointAuthMethod: "none",
+			Scope:                   registeredScope,
+		},
+	}); err != nil {
+		t.Fatalf("UpsertClient: %v", err)
+	}
+	repo := newFakeAuthRepo()
+	uid := uuid.New()
+	repo.mu.Lock()
+	repo.users[uid.String()] = &auth.User{ID: uid.String(), Provider: "github", GitHubLogin: "octocat"}
+	repo.mu.Unlock()
+	id := Identity{Subject: "github:octocat", UserID: uid.String(), SessionID: uuid.NewString()}
+	_, gh := stubGitHubOAuthServer(t)
+	srv := New(Config{
+		OAuthASIssuer:    testIssuer,
+		OAuthStore:       store,
+		OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+		AuthRepo:         repo,
+		GitHubOAuth:      gh,
+	})
+	return srv, store, pool, id
+}
+
+// TestOAuthFlow_AdvertisedScopesRequestedVerbatimEndToEnd is #2477's
+// done-means at the altitude the issue asks about: what does a client that
+// reads scopes_supported and asks for it EXPLICITLY, by name, actually
+// RECEIVE? The scope-less walk above cannot answer that — it exercises the
+// defaulting branch, and a bound applied only to the default would pass it
+// while an explicit request still widened the grant.
+//
+// It crosses every seam in one walk: request parsing → oauthas resolution →
+// consent render → the persisted authorization-code row → token exchange →
+// the persisted access token read back through the REAL repository. Each
+// per-layer unit passes while any one of those seams re-derives the set.
+func TestOAuthFlow_AdvertisedScopesRequestedVerbatimEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	srv, store, _, id := oauthFlowScopeServer(t, "")
+
+	// Verbatim: exactly what the PRM and AS metadata advertise, space-joined,
+	// as a discovering client would echo it back.
+	advertised := oauthas.ScopeString(oauthas.DefaultScopes)
+	q := map[string]string{"scope": advertised}
+
+	page := getAuthorize(srv, authorizeQuery(q), &id)
+	if page.Code != http.StatusOK {
+		t.Fatalf("the advertised set must be requestable verbatim; status=%d body=%s", page.Code, page.Body.String())
+	}
+	shown := consentScopeListItems(t, page.Body.String())
+	if !equalStrings(shown, oauthas.DefaultScopes) {
+		t.Fatalf("consent displayed %v, want the seven advertised scopes %v", shown, oauthas.DefaultScopes)
+	}
+	if containsOAuth(shown, "write:deploy") {
+		t.Fatalf("consent displayed write:deploy: %v", shown)
+	}
+	hidden := consentHiddenScope(t, page.Body.String())
+
+	code := redirectQuery(t, postConsent(srv, consentForm(map[string]string{"scope": hidden}), &id)).Get("code")
+	if code == "" {
+		t.Fatal("the verbatim advertised request did not mint a code")
+	}
+
+	resp := decodeToken(t, postToken(srv, codeExchangeForm(code), nil))
+	if resp.Scope != advertised {
+		t.Errorf("token response scope = %q, want %q", resp.Scope, advertised)
+	}
+
+	at, err := store.AuthenticateAccessToken(ctx, resp.AccessToken)
+	if err != nil {
+		t.Fatalf("authenticate the minted access token: %v", err)
+	}
+	if !equalStrings(at.Scopes, oauthas.DefaultScopes) {
+		t.Fatalf("access token scopes = %v, want the seven advertised scopes %v", at.Scopes, oauthas.DefaultScopes)
+	}
+	if containsOAuth(at.Scopes, "write:deploy") {
+		t.Fatalf("the persisted access token carries write:deploy: %v", at.Scopes)
+	}
+}
+
+// TestOAuthFlow_MaximalScopeRequestRefusedAndMintsNothing is the negative half
+// of the same criterion, against the REAL repository: an unpinned client
+// asking for all eight (the #2471 shape, which is what scopes_supported
+// advertised BEFORE this change) is refused invalid_scope AND commits nothing.
+//
+// The committed-state half is load-bearing, not belt-and-braces: a control
+// that fires and rolls back returns a redirect BYTE-IDENTICAL to one that
+// never fired, so the error-identity assertion alone cannot distinguish them.
+func TestOAuthFlow_MaximalScopeRequestRefusedAndMintsNothing(t *testing.T) {
+	ctx := context.Background()
+	srv, _, pool, id := oauthFlowScopeServer(t, "")
+
+	all := oauthas.ScopeString(oauthas.SupportedScopes)
+	rr := postConsent(srv, consentForm(map[string]string{"scope": all}), &id)
+	if got := redirectQuery(t, rr).Get("error"); got != "invalid_scope" {
+		t.Fatalf("error = %q, want invalid_scope for an unpinned all-eight request", got)
+	}
+
+	// COMMITTED STATE, read straight out of the REAL database: the refused
+	// request must have persisted no authorization-code row at all.
+	var codeRows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM oauth_authorization_codes`).Scan(&codeRows); err != nil {
+		t.Fatalf("count authorization codes: %v", err)
+	}
+	if codeRows != 0 {
+		t.Fatalf("the refused all-eight request persisted %d authorization-code row(s); want 0", codeRows)
+	}
+}
+
+// TestOAuthFlow_CIMDSelfPinnedWriteDeployNeverReachesAToken is the cross-boundary
+// half of the #2477 fix-up, against the REAL repository. The CIMD resolution
+// path is the supported way a client connects, and its `scope` member is
+// client-authored and unvalidated — so a client with NO store row declaring
+// write:deploy in its own metadata is the adversarial shape the request-time
+// bound has to survive. The unit and route tests assert the refusal; this walk
+// asserts the far end: no minted CREDENTIAL, read back out of Postgres, ever
+// carries write:deploy on either request form.
+//
+// It matters at this altitude because the grant crosses six seams (resolution →
+// oauthas → consent render → the persisted code row → token exchange → the
+// persisted access token) and a bound applied at only one of them passes every
+// per-layer unit while a later seam re-derives the set from the registration.
+func TestOAuthFlow_CIMDSelfPinnedWriteDeployNeverReachesAToken(t *testing.T) {
+	const clientID = "https://selfpin.example/cimd"
+	const redirect = "https://selfpin.example/cb"
+	// The client declares the WHOLE eight-scope vocabulary in its own document.
+	selfPinned := oauthas.ScopeString(oauthas.SupportedScopes)
+
+	// setup stands up a REAL-repository AS with NO oauth_clients row for
+	// clientID, so resolveOAuthClient must fall through to the CIMD document.
+	setup := func(t *testing.T) (*Server, oauthstore.Repository, *pgxpool.Pool, Identity) {
+		t.Helper()
+		pool := pgtest.NewPool(t)
+		store := oauthstore.NewPostgresRepository(pool)
+		rt := newCIMD()
+		rt.docs[clientID] = cimdDoc(clientID, []string{redirect}, []string{"authorization_code", "refresh_token"}, nil, selfPinned)
+		repo := newFakeAuthRepo()
+		uid := uuid.New()
+		repo.mu.Lock()
+		repo.users[uid.String()] = &auth.User{ID: uid.String(), Provider: "github", GitHubLogin: "octocat"}
+		repo.mu.Unlock()
+		id := Identity{Subject: "github:octocat", UserID: uid.String(), SessionID: uuid.NewString()}
+		_, gh := stubGitHubOAuthServer(t)
+		srv := New(Config{
+			OAuthASIssuer:    testIssuer,
+			OAuthStore:       store,
+			OAuthCIMDFetcher: newCIMDFetcher(rt),
+			AuthRepo:         repo,
+			GitHubOAuth:      gh,
+		})
+		return srv, store, pool, id
+	}
+	q := func(scope string) map[string]string {
+		return map[string]string{"client_id": clientID, "redirect_uri": redirect, "scope": scope}
+	}
+
+	// EXPLICIT: naming write:deploy is refused and persists nothing at all.
+	t.Run("explicit_request_refused_and_persists_no_code", func(t *testing.T) {
+		ctx := context.Background()
+		srv, _, pool, id := setup(t)
+		rr := postConsent(srv, consentForm(q("read:runs write:deploy")), &id)
+		if got := redirectQuery(t, rr).Get("error"); got != "invalid_scope" {
+			t.Fatalf("error = %q, want invalid_scope for a CIMD self-pinned write:deploy", got)
+		}
+		var codeRows int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM oauth_authorization_codes`).Scan(&codeRows); err != nil {
+			t.Fatalf("count authorization codes: %v", err)
+		}
+		if codeRows != 0 {
+			t.Fatalf("the refused self-pinned request persisted %d authorization-code row(s); want 0", codeRows)
+		}
+	})
+
+	// DEFAULTED: sending no scope token at all defaults to the client's own
+	// declared set. write:deploy must be dropped from it, and the remaining
+	// seven must still travel the whole chain onto a usable token.
+	t.Run("scope_less_default_yields_a_token_without_write_deploy", func(t *testing.T) {
+		ctx := context.Background()
+		srv, store, _, id := setup(t)
+		page := getAuthorize(srv, authorizeQuery(q("\x00")), &id)
+		if page.Code != http.StatusOK {
+			t.Fatalf("the scope-less CIMD request must reach consent; status=%d body=%s", page.Code, page.Body.String())
+		}
+		shown := consentScopeListItems(t, page.Body.String())
+		if !equalStrings(shown, oauthas.DefaultScopes) {
+			t.Fatalf("consent displayed %v, want the self-declared set minus write:deploy %v", shown, oauthas.DefaultScopes)
+		}
+		hidden := consentHiddenScope(t, page.Body.String())
+
+		code := redirectQuery(t, postConsent(srv, consentForm(map[string]string{"client_id": clientID, "redirect_uri": redirect, "scope": hidden}), &id)).Get("code")
+		if code == "" {
+			t.Fatal("the scope-less CIMD consent did not mint a code")
+		}
+		form := codeExchangeForm(code)
+		form.Set("client_id", clientID)
+		form.Set("redirect_uri", redirect)
+		resp := decodeToken(t, postToken(srv, form, nil))
+		if want := oauthas.ScopeString(oauthas.DefaultScopes); resp.Scope != want {
+			t.Errorf("token response scope = %q, want %q", resp.Scope, want)
+		}
+
+		// COMMITTED STATE at the far end: the persisted access token, read back
+		// through the REAL repository, carries the seven and not write:deploy.
+		at, err := store.AuthenticateAccessToken(ctx, resp.AccessToken)
+		if err != nil {
+			t.Fatalf("authenticate the minted access token: %v", err)
+		}
+		if containsOAuth(at.Scopes, "write:deploy") {
+			t.Fatalf("the persisted access token carries a self-pinned write:deploy: %v", at.Scopes)
+		}
+		if !equalStrings(at.Scopes, oauthas.DefaultScopes) {
+			t.Fatalf("access token scopes = %v, want %v", at.Scopes, oauthas.DefaultScopes)
+		}
+	})
 }
 
 // TestOAuthFlow_GitLabEndToEnd_SubjectAndProvider drives the full AS walk on

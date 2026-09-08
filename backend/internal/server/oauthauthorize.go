@@ -144,12 +144,31 @@ func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req 
 	// url.Values.Get cannot tell them apart and they are deliberately equivalent)
 	// is DEFAULTED per RFC 6749 §3.3 rather than refused (#2466): to the client's
 	// registered scope intersected with this server's vocabulary when the
-	// registration pins one, else to the whole vocabulary. Every PRESENT value
-	// still validates exactly as before — an unknown scope, a whitespace-only
-	// `scope=%20%20`, and a scope exceeding the registration all still fail
-	// invalid_scope.
+	// registration pins one, else to oauthas.DefaultScopes — the ADVERTISED
+	// posture, which is the vocabulary MINUS write:deploy, NOT the whole
+	// vocabulary (#2477: the least-effort path for a first-time client must not
+	// be authority to ship). Every PRESENT value still validates exactly as
+	// before — an unknown scope, a whitespace-only `scope=%20%20`, and a scope
+	// exceeding the registration all still fail invalid_scope — and a present
+	// request naming a PreRegistrationOnlyScopes member (write:deploy) is now
+	// additionally refused invalid_scope unless the registration pins it, the
+	// whole request refused rather than that scope silently stripped.
+	//
+	// The bound lives in oauthas.ResolveRequestedScope, not here: that is the
+	// SOLE production resolution path for an authorization request's scope set,
+	// so one chokepoint covers both the explicit and the defaulted route and is
+	// unit-testable without a server.
+	//
+	// The registration's AUTHORITY travels with it. resolveOAuthClient resolves
+	// STORE-FIRST and falls through to the client's own CIMD document, so
+	// "the registration pins it" is an operator authorization only on the store
+	// branch; a CIMD `scope` member is unvalidated client-authored input. Passing
+	// client.ScopeAuthority is what stops a client with no store row from
+	// self-declaring write:deploy in its own metadata and satisfying the very
+	// bound that scope exists behind — on the explicit path it is refused as
+	// though it pinned nothing, on the defaulted path it is dropped.
 	registered := registeredScopeSet(client)
-	scopes, err := oauthas.ResolveRequestedScope(req.scope, registered)
+	scopes, err := oauthas.ResolveRequestedScope(req.scope, registered, registeredScopeAuthority(client))
 	if err != nil {
 		s.redirectOAuthError(w, r, responseRedirect, req.state, toOAuthError(err))
 		return authorizeResolved{}, false
@@ -164,7 +183,9 @@ func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req 
 	// for a DEFAULTED set: that set passes by construction (every member came
 	// from the registration, or the registration was absent and imposes no
 	// restriction), so one unconditional restriction ladder beats a conditional
-	// one a later edit could get wrong.
+	// one a later edit could get wrong. UNCHANGED by #2477 — it still bounds
+	// BOTH the explicit and the defaulted set, and it is what keeps a
+	// registration that pins write:deploy from also unlocking every other scope.
 	if len(registered) > 0 {
 		for _, want := range scopes {
 			if !containsOAuth(registered, want) {

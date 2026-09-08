@@ -2830,7 +2830,9 @@ depends on the OAuth AS verdict (`oauthas.go`), so `server.New` resolves
 (bare) and `GET /.well-known/oauth-protected-resource/{resource_path...}`
 (RFC 9728 §3.1 path-suffixed) both serve an `oauthPRMetadata` document —
 `resource`, `authorization_servers` (this AS's own issuer), `scopes_supported`
-(identical to the AS metadata's), `bearer_methods_supported: ["header"]`,
+(identical to the AS metadata's — both publish `oauthas.DefaultScopes`, the
+advertised posture, NOT the whole mintable vocabulary; #2477),
+`bearer_methods_supported: ["header"]`,
 `resource_name` — but ONLY when the AS is ENABLED (else `503
 oauth_as_unconfigured`, via the same `oauthASEnabled` gate the AS metadata route
 uses; never a partial document). `protectedResourceMetadataURL` derives the URL
@@ -3317,17 +3319,65 @@ that DID pin a narrow scope is bounded to it.
 An **absent REQUEST `scope`** now defaults too (#2466), which makes the two sides
 consistent — an absent registration already meant "no restriction", so failing
 closed on an absent request parameter was the odd one out. The ladder's step 6
-calls `oauthas.ResolveRequestedScope(req.scope, registeredScopeSet(client))`: a
+calls `oauthas.ResolveRequestedScope(req.scope, registeredScopeSet(client), registeredScopeAuthority(client))`: a
 request that CARRIES NO SCOPE TOKEN (the key absent, or a present-but-empty
 `scope=` — `url.Values.Get` cannot tell them apart and they are deliberately
 equivalent) is granted the client's registered scope INTERSECTED with the server
-vocabulary, or the whole vocabulary when the registration pins nothing; a
+vocabulary, or `oauthas.DefaultScopes` when the registration pins nothing; a
 registration naming no supported scope fails CLOSED with `invalid_scope`. Every
 PRESENT value still validates exactly as before — an unknown scope, a
 whitespace-only `scope=%20%20`, and a scope exceeding the registration all still
 fail `invalid_scope`. Step 7 is NOT skipped for a defaulted set: it passes by
 construction, so one unconditional restriction ladder beats a conditional one a
 later edit could get wrong. Contract detail: `backend/internal/oauthas/README.md`.
+
+**The default is `DefaultScopes`, NOT the whole vocabulary (#2477 / #2471).**
+This is the ratified scope posture, and the rationale is the whole point: the
+least-effort path for a first-time MCP client must not be authority to approve
+gates and ship. Before this, the PRM and AS metadata advertised all eight
+operator scopes, so a client that echoed `scopes_supported` back verbatim — or
+omitted `scope` entirely, taking the #2466 default — was granted `write:deploy`.
+`oauthas.DefaultScopes` is `SupportedScopes` minus `write:deploy`, and it is now
+what BOTH advertised surfaces publish and what the no-registration default hands
+out.
+
+The VOCABULARY is untouched: nothing is deleted or renamed, `ParseScope` still
+validates against `SupportedScopes`, and no operator token changes —
+`fishhawkd token issue` still mints `write:deploy`.
+
+`write:deploy` is additionally refused on the ordinary authorization-request path
+(`oauthas.PreRegistrationOnlyScopes`, enforced at the single
+`ResolveRequestedScope` chokepoint so it covers both the explicit and the
+defaulted route): a request naming it is `invalid_scope` unless an
+OPERATOR-AUTHORED registration PINS it, and a MIXED request naming it alongside
+valid scopes is refused WHOLE rather than silently stripped — stripping would
+grant less than the consent page displayed. The operator write path for such a
+registration has SHIPPED: `fishhawkd oauth client register --scope
+"... write:deploy"` (#2438), which `resolveOAuthClient` prefers over a CIMD fetch.
+
+**Only the STORE branch is an operator act, and the resolver says which branch it
+was.** `resolveOAuthClient` falls through to the client's own CIMD document on a
+store miss, and that document's `scope` member is unvalidated client-authored
+input — so honouring it would let a client with no store row declare
+`write:deploy` about itself and satisfy the very bound the scope sits behind, on
+the supported connection path. It does not: `resolvedOAuthClient.ScopeAuthority`
+carries the provenance (`resolvedFromStore` →
+`oauthas.OperatorAuthoredRegistration`, `resolvedFromCIMD` →
+`oauthas.ClientAuthoredRegistration`, the untrusted ZERO value), the ladder passes
+it to the chokepoint, and only the operator value unlocks the scope. A
+client-authored pin is refused WHOLE on the explicit path and DROPPED from the
+defaulted one (a defaulted request named nothing, so there is no asked-for set to
+diverge from; an intersection emptied that way still fails closed). Driven
+adversarially end to end by `TestAuthorize_CIMDClientCannotSelfPinWriteDeploy` and
+`TestOAuthFlow_CIMDSelfPinnedWriteDeployNeverReachesAToken`, each with a
+discrimination arm proving the SAME scope string from a store row still grants.
+Residual: anything able to WRITE an `oauth_clients` row counts as an operator, so
+a future RFC 7591 dynamic-registration endpoint would have to be excluded
+explicitly. Full contract and the forward rule for adding a scope to the bound:
+`backend/internal/oauthas/README.md`.
+
+Step 7's registered-scope restriction is **unchanged** by #2477 and still bounds
+BOTH the explicit and the defaulted set.
 
 **The consent form's hidden `scope` field carries the RESOLVED set, not the raw
 request value.** The page DISPLAYS the resolved scopes, so submitting the raw

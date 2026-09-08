@@ -257,14 +257,13 @@ components:
         scopes_supported:
           type: array
           items: { type: string }
-          description: The operator scope vocabulary.
+          description: The advertised/defaulted scope posture — the operator vocabulary MINUS `write:deploy`, which is reachable only through an operator pre-registration that pins it (#2477).
           example:
             - read:runs
             - read:audit
             - write:runs
             - write:approvals
             - write:stages
-            - write:deploy
             - write:campaigns
             - read:audit-export
         code_challenge_methods_supported:
@@ -315,14 +314,13 @@ components:
         scopes_supported:
           type: array
           items: { type: string }
-          description: The operator scope vocabulary (identical to the AS metadata's `scopes_supported`).
+          description: The advertised/defaulted scope posture — the operator vocabulary MINUS `write:deploy`, which is reachable only through an operator pre-registration that pins it (#2477). Identical to the AS metadata's `scopes_supported`.
           example:
             - read:runs
             - read:audit
             - write:runs
             - write:approvals
             - write:stages
-            - write:deploy
             - write:campaigns
             - read:audit-export
         bearer_methods_supported:
@@ -5558,9 +5556,14 @@ paths:
             Space-delimited requested scopes from the operator vocabulary. A request carrying NO scope token — the key
             absent, or a present-but-empty `scope=`, which are treated identically — is DEFAULTED per RFC 6749 §3.3
             rather than refused: to the client's registered `scope` intersected with the server vocabulary when the
-            registration pins one, otherwise to the whole advertised `scopes_supported` set. A registration naming no
-            supported scope is refused `invalid_scope`. Every present value still validates: an unknown scope, a
-            whitespace-only value, and a scope exceeding the client's registration all fail `invalid_scope`.
+            registration pins one, otherwise to the advertised `scopes_supported` posture — the operator vocabulary
+            MINUS `write:deploy`, not the whole vocabulary (#2477). A registration naming no supported scope is refused
+            `invalid_scope`. Every present value still validates: an unknown scope, a whitespace-only value, and a scope
+            exceeding the client's registration all fail `invalid_scope`. A request NAMING `write:deploy` is refused
+            `invalid_scope` unless an OPERATOR-AUTHORED registration pins it — and a mixed request naming it
+            alongside valid scopes is refused WHOLE, never silently stripped. Only a registration an operator wrote
+            into this deployment counts: a client that self-declares `write:deploy` in its own client-ID metadata
+            document does not unlock it, and a client-authored pin is instead DROPPED from the defaulted set.
           schema: { type: string }
         - name: state
           in: query

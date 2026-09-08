@@ -103,7 +103,7 @@ func (s *Server) protectedResourceMetadataDoc() oauthPRMetadata {
 	return oauthPRMetadata{
 		Resource:               st.resource.String(),
 		AuthorizationServers:   []string{st.issuer.String()},
-		ScopesSupported:        append([]string(nil), oauthas.SupportedScopes...),
+		ScopesSupported:        append([]string(nil), oauthas.DefaultScopes...),
 		BearerMethodsSupported: []string{"header"},
 		ResourceName:           "Fishhawk",
 	}
