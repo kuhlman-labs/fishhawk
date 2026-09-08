@@ -15,6 +15,7 @@ package github
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -43,6 +44,11 @@ var _ forge.Forge = (*Forge)(nil)
 // Compile-time assertion that the adapter also provides the standalone
 // file-read capability the per-repo conventions loader consumes (#2022).
 var _ forge.FileFetcher = (*Forge)(nil)
+
+// Compile-time assertion that the adapter provides the standalone
+// issue-thread capability the split-parent auto-close watcher consumes
+// (E50.17 / #2900).
+var _ forge.IssueOperations = (*Forge)(nil)
 
 // New wraps c as the registered "github" forge. c is the same concrete
 // client serve.go wires for the non-forge surfaces (issues, comments,
@@ -85,4 +91,74 @@ func (f *Forge) FetchFile(ctx context.Context, scope forge.CredentialScope, repo
 		return nil, err
 	}
 	return &forge.FileContent{Path: fc.Path, Content: fc.Content, SHA: fc.SHA}, nil
+}
+
+// --- forge.IssueOperations (E50.17 / #2900) -----------------------------
+//
+// Four thin wrappers over the embedded client's issue surface, each
+// mapping the concrete result onto the forge-neutral vocabulary and
+// propagating errors UNMODIFIED — the same shape FetchFile uses. They are
+// named FetchIssue / FetchIssueComments / PostIssueComment / SetIssueState
+// rather than GetIssue / ListIssueComments / CreateIssueComment /
+// UpdateIssue so they do not SHADOW the promoted client methods of those
+// names (an outer method wins over an embedded one, silently changing the
+// type any caller of f.GetIssue receives).
+
+// FetchIssue implements forge.IssueOperations by delegating to the
+// embedded client's GetIssue (GET /repos/{owner}/{repo}/issues/{number}).
+// GitHub's state vocabulary is already the forge-neutral one, so State
+// and StateReason pass through verbatim.
+func (f *Forge) FetchIssue(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int) (*forge.Issue, error) {
+	is, err := f.GetIssue(ctx, scope, repo, number)
+	if err != nil {
+		return nil, err
+	}
+	return &forge.Issue{
+		Number:      is.Number,
+		Title:       is.Title,
+		Body:        is.Body,
+		State:       is.State,
+		StateReason: is.StateReason,
+		Labels:      is.Labels,
+	}, nil
+}
+
+// FetchIssueComments implements forge.IssueOperations by delegating to the
+// embedded client's ListIssueComments, which already pages to exhaustion
+// via the rel="next" Link header.
+func (f *Forge) FetchIssueComments(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int) ([]forge.IssueComment, error) {
+	comments, err := f.ListIssueComments(ctx, scope, repo, number)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]forge.IssueComment, 0, len(comments))
+	for _, c := range comments {
+		out = append(out, forge.IssueComment{ID: c.ID, Author: c.Author, Body: c.Body, CreatedAt: c.CreatedAt})
+	}
+	return out, nil
+}
+
+// PostIssueComment implements forge.IssueOperations by delegating to the
+// embedded client's CreateIssueComment. The created comment's id is not
+// surfaced: the capability's one consumer keys idempotency on a body
+// marker, not on a recorded id.
+func (f *Forge) PostIssueComment(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int, body string) error {
+	_, err := f.CreateIssueComment(ctx, scope, repo, number, body)
+	return err
+}
+
+// SetIssueState implements forge.IssueOperations by delegating to the
+// embedded client's UpdateIssue with BOTH State and StateReason carried
+// onto githubclient.UpdateIssueParams — a state-only PATCH would silently
+// drop the completion reason. A nil State is refused locally with
+// forge.ErrValidation before any HTTP call, per the interface contract.
+func (f *Forge) SetIssueState(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int, u forge.IssueStateUpdate) error {
+	if u.State == nil {
+		return fmt.Errorf("%w: set issue state requires a target state", forge.ErrValidation)
+	}
+	_, err := f.UpdateIssue(ctx, scope, repo, number, githubclient.UpdateIssueParams{
+		State:       u.State,
+		StateReason: u.StateReason,
+	})
+	return err
 }
