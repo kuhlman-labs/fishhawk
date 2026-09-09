@@ -114,9 +114,12 @@ func TestE2E_StageDeadline_RemainingBudgetOnWaitStatus(t *testing.T) {
 			t.Fatalf("TransitionStage(implement → %s): %v", to, err)
 		}
 	}
+	// Backdate BOTH started_at and dispatched_at to ~600s ago (#3335): a normal
+	// running stage 600s in was dispatched 600s ago, so the per-attempt deadline
+	// clock aligns with the cumulative elapsed clock and the identity below holds.
 	if _, err := fx.pool.Exec(ctx,
-		`UPDATE stages SET started_at = $1 WHERE id = $2`, startedAt, implStage.ID); err != nil {
-		t.Fatalf("backdate implement started_at: %v", err)
+		`UPDATE stages SET started_at = $1, dispatched_at = $1 WHERE id = $2`, startedAt, implStage.ID); err != nil {
+		t.Fatalf("backdate implement started_at/dispatched_at: %v", err)
 	}
 
 	// Running: the deadline fields ride the surface, spec-resolved and consistent.
@@ -161,12 +164,97 @@ func TestE2E_StageDeadline_RemainingBudgetOnWaitStatus(t *testing.T) {
 	}
 }
 
+// TestE2E_StageDeadline_RedispatchReportsPerAttemptBudget is the #3335
+// cross-boundary vehicle (persistence → domain type → HTTP response → MCP
+// projection): a stage whose started_at predates its whole budget but which was
+// re-dispatched seconds ago must report a NEAR-FULL deadline_seconds_remaining
+// (derived from the per-attempt dispatch clock), not 0 (a cumulative clock).
+// Per-layer units each pass while the seam breaks; only the end-to-end read
+// pins it.
+func TestE2E_StageDeadline_RedispatchReportsPerAttemptBudget(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    audit.NewPostgresRepository(fx.pool),
+		SigningRepo:  signing.NewPostgresRepository(fx.pool),
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	r, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef",
+		TriggerSource: runpkg.TriggerCLI, WorkflowSpec: stageDeadlineWorkflowSpec,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if _, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r.ID, Sequence: 1, Type: runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1", RequiresApproval: true,
+	}); err != nil {
+		t.Fatalf("CreateStage(plan): %v", err)
+	}
+	implStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r.ID, Sequence: 2, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(implement): %v", err)
+	}
+
+	const wantBudget = 3600 // spec's 60m implement executor timeout
+	// Dispatch → running stamps dispatched_at (migration 0072 trigger) ~now, and
+	// started_at ~now under COALESCE. Then backdate ONLY started_at to well past
+	// the whole budget — the shape of a stage re-dispatched seconds ago whose
+	// original start is ancient. deadline must come from the recent dispatch.
+	for _, to := range []runpkg.StageState{runpkg.StageStateDispatched, runpkg.StageStateRunning} {
+		if _, err := fx.runRepo.TransitionStage(ctx, implStage.ID, to, nil); err != nil {
+			t.Fatalf("TransitionStage(implement → %s): %v", to, err)
+		}
+	}
+	if _, err := fx.pool.Exec(ctx,
+		`UPDATE stages SET started_at = $1 WHERE id = $2`,
+		time.Now().UTC().Add(-4000*time.Second), implStage.ID); err != nil {
+		t.Fatalf("backdate implement started_at: %v", err)
+	}
+
+	ws := implementDeadlineStatus(t, ctx, session, r.ID)
+	if ws == nil {
+		t.Fatal("implement_stage_wait_status is nil")
+	}
+	if ws.DeadlineSecondsRemaining == nil {
+		t.Fatal("deadline_seconds_remaining is nil, want a near-full per-attempt budget")
+	}
+	// Near-full: the attempt started seconds ago, so the remaining budget is
+	// within a small sliver of the whole 3600 — emphatically NOT 0.
+	if *ws.DeadlineSecondsRemaining < wantBudget-120 {
+		t.Errorf("deadline_seconds_remaining = %d, want near %d (per-attempt from the recent dispatch, not the 4000s-old start)",
+			*ws.DeadlineSecondsRemaining, wantBudget)
+	}
+	// elapsed_seconds stays CUMULATIVE from the original start (>= 4000).
+	if ws.ElapsedSeconds < 4000 {
+		t.Errorf("elapsed_seconds = %d, want >= 4000 (cumulative from the original start)", ws.ElapsedSeconds)
+	}
+	// attempt_elapsed_seconds is the small per-attempt value the deadline derives from.
+	if ws.AttemptElapsedSeconds == nil || *ws.AttemptElapsedSeconds > 120 {
+		t.Errorf("attempt_elapsed_seconds = %v, want a small value (recent dispatch)", ws.AttemptElapsedSeconds)
+	}
+}
+
 // implementDeadlineWaitStatus is the decoded implement_stage_wait_status,
 // projecting the #2540 deadline fields alongside status.
 type implementDeadlineWaitStatus struct {
 	Stage                    string `json:"stage"`
 	Status                   string `json:"status"`
 	ElapsedSeconds           int    `json:"elapsed_seconds"`
+	AttemptElapsedSeconds    *int   `json:"attempt_elapsed_seconds"`
 	AgentTimeoutSeconds      int    `json:"agent_timeout_seconds"`
 	DeadlineSecondsRemaining *int   `json:"deadline_seconds_remaining"`
 }

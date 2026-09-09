@@ -983,3 +983,121 @@ func TestApply_StampsOnceWhenCallerBodyAlreadyKeyed(t *testing.T) {
 		t.Errorf("already-keyed body was rewritten:\ngot  %q\nwant %q", item.Body, pre)
 	}
 }
+
+// --- derived-title length guard (#3335) --------------------------------------
+
+// TestApply_DerivedTitleOverLimitRefused is COUNTERFACTUAL CONTROL 3: the
+// rune-length refusal in renderTitle. Filing a feature whose derived title
+// exceeds MaxTitleRunes must fail with a *SemanticError whose Details name the
+// derived title and its length. Delete the length branch and Apply returns a
+// WorkItem with no error -> RED. Error identity is sufficient because Apply is
+// pure and commits no state before returning.
+func TestApply_DerivedTitleOverLimitRefused(t *testing.T) {
+	conv := testConventions(t)
+	summary := strings.Repeat("a", 256) // derived title = "[E22.7] " + 256 runes
+	_, _, err := Apply(FilingRequest{
+		Type:      "feature",
+		Summary:   summary,
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		Relations: Relations{ParentEpic: "#1005"},
+	}, conv)
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("want *SemanticError for an over-long derived title, got %v", err)
+	}
+	// derived_title_length must be the FULL derived rune count, not the summary's.
+	wantLen := len("[E22.7] ") + 256
+	if se.Details["derived_title_length"] != wantLen {
+		t.Errorf("derived_title_length = %v, want %d", se.Details["derived_title_length"], wantLen)
+	}
+	if se.Details["title_limit"] != MaxTitleRunes {
+		t.Errorf("title_limit = %v, want %d", se.Details["title_limit"], MaxTitleRunes)
+	}
+	if _, ok := se.Details["derived_title"]; !ok {
+		t.Errorf("Details missing derived_title: %v", se.Details)
+	}
+}
+
+// TestRenderTitle_AtLimitAccepted: a derived title of exactly MaxTitleRunes (255)
+// is accepted (the strictest-provider boundary).
+func TestRenderTitle_AtLimitAccepted(t *testing.T) {
+	summary := strings.Repeat("a", MaxTitleRunes) // 255, no format -> bare summary
+	got, err := renderTitle("", summary, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("renderTitle at %d runes: %v (must be accepted)", MaxTitleRunes, err)
+	}
+	if got != summary {
+		t.Errorf("title = %q, want the summary unchanged", got)
+	}
+}
+
+// TestRenderTitle_OneOverLimitRefused: a derived title of exactly 256 runes is
+// refused. This is the pair that pins the strictest-provider choice — under the
+// old 256 constant this title would have been admitted and 502'd at a GitLab
+// provider.
+func TestRenderTitle_OneOverLimitRefused(t *testing.T) {
+	summary := strings.Repeat("a", MaxTitleRunes+1) // 256
+	_, err := renderTitle("", summary, 0, 0, nil)
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("want *SemanticError at %d runes, got %v", MaxTitleRunes+1, err)
+	}
+	if se.Details["derived_title_length"] != MaxTitleRunes+1 {
+		t.Errorf("derived_title_length = %v, want %d", se.Details["derived_title_length"], MaxTitleRunes+1)
+	}
+}
+
+// TestMaxTitleRunes_PinsStrictestProviderBoundary pins the CONSTANT to the
+// literal 255, independent of the boundary tests above. Those tests derive every
+// input and expectation FROM MaxTitleRunes, so bumping the constant to 256 slides
+// their at-limit / over-limit boundary along with it and they stay green — the
+// strictest-provider choice (255, the GitLab cap, not GitHub's 256) would then be
+// silently unpinned. This literal assertion is the one that goes RED on that
+// change, so a future bump is a deliberate edit here and not an accident.
+func TestMaxTitleRunes_PinsStrictestProviderBoundary(t *testing.T) {
+	if MaxTitleRunes != 255 {
+		t.Errorf("MaxTitleRunes = %d, want 255 (the strictest-provider cap: GitLab 255, GitHub 256). "+
+			"Changing this is a provider-portability decision, not a refactor — see the const's doc comment in apply.go.",
+			MaxTitleRunes)
+	}
+}
+
+// TestRenderTitle_FormatPrefixPushesOver: a SHORT summary whose title_format
+// PREFIX pushes the DERIVED title over the limit is refused — proving the check
+// reads the derived title, not the summary (the exact misdiagnosis #3335
+// reports).
+func TestRenderTitle_FormatPrefixPushesOver(t *testing.T) {
+	summary := strings.Repeat("a", MaxTitleRunes-2) // 253, well under on its own
+	// A 7-rune literal prefix -> derived 260 runes, over the cap.
+	_, err := renderTitle("[E1.1] {summary}", summary, 0, 0, nil)
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("want *SemanticError (prefix pushes derived title over), got %v", err)
+	}
+	if se.Details["derived_title_length"] != len("[E1.1] ")+MaxTitleRunes-2 {
+		t.Errorf("derived_title_length = %v, want %d", se.Details["derived_title_length"], len("[E1.1] ")+MaxTitleRunes-2)
+	}
+	// The summary alone is under the cap: the same runes with no prefix pass.
+	if _, err := renderTitle("", summary, 0, 0, nil); err != nil {
+		t.Errorf("summary alone (%d runes) must be accepted: %v", MaxTitleRunes-2, err)
+	}
+}
+
+// TestRenderTitle_CountsRunesNotBytes: a multi-byte (non-ASCII) title is counted
+// in RUNES, not bytes — 255 two-byte runes (510 bytes) is accepted, 256 refused.
+// A byte-based count would over-refuse the legitimate 255-rune title.
+func TestRenderTitle_CountsRunesNotBytes(t *testing.T) {
+	at := strings.Repeat("é", MaxTitleRunes) // 255 runes, 510 bytes
+	if _, err := renderTitle("", at, 0, 0, nil); err != nil {
+		t.Fatalf("255 two-byte runes must be accepted (runes, not bytes): %v", err)
+	}
+	over := strings.Repeat("é", MaxTitleRunes+1) // 256 runes
+	_, err := renderTitle("", over, 0, 0, nil)
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("256 two-byte runes must be refused, got %v", err)
+	}
+	if se.Details["derived_title_length"] != MaxTitleRunes+1 {
+		t.Errorf("derived_title_length = %v, want %d (runes)", se.Details["derived_title_length"], MaxTitleRunes+1)
+	}
+}

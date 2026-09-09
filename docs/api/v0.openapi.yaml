@@ -3050,6 +3050,22 @@ components:
         started_at:
           type: [string, "null"]
           format: date-time
+          description: |
+            When the stage FIRST entered `running`. Written under
+            COALESCE and never overwritten, so it is CUMULATIVE across
+            in-driver re-spawns and fix-up/retry re-dispatches — use
+            `dispatched_at` for the per-attempt clock (#3335).
+        dispatched_at:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            The PER-ATTEMPT dispatch clock (#3335): re-stamped on every
+            transition INTO `dispatched` (migration 0072), so a fix-up
+            re-dispatch or a retry RESETS it — unlike `started_at`. The
+            MCP stage-wait `deadline_seconds_remaining` derives from this
+            so a re-dispatched stage reports its fresh per-attempt agent
+            budget rather than a cumulative clock reading 0. Null for a
+            legacy row or a stage that never passed through `dispatched`.
         ended_at:
           type: [string, "null"]
           format: date-time
@@ -3175,7 +3191,10 @@ components:
         operator-facing `elapsed_seconds` is deliberately NOT part of
         `progress`: it is derived server-side from the stage's `started_at`,
         which makes it cumulative and monotonic across re-spawns, and it is
-        surfaced on the MCP stage-wait status rather than here.
+        surfaced on the MCP stage-wait status rather than here. (The stage-wait
+        `deadline_seconds_remaining`, by contrast, derives from the per-attempt
+        `dispatched_at` clock since #3335, so a re-dispatched stage reports its
+        fresh remaining budget while `elapsed_seconds` stays cumulative.)
       required: [last_event, turns_this_attempt, tokens_this_attempt, reported_at]
       properties:
         last_event:
@@ -14530,8 +14549,10 @@ paths:
         A category-B (policy) failure still CONSUMES a pass — it is a verdict
         on delivered work, not a delivery failure — and the PUSH VETO applies
         UNIFORMLY: a pass that pushed a commit delivered something, so it
-        consumes budget however it later died. No refund ever extends the
-        absolute 3-pass ceiling, which keeps counting RAW triggered passes.
+        consumes budget however it later died. Since #3335 a delivered-nothing
+        refund ALSO credits the hard ceiling, bounded so the absolute cap is
+        6 triggered passes (the base 3-pass ceiling plus 3 credits); both 422s
+        report `ceiling_refunded_passes` and `remaining_ceiling_slots`.
       tags: [stages]
       parameters:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -14773,10 +14794,14 @@ paths:
             whose delivered-nothing signal was a DEATH — a category-A or
             category-C crash that pushed nothing — and reporting 0 for a
             window refunded only on `fixup_no_changes`, so an operator can see
-            whether they are overriding a real limit or a crash, #3085); or
-            the hard ceiling of 3 total passes is reached and the override can
+            whether they are overriding a real limit or a crash, #3085; a
+            delivered-nothing refund also credits the ceiling up to 3 so the
+            absolute cap is 6 triggered passes, and `details` additionally carry
+            `ceiling_refunded_passes` + `remaining_ceiling_slots`, #3335); or
+            the hard ceiling is reached and the override can
             no longer help (`fixup_ceiling_reached`, distinct from
-            `fixup_budget_exhausted`; its `details` carry a `remediation`
+            `fixup_budget_exhausted`; its `details` carry `ceiling_refunded_passes`,
+            `remaining_ceiling_slots` and a `remediation`
             pointer to the operator commit-and-`fishhawk_vouch_commit` path for
             a late CI/SAST finding, #1068/#1044); or the resolved `implement_model`
             override is not in the deployment's per-adapter allow-list

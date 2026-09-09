@@ -735,8 +735,10 @@ arm on the next snapshot — spawns the actual re-run.
 
 ### Late CI/SAST finding after the fix-up ceiling
 
-The bounded fix-up budget is hard-capped at 3 total passes per implement stage
-(normal pass + operator overrides). Once that ceiling is reached,
+The bounded fix-up budget is hard-capped at the ceiling (base 3 passes; a
+delivered-nothing pass is credited against the ceiling as well as the normal
+budget, capped at 3 such credits, so the absolute bound is 6 triggered passes,
+#3335). Once that ceiling is reached,
 `fishhawk_fixup_stage` refuses with `422 fixup_ceiling_reached` and the MCP
 `review_action_hint` stops offering an override. A required external check
 (CodeQL/SAST) can still surface a late finding at that point, and there is no

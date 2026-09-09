@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // FilingRequest is the raw caller input to Apply — what the MCP tool,
@@ -68,6 +69,31 @@ type FilingRequest struct {
 
 // placeholderRE matches a `{name}` title_format placeholder.
 var placeholderRE = regexp.MustCompile(`\{([a-zA-Z0-9_]+)\}`)
+
+// MaxTitleRunes is the STRICTEST derived-title length across supported providers
+// (#3335): GitHub caps issue titles at 256 characters, GitLab at 255, so 255 is
+// the bound that holds for EVERY provider. renderTitle refuses a longer derived
+// title in the pure Apply layer with a *SemanticError -> 422 work_item_invalid,
+// naming the derived title and its length, instead of letting an over-long title
+// reach the provider and come back as a bare 502 whose real cause (title too
+// long) is only in the fishhawkd log.
+//
+// The count is in RUNES, not bytes: both providers enforce on characters, so a
+// rune count is the closer approximation and a byte count would over-refuse a
+// legitimate multi-byte title.
+//
+// Residual, deliberate and fail-closed: a 256-rune title GitHub ALONE would have
+// accepted is refused locally. That trade is what makes the guarantee true for
+// EVERY supported provider — at 256 a GitLab filing still returns the bare 502
+// this guard exists to prevent. If 255 proves too strict for a GitHub-only
+// deployment it is a one-constant change; the boundary tests name the number
+// explicitly so the intent is not lost.
+const MaxTitleRunes = 255
+
+// maxEchoedTitleRunes bounds the derived_title echoed back in the refusal error
+// so the message stays readable — a bounded prefix + suffix of the over-long
+// title, not the whole thing.
+const maxEchoedTitleRunes = 80
 
 // Apply resolves a FilingRequest against the repo's conventions into a
 // conventions-complete WorkItem plus the allocated sequential number (0
@@ -227,7 +253,10 @@ func allocateNumber(itemType ItemType, existing []int) (int, error) {
 // that declare no numbering.pad are unchanged.
 func renderTitle(format, summary string, number, pad int, vars map[string]string) (string, error) {
 	if strings.TrimSpace(format) == "" {
-		return summary, nil
+		// Bare-summary path goes through the SAME length check (#3335): a
+		// long summary with no title_format still reaches the provider as the
+		// title.
+		return checkTitleLength(summary, format)
 	}
 	subs := map[string]string{"summary": summary}
 	if number > 0 {
@@ -261,7 +290,46 @@ func renderTitle(format, summary string, number, pad int, vars map[string]string
 			},
 		}
 	}
-	return out, nil
+	return checkTitleLength(out, format)
+}
+
+// checkTitleLength refuses a DERIVED title longer than MaxTitleRunes (#3335)
+// with a *SemanticError -> 422 work_item_invalid, so an over-long title is
+// rejected in the pure Apply layer instead of reaching the provider and coming
+// back as a bare 502. It counts RUNES (both supported providers enforce on
+// characters), and carries Details{derived_title, derived_title_length,
+// title_limit, title_format} so the handler's SemanticError -> 422 mapping
+// surfaces the derived title and its length with no handler change. The echoed
+// derived_title is truncated to a bounded prefix+suffix so the error stays
+// readable. Returns the title unchanged when it is within the cap.
+func checkTitleLength(title, format string) (string, error) {
+	n := utf8.RuneCountInString(title)
+	if n <= MaxTitleRunes {
+		return title, nil
+	}
+	return "", &SemanticError{
+		Msg: fmt.Sprintf(
+			"derived title is %d characters; the maximum is %d (the strictest supported-provider bound): %q",
+			n, MaxTitleRunes, truncateForEcho(title)),
+		Details: map[string]any{
+			"derived_title":        truncateForEcho(title),
+			"derived_title_length": n,
+			"title_limit":          MaxTitleRunes,
+			"title_format":         format,
+		},
+	}
+}
+
+// truncateForEcho bounds a derived title echoed in an error to a readable
+// prefix+suffix (rune-safe), so a pathologically long title does not bloat the
+// message. A title within maxEchoedTitleRunes is returned verbatim.
+func truncateForEcho(s string) string {
+	r := []rune(s)
+	if len(r) <= maxEchoedTitleRunes {
+		return s
+	}
+	half := maxEchoedTitleRunes / 2
+	return string(r[:half]) + "…" + string(r[len(r)-half:])
 }
 
 // resolveRelations validates the caller's relations against the type's

@@ -77,7 +77,7 @@ type FixupStageInput struct {
 	// AllowCreate declares net-new files this fix-up will create (#823).
 	AllowCreate []string `json:"allow_create,omitempty" jsonschema:"optional repo-relative paths the fix-up will CREATE; folded into the effective scope.files for THIS pass only (bounded, explicit, operator-authorized) so the runner stages them instead of failing category-B created-out-of-scope. Any created file NOT declared here still fails category-B."`
 	// ForceAdditionalPass is the bounded operator override (#860).
-	ForceAdditionalPass bool `json:"force_additional_pass,omitempty" jsonschema:"bounded operator override: set true to grant ONE fix-up pass BEYOND the normal budget when it is already spent (you got fixup_budget_exhausted) but a concern still needs the agent. Hard-capped at 3 total passes per stage; the forced pass is audited (forced flag + your reason). At the ceiling the tool returns fixup_ceiling_reached and the override no longer helps. NOT the recourse after a crash: a pass that delivered NOTHING to the PR branch (no commit, or a category-A/category-C death that pushed nothing) is refunded against the normal budget automatically, so check the error details' crashed_without_push first. Default false."`
+	ForceAdditionalPass bool `json:"force_additional_pass,omitempty" jsonschema:"bounded operator override: set true to grant ONE fix-up pass BEYOND the normal budget when it is already spent (you got fixup_budget_exhausted) but a concern still needs the agent. Hard-capped at the ceiling; the forced pass is audited (forced flag + your reason). At the ceiling the tool returns fixup_ceiling_reached and the override no longer helps. NOT the recourse after a crash: a pass that delivered NOTHING to the PR branch (no commit, or a category-A/category-C death that pushed nothing) is refunded against the normal budget AND credited against the ceiling automatically (#3335, up to 3 credits — absolute cap 6 triggered passes), so check the error details' crashed_without_push and remaining_ceiling_slots first. Default false."`
 	// ImplementModel is the optional operator/driver model override for this
 	// fix-up pass (#1164).
 	ImplementModel string `json:"implement_model,omitempty" jsonschema:"optional operator/driver model override for THIS fix-up pass; default (empty) inherits the run's resolved implement model. Validated against the deployment per-adapter allow-list — a disallowed value returns fixup_invalid_model (422)."`
@@ -204,12 +204,14 @@ Inputs:
   - force_additional_pass : bounded operator override (#860). When the
     NORMAL budget is spent (you got fixup_budget_exhausted) but a concern
     still needs the agent, set this true to grant ONE pass beyond the
-    budget. Hard-capped at 3 total passes per stage; the forced pass is
-    audited (a 'forced' flag plus your reason on the stage_fixup_triggered
-    entry). Default false. NOT the recourse after a crash: a pass that
-    delivered nothing to the PR branch is refunded automatically (#3085), so
-    check the fixup_budget_exhausted details' crashed_without_push before
-    spending the override.
+    budget. Hard-capped at the ceiling; the forced pass is audited (a
+    'forced' flag plus your reason on the stage_fixup_triggered entry).
+    Default false. NOT the recourse after a crash: a pass that delivered
+    nothing to the PR branch is refunded against the normal budget AND
+    credited against the ceiling automatically (#3085 / #3335, up to 3
+    credits — absolute cap 6 triggered passes), so check the
+    fixup_budget_exhausted details' crashed_without_push and
+    remaining_ceiling_slots before spending the override.
   - implement_model : optional operator/driver model override for THIS
     fix-up pass (#1164). Default (empty) inherits the run's already-resolved
     implement model — byte-identical to today. A non-empty value is
@@ -234,22 +236,26 @@ The budget is the number of remaining passes (max − fix-ups already
 triggered, observable on the stage_fixup_triggered audit entry's
 remaining_budget field). A second attempt once the budget is spent returns
 fixup_budget_exhausted — but the operator may grant ONE more pass with
-force_additional_pass=true, hard-capped at 3 TOTAL passes per stage. Once
-that hard ceiling is reached the tool returns the DISTINCT
-fixup_ceiling_reached error (the override no longer helps — file a
-follow-up and merge, or start a fresh run). A run-bound token may fix up
-only its own run's stages. The operator still owns the merge.
+force_additional_pass=true, hard-capped at the ceiling. Once that hard
+ceiling is reached the tool returns the DISTINCT fixup_ceiling_reached
+error (the override no longer helps — file a follow-up and merge, or start
+a fresh run). A run-bound token may fix up only its own run's stages. The
+operator still owns the merge.
 
-Delivered-nothing refund (#967 / #1957 / #3085): a pass that landed NOTHING
-on the PR branch is REFUNDED against the normal budget — the next trigger is
-admitted WITHOUT force_additional_pass, so a crash is not a reason to reach
-for the override. Four shapes qualify: the re-dispatch produced no commit
+Delivered-nothing refund (#967 / #1957 / #3085 / #3335): a pass that landed
+NOTHING on the PR branch is REFUNDED against the normal budget AND CREDITED
+against the hard ceiling — the next trigger is admitted WITHOUT
+force_additional_pass, so a crash is not a reason to reach for the override,
+and two harness kills that pushed nothing no longer exhaust the whole
+remediation budget. Four shapes qualify: the re-dispatch produced no commit
 (fixup_no_changes), the runner died on infrastructure before the agent ran,
 the pass died category-C on the push/report, or the agent's HARNESS died
 category-A (a 400, a zero-token hang). A category-B (policy) failure still
 CONSUMES a pass, and so does any pass that PUSHED a commit before it died —
-that pass delivered something. The refund never extends the absolute 3-pass
-ceiling, which counts every triggered pass including refunded ones.
+that pass delivered something. The ceiling credit is CAPPED at 3 (#3335), so
+the absolute cap is 6 triggered passes (the base 3-pass ceiling plus 3
+credits); both 422s report remaining_ceiling_slots so you can size the next
+pass before spending it.
 
 Returns the re-opened Stage row (pending → dispatched) on success.
 Returns a tool error on:
@@ -264,13 +270,15 @@ Returns a tool error on:
     the stage is not at the gate / its review gate already resolved, 422)
   - fixup_budget_exhausted (the NORMAL bounded pass count is spent, 422;
     one more pass is available via force_additional_pass=true. The details
-    carry max_passes, used, refunded_passes and crashed_without_push — the
-    last counts the refunded passes that DIED rather than merely producing
-    no commit, so you can see whether you are overriding a real limit or a
-    crash)
-  - fixup_ceiling_reached (the hard ceiling of 3 total passes is reached,
-    422; a hard stop — the override cannot push past it. File a follow-up
-    and merge, or start a fresh run)
+    carry max_passes, used, refunded_passes, crashed_without_push —
+    the count of refunded passes that DIED rather than merely producing no
+    commit — and ceiling_refunded_passes + remaining_ceiling_slots (#3335)
+    so you learn the ceiling headroom BEFORE spending the override)
+  - fixup_ceiling_reached (the hard ceiling is reached, 422; a hard stop —
+    the override cannot push past it. Delivered-nothing refunds credit the
+    ceiling up to 3 (absolute cap 6 triggered passes); the details carry
+    ceiling_refunded_passes and remaining_ceiling_slots (0 here). File a
+    follow-up and merge, or start a fresh run)
   - fixup_invalid_model (the resolved implement_model override is not in the
     deployment's per-adapter allow-list, 422; choose an allowed model or
     widen the allow-list)

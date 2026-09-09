@@ -225,6 +225,69 @@ func TestGetStage_HappyPath(t *testing.T) {
 	}
 }
 
+// TestStageDispatchedAt_Projected pins the #3335 dispatched_at projection on
+// BOTH observability read paths (handleGetStage and handleListRunStages): a
+// stage carrying the per-attempt dispatch clock surfaces it on the wire, and a
+// stage that never dispatched serves null (a plain *time.Time, not omitempty).
+func TestStageDispatchedAt_Projected(t *testing.T) {
+	repo := newStagesRunRepo()
+	runID := uuid.New()
+	now := time.Date(2026, 5, 3, 10, 0, 0, 0, time.UTC)
+	dispatched := now.Add(-30 * time.Second)
+	dispatchedStageID := uuid.New()
+	repo.stages[runID] = []*run.Stage{
+		{ID: dispatchedStageID, RunID: runID, Sequence: 0, Type: run.StageTypeImplement,
+			ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+			State: run.StageStateRunning, StartedAt: &now, DispatchedAt: &dispatched,
+			CreatedAt: now, UpdatedAt: now},
+		{ID: uuid.New(), RunID: runID, Sequence: 1, Type: run.StageTypeReview,
+			ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+			State: run.StageStatePending, CreatedAt: now, UpdatedAt: now}, // never dispatched
+	}
+
+	// List path.
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s/stages", runID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var list struct {
+		Items []stageResponse `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if list.Items[0].DispatchedAt == nil || !list.Items[0].DispatchedAt.Equal(dispatched) {
+		t.Errorf("list stage[0].dispatched_at = %v, want %v", list.Items[0].DispatchedAt, dispatched)
+	}
+	if list.Items[1].DispatchedAt != nil {
+		t.Errorf("list stage[1].dispatched_at = %v, want nil (never dispatched)", list.Items[1].DispatchedAt)
+	}
+	// The key must be present on the wire (not omitempty) — null for the
+	// never-dispatched stage.
+	if !strings.Contains(w.Body.String(), `"dispatched_at":null`) {
+		t.Errorf("list wire missing dispatched_at:null for never-dispatched stage:\n%s", w.Body.String())
+	}
+
+	// Get path.
+	sg := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: repo}})
+	wg := httptest.NewRecorder()
+	reqg := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s", dispatchedStageID), nil)
+	sg.Handler().ServeHTTP(wg, reqg)
+	if wg.Code != http.StatusOK {
+		t.Fatalf("get status = %d, want 200:\n%s", wg.Code, wg.Body.String())
+	}
+	var got stageResponse
+	if err := json.Unmarshal(wg.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.DispatchedAt == nil || !got.DispatchedAt.Equal(dispatched) {
+		t.Errorf("get stage.dispatched_at = %v, want %v", got.DispatchedAt, dispatched)
+	}
+}
+
 // TestStageProgress_WireSemanticsAreOnTheSchema pins the per-attempt-versus-
 // cumulative meaning on the WIRE SCHEMA, not just in prose (#2541): the
 // marshalled Stage JSON must use the keys turns_this_attempt /

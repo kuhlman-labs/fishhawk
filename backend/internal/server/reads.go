@@ -23,19 +23,31 @@ import (
 // envelope is built explicitly so we never accidentally leak an
 // internal representation change through to the wire format.
 type stageResponse struct {
-	ID              uuid.UUID     `json:"id"`
-	RunID           uuid.UUID     `json:"run_id"`
-	Sequence        int           `json:"sequence"`
-	Type            string        `json:"type"`
-	Executor        stageExecutor `json:"executor"`
-	State           string        `json:"state"`
-	StartedAt       *time.Time    `json:"started_at"`
-	EndedAt         *time.Time    `json:"ended_at"`
-	FailureCategory *string       `json:"failure_category"`
-	FailureReason   *string       `json:"failure_reason"`
-	Gate            *stageGate    `json:"gate,omitempty"`
-	CreatedAt       time.Time     `json:"created_at"`
-	UpdatedAt       time.Time     `json:"updated_at"`
+	ID        uuid.UUID     `json:"id"`
+	RunID     uuid.UUID     `json:"run_id"`
+	Sequence  int           `json:"sequence"`
+	Type      string        `json:"type"`
+	Executor  stageExecutor `json:"executor"`
+	State     string        `json:"state"`
+	StartedAt *time.Time    `json:"started_at"`
+	// DispatchedAt is the PER-ATTEMPT dispatch clock (#3335): stamped by the
+	// migration 0072 trigger on every transition INTO 'dispatched', so a fix-up
+	// re-dispatch or retry RESETS it — unlike started_at, which is written under
+	// COALESCE and never overwritten. The MCP stage-wait deadline derivation
+	// reads it so a re-dispatched stage's deadline_seconds_remaining reflects the
+	// per-attempt budget the runner actually granted, not a cumulative clock
+	// reporting 0. A plain *time.Time (nil for a legacy row or a stage that never
+	// passed through 'dispatched'). Unlike resolved_model/agent_timeout_seconds
+	// it is a pure row projection — populated by toStageResponse on EVERY read
+	// path (both observability reads and every action endpoint), costing no
+	// lookup.
+	DispatchedAt    *time.Time `json:"dispatched_at"`
+	EndedAt         *time.Time `json:"ended_at"`
+	FailureCategory *string    `json:"failure_category"`
+	FailureReason   *string    `json:"failure_reason"`
+	Gate            *stageGate `json:"gate,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 	// ResolvedModel is the source-tagged model the approval gate resolved
 	// for this stage, read from the per-stage model_resolved audit entry
 	// (#1416 / #1427). Plain string (NOT omitempty) so the response always
@@ -127,6 +139,7 @@ func toStageResponse(s *run.Stage) stageResponse {
 		Executor:        stageExecutor{Kind: string(s.ExecutorKind), Ref: s.ExecutorRef},
 		State:           string(s.State),
 		StartedAt:       s.StartedAt,
+		DispatchedAt:    s.DispatchedAt,
 		EndedAt:         s.EndedAt,
 		FailureCategory: failureCategory,
 		FailureReason:   s.FailureReason,

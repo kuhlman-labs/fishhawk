@@ -649,6 +649,40 @@ func TestAutoFixup_InfraRefundAdmitsPass(t *testing.T) {
 	}
 }
 
+// TestAutoFixup_CeilingCreditAdmitsWhereEndpointAdmits (#3335): the auto-driver
+// must credit the hard ceiling for delivered-nothing refunds exactly as the HTTP
+// handler does, so it cannot refuse (decision_required fixup_ceiling_reached)
+// where the endpoint would admit. Three prior triggered passes that each
+// delivered nothing -> ceilingCredits=3 -> effective ceiling count 0 -> the arm
+// ACTS. Without the mirrored credit computation this would page the operator.
+func TestAutoFixup_CeilingCreditAdmitsWhereEndpointAdmits(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	// Three triggered passes, each with a delivered-nothing no-change signal in
+	// its own spaced window.
+	for i := 0; i < 3; i++ {
+		base := int64(1000 + i*10)
+		seedFixupTriggeredSeq(au, runID, impl.ID, base)
+		seedFixupNoChangesSeq(au, runID, impl.ID, base+5)
+	}
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionRouteFixup {
+		t.Fatalf("outcome = %+v, want acted route_fixup (delivered-nothing refunds credit the ceiling)", out)
+	}
+	e := auditEntry(t, au, CategoryStageFixupTriggered)
+	var payload map[string]any
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload["ceiling_refunded_passes"].(float64) != 3 {
+		t.Errorf("ceiling_refunded_passes = %v, want 3", payload["ceiling_refunded_passes"])
+	}
+}
+
 // TestAutoDriveRunGate_RouteFixupCeilingReached asserts the DISTINCT hard-ceiling
 // sentinel maps to DecisionState=fixup_ceiling_reached (nil error) — the state
 // the operator override can never push past — rather than being collapsed into

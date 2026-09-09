@@ -63,11 +63,34 @@ type FixupOptions struct {
 	// HardCeiling is the absolute cap on total fix-up passes per stage,
 	// supplied by the caller (mirroring how MaxPasses is injected). It
 	// ALWAYS wins — even with ForceAdditionalPass set: when
-	// PriorPassCount >= HardCeiling FixupStage refuses with
-	// ErrFixupCeilingReached before touching any stage. A zero/unset
-	// HardCeiling means no override headroom (the ceiling check fires at
-	// PriorPassCount >= 0), so callers that want the override MUST set it.
+	// PriorPassCount-credit >= HardCeiling FixupStage refuses with
+	// ErrFixupCeilingReached before touching any stage (credit is
+	// CeilingRefundedPasses, below). A zero/unset HardCeiling means no
+	// override headroom (the ceiling check fires at PriorPassCount >= 0),
+	// so callers that want the override MUST set it.
 	HardCeiling int
+
+	// CeilingRefundedPasses credits the HARD CEILING comparison for prior
+	// passes that delivered NOTHING (#3335), exactly as the handler already
+	// widens MaxPasses by the refund count for the NORMAL budget. Default 0
+	// keeps every caller that does not set it BYTE-IDENTICAL to today's
+	// behaviour. FixupStage clamps it into [0, PriorPassCount] and subtracts
+	// the clamped `credit` in the ceiling comparison
+	// (PriorPassCount-credit >= HardCeiling), so two harness loop-detector
+	// kills that pushed nothing no longer exhaust the whole remediation
+	// budget. The caller (server) bounds the value it passes here by its own
+	// maxCeilingRefundCredits so the runaway-cost guard survives — the
+	// absolute cap is HardCeiling + that bound.
+	//
+	// The two clamp bounds are SEPARATE controls with separate observable
+	// effects. The LOWER bound (a negative value raised to 0) prevents a
+	// caller MANUFACTURING a refusal by driving the effective count UP. The
+	// UPPER bound (a value above PriorPassCount lowered to PriorPassCount)
+	// cannot change the admit/refuse verdict — the effective count is already
+	// <= 0 there and 0 >= HardCeiling is false for any positive ceiling — but
+	// it DOES bound the reported RemainingCeilingSlots. Do not mistake the
+	// upper clamp for an admit-path guard.
+	CeilingRefundedPasses int
 
 	// AcceptanceStageID, when non-nil, puts FixupStage in acceptance-driven
 	// mode (E31.8 / #1536): the fix-up was triggered by a failed acceptance
@@ -128,6 +151,16 @@ type FixupDecision struct {
 	// acceptance against a fresh preview. Nil on the classic
 	// implement-review fix-up path.
 	ReopenedAcceptance *Stage
+
+	// RemainingCeilingSlots is how many hard-ceiling slots survive THIS
+	// admission (#3335): HardCeiling - (PriorPassCount - credit + 1),
+	// floored at 0, where credit is the clamped CeilingRefundedPasses. The
+	// handler surfaces it on the audit receipt and both 422 refusals so an
+	// operator sizing the next pass learns the ceiling headroom BEFORE
+	// spending it. Because credit is bounded by the caller's
+	// maxCeilingRefundCredits, this is the honest slots-left figure against
+	// the absolute cap.
+	RemainingCeilingSlots int
 }
 
 // FixupStage re-opens an implement stage parked at (or held open by) the
@@ -155,8 +188,12 @@ type FixupDecision struct {
 // The bound decision (checked before any stage is touched — fix-up is
 // never an unbounded auto-loop) is, in order:
 //
-//   - PriorPassCount >= HardCeiling -> ErrFixupCeilingReached. The hard
-//     stop ALWAYS wins, even when ForceAdditionalPass is set.
+//   - PriorPassCount-credit >= HardCeiling -> ErrFixupCeilingReached,
+//     where credit is CeilingRefundedPasses clamped into
+//     [0, PriorPassCount] (#3335). The hard stop ALWAYS wins, even when
+//     ForceAdditionalPass is set; the credit only stops a delivered-nothing
+//     refund from consuming a ceiling slot, and the caller bounds it so the
+//     absolute cap survives.
 //   - else PriorPassCount >= MaxPasses && !ForceAdditionalPass ->
 //     ErrFixupBudgetExhausted. The normal budget is spent and no override
 //     was requested (the unchanged default behaviour).
@@ -243,12 +280,29 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 			ErrFixupNotApplicable, stage.State)
 	}
 
+	// Clamp the ceiling refund credit into [0, PriorPassCount] (#3335). The
+	// LOWER bound stops a negative value manufacturing a refusal by driving
+	// the effective count UP; the UPPER bound keeps the credit from crediting
+	// more passes than were actually triggered (and bounds the reported
+	// RemainingCeilingSlots). See the FixupOptions.CeilingRefundedPasses doc
+	// for why the two bounds are distinct controls.
+	credit := opts.CeilingRefundedPasses
+	if credit < 0 {
+		credit = 0
+	}
+	if credit > opts.PriorPassCount {
+		credit = opts.PriorPassCount
+	}
+
 	// The hard ceiling ALWAYS wins, even when the operator forced an
 	// additional pass — it is the absolute stop the override cannot push
-	// past (#860).
-	if opts.PriorPassCount >= opts.HardCeiling {
-		return nil, fmt.Errorf("%w: %d of %d fix-up passes already used (hard ceiling)",
-			ErrFixupCeilingReached, opts.PriorPassCount, opts.HardCeiling)
+	// past (#860). The refund credit (#3335) only prevents a
+	// delivered-nothing pass from consuming a ceiling slot; the caller
+	// bounds it so the absolute cap (HardCeiling + maxCeilingRefundCredits)
+	// survives.
+	if opts.PriorPassCount-credit >= opts.HardCeiling {
+		return nil, fmt.Errorf("%w: %d of %d fix-up passes already used (hard ceiling; %d delivered-nothing refund credit)",
+			ErrFixupCeilingReached, opts.PriorPassCount, opts.HardCeiling, credit)
 	}
 	// The normal budget is spent and no override was requested — unchanged
 	// default behaviour.
@@ -312,13 +366,21 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 		remaining = 0
 	}
 
+	// Ceiling slots surviving this admission (#3335), measured against the
+	// credited effective count: HardCeiling - (effective + 1), floored at 0.
+	remainingCeiling := opts.HardCeiling - (opts.PriorPassCount - credit + 1)
+	if remainingCeiling < 0 {
+		remainingCeiling = 0
+	}
+
 	return &FixupDecision{
-		PriorState:         priorState,
-		Stage:              updated,
-		ReparkedReview:     reviewToRepark,
-		ReopenedAcceptance: reopenedAcceptance,
-		RemainingBudget:    remaining,
-		Forced:             forced,
+		PriorState:            priorState,
+		Stage:                 updated,
+		ReparkedReview:        reviewToRepark,
+		ReopenedAcceptance:    reopenedAcceptance,
+		RemainingBudget:       remaining,
+		RemainingCeilingSlots: remainingCeiling,
+		Forced:                forced,
 	}, nil
 }
 

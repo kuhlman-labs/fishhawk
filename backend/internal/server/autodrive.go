@@ -651,15 +651,25 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 	if refunded > priorPasses {
 		refunded = priorPasses
 	}
+	// Credit the hard ceiling for delivered-nothing refunds (#3335), bounded by
+	// maxCeilingRefundCredits — the IDENTICAL computation the HTTP handler
+	// applies, so the auto-driver's admit decision cannot diverge from the
+	// endpoint's (a driver that refuses where the endpoint admits is the #968
+	// disagreement class).
+	ceilingCredits := refunded
+	if ceilingCredits > maxCeilingRefundCredits {
+		ceilingCredits = maxCeilingRefundCredits
+	}
 	// The PR-body-unsatisfiable set (#2782) is unused on the auto-drive path —
 	// there is no operator tool result to warn on — so it is discarded; the
 	// advisory audit entry is still written inside fixupStageAs.
 	if _, _, err := s.fixupStageAs(ctx, id, fixupActionParams{
 		StageID: impl.ID,
 		Options: run.FixupOptions{
-			PriorPassCount: priorPasses,
-			MaxPasses:      defaultMaxFixupPasses + refunded,
-			HardCeiling:    defaultFixupCeiling,
+			PriorPassCount:        priorPasses,
+			MaxPasses:             defaultMaxFixupPasses + refunded,
+			HardCeiling:           defaultFixupCeiling,
+			CeilingRefundedPasses: ceilingCredits,
 		},
 		Selected:       selected,
 		ConcernIDs:     ids,

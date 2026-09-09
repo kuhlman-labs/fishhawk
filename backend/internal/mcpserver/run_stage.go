@@ -157,7 +157,7 @@ type RunStageOutput struct {
 	ElapsedSeconds int    `json:"elapsed_seconds,omitempty" jsonschema:"wall-clock seconds from the last stage_progress heartbeat"`
 	LastEventKind  string `json:"last_event_kind,omitempty" jsonschema:"the agent's last event kind from the last stage_progress heartbeat"`
 
-	FixupNoChanges bool `json:"fixup_no_changes,omitempty" jsonschema:"true when this fix-up pass produced NO commit (the runner reported implement_fixup_no_changes): the PR branch tip is unchanged and the stage returned to its review gate. The pass is refunded against the normal fix-up budget (the absolute 3-pass ceiling still counts it), so a corrected fixup can be re-triggered without force_additional_pass"`
+	FixupNoChanges bool `json:"fixup_no_changes,omitempty" jsonschema:"true when this fix-up pass produced NO commit (the runner reported implement_fixup_no_changes): the PR branch tip is unchanged and the stage returned to its review gate. The pass is refunded against the normal fix-up budget AND credited against the hard ceiling (capped at 3 credits, absolute bound 6 triggered passes, #3335), so a corrected fixup can be re-triggered without force_additional_pass"`
 
 	// NeedsTarget is the pre-spawn acceptance refusal (E48.6 / #1953): set only
 	// when Outcome=="needs_target", i.e. the acceptance-admission endpoint

@@ -637,6 +637,15 @@ var runStatusPathTable = []pathClassification{
 	// reflection pin without adding a skeleton-ledger entry or perturbing the
 	// floor assertions.
 	{Path: "stages[].progress", Tier: tierNever},
+	// dispatched_at (#3335) is a small per-attempt timestamp that is a REDUNDANT
+	// decode-mirror of the attempt clock folded into
+	// {plan,implement,acceptance}_stage_wait_status.deadline_seconds_remaining
+	// (the deadline is derived from it server-side). Being redundant it is not
+	// worth a per-tier elision entry — classifying it tierNever (like the
+	// adjacent agent_timeout_seconds and progress rows) rides it along without a
+	// skeleton-ledger entry, so it neither bypasses the budget nor perturbs the
+	// diagnosis-skeleton size the floor assertions pin.
+	{Path: "stages[].dispatched_at", Tier: tierNever},
 	{Path: "stages[].failure_reason", Tier: "T7", Class: classOversizedCapable, Surfaces: restStages, Unbounded: unboundedStages},
 	{Path: "stages[].id", Tier: "skeleton", Class: classStored, Surfaces: restStages},
 	{Path: "stages[].run_id", Tier: "skeleton", Class: classStored, Surfaces: restStages},

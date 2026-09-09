@@ -1679,7 +1679,9 @@ type fixupRequest struct {
 	// the common fix-up omits it and stays unaffected.
 	AllowCreate []string `json:"allow_create,omitempty"`
 	// ForceAdditionalPass is the bounded operator override (#860): grant ONE
-	// fix-up pass beyond the normal budget, hard-capped at 3 total passes.
+	// fix-up pass beyond the normal budget, capped at the hard ceiling
+	// (delivered-nothing refunds credit the ceiling up to 3, absolute cap 6
+	// triggered passes, #3335).
 	// omitempty: the common fix-up omits it and stays on the default budget.
 	ForceAdditionalPass bool `json:"force_additional_pass,omitempty"`
 	// ImplementModel is the optional operator/driver model override for this
@@ -1718,9 +1720,11 @@ type fixupRequest struct {
 //   - 422 fixup_budget_exhausted (the NORMAL bounded pass count is spent;
 //     details carry max_passes + used — one more pass is still available
 //     via forceAdditionalPass below)
-//   - 422 fixup_ceiling_reached (the hard ceiling of 3 total passes is
-//     reached; the override cannot push past it — merge-with-follow-up or a
-//     fresh run; details carry ceiling + used)
+//   - 422 fixup_ceiling_reached (the hard ceiling is reached; delivered-nothing
+//     refunds credit it up to 3 so the absolute cap is 6 triggered passes
+//     (#3335); the override cannot push past it — merge-with-follow-up or a
+//     fresh run; details carry ceiling, used, ceiling_refunded_passes +
+//     remaining_ceiling_slots)
 //   - 422 fixup_invalid_model (the resolved implement_model override is not in
 //     the deployment's per-adapter allow-list; details carry the resolved
 //     model, source, and adapter)
@@ -3818,16 +3822,26 @@ func (c *apiClient) ReportProductIssue(ctx context.Context, runID uuid.UUID, kin
 // for ordering, executor + timestamps + failure fields for the
 // agent's context.
 type Stage struct {
-	ID              string        `json:"id"`
-	RunID           string        `json:"run_id"`
-	Sequence        int           `json:"sequence"`
-	Type            string        `json:"type"`
-	Executor        StageExecutor `json:"executor"`
-	State           string        `json:"state"`
-	StartedAt       *time.Time    `json:"started_at,omitempty"`
-	EndedAt         *time.Time    `json:"ended_at,omitempty"`
-	FailureCategory *string       `json:"failure_category,omitempty"`
-	FailureReason   *string       `json:"failure_reason,omitempty"`
+	ID        string        `json:"id"`
+	RunID     string        `json:"run_id"`
+	Sequence  int           `json:"sequence"`
+	Type      string        `json:"type"`
+	Executor  StageExecutor `json:"executor"`
+	State     string        `json:"state"`
+	StartedAt *time.Time    `json:"started_at,omitempty"`
+	// DispatchedAt mirrors the backend stageResponse.dispatched_at (#3335): the
+	// PER-ATTEMPT dispatch clock, reset on every transition into 'dispatched'
+	// (a fix-up re-dispatch or retry), unlike started_at. The stage-wait
+	// deadline derivation reads it (via stageAttemptStart) so a re-dispatched
+	// stage's deadline_seconds_remaining reflects the per-attempt budget rather
+	// than a cumulative clock reporting 0. Nil for a legacy row, a stage that
+	// never dispatched, or an older backend that omits the key. The json tag
+	// MUST byte-match the backend or the field silently decodes to nil — the
+	// #371-class wire-mirror trap the adjacent AgentTimeoutSeconds comment names.
+	DispatchedAt    *time.Time `json:"dispatched_at,omitempty"`
+	EndedAt         *time.Time `json:"ended_at,omitempty"`
+	FailureCategory *string    `json:"failure_category,omitempty"`
+	FailureReason   *string    `json:"failure_reason,omitempty"`
 	// AgentTimeoutSeconds mirrors the backend stageResponse.agent_timeout_seconds
 	// (#2540): the spec-resolved agent wall clock the runner enforces for this
 	// stage. The stage-wait deadline derivation reads it to report a non-terminal

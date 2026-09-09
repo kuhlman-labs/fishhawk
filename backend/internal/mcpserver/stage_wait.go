@@ -119,7 +119,18 @@ type StageWaitStatus struct {
 	// omitempty scalars — absent when the budget is unknown or the stage terminal.
 	ElapsedSeconds           int  `json:"elapsed_seconds,omitempty" jsonschema:"seconds the stage has been running (from its server-recorded started_at); present only while non-terminal and when the agent wall clock is known"`
 	AgentTimeoutSeconds      int  `json:"agent_timeout_seconds,omitempty" jsonschema:"the spec-resolved agent wall clock (seconds) the runner enforces for this stage; present only while non-terminal and when resolved"`
-	DeadlineSecondsRemaining *int `json:"deadline_seconds_remaining,omitempty" jsonschema:"seconds of agent budget left before the runner kills the stage (agent_timeout_seconds - elapsed_seconds, clamped at 0); present only while non-terminal and when the budget is known. A filed scope amendment needs at least the amendment poll window of remaining budget to be decidable"`
+	DeadlineSecondsRemaining *int `json:"deadline_seconds_remaining,omitempty" jsonschema:"seconds of agent budget left before the runner kills the stage, derived from the PER-ATTEMPT dispatch clock (agent_timeout_seconds - attempt_elapsed_seconds, clamped at 0); present only while non-terminal and when the budget is known. Because it is per-attempt, a re-dispatched (fix-up or retried) stage reports its fresh remaining budget rather than a cumulative clock that would read 0 (#3335). A filed scope amendment needs at least the amendment poll window of remaining budget to be decidable"`
+	// AttemptElapsedSeconds is how long the CURRENT attempt has run, from the
+	// per-attempt dispatch clock (dispatched_at, or started_at when the stage
+	// never re-dispatched) — the clock deadline_seconds_remaining is derived
+	// from (#3335). It sits beside the cumulative ElapsedSeconds so the two are
+	// legible side by side: on a re-dispatched stage ElapsedSeconds counts from
+	// the ORIGINAL start while this counts from the latest dispatch. Populated on
+	// the SAME condition as ElapsedSeconds (non-terminal, and a known budget or a
+	// reported heartbeat); omitempty, so a stage that never re-dispatched — where
+	// it would equal ElapsedSeconds — still carries it whenever ElapsedSeconds is
+	// present.
+	AttemptElapsedSeconds *int `json:"attempt_elapsed_seconds,omitempty" jsonschema:"seconds the CURRENT attempt has run, from the per-attempt dispatch clock (dispatched_at, else started_at); the clock deadline_seconds_remaining is derived from. On a re-dispatched (fix-up/retry) stage this is smaller than elapsed_seconds, which stays cumulative from the original start. Present only while non-terminal and when elapsed_seconds is"`
 	// LastEvent / TurnsThisAttempt / TokensThisAttempt are the stage's
 	// mid-execution progress heartbeat (#2541): the agent's last event kind and
 	// the turn/token counters from the runner's most recent stage_progress
@@ -249,6 +260,23 @@ func stageElapsed(startedAt *time.Time, now time.Time) time.Duration {
 	return now.Sub(*startedAt)
 }
 
+// stageAttemptStart returns the clock the CURRENT attempt's elapsed and deadline
+// are measured from (#3335): the per-attempt dispatch clock (dispatchedAt) when
+// present, else the cumulative started_at, else nil. dispatched_at is stamped on
+// every transition into 'dispatched' (migration 0072) and therefore RESET by a
+// fix-up re-dispatch or a retry, so preferring it makes the deadline reflect the
+// full per-attempt agent budget the runner granted rather than a cumulative
+// clock that reads 0 on a re-dispatched stage whose original start predates the
+// whole budget. Falling back to started_at keeps a legacy row (or a stage that
+// never dispatched) byte-identical to the pre-#3335 derivation. Pure and
+// table-testable.
+func stageAttemptStart(dispatchedAt, startedAt *time.Time) *time.Time {
+	if dispatchedAt != nil {
+		return dispatchedAt
+	}
+	return startedAt
+}
+
 // derivedStageWaitPollInterval is the convenience wrapper the next-actions arms
 // call: the derived cadence for one stage of one run, read against the current
 // clock. A nil run or a nil stage yields the floor — the honest answer when
@@ -365,8 +393,14 @@ func stageWaitStatusFor(stages []Stage, stageType, runState string, predictedMin
 			st := classifyStageWaitStatus(stageType, s.State, runState, s.StartedAt, predictedMinutes, now)
 			if !stageStateIsTerminal(s.State) && !runStateIsTerminal(runState) {
 				elapsed := stageElapsed(s.StartedAt, now)
+				// Deadline is derived from the PER-ATTEMPT clock (#3335): the
+				// dispatch clock resets on a fix-up re-dispatch/retry, so a
+				// re-dispatched stage reports its fresh remaining budget rather
+				// than a cumulative clock reading 0. ElapsedSeconds below keeps its
+				// documented cumulative-from-started_at meaning.
+				attemptElapsed := stageElapsed(stageAttemptStart(s.DispatchedAt, s.StartedAt), now)
 				st.AgentTimeoutSeconds = s.AgentTimeoutSeconds
-				st.DeadlineSecondsRemaining = stageDeadlineRemaining(s.AgentTimeoutSeconds, elapsed)
+				st.DeadlineSecondsRemaining = stageDeadlineRemaining(s.AgentTimeoutSeconds, attemptElapsed)
 				// Mid-execution progress heartbeat (#2541): project the per-attempt
 				// counters + last_event onto the wait status. elapsed_seconds is NOT
 				// taken from the heartbeat — it stays the started_at derivation, so it
@@ -388,6 +422,12 @@ func stageWaitStatusFor(stages []Stage, stageType, runState string, predictedMin
 				// keeps the byte-identical pre-#2540 shape.
 				if s.AgentTimeoutSeconds > 0 || s.Progress != nil {
 					st.ElapsedSeconds = int(elapsed.Seconds())
+					// AttemptElapsedSeconds rides the SAME population condition as
+					// ElapsedSeconds (#3335), so the two per-attempt-vs-cumulative
+					// clocks are always legible together. A pointer so a genuine 0
+					// (a stage dispatched this instant) survives omitempty.
+					ae := int(attemptElapsed.Seconds())
+					st.AttemptElapsedSeconds = &ae
 				}
 			}
 			return st

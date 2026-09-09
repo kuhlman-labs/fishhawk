@@ -437,6 +437,128 @@ func TestFixupStage_HardCeilingWinsEvenWhenForced(t *testing.T) {
 	}
 }
 
+func TestFixupStage_CeilingRefundCreditsAndSlots(t *testing.T) {
+	// #3335: a delivered-nothing refund credits the HARD CEILING (via
+	// CeilingRefundedPasses), so a state that WOULD refuse without the credit
+	// is admitted with it, and RemainingCeilingSlots reflects the credited
+	// effective count. Table-driven over the admit/refuse boundary.
+	cases := []struct {
+		name        string
+		prior       int
+		credit      int
+		hardCeiling int
+		wantErr     bool
+		wantSlots   int // only checked on admit
+	}{
+		{
+			name:  "no credit at ceiling refuses (byte-identical to today)",
+			prior: 3, credit: 0, hardCeiling: 3, wantErr: true,
+		},
+		{
+			name:  "one credit at ceiling admits with zero slots surviving",
+			prior: 3, credit: 1, hardCeiling: 3, wantErr: false, wantSlots: 0,
+		},
+		{
+			name:  "two credits below ceiling admits with one slot surviving",
+			prior: 3, credit: 2, hardCeiling: 3, wantErr: false, wantSlots: 1,
+		},
+		{
+			name:  "zero prior zero credit admits with full slots",
+			prior: 0, credit: 0, hardCeiling: 3, wantErr: false, wantSlots: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, stage := implementStage(t, run.StageStateAwaitingApproval)
+			dec, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{
+				PriorPassCount:        tc.prior,
+				MaxPasses:             defaultTestMaxPasses(tc.prior),
+				HardCeiling:           tc.hardCeiling,
+				CeilingRefundedPasses: tc.credit,
+			})
+			if tc.wantErr {
+				if !errors.Is(err, run.ErrFixupCeilingReached) {
+					t.Fatalf("err = %v, want ErrFixupCeilingReached", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("FixupStage: %v", err)
+			}
+			if dec.RemainingCeilingSlots != tc.wantSlots {
+				t.Errorf("RemainingCeilingSlots = %d, want %d", dec.RemainingCeilingSlots, tc.wantSlots)
+			}
+		})
+	}
+}
+
+func TestFixupStage_ZeroCeilingRefundByteIdenticalToToday(t *testing.T) {
+	// The default zero CeilingRefundedPasses must reproduce the pre-#3335
+	// ceiling comparison exactly: prior==ceiling refuses.
+	repo, stage := implementStage(t, run.StageStateAwaitingApproval)
+	_, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{
+		PriorPassCount: 3,
+		MaxPasses:      1,
+		HardCeiling:    3,
+		// CeilingRefundedPasses left at its zero default.
+	})
+	if !errors.Is(err, run.ErrFixupCeilingReached) {
+		t.Fatalf("err = %v, want ErrFixupCeilingReached (zero credit is byte-identical to today)", err)
+	}
+}
+
+func TestFixupStage_CeilingRefundClampedToPriorPasses(t *testing.T) {
+	// Control 2a — the UPPER clamp of [0, PriorPassCount] on
+	// CeilingRefundedPasses. Observable ONLY through RemainingCeilingSlots: an
+	// over-large credit drives the effective count <= 0 and the pass is admitted
+	// with OR without the clamp, so a refusal assertion cannot discriminate here.
+	// With PriorPassCount=1, HardCeiling=3, credit clamped to 1 -> effective 0 ->
+	// RemainingCeilingSlots = 3 - (0 + 1) = 2. Without the clamp the effective
+	// count is 1-100 = -99 and slots would be 101.
+	repo, stage := implementStage(t, run.StageStateAwaitingApproval)
+	dec, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{
+		PriorPassCount:        1,
+		MaxPasses:             3,
+		HardCeiling:           3,
+		CeilingRefundedPasses: 100,
+	})
+	if err != nil {
+		t.Fatalf("FixupStage: %v", err)
+	}
+	if dec.RemainingCeilingSlots != 2 {
+		t.Errorf("RemainingCeilingSlots = %d, want 2 (credit clamped to PriorPassCount=1)", dec.RemainingCeilingSlots)
+	}
+}
+
+func TestFixupStage_NegativeCeilingRefundCannotManufactureRefusal(t *testing.T) {
+	// Control 2b — the LOWER clamp (a negative credit raised to 0). With
+	// PriorPassCount=0, HardCeiling=3, a negative credit must NOT drive the
+	// effective count UP into a refusal: 0-(-10) = 10 >= 3 would wrongly refuse.
+	// The clamp keeps credit at 0, so the pass is ADMITTED.
+	repo, stage := implementStage(t, run.StageStateAwaitingApproval)
+	dec, err := run.FixupStage(context.Background(), repo, stage.ID, run.FixupOptions{
+		PriorPassCount:        0,
+		MaxPasses:             1,
+		HardCeiling:           3,
+		CeilingRefundedPasses: -10,
+	})
+	if err != nil {
+		t.Fatalf("FixupStage: %v (a negative credit must not manufacture a refusal)", err)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("post-fixup state = %q, want pending (admitted)", dec.Stage.State)
+	}
+}
+
+// defaultTestMaxPasses widens MaxPasses enough that the ceiling arm — not the
+// budget arm — is the one under test for a given prior-pass count.
+func defaultTestMaxPasses(prior int) int {
+	if prior < 1 {
+		return 1
+	}
+	return prior + 1
+}
+
 func TestFixupStage_RefusesTerminalRun(t *testing.T) {
 	// #968 defense-in-depth: a terminal run's stages must never be
 	// re-opened — there is no live gate for the fix-up to flow back into,
