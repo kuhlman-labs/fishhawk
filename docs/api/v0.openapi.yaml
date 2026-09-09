@@ -1964,9 +1964,11 @@ components:
     GateViewDispute:
       type: object
       description: |
-        One `confirmed` resolution REFUSED by the implement re-review's
-        round-level veto pass (#2551), reconstructed from a
-        `concern_resolution_vetoed` audit entry.
+        One resolution REFUSED by the implement re-review's veto pass,
+        reconstructed from a `concern_resolution_vetoed` audit entry. Originally
+        always a refused `confirmed` (#2551); since #3319 a refused `reopened`
+        is carried here too — read `resolution` to tell them apart. Only a
+        refused `confirmed` sets the concern's `disputed` flag.
       required: [sequence, veto_reason]
       properties:
         sequence: { type: integer, format: int64 }
@@ -1975,7 +1977,7 @@ components:
           description: Derived as for `GateViewResolution.round`.
         veto_reason:
           type: string
-          enum: [raiser_rejected_same_round, operator_evidence_routed, fixup_pass_no_changes, evidence_lookup_failed]
+          enum: [raiser_rejected_same_round, operator_evidence_routed, fixup_pass_no_changes, evidence_lookup_failed, reopen_without_named_concern]
           description: |
             `raiser_rejected_same_round` — a DIFFERENT reviewer confirmed a
             concern whose RAISING reviewer returned `reject` in the same round;
@@ -1984,10 +1986,20 @@ components:
             recorded `fixup_no_changes`, so nothing landed;
             `evidence_lookup_failed` — the audit reads behind the two evidence
             arms failed, so the confirm was refused rather than applied on
-            unknown evidence (fail-closed).
+            unknown evidence (fail-closed);
+            `reopen_without_named_concern` (#3319) — the ONE reason that refuses
+            a `reopened` rather than a `confirmed`: the verdict was `reject`, it
+            raised no concern of its own, and THIS resolution's own note was
+            blank, so nothing substantiated reopening the concern it names. It
+            is decided PER RESOLUTION — a sibling resolution's note is evidence
+            for that sibling, and `free_form` prose is unmatched to any concern
+            id and substantiates nothing.
         resolution:
           type: string
-          description: The refused resolution (always `confirmed`).
+          description: |
+            The refused resolution: `confirmed` for the four round-level veto
+            reasons, `reopened` for `reopen_without_named_concern`. Empty on an
+            entry recorded before #3319, which was always a `confirmed`.
         confirming_reviewer_model:
           type: string
         raising_reviewer_model:

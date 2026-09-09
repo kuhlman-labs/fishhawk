@@ -34,6 +34,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -14329,5 +14330,44 @@ func TestRebaseRunBranch_MCPToolToCheckPublication_EndToEnd(t *testing.T) {
 	}
 	if !sawVouch {
 		t.Error("no operator_commit_vouched lineage attribution persisted to Postgres; the run would be wedged as foreign")
+	}
+}
+
+// TestPlanReview_DecodesRejectWithoutConcern (#3319) pins the additive
+// implement_reviewed → PlanReview decode: the flag crosses the json-tag seam
+// between two structs in two different packages that agree only by tag, and a
+// payload stored before #3319 (no key) decodes false.
+func TestPlanReview_DecodesRejectWithoutConcern(t *testing.T) {
+	// The payload the SERVER writes, marshalled from the production type, so a
+	// tag rename on either side turns this RED rather than passing on a
+	// hand-copied literal.
+	raw, err := json.Marshal(planreview.ImplementReviewedPayload{
+		ReviewerKind:         "agent",
+		ReviewerModel:        "fable-5",
+		Authority:            planreview.AuthorityAdvisory,
+		Verdict:              planreview.VerdictReject,
+		RejectWithoutConcern: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal server payload: %v", err)
+	}
+	var got PlanReview
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode into PlanReview: %v", err)
+	}
+	if !got.RejectWithoutConcern {
+		t.Errorf("RejectWithoutConcern = false, want true — the flag did not cross the json-tag seam\npayload: %s", raw)
+	}
+	if got.Verdict != string(planreview.VerdictReject) || got.ReviewerModel != "fable-5" {
+		t.Errorf("decoded = %+v, want the surrounding fields intact", got)
+	}
+
+	// A pre-#3319 payload: the key is absent, and the field defaults false.
+	var legacy PlanReview
+	if err := json.Unmarshal([]byte(`{"reviewer_kind":"agent","authority":"advisory","verdict":"reject"}`), &legacy); err != nil {
+		t.Fatalf("decode legacy payload: %v", err)
+	}
+	if legacy.RejectWithoutConcern {
+		t.Error("a payload stored before #3319 must decode reject_without_concern=false")
 	}
 }

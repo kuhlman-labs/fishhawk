@@ -105,6 +105,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 			na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
 		}
 		foldLiveValidationAdvisory(run, na)
+		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 		foldProductIssueSuggestion(run, stages, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
@@ -128,6 +129,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		na = fallback
 	}
 	foldLiveValidationAdvisory(run, na)
+	foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 	foldProductIssueSuggestion(run, stages, na)
 	foldWorkingDirParams(run, na)
 	foldFailureSignature(run, stages, na)
@@ -394,6 +396,49 @@ func foldLiveValidationAdvisory(run *Run, na *NextActions) {
 		Precondition: "the approved plan carries requires_live_validation acceptance criteria — a live forge/deploy/external target the default-deny sandbox cannot reach, so the acceptance stage cannot validate them",
 		Consumes:     consumesNone,
 		Reason:       guidance + " — perform the live check yourself; when the walk was not durably filed (file manually) open the tracking work item by hand so the pending validation is not shipped silently unvalidated",
+	})
+}
+
+// foldRejectWithoutConcernAdvisory appends a DISPLAY-ONLY advisory when a
+// decoded implement review carries the #3319 reject_without_concern flag: the
+// reviewer rejected the pass without naming a single concern, so there is
+// nothing for the operator to route through fishhawk_fixup_stage and the
+// assertion — if there is one — lives in free_form. Modelled on
+// foldLiveValidationAdvisory: nil-safe, consumes nothing, and appended LAST so
+// it never reorders the primary next move or suppresses the unclassified
+// fallback. A run with no such review appends nothing, leaving every existing
+// surface byte-identical. na is mutated in place.
+func foldRejectWithoutConcernAdvisory(implementReviewStatus *ReviewStatus, na *NextActions) {
+	if na == nil || implementReviewStatus == nil {
+		return
+	}
+	flagged := 0
+	var models []string
+	for _, r := range implementReviewStatus.Reviews {
+		if !r.RejectWithoutConcern {
+			continue
+		}
+		flagged++
+		if r.ReviewerModel != "" {
+			models = append(models, r.ReviewerModel)
+		}
+	}
+	if flagged == 0 {
+		return
+	}
+	// The advisory is about the VERDICT, not about who returned it, so a
+	// flagged review with an empty model string still fires — under a generic
+	// label rather than a blank one.
+	who := "the implement reviewer"
+	if len(models) > 0 {
+		who = strings.Join(models, ", ")
+	}
+	na.Actions = append(na.Actions, SuggestedAction{
+		Action:       "review_reject_without_concern",
+		Params:       map[string]string{"reviewer_model": who},
+		Precondition: "an implement review returned `reject` while naming no concern — no concerns[] entry and no concern_resolutions note",
+		Consumes:     consumesNone,
+		Reason:       who + " rejected the pass without naming a concern, so there is nothing to route through fishhawk_fixup_stage — read the review's free_form for what it actually asserted and decide yourself whether it is a finding worth routing",
 	})
 }
 

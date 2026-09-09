@@ -124,19 +124,29 @@ type gateViewConcern struct {
 	// Disputes carries the recorded veto detail — why the confirmation was
 	// refused, and by/against which reviewer. Enrichment over Disputed: it can
 	// be empty on a disputed concern when the (best-effort) veto append failed.
+	// Since #3319 it ALSO carries refused `reopened` resolutions
+	// (reopen_without_named_concern), which do NOT set Disputed — a refused
+	// reopen is not a confirmation that failed to settle the concern.
 	Disputes []gateViewDispute `json:"disputes,omitempty"`
 }
 
-// gateViewDispute is one refused `confirmed` resolution, reconstructed from a
-// concern_resolution_vetoed audit entry (E48.103 / #2551).
+// gateViewDispute is one refused resolution, reconstructed from a
+// concern_resolution_vetoed audit entry (E48.103 / #2551). Originally always a
+// refused `confirmed`; since #3319 a refused `reopened` is carried here too —
+// read Resolution to tell them apart. Only a refused confirm sets Disputed.
 type gateViewDispute struct {
 	Sequence int64 `json:"sequence"`
 	// Round is derived as for gateViewResolution.Round (the veto is recorded on
 	// the implement stage, so the fix-up-round convention applies).
 	Round int `json:"round,omitempty"`
 	// VetoReason is one of raiser_rejected_same_round | operator_evidence_routed
-	// | fixup_pass_no_changes | evidence_lookup_failed.
-	VetoReason              string `json:"veto_reason"`
+	// | fixup_pass_no_changes | evidence_lookup_failed |
+	// reopen_without_named_concern (#3319, the one reason that refuses a
+	// `reopened` rather than a `confirmed`).
+	VetoReason string `json:"veto_reason"`
+	// Resolution is the refused resolution: "confirmed" for the four
+	// round-level veto reasons, "reopened" for reopen_without_named_concern.
+	// Empty on a legacy pre-#3319 entry, which was always a confirm.
 	Resolution              string `json:"resolution,omitempty"`
 	ConfirmingReviewerModel string `json:"confirming_reviewer_model,omitempty"`
 	RaisingReviewerModel    string `json:"raising_reviewer_model,omitempty"`
@@ -640,7 +650,16 @@ func gateViewOpenConcern(c *concern.Concern, h gateViewHistory) gateViewConcern 
 		if v.concernID != idStr {
 			continue
 		}
-		out.Disputed = true
+		// SCOPED to refused CONFIRMS (#3319). A refused `reopened` resolution
+		// leaves the concern in its current open state — reporting it as
+		// `disputed` would tell the operator a confirmation failed to settle
+		// the concern when the opposite happened. An EMPTY resolution string is
+		// a legacy pre-#3319 payload, which was always a confirm veto. The
+		// refused reopen still appends its disputes[] row below, so the refusal
+		// stays visible as DETAIL.
+		if v.payload.Resolution == "confirmed" || v.payload.Resolution == "" {
+			out.Disputed = true
+		}
 		out.Disputes = append(out.Disputes, gateViewDispute{
 			Sequence:                v.sequence,
 			Round:                   gateViewRound(h.triggers, c.StageID, v.sequence),

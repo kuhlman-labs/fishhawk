@@ -7,7 +7,11 @@
 // ReviewersConfig via ResolveAuthority.
 package planreview
 
-import "github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+import (
+	"strings"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+)
 
 // Verdict is the review agent's conclusion on a plan artifact.
 // The closed set matches the verdict JSON schema emitted by the
@@ -246,6 +250,73 @@ type ReviewVerdict struct {
 	// cost figure. Zero-value with Known=false when the backend cannot
 	// report usage (graceful degradation).
 	Usage Usage `json:"-"`
+}
+
+// RejectSubstantiatesResolution answers the PER-RESOLUTION question the
+// server-side reopen veto asks (#3319): may THIS resolution be applied on the
+// evidence THIS verdict carries for it? It returns false — the resolution is
+// UNSUBSTANTIATED and must be refused — when the verdict is `reject`, the
+// verdict raises no concern of its own (len(v.Concerns) == 0), and this
+// resolution's OWN Note is blank after TrimSpace. It returns true otherwise.
+//
+// It reads ONLY res.Note. A sibling resolution's note is evidence for that
+// SIBLING, never for this one — which is exactly why this predicate exists
+// separately from RejectNamesNoConcern below and MUST be the one the veto
+// consults. Worked example, the mixed-resolution verdict:
+//
+//	verdict = reject, concerns[] = empty
+//	  resolution A = confirmed, note "looks good"   (a DIFFERENT concern)
+//	  resolution B = reopened,  note ""
+//
+// RejectNamesNoConcern is FALSE here (A carries a note), so a veto keyed on it
+// would apply B's unsubstantiated reopen using A's evidence — concern A's
+// evidence authorising concern B's reopen, the defect #3319 exists to close.
+// RejectSubstantiatesResolution(v, B) is false and refuses B, while
+// RejectSubstantiatesResolution(v, A) is true and A applies normally.
+//
+// v.FreeForm is deliberately NOT consulted: free-form prose is unmatched to any
+// concern id, and treating it as substantiation is precisely the shape #3319
+// reports. The narrowing is deliberate in both directions — a one-word note
+// ("still broken") is NOT refused, because a broader semantic judgement is not
+// machine-decidable and would silently discard genuine findings; and a reject
+// that DOES raise a new concern is an engaged review, so its blank-note reopens
+// still apply.
+func RejectSubstantiatesResolution(v ReviewVerdict, res ConcernResolution) bool {
+	if v.Verdict != VerdictReject {
+		return true
+	}
+	if len(v.Concerns) != 0 {
+		return true
+	}
+	return strings.TrimSpace(res.Note) != ""
+}
+
+// RejectNamesNoConcern answers the VERDICT-LEVEL question the display-only
+// advisory asks (#3319): did this reject name NOTHING, ANYWHERE? It returns
+// true when the verdict is `reject`, it raises no concern of its own, and no
+// entry in v.ConcernResolutions carries a non-blank (TrimSpace) note.
+//
+// This is intentionally a DIFFERENT question from
+// RejectSubstantiatesResolution above, and it MUST NOT be consulted by the
+// veto. It aggregates over ALL resolutions, which is correct for an advisory
+// whose job is to tell the operator the whole verdict carried no evidence, and
+// wrong for a per-resolution refusal: on the mixed-resolution verdict in that
+// function's doc comment it is FALSE, so a veto keyed on it would apply B's
+// unsubstantiated reopen on A's note. Do not helpfully re-unify the two.
+//
+// v.FreeForm is likewise not consulted — a reject whose entire assertion lives
+// in free_form names no concern, which is the reported #3319 shape and reads
+// true here.
+func RejectNamesNoConcern(v ReviewVerdict) bool {
+	if v.Verdict != VerdictReject || len(v.Concerns) != 0 {
+		return false
+	}
+	for _, res := range v.ConcernResolutions {
+		if strings.TrimSpace(res.Note) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // AuthorityMode determines whether agent verdicts gate stage advancement.
@@ -526,6 +597,15 @@ type ImplementReviewedPayload struct {
 	// adapters, so omitempty keeps every pre-#1768 payload byte-identical.
 	ReviewerVersion string `json:"reviewer_version,omitempty"`
 	ReviewerBinary  string `json:"reviewer_binary,omitempty"`
+
+	// RejectWithoutConcern marks a `reject` verdict that named NO concern
+	// anywhere (#3319) — no concerns[] entry and no concern_resolutions entry
+	// carrying a non-blank note. ADVISORY and DISPLAY-ONLY: it gates nothing and
+	// is derived from RejectNamesNoConcern, the VERDICT-LEVEL predicate — never
+	// from RejectSubstantiatesResolution, which is the per-resolution question
+	// the reopen veto asks. omitempty keeps every pre-#3319 payload
+	// byte-identical, and an old stored payload decodes false.
+	RejectWithoutConcern bool `json:"reject_without_concern,omitempty"`
 
 	// Origin marks a non-first-review provenance for the verdict (#1250).
 	// Empty on the first review and the parent-decomposition consolidated

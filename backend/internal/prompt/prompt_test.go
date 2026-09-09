@@ -14932,3 +14932,62 @@ func TestWriteGateEvidence_OperatorScopeUndelivered(t *testing.T) {
 		}
 	})
 }
+
+// reopenSubstantiationFragments are the substrings of the #3319 blank-note
+// reopen-refusal bullet. Presence and absence are asserted in the same two
+// halves as the re-read bullet above.
+var reopenSubstantiationFragments = []string{
+	"A `reopened` resolution whose OWN `note` is blank is REFUSED by the server",
+	"when your verdict is `reject` and raises no concern of its own",
+	"State SPECIFICALLY what remains missing and where, in THAT resolution's `note`",
+	"A sibling resolution's note substantiates that sibling, never this one",
+	"`free_form` prose substantiates nothing",
+}
+
+// TestImplementReview_PriorConcerns_ReopenSubstantiation (#3319): the bullet
+// that makes the server-side per-resolution refusal discoverable to the
+// reviewer renders when PriorConcerns is non-empty.
+func TestImplementReview_PriorConcerns_ReopenSubstantiation(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		PriorConcerns: []PriorConcern{{
+			ID: "c1", State: "addressed_pending", Severity: "medium", Category: "correctness", Note: "n",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range reopenSubstantiationFragments {
+		if !strings.Contains(got, w) {
+			t.Errorf("reopen-substantiation bullet missing %q\n---\n%s", w, got)
+		}
+	}
+	// It follows the re-read bullet it extends, inside the same section.
+	iSection := strings.Index(got, "### Prior concerns (delta verification)")
+	iReRead := strings.Index(got, "Before emitting a `reopened` resolution, READ the CURRENT diff state")
+	iNew := strings.Index(got, "A `reopened` resolution whose OWN `note` is blank is REFUSED by the server")
+	if iSection < 0 || iReRead < 0 || iNew < 0 || iSection >= iReRead || iReRead >= iNew {
+		t.Errorf("bullet ordering = section %d, re-read %d, new %d; want the new bullet inside the section after the re-read bullet", iSection, iReRead, iNew)
+	}
+}
+
+// TestImplementReview_PriorConcerns_ReopenSubstantiation_EmptyByteIdentical is
+// the absence half: hoisting the bullet out of the len(t.PriorConcerns) > 0
+// guard (and thereby changing the no-prior-concerns prompt) turns this RED.
+func TestImplementReview_PriorConcerns_ReopenSubstantiation_EmptyByteIdentical(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range reopenSubstantiationFragments {
+		if strings.Contains(got, w) {
+			t.Errorf("empty PriorConcerns must render NO fragment of the reopen-substantiation bullet; found %q\n---\n%s", w, got)
+		}
+	}
+}
