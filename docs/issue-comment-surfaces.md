@@ -1371,6 +1371,33 @@ Notes:
   `notifyStatusUpdate` hook, not this audit kind). Mirrors the sibling `fixup_pushed`
   (#794) minus the new commit. Listed here only so a future reader grepping the audit
   categories doesn't mistake it for a comment surface.
+- The bounded conflict-resolution pass audit kinds — `stage_conflict_resolution_triggered`,
+  `stage_conflict_resolution_failed` and `conflict_resolution_pushed` (E64.62 / #3202)
+  — are **internal, system-actor audit kinds, not issue-comment surfaces**. Nothing in
+  `issuecomment` posts them and none has a Notifier method.
+  `stage_conflict_resolution_triggered` is the rebase verb's 202 arm's durable
+  authorization marker AND the pass's OWN budget counter (ceiling 1) — the fix-up
+  counter never reads or writes it, which is what makes the budget separation
+  structural rather than asserted. `server/conflictresolution.go::maybeRecover-
+  ConflictResolutionFailure` writes `stage_conflict_resolution_failed` (payload
+  `{stage_id, branch, base_ref, expected_head_sha, pass, reason}`, carrying the
+  runner's NAMED refusal reason) when a pass is refused; that entry CONSUMES the
+  trigger it follows, so an ordinary later fix-up on the same stage is served
+  `conflict_resolution=false` rather than being hijacked into a pass against a
+  repository that is not mid-merge. `server/pullrequest.go::succeedConflict-
+  ResolutionPushStage` writes `conflict_resolution_pushed` once (idempotency-guarded
+  **stage-keyed**, since the pass has a ceiling of one) when the runner reports
+  `{outcome:"conflict_resolution_pushed"}` after pushing its single merge commit onto
+  the EXISTING PR branch, with payload `{run_id, stage_id, branch, head_sha, base_sha,
+  files_changed_count, auth_method}`. That entry ALSO consumes the trigger, exactly as
+  the failure entry does: either terminal outcome settles the pass, so a later ordinary
+  fix-up on the stage is served `conflict_resolution=false` whether the pass was refused
+  or succeeded. It drives the stage's terminal transition and
+  re-parks the review gate — a mechanical resolution is not a substitute for review —
+  but posts nothing to the issue thread (the existing PR's sticky status comment is
+  refreshed via the separate `notifyStatusUpdate` hook). Mirrors the sibling
+  `fixup_pushed` (#794). Listed here only so a future reader grepping the audit
+  categories doesn't mistake them for comment surfaces.
 - The mid-stage scope-amendment audit kinds — `scope_amendment_requested` /
   `scope_amendment_decided` (#961) — have **no dedicated Notifier methods**.
   `scope_amendment_requested` stays an internal-only kind (it doubles as the

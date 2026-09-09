@@ -2027,6 +2027,15 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// nextActionsFor call sites (here and run_stage.go) so the two snapshot
 	// surfaces cannot diverge.
 	foldAcceptanceRedispatchAdvisory(runRow, stages, recent, nextActions)
+	// E64.62 (#3202): name a bounded conflict-resolution pass. A re-opened
+	// implement stage looks like any other pending implement stage and a spent
+	// ceiling-of-one budget looks like nothing at all, so neither is visible
+	// from stage state alone. Folded off the SAME recent slice already fetched
+	// — no extra round-trip — and wired at BOTH nextActionsFor call sites (here
+	// and run_stage.go) so the status surface and the post-stage surface cannot
+	// disagree about a spent budget. Fail-open: an un-fetched or aged-out
+	// recent slice degrades to silence, never to a false advisory.
+	foldConflictResolutionAdvisory(runRow, recent, nextActions)
 
 	// Best-effort decomposed-parent children status (#1147). Cost-gated so an
 	// ordinary run pays nothing: only a decomposed parent (no parent_run_id,
@@ -3434,13 +3443,38 @@ all (an undecodable merge sha AND a failed post-merge head re-read). A
 success carrying that warning must NOT be read as a clean recovery: the run
 stays wedged on the lineage check until you act.
 
-FAIL-CLOSED on a conflict: if the run branch CONFLICTS with the advanced
-base the call is refused (rebase_conflict) having written NOTHING — no
-merge commit, no audit entry, no check re-post. This first slice does not
-resolve conflicts; agent-driven resolution is tracked in #3202, and today's
-route (resolve in a worktree, push, then fishhawk_vouch_commit) remains the
-fallback. Every uncertain anchor is likewise fail-closed
-(rebase_not_determinable) rather than merged on a guess.
+ON A CONFLICT the call no longer refuses outright (E64.62 / #3202). It
+returns 202 having written NOTHING to the branch — no merge commit, no
+audit entry, no check re-post — and instead AUTHORIZES a bounded,
+agent-driven conflict-resolution pass: the implement stage is re-opened,
+and the runner performs the base merge LOCALLY on the run branch, resolves
+only inside the hunks git itself marked, and pushes the merge commit
+through the App installation (ADR-035 sole writer preserved). The 202
+carries conflict_resolution_triggered=true, conflict_resolution_stage_id
+(the stage to await), conflict_resolution_pass and
+conflict_resolution_note; new_head_sha and merge_commit_sha are EMPTY by
+construction, so do not read a 202 as an advance. Await the stage, then
+re-invoke this verb: the behind-probe short-circuits the merge and the
+check is re-posted at the resulting head.
+
+The pass has its OWN budget — a ceiling of ONE, counted on the
+stage_conflict_resolution_triggered audit category. It NEVER spends a
+fix-up pass, and a fix-up never spends it. A REFUSED pass writes
+stage_conflict_resolution_failed, restores the run to its pre-pass review
+gate (a pass is an assist, never an escalation) and CONSUMES the trigger; a
+SUCCESSFUL pass writes conflict_resolution_pushed, which consumes it just as
+surely — either terminal outcome settles the pass, so a later ordinary
+fix-up on that stage is never served the completed instruction.
+
+FAIL-CLOSED once the budget is spent, or whenever no pass can be started at
+all (no implement stage, an unresolvable branch/base/head anchor, an
+unreadable budget count, a failed trigger append, a failed stage re-open):
+the call is refused with today's rebase_conflict 422, naming the FAILED
+pass, its refusal reason and the fallback route — resolve in a worktree,
+push, then fishhawk_vouch_commit. Because the conflict arm otherwise
+returns 202, that refusal is normally observable on the NEXT invocation.
+Every uncertain anchor is likewise fail-closed (rebase_not_determinable)
+rather than merged on a guess.
 
 Sibling verb: fishhawk_reset_run_branch is the right verb for a FOREIGN
 COMMIT pushed ON TOP of the run's commits — a different problem. This one
@@ -3460,13 +3494,18 @@ Inputs:
 
 Returns the advance summary (prior_head_sha, new_head_sha,
 merge_commit_sha, already_up_to_date, mechanism_note,
-audit_check_republished, lineage_attribution_warning) on success. Returns a tool error on:
+audit_check_republished, lineage_attribution_warning) on success, or the
+conflict-resolution trigger fields (conflict_resolution_triggered,
+conflict_resolution_stage_id, conflict_resolution_pass,
+conflict_resolution_note) on a 202. Returns a tool error on:
   - invalid UUID (caught before the HTTP hop)
   - confirmation_required (confirm not true, 400)
   - run_token_forbidden (a run-bound agent token, 403)
   - insufficient_scope (no write:stages, 403)
   - run_not_found (404)
-  - rebase_conflict (the branch conflicts with the base; nothing written, 422)
+  - rebase_conflict (the branch conflicts with the base AND no
+    conflict-resolution pass could be started — the ceiling-of-one budget is
+    spent, or no pass was startable; nothing written, 422)
   - rebase_not_determinable (fail-closed: unresolvable anchor, behind-probe
     failure, or a concurrent push caught by the lease re-check, 422)
   - rebase_merge_failed (the merge failed for a non-conflict reason, 502)

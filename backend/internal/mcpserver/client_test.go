@@ -2452,3 +2452,82 @@ func TestCreateCampaignDecodesServerTimeout504(t *testing.T) {
 		}
 	})
 }
+
+// --- E64.62 / #3202: the rebase verb's 202 conflict-resolution arm ---
+
+// TestRebaseRunBranch_Decodes202ConflictResolution is the LEGIBILITY pin.
+// apiClient.do's only status branch is >= 400, so a 202 is decoded EXACTLY
+// like a 200 — meaning that WITHOUT the conflict_resolution_* fields on
+// RebaseBranchResult a triggered pass would surface as a success-shaped result
+// with an empty new head and no signal at all, which reads as "advance
+// succeeded, head unchanged" and is strictly worse than the loud 422 it
+// replaces. Deleting those fields makes this test go red on the empty-signal
+// result rather than on a decode error, so the assertion is on the SIGNAL, not
+// on the struct shape.
+func TestRebaseRunBranch_Decodes202ConflictResolution(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.NewString()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/rebase-branch") {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`","pr_number":77,`+
+			`"branch":"fishhawk/run/cr","base_ref":"main",`+
+			`"prior_head_sha":"aaaa1111","new_head_sha":"","merge_commit_sha":"",`+
+			`"mechanism_note":"...","conflict_resolution_triggered":true,`+
+			`"conflict_resolution_stage_id":"`+stageID+`",`+
+			`"conflict_resolution_pass":1,`+
+			`"conflict_resolution_note":"NOTHING was written to the run branch by this call"}`)
+	}))
+	defer ts.Close()
+
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	res, err := c.RebaseRunBranch(context.Background(), runID, "conflict")
+	if err != nil {
+		t.Fatalf("RebaseRunBranch on a 202 = %v, want nil (202 is not an error)", err)
+	}
+	if !res.ConflictResolutionTriggered {
+		t.Error("a 202 must decode as a TRIGGERED pass; without the signal this result is indistinguishable from a success that advanced nothing")
+	}
+	if res.ConflictResolutionStageID != stageID {
+		t.Errorf("conflict_resolution_stage_id = %q, want %q", res.ConflictResolutionStageID, stageID)
+	}
+	if res.ConflictResolutionPass != 1 {
+		t.Errorf("conflict_resolution_pass = %d, want 1", res.ConflictResolutionPass)
+	}
+	if !strings.Contains(res.ConflictResolutionNote, "NOTHING was written") {
+		t.Errorf("conflict_resolution_note = %q, want the nothing-was-written statement", res.ConflictResolutionNote)
+	}
+	// A 202 must never look like an advance.
+	if res.NewHeadSHA != "" || res.MergeCommitSHA != "" {
+		t.Errorf("202 decoded new_head_sha=%q merge_commit_sha=%q, want both empty",
+			res.NewHeadSHA, res.MergeCommitSHA)
+	}
+}
+
+// TestRebaseRunBranch_Decodes200WithoutConflictResolution is the differential
+// control: an ordinary 200 must carry NO conflict-resolution signal, so the
+// new fields cannot make every successful advance look like a triggered pass.
+func TestRebaseRunBranch_Decodes200WithoutConflictResolution(t *testing.T) {
+	runID := uuid.New()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`","new_head_sha":"bbbb2222","mechanism_note":"..."}`)
+	}))
+	defer ts.Close()
+
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	res, err := c.RebaseRunBranch(context.Background(), runID, "")
+	if err != nil {
+		t.Fatalf("RebaseRunBranch = %v", err)
+	}
+	if res.ConflictResolutionTriggered || res.ConflictResolutionStageID != "" ||
+		res.ConflictResolutionPass != 0 || res.ConflictResolutionNote != "" {
+		t.Errorf("a clean 200 must carry no conflict-resolution signal: %+v", res)
+	}
+	if res.NewHeadSHA != "bbbb2222" {
+		t.Errorf("new_head_sha = %q, want bbbb2222", res.NewHeadSHA)
+	}
+}

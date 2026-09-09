@@ -2531,3 +2531,162 @@ func campaignUnclassifiedNextActions(na CampaignNextAction) *NextActions {
 		},
 	}
 }
+
+// --- E64.62 / #3202: conflict-resolution pass advisory ---
+
+const (
+	// auditCategoryConflictResolutionTriggered / _Failed / _Pushed MUST match
+	// backend/internal/server.CategoryStageConflictResolutionTriggered,
+	// CategoryStageConflictResolutionFailed and
+	// CategoryConflictResolutionPushed. They are duplicated rather than
+	// imported because mcpserver reads them off the WIRE (the audit slice this
+	// surface already fetched), not out of the server package.
+	auditCategoryConflictResolutionTriggered = "stage_conflict_resolution_triggered"
+	auditCategoryConflictResolutionFailed    = "stage_conflict_resolution_failed"
+	auditCategoryConflictResolutionPushed    = "conflict_resolution_pushed"
+)
+
+// conflictResolutionSignal is what the recent-audit slice says about a run's
+// bounded conflict-resolution pass (#3202). Exactly one of Triggered / Failed /
+// Succeeded is true when Present.
+type conflictResolutionSignal struct {
+	Present   bool
+	Triggered bool
+	Failed    bool
+	Succeeded bool
+	StageID   string
+	Reason    string
+}
+
+// conflictResolutionSignalIn reads the newest conflict-resolution entry out of
+// the recent-audit slice and classifies it.
+//
+// Selection is by SEQUENCE, newest wins, across ALL THREE categories together —
+// deliberately not "is there a trigger" then "is there a failure", because the
+// categories interleave on one stage and their ORDER is the whole signal: a
+// SETTLEMENT newer than the trigger means the pass ran and is over — refused
+// (stage_conflict_resolution_failed) or succeeded (conflict_resolution_pushed),
+// budget spent either way — while a trigger newer than every settlement means a
+// pass is live. Reading only the failure category (#3202 round-3) left a
+// SUCCEEDED pass classified as permanently pending, sending the operator to
+// wait on a stage that had already gone terminal. That is the same consumption
+// rule the server's resolveConflictResolutionTrigger applies, so the two cannot
+// disagree about whether a pass is outstanding.
+//
+// FAILS OPEN to a zero signal on every uncertainty — an empty or un-fetched
+// slice, an entry aged out of the window, a payload that is not a JSON object.
+// A false advisory naming a pass that is not there would send the operator to
+// wait on a stage nothing is going to dispatch, which is worse than silence.
+func conflictResolutionSignalIn(recent []AuditEntry) conflictResolutionSignal {
+	var newest *AuditEntry
+	for i := range recent {
+		c := recent[i].Category
+		if c != auditCategoryConflictResolutionTriggered && c != auditCategoryConflictResolutionFailed &&
+			c != auditCategoryConflictResolutionPushed {
+			continue
+		}
+		if newest == nil || recent[i].Sequence > newest.Sequence {
+			newest = &recent[i]
+		}
+	}
+	if newest == nil {
+		return conflictResolutionSignal{}
+	}
+	sig := conflictResolutionSignal{
+		Present:   true,
+		Triggered: newest.Category == auditCategoryConflictResolutionTriggered,
+		Failed:    newest.Category == auditCategoryConflictResolutionFailed,
+		Succeeded: newest.Category == auditCategoryConflictResolutionPushed,
+		Reason:    acceptancePayloadString(newest.Payload, "reason"),
+	}
+	if newest.StageID != nil {
+		sig.StageID = *newest.StageID
+	}
+	return sig
+}
+
+// foldConflictResolutionAdvisory names a bounded conflict-resolution pass on
+// the next_actions block (E64.62 / #3202).
+//
+// The gap it closes: fishhawk_rebase_run_branch's conflict arm no longer
+// refuses — it returns 202 having re-opened the implement stage for a pass, or
+// (once the ceiling-of-one is spent) the fail-closed 422. Neither fact is
+// visible in the run's stage states: a re-opened implement stage looks like any
+// other pending implement stage, and a spent budget looks like nothing at all.
+// So an operator reading next_actions after a triggered pass would see a
+// generic implement arm with no hint that a rebase is waiting on it, and after
+// a REFUSED pass would see no hint that re-invoking the rebase verb will now
+// fail closed.
+//
+// DISPLAY-ONLY and ADDITIVE, in the foldAcceptanceRedispatchAdvisory idiom. It
+// never removes an action and never gates anything:
+//
+//   - a LIVE trigger (the newest conflict-resolution entry is the trigger):
+//     APPENDS a wait-shaped fishhawk_await_stage on the re-opened stage and
+//     relabels the state conflict_resolution_pass_pending. A wait, not a
+//     dispatch: on the local loop the operator dispatches the stage through the
+//     ordinary implement arm the block already carries, and naming a second
+//     dispatch verb here would invite a double dispatch.
+//   - a SUCCEEDED pass (the newest entry is conflict_resolution_pushed):
+//     APPENDS a fishhawk_rebase_run_branch action and relabels the state
+//     conflict_resolution_pass_succeeded. The pass is SETTLED, not pending —
+//     without this arm the advisory kept naming a completed pass as pending and
+//     pointed the operator at a wait on a stage that had already gone terminal.
+//   - a FAILED pass (the newest entry is the failure): APPENDS a
+//     fishhawk_rebase_run_branch action whose reason names the refusal and the
+//     resolve-push-vouch fallback, and relabels the state
+//     conflict_resolution_pass_failed. The verb is still legal to attempt — the
+//     server is the authority — and invoking it is precisely how the operator
+//     SEES the budget-spent 422 naming the reason.
+//
+// A no-op leaving na deep-equal to its unfolded value when na is nil, when run
+// is nil, or when the recent slice carries no conflict-resolution entry at all
+// — which is what keeps every ordinary run byte-identical.
+func foldConflictResolutionAdvisory(run *Run, recent []AuditEntry, na *NextActions) {
+	if run == nil || na == nil {
+		return
+	}
+	sig := conflictResolutionSignalIn(recent)
+	if !sig.Present {
+		return
+	}
+	if sig.Triggered {
+		na.State = "conflict_resolution_pass_pending"
+		reason := "fishhawk_rebase_run_branch found the run branch CONFLICTS with its advanced base and authorized a bounded conflict-resolution pass (ceiling 1) instead of refusing; NOTHING was written to the branch. Await the re-opened implement stage, then re-invoke fishhawk_rebase_run_branch — on success the behind-probe short-circuits and the fishhawk_audit_complete check is re-posted at the resulting head."
+		params := map[string]string{"run_id": run.ID}
+		if sig.StageID != "" {
+			params["stage_id"] = sig.StageID
+		}
+		na.Actions = append(na.Actions, SuggestedAction{
+			Action:       "fishhawk_await_stage",
+			Params:       params,
+			Precondition: "a conflict-resolution pass is authorized and its implement stage is re-opened, so there is a settle to wait on",
+			Consumes:     consumesNone,
+			Reason:       reason,
+		})
+		return
+	}
+	if sig.Succeeded {
+		na.State = "conflict_resolution_pass_succeeded"
+		na.Actions = append(na.Actions, SuggestedAction{
+			Action:       "fishhawk_rebase_run_branch",
+			Params:       map[string]string{"run_id": run.ID, "confirm": "true"},
+			Precondition: "the conflict-resolution pass SETTLED with its merge commit pushed to the PR branch, so the rebase can now complete",
+			Consumes:     consumesNone,
+			Reason:       "the bounded conflict-resolution pass SUCCEEDED: its single merge commit is committed and pushed to the existing PR branch, the review gate was re-parked so the merge commit is reviewed, and its ceiling-of-one budget is now SPENT. The pass is SETTLED, not pending — re-invoke fishhawk_rebase_run_branch to let the behind-probe short-circuit and re-post the fishhawk_audit_complete check at the resulting head.",
+		})
+		return
+	}
+	na.State = "conflict_resolution_pass_failed"
+	reason := "the bounded conflict-resolution pass was REFUSED and the run was restored to its pre-pass review gate; its ceiling-of-one budget is now SPENT, so re-invoking fishhawk_rebase_run_branch on the same conflict fails closed (422 rebase_conflict) naming the refusal and the fallback: resolve in a worktree, push, then fishhawk_vouch_commit."
+	if sig.Reason != "" {
+		reason = "refusal reason: " + sig.Reason + ". " + reason
+	}
+	na.Actions = append(na.Actions, SuggestedAction{
+		Action:       "fishhawk_rebase_run_branch",
+		Params:       map[string]string{"run_id": run.ID, "confirm": "true"},
+		Precondition: "the conflict-resolution budget is spent, so this call reports the fail-closed refusal rather than advancing the branch",
+		Consumes:     consumesNone,
+		Reason:       reason,
+	})
+}

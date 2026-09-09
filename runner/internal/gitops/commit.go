@@ -2090,3 +2090,182 @@ func orDefault(v, fallback string) string {
 	}
 	return v
 }
+
+// PushCommittedBranchArgs collects everything PushCommittedBranch needs. It is
+// the ALREADY-COMMITTED sibling of CommitAndPushArgs: the caller has already
+// produced the commit (the conflict-resolution pass's single `git commit
+// --no-edit`, #3202) and needs only the authorized publish step, so nothing
+// here stages, commits, or rewrites the working tree.
+type PushCommittedBranchArgs struct {
+	// RepoDir is the git working directory holding the commit.
+	RepoDir string
+	// Branch is the branch to publish. The commit is pushed as
+	// <HeadSHA>:refs/heads/<Branch>, so the caller need not have the branch
+	// checked out by name.
+	Branch string
+	// RemoteURL is the URL `git push` targets. Required.
+	RemoteURL string
+	// PushToken authenticates the push. Applied per-invocation as
+	// process-scoped git config via authConfigEnv — nothing is written to any
+	// config file. Empty means ambient auth (a file-path remote in tests).
+	PushToken string
+	// HeadSHA is the gate-authorized commit to publish, and it is the SOURCE
+	// of the push refspec — not merely something checked afterwards. It must
+	// be a full hexadecimal object id (40 or 64 lowercase hex characters); a
+	// symbolic source such as "HEAD" or a branch name is REFUSED, because
+	// anything git resolves at push time can name a different commit than the
+	// one the gate authorized. The push is ALSO confirmed against it: after
+	// pushing, the remote tip is observed via ls-remote and must equal
+	// HeadSHA, so a push that reported success but left the remote elsewhere
+	// (a concurrent writer, a server-side hook) is a loud error rather than a
+	// silent claim.
+	HeadSHA string
+}
+
+// fullObjectID reports whether s is a full hexadecimal git object id — 40
+// characters for SHA-1, 64 for SHA-256, lowercase only (what `git rev-parse`
+// emits). Anything else, including an abbreviated id or a ref name, is
+// rejected: PushCommittedBranch uses HeadSHA as the SOURCE of its refspec, and
+// only an object id names a fixed commit that cannot be re-resolved to
+// something else between authorization and publication.
+func fullObjectID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// PushCommittedBranchResult reports the CONFIRMED remote tip.
+type PushCommittedBranchResult struct {
+	// RemoteHeadSHA is what ls-remote reported for refs/heads/<Branch> after
+	// the push. Always equal to Args.HeadSHA on a nil error.
+	RemoteHeadSHA string
+}
+
+// PushCommittedBranch publishes an already-committed branch tip and CONFIRMS
+// the remote advanced to it (#3202).
+//
+// It is deliberately narrower than CommitAndPush: no checkout, no staging, no
+// commit, no rebase, no lease. The conflict-resolution pass has already made
+// its single merge commit under a passing confinement gate, and the only thing
+// left is the authorized write — routed through this package so it reuses the
+// same process-scoped authConfigEnv auth the implement push uses and the same
+// observeRemoteHead confirmation.
+//
+// The publish is PINNED to args.HeadSHA. The refspec source is the authorized
+// object id itself (`<HeadSHA>:refs/heads/<Branch>`), never `HEAD` — a
+// symbolic source is resolved by git at push time, so a local HEAD that moved
+// after the confinement gate ran (an agent-spawned background process outlives
+// the agent's own turn, and .git is outside the working tree its contract
+// confines it to) would publish an UNAUTHORIZED commit and only then be caught
+// by the confirmation below, after the remote write. Pinning the source makes
+// the wrong write unreachable rather than merely reported: a moved HEAD now
+// changes nothing about what is published, and a HeadSHA that is not a full
+// object id is refused before any remote is contacted.
+//
+// The remote-tip check remains load-bearing for what pinning cannot cover.
+// `git push` exiting 0 is not
+// proof the ref moved (a `--dry-run`-shaped invocation, a hook that rewrites,
+// or a concurrent writer that lands after us all exit 0 from our side), and
+// the caller reports a TERMINAL success to the backend on the strength of this
+// call — so a tip that does not equal HeadSHA is an error, not a warning.
+func (p *Pusher) PushCommittedBranch(ctx context.Context, args PushCommittedBranchArgs) (*PushCommittedBranchResult, error) {
+	switch {
+	case args.RepoDir == "":
+		return nil, errors.New("gitops: RepoDir required")
+	case args.Branch == "":
+		return nil, errors.New("gitops: Branch required")
+	case args.RemoteURL == "":
+		return nil, errors.New("gitops: RemoteURL required")
+	case args.HeadSHA == "":
+		return nil, errors.New("gitops: HeadSHA required")
+	case !fullObjectID(args.HeadSHA):
+		return nil, fmt.Errorf(
+			"gitops: HeadSHA %q is not a full object id — the push source must name a fixed commit, not a ref git resolves at push time",
+			args.HeadSHA)
+	}
+
+	authEnv, err := authConfigEnv(args.RemoteURL, args.PushToken)
+	if err != nil {
+		return nil, err
+	}
+
+	// The push is the one invocation in this call that runs with a live
+	// installation token in its environment, and `git push` runs the
+	// repository's `pre-push` hook — which the conflict-resolution agent could
+	// have written, since `.git/hooks` is outside the working tree its contract
+	// confines it to. HardeningArgs neutralizes that hook (and every other
+	// command-executing config key) for this invocation.
+	pushArgs := append(HardeningArgs(), "push", args.RemoteURL, args.HeadSHA+":refs/heads/"+args.Branch)
+	if err := p.runEnv(ctx, args.RepoDir, authEnv, pushArgs...); err != nil {
+		return nil, fmt.Errorf("gitops: push committed branch %s: %w", args.Branch, err)
+	}
+
+	remoteHead, err := p.observeRemoteHead(ctx, args.RepoDir, args.RemoteURL, args.Branch, authEnv)
+	if err != nil {
+		return nil, fmt.Errorf("gitops: confirm pushed tip: %w", err)
+	}
+	if remoteHead != args.HeadSHA {
+		return nil, fmt.Errorf(
+			"gitops: remote tip of %s is %q after push, want %q — the push did not land the expected commit",
+			args.Branch, remoteHead, args.HeadSHA)
+	}
+	return &PushCommittedBranchResult{RemoteHeadSHA: remoteHead}, nil
+}
+
+// InertHooksPath is what HardeningArgs points `core.hooksPath` at. `/dev/null`
+// is not a directory and cannot be made one, so git looks for
+// `/dev/null/<hook>`, finds nothing, and runs no hook — while an EMPTY value
+// resolves hooks relative to the current directory (a path an agent CAN write)
+// and a temp directory is one an agent with filesystem access could populate.
+// The runner targets darwin/linux only, where `/dev/null` is guaranteed.
+const InertHooksPath = "/dev/null"
+
+// HardeningArgs returns the `git -c` options that neutralize the repository
+// state which EXECUTES A COMMAND on an ordinary git invocation (#3202).
+//
+// It exists because of the conflict-resolution pass's threat model: the agent
+// is handed a working-tree-edits-only CONTRACT, but a contract is not a
+// control. `.git/hooks/*` and `.git/config` live OUTSIDE the working tree, so
+// an agent that writes them changes what the runner's OWN post-agent git
+// commands do — after the confinement gate has already inspected the tree and
+// said yes. Every key here is one that hands git a command line to run:
+//
+//   - core.hooksPath — a pre-commit hook can `git add` content the gate never
+//     saw; a prepare-commit-msg hook can rewrite the merge message after it was
+//     compared; a pre-push hook runs with the freshly minted installation token
+//     in the process environment.
+//   - core.fsmonitor — runs on the very next index refresh and can falsify the
+//     `git diff --name-only` / `git status` reads the gate DECIDES on, hiding an
+//     out-of-set edit from the observation itself.
+//   - core.editor / sequence.editor / core.pager — each spawns a process.
+//   - commit.gpgsign — signing spawns `gpg.program`.
+//   - credential.helper — an empty value RESETS the helper list (git-config(1)),
+//     so no agent-configured helper binary runs while a push token is in scope.
+//
+// `-c` beats every config file, so this holds against `.git/config`,
+// `$HOME/.gitconfig` and the system file alike.
+//
+// Read the residual honestly: this is a DENY-LIST of the keys that execute a
+// command, not a proof that repository-local git state is inert. Content
+// filters (`filter.<driver>.clean`) are keyed by a driver name that cannot be
+// wildcarded away, which is why the conflict-resolution pass ALSO verifies the
+// artifact it publishes — the staged bytes against what the gate observed, and
+// the committed tree, parents and message against what it authorized — rather
+// than relying on neutralization alone.
+func HardeningArgs() []string {
+	return []string{
+		"-c", "core.hooksPath=" + InertHooksPath,
+		"-c", "core.fsmonitor=false",
+		"-c", "core.editor=true",
+		"-c", "sequence.editor=true",
+		"-c", "core.pager=cat",
+		"-c", "commit.gpgsign=false",
+		"-c", "credential.helper=",
+	}
+}

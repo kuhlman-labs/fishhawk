@@ -3571,6 +3571,26 @@ type fakePusher struct {
 	// pass that committed, reset and reported no changes — and to positively
 	// assert the resulting clean state before the no-changes path evaluates.
 	onCommit func(args gitops.CommitAndPushArgs)
+
+	// pushCommittedArgs / pushCommittedResult / pushCommittedErr cover the
+	// conflict-resolution publish seam (#3202). A nil pushCommittedResult with a
+	// nil error echoes back the requested HeadSHA, so the common case needs no
+	// per-test wiring.
+	pushCommittedArgs   *gitops.PushCommittedBranchArgs
+	pushCommittedResult *gitops.PushCommittedBranchResult
+	pushCommittedErr    error
+}
+
+func (f *fakePusher) PushCommittedBranch(_ context.Context, args gitops.PushCommittedBranchArgs) (*gitops.PushCommittedBranchResult, error) {
+	a := args
+	f.pushCommittedArgs = &a
+	if f.pushCommittedErr != nil {
+		return nil, f.pushCommittedErr
+	}
+	if f.pushCommittedResult != nil {
+		return f.pushCommittedResult, nil
+	}
+	return &gitops.PushCommittedBranchResult{RemoteHeadSHA: args.HeadSHA}, nil
 }
 
 func (f *fakePusher) CommitAndPush(_ context.Context, args gitops.CommitAndPushArgs) (*gitops.CommitAndPushResult, error) {

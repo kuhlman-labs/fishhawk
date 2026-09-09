@@ -3285,3 +3285,89 @@ func TestShrinkParkBodyFields_Ladder(t *testing.T) {
 		t.Errorf("the exhausted ladder must have dropped the PR text: %+v", over)
 	}
 }
+
+// TestFetchedPrompt_DecodesConflictResolutionFields feeds the BACKEND's literal
+// json field names (#3202). The cross-module wire contract is by TAG, and a tag
+// drift silently DISABLES the pass — the runner would decode false, take the
+// ordinary implement path, and nothing would report that the pass never ran.
+func TestFetchedPrompt_DecodesConflictResolutionFields(t *testing.T) {
+	const body = `{
+		"stage_id":"s1","stage_type":"implement","prompt":"p","prompt_hash":"h",
+		"conflict_resolution":true,
+		"conflict_resolution_branch":"fishhawk/run-1",
+		"conflict_resolution_base_ref":"release/1.2",
+		"conflict_resolution_expected_head_sha":"deadbeef"
+	}`
+	var got FetchedPrompt
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.ConflictResolution {
+		t.Error("ConflictResolution = false, want true")
+	}
+	if got.ConflictResolutionBranch != "fishhawk/run-1" {
+		t.Errorf("branch = %q", got.ConflictResolutionBranch)
+	}
+	if got.ConflictResolutionBaseRef != "release/1.2" {
+		t.Errorf("base_ref = %q", got.ConflictResolutionBaseRef)
+	}
+	if got.ConflictResolutionExpectedHeadSHA != "deadbeef" {
+		t.Errorf("expected_head_sha = %q", got.ConflictResolutionExpectedHeadSHA)
+	}
+}
+
+// TestFetchedPrompt_ConflictResolutionAbsentIsOff pins the byte-identical
+// default: a prompt response with none of the fields decodes to no pass.
+func TestFetchedPrompt_ConflictResolutionAbsentIsOff(t *testing.T) {
+	var got FetchedPrompt
+	if err := json.Unmarshal([]byte(`{"stage_id":"s1","stage_type":"implement","prompt":"p","prompt_hash":"h"}`), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.ConflictResolution || got.ConflictResolutionBranch != "" ||
+		got.ConflictResolutionBaseRef != "" || got.ConflictResolutionExpectedHeadSHA != "" {
+		t.Fatalf("absent instruction decoded as %+v, want the zero value", got)
+	}
+}
+
+// TestShipPullRequest_ConflictResolutionPushedBody pins the SIGNED bytes of the
+// terminal success report. The outcome string and every tag must be
+// byte-identical to what the backend's closed allow-list accepts — an outcome
+// outside that set is rejected, the stage never leaves `running`, and the run
+// strands.
+func TestShipPullRequest_ConflictResolutionPushedBody(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &got)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"a","stage_id":"s","content_hash":"c"}`))
+	}))
+	defer srv.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+		Outcome: "conflict_resolution_pushed",
+		Branch:  "fishhawk/run-1", HeadSHA: "merge1", BaseSHA: "pre1",
+		FilesChangedCount: 2,
+	}); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	for k, want := range map[string]any{
+		"outcome":  "conflict_resolution_pushed",
+		"branch":   "fishhawk/run-1",
+		"head_sha": "merge1",
+		"base_sha": "pre1",
+	} {
+		if got[k] != want {
+			t.Errorf("body[%q] = %v, want %v", k, got[k], want)
+		}
+	}
+	if got["files_changed_count"] != float64(2) {
+		t.Errorf("files_changed_count = %v, want 2", got["files_changed_count"])
+	}
+}

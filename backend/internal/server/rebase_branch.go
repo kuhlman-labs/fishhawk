@@ -102,6 +102,28 @@ type rebaseBranchResponse struct {
 	// deliberately attributes nothing — so the warning names
 	// fishhawk_vouch_commit as the required step instead.
 	LineageAttributionWarning string `json:"lineage_attribution_warning,omitempty"`
+
+	// --- 202 conflict-resolution trigger arm (E64.62 / #3202) ---
+	//
+	// These three fields are what make a 202 LEGIBLE. The response body of a
+	// triggered pass is otherwise shaped exactly like a 200 with an empty
+	// new_head_sha, and an MCP client decodes 202 and 200 identically — so
+	// without them a triggered pass would read as a silent success that
+	// advanced nothing, which is strictly worse than the loud refusal it
+	// replaces.
+
+	// ConflictResolutionTriggered is true ONLY on the 202: the base merge
+	// CONFLICTED, nothing was written to the branch, and a bounded
+	// agent-driven conflict-resolution pass was authorized instead.
+	ConflictResolutionTriggered bool `json:"conflict_resolution_triggered,omitempty"`
+	// ConflictResolutionStageID is the re-opened implement stage to await.
+	ConflictResolutionStageID string `json:"conflict_resolution_stage_id,omitempty"`
+	// ConflictResolutionPass is the 1-based pass ordinal, against a ceiling of
+	// conflictResolutionCeiling.
+	ConflictResolutionPass int `json:"conflict_resolution_pass,omitempty"`
+	// ConflictResolutionNote is the constant sentence stating that nothing was
+	// written by this call and naming the await-then-re-invoke route.
+	ConflictResolutionNote string `json:"conflict_resolution_note,omitempty"`
 }
 
 // handleRebaseRunBranch implements POST /v0/runs/{run_id}/rebase-branch.
@@ -130,11 +152,17 @@ type rebaseBranchResponse struct {
 //   - any identity without write:stages → 403 insufficient_scope, enforced
 //     UNCONDITIONALLY with no cookie-session bypass.
 //
-// FAIL-CLOSED FIRST SLICE: a CONFLICTING merge produces a named
-// rebase_conflict refusal that performs NO write and tells the operator
-// what happened, cross-linking fishhawk_reset_run_branch (the sibling verb
-// for a foreign commit pushed ON TOP, a different problem) and naming
-// #3202 as where agent-driven conflict resolution is tracked.
+// A CONFLICTING merge no longer fails closed outright (E64.62 / #3202).
+// It takes the BUDGETED 202 TRIGGER ARM: still no write to the branch, but
+// a bounded, agent-driven conflict-resolution pass (ceiling 1, its OWN
+// audit counter — never the fix-up budget) is authorized, the implement
+// stage is re-opened, and the response carries
+// conflict_resolution_triggered plus the stage to await. At or over the
+// ceiling — and whenever no pass can be started at all — the response is
+// TODAY'S fail-closed 422 rebase_conflict, now naming the FAILED pass, its
+// refusal reason and the resolve-push-vouch route, and still cross-linking
+// fishhawk_reset_run_branch (the sibling verb for a foreign commit pushed
+// ON TOP, a different problem).
 //
 // Two structural properties are load-bearing and deliberately NOT
 // shortcuts:
@@ -289,13 +317,33 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 		sha, merr := s.cfg.GitHub.MergeBranch(r.Context(), scope, repo, branch, baseRef, msg)
 		if merr != nil {
 			if errors.Is(merr, forge.ErrMergeConflict) {
-				s.writeError(w, r, http.StatusUnprocessableEntity, "rebase_conflict",
-					"the run branch conflicts with the advanced base; the merge was REFUSED and NOTHING was written (no merge commit, no audit entry, no check re-post). This first slice does not resolve conflicts — agent-driven conflict resolution is tracked in #3202. If the problem is instead a FOREIGN COMMIT pushed ON TOP of the run's commits rather than a base advance, fishhawk_reset_run_branch is the right verb.",
-					map[string]any{
-						"branch":   branch,
-						"base_ref": baseRef,
-						"error":    merr.Error(),
-					})
+				// THE 202 TRIGGER ARM (E64.62 / #3202). A conflict is no
+				// longer an outright refusal: under a ceiling of ONE, the
+				// implement stage is re-opened for a bounded, agent-driven
+				// conflict-resolution pass that performs the merge LOCALLY on
+				// the run branch and pushes through the App installation, so
+				// the operator never has to push to a branch ADR-035 declares
+				// runner-owned. NOTHING is written to the branch by THIS call
+				// either way. When the budget is spent — or no pass can be
+				// started at all — the fail-closed 422 below is today's
+				// behaviour, now naming the failed pass and its reason.
+				start, refusal := s.startConflictResolutionPass(r, runID, branch, baseRef, headSHA)
+				if refusal != nil {
+					s.writeRebaseConflictRefusal(w, r, refusal, branch, baseRef, merr)
+					return
+				}
+				s.writeJSON(w, r, http.StatusAccepted, rebaseBranchResponse{
+					RunID:                       runID.String(),
+					PRNumber:                    prNumber,
+					Branch:                      branch,
+					BaseRef:                     baseRef,
+					PriorHeadSHA:                headSHA,
+					MechanismNote:               rebaseMechanismNote,
+					ConflictResolutionTriggered: true,
+					ConflictResolutionStageID:   start.StageID.String(),
+					ConflictResolutionPass:      start.Pass,
+					ConflictResolutionNote:      conflictResolutionTriggeredNote,
+				})
 				return
 			}
 			s.writeError(w, r, http.StatusBadGateway, "rebase_merge_failed",

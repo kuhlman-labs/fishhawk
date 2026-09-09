@@ -5122,3 +5122,296 @@ func TestCommitAndPush_UntypedCommittedTestsWrapAborts(t *testing.T) {
 		t.Errorf("origin must be untouched on the aborted push, but the branch exists: %s", out)
 	}
 }
+
+// --- PushCommittedBranch (#3202) ---
+
+// pushCommittedFixture builds a real repo with one commit on an unpushed
+// branch plus a bare local remote, and returns (repo, bare, headSHA).
+func pushCommittedFixture(t *testing.T) (string, string, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	return repo, bare, mustGitOut(t, repo, "rev-parse", "HEAD")
+}
+
+// TestPushCommittedBranch_AdvancesRemoteTip is the publish half of the
+// conflict-resolution pass: an already-committed tip must reach the remote and
+// the call must CONFIRM it did. The assertion reads the BARE REPO back — the
+// committed state — rather than trusting the returned struct.
+func TestPushCommittedBranch_AdvancesRemoteTip(t *testing.T) {
+	repo, bare, head := pushCommittedFixture(t)
+
+	res, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+		RepoDir:   repo,
+		Branch:    "fishhawk/run-x",
+		RemoteURL: bare,
+		HeadSHA:   head,
+	})
+	if err != nil {
+		t.Fatalf("PushCommittedBranch: %v", err)
+	}
+	if res.RemoteHeadSHA != head {
+		t.Errorf("RemoteHeadSHA = %q, want %q", res.RemoteHeadSHA, head)
+	}
+	out, err := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/run-x").Output()
+	if err != nil {
+		t.Fatalf("read bare tip: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != head {
+		t.Errorf("bare tip = %q, want %q", got, head)
+	}
+}
+
+// bareBranchTip reads a branch out of a bare repo, reporting "" when the
+// branch does not exist. Every PushCommittedBranch assertion below reads the
+// REMOTE STATE through this rather than the returned struct or error: the
+// publish is a committed side effect, and a control that fires only after the
+// write returns a byte-identical error to one that prevented it.
+func bareBranchTip(t *testing.T, bare, branch string) string {
+	t.Helper()
+	out, err := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "--quiet",
+		"refs/heads/"+branch).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestPushCommittedBranch_PublishesAuthorizedSHAWhenLocalHeadMoves pins the
+// PINNED-REFSPEC control. The gate authorizes ONE commit, but the push happens
+// afterwards, and .git is outside the working tree the conflict-resolution
+// agent's contract confines it to — an agent-spawned background process
+// outlives the agent's turn and can move HEAD in that window. Publishing
+// `HEAD:refs/heads/<branch>` would resolve that moved HEAD and write the
+// unauthorized commit to the run branch, with the mismatch reported only
+// afterwards; publishing `<HeadSHA>:refs/heads/<branch>` cannot.
+//
+// The assertion is therefore the REMOTE TIP read back after the call returns,
+// and it is checked whether or not the call errored: an unpinned build DOES
+// return an error (the confirmation catches the mismatch), so asserting on the
+// error would stay green with the unauthorized commit already published.
+func TestPushCommittedBranch_PublishesAuthorizedSHAWhenLocalHeadMoves(t *testing.T) {
+	repo, bare, authorized := pushCommittedFixture(t)
+
+	// The window between authorization and publication: local HEAD moves to a
+	// commit no gate ever saw.
+	if err := os.WriteFile(filepath.Join(repo, "smuggled.txt"), []byte("unauthorized\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "moved by a background process")
+	moved := mustGitOut(t, repo, "rev-parse", "HEAD")
+	if moved == authorized {
+		t.Fatalf("fixture did not move HEAD: still %s", authorized)
+	}
+
+	_, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+		RepoDir:   repo,
+		Branch:    "fishhawk/run-x",
+		RemoteURL: bare,
+		HeadSHA:   authorized,
+	})
+
+	switch tip := bareBranchTip(t, bare, "fishhawk/run-x"); tip {
+	case moved:
+		t.Fatalf("the UNAUTHORIZED commit %s reached the run branch: the push resolved local HEAD instead of the gate-authorized %s", moved, authorized)
+	case authorized:
+		// The only acceptable published state.
+	default:
+		t.Fatalf("run branch tip = %q, want the authorized %s", tip, authorized)
+	}
+	if err != nil {
+		t.Fatalf("PushCommittedBranch: %v", err)
+	}
+}
+
+// TestPushCommittedBranch_RefusesSymbolicHeadSHA pins the companion guard that
+// makes the pinned refspec meaningful: a source git can RE-RESOLVE at push
+// time reintroduces exactly the moved-HEAD hole, so only a full object id is
+// accepted. The assertion is again remote state — no branch may exist — so a
+// build that dropped the guard and let git resolve "HEAD" fails on the write
+// it performed rather than on a message.
+func TestPushCommittedBranch_RefusesSymbolicHeadSHA(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sha  string
+	}{
+		{"symbolic_head", "HEAD"},
+		{"branch_name", "main"},
+		{"revision_expression", "HEAD~1"},
+		{"abbreviated", "abc1234"},
+		{"uppercase_hex", strings.ToUpper(strings.Repeat("ab", 20))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, bare, _ := pushCommittedFixture(t)
+
+			_, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+				RepoDir:   repo,
+				Branch:    "fishhawk/run-x",
+				RemoteURL: bare,
+				HeadSHA:   tc.sha,
+			})
+
+			if tip := bareBranchTip(t, bare, "fishhawk/run-x"); tip != "" {
+				t.Fatalf("a push happened for HeadSHA %q: run branch is at %s, want no branch at all", tc.sha, tip)
+			}
+			if err == nil || !strings.Contains(err.Error(), "not a full object id") {
+				t.Fatalf("err = %v, want the non-object-id refusal", err)
+			}
+		})
+	}
+}
+
+// TestPushCommittedBranch_RefusesWhenRemoteTipDiffers is the counterfactual
+// vehicle for the confirmation control, which pinning the refspec does NOT
+// subsume: `git push` exiting 0 is not proof the ref carries the commit the
+// caller is about to report as terminal success. The mismatch is produced the
+// way the doc comment names it — a server-side hook that rewrites the ref
+// after accepting the push — because a bogus local HeadSHA now fails at the
+// pinned refspec instead, which would exercise a different control.
+func TestPushCommittedBranch_RefusesWhenRemoteTipDiffers(t *testing.T) {
+	repo, bare, head := pushCommittedFixture(t)
+
+	// A second commit, published to the bare repo under an unrelated ref so
+	// the object exists there for the hook to point at.
+	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "second")
+	other := mustGitOut(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "push", bare, other+":refs/heads/decoy")
+
+	if err := os.WriteFile(filepath.Join(bare, "hooks", "post-receive"),
+		[]byte("#!/bin/sh\ngit update-ref refs/heads/fishhawk/run-x "+other+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+		RepoDir:   repo,
+		Branch:    "fishhawk/run-x",
+		RemoteURL: bare,
+		HeadSHA:   head,
+	})
+	if err == nil {
+		t.Fatal("PushCommittedBranch = nil error, want a remote-tip mismatch refusal")
+	}
+	if !strings.Contains(err.Error(), "did not land the expected commit") {
+		t.Errorf("error = %v, want the remote-tip mismatch refusal", err)
+	}
+	// Guard the fixture itself: the mismatch must come from the rewrite, not
+	// from a push that never landed.
+	if tip := bareBranchTip(t, bare, "fishhawk/run-x"); tip != other {
+		t.Fatalf("fixture did not rewrite the ref: run branch tip = %q, want %s", tip, other)
+	}
+}
+
+// TestPushCommittedBranch_RequiredArgs pins each required-field guard by its
+// own message, so a guard deleted individually is caught individually.
+func TestPushCommittedBranch_RequiredArgs(t *testing.T) {
+	full := PushCommittedBranchArgs{RepoDir: "r", Branch: "b", RemoteURL: "u", HeadSHA: "h"}
+	cases := []struct {
+		name  string
+		mut   func(*PushCommittedBranchArgs)
+		wants string
+	}{
+		{"repo_dir", func(a *PushCommittedBranchArgs) { a.RepoDir = "" }, "RepoDir required"},
+		{"branch", func(a *PushCommittedBranchArgs) { a.Branch = "" }, "Branch required"},
+		{"remote_url", func(a *PushCommittedBranchArgs) { a.RemoteURL = "" }, "RemoteURL required"},
+		{"head_sha", func(a *PushCommittedBranchArgs) { a.HeadSHA = "" }, "HeadSHA required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := full
+			tc.mut(&args)
+			_, err := (&Pusher{}).PushCommittedBranch(context.Background(), args)
+			if err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.wants)
+			}
+		})
+	}
+}
+
+// TestPushCommittedBranch_NeutralizesPrePushHook pins the credential half of
+// the conflict-resolution threat model (#3202): `git push` is the ONE
+// invocation of that pass carrying a freshly minted installation token in its
+// process environment, and it runs the repository's `pre-push` hook — which the
+// agent can write, since .git/hooks is outside the working tree its contract
+// confines it to. The hook here records that it ran; the assertion is its
+// ABSENCE, read off the filesystem after the push returns, because a hook that
+// fired changes nothing about the returned error.
+func TestPushCommittedBranch_NeutralizesPrePushHook(t *testing.T) {
+	repo, bare, head := pushCommittedFixture(t)
+	sentinel := filepath.Join(t.TempDir(), "pre-push-ran")
+
+	hooks := filepath.Join(repo, ".git", "hooks")
+	if err := os.MkdirAll(hooks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hooks, "pre-push"),
+		[]byte("#!/bin/sh\ntouch "+sentinel+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+		RepoDir:   repo,
+		Branch:    "fishhawk/run-x",
+		RemoteURL: bare,
+		HeadSHA:   head,
+	}); err != nil {
+		t.Fatalf("PushCommittedBranch: %v", err)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Errorf("the repository's pre-push hook RAN during the authorized push (stat err = %v)", err)
+	}
+}
+
+// TestHardeningArgs pins every key in the deny-list, one assertion per
+// execution vector, because the set is the control: a key silently dropped
+// from it re-opens exactly the bypass it was added for, and the keys whose
+// effect is hard to observe end to end (an fsmonitor command falsifying the
+// gate's own `git status` / `git diff` reads) have no other pin.
+func TestHardeningArgs(t *testing.T) {
+	args := HardeningArgs()
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"core.hooksPath=" + InertHooksPath, // hooks: pre-commit / prepare-commit-msg / pre-push
+		"core.fsmonitor=false",             // a command run on index refresh, falsifying the observation
+		"core.editor=true",                 // editor spawn
+		"sequence.editor=true",             // editor spawn
+		"core.pager=cat",                   // pager spawn
+		"commit.gpgsign=false",             // gpg.program spawn
+		"credential.helper=",               // credential-helper binary, with a push token in scope
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("HardeningArgs missing %q: %v", want, args)
+		}
+	}
+	for i := 0; i < len(args); i += 2 {
+		if args[i] != "-c" {
+			t.Fatalf("HardeningArgs[%d] = %q, want every entry to be a -c pair: %v", i, args[i], args)
+		}
+	}
+	// An EMPTY hooksPath resolves hooks relative to the current directory,
+	// which an agent CAN write — the neutralization must not degrade to it.
+	if InertHooksPath == "" {
+		t.Error("InertHooksPath is empty, which makes git resolve hooks relative to the working directory")
+	}
+}

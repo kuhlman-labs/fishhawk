@@ -171,6 +171,33 @@ type promptResponse struct {
 	// down the unchanged agent fix-up path. Omitted on a normal implement
 	// dispatch and on a non-eligible fix-up — byte-identical to today.
 	FixupApplyPatches []fixupApplyPatch `json:"fixup_apply_patches,omitempty"`
+
+	// Conflict-resolution pass (E64.62 / #3202): the operator invoked
+	// fishhawk_rebase_run_branch, the base merge conflicted, and the backend
+	// re-opened this implement stage to have the agent resolve the conflict ON
+	// the run branch instead of failing closed. The runner merges the base
+	// LOCALLY, gates the agent's edits to the conflicted hunks, and pushes the
+	// single merge commit itself — it takes NONE of the ordinary implement /
+	// fix-up branch, worktree or verify wiring.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags (conflict_resolution /
+	// conflict_resolution_branch / conflict_resolution_base_ref /
+	// conflict_resolution_expected_head_sha) MUST stay byte-identical to the
+	// runner's upload.FetchedPrompt (runner/internal/upload/upload.go). A tag
+	// drift silently DISABLES the pass — the runner decodes false and takes the
+	// ordinary implement path, and nothing reports that the pass never ran.
+	//
+	// All four are served TOGETHER or not at all: a half-populated instruction
+	// is refused at the resolver, because a runner handed an empty base ref
+	// would merge nothing and refuse naming the wrong cause.
+	ConflictResolution bool `json:"conflict_resolution,omitempty"`
+	// ConflictResolutionBranch is the run branch the pass runs ON.
+	ConflictResolutionBranch string `json:"conflict_resolution_branch,omitempty"`
+	// ConflictResolutionBaseRef is the base branch whose advance conflicts.
+	ConflictResolutionBaseRef string `json:"conflict_resolution_base_ref,omitempty"`
+	// ConflictResolutionExpectedHeadSHA is the run-branch tip the trigger was
+	// anchored to; the runner refuses BEFORE mutating anything on a mismatch.
+	ConflictResolutionExpectedHeadSHA string `json:"conflict_resolution_expected_head_sha,omitempty"`
 	// ScopeExemptions is the operator's exempt_scope_files list (#1229) echoed
 	// on a recovery run's implement stage so the runner's #1151 MissingScopeFiles
 	// shortfall gate subtracts each operator-justified-unchanged declared path —
@@ -1022,6 +1049,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	var fixupBranch string
 	var fixupExpectedHeadSHA string
 	var fixupApplyPatches []fixupApplyPatch
+	var conflictResolution *conflictResolutionTrigger
 	if stage.Type == run.StageTypeImplement {
 		// Run/stage ids for the implement prompt's scope self-exempt sidecar
 		// path (#1153). Populated only on the implement path; plan/review
@@ -1175,6 +1203,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// edits whenever a concern carried only prose and an amendment was
 		// present. An undeclared create still fails category-B at the runner's
 		// #818 gate. No-op for a normal (non-fix-up) implement dispatch.
+		// Conflict-resolution pass (#3202). Resolved BEFORE the fix-up block:
+		// a live trigger makes this dispatch a conflict-resolution pass, and
+		// the runner routes on it ahead of every implement/fix-up path. The
+		// resolver returns nil for a CONSUMED trigger — one a later
+		// stage_conflict_resolution_failed (refused) or conflict_resolution_
+		// pushed (succeeded) entry spent — so an ordinary fix-up that follows
+		// EITHER terminal outcome is served conflict_resolution=false and takes
+		// the unchanged fix-up path.
+		conflictResolution = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
 		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
 			// Routed reporting obligations (#2737) ride the same trigger, derived
@@ -1397,6 +1434,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		FixupBranch:          fixupBranch,
 		FixupExpectedHeadSHA: fixupExpectedHeadSHA,
 		FixupApplyPatches:    fixupApplyPatches,
+	}
+	// Conflict-resolution instruction (#3202). Served as a UNIT: the resolver
+	// already refused a half-populated trigger, so a non-nil value here carries
+	// all three anchors and the runner can route on the flag alone.
+	if conflictResolution != nil {
+		resp.ConflictResolution = true
+		resp.ConflictResolutionBranch = conflictResolution.Branch
+		resp.ConflictResolutionBaseRef = conflictResolution.BaseRef
+		resp.ConflictResolutionExpectedHeadSHA = conflictResolution.ExpectedHeadSHA
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -1685,6 +1731,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	var fixupBranch string
 	var fixupExpectedHeadSHA string
 	var fixupApplyPatches []fixupApplyPatch
+	var conflictResolution *conflictResolutionTrigger
 	if stage.Type == run.StageTypeImplement {
 		// Run/stage ids for the implement prompt's scope self-exempt sidecar
 		// path (#1153). Populated only on the implement path; plan/review
@@ -1809,6 +1856,15 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// matches byte-for-byte — the inherited plan scope.files, allow_create
 		// (#823), and the stage's approved mid-pass scope amendments (#961). No-op
 		// for a normal (non-fix-up) implement dispatch.
+		// Conflict-resolution pass (#3202). Resolved BEFORE the fix-up block:
+		// a live trigger makes this dispatch a conflict-resolution pass, and
+		// the runner routes on it ahead of every implement/fix-up path. The
+		// resolver returns nil for a CONSUMED trigger — one a later
+		// stage_conflict_resolution_failed (refused) or conflict_resolution_
+		// pushed (succeeded) entry spent — so an ordinary fix-up that follows
+		// EITHER terminal outcome is served conflict_resolution=false and takes
+		// the unchanged fix-up path.
+		conflictResolution = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
 		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
 			// Routed reporting obligations (#2737) ride the same trigger, derived
@@ -2018,6 +2074,15 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		FixupBranch:          fixupBranch,
 		FixupExpectedHeadSHA: fixupExpectedHeadSHA,
 		FixupApplyPatches:    fixupApplyPatches,
+	}
+	// Conflict-resolution instruction (#3202). Served as a UNIT: the resolver
+	// already refused a half-populated trigger, so a non-nil value here carries
+	// all three anchors and the runner can route on the flag alone.
+	if conflictResolution != nil {
+		resp.ConflictResolution = true
+		resp.ConflictResolutionBranch = conflictResolution.Branch
+		resp.ConflictResolutionBaseRef = conflictResolution.BaseRef
+		resp.ConflictResolutionExpectedHeadSHA = conflictResolution.ExpectedHeadSHA
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()

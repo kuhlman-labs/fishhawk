@@ -4546,3 +4546,290 @@ func TestHumanReviewGateNextActions_NoReviewRow_ReturnsNil(t *testing.T) {
 		t.Errorf("humanReviewGateNextActions = %+v, want nil with no review row", got)
 	}
 }
+
+// --- E64.62 / #3202: the conflict-resolution pass advisory ---
+
+// crAuditEntry builds a recent-audit entry of a conflict-resolution category.
+func crAuditEntry(category string, seq int64, stageID string, payload any) AuditEntry {
+	e := AuditEntry{Category: category, Sequence: seq, Payload: payload}
+	if stageID != "" {
+		sid := stageID
+		e.StageID = &sid
+	}
+	return e
+}
+
+// TestConflictResolutionCategoriesMatchTheServer pins the duplicated category
+// strings to the server's exported constants. They are read off the WIRE here,
+// so nothing else would catch a rename — and a mismatch would silently make
+// the advisory permanently silent, which is exactly the fail-open direction
+// that hides a regression.
+func TestConflictResolutionCategoriesMatchTheServer(t *testing.T) {
+	if auditCategoryConflictResolutionTriggered != server.CategoryStageConflictResolutionTriggered {
+		t.Errorf("triggered category = %q, want %q",
+			auditCategoryConflictResolutionTriggered, server.CategoryStageConflictResolutionTriggered)
+	}
+	if auditCategoryConflictResolutionFailed != server.CategoryStageConflictResolutionFailed {
+		t.Errorf("failed category = %q, want %q",
+			auditCategoryConflictResolutionFailed, server.CategoryStageConflictResolutionFailed)
+	}
+	if auditCategoryConflictResolutionPushed != server.CategoryConflictResolutionPushed {
+		t.Errorf("pushed category = %q, want %q",
+			auditCategoryConflictResolutionPushed, server.CategoryConflictResolutionPushed)
+	}
+}
+
+// TestConflictResolutionSignalIn_SuccessSettlesThePass is the ROUND-3
+// classifier requirement. The signal read only the trigger/failure pair, so a
+// pass that SUCCEEDED (conflict_resolution_pushed) left the newest entry a
+// trigger and the advisory kept calling a completed pass PENDING — pointing the
+// operator at a wait on a stage that had already gone terminal.
+//
+// The counterfactual vehicle: dropping auditCategoryConflictResolutionPushed
+// from conflictResolutionSignalIn's category filter makes this test go RED.
+func TestConflictResolutionSignalIn_SuccessSettlesThePass(t *testing.T) {
+	stageID := uuid.NewString()
+	got := conflictResolutionSignalIn([]AuditEntry{
+		crAuditEntry(auditCategoryConflictResolutionTriggered, 10, stageID, nil),
+		crAuditEntry(auditCategoryConflictResolutionPushed, 20, stageID,
+			map[string]any{"head_sha": "merge-sha"}),
+	})
+	if !got.Present || !got.Succeeded {
+		t.Fatalf("signal = %+v, want Present+Succeeded for a pushed pass", got)
+	}
+	if got.Triggered || got.Failed {
+		t.Errorf("signal = %+v, want exactly one of Triggered/Failed/Succeeded", got)
+	}
+	if got.StageID != stageID {
+		t.Errorf("stage_id = %q, want %q", got.StageID, stageID)
+	}
+
+	// The other side: a trigger NEWER than a push is live again, so settlement
+	// cannot be implemented as "any push kills every trigger".
+	relive := conflictResolutionSignalIn([]AuditEntry{
+		crAuditEntry(auditCategoryConflictResolutionPushed, 20, stageID, nil),
+		crAuditEntry(auditCategoryConflictResolutionTriggered, 30, stageID, nil),
+	})
+	if !relive.Triggered || relive.Succeeded {
+		t.Errorf("signal = %+v, want the NEWER trigger to win", relive)
+	}
+}
+
+// TestFoldConflictResolutionAdvisory_SucceededPass pins the settlement arm: a
+// completed pass must be relabelled succeeded and must NOT be described as
+// pending, and the appended action must be additive.
+func TestFoldConflictResolutionAdvisory_SucceededPass(t *testing.T) {
+	stageID := uuid.NewString()
+	r := naRun("running")
+	na := &NextActions{State: "implement_running", Actions: []SuggestedAction{{Action: "fishhawk_await_stage"}}}
+	foldConflictResolutionAdvisory(r, []AuditEntry{
+		crAuditEntry(auditCategoryConflictResolutionTriggered, 10, stageID, nil),
+		crAuditEntry(auditCategoryConflictResolutionPushed, 20, stageID,
+			map[string]any{"head_sha": "merge-sha"}),
+	}, na)
+
+	if na.State != "conflict_resolution_pass_succeeded" {
+		t.Fatalf("state = %q, want conflict_resolution_pass_succeeded (NOT pending — the pass is settled)", na.State)
+	}
+	if len(na.Actions) != 2 {
+		t.Fatalf("actions = %d, want the original PLUS one advisory (additive)", len(na.Actions))
+	}
+	got := na.Actions[1]
+	if got.Action != "fishhawk_rebase_run_branch" {
+		t.Errorf("action = %q, want fishhawk_rebase_run_branch", got.Action)
+	}
+	if got.Consumes != consumesNone {
+		t.Errorf("consumes = %q, want none", got.Consumes)
+	}
+	for _, want := range []string{"SUCCEEDED", "SETTLED", "SPENT"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Errorf("reason missing %q: %q", want, got.Reason)
+		}
+	}
+}
+
+// TestConflictResolutionSignalIn covers the classifier, including the
+// ORDER-SENSITIVE pair: the two categories interleave on one stage and which
+// is NEWEST is the whole signal.
+func TestConflictResolutionSignalIn(t *testing.T) {
+	stageID := uuid.NewString()
+	trigger := crAuditEntry(auditCategoryConflictResolutionTriggered, 10, stageID, nil)
+	failure := crAuditEntry(auditCategoryConflictResolutionFailed, 20, stageID,
+		map[string]any{"reason": "conflict_resolution_residual_marker"})
+
+	for _, tc := range []struct {
+		name      string
+		recent    []AuditEntry
+		wantPres  bool
+		wantTrig  bool
+		wantFail  bool
+		wantStage string
+		wantReas  string
+	}{
+		{name: "no entries"},
+		{name: "unrelated entries only", recent: []AuditEntry{{Category: "branch_rebased", Sequence: 5}}},
+		{name: "live trigger", recent: []AuditEntry{trigger},
+			wantPres: true, wantTrig: true, wantStage: stageID},
+		{name: "failure newer than its trigger consumes it",
+			recent:   []AuditEntry{trigger, failure},
+			wantPres: true, wantFail: true, wantStage: stageID,
+			wantReas: "conflict_resolution_residual_marker"},
+		{name: "a NEW trigger after a failure is live again",
+			recent: []AuditEntry{trigger, failure,
+				crAuditEntry(auditCategoryConflictResolutionTriggered, 30, stageID, nil)},
+			wantPres: true, wantTrig: true, wantStage: stageID},
+		{name: "slice order does not decide — sequence does",
+			recent:   []AuditEntry{failure, trigger},
+			wantPres: true, wantFail: true, wantStage: stageID,
+			wantReas: "conflict_resolution_residual_marker"},
+		{name: "non-object payload degrades the reason, not the signal",
+			recent:   []AuditEntry{crAuditEntry(auditCategoryConflictResolutionFailed, 20, stageID, "not-an-object")},
+			wantPres: true, wantFail: true, wantStage: stageID},
+		{name: "entry with no stage id still classifies",
+			recent:   []AuditEntry{crAuditEntry(auditCategoryConflictResolutionTriggered, 10, "", nil)},
+			wantPres: true, wantTrig: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := conflictResolutionSignalIn(tc.recent)
+			if got.Present != tc.wantPres || got.Triggered != tc.wantTrig || got.Failed != tc.wantFail {
+				t.Fatalf("signal = %+v, want present=%v triggered=%v failed=%v",
+					got, tc.wantPres, tc.wantTrig, tc.wantFail)
+			}
+			if got.StageID != tc.wantStage {
+				t.Errorf("stage id = %q, want %q", got.StageID, tc.wantStage)
+			}
+			if got.Reason != tc.wantReas {
+				t.Errorf("reason = %q, want %q", got.Reason, tc.wantReas)
+			}
+		})
+	}
+}
+
+// TestFoldConflictResolutionAdvisory covers the three arms — a triggered pass,
+// a failed pass and no pass — plus the nil guards. The no-pass arm asserts the
+// block is left DEEP-EQUAL to its unfolded value, which is what keeps every
+// ordinary run byte-identical.
+func TestFoldConflictResolutionAdvisory(t *testing.T) {
+	stageID := uuid.NewString()
+
+	t.Run("triggered pass appends a wait and relabels", func(t *testing.T) {
+		r := naRun("running")
+		na := &NextActions{State: "implement_running", Actions: []SuggestedAction{{Action: "fishhawk_await_stage"}}}
+		foldConflictResolutionAdvisory(r, []AuditEntry{
+			crAuditEntry(auditCategoryConflictResolutionTriggered, 10, stageID, nil)}, na)
+
+		if na.State != "conflict_resolution_pass_pending" {
+			t.Errorf("state = %q, want conflict_resolution_pass_pending", na.State)
+		}
+		if len(na.Actions) != 2 {
+			t.Fatalf("actions = %d, want the original PLUS one advisory (additive, never replacing)", len(na.Actions))
+		}
+		got := na.Actions[1]
+		if got.Action != "fishhawk_await_stage" {
+			t.Errorf("action = %q, want fishhawk_await_stage — a wait, not a second dispatch", got.Action)
+		}
+		if got.Params["stage_id"] != stageID || got.Params["run_id"] != r.ID {
+			t.Errorf("params = %v, want the re-opened stage and run", got.Params)
+		}
+		if got.Consumes != consumesNone {
+			t.Errorf("consumes = %q, want none", got.Consumes)
+		}
+		if !strings.Contains(got.Reason, "NOTHING was written") ||
+			!strings.Contains(got.Reason, "fishhawk_rebase_run_branch") {
+			t.Errorf("reason must state nothing was written and name the re-invocation: %q", got.Reason)
+		}
+	})
+
+	t.Run("failed pass names the refusal and the fallback", func(t *testing.T) {
+		r := naRun("running")
+		na := &NextActions{State: "succeeded_pr_open"}
+		foldConflictResolutionAdvisory(r, []AuditEntry{
+			crAuditEntry(auditCategoryConflictResolutionTriggered, 10, stageID, nil),
+			crAuditEntry(auditCategoryConflictResolutionFailed, 20, stageID,
+				map[string]any{"reason": "conflict_resolution_outside_hunk"}),
+		}, na)
+
+		if na.State != "conflict_resolution_pass_failed" {
+			t.Errorf("state = %q, want conflict_resolution_pass_failed", na.State)
+		}
+		if len(na.Actions) != 1 {
+			t.Fatalf("actions = %d, want one advisory", len(na.Actions))
+		}
+		got := na.Actions[0]
+		if got.Action != "fishhawk_rebase_run_branch" {
+			t.Errorf("action = %q, want fishhawk_rebase_run_branch", got.Action)
+		}
+		for _, want := range []string{
+			"conflict_resolution_outside_hunk", "SPENT", "fishhawk_vouch_commit",
+		} {
+			if !strings.Contains(got.Reason, want) {
+				t.Errorf("reason missing %q: %q", want, got.Reason)
+			}
+		}
+	})
+
+	t.Run("failed pass with no recorded reason still advises", func(t *testing.T) {
+		r := naRun("running")
+		na := &NextActions{State: "succeeded_pr_open"}
+		foldConflictResolutionAdvisory(r, []AuditEntry{
+			crAuditEntry(auditCategoryConflictResolutionFailed, 20, stageID, nil)}, na)
+		if len(na.Actions) != 1 || !strings.Contains(na.Actions[0].Reason, "fishhawk_vouch_commit") {
+			t.Errorf("a failure with no decodable reason must still name the fallback: %+v", na.Actions)
+		}
+	})
+
+	t.Run("no conflict-resolution entry is a byte-identical no-op", func(t *testing.T) {
+		r := naRun("running")
+		base := &NextActions{State: "succeeded_pr_open", Actions: []SuggestedAction{{Action: "fishhawk_merge_run"}}}
+		want := &NextActions{State: "succeeded_pr_open", Actions: []SuggestedAction{{Action: "fishhawk_merge_run"}}}
+		foldConflictResolutionAdvisory(r, []AuditEntry{{Category: "branch_rebased", Sequence: 3}}, base)
+		if !reflect.DeepEqual(base, want) {
+			t.Errorf("fold mutated the block with no conflict-resolution entry:\ngot  %+v\nwant %+v", base, want)
+		}
+		foldConflictResolutionAdvisory(r, nil, base)
+		if !reflect.DeepEqual(base, want) {
+			t.Errorf("fold mutated the block on a nil recent slice (the fail-open degrade):\ngot  %+v\nwant %+v", base, want)
+		}
+	})
+
+	t.Run("nil guards", func(t *testing.T) {
+		recent := []AuditEntry{crAuditEntry(auditCategoryConflictResolutionTriggered, 10, stageID, nil)}
+		foldConflictResolutionAdvisory(nil, recent, &NextActions{}) // must not panic
+		foldConflictResolutionAdvisory(naRun("running"), recent, nil)
+		na := &NextActions{State: "x"}
+		foldConflictResolutionAdvisory(nil, recent, na)
+		if na.State != "x" {
+			t.Errorf("state = %q, want unchanged on a nil run", na.State)
+		}
+	})
+}
+
+// TestConflictResolutionAdvisoryFoldedAtBothCallSites is the BOTH-CALL-SITES
+// pin (binding approval condition 2). getRunStatus and run_stage build their
+// next_actions block independently, so a fold wired at only one of them makes
+// the status surface and the post-stage surface disagree about whether a pass
+// is pending or its budget is spent — the divergence #3222 established as a
+// defect on the sibling acceptance advisory. Nothing else would catch it: both
+// surfaces compile and both return a valid block.
+func TestConflictResolutionAdvisoryFoldedAtBothCallSites(t *testing.T) {
+	for _, tc := range []struct{ path, call string }{
+		{"tools.go", "foldConflictResolutionAdvisory(runRow, recent, nextActions)"},
+		{"run_stage.go", "foldConflictResolutionAdvisory(&runView.Run, recentAudit, nextActions)"},
+	} {
+		body, err := os.ReadFile(tc.path)
+		if err != nil {
+			t.Fatalf("read %s: %v", tc.path, err)
+		}
+		src := string(body)
+		if !strings.Contains(src, "foldConflictResolutionAdvisory(") {
+			t.Errorf("%s does not call foldConflictResolutionAdvisory; the two next_actions surfaces would disagree about a conflict-resolution pass", tc.path)
+			continue
+		}
+		// It must be fed the SAME recent-audit slice the sibling acceptance
+		// fold already consumes — a fold handed a different (or empty) slice
+		// would degrade to permanent silence rather than to the truth.
+		if !strings.Contains(src, tc.call) {
+			t.Errorf("%s must call %q — the fold has to see the recent-audit slice already fetched for the acceptance fold", tc.path, tc.call)
+		}
+	}
+}

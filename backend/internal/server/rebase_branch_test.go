@@ -862,17 +862,108 @@ func TestRebaseRunBranch_RunNotFound(t *testing.T) {
 
 // --- REFUSAL RULE (b): DISCOVERED by the merges endpoint ---
 
-// TestRebaseRunBranch_Conflict is COUNTERFACTUAL c5's vehicle: the merges
-// endpoint is hardwired to 409 BY CONSTRUCTION, so deleting the
-// errors.Is(err, githubclient.ErrMergeConflict) branch collapses this to a
-// 502 rebase_merge_failed and drops the fishhawk_reset_run_branch cross-link.
-// Rule (b) applies: EXACTLY ONE merge POST occurred and nothing was written
-// after it.
-func TestRebaseRunBranch_Conflict(t *testing.T) {
+// conflictRebaseStub is the standard CONFLICTING stub: the run branch is
+// behind, and the merges endpoint answers 409.
+func conflictRebaseStub() *rebaseGitHub {
 	stub := cleanRebaseStub()
 	stub.mergeStatus = http.StatusConflict
 	stub.mergeBody = `{"message":"Merge conflict"}`
-	sd := seedRebaseRun(t, stub, rebaseOpts{})
+	return stub
+}
+
+// assertConflictWroteNothingToTheBranch is the trigger arm's sibling of
+// refusal rule (b). EXACTLY ONE merge POST occurred (that is how the conflict
+// is discovered) and nothing that would touch the BRANCH followed it: no
+// branch_rebased entry and no check re-post. Deliberately NOT
+// assertMergeAttemptedNothingWritten, which also forbids a re-park to
+// pending — on the 202 arm the re-park is the whole point.
+func assertConflictWroteNothingToTheBranch(t *testing.T, sd *rebaseSeed) {
+	t.Helper()
+	if m := sd.stub.merges(); len(m) != 1 {
+		t.Errorf("merge POSTs = %d, want exactly 1 (the conflict is discovered BY the merges endpoint)", len(m))
+	}
+	if a := branchRebasedAudit(sd.au); a != nil {
+		t.Error("branch_rebased audit entry written on a conflict — nothing was merged")
+	}
+	if p := checkPublications(sd.creator); len(p) != 0 {
+		t.Errorf("check publications = %v, want none on a conflict", p)
+	}
+}
+
+// TestRebaseRunBranch_ConflictTriggersPass is the 202 TRIGGER ARM (E64.62 /
+// #3202) and remains COUNTERFACTUAL c5's vehicle: the merges endpoint is
+// hardwired to 409 BY CONSTRUCTION, so deleting the
+// errors.Is(merr, forge.ErrMergeConflict) branch collapses this to a 502
+// rebase_merge_failed and no pass is ever authorized.
+func TestRebaseRunBranch_ConflictTriggersPass(t *testing.T) {
+	sd := seedRebaseRun(t, conflictRebaseStub(), rebaseOpts{})
+	impl := crImplementStage(t, sd)
+
+	w := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	var got rebaseBranchResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode 202 body: %v\n%s", err, w.Body.String())
+	}
+	if !got.ConflictResolutionTriggered {
+		t.Error("202 body must carry conflict_resolution_triggered — without it the result is shaped exactly like a success with an empty head")
+	}
+	if got.ConflictResolutionStageID != impl.ID.String() {
+		t.Errorf("conflict_resolution_stage_id = %q, want the re-opened implement stage %s",
+			got.ConflictResolutionStageID, impl.ID)
+	}
+	if got.ConflictResolutionPass != 1 {
+		t.Errorf("conflict_resolution_pass = %d, want 1", got.ConflictResolutionPass)
+	}
+	if !strings.Contains(got.ConflictResolutionNote, "NOTHING was written") {
+		t.Errorf("conflict_resolution_note must state that nothing was written: %q", got.ConflictResolutionNote)
+	}
+	if !strings.Contains(got.ConflictResolutionNote, "fishhawk_await_stage") {
+		t.Errorf("conflict_resolution_note must name the await-then-re-invoke route: %q", got.ConflictResolutionNote)
+	}
+	// A 202 must never look like an advance.
+	if got.NewHeadSHA != "" || got.MergeCommitSHA != "" {
+		t.Errorf("202 reported new_head_sha=%q merge_commit_sha=%q, want both empty", got.NewHeadSHA, got.MergeCommitSHA)
+	}
+
+	if n := len(auditEntries(sd.au, CategoryStageConflictResolutionTriggered)); n != 1 {
+		t.Errorf("stage_conflict_resolution_triggered entries = %d, want 1", n)
+	}
+	if impl.State != run.StageStatePending {
+		t.Errorf("implement stage state = %q, want pending (re-opened for the pass)", impl.State)
+	}
+	assertConflictWroteNothingToTheBranch(t, sd)
+}
+
+// TestRebaseRunBranch_ConflictConsumesNoFixupBudget pins the issue's second
+// acceptance criterion structurally: a triggered pass writes its OWN category
+// and the fix-up counter is unmoved.
+func TestRebaseRunBranch_ConflictConsumesNoFixupBudget(t *testing.T) {
+	sd := seedRebaseRun(t, conflictRebaseStub(), rebaseOpts{})
+
+	w := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(auditEntries(sd.au, CategoryStageFixupTriggered)); n != 0 {
+		t.Errorf("stage_fixup_triggered entries = %d, want 0 — the pass has its OWN budget", n)
+	}
+}
+
+// TestRebaseRunBranch_ConflictBudgetSpentFailsClosed: with the ceiling-of-one
+// already spent by a REFUSED pass, the conflict arm returns to TODAY'S
+// fail-closed 422, now naming the failed pass, its refusal reason and the
+// resolve-push-vouch route. Rule (b) applies in full — including no re-park,
+// because no second pass is started.
+func TestRebaseRunBranch_ConflictBudgetSpentFailsClosed(t *testing.T) {
+	sd := seedRebaseRun(t, conflictRebaseStub(), rebaseOpts{})
+	impl := crImplementStage(t, sd)
+	seedConflictTrigger(sd, impl.ID, 1)
+	seedConflictFailure(sd, impl.ID, 1, "conflict_resolution_residual_marker")
 
 	w := postRebaseBranch(t, sd.s, sd.runID,
 		rebaseBranchRequest{Confirm: true}, withRebaseOperator)
@@ -880,20 +971,87 @@ func TestRebaseRunBranch_Conflict(t *testing.T) {
 		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, "rebase_conflict") {
-		t.Errorf("body missing rebase_conflict: %s", body)
+	for _, want := range []string{
+		"rebase_conflict",
+		"NOTHING was written",
+		"Conflict-resolution pass 1 already ran and was REFUSED",
+		"conflict_resolution_residual_marker",
+		"fishhawk_vouch_commit",
+		"fishhawk_reset_run_branch",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the budget-spent refusal must contain %q:\n%s", want, body)
+		}
 	}
-	// SHIPPED-MESSAGE / CROSS-LINK PINS — none of these is compiler-enforced.
-	if !strings.Contains(body, "fishhawk_reset_run_branch") {
-		t.Errorf("the conflict refusal must cross-link the sibling verb: %s", body)
-	}
-	if !strings.Contains(body, "#3202") {
-		t.Errorf("the conflict refusal must name the deferred agent-resolution issue: %s", body)
-	}
-	if !strings.Contains(body, "NOTHING was written") {
-		t.Errorf("the conflict refusal must state that nothing was written: %s", body)
+	if n := len(auditEntries(sd.au, CategoryStageConflictResolutionTriggered)); n != 1 {
+		t.Errorf("trigger entries = %d, want 1 (the seeded one) — the ceiling must not authorize a second pass", n)
 	}
 	assertMergeAttemptedNothingWritten(t, sd)
+	if impl.State != run.StageStateSucceeded {
+		t.Errorf("implement stage state = %q, want succeeded (untouched at the ceiling)", impl.State)
+	}
+}
+
+// TestRebaseRunBranch_ConflictNoPassStartableFailsClosed: a run with no
+// implement stage cannot host a pass at all, so the conflict arm keeps today's
+// fail-closed 422 on the FIRST invocation.
+func TestRebaseRunBranch_ConflictNoPassStartableFailsClosed(t *testing.T) {
+	sd := seedRebaseRun(t, conflictRebaseStub(), rebaseOpts{})
+	sd.rr.stagesByRunID[sd.runID] = []*run.Stage{sd.review}
+
+	w := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "no implement stage") {
+		t.Errorf("the refusal must name why no pass was startable:\n%s", body)
+	}
+	if !strings.Contains(body, "fishhawk_vouch_commit") {
+		t.Errorf("the refusal must name the fallback route:\n%s", body)
+	}
+	if n := len(auditEntries(sd.au, CategoryStageConflictResolutionTriggered)); n != 0 {
+		t.Errorf("trigger entries = %d, want 0", n)
+	}
+	assertMergeAttemptedNothingWritten(t, sd)
+}
+
+// TestRebaseRunBranch_SuccessfulResolutionFallsIntoSharedTail: once the pass
+// has pushed its merge commit the run branch CONTAINS the base, so re-invoking
+// the verb takes the behind-probe short-circuit and still runs the shared
+// re-park + audit + republish tail — which is what makes the
+// await-then-re-invoke route the 202 advertises genuinely true.
+func TestRebaseRunBranch_SuccessfulResolutionFallsIntoSharedTail(t *testing.T) {
+	sd := seedRebaseRun(t, upToDateRebaseStub(), rebaseOpts{})
+
+	w := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var got rebaseBranchResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if !got.AlreadyUpToDate {
+		t.Error("want already_up_to_date on the post-resolution re-invocation")
+	}
+	if got.ConflictResolutionTriggered {
+		t.Error("a short-circuited re-invocation must not report a conflict-resolution trigger")
+	}
+	if len(sd.stub.merges()) != 0 {
+		t.Error("the behind-probe must short-circuit the merge once the branch contains the base")
+	}
+	if a := branchRebasedAudit(sd.au); a == nil {
+		t.Error("the shared tail must still append branch_rebased")
+	}
+	if p := checkPublications(sd.creator); len(p) != 1 {
+		t.Errorf("check publications = %v, want the audit-complete check re-posted at the resulting head", p)
+	}
+	if n := len(auditEntries(sd.au, CategoryStageConflictResolutionTriggered)); n != 0 {
+		t.Errorf("trigger entries = %d, want 0 — a clean advance authorizes no pass", n)
+	}
 }
 
 // TestRebaseRunBranch_MergeFailed: any non-conflict merge error → 502

@@ -12776,3 +12776,174 @@ func TestPromptBuildError_Mapping(t *testing.T) {
 		})
 	}
 }
+
+// --- conflict-resolution instruction (E64.62 / #3202) ---
+
+func conflictTriggerEntry(runID, stageID uuid.UUID, seq int64, branch, baseRef, head string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"branch": branch, "base_ref": baseRef, "expected_head_sha": head, "pass": 1,
+		"prior_state": "succeeded",
+	})
+	sid := stageID
+	rid := runID
+	return &audit.Entry{
+		Sequence: seq, RunID: &rid, StageID: &sid,
+		Category: CategoryStageConflictResolutionTriggered, Payload: payload,
+	}
+}
+
+func conflictFailedEntry(runID, stageID uuid.UUID, seq int64) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{"stage_id": stageID.String(), "reason": "conflict_resolution_residual_marker"})
+	sid := stageID
+	rid := runID
+	return &audit.Entry{
+		Sequence: seq, RunID: &rid, StageID: &sid,
+		Category: CategoryStageConflictResolutionFailed, Payload: payload,
+	}
+}
+
+// promptWithConflictEntries drives the real /prompt handler for an implement
+// stage whose run carries the given audit entries, and returns the decoded
+// response.
+func promptWithConflictEntries(t *testing.T, entries func(runID, stageID uuid.UUID) []*audit.Entry) promptResponse {
+	t.Helper()
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	implStageID := uuid.New()
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: art,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{runID: entries(runID, implStageID)}},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return resp
+}
+
+// TestGetStagePrompt_ServesConflictResolutionInstruction is the cross-boundary
+// serve assertion: the four conflict_resolution wire fields must be served FROM
+// THE TRIGGER PAYLOAD. A tag or resolver drift silently DISABLES the pass — the
+// runner decodes false, takes the ordinary implement path, and nothing reports
+// that the pass never ran.
+func TestGetStagePrompt_ServesConflictResolutionInstruction(t *testing.T) {
+	resp := promptWithConflictEntries(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{conflictTriggerEntry(runID, stageID, 1, "fishhawk/run-1", "release/1.2", "head1")}
+	})
+	if !resp.ConflictResolution {
+		t.Fatal("conflict_resolution = false, want true for a stage with a live trigger")
+	}
+	if resp.ConflictResolutionBranch != "fishhawk/run-1" {
+		t.Errorf("branch = %q", resp.ConflictResolutionBranch)
+	}
+	if resp.ConflictResolutionBaseRef != "release/1.2" {
+		t.Errorf("base_ref = %q", resp.ConflictResolutionBaseRef)
+	}
+	if resp.ConflictResolutionExpectedHeadSHA != "head1" {
+		t.Errorf("expected_head_sha = %q", resp.ConflictResolutionExpectedHeadSHA)
+	}
+}
+
+// TestGetStagePrompt_ConsumedConflictTriggerIsNotServed is the end-to-end
+// consumption assertion: after a refused pass, an ordinary later fix-up on the
+// same stage must be served conflict_resolution=false. Round 1's omission of
+// the failed-entry comparison hijacked that fix-up into a conflict-resolution
+// pass against a repository that was not mid-merge.
+func TestGetStagePrompt_ConsumedConflictTriggerIsNotServed(t *testing.T) {
+	resp := promptWithConflictEntries(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{
+			conflictTriggerEntry(runID, stageID, 1, "fishhawk/run-1", "main", "head1"),
+			conflictFailedEntry(runID, stageID, 2),
+		}
+	})
+	if resp.ConflictResolution {
+		t.Fatalf("consumed trigger served: branch=%q head=%q",
+			resp.ConflictResolutionBranch, resp.ConflictResolutionExpectedHeadSHA)
+	}
+	if resp.ConflictResolutionBranch != "" || resp.ConflictResolutionBaseRef != "" ||
+		resp.ConflictResolutionExpectedHeadSHA != "" {
+		t.Errorf("stale anchors served alongside conflict_resolution=false: %+v", resp)
+	}
+}
+
+// conflictPushedEntry builds the terminal SUCCESS marker
+// succeedConflictResolutionPushStage writes, under the SAME exported constant
+// that handler uses.
+func conflictPushedEntry(runID, stageID uuid.UUID, seq int64, head string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"run_id": runID.String(), "stage_id": stageID.String(),
+		"branch": "fishhawk/run-1", "head_sha": head, "base_sha": "pre", "files_changed_count": 2,
+	})
+	sid := stageID
+	rid := runID
+	return &audit.Entry{
+		Sequence: seq, RunID: &rid, StageID: &sid,
+		Category: CategoryConflictResolutionPushed, Payload: payload,
+	}
+}
+
+// TestGetStagePrompt_SucceededPassConsumesTriggerForLaterFixup is the ROUND-3
+// successful-pass-then-ordinary-fix-up regression, driven through the REAL
+// /prompt handler. Round 2 keyed consumption on the failure entry alone, so
+// after a pass that SUCCEEDED the next ordinary fix-up dispatch on the same
+// implement stage was still served conflict_resolution=true — with anchors
+// naming a merge already committed and pushed, against a repository that is not
+// mid-merge. It is the same hijack the failure comparison closes, reached
+// through the HAPPY path, which is why no failure-side test could catch it.
+func TestGetStagePrompt_SucceededPassConsumesTriggerForLaterFixup(t *testing.T) {
+	resp := promptWithConflictEntries(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{
+			conflictTriggerEntry(runID, stageID, 1, "fishhawk/run-1", "main", "head1"),
+			conflictPushedEntry(runID, stageID, 2, "merge-sha"),
+		}
+	})
+	if resp.ConflictResolution {
+		t.Fatalf("trigger served after a SUCCESSFUL pass: branch=%q head=%q",
+			resp.ConflictResolutionBranch, resp.ConflictResolutionExpectedHeadSHA)
+	}
+	if resp.ConflictResolutionBranch != "" || resp.ConflictResolutionBaseRef != "" ||
+		resp.ConflictResolutionExpectedHeadSHA != "" {
+		t.Errorf("stale anchors served alongside conflict_resolution=false: %+v", resp)
+	}
+}
+
+// TestGetStagePrompt_TriggerAfterASucceededPassIsStillServed is the other side:
+// a trigger NEWER than the push is live, so consumption cannot be implemented
+// as "any conflict_resolution_pushed entry kills every trigger".
+func TestGetStagePrompt_TriggerAfterASucceededPassIsStillServed(t *testing.T) {
+	resp := promptWithConflictEntries(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{
+			conflictTriggerEntry(runID, stageID, 1, "fishhawk/run-1", "main", "old"),
+			conflictPushedEntry(runID, stageID, 2, "merge-sha"),
+			conflictTriggerEntry(runID, stageID, 3, "fishhawk/run-1", "main", "new"),
+		}
+	})
+	if !resp.ConflictResolution || resp.ConflictResolutionExpectedHeadSHA != "new" {
+		t.Fatalf("newer trigger not served: %+v", resp)
+	}
+}
+
+// TestGetStagePrompt_NoConflictTriggerServesNothing pins the byte-identical
+// default for an ordinary implement dispatch.
+func TestGetStagePrompt_NoConflictTriggerServesNothing(t *testing.T) {
+	resp := promptWithConflictEntries(t, func(uuid.UUID, uuid.UUID) []*audit.Entry { return nil })
+	if resp.ConflictResolution || resp.ConflictResolutionBranch != "" {
+		t.Fatalf("ordinary dispatch served a pass: %+v", resp)
+	}
+}
