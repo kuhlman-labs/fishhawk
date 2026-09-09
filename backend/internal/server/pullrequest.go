@@ -309,8 +309,28 @@ func (p *pullRequestBody) validate() error {
 		}
 		return nil
 	}
+	// Conflict-resolution push success variant (E64.62 / #3202): a bounded
+	// conflict-resolution pass merged the advanced base locally, passed the
+	// confinement gate, committed the single merge commit and PUSHED it to the
+	// EXISTING PR branch. Same shape as the fixup_pushed variant — no
+	// pr_number/pr_url; require the commit coordinates so the audit entry pins
+	// what landed. This arm is what makes the pass TERMINAL: without it the
+	// closed allow-list below rejects the report, the stage never leaves
+	// `running`, and the run strands — precisely the failure the pass exists to
+	// remove.
+	if p.Outcome == "conflict_resolution_pushed" {
+		switch {
+		case p.Branch == "":
+			return errors.New("branch is required for a conflict_resolution_pushed outcome")
+		case p.HeadSHA == "":
+			return errors.New("head_sha is required for a conflict_resolution_pushed outcome")
+		case p.BaseSHA == "":
+			return errors.New("base_sha is required for a conflict_resolution_pushed outcome")
+		}
+		return nil
+	}
 	if p.Outcome != "" {
-		return fmt.Errorf("outcome must be \"failed\", \"pushed\", \"fixup_pushed\", \"fixup_no_changes\", or \"scope_park\" when set, got %q", p.Outcome)
+		return fmt.Errorf("outcome must be \"failed\", \"pushed\", \"fixup_pushed\", \"fixup_no_changes\", \"scope_park\", or \"conflict_resolution_pushed\" when set, got %q", p.Outcome)
 	}
 	switch {
 	case p.PRNumber <= 0:
@@ -510,6 +530,18 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// in-band operator exempt-or-fail decision. No PR artifact.
 	if pr.Outcome == "scope_park" {
 		s.parkScopeCompletenessStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
+		return
+	}
+
+	// Conflict-resolution push success variant (#3202): a bounded
+	// conflict-resolution pass pushed its single merge commit to the EXISTING
+	// PR branch. Drive the stage's terminal transition, re-park the review gate
+	// (the merge commit is new code that must be reviewed), write a
+	// conflict_resolution_pushed audit entry, and respond 200. No PR artifact
+	// and no pull_request_url backfill — the PR already exists and tracks this
+	// branch.
+	if pr.Outcome == "conflict_resolution_pushed" {
+		s.succeedConflictResolutionPushStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
 		return
 	}
 
@@ -1488,7 +1520,19 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	// case) returns false and the orchestrator Advance runs unchanged. The
 	// pull_request_failed audit entry is still written either way — it is the
 	// honest record that the commit/push/PR-open step failed.
-	recovered := s.maybeRecoverFixupFailure(r.Context(), runID, stage.ID)
+	// Conflict-resolution recovery (#3202) runs FIRST, ahead of the fix-up
+	// recovery. A stage can carry BOTH trigger categories (an ordinary fix-up
+	// earlier, a conflict-resolution pass now), and the two read DIFFERENT
+	// restore anchors from their own trigger payloads. Consulting the fix-up
+	// anchor first would restore this failed pass from the STALE fix-up
+	// trigger's prior_state and re-parked review stage. maybeRecover-
+	// ConflictResolutionFailure returns false whenever there is no LIVE
+	// conflict-resolution trigger (including one a prior failure already
+	// consumed), so an ordinary fix-up failure falls through unchanged.
+	recovered := s.maybeRecoverConflictResolutionFailure(r.Context(), runID, stage.ID, pr.Reason)
+	if !recovered {
+		recovered = s.maybeRecoverFixupFailure(r.Context(), runID, stage.ID)
+	}
 
 	// Advance the run so the orchestrator walks it forward — without this the
 	// run stays pending/running after the stage fails. Best-effort, mirroring
@@ -1680,4 +1724,93 @@ func (s *Server) closePRAfterGatingReject(r *http.Request, runID uuid.UUID,
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// pullRequestConflictResolutionResponse is the 200 body for the
+// conflict-resolution push variant (E64.62 / #3202): the pass's single merge
+// commit landed on the existing PR branch and the stage transitioned
+// terminally.
+type pullRequestConflictResolutionResponse struct {
+	StageID uuid.UUID `json:"stage_id"`
+	Outcome string    `json:"outcome"`
+	Branch  string    `json:"branch"`
+	HeadSHA string    `json:"head_sha"`
+}
+
+// succeedConflictResolutionPushStage handles the conflict-resolution push
+// success variant (#3202): a bounded conflict-resolution pass merged the
+// advanced base locally, passed the confinement gate, committed one merge
+// commit and pushed it to the EXISTING PR branch after the trace gate left the
+// stage in `running`.
+//
+// It drives the running → terminal transition via advanceImplementStageAfterPR
+// (which re-parks the review gate pending → awaiting_approval — the merge
+// commit is new code and a mechanical resolution is not a substitute for
+// review), writes a conflict_resolution_pushed audit entry, fires the sticky
+// status comment and responds 200. No PR artifact and no pull_request_url
+// backfill: the PR already exists and tracks this branch.
+//
+// Structurally this mirrors succeedFixupNoChangesStage's stage-keyed
+// idempotency rather than succeedFixupPushStage's head-keyed dedup, because the
+// pass has a ceiling of one and its report is stage-unique: a runner retry
+// after a 5xx must not append a second entry or re-fire the status comment.
+// Fail-open on a read error — a transient listing failure must never drop the
+// report the stage's terminal transition depends on.
+func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
+	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
+	stageID := stage.ID
+
+	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, "conflict_resolution_pushed"); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"conflict-resolution push report: list conflict_resolution_pushed audit entries failed; proceeding without idempotency guard",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	} else if auditEntryForStage(entries, stageID) {
+		s.writeJSON(w, r, http.StatusOK, pullRequestConflictResolutionResponse{
+			StageID: stageID,
+			Outcome: "conflict_resolution_pushed",
+			Branch:  pr.Branch,
+			HeadSHA: pr.HeadSHA,
+		})
+		return
+	}
+
+	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
+		s.advanceImplementStageAfterPR(r, runID, stage)
+	}
+
+	auditPayload, _ := json.Marshal(map[string]any{
+		"run_id":              runID.String(),
+		"stage_id":            stageID.String(),
+		"branch":              pr.Branch,
+		"head_sha":            pr.HeadSHA,
+		"base_sha":            pr.BaseSHA,
+		"files_changed_count": pr.FilesChangedCount,
+		"auth_method":         authMethod,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     "conflict_resolution_pushed",
+		ActorKind:    &actorKind,
+		ActorSubject: actorSubject,
+		Payload:      auditPayload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"conflict-resolution push report: append audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+
+	s.notifyStatusUpdate(r.Context(), runID, "conflict_resolution_pushed")
+
+	s.writeJSON(w, r, http.StatusOK, pullRequestConflictResolutionResponse{
+		StageID: stageID,
+		Outcome: "conflict_resolution_pushed",
+		Branch:  pr.Branch,
+		HeadSHA: pr.HeadSHA,
+	})
 }

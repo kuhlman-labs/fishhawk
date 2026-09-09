@@ -3323,3 +3323,234 @@ func TestNormalizePRBodyFallbackReason_ClosedSet(t *testing.T) {
 		}
 	}
 }
+
+// --- conflict-resolution push report (E64.62 / #3202) ---
+
+// TestShipPullRequest_ConflictResolutionPushed_DrivesTerminal is BINDING
+// CONDITION 1. The handler validates `outcome` against a CLOSED allow-list; if
+// the runner ships conflict_resolution_pushed and the allow-list and its
+// dispatch switch are not extended in the SAME slice, the report is rejected,
+// the stage never leaves `running`, and the run strands — precisely the failure
+// this whole change exists to remove.
+//
+// It therefore drives the bytes the RUNNER SERIALIZES (upload.go's
+// pullRequestChildPushBody shape for the conflict_resolution_pushed outcome)
+// through the REAL backend handler and asserts the resulting STAGE STATE, not a
+// parsed struct. Separate encode and decode tests do not discharge this.
+func TestShipPullRequest_ConflictResolutionPushed_DrivesTerminal(t *testing.T) {
+	s, sf, ar, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	// The exact key set the runner marshals for this outcome.
+	body := []byte(`{"outcome":"conflict_resolution_pushed","branch":"fishhawk/run-aaaaaaaa","head_sha":"merge-sha","base_sha":"pre-merge-sha","files_changed_count":2}`)
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a rejected report strands the stage in running):\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State == run.StageStateRunning {
+		t.Fatal("stage.State = running — the conflict-resolution report did not settle the stage (the strand this change removes)")
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want awaiting_approval (the merge commit must go back through the review gate)", got.State)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 (no PR artifact — the PR already exists)", len(ar.all))
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found bool
+	for _, e := range au.appended {
+		if e.Category == "conflict_resolution_pushed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("no conflict_resolution_pushed audit entry recorded")
+	}
+}
+
+// TestShipPullRequest_ConflictResolutionPushed_IsIdempotent pins the
+// stage-keyed guard: a runner retry after a 5xx must not append a second entry.
+func TestShipPullRequest_ConflictResolutionPushed_IsIdempotent(t *testing.T) {
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body := []byte(`{"outcome":"conflict_resolution_pushed","branch":"b","head_sha":"h","base_sha":"p","files_changed_count":1}`)
+	for i := 0; i < 2; i++ {
+		if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, ""); w.Code != http.StatusOK {
+			t.Fatalf("delivery %d: status = %d:\n%s", i, w.Code, w.Body.String())
+		}
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for _, e := range au.appended {
+		if e.Category == "conflict_resolution_pushed" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("conflict_resolution_pushed entries = %d, want exactly 1", n)
+	}
+}
+
+// TestPullRequestBody_ConflictResolutionValidation pins each required-field
+// guard of the new allow-list arm by its own message, and pins that the
+// catch-all still refuses an outcome outside the set.
+func TestPullRequestBody_ConflictResolutionValidation(t *testing.T) {
+	full := pullRequestBody{Outcome: "conflict_resolution_pushed", Branch: "b", HeadSHA: "h", BaseSHA: "p"}
+	if err := full.validate(); err != nil {
+		t.Fatalf("fully populated body rejected: %v", err)
+	}
+	cases := []struct {
+		name  string
+		mut   func(*pullRequestBody)
+		wants string
+	}{
+		{"branch", func(p *pullRequestBody) { p.Branch = "" }, "branch is required for a conflict_resolution_pushed outcome"},
+		{"head_sha", func(p *pullRequestBody) { p.HeadSHA = "" }, "head_sha is required for a conflict_resolution_pushed outcome"},
+		{"base_sha", func(p *pullRequestBody) { p.BaseSHA = "" }, "base_sha is required for a conflict_resolution_pushed outcome"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := full
+			tc.mut(&b)
+			err := b.validate()
+			if err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.wants)
+			}
+		})
+	}
+	t.Run("unknown_outcome_still_refused", func(t *testing.T) {
+		b := pullRequestBody{Outcome: "conflict_resolution", Branch: "b", HeadSHA: "h", BaseSHA: "p"}
+		err := b.validate()
+		if err == nil || !strings.Contains(err.Error(), "conflict_resolution_pushed") {
+			t.Fatalf("err = %v, want the closed allow-list refusal naming the accepted set", err)
+		}
+	})
+}
+
+// TestFailPullRequestStage_ConflictResolutionRecoveryPrecedesFixup pins the
+// ORDERING in failPullRequestStage (#3202). A stage can carry BOTH trigger
+// categories — an ordinary fix-up earlier, a conflict-resolution pass now — and
+// the two recoveries read DIFFERENT restore anchors from their own trigger
+// payloads. Consulting the fix-up anchor first restores this failed pass from
+// the STALE fix-up trigger's prior_state and re-parked review stage.
+//
+// The two anchors are made DISCRIMINATING by construction: the fix-up trigger
+// names prior_state=awaiting_approval, the conflict-resolution trigger names
+// succeeded. The assertion reads the stage state back, so the ordering is
+// observable in committed state rather than in a returned error (which is
+// byte-identical either way).
+func TestFailPullRequestStage_ConflictResolutionRecoveryPrecedesFixup(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newSequencedAuditFake()
+	sf := newSigningFake()
+	s := New(Config{
+		Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: newFakeArtifactRepo(),
+		AuditRepo: au, RunRepo: rr, Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	runRow := rr.seedRun()
+	impl := rr.seedStage(runRow.ID, 1, run.StageStateRunning)
+	review := rr.seedStage(runRow.ID, 2, run.StageStatePending)
+	rr.mu.Lock()
+	impl.Type = run.StageTypeImplement
+	review.Type = run.StageTypeReview
+	rr.mu.Unlock()
+
+	// The STALE fix-up anchor, then the LIVE conflict-resolution anchor.
+	seedFixupTriggered(t, au.storingAuditFake, runRow.ID, impl.ID, run.StageStateAwaitingApproval, &review.ID)
+	seedConflictResolutionTriggered(t, au, runRow.ID, impl.ID, "feature", "main", "head1", run.StageStateSucceeded, &review.ID)
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body := []byte(`{"outcome":"failed","category":"B","reason":"conflict_resolution_residual_marker: refused"}`)
+	if w := shipPRRequest(t, s, runRow.ID, impl.ID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateSucceeded {
+		t.Fatalf("implement state = %q, want succeeded (the CONFLICT-RESOLUTION anchor); "+
+			"awaiting_approval means the stale fix-up anchor won", got.State)
+	}
+	// The run must stay non-terminal with the intact PR un-orphaned.
+	gotRun, err := rr.GetRun(t.Context(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.State == run.StateFailed {
+		t.Error("run failed — a refused pass is an assist that failed, never an escalation")
+	}
+	// And the failure entry carrying the runner's named reason was written.
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found bool
+	for _, e := range au.appended {
+		if e.Category == CategoryStageConflictResolutionFailed {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("no stage_conflict_resolution_failed entry recorded")
+	}
+}
+
+// TestFailPullRequestStage_OrdinaryFixupFailureUnaffected is the control for
+// the ordering change: with NO conflict-resolution trigger, the fix-up recovery
+// still runs exactly as before.
+func TestFailPullRequestStage_OrdinaryFixupFailureUnaffected(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newSequencedAuditFake()
+	sf := newSigningFake()
+	s := New(Config{
+		Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: newFakeArtifactRepo(),
+		AuditRepo: au, RunRepo: rr, Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	runRow := rr.seedRun()
+	impl := rr.seedStage(runRow.ID, 1, run.StageStateRunning)
+	review := rr.seedStage(runRow.ID, 2, run.StageStatePending)
+	rr.mu.Lock()
+	impl.Type = run.StageTypeImplement
+	review.Type = run.StageTypeReview
+	rr.mu.Unlock()
+	seedFixupTriggered(t, au.storingAuditFake, runRow.ID, impl.ID, run.StageStateAwaitingApproval, &review.ID)
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body := []byte(`{"outcome":"failed","category":"C","reason":"push failed"}`)
+	if w := shipPRRequest(t, s, runRow.ID, impl.ID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	got, err := rr.GetStage(t.Context(), impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("implement state = %q, want awaiting_approval (the fix-up anchor)", got.State)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category == CategoryStageConflictResolutionFailed {
+			t.Fatal("a conflict-resolution failure entry was written for an ordinary fix-up failure")
+		}
+	}
+}

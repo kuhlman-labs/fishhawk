@@ -1,0 +1,913 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/conflictresolve"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
+)
+
+// --- fixtures ---
+
+func crGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+func crGitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func crWrite(t *testing.T, dir, rel, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, rel), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// crRepo builds a real repository with a `main` base branch and a `feature`
+// run branch whose edits to conflict.txt CONFLICT with main's. It leaves
+// `feature` checked out and returns (repoDir, featureTipSHA).
+//
+// The repository is REAL: every assertion below reads git's own state back
+// rather than a model of it, because the controls under test have their effect
+// on committed repository state, not on a returned error.
+func crRepo(t *testing.T) (string, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	crGit(t, repo, "init", "--initial-branch=main")
+	crGit(t, repo, "config", "user.name", "test")
+	crGit(t, repo, "config", "user.email", "test@example.com")
+	crWrite(t, repo, "conflict.txt", "base\n")
+	crWrite(t, repo, "quiet.txt", "untouched\n")
+	crGit(t, repo, "add", "-A")
+	crGit(t, repo, "commit", "-m", "initial")
+
+	crGit(t, repo, "checkout", "-b", "feature")
+	crWrite(t, repo, "conflict.txt", "ours\n")
+	crGit(t, repo, "commit", "-am", "ours")
+
+	crGit(t, repo, "checkout", "main")
+	crWrite(t, repo, "conflict.txt", "theirs\n")
+	crWrite(t, repo, "cleanly-advanced.txt", "new on base\n")
+	crGit(t, repo, "add", "-A")
+	crGit(t, repo, "commit", "-m", "theirs")
+
+	crGit(t, repo, "checkout", "feature")
+	return repo, crGitOut(t, repo, "rev-parse", "HEAD")
+}
+
+// crRequest builds the trigger for a repo whose base branch is local `main`.
+func crRequest(head string) conflictResolutionRequest {
+	return conflictResolutionRequest{Branch: "feature", BaseRef: "refs/heads/main", ExpectedHeadSHA: head}
+}
+
+// noAgent is the stub that changes nothing.
+func noAgent(context.Context) error { return nil }
+
+// crAssertRestored reads the REPOSITORY back and asserts the pre-merge tip and
+// a clean worktree. This is the assertion that actually discriminates: every
+// refusal returns a byte-identical-shaped error whether or not the recovery
+// ran, so asserting error identity alone would stay green with recovery gone.
+func crAssertRestored(t *testing.T, repo, preTip string) {
+	t.Helper()
+	if got := crGitOut(t, repo, "rev-parse", "HEAD"); got != preTip {
+		t.Errorf("HEAD = %s, want pre-merge tip %s", got, preTip)
+	}
+	if st := crGitOut(t, repo, "status", "--porcelain"); st != "" {
+		t.Errorf("worktree not clean after refusal:\n%s", st)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git", "MERGE_HEAD")); !os.IsNotExist(err) {
+		t.Errorf(".git/MERGE_HEAD still present after refusal (err=%v)", err)
+	}
+}
+
+// --- qualifyMergeRef ---
+
+// TestQualifyMergeRef is the round-1 naming-bug regression. The naive
+// "contains a slash → already qualified" rule left `release/1.2` unqualified,
+// the merge failed to resolve it, and the ceiling-of-one budget burned on a
+// naming bug rather than on a real conflict.
+func TestQualifyMergeRef(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	crGit(t, repo, "init", "--initial-branch=main")
+	crGit(t, repo, "remote", "add", "origin", repo)
+
+	cases := []struct{ name, in, want string }{
+		{"plain_branch", "main", "origin/main"},
+		{"slash_bearing_branch", "release/1.2", "origin/release/1.2"},
+		{"already_remote_qualified", "origin/main", "origin/main"},
+		{"explicit_ref_path", "refs/heads/main", "refs/heads/main"},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := qualifyMergeRef(context.Background(), repo, "origin", tc.in); got != tc.want {
+				t.Errorf("qualifyMergeRef(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// --- conflictResolutionFromPrompt ---
+
+// TestConflictResolutionFromPrompt covers the half-populated refusal: a serve
+// missing ANY anchor must yield NO pass, because a runner handed an empty base
+// ref merges nothing and then refuses naming the wrong cause.
+func TestConflictResolutionFromPrompt(t *testing.T) {
+	full := &upload.FetchedPrompt{
+		ConflictResolution:                true,
+		ConflictResolutionBranch:          "feature",
+		ConflictResolutionBaseRef:         "main",
+		ConflictResolutionExpectedHeadSHA: "abc",
+	}
+	if got := conflictResolutionFromPrompt(full); got == nil {
+		t.Fatal("fully populated instruction yielded no pass")
+	} else if got.Branch != "feature" || got.BaseRef != "main" || got.ExpectedHeadSHA != "abc" {
+		t.Errorf("request = %+v, want the served anchors", got)
+	}
+
+	cases := []struct {
+		name string
+		mut  func(*upload.FetchedPrompt)
+	}{
+		{"nil_prompt", nil},
+		{"flag_unset", func(p *upload.FetchedPrompt) { p.ConflictResolution = false }},
+		{"no_branch", func(p *upload.FetchedPrompt) { p.ConflictResolutionBranch = "" }},
+		{"no_base_ref", func(p *upload.FetchedPrompt) { p.ConflictResolutionBaseRef = "" }},
+		{"no_expected_head", func(p *upload.FetchedPrompt) { p.ConflictResolutionExpectedHeadSHA = "" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.mut == nil {
+				if conflictResolutionFromPrompt(nil) != nil {
+					t.Fatal("nil prompt yielded a pass")
+				}
+				return
+			}
+			p := *full
+			tc.mut(&p)
+			if got := conflictResolutionFromPrompt(&p); got != nil {
+				t.Fatalf("half-populated instruction yielded a pass: %+v", got)
+			}
+		})
+	}
+}
+
+// --- the pass, driven end to end against real repositories ---
+
+// TestConflictResolutionPass_AcceptsResolvedHunk is the success control: an
+// agent that resolves the hunk reaches the scoped add + single commit, and the
+// repository carries a real merge commit with BOTH parents.
+func TestConflictResolutionPass_AcceptsResolvedHunk(t *testing.T) {
+	repo, head := crRepo(t)
+	mainTip := crGitOut(t, repo, "rev-parse", "main")
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { crWrite(t, repo, "conflict.txt", "ours\n"); return nil }, nil)
+
+	if res.refused() {
+		t.Fatalf("pass refused: %s (%s)", res.Reason, res.Detail)
+	}
+	if res.BaseSHA != head {
+		t.Errorf("BaseSHA = %s, want %s", res.BaseSHA, head)
+	}
+	if got := crGitOut(t, repo, "rev-parse", "HEAD"); got != res.HeadSHA {
+		t.Errorf("HEAD = %s, want the reported merge commit %s", got, res.HeadSHA)
+	}
+	parents := strings.Fields(crGitOut(t, repo, "rev-list", "--parents", "-n", "1", "HEAD"))
+	if len(parents) != 3 || parents[1] != head || parents[2] != mainTip {
+		t.Errorf("merge parents = %v, want [%s %s]", parents[1:], head, mainTip)
+	}
+	// The clean base change git auto-staged is AUTHORIZED and must have landed.
+	if _, err := os.Stat(filepath.Join(repo, "cleanly-advanced.txt")); err != nil {
+		t.Errorf("clean base change missing from the merge commit: %v", err)
+	}
+}
+
+// TestConflictResolutionPass_Refusals drives ONE case per named refusal end to
+// end. Every case asserts BOTH the named reason AND — by reading the repository
+// back — that HEAD is the pre-merge tip with a clean worktree.
+func TestConflictResolutionPass_Refusals(t *testing.T) {
+	cases := []struct {
+		name   string
+		req    func(head string) conflictResolutionRequest
+		agent  func(t *testing.T, repo string) func(context.Context) error
+		reason string
+	}{
+		{
+			name: "unexpected_head",
+			req: func(string) conflictResolutionRequest {
+				return conflictResolutionRequest{Branch: "feature", BaseRef: "refs/heads/main", ExpectedHeadSHA: strings.Repeat("d", 40)}
+			},
+			reason: reasonUnexpectedHead,
+		},
+		{
+			name: "no_conflict",
+			req: func(head string) conflictResolutionRequest {
+				// Merge a ref that does NOT conflict: the base advanced past it.
+				return conflictResolutionRequest{Branch: "feature", BaseRef: "refs/heads/clean", ExpectedHeadSHA: head}
+			},
+			reason: reasonNoConflict,
+		},
+		{
+			name: "merge_failed",
+			req: func(head string) conflictResolutionRequest {
+				return conflictResolutionRequest{Branch: "feature", BaseRef: "refs/heads/does-not-exist", ExpectedHeadSHA: head}
+			},
+			reason: reasonMergeFailed,
+		},
+		{
+			name: "agent_failed",
+			req:  crRequest,
+			agent: func(*testing.T, string) func(context.Context) error {
+				return func(context.Context) error { return errors.New("boom") }
+			},
+			reason: reasonAgentFailed,
+		},
+		{
+			name: "edit_outside_hunk",
+			req:  crRequest,
+			agent: func(t *testing.T, repo string) func(context.Context) error {
+				return func(context.Context) error {
+					crWrite(t, repo, "conflict.txt", "ours\n")
+					crWrite(t, repo, "quiet.txt", "tampered\n")
+					return nil
+				}
+			},
+			reason: "conflict_resolution_unstaged_change_outside_set",
+		},
+		{
+			name: "untracked_path_outside_set",
+			req:  crRequest,
+			agent: func(t *testing.T, repo string) func(context.Context) error {
+				return func(context.Context) error {
+					crWrite(t, repo, "conflict.txt", "ours\n")
+					crWrite(t, repo, "smuggled.txt", "new\n")
+					return nil
+				}
+			},
+			reason: "conflict_resolution_untracked_path_outside_set",
+		},
+		{
+			name: "agent_staged_the_path",
+			req:  crRequest,
+			agent: func(t *testing.T, repo string) func(context.Context) error {
+				return func(context.Context) error {
+					crWrite(t, repo, "conflict.txt", "ours\n")
+					crGit(t, repo, "add", "conflict.txt")
+					return nil
+				}
+			},
+			reason: "conflict_resolution_conflicted_path_not_unmerged",
+		},
+		{
+			name: "agent_committed",
+			req:  crRequest,
+			agent: func(t *testing.T, repo string) func(context.Context) error {
+				return func(context.Context) error {
+					crWrite(t, repo, "conflict.txt", "ours\n")
+					crGit(t, repo, "add", "conflict.txt")
+					crGit(t, repo, "commit", "--no-edit")
+					return nil
+				}
+			},
+			reason: "conflict_resolution_head_moved",
+		},
+		{
+			name: "merge_head_rewritten",
+			req:  crRequest,
+			agent: func(t *testing.T, repo string) func(context.Context) error {
+				return func(context.Context) error {
+					crWrite(t, repo, "conflict.txt", "ours\n")
+					crWrite(t, repo, ".git/MERGE_HEAD", strings.Repeat("a", 40)+"\n")
+					return nil
+				}
+			},
+			reason: "conflict_resolution_merge_head_changed",
+		},
+		{
+			name: "merge_message_rewritten",
+			req:  crRequest,
+			agent: func(t *testing.T, repo string) func(context.Context) error {
+				return func(context.Context) error {
+					crWrite(t, repo, "conflict.txt", "ours\n")
+					crWrite(t, repo, ".git/MERGE_MSG", "a message the operator never authorized\n")
+					return nil
+				}
+			},
+			reason: "conflict_resolution_merge_message_changed",
+		},
+		{
+			name: "conflicted_mode_changed",
+			req:  crRequest,
+			agent: func(t *testing.T, repo string) func(context.Context) error {
+				return func(context.Context) error {
+					crWrite(t, repo, "conflict.txt", "ours\n")
+					if err := os.Chmod(filepath.Join(repo, "conflict.txt"), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					return nil
+				}
+			},
+			reason: "conflict_resolution_conflicted_mode_changed",
+		},
+		{
+			name: "conflicted_path_deleted",
+			req:  crRequest,
+			agent: func(t *testing.T, repo string) func(context.Context) error {
+				return func(context.Context) error {
+					return os.Remove(filepath.Join(repo, "conflict.txt"))
+				}
+			},
+			reason: "conflict_resolution_conflicted_path_missing",
+		},
+		{
+			name:   "residual_marker",
+			req:    crRequest,
+			agent:  func(*testing.T, string) func(context.Context) error { return noAgent },
+			reason: "conflict_resolution_residual_marker",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, head := crRepo(t)
+			if tc.name == "no_conflict" {
+				// A base branch that advanced WITHOUT touching conflict.txt.
+				crGit(t, repo, "branch", "clean", "main~1")
+				crGit(t, repo, "checkout", "clean")
+				crWrite(t, repo, "elsewhere.txt", "clean advance\n")
+				crGit(t, repo, "add", "-A")
+				crGit(t, repo, "commit", "-m", "clean advance")
+				crGit(t, repo, "checkout", "feature")
+			}
+			agent := noAgent
+			if tc.agent != nil {
+				agent = tc.agent(t, repo)
+			}
+			res := runConflictResolutionPass(context.Background(), repo, "origin", tc.req(head), agent, nil)
+
+			if res.Reason != tc.reason {
+				t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, tc.reason)
+			}
+			if !res.Recovered {
+				t.Errorf("recovery not verified: %s", res.RecoveryDetail)
+			}
+			crAssertRestored(t, repo, head)
+		})
+	}
+}
+
+// TestConflictResolutionPass_BaselineCaptureFailure drives the
+// baseline_capture_failed branch by removing .git/MERGE_HEAD between the merge
+// and the capture — the one input the capture treats as mandatory.
+func TestConflictResolutionPass_BaselineCaptureFailure(t *testing.T) {
+	repo, head := crRepo(t)
+	orig := conflictCaptureHook
+	t.Cleanup(func() { conflictCaptureHook = orig })
+	conflictCaptureHook = func(repoDir string) {
+		_ = os.Remove(filepath.Join(repoDir, ".git", "MERGE_HEAD"))
+	}
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head), noAgent, nil)
+	if res.Reason != reasonBaselineCaptureFailed {
+		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonBaselineCaptureFailed)
+	}
+	crAssertRestored(t, repo, head)
+}
+
+// TestConflictResolutionPass_CommitFailure drives the commit_failed branch: the
+// gate PASSES and the commit is then made to fail, proving the reason is not
+// mis-attributed to the gate.
+func TestConflictResolutionPass_CommitFailure(t *testing.T) {
+	repo, head := crRepo(t)
+	orig := conflictCommitHook
+	t.Cleanup(func() { conflictCommitHook = orig })
+	conflictCommitHook = func(repoDir string) {
+		// An unreadable index makes `git add` fail while everything the gate
+		// already decided stays true.
+		_ = os.WriteFile(filepath.Join(repoDir, ".git", "index"), []byte("not an index"), 0o000)
+	}
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { crWrite(t, repo, "conflict.txt", "ours\n"); return nil }, nil)
+	if res.Reason != reasonCommitFailed {
+		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonCommitFailed)
+	}
+}
+
+// TestConflictResolutionRecoveryOutlivesCancellation is the ROUND-2 recovery
+// requirement. exec.CommandContext kills the child the instant the context is
+// done, so a cancellation while the agent ran previously made the abort, the
+// verification, the reset and the clean ALL fail instantly and left the
+// repository mid-merge. The stub agent cancels the pass's OWN context, and the
+// assertion reads the repository back.
+func TestConflictResolutionRecoveryOutlivesCancellation(t *testing.T) {
+	repo, head := crRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	res := runConflictResolutionPass(ctx, repo, "origin", crRequest(head), func(context.Context) error {
+		crWrite(t, repo, "quiet.txt", "tampered mid-cancel\n")
+		cancel()
+		return context.Canceled
+	}, nil)
+
+	if !res.refused() {
+		t.Fatal("cancelled pass was not refused")
+	}
+	if !res.Recovered {
+		t.Errorf("recovery not verified after cancellation: %s", res.RecoveryDetail)
+	}
+	crAssertRestored(t, repo, head)
+}
+
+// --- stage-level publish + report ---
+
+type crFakeUpload struct {
+	uploadClient
+	ships []upload.ShipPullRequestArgs
+	err   error
+}
+
+func (f *crFakeUpload) ShipPullRequest(_ context.Context, args upload.ShipPullRequestArgs) (*upload.ShipPullRequestResult, error) {
+	f.ships = append(f.ships, args)
+	return &upload.ShipPullRequestResult{}, f.err
+}
+
+func (f *crFakeUpload) FetchInstallationToken(context.Context, upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error) {
+	return &upload.FetchInstallationTokenResult{Token: "tok"}, nil
+}
+
+func crStageCfg(repo string) config {
+	return config{runID: "run-1", stageID: "stage-1", workingDir: repo, githubRepo: "acme/widgets"}
+}
+
+// TestConflictResolutionStage_PushesAndReports is the publish-and-report
+// requirement: a passing gate must PUSH the merge commit through the authorized
+// pusher seam and then report the TERMINAL outcome. Neither arm may leave the
+// stage in `running`.
+func TestConflictResolutionStage_PushesAndReports(t *testing.T) {
+	repo, head := crRepo(t)
+	fp := &fakePusher{}
+	origPusher := newPusher
+	newPusher = func() pusher { return fp }
+	t.Cleanup(func() { newPusher = origPusher })
+
+	origAgent := conflictResolutionAgentInvoker
+	t.Cleanup(func() { conflictResolutionAgentInvoker = origAgent })
+	conflictResolutionAgentInvoker = func(_ context.Context, cfg config, _ io.Writer) error {
+		crWrite(t, cfg.workingDir, "conflict.txt", "ours\n")
+		return nil
+	}
+
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(repo), crRequest(head),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d", code, exitOK)
+	}
+	mergeSHA := crGitOut(t, repo, "rev-parse", "HEAD")
+	if fp.pushCommittedArgs == nil {
+		t.Fatal("the merge commit was never pushed")
+	}
+	if fp.pushCommittedArgs.HeadSHA != mergeSHA || fp.pushCommittedArgs.Branch != "feature" {
+		t.Errorf("push args = %+v, want branch feature at %s", fp.pushCommittedArgs, mergeSHA)
+	}
+	if len(client.ships) != 1 {
+		t.Fatalf("ships = %d, want exactly one terminal report", len(client.ships))
+	}
+	got := client.ships[0]
+	if got.Outcome != "conflict_resolution_pushed" || got.HeadSHA != mergeSHA || got.BaseSHA != head {
+		t.Errorf("report = %+v, want conflict_resolution_pushed at %s from %s", got, mergeSHA, head)
+	}
+}
+
+// TestConflictResolutionStage_RefusalReportsNamedReason: a refused pass must
+// still REPORT, carrying the named refusal reason, and must not push.
+func TestConflictResolutionStage_RefusalReportsNamedReason(t *testing.T) {
+	repo, head := crRepo(t)
+	fp := &fakePusher{}
+	origPusher := newPusher
+	newPusher = func() pusher { return fp }
+	t.Cleanup(func() { newPusher = origPusher })
+
+	origAgent := conflictResolutionAgentInvoker
+	conflictResolutionAgentInvoker = func(_ context.Context, cfg config, _ io.Writer) error {
+		crWrite(t, cfg.workingDir, "quiet.txt", "tampered\n")
+		crWrite(t, cfg.workingDir, "conflict.txt", "ours\n")
+		return nil
+	}
+	t.Cleanup(func() { conflictResolutionAgentInvoker = origAgent })
+
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(repo), crRequest(head),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitFailure {
+		t.Fatalf("exit code = %d, want %d", code, exitFailure)
+	}
+	if fp.pushCommittedArgs != nil {
+		t.Fatal("a refused pass pushed anyway")
+	}
+	if len(client.ships) != 1 {
+		t.Fatalf("ships = %d, want exactly one terminal failure report", len(client.ships))
+	}
+	got := client.ships[0]
+	if got.Outcome != "failed" || got.Category != "B" {
+		t.Errorf("report outcome/category = %q/%q, want failed/B", got.Outcome, got.Category)
+	}
+	if !strings.Contains(got.Reason, "conflict_resolution_unstaged_change_outside_set") {
+		t.Errorf("reason = %q, want the NAMED refusal reason", got.Reason)
+	}
+	crAssertRestored(t, repo, head)
+}
+
+// TestConflictResolutionStage_PushFailureReportsCategoryC pins the push-failure
+// branch: a transport failure is category C, not a judgment, and it still
+// settles the stage.
+func TestConflictResolutionStage_PushFailureReportsCategoryC(t *testing.T) {
+	repo, head := crRepo(t)
+	fp := &fakePusher{pushCommittedErr: errors.New("remote hung up")}
+	origPusher := newPusher
+	newPusher = func() pusher { return fp }
+	t.Cleanup(func() { newPusher = origPusher })
+
+	origAgent := conflictResolutionAgentInvoker
+	conflictResolutionAgentInvoker = func(_ context.Context, cfg config, _ io.Writer) error {
+		crWrite(t, cfg.workingDir, "conflict.txt", "ours\n")
+		return nil
+	}
+	t.Cleanup(func() { conflictResolutionAgentInvoker = origAgent })
+
+	client := &crFakeUpload{}
+	if code := runConflictResolutionStage(context.Background(), crStageCfg(repo), crRequest(head),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard); code != exitFailure {
+		t.Fatalf("exit code = %d, want %d", code, exitFailure)
+	}
+	if len(client.ships) != 1 || client.ships[0].Category != "C" {
+		t.Fatalf("ships = %+v, want one category-C failure report", client.ships)
+	}
+	if !strings.Contains(client.ships[0].Reason, "conflict_resolution_push_failed") {
+		t.Errorf("reason = %q, want the named push-failure reason", client.ships[0].Reason)
+	}
+}
+
+// TestConflictResolutionStage_BadRepoSlugFailsClosed pins the owner/name guard:
+// an unresolvable repo slug must be reported, never silently skipped.
+func TestConflictResolutionStage_BadRepoSlugFailsClosed(t *testing.T) {
+	repo, head := crRepo(t)
+	origPusher := newPusher
+	newPusher = func() pusher { return &fakePusher{} }
+	t.Cleanup(func() { newPusher = origPusher })
+	origAgent := conflictResolutionAgentInvoker
+	conflictResolutionAgentInvoker = func(_ context.Context, cfg config, _ io.Writer) error {
+		crWrite(t, cfg.workingDir, "conflict.txt", "ours\n")
+		return nil
+	}
+	t.Cleanup(func() { conflictResolutionAgentInvoker = origAgent })
+	t.Setenv("GITHUB_REPOSITORY", "")
+
+	cfg := crStageCfg(repo)
+	cfg.githubRepo = "not-a-slug"
+	client := &crFakeUpload{}
+	if code := runConflictResolutionStage(context.Background(), cfg, crRequest(head),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard); code != exitFailure {
+		t.Fatalf("exit code = %d, want %d", code, exitFailure)
+	}
+	if len(client.ships) != 1 || !strings.Contains(client.ships[0].Reason, "is not owner/name") {
+		t.Fatalf("ships = %+v, want one report naming the unresolvable slug", client.ships)
+	}
+}
+
+// --- helpers pinned in isolation ---
+
+// TestSplitNUL pins that path enumeration splits on NUL, not newline: a
+// filename carrying a newline must stay ONE path. A line-oriented split would
+// turn it into two and drop the real path out of the conflicted set.
+func TestSplitNUL(t *testing.T) {
+	got := splitNUL([]byte("a.txt\x00dir/we\nird.txt\x00"))
+	if len(got) != 2 || got[1] != "dir/we\nird.txt" {
+		t.Fatalf("splitNUL = %q, want the newline-bearing path intact", got)
+	}
+}
+
+// TestLogEventQuotesValues pins that a git error carrying a quote cannot break
+// the runner's JSON log record.
+func TestLogEventQuotesValues(t *testing.T) {
+	var sb strings.Builder
+	logEvent(&sb, "conflict_resolution_refused", map[string]string{
+		"reason": `he said "no"`, "empty": "",
+	})
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(sb.String())), &decoded); err != nil {
+		t.Fatalf("log line is not valid JSON: %v (%s)", err, sb.String())
+	}
+	if decoded["reason"] != `he said "no"` {
+		t.Errorf("reason = %q, want the quoted value round-tripped", decoded["reason"])
+	}
+	if _, ok := decoded["empty"]; ok {
+		t.Error("empty field was emitted")
+	}
+}
+
+// TestConflictRecoveryTimeoutIsBounded pins that the detached recovery context
+// is BOUNDED, not merely uncancellable: WithoutCancel alone would let a wedged
+// git command hang the stage forever.
+func TestConflictRecoveryTimeoutIsBounded(t *testing.T) {
+	if conflictRecoveryTimeout <= 0 || conflictRecoveryTimeout > 10*time.Minute {
+		t.Fatalf("conflictRecoveryTimeout = %v, want a bounded positive duration", conflictRecoveryTimeout)
+	}
+}
+
+var _ = gitops.DefaultRemote
+
+// crDeleteModifyRepo builds a real delete/modify conflict: `feature` modifies
+// doomed.txt while `main` DELETES it. git leaves the path unmerged with only
+// stage 2 present.
+func crDeleteModifyRepo(t *testing.T) (string, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	crGit(t, repo, "init", "--initial-branch=main")
+	crGit(t, repo, "config", "user.name", "test")
+	crGit(t, repo, "config", "user.email", "test@example.com")
+	crWrite(t, repo, "doomed.txt", "base\n")
+	crGit(t, repo, "add", "-A")
+	crGit(t, repo, "commit", "-m", "initial")
+
+	crGit(t, repo, "checkout", "-b", "feature")
+	crWrite(t, repo, "doomed.txt", "ours modified\n")
+	crGit(t, repo, "commit", "-am", "ours")
+
+	crGit(t, repo, "checkout", "main")
+	crGit(t, repo, "rm", "doomed.txt")
+	crGit(t, repo, "commit", "-m", "theirs deletes")
+
+	crGit(t, repo, "checkout", "feature")
+	return repo, crGitOut(t, repo, "rev-parse", "HEAD")
+}
+
+// TestConflictResolutionPass_DeleteModify_AcceptsOursSide: a delete/modify
+// resolution must be one side's FULL content or the deletion. Keeping ours is
+// accepted.
+func TestConflictResolutionPass_DeleteModify_AcceptsOursSide(t *testing.T) {
+	repo, head := crDeleteModifyRepo(t)
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head), noAgent, nil)
+	if res.refused() {
+		t.Fatalf("keeping ours was refused: %s (%s)", res.Reason, res.Detail)
+	}
+	if got := crGitOut(t, repo, "rev-parse", "HEAD"); got != res.HeadSHA {
+		t.Errorf("HEAD = %s, want the merge commit %s", got, res.HeadSHA)
+	}
+}
+
+// TestConflictResolutionPass_DeleteModify_AcceptsTheDeletion: taking the
+// deletion is the other accepted resolution.
+func TestConflictResolutionPass_DeleteModify_AcceptsTheDeletion(t *testing.T) {
+	repo, head := crDeleteModifyRepo(t)
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { return os.Remove(filepath.Join(repo, "doomed.txt")) }, nil)
+	if res.refused() {
+		t.Fatalf("taking the deletion was refused: %s (%s)", res.Reason, res.Detail)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "doomed.txt")); !os.IsNotExist(err) {
+		t.Errorf("doomed.txt still present after the deletion resolution (err=%v)", err)
+	}
+}
+
+// TestConflictResolutionPass_DeleteModify_RefusesInventedContent: anything that
+// is neither side's full content nor the deletion is refused by name.
+func TestConflictResolutionPass_DeleteModify_RefusesInventedContent(t *testing.T) {
+	repo, head := crDeleteModifyRepo(t)
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { crWrite(t, repo, "doomed.txt", "a third thing\n"); return nil }, nil)
+	if res.Reason != "conflict_resolution_delete_modify_content" {
+		t.Fatalf("reason = %q (%s), want conflict_resolution_delete_modify_content", res.Reason, res.Detail)
+	}
+	crAssertRestored(t, repo, head)
+}
+
+// TestConflictResolutionPass_BinaryConflictRefused: git leaves OURS on disk
+// with NO markers for a binary conflict, so there is no hunk boundary to
+// confine anything to and the pass refuses by name.
+func TestConflictResolutionPass_BinaryConflictRefused(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	crGit(t, repo, "init", "--initial-branch=main")
+	crGit(t, repo, "config", "user.name", "test")
+	crGit(t, repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("blob.bin binary\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "blob.bin"), []byte{0, 1, 2, 3}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	crGit(t, repo, "add", "-A")
+	crGit(t, repo, "commit", "-m", "initial")
+
+	crGit(t, repo, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repo, "blob.bin"), []byte{9, 9, 9, 9}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	crGit(t, repo, "commit", "-am", "ours")
+	crGit(t, repo, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(repo, "blob.bin"), []byte{7, 7, 7, 7}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	crGit(t, repo, "commit", "-am", "theirs")
+	crGit(t, repo, "checkout", "feature")
+	head := crGitOut(t, repo, "rev-parse", "HEAD")
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head), noAgent, nil)
+	if res.Reason != "conflict_resolution_binary_conflict" {
+		t.Fatalf("reason = %q (%s), want conflict_resolution_binary_conflict", res.Reason, res.Detail)
+	}
+	crAssertRestored(t, repo, head)
+}
+
+// TestReadWorkingFile_Modes pins the filesystem→git mode derivation the gate's
+// mode comparison depends on: 100644, 100755 and the symlink 120000. A wrong
+// mapping would let a regular-file→symlink swap on a conflicted path through.
+func TestReadWorkingFile_Modes(t *testing.T) {
+	dir := t.TempDir()
+	crWrite(t, dir, "plain.txt", "x\n")
+	crWrite(t, dir, "exec.sh", "#!/bin/sh\n")
+	if err := os.Chmod(filepath.Join(dir, "exec.sh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("plain.txt", filepath.Join(dir, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	for _, tc := range []struct{ path, mode, bytes string }{
+		{"plain.txt", "100644", "x\n"},
+		{"exec.sh", "100755", "#!/bin/sh\n"},
+		{"link", "120000", "plain.txt"},
+	} {
+		got, err := readWorkingFile(dir, tc.path)
+		if err != nil {
+			t.Fatalf("readWorkingFile(%q): %v", tc.path, err)
+		}
+		if !got.Present {
+			t.Errorf("%s: Present = false", tc.path)
+		}
+		if got.Mode != tc.mode {
+			t.Errorf("%s: mode = %q, want %q", tc.path, got.Mode, tc.mode)
+		}
+		if string(got.Bytes) != tc.bytes {
+			t.Errorf("%s: bytes = %q, want %q", tc.path, got.Bytes, tc.bytes)
+		}
+	}
+
+	// An absent path is the zero value, NOT an error: a deleted conflicted path
+	// is a gate decision (conflict_resolution_conflicted_path_missing), not a
+	// read failure that would mask it behind observe_failed.
+	got, err := readWorkingFile(dir, "nope.txt")
+	if err != nil {
+		t.Fatalf("absent path returned an error: %v", err)
+	}
+	if got.Present {
+		t.Error("absent path reported Present")
+	}
+}
+
+// TestConflictHelpers_FailClosedOutsideAGitRepo pins the git-error branch of
+// every capture/observe helper: a directory that is not a work tree makes each
+// one return an error rather than an empty-but-plausible value. An empty
+// baseline would make the gate authorize everything.
+func TestConflictHelpers_FailClosedOutsideAGitRepo(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	if _, err := readMergeMessage(ctx, dir); err == nil {
+		t.Error("readMergeMessage outside a work tree returned nil error")
+	}
+	if _, err := readStageZeroIndex(ctx, dir); err == nil {
+		t.Error("readStageZeroIndex outside a work tree returned nil error")
+	}
+	if _, err := captureConflictBaseline(ctx, dir, "head", map[string]bool{}); err == nil {
+		t.Error("captureConflictBaseline outside a work tree returned nil error")
+	}
+	if _, err := observeConflictState(ctx, dir, conflictresolveBaselineForTest()); err == nil {
+		t.Error("observeConflictState outside a work tree returned nil error")
+	}
+}
+
+func conflictresolveBaselineForTest() conflictresolve.Baseline {
+	return conflictresolve.Baseline{
+		Index:      map[string]conflictresolve.IndexEntry{},
+		Conflicted: map[string]conflictresolve.ConflictedFile{},
+	}
+}
+
+// TestUnmergedStages_SkipsMalformedRecords pins the tolerance branches: a
+// record with no tab, too few fields, or an unparseable stage number is
+// SKIPPED rather than panicking or mis-attributing a stage — a wrong stage set
+// would misclassify a content conflict as delete/modify.
+func TestUnmergedStages_SkipsMalformedRecords(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		"no-tab-here",
+		"100644 oid\ttoo-few-fields.txt",
+		"100644 oid notanumber\tbad-stage.txt",
+		"100644 oid 2\tgood.txt",
+		"100644 oid 3\tgood.txt",
+		"100644 oid 0\t",
+	}, "\x00") + "\x00")
+
+	got := unmergedStages(raw)
+	if len(got) != 1 {
+		t.Fatalf("stages = %v, want only the well-formed path", got)
+	}
+	if !got["good.txt"][2] || !got["good.txt"][3] {
+		t.Errorf("good.txt stages = %v, want both 2 and 3", got["good.txt"])
+	}
+}
+
+// TestUnmergedPathSet_DeduplicatesAcrossStages: one path appears once per stage
+// present, and the conflicted set must carry it exactly once.
+func TestUnmergedPathSet_DeduplicatesAcrossStages(t *testing.T) {
+	raw := []byte("100644 a 1\tp.txt\x00100644 b 2\tp.txt\x00100644 c 3\tp.txt\x00")
+	got := unmergedPathSet(raw)
+	if len(got) != 1 || !got["p.txt"] {
+		t.Fatalf("path set = %v, want exactly {p.txt}", got)
+	}
+}
+
+// TestConflictResolutionStage_ReportShipFailures pins both report-failure
+// branches. A report that cannot be delivered is the one case where the stage
+// genuinely may strand, so it must exit non-zero and log rather than exit 0 and
+// claim success.
+func TestConflictResolutionStage_ReportShipFailures(t *testing.T) {
+	cases := []struct {
+		name   string
+		agent  func(cfg config) error
+		wantEv string
+	}{
+		{
+			name:   "success_report_undeliverable",
+			agent:  func(cfg config) error { crWrite(t, cfg.workingDir, "conflict.txt", "ours\n"); return nil },
+			wantEv: "conflict_resolution_report_failed",
+		},
+		{
+			name:   "refusal_report_undeliverable",
+			agent:  func(cfg config) error { crWrite(t, cfg.workingDir, "quiet.txt", "tampered\n"); return nil },
+			wantEv: "conflict_resolution_report_failed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, head := crRepo(t)
+			origPusher := newPusher
+			newPusher = func() pusher { return &fakePusher{} }
+			t.Cleanup(func() { newPusher = origPusher })
+			origAgent := conflictResolutionAgentInvoker
+			conflictResolutionAgentInvoker = func(_ context.Context, cfg config, _ io.Writer) error { return tc.agent(cfg) }
+			t.Cleanup(func() { conflictResolutionAgentInvoker = origAgent })
+
+			var sb strings.Builder
+			client := &crFakeUpload{err: errors.New("backend unreachable")}
+			if code := runConflictResolutionStage(context.Background(), crStageCfg(repo), crRequest(head),
+				client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, &sb); code != exitFailure {
+				t.Fatalf("exit code = %d, want %d", code, exitFailure)
+			}
+			if !strings.Contains(sb.String(), tc.wantEv) {
+				t.Errorf("log = %q, want an event naming %q", sb.String(), tc.wantEv)
+			}
+		})
+	}
+}

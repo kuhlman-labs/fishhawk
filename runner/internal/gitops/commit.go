@@ -2090,3 +2090,85 @@ func orDefault(v, fallback string) string {
 	}
 	return v
 }
+
+// PushCommittedBranchArgs collects everything PushCommittedBranch needs. It is
+// the ALREADY-COMMITTED sibling of CommitAndPushArgs: the caller has already
+// produced the commit (the conflict-resolution pass's single `git commit
+// --no-edit`, #3202) and needs only the authorized publish step, so nothing
+// here stages, commits, or rewrites the working tree.
+type PushCommittedBranchArgs struct {
+	// RepoDir is the git working directory holding the commit.
+	RepoDir string
+	// Branch is the branch to publish. The local commit is pushed as
+	// HEAD:refs/heads/<Branch>, so the caller need not have the branch
+	// checked out by name.
+	Branch string
+	// RemoteURL is the URL `git push` targets. Required.
+	RemoteURL string
+	// PushToken authenticates the push. Applied per-invocation as
+	// process-scoped git config via authConfigEnv — nothing is written to any
+	// config file. Empty means ambient auth (a file-path remote in tests).
+	PushToken string
+	// HeadSHA is the local commit the caller expects to publish. The push is
+	// CONFIRMED against it: after pushing, the remote tip is observed via
+	// ls-remote and must equal HeadSHA, so a push that reported success but
+	// left the remote elsewhere (a concurrent writer, a server-side hook) is a
+	// loud error rather than a silent claim.
+	HeadSHA string
+}
+
+// PushCommittedBranchResult reports the CONFIRMED remote tip.
+type PushCommittedBranchResult struct {
+	// RemoteHeadSHA is what ls-remote reported for refs/heads/<Branch> after
+	// the push. Always equal to Args.HeadSHA on a nil error.
+	RemoteHeadSHA string
+}
+
+// PushCommittedBranch publishes an already-committed branch tip and CONFIRMS
+// the remote advanced to it (#3202).
+//
+// It is deliberately narrower than CommitAndPush: no checkout, no staging, no
+// commit, no rebase, no lease. The conflict-resolution pass has already made
+// its single merge commit under a passing confinement gate, and the only thing
+// left is the authorized write — routed through this package so it reuses the
+// same process-scoped authConfigEnv auth the implement push uses and the same
+// observeRemoteHead confirmation.
+//
+// The remote-tip check is the load-bearing half. `git push` exiting 0 is not
+// proof the ref moved (a `--dry-run`-shaped invocation, a hook that rewrites,
+// or a concurrent writer that lands after us all exit 0 from our side), and
+// the caller reports a TERMINAL success to the backend on the strength of this
+// call — so a tip that does not equal HeadSHA is an error, not a warning.
+func (p *Pusher) PushCommittedBranch(ctx context.Context, args PushCommittedBranchArgs) (*PushCommittedBranchResult, error) {
+	switch {
+	case args.RepoDir == "":
+		return nil, errors.New("gitops: RepoDir required")
+	case args.Branch == "":
+		return nil, errors.New("gitops: Branch required")
+	case args.RemoteURL == "":
+		return nil, errors.New("gitops: RemoteURL required")
+	case args.HeadSHA == "":
+		return nil, errors.New("gitops: HeadSHA required")
+	}
+
+	authEnv, err := authConfigEnv(args.RemoteURL, args.PushToken)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := p.runEnv(ctx, args.RepoDir, authEnv,
+		"push", args.RemoteURL, "HEAD:refs/heads/"+args.Branch); err != nil {
+		return nil, fmt.Errorf("gitops: push committed branch %s: %w", args.Branch, err)
+	}
+
+	remoteHead, err := p.observeRemoteHead(ctx, args.RepoDir, args.RemoteURL, args.Branch, authEnv)
+	if err != nil {
+		return nil, fmt.Errorf("gitops: confirm pushed tip: %w", err)
+	}
+	if remoteHead != args.HeadSHA {
+		return nil, fmt.Errorf(
+			"gitops: remote tip of %s is %q after push, want %q — the push did not land the expected commit",
+			args.Branch, remoteHead, args.HeadSHA)
+	}
+	return &PushCommittedBranchResult{RemoteHeadSHA: remoteHead}, nil
+}

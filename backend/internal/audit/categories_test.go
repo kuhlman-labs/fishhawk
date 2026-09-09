@@ -26,6 +26,11 @@ func TestIsKnownCategory(t *testing.T) {
 		"merge_verdict_recorded",   // E48.7 / #1954 operator merge-verdict chain entry
 		"grooming_report_recorded", // E54.3 / #2235 grooming_report ingest entry
 		"grooming_churn_filtered",  // E54.8 / #2240 churn-guard verdict entry
+		// E64.62 / #3202 bounded conflict-resolution pass: the trigger the
+		// rebase verb's 202 arm writes, and the failure that CONSUMES it.
+		"stage_conflict_resolution_triggered",
+		"stage_conflict_resolution_failed",
+		"conflict_resolution_pushed",
 	}
 	for _, c := range known {
 		if !IsKnownCategory(c) {
@@ -38,6 +43,10 @@ func TestIsKnownCategory(t *testing.T) {
 		"implement_review",        // truncated
 		"",                        // empty
 		"garbage_not_a_category",
+		// #3202 near-misses: the runner-side refusal reason and a truncation of
+		// the trigger category are NOT audit categories.
+		"conflict_resolution_residual_marker",
+		"stage_conflict_resolution",
 		"IMPLEMENT_REVIEWED", // wrong case
 	}
 	for _, c := range unknown {

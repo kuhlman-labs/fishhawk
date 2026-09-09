@@ -539,6 +539,35 @@ type FetchedPrompt struct {
 	// a non-eligible fix-up — byte-identical to today. The wire tag
 	// (fixup_apply_patches / patch) matches the backend's fixupApplyPatch shape.
 	FixupApplyPatches []FixupApplyPatch `json:"fixup_apply_patches,omitempty"`
+
+	// ConflictResolution is true when this implement stage is an
+	// operator-authorized, bounded conflict-resolution pass (#3202): the
+	// operator invoked fishhawk_rebase_run_branch, the base merge conflicted,
+	// and the backend re-opened this stage to have the agent resolve the
+	// conflict ON the run branch instead of failing closed. The runner performs
+	// the base merge LOCALLY, gates the agent's edits to the conflicted hunks,
+	// and pushes the single merge commit itself — it does NOT take any of the
+	// ordinary implement / fix-up branch, worktree or verify wiring.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags (conflict_resolution /
+	// conflict_resolution_branch / conflict_resolution_base_ref /
+	// conflict_resolution_expected_head_sha) MUST stay byte-identical to the
+	// backend's promptResponse (backend/internal/server/prompt.go). Same
+	// independent-struct-by-tag convention as the Fixup* family above; a tag
+	// drift silently DISABLES the pass — the runner decodes false, takes the
+	// ordinary implement path against a repository the operator expected to be
+	// mid-merge, and nothing reports that the pass never ran.
+	ConflictResolution bool `json:"conflict_resolution,omitempty"`
+	// ConflictResolutionBranch is the run branch the pass runs ON. Non-empty
+	// only when ConflictResolution is true.
+	ConflictResolutionBranch string `json:"conflict_resolution_branch,omitempty"`
+	// ConflictResolutionBaseRef is the base branch whose advance conflicts. The
+	// runner qualifies it against its remote before merging.
+	ConflictResolutionBaseRef string `json:"conflict_resolution_base_ref,omitempty"`
+	// ConflictResolutionExpectedHeadSHA is the run-branch tip the backend
+	// anchored the trigger to. The runner refuses BEFORE mutating anything when
+	// the checked-out tip differs.
+	ConflictResolutionExpectedHeadSHA string `json:"conflict_resolution_expected_head_sha,omitempty"`
 	// OpenPRFromHeldCommit is true on an operator EXEMPT resolution of a
 	// scope-completeness park (#1231): the implement stage previously parked
 	// because the missing-declared-scope-file gate was its sole failure, and the
@@ -1746,6 +1775,16 @@ type ShipPullRequestArgs struct {
 	// commit did not touch. The outcome string + tags are byte-identical to the
 	// backend's scope_park pullRequestBody decode (slice 1).
 	//
+	// When Outcome is "conflict_resolution_pushed", this is the TERMINAL success
+	// report of a bounded conflict-resolution pass (#3202): the runner merged
+	// the advanced base locally, gated the agent's edits to the conflicted
+	// hunks, committed the single merge commit and PUSHED it to the run branch
+	// itself. No PR was opened (the PR already exists and tracks this branch).
+	// ShipPullRequest signs and ships
+	// {"outcome":"conflict_resolution_pushed","branch":...,"head_sha":...,
+	// "base_sha":...,"files_changed_count":...} so the backend drives the
+	// stage's terminal transition instead of leaving it in `running`.
+	//
 	// When Outcome is empty the success Body path (a real PR artifact) is
 	// used unchanged.
 	Outcome  string
@@ -2000,9 +2039,9 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			return nil, fmt.Errorf("upload: marshal pull-request failure body: %w", err)
 		}
 		body = marshalled
-	case "pushed", "fixup_pushed", "fixup_no_changes":
-		// Child-push (#771) / fix-up-push (#794) / fix-up no-changes (#856)
-		// success report: build the push body from the pushed commit details
+	case "pushed", "fixup_pushed", "fixup_no_changes", "conflict_resolution_pushed":
+		// Child-push (#771) / fix-up-push (#794) / fix-up no-changes (#856) /
+		// conflict-resolution push (#3202) success report: build the push body from the pushed commit details
 		// rather than the (absent) PR artifact. All three outcomes share the
 		// same wire shape (branch + SHAs + diff size); only the outcome
 		// discriminator differs. For "fixup_no_changes" no new commit landed, so
