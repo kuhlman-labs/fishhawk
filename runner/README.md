@@ -176,6 +176,66 @@ git worktree remove /tmp/fishhawk-runner-fix
 
 **Residual, stated honestly:** the binary that verifies the change is then built from an **unmerged branch**, which is exactly why doing this automatically (option 2 in #3086) is deferred to its own discussion — see [#3086](https://github.com/kuhlman-labs/fishhawk/issues/3086).
 
+## Bounded conflict-resolution pass ([E64.62 / #3202](https://github.com/kuhlman-labs/fishhawk/issues/3202))
+
+When `fishhawk_rebase_run_branch` hits a base merge conflict, the backend may
+authorize ONE agent-driven conflict-resolution pass and re-open the implement
+stage for it. The runner recognises the pass by the four `conflict_resolution*`
+prompt-response fields and routes to `runConflictResolutionStage` **before** any
+implement / fix-up branch, worktree or verify wiring — the pass runs ON the run
+branch already checked out in the working tree, not in a relocated lineage
+worktree. `conflictResolutionFromPrompt` refuses a HALF-populated instruction
+(the flag set but a missing branch, base ref or anchor): a runner handed an
+empty base ref would merge nothing and then refuse naming the wrong cause,
+burning the ceiling-of-one budget on a serve bug.
+
+The pass's git sequence is ordered and every step is load-bearing:
+
+1. Verify the checked-out tip equals the trigger's `expected_head_sha` —
+   `conflict_resolution_unexpected_head` refuses **before** mutating anything.
+2. `git merge --no-commit --no-ff <ref>`, where `<ref>` is qualified by
+   `qualifyMergeRef`: an explicit `refs/...` path passes through, a ref whose
+   FIRST path segment names a **configured remote** passes through, and
+   everything else is prefixed with the remote. The rule is deliberately not
+   "contains a slash → already qualified" — that left `release/1.2` unqualified
+   and burned the budget on a naming bug.
+3. A merge that completes CLEANLY refuses `conflict_resolution_no_conflict`: the
+   base advanced past the conflict, and the operator authorized a resolution,
+   not an unreviewed clean merge.
+4. Capture the baseline in ONE read — HEAD, `MERGE_HEAD`, `MERGE_MSG`, every
+   NON-conflicted stage-0 index entry, and each conflicted path's kind, working
+   bytes, sides and **mode**. Clean base changes git auto-staged elsewhere are
+   part of the baseline and are AUTHORIZED.
+5. Invoke the agent under a working-tree-edits-only contract.
+6. Read the state back and hand it to `runner/internal/conflictresolve`, which
+   is the SOLE owner of the accept/refuse decision, one named reason per rule.
+7. Only on zero violations: `git add --` EXACTLY the conflicted paths (never
+   `git add -A`) and ONE `git commit --no-edit`.
+
+Every path enumeration uses `-z` and splits on NUL — git only refrains from
+C-quoting a path under `-z`, and a newline inside a filename splits one path
+into two under any line-oriented split, dropping the real path out of the gate.
+
+**Recovery outlives cancellation.** `exec.CommandContext` kills the child the
+instant the context is done, so running `git merge --abort` under the pass's own
+context makes the abort, the verification, the reset and the clean ALL fail
+instantly on a cancellation and leave the repository mid-merge. The recovery
+context is derived with `context.WithoutCancel` plus its own bounded timeout; it
+aborts, VERIFIES the postcondition (HEAD == the pre-merge tip AND `git status
+--porcelain` empty), escalates to `reset --hard` + `clean -fd` on failure, and
+re-verifies. The result reports whether restoration was verified rather than
+assuming it.
+
+**A successful pass publishes; a failed pass reports.** On a passing gate the
+merge commit is pushed via `gitops.PushCommittedBranch`, which reuses the
+process-scoped `authConfigEnv` auth and CONFIRMS the remote tip advanced to the
+pushed SHA, and the terminal outcome is reported as
+`{outcome:"conflict_resolution_pushed"}`. A refusal reports
+`{outcome:"failed", category:"B"}` carrying the NAMED refusal reason and the
+recovery verdict; a push failure reports category C. Neither arm may leave the
+stage in `running` — that strand is the failure this whole change removes.
+
+
 ## Local invocation
 
 The same binary the action runs can be invoked locally for development:

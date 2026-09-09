@@ -5122,3 +5122,109 @@ func TestCommitAndPush_UntypedCommittedTestsWrapAborts(t *testing.T) {
 		t.Errorf("origin must be untouched on the aborted push, but the branch exists: %s", out)
 	}
 }
+
+// --- PushCommittedBranch (#3202) ---
+
+// pushCommittedFixture builds a real repo with one commit on an unpushed
+// branch plus a bare local remote, and returns (repo, bare, headSHA).
+func pushCommittedFixture(t *testing.T) (string, string, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	return repo, bare, mustGitOut(t, repo, "rev-parse", "HEAD")
+}
+
+// TestPushCommittedBranch_AdvancesRemoteTip is the publish half of the
+// conflict-resolution pass: an already-committed tip must reach the remote and
+// the call must CONFIRM it did. The assertion reads the BARE REPO back — the
+// committed state — rather than trusting the returned struct.
+func TestPushCommittedBranch_AdvancesRemoteTip(t *testing.T) {
+	repo, bare, head := pushCommittedFixture(t)
+
+	res, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+		RepoDir:   repo,
+		Branch:    "fishhawk/run-x",
+		RemoteURL: bare,
+		HeadSHA:   head,
+	})
+	if err != nil {
+		t.Fatalf("PushCommittedBranch: %v", err)
+	}
+	if res.RemoteHeadSHA != head {
+		t.Errorf("RemoteHeadSHA = %q, want %q", res.RemoteHeadSHA, head)
+	}
+	out, err := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/run-x").Output()
+	if err != nil {
+		t.Fatalf("read bare tip: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != head {
+		t.Errorf("bare tip = %q, want %q", got, head)
+	}
+}
+
+// TestPushCommittedBranch_RefusesWhenRemoteTipDiffers is the counterfactual
+// vehicle for the confirmation control: `git push` exiting 0 is not proof the
+// ref carries the commit the caller is about to report as terminal success. The
+// mismatch is produced by asking for a HeadSHA that is NOT the local tip, so a
+// build without the comparison returns success on a remote that carries
+// something else.
+func TestPushCommittedBranch_RefusesWhenRemoteTipDiffers(t *testing.T) {
+	repo, bare, head := pushCommittedFixture(t)
+	other := strings.Repeat("0", len(head))
+
+	_, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+		RepoDir:   repo,
+		Branch:    "fishhawk/run-x",
+		RemoteURL: bare,
+		HeadSHA:   other,
+	})
+	if err == nil {
+		t.Fatal("PushCommittedBranch = nil error, want a remote-tip mismatch refusal")
+	}
+	if !strings.Contains(err.Error(), "did not land the expected commit") {
+		t.Errorf("error = %v, want the remote-tip mismatch refusal", err)
+	}
+}
+
+// TestPushCommittedBranch_RequiredArgs pins each required-field guard by its
+// own message, so a guard deleted individually is caught individually.
+func TestPushCommittedBranch_RequiredArgs(t *testing.T) {
+	full := PushCommittedBranchArgs{RepoDir: "r", Branch: "b", RemoteURL: "u", HeadSHA: "h"}
+	cases := []struct {
+		name  string
+		mut   func(*PushCommittedBranchArgs)
+		wants string
+	}{
+		{"repo_dir", func(a *PushCommittedBranchArgs) { a.RepoDir = "" }, "RepoDir required"},
+		{"branch", func(a *PushCommittedBranchArgs) { a.Branch = "" }, "Branch required"},
+		{"remote_url", func(a *PushCommittedBranchArgs) { a.RemoteURL = "" }, "RemoteURL required"},
+		{"head_sha", func(a *PushCommittedBranchArgs) { a.HeadSHA = "" }, "HeadSHA required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := full
+			tc.mut(&args)
+			_, err := (&Pusher{}).PushCommittedBranch(context.Background(), args)
+			if err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.wants)
+			}
+		})
+	}
+}
