@@ -14973,21 +14973,82 @@ func TestImplementReview_PriorConcerns_ReopenSubstantiation(t *testing.T) {
 	}
 }
 
-// TestImplementReview_PriorConcerns_ReopenSubstantiation_EmptyByteIdentical is
-// the absence half: hoisting the bullet out of the len(t.PriorConcerns) > 0
-// guard (and thereby changing the no-prior-concerns prompt) turns this RED.
-func TestImplementReview_PriorConcerns_ReopenSubstantiation_EmptyByteIdentical(t *testing.T) {
-	got, err := Build("implement_review", Trigger{
+// implementReviewNoPriorConcernsGolden is the testdata file holding the
+// PRE-CHANGE bytes of the implement-review prompt rendered with NO prior
+// concerns.
+const implementReviewNoPriorConcernsGolden = "testdata/implement-review-no-prior-concerns-pre-change.golden"
+
+// noPriorConcernsGoldenTrigger is the exact Trigger the golden was captured
+// from. It leaves PriorConcerns nil — that emptiness is the whole point of the
+// pin — and every other field is deterministic (fixturePlan stamps a fixed
+// timestamp), so the rendering is reproducible.
+func noPriorConcernsGoldenTrigger() Trigger {
+	return Trigger{
 		Repo:         "kuhlman-labs/example",
 		ApprovedPlan: fixturePlan(),
 		Diff:         "- M pkg/bar/bar.go\n",
-	})
+	}
+}
+
+// TestImplementReview_PriorConcerns_ReopenSubstantiation_EmptyByteIdentical is
+// the absence half, and it establishes BYTE identity rather than merely the
+// absence of selected fragments: the no-prior-concerns prompt must equal the
+// PRE-CHANGE rendering byte for byte. Hoisting the bullet out of the
+// len(t.PriorConcerns) > 0 guard — or any other edit that reaches the
+// no-prior-concerns prompt — turns this RED.
+//
+// PROVENANCE. The golden is the rendering of
+// Build("implement_review", noPriorConcernsGoldenTrigger()) at the run's BASE
+// commit 29df5ba2 ("fix(runner): settle pending scope amendment before
+// verify"), captured in a scratch detached worktree of that commit BEFORE the
+// #3319 bullet existed, and copied here unmodified (12452 bytes). It is
+// therefore genuine pre-change evidence, not a post-change snapshot compared
+// against itself. To re-derive it: `git worktree add --detach <dir> 29df5ba2`,
+// render that Build in the worktree's prompt package, and diff the bytes.
+// If this test ever fails, that is a FINDING about the no-prior-concerns
+// prompt — do NOT refresh the fixture from the current tree, which would
+// silently convert the pin into a tautology.
+//
+// Anti-vacuity guard: the golden must carry NONE of the reopen-substantiation
+// fragments (a golden mistakenly re-captured from a tree where the bullet had
+// been hoisted out of the guard would carry them, and the byte comparison
+// alone would then pass against the wrong baseline) and must still look like
+// the implement-review prompt (a truncated or empty golden is rejected).
+func TestImplementReview_PriorConcerns_ReopenSubstantiation_EmptyByteIdentical(t *testing.T) {
+	want, err := os.ReadFile(implementReviewNoPriorConcernsGolden)
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	tr := noPriorConcernsGoldenTrigger()
+	if len(tr.PriorConcerns) != 0 {
+		t.Fatal("noPriorConcernsGoldenTrigger must leave PriorConcerns empty — that is the case the golden pins")
+	}
+	got, err := Build("implement_review", tr)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
+	if got != string(want) {
+		t.Errorf("the no-prior-concerns implement-review prompt diverged from the pre-change golden %s.\n"+
+			"This change must not alter the empty-PriorConcerns rendering; investigate rather than re-capturing "+
+			"the golden from the current tree.\n--- got ---\n%q\n--- want ---\n%q",
+			implementReviewNoPriorConcernsGolden, got, string(want))
+	}
 	for _, w := range reopenSubstantiationFragments {
-		if strings.Contains(got, w) {
-			t.Errorf("empty PriorConcerns must render NO fragment of the reopen-substantiation bullet; found %q\n---\n%s", w, got)
+		if strings.Contains(string(want), w) {
+			t.Errorf("the golden contains reopen-substantiation fragment %q; it was captured from a tree that "+
+				"already rendered the bullet outside the len(PriorConcerns) > 0 guard, so it is the wrong baseline", w)
 		}
+	}
+	for _, marker := range []string{
+		"You are an implement-review agent for the repository",
+		"### Verdict schema",
+		"### Diff under review",
+	} {
+		if !strings.Contains(string(want), marker) {
+			t.Errorf("the golden is missing %q; it is not a complete implement-review prompt", marker)
+		}
+	}
+	if strings.Contains(string(want), "### Prior concerns (delta verification)") {
+		t.Error("the golden carries the prior-concerns section; it was captured with a non-empty PriorConcerns")
 	}
 }

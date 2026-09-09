@@ -11679,6 +11679,13 @@ func TestApplyConcernResolutions_BareRejectWithNoResolutionsReopensNothing(t *te
 	if got.State != concern.StateAddressedPending {
 		t.Errorf("state = %q, want addressed_pending — a reject naming no concern reopens nothing", got.State)
 	}
+	// The literal done-means is that the concern is left ALONE, which includes
+	// the routing reason the fix-up pass reads: a path that reopened from a
+	// bare verdict would overwrite it with a reopen reason even if it somehow
+	// left the state alone, so the state assertion above does not cover it.
+	if got.StateReason != "routing reason" {
+		t.Errorf("state_reason = %q, want the seeded routing reason intact — a bare reject must not rewrite it", got.StateReason)
+	}
 	if n := len(vetoEntries(t, au)); n != 0 {
 		t.Errorf("%s entries = %d, want 0 — there was no resolution to veto", concernResolutionVetoedCategory, n)
 	}
