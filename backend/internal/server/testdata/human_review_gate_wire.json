@@ -39,6 +39,7 @@
       {
         "agent_timeout_seconds": 900,
         "created_at": "2026-01-01T00:00:00Z",
+        "dispatched_at": null,
         "ended_at": null,
         "executor": {
           "kind": "agent",
@@ -66,6 +67,7 @@
       {
         "agent_timeout_seconds": 900,
         "created_at": "2026-01-01T00:00:00Z",
+        "dispatched_at": null,
         "ended_at": null,
         "executor": {
           "kind": "human",

@@ -589,6 +589,142 @@ func TestFixupStage_SecondPassRefused(t *testing.T) {
 	}
 }
 
+// decodeErrorDetails unmarshals a writeError envelope's details map (#3335
+// key assertions).
+func decodeErrorDetails(t *testing.T, body []byte) (string, map[string]any) {
+	t.Helper()
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("unmarshal error envelope: %v", err)
+	}
+	return env.Error.Code, env.Error.Details
+}
+
+// TestFixupStage_BudgetExhaustedReportsCeilingHeadroom (#3335): the
+// fixup_budget_exhausted 422 carries ceiling_refunded_passes and
+// remaining_ceiling_slots so an operator sizing the override pass learns the
+// ceiling headroom BEFORE spending it.
+func TestFixupStage_BudgetExhaustedReportsCeilingHeadroom(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+	// One prior triggered pass, no refund -> budget spent at pass 2.
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeErrorDetails(t, w.Body.Bytes())
+	if code != "fixup_budget_exhausted" {
+		t.Fatalf("code = %q, want fixup_budget_exhausted", code)
+	}
+	if _, ok := details["ceiling_refunded_passes"]; !ok {
+		t.Errorf("details missing ceiling_refunded_passes: %v", details)
+	}
+	// priorPasses=1, no refund -> headroom = 3 - (1 - 0) = 2.
+	if details["remaining_ceiling_slots"] != float64(2) {
+		t.Errorf("remaining_ceiling_slots = %v, want 2", details["remaining_ceiling_slots"])
+	}
+}
+
+// TestFixupStage_CeilingReachedReportsSlotsZero (#3335): the
+// fixup_ceiling_reached 422 carries ceiling_refunded_passes and
+// remaining_ceiling_slots == 0.
+func TestFixupStage_CeilingReachedReportsSlotsZero(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+	// Three raw triggered passes, no refunds -> at the ceiling.
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 20)
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 30)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ForceAdditionalPass: true})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeErrorDetails(t, w.Body.Bytes())
+	if code != "fixup_ceiling_reached" {
+		t.Fatalf("code = %q, want fixup_ceiling_reached", code)
+	}
+	if _, ok := details["ceiling_refunded_passes"]; !ok {
+		t.Errorf("details missing ceiling_refunded_passes: %v", details)
+	}
+	if details["remaining_ceiling_slots"] != float64(0) {
+		t.Errorf("remaining_ceiling_slots = %v, want 0", details["remaining_ceiling_slots"])
+	}
+}
+
+// TestFixupStage_AuditReceiptCarriesCeilingKeys (#3335): the
+// stage_fixup_triggered audit payload carries ceiling_refunded_passes and
+// remaining_ceiling_slots on an admitted pass.
+func TestFixupStage_AuditReceiptCarriesCeilingKeys(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := lastFixupTriggeredPayload(t, au)
+	if _, ok := payload["ceiling_refunded_passes"]; !ok {
+		t.Errorf("audit payload missing ceiling_refunded_passes: %v", payload)
+	}
+	if _, ok := payload["remaining_ceiling_slots"]; !ok {
+		t.Errorf("audit payload missing remaining_ceiling_slots: %v", payload)
+	}
+	// First pass, no refunds -> RemainingCeilingSlots = 3 - (0 + 1) = 2.
+	if payload["remaining_ceiling_slots"].(float64) != 2 {
+		t.Errorf("remaining_ceiling_slots = %v, want 2", payload["remaining_ceiling_slots"])
+	}
+}
+
+// TestFixupStage_PushedThenCrashedStillConsumesCeiling is the PUSH-VETO
+// discrimination test (#3335 control 4): a pass that PUSHED a commit and then
+// died (category A) is NOT refunded — neither the budget nor the ceiling is
+// credited for it — so the credit never silently widens into "every failed pass
+// is free". The window holds BOTH a fixup_pushed and a stage_fixup_recovered/A;
+// the next pass is refused budget-exhausted with refunded_passes=0 and
+// ceiling_refunded_passes=0.
+func TestFixupStage_PushedThenCrashedStillConsumesCeiling(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+	// One triggered pass whose window holds a push AND a later category-A death.
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+	seedFixupPushedSeq(au, stage.RunID, stage.ID, 12)
+	seedFixupRecoveredC(au, stage.RunID, stage.ID, run.FailureA, 14)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (pushed-then-crashed consumes budget):\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeErrorDetails(t, w.Body.Bytes())
+	if code != "fixup_budget_exhausted" {
+		t.Fatalf("code = %q, want fixup_budget_exhausted", code)
+	}
+	if details["refunded_passes"] != float64(0) {
+		t.Errorf("refunded_passes = %v, want 0 (push veto)", details["refunded_passes"])
+	}
+	if details["ceiling_refunded_passes"] != float64(0) {
+		t.Errorf("ceiling_refunded_passes = %v, want 0 (ceiling not credited for a pushed pass)", details["ceiling_refunded_passes"])
+	}
+}
+
 // reparkFixupStage models the re-review landing the stage on
 // awaiting_approval again, so the only thing gating the next pass is the
 // budget/ceiling decision — not the state machine.
@@ -805,41 +941,80 @@ func TestFixupStage_NoChangeRefundAdmitsSecondPass(t *testing.T) {
 	}
 }
 
-// TestFixupStage_NoChangeRefundNeverExtendsCeiling: the refund applies to
-// the NORMAL budget only — the absolute hard ceiling keeps counting RAW
-// stage_fixup_triggered entries, so 3 triggered passes hard-stop the stage
-// even when one of them was a refunded no-change pass (#967).
-func TestFixupStage_NoChangeRefundNeverExtendsCeiling(t *testing.T) {
+// TestFixupStage_RefundCreditsCeilingUpToCap: #3335 INVERTS the pre-change
+// rule. A delivered-nothing refund now credits the HARD CEILING too (bounded by
+// maxCeilingRefundCredits), so three triggered passes that each delivered
+// nothing no longer hard-stop the stage — the fourth is ADMITTED, and the
+// receipt records the ceiling credit + surviving slots. (Previously this state
+// refused fixup_ceiling_reached.)
+func TestFixupStage_RefundCreditsCeilingUpToCap(t *testing.T) {
 	s, repo, au := fixupServer(t)
 	stage := seedImplementGateStage(repo)
 	seedConcernsReview(au, stage,
 		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
 	)
 
-	// Pass 1 (normal), then a no-change report refunds it.
-	if w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}}); w.Code != http.StatusOK {
-		t.Fatalf("pass 1 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	// Three prior triggered passes, each with a delivered-nothing no-change
+	// signal in its own window — seeded BY CONSTRUCTION so the RED (when the
+	// server min() cap is deleted) lands on the behavioural assertion, not on
+	// fixture setup.
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+	seedFixupNoChangesSeq(au, stage.RunID, stage.ID, 15)
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 20)
+	seedFixupNoChangesSeq(au, stage.RunID, stage.ID, 25)
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 30)
+	seedFixupNoChangesSeq(au, stage.RunID, stage.ID, 35)
+
+	// The fourth pass: priorPasses=3, refunds=3, ceilingCredits=min(3,3)=3 ->
+	// effective ceiling count 0 -> admitted (was fixup_ceiling_reached).
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, Reason: "after three delivered-nothing passes"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("credited fourth fixup status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
-	seedFixupNoChanges(au, stage)
-	// Pass 2 (refund-admitted) and pass 3 (forced) reach the raw ceiling.
-	reparkFixupStage(repo, stage.ID)
-	if w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}}); w.Code != http.StatusOK {
-		t.Fatalf("pass 2 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	payload := lastFixupTriggeredPayload(t, au)
+	if payload["ceiling_refunded_passes"].(float64) != 3 {
+		t.Errorf("ceiling_refunded_passes = %v, want 3", payload["ceiling_refunded_passes"])
 	}
-	reparkFixupStage(repo, stage.ID)
-	if w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ForceAdditionalPass: true}); w.Code != http.StatusOK {
-		t.Fatalf("pass 3 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	// RemainingCeilingSlots = 3 - (3 - 3 + 1) = 2.
+	if payload["remaining_ceiling_slots"].(float64) != 2 {
+		t.Errorf("remaining_ceiling_slots = %v, want 2", payload["remaining_ceiling_slots"])
+	}
+}
+
+// TestFixupStage_CeilingRefundCreditsAreCapped is COUNTERFACTUAL CONTROL 1 (the
+// runaway-cost guard): the min(refundedPasses, maxCeilingRefundCredits) cap in
+// server/fixup.go. SIX triggered passes each with a refunding window means the
+// SEVENTH is refused fixup_ceiling_reached — the credit is capped at 3 so the
+// effective count (6-3=3) is at the ceiling. Delete the min() so credits are
+// unbounded and the seventh is admitted -> RED on this refusal assertion. The
+// refunding windows are seeded BY CONSTRUCTION so the RED lands here, not on
+// fixture setup.
+func TestFixupStage_CeilingRefundCreditsAreCapped(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	// Six triggered passes, each holding a delivered-nothing no-change signal in
+	// its own window: triggers at 10,20,...,60; signals at 15,25,...,65.
+	for i := 0; i < 6; i++ {
+		base := int64(10 + i*10)
+		seedFixupTriggeredSeq(au, stage.RunID, stage.ID, base)
+		seedFixupNoChangesSeq(au, stage.RunID, stage.ID, base+5)
 	}
 
-	// 4th attempt: 3 RAW passes triggered — refused with the distinct
-	// ceiling code despite the refund, even when forced.
-	reparkFixupStage(repo, stage.ID)
+	// The seventh pass: priorPasses=6, refunds=6, but ceilingCredits=min(6,3)=3
+	// -> effective ceiling count 6-3=3 >= ceiling -> refused.
 	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ForceAdditionalPass: true})
 	if w.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("ceiling status = %d, want 422:\n%s", w.Code, w.Body.String())
+		t.Fatalf("seventh fixup status = %d, want 422 (credit capped at %d):\n%s", w.Code, maxCeilingRefundCredits, w.Body.String())
 	}
 	if !strings.Contains(w.Body.String(), "fixup_ceiling_reached") {
 		t.Errorf("body missing fixup_ceiling_reached code: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "remaining_ceiling_slots") {
+		t.Errorf("ceiling-reached details missing remaining_ceiling_slots: %s", w.Body.String())
 	}
 }
 
@@ -986,31 +1161,35 @@ func TestFixupStage_InfraRefund_BothSignalsOneWindowRefundOnce(t *testing.T) {
 	}
 }
 
-// TestFixupStage_InfraRefundNeverExtendsCeiling: the infra refund applies to the
-// NORMAL budget only — the absolute hard ceiling keeps counting RAW
-// stage_fixup_triggered entries, so 3 triggered passes hard-stop the stage even
-// with an infra refund in play, even when forced (#1957, mirroring the #967
-// ceiling guarantee).
-func TestFixupStage_InfraRefundNeverExtendsCeiling(t *testing.T) {
+// TestFixupStage_InfraRefundCreditsCeiling (#3335, INVERTED from the pre-change
+// "never extends the ceiling" rule): an infra refund now credits the hard
+// ceiling too. Three RAW triggered passes plus ONE category-C death in the first
+// window -> ceilingCredits=1 -> effective ceiling count 2 < 3 -> the fourth pass
+// is ADMITTED (was fixup_ceiling_reached). The credit is recorded on the receipt.
+func TestFixupStage_InfraRefundCreditsCeiling(t *testing.T) {
 	s, repo, au := fixupServer(t)
 	stage := seedImplementGateStage(repo)
 	seedConcernsReview(au, stage,
 		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
 	)
 
-	// Three RAW triggered passes plus a category-C death inside the first
-	// window: the refund would widen the NORMAL budget but never the ceiling.
+	// Three RAW triggered passes plus a category-C death inside the first window.
+	// The single refund widens the normal budget by one (to 2), so at 3 prior
+	// passes the normal budget is spent — the operator forces the pass, and the
+	// CREDITED ceiling (effective 2 < 3) is what admits it. Without the credit
+	// the ceiling arm (effective 3 >= 3) would refuse even under force.
 	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
 	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 20)
 	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 30)
 	seedDispatchReaperFailed(au, stage.RunID, stage.ID, run.FailureC, 12)
 
 	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ForceAdditionalPass: true})
-	if w.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d, want 422 at the ceiling:\n%s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the infra refund credits the ceiling):\n%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "fixup_ceiling_reached") {
-		t.Errorf("body missing fixup_ceiling_reached code (refund must not extend the ceiling): %s", w.Body.String())
+	payload := lastFixupTriggeredPayload(t, au)
+	if payload["ceiling_refunded_passes"].(float64) != 1 {
+		t.Errorf("ceiling_refunded_passes = %v, want 1", payload["ceiling_refunded_passes"])
 	}
 }
 
@@ -1248,11 +1427,15 @@ func TestFixupStage_CrashRefund_SignalBeforeFirstTriggerNotRefunded(t *testing.T
 	}
 }
 
-// TestFixupStage_RefundNeverExtendsRawCeiling: no refund widens the ABSOLUTE
-// 3-pass ceiling, which counts RAW triggers. Three triggers each with a
-// refunding category-A crash still returns fixup_ceiling_reached, not a fourth
-// pass — even under force_additional_pass.
-func TestFixupStage_RefundNeverExtendsRawCeiling(t *testing.T) {
+// TestFixupStage_CrashRefundCreditsRawCeiling (#3335, INVERTED from the pre-change
+// "never extends the RAW ceiling" rule): three triggers each with a refunding
+// category-A crash now CREDIT the ceiling (3 credits, capped at
+// maxCeilingRefundCredits) -> effective ceiling count 0 -> the fourth pass is
+// ADMITTED (was fixup_ceiling_reached even under force). This is the exact run
+// 26663b11 shape the change unblocks. The companion
+// TestFixupStage_CeilingRefundCreditsAreCapped proves the cap still refuses at
+// seven passes.
+func TestFixupStage_CrashRefundCreditsRawCeiling(t *testing.T) {
 	s, repo, au := fixupServer(t)
 	stage := seedImplementGateStage(repo)
 	seedConcernsReview(au, stage,
@@ -1264,12 +1447,13 @@ func TestFixupStage_RefundNeverExtendsRawCeiling(t *testing.T) {
 		seedFixupRecoveredC(au, stage.RunID, stage.ID, run.FailureA, base+2)
 	}
 
-	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ForceAdditionalPass: true})
-	if w.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d, want 422 at the ceiling:\n%s", w.Code, w.Body.String())
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (three delivered-nothing crashes credit the ceiling):\n%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "fixup_ceiling_reached") {
-		t.Errorf("body missing fixup_ceiling_reached (a refund must not extend the RAW ceiling): %s", w.Body.String())
+	payload := lastFixupTriggeredPayload(t, au)
+	if payload["ceiling_refunded_passes"].(float64) != 3 {
+		t.Errorf("ceiling_refunded_passes = %v, want 3", payload["ceiling_refunded_passes"])
 	}
 }
 

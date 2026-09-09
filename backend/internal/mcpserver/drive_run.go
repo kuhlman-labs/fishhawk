@@ -1445,7 +1445,7 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 		forcedFixup := SuggestedAction{
 			Action:       "fishhawk_fixup_stage",
 			Params:       withParams(params, map[string]string{"concern_ids": "run.concerns.items[].id", "force_additional_pass": "true"}),
-			Precondition: "the delegated route_fixup gate met but the NORMAL fix-up budget is spent (fixup_budget_exhausted); the hard ceiling of 3 total passes is not reached. Stay on a clean default branch — the runner owns the run branch in its lineage worktree",
+			Precondition: "the delegated route_fixup gate met but the NORMAL fix-up budget is spent (fixup_budget_exhausted); the hard ceiling is not reached (base 3 passes; delivered-nothing passes credit the ceiling up to 3, absolute bound 6 triggered passes, #3335). Stay on a clean default branch — the runner owns the run branch in its lineage worktree",
 			Consumes:     consumesFixupBudget,
 			Reason:       "grant ONE bounded operator override pass (force_additional_pass=true) to route the open concern(s) back to the agent; the forced pass is audited, then re-invoke fishhawk_drive_run",
 		}

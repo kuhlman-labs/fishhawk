@@ -74,6 +74,22 @@ const defaultMaxFixupPasses = 1
 // stop: merge-with-follow-up or a fresh run), not fixup_budget_exhausted.
 const defaultFixupCeiling = 3
 
+// maxCeilingRefundCredits is the RUNAWAY-COST GUARD (#3335). A fix-up pass that
+// delivered NOTHING is refunded against the HARD CEILING as well as the normal
+// budget (run.FixupOptions.CeilingRefundedPasses), so two harness loop-detector
+// kills that pushed nothing no longer exhaust a run's whole remediation budget.
+// This bounds that credit: the absolute ceiling stays defaultFixupCeiling +
+// maxCeilingRefundCredits = 6 triggered passes, so a pathologically crashing
+// agent can never loop unbounded.
+//
+// RATIFIED POLICY NUMBER (operator condition 4): keep this a single named
+// constant here AND on the MCP mirror side (mcpserver.maxCeilingRefundCredits)
+// — each carrying this KEEP-IN-SYNC warning — so the number stays cheap to
+// change later. If the two drift, the review_action_hint would announce ceiling
+// headroom the backend refuses (or vice versa), the #968 hint-vs-backend
+// disagreement class.
+const maxCeilingRefundCredits = 3
+
 // operatorConcernCategory / operatorConcernSeverity classify the concern the
 // handler builds from a free-text operator_concern (#1311). The category is
 // "operator" (it is operator-authored, not reviewer-emitted) and the severity
@@ -493,10 +509,12 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	//
 	// Implemented by widening MaxPasses by the refund count, equivalent to
 	// subtracting the refunds from the budget comparison
-	// (raw >= max+refunded ⟺ raw-refunded >= max), while HardCeiling keeps
-	// counting RAW triggered passes — so the absolute 3-pass cap is unaffected
-	// (a category-A/B failure that PUSHED, or a pathologically no-op'ing agent,
-	// is still hard-stopped, and no refund can ever extend the RAW ceiling).
+	// (raw >= max+refunded ⟺ raw-refunded >= max). Since #3335 the HARD CEILING
+	// is ALSO credited for delivered-nothing refunds, but BOUNDED by
+	// maxCeilingRefundCredits (min() below), so the ABSOLUTE cap stays
+	// defaultFixupCeiling + maxCeilingRefundCredits = 6 triggered passes — a
+	// pathologically no-op'ing agent is still hard-stopped, and a pass that
+	// PUSHED is vetoed from crediting either budget or ceiling.
 	refundedPasses, crashedWithoutPush, err := s.fixupRefundedPasses(r.Context(), stage.RunID, stageID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -574,13 +592,24 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// the request validation, the model/budget gates above, and the sentinel
 	// error → HTTP mapping below; run.FixupStage's errors are returned
 	// verbatim and mapped here exactly as before.
+	// Credit the HARD CEILING for delivered-nothing refunds (#3335), bounded
+	// by maxCeilingRefundCredits so the absolute cap survives. refundedPasses
+	// is already clamped to priorPasses above; min() with the runaway-cost
+	// guard keeps the absolute ceiling at defaultFixupCeiling +
+	// maxCeilingRefundCredits.
+	ceilingCredits := refundedPasses
+	if ceilingCredits > maxCeilingRefundCredits {
+		ceilingCredits = maxCeilingRefundCredits
+	}
+
 	dec, prBodyObligations, err := s.fixupStageAs(r.Context(), id, fixupActionParams{
 		StageID: stageID,
 		Options: run.FixupOptions{
-			PriorPassCount:      priorPasses,
-			MaxPasses:           defaultMaxFixupPasses + refundedPasses,
-			ForceAdditionalPass: reqBody.ForceAdditionalPass,
-			HardCeiling:         defaultFixupCeiling,
+			PriorPassCount:        priorPasses,
+			MaxPasses:             defaultMaxFixupPasses + refundedPasses,
+			ForceAdditionalPass:   reqBody.ForceAdditionalPass,
+			HardCeiling:           defaultFixupCeiling,
+			CeilingRefundedPasses: ceilingCredits,
 		},
 		Selected:         selected,
 		ConcernIDs:       concernIDs,
@@ -616,17 +645,34 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 			// a run-bound mcp:run:<uuid> token (run_token_forbidden).
 			s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_ceiling_reached",
 				err.Error(), map[string]any{
-					"ceiling":     defaultFixupCeiling,
-					"used":        priorPasses,
-					"remediation": "fix-up ceiling reached; for a late CI/SAST finding, commit the fix on the run branch then fishhawk_vouch_commit it (operator/operator-agent token, NOT the run's fhm_ token) so the operator commit clears the run's sole-writer lineage gate without breaking ADR-035 (#1068/#1044). Otherwise merge with a follow-up or start a fresh run.",
+					"ceiling": defaultFixupCeiling,
+					"used":    priorPasses,
+					// #3335: the delivered-nothing refunds credited against the
+					// ceiling, and the surviving slots (0 — the ceiling is the hard
+					// stop). The message from run.FixupStage names the absolute bound
+					// (ceiling + credit).
+					"ceiling_refunded_passes": ceilingCredits,
+					"remaining_ceiling_slots": 0,
+					"absolute_ceiling":        defaultFixupCeiling + maxCeilingRefundCredits,
+					"remediation":             "fix-up ceiling reached; for a late CI/SAST finding, commit the fix on the run branch then fishhawk_vouch_commit it (operator/operator-agent token, NOT the run's fhm_ token) so the operator commit clears the run's sole-writer lineage gate without breaking ADR-035 (#1068/#1044). Otherwise merge with a follow-up or start a fresh run.",
 				})
 			return
 		case errors.Is(err, run.ErrFixupBudgetExhausted):
+			// remaining_ceiling_slots (#3335): the ceiling headroom an operator
+			// reaching for force_additional_pass has BEFORE spending it — the
+			// ceiling arm above did not fire, so priorPasses-ceilingCredits <
+			// defaultFixupCeiling and this is >= 1.
+			budgetCeilingSlots := defaultFixupCeiling - (priorPasses - ceilingCredits)
+			if budgetCeilingSlots < 0 {
+				budgetCeilingSlots = 0
+			}
 			s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_budget_exhausted",
 				err.Error(), map[string]any{
-					"max_passes":      defaultMaxFixupPasses,
-					"used":            priorPasses,
-					"refunded_passes": refundedPasses,
+					"max_passes":              defaultMaxFixupPasses,
+					"used":                    priorPasses,
+					"refunded_passes":         refundedPasses,
+					"ceiling_refunded_passes": ceilingCredits,
+					"remaining_ceiling_slots": budgetCeilingSlots,
 					// crashed_without_push (#3085): of the refunding windows,
 					// how many refunded on a DEATH (a category-A or category-C
 					// crash that pushed nothing) rather than merely on a
@@ -1407,11 +1453,23 @@ func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.Fixu
 	passOrdinal := priorPasses + 1
 	admissibilityReason := fmt.Sprintf("fix-up pass %d of %d; %d concern(s) routed back; via %s",
 		passOrdinal, defaultMaxFixupPasses, len(selected), fixupScopeUsed(id))
+	// Ceiling refund credit (#3335): the delivered-nothing refunds credited
+	// against the HARD CEILING, bounded by the runaway-cost guard. min() with
+	// maxCeilingRefundCredits mirrors handleFixupStage exactly.
+	ceilingCredits := refundedPasses
+	if ceilingCredits > maxCeilingRefundCredits {
+		ceilingCredits = maxCeilingRefundCredits
+	}
 	if refundedPasses > 0 {
 		// Generalised for #3085: the refund is no longer no-change-only — a
 		// delivered-nothing crash (category A or C) refunds too, so naming the
 		// kind here would be false for a crash refund.
 		admissibilityReason += fmt.Sprintf("; %d delivered-nothing pass(es) refunded", refundedPasses)
+		if ceilingCredits > 0 {
+			// #3335: when a refund credited the ceiling, name the surviving
+			// slots so the receipt shows the ceiling headroom this pass leaves.
+			admissibilityReason += fmt.Sprintf("; %d ceiling slot(s) remain (credited %d)", dec.RemainingCeilingSlots, ceilingCredits)
+		}
 	}
 	if dec.Forced {
 		// Durably record that this pass ran past the normal budget only
@@ -1432,21 +1490,26 @@ func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.Fixu
 	// boolean is the server-side eligibility half of the same provenance.
 	applyEligible := fixupApplyEligible(selected)
 	fields := map[string]any{
-		"stage_id":             dec.Stage.ID.String(),
-		"prior_state":          string(dec.PriorState),
-		"concern_ids":          routedIDs,
-		"selected_indices":     indices,
-		"concerns":             selected,
-		"reason":               reason,
-		"allow_create":         allowCreate,
-		"pass_ordinal":         passOrdinal,
-		"max_passes":           defaultMaxFixupPasses,
-		"hard_ceiling":         defaultFixupCeiling,
-		"remaining_budget":     dec.RemainingBudget,
-		"refunded_passes":      refundedPasses,
-		"forced":               dec.Forced,
-		"admissibility_reason": admissibilityReason,
-		"apply_eligible":       applyEligible,
+		"stage_id":         dec.Stage.ID.String(),
+		"prior_state":      string(dec.PriorState),
+		"concern_ids":      routedIDs,
+		"selected_indices": indices,
+		"concerns":         selected,
+		"reason":           reason,
+		"allow_create":     allowCreate,
+		"pass_ordinal":     passOrdinal,
+		"max_passes":       defaultMaxFixupPasses,
+		"hard_ceiling":     defaultFixupCeiling,
+		"remaining_budget": dec.RemainingBudget,
+		"refunded_passes":  refundedPasses,
+		// #3335: the delivered-nothing refunds credited against the hard
+		// ceiling and the ceiling slots surviving THIS admission, so an
+		// operator reading the receipt sees the absolute-cap headroom.
+		"ceiling_refunded_passes": ceilingCredits,
+		"remaining_ceiling_slots": dec.RemainingCeilingSlots,
+		"forced":                  dec.Forced,
+		"admissibility_reason":    admissibilityReason,
+		"apply_eligible":          applyEligible,
 	}
 	// Fix-up model pin (#1164): the source-tagged model this pass will run
 	// under (operator override or the run's inherited resolution). Present

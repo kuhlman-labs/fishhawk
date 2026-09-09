@@ -260,7 +260,7 @@ func fixupRecoveryMessage(rec *FixupRecovery) string {
 		b.WriteString(" " + fixupRecoveryUntrustedClose)
 	}
 	b.WriteString(" Confirm with `git log` on the PR head: the fix-up commit is absent.")
-	b.WriteString(" Fix-up budget, as it stands today: a fix-up pass that delivered NOTHING to the PR branch is refunded against the normal budget — whether it died category-A (harness, #3085) or category-C (infrastructure, #1957), or produced no commit at all (#967). A category-B (policy) failure still CONSUMES a pass, as does any pass that pushed a commit before it died. No refund extends the hard ceiling of 3 total passes.")
+	b.WriteString(" Fix-up budget, as it stands today: a fix-up pass that delivered NOTHING to the PR branch is refunded against the normal budget — whether it died category-A (harness, #3085) or category-C (infrastructure, #1957), or produced no commit at all (#967). A category-B (policy) failure still CONSUMES a pass, as does any pass that pushed a commit before it died. Since #3335 a delivered-nothing pass is credited against the hard ceiling as well as the normal budget, capped at 3 such credits, so the absolute bound is 6 triggered passes.")
 	return b.String()
 }
 

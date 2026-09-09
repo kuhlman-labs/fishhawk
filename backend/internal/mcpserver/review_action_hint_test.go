@@ -296,10 +296,12 @@ func TestReviewActionHintFor(t *testing.T) {
 		{
 			// #1150 (d): two triggered + one refund => effectiveConsumed=1,
 			// which is NOT < maxFixupPasses(1), so the NORMAL arm does not
-			// fire — the override arm does. raw priorPasses=2 is still < the
-			// hard ceiling of 3, so an override pass is available. Proves the
-			// override arm keys off RAW priorPasses, not effectiveConsumed.
-			name:          "two passes, one refund -> override (keys off raw priorPasses)",
+			// fire — the override arm does. Since #3335 the ceiling arm compares
+			// the CREDITED count (2 - min(1,3) = 1 < 3), so an override pass is
+			// available. The result is unchanged from the pre-#3335 raw
+			// comparison here, but the arm now keys off the credited effective
+			// count, not RAW priorPasses.
+			name:          "two passes, one refund -> override (credited below ceiling)",
 			status:        completeStatus(),
 			seedConcerns:  1,
 			priorPasses:   2,
@@ -310,22 +312,20 @@ func TestReviewActionHintFor(t *testing.T) {
 			wantOverride:  true,
 		},
 		{
-			// #1150 (d) boundary: three triggered + one refund =>
-			// effectiveConsumed=2. If the ceiling arm wrongly keyed off
-			// effectiveConsumed (2 < 3) it would still offer an override; it
-			// must key off RAW priorPasses=3, which is at the ceiling => no
-			// override left. This is the case that truly distinguishes raw
-			// from effective.
-			name:                "ceiling keys off raw passes despite refund -> no override",
-			status:              completeStatus(),
-			seedConcerns:        1,
-			priorPasses:         3,
-			refunds:             1,
-			wantNil:             false,
-			wantConcerns:        1,
-			wantRemaining:       0,
-			wantOverride:        false,
-			wantMessageContains: "fishhawk_vouch_commit",
+			// #3335: a delivered-nothing refund now CREDITS the ceiling too. Three
+			// triggered + one refund => effectiveCeilingCount = 3 - min(1,3) = 2 <
+			// 3, so the ceiling is NOT reached and effectiveConsumed = 2 (not < 1)
+			// yields the override arm. (Pre-#3335 this refused as ceiling-reached
+			// with the vouch message — the rule this issue inverts.)
+			name:          "refund credits ceiling -> override available",
+			status:        completeStatus(),
+			seedConcerns:  1,
+			priorPasses:   3,
+			refunds:       1,
+			wantNil:       false,
+			wantConcerns:  1,
+			wantRemaining: 0,
+			wantOverride:  true,
 		},
 		{
 			name:                "ceiling reached -> hard-stop hint, no override",
@@ -484,17 +484,34 @@ func TestReviewActionHintFor(t *testing.T) {
 			wantOverride:  false,
 		},
 		{
-			// #1957 (g): ceiling precedence — three raw triggers each with an
-			// in-window C signal (raw=3, refunds=3). The hard-ceiling check is
-			// hoisted ahead of the normal-budget arm (matching the backend's
-			// ErrFixupCeilingReached-before-budget precedence), so even though
-			// the summed refunds leave effectiveConsumed=0, priorPasses=3 at the
-			// ceiling yields remaining=0/override=false and the ceiling message,
-			// NOT a spurious remaining normal pass.
-			name:                "raw ceiling with full refunds -> no override (ceiling precedence)",
+			// #3335: three raw triggers each with an in-window C signal (raw=3,
+			// refunds=3). Since the ceiling now credits delivered-nothing refunds
+			// (bounded by maxCeilingRefundCredits=3), effectiveCeilingCount =
+			// 3 - min(3,3) = 0 < 3, so the ceiling is NOT reached and
+			// effectiveConsumed = 0 < 1 yields the normal route-back arm with a
+			// restored budget. (Pre-#3335 this refused as ceiling-reached — the
+			// exact state run 26663b11 stranded, now recoverable.)
+			name:          "three refunds credit ceiling -> route-back restored",
+			status:        completeStatus(),
+			seedConcerns:  1,
+			infraRounds:   3,
+			wantNil:       false,
+			wantConcerns:  1,
+			wantRemaining: 1,
+			wantOverride:  false,
+		},
+		{
+			// #3335 control 5 (the MCP mirror's OWN min() cap): SEVEN refunding
+			// windows (raw=7, refunds=7). The credit is CAPPED at
+			// maxCeilingRefundCredits=3, so effectiveCeilingCount = 7 - 3 = 4 >= 3
+			// -> the ceiling IS reached, matching the backend's capped refusal.
+			// Delete the mirror's min() and the credit becomes 7 -> effective 0 ->
+			// the hint would announce headroom the backend refuses (RED on
+			// remaining=0/the vouch message).
+			name:                "seven refunds capped -> ceiling reached (mirror cap)",
 			status:              completeStatus(),
 			seedConcerns:        1,
-			infraRounds:         3,
+			infraRounds:         7,
 			wantNil:             false,
 			wantConcerns:        1,
 			wantRemaining:       0,

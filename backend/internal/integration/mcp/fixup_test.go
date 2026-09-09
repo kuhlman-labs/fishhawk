@@ -1591,8 +1591,9 @@ func succeedFixupPushViaBackend(t *testing.T, ctx context.Context, fx *e2eFixtur
 //   - (b) a {outcome:"fixup_no_changes"} /pull-request report refunds the
 //     spent pass against the NORMAL budget (a second trigger is admitted
 //     without force_additional_pass, with refunded_passes recorded on the
-//     audit payload), while the absolute 3-pass ceiling keeps counting RAW
-//     triggered passes and still rejects the pass beyond it.
+//     audit payload), and CREDITS the hard ceiling by one (#3335) so the
+//     absolute cap here is 3 + 1 = 4 raw passes — the pass beyond THAT is
+//     rejected fixup_ceiling_reached.
 func TestE2E_Fixup_ExpectedHeadAdvertisedAndNoChangeRefund(t *testing.T) {
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1717,15 +1718,20 @@ func TestE2E_Fixup_ExpectedHeadAdvertisedAndNoChangeRefund(t *testing.T) {
 		t.Error("refund-admitted pass audited as forced; want a normal-budget pass")
 	}
 
-	// 7. The ceiling counts RAW passes: a third pass (forced — the refund
-	// is consumed) reaches 3 raw passes, and the next attempt is rejected
-	// with the DISTINCT ceiling error even when forced.
+	// 7. The single delivered-nothing refund CREDITS the ceiling by one (#3335),
+	// so the absolute cap here is defaultFixupCeiling(3) + 1 = 4 raw passes.
+	// Pass 3 (forced) and pass 4 (forced) are both admitted — the fourth is the
+	// extra slot the credit bought — and only the FIFTH attempt is refused with
+	// the DISTINCT ceiling error.
 	if res := callFixup(true); res.IsError {
 		t.Fatalf("third fix-up returned error: %s", toolContentString(t, res))
 	}
+	if res := callFixup(true); res.IsError {
+		t.Fatalf("fourth fix-up (the credited ceiling slot) returned error: %s", toolContentString(t, res))
+	}
 	ceil := callFixup(true)
 	if !ceil.IsError {
-		t.Fatalf("fix-up beyond the raw ceiling unexpectedly succeeded; want fixup_ceiling_reached")
+		t.Fatalf("fix-up beyond the credited ceiling unexpectedly succeeded; want fixup_ceiling_reached")
 	}
 	if body := toolContentString(t, ceil); !strings.Contains(body, "fixup_ceiling_reached") {
 		t.Errorf("ceiling fix-up error missing fixup_ceiling_reached code: %s", body)
@@ -2573,9 +2579,10 @@ func decodeStructured(t *testing.T, r *mcp.CallToolResult, dst any) {
 //     delivered-nothing invariant (#1957) it REFUNDS against the normal budget:
 //     the next pass is admitted WITHOUT force_additional_pass and re-parks the
 //     review stage again (superseding the pre-#1957 forced-override path);
-//  4. the refund widens the normal budget but NEVER the absolute ceiling — three
-//     RAW stage_fixup_triggered entries hard-stop the stage with
-//     fixup_ceiling_reached even under force and despite three refunds.
+//  4. #3335: three delivered-nothing recoveries CREDIT the hard ceiling (bounded
+//     by maxCeilingRefundCredits), so raw=3/refunds=3 admits a fourth pass rather
+//     than hard-stopping — the run-26663b11 recovery the change unblocks; the
+//     absolute cap (raw=6) is pinned separately by the cap tests.
 func TestE2E_Fixup_DuplicateFailureReportThenRefundedPass(t *testing.T) {
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -2800,55 +2807,169 @@ func TestE2E_Fixup_DuplicateFailureReportThenRefundedPass(t *testing.T) {
 	}
 	recoverCategoryC("after third pass recovery") // raw=3, refunds=3
 
-	// Pass 4 at the raw ceiling: refused even with force_additional_pass — the
-	// refunds widened the normal budget but the RAW-trigger ceiling of 3 is the
-	// unconditional loop bound.
+	// Pass 4: #3335 INVERTS the pre-change "refunds never extend the ceiling"
+	// rule — three delivered-nothing recoveries now CREDIT the hard ceiling
+	// (bounded by maxCeilingRefundCredits=3), so raw=3/refunds=3 leaves the
+	// effective ceiling count at 0 and the fourth pass is ADMITTED. This is the
+	// exact run-26663b11 recovery the change unblocks; the absolute cap (raw=6)
+	// is pinned separately by the unit/e2e cap tests.
 	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
 		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "one drift too many"})
 
-	// At the raw ceiling (raw=3, refunds=3) the hint must AGREE with the
-	// backend's fixup_ceiling_reached refusal: RemainingFixupBudget=0 and
-	// OverrideAvailable=false. This pins the ceiling-precedence hoist — even
-	// though the summed refunds leave effectiveConsumed below the normal budget,
-	// the RAW-trigger ceiling is checked FIRST (mirroring the backend's
-	// ErrFixupCeilingReached-before-budget precedence), so the hint must NOT
-	// advertise a spurious remaining normal pass the endpoint would refuse.
+	// At raw=3/refunds=3 the credited ceiling leaves the route-back restored:
+	// the hint agrees with the backend admitting a normal pass —
+	// RemainingFixupBudget=1 and OverrideAvailable=false (a route-back, not an
+	// override, and not a hard stop).
 	hintAtCeiling := getReviewActionHint(t, ctx, session, fx.runID)
 	if hintAtCeiling == nil {
-		t.Fatal("review_action_hint = nil at the raw ceiling, want a populated hint agreeing with the fixup_ceiling_reached refusal")
+		t.Fatal("review_action_hint = nil after three refunds, want a populated hint agreeing with the credited route-back")
 	}
-	if hintAtCeiling.RemainingFixupBudget != 0 {
-		t.Errorf("review_action_hint.remaining_fixup_budget = %d at the raw ceiling, want 0 (the RAW-trigger ceiling is reached; the hint must agree with the backend's fixup_ceiling_reached refusal, not advertise a refund-widened normal pass)", hintAtCeiling.RemainingFixupBudget)
+	if hintAtCeiling.RemainingFixupBudget != 1 {
+		t.Errorf("review_action_hint.remaining_fixup_budget = %d after three refunds, want 1 (the ceiling is credited; the route-back is restored)", hintAtCeiling.RemainingFixupBudget)
 	}
 	if hintAtCeiling.OverrideAvailable {
-		t.Errorf("review_action_hint.override_available = true at the raw ceiling, want false (no override left past the hard ceiling)")
+		t.Errorf("review_action_hint.override_available = true, want false (a normal route-back is available, not an override)")
 	}
 
 	ceilingRes, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "fishhawk_fixup_stage",
 		Arguments: map[string]any{
-			"stage_id":              impl.ID.String(),
-			"concerns":              []int{0},
-			"reason":                "attempt past the raw ceiling",
-			"force_additional_pass": true,
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "fourth pass — the credited ceiling admits it",
 		},
 	})
 	if err != nil {
-		t.Fatalf("CallTool ceiling fishhawk_fixup_stage: %v", err)
+		t.Fatalf("CallTool fourth fishhawk_fixup_stage: %v", err)
 	}
-	if !ceilingRes.IsError {
-		t.Fatalf("fourth pass admitted — the RAW-trigger ceiling of 3 must hard-stop the stage even with force and despite the refunds")
-	}
-	if got := toolContentString(t, ceilingRes); !strings.Contains(got, "fixup_ceiling_reached") {
-		t.Errorf("ceiling refusal = %q, want fixup_ceiling_reached (refunds must never extend the raw-trigger ceiling)", got)
+	if ceilingRes.IsError {
+		t.Fatalf("fourth pass refused — three delivered-nothing recoveries must credit the ceiling and admit it (#3335): %s", toolContentString(t, ceilingRes))
 	}
 
 	triggeredFinal, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
 	if err != nil {
 		t.Fatalf("ListForRunByCategory(triggered, final): %v", err)
 	}
-	if len(triggeredFinal) != 3 {
-		t.Errorf("stage_fixup_triggered entries = %d, want 3 (the ceiling refusal writes no fourth trigger)", len(triggeredFinal))
+	if len(triggeredFinal) != 4 {
+		t.Errorf("stage_fixup_triggered entries = %d, want 4 (the credited fourth pass writes a trigger)", len(triggeredFinal))
+	}
+}
+
+// TestE2E_Fixup_TwoNoPushCategoryADeathsLeaveAThirdPassAvailable is the #3335
+// DONE-MEANS vehicle, driving the exact run-26663b11 sequence across the MCP →
+// server → run → audit layers: pass 1 PUSHES a commit (fixup_pushed, so the push
+// veto keeps it consuming a ceiling slot), then TWO forced passes each DIE
+// category-A having pushed nothing (each a stage_fixup_recovered/source_failure_
+// category:A, the #3085 delivered-nothing shape). Under #3335 those two
+// delivered-nothing deaths CREDIT the hard ceiling, so the FOURTH fixup call is
+// ADMITTED (200, not 422 fixup_ceiling_reached) and its audit receipt reports the
+// credited counts. Before the change the fourth pass hit the raw ceiling and the
+// run stranded with verified defects and no pass left.
+func TestE2E_Fixup_TwoNoPushCategoryADeathsLeaveAThirdPassAvailable(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	if _, err := fx.runRepo.TransitionRun(ctx, fx.runID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun → running: %v", err)
+	}
+
+	// push_and_open_pr shape: implement SUCCEEDED (PR open), separate review
+	// stage holding the human gate.
+	impl, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: fx.runID, Sequence: 1, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1", RequiresApproval: false,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(implement): %v", err)
+	}
+	walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+	review, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: fx.runID, Sequence: 2, Type: runpkg.StageTypeReview,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1", RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(review): %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, review.ID)
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+
+	fixupCall := func(force bool, reason string) *mcp.CallToolResult {
+		t.Helper()
+		seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+			planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "still drifting"})
+		args := map[string]any{"stage_id": impl.ID.String(), "concerns": []int{0}, "reason": reason}
+		if force {
+			args["force_additional_pass"] = true
+		}
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "fishhawk_fixup_stage", Arguments: args})
+		if err != nil {
+			t.Fatalf("CallTool fishhawk_fixup_stage (%s): %v", reason, err)
+		}
+		return res
+	}
+
+	// restoreGate models the death+recovery / push aftermath: the fix-up re-opened
+	// implement→pending and review→pending; put the run back in the
+	// push_and_open_pr gate shape so the next pass is applicable.
+	restoreGate := func() {
+		walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+		parkAtGate(t, ctx, fx.runRepo, review.ID)
+	}
+
+	// Pass 1: admitted, then PUSHES a commit — the push veto keeps it consuming a
+	// ceiling slot (it delivered something).
+	if res := fixupCall(false, "pass 1 lands a commit"); res.IsError {
+		t.Fatalf("pass 1 refused: %s", toolContentString(t, res))
+	}
+	seedReportedHead(t, ctx, auditRepo, fx.runID, impl.ID, server.CategoryFixupPushed, "cafebabe01", time.Now().UTC())
+	restoreGate()
+
+	// Pass 2: forced (normal budget spent), then dies category-A having pushed
+	// nothing — a #3085 delivered-nothing recovery that refunds AND credits.
+	if res := fixupCall(true, "pass 2 forced"); res.IsError {
+		t.Fatalf("pass 2 refused: %s", toolContentString(t, res))
+	}
+	seedFixupRecoveredCategory(t, ctx, auditRepo, fx.runID, impl.ID, "A")
+	restoreGate()
+
+	// Pass 3: forced, then dies category-A having pushed nothing.
+	if res := fixupCall(true, "pass 3 forced"); res.IsError {
+		t.Fatalf("pass 3 refused: %s", toolContentString(t, res))
+	}
+	seedFixupRecoveredCategory(t, ctx, auditRepo, fx.runID, impl.ID, "A")
+	restoreGate()
+
+	// Pass 4: raw=3, refunds=2 (the two category-A deaths; pass 1's push is
+	// vetoed). The two delivered-nothing deaths CREDIT the ceiling, so effective
+	// ceiling count = 3 - 2 = 1 < 3 -> ADMITTED (was fixup_ceiling_reached before
+	// #3335). A no-op touch of server/fixup.go leaves this RED.
+	fourth := fixupCall(true, "pass 4 — the credited ceiling admits it")
+	if fourth.IsError {
+		t.Fatalf("FOURTH pass refused — two no-push category-A deaths must credit the ceiling and leave a pass available (#3335): %s", toolContentString(t, fourth))
+	}
+
+	triggered, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(triggered): %v", err)
+	}
+	if len(triggered) != 4 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want 4", len(triggered))
+	}
+	var receipt struct {
+		RefundedPasses        float64 `json:"refunded_passes"`
+		CeilingRefundedPasses float64 `json:"ceiling_refunded_passes"`
+	}
+	if err := json.Unmarshal(triggered[len(triggered)-1].Payload, &receipt); err != nil {
+		t.Fatalf("unmarshal fourth-pass receipt: %v", err)
+	}
+	if receipt.RefundedPasses != 2 {
+		t.Errorf("fourth-pass refunded_passes = %v, want 2 (the two category-A deaths)", receipt.RefundedPasses)
+	}
+	if receipt.CeilingRefundedPasses != 2 {
+		t.Errorf("fourth-pass ceiling_refunded_passes = %v, want 2 (the credited ceiling slots)", receipt.CeilingRefundedPasses)
 	}
 }
 

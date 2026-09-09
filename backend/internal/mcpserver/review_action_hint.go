@@ -31,6 +31,20 @@ const maxFixupPasses = 1
 // fixup_ceiling_reached fires at exactly this many total passes end-to-end.
 const fixupCeiling = 3
 
+// maxCeilingRefundCredits mirrors backend server.maxCeilingRefundCredits
+// (backend/internal/server/fixup.go), which is unexported. KEEP IN SYNC
+// (RATIFIED POLICY NUMBER, operator condition 4): it bounds how many
+// delivered-nothing refunds credit the HARD CEILING (#3335) so the absolute cap
+// stays fixupCeiling + maxCeilingRefundCredits = 6 triggered passes. The hoisted
+// ceiling arm subtracts min(refunds, maxCeilingRefundCredits) from priorPasses
+// exactly as the backend does; refunds is already defensively clamped to
+// priorPasses above (fixupRefundedPasses returns >= 0 by construction), so no
+// LOWER clamp is needed on this side. If this drifts from the backend the hint
+// announces ceiling headroom the backend refuses — the #968 hint-vs-backend
+// disagreement class. If the backend's upstream `refunds > priorPasses` clamp is
+// ever removed the mirror's arithmetic becomes unsound.
+const maxCeilingRefundCredits = 3
+
 // categoryStageFixupTriggered mirrors backend server.CategoryStageFixupTriggered
 // (backend/internal/server/fixup.go). KEEP IN SYNC: it is the audit-log
 // category the backend writes one entry per fix-up pass under, and the MCP
@@ -154,7 +168,7 @@ type ReviewActionHint struct {
 	Concerns             int    `json:"concerns" jsonschema:"number of open approve_with_concerns implement-stage concerns. AUTHORITATIVE by default: the open implement-stage count from the run's store-derived concern block, equal to fishhawk_get_gate_view(stage_kind=implement).open. Falls back to the LATEST-round audit-derived sum only in the two degraded source states (the concern block was unavailable, or a legacy peer omitted the authoritative count)"`
 	Source               string `json:"source,omitempty" jsonschema:"provenance of the concern count: 'store' (authoritative — the store-derived open concern block, agreeing with the gate view); 'audit_fallback_store_unavailable' (degraded — the concern block was ABSENT because the store read failed or is unwired, so the count came from audit payloads); or 'audit_fallback_legacy_peer' (degraded — the block was PRESENT but a backend peer predating the authoritative count omitted it, so the store read succeeded yet the count still came from audit payloads). Audit payloads do not track concern lifecycle; on either fallback, verify with fishhawk_get_gate_view. Always set on a live hint"`
 	RemainingFixupBudget int    `json:"remaining_fixup_budget" jsonschema:"remaining NORMAL fix-up passes for the implement stage (max_passes minus prior stage_fixup_triggered entries that were NOT refunded); 0 once the budget is spent, restored when a prior pass DELIVERED NOTHING to the PR branch — it produced no commit (#967), or it died category-C on infrastructure (#1957), or its harness died category-A (#3085). A pass that PUSHED a commit consumes budget however it later died, and a category-B policy failure always consumes one"`
-	OverrideAvailable    bool   `json:"override_available" jsonschema:"true when the NORMAL budget is spent but an operator override pass (fishhawk_fixup_stage with force_additional_pass=true) can still be granted below the hard ceiling of 3 total passes; false below budget (no override needed) and at/above the ceiling (no override left)"`
+	OverrideAvailable    bool   `json:"override_available" jsonschema:"true when the NORMAL budget is spent but an operator override pass (fishhawk_fixup_stage with force_additional_pass=true) can still be granted below the hard ceiling; false below budget (no override needed) and at/above the ceiling (no override left). The ceiling is credited for delivered-nothing refunds up to a bounded cap (#3335), so a pass that pushed nothing does not count toward it — the absolute cap is 6 total triggered passes"`
 	Message              string `json:"message" jsonschema:"one-line advisory pointer at the next action: route concerns back with fishhawk_fixup_stage vs approving to merge (below budget), the operator override vs merge-with-follow-up (budget spent, below ceiling), or merge-with-follow-up vs a fresh run (at the ceiling); display-only, never gates the run"`
 }
 
@@ -505,7 +519,8 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 	// the same single evaluation here so the surfaced budget agrees with the
 	// backend's admit decision; a mirror that double-counts where the backend
 	// does not is worse than no mirror. The refund only affects the
-	// NORMAL-budget arm; the hard ceiling keeps counting RAW passes.
+	// NORMAL-budget arm; the hard ceiling credits refunds up to
+	// maxCeilingRefundCredits (#3335).
 	//
 	// The four unioned signal shapes:
 	//   - #967/#1150: fixup_no_changes — a re-dispatch that produced no commit.
@@ -533,25 +548,45 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 		remaining = 0
 	}
 
+	// Ceiling refund credit (#3335), mirroring the backend: a delivered-nothing
+	// refund credits the HARD CEILING too, bounded by maxCeilingRefundCredits so
+	// the absolute cap survives. refunds is already clamped to priorPasses above,
+	// so no lower clamp is needed. effectiveCeilingCount is what the backend's
+	// ceiling arm actually compares against (priorPasses - credit).
+	ceilingCredit := refunds
+	if ceilingCredit > maxCeilingRefundCredits {
+		ceilingCredit = maxCeilingRefundCredits
+	}
+	effectiveCeilingCount := priorPasses - ceilingCredit
+	// Ceiling slots surviving another admission, floored at 0 — the headroom the
+	// messages below report.
+	remainingCeilingSlots := fixupCeiling - effectiveCeilingCount
+	if remainingCeilingSlots < 0 {
+		remainingCeilingSlots = 0
+	}
+
 	// Hard ceiling reached: hoisted AHEAD of the normal-budget arm to match the
 	// backend's error precedence — run.ErrFixupCeilingReached is checked BEFORE
-	// budget exhaustion (fixup.go:555), so a raw priorPasses at the ceiling
-	// refuses with fixup_ceiling_reached even when the summed refunds would
-	// otherwise leave effectiveConsumed below the normal budget (the raw=3/
-	// refunds=3 state the #1957 E2E drives; unreachable before the infra refund
-	// because the stage-keyed no-change dedup caps refunds at 1). No override
-	// left — merge-with-follow-up, a commit-and-vouch for a late CI/SAST finding
+	// budget exhaustion, so a stage at the ceiling refuses with
+	// fixup_ceiling_reached even when refunds would otherwise leave
+	// effectiveConsumed below the normal budget. Since #3335 the ceiling arm
+	// compares the CREDITED count (priorPasses - min(refunds,
+	// maxCeilingRefundCredits)), mirroring the backend's
+	// FixupOptions.CeilingRefundedPasses: a delivered-nothing refund credits the
+	// ceiling too, bounded so the absolute cap stays fixupCeiling +
+	// maxCeilingRefundCredits. At the credited ceiling there is no override left
+	// — merge-with-follow-up, a commit-and-vouch for a late CI/SAST finding
 	// (#1097), or a fresh run.
 	var hint *ReviewActionHint
 	switch {
-	case priorPasses >= fixupCeiling:
+	case effectiveCeilingCount >= fixupCeiling:
 		hint = &ReviewActionHint{
 			Concerns:             concerns,
 			RemainingFixupBudget: 0,
 			OverrideAvailable:    false,
 			Message: fmt.Sprintf(
-				"%d concern(s) remain but the hard fix-up ceiling of %d total passes is reached — no override left. Merge now and file a follow-up; for a late CI/SAST finding, commit the fix on the run branch then fishhawk_vouch_commit it (operator/operator-agent token, NOT the run's fhm_ token) so the operator commit clears the run's sole-writer lineage gate (ADR-035, #1068/#1044); or start a fresh run to address them.",
-				concerns, fixupCeiling),
+				"%d concern(s) remain but the hard fix-up ceiling of %d total passes is reached (delivered-nothing refunds credit up to %d, absolute cap %d) — no override left. Merge now and file a follow-up; for a late CI/SAST finding, commit the fix on the run branch then fishhawk_vouch_commit it (operator/operator-agent token, NOT the run's fhm_ token) so the operator commit clears the run's sole-writer lineage gate (ADR-035, #1068/#1044); or start a fresh run to address them.",
+				concerns, fixupCeiling, maxCeilingRefundCredits, fixupCeiling+maxCeilingRefundCredits),
 		}
 	case effectiveConsumed < maxFixupPasses:
 		// Below the normal budget (after refunds): the original route-back vs
@@ -583,8 +618,8 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 			RemainingFixupBudget: 0,
 			OverrideAvailable:    true,
 			Message: fmt.Sprintf(
-				"%d concern(s) remain after the fix-up budget is spent (%d/%d normal passes used). Either merge now and file a follow-up, or grant ONE bounded override pass with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id, force_additional_pass=true) — capped at %d total passes.",
-				concerns, priorPasses, maxFixupPasses, implementStageID, fixupCeiling),
+				"%d concern(s) remain after the fix-up budget is spent (%d/%d normal passes used). Either merge now and file a follow-up, or grant ONE bounded override pass with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id, force_additional_pass=true) — %d hard-ceiling slot(s) remain (delivered-nothing refunds credit up to %d, absolute cap %d total passes).",
+				concerns, priorPasses, maxFixupPasses, implementStageID, remainingCeilingSlots, maxCeilingRefundCredits, fixupCeiling+maxCeilingRefundCredits),
 		}
 	}
 

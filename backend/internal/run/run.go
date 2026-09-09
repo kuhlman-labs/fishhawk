@@ -739,14 +739,23 @@ type RequiredChecksSnapshot struct {
 
 // Stage is one ordered unit of work within a run.
 type Stage struct {
-	ID              uuid.UUID
-	RunID           uuid.UUID
-	Sequence        int
-	Type            StageType
-	ExecutorKind    ExecutorKind
-	ExecutorRef     string // e.g. "claude-code" for agent executors
-	State           StageState
-	StartedAt       *time.Time
+	ID           uuid.UUID
+	RunID        uuid.UUID
+	Sequence     int
+	Type         StageType
+	ExecutorKind ExecutorKind
+	ExecutorRef  string // e.g. "claude-code" for agent executors
+	State        StageState
+	StartedAt    *time.Time
+	// DispatchedAt is the PER-ATTEMPT dispatch clock (#3335): stamped by the
+	// migration 0072 trigger on every transition INTO 'dispatched', so a
+	// fix-up re-dispatch or a retry RESETS it — unlike StartedAt, which is
+	// written under COALESCE(started_at, $3) and never overwritten. It is the
+	// clock the stage-wait deadline derivation reads so a re-dispatched stage's
+	// deadline_seconds_remaining reflects the full per-attempt agent budget the
+	// runner actually granted, not a cumulative clock reporting 0. Nil for a
+	// legacy row or a stage that never passed through 'dispatched'.
+	DispatchedAt    *time.Time
 	EndedAt         *time.Time
 	FailureCategory *FailureCategory
 	FailureReason   *string

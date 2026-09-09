@@ -1079,6 +1079,13 @@ func rowToStage(s rundb.Stage) *Stage {
 		t := s.StartedAt.Time
 		out.StartedAt = &t
 	}
+	if s.DispatchedAt.Valid {
+		// Per-attempt dispatch clock (#3335), stamped by the migration 0072
+		// trigger on every transition into 'dispatched' — reset by a fix-up
+		// re-dispatch/retry, unlike started_at.
+		t := s.DispatchedAt.Time
+		out.DispatchedAt = &t
+	}
 	if s.EndedAt.Valid {
 		t := s.EndedAt.Time
 		out.EndedAt = &t

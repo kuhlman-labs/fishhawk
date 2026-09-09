@@ -432,6 +432,106 @@ func TestStageWaitStatusFor_DeadlineFields(t *testing.T) {
 	requireWaitDeadlineKeysAbsent(t, acc, "unknown-budget stage")
 }
 
+// TestStageAttemptStart pins the pure per-attempt-clock selector (#3335):
+// dispatched_at when present, else started_at, else nil.
+func TestStageAttemptStart(t *testing.T) {
+	d := startedAgo(30 * time.Second)
+	s := startedAgo(3000 * time.Second)
+	if got := stageAttemptStart(d, s); got != d {
+		t.Errorf("dispatched present: got %v, want dispatched_at", got)
+	}
+	if got := stageAttemptStart(nil, s); got != s {
+		t.Errorf("dispatched nil: got %v, want started_at fallback", got)
+	}
+	if got := stageAttemptStart(nil, nil); got != nil {
+		t.Errorf("both nil: got %v, want nil", got)
+	}
+}
+
+// TestStageWaitStatusFor_AttemptClockDeadline pins the five #3335 derivation
+// modes: the deadline is derived from the PER-ATTEMPT dispatch clock, while
+// elapsed_seconds stays cumulative from started_at.
+func TestStageWaitStatusFor_AttemptClockDeadline(t *testing.T) {
+	t.Run("dispatched_at newer than started_at -> deadline from dispatch (near-full)", func(t *testing.T) {
+		// started 3000s ago (nearly the whole 3600 budget), but re-dispatched
+		// only 30s ago: the deadline must reflect the fresh per-attempt budget.
+		stages := []Stage{{
+			Type: "implement", State: "running",
+			StartedAt: startedAgo(3000 * time.Second), DispatchedAt: startedAgo(30 * time.Second),
+			AgentTimeoutSeconds: 3600,
+		}}
+		st := stageWaitStatusFor(stages, "implement", "running", 0, waitBase)
+		if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 3570 {
+			t.Fatalf("deadline_seconds_remaining = %v, want 3570 (from the 30s-old dispatch, not the 3000s-old start)", st.DeadlineSecondsRemaining)
+		}
+		if st.AttemptElapsedSeconds == nil || *st.AttemptElapsedSeconds != 30 {
+			t.Errorf("attempt_elapsed_seconds = %v, want 30", st.AttemptElapsedSeconds)
+		}
+		// elapsed_seconds stays cumulative from the original start.
+		if st.ElapsedSeconds != 3000 {
+			t.Errorf("elapsed_seconds = %d, want 3000 (cumulative from started_at)", st.ElapsedSeconds)
+		}
+	})
+
+	t.Run("dispatched_at nil -> falls back to started_at (byte-identical to today)", func(t *testing.T) {
+		stages := []Stage{{
+			Type: "implement", State: "running",
+			StartedAt:           startedAgo(600 * time.Second), // no DispatchedAt
+			AgentTimeoutSeconds: 3600,
+		}}
+		st := stageWaitStatusFor(stages, "implement", "running", 0, waitBase)
+		if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 3000 {
+			t.Fatalf("deadline_seconds_remaining = %v, want 3000 (from started_at fallback)", st.DeadlineSecondsRemaining)
+		}
+		if st.AttemptElapsedSeconds == nil || *st.AttemptElapsedSeconds != 600 {
+			t.Errorf("attempt_elapsed_seconds = %v, want 600 (== elapsed on a never-redispatched stage)", st.AttemptElapsedSeconds)
+		}
+	})
+
+	t.Run("both nil -> deadline omitted", func(t *testing.T) {
+		stages := []Stage{{
+			Type: "implement", State: "running", // no StartedAt, no DispatchedAt
+			AgentTimeoutSeconds: 3600,
+		}}
+		st := stageWaitStatusFor(stages, "implement", "running", 0, waitBase)
+		// Budget known but elapsed 0 -> remaining is the full budget, not omitted.
+		if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 3600 {
+			t.Fatalf("deadline_seconds_remaining = %v, want 3600 (both clocks nil -> elapsed 0)", st.DeadlineSecondsRemaining)
+		}
+	})
+
+	t.Run("agent_timeout 0 -> deadline omitted, elapsed still reported with progress", func(t *testing.T) {
+		stages := []Stage{{
+			Type: "implement", State: "running",
+			StartedAt: startedAgo(600 * time.Second), DispatchedAt: startedAgo(30 * time.Second),
+			// AgentTimeoutSeconds 0 (unresolved spec)
+			Progress: &StageProgress{LastEvent: "assistant"},
+		}}
+		st := stageWaitStatusFor(stages, "implement", "running", 0, waitBase)
+		if st.DeadlineSecondsRemaining != nil {
+			t.Errorf("deadline_seconds_remaining = %v, want nil (budget unresolved)", st.DeadlineSecondsRemaining)
+		}
+		if st.ElapsedSeconds != 600 {
+			t.Errorf("elapsed_seconds = %d, want 600 (reported alongside progress)", st.ElapsedSeconds)
+		}
+		if st.AttemptElapsedSeconds == nil || *st.AttemptElapsedSeconds != 30 {
+			t.Errorf("attempt_elapsed_seconds = %v, want 30 (reported alongside progress)", st.AttemptElapsedSeconds)
+		}
+	})
+
+	t.Run("attempt elapsed >= budget -> clamped to 0", func(t *testing.T) {
+		stages := []Stage{{
+			Type: "implement", State: "running",
+			StartedAt: startedAgo(5000 * time.Second), DispatchedAt: startedAgo(4000 * time.Second),
+			AgentTimeoutSeconds: 3600,
+		}}
+		st := stageWaitStatusFor(stages, "implement", "running", 0, waitBase)
+		if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 0 {
+			t.Fatalf("deadline_seconds_remaining = %v, want 0 (overrun, clamped never negative)", st.DeadlineSecondsRemaining)
+		}
+	})
+}
+
 // TestStageWaitStatusFor_ProjectsProgress (E3 / DONE-MEANS) asserts a
 // mid-execution wait status is no longer one bit: the runner's heartbeat
 // counters + last_event land on the status, while elapsed_seconds comes from

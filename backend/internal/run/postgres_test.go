@@ -969,6 +969,65 @@ func TestPostgres_StageLifecycle(t *testing.T) {
 	}
 }
 
+// TestPostgres_StageDispatchedAtResetsOnRedispatch pins the #3335 invariant the
+// deadline derivation relies on: dispatched_at (migration 0072 trigger) is
+// RE-STAMPED on every transition into 'dispatched', so a fix-up re-dispatch
+// resets it, while started_at (written under COALESCE) stays frozen at the
+// original start. All timestamps are DB-stamped and compared against each other
+// (same clock domain — no cross-clock skew, #3048).
+func TestPostgres_StageDispatchedAtResetsOnRedispatch(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0)
+
+	// First dispatch → running: dispatched_at and started_at both stamped, with
+	// started_at strictly after the first dispatch.
+	dispatched1, err := repo.TransitionStage(ctx, s.ID, run.StageStateDispatched, nil)
+	if err != nil {
+		t.Fatalf("→dispatched: %v", err)
+	}
+	if dispatched1.DispatchedAt == nil {
+		t.Fatal("DispatchedAt should be stamped on first entry to dispatched")
+	}
+	running, err := repo.TransitionStage(ctx, s.ID, run.StageStateRunning, nil)
+	if err != nil {
+		t.Fatalf("→running: %v", err)
+	}
+	if running.StartedAt == nil {
+		t.Fatal("StartedAt should be stamped on first entry to running")
+	}
+	started1 := *running.StartedAt
+
+	// Model a fix-up re-open: running → awaiting_approval (the review gate) →
+	// pending (the fix-up re-open edge) → dispatched again.
+	if _, err := repo.TransitionStage(ctx, s.ID, run.StageStateAwaitingApproval, nil); err != nil {
+		t.Fatalf("→awaiting_approval: %v", err)
+	}
+	if _, err := repo.TransitionStage(ctx, s.ID, run.StageStatePending, nil); err != nil {
+		t.Fatalf("→pending (fix-up re-open): %v", err)
+	}
+	dispatched2, err := repo.TransitionStage(ctx, s.ID, run.StageStateDispatched, nil)
+	if err != nil {
+		t.Fatalf("→dispatched (re-dispatch): %v", err)
+	}
+
+	// dispatched_at RESET: the re-dispatch is stamped AFTER the original start,
+	// proving the trigger re-fired (the first dispatch predated started1).
+	if dispatched2.DispatchedAt == nil {
+		t.Fatal("DispatchedAt should be re-stamped on re-dispatch")
+	}
+	if !dispatched2.DispatchedAt.After(started1) {
+		t.Errorf("re-dispatch DispatchedAt = %v, want strictly after the original start %v (reset)", dispatched2.DispatchedAt, started1)
+	}
+	// started_at FROZEN under COALESCE: unchanged by the re-dispatch.
+	if dispatched2.StartedAt == nil || !dispatched2.StartedAt.Equal(started1) {
+		t.Errorf("StartedAt = %v, want unchanged at %v (COALESCE, never overwritten)", dispatched2.StartedAt, started1)
+	}
+}
+
 func TestPostgres_StageFailureRequiresCompletion(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
