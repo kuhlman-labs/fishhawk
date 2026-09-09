@@ -586,15 +586,14 @@ func awaitMigrationRenumberDecision(ctx context.Context, client uploadClient, cf
 // which omits the query parameter entirely and makes the request return
 // immediately — the loop then observes the expired deadline and reports
 // undecided.
+//
+// Delegates to the shared boundedWaitSeconds (scopeamendwait.go, #3320) so the
+// bound-both-ways logic this #2748 fix-up established has ONE definition.
+// Behaviour-preserving: TestBoundedRenumberWaitSeconds is deliberately left
+// UNEDITED as the regression pin, so a delegation that changed any boundary
+// (cap, sub-second floor, non-positive remainder) goes red on its own.
 func boundedRenumberWaitSeconds(remaining time.Duration) int {
-	if remaining <= 0 {
-		return 0
-	}
-	secs := int(remaining / time.Second)
-	if secs > migrationRenumberWaitSeconds {
-		return migrationRenumberWaitSeconds
-	}
-	return secs
+	return boundedWaitSeconds(remaining, migrationRenumberWaitSeconds)
 }
 
 // migrationRenumberReason spells out each declared→created substitution so the

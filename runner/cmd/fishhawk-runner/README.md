@@ -747,6 +747,54 @@ Two concurrent items that both add a database migration are planned against the 
 
 **No HTTP-surface change.** The `?wait` query parameter already exists and is already documented; `upload.FetchScopeAmendmentsArgs.WaitSeconds` is additive and omits the parameter entirely when zero or negative, so the #961 pre-commit refresh and the #2601 undecided-detection requests stay byte-identical. No new endpoint, no new audit kind, no new Notifier method: the reused `scope_amendment_requested` / `scope_amendment_decided` rows and the existing `must_page_human` `scope_amendment` ping fire unchanged.
 
+## Scope-amendment SETTLE WAIT before the verify gates (E68.42 / [#3320](https://github.com/kuhlman-labs/fishhawk/issues/3320))
+
+**The incident (run 6d3ba9fe).** At agent exit `run()` did exactly ONE amendment fetch (`refreshScopeAmendments`, #961) and then immediately ran either the committed-tree verify-fix loop (#651) or the single-shot committed gate (#802). The agent had filed a mid-stage amendment; the operator approved it **within one minute** — but seconds AFTER that single fetch. The approval was therefore invisible to the fold, the gates ran against a scope-only tree that excluded the approved file, and the stage failed on exactly the two tests that file would have fixed. Worse, the same still-`pending` row then tripped the #2601 undecided detection, which WITHHOLDS the verify-fix reinvoke — so the stage could not even self-correct.
+
+**The fix is a bounded PAUSE, not a new gate.** `awaitPendingScopeAmendmentSettle` (`scopeamendwait.go`) runs immediately before the fold. When this stage has an amendment still `pending` at agent exit, it long-polls `GET /v0/runs/{id}/scope-amendments` (the `?wait=N` primitive #2748 added to `upload.FetchScopeAmendmentsArgs`) until every pending row for THIS stage is decided, the settle budget elapses, the fetch fails, or the context is cancelled — and only then lets the fold read the list. It changes **when** the existing fold observes the amendment list and nothing else.
+
+**Ordering, three steps, load-bearing:** settle-wait (let an in-flight decision land) → fold (approved paths enter `cfg.scopeFiles`, emitting `scope_amendments_folded`) → `detectUndecidedScopeAmendments` (#2601). #2601's monotonic-status argument is **strengthened**, not weakened: a row still `pending` after the settle wait is genuinely undecided rather than merely un-awaited.
+
+**It cannot change WHAT is committed.** The function takes `cfg` **by value**, deliberately unlike `refreshScopeAmendments(*config)`. The fold that runs immediately after remains the SINGLE writer of `cfg.scopeFiles`, so the #960 verified-tree invariant is untouched. A reviewer reading the two adjacent call sites will notice the asymmetry; it is the point.
+
+**THE BUDGET BOUNDS THE WHOLE FUNCTION, THE INITIAL PROBE INCLUDED.** The deadline is computed **once at function entry**, after the no-op guards and **before any network call**, and the initial no-wait probe derives its context from that same deadline exactly as each loop iteration does (only the context changes; `WaitSeconds` stays 0). So probe time is **DEBITED from the budget rather than added to it**, and a stalled or hung probe against an unresponsive backend can never make the function exceed the bound it advertises. `waited_ms` is measured from that same origin and therefore includes the probe. `TestAwaitPendingScopeAmendmentSettle_ProbeBlocksPastBudget_BoundedAndFailsOpen` pins it with a fake whose first fetch honours its context and returns only when that context expires; moving the deadline computation to after the probe makes it go RED on elapsed wall clock.
+
+**Tuning vars** (package-level `var`s so tests can shrink them; the number stays a one-line change):
+
+| var | default | what it bounds |
+|---|---|---|
+| `scopeAmendmentSettleBudget` | `120s` | the TOTAL blocking bound on the whole function, probe included |
+| `scopeAmendmentSettleWaitSeconds` | `30` | the per-request `?wait=N` hold the backend applies |
+| `scopeAmendmentSettlePollInterval` | `2s` | the gap between long-polls; matters only when the server returns immediately |
+
+**The 120s default is DELIBERATE and RATIFIED — do not change it to 900s.** The issue's proposal reads "waits up to the amendment poll window" (900s, the backend's `AmendmentPollWindowSeconds`, mirrored by `migrationRenumberDecisionBudget`). 120s ships instead because the agent has ALREADY burned its own ~900s wait-poll on this amendment INSIDE the invocation — this is a SETTLE window for a decision already in flight, not a fresh wait for one; because the immediately preceding campaign run (#3335) had its implement stage KILLED by an agent timeout at exactly 3600s, so up to 900s of dead wall-clock before every verify loop on a stage that already has a pending amendment would materially raise that risk against a 60-minute budget; and because the incident being fixed was an approval landing inside ONE minute.
+
+**The 120–900s gap is a KNOWN, ACCEPTED RESIDUAL.** An approval landing in that window still takes the #2601 undecided path, which handles it correctly and safely (distinct `scope_amendment_undecided` signal, withheld reinvoke, a category-B demote reason naming the amendment id and both recovery verbs). The alternative — a 900s settle — buys that window at the cost above.
+
+**Bounded both ways, like the #2748 park.** Each loop iteration recomputes `remaining`, returns on a non-positive remainder, derives a per-request `context.WithDeadline` at the SAME entry-computed deadline, and passes `WaitSeconds: boundedWaitSeconds(remaining, scopeAmendmentSettleWaitSeconds)` — the shared helper `boundedRenumberWaitSeconds` now delegates to, so the bound-both-ways logic has ONE definition. A backend that ignores `?wait` entirely therefore degrades to a polling loop that still terminates on time.
+
+**Outcome classification is by CAUSE, never by reading the clock after the error:**
+
+| outcome | when |
+|---|---|
+| `decided` | no `pending` row for this stage remains. An APPROVED **and** a DENIED row both end the wait — a denial IS a decision, and burning the rest of the budget on it is pure cost. |
+| `timeout` | the budget expired with a row still pending, OR a fetch failed with `context.DeadlineExceeded` while the PARENT context is still healthy (our derived deadline ended it, not a broken backend). |
+| `unavailable` | any other fetch error, or parent-context cancellation. |
+
+`timeout`'s two sub-cases are pinned SEPARATELY, because a test reaching one does not exercise the other: the clock check by `TestAwaitPendingScopeAmendmentSettle_BudgetExpires_OutcomeTimeout` (the fake returns immediately, so the loop always finds `remaining <= 0` between requests), the deadline-ended-an-IN-FLIGHT-fetch classification by `TestAwaitPendingScopeAmendmentSettle_ProbeBlocksPastBudget_BoundedAndFailsOpen` on the probe side and `TestAwaitPendingScopeAmendmentSettle_LoopFetchHeldPastBudget_OutcomeTimeout` on the loop side (E68.42 review follow-up). The loop-side test asserts the hold was genuinely ended by the derived deadline before asserting the outcome, so it cannot silently degrade into a duplicate of the clock-check case.
+
+**Every degrade is fail-open.** The stage proceeds exactly as it does today; the wait never sets `res.OK=false` and never carries a failure category. No-op (no fetch, no clock read at all) on: a nil client, an empty MCP token, a non-`implement` stage, an empty `cfg.stageID` (mirroring `undecidedScopeAmendmentsForStage`'s guard — a row whose `StageID` is also empty would otherwise match by accident), or a non-positive budget (the tuning off-switch). A probe that succeeds with no pending row for this stage returns immediately with **no log line and no policy_event**, mirroring `refreshScopeAmendments`'s nil-on-no-op posture so the ordinary stage log is untouched. Stage ownership is decided by the EXISTING `undecidedScopeAmendmentsForStage` filter, so a pending row belonging to an EARLIER stage of the same run can never make this stage wait.
+
+**JSONL log lines** (exact field sets, pinned by `TestEmitScopeAmendmentSettle_SeamContract`):
+
+- `scope_amendment_settle_wait_started` — `{event, run_id, stage_id, amendments, budget_seconds}`
+- `scope_amendment_settle_wait_ended` — `{event, run_id, stage_id, outcome, waited_ms, amendments}`
+- `scope_amendment_settle_check_failed` — `{event, run_id, stage_id, outcome, detail}` (the probe-failure path; carries the outcome so the probe classification is observable rather than reasoned about)
+
+**Trace policy_event** — `{"check":"scope_amendment_settle_wait", "outcome", "amendments", "waited_ms"}`, mirroring the `scope_drift` / `scope_amendments_folded` shape so the record rides into BOTH bundle variants (`PackBytes` / `redactEvents`). Pinned by `TestAwaitPendingScopeAmendmentSettle_PolicyEventShape`.
+
+**Other stated residuals.** The wait adds up to the budget to the implement stage's wall clock and therefore counts against the stage kill cap. And the settle events are recorded in the runner log and the trace bundle but are **NOT** relayed in-band by `fishhawk-mcp`'s `run_stage` message mapper, so a driving operator sees them only in the log or the trace.
+
 ## Fix-up reporting-obligation reports (#2737)
 
 On a fix-up pass the self-report sidecar (`#1210`) may carry an `obligations`
