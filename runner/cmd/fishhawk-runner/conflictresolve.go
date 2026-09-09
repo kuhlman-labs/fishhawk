@@ -995,8 +995,10 @@ func runConflictResolutionStage(ctx context.Context, cfg config, req conflictRes
 }
 
 // pushConflictResolutionCommit mints a fresh installation token and pushes the
-// merge commit through gitops.PushCommittedBranch, which CONFIRMS the remote
-// tip advanced to it. It returns the confirmed remote head.
+// merge commit through gitops.PushCommittedBranch, which PINS the push to the
+// gate-authorized res.HeadSHA (so a local HEAD moved after the gate ran cannot
+// be what gets published) and then CONFIRMS the remote tip advanced to it. It
+// returns the confirmed remote head.
 func pushConflictResolutionCommit(ctx context.Context, cfg config, client uploadClient,
 	issued *upload.IssuedKey, repoDir, branch, headSHA string, logSink io.Writer) (string, error) {
 

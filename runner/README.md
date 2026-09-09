@@ -269,12 +269,24 @@ assuming it.
 
 **A successful pass publishes; a failed pass reports.** On a passing gate the
 merge commit is pushed via `gitops.PushCommittedBranch`, which reuses the
-process-scoped `authConfigEnv` auth and CONFIRMS the remote tip advanced to the
-pushed SHA, and the terminal outcome is reported as
+process-scoped `authConfigEnv` auth, PINS the push to the gate-authorized SHA
+and CONFIRMS the remote tip advanced to it, and the terminal outcome is reported as
 `{outcome:"conflict_resolution_pushed"}`. A refusal reports
 `{outcome:"failed", category:"B"}` carrying the NAMED refusal reason and the
 recovery verdict; a push failure reports category C. Neither arm may leave the
 stage in `running` — that strand is the failure this whole change removes.
+
+**The publish is PINNED, not merely confirmed.** `PushCommittedBranch` pushes
+`<HeadSHA>:refs/heads/<branch>`, never `HEAD:refs/heads/<branch>`, and refuses a
+`HeadSHA` that is not a full object id. The gate authorizes ONE commit and the
+push happens afterwards; `.git` is outside the working tree the agent's contract
+confines it to, and an agent-spawned background process outlives the agent's
+turn, so a symbolic source git resolves at PUSH time could name a commit no gate
+ever saw. Confirming the remote tip afterwards would report that write, not
+prevent it — the refusal has to be reachable before the remote is contacted,
+which is what pinning the refspec source buys. The remote-tip confirmation stays
+for what pinning cannot cover: a concurrent writer or a server-side hook that
+rewrites the ref after the push is accepted.
 
 
 ## Local invocation

@@ -2099,8 +2099,8 @@ func orDefault(v, fallback string) string {
 type PushCommittedBranchArgs struct {
 	// RepoDir is the git working directory holding the commit.
 	RepoDir string
-	// Branch is the branch to publish. The local commit is pushed as
-	// HEAD:refs/heads/<Branch>, so the caller need not have the branch
+	// Branch is the branch to publish. The commit is pushed as
+	// <HeadSHA>:refs/heads/<Branch>, so the caller need not have the branch
 	// checked out by name.
 	Branch string
 	// RemoteURL is the URL `git push` targets. Required.
@@ -2109,12 +2109,35 @@ type PushCommittedBranchArgs struct {
 	// process-scoped git config via authConfigEnv — nothing is written to any
 	// config file. Empty means ambient auth (a file-path remote in tests).
 	PushToken string
-	// HeadSHA is the local commit the caller expects to publish. The push is
-	// CONFIRMED against it: after pushing, the remote tip is observed via
-	// ls-remote and must equal HeadSHA, so a push that reported success but
-	// left the remote elsewhere (a concurrent writer, a server-side hook) is a
-	// loud error rather than a silent claim.
+	// HeadSHA is the gate-authorized commit to publish, and it is the SOURCE
+	// of the push refspec — not merely something checked afterwards. It must
+	// be a full hexadecimal object id (40 or 64 lowercase hex characters); a
+	// symbolic source such as "HEAD" or a branch name is REFUSED, because
+	// anything git resolves at push time can name a different commit than the
+	// one the gate authorized. The push is ALSO confirmed against it: after
+	// pushing, the remote tip is observed via ls-remote and must equal
+	// HeadSHA, so a push that reported success but left the remote elsewhere
+	// (a concurrent writer, a server-side hook) is a loud error rather than a
+	// silent claim.
 	HeadSHA string
+}
+
+// fullObjectID reports whether s is a full hexadecimal git object id — 40
+// characters for SHA-1, 64 for SHA-256, lowercase only (what `git rev-parse`
+// emits). Anything else, including an abbreviated id or a ref name, is
+// rejected: PushCommittedBranch uses HeadSHA as the SOURCE of its refspec, and
+// only an object id names a fixed commit that cannot be re-resolved to
+// something else between authorization and publication.
+func fullObjectID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // PushCommittedBranchResult reports the CONFIRMED remote tip.
@@ -2134,7 +2157,19 @@ type PushCommittedBranchResult struct {
 // same process-scoped authConfigEnv auth the implement push uses and the same
 // observeRemoteHead confirmation.
 //
-// The remote-tip check is the load-bearing half. `git push` exiting 0 is not
+// The publish is PINNED to args.HeadSHA. The refspec source is the authorized
+// object id itself (`<HeadSHA>:refs/heads/<Branch>`), never `HEAD` — a
+// symbolic source is resolved by git at push time, so a local HEAD that moved
+// after the confinement gate ran (an agent-spawned background process outlives
+// the agent's own turn, and .git is outside the working tree its contract
+// confines it to) would publish an UNAUTHORIZED commit and only then be caught
+// by the confirmation below, after the remote write. Pinning the source makes
+// the wrong write unreachable rather than merely reported: a moved HEAD now
+// changes nothing about what is published, and a HeadSHA that is not a full
+// object id is refused before any remote is contacted.
+//
+// The remote-tip check remains load-bearing for what pinning cannot cover.
+// `git push` exiting 0 is not
 // proof the ref moved (a `--dry-run`-shaped invocation, a hook that rewrites,
 // or a concurrent writer that lands after us all exit 0 from our side), and
 // the caller reports a TERMINAL success to the backend on the strength of this
@@ -2149,6 +2184,10 @@ func (p *Pusher) PushCommittedBranch(ctx context.Context, args PushCommittedBran
 		return nil, errors.New("gitops: RemoteURL required")
 	case args.HeadSHA == "":
 		return nil, errors.New("gitops: HeadSHA required")
+	case !fullObjectID(args.HeadSHA):
+		return nil, fmt.Errorf(
+			"gitops: HeadSHA %q is not a full object id — the push source must name a fixed commit, not a ref git resolves at push time",
+			args.HeadSHA)
 	}
 
 	authEnv, err := authConfigEnv(args.RemoteURL, args.PushToken)
@@ -2162,7 +2201,7 @@ func (p *Pusher) PushCommittedBranch(ctx context.Context, args PushCommittedBran
 	// have written, since `.git/hooks` is outside the working tree its contract
 	// confines it to. HardeningArgs neutralizes that hook (and every other
 	// command-executing config key) for this invocation.
-	pushArgs := append(HardeningArgs(), "push", args.RemoteURL, "HEAD:refs/heads/"+args.Branch)
+	pushArgs := append(HardeningArgs(), "push", args.RemoteURL, args.HeadSHA+":refs/heads/"+args.Branch)
 	if err := p.runEnv(ctx, args.RepoDir, authEnv, pushArgs...); err != nil {
 		return nil, fmt.Errorf("gitops: push committed branch %s: %w", args.Branch, err)
 	}
