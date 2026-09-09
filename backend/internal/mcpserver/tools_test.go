@@ -3141,10 +3141,12 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 
 	// fishhawk_rebase_run_branch (E64.23 / #3125) must be wire-visible, and its
-	// DESCRIPTION must carry the two claims that are not compiler-enforced
+	// DESCRIPTION must carry the claims that are not compiler-enforced
 	// anywhere: the merge-commit MECHANISM (the verb's name would otherwise
-	// imply linear history) and the fishhawk_reset_run_branch cross-link (an
-	// operator who reaches for the wrong sibling must be told which is right).
+	// imply linear history), the fishhawk_reset_run_branch cross-link (an
+	// operator who reaches for the wrong sibling must be told which is right),
+	// and — since E64.62 / #3202 — the budgeted 202 conflict-resolution arm
+	// that replaced the outright conflict refusal.
 	var sawRebase bool
 	for _, tool := range res.Tools {
 		if tool.Name != "fishhawk_rebase_run_branch" {
@@ -3162,7 +3164,30 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 			t.Errorf("fishhawk_rebase_run_branch description must cross-link the sibling verb:\n%s", tool.Description)
 		}
 		if !strings.Contains(tool.Description, "#3202") {
-			t.Errorf("fishhawk_rebase_run_branch description must name the deferred conflict-resolution issue:\n%s", tool.Description)
+			t.Errorf("fishhawk_rebase_run_branch description must name the conflict-resolution issue:\n%s", tool.Description)
+		}
+		// E64.62 (#3202) CHANGED the conflict behaviour from an outright
+		// refusal to a budgeted 202 trigger arm. None of these claims is
+		// compiler-enforced, and a description still promising a fail-closed
+		// refusal would send the operator straight to resolve-push-vouch when
+		// a pass is available — the exact manual write ADR-035 reserves to the
+		// installation.
+		if !strings.Contains(tool.Description, "conflict_resolution_triggered") ||
+			!strings.Contains(tool.Description, "conflict_resolution_stage_id") {
+			t.Errorf("fishhawk_rebase_run_branch description must name the 202 response fields:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "ceiling of ONE") {
+			t.Errorf("fishhawk_rebase_run_branch description must state the pass budget:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "NEVER spends a\nfix-up pass") {
+			t.Errorf("fishhawk_rebase_run_branch description must state the fix-up budget separation:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "FAIL-CLOSED once the budget is spent") ||
+			!strings.Contains(tool.Description, "fishhawk_vouch_commit") {
+			t.Errorf("fishhawk_rebase_run_branch description must state the budget-spent refusal and its fallback route:\n%s", tool.Description)
+		}
+		if strings.Contains(tool.Description, "This first slice does not") {
+			t.Errorf("fishhawk_rebase_run_branch description still claims the pre-#3202 fail-closed-only behaviour:\n%s", tool.Description)
 		}
 	}
 	if !sawRebase {

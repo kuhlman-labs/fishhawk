@@ -2083,6 +2083,30 @@ type RebaseBranchResult struct {
 	// already-contains-base arm, which attributes nothing — so the warning
 	// names fishhawk_vouch_commit as the required step.
 	LineageAttributionWarning string `json:"lineage_attribution_warning,omitempty"`
+
+	// --- 202 conflict-resolution trigger arm (E64.62 / #3202) ---
+	//
+	// These fields are what make a 202 LEGIBLE at this surface, and they are
+	// load-bearing rather than cosmetic: apiClient.do decodes a 202 EXACTLY
+	// like a 200 (its only branch is >= 400), so WITHOUT them a triggered pass
+	// decodes as a success-shaped result carrying an empty new_head_sha and no
+	// signal at all — strictly worse than the loud 422 refusal it replaces,
+	// because the caller would read it as "advance succeeded, head unchanged".
+
+	// ConflictResolutionTriggered is true ONLY on the 202: the base merge
+	// CONFLICTED, NOTHING was written to the branch, and a bounded
+	// agent-driven conflict-resolution pass was authorized instead. When it is
+	// true, NewHeadSHA and MergeCommitSHA are empty BY CONSTRUCTION.
+	ConflictResolutionTriggered bool `json:"conflict_resolution_triggered,omitempty"`
+	// ConflictResolutionStageID is the re-opened implement stage to await with
+	// fishhawk_await_stage before re-invoking this verb.
+	ConflictResolutionStageID string `json:"conflict_resolution_stage_id,omitempty"`
+	// ConflictResolutionPass is the 1-based pass ordinal against the ceiling
+	// of one.
+	ConflictResolutionPass int `json:"conflict_resolution_pass,omitempty"`
+	// ConflictResolutionNote states that nothing was written by this call and
+	// names the await-then-re-invoke route.
+	ConflictResolutionNote string `json:"conflict_resolution_note,omitempty"`
 }
 
 // RebaseRunBranch has the RUNNER advance its own lineage branch onto the
