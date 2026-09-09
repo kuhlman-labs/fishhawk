@@ -1949,8 +1949,22 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// broadens the git_diff re-emit gate below (#1660) so a folded-and-committed
 	// path is not left out of the last git_diff when the verify-fix loop does
 	// NOT reinvoke the agent.
+	//
+	// ORDERING, three steps and load-bearing (#3320): settle-wait (let an
+	// in-flight operator decision LAND) -> fold (approved paths enter
+	// cfg.scopeFiles, emitting scope_amendments_folded) ->
+	// detectUndecidedScopeAmendments (#2601, below). The settle wait is what
+	// closes run 6d3ba9fe's race: the fold does exactly ONE fetch and the
+	// verify gates run immediately after, so an approval landing SECONDS later
+	// was invisible and the gates ran against a tree that excluded the approved
+	// file. It is a bounded PAUSE, not a new gate — it changes only WHEN the
+	// fold reads the amendment list (it takes cfg by VALUE and cannot mutate
+	// the scope set), and every degrade is fail-open. #2601's monotonic-status
+	// argument is STRENGTHENED, not weakened: a row still pending after the
+	// settle wait is genuinely undecided rather than merely un-awaited.
 	amendmentsFolded := false
 	if res.OK && stageType == "implement" && !cfg.noPR {
+		res.Events = append(res.Events, awaitPendingScopeAmendmentSettle(ctx, client, cfg, mcpBearerToken, stageType, logSink)...)
 		before := len(cfg.scopeFiles)
 		res.Events = append(res.Events, refreshScopeAmendments(ctx, client, &cfg, mcpBearerToken, logSink)...)
 		amendmentsFolded = len(cfg.scopeFiles) > before

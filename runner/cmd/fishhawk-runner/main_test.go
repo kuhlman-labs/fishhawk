@@ -27208,3 +27208,208 @@ func TestLoadAgentAuthoredPR_OversizeLegacyUnremovable(t *testing.T) {
 		t.Errorf("fixture invariant: the path was expected to survive, stat err = %v", err)
 	}
 }
+
+// --- #3320 scope-amendment settle wait, end to end through the real run() ---
+
+// settleAmendmentRow is the e2e fixture row: an amendment THIS stage filed for
+// the net-new mod/other.go, whose presence in the committed scope-only tree is
+// what makes verify pass. Distinct from undecidedAmendmentRow (a modify of the
+// same path) because the settle-wait tests need the CREATE operation so the
+// #818/#825 created-out-of-scope gate honors the approved create.
+func settleAmendmentRow(status string) upload.ScopeAmendment {
+	return upload.ScopeAmendment{
+		ID:      "amd-settle",
+		RunID:   verifyFixRunID,
+		StageID: verifyFixStageID,
+		Status:  status,
+		Paths:   []upload.ScopeAmendmentPath{{Path: "mod/other.go", Operation: "create"}},
+		Reason:  "the fix needs a seeding file the plan did not declare",
+	}
+}
+
+// settleE2ERepo seeds the shared settle-wait fixture: a real base repo whose
+// working tree carries the two declared scope files (the committed tree of
+// which FAILS verify) plus mod/other.go — the amendment path, whose init()
+// seeds the registry and is therefore what makes verify PASS, but only if the
+// amendment is folded into cfg.scopeFiles before the committed-tree gate runs.
+func settleE2ERepo(t *testing.T) string {
+	t.Helper()
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+	mustWrite(t, filepath.Join(repo, "mod", "other.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
+	return repo
+}
+
+// pinSettleTuningForE2E shrinks the settle budget so the pending-forever
+// control does not spend the production 120s, and parks the poll interval
+// small. The budget is SCALED via the module's one time factor (#1984).
+func pinSettleTuningForE2E(t *testing.T, budget time.Duration) {
+	t.Helper()
+	oldBudget, oldPoll := scopeAmendmentSettleBudget, scopeAmendmentSettlePollInterval
+	scopeAmendmentSettleBudget = budget
+	scopeAmendmentSettlePollInterval = 5 * time.Millisecond
+	t.Cleanup(func() {
+		scopeAmendmentSettleBudget = oldBudget
+		scopeAmendmentSettlePollInterval = oldPoll
+	})
+}
+
+// TestRun_ScopeAmendmentApprovedDuringSettleWait_FoldedBeforeVerify is the
+// #3320 DONE-MEANS test, driven end to end through the real run().
+//
+// The amendment is `pending` when the settle wait PROBES and `approved` on the
+// next poll — the operator decided seconds after agent exit, exactly run
+// 6d3ba9fe's shape. The settle wait must hold until that decision lands so the
+// fold folds mod/other.go into cfg.scopeFiles BEFORE the committed-tree verify
+// gate runs against a scope-only tree that would otherwise exclude it.
+//
+// Assertions are on OBSERVABLE OUTPUT, not on reasoning: the stage succeeds
+// (verify passed, so the tree it verified contained the amendment file), the
+// scope_amendments_folded line appears at a byte offset BEFORE the first
+// verify_run line, no scope_amendment_undecided is emitted, and the amendment
+// path is STAGED rather than reported as scope drift.
+//
+// Without the settle wait the fold's single fetch reads `pending`, nothing is
+// folded, and every one of those assertions goes RED.
+func TestRun_ScopeAmendmentApprovedDuringSettleWait_FoldedBeforeVerify(t *testing.T) {
+	pinAmendmentWatchInterval(t)
+	pinSettleTuningForE2E(t, scaledD(10*time.Second))
+	repo := settleE2ERepo(t)
+
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = undecidedVerifyFixPrompt()
+	// Call #1 is the settle wait's PROBE and sees `pending`; every later call
+	// sees the operator's decision. Only a runner that WAITS reaches call #2
+	// before the fold.
+	fu.amendmentsSeq = [][]upload.ScopeAmendment{
+		{settleAmendmentRow("pending")},
+		{settleAmendmentRow("approved")},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	code := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	log := stderr.String()
+
+	if code != 0 {
+		t.Fatalf("run exit = %d, want 0 (the folded amendment file must make verify pass)\n%s", code, log)
+	}
+	// ORDERING, on the two artifacts that actually carry each record.
+	//
+	// NOTE (plan-vs-reality, reported rather than reshaped): the approved plan
+	// predicted a byte-offset comparison on the LOG between
+	// scope_amendments_folded and "the first verify-iteration line". The
+	// verify-fix loop (#651) does NOT write a per-iteration JSONL line — its
+	// per-iteration record is the verify_run TRACE EVENT (verifyRunEvent). The
+	// `{"event":"verify_run"...}` LOG line at main.go's single-shot
+	// runVerifyGateCommitted (#802) belongs to the other arm, which does not
+	// run when the fix loop does. So the same ordering claim is asserted where
+	// the records genuinely live: the trace bundle's event INDEX (both records
+	// are appended to res.Events in program order, so index order IS execution
+	// order) plus the log's byte offsets for the two lines that DO appear there.
+	foldIdx := strings.Index(log, `"event":"scope_amendments_folded"`)
+	if foldIdx < 0 {
+		t.Fatalf("no scope_amendments_folded line — the approval never folded:\n%s", log)
+	}
+	settleIdx := strings.Index(log, `"event":"scope_amendment_settle_wait_ended"`)
+	if settleIdx < 0 {
+		t.Fatalf("no scope_amendment_settle_wait_ended line:\n%s", log)
+	}
+	if settleIdx >= foldIdx {
+		t.Errorf("settle wait_ended at byte %d, scope_amendments_folded at byte %d: the settle wait MUST precede the fold\n%s",
+			settleIdx, foldIdx, log)
+	}
+	events := readBundleEvents(t, bundlePath)
+	foldEv, verifyEv := -1, -1
+	for i, ev := range events {
+		if foldEv < 0 && ev.Kind == "policy_event" && strings.Contains(string(ev.Data), `"check":"scope_amendments_folded"`) {
+			foldEv = i
+		}
+		if verifyEv < 0 && ev.Kind == "verify_run" {
+			verifyEv = i
+		}
+	}
+	if foldEv < 0 {
+		t.Fatalf("no scope_amendments_folded policy_event in the bundle:\n%+v", events)
+	}
+	if verifyEv < 0 {
+		t.Fatalf("no verify_run event — the committed-tree gate never ran:\n%+v", events)
+	}
+	if foldEv >= verifyEv {
+		t.Errorf("scope_amendments_folded at event %d, first verify_run at event %d: the fold MUST precede the verify iteration",
+			foldEv, verifyEv)
+	}
+	if strings.Contains(log, `"event":"scope_amendment_undecided"`) {
+		t.Errorf("scope_amendment_undecided emitted for an amendment decided inside the settle window:\n%s", log)
+	}
+	if !strings.Contains(log, `"event":"scope_amendment_settle_wait_ended"`) {
+		t.Errorf("no settle wait_ended line — the settle wait did not run:\n%s", log)
+	}
+	// The amendment path must be STAGED (in the pushed scope set), not
+	// reported as drift.
+	if fp.gotArgs == nil {
+		t.Fatalf("no push recorded; log:\n%s", log)
+	}
+	var sawAmendmentPath bool
+	for _, sf := range fp.gotArgs.ScopeFiles {
+		if sf == "mod/other.go" {
+			sawAmendmentPath = true
+		}
+	}
+	if !sawAmendmentPath {
+		t.Errorf("push ScopeFiles = %+v, want the approved amendment path mod/other.go", fp.gotArgs.ScopeFiles)
+	}
+}
+
+// TestRun_ScopeAmendmentStaysPending_UnchangedUndecidedPath is the paired
+// CONTROL: the identical fixture with the row `pending` on EVERY fetch must
+// still reach the #2601 undecided path once the settle budget expires. The
+// settle wait is a bounded PAUSE, not a replacement — it must not have
+// dissolved #2601's suppression.
+func TestRun_ScopeAmendmentStaysPending_UnchangedUndecidedPath(t *testing.T) {
+	pinAmendmentWatchInterval(t)
+	pinSettleTuningForE2E(t, scaledD(200*time.Millisecond))
+	repo := settleE2ERepo(t)
+
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = undecidedVerifyFixPrompt()
+	fu.amendments = []upload.ScopeAmendment{settleAmendmentRow("pending")}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	log := stderr.String()
+
+	if !strings.Contains(log, `"event":"scope_amendment_undecided"`) {
+		t.Errorf("no scope_amendment_undecided line — the settle wait must not dissolve #2601:\n%s", log)
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (the fix-loop reinvoke stays withheld for an undecided amendment)", invoker.callIdx)
+	}
+	settleEnded := strings.Index(log, `"event":"scope_amendment_settle_wait_ended"`)
+	if settleEnded < 0 {
+		t.Fatalf("no settle wait_ended line:\n%s", log)
+	}
+	if !strings.Contains(log[settleEnded:], `"outcome":"timeout"`) &&
+		!strings.Contains(log, `"event":"scope_amendment_settle_wait_ended","run_id":"`+verifyFixRunID+`","stage_id":"`+verifyFixStageID+`","outcome":"timeout"`) {
+		t.Errorf("settle wait did not end in timeout for a row pending on every fetch:\n%s", log)
+	}
+}
