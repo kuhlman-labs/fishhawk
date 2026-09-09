@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -11224,5 +11225,205 @@ func TestResolveStageCumulativeEval_FailClosedModes(t *testing.T) {
 				t.Errorf("a hedged block must NOT carry the machine-verified framing:\n%s", got)
 			}
 		})
+	}
+}
+
+// --- E64.62 / #3202: conflict-resolution recovery precedes fix-up recovery ---
+
+// seedConflictResolutionTriggeredEntry appends the durable trigger the
+// conflict-resolution recovery keys off, carrying its OWN restore anchors.
+func seedConflictResolutionTriggeredEntry(t *testing.T, au *storingAuditFake,
+	runID, stageID uuid.UUID, priorState run.StageState, reviewID *uuid.UUID) {
+	t.Helper()
+	trigger := conflictResolutionTrigger{
+		Branch:          "fishhawk/run/cr",
+		BaseRef:         "main",
+		ExpectedHeadSHA: "dddd444444444444444444444444444444444444",
+		Pass:            1,
+		PriorState:      string(priorState),
+	}
+	if reviewID != nil {
+		trigger.ReparkedReviewStageID = reviewID.String()
+	}
+	payload, _ := json.Marshal(trigger)
+	kind := audit.ActorKind("user")
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Category:  CategoryStageConflictResolutionTriggered,
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("seed stage_conflict_resolution_triggered: %v", err)
+	}
+}
+
+// TestAdvanceAfterFailure_ConflictResolutionRecoveryPrecedesFixup seeds a
+// stage carrying BOTH trigger categories with DELIBERATELY DIFFERENT restore
+// anchors — the stale fix-up trigger says the pre-pass gate was
+// awaiting_approval and names no review stage; the live conflict-resolution
+// trigger says succeeded and names the review stage — so the restored state
+// alone discriminates which anchor was consulted. Asserting the ORDER any
+// other way (e.g. on a returned bool) would not: both recoveries return true.
+func TestAdvanceAfterFailure_ConflictResolutionRecoveryPrecedesFixup(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newStoringAuditFake()
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		RunRepo:   rr,
+		AuditRepo: au,
+	})
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	// STALE fix-up anchor: awaiting_approval, no review re-park.
+	seedFixupTriggered(t, au, runRow.ID, impl.ID, run.StageStateAwaitingApproval, nil)
+	// LIVE conflict-resolution anchor: succeeded, WITH the review stage.
+	seedConflictResolutionTriggeredEntry(t, au, runRow.ID, impl.ID, run.StageStateSucceeded, &review.ID)
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	s.advanceAfterFailure(req, runRow.ID, impl.ID)
+
+	ctx := context.Background()
+	curImpl, _ := rr.GetStage(ctx, impl.ID)
+	if curImpl.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want succeeded — restored from the CONFLICT-RESOLUTION anchor, not the stale fix-up one (awaiting_approval)", curImpl.State)
+	}
+	curReview, _ := rr.GetStage(ctx, review.ID)
+	if curReview.State != run.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want awaiting_approval — the conflict-resolution anchor names the review stage; the fix-up anchor does not", curReview.State)
+	}
+	// The consumption marker is what makes the trigger spent, so the next
+	// rebase invocation takes the budget-spent 422.
+	failures, _ := au.ListForRunByCategory(ctx, runRow.ID, CategoryStageConflictResolutionFailed)
+	if len(failures) != 1 {
+		t.Fatalf("stage_conflict_resolution_failed entries = %d, want 1", len(failures))
+	}
+	var failPayload struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(failures[0].Payload, &failPayload); err != nil {
+		t.Fatalf("decode failure payload: %v", err)
+	}
+	// advanceAfterFailure carries no runner-supplied refusal reason, so the
+	// stage's own recorded failure is passed through instead.
+	if !strings.Contains(failPayload.Reason, "agent crashed mid fix-up") {
+		t.Errorf("failure reason = %q, want the stage's recorded failure reason", failPayload.Reason)
+	}
+	// The fix-up recovery must NOT also have run.
+	recovered, _ := au.ListForRunByCategory(ctx, runRow.ID, CategoryStageFixupRecovered)
+	if len(recovered) != 0 {
+		t.Errorf("stage_fixup_recovered entries = %d, want 0 — the conflict-resolution recovery returned true, so the fix-up recovery is skipped", len(recovered))
+	}
+}
+
+// TestAdvanceAfterFailure_OrdinaryFixupStillRecovers is the differential
+// control: with NO conflict-resolution trigger the same stage falls through to
+// the fix-up recovery unchanged, so the new ordering cannot have swallowed the
+// ordinary path.
+func TestAdvanceAfterFailure_OrdinaryFixupStillRecovers(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newStoringAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	seedFixupTriggered(t, au, runRow.ID, impl.ID, run.StageStateSucceeded, &review.ID)
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	s.advanceAfterFailure(req, runRow.ID, impl.ID)
+
+	ctx := context.Background()
+	if curImpl, _ := rr.GetStage(ctx, impl.ID); curImpl.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want succeeded (fix-up recovery still runs)", curImpl.State)
+	}
+	recovered, _ := au.ListForRunByCategory(ctx, runRow.ID, CategoryStageFixupRecovered)
+	if len(recovered) != 1 {
+		t.Errorf("stage_fixup_recovered entries = %d, want 1", len(recovered))
+	}
+	failures, _ := au.ListForRunByCategory(ctx, runRow.ID, CategoryStageConflictResolutionFailed)
+	if len(failures) != 0 {
+		t.Errorf("stage_conflict_resolution_failed entries = %d, want 0 — no trigger, no conflict-resolution recovery", len(failures))
+	}
+}
+
+// TestStageFailureReason covers every arm of the reason the recovery records
+// when no runner-supplied refusal reason exists. The unknown fallback is a
+// NAMED sentence rather than an empty string: a budget-spent 422 that names no
+// reason at all reads as a missing field.
+func TestStageFailureReason(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+	ctx := context.Background()
+
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 1, run.StageStateFailed)
+
+	cat := run.FailureB
+	reason := "scope drift"
+	rr.mu.Lock()
+	stage.FailureCategory, stage.FailureReason = &cat, &reason
+	rr.mu.Unlock()
+	if got := s.stageFailureReason(ctx, stage.ID); !strings.Contains(got, "category B") || !strings.Contains(got, "scope drift") {
+		t.Errorf("both present: got %q", got)
+	}
+
+	rr.mu.Lock()
+	stage.FailureCategory = nil
+	rr.mu.Unlock()
+	if got := s.stageFailureReason(ctx, stage.ID); !strings.Contains(got, "scope drift") || strings.Contains(got, "category") {
+		t.Errorf("reason only: got %q", got)
+	}
+
+	rr.mu.Lock()
+	stage.FailureCategory, stage.FailureReason = &cat, nil
+	rr.mu.Unlock()
+	if got := s.stageFailureReason(ctx, stage.ID); !strings.Contains(got, "category B") || !strings.Contains(got, "no recorded reason") {
+		t.Errorf("category only: got %q", got)
+	}
+
+	rr.mu.Lock()
+	stage.FailureCategory = nil
+	rr.mu.Unlock()
+	if got := s.stageFailureReason(ctx, stage.ID); got != "the conflict-resolution pass stage failed with no recorded failure reason" {
+		t.Errorf("neither present: got %q", got)
+	}
+
+	if got := s.stageFailureReason(ctx, uuid.New()); got != "the conflict-resolution pass stage failed with no recorded failure reason" {
+		t.Errorf("unknown stage: got %q", got)
+	}
+
+	noRepo := New(Config{Addr: "127.0.0.1:0"})
+	if got := noRepo.stageFailureReason(ctx, stage.ID); got != "the conflict-resolution pass stage failed with no recorded failure reason" {
+		t.Errorf("no run repo: got %q", got)
+	}
+}
+
+// TestConflictResolutionRecoveryOrderedAtBothCallSites is the BOTH-CALL-SITES
+// pin. The two chokepoints a failed conflict-resolution pass can arrive at —
+// trace.go's advanceAfterFailure and pullrequest.go's failPullRequestStage —
+// must consult the conflict-resolution recovery BEFORE the fix-up recovery, or
+// a stage carrying both trigger categories restores from the stale fix-up
+// anchor at one of them. Behavioural coverage of the advanceAfterFailure site
+// lives above; failPullRequestStage's ordering is pinned here by source
+// position, because its test sibling is outside this slice's scope.
+func TestConflictResolutionRecoveryOrderedAtBothCallSites(t *testing.T) {
+	for _, path := range []string{"trace.go", "pullrequest.go"} {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		src := string(body)
+		cr := strings.Index(src, "maybeRecoverConflictResolutionFailure(")
+		fx := strings.Index(src, "maybeRecoverFixupFailure(")
+		if cr < 0 {
+			t.Errorf("%s does not call maybeRecoverConflictResolutionFailure", path)
+			continue
+		}
+		if fx < 0 {
+			t.Errorf("%s does not call maybeRecoverFixupFailure", path)
+			continue
+		}
+		if cr > fx {
+			t.Errorf("%s calls maybeRecoverFixupFailure BEFORE maybeRecoverConflictResolutionFailure; a stage carrying both trigger categories would restore from the stale fix-up anchor", path)
+		}
 	}
 }

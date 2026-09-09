@@ -1404,6 +1404,28 @@ func (s *Server) advanceAfterFailure(r *http.Request, runID, stageID uuid.UUID) 
 	// implement-review gating-reject path, and failStageCategoryB/C — all
 	// funnel through here. A non-recovery failure (the common case) returns
 	// false and the orchestrator Advance below runs unchanged.
+	//
+	// ORDERING (#3202): conflict-resolution recovery is consulted FIRST, and
+	// this call site must agree with failPullRequestStage's, which is the
+	// other chokepoint the same failure can arrive at. A stage can carry BOTH
+	// trigger categories — an ordinary fix-up earlier in its life, a
+	// conflict-resolution pass now — and each recovery reads a DIFFERENT set
+	// of restore anchors out of its OWN trigger payload. Consulting the fix-up
+	// anchor first would restore a failed conflict-resolution pass from the
+	// STALE fix-up trigger's prior_state and re-parked review stage.
+	// maybeRecoverConflictResolutionFailure returns false whenever there is no
+	// LIVE conflict-resolution trigger (including one an earlier failure
+	// already consumed), so an ordinary fix-up failure falls through
+	// unchanged.
+	//
+	// Unlike the PR-report path there is no runner-supplied refusal reason
+	// here — this chokepoint carries a cat-A/B/C stage failure — so the stage's
+	// own recorded failure category and reason are passed through instead,
+	// which is what the stage_conflict_resolution_failed entry records.
+	if s.maybeRecoverConflictResolutionFailure(r.Context(), runID, stageID,
+		s.stageFailureReason(r.Context(), stageID)) {
+		return
+	}
 	if s.maybeRecoverFixupFailure(r.Context(), runID, stageID) {
 		return
 	}
@@ -1427,6 +1449,41 @@ func (s *Server) advanceAfterFailure(r *http.Request, runID, stageID uuid.UUID) 
 	// already failed, so a board miss never changes the outcome.
 	if rn, err := s.cfg.RunRepo.GetRun(r.Context(), runID); err == nil && rn.State == run.StateFailed {
 		s.boardTransitionForRun(r.Context(), rn, lifecycleRunFailed)
+	}
+}
+
+// stageFailureReason renders the stage's recorded failure category + reason
+// into the sentence the conflict-resolution failure entry records, so a
+// budget-spent 422 on the NEXT rebase invocation can name what the pass
+// actually failed with (#3202). Falls back to a NAMED unavailable-reason
+// sentence rather than an empty string: a refusal that names no reason at all
+// reads as a missing field, whereas "the stage failed with no recorded reason"
+// is the honest answer.
+func (s *Server) stageFailureReason(ctx context.Context, stageID uuid.UUID) string {
+	const unknown = "the conflict-resolution pass stage failed with no recorded failure reason"
+	if s.cfg.RunRepo == nil {
+		return unknown
+	}
+	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil || stage == nil {
+		return unknown
+	}
+	cat, reason := "", ""
+	if stage.FailureCategory != nil {
+		cat = string(*stage.FailureCategory)
+	}
+	if stage.FailureReason != nil {
+		reason = *stage.FailureReason
+	}
+	switch {
+	case cat != "" && reason != "":
+		return "the conflict-resolution pass stage failed (category " + cat + "): " + reason
+	case reason != "":
+		return "the conflict-resolution pass stage failed: " + reason
+	case cat != "":
+		return "the conflict-resolution pass stage failed (category " + cat + ") with no recorded reason"
+	default:
+		return unknown
 	}
 }
 
