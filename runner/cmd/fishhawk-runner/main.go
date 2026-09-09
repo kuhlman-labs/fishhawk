@@ -4519,6 +4519,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		lastIterErr     error  // non-nil only on a PRE-commit infra failure → non-blocking skip
 		fatalErr        error  // non-nil on a POST-commit reset failure (#816) or a passed-but-unresolvable verified tree (#960) → hard abort
 		flakeRetried    bool   // once-per-stage testcontainers infra-flake absorb (#972) already spent
+		autoformatted   bool   // once-per-stage gofmt/goimports auto-format absorb (#3316) already spent
 	)
 
 	for iter := 0; iter <= cfg.verifyMaxIterations; iter++ {
@@ -4630,6 +4631,77 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 			})
 			iter--
 			continue
+		}
+
+		// Auto-format absorb (#3316): a failed verify whose output carries
+		// golangci-lint findings that are EXCLUSIVELY gofmt/goimports
+		// formatting findings is a failure the fix agent cannot fix better
+		// than a formatter can. Run `golangci-lint fmt` over the stage's
+		// eligible in-scope Go files and, if it actually CHANGED something,
+		// repeat the iteration via the existing loop body (re-stage,
+		// re-commit, re-verify) WITHOUT invoking the fix agent and WITHOUT
+		// advancing iter — mirroring the infra absorb immediately above.
+		//
+		// It sits AFTER that absorb and BEFORE the exhaustion check, so a
+		// format-only failure on the LAST iteration is absorbed rather than
+		// demoting the stage category-A (run 453b5e3b / #2817 lost both
+		// iterations to a single `File is not properly formatted (gofmt)`).
+		// It sits after the (d) reset --soft, so the #816 fatal-reset and
+		// #960 verified-tree invariants are untouched, and it never sets
+		// passed/fatalErr/lastIterErr — it can absorb a red tree into a
+		// re-verify, never into a pass.
+		//
+		// The once-flag is consumed on any formatter INVOCATION ATTEMPT — set
+		// before the formatter runs, so the errored and changed-nothing
+		// branches spend it too. That is what makes the bound "at most ONE
+		// formatter invocation per stage, full stop" rather than one per
+		// iteration. It is NOT consumed when no eligible file exists, because
+		// no invocation happened.
+		//
+		// Every non-firing branch falls THROUGH to the unchanged agent
+		// re-invoke path below, each logging one verify_autoformat_skipped
+		// line naming its reason. Only an applied reformat emits a
+		// verify_autoformatted trace event, so that kind means exactly
+		// "formatting was applied".
+		if outcome == "failed" && isFormatOnlyLintFailure(out) {
+			switch {
+			case autoformatted:
+				logAutoformatSkipped(logSink, cfg, iter+1, "already_absorbed",
+					"the auto-format absorb already fired for this stage; falling through to the fix agent")
+			default:
+				eligible := eligibleAutoformatFiles(repoDir, cfg.scopeFiles)
+				if len(eligible) == 0 {
+					// No invocation happens, so the once-flag is NOT spent.
+					logAutoformatSkipped(logSink, cfg, iter+1, "no_eligible_files",
+						"no regular, non-symlinked, on-disk in-scope .go file to format; falling through to the fix agent")
+					break
+				}
+				// Spend the once-flag on the ATTEMPT, before the formatter runs.
+				autoformatted = true
+				changed, ferr := runAutoformat(ctx, repoDir, eligible, timeout)
+				switch {
+				case ferr != nil:
+					logAutoformatSkipped(logSink, cfg, iter+1, "formatter_failed", ferr.Error())
+				case len(changed) == 0:
+					logAutoformatSkipped(logSink, cfg, iter+1, "no_change",
+						"the formatter left every eligible in-scope .go file byte-identical; falling through to the fix agent")
+				default:
+					detail := fmt.Sprintf("verify failure was exclusively gofmt/goimports findings; reformatted %d in-scope file(s) and re-running verify without consuming a fix iteration", len(changed))
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"verify_autoformatted","run_id":%q,"stage_id":%q,"iteration":%d,"files":%q,"detail":%q}`+"\n",
+						cfg.runID, cfg.stageID, iter+1, strings.Join(changed, ","), detail)
+					res.Events = append(res.Events, agent.Event{
+						Kind: "verify_autoformatted",
+						Payload: agent.MakePayload(map[string]any{
+							"iteration": iter + 1,
+							"files":     changed,
+							"detail":    detail,
+						}),
+					})
+					iter--
+					continue
+				}
+			}
 		}
 
 		if iter == cfg.verifyMaxIterations {
@@ -5187,10 +5259,39 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 // spec-supplied command — route it through here so containment cannot
 // diverge, and do NOT widen the gate-env allow-list to make a particular
 // tool work; that is a separate, explicit decision.
+//
+// It is implemented as a one-line delegate of runBoundedGateArgv (#3316),
+// which carries the contract above; a caller holding an ARGV rather than a
+// command string (the auto-format absorb) routes through the argv form
+// directly, so there is still exactly ONE containment implementation.
 func runBoundedGateCommand(ctx context.Context, command, dir, lintCacheDir string, timeout time.Duration) (string, int) {
+	return runBoundedGateArgv(ctx, []string{"sh", "-c", command}, dir, lintCacheDir, timeout)
+}
+
+// runBoundedGateArgv is the SHARED implementation of the gate-containment
+// contract documented on runBoundedGateCommand above — bounded child context,
+// Setpgid + process-group SIGKILL on cancellation, default-deny
+// sanitizedGateEnv, per-invocation isolated lint cache, CombinedOutput, and
+// the same 0 / child-code / -1 exit-code mapping. runBoundedGateCommand is a
+// one-line delegate that passes []string{"sh", "-c", command}.
+//
+// It exists so a caller with an ARGV — file paths, not a command string — can
+// reach the containment contract WITHOUT a shell. The autoformat absorb
+// (#3316) hands the formatter a list of scope file paths; interpolating those
+// into `sh -c` would let a path containing shell metacharacters inject a
+// command into the runner's gate subprocess. Adding a second exec path would
+// let containment diverge, which runBoundedGateCommand's doc comment forbids,
+// so the shell form became a delegate of the argv form instead.
+//
+// argv must be non-empty; argv[0] is the executable, resolved through PATH.
+// An empty argv returns ("", -1) rather than panicking.
+func runBoundedGateArgv(ctx context.Context, argv []string, dir, lintCacheDir string, timeout time.Duration) (string, int) {
+	if len(argv) == 0 {
+		return "", -1
+	}
 	childCtx, childCancel := context.WithTimeout(ctx, timeout)
 	defer childCancel()
-	cmd := exec.CommandContext(childCtx, "sh", "-c", command)
+	cmd := exec.CommandContext(childCtx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = withIsolatedLintCache(sanitizedGateEnv(), lintCacheDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
