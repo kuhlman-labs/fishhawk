@@ -27404,12 +27404,18 @@ func TestRun_ScopeAmendmentStaysPending_UnchangedUndecidedPath(t *testing.T) {
 	if invoker.callIdx != 1 {
 		t.Errorf("Invoke call count = %d, want 1 (the fix-loop reinvoke stays withheld for an undecided amendment)", invoker.callIdx)
 	}
-	settleEnded := strings.Index(log, `"event":"scope_amendment_settle_wait_ended"`)
-	if settleEnded < 0 {
+	// Parse the wait_ended line as JSON and read outcome OFF THAT OBJECT
+	// (settleLogLine, shared with the unit tests). A substring scan of the log
+	// tail would be satisfied by any later unrelated `"outcome":"timeout"`, and
+	// a whole-line exact match would be brittle against key ordering.
+	ended := settleLogLine(t, log, "scope_amendment_settle_wait_ended")
+	if ended == nil {
 		t.Fatalf("no settle wait_ended line:\n%s", log)
 	}
-	if !strings.Contains(log[settleEnded:], `"outcome":"timeout"`) &&
-		!strings.Contains(log, `"event":"scope_amendment_settle_wait_ended","run_id":"`+verifyFixRunID+`","stage_id":"`+verifyFixStageID+`","outcome":"timeout"`) {
-		t.Errorf("settle wait did not end in timeout for a row pending on every fetch:\n%s", log)
+	if ended["run_id"] != verifyFixRunID || ended["stage_id"] != verifyFixStageID {
+		t.Errorf("wait_ended ids = %v/%v, want %s/%s", ended["run_id"], ended["stage_id"], verifyFixRunID, verifyFixStageID)
+	}
+	if ended["outcome"] != "timeout" {
+		t.Errorf("settle wait outcome = %v, want timeout for a row pending on every fetch:\n%s", ended["outcome"], log)
 	}
 }

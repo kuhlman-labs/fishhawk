@@ -371,6 +371,90 @@ func TestAwaitPendingScopeAmendmentSettle_MidWaitFetchError_OutcomeUnavailable(t
 	}
 }
 
+// TestAwaitPendingScopeAmendmentSettle_LoopFetchHeldPastBudget_OutcomeTimeout
+// pins settleLoop's OWN timeout-by-cause branch: the
+// `errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil` classification
+// INSIDE the loop, reached by a fetch that is still IN FLIGHT when the derived
+// deadline fires.
+//
+// The sibling tests do not reach it. The probe-side twin
+// (…_ProbeBlocksPastBudget_…) expires before loop entry;
+// …_BudgetExpires_OutcomeTimeout's fake returns immediately, so it reaches
+// timeout only via the loop's `remaining <= 0` clock check; and
+// …_ParentContextCancelled_… holds a request but cancels the PARENT, which is
+// the other side of the same discrimination.
+//
+// So here the probe returns pending IMMEDIATELY (call #1) and every LATER call
+// holds until its context expires — which, with a healthy parent, can only be
+// the entry-computed settle deadline. heldInFlight records that the hold was
+// genuinely ended by that context rather than by the loop returning between
+// requests, so the test cannot silently degrade into the clock-check path it
+// exists to distinguish itself from.
+func TestAwaitPendingScopeAmendmentSettle_LoopFetchHeldPastBudget_OutcomeTimeout(t *testing.T) {
+	budget := scaledD(200 * time.Millisecond)
+	withShrunkSettleTuning(t, budget)
+	// Far longer than the budget: only the derived deadline can end the hold.
+	hold := scaledD(5 * time.Second)
+	var heldInFlight bool
+	fake := &fakeUploader{amendments: []upload.ScopeAmendment{settlePendingRow("a1", "stage-1")}}
+	fake.amendmentsHook = func(hookCtx context.Context, _ upload.FetchScopeAmendmentsArgs) error {
+		if fake.amendmentCalls < 2 {
+			return nil // the probe returns immediately, so the LOOP is entered
+		}
+		select {
+		case <-hookCtx.Done():
+			heldInFlight = true
+			return hookCtx.Err()
+		case <-time.After(hold):
+			return nil
+		}
+	}
+	var log bytes.Buffer
+
+	ctx := context.Background()
+	start := time.Now()
+	got := awaitPendingScopeAmendmentSettle(ctx, fake, settleCfg(), "fhm_x", "implement", &log)
+	elapsed := time.Since(start)
+
+	if !heldInFlight {
+		t.Fatalf("the loop's fetch was never held to its context deadline (calls=%d): this test did not exercise the in-loop timeout-by-cause branch", fake.amendmentCalls)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("parent ctx = %v, want healthy (a cancelled parent would classify unavailable for the OTHER reason)", ctx.Err())
+	}
+	// Bound derived from the SAME scale factor as the budget, so the
+	// discrimination ratio (bound/budget = 4x, hold/bound ~= 6x) holds at any
+	// factor.
+	upper := scaledD(800 * time.Millisecond)
+	if elapsed > upper {
+		t.Errorf("call took %s, want <= %s (the derived deadline must end the in-flight fetch)", elapsed, upper)
+	}
+	if len(got) != 1 {
+		t.Fatalf("events = %v, want exactly 1 policy_event", got)
+	}
+	ended := settleLogLine(t, log.String(), "scope_amendment_settle_wait_ended")
+	if ended == nil {
+		t.Fatalf("no wait_ended line in %q", log.String())
+	}
+	if ended["outcome"] != "timeout" {
+		t.Errorf("outcome = %v, want timeout (OUR deadline ended an in-flight fetch while the parent stayed healthy)", ended["outcome"])
+	}
+	// The policy_event carries the same classification into the trace bundle.
+	raw, err := json.Marshal(got[0].Payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var p struct {
+		Outcome string `json:"outcome"`
+	}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("unmarshal payload %s: %v", raw, err)
+	}
+	if p.Outcome != "timeout" {
+		t.Errorf("policy_event outcome = %q, want timeout", p.Outcome)
+	}
+}
+
 // TestAwaitPendingScopeAmendmentSettle_ParentContextCancelled_OutcomeUnavailable:
 // the parent context is cancelled while a request is genuinely IN FLIGHT (the
 // hook holds the way the backend's `?wait` does), which must classify
