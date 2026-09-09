@@ -1227,3 +1227,88 @@ func TestHandleGetRunGateView_ReviewDiffTruncated_EndToEnd(t *testing.T) {
 			body.ReviewDiffTruncated.OmittedFilesResidual)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #3319 — `disputed` is SCOPED to refused CONFIRMS.
+// ---------------------------------------------------------------------------
+
+// TestGateView_ReopenVeto_NotDisputedButSurfacedAsDetail: a concern carrying
+// ONLY a refused `reopened` reports disputed=false with one disputes[] row. A
+// refused reopen leaves the concern addressed_pending, so calling it `disputed`
+// would tell the operator a confirmation failed to settle it — the opposite of
+// what happened. The refusal still surfaces as detail.
+func TestGateView_ReopenVeto_NotDisputedButSurfacedAsDetail(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	stageID := uuid.New()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", gateViewLongNote, "routed: fix the authz check")
+
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict:            planreview.VerdictReject,
+			ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: "reopened"}},
+		},
+		model: "fable-5",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: reviewer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+	got := openConcernByID(t, decodeGateView(t, getGateView(t, s, runID, "")), row.ID)
+	if got.State != string(concern.StateAddressedPending) {
+		t.Fatalf("state = %q, want addressed_pending", got.State)
+	}
+	if got.Disputed {
+		t.Error("disputed = true on a refused REOPEN, want false — no confirmation failed to settle this concern")
+	}
+	if len(got.Disputes) != 1 {
+		t.Fatalf("disputes = %+v, want exactly one row carrying the refusal as detail", got.Disputes)
+	}
+	if got.Disputes[0].VetoReason != vetoReopenWithoutNamedConcern || got.Disputes[0].Resolution != "reopened" {
+		t.Errorf("dispute = %+v, want veto_reason=%s resolution=reopened", got.Disputes[0], vetoReopenWithoutNamedConcern)
+	}
+}
+
+// TestGateView_ConfirmVeto_StillDisputed: the pre-#3319 behaviour is unchanged
+// for a refused `confirmed`.
+func TestGateView_ConfirmVeto_StillDisputed(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	stageID := uuid.New()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", gateViewLongNote, "routed")
+
+	runSplitRound(s, runID, stageID, row.ID.String())
+
+	got := openConcernByID(t, decodeGateView(t, getGateView(t, s, runID, "")), row.ID)
+	if !got.Disputed {
+		t.Error("disputed = false on a refused CONFIRM, want true")
+	}
+	if len(got.Disputes) != 1 || got.Disputes[0].Resolution != "confirmed" {
+		t.Errorf("disputes = %+v, want one refused confirm", got.Disputes)
+	}
+}
+
+// TestGateView_LegacyVetoPayload_EmptyResolution_StillDisputed: a veto payload
+// recorded before #3319 carries no `resolution` string. Those were ALWAYS
+// confirm vetoes, so an empty resolution must still set disputed.
+func TestGateView_LegacyVetoPayload_EmptyResolution_StillDisputed(t *testing.T) {
+	s, repo, au, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	stageID := uuid.New()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", gateViewLongNote, "routed")
+
+	// A legacy entry BY CONSTRUCTION: veto_reason set, resolution absent.
+	seedStageAuditEntry(t, au, runID, stageID, 11, concernResolutionVetoedCategory, map[string]any{
+		"concern_id":      row.ID.String(),
+		"veto_reason":     vetoRaiserRejectedSameRound,
+		"review_sequence": 11,
+	})
+
+	got := openConcernByID(t, decodeGateView(t, getGateView(t, s, runID, "")), row.ID)
+	if !got.Disputed {
+		t.Error("disputed = false on a legacy veto payload with an empty resolution, want true — pre-#3319 vetoes were always confirms")
+	}
+	if len(got.Disputes) != 1 || got.Disputes[0].Resolution != "" {
+		t.Errorf("disputes = %+v, want one row with an empty resolution", got.Disputes)
+	}
+}

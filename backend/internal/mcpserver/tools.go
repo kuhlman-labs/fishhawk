@@ -602,6 +602,13 @@ type PlanReview struct {
 	Verdict       string              `json:"verdict"`
 	Concerns      []PlanReviewConcern `json:"concerns,omitempty"`
 	FreeForm      string              `json:"free_form,omitempty"`
+	// RejectWithoutConcern decodes the implement_reviewed payload's advisory
+	// #3319 marker: this `reject` named NO concern anywhere — no concerns[]
+	// entry and no concern_resolutions entry carrying a non-blank note.
+	// DISPLAY-ONLY; it gates nothing. Additive + omitempty, so a payload stored
+	// before #3319 decodes false and every existing surface stays
+	// byte-identical.
+	RejectWithoutConcern bool `json:"reject_without_concern,omitempty" jsonschema:"advisory (#3319): true when this reject verdict named no concern anywhere — no concerns[] entry and no concern_resolutions note. Read free_form for what the reviewer actually asserted; there is nothing to route through fishhawk_fixup_stage. Display-only, gates nothing"`
 	// Reason is populated only on a "skipped" verdict (#574): it
 	// names why the configured agent layer was not run (e.g.
 	// "reviewer_not_configured" when reviewers.agent>0 but no

@@ -5037,6 +5037,12 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// (#984) ride on the authoritative audit payload; the concern
 			// store applies them below as a derived index.
 			ConcernResolutions: verdict.ConcernResolutions,
+			// #3319 display-only advisory: did this reject name NOTHING,
+			// ANYWHERE? That is the VERDICT-LEVEL question — deliberately the
+			// OTHER predicate from the per-resolution
+			// planreview.RejectSubstantiatesResolution the reopen veto in
+			// applyConcernResolutions consults. Do not swap them.
+			RejectWithoutConcern: planreview.RejectNamesNoConcern(*verdict),
 			// Per-invocation token usage on the review surface (#995).
 			InputTokens:  verdict.Usage.InputTokens,
 			OutputTokens: verdict.Usage.OutputTokens,
@@ -5081,6 +5087,9 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 				verdict:        verdict.Verdict,
 				resolutions:    verdict.ConcernResolutions,
 				reviewSequence: entry.Sequence,
+				// The authoritative input to the #3319 per-resolution
+				// substantiation predicate.
+				review: *verdict,
 			})
 			// Condition-claim resolution (E48.9 / #1956): ONE confirming
 			// (non-reject) implement review resolves the operator's claimed
@@ -5908,6 +5917,17 @@ const (
 	vetoEvidenceLookupFailed = "evidence_lookup_failed"
 )
 
+// vetoReopenWithoutNamedConcern refuses a `reopened` resolution the verdict
+// does not substantiate (#3319): the verdict is `reject`, it raises no concern
+// of its own, and THIS resolution's own note is blank. Unlike the four reasons
+// above — which are decided from ROUND-LEVEL evidence against a `confirmed`
+// resolution — this one is decided PER RESOLUTION from the resolution's OWN
+// note, via planreview.RejectSubstantiatesResolution. A sibling resolution's
+// note is evidence for that sibling; the verdict-level aggregate
+// (planreview.RejectNamesNoConcern) is for the display advisory ONLY and must
+// never be consulted here.
+const vetoReopenWithoutNamedConcern = "reopen_without_named_concern"
+
 // roundReviewVerdict is one buffered reviewer verdict from a single implement-
 // review round (E48.103 / #2551), captured under the SAME append-gated posture
 // the inline application had: it is buffered only when the implement_reviewed
@@ -5917,6 +5937,16 @@ type roundReviewVerdict struct {
 	verdict        planreview.Verdict
 	resolutions    []planreview.ConcernResolution
 	reviewSequence int64
+	// review is the FULL decoded verdict, added additively for #3319: the
+	// per-resolution reopen-substantiation predicate needs the verdict's
+	// Concerns as well as its Verdict, which the projections above do not
+	// carry. The pre-existing `verdict`/`resolutions` projections are kept
+	// unchanged for their existing consumers, and the field is purely additive
+	// because out-of-scope keyed literals (implement_review_test.go) construct
+	// this struct — do NOT rename or remove a field. A legacy literal leaves
+	// `review` zero-valued (Verdict ""), so RejectSubstantiatesResolution
+	// returns true and the #3319 arm is inert for it.
+	review planreview.ReviewVerdict
 }
 
 // resolutionVetoContext is the round-level evidence a `confirmed` resolution is
@@ -6157,7 +6187,13 @@ func (s *Server) appendConcernResolutionVetoed(ctx context.Context, runID, stage
 // context (E48.103 / #2551) before it is applied: a confirm the evidence
 // contradicts leaves the concern in its current OPEN state with its
 // state_reason intact and records a concern_resolution_vetoed entry instead.
-// `reopened` and `superseded` are never vetoed.
+//
+// A `reopened` resolution is additionally checked against the PER-RESOLUTION
+// substantiation predicate (#3319): a reopen carrying no note of its own, on a
+// `reject` verdict that raises no concern of its own, is REFUSED the same way —
+// state and state_reason untouched, one concern_resolution_vetoed entry with
+// reason reopen_without_named_concern. `superseded` is never vetoed, and
+// sibling resolutions in the SAME verdict still apply normally.
 func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uuid.UUID, rv roundReviewVerdict, vc resolutionVetoContext, reviewedHeadSHA string) {
 	resolutions := rv.resolutions
 	if s.cfg.ConcernRepo == nil || len(resolutions) == 0 {
@@ -6222,6 +6258,33 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 				})
 				continue
 			}
+		}
+		// Per-resolution reopen veto (#3319), for `reopened` ONLY: a reopen the
+		// verdict does not substantiate FOR THIS CONCERN is REFUSED — the
+		// concern keeps its current state AND state_reason (the ledger is left
+		// unchanged, which is the issue's done-means) and the refusal is
+		// recorded. This asks the PER-RESOLUTION question: only THIS
+		// resolution's own note may substantiate it. The verdict-level
+		// planreview.RejectNamesNoConcern is for the display advisory stamped
+		// on the payload above and must NOT be consulted here — on a verdict
+		// mixing a noted `confirmed` for concern A with a blank-note `reopened`
+		// for concern B it is false, so a veto keyed on it would apply B's
+		// unsubstantiated reopen using A's evidence.
+		if to == concern.StateReopened && !planreview.RejectSubstantiatesResolution(rv.review, res) {
+			warn(res, "reopened resolution vetoed: "+vetoReopenWithoutNamedConcern)
+			s.appendConcernResolutionVetoed(ctx, runID, stageID, concernResolutionVetoedPayload{
+				ConcernID:               cid.String(),
+				Resolution:              res.Resolution,
+				VetoReason:              vetoReopenWithoutNamedConcern,
+				ConfirmingReviewerModel: rv.model,
+				RaisingReviewerModel:    derefStr(row.ReviewerModel),
+				ConcernSeverity:         row.Severity,
+				ConcernCategory:         row.Category,
+				Note:                    res.Note,
+				ReviewSequence:          rv.reviewSequence,
+				OriginReviewSequence:    row.OriginReviewSequence,
+			})
+			continue
 		}
 		// Ledger provenance (#2884): for a `confirmed` resolution — the one
 		// that writes StateAddressed — stamp the reviewed head sha into the

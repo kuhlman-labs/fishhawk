@@ -5338,7 +5338,16 @@ func buildImplementReview(t Trigger) string {
 			"against the diff in front of you or state SPECIFICALLY what remains missing and where. Reopening " +
 			"on prior-round reasoning — restating the round-N finding without checking the round-N+1 diff — is " +
 			"a defect in the review; on the delta path the diff shown is exactly the fix-up change the " +
-			"resolution refers to.\n\n")
+			"resolution refers to.\n")
+		// Server-side refusal, made discoverable to the reviewer (#3319). The
+		// veto is per-resolution: only THIS resolution's own note substantiates
+		// it. Rendered INSIDE the len(t.PriorConcerns) > 0 guard, so the empty
+		// case stays byte-identical.
+		b.WriteString("- A `reopened` resolution whose OWN `note` is blank is REFUSED by the server when your " +
+			"verdict is `reject` and raises no concern of its own — the concern keeps its current state and the " +
+			"refusal is recorded against your review. State SPECIFICALLY what remains missing and where, in THAT " +
+			"resolution's `note`. A sibling resolution's note substantiates that sibling, never this one, and " +
+			"`free_form` prose substantiates nothing: it is unmatched to any concern id.\n\n")
 		for _, c := range t.PriorConcerns {
 			fmt.Fprintf(&b, "- id: %s\n  state: %s\n  severity: %s\n  category: %s\n  note: %s\n",
 				c.ID, c.State, c.Severity, c.Category, c.Note)

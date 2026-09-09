@@ -898,3 +898,216 @@ func TestVerdictSchema_OmitsProvenance(t *testing.T) {
 		t.Errorf("VerdictSchema() concern properties include \"provenance\"; it MUST stay server-internal so a reviewer cannot populate it")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #3319 — the reopen-substantiation predicate SPLIT.
+//
+// Two deliberately different questions. The veto asks the PER-RESOLUTION one
+// (RejectSubstantiatesResolution); the display advisory asks the VERDICT-LEVEL
+// one (RejectNamesNoConcern). These tables pin each, and TestRejectPredicates_
+// DisagreeOnMixedResolutionVerdict pins the case where they must disagree — the
+// hole a single shared predicate reopens.
+// ---------------------------------------------------------------------------
+
+func TestRejectSubstantiatesResolution_Table(t *testing.T) {
+	noteRes := planreview.ConcernResolution{ID: "a", Resolution: "reopened", Note: "the handler still trusts the caller subject"}
+	blankRes := planreview.ConcernResolution{ID: "a", Resolution: "reopened"}
+	wsRes := planreview.ConcernResolution{ID: "a", Resolution: "reopened", Note: " \t\n"}
+
+	tests := []struct {
+		name    string
+		verdict planreview.ReviewVerdict
+		res     planreview.ConcernResolution
+		want    bool
+	}{
+		{
+			name:    "reject/no-concerns/blank-note → UNsubstantiated",
+			verdict: planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+			res:     blankRes,
+			want:    false,
+		},
+		{
+			name:    "reject/no-concerns/non-blank-note → substantiated",
+			verdict: planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+			res:     noteRes,
+			want:    true,
+		},
+		{
+			name: "reject/raises-a-concern/blank-note → substantiated (an engaged review)",
+			verdict: planreview.ReviewVerdict{
+				Verdict:  planreview.VerdictReject,
+				Concerns: []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "correctness", Note: "new finding"}},
+			},
+			res:  blankRes,
+			want: true,
+		},
+		{
+			name:    "approve/blank-note → substantiated (the rule is reject-scoped)",
+			verdict: planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+			res:     blankRes,
+			want:    true,
+		},
+		{
+			name:    "approve_with_concerns/blank-note → substantiated",
+			verdict: planreview.ReviewVerdict{Verdict: planreview.VerdictApproveWithConcerns},
+			res:     blankRes,
+			want:    true,
+		},
+		{
+			name:    "reject/no-concerns/whitespace-only note → UNsubstantiated (TrimSpace)",
+			verdict: planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+			res:     wsRes,
+			want:    false,
+		},
+		{
+			// The reported #3319 shape: the whole assertion lives in free_form,
+			// unmatched to any concern id. free_form substantiates NOTHING.
+			name: "reject/free_form-only/blank-note → UNsubstantiated",
+			verdict: planreview.ReviewVerdict{
+				Verdict:  planreview.VerdictReject,
+				FreeForm: "this is still broken in three places and must not merge",
+			},
+			res:  blankRes,
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := planreview.RejectSubstantiatesResolution(tc.verdict, tc.res); got != tc.want {
+				t.Errorf("RejectSubstantiatesResolution = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRejectNamesNoConcern_Table(t *testing.T) {
+	tests := []struct {
+		name    string
+		verdict planreview.ReviewVerdict
+		want    bool
+	}{
+		{
+			name:    "reject/no-concerns/no-resolutions → names nothing",
+			verdict: planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+			want:    true,
+		},
+		{
+			name: "reject/no-concerns/all-blank-note resolutions → names nothing",
+			verdict: planreview.ReviewVerdict{
+				Verdict: planreview.VerdictReject,
+				ConcernResolutions: []planreview.ConcernResolution{
+					{ID: "a", Resolution: "reopened"},
+					{ID: "b", Resolution: "reopened", Note: "  "},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "reject/raises-a-concern → names something",
+			verdict: planreview.ReviewVerdict{
+				Verdict:  planreview.VerdictReject,
+				Concerns: []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "correctness", Note: "new finding"}},
+			},
+			want: false,
+		},
+		{
+			name: "reject/one non-blank-note resolution → names something",
+			verdict: planreview.ReviewVerdict{
+				Verdict: planreview.VerdictReject,
+				ConcernResolutions: []planreview.ConcernResolution{
+					{ID: "a", Resolution: "reopened"},
+					{ID: "b", Resolution: "confirmed", Note: "looks good"},
+				},
+			},
+			want: false,
+		},
+		{
+			name:    "approve → false",
+			verdict: planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+			want:    false,
+		},
+		{
+			name:    "approve_with_concerns → false",
+			verdict: planreview.ReviewVerdict{Verdict: planreview.VerdictApproveWithConcerns},
+			want:    false,
+		},
+		{
+			// free_form is not a named concern, so a free-form-only reject
+			// still reads as naming nothing — the #3319 shape.
+			name: "reject/free_form-only → names nothing",
+			verdict: planreview.ReviewVerdict{
+				Verdict:  planreview.VerdictReject,
+				FreeForm: "this is still broken in three places and must not merge",
+			},
+			want: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := planreview.RejectNamesNoConcern(tc.verdict); got != tc.want {
+				t.Errorf("RejectNamesNoConcern = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRejectPredicates_DisagreeOnMixedResolutionVerdict is the POINT of the
+// split (#3319). On the mixed-resolution verdict the verdict-level predicate is
+// FALSE (A carries a note) while the per-resolution predicate still REFUSES B.
+// A future re-unification of the two breaks a named assertion here rather than
+// silently reintroducing the hole where A's evidence authorises B's reopen.
+func TestRejectPredicates_DisagreeOnMixedResolutionVerdict(t *testing.T) {
+	confirmA := planreview.ConcernResolution{ID: "a", Resolution: "confirmed", Note: "looks good"}
+	reopenB := planreview.ConcernResolution{ID: "b", Resolution: "reopened"}
+	v := planreview.ReviewVerdict{
+		Verdict:            planreview.VerdictReject,
+		ConcernResolutions: []planreview.ConcernResolution{confirmA, reopenB},
+	}
+
+	if planreview.RejectNamesNoConcern(v) {
+		t.Error("RejectNamesNoConcern = true, want false: resolution A carries a non-blank note, so this reject DID name something")
+	}
+	if planreview.RejectSubstantiatesResolution(v, reopenB) {
+		t.Error("RejectSubstantiatesResolution(v, B) = true, want false: B's OWN note is blank — A's note is evidence for A, never for B")
+	}
+	if !planreview.RejectSubstantiatesResolution(v, confirmA) {
+		t.Error("RejectSubstantiatesResolution(v, A) = false, want true: A carries its own note")
+	}
+}
+
+// TestImplementReviewedPayload_RejectWithoutConcernOmitempty pins that the
+// advisory flag is additive: a payload that does not set it marshals
+// byte-identically to a pre-#3319 entry.
+func TestImplementReviewedPayload_RejectWithoutConcernOmitempty(t *testing.T) {
+	raw, err := json.Marshal(planreview.ImplementReviewedPayload{
+		ReviewerKind: "agent",
+		Authority:    planreview.AuthorityAdvisory,
+		Verdict:      planreview.VerdictReject,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "reject_without_concern") {
+		t.Errorf("unset flag must be omitted, got %s", raw)
+	}
+	raw, err = json.Marshal(planreview.ImplementReviewedPayload{
+		ReviewerKind:         "agent",
+		Authority:            planreview.AuthorityAdvisory,
+		Verdict:              planreview.VerdictReject,
+		RejectWithoutConcern: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"reject_without_concern":true`) {
+		t.Errorf("set flag must be present, got %s", raw)
+	}
+	// And an old stored payload with no key decodes false.
+	var back planreview.ImplementReviewedPayload
+	if err := json.Unmarshal([]byte(`{"reviewer_kind":"agent","authority":"advisory","verdict":"reject"}`), &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.RejectWithoutConcern {
+		t.Error("a pre-#3319 payload must decode reject_without_concern=false")
+	}
+}

@@ -11427,3 +11427,346 @@ func TestConflictResolutionRecoveryOrderedAtBothCallSites(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #3319 — the PER-RESOLUTION reopen-substantiation veto.
+//
+// Every case seeds bad state BY CONSTRUCTION (a real routed concern via
+// seedRoutedConcern, then a verdict literal) and asserts COMMITTED STATE — the
+// row re-read after the call — not an error identity, because the control's
+// effect IS the state that did not change.
+// ---------------------------------------------------------------------------
+
+// reopenVerdict builds a `reject` verdict carrying the given reopen resolutions
+// and (optionally) its own concerns, plus the roundReviewVerdict that carries
+// it into applyRoundConcernResolutions.
+func reopenRound(model string, v planreview.ReviewVerdict) roundReviewVerdict {
+	return roundReviewVerdict{
+		model:          model,
+		verdict:        v.Verdict,
+		resolutions:    v.ConcernResolutions,
+		reviewSequence: 7,
+		review:         v,
+	}
+}
+
+func TestApplyConcernResolutions_M1_BareRejectBlankNoteReopenVetoed(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "the handler still trusts the caller subject", "routing reason: fix the authz check")
+
+	s.applyRoundConcernResolutions(ctx, runID, stageID, []roundReviewVerdict{
+		reopenRound("fable-5", planreview.ReviewVerdict{
+			Verdict:            planreview.VerdictReject,
+			ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: "reopened"}},
+		}),
+	}, "")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — an unsubstantiated reopen must leave the ledger unchanged", got.State)
+	}
+	if got.StateReason != "routing reason: fix the authz check" {
+		t.Errorf("state_reason = %q, want the routing reason byte-identical", got.StateReason)
+	}
+	vetoes := vetoEntries(t, au)
+	if len(vetoes) != 1 {
+		t.Fatalf("%s entries = %d, want 1", concernResolutionVetoedCategory, len(vetoes))
+	}
+	v := vetoes[0]
+	if v.VetoReason != vetoReopenWithoutNamedConcern {
+		t.Errorf("veto_reason = %q, want %q", v.VetoReason, vetoReopenWithoutNamedConcern)
+	}
+	if v.Resolution != "reopened" || v.ConcernID != row.ID.String() || v.ConfirmingReviewerModel != "fable-5" {
+		t.Errorf("payload = %+v, want resolution=reopened naming the concern and the reopening reviewer", v)
+	}
+}
+
+func TestApplyConcernResolutions_M2_NotedReopenApplies(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "still trusts the caller subject", "routing reason")
+
+	s.applyRoundConcernResolutions(ctx, runID, stageID, []roundReviewVerdict{
+		reopenRound("fable-5", planreview.ReviewVerdict{
+			Verdict: planreview.VerdictReject,
+			ConcernResolutions: []planreview.ConcernResolution{
+				{ID: row.ID.String(), Resolution: "reopened", Note: "the subject is still read from the request body at handler.go:88"},
+			},
+		}),
+	}, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateReopened {
+		t.Errorf("state = %q, want reopened — this resolution carries its own note", got.State)
+	}
+	if n := len(vetoEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernResolutionVetoedCategory, n)
+	}
+}
+
+func TestApplyConcernResolutions_M3_RejectRaisingAConcernAppliesBlankReopen(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "still trusts the caller subject", "routing reason")
+
+	s.applyRoundConcernResolutions(ctx, runID, stageID, []roundReviewVerdict{
+		reopenRound("fable-5", planreview.ReviewVerdict{
+			Verdict:            planreview.VerdictReject,
+			Concerns:           []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "correctness", Note: "a new finding"}},
+			ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: "reopened"}},
+		}),
+	}, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateReopened {
+		t.Errorf("state = %q, want reopened — a reject that raises its own concern is an engaged review", got.State)
+	}
+	if n := len(vetoEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernResolutionVetoedCategory, n)
+	}
+}
+
+func TestApplyConcernResolutions_M4_NonRejectVerdictAppliesBlankReopen(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "still trusts the caller subject", "routing reason")
+
+	s.applyRoundConcernResolutions(ctx, runID, stageID, []roundReviewVerdict{
+		reopenRound("fable-5", planreview.ReviewVerdict{
+			Verdict:            planreview.VerdictApproveWithConcerns,
+			ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: "reopened"}},
+		}),
+	}, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateReopened {
+		t.Errorf("state = %q, want reopened — the rule is scoped to reject verdicts", got.State)
+	}
+	if n := len(vetoEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernResolutionVetoedCategory, n)
+	}
+}
+
+func TestApplyConcernResolutions_M5_WhitespaceOnlyNoteVetoed(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "still trusts the caller subject", "routing reason")
+
+	s.applyRoundConcernResolutions(ctx, runID, stageID, []roundReviewVerdict{
+		reopenRound("fable-5", planreview.ReviewVerdict{
+			Verdict:            planreview.VerdictReject,
+			ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: "reopened", Note: " \t\n"}},
+		}),
+	}, "")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — a whitespace-only note substantiates nothing", got.State)
+	}
+	if got.StateReason != "routing reason" {
+		t.Errorf("state_reason = %q, want it intact", got.StateReason)
+	}
+	vetoes := vetoEntries(t, au)
+	if len(vetoes) != 1 || vetoes[0].VetoReason != vetoReopenWithoutNamedConcern {
+		t.Fatalf("vetoes = %+v, want one %s", vetoes, vetoReopenWithoutNamedConcern)
+	}
+}
+
+func TestApplyConcernResolutions_M6_SupersededUnaffectedByReopenArm(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "still trusts the caller subject", "routing reason")
+
+	s.applyRoundConcernResolutions(ctx, runID, stageID, []roundReviewVerdict{
+		reopenRound("fable-5", planreview.ReviewVerdict{
+			Verdict:            planreview.VerdictReject,
+			ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: "superseded"}},
+		}),
+	}, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateSuperseded {
+		t.Errorf("state = %q, want superseded — the #3319 arm touches `reopened` only", got.State)
+	}
+	if n := len(vetoEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernResolutionVetoedCategory, n)
+	}
+}
+
+// M7: the best-effort audit append FAILING does not un-veto. The concern is
+// still addressed_pending, matching the four confirm arms' posture.
+func TestApplyConcernResolutions_M7_VetoStandsWhenAuditAppendFails(t *testing.T) {
+	ctx := context.Background()
+	au := newAuditFake()
+	au.appendErr = errors.New("chain append failed")
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "still trusts the caller subject", "routing reason")
+
+	s.applyRoundConcernResolutions(ctx, runID, stageID, []roundReviewVerdict{
+		reopenRound("fable-5", planreview.ReviewVerdict{
+			Verdict:            planreview.VerdictReject,
+			ConcernResolutions: []planreview.ConcernResolution{{ID: row.ID.String(), Resolution: "reopened"}},
+		}),
+	}, "")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — the veto stands whether or not the append lands", got.State)
+	}
+	if got.StateReason != "routing reason" {
+		t.Errorf("state_reason = %q, want it intact", got.StateReason)
+	}
+}
+
+// M8 is THE MIXED-RESOLUTION CASE and the regression pin for the predicate
+// split: a NOTED `confirmed` for concern A plus a BLANK-NOTE `reopened` for
+// concern B on one reject verdict. B must be vetoed (A's note is evidence for
+// A, never for B) while A's confirm applies normally. A verdict-level veto
+// predicate lets B through — counterfactual (2).
+func TestApplyConcernResolutions_M8_MixedResolutionVetoesOnlyTheBlankReopen(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	rowA := seedRoutedConcern(t, cr, runID, stageID, "fable-5", "concern A", "routing reason A")
+	rowB := seedRoutedConcern(t, cr, runID, stageID, "fable-5", "concern B", "routing reason B")
+
+	s.applyRoundConcernResolutions(ctx, runID, stageID, []roundReviewVerdict{
+		reopenRound("fable-5", planreview.ReviewVerdict{
+			Verdict: planreview.VerdictReject,
+			ConcernResolutions: []planreview.ConcernResolution{
+				{ID: rowA.ID.String(), Resolution: "confirmed", Note: "looks good"},
+				{ID: rowB.ID.String(), Resolution: "reopened"},
+			},
+		}),
+	}, "")
+
+	gotB := concernRowAfterRound(t, cr, rowB.ID)
+	if gotB.State != concern.StateAddressedPending {
+		t.Errorf("B state = %q, want addressed_pending — concern A's note must not substantiate concern B's reopen", gotB.State)
+	}
+	if gotB.StateReason != "routing reason B" {
+		t.Errorf("B state_reason = %q, want it intact", gotB.StateReason)
+	}
+	if gotA := concernRowAfterRound(t, cr, rowA.ID); gotA.State != concern.StateAddressed {
+		t.Errorf("A state = %q, want addressed — a sibling's veto must not suppress a well-noted confirm", gotA.State)
+	}
+	vetoes := vetoEntries(t, au)
+	if len(vetoes) != 1 {
+		t.Fatalf("%s entries = %d, want exactly 1 (B only): %+v", concernResolutionVetoedCategory, len(vetoes), vetoes)
+	}
+	if vetoes[0].ConcernID != rowB.ID.String() || vetoes[0].VetoReason != vetoReopenWithoutNamedConcern {
+		t.Errorf("veto = %+v, want %s naming concern B", vetoes[0], vetoReopenWithoutNamedConcern)
+	}
+}
+
+// TestApplyConcernResolutions_BareRejectWithNoResolutionsReopensNothing is the
+// DONE-MEANS PIN for #3319's literal rule. It passes on UNCHANGED code — a
+// reject verdict cannot reopen a concern on its own, because concern
+// .StateReopened is written in exactly one place, inside the loop over
+// concern_resolutions[] that already NAMES the concern by id. Pinned so a
+// future ingestion path that reopens from a bare verdict goes RED here.
+func TestApplyConcernResolutions_BareRejectWithNoResolutionsReopensNothing(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "still trusts the caller subject", "routing reason")
+
+	s.applyRoundConcernResolutions(ctx, runID, stageID, []roundReviewVerdict{
+		reopenRound("fable-5", planreview.ReviewVerdict{
+			Verdict:  planreview.VerdictReject,
+			FreeForm: "this is still broken and must not merge",
+		}),
+	}, "")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — a reject naming no concern reopens nothing", got.State)
+	}
+	// The literal done-means is that the concern is left ALONE, which includes
+	// the routing reason the fix-up pass reads: a path that reopened from a
+	// bare verdict would overwrite it with a reopen reason even if it somehow
+	// left the state alone, so the state assertion above does not cover it.
+	if got.StateReason != "routing reason" {
+		t.Errorf("state_reason = %q, want the seeded routing reason intact — a bare reject must not rewrite it", got.StateReason)
+	}
+	if n := len(vetoEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0 — there was no resolution to veto", concernResolutionVetoedCategory, n)
+	}
+}
+
+// rawImplementReviewedPayloads returns the raw JSON bytes of every
+// implement_reviewed entry appended in a test, so a byte-level omitempty
+// assertion is possible (a decoded struct cannot tell an absent key from false).
+func rawImplementReviewedPayloads(au *auditFake) [][]byte {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out [][]byte
+	for _, ap := range au.appended {
+		if ap.Category == "implement_reviewed" {
+			out = append(out, ap.Payload)
+		}
+	}
+	return out
+}
+
+// TestImplementReviewed_RejectWithoutConcernFlag pins the VERDICT-LEVEL
+// advisory flag on the emitted payload (#3319): present and true for a bare
+// reject, and the key OMITTED entirely for every other shape — including the
+// mixed-resolution verdict, where the per-resolution veto still fires. That
+// divergence is the split, observed at the payload surface.
+func TestImplementReviewed_RejectWithoutConcernFlag(t *testing.T) {
+	tests := []struct {
+		name    string
+		verdict *planreview.ReviewVerdict
+		wantKey bool
+	}{
+		{
+			name:    "bare reject → flag present",
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+			wantKey: true,
+		},
+		{
+			name:    "free-form-only reject → flag present (free_form names no concern)",
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject, FreeForm: "still broken"},
+			wantKey: true,
+		},
+		{
+			name: "mixed-resolution reject → flag OMITTED (A carries a note)",
+			verdict: &planreview.ReviewVerdict{
+				Verdict: planreview.VerdictReject,
+				ConcernResolutions: []planreview.ConcernResolution{
+					{ID: uuid.New().String(), Resolution: "confirmed", Note: "looks good"},
+					{ID: uuid.New().String(), Resolution: "reopened"},
+				},
+			},
+		},
+		{
+			name: "reject raising a concern → flag OMITTED",
+			verdict: &planreview.ReviewVerdict{
+				Verdict:  planreview.VerdictReject,
+				Concerns: []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "correctness", Note: "a finding"}},
+			},
+		},
+		{
+			name:    "approve → flag OMITTED",
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au, _, runID, stageID := vetoRoundServer()
+			s.runImplementReviewInvocations(context.Background(), runID, stageID,
+				[]reviewerInvocation{{reviewer: &fakePlanReviewer{verdict: tc.verdict, model: "fable-5"}}},
+				planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+
+			raw := rawImplementReviewedPayloads(au)
+			if len(raw) != 1 {
+				t.Fatalf("implement_reviewed payloads = %d, want 1", len(raw))
+			}
+			has := strings.Contains(string(raw[0]), `"reject_without_concern":true`)
+			if has != tc.wantKey {
+				t.Errorf("reject_without_concern present = %v, want %v\npayload: %s", has, tc.wantKey, raw[0])
+			}
+			if !tc.wantKey && strings.Contains(string(raw[0]), "reject_without_concern") {
+				t.Errorf("the key must be OMITTED entirely so pre-#3319 payloads stay byte-identical\npayload: %s", raw[0])
+			}
+		})
+	}
+}

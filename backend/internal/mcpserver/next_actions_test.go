@@ -4833,3 +4833,91 @@ func TestConflictResolutionAdvisoryFoldedAtBothCallSites(t *testing.T) {
 		}
 	}
 }
+
+// TestNextActions_RejectWithoutConcernAdvisory (#3319) pins the display-only
+// advisory the MCP surface folds in when a decoded implement review carries
+// reject_without_concern: present when flagged, absent when not, appended LAST,
+// consumes none, and naming the rejecting reviewer.
+func TestNextActions_RejectWithoutConcernAdvisory(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	baseRun := func() *Run {
+		r := naRun("succeeded")
+		r.PullRequestURL = &prURL
+		return r
+	}
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	implWith := func(reviews ...PlanReview) *ReviewStatus {
+		rs := naReviewStatus("implement", "complete")
+		rs.Reviews = reviews
+		return rs
+	}
+
+	t.Run("flagged review folds the advisory in, LAST, consuming nothing", func(t *testing.T) {
+		na := nextActionsFor(baseRun(), stages, nil, implWith(
+			PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject", ReviewerModel: "fable-5", RejectWithoutConcern: true},
+		), nil, nil, false, false, false, "", "", releaseSignals{})
+
+		act := findAction(t, na, "review_reject_without_concern")
+		if act.Consumes != consumesNone {
+			t.Errorf("consumes = %q, want none (display-only advisory)", act.Consumes)
+		}
+		if !strings.Contains(act.Reason, "fable-5") {
+			t.Errorf("reason = %q, want it to name the rejecting reviewer", act.Reason)
+		}
+		if !strings.Contains(act.Reason, "free_form") {
+			t.Errorf("reason = %q, want it to point the operator at free_form", act.Reason)
+		}
+		names := actionNames(na)
+		if names[len(names)-1] != "review_reject_without_concern" {
+			t.Errorf("advisory must be appended LAST; actions = %v", names)
+		}
+		if !strings.Contains(strings.Join(names, ","), "fishhawk_merge_run") {
+			t.Errorf("actions = %v, want the primary next move retained alongside the advisory", names)
+		}
+	})
+
+	t.Run("multiple flagged reviews name every model", func(t *testing.T) {
+		na := nextActionsFor(baseRun(), stages, nil, implWith(
+			PlanReview{Verdict: "reject", ReviewerModel: "fable-5", RejectWithoutConcern: true},
+			PlanReview{Verdict: "reject", ReviewerModel: "gpt-5.6-sol", RejectWithoutConcern: true},
+		), nil, nil, false, false, false, "", "", releaseSignals{})
+		act := findAction(t, na, "review_reject_without_concern")
+		if !strings.Contains(act.Reason, "fable-5") || !strings.Contains(act.Reason, "gpt-5.6-sol") {
+			t.Errorf("reason = %q, want both rejecting reviewers named", act.Reason)
+		}
+	})
+
+	t.Run("a flagged review with no model still fires under a generic label", func(t *testing.T) {
+		na := nextActionsFor(baseRun(), stages, nil, implWith(
+			PlanReview{Verdict: "reject", RejectWithoutConcern: true},
+		), nil, nil, false, false, false, "", "", releaseSignals{})
+		act := findAction(t, na, "review_reject_without_concern")
+		if !strings.Contains(act.Reason, "the implement reviewer") {
+			t.Errorf("reason = %q, want the generic label when no model is recorded", act.Reason)
+		}
+	})
+
+	t.Run("no flagged review appends nothing", func(t *testing.T) {
+		na := nextActionsFor(baseRun(), stages, nil, implWith(
+			PlanReview{Verdict: "reject", ReviewerModel: "fable-5"},
+			PlanReview{Verdict: "approve", ReviewerModel: "gpt-5.6-sol"},
+		), nil, nil, false, false, false, "", "", releaseSignals{})
+		for _, name := range actionNames(na) {
+			if name == "review_reject_without_concern" {
+				t.Fatalf("advisory must not appear when no review carries the flag; actions = %v", actionNames(na))
+			}
+		}
+	})
+
+	t.Run("nil review status and nil na are no-ops", func(t *testing.T) {
+		na := nextActionsFor(baseRun(), stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		for _, name := range actionNames(na) {
+			if name == "review_reject_without_concern" {
+				t.Fatalf("advisory must not appear with a nil implement review status; actions = %v", actionNames(na))
+			}
+		}
+		// Defensive nil-na guard: never reached from nextActionsFor, but must
+		// not panic if a future caller passes nil.
+		foldRejectWithoutConcernAdvisory(implWith(PlanReview{RejectWithoutConcern: true}), nil)
+	})
+}
