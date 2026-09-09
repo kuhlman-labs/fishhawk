@@ -1047,6 +1047,21 @@ func TestRenderTitle_OneOverLimitRefused(t *testing.T) {
 	}
 }
 
+// TestMaxTitleRunes_PinsStrictestProviderBoundary pins the CONSTANT to the
+// literal 255, independent of the boundary tests above. Those tests derive every
+// input and expectation FROM MaxTitleRunes, so bumping the constant to 256 slides
+// their at-limit / over-limit boundary along with it and they stay green — the
+// strictest-provider choice (255, the GitLab cap, not GitHub's 256) would then be
+// silently unpinned. This literal assertion is the one that goes RED on that
+// change, so a future bump is a deliberate edit here and not an accident.
+func TestMaxTitleRunes_PinsStrictestProviderBoundary(t *testing.T) {
+	if MaxTitleRunes != 255 {
+		t.Errorf("MaxTitleRunes = %d, want 255 (the strictest-provider cap: GitLab 255, GitHub 256). "+
+			"Changing this is a provider-portability decision, not a refactor — see the const's doc comment in apply.go.",
+			MaxTitleRunes)
+	}
+}
+
 // TestRenderTitle_FormatPrefixPushesOver: a SHORT summary whose title_format
 // PREFIX pushes the DERIVED title over the limit is refused — proving the check
 // reads the derived title, not the summary (the exact misdiagnosis #3335

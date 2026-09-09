@@ -488,7 +488,20 @@ func TestStageWaitStatusFor_AttemptClockDeadline(t *testing.T) {
 		}
 	})
 
-	t.Run("both nil -> deadline omitted", func(t *testing.T) {
+	// PLAN-vs-BEHAVIOR DIVERGENCE, surfaced to the operator (E68.45 fix-up, concern
+	// low/test-accuracy + low/untested_edge): the plan's per-failure-mode (c)
+	// specified "both nil -> DeadlineSecondsRemaining omitted entirely". The shipped
+	// code does NOT omit it. stageAttemptStart(nil, nil) is nil, and stageElapsed
+	// over a nil clock yields 0 (TestStageElapsed pins this) — so with a KNOWN
+	// budget, stageDeadlineRemaining(3600, 0) is budget-minus-zero = the full 3600,
+	// not nil. This matches the pre-#3335 started_at-only derivation (a known budget
+	// with no start reported full remaining then too), so per standing rule 9 it is
+	// baseline-matching behavior, not a regression this change introduced. The plan's
+	// specified omission would require a separate "no attempt clock" branch that the
+	// implementation deliberately does not carry; that disagreement is reported to
+	// the operator rather than resolved by bending the code. The subtest is named for
+	// what it ASSERTS (full budget reported), not for the plan's unmet expectation.
+	t.Run("both clocks nil -> elapsed 0, full budget reported", func(t *testing.T) {
 		stages := []Stage{{
 			Type: "implement", State: "running", // no StartedAt, no DispatchedAt
 			AgentTimeoutSeconds: 3600,
@@ -496,7 +509,7 @@ func TestStageWaitStatusFor_AttemptClockDeadline(t *testing.T) {
 		st := stageWaitStatusFor(stages, "implement", "running", 0, waitBase)
 		// Budget known but elapsed 0 -> remaining is the full budget, not omitted.
 		if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 3600 {
-			t.Fatalf("deadline_seconds_remaining = %v, want 3600 (both clocks nil -> elapsed 0)", st.DeadlineSecondsRemaining)
+			t.Fatalf("deadline_seconds_remaining = %v, want 3600 (both clocks nil -> elapsed 0, full budget)", st.DeadlineSecondsRemaining)
 		}
 	})
 
