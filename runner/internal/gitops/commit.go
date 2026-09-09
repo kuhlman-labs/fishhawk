@@ -2156,8 +2156,14 @@ func (p *Pusher) PushCommittedBranch(ctx context.Context, args PushCommittedBran
 		return nil, err
 	}
 
-	if err := p.runEnv(ctx, args.RepoDir, authEnv,
-		"push", args.RemoteURL, "HEAD:refs/heads/"+args.Branch); err != nil {
+	// The push is the one invocation in this call that runs with a live
+	// installation token in its environment, and `git push` runs the
+	// repository's `pre-push` hook — which the conflict-resolution agent could
+	// have written, since `.git/hooks` is outside the working tree its contract
+	// confines it to. HardeningArgs neutralizes that hook (and every other
+	// command-executing config key) for this invocation.
+	pushArgs := append(HardeningArgs(), "push", args.RemoteURL, "HEAD:refs/heads/"+args.Branch)
+	if err := p.runEnv(ctx, args.RepoDir, authEnv, pushArgs...); err != nil {
 		return nil, fmt.Errorf("gitops: push committed branch %s: %w", args.Branch, err)
 	}
 
@@ -2171,4 +2177,56 @@ func (p *Pusher) PushCommittedBranch(ctx context.Context, args PushCommittedBran
 			args.Branch, remoteHead, args.HeadSHA)
 	}
 	return &PushCommittedBranchResult{RemoteHeadSHA: remoteHead}, nil
+}
+
+// InertHooksPath is what HardeningArgs points `core.hooksPath` at. `/dev/null`
+// is not a directory and cannot be made one, so git looks for
+// `/dev/null/<hook>`, finds nothing, and runs no hook — while an EMPTY value
+// resolves hooks relative to the current directory (a path an agent CAN write)
+// and a temp directory is one an agent with filesystem access could populate.
+// The runner targets darwin/linux only, where `/dev/null` is guaranteed.
+const InertHooksPath = "/dev/null"
+
+// HardeningArgs returns the `git -c` options that neutralize the repository
+// state which EXECUTES A COMMAND on an ordinary git invocation (#3202).
+//
+// It exists because of the conflict-resolution pass's threat model: the agent
+// is handed a working-tree-edits-only CONTRACT, but a contract is not a
+// control. `.git/hooks/*` and `.git/config` live OUTSIDE the working tree, so
+// an agent that writes them changes what the runner's OWN post-agent git
+// commands do — after the confinement gate has already inspected the tree and
+// said yes. Every key here is one that hands git a command line to run:
+//
+//   - core.hooksPath — a pre-commit hook can `git add` content the gate never
+//     saw; a prepare-commit-msg hook can rewrite the merge message after it was
+//     compared; a pre-push hook runs with the freshly minted installation token
+//     in the process environment.
+//   - core.fsmonitor — runs on the very next index refresh and can falsify the
+//     `git diff --name-only` / `git status` reads the gate DECIDES on, hiding an
+//     out-of-set edit from the observation itself.
+//   - core.editor / sequence.editor / core.pager — each spawns a process.
+//   - commit.gpgsign — signing spawns `gpg.program`.
+//   - credential.helper — an empty value RESETS the helper list (git-config(1)),
+//     so no agent-configured helper binary runs while a push token is in scope.
+//
+// `-c` beats every config file, so this holds against `.git/config`,
+// `$HOME/.gitconfig` and the system file alike.
+//
+// Read the residual honestly: this is a DENY-LIST of the keys that execute a
+// command, not a proof that repository-local git state is inert. Content
+// filters (`filter.<driver>.clean`) are keyed by a driver name that cannot be
+// wildcarded away, which is why the conflict-resolution pass ALSO verifies the
+// artifact it publishes — the staged bytes against what the gate observed, and
+// the committed tree, parents and message against what it authorized — rather
+// than relying on neutralization alone.
+func HardeningArgs() []string {
+	return []string{
+		"-c", "core.hooksPath=" + InertHooksPath,
+		"-c", "core.fsmonitor=false",
+		"-c", "core.editor=true",
+		"-c", "sequence.editor=true",
+		"-c", "core.pager=cat",
+		"-c", "commit.gpgsign=false",
+		"-c", "credential.helper=",
+	}
 }

@@ -210,7 +210,48 @@ The pass's git sequence is ordered and every step is load-bearing:
 6. Read the state back and hand it to `runner/internal/conflictresolve`, which
    is the SOLE owner of the accept/refuse decision, one named reason per rule.
 7. Only on zero violations: `git add --` EXACTLY the conflicted paths (never
-   `git add -A`) and ONE `git commit --no-edit`.
+   `git add -A`), then VERIFY the staged bytes are the bytes the gate observed,
+   snapshot the authorized tree with `git write-tree`, and make ONE
+   `git commit --no-edit --no-verify`.
+8. Verify the commit that is about to be PUBLISHED against what was authorized:
+   its tree equals the `write-tree` snapshot, its parents are (pre-merge tip,
+   `MERGE_HEAD`), and its message is the merge message the gate compared —
+   `conflict_resolution_staged_content_changed`,
+   `conflict_resolution_commit_tree_changed` and
+   `conflict_resolution_committed_message_changed` each refuse, and the refusal
+   resets to the pre-merge tip, so an unauthorized commit is discarded rather
+   than pushed.
+
+**The agent's contract is working-tree edits; `.git` is not the working tree.**
+`.git/hooks/*` and `.git/config` sit outside it and are invisible to the gate's
+observation, so an agent that legitimately resolves the conflicted file can
+still install a `pre-commit` hook that `git add`s content AFTER the gate said
+yes, a `prepare-commit-msg` hook that rewrites the merge message after it was
+compared (`--no-verify` alone does NOT stop that hook), a `pre-push` hook that
+runs while the freshly minted installation token is in the process environment,
+or a `core.fsmonitor` command that falsifies the very `git status` /
+`git diff --name-only` reads the gate DECIDES on. Two layers answer that:
+
+- **Neutralization.** EVERY git invocation the pass makes — capture, observe,
+  add, write-tree, commit, recovery, and the `PushCommittedBranch` push — runs
+  with `gitops.HardeningArgs()`: `core.hooksPath` pointed at `/dev/null` (an
+  EMPTY value would resolve hooks relative to the current directory, which the
+  agent CAN write), plus `core.fsmonitor=false`, `core.editor`/`sequence.editor`,
+  `core.pager`, `commit.gpgsign=false` and an emptied `credential.helper`. `-c`
+  beats every config file, and applying it inside `gitOutRaw` means a git
+  command added later cannot silently miss it.
+- **Artifact verification**, because neutralization is a DENY-LIST and the
+  residual is real: a content filter (`filter.<driver>.clean`) is named by
+  config and cannot be wildcarded away, so `git add` can still transform bytes
+  between the working tree and the index. The pass therefore checks the result
+  rather than trusting the inputs — steps 7 and 8 above.
+
+Residual, stated: only `PushCommittedBranch` (the conflict-resolution publish
+path) is hardened in `gitops`; the implement stage's own push and the shared
+`observeRemoteHead` keep their existing posture, which this change does not
+alter. And a pass whose repository still carries an agent-configured filter will
+see `git status --porcelain` report the worktree dirty during recovery and
+report `recovered=false` — conservative, and the fail-safe direction.
 
 Every path enumeration uses `-z` and splits on NUL — git only refrains from
 C-quoting a path under `-z`, and a newline inside a filename splits one path

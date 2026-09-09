@@ -52,6 +52,25 @@ const (
 	// reasonCommitFailed — the scoped `git add` or the single `git commit
 	// --no-edit` failed AFTER a passing gate.
 	reasonCommitFailed = "conflict_resolution_commit_failed"
+	// reasonStagedContentChanged — a conflicted path's STAGED bytes are not the
+	// working-tree bytes the gate observed. `git add` runs any content filter
+	// the repository configures for the path, and a filter driver is named by
+	// the config, so it cannot be neutralized by a deny-list the way a hook can
+	// (gitops.HardeningArgs). Refused AFTER the gate, BEFORE the commit.
+	reasonStagedContentChanged = "conflict_resolution_staged_content_changed"
+	// reasonCommitTreeChanged — the commit git produced is not the artifact the
+	// gate authorized: its tree differs from the index written immediately
+	// after the scoped add, or its parents are not (pre-merge tip, MERGE_HEAD).
+	// This is the mechanism-INDEPENDENT check: whatever staged the extra
+	// content — a hook, a filter, a config key nobody thought of — the
+	// published commit is compared against the authorized result rather than
+	// trusted because the inputs were neutralized.
+	reasonCommitTreeChanged = "conflict_resolution_commit_tree_changed"
+	// reasonCommittedMessageChanged — the committed message is not the merge
+	// message the gate compared. Distinct from the gate's
+	// conflict_resolution_merge_message_changed, which reads MERGE_MSG BEFORE
+	// the commit: this one catches a rewrite that happens DURING it.
+	reasonCommittedMessageChanged = "conflict_resolution_committed_message_changed"
 )
 
 // conflictResolutionRequest is the runner's view of the backend's
@@ -127,6 +146,14 @@ var (
 	// conflictCommitHook runs immediately after a PASSING gate and immediately
 	// before the scoped `git add`.
 	conflictCommitHook func(repoDir string)
+	// conflictPostAddHook runs after the authorized tree is written and
+	// immediately BEFORE the single commit. It stands in for whatever git
+	// mechanism the neutralization missed — the production vector is an
+	// agent-installed pre-commit hook — so the post-commit authorized-artifact
+	// check has a vehicle that does not depend on gitops.HardeningArgs being
+	// incomplete. Without it that check could only be exercised by disabling
+	// the neutralization, i.e. by shipping a bypass.
+	conflictPostAddHook func(repoDir string)
 )
 
 // gitOut runs git in repoDir and returns trimmed stdout.
@@ -139,7 +166,18 @@ func gitOut(ctx context.Context, repoDir string, args ...string) (string, error)
 // every `-z` enumeration: trimming would eat a trailing NUL and, on a path
 // carrying whitespace, silently reshape it.
 func gitOutRaw(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	// EVERY git invocation this pass makes runs with repository-local hooks and
+	// command-executing config neutralized (#3202). The agent is confined to
+	// working-tree edits by CONTRACT, but `.git/hooks/*` and `.git/config` sit
+	// OUTSIDE that tree: an agent-written pre-commit hook would `git add`
+	// content after the gate passed, and an agent-set `core.fsmonitor` would
+	// run a command during the observation reads the gate DECIDES on. Neither
+	// is captured by the baseline, so neutralization is applied here — at the
+	// single choke point every capture, observe, add, commit and recovery
+	// command flows through — rather than at each call site, where the next
+	// added command would silently miss it. gitops.HardeningArgs is the ONE
+	// definition; the push path applies the same set.
+	cmd := exec.CommandContext(ctx, "git", append(gitops.HardeningArgs(), args...)...)
 	cmd.Dir = repoDir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -226,8 +264,13 @@ func configuredRemotes(ctx context.Context, repoDir string) []string {
 
 // runConflictResolutionPass performs the whole local pass: verify, merge,
 // capture, invoke, observe, gate, and — only on a passing gate — the scoped
-// `git add` plus ONE `git commit --no-edit`. It performs NO network I/O; the
-// caller owns the push and the terminal report.
+// `git add`, ONE `git commit --no-edit --no-verify`, and the verification that
+// the commit it is about to hand back IS the artifact the gate authorized. It
+// performs NO network I/O; the caller owns the push and the terminal report.
+//
+// Every git command below runs with repository-local hooks and
+// command-executing config neutralized (see gitOutRaw): `.git` is not the
+// working tree the agent's contract confines it to.
 //
 // Every refusal path runs the detached recovery before returning, so the
 // repository is left at the pre-merge tip with a clean worktree whatever
@@ -323,7 +366,30 @@ func runConflictResolutionPass(ctx context.Context, repoDir, remote string,
 	if err := gitRun(obsCtx, repoDir, addArgs...); err != nil {
 		return refuse(reasonCommitFailed, "stage conflicted paths: "+err.Error(), nil)
 	}
-	if err := gitRun(obsCtx, repoDir, "commit", "--no-edit"); err != nil {
+
+	// (7a) The gate decided on WORKING-TREE bytes; `git add` is what turns them
+	// into the artifact. Verify the index holds exactly what the gate saw
+	// before anything is committed — a content filter transforms bytes between
+	// the two and is named by config, so it survives the hook/config
+	// neutralization above.
+	if reason, detail := verifyStagedMatchesObserved(obsCtx, repoDir, base, obs); reason != "" {
+		return refuse(reason, detail, nil)
+	}
+
+	// (7b) Snapshot the AUTHORIZED tree from the index the gate just approved,
+	// then commit. Anything that mutates the index between here and the commit
+	// (a hook the neutralization missed, a config key nobody enumerated) moves
+	// the committed tree off this SHA and is refused below.
+	authorizedTree, err := gitOut(obsCtx, repoDir, "write-tree")
+	if err != nil {
+		return refuse(reasonCommitFailed, "write authorized tree: "+err.Error(), nil)
+	}
+	if conflictPostAddHook != nil {
+		conflictPostAddHook(repoDir)
+	}
+	// --no-verify is belt to HardeningArgs' braces: it bypasses the pre-commit
+	// and commit-msg hooks by flag as well as by path.
+	if err := gitRun(obsCtx, repoDir, "commit", "--no-edit", "--no-verify"); err != nil {
 		return refuse(reasonCommitFailed, "commit merge: "+err.Error(), nil)
 	}
 	newHead, err := gitOut(obsCtx, repoDir, "rev-parse", "HEAD")
@@ -331,10 +397,119 @@ func runConflictResolutionPass(ctx context.Context, repoDir, remote string,
 		return refuse(reasonCommitFailed, "read merge commit: "+err.Error(), nil)
 	}
 
+	// (7c) The commit that will be PUBLISHED is compared against the authorized
+	// result — tree, parents and message — rather than trusted. A refusal here
+	// resets to the pre-merge tip, so the unauthorized commit is discarded and
+	// never pushed.
+	if reason, detail := verifyAuthorizedCommit(obsCtx, repoDir, base, head, authorizedTree); reason != "" {
+		return refuse(reason, detail, nil)
+	}
+
 	logEvent(logSink, "conflict_resolution_committed", map[string]string{
 		"head_sha": newHead, "base_sha": head, "merge_ref": mergeRef,
 	})
 	return conflictResolutionResult{HeadSHA: newHead, BaseSHA: head, Recovered: true}
+}
+
+// verifyStagedMatchesObserved compares each conflicted path's STAGED bytes
+// against the working-tree bytes the gate observed and approved.
+//
+// It is the filter-driver answer. `git add` applies whatever
+// `filter.<driver>.clean` command the repository configures for a path, and a
+// driver is named by config — there is no wildcard to neutralize it with the
+// way gitops.HardeningArgs neutralizes a fixed key. So the pass does not assume
+// the index holds what the gate read: it reads the index back. A path the gate
+// observed as ABSENT (the deletion side of a delete/modify conflict) must be
+// absent from the index too.
+//
+// Returns ("", "") when the index matches, or a named reason and a detail.
+func verifyStagedMatchesObserved(ctx context.Context, repoDir string,
+	base conflictresolve.Baseline, obs conflictresolve.Observed) (string, string) {
+
+	for _, path := range sortedStringKeys(base.Conflicted) {
+		want := obs.Working[path]
+		staged, err := gitOutRaw(ctx, repoDir, "cat-file", "blob", ":"+path)
+		if err != nil {
+			// No stage-0 entry. Correct only when the gate observed the path
+			// gone; otherwise the add did not stage what the gate approved.
+			if want.Present {
+				return reasonStagedContentChanged,
+					fmt.Sprintf("%s: no staged entry for a path the gate observed present", path)
+			}
+			continue
+		}
+		if !want.Present {
+			return reasonStagedContentChanged,
+				fmt.Sprintf("%s: staged entry present for a path the gate observed deleted", path)
+		}
+		if !bytes.Equal(staged, want.Bytes) {
+			return reasonStagedContentChanged,
+				fmt.Sprintf("%s: staged %d bytes, gate approved %d bytes", path, len(staged), len(want.Bytes))
+		}
+	}
+	return "", ""
+}
+
+// verifyAuthorizedCommit compares the commit that is about to be PUBLISHED
+// against the artifact the gate authorized: the tree written from the approved
+// index, the two merge parents, and the merge message.
+//
+// This is the check that makes the confinement claim hold WITHOUT depending on
+// having enumerated every way an agent can make git run a command. Whatever the
+// mechanism, a commit whose tree is not `authorizedTree` is refused, and the
+// refusal's recovery resets to the pre-merge tip, so the unauthorized commit is
+// discarded rather than pushed.
+func verifyAuthorizedCommit(ctx context.Context, repoDir string,
+	base conflictresolve.Baseline, preTip, authorizedTree string) (string, string) {
+
+	tree, err := gitOut(ctx, repoDir, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		return reasonCommitTreeChanged, "read committed tree: " + err.Error()
+	}
+	if tree != authorizedTree {
+		return reasonCommitTreeChanged,
+			fmt.Sprintf("committed tree %s is not the authorized tree %s", tree, authorizedTree)
+	}
+
+	parentLine, err := gitOut(ctx, repoDir, "rev-list", "--parents", "-n", "1", "HEAD")
+	if err != nil {
+		return reasonCommitTreeChanged, "read commit parents: " + err.Error()
+	}
+	parents := strings.Fields(parentLine)
+	if len(parents) != 3 || parents[1] != preTip || parents[2] != base.MergeHeadSHA {
+		return reasonCommitTreeChanged,
+			fmt.Sprintf("commit parents %v, want [%s %s]", parents[1:], preTip, base.MergeHeadSHA)
+	}
+
+	msgRaw, err := gitOutRaw(ctx, repoDir, "log", "-1", "--format=%B", "HEAD")
+	if err != nil {
+		return reasonCommittedMessageChanged, "read commit message: " + err.Error()
+	}
+	if normalizeCommitMessage(string(msgRaw)) != normalizeCommitMessage(base.MergeMessage) {
+		return reasonCommittedMessageChanged,
+			"the committed message is not the merge message the gate compared"
+	}
+	return "", ""
+}
+
+// normalizeCommitMessage renders a message in the form the comparison above can
+// make: comment lines dropped, trailing whitespace trimmed per line, and the
+// whole trimmed.
+//
+// git itself strips comment lines and normalizes trailing blank lines when it
+// records a commit, so the recorded message is never byte-identical to
+// MERGE_MSG and a raw comparison would refuse EVERY pass. Both sides go through
+// the same normalization, so the comparison stays symmetric: a rewrite of the
+// message BODY is caught, while git's own cleanup is not mistaken for one.
+func normalizeCommitMessage(s string) string {
+	var kept []string
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		kept = append(kept, strings.TrimRight(line, " \t"))
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n"))
 }
 
 // violationDetail renders every violation into one operator-readable line, so a

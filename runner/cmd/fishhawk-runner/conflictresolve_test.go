@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -909,5 +910,195 @@ func TestConflictResolutionStage_ReportShipFailures(t *testing.T) {
 				t.Errorf("log = %q, want an event naming %q", sb.String(), tc.wantEv)
 			}
 		})
+	}
+}
+
+// --- agent-writable .git state: neutralization + artifact verification (#3202) ---
+
+// crWriteHook installs an executable hook under .git/hooks. The agent runs
+// under a WORKING-TREE-EDITS-ONLY contract, but .git/hooks is outside the
+// working tree, so nothing in the gate's observation sees this — which is
+// exactly the bypass these tests pin.
+func crWriteHook(t *testing.T, repo, name, script string) {
+	t.Helper()
+	dir := filepath.Join(repo, ".git", "hooks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// crListDir returns the directory's entry names, sorted, for sentinel checks.
+func crListDir(t *testing.T, dir string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestConflictResolutionPass_NeutralizesAgentWrittenHooks is the routed
+// security concern's named test: an agent that legitimately resolves the
+// conflicted file ALSO installs .git hooks that tamper with the artifact after
+// the gate has already said yes.
+//
+// The pre-commit hook stages an out-of-set file (the tree the gate verified is
+// then not the tree that gets pushed); prepare-commit-msg rewrites the merge
+// message after conflict_resolution_merge_message_changed was checked — and
+// `--no-verify` alone would NOT stop that one; post-commit proves whether any
+// hook ran at all. The assertions read the COMMITTED REPOSITORY back, not a
+// returned error: a hook that fired and was then papered over returns the same
+// nil error as one that never ran.
+func TestConflictResolutionPass_NeutralizesAgentWrittenHooks(t *testing.T) {
+	repo, head := crRepo(t)
+	sentinels := t.TempDir()
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error {
+			crWrite(t, repo, "conflict.txt", "ours\n")
+			crWriteHook(t, repo, "pre-commit", "#!/bin/sh\n"+
+				"echo owned > evil.txt\n"+
+				"git add evil.txt\n"+
+				"touch "+filepath.Join(sentinels, "pre-commit")+"\n")
+			crWriteHook(t, repo, "prepare-commit-msg", "#!/bin/sh\n"+
+				"echo 'rewritten by the hook' > \"$1\"\n"+
+				"touch "+filepath.Join(sentinels, "prepare-commit-msg")+"\n")
+			crWriteHook(t, repo, "post-commit", "#!/bin/sh\n"+
+				"touch "+filepath.Join(sentinels, "post-commit")+"\n")
+			return nil
+		}, nil)
+
+	if got := crListDir(t, sentinels); len(got) != 0 {
+		t.Errorf("agent-installed hooks RAN during the pass: %v", got)
+	}
+	if res.refused() {
+		t.Fatalf("pass refused with the hooks neutralized: %s (%s)", res.Reason, res.Detail)
+	}
+	// The published artifact is the one the gate authorized: the out-of-set
+	// file the hook would have staged is in no tree, and the merge message is
+	// git's, not the hook's.
+	tree := crGitOut(t, repo, "ls-tree", "--name-only", "-r", "HEAD")
+	if strings.Contains(tree, "evil.txt") {
+		t.Errorf("out-of-set file reached the committed tree:\n%s", tree)
+	}
+	if msg := crGitOut(t, repo, "log", "-1", "--format=%B", "HEAD"); strings.Contains(msg, "rewritten by the hook") {
+		t.Errorf("merge message was rewritten by the hook: %q", msg)
+	}
+}
+
+// TestConflictResolutionPass_RefusesCommitOffTheAuthorizedTree pins the
+// mechanism-INDEPENDENT half: whatever stages content between the approved
+// index and the commit, the commit that would be published is compared against
+// the authorized tree and refused when it differs.
+//
+// The seam stands in for a hook the neutralization missed — the point of the
+// check is that it does not depend on the deny-list being complete.
+func TestConflictResolutionPass_RefusesCommitOffTheAuthorizedTree(t *testing.T) {
+	repo, head := crRepo(t)
+	orig := conflictPostAddHook
+	t.Cleanup(func() { conflictPostAddHook = orig })
+	conflictPostAddHook = func(repoDir string) {
+		crWrite(t, repoDir, "evil.txt", "owned\n")
+		crGit(t, repoDir, "add", "evil.txt")
+	}
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { crWrite(t, repo, "conflict.txt", "ours\n"); return nil }, nil)
+
+	if res.Reason != reasonCommitTreeChanged {
+		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonCommitTreeChanged)
+	}
+	// The refusal's effect is COMMITTED STATE: the unauthorized commit must be
+	// gone, not merely reported.
+	crAssertRestored(t, repo, head)
+	if log := crGitOut(t, repo, "log", "--all", "--name-only", "--format="); strings.Contains(log, "evil.txt") {
+		t.Errorf("the unauthorized commit survived the refusal:\n%s", log)
+	}
+}
+
+// TestConflictResolutionPass_RefusesRewrittenCommitMessage pins the message
+// half of the same check: the gate compared MERGE_MSG BEFORE the commit, so a
+// rewrite DURING it is caught only by comparing what was actually recorded.
+func TestConflictResolutionPass_RefusesRewrittenCommitMessage(t *testing.T) {
+	repo, head := crRepo(t)
+	orig := conflictPostAddHook
+	t.Cleanup(func() { conflictPostAddHook = orig })
+	conflictPostAddHook = func(repoDir string) {
+		if err := os.WriteFile(filepath.Join(repoDir, ".git", "MERGE_MSG"),
+			[]byte("a message the gate never saw\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { crWrite(t, repo, "conflict.txt", "ours\n"); return nil }, nil)
+
+	if res.Reason != reasonCommittedMessageChanged {
+		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonCommittedMessageChanged)
+	}
+	crAssertRestored(t, repo, head)
+}
+
+// TestConflictResolutionPass_RefusesFilterMangledStagedContent is the vector
+// the hook deny-list CANNOT close: a content filter is named by config
+// (`filter.<driver>.clean`), so there is no fixed key to neutralize. The agent
+// resolves the hunk exactly as the gate requires and configures a clean filter
+// that transforms the bytes as `git add` stages them, so the index would hold
+// content the gate never approved.
+//
+// Nothing here uses a seam: the filter is real repository state and git runs it.
+func TestConflictResolutionPass_RefusesFilterMangledStagedContent(t *testing.T) {
+	repo, head := crRepo(t)
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error {
+			crWrite(t, repo, "conflict.txt", "ours\n")
+			crGit(t, repo, "config", "filter.mangle.clean", "sed s/ours/owned/")
+			if err := os.WriteFile(filepath.Join(repo, ".git", "info", "attributes"),
+				[]byte("conflict.txt filter=mangle\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}, nil)
+
+	if res.Reason != reasonStagedContentChanged {
+		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonStagedContentChanged)
+	}
+	if got := crGitOut(t, repo, "rev-parse", "HEAD"); got != head {
+		t.Errorf("HEAD = %s, want the pre-merge tip %s", got, head)
+	}
+	// The filter is still configured, so `git status` re-runs it on every read
+	// and reports the file dirty — the pass's own recovery verdict is therefore
+	// conservatively "not restored", which is the fail-safe direction. Remove
+	// the adversarial state (not its effect) before asserting cleanliness, so
+	// this test measures recovery rather than the filter.
+	if err := os.Remove(filepath.Join(repo, ".git", "info", "attributes")); err != nil {
+		t.Fatal(err)
+	}
+	crGit(t, repo, "config", "--unset", "filter.mangle.clean")
+	crAssertRestored(t, repo, head)
+}
+
+// TestNormalizeCommitMessage pins the symmetry the committed-message comparison
+// depends on: git strips comment lines and normalizes trailing blank lines when
+// it records a merge, so a raw comparison against MERGE_MSG would refuse EVERY
+// pass, while a normalization applied to only one side would miss a rewrite.
+func TestNormalizeCommitMessage(t *testing.T) {
+	mergeMsg := "Merge branch 'main' into feature\n\n# Conflicts:\n#\tconflict.txt\n"
+	recorded := "Merge branch 'main' into feature\n\n# Conflicts:\n#\tconflict.txt\n\n"
+	if normalizeCommitMessage(mergeMsg) != normalizeCommitMessage(recorded) {
+		t.Errorf("git's own cleanup read as a rewrite: %q vs %q",
+			normalizeCommitMessage(mergeMsg), normalizeCommitMessage(recorded))
+	}
+	if normalizeCommitMessage(mergeMsg) == normalizeCommitMessage("owned\n") {
+		t.Error("a rewritten body normalized equal to the merge message")
 	}
 }

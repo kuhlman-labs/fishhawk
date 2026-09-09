@@ -5228,3 +5228,70 @@ func TestPushCommittedBranch_RequiredArgs(t *testing.T) {
 		})
 	}
 }
+
+// TestPushCommittedBranch_NeutralizesPrePushHook pins the credential half of
+// the conflict-resolution threat model (#3202): `git push` is the ONE
+// invocation of that pass carrying a freshly minted installation token in its
+// process environment, and it runs the repository's `pre-push` hook — which the
+// agent can write, since .git/hooks is outside the working tree its contract
+// confines it to. The hook here records that it ran; the assertion is its
+// ABSENCE, read off the filesystem after the push returns, because a hook that
+// fired changes nothing about the returned error.
+func TestPushCommittedBranch_NeutralizesPrePushHook(t *testing.T) {
+	repo, bare, head := pushCommittedFixture(t)
+	sentinel := filepath.Join(t.TempDir(), "pre-push-ran")
+
+	hooks := filepath.Join(repo, ".git", "hooks")
+	if err := os.MkdirAll(hooks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hooks, "pre-push"),
+		[]byte("#!/bin/sh\ntouch "+sentinel+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+		RepoDir:   repo,
+		Branch:    "fishhawk/run-x",
+		RemoteURL: bare,
+		HeadSHA:   head,
+	}); err != nil {
+		t.Fatalf("PushCommittedBranch: %v", err)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Errorf("the repository's pre-push hook RAN during the authorized push (stat err = %v)", err)
+	}
+}
+
+// TestHardeningArgs pins every key in the deny-list, one assertion per
+// execution vector, because the set is the control: a key silently dropped
+// from it re-opens exactly the bypass it was added for, and the keys whose
+// effect is hard to observe end to end (an fsmonitor command falsifying the
+// gate's own `git status` / `git diff` reads) have no other pin.
+func TestHardeningArgs(t *testing.T) {
+	args := HardeningArgs()
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"core.hooksPath=" + InertHooksPath, // hooks: pre-commit / prepare-commit-msg / pre-push
+		"core.fsmonitor=false",             // a command run on index refresh, falsifying the observation
+		"core.editor=true",                 // editor spawn
+		"sequence.editor=true",             // editor spawn
+		"core.pager=cat",                   // pager spawn
+		"commit.gpgsign=false",             // gpg.program spawn
+		"credential.helper=",               // credential-helper binary, with a push token in scope
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("HardeningArgs missing %q: %v", want, args)
+		}
+	}
+	for i := 0; i < len(args); i += 2 {
+		if args[i] != "-c" {
+			t.Fatalf("HardeningArgs[%d] = %q, want every entry to be a -c pair: %v", i, args[i], args)
+		}
+	}
+	// An EMPTY hooksPath resolves hooks relative to the current directory,
+	// which an agent CAN write — the neutralization must not degrade to it.
+	if InertHooksPath == "" {
+		t.Error("InertHooksPath is empty, which makes git resolve hooks relative to the working directory")
+	}
+}

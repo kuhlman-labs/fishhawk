@@ -54,7 +54,7 @@ They partition into `before\n` and `<<<<<< HEAD\n`, so the candidate `before\n<<
 
 `Observed` is the same shape read back after the agent, plus `Unmerged` / `Unstaged` / `Untracked` and a `Working` `FileState` (present, mode, bytes) per conflicted path.
 
-`Verify` returns one `Violation` per rule broken, each carrying its OWN named reason, in deterministic order: the repository-level rules first (their `Path` is empty, which sorts first), then the path-keyed rules sorted by path and reason. **An empty result is the accept verdict — and only then may the runner perform its scoped `git add` of exactly the conflicted paths and its single `git commit --no-edit`.**
+`Verify` returns one `Violation` per rule broken, each carrying its OWN named reason, in deterministic order: the repository-level rules first (their `Path` is empty, which sorts first), then the path-keyed rules sorted by path and reason. **An empty result is the accept verdict — and only then may the runner perform its scoped `git add` of exactly the conflicted paths and its single `git commit --no-edit`.** The accept verdict is a necessary condition, not the last one: this package decides on the WORKING-TREE state it was handed, so the runner additionally neutralizes agent-writable `.git` state on every git invocation and verifies the staged bytes, tree, parents and message of the commit it publishes against what was authorized here (#3202 — see `runner/README.md`).
 
 | Reason | Rule |
 |---|---|
