@@ -2535,22 +2535,25 @@ func campaignUnclassifiedNextActions(na CampaignNextAction) *NextActions {
 // --- E64.62 / #3202: conflict-resolution pass advisory ---
 
 const (
-	// auditCategoryConflictResolutionTriggered / _Failed MUST match
-	// backend/internal/server.CategoryStageConflictResolutionTriggered and
-	// CategoryStageConflictResolutionFailed. They are duplicated rather than
+	// auditCategoryConflictResolutionTriggered / _Failed / _Pushed MUST match
+	// backend/internal/server.CategoryStageConflictResolutionTriggered,
+	// CategoryStageConflictResolutionFailed and
+	// CategoryConflictResolutionPushed. They are duplicated rather than
 	// imported because mcpserver reads them off the WIRE (the audit slice this
 	// surface already fetched), not out of the server package.
 	auditCategoryConflictResolutionTriggered = "stage_conflict_resolution_triggered"
 	auditCategoryConflictResolutionFailed    = "stage_conflict_resolution_failed"
+	auditCategoryConflictResolutionPushed    = "conflict_resolution_pushed"
 )
 
 // conflictResolutionSignal is what the recent-audit slice says about a run's
-// bounded conflict-resolution pass (#3202). Exactly one of Triggered / Failed
-// is true when Present.
+// bounded conflict-resolution pass (#3202). Exactly one of Triggered / Failed /
+// Succeeded is true when Present.
 type conflictResolutionSignal struct {
 	Present   bool
 	Triggered bool
 	Failed    bool
+	Succeeded bool
 	StageID   string
 	Reason    string
 }
@@ -2558,14 +2561,17 @@ type conflictResolutionSignal struct {
 // conflictResolutionSignalIn reads the newest conflict-resolution entry out of
 // the recent-audit slice and classifies it.
 //
-// Selection is by SEQUENCE, newest wins, across BOTH categories together —
+// Selection is by SEQUENCE, newest wins, across ALL THREE categories together —
 // deliberately not "is there a trigger" then "is there a failure", because the
-// two categories interleave on one stage and the pair's ORDER is the whole
-// signal: a failure NEWER than the trigger means the pass ran and was refused
-// (the budget is spent), while a trigger newer than any failure means a pass is
-// live. That is the same consumption rule the server's
-// resolveConflictResolutionTrigger applies, so the two cannot disagree about
-// whether a pass is outstanding.
+// categories interleave on one stage and their ORDER is the whole signal: a
+// SETTLEMENT newer than the trigger means the pass ran and is over — refused
+// (stage_conflict_resolution_failed) or succeeded (conflict_resolution_pushed),
+// budget spent either way — while a trigger newer than every settlement means a
+// pass is live. Reading only the failure category (#3202 round-3) left a
+// SUCCEEDED pass classified as permanently pending, sending the operator to
+// wait on a stage that had already gone terminal. That is the same consumption
+// rule the server's resolveConflictResolutionTrigger applies, so the two cannot
+// disagree about whether a pass is outstanding.
 //
 // FAILS OPEN to a zero signal on every uncertainty — an empty or un-fetched
 // slice, an entry aged out of the window, a payload that is not a JSON object.
@@ -2575,7 +2581,8 @@ func conflictResolutionSignalIn(recent []AuditEntry) conflictResolutionSignal {
 	var newest *AuditEntry
 	for i := range recent {
 		c := recent[i].Category
-		if c != auditCategoryConflictResolutionTriggered && c != auditCategoryConflictResolutionFailed {
+		if c != auditCategoryConflictResolutionTriggered && c != auditCategoryConflictResolutionFailed &&
+			c != auditCategoryConflictResolutionPushed {
 			continue
 		}
 		if newest == nil || recent[i].Sequence > newest.Sequence {
@@ -2589,6 +2596,7 @@ func conflictResolutionSignalIn(recent []AuditEntry) conflictResolutionSignal {
 		Present:   true,
 		Triggered: newest.Category == auditCategoryConflictResolutionTriggered,
 		Failed:    newest.Category == auditCategoryConflictResolutionFailed,
+		Succeeded: newest.Category == auditCategoryConflictResolutionPushed,
 		Reason:    acceptancePayloadString(newest.Payload, "reason"),
 	}
 	if newest.StageID != nil {
@@ -2619,6 +2627,11 @@ func conflictResolutionSignalIn(recent []AuditEntry) conflictResolutionSignal {
 //     dispatch: on the local loop the operator dispatches the stage through the
 //     ordinary implement arm the block already carries, and naming a second
 //     dispatch verb here would invite a double dispatch.
+//   - a SUCCEEDED pass (the newest entry is conflict_resolution_pushed):
+//     APPENDS a fishhawk_rebase_run_branch action and relabels the state
+//     conflict_resolution_pass_succeeded. The pass is SETTLED, not pending —
+//     without this arm the advisory kept naming a completed pass as pending and
+//     pointed the operator at a wait on a stage that had already gone terminal.
 //   - a FAILED pass (the newest entry is the failure): APPENDS a
 //     fishhawk_rebase_run_branch action whose reason names the refusal and the
 //     resolve-push-vouch fallback, and relabels the state
@@ -2650,6 +2663,17 @@ func foldConflictResolutionAdvisory(run *Run, recent []AuditEntry, na *NextActio
 			Precondition: "a conflict-resolution pass is authorized and its implement stage is re-opened, so there is a settle to wait on",
 			Consumes:     consumesNone,
 			Reason:       reason,
+		})
+		return
+	}
+	if sig.Succeeded {
+		na.State = "conflict_resolution_pass_succeeded"
+		na.Actions = append(na.Actions, SuggestedAction{
+			Action:       "fishhawk_rebase_run_branch",
+			Params:       map[string]string{"run_id": run.ID, "confirm": "true"},
+			Precondition: "the conflict-resolution pass SETTLED with its merge commit pushed to the PR branch, so the rebase can now complete",
+			Consumes:     consumesNone,
+			Reason:       "the bounded conflict-resolution pass SUCCEEDED: its single merge commit is committed and pushed to the existing PR branch, the review gate was re-parked so the merge commit is reviewed, and its ceiling-of-one budget is now SPENT. The pass is SETTLED, not pending — re-invoke fishhawk_rebase_run_branch to let the behind-probe short-circuit and re-post the fishhawk_audit_complete check at the resulting head.",
 		})
 		return
 	}

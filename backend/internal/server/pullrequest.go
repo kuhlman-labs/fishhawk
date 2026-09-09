@@ -1750,6 +1750,13 @@ type pullRequestConflictResolutionResponse struct {
 // status comment and responds 200. No PR artifact and no pull_request_url
 // backfill: the PR already exists and tracks this branch.
 //
+// That audit entry is also the trigger's CONSUMPTION marker (#3202 round-3):
+// resolveConflictResolutionTrigger treats CategoryConflictResolutionPushed
+// exactly as it treats the failure category, so a successful pass leaves no
+// live instruction behind for the next ordinary fix-up on this stage to be
+// hijacked by. The category constant is shared with the resolver for that
+// reason — a literal here could drift out of the consumption set silently.
+//
 // Structurally this mirrors succeedFixupNoChangesStage's stage-keyed
 // idempotency rather than succeedFixupPushStage's head-keyed dedup, because the
 // pass has a ceiling of one and its report is stage-unique: a runner retry
@@ -1760,7 +1767,7 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
 	stageID := stage.ID
 
-	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, "conflict_resolution_pushed"); err != nil {
+	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryConflictResolutionPushed); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"conflict-resolution push report: list conflict_resolution_pushed audit entries failed; proceeding without idempotency guard",
 			slog.String("run_id", runID.String()),
@@ -1793,7 +1800,7 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 		RunID:        runID,
 		StageID:      &stageID,
 		Timestamp:    time.Now().UTC(),
-		Category:     "conflict_resolution_pushed",
+		Category:     CategoryConflictResolutionPushed,
 		ActorKind:    &actorKind,
 		ActorSubject: actorSubject,
 		Payload:      auditPayload,
@@ -1805,7 +1812,7 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 			slog.String("error", err.Error()))
 	}
 
-	s.notifyStatusUpdate(r.Context(), runID, "conflict_resolution_pushed")
+	s.notifyStatusUpdate(r.Context(), runID, CategoryConflictResolutionPushed)
 
 	s.writeJSON(w, r, http.StatusOK, pullRequestConflictResolutionResponse{
 		StageID: stageID,

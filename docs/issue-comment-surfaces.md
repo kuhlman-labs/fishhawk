@@ -1389,7 +1389,10 @@ Notes:
   **stage-keyed**, since the pass has a ceiling of one) when the runner reports
   `{outcome:"conflict_resolution_pushed"}` after pushing its single merge commit onto
   the EXISTING PR branch, with payload `{run_id, stage_id, branch, head_sha, base_sha,
-  files_changed_count, auth_method}`. It drives the stage's terminal transition and
+  files_changed_count, auth_method}`. That entry ALSO consumes the trigger, exactly as
+  the failure entry does: either terminal outcome settles the pass, so a later ordinary
+  fix-up on the stage is served `conflict_resolution=false` whether the pass was refused
+  or succeeded. It drives the stage's terminal transition and
   re-parks the review gate — a mechanical resolution is not a substitute for review —
   but posts nothing to the issue thread (the existing PR's sticky status comment is
   refreshed via the separate `notifyStatusUpdate` hook). Mirrors the sibling

@@ -1206,10 +1206,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// Conflict-resolution pass (#3202). Resolved BEFORE the fix-up block:
 		// a live trigger makes this dispatch a conflict-resolution pass, and
 		// the runner routes on it ahead of every implement/fix-up path. The
-		// resolver returns nil for a CONSUMED trigger (one a later
-		// stage_conflict_resolution_failed entry spent), so an ordinary fix-up
-		// that follows a refused pass is served conflict_resolution=false and
-		// takes the unchanged fix-up path.
+		// resolver returns nil for a CONSUMED trigger — one a later
+		// stage_conflict_resolution_failed (refused) or conflict_resolution_
+		// pushed (succeeded) entry spent — so an ordinary fix-up that follows
+		// EITHER terminal outcome is served conflict_resolution=false and takes
+		// the unchanged fix-up path.
 		conflictResolution = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
 		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
@@ -1858,10 +1859,11 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// Conflict-resolution pass (#3202). Resolved BEFORE the fix-up block:
 		// a live trigger makes this dispatch a conflict-resolution pass, and
 		// the runner routes on it ahead of every implement/fix-up path. The
-		// resolver returns nil for a CONSUMED trigger (one a later
-		// stage_conflict_resolution_failed entry spent), so an ordinary fix-up
-		// that follows a refused pass is served conflict_resolution=false and
-		// takes the unchanged fix-up path.
+		// resolver returns nil for a CONSUMED trigger — one a later
+		// stage_conflict_resolution_failed (refused) or conflict_resolution_
+		// pushed (succeeded) entry spent — so an ordinary fix-up that follows
+		// EITHER terminal outcome is served conflict_resolution=false and takes
+		// the unchanged fix-up path.
 		conflictResolution = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
 		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
 			trigger.FixupConcerns = rendered

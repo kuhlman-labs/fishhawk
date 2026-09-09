@@ -1156,8 +1156,28 @@ never has to push to a branch ADR-035 declares runner-owned.
   fix-up can never spend the pass. The ceiling is deliberately NOT
   operator-overridable: the pass resolves mechanically inside the marked
   hunks, so a second attempt at the same conflict has no new information and
-  would only widen the blast radius. A trigger CONSUMED by a later failure
+  would only widen the blast radius. A trigger CONSUMED by a later settlement
   still counts — the pass it authorized ran.
+- **CONSUMPTION is written by BOTH terminal outcomes.**
+  `resolveConflictResolutionTrigger` treats a same-stage
+  `stage_conflict_resolution_failed` (refused) or `conflict_resolution_pushed`
+  (succeeded) entry at or newer than the trigger's sequence as spending it, and
+  serves no pass thereafter. Reading only the failure category left a
+  SUCCESSFUL pass's trigger live, so the next ordinary fix-up on that implement
+  stage was served `conflict_resolution=true` with anchors naming a merge
+  already committed and pushed — the same hijack the failure comparison closes,
+  reached through the happy path. `succeedConflictResolutionPushStage` and the
+  resolver share the `CategoryConflictResolutionPushed` constant so the writer
+  cannot drift out of the consumption set.
+- **The failure marker is appended BEFORE the restore, and a persistence
+  failure REFUSES the recovery.** Consumption lives only in the audit chain, so
+  a restore that lands while the marker append fails would acknowledge the
+  recovery (implement back to `succeeded`, review back to `awaiting_approval`)
+  while leaving the trigger dispatchable. Marker-first inverts the exposure:
+  the append error returns false, nothing is restored, the stage stays `failed`
+  and the caller's normal failure path runs. The residual is deliberate and
+  strictly smaller — a marker landing ahead of a restore that turns out not to
+  apply spends a trigger for a pass the runner has already reported as failed.
 - **ORDERING IS LOAD-BEARING, and it is APPEND-THEN-REOPEN.** The trigger
   entry is BOTH the durable budget counter and the runner's instruction; the
   re-open is what makes the local loop dispatch the stage. A failed re-open

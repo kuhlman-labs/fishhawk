@@ -4573,6 +4573,79 @@ func TestConflictResolutionCategoriesMatchTheServer(t *testing.T) {
 		t.Errorf("failed category = %q, want %q",
 			auditCategoryConflictResolutionFailed, server.CategoryStageConflictResolutionFailed)
 	}
+	if auditCategoryConflictResolutionPushed != server.CategoryConflictResolutionPushed {
+		t.Errorf("pushed category = %q, want %q",
+			auditCategoryConflictResolutionPushed, server.CategoryConflictResolutionPushed)
+	}
+}
+
+// TestConflictResolutionSignalIn_SuccessSettlesThePass is the ROUND-3
+// classifier requirement. The signal read only the trigger/failure pair, so a
+// pass that SUCCEEDED (conflict_resolution_pushed) left the newest entry a
+// trigger and the advisory kept calling a completed pass PENDING — pointing the
+// operator at a wait on a stage that had already gone terminal.
+//
+// The counterfactual vehicle: dropping auditCategoryConflictResolutionPushed
+// from conflictResolutionSignalIn's category filter makes this test go RED.
+func TestConflictResolutionSignalIn_SuccessSettlesThePass(t *testing.T) {
+	stageID := uuid.NewString()
+	got := conflictResolutionSignalIn([]AuditEntry{
+		crAuditEntry(auditCategoryConflictResolutionTriggered, 10, stageID, nil),
+		crAuditEntry(auditCategoryConflictResolutionPushed, 20, stageID,
+			map[string]any{"head_sha": "merge-sha"}),
+	})
+	if !got.Present || !got.Succeeded {
+		t.Fatalf("signal = %+v, want Present+Succeeded for a pushed pass", got)
+	}
+	if got.Triggered || got.Failed {
+		t.Errorf("signal = %+v, want exactly one of Triggered/Failed/Succeeded", got)
+	}
+	if got.StageID != stageID {
+		t.Errorf("stage_id = %q, want %q", got.StageID, stageID)
+	}
+
+	// The other side: a trigger NEWER than a push is live again, so settlement
+	// cannot be implemented as "any push kills every trigger".
+	relive := conflictResolutionSignalIn([]AuditEntry{
+		crAuditEntry(auditCategoryConflictResolutionPushed, 20, stageID, nil),
+		crAuditEntry(auditCategoryConflictResolutionTriggered, 30, stageID, nil),
+	})
+	if !relive.Triggered || relive.Succeeded {
+		t.Errorf("signal = %+v, want the NEWER trigger to win", relive)
+	}
+}
+
+// TestFoldConflictResolutionAdvisory_SucceededPass pins the settlement arm: a
+// completed pass must be relabelled succeeded and must NOT be described as
+// pending, and the appended action must be additive.
+func TestFoldConflictResolutionAdvisory_SucceededPass(t *testing.T) {
+	stageID := uuid.NewString()
+	r := naRun("running")
+	na := &NextActions{State: "implement_running", Actions: []SuggestedAction{{Action: "fishhawk_await_stage"}}}
+	foldConflictResolutionAdvisory(r, []AuditEntry{
+		crAuditEntry(auditCategoryConflictResolutionTriggered, 10, stageID, nil),
+		crAuditEntry(auditCategoryConflictResolutionPushed, 20, stageID,
+			map[string]any{"head_sha": "merge-sha"}),
+	}, na)
+
+	if na.State != "conflict_resolution_pass_succeeded" {
+		t.Fatalf("state = %q, want conflict_resolution_pass_succeeded (NOT pending — the pass is settled)", na.State)
+	}
+	if len(na.Actions) != 2 {
+		t.Fatalf("actions = %d, want the original PLUS one advisory (additive)", len(na.Actions))
+	}
+	got := na.Actions[1]
+	if got.Action != "fishhawk_rebase_run_branch" {
+		t.Errorf("action = %q, want fishhawk_rebase_run_branch", got.Action)
+	}
+	if got.Consumes != consumesNone {
+		t.Errorf("consumes = %q, want none", got.Consumes)
+	}
+	for _, want := range []string{"SUCCEEDED", "SETTLED", "SPENT"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Errorf("reason missing %q: %q", want, got.Reason)
+		}
+	}
 }
 
 // TestConflictResolutionSignalIn covers the classifier, including the

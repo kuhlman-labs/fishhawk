@@ -29,6 +29,17 @@ const CategoryStageConflictResolutionTriggered = "stage_conflict_resolution_trig
 // is not mid-merge.
 const CategoryStageConflictResolutionFailed = "stage_conflict_resolution_failed"
 
+// CategoryConflictResolutionPushed is the terminal SUCCESS marker the
+// pull-request report handler writes when the runner ships a
+// conflict_resolution_pushed outcome. It CONSUMES its trigger exactly as the
+// failure entry does (#3202 round-3): a pass that SUCCEEDED has spent the
+// ceiling-of-one budget just as surely as one that was refused, and leaving the
+// trigger live would hand the next ordinary fix-up on the same implement stage
+// conflict_resolution=true with anchors that name a merge already committed and
+// pushed. Success and failure are therefore both consumption, and the resolver
+// takes whichever is newest.
+const CategoryConflictResolutionPushed = "conflict_resolution_pushed"
+
 // conflictResolutionTrigger is the payload of a
 // stage_conflict_resolution_triggered entry: everything the runner needs to
 // perform the pass, plus the pre-pass gate state the failure recovery restores.
@@ -80,13 +91,16 @@ func (s *Server) newestStageEntry(ctx context.Context, runID, stageID uuid.UUID,
 // resolveConflictResolutionTrigger returns the LIVE conflict-resolution trigger
 // for a stage, or nil when there is none to serve.
 //
-// The comparison against the newest same-stage
-// stage_conflict_resolution_failed entry is the load-bearing half (#3202). A
-// trigger whose Sequence is at or BELOW that failure's has already been spent
-// by the pass that failed, so it is CONSUMED and must not be served again —
-// otherwise the next ordinary fix-up dispatch on this stage is handed
-// conflict_resolution=true with anchors pointing at a merge that was aborted
-// and a HEAD that has since moved.
+// The comparison against the newest same-stage CONSUMPTION entry is the
+// load-bearing half (#3202). Consumption is written by BOTH terminal outcomes
+// — stage_conflict_resolution_failed for a refused pass and
+// conflict_resolution_pushed for a successful one — because either settles the
+// pass and spends its ceiling-of-one budget. A trigger whose Sequence is at or
+// BELOW the newest of those has already been spent, so it is CONSUMED and must
+// not be served again — otherwise the next ordinary fix-up dispatch on this
+// stage is handed conflict_resolution=true with anchors pointing either at a
+// merge that was aborted and a HEAD that has since moved (the failure case) or
+// at a merge already committed and pushed (the success case).
 //
 // Fails closed on every uncertainty: an unreadable audit chain, a
 // undecodable payload, and a half-populated trigger all return nil (no pass),
@@ -98,13 +112,17 @@ func (s *Server) resolveConflictResolutionTrigger(ctx context.Context, runID, st
 	if !ok || trigger == nil {
 		return nil
 	}
-	failure, ok := s.newestStageEntry(ctx, runID, stageID, CategoryStageConflictResolutionFailed)
-	if !ok {
-		return nil
-	}
-	if failure != nil && failure.Sequence >= trigger.Sequence {
-		// The trigger was consumed by the pass that failed.
-		return nil
+	for _, category := range []string{CategoryStageConflictResolutionFailed, CategoryConflictResolutionPushed} {
+		settled, ok := s.newestStageEntry(ctx, runID, stageID, category)
+		if !ok {
+			return nil
+		}
+		if settled != nil && settled.Sequence >= trigger.Sequence {
+			// The trigger was consumed by the pass that settled — refused
+			// (stage_conflict_resolution_failed) or succeeded
+			// (conflict_resolution_pushed). Either way its budget is spent.
+			return nil
+		}
 	}
 
 	var payload conflictResolutionTrigger
@@ -131,6 +149,20 @@ func (s *Server) resolveConflictResolutionTrigger(ctx context.Context, runID, st
 // the runner's named refusal reason (which CONSUMES the trigger) and restores
 // the run to its pre-pass review gate, returning true so the caller SKIPS both
 // the ordinary fix-up recovery and the run-failing orchestrator advance.
+//
+// The consumption marker is appended BEFORE the restore, and a persistence
+// failure REFUSES the recovery (#3202 round-3). Consumption lives only in the
+// audit chain, so a restore that lands while the marker append fails would
+// acknowledge the recovery — implement back to succeeded, review back to
+// awaiting_approval — while leaving the trigger LIVE and therefore dispatchable:
+// the operator's next ordinary fix-up on that stage is served
+// conflict_resolution=true with anchors naming a merge that was aborted. Marker
+// first inverts the exposure: if the append fails nothing is restored, the
+// stage stays `failed`, the caller's normal failure path runs, and no ordinary
+// fix-up can be dispatched off the stale instruction. The converse residual is
+// deliberate and strictly smaller: a marker that lands ahead of a restore that
+// turns out not to apply spends a trigger for a pass the runner has already
+// reported as failed, which is what the trigger's budget means anyway.
 //
 // A pass is an ASSIST, never an escalation: the operator asked whether a
 // mechanical resolution was possible, and "no" must leave the run exactly where
@@ -167,6 +199,18 @@ func (s *Server) maybeRecoverConflictResolutionFailure(ctx context.Context, runI
 		reviewStageID = &rid
 	}
 
+	// Write the consumption marker BEFORE the restore: it is the ONLY durable
+	// record that this trigger is spent, so a restore we cannot pair with it
+	// must not happen at all.
+	if err := s.writeConflictResolutionFailedAudit(ctx, runID, stageID, trigger, reason); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"conflict resolution recovery: consumption marker not persisted — refusing the recovery so the stale trigger cannot be dispatched",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+
 	recovery, err := run.RestoreFixupStage(ctx, s.cfg.RunRepo, stageID,
 		run.StageState(trigger.PriorState), reviewStageID)
 	if err != nil {
@@ -180,22 +224,16 @@ func (s *Server) maybeRecoverConflictResolutionFailure(ctx context.Context, runI
 		return false
 	}
 
-	// Write the consumption marker AFTER the restore lands. Ordering is
-	// deliberate: the entry is what makes the trigger spent, and a spent
-	// trigger with an un-restored stage would leave the run failed with no
-	// route back — whereas a restored stage whose marker append fails is
-	// re-attemptable (the next report re-enters this function with the trigger
-	// still live).
-	s.writeConflictResolutionFailedAudit(ctx, runID, stageID, trigger, reason)
 	s.notifyStatusUpdate(ctx, runID, "stage_conflict_resolution_failed")
 	_ = recovery
 	return true
 }
 
 // writeConflictResolutionFailedAudit appends the stage_conflict_resolution_
-// failed entry. Best-effort: the recovery transition is already committed, so a
-// failure here logs but does not unwind.
-func (s *Server) writeConflictResolutionFailedAudit(ctx context.Context, runID, stageID uuid.UUID, trigger *conflictResolutionTrigger, reason string) {
+// failed entry and RETURNS the append error. It is not best-effort: the entry
+// is the trigger's consumption record, and its caller refuses the recovery
+// outright when it cannot be persisted.
+func (s *Server) writeConflictResolutionFailedAudit(ctx context.Context, runID, stageID uuid.UUID, trigger *conflictResolutionTrigger, reason string) error {
 	payload, _ := json.Marshal(map[string]any{
 		"stage_id":          stageID.String(),
 		"branch":            trigger.Branch,
@@ -213,10 +251,7 @@ func (s *Server) writeConflictResolutionFailedAudit(ctx context.Context, runID, 
 		ActorKind: &systemKind,
 		Payload:   payload,
 	}); err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"conflict resolution recovery: append stage_conflict_resolution_failed audit entry failed",
-			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stageID.String()),
-			slog.String("error", err.Error()))
+		return err
 	}
+	return nil
 }

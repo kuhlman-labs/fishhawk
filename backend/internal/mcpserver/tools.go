@@ -3461,7 +3461,10 @@ The pass has its OWN budget — a ceiling of ONE, counted on the
 stage_conflict_resolution_triggered audit category. It NEVER spends a
 fix-up pass, and a fix-up never spends it. A REFUSED pass writes
 stage_conflict_resolution_failed, restores the run to its pre-pass review
-gate (a pass is an assist, never an escalation) and CONSUMES the trigger.
+gate (a pass is an assist, never an escalation) and CONSUMES the trigger; a
+SUCCESSFUL pass writes conflict_resolution_pushed, which consumes it just as
+surely — either terminal outcome settles the pass, so a later ordinary
+fix-up on that stage is never served the completed instruction.
 
 FAIL-CLOSED once the budget is spent, or whenever no pass can be started at
 all (no implement stage, an unresolvable branch/base/head anchor, an
