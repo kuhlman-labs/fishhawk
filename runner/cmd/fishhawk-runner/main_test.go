@@ -27419,3 +27419,314 @@ func TestRun_ScopeAmendmentStaysPending_UnchangedUndecidedPath(t *testing.T) {
 		t.Errorf("settle wait outcome = %v, want timeout for a row pending on every fetch:\n%s", ended["outcome"], log)
 	}
 }
+
+// --- #3316 auto-format absorb -------------------------------------------
+
+// autoformatRepo builds the verifiedTreeRepo fixture with an unformatted
+// in-scope Go file standing in for the agent's work, and returns a cfg whose
+// scopeFiles name it. The unformatted bytes are seeded BY CONSTRUCTION, never
+// produced by calling the classifier or the eligibility filter.
+func autoformatRepo(t *testing.T, verifyCmd string) (string, config) {
+	t.Helper()
+	repo, _, _ := verifiedTreeRepo(t)
+	mustWrite(t, filepath.Join(repo, "fmtme.go"), "package p\n\nimport (\n\"fmt\"\n)\n\nfunc F() { fmt.Println() }\n")
+	cfg := verifiedTreeCfg(repo, verifyCmd)
+	cfg.scopeFiles = []upload.ScopeFile{
+		{Path: "a.txt", Operation: "modify"},
+		{Path: "fmtme.go", Operation: "modify"},
+	}
+	cfg.verifyMaxIterations = 1
+	return repo, cfg
+}
+
+// formatThenPassVerifyCmd fails ONCE with the given format-only lint output
+// (sentinel outside the worktree), then passes — modelled on
+// infraThenPassVerifyCmd.
+func formatThenPassVerifyCmd(t *testing.T, output string) string {
+	t.Helper()
+	return infraThenPassVerifyCmd(t, output)
+}
+
+func countEvents(events []agent.Event, kind string) int {
+	n := 0
+	for _, ev := range events {
+		if ev.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRunVerifyFixLoop_FormatOnlyFailureAutoformattedWithoutFixInvoke is the
+// DONE-MEANS test (#1169): a stage whose SOLE verify failure is formatting
+// reaches a PASSING committed-tree verify with reinvoked==false, a non-empty
+// verified tree SHA, exactly one verify_autoformatted trace event naming the
+// reformatted file, and no verify_fix_reinvoke log line. A comment-only or
+// no-op touch of main.go fails it.
+func TestRunVerifyFixLoop_FormatOnlyFailureAutoformattedWithoutFixInvoke(t *testing.T) {
+	repo, cfg := autoformatRepo(t, formatThenPassVerifyCmd(t, gofmtOnlyLintOutput))
+	count := stubFormatter(t, `printf 'package p\n' > fmtme.go; exit 0`)
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg,
+		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if reinvoked {
+		t.Errorf("a format-only failure must not re-invoke the fix agent\n%s", logSink.String())
+	}
+	if tree == "" {
+		t.Errorf("the absorbed re-verify passed, so the loop must return a verified tree\n%s", logSink.String())
+	}
+	if n := countEvents(res.Events, "verify_autoformatted"); n != 1 {
+		t.Errorf("verify_autoformatted events = %d, want exactly 1\n%s", n, logSink.String())
+	}
+	if strings.Contains(logSink.String(), `"event":"verify_fix_reinvoke"`) {
+		t.Errorf("no verify_fix_reinvoke may be logged for a format-only failure:\n%s", logSink.String())
+	}
+	if !strings.Contains(logSink.String(), `fmtme.go`) {
+		t.Errorf("the verify_autoformatted line must name the reformatted file:\n%s", logSink.String())
+	}
+	if n := count(); n != 1 {
+		t.Errorf("formatter invocations = %d, want 1", n)
+	}
+	if b, rerr := os.ReadFile(filepath.Join(repo, "fmtme.go")); rerr != nil || string(b) != "package p\n" {
+		t.Errorf("the formatter's edit must survive in the working tree: %q, %v", b, rerr)
+	}
+}
+
+// TestRunVerifyFixLoop_NonFormatLintFailureStillReinvokesAgent: output
+// carrying even one non-format lint finding takes the unchanged agent path,
+// emits ZERO verify_autoformatted events, and invokes the formatter ZERO
+// times. Counterfactual vehicle for the isFormatOnlyLintFailure guard.
+func TestRunVerifyFixLoop_NonFormatLintFailureStillReinvokesAgent(t *testing.T) {
+	_, cfg := autoformatRepo(t, scriptedVerifyCmd(t, gofmtGoimportsReviveLintOutput))
+	count := stubFormatter(t, `printf 'package p\n' > fmtme.go; exit 0`)
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	reinvoked, _, err := runVerifyFixLoop(context.Background(), cfg,
+		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if !reinvoked {
+		t.Errorf("a lint failure carrying a revive finding must re-invoke the fix agent\n%s", logSink.String())
+	}
+	if n := countEvents(res.Events, "verify_autoformatted"); n != 0 {
+		t.Errorf("verify_autoformatted events = %d, want 0 for a non-format finding\n%s", n, logSink.String())
+	}
+	if n := count(); n != 0 {
+		t.Errorf("formatter invocations = %d, want 0 for a non-format finding", n)
+	}
+}
+
+// TestRunVerifyFixLoop_AutoformatFiresAtMostOncePerStage: a verify that stays
+// format-only-failing forever while the formatter DOES change a file yields
+// exactly ONE verify_autoformatted event and terminates category-A.
+// Counterfactual vehicle for the `autoformatted` once-flag.
+func TestRunVerifyFixLoop_AutoformatFiresAtMostOncePerStage(t *testing.T) {
+	_, cfg := autoformatRepo(t, scriptedVerifyCmd(t, gofmtOnlyLintOutput))
+	cfg.verifyMaxIterations = 3
+	// A formatter that changes the file on EVERY invocation, so only the
+	// once-flag can bound the absorb.
+	count := stubFormatter(t, `printf 'package p // %s\n' "$(date +%s%N)$RANDOM" > fmtme.go; exit 0`)
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	_, tree, err := runVerifyFixLoop(context.Background(), cfg,
+		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if n := countEvents(res.Events, "verify_autoformatted"); n != 1 {
+		t.Errorf("verify_autoformatted events = %d, want exactly 1 (once-per-stage bound)\n%s", n, logSink.String())
+	}
+	if n := count(); n != 1 {
+		t.Errorf("formatter invocations = %d, want exactly 1", n)
+	}
+	if tree != "" {
+		t.Errorf("exhaustion must return an empty verified tree, got %q", tree)
+	}
+	if res.OK || res.FailureCategory != "A" {
+		t.Errorf("exhaustion must demote to category-A; OK=%t category=%q", res.OK, res.FailureCategory)
+	}
+}
+
+// TestRunVerifyFixLoop_AutoformatInvokesFormatterAtMostOncePerStage is the
+// once-flag PLACEMENT pin: a verify that stays format-only-failing while the
+// formatter changes NOTHING must invoke the stub formatter EXACTLY ONCE across
+// the whole loop. The assertion is the INVOCATION COUNT, not the event count —
+// no verify_autoformatted event is emitted on a no-change pass, which is
+// exactly why a post-change flag assignment would leave this bound unpinned.
+func TestRunVerifyFixLoop_AutoformatInvokesFormatterAtMostOncePerStage(t *testing.T) {
+	_, cfg := autoformatRepo(t, scriptedVerifyCmd(t, gofmtOnlyLintOutput))
+	cfg.verifyMaxIterations = 3
+	count := stubFormatter(t, `exit 0`) // changes nothing
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	if _, _, err := runVerifyFixLoop(context.Background(), cfg,
+		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink); err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if n := count(); n != 1 {
+		t.Errorf("formatter invocations = %d, want exactly 1 across the whole stage\n%s", n, logSink.String())
+	}
+	if n := countEvents(res.Events, "verify_autoformatted"); n != 0 {
+		t.Errorf("verify_autoformatted events = %d, want 0 (the formatter changed nothing)", n)
+	}
+	if !strings.Contains(logSink.String(), `"reason":"no_change"`) {
+		t.Errorf("expected a no_change verify_autoformat_skipped line:\n%s", logSink.String())
+	}
+	if !strings.Contains(logSink.String(), `"reason":"already_absorbed"`) {
+		t.Errorf("expected an already_absorbed verify_autoformat_skipped line on the later iteration:\n%s", logSink.String())
+	}
+	if res.OK || res.FailureCategory != "A" {
+		t.Errorf("exhaustion must demote to category-A; OK=%t category=%q", res.OK, res.FailureCategory)
+	}
+}
+
+// TestRunVerifyFixLoop_AutoformatSkippedNoEligibleFiles: a scope naming no
+// eligible .go file falls through to the agent and invokes the formatter ZERO
+// times. Counterfactual vehicle for the eligibility existence/extension filter.
+func TestRunVerifyFixLoop_AutoformatSkippedNoEligibleFiles(t *testing.T) {
+	_, cfg := autoformatRepo(t, scriptedVerifyCmd(t, gofmtOnlyLintOutput))
+	// a.txt is not a .go file; gone.go does not exist on disk.
+	cfg.scopeFiles = []upload.ScopeFile{
+		{Path: "a.txt", Operation: "modify"},
+		{Path: "gone.go", Operation: "modify"},
+	}
+	count := stubFormatter(t, `printf 'package p\n' > fmtme.go; exit 0`)
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	reinvoked, _, err := runVerifyFixLoop(context.Background(), cfg,
+		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if n := count(); n != 0 {
+		t.Errorf("formatter invocations = %d, want 0 with no eligible .go scope file", n)
+	}
+	if !reinvoked {
+		t.Errorf("with no eligible file the loop must fall through to the fix agent\n%s", logSink.String())
+	}
+	if !strings.Contains(logSink.String(), `"reason":"no_eligible_files"`) {
+		t.Errorf("expected a no_eligible_files verify_autoformat_skipped line:\n%s", logSink.String())
+	}
+	if n := countEvents(res.Events, "verify_autoformatted"); n != 0 {
+		t.Errorf("verify_autoformatted events = %d, want 0", n)
+	}
+}
+
+// TestRunVerifyFixLoop_AutoformatSkippedWhenFormatterFails: a formatter that
+// exits non-zero falls through to the agent. Counterfactual vehicle for the
+// formatter-error fall-through.
+func TestRunVerifyFixLoop_AutoformatSkippedWhenFormatterFails(t *testing.T) {
+	_, cfg := autoformatRepo(t, scriptedVerifyCmd(t, gofmtOnlyLintOutput))
+	stubFormatter(t, `printf 'boom\n' >&2; exit 3`)
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	reinvoked, _, err := runVerifyFixLoop(context.Background(), cfg,
+		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if !reinvoked {
+		t.Errorf("a failed formatter must fall through to the fix agent\n%s", logSink.String())
+	}
+	if !strings.Contains(logSink.String(), `"reason":"formatter_failed"`) {
+		t.Errorf("expected a formatter_failed verify_autoformat_skipped line:\n%s", logSink.String())
+	}
+	if n := countEvents(res.Events, "verify_autoformatted"); n != 0 {
+		t.Errorf("verify_autoformatted events = %d, want 0 when the formatter errored", n)
+	}
+}
+
+// TestRunVerifyFixLoop_AutoformatNoChangeAddsNoExtraVerifyRun: a formatter
+// that changes nothing must not repeat the iteration, so a false-positive
+// classification costs ZERO extra verify runs. Counterfactual vehicle for the
+// changed-set-non-empty guard.
+func TestRunVerifyFixLoop_AutoformatNoChangeAddsNoExtraVerifyRun(t *testing.T) {
+	_, cfg := autoformatRepo(t, scriptedVerifyCmd(t, gofmtOnlyLintOutput))
+	cfg.verifyMaxIterations = 1
+	stubFormatter(t, `exit 0`)
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	if _, _, err := runVerifyFixLoop(context.Background(), cfg,
+		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink); err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	// max_iterations=1 → exactly two verify runs (iter 0 and iter 1) when
+	// nothing is absorbed. A repeated iteration would add a third.
+	if n := countEvents(res.Events, "verify_run"); n != 2 {
+		t.Errorf("verify_run events = %d, want 2 (a changed-nothing format pass must add no extra verify run)\n%s", n, logSink.String())
+	}
+}
+
+// TestRunBoundedGateArgv_NoShellInterpretation: argv elements reach the child
+// VERBATIM — no shell parses them — so a scope path containing `;` and a space
+// cannot inject a command. The injected command writes a sentinel; the test
+// asserts the sentinel was never created and the filename arrived intact.
+func TestRunBoundedGateArgv_NoShellInterpretation(t *testing.T) {
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "INJECTED")
+	script := filepath.Join(dir, "echo-argv")
+	mustWrite(t, script, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hostile := "weird name.go; touch " + sentinel
+	out, code := runBoundedGateArgv(context.Background(), []string{script, "fmt", hostile}, dir, filepath.Join(dir, "cache"), time.Minute)
+	if code != 0 {
+		t.Fatalf("exit = %d, output %q", code, out)
+	}
+	if !strings.Contains(out, hostile+"\n") {
+		t.Errorf("argv element must reach the child verbatim; got %q, want a line %q", out, hostile)
+	}
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Errorf("the injected command ran — argv was shell-interpreted (sentinel %s exists)", sentinel)
+	}
+	// Sanity: the same string through the SHELL form does inject, so the
+	// assertion above is discriminating rather than vacuous.
+	shellSentinel := filepath.Join(dir, "SHELL_INJECTED")
+	_, _ = runBoundedGateCommand(context.Background(),
+		script+" fmt weird\\ name.go; touch "+shellSentinel, dir, filepath.Join(dir, "cache2"), time.Minute)
+	if _, err := os.Stat(shellSentinel); err != nil {
+		t.Fatalf("control: the shell form should have injected, so the argv assertion is meaningful: %v", err)
+	}
+}
+
+// TestRunBoundedGateCommand_DelegatesThroughArgvPath: the refactor is
+// behaviour-preserving — runBoundedGateCommand still routes `sh -c` through
+// the shared argv path, with the sanitized env and process-group kill intact.
+func TestRunBoundedGateCommand_DelegatesThroughArgvPath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FISHHAWKD_ANTHROPIC_API_KEY", "sk-should-not-reach-the-child")
+
+	// Shell metacharacters ARE interpreted by the sh -c form.
+	out, code := runBoundedGateCommand(context.Background(),
+		"printf 'a\\n'; printf 'b\\n'; printenv FISHHAWKD_ANTHROPIC_API_KEY; printenv GOLANGCI_LINT_CACHE",
+		dir, filepath.Join(dir, "cache"), time.Minute)
+	if code != 0 {
+		t.Fatalf("exit = %d, output %q", code, out)
+	}
+	if !strings.Contains(out, "a\nb\n") {
+		t.Errorf("sh -c must still interpret the command string; got %q", out)
+	}
+	if strings.Contains(out, "sk-should-not-reach-the-child") {
+		t.Errorf("sanitizedGateEnv must still strip the credential; got %q", out)
+	}
+	if !strings.Contains(out, filepath.Join(dir, "cache")) {
+		t.Errorf("withIsolatedLintCache must still reach the child; got %q", out)
+	}
+
+	// Process-group kill: a command whose grandchild holds the output pipe
+	// open must still be reaped at the timeout rather than blocking forever.
+	start := time.Now()
+	_, code = runBoundedGateCommand(context.Background(), "sleep 60 & sleep 60", dir, filepath.Join(dir, "cache3"), 2*time.Second)
+	if code != -1 {
+		t.Errorf("timed-out command exit = %d, want -1", code)
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Errorf("process-group kill did not reap the grandchild: elapsed %s", elapsed)
+	}
+}
