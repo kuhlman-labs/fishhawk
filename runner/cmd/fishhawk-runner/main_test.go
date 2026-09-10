@@ -11716,8 +11716,15 @@ func TestRun_VerifyFixLoop_InfraFlakeRetry_NoBudgetBurn(t *testing.T) {
 					flakeRetries++
 				}
 			}
-			if verifyRuns != 2 {
-				t.Errorf("verify_run events = %d, want 2 (flaked + retried)", verifyRuns)
+			// THREE verify_run events since #3315, not two, and the exact count is
+			// kept exact rather than relaxed to a bound: the flaked run and the
+			// retried run are both the SCOPED form (this fixture's scope carries
+			// Go files), and the retried run PASSES, which is precisely what
+			// triggers the FULL re-verify that makes a passing iteration
+			// authoritative. A `>= 2` here would stop discriminating a dropped
+			// re-verify, which is the control the count exists to pin.
+			if verifyRuns != 3 {
+				t.Errorf("verify_run events = %d, want 3 (scoped flaked + scoped retried + the #3315 FULL re-verify)", verifyRuns)
 			}
 			if flakeRetries != 1 {
 				t.Errorf("verify_infra_flake_retry events = %d, want 1 (recorded, not swallowed)", flakeRetries)
@@ -13166,7 +13173,7 @@ func TestVerifyCommittedTree_StripsRunnerCredsFromSubprocess(t *testing.T) {
 	runGit("commit", "-m", "seed commit")
 	head := gitHead(t, repo)
 
-	_, out, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute)
+	_, out, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute, nil)
 	if strings.Contains(out, canary) {
 		t.Errorf("runVerifyCommittedTree leaked the runner secret into the gate subprocess env:\n%s", out)
 	}
@@ -13218,8 +13225,8 @@ func TestVerifyCommittedTree_IsolatesLintCachePerInvocation(t *testing.T) {
 	runGit("commit", "-m", "seed commit")
 	head := gitHead(t, repo)
 
-	_, out1, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute)
-	_, out2, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute)
+	_, out1, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute, nil)
+	_, out2, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute, nil)
 
 	c1 := extractEnvGateVal(out1, "GOLANGCI_LINT_CACHE")
 	c2 := extractEnvGateVal(out2, "GOLANGCI_LINT_CACHE")
@@ -14486,14 +14493,14 @@ func TestRunVerifyCommittedTree_OutcomeStrings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if ev, _, outcome := runVerifyCommittedTree(context.Background(), "true", repo, head, time.Minute); outcome != "passed" {
+	if ev, _, outcome := runVerifyCommittedTree(context.Background(), "true", repo, head, time.Minute, nil); outcome != "passed" {
 		t.Errorf("exit-0 outcome = %q, want passed (%s)", outcome, ev.Payload)
 	}
-	if _, _, outcome := runVerifyCommittedTree(context.Background(), "false", repo, head, time.Minute); outcome != "failed" {
+	if _, _, outcome := runVerifyCommittedTree(context.Background(), "false", repo, head, time.Minute, nil); outcome != "failed" {
 		t.Errorf("non-zero outcome = %q, want failed", outcome)
 	}
 	bogus := strings.Repeat("deadbeef", 5)
-	if ev, _, outcome := runVerifyCommittedTree(context.Background(), "true", repo, bogus, time.Minute); outcome != "skipped" {
+	if ev, _, outcome := runVerifyCommittedTree(context.Background(), "true", repo, bogus, time.Minute, nil); outcome != "skipped" {
 		t.Errorf("worktree_add-failure outcome = %q, want skipped (%s)", outcome, ev.Payload)
 	}
 }
@@ -18736,8 +18743,8 @@ func TestFixupSelfReport_VocabularyMatchesProductionVerifyOutcome(t *testing.T) 
 	headSHA := gitHead(t, repo)
 	ctx := context.Background()
 
-	_, _, prodPass := runVerifyCommittedTree(ctx, "true", repo, headSHA, time.Minute)
-	_, _, prodFail := runVerifyCommittedTree(ctx, "false", repo, headSHA, time.Minute)
+	_, _, prodPass := runVerifyCommittedTree(ctx, "true", repo, headSHA, time.Minute, nil)
+	_, _, prodFail := runVerifyCommittedTree(ctx, "false", repo, headSHA, time.Minute, nil)
 	if prodPass == prodFail {
 		t.Fatalf("production pass/fail verify literals must differ, both = %q", prodPass)
 	}
@@ -27728,5 +27735,270 @@ func TestRunBoundedGateCommand_DelegatesThroughArgvPath(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 30*time.Second {
 		t.Errorf("process-group kill did not reap the grandchild: elapsed %s", elapsed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #3315 — the scoped-then-full verify fix loop.
+//
+// These tests observe the ENVIRONMENT of every verify invocation by making the
+// verify command itself a recorder: it appends one line naming the scoped-verify
+// variables it saw, then exits with a code chosen by WHICH form invoked it. That
+// is what lets a single fixture assert "the first invocation is scoped, the
+// final one is not" behaviourally rather than by reading the source.
+// ---------------------------------------------------------------------------
+
+// verifyFormRecorder returns a verify command that appends
+// `pkgs=[…] owner=[…]` to logPath on every invocation and exits scopedRC when
+// the packages variable is SET, fullRC when it is absent.
+func verifyFormRecorder(logPath string, scopedRC, fullRC int) string {
+	return fmt.Sprintf(
+		`printf 'pkgs=[%%s] owner=[%%s]\n' "$%s" "$%s" >> %q; `+
+			`if [ -n "$%s" ]; then exit %d; else exit %d; fi`,
+		verifyPackagesEnvVar, verifyLockOwnerEnvVar, logPath,
+		verifyPackagesEnvVar, scopedRC, fullRC)
+}
+
+// readVerifyFormLog returns the recorder's lines, one per verify invocation.
+func readVerifyFormLog(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path) //nolint:gosec // test-owned temp path
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatalf("reading the verify-form log: %v", err)
+	}
+	var lines []string
+	for _, l := range strings.Split(string(data), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+// verifyFixLoopScopeFixture builds a repo with a base commit and one Go scope
+// file, plus the recorder command and its log path.
+func verifyFixLoopScopeFixture(t *testing.T, scopeFiles []upload.ScopeFile, scopedRC, fullRC int) (config, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "seed.txt"), "seed\n")
+	runGit("add", "seed.txt")
+	runGit("commit", "-m", "base", "--no-verify")
+
+	for _, sf := range scopeFiles {
+		full := filepath.Join(repo, filepath.FromSlash(sf.Path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir for scope file %s: %v", sf.Path, err)
+		}
+		mustWrite(t, full, "package p\n")
+	}
+
+	logPath := filepath.Join(t.TempDir(), "verifyforms.log")
+	return config{
+		workingDir:          repo,
+		verifyCmd:           verifyFormRecorder(logPath, scopedRC, fullRC),
+		verifyMaxIterations: 1,
+		verifyTimeout:       time.Minute,
+		scopeFiles:          scopeFiles,
+	}, logPath
+}
+
+var verifyScopeGoFiles = []upload.ScopeFile{{Path: "pkga/a.go", Operation: "create"}}
+
+// TestRunVerifyFixLoop_ScopedThenFullOnPass: with a derivable package set the
+// FIRST verify invocation carries FISHHAWK_VERIFY_PACKAGES and the FINAL one
+// does NOT. The absence is asserted, not just the presence — the authoritative
+// gate must be unnarrowable. Every invocation carries the owner marker.
+func TestRunVerifyFixLoop_ScopedThenFullOnPass(t *testing.T) {
+	cfg, logPath := verifyFixLoopScopeFixture(t, verifyScopeGoFiles, 0, 0)
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
+	}
+	if reinvoked {
+		t.Errorf("a passing first iteration must not re-invoke the agent")
+	}
+	if tree == "" {
+		t.Errorf("a passing FULL re-verify must yield a #960 verified tree")
+	}
+
+	lines := readVerifyFormLog(t, logPath)
+	if len(lines) != 2 {
+		t.Fatalf("recorded %d verify invocations, want 2 (scoped pre-pass then FULL re-verify): %q", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "pkgs=[pkga]") {
+		t.Errorf("the FIRST invocation is not the scoped form: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "pkgs=[]") {
+		t.Errorf("the FINAL invocation carried a package set — the authoritative gate must be unnarrowable: %q", lines[1])
+	}
+	for i, l := range lines {
+		if !strings.Contains(l, "owner=[runner]") {
+			t.Errorf("invocation %d is missing the verify-lock owner marker: %q", i, l)
+		}
+	}
+	// Each form's outcome is named in the log so a green/red pair is legible.
+	for _, want := range []string{`"form":"scoped"`, `"form":"full"`} {
+		if !strings.Contains(logSink.String(), want) {
+			t.Errorf("log does not name the verify form %s:\n%s", want, logSink.String())
+		}
+	}
+}
+
+// TestRunVerifyFixLoop_EmptyScopeRunsOneFullVerify: a non-Go scope derives no
+// package set, so the pre-pass is skipped entirely and the stage pays exactly
+// ONE verify — what it paid before #3315.
+func TestRunVerifyFixLoop_EmptyScopeRunsOneFullVerify(t *testing.T) {
+	cfg, logPath := verifyFixLoopScopeFixture(t,
+		[]upload.ScopeFile{{Path: "docs/notes.md", Operation: "create"}}, 0, 0)
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+
+	_, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
+	}
+	lines := readVerifyFormLog(t, logPath)
+	if len(lines) != 1 {
+		t.Fatalf("recorded %d verify invocations, want exactly 1 (no scoped pre-pass for a non-Go scope): %q", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "pkgs=[]") {
+		t.Errorf("the single invocation must be the FULL form: %q", lines[0])
+	}
+	if tree == "" {
+		t.Errorf("a passing full verify must yield a #960 verified tree")
+	}
+}
+
+// TestRunVerifyFixLoop_UndecodableScopeRunsOneFullVerify: the fail-safe
+// WIDENING branch driven end to end — a scope path carrying the encoding's own
+// separator derives no package set, so the loop runs the full form only.
+func TestRunVerifyFixLoop_UndecodableScopeRunsOneFullVerify(t *testing.T) {
+	cfg, logPath := verifyFixLoopScopeFixture(t, []upload.ScopeFile{
+		{Path: "pkga/a.go", Operation: "create"},
+		{Path: "pkgb/we,ird.go", Operation: "create"},
+	}, 0, 0)
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+
+	if _, _, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink); err != nil {
+		t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
+	}
+	lines := readVerifyFormLog(t, logPath)
+	if len(lines) != 1 {
+		t.Fatalf("an undecodable scope recorded %d verify invocations, want 1 FULL: %q", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "pkgs=[]") {
+		t.Errorf("an undecodable scope must widen to the FULL form: %q", lines[0])
+	}
+}
+
+// TestRunVerifyFixLoop_ScopedFailureReinvokesWithBudget: a failing SCOPED
+// iteration with budget remaining re-invokes the agent and never reaches the
+// full form (there is nothing to confirm).
+func TestRunVerifyFixLoop_ScopedFailureReinvokesWithBudget(t *testing.T) {
+	cfg, logPath := verifyFixLoopScopeFixture(t, verifyScopeGoFiles, 1, 0)
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+
+	reinvoked, _, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
+	}
+	if !reinvoked {
+		t.Errorf("a failing scoped iteration with budget remaining must re-invoke the agent:\n%s", logSink.String())
+	}
+	for i, l := range readVerifyFormLog(t, logPath) {
+		if strings.Contains(l, "pkgs=[]") {
+			t.Errorf("invocation %d ran the FULL form after a scoped FAILURE — the re-verify is a pass-only confirmation: %q", i, l)
+		}
+	}
+}
+
+// TestRunVerifyFixLoop_ScopedPassFullFailIsAnOrdinaryFailure is the load-bearing
+// case: a change that breaks a test in a package the scope does not name passes
+// the scoped pre-pass and must still be caught. With budget remaining it
+// re-invokes the agent; with the budget exhausted it demotes and, critically,
+// returns NO #960 verified tree — so the pushed tree can never be one only the
+// scoped form approved.
+func TestRunVerifyFixLoop_ScopedPassFullFailIsAnOrdinaryFailure(t *testing.T) {
+	t.Run("budget remaining re-invokes the agent", func(t *testing.T) {
+		cfg, logPath := verifyFixLoopScopeFixture(t, verifyScopeGoFiles, 0, 1)
+		res := agent.Result{OK: true}
+		var logSink strings.Builder
+		invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+
+		reinvoked, _, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+		if err != nil {
+			t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
+		}
+		if !reinvoked {
+			t.Errorf("a green-scoped / red-full iteration with budget remaining must re-invoke the agent:\n%s", logSink.String())
+		}
+		lines := readVerifyFormLog(t, logPath)
+		if len(lines) < 2 {
+			t.Fatalf("recorded %d invocations, want at least the scoped+full pair: %q", len(lines), lines)
+		}
+		if !strings.Contains(lines[0], "pkgs=[pkga]") || !strings.Contains(lines[1], "pkgs=[]") {
+			t.Errorf("the first iteration is not a scoped-then-full pair: %q", lines[:2])
+		}
+	})
+
+	t.Run("budget exhausted demotes and returns no verified tree", func(t *testing.T) {
+		cfg, _ := verifyFixLoopScopeFixture(t, verifyScopeGoFiles, 0, 1)
+		cfg.verifyMaxIterations = 0
+		res := agent.Result{OK: true}
+		var logSink strings.Builder
+		invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+
+		reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+		if err != nil {
+			t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
+		}
+		if reinvoked {
+			t.Errorf("an exhausted budget must not re-invoke the agent")
+		}
+		if tree != "" {
+			t.Fatalf("a FAILING full re-verify returned verified tree %q — the #960 tree must come from the FULL form, so a scoped-only pass can never authorize a push", tree)
+		}
+		if res.OK {
+			t.Errorf("a red full re-verify must not leave the stage OK")
+		}
+		if res.FailureCategory != "A" {
+			t.Errorf("FailureCategory = %q, want A (the loop demotes exactly as before #3315)", res.FailureCategory)
+		}
+	})
+}
+
+// TestRunVerifyGateCommitted_NeverCarriesThePackagesVar: the single-shot
+// authoritative gate (max_iterations == 0) is FULL-form and is never narrowed.
+func TestRunVerifyGateCommitted_NeverCarriesThePackagesVar(t *testing.T) {
+	cfg, logPath := verifyFixLoopScopeFixture(t, verifyScopeGoFiles, 1, 0)
+	cfg.verifyMaxIterations = 0
+
+	if _, _, err := runVerifyGateCommitted(context.Background(), cfg, io.Discard); err != nil {
+		t.Fatalf("single-shot gate returned an error: %v", err)
+	}
+	lines := readVerifyFormLog(t, logPath)
+	if len(lines) != 1 {
+		t.Fatalf("recorded %d invocations, want exactly 1: %q", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "pkgs=[]") {
+		t.Errorf("the single-shot committed gate carried a package set: %q", lines[0])
+	}
+	if !strings.Contains(lines[0], "owner=[runner]") {
+		t.Errorf("the single-shot committed gate is missing the owner marker: %q", lines[0])
 	}
 }

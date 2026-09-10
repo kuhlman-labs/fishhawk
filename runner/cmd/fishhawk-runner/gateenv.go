@@ -133,6 +133,24 @@ var gateEnvAllowPrefix = []string{"CGO_", "LC_"}
 
 // gateEnvDeny is the explicit known-secret denylist (belt-and-suspenders on top
 // of the default-deny allow-list). These keys are dropped unconditionally.
+// The last two entries are not secrets: they are the #3315 scoped-verify
+// control variables (verifyPackagesEnvVar / verifyLockOwnerEnvVar). The PRIMARY
+// protection for them is the default-deny allow-list — neither name is on
+// gateEnvAllowExact, gateEnvAllowGo, nor gateEnvAllowPrefix (which is CGO_/LC_
+// only), so an ambient value is ALREADY dropped and these entries are redundant
+// defence. They are listed anyway so a future allow-rule that re-widened (the
+// #2504 shape) could not silently let an agent's ambient value narrow the
+// runner's authoritative pre-push gate or claim runner-kind ownership of the
+// verify lock. Because BOTH layers hold independently, the attainable
+// counterfactual for this control mutates BOTH — widen the allow-list AND
+// delete these entries — which is what TestGateEnvBothLayersStripVerifyControls
+// documents and gateenv_test.go's counterfactual note records.
+//
+// Note honestly what this does NOT do: the agent's OWN shell environment is not
+// the runner's, so an agent can still set either variable in its own shell. The
+// refusal is a CONTENTION guard, not an adversarial control. What an agent
+// cannot do is narrow the AUTHORITATIVE gate: the runner invokes that one
+// itself with the packages variable unset.
 var gateEnvDeny = map[string]struct{}{
 	"FISHHAWK_GITHUB_TOKEN": {},
 	"FISHHAWK_GITLAB_TOKEN": {},
@@ -141,6 +159,8 @@ var gateEnvDeny = map[string]struct{}{
 	"ANTHROPIC_API_KEY":     {},
 	"OPENAI_API_KEY":        {},
 	"FISHHAWK_API_TOKEN":    {},
+	verifyPackagesEnvVar:    {},
+	verifyLockOwnerEnvVar:   {},
 }
 
 // gateEnvDenyPrefix lists key prefixes dropped unconditionally — the
@@ -317,4 +337,36 @@ func gateEnvDenied(key string) bool {
 		}
 	}
 	return false
+}
+
+// appendGateExtraEnv folds the runner's post-sanitization env injections
+// (#3315) into a gate child's environment, applying each "KEY=VALUE" entry with
+// the SAME drop-then-append discipline withIsolatedLintCache uses: any
+// same-named survivor is removed first, so the injected entry REPLACES it and
+// cannot be undercut by the platform's undocumented duplicate-key resolution
+// (https://pkg.go.dev/os/exec#Cmd — Env is passed as-is with no dedup
+// guarantee).
+//
+// An entry with no '=' or an empty key is not a usable assignment and is
+// DROPPED, matching sanitizeEnv's treatment of the same malformed shape rather
+// than passing a byte the child would parse unpredictably.
+//
+// This does not widen the allow-list: the values here are ones the runner chose
+// in code (the scoped-verify package set, the verify-lock owner marker), and an
+// AMBIENT value of either name was already stripped by sanitizeEnv — both are
+// on gateEnvDeny and on none of the allow-lists.
+func appendGateExtraEnv(env []string, extra []string) []string {
+	if len(extra) == 0 {
+		return env
+	}
+	out := env
+	for _, kv := range extra {
+		eq := strings.IndexByte(kv, '=')
+		if eq <= 0 {
+			continue
+		}
+		out = dropEnvKey(out, kv[:eq])
+		out = append(out, kv)
+	}
+	return out
 }

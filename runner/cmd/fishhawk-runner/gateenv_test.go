@@ -640,3 +640,135 @@ func envSliceToMap(t *testing.T, env []string) map[string]string {
 	}
 	return m
 }
+
+// ---------------------------------------------------------------------------
+// #3315 — the scoped-verify control variables.
+//
+// FISHHAWK_VERIFY_PACKAGES narrows `scripts/test verify`'s test loop and
+// FISHHAWK_VERIFY_LOCK_OWNER claims runner-kind ownership of the verify lock.
+// Neither may be INHERITED into a gate child: the value the runner's
+// authoritative pre-push gate sees must be one the runner chose in code.
+// ---------------------------------------------------------------------------
+
+// TestSanitizedGateEnv_StripsVerifyControlVars is the BEHAVIOURAL assertion:
+// an ambient value of either name does not survive sanitization.
+//
+// COUNTERFACTUAL NOTE (operator binding condition 2). This test is protected by
+// TWO INDEPENDENT layers, so mutating either one alone leaves it GREEN:
+//
+//   - the default-deny allow-list — neither name is on gateEnvAllowExact,
+//     gateEnvAllowGo, nor gateEnvAllowPrefix (which is CGO_/LC_ only);
+//   - the explicit gateEnvDeny entries this change added.
+//
+// The ATTAINABLE counterfactual therefore mutates BOTH: add "FISHHAWK_" to
+// gateEnvAllowPrefix AND delete the two gateEnvDeny entries. Only then does the
+// ambient value reach the child and this test go RED. Single-layer mutations are
+// covered by TestGateEnvVerifyControlsProtectedByBothLayers below, which
+// asserts each layer separately so a one-layer deletion still reddens something.
+func TestSanitizedGateEnv_StripsVerifyControlVars(t *testing.T) {
+	const pkgMarker = "attacker/only/this/package"
+	const ownerMarker = "runner"
+	t.Setenv(verifyPackagesEnvVar, pkgMarker)
+	t.Setenv(verifyLockOwnerEnvVar, ownerMarker)
+
+	got := sanitizedGateEnv()
+	for _, key := range []string{verifyPackagesEnvVar, verifyLockOwnerEnvVar} {
+		for _, kv := range got {
+			if strings.HasPrefix(kv, key+"=") {
+				t.Errorf("sanitizedGateEnv admitted the ambient %s (%q) — an agent could narrow the runner's authoritative gate or claim runner-kind lock ownership", key, kv)
+			}
+		}
+	}
+}
+
+// TestRunBoundedGateCommand_ChildDoesNotInheritVerifyControls is the same
+// assertion at the CHILD, through the real exec path — the layer the unit test
+// above cannot reach. It also proves the runner's OWN injection still arrives,
+// so "stripped" is not confused with "never deliverable".
+func TestRunBoundedGateCommand_ChildDoesNotInheritVerifyControls(t *testing.T) {
+	t.Setenv(verifyPackagesEnvVar, "attacker/pkg")
+	t.Setenv(verifyLockOwnerEnvVar, "runner")
+
+	dir := t.TempDir()
+	lintCache := t.TempDir()
+	command := `echo "pkgs=[$` + verifyPackagesEnvVar + `] owner=[$` + verifyLockOwnerEnvVar + `]"`
+
+	// No extraEnv: the ambient values must not reach the child at all.
+	out, code := runBoundedGateCommand(context.Background(), command, dir, lintCache, 30*time.Second)
+	if code != 0 {
+		t.Fatalf("gate command exited %d; output: %s", code, out)
+	}
+	if !strings.Contains(out, "pkgs=[] owner=[]") {
+		t.Errorf("the gate child inherited a scoped-verify control variable:\n%s", out)
+	}
+
+	// With the runner's OWN post-sanitization injection, both arrive verbatim.
+	extra := verifyScopeEnv(verifyLockOwnerEnv(nil), []string{"backend/internal/run"})
+	out2, code2 := runBoundedGateCommand(context.Background(), command, dir, lintCache, 30*time.Second, extra...)
+	if code2 != 0 {
+		t.Fatalf("gate command exited %d; output: %s", code2, out2)
+	}
+	if !strings.Contains(out2, "pkgs=[backend/internal/run] owner=[runner]") {
+		t.Errorf("the runner's own injection did not reach the child:\n%s", out2)
+	}
+}
+
+// TestGateEnvVerifyControlsProtectedByBothLayers asserts each protection layer
+// SEPARATELY, so that a single-layer mutation reddens this test even though the
+// behavioural stripping test above stays green. Together the two tests make
+// every mutation of this control attainable as a RED somewhere.
+func TestGateEnvVerifyControlsProtectedByBothLayers(t *testing.T) {
+	for _, key := range []string{verifyPackagesEnvVar, verifyLockOwnerEnvVar} {
+		if !gateEnvDenied(key) {
+			t.Errorf("gateEnvDenied(%q) = false — the belt-and-suspenders deny entry is missing", key)
+		}
+		if gateEnvAllowed(key) {
+			t.Errorf("gateEnvAllowed(%q) = true — the default-deny allow-list was widened to admit a scoped-verify control variable", key)
+		}
+	}
+}
+
+// TestAppendGateExtraEnv covers the post-sanitization injection helper,
+// including each defensive branch: an empty list, a same-named survivor, and a
+// malformed entry with no '=' or an empty key.
+func TestAppendGateExtraEnv(t *testing.T) {
+	base := []string{"PATH=/usr/bin", "HOME=/home/x"}
+
+	t.Run("an empty list returns env untouched", func(t *testing.T) {
+		for _, extra := range [][]string{nil, {}} {
+			got := appendGateExtraEnv(base, extra)
+			if len(got) != len(base) {
+				t.Fatalf("appendGateExtraEnv(base, %q) = %q, want it unchanged", extra, got)
+			}
+		}
+	})
+
+	t.Run("an injected entry replaces a same-named survivor", func(t *testing.T) {
+		polluted := append(append([]string{}, base...), "K=inherited")
+		got := appendGateExtraEnv(polluted, []string{"K=injected"})
+		n := 0
+		for _, kv := range got {
+			if strings.HasPrefix(kv, "K=") {
+				n++
+				if kv != "K=injected" {
+					t.Errorf("surviving entry = %q, want K=injected", kv)
+				}
+			}
+		}
+		if n != 1 {
+			t.Fatalf("found %d K= entries, want exactly 1: %q", n, got)
+		}
+	})
+
+	t.Run("a malformed entry is dropped, not forwarded", func(t *testing.T) {
+		got := appendGateExtraEnv(base, []string{"NOEQUALS", "=novalue", "GOOD=1"})
+		for _, kv := range got {
+			if kv == "NOEQUALS" || kv == "=novalue" {
+				t.Errorf("appendGateExtraEnv forwarded the malformed entry %q: %q", kv, got)
+			}
+		}
+		if !envHas(got, "GOOD=1") {
+			t.Errorf("appendGateExtraEnv dropped the well-formed entry: %q", got)
+		}
+	})
+}

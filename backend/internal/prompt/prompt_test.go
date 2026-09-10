@@ -15052,3 +15052,84 @@ func TestImplementReview_PriorConcerns_ReopenSubstantiation_EmptyByteIdentical(t
 		t.Error("the golden carries the prior-concerns section; it was captured with a non-empty PriorConcerns")
 	}
 }
+
+// concurrentVerifyPollSentinel is the load-bearing CLAUSE of the #3315 block —
+// the do-not-poll consequence, not the heading. A heading-only assertion would
+// stay green if the rule's substance were edited away, which is exactly the
+// failure the block exists to prevent (run a662ed6f burned a whole stage
+// retrying a lock-held refusal in a loop).
+//
+// It is a short PHRASE, not a full sentence: a full-sentence assertion is
+// brittle to the next copy-edit and gets silently deleted rather than updated.
+const concurrentVerifyPollSentinel = "Do NOT poll it, retry it in a loop"
+
+// TestBuild_Implement_ConcurrentVerifyRule_Rendered proves the full implement
+// path renders the #3315 concurrency rule, including the do-not-poll clause.
+func TestBuild_Implement_ConcurrentVerifyRule_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  3315,
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### Concurrent verify") {
+		t.Errorf("full implement prompt missing the concurrent-verify heading\n---\n%s", got)
+	}
+	if !strings.Contains(got, concurrentVerifyPollSentinel) {
+		t.Errorf("full implement prompt does not name the do-not-poll consequence\n---\n%s", got)
+	}
+	if !strings.Contains(got, "fast failure") {
+		t.Errorf("full implement prompt does not say the refusal is a fast failure rather than a queue\n---\n%s", got)
+	}
+}
+
+// TestBuild_ImplementFixup_ConcurrentVerifyRule_Rendered proves the slim fix-up
+// path renders the IDENTICAL rule. A fix-up pass is the one most likely to meet
+// the runner's own verify still holding the lock, so this arm is not optional.
+func TestBuild_ImplementFixup_ConcurrentVerifyRule_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		IssueNumber:   3315,
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: []FixupConcern{{Text: "[medium] tighten the bound check"}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### Concurrent verify") {
+		t.Errorf("slim fix-up prompt missing the concurrent-verify heading\n---\n%s", got)
+	}
+	if !strings.Contains(got, concurrentVerifyPollSentinel) {
+		t.Errorf("slim fix-up prompt does not name the do-not-poll consequence\n---\n%s", got)
+	}
+}
+
+// TestBuild_ConcurrentVerifyRule_StaysRepoAgnostic: the prompt does not know the
+// project's verify command, so the block must name the BEHAVIOUR rather than
+// hard-code this repository's own command or environment variables. A leaked
+// `scripts/test` would be wrong for every other repository the product drives.
+func TestBuild_ConcurrentVerifyRule_StaysRepoAgnostic(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  3315,
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	start := strings.Index(got, "### Concurrent verify")
+	if start < 0 {
+		t.Fatalf("concurrent-verify block absent\n---\n%s", got)
+	}
+	section := got[start:]
+	if end := strings.Index(section[len("### Concurrent verify"):], "\n### "); end >= 0 {
+		section = section[:len("### Concurrent verify")+end]
+	}
+	for _, leaked := range []string{"scripts/test", "FISHHAWK_VERIFY_PACKAGES", "FISHHAWK_VERIFY_LOCK_OWNER", "golangci-lint"} {
+		if strings.Contains(section, leaked) {
+			t.Errorf("the concurrent-verify block leaks the repo-specific token %q:\n%s", leaked, section)
+		}
+	}
+}
