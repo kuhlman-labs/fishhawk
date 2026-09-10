@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -442,5 +444,154 @@ func TestNew_TrimsTrailingSlash(t *testing.T) {
 	c := New(testBaseURL+"/", testToken, WithHTTPClient(stub))
 	if _, err := c.GetProject(context.Background(), "g/p"); err != nil {
 		t.Fatalf("GetProject: %v", err)
+	}
+}
+
+// --- c.do redirect boundary (E45.39 / #3305) ------------------------------
+//
+// These cases drive the REAL *http.Client through the same-package
+// newIssueServer harness: the stubDoer cases above cannot exercise
+// CheckRedirect at all (a hand-rolled stub never follows a redirect), so the
+// hoisted guard on c.do needs a live listener to be observable. Every
+// redirect target — foreign and same-origin alike — is a reachable in-test
+// httptest listener, so deleting the guard fails these tests on the
+// zero-hit / empty-token behavioral assertions rather than on a dial error.
+
+// foreignRecorder is a reachable in-test stand-in for an off-instance host.
+// It counts requests and records the PRIVATE-TOKEN it was handed, so a
+// deleted guard is caught disclosing the credential rather than merely
+// failing to connect.
+type foreignRecorder struct {
+	srv   *httptest.Server
+	hits  atomic.Int64
+	token atomic.Value // string
+}
+
+func newForeignRecorder(t *testing.T) *foreignRecorder {
+	t.Helper()
+	f := &foreignRecorder{}
+	f.token.Store("")
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.hits.Add(1)
+		f.token.Store(r.Header.Get("PRIVATE-TOKEN"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+// assertNotReached fails unless the foreign host was never dialed and never
+// saw the token — the two observables that redden when the guard is deleted.
+func (f *foreignRecorder) assertNotReached(t *testing.T) {
+	t.Helper()
+	if got := f.hits.Load(); got != 0 {
+		t.Errorf("foreign host received %d requests, want 0 (token must not follow a redirect off-instance)", got)
+	}
+	if tok := f.token.Load().(string); tok != "" {
+		t.Errorf("foreign host saw PRIVATE-TOKEN %q, want it never disclosed", tok)
+	}
+}
+
+// TestGitLabClient_Do_RefusesOffOriginRedirect_GetIssue pins the hoisted guard
+// on a BODILESS GET dispatched through c.do: a same-origin endpoint answering
+// 302 to a foreign host is refused before the redirected request is sent.
+// Before the hoist this path called c.http.Do directly, so the default client
+// would have chased the 302 with PRIVATE-TOKEN attached.
+func TestGitLabClient_Do_RefusesOffOriginRedirect_GetIssue(t *testing.T) {
+	foreign := newForeignRecorder(t)
+
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, foreign.srv.URL+"/api/v4/projects/42/issues/7", http.StatusFound)
+	})
+
+	issue, err := s.client().GetIssue(context.Background(), 42, 7)
+	// Deliberately Errorf, not Fatalf: with the guard deleted the call
+	// SUCCEEDS, and the zero-hit / empty-token assertions below are the ones
+	// that prove the credential reached the foreign listener.
+	if err == nil {
+		t.Errorf("GetIssue = %v, nil; want a refusal of the off-origin redirect", issue)
+	} else if !strings.Contains(err.Error(), "refusing redirect target") {
+		t.Errorf("err = %v, want the same-origin refusal from CheckRedirect", err)
+	}
+	foreign.assertNotReached(t)
+}
+
+// TestGitLabClient_Do_RefusesOffOriginRedirect_CreateIssueNote pins the same
+// boundary on the BODY-CARRYING POST path, using a 307 — the body-preserving
+// redirect class, which net/http replays with the original body and headers.
+func TestGitLabClient_Do_RefusesOffOriginRedirect_CreateIssueNote(t *testing.T) {
+	foreign := newForeignRecorder(t)
+
+	s := newIssueServer(t)
+	s.mux.HandleFunc("POST /api/v4/projects/42/issues/7/notes", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, foreign.srv.URL+"/api/v4/projects/42/issues/7/notes", http.StatusTemporaryRedirect)
+	})
+
+	note, err := s.client().CreateIssueNote(context.Background(), 42, 7, "hello")
+	// Deliberately Errorf, not Fatalf: with the guard deleted the call
+	// SUCCEEDS, and the zero-hit / empty-token assertions below are the ones
+	// that prove the credential reached the foreign listener.
+	if err == nil {
+		t.Errorf("CreateIssueNote = %v, nil; want a refusal of the off-origin redirect", note)
+	} else if !strings.Contains(err.Error(), "refusing redirect target") {
+		t.Errorf("err = %v, want the same-origin refusal from CheckRedirect", err)
+	}
+	foreign.assertNotReached(t)
+}
+
+// TestGitLabClient_Do_FollowsSameOriginRedirect pins that the guard is a
+// BOUNDARY and not a blanket redirect ban: a redirect that stays on the
+// configured origin is still followed to completion.
+func TestGitLabClient_Do_FollowsSameOriginRedirect(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/api/v4/projects/42/issues/7/moved", http.StatusFound)
+	})
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7/moved", func(w http.ResponseWriter, r *http.Request) {
+		writeIssueJSON(w, http.StatusOK, `{"iid":7,"title":"Moved","state":"opened"}`)
+	})
+
+	issue, err := s.client().GetIssue(context.Background(), 42, 7)
+	if err != nil {
+		t.Fatalf("GetIssue: %v; want a same-origin redirect to be followed", err)
+	}
+	if issue.IID != 7 || issue.Title != "Moved" {
+		t.Errorf("issue = %+v, want the body served after the redirect", issue)
+	}
+
+	var sawRedirecting, sawFinal bool
+	for _, r := range s.requests() {
+		switch r.Path {
+		case "/api/v4/projects/42/issues/7":
+			sawRedirecting = true
+		case "/api/v4/projects/42/issues/7/moved":
+			sawFinal = true
+		}
+	}
+	if !sawRedirecting || !sawFinal {
+		t.Errorf("request log = %+v, want BOTH the redirecting and the final path (redirect genuinely followed)", s.requests())
+	}
+}
+
+// TestGitLabClient_Do_StopsAfterRedirectCap pins that overriding CheckRedirect
+// did not disable net/http's default chain bound: a same-origin handler that
+// redirects to itself terminates rather than looping forever.
+func TestGitLabClient_Do_StopsAfterRedirectCap(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/api/v4/projects/42/issues/7", http.StatusFound)
+	})
+
+	issue, err := s.client().GetIssue(context.Background(), 42, 7)
+	if err == nil {
+		t.Fatalf("GetIssue = %v, nil; want the redirect chain to be capped", issue)
+	}
+	if !strings.Contains(err.Error(), "stopped after") {
+		t.Errorf("err = %v, want the redirect-cap refusal", err)
+	}
+	if got := len(s.requests()); got > maxRedirects+1 {
+		t.Errorf("server recorded %d requests, want at most %d (the chain cap must still bound the walk)", got, maxRedirects+1)
 	}
 }
