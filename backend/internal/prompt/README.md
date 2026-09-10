@@ -873,8 +873,10 @@ renders longer by construction, and the instruction block is unconditional, so
 
 The marker-bearing-fixture enumeration approval condition (2) asked for has a
 short answer, and it corrects the condition's own premise. The condition named
-`TestBuild_PlanReview_GateEvidence_AllSkipConsequenceRenders` (the all-skip
-consequence test, #3026) as a test that "necessarily sets both on every
+`TestBuild_PlanReview_GateEvidence_AllSkipConsequenceRenders` — since renamed
+to `TestBuild_PlanReview_GateEvidence_AllSkipAdvisoryRenders` by #3317, which
+merged the CONSEQUENCE line the test originally pinned into the single
+ADVISORY line described below — as a test that "necessarily sets both on every
 criterion". It does not: it sets `AllSkipShortCircuit` and an
 `all_criteria_skip_expected` finding on the GATE-EVIDENCE struct
 (`AcceptancePrecheckEvidence`) — the precheck's REPORT that the plan is all-skip
@@ -908,3 +910,78 @@ spurious reject, which the operator already overrules. Falsifiable check: if a
 reject on the flagged-criterion premise recurs after this ships, the
 informational fix was insufficient and the next step is a deterministic
 gate-side suppression rather than more prompt text.
+
+## All-skip acceptance advisory line (#3026, collapsed #3317)
+
+The #3026 `AllSkipShortCircuit` headline used to render as TWO gate-evidence
+lines for a plan whose acceptance criteria are all `skip_expected`: a
+`- CONSEQUENCE:` line, plus the generic findings loop separately rendering
+`- FINDING all_criteria_skip_expected: …`. The gate-evidence preamble's
+blanket "a violation or finding listed here MUST be recorded as a
+high-severity concern" rule applied to both, so every plan reviewer escalated
+the same machine-derived duplicate — the operator waived the identical pair of
+concerns 14 times across one campaign, always for the same reason: the
+acceptance preview is a separate, empty `*_preview` database behind a
+localhost:8090-only allow-list with no forge client, so no criterion is
+drivable.
+
+`writePlanGateEvidence` now writes ONE `- ADVISORY all_criteria_skip_expected:`
+line (`allSkipAdvisoryLine`) in place of the CONSEQUENCE line, carrying the
+original consequence prose plus an explicit HANDLING clause: acknowledge in
+`free_form`; never record it as a concern or let it, on its own, drive a
+`reject`/`approve_with_concerns`; record exactly one concern ONLY when a
+specific criterion in the plan could actually be driven against the localhost
+preview or a repository-local harness, naming that criterion. The findings
+loop then SUPPRESSES the duplicate `- FINDING all_criteria_skip_expected` line
+— keyed on `AllSkipShortCircuit == true` AND `Rule ==
+plan.RuleAllCriteriaSkipExpected`, never on the rule alone, so a
+(never-produced-by-the-real-path) flag-false/finding-present value still
+renders the raw FINDING line unchanged, honoring the documented
+`AcceptancePrecheckEvidence` invariant rather than silently dropping a finding
+no one asked to fold. When suppression leaves zero findings, the trailing
+label reads `- other findings: none (checked and clean)` rather than the
+plain `- findings: none (checked and clean)`, so the block never claims
+"clean" directly under a line that IS a finding.
+
+**Reachability.** The preamble's blanket must-be-a-concern rule would
+otherwise apply to the ADVISORY line too, so `allSkipPreambleException` adds
+one sentence to the preamble — rendered whenever any gate evidence is present
+— naming the acceptance pre-check's specific `all_criteria_skip_expected`
+advisory line as the exception that carries its own HANDLING instruction
+instead. The exception is scoped to that one specific line, not a bare
+`ADVISORY` line-prefix: every other gate-evidence line renders
+`fmt.Fprintf`-interpolated finding/violation Detail text this package does not
+fully control, so a bare-prefix exception would hand any such text a
+de-escalation channel by placing a newline plus its own
+`- ADVISORY ...: HANDLING: ...` into a Detail string. Naming the specific
+advisory — never the word `ADVISORY` alone — closes that off; the exception
+sentence deliberately keeps the two terms non-adjacent so it does not itself
+trip a naive substring match for the rendered advisory line.
+
+**Narrowness.** The de-escalation, mirroring `liveValidationVerdictClause`'s
+shape, covers ONLY the plan-level all-skip shape itself. A concern about an
+individual criterion's own statement text (testability, independence,
+falsifiability), or any OTHER acceptance finding (`undecidable_criterion`,
+`missing_live_validation_marker`), is unaffected and must still be recorded.
+Nothing outside the prompt renderer changed: `backend/internal/plan`'s rule
+still fires, `runAcceptancePrecheck` still sets the headline, the
+`plan_acceptance_precheck` audit payload is byte-unchanged, and the
+merge-verdict path's "NOT a validated pass" warning (#2347) is untouched —
+this suppresses a machine-derived duplicate, not a reviewer's ability to raise
+a real acceptance concern.
+
+Pinned by `TestBuild_PlanReview_GateEvidence_AllSkipAdvisoryRenders` (the
+merged line renders when the flag is true and is absent — with the raw FINDING
+line and findings list unchanged — when false),
+`TestBuild_PlanReview_AllSkipAdvisory_SuppressesOnlyItsOwnFinding` (an
+unrelated finding alongside the flag still renders, proving the filter is
+rule-scoped not blanket), `TestBuild_PlanReview_AllSkipAdvisory_FlagFalseFindingStillRenders`
+(the flag-false-but-finding-present invariant-violating shape still renders
+its raw FINDING line), and `TestBuild_PlanReview_GateEvidencePreambleCarriesAdvisoryException`
+(the preamble sentence renders whenever gate evidence is present and is
+absent, with the whole section, when there is none — `TestBuild_PlanReview_TrimmedBelowBaseline`'s
+unmoved `preTrimBaselineLen` is the no-unconditional-growth control, since
+every added byte here is conditional on gate evidence being present). The
+producer-to-consumer join through the real `runAcceptancePrecheck` ->
+`planGateEvidence` -> `prompt.Build` path is
+`backend/internal/server`'s `TestAcceptancePrecheck_AllSkip_JoinToRenderedPrompt`.

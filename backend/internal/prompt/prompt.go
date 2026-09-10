@@ -1583,22 +1583,29 @@ type GateViolation struct {
 // it apart from "never checked" (nil AcceptancePrecheck, i.e. no acceptance
 // stage configured).
 //
-// AllSkipShortCircuit (#3026) carries the plan-level all-skip headline: every
-// criterion is skip_expected-with-basis, so acceptance will short-circuit
-// having verified ZERO criteria. It renders one extra CONSEQUENCE line and
-// renders NOTHING when false, so the gate-evidence bytes stay byte-identical
-// for every other plan.
+// AllSkipShortCircuit (#3026, rendering reworked #3317) carries the
+// plan-level all-skip headline: every criterion is skip_expected-with-basis,
+// so acceptance will short-circuit having verified ZERO criteria. When true
+// it renders a single `- ADVISORY all_criteria_skip_expected:` line (see
+// allSkipAdvisoryLine) carrying the consequence prose plus a HANDLING clause
+// that tells the reviewer to acknowledge it in free_form rather than record
+// it as a concern; the corresponding raw `- FINDING all_criteria_skip_expected`
+// line is SUPPRESSED so the two do not both render. It renders NOTHING extra
+// when false, so the gate-evidence bytes stay byte-identical for every other
+// plan.
 //
 // INVARIANT: AllSkipShortCircuit is DERIVED from the all_criteria_skip_expected
 // finding by the server's runAcceptancePrecheck — it is never set
-// independently, so true implies Findings carries that finding. The renderer
-// deliberately does NOT re-check the findings list before writing the
-// CONSEQUENCE line, so a hand-constructed value that sets the flag true with an
-// empty Findings would render the consequence immediately followed by
-// "findings: none (checked and clean)". That block is self-contradictory and is
-// unreachable on the real path; a caller that ever populates this struct from
-// somewhere other than the finding must preserve the invariant or add the
-// guard.
+// independently, so true implies Findings carries that finding. This
+// invariant is now load-bearing for the suppression filter, not just for the
+// advisory line: the filter is keyed on the flag AND the rule
+// (plan.RuleAllCriteriaSkipExpected), never on the rule alone, so a
+// hand-constructed flag-true/empty-Findings value renders the advisory line
+// with no finding left to suppress (harmless — the trailing label reads
+// "other findings: none (checked and clean)"), while a hand-constructed
+// flag-false/finding-present value renders the raw FINDING line unchanged,
+// preserving the documented invariant honestly rather than silently dropping
+// a finding no one asked to fold.
 type AcceptancePrecheckEvidence struct {
 	AcceptanceStageID   string
 	CriteriaCount       int
@@ -4625,6 +4632,7 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 		"high-severity concern and named FIRST among your concerns — it outranks any stylistic or " +
 		"text-level finding, and once recorded you may shortcut the remaining review criteria. " +
 		"A clean result does NOT certify plan quality: every review criterion below still applies.\n\n")
+	b.WriteString(allSkipPreambleException)
 	b.WriteString("Escape valve — gate evidence is ground truth ABOUT WHAT THE GATES MEASURED and normally " +
 		"outranks any text-level reading of the plan, but the evidence itself can be wrong. When the plan/artifact " +
 		"under review DIRECTLY and VERIFIABLY contradicts a specific evidence claim above (e.g. the plan plainly " +
@@ -4673,15 +4681,28 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 		fmt.Fprintf(b, "- criteria: %d (blocking: %d)\n", ap.CriteriaCount, ap.BlockingCount)
 		fmt.Fprintf(b, "- out_of_scope entries: %d\n", ap.OutOfScopeCount)
 		if ap.AllSkipShortCircuit {
-			b.WriteString("- CONSEQUENCE: every acceptance criterion is marked skip_expected with an expectation_basis, so the " +
-				"acceptance stage will short-circuit to a not_validated verdict with no runner spawn and no preview — ZERO " +
-				"criteria will be verified. The run stays merge-eligible, but this is NOT a validated pass (#2347). Ask whether " +
-				"a drivable criterion genuinely exists for this change; an all-skip plan is not a cheap green.\n")
+			b.WriteString(allSkipAdvisoryLine)
 		}
-		if len(ap.Findings) == 0 {
-			b.WriteString("- findings: none (checked and clean)\n")
+		// The advisory line above already carries the all_criteria_skip_expected
+		// finding (when AllSkipShortCircuit is true); suppress its duplicate
+		// FINDING line ONLY, keyed on flag AND rule so a flag-false value (never
+		// set by the real path, but preserving the documented invariant) still
+		// renders its raw FINDING line unchanged.
+		other := make([]AcceptanceFindingEvidence, 0, len(ap.Findings))
+		for _, f := range ap.Findings {
+			if ap.AllSkipShortCircuit && f.Rule == plan.RuleAllCriteriaSkipExpected {
+				continue
+			}
+			other = append(other, f)
+		}
+		if len(other) == 0 {
+			if ap.AllSkipShortCircuit {
+				b.WriteString("- other findings: none (checked and clean)\n")
+			} else {
+				b.WriteString("- findings: none (checked and clean)\n")
+			}
 		} else {
-			for _, f := range ap.Findings {
+			for _, f := range other {
 				if f.CriterionID != "" {
 					fmt.Fprintf(b, "- FINDING %s (criterion: %s): %s\n", f.Rule, f.CriterionID, f.Detail)
 				} else {
@@ -6395,6 +6416,59 @@ const liveValidationVerdictClause = "- A criterion's `requires_live_validation` 
 	"it covers ONLY coverage/verification-gap concerns arising from the MARKING ITSELF (record those only under " +
 	"the three cases in criterion 13). Concerns about the marked criterion's own statement text — testability, " +
 	"independence, falsifiability — are unaffected; keep recording them.\n\n"
+
+// allSkipAdvisoryLine is the single gate-evidence line rendered in place of
+// the former #3026 CONSEQUENCE line plus the duplicate all_criteria_skip_expected
+// FINDING line (#3317). The plan-level all-skip shape drew an identical
+// high-severity concern from both plan reviewers on every occurrence across a
+// campaign — a machine-derived duplicate, not a reviewer judgement — because
+// the gate-evidence preamble's blanket "MUST be recorded as a high-severity
+// concern" rule left the reviewer no room to de-escalate it. This line carries
+// the original consequence prose verbatim in substance, plus an explicit
+// HANDLING clause that supersedes the blanket rule for this one line (see
+// allSkipPreambleException, which is what makes the exception reachable). The
+// de-escalation is narrow, mirroring liveValidationVerdictClause's shape: it
+// covers ONLY the plan-level all-skip shape itself. A concern about an
+// individual criterion's statement text (testability, independence,
+// falsifiability) or any OTHER acceptance finding (undecidable_criterion,
+// missing_live_validation_marker) is unaffected and must still be recorded.
+const allSkipAdvisoryLine = "- ADVISORY all_criteria_skip_expected: every acceptance criterion is marked skip_expected " +
+	"with an expectation_basis, so the acceptance stage will short-circuit to a not_validated verdict with no runner " +
+	"spawn and no preview — ZERO criteria will be verified. The run stays merge-eligible, but this is NOT a validated " +
+	"pass (#2347). HANDLING: acknowledge this in `free_form`. Do NOT record it as a concern and do NOT let it, on its " +
+	"own, drive a `reject` or `approve_with_concerns` verdict. Record exactly ONE concern ONLY if you can NAME a " +
+	"specific criterion in this plan that the sandboxed acceptance agent COULD drive against the localhost preview " +
+	"(or a repository-local harness) — name that criterion id in the concern. This suppression covers ONLY the " +
+	"plan-level all-skip shape itself: a concern about an individual criterion's own statement text (testability, " +
+	"independence, falsifiability) or any OTHER acceptance finding (undecidable_criterion, " +
+	"missing_live_validation_marker) is unaffected and must still be recorded.\n"
+
+// allSkipPreambleException is appended to the gate-evidence preamble's
+// blanket "a violation or finding listed here MUST be recorded as a
+// high-severity concern" rule (#3317). It names the ONE specific line that
+// carries its own HANDLING instruction in place of that rule, which is what
+// makes allSkipAdvisoryLine's de-escalation reachable from the rule it
+// modifies. Renders whenever any gate evidence is present, mirroring the
+// escape-valve paragraph it precedes.
+//
+// Deliberately NOT worded as a bare `ADVISORY` line-prefix exception: every
+// other gate-evidence line is rendered from fmt.Fprintf-interpolated
+// finding/violation Detail text, which this package does not control end to
+// end (a plan rule's Detail string could in principle carry
+// attacker-influenced text). A bare-prefix exception would hand any such
+// text a de-escalation channel by placing a newline followed by its own
+// `- ADVISORY ...: HANDLING: ...` line into a Detail field. Naming the
+// specific all_criteria_skip_expected advisory — not the word ADVISORY as a
+// prefix — closes that off. (The wording below keeps `ADVISORY` and
+// `all_criteria_skip_expected` non-adjacent on purpose, so this sentence
+// itself, which renders unconditionally whenever any gate evidence is
+// present, does not trip a naive substring match for the rendered advisory
+// line — see TestBuild_PlanReview_AllSkipAdvisory_FlagFalseFindingStillRenders.)
+const allSkipPreambleException = "One exception: the acceptance pre-check's `all_criteria_skip_expected` advisory " +
+	"line below (identified by its own literal text, not by the word `ADVISORY` occurring as a bare line prefix) " +
+	"carries its own HANDLING instruction in place of the rule above — follow that instruction instead. Any OTHER " +
+	"line — including one that merely begins with, or elsewhere contains, the word `ADVISORY` — remains subject to " +
+	"the must-be-a-concern rule above.\n\n"
 
 // writeAcceptanceCriteriaForReview renders a plan's typed
 // verification.acceptance_criteria (and out_of_scope) for the review-agent
