@@ -408,7 +408,10 @@ func liveValidationSectionKey(runID uuid.UUID) string {
 //     regardless of whether {n} is allocatable — appending needs no new child,
 //     no addSubIssue and no {n}. ChildN is a BEST-EFFORT allocation carried only
 //     so a rare append DEGRADE (the candidate unreadable/closed at the fresh
-//     read) can still file a new rolling walk; it is legitimately "" here.
+//     read) can still file a new rolling walk; it is legitimately "" here — and
+//     it is left "" when the epic is AT the cap, because that degrade's File
+//     attaches a new sub-issue and would be doomed at the cap, so a degrade at
+//     the cap falls through to the companion arm instead (binding condition 4).
 //   - AppendTo == 0: no candidate; FILE a new rolling walk with the allocated
 //     ChildN. Only THIS path is gated by the cap and the NextChildNumber
 //     allocation (binding condition — allocation gates only the file-new path).
@@ -546,11 +549,21 @@ func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.Credenti
 
 	// ADOPTION FIRST: an open rolling walk is appendable regardless of the cap and
 	// regardless of {n} allocatability. ChildN is allocated best-effort only for a
-	// possible append DEGRADE; its absence never blocks the append path.
+	// possible append DEGRADE (the candidate unreadable/closed at the fresh read, so
+	// the degrade must FILE a new rolling walk); its absence never blocks the append
+	// path itself. That fallback File attaches a new [E<epic>.<n>] sub-issue, so it
+	// is gated by the SAME cap as the file-new path below: at the cap, allocating
+	// {n} would only produce a filed-but-UNPARENTED walk (the doomed addSubIssue
+	// attach, binding condition 4 — E22 #389, E48 #1940, E67 #2561 are capped today).
+	// So when the epic is at the cap, leave ChildN="" — a degrade then falls through
+	// to the companion arm (which files an attachable companion) rather than a doomed
+	// new epic child (high/untested_edge_path, medium/untested-path fix-up).
 	if cand := findHighestOpenRollingCandidate(res.Children, rollingKey); cand != nil {
 		childN := ""
-		if n, ok := workmgmt.NextChildNumber(choreType.TitleFormat, epicVar, res.Children); ok {
-			childN = strconv.Itoa(n)
+		if len(res.Children) < githubSubIssueParentCap {
+			if n, ok := workmgmt.NextChildNumber(choreType.TitleFormat, epicVar, res.Children); ok {
+				childN = strconv.Itoa(n)
+			}
 		}
 		return walkEpicResolution{EpicArm: true, EpicRef: epicRef, EpicVar: epicVar, ChildN: childN, AppendTo: cand.Number, Unlock: unlock}
 	}

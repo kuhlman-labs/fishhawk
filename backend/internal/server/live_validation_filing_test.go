@@ -318,6 +318,9 @@ func liveValPlanBytes(t *testing.T, marked bool) []byte {
 		// carries skip_expected + expectation_basis so acceptance short-circuits.
 		crits[0].SkipExpected = true
 		crits[0].ExpectationBasis = "validated by the integration test with a fake forge"
+		// A verify_hint so the rendered rolling section exercises the `Verify:`
+		// continuation branch of liveValidationRunSection (low/test_coverage).
+		crits[0].VerifyHint = "trigger a real push and observe the webhook delivery"
 	}
 	p := &plan.Plan{
 		PlanVersion: "standard_v1",
@@ -1330,6 +1333,68 @@ func TestFileOrLinkLiveValidationWalk_RollingCandidateClosedAtFreshReadFilesNew(
 	}
 }
 
+// TestFileOrLinkLiveValidationWalk_RollingCappedCandidateReadErrorCompanion is the
+// intersection the fix-up concerns name (high/untested_edge_path, medium/untested-
+// path, low/untested-path): a CAPPED epic (exactly the sub-issue cap) whose adopted
+// OPEN candidate is UNREADABLE at the fresh GetIssue. The append degrades retryably,
+// but because the epic is at the cap the best-effort ChildN is "" (allocating a new
+// [E<epic>.<n>] child would be a doomed, filed-but-UNPARENTED attach), so the degrade
+// falls through to the COMPANION arm — an attachable companion, NOT a new epic child.
+// Deleting the cap gate on the append-fallback allocation (in resolveWalkParentEpic)
+// makes ChildN nonempty at the cap and reddens this on the ParentEpic assertion (the
+// walk would be filed with a doomed ParentEpic instead of a companion).
+func TestFileOrLinkLiveValidationWalk_RollingCappedCandidateReadErrorCompanion(t *testing.T) {
+	cand := liveValRollingCandidate(6001, "OPEN", liveValRollingKeyOR())
+	children := append(numberedEpicChildren("48", githubSubIssueParentCap-1), cand)
+	if len(children) != githubSubIssueParentCap {
+		t.Fatalf("seeded %d children, want exactly the cap %d", len(children), githubSubIssueParentCap)
+	}
+	h, store := liveValRollingHarness(t, children)
+	store.seed(6001, cand.Body, "open")
+	store.injectGetError(6001) // fresh read of the candidate fails → retryable degrade
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	// The degrade takes the COMPANION arm: exactly one File, companion shape, NO new
+	// epic child, and no PATCH.
+	if h.provider.calls != 1 || len(h.provider.reqs) != 1 {
+		t.Fatalf("File called %d (reqs %d), want exactly 1 companion filing (capped degrade → companion)", h.provider.calls, len(h.provider.reqs))
+	}
+	req := h.provider.reqs[0]
+	if req.Item.Relations.ParentEpic != "" {
+		t.Errorf("parent_epic = %q, want empty: a capped-epic degrade must NOT attach a new epic child", req.Item.Relations.ParentEpic)
+	}
+	parentRef := "#" + strconv.Itoa(liveValParentIssue)
+	if len(req.Item.Relations.CompanionTo) != 1 || req.Item.Relations.CompanionTo[0] != parentRef {
+		t.Errorf("companion_to = %v, want [%s] (companion arm)", req.Item.Relations.CompanionTo, parentRef)
+	}
+	if store.totalPatches() != 0 {
+		t.Errorf("patches = %d, want 0 (the failed read never reached a PATCH)", store.totalPatches())
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingCappedCandidateClosedCompanion is the same
+// cap intersection reached via the OTHER retryable trigger: the candidate is OPEN in
+// the EpicChildren snapshot but CLOSED at the authoritative fresh read. At the cap the
+// degrade takes the companion arm rather than a doomed new epic child.
+func TestFileOrLinkLiveValidationWalk_RollingCappedCandidateClosedCompanion(t *testing.T) {
+	cand := liveValRollingCandidate(6001, "OPEN", liveValRollingKeyOR()) // snapshot OPEN
+	children := append(numberedEpicChildren("48", githubSubIssueParentCap-1), cand)
+	h, store := liveValRollingHarness(t, children)
+	store.seed(6001, cand.Body, "closed") // fresh read CLOSED → retryable degrade
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 1 || len(h.provider.reqs) != 1 {
+		t.Fatalf("File called %d (reqs %d), want exactly 1 companion filing (capped degrade → companion)", h.provider.calls, len(h.provider.reqs))
+	}
+	req := h.provider.reqs[0]
+	if req.Item.Relations.ParentEpic != "" {
+		t.Errorf("parent_epic = %q, want empty (companion, not a doomed epic child)", req.Item.Relations.ParentEpic)
+	}
+	if store.totalPatches() != 0 {
+		t.Errorf("patches = %d, want 0 (a walk closed at the fresh read is never PATCHed)", store.totalPatches())
+	}
+}
+
 // TestFileOrLinkLiveValidationWalk_RollingAppendErrorMarksFilingFailed (branch 7):
 // an UpdateIssue error routes to a filing_failed linked marker with an EMPTY
 // walk_ref and provider File called ZERO times — asserted on COMMITTED audit
@@ -1549,5 +1614,15 @@ func TestFileOrLinkLiveValidationWalk_RollingTwoRunsOneWalk(t *testing.T) {
 	}
 	if got := strings.Count(si.body, "### Run "+stageB.RunID.String()); got != 1 {
 		t.Errorf("run B section count = %d, want 1", got)
+	}
+	// The sections are NOT empty headings (low/test_coverage): each carries the
+	// marked criterion's checkbox bullet AND its Verify continuation line, so an
+	// empty section — which would still satisfy the heading counts above — is
+	// caught. One bullet + one Verify line per run section, two runs.
+	if got := strings.Count(si.body, "- [ ] `ac1` — the webhook fires on a real push"); got != 2 {
+		t.Errorf("criterion bullet count = %d, want 2 (one live-validation checkbox per run section)", got)
+	}
+	if got := strings.Count(si.body, "Verify: trigger a real push and observe the webhook delivery"); got != 2 {
+		t.Errorf("verify-line count = %d, want 2 (one Verify continuation per run section)", got)
 	}
 }
