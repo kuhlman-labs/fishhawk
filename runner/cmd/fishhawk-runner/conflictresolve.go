@@ -52,11 +52,16 @@ const (
 	// reasonCommitFailed — the scoped `git add` or the single `git commit
 	// --no-edit` failed AFTER a passing gate.
 	reasonCommitFailed = "conflict_resolution_commit_failed"
-	// reasonStagedContentChanged — a conflicted path's STAGED bytes are not the
-	// working-tree bytes the gate observed. `git add` runs any content filter
-	// the repository configures for the path, and a filter driver is named by
-	// the config, so it cannot be neutralized by a deny-list the way a hook can
-	// (gitops.HardeningArgs). Refused AFTER the gate, BEFORE the commit.
+	// reasonStagedContentChanged — the index `git add` wrote is not the artifact
+	// the gate approved. `git add` applies the eol/text/ident normalization and
+	// any `filter.<driver>.clean` the path's attributes name, and a driver is
+	// named by config, so it cannot be neutralized by a deny-list the way a hook
+	// can (gitops.HardeningArgs). The check compares the staged OID against the
+	// OID `git add` WOULD produce from the gate-observed bytes (`git hash-object
+	// --path`), so an HONEST committed-attribute transformation is accepted while
+	// content the gate never approved is refused; it ALSO refuses a config or
+	// attribute change slipped between the gate and the add. Refused AFTER the
+	// gate, BEFORE the commit.
 	reasonStagedContentChanged = "conflict_resolution_staged_content_changed"
 	// reasonCommitTreeChanged — the commit git produced is not the artifact the
 	// gate authorized: its tree differs from the index written immediately
@@ -195,6 +200,24 @@ func gitRun(ctx context.Context, repoDir string, args ...string) error {
 	return err
 }
 
+// gitOutStdin runs git in repoDir feeding stdin, returning trimmed stdout. It
+// applies the same HardeningArgs choke point every other invocation uses. It is
+// the vehicle for `git hash-object --path=<p> --stdin`, whose stdin is the
+// gate-observed bytes — never the mutable working tree.
+func gitOutStdin(ctx context.Context, repoDir string, stdin []byte, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", append(gitops.HardeningArgs(), args...)...)
+	cmd.Dir = repoDir
+	cmd.Stdin = bytes.NewReader(stdin)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git %s: %w: %s",
+			strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
 // readGitConfigFn is a TEST SEAM, never reassigned outside tests. Both config
 // reads' failure branches are fail-closed returns that a repository state
 // cannot reach selectively: a malformed `.git/config` fails `git rev-parse` and
@@ -221,6 +244,41 @@ func readGitConfig(ctx context.Context, repoDir string) (string, error) {
 	out, err := gitOutRaw(ctx, repoDir, "config", "--list", "-z")
 	if err != nil {
 		return "", fmt.Errorf("read git config: %w", err)
+	}
+	return string(out), nil
+}
+
+// readConflictedAttributesFn is a TEST SEAM, never reassigned outside tests. It
+// exists for the same reason readGitConfigFn does: both attribute reads'
+// fail-closed returns are reachable only from a repository state that fails the
+// other capture/observe reads FIRST, so the test would pass whether or not the
+// attribute read returned. The seam makes each branch's own return the thing
+// under test.
+var readConflictedAttributesFn = readConflictedAttributes
+
+// readConflictedAttributes captures the EFFECTIVE gitattributes for the
+// conflicted set as a raw `git check-attr -z --all -- <paths>` stream, for the
+// gate input that refuses ANY attribute change during the pass
+// (conflictresolve.ReasonAttributesChanged) and for step 7a's post-clean
+// staged-blob comparison.
+//
+// `check-attr` resolves the working-tree `.gitattributes`, `.git/info/attributes`
+// and the global `$HOME/.config/git/attributes`, so this covers every place an
+// agent could bind an eol/text/ident/filter driver to a conflicted path. Paths
+// are SORTED so the stream is deterministic across the baseline and observe
+// reads. Read through gitOutRaw so it inherits the same HardeningArgs choke
+// point every other read uses.
+//
+// RAW, never trimmed, and returned UNPARSED: the conflictresolve package owns
+// the framing parse (parseAttrStream), so this stream has exactly one parser.
+func readConflictedAttributes(ctx context.Context, repoDir string, paths []string) (string, error) {
+	if len(paths) == 0 {
+		return "", nil
+	}
+	args := append([]string{"check-attr", "-z", "--all", "--"}, paths...)
+	out, err := gitOutRaw(ctx, repoDir, args...)
+	if err != nil {
+		return "", fmt.Errorf("read git attributes: %w", err)
 	}
 	return string(out), nil
 }
@@ -398,10 +456,12 @@ func runConflictResolutionPass(ctx context.Context, repoDir, remote string,
 	}
 
 	// (7a) The gate decided on WORKING-TREE bytes; `git add` is what turns them
-	// into the artifact. Verify the index holds exactly what the gate saw
-	// before anything is committed — a content filter transforms bytes between
-	// the two and is named by config, so it survives the hook/config
-	// neutralization above.
+	// into the artifact, applying the eol/text/ident/filter transformation the
+	// path's attributes name. Verify the staged blob is the EXPECTED POST-CLEAN
+	// form of the gate-observed bytes (not their raw bytes), and that neither the
+	// config nor the attributes moved between the gate and the add — both survive
+	// the hook/config neutralization above because a filter/eol driver is named
+	// by config or attributes, not by a fixed key.
 	if reason, detail := verifyStagedMatchesObserved(obsCtx, repoDir, base, obs); reason != "" {
 		return refuse(reason, detail, nil)
 	}
@@ -441,24 +501,58 @@ func runConflictResolutionPass(ctx context.Context, repoDir, remote string,
 	return conflictResolutionResult{HeadSHA: newHead, BaseSHA: head, Recovered: true}
 }
 
-// verifyStagedMatchesObserved compares each conflicted path's STAGED bytes
-// against the working-tree bytes the gate observed and approved.
+// verifyStagedMatchesObserved confirms the index `git add` just wrote holds
+// exactly what the gate approved, comparing against the EXPECTED POST-CLEAN form
+// rather than the raw observed bytes.
 //
-// It is the filter-driver answer. `git add` applies whatever
-// `filter.<driver>.clean` command the repository configures for a path, and a
-// driver is named by config — there is no wildcard to neutralize it with the
-// way gitops.HardeningArgs neutralizes a fixed key. So the pass does not assume
-// the index holds what the gate read: it reads the index back. A path the gate
-// observed as ABSENT (the deletion side of a delete/modify conflict) must be
-// absent from the index too.
+// It is the filter/eol answer. `git add` applies whatever eol/text/ident
+// normalization AND whatever `filter.<driver>.clean` command the path's
+// attributes name, and a driver is named by config — there is no wildcard to
+// neutralize it the way gitops.HardeningArgs neutralizes a fixed key. A raw
+// byte comparison therefore refuses EVERY honest resolution in a repository
+// whose committed `.gitattributes` legitimately transforms bytes (e.g.
+// `text eol=crlf`: checkout writes CRLF, add cleans to LF). So the check has two
+// parts:
+//
+//	(i)  Re-read the config AND the conflicted set's attributes and refuse any
+//	     drift from the baseline the gate decided on — a change between the gate
+//	     and the add moves the transformation, so a post-clean comparison could
+//	     otherwise AGREE with a maliciously-transformed blob.
+//	(ii) Compare each conflicted path's staged stage-0 OID against the OID
+//	     `git add` WOULD produce from the gate-observed bytes — computed by
+//	     hashing those bytes with the path's own attributes applied
+//	     (`git hash-object --path=<p> --stdin`), fed the GATE-OBSERVED bytes and
+//	     never the mutable working tree. A path the gate observed ABSENT must be
+//	     absent from the index too.
 //
 // Returns ("", "") when the index matches, or a named reason and a detail.
 func verifyStagedMatchesObserved(ctx context.Context, repoDir string,
 	base conflictresolve.Baseline, obs conflictresolve.Observed) (string, string) {
 
+	// Part (i): config/attribute drift between the gate and the add.
+	cfg, err := readGitConfigFn(ctx, repoDir)
+	if err != nil {
+		return reasonStagedContentChanged, "re-read git config after add: " + err.Error()
+	}
+	if cfg != base.Config {
+		return reasonStagedContentChanged,
+			"the effective git configuration changed between the gate and the add — " +
+				conflictresolve.ConfigChangeDetail(base.Config, cfg)
+	}
+	attrs, err := readConflictedAttributesFn(ctx, repoDir, sortedStringKeys(base.Conflicted))
+	if err != nil {
+		return reasonStagedContentChanged, "re-read git attributes after add: " + err.Error()
+	}
+	if attrs != base.Attributes {
+		return reasonStagedContentChanged,
+			"the effective git attributes changed between the gate and the add — " +
+				conflictresolve.AttributeChangeDetail(base.Attributes, attrs)
+	}
+
+	// Part (ii): staged OID vs the expected post-clean OID of the observed bytes.
 	for _, path := range sortedStringKeys(base.Conflicted) {
 		want := obs.Working[path]
-		staged, err := gitOutRaw(ctx, repoDir, "cat-file", "blob", ":"+path)
+		staged, err := gitOut(ctx, repoDir, "rev-parse", ":"+path)
 		if err != nil {
 			// No stage-0 entry. Correct only when the gate observed the path
 			// gone; otherwise the add did not stage what the gate approved.
@@ -472,9 +566,16 @@ func verifyStagedMatchesObserved(ctx context.Context, repoDir string,
 			return reasonStagedContentChanged,
 				fmt.Sprintf("%s: staged entry present for a path the gate observed deleted", path)
 		}
-		if !bytes.Equal(staged, want.Bytes) {
+		expected, err := gitOutStdin(ctx, repoDir, want.Bytes, "hash-object", "--path="+path, "--stdin")
+		if err != nil {
 			return reasonStagedContentChanged,
-				fmt.Sprintf("%s: staged %d bytes, gate approved %d bytes", path, len(staged), len(want.Bytes))
+				fmt.Sprintf("%s: hash gate-observed bytes: %s", path, err.Error())
+		}
+		if staged != expected {
+			return reasonStagedContentChanged, fmt.Sprintf(
+				"%s: staged blob %s is not the expected post-clean blob %s of the %d gate-approved bytes (attributes: %s)",
+				path, staged, expected, len(want.Bytes),
+				conflictresolve.AttributeNamesFor(base.Attributes, path))
 		}
 	}
 	return "", ""
@@ -702,6 +803,15 @@ func captureConflictBaseline(ctx context.Context, repoDir, head string, conflict
 	}
 	base.Config = cfg
 
+	// Same fail-closed discipline as the config read: an empty attribute stream
+	// would compare unequal to every observation (or, worse, mask a later
+	// change), so a read failure RETURNS as conflict_resolution_baseline_capture_failed.
+	attrs, err := readConflictedAttributesFn(ctx, repoDir, sortedStringKeys(conflicted))
+	if err != nil {
+		return base, err
+	}
+	base.Attributes = attrs
+
 	unmergedRaw, err := gitOutRaw(ctx, repoDir, "ls-files", "--unmerged", "-z")
 	if err != nil {
 		return base, fmt.Errorf("read unmerged entries: %w", err)
@@ -887,6 +997,15 @@ func observeConflictState(ctx context.Context, repoDir string, base conflictreso
 		return obs, err
 	}
 	obs.Config = cfg
+
+	// Re-read the conflicted set's effective attributes over the SAME sorted
+	// path list the baseline captured, so the gate compares like for like. A
+	// read failure RETURNS (surfacing as conflict_resolution_observe_failed).
+	attrs, err := readConflictedAttributesFn(ctx, repoDir, sortedStringKeys(base.Conflicted))
+	if err != nil {
+		return obs, err
+	}
+	obs.Attributes = attrs
 
 	obs.Working = map[string]conflictresolve.FileState{}
 	for path := range base.Conflicted {

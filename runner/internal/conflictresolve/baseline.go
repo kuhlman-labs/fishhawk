@@ -67,6 +67,25 @@ const (
 	// covered on the push side (gitops.PushCommittedBranch's destination
 	// guard), not here.
 	ReasonRepoConfigChanged Reason = "conflict_resolution_repo_config_changed"
+	// ReasonAttributesChanged — the EFFECTIVE gitattributes for the conflicted
+	// set moved while the pass was running.
+	//
+	// The conflicted set's attributes are a gate input for the same reason the
+	// configuration is: `git add` applies whatever eol/text/ident/filter
+	// transformation the path's attributes name, so a `.gitattributes` edit (a
+	// working-tree file, `.git/info/attributes`, or `$HOME/.config/git/attributes`)
+	// changes the bytes that get staged without touching either the working tree
+	// or the config. Capturing the effective attributes alongside the config and
+	// refusing ANY change closes the in-pass filter/eol vector — including a
+	// driver bound by a path the enumeration never named — without listing one.
+	//
+	// Read the residual honestly, exactly as ReasonRepoConfigChanged states it:
+	// this control sees attributes the agent CHANGES, never a driver that was
+	// ALREADY in place when the pass began. A prior-stage agent with that access
+	// could already mangle its own implement commit through the same filter, so
+	// the pass gains no new exposure; the pre-existing case is what step 7a's
+	// staged-blob comparison (against the expected post-clean form) covers.
+	ReasonAttributesChanged Reason = "conflict_resolution_attributes_changed"
 )
 
 // ConflictKind is how git presented one conflicted path.
@@ -129,6 +148,12 @@ type Baseline struct {
 	// the same key is a semantic change, and sorting before comparison would
 	// hide it.
 	Config string
+	// Attributes is the raw `git check-attr -z --all -- <conflicted paths>`
+	// stream captured with the rest of the baseline. Stored VERBATIM (like
+	// Config) so any change to the effective eol/text/ident/filter assignment
+	// for a conflicted path is caught byte-for-byte. Framing is git's
+	// `<path>\0<attr>\0<value>\0` triplet (verified with od).
+	Attributes string
 }
 
 // Observed is the same shape read back after the agent, plus the status sets the
@@ -145,6 +170,9 @@ type Observed struct {
 	Working      map[string]FileState
 	// Config is the same raw stream re-read after the agent. See Baseline.Config.
 	Config string
+	// Attributes is the same raw stream re-read after the agent. See
+	// Baseline.Attributes.
+	Attributes string
 }
 
 // Violation is one broken rule. Path is empty for the repository-level rules.
@@ -203,6 +231,9 @@ func Verify(base Baseline, obs Observed) []Violation {
 	}
 	if obs.Config != base.Config {
 		add(ReasonRepoConfigChanged, "", configChangeDetail(base.Config, obs.Config))
+	}
+	if obs.Attributes != base.Attributes {
+		add(ReasonAttributesChanged, "", attributeChangeDetail(base.Attributes, obs.Attributes))
 	}
 
 	for path, want := range base.Index {
@@ -438,4 +469,144 @@ func configChangeDetail(base, obs string) string {
 	return "the effective git configuration changed: " + strconv.Itoa(len(keys)) +
 		" key(s) " + strings.Join(keys, ", ") +
 		" (redacted to section and final component; values are never reported)"
+}
+
+// ConfigChangeDetail is the exported form of the config-change detail. The
+// runner's post-add re-verification (step 7a) renders which input moved through
+// this ONE parser rather than growing a second one for the same stream.
+func ConfigChangeDetail(base, obs string) string { return configChangeDetail(base, obs) }
+
+// attrRecord is one `git check-attr -z --all` triplet: the path, one attribute
+// name, and the attribute's effective value.
+type attrRecord struct {
+	path  string
+	attr  string
+	value string
+}
+
+// parseAttrStream splits a `git check-attr -z --all` stream into triplets.
+//
+// The FRAMING is git's, not a guess: `-z` emits `<path>\0<attr>\0<value>\0`
+// (verified with od(1); git-check-attr(1) -z). EVERY field boundary is taken
+// from the NUL framing — never whitespace, never a newline — because an
+// attribute VALUE is arbitrary text: a value carrying a space or a newline
+// would split into a bogus extra field under any non-NUL parse, which is the
+// exact #3338 root cause this discipline exists to avoid. A trailing PARTIAL
+// triplet (a truncated stream) is tolerated and dropped rather than panicking.
+func parseAttrStream(s string) []attrRecord {
+	if s == "" {
+		return nil
+	}
+	fields := strings.Split(s, "\x00")
+	// A well-formed stream ends with a NUL, so the final field is empty.
+	if len(fields) > 0 && fields[len(fields)-1] == "" {
+		fields = fields[:len(fields)-1]
+	}
+	out := make([]attrRecord, 0, len(fields)/3)
+	for i := 0; i+3 <= len(fields); i += 3 {
+		out = append(out, attrRecord{path: fields[i], attr: fields[i+1], value: fields[i+2]})
+	}
+	return out
+}
+
+// attrValuesByPath groups a parsed attribute stream into path -> {attr: value}.
+func attrValuesByPath(recs []attrRecord) map[string]map[string]string {
+	m := map[string]map[string]string{}
+	for _, r := range recs {
+		if m[r.path] == nil {
+			m[r.path] = map[string]string{}
+		}
+		m[r.path][r.attr] = r.value
+	}
+	return m
+}
+
+// differingAttrNames returns the sorted set of attribute NAMES whose assignment
+// differs between two per-path attribute maps — added, removed, or value-changed.
+// NAMES only: a value never leaves this comparison.
+func differingAttrNames(base, obs map[string]string) []string {
+	differs := map[string]bool{}
+	for name, bv := range base {
+		if ov, ok := obs[name]; !ok || ov != bv {
+			differs[name] = true
+		}
+	}
+	for name := range obs {
+		if _, ok := base[name]; !ok {
+			differs[name] = true
+		}
+	}
+	out := make([]string, 0, len(differs))
+	for name := range differs {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// attributeChangeDetail renders the ReasonAttributesChanged violation detail:
+// per path whose effective attributes moved, the attribute NAMES that differ.
+//
+// NAMES ONLY, never a value. git restricts an attribute name to alphanumerics,
+// `-`, `_` and `.` (gitattributes(5)), so a name cannot carry a URL or a
+// credential; an attribute VALUE is agent-writable arbitrary text and is never
+// rendered. The constant fallback mirrors configChangeDetail: report the change
+// rather than swallow it when no per-path difference resolves.
+func attributeChangeDetail(base, obs string) string {
+	baseByPath := attrValuesByPath(parseAttrStream(base))
+	obsByPath := attrValuesByPath(parseAttrStream(obs))
+
+	seen := map[string]bool{}
+	var paths []string
+	for p := range baseByPath {
+		if !seen[p] {
+			seen[p], paths = true, append(paths, p)
+		}
+	}
+	for p := range obsByPath {
+		if !seen[p] {
+			seen[p], paths = true, append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+
+	var parts []string
+	for _, p := range paths {
+		names := differingAttrNames(baseByPath[p], obsByPath[p])
+		if len(names) == 0 {
+			continue
+		}
+		parts = append(parts, p+": "+strings.Join(names, ", "))
+	}
+	if len(parts) == 0 {
+		return "the effective git attributes changed (no per-path difference resolved)"
+	}
+	return "the effective git attributes changed: " + strings.Join(parts, "; ") +
+		" (attribute names only; values are never reported)"
+}
+
+// AttributeChangeDetail is the exported form of the attribute-change detail, so
+// the runner's post-add re-verification (step 7a) reuses this ONE parser.
+func AttributeChangeDetail(base, obs string) string { return attributeChangeDetail(base, obs) }
+
+// AttributeNamesFor returns the sorted, comma-joined NAMES of the effective
+// attributes the raw `git check-attr -z --all` stream records for path, or the
+// literal "none" when the path carries no attribute.
+//
+// NAMES only — a value is never rendered (it is agent-writable arbitrary text),
+// which is why the staged-content refusal detail can carry this string safely.
+// An attribute name is restricted by git to alphanumerics, `-`, `_` and `.`
+// (gitattributes(5)), so it cannot carry a URL or a credential.
+func AttributeNamesFor(attrs, path string) string {
+	var names []string
+	for _, r := range parseAttrStream(attrs) {
+		if r.path == path {
+			names = append(names, r.attr)
+		}
+	}
+	if len(names) == 0 {
+		return "none"
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }

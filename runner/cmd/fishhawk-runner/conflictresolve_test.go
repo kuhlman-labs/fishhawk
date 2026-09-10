@@ -1047,21 +1047,17 @@ func TestConflictResolutionPass_RefusesRewrittenCommitMessage(t *testing.T) {
 	crAssertRestored(t, repo, head)
 }
 
-// TestConflictResolutionPass_RefusesFilterMangledStagedContent is the vector
-// the hook deny-list CANNOT close: a content filter is named by config
-// (`filter.<driver>.clean`), so there is no fixed key to neutralize. The agent
-// resolves the hunk exactly as the gate requires and configures a clean filter
-// that transforms the bytes as `git add` stages them, so the index would hold
-// content the gate never approved.
+// TestConflictResolutionPass_RefusesFilterMangledStagedContent pins the in-pass
+// filter/attribute vector. The filter DRIVER is configured before the pass (so
+// it is baseline config, not a config change), and the agent binds it to the
+// conflicted path by writing `.git/info/attributes` — a file outside the working
+// tree the gate observes. That binding CHANGES the conflicted path's effective
+// attributes, which the attributes gate (#3339) catches at step 6, BEFORE the
+// add, with its own named reason. Catching the attribute change is the earlier,
+// more precise refusal than the staged-content check that would otherwise fire.
 //
-// Nothing here uses a seam: the filter is real repository state and git runs it.
-//
-// The filter DRIVER is configured before the pass starts and only the
-// `.git/info/attributes` binding is written by the agent. Writing the config
-// key from inside the agent would now trip the config-change gate (#3338) and
-// this test would measure THAT control instead of the staged-content check it
-// exists for — a pre-existing poisoned config is also the realistic shape,
-// since it is precisely what capture-and-compare cannot see.
+// Nothing here uses a seam: the filter and the attribute binding are real
+// repository state and git runs them.
 func TestConflictResolutionPass_RefusesFilterMangledStagedContent(t *testing.T) {
 	repo, head := crRepo(t)
 	crGit(t, repo, "config", "filter.mangle.clean", "sed s/ours/owned/")
@@ -1076,8 +1072,14 @@ func TestConflictResolutionPass_RefusesFilterMangledStagedContent(t *testing.T) 
 			return nil
 		}, nil)
 
-	if res.Reason != reasonStagedContentChanged {
-		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonStagedContentChanged)
+	if res.Reason != string(conflictresolve.ReasonAttributesChanged) {
+		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, conflictresolve.ReasonAttributesChanged)
+	}
+	if !strings.Contains(res.Detail, "conflict.txt: filter") {
+		t.Errorf("detail does not name the changed attribute: %q", res.Detail)
+	}
+	if strings.Contains(res.Detail, "mangle") {
+		t.Errorf("detail leaked the attribute VALUE: %q", res.Detail)
 	}
 	if got := crGitOut(t, repo, "rev-parse", "HEAD"); got != head {
 		t.Errorf("HEAD = %s, want the pre-merge tip %s", got, head)
@@ -1089,6 +1091,30 @@ func TestConflictResolutionPass_RefusesFilterMangledStagedContent(t *testing.T) 
 	// this test measures recovery rather than the filter.
 	if err := os.Remove(filepath.Join(repo, ".git", "info", "attributes")); err != nil {
 		t.Fatal(err)
+	}
+	crGit(t, repo, "config", "--unset", "filter.mangle.clean")
+	crAssertRestored(t, repo, head)
+}
+
+// TestConflictResolutionPass_RefusesWorkingTreeAttributeEdit is the sibling
+// vector: instead of `.git/info/attributes`, the agent edits the COMMITTED,
+// tracked working-tree `.gitattributes` to bind the pre-configured filter to the
+// conflicted path. That edit changes the effective attributes AND is itself an
+// out-of-set unstaged change, so `conflict_resolution_attributes_changed` is
+// among the violations (it sorts first, being repository-level).
+func TestConflictResolutionPass_RefusesWorkingTreeAttributeEdit(t *testing.T) {
+	repo, head := crRepoWithAttributes(t, "conflict.txt eol=lf\n")
+	crGit(t, repo, "config", "filter.mangle.clean", "sed s/ours/owned/")
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error {
+			crWrite(t, repo, "conflict.txt", "ours\n")
+			crWrite(t, repo, ".gitattributes", "conflict.txt eol=lf filter=mangle\n")
+			return nil
+		}, nil)
+
+	if !crViolationsContain(res, conflictresolve.ReasonAttributesChanged) {
+		t.Fatalf("violations = %+v, want one naming %q", res.Violations, conflictresolve.ReasonAttributesChanged)
 	}
 	crGit(t, repo, "config", "--unset", "filter.mangle.clean")
 	crAssertRestored(t, repo, head)
@@ -1182,6 +1208,11 @@ func TestConflictResolutionPass_ConfigReadFailures(t *testing.T) {
 	}{
 		{"baseline_side", 1, reasonBaselineCaptureFailed},
 		{"observe_side", 2, reasonObserveFailed},
+		// The THIRD config read is step 7a's post-add re-verification: a failure
+		// there is fail-closed as conflict_resolution_staged_content_changed,
+		// because an unreadable config after the add cannot prove the transform
+		// git applied is the one the gate decided on.
+		{"post_add_side", 3, reasonStagedContentChanged},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1253,5 +1284,289 @@ func TestNormalizeCommitMessageFirstByteRule(t *testing.T) {
 	}
 	if normalizeCommitMessage(base) != normalizeCommitMessage(base+"# a real comment\n") {
 		t.Error("an unindented comment line was NOT stripped")
+	}
+}
+
+// --- the conflicted set's effective attributes as a gate input (#3339) ---
+
+// crRepoWithAttributes is crRepo whose INITIAL commit also carries a
+// `.gitattributes` binding, inherited by both branches. It is the fixture for
+// the honest-transformation accept cases (a committed `text eol=crlf` makes
+// `git add` legitimately clean CRLF→LF) and the staged-content detail contract.
+func crRepoWithAttributes(t *testing.T, gitattributes string) (string, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	crGit(t, repo, "init", "--initial-branch=main")
+	crGit(t, repo, "config", "user.name", "test")
+	crGit(t, repo, "config", "user.email", "test@example.com")
+	crWrite(t, repo, ".gitattributes", gitattributes)
+	crWrite(t, repo, "conflict.txt", "base\n")
+	crWrite(t, repo, "quiet.txt", "untouched\n")
+	crGit(t, repo, "add", "-A")
+	crGit(t, repo, "commit", "-m", "initial")
+
+	crGit(t, repo, "checkout", "-b", "feature")
+	crWrite(t, repo, "conflict.txt", "ours\n")
+	crGit(t, repo, "commit", "-am", "ours")
+
+	crGit(t, repo, "checkout", "main")
+	crWrite(t, repo, "conflict.txt", "theirs\n")
+	crWrite(t, repo, "cleanly-advanced.txt", "new on base\n")
+	crGit(t, repo, "add", "-A")
+	crGit(t, repo, "commit", "-m", "theirs")
+
+	crGit(t, repo, "checkout", "feature")
+	return repo, crGitOut(t, repo, "rev-parse", "HEAD")
+}
+
+// crGitOutBytes runs git and returns raw, UNTRIMMED stdout — needed to assert on
+// a blob whose exact trailing newline is the point (crGitOut trims it away).
+func crGitOutBytes(t *testing.T, dir string, args ...string) []byte {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+	}
+	return out
+}
+
+// crHashObject computes the OID `git add` would produce for content at path,
+// with the path's own attributes applied — the by-construction expected value
+// for the staged-content detail contract.
+func crHashObject(t *testing.T, repo, path, content string) string {
+	t.Helper()
+	cmd := exec.Command("git", "hash-object", "--path="+path, "--stdin")
+	cmd.Dir = repo
+	cmd.Stdin = strings.NewReader(content)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git hash-object: %v", err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// crViolationsContain reports whether the refusal carried a violation with the
+// given reason.
+func crViolationsContain(res conflictResolutionResult, reason conflictresolve.Reason) bool {
+	for _, v := range res.Violations {
+		if v.Reason == reason {
+			return true
+		}
+	}
+	return false
+}
+
+// TestConflictResolutionPass_AcceptsAttributeResolution is the DONE-MEANS test
+// (RED under the pre-change raw-bytes comparison): an honest resolution in a
+// repository whose committed `.gitattributes` legitimately transforms bytes on
+// `git add` is ACCEPTED, because step 7a compares the staged blob against the
+// EXPECTED POST-CLEAN form of the gate-observed bytes rather than their raw
+// bytes. Each row asserts the committed blob is the LF-normalized `ours\n`.
+//
+// The `text=auto` row: if it reddens the divergence is a REFUSE (fail-closed),
+// which is a result to investigate, NEVER grounds to loosen the comparison
+// (operator instruction).
+func TestConflictResolutionPass_AcceptsAttributeResolution(t *testing.T) {
+	cases := []struct{ name, attr, agentBytes string }{
+		{"text_eol_crlf", "conflict.txt text eol=crlf\n", "ours\r\n"},
+		{"text_auto", "conflict.txt text=auto\n", "ours\r\n"},
+		{"eol_lf", "conflict.txt eol=lf\n", "ours\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, head := crRepoWithAttributes(t, tc.attr)
+			res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+				func(context.Context) error { crWrite(t, repo, "conflict.txt", tc.agentBytes); return nil }, nil)
+
+			if res.refused() {
+				t.Fatalf("honest attribute resolution refused — fail-closed direction, investigate, do NOT loosen: %s (%s)",
+					res.Reason, res.Detail)
+			}
+			if blob := crGitOutBytes(t, repo, "cat-file", "blob", "HEAD:conflict.txt"); string(blob) != "ours\n" {
+				t.Errorf("committed blob = %q, want the LF-normalized %q", blob, "ours\n")
+			}
+		})
+	}
+}
+
+// TestConflictResolutionPass_AcceptsAutocrlfResolution is the config-driven
+// sibling: `core.autocrlf=true` set BEFORE the pass (so it is baseline config)
+// makes `git add` clean the agent's CRLF to LF, and the post-clean comparison
+// accepts it.
+func TestConflictResolutionPass_AcceptsAutocrlfResolution(t *testing.T) {
+	repo, head := crRepo(t)
+	crGit(t, repo, "config", "core.autocrlf", "true")
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { crWrite(t, repo, "conflict.txt", "ours\r\n"); return nil }, nil)
+
+	if res.refused() {
+		t.Fatalf("autocrlf resolution refused: %s (%s)", res.Reason, res.Detail)
+	}
+	if blob := crGitOutBytes(t, repo, "cat-file", "blob", "HEAD:conflict.txt"); string(blob) != "ours\n" {
+		t.Errorf("committed blob = %q, want the LF-normalized %q", blob, "ours\n")
+	}
+}
+
+// TestConflictResolutionPass_RefusesAttributeChangeBetweenGateAndAdd pins step
+// 7a part (i)'s attribute half: the gate passes, then the conflictCommitHook
+// binds the pre-configured filter driver via `.git/info/attributes` between the
+// gate and the `git add`. The post-add attribute re-read detects the drift and
+// refuses conflict_resolution_staged_content_changed, naming attributes as the
+// moved input.
+func TestConflictResolutionPass_RefusesAttributeChangeBetweenGateAndAdd(t *testing.T) {
+	repo, head := crRepo(t)
+	crGit(t, repo, "config", "filter.mangle.clean", "sed s/ours/owned/")
+	orig := conflictCommitHook
+	t.Cleanup(func() { conflictCommitHook = orig })
+	conflictCommitHook = func(repoDir string) {
+		_ = os.WriteFile(filepath.Join(repoDir, ".git", "info", "attributes"),
+			[]byte("conflict.txt filter=mangle\n"), 0o644)
+	}
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { crWrite(t, repo, "conflict.txt", "ours\n"); return nil }, nil)
+
+	if res.Reason != reasonStagedContentChanged {
+		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonStagedContentChanged)
+	}
+	if !strings.Contains(res.Detail, "attributes changed between the gate and the add") {
+		t.Errorf("detail does not name ATTRIBUTES as the moved input: %q", res.Detail)
+	}
+	_ = os.Remove(filepath.Join(repo, ".git", "info", "attributes"))
+	crGit(t, repo, "config", "--unset", "filter.mangle.clean")
+	crAssertRestored(t, repo, head)
+}
+
+// TestConflictResolutionPass_RefusesConfigChangeBetweenGateAndAdd pins step 7a
+// part (i)'s CONFIG half — the half the attribute sibling cannot cover (operator
+// binding condition). A SUCCESSFUL config read returning CHANGED content between
+// the gate and the add (distinct from the config-READ-FAILURE case) is refused
+// conflict_resolution_staged_content_changed, naming config as the moved input.
+func TestConflictResolutionPass_RefusesConfigChangeBetweenGateAndAdd(t *testing.T) {
+	repo, head := crRepo(t)
+	orig := conflictCommitHook
+	t.Cleanup(func() { conflictCommitHook = orig })
+	conflictCommitHook = func(repoDir string) {
+		cmd := exec.Command("git", "config", "fishhawk.probe", "1")
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git config: %v\n%s", err, out)
+		}
+	}
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { crWrite(t, repo, "conflict.txt", "ours\n"); return nil }, nil)
+
+	if res.Reason != reasonStagedContentChanged {
+		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonStagedContentChanged)
+	}
+	if !strings.Contains(res.Detail, "configuration changed between the gate and the add") {
+		t.Errorf("detail does not name CONFIG as the moved input: %q", res.Detail)
+	}
+	crAssertRestored(t, repo, head)
+}
+
+// TestConflictResolutionPass_RefusesContentChangeBetweenGateAndAdd pins step 7a
+// part (ii) AND the staged-content detail contract. The fixture commits
+// `.gitattributes` binding `text eol=crlf` (an honest transform) plus a custom
+// `marker` attribute whose VALUE is secret-shaped but legal (gitattributes(5)).
+// The agent resolves correctly (CRLF), the conflictCommitHook rewrites the file
+// to the OTHER side between the gate and the add, and the refusal detail must
+// carry the path, BOTH blob OIDs (computed by construction) and the attribute
+// NAMES — never the planted value.
+func TestConflictResolutionPass_RefusesContentChangeBetweenGateAndAdd(t *testing.T) {
+	repo, head := crRepoWithAttributes(t, "conflict.txt text eol=crlf marker=hunter2-SECRET-VALUE\n")
+	orig := conflictCommitHook
+	t.Cleanup(func() { conflictCommitHook = orig })
+	conflictCommitHook = func(repoDir string) {
+		crWrite(t, repoDir, "conflict.txt", "theirs\r\n")
+	}
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { crWrite(t, repo, "conflict.txt", "ours\r\n"); return nil }, nil)
+
+	if res.Reason != reasonStagedContentChanged {
+		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonStagedContentChanged)
+	}
+	wantExpected := crHashObject(t, repo, "conflict.txt", "ours\r\n")
+	wantStaged := crHashObject(t, repo, "conflict.txt", "theirs\r\n")
+	if wantExpected == wantStaged {
+		t.Fatalf("fixture is not discriminating: both OIDs are %s", wantStaged)
+	}
+	for _, want := range []string{"conflict.txt", wantStaged, wantExpected, "text", "eol", "marker"} {
+		if !strings.Contains(res.Detail, want) {
+			t.Errorf("detail missing %q: %q", want, res.Detail)
+		}
+	}
+	for _, leak := range []string{"hunter2-SECRET-VALUE", "crlf"} {
+		if strings.Contains(res.Detail, leak) {
+			t.Errorf("detail leaked attribute VALUE %q: %q", leak, res.Detail)
+		}
+	}
+	crAssertRestored(t, repo, head)
+}
+
+// TestConflictResolutionPass_ContentChangeDetailNamesNoneWithoutAttributes is
+// the sibling asserting the `(attributes: none)` fallback on a repository with
+// no `.gitattributes`.
+func TestConflictResolutionPass_ContentChangeDetailNamesNoneWithoutAttributes(t *testing.T) {
+	repo, head := crRepo(t)
+	orig := conflictCommitHook
+	t.Cleanup(func() { conflictCommitHook = orig })
+	conflictCommitHook = func(repoDir string) { crWrite(t, repoDir, "conflict.txt", "theirs\n") }
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { crWrite(t, repo, "conflict.txt", "ours\n"); return nil }, nil)
+
+	if res.Reason != reasonStagedContentChanged {
+		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonStagedContentChanged)
+	}
+	if !strings.Contains(res.Detail, "(attributes: none)") {
+		t.Errorf("detail does not render the none fallback: %q", res.Detail)
+	}
+	crAssertRestored(t, repo, head)
+}
+
+// TestConflictResolutionPass_AttributeReadFailures pins all three attribute
+// reads' own fail-closed returns via the seam, each surfacing as its OWN named
+// reason: baseline capture, observe, and the step-7a post-add re-read.
+func TestConflictResolutionPass_AttributeReadFailures(t *testing.T) {
+	cases := []struct {
+		name     string
+		failCall int // 1 = baseline, 2 = observe, 3 = post-add re-read
+		reason   string
+	}{
+		{"baseline_side", 1, reasonBaselineCaptureFailed},
+		{"observe_side", 2, reasonObserveFailed},
+		{"post_add_side", 3, reasonStagedContentChanged},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, head := crRepo(t)
+			orig := readConflictedAttributesFn
+			t.Cleanup(func() { readConflictedAttributesFn = orig })
+			calls := 0
+			readConflictedAttributesFn = func(ctx context.Context, repoDir string, paths []string) (string, error) {
+				calls++
+				if calls == tc.failCall {
+					return "", errors.New("read git attributes: simulated failure")
+				}
+				return orig(ctx, repoDir, paths)
+			}
+
+			res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+				crResolve(t, repo), nil)
+
+			if res.Reason != tc.reason {
+				t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, tc.reason)
+			}
+			crAssertRestored(t, repo, head)
+		})
 	}
 }
