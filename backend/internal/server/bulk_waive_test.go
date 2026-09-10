@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // bulkWaiveServer wires the audit + concern fakes the bulk handler needs.
@@ -234,6 +236,60 @@ func TestBulkWaive_DuplicateID_Refused(t *testing.T) {
 	assertConcernStates(t, cr, map[uuid.UUID]concern.State{a.ID: concern.StateRaised})
 	if n := len(auditEntriesByCategory(au, CategoryConcernWaived)); n != 0 {
 		t.Errorf("concern_waived entries = %d, want 0 (the duplicate must not waive twice)", n)
+	}
+}
+
+// TestBulkWaive_DuplicateUUIDSpelling_Refused hardens the test above past a
+// byte-identical repeat. uuid.Parse accepts SEVERAL spellings of one id, so a
+// raw-string duplicate check would pass a batch naming the same concern twice
+// in two spellings and then append TWO concern_waived rows for it — the second
+// failing its transition mid-batch AFTER the first already committed. Each
+// case pairs one spelling with an EQUIVALENT one (never with a different
+// concern), so the refusal can only come from the equivalence check itself,
+// and state is read back after the call because the control's real effect is
+// that NOTHING was waived.
+func TestBulkWaive_DuplicateUUIDSpelling_Refused(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		alias func(uuid.UUID) string
+	}{
+		{"uppercase", func(id uuid.UUID) string { return strings.ToUpper(id.String()) }},
+		{"urn_prefix", func(id uuid.UUID) string { return "urn:uuid:" + id.String() }},
+		{"braced", func(id uuid.UUID) string { return "{" + id.String() + "}" }},
+		{"dashless_hex", func(id uuid.UUID) string { return strings.ReplaceAll(id.String(), "-", "") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au, cr := bulkWaiveServer(t)
+			runID := uuid.New()
+			a := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "a")
+			spelling := tc.alias(a.ID)
+			if spelling == a.ID.String() {
+				t.Fatalf("alias %q is byte-identical to the canonical form; the case proves nothing", spelling)
+			}
+
+			w := postBulkWaive(t, s, runID.String(), bulkWaiveRequest{
+				ConcernIDs: []string{a.ID.String(), spelling}, Reason: "r",
+			})
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 on an equivalent UUID spelling:\n%s", w.Code, w.Body.String())
+			}
+			code, details := bulkWaiveErrorEnvelope(t, w)
+			if code != "validation_failed" {
+				t.Errorf("error code = %q, want validation_failed", code)
+			}
+			if details["concern_id"] != spelling {
+				t.Errorf("details.concern_id = %v, want the raw spelling %q", details["concern_id"], spelling)
+			}
+			if details["canonical_concern_id"] != a.ID.String() {
+				t.Errorf("details.canonical_concern_id = %v, want %s", details["canonical_concern_id"], a.ID)
+			}
+			// The refusal must land BEFORE any audit append, so the concern is
+			// still open and no row was written.
+			assertConcernStates(t, cr, map[uuid.UUID]concern.State{a.ID: concern.StateRaised})
+			if n := len(auditEntriesByCategory(au, CategoryConcernWaived)); n != 0 {
+				t.Errorf("concern_waived entries = %d, want 0 (the refusal precedes every append)", n)
+			}
+		})
 	}
 }
 
@@ -479,6 +535,74 @@ func TestBulkWaive_Delegated_NotConfigured(t *testing.T) {
 	})
 	if n := len(auditEntriesByCategory(au, CategoryConcernWaived)); n != 0 {
 		t.Errorf("concern_waived entries = %d, want 0 (the delegation check precedes every append)", n)
+	}
+}
+
+// TestBulkWaive_Delegated_SoloLowMet_StampsRuleOnEveryRow drives the delegated
+// SUCCESS arm the refusal test above cannot reach: checkDelegation RESOLVES,
+// and the returned rule must be stamped as the `delegated` key on EVERY
+// concern_waived row the batch appends (applyConcernWaive writes it when
+// delegatedRule != ""). The single-waive tests pin the stamping code itself;
+// what is unwitnessed without this test is the BULK path's wiring of the
+// once-per-run rule into the per-item apply loop.
+//
+// The batch is ONE concern by CONSTRUCTION, not by convenience: may_waive's
+// only condition is solo_low, which requires the run to have EXACTLY ONE open
+// concern and that concern to be low severity (delegation.evalSoloLow). A
+// two-item delegated batch is therefore unsatisfiable by definition, so the
+// assertion loops over every appended row and also pins the row COUNT — if a
+// future condition makes a wider delegated batch reachable, the loop already
+// covers it rather than silently checking only the first row.
+func TestBulkWaive_Delegated_SoloLowMet_StampsRuleOnEveryRow(t *testing.T) {
+	repo := newApprovalRunRepo()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		RunRepo:     repo,
+		AuditRepo:   au,
+		ConcernRepo: cr,
+	})
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedLowConcernRow(t, cr, runID, stageID)
+	repo.seedRun(&run.Run{
+		ID:           runID,
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: []byte(delegatedActionSpecYAML),
+	})
+
+	w := postBulkWaive(t, s, runID.String(), bulkWaiveRequest{
+		ConcernIDs: []string{row.ID.String()}, Reason: "style nit, not blocking", Delegated: true,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 on a satisfied solo_low delegation:\n%s", w.Code, w.Body.String())
+	}
+	resp := decodeBulkWaive(t, w)
+	if resp.Waived != 1 || resp.Failed != 0 {
+		t.Errorf("waived/failed = %d/%d, want 1/0: %+v", resp.Waived, resp.Failed, resp)
+	}
+	assertConcernStates(t, cr, map[uuid.UUID]concern.State{row.ID: concern.StateWaived})
+
+	idx := auditEntriesByCategory(au, CategoryConcernWaived)
+	if len(idx) != 1 {
+		t.Fatalf("concern_waived entries = %d, want 1 (solo_low admits exactly one open concern)", len(idx))
+	}
+	for _, i := range idx {
+		var payload map[string]any
+		if err := json.Unmarshal(au.appended[i].Payload, &payload); err != nil {
+			t.Fatalf("decode concern_waived payload: %v", err)
+		}
+		// Presence and value asserted separately: an absent `delegated` key and
+		// a present empty string both read as "" through a `v, _ :=` assertion,
+		// and an absent key is exactly the regression this test exists to catch.
+		raw, present := payload["delegated"]
+		if !present {
+			t.Fatalf("concern_waived payload carries NO delegated key; the once-per-run rule was not stamped: %v", payload)
+		}
+		if raw != "solo_low" {
+			t.Errorf("delegated = %#v, want %q", raw, "solo_low")
+		}
 	}
 }
 

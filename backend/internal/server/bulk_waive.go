@@ -74,8 +74,9 @@ type bulkWaiveResponse struct {
 //
 //   - PRE-VALIDATION is ALL-OR-NOTHING and mutates NOTHING. The first violation
 //     wins and names the offending id: blank reason, empty list, over-cap,
-//     duplicate id, non-UUID id, unwired store, unknown id, an id belonging to
-//     ANOTHER run, or an id not in an OPEN state.
+//     non-UUID id, duplicate id (compared on the PARSED uuid, so two spellings
+//     of one id collide), unwired store, unknown id, an id belonging to ANOTHER
+//     run, or an id not in an OPEN state.
 //   - the APPLY loop is PER-ITEM. The batch is deliberately NOT a database
 //     transaction: each concern carries its own audit row, and wrapping N chained
 //     audit appends plus N transitions in one transaction would either serialize
@@ -155,16 +156,17 @@ func (s *Server) handleBulkWaiveConcerns(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	seen := make(map[string]struct{}, len(reqBody.ConcernIDs))
+	// Parse FIRST, then dedupe on the PARSED uuid rather than the raw string.
+	// uuid.Parse accepts several spellings of one id — case-insensitive hex,
+	// the `urn:uuid:` prefix, brace-wrapped, and the dash-less 32-hex form —
+	// so a raw-string compare would let two spellings of the SAME concern
+	// through pre-validation and append TWO concern_waived rows for it, the
+	// second failing its transition mid-batch after the first already
+	// committed. The refusal names the raw spelling the client sent AND the
+	// canonical id it collided on, so the alias is visible in the error.
+	seen := make(map[uuid.UUID]string, len(reqBody.ConcernIDs))
 	parsed := make([]uuid.UUID, 0, len(reqBody.ConcernIDs))
 	for _, raw := range reqBody.ConcernIDs {
-		if _, dup := seen[raw]; dup {
-			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"concern_ids contains a duplicate id",
-				map[string]any{"field": "concern_ids", "concern_id": raw})
-			return
-		}
-		seen[raw] = struct{}{}
 		cid, perr := uuid.Parse(raw)
 		if perr != nil {
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
@@ -172,6 +174,18 @@ func (s *Server) handleBulkWaiveConcerns(w http.ResponseWriter, r *http.Request)
 				map[string]any{"field": "concern_ids", "concern_id": raw})
 			return
 		}
+		if first, dup := seen[cid]; dup {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"concern_ids contains a duplicate id",
+				map[string]any{
+					"field":                "concern_ids",
+					"concern_id":           raw,
+					"canonical_concern_id": cid.String(),
+					"first_spelling":       first,
+				})
+			return
+		}
+		seen[cid] = raw
 		parsed = append(parsed, cid)
 	}
 

@@ -15106,8 +15106,12 @@ paths:
           description: |
             Body's `error` is `validation_failed` for: a malformed body or
             non-UUID `run_id`; a blank `reason`; an empty `concern_ids`; more
-            than 50 ids (`details` carries `count` and `max`); a duplicate id; a
-            non-UUID id; or an id belonging to ANOTHER run — the last carrying
+            than 50 ids (`details` carries `count` and `max`); a non-UUID id; a
+            duplicate id — compared on the PARSED uuid, not the raw string, so
+            two spellings of one id (case-insensitive hex, `urn:uuid:`, braces,
+            dash-less 32-hex) collide, with `details` carrying `concern_id` (the
+            raw spelling sent), `canonical_concern_id` and `first_spelling`; or
+            an id belonging to ANOTHER run — the last carrying
             `details.rule` `concern_run_mismatch` alongside `concern_id`,
             `concern_run_id` and `path_run_id`. Every one refuses the whole batch
             with NOTHING waived.

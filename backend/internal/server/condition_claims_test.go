@@ -501,8 +501,20 @@ func TestExpandAllOpenPlanConcernClaims_EmptyExpansionIsLegal(t *testing.T) {
 	if payload["claims_all_open_plan_concerns"] != true {
 		t.Errorf("claims_all_open_plan_concerns = %v, want true (the intent survives an empty expansion)", payload["claims_all_open_plan_concerns"])
 	}
-	if n, _ := payload["claims_all_open_plan_concerns_expanded"].(float64); int(n) != 0 {
-		t.Errorf("claims_all_open_plan_concerns_expanded = %v, want 0", payload["claims_all_open_plan_concerns_expanded"])
+	// Assert PRESENCE separately from VALUE. A `v, _ := m[k].(float64)`
+	// collapses an ABSENT key onto the same zero as a present numeric 0, so
+	// the promised explicit zero-count evidence would stay unpinned if the
+	// key were dropped entirely.
+	rawExpanded, present := payload["claims_all_open_plan_concerns_expanded"]
+	if !present {
+		t.Fatalf("claims_all_open_plan_concerns_expanded is ABSENT; the explicit zero count is the evidence this test exists to pin: %v", payload)
+	}
+	n, isNumber := rawExpanded.(float64)
+	if !isNumber {
+		t.Fatalf("claims_all_open_plan_concerns_expanded = %#v, want a JSON number", rawExpanded)
+	}
+	if int(n) != 0 {
+		t.Errorf("claims_all_open_plan_concerns_expanded = %v, want 0", rawExpanded)
 	}
 }
 
