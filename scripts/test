@@ -1244,9 +1244,26 @@ _verify_site_ia() {
 # Re-reading immediately before the unlink only narrows that window; the marker
 # closes it. Holding the marker the pruner RE-READS the lock and only removes a
 # still-dead holder; if a live holder appeared it falls through to the normal
-# live-holder path. The marker gets the same dead-owner recovery the lock has, so
-# a pruner killed mid-prune cannot wedge later invocations, and it is released by
-# the same EXIT trap, only when this invocation created it.
+# live-holder path. The marker is released by the same EXIT trap, only when this
+# invocation created it.
+#
+# The marker's OWN dead-owner recovery is exclusive too (_verify_lock_recover_
+# marker): a claim at <lockpath>.prune.reap.<victim>, content-addressed by the
+# observed dead owner, and a removal CONDITIONAL on the marker still naming that
+# owner. An unprotected read/kill/rm there would be the identical defect one
+# level up — two recoverers, the loser deleting the winner's fresh live marker,
+# both then pruning the lock. A claim is never broken, so a recoverer killed
+# while holding one wedges recovery of that one marker; the restart budget turns
+# that into a loud refusal naming the paths to remove, which is a residual an
+# operator can clear rather than a mutual exclusion that is merely narrow.
+#
+# The runner's EXPIRY displacement is conditional in the same sense
+# (_verify_lock_steal): the lock is taken by an atomic `mv` to a private path and
+# the entry actually taken is READ. Anything other than the holder the budget was
+# spent on is put back and the displacement refused, so the decision stays valid
+# THROUGH the unlink rather than only at classification time — a shell holder
+# that releases into a fresh RUNNER holder in that window is met by the normal
+# live-runner refusal instead of being deleted.
 #
 # RESIDUAL, stated: `kill -0 <pid>` succeeding does not prove the pid is the
 # ORIGINAL holder — a reused pid reads as live. That is the identical residual
@@ -1365,6 +1382,140 @@ _verify_lock_try_acquire() {
   return 0
 }
 
+# _verify_lock_recover_marker <markerpath> <observed-owner>: recover a prune
+# marker left behind by a pruner that died holding it — WITHOUT the unlink race
+# the marker itself exists to close.
+#
+# The naive form (read the owner, `kill -0` it, `rm`) is the SAME defect one
+# level up: two recoverers can both observe the same dead owner, A removes the
+# marker and plants its own, and B — still acting on the classification it took
+# BEFORE A ran — deletes A's FRESH LIVE marker. Both then believe they are the
+# sole pruner and both prune the lock, which is exactly the double-prune this
+# marker was introduced to prevent.
+#
+# The observed owner is therefore an ARGUMENT, not something re-read here: the
+# staleness is the hazard, so it is modelled explicitly and the removal is made
+# both EXCLUSIVE and CONDITIONAL.
+#
+#   * The right to reap a marker owned by <victim> is claimed by an atomic
+#     symlink at <marker>.reap.<victim>. The claim is CONTENT-ADDRESSED by the
+#     victim, so two recoverers acting on the same observation cannot both hold
+#     it, and one acting on a DIFFERENT observation is not competing for the
+#     same removal at all.
+#   * Holding the claim, the marker is RE-READ and removed ONLY if it still
+#     names <victim>. A fresh marker planted by whoever got there first names a
+#     different pid and is left strictly alone.
+#
+# Nothing is created at <marker> here. The caller restarts classification and
+# competes for the marker with the same atomic `ln -s` every other invocation
+# uses, so a successful recovery confers no ownership. It returns 0 ONLY when it
+# actually removed the marker it was asked about, and 1 for every back-off — a
+# live owner, a claim held by another recoverer, or a marker that has since
+# changed hands.
+#
+# This function NEVER breaks a claim it finds, not even one whose owner is dead:
+# breaking a claim would reintroduce the identical race one level deeper, and
+# each further level could only ever narrow the window rather than close it. The
+# terminating alternative is stated honestly instead. A claim leaked by a
+# recoverer SIGKILLed inside the microseconds it holds one wedges recovery of
+# that ONE dead marker; the acquisition loop's restart budget converts that into
+# a loud refusal naming the paths to remove. A wedge an operator can clear in
+# one `rm` beats a mutual exclusion that is merely narrow.
+_verify_lock_recover_marker() {
+  local marker="$1" victim="$2" claim self cur rc
+  self="$(_verify_lock_self_pid)"
+  case "$victim" in
+    ''|*[!0-9]*)
+      # No pid to identify a live pruner with: a GARBAGE marker (a dir-form
+      # leftover, or a target that names no pid). It still goes through an
+      # exclusive claim, so two recoverers cannot both act on it.
+      claim="$marker.reap.garbage"
+      ;;
+    *)
+      if kill -0 "$victim" 2>/dev/null; then
+        return 1  # a LIVE pruner holds it: there is nothing to recover
+      fi
+      claim="$marker.reap.$victim"
+      ;;
+  esac
+  if ! { ln -s "$self" "$claim" 2>/dev/null && [ "$(readlink "$claim" 2>/dev/null)" = "$self" ]; }; then
+    return 1
+  fi
+  cur="$(readlink "$marker" 2>/dev/null || true)"
+  rc=1
+  if [ "$cur" = "$victim" ]; then
+    rm -rf "$marker" 2>/dev/null || true
+    rc=0
+  fi
+  rm -f "$claim" 2>/dev/null || true
+  return "$rc"
+}
+
+# _verify_lock_steal <lockpath> <victim-target> <target>: the runner's
+# wait-expiry displacement, made valid THROUGH the removal rather than only at
+# classification time.
+#
+# The unconditional `rm -f "$lock"` this replaces decided on a classification
+# and acted on it afterwards. Between the two, the wedged shell holder can
+# release and a DIFFERENT invocation — including a RUNNER one — can acquire; the
+# rm would then delete a fresh lock this loop never classified, producing exactly
+# the two concurrent runner verifies the live-runner branch exists to refuse.
+#
+# `rm` cannot be made conditional, but `mv` can be made EXCLUSIVE: renaming the
+# lock to a private path is atomic, so of two invocations racing to displace the
+# same entry exactly one succeeds — and the winner can then READ what it actually
+# took. Taking anything other than the holder the budget was spent on is a
+# MIS-TAKE: the entry is put back with a non-clobbering `ln -s` and this
+# invocation REFUSES, so the caller restarts classification and meets the new
+# holder through the normal branches. A displacement is only ever completed
+# against the holder that was actually waited on.
+#
+# The prune marker is held across the whole sequence, so a concurrent PRUNER
+# (which also removes the lock) is excluded while the rename excludes a
+# concurrent STEALER.
+#
+# RESIDUAL, stated rather than claimed closed: the restore is `ln -s`, which
+# refuses to clobber. If a THIRD invocation acquired the freed path between the
+# mis-take and the restore, the mis-taken holder's entry is gone and it becomes a
+# phantom holder. That needs two separate acquisitions inside the same
+# microseconds, and this invocation still refuses — but it is a window, not a
+# guarantee. The alternative, a clobbering `mv` restore, would delete the third
+# invocation's live lock instead, which is strictly worse.
+#
+# Returns 0 when this invocation displaced the victim AND now holds the lock,
+# 2 when it displaced the victim but LOST the race to re-acquire (the caller
+# must never displace twice), and 1 when no displacement was performed at all.
+_verify_lock_steal() {
+  local lock="$1" victim="$2" target="$3" marker self taken moved rc=1
+  self="$(_verify_lock_self_pid)"
+  marker="$lock.prune"
+  if ! { ln -s "$self" "$marker" 2>/dev/null && [ "$(readlink "$marker" 2>/dev/null)" = "$self" ]; }; then
+    _verify_lock_recover_marker "$marker" "$(readlink "$marker" 2>/dev/null || true)" || true
+    return 1
+  fi
+  VERIFY_PRUNE_MARKER="$marker"
+  trap "$EXIT_TRAP" EXIT
+  taken="$lock.stolen.$self"
+  rm -rf "$taken" 2>/dev/null || true
+  if mv "$lock" "$taken" 2>/dev/null; then
+    moved="$(readlink "$taken" 2>/dev/null || true)"
+    if [ "$moved" = "$victim" ]; then
+      rm -rf "$taken" 2>/dev/null || true
+      if _verify_lock_try_acquire "$lock" "$target"; then rc=0; else rc=2; fi
+    else
+      # MIS-TAKE: the entry we took is not the holder we waited on. Put it back
+      # without clobbering anything that landed meanwhile, and refuse.
+      if [ -n "$moved" ]; then
+        ln -s "$moved" "$lock" 2>/dev/null || true
+      fi
+      rm -rf "$taken" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$marker" 2>/dev/null || true
+  VERIFY_PRUNE_MARKER=""
+  return "$rc"
+}
+
 # _verify_lock_prune_and_acquire <lockpath> <target>: prune a dead/garbage holder
 # under the exclusive prune marker. Returns 0 only when this invocation now HOLDS
 # the lock; returns 1 for every other outcome, and the caller then RESTARTS
@@ -1374,14 +1525,11 @@ _verify_lock_prune_and_acquire() {
   marker="$lock.prune"
   self="$(_verify_lock_self_pid)"
   if ! { ln -s "$self" "$marker" 2>/dev/null && [ "$(readlink "$marker" 2>/dev/null)" = "$self" ]; }; then
-    # Another invocation is already pruning. Give the marker the same dead-owner
-    # recovery the lock has so a pruner killed mid-prune cannot wedge every later
-    # invocation, then back off and restart classification from the top.
+    # Another invocation is already pruning. Recover the marker if its owner
+    # died holding it — EXCLUSIVELY, see _verify_lock_recover_marker — then back
+    # off and restart classification from the top.
     mowner="$(readlink "$marker" 2>/dev/null || true)"
-    case "$mowner" in
-      ''|*[!0-9]*) rm -rf "$marker" 2>/dev/null || true ;;
-      *) if ! kill -0 "$mowner" 2>/dev/null; then rm -f "$marker" 2>/dev/null || true; fi ;;
-    esac
+    _verify_lock_recover_marker "$marker" "$mowner" || true
     return 1
   fi
   VERIFY_PRUNE_MARKER="$marker"
@@ -1404,12 +1552,20 @@ _verify_lock_prune_and_acquire() {
   return "$rc"
 }
 
+# The one refusal both restart budgets print. It names the recovery-claim paths
+# because the only way this is reached repeatedly is a recoverer SIGKILLed while
+# holding one — the stated, operator-clearable residual of
+# _verify_lock_recover_marker's refusal to break a claim it did not create.
+VERIFY_LOCK_UNSETTLED_MSG='scripts/test: the verify lock never settled — refusing rather than proceeding under an uncertain lock state.
+If this repeats, a pruner was killed holding a recovery claim: inspect and remove
+<git-common-dir>/fishhawk-verify.lock.prune and its .reap.* siblings by hand.'
+
 # _acquire_verify_lock_at <lockpath>: the acquisition loop. Returns 0 when this
 # invocation may proceed (it holds the lock), 1 when it must REFUSE. Split from
 # _acquire_verify_lock so the harness can drive every branch in-process against a
 # fixture lock path with an injected self pid.
 _acquire_verify_lock_at() {
-  local lock="$1" kind target self cls holder budget poll waited=0 announced=0 stole=0 restarts=0
+  local lock="$1" kind target self cls holder budget poll steal_rc waited=0 announced=0 stole=0 restarts=0
   self="$(_verify_lock_self_pid)"
   kind="$(_verify_lock_kind)"
   target="$self:$kind"
@@ -1425,7 +1581,7 @@ _acquire_verify_lock_at() {
       free|dead|garbage)
         restarts=$((restarts + 1))
         if [ "$restarts" -gt 100 ]; then
-          echo "scripts/test: the verify lock at $lock kept changing hands — refusing rather than proceeding under an uncertain lock state" >&2
+          echo "$VERIFY_LOCK_UNSETTLED_MSG" >&2
           return 1
         fi
         if [ "$cls" = "free" ]; then
@@ -1460,9 +1616,27 @@ EOF
             echo "scripts/test: the verify lock at $lock was retaken after a displacement — refusing rather than displacing twice" >&2
             return 1
           fi
-          echo "scripts/test: WARNING: displacing a wedged shell verify holding $lock (deposed pid ${holder:-unknown}) after ${budget}s — two verifies may now contend on golangci-lint's global lock and the shared testcontainers Postgres." >&2
-          stole=1
-          rm -f "$lock" 2>/dev/null || true
+          # Conditional displacement: the decision must still be VALID at the
+          # unlink, not merely at the classification. _verify_lock_steal
+          # completes only against this exact holder.
+          steal_rc=0
+          _verify_lock_steal "$lock" "$holder:shell" "$target" || steal_rc=$?
+          case "$steal_rc" in
+            0)
+              echo "scripts/test: WARNING: displacing a wedged shell verify holding $lock (deposed pid ${holder:-unknown}) after ${budget}s — two verifies may now contend on golangci-lint's global lock and the shared testcontainers Postgres." >&2
+              return 0
+              ;;
+            2)
+              # The victim was displaced but another invocation won the free
+              # lock. Never displace twice: the next expiry refuses.
+              stole=1
+              ;;
+          esac
+          restarts=$((restarts + 1))
+          if [ "$restarts" -gt 100 ]; then
+            echo "$VERIFY_LOCK_UNSETTLED_MSG" >&2
+            return 1
+          fi
           continue
         fi
         if [ "$announced" -eq 0 ]; then

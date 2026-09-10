@@ -33,7 +33,9 @@ import (
 // TestRunnerEnvDrivesRealScriptsTestVerify runs the REAL `scripts/test verify`
 // with an environment built by CALLING the builders below (the executable pin
 // that binds the VALUE ENCODING — the half a name pin structurally cannot
-// cover).
+// cover). That executable pin carries a MULTI-PACKAGE arm on purpose: a
+// one-element join emits the same bytes under any separator, so only a two-
+// package set can bind verifyPackagesSeparator at all.
 const (
 	// verifyPackagesEnvVar is the scoped-verify package-set variable
 	// `scripts/test` reads as its `--packages` fallback.

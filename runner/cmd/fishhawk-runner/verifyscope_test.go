@@ -362,6 +362,69 @@ func TestRunnerEnvDrivesRealScriptsTestVerify(t *testing.T) {
 		t.Errorf("scoped verify named a package outside the derived set: %q", scoped[0])
 	}
 
+	// --- MULTI-PACKAGE SCOPED arm ------------------------------------------
+	// The singleton arm above cannot exercise verifyPackagesSeparator at all: a
+	// one-element join emits the same bytes under any separator, so changing the
+	// production joiner would leave that arm's input unchanged and green. This
+	// arm derives TWO distinct packages through the production mapper and asserts
+	// on the package arguments the SHELL actually ran, which is the only place a
+	// separator disagreement can show up. A joiner that is not the comma
+	// `_verify_scope_buckets` splits on presents the pair as ONE mangled entry,
+	// and the recorded argv then names neither package.
+	multiPkgs := verifyScopePackages([]string{
+		"backend/internal/alpha/a.go",
+		"backend/internal/beta/b.go",
+		"docs/ARCHITECTURE.md",
+	})
+	wantMulti := []string{"backend/internal/alpha", "backend/internal/beta"}
+	if !reflect.DeepEqual(multiPkgs, wantMulti) {
+		t.Fatalf("verifyScopePackages = %q, want %q", multiPkgs, wantMulti)
+	}
+	multiEnv := verifyScopeEnv(verifyLockOwnerEnv(base), multiPkgs)
+	multiValue := ""
+	for _, kv := range multiEnv {
+		if v, ok := strings.CutPrefix(kv, verifyPackagesEnvVar+"="); ok {
+			multiValue = v
+		}
+	}
+	// Asserted so a joiner change is visible HERE as well as in the argv below,
+	// and so the two assertions cannot both be satisfied by an encoding the shell
+	// does not split.
+	if !strings.Contains(multiValue, verifyPackagesSeparator) {
+		t.Fatalf("the two-package env value %q does not carry the separator at all", multiValue)
+	}
+
+	multi := runVerify(t, multiEnv)
+	if len(multi) != 1 {
+		t.Fatalf("two packages in ONE module recorded %d `go test` invocations, want exactly 1: %q", len(multi), multi)
+	}
+	mod, argv, _ := strings.Cut(multi[0], "\t")
+	if mod != "backend" {
+		t.Errorf("multi-package verify ran `go test` in module %q, want backend: %q", mod, multi[0])
+	}
+	// Field-exact, not substring: a mangled single entry such as
+	// "./internal/alpha:backend/internal/beta" CONTAINS both package names, so a
+	// substring check would stay green under the very separator change this arm
+	// exists to catch.
+	gotPkgs := map[string]bool{}
+	for _, f := range strings.Fields(argv) {
+		if strings.HasPrefix(f, "./") {
+			gotPkgs[f] = true
+		}
+	}
+	for _, want := range []string{"./internal/alpha", "./internal/beta"} {
+		if !gotPkgs[want] {
+			t.Errorf("multi-package verify did not pass %q as its own package argument (env %q, argv %q)",
+				want, multiValue, argv)
+		}
+	}
+	if len(gotPkgs) != 2 {
+		t.Errorf("multi-package verify passed %d package arguments, want exactly 2: %q", len(gotPkgs), argv)
+	}
+	if gotPkgs["./..."] {
+		t.Errorf("multi-package verify widened to the whole-module pattern: %q", argv)
+	}
+
 	// --- UNSCOPED arm ------------------------------------------------------
 	// The FINAL authoritative invocation's environment, built by the SAME
 	// production builders with an EMPTY set. Asserting the ABSENCE is the point:

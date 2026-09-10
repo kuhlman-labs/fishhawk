@@ -475,7 +475,7 @@ Semantics, by the kind of the invocation MEETING a live holder:
 |---|---|
 | SHELL meets any live holder | **Refuse immediately.** Non-zero, no sleep, no poll, and an actionable message naming `scripts/test single -run TestX ./your/package/...`. |
 | RUNNER meets a live SHELL holder | **Wait**, bounded by **600 seconds** at a **2-second** poll, announcing the wait once. Most holders finish inside that and the runner then acquires with no concurrency at all. |
-| RUNNER meets a live SHELL holder, budget EXPIRED | **Displace**, with a loud one-line warning naming the deposed pid and stating that two verifies may now contend. The wedged-holder escape hatch, not the normal path. It displaces at most once per invocation. |
+| RUNNER meets a live SHELL holder, budget EXPIRED | **Displace**, with a loud one-line warning naming the deposed pid and stating that two verifies may now contend. The wedged-holder escape hatch, not the normal path. It displaces at most once per invocation, and only against the holder it actually waited on — see "The displacement stays valid through the unlink". |
 | RUNNER meets a live RUNNER holder | Wait on the same budget, then **refuse** naming both pids. Two concurrent runner verifies on one worktree family is a bug to surface, not one to paper over by stealing. |
 
 **Do not poll a refusal.** It is a fast failure, not a queue — retrying it in a
@@ -507,10 +507,69 @@ if it still names a dead (or garbage) holder; if a live holder appeared it leave
 it alone and the caller falls through to the normal live-holder path. A
 successful prune confers NOTHING on its own: `_verify_lock_prune_and_acquire`
 returns 0 only when it actually acquired, and every other outcome sends the
-caller back to re-classify from the top. The marker gets the same dead-owner
-recovery the lock has, so a pruner killed mid-prune cannot wedge later
-invocations, and it is released by the same EXIT trap, only when this invocation
-created it.
+caller back to re-classify from the top. The marker is released by the same EXIT
+trap, only when this invocation created it.
+
+#### Recovering the marker is exclusive too
+
+A pruner killed mid-prune must not wedge every later invocation, so a marker
+whose owner is dead is recoverable. Recovering it by the naive read/`kill -0`/`rm`
+would be the IDENTICAL defect one level up: two recoverers both observe the dead
+owner, A removes the marker and plants its own, and B — acting on the
+classification it took BEFORE A ran — deletes A's FRESH LIVE marker, after which
+both prune the lock.
+
+`_verify_lock_recover_marker` therefore takes the observed owner as an ARGUMENT
+(the staleness is the hazard, so it is modelled rather than papered over by a
+fresh read) and makes the removal both exclusive and conditional:
+
+- the right to reap a marker owned by `<victim>` is claimed by an atomic symlink
+  at `<lockpath>.prune.reap.<victim>` — CONTENT-ADDRESSED by the victim, so two
+  recoverers acting on the same observation cannot both hold it;
+- holding the claim, the marker is RE-READ and removed **only** if it still names
+  `<victim>`. A fresh marker planted by whoever got there first names a different
+  pid and is left strictly alone.
+
+It creates nothing at `<lockpath>.prune`: the caller restarts classification and
+competes for the marker with the same atomic `ln -s` everyone else uses, and the
+function returns 0 only when it actually removed the marker it was asked about.
+
+**Residual, stated:** a claim is NEVER broken, not even one whose owner is dead —
+breaking a claim would reintroduce the same race one level deeper, and each
+further level could only narrow the window, never close it. So a recoverer
+SIGKILLed inside the microseconds it holds a claim wedges recovery of that ONE
+dead marker. The acquisition loop's restart budget turns that into a loud refusal
+naming `<lockpath>.prune` and its `.reap.*` siblings to remove by hand. A wedge
+an operator can clear with one `rm` is a better trade than a mutual exclusion
+that is merely narrow.
+
+### The displacement stays valid through the unlink
+
+The runner's expiry displacement has the same shape of hazard: the decision is
+made at classification and acted on afterwards. An unconditional `rm -f "$lock"`
+would delete whatever is at the path — and in that window the wedged shell holder
+can release and a DIFFERENT invocation, including a RUNNER one, can acquire.
+Removing that fresh lock produces exactly the two concurrent runner verifies the
+live-runner row above exists to refuse.
+
+`rm` cannot be made conditional, but `mv` can be made EXCLUSIVE. `_verify_lock_steal`
+holds the prune marker (excluding a concurrent pruner, which also removes the
+lock), renames the lock to a private `<lockpath>.stolen.<pid>` — one atomic
+`rename(2)`, so of two invocations racing to displace the same entry exactly one
+succeeds — and then READS what it actually took. Anything other than the
+`<pid>:shell` target the budget was spent on is a MIS-TAKE: the entry is put back
+with a non-clobbering `ln -s` and the displacement is REFUSED, sending the caller
+back to re-classify and meet the new holder through the normal branches. It
+returns 0 when it displaced and acquired, 2 when it displaced but lost the free
+lock to someone else (which arms the never-displace-twice refusal), and 1 when no
+displacement happened at all.
+
+**Residual, stated:** the restore is a non-clobbering `ln -s`. If a THIRD
+invocation acquired the freed path between the mis-take and the restore, the
+mis-taken holder's entry is gone and it becomes a phantom holder. That needs two
+separate acquisitions inside the same microseconds and this invocation still
+refuses, but it is a window rather than a guarantee — a clobbering `mv` restore
+would delete the third invocation's live lock instead, which is strictly worse.
 
 **Residual, stated:** `kill -0 <pid>` succeeding does not prove the pid is the
 ORIGINAL holder — a reused pid reads as live. That is the identical residual the
@@ -553,8 +612,18 @@ no Go toolchain) is wired into `_verify_gate_harnesses`, so a regression fails
   and — the STRUCTURAL proof of promptness, never an elapsed-time bound — zero
   recorded `sleep` calls; the dead-holder prune; the prune RACE driven exactly as
   written above, with B's classification taken BEFORE A's acquire and exactly one
-  proceeding; the live and dead prune-marker branches; runner-waits-then-acquires
-  for both holder kinds; runner-displaces-a-shell on expiry; runner-REFUSES-a-
+  proceeding; the live and dead prune-marker branches; the MARKER-recovery race
+  (`b3d`–`b3g`), where the second recoverer's observation is passed IN as an
+  argument so the helper cannot re-read its way to the right answer — which is
+  what distinguishes serialisation from sequential re-reading — paired with the
+  same-victim back-off, an uncontested positive control so those two pin
+  exclusivity rather than a recovery that never fires, and an end-to-end run of
+  the whole interleaving asserting exactly one holder remains; runner-waits-then-
+  acquires for both holder kinds; runner-displaces-a-shell on expiry; the
+  displacement under HOLDER TURNOVER (`b5b`), where the classified shell holder
+  has been replaced by a RUNNER one before the unlink and the fresh runner lock
+  must survive, with its positive control (`b5c`) and the live-pruner back-off
+  (`b5d`); runner-REFUSES-a-
   runner on expiry, asserted on lock STATE and not only on the message; all three
   no-locking degrades as separate cases; a real `git worktree add` proving a
   linked worktree resolves the SAME lock path (which is what makes the control
