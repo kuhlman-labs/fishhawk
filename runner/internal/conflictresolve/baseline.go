@@ -3,6 +3,8 @@ package conflictresolve
 import (
 	"bytes"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // Baseline-side reasons. Each rule the gate can break earns its OWN named
@@ -48,6 +50,23 @@ const (
 	// ReasonDeleteModifyContent — a delete/modify resolution must be one side's
 	// full content or the deletion.
 	ReasonDeleteModifyContent Reason = "conflict_resolution_delete_modify_content"
+	// ReasonRepoConfigChanged — the EFFECTIVE git configuration moved while the
+	// pass was running.
+	//
+	// The whole configuration is the gate input, not a list of dangerous keys.
+	// The enumeration this replaces could only name the keys someone had
+	// already thought of (`url.<base>.insteadOf`, `url.<base>.pushInsteadOf`),
+	// and `url.<base>.*` alone is an unbounded namespace: the subsection is an
+	// arbitrary URL, so there is no finite key set to deny. Capturing the
+	// config alongside HEAD/MERGE_HEAD/MERGE_MSG and refusing ANY change during
+	// the pass closes every arbitrarily-named key, including ones git has not
+	// shipped yet, without naming one of them.
+	//
+	// Read the residual honestly: this control sees a config the agent CHANGES,
+	// never one that was ALREADY poisoned when the pass began. That gap is
+	// covered on the push side (gitops.PushCommittedBranch's destination
+	// guard), not here.
+	ReasonRepoConfigChanged Reason = "conflict_resolution_repo_config_changed"
 )
 
 // ConflictKind is how git presented one conflicted path.
@@ -104,6 +123,12 @@ type Baseline struct {
 	// already auto-staged in other files live here and are AUTHORIZED.
 	Index      map[string]IndexEntry
 	Conflicted map[string]ConflictedFile
+	// Config is the raw `git config --list -z` stream captured with the rest of
+	// the baseline. It is stored VERBATIM so ORDER is compared too: git resolves
+	// a single-valued key last-one-wins, so a pure reorder of two entries for
+	// the same key is a semantic change, and sorting before comparison would
+	// hide it.
+	Config string
 }
 
 // Observed is the same shape read back after the agent, plus the status sets the
@@ -118,6 +143,8 @@ type Observed struct {
 	Unstaged     []string
 	Untracked    []string
 	Working      map[string]FileState
+	// Config is the same raw stream re-read after the agent. See Baseline.Config.
+	Config string
 }
 
 // Violation is one broken rule. Path is empty for the repository-level rules.
@@ -173,6 +200,9 @@ func Verify(base Baseline, obs Observed) []Violation {
 	}
 	if obs.MergeMessage != base.MergeMessage {
 		add(ReasonMergeMessageChanged, "", "merge message rewritten")
+	}
+	if obs.Config != base.Config {
+		add(ReasonRepoConfigChanged, "", configChangeDetail(base.Config, obs.Config))
 	}
 
 	for path, want := range base.Index {
@@ -237,4 +267,168 @@ func Verify(base Baseline, obs Observed) []Violation {
 		return vs[i].Reason < vs[j].Reason
 	})
 	return vs
+}
+
+// redactedConfigPart is the fixed stand-in a redacted git-config key part is
+// replaced BY. It is a constant, never derived from the input, so nothing an
+// agent controls can reach an operator-visible detail through it.
+const redactedConfigPart = "<redacted>"
+
+// configRecord is one `git config --list -z` record: its key and whether it
+// carried a value at all.
+type configRecord struct {
+	key   string
+	value string
+}
+
+// parseConfigStream splits a `git config --list -z` stream into records.
+//
+// The FRAMING is git's, not a guess: `--list -z` emits `key\nvalue\0` — the
+// record is NUL-TERMINATED and the key/value separator INSIDE it is a NEWLINE,
+// not `=` (verified with od(1); git-config(1) --list / --null). A parser that
+// split records on NUL and then on `=` would treat the whole `key\nvalue` as
+// the key, so the detail documented as carrying key NAMES ONLY would in fact
+// carry the VALUES — the control meant to prevent credential disclosure would
+// be the thing disclosing them. A record with no newline is a VALUELESS key
+// (`git config --list` prints those bare); its whole text is the key.
+func parseConfigStream(s string) []configRecord {
+	if s == "" {
+		return nil
+	}
+	fields := strings.Split(s, "\x00")
+	// A well-formed stream ends with a NUL, so the final field is empty.
+	if len(fields) > 0 && fields[len(fields)-1] == "" {
+		fields = fields[:len(fields)-1]
+	}
+	out := make([]configRecord, 0, len(fields))
+	for _, f := range fields {
+		if nl := strings.IndexByte(f, '\n'); nl >= 0 {
+			out = append(out, configRecord{key: f[:nl], value: f[nl+1:]})
+			continue
+		}
+		out = append(out, configRecord{key: f})
+	}
+	return out
+}
+
+// redactConfigKey renders a git config key in the form an operator-visible
+// detail may carry: `<section>.<redacted>.<final>`.
+//
+// The redaction is POSITIVE — the middle is REPLACED by a constant rather than
+// filtered — because a key NAME can itself carry a credential. A git config key
+// is `section.key` or `section.<subsection>.key`, and the subsection may contain
+// any character except a newline (git-config(1)), so
+// `url.https://user:password@example.com/.insteadof` is a real, valid shape.
+// Section and final-component names are restricted to alphanumerics and `-`, so
+// emitting those two verbatim can never carry an embedded URL; replacing
+// everything between them means no arbitrary text reaches the detail at all.
+// A key with no dot has no safe part to emit, so it collapses to the placeholder.
+func redactConfigKey(key string) string {
+	first := strings.IndexByte(key, '.')
+	last := strings.LastIndexByte(key, '.')
+	if first < 0 {
+		return redactedConfigPart
+	}
+	section, final := key[:first], key[last+1:]
+	if first == last {
+		return section + "." + final
+	}
+	return section + "." + redactedConfigPart + "." + final
+}
+
+// configDiffKeys returns the sorted set of REDACTED key names that differ
+// between two `git config --list -z` streams — added, removed, value-changed,
+// or REORDERED relative to the other keys.
+//
+// Order is part of the comparison because git resolves a single-valued key
+// LAST-ONE-WINS: a reorder changes which value wins, so it cannot be compared
+// away by a set-equality check. It is compared in two SEMANTIC pieces rather
+// than as a raw record index, because a raw index is not a semantic property —
+// inserting ONE key shifts the index of every record after it, and an
+// index-keyed signature would then name every one of them as changed and bury
+// the real edit.
+//
+//   - Each key's ordered list of VALUES, which is what last-one-wins resolves
+//     over for that key.
+//   - The ordered sequence of keys RESTRICTED to those present on both sides,
+//     which catches a pure permutation of two entries while staying invariant
+//     to an insertion elsewhere in the stream.
+func configDiffKeys(base, obs string) []string {
+	differs := map[string]bool{}
+	mark := func(key string) { differs[redactConfigKey(key)] = true }
+
+	values := func(recs []configRecord) map[string][]string {
+		m := map[string][]string{}
+		for _, rec := range recs {
+			m[rec.key] = append(m[rec.key], rec.value)
+		}
+		return m
+	}
+	baseRecs, obsRecs := parseConfigStream(base), parseConfigStream(obs)
+	a, b := values(baseRecs), values(obsRecs)
+	for key, av := range a {
+		bv, ok := b[key]
+		if !ok || !equalStrings(av, bv) {
+			mark(key)
+		}
+	}
+	for key := range b {
+		if _, ok := a[key]; !ok {
+			mark(key)
+		}
+	}
+
+	common := func(recs []configRecord, other map[string][]string) []string {
+		var out []string
+		for _, rec := range recs {
+			if _, ok := other[rec.key]; ok {
+				out = append(out, rec.key)
+			}
+		}
+		return out
+	}
+	ax, bx := common(baseRecs, b), common(obsRecs, a)
+	if len(ax) == len(bx) {
+		for i := range ax {
+			if ax[i] != bx[i] {
+				mark(ax[i])
+				mark(bx[i])
+			}
+		}
+	}
+
+	out := make([]string, 0, len(differs))
+	for k := range differs {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// equalStrings reports whether two string slices are element-wise equal.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// configChangeDetail renders the ReasonRepoConfigChanged violation detail. It
+// carries redacted key names and a count — never a value, and never the middle
+// of a key.
+func configChangeDetail(base, obs string) string {
+	keys := configDiffKeys(base, obs)
+	if len(keys) == 0 {
+		// The raw streams differ but no key signature does — the framing itself
+		// moved. Report the change rather than swallowing it.
+		return "the effective git configuration changed (no key-level difference resolved)"
+	}
+	return "the effective git configuration changed: " + strconv.Itoa(len(keys)) +
+		" key(s) " + strings.Join(keys, ", ") +
+		" (redacted to section and final component; values are never reported)"
 }

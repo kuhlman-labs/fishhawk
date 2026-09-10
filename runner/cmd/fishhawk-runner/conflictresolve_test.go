@@ -1055,13 +1055,20 @@ func TestConflictResolutionPass_RefusesRewrittenCommitMessage(t *testing.T) {
 // content the gate never approved.
 //
 // Nothing here uses a seam: the filter is real repository state and git runs it.
+//
+// The filter DRIVER is configured before the pass starts and only the
+// `.git/info/attributes` binding is written by the agent. Writing the config
+// key from inside the agent would now trip the config-change gate (#3338) and
+// this test would measure THAT control instead of the staged-content check it
+// exists for — a pre-existing poisoned config is also the realistic shape,
+// since it is precisely what capture-and-compare cannot see.
 func TestConflictResolutionPass_RefusesFilterMangledStagedContent(t *testing.T) {
 	repo, head := crRepo(t)
+	crGit(t, repo, "config", "filter.mangle.clean", "sed s/ours/owned/")
 
 	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
 		func(context.Context) error {
 			crWrite(t, repo, "conflict.txt", "ours\n")
-			crGit(t, repo, "config", "filter.mangle.clean", "sed s/ours/owned/")
 			if err := os.WriteFile(filepath.Join(repo, ".git", "info", "attributes"),
 				[]byte("conflict.txt filter=mangle\n"), 0o644); err != nil {
 				t.Fatal(err)
@@ -1100,5 +1107,151 @@ func TestNormalizeCommitMessage(t *testing.T) {
 	}
 	if normalizeCommitMessage(mergeMsg) == normalizeCommitMessage("owned\n") {
 		t.Error("a rewritten body normalized equal to the merge message")
+	}
+}
+
+// --- the repository-config gate input (#3338) ---
+
+// crResolve is the agent stub that resolves the conflict CORRECTLY. Every
+// config-gate case below composes it, so the only difference from the accept
+// control (TestConflictResolutionPass_AcceptsResolvedHunk) is the config write
+// — which is what makes the refusal discriminating rather than blanket.
+func crResolve(t *testing.T, repo string) func(context.Context) error {
+	t.Helper()
+	return func(context.Context) error {
+		crWrite(t, repo, "conflict.txt", "ours\n")
+		return nil
+	}
+}
+
+// TestConflictResolutionPass_RefusesRepoConfigChange is the issue's case. The
+// agent resolves the hunk exactly as required AND sets a
+// `url.<decoy>.insteadOf` key that would silently redirect the runner's own
+// push. `.git/config` is outside the working tree the agent's contract confines
+// it to, so nothing else in the gate sees it.
+//
+// The second case writes an UNRELATED key: the control does not care WHICH key
+// moved, which is the whole point of capturing the configuration instead of
+// enumerating dangerous keys.
+func TestConflictResolutionPass_RefusesRepoConfigChange(t *testing.T) {
+	cases := []struct {
+		name  string
+		write func(t *testing.T, repo string)
+	}{
+		{"push_redirect_key", func(t *testing.T, repo string) {
+			crGit(t, repo, "config", "url.https://decoy.example/.insteadOf", "https://origin.example/")
+		}},
+		{"unrelated_key", func(t *testing.T, repo string) {
+			crGit(t, repo, "config", "fishhawk.probe", "1")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, head := crRepo(t)
+			resolve := crResolve(t, repo)
+			res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+				func(ctx context.Context) error {
+					if err := resolve(ctx); err != nil {
+						return err
+					}
+					tc.write(t, repo)
+					return nil
+				}, nil)
+
+			if res.Reason != string(conflictresolve.ReasonRepoConfigChanged) {
+				t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail,
+					conflictresolve.ReasonRepoConfigChanged)
+			}
+			// The refusal's effect is COMMITTED STATE: no merge commit may
+			// survive, and the repository must be back at the pre-merge tip.
+			crAssertRestored(t, repo, head)
+		})
+	}
+}
+
+// TestConflictResolutionPass_ConfigReadFailures pins BOTH config reads' own
+// fail-closed returns. Neither side may default to the empty string: an empty
+// baseline config compares unequal to every observation, and an empty observed
+// one would make a LATER change undetectable. Each surfaces as its OWN named
+// reason rather than being mis-attributed.
+func TestConflictResolutionPass_ConfigReadFailures(t *testing.T) {
+	cases := []struct {
+		name     string
+		failCall int // 1 = the baseline capture's read, 2 = the observation's
+		reason   string
+	}{
+		{"baseline_side", 1, reasonBaselineCaptureFailed},
+		{"observe_side", 2, reasonObserveFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, head := crRepo(t)
+			orig := readGitConfigFn
+			t.Cleanup(func() { readGitConfigFn = orig })
+			calls := 0
+			readGitConfigFn = func(ctx context.Context, repoDir string) (string, error) {
+				calls++
+				if calls == tc.failCall {
+					return "", errors.New("read git config: simulated failure")
+				}
+				return orig(ctx, repoDir)
+			}
+
+			res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+				crResolve(t, repo), nil)
+
+			if res.Reason != tc.reason {
+				t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, tc.reason)
+			}
+			crAssertRestored(t, repo, head)
+		})
+	}
+}
+
+// TestConflictResolutionPass_RefusesIndentedCommentLineRewrite is the done-means
+// test for narrowing normalizeCommitMessage to git's OWN first-byte comment
+// rule.
+//
+// The committed message differs from the gate's merge message by exactly one
+// INDENTED comment-like line. git treats that as ordinary message content (only
+// a line whose FIRST byte is the comment character is a comment), so it lands in
+// the recorded message — but the pre-change normalization trimmed leading
+// whitespace before the test and deleted it from BOTH sides, so the comparison
+// could not see it. This test is RED under that normalization, which is what
+// makes it a control rather than a restatement.
+func TestConflictResolutionPass_RefusesIndentedCommentLineRewrite(t *testing.T) {
+	repo, head := crRepo(t)
+	orig := conflictPostAddHook
+	t.Cleanup(func() { conflictPostAddHook = orig })
+	conflictPostAddHook = func(repoDir string) {
+		msgPath := filepath.Join(repoDir, ".git", "MERGE_MSG")
+		existing, err := os.ReadFile(msgPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(msgPath, append(existing, []byte("  # smuggled\n")...), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		crResolve(t, repo), nil)
+
+	if res.Reason != reasonCommittedMessageChanged {
+		t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonCommittedMessageChanged)
+	}
+	crAssertRestored(t, repo, head)
+}
+
+// TestNormalizeCommitMessageFirstByteRule pins the narrowing at the unit level
+// alongside the end-to-end case above: an indented comment-like line is CONTENT
+// (git's rule is the first byte), while an unindented one is a comment.
+func TestNormalizeCommitMessageFirstByteRule(t *testing.T) {
+	const base = "Merge branch 'main'\n"
+	if normalizeCommitMessage(base) == normalizeCommitMessage(base+"  # smuggled\n") {
+		t.Error("an INDENTED comment-like line was stripped — git treats it as message content")
+	}
+	if normalizeCommitMessage(base) != normalizeCommitMessage(base+"# a real comment\n") {
+		t.Error("an unindented comment line was NOT stripped")
 	}
 }

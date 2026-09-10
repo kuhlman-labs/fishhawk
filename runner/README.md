@@ -239,10 +239,13 @@ The pass's git sequence is ordered and every step is load-bearing:
 3. A merge that completes CLEANLY refuses `conflict_resolution_no_conflict`: the
    base advanced past the conflict, and the operator authorized a resolution,
    not an unreviewed clean merge.
-4. Capture the baseline in ONE read — HEAD, `MERGE_HEAD`, `MERGE_MSG`, every
-   NON-conflicted stage-0 index entry, and each conflicted path's kind, working
-   bytes, sides and **mode**. Clean base changes git auto-staged elsewhere are
-   part of the baseline and are AUTHORIZED.
+4. Capture the baseline in ONE read — HEAD, `MERGE_HEAD`, `MERGE_MSG`, the raw
+   `git config --list -z` stream, every NON-conflicted stage-0 index entry, and
+   each conflicted path's kind, working bytes, sides and **mode**. Clean base
+   changes git auto-staged elsewhere are part of the baseline and are
+   AUTHORIZED. The config is re-read in step 6 and ANY change refuses
+   `conflict_resolution_repo_config_changed`; both reads FAIL CLOSED rather than
+   defaulting to the empty string.
 5. Invoke the agent under a working-tree-edits-only contract.
 6. Read the state back and hand it to `runner/internal/conflictresolve`, which
    is the SOLE owner of the accept/refuse decision, one named reason per rule.
@@ -283,12 +286,87 @@ or a `core.fsmonitor` command that falsifies the very `git status` /
   between the working tree and the index. The pass therefore checks the result
   rather than trusting the inputs — steps 7 and 8 above.
 
-Residual, stated: only `PushCommittedBranch` (the conflict-resolution publish
-path) is hardened in `gitops`; the implement stage's own push and the shared
-`observeRemoteHead` keep their existing posture, which this change does not
-alter. And a pass whose repository still carries an agent-configured filter will
-see `git status --porcelain` report the worktree dirty during recovery and
-report `recovered=false` — conservative, and the fail-safe direction.
+`HardeningArgs` also pins `core.commentChar=#`. That key executes nothing, so it
+sits outside the deny-list's original "keys that run a command" charter; it is
+there because it changes how git PARSES the artifact the gate compares. Step 8
+compares the COMMITTED message against the merge message the gate approved and
+normalizes both by dropping comment lines, and without the pin that
+normalization is a guess about the repository's configuration. The
+normalization matches git's OWN rule — a comment is a line whose **first byte**
+is the comment character (git-commit(1) `--cleanup`), so an INDENTED
+comment-like line is ordinary message content and is compared, not deleted.
+
+### The two config-rewrite residuals, and what closes them ([#3338](https://github.com/kuhlman-labs/fishhawk/issues/3338))
+
+`url.<base>.insteadOf` and `url.<base>.pushInsteadOf` execute nothing — they
+silently rewrite where `git push` LANDS. A deny-list cannot reach them: the
+subsection is an arbitrary URL, so `url.<base>.*` is an unbounded namespace.
+Two layers answer that, and they cover DIFFERENT halves.
+
+- **In-pass config change.** The whole effective configuration is a gate input
+  (step 4). Any change during the pass refuses
+  `conflict_resolution_repo_config_changed`, whatever the key. `git config
+  --list` resolves `include.path` and merges the system, global, local and
+  worktree scopes, so this also covers an agent that writes `$HOME/.gitconfig`
+  or an included file rather than `.git/config`. The refusal detail carries
+  REDACTED key names only (`<section>.<redacted>.<final>`) and never a value —
+  a key name can itself carry a credential.
+- **Pre-push destination guard.** `gitops.PushCommittedBranch` runs
+  `verifyPushDestination` BEFORE any remote is contacted and before a token is
+  minted into an environment, because a redirect that is only REPORTED after
+  the write has already exfiltrated the branch. It is NOT "the `url.` namespace
+  is refused". It is two checks:
+  - **(a) an identity probe.** `git ls-remote --get-url <url>` is git's own URL
+    resolution applied to a command-line URL; the answer must equal the URL the
+    runner supplied. This is what covers `insteadOf` — a hostile key that
+    rewrote the destination changes the answer and is refused. A probe FAILURE
+    is itself a refusal: an unverifiable destination is not an approved one.
+  - **(b) a narrow refusal of `url.*.pushInsteadOf` ONLY.** `--get-url` applies
+    FETCH rewriting, so (a) structurally cannot see a pushInsteadOf redirect
+    (verified: with `url.X.pushInsteadOf=Y` set, `ls-remote --get-url Y` prints
+    Y unchanged). (b) covers exactly that gap.
+
+  **(b) is deliberately not the whole `url.` namespace.** This repository
+  carries a benign `url.https://github.com/.insteadOf = git@github.com:` in
+  LOCAL scope — it rewrites in the harmless direction, so the identity probe's
+  answer is unchanged and (a) passes on the merits. A whole-namespace refusal
+  would make the conflict-resolution pass permanently unusable in its own
+  development environment.
+
+**Residuals of the destination guard, stated:**
+
+- **A config already poisoned BEFORE the pass began is invisible to the
+  capture-and-compare layer.** Only the push guard sees it, and the push guard
+  covers the DESTINATION — not, say, a pre-existing `filter.<driver>.clean`,
+  which step 7's staged-bytes check covers instead.
+- **Check (b) is a key-PRESENCE refusal, so a BENIGN global `pushInsteadOf`
+  trips it.** The exact mode: the common fetch-over-HTTPS / push-over-SSH setup
+  is `url."git@github.com:".pushInsteadOf = https://github.com/` in
+  `~/.gitconfig`, and `git config --list` merges the global scope, so an
+  operator with that line gets EVERY conflict-resolution push refused with
+  `refusing to push — repository configuration carries a push-rewrite key`.
+  There is no identity-probe equivalent that could tell it apart from a hostile
+  one: `git remote get-url --push <name>` does not see a remote supplied only
+  via `-c remote.<name>.url=<url>` (verified: `error: No such remote`), and
+  registering a real remote would WRITE config, which the pass's own
+  config-change gate would then refuse. **How to tell:** run `git config
+  --show-origin --get-regexp '^url\..*\.pushinsteadof$'` — if the origin is
+  your `~/.gitconfig` and the key's pattern is one YOU set, this is the benign
+  mode. The workaround is to unset it for the duration of the run (or scope it
+  to a different config file the runner's repository does not inherit); there is
+  no override flag, because a flag that skips the check would be reachable by
+  the agent the check exists to bound.
+- **The comment-character pin makes the message normalization exact for git's
+  own comment rule, not for every cleanup mode.** A repository configuring
+  `commit.cleanup=whitespace` or `=verbatim` changes what git records; the
+  comparison stays symmetric but the stripping the runner does is tolerance for
+  `strip`, not a mirror of every mode.
+- **Only `PushCommittedBranch` (the conflict-resolution publish path) is
+  hardened in `gitops`;** the implement stage's own push and the shared
+  `observeRemoteHead` keep their existing posture, which this change does not
+  alter. And a pass whose repository still carries an agent-configured filter
+  will see `git status --porcelain` report the worktree dirty during recovery
+  and report `recovered=false` — conservative, and the fail-safe direction.
 
 Every path enumeration uses `-z` and splits on NUL — git only refrains from
 C-quoting a path under `-z`, and a newline inside a filename splits one path
@@ -324,6 +402,10 @@ prevent it — the refusal has to be reachable before the remote is contacted,
 which is what pinning the refspec source buys. The remote-tip confirmation stays
 for what pinning cannot cover: a concurrent writer or a server-side hook that
 rewrites the ref after the push is accepted.
+
+**Pinning the SOURCE is not pinning the DESTINATION.** The refspec pin fixes
+WHAT is published; `verifyPushDestination` (above) fixes WHERE, and it runs in
+the same pre-remote window for the same reason.
 
 
 ## Local invocation

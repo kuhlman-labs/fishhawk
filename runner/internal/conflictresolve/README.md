@@ -50,7 +50,7 @@ They partition into `before\n` and `<<<<<< HEAD\n`, so the candidate `before\n<<
 
 ### `baseline.go` — the captured values and the verdict
 
-`Baseline` is the snapshot captured in ONE read immediately after the merge stopped: `HeadSHA`, `MergeHeadSHA`, `MergeMessage`, the non-conflicted stage-0 `Index` (mode + OID per path), and `Conflicted` (per path: `Kind`, `MarkerBytes`, `Sides`, and `Mode`). **Clean base changes git already auto-staged in other files are part of the baseline and are AUTHORIZED.**
+`Baseline` is the snapshot captured in ONE read immediately after the merge stopped: `HeadSHA`, `MergeHeadSHA`, `MergeMessage`, the non-conflicted stage-0 `Index` (mode + OID per path), `Conflicted` (per path: `Kind`, `MarkerBytes`, `Sides`, and `Mode`), and `Config` — the raw `git config --list -z` stream. **Clean base changes git already auto-staged in other files are part of the baseline and are AUTHORIZED.**
 
 `Observed` is the same shape read back after the agent, plus `Unmerged` / `Unstaged` / `Untracked` and a `Working` `FileState` (present, mode, bytes) per conflicted path.
 
@@ -72,10 +72,23 @@ They partition into `before\n` and `<<<<<< HEAD\n`, so the candidate `before\n<<
 | `conflict_resolution_conflicted_mode_changed` | a mode flip on a conflicted path |
 | `conflict_resolution_binary_conflict` | refused: git leaves OURS on disk with no markers, so there is no hunk boundary |
 | `conflict_resolution_delete_modify_content` | a delete/modify resolution that is neither side's full content nor the deletion |
+| `conflict_resolution_repo_config_changed` | the EFFECTIVE git configuration moved while the pass was running |
 | `conflict_resolution_edit_outside_hunk` | the resolution does not preserve every non-conflict segment |
 | `conflict_resolution_residual_marker` | a marker line survives at a position a replacement reaches |
 | `conflict_resolution_malformed_markers` | the file cannot be partitioned, so nothing can be authorized |
 | `conflict_resolution_partition_undecidable` | the accept sweep exhausted its step budget |
+
+### The whole configuration is ONE gate input (#3338)
+
+`Config` carries the raw `git config --list -z` stream, and ANY change during the pass is `conflict_resolution_repo_config_changed`. It is not a list of dangerous keys, because there is no finite list to write: `url.<base>.insteadOf` and `url.<base>.pushInsteadOf` silently rewrite where the runner's own push LANDS, and their subsection is an arbitrary URL, so `url.<base>.*` is an unbounded namespace. Refusing on any change closes every arbitrarily-named key — including ones git has not shipped yet — without naming one of them, which is what the enumeration it replaces could never do.
+
+The stream is stored **verbatim, so ORDER is compared too**: git resolves a single-valued key last-one-wins, and a pure reorder of two entries for the same key changes which value wins.
+
+The violation **detail is redacted POSITIVELY**: each differing key is rendered `<section>.<redacted>.<final>`, with the middle REPLACED by a constant rather than filtered out. Key names alone are NOT sufficient redaction — the subsection of `url.<base>.insteadOf` is an arbitrary URL, so `url.https://user:password@example.com/.insteadof` is a real, valid shape and a key name can itself carry a credential. Section and final-component names are restricted to alphanumerics and `-`, so emitting exactly those two can never carry an embedded URL. Values are never reported at all. An operator diagnosing a refusal therefore has to read the repository's own config; that is the deliberate trade.
+
+Which keys are reported is computed SEMANTICALLY — each key's ordered value list, plus the ordered key sequence restricted to keys present on both sides — not from a raw record index. Inserting one key shifts the index of every record after it, and an index-keyed signature would name all of them and bury the real edit.
+
+**Residual, stated:** this control sees a config the agent CHANGES, never one that was ALREADY poisoned when the pass began. That gap is closed on the push side by `gitops.PushCommittedBranch`'s destination guard — see `runner/README.md`.
 
 Two rules are worth naming explicitly:
 
