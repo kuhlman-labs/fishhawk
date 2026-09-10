@@ -14,7 +14,11 @@
 // come from FISHHAWKD_GITLAB_* server env (secrets cannot live in a
 // checked-in repo config), wired in a sibling slice. A configurable base
 // URL is what lets one client cover both GitLab.com SaaS and self-managed
-// instances. The token is unexported and never logged.
+// instances. The token is unexported and never logged, and it never crosses
+// an origin boundary: net/http strips Authorization and Cookie on a
+// cross-host redirect but NOT a custom header, so every request is
+// dispatched through doNoOffOriginRedirect, which refuses a 3xx pointing
+// off-instance before the redirected request is sent.
 //
 // What's NOT in scope: a comprehensive GitLab SDK. We cover exactly the
 // small set of calls Fishhawk's flows map onto. The HTTP transport is
@@ -320,9 +324,79 @@ func (c *Client) LinkIssues(ctx context.Context, projectID, iid, targetIID int) 
 	return errForStatus("link issues", resp)
 }
 
+// sameOrigin refuses an absolute URL whose scheme or host differs from the
+// client's configured base URL — the guard that keeps every gitlabclient
+// request from carrying PRIVATE-TOKEN to a foreign host. what names the kind
+// of URL being refused ("next-page link", "redirect target") so a refusal
+// reports which boundary it came from.
+func (c *Client) sameOrigin(absURL, what string) error {
+	base, err := url.Parse(c.baseURL)
+	if err != nil {
+		return fmt.Errorf("gitlabclient: parse base url: %w", err)
+	}
+	u, err := url.Parse(absURL)
+	if err != nil {
+		return fmt.Errorf("gitlabclient: parse next-page url: %w", err)
+	}
+	if u.Scheme != base.Scheme || u.Host != base.Host {
+		return fmt.Errorf("gitlabclient: refusing %s %s://%s: not the configured base %s://%s", what, u.Scheme, u.Host, base.Scheme, base.Host)
+	}
+	return nil
+}
+
+// maxRedirects caps a same-origin redirect chain, matching net/http's own
+// default (which our CheckRedirect override would otherwise disable).
+const maxRedirects = 10
+
+// doNoOffOriginRedirect issues req through the client's Doer with the
+// same-origin boundary enforced across HTTP 3xx redirects. Every gitlabclient
+// request dispatches through this helper — c.do's shared choke point and the
+// notes-pagination walk alike. A same-origin endpoint answering with a
+// redirect to a foreign host would otherwise be followed by the default
+// *http.Client — carrying the custom PRIVATE-TOKEN header, which the stdlib
+// does NOT strip on a cross-host redirect the way it strips Authorization and
+// Cookie. Returning an error from CheckRedirect stops the client BEFORE it
+// sends the redirected request, so the credential never reaches the foreign
+// target.
+//
+// The guard applies only when the Doer is an *http.Client (the production
+// http.DefaultClient and the tests' httptest client): it is cloned so the
+// per-call CheckRedirect never mutates shared state, and the underlying
+// Transport pointer is deliberately carried across by the shallow copy so
+// connection pooling is unaffected. A non-*http.Client Doer (a hand-rolled
+// test stub) does not follow redirects on its own, so it is invoked unchanged.
+//
+// WARNING to anyone injecting a custom Doer through WithHTTPClient (this file)
+// or WithFactoryHTTPClient (factory.go): an instrumentation, retry or tracing
+// wrapper that is not itself an *http.Client falls through to an UNGUARDED
+// c.http.Do and silently loses this boundary while looking correct. Such a
+// wrapper must either delegate to an *http.Client that already carries this
+// CheckRedirect, or re-implement the same-origin check itself before
+// dispatching.
+func (c *Client) doNoOffOriginRedirect(req *http.Request) (*http.Response, error) {
+	hc, ok := c.http.(*http.Client)
+	if !ok {
+		return c.http.Do(req)
+	}
+	guarded := *hc
+	guarded.CheckRedirect = func(r *http.Request, via []*http.Request) error {
+		if err := c.sameOrigin(r.URL.String(), "redirect target"); err != nil {
+			return err
+		}
+		if len(via) >= maxRedirects {
+			return fmt.Errorf("gitlabclient: stopped after %d redirects", maxRedirects)
+		}
+		return nil
+	}
+	return guarded.Do(req)
+}
+
 // do builds and sends a PRIVATE-TOKEN-authed request. A non-nil body is
 // JSON-encoded; a nil body sends no payload (GET). The caller owns
-// closing the returned response body.
+// closing the returned response body. A server-initiated HTTP 3xx is
+// followed only within the configured origin: doNoOffOriginRedirect refuses
+// a cross-origin hop before it is sent, so PRIVATE-TOKEN never leaves the
+// instance.
 func (c *Client) do(ctx context.Context, method, path string, body any) (*http.Response, error) {
 	var reader io.Reader
 	if body != nil {
@@ -343,7 +417,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any) (*http.R
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := c.doNoOffOriginRedirect(req)
 	if err != nil {
 		return nil, fmt.Errorf("gitlabclient: %s %s: %w", method, path, err)
 	}

@@ -243,7 +243,9 @@ func TestGitLabClient_ListIssueNotes_RefusesOffOriginNextLink(t *testing.T) {
 // answers with an HTTP 302 to a foreign host. sameOrigin validated the initial
 // URL, so without a redirect boundary the default *http.Client would follow the
 // 302 and carry the custom PRIVATE-TOKEN header there (the stdlib strips only
-// Authorization/Cookie on a cross-host hop, not a custom header). The foreign
+// Authorization/Cookie on a cross-host hop, not a custom header). The guard now
+// lives in client.go and covers EVERY gitlabclient request, not just the notes
+// walk; this case pins the notes half of it. The foreign
 // host is a reachable in-test server that RECORDS any token it receives, so
 // deleting the CheckRedirect guard in doNoOffOriginRedirect SUCCEEDS against it
 // and reddens BOTH the zero-hit and zero-token-disclosure assertions rather
@@ -270,7 +272,7 @@ func TestGitLabClient_ListIssueNotes_RefusesOffOriginRedirect(t *testing.T) {
 	if err == nil {
 		t.Fatalf("ListIssueNotes = %v, nil; want a refusal of the off-origin redirect", notes)
 	}
-	if !strings.Contains(err.Error(), "refusing next-page link") {
+	if !strings.Contains(err.Error(), "refusing redirect target") {
 		t.Errorf("err = %v, want the same-origin refusal from CheckRedirect", err)
 	}
 	if got := foreignHits.Load(); got != 0 {

@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 )
 
@@ -116,9 +115,10 @@ func (c *Client) GetIssue(ctx context.Context, projectID, iid int) (*Issue, erro
 // and scheme; any other host is refused rather than followed, because the
 // request carries the PRIVATE-TOKEN header and a forge-supplied absolute
 // URL must never redirect that credential off-instance. The SAME boundary is
-// enforced across HTTP 3xx redirects (getNotesPage installs a same-origin
-// CheckRedirect): a same-origin endpoint that redirects off-instance is
-// refused BEFORE the redirected request is sent, so the header never follows.
+// enforced across HTTP 3xx redirects by doNoOffOriginRedirect (client.go),
+// which every gitlabclient request now dispatches through: a same-origin
+// endpoint that redirects off-instance is refused BEFORE the redirected
+// request is sent, so the header never follows.
 func (c *Client) ListIssueNotes(ctx context.Context, projectID, iid int) ([]Note, error) {
 	if projectID <= 0 {
 		return nil, fmt.Errorf("gitlabclient: project id required")
@@ -130,7 +130,7 @@ func (c *Client) ListIssueNotes(ctx context.Context, projectID, iid int) ([]Note
 	next := c.baseURL + fmt.Sprintf("/api/v4/projects/%d/issues/%d/notes?per_page=100&sort=asc&order_by=created_at", projectID, iid)
 	var out []Note
 	for next != "" {
-		if err := c.sameOrigin(next); err != nil {
+		if err := c.sameOrigin(next, "next-page link"); err != nil {
 			return nil, err
 		}
 		page, link, err := c.getNotesPage(ctx, next)
@@ -171,61 +171,6 @@ func (c *Client) getNotesPage(ctx context.Context, absURL string) ([]Note, strin
 		page = append(page, n.note())
 	}
 	return page, resp.Header.Get("Link"), nil
-}
-
-// sameOrigin refuses an absolute URL whose scheme or host differs from the
-// client's configured base URL — the guard that keeps a Link-header walk
-// from carrying PRIVATE-TOKEN to a foreign host.
-func (c *Client) sameOrigin(absURL string) error {
-	base, err := url.Parse(c.baseURL)
-	if err != nil {
-		return fmt.Errorf("gitlabclient: parse base url: %w", err)
-	}
-	u, err := url.Parse(absURL)
-	if err != nil {
-		return fmt.Errorf("gitlabclient: parse next-page url: %w", err)
-	}
-	if u.Scheme != base.Scheme || u.Host != base.Host {
-		return fmt.Errorf("gitlabclient: refusing next-page link %s://%s: not the configured base %s://%s", u.Scheme, u.Host, base.Scheme, base.Host)
-	}
-	return nil
-}
-
-// maxNotesRedirects caps a same-origin redirect chain, matching net/http's own
-// default (which our CheckRedirect override would otherwise disable).
-const maxNotesRedirects = 10
-
-// doNoOffOriginRedirect issues req through the client's Doer with the
-// same-origin boundary ALSO enforced across HTTP 3xx redirects. sameOrigin
-// validates the initial pagination URL, but a same-origin endpoint answering
-// with a redirect to a foreign host would otherwise be followed by the default
-// *http.Client — carrying the custom PRIVATE-TOKEN header, which the stdlib
-// does NOT strip on a cross-host redirect the way it strips Authorization and
-// Cookie. Returning an error from CheckRedirect stops the client BEFORE it
-// sends the redirected request, so the credential never reaches the foreign
-// target.
-//
-// The guard applies only when the Doer is an *http.Client (the production
-// http.DefaultClient and the tests' httptest client): it is cloned so the
-// per-call CheckRedirect never mutates shared state, and the underlying
-// Transport is reused. A non-*http.Client Doer (a hand-rolled test stub) does
-// not follow redirects on its own, so it is invoked unchanged.
-func (c *Client) doNoOffOriginRedirect(req *http.Request) (*http.Response, error) {
-	hc, ok := c.http.(*http.Client)
-	if !ok {
-		return c.http.Do(req)
-	}
-	guarded := *hc
-	guarded.CheckRedirect = func(r *http.Request, via []*http.Request) error {
-		if err := c.sameOrigin(r.URL.String()); err != nil {
-			return err
-		}
-		if len(via) >= maxNotesRedirects {
-			return fmt.Errorf("gitlabclient: stopped after %d redirects", maxNotesRedirects)
-		}
-		return nil
-	}
-	return guarded.Do(req)
 }
 
 // nextPageURL extracts the rel="next" target from an RFC 8288 Link header,
