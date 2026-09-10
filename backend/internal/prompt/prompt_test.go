@@ -4912,13 +4912,12 @@ func TestBuild_PlanReview_GateEvidence_AcceptanceNilByteIdentical(t *testing.T) 
 	}
 }
 
-// TestBuild_PlanReview_GateEvidence_AllSkipConsequenceRenders pins the #3026
-// consequence line: it renders when AllSkipShortCircuit is true and is ABSENT
-// when false — the always-on control the issue's second acceptance criterion
-// demands. The surrounding gate-evidence block is otherwise unchanged, which
-// the byte-identity assertion at the end proves: stripping exactly the one
-// consequence line reproduces the flag-false prompt.
-func TestBuild_PlanReview_GateEvidence_AllSkipConsequenceRenders(t *testing.T) {
+// TestBuild_PlanReview_GateEvidence_AllSkipAdvisoryRenders pins the #3317
+// merged ADVISORY line: it renders in place of the former CONSEQUENCE line
+// AND suppresses the duplicate all_criteria_skip_expected FINDING line when
+// AllSkipShortCircuit is true, and is ABSENT (with the raw FINDING line and
+// findings list unchanged) when false.
+func TestBuild_PlanReview_GateEvidence_AllSkipAdvisoryRenders(t *testing.T) {
 	mk := func(allSkip bool) string {
 		t.Helper()
 		got, err := Build("plan_review", Trigger{
@@ -4943,32 +4942,148 @@ func TestBuild_PlanReview_GateEvidence_AllSkipConsequenceRenders(t *testing.T) {
 		return got
 	}
 
-	const consequence = "- CONSEQUENCE: every acceptance criterion is marked skip_expected with an expectation_basis, so the " +
-		"acceptance stage will short-circuit to a not_validated verdict with no runner spawn and no preview — ZERO " +
-		"criteria will be verified. The run stays merge-eligible, but this is NOT a validated pass (#2347). Ask whether " +
-		"a drivable criterion genuinely exists for this change; an all-skip plan is not a cheap green.\n"
-
 	on := mk(true)
-	for _, want := range []string{consequence, "ZERO", "#2347", "not a cheap green"} {
+	for _, want := range []string{
+		"- ADVISORY all_criteria_skip_expected:",
+		"ZERO", "#2347", // consequence tokens
+		"HANDLING: acknowledge this in `free_form`", "Do NOT record it as a concern", // handling tokens
+	} {
 		if !strings.Contains(on, want) {
-			t.Errorf("plan_review prompt missing all-skip consequence element %q:\n%s", want, on)
+			t.Errorf("plan_review prompt missing all-skip advisory element %q:\n%s", want, on)
 		}
 	}
+	if strings.Contains(on, "- FINDING all_criteria_skip_expected") {
+		t.Errorf("the duplicate FINDING line must be ABSENT when AllSkipShortCircuit is true:\n%s", on)
+	}
+	if !strings.Contains(on, "- other findings: none (checked and clean)") {
+		t.Errorf("trailing label must read 'other findings' when the advisory absorbed the only finding:\n%s", on)
+	}
+	if strings.Contains(on, "- findings: none (checked and clean)") {
+		t.Errorf("the plain 'findings: none' label must not render alongside an advisory that IS a finding:\n%s", on)
+	}
+
 	off := mk(false)
-	if strings.Contains(off, "CONSEQUENCE: every acceptance criterion") {
-		t.Errorf("the consequence line must be ABSENT when AllSkipShortCircuit is false:\n%s", off)
+	if strings.Contains(off, "ADVISORY all_criteria_skip_expected") {
+		t.Errorf("the advisory line must be ABSENT when AllSkipShortCircuit is false:\n%s", off)
 	}
-	// The line is a clean additive insertion: stripping it reproduces the
-	// flag-false prompt byte-for-byte, so no other gate-evidence byte moved.
-	if strings.Replace(on, consequence, "", 1) != off {
-		t.Error("the consequence line is not a clean additive insertion over the flag-false prompt")
+	if strings.Contains(off, "HANDLING: acknowledge this in `free_form`") || strings.Contains(off, "Do NOT record it as a concern") {
+		t.Errorf("handling text must be ABSENT when AllSkipShortCircuit is false:\n%s", off)
 	}
-	// Position: after the out_of_scope count, before the findings list.
+	if !strings.Contains(off, "- FINDING all_criteria_skip_expected") {
+		t.Errorf("the raw FINDING line must still render when AllSkipShortCircuit is false:\n%s", off)
+	}
+
+	// Position: after the out_of_scope count, before the trailing label.
 	iCount := strings.Index(on, "- out_of_scope entries: 0")
-	iCons := strings.Index(on, "- CONSEQUENCE:")
-	iFind := strings.Index(on, "- FINDING all_criteria_skip_expected")
-	if iCount >= iCons || iCons >= iFind {
-		t.Errorf("consequence line is misordered: out_of_scope=%d consequence=%d findings=%d", iCount, iCons, iFind)
+	iAdv := strings.Index(on, "- ADVISORY all_criteria_skip_expected:")
+	iLabel := strings.Index(on, "- other findings: none")
+	if iCount >= iAdv || iAdv >= iLabel {
+		t.Errorf("advisory line is misordered: out_of_scope=%d advisory=%d label=%d", iCount, iAdv, iLabel)
+	}
+}
+
+// TestBuild_PlanReview_AllSkipAdvisory_SuppressesOnlyItsOwnFinding proves the
+// suppression filter is keyed on the RULE, not a blanket findings wipe: an
+// unrelated finding alongside AllSkipShortCircuit=true still renders as its
+// own FINDING line, and the trailing label is the plain (non-"other")
+// findings list because a real finding survived.
+func TestBuild_PlanReview_AllSkipAdvisory_SuppressesOnlyItsOwnFinding(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			AcceptancePrecheck: &AcceptancePrecheckEvidence{
+				AcceptanceStageID:   "acceptance",
+				CriteriaCount:       2,
+				BlockingCount:       2,
+				AllSkipShortCircuit: true,
+				Findings: []AcceptanceFindingEvidence{
+					{Rule: "all_criteria_skip_expected", Detail: "every acceptance criterion is marked skip_expected"},
+					{Rule: "undecidable_criterion", CriterionID: "a1", Detail: "criterion requires reading intent"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "- FINDING undecidable_criterion (criterion: a1): criterion requires reading intent") {
+		t.Errorf("unrelated finding must still render unchanged:\n%s", got)
+	}
+	if strings.Contains(got, "- FINDING all_criteria_skip_expected") {
+		t.Errorf("the all-skip finding's own FINDING line must still be suppressed:\n%s", got)
+	}
+	if strings.Contains(got, "- other findings: none") {
+		t.Errorf("trailing label must be the plain findings list when a real finding survives:\n%s", got)
+	}
+}
+
+// TestBuild_PlanReview_AllSkipAdvisory_FlagFalseFindingStillRenders pins the
+// documented AcceptancePrecheckEvidence invariant-violating shape: the flag is
+// false but the finding is present anyway (never produced by the real path,
+// but not the renderer's job to hide). The filter is keyed on flag AND rule,
+// so this renders the raw FINDING line unchanged and no advisory.
+func TestBuild_PlanReview_AllSkipAdvisory_FlagFalseFindingStillRenders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			AcceptancePrecheck: &AcceptancePrecheckEvidence{
+				AcceptanceStageID:   "acceptance",
+				CriteriaCount:       2,
+				BlockingCount:       2,
+				AllSkipShortCircuit: false,
+				Findings: []AcceptanceFindingEvidence{
+					{Rule: "all_criteria_skip_expected", Detail: "every acceptance criterion is marked skip_expected"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "- FINDING all_criteria_skip_expected: every acceptance criterion is marked skip_expected") {
+		t.Errorf("flag-false-but-finding-present must still render the raw FINDING line:\n%s", got)
+	}
+	if strings.Contains(got, "ADVISORY all_criteria_skip_expected") {
+		t.Errorf("no advisory line when the flag is false:\n%s", got)
+	}
+}
+
+// TestBuild_PlanReview_GateEvidencePreambleCarriesAdvisoryException pins the
+// #3317 preamble exception sentence that makes allSkipAdvisoryLine's HANDLING
+// clause reachable from the blanket must-be-a-concern rule it modifies. It
+// renders whenever any gate evidence is present and is absent — along with
+// the whole gate-evidence section — when there is none.
+func TestBuild_PlanReview_GateEvidencePreambleCarriesAdvisoryException(t *testing.T) {
+	const exceptionToken = "carries its own HANDLING instruction in place of the rule above"
+
+	withEvidence, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			ScopePrecheck: &ScopePrecheckEvidence{ScannedFiles: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(withEvidence, exceptionToken) {
+		t.Errorf("gate-evidence preamble missing the ADVISORY exception sentence:\n%s", withEvidence)
+	}
+
+	noEvidence, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(noEvidence, exceptionToken) {
+		t.Errorf("no-evidence prompt must not carry the ADVISORY exception sentence:\n%s", noEvidence)
+	}
+	if strings.Contains(noEvidence, "### Gate evidence") {
+		t.Errorf("no-evidence prompt must not carry the gate-evidence section at all:\n%s", noEvidence)
 	}
 }
 

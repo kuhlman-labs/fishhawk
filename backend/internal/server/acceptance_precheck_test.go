@@ -1144,22 +1144,24 @@ func TestAcceptancePrecheck_AllSkip_JoinToRenderedPrompt(t *testing.T) {
 		return got
 	}
 
-	const consequence = "CONSEQUENCE: every acceptance criterion is marked skip_expected with an expectation_basis"
+	const consequence = "ADVISORY all_criteria_skip_expected: every acceptance criterion is marked skip_expected with an expectation_basis"
 
 	allSkip := render(t, []map[string]any{
 		allSkipCriterion("a1", "the payload records the headline", "covered by the server payload unit test"),
-		allSkipCriterion("a2", "the renderer emits the consequence line", "covered by the prompt render unit test"),
+		allSkipCriterion("a2", "the renderer emits the advisory line", "covered by the prompt render unit test"),
 	})
 	for _, want := range []string{
 		"Acceptance pre-check (verification.acceptance_criteria evaluated against the configured acceptance stage)",
 		consequence,
 		"ZERO",
 		"#2347",
-		"FINDING all_criteria_skip_expected",
 	} {
 		if !strings.Contains(allSkip, want) {
 			t.Errorf("rendered plan_review prompt missing %q — a seam between pre-check, evidence mapping and render is broken:\n%s", want, allSkip)
 		}
+	}
+	if strings.Contains(allSkip, "FINDING all_criteria_skip_expected") {
+		t.Errorf("rendered plan_review prompt must not carry the duplicate FINDING line once the ADVISORY line absorbs it:\n%s", allSkip)
 	}
 
 	// NEGATIVE TWIN from a real mixed-criteria body: the line is absent.
@@ -1168,7 +1170,7 @@ func TestAcceptancePrecheck_AllSkip_JoinToRenderedPrompt(t *testing.T) {
 		{"id": "a2", "statement": "the plan gate admits the plan", "source": "explicit", "source_ref": "#3026"},
 	})
 	if strings.Contains(mixed, consequence) {
-		t.Errorf("mixed-criteria plan must not render the all-skip consequence line:\n%s", mixed)
+		t.Errorf("mixed-criteria plan must not render the all-skip advisory line:\n%s", mixed)
 	}
 	if strings.Contains(mixed, "FINDING all_criteria_skip_expected") {
 		t.Errorf("mixed-criteria plan must not render the all_criteria_skip_expected finding:\n%s", mixed)
