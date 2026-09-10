@@ -2372,6 +2372,17 @@ func redactURLUserinfo(raw string) string {
 // config, which the pass's own config-change gate would then refuse. So (b) is a
 // key-PRESENCE refusal, and the residual — a benign global pushInsteadOf trips
 // it — is stated in runner/README.md rather than implied away.
+//
+// (b)'s probe runs `--get-regexp -z` and parses git's OWN `key\nvalue\0`
+// framing, the same posture the conflict-resolution config capture uses. Without
+// `-z` git prints `key value\n`, and BOTH halves of that line-oriented shape
+// disclose text the refusal is supposed to redact: a git config SUBSECTION may
+// contain whitespace, so taking the first whitespace-separated field TRUNCATES
+// `url.https://user:token@host path/.pushinsteadof` to a two-component key whose
+// credential-bearing half redactConfigKeyName would then emit VERBATIM; and a
+// config VALUE may contain a newline, so a line-split reads the value's
+// continuation lines as key names. Under `-z` the record is NUL-terminated and
+// the key ends at the FIRST newline, so neither shape is reachable.
 func (p *Pusher) verifyPushDestination(ctx context.Context, repoDir, remoteURL string) error {
 	resolved, code, err := p.probeOut(ctx, repoDir,
 		append(HardeningArgs(), "ls-remote", "--get-url", remoteURL)...)
@@ -2387,15 +2398,15 @@ func (p *Pusher) verifyPushDestination(ctx context.Context, repoDir, remoteURL s
 	}
 
 	out, code, err := p.probeOut(ctx, repoDir,
-		append(HardeningArgs(), "config", "--get-regexp", `^url\..*\.pushinsteadof$`)...)
+		append(HardeningArgs(), "config", "--get-regexp", "-z", `^url\..*\.pushinsteadof$`)...)
 	switch {
 	case err == nil:
 		keys := make([]string, 0, 2)
-		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-			if line == "" {
+		for _, rec := range strings.Split(out, "\x00") {
+			if rec == "" {
 				continue
 			}
-			keys = append(keys, redactConfigKeyName(strings.Fields(line)[0]))
+			keys = append(keys, redactConfigKeyName(configRecordKey(rec)))
 		}
 		if len(keys) == 0 {
 			// Exit 0 with no output is not a shape git produces for
@@ -2416,22 +2427,61 @@ func (p *Pusher) verifyPushDestination(ctx context.Context, repoDir, remoteURL s
 	}
 }
 
+// configRecordKey returns the KEY of one `git config --get-regexp -z` record.
+//
+// The framing is git's, not a guess: `-z` emits `key\nvalue\0`, so the record is
+// NUL-terminated and the key/value separator INSIDE it is a NEWLINE (verified
+// with od(1); git-config(1) --null). The key therefore ends at the FIRST
+// newline, and everything after it is value bytes that must never reach the
+// operator-visible refusal. A record with no newline is a valueless key, whose
+// whole text is the key.
+func configRecordKey(rec string) string {
+	if nl := strings.IndexByte(rec, '\n'); nl >= 0 {
+		return rec[:nl]
+	}
+	return rec
+}
+
 // redactConfigKeyName renders a git config key as `<section>.<redacted>.<final>`.
 // The subsection of a `url.<base>.pushInsteadOf` key is an arbitrary URL and may
 // itself carry a credential, so the middle is REPLACED by a constant rather than
 // filtered — the same positive redaction the conflict-resolution config detail
-// uses. Section and final-component names are restricted to alphanumerics and
-// `-`, so emitting those two verbatim can never carry an embedded URL.
+// uses.
+//
+// git restricts a section and a final component to alphanumerics and `-`, and
+// that restriction is ENFORCED here rather than assumed: it is the property that
+// makes emitting those two verbatim safe, and the only reason a credential could
+// ever occupy one of them is a caller that mis-framed the key (splitting a
+// whitespace-bearing subsection, say). A part that is not git-shaped is replaced
+// by the placeholder too, so a framing mistake degrades to an unhelpful refusal
+// rather than to a disclosure.
 func redactConfigKeyName(key string) string {
 	first := strings.IndexByte(key, '.')
 	last := strings.LastIndexByte(key, '.')
 	if first < 0 {
 		return pushDestinationRedaction
 	}
+	section, final := safeConfigPart(key[:first]), safeConfigPart(key[last+1:])
 	if first == last {
-		return key[:first] + "." + key[last+1:]
+		return section + "." + final
 	}
-	return key[:first] + "." + pushDestinationRedaction + "." + key[last+1:]
+	return section + "." + pushDestinationRedaction + "." + final
+}
+
+// safeConfigPart returns part when it has git's section/final-component shape —
+// non-empty, alphanumerics and `-` only — and the placeholder otherwise.
+func safeConfigPart(part string) string {
+	if part == "" {
+		return pushDestinationRedaction
+	}
+	for _, r := range part {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
+		default:
+			return pushDestinationRedaction
+		}
+	}
+	return part
 }
 
 // probeOut runs git and returns (stdout, exit code, error). It exists because

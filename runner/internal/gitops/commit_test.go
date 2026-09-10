@@ -5600,6 +5600,68 @@ func TestPushCommittedBranch_EmptyRegexpProbeFailsClosed(t *testing.T) {
 	}
 }
 
+// TestPushCommittedBranch_RefusalRedactsHostileConfigKey drives the redaction
+// THROUGH THE GUARD rather than through its helper, which is the point: the
+// helper tests hand redactConfigKeyName a key that is already correctly framed,
+// so they cannot see a PARSING step that mis-frames it first. Both fixtures
+// below are keys git accepts and a line-oriented parse mangles.
+//
+//   - whitespace_subsection: a git config subsection may contain whitespace, so
+//     `url.https://user:<token>@host path/.pushinsteadof` truncated at the first
+//     whitespace-separated field leaves a TWO-component key whose second half is
+//     the credential — which redactConfigKeyName then emits verbatim, because a
+//     two-component key has no subsection to replace.
+//   - newline_in_value: a config VALUE may contain a newline, and without `-z`
+//     git prints the value on the same logical record, so a line-split reads the
+//     value's continuation lines as key names.
+//
+// Every case asserts the refusal FIRED (the config is hostile), that the branch
+// reached NEITHER bare repo, and that no planted secret appears anywhere in the
+// error text.
+func TestPushCommittedBranch_RefusalRedactsHostileConfigKey(t *testing.T) {
+	const token = "s3cr3t-token"
+	const valueSecret = "v4lue-s3cr3t"
+	cases := []struct{ name, key, value string }{
+		{
+			"whitespace_subsection",
+			"url.https://user:" + token + "@host path/.pushInsteadOf",
+			"https://example.com/",
+		},
+		{
+			"newline_in_value",
+			"url.https://example.com/.pushInsteadOf",
+			"https://example.com/\nsecret." + valueSecret,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, origin, decoy, head := pushDecoyFixture(t)
+			mustGit(t, repo, "config", tc.key, tc.value)
+
+			_, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+				RepoDir: repo, Branch: "fishhawk/run-x", RemoteURL: origin, HeadSHA: head,
+			})
+			if err == nil {
+				t.Fatal("PushCommittedBranch published with a push-rewrite key configured")
+			}
+			for _, secret := range []string{token, valueSecret, "user:", "host path"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("the refusal leaked %q: %v", secret, err)
+				}
+			}
+			if want := "url." + pushDestinationRedaction + ".pushinsteadof"; !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal must still name the redacted key shape %q: %v", want, err)
+			}
+			if tip := bareBranchTip(t, decoy, "fishhawk/run-x"); tip != "" {
+				t.Errorf("the branch landed in the DECOY remote (%s)", tip)
+			}
+			if tip := bareBranchTip(t, origin, "fishhawk/run-x"); tip != "" {
+				t.Errorf("the branch was published despite the refusal: origin tip = %s", tip)
+			}
+		})
+	}
+}
+
 // TestRedactURLUserinfo pins the three shapes plus the fail-safe. The URL this
 // runs on is one an ATTACKER shaped — a poisoned insteadOf can rewrite the
 // runner's remote into a `user:token@host` form that then flows into the
@@ -5626,6 +5688,32 @@ func TestRedactURLUserinfo(t *testing.T) {
 	}
 }
 
+// TestConfigRecordKey pins the FRAMING the push-rewrite probe parses. git's
+// `--get-regexp -z` emits `key\nvalue\0`: the record is NUL-terminated and the
+// key/value separator inside it is a NEWLINE. A parser that took the first
+// whitespace-separated field instead would truncate a whitespace-bearing
+// subsection, and one that split on `\n` per line would read a newline-bearing
+// VALUE's continuation as a key — both are how attacker-shaped text reaches a
+// refusal that is otherwise redacted.
+func TestConfigRecordKey(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"key and value", "url.https://x/.pushinsteadof\nhttps://y/",
+			"url.https://x/.pushinsteadof"},
+		{"subsection with whitespace", "url.https://host path/.pushinsteadof\nhttps://y/",
+			"url.https://host path/.pushinsteadof"},
+		{"value carries a newline", "url.https://x/.pushinsteadof\nhttps://y/\nsecret.token",
+			"url.https://x/.pushinsteadof"},
+		{"valueless record", "url.https://x/.pushinsteadof", "url.https://x/.pushinsteadof"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := configRecordKey(tc.in); got != tc.want {
+				t.Errorf("configRecordKey(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRedactConfigKeyName pins the positive redaction the push-rewrite refusal
 // reports through: the subsection of a `url.<base>.pushInsteadOf` key is an
 // arbitrary URL and may carry a credential, so the middle is REPLACED rather
@@ -5636,6 +5724,13 @@ func TestRedactConfigKeyName(t *testing.T) {
 		{"url.https://user:" + token + "@example.com/.pushinsteadof", "url.<redacted>.pushinsteadof"},
 		{"user.name", "user.name"},
 		{"bare", "<redacted>"},
+		// A part that is not git-shaped (alphanumerics and `-`) can only arrive
+		// from a caller that mis-framed the key — the whitespace-truncation
+		// shape below is exactly that. Emitting it verbatim is the disclosure
+		// the enforcement exists to prevent, so it collapses too.
+		{"url.https://user:" + token + "@host", "url.<redacted>"},
+		{"url.<sub>.https://user:" + token + "@host", "url.<redacted>.<redacted>"},
+		{"user.", "user.<redacted>"},
 	}
 	for _, tc := range cases {
 		got := redactConfigKeyName(tc.in)

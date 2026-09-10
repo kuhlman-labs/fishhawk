@@ -324,7 +324,15 @@ Two layers answer that, and they cover DIFFERENT halves.
   - **(b) a narrow refusal of `url.*.pushInsteadOf` ONLY.** `--get-url` applies
     FETCH rewriting, so (a) structurally cannot see a pushInsteadOf redirect
     (verified: with `url.X.pushInsteadOf=Y` set, `ls-remote --get-url Y` prints
-    Y unchanged). (b) covers exactly that gap.
+    Y unchanged). (b) covers exactly that gap. Its probe runs `--get-regexp -z`
+    and parses git's own `key\nvalue\0` framing: a config SUBSECTION may contain
+    whitespace and a config VALUE may contain a newline, so a line-oriented
+    parse would either truncate the key at the whitespace — emitting its
+    credential-bearing tail as a two-component key the redaction leaves
+    verbatim — or read a value's continuation lines as key names. The redaction
+    additionally ENFORCES git's alphanumeric-and-`-` shape on the two parts it
+    emits verbatim, so a future framing mistake degrades to an unhelpful refusal
+    rather than to a disclosure.
 
   **(b) is deliberately not the whole `url.` namespace.** This repository
   carries a benign `url.https://github.com/.insteadOf = git@github.com:` in
@@ -371,6 +379,9 @@ Two layers answer that, and they cover DIFFERENT halves.
 Every path enumeration uses `-z` and splits on NUL — git only refrains from
 C-quoting a path under `-z`, and a newline inside a filename splits one path
 into two under any line-oriented split, dropping the real path out of the gate.
+The same posture covers the CONFIG reads (`--list -z`, `--get-regexp -z`), where
+`-z` also fixes the key/value separator at a newline rather than at whitespace
+or `=`.
 
 **Recovery outlives cancellation.** `exec.CommandContext` kills the child the
 instant the context is done, so running `git merge --abort` under the pass's own

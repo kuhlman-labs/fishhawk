@@ -450,6 +450,12 @@ func TestConfigDiffKeys(t *testing.T) {
 			[]string{"url." + redactedConfigPart + ".insteadof"}},
 		{"dotless key collapses to the placeholder", "", cfgStream("bare", "a"),
 			[]string{redactedConfigPart}},
+		// A VALUELESS record (`key\0`, git's boolean-true shape) and an
+		// EMPTY-VALUED one (`key\n\0`) both parse to value "", so no key-level
+		// difference resolves. The streams still DIFFER, which is why Verify's
+		// byte-for-byte comparison refuses regardless; this case pins that the
+		// key signature is what goes silent.
+		{"valueless vs empty-valued resolves no key", "core.bare\x00", "core.bare\n\x00", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -459,6 +465,39 @@ func TestConfigDiffKeys(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("configDiffKeys = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestConfigChangeDetailFallback pins configChangeDetail's no-key-resolved
+// branch, which is reachable because parseConfigStream conflates a VALUELESS
+// record (`key\0`, git's boolean-true shape) with an EMPTY-VALUED one
+// (`key\n\0`): both parse to value "", so configDiffKeys returns nothing while
+// the raw streams still differ. The detail must report the change rather than
+// swallow it — the alternative would be an empty key list rendered as though
+// nothing had happened.
+//
+// The gate itself is unaffected either way: Verify compares the raw streams
+// byte-for-byte and refuses on any difference (TestVerifyRepoConfigChanged).
+// What this pins is the DETAIL an operator reads.
+func TestConfigChangeDetailFallback(t *testing.T) {
+	cases := []struct{ name, base, obs string }{
+		{"valueless becomes empty-valued", "core.bare\x00", "core.bare\n\x00"},
+		{"empty-valued becomes valueless", "core.bare\n\x00", "core.bare\x00"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.base == tc.obs {
+				t.Fatalf("the fixture streams are identical, so nothing changed: %q", tc.base)
+			}
+			if keys := configDiffKeys(tc.base, tc.obs); len(keys) != 0 {
+				t.Fatalf("configDiffKeys resolved %v — the fallback branch is not reached", keys)
+			}
+			detail := configChangeDetail(tc.base, tc.obs)
+			const want = "the effective git configuration changed (no key-level difference resolved)"
+			if detail != want {
+				t.Errorf("configChangeDetail = %q, want %q", detail, want)
 			}
 		})
 	}

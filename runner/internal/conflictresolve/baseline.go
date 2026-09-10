@@ -274,8 +274,15 @@ func Verify(base Baseline, obs Observed) []Violation {
 // agent controls can reach an operator-visible detail through it.
 const redactedConfigPart = "<redacted>"
 
-// configRecord is one `git config --list -z` record: its key and whether it
-// carried a value at all.
+// configRecord is one `git config --list -z` record: its key and its value.
+//
+// It deliberately does NOT track whether the record carried a value at all, so
+// a VALUELESS record (`key\0`, git's boolean-true shape) and an EMPTY-VALUED one
+// (`key\n\0`) both yield value "" and are indistinguishable here. That is not a
+// hole in the gate: Verify compares the raw config streams BYTE-FOR-BYTE and
+// refuses on any difference, so such a pair is still caught. What the conflation
+// costs is the DETAIL — configDiffKeys resolves no key-level difference, and
+// configChangeDetail falls back to naming the change without a key.
 type configRecord struct {
 	key   string
 	value string
