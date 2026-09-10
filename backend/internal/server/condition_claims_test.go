@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -10,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // conditionClaimsServer wires the audit + concern fakes the condition-claim
@@ -389,4 +392,257 @@ func TestResolveConditionClaimedPlanConcerns_SecondRoundIdempotent(t *testing.T)
 	if n := len(auditEntriesByCategory(au, CategoryConcernAddressedByCondition)); n != 1 {
 		t.Errorf("concern_addressed_by_condition entries = %d, want 1 (round 2 is idempotent)", n)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// claims_all_open_plan_concerns — the #3318 approve-time expansion shorthand.
+// ---------------------------------------------------------------------------
+
+// claimsErrorEnvelope decodes {"error":{"code","message","details"}} out of a
+// refusal body. Error-code IDENTITY (rather than "some 400 happened") is what
+// makes each per-mode test below a working counterfactual: deleting one branch
+// lets a NEIGHBOURING guard refuse instead, with a different code, which this
+// catches and a bare status assertion would not.
+func claimsErrorEnvelope(t *testing.T, body []byte) (string, map[string]any) {
+	t.Helper()
+	var wrapper map[string]any
+	if err := json.Unmarshal(body, &wrapper); err != nil {
+		t.Fatalf("decode error body: %v\n%s", err, body)
+	}
+	env, _ := wrapper["error"].(map[string]any)
+	if env == nil {
+		t.Fatalf("body carries no error envelope: %s", body)
+	}
+	code, _ := env["code"].(string)
+	details, _ := env["details"].(map[string]any)
+	return code, details
+}
+
+// TestExpandAllOpenPlanConcernClaims_ClaimsExactlyOpenPlanConcerns is the
+// DONE-MEANS for the shorthand. Correctness is not structurally enforced by
+// compilation — an expansion that silently claimed the WRONG set would still
+// compile and still record a claims_concern_ids key — so this seeds a run
+// carrying two open PLAN concerns, one open IMPLEMENT concern and one
+// already-waived PLAN concern, approves with the shorthand, and asserts the
+// recorded claims_concern_ids equals EXACTLY the two open plan ids. A no-op or
+// over-broad expansion fails here where a mere file-touch would pass.
+func TestExpandAllOpenPlanConcernClaims_ClaimsExactlyOpenPlanConcerns(t *testing.T) {
+	s, _, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	planStageID := uuid.New()
+
+	planA := seedConcernRow(t, cr, stage.RunID, planStageID, concern.StageKindPlan, 5, "the retry cap is not enforced")
+	planB := seedConcernRow(t, cr, stage.RunID, planStageID, concern.StageKindPlan, 6, "the fallback is untested")
+	implA := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindImplement, 7, "an out-of-scope edit")
+	waived := seedConcernRow(t, cr, stage.RunID, planStageID, concern.StageKindPlan, 4, "already settled")
+	if _, err := cr.ApplyResolution(context.Background(), waived.ID, concern.StateWaived, "not blocking"); err != nil {
+		t.Fatalf("seed waived concern: %v", err)
+	}
+	// A concern in ANOTHER run, to pin the run scoping of the expansion.
+	other := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindPlan, 9, "another run's concern")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","claims_all_open_plan_concerns":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	raw, ok := payload["claims_concern_ids"].([]any)
+	if !ok {
+		t.Fatalf("claims_concern_ids = %v, want the expanded open plan ids", payload["claims_concern_ids"])
+	}
+	got := make(map[string]bool, len(raw))
+	for _, v := range raw {
+		s, _ := v.(string)
+		got[s] = true
+	}
+	want := map[string]bool{planA.ID.String(): true, planB.ID.String(): true}
+	if len(got) != len(want) {
+		t.Fatalf("claims_concern_ids = %v (%d ids), want exactly the two open plan ids %v", raw, len(got), want)
+	}
+	for id := range want {
+		if !got[id] {
+			t.Errorf("expanded claim set is missing open plan concern %s: %v", id, raw)
+		}
+	}
+	if got[implA.ID.String()] {
+		t.Errorf("expansion claimed an IMPLEMENT-stage concern %s — the StageKindPlan filter is not holding: %v", implA.ID, raw)
+	}
+	if got[waived.ID.String()] {
+		t.Errorf("expansion claimed an already-waived concern %s — ListOpenByRun should exclude it: %v", waived.ID, raw)
+	}
+	if got[other.ID.String()] {
+		t.Errorf("expansion claimed another run's concern %s: %v", other.ID, raw)
+	}
+	// The INTENT keys ride alongside the expanded ids.
+	if payload["claims_all_open_plan_concerns"] != true {
+		t.Errorf("claims_all_open_plan_concerns = %v, want true", payload["claims_all_open_plan_concerns"])
+	}
+	if n, _ := payload["claims_all_open_plan_concerns_expanded"].(float64); int(n) != 2 {
+		t.Errorf("claims_all_open_plan_concerns_expanded = %v, want 2", payload["claims_all_open_plan_concerns_expanded"])
+	}
+}
+
+// TestExpandAllOpenPlanConcernClaims_EmptyExpansionIsLegal: no open plan
+// concerns at approval time is NOT an error — nothing to claim is a legal
+// outcome — but the operator's declared INTENT is still recorded, with
+// _expanded:0 distinguishing it from an approve that never used the channel.
+func TestExpandAllOpenPlanConcernClaims_EmptyExpansionIsLegal(t *testing.T) {
+	s, _, rr, au, _ := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","claims_all_open_plan_concerns":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 on an empty expansion:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, ok := payload["claims_concern_ids"]; ok {
+		t.Errorf("claims_concern_ids should be absent for an empty expansion: %v", payload)
+	}
+	if payload["claims_all_open_plan_concerns"] != true {
+		t.Errorf("claims_all_open_plan_concerns = %v, want true (the intent survives an empty expansion)", payload["claims_all_open_plan_concerns"])
+	}
+	// Assert PRESENCE separately from VALUE. A `v, _ := m[k].(float64)`
+	// collapses an ABSENT key onto the same zero as a present numeric 0, so
+	// the promised explicit zero-count evidence would stay unpinned if the
+	// key were dropped entirely.
+	rawExpanded, present := payload["claims_all_open_plan_concerns_expanded"]
+	if !present {
+		t.Fatalf("claims_all_open_plan_concerns_expanded is ABSENT; the explicit zero count is the evidence this test exists to pin: %v", payload)
+	}
+	n, isNumber := rawExpanded.(float64)
+	if !isNumber {
+		t.Fatalf("claims_all_open_plan_concerns_expanded = %#v, want a JSON number", rawExpanded)
+	}
+	if int(n) != 0 {
+		t.Errorf("claims_all_open_plan_concerns_expanded = %v, want 0", rawExpanded)
+	}
+}
+
+// TestApprove_ClaimsAllOpenPlanConcerns_NoShorthand_OmitsIntentKeys pins the
+// byte-identical no-shorthand path: an approve that does not use the channel
+// carries NEITHER intent key.
+func TestApprove_ClaimsAllOpenPlanConcerns_NoShorthand_OmitsIntentKeys(t *testing.T) {
+	s, _, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	row := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindPlan, 5, "note")
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","claims_concern_ids":["`+row.ID.String()+`"]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, ok := payload["claims_all_open_plan_concerns"]; ok {
+		t.Errorf("claims_all_open_plan_concerns present on an explicit-id approve: %v", payload)
+	}
+	if _, ok := payload["claims_all_open_plan_concerns_expanded"]; ok {
+		t.Errorf("claims_all_open_plan_concerns_expanded present on an explicit-id approve: %v", payload)
+	}
+}
+
+// TestApprove_ClaimsAllAndExplicitIDs_Rejected pins the MUTUAL EXCLUSION
+// branch: the expansion is always a superset of any valid explicit list, so
+// accepting both would make the recorded claim ambiguous about operator intent.
+func TestApprove_ClaimsAllAndExplicitIDs_Rejected(t *testing.T) {
+	s, ar, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	row := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindPlan, 5, "note")
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","claims_all_open_plan_concerns":true,"claims_concern_ids":["`+row.ID.String()+`"]}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 when both claim channels are set:\n%s", w.Code, w.Body.String())
+	}
+	code, details := claimsErrorEnvelope(t, w.Body.Bytes())
+	if code != "validation_failed" {
+		t.Errorf("error code = %q, want validation_failed", code)
+	}
+	if details["rule"] != "claims_all_and_explicit_ids" {
+		t.Errorf("details.rule = %v, want claims_all_and_explicit_ids", details["rule"])
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestApprove_ClaimsAllOpenPlanConcerns_OnRejectRejected: the shorthand is
+// approve-only — a claim only makes sense on the approval carrying the binding
+// condition.
+func TestApprove_ClaimsAllOpenPlanConcerns_OnRejectRejected(t *testing.T) {
+	s, ar, rr, au, _ := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject","claims_all_open_plan_concerns":true}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on a shorthand claim with reject:\n%s", w.Code, w.Body.String())
+	}
+	code, details := claimsErrorEnvelope(t, w.Body.Bytes())
+	if code != "validation_failed" {
+		t.Errorf("error code = %q, want validation_failed", code)
+	}
+	if details["field"] != "claims_all_open_plan_concerns" {
+		t.Errorf("details.field = %v, want claims_all_open_plan_concerns", details["field"])
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestApprove_ClaimsAllOpenPlanConcerns_OnDeployStageRejected: plan-stage only
+// — the concerns a condition answers are plan-stage concerns.
+func TestApprove_ClaimsAllOpenPlanConcerns_OnDeployStageRejected(t *testing.T) {
+	s, ar, rr, au, _ := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.mu.Lock()
+	stage.Type = run.StageTypeDeploy
+	rr.mu.Unlock()
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","claims_all_open_plan_concerns":true}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on a deploy-stage shorthand claim:\n%s", w.Code, w.Body.String())
+	}
+	code, details := claimsErrorEnvelope(t, w.Body.Bytes())
+	if code != "validation_failed" {
+		t.Errorf("error code = %q, want validation_failed", code)
+	}
+	if details["stage_type"] != string(run.StageTypeDeploy) {
+		t.Errorf("details.stage_type = %v, want deploy", details["stage_type"])
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestApprove_ClaimsAllOpenPlanConcerns_NilConcernRepoReturns503: the
+// expansion cannot be computed without a concern store, so it fails CLOSED
+// rather than silently claiming nothing.
+func TestApprove_ClaimsAllOpenPlanConcerns_NilConcernRepoReturns503(t *testing.T) {
+	// newApprovalServer wires NO ConcernRepo.
+	s, ar, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","claims_all_open_plan_concerns":true}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 with no concern store:\n%s", w.Code, w.Body.String())
+	}
+	code, _ := claimsErrorEnvelope(t, w.Body.Bytes())
+	if code != "concern_store_unconfigured" {
+		t.Errorf("error code = %q, want concern_store_unconfigured", code)
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestApprove_ClaimsAllOpenPlanConcerns_ListErrorReturns500: a store OUTAGE is
+// retryable, not an operator-corrected input, so it is a 500 internal_error —
+// the same posture validateClaimsConcernIDs takes for a non-ErrNotFound
+// GetByIDs failure. Collapsing it into a 400 would point the operator at
+// re-reading concern ids instead of retrying.
+func TestApprove_ClaimsAllOpenPlanConcerns_ListErrorReturns500(t *testing.T) {
+	s, ar, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	cr.listErr = errors.New("concern store down")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","claims_all_open_plan_concerns":true}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 on a concern-store read failure:\n%s", w.Code, w.Body.String())
+	}
+	code, _ := claimsErrorEnvelope(t, w.Body.Bytes())
+	if code != "internal_error" {
+		t.Errorf("error code = %q, want internal_error", code)
+	}
+	assertNoApprovalRecorded(t, ar, au)
 }

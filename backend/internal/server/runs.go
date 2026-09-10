@@ -493,6 +493,16 @@ type runConcernPayload struct {
 	// UUID above remains identity, so two concerns whose notes share a long
 	// prefix MAY share a label — route fix-ups by id, never by this.
 	ShortSummary string `json:"short_summary,omitempty"`
+	// ClaimedByApproval reports that an approval's claims_concern_ids — named
+	// explicitly, or expanded from the claims_all_open_plan_concerns shorthand —
+	// covers THIS concern (E64.77 / #3318). Meaning: it will self-settle to the
+	// terminal addressed_by_condition state at the first confirming implement
+	// review and needs NO hand waive at the merge gate. That is only useful while
+	// the concern is still OPEN — a settled one has left this list — so the marker
+	// is what tells an operator, at the gate, which of the open concerns they can
+	// leave alone. omitempty: an unclaimed concern marshals byte-identically to
+	// pre-#3318.
+	ClaimedByApproval bool `json:"claimed_by_approval,omitempty"`
 }
 
 // runDelegationPayload is the operator_agent delegation surface on the
@@ -1720,7 +1730,36 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			s.cfg.Logger.Warn("list open concerns failed; omitting concerns block",
 				"run_id", runID.String(), "error", cerr.Error())
 		} else {
-			resp.Concerns = buildRunConcernsPayload(open)
+			// Condition-claim markers (E64.77 / #3318). Gated on the open set
+			// containing at least one PLAN-stage concern: an approval's claim set
+			// contains only plan-stage ids, so a run with no open plan concerns
+			// would pay an audit read to build an empty set. That gate is a pure
+			// PERFORMANCE guard with no behavioural signature — the markers are
+			// identical with or without it — and is deliberately NOT claimed as a
+			// control. Best-effort exactly like the surrounding blocks:
+			// loadApprovalConcernClaims warn-logs and returns nil on any failure,
+			// so the markers are simply absent. The concerns block itself must
+			// NEVER become absent because of this — presence stays authoritative
+			// (#3043).
+			var claimed map[uuid.UUID]struct{}
+			hasOpenPlanConcern := false
+			for _, c := range open {
+				if c.StageKind == concern.StageKindPlan {
+					hasOpenPlanConcern = true
+					break
+				}
+			}
+			if hasOpenPlanConcern {
+				if claims := s.loadApprovalConcernClaims(r.Context(), runID); claims != nil {
+					claimed = make(map[uuid.UUID]struct{}, len(claims.ConcernIDs))
+					for _, raw := range claims.ConcernIDs {
+						if cid, perr := uuid.Parse(raw); perr == nil {
+							claimed[cid] = struct{}{}
+						}
+					}
+				}
+			}
+			resp.Concerns = buildRunConcernsPayload(open, claimed)
 		}
 	}
 	// Drive read surfaces (#1023): auto_advanced + next_action +
@@ -2613,7 +2652,7 @@ func concernShortSummary(note string) string {
 // stays a non-nil slice so the JSON renders `[]`, not `null`. OpenImplement
 // is computed here over the FULL open set — the authoritative implement-stage
 // count the MCP hint transports rather than re-deriving from a bounded Items.
-func buildRunConcernsPayload(open []*concern.Concern) *runConcernsPayload {
+func buildRunConcernsPayload(open []*concern.Concern, claimed map[uuid.UUID]struct{}) *runConcernsPayload {
 	out := &runConcernsPayload{
 		Open:    len(open),
 		ByState: make(map[string]int, 3),
@@ -2638,6 +2677,12 @@ func buildRunConcernsPayload(open []*concern.Concern) *runConcernsPayload {
 			// instead; the collapse/bound/marker logic is unchanged.
 			ShortSummary: concernShortSummary(c.DisplayNote()),
 		})
+		// Nil-safe: a nil claimed map yields ok==false for every lookup, so a run
+		// whose claims could not be loaded (or that has none) simply carries no
+		// markers.
+		if _, ok := claimed[c.ID]; ok {
+			out.Items[len(out.Items)-1].ClaimedByApproval = true
+		}
 	}
 	return out
 }

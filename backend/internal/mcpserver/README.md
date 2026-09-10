@@ -38,9 +38,9 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 275 identifiers, not 3
+## Exported surface: why 279 identifiers, not 3
 
-The package presents **275** exported top-level identifiers, but only the three
+The package presents **279** exported top-level identifiers, but only the three
 above are intended entry points. The other 272 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
@@ -891,6 +891,26 @@ What a waive does:
 - **Auth:** same write-scope pair as fix-up (`write:stages` or `write:fixups`); a run-bound token may waive only its own run's concerns (`cross_run_waive`, 403).
 
 Error surfaces propagated as tool errors: `validation_failed` (400 — empty reason / bad UUID, both also caught locally before the HTTP hop), `cross_run_waive` (403), `concern_not_found` (404), `concern_waive_conflict` (422 — the concern is already `waived`/`superseded`/`addressed`; details carry the rejected `from`/`to` pair), `concern_store_unconfigured` (503).
+
+## Bulk concern waiver (`fishhawk_waive_concerns`)
+
+`fishhawk_waive_concerns` (E64.77 / [#3318](https://github.com/kuhlman-labs/fishhawk/issues/3318)) is the **bulk** sibling of the tool above: it waives a LIST of one run's open concerns under **one** audited reason, wrapping `POST /v0/runs/{run_id}/concerns/waive`. It exists for the merge-gate case a campaign surfaced — a run reaching its gate with a dozen concerns the operator has already judged non-blocking, each otherwise costing its own round trip.
+
+**Prefer the singular `fishhawk_waive_concern` when the concerns need DIFFERENT reasons.** The reason is what later re-reviews read verbatim, so one that only fits part of the batch is worse than N calls. And before reaching for either on PLAN-stage concerns, consider `fishhawk_approve_plan`'s `claims_all_open_plan_concerns`: a concern your binding condition already answers self-settles to `addressed_by_condition` at the confirming implement review and should not be waived at all.
+
+| Field | Required | Notes |
+|---|---|---|
+| `run_id` | **yes** | The run whose concerns to waive. Every id must belong to THIS run. |
+| `concern_ids` | **yes** | At most 50 per batch; duplicates and non-UUIDs are refused. |
+| `reason` | **yes** | Recorded on EVERY `concern_waived` entry in the batch and as each concern's `state_reason`. |
+| `delegated` | no | ADR-040 delegated-action path; evaluated ONCE for the run before anything is appended. |
+
+The two halves have deliberately different atomicity, and a caller must not assume all-or-nothing across both:
+
+- **PRE-VALIDATION is all-or-nothing and mutates NOTHING.** The first violation refuses the whole batch naming the offending id.
+- **the APPLY loop is per-item.** The batch is not a database transaction (each concern carries its own audit row), so a concurrent transition that raced the validation fails ONE concern while the rest still apply. Read `results[]` — it is in REQUEST order and each entry carries `applied` plus either `state`/`state_reason` or `error_code`/`error`. `waived + failed == len(concern_ids)`.
+
+`error_code` reuses the single verb's vocabulary (`concern_waive_conflict`, `audit_append_failed`, `internal_error`). Error surfaces propagated as tool errors: a local pre-flight refusal (bad `run_id` UUID, empty `concern_ids`, blank `reason` — all caught before the HTTP hop), `validation_failed` (400 — over the cap, a non-UUID, a duplicate (deduped on the PARSED uuid, so two spellings of one id collide), or an id from another run carrying `details.rule` `concern_run_mismatch`), `cross_run_waive` (403), `concern_not_found` (404), `concern_waive_conflict` (422 — an id is not open; the WHOLE batch is refused), `concern_store_unconfigured` (503).
 
 ## Concern defer (`fishhawk_defer_concern`)
 

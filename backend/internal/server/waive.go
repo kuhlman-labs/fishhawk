@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -178,44 +179,23 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 
 	// Durable-record-first: append the concern_waived intent entry BEFORE
 	// the state mutation. Append failure is request failure — no
-	// mutation may occur without the audit record.
+	// mutation may occur without the audit record. The ordering itself lives
+	// in applyConcernWaive, SHARED with the bulk verb so the two paths cannot
+	// drift (E64.77 / #3318).
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
 	}
-	actorKind := actorKindForSubject(subject)
-	waivedFields := map[string]any{
-		"concern_id":  row.ID.String(),
-		"prior_state": string(row.State),
-		"reason":      reqBody.Reason,
-		"stage_kind":  row.StageKind,
-		"severity":    row.Severity,
-		"category":    row.Category,
-	}
-	if delegatedRule != "" {
-		waivedFields["delegated"] = delegatedRule
-	}
-	payload, _ := json.Marshal(waivedFields)
-	if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
-		RunID:        row.RunID,
-		StageID:      &row.StageID,
-		Timestamp:    time.Now().UTC(),
-		Category:     CategoryConcernWaived,
-		ActorKind:    &actorKind,
-		ActorSubject: &subject,
-		Payload:      payload,
-	}); aerr != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "audit_append_failed",
-			"appending the concern_waived audit entry failed; the waive was NOT applied",
-			map[string]any{"error": aerr.Error()})
-		return
-	}
-
-	updated, err := s.cfg.ConcernRepo.ApplyResolution(r.Context(), concernID, concern.StateWaived, reqBody.Reason)
+	updated, err := s.applyConcernWaive(r.Context(), row, reqBody.Reason, subject,
+		actorKindForSubject(subject), delegatedRule, false)
 	if err != nil {
-		// The intent entry is already durable; keep the chain truthful
-		// with a corrective entry naming the actual outcome (warn-only).
-		s.writeConcernWaiveFailedAudit(r, row, err)
+		var appendErr concernWaiveAuditAppendError
+		if errors.As(err, &appendErr) {
+			s.writeError(w, r, http.StatusInternalServerError, "audit_append_failed",
+				"appending the concern_waived audit entry failed; the waive was NOT applied",
+				map[string]any{"error": appendErr.Unwrap().Error()})
+			return
+		}
 		var bad concern.InvalidTransitionError
 		if errors.As(err, &bad) {
 			s.writeError(w, r, http.StatusUnprocessableEntity, "concern_waive_conflict",
@@ -251,7 +231,7 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 // concern_waived intent entry. Best-effort/warn-only: the 4xx/5xx response
 // already tells the operator the waive did not land; this entry exists so
 // the audit chain never shows an intent without its outcome.
-func (s *Server) writeConcernWaiveFailedAudit(r *http.Request, row *concern.Concern, cause error) {
+func (s *Server) writeConcernWaiveFailedAudit(ctx context.Context, row *concern.Concern, cause error) {
 	actual := string(row.State)
 	var bad concern.InvalidTransitionError
 	if errors.As(cause, &bad) {
@@ -264,7 +244,7 @@ func (s *Server) writeConcernWaiveFailedAudit(r *http.Request, row *concern.Conc
 		"error":          cause.Error(),
 	})
 	systemKind := audit.ActorSystem
-	if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     row.RunID,
 		StageID:   &row.StageID,
 		Timestamp: time.Now().UTC(),
@@ -272,10 +252,76 @@ func (s *Server) writeConcernWaiveFailedAudit(r *http.Request, row *concern.Conc
 		ActorKind: &systemKind,
 		Payload:   payload,
 	}); aerr != nil {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"waive: append corrective concern_waive_failed entry failed",
 			slog.String("run_id", row.RunID.String()),
 			slog.String("concern_id", row.ID.String()),
 			slog.String("error", aerr.Error()))
 	}
+}
+
+// concernWaiveAuditAppendError distinguishes the audit-APPEND failure from a
+// transition failure in applyConcernWaive's single error return. The two map to
+// different operator-facing outcomes — 500 audit_append_failed with NO mutation
+// and no corrective entry, versus a 422/404/500 that DID durably record intent
+// and therefore also appended the corrective concern_waive_failed entry — so
+// collapsing them into one opaque error would make the bulk path unable to
+// report the same per-item error_code vocabulary the single path uses.
+type concernWaiveAuditAppendError struct{ err error }
+
+func (e concernWaiveAuditAppendError) Error() string { return e.err.Error() }
+func (e concernWaiveAuditAppendError) Unwrap() error { return e.err }
+
+// applyConcernWaive is the SHARED durable-record-first waive body behind both
+// POST /v0/concerns/{concern_id}/waive and the bulk
+// POST /v0/runs/{run_id}/concerns/waive (E64.77 / #3318). Extracting it is what
+// makes the ordering invariant impossible to drift between the two verbs:
+//
+//  1. append the concern_waived intent entry FIRST. On failure return
+//     concernWaiveAuditAppendError with NO mutation and NO corrective entry —
+//     there is no intent on the chain to correct;
+//  2. ApplyResolution to the terminal waived state. On failure append the
+//     corrective concern_waive_failed entry (warn-only) naming the actual state,
+//     then return the transition error unwrapped so the caller can map
+//     InvalidTransitionError -> 422 and ErrNotFound -> 404.
+//
+// bulk stamps an ADDITIVE bulk_waive:true marker on the payload so an operator
+// reading the chain can tell a batched waive from a single one. The single path
+// passes bulk=false and its payload stays byte-identical to pre-#3318.
+func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, reason, subject string, actorKind audit.ActorKind, delegatedRule string, bulk bool) (*concern.Concern, error) {
+	waivedFields := map[string]any{
+		"concern_id":  row.ID.String(),
+		"prior_state": string(row.State),
+		"reason":      reason,
+		"stage_kind":  row.StageKind,
+		"severity":    row.Severity,
+		"category":    row.Category,
+	}
+	if delegatedRule != "" {
+		waivedFields["delegated"] = delegatedRule
+	}
+	if bulk {
+		waivedFields["bulk_waive"] = true
+	}
+	payload, _ := json.Marshal(waivedFields)
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        row.RunID,
+		StageID:      &row.StageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryConcernWaived,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}); aerr != nil {
+		return nil, concernWaiveAuditAppendError{err: aerr}
+	}
+
+	updated, err := s.cfg.ConcernRepo.ApplyResolution(ctx, row.ID, concern.StateWaived, reason)
+	if err != nil {
+		// The intent entry is already durable; keep the chain truthful with a
+		// corrective entry naming the actual outcome (warn-only).
+		s.writeConcernWaiveFailedAudit(ctx, row, err)
+		return nil, err
+	}
+	return updated, nil
 }

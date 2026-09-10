@@ -1650,3 +1650,104 @@ func TestCompletionBlocked_NamesTheLowestSequenceBlocker(t *testing.T) {
 		t.Errorf("recovery = %q, want none: the blocking stage is a running implement", got.Recovery)
 	}
 }
+
+// TestRunConcerns_ClaimedByApprovalMarker pins the #3318 run-status marker: an
+// open plan-stage concern an approval's claims_concern_ids names carries
+// claimed_by_approval:true, and an unclaimed plan concern and an implement
+// concern do not. Asserted against the RAW body through the real handler,
+// because an omitempty bool regression yields an ABSENT key (never an error),
+// which a struct-only assertion cannot distinguish from false.
+func TestRunConcerns_ClaimedByApprovalMarker(t *testing.T) {
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr, AuditRepo: au})
+
+	got, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s", TriggerSource: run.TriggerCLI,
+	})
+	claimedPlan := seedConcernRow(t, cr, got.ID, uuid.New(), "plan", 10, "claimed by the condition")
+	unclaimedPlan := seedConcernRow(t, cr, got.ID, uuid.New(), "plan", 11, "still needs a decision")
+	impl := seedConcernRow(t, cr, got.ID, uuid.New(), "implement", 12, "an implement concern")
+	seedApprovalEntry(au, got.ID, 42, "approve", "brett", []string{claimedPlan.ID.String()})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var raw struct {
+		Concerns *struct {
+			Items []map[string]any `json:"items"`
+		} `json:"concerns"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if raw.Concerns == nil {
+		t.Fatalf("concerns block missing:\n%s", w.Body.String())
+	}
+	byID := map[string]map[string]any{}
+	for _, item := range raw.Concerns.Items {
+		id, _ := item["id"].(string)
+		byID[id] = item
+	}
+	if got := byID[claimedPlan.ID.String()]["claimed_by_approval"]; got != true {
+		t.Errorf("claimed plan concern claimed_by_approval = %v, want true:\n%s", got, w.Body.String())
+	}
+	if _, present := byID[unclaimedPlan.ID.String()]["claimed_by_approval"]; present {
+		t.Errorf("unclaimed plan concern carries claimed_by_approval, want the key absent:\n%s", w.Body.String())
+	}
+	if _, present := byID[impl.ID.String()]["claimed_by_approval"]; present {
+		t.Errorf("implement concern carries claimed_by_approval, want the key absent:\n%s", w.Body.String())
+	}
+}
+
+// TestRunConcerns_AuditReadFailure_BlockStillPresent is the #3043
+// presence-is-authoritative control: the claims load is BEST-EFFORT, so an
+// audit-store failure must omit only the MARKERS. The concerns block itself
+// must stay present — its absence is the wire signal for "the open set could
+// not be read", which the MCP review-action hint reads, and corrupting that
+// distinction would silently degrade an authoritative count to a fallback.
+func TestRunConcerns_AuditReadFailure_BlockStillPresent(t *testing.T) {
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	au := newAuditFake()
+	au.listByCategoryErr = errors.New("audit store down")
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr, AuditRepo: au})
+
+	got, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s", TriggerSource: run.TriggerCLI,
+	})
+	planRow := seedConcernRow(t, cr, got.ID, uuid.New(), "plan", 10, "a plan concern")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var raw struct {
+		Concerns *struct {
+			Open  int              `json:"open"`
+			Items []map[string]any `json:"items"`
+		} `json:"concerns"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if raw.Concerns == nil {
+		t.Fatalf("concerns block ABSENT after a claims-load failure — presence must stay authoritative (#3043):\n%s", w.Body.String())
+	}
+	if raw.Concerns.Open != 1 || len(raw.Concerns.Items) != 1 {
+		t.Fatalf("concerns = open %d / %d items, want the open set rendered:\n%s",
+			raw.Concerns.Open, len(raw.Concerns.Items), w.Body.String())
+	}
+	if raw.Concerns.Items[0]["id"] != planRow.ID.String() {
+		t.Errorf("item id = %v, want %s", raw.Concerns.Items[0]["id"], planRow.ID)
+	}
+	if _, present := raw.Concerns.Items[0]["claimed_by_approval"]; present {
+		t.Errorf("claimed_by_approval present despite an unreadable audit store, want the marker omitted:\n%s", w.Body.String())
+	}
+}

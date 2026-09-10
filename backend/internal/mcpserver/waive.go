@@ -97,3 +97,100 @@ func (r *runResolver) waiveConcern(ctx context.Context, _ *mcp.CallToolRequest, 
 	}
 	return nil, WaiveConcernOutput{Concern: *waived}, nil
 }
+
+// WaiveConcernsInput is the fishhawk_waive_concerns (plural) tool's input
+// schema (E64.77 / #3318). Mirrors
+// `POST /v0/runs/{run_id}/concerns/waive`: a list of concern ids and ONE
+// reason covering the whole batch.
+type WaiveConcernsInput struct {
+	RunID      string   `json:"run_id" jsonschema:"the run whose concerns to waive; every id must belong to THIS run"`
+	ConcernIDs []string `json:"concern_ids" jsonschema:"the stable concern UUIDs to waive (from fishhawk_get_run_status's run.concerns.items[].id or fishhawk_get_gate_view). At most 50 per batch; duplicates are rejected"`
+	Reason     string   `json:"reason" jsonschema:"REQUIRED operator rationale, recorded on EVERY concern_waived audit entry in the batch and stored as each concern's state_reason. One reason covers the batch — make it self-contained, since later re-reviews read it verbatim"`
+	Delegated  bool     `json:"delegated,omitempty" jsonschema:"opt the batch into the ADR-040 delegated-action path; the may_waive condition is evaluated ONCE for the run before anything is appended"`
+}
+
+// WaiveConcernsOutput surfaces the per-item outcome list plus the counts.
+type WaiveConcernsOutput struct {
+	Result BulkWaiveResult `json:"result"`
+}
+
+// registerWaiveConcerns wires the fishhawk_waive_concerns tool (E64.77 /
+// #3318): the BULK sibling of fishhawk_waive_concern, for the merge-gate case
+// where a run carries a dozen open concerns the operator has already judged
+// non-blocking and each one today costs its own round trip.
+//
+// Auth: write tool, same scope pair as the single waive; a run-bound MCP token
+// may only bulk-waive its own run.
+func registerWaiveConcerns(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_waive_concerns",
+		Description: strings.TrimSpace(`
+Waive SEVERAL of one run's open concerns in a single call, with one
+required, audited reason.
+
+Use this at a merge gate when a batch of recorded concerns does NOT
+warrant a change and they share one rationale — the bulk sibling of
+fishhawk_waive_concern, which you should still prefer when the concerns
+need DIFFERENT reasons (the reason is what later re-reviews read, so a
+reason that only fits some of the batch is worse than N calls).
+
+Eligibility: every id must be a concern of THIS run in an OPEN state
+(raised, addressed_pending, reopened). Plan-stage and implement-stage
+concerns can both be waived. Waiving is terminal — there is no un-waive.
+
+Before reaching for this on plan-stage concerns, consider
+fishhawk_approve_plan's claims_all_open_plan_concerns instead: a concern
+your binding approval condition already answers self-settles to
+addressed_by_condition at the confirming implement review and should not
+be waived at all.
+
+The two halves have deliberately different atomicity:
+
+  - PRE-VALIDATION is all-or-nothing and mutates NOTHING. The first
+    violation refuses the WHOLE batch, naming the offending id.
+  - the APPLY loop is per-item. A concurrent transition that raced the
+    validation fails ONE concern; the rest still apply. Read results[]
+    (request order) rather than assuming all-or-nothing here.
+
+Returns {waived, failed, results[]}, where waived + failed == the number
+of ids and each result carries concern_id, applied, and either
+state/state_reason or error_code/error (error_code is the same
+vocabulary the single waive uses: concern_waive_conflict,
+audit_append_failed, internal_error).
+
+Returns a tool error on:
+  - invalid run_id UUID, empty concern_ids, or empty reason (caught
+    before the HTTP hop)
+  - validation_failed (400: over the 50-id cap, a duplicate id, a
+    non-UUID id, or an id belonging to another run — details.rule
+    concern_run_mismatch)
+  - concern_not_found (404: an id with no row)
+  - concern_waive_conflict (422: an id is not open — the WHOLE batch is
+    refused and nothing is waived)
+  - cross_run_waive (403: a run-bound token reaching another run)
+  - concern_store_unconfigured (503)
+`),
+	}, resolver.waiveConcerns)
+}
+
+// waiveConcerns is the tool handler. Thin wrapper over the client's
+// BulkWaiveConcerns; the pre-validation ladder, the per-item audit-before-
+// mutation ordering, and the subject-binding guard all live server-side in
+// server/bulk_waive.go.
+func (r *runResolver) waiveConcerns(ctx context.Context, _ *mcp.CallToolRequest, in WaiveConcernsInput) (*mcp.CallToolResult, WaiveConcernsOutput, error) {
+	runID, err := uuid.Parse(in.RunID)
+	if err != nil {
+		return nil, WaiveConcernsOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+	if len(in.ConcernIDs) == 0 {
+		return nil, WaiveConcernsOutput{}, fmt.Errorf("concern_ids must name at least one concern")
+	}
+	if strings.TrimSpace(in.Reason) == "" {
+		return nil, WaiveConcernsOutput{}, fmt.Errorf("reason is required: the waive rationale is audited on every concern in the batch and shown to later re-reviews")
+	}
+	res, err := r.api.BulkWaiveConcerns(ctx, runID, in.ConcernIDs, in.Reason, in.Delegated)
+	if err != nil {
+		return nil, WaiveConcernsOutput{}, fmt.Errorf("bulk waive concerns: %w", err)
+	}
+	return nil, WaiveConcernsOutput{Result: *res}, nil
+}

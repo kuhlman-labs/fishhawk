@@ -165,6 +165,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/stages/{stage_id}/retry", s.requireStageAccount(memberWrite, s.handleRetryStage))
 	mux.HandleFunc("POST /v0/stages/{stage_id}/acceptance-admission", s.requireStageAccount(memberWrite, s.handleAcceptanceAdmission))
 	mux.HandleFunc("POST /v0/stages/{stage_id}/fixup", s.requireStageAccount(memberWrite, s.handleFixupStage))
+	mux.HandleFunc("POST /v0/runs/{run_id}/concerns/waive", s.requireRunAccount(memberWrite, s.handleBulkWaiveConcerns))
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive", s.requireConcernAccount(memberWrite, s.handleWaiveConcern))
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/defer", s.requireConcernAccount(memberWrite, s.handleDeferConcern))
 	mux.HandleFunc("GET /v0/artifacts/{artifact_id}", s.handleGetArtifact)

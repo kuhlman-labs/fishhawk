@@ -4446,3 +4446,53 @@ curl -sS "$FISHHAWK_BACKEND_URL/v0/runs/$RUN_ID/audit?category=merge_observation
   | jq '.items | length, .[0].payload.merge_commit_sha, .[0].payload.merged_at'
 # -> 1, "<sha>", "<forge time>"
 ```
+
+## Bulk concern waive + the condition-claim shorthand (`bulk_waive.go`, `condition_claims.go`, E64.77 / #3318)
+
+Three surfaces closing the merge-gate concern-waiver toil a 2026-09 campaign surfaced, built on the existing #1956 condition-claim machinery rather than beside it.
+
+### `claims_all_open_plan_concerns` — the approve-time expansion
+
+`POST /v0/stages/{id}/approvals` accepts `claims_all_open_plan_concerns: true` as the shorthand for `claims_concern_ids`. `expandAllOpenPlanConcernClaims` resolves it PRE-Submit into the run's full open PLAN-stage concern id set (`ConcernRepo.ListOpenByRun`, filtered to `StageKindPlan`, in origin-sequence order) and the handler threads THOSE ids through the existing `claims_concern_ids` channel — so `writeApprovalAudit` records them under the same audit key, and the whole downstream path (`loadApprovalConcernClaims` → `resolveConditionClaimedPlanConcerns` → `concern_addressed_by_condition`) runs byte-identically with no change at all.
+
+The semantics are a **SNAPSHOT taken during the approve request**, not a continuously-evaluated set. That is the load-bearing choice: expanding at approve time is what lets the resolution path stay unchanged and makes the operator's claim reconstructable from the `approval_submitted` payload alone. The consequence, stated rather than hidden: a concern raised AFTER the approval is NOT claimed and still needs its own decision.
+
+Two additive intent keys ride the same payload — `claims_all_open_plan_concerns: true` and `claims_all_open_plan_concerns_expanded: <count>` — so a shorthand approve is distinguishable from one that hand-listed the same ids, and an expansion that legitimately resolved to ZERO concerns still leaves a trace of the declared intent. Both are omitted otherwise, so a non-shorthand approve marshals byte-identically to pre-#3318.
+
+Named refusals, all pre-Submit (a malformed shorthand inserts NO approval row, so a corrected retry flows normally — the `binding_assertions` / `claims_concern_ids` posture):
+
+| Condition | Response |
+|---|---|
+| `decision != approve` | 400 `validation_failed`, `details.field` |
+| non-plan stage | 400 `validation_failed`, `details.stage_type` |
+| `claims_concern_ids` also non-empty | 400 `validation_failed`, `details.rule` `claims_all_and_explicit_ids` |
+| `ConcernRepo` unwired | 503 `concern_store_unconfigured` |
+| `ListOpenByRun` failed | 500 `internal_error` |
+
+The two channels are **mutually exclusive** because the expansion is always a superset of any valid explicit list: accepting both would make the recorded audit claim ambiguous about operator intent. A store outage is a 500 rather than a 400 for the same reason `validateClaimsConcernIDs` distinguishes them — a transient failure is retryable, not an operator-corrected input, and collapsing it into a 400 would point the operator at re-reading ids.
+
+An EMPTY expansion (no open plan concerns at approval time) is legal: nothing to claim is not an error.
+
+### `claimed_by_approval` — the run-status marker
+
+`GET /v0/runs/{run_id}`'s `concerns.items[]` gain `claimed_by_approval` (omitempty), true when the run's newest claiming approval covers that concern. It means: this concern will self-settle to `addressed_by_condition` at the first confirming implement review and needs no hand waive at the merge gate.
+
+It is only useful while the concern is still OPEN — a settled one has left the list — so the marker is what tells an operator, AT the gate, which of the open concerns they can leave alone. `handleGetRun` loads the claims only when the open set contains at least one plan-stage concern; that gate is a pure PERFORMANCE guard with no behavioural signature (an approval's claim set contains only plan-stage ids, so a run with no open plan concerns yields an empty claimed set either way) and is deliberately not claimed as a control. The load is best-effort exactly like the surrounding Drive block: `loadApprovalConcernClaims` warn-logs and returns nil on any failure, so the MARKERS are simply absent. The concerns block itself must never become absent because of this — presence stays the authoritative store-read signal the MCP review-action hint reads (#3043).
+
+### `POST /v0/runs/{run_id}/concerns/waive` — the bulk verb
+
+Waives a LIST of one run's open concerns under ONE audited reason, recording one `concern_waived` audit row per concern (each carrying an additive `bulk_waive: true` marker; the single path passes `bulk=false` and its payload is byte-identical to before).
+
+Auth mirrors `handleWaiveConcern`: authenticated required, `write:stages` OR `write:fixups`, and the `mcp:run:` subject-binding guard — compared here against the **PATH** run id, which is what makes the same-run invariant structural on this route and lets the guard decide without a concern read.
+
+**Pre-validation is ALL-OR-NOTHING and mutates NOTHING.** First violation wins, each naming the offending id: blank reason, empty `concern_ids`, more than `bulkWaiveMaxConcerns` (50) ids, a non-UUID id, a duplicate id (all 400 `validation_failed`; ids are parsed BEFORE the duplicate check and deduped on the PARSED `uuid.UUID`, not the raw string, so two spellings of one id — `uuid.Parse` accepts case-insensitive hex, the `urn:uuid:` prefix, braces and the dash-less 32-hex form — collide rather than slipping through to append two `concern_waived` rows for one concern; the refusal carries `concern_id` (the raw spelling sent), `canonical_concern_id` and `first_spelling`); an unwired store (503); an unknown id (404 `concern_not_found`); an id whose `RunID` is not the path run (400 `validation_failed` with `details.rule` `concern_run_mismatch` — the top-level code stays the house-convention `validation_failed` and the specific rule travels in `details`, matching the acceptance-amendment refusals); an id not in an OPEN state (422 `concern_waive_conflict` naming the id and the from/to pair). A `delegated: true` batch evaluates `checkDelegation` ONCE for the run before any intent entry is appended — every batched concern shares the run, so a per-item re-evaluation would read the same state N times.
+
+**The apply loop is PER-ITEM, and the batch is deliberately NOT a database transaction.** Each concern carries its own chained audit row; wrapping N audit appends plus N transitions in one transaction would either serialize the chain append or leave the chain and the concern store inconsistent on rollback. So a concurrent transition landing between validation and apply fails ONE item while the rest still apply — reported honestly as per-item `results` rather than a single misleading status.
+
+The 200 body is `{run_id, reason, waived, failed, results[]}`. **The counting rule:** `waived` counts results with `applied == true` and `failed` counts `applied == false`, so a three-item batch whose SECOND item fails reports `waived: 2` / `failed: 1` with `results` carrying `[applied=true, applied=false, applied=true]` in REQUEST order. `error_code` reuses the single path's vocabulary (`concern_waive_conflict` / `audit_append_failed` / `internal_error`) so an operator reads one code set across both verbs.
+
+The 50-id cap is an arbitrary but STATED bound on the audit-append fan-out and the response size; the campaign that motivated this issue waived roughly 90 concerns across many runs, so a per-RUN batch of 50 sits comfortably above the observed per-run need. It is a named 400 refusal, never a silent truncation.
+
+### The shared `applyConcernWaive` helper
+
+`waive.go` now carries the durable-record-first body as one unexported helper both verbs call, so the ordering invariant cannot drift between them: append the `concern_waived` intent entry FIRST (failure returns `concernWaiveAuditAppendError` with NO mutation and NO corrective entry — there is no intent on the chain to correct), then `ApplyResolution`, and on ITS failure append the corrective `concern_waive_failed` entry before returning the transition error unwrapped so the caller can map `InvalidTransitionError` → 422 and `ErrNotFound` → 404. The typed append error is what lets the bulk path report the same per-item `error_code` vocabulary the single path uses.

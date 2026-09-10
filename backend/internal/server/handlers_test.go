@@ -1,12 +1,15 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 )
@@ -611,5 +614,38 @@ func assertOAuthRouteRegistered(t *testing.T, method, path string) {
 	}
 	if !strings.Contains(rec.Body.String(), "oauth_as_unconfigured") {
 		t.Fatalf("%s %s: body = %s, want oauth_as_unconfigured", method, path, rec.Body.String())
+	}
+}
+
+// TestBulkWaiveConcernsRouteRegistered guards the route table, following this
+// package's per-route convention: drive the pattern through the REAL mux and
+// assert it reaches the handler's own auth ladder (401 authentication_required)
+// rather than the mux's default 404. It is SELF-PAIRED against a near-miss
+// sibling path that is deliberately NOT registered — so the 401-vs-404
+// discrimination is demonstrated inside the test rather than assumed, and an
+// unregistered route cannot green it.
+func TestBulkWaiveConcernsRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	runID := uuid.New()
+	body, _ := json.Marshal(bulkWaiveRequest{ConcernIDs: []string{uuid.NewString()}, Reason: "r"})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID.String()+"/concerns/waive", bytes.NewReader(body))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (the route reaches handleBulkWaiveConcerns' auth ladder):\n%s", rec.Code, rec.Body.String())
+	}
+	if code, _ := bulkWaiveErrorEnvelope(t, rec); code != "authentication_required" {
+		t.Errorf("error code = %q, want authentication_required", code)
+	}
+
+	// Self-pairing: an UNregistered near-miss under the same prefix must 404, so
+	// the assertion above genuinely distinguishes registered from not.
+	missRec := httptest.NewRecorder()
+	missReq := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID.String()+"/concerns/waive-all", bytes.NewReader(body))
+	s.Handler().ServeHTTP(missRec, missReq)
+	if missRec.Code != http.StatusNotFound {
+		t.Fatalf("unregistered near-miss path returned %d, want 404 — the discrimination this test relies on does not hold:\n%s",
+			missRec.Code, missRec.Body.String())
 	}
 }

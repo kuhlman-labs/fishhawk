@@ -166,9 +166,10 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_revive_run":  {anyOf: []string{"write:stages", scopeRunBoundRetry}}, // revive.go handleReviveRun
 
 	// fixup.go / waive.go / defer_concern.go: `write:stages OR write:fixups`.
-	"fishhawk_fixup_stage":   {anyOf: []string{"write:stages", scopeFixupAlternate}},
-	"fishhawk_waive_concern": {anyOf: []string{"write:stages", scopeFixupAlternate}},
-	"fishhawk_defer_concern": {anyOf: []string{"write:stages", scopeFixupAlternate}},
+	"fishhawk_fixup_stage":    {anyOf: []string{"write:stages", scopeFixupAlternate}},
+	"fishhawk_waive_concern":  {anyOf: []string{"write:stages", scopeFixupAlternate}},
+	"fishhawk_waive_concerns": {anyOf: []string{"write:stages", scopeFixupAlternate}}, // bulk_waive.go handleBulkWaiveConcerns (E64.77 / #3318) — same predicate as the singular verb
+	"fishhawk_defer_concern":  {anyOf: []string{"write:stages", scopeFixupAlternate}},
 
 	// --- write:approvals.
 	"fishhawk_approve_plan":                 {anyOf: []string{"write:approvals"}}, // approvals.go handleSubmitApproval
