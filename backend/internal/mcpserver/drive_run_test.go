@@ -4427,3 +4427,52 @@ func TestDriveRun_InheritsBoundWorkingDir(t *testing.T) {
 		t.Errorf("argv missing inherited --working-dir %q: %v", bound, joined)
 	}
 }
+
+// TestDriveRun_AcceptanceNeedsTarget_StepNamesPreviewCommand pins the drive
+// loop's half of #3321: its needs_target stop step now names the CONCRETE
+// bring-up command, with NO FISHHAWK_ACCEPTANCE_PREVIEW_CMD configured (the
+// drive loop carries no auto_preview flag, so this is the defaulted path). Its
+// PROCEED behaviour is unchanged — TestDriveRun_AcceptanceNeedsTargetVerified_Dispatches
+// and TestDriveRun_AcceptancePreviewCmdSet_Dispatches below re-run unchanged.
+func TestDriveRun_AcceptanceNeedsTarget_StepNamesPreviewCommand(t *testing.T) {
+	origAttempts := acceptanceQuickProbeAttempts
+	acceptanceQuickProbeAttempts = 1
+	t.Cleanup(func() { acceptanceQuickProbeAttempts = origAttempts })
+
+	target := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
+	targetHost := hostOf(target.URL)
+	target.Close()
+
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveAccID, "acceptance", "pending", 2),
+	})
+	f.admissionNeedsTarget = true
+	f.admissionTargetHosts = []string{targetHost}
+	f.admissionExpectedHeadSHA = probeExpectedSHA
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{Note: "observe-only"}
+	})
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedAcceptanceNeedsTarget {
+		t.Fatalf("stopped_reason = %q, want acceptance_needs_target", out.StoppedReason)
+	}
+	want := "scripts/dev preview " + probeExpectedSHA
+	var found bool
+	for _, s := range out.StepsTaken {
+		if s.Kind == "dispatch" && s.Stage == "acceptance" && strings.Contains(s.Note, want) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no drive step names the concrete bring-up command %q; steps: %+v", want, out.StepsTaken)
+	}
+}

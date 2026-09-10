@@ -547,7 +547,15 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// Verified / unverifiable / no-hosts / preview-cmd-set all proceed
 		// (checkAcceptanceTarget returns nil), preserving runner parity and the
 		// #1928 fail-open contract for the branches that remain fail-open.
-		if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission); refusal != nil {
+		// E68.43 (#3321): the preview cmd is resolved from the ENV ONLY here
+		// (autoPreview false) — fishhawk_run_stage carries no auto_preview flag,
+		// so this verb's PROCEED behaviour is byte-identical to today. What
+		// changes is the REFUSAL, which now carries the concrete bring-up
+		// command the renderer defaults.
+		previewCmd, previewSource := resolveAcceptancePreviewCmd(r.getenv, false)
+		if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission, acceptanceTargetOpts{
+			workingDir: workingDir, previewCmd: previewCmd, previewSource: previewSource,
+		}); refusal != nil {
 			stageState := ""
 			var stageWaitStatus *StageWaitStatus
 			if fetchErr := func() error {
@@ -863,6 +871,14 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// ceiling-of-one budget is spent. Fail-open like every other derivation
 		// here: an un-fetched recent slice degrades to silence.
 		foldConflictResolutionAdvisory(&runView.Run, recentAudit, nextActions)
+		// E68.43 (#3321): the same display-only acceptance-preview fold
+		// getRunStatus applies, off the SAME recentAudit slice, so the
+		// post-stage snapshot and the status snapshot cannot diverge on whether
+		// the acceptance dispatch's preview precondition was named. autoPreview
+		// is false for the same reason it is in getRunStatus — this renders a
+		// snapshot, it does not dispatch.
+		previewCmd, _ := resolveAcceptancePreviewCmd(r.getenv, false)
+		foldAcceptancePreviewAdvisory(&runView.Run, previewCmd, latestReportedHeadSHA(recentAudit), nextActions)
 	}
 
 	out := RunStageOutput{

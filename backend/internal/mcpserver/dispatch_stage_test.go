@@ -1089,6 +1089,12 @@ type dispatchAutoDriveFake struct {
 	// admission POST — used to fail the post-short-circuit stage fetch while the
 	// pre-admission reads succeed (#1928 untested-error-path concern).
 	stagesFailAfterAdmission bool
+	// runnerKind / runnerKindResolved seed GET /v0/runs/{id}'s runner-kind lock
+	// so guardHostDispatch's known-non-host-dispatched refusal can be driven
+	// (E68.43 / #3321). Zero values keep the run UNLOCKED, which is what every
+	// pre-existing test using this fake expects.
+	runnerKind         string
+	runnerKindResolved bool
 }
 
 func (f *dispatchAutoDriveFake) stageTypeOrDefault() string {
@@ -1177,8 +1183,15 @@ func (f *dispatchAutoDriveFake) handler() http.HandlerFunc {
 			f.mu.Unlock()
 			_ = json.NewEncoder(w).Encode(HostDispatchResult{Transitioned: true, StageState: "dispatched"})
 		default:
-			// guardHostDispatch's GET /v0/runs/{id}: an unlocked run so the guard passes.
-			_ = json.NewEncoder(w).Encode(Run{ID: f.runID.String(), Repo: "x/y", State: "running"})
+			// guardHostDispatch's GET /v0/runs/{id}: unlocked by default so the
+			// guard passes; the runnerKind* fixtures lock it when set.
+			f.mu.Lock()
+			kind, resolved := f.runnerKind, f.runnerKindResolved
+			f.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(Run{
+				ID: f.runID.String(), Repo: "x/y", State: "running",
+				RunnerKind: kind, RunnerKindResolved: resolved,
+			})
 		}
 	}
 }
@@ -2276,5 +2289,283 @@ func TestDispatchStage_RunnerScope_SurfacesBootstrapWarning(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("advisory not surfaced in DispatchStageOutput.Warnings: %v", out.Warnings)
+	}
+}
+
+// --- (E68.43 / #3321) auto_preview: verb -> gate -> spawn-env -------------
+
+// autoPreviewSpawnCapture substitutes the detached-spawn seam and records every
+// (binary, argv, env) it is handed WITHOUT launching a runner or a reaper. It
+// returns the recorder; calls is the invocation count, so a test can assert the
+// seam was NEVER reached.
+type autoPreviewSpawnCapture struct {
+	calls int
+	envs  [][]string
+}
+
+func captureAutoPreviewSpawn(t *testing.T) *autoPreviewSpawnCapture {
+	t.Helper()
+	cap := &autoPreviewSpawnCapture{}
+	saved := dispatchSpawnDetached
+	dispatchSpawnDetached = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
+		cap.calls++
+		cap.envs = append(cap.envs, append([]string(nil), env...))
+		return "/dev/null", nil
+	}
+	t.Cleanup(func() { dispatchSpawnDetached = saved })
+	return cap
+}
+
+// envValue reads the LAST occurrence of key in an exec-style env slice, which is
+// the value the OS resolves when a key appears more than once.
+func envValue(env []string, key string) (string, bool) {
+	val, found := "", false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			val, found = strings.TrimPrefix(kv, key+"="), true
+		}
+	}
+	return val, found
+}
+
+// autoPreviewStaleTargetFake returns a fake backend serving a needs_target
+// acceptance admission against a REACHABLE target that serves a STALE git_sha.
+// That is the input that REFUSES without the preview-cmd proceed branch, so a
+// spawned handle here cannot be explained by anything but the branch under test.
+func autoPreviewStaleTargetFake(t *testing.T) (*dispatchAutoDriveFake, *httptest.Server) {
+	t.Helper()
+	origAttempts := acceptanceQuickProbeAttempts
+	acceptanceQuickProbeAttempts = 1
+	t.Cleanup(func() { acceptanceQuickProbeAttempts = origAttempts })
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"git_sha":"9f2c1ab"}`)) // stale
+	}))
+	t.Cleanup(target.Close)
+
+	f := &dispatchAutoDriveFake{
+		runID: uuid.New(), stageID: uuid.New(), stageType: "acceptance",
+		admissionNeedsTarget:     true,
+		admissionTargetHosts:     []string{hostOf(target.URL)},
+		admissionExpectedHeadSHA: probeExpectedSHA,
+	}
+	srv := httptest.NewServer(f.handler())
+	t.Cleanup(srv.Close)
+	return f, srv
+}
+
+// TestDispatchStage_AutoPreviewInjectsProvisionCmdIntoSpawnEnv is the
+// CROSS-BOUNDARY done-means for #3321 proposal 2, asserting in ONE test the two
+// halves that must agree for the runner to actually provision:
+//
+//	(1) the verb took the PROCEED branch — a spawned handle, not a needs_target
+//	    park — against a stale REACHABLE target that otherwise refuses; and
+//	(2) the captured spawn env carries FISHHAWK_ACCEPTANCE_PREVIEW_CMD=<default>.
+//
+// Deleting the env append reddens (2) while (1) still passes — precisely the
+// silent degradation (gate proceeds, runner provisions nothing) this exists to
+// catch (#3321 failure mode (c)).
+func TestDispatchStage_AutoPreviewInjectsProvisionCmdIntoSpawnEnv(t *testing.T) {
+	f, srv := autoPreviewStaleTargetFake(t)
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+	cap := captureAutoPreviewSpawn(t)
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", WorkingDir: t.TempDir(), PushAndOpenPR: boolPtr(false),
+		RunnerBinary: "/fake/fishhawk-runner",
+		AutoPreview:  true,
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	// (1) PROCEED: a spawned handle, not a park.
+	if out.NeedsTarget != nil {
+		t.Fatalf("NeedsTarget = %+v, want a SPAWNED handle — auto_preview must take the proceed branch", out.NeedsTarget)
+	}
+	if cap.calls != 1 {
+		t.Fatalf("spawn seam invoked %d times, want exactly 1", cap.calls)
+	}
+	// (2) the runner was actually handed the provision command.
+	got, found := envValue(cap.envs[0], acceptancePreviewCmdEnv)
+	if !found {
+		t.Fatalf("spawn env carries NO %s — the gate proceeded but the runner would provision nothing", acceptancePreviewCmdEnv)
+	}
+	if got != acceptancePreviewDefaultCmd {
+		t.Errorf("%s = %q, want %q", acceptancePreviewCmdEnv, got, acceptancePreviewDefaultCmd)
+	}
+	// The verb returns the durable handle immediately; it performs no bring-up
+	// itself (the ratified design deviation, #3321 condition 6).
+	if out.StageID == "" {
+		t.Error("StageID = empty, want the durable handle returned immediately")
+	}
+	joined := strings.Join(out.Warnings, "\n")
+	if !strings.Contains(joined, acceptancePreviewDefaultCmd) {
+		t.Errorf("warnings = %q, want one naming the command the runner will run", joined)
+	}
+}
+
+// TestDispatchStage_AutoPreviewInertOnImplementStage is #3321 failure mode (d):
+// the `in.Stage == "acceptance"` conjunct confines the flag. An implement
+// dispatch with auto_preview:true injects NOTHING. Deleting the conjunct
+// reddens it.
+func TestDispatchStage_AutoPreviewInertOnImplementStage(t *testing.T) {
+	f := &dispatchAutoDriveFake{runID: uuid.New(), stageID: uuid.New()} // implement
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+	cap := captureAutoPreviewSpawn(t)
+
+	if _, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", WorkingDir: t.TempDir(), PushAndOpenPR: boolPtr(false),
+		RunnerBinary: "/fake/fishhawk-runner",
+		AutoPreview:  true,
+	}); err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if cap.calls != 1 {
+		t.Fatalf("spawn seam invoked %d times, want exactly 1", cap.calls)
+	}
+	if got, found := envValue(cap.envs[0], acceptancePreviewCmdEnv); found {
+		t.Errorf("%s = %q injected on an IMPLEMENT dispatch; auto_preview must be inert outside the acceptance stage",
+			acceptancePreviewCmdEnv, got)
+	}
+}
+
+// TestDispatchStage_AutoPreviewPassesOperatorEnvThroughUnchanged pins that an
+// operator-set FISHHAWK_ACCEPTANCE_PREVIEW_CMD wins: the value the runner
+// resolves is the operator's, never overwritten by the built-in default, even
+// with auto_preview:true. The assertion reads the LAST occurrence, which is what
+// the OS resolves — so an appended default that shadowed the operator's value
+// would be caught rather than hidden by an earlier matching entry.
+func TestDispatchStage_AutoPreviewPassesOperatorEnvThroughUnchanged(t *testing.T) {
+	const operatorCmd = "make preview-target"
+	f, srv := autoPreviewStaleTargetFake(t)
+	r := &runResolver{
+		api: newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(k string) string {
+			if k == acceptancePreviewCmdEnv {
+				return operatorCmd
+			}
+			return ""
+		},
+	}
+	cap := captureAutoPreviewSpawn(t)
+	// os.Environ() is what the verb builds the spawn env from, so the operator's
+	// value must genuinely be there for the pass-through claim to be observable.
+	t.Setenv(acceptancePreviewCmdEnv, operatorCmd)
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", WorkingDir: t.TempDir(), PushAndOpenPR: boolPtr(false),
+		RunnerBinary: "/fake/fishhawk-runner",
+		AutoPreview:  true,
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if out.NeedsTarget != nil {
+		t.Fatalf("NeedsTarget = %+v, want the proceed branch", out.NeedsTarget)
+	}
+	if cap.calls != 1 {
+		t.Fatalf("spawn seam invoked %d times, want exactly 1", cap.calls)
+	}
+	got, found := envValue(cap.envs[0], acceptancePreviewCmdEnv)
+	if !found {
+		t.Fatalf("spawn env carries no %s", acceptancePreviewCmdEnv)
+	}
+	if got != operatorCmd {
+		t.Errorf("%s = %q, want the OPERATOR value %q — auto_preview must never overwrite it", acceptancePreviewCmdEnv, got, operatorCmd)
+	}
+}
+
+// TestDispatchStage_AutoPreviewCannotReachNonLocalRunnerKind is the behavioural
+// pin for the local-only-by-construction finding (#3321 constraint item 2,
+// failure mode (e)). A run LOCKED to runner_kind=github_actions draws
+// guardHostDispatch's refusal BEFORE any spawn, so the spawn seam is NEVER
+// invoked and no FISHHAWK_ACCEPTANCE_PREVIEW_CMD can reach a non-local channel.
+//
+// This is the regression alarm the "no runner_kind conjunct needed" conclusion
+// rests on: if a future change adds a remote-dispatch branch to this verb, the
+// seam-call count goes non-zero and this test goes red.
+func TestDispatchStage_AutoPreviewCannotReachNonLocalRunnerKind(t *testing.T) {
+	f, srv := autoPreviewStaleTargetFake(t)
+	f.runnerKind = "github_actions"
+	f.runnerKindResolved = true
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+	cap := captureAutoPreviewSpawn(t)
+
+	_, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", WorkingDir: t.TempDir(), PushAndOpenPR: boolPtr(false),
+		RunnerBinary: "/fake/fishhawk-runner",
+		AutoPreview:  true,
+	})
+	// t.Error (not t.Fatal) so the SEAM-COUNT assertion below still runs when the
+	// refusal is missing: the load-bearing claim is that nothing spawned, and a
+	// Fatal here would hide whether it did.
+	if err == nil {
+		t.Error("dispatchStage returned nil error; want the guardHostDispatch refusal against a github_actions-locked run")
+	} else if !strings.Contains(err.Error(), "github_actions") {
+		t.Errorf("error = %v, want it to name the locked kind", err)
+	}
+	if cap.calls != 0 {
+		t.Errorf("spawn seam invoked %d times, want 0 — no env injection may reach a non-local channel", cap.calls)
+	}
+	for _, env := range cap.envs {
+		if got, found := envValue(env, acceptancePreviewCmdEnv); found {
+			t.Errorf("%s = %q reached a spawn on a NON-LOCAL-locked run", acceptancePreviewCmdEnv, got)
+		}
+	}
+}
+
+// TestDispatchStage_NoAutoPreviewStillParksAtNeedsTarget is the control for the
+// two tests above: the SAME stale reachable target WITHOUT auto_preview still
+// refuses, with the refusal now naming the concrete bring-up command. Without
+// this, a spawned handle in the auto_preview tests could be explained by the
+// fixture no longer refusing at all.
+func TestDispatchStage_NoAutoPreviewStillParksAtNeedsTarget(t *testing.T) {
+	f, srv := autoPreviewStaleTargetFake(t)
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+	cap := captureAutoPreviewSpawn(t)
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", WorkingDir: "/repo", PushAndOpenPR: boolPtr(false),
+		RunnerBinary: "/fake/fishhawk-runner",
+		// AutoPreview omitted -> false
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if out.NeedsTarget == nil {
+		t.Fatal("NeedsTarget = nil, want the stale-target park without auto_preview")
+	}
+	if cap.calls != 0 {
+		t.Errorf("spawn seam invoked %d times, want 0 on a needs_target park", cap.calls)
+	}
+	if out.NeedsTarget.PreviewAction == nil {
+		t.Fatal("PreviewAction = nil, want the park to name the concrete bring-up command")
+	}
+	want := "scripts/dev preview " + probeExpectedSHA
+	if got := out.NeedsTarget.PreviewAction.Params["command"]; got != want {
+		t.Errorf("preview command = %q, want %q", got, want)
+	}
+	if got := out.NeedsTarget.PreviewAction.Params["working_dir"]; got != "/repo" {
+		t.Errorf("preview working_dir = %q, want the dispatch working dir", got)
 	}
 }

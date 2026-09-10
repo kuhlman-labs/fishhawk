@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -233,21 +234,21 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 	}
 
 	t.Run("nil admission -> proceed", func(t *testing.T) {
-		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), nil)
+		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), nil, acceptanceTargetOpts{})
 		if refusal != nil || warn != "" {
 			t.Errorf("got (%+v, %q), want proceed silently", refusal, warn)
 		}
 	})
 	t.Run("!NeedsTarget -> proceed", func(t *testing.T) {
 		adm := &AcceptanceAdmissionResult{NeedsTarget: false, TargetHosts: []string{"localhost:8090"}}
-		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm)
+		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{})
 		if refusal != nil || warn != "" {
 			t.Errorf("got (%+v, %q), want proceed silently", refusal, warn)
 		}
 	})
 	t.Run("no declared hosts -> proceed", func(t *testing.T) {
 		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: nil, ExpectedHeadSHA: probeExpectedSHA}
-		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm)
+		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{})
 		if refusal != nil || warn != "" {
 			t.Errorf("got (%+v, %q), want proceed silently", refusal, warn)
 		}
@@ -255,12 +256,20 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 	t.Run("FISHHAWK_ACCEPTANCE_PREVIEW_CMD set -> proceed with note", func(t *testing.T) {
 		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{"localhost:8090"}, ExpectedHeadSHA: probeExpectedSHA}
 		env := map[string]string{acceptancePreviewCmdEnv: "scripts/dev preview"}
-		refusal, warn := newResolver(env).checkAcceptanceTarget(context.Background(), adm)
+		r := newResolver(env)
+		// Resolve exactly as the production call sites do, so this still proves
+		// the operator-env path end to end through the new opts parameter.
+		cmd, src := resolveAcceptancePreviewCmd(r.getenv, false)
+		refusal, warn := r.checkAcceptanceTarget(context.Background(), adm,
+			acceptanceTargetOpts{previewCmd: cmd, previewSource: src})
 		if refusal != nil {
 			t.Fatalf("refusal = %+v, want proceed (the spawned runner provisions)", refusal)
 		}
-		if !strings.Contains(warn, acceptancePreviewCmdEnv) {
-			t.Errorf("warning = %q, want a note naming %s", warn, acceptancePreviewCmdEnv)
+		if !strings.Contains(warn, "scripts/dev preview") {
+			t.Errorf("warning = %q, want a note naming the provision command", warn)
+		}
+		if !strings.Contains(warn, "env") {
+			t.Errorf("warning = %q, want it to name the resolution source", warn)
 		}
 	})
 	// (l) #3091: an unresolvable expectation REFUSES. The assertion is on the
@@ -270,7 +279,7 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 	// against it.
 	t.Run("empty expected head SHA -> refuse", func(t *testing.T) {
 		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{"localhost:8090"}, ExpectedHeadSHA: ""}
-		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm)
+		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{})
 		if refusal == nil {
 			t.Fatalf("refusal = nil (warn=%q), want an %s refusal", warn, acceptanceReasonHeadUnresolved)
 		}
@@ -296,7 +305,10 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 	t.Run("empty expected head SHA with preview cmd set -> still refuse", func(t *testing.T) {
 		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{"localhost:8090"}, ExpectedHeadSHA: ""}
 		env := map[string]string{acceptancePreviewCmdEnv: "scripts/dev preview"}
-		refusal, warn := newResolver(env).checkAcceptanceTarget(context.Background(), adm)
+		r := newResolver(env)
+		cmd, src := resolveAcceptancePreviewCmd(r.getenv, false)
+		refusal, warn := r.checkAcceptanceTarget(context.Background(), adm,
+			acceptanceTargetOpts{previewCmd: cmd, previewSource: src})
 		if refusal == nil {
 			t.Fatalf("refusal = nil (warn=%q), want the %s refusal to outrank the preview-cmd proceed branch",
 				warn, acceptanceReasonHeadUnresolved)
@@ -304,8 +316,13 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 		if !strings.Contains(refusal.Detail, acceptanceReasonHeadUnresolved) {
 			t.Errorf("detail = %q, want it to name %s", refusal.Detail, acceptanceReasonHeadUnresolved)
 		}
-		if strings.Contains(warn, acceptancePreviewCmdEnv) {
+		if warn != "" {
 			t.Errorf("warning = %q, want no preview-cmd proceed note on a refusal", warn)
+		}
+		// #3321: the empty-head refusal carries NO preview action — running a
+		// preview is not its remediation and there is no head to render.
+		if refusal.PreviewAction != nil {
+			t.Errorf("PreviewAction = %+v, want nil on the empty-head refusal", refusal.PreviewAction)
 		}
 	})
 	// (n) the #3091 stale-slot criterion at the verb layer: a REACHABLE in-test
@@ -317,7 +334,7 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 		ts := healthzServer(t, http.StatusOK, `{"git_sha":"`+servedSHA+`"}`)
 		host := hostOf(ts.URL)
 		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{host}, ExpectedHeadSHA: probeExpectedSHA}
-		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm)
+		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{})
 		if refusal == nil {
 			t.Fatalf("refusal = nil (warn=%q), want a stale refusal against a REACHABLE target", warn)
 		}
@@ -334,7 +351,7 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 	t.Run("probe verified -> proceed", func(t *testing.T) {
 		ts := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
 		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{hostOf(ts.URL)}, ExpectedHeadSHA: probeExpectedSHA}
-		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm)
+		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{})
 		if refusal != nil || warn != "" {
 			t.Errorf("got (%+v, %q), want proceed silently on verified", refusal, warn)
 		}
@@ -342,7 +359,7 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 	t.Run("probe unverifiable -> proceed with warning", func(t *testing.T) {
 		ts := healthzServer(t, http.StatusOK, `{"status":"ok"}`) // no git_sha
 		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{hostOf(ts.URL)}, ExpectedHeadSHA: probeExpectedSHA}
-		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm)
+		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{})
 		if refusal != nil {
 			t.Fatalf("refusal = %+v, want proceed with a warning on unverifiable", refusal)
 		}
@@ -353,7 +370,7 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 	t.Run("probe stale -> refuse", func(t *testing.T) {
 		ts := healthzServer(t, http.StatusOK, `{"git_sha":"deadbeefcafe"}`)
 		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{hostOf(ts.URL)}, ExpectedHeadSHA: probeExpectedSHA}
-		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm)
+		refusal, warn := newResolver(nil).checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{})
 		if refusal == nil {
 			t.Fatalf("refusal = nil, want a stale refusal (warn=%q)", warn)
 		}
@@ -369,7 +386,7 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 		host := hostOf(ts.URL)
 		ts.Close()
 		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{host}, ExpectedHeadSHA: probeExpectedSHA}
-		refusal, _ := newResolver(nil).checkAcceptanceTarget(context.Background(), adm)
+		refusal, _ := newResolver(nil).checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{})
 		if refusal == nil {
 			t.Fatal("refusal = nil, want an unreachable refusal")
 		}
@@ -377,4 +394,184 @@ func TestCheckAcceptanceTarget_GateBranches(t *testing.T) {
 			t.Errorf("refusal.TargetHost = %q, want %q", refusal.TargetHost, host)
 		}
 	})
+}
+
+// TestCheckAcceptanceTarget_StaleRefusalCarriesDefaultPreviewCommand is the
+// REVISION-1 done-means on the refusal path (#3321 failure mode (a), second
+// half): with an EMPTY opts.previewCmd — no FISHHAWK_ACCEPTANCE_PREVIEW_CMD
+// configured and auto_preview false, the most common configuration — the stale
+// refusal still carries a PreviewAction naming
+// `scripts/dev preview <expected head>`. The counterfactual is to remove the
+// default from acceptancePreviewCommandOrDefault, which reddens the exact-string
+// assertion below.
+func TestCheckAcceptanceTarget_StaleRefusalCarriesDefaultPreviewCommand(t *testing.T) {
+	origAttempts := acceptanceQuickProbeAttempts
+	acceptanceQuickProbeAttempts = 1
+	t.Cleanup(func() { acceptanceQuickProbeAttempts = origAttempts })
+
+	const servedSHA = "9f2c1ab" // a valid sha that is NOT a prefix of probeExpectedSHA
+	ts := healthzServer(t, http.StatusOK, `{"git_sha":"`+servedSHA+`"}`)
+	host := hostOf(ts.URL)
+
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{host}, ExpectedHeadSHA: probeExpectedSHA}
+	// Exactly what the production call sites resolve with no env and no flag.
+	cmd, src := resolveAcceptancePreviewCmd(r.getenv, false)
+	if cmd != "" {
+		t.Fatalf("fixture precondition: resolved cmd = %q, want EMPTY (no env, auto_preview false)", cmd)
+	}
+	refusal, warn := r.checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{
+		workingDir: "/repo", previewCmd: cmd, previewSource: src,
+	})
+	if refusal == nil {
+		t.Fatalf("refusal = nil (warn=%q), want a stale refusal", warn)
+	}
+	if refusal.PreviewAction == nil {
+		t.Fatal("PreviewAction = nil; the stale refusal must name the concrete bring-up command")
+	}
+	want := "scripts/dev preview " + probeExpectedSHA
+	if got := refusal.PreviewAction.Params["command"]; got != want {
+		t.Errorf("preview command = %q, want %q", got, want)
+	}
+	if refusal.PreviewAction.Params["command"] == "" {
+		t.Error("preview command is EMPTY; the renderer must always default")
+	}
+	if got := refusal.PreviewAction.Params["target_host"]; got != host {
+		t.Errorf("preview target_host = %q, want %q", got, host)
+	}
+	if got := refusal.PreviewAction.Params["working_dir"]; got != "/repo" {
+		t.Errorf("preview working_dir = %q, want the dispatch working dir", got)
+	}
+	if !strings.Contains(refusal.Remediation, want) {
+		t.Errorf("remediation = %q, want it to name the concrete command %q", refusal.Remediation, want)
+	}
+}
+
+// TestCheckAcceptanceTarget_UnreachableRefusalCarriesPreviewAction pins the
+// OTHER refusing probe outcome (unreachable, not stale) carries the action too.
+func TestCheckAcceptanceTarget_UnreachableRefusalCarriesPreviewAction(t *testing.T) {
+	origAttempts := acceptanceQuickProbeAttempts
+	acceptanceQuickProbeAttempts = 1
+	t.Cleanup(func() { acceptanceQuickProbeAttempts = origAttempts })
+
+	ts := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
+	host := hostOf(ts.URL)
+	ts.Close() // nothing listens
+
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{host}, ExpectedHeadSHA: probeExpectedSHA}
+	refusal, _ := r.checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{})
+	if refusal == nil {
+		t.Fatal("refusal = nil, want an unreachable refusal")
+	}
+	if refusal.PreviewAction == nil || refusal.PreviewAction.Params["command"] == "" {
+		t.Fatalf("PreviewAction = %+v, want a concrete command on the unreachable refusal", refusal.PreviewAction)
+	}
+}
+
+// TestCheckAcceptanceTarget_AutoPreviewSourcedCmdProceedsWithNoProbe is #3321's
+// gate half of the auto_preview flow: an auto_preview-sourced opts.previewCmd
+// takes the SAME preview-cmd proceed branch an operator-set env takes, with NO
+// probe. The target is a REACHABLE in-test server serving a STALE sha — the
+// input that refuses without the proceed branch — so a green here cannot be
+// explained by an unreachable address, and a probe-counting handler proves no
+// probe fired.
+func TestCheckAcceptanceTarget_AutoPreviewSourcedCmdProceedsWithNoProbe(t *testing.T) {
+	origAttempts := acceptanceQuickProbeAttempts
+	acceptanceQuickProbeAttempts = 1
+	t.Cleanup(func() { acceptanceQuickProbeAttempts = origAttempts })
+
+	var probes int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&probes, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"git_sha":"9f2c1ab"}`)) // STALE
+	}))
+	t.Cleanup(ts.Close)
+	host := hostOf(ts.URL)
+
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	cmd, src := resolveAcceptancePreviewCmd(r.getenv, true) // auto_preview
+	if src != "auto_preview" {
+		t.Fatalf("fixture precondition: source = %q, want auto_preview", src)
+	}
+	adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{host}, ExpectedHeadSHA: probeExpectedSHA}
+	refusal, warn := r.checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{
+		previewCmd: cmd, previewSource: src,
+	})
+	if refusal != nil {
+		t.Fatalf("refusal = %+v, want the auto_preview proceed branch against a STALE reachable target", refusal)
+	}
+	if n := atomic.LoadInt32(&probes); n != 0 {
+		t.Errorf("probe count = %d, want 0 — the preview-cmd branch must proceed WITHOUT probing", n)
+	}
+	if !strings.Contains(warn, acceptancePreviewDefaultCmd) {
+		t.Errorf("warning = %q, want it to name the provision command", warn)
+	}
+	if !strings.Contains(warn, "auto_preview") {
+		t.Errorf("warning = %q, want it to name the auto_preview source", warn)
+	}
+}
+
+// TestCheckAcceptanceTarget_EmptyHeadRefusesAheadOfAutoPreview is #3321 failure
+// mode (f): the #3091 empty-ExpectedHeadSHA refusal stays FIRST, ahead of the
+// preview-cmd proceed branch, EVEN when the command came from auto_preview — a
+// provision command cannot provision an unknown head. Moving the preview-cmd
+// branch above the empty-head branch reddens it.
+func TestCheckAcceptanceTarget_EmptyHeadRefusesAheadOfAutoPreview(t *testing.T) {
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	cmd, src := resolveAcceptancePreviewCmd(r.getenv, true)
+	adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{"localhost:8090"}, ExpectedHeadSHA: ""}
+	refusal, warn := r.checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{
+		previewCmd: cmd, previewSource: src,
+	})
+	if refusal == nil {
+		t.Fatalf("refusal = nil (warn=%q), want the %s refusal to outrank the auto_preview proceed branch",
+			warn, acceptanceReasonHeadUnresolved)
+	}
+	if !strings.Contains(refusal.Detail, acceptanceReasonHeadUnresolved) {
+		t.Errorf("detail = %q, want it to name %s", refusal.Detail, acceptanceReasonHeadUnresolved)
+	}
+	if warn != "" {
+		t.Errorf("warning = %q, want empty — a refusal must not also warn-and-proceed", warn)
+	}
+	// The empty-head refusal deliberately carries NO preview action: running a
+	// preview is not its remediation and there is no head to render.
+	if refusal.PreviewAction != nil {
+		t.Errorf("PreviewAction = %+v, want nil on the empty-head refusal", refusal.PreviewAction)
+	}
+}
+
+// TestCheckAcceptanceTarget_RendersTheAdmissionsCurrentHead is the fix-up
+// staleness pin: two calls with two admissions carrying DIFFERENT
+// ExpectedHeadSHAs must each render their OWN head. Nothing is cached across
+// calls, so a fix-up push that moves the head is reflected on the NEXT dispatch.
+func TestCheckAcceptanceTarget_RendersTheAdmissionsCurrentHead(t *testing.T) {
+	origAttempts := acceptanceQuickProbeAttempts
+	acceptanceQuickProbeAttempts = 1
+	t.Cleanup(func() { acceptanceQuickProbeAttempts = origAttempts })
+
+	ts := healthzServer(t, http.StatusOK, `{"git_sha":"9f2c1ab"}`) // stale for both
+	host := hostOf(ts.URL)
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+
+	const headA = "1111111aaaa"
+	const headB = "2222222bbbb"
+	for _, head := range []string{headA, headB} {
+		adm := &AcceptanceAdmissionResult{NeedsTarget: true, TargetHosts: []string{host}, ExpectedHeadSHA: head}
+		refusal, warn := r.checkAcceptanceTarget(context.Background(), adm, acceptanceTargetOpts{})
+		if refusal == nil {
+			t.Fatalf("head %s: refusal = nil (warn=%q), want a stale refusal", head, warn)
+		}
+		if refusal.ExpectedHeadSHA != head {
+			t.Errorf("head %s: refusal.ExpectedHeadSHA = %q, want the CURRENT admission's head", head, refusal.ExpectedHeadSHA)
+		}
+		if refusal.PreviewAction == nil {
+			t.Fatalf("head %s: PreviewAction = nil", head)
+		}
+		want := "scripts/dev preview " + head
+		if got := refusal.PreviewAction.Params["command"]; got != want {
+			t.Errorf("head %s: preview command = %q, want %q — nothing may be cached across calls", head, got, want)
+		}
+	}
 }

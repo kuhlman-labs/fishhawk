@@ -31,6 +31,7 @@ type DispatchStageInput struct {
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement stage; defaults to main. It applies even when push_and_open_pr is false — the runner passes --base-branch (and --check-base-ref for every implement stage) unconditionally and provisions the run worktree from it"`
 	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1), same as fishhawk_run_stage. A bare omitted value resolves to true. On a STANDALONE implement stage false is supported and unchanged (the E22.8/#406 commit-yourself flow): the agent's work is left in the working tree for the operator to commit, and the stage settles on its trace upload. On a DECOMPOSITION CHILD or a FIX-UP pass false is REFUSED (#2691), because those stages settle on a push this flag suppresses — use fishhawk_run_children for a decomposition child, and re-dispatch without push_and_open_pr=false for a fix-up"`
 	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary, then PATH"`
+	AutoPreview   bool   `json:"auto_preview,omitempty" jsonschema:"ACCEPTANCE STAGE ONLY (inert on every other stage): stand the acceptance preview target up as part of this dispatch instead of provisioning it by hand first. It sets FISHHAWK_ACCEPTANCE_PREVIEW_CMD=\"scripts/dev preview\" on the SPAWNED RUNNER, so the runner performs the bring-up through its existing provision -> readiness -> identity -> teardown pipeline (docs/acceptance-preview.md) and this verb still returns the durable handle immediately. An operator-set FISHHAWK_ACCEPTANCE_PREVIEW_CMD in this process ALWAYS wins and is passed through unchanged. Defaults to false, which resolves the preview command from the environment exactly as before"`
 }
 
 // DispatchStageOutput is the non-blocking dispatch handle (#1232). Unlike
@@ -148,6 +149,16 @@ fishhawk_await_stage is the single wait to call on the handle; it needs no poll
 loop, and since #2588 it OBSERVES that amendment channel — it releases with
 status "amendment_pending" carrying the amendment row, so the channel this verb
 exists to enable no longer requires hand-polling to see.
+
+For a local ACCEPTANCE stage, auto_preview=true collapses the
+provision-then-re-dispatch dance into ONE call (E68.43 / #3321): it sets
+FISHHAWK_ACCEPTANCE_PREVIEW_CMD on the spawned runner, which brings the target
+up itself through its existing provision/readiness/identity pipeline, so a
+dispatch against a stale or absent preview returns a spawned handle instead of
+a needs_target park. An operator-set FISHHAWK_ACCEPTANCE_PREVIEW_CMD wins over
+the built-in default, and the flag is inert on every non-acceptance stage. When
+a dispatch DOES park at needs_target, the refusal now names the exact bring-up
+command to run.
 
 Requires the fishhawk-runner binary to resolve on the MCP server's host,
 exactly like fishhawk_run_stage (this tool is local-only by design, ADR-024 Q5).
@@ -287,6 +298,40 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	argv := r.composeRunnerArgv(runStageIn, resolvedStageID, repo, baseBranch, pushAndOpenPR)
 	env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 
+	// (5a') auto_preview (E68.43 / #3321). ONE resolution feeds BOTH the gate's
+	// proceed decision (5b' below) and the spawn-env injection here, so the gate
+	// can never proceed on a command the runner was never handed. The
+	// acceptance-stage conjunct confines the flag: it is inert on every other
+	// stage type. An operator-set FISHHAWK_ACCEPTANCE_PREVIEW_CMD resolves with
+	// source "env" and is ALREADY in os.Environ() above, so nothing is appended
+	// and the operator's value is passed through unchanged.
+	//
+	// LOCAL-ONLY BY CONSTRUCTION — recorded here so the next reader need not
+	// re-derive it (#3321 operator constraint item 2). This verb's ONLY spawn is
+	// dispatchSpawnDetached (below), whose production value is
+	// spawnRunnerStageDetached, which opens `cmd := runStageCommand(binary,
+	// argv...)` / `cmd.Env = env` (run_stage.go) — an os/exec of the runner
+	// binary on the MCP server's OWN host. There is no remote-dispatch branch
+	// anywhere in this verb; its tool description says so ("this tool is
+	// local-only by design, ADR-024 Q5"), and guardHostDispatch already REFUSED,
+	// before any spawn, a run locked to a KNOWN non-host-dispatched kind
+	// (KindHostDispatched returns (false, true) for github_actions and
+	// gitlab_ci). So a runner_kind conjunct here would be redundant: "local" is a
+	// property of the SPAWN PATH, not of the run's runner_kind field. RESIDUAL,
+	// stated rather than glossed: guardHostDispatch deliberately ALLOWS an
+	// un-resolved run (so #1346's first-dispatch auto-resolve can fire) and an
+	// unknown locked kind — but in BOTH cases the spawn is still the local exec
+	// above, so the injected command still reaches a local runner running from
+	// workingDir. TestDispatchStage_AutoPreviewCannotReachNonLocalRunnerKind is
+	// the regression alarm if a remote-dispatch branch is ever added here.
+	previewCmd, previewSource := resolveAcceptancePreviewCmd(r.getenv, in.AutoPreview && in.Stage == "acceptance")
+	if previewSource == "auto_preview" {
+		env = append(env, acceptancePreviewCmdEnv+"="+previewCmd)
+		warnings = append(warnings, fmt.Sprintf(
+			"auto_preview: the spawned runner will run %q in %s to provision the acceptance target before validating, and tear it down afterwards (%s was not set in this process, so the built-in default applies).",
+			previewCmd, workingDir, acceptancePreviewCmdEnv))
+	}
+
 	// (6) Spawn DETACHED — start and return; the runner outlives this call. The
 	// reporter closure binds the backend client + durable handle so the detached
 	// reaper can report a spawn-phase non-zero exit (a runner that died before
@@ -368,7 +413,9 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		// with a warning, which let the stage record a verdict bound to no tree.
 		// Every proceed outcome (verified / unverifiable / no hosts /
 		// preview-cmd-set) returns nil and falls through.
-		if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission); refusal != nil {
+		if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission, acceptanceTargetOpts{
+			workingDir: workingDir, previewCmd: previewCmd, previewSource: previewSource,
+		}); refusal != nil {
 			var stageWaitStatus *StageWaitStatus
 			if fetchErr := func() error {
 				fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

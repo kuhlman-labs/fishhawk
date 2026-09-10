@@ -14093,9 +14093,32 @@ func TestGetRunStatus_NextActions_ConcernsOpenAcceptancePending(t *testing.T) {
 	if out.NextActions.State != "implement_concerns_open_acceptance_pending" {
 		t.Fatalf("next_actions.state = %q, want implement_concerns_open_acceptance_pending", out.NextActions.State)
 	}
-	first := out.NextActions.Actions[0]
+	// The suggested default MCP MOVE is still the acceptance dispatch. Since
+	// #3321 the acceptance dispatch is preceded by ONE display-only run_preview
+	// RITUAL step (its precondition — the bring-up happens on the operator's
+	// host, outside the MCP surface), so the #3116 claim is asserted as "the
+	// FIRST MCP TOOL action" plus the adjacency, which is strictly stronger than
+	// the old bare Actions[0] check: it pins BOTH that no other tool outranks the
+	// dispatch AND where the ritual step sits.
+	firstTool := -1
+	for i, a := range out.NextActions.Actions {
+		if strings.HasPrefix(a.Action, "fishhawk_") {
+			firstTool = i
+			break
+		}
+	}
+	if firstTool < 0 {
+		t.Fatalf("next_actions offers no fishhawk_* tool action: %+v", out.NextActions.Actions)
+	}
+	first := out.NextActions.Actions[firstTool]
 	if first.Action != "fishhawk_dispatch_stage" || first.Params["stage"] != "acceptance" {
-		t.Errorf("first action = %q(stage=%q), want fishhawk_dispatch_stage(stage=acceptance)", first.Action, first.Params["stage"])
+		t.Errorf("first tool action = %q(stage=%q), want fishhawk_dispatch_stage(stage=acceptance)", first.Action, first.Params["stage"])
+	}
+	if firstTool != 0 {
+		if firstTool != 1 || out.NextActions.Actions[0].Action != acceptancePreviewActionName {
+			t.Errorf("actions[0..firstTool] = %+v, want at most the single %s ritual step ahead of the dispatch",
+				out.NextActions.Actions[:firstTool], acceptancePreviewActionName)
+		}
 	}
 	for _, a := range out.NextActions.Actions {
 		if a.Action == "fishhawk_fixup_stage" {
@@ -14370,4 +14393,148 @@ func TestPlanReview_DecodesRejectWithoutConcern(t *testing.T) {
 	if legacy.RejectWithoutConcern {
 		t.Error("a payload stored before #3319 must decode reject_without_concern=false")
 	}
+}
+
+// --- E68.43 / #3321: the acceptance-preview next_actions fold ---------------
+
+// acceptanceParkFixture seeds a fake backend with a run whose acceptance stage
+// is parked at awaiting_host_dispatch (the state that draws a suggested
+// acceptance dispatch) and whose recent audit carries a pull_request_opened
+// head_sha. Shared by the two SNAPSHOT-SURFACE tests (getRunStatus here and the
+// run_stage post-stage snapshot in run_stage_test.go) so both assert the same
+// property against the same fixture.
+func acceptanceParkFixture(t *testing.T, fb *fakeBackend, runID uuid.UUID, headSHA string) {
+	t.Helper()
+	implementStageID := uuid.New()
+	openImplement := 2
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", State: "running", RunnerKind: "local",
+		Concerns: &RunConcerns{
+			Open:          2,
+			ByState:       map[string]int{"raised": 2},
+			OpenImplement: &openImplement,
+			Items: []RunConcernItem{
+				{ID: uuid.NewString(), StageKind: "implement", Severity: "medium", Category: "scope", State: "raised"},
+				{ID: uuid.NewString(), StageKind: "implement", Severity: "low", Category: "style", State: "raised"},
+			},
+		},
+	}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: implementStageID.String(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 3, Type: "acceptance", State: "awaiting_host_dispatch"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 4, Type: "review", State: "pending"},
+	}
+	seedImplementReviewedAudit(fb, runID, implementStageID, 2)
+	// Prepend the reported-head ledger entry as the NEWEST entry (the recent
+	// slice is time-descending), so latestReportedHeadSHA reads it.
+	fb.auditByRun[runID] = append([]AuditEntry{{
+		ID: uuid.NewString(), Sequence: 99, RunID: runID.String(),
+		Category: "pull_request_opened",
+		Payload:  map[string]any{"head_sha": headSHA},
+	}}, fb.auditByRun[runID]...)
+}
+
+// assertPreviewFoldedBeforeAcceptanceDispatch is the shared SNAPSHOT-SURFACE
+// assertion (#3321 operator condition 1). Both nextActionsFor call sites route
+// through foldAcceptancePreviewAdvisory, and BOTH are asserted — deleting
+// either wire reddens the corresponding test.
+func assertPreviewFoldedBeforeAcceptanceDispatch(t *testing.T, na *NextActions, wantCommand string) {
+	t.Helper()
+	if na == nil {
+		t.Fatal("next_actions absent")
+	}
+	previewIdx, dispatchIdx := -1, -1
+	for i, a := range na.Actions {
+		if a.Action == acceptancePreviewActionName && previewIdx < 0 {
+			previewIdx = i
+		}
+		if a.Action == "fishhawk_dispatch_stage" && a.Params["stage"] == "acceptance" && dispatchIdx < 0 {
+			dispatchIdx = i
+		}
+	}
+	if dispatchIdx < 0 {
+		t.Fatalf("fixture precondition: no acceptance fishhawk_dispatch_stage in %+v", na.Actions)
+	}
+	if previewIdx < 0 {
+		t.Fatalf("next_actions carries NO %s action; the acceptance-preview fold is not wired at this call site (actions=%+v)",
+			acceptancePreviewActionName, na.Actions)
+	}
+	if previewIdx != dispatchIdx-1 {
+		t.Errorf("%s at index %d, acceptance dispatch at %d — want the preview IMMEDIATELY BEFORE its dispatch",
+			acceptancePreviewActionName, previewIdx, dispatchIdx)
+	}
+	got := na.Actions[previewIdx].Params["command"]
+	if got == "" {
+		t.Fatal("preview params.command is EMPTY; the renderer must always name a concrete command")
+	}
+	if got != wantCommand {
+		t.Errorf("preview params.command = %q, want %q", got, wantCommand)
+	}
+}
+
+// TestGetRunStatus_AcceptanceParkNamesDefaultPreviewCommand is the REVISION-1
+// PRIMARY-PATH done-means (#3321 failure mode (a)): with NO
+// FISHHAWK_ACCEPTANCE_PREVIEW_CMD configured and auto_preview false — the most
+// common configuration — the get_run_status next_actions block carries a
+// run_preview action, positioned immediately BEFORE the acceptance dispatch,
+// whose params.command is EXACTLY `scripts/dev preview <head sha>`.
+//
+// The counterfactual is removing the default from
+// acceptancePreviewCommandOrDefault, which empties the command and reddens the
+// exact-string assertion.
+func TestGetRunStatus_AcceptanceParkNamesDefaultPreviewCommand(t *testing.T) {
+	const headSHA = "abc1234def5678"
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	acceptanceParkFixture(t, fb, runID, headSHA)
+
+	// nil env: NO FISHHAWK_ACCEPTANCE_PREVIEW_CMD configured.
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	assertPreviewFoldedBeforeAcceptanceDispatch(t, out.NextActions, "scripts/dev preview "+headSHA)
+}
+
+// TestGetRunStatus_AcceptanceParkPreviewOmitsAgedOutSHA pins the bounded-window
+// degrade: with no reported-head entry in the recent slice the fold renders the
+// CONCRETE command with NO sha appended — it degrades the SHA, never the command.
+func TestGetRunStatus_AcceptanceParkPreviewOmitsAgedOutSHA(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	acceptanceParkFixture(t, fb, runID, "abc1234def5678")
+	// Drop the ledger entry: the head has aged out of the bounded window.
+	trimmed := make([]AuditEntry, 0, len(fb.auditByRun[runID]))
+	for _, e := range fb.auditByRun[runID] {
+		if e.Category != "pull_request_opened" {
+			trimmed = append(trimmed, e)
+		}
+	}
+	fb.auditByRun[runID] = trimmed
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	assertPreviewFoldedBeforeAcceptanceDispatch(t, out.NextActions, acceptancePreviewDefaultCmd)
+}
+
+// TestGetRunStatus_AcceptanceParkPreviewHonoursOperatorEnv pins that a
+// configured FISHHAWK_ACCEPTANCE_PREVIEW_CMD overrides the built-in default on
+// this surface too.
+func TestGetRunStatus_AcceptanceParkPreviewHonoursOperatorEnv(t *testing.T) {
+	const headSHA = "abc1234def5678"
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	acceptanceParkFixture(t, fb, runID, headSHA)
+
+	r := newResolver(srv, map[string]string{acceptancePreviewCmdEnv: "make preview"})
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	assertPreviewFoldedBeforeAcceptanceDispatch(t, out.NextActions, "make preview "+headSHA)
 }

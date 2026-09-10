@@ -117,6 +117,13 @@ type AcceptanceNeedsTarget struct {
 	ExpectedHeadSHA string `json:"expected_head_sha" jsonschema:"the merge-candidate head SHA the target's /healthz git_sha must match; empty when the backend could not resolve it"`
 	Detail          string `json:"detail" jsonschema:"the probe classification detail (unreachable or stale, with the URL probed and the observed git_sha)"`
 	Remediation     string `json:"remediation" jsonschema:"the operator action that unblocks the dispatch: bring up the target at the expected head SHA, then re-dispatch"`
+	// PreviewAction carries the CONCRETE bring-up command for the stale/
+	// unreachable refusal (E68.43 / #3321) — the ritual that used to live only
+	// in operator memory. Always non-empty on that refusal (the renderer
+	// defaults to `scripts/dev preview` when no FISHHAWK_ACCEPTANCE_PREVIEW_CMD
+	// is configured); ABSENT on the #3091 empty-head refusal, whose remediation
+	// is not a preview run and which has no head to render.
+	PreviewAction *SuggestedAction `json:"preview_action,omitempty" jsonschema:"the concrete acceptance-preview bring-up to run on the dispatch host before re-dispatching; its params.command is always populated. Absent when the refusal is not remediable by a preview run"`
 }
 
 // acceptanceProbeSchemeOrder returns the scheme attempt order for a declared
@@ -246,6 +253,16 @@ func acceptanceSleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// acceptanceTargetOpts carries the caller-resolved inputs to the verb-side
+// acceptance gate (E68.43 / #3321). previewCmd/previewSource come from
+// resolveAcceptancePreviewCmd — the GATE decision, which does NOT default —
+// while workingDir names the checkout the rendered bring-up command runs in.
+type acceptanceTargetOpts struct {
+	workingDir    string
+	previewCmd    string
+	previewSource string
+}
+
 // checkAcceptanceTarget is the verb-side pre-spawn gate (E48.6 / #1953). Given a
 // needs_target admission result, it decides whether to PROCEED to spawn (nil
 // refusal) — optionally with a warning — or to REFUSE (non-nil
@@ -255,8 +272,10 @@ func acceptanceSleepCtx(ctx context.Context, d time.Duration) bool {
 // Proceed paths (nil refusal):
 //   - admission nil / !NeedsTarget / no declared hosts: not a needs_target
 //     result, proceed silently.
-//   - FISHHAWK_ACCEPTANCE_PREVIEW_CMD set: the spawned runner inherits it and
-//     provisions the target itself (#1569) — proceed with an informational note.
+//   - opts.previewCmd non-empty (an operator-set FISHHAWK_ACCEPTANCE_PREVIEW_CMD,
+//     or an auto_preview dispatch's injected default): the spawned runner
+//     carries it and provisions the target itself (#1569 / #3321) — proceed
+//     with an informational note naming the command and its source.
 //   - probe VERIFIED: the target serves the merge candidate — proceed.
 //   - probe UNVERIFIABLE: the target answered but exposes no comparable build
 //     identity — proceed with the probe detail as a warning.
@@ -268,8 +287,20 @@ func acceptanceSleepCtx(ctx context.Context, d time.Duration) bool {
 //     preview-cmd branch — a provision command cannot provision an unknown
 //     head, so that proceed path must not outrank this refusal.
 //   - probe STALE or UNREACHABLE — the target is up on the wrong build or not
-//     up at all; refuse so no doomed runner spawns.
-func (r *runResolver) checkAcceptanceTarget(ctx context.Context, admission *AcceptanceAdmissionResult) (refusal *AcceptanceNeedsTarget, warning string) {
+//     up at all; refuse so no doomed runner spawns. That refusal carries a
+//     PreviewAction naming the CONCRETE bring-up command (#3321); the empty-head
+//     refusal above deliberately carries none.
+//
+// acceptanceTargetOpts carries the caller-resolved inputs: workingDir (where
+// the operator would run the bring-up) and the previewCmd/previewSource pair
+// from resolveAcceptancePreviewCmd.
+// The receiver is deliberately blank since #3321: the gate now reads its
+// provision command from opts (which the CALLER resolves via
+// resolveAcceptancePreviewCmd) rather than from r.getenv, so one resolution
+// feeds both the proceed decision and dispatch's spawn-env injection. The
+// METHOD form is kept so the three call sites are unchanged and a future branch
+// can reach the resolver again without a signature churn.
+func (*runResolver) checkAcceptanceTarget(ctx context.Context, admission *AcceptanceAdmissionResult, opts acceptanceTargetOpts) (refusal *AcceptanceNeedsTarget, warning string) {
 	if admission == nil || !admission.NeedsTarget || len(admission.TargetHosts) == 0 {
 		return nil, ""
 	}
@@ -293,10 +324,19 @@ func (r *runResolver) checkAcceptanceTarget(ctx context.Context, admission *Acce
 		}, ""
 	}
 
-	if r.getenv(acceptancePreviewCmdEnv) != "" {
+	// The PROCEED decision reads opts.previewCmd, which the caller resolved via
+	// resolveAcceptancePreviewCmd: an operator-set env keeps today's exact
+	// behaviour, and an auto_preview dispatch (#3321) takes this SAME branch.
+	// This is the GATE decision only — it deliberately does NOT default, because
+	// proceeding without a command would spawn a runner that provisions nothing.
+	if opts.previewCmd != "" {
+		source := opts.previewSource
+		if source == "" {
+			source = "env"
+		}
 		return nil, fmt.Sprintf(
-			"acceptance target %q needs the merge candidate (expected head %s); %s is set so the spawned runner will provision it (#1569).",
-			host, admission.ExpectedHeadSHA, acceptancePreviewCmdEnv)
+			"acceptance target %q needs the merge candidate (expected head %s); provision command %q (source: %s) will be carried by the spawned runner, which provisions it (#1569).",
+			host, admission.ExpectedHeadSHA, opts.previewCmd, source)
 	}
 
 	res := awaitAcceptanceTargetReady(ctx, host, admission.ExpectedHeadSHA)
@@ -307,12 +347,19 @@ func (r *runResolver) checkAcceptanceTarget(ctx context.Context, admission *Acce
 		return nil, fmt.Sprintf(
 			"acceptance target %q identity not verifiable (%s); proceeding to spawn.", host, res.detail)
 	default: // stale or unreachable
+		// E68.43 (#3321): the refusal carries the CONCRETE bring-up command. The
+		// renderer owns the default, so with NO env configured and auto_preview
+		// false (opts.previewCmd == "") this still names
+		// `scripts/dev preview <expected head>` rather than an empty string.
+		preview := acceptancePreviewAction(opts.previewCmd, admission.ExpectedHeadSHA, opts.workingDir, host)
 		return &AcceptanceNeedsTarget{
 			TargetHost:      host,
 			ExpectedHeadSHA: admission.ExpectedHeadSHA,
 			Detail:          res.detail,
 			Remediation: fmt.Sprintf(
-				"bring up the acceptance target at head %s (e.g. scripts/dev preview), then re-dispatch", admission.ExpectedHeadSHA),
+				"bring up the acceptance target at head %s (%s), then re-dispatch — or re-dispatch with auto_preview=true and the spawned runner brings it up",
+				admission.ExpectedHeadSHA, preview.Params["command"]),
+			PreviewAction: &preview,
 		}, ""
 	}
 }
