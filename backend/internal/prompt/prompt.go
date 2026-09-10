@@ -1955,6 +1955,7 @@ func buildImplement(t Trigger) string {
 	// family as writeScopeAmendments — rendered here so the full implement path
 	// carries it, and identically in buildImplementFixup for the slim path.
 	writeWorkspaceHygiene(&b)
+	writeConcurrentVerifyRule(&b)
 
 	// Scope self-exempt (#1153): the standalone open-PR path's escape hatch for
 	// a declared scope.files path the agent DELIBERATELY leaves unchanged. The
@@ -2799,6 +2800,23 @@ func writeWorkspaceHygiene(b *strings.Builder) {
 	b.WriteString("\n")
 }
 
+// writeConcurrentVerifyRule renders the "### Concurrent verify" block (#3315):
+// the runner runs the project's verify gate against the COMMITTED tree after the
+// agent finishes, and that gate now takes a per-repository lock. An agent-shell
+// verify meeting a live holder is REFUSED immediately — a fast failure, not a
+// queue — so an agent that retries it in a loop burns the whole stage budget on
+// a refusal that will never clear (run a662ed6f died category-A exactly that
+// way). The wording is deliberately repo-agnostic: the prompt does not know the
+// project's verify command, so it names the BEHAVIOUR (a lock-held refusal) and
+// the correct response (narrow to package-scoped tests, report what you have)
+// rather than any particular command.
+func writeConcurrentVerifyRule(b *strings.Builder) {
+	b.WriteString("### Concurrent verify\n\n")
+	b.WriteString("After you finish, the runner runs the project's verify gate against the committed tree — you do not need to run the full gate yourself for it to happen. Do NOT start a second concurrent full verify while that one may be running: they contend on the same shared linter and test-container resources, and the loser fails for reasons that have nothing to do with your change.\n\n")
+	b.WriteString("If a verify command REFUSES with a message saying the lock is held or another verify is already running, that is a fast failure, NOT a queue: it will not clear by waiting. Do NOT poll it, retry it in a loop, or sleep-and-retry — that burns the stage budget on a refusal. Instead narrow to package-scoped tests over the packages you actually touched, and report the outcome you have along with the fact that the full gate was held by another invocation.\n")
+	b.WriteString("\n")
+}
+
 // writeScopeSelfExempt renders the "### Deliberately-unchanged declared scope
 // files" block (#1153): the in-band escape hatch for a declared scope.files
 // path the agent intentionally leaves unchanged. The agent writes a JSON
@@ -3187,6 +3205,7 @@ func buildImplementFixup(t Trigger) string {
 	// rendered identically to the full implement path so a fix-up pass that
 	// compiles or downloads while verifying leaves no untracked build output.
 	writeWorkspaceHygiene(&b)
+	writeConcurrentVerifyRule(&b)
 
 	// Advisory verify-outcome self-report (#1210): fix-up-only honesty cross-
 	// check, surfaced to the reviewer via gate_evidence. Placed after the scope

@@ -151,7 +151,44 @@ Or from this directory directly:
     go build ./...
     go test ./...
 
-To mirror the implement-stage verify gate locally, run the repo-root wrapper (`scripts/test lint` for golangci-lint per module, `scripts/test verify` for lint + tests).
+To mirror the implement-stage verify gate locally, run the repo-root wrapper (`scripts/test lint` for golangci-lint per module, `scripts/test verify` for lint + tests). `scripts/test verify` now takes a per-repository lock, and an agent-shell invocation meeting a live holder is REFUSED immediately rather than queued — run `scripts/test single -run TestX ./your/package/...` instead of retrying it. See "Scoped verify" below.
+
+## Scoped verify: the touched-package pre-pass and the one full gate ([E68.39 / #3315](https://github.com/kuhlman-labs/fishhawk/issues/3315))
+
+A long implement stage spends most of its wall clock in `runVerifyFixLoop`, and every iteration used to pay a FULL `scripts/test verify` — the whole `go test -race ./...` loop across every module, whether or not the change touched them. Since #3315 the loop is split into a fast **scoped** form and one authoritative **full** form.
+
+**What the runner injects.** `verifyscope.go` owns the shell/Go contract as package consts, so the Go side has one source of truth:
+
+| Variable | Value | Meaning to `scripts/test verify` |
+|---|---|---|
+| `FISHHAWK_VERIFY_PACKAGES` | comma-joined repo-relative package dirs | restrict the `go test -race` loop to these packages; skip every module owning none |
+| `FISHHAWK_VERIFY_LOCK_OWNER` | `runner` | this is the runner's own gate: **wait** for a live agent-shell holder of the verify lock rather than racing it, and never be displaced by one |
+
+`verifyScopePackages` derives the package set from the stage's scope files: `.go` files only, mapped to their directory (a root-level file → `.`), deduplicated and sorted. It returns the **EMPTY** set — which means *no scoping*, and therefore the FULL form — on every path it cannot present faithfully: any scope path (Go or not) carrying a comma, tab or newline, and any absolute or root-escaping path. Every one of those branches **widens**; none narrows. The shell layer widens independently on a package it cannot bucket into a `go.work` module, so the two layers fail safe in the same direction.
+
+Both values are injected **after** sanitization, through `runBoundedGateArgv`'s variadic `extraEnv` (`verifyScopeEnv` / `verifyLockOwnerEnv`, drop-then-append so an injected entry replaces rather than duplicates a survivor). Neither name is on any gate-env allow-list, so an **ambient** value is already stripped by `sanitizedGateEnv`'s default-deny layer, and both are additionally on `gateEnvDeny` as redundant defence against a future allow-rule re-widening. `extraEnv` is variadic deliberately: every pre-existing call site compiles unchanged, so no second exec path was introduced.
+
+**The loop shape.** Per iteration:
+
+1. stage scope-only, throwaway-commit, resolve the SHA (unchanged);
+2. verify that SHA with the **SCOPED** form when a package set was derived — the fast pre-pass, **not** the authority;
+3. the moment the scoped form **passes**, immediately re-verify the **SAME committed SHA** with the **FULL** form, before the `reset --soft`, and adopt its outcome and output.
+
+Consequences, all deliberate:
+
+- the **#960 verified tree is the FULL form's** — captured only after the full run passed — so the tree that gets pushed is always the fully-verified one. A green-scoped / red-full iteration returns *no* verified tree at all;
+- a green-scoped / red-full pair is an **ordinary iteration failure**: with budget remaining the agent is re-invoked with the FULL output; with the budget exhausted the stage demotes to category A exactly as before #3315. A break in a package the scope did not name is still caught **before push**, never deferred to CI;
+- both absorbs (the #972/#2645 infra-flake retry, the #3316 auto-format absorb) evaluate whichever form produced the failure, because the outcome and output have been replaced;
+- an **EMPTY** package set skips the pre-pass entirely, so a non-Go change pays exactly one full verify per iteration — what it paid before;
+- a tolerant infra `skipped` outcome does **not** trigger the full re-verify: it is not a pass, and re-running the full form over gate plumbing that just failed buys nothing.
+
+`runVerifyGateCommitted` (the `max_iterations == 0` single-shot gate) and the #960 strict pre-push re-verify are **always full-form** and never carry the packages variable.
+
+**Cost, honestly.** An iteration whose scoped form passes pays scoped + full instead of one full, and because the scoped form keeps lint, the doc-line budget, schema-sync, the gate harnesses and both site gates unchanged, those legs are paid twice. The trade is deliberate: iterations 2..N of a fix loop — which is where the long stages come from — pay only the scoped cost. Measured intervals are in the #3315 PR notes. The natural follow-up, deliberately not done here, is letting the scoped form skip the legs the full form will repeat; that would remove the agent's fastest lint feedback.
+
+**Every verify log line names its form.** One iteration can emit two `verify_run` events, so `verify_form_outcome` (`{"form":"scoped"|"full","outcome":…}`) plus the once-per-loop `verify_scope_resolved` line make a green/red pair legible instead of contradictory.
+
+**The lock is a contention guard, not an adversarial control.** The agent's own shell environment is not the runner's, so an agent can set either variable in its own shell. What it cannot do is narrow the **authoritative** gate: the runner invokes that one itself with the packages variable unset. The shell half of the contract — the `--packages` flag, the lock's kind encoding, the wait budget and every degrade — is documented in `scripts/README.md`.
 
 ## Self-hosting bootstrap deadlock ([E64.5 / #3086](https://github.com/kuhlman-labs/fishhawk/issues/3086))
 

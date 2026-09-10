@@ -4453,16 +4453,31 @@ func verifyFailureExcerpt(out string) string {
 //
 //  1. stages the scope-only files (StageScoped, #581) and makes a THROWAWAY
 //     local commit to materialize a committed-HEAD SHA;
+//
 //  2. runs the verify command against that committed SHA in an isolated git
 //     worktree (runVerifyCommittedTree) — NOT the dirty working tree, so a
-//     drift-excluded test failure surfaces here exactly as it would in CI;
+//     drift-excluded test failure surfaces here exactly as it would in CI.
+//     Since #3315 this is the SCOPED form whenever the stage's Go scope files
+//     yield a package set (verifyScopePackages): a fast pre-pass restricted to
+//     the touched packages, which is what makes iterations 2..N of a long fix
+//     loop cheap. It is NOT the authority — 2b is;
+//
+//     2b. on a SCOPED pass, immediately re-verifies the SAME committed SHA with
+//     the FULL form and adopts its outcome and output. A passing iteration
+//     therefore always ends on a complete verify, the #960 verified tree is the
+//     FULL form's, and a break in a package the scope did not name cannot slip
+//     past the gate. An EMPTY package set skips the pre-pass and runs the full
+//     form exactly once, as before #3315;
+//
 //  3. on PASS: undoes the throwaway commit (git reset --soft HEAD~1, which
 //     leaves the converged working-tree edits + index intact) so the real
 //     CommitAndPush in openPRAndShipArtifact makes the single push commit;
+//
 //  4. on FAIL with budget remaining: undoes the throwaway commit, then
 //     re-invokes the agent in-place with a fix prompt embedding the captured
 //     verify output. The next iteration re-commits scope-only onto the SAME
 //     base — one converged commit, never a stack of fix commits on a bad base;
+//
 //  5. on FAIL with the budget exhausted (iter == max_iterations): undoes the
 //     throwaway commit and demotes res to category-A. This is TERMINAL — the
 //     loop is outside the ADR-023 self-retry for{} loop, so it can never call
@@ -4509,6 +4524,17 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 	if timeout == 0 {
 		timeout = 10 * time.Minute
 	}
+
+	// Derive the scoped-verify package set ONCE (#3315). A non-empty set makes
+	// every ITERATION verify the touched packages only; the iteration that
+	// passes then re-verifies the same committed SHA with the FULL form before
+	// the loop may report success. An EMPTY set (no Go scope files, or an
+	// undecodable path) skips the pre-pass entirely, so a non-Go change pays
+	// exactly ONE full verify per iteration — what it paid before this change.
+	scopePkgs := verifyScopePackages(scopeFiles)
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"verify_scope_resolved","run_id":%q,"stage_id":%q,"packages":%q,"form":%q}`+"\n",
+		cfg.runID, cfg.stageID, strings.Join(scopePkgs, ","), verifyFormName(scopePkgs))
 
 	var (
 		passed          bool
@@ -4558,11 +4584,44 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 			break
 		}
 
-		// (c) Verify against the committed tree.
-		ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
+		// (c) Verify against the committed tree. With a scope set in force this
+		// is the SCOPED form — a fast pre-pass over the touched packages, NOT
+		// the authority.
+		ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
 		res.Events = append(res.Events, ev)
 		attempts++
 		lastOutput = out
+		logVerifyFormOutcome(logSink, cfg, iter+1, verifyFormName(scopePkgs), outcome)
+
+		// (c2) FULL re-verify on the passing iteration (#3315). A scoped pass
+		// proves only the named packages; a change can break a test in a package
+		// it does not name. So the moment the scoped form PASSES, re-verify the
+		// SAME committed SHA with the FULL form — before the reset, while HEAD
+		// still names the throwaway commit — and let the full form's outcome and
+		// output be the ones the rest of the iteration acts on. Consequences,
+		// all deliberate:
+		//
+		//   - the #960 verified tree is captured only after the FULL form
+		//     passed, so the pushed tree is always the fully-verified one;
+		//   - a green-scoped / red-full pair is an ORDINARY iteration failure:
+		//     with budget remaining the agent is re-invoked with the FULL
+		//     output, without it the stage demotes exactly as before. The break
+		//     is still caught BEFORE push, never deferred to CI;
+		//   - both absorbs below evaluate whichever form produced the failure,
+		//     because out/outcome have been replaced.
+		//
+		// It runs only for outcome=="passed": a tolerant infra "skipped" is not
+		// a pass, and re-running the full form over gate plumbing that just
+		// failed would buy nothing. The empty-set case never enters here at all
+		// — the scoped call above WAS the full form, so re-running it would
+		// double every iteration's cost for no added coverage.
+		if len(scopePkgs) > 0 && outcome == "passed" {
+			fev, fout, foutcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
+			res.Events = append(res.Events, fev)
+			out, outcome = fout, foutcome
+			lastOutput = fout
+			logVerifyFormOutcome(logSink, cfg, iter+1, verifyFormFull, outcome)
+		}
 
 		// Capture the verified tree's object hash BEFORE the reset (#960).
 		// Only a real "passed" earns one; the tolerant infra-skip outcome
@@ -4911,7 +4970,9 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	}
 
 	// (d) Verify against the committed scope-only tree.
-	ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
+	// nil scope set = the FULL verify form (#3315). runVerifyGateCommitted is
+	// the single-shot authoritative gate; it is never narrowed.
+	ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 	events := []agent.Event{ev}
 
 	// Infrastructure-failure absorb (#972, widened by #2645): a failed verify
@@ -4936,7 +4997,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 				"detail":    detail,
 			}),
 		})
-		ev, out, outcome = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout)
+		ev, out, outcome = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 		events = append(events, ev)
 	}
 
@@ -5204,7 +5265,21 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 // outcome "skipped"; the gate call sites map that to their existing tolerant
 // behavior (no failure invented from gate plumbing — reclassification is
 // #959's scope), while the #960 re-verify treats it as not-verified.
-func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration) (agent.Event, string, string) {
+//
+// scopePkgs (#3315) is the repo-relative package set the verify command should
+// narrow its test loop to, as derived by verifyScopePackages. A NON-EMPTY set
+// runs the SCOPED form (FISHHAWK_VERIFY_PACKAGES injected); an EMPTY set — nil,
+// a non-Go scope, or an undecodable path — runs the FULL form with the variable
+// ABSENT, which is the fail-safe direction and byte-identical to the pre-#3315
+// invocation. Every invocation, scoped or full, carries the verify-lock owner
+// marker so the runner's gate waits for a live agent-shell verify rather than
+// racing it. Both are injected AFTER sanitization through runBoundedGateArgv's
+// extraEnv, so neither can be inherited from the ambient environment.
+//
+// The scoped form is NOT authoritative: runVerifyFixLoop re-verifies the same
+// committed SHA with the FULL form before reporting success, and it is that
+// full run's tree that supplies the #960 pre-push verified tree.
+func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration, scopePkgs []string) (agent.Event, string, string) {
 	// Best-effort tree identity for the trace event: the enforcement-grade
 	// capture is the gates' fail-closed gitRevParseTreeOf; an empty tree_sha
 	// here only degrades the audit stamp, never the invariant.
@@ -5224,8 +5299,13 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 			"worktree_add: "+strings.TrimSpace(string(out)), "skipped"), "", "skipped"
 	}
 
+	// Owner marker always; package set only when one was derived. verifyScopeEnv
+	// returns its input UNCHANGED for an empty set, so the full form's extraEnv
+	// carries exactly one entry and the packages variable is ABSENT, not empty.
+	extraEnv := verifyScopeEnv(verifyLockOwnerEnv(nil), scopePkgs)
+
 	output, exitCode := runBoundedGateCommand(ctx, verifyCmd, wt,
-		filepath.Join(parent, "golangci-lint-cache"), timeout)
+		filepath.Join(parent, "golangci-lint-cache"), timeout, extraEnv...)
 	outcome := "passed"
 	if exitCode != 0 {
 		outcome = "failed"
@@ -5264,8 +5344,12 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 // which carries the contract above; a caller holding an ARGV rather than a
 // command string (the auto-format absorb) routes through the argv form
 // directly, so there is still exactly ONE containment implementation.
-func runBoundedGateCommand(ctx context.Context, command, dir, lintCacheDir string, timeout time.Duration) (string, int) {
-	return runBoundedGateArgv(ctx, []string{"sh", "-c", command}, dir, lintCacheDir, timeout)
+//
+// extraEnv (#3315) is a variadic list of "KEY=VALUE" entries appended AFTER
+// sanitization — see runBoundedGateArgv for what that does and does not widen.
+// It is variadic so every pre-existing call site stays source-compatible.
+func runBoundedGateCommand(ctx context.Context, command, dir, lintCacheDir string, timeout time.Duration, extraEnv ...string) (string, int) {
+	return runBoundedGateArgv(ctx, []string{"sh", "-c", command}, dir, lintCacheDir, timeout, extraEnv...)
 }
 
 // runBoundedGateArgv is the SHARED implementation of the gate-containment
@@ -5285,7 +5369,21 @@ func runBoundedGateCommand(ctx context.Context, command, dir, lintCacheDir strin
 //
 // argv must be non-empty; argv[0] is the executable, resolved through PATH.
 // An empty argv returns ("", -1) rather than panicking.
-func runBoundedGateArgv(ctx context.Context, argv []string, dir, lintCacheDir string, timeout time.Duration) (string, int) {
+//
+// extraEnv (#3315) is a variadic list of "KEY=VALUE" entries the RUNNER injects
+// into the gate child AFTER sanitization — today the scoped-verify package set
+// and the verify-lock owner marker (verifyScopeEnv / verifyLockOwnerEnv). It is
+// deliberately variadic so every pre-existing call site compiles byte-unchanged
+// and no second exec path is introduced, which this contract forbids.
+//
+// It does NOT widen the containment contract: appendGateExtraEnv applies these
+// entries with the same drop-then-append discipline withIsolatedLintCache uses,
+// so an entry REPLACES rather than duplicates any same-named survivor, and the
+// values are ones the runner chose in code — never ones inherited from the
+// ambient environment, which sanitizedGateEnv's default-deny allow-list has
+// already dropped. Do NOT use extraEnv to smuggle a credential past the
+// allow-list; that is the exact decision the allow-list exists to make explicit.
+func runBoundedGateArgv(ctx context.Context, argv []string, dir, lintCacheDir string, timeout time.Duration, extraEnv ...string) (string, int) {
 	if len(argv) == 0 {
 		return "", -1
 	}
@@ -5293,7 +5391,7 @@ func runBoundedGateArgv(ctx context.Context, argv []string, dir, lintCacheDir st
 	defer childCancel()
 	cmd := exec.CommandContext(childCtx, argv[0], argv[1:]...)
 	cmd.Dir = dir
-	cmd.Env = withIsolatedLintCache(sanitizedGateEnv(), lintCacheDir)
+	cmd.Env = appendGateExtraEnv(withIsolatedLintCache(sanitizedGateEnv(), lintCacheDir), extraEnv)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
@@ -7703,7 +7801,9 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		if reverifyTimeout == 0 {
 			reverifyTimeout = 10 * time.Minute
 		}
-		ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout)
+		// nil scope set = the FULL verify form (#3315): the #960 strict re-verify
+		// is the pre-push authority and is never narrowed.
+		ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
 		// Emit the decisive re-verify's verify_run record unconditionally
 		// (pass or fail) before the outcome check (#969). The gate's first
 		// verify_run shipped inside the trace bundle, but the bundle is
@@ -7748,7 +7848,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, 1, detail)
-			ev, out, outcome = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout)
+			ev, out, outcome = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
 			emitReverifyRun(ev)
 		}
 		if outcome != "passed" {

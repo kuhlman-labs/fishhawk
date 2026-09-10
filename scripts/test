@@ -10,9 +10,25 @@
 #   scripts/test coverage     the gate above + scripts/check-coverage.py
 #   scripts/test lint         run `golangci-lint run ./...` in every module
 #   scripts/test verify       lint + schema-sync + tests + patch-coverage — the runner's gate
+#   scripts/test verify --packages backend/internal/run,cli/internal/spec
+#                             the SCOPED verify form (#3315): every non-test leg
+#                             is unchanged, but the `go test -race` loop is
+#                             restricted to the listed repo-relative package
+#                             DIRECTORIES in the modules that own them and every
+#                             other module is skipped. The patch-coverage gate is
+#                             SKIPPED in this form (its denominator is the whole
+#                             branch diff, which a scoped run cannot honestly
+#                             gate) — the full form still runs it. Falls back to
+#                             $FISHHAWK_VERIFY_PACKAGES when the flag is absent.
 #   scripts/test single ARGS  pass-through to `go test -race ARGS`
 #                             example:
 #                             scripts/test single -run TestX ./backend/internal/version/...
+#
+# `verify` (both forms) takes a per-repository lock in the shared git common dir
+# so two verifies never contend on golangci-lint's global lock or the shared
+# testcontainers Postgres. A SHELL-kind invocation meeting a live holder REFUSES
+# immediately (it does not poll); a RUNNER-kind one (FISHHAWK_VERIFY_LOCK_OWNER=
+# runner) waits up to 600s. Long form: scripts/README.md.
 #
 # Frontend gates (pnpm format:check / typecheck / test) are NOT
 # covered here — they have their own conventions per docs/.
@@ -322,6 +338,15 @@ _register_lease() {
 PATCHCOV_DIR=""
 LEASE_ARMED=0
 
+# Verify-lock state (#3315). VERIFY_LOCK_HELD is the lock path THIS invocation
+# actually acquired (empty when it refused, degraded, or was stolen from);
+# VERIFY_LOCK_TARGET is the `<pid>:<kind>` link target it wrote, re-read before
+# release so a lock that no longer names us is never removed. VERIFY_PRUNE_MARKER
+# is the prune-serialising marker while this invocation holds it.
+VERIFY_LOCK_HELD=""
+VERIFY_LOCK_TARGET=""
+VERIFY_PRUNE_MARKER=""
+
 # Integrity anchor for the pre-test change-set snapshot (#2124). Computed by the
 # PARENT shell from the pristine snapshot BEFORE the go-test loop and held only
 # here in parent memory — never written to a test-reachable path, never exported
@@ -362,7 +387,7 @@ _patchcov_cleanup() {
 # an invocation holding no lease must never docker-rm the container out from
 # under a peer (#1792). Kept as one string so both arming sites install the
 # identical handler.
-EXIT_TRAP='_patchcov_cleanup; if [ "${LEASE_ARMED:-0}" = "1" ]; then _reap_shared_container; fi'
+EXIT_TRAP='_release_verify_lock; _patchcov_cleanup; if [ "${LEASE_ARMED:-0}" = "1" ]; then _reap_shared_container; fi'
 
 # _patchcov_mktemp: create the per-invocation profile dir and arm the EXIT trap.
 # Returns non-zero (never aborts) if the dir cannot be created — the caller then
@@ -485,6 +510,164 @@ cmd_test() {
     printf '>>> %s\n' "$m"
     (cd "$m" && go test -race -p "$TEST_P" ./...)
   done <<< "$mlist"
+}
+
+# --------------------------------------------------------------------------
+# Scoped verify (#3315)
+#
+# The runner's in-loop verify gate re-runs the WHOLE `go test -race ./...` loop
+# on every fix-up iteration, which is where a 25-40 minute implement stage comes
+# from. `scripts/test verify --packages <repo/rel/pkg,...>` (or the
+# FISHHAWK_VERIFY_PACKAGES env fallback the runner injects) restricts ONLY that
+# loop to the listed packages in the modules that own them; every other module is
+# skipped entirely, which is where the saving comes from.
+#
+# Everything else is deliberately UNCHANGED in scoped mode: lint, the doc-line
+# budget, schema-sync, the gate harnesses and both site gates all still run, so
+# the agent keeps its fastest lint/format feedback. The one thing that is not run
+# is the patch-coverage gate — see cmd_verify for why.
+#
+# FAIL-SAFE DIRECTION: a scoped run must never silently test LESS than the
+# caller asked for. So a package this layer cannot bucket (owned by no go.work
+# module, or carrying a tab/newline its own `<module>\t<pkgs>` encoding cannot
+# present) prints a one-line reason and returns non-zero, and cmd_verify then
+# WIDENS to the full unscoped loop. That mirrors _patch_cov_all_modules' precedent
+# of paying more rather than dropping a file out of a gate's reach.
+# --------------------------------------------------------------------------
+
+# The package list in force for this invocation, set by _parse_verify_args from
+# the --packages flag or the FISHHAWK_VERIFY_PACKAGES fallback. Empty means the
+# full unscoped form, which is byte-for-byte what verify did before #3315.
+VERIFY_PACKAGES=""
+
+# _parse_verify_args: consume `verify`'s own options. CLI beats the environment
+# when both are present. A `--packages` given with an EMPTY value is a CALLER
+# BUG, not a request to run unscoped: silently widening would hide a runner-side
+# defect that produced an empty list, so it exits 1 with the usage line.
+_parse_verify_args() {
+  local seen_flag=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --packages)
+        if [ "$#" -lt 2 ]; then
+          echo "scripts/test: --packages requires a comma-separated package list" >&2
+          usage >&2
+          exit 1
+        fi
+        VERIFY_PACKAGES="$2"
+        seen_flag=1
+        shift 2
+        ;;
+      --packages=*)
+        VERIFY_PACKAGES="${1#--packages=}"
+        seen_flag=1
+        shift
+        ;;
+      *)
+        echo "scripts/test: unknown verify option: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+  if [ "$seen_flag" = "1" ]; then
+    if [ -z "$VERIFY_PACKAGES" ]; then
+      echo "scripts/test: --packages requires a non-empty comma-separated package list" >&2
+      usage >&2
+      exit 1
+    fi
+    return 0
+  fi
+  VERIFY_PACKAGES="${FISHHAWK_VERIFY_PACKAGES:-}"
+}
+
+# _verify_scope_buckets <comma-separated repo-relative package dirs>: emit one
+# `<module>\t./pkg ./pkg2` line per owning go.work module, using the same
+# longest-prefix module match _patch_cov_changed_modules uses. Returns non-zero
+# (after printing a one-line reason) for every input this layer cannot bucket, so
+# the caller widens to the full loop.
+_verify_scope_buckets() {
+  local list="$1" mlist p cand m rel pairs=""
+  case "$list" in
+    *$'\n'*|*$'\t'*)
+      echo "scripts/test: --packages value contains a tab or newline this layer cannot present — running the full test loop" >&2
+      return 1
+      ;;
+  esac
+  if ! mlist="$(modules 2>/dev/null)" || [ -z "$mlist" ]; then
+    echo "scripts/test: could not enumerate go.work modules to scope --packages — running the full test loop" >&2
+    return 1
+  fi
+  while IFS= read -r p; do
+    p="${p#./}"
+    p="${p%/}"
+    if [ -z "$p" ]; then
+      echo "scripts/test: --packages contains an empty entry — running the full test loop" >&2
+      return 1
+    fi
+    m=""
+    while IFS= read -r cand; do
+      cand="${cand#./}"
+      cand="${cand%/}"
+      if [ -z "$cand" ]; then continue; fi
+      if [ "$p" = "$cand" ] || [ "${p#"$cand"/}" != "$p" ]; then
+        if [ "${#cand}" -gt "${#m}" ]; then m="$cand"; fi
+      fi
+    done <<< "$mlist"
+    if [ -z "$m" ]; then
+      echo "scripts/test: --packages entry '$p' is not inside any go.work module — running the full test loop" >&2
+      return 1
+    fi
+    if [ "$p" = "$m" ]; then rel="."; else rel="./${p#"$m"/}"; fi
+    pairs="$pairs$m	$rel
+"
+  done <<< "$(printf '%s' "$list" | tr ',' '\n')"
+  if [ -z "$pairs" ]; then
+    echo "scripts/test: --packages produced no packages — running the full test loop" >&2
+    return 1
+  fi
+  printf '%s' "$pairs" | sort -u | awk -F'\t' '
+    { if ($1 != cur) { if (cur != "") print cur "\t" acc; cur = $1; acc = $2 }
+      else acc = acc " " $2 }
+    END { if (cur != "") print cur "\t" acc }'
+}
+
+# cmd_test_scoped <buckets>: cmd_test's loop restricted to the bucketed packages.
+# A module with no listed package is SKIPPED (printed, so the saving is visible in
+# the log). It arms the container lease exactly as cmd_test does — a scoped loop
+# still touches the shared testcontainers Postgres — and fails closed on an
+# unavailable/empty module list with cmd_test's NO_MODULES_MSG contract.
+cmd_test_scoped() {
+  local buckets="$1" mlist m mm pp pkgs ran=0
+  if ! mlist="$(_module_list)"; then
+    echo "$NO_MODULES_MSG" >&2
+    exit 1
+  fi
+  _arm_container_lease
+  while IFS= read -r m; do
+    pkgs=""
+    while IFS=$'\t' read -r mm pp; do
+      if [ "${mm#./}" = "${m#./}" ]; then pkgs="$pp"; fi
+    done <<< "$buckets"
+    if [ -z "$pkgs" ]; then
+      printf '>>> %s (no scoped packages — skipped)\n' "$m"
+      continue
+    fi
+    printf '>>> %s %s\n' "$m" "$pkgs"
+    # Word-splitting $pkgs is intentional: it is a space-joined list of ./pkg
+    # arguments this script built itself, and _verify_scope_buckets already
+    # refused any entry carrying whitespace.
+    # shellcheck disable=SC2086
+    (cd "$m" && go test -race -p "$TEST_P" $pkgs)
+    ran=$((ran + 1))
+  done <<< "$mlist"
+  # Defence in depth against the module list changing between bucketing and this
+  # loop: a scoped loop that matched NO module must never exit 0, for the same
+  # reason _module_list fails closed — that is a green gate that ran nothing.
+  if [ "$ran" -eq 0 ]; then
+    echo "scripts/test: scoped verify matched no go.work module — refusing to report success without running any tests" >&2
+    exit 1
+  fi
 }
 
 cmd_coverage() {
@@ -953,10 +1136,18 @@ _verify_patch_coverage() {
 # zsh guard; the go-absent SKIP lives INSIDE the harness (a printed reason plus
 # exit 0), exactly like test-helm-render's helm-absent skip, so this loop needs
 # no site-reference-specific branch.
+# test-verify-scope (#3315) pins the scoped verify form (--packages, its env
+# fallback and both widening fail-safes) and the per-repository verify lock
+# (shell-refuses / runner-waits-then-displaces / runner-never-displaces-a-runner,
+# the serialised prune, and all three no-locking degrades). It is bash (no zsh
+# guard needed) and hermetic — temp-dir git fixtures with stubbed go/golangci-lint/
+# sleep/docker, no network and no real Docker. Wiring it here is what makes the
+# harness enforce anything: a harness that exists but is never invoked satisfies
+# the scope-completeness gate while enforcing nothing.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference; do
+  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue
@@ -1010,6 +1201,498 @@ _verify_site_ia() {
   "$ROOT/scripts/check-site-ia"
 }
 
+# --------------------------------------------------------------------------
+# Per-repository verify lock (#3315)
+#
+# Two concurrent `scripts/test verify` invocations on one worktree family contend
+# on golangci-lint's global lock and on the shared testcontainers Postgres, and
+# the loser fails category-B behind a misleading scope-drift framing (#2645). The
+# lock makes that structurally impossible on the normal path.
+#
+# KEY: <git-common-dir>/fishhawk-verify.lock. The common dir is SHARED by the
+# main checkout and every linked worktree, so the runner's throwaway verify
+# worktree and the agent's run worktree genuinely contend — which a TMPDIR-keyed
+# path would not guarantee, since the runner's gate env is a default-deny
+# allow-list and a differing TMPDIR would leave the control inert while appearing
+# to work. Living inside .git also keeps it invisible to `git status`, so it can
+# never pollute the scope-completeness or untracked-file gates.
+#
+# PRIMITIVE: an atomic symlink whose TARGET is `<pid>:<kind>` (kind is `runner`
+# or `shell`). `ln -s` is one symlink(2) that fails EEXIST if the path is taken,
+# so the lock carries BOTH its owner and its kind from the instant it exists —
+# there is no window in which it exists yet is unowned. Same construction as
+# _lease_lock (#1792).
+#
+# SEMANTICS, by the kind of the invocation MEETING a live holder:
+#   * SHELL meets ANY live holder  -> REFUSE IMMEDIATELY. Non-zero, no sleep, no
+#     poll, and an actionable message naming `scripts/test single`. Polling a
+#     refusal in a loop is what killed run a662ed6f category-A; the refusal is a
+#     fast failure, not a queue.
+#   * RUNNER meets a live SHELL holder -> WAIT, bounded by 600 seconds at a
+#     2-second poll. Most holders finish inside that, and the runner then
+#     acquires normally with NO concurrency at all. Only on EXPIRY does it
+#     DISPLACE the holder, printing a loud warning naming the deposed pid. That
+#     is the wedged-holder escape hatch, not the normal path.
+#   * RUNNER meets a live RUNNER holder -> wait on the same budget and then
+#     REFUSE. Two concurrent runner verifies on one worktree family is a bug to
+#     surface, not one to paper over by stealing.
+#
+# DEAD/GARBAGE holders are pruned, and the prune is itself SERIALISED by a second
+# atomic symlink at <lockpath>.prune. Without that, two invocations that both
+# classify the same dead holder can both unlink it, and the loser's unlink
+# removes the WINNER'S fresh live lock — both then believe they hold it.
+# Re-reading immediately before the unlink only narrows that window; the marker
+# closes it. Holding the marker the pruner RE-READS the lock and only removes a
+# still-dead holder; if a live holder appeared it falls through to the normal
+# live-holder path. The marker is released by the same EXIT trap, only when this
+# invocation created it.
+#
+# The marker's OWN dead-owner recovery is exclusive too (_verify_lock_recover_
+# marker): a claim at <lockpath>.prune.reap.<victim>, content-addressed by the
+# observed dead owner, and a removal CONDITIONAL on the marker still naming that
+# owner. An unprotected read/kill/rm there would be the identical defect one
+# level up — two recoverers, the loser deleting the winner's fresh live marker,
+# both then pruning the lock. A claim is never broken, so a recoverer killed
+# while holding one wedges recovery of that one marker; the restart budget turns
+# that into a loud refusal naming the paths to remove, which is a residual an
+# operator can clear rather than a mutual exclusion that is merely narrow.
+#
+# The runner's EXPIRY displacement is conditional in the same sense
+# (_verify_lock_steal): the lock is taken by an atomic `mv` to a private path and
+# the entry actually taken is READ. Anything other than the holder the budget was
+# spent on is put back and the displacement refused, so the decision stays valid
+# THROUGH the unlink rather than only at classification time — a shell holder
+# that releases into a fresh RUNNER holder in that window is met by the normal
+# live-runner refusal instead of being deleted.
+#
+# RESIDUAL, stated: `kill -0 <pid>` succeeding does not prove the pid is the
+# ORIGINAL holder — a reused pid reads as live. That is the identical residual
+# the container lease already accepts, and the consequence here is a bounded wait
+# plus a loud displacement, or a refusal with an escape hatch printed in the
+# message — never a lost or corrupted run.
+#
+# The lock is taken by `verify` ONLY, so `test`/`coverage`/`lint`/`single` are
+# unaffected and the escape hatch the refusal names stays always available.
+# Long form: scripts/README.md.
+# --------------------------------------------------------------------------
+
+# Wait budget and poll interval, by number. Both are dev-overridable via the
+# environment; that override is DEV-ONLY in the same sense as the other FISHHAWK_*
+# knobs, since the runner's gate env is a default-deny allow-list and FISHHAWK_ is
+# not an allowed prefix. Read at USE time (not frozen at load) so a per-invocation
+# override is honoured even when this file is sourced lib-only by the harness.
+VERIFY_LOCK_WAIT_SECONDS=600
+VERIFY_LOCK_POLL_SECONDS=2
+
+_verify_lock_wait_budget() {
+  local v="${FISHHAWK_VERIFY_LOCK_WAIT_SECONDS:-$VERIFY_LOCK_WAIT_SECONDS}"
+  case "$v" in ''|*[!0-9]*) v="$VERIFY_LOCK_WAIT_SECONDS" ;; esac
+  printf '%s' "$v"
+}
+
+_verify_lock_poll_interval() {
+  local v="${FISHHAWK_VERIFY_LOCK_POLL_SECONDS:-$VERIFY_LOCK_POLL_SECONDS}"
+  case "$v" in ''|*[!0-9]*|0) v="$VERIFY_LOCK_POLL_SECONDS" ;; esac
+  printf '%s' "$v"
+}
+
+# _verify_lock_self_pid: this invocation's identity. Injectable (as the container
+# lease's _lease_token is) so the harness can drive two synthetic acquisitions in
+# one process and pin the prune interleaving deterministically.
+_verify_lock_self_pid() {
+  printf '%s' "${FISHHAWK_VERIFY_LOCK_SELF_PID:-$$}"
+}
+
+# _verify_lock_kind: `runner` when the runner marked this invocation, else
+# `shell`. The runner appends the marker to the gate env AFTER sanitization, so
+# an ambient value never reaches the gate subprocess.
+_verify_lock_kind() {
+  if [ "${FISHHAWK_VERIFY_LOCK_OWNER:-}" = "runner" ]; then
+    printf 'runner'
+  else
+    printf 'shell'
+  fi
+}
+
+# _verify_lock_path: <git-common-dir>/fishhawk-verify.lock, or non-zero plus a
+# printed reason when locking is not possible. Three DEGRADES, each to NO
+# locking rather than to a failure: git absent, $ROOT not a work tree, and a BARE
+# repo. The bare-repo case guards on the printed `--is-inside-work-tree` VALUE,
+# not its exit status, because a bare repo prints `false` yet exits 0 — the same
+# trap _verify_schema_sync documents.
+_verify_lock_path() {
+  if ! command -v git >/dev/null 2>&1; then
+    echo "scripts/test: git not found — running verify without the concurrency lock" >&2
+    return 1
+  fi
+  if [ "$(git -C "$ROOT" rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then
+    echo "scripts/test: $ROOT is not a git work tree — running verify without the concurrency lock" >&2
+    return 1
+  fi
+  local common
+  if ! common="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || [ -z "$common" ]; then
+    echo "scripts/test: could not resolve the git common dir — running verify without the concurrency lock" >&2
+    return 1
+  fi
+  printf '%s/fishhawk-verify.lock' "${common%/}"
+}
+
+# _verify_lock_classify <lockpath>: ONE parse driving every branch below, so the
+# three callers cannot diverge. Prints exactly one of:
+#   free | dead | live-shell | live-runner | garbage
+_verify_lock_classify() {
+  local lock="$1" target pid kind
+  if [ ! -L "$lock" ]; then
+    if [ -e "$lock" ]; then printf 'garbage'; else printf 'free'; fi
+    return 0
+  fi
+  target="$(readlink "$lock" 2>/dev/null || true)"
+  pid="${target%%:*}"
+  kind="${target#*:}"
+  case "$pid" in ''|*[!0-9]*) printf 'garbage'; return 0 ;; esac
+  case "$kind" in runner|shell) ;; *) printf 'garbage'; return 0 ;; esac
+  if kill -0 "$pid" 2>/dev/null; then
+    printf 'live-%s' "$kind"
+  else
+    printf 'dead'
+  fi
+}
+
+# _verify_lock_holder_pid <lockpath>: the holder pid, or empty.
+_verify_lock_holder_pid() {
+  local target
+  target="$(readlink "$1" 2>/dev/null || true)"
+  case "${target%%:*}" in
+    ''|*[!0-9]*) printf '' ;;
+    *) printf '%s' "${target%%:*}" ;;
+  esac
+}
+
+# _verify_lock_try_acquire <lockpath> <target>: the atomic claim. The
+# readlink-equals-ours re-check rejects the case where `ln -s` "succeeded" by
+# landing a stray link INSIDE a leftover dir-form lock, so only a genuine atomic
+# claim returns success.
+_verify_lock_try_acquire() {
+  local lock="$1" target="$2"
+  ln -s "$target" "$lock" 2>/dev/null || return 1
+  [ "$(readlink "$lock" 2>/dev/null)" = "$target" ] || return 1
+  VERIFY_LOCK_HELD="$lock"
+  VERIFY_LOCK_TARGET="$target"
+  trap "$EXIT_TRAP" EXIT
+  return 0
+}
+
+# _verify_lock_recover_marker <markerpath> <observed-owner>: recover a prune
+# marker left behind by a pruner that died holding it — WITHOUT the unlink race
+# the marker itself exists to close.
+#
+# The naive form (read the owner, `kill -0` it, `rm`) is the SAME defect one
+# level up: two recoverers can both observe the same dead owner, A removes the
+# marker and plants its own, and B — still acting on the classification it took
+# BEFORE A ran — deletes A's FRESH LIVE marker. Both then believe they are the
+# sole pruner and both prune the lock, which is exactly the double-prune this
+# marker was introduced to prevent.
+#
+# The observed owner is therefore an ARGUMENT, not something re-read here: the
+# staleness is the hazard, so it is modelled explicitly and the removal is made
+# both EXCLUSIVE and CONDITIONAL.
+#
+#   * The right to reap a marker owned by <victim> is claimed by an atomic
+#     symlink at <marker>.reap.<victim>. The claim is CONTENT-ADDRESSED by the
+#     victim, so two recoverers acting on the same observation cannot both hold
+#     it, and one acting on a DIFFERENT observation is not competing for the
+#     same removal at all.
+#   * Holding the claim, the marker is RE-READ and removed ONLY if it still
+#     names <victim>. A fresh marker planted by whoever got there first names a
+#     different pid and is left strictly alone.
+#
+# Nothing is created at <marker> here. The caller restarts classification and
+# competes for the marker with the same atomic `ln -s` every other invocation
+# uses, so a successful recovery confers no ownership. It returns 0 ONLY when it
+# actually removed the marker it was asked about, and 1 for every back-off — a
+# live owner, a claim held by another recoverer, or a marker that has since
+# changed hands.
+#
+# This function NEVER breaks a claim it finds, not even one whose owner is dead:
+# breaking a claim would reintroduce the identical race one level deeper, and
+# each further level could only ever narrow the window rather than close it. The
+# terminating alternative is stated honestly instead. A claim leaked by a
+# recoverer SIGKILLed inside the microseconds it holds one wedges recovery of
+# that ONE dead marker; the acquisition loop's restart budget converts that into
+# a loud refusal naming the paths to remove. A wedge an operator can clear in
+# one `rm` beats a mutual exclusion that is merely narrow.
+_verify_lock_recover_marker() {
+  local marker="$1" victim="$2" claim self cur rc
+  self="$(_verify_lock_self_pid)"
+  case "$victim" in
+    ''|*[!0-9]*)
+      # No pid to identify a live pruner with: a GARBAGE marker (a dir-form
+      # leftover, or a target that names no pid). It still goes through an
+      # exclusive claim, so two recoverers cannot both act on it.
+      claim="$marker.reap.garbage"
+      ;;
+    *)
+      if kill -0 "$victim" 2>/dev/null; then
+        return 1  # a LIVE pruner holds it: there is nothing to recover
+      fi
+      claim="$marker.reap.$victim"
+      ;;
+  esac
+  if ! { ln -s "$self" "$claim" 2>/dev/null && [ "$(readlink "$claim" 2>/dev/null)" = "$self" ]; }; then
+    return 1
+  fi
+  cur="$(readlink "$marker" 2>/dev/null || true)"
+  rc=1
+  if [ "$cur" = "$victim" ]; then
+    rm -rf "$marker" 2>/dev/null || true
+    rc=0
+  fi
+  rm -f "$claim" 2>/dev/null || true
+  return "$rc"
+}
+
+# _verify_lock_steal <lockpath> <victim-target> <target>: the runner's
+# wait-expiry displacement, made valid THROUGH the removal rather than only at
+# classification time.
+#
+# The unconditional `rm -f "$lock"` this replaces decided on a classification
+# and acted on it afterwards. Between the two, the wedged shell holder can
+# release and a DIFFERENT invocation — including a RUNNER one — can acquire; the
+# rm would then delete a fresh lock this loop never classified, producing exactly
+# the two concurrent runner verifies the live-runner branch exists to refuse.
+#
+# `rm` cannot be made conditional, but `mv` can be made EXCLUSIVE: renaming the
+# lock to a private path is atomic, so of two invocations racing to displace the
+# same entry exactly one succeeds — and the winner can then READ what it actually
+# took. Taking anything other than the holder the budget was spent on is a
+# MIS-TAKE: the entry is put back with a non-clobbering `ln -s` and this
+# invocation REFUSES, so the caller restarts classification and meets the new
+# holder through the normal branches. A displacement is only ever completed
+# against the holder that was actually waited on.
+#
+# The prune marker is held across the whole sequence, so a concurrent PRUNER
+# (which also removes the lock) is excluded while the rename excludes a
+# concurrent STEALER.
+#
+# RESIDUAL, stated rather than claimed closed: the restore is `ln -s`, which
+# refuses to clobber. If a THIRD invocation acquired the freed path between the
+# mis-take and the restore, the mis-taken holder's entry is gone and it becomes a
+# phantom holder. That needs two separate acquisitions inside the same
+# microseconds, and this invocation still refuses — but it is a window, not a
+# guarantee. The alternative, a clobbering `mv` restore, would delete the third
+# invocation's live lock instead, which is strictly worse.
+#
+# Returns 0 when this invocation displaced the victim AND now holds the lock,
+# 2 when it displaced the victim but LOST the race to re-acquire (the caller
+# must never displace twice), and 1 when no displacement was performed at all.
+# 0 and 2 are both COMPLETED displacements — the victim's lock is gone in each —
+# so the caller owes the loud warning on both, not only on the one that ends
+# holding the lock.
+_verify_lock_steal() {
+  local lock="$1" victim="$2" target="$3" marker self taken moved rc=1
+  self="$(_verify_lock_self_pid)"
+  marker="$lock.prune"
+  if ! { ln -s "$self" "$marker" 2>/dev/null && [ "$(readlink "$marker" 2>/dev/null)" = "$self" ]; }; then
+    _verify_lock_recover_marker "$marker" "$(readlink "$marker" 2>/dev/null || true)" || true
+    return 1
+  fi
+  VERIFY_PRUNE_MARKER="$marker"
+  trap "$EXIT_TRAP" EXIT
+  taken="$lock.stolen.$self"
+  rm -rf "$taken" 2>/dev/null || true
+  if mv "$lock" "$taken" 2>/dev/null; then
+    moved="$(readlink "$taken" 2>/dev/null || true)"
+    if [ "$moved" = "$victim" ]; then
+      rm -rf "$taken" 2>/dev/null || true
+      if _verify_lock_try_acquire "$lock" "$target"; then rc=0; else rc=2; fi
+    else
+      # MIS-TAKE: the entry we took is not the holder we waited on. Put it back
+      # without clobbering anything that landed meanwhile, and refuse.
+      if [ -n "$moved" ]; then
+        ln -s "$moved" "$lock" 2>/dev/null || true
+      fi
+      rm -rf "$taken" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$marker" 2>/dev/null || true
+  VERIFY_PRUNE_MARKER=""
+  return "$rc"
+}
+
+# _verify_lock_prune_and_acquire <lockpath> <target>: prune a dead/garbage holder
+# under the exclusive prune marker. Returns 0 only when this invocation now HOLDS
+# the lock; returns 1 for every other outcome, and the caller then RESTARTS
+# classification from the top rather than assuming the prune conferred anything.
+_verify_lock_prune_and_acquire() {
+  local lock="$1" target="$2" marker self mowner cls rc=1
+  marker="$lock.prune"
+  self="$(_verify_lock_self_pid)"
+  if ! { ln -s "$self" "$marker" 2>/dev/null && [ "$(readlink "$marker" 2>/dev/null)" = "$self" ]; }; then
+    # Another invocation is already pruning. Recover the marker if its owner
+    # died holding it — EXCLUSIVELY, see _verify_lock_recover_marker — then back
+    # off and restart classification from the top.
+    mowner="$(readlink "$marker" 2>/dev/null || true)"
+    _verify_lock_recover_marker "$marker" "$mowner" || true
+    return 1
+  fi
+  VERIFY_PRUNE_MARKER="$marker"
+  trap "$EXIT_TRAP" EXIT
+  # Holding the marker, RE-READ the lock. Only a still-dead (or garbage) holder is
+  # removed; a live holder that got there first is left alone and the caller falls
+  # through to the normal live-holder path.
+  cls="$(_verify_lock_classify "$lock")"
+  case "$cls" in
+    dead|garbage)
+      rm -rf "$lock" 2>/dev/null || true
+      if _verify_lock_try_acquire "$lock" "$target"; then rc=0; fi
+      ;;
+    free)
+      if _verify_lock_try_acquire "$lock" "$target"; then rc=0; fi
+      ;;
+  esac
+  rm -f "$marker" 2>/dev/null || true
+  VERIFY_PRUNE_MARKER=""
+  return "$rc"
+}
+
+# The one refusal both restart budgets print. It names the recovery-claim paths
+# because the only way this is reached repeatedly is a recoverer SIGKILLed while
+# holding one — the stated, operator-clearable residual of
+# _verify_lock_recover_marker's refusal to break a claim it did not create.
+VERIFY_LOCK_UNSETTLED_MSG='scripts/test: the verify lock never settled — refusing rather than proceeding under an uncertain lock state.
+If this repeats, a pruner was killed holding a recovery claim: inspect and remove
+<git-common-dir>/fishhawk-verify.lock.prune and its .reap.* siblings by hand.'
+
+# _acquire_verify_lock_at <lockpath>: the acquisition loop. Returns 0 when this
+# invocation may proceed (it holds the lock), 1 when it must REFUSE. Split from
+# _acquire_verify_lock so the harness can drive every branch in-process against a
+# fixture lock path with an injected self pid.
+_acquire_verify_lock_at() {
+  local lock="$1" kind target self cls holder budget poll steal_rc waited=0 announced=0 stole=0 restarts=0
+  self="$(_verify_lock_self_pid)"
+  kind="$(_verify_lock_kind)"
+  target="$self:$kind"
+  budget="$(_verify_lock_wait_budget)"
+  poll="$(_verify_lock_poll_interval)"
+  while :; do
+    if _verify_lock_try_acquire "$lock" "$target"; then
+      return 0
+    fi
+    cls="$(_verify_lock_classify "$lock")"
+    holder="$(_verify_lock_holder_pid "$lock")"
+    case "$cls" in
+      free|dead|garbage)
+        restarts=$((restarts + 1))
+        if [ "$restarts" -gt 100 ]; then
+          echo "$VERIFY_LOCK_UNSETTLED_MSG" >&2
+          return 1
+        fi
+        if [ "$cls" = "free" ]; then
+          continue
+        fi
+        if _verify_lock_prune_and_acquire "$lock" "$target"; then
+          return 0
+        fi
+        continue
+        ;;
+      live-shell|live-runner)
+        if [ "$kind" = "shell" ]; then
+          cat >&2 <<EOF
+scripts/test: another verify already holds the lock at $lock (pid ${holder:-unknown}, kind ${cls#live-}).
+The runner owns verify for this stage. Do NOT poll or retry this in a loop — it is a
+fast failure, not a queue. Run your package's tests directly instead:
+  scripts/test single -run TestX ./your/package/...
+EOF
+          return 1
+        fi
+        if [ "$waited" -ge "$budget" ]; then
+          if [ "$cls" = "live-runner" ]; then
+            cat >&2 <<EOF
+scripts/test: another RUNNER verify still holds the lock at $lock after ${budget}s
+(holder pid ${holder:-unknown}, this pid $self). Two concurrent runner verifies on one
+worktree family is a bug to surface, not one to paper over — refusing rather than
+displacing a peer runner.
+EOF
+            return 1
+          fi
+          if [ "$stole" -eq 1 ]; then
+            echo "scripts/test: the verify lock at $lock was retaken after a displacement — refusing rather than displacing twice" >&2
+            return 1
+          fi
+          # Conditional displacement: the decision must still be VALID at the
+          # unlink, not merely at the classification. _verify_lock_steal
+          # completes only against this exact holder.
+          steal_rc=0
+          _verify_lock_steal "$lock" "$holder:shell" "$target" || steal_rc=$?
+          # The warning is owed on EVERY COMPLETED displacement, not only on the
+          # one that ended with this invocation holding the lock. rc=2 means the
+          # victim's lock WAS removed and someone else won the freed path — the
+          # deposed verify is running unprotected either way, which is exactly
+          # the state the warning exists to announce. Gating the warning on rc=0
+          # would let a real displacement pass silently.
+          case "$steal_rc" in
+            0|2)
+              echo "scripts/test: WARNING: displacing a wedged shell verify holding $lock (deposed pid ${holder:-unknown}) after ${budget}s — two verifies may now contend on golangci-lint's global lock and the shared testcontainers Postgres." >&2
+              ;;
+          esac
+          case "$steal_rc" in
+            0)
+              return 0
+              ;;
+            2)
+              # The victim was displaced but another invocation won the free
+              # lock. Never displace twice: the next expiry refuses.
+              echo "scripts/test: the freed verify lock at $lock was taken by another invocation before this one could re-acquire it — this invocation will not displace again." >&2
+              stole=1
+              ;;
+          esac
+          restarts=$((restarts + 1))
+          if [ "$restarts" -gt 100 ]; then
+            echo "$VERIFY_LOCK_UNSETTLED_MSG" >&2
+            return 1
+          fi
+          continue
+        fi
+        if [ "$announced" -eq 0 ]; then
+          echo "scripts/test: waiting up to ${budget}s for the verify lock at $lock (holder pid ${holder:-unknown}, kind ${cls#live-})" >&2
+          announced=1
+        fi
+        sleep "$poll"
+        waited=$((waited + poll))
+        continue
+        ;;
+    esac
+  done
+}
+
+# _acquire_verify_lock: resolve the lock path and acquire. Returns 0 to proceed
+# (held, or degraded to no locking) and 1 to refuse.
+_acquire_verify_lock() {
+  local lock
+  if ! lock="$(_verify_lock_path)"; then
+    return 0  # degrade: reason already printed, run without the lock
+  fi
+  _acquire_verify_lock_at "$lock"
+}
+
+# _release_verify_lock: EXIT-trap release. Removes the prune marker only when it
+# still names us, and the lock only when it still names US — so a lock this
+# invocation refused on, or one that was displaced out from under it, is never
+# removed.
+_release_verify_lock() {
+  local self
+  self="$(_verify_lock_self_pid)"
+  if [ -n "${VERIFY_PRUNE_MARKER:-}" ] && [ "$(readlink "$VERIFY_PRUNE_MARKER" 2>/dev/null)" = "$self" ]; then
+    rm -f "$VERIFY_PRUNE_MARKER" 2>/dev/null || true
+  fi
+  VERIFY_PRUNE_MARKER=""
+  if [ -n "${VERIFY_LOCK_HELD:-}" ] && [ "$(readlink "$VERIFY_LOCK_HELD" 2>/dev/null)" = "${VERIFY_LOCK_TARGET:-}" ]; then
+    rm -f "$VERIFY_LOCK_HELD" 2>/dev/null || true
+  fi
+  VERIFY_LOCK_HELD=""
+  return 0
+}
+
 # verify: the runner's committed-tree implement gate. Lint FIRST so a fast
 # format/lint failure leads the captured output and aborts (set -e) before the
 # slow test loop. The doc line budget and schema-sync drift are checked NEXT
@@ -1022,12 +1705,29 @@ _verify_site_ia() {
 # second run happens. Every precondition degrades to a one-line reason plus the
 # plain `cmd_test` loop; none of them can red-line verify.
 cmd_verify() {
+  if ! _acquire_verify_lock; then
+    exit 1
+  fi
   cmd_lint
   _verify_doc_line_budget
   _verify_schema_sync
   _verify_gate_harnesses
   _verify_site_voice
   _verify_site_ia
+  # SCOPED form (#3315). Bucketing fails SAFE: any package this layer cannot
+  # place prints a reason and falls through to the full unscoped loop below.
+  local buckets=""
+  if [ -n "$VERIFY_PACKAGES" ] && buckets="$(_verify_scope_buckets "$VERIFY_PACKAGES")" && [ -n "$buckets" ]; then
+    # The patch-coverage gate is SKIPPED, not narrowed. Its denominator is the
+    # WHOLE branch diff, so a run that tested only a few packages cannot honestly
+    # gate it — and narrowing the denominator to the scoped packages would be a
+    # gate that reports a coverage verdict it did not earn. The #2124 pre-test
+    # snapshot/digest machinery is therefore left completely UN-ARMED here rather
+    # than armed and weakened; the full committed-tree gate still runs it.
+    echo "scripts/test: scoped verify (--packages $VERIFY_PACKAGES) — the patch-coverage gate runs in the full committed-tree gate" >&2
+    cmd_test_scoped "$buckets"
+    return 0
+  fi
   local base="" mods=""
   if [ -n "${FISHHAWK_SKIP_PATCH_COVERAGE:-}" ]; then
     echo "scripts/test: FISHHAWK_SKIP_PATCH_COVERAGE set — skipping the patch-coverage gate" >&2
@@ -1064,6 +1764,12 @@ usage: scripts/test [SUBCOMMAND] [ARGS]
   coverage             run tests + aggregate coverage gate
   lint                 run `golangci-lint run ./...` in every module
   verify               lint + schema-sync + tests + patch-scoped coverage — the runner's verify gate
+  verify --packages P  the SCOPED verify form: P is a comma-separated list of
+                       repo-relative package DIRECTORIES (e.g.
+                       backend/internal/run,cli/internal/spec). Every non-test
+                       leg is unchanged; the `go test -race` loop is restricted
+                       to those packages and the patch-coverage gate is skipped.
+                       Falls back to $FISHHAWK_VERIFY_PACKAGES when absent.
   single ARGS          pass-through to `go test -race ARGS`
   -h | --help | help   show this message
 EOF
@@ -1077,7 +1783,7 @@ if [ -z "${FISHHAWK_TEST_LIB_ONLY:-}" ]; then
     test|"")          cmd_test ;;
     coverage|cover)   cmd_coverage ;;
     lint)             cmd_lint ;;
-    verify)           cmd_verify ;;
+    verify)           shift; _parse_verify_args "$@"; cmd_verify ;;
     single)           shift; cmd_single "$@" ;;
     -h|--help|help)   usage ;;
     *)

@@ -377,14 +377,30 @@ var verifyEnvAllowPrefix = []string{"CGO_", "LC_"}
 
 // verifyEnvDeny is the explicit known-secret denylist layered on top of the
 // default-deny allow-list. These keys are dropped unconditionally.
+//
+// The last two entries are not secrets: they are the #3315 scoped-verify
+// control variables. FISHHAWK_VERIFY_PACKAGES narrows `scripts/test verify`'s
+// test loop and FISHHAWK_VERIFY_LOCK_OWNER claims runner-kind ownership of the
+// verify lock, so neither may be inherited from an ambient environment into a
+// gate child. The PRIMARY protection is the default-deny allow-list (neither
+// name is on verifyEnvAllowExact, verifyEnvAllowGo, nor verifyEnvAllowPrefix,
+// which is CGO_/LC_ only); these entries are redundant defence against a future
+// allow-rule re-widening, the #2504 shape.
+//
+// Kept IDENTICAL to runner/cmd/fishhawk-runner/gateenv.go's gateEnvDeny by the
+// runner's TestGateEnvListsMatchCLICopy — editing one copy fails that suite.
+// The runner copy spells these two via its verifyPackagesEnvVar /
+// verifyLockOwnerEnvVar consts; the VALUES must match these literals.
 var verifyEnvDeny = map[string]struct{}{
-	"FISHHAWK_GITHUB_TOKEN": {},
-	"FISHHAWK_GITLAB_TOKEN": {},
-	"GITHUB_TOKEN":          {},
-	"GH_TOKEN":              {},
-	"ANTHROPIC_API_KEY":     {},
-	"OPENAI_API_KEY":        {},
-	"FISHHAWK_API_TOKEN":    {},
+	"FISHHAWK_GITHUB_TOKEN":      {},
+	"FISHHAWK_GITLAB_TOKEN":      {},
+	"GITHUB_TOKEN":               {},
+	"GH_TOKEN":                   {},
+	"ANTHROPIC_API_KEY":          {},
+	"OPENAI_API_KEY":             {},
+	"FISHHAWK_API_TOKEN":         {},
+	"FISHHAWK_VERIFY_PACKAGES":   {},
+	"FISHHAWK_VERIFY_LOCK_OWNER": {},
 }
 
 // verifyEnvDenyPrefix lists key prefixes dropped unconditionally — the
