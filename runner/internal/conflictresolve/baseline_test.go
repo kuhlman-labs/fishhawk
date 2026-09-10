@@ -530,3 +530,128 @@ func TestConfigStreamFraming(t *testing.T) {
 		}
 	}
 }
+
+// --- the conflicted set's effective attributes as a gate input (#3339) ---
+
+// attrStream renders triplets into git's REAL `git check-attr -z --all`
+// framing: `<path>\0<attr>\0<value>\0` per record. Every fixture below is built
+// through it so no test silently encodes the WRONG framing and then agrees with
+// a wrong parser.
+func attrStream(triplets ...string) string {
+	var b strings.Builder
+	for i := 0; i+3 <= len(triplets); i += 3 {
+		b.WriteString(triplets[i])
+		b.WriteByte(0)
+		b.WriteString(triplets[i+1])
+		b.WriteByte(0)
+		b.WriteString(triplets[i+2])
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
+// TestVerifyAttributesChanged pins the gate input: attributes that moved during
+// the pass are a violation with their OWN named reason, an identical stream is
+// not, and the detail names the differing attribute by NAME while never leaking
+// its value. The pair is otherwise the ACCEPTED pair, so the discrimination is
+// on the attributes alone.
+func TestVerifyAttributesChanged(t *testing.T) {
+	base, obs := acceptedPair()
+	base.Attributes = attrStream("conf.go", "text", "set")
+	obs.Attributes = base.Attributes
+	if vs := Verify(base, obs); len(vs) != 0 {
+		t.Fatalf("an unchanged attribute stream must not violate: %+v", vs)
+	}
+
+	obs.Attributes = attrStream("conf.go", "text", "set", "conf.go", "filter", "mangle")
+	vs := Verify(base, obs)
+	if len(vs) != 1 {
+		t.Fatalf("Verify = %+v, want exactly one violation", vs)
+	}
+	if vs[0].Reason != ReasonAttributesChanged {
+		t.Errorf("reason = %q, want %q", vs[0].Reason, ReasonAttributesChanged)
+	}
+	if vs[0].Path != "" {
+		t.Errorf("Path = %q, want empty (a repository-level rule)", vs[0].Path)
+	}
+	if !strings.Contains(vs[0].Detail, "conf.go: filter") {
+		t.Errorf("detail does not name the differing attribute: %q", vs[0].Detail)
+	}
+	if strings.Contains(vs[0].Detail, "mangle") {
+		t.Errorf("detail leaked the attribute VALUE: %q", vs[0].Detail)
+	}
+}
+
+// TestAttributeChangeDetailNamesOnly is the disclosure control for the attribute
+// detail: a git attribute VALUE is agent-writable arbitrary text, so a secret
+// planted in a value must never reach the operator-visible detail. Only the
+// attribute NAME (git-restricted to `-`, `_`, `.` and alphanumerics) is emitted.
+func TestAttributeChangeDetailNamesOnly(t *testing.T) {
+	const valueSecret = "hunter2-SECRET-VALUE"
+	base := attrStream("conf.go", "text", "set")
+	obs := attrStream("conf.go", "text", "set", "conf.go", "marker", valueSecret)
+	detail := attributeChangeDetail(base, obs)
+	for _, leak := range []string{valueSecret, "hunter2"} {
+		if strings.Contains(detail, leak) {
+			t.Errorf("detail leaked a VALUE %q: %q", leak, detail)
+		}
+	}
+	if !strings.Contains(detail, "conf.go: marker") {
+		t.Errorf("detail must name the attribute NAME: %q", detail)
+	}
+}
+
+// TestAttributeNamesFor pins the names-only rendering the staged-content refusal
+// detail reuses: sorted NAMES for a path, the "none" fallback, and never a value.
+func TestAttributeNamesFor(t *testing.T) {
+	stream := attrStream(
+		"conf.go", "text", "set",
+		"conf.go", "eol", "crlf",
+		"conf.go", "marker", "hunter2-SECRET-VALUE",
+		"other.go", "diff", "golang",
+	)
+	if got := AttributeNamesFor(stream, "conf.go"); got != "eol, marker, text" {
+		t.Errorf("AttributeNamesFor(conf.go) = %q, want the sorted names", got)
+	}
+	if strings.Contains(AttributeNamesFor(stream, "conf.go"), "hunter2") {
+		t.Error("a value reached the names output")
+	}
+	if got := AttributeNamesFor(stream, "nope.go"); got != "none" {
+		t.Errorf("AttributeNamesFor(absent path) = %q, want none", got)
+	}
+	if got := AttributeNamesFor("", "conf.go"); got != "none" {
+		t.Errorf("AttributeNamesFor(empty stream) = %q, want none", got)
+	}
+}
+
+// TestParseAttrStream pins that EVERY field boundary is taken from the NUL
+// framing, never whitespace or a newline — the #3338 root cause. A value
+// carrying spaces, a newline and an `=` must parse intact, a trailing partial
+// triplet must be dropped rather than panic, and the empty stream is nil.
+func TestParseAttrStream(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []attrRecord
+	}{
+		{"empty", "", nil},
+		{"well_formed", attrStream("p", "a", "v"), []attrRecord{{"p", "a", "v"}}},
+		{
+			"value_with_spaces_newline_equals",
+			attrStream("p", "filter", "sed s/a b/c=d/\nx"),
+			[]attrRecord{{"p", "filter", "sed s/a b/c=d/\nx"}},
+		},
+		{
+			"trailing_partial_dropped",
+			attrStream("p", "a", "v") + "q\x00b\x00",
+			[]attrRecord{{"p", "a", "v"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseAttrStream(tc.in); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("parseAttrStream = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}

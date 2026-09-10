@@ -50,7 +50,7 @@ They partition into `before\n` and `<<<<<< HEAD\n`, so the candidate `before\n<<
 
 ### `baseline.go` — the captured values and the verdict
 
-`Baseline` is the snapshot captured in ONE read immediately after the merge stopped: `HeadSHA`, `MergeHeadSHA`, `MergeMessage`, the non-conflicted stage-0 `Index` (mode + OID per path), `Conflicted` (per path: `Kind`, `MarkerBytes`, `Sides`, and `Mode`), and `Config` — the raw `git config --list -z` stream. **Clean base changes git already auto-staged in other files are part of the baseline and are AUTHORIZED.**
+`Baseline` is the snapshot captured in ONE read immediately after the merge stopped: `HeadSHA`, `MergeHeadSHA`, `MergeMessage`, the non-conflicted stage-0 `Index` (mode + OID per path), `Conflicted` (per path: `Kind`, `MarkerBytes`, `Sides`, and `Mode`), `Config` — the raw `git config --list -z` stream — and `Attributes` — the raw `git check-attr -z --all -- <conflicted paths>` stream. **Clean base changes git already auto-staged in other files are part of the baseline and are AUTHORIZED.**
 
 `Observed` is the same shape read back after the agent, plus `Unmerged` / `Unstaged` / `Untracked` and a `Working` `FileState` (present, mode, bytes) per conflicted path.
 
@@ -73,6 +73,7 @@ They partition into `before\n` and `<<<<<< HEAD\n`, so the candidate `before\n<<
 | `conflict_resolution_binary_conflict` | refused: git leaves OURS on disk with no markers, so there is no hunk boundary |
 | `conflict_resolution_delete_modify_content` | a delete/modify resolution that is neither side's full content nor the deletion |
 | `conflict_resolution_repo_config_changed` | the EFFECTIVE git configuration moved while the pass was running |
+| `conflict_resolution_attributes_changed` | the EFFECTIVE gitattributes for the conflicted set moved while the pass was running |
 | `conflict_resolution_edit_outside_hunk` | the resolution does not preserve every non-conflict segment |
 | `conflict_resolution_residual_marker` | a marker line survives at a position a replacement reaches |
 | `conflict_resolution_malformed_markers` | the file cannot be partitioned, so nothing can be authorized |
@@ -89,6 +90,16 @@ The violation **detail is redacted POSITIVELY**: each differing key is rendered 
 Which keys are reported is computed SEMANTICALLY — each key's ordered value list, plus the ordered key sequence restricted to keys present on both sides — not from a raw record index. Inserting one key shifts the index of every record after it, and an index-keyed signature would name all of them and bury the real edit.
 
 **Residual, stated:** this control sees a config the agent CHANGES, never one that was ALREADY poisoned when the pass began. That gap is closed on the push side by `gitops.PushCommittedBranch`'s destination guard — see `runner/README.md`.
+
+### The conflicted set's effective attributes are ONE gate input (#3339)
+
+`Attributes` carries the raw `git check-attr -z --all -- <conflicted paths>` stream, and ANY change during the pass is `conflict_resolution_attributes_changed`. It closes the sibling of the config vector: `git add` applies whatever eol/text/ident normalization AND `filter.<driver>.clean` the path's attributes name, and an attribute can be bound by a working-tree `.gitattributes`, by `.git/info/attributes`, or by `$HOME/.config/git/attributes` — none of which the working-tree observation or the config stream sees. Capturing the effective attributes for the conflicted set and refusing any in-pass change closes every one of those binding points, including a driver bound by a path the enumeration never named.
+
+The parse takes EVERY field boundary from the `-z` NUL framing (`<path>\0<attr>\0<value>\0`), never whitespace or a newline: an attribute VALUE is arbitrary text, and a value carrying a space or newline would split into a bogus field under any non-NUL parse — the #3338 root cause. `parseAttrStream` is the ONE parser for this stream; the runner hands the stream over unparsed rather than growing a second.
+
+The violation **detail names attribute NAMES only, never a value**: git restricts an attribute name to alphanumerics, `-`, `_` and `.` (gitattributes(5)), so a name cannot carry a URL or a credential, but a value is agent-writable arbitrary text. `AttributeNamesFor(attrs, path)` renders the names-only string the runner's staged-content refusal detail reuses (`none` when a path carries no attribute).
+
+**Residual, stated (same shape as the config one):** this control sees attributes the agent CHANGES, never a driver ALREADY in place when the pass began. A prior-stage agent with that access could already mangle its own implement commit through the same filter, so the pass gains no new exposure; the pre-existing case is what the runner's step-7a staged-blob comparison against the expected POST-CLEAN form covers — see `runner/README.md`.
 
 Two rules are worth naming explicitly:
 

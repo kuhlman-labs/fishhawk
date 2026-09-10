@@ -240,19 +240,33 @@ The pass's git sequence is ordered and every step is load-bearing:
    base advanced past the conflict, and the operator authorized a resolution,
    not an unreviewed clean merge.
 4. Capture the baseline in ONE read — HEAD, `MERGE_HEAD`, `MERGE_MSG`, the raw
-   `git config --list -z` stream, every NON-conflicted stage-0 index entry, and
-   each conflicted path's kind, working bytes, sides and **mode**. Clean base
-   changes git auto-staged elsewhere are part of the baseline and are
-   AUTHORIZED. The config is re-read in step 6 and ANY change refuses
-   `conflict_resolution_repo_config_changed`; both reads FAIL CLOSED rather than
-   defaulting to the empty string.
+   `git config --list -z` stream, the raw
+   `git check-attr -z --all -- <conflicted paths>` stream, every NON-conflicted
+   stage-0 index entry, and each conflicted path's kind, working bytes, sides
+   and **mode**. Clean base changes git auto-staged elsewhere are part of the
+   baseline and are AUTHORIZED. Both the config AND the conflicted set's
+   effective attributes are re-read in step 6 and ANY change refuses
+   `conflict_resolution_repo_config_changed` / `conflict_resolution_attributes_changed`
+   respectively; every one of these reads FAILS CLOSED rather than defaulting to
+   the empty string.
 5. Invoke the agent under a working-tree-edits-only contract.
 6. Read the state back and hand it to `runner/internal/conflictresolve`, which
    is the SOLE owner of the accept/refuse decision, one named reason per rule.
 7. Only on zero violations: `git add --` EXACTLY the conflicted paths (never
-   `git add -A`), then VERIFY the staged bytes are the bytes the gate observed,
-   snapshot the authorized tree with `git write-tree`, and make ONE
-   `git commit --no-edit --no-verify`.
+   `git add -A`), then VERIFY the staged artifact. Two parts: (i) re-read the
+   config AND the conflicted set's attributes and refuse any drift from the
+   baseline the gate decided on — a change between the gate and the add moves the
+   transformation `git add` applies, so a post-clean comparison could otherwise
+   AGREE with a maliciously-transformed blob; (ii) compare each conflicted path's
+   staged stage-0 OID against the OID `git add` WOULD produce from the
+   gate-observed bytes — computed with `git hash-object --path=<p> --stdin` fed
+   the GATE-OBSERVED bytes (never the mutable working tree), so an HONEST
+   eol/text/ident/filter transformation the repository's committed attributes
+   legitimately apply is accepted while content the gate never approved is
+   refused. The `conflict_resolution_staged_content_changed` refusal detail names
+   the path, BOTH blob OIDs and the path's effective attribute NAMES (values
+   never rendered — they are agent-writable). Then snapshot the authorized tree
+   with `git write-tree`, and make ONE `git commit --no-edit --no-verify`.
 8. Verify the commit that is about to be PUBLISHED against what was authorized:
    its tree equals the `write-tree` snapshot, its parents are (pre-merge tip,
    `MERGE_HEAD`), and its message is the merge message the gate compared —
@@ -281,10 +295,18 @@ or a `core.fsmonitor` command that falsifies the very `git status` /
   beats every config file, and applying it inside `gitOutRaw` means a git
   command added later cannot silently miss it.
 - **Artifact verification**, because neutralization is a DENY-LIST and the
-  residual is real: a content filter (`filter.<driver>.clean`) is named by
-  config and cannot be wildcarded away, so `git add` can still transform bytes
-  between the working tree and the index. The pass therefore checks the result
-  rather than trusting the inputs — steps 7 and 8 above.
+  residual is real: the eol/text/ident normalization and a content filter
+  (`filter.<driver>.clean`) are named by the path's config/attributes and cannot
+  be wildcarded away, so `git add` can still transform bytes between the working
+  tree and the index. The pass therefore checks the result rather than trusting
+  the inputs — steps 7 and 8 above. It does NOT refuse the transform itself: an
+  HONEST eol/text/ident/filter transformation the repository's COMMITTED
+  attributes legitimately apply (e.g. `text eol=crlf`, where checkout writes CRLF
+  and `git add` cleans to LF) is accepted, because step 7 compares the staged
+  blob against the EXPECTED POST-CLEAN form of the gate-observed bytes
+  (`git hash-object --path`), not their raw bytes (#3339). What it refuses is a
+  staged blob that is not that expected form, or an attribute/config binding that
+  MOVED between the gate and the add.
 
 `HardeningArgs` also pins `core.commentChar=#`. That key executes nothing, so it
 sits outside the deny-list's original "keys that run a command" charter; it is
@@ -343,10 +365,17 @@ Two layers answer that, and they cover DIFFERENT halves.
 
 **Residuals of the destination guard, stated:**
 
-- **A config already poisoned BEFORE the pass began is invisible to the
-  capture-and-compare layer.** Only the push guard sees it, and the push guard
-  covers the DESTINATION — not, say, a pre-existing `filter.<driver>.clean`,
-  which step 7's staged-bytes check covers instead.
+- **A config or attribute driver already in place BEFORE the pass began is
+  inherited baseline state, invisible to the capture-and-compare layer.** The
+  push guard sees a poisoned DESTINATION, but a pre-existing `filter.<driver>.clean`
+  or a committed `.gitattributes` binding is NOT refused: step 7 compares the
+  staged blob against the expected POST-CLEAN form of the gate-observed bytes
+  (`git hash-object --path`), so a transform BOTH `git add` and that comparison
+  apply agrees and is accepted (#3339). This is deliberate — the pass gains no
+  new exposure, because a prior-stage agent with that access could already mangle
+  its OWN implement commit through the same driver. What steps 6/7 add is
+  refusing an attribute or config binding the pass's OWN agent introduces or
+  MOVES between the gate and the add.
 - **Check (b) is a key-PRESENCE refusal, so a BENIGN global `pushInsteadOf`
   trips it.** The exact mode: the common fetch-over-HTTPS / push-over-SSH setup
   is `url."git@github.com:".pushInsteadOf = https://github.com/` in
