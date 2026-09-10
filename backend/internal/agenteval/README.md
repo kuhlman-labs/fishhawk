@@ -6,9 +6,15 @@ Agent-evaluation harness. Two families live here:
   Tier-B LLM-as-judge (`judge.go`) and its calibration harness
   (`calibration.go`), plus the plan-review-miss corpus feed
   (`planreviewmiss.go`). Design: [`docs/architecture/agent-eval.md`](../../../docs/architecture/agent-eval.md).
-- **Prompt-envelope evaluation (E60.2 / #2291)** — the two corpora this
-  document covers, which measure whether #2290's asymmetric issue-body
-  treatment is right.
+- **Prompt-envelope evaluation (E60.2 / #2291)** — the injection and
+  envelope-quality corpora, which measure whether #2290's asymmetric
+  issue-body treatment is right.
+- **Severity calibration + adversarial-finding retention (E50.22 / #3309)**
+  — the severity-calibration and adversarial-retention corpora and the
+  pre-/post-#2119 two-arm comparison, which measure whether #2119's severity
+  rubric moved reviewer severities toward the operator's label and whether it
+  COST any adversarial finding. See
+  [Severity calibration](#severity-calibration-and-adversarial-retention-e5022--3309).
 
 ---
 
@@ -223,6 +229,178 @@ not behaviour-preserving.
 
 ---
 
+## Severity calibration and adversarial retention (E50.22 / #3309)
+
+#2119 added a severity rubric plus two standing calibration criteria to the
+implement-review prompt, on the bet that they would move reviewer severities
+closer to the severity an operator actually assigned when dispositioning the
+concern — without costing the adversarial findings the prompt was already
+producing. Two corpora test the two halves of that bet:
+
+| Corpus | Source | Question |
+|---|---|---|
+| `testdata/severity-calibration-corpus/` (`severitycalibration.go`) | operator-labelled concerns + their dispositions | is the post-#2119 reviewer severity CLOSER to the operator's label? (done-means 2) |
+| `testdata/adversarial-retention-corpus/` (`adversarialretention.go`) | four hand-authored diffs, one per finding class #2119 names | did #2119 LOSE a finding the pre-#2119 prompt produced? (done-means 2b, feeding the 3 revert-or-fix decision) |
+
+Both are driven as a two-arm A/B in exactly the shape the #2291
+envelope-quality A/B uses: `ArmPreCalibration` versus `ArmPostCalibration`,
+ONE generator config for both arms, and the arms differing ONLY in the
+treatment.
+
+### WHAT THIS PROVES TODAY
+
+The offline gates run in every `scripts/test verify` and make no model call.
+They prove **ARM CORRECTNESS**: that the five treatment literals are
+byte-exact against the real shipped prompt, that the strip is posture-aware
+in both directions, that the comparison cannot be gamed by an omission, and
+that the retention verdict's third state is not a pass.
+
+They prove **NOTHING about whether #2119 calibrated anything.** This change
+ships the APPARATUS, not the measurement. #3309 done-means 2 and 3 stay
+UNANSWERED until an operator runs the live arms against a real model — the
+runner denies `ANTHROPIC_API_KEY` to gate subprocesses by design
+(`runner/cmd/fishhawk-runner/gateenv.go` `gateEnvDeny`), so these arms are
+operator-executed and cannot be made to run in-loop. The walk is
+[`docs/compliance/severity-calibration-evidence.md`](../../../docs/compliance/severity-calibration-evidence.md).
+Read the green honestly; it is the same honest-residual posture the #2291
+corpora ship with.
+
+### The #2119 TREATMENT SET IS EXACTLY THESE FIVE LITERALS
+
+`StripCalibrationCriteria` produces the pre-#2119 arm by removing exactly
+five byte-exact literals from a genuinely built implement-review prompt.
+They are named in `treatmentLiterals` (`severitycalibration.go`) and
+`TestTreatmentLiteralCount_IsFiveAndEnumerated` pins the count, the order and
+the names:
+
+| Literal name | Renders in | Notes |
+|---|---|---|
+| `standing-criterion-9-lead` | `prompt.go` `writeGroundedCalibrationCriteria` | criterion 9's lead sentence |
+| `standing-criterion-10-lead` | `prompt.go` `writeGroundedCalibrationCriteria` | criterion 10's lead sentence |
+| `adversarial-carve-out` | `prompt.go` `writeGroundedCalibrationCriteria` | the `These two standing rules apply to PATTERN-based …` sentence |
+| `severity-calibration-rubric` | `prompt.go` `writeSeverityCalibration` | the `### Severity calibration` heading, rubric body and tier bullets |
+| `re-read-before-reopen-bullet` | `prompt.go`, inside the `if len(t.PriorConcerns) > 0` guard of the "Prior concerns (delta verification)" section | **GUARD-CONDITIONAL** |
+
+**ADDING A SIXTH #2119 SURFACE TO THE IMPLEMENT-REVIEW PROMPT WITHOUT ADDING
+IT HERE SILENTLY WEAKENS THE PRE ARM.** The pre arm would then carry part of
+the treatment while being labelled "pre-#2119", and the comparison would
+under-report the effect with nothing going red. Neither the count test nor
+the byte-exact drift detectors can see a NEW prompt surface nobody
+registers; that residual is stated rather than papered over.
+
+The fifth literal is why the strip is POSTURE-AWARE. It renders only when
+the trigger carries prior concerns, so leaving it in the pre arm would be
+INVISIBLE on a fixture set that never populates the guard and would corrupt
+the comparison the moment one did. `StripCalibrationCriteria` therefore takes
+an explicit `expectPriorConcerns` and fails closed in BOTH directions —
+bullet absent when expected present, bullet present when expected absent.
+
+### The comparison is OMISSION-MONOTONE, by an explicit MISS PENALTY
+
+An arm's score for a case is the mean tier distance from the operator label
+over the **FULL LABELLED POPULATION**. A concern the arm emitted contributes
+its measured distance; a concern the arm **MISSED contributes
+`MaxSeverityTierDistance`**, the largest distance the scale admits. The
+denominator is the labelled count — identical in both arms and independent
+of what either arm emitted.
+
+The property this buys: **omitting a labelled concern can never improve an
+arm's score, or its delta against the other arm.** The penalty is at least
+as large as any distance an emitted answer could score, so replacing a
+measured distance with a miss never lowers the sum, and it cannot change the
+other arm's score at all.
+
+**Why NOT a per-arm matched-set mean.** Scoring each arm over only the
+concerns IT matched lets a post arm lower its own mean purely by omitting a
+badly-calibrated concern, reporting an improvement with no severity having
+moved. That is the defect the whole scoring section exists to prevent.
+
+**Why NOT pairwise-complete** (exclude a labelled concern from BOTH arms
+whenever EITHER arm missed it), which reads conservative but is **not**
+omission-monotone. Two labelled concerns A and B with pre/post distances
+1/2 and 2/1 score 1.5 against 1.5 — delta zero. Let the post arm omit A:
+pairwise-complete drops A from both arms and leaves B, giving pre 2 against
+post 1 and a reported **+1 improvement produced entirely by an omission**.
+Dropping a concern on which the post arm did WORSE flatters the remainder,
+and reporting the omission makes it visible without making the number right.
+Under the miss penalty the same case scores 1.5 against (2 + 1)/2 = 1.5 —
+delta zero, no improvement.
+`TestCompareSeverityArms_OmissionCannotManufactureImprovement` is that exact
+case, and it goes red if the penalty is removed.
+
+**The penalty VALUE is a judgement call and is stated as one.**
+`MaxSeverityTierDistance` is the SMALLEST value that guarantees monotonicity
+— any smaller value could be beaten by an emitted answer, and omitting that
+answer would then improve the score. Its cost: a heavily-omitting arm's
+score is dominated by penalties rather than by measured severities, so a
+delta computed mostly from penalties measures COVERAGE, not calibration.
+That is why `RunSeverityArm` returns per-arm **labelled / matched / missed**
+coverage and `CompareSeverityArms` reports `PreMissed` / `PostMissed` per
+case: the reader must be able to see when that has happened.
+
+A case whose labelled population is EMPTY contributes **no score** and is
+reported as `no_labelled_concerns` — never as a zero distance, which would
+read as perfect agreement and fail OPEN. A case name present in one arm and
+absent from the other FAILS CLOSED, in either direction.
+
+### Retention: three states, and indeterminate is NOT a pass
+
+`RetentionVerdict` returns `FindingProduced`, `FindingAbsent` or
+`FindingIndeterminate`, and `RetentionReport` counts all three SEPARATELY —
+its rendered header says `indeterminate is NOT a pass` in words. Only
+substantive judged evidence reaches `FindingAbsent`: a missing decider
+dimension or an undecodable verdict resolves to indeterminate.
+`CompareRetentionArms` marks a case REGRESSED when the finding is produced
+in the PRE arm and absent in the POST arm — done-means 3's loss condition —
+and fails closed on a case-name mismatch in either direction.
+
+### The corpus feed, and its FREE-TEXT posture
+
+`fishhawk-distill-corpus --severity-calibration` scaffolds candidate
+severity-calibration cases from a run's audit feed; the contract, the join
+and its fail-loud modes are in
+[`backend/internal/corpusdistill/README.md`](../corpusdistill/README.md).
+
+Two properties matter here. First, `operator_severity` is left **EMPTY** by
+the tool and loader mode (g) REFUSES an unlabelled candidate, so an unedited
+scaffold cannot silently join the corpus — that is what makes "labelled"
+mean something. Second, **this surface makes NO redacted-by-construction
+claim.** Concern notes and disposition reasons are FREE-TEXT reviewer and
+operator prose: they can carry tokens, hostnames, internal paths or customer
+detail regardless of the structured field they travel in, and no reusable
+free-text redactor exists in this repository to route them through
+(`backend/internal/diagnostics` takes a structured-fields-only posture —
+`ClassifyFailureDetail` maps a failure reason to a CLASS rather than
+scrubbing prose). The generated `case.md` therefore carries a point-of-use
+`TODO(operator): REVIEW FREE TEXT BEFORE COMMITTING` block instead of a
+redaction claim, and a test asserts the string `redacted-by-construction`
+appears nowhere in the written output.
+
+The `disposition` enum is `waived | deferred | addressed |
+addressed_by_condition | superseded` — every member is a real
+`backend/internal/concern` state. `addressed` and `superseded` have **no
+dedicated audit category**, so the distiller cannot scaffold them: a case
+labelled with either is operator-curated by hand. So is a
+`concern_addressed_by_condition` disposition, whose audit payload carries
+neither `severity` nor `category` and therefore has no key to join on; the
+tool lists such entries by `concern_id` in `case.md` rather than guessing
+them into a labelled corpus.
+
+### The committed seed fixtures are SYNTHETIC
+
+Epic #1824's operator dispositions are rows in the operator audit database,
+not files in this repository — that is the fact on which #2119 deferred this
+work, and it is unchanged. The committed seed fixtures are hand-authored and
+carry `synthetic: true` so no reader can mistake them for distilled
+production cases; a case the distiller writes carries `synthetic: false`.
+The four adversarial-retention fixtures are hand-authored reconstructions of
+the finding CLASSES #2119 names, not verbatim replays of the original #1824
+diffs, so each carries an `expectation_note` stating in reviewable terms why
+its diff exhibits the class — and the loader refuses a fixture with an empty
+`expectation_note` or empty `finding_probes`.
+
+---
+
 ## Running it
 
 ```sh
@@ -237,7 +415,15 @@ FISHHAWK_AGENTEVAL_INJECTION_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
 # Live envelope-quality arms (opt-in; makes real model calls):
 FISHHAWK_AGENTEVAL_QUALITY_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   scripts/test single -run TestEnvelopeQualityLive ./backend/internal/agenteval/
+
+# Offline severity-calibration + retention gates (no model call):
+scripts/test single -run 'TestStripCalibrationCriteria|TestLoadSeverityCalibration|TestCalibrationArms|TestSeverityTier|TestCompareSeverityArms|TestRunSeverityArm|TestTreatmentLiteral|TestRetention|TestLoadAdversarialRetention|TestCompareRetentionArms' ./backend/internal/agenteval/
+
+# Live severity-calibration + retention arms (opt-in; makes real model calls):
+FISHHAWK_AGENTEVAL_CALIBRATION_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  scripts/test single -run 'TestSeverityCalibrationLive|TestAdversarialRetentionLive' ./backend/internal/agenteval/
 ```
 
-Both live tests SKIP with a message naming #3187 and the criteria they leave
-undecided.
+The #2291 live tests SKIP with a message naming #3187 and the criteria they
+leave undecided; the #3309 live arms SKIP naming #3309 and
+`docs/compliance/severity-calibration-evidence.md`.

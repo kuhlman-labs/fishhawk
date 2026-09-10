@@ -347,3 +347,227 @@ func TestRun_PlanReviewMiss_BadItemsJSON(t *testing.T) {
 		t.Errorf("error not actionable: %s", stderr.String())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// --severity-calibration mode (E50.22 / #3309).
+// ---------------------------------------------------------------------------
+
+// minimalCalItems is one implement_reviewed verdict plus one waived
+// disposition that joins to it by (severity, category).
+const minimalCalItems = `[
+  {"sequence":10,"run_id":"run-1","category":"implement_reviewed",
+   "payload":{"reviewer_model":"claude-fable-5","verdict":"reject",
+     "concerns":[{"severity":"high","category":"correctness","note":"unbounded read"}]}},
+  {"sequence":20,"run_id":"run-1","category":"concern_waived",
+   "payload":{"concern_id":"c-1","prior_state":"open","reason":"sibling code does this",
+     "stage_kind":"implement","severity":"high","category":"correctness"}}
+]`
+
+// TestRun_SeverityCalibration_FlagValidation covers every mode-exclusivity
+// and flag-applicability refusal the mode adds. Each asserts exit 2 (a
+// usage error) and the message naming the offending flag.
+func TestRun_SeverityCalibration_FlagValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"both modes", []string{"--severity-calibration", "--plan-review-miss", "--case-name", "c", "--issue", "#1"}, "mutually exclusive"},
+		{"stage-id", []string{"--severity-calibration", "--stage-id", "s", "--case-name", "c", "--issue", "#1"}, "--stage-id"},
+		{"diff outside mode", []string{"--diff", "d.patch", "--case-name", "c", "--issue", "#1"}, "--diff and --plan-summary"},
+		{"plan-summary outside mode", []string{"--plan-summary", "p.md", "--case-name", "c", "--issue", "#1"}, "--diff and --plan-summary"},
+		{"run-id outside both modes", []string{"--run-id", "r", "--case-name", "c", "--issue", "#1"}, "--run-id only applies"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run(tc.args, &stdout, &stderr); code != 2 {
+				t.Fatalf("exit = %d, want 2; stderr=%s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Errorf("stderr missing %q:\n%s", tc.want, stderr.String())
+			}
+		})
+	}
+}
+
+// TestRun_SeverityCalibration_RunIDIsAcceptedInThisMode is the paired
+// direction of the "run-id outside both modes" case above: --run-id must
+// NOT be refused when --severity-calibration IS set.
+func TestRun_SeverityCalibration_RunIDIsAcceptedInThisMode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("category") == "implement_reviewed" {
+			_, _ = w.Write([]byte(`{"items":[{"sequence":10,"run_id":"run-1","category":"implement_reviewed","payload":{"reviewer_model":"m","concerns":[{"severity":"high","category":"correctness","note":"n"}]}}],"next_cursor":""}`))
+			return
+		}
+		if r.URL.Query().Get("category") == "concern_waived" {
+			_, _ = w.Write([]byte(`{"items":[{"sequence":20,"run_id":"run-1","category":"concern_waived","payload":{"concern_id":"c-1","severity":"high","category":"correctness","reason":"r"}}],"next_cursor":""}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	out := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--severity-calibration", "--run-id", "run-1", "--backend-url", srv.URL,
+		"--case-name", "c", "--issue", "#3309", "--out-dir", out}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", code, stderr.String())
+	}
+	md, err := os.ReadFile(filepath.Join(out, "c", "case.md"))
+	if err != nil {
+		t.Fatalf("read case.md: %v", err)
+	}
+	if !strings.Contains(string(md), "Provenance: PRODUCTION") {
+		t.Errorf("--run-id must set Fetched=true:\n%s", md)
+	}
+	// The mode's honest posture: no redaction claim, and the point-of-use
+	// free-text warning is present.
+	if strings.Contains(strings.ToLower(string(md)), "redacted-by-construction") {
+		t.Errorf("severity-calibration case.md must NOT claim redacted-by-construction:\n%s", md)
+	}
+	if !strings.Contains(string(md), "TODO(operator): REVIEW FREE TEXT BEFORE COMMITTING") {
+		t.Errorf("case.md missing the point-of-use free-text warning:\n%s", md)
+	}
+}
+
+// TestRun_SeverityCalibration_StdinSourceWithDiff covers the --in/stdin
+// path plus --diff/--plan-summary file reading.
+func TestRun_SeverityCalibration_StdinSourceWithDiff(t *testing.T) {
+	withStdin(t, minimalCalItems)
+	dir := t.TempDir()
+	diffPath := filepath.Join(dir, "d.patch")
+	if err := os.WriteFile(diffPath, []byte("--- a/x\n+++ b/x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	summaryPath := filepath.Join(dir, "plan.md")
+	if err := os.WriteFile(summaryPath, []byte("tighten the mirror gate"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"--severity-calibration", "--case-name", "c", "--issue", "#3309",
+		"--out-dir", out, "--diff", diffPath, "--plan-summary", summaryPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", code, stderr.String())
+	}
+	raw, err := os.ReadFile(filepath.Join(out, "c", "case.json"))
+	if err != nil {
+		t.Fatalf("read case.json: %v", err)
+	}
+	body := string(raw)
+	for _, want := range []string{`"diff"`, "+++ b/x", "tighten the mirror gate", `"operator_severity": ""`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("case.json missing %q:\n%s", want, body)
+		}
+	}
+	if strings.TrimSpace(stdout.String()) != filepath.Join(out, "c") {
+		t.Errorf("stdout = %q", stdout.String())
+	}
+}
+
+// TestRun_SeverityCalibration_UnreadableDiffExitsNonZero: a named-but-bad
+// --diff path is an ERROR, never a silent diff-less case the operator only
+// discovers when the agenteval loader refuses it.
+func TestRun_SeverityCalibration_UnreadableDiffExitsNonZero(t *testing.T) {
+	withStdin(t, minimalCalItems)
+	out := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"--severity-calibration", "--case-name", "c", "--issue", "#3309",
+		"--out-dir", out, "--diff", filepath.Join(t.TempDir(), "nope.patch")}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--diff") {
+		t.Errorf("stderr should name the flag:\n%s", stderr.String())
+	}
+	if entries, err := os.ReadDir(out); err != nil || len(entries) != 0 {
+		t.Errorf("nothing should have been written: %v %v", entries, err)
+	}
+}
+
+// TestRun_SeverityCalibration_DryRun: exits 0, writes nothing, prints the
+// would-be case.
+func TestRun_SeverityCalibration_DryRun(t *testing.T) {
+	withStdin(t, minimalCalItems)
+	out := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"--severity-calibration", "--case-name", "c", "--issue", "#3309",
+		"--out-dir", out, "--dry-run"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", code, stderr.String())
+	}
+	if entries, err := os.ReadDir(out); err != nil {
+		t.Fatalf("read out dir: %v", err)
+	} else if len(entries) != 0 {
+		t.Errorf("--dry-run wrote entries: %v", entries)
+	}
+	for _, want := range []string{"DRY RUN", filepath.Join(out, "c"), "case.json", "case.md"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("dry-run stdout missing %q\n%s", want, stdout.String())
+		}
+	}
+}
+
+// TestRun_SeverityCalibration_ZeroJoinedExitsNonZero: the distiller's
+// fail-loud contract reaches the exit code.
+func TestRun_SeverityCalibration_ZeroJoinedExitsNonZero(t *testing.T) {
+	withStdin(t, `[{"sequence":10,"run_id":"r","category":"implement_reviewed","payload":{"concerns":[]}}]`)
+	out := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	if code := run([]string{"--severity-calibration", "--case-name", "c", "--issue", "#3309", "--out-dir", out}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "nothing to scaffold") {
+		t.Errorf("stderr:\n%s", stderr.String())
+	}
+}
+
+// TestRun_SeverityCalibration_BadItemsJSON: an input that is neither an
+// items array nor an {items:[...]} envelope is an actionable error.
+func TestRun_SeverityCalibration_BadItemsJSON(t *testing.T) {
+	withStdin(t, `not json`)
+	out := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	if code := run([]string{"--severity-calibration", "--case-name", "c", "--issue", "#3309", "--out-dir", out}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "{items:[...]} envelope") {
+		t.Errorf("stderr:\n%s", stderr.String())
+	}
+}
+
+// TestRun_SeverityCalibration_EnvelopeInput: the {items:[...]} envelope
+// form is accepted, so an operator can paste the audit response verbatim.
+func TestRun_SeverityCalibration_EnvelopeInput(t *testing.T) {
+	withStdin(t, `{"items":`+minimalCalItems+`,"next_cursor":""}`)
+	out := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	if code := run([]string{"--severity-calibration", "--case-name", "c", "--issue", "#3309", "--out-dir", out}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(out, "c", "case.json")); err != nil {
+		t.Errorf("case.json not written: %v", err)
+	}
+}
+
+// TestRun_SeverityCalibration_DefaultOutDirFailLoud: the mode's default
+// --out-dir resolution shares the fail-loud parent check.
+func TestRun_SeverityCalibration_DefaultOutDirFailLoud(t *testing.T) {
+	t.Chdir(t.TempDir())
+	withStdin(t, minimalCalItems)
+	var stdout, stderr bytes.Buffer
+
+	if code := run([]string{"--severity-calibration", "--case-name", "c", "--issue", "#3309"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), corpusParentRel) {
+		t.Errorf("stderr should name the missing parent dir:\n%s", stderr.String())
+	}
+}
