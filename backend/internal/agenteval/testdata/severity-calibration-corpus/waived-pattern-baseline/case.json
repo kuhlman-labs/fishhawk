@@ -1,0 +1,48 @@
+{
+  "name": "waived-pattern-baseline",
+  "issue_number": 1824,
+  "synthetic": true,
+  "plan_summary": "Add a bounded reader for the workspace manifest so the loader stops re-reading the whole file on every lookup.",
+  "scope_files": ["backend/internal/workspace/manifest.go"],
+  "prior_concerns": [
+    {
+      "id": "c-prior-0001",
+      "state": "addressed_pending",
+      "severity": "medium",
+      "category": "correctness",
+      "note": "The first round returned the manifest bytes without closing the file handle on the early-return path.",
+      "state_reason": "Routed back to the agent for the fix-up under review."
+    },
+    {
+      "id": "c-prior-0002",
+      "state": "waived",
+      "severity": "low",
+      "category": "style",
+      "note": "The helper name readAll shadows the stdlib idiom and reads ambiguously.",
+      "state_reason": "Operator waived: renaming is churn on a private helper."
+    }
+  ],
+  "diff": "diff --git a/backend/internal/workspace/manifest.go b/backend/internal/workspace/manifest.go\n--- a/backend/internal/workspace/manifest.go\n+++ b/backend/internal/workspace/manifest.go\n@@ -12,6 +12,14 @@ package workspace\n+// loadManifest reads the workspace manifest from disk.\n+func loadManifest(path string) (Manifest, error) {\n+\traw, err := os.ReadFile(path)\n+\tif err != nil {\n+\t\treturn Manifest{}, err\n+\t}\n+\tvar m Manifest\n+\treturn m, json.Unmarshal(raw, &m)\n+}\n",
+  "concerns": [
+    {
+      "concern_id": "c-0001",
+      "reviewer_model": "reviewer-a",
+      "severity": "high",
+      "category": "resource",
+      "note": "loadManifest calls os.ReadFile with no size cap, so an oversized manifest is read wholly into memory before it is parsed. An unbounded read on an operator-supplied path is a memory-exhaustion surface.",
+      "disposition": "waived",
+      "disposition_reason": "Every other loader in this package reads its file the same unbounded way; this diff matches the existing convention rather than introducing the pattern, and the manifest path is operator-controlled.",
+      "operator_severity": "low"
+    },
+    {
+      "concern_id": "c-0002",
+      "reviewer_model": "reviewer-b",
+      "severity": "medium",
+      "category": "correctness",
+      "note": "The early return on the ReadFile error path discards the partially decoded manifest, which is correct, but the returned error is not wrapped so the caller cannot tell which path failed.",
+      "disposition": "waived",
+      "disposition_reason": "Error wrapping is a house convention, not a defect on this path; the caller already annotates.",
+      "operator_severity": "low"
+    }
+  ]
+}
