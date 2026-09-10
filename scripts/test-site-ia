@@ -24,6 +24,16 @@
 #       ran scripts/test-site-ia:
 #         case c3 went RED — "c3: orphaned page exited 0 (expected 1)"; and c4 also
 #         RED (its orphan half no longer reported). Restored → all cases PASS.
+#
+#  (iv) Removed the `-o -name '*.mdx'` clause from check-site-ia's find invocation
+#       (mutate → observe → restore done atomically; `git diff --stat -- scripts/
+#       check-site-ia` confirmed no change before anything was committed), ran
+#       scripts/test-site-ia: case c5 went RED — "c5: .mdx page exited 1 (expected
+#       0); output: check-site-ia: sidebar slug 'reference/api' resolves to no
+#       content page under .../c5\ncheck-site-ia: 1 IA violation(s) ...". Confirms
+#       the anchor page converts a broken .mdx enumeration into a dangling-slug
+#       violation (exit 1) rather than the page_count==0 fail-open (exit 0) the
+#       old single-page c5 would have hit. Restored → all 11 cases PASS again.
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
@@ -147,16 +157,28 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# c5 — an .mdx page resolves like an .md one.
+# c5 — an .mdx page resolves like an .md one. ANCHORED with a second, .md page
+# (start/what.md) so page_count is non-zero regardless of whether .mdx
+# enumeration works: this keeps the check-site-ia page_count==0 fail-open
+# ("nothing to check", exit 0) UNREACHABLE, so a broken .mdx enumeration
+# surfaces as a dangling 'reference/api' sidebar slug (exit 1) instead of a
+# silent exit 0. Without the anchor, a fixture whose ONLY page is .mdx would
+# pass this case even with .mdx resolution completely broken — verified
+# empirically during planning against a mutated /tmp copy of the gate.
 # ---------------------------------------------------------------------------
 c5="$tmproot/c5"; c5cfg="$tmproot/c5.mjs"
 write_page "$c5/reference/api.mdx"
-write_config "$c5cfg" "{ slug: 'reference/api' },"
+write_page "$c5/start/what.md"
+write_config "$c5cfg" "{ slug: 'reference/api' }," "{ slug: 'start/what' },"
 run_check "$c5" "$c5cfg"
 if [ "$status" -ne 0 ]; then
   fail "c5: .mdx page exited $status (expected 0); output: $out"
+elif ! printf '%s\n' "$out" | grep -q '2 page(s) consistent'; then
+  fail "c5: expected a 2-page consistent report (fail-open unreachable); output: $out"
+elif printf '%s\n' "$out" | grep -q 'nothing to check'; then
+  fail "c5: fail-open text present — .mdx page silently vanished; output: $out"
 else
-  pass "c5: an .mdx page resolves like an .md page"
+  pass "c5: .mdx page resolves like an .md page (fail-open unreachable)"
 fi
 
 # ---------------------------------------------------------------------------
