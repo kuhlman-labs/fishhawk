@@ -768,7 +768,14 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 				// acceptance_expected_head_unresolved) instead of proceeding
 				// unverified. Verified/unverifiable/no-hosts/preview-cmd-set all
 				// proceed (nil refusal).
-				if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission); refusal != nil {
+				// E68.43 (#3321): env-only resolution (autoPreview false) — the
+				// drive loop carries no auto_preview flag, so its PROCEED
+				// behaviour is byte-identical to today; only the refusal gains
+				// the concrete bring-up command.
+				previewCmd, previewSource := resolveAcceptancePreviewCmd(r.getenv, false)
+				if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission, acceptanceTargetOpts{
+					workingDir: in.WorkingDir, previewCmd: previewCmd, previewSource: previewSource,
+				}); refusal != nil {
 					out.StepsTaken = append(out.StepsTaken, DriveStep{
 						Kind: "dispatch", Stage: "acceptance", Delegated: false,
 						Note: fmt.Sprintf(

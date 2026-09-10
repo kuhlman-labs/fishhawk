@@ -3938,3 +3938,47 @@ func TestRunStage_NextActions_AcceptanceBlockerFold(t *testing.T) {
 		}
 	}
 }
+
+// TestRunStage_AcceptanceParkNamesDefaultPreviewCommand closes the SECOND WIRE
+// (#3321 operator condition 1). foldAcceptancePreviewAdvisory is wired at BOTH
+// nextActionsFor call sites — tools.go's getRunStatus and this one, run_stage's
+// post-stage snapshot — precisely so the two surfaces cannot diverge. With only
+// the getRunStatus surface asserted, deleting THIS wire would stay green.
+//
+// It drives the REAL runStage handler against the SAME acceptanceParkFixture
+// the getRunStatus done-means uses, and applies the SAME shared assertion, so
+// the two surfaces are pinned to the same property. The counterfactual is
+// deleting the foldAcceptancePreviewAdvisory call in run_stage.go, which
+// reddens this test while the getRunStatus one stays green.
+func TestRunStage_AcceptanceParkNamesDefaultPreviewCommand(t *testing.T) {
+	const headSHA = "abc1234def5678"
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil) // NO FISHHAWK_ACCEPTANCE_PREVIEW_CMD configured
+	captureArgv(t)
+
+	runID := uuid.New()
+	acceptanceParkFixture(t, fb, runID, headSHA)
+	// Drive the IMPLEMENT stage: the post-stage snapshot re-reads the stage list,
+	// which still carries the acceptance stage parked at awaiting_host_dispatch.
+	var implementStageID string
+	for _, s := range fb.stagesByRun[runID] {
+		if s.Type == "implement" {
+			implementStageID = s.ID
+		}
+	}
+	if implementStageID == "" {
+		t.Fatal("fixture precondition: no implement stage seeded")
+	}
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    implementStageID,
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage(implement): %v", err)
+	}
+	assertPreviewFoldedBeforeAcceptanceDispatch(t, out.NextActions, "scripts/dev preview "+headSHA)
+}

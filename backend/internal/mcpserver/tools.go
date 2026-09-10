@@ -2043,6 +2043,18 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// disagree about a spent budget. Fail-open: an un-fetched or aged-out
 	// recent slice degrades to silence, never to a false advisory.
 	foldConflictResolutionAdvisory(runRow, recent, nextActions)
+	// E68.43 (#3321): name the acceptance-preview bring-up immediately BEFORE
+	// the acceptance dispatch it is a precondition for, so the ritual stops
+	// living in operator memory. Off the SAME recent slice already fetched — no
+	// extra round-trip. The command is CONCRETE even with no
+	// FISHHAWK_ACCEPTANCE_PREVIEW_CMD configured (the renderer defaults); the
+	// SHA degrades to omitted when it has aged out of the bounded window.
+	// autoPreview is deliberately FALSE here: this is a read-only status call,
+	// not a dispatch, so it must not fake an auto_preview gate resolution — an
+	// operator-set env still wins. Wired at BOTH nextActionsFor call sites (here
+	// and run_stage.go) so the two snapshot surfaces cannot diverge.
+	previewCmd, _ := resolveAcceptancePreviewCmd(r.getenv, false)
+	foldAcceptancePreviewAdvisory(runRow, previewCmd, latestReportedHeadSHA(recent), nextActions)
 
 	// Best-effort decomposed-parent children status (#1147). Cost-gated so an
 	// ordinary run pays nothing: only a decomposed parent (no parent_run_id,

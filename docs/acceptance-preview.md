@@ -19,6 +19,18 @@ Both hooks run via `sh -c` in the operator's dispatch `working_dir` — the chec
 
 The teardown hook is deferred the moment it is configured, so it runs on the happy path (after the verdict ships) **and** on every pre-spawn failure that occurs after provisioning began (readiness timeout, stale/unreachable target, any gate failure). It is best-effort: a non-zero teardown exit logs `acceptance_preview_teardown_failed` and never changes the stage outcome.
 
+### `auto_preview`: the loop-side entry point to the same contract (E68.43 / [#3321](https://github.com/kuhlman-labs/fishhawk/issues/3321))
+
+`FISHHAWK_ACCEPTANCE_PREVIEW_CMD` need not be exported by hand. `fishhawk_dispatch_stage(stage:"acceptance", auto_preview:true)` sets it **on the spawned runner's environment** for that dispatch, so the runner provisions the target through exactly the pipeline this document specifies — nothing about the hook contract, the injected variables, the timeouts, the readiness contract or the exit-code semantics changes. It is one call instead of the provision-then-re-dispatch dance.
+
+Three properties worth stating explicitly:
+
+- **The operator's value always wins.** An exported `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` is already in the verb's `os.Environ()`, so `auto_preview` appends nothing and the runner receives that value unchanged.
+- **The built-in default is `scripts/dev preview`**, which is **fishhawk's own dogfood default** and is meaningless in a non-fishhawk checkout. A non-fishhawk stack must set `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` — which, per the point above, overrides the default everywhere it is used or rendered. Without it, an `auto_preview` dispatch in such a repo results in the ordinary category-C `acceptance_preview_provision_failed` with a bounded output tail.
+- **Non-goal: `auto_preview` does NOT set the teardown hook.** `FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD` remains an operator-configured variable under the contract above. A provision without a teardown leaves the preview running after the verdict ships, exactly as it does when the provision hook is exported by hand.
+
+The same default command is rendered — as a **`run_preview`** action naming `scripts/dev preview <expected head sha>` — on the `needs_target` dispatch refusal and in `next_actions` immediately before a suggested acceptance dispatch, so the bring-up is visible whether or not `auto_preview` is used. Details: `backend/internal/mcpserver/README.md`.
+
 ### Injected environment
 
 At call time the runner adds two variables to each hook's environment:
