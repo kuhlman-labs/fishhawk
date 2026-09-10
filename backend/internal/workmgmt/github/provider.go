@@ -677,6 +677,11 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 			// not_planned / duplicate close is NOT complete — its work did not
 			// land — so it does not satisfy a downstream dependency (#2120).
 			Complete: s.State == "CLOSED" && s.StateReason == "COMPLETED",
+			// State carries the child's forge issue state, NORMALIZED to the
+			// uppercase spelling (#3323). ListSubIssues returns uppercase GraphQL
+			// enums, so ToUpper is a no-op on the production path but makes the
+			// two producers agree (the REST site below lowercases).
+			State: strings.ToUpper(s.State),
 			// Body and URL carry the forge's own values through verbatim so
 			// the forge-state idempotency lookup (#2064, E50.7) can read the
 			// hidden marker off a child's body and, on adoption, record the
@@ -1051,6 +1056,11 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 			// ListSubIssues' uppercase GraphQL enums — so match case-insensitively.
 			// A not_planned / duplicate close is NOT complete (its work did not land).
 			Complete: strings.EqualFold(issue.State, "closed") && strings.EqualFold(issue.StateReason, "completed"),
+			// State carries the child's forge issue state, NORMALIZED to the
+			// uppercase spelling (#3323). GetIssue is the REST payload, whose state
+			// is LOWERCASE ("open"/"closed"), so ToUpper is load-bearing here — it
+			// is what makes this producer agree with the uppercase GraphQL site.
+			State: strings.ToUpper(issue.State),
 		})
 		for _, dep := range parseDependsOnMarker(issue.Body) {
 			key := dependsEdgeKey{From: issue.Number, To: dep.Number, Digest: dep.RawDigest}

@@ -2827,6 +2827,11 @@ func TestNextActions_LiveValidationGuidance(t *testing.T) {
 			want: "3 criteria pending operator live-validation (walk: #123)",
 		},
 		{
+			name: "rolling walk with checklist_anchor",
+			lv:   &RunLiveValidation{PendingCriteriaCount: 3, WalkRef: "#123", FilingFailed: false, ChecklistAnchor: "run-abc"},
+			want: "3 criteria pending operator live-validation (rolling walk: #123, section run-abc)",
+		},
+		{
 			name: "filing failure",
 			lv:   &RunLiveValidation{PendingCriteriaCount: 2, FilingFailed: true},
 			want: "2 criteria pending operator live-validation (walk filing failed — file manually)",
@@ -2862,6 +2867,17 @@ func TestNextActions_LiveValidationGuidance(t *testing.T) {
 	t.Run("healthy walk_ref reaches the action params", func(t *testing.T) {
 		na := nextActionsFor(baseRun(&RunLiveValidation{PendingCriteriaCount: 3, WalkRef: "#123"}), stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
 		act := findAction(t, na, "operator_live_validation")
+		if act.Params["walk_ref"] != "#123" {
+			t.Errorf("params[walk_ref] = %q, want #123", act.Params["walk_ref"])
+		}
+	})
+
+	t.Run("checklist_anchor reaches the action params", func(t *testing.T) {
+		na := nextActionsFor(baseRun(&RunLiveValidation{PendingCriteriaCount: 3, WalkRef: "#123", ChecklistAnchor: "run-abc"}), stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
+		act := findAction(t, na, "operator_live_validation")
+		if act.Params["checklist_anchor"] != "run-abc" {
+			t.Errorf("params[checklist_anchor] = %q, want run-abc", act.Params["checklist_anchor"])
+		}
 		if act.Params["walk_ref"] != "#123" {
 			t.Errorf("params[walk_ref] = %q, want #123", act.Params["walk_ref"])
 		}

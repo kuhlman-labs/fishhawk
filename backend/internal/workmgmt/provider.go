@@ -288,6 +288,23 @@ type EpicChild struct {
 	Title    string
 	Autonomy string
 	Complete bool
+	// State is the child's forge issue state, NORMALIZED to the forge's
+	// uppercase spelling ("OPEN"/"CLOSED"). It is empty for a provider that does
+	// not populate it (gitlab/jira), and an empty State means UNKNOWN — do NOT
+	// adopt: the #3323 rolling-walk adoption requires a positively-OPEN candidate,
+	// so empty degrades to the pre-change file-a-new-walk status quo.
+	//
+	// It is NOT derivable from Complete: Complete is closed-AND-completed, so a
+	// closed-as-not_planned child has Complete=false yet is NOT open — a consumer
+	// needing open-ness (rolling-walk adoption) cannot invert Complete.
+	//
+	// It is NORMALIZED rather than carried verbatim because the two github
+	// construction sites read DIFFERENT case conventions (the GraphQL sub-issues
+	// site compares against uppercase enums, the REST GetIssue site compares
+	// case-insensitively against lowercase ones), so a verbatim field would hand
+	// every consumer a case landmine; normalizing at the two producers removes it
+	// once. Additive.
+	State string
 	// Body is the child issue's raw body. It is the surface the forge-state
 	// idempotency lookup reads (#2064, E50.7): a filed child carries a hidden
 	// idempotency marker in its body, so query-before-file adoption asks

@@ -1586,6 +1586,10 @@ components:
         and `GET /v0/runs/{run_id}/gate-view` ONLY (a single audit read, same
         posture as `security_findings`); omitted when the run's approved plan
         carried no marked criterion.
+
+        The walk is ROLLING per epic (#3323): runs under the same epic append a
+        per-run checklist section to ONE walk issue rather than filing a new walk
+        per run. `checklist_anchor` names this run's section within that walk.
       required: [pending_criteria_count, filing_failed]
       properties:
         pending_criteria_count:
@@ -1616,6 +1620,13 @@ components:
             between the intent-marker append and the forge call). Rendered as
             "walk filing incomplete — file manually" versus a filing-failure's
             "walk filing failed — file manually". Omitted (false) otherwise.
+        checklist_anchor:
+          type: string
+          description: |
+            This run's checklist section anchor (`run-<run_id>`) inside the
+            rolling per-epic walk (#3323). Present only when the walk carries a
+            per-run section for this run; omitted when the walk could not be
+            filed (a stranded intent marker or a filing failure has no section).
 
     RunFixupModel:
       type: object
