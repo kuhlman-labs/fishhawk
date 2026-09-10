@@ -959,11 +959,13 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 	numbers := make([]int, 0, len(req.Items))
 	inSet := make(map[int]bool, len(req.Items))
 	for _, ref := range req.Items {
-		// Items arrive in the bare-number ("101") or issue:N ("issue:101") ref
-		// convention (the campaign subset ref shape); strip the optional issue:
-		// prefix, then REUSE parseIssueRef (which also tolerates a leading #) so
-		// the number parse stays a single helper — no regex duplication.
-		n, err := parseIssueRef(strings.TrimPrefix(strings.TrimSpace(ref), "issue:"))
+		// Items arrive in the N, #N or issue:N ref convention (the campaign
+		// subset ref shape). The raw ref goes STRAIGHT to the shared parser,
+		// which owns ALL normalization (#3314) — a caller-side strip here PLUS
+		// the parser's own strip would accept "issue:issue:101" on this path
+		// while the campaign path (which delegates once) rejects it, recreating
+		// the exact cross-path divergence this change exists to close.
+		n, err := parseIssueRef(ref)
 		if err != nil {
 			// Multi-%w so BOTH the classification sentinel and the underlying
 			// parse cause stay reachable: the handler errors.Is the sentinel to
@@ -1630,17 +1632,14 @@ func parseAutonomyLabel(labels []string) string {
 	return workmgmt.ParseAutonomyLabel(labels)
 }
 
-// parseIssueRef parses "#123" or "123" into the issue number.
+// parseIssueRef delegates to workmgmt.ParseIssueRef — the single source of
+// truth for the issue-ref parse (#3314), shared with the campaign package's
+// epic-subset ref parser. It is retained as a thin local name so the
+// existing call sites (linkEpic, EpicChildren, ResolveDependencies,
+// reader.go, grooming.go) and the provider_test table read unchanged. The
+// widened accepted set is `N`, `#N`, `issue:N`, at most one of each prefix.
 func parseIssueRef(ref string) (int, error) {
-	s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(ref), "#"))
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, fmt.Errorf("not a numeric issue reference")
-	}
-	if n <= 0 {
-		return 0, fmt.Errorf("issue number must be > 0")
-	}
-	return n, nil
+	return workmgmt.ParseIssueRef(ref)
 }
 
 // sortedKeys returns the sorted keys of a string-keyed map, for stable

@@ -220,7 +220,7 @@ type createCampaignRequest struct {
 	// issue-run inherits its workflow's contract — the unchanged default).
 	OperatorAgent json.RawMessage `json:"operator_agent,omitempty"`
 	// Items is the OPTIONAL subset filter (#2003) / no-epic item list (#2051):
-	// issue refs (bare number or issue:N). WITH epic_ref it is a subset filter —
+	// issue refs (N, #N or issue:N, #3314). WITH epic_ref it is a subset filter —
 	// every ref must be a child of epic_ref (a non-child fails
 	// campaign_item_not_child, 422) and the DAG is built over just these
 	// children. WITHOUT epic_ref it is the AUTHORITATIVE set — the campaign

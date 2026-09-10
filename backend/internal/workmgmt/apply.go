@@ -361,9 +361,12 @@ func resolveRelations(typeName, epicLink string, rel Relations) (Relations, erro
 }
 
 // issueRefRE matches a well-formed issue reference: an optional leading `#`
-// then a positive integer, surrounding whitespace tolerated. It mirrors the
-// github provider's parseIssueRef so a depends_on edge validates at file
-// time the same way the parent-epic ref resolves at provider time.
+// then a positive integer, surrounding whitespace tolerated. This is
+// DELIBERATELY NARROWER than ParseIssueRef (#3314): a depends_on entry stays
+// `#N`/`N` only — `issue:N` is not accepted here — because depends_on is
+// filed prose (an intake-time well-formedness check on a relations field),
+// not one of the three operator-facing items/epic_ref surfaces ParseIssueRef
+// unifies, so widening it is out of scope for this change.
 var issueRefRE = regexp.MustCompile(`^\s*#?([1-9]\d*)\s*$`)
 
 // isWellFormedIssueRef reports whether ref is a `#N` or `N` positive-integer

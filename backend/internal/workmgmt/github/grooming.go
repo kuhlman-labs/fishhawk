@@ -185,7 +185,7 @@ func (p *Provider) groomingPreflight(req workmgmt.GroomingMutationRequest) (forg
 		return forge.RepoRef{}, 0, groomingUnavailable(workmgmt.ReasonNoInstallation,
 			"no installation id available; grooming mutations are run-scoped in v0", nil)
 	}
-	number, err := parseIssueRef(strings.TrimPrefix(strings.TrimSpace(req.ItemRef), "issue:"))
+	number, err := parseIssueRef(req.ItemRef)
 	if err != nil {
 		return forge.RepoRef{}, 0, fmt.Errorf("workmgmt/github: grooming target %q: %w", req.ItemRef, err)
 	}

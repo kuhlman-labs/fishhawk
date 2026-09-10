@@ -81,7 +81,7 @@ func TestFilterToSubset_NonChildItem_ReturnsErrItemNotChild(t *testing.T) {
 // `go test -run TestFilterToSubset ./internal/campaign/` produced:
 //
 //	--- FAIL: TestFilterToSubset_UnparseableItem_ReturnsErrInvalidItemRef
-//	    subset_test.go:91: err = campaign: subset item is not a child of the epic: "not-a-ref" is not a valid issue ref (want a number or issue:N), want ErrInvalidItemRef
+//	    subset_test.go:91: err = campaign: subset item is not a child of the epic: "not-a-ref" is not a valid issue ref (want N, #N or issue:N), want ErrInvalidItemRef
 //	--- FAIL: TestFilterToSubset_NonChildItem_ReturnsErrItemNotChild  (unaffected — still green)
 //
 // Restored byte-identically; both tests green again.
@@ -329,14 +329,58 @@ func TestFilterToSubset_EmptyItems_ReturnsUnchanged(t *testing.T) {
 	}
 }
 
-// TestFilterToSubset_BareAndIssueRefForms_BothResolve proves a subset can name
-// items in the bare-number and issue:N forms interchangeably.
-func TestFilterToSubset_BareAndIssueRefForms_BothResolve(t *testing.T) {
-	res, err := campaign.FilterToSubset(fullDAG(), []string{"100", "issue:101"})
+// TestFilterToSubset_BareHashAndIssueRefForms_AllResolve proves a subset can
+// name items in the bare-number, #N, and issue:N forms interchangeably
+// (#3314: the epic-path parser now accepts #N alongside the two forms it
+// already accepted).
+func TestFilterToSubset_BareHashAndIssueRefForms_AllResolve(t *testing.T) {
+	res, err := campaign.FilterToSubset(fullDAG(), []string{"100", "issue:101", "#102"})
+	if err != nil {
+		t.Fatalf("FilterToSubset: %v", err)
+	}
+	if len(res.Children) != 3 {
+		t.Fatalf("Children = %+v, want 3 (all three ref forms resolved)", res.Children)
+	}
+}
+
+// TestFilterToSubset_WhitespacePaddedRefForms_Resolve proves surrounding
+// whitespace around either prefixed form is tolerated, mirroring
+// workmgmt.ParseIssueRef's own TrimSpace passes.
+func TestFilterToSubset_WhitespacePaddedRefForms_Resolve(t *testing.T) {
+	res, err := campaign.FilterToSubset(fullDAG(), []string{" #100 ", " issue:101 "})
 	if err != nil {
 		t.Fatalf("FilterToSubset: %v", err)
 	}
 	if len(res.Children) != 2 {
-		t.Fatalf("Children = %+v, want 2 (both ref forms resolved)", res.Children)
+		t.Fatalf("Children = %+v, want 2 (whitespace-padded refs resolved)", res.Children)
+	}
+}
+
+// TestFilterToSubset_NonPositiveItemRef_ReturnsErrInvalidItemRef is the
+// counterfactual vehicle for the new n <= 0 guard workmgmt.ParseIssueRef adds
+// (#3314): "0" and "-5" are wrapped as workmgmt.ErrInvalidItemRef, NOT
+// campaign.ErrItemNotChild — a tightening from the prior campaign-path
+// behavior, where "0" parsed to 0 and drew the less precise
+// campaign_item_not_child instead.
+func TestFilterToSubset_NonPositiveItemRef_ReturnsErrInvalidItemRef(t *testing.T) {
+	for _, ref := range []string{"0", "-5"} {
+		_, err := campaign.FilterToSubset(fullDAG(), []string{ref})
+		if !errors.Is(err, workmgmt.ErrInvalidItemRef) {
+			t.Errorf("FilterToSubset(%q) err = %v, want ErrInvalidItemRef", ref, err)
+		}
+		if errors.Is(err, campaign.ErrItemNotChild) {
+			t.Errorf("FilterToSubset(%q) err = %v, want NOT ErrItemNotChild", ref, err)
+		}
+	}
+}
+
+// TestFilterToSubset_DoubleIssuePrefix_Rejected is the campaign-side half of
+// the operator-constraint-(1) single-normalization pin (#3314): "issue:issue:101"
+// must NOT resolve to 101. It is named to read as a pair with
+// TestProvider_DoubleIssuePrefix_RejectedOnEveryPath in the github package.
+func TestFilterToSubset_DoubleIssuePrefix_Rejected(t *testing.T) {
+	_, err := campaign.FilterToSubset(fullDAG(), []string{"issue:issue:101"})
+	if !errors.Is(err, workmgmt.ErrInvalidItemRef) {
+		t.Fatalf("FilterToSubset(issue:issue:101) err = %v, want ErrInvalidItemRef", err)
 	}
 }

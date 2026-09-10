@@ -24,7 +24,7 @@ Why a GitHub App installation token can't board Project #7:
 - **Undecidable board membership is TYPED.** `ListWorkItems` matches `githubclient`'s `*BoardMembershipUndecidableError` (the truncated-`projectItems` refusal) with `errors.As` and re-surfaces it as `*workmgmt.UnavailableError{Reason: ReasonBoardStateUndecidable}`, retaining the githubclient error in `Cause`. So a caller classifies it through the SAME `errors.As` chokepoint every other degradation uses, and can unwrap for the offending issue number; it never has to match on message text. `TestListWorkItems_UndecidableBoardMembershipIsTyped` drives it end to end over `httptest`.
 - **`WorkItemRecord.URL` is LIST-PATH-ONLY.** The list path populates it from the GraphQL issue node's `url`; `ReadWorkItem` leaves it EMPTY, because `GetIssue` decodes `githubclient.Issue` — the REST single-issue payload — which carries no URL field at all. Widening that shared REST struct is deferred to the first consumer that needs it (several unrelated callers consume it). A caller must not read an empty URL from the read path as "this item has no URL": reconstruct it from `Number` plus the target repo, or read through `ListWorkItems`. Pinned by the URL assertion in `TestProvider_ReadWorkItem_AcceptsEveryRefForm` so the asymmetry cannot drift unnoticed.
 - **Completion:** `Complete = closed AND completed`. The list path matches the UPPERCASE GraphQL enums (as `EpicChildren` does); the read path matches case-insensitively because `GetIssue` returns GitHub's LOWERCASE REST `state`/`state_reason` (as `ResolveDependencies` does).
-- **Refs:** `ReadWorkItem` accepts `#N`, `N`, and `issue:N` through the existing `parseIssueRef` helper — no second regex.
+- **Refs:** `ReadWorkItem` accepts `#N`, `N`, and `issue:N` through the existing `parseIssueRef` helper — no second regex. This is now LITERALLY true rather than true-by-caller-workaround: `parseIssueRef` is a thin delegate to the single shared `workmgmt.ParseIssueRef` (#3314), and the caller-side `TrimPrefix(ref, "issue:")` this call site used to run BEFORE delegating is gone — the raw ref reaches the shared parser unstripped, so a doubled `issue:` prefix is rejected here the same way it is on every other path.
 
 ## Grooming apply — the mutation half (E54.5 / #2237)
 
@@ -138,7 +138,7 @@ The resolution runs in three phases:
 
 | Phase | What it does | Concurrency |
 |---|---|---|
-| 0 | Parse each `Items` ref via `parseIssueRef`, dedup into `numbers` preserving REQUEST ORDER (ratified rank order on the grooming path) | serial |
+| 0 | Parse each `Items` ref via `parseIssueRef` (passed the RAW ref — no caller-side `issue:` strip, #3314), dedup into `numbers` preserving REQUEST ORDER (ratified rank order on the grooming path) | serial |
 | 1 | Fetch every named issue | bounded, `issueSetFetchConcurrency` (8) |
 | 2 | Collect the DISTINCT out-of-set targets in first-encounter order (`outOfSetTargets`), fetch them, build `stateCache` | bounded fetch, SERIAL cache build |
 | 3 | Classify in request order, emit `Children`/`Edges`/`DroppedEdges`/`SatisfiedEdges`, sort | serial |

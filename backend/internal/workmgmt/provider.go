@@ -91,8 +91,8 @@ type EpicChildrenQuerier interface {
 }
 
 // EpicChildrenRequest is the resolved input to EpicChildren: the filing
-// Target (repo + installation) and the epic issue reference (`#N` or `N`)
-// whose children and depends_on edges are queried.
+// Target (repo + installation) and the epic issue reference (`N`, `#N` or
+// `issue:N`) whose children and depends_on edges are queried.
 type EpicChildrenRequest struct {
 	Target Target
 	Epic   string
@@ -143,7 +143,8 @@ type IssueSetRequest struct {
 // ErrInvalidItemRef is PART OF THE RESOLVER CONTRACT: a named item ref is not a
 // valid issue reference (it is not `N`, `#N` or `issue:N`). It is returned
 // WRAPPED — by IssueSetDependencyResolver.ResolveDependencies on the no-epic
-// path and by the campaign package's subset ref parser on the epic path — so a
+// path and by the campaign package's subset ref parser on the epic path —
+// where BOTH paths now reach the SAME shared parser, ParseIssueRef, so a
 // caller errors.Is matches it to classify a CLIENT-INPUT failure apart from a
 // provider/transport failure, and answers a 4xx instead of the transport-class
 // 502 an unclassified resolver error draws (#2176).

@@ -10979,7 +10979,7 @@ paths:
                   items: { type: string }
                   description: |
                     OPTIONAL subset filter (#2003) / no-epic item list (#2051):
-                    issue refs (bare number or `issue:N`). WITH `epic_ref` it
+                    issue refs (`N`, `#N` or `issue:N`). WITH `epic_ref` it
                     names the subset of the epic's children to scope the campaign
                     to — every entry must be a child of the epic (a non-child
                     fails `campaign_item_not_child`) and the DAG is built over

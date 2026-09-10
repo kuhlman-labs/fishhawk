@@ -306,7 +306,9 @@ func canonicalStateSet(states []string) map[string]bool {
 // ReadWorkItem implements workmgmt.WorkItemReader: resolve ONE work item by
 // reference. Ref accepts `#N`, `N`, or `issue:N` — the repo's existing ref
 // conventions, parsed by the SAME parseIssueRef helper ResolveDependencies
-// uses (no second regex).
+// uses (no second regex), which now delegates to the single shared
+// workmgmt.ParseIssueRef (#3314) and is passed the RAW ref unstripped — a
+// caller-side "issue:" strip here would double-strip a doubled prefix.
 //
 // The record's URL is left EMPTY here: GetIssue is the REST single-issue
 // payload and githubclient.Issue carries no URL field, where the list path's
@@ -332,7 +334,7 @@ func (p *Provider) ReadWorkItem(ctx context.Context, req workmgmt.ReadWorkItemRe
 	if err != nil {
 		return nil, err
 	}
-	number, err := parseIssueRef(strings.TrimPrefix(strings.TrimSpace(req.Ref), "issue:"))
+	number, err := parseIssueRef(req.Ref)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: work item %q: %w", req.Ref, err)
 	}

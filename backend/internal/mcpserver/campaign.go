@@ -35,7 +35,7 @@ type StartCampaignInput struct {
 	// WITH epic_ref it scopes the campaign to a named subset of the epic's
 	// children; WITHOUT epic_ref it is the authoritative issue set the no-epic
 	// campaign assembles over.
-	Items []string `json:"items,omitempty" jsonschema:"OPTIONAL issue refs (a bare number like '101' or 'issue:101'). WITH epic_ref: the subset of the epic's children to scope the campaign to — every item must be a child of the epic (a non-child fails campaign_item_not_child); omit to sweep every child. WITHOUT epic_ref: the authoritative issue set a no-epic campaign assembles over, resolving each issue's depends_on directly (#2051). In both modes an included item whose depends_on points at an issue OUTSIDE the set fails campaign_dangling_dependency (that dependency must run within the batch). One of epic_ref / items is required"`
+	Items []string `json:"items,omitempty" jsonschema:"OPTIONAL issue refs (a bare number like '101', '#101', or 'issue:101'). WITH epic_ref: the subset of the epic's children to scope the campaign to — every item must be a child of the epic (a non-child fails campaign_item_not_child); omit to sweep every child. WITHOUT epic_ref: the authoritative issue set a no-epic campaign assembles over, resolving each issue's depends_on directly (#2051). In both modes an included item whose depends_on points at an issue OUTSIDE the set fails campaign_dangling_dependency (that dependency must run within the batch). One of epic_ref / items is required"`
 	// GroomingRunID selects the THIRD campaign source (E54.6 / #2238): an
 	// approved grooming run whose ratified priority order becomes the campaign
 	// queue. Deliberately a RUN ID and nothing more — no board column, no order
