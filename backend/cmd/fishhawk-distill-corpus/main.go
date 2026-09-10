@@ -45,6 +45,9 @@ const (
 	defaultCorpusRel     = "backend/internal/agenteval/testdata/corpus"
 	corpusParentRel      = "backend/internal/agenteval/testdata"
 	defaultMissCorpusRel = "backend/internal/agenteval/testdata/planreview-miss-corpus"
+	// defaultCalibrationCorpusRel is the --severity-calibration mode's
+	// default corpus dir (E50.22 / #3309), sharing the same parent check.
+	defaultCalibrationCorpusRel = "backend/internal/agenteval/testdata/severity-calibration-corpus"
 )
 
 func main() {
@@ -83,17 +86,28 @@ item source is --run-id (fetched from --backend-url, all pages) or --in/stdin
 blobs stay customer-side per ADR-049 #5. The tool scaffolds a CANDIDATE:
 selection, labeling, and committing stay operator curation (#819 / ADR-040).
 
+Severity-calibration mode (E50.22 / #3309): --severity-calibration scaffolds ONE
+candidate severity-calibration case (case.json + case.md) by joining a run's
+implement_reviewed concerns to its concern_waived / concern_deferred /
+concern_addressed_by_condition dispositions. Item source is --run-id (all four
+categories, all pages, merged ascending by sequence) or --in/stdin. Default
+--out-dir for this mode is %s. No audit payload carries the reviewed diff, so
+supply it with --diff <path> (and --plan-summary <path>). operator_severity is
+left EMPTY on every concern — the agenteval loader REFUSES an unlabelled case.
+The concern notes and disposition reasons are FREE-TEXT operator and reviewer
+prose: read them before committing (case.md says so at the point of use).
+
 Flags:
-`, defaultCorpusRel, corpusParentRel, defaultMissCorpusRel)
+`, defaultCorpusRel, corpusParentRel, defaultMissCorpusRel, defaultCalibrationCorpusRel)
 		fs.PrintDefaults()
 	}
 
 	var (
-		in             = fs.String("in", "", "path to a trace bundle (.jsonl.gz or .jsonl), or audit items JSON with --plan-review-miss; '-' or empty reads stdin")
+		in             = fs.String("in", "", "path to a trace bundle (.jsonl.gz or .jsonl), or audit items JSON in the --plan-review-miss / --severity-calibration modes; '-' or empty reads stdin")
 		stageID        = fs.String("stage-id", "", "fetch the bundle for this stage id from --backend-url (takes precedence over --in/stdin)")
 		caseName       = fs.String("case-name", "", "corpus case slug (required); becomes the case directory name")
 		issue          = fs.String("issue", "", "originating issue/run reference recorded in case.md (required), e.g. '#819'")
-		outDir         = fs.String("out-dir", "", "corpus parent directory (default: "+defaultCorpusRel+", or "+defaultMissCorpusRel+" with --plan-review-miss, relative to cwd)")
+		outDir         = fs.String("out-dir", "", "corpus parent directory (default: "+defaultCorpusRel+", or "+defaultMissCorpusRel+" with --plan-review-miss, or "+defaultCalibrationCorpusRel+" with --severity-calibration; relative to cwd)")
 		force          = fs.Bool("force", false, "overwrite an existing case directory")
 		signal         = fs.String("signal", "", "optional scorecard signal/classification this case demonstrates (pre-fills case.md; else a TODO prompt)")
 		narrative      = fs.String("narrative", "", "optional distilled-signal narrative for case.md (pre-fills the section; else a TODO prompt)")
@@ -101,19 +115,34 @@ Flags:
 		backendURL     = fs.String("backend-url", envOr("FISHHAWK_BACKEND_URL", "http://localhost:8080"), "backend base URL for --stage-id/--run-id fetch (env FISHHAWK_BACKEND_URL)")
 		token          = fs.String("token", os.Getenv("FISHHAWK_TOKEN"), "bearer API token for --stage-id/--run-id fetch (env FISHHAWK_TOKEN)")
 		planReviewMiss = fs.Bool("plan-review-miss", false, "scaffold plan-review-miss corpus cases from class-3 acceptance_triage_decided audit entries (E31.11 / #1539)")
-		runID          = fs.String("run-id", "", "with --plan-review-miss: fetch the run's acceptance_triage_decided audit entries from --backend-url (takes precedence over --in/stdin)")
+		runID          = fs.String("run-id", "", "with --plan-review-miss or --severity-calibration: fetch the run's audit entries from --backend-url (takes precedence over --in/stdin)")
+		severityCal    = fs.Bool("severity-calibration", false, "scaffold a severity-calibration candidate case by joining implement_reviewed concerns to their concern_waived/_deferred/_addressed_by_condition dispositions (E50.22 / #3309)")
+		diffPath       = fs.String("diff", "", "with --severity-calibration: path to the unified diff the implement stage produced (no audit payload carries it)")
+		planSummary    = fs.String("plan-summary", "", "with --severity-calibration: path to the approved-plan summary the reviewer read")
 	)
 
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
+	if *planReviewMiss && *severityCal {
+		_, _ = fmt.Fprintln(stderr, "error: --plan-review-miss and --severity-calibration are mutually exclusive modes; pick one")
+		return 2
+	}
+	if *severityCal && *stageID != "" {
+		_, _ = fmt.Fprintln(stderr, "error: --stage-id is the trace-bundle source and does not apply to --severity-calibration; use --run-id (or --in/stdin) instead")
+		return 2
+	}
+	if !*severityCal && (*diffPath != "" || *planSummary != "") {
+		_, _ = fmt.Fprintln(stderr, "error: --diff and --plan-summary only apply to --severity-calibration")
+		return 2
+	}
 	if *planReviewMiss && *stageID != "" {
 		_, _ = fmt.Fprintln(stderr, "error: --stage-id is the trace-bundle source and does not apply to --plan-review-miss; use --run-id (or --in/stdin) instead")
 		return 2
 	}
-	if !*planReviewMiss && *runID != "" {
-		_, _ = fmt.Fprintln(stderr, "error: --run-id only applies to --plan-review-miss (the trace mode's fetch source is --stage-id)")
+	if !*planReviewMiss && !*severityCal && *runID != "" {
+		_, _ = fmt.Fprintln(stderr, "error: --run-id only applies to --plan-review-miss or --severity-calibration (the trace mode's fetch source is --stage-id)")
 		return 2
 	}
 	if *caseName == "" {
@@ -126,13 +155,43 @@ Flags:
 	}
 
 	defaultRel := defaultCorpusRel
-	if *planReviewMiss {
+	switch {
+	case *planReviewMiss:
 		defaultRel = defaultMissCorpusRel
+	case *severityCal:
+		defaultRel = defaultCalibrationCorpusRel
 	}
 	resolvedOut, err := resolveOutDir(*outDir, defaultRel)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
+	}
+
+	if *severityCal {
+		diff, err := readOptionalFile(*diffPath, "--diff")
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		summary, err := readOptionalFile(*planSummary, "--plan-summary")
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		return runSeverityCalibration(calibrationRunParams{
+			runID: *runID, in: *in, backendURL: *backendURL, token: *token,
+			opts: corpusdistill.CalibrationOptions{
+				CaseName:    *caseName,
+				Issue:       *issue,
+				OutDir:      resolvedOut,
+				Force:       *force,
+				Fetched:     *runID != "",
+				Diff:        diff,
+				PlanSummary: summary,
+				Narrative:   *narrative,
+			},
+			dryRun: *dryRun,
+		}, stdout, stderr)
 	}
 
 	if *planReviewMiss {
@@ -318,4 +377,87 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// calibrationRunParams collects the --severity-calibration mode inputs.
+type calibrationRunParams struct {
+	runID, in, backendURL, token string
+	opts                         corpusdistill.CalibrationOptions
+	dryRun                       bool
+}
+
+// runSeverityCalibration drives the --severity-calibration mode: source the
+// audit items (--run-id fetch > --in file > stdin), then preview
+// (--dry-run) or distill the candidate case.
+func runSeverityCalibration(p calibrationRunParams, stdout, stderr io.Writer) int {
+	items, err := loadCalibrationItems(context.Background(), p)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+
+	if p.dryRun {
+		res, err := corpusdistill.PreviewSeverityCalibration(items, p.opts)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		_, _ = fmt.Fprintf(stdout, "DRY RUN — no files written.\n")
+		_, _ = fmt.Fprintf(stdout, "case dir: %s\n", res.CaseDir)
+		_, _ = fmt.Fprintf(stdout, "\n--- case.json ---\n%s", res.CaseJSON)
+		_, _ = fmt.Fprintf(stdout, "\n--- case.md ---\n%s", res.CaseMD)
+		return 0
+	}
+
+	dir, err := corpusdistill.DistillSeverityCalibration(items, p.opts)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	_, _ = fmt.Fprintln(stdout, dir)
+	return 0
+}
+
+// loadCalibrationItems sources the audit items for the
+// --severity-calibration mode: --run-id fetches all four categories from
+// the backend; otherwise --in/stdin supplies JSON — either a bare items
+// array or the {items:[...]} audit-endpoint envelope.
+func loadCalibrationItems(ctx context.Context, p calibrationRunParams) ([]corpusdistill.CalibrationAuditItem, error) {
+	if p.runID != "" {
+		return corpusdistill.FetchRunConcernDispositions(ctx, p.backendURL, p.runID, p.token)
+	}
+	src, err := openSource(ctx, "", p.in, p.backendURL, p.token, os.Stdin)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := io.ReadAll(src)
+	if err != nil {
+		return nil, fmt.Errorf("read audit items: %w", err)
+	}
+	var items []corpusdistill.CalibrationAuditItem
+	if err := json.Unmarshal(raw, &items); err == nil {
+		return items, nil
+	}
+	var envelope struct {
+		Items []corpusdistill.CalibrationAuditItem `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, fmt.Errorf("audit items input must be a JSON array of audit items or an {items:[...]} envelope: %w", err)
+	}
+	return envelope.Items, nil
+}
+
+// readOptionalFile reads path when non-empty, returning "" otherwise. A
+// named-but-unreadable path is an ERROR, never a silent empty value: an
+// operator who passed --diff and got a diff-less case would only find out
+// when the agenteval loader refused it, far from the typo.
+func readOptionalFile(path, flagName string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s %q: %w", flagName, path, err)
+	}
+	return string(b), nil
 }
