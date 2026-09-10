@@ -1255,10 +1255,13 @@ warning lives in the `check-site-ia` script header.
 `scripts/test-site-ia` runs eleven cases, one per named behavior: c1 consistent
 → exit 0; c2 dangling sidebar slug → exit 1 (slug named); c3 orphaned page →
 exit 1 (path named); c4 both violations reported before one exit; c5 `.mdx`
-resolution; c6 group-landing `<slug>/index.md`; c7 missing content root → exit 0
-with reason; c8 missing astro config → exit 0 with reason; c9 failed enumeration
-→ exit 2, never a clean report; c10 the commented-out-slug parser-limitation pin;
-c11 `_verify_site_ia` skips with a reason (return 0) when the gate is absent.
+resolution ANCHORED by a second `.md` page so `page_count` stays non-zero,
+forcing a broken `.mdx` enumeration to surface as a dangling-slug violation
+instead of silently satisfying the empty-content fail-open; c6 group-landing
+`<slug>/index.md`; c7 missing content root → exit 0 with reason; c8 missing
+astro config → exit 0 with reason; c9 failed enumeration → exit 2, never a
+clean report; c10 the commented-out-slug parser-limitation pin; c11
+`_verify_site_ia` skips with a reason (return 0) when the gate is absent.
 
 `scripts/test verify` runs BOTH: `test-site-ia` in `_verify_gate_harnesses`
 (proving the control still works), and `check-site-ia` itself via
