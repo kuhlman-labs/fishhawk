@@ -103,6 +103,25 @@ type RetentionCase struct {
 	// ExpectationNote states, in reviewable terms, WHY this diff exhibits
 	// the declared class.
 	ExpectationNote string `json:"expectation_note"`
+	// NonRetainingExamples are CONCRETE reviewer concern notes that match
+	// this fixture's declared ResistantBehavior — reviews that plausibly
+	// occur and that did NOT raise the named finding. They are REQUIRED,
+	// and they exist to make the fixture's OWN probe set falsifiable.
+	//
+	// WHY: FindingProbes short-circuit the judge (RetentionVerdict rule 1),
+	// so a probe broad enough to occur in an ordinary non-retaining review
+	// reports the finding PRODUCED on a review that explicitly did not
+	// produce it — concealing exactly the #2119 regression this corpus
+	// measures, and doing so in the fail-OPEN direction. A single-word probe
+	// like "forge" is matched by "the forge parameter is unused in
+	// Register", which the cross-forge fixture's own rubric names as
+	// non-retaining.
+	//
+	// Loader mode (i) REFUSES a corpus in which any probe matches any
+	// declared non-retaining example, so probe breadth is bounded by the
+	// fixture's own statement of what non-retention looks like rather than
+	// by an author's judgement at the time of writing.
+	NonRetainingExamples []string `json:"non_retaining_examples"`
 	// Synthetic marks a HAND-AUTHORED fixture. All four committed fixtures
 	// set it true: they are reconstructions of the finding CLASSES #2119
 	// names, not verbatim replays of epic #1824's diffs, which are not in
@@ -137,6 +156,11 @@ type NamedRetentionCase struct {
 //	    exhibits the class, and a fixture that does not exhibit it scores a
 //	    legitimate non-finding as a #2119 regression
 //	(h) a finding_class outside RetentionFindingClasses
+//	(i) empty non_retaining_examples, a blank example, or — the substantive
+//	    half — a finding_probe that MATCHES a declared non-retaining
+//	    example. Such a probe would short-circuit the judge and report the
+//	    finding PRODUCED on a review the fixture itself declares
+//	    non-retaining, hiding a #2119 regression
 func LoadAdversarialRetentionCorpus(dir string) ([]NamedRetentionCase, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -181,7 +205,37 @@ func (c *RetentionCase) validate() error {
 	if strings.TrimSpace(c.ExpectationNote) == "" {
 		return fmt.Errorf("expectation_note must be non-empty — nothing would state why this diff exhibits %q", c.FindingClass) // (g)
 	}
-	return validateRetentionRubric(c.BehavioralRubric)
+	if err := validateRetentionRubric(c.BehavioralRubric); err != nil {
+		return err
+	}
+	// (i) LAST: the rubric's ResistantBehavior is what the declared
+	// non-retaining examples instantiate, so a fixture with no usable rubric
+	// should draw the rubric's own error first.
+	return c.validateProbesAgainstNonRetainingExamples()
+}
+
+// validateProbesAgainstNonRetainingExamples implements mode (i): the
+// fixture's probe set must be DISCRIMINATING, and the fixture's own declared
+// non-retaining reviews are the falsifier.
+//
+// It matches with EXACTLY the function the measurement uses, MatchFindingProbe,
+// rather than an independent re-implementation — a check that matched
+// differently from the runtime would leave the gap it exists to close.
+func (c *RetentionCase) validateProbesAgainstNonRetainingExamples() error {
+	if len(c.NonRetainingExamples) == 0 {
+		return fmt.Errorf("non_retaining_examples must be non-empty — without a declared non-retaining review nothing bounds how broad finding_probes may be, and a probe matched by an ordinary non-retaining note reports the finding PRODUCED and hides a #2119 regression") // (i)
+	}
+	for i, ex := range c.NonRetainingExamples {
+		if strings.TrimSpace(ex) == "" {
+			return fmt.Errorf("non_retaining_examples[%d] must be non-empty", i) // (i)
+		}
+		if probe, matched := MatchFindingProbe(*c, []string{ex}); matched {
+			return fmt.Errorf(
+				"finding_probe %q matches non_retaining_examples[%d] (%q); a probe short-circuits the judge, so this probe would report the finding PRODUCED on a review this fixture itself declares NON-RETAINING — narrow the probe or drop it",
+				probe, i, ex) // (i)
+		}
+	}
+	return nil
 }
 
 // validateRetentionRubric implements modes (e) and (f).

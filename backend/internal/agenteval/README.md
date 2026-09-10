@@ -315,6 +315,25 @@ concerns IT matched lets a post arm lower its own mean purely by omitting a
 badly-calibrated concern, reporting an improvement with no severity having
 moved. That is the defect the whole scoring section exists to prevent.
 
+**The same penalty applies PER SAMPLE, and it has to.** The live arm runs
+`DefaultCalibrationSamples = 5` samples per fixture, so a concern can be
+omitted from SOME samples without being missed outright — and the
+concern-level penalty above cannot see that, because the concern WAS
+matched, once. `RunSeverityArm` therefore averages each concern's distance
+over **`samples`**, not over the samples in which it happened to be matched,
+charging `MaxSeverityTierDistance` for each sample that did not emit it.
+Without this, pre distances `[2,2,2,2,0]` average to 1.6 while a post arm
+that omitted the first four occurrences and kept only the distance-0 one
+averages to 0 — a **+0.8 improvement manufactured entirely by partial
+omission**, above the 0.25 threshold, with no emitted severity having
+changed. `ArmCoverage.MatchedSamples` reports the per-concern sample count
+so a partial omission is legible rather than folded into the mean, and
+`TestRunSeverityArm_PartialSampleOmissionIsNotAnImprovement` drives that
+exact case through `RunSeverityArm` at five samples. The two rules agree at
+the boundary: a concern missed in EVERY sample scores exactly
+`MaxSeverityTierDistance`, which is what the concern-level penalty would
+have charged it.
+
 **Why NOT pairwise-complete** (exclude a labelled concern from BOTH arms
 whenever EITHER arm missed it), which reads conservative but is **not**
 omission-monotone. Two labelled concerns A and B with pre/post distances
@@ -398,6 +417,32 @@ the finding CLASSES #2119 names, not verbatim replays of the original #1824
 diffs, so each carries an `expectation_note` stating in reviewable terms why
 its diff exhibits the class — and the loader refuses a fixture with an empty
 `expectation_note` or empty `finding_probes`.
+
+### Retention probes must be DISCRIMINATING, and the fixture says so itself
+
+A `finding_probe` SHORT-CIRCUITS the judge (`RetentionVerdict` rule 1), so a
+probe broad enough to occur in an ordinary review that did NOT raise the
+finding reports `FindingProduced` on a non-retaining review — concealing the
+very #2119 regression this corpus measures, in the **fail-OPEN** direction.
+A single word is the trap: `"forge"` is matched by *"the forge parameter is
+unused in Register"*, which the cross-forge fixture's own
+`resistant_behavior` names as non-retaining.
+
+So every fixture also declares `non_retaining_examples`: CONCRETE reviewer
+notes instantiating its own `resistant_behavior`. Loader **mode (i)** refuses
+a corpus in which any probe matches any declared non-retaining example —
+matching with `MatchFindingProbe` itself, not a re-implementation, so the
+check cannot diverge from the runtime it bounds. Probe breadth is therefore
+bounded by the fixture's own statement of what non-retention looks like,
+rather than by an author's judgement at the time of writing.
+
+Two committed tests hold the pair from both sides:
+`TestRetentionCorpus_DeclaredNonRetainingReviewsStayNonRetaining` drives every
+declared non-retaining review through the COMPLETE probe/judge path
+(`RunRetentionArm`, judge seeded at the score floor) and asserts
+`FindingAbsent`, while `TestRetentionCorpus_ProbesStillMatchARetainingReview`
+asserts each fixture's probes still match its own `compliant_behavior` — so
+mode (i) cannot be satisfied by deleting every probe.
 
 ---
 

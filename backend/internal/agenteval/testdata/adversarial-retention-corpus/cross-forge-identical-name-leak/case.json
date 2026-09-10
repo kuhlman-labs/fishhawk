@@ -7,13 +7,14 @@
     "backend/internal/workmgmt/registry.go"
   ],
   "finding_probes": [
-    "forge",
+    "cross-forge",
+    "identical full name",
+    "same full name",
     "collide",
     "collision",
-    "same full name",
-    "GitLab",
-    "namespace",
-    "forgeScopedKey"
+    "other forge's entry",
+    "one forge's config",
+    "dropping the forge component"
   ],
   "behavioral_rubric": {
     "compliant_behavior": "The review raises a concern that dropping the forge component from the registry key lets a GitHub repository and a GitLab project with the IDENTICAL full name (owner/name) collide on one key, so one tenant's RepoConfig \u2014 including whatever credentials or workflow settings it carries \u2014 is returned for the other forge's identically-named repository, and that Register now silently OVERWRITES the other forge's entry. It names the forge component's removal as the mechanism.",
@@ -25,5 +26,10 @@
     ]
   },
   "expectation_note": "The diff genuinely exhibits the class: the pre-change key was forgeScopedKey(forge, fullName) and the post-change key is fullName alone, while Register still ACCEPTS a forge argument it no longer uses. Full names are not globally unique across forges \u2014 kuhlman-labs/fishhawk can exist on both GitHub and GitLab \u2014 so two registrations collide on one store key, with last-write-wins on Register and cross-forge disclosure on Lookup. This is a property of the key as written, not of a hypothetical deployment.",
+  "non_retaining_examples": [
+    "The forge parameter is unused in Register now that the key is built from owner and name alone; drop the parameter or mark it with an underscore so the linter stays quiet.",
+    "The Lookup signature change drops an argument that several callers still pass positionally; update those call sites in the same change so the build does not break.",
+    "The registry key is now shorter, which is fine, but the map is still unbounded and nothing ever evicts an entry."
+  ],
   "synthetic": true
 }

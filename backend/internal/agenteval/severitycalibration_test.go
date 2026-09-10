@@ -855,3 +855,184 @@ func TestRunSeverityArm_FailsClosed(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Omission monotonicity ACROSS SAMPLE AGGREGATION (the multi-sample half).
+// ---------------------------------------------------------------------------
+
+// multiSampleCase is astra's counterexample expressed as a real fixture that
+// RunSeverityArm can drive: two labelled concerns with DISTINCT categories,
+// so the emitted-to-labelled match is unambiguous, and notes carrying
+// substantive words the emitted notes echo (the matcher needs category
+// equality plus two shared words longer than three characters).
+func multiSampleCase() []NamedSeverityCalibrationCase {
+	return []NamedSeverityCalibrationCase{{
+		Name: "astra-multisample",
+		Case: SeverityCalibrationCase{
+			Name:      "astra-multisample",
+			Diff:      "--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-old\n+new\n",
+			Synthetic: true,
+			Concerns: []LabelledConcern{
+				{
+					ConcernID: "A", Category: "correctness", Severity: "low",
+					Note:        "the authorization check reads an asynchronous projection while the mutation applies against the authoritative store",
+					Disposition: "addressed", OperatorSeverity: "high",
+				},
+				{
+					ConcernID: "B", Category: "efficiency", Severity: "medium",
+					Note:        "the decode path allocates without an upper bound on the declared length",
+					Disposition: "waived", OperatorSeverity: "high",
+				},
+			},
+		},
+	}}
+}
+
+// emittedConcernJSON renders one emitted concern for the fake sender.
+func emittedConcernJSON(category, severity, note string) string {
+	return fmt.Sprintf(`{"severity":%q,"category":%q,"note":%q}`, severity, category, note)
+}
+
+// verdictJSON assembles a reviewer verdict from already-rendered concerns.
+func verdictJSON(concerns ...string) string {
+	return `{"verdict":"changes_requested","concerns":[` + strings.Join(concerns, ",") + `]}`
+}
+
+const (
+	// noteA / noteB echo enough of each labelled note to bind the emitted
+	// concern to it. Kept as constants so every sample in both arms uses
+	// byte-identical prose and the ONLY thing varying across the arms is
+	// which samples emit A at all.
+	noteA = "the projection read and the authoritative store disagree, so the authorization check passes stale"
+	noteB = "the decode allocates without an upper bound on the declared length"
+)
+
+// TestRunSeverityArm_PartialSampleOmissionIsNotAnImprovement is astra's
+// counterexample driven through the SUPPORTED MULTI-SAMPLE configuration,
+// which is the shape the single-sample comparison tests structurally cannot
+// reach.
+//
+// Both arms run 5 samples. In BOTH arms concern A is emitted at tier
+// distance 2 in samples 1-4 and distance 0 in sample 5 WHEN IT IS EMITTED AT
+// ALL; concern B is emitted identically in every sample of both arms, so B
+// contributes nothing to the delta. The arms differ ONLY in that the POST
+// arm OMITS A from samples 1-4 — no emitted severity differs between the
+// arms, so an honest comparison must report a delta of exactly zero.
+//
+// Averaging each concern over its MATCHED samples only fails this: pre A is
+// (2+2+2+2+0)/5 = 1.6 while post A is 0/1 = 0, and the case reports a +0.8
+// improvement manufactured entirely by partial omission. The concern-level
+// miss penalty in penalizedMeanDistance cannot catch it, because A WAS
+// matched — once. The fix is the per-SAMPLE penalty inside RunSeverityArm.
+func TestRunSeverityArm_PartialSampleOmissionIsNotAnImprovement(t *testing.T) {
+	ctx := context.Background()
+	cases := multiSampleCase()
+	const samples = 5
+
+	// A at distance 2 from its "high" label is an emitted "low"; at distance
+	// 0 it is an emitted "high". B is always emitted at distance 0.
+	aFar := emittedConcernJSON("correctness", "low", noteA)
+	aExact := emittedConcernJSON("correctness", "high", noteA)
+	bExact := emittedConcernJSON("efficiency", "high", noteB)
+
+	preSender := &fakeCalibrationSender{responses: []string{
+		verdictJSON(aFar, bExact),
+		verdictJSON(aFar, bExact),
+		verdictJSON(aFar, bExact),
+		verdictJSON(aFar, bExact),
+		verdictJSON(aExact, bExact),
+	}}
+	// IDENTICAL except A is simply absent from the first four samples.
+	postSender := &fakeCalibrationSender{responses: []string{
+		verdictJSON(bExact),
+		verdictJSON(bExact),
+		verdictJSON(bExact),
+		verdictJSON(bExact),
+		verdictJSON(aExact, bExact),
+	}}
+
+	pre, err := RunSeverityArm(ctx, preSender, cases, ArmPreCalibration, samples)
+	if err != nil {
+		t.Fatalf("pre arm: %v", err)
+	}
+	post, err := RunSeverityArm(ctx, postSender, cases, ArmPostCalibration, samples)
+	if err != nil {
+		t.Fatalf("post arm: %v", err)
+	}
+
+	preCov := pre.PerCase["astra-multisample"]
+	postCov := post.PerCase["astra-multisample"]
+	if got := preCov.MatchedSamples["A"]; got != samples {
+		t.Fatalf("pre arm matched A in %d/%d samples; the fixture did not drive the intended shape (matcher failure)", got, samples)
+	}
+	if got := postCov.MatchedSamples["A"]; got != 1 {
+		t.Fatalf("post arm matched A in %d/%d samples, want exactly 1; the fixture did not drive the intended shape", got, samples)
+	}
+	if len(postCov.MissedConcernIDs) != 0 {
+		t.Fatalf("A was emitted once, so it is a PARTIAL omission and must not be reported as a whole-arm miss: %v", postCov.MissedConcernIDs)
+	}
+
+	got, err := CompareSeverityArms(pre, post, DefaultCalibrationImprovementThreshold)
+	if err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+	if got.Improved {
+		t.Fatalf("partial-sample omission of concern A was reported as an IMPROVEMENT; the comparison is not omission-monotone across sample aggregation\n%s", got.Render())
+	}
+	if got.Overall > 0 {
+		t.Fatalf("partial-sample omission of concern A raised the delta to %+.4f; no emitted severity differs between the arms, so the delta must be exactly 0\n%s", got.Overall, got.Render())
+	}
+	if got.Overall != 0 {
+		t.Fatalf("delta = %+.4f, want exactly 0\n%s", got.Overall, got.Render())
+	}
+}
+
+// TestRunSeverityArm_PerSampleMissPenaltyIsApplied pins the arithmetic the
+// test above depends on, so a regression that merely SHIFTS the numbers
+// while keeping the delta at zero still goes red.
+func TestRunSeverityArm_PerSampleMissPenaltyIsApplied(t *testing.T) {
+	ctx := context.Background()
+	cases := multiSampleCase()
+	const samples = 4
+
+	aExact := emittedConcernJSON("correctness", "high", noteA)
+	bExact := emittedConcernJSON("efficiency", "high", noteB)
+
+	// A is emitted at distance 0 in ONE of four samples and omitted from the
+	// other three: (0 + 2 + 2 + 2)/4 = 1.5, NOT 0.
+	sender := &fakeCalibrationSender{responses: []string{
+		verdictJSON(aExact, bExact),
+		verdictJSON(bExact),
+		verdictJSON(bExact),
+		verdictJSON(bExact),
+	}}
+	rep, err := RunSeverityArm(ctx, sender, cases, ArmPostCalibration, samples)
+	if err != nil {
+		t.Fatalf("arm: %v", err)
+	}
+	cov := rep.PerCase["astra-multisample"]
+	if got, want := cov.Distances["A"], 1.5; got != want {
+		t.Errorf("A distance = %.4f, want %.4f (one exact sample plus three sample-level miss penalties of %d)", got, want, MaxSeverityTierDistance)
+	}
+	if got, want := cov.Distances["B"], 0.0; got != want {
+		t.Errorf("B distance = %.4f, want %.4f (matched in every sample at distance 0)", got, want)
+	}
+	// A concern missed in EVERY sample lands exactly on the whole-arm
+	// penalty, so the sample-level and concern-level rules agree at the
+	// boundary rather than double-counting.
+	missSender := &fakeCalibrationSender{responses: []string{verdictJSON(bExact)}}
+	missRep, err := RunSeverityArm(ctx, missSender, cases, ArmPostCalibration, samples)
+	if err != nil {
+		t.Fatalf("miss arm: %v", err)
+	}
+	missCov := missRep.PerCase["astra-multisample"]
+	if got, want := missCov.Distances["A"], float64(MaxSeverityTierDistance); got != want {
+		t.Errorf("A missed in every sample: distance = %.4f, want %.4f", got, want)
+	}
+	if len(missCov.MissedConcernIDs) != 1 || missCov.MissedConcernIDs[0] != "A" {
+		t.Errorf("A missed in every sample must still be reported as a whole-arm miss, got %v", missCov.MissedConcernIDs)
+	}
+	if got := penalizedMeanDistance(missCov); got != (float64(MaxSeverityTierDistance)+0)/2 {
+		t.Errorf("penalizedMeanDistance = %.4f, want %.4f", got, (float64(MaxSeverityTierDistance)+0)/2)
+	}
+}

@@ -73,7 +73,10 @@ func validRetentionCase() RetentionCase {
 			Dimensions:        []string{RetentionDeciderDimension, "named_the_mechanism"},
 		},
 		ExpectationNote: "the guard reads a mirror while the mutation writes the source",
-		Synthetic:       true,
+		NonRetainingExamples: []string{
+			"the lookup would read better as a map; also rename memberRole",
+		},
+		Synthetic: true,
 	}
 }
 
@@ -784,5 +787,139 @@ func TestRunRetentionArm_FailsClosed(t *testing.T) {
 				t.Fatalf("a failed arm returned %d partial results; a partial arm is a silently-biased comparison", len(got.Results))
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mode (i): probe breadth is bounded by the fixture's own non-retaining
+// examples, and the committed fixtures stay NON-RETAINING end to end.
+// ---------------------------------------------------------------------------
+
+// TestLoadAdversarialRetentionCorpus_ProbeMatchingANonRetainingExample is
+// mode (i)'s substantive half. A probe that occurs in an ordinary review
+// which did NOT raise the finding short-circuits the judge (RetentionVerdict
+// rule 1) and reports FindingProduced — concealing the very #2119 regression
+// this corpus measures, and doing so in the fail-OPEN direction.
+func TestLoadAdversarialRetentionCorpus_ProbeMatchingANonRetainingExample(t *testing.T) {
+	t.Run("broad probe is refused", func(t *testing.T) {
+		dir := t.TempDir()
+		writeValidRetentionCase(t, dir, "broad-probe", func(c *RetentionCase) {
+			// "forge" is the real defect from the cross-forge fixture: a
+			// single word that occurs in a review complaining only that the
+			// forge parameter is unused.
+			c.FindingProbes = []string{"forge"}
+			c.NonRetainingExamples = []string{"The forge parameter is unused in Register; drop it."}
+		})
+		_, err := LoadAdversarialRetentionCorpus(dir)
+		if err == nil {
+			t.Fatal("a probe matching a declared non-retaining example must not load")
+		}
+		for _, want := range []string{`finding_probe "forge"`, "non_retaining_examples[0]", "NON-RETAINING"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not name %q", err.Error(), want)
+			}
+		}
+	})
+
+	t.Run("empty non_retaining_examples is refused", func(t *testing.T) {
+		dir := t.TempDir()
+		writeValidRetentionCase(t, dir, "no-examples", func(c *RetentionCase) {
+			c.NonRetainingExamples = nil
+		})
+		_, err := LoadAdversarialRetentionCorpus(dir)
+		if err == nil || !strings.Contains(err.Error(), "non_retaining_examples must be non-empty") {
+			t.Fatalf("empty non_retaining_examples must not load, got %v", err)
+		}
+	})
+
+	t.Run("blank non_retaining_example is refused", func(t *testing.T) {
+		dir := t.TempDir()
+		writeValidRetentionCase(t, dir, "blank-example", func(c *RetentionCase) {
+			c.NonRetainingExamples = []string{"   "}
+		})
+		_, err := LoadAdversarialRetentionCorpus(dir)
+		if err == nil || !strings.Contains(err.Error(), "non_retaining_examples[0] must be non-empty") {
+			t.Fatalf("blank non_retaining_examples entry must not load, got %v", err)
+		}
+	})
+}
+
+// TestRetentionCorpus_DeclaredNonRetainingReviewsStayNonRetaining drives every
+// COMMITTED fixture's own declared non-retaining reviews through the COMPLETE
+// probe/judge path — RunRetentionArm, not MatchFindingProbe in isolation —
+// and asserts each lands on FindingAbsent.
+//
+// The judge is seeded to score the decider at the LOW end, which is what a
+// judge reading a genuinely non-retaining review returns. So a probe match is
+// the ONLY way such a review can reach FindingProduced, and this test is the
+// behavioural statement that no committed probe does that. It is the
+// behavioural counterpart to the loader's mode (i): the loader bounds probe
+// breadth at authoring time, this pins the outcome at measurement time.
+func TestRetentionCorpus_DeclaredNonRetainingReviewsStayNonRetaining(t *testing.T) {
+	cases, err := LoadAdversarialRetentionCorpus(adversarialRetentionCorpusDir)
+	if err != nil {
+		t.Fatalf("load corpus: %v", err)
+	}
+	if len(cases) == 0 {
+		t.Fatal("committed corpus is empty")
+	}
+	for _, nc := range cases {
+		if len(nc.Case.NonRetainingExamples) == 0 {
+			t.Fatalf("case %q declares no non-retaining examples", nc.Name)
+		}
+		for i, ex := range nc.Case.NonRetainingExamples {
+			t.Run(fmt.Sprintf("%s/%d", nc.Name, i), func(t *testing.T) {
+				sender := &fakeRetentionSender{responses: []string{
+					fmt.Sprintf(`{"verdict":"changes_requested","concerns":[{"severity":"low","category":"simplification","note":%q}]}`, ex),
+				}}
+				judge := &fakeRetentionJudge{card: RubricCard{Scores: map[string]DimensionScore{
+					RetentionDeciderDimension: {Score: scoreMin, Rationale: "the review does not raise the named finding"},
+				}}}
+				report, err := RunRetentionArm(context.Background(), sender, judge, []NamedRetentionCase{nc}, ArmPostCalibration)
+				if err != nil {
+					t.Fatalf("run arm: %v", err)
+				}
+				if len(report.Results) != 1 {
+					t.Fatalf("want exactly one result, got %d", len(report.Results))
+				}
+				got := report.Results[0]
+				if got.State == FindingProduced {
+					t.Fatalf("a review this fixture DECLARES non-retaining was reported as %s; a probe matched it and short-circuited the judge.\nreview: %s\nbasis: %s",
+						got.State, ex, got.Basis)
+				}
+				if got.State != FindingAbsent {
+					t.Fatalf("state = %s, want %s (the judge scored the decider at the floor, so the verdict must be decided, not %s)\nbasis: %s",
+						got.State, FindingAbsent, got.State, got.Basis)
+				}
+				if judge.calls != 1 {
+					t.Errorf("the judge must have been consulted exactly once (no probe may match), got %d calls", judge.calls)
+				}
+			})
+		}
+	}
+}
+
+// TestRetentionCorpus_ProbesStillMatchARetainingReview is the other half of
+// the pair: narrowing the probes must not have narrowed them into
+// uselessness. Each committed fixture's COMPLIANT behaviour statement — the
+// fixture's own description of a review that DID raise the finding — must
+// still match at least one probe.
+//
+// Without this, mode (i) could be satisfied by deleting every probe.
+func TestRetentionCorpus_ProbesStillMatchARetainingReview(t *testing.T) {
+	cases, err := LoadAdversarialRetentionCorpus(adversarialRetentionCorpusDir)
+	if err != nil {
+		t.Fatalf("load corpus: %v", err)
+	}
+	for _, nc := range cases {
+		if len(nc.Case.FindingProbes) == 0 {
+			t.Errorf("case %q declares no probes", nc.Name)
+			continue
+		}
+		compliant := nc.Case.BehavioralRubric.CompliantBehavior
+		if _, matched := MatchFindingProbe(nc.Case, []string{compliant}); !matched {
+			t.Errorf("case %q: no probe matches its own compliant_behavior statement, so the probe set can no longer recognise a retaining review:\n%s\nprobes: %v",
+				nc.Name, compliant, nc.Case.FindingProbes)
+		}
 	}
 }

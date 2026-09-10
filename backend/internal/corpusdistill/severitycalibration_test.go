@@ -482,12 +482,104 @@ func TestDistillSeverityCalibration_ProvenanceDoesNotClaimRedaction(t *testing.T
 		if err != nil {
 			t.Fatalf("preview (fetched=%v): %v", fetched, err)
 		}
-		if strings.Contains(strings.ToLower(res.CaseMD), "redact") &&
-			!strings.Contains(res.CaseMD, "redact by hand") {
-			t.Errorf("fetched=%v: case.md makes a redaction claim: %s", fetched, res.CaseMD)
+		// DIRECT, not a compound: every case.md carries the
+		// calibrationFreeTextWarning, whose closing line is "redact by
+		// hand", so a `contains("redact") && !contains("redact by hand")`
+		// condition short-circuits to false on EVERY input and can never
+		// fire — a provenance block that reintroduced a redaction CLAIM
+		// would pass it. Assert the absence of the claim phrases instead.
+		for _, claim := range []string{
+			"redacted-by-construction",
+			"redacted by construction",
+			"has been redacted",
+			"is redacted",
+			"automatically redacted",
+		} {
+			if strings.Contains(strings.ToLower(res.CaseMD), claim) {
+				t.Errorf("fetched=%v: case.md makes the redaction claim %q; both source paths carry free-text prose and neither is redacted:\n%s", fetched, claim, res.CaseMD)
+			}
+		}
+		if !strings.Contains(res.CaseMD, "redact by hand") {
+			t.Errorf("fetched=%v: case.md must keep the point-of-use instruction to redact by hand", fetched)
 		}
 		if !strings.Contains(res.CaseMD, "free text") && !strings.Contains(res.CaseMD, "FREE TEXT") {
 			t.Errorf("fetched=%v: case.md must state the free-text posture", fetched)
 		}
+	}
+}
+
+// TestDistillSeverityCalibration_ChronologicallyImpossibleJoinRefused pins
+// the chronology half of the join, which sequence ORDERING alone does not
+// give: sorting ascending guarantees the catalogue is COMPLETE before the
+// first disposition consumes from it, and completeness is exactly what lets
+// a disposition at sequence 20 reach FORWARD and consume the sole
+// (severity, category) match at sequence 30.
+//
+// A review recorded after the disposition cannot have originated it, so the
+// prose attributed to that concern_id would be a later, unrelated reviewer's
+// — silently corrupting a LABELLED corpus.
+//
+// Reachable on the --in / stdin path, where the caller hands over an
+// arbitrary slice of a run's audit chain: a window that starts after the
+// originating review but catches a later one produces exactly this input.
+// It is driven through the WRITER, not only the preview, and the writer must
+// leave NOTHING on disk.
+func TestDistillSeverityCalibration_ChronologicallyImpossibleJoinRefused(t *testing.T) {
+	items := []CalibrationAuditItem{
+		// The disposition comes FIRST. The only (high, correctness) review
+		// concern in the window is recorded AFTER it.
+		dispositionItem(t, 20, "run-1", categoryConcernWaived, "c-1", "high", "correctness", "sibling code already does this"),
+		reviewItem(t, 30, "run-1", "claude-fable-5",
+			[3]string{"high", "correctness", "a LATER reviewer's prose about something else entirely"}),
+	}
+	opts := calibrationOpts(t)
+
+	_, err := PreviewSeverityCalibration(items, opts)
+	if err == nil {
+		t.Fatal("a disposition at sequence 20 must not consume a review concern at sequence 30")
+	}
+	for _, want := range []string{"chronologically impossible", "sequence 20", "LATER sequences", "[30]", "c-1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err.Error(), want)
+		}
+	}
+
+	dir, werr := DistillSeverityCalibration(items, opts)
+	if werr == nil {
+		t.Fatalf("the writer must refuse too, got dir %q", dir)
+	}
+	if !strings.Contains(werr.Error(), "chronologically impossible") {
+		t.Errorf("writer error %q does not name the chronology mode", werr.Error())
+	}
+	if _, statErr := os.Stat(filepath.Join(opts.OutDir, opts.CaseName)); !os.IsNotExist(statErr) {
+		t.Errorf("the refused write must leave nothing on disk, stat = %v", statErr)
+	}
+}
+
+// TestDistillSeverityCalibration_ChronologyGuardAdmitsTheOrdinaryCase is the
+// other direction: the guard must not refuse the shape
+// FetchRunConcernDispositions actually produces, where every disposition is
+// preceded by the review that originated it — including a review and its
+// disposition at ADJACENT sequences, and a second review interleaved between
+// two dispositions.
+func TestDistillSeverityCalibration_ChronologyGuardAdmitsTheOrdinaryCase(t *testing.T) {
+	items := []CalibrationAuditItem{
+		reviewItem(t, 10, "run-1", "claude-fable-5",
+			[3]string{"high", "correctness", "unbounded read in the mirror path"}),
+		dispositionItem(t, 11, "run-1", categoryConcernWaived, "c-1", "high", "correctness", "sibling code already does this"),
+		reviewItem(t, 12, "run-1", "gpt-6-astra",
+			[3]string{"medium", "test-coverage", "no counterfactual for the new guard"}),
+		dispositionItem(t, 13, "run-1", categoryConcernDeferred, "c-2", "medium", "test-coverage", "filed as #9999"),
+	}
+	res, err := PreviewSeverityCalibration(items, calibrationOpts(t))
+	if err != nil {
+		t.Fatalf("the ordinary review-then-disposition shape must join: %v", err)
+	}
+	if len(res.Case.Concerns) != 2 {
+		t.Fatalf("want 2 joined concerns, got %d", len(res.Case.Concerns))
+	}
+	if res.Case.Concerns[0].Note != "unbounded read in the mirror path" ||
+		res.Case.Concerns[1].Note != "no counterfactual for the new guard" {
+		t.Errorf("notes attributed to the wrong concerns: %+v", res.Case.Concerns)
 	}
 }

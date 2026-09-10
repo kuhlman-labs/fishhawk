@@ -567,12 +567,34 @@ type ArmCoverage struct {
 	// LabelledConcernIDs is the FULL labelled population for this case, in
 	// corpus order. It is the denominator — see CompareSeverityArms.
 	LabelledConcernIDs []string
-	// Distances maps a labelled concern_id to this arm's mean tier distance
-	// from the operator's label, over the samples in which it was matched.
-	// A concern absent from this map was MISSED in every sample.
+	// Distances maps a labelled concern_id to this arm's PENALIZED mean tier
+	// distance from the operator's label, taken over ALL Samples — not over
+	// the samples in which the concern happened to be matched.
+	//
+	// OMISSION-MONOTONE ACROSS SAMPLE AGGREGATION, and this is where that
+	// property is established: a sample in which the concern was NOT emitted
+	// contributes MaxSeverityTierDistance, exactly as a whole-arm miss does
+	// in penalizedMeanDistance. The denominator is Samples and is therefore
+	// identical in both arms and independent of what either arm emitted.
+	//
+	// Averaging over the MATCHED samples only (the earlier shape) is not
+	// omission-monotone at the sample level: with five samples, distances
+	// [2,2,2,2,0] average to 1.6, while an arm that omitted the first four
+	// occurrences and retained only the distance-0 one averages to 0 — an
+	// improvement produced entirely by partial omission, with no emitted
+	// severity having changed. penalizedMeanDistance cannot see that,
+	// because it penalizes only a concern missed in EVERY sample.
+	//
+	// Every labelled concern_id has an entry, including one missed in every
+	// sample (whose value is exactly MaxSeverityTierDistance).
 	Distances map[string]float64
-	// MissedConcernIDs are labelled concerns this arm never emitted, in
-	// corpus order.
+	// MatchedSamples maps a labelled concern_id to the number of samples in
+	// which this arm emitted it, out of Samples. Reported so a PARTIAL
+	// omission — the shape that is scored but not visible in a mean — is
+	// legible to the operator rather than folded away.
+	MatchedSamples map[string]int
+	// MissedConcernIDs are labelled concerns this arm never emitted in ANY
+	// sample, in corpus order.
 	MissedConcernIDs []string
 	// UnmatchedEmitted counts emitted concerns that matched no labelled
 	// concern, summed over samples. Reported, never scored: a novel finding
@@ -619,7 +641,10 @@ func RunSeverityArm(ctx context.Context, sender MessageSender, cases []NamedSeve
 		if err != nil {
 			return SeverityArmReport{}, err
 		}
-		cov := ArmCoverage{Distances: make(map[string]float64, len(nc.Case.Concerns))}
+		cov := ArmCoverage{
+			Distances:      make(map[string]float64, len(nc.Case.Concerns)),
+			MatchedSamples: make(map[string]int, len(nc.Case.Concerns)),
+		}
 		for _, lc := range nc.Case.Concerns {
 			cov.LabelledConcernIDs = append(cov.LabelledConcernIDs, lc.ConcernID)
 		}
@@ -653,12 +678,20 @@ func RunSeverityArm(ctx context.Context, sender MessageSender, cases []NamedSeve
 			}
 		}
 
+		// PENALIZE PER SAMPLE, not per concern. Each of the `samples - n`
+		// samples in which the concern was not emitted contributes
+		// MaxSeverityTierDistance, so the denominator is `samples` in both
+		// arms and omitting an occurrence can only ever raise this concern's
+		// distance. See ArmCoverage.Distances for the counterexample this
+		// closes.
 		for _, id := range cov.LabelledConcernIDs {
-			if matchedSamples[id] == 0 {
+			n := matchedSamples[id]
+			cov.MatchedSamples[id] = n
+			if n == 0 {
 				cov.MissedConcernIDs = append(cov.MissedConcernIDs, id)
-				continue
 			}
-			cov.Distances[id] = distanceSum[id] / float64(matchedSamples[id])
+			missedSamples := float64(samples - n)
+			cov.Distances[id] = (distanceSum[id] + MaxSeverityTierDistance*missedSamples) / float64(samples)
 		}
 		report.PerCase[nc.Name] = cov
 	}
@@ -793,6 +826,17 @@ type SeverityComparison struct {
 // measured distance with a miss never lowers the sum. An arm cannot improve
 // its score, or its delta against the other arm, by omitting anything.
 //
+// THE PROPERTY HOLDS AT BOTH LEVELS, and needs to: at the multi-sample
+// configuration the live arm actually runs (DefaultCalibrationSamples = 5),
+// a concern can be omitted from SOME samples without being missed outright.
+// RunSeverityArm therefore applies the SAME MaxSeverityTierDistance penalty
+// per unmatched SAMPLE, over a denominator of `samples`, before this
+// function ever sees the value. Without that, distances [2,2,2,2,0] would
+// average to 1.6 while an arm omitting the first four occurrences averaged
+// to 0 — a partial omission reported as an improvement, which the
+// concern-level penalty here cannot detect because the concern was matched
+// at least once.
+//
 // WHY NOT PAIRWISE-COMPLETE (excluding a concern from BOTH arms whenever
 // EITHER missed it): it is not omission-monotone. Two labelled concerns A
 // and B with pre/post distances 1/2 and 2/1 score 1.5 against 1.5 — delta
@@ -862,13 +906,22 @@ func CompareSeverityArms(pre, post SeverityArmReport, threshold float64) (Severi
 	return out, nil
 }
 
-// penalizedMeanDistance is the OMISSION-MONOTONE score: the mean tier
-// distance over the FULL labelled population, with a missed concern scored
-// at MaxSeverityTierDistance rather than dropped.
+// penalizedMeanDistance is the CONCERN-LEVEL half of the omission-monotone
+// score: the mean tier distance over the FULL labelled population, with a
+// concern absent from Distances scored at MaxSeverityTierDistance rather
+// than dropped.
 //
 // Dropping misses instead (a mean over each arm's own matched set) is
 // exactly the defect this function exists to prevent — see
 // CompareSeverityArms.
+//
+// The SAMPLE-LEVEL half lives in RunSeverityArm, which already folds a
+// per-sample miss penalty into each Distances value, so an arm produced by
+// RunSeverityArm carries an entry for every labelled id and never reaches
+// the fallback below. The fallback remains because a coverage may be
+// constructed directly (a test seeds one by hand, a future caller may),
+// and a missing entry must score as a miss rather than silently drop the
+// concern out of the denominator.
 func penalizedMeanDistance(c ArmCoverage) float64 {
 	total := 0.0
 	for _, id := range c.LabelledConcernIDs {
@@ -890,7 +943,8 @@ func (s SeverityComparison) Render() string {
 	b.WriteString("severity calibration: pre-#2119 vs post-#2119\n")
 	b.WriteString("score = mean tier distance from the operator label over the FULL labelled population;\n")
 	fmt.Fprintf(&b, "a MISSED labelled concern is penalized at the maximum distance (%d), never dropped,\n", MaxSeverityTierDistance)
-	b.WriteString("so omitting a concern can never improve an arm's score. positive delta = post arm is closer.\n\n")
+	fmt.Fprintf(&b, "and so is each individual SAMPLE in which a concern was not emitted, so neither a whole\n")
+	b.WriteString("omission nor a partial one can improve an arm's score. positive delta = post arm is closer.\n\n")
 	for _, c := range s.PerCase {
 		if !c.Scored {
 			fmt.Fprintf(&b, "  %-40s SKIPPED (%s)\n", c.Case, c.SkipReason)

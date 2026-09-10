@@ -107,14 +107,22 @@ sits CLOSER to the operator's label. Read it beside the coverage columns:
 the score penalizes a MISSED labelled concern at the maximum tier distance
 (`MaxSeverityTierDistance`), which is what makes the comparison
 omission-monotone — an arm can never improve its score by omitting a
-labelled concern. The cost of that choice is that a delta computed mostly
-from penalties measures **coverage, not calibration**, so check
-`pre_missed` / `post_missed` per case before believing a number. The penalty
+labelled concern. The SAME penalty applies per SAMPLE: each concern's
+distance is averaged over all `--samples`, charging the maximum distance for
+every sample that did not emit it, so a PARTIAL omission (a concern dropped
+from four samples of five) cannot manufacture an improvement either. The
+cost of that choice is that a delta computed mostly from penalties measures
+**coverage, not calibration**, so check `pre_missed` / `post_missed` and the
+per-concern matched-sample counts per case before believing a number. The penalty
 value and the improvement threshold are both JUDGEMENT CALLS, not measured
 values; they are parameters, not hardcoded gates.
 
 **Retention.** `indeterminate is NOT a pass` — the report says so in its
-header and counts the three states separately. A case REGRESSED means the
+header and counts the three states separately. A `produced` verdict reached
+by a PROBE match short-circuits the judge, so probe breadth is bounded at
+LOAD time: each fixture declares `non_retaining_examples` and the loader
+refuses any probe that matches one (mode (i)). If you add a fixture or widen
+a probe, that refusal is the gate you will meet. A case REGRESSED means the
 finding was produced in the PRE arm and absent in the POST arm. That is
 done-means 3's loss condition and the outcome that would argue for
 reverting or narrowing #2119's wording.

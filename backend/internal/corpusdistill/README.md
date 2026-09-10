@@ -37,7 +37,9 @@ Verified in the tree rather than taken on report:
 - The `implement_reviewed` payload does **NOT** carry a `concern_id`. `planreview.Concern` is `{severity, category, note, suggested_patch, provenance}` — the concern-store UUID is assigned when the verdict is PERSISTED, and no audit category records that assignment (there is no `concern_recorded` category). So "join the review concerns to the dispositions BY `concern_id`" is not implementable as stated: the review side has no such key.
 - `concern_addressed_by_condition` carries neither `severity` nor `category` (`server/condition_claims.go`): its payload is `{concern_id, prior_state, approval_sequence, approver_subject, confirming_review_sequence, reviewer_model, verdict, confirming_review_qualified}`.
 
-So the join actually implemented is: **the disposition entries are the spine** — they supply `concern_id`, the disposition and the disposition reason — and **the `implement_reviewed` concerns are a NOTE CATALOGUE matched ONE-TO-ONE by `(severity, category)`**, consumed in ascending sequence order.
+So the join actually implemented is: **the disposition entries are the spine** — they supply `concern_id`, the disposition and the disposition reason — and **the `implement_reviewed` concerns are a NOTE CATALOGUE matched ONE-TO-ONE by `(severity, category)` AND BY CHRONOLOGY**, consumed in ascending sequence order.
+
+**Chronology is a second key, not a consequence of the ordering.** Sorting ascending guarantees the catalogue is COMPLETE before the first disposition consumes from it — and completeness is exactly what lets a disposition at sequence 20 reach FORWARD and consume the sole `(severity, category)` match at sequence 30. A review recorded AFTER a disposition cannot have originated it, so a catalogue entry whose sequence exceeds the disposition's is not a candidate. On the `--from-run` path a disposition is always preceded by its review, so this refuses nothing that path produces; it bites on `--in` / stdin, where the caller hands over an arbitrary slice of a run's audit chain and a truncated window can leave a disposition with only a later review to match against.
 
 ### Fail-loud modes
 
@@ -48,6 +50,7 @@ Mirroring `DistillPlanReviewMiss`, and each asserted by a test that reads the OU
 | undecodable payload | error naming the item's `sequence`; nothing written |
 | disposition with no `concern_id` | error; the disposition cannot be attributed |
 | **orphan** — no unconsumed catalogue concern matches `(severity, category)` | error naming the `concern_id`; nothing written |
+| **chronologically impossible** — the only unconsumed `(severity, category)` matches are at LATER sequences than the disposition | error naming the disposition's sequence, the `concern_id` and the later sequences, pointing at widening the audit window; nothing written |
 | **ambiguous** — MORE THAN ONE unconsumed catalogue concern matches | error naming the `concern_id` and the count; nothing written |
 | zero joined concerns | error, never an empty success |
 | existing case dir without `--force` | refusal |

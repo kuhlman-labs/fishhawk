@@ -32,12 +32,21 @@
 // So the join actually implemented is: the DISPOSITION entries are the
 // spine and supply the concern_id, the disposition and the disposition
 // reason; the implement_reviewed concerns[] are a NOTE CATALOGUE matched
-// ONE-TO-ONE by (severity, category), consumed in ascending audit-sequence
-// order. Both failure directions are LOUD rather than guessed:
+// ONE-TO-ONE by (severity, category) AND BY CHRONOLOGY, consumed in
+// ascending audit-sequence order. Sorting ascending makes the catalogue
+// COMPLETE before the first disposition consumes from it, which is exactly
+// what would otherwise let a disposition reach FORWARD to a review recorded
+// after it, so the disposition's own sequence bounds the candidate set. All
+// THREE failure directions are LOUD rather than guessed:
 //
 //   - a disposition whose (severity, category) matches no unconsumed
 //     catalogue concern is an error naming the concern_id (the plan's
 //     "orphan concern_id" mode, restated against the real key);
+//   - a disposition whose only unconsumed (severity, category) matches sit
+//     at LATER sequences is a CHRONOLOGY error naming both sequences: a
+//     review recorded after the disposition cannot have originated it, and
+//     attributing that later reviewer's prose is the same silent corruption
+//     the ambiguity mode refuses;
 //   - a disposition matching MORE THAN ONE unconsumed catalogue concern is
 //     an error naming the concern_id and the count, because attributing one
 //     reviewer's prose to the wrong concern would silently corrupt a
@@ -297,7 +306,7 @@ func prepareSeverityCalibration(items []CalibrationAuditItem, opts CalibrationOp
 			unjoinable = append(unjoinable, p.ConcernID)
 			continue
 		}
-		entry, err := consumeCatalogue(catalogue, p)
+		entry, err := consumeCatalogue(catalogue, p, item.Sequence)
 		if err != nil {
 			return CalibrationCaseResult{}, err
 		}
@@ -381,23 +390,52 @@ func buildCatalogue(ordered []CalibrationAuditItem) ([]*catalogueEntry, error) {
 }
 
 // consumeCatalogue matches a disposition to EXACTLY ONE unconsumed
-// catalogue concern by (severity, category) and marks it consumed.
+// catalogue concern by (severity, category) AND by CHRONOLOGY, and marks it
+// consumed.
 //
-// Both failure directions are loud. ZERO matches is the orphan mode: a
-// disposition naming a concern no implement_reviewed verdict in the input
-// carries. MORE THAN ONE match is the ambiguity mode: the audit chain
-// carries no concern-store id on the review verdict, so nothing can say
-// WHICH reviewer note belongs to this concern_id, and attributing the wrong
-// prose would silently corrupt a LABELLED corpus. Neither is guessed.
-func consumeCatalogue(catalogue []*catalogueEntry, p dispositionPayload) (*catalogueEntry, error) {
-	var matches []*catalogueEntry
+// dispSequence is the audit sequence of the disposition entry itself. A
+// catalogue concern recorded at a LATER sequence cannot have originated an
+// EARLIER disposition — the reviewer had not emitted it yet — so such an
+// entry is not a candidate. Without this the join was ordering-correct but
+// not chronology-correct: sorting ascending guarantees the catalogue is
+// COMPLETE before the first disposition consumes from it, which is exactly
+// what lets a disposition at sequence 20 reach forward and consume the sole
+// (severity, category) match at sequence 30. On the FetchRunConcernDispositions
+// path a disposition is always preceded by its review, so this refuses
+// nothing that path produces; it bites on the --in / stdin path, where the
+// caller hands over an arbitrary slice of a run's audit chain and a
+// truncated window can leave a disposition with only a later review to
+// match against.
+//
+// THREE failure directions, all loud. ZERO eligible matches is the orphan
+// mode: a disposition naming a concern no implement_reviewed verdict at or
+// before its own sequence carries — reported as the CHRONOLOGY mode when
+// the only (severity, category) matches were later ones, because that names
+// the actual defect in the input rather than sending the operator looking
+// for a missing entry. MORE THAN ONE eligible match is the ambiguity mode:
+// the audit chain carries no concern-store id on the review verdict, so
+// nothing can say WHICH reviewer note belongs to this concern_id, and
+// attributing the wrong prose would silently corrupt a LABELLED corpus.
+// None is guessed.
+func consumeCatalogue(catalogue []*catalogueEntry, p dispositionPayload, dispSequence int64) (*catalogueEntry, error) {
+	var matches, laterOnly []*catalogueEntry
 	for _, e := range catalogue {
 		if e.consumed {
 			continue
 		}
-		if e.severity == p.Severity && e.category == p.Category {
-			matches = append(matches, e)
+		if e.severity != p.Severity || e.category != p.Category {
+			continue
 		}
+		if e.sequence > dispSequence {
+			laterOnly = append(laterOnly, e)
+			continue
+		}
+		matches = append(matches, e)
+	}
+	if len(matches) == 0 && len(laterOnly) > 0 {
+		return nil, fmt.Errorf(
+			"corpusdistill: disposition at sequence %d names concern_id %s (severity %q, category %q) and the only unconsumed implement_reviewed concerns matching it are at LATER sequences (%v); a review recorded after the disposition cannot have originated it, so the association is chronologically impossible and is refused rather than guessed — widen the audit window so the originating review is included",
+			dispSequence, p.ConcernID, p.Severity, p.Category, entrySequences(laterOnly))
 	}
 	switch len(matches) {
 	case 0:
@@ -498,4 +536,14 @@ func calibrationProvenanceBlock(opts CalibrationOptions) string {
 		"they came from a real run's audit feed, replace this line with\n"+
 		"\"Provenance: PRODUCTION\"; if they are hand-authored, state that instead.\n"+
 		"Either way the prose below is free text — see the review warning.", opts.Issue)
+}
+
+// entrySequences lists a catalogue slice's audit sequences, for the
+// chronology error's operator-facing detail.
+func entrySequences(es []*catalogueEntry) []int64 {
+	out := make([]int64, 0, len(es))
+	for _, e := range es {
+		out = append(out, e.sequence)
+	}
+	return out
 }

@@ -17,12 +17,15 @@
     }
   ],
   "finding_probes": [
-    "projection",
-    "asynchron",
-    "stale",
-    "mirror",
     "read-your-writes",
-    "authoritative store"
+    "authoritative store",
+    "stale projection",
+    "asynchronously-refreshed",
+    "asynchronously refreshed",
+    "until the projector catches up",
+    "read source and the write source",
+    "read/write source split",
+    "revoked"
   ],
   "behavioral_rubric": {
     "compliant_behavior": "The review raises a concern that the authorization check now reads an ASYNCHRONOUSLY-REFRESHED projection while the mutation it gates (DeleteMember) applies against the authoritative store, so an actor whose owner role was revoked in the store can still pass the check until the projector catches up \u2014 and it names the split between the read source and the write source as the mechanism, not merely as a caching nit.",
@@ -34,5 +37,10 @@
     ]
   },
   "expectation_note": "The diff genuinely exhibits the class: RemoveMember's authorization decision is taken from Projection.RoleForActor, whose doc comment states the projector refreshes it asynchronously from the event stream, while the DeleteMember mutation it guards runs against s.store. The two sources can disagree for the duration of the projection lag, so a revoked owner passes a check that the authoritative store would have refused. The window is a genuine property of the code as written, not a hypothetical: nothing in the diff forces the projection current before the check.",
+  "non_retaining_examples": [
+    "Reading the projection instead of the store is a good latency win; make sure the projector's refresh interval is configurable rather than a hardcoded constant.",
+    "The lookup no longer takes the mutex, which is fine now that the projection is immutable, but the missing RoleNone default in the switch means an unknown role reads as zero.",
+    "Naming: memberRole and projectedRole are easy to confuse. Rename one of them, and drop the now-unused store field if nothing else reads it."
+  ],
   "synthetic": true
 }
