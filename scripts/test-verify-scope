@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+# scripts/test-verify-scope — hermetic harness for scripts/test's SCOPED verify
+# form and its per-repository verify lock (#3315).
+#
+# Two controls are pinned here:
+#
+#   A. `scripts/test verify --packages <repo/rel/pkg,...>` (and the
+#      FISHHAWK_VERIFY_PACKAGES env fallback): the `go test -race` loop is
+#      restricted to the listed packages in the modules that own them, every
+#      other module is SKIPPED, the patch-coverage gate is bypassed with a
+#      printed reason, and every non-test leg (lint, the doc-line budget,
+#      schema-sync, the gate harnesses, both site gates) is UNCHANGED. Both
+#      widening fail-safes — an unknown package, an undecodable one — fall back
+#      to the full unscoped loop rather than testing less than was asked for.
+#
+#   B. The verify lock at <git-common-dir>/fishhawk-verify.lock: a SHELL-kind
+#      invocation meeting any live holder refuses immediately without polling; a
+#      RUNNER-kind one waits, bounded, and only on expiry displaces a live SHELL
+#      holder, never a live RUNNER holder; dead holders are pruned under an
+#      exclusive prune marker so two pruners cannot both proceed; and three
+#      distinct conditions degrade to no locking at all.
+#
+# Hermetic: temp-dir git fixtures with stubbed `go`, `golangci-lint`, `sleep` and
+# `docker` on PATH. No network, no real Docker, no real Go toolchain. Bash (no
+# zsh guard needed). Wired into scripts/test's _verify_gate_harnesses, so a
+# regression fails verify in-loop rather than only when a human runs this.
+#
+# ALSO ships `--fixture <dir>`: build the standard fixture into <dir> and exit,
+# so the runner's Go cross-boundary test (slice 2) drives the REAL scripts/test
+# against ONE fixture definition instead of duplicating it. The manifest printed
+# on stdout names every path that test needs.
+set -o pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REAL_SLEEP="$(command -v sleep)"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+assert_contains() { # <desc> <file> <needle>
+  if grep -qF -- "$3" "$2" 2>/dev/null; then pass "$1"; else
+    fail "$1 (expected '$3' in $2)"
+    sed -n '1,40p' "$2" 2>/dev/null | sed 's/^/    | /'
+  fi
+}
+assert_not_contains() { # <desc> <file> <needle>
+  if grep -qF -- "$3" "$2" 2>/dev/null; then
+    fail "$1 (unexpected '$3' in $2)"
+    sed -n '1,40p' "$2" 2>/dev/null | sed 's/^/    | /'
+  else pass "$1"; fi
+}
+assert_eq() { # <desc> <expected> <actual>
+  if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (expected '$2', got '$3')"; fi
+}
+assert_ne() { # <desc> <not-expected> <actual>
+  if [ "$2" != "$3" ]; then pass "$1"; else fail "$1 (expected NOT '$2')"; fi
+}
+
+# --------------------------------------------------------------------------
+# The standard fixture.
+#
+# <dir>/scripts/test          a copy of the REPO's real scripts/test
+# <dir>/scripts/*             no-op recording stubs for every sub-gate verify runs
+# <dir>/bin/{go,golangci-lint,sleep,docker}  recording stubs; prepend to PATH
+# <dir>/go.work + modules.json  two modules: ./backend and ./cli
+# <dir>/logs/go.log           one `<reldir>\t<argv>` line per `go test`
+# <dir>/logs/lint.log         one line per golangci-lint run
+# <dir>/logs/gate.log         one line per sub-gate script that ran
+# <dir>/logs/cov.log          one line per check-coverage.py invocation
+# <dir>/logs/sleep.log        one line per `sleep`
+# --------------------------------------------------------------------------
+build_fixture() {
+  local dir="$1"
+  mkdir -p "$dir/scripts" "$dir/bin" "$dir/logs" \
+    "$dir/backend/internal/alpha" "$dir/backend/internal/beta" \
+    "$dir/cli/internal/gamma" "$dir/docs"
+
+  cp "$REPO_ROOT/scripts/test" "$dir/scripts/test"
+  chmod +x "$dir/scripts/test"
+
+  cat > "$dir/modules.json" <<'EOF'
+{"Use":[{"DiskPath":"./backend"},{"DiskPath":"./cli"}]}
+EOF
+  # Rotated list for the "module list changed between bucketing and the loop"
+  # fail-closed case: neither module matches the buckets built from the first.
+  cat > "$dir/modules2.json" <<'EOF'
+{"Use":[{"DiskPath":"./other"}]}
+EOF
+
+  printf 'go 1.25\n\nuse ./backend\nuse ./cli\n' > "$dir/go.work"
+  printf 'module example.com/backend\n\ngo 1.25\n' > "$dir/backend/go.mod"
+  printf 'module example.com/cli\n\ngo 1.25\n' > "$dir/cli/go.mod"
+  printf 'package beta\n' > "$dir/backend/internal/beta/b.go"
+  printf 'package gamma\n' > "$dir/cli/internal/gamma/g.go"
+  printf '# ARCHITECTURE\n\nshort line\n' > "$dir/docs/ARCHITECTURE.md"
+
+  # --- go stub -----------------------------------------------------------
+  cat > "$dir/bin/go" <<EOF
+#!/usr/bin/env bash
+FX="$dir"
+if [ "\$1" = "work" ]; then
+  n=\$(cat "\$FX/logs/modcount" 2>/dev/null || echo 0)
+  n=\$((n + 1)); printf '%s' "\$n" > "\$FX/logs/modcount"
+  if [ -n "\${FIXTURE_MODULES_ROTATE_AT:-}" ] && [ "\$n" -ge "\${FIXTURE_MODULES_ROTATE_AT}" ]; then
+    cat "\$FX/modules2.json"
+  else
+    cat "\$FX/modules.json"
+  fi
+  exit 0
+fi
+if [ "\$1" = "test" ]; then
+  printf '%s\t%s\n' "\$(basename "\$PWD")" "\$*" >> "\$FX/logs/go.log"
+  exit 0
+fi
+exit 0
+EOF
+
+  # --- golangci-lint stub -------------------------------------------------
+  cat > "$dir/bin/golangci-lint" <<EOF
+#!/usr/bin/env bash
+FX="$dir"
+printf '%s\t%s\n' "\$(basename "\$PWD")" "\$*" >> "\$FX/logs/lint.log"
+exit 0
+EOF
+
+  # --- sleep stub ---------------------------------------------------------
+  # Records every call, so a refusal's promptness is asserted STRUCTURALLY (zero
+  # recorded sleeps) rather than by elapsed time. When FIXTURE_SLEEP_RELEASE
+  # names a lock symlink it removes it, which is how "the holder releases inside
+  # the budget" is driven deterministically without ever really waiting.
+  cat > "$dir/bin/sleep" <<EOF
+#!/usr/bin/env bash
+FX="$dir"
+printf '%s\n' "\$*" >> "\$FX/logs/sleep.log"
+if [ -n "\${FIXTURE_SLEEP_RELEASE:-}" ] && [ -L "\${FIXTURE_SLEEP_RELEASE}" ]; then
+  rm -f "\${FIXTURE_SLEEP_RELEASE}"
+fi
+exit 0
+EOF
+
+  # --- docker stub --------------------------------------------------------
+  # A no-op docker keeps the container lease's EXIT trap from touching the
+  # operator's REAL shared fishhawk-test-postgres container.
+  cat > "$dir/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+  # --- sub-gate stubs -----------------------------------------------------
+  local g
+  for g in sync-schemas check-site-voice check-site-ia \
+           test-check-coverage test-patch-coverage test-container-lease \
+           test-dev test-site-voice test-site-ia test-helm-render \
+           test-site-reference test-verify-scope; do
+    cat > "$dir/scripts/$g" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "$g" >> "$dir/logs/gate.log"
+exit 0
+EOF
+    chmod +x "$dir/scripts/$g"
+  done
+
+  # --- check-coverage.py stub --------------------------------------------
+  cat > "$dir/scripts/check-coverage.py" <<EOF
+#!/usr/bin/env python3
+import sys
+argv = sys.argv[1:]
+with open("$dir/logs/cov.log", "a") as fh:
+    fh.write(" ".join(argv) + "\n")
+if "--emit-changed-snapshot" in argv:
+    path = argv[argv.index("--emit-changed-snapshot") + 1]
+    with open(path, "w") as fh:
+        fh.write('{"changed": {"backend/internal/alpha/a.go": [1]}}')
+sys.exit(0)
+EOF
+
+  chmod +x "$dir/bin/go" "$dir/bin/golangci-lint" "$dir/bin/sleep" "$dir/bin/docker"
+
+  # --- git repo -----------------------------------------------------------
+  # main is committed; backend/internal/alpha/a.go is left UNTRACKED so the
+  # unscoped patch-coverage path has exactly one changed module (backend).
+  (
+    cd "$dir" || exit 1
+    git init -q -b main . >/dev/null 2>&1
+    git config user.email "harness@example.com"
+    git config user.name "harness"
+    git config commit.gpgsign false
+    git add -A >/dev/null 2>&1
+    git commit -q -m "fixture base" >/dev/null 2>&1
+  )
+  printf 'package alpha\n\nfunc A() int { return 1 }\n' > "$dir/backend/internal/alpha/a.go"
+
+  # Pre-create every log so a consumer (slice 2's Go test) can read them without
+  # first having to run something that creates them.
+  : > "$dir/logs/go.log"; : > "$dir/logs/lint.log"; : > "$dir/logs/gate.log"
+  : > "$dir/logs/cov.log"; : > "$dir/logs/sleep.log"
+}
+
+reset_logs() {
+  local dir="$1"
+  rm -f "$dir/logs/go.log" "$dir/logs/lint.log" "$dir/logs/gate.log" \
+        "$dir/logs/cov.log" "$dir/logs/sleep.log" "$dir/logs/modcount" \
+        "$dir/logs/stdout.log" "$dir/logs/stderr.log"
+  : > "$dir/logs/go.log"; : > "$dir/logs/lint.log"; : > "$dir/logs/gate.log"
+  : > "$dir/logs/cov.log"; : > "$dir/logs/sleep.log"
+  : > "$dir/logs/stdout.log"; : > "$dir/logs/stderr.log"
+  rm -rf "$dir/leases" "$dir/leases.lock" "$dir/leases.snapshot" 2>/dev/null
+  # Deliberately does NOT touch the verify lock: the B cases SEED a holder before
+  # calling run_verify, and clearing it here would silently defeat every one of
+  # them (the lock cases would test an uncontended acquire and still go green).
+}
+
+# run_verify <fixture> [verify args...] — the end-to-end driver. Extra env for a
+# case goes in the RV_ENV array (reset by the caller). Returns verify's exit code.
+RV_ENV=()
+run_verify() {
+  local fx="$1"; shift
+  local rc=0
+  reset_logs "$fx"
+  (
+    cd "$fx" || exit 1
+    env -u FISHHAWK_VERIFY_PACKAGES -u FISHHAWK_VERIFY_LOCK_OWNER \
+        -u FISHHAWK_VERIFY_LOCK_SELF_PID -u FISHHAWK_SKIP_PATCH_COVERAGE \
+        -u FISHHAWK_DIFF_BASE -u FISHHAWK_VERIFY_LOCK_WAIT_SECONDS \
+        PATH="$fx/bin:$PATH" \
+        FISHHAWK_TEST_P=4 \
+        FISHHAWK_TEST_LEASE_DIR="$fx/leases" \
+        "${RV_ENV[@]}" \
+        bash "$fx/scripts/test" verify "$@"
+  ) > "$fx/logs/stdout.log" 2> "$fx/logs/stderr.log"
+  rc=$?
+  RV_ENV=()
+  return $rc
+}
+
+count_lines() { local n; n="$(grep -c . "$1" 2>/dev/null)"; [ -n "$n" ] || n=0; printf '%s' "$n"; }
+go_log_lines() { count_lines "$1/logs/go.log"; }
+
+# --------------------------------------------------------------------------
+# --fixture mode: build and describe, then exit.
+# --------------------------------------------------------------------------
+if [ "${1:-}" = "--fixture" ]; then
+  if [ -z "${2:-}" ]; then
+    echo "usage: scripts/test-verify-scope --fixture <dir>" >&2
+    exit 1
+  fi
+  mkdir -p "$2"
+  fixdir="$(cd "$2" && pwd)"
+  build_fixture "$fixdir"
+  cat <<EOF
+root=$fixdir
+script=$fixdir/scripts/test
+bin=$fixdir/bin
+go_log=$fixdir/logs/go.log
+lease_dir=$fixdir/leases
+modules=./backend ./cli
+packages=backend/internal/alpha backend/internal/beta cli/internal/gamma
+EOF
+  exit 0
+fi
+
+tmproot="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-verify-scope.XXXXXX")"
+LIVE_PIDS=""
+cleanup() {
+  local p
+  for p in $LIVE_PIDS; do kill "$p" 2>/dev/null; done
+  rm -rf "$tmproot"
+}
+trap cleanup EXIT
+
+# A LIVE pid, seeded by construction (a real background process we own).
+spawn_live() {
+  "$REAL_SLEEP" 300 >/dev/null 2>&1 &
+  local p=$!
+  LIVE_PIDS="$LIVE_PIDS $p"
+  printf '%s' "$p"
+}
+# A DEAD pid, seeded by construction: a background child we reap, so `kill -0`
+# is guaranteed to fail without depending on the control under test.
+spawn_dead() {
+  "$REAL_SLEEP" 0 >/dev/null 2>&1 &
+  local p=$!
+  wait "$p" 2>/dev/null
+  printf '%s' "$p"
+}
+
+FX="$tmproot/fx"
+mkdir -p "$FX"
+build_fixture "$FX"
+LOCK="$FX/.git/fishhawk-verify.lock"
+rm -f "$LOCK" "$LOCK.prune" 2>/dev/null
+
+echo "=== A. scoped verify ==="
+
+# a1 — scoped: exactly one go test, in backend, naming only ./internal/alpha,
+# and NO invocation recorded for the other module. The saving IS the skipped
+# module, so that absence is the load-bearing assertion.
+run_verify "$FX" --packages backend/internal/alpha
+rc=$?
+assert_eq "a1 scoped verify exits 0" "0" "$rc"
+assert_eq "a1 scoped verify runs exactly one go test" "1" "$(go_log_lines "$FX")"
+assert_contains "a1 scoped go test runs in backend on ./internal/alpha" \
+  "$FX/logs/go.log" "backend	test -race -p 4 ./internal/alpha"
+assert_not_contains "a1 scoped verify runs NO go test in cli" "$FX/logs/go.log" "cli	"
+
+# a2 — no --packages and no env var: the full unscoped loop, every module.
+run_verify "$FX"
+rc=$?
+assert_eq "a2 unscoped verify exits 0" "0" "$rc"
+assert_eq "a2 unscoped verify runs a go test per module" "2" "$(go_log_lines "$FX")"
+assert_contains "a2 unscoped backend runs ./..." "$FX/logs/go.log" "backend	test -race"
+assert_contains "a2 unscoped cli runs ./..." "$FX/logs/go.log" "cli	test -race -p 4 ./..."
+
+# a3 — FISHHAWK_VERIFY_PACKAGES alone scopes the loop.
+RV_ENV=(FISHHAWK_VERIFY_PACKAGES=cli/internal/gamma)
+run_verify "$FX"
+rc=$?
+assert_eq "a3 env-fallback verify exits 0" "0" "$rc"
+assert_eq "a3 env fallback scopes the loop to one module" "1" "$(go_log_lines "$FX")"
+assert_contains "a3 env fallback names cli/internal/gamma" \
+  "$FX/logs/go.log" "cli	test -race -p 4 ./internal/gamma"
+
+# a4 — CLI --packages beats a conflicting env var.
+RV_ENV=(FISHHAWK_VERIFY_PACKAGES=cli/internal/gamma)
+run_verify "$FX" --packages backend/internal/beta
+rc=$?
+assert_eq "a4 CLI-beats-env verify exits 0" "0" "$rc"
+assert_contains "a4 CLI --packages wins" "$FX/logs/go.log" "backend	test -race -p 4 ./internal/beta"
+assert_not_contains "a4 the env var's package is not used" "$FX/logs/go.log" "cli	"
+
+# a5 — an EMPTY --packages is a caller bug, not a request to run unscoped.
+run_verify "$FX" --packages ""
+rc=$?
+assert_ne "a5 --packages '' exits non-zero" "0" "$rc"
+assert_contains "a5 --packages '' prints the usage line" "$FX/logs/stderr.log" "usage: scripts/test"
+assert_eq "a5 --packages '' runs no tests" "0" "$(go_log_lines "$FX")"
+
+# a6 — a package owned by NO go.work module widens to the FULL loop.
+run_verify "$FX" --packages nosuchmodule/internal/x
+rc=$?
+assert_eq "a6 unknown package still exits 0" "0" "$rc"
+assert_contains "a6 unknown package prints its reason" \
+  "$FX/logs/stderr.log" "is not inside any go.work module"
+assert_eq "a6 unknown package WIDENS to the full loop" "2" "$(go_log_lines "$FX")"
+assert_contains "a6 widened loop covers cli" "$FX/logs/go.log" "cli	test -race"
+
+# a7 — an undecodable package (tab / newline / empty element) does the same.
+run_verify "$FX" --packages "backend/internal/alpha	x"
+rc=$?
+assert_eq "a7 tab-bearing package still exits 0" "0" "$rc"
+assert_contains "a7 tab-bearing package prints its reason" \
+  "$FX/logs/stderr.log" "contains a tab or newline"
+assert_eq "a7 tab-bearing package WIDENS to the full loop" "2" "$(go_log_lines "$FX")"
+
+run_verify "$FX" --packages "$(printf 'backend/internal/alpha\ncli/internal/gamma')"
+rc=$?
+assert_contains "a7b newline-bearing package prints its reason" \
+  "$FX/logs/stderr.log" "contains a tab or newline"
+assert_eq "a7b newline-bearing package WIDENS to the full loop" "2" "$(go_log_lines "$FX")"
+
+run_verify "$FX" --packages "backend/internal/alpha,,cli/internal/gamma"
+rc=$?
+assert_contains "a7c empty list element prints its reason" \
+  "$FX/logs/stderr.log" "contains an empty entry"
+assert_eq "a7c empty list element WIDENS to the full loop" "2" "$(go_log_lines "$FX")"
+
+# a8 — scoped mode prints the patch-coverage skip reason and NEVER arms the
+# #2124 snapshot machinery (no --emit-changed-snapshot invocation at all).
+run_verify "$FX" --packages backend/internal/alpha
+assert_contains "a8 scoped mode prints the patch-coverage skip reason" \
+  "$FX/logs/stderr.log" "the patch-coverage gate runs in the full committed-tree gate"
+assert_not_contains "a8 scoped mode never emits a changed-line snapshot" \
+  "$FX/logs/cov.log" "--emit-changed-snapshot"
+
+# a9 — the unscoped control: the same gate DOES emit one, proving a8 is a
+# scoped-mode branch and not a broken gate.
+run_verify "$FX"
+assert_contains "a9 unscoped mode DOES emit a changed-line snapshot" \
+  "$FX/logs/cov.log" "--emit-changed-snapshot"
+
+# a10 — every non-test leg runs UNCHANGED in both modes.
+run_verify "$FX" --packages backend/internal/alpha
+assert_contains "a10 scoped: lint ran in backend" "$FX/logs/lint.log" "backend	run ./..."
+assert_contains "a10 scoped: lint ran in cli" "$FX/logs/lint.log" "cli	run ./..."
+assert_contains "a10 scoped: schema-sync ran" "$FX/logs/gate.log" "sync-schemas"
+assert_contains "a10 scoped: gate harnesses ran" "$FX/logs/gate.log" "test-check-coverage"
+assert_contains "a10 scoped: the new harness is wired in" "$FX/logs/gate.log" "test-verify-scope"
+assert_contains "a10 scoped: site voice gate ran" "$FX/logs/gate.log" "check-site-voice"
+assert_contains "a10 scoped: site IA gate ran" "$FX/logs/gate.log" "check-site-ia"
+run_verify "$FX"
+assert_contains "a10 unscoped: lint ran in backend" "$FX/logs/lint.log" "backend	run ./..."
+assert_contains "a10 unscoped: schema-sync ran" "$FX/logs/gate.log" "sync-schemas"
+assert_contains "a10 unscoped: gate harnesses ran" "$FX/logs/gate.log" "test-check-coverage"
+assert_contains "a10 unscoped: site voice gate ran" "$FX/logs/gate.log" "check-site-voice"
+assert_contains "a10 unscoped: site IA gate ran" "$FX/logs/gate.log" "check-site-ia"
+
+# a11 — the doc-line budget still FAILS verify in both modes (the non-test legs
+# are not merely invoked in scoped mode, they still gate).
+python3 - "$FX/docs/ARCHITECTURE.md" <<'PY'
+import sys
+with open(sys.argv[1], "a") as fh:
+    fh.write("| " + ("x" * 1200) + " |\n")
+PY
+run_verify "$FX" --packages backend/internal/alpha
+rc=$?
+assert_ne "a11 scoped: an over-long ARCHITECTURE.md line fails verify" "0" "$rc"
+assert_contains "a11 scoped: the budget message is printed" \
+  "$FX/logs/stderr.log" "1000-char budget"
+run_verify "$FX"
+rc=$?
+assert_ne "a11 unscoped: an over-long ARCHITECTURE.md line fails verify" "0" "$rc"
+printf '# ARCHITECTURE\n\nshort line\n' > "$FX/docs/ARCHITECTURE.md"
+
+# a12 — fail-closed: the module list changing between bucketing and the loop must
+# never report success having run nothing. The go stub rotates its module list
+# from the third `go work edit` call (cmd_lint, then bucketing, then the loop).
+RV_ENV=(FIXTURE_MODULES_ROTATE_AT=3)
+run_verify "$FX" --packages backend/internal/alpha
+rc=$?
+assert_ne "a12 a scoped loop that matched no module exits non-zero" "0" "$rc"
+assert_contains "a12 it says it refused rather than reporting success" \
+  "$FX/logs/stderr.log" "refusing to report success without running any tests"
+assert_eq "a12 it ran no tests" "0" "$(go_log_lines "$FX")"
+
+echo "=== B. verify lock ==="
+
+# Source scripts/test lib-only for the unit-level lock cases: they need two
+# synthetic identities in one process, which a subprocess cannot give.
+FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+# scripts/test enables `set -euo pipefail`; both -e and -u have to come back off
+# (an empty RV_ENV array expansion is an "unbound variable" under -u on bash 3.2).
+set +eu
+# scripts/test's helpers install their own EXIT trap; fold our cleanup into the
+# shared handler so the temp root is still removed.
+EXIT_TRAP="$EXIT_TRAP; cleanup"
+
+lock_reset() {
+  rm -f "$LOCK" "$LOCK.prune" 2>/dev/null
+  VERIFY_LOCK_HELD=""; VERIFY_LOCK_TARGET=""; VERIFY_PRUNE_MARKER=""
+  unset FISHHAWK_VERIFY_LOCK_OWNER FISHHAWK_VERIFY_LOCK_SELF_PID
+  unset FISHHAWK_VERIFY_LOCK_WAIT_SECONDS FISHHAWK_VERIFY_LOCK_POLL_SECONDS
+  unset FIXTURE_SLEEP_RELEASE
+  : > "$FX/logs/sleep.log"
+}
+
+# b1 — a SHELL-kind verify meeting a LIVE holder refuses IMMEDIATELY: non-zero,
+# the actionable `scripts/test single` message, NO test run, and — the structural
+# proof of promptness, never an elapsed-time bound — zero recorded sleeps.
+lock_reset
+livepid="$(spawn_live)"
+ln -s "$livepid:runner" "$LOCK"
+run_verify "$FX" --packages backend/internal/alpha
+rc=$?
+assert_ne "b1 shell meeting a live holder exits non-zero" "0" "$rc"
+assert_contains "b1 the refusal names scripts/test single" \
+  "$FX/logs/stderr.log" "scripts/test single -run TestX ./your/package/..."
+assert_contains "b1 the refusal says not to poll it" "$FX/logs/stderr.log" "Do NOT poll"
+assert_eq "b1 a refusal runs NO tests" "0" "$(go_log_lines "$FX")"
+assert_eq "b1 a refusal runs no lint either" "0" "$(count_lines "$FX/logs/lint.log")"
+assert_eq "b1 a refusal never sleeps (structural promptness)" "0" "$(count_lines "$FX/logs/sleep.log")"
+assert_eq "b1 the holder's lock is untouched" "$livepid:runner" "$(readlink "$LOCK")"
+
+# b2 — a DEAD holder is pruned and the lock acquired; verify proceeds normally
+# and the lock is released on exit.
+lock_reset
+deadpid="$(spawn_dead)"
+ln -s "$deadpid:shell" "$LOCK"
+run_verify "$FX" --packages backend/internal/alpha
+rc=$?
+assert_eq "b2 a dead holder is pruned and verify proceeds" "0" "$rc"
+assert_eq "b2 the scoped loop ran" "1" "$(go_log_lines "$FX")"
+if [ -L "$LOCK" ]; then fail "b2 the lock is released on exit"; else pass "b2 the lock is released on exit"; fi
+
+# b3 — THE PRUNE RACE. Lock L held by dead pid D. B classifies D dead FIRST;
+# A then prunes and acquires; B, acting on its now-stale classification, must NOT
+# remove A's fresh LIVE lock. Exactly one proceeds.
+lock_reset
+deadpid="$(spawn_dead)"
+pidA="$(spawn_live)"
+pidB="$(spawn_live)"
+ln -s "$deadpid:shell" "$LOCK"
+clsB="$(_verify_lock_classify "$LOCK")"          # B's classification, taken FIRST
+assert_eq "b3 B classifies the seeded holder as dead" "dead" "$clsB"
+FISHHAWK_VERIFY_LOCK_SELF_PID="$pidA"
+_verify_lock_prune_and_acquire "$LOCK" "$pidA:runner"; rcA=$?
+VERIFY_LOCK_HELD=""; VERIFY_LOCK_TARGET=""       # A's state is not B's
+FISHHAWK_VERIFY_LOCK_SELF_PID="$pidB"
+_verify_lock_prune_and_acquire "$LOCK" "$pidB:runner"; rcB=$?
+unset FISHHAWK_VERIFY_LOCK_SELF_PID
+assert_eq "b3 A prunes the dead holder and acquires" "0" "$rcA"
+assert_ne "b3 B does NOT also acquire" "0" "$rcB"
+assert_eq "b3 exactly one holder remains, and it is A" "$pidA:runner" "$(readlink "$LOCK")"
+if [ -L "$LOCK.prune" ]; then fail "b3 the prune marker is released"; else pass "b3 the prune marker is released"; fi
+
+# b3b — a prune marker held by a LIVE pruner makes a second pruner back off
+# without touching the lock.
+lock_reset
+deadpid="$(spawn_dead)"
+pidA="$(spawn_live)"
+ln -s "$deadpid:shell" "$LOCK"
+ln -s "$pidA" "$LOCK.prune"
+FISHHAWK_VERIFY_LOCK_SELF_PID="$(spawn_live)"
+_verify_lock_prune_and_acquire "$LOCK" "9:runner"; rc=$?
+unset FISHHAWK_VERIFY_LOCK_SELF_PID
+assert_ne "b3b a second pruner backs off while a live pruner holds the marker" "0" "$rc"
+assert_eq "b3b it left the lock alone" "$deadpid:shell" "$(readlink "$LOCK")"
+assert_eq "b3b it left the live marker alone" "$pidA" "$(readlink "$LOCK.prune")"
+
+# b3c — a prune marker held by a DEAD pruner is recovered, so a pruner killed
+# mid-prune cannot wedge every later invocation.
+lock_reset
+deadpid="$(spawn_dead)"
+deadpruner="$(spawn_dead)"
+ln -s "$deadpid:shell" "$LOCK"
+ln -s "$deadpruner" "$LOCK.prune"
+selfpid="$(spawn_live)"
+FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
+_verify_lock_prune_and_acquire "$LOCK" "$selfpid:runner" >/dev/null 2>&1
+_verify_lock_prune_and_acquire "$LOCK" "$selfpid:runner"; rc=$?
+unset FISHHAWK_VERIFY_LOCK_SELF_PID
+assert_eq "b3c a dead pruner's marker is recovered and the prune completes" "0" "$rc"
+assert_eq "b3c the lock now names the recovering invocation" "$selfpid:runner" "$(readlink "$LOCK")"
+
+# b4 — RUNNER meets a live SHELL holder that RELEASES inside the budget: it
+# waits (>=1 recorded sleep), acquires, and prints NO displacement warning.
+lock_reset
+export PATH="$FX/bin:$PATH"
+holder="$(spawn_live)"
+selfpid="$(spawn_live)"
+ln -s "$holder:shell" "$LOCK"
+export FISHHAWK_VERIFY_LOCK_OWNER=runner
+export FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
+export FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=600
+export FIXTURE_SLEEP_RELEASE="$LOCK"
+_acquire_verify_lock_at "$LOCK" > "$tmproot/b4.out" 2>&1; rc=$?
+unset FIXTURE_SLEEP_RELEASE
+assert_eq "b4 runner acquires once the shell holder releases inside the budget" "0" "$rc"
+assert_eq "b4 it actually waited" "1" "$(count_lines "$FX/logs/sleep.log")"
+assert_contains "b4 it announced the wait" "$tmproot/b4.out" "waiting up to 600s"
+assert_not_contains "b4 NO displacement warning was printed" "$tmproot/b4.out" "displacing"
+assert_eq "b4 the runner now holds the lock" "$selfpid:runner" "$(readlink "$LOCK")"
+
+# b5 — RUNNER meets a live SHELL holder past an injected zero budget: it
+# DISPLACES, printing the loud warning naming the deposed pid.
+lock_reset
+holder="$(spawn_live)"
+selfpid="$(spawn_live)"
+ln -s "$holder:shell" "$LOCK"
+export FISHHAWK_VERIFY_LOCK_OWNER=runner
+export FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
+export FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=0
+_acquire_verify_lock_at "$LOCK" > "$tmproot/b5.out" 2>&1; rc=$?
+assert_eq "b5 runner displaces a wedged shell holder on expiry" "0" "$rc"
+assert_contains "b5 the warning names the deposed pid" "$tmproot/b5.out" "deposed pid $holder"
+assert_contains "b5 the warning states the contention consequence" \
+  "$tmproot/b5.out" "two verifies may now contend"
+assert_eq "b5 the runner now holds the lock" "$selfpid:runner" "$(readlink "$LOCK")"
+
+# b6 — RUNNER meets a live RUNNER holder past the budget: it REFUSES and does
+# NOT displace. "Did not displace" is asserted on STATE, not only on the message.
+lock_reset
+holder="$(spawn_live)"
+selfpid="$(spawn_live)"
+ln -s "$holder:runner" "$LOCK"
+export FISHHAWK_VERIFY_LOCK_OWNER=runner
+export FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
+export FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=0
+_acquire_verify_lock_at "$LOCK" > "$tmproot/b6.out" 2>&1; rc=$?
+assert_ne "b6 runner refuses a live RUNNER holder" "0" "$rc"
+assert_contains "b6 the refusal names the holder pid" "$tmproot/b6.out" "holder pid $holder"
+assert_contains "b6 the refusal names this pid" "$tmproot/b6.out" "this pid $selfpid"
+assert_eq "b6 the holder's lock still exists and still names it" "$holder:runner" "$(readlink "$LOCK")"
+
+# b7 — RUNNER meets a live RUNNER holder that releases INSIDE the budget: it
+# acquires normally. The wait applies to both kinds; only the EXPIRY differs.
+lock_reset
+holder="$(spawn_live)"
+selfpid="$(spawn_live)"
+ln -s "$holder:runner" "$LOCK"
+export FISHHAWK_VERIFY_LOCK_OWNER=runner
+export FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
+export FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=600
+export FIXTURE_SLEEP_RELEASE="$LOCK"
+_acquire_verify_lock_at "$LOCK" > "$tmproot/b7.out" 2>&1; rc=$?
+unset FIXTURE_SLEEP_RELEASE
+assert_eq "b7 runner acquires once a runner holder releases inside the budget" "0" "$rc"
+assert_eq "b7 the runner now holds the lock" "$selfpid:runner" "$(readlink "$LOCK")"
+assert_not_contains "b7 no displacement warning" "$tmproot/b7.out" "displacing"
+
+# b8 — git absent degrades to NO locking, with a printed reason.
+lock_reset
+mkdir -p "$tmproot/nopath"
+savedpath="$PATH"
+ROOT_SAVED="$ROOT"; ROOT="$FX"
+PATH="$tmproot/nopath"
+_verify_lock_path > "$tmproot/b8.out" 2>&1; rc=$?
+_acquire_verify_lock > "$tmproot/b8b.out" 2>&1; arc=$?
+PATH="$savedpath"; ROOT="$ROOT_SAVED"
+assert_ne "b8 git absent: no lock path" "0" "$rc"
+assert_contains "b8 git absent prints its reason" "$tmproot/b8.out" "git not found"
+assert_eq "b8 git absent DEGRADES (verify proceeds unlocked)" "0" "$arc"
+if [ -L "$LOCK" ]; then fail "b8 git absent takes no lock"; else pass "b8 git absent takes no lock"; fi
+
+# b9 — a non-work-tree $ROOT degrades to NO locking.
+lock_reset
+mkdir -p "$tmproot/notarepo"
+ROOT_SAVED="$ROOT"; ROOT="$tmproot/notarepo"
+_verify_lock_path > "$tmproot/b9.out" 2>&1; rc=$?
+_acquire_verify_lock > "$tmproot/b9b.out" 2>&1; arc=$?
+ROOT="$ROOT_SAVED"
+assert_ne "b9 non-work-tree: no lock path" "0" "$rc"
+assert_contains "b9 non-work-tree prints its reason" "$tmproot/b9.out" "is not a git work tree"
+assert_eq "b9 non-work-tree DEGRADES" "0" "$arc"
+
+# b10 — a BARE repo degrades to NO locking. It is its own case because
+# `--is-inside-work-tree` prints `false` yet EXITS 0, so an exit-status-only
+# guard would fall through instead of taking the documented no-op.
+lock_reset
+git init -q --bare "$tmproot/bare.git" >/dev/null 2>&1
+ROOT_SAVED="$ROOT"; ROOT="$tmproot/bare.git"
+bareval="$(git -C "$tmproot/bare.git" rev-parse --is-inside-work-tree 2>/dev/null)"
+bareexit=$?
+_verify_lock_path > "$tmproot/b10.out" 2>&1; rc=$?
+_acquire_verify_lock > "$tmproot/b10b.out" 2>&1; arc=$?
+ROOT="$ROOT_SAVED"
+assert_eq "b10 a bare repo prints 'false' for --is-inside-work-tree" "false" "$bareval"
+assert_eq "b10 ... yet EXITS 0 (why the value, not the status, is guarded)" "0" "$bareexit"
+assert_ne "b10 bare repo: no lock path" "0" "$rc"
+assert_contains "b10 bare repo prints its reason" "$tmproot/b10.out" "is not a git work tree"
+assert_eq "b10 bare repo DEGRADES" "0" "$arc"
+
+# b11 — a LINKED worktree resolves to the SAME lock path as the main checkout.
+# This is what makes the runner's throwaway verify worktree and the agent's run
+# worktree contend at all, so it is asserted directly rather than assumed.
+lock_reset
+git -C "$FX" worktree add -q --detach "$tmproot/linked" >/dev/null 2>&1
+ROOT_SAVED="$ROOT"
+ROOT="$FX";            main_lock="$(_verify_lock_path 2>/dev/null)"
+ROOT="$tmproot/linked"; linked_lock="$(_verify_lock_path 2>/dev/null)"
+ROOT="$ROOT_SAVED"
+assert_eq "b11 a linked worktree resolves the SAME lock path" "$main_lock" "$linked_lock"
+assert_ne "b11 the lock path is non-empty" "" "$main_lock"
+# ... and a held lock leaves the work tree clean (it lives inside .git).
+ln -s "999999:shell" "$LOCK"
+assert_eq "b11 a held lock is invisible to git status (it lives inside .git)" \
+  "0" "$(git -C "$FX" status --porcelain 2>/dev/null | grep -c 'fishhawk-verify' )"
+rm -f "$LOCK"
+git -C "$FX" worktree remove --force "$tmproot/linked" >/dev/null 2>&1
+
+# b12 — the EXIT-trap release: it removes a lock this invocation HOLDS, does NOT
+# remove one it refused on, and does NOT remove one displaced out from under it.
+lock_reset
+selfpid="$(spawn_live)"
+export FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
+_verify_lock_try_acquire "$LOCK" "$selfpid:shell" >/dev/null 2>&1
+_release_verify_lock
+if [ -L "$LOCK" ]; then fail "b12a release removes a lock we hold"; else pass "b12a release removes a lock we hold"; fi
+
+lock_reset
+holder="$(spawn_live)"
+ln -s "$holder:runner" "$LOCK"
+export FISHHAWK_VERIFY_LOCK_SELF_PID="$(spawn_live)"
+VERIFY_LOCK_HELD=""; VERIFY_LOCK_TARGET=""       # we refused: we hold nothing
+_release_verify_lock
+assert_eq "b12b release does NOT remove a lock we refused on" "$holder:runner" "$(readlink "$LOCK")"
+
+lock_reset
+selfpid="$(spawn_live)"
+thief="$(spawn_live)"
+export FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
+_verify_lock_try_acquire "$LOCK" "$selfpid:shell" >/dev/null 2>&1
+rm -f "$LOCK"; ln -s "$thief:runner" "$LOCK"      # displaced out from under us
+_release_verify_lock
+assert_eq "b12c release does NOT remove a lock displaced from us" "$thief:runner" "$(readlink "$LOCK")"
+lock_reset
+
+# b13 — classification is ONE parse driving every branch: pin each verdict.
+lock_reset
+assert_eq "b13 an absent lock is free" "free" "$(_verify_lock_classify "$LOCK")"
+livepid="$(spawn_live)"
+ln -s "$livepid:shell" "$LOCK";  assert_eq "b13 a live shell holder" "live-shell" "$(_verify_lock_classify "$LOCK")"
+rm -f "$LOCK"; ln -s "$livepid:runner" "$LOCK"; assert_eq "b13 a live runner holder" "live-runner" "$(_verify_lock_classify "$LOCK")"
+rm -f "$LOCK"; ln -s "$(spawn_dead):shell" "$LOCK"; assert_eq "b13 a dead holder" "dead" "$(_verify_lock_classify "$LOCK")"
+rm -f "$LOCK"; ln -s "not-a-pid:shell" "$LOCK";  assert_eq "b13 a non-numeric target is garbage" "garbage" "$(_verify_lock_classify "$LOCK")"
+rm -f "$LOCK"; ln -s "$livepid:bogus" "$LOCK";   assert_eq "b13 an unknown kind is garbage" "garbage" "$(_verify_lock_classify "$LOCK")"
+rm -f "$LOCK"; mkdir -p "$LOCK";                 assert_eq "b13 a dir-form leftover is garbage" "garbage" "$(_verify_lock_classify "$LOCK")"
+rm -rf "$LOCK"
+lock_reset
+
+echo
+echo "passed: $PASS  failed: $FAIL"
+[ "$FAIL" -eq 0 ]
