@@ -25,7 +25,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **117 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **118 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -127,6 +127,7 @@ The v0 REST API exposes **117 operations** across the paths below, generated fro
 | `POST` | `/v0/stages/{stage_id}/acceptance-admission` | Pre-spawn acceptance short-circuit admission |
 | `POST` | `/v0/stages/{stage_id}/fixup` | Route advisory implement-review concerns back to the agent |
 | `POST` | `/v0/concerns/{concern_id}/waive` | Waive an open review concern with an audited reason |
+| `POST` | `/v0/runs/{run_id}/concerns/waive` | Waive several of one run's open concerns with one audited reason |
 | `POST` | `/v0/concerns/{concern_id}/defer` | Defer an open review concern into a follow-up work item |
 | `GET` | `/v0/artifacts/{artifact_id}` | Get an artifact |
 | `POST` | `/v0/runs/{run_id}/signing-key` | Issue a per-run Ed25519 signing key |

@@ -289,6 +289,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerDraftEpic(srv, resolver)
 	registerFixupStage(srv, resolver)
 	registerWaiveConcern(srv, resolver)
+	registerWaiveConcerns(srv, resolver)
 	registerDeferConcern(srv, resolver)
 	registerRecordGroomingDispositions(srv, resolver)
 	registerListScopeAmendments(srv, resolver)
@@ -3681,6 +3682,13 @@ type ApprovePlanInput struct {
 	// condition is the authority, the reviewer the witness. Validated pre-Submit
 	// (approve-only, plan-stage-only, open plan-stage concerns of the same run).
 	ClaimsConcernIDs []string `json:"claims_concern_ids,omitempty" jsonschema:"optional list of plan-stage concern ids (from fishhawk_get_gate_view / the run-status concerns block) that THIS approval's binding condition (in 'reason' or 'binding_assertions') answers. Each claimed concern auto-resolves to the terminal addressed_by_condition state once ONE implement review returns a confirming (non-reject) verdict — the operator's condition is the authority, the reviewer only witnesses — so it lands in the settled ledger instead of demanding a hand waive at the merge gate. Rejected 400 unless each id is an OPEN plan-stage concern of this run; approve-only, plan-stage-only"`
+	// ClaimsAllOpenPlanConcerns is the SHORTHAND for the read-both-reviews-
+	// then-approve case (#3318): the per-id form above cannot serve it without
+	// the operator hand-copying every id out of the gate view. The backend
+	// expands it at approve time into the run's full open plan-stage concern id
+	// set — a SNAPSHOT, not a continuously-evaluated set — and records those ids
+	// under claims_concern_ids, so resolution is byte-identical.
+	ClaimsAllOpenPlanConcerns bool `json:"claims_all_open_plan_concerns,omitempty" jsonschema:"optional shorthand: claim EVERY open plan-stage concern of this run instead of naming ids in claims_concern_ids. The set is SNAPSHOTTED at approval time (a concern raised afterwards is NOT claimed). Use it for the read-both-reviews-then-approve case where your conditions answer the whole open plan-review ledger. MUTUALLY EXCLUSIVE with claims_concern_ids (400 validation_failed, details.rule claims_all_and_explicit_ids — the expansion is always a superset, so naming ids alongside it would make the recorded claim ambiguous). Approve-only and plan-stage-only (400); 503 concern_store_unconfigured when the concern store is unwired. An expansion resolving to ZERO open plan concerns is legal and is recorded as such"`
 	// ImplementModel is the optional operator override for the implement-stage
 	// model (#1013) — the top rung of the resolution ladder. The backend
 	// resolves the full ladder at the gate, validates the resolved value
@@ -3898,6 +3906,17 @@ instead of demanding a hand waive at the merge gate. Each id must be
 an OPEN plan-stage concern of THIS run or the approve is rejected 400
 before any approval row is recorded (approve-only, plan-stage-only).
 
+claims_all_open_plan_concerns (#3318, optional): the SHORTHAND for the
+common read-both-reviews-then-approve case — set it instead of copying
+every open plan-stage concern id into claims_concern_ids by hand. The
+backend expands it at approve time into the run's full open plan-stage
+concern id set and records THOSE ids, so resolution behaves exactly as
+if you had named them. It is a SNAPSHOT taken during the approve: a
+concern raised afterwards is NOT claimed. Mutually exclusive with
+claims_concern_ids (400, details.rule claims_all_and_explicit_ids);
+approve-only and plan-stage-only. An expansion that resolves to zero
+open plan concerns is legal and recorded as such.
+
 implement_model (#1013, optional): override the implement-stage model.
 The backend resolves the ladder deployment-default < spec executor.model
 < plan model_recommendation < this override, validates the resolved
@@ -4041,7 +4060,7 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	// warning on the tool result and an empty login — never a blocked
 	// approval.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.AddScopeFilesToSlice, in.MoveScopeFilesToSlice, in.BindingAssertions, in.ClaimsConcernIDs, in.AmendAcceptanceCriteria, in.ImplementModel)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.AddScopeFilesToSlice, in.MoveScopeFilesToSlice, in.BindingAssertions, in.ClaimsConcernIDs, in.ClaimsAllOpenPlanConcerns, in.AmendAcceptanceCriteria, in.ImplementModel)
 	if err != nil {
 		// ADR-036 (#875): the backend refuses the approve while a
 		// configured agent plan review is still in-flight. Surface this
@@ -4109,7 +4128,7 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	// so this NEVER refuses the submit: warn-on-reject / refuse-on-approve is a
 	// deliberate asymmetry, not an inconsistency.
 	warn = mergeRejectWarnings(warn, rejectReasonOverBudgetWarning(in.Reason))
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, false, nil, "")
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
@@ -4218,7 +4237,7 @@ func (r *runResolver) approveDeploy(ctx context.Context, _ *mcp.CallToolRequest,
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, nil, nil, nil, false, nil, "")
 	if err != nil {
 		// The deploy pre-flight 422s (deploy_environment_not_allowed,
 		// deploy_change_freeze_active, deploy_upstream_not_satisfied) and the
@@ -4249,7 +4268,7 @@ func (r *runResolver) rejectDeploy(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, RejectDeployOutput{}, fmt.Errorf("resolved deploy stage has invalid id %q: %w", deployStage.ID, err)
 	}
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, false, nil, "")
 	if err != nil {
 		return nil, RejectDeployOutput{}, fmt.Errorf("submit deploy rejection: %w", err)
 	}

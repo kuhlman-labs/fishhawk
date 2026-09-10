@@ -1746,7 +1746,7 @@ func TestWriteApprovalAudit_RemoveScopeFiles_RecordsBeforeAfter(t *testing.T) {
 		Decision:        approval.DecisionApprove,
 		Surface:         approval.SurfaceAPI,
 	}
-	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, nil, nil, nil, nil, "", "", "", "", nil)
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, nil, nil, nil, false, nil, "", "", "", "", nil)
 
 	au := s.cfg.AuditRepo.(*auditFake)
 	payload := findApprovalSubmittedPayload(t, au.appended)
@@ -9973,7 +9973,7 @@ func TestWriteApprovalAudit_RecordsMoveResolved(t *testing.T) {
 		{Path: "backend/a.go", FromSlice: 0, ToSlice: 1},
 		{Path: "backend/b.go", FromSlice: 2, ToSlice: 1},
 	}
-	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, nil, nil, moveMap, resolved, nil, nil, nil, "", "", "", "", nil)
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, nil, nil, moveMap, resolved, nil, nil, false, nil, "", "", "", "", nil)
 
 	payload := findApprovalSubmittedPayload(t, au.appended)
 	rawMap, err := json.Marshal(payload["move_scope_files_to_slice"])
@@ -10002,7 +10002,7 @@ func TestWriteApprovalAudit_RecordsMoveResolved(t *testing.T) {
 	// No-move approve: both keys ABSENT.
 	au2 := newApprovalAuditFake()
 	s2 := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au2})
-	s2.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, nil, nil, nil, nil, nil, nil, nil, "", "", "", "", nil)
+	s2.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, nil, nil, nil, nil, nil, nil, false, nil, "", "", "", "", nil)
 	payload2 := findApprovalSubmittedPayload(t, au2.appended)
 	if _, ok := payload2["move_scope_files_to_slice"]; ok {
 		t.Errorf("move_scope_files_to_slice present on a no-move approve payload: %#v", payload2)

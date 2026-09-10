@@ -405,6 +405,14 @@ type fakeBackend struct {
 	waiveStatus     int
 	waiveErrBody    string
 	waiveCalledByID map[uuid.UUID]int
+	// bulkWaiveBody captures the last decoded bulk-waive body and
+	// bulkWaivePath the path it arrived on (E64.77 / #3318); bulkWaiveResp
+	// seeds the response and bulkWaiveStatus/bulkWaiveErrBody the refusal.
+	bulkWaiveBody    bulkWaiveRequestBody
+	bulkWaivePath    string
+	bulkWaiveResp    *BulkWaiveResult
+	bulkWaiveStatus  int
+	bulkWaiveErrBody string
 
 	// #1202 fixtures: POST /v0/concerns/{id}/defer.
 	// deferBody captures the last decoded request body (the title
@@ -1090,6 +1098,39 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		if !ok {
 			resp = WaivedConcern{ID: id.String(), State: "waived", StateReason: body.Reason}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/concerns/waive", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body bulkWaiveRequestBody
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.bulkWaiveBody = body
+		fb.bulkWaivePath = r.URL.Path
+		status := fb.bulkWaiveStatus
+		errBody := fb.bulkWaiveErrBody
+		resp := fb.bulkWaiveResp
+		fb.mu.Unlock()
+		if status == 0 {
+			status = http.StatusOK
+		}
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if resp == nil {
+			out := BulkWaiveResult{RunID: id.String(), Reason: body.Reason, Waived: len(body.ConcernIDs)}
+			for _, cid := range body.ConcernIDs {
+				out.Results = append(out.Results, BulkWaiveItem{ConcernID: cid, Applied: true, State: "waived", StateReason: body.Reason})
+			}
+			resp = &out
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -3106,7 +3147,12 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// onto the declared base (a forge-side merge of the base INTO the run
 	// branch, leaving a merge commit) so a behind-base operator never pushes to
 	// a runner-owned branch — taking the total 52 -> 53.
-	const wantToolCount = 53
+	//
+	// E64.77 (#3318) adds exactly ONE tool — fishhawk_waive_concerns, the BULK
+	// sibling of fishhawk_waive_concern that settles a list of one run's open
+	// concerns under ONE audited reason (the merge-gate toil the 2026-09
+	// campaign surfaced) — taking the total 53 -> 54.
+	const wantToolCount = 54
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3122,6 +3168,19 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 			sawConsolidate = true
 			break
 		}
+	}
+	// fishhawk_waive_concerns (#3318) must likewise be wire-visible: the count
+	// bump above alone would stay green if the registration were dropped and a
+	// DIFFERENT tool added in the same change.
+	var sawWaiveConcerns bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_waive_concerns" {
+			sawWaiveConcerns = true
+			break
+		}
+	}
+	if !sawWaiveConcerns {
+		t.Error("fishhawk_waive_concerns is not in the registered tool list — the bulk waive verb is unreachable")
 	}
 	if !sawConsolidate {
 		t.Error("fishhawk_consolidate_slices is not registered/visible over ListTools")
@@ -14537,4 +14596,50 @@ func TestGetRunStatus_AcceptanceParkPreviewHonoursOperatorEnv(t *testing.T) {
 		t.Fatalf("getRunStatus: %v", err)
 	}
 	assertPreviewFoldedBeforeAcceptanceDispatch(t, out.NextActions, "make preview "+headSHA)
+}
+
+// TestApprovePlan_ClaimsAllOpenPlanConcerns_PlumbedToSubmitApproval pins the
+// #3318 MCP wire seam: the tool's claims_all_open_plan_concerns input reaches
+// the approvals request body the backend decodes. A severed seam here is
+// SILENT — the backend simply expands nothing and the operator's claim never
+// lands — so this asserts the decoded body, not the tool's return value.
+func TestApprovePlan_ClaimsAllOpenPlanConcerns_PlumbedToSubmitApproval(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:                     runID.String(),
+		Reason:                    "both reviews read; my conditions answer the whole open plan ledger",
+		ClaimsAllOpenPlanConcerns: true,
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if !fb.approvalsBody.ClaimsAllOpenPlanConcerns {
+		t.Errorf("claims_all_open_plan_concerns = false on the decoded body, want true — the shorthand was dropped on the wire")
+	}
+}
+
+// TestApprovePlan_NoClaimsAllOpenPlanConcerns_OmitsFieldOnTheWire confirms the
+// byte-identical no-shorthand path.
+func TestApprovePlan_NoClaimsAllOpenPlanConcerns_OmitsFieldOnTheWire(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks good",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.ClaimsAllOpenPlanConcerns {
+		t.Errorf("claims_all_open_plan_concerns = true when none declared, want false")
+	}
 }

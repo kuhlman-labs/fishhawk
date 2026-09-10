@@ -498,3 +498,33 @@ func TestWaiveConcern_OperatorAgentActorAttribution(t *testing.T) {
 		t.Errorf("ActorSubject = %v, want %q", entry.ActorSubject, operatorAgentSubject)
 	}
 }
+
+// TestWaiveConcern_SinglePath_OmitsBulkWaiveMarker pins the byte-identical half
+// of the #3318 applyConcernWaive extraction: the SINGLE waive path passes
+// bulk=false, so its concern_waived payload must carry NO bulk_waive key. The
+// ordering assertions above (audit-append-before-mutation, the corrective
+// entry, the delegated rule) are the extraction's regression control and pass
+// unchanged; this is the one NEW fact the shared helper introduces.
+func TestWaiveConcern_SinglePath_OmitsBulkWaiveMarker(t *testing.T) {
+	s, au, cr := waiveServer(t)
+	row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 100, "a nit")
+
+	w := postWaive(t, s, row.ID.String(), waiveConcernRequest{Reason: "accepted trade-off"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	idx := auditEntriesByCategory(au, CategoryConcernWaived)
+	if len(idx) != 1 {
+		t.Fatalf("concern_waived entries = %d, want 1", len(idx))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[idx[0]].Payload, &payload); err != nil {
+		t.Fatalf("decode concern_waived payload: %v", err)
+	}
+	if _, present := payload["bulk_waive"]; present {
+		t.Errorf("bulk_waive present on a SINGLE waive payload, want the key absent: %v", payload)
+	}
+	if payload["concern_id"] != row.ID.String() || payload["reason"] != "accepted trade-off" {
+		t.Errorf("payload = %v, want the concern id + operator reason unchanged by the extraction", payload)
+	}
+}

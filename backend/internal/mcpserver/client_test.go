@@ -1883,7 +1883,7 @@ func TestSubmitApproval_SendsSliceAddScopeFilesBody(t *testing.T) {
 	})
 
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "restore the dropped file",
-		"kuhlman-labs", nil, nil, perSlice, nil, nil, nil, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, perSlice, nil, nil, nil, false, nil, ""); err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
 	}
 	if gotMethod != http.MethodPost || gotPath != "/v0/stages/"+stageID.String()+"/approvals" {
@@ -1900,7 +1900,7 @@ func TestSubmitApproval_SendsSliceAddScopeFilesBody(t *testing.T) {
 	// nil → the key must be absent, not present-and-null.
 	gotRaw = nil
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, ""); err != nil {
 		t.Fatalf("SubmitApproval (no slice map): %v", err)
 	}
 	if _, present := gotRaw["add_scope_files_to_slice"]; present {
@@ -1929,7 +1929,7 @@ func TestSubmitApproval_SendsAmendAcceptanceCriteriaBody(t *testing.T) {
 	})
 
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "narrowed the design",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, amendments, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, amendments, ""); err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
 	}
 	raw, err := json.Marshal(gotRaw["amend_acceptance_criteria"])
@@ -1947,7 +1947,7 @@ func TestSubmitApproval_SendsAmendAcceptanceCriteriaBody(t *testing.T) {
 	// nil → the key must be absent, not present-and-null.
 	gotRaw = nil
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, ""); err != nil {
 		t.Fatalf("SubmitApproval (no amendments): %v", err)
 	}
 	if _, present := gotRaw["amend_acceptance_criteria"]; present {
@@ -2254,7 +2254,7 @@ func TestSubmitApproval_SendsSliceMoveScopeFilesBody(t *testing.T) {
 	})
 
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "relocate the file",
-		"kuhlman-labs", nil, nil, nil, move, nil, nil, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, move, nil, nil, false, nil, ""); err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
 	}
 	if gotMethod != http.MethodPost || gotPath != "/v0/stages/"+stageID.String()+"/approvals" {
@@ -2271,7 +2271,7 @@ func TestSubmitApproval_SendsSliceMoveScopeFilesBody(t *testing.T) {
 	// nil → the key must be absent, not present-and-null.
 	gotRaw = nil
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, ""); err != nil {
 		t.Fatalf("SubmitApproval (no move map): %v", err)
 	}
 	if _, present := gotRaw["move_scope_files_to_slice"]; present {
@@ -2529,5 +2529,115 @@ func TestRebaseRunBranch_Decodes200WithoutConflictResolution(t *testing.T) {
 	}
 	if res.NewHeadSHA != "bbbb2222" {
 		t.Errorf("new_head_sha = %q, want bbbb2222", res.NewHeadSHA)
+	}
+}
+
+// TestSubmitApproval_SendsClaimsAllOpenPlanConcernsBody pins the apiClient half
+// of the #3318 wire contract against a real HTTP server: the shorthand must
+// arrive under the exact key claims_all_open_plan_concerns (the backend's
+// DisallowUnknownFields decoder rejects any drift in the name, and a silently
+// dropped field would simply expand nothing), and must be ABSENT entirely when
+// the caller passes false — the omitempty pin that keeps a non-shorthand
+// approve body byte-identical to pre-#3318.
+func TestSubmitApproval_SendsClaimsAllOpenPlanConcernsBody(t *testing.T) {
+	stageID := uuid.New()
+
+	var gotMethod, gotPath string
+	var gotRaw map[string]any
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotRaw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"`+uuid.NewString()+`","state":"succeeded"}`)
+	})
+
+	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "conditions answer the whole ledger",
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, true, nil, ""); err != nil {
+		t.Fatalf("SubmitApproval: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v0/stages/"+stageID.String()+"/approvals" {
+		t.Errorf("request = %s %s, want POST /v0/stages/%s/approvals", gotMethod, gotPath, stageID)
+	}
+	if gotRaw["claims_all_open_plan_concerns"] != true {
+		t.Errorf("claims_all_open_plan_concerns = %v, want true: %#v", gotRaw["claims_all_open_plan_concerns"], gotRaw)
+	}
+
+	// false → the key must be absent, not present-and-false.
+	gotRaw = nil
+	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, ""); err != nil {
+		t.Fatalf("SubmitApproval (no shorthand): %v", err)
+	}
+	if _, present := gotRaw["claims_all_open_plan_concerns"]; present {
+		t.Errorf("claims_all_open_plan_concerns present on a shorthand-less approve body: %#v", gotRaw)
+	}
+}
+
+// TestBulkWaiveConcerns_PostsRunScopedPath pins the bulk waive client half: the
+// RUN-scoped path (which is what makes the same-run invariant structural), the
+// body's ids + single reason, and the decoded per-item result list.
+func TestBulkWaiveConcerns_PostsRunScopedPath(t *testing.T) {
+	runID := uuid.New()
+	ids := []string{uuid.NewString(), uuid.NewString()}
+
+	var gotMethod, gotPath string
+	var gotRaw map[string]any
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotRaw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`","reason":"r","waived":1,"failed":1,"results":[`+
+			`{"concern_id":"`+ids[0]+`","applied":true,"state":"waived","state_reason":"r"},`+
+			`{"concern_id":"`+ids[1]+`","applied":false,"error_code":"concern_waive_conflict","error":"raced"}]}`)
+	})
+
+	res, err := c.BulkWaiveConcerns(context.Background(), runID, ids, "r", false)
+	if err != nil {
+		t.Fatalf("BulkWaiveConcerns: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v0/runs/"+runID.String()+"/concerns/waive" {
+		t.Errorf("request = %s %s, want POST /v0/runs/%s/concerns/waive", gotMethod, gotPath, runID)
+	}
+	rawIDs, _ := gotRaw["concern_ids"].([]any)
+	if len(rawIDs) != 2 || rawIDs[0] != ids[0] || rawIDs[1] != ids[1] {
+		t.Errorf("body concern_ids = %v, want %v in order", gotRaw["concern_ids"], ids)
+	}
+	if gotRaw["reason"] != "r" {
+		t.Errorf("body reason = %v, want r", gotRaw["reason"])
+	}
+	if _, present := gotRaw["delegated"]; present {
+		t.Errorf("delegated present on a non-delegated bulk waive body: %#v", gotRaw)
+	}
+	if res.Waived != 1 || res.Failed != 1 || len(res.Results) != 2 {
+		t.Fatalf("decoded result = %+v, want waived 1 / failed 1 / 2 results", res)
+	}
+	if !res.Results[0].Applied || res.Results[0].State != "waived" {
+		t.Errorf("results[0] = %+v, want applied waived", res.Results[0])
+	}
+	if res.Results[1].Applied || res.Results[1].ErrorCode != "concern_waive_conflict" {
+		t.Errorf("results[1] = %+v, want applied=false error_code=concern_waive_conflict", res.Results[1])
+	}
+}
+
+// TestRunConcernItem_DecodesClaimedByApproval pins the hand-maintained wire
+// mirror for the #3318 marker: the backend's claimed_by_approval must decode
+// onto RunConcernItem. A json-tag drift here yields a silent false — never an
+// error — so the marker would vanish from every MCP consumer with nothing red.
+func TestRunConcernItem_DecodesClaimedByApproval(t *testing.T) {
+	var item RunConcernItem
+	if err := json.Unmarshal([]byte(`{"id":"x","stage_kind":"plan","state":"raised","claimed_by_approval":true}`), &item); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !item.ClaimedByApproval {
+		t.Error("claimed_by_approval decoded to false — the json tag does not byte-match the backend's field")
+	}
+	// Self-paired against the SAME shape with the marker absent, so the
+	// assertion above cannot be satisfied by a field that is always true.
+	var unmarked RunConcernItem
+	if err := json.Unmarshal([]byte(`{"id":"x","stage_kind":"plan","state":"raised"}`), &unmarked); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if unmarked.ClaimedByApproval {
+		t.Error("claimed_by_approval decoded to true from a body that omits it")
 	}
 }

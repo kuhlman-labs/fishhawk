@@ -310,3 +310,82 @@ func (s *Server) resolveConditionClaimedPlanConcerns(ctx context.Context, runID 
 		}
 	}
 }
+
+// expandAllOpenPlanConcernClaims is the approve-time EXPANSION half of the
+// claims_all_open_plan_concerns shorthand (E64.77 / #3318): the
+// read-both-reviews-then-approve case the per-id claims_concern_ids form
+// cannot serve without the operator hand-copying every id out of the gate
+// view. When the shorthand is set, the backend expands it into the run's FULL
+// open plan-stage concern id set and records THOSE ids under the existing
+// claims_concern_ids audit key, so the whole downstream resolution path
+// (loadApprovalConcernClaims -> resolveConditionClaimedPlanConcerns ->
+// concern_addressed_by_condition) runs byte-identically.
+//
+// Returns (nil, true) untouched when all==false, so every existing caller path
+// is byte-identical to today.
+//
+// The refusals, in order, each writing the response and returning ok=false:
+//
+//   - decision != "approve" -> 400 validation_failed;
+//   - a non-plan stage -> 400 validation_failed (the concerns a condition
+//     answers are plan-stage concerns);
+//   - a non-empty explicit claims_concern_ids alongside it -> 400
+//     validation_failed with rule=claims_all_and_explicit_ids. The two
+//     channels are MUTUALLY EXCLUSIVE: the expansion is always a superset of
+//     any valid explicit list, so accepting both would make the recorded audit
+//     claim ambiguous about operator intent;
+//   - nil ConcernRepo -> 503 concern_store_unconfigured (mirrors
+//     validateClaimsConcernIDs and waive.go);
+//   - a ListOpenByRun failure -> 500 internal_error (a store outage is
+//     retryable, NOT an operator-corrected input — the same posture
+//     validateClaimsConcernIDs takes for a non-ErrNotFound GetByIDs failure).
+//
+// The SNAPSHOT semantics are the point: "every open plan-stage concern" is
+// resolved once, HERE, at approve time — not continuously. A concern raised
+// AFTER the approval is not claimed. An EMPTY expansion (no open plan concerns
+// at approval time) is legal and returns (nil, true): nothing to claim is not
+// an error, and the caller still records the operator's declared intent on the
+// approval payload.
+func (s *Server) expandAllOpenPlanConcernClaims(w http.ResponseWriter, r *http.Request, stage *run.Stage, decision string, all bool, explicit []string) ([]string, bool) {
+	if !all {
+		return nil, true
+	}
+	if decision != "approve" {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"claims_all_open_plan_concerns is only valid on an approve decision",
+			map[string]any{"field": "claims_all_open_plan_concerns", "decision": decision})
+		return nil, false
+	}
+	if stage.Type != run.StageTypePlan {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"claims_all_open_plan_concerns is only valid on a plan-stage approval (the concerns a condition answers are plan-stage concerns)",
+			map[string]any{"field": "claims_all_open_plan_concerns", "stage_type": string(stage.Type)})
+		return nil, false
+	}
+	if len(explicit) > 0 {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"claims_all_open_plan_concerns and claims_concern_ids are mutually exclusive: the expansion already covers every open plan-stage concern, so naming ids alongside it would make the recorded claim ambiguous",
+			map[string]any{"field": "claims_all_open_plan_concerns", "rule": "claims_all_and_explicit_ids"})
+		return nil, false
+	}
+	if s.cfg.ConcernRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "concern_store_unconfigured",
+			"claims_all_open_plan_concerns requires a configured concern repository", nil)
+		return nil, false
+	}
+	open, err := s.cfg.ConcernRepo.ListOpenByRun(r.Context(), stage.RunID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"claims_all_open_plan_concerns expansion could not read the concern store",
+			map[string]any{"field": "claims_all_open_plan_concerns", "error": err.Error()})
+		return nil, false
+	}
+	ids := make([]string, 0, len(open))
+	for _, c := range open {
+		if c.StageKind != concern.StageKindPlan {
+			continue
+		}
+		ids = append(ids, c.ID.String())
+	}
+	return ids, true
+}

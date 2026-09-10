@@ -153,6 +153,20 @@ type approvalRequest struct {
 	// here so the DisallowUnknownFields decode accepts it; callers omit it
 	// (omitempty) and stay byte-identical to today.
 	ClaimsConcernIDs []string `json:"claims_concern_ids,omitempty"`
+	// ClaimsAllOpenPlanConcerns is the OPTIONAL shorthand for the
+	// read-both-reviews-then-approve case (E64.77 / #3318): instead of
+	// hand-copying every open plan-stage concern id into ClaimsConcernIDs, set
+	// this and the backend EXPANDS it at approve time into the run's full open
+	// plan-stage concern id set, recording THOSE ids under the same
+	// claims_concern_ids audit key — so the downstream #1956 resolution path is
+	// byte-identical. The expansion is a SNAPSHOT taken during this request, not
+	// a continuously-evaluated set: a concern raised after the approval is not
+	// claimed. MUTUALLY EXCLUSIVE with ClaimsConcernIDs (400), approve-only and
+	// plan-stage-only, validated pre-Submit by expandAllOpenPlanConcernClaims so
+	// a malformed shorthand inserts no approval row. Declared here so the
+	// DisallowUnknownFields decode accepts it; callers omit it (omitempty) and
+	// stay byte-identical to today.
+	ClaimsAllOpenPlanConcerns bool `json:"claims_all_open_plan_concerns,omitempty"`
 	// AmendAcceptanceCriteria is the OPTIONAL operator channel for RETIRING or
 	// RESTATING an approved plan's acceptance criteria by id at the plan gate
 	// (#2581). Plan-approval conditions reshape the design but never rewrite the
@@ -479,6 +493,22 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// approves skip this and stay byte-identical to today.
 	if !s.validateClaimsConcernIDs(w, r, stage, req.Decision, req.ClaimsConcernIDs) {
 		return
+	}
+
+	// Condition-claim SHORTHAND expansion (E64.77 / #3318): claims_all_open_plan_concerns
+	// resolves to the run's open plan-stage concern ids HERE, pre-Submit, so a
+	// malformed shorthand inserts no approval row (the same posture as
+	// binding_assertions and claims_concern_ids) and the expanded ids ride the
+	// existing claims_concern_ids channel from this point on. An approve that
+	// omits the shorthand leaves effectiveClaimsConcernIDs at req.ClaimsConcernIDs
+	// and is byte-identical to today.
+	expandedClaims, claimsOK := s.expandAllOpenPlanConcernClaims(w, r, stage, req.Decision, req.ClaimsAllOpenPlanConcerns, req.ClaimsConcernIDs)
+	if !claimsOK {
+		return
+	}
+	effectiveClaimsConcernIDs := req.ClaimsConcernIDs
+	if len(expandedClaims) > 0 {
+		effectiveClaimsConcernIDs = expandedClaims
 	}
 
 	// Author separation-of-duties (E39.4 / #1709, corrected by #2358): the
@@ -815,24 +845,25 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// the prior inline core did (duplicate 200, InvalidTransition 409, and
 	// the two distinct submit/advance 500 messages).
 	result, err := s.approveStageAs(r.Context(), ident, approveActionParams{
-		Stage:                   stage,
-		Decision:                decision,
-		Comment:                 req.Comment,
-		CommentPtr:              commentPtr,
-		ApproverGithubLogin:     req.ApproverGithubLogin,
-		AddScopeFiles:           addScopeFiles,
-		RemoveScopeFiles:        removeScopeFiles,
-		SliceAddScopeFiles:      sliceAddScopeFiles,
-		SliceMoveScopeFiles:     sliceMoveScopeFiles,
-		SliceMovesResolved:      sliceMovesResolved,
-		BindingAssertions:       req.BindingAssertions,
-		ClaimsConcernIDs:        req.ClaimsConcernIDs,
-		AmendAcceptanceCriteria: amendAcceptanceCriteria,
-		DelegatedRule:           delegatedRule,
-		ResolvedModel:           resolvedModel,
-		PlanModel:               req.PlanModel,
-		ReviewModel:             req.ReviewModel,
-		PredicateResolution:     predicateRes,
+		Stage:                     stage,
+		Decision:                  decision,
+		Comment:                   req.Comment,
+		CommentPtr:                commentPtr,
+		ApproverGithubLogin:       req.ApproverGithubLogin,
+		AddScopeFiles:             addScopeFiles,
+		RemoveScopeFiles:          removeScopeFiles,
+		SliceAddScopeFiles:        sliceAddScopeFiles,
+		SliceMoveScopeFiles:       sliceMoveScopeFiles,
+		SliceMovesResolved:        sliceMovesResolved,
+		BindingAssertions:         req.BindingAssertions,
+		ClaimsConcernIDs:          effectiveClaimsConcernIDs,
+		ClaimsAllOpenPlanConcerns: req.ClaimsAllOpenPlanConcerns,
+		AmendAcceptanceCriteria:   amendAcceptanceCriteria,
+		DelegatedRule:             delegatedRule,
+		ResolvedModel:             resolvedModel,
+		PlanModel:                 req.PlanModel,
+		ReviewModel:               req.ReviewModel,
+		PredicateResolution:       predicateRes,
 	})
 	if err != nil {
 		var aerr *approveActionError
@@ -967,6 +998,13 @@ type approveActionParams struct {
 	SliceMovesResolved  []movedPath
 	BindingAssertions   []bindingAssertion
 	ClaimsConcernIDs    []string
+	// ClaimsAllOpenPlanConcerns records that the operator used the #3318
+	// SHORTHAND rather than naming ids: ClaimsConcernIDs above already carries
+	// the EXPANDED set, so this flag exists only so the approval_submitted
+	// payload can reconstruct the operator's INTENT (including an expansion that
+	// legitimately resolved to zero concerns). The in-process campaign
+	// auto-driver leaves it false.
+	ClaimsAllOpenPlanConcerns bool
 	// AmendAcceptanceCriteria is the canonical amendment slice
 	// checkAmendAcceptanceCriteria produced, or nil when the approve carried
 	// none (#2581). Recorded on the approval_submitted payload; the in-process
@@ -1119,7 +1157,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 				// vote), and the stage stays awaiting_approval until the
 				// baseline is readable again. No predicate_snapshot — nothing
 				// about the effective requirement is known to snapshot.
-				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
+				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.ClaimsAllOpenPlanConcerns, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
 				s.notifyStatusUpdate(ctx, p.Stage.RunID, "approval_submit")
 				return &approveActionResult{Stage: p.Stage}, nil
 			}
@@ -1129,7 +1167,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		// enrichment (ADR-055 record leg) on the approval_submitted row. No
 		// predicate_snapshot — the gate declares no approvals block
 		// (operator binding condition 2).
-		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
+		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.ClaimsAllOpenPlanConcerns, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
 		return s.finishApprovalAdvance(ctx, p, res)
 	}
 
@@ -1259,7 +1297,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	}
 	// Persist the enriched approval audit BEFORE any advance (#1351) so a
 	// dispatch racing the transition observes it. Best-effort append.
-	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, snapshot)
+	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.ClaimsAllOpenPlanConcerns, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, snapshot)
 
 	if !reached {
 		// Recorded but below quorum (or a delegated/agent submission that
@@ -2110,7 +2148,7 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // gates with no approvals block. All new keys ride INSIDE the existing
 // hashed payload JSONB — no new top-level audit.Entry / Export v1 field — so
 // the hash chain and the E9 verifier's strict decode are unaffected.
-func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, sliceAddScopeFiles map[string][]string, sliceMoveScopeFiles map[string][]string, sliceMovesResolved []movedPath, bindingAssertions []bindingAssertion, claimsConcernIDs []string, amendAcceptanceCriteria []acceptanceCriteriaAmendment, delegatedRule, authMethod, channel, onBehalfOf string, snapshot *predicateSnapshot) {
+func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, sliceAddScopeFiles map[string][]string, sliceMoveScopeFiles map[string][]string, sliceMovesResolved []movedPath, bindingAssertions []bindingAssertion, claimsConcernIDs []string, claimsAllOpenPlanConcerns bool, amendAcceptanceCriteria []acceptanceCriteriaAmendment, delegatedRule, authMethod, channel, onBehalfOf string, snapshot *predicateSnapshot) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -2228,6 +2266,17 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	}
 	if app.Decision == approval.DecisionApprove && len(claimsConcernIDs) > 0 {
 		auditPayload["claims_concern_ids"] = claimsConcernIDs
+	}
+	// Shorthand INTENT (E64.77 / #3318): the EXPANDED ids ride claims_concern_ids
+	// above, so the resolution path needs nothing here — but without these two
+	// keys an approve that used claims_all_open_plan_concerns is indistinguishable
+	// from one that hand-listed the same ids, and an expansion that legitimately
+	// resolved to ZERO concerns would leave no trace of the operator's declared
+	// intent at all. Both keys are omitted otherwise, so a non-shorthand approve
+	// marshals byte-identically to today.
+	if app.Decision == approval.DecisionApprove && claimsAllOpenPlanConcerns {
+		auditPayload["claims_all_open_plan_concerns"] = true
+		auditPayload["claims_all_open_plan_concerns_expanded"] = len(claimsConcernIDs)
 	}
 	if delegatedRule != "" {
 		auditPayload["delegated"] = delegatedRule

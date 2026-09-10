@@ -415,7 +415,12 @@ type RunConcernItem struct {
 	// to "" silently — this is the hand-maintained wire mirror the seam test
 	// pins. Omitted for a concern whose note is blank after whitespace
 	// collapsing.
-	ShortSummary string `json:"short_summary,omitempty" jsonschema:"bounded (at most 100 bytes, one line) note-derived recognition label for reading concerns at a glance; equal to the whole collapsed note when it fits, marked with a trailing ... when cut, absent when the note is blank. A recognition label, NOT a unique key — id remains the addressing key for fishhawk_fixup_stage concern_ids; two concerns with a long shared note prefix may share a label"`
+	// ClaimedByApproval mirrors the backend's claimed_by_approval marker
+	// (#3318). The json tag MUST byte-match the server's field or it decodes to
+	// false silently — the same hand-maintained wire mirror ShortSummary below
+	// warns about, and the one the #3318 integration test decodes through.
+	ClaimedByApproval bool   `json:"claimed_by_approval,omitempty" jsonschema:"true when an approval's claims_concern_ids (named explicitly, or expanded from claims_all_open_plan_concerns) covers this concern: it will self-settle to addressed_by_condition at the first confirming implement review and needs NO hand waive at the merge gate. Absent/false means it still needs an operator decision"`
+	ShortSummary      string `json:"short_summary,omitempty" jsonschema:"bounded (at most 100 bytes, one line) note-derived recognition label for reading concerns at a glance; equal to the whole collapsed note when it fits, marked with a trailing ... when cut, absent when the note is blank. A recognition label, NOT a unique key — id remains the addressing key for fishhawk_fixup_stage concern_ids; two concerns with a long shared note prefix may share a label"`
 }
 
 // IssueContext mirrors the OpenAPI shape: the GitHub issue payload
@@ -1072,6 +1077,16 @@ type approvalRequest struct {
 	// DisallowUnknownFields decoder requires the field be declared here too;
 	// reject and claim-less approve callers pass nil (omitempty).
 	ClaimsConcernIDs []string `json:"claims_concern_ids,omitempty"`
+	// ClaimsAllOpenPlanConcerns is the operator's shorthand for "every open
+	// plan-stage concern of this run" (#3318): the backend expands it at approve
+	// time and records the expanded ids under claims_concern_ids. The json tag
+	// MUST byte-match the backend's approvalRequest field or the shorthand is
+	// silently dropped and the operator's claim never lands — the
+	// hand-maintained-wire-mirror trap the adjacent fields warn about. The
+	// DisallowUnknownFields decoder requires the field be declared here too;
+	// reject and shorthand-less approve callers pass false (omitempty), so a
+	// non-shorthand approve posts a byte-identical body.
+	ClaimsAllOpenPlanConcerns bool `json:"claims_all_open_plan_concerns,omitempty"`
 	// AmendAcceptanceCriteria is the operator's approve-time amendment of the
 	// approved plan's acceptance criteria (#2581): retire or restate a criterion
 	// by id, each with a required reason. The backend validates it pre-Submit and
@@ -1232,19 +1247,20 @@ type approvalResult struct {
 //     deployment's per-adapter allow-list; details carry model,
 //     model_source, and adapter. Pre-insert: retry with an allowed
 //     implement_model, or widen the allow-list)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, addScopeFilesToSlice, moveScopeFilesToSlice map[string][]string, bindingAssertions []BindingAssertion, claimsConcernIDs []string, amendAcceptanceCriteria []AcceptanceCriteriaAmendment, implementModel string) (*approvalResult, error) {
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, addScopeFilesToSlice, moveScopeFilesToSlice map[string][]string, bindingAssertions []BindingAssertion, claimsConcernIDs []string, claimsAllOpenPlanConcerns bool, amendAcceptanceCriteria []AcceptanceCriteriaAmendment, implementModel string) (*approvalResult, error) {
 	body, err := json.Marshal(approvalRequest{
-		Decision:                decision,
-		Comment:                 comment,
-		ApproverGithubLogin:     approverGithubLogin,
-		AddScopeFiles:           addScopeFiles,
-		RemoveScopeFiles:        removeScopeFiles,
-		AddScopeFilesToSlice:    addScopeFilesToSlice,
-		MoveScopeFilesToSlice:   moveScopeFilesToSlice,
-		BindingAssertions:       bindingAssertions,
-		ClaimsConcernIDs:        claimsConcernIDs,
-		AmendAcceptanceCriteria: amendAcceptanceCriteria,
-		ImplementModel:          implementModel,
+		Decision:                  decision,
+		Comment:                   comment,
+		ApproverGithubLogin:       approverGithubLogin,
+		AddScopeFiles:             addScopeFiles,
+		RemoveScopeFiles:          removeScopeFiles,
+		AddScopeFilesToSlice:      addScopeFilesToSlice,
+		MoveScopeFilesToSlice:     moveScopeFilesToSlice,
+		BindingAssertions:         bindingAssertions,
+		ClaimsConcernIDs:          claimsConcernIDs,
+		ClaimsAllOpenPlanConcerns: claimsAllOpenPlanConcerns,
+		AmendAcceptanceCriteria:   amendAcceptanceCriteria,
+		ImplementModel:            implementModel,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal approval: %w", err)
@@ -4446,4 +4462,61 @@ func (c *apiClient) doWithStatusUsing(client *http.Client, ctx context.Context, 
 		return resp.StatusCode, fmt.Errorf("decode response: %w", err)
 	}
 	return resp.StatusCode, nil
+}
+
+// BulkWaiveItem is one concern's outcome in a bulk waive. It mirrors the
+// backend's bulkWaiveItemResult; every json tag MUST byte-match or the field
+// decodes to its zero value silently.
+type BulkWaiveItem struct {
+	ConcernID   string `json:"concern_id" jsonschema:"the concern this outcome belongs to"`
+	Applied     bool   `json:"applied" jsonschema:"true when this concern was waived; false when it failed mid-batch"`
+	State       string `json:"state,omitempty" jsonschema:"the concern's state after the waive (waived) — present only when applied"`
+	StateReason string `json:"state_reason,omitempty" jsonschema:"the stored rationale — present only when applied"`
+	ErrorCode   string `json:"error_code,omitempty" jsonschema:"concern_waive_conflict, audit_append_failed or internal_error — present only when this item failed"`
+	Error       string `json:"error,omitempty" jsonschema:"the failure detail for this item"`
+}
+
+// BulkWaiveResult is the decoded 200 body of the bulk waive. Waived + Failed
+// always sum to len(Results), and Results is in REQUEST order — a mid-batch
+// failure does NOT abort the remaining items (the batch is deliberately not a
+// transaction; each concern carries its own audit row).
+type BulkWaiveResult struct {
+	RunID   string          `json:"run_id"`
+	Reason  string          `json:"reason" jsonschema:"the single rationale recorded on every concern_waived entry in the batch"`
+	Waived  int             `json:"waived" jsonschema:"how many concerns were waived"`
+	Failed  int             `json:"failed" jsonschema:"how many failed mid-batch; read results[] for which"`
+	Results []BulkWaiveItem `json:"results" jsonschema:"per-concern outcome in request order"`
+}
+
+// bulkWaiveRequestBody mirrors the backend's bulkWaiveRequest
+// (`backend/internal/server/bulk_waive.go::bulkWaiveRequest`).
+type bulkWaiveRequestBody struct {
+	ConcernIDs []string `json:"concern_ids"`
+	Reason     string   `json:"reason"`
+	Delegated  bool     `json:"delegated,omitempty"`
+}
+
+// BulkWaiveConcerns waives a LIST of one run's open concerns with ONE audited
+// reason via `POST /v0/runs/{run_id}/concerns/waive` (E64.77 / #3318). The
+// PRE-VALIDATION half is all-or-nothing (nothing is waived when it refuses);
+// the APPLY half is per-item. 4xx/5xx surfaces:
+//   - 400 validation_failed (blank reason, empty concern_ids, over the 50-id
+//     cap, a duplicate id, a non-UUID id, or an id belonging to another run —
+//     the last carrying details.rule "concern_run_mismatch")
+//   - 403 cross_run_waive (a run-bound token reaching another run) or
+//     insufficient_scope
+//   - 404 concern_not_found (an id with no row)
+//   - 422 concern_waive_conflict (an id not in an open state — the WHOLE batch
+//     is refused and nothing is waived)
+//   - 503 concern_store_unconfigured
+func (c *apiClient) BulkWaiveConcerns(ctx context.Context, runID uuid.UUID, concernIDs []string, reason string, delegated bool) (*BulkWaiveResult, error) {
+	body, err := json.Marshal(bulkWaiveRequestBody{ConcernIDs: concernIDs, Reason: reason, Delegated: delegated})
+	if err != nil {
+		return nil, fmt.Errorf("marshal bulk waive: %w", err)
+	}
+	var out BulkWaiveResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/concerns/waive", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }

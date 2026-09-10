@@ -1779,6 +1779,20 @@ components:
             surfaced — the diff text itself is not reflected here. A routed
             fix-up whose concerns all carry a patch can be resolved by the
             near-deterministic apply path instead of a full agent loop.
+        claimed_by_approval:
+          type: boolean
+          description: |
+            True when an approval's `claims_concern_ids` — named explicitly, or
+            expanded from the `claims_all_open_plan_concerns` shorthand — covers
+            this concern (E64.77 / #3318): it will self-settle to the terminal
+            `addressed_by_condition` state at the first confirming implement
+            review and needs NO hand waive at the merge gate. OMITTED when the
+            concern is unclaimed. Only meaningful while the concern is OPEN — a
+            settled one has left this list — so it is what tells an operator, at
+            the gate, which open concerns they can leave alone. Best-effort: when
+            the approval-audit read fails the markers are omitted while the
+            `concerns` block itself stays present (presence remains the
+            authoritative store-read signal, #3043).
         short_summary:
           type: string
           maxLength: 100
@@ -13320,6 +13334,34 @@ paths:
                     before any approval row is recorded. Honored only on
                     `approve`; ignored on `reject`. Omitting the field is
                     byte-identical to today.
+                claims_all_open_plan_concerns:
+                  type: boolean
+                  default: false
+                  description: |
+                    Optional SHORTHAND for `claims_concern_ids` (E64.77 / #3318):
+                    claim EVERY open plan-stage concern of this run instead of
+                    naming ids. The backend EXPANDS it at approve time into the
+                    run's full open plan-stage concern id set and records THOSE
+                    ids under the existing `claims_concern_ids` key of the
+                    `approval_submitted` payload, so the downstream resolution
+                    path is byte-identical to the per-id form. The expansion is a
+                    SNAPSHOT taken during this request, not a continuously
+                    evaluated set — a concern raised AFTER the approval is not
+                    claimed. Two additive intent keys ride the same payload so an
+                    expansion that legitimately resolved to ZERO concerns is still
+                    reconstructable: `claims_all_open_plan_concerns: true` and
+                    `claims_all_open_plan_concerns_expanded: <count>`. MUTUALLY
+                    EXCLUSIVE with `claims_concern_ids` — supplying both is
+                    refused `400 validation_failed` with `details.rule`
+                    `claims_all_and_explicit_ids`, because the expansion is always
+                    a superset of any valid explicit list and accepting both would
+                    make the recorded claim ambiguous. Approve-only and
+                    plan-stage-only (`400 validation_failed`); `503
+                    concern_store_unconfigured` when no concern store is wired;
+                    `500 internal_error` when the concern store read fails (a
+                    retryable outage, not a corrected input). Every refusal is
+                    pre-Submit, so no approval row is recorded. An empty expansion
+                    is legal. Omitting the field is byte-identical to today.
                 implement_model:
                   type: string
                   description: |
@@ -14947,6 +14989,162 @@ paths:
           description: |
             Concern or audit store not configured on this deployment.
             Body's `error` is `concern_store_unconfigured`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/concerns/waive:
+    post:
+      operationId: bulkWaiveConcerns
+      summary: Waive several of one run's open concerns with one audited reason
+      description: |
+        The BULK sibling of `POST /v0/concerns/{concern_id}/waive` (E64.77 /
+        #3318): waive a LIST of THIS run's open concerns under ONE reason,
+        recording one `concern_waived` audit row per concern. It closes the
+        merge-gate toil of a run reaching its gate with a dozen concerns the
+        operator has already judged non-blocking, each otherwise costing its own
+        round trip. Prefer the single-concern endpoint when the concerns need
+        DIFFERENT reasons — the reason is what later re-reviews read.
+
+        The two halves have deliberately different atomicity:
+
+        - **PRE-VALIDATION is all-or-nothing and mutates NOTHING.** The first
+          violation refuses the WHOLE batch, naming the offending id.
+        - **the APPLY loop is per-item.** The batch is deliberately NOT a
+          database transaction: each concern carries its own audit row, and
+          wrapping N chained audit appends plus N transitions in one transaction
+          would either serialize the chain append or leave the chain and the
+          concern store inconsistent on rollback. So a concurrent transition
+          that raced the pre-validation fails ONE item while the rest still
+          apply — reported as per-item `results` plus `waived`/`failed` counts
+          rather than a single misleading status.
+
+        Each item goes through the SAME durable-record-first helper the single
+        waive uses: the `concern_waived` intent entry is appended FIRST (with an
+        additive `bulk_waive: true` marker) and append failure means NO mutation
+        for that concern; a transition failure after the append appends the
+        corrective `concern_waive_failed` entry.
+
+        Auth mirrors the single waive: `write:stages` OR `write:fixups`; an mcp
+        run-bound token (subject `mcp:run:<uuid>`) may only bulk-waive its own
+        run, compared against the PATH run id (403 `cross_run_waive`).
+      tags: [stages]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [concern_ids, reason]
+              properties:
+                concern_ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items: { $ref: '#/components/schemas/UUID' }
+                  description: |
+                    The concerns to waive. Every id must be an OPEN concern of
+                    THIS run. At most 50 per batch — a named `400` refusal, never
+                    a silent truncation, so an operator who hits it splits the
+                    batch rather than losing concerns.
+                reason:
+                  type: string
+                  minLength: 1
+                  description: |
+                    REQUIRED operator rationale, recorded on EVERY
+                    `concern_waived` entry in the batch and stored as each
+                    concern's `state_reason`. One reason covers the batch — make
+                    it self-contained, since later re-reviews read it verbatim.
+                delegated:
+                  type: boolean
+                  default: false
+                  description: |
+                    Opts the batch into the ADR-040 delegated-action path. The
+                    `operator_agent.may_waive` condition is evaluated ONCE for
+                    the run BEFORE any intent entry is appended (every batched
+                    concern shares the run), with the same 403
+                    `delegation_not_configured` / `delegation_condition_unmet`
+                    refusals the single waive uses.
+      responses:
+        '200':
+          description: |
+            The batch was applied. `waived` counts items with `applied: true`,
+            `failed` counts `applied: false`, and `results` is in REQUEST order —
+            so a three-item batch whose SECOND item failed reports
+            `waived: 2` / `failed: 1`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, reason, waived, failed, results]
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  reason: { type: string }
+                  waived: { type: integer }
+                  failed: { type: integer }
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      required: [concern_id, applied]
+                      properties:
+                        concern_id: { $ref: '#/components/schemas/UUID' }
+                        applied: { type: boolean }
+                        state: { type: string, description: 'The concern state after the waive; present only when applied.' }
+                        state_reason: { type: string, description: 'The stored rationale; present only when applied.' }
+                        error_code:
+                          type: string
+                          description: |
+                            Present only when this item FAILED. Reuses the single
+                            waive's vocabulary so an operator reads one code set:
+                            `concern_waive_conflict`, `audit_append_failed`, or
+                            `internal_error`.
+                        error: { type: string, description: 'The failure detail for this item.' }
+        '400':
+          description: |
+            Body's `error` is `validation_failed` for: a malformed body or
+            non-UUID `run_id`; a blank `reason`; an empty `concern_ids`; more
+            than 50 ids (`details` carries `count` and `max`); a duplicate id; a
+            non-UUID id; or an id belonging to ANOTHER run — the last carrying
+            `details.rule` `concern_run_mismatch` alongside `concern_id`,
+            `concern_run_id` and `path_run_id`. Every one refuses the whole batch
+            with NOTHING waived.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` (the token lacks both `write:stages` and
+            `write:fixups`), `cross_run_waive` (an mcp run-bound token whose run
+            does not match the PATH run id), or the `delegated: true` refusals
+            `delegation_not_configured` / `delegation_condition_unmet`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            One of the named ids resolves to no concern row. Body's `error` is
+            `concern_not_found`, `details.concern_id` names it, and the whole
+            batch is refused with nothing waived.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            One of the named ids is not in an OPEN state. Body's `error` is
+            `concern_waive_conflict`, `details` carries the offending
+            `concern_id` and the rejected `from`/`to` pair, and the WHOLE batch
+            is refused — nothing is waived.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            Concern or audit store not configured on this deployment. Body's
+            `error` is `concern_store_unconfigured`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

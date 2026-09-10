@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 275 names are tool I/O request/response structs. The MCP
+// The bulk of these 279 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -58,6 +58,13 @@ var exportBaseline = []string{
 	"AwaitStageOutput",
 	"BindingAssertion",
 	"BudgetStatus",
+	// E64.77 / #3318: the client mirrors of the bulk-waive response
+	// (POST /v0/runs/{run_id}/concerns/waive). Exported because
+	// WaiveConcernsOutput embeds BulkWaiveResult, which embeds
+	// []BulkWaiveItem, and the SDK reflects over the whole tree to build the
+	// tool's output schema.
+	"BulkWaiveItem",
+	"BulkWaiveResult",
 	"CacheEfficiency",
 	"CacheEfficiencyStage",
 	"CalibrationParams",
@@ -338,6 +345,11 @@ var exportBaseline = []string{
 	"VouchCommitResult",
 	"WaiveConcernInput",
 	"WaiveConcernOutput",
+	// E64.77 / #3318: the BULK waive tool's I/O structs
+	// (fishhawk_waive_concerns). Exported for the same SDK-reflection reason
+	// as every other tool I/O type in this baseline.
+	"WaiveConcernsInput",
+	"WaiveConcernsOutput",
 	"WaivedConcern",
 	"WorkItemRelations",
 }
