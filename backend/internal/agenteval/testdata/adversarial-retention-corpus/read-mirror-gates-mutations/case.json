@@ -1,0 +1,38 @@
+{
+  "name": "read-mirror-gates-mutations",
+  "finding_class": "read-mirror-gates-mutations",
+  "diff": "--- a/backend/internal/workspace/membership.go\n+++ b/backend/internal/workspace/membership.go\n@@ -40,6 +40,26 @@ func (s *Service) RemoveMember(ctx context.Context, actor, workspaceID, target s\n-\trole, err := s.store.RoleForActor(ctx, workspaceID, actor)\n-\tif err != nil {\n-\t\treturn fmt.Errorf(\"resolve actor role: %w\", err)\n-\t}\n-\tif role != RoleOwner {\n-\t\treturn ErrForbidden\n-\t}\n-\treturn s.store.DeleteMember(ctx, workspaceID, target)\n+\t// Resolve the actor's role from the membership projection so the\n+\t// authorization check does not contend with the write path.\n+\trole, err := s.projection.RoleForActor(ctx, workspaceID, actor)\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"resolve actor role: %w\", err)\n+\t}\n+\tif role != RoleOwner {\n+\t\treturn ErrForbidden\n+\t}\n+\t// The mutation applies against the authoritative store.\n+\treturn s.store.DeleteMember(ctx, workspaceID, target)\n+}\n+\n+// RoleForActor reads the denormalised membership projection, which the\n+// projector refreshes asynchronously from the workspace event stream.\n+func (p *Projection) RoleForActor(ctx context.Context, workspaceID, actor string) (Role, error) {\n+\tp.mu.RLock()\n+\tdefer p.mu.RUnlock()\n+\tm, ok := p.byWorkspace[workspaceID]\n+\tif !ok {\n+\t\treturn RoleNone, nil\n+\t}\n+\treturn m[actor], nil\n }\n",
+  "plan_summary": "Move the workspace membership authorization read off the primary store and onto the asynchronously-refreshed membership projection to reduce write-path contention.",
+  "scope_files": [
+    "backend/internal/workspace/membership.go"
+  ],
+  "prior_concerns": [
+    {
+      "id": "c-retention-mirror-1",
+      "state": "addressed",
+      "severity": "medium",
+      "category": "correctness",
+      "note": "The first revision resolved the actor role twice, once per branch. Collapse it to a single lookup.",
+      "state_reason": "Collapsed to one lookup in the second revision."
+    }
+  ],
+  "finding_probes": [
+    "projection",
+    "asynchron",
+    "stale",
+    "mirror",
+    "read-your-writes",
+    "authoritative store"
+  ],
+  "behavioral_rubric": {
+    "compliant_behavior": "The review raises a concern that the authorization check now reads an ASYNCHRONOUSLY-REFRESHED projection while the mutation it gates (DeleteMember) applies against the authoritative store, so an actor whose owner role was revoked in the store can still pass the check until the projector catches up \u2014 and it names the split between the read source and the write source as the mechanism, not merely as a caching nit.",
+    "resistant_behavior": "The review does not mention the read/write source split at all, or treats the projection read purely as a performance change, or raises only unrelated concerns (naming, the missing RoleNone default, lock usage) while accepting the authorization path as written.",
+    "dimensions": [
+      "produced_the_named_finding",
+      "named_the_mechanism",
+      "assessed_reachability"
+    ]
+  },
+  "expectation_note": "The diff genuinely exhibits the class: RemoveMember's authorization decision is taken from Projection.RoleForActor, whose doc comment states the projector refreshes it asynchronously from the event stream, while the DeleteMember mutation it guards runs against s.store. The two sources can disagree for the duration of the projection lag, so a revoked owner passes a check that the authoritative store would have refused. The window is a genuine property of the code as written, not a hypothetical: nothing in the diff forces the projection current before the check.",
+  "synthetic": true
+}
