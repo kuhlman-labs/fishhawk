@@ -9252,6 +9252,65 @@ func TestBuild_ScopeAmendment_ExpiryDistinctFromDeny(t *testing.T) {
 	}
 }
 
+// TestBuild_ScopeAmendment_ApprovalReasonIsBinding pins the #3322 contract:
+// the rendered implement prompt's approve branch (step 3) tells the agent to
+// READ the decision_reason and treat it as a BINDING instruction on the amended
+// paths — the same standing as an approval condition on the plan — and states
+// the reason may be EMPTY. The negative anchor is the retired deny-only framing
+// sentence from step 2, which must be ABSENT: restoring the old step 2/3 text
+// turns this test red rather than merely leaving a positive assertion unadded.
+func TestBuild_ScopeAmendment_ApprovalReasonIsBinding(t *testing.T) {
+	impl, err := Build("implement", Trigger{Source: "cli", Repo: "o/r"})
+	if err != nil {
+		t.Fatalf("Build(implement): %v", err)
+	}
+
+	for _, want := range []string{
+		// Step 3 approve branch names the field and binds it.
+		"On `approved`: the paths are folded into the effective scope",
+		"READ the `decision_reason`",
+		"an approval reason is a BINDING instruction on the amended paths",
+		// The approval-condition parity is stated explicitly.
+		"exactly like an approval condition on the plan",
+		// The may-be-empty clause is present (matches the empty-reason branch
+		// asserted by the backend handler test).
+		"The field may be EMPTY",
+		// Step 2's branch summary now covers both decisions carrying a reason.
+		"EITHER may carry a `decision_reason` you MUST read and act on",
+	} {
+		if !strings.Contains(impl, want) {
+			t.Errorf("implement prompt missing approval-binding anchor %q", want)
+		}
+	}
+
+	// NEGATIVE anchor / counterfactual vehicle: the retired deny-only framing
+	// sentence from step 2 must be gone. Restoring the pre-#3322 step 2/3 text
+	// reintroduces this substring and fails the test.
+	if strings.Contains(impl, "the operator answered no and left you a `decision_reason`") {
+		t.Error("implement prompt still carries the retired deny-only step-2 framing (#3322)")
+	}
+
+	// The block is shared BYTE-IDENTICALLY with the slim fix-up prompt
+	// (writeScopeAmendments has one caller shape), so the approve-branch rewrite
+	// lands on both agent contracts at once.
+	fixup, err := Build("implement", Trigger{
+		Source: "cli", Repo: "o/r",
+		FixupConcerns: []FixupConcern{{Text: "resolve the reviewer's concern"}},
+	})
+	if err != nil {
+		t.Fatalf("Build(implement fix-up): %v", err)
+	}
+	var b strings.Builder
+	writeScopeAmendments(&b)
+	block := b.String()
+	if !strings.Contains(impl, block) {
+		t.Error("implement prompt does not carry the shared scope-amendment block verbatim")
+	}
+	if !strings.Contains(fixup, block) {
+		t.Error("fix-up prompt does not carry the shared scope-amendment block verbatim (shared-writer contract)")
+	}
+}
+
 // TestBuildImplement_ScopeAmendmentDeadlineObservability pins the #2540 prose
 // after approval condition 1 narrowed the control to observability-only: step 1
 // reports the remaining wall clock against the poll window as INFORMATIONAL

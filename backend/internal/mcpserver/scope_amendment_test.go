@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -309,5 +310,88 @@ func TestDecideScopeAmendment_FieldsAbsent_NoWarning(t *testing.T) {
 	}
 	if meta != nil {
 		t.Errorf("meta = %+v, want nil for an older-backend shape", meta)
+	}
+}
+
+// TestDecideScopeAmendment_DescriptionStatesApprovalBinding pins the #3322
+// operator-surface correction: the registered fishhawk_decide_scope_amendment
+// tool must tell the operator that an approval reason reaches the agent and is
+// treated as a binding instruction, and the retired deny-only phrasing must be
+// gone from the reason input-schema description. Asserted over the real
+// ListTools round-trip so a comment-only touch cannot satisfy it.
+//
+// COUNTERFACTUAL: restore the old jsonschema string ("delivered to the agent
+// verbatim on deny (decision_reason)") and the deny-only-absent assertion goes
+// red; drop the binding sentence from the description and the positive anchors
+// go red.
+func TestDecideScopeAmendment_DescriptionStatesApprovalBinding(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range res.Tools {
+		if tl.Name == "fishhawk_decide_scope_amendment" {
+			tool = tl
+			break
+		}
+	}
+	if tool == nil {
+		t.Fatal("fishhawk_decide_scope_amendment not registered/visible over ListTools")
+	}
+
+	// The description states the approval reason reaches the agent and binds.
+	lowerDesc := strings.ToLower(tool.Description)
+	for _, want := range []string{"reads your reason on approve", "binding instruction on the amended paths"} {
+		if !strings.Contains(lowerDesc, strings.ToLower(want)) {
+			t.Errorf("decide description missing approval-binding anchor %q:\n%s", want, tool.Description)
+		}
+	}
+
+	// The reason input-schema description states approve-AND-deny delivery and
+	// no longer carries the retired deny-only phrasing.
+	if tool.InputSchema == nil {
+		t.Fatal("fishhawk_decide_scope_amendment has no input schema")
+	}
+	rawSchema, err := json.Marshal(tool.InputSchema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Description string `json:"description"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(rawSchema, &schema); err != nil {
+		t.Fatalf("decode input schema: %v (%s)", err, rawSchema)
+	}
+	reason, ok := schema.Properties["reason"]
+	if !ok {
+		t.Fatalf("input schema has no 'reason' property: %s", rawSchema)
+	}
+	if !strings.Contains(strings.ToLower(reason.Description), "on approve and on deny") {
+		t.Errorf("reason schema must state approve-and-deny delivery:\n%s", reason.Description)
+	}
+	if strings.Contains(reason.Description, "delivered to the agent verbatim on deny") {
+		t.Errorf("reason schema still carries the retired deny-only phrasing (#3322):\n%s", reason.Description)
 	}
 }

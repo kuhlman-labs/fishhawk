@@ -1249,6 +1249,91 @@ func TestScopeAmendment_EndToEnd_DecisionThenList(t *testing.T) {
 	}
 }
 
+// TestScopeAmendment_ApprovalReasonReachesAgent is the #3322 backend half of
+// the agent-seam pin: an APPROVED amendment's operator decision_reason must
+// reach the implement agent through the agent's OWN run-bound poll — both the
+// plain list read and the ?wait long-poll read — so the prompt's new "read the
+// approval reason" contract has a delivered field to read. The empty-reason
+// branch pins the prompt's may-be-empty clause: approving with no reason still
+// approves the row and carries no non-empty decision_reason.
+//
+// COUNTERFACTUAL: make amendmentToResponse
+// (backend/internal/server/scope_amendment.go) copy DecisionReason only when the
+// status is denied and both verbatim-reason assertions below go red.
+func TestScopeAmendment_ApprovalReasonReachesAgent(t *testing.T) {
+	s, _, _, _, runRow, _ := scopeAmendmentServer(t)
+	amendmentID := seedPendingAmendment(t, s, runRow.ID)
+
+	const reason = "use the helper in pkg/util rather than re-deriving it"
+	if w := postDecision(t, s, runRow.ID, amendmentID,
+		`{"decision":"approve","reason":"`+reason+`"}`,
+		func(r *http.Request) *http.Request { return withOperatorIdentity(r, "write:stages") }); w.Code != http.StatusOK {
+		t.Fatalf("decision status = %d", w.Code)
+	}
+
+	runBound := func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read")
+	}
+
+	// Plain list read (the agent's own poll path).
+	readApproved := func(t *testing.T, w *httptest.ResponseRecorder, wantReason string) {
+		t.Helper()
+		if w.Code != http.StatusOK {
+			t.Fatalf("list status = %d", w.Code)
+		}
+		var resp scopeAmendmentListResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Items) != 1 {
+			t.Fatalf("items = %d, want 1", len(resp.Items))
+		}
+		item := resp.Items[0]
+		if item.Status != "approved" {
+			t.Errorf("status = %q, want approved", item.Status)
+		}
+		if item.DecisionReason == nil || *item.DecisionReason != wantReason {
+			t.Errorf("decision_reason = %v, want %q on the approved row", item.DecisionReason, wantReason)
+		}
+	}
+
+	readApproved(t, getAmendments(t, s, runRow.ID, runBound), reason)
+	// The ?wait long-poll read path returns immediately for an already-decided
+	// row and must carry the same reason.
+	readApproved(t, getAmendmentsWait(t, s, runRow.ID, 1, runBound), reason)
+
+	// EMPTY-reason branch: approving with no reason still approves, and the
+	// response carries no non-empty decision_reason (the prompt's may-be-empty
+	// clause is honest).
+	s2, _, _, _, runRow2, _ := scopeAmendmentServer(t)
+	amendmentID2 := seedPendingAmendment(t, s2, runRow2.ID)
+	if w := postDecision(t, s2, runRow2.ID, amendmentID2,
+		`{"decision":"approve","reason":""}`,
+		func(r *http.Request) *http.Request { return withOperatorIdentity(r, "write:stages") }); w.Code != http.StatusOK {
+		t.Fatalf("empty-reason decision status = %d", w.Code)
+	}
+	w := getAmendments(t, s2, runRow2.ID, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow2.ID, "mcp:read")
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("list status = %d", w.Code)
+	}
+	var resp scopeAmendmentListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Items) != 1 {
+		t.Fatalf("items = %d, want 1", len(resp.Items))
+	}
+	item := resp.Items[0]
+	if item.Status != "approved" {
+		t.Errorf("status = %q, want approved on an empty-reason approval", item.Status)
+	}
+	if item.DecisionReason != nil && *item.DecisionReason != "" {
+		t.Errorf("decision_reason = %q, want absent/empty on an empty-reason approval", *item.DecisionReason)
+	}
+}
+
 // --- Scope-cap headroom on amendment surfaces (#983) ---
 
 // scopeAmendmentHeadroomServer mirrors scopeAmendmentServer but wires
