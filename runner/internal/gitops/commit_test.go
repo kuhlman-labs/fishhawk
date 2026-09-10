@@ -5399,6 +5399,10 @@ func TestHardeningArgs(t *testing.T) {
 		"core.pager=cat",                   // pager spawn
 		"commit.gpgsign=false",             // gpg.program spawn
 		"credential.helper=",               // credential-helper binary, with a push token in scope
+		// Not a command-executing key: it changes how git PARSES the message
+		// the conflict-resolution gate compares, so without it the runner-side
+		// normalization is a guess about the repository's configuration.
+		"core.commentChar=#",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("HardeningArgs missing %q: %v", want, args)
@@ -5413,5 +5417,328 @@ func TestHardeningArgs(t *testing.T) {
 	// which an agent CAN write — the neutralization must not degrade to it.
 	if InertHooksPath == "" {
 		t.Error("InertHooksPath is empty, which makes git resolve hooks relative to the working directory")
+	}
+}
+
+// --- push-destination guard (#3338) ---
+
+// pushDecoyFixture is pushCommittedFixture plus a SECOND, real, REACHABLE bare
+// repository in the same temp dir, standing in for the destination an
+// agent-poisoned `url.<base>.insteadOf` would redirect to.
+//
+// Reachability is what makes the counterfactual honest: with the guard deleted
+// the push must SUCCEED into the decoy, so the red is the branch APPEARING
+// there. Pointing the decoy at an unreachable address would fail the push for a
+// reason that is not the control's, and the test would stay green with the
+// control gone.
+func pushDecoyFixture(t *testing.T) (repo, origin, decoy, head string) {
+	t.Helper()
+	repo, origin, head = pushCommittedFixture(t)
+	decoy = filepath.Join(filepath.Dir(origin), "decoy.git")
+	mustGit(t, repo, "init", "--bare", decoy)
+	return repo, origin, decoy, head
+}
+
+// TestPushCommittedBranch_RefusesRewrittenDestination pins both halves of the
+// destination guard against a REAL redirect, one case per rewrite mechanism.
+//
+// `insteadOf` is caught by check (a): git's own `ls-remote --get-url` resolution
+// returns the decoy, which is not the authorized remote. `pushInsteadOf` is
+// caught ONLY by check (b): `--get-url` applies FETCH rewriting, so it reports
+// the supplied URL unchanged and (a) structurally cannot see the redirect.
+//
+// Every assertion reads COMMITTED REMOTE STATE. A control that fires after the
+// write returns a byte-identical error to one that prevented it, so the branch
+// must be absent from BOTH bare repos — the decoy (the exfiltration) and the
+// origin (which the guard also declines to write).
+func TestPushCommittedBranch_RefusesRewrittenDestination(t *testing.T) {
+	cases := []struct{ name, key string }{
+		{"instead_of", "insteadOf"},
+		{"push_instead_of", "pushInsteadOf"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, origin, decoy, head := pushDecoyFixture(t)
+			mustGit(t, repo, "config", "url."+decoy+"."+tc.key, origin)
+
+			_, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+				RepoDir: repo, Branch: "fishhawk/run-x", RemoteURL: origin, HeadSHA: head,
+			})
+			// Error, not Fatal: the COMMITTED-STATE assertions below are what
+			// discriminate. A control that fires after the write returns a
+			// byte-identical error to one that prevented it, so the test must
+			// reach the bare-repo reads even when the error is missing.
+			if err == nil {
+				t.Error("PushCommittedBranch published to a rewritten destination")
+			}
+			if tip := bareBranchTip(t, decoy, "fishhawk/run-x"); tip != "" {
+				t.Errorf("the branch landed in the DECOY remote (%s) — the redirect was not refused", tip)
+			}
+			if tip := bareBranchTip(t, origin, "fishhawk/run-x"); tip != "" {
+				t.Errorf("the branch was published despite the refusal: origin tip = %s", tip)
+			}
+		})
+	}
+}
+
+// TestPushCommittedBranch_AllowsBenignRewrite is the test that keeps check (b)
+// NARROW. This repository carries a benign `url.https://github.com/.insteadOf =
+// git@github.com:` in LOCAL scope — a fetch-rewrite in the harmless direction
+// that leaves the URL the runner supplies UNCHANGED. A check (b) widened to the
+// whole `url.` namespace would refuse it, making the conflict-resolution pass
+// permanently unusable in its own development environment; this case goes RED if
+// that widening is ever reintroduced.
+//
+// The fixture mirrors that real shape: the key rewrites a DIFFERENT prefix TO
+// the one the caller passes, so `ls-remote --get-url` returns the supplied URL
+// byte-for-byte and check (a) is satisfied on the merits, not by luck.
+func TestPushCommittedBranch_AllowsBenignRewrite(t *testing.T) {
+	repo, origin, decoy, head := pushDecoyFixture(t)
+	mustGit(t, repo, "config", "url."+origin+".insteadOf", decoy)
+
+	res, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+		RepoDir: repo, Branch: "fishhawk/run-x", RemoteURL: origin, HeadSHA: head,
+	})
+	if err != nil {
+		t.Fatalf("a benign insteadOf rewrite was refused: %v", err)
+	}
+	if res.RemoteHeadSHA != head {
+		t.Errorf("RemoteHeadSHA = %q, want %q", res.RemoteHeadSHA, head)
+	}
+	if tip := bareBranchTip(t, origin, "fishhawk/run-x"); tip != head {
+		t.Errorf("origin tip = %q, want %q — the authorized push did not land", tip, head)
+	}
+}
+
+// failingProbeCmd builds a p.Cmd seam that delegates to exec.CommandContext for
+// EVERY git invocation except the one whose argv contains every string in
+// `match`, which it replaces with a command that exits non-zero.
+//
+// The seam is what makes the fail-closed assertion unambiguous. A non-git
+// RepoDir does NOT reliably exercise the guard — `ls-remote --get-url` resolves
+// a literal URL outside a repository and `config --get-regexp` still reads
+// global config there — so a LATER push failure could satisfy an error-only
+// assertion while proving nothing. Here the push itself would still SUCCEED if
+// the guard let it through, so "the branch is absent from origin" can only be
+// satisfied by a guard that refused before the write.
+func failingProbeCmd(match ...string) func(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		joined := strings.Join(args, " ")
+		hit := true
+		for _, m := range match {
+			if !strings.Contains(joined, m) {
+				hit = false
+				break
+			}
+		}
+		if hit {
+			return exec.CommandContext(ctx, "sh", "-c", "exit 3")
+		}
+		return exec.CommandContext(ctx, name, args...)
+	}
+}
+
+// TestPushCommittedBranch_ProbeFailureFailsClosed pins each probe's OWN
+// unverifiable-destination branch. An unverifiable destination is not an
+// approved one, so both fail closed.
+//
+// Exit 3 (not 1) on the `--get-regexp` case is deliberate: exit 1 with no output
+// is git's documented "pattern matched nothing", which is the PASS case, so the
+// unexpected-exit branch needs a different code to be reached at all.
+func TestPushCommittedBranch_ProbeFailureFailsClosed(t *testing.T) {
+	cases := []struct {
+		name  string
+		match []string
+	}{
+		{"identity_probe", []string{"ls-remote", "--get-url"}},
+		{"push_rewrite_probe", []string{"--get-regexp"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, origin, _, head := pushDecoyFixture(t)
+
+			p := &Pusher{Cmd: failingProbeCmd(tc.match...)}
+			if _, err := p.PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+				RepoDir: repo, Branch: "fishhawk/run-x", RemoteURL: origin, HeadSHA: head,
+			}); err == nil {
+				// Error, not Fatal — the origin-tip read below is the
+				// discriminating assertion. See above.
+				t.Error("PushCommittedBranch published with an unverifiable destination")
+			}
+			if tip := bareBranchTip(t, origin, "fishhawk/run-x"); tip != "" {
+				t.Errorf("the branch was published despite the failed probe: origin tip = %s", tip)
+			}
+		})
+	}
+}
+
+// TestPushCommittedBranch_EmptyRegexpProbeFailsClosed pins check (b)'s
+// unexpected-SHAPE branch, the sibling of the unexpected-EXIT one above:
+// `git config --get-regexp` exiting 0 with NO output is not a shape git
+// produces, so it is unverifiable, not a pass.
+//
+// git will not produce it, which is exactly why the assertion goes through the
+// p.Cmd seam — the branch is a fail-closed default for a git that behaves
+// differently than documented, and prose alone would leave it untested. The
+// push itself would still succeed if the guard let it through.
+func TestPushCommittedBranch_EmptyRegexpProbeFailsClosed(t *testing.T) {
+	repo, origin, _, head := pushDecoyFixture(t)
+
+	p := &Pusher{Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if strings.Contains(strings.Join(args, " "), "--get-regexp") {
+			return exec.CommandContext(ctx, "sh", "-c", "exit 0")
+		}
+		return exec.CommandContext(ctx, name, args...)
+	}}
+	if _, err := p.PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+		RepoDir: repo, Branch: "fishhawk/run-x", RemoteURL: origin, HeadSHA: head,
+	}); err == nil {
+		t.Error("PushCommittedBranch published on an undocumented probe shape")
+	}
+	if tip := bareBranchTip(t, origin, "fishhawk/run-x"); tip != "" {
+		t.Errorf("the branch was published despite the unverifiable probe: origin tip = %s", tip)
+	}
+}
+
+// TestPushCommittedBranch_RefusalRedactsHostileConfigKey drives the redaction
+// THROUGH THE GUARD rather than through its helper, which is the point: the
+// helper tests hand redactConfigKeyName a key that is already correctly framed,
+// so they cannot see a PARSING step that mis-frames it first. Both fixtures
+// below are keys git accepts and a line-oriented parse mangles.
+//
+//   - whitespace_subsection: a git config subsection may contain whitespace, so
+//     `url.https://user:<token>@host path/.pushinsteadof` truncated at the first
+//     whitespace-separated field leaves a TWO-component key whose second half is
+//     the credential — which redactConfigKeyName then emits verbatim, because a
+//     two-component key has no subsection to replace.
+//   - newline_in_value: a config VALUE may contain a newline, and without `-z`
+//     git prints the value on the same logical record, so a line-split reads the
+//     value's continuation lines as key names.
+//
+// Every case asserts the refusal FIRED (the config is hostile), that the branch
+// reached NEITHER bare repo, and that no planted secret appears anywhere in the
+// error text.
+func TestPushCommittedBranch_RefusalRedactsHostileConfigKey(t *testing.T) {
+	const token = "s3cr3t-token"
+	const valueSecret = "v4lue-s3cr3t"
+	cases := []struct{ name, key, value string }{
+		{
+			"whitespace_subsection",
+			"url.https://user:" + token + "@host path/.pushInsteadOf",
+			"https://example.com/",
+		},
+		{
+			"newline_in_value",
+			"url.https://example.com/.pushInsteadOf",
+			"https://example.com/\nsecret." + valueSecret,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, origin, decoy, head := pushDecoyFixture(t)
+			mustGit(t, repo, "config", tc.key, tc.value)
+
+			_, err := (&Pusher{}).PushCommittedBranch(context.Background(), PushCommittedBranchArgs{
+				RepoDir: repo, Branch: "fishhawk/run-x", RemoteURL: origin, HeadSHA: head,
+			})
+			if err == nil {
+				t.Fatal("PushCommittedBranch published with a push-rewrite key configured")
+			}
+			for _, secret := range []string{token, valueSecret, "user:", "host path"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("the refusal leaked %q: %v", secret, err)
+				}
+			}
+			if want := "url." + pushDestinationRedaction + ".pushinsteadof"; !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal must still name the redacted key shape %q: %v", want, err)
+			}
+			if tip := bareBranchTip(t, decoy, "fishhawk/run-x"); tip != "" {
+				t.Errorf("the branch landed in the DECOY remote (%s)", tip)
+			}
+			if tip := bareBranchTip(t, origin, "fishhawk/run-x"); tip != "" {
+				t.Errorf("the branch was published despite the refusal: origin tip = %s", tip)
+			}
+		})
+	}
+}
+
+// TestRedactURLUserinfo pins the three shapes plus the fail-safe. The URL this
+// runs on is one an ATTACKER shaped — a poisoned insteadOf can rewrite the
+// runner's remote into a `user:token@host` form that then flows into the
+// operator-visible refusal — so every case asserts the credential is ABSENT.
+func TestRedactURLUserinfo(t *testing.T) {
+	const token = "s3cr3t-token"
+	cases := []struct{ name, in, want string }{
+		{"https with userinfo", "https://user:" + token + "@host/p", "https://host/p"},
+		{"https without userinfo", "https://host/p", "https://host/p"},
+		{"scp-like", "git@host:org/repo.git", "<redacted>@host:org/repo.git"},
+		{"scp-like with password", "user:" + token + "@host:org/repo.git", "<redacted>@host:org/repo.git"},
+		{"neither shape", "user:" + token + "@ nonsense", "<redacted>"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactURLUserinfo(tc.in)
+			if got != tc.want {
+				t.Errorf("redactURLUserinfo(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if strings.Contains(got, token) {
+				t.Errorf("redactURLUserinfo(%q) leaked the credential: %q", tc.in, got)
+			}
+		})
+	}
+}
+
+// TestConfigRecordKey pins the FRAMING the push-rewrite probe parses. git's
+// `--get-regexp -z` emits `key\nvalue\0`: the record is NUL-terminated and the
+// key/value separator inside it is a NEWLINE. A parser that took the first
+// whitespace-separated field instead would truncate a whitespace-bearing
+// subsection, and one that split on `\n` per line would read a newline-bearing
+// VALUE's continuation as a key — both are how attacker-shaped text reaches a
+// refusal that is otherwise redacted.
+func TestConfigRecordKey(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"key and value", "url.https://x/.pushinsteadof\nhttps://y/",
+			"url.https://x/.pushinsteadof"},
+		{"subsection with whitespace", "url.https://host path/.pushinsteadof\nhttps://y/",
+			"url.https://host path/.pushinsteadof"},
+		{"value carries a newline", "url.https://x/.pushinsteadof\nhttps://y/\nsecret.token",
+			"url.https://x/.pushinsteadof"},
+		{"valueless record", "url.https://x/.pushinsteadof", "url.https://x/.pushinsteadof"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := configRecordKey(tc.in); got != tc.want {
+				t.Errorf("configRecordKey(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRedactConfigKeyName pins the positive redaction the push-rewrite refusal
+// reports through: the subsection of a `url.<base>.pushInsteadOf` key is an
+// arbitrary URL and may carry a credential, so the middle is REPLACED rather
+// than filtered.
+func TestRedactConfigKeyName(t *testing.T) {
+	const token = "s3cr3t-token"
+	cases := []struct{ in, want string }{
+		{"url.https://user:" + token + "@example.com/.pushinsteadof", "url.<redacted>.pushinsteadof"},
+		{"user.name", "user.name"},
+		{"bare", "<redacted>"},
+		// A part that is not git-shaped (alphanumerics and `-`) can only arrive
+		// from a caller that mis-framed the key — the whitespace-truncation
+		// shape below is exactly that. Emitting it verbatim is the disclosure
+		// the enforcement exists to prevent, so it collapses too.
+		{"url.https://user:" + token + "@host", "url.<redacted>"},
+		{"url.<sub>.https://user:" + token + "@host", "url.<redacted>.<redacted>"},
+		{"user.", "user.<redacted>"},
+	}
+	for _, tc := range cases {
+		got := redactConfigKeyName(tc.in)
+		if got != tc.want {
+			t.Errorf("redactConfigKeyName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+		if strings.Contains(got, token) {
+			t.Errorf("redactConfigKeyName(%q) leaked the credential: %q", tc.in, got)
+		}
 	}
 }

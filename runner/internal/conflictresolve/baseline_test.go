@@ -2,6 +2,7 @@ package conflictresolve
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -343,5 +344,189 @@ func TestAcceptConflictedFile(t *testing.T) {
 				t.Errorf("AcceptConflictedFile = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- the repository-config gate input (#3338) ---
+
+// cfgStream renders records into git's REAL `git config --list -z` framing:
+// `key\nvalue\0` per record. Every fixture below is built through it so no test
+// silently encodes the WRONG framing and then agrees with a wrong parser.
+func cfgStream(kv ...string) string {
+	var b strings.Builder
+	for i := 0; i < len(kv); i += 2 {
+		b.WriteString(kv[i])
+		b.WriteByte('\n')
+		b.WriteString(kv[i+1])
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
+// TestVerifyRepoConfigChanged pins the gate input itself: a config that moved
+// during the pass is a violation with its OWN named reason, and an identical
+// config is not. The pair is otherwise the ACCEPTED pair, so the discrimination
+// is on the config alone.
+func TestVerifyRepoConfigChanged(t *testing.T) {
+	base, obs := acceptedPair()
+	base.Config = cfgStream("user.name", "test")
+	obs.Config = base.Config
+	if vs := Verify(base, obs); len(vs) != 0 {
+		t.Fatalf("an unchanged config must not violate: %+v", vs)
+	}
+
+	obs.Config = cfgStream("user.name", "test", "url.https://decoy.example/.insteadof", "https://origin.example/")
+	vs := Verify(base, obs)
+	if len(vs) != 1 {
+		t.Fatalf("Verify = %+v, want exactly one violation", vs)
+	}
+	if vs[0].Reason != ReasonRepoConfigChanged {
+		t.Errorf("reason = %q, want %q", vs[0].Reason, ReasonRepoConfigChanged)
+	}
+	if vs[0].Path != "" {
+		t.Errorf("Path = %q, want empty (a repository-level rule)", vs[0].Path)
+	}
+	if !strings.Contains(vs[0].Detail, "url."+redactedConfigPart+".insteadof") {
+		t.Errorf("detail does not name the redacted key: %q", vs[0].Detail)
+	}
+}
+
+// TestConfigChangeDetailRedactsKeyAndValue is the disclosure control. A git
+// config key NAME can itself carry a credential — the subsection of
+// `url.<base>.insteadOf` is an arbitrary URL — so the detail is built
+// POSITIVELY (section + constant + final component) rather than by filtering
+// values out. The fixture plants a distinctive secret in BOTH halves and the
+// assertion is that NEITHER reaches the detail.
+func TestConfigChangeDetailRedactsKeyAndValue(t *testing.T) {
+	const keySecret = "s3cr3t-user:s3cr3t-token"
+	const valueSecret = "v4lue-s3cr3t-token"
+	base := cfgStream("user.name", "test")
+	obs := cfgStream("user.name", "test",
+		"url.https://"+keySecret+"@example.com/.insteadof", "https://"+valueSecret+"@example.com/")
+
+	detail := configChangeDetail(base, obs)
+	for _, secret := range []string{keySecret, valueSecret, "s3cr3t", "example.com"} {
+		if strings.Contains(detail, secret) {
+			t.Errorf("detail leaked %q: %q", secret, detail)
+		}
+	}
+	if !strings.Contains(detail, "url."+redactedConfigPart+".insteadof") {
+		t.Errorf("detail must still name the redacted key shape: %q", detail)
+	}
+}
+
+// TestConfigDiffKeys is the helper's table: one case per way two streams can
+// differ, plus the identical control.
+func TestConfigDiffKeys(t *testing.T) {
+	cases := []struct {
+		name      string
+		base, obs string
+		want      []string
+	}{
+		{"identical", cfgStream("user.name", "a"), cfgStream("user.name", "a"), nil},
+		{"key added", cfgStream("user.name", "a"), cfgStream("user.name", "a", "core.bare", "false"),
+			[]string{"core.bare"}},
+		{"key removed", cfgStream("user.name", "a", "core.bare", "false"), cfgStream("user.name", "a"),
+			[]string{"core.bare"}},
+		{"value changed", cfgStream("user.name", "a"), cfgStream("user.name", "b"),
+			[]string{"user.name"}},
+		{
+			// git resolves a single-valued key LAST-ONE-WINS, so a pure reorder
+			// changes which value wins and must be reported as a difference
+			// rather than compared away by a set-equality check.
+			"pure reorder", cfgStream("user.name", "a", "core.bare", "false"),
+			cfgStream("core.bare", "false", "user.name", "a"),
+			[]string{"core.bare", "user.name"},
+		},
+		{"multi-valued key reordered", cfgStream("remote.origin.fetch", "a", "remote.origin.fetch", "b"),
+			cfgStream("remote.origin.fetch", "b", "remote.origin.fetch", "a"),
+			[]string{"remote." + redactedConfigPart + ".fetch"}},
+		{"valueless record", cfgStream("user.name", "a"), cfgStream("user.name", "a") + "core.bare\x00",
+			[]string{"core.bare"}},
+		{"two-component key keeps both parts", "", cfgStream("user.name", "a"),
+			[]string{"user.name"}},
+		{"dotted subsection is replaced wholesale", "",
+			cfgStream("url.https://x.example/.insteadof", "y"),
+			[]string{"url." + redactedConfigPart + ".insteadof"}},
+		{"dotless key collapses to the placeholder", "", cfgStream("bare", "a"),
+			[]string{redactedConfigPart}},
+		// A VALUELESS record (`key\0`, git's boolean-true shape) and an
+		// EMPTY-VALUED one (`key\n\0`) both parse to value "", so no key-level
+		// difference resolves. The streams still DIFFER, which is why Verify's
+		// byte-for-byte comparison refuses regardless; this case pins that the
+		// key signature is what goes silent.
+		{"valueless vs empty-valued resolves no key", "core.bare\x00", "core.bare\n\x00", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := configDiffKeys(tc.base, tc.obs)
+			if len(got) == 0 && len(tc.want) == 0 {
+				return
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("configDiffKeys = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestConfigChangeDetailFallback pins configChangeDetail's no-key-resolved
+// branch, which is reachable because parseConfigStream conflates a VALUELESS
+// record (`key\0`, git's boolean-true shape) with an EMPTY-VALUED one
+// (`key\n\0`): both parse to value "", so configDiffKeys returns nothing while
+// the raw streams still differ. The detail must report the change rather than
+// swallow it — the alternative would be an empty key list rendered as though
+// nothing had happened.
+//
+// The gate itself is unaffected either way: Verify compares the raw streams
+// byte-for-byte and refuses on any difference (TestVerifyRepoConfigChanged).
+// What this pins is the DETAIL an operator reads.
+func TestConfigChangeDetailFallback(t *testing.T) {
+	cases := []struct{ name, base, obs string }{
+		{"valueless becomes empty-valued", "core.bare\x00", "core.bare\n\x00"},
+		{"empty-valued becomes valueless", "core.bare\n\x00", "core.bare\x00"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.base == tc.obs {
+				t.Fatalf("the fixture streams are identical, so nothing changed: %q", tc.base)
+			}
+			if keys := configDiffKeys(tc.base, tc.obs); len(keys) != 0 {
+				t.Fatalf("configDiffKeys resolved %v — the fallback branch is not reached", keys)
+			}
+			detail := configChangeDetail(tc.base, tc.obs)
+			const want = "the effective git configuration changed (no key-level difference resolved)"
+			if detail != want {
+				t.Errorf("configChangeDetail = %q, want %q", detail, want)
+			}
+		})
+	}
+}
+
+// TestConfigStreamFraming is the FRAMING regression pin. git's `--list -z`
+// emits `key\nvalue\0` — the record is NUL-terminated and the key/value
+// separator inside it is a NEWLINE, not `=`. A parser that split records on NUL
+// and then on `=` would fold the VALUE into the key, so the detail documented
+// as key-names-only would carry values instead.
+//
+// The two fixture keys are in DIFFERENT sections deliberately: they must stay
+// distinguishable after redaction, so a wrong split produces two visibly wrong
+// key names rather than collapsing into one placeholder that happens to match.
+// Both values carry an `=` so an `=`-splitting parser has something to hit.
+func TestConfigStreamFraming(t *testing.T) {
+	stream := "alpha.one\nv=1\x00beta.two\nv=2\x00"
+	if stream != cfgStream("alpha.one", "v=1", "beta.two", "v=2") {
+		t.Fatalf("the byte-exact fixture and cfgStream disagree on git's framing")
+	}
+	got := configDiffKeys("", stream)
+	want := []string{"alpha.one", "beta.two"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("configDiffKeys = %v, want %v — the key/value split is not git's `key\\nvalue` framing", got, want)
+	}
+	detail := configChangeDetail("", stream)
+	for _, leak := range []string{"v=1", "v=2"} {
+		if strings.Contains(detail, leak) {
+			t.Errorf("detail leaked a VALUE %q: %q", leak, detail)
+		}
 	}
 }

@@ -2190,6 +2190,14 @@ func (p *Pusher) PushCommittedBranch(ctx context.Context, args PushCommittedBran
 			args.HeadSHA)
 	}
 
+	// The DESTINATION guard runs before ANY remote is contacted and before a
+	// token is minted into an environment, exactly as the pinned-refspec guard
+	// above does: a redirect that is only REPORTED after the write has already
+	// exfiltrated the branch.
+	if err := p.verifyPushDestination(ctx, args.RepoDir, args.RemoteURL); err != nil {
+		return nil, err
+	}
+
 	authEnv, err := authConfigEnv(args.RemoteURL, args.PushToken)
 	if err != nil {
 		return nil, err
@@ -2248,6 +2256,19 @@ const InertHooksPath = "/dev/null"
 //   - credential.helper — an empty value RESETS the helper list (git-config(1)),
 //     so no agent-configured helper binary runs while a push token is in scope.
 //
+// One key here covers a SECOND, distinct class, and the widening is deliberate
+// rather than accidental: a key that executes nothing but changes how git
+// PARSES the artifact the gate compares.
+//
+//   - core.commentChar — it selects which leading byte git's message cleanup
+//     treats as a comment. The conflict-resolution pass compares the COMMITTED
+//     message against the merge message the gate approved, and normalizes both
+//     by dropping comment lines; without this pin that normalization is a GUESS
+//     about the repository's configuration, and an agent that set
+//     `core.commentChar=;` would move the boundary under the comparison. Pinning
+//     it makes the runner-side normalization an exact match for git's own rule
+//     instead.
+//
 // `-c` beats every config file, so this holds against `.git/config`,
 // `$HOME/.gitconfig` and the system file alike.
 //
@@ -2267,5 +2288,233 @@ func HardeningArgs() []string {
 		"-c", "core.pager=cat",
 		"-c", "commit.gpgsign=false",
 		"-c", "credential.helper=",
+		"-c", "core.commentChar=#",
 	}
+}
+
+// pushDestinationRedaction is the fixed stand-in an unrecognisable URL is
+// reported AS. It is a constant, so nothing an agent shapes can reach the
+// operator-visible refusal through it.
+const pushDestinationRedaction = "<redacted>"
+
+// redactURLUserinfo strips credentials out of a URL before it reaches an
+// operator-visible error.
+//
+// The URL this is applied to is one an ATTACKER may have shaped: a poisoned
+// `url.<base>.insteadOf` rewrites the runner's remote into whatever the key
+// says, including a `user:token@host` form, and the rewritten value flows
+// straight into the refusal the runner reports to the backend. The same
+// redaction posture the conflict-resolution config detail carries applies here.
+//
+// Three shapes, in order: a `scheme://` URL has its Userinfo cleared; an
+// scp-like `user@host:path` has the userinfo replaced; anything matching
+// NEITHER shape is emitted wholesale as the placeholder rather than guessed at.
+//
+// The scheme branch requires a literal `://`, not merely a non-empty
+// url.URL.Scheme. `user:token@host:org/repo.git` PARSES with Scheme="user" —
+// the colon before the `@` reads as a scheme separator — and clearing Userinfo
+// on that parse is a no-op, so a scheme-only test returns the credential
+// verbatim. Requiring `://` routes that shape to the scp branch instead.
+func redactURLUserinfo(raw string) string {
+	if strings.Contains(raw, "://") {
+		if u, err := url.Parse(raw); err == nil && u.Scheme != "" {
+			u.User = nil
+			return u.String()
+		}
+	}
+	if at := strings.IndexByte(raw, '@'); at > 0 {
+		rest := raw[at+1:]
+		// An scp-like remote is `[user@]host:path` — the colon must follow the
+		// host, and the host itself carries no slash.
+		if colon := strings.IndexByte(rest, ':'); colon > 0 && !strings.Contains(rest[:colon], "/") {
+			return pushDestinationRedaction + "@" + rest
+		}
+	}
+	return pushDestinationRedaction
+}
+
+// verifyPushDestination refuses to publish when the repository's configuration
+// would send the push somewhere other than the URL the caller supplied (#3338).
+//
+// gitops.HardeningArgs is a DENY-LIST of keys that EXECUTE a command, and
+// `url.<base>.insteadOf` / `url.<base>.pushInsteadOf` execute nothing — they
+// silently REWRITE the destination. Enumerating them is not available either:
+// the subsection is an arbitrary URL, so `url.<base>.*` is an unbounded
+// namespace. The conflict-resolution pass's config-change gate closes a config
+// the agent WRITES during the pass; this guard closes one that was ALREADY
+// poisoned when the pass began, which capture-and-compare structurally cannot
+// see. Both checks refuse BEFORE any remote is contacted.
+//
+// (a) DESTINATION IDENTITY. `git ls-remote --get-url <url>` is git's OWN URL
+// resolution applied to a command-line URL, so it matches the MECHANISM rather
+// than enumerating keys, and it covers any future rewriting git folds into that
+// resolution. The resolved URL must equal the one supplied. A failure of the
+// probe is itself a refusal: an unverifiable destination is not an approved one.
+//
+// (b) PUSH-REWRITE KEY. `--get-url` applies FETCH rewriting only — verified
+// empirically: with `url.X.pushInsteadOf=Y` set, `ls-remote --get-url Y` prints
+// Y unchanged and only `git remote get-url --push` shows the rewrite. So (a)
+// structurally cannot see a pushInsteadOf redirect, and check (b) covers
+// EXACTLY that gap by refusing when any `url.*.pushInsteadOf` key is configured.
+//
+// (b) is scoped to `pushinsteadof` and NOT to the whole `url.` namespace on
+// purpose: this repository carries a benign `url.https://github.com/.insteadof
+// = git@github.com:` in LOCAL scope, so a whole-namespace refusal would make
+// the conflict-resolution pass permanently unusable in its own development
+// environment. Coverage is unchanged — (a) covers insteadOf, because a hostile
+// insteadOf that rewrote the supplied URL changes the resolved destination and
+// (a) refuses it, while the benign key above rewrites in the OTHER direction and
+// leaves the probe's answer identical.
+//
+// It cannot be an exact push-destination probe. `git remote get-url --push
+// <name>` does not see a remote supplied only via `-c remote.<name>.url=<url>`
+// (verified: `error: No such remote`), and registering a real remote would WRITE
+// config, which the pass's own config-change gate would then refuse. So (b) is a
+// key-PRESENCE refusal, and the residual — a benign global pushInsteadOf trips
+// it — is stated in runner/README.md rather than implied away.
+//
+// (b)'s probe runs `--get-regexp -z` and parses git's OWN `key\nvalue\0`
+// framing, the same posture the conflict-resolution config capture uses. Without
+// `-z` git prints `key value\n`, and BOTH halves of that line-oriented shape
+// disclose text the refusal is supposed to redact: a git config SUBSECTION may
+// contain whitespace, so taking the first whitespace-separated field TRUNCATES
+// `url.https://user:token@host path/.pushinsteadof` to a two-component key whose
+// credential-bearing half redactConfigKeyName would then emit VERBATIM; and a
+// config VALUE may contain a newline, so a line-split reads the value's
+// continuation lines as key names. Under `-z` the record is NUL-terminated and
+// the key ends at the FIRST newline, so neither shape is reachable.
+func (p *Pusher) verifyPushDestination(ctx context.Context, repoDir, remoteURL string) error {
+	resolved, code, err := p.probeOut(ctx, repoDir,
+		append(HardeningArgs(), "ls-remote", "--get-url", remoteURL)...)
+	if err != nil {
+		return fmt.Errorf(
+			"gitops: refusing to push — the push destination could not be verified (git ls-remote --get-url exited %d): %w",
+			code, err)
+	}
+	if got := strings.TrimSpace(resolved); got != remoteURL {
+		return fmt.Errorf(
+			"gitops: refusing to push — repository configuration rewrites the push destination to %q, not the authorized remote %q (a url.<base>.insteadOf key)",
+			redactURLUserinfo(got), remoteURL)
+	}
+
+	out, code, err := p.probeOut(ctx, repoDir,
+		append(HardeningArgs(), "config", "--get-regexp", "-z", `^url\..*\.pushinsteadof$`)...)
+	switch {
+	case err == nil:
+		keys := make([]string, 0, 2)
+		for _, rec := range strings.Split(out, "\x00") {
+			if rec == "" {
+				continue
+			}
+			keys = append(keys, redactConfigKeyName(configRecordKey(rec)))
+		}
+		if len(keys) == 0 {
+			// Exit 0 with no output is not a shape git produces for
+			// --get-regexp; treat it as unverifiable rather than as a pass.
+			return errors.New("gitops: refusing to push — the push-rewrite config probe returned no key on a successful exit")
+		}
+		return fmt.Errorf(
+			"gitops: refusing to push — repository configuration carries a push-rewrite key (%s), which redirects `git push` without changing the URL git reports; the destination cannot be verified",
+			strings.Join(keys, ", "))
+	case code == 1 && strings.TrimSpace(out) == "":
+		// git-config(1): --get-regexp exits 1 with no output when the pattern
+		// matches nothing. That is the ONLY pass case.
+		return nil
+	default:
+		return fmt.Errorf(
+			"gitops: refusing to push — the push-rewrite config probe failed (git config --get-regexp exited %d): %w",
+			code, err)
+	}
+}
+
+// configRecordKey returns the KEY of one `git config --get-regexp -z` record.
+//
+// The framing is git's, not a guess: `-z` emits `key\nvalue\0`, so the record is
+// NUL-terminated and the key/value separator INSIDE it is a NEWLINE (verified
+// with od(1); git-config(1) --null). The key therefore ends at the FIRST
+// newline, and everything after it is value bytes that must never reach the
+// operator-visible refusal. A record with no newline is a valueless key, whose
+// whole text is the key.
+func configRecordKey(rec string) string {
+	if nl := strings.IndexByte(rec, '\n'); nl >= 0 {
+		return rec[:nl]
+	}
+	return rec
+}
+
+// redactConfigKeyName renders a git config key as `<section>.<redacted>.<final>`.
+// The subsection of a `url.<base>.pushInsteadOf` key is an arbitrary URL and may
+// itself carry a credential, so the middle is REPLACED by a constant rather than
+// filtered — the same positive redaction the conflict-resolution config detail
+// uses.
+//
+// git restricts a section and a final component to alphanumerics and `-`, and
+// that restriction is ENFORCED here rather than assumed: it is the property that
+// makes emitting those two verbatim safe, and the only reason a credential could
+// ever occupy one of them is a caller that mis-framed the key (splitting a
+// whitespace-bearing subsection, say). A part that is not git-shaped is replaced
+// by the placeholder too, so a framing mistake degrades to an unhelpful refusal
+// rather than to a disclosure.
+func redactConfigKeyName(key string) string {
+	first := strings.IndexByte(key, '.')
+	last := strings.LastIndexByte(key, '.')
+	if first < 0 {
+		return pushDestinationRedaction
+	}
+	section, final := safeConfigPart(key[:first]), safeConfigPart(key[last+1:])
+	if first == last {
+		return section + "." + final
+	}
+	return section + "." + pushDestinationRedaction + "." + final
+}
+
+// safeConfigPart returns part when it has git's section/final-component shape —
+// non-empty, alphanumerics and `-` only — and the placeholder otherwise.
+func safeConfigPart(part string) string {
+	if part == "" {
+		return pushDestinationRedaction
+	}
+	for _, r := range part {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
+		default:
+			return pushDestinationRedaction
+		}
+	}
+	return part
+}
+
+// probeOut runs git and returns (stdout, exit code, error). It exists because
+// the destination guard must DISTINGUISH git's exit codes — `config
+// --get-regexp` exits 1 with no output when nothing matches, which is the pass
+// case, while any other non-zero exit is unverifiable and must fail closed —
+// and runOutEnv discards stdout and the code on error. It goes through the same
+// p.Cmd seam, so a test can fail exactly one probe invocation.
+//
+// The code is -1 when the failure was not a non-zero exit (git absent, context
+// cancelled), which is never the pass case.
+func (p *Pusher) probeOut(ctx context.Context, dir string, gitArgs ...string) (string, int, error) {
+	binary := p.Binary
+	if binary == "" {
+		binary = "git"
+	}
+	cmdFn := p.Cmd
+	if cmdFn == nil {
+		cmdFn = exec.CommandContext
+	}
+	cmd := cmdFn(ctx, binary, gitArgs...)
+	cmd.Dir = dir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		code := -1
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			code = ee.ExitCode()
+		}
+		return stdout.String(), code, fmt.Errorf("git %s: %w (stderr: %s)",
+			strings.Join(gitArgs, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), 0, nil
 }

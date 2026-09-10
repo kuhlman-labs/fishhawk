@@ -195,6 +195,36 @@ func gitRun(ctx context.Context, repoDir string, args ...string) error {
 	return err
 }
 
+// readGitConfigFn is a TEST SEAM, never reassigned outside tests. Both config
+// reads' failure branches are fail-closed returns that a repository state
+// cannot reach selectively: a malformed `.git/config` fails `git rev-parse` and
+// `git ls-files` too (verified), so every capture and observe read would fail
+// FIRST and the test would pass whether or not the config read returned. The
+// seam makes each branch's own return the thing under test — the same reason
+// conflictCaptureHook and conflictCommitHook exist.
+var readGitConfigFn = readGitConfig
+
+// readGitConfig captures the EFFECTIVE git configuration as a raw
+// `git config --list -z` stream, for the gate input that refuses ANY config
+// change during the pass (conflictresolve.ReasonRepoConfigChanged).
+//
+// `--list` resolves `include.path` directives and merges the system, global,
+// local and worktree scopes, so this covers an agent that writes
+// `$HOME/.gitconfig` or an included file rather than `.git/config`. It is read
+// through gitOutRaw so it inherits the same HardeningArgs choke point every
+// other read uses; the `-c` overrides are CONSTANT across the baseline and
+// observe reads, so they cannot manufacture a difference between them.
+//
+// RAW, never trimmed: the stream is compared byte-for-byte and a trailing NUL
+// is part of it.
+func readGitConfig(ctx context.Context, repoDir string) (string, error) {
+	out, err := gitOutRaw(ctx, repoDir, "config", "--list", "-z")
+	if err != nil {
+		return "", fmt.Errorf("read git config: %w", err)
+	}
+	return string(out), nil
+}
+
 // splitNUL splits a `-z` git stream on NUL, dropping the empty trailing field.
 // Splitting on NUL rather than newline is not optional: git only refrains from
 // C-quoting a path (a quote, a backslash, a control character, a non-ASCII
@@ -494,17 +524,28 @@ func verifyAuthorizedCommit(ctx context.Context, repoDir string,
 
 // normalizeCommitMessage renders a message in the form the comparison above can
 // make: comment lines dropped, trailing whitespace trimmed per line, and the
-// whole trimmed.
+// whole trimmed. Both sides go through it, so the comparison stays symmetric.
 //
-// git itself strips comment lines and normalizes trailing blank lines when it
-// records a commit, so the recorded message is never byte-identical to
-// MERGE_MSG and a raw comparison would refuse EVERY pass. Both sides go through
-// the same normalization, so the comparison stays symmetric: a rewrite of the
-// message BODY is caught, while git's own cleanup is not mistaken for one.
+// A comment line is one whose FIRST BYTE is the comment character — that is
+// git's own rule (git-commit(1) --cleanup), and matching it exactly is the
+// point. The earlier form trimmed leading whitespace before the test, which was
+// WIDER than git: an INDENTED comment-like line (`  # x`) is ordinary message
+// content to git and survives into the recorded message, but was deleted from
+// BOTH sides here — so an agent could add or remove one and the comparison
+// would not see it. gitops.HardeningArgs pins `core.commentChar=#` on every
+// invocation this pass makes, so "the comment character" is exactly defined
+// rather than assumed from the repository's configuration.
+//
+// The stripping that remains is tolerance for a `commit.cleanup=strip`
+// configuration, NOT a mirror of the default path: verified empirically that
+// `git commit --no-edit` under the default cleanup mode strips NO comment lines
+// at all — the recorded message retains git's own `# Conflicts:` block verbatim.
+// Narrowing to a first-byte test therefore strictly TIGHTENS the comparison and
+// cannot break the ordinary case.
 func normalizeCommitMessage(s string) string {
 	var kept []string
 	for _, line := range strings.Split(s, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+		if strings.HasPrefix(line, "#") {
 			continue
 		}
 		kept = append(kept, strings.TrimRight(line, " \t"))
@@ -649,6 +690,17 @@ func captureConflictBaseline(ctx context.Context, repoDir, head string, conflict
 		}
 		base.Index[path] = entry
 	}
+
+	// A read failure RETURNS rather than defaulting to the empty string: an
+	// empty baseline config would compare unequal to every observation, or —
+	// worse, if the observe side also degraded — make a LATER change
+	// undetectable. Surfacing it as conflict_resolution_baseline_capture_failed
+	// is the fail-closed direction.
+	cfg, err := readGitConfigFn(ctx, repoDir)
+	if err != nil {
+		return base, err
+	}
+	base.Config = cfg
 
 	unmergedRaw, err := gitOutRaw(ctx, repoDir, "ls-files", "--unmerged", "-z")
 	if err != nil {
@@ -826,6 +878,15 @@ func observeConflictState(ctx context.Context, repoDir string, base conflictreso
 		return obs, fmt.Errorf("read untracked paths: %w", err)
 	}
 	obs.Untracked = splitNUL(untrackedRaw)
+
+	// Like the baseline side, a read failure RETURNS (surfacing as
+	// conflict_resolution_observe_failed) rather than defaulting to the empty
+	// string, which would silently compare unequal and misname the cause.
+	cfg, err := readGitConfigFn(ctx, repoDir)
+	if err != nil {
+		return obs, err
+	}
+	obs.Config = cfg
 
 	obs.Working = map[string]conflictresolve.FileState{}
 	for path := range base.Conflicted {
