@@ -1,0 +1,20 @@
+{
+  "name": "deferred-untraced-prediction",
+  "issue_number": 1824,
+  "synthetic": true,
+  "plan_summary": "Return 409 instead of 500 when a run lease is already held, and cover the branch with a handler test.",
+  "scope_files": ["backend/internal/server/lease.go", "backend/internal/server/lease_test.go"],
+  "diff": "diff --git a/backend/internal/server/lease.go b/backend/internal/server/lease.go\n--- a/backend/internal/server/lease.go\n+++ b/backend/internal/server/lease.go\n@@ -40,7 +40,11 @@ func (s *Server) handleAcquireLease(w http.ResponseWriter, r *http.Request) {\n-\t\twriteError(w, http.StatusInternalServerError, \"lease_failed\", err.Error())\n+\t\tif errors.Is(err, lease.ErrHeld) {\n+\t\t\twriteError(w, http.StatusConflict, \"lease_held\", \"the run lease is already held\")\n+\t\t\treturn\n+\t\t}\n+\t\twriteError(w, http.StatusInternalServerError, \"lease_failed\", err.Error())\n \t\treturn\n \t}\n",
+  "concerns": [
+    {
+      "concern_id": "c-0101",
+      "reviewer_model": "reviewer-a",
+      "severity": "high",
+      "category": "testing",
+      "note": "The new lease_test.go fake will return a generic error rather than lease.ErrHeld, so the 409 branch is never exercised and the test asserts the 500 path while claiming to cover the conflict path.",
+      "disposition": "deferred",
+      "disposition_reason": "The fake's behaviour is not in the scope-bounded diff, so the prediction about what it returns is untraced; filed as a follow-up to confirm rather than blocking this change.",
+      "operator_severity": "medium"
+    }
+  ]
+}
