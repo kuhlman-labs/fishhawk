@@ -1,0 +1,20 @@
+{
+  "name": "addressed-reachable-defect",
+  "issue_number": 1824,
+  "synthetic": true,
+  "plan_summary": "Scope the workspace token check to the requesting tenant before serving a run artifact.",
+  "scope_files": ["backend/internal/server/artifacts.go"],
+  "diff": "diff --git a/backend/internal/server/artifacts.go b/backend/internal/server/artifacts.go\n--- a/backend/internal/server/artifacts.go\n+++ b/backend/internal/server/artifacts.go\n@@ -55,8 +55,8 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {\n-\tart, err := s.store.ArtifactByID(ctx, id)\n+\tart, err := s.store.ArtifactByID(ctx, id)\n \tif err != nil {\n \t\twriteError(w, http.StatusNotFound, \"not_found\", \"artifact not found\")\n \t\treturn\n \t}\n-\tserveArtifact(w, art)\n+\tserveArtifact(w, art)\n",
+  "concerns": [
+    {
+      "concern_id": "c-0201",
+      "reviewer_model": "reviewer-a",
+      "severity": "high",
+      "category": "security",
+      "note": "handleGetArtifact resolves the artifact by id alone and never compares its workspace to the caller's, so any authenticated caller in any workspace can read any artifact by guessing or replaying an id. This is reachable in the shipped multi-tenant configuration.",
+      "disposition": "addressed",
+      "disposition_reason": "Confirmed reachable cross-tenant read; the fix-up added the workspace comparison before serving.",
+      "operator_severity": "high"
+    }
+  ]
+}

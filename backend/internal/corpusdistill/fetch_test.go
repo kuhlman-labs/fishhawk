@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -201,6 +202,159 @@ func TestFetchRunTriageAudit_BadJSON(t *testing.T) {
 	defer srv.Close()
 
 	_, err := FetchRunTriageAudit(context.Background(), srv.URL, "rid", "")
+	if err == nil {
+		t.Fatal("expected decode error, got nil")
+	}
+	if !strings.Contains(err.Error(), "decode audit page") {
+		t.Errorf("error not wrapped as a page-decode failure: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FetchRunConcernDispositions (E50.22 / #3309).
+// ---------------------------------------------------------------------------
+
+// TestFetchRunConcernDispositions_MergesCategories drives the load-bearing
+// contract: the audit endpoint filters by exactly ONE category per request
+// (server/reads.go handleListRunAudit reads a single `category` value), so
+// the helper must issue one request PER category and merge the results
+// ASCENDING BY SEQUENCE. The server serves a DISTINCT entry per category so
+// a single-request implementation — or one assuming a comma-separated or
+// repeated parameter works — returns a strict subset and fails here.
+func TestFetchRunConcernDispositions_MergesCategories(t *testing.T) {
+	const token = "fhk_test_token"
+	// Deliberately NOT in fetch order: the merge must sort, not concatenate.
+	seqByCategory := map[string]int64{
+		"implement_reviewed":             40,
+		"concern_waived":                 10,
+		"concern_deferred":               30,
+		"concern_addressed_by_condition": 20,
+	}
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Errorf("Authorization = %q, want Bearer %s", got, token)
+		}
+		if got := r.URL.Path; got != "/v0/runs/rid/audit" {
+			t.Errorf("path = %q", got)
+		}
+		cat := r.URL.Query().Get("category")
+		seen = append(seen, cat)
+		seq, ok := seqByCategory[cat]
+		if !ok {
+			t.Errorf("unexpected category %q", cat)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"items":[{"sequence":` +
+			strconv.FormatInt(seq, 10) + `,"run_id":"rid","category":"` + cat +
+			`","payload":{}}],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	items, err := FetchRunConcernDispositions(context.Background(), srv.URL, "rid", token)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(seen) != len(CalibrationCategories) {
+		t.Fatalf("issued %d requests for %d categories: %v", len(seen), len(CalibrationCategories), seen)
+	}
+	for _, want := range CalibrationCategories {
+		found := false
+		for _, got := range seen {
+			if got == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("category %q was never requested", want)
+		}
+	}
+	if len(items) != 4 {
+		t.Fatalf("want 4 merged items, got %d", len(items))
+	}
+	wantOrder := []int64{10, 20, 30, 40}
+	for i, want := range wantOrder {
+		if items[i].Sequence != want {
+			t.Errorf("merged item %d sequence = %d, want %d (the merge must be ascending by sequence)", i, items[i].Sequence, want)
+		}
+	}
+	// The category discriminator must survive the decode: without it the
+	// join cannot tell a review verdict from a disposition.
+	for _, it := range items {
+		if it.Category == "" {
+			t.Errorf("item at sequence %d decoded with an empty category", it.Sequence)
+		}
+	}
+}
+
+// TestFetchRunConcernDispositions_FollowsPages: next_cursor is followed
+// per category, so a long-audit run cannot silently truncate.
+func TestFetchRunConcernDispositions_FollowsPages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cat := r.URL.Query().Get("category")
+		if cat != "concern_waived" {
+			_, _ = w.Write([]byte(`{"items":[],"next_cursor":""}`))
+			return
+		}
+		if r.URL.Query().Get("cursor") == "" {
+			_, _ = w.Write([]byte(`{"items":[{"sequence":1,"category":"concern_waived","payload":{}}],"next_cursor":"c2"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"items":[{"sequence":2,"category":"concern_waived","payload":{}}],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	items, err := FetchRunConcernDispositions(context.Background(), srv.URL, "rid", "")
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("want 2 items across both pages, got %d", len(items))
+	}
+	if items[0].Sequence != 1 || items[1].Sequence != 2 {
+		t.Errorf("paged items = %+v", items)
+	}
+}
+
+// TestFetchRunConcernDispositions_NonOKStatus: a non-200 on ANY ONE of the
+// four category requests is an error carrying the status + body snippet.
+// The server is a REACHABLE in-test address returning 500 — never an
+// unreachable host, whose transport error would map to the same failure
+// whether or not the status guard exists.
+func TestFetchRunConcernDispositions_NonOKStatus(t *testing.T) {
+	for _, bad := range CalibrationCategories {
+		t.Run(bad, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("category") == bad {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`{"error":"boom"}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"items":[],"next_cursor":""}`))
+			}))
+			defer srv.Close()
+
+			_, err := FetchRunConcernDispositions(context.Background(), srv.URL, "rid", "")
+			if err == nil {
+				t.Fatalf("expected an error when %s returned 500, got nil", bad)
+			}
+			if !strings.Contains(err.Error(), "500") || !strings.Contains(err.Error(), "boom") {
+				t.Errorf("error should carry the status and a body snippet, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestFetchRunConcernDispositions_BadJSON: an undecodable page body errors
+// rather than returning a partial silently.
+func TestFetchRunConcernDispositions_BadJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"items":`))
+	}))
+	defer srv.Close()
+
+	_, err := FetchRunConcernDispositions(context.Background(), srv.URL, "rid", "")
 	if err == nil {
 		t.Fatal("expected decode error, got nil")
 	}
