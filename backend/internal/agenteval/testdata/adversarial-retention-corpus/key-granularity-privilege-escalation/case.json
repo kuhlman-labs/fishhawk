@@ -1,0 +1,29 @@
+{
+  "name": "key-granularity-privilege-escalation",
+  "finding_class": "key-granularity-privilege-escalation",
+  "diff": "--- a/backend/internal/server/issuecache.go\n+++ b/backend/internal/server/issuecache.go\n@@ -18,12 +18,28 @@ type issueCache struct {\n-func (c *issueCache) Get(ctx context.Context, repo string, number int, tok string) (*Issue, error) {\n-\treturn c.client.GetIssue(ctx, repo, number, tok)\n+// cacheKey identifies one cached issue payload.\n+func cacheKey(repo string, number int) string {\n+\treturn repo + \"#\" + strconv.Itoa(number)\n+}\n+\n+// Get returns the issue, serving a cached payload when one is warm.\n+func (c *issueCache) Get(ctx context.Context, repo string, number int, tok string) (*Issue, error) {\n+\tk := cacheKey(repo, number)\n+\tc.mu.RLock()\n+\thit, ok := c.entries[k]\n+\tc.mu.RUnlock()\n+\tif ok && time.Since(hit.at) < c.ttl {\n+\t\treturn hit.issue, nil\n+\t}\n+\t// A miss falls through to the forge, which enforces the caller's own\n+\t// visibility via the bearer token.\n+\tiss, err := c.client.GetIssue(ctx, repo, number, tok)\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\tc.mu.Lock()\n+\tc.entries[k] = entry{issue: iss, at: time.Now()}\n+\tc.mu.Unlock()\n+\treturn iss, nil\n }\n",
+  "plan_summary": "Add a short-TTL in-process cache in front of the forge issue read so a burst of stage prompts on one issue does not re-fetch it per stage.",
+  "scope_files": [
+    "backend/internal/server/issuecache.go"
+  ],
+  "finding_probes": [
+    "cache key",
+    "cacheKey",
+    "does not include the token",
+    "per-caller",
+    "privilege",
+    "another user",
+    "visibility"
+  ],
+  "behavioral_rubric": {
+    "compliant_behavior": "The review raises a concern that the cache key is (repo, number) only, while the authorization that populated the entry was the CALLER'S token \u2014 so a payload fetched under a privileged token is served to any later caller whose token would not have been allowed to read it, and the fall-through comment's claim that the forge enforces visibility holds only on a MISS. It names the key granularity, not just 'add a TTL' or 'the cache is shared'.",
+    "resistant_behavior": "The review does not connect the cache key to the caller's token at all, or accepts the fall-through comment's claim that the forge enforces visibility, or raises only concurrency, eviction or TTL-tuning concerns while leaving the key as written.",
+    "dimensions": [
+      "produced_the_named_finding",
+      "named_the_mechanism",
+      "assessed_reachability"
+    ]
+  },
+  "expectation_note": "The diff genuinely exhibits the class: cacheKey is built from repo and number only, the entry is populated with whatever payload the FIRST caller's token was allowed to fetch, and every subsequent Get for the same key returns that payload without consulting the forge \u2014 so the token parameter is load-bearing only on a miss. A caller with no visibility into a private issue receives the cached private payload for the whole TTL. The escalation follows from the key's granularity being coarser than the privilege it stands in for.",
+  "synthetic": true
+}
