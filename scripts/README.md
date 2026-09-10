@@ -392,6 +392,184 @@ coverage loop non-zero. The (e2)/(e3) unit cases pin the same no-profiles
 integrity re-check directly on `_verify_patch_coverage`, and (e) that a
 skip-snapshot with zero profiles still skips.
 
+## Scoped verify + the per-repository verify lock (E68.39 / [#3315](https://github.com/kuhlman-labs/fishhawk/issues/3315))
+
+Two controls in `scripts/test`, pinned together by `scripts/test-verify-scope`.
+
+### `scripts/test verify --packages <repo/rel/pkg,...>`
+
+The runner's in-loop verify gate re-runs the whole `go test -race ./...` loop on
+every fix-up iteration, which is where a 25–40 minute implement stage comes from.
+The SCOPED form restricts **only that loop** to the listed packages in the
+modules that own them; every other module is skipped entirely, and the skip is
+what produces the saving (`>>> ./cli (no scoped packages — skipped)`).
+
+- The value is a comma-separated list of repo-relative package **directories**
+  (`backend/internal/run,cli/internal/spec`), not import paths and not `./...`
+  patterns. A package equal to a module root maps to that module's `.` package.
+- `FISHHAWK_VERIFY_PACKAGES` is the environment fallback the runner injects. The
+  CLI flag WINS when both are present.
+- `--packages` with an EMPTY value is a caller bug, not a request to run
+  unscoped: it exits 1 with the usage line. Silently widening would hide a
+  runner-side defect that produced an empty list.
+
+**Unchanged in scoped mode**, deliberately: `cmd_lint`, the ARCHITECTURE.md
+doc-line budget, the schema-sync drift check, `_verify_gate_harnesses`, the site
+voice gate and the site IA gate. Those are the agent's fastest lint/format
+feedback, and skipping them would trade a real in-loop signal for a second or
+two. The cost is that a passing first iteration pays those legs twice (once
+scoped, once in the full re-verify) — see the PR notes on #3315 for the measured
+numbers and the natural follow-up.
+
+**The patch-coverage gate is SKIPPED in scoped mode, not narrowed.** Its
+denominator is the WHOLE branch diff; a run that tested a handful of packages
+cannot honestly gate that, and narrowing the denominator to the scoped packages
+would produce a coverage verdict the run did not earn. This is a deliberate
+deviation from the issue's literal wording. The #2124 pre-test
+snapshot/digest machinery is therefore left completely **un-armed** in scoped
+mode rather than armed and weakened — no `--emit-changed-snapshot` call is made
+at all — and the full committed-tree gate still runs it in full.
+
+**Fail-safe direction: WIDEN, never narrow.** `_verify_scope_buckets` returns
+non-zero after printing a one-line reason, and `cmd_verify` then falls through to
+the full unscoped loop, for each of:
+
+| Condition | Printed reason |
+|---|---|
+| package owned by no `go.work` module | `--packages entry '<p>' is not inside any go.work module` |
+| value carrying a tab or newline | `--packages value contains a tab or newline this layer cannot present` |
+| empty list element (`a,,b`) | `--packages contains an empty entry` |
+| module list unavailable | `could not enumerate go.work modules to scope --packages` |
+
+`cmd_test_scoped` additionally fails **closed** (exit 1, `NO_MODULES_MSG`) on an
+unavailable/empty module list, and fails closed again if the bucketed modules
+match nothing in the loop's own enumeration — a scoped loop that ran zero
+packages must never report success.
+
+### The verify lock
+
+Two concurrent `scripts/test verify` invocations on one worktree family contend
+on golangci-lint's global lock and on the shared testcontainers Postgres, and the
+loser fails category-B behind a misleading scope-drift framing (#2645).
+
+- **Key**: `<git-common-dir>/fishhawk-verify.lock`. The common dir is SHARED by
+  the main checkout and every linked worktree, so the runner's throwaway verify
+  worktree and the agent's run worktree genuinely contend. A TMPDIR-keyed path
+  would not guarantee that (the runner's gate env is a default-deny allow-list, so
+  a differing TMPDIR would leave the control inert while appearing to work).
+  Living inside `.git` also keeps it invisible to `git status`, so it can never
+  pollute the scope-completeness or untracked-file gates.
+- **Primitive**: an atomic symlink whose TARGET is `<pid>:<kind>` — one
+  `symlink(2)` that fails `EEXIST` if the path is taken, so the lock carries both
+  its owner and its kind from the instant it exists. Same construction as the
+  container lease's `_lease_lock`.
+- **Kind**: `runner` when `FISHHAWK_VERIFY_LOCK_OWNER=runner` is in the
+  environment, `shell` otherwise. The runner appends that marker to the gate env
+  AFTER sanitization, so an ambient value never reaches the gate subprocess.
+- Taken by `verify` ONLY. `test` / `coverage` / `lint` / `single` are unaffected,
+  so the escape hatch the refusal names stays always available.
+
+Semantics, by the kind of the invocation MEETING a live holder:
+
+| Meeting | Behaviour |
+|---|---|
+| SHELL meets any live holder | **Refuse immediately.** Non-zero, no sleep, no poll, and an actionable message naming `scripts/test single -run TestX ./your/package/...`. |
+| RUNNER meets a live SHELL holder | **Wait**, bounded by **600 seconds** at a **2-second** poll, announcing the wait once. Most holders finish inside that and the runner then acquires with no concurrency at all. |
+| RUNNER meets a live SHELL holder, budget EXPIRED | **Displace**, with a loud one-line warning naming the deposed pid and stating that two verifies may now contend. The wedged-holder escape hatch, not the normal path. It displaces at most once per invocation. |
+| RUNNER meets a live RUNNER holder | Wait on the same budget, then **refuse** naming both pids. Two concurrent runner verifies on one worktree family is a bug to surface, not one to paper over by stealing. |
+
+**Do not poll a refusal.** It is a fast failure, not a queue — retrying it in a
+loop is what killed run a662ed6f category-A. Narrow to `scripts/test single` on
+your package instead.
+
+`FISHHAWK_VERIFY_LOCK_WAIT_SECONDS` / `FISHHAWK_VERIFY_LOCK_POLL_SECONDS` override
+the 600/2 defaults, and `FISHHAWK_VERIFY_LOCK_SELF_PID` injects this invocation's
+identity. All three are DEV-ONLY in the same sense as the other `FISHHAWK_*`
+knobs: the runner's gate env is a default-deny allow-list and `FISHHAWK_` is not
+an allowed prefix, so an ambient value never reaches the gate subprocess.
+
+### The prune is SERIALISED, not merely narrowed
+
+A dead or garbage holder is pruned — but the prune itself is exclusive, via a
+second atomic symlink at `<lockpath>.prune`. Without that, this interleaving is
+real, with lock L held by dead pid D:
+
+```
+A reads L -> classifies D dead        B reads L -> classifies D dead
+A: rm L ; ln -s A -> L   (A proceeds, holding a LIVE lock)
+B: rm L  <- removes A's FRESH LIVE lock, acting on its stale classification
+   ln -s B -> L          (B proceeds)   -> both believe they hold it
+```
+
+Re-reading immediately before the `rm` only narrows that window; it does not
+close it. Holding the marker, the pruner RE-READS the lock and removes it only
+if it still names a dead (or garbage) holder; if a live holder appeared it leaves
+it alone and the caller falls through to the normal live-holder path. A
+successful prune confers NOTHING on its own: `_verify_lock_prune_and_acquire`
+returns 0 only when it actually acquired, and every other outcome sends the
+caller back to re-classify from the top. The marker gets the same dead-owner
+recovery the lock has, so a pruner killed mid-prune cannot wedge later
+invocations, and it is released by the same EXIT trap, only when this invocation
+created it.
+
+**Residual, stated:** `kill -0 <pid>` succeeding does not prove the pid is the
+ORIGINAL holder — a reused pid reads as live. That is the identical residual the
+container lease already accepts, and the consequence here is a bounded wait plus
+a loud displacement, or a refusal with an escape hatch printed in the message —
+never a lost or corrupted run.
+
+### Degrades to no locking
+
+Three conditions each degrade to running verify WITHOUT the lock, with a printed
+one-line reason and never a failure: git absent from PATH, `$ROOT` not a git work
+tree, and a BARE repo. The bare-repo case guards on the printed
+`--is-inside-work-tree` VALUE rather than its exit status, because a bare repo
+prints `false` yet exits 0 — the same trap `_verify_schema_sync` documents.
+
+### Release
+
+An EXIT trap removes the prune marker only when it still names us, and the lock
+only when it still names US — so a lock this invocation refused on, or one that
+was displaced out from under it, is never removed.
+
+### Testing
+
+`scripts/test-verify-scope` (bash, hermetic: temp-dir git fixtures with stubbed
+`go`, `golangci-lint`, `sleep` and `docker` on PATH; no network, no real Docker,
+no Go toolchain) is wired into `_verify_gate_harnesses`, so a regression fails
+`scripts/test verify` in-loop rather than only when a human runs the harness.
+
+- **a1–a12** cover the scoped form: one `go test` in the owning module and NONE
+  in the others (the saving IS the skipped module, so that absence is the
+  load-bearing assertion); the unscoped no-regression control; the env fallback
+  and CLI-beats-env precedence; the empty-value exit 1; all three widening
+  fail-safes asserted on the FULL widened argv, not just the exit code; the
+  scoped patch-coverage skip paired with its unscoped control (`a9` proves `a8`
+  is a scoped-mode branch and not a broken gate); every non-test leg recorded as
+  having run in BOTH modes AND still gating in both (`a11` drives a real
+  over-long `ARCHITECTURE.md` line to a non-zero exit); and the scoped loop's
+  fail-closed branch when the module list changes under it.
+- **b1–b13** cover the lock: the shell refusal, asserted to run no tests, no lint
+  and — the STRUCTURAL proof of promptness, never an elapsed-time bound — zero
+  recorded `sleep` calls; the dead-holder prune; the prune RACE driven exactly as
+  written above, with B's classification taken BEFORE A's acquire and exactly one
+  proceeding; the live and dead prune-marker branches; runner-waits-then-acquires
+  for both holder kinds; runner-displaces-a-shell on expiry; runner-REFUSES-a-
+  runner on expiry, asserted on lock STATE and not only on the message; all three
+  no-locking degrades as separate cases; a real `git worktree add` proving a
+  linked worktree resolves the SAME lock path (which is what makes the control
+  contend at all); the three release branches; and one case per classification
+  verdict.
+- There is deliberately **no wall-clock assertion anywhere**. The issue's "under
+  10 minutes" outcome is established by measurement recorded in the #3315 PR
+  notes, not by a timing bound that would be a flake risk.
+
+`scripts/test-verify-scope --fixture <dir>` builds the standard fixture and exits,
+printing a manifest (`root=`, `script=`, `bin=`, `go_log=`, `lease_dir=`,
+`modules=`, `packages=`). The runner's Go cross-boundary test uses it so the
+shell/Go contract is pinned against ONE fixture definition rather than a
+duplicated one.
+
 ## Container lease + generation-keyed orphan sweep ([#1792](https://github.com/kuhlman-labs/fishhawk/issues/1792) / [#3122](https://github.com/kuhlman-labs/fishhawk/issues/3122))
 
 `scripts/test` disables the testcontainers ryuk reaper
