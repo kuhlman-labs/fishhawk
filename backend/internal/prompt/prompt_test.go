@@ -4947,6 +4947,8 @@ func TestBuild_PlanReview_GateEvidence_AllSkipAdvisoryRenders(t *testing.T) {
 		"- ADVISORY all_criteria_skip_expected:",
 		"ZERO", "#2347", // consequence tokens
 		"HANDLING: acknowledge this in `free_form`", "Do NOT record it as a concern", // handling tokens
+		"Record exactly ONE concern ONLY if you can NAME a specific criterion",                                                          // named-sandbox-drivable-criterion exception
+		"any OTHER acceptance finding (undecidable_criterion, missing_live_validation_marker) is unaffected and must still be recorded", // preservation of independent acceptance concerns
 	} {
 		if !strings.Contains(on, want) {
 			t.Errorf("plan_review prompt missing all-skip advisory element %q:\n%s", want, on)
@@ -5070,6 +5072,9 @@ func TestBuild_PlanReview_GateEvidencePreambleCarriesAdvisoryException(t *testin
 	}
 	if !strings.Contains(withEvidence, exceptionToken) {
 		t.Errorf("gate-evidence preamble missing the ADVISORY exception sentence:\n%s", withEvidence)
+	}
+	if !strings.Contains(withEvidence, "### Gate evidence") {
+		t.Errorf("with-evidence prompt must carry the gate-evidence section header (anchors the literal asserted absent below):\n%s", withEvidence)
 	}
 
 	noEvidence, err := Build("plan_review", Trigger{

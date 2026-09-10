@@ -946,8 +946,17 @@ plain `- findings: none (checked and clean)`, so the block never claims
 **Reachability.** The preamble's blanket must-be-a-concern rule would
 otherwise apply to the ADVISORY line too, so `allSkipPreambleException` adds
 one sentence to the preamble — rendered whenever any gate evidence is present
-— naming `ADVISORY`-prefixed lines as the one exception that carries its own
-HANDLING instruction instead.
+— naming the acceptance pre-check's specific `all_criteria_skip_expected`
+advisory line as the exception that carries its own HANDLING instruction
+instead. The exception is scoped to that one specific line, not a bare
+`ADVISORY` line-prefix: every other gate-evidence line renders
+`fmt.Fprintf`-interpolated finding/violation Detail text this package does not
+fully control, so a bare-prefix exception would hand any such text a
+de-escalation channel by placing a newline plus its own
+`- ADVISORY ...: HANDLING: ...` into a Detail string. Naming the specific
+advisory — never the word `ADVISORY` alone — closes that off; the exception
+sentence deliberately keeps the two terms non-adjacent so it does not itself
+trip a naive substring match for the rendered advisory line.
 
 **Narrowness.** The de-escalation, mirroring `liveValidationVerdictClause`'s
 shape, covers ONLY the plan-level all-skip shape itself. A concern about an
