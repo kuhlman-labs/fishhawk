@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
@@ -273,7 +274,12 @@ type splitFilingConfig struct {
 	reachabilityDerived int  // contract-phase DerivedCount to seed; 0 = seed NO reachability entry
 	installID           *int64
 	github              *githubclient.Client
-	providerFailOnCall  int
+	// installationRef seeds run.Run.InstallationRef, which drives the #2900
+	// parent_forge stamp (splitParentForgeFamilyFromRef). nil (the default every
+	// other splitFilingConfig literal leaves it at) reproduces the legacy
+	// GitHub-family behaviour those tests already assert.
+	installationRef    *string
+	providerFailOnCall int
 	// planOverride, when non-nil, seeds this plan artifact instead of the
 	// default splitPlanBytes(withSplitProposal). Used by the #2412 refusal tests
 	// to construct a split_proposal with an over-cap lead phase by construction.
@@ -429,11 +435,12 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 	planStageID := uuid.New()
 	trigger := "issue:" + strconv.Itoa(splitParentIssue)
 	runRow := &run.Run{
-		ID:             runID,
-		Repo:           "o/r",
-		WorkflowID:     "feature_change",
-		TriggerRef:     &trigger,
-		InstallationID: cfg.installID,
+		ID:              runID,
+		Repo:            "o/r",
+		WorkflowID:      "feature_change",
+		TriggerRef:      &trigger,
+		InstallationID:  cfg.installID,
+		InstallationRef: cfg.installationRef,
 	}
 	if cfg.withSpec {
 		runRow.WorkflowSpec = specImplementPathConstraints
@@ -604,6 +611,68 @@ func TestFileSplitProposalChildren_HappyPath_DeleteOnly(t *testing.T) {
 	}
 	if payload.ParentIssue != splitParentIssue {
 		t.Errorf("parent_issue = %d, want %d (parsed from the run's trigger ref)", payload.ParentIssue, splitParentIssue)
+	}
+}
+
+// TestFileSplitProposalChildren_StampsParentForge closes the #3306 verification
+// gap left by PR #3304: every existing assertion about a split linkage's
+// parent_forge either hand-seeds the field (splitParentCloseAudit.seedLinkageForge
+// in split_parent_close_test.go) or exercises splitParentForgeFamilyFromRef /
+// normalizeSplitParentForge in isolation (TestSplitParentForgeFamily) — nothing
+// drove the real fileSplitProposalChildren hook and inspected the EMITTED,
+// marshaled-then-decoded split_children_filed payload. So a regression that drops
+// the ParentForge assignment in writeSplitChildrenFiledAudit (split_filing.go:715)
+// would leave the whole suite green while a newly filed GitLab linkage silently
+// stopped matching its delivering forge on read (`parent_forge` is
+// `json:"omitempty"`, so a dropped assignment marshals the field ABSENT and
+// decodes back as "").
+//
+// COUNTERFACTUAL 1 (run, don't reason): delete the
+// `ParentForge: splitParentForgeFamilyFromRef(installationRef),` line at
+// split_filing.go:715 — the gitlab case reddens on the parent_forge assertion
+// (decoded as "", not "gitlab"), never on a compile or fixture error.
+// COUNTERFACTUAL 2: replace that line's RHS with the constant webhook.ForgeGitLab
+// — the three github cases redden, proving they are not vacuously asserting a
+// value the producer never actually computes.
+//
+// Each case also cross-checks normalizeSplitParentForge(payload.ParentForge)
+// against the family splitParentForgeID emits for a delivery on that forge, so a
+// producer/consumer vocabulary rename on either side fails here instead of
+// silently unmatching linkages in production.
+func TestFileSplitProposalChildren_StampsParentForge(t *testing.T) {
+	gitlabRef := "gitlab:77"
+	githubRef := "12345"
+	emptyRef := ""
+	cases := []struct {
+		name            string
+		installationRef *string
+		wantForge       string
+	}{
+		{"gitlab installation ref", &gitlabRef, webhook.ForgeGitLab},
+		{"bare github App installation ref", &githubRef, forgeNameGitHub},
+		{"nil ref (legacy github run)", nil, forgeNameGitHub},
+		{"empty-string ref", &emptyRef, forgeNameGitHub},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newSplitFilingHarness(t, splitFilingConfig{
+				withSplitProposal: true, withSpec: true,
+				reachabilityDerived: 2, // <= cap (3) -> delete-only, no GitHub client needed
+				installationRef:     tc.installationRef,
+			})
+			h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+			payload, n := h.completionEntry(t)
+			if n != 1 {
+				t.Fatalf("wrote %d split_children_filed entries, want 1", n)
+			}
+			if payload.ParentForge != tc.wantForge {
+				t.Fatalf("parent_forge = %q, want %q", payload.ParentForge, tc.wantForge)
+			}
+			if got := normalizeSplitParentForge(payload.ParentForge); got != tc.wantForge {
+				t.Fatalf("normalizeSplitParentForge(%q) = %q, want %q (producer/consumer vocabulary drift)", payload.ParentForge, got, tc.wantForge)
+			}
+		})
 	}
 }
 
