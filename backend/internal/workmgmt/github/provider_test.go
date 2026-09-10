@@ -620,6 +620,15 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 			t.Errorf("child #%d Complete = %v, want %v", c.Number, c.Complete, wantComplete[c.Number])
 		}
 	}
+	// State carries the child's forge issue state, NORMALIZED to uppercase (#3323).
+	// ListSubIssues returns uppercase GraphQL enums, so #41/#43 are CLOSED and #42
+	// is OPEN — the signal the rolling-walk adoption reads (an OPEN candidate).
+	wantState := map[int]string{41: "CLOSED", 42: "OPEN", 43: "CLOSED"}
+	for _, c := range res.Children {
+		if c.State != wantState[c.Number] {
+			t.Errorf("child #%d State = %q, want %q", c.Number, c.State, wantState[c.Number])
+		}
+	}
 	// Edges: 42->41, 43->41, 43->42. The #999 reference is not a child → it is
 	// kept out of Edges and surfaced in DroppedEdges (not silently discarded).
 	want := []workmgmt.DependsEdge{{From: 42, To: 41}, {From: 43, To: 41}, {From: 43, To: 42}}
@@ -933,6 +942,19 @@ func TestProvider_ResolveDependencies(t *testing.T) {
 		}
 		if byNum[102].Complete {
 			t.Errorf("#102 Complete = true, want false (open)")
+		}
+		// State is NORMALIZED to uppercase (#3323). GetIssue is the REST payload,
+		// whose state is LOWERCASE ("open"/"closed"), so these assertions are what
+		// catch a missing strings.ToUpper at the ResolveDependencies EpicChild site
+		// (the named counterfactual): without it, State would be "closed"/"open".
+		if byNum[100].State != "CLOSED" {
+			t.Errorf("#100 State = %q, want CLOSED (lowercase REST normalized to uppercase)", byNum[100].State)
+		}
+		if byNum[101].State != "CLOSED" {
+			t.Errorf("#101 State = %q, want CLOSED", byNum[101].State)
+		}
+		if byNum[102].State != "OPEN" {
+			t.Errorf("#102 State = %q, want OPEN (lowercase REST normalized to uppercase)", byNum[102].State)
 		}
 	})
 
@@ -3142,7 +3164,9 @@ func jitterGolden() *workmgmt.EpicChildrenResult {
 	canon := dependsOnTokenCanonical("other/repo#5")
 	return &workmgmt.EpicChildrenResult{
 		Children: []workmgmt.EpicChild{
-			{Number: 101, Title: "one-one", Complete: true},
+			// #101 is closed+completed, so State normalizes to "CLOSED" (#3323); the
+			// rest carry no state in the fixture, so State is "".
+			{Number: 101, Title: "one-one", Complete: true, State: "CLOSED"},
 			{Number: 102, Title: "one-two"},
 			{Number: 103, Title: "one-three"},
 			{Number: 104, Title: "one-four"},

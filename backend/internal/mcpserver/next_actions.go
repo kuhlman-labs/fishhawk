@@ -343,7 +343,9 @@ func foldWorkingDirParams(run *Run, na *NextActions) {
 // carries no pending live-validation walk. Three variants, keyed off the
 // backend's filing_failed / filing_incomplete bits (binding condition A(1)):
 //
-//   - healthy walk (filing_failed=false, a non-empty walk_ref): "walk: #X"
+//   - rolling walk (filing_failed=false, non-empty walk_ref AND checklist_anchor,
+//     #3323): "rolling walk: #X, section run-<id>"
+//   - healthy walk (filing_failed=false, a non-empty walk_ref, no anchor): "walk: #X"
 //   - filing failure (filing_failed=true, filing_incomplete=false): the
 //     file-manually variant "walk filing failed — file manually"
 //   - stranded intent marker (filing_failed=true, filing_incomplete=true — the
@@ -360,6 +362,9 @@ func liveValidationGuidance(lv *RunLiveValidation) string {
 	}
 	n := lv.PendingCriteriaCount
 	switch {
+	case !lv.FilingFailed && lv.WalkRef != "" && lv.ChecklistAnchor != "":
+		// Rolling per-epic walk (#3323): name both the walk and this run's section.
+		return fmt.Sprintf("%d criteria pending operator live-validation (rolling walk: %s, section %s)", n, lv.WalkRef, lv.ChecklistAnchor)
 	case !lv.FilingFailed && lv.WalkRef != "":
 		return fmt.Sprintf("%d criteria pending operator live-validation (walk: %s)", n, lv.WalkRef)
 	case lv.FilingIncomplete:
@@ -389,6 +394,9 @@ func foldLiveValidationAdvisory(run *Run, na *NextActions) {
 	params := map[string]string{"run_id": run.ID}
 	if ref := run.LiveValidation.WalkRef; ref != "" {
 		params["walk_ref"] = ref
+	}
+	if anchor := run.LiveValidation.ChecklistAnchor; anchor != "" {
+		params["checklist_anchor"] = anchor
 	}
 	na.Actions = append(na.Actions, SuggestedAction{
 		Action:       "operator_live_validation",

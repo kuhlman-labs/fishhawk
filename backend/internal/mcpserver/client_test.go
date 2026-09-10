@@ -1502,6 +1502,35 @@ func TestRunLiveValidation_WireShape(t *testing.T) {
 		}
 	})
 
+	t.Run("rolling walk with checklist_anchor decodes", func(t *testing.T) {
+		// #3323: the rolling per-epic walk carries this run's section anchor. The
+		// json tag MUST byte-match the backend or checklist_anchor silently decodes
+		// to "" (the #371-class trap this test exists to pin — a tag typo does NOT
+		// break the build). Assert the exact string round-trips through the REAL
+		// GetRun decode path.
+		anchor := "run-" + runID.String()
+		r := serveRun(t, runBody(`{"pending_criteria_count":3,"walk_ref":"#123","filing_failed":false,"checklist_anchor":"`+anchor+`"}`))
+		if r.LiveValidation == nil {
+			t.Fatal("LiveValidation is nil; the live_validation json tag does not byte-match the backend")
+		}
+		if got := r.LiveValidation.ChecklistAnchor; got != anchor {
+			t.Errorf("ChecklistAnchor = %q, want %q (checklist_anchor tag mismatch decodes silently to empty)", got, anchor)
+		}
+	})
+
+	t.Run("healthy walk omitting checklist_anchor decodes empty", func(t *testing.T) {
+		// The backend tags the field omitempty, so it never emits a present-empty
+		// value: the no-anchor state is deliberately collapsed with absent, and both
+		// decode to "".
+		r := serveRun(t, runBody(`{"pending_criteria_count":3,"walk_ref":"#123","filing_failed":false}`))
+		if r.LiveValidation == nil {
+			t.Fatal("LiveValidation is nil on a healthy body")
+		}
+		if got := r.LiveValidation.ChecklistAnchor; got != "" {
+			t.Errorf("ChecklistAnchor = %q, want empty when the key is omitted", got)
+		}
+	})
+
 	t.Run("filing-failure marker decodes", func(t *testing.T) {
 		r := serveRun(t, runBody(`{"pending_criteria_count":2,"filing_failed":true}`))
 		if r.LiveValidation == nil {

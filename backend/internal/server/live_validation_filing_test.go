@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,6 +70,73 @@ type liveValParentFixture struct {
 	errs   bool
 }
 
+// liveValIssueStore is an in-test issue store (number -> body/state) shared by
+// newLiveValGitHubWithStore's REST GET and PATCH handlers (#3323): a rolling-walk
+// test seeds a candidate's fresh body/state and reads back what appendRollingWalkSection
+// PATCHed. Guarded by a mutex — the hook's read-modify-write and the test assertions
+// run on different goroutines under the httptest server.
+type liveValIssueStore struct {
+	mu       sync.Mutex
+	issues   map[int]*storedIssue
+	patched  map[int]int  // number -> count of PATCHes landed
+	failGet  map[int]bool // numbers whose GET returns 500
+	failPtch map[int]bool // numbers whose PATCH returns 500
+}
+
+type storedIssue struct {
+	body  string
+	state string // "open" / "closed"
+}
+
+func newLiveValIssueStore() *liveValIssueStore {
+	return &liveValIssueStore{issues: map[int]*storedIssue{}, patched: map[int]int{}, failGet: map[int]bool{}, failPtch: map[int]bool{}}
+}
+
+func (s *liveValIssueStore) seed(number int, body, state string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.issues[number] = &storedIssue{body: body, state: state}
+}
+
+func (s *liveValIssueStore) get(number int) (*storedIssue, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i, ok := s.issues[number]
+	if !ok {
+		return nil, false
+	}
+	cp := *i
+	return &cp, true
+}
+
+func (s *liveValIssueStore) injectGetError(number int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failGet[number] = true
+}
+
+func (s *liveValIssueStore) injectPatchError(number int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failPtch[number] = true
+}
+
+func (s *liveValIssueStore) patchCount(number int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.patched[number]
+}
+
+func (s *liveValIssueStore) totalPatches() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, c := range s.patched {
+		n += c
+	}
+	return n
+}
+
 // newLiveValGitHub returns a GitHub client that serves BOTH the REST GetIssue
 // (answering restTitle — kept so the pre-#2179 callers are unaffected) AND the
 // GraphQL IssueParent query resolveWalkParentEpic issues. `parent` drives the
@@ -76,12 +144,66 @@ type liveValParentFixture struct {
 // fallback mode). Every other endpoint 404s.
 func newLiveValGitHub(t *testing.T, restTitle string, parent *liveValParentFixture) *githubclient.Client {
 	t.Helper()
+	c, _ := newLiveValGitHubWithStore(t, restTitle, parent)
+	return c
+}
+
+// newLiveValGitHubWithStore is newLiveValGitHub plus an addressable issue store
+// (#3323): the REST GET serves a seeded issue's body/state when present (else the
+// default restTitle/open), and a PATCH updates the stored body + counts the write,
+// so a rolling-walk append test can seed a candidate and assert on the PATCHed body.
+func newLiveValGitHubWithStore(t *testing.T, restTitle string, parent *liveValParentFixture) (*githubclient.Client, *liveValIssueStore) {
+	t.Helper()
+	store := newLiveValIssueStore()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}",
 		func(w http.ResponseWriter, r *http.Request) {
 			num, _ := strconv.Atoi(r.PathValue("number"))
+			store.mu.Lock()
+			fail := store.failGet[num]
+			store.mu.Unlock()
+			if fail {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, `{"message":"injected GET error"}`)
+				return
+			}
+			if si, ok := store.get(num); ok {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"number": num, "title": restTitle, "body": si.body, "state": si.state,
+				})
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number": num, "title": restTitle, "body": "", "state": "open",
+			})
+		})
+	mux.HandleFunc("PATCH /repos/{owner}/{repo}/issues/{number}",
+		func(w http.ResponseWriter, r *http.Request) {
+			num, _ := strconv.Atoi(r.PathValue("number"))
+			store.mu.Lock()
+			failP := store.failPtch[num]
+			store.mu.Unlock()
+			if failP {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, `{"message":"injected PATCH error"}`)
+				return
+			}
+			var in map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			store.mu.Lock()
+			si := store.issues[num]
+			if si == nil {
+				si = &storedIssue{state: "open"}
+				store.issues[num] = si
+			}
+			if b, ok := in["body"].(string); ok {
+				si.body = b
+			}
+			store.patched[num]++
+			body, state := si.body, si.state
+			store.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": num, "title": restTitle, "body": body, "state": state,
 			})
 		})
 	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
@@ -103,7 +225,7 @@ func newLiveValGitHub(t *testing.T, restTitle string, parent *liveValParentFixtu
 		BaseURL: srv.URL,
 		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
 		HTTP:    &http.Client{Timeout: 5 * time.Second},
-	}
+	}, store
 }
 
 // liveValEpicFileProvider is liveValFileProvider PLUS the EpicChildrenQuerier
@@ -167,6 +289,9 @@ type liveValConfig struct {
 	// onward so a test can make the epic reach the cap DURING the arm decision (the
 	// high/concurrency TOCTOU: pre-count sees room, the locked read sees the cap).
 	epicChildrenAfter []workmgmt.EpicChild
+	// githubStore, when set, is the issue store backing cfg.github's REST GET/PATCH
+	// (#3323 rolling-walk append tests).
+	githubStore *liveValIssueStore
 }
 
 type liveValHarness struct {
@@ -174,6 +299,7 @@ type liveValHarness struct {
 	au        *auditFake
 	rr        *promptRunRepo
 	provider  *liveValFileProvider
+	store     *liveValIssueStore
 	runID     uuid.UUID
 	planStage *run.Stage
 }
@@ -255,7 +381,7 @@ func newLiveValHarness(t *testing.T, cfg liveValConfig) *liveValHarness {
 	if cfg.github != nil {
 		s.cfg.GitHub = cfg.github
 	}
-	return &liveValHarness{s: s, au: au, rr: rr, provider: provider, runID: runID, planStage: planStage}
+	return &liveValHarness{s: s, au: au, rr: rr, provider: provider, store: cfg.githubStore, runID: runID, planStage: planStage}
 }
 
 // markerCount counts appended markers of a category.
@@ -762,13 +888,27 @@ func TestFileOrLinkLiveValidationWalk_EpicArm(t *testing.T) {
 	// lock — a re-entry regression DEADLOCKS this synchronous call and times the
 	// test out). Asserting the exact rendered title pins that the locked-allocated
 	// {n} reached the filed item rather than "whatever came back".
-	wantTitle := "[E48.4] Operator live-validation walk for #" + strconv.Itoa(liveValParentIssue)
+	// The epic arm is now a ROLLING walk (#3323): summary "Operator live-validation
+	// walk (rolling)", so the first filing under this epic renders this exact title.
+	wantTitle := "[E48.4] Operator live-validation walk (rolling)"
 	if req.Item.Title != wantTitle {
 		t.Errorf("walk title = %q, want exactly %q (locked-allocated {n} rendered)", req.Item.Title, wantTitle)
 	}
 	linked, ok := h.newestLinked(t)
 	if !ok || linked.FilingFailed || linked.WalkRef == "" {
 		t.Errorf("linked marker = %+v (ok=%v), want a healthy walk_ref", linked, ok)
+	}
+	// First filing under the epic carries this run's section anchor and did NOT
+	// append (no prior candidate).
+	if linked.ChecklistAnchor != "run-"+h.runID.String() {
+		t.Errorf("checklist_anchor = %q, want run-%s", linked.ChecklistAnchor, h.runID.String())
+	}
+	if linked.WalkAppended {
+		t.Errorf("walk_appended = true, want false on the first filing")
+	}
+	// The rolling key is stamped into the filed body so the next run adopts it.
+	if !workmgmt.BodyHasIdempotencyKey(req.Item.Body, liveValidationRollingKey("o/r", "#1940")) {
+		t.Errorf("filed rolling walk body missing the rolling idempotency key")
 	}
 }
 
@@ -947,5 +1087,467 @@ func TestLiveValidationWalkBody_CompanionByteIdentity(t *testing.T) {
 	got := liveValidationWalkBody("#2045", "#1940", crits, true)
 	if got != want {
 		t.Errorf("companion body drifted from the frozen golden.\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rolling per-epic walk (#3323): ADOPTION-vs-ALLOCATION + append/file arms.
+// ---------------------------------------------------------------------------
+
+// liveValRollingKeyOR is the rolling key for epic #1940 in repo o/r (the shared
+// epic fixture below), computed via the production helper so a discovery mismatch
+// is impossible.
+func liveValRollingKeyOR() string { return liveValidationRollingKey("o/r", "#1940") }
+
+// liveValRollingCandidate builds an epic child that IS a rolling walk for epic
+// #1940: a numbered title, a body stamped with the given rolling key, and the
+// given (already-normalized) State.
+func liveValRollingCandidate(number int, state, rollingKey string) workmgmt.EpicChild {
+	body := workmgmt.StampIdempotencyKey("## Summary\n\nParent epic: #1940.", rollingKey)
+	return workmgmt.EpicChild{
+		Number: number,
+		Title:  "[E48.4] Operator live-validation walk (rolling)",
+		Body:   body,
+		State:  state,
+	}
+}
+
+// liveValRollingHarness builds an epic-arm harness (IssueParent -> [E48] #1940,
+// querier provider) whose epic children are `children`, wired to a github client
+// with an addressable store.
+func liveValRollingHarness(t *testing.T, children []workmgmt.EpicChild) (*liveValHarness, *liveValIssueStore) {
+	t.Helper()
+	inst := int64(77)
+	gh, store := newLiveValGitHubWithStore(t, "", &liveValParentFixture{number: 1940, title: "[E48] SDLC dogfooding"})
+	h := newLiveValHarness(t, liveValConfig{
+		marked: true, installID: &inst, github: gh, githubStore: store,
+		providerQuerier: true, epicChildren: children,
+	})
+	return h, store
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingFirstFilingStampsKey (branch 1): no
+// candidate -> FILE a new rolling walk whose body carries the rolling key.
+func TestFileOrLinkLiveValidationWalk_RollingFirstFilingStampsKey(t *testing.T) {
+	h, store := liveValRollingHarness(t, numberedEpicChildren("48", 3))
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+	if h.provider.calls != 1 {
+		t.Fatalf("File called %d, want exactly 1 (first rolling filing)", h.provider.calls)
+	}
+	if store.totalPatches() != 0 {
+		t.Fatalf("patches = %d, want 0 on a first filing", store.totalPatches())
+	}
+	req := h.provider.reqs[0]
+	if !workmgmt.BodyHasIdempotencyKey(req.Item.Body, liveValRollingKeyOR()) {
+		t.Errorf("filed body missing the rolling key so the NEXT run cannot adopt it")
+	}
+	if req.Item.Title != "[E48.4] Operator live-validation walk (rolling)" {
+		t.Errorf("title = %q, want the rolling summary", req.Item.Title)
+	}
+	linked, _ := h.newestLinked(t)
+	if linked.WalkAppended || linked.ChecklistAnchor != "run-"+h.runID.String() {
+		t.Errorf("linked = %+v, want appended=false anchor=run-%s", linked, h.runID.String())
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingAppendsToOpenWalk (branch 2): an OPEN
+// marker-bearing candidate -> APPEND, provider File called ZERO times.
+func TestFileOrLinkLiveValidationWalk_RollingAppendsToOpenWalk(t *testing.T) {
+	cand := liveValRollingCandidate(5001, "OPEN", liveValRollingKeyOR())
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), cand))
+	store.seed(5001, cand.Body, "open")
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Fatalf("File called %d, want 0 on the append path (no addSubIssue, no new child)", h.provider.calls)
+	}
+	if store.totalPatches() != 1 || store.patchCount(5001) != 1 {
+		t.Fatalf("patches total=%d #5001=%d, want exactly one PATCH to #5001", store.totalPatches(), store.patchCount(5001))
+	}
+	si, _ := store.get(5001)
+	if !strings.Contains(si.body, "### Run "+h.runID.String()) {
+		t.Errorf("appended body missing this run's section heading")
+	}
+	linked, _ := h.newestLinked(t)
+	if linked.FilingFailed || linked.WalkRef != "#5001" || !linked.WalkAppended || linked.ChecklistAnchor != "run-"+h.runID.String() {
+		t.Errorf("linked = %+v, want healthy appended walk_ref #5001 anchor run-%s", linked, h.runID.String())
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingCappedEpicWithCandidateAppends (binding
+// condition test (a)): a capped epic (exactly the sub-issue cap) that HOLDS an
+// open rolling candidate APPENDS regardless of the cap; File called ZERO times.
+// This is the feature-is-inert-at-the-cap defect the binding condition exists to
+// fix (E22/E48/E67 are at the cap today).
+func TestFileOrLinkLiveValidationWalk_RollingCappedEpicWithCandidateAppends(t *testing.T) {
+	cand := liveValRollingCandidate(6001, "OPEN", liveValRollingKeyOR())
+	children := append(numberedEpicChildren("48", githubSubIssueParentCap-1), cand)
+	if len(children) != githubSubIssueParentCap {
+		t.Fatalf("seeded %d children, want exactly the cap %d", len(children), githubSubIssueParentCap)
+	}
+	h, store := liveValRollingHarness(t, children)
+	store.seed(6001, cand.Body, "open")
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Fatalf("File called %d, want 0: a capped epic with an open candidate APPENDS (binding condition a)", h.provider.calls)
+	}
+	if store.patchCount(6001) != 1 {
+		t.Fatalf("PATCH to #6001 = %d, want 1 (appended despite the cap)", store.patchCount(6001))
+	}
+	linked, _ := h.newestLinked(t)
+	if !linked.WalkAppended || linked.WalkRef != "#6001" {
+		t.Errorf("linked = %+v, want appended walk_ref #6001", linked)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingCappedEpicNoCandidateCompanion (binding
+// condition test (b)): a capped epic with NO candidate degrades to the UNCHANGED
+// companion arm — proving the existing degrade is preserved, not silently narrowed.
+func TestFileOrLinkLiveValidationWalk_RollingCappedEpicNoCandidateCompanion(t *testing.T) {
+	h, store := liveValRollingHarness(t, numberedEpicChildren("48", githubSubIssueParentCap))
+	assertCompanionArm(t, h)
+	if store.totalPatches() != 0 {
+		t.Errorf("patches = %d, want 0 (companion arm never PATCHes)", store.totalPatches())
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingUnallocatableWithCandidateAppends
+// (binding condition test (c)): an epic where NextChildNumber cannot allocate {n}
+// (children carry no numbered form) but that HOLDS an open candidate APPENDS —
+// allocation is irrelevant to the append path.
+func TestFileOrLinkLiveValidationWalk_RollingUnallocatableWithCandidateAppends(t *testing.T) {
+	// The ONLY child is a marker-bearing OPEN candidate with a NON-numbered title,
+	// so NextChildNumber returns !ok, yet the candidate is adoptable.
+	body := workmgmt.StampIdempotencyKey("rolling walk", liveValRollingKeyOR())
+	cand := workmgmt.EpicChild{Number: 7001, Title: "operator walk (no bracket)", Body: body, State: "OPEN"}
+	h, store := liveValRollingHarness(t, []workmgmt.EpicChild{cand})
+	store.seed(7001, body, "open")
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Fatalf("File called %d, want 0: append needs no {n} (binding condition c)", h.provider.calls)
+	}
+	if store.patchCount(7001) != 1 {
+		t.Fatalf("PATCH to #7001 = %d, want 1", store.patchCount(7001))
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingClosedCandidateFilesNew (branch 3): a
+// CLOSED marker-bearing candidate is NOT adopted -> FILE a new walk, no PATCH.
+func TestFileOrLinkLiveValidationWalk_RollingClosedCandidateFilesNew(t *testing.T) {
+	cand := liveValRollingCandidate(5001, "CLOSED", liveValRollingKeyOR())
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), cand))
+	// Deliberately DO NOT seed the store (fresh read would default to "open"), so
+	// the ONLY thing keeping this closed candidate from being adopted is the State
+	// == "OPEN" control — deleting that control reddens this test on the PATCH.
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 1 {
+		t.Fatalf("File called %d, want 1 (closed candidate not adopted -> file new)", h.provider.calls)
+	}
+	if store.totalPatches() != 0 {
+		t.Fatalf("patches = %d, want 0 (a closed candidate is never PATCHed)", store.totalPatches())
+	}
+	linked, _ := h.newestLinked(t)
+	if linked.FilingFailed || linked.WalkRef == "" || linked.WalkAppended {
+		t.Errorf("linked = %+v, want a healthy filed (not appended) walk", linked)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingUnknownStateFilesNew (branch 4): a
+// candidate with EMPTY State (a provider that does not populate it) is UNKNOWN and
+// never adopted -> FILE a new walk, no PATCH.
+func TestFileOrLinkLiveValidationWalk_RollingUnknownStateFilesNew(t *testing.T) {
+	cand := liveValRollingCandidate(5001, "", liveValRollingKeyOR()) // empty State
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), cand))
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 1 {
+		t.Fatalf("File called %d, want 1 (empty State -> unknown -> not adopted)", h.provider.calls)
+	}
+	if store.totalPatches() != 0 {
+		t.Fatalf("patches = %d, want 0", store.totalPatches())
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingForeignKeyNotAdopted (branch 5): a
+// candidate carrying a DIFFERENT epic's rolling key is NOT adopted -> FILE a new
+// walk, no PATCH.
+func TestFileOrLinkLiveValidationWalk_RollingForeignKeyNotAdopted(t *testing.T) {
+	foreign := liveValidationRollingKey("o/r", "#9999")
+	cand := liveValRollingCandidate(5001, "OPEN", foreign)
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), cand))
+	store.seed(5001, cand.Body, "open")
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 1 {
+		t.Fatalf("File called %d, want 1 (foreign-key candidate not adopted)", h.provider.calls)
+	}
+	if store.totalPatches() != 0 {
+		t.Fatalf("patches = %d, want 0 (a foreign walk is never PATCHed)", store.totalPatches())
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingCandidateReadErrorFilesNew (branch 6): a
+// GetIssue error on the candidate degrades to FILING a new walk (never a lost
+// walk); healthy linked marker.
+func TestFileOrLinkLiveValidationWalk_RollingCandidateReadErrorFilesNew(t *testing.T) {
+	cand := liveValRollingCandidate(5001, "OPEN", liveValRollingKeyOR())
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), cand))
+	store.seed(5001, cand.Body, "open")
+	store.injectGetError(5001) // the fresh read fails
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 1 {
+		t.Fatalf("File called %d, want 1 (GetIssue error degrades to file-new)", h.provider.calls)
+	}
+	if store.totalPatches() != 0 {
+		t.Fatalf("patches = %d, want 0 (the failed read never reached a PATCH)", store.totalPatches())
+	}
+	linked, _ := h.newestLinked(t)
+	if linked.FilingFailed || linked.WalkRef == "" {
+		t.Errorf("linked = %+v, want a healthy filed walk after the read-error degrade", linked)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingCandidateClosedAtFreshReadFilesNew is
+// the counterfactual vehicle for the fresh-GetIssue state re-check: the candidate
+// is OPEN in the EpicChildren snapshot but CLOSED at the authoritative fresh read
+// (a walk closed between the snapshot and the append). It degrades to filing a new
+// walk; deleting the fresh-state re-check would PATCH a closed walk.
+func TestFileOrLinkLiveValidationWalk_RollingCandidateClosedAtFreshReadFilesNew(t *testing.T) {
+	cand := liveValRollingCandidate(5001, "OPEN", liveValRollingKeyOR()) // snapshot: OPEN
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), cand))
+	store.seed(5001, cand.Body, "closed") // fresh read: CLOSED
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 1 {
+		t.Fatalf("File called %d, want 1 (candidate closed at fresh read -> file new)", h.provider.calls)
+	}
+	if store.totalPatches() != 0 {
+		t.Fatalf("patches = %d, want 0 (a walk closed at the fresh read is never PATCHed)", store.totalPatches())
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingAppendErrorMarksFilingFailed (branch 7):
+// an UpdateIssue error routes to a filing_failed linked marker with an EMPTY
+// walk_ref and provider File called ZERO times — asserted on COMMITTED audit
+// state (the hook returns nothing). It must NOT re-file (the #2045 double-file
+// window).
+func TestFileOrLinkLiveValidationWalk_RollingAppendErrorMarksFilingFailed(t *testing.T) {
+	cand := liveValRollingCandidate(5001, "OPEN", liveValRollingKeyOR())
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), cand))
+	store.seed(5001, cand.Body, "open")
+	store.injectPatchError(5001) // the append write fails
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Fatalf("File called %d, want 0: an UpdateIssue error must NOT re-file (double-file window)", h.provider.calls)
+	}
+	linked, ok := h.newestLinked(t)
+	if !ok || !linked.FilingFailed || linked.WalkRef != "" {
+		t.Errorf("linked = %+v (ok=%v), want filing_failed with an empty walk_ref", linked, ok)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingPicksHighestOpenCandidate (branch 8):
+// two open candidates (a prior degrade left two) -> the HIGHEST-numbered one is
+// PATCHed.
+func TestFileOrLinkLiveValidationWalk_RollingPicksHighestOpenCandidate(t *testing.T) {
+	key := liveValRollingKeyOR()
+	c1 := liveValRollingCandidate(5001, "OPEN", key)
+	c2 := liveValRollingCandidate(5002, "OPEN", key)
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), c1, c2))
+	store.seed(5001, c1.Body, "open")
+	store.seed(5002, c2.Body, "open")
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Fatalf("File called %d, want 0 (append path)", h.provider.calls)
+	}
+	if store.patchCount(5002) != 1 || store.patchCount(5001) != 0 {
+		t.Fatalf("patches #5002=%d #5001=%d, want the HIGHEST (#5002) PATCHed only", store.patchCount(5002), store.patchCount(5001))
+	}
+	linked, _ := h.newestLinked(t)
+	if linked.WalkRef != "#5002" {
+		t.Errorf("walk_ref = %q, want #5002 (highest)", linked.WalkRef)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingSectionAlreadyPresentNoWrite (branch 9):
+// a re-entry whose section is already present in the fresh body writes NO PATCH,
+// records a healthy linked marker, and still reports the anchor.
+func TestFileOrLinkLiveValidationWalk_RollingSectionAlreadyPresentNoWrite(t *testing.T) {
+	cand := liveValRollingCandidate(5001, "OPEN", liveValRollingKeyOR())
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), cand))
+	// The fresh body ALREADY carries this run's section key.
+	bodyWithSection := workmgmt.StampIdempotencyKey(cand.Body, liveValidationSectionKey(h.runID))
+	store.seed(5001, bodyWithSection, "open")
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Fatalf("File called %d, want 0", h.provider.calls)
+	}
+	if store.totalPatches() != 0 {
+		t.Fatalf("patches = %d, want 0 (section already present, idempotent re-entry)", store.totalPatches())
+	}
+	linked, _ := h.newestLinked(t)
+	if linked.FilingFailed || linked.WalkRef != "#5001" || !linked.WalkAppended || linked.ChecklistAnchor != "run-"+h.runID.String() {
+		t.Errorf("linked = %+v, want healthy #5001 anchor run-%s with no write", linked, h.runID.String())
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_CompanionArmNotRolling (branch 10): the
+// companion arm (no resolvable epic) is unchanged — no rolling key, no candidate
+// scan, no PATCH, no anchor.
+func TestFileOrLinkLiveValidationWalk_CompanionArmNotRolling(t *testing.T) {
+	inst := int64(77)
+	h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst, providerQuerier: true}) // no github -> companion
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+	if len(h.provider.reqs) != 1 {
+		t.Fatalf("filed %d, want 1 companion walk", len(h.provider.reqs))
+	}
+	req := h.provider.reqs[0]
+	if !strings.Contains(req.Item.Body, "Companion to #2045") {
+		t.Errorf("companion body missing the companion line")
+	}
+	if workmgmt.BodyHasIdempotencyKey(req.Item.Body, liveValidationRollingKey("o/r", "#2045")) {
+		t.Errorf("companion walk carries a rolling key, want none")
+	}
+	linked, _ := h.newestLinked(t)
+	if linked.WalkAppended || linked.ChecklistAnchor != "" {
+		t.Errorf("linked = %+v, want no anchor / not appended on the companion arm", linked)
+	}
+}
+
+// TestLiveValidationForRun_ChecklistAnchor (branch 11): the anchor round-trips
+// linked-marker -> runLiveValidationPayload, and a stranded INTENT marker yields
+// an EMPTY anchor with filing_failed/filing_incomplete unchanged.
+func TestLiveValidationForRun_ChecklistAnchor(t *testing.T) {
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+
+	runID := uuid.New()
+	seedLiveValidationMarker(au, runID, liveValidationWalkLinkedKind, liveValidationWalkMarker{
+		Phase: "linked", PendingCriteriaCount: 1, WalkRef: "#5001",
+		ChecklistAnchor: "run-" + runID.String(), WalkAppended: true,
+	})
+	p := s.liveValidationForRun(context.Background(), runID)
+	if p == nil || p.ChecklistAnchor != "run-"+runID.String() {
+		t.Fatalf("payload = %+v, want checklist_anchor run-%s", p, runID.String())
+	}
+
+	runID2 := uuid.New()
+	seedLiveValidationMarker(au, runID2, liveValidationWalkIntentKind, liveValidationWalkMarker{
+		Phase: "intent", PendingCriteriaCount: 1,
+	})
+	p2 := s.liveValidationForRun(context.Background(), runID2)
+	if p2 == nil || p2.ChecklistAnchor != "" || !p2.FilingFailed || !p2.FilingIncomplete {
+		t.Errorf("stranded-intent payload = %+v, want empty anchor + filing_failed + filing_incomplete", p2)
+	}
+}
+
+// liveValRollingProvider is an append-aware querier provider for the two-run
+// done-means test: File reflects the created walk into BOTH its own epic children
+// (so a later run discovers it) and the shared issue store (so the later run's
+// fresh read + PATCH land on it).
+type liveValRollingProvider struct {
+	*liveValFileProvider
+	store    *liveValIssueStore
+	mu       sync.Mutex
+	children []workmgmt.EpicChild
+}
+
+func (p *liveValRollingProvider) EpicChildren(_ context.Context, _ workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]workmgmt.EpicChild, len(p.children))
+	copy(out, p.children)
+	return &workmgmt.EpicChildrenResult{Children: out}, nil
+}
+
+func (p *liveValRollingProvider) File(ctx context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+	ci, err := p.liveValFileProvider.File(ctx, req)
+	if err != nil {
+		return ci, err
+	}
+	p.mu.Lock()
+	p.children = append(p.children, workmgmt.EpicChild{
+		Number: ci.Number, Title: req.Item.Title, Body: req.Item.Body, State: "OPEN",
+	})
+	p.mu.Unlock()
+	p.store.seed(ci.Number, req.Item.Body, "open")
+	return ci, err
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingTwoRunsOneWalk is the DONE-MEANS and
+// the cross-boundary end-to-end: it drives the hook TWICE under one epic against
+// the httptest github fixture — run A finds no candidate and FILES, run B finds
+// A's walk among the epic children and APPENDS — and asserts File was called
+// EXACTLY ONCE, exactly one PATCH landed, the final body carries TWO run sections,
+// and run A's filed title is the rolling summary.
+func TestFileOrLinkLiveValidationWalk_RollingTwoRunsOneWalk(t *testing.T) {
+	inst := int64(77)
+	gh, store := newLiveValGitHubWithStore(t, "", &liveValParentFixture{number: 1940, title: "[E48] SDLC dogfooding"})
+	prov := &liveValRollingProvider{
+		liveValFileProvider: &liveValFileProvider{name: workmgmt.Default().Provider},
+		store:               store,
+		children:            numberedEpicChildren("48", 3),
+	}
+	workmgmt.Register(prov)
+
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{}
+	art := newFakeArtifactRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr, ArtifactRepo: art})
+	s.cfg.GitHub = gh
+
+	seedRun := func() *run.Stage {
+		runID := uuid.New()
+		trigger := "issue:" + strconv.Itoa(liveValParentIssue)
+		rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change", TriggerRef: &trigger, InstallationID: &inst}
+		psID := uuid.New()
+		ps := &run.Stage{ID: psID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded}
+		rr.getStages[psID] = ps
+		rr.stagesByRunID[runID] = []*run.Stage{ps}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID: psID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: liveValPlanBytes(t, true),
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+		return ps
+	}
+
+	stageA := seedRun()
+	s.fileOrLinkLiveValidationWalk(context.Background(), stageA)
+	stageB := seedRun()
+	s.fileOrLinkLiveValidationWalk(context.Background(), stageB)
+
+	if prov.calls != 1 {
+		t.Fatalf("provider File called %d times across both runs, want EXACTLY 1 (run B appends)", prov.calls)
+	}
+	req := prov.reqs[0]
+	if req.Item.Title != "[E48.4] Operator live-validation walk (rolling)" {
+		t.Errorf("run A title = %q, want the rolling title", req.Item.Title)
+	}
+	filed := 4000 + prov.success // the number liveValFileProvider assigned run A's walk
+	if store.patchCount(filed) != 1 || store.totalPatches() != 1 {
+		t.Fatalf("PATCHes to #%d = %d (total %d), want exactly 1 (run B's append)", filed, store.patchCount(filed), store.totalPatches())
+	}
+	si, ok := store.get(filed)
+	if !ok {
+		t.Fatalf("walk #%d not in the store", filed)
+	}
+	if n := strings.Count(si.body, "### Run "); n != 2 {
+		t.Errorf("final walk body carries %d run sections, want 2 (one per run)", n)
+	}
+	if got := strings.Count(si.body, "### Run "+stageA.RunID.String()); got != 1 {
+		t.Errorf("run A section count = %d, want 1", got)
+	}
+	if got := strings.Count(si.body, "### Run "+stageB.RunID.String()); got != 1 {
+		t.Errorf("run B section count = %d, want 1", got)
 	}
 }

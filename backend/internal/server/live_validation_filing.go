@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -69,6 +70,15 @@ type liveValidationWalkMarker struct {
 	// FilingFailed is true on a linked marker written when the forge filing
 	// failed (walk_ref empty). Always false on an intent marker.
 	FilingFailed bool `json:"filing_failed"`
+	// ChecklistAnchor is this run's section anchor ("run-<run_id>") inside the
+	// ROLLING per-epic walk (#3323). Set on a healthy linked marker whose walk
+	// carries a per-run section; empty on an intent marker, a filing-failure
+	// marker, and a companion-arm walk (which carries no per-run section).
+	ChecklistAnchor string `json:"checklist_anchor,omitempty"`
+	// WalkAppended is true on a healthy linked marker when the run APPENDED its
+	// section to an existing rolling walk rather than filing a new one (#3323).
+	// Diagnostic; empty on the file-new path and on every non-healthy marker.
+	WalkAppended bool `json:"walk_appended,omitempty"`
 }
 
 // runLiveValidationPayload is the run-status / gate-view wire surface for a
@@ -91,6 +101,11 @@ type runLiveValidationPayload struct {
 	WalkRef              string `json:"walk_ref,omitempty"`
 	FilingFailed         bool   `json:"filing_failed"`
 	FilingIncomplete     bool   `json:"filing_incomplete,omitempty"`
+	// ChecklistAnchor is this run's section anchor ("run-<run_id>") inside the
+	// rolling per-epic walk (#3323), copied off the newest healthy linked marker.
+	// Empty when the walk was not durably filed (a stranded intent marker or a
+	// filing failure has no section) and on the companion arm.
+	ChecklistAnchor string `json:"checklist_anchor,omitempty"`
 }
 
 // liveValidationWalkArea is the area:* label supplied on the filed chore walk so
@@ -296,7 +311,7 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 	// on success with the walk ref, on ANY filing failure with filing_failed=true
 	// and an empty ref — so approval never advances leaving pending
 	// live-validation criteria with zero surfaced indication (replan directive 1).
-	walkRef, filed := s.fileLiveValidationChore(ctx, runRow, owner, name, parentIssue, crits)
+	walkRef, anchor, appended, filed := s.fileLiveValidationChore(ctx, runRow, owner, name, parentIssue, crits)
 	linked := liveValidationWalkMarker{
 		Phase:                "linked",
 		PendingCriteriaCount: len(crits),
@@ -304,6 +319,10 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 	}
 	if filed {
 		linked.WalkRef = walkRef
+		// ChecklistAnchor is set only on the ROLLING epic arm (#3323); the
+		// companion arm returns an empty anchor.
+		linked.ChecklistAnchor = anchor
+		linked.WalkAppended = appended
 	} else {
 		linked.FilingFailed = true
 	}
@@ -359,13 +378,80 @@ const githubSubIssueParentCap = 100
 // digit run rejects a child title, so only a true epic parents the walk.
 var walkEpicTitleRE = regexp.MustCompile(`^\s*\[E(\d+)\]`)
 
+// liveValidationRollingKey is the stable per-(repo, epic) identity of the
+// ROLLING live-validation walk (#3323). It is stamped into the rolling walk's
+// body as a hidden idempotency marker (via FilingRequest.IdempotencyKey), so a
+// later run under the SAME epic re-derives the byte-identical key and adopts the
+// existing walk by a WHOLE-LINE body-marker match (workmgmt.BodyHasIdempotencyKey)
+// rather than a fragile title match — an operator retitling the walk cannot
+// orphan it. Marker-keyed discovery is the ratified deviation from the issue's
+// title-match proposal; do not weaken it to a title match.
+func liveValidationRollingKey(repoFullName, epicRef string) string {
+	return workmgmt.MintIdempotencyKey("live_validation_walk_rolling", repoFullName, epicRef)
+}
+
+// liveValidationSectionKey is the per-run identity of one appended checklist
+// section (#3323), stamped as a hidden whole-line marker inside the section so a
+// re-entry (a re-approval that reaches the append) can recognize its own section
+// already present and write NOTHING rather than duplicating it.
+func liveValidationSectionKey(runID uuid.UUID) string {
+	return workmgmt.MintIdempotencyKey("live_validation_walk_section", runID.String())
+}
+
+// walkEpicResolution is resolveWalkParentEpic's outcome, carrying the adoption /
+// allocation decision honestly (binding condition — separate ADOPTION from
+// ALLOCATION). EpicArm is false for every companion-degrade fallback. On the
+// epic arm exactly one of two paths holds:
+//
+//   - AppendTo > 0: an OPEN rolling walk already exists under this epic; APPEND a
+//     section to it. This path is taken regardless of the sub-issue cap and
+//     regardless of whether {n} is allocatable — appending needs no new child,
+//     no addSubIssue and no {n}. ChildN is a BEST-EFFORT allocation carried only
+//     so a rare append DEGRADE (the candidate unreadable/closed at the fresh
+//     read) can still file a new rolling walk; it is legitimately "" here.
+//   - AppendTo == 0: no candidate; FILE a new rolling walk with the allocated
+//     ChildN. Only THIS path is gated by the cap and the NextChildNumber
+//     allocation (binding condition — allocation gates only the file-new path).
+//
+// Unlock is the HELD per-epic allocation lock the caller releases after its
+// File/append (nil when EpicArm is false).
+type walkEpicResolution struct {
+	EpicArm  bool
+	EpicRef  string // "#<epic issue>"
+	EpicVar  string // "<epic digits>"
+	ChildN   string // allocated {n} for a file-new; "" is legal on the append path
+	AppendTo int    // >0 → append to this open rolling walk's issue number
+	Unlock   func()
+}
+
+// findHighestOpenRollingCandidate returns the HIGHEST-numbered child that carries
+// the rolling key in its body AND is positively OPEN (State == "OPEN"), or nil.
+// The OPEN requirement is strict: an empty State (a provider that does not
+// populate it) is UNKNOWN and NEVER adopts, so the fail direction is the
+// pre-#3323 file-a-new-walk status quo. Highest-numbered is deterministic when a
+// prior degrade left two open candidates.
+func findHighestOpenRollingCandidate(children []workmgmt.EpicChild, rollingKey string) *workmgmt.EpicChild {
+	var best *workmgmt.EpicChild
+	for i := range children {
+		c := &children[i]
+		if c.State != "OPEN" {
+			continue // empty/CLOSED → not adoptable
+		}
+		if !workmgmt.BodyHasIdempotencyKey(c.Body, rollingKey) {
+			continue
+		}
+		if best == nil || c.Number > best.Number {
+			best = c
+		}
+	}
+	return best
+}
+
 // resolveWalkParentEpic decides whether the live-validation walk should be
-// parented under the triggering child's TRUE epic (#2179) instead of companion-
-// linked to the child. It returns ("#<epic issue>", "<epic digits>",
-// "<child number>", unlock, true) only when EVERY precondition holds — where
-// unlock is a HELD per-epic allocation lock the caller must release AFTER its
-// File (see the TOCTOU note below); otherwise ok=false, unlock is nil, and the
-// caller files the UNCHANGED companion walk. Each fallback mode is an explicit
+// parented under the triggering child's TRUE epic (#2179, ROLLING per epic
+// #3323) instead of companion-linked to the child. It returns EpicArm=true only
+// when EVERY precondition holds; otherwise EpicArm is false and the caller files
+// the UNCHANGED companion walk. Each companion-degrade fallback is an explicit
 // early return:
 //
 //	(1) no GitHub client wired;
@@ -375,56 +461,62 @@ var walkEpicTitleRE = regexp.MustCompile(`^\s*\[E(\d+)\]`)
 //	(5) the parent's title is not the bracket-closed [E<n>] epic form (e.g. it is
 //	    another child, [E48.35]) — walkEpicTitleRE, NOT the child-accepting epicTitleRE;
 //	(6) the resolved provider is unregistered (workmgmt.Get errors) or does not
-//	    implement EpicChildrenQuerier, so {n} could never be discovered and the
-//	    epic-arm filing would 422 at renderTitle — both degrade the same safe way;
-//	(7) the epic is resolvable but UNATTACHABLE — it already holds the per-parent
-//	    sub-issue cap, its child count could not be read, or its children carry no
-//	    numbered [E<epic>.<n>] form so {n} cannot be allocated (#2101); degrade to
-//	    companion the same way an unresolvable epic does (binding condition 4).
+//	    implement EpicChildrenQuerier — both degrade the same safe way;
+//	(7) the epic is resolvable but the AUTHORITATIVE child read fails, or — WHEN
+//	    THERE IS NO OPEN ROLLING CANDIDATE — the epic is at the sub-issue cap or
+//	    its children carry no numbered [E<epic>.<n>] form so {n} cannot be
+//	    allocated (#2101); degrade to companion (binding condition 4).
 //
-// CAP DECISION UNDER THE ALLOCATION LOCK (high/concurrency TOCTOU, #2179 fix-up).
-// The capacity decision and the {n} allocation are BOTH made under the SAME
-// per-epic childNumberLock applyAndFileWorkItem's deriveChildNumberTitleVar
-// takes, and the lock stays HELD (returned to the caller as unlock) across the
-// caller's File. The unlocked pre-count is only a fast reject of an obviously-
-// full epic; the AUTHORITATIVE check is the second read UNDER the lock. Without
-// this a concurrent filer could add the cap-th child between an unlocked count
-// and the File, after which this walk would take the epic arm and fail
-// attachment instead of using the mandatory companion fallback. Because the arm
-// pre-computes {n} here, the caller supplies it explicitly so
-// deriveChildNumberTitleVar short-circuits and does NOT re-take the lock (no
-// deadlock, no second discovery read).
-func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.CredentialScope, owner, name string, childIssue int, conv workmgmt.Conventions) (string, string, string, func(), bool) {
+// ADOPTION BEFORE ALLOCATION (binding condition). Under the HELD per-epic lock,
+// using the AUTHORITATIVE EpicChildren result, an OPEN rolling candidate is
+// looked for FIRST. If one exists the append path is taken REGARDLESS of the cap
+// and REGARDLESS of whether {n} is allocatable — appending needs no new child.
+// Only when there is NO candidate do the cap and NextChildNumber failures degrade
+// to companion. The cap/allocation gating therefore CANNOT route to companion an
+// epic that still holds a perfectly good open rolling walk — the exact inertness
+// (E22 #389, E48 #1940, E67 #2561 are at the cap today) this issue exists to fix.
+//
+// CAP/ALLOCATION UNDER THE ALLOCATION LOCK (high/concurrency TOCTOU, #2179
+// fix-up). The file-new capacity decision and the {n} allocation are BOTH made
+// under the SAME per-epic childNumberLock deriveChildNumberTitleVar takes, and
+// the lock stays HELD (returned as Unlock) across the caller's File. The
+// unlocked pre-count still fast-rejects an obviously-full epic WITHOUT the lock —
+// but ONLY when the pre-count shows no candidate, so a capped epic with a
+// candidate is never fast-rejected before the authoritative candidate scan.
+func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.CredentialScope, owner, name string, childIssue int, conv workmgmt.Conventions, repoFullName string) walkEpicResolution {
+	none := walkEpicResolution{}
 	if s.cfg.GitHub == nil {
-		return "", "", "", nil, false // (1)
+		return none // (1)
 	}
 	if scope.IsZero() {
-		return "", "", "", nil, false // (2)
+		return none // (2)
 	}
 	parent, err := s.cfg.GitHub.IssueParent(ctx, scope, forge.RepoRef{Owner: owner, Name: name}, childIssue)
 	if err != nil {
-		return "", "", "", nil, false // (3)
+		return none // (3)
 	}
 	if parent == nil {
-		return "", "", "", nil, false // (4)
+		return none // (4)
 	}
 	m := walkEpicTitleRE.FindStringSubmatch(parent.Title)
 	if m == nil {
-		return "", "", "", nil, false // (5) not the bracket-closed epic form
+		return none // (5) not the bracket-closed epic form
 	}
 	provider, err := workmgmt.Get(conv.Provider)
 	if err != nil {
-		return "", "", "", nil, false // (6) unregistered provider → no querier capability reachable, safe companion degrade
+		return none // (6) unregistered provider → no querier capability reachable, safe companion degrade
 	}
 	querier, ok := provider.(workmgmt.EpicChildrenQuerier)
 	if !ok {
-		return "", "", "", nil, false // (6) no capability to discover {n}
+		return none // (6) no capability to query children
 	}
 	choreType, ok := conv.Types["chore"]
 	if !ok || !strings.Contains(choreType.TitleFormat, "{n}") {
-		return "", "", "", nil, false // (6) the chore type carries no {n} placeholder to allocate → companion
+		return none // (6) the chore type carries no {n} placeholder → companion
 	}
 	epicRef := "#" + strconv.Itoa(parent.Number)
+	epicVar := m[1]
+	rollingKey := liveValidationRollingKey(repoFullName, epicRef)
 	target := workmgmt.Target{
 		Repo:    workmgmt.Repo{Owner: owner, Name: name},
 		Project: conv.Project,
@@ -432,39 +524,51 @@ func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.Credenti
 		Scope:   scope,
 	}
 
-	// Fast reject: an obviously-full (or unreadable) epic degrades to companion
-	// without taking the allocation lock. This unlocked pre-count is ONLY an
-	// optimization — the AUTHORITATIVE capacity decision is the locked read below.
+	// Fast reject: an obviously-full (or unreadable) epic THAT HOLDS NO OPEN
+	// ROLLING CANDIDATE degrades to companion without taking the allocation lock.
+	// The candidate scan is gated FIRST so a capped epic with an adoptable walk is
+	// never fast-rejected here (binding condition) — the AUTHORITATIVE decision is
+	// still the locked read below.
 	if res, perr := querier.EpicChildren(ctx, workmgmt.EpicChildrenRequest{Target: target, Epic: epicRef}); perr != nil {
-		return "", "", "", nil, false // (7) child count unreadable → companion
-	} else if len(res.Children) >= githubSubIssueParentCap {
-		return "", "", "", nil, false // (7) full epic → companion (binding condition 4)
+		return none // (7) child count unreadable → companion
+	} else if findHighestOpenRollingCandidate(res.Children, rollingKey) == nil && len(res.Children) >= githubSubIssueParentCap {
+		return none // (7) full epic, no candidate to adopt → companion (binding condition 4)
 	}
 
 	// AUTHORITATIVE decision under the per-epic allocation lock, HELD across the
-	// caller's File so the capacity decision is effective under the same
-	// synchronization deriveChildNumberTitleVar uses (high/concurrency TOCTOU).
+	// caller's File/append.
 	unlock := lockChildNumberKey(childNumberLockKey(target, epicRef))
 	res, err := querier.EpicChildren(ctx, workmgmt.EpicChildrenRequest{Target: target, Epic: epicRef})
 	if err != nil {
 		unlock()
-		return "", "", "", nil, false // (7) child count unreadable under the lock → companion
+		return none // (7) child count unreadable under the lock → companion
 	}
+
+	// ADOPTION FIRST: an open rolling walk is appendable regardless of the cap and
+	// regardless of {n} allocatability. ChildN is allocated best-effort only for a
+	// possible append DEGRADE; its absence never blocks the append path.
+	if cand := findHighestOpenRollingCandidate(res.Children, rollingKey); cand != nil {
+		childN := ""
+		if n, ok := workmgmt.NextChildNumber(choreType.TitleFormat, epicVar, res.Children); ok {
+			childN = strconv.Itoa(n)
+		}
+		return walkEpicResolution{EpicArm: true, EpicRef: epicRef, EpicVar: epicVar, ChildN: childN, AppendTo: cand.Number, Unlock: unlock}
+	}
+
+	// ALLOCATION (file-new path only): the cap and NextChildNumber gate here,
+	// AFTER the candidate scan.
 	if len(res.Children) >= githubSubIssueParentCap {
-		// Raced to the cap between the pre-count and here: degrade to companion
-		// rather than take the epic arm to a doomed over-cap attachment.
 		unlock()
-		return "", "", "", nil, false // (7) full epic (binding condition 4)
+		return none // (7) full epic (binding condition 4)
 	}
-	n, ok := workmgmt.NextChildNumber(choreType.TitleFormat, m[1], res.Children)
+	n, ok := workmgmt.NextChildNumber(choreType.TitleFormat, epicVar, res.Children)
 	if !ok {
 		// Children exist but none carry the numbered [E<epic>.<n>] form, so {n}
-		// cannot be allocated (#2101). Degrade to companion — a filed companion is
-		// a better outcome than a filing failure (binding condition 4 spirit).
+		// cannot be allocated (#2101). Degrade to companion (binding condition 4).
 		unlock()
-		return "", "", "", nil, false // (7)
+		return none // (7)
 	}
-	return epicRef, m[1], strconv.Itoa(n), unlock, true
+	return walkEpicResolution{EpicArm: true, EpicRef: epicRef, EpicVar: epicVar, ChildN: strconv.Itoa(n), Unlock: unlock}
 }
 
 // fileLiveValidationChore files the `chore`-type operator-validation walk work
@@ -524,11 +628,11 @@ func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.Credenti
 //     A filed unparented walk is still a better outcome than a hook that errors,
 //     and the residual is rare and visible via the EpicLinkError WARN. See
 //     backend/internal/server/README.md.
-func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, owner, name string, parentIssue int, crits []plan.AcceptanceCriterion) (string, bool) {
+func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, owner, name string, parentIssue int, crits []plan.AcceptanceCriterion) (walkRef, anchor string, appended, filed bool) {
 	conv, err := conventionsLoader(ctx, runRow.Repo)
 	if err != nil {
 		s.logLiveValidationWarn(ctx, runRow.ID, "load work-management conventions failed", err.Error())
-		return "", false
+		return "", "", false, false
 	}
 	target := workmgmt.Target{
 		Repo:    workmgmt.Repo{Owner: owner, Name: name},
@@ -548,51 +652,190 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 	summary := "Operator live-validation walk for " + parentRef
 
 	// Decide the arm ONCE, before the single File call below. On the epic arm
-	// resolveWalkParentEpic returns the pre-computed child number AND a HELD
-	// per-epic allocation lock (unlockEpic); hold it across applyAndFileWorkItem
-	// so the capacity decision and the File are serialized against a concurrent
-	// filer, then release it (high/concurrency TOCTOU, #2179 fix-up).
-	epicRef, epicVar, epicN, unlockEpic, epicArm := s.resolveWalkParentEpic(ctx, target.Scope, owner, name, parentIssue, conv)
-	if epicArm {
-		defer unlockEpic()
+	// resolveWalkParentEpic returns a HELD per-epic allocation lock; hold it
+	// across the append/File so the adoption/allocation decision is serialized
+	// against a concurrent filer, then release it (high/concurrency TOCTOU).
+	res := s.resolveWalkParentEpic(ctx, target.Scope, owner, name, parentIssue, conv, runRow.Repo)
+	if res.EpicArm {
+		defer res.Unlock()
 	}
 
-	var req workmgmt.FilingRequest
-	if epicArm {
-		// Epic arm: parent under the TRUE epic with the {n} allocated under the
-		// held lock. Passing {n} EXPLICITLY makes deriveChildNumberTitleVar
-		// short-circuit so it does not re-take the per-epic lock (no deadlock).
-		req = workmgmt.FilingRequest{
-			Type:      "chore",
-			Summary:   summary,
-			Body:      liveValidationWalkBody(parentRef, epicRef, crits, false),
-			Labels:    []string{liveValidationWalkArea},
-			TitleVars: map[string]string{"epic": epicVar, "n": epicN},
-			Relations: workmgmt.Relations{
-				ParentEpic:   epicRef,
-				EvidenceRuns: []string{runRow.ID.String()},
-			},
+	if res.EpicArm {
+		rollingKey := liveValidationRollingKey(runRow.Repo, res.EpicRef)
+		if res.AppendTo > 0 {
+			// ADOPTION: append this run's section to the existing open rolling walk
+			// (#3323). No File, no addSubIssue, no {n}.
+			a, appended, retryable := s.appendRollingWalkSection(ctx, target.Scope, runRow, owner, name, res.AppendTo, parentRef, crits)
+			if appended {
+				return fmt.Sprintf("#%d", res.AppendTo), a, true, true
+			}
+			if !retryable {
+				// UpdateIssue FAILED on an existing walk: route to filing_failed and
+				// NEVER file a second walk — a re-file would reopen the same-approval
+				// double-file window (#2045). The walk exists; the operator's surface
+				// renders file-manually and a re-approval no-ops on the intent marker.
+				return "", "", false, false
+			}
+			// Retryable degrade (the candidate could not be READ, or was CLOSED at the
+			// fresh read): file a NEW rolling walk when {n} is allocatable (never a
+			// lost walk); else fall through to the companion arm.
+			if res.ChildN == "" {
+				s.logLiveValidationWarn(ctx, runRow.ID, "rolling walk append degraded and no allocatable child number; filing companion", res.EpicRef)
+			} else {
+				ref, a, ok := s.fileNewRollingWalk(ctx, runRow, conv, target, owner, name, res, parentRef, rollingKey, crits)
+				return ref, a, false, ok
+			}
+		} else {
+			// No candidate: FIRST rolling filing under this epic.
+			ref, a, ok := s.fileNewRollingWalk(ctx, runRow, conv, target, owner, name, res, parentRef, rollingKey, crits)
+			return ref, a, false, ok
 		}
-	} else {
-		// Companion arm: the pre-#2179 filing, unchanged byte-for-byte.
-		req = workmgmt.FilingRequest{
-			Type:      "chore",
-			Summary:   summary,
-			Body:      liveValidationWalkBody(parentRef, "", crits, true),
-			Labels:    []string{liveValidationWalkArea},
-			TitleVars: map[string]string{"epic": strconv.Itoa(parentIssue), "n": "1"},
-			Relations: workmgmt.Relations{
-				CompanionTo:  []string{parentRef},
-				EvidenceRuns: []string{runRow.ID.String()},
-			},
-		}
+	}
+
+	// Companion arm: the pre-#2179 filing, unchanged byte-for-byte. It carries no
+	// per-run rolling section, so its anchor is empty.
+	req := workmgmt.FilingRequest{
+		Type:      "chore",
+		Summary:   summary,
+		Body:      liveValidationWalkBody(parentRef, "", crits, true),
+		Labels:    []string{liveValidationWalkArea},
+		TitleVars: map[string]string{"epic": strconv.Itoa(parentIssue), "n": "1"},
+		Relations: workmgmt.Relations{
+			CompanionTo:  []string{parentRef},
+			EvidenceRuns: []string{runRow.ID.String()},
+		},
 	}
 	if _, created, werr := s.applyAndFileWorkItem(ctx, req, conv, target, owner, name); werr == nil {
-		return fmt.Sprintf("#%d", created.Number), true
+		return fmt.Sprintf("#%d", created.Number), "", false, true
 	} else {
 		s.logLiveValidationWarn(ctx, runRow.ID, "live-validation walk filing failed", werr.msg)
-		return "", false
+		return "", "", false, false
 	}
+}
+
+// fileNewRollingWalk files the FIRST rolling walk under an epic (#3323): summary
+// "Operator live-validation walk (rolling)", the rolling body carrying this run's
+// first section, and the rolling idempotency key stamped into the body so the
+// NEXT run under this epic adopts it. The explicit {n} (allocated under the held
+// per-epic lock) makes deriveChildNumberTitleVar short-circuit so it does not
+// re-take the lock (no deadlock). Returns ("#N", "run-<id>", true) on success and
+// ("", "", false) on a File failure (the caller routes that to filing_failed).
+func (s *Server) fileNewRollingWalk(ctx context.Context, runRow *run.Run, conv workmgmt.Conventions, target workmgmt.Target, owner, name string, res walkEpicResolution, parentRef, rollingKey string, crits []plan.AcceptanceCriterion) (string, string, bool) {
+	body, anchor := liveValidationRollingWalkBody(runRow.ID, res.EpicRef, parentRef, crits)
+	req := workmgmt.FilingRequest{
+		Type:           "chore",
+		Summary:        "Operator live-validation walk (rolling)",
+		Body:           body,
+		Labels:         []string{liveValidationWalkArea},
+		TitleVars:      map[string]string{"epic": res.EpicVar, "n": res.ChildN},
+		IdempotencyKey: rollingKey,
+		Relations: workmgmt.Relations{
+			ParentEpic:   res.EpicRef,
+			EvidenceRuns: []string{runRow.ID.String()},
+		},
+	}
+	_, created, werr := s.applyAndFileWorkItem(ctx, req, conv, target, owner, name)
+	if werr != nil {
+		s.logLiveValidationWarn(ctx, runRow.ID, "live-validation rolling walk filing failed", werr.msg)
+		return "", "", false
+	}
+	return fmt.Sprintf("#%d", created.Number), anchor, true
+}
+
+// appendRollingWalkSection appends this run's checklist section to the existing
+// open rolling walk (#3323), running INSIDE the already-held per-epic lock. Order
+// (a lost-update read-modify-write narrowed by that lock, not closed across
+// processes — see backend/internal/server/README.md):
+//
+//	(a) GetIssue for a FRESH authoritative body+state (the EpicChildren snapshot
+//	    is stale by construction);
+//	(b) if the fresh state is not open, treat as no candidate — return ok=false so
+//	    the caller files a new rolling walk;
+//	(c) if the fresh body already carries this run's section key, the section is
+//	    already present (idempotent re-entry): return the anchor, write NOTHING;
+//	(d) otherwise UpdateIssue with body + the rendered section.
+//
+// Return contract, three cases the caller acts on distinctly:
+//
+//	appended=true                    → the section is written (or already present).
+//	appended=false, retryable=true   → the candidate is unusable (GetIssue error or
+//	                                   CLOSED at the fresh read): file a NEW rolling
+//	                                   walk (never a lost walk).
+//	appended=false, retryable=false  → UpdateIssue FAILED on an existing walk: route
+//	                                   to filing_failed and NEVER file a second walk
+//	                                   (the #2045 double-file window).
+func (s *Server) appendRollingWalkSection(ctx context.Context, scope forge.CredentialScope, runRow *run.Run, owner, name string, walkNumber int, triggerRef string, crits []plan.AcceptanceCriterion) (anchor string, appended, retryable bool) {
+	if s.cfg.GitHub == nil {
+		return "", false, true
+	}
+	repo := forge.RepoRef{Owner: owner, Name: name}
+	issue, err := s.cfg.GitHub.GetIssue(ctx, scope, repo, walkNumber)
+	if err != nil {
+		s.logLiveValidationWarn(ctx, runRow.ID, "rolling walk fresh read failed; filing new walk", fmt.Sprintf("#%d: %v", walkNumber, err))
+		return "", false, true // retryable → file a new walk
+	}
+	// (b) The snapshot said OPEN, but the fresh read is authoritative — a walk
+	// closed between the snapshot and here is no longer a candidate. REST lowercases
+	// state, so compare case-insensitively.
+	if !strings.EqualFold(issue.State, "open") {
+		s.logLiveValidationWarn(ctx, runRow.ID, "rolling walk closed at fresh read; filing new walk", fmt.Sprintf("#%d state=%q", walkNumber, issue.State))
+		return "", false, true // retryable → file a new walk
+	}
+	section, a := liveValidationRunSection(runRow.ID, triggerRef, crits)
+	// (c) Idempotent re-entry: this run's section is already present.
+	if workmgmt.BodyHasIdempotencyKey(issue.Body, liveValidationSectionKey(runRow.ID)) {
+		return a, true, false
+	}
+	// (d) Append the section.
+	newBody := strings.TrimRight(issue.Body, "\n") + "\n\n" + section
+	if _, err := s.cfg.GitHub.UpdateIssue(ctx, scope, repo, walkNumber, githubclient.UpdateIssueParams{Body: &newBody}); err != nil {
+		s.logLiveValidationWarn(ctx, runRow.ID, "rolling walk section append (UpdateIssue) failed", fmt.Sprintf("#%d: %v", walkNumber, err))
+		return "", false, false // NOT retryable → filing_failed, never re-file
+	}
+	return a, true, false
+}
+
+// liveValidationRunSection renders one per-run checklist section for the rolling
+// walk (#3323) and returns (section, anchor). The `### Run <run-id>` heading's
+// GitHub slug IS the anchor `run-<run-id>`; the hidden section marker line keys
+// the per-run idempotent re-entry; a `Filed for <triggerRef>.` line names the
+// triggering issue; and each criterion is a checkbox bullet with an indented
+// `Verify:` continuation when it carries a verify_hint.
+func liveValidationRunSection(runID uuid.UUID, triggerRef string, crits []plan.AcceptanceCriterion) (string, string) {
+	anchor := "run-" + runID.String()
+	var b strings.Builder
+	fmt.Fprintf(&b, "### Run %s\n\n", runID.String())
+	b.WriteString(workmgmt.StampIdempotencyKey("", liveValidationSectionKey(runID)))
+	b.WriteString("\n\n")
+	fmt.Fprintf(&b, "Filed for %s.\n\n", triggerRef)
+	for _, c := range crits {
+		stmt := c.Statement
+		if stmt == "" {
+			stmt = c.ID
+		}
+		fmt.Fprintf(&b, "- [ ] `%s` — %s\n", c.ID, stmt)
+		if c.VerifyHint != "" {
+			fmt.Fprintf(&b, "  Verify: %s\n", c.VerifyHint)
+		}
+	}
+	return b.String(), anchor
+}
+
+// liveValidationRollingWalkBody assembles the body of a NEW rolling walk's first
+// filing (#3323): the walk summary, a Parent-epic reference, a line stating that
+// each run appends its own section and the walk closes only when every section is
+// ticked, then this run's first section. It returns (body, anchor).
+func liveValidationRollingWalkBody(runID uuid.UUID, epicRef, triggerRef string, crits []plan.AcceptanceCriterion) (string, string) {
+	body := "## Summary\n\nThis run's approved plan carries acceptance criteria whose true verification " +
+		"needs a live forge/deploy/external target the default-deny acceptance sandbox cannot reach " +
+		"(`requires_live_validation`). The acceptance stage short-circuits them; this walk tracks the " +
+		"operator live check so nothing ships silently unvalidated (#2045).\n\n"
+	body += "Parent epic: " + epicRef + ".\n\n"
+	body += "This is a ROLLING walk (#3323): each run under this epic appends its own section below, " +
+		"and the walk closes only when EVERY section's criteria are ticked.\n\n"
+	section, anchor := liveValidationRunSection(runID, triggerRef, crits)
+	body += section
+	return body, anchor
 }
 
 // liveValidationWalkBody assembles the walk body: what the walk is, the criteria
@@ -680,6 +923,9 @@ func (s *Server) liveValidationForRun(ctx context.Context, runID uuid.UUID) *run
 			PendingCriteriaCount: m.PendingCriteriaCount,
 			WalkRef:              m.WalkRef,
 			FilingFailed:         m.FilingFailed,
+			// The rolling per-epic section anchor (#3323); empty on a filing-failure
+			// marker and on the companion arm (neither carries a per-run section).
+			ChecklistAnchor: m.ChecklistAnchor,
 		}
 	}
 

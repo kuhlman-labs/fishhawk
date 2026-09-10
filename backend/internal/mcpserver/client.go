@@ -357,6 +357,12 @@ type RunLiveValidation struct {
 	WalkRef              string `json:"walk_ref,omitempty" jsonschema:"the filed operator-validation walk ref (e.g. #123); empty when filing failed or is incomplete"`
 	FilingFailed         bool   `json:"filing_failed" jsonschema:"true when the walk is not durably filed (a filing failure OR a stranded intent marker) — the operator files it by hand"`
 	FilingIncomplete     bool   `json:"filing_incomplete,omitempty" jsonschema:"true for the stranded-intent crash-window sub-case, so the wording is 'walk filing incomplete' vs 'walk filing failed'"`
+	// ChecklistAnchor mirrors the backend runLiveValidationPayload field (#3323):
+	// this run's section anchor (run-<run_id>) inside the ROLLING per-epic walk.
+	// The json tag MUST byte-match the backend or it silently decodes to "" (the
+	// #371-class trap this file's WireShape test pins). Empty when the walk was
+	// not durably filed or on the companion arm (no per-run section).
+	ChecklistAnchor string `json:"checklist_anchor,omitempty" jsonschema:"this run's checklist section anchor (run-<run_id>) inside the rolling per-epic walk; empty when the walk carries no per-run section"`
 }
 
 // RunConcerns mirrors the backend's run-status concerns block (#964):
