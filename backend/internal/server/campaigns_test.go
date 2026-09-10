@@ -878,6 +878,76 @@ func TestCreateCampaign_EpicPath_MalformedItemRef_422(t *testing.T) {
 	}
 }
 
+// TestCreateCampaign_EpicPath_HashRefForm_Succeeds is the epic-path
+// cross-boundary acceptance test for #3314: the MCP remedy string
+// ("pass a bare number (101), #101, or issue:101") now round-trips through
+// the REAL campaign.FilterToSubset the handler calls — the exact operator
+// retry the misleading pre-fix remedy sent into a second refusal now
+// succeeds. Posts items in BOTH the "#101" and "issue:100" forms.
+func TestCreateCampaign_EpicPath_HashRefForm_Succeeds(t *testing.T) {
+	fp := &fakeEpicProvider{result: threeChildDAG()}
+	registerEpicProvider(t, fp)
+	repo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: repo}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["#101","issue:100"]}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	refs := map[string]bool{}
+	for _, it := range items {
+		refs[it.IssueRef] = true
+	}
+	if len(items) != 2 || !refs["issue:100"] || !refs["issue:101"] {
+		t.Fatalf("persisted items = %+v, want exactly {issue:100, issue:101}", items)
+	}
+}
+
+// TestCreateCampaign_EpicPath_NonPositiveItemRef_422 is the handler-level
+// sibling of the workmgmt.ParseIssueRef n<=0 tightening (#3314): "0" now
+// answers 422 campaign_item_ref_invalid (a parse-classified failure) rather
+// than the looser campaign_item_not_child it drew before the shared parser
+// rejected non-positive numbers.
+func TestCreateCampaign_EpicPath_NonPositiveItemRef_422(t *testing.T) {
+	fp := &fakeEpicProvider{result: threeChildDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["0"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_item_ref_invalid" {
+		t.Errorf("error code = %q, want campaign_item_ref_invalid", code)
+	}
+}
+
+// TestCreateCampaign_EpicPath_DoubleIssuePrefix_422 is the handler-level half
+// of the operator-constraint-(1) single-normalization pin (#3314): the SAME
+// ref the github package's TestProvider_DoubleIssuePrefix_RejectedOnEveryPath
+// exercises at the provider layer is refused end to end at the HTTP boundary.
+func TestCreateCampaign_EpicPath_DoubleIssuePrefix_422(t *testing.T) {
+	fp := &fakeEpicProvider{result: threeChildDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["issue:issue:101"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_item_ref_invalid" {
+		t.Errorf("error code = %q, want campaign_item_ref_invalid", code)
+	}
+}
+
 // assertShippedItemsEcho asserts the SHIPPED details map echoes the request's
 // items, so the operator can see which set drew the refusal. It reads the
 // decoded body, not the map the handler built, so a future redaction change

@@ -977,6 +977,99 @@ func TestProvider_ResolveDependencies(t *testing.T) {
 	})
 }
 
+// TestProvider_ResolveDependencies_AcceptsEveryRefForm is the no-epic-path
+// cross-layer acceptance test for #3314: driving the REAL resolver over
+// Items in all three accepted forms ("#101", "issue:102", "103") against the
+// package's fake API resolves all three to the same sibling set — the
+// done-means test for the github-side widening (issue:N previously required
+// a call-site pre-strip; now the shared parser accepts it directly).
+func TestProvider_ResolveDependencies_AcceptsEveryRefForm(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		101: {Number: 101, Title: "a", Body: "no deps", State: "open"},
+		102: {Number: 102, Title: "b", Body: "no deps", State: "open"},
+		103: {Number: 103, Title: "c", Body: "no deps", State: "open"},
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("#101", "issue:102", "103"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.Children) != 3 {
+		t.Fatalf("children = %+v, want 3 (all three ref forms resolved)", res.Children)
+	}
+	for _, n := range []int{101, 102, 103} {
+		if got := api.getIssueCalls[n]; got != 1 {
+			t.Errorf("GetIssue(#%d) called %d times, want exactly 1", n, got)
+		}
+	}
+}
+
+// TestProvider_DoubleIssuePrefix_RejectedOnEveryPath is the github half of the
+// operator-constraint-(1) single-normalization pin (#3314) and the
+// counterfactual vehicle for the step-4 pre-strip removal: "issue:issue:2230"
+// must be REJECTED by BOTH ResolveDependencies (Items) and ReadWorkItem (Ref).
+// It reuses the readerAPI()/readerTarget() helpers from reader_test.go, legal
+// because both files are package github. If either call site's pre-strip were
+// left in place this test would go RED on that arm — the ref would resolve to
+// 2230 instead of being refused.
+//
+// COUNTERFACTUAL (plan step 12-ii) — OBSERVED, not reasoned: restoring the
+// `strings.TrimPrefix(req.Ref, "issue:")` pre-strip at reader.go:335 and
+// running `go test -run TestProvider_DoubleIssuePrefix_RejectedOnEveryPath -v
+// ./internal/workmgmt/github/` produced:
+//
+//	=== RUN   TestProvider_DoubleIssuePrefix_RejectedOnEveryPath/ReadWorkItem
+//	    provider_test.go:1033: ReadWorkItem(issue:issue:2230) err = nil, want a parse error
+//	--- FAIL: TestProvider_DoubleIssuePrefix_RejectedOnEveryPath
+//	    --- PASS: TestProvider_DoubleIssuePrefix_RejectedOnEveryPath/ResolveDependencies (unaffected — still green)
+//	    --- FAIL: TestProvider_DoubleIssuePrefix_RejectedOnEveryPath/ReadWorkItem
+//
+// (the pre-strip removed the first "issue:" before delegating, so the shared
+// parser's own strip removed the second and the doubled-prefix ref silently
+// resolved to 2230 instead of being refused.) Restored byte-identically at
+// reader.go; green again.
+func TestProvider_DoubleIssuePrefix_RejectedOnEveryPath(t *testing.T) {
+	t.Run("ResolveDependencies", func(t *testing.T) {
+		api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+			2230: {Number: 2230, Title: "x", Body: "no deps", State: "open"},
+		}}
+		_, err := New(api).ResolveDependencies(context.Background(), resolveReq("issue:issue:2230"))
+		if err == nil || !errors.Is(err, workmgmt.ErrInvalidItemRef) {
+			t.Fatalf("ResolveDependencies(issue:issue:2230) err = %v, want ErrInvalidItemRef", err)
+		}
+	})
+	t.Run("ReadWorkItem", func(t *testing.T) {
+		api := readerAPI()
+		api.getIssues = map[int]*githubclient.Issue{
+			2230: {Number: 2230, Title: "x", Body: "body", State: "open"},
+		}
+		_, err := New(api).ReadWorkItem(context.Background(), workmgmt.ReadWorkItemRequest{
+			Target: readerTarget(), Ref: "issue:issue:2230", States: canonicalStates,
+		})
+		if err == nil {
+			t.Fatal("ReadWorkItem(issue:issue:2230) err = nil, want a parse error")
+		}
+	})
+}
+
+// TestProvider_EpicChildren_AcceptsIssuePrefixedEpicRef proves the epic_ref
+// surface (#3314) resolves "issue:N" — docs/api/v0.openapi.yaml already
+// documented epic_ref as "in issue:N form" while the real provider rejected
+// it before this change (a latent inconsistency the shared parser fixes as a
+// byproduct of widening).
+func TestProvider_EpicChildren_AcceptsIssuePrefixedEpicRef(t *testing.T) {
+	api := &fakeAPI{parentNode: "EPIC_NODE"}
+	_, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "issue:99",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren(issue:99): %v", err)
+	}
+	if api.nodeIDNumber != 99 {
+		t.Errorf("epic resolved number = %d, want 99", api.nodeIDNumber)
+	}
+}
+
 // TestProvider_ResolveDependencies_FailClosed covers the defensive branches: a
 // nil API, a missing repo, a zero installation, an unparseable item ref, and a
 // GetIssue error each return an error rather than a partial result.
@@ -1673,8 +1766,20 @@ func TestParseIssueRef(t *testing.T) {
 		{"#1005", 1005, false},
 		{"1005", 1005, false},
 		{" #42 ", 42, false},
+		{"issue:1005", 1005, false},
+		{" issue:1005 ", 1005, false},
+		{"issue:#1005", 1005, false},
 		{"abc", 0, true},
 		{"#0", 0, true},
+		{"0", 0, true},
+		// Single-strip pins (#3314 operator constraint 1): a doubled prefix is
+		// REJECTED rather than resolving, the github-side half of the
+		// single-normalization property TestProvider_DoubleIssuePrefix_RejectedOnEveryPath
+		// exercises end to end.
+		{"issue:issue:1005", 0, true},
+		{"##1005", 0, true},
+		{"issue:0", 0, true},
+		{"issue:", 0, true},
 	} {
 		got, err := parseIssueRef(tc.in)
 		if tc.wantErr {

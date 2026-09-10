@@ -3,8 +3,6 @@ package campaign
 import (
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -31,12 +29,15 @@ var ErrItemNotChild = errors.New("campaign: subset item is not a child of the ep
 // slice of an epic's children in one call instead of filing a shadow epic and
 // re-parenting issues.
 //
-// items are issue refs in either the bare-number ("101") or issue:N
-// ("issue:101") form, mirroring the ref convention Assemble emits. Every
-// requested ref MUST parse AND resolve to a child in res.Children; the FIRST
-// miss fails closed naming the offending ref — a ref that does not parse returns
-// a wrapped workmgmt.ErrInvalidItemRef, a parseable ref that is not a child
-// returns a wrapped ErrItemNotChild (#2176).
+// items are issue refs in the "101", "#101", or "issue:101" form (#3314),
+// each parsed by the single shared workmgmt.ParseIssueRef, which tolerates at
+// most one of each prefix — a doubled prefix like "issue:issue:101" fails to
+// parse rather than silently resolving. Every requested ref MUST parse AND
+// resolve to a child in res.Children; the FIRST miss fails closed naming the
+// offending ref — a ref that does not parse returns a wrapped
+// workmgmt.ErrInvalidItemRef (this now also covers a non-positive number, a
+// tightening from the prior campaign-path behavior), a parseable ref that is
+// not a child returns a wrapped ErrItemNotChild (#2176).
 //
 // The edge set is re-partitioned against the included item set:
 //   - an edge with BOTH endpoints included is kept in Edges;
@@ -172,19 +173,22 @@ func FilterToSubset(res *workmgmt.EpicChildrenResult, items []string) (*workmgmt
 }
 
 // parseItemRef parses a subset item ref into a child issue number. It accepts
-// both the bare-number ("101") and issue:N ("issue:101") forms, mirroring the
-// issue:N ref convention Assemble emits. A ref in any other shape is a caller
-// error (an unresolvable subset item), returned as a wrapped
-// workmgmt.ErrInvalidItemRef — the SHARED sentinel the no-epic resolver also
-// wraps — so the handler answers 422 campaign_item_ref_invalid. It is
-// deliberately NOT ErrItemNotChild (#2176): a ref that names no issue cannot be
-// claimed to be "not a child of the epic".
+// the `N`, `#N`, and `issue:N` forms (#3314) by delegating to the single
+// shared workmgmt.ParseIssueRef — the SAME parser the no-epic
+// IssueSetDependencyResolver path uses — passed the RAW ref: no local trim,
+// no local strip, since ParseIssueRef is the ONLY normalization either path
+// may apply (a local pre-strip here would double-strip a doubled "issue:"
+// prefix on this path while the delegate-once github path rejects it). A ref
+// in any other shape, including a non-positive number, is a caller error (an
+// unresolvable subset item), returned as a wrapped workmgmt.ErrInvalidItemRef
+// — the SHARED sentinel the no-epic resolver also wraps — so the handler
+// answers 422 campaign_item_ref_invalid. It is deliberately NOT ErrItemNotChild
+// (#2176): a ref that names no issue cannot be claimed to be "not a child of
+// the epic".
 func parseItemRef(ref string) (int, error) {
-	s := strings.TrimSpace(ref)
-	s = strings.TrimPrefix(s, "issue:")
-	num, err := strconv.Atoi(strings.TrimSpace(s))
+	num, err := workmgmt.ParseIssueRef(ref)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %q is not a valid issue ref (want a number or issue:N)", workmgmt.ErrInvalidItemRef, ref)
+		return 0, fmt.Errorf("%w: %q is not a valid issue ref (want N, #N or issue:N): %w", workmgmt.ErrInvalidItemRef, ref, err)
 	}
 	return num, nil
 }

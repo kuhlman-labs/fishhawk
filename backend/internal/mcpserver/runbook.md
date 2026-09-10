@@ -516,7 +516,7 @@ above).
 wave-orders the DAG, and persists the campaign — the batch counterpart to
 `fishhawk_start_run`. Two ways to scope the batch:
 - **WITH `epic_ref`** it resolves the epic's children. Pass optional `items`
-  (issue refs — bare number or `issue:N`) to scope to a SUBSET of the epic's
+  (issue refs — `N`, `#N`, or `issue:N`) to scope to a SUBSET of the epic's
   children instead of all of them (#2003): every item must parse and be a child of
   the epic (a parseable non-child fails `campaign_item_not_child`; a ref that is
   not a valid issue reference at all fails `campaign_item_ref_invalid`, #2176),
