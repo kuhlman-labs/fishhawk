@@ -339,7 +339,7 @@ The flow it enables (the [#1189](https://github.com/kuhlman-labs/fishhawk/issues
 
 1. `fishhawk_dispatch_stage --stage implement …` — returns the handle now.
 2. Poll `fishhawk_get_run_status` on the advertised `poll_interval_seconds` (derived — see the stage-execution wait contract above; the dispatch response itself always advertises the 30s floor, because the spawn path does not hold the run row and a freshly dispatched stage has ~0 elapsed) until the stage's `*_stage_wait_status` goes terminal.
-3. **Between polls**, when a `scope_amendment_pending` surfaces, call `fishhawk_decide_scope_amendment` — so the runner's amendment `?wait` poll resolves **before its window elapses**, with no failed-stage retry.
+3. **Between polls**, when a `scope_amendment_pending` surfaces, call `fishhawk_decide_scope_amendment` — so the runner's amendment `?wait` poll resolves **before its window elapses**, with no failed-stage retry. A `reason` you leave is delivered to the agent as `decision_reason` on **approve** as well as on deny (#3322); on approve the agent treats it as a **binding** instruction on the amended paths — the same standing as an approval condition on the plan — so a note here is followed, not just recorded.
 
 This is what a **single** MCP session needs: a blocking `fishhawk_run_stage` call cannot decide an amendment the same agent's runner files mid-stage. `fishhawk_dispatch_stage` **superseded the interim `fishhawk run auto-decide` second channel** ([#1233](https://github.com/kuhlman-labs/fishhawk/issues/1233)/[#1234](https://github.com/kuhlman-labs/fishhawk/issues/1234)) for that decision, since removed ([#1554](https://github.com/kuhlman-labs/fishhawk/issues/1554)).
 

@@ -872,7 +872,10 @@ components:
           enum: [pending, approved, denied]
         decision_reason:
           type: string
-          description: Operator note; delivered to the agent verbatim on deny.
+          description: >-
+            Operator note; returned on every decided row and delivered to the
+            agent verbatim on approve and on deny. On approve it binds the
+            amended paths.
         decided_by:
           type: string
           description: Operator subject (never a run-bound token).
@@ -16281,9 +16284,10 @@ paths:
                 reason:
                   type: string
                   description: |
-                    Operator note; delivered to the agent verbatim on
-                    deny (`decision_reason`), recorded on the audit
-                    entry either way.
+                    Operator note; delivered to the agent verbatim as
+                    `decision_reason` on approve and on deny, recorded on
+                    the audit entry either way. On approve it binds the
+                    amended paths.
       responses:
         '200':
           description: The decided amendment.

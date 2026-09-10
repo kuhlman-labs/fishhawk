@@ -1403,6 +1403,12 @@ func TestFetchScopeAmendments_HappyPath(t *testing.T) {
 		got[0].Paths[1].Operation != "create" || got[0].Paths[1].Path != "pkg/newfile.go" {
 		t.Errorf("approved item decoded wrong: %+v", got[0])
 	}
+	// The approved row's decision_reason must survive the decode — the runner
+	// half of the #618 seam pin (#3322): an approval reason now binds the agent,
+	// so it must reach the runner-side amendment shape, not only the denied row.
+	if got[0].DecisionReason != "ok" {
+		t.Errorf("approved item decision_reason = %q, want %q", got[0].DecisionReason, "ok")
+	}
 	if got[1].Status != "denied" || got[1].DecisionReason != "out of bounds" {
 		t.Errorf("denied item decoded wrong: %+v", got[1])
 	}

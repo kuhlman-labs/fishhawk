@@ -161,7 +161,7 @@ type DecideScopeAmendmentInput struct {
 	RunID       string `json:"run_id" jsonschema:"the Fishhawk run UUID the amendment belongs to"`
 	AmendmentID string `json:"amendment_id" jsonschema:"the scope amendment UUID (from fishhawk_list_scope_amendments or the scope_amendment_requested audit entry's amendment_id)"`
 	Decision    string `json:"decision" jsonschema:"approve or deny"`
-	Reason      string `json:"reason,omitempty" jsonschema:"operator rationale; delivered to the agent verbatim on deny (decision_reason), recorded on the scope_amendment_decided audit entry either way"`
+	Reason      string `json:"reason,omitempty" jsonschema:"operator rationale; delivered to the agent verbatim as decision_reason on approve AND on deny, and recorded on the scope_amendment_decided audit entry either way. On approve the agent treats your reason as a binding instruction on the amended paths"`
 }
 
 // DecideScopeAmendmentOutput surfaces the decided amendment row.
@@ -188,8 +188,11 @@ scope.files: the agent's poll loop sees the approval and edits/creates
 them; the runner's pre-commit refresh folds the same paths before the
 verified-tree gates AND the push, so approved creates pass the
 created-out-of-scope gate while anything NOT requested still fails loud
-(#818/#825). On DENY the agent reads your reason and must adapt within
-the original scope or fail loud.
+(#818/#825). The agent also reads your reason on approve and treats it
+as a BINDING instruction on the amended paths — the same standing as an
+approval condition on the plan — so a note you leave here is followed,
+not just recorded (#3322). On DENY the agent reads your reason and must
+adapt within the original scope or fail loud.
 
 The agent polls for ` + amendmentPollWindowText() + ` per request — the figure the implement
 prompt actually instructs it to follow (backend/internal/prompt/prompt.go;
