@@ -697,6 +697,74 @@ assert_ne "b5d a steal backs off while a live pruner holds the marker" "0" "$rc"
 assert_eq "b5d the holder's lock is left intact" "$holderH:shell" "$(readlink "$LOCK")"
 rm -f "$LOCK.prune"
 
+# b5e — a COMPLETED displacement whose re-acquisition is LOST (the steal's
+# documented rc=2) must STILL print the loud displacement warning: the victim's
+# lock is gone either way, so the deposed verify is running unprotected and the
+# warning is what makes that visible. Gating the warning on rc=0 lets a real
+# displacement pass silently.
+#
+# rc=2 needs a second acquisition inside the microseconds the steal holds the
+# freed path, which no single-process fixture can seed by construction — so the
+# STEAL is stubbed to produce exactly its documented rc=2 postcondition (victim
+# removed, a different live holder at the path) and the assertion lands on
+# _acquire_verify_lock_at, which is the unit the concern is about. The same case
+# then drives the steal-at-most-once guard: the loop re-classifies, meets the
+# thief past the same expired budget, and must REFUSE rather than displace a
+# second time.
+lock_reset
+holderH="$(spawn_live)"
+thief="$(spawn_live)"
+selfpid="$(spawn_live)"
+ln -s "$holderH:shell" "$LOCK"
+B5E_SAVED_STEAL="$(declare -f _verify_lock_steal)"
+_verify_lock_steal() { # <lock> <victim> <target>: displaced, then lost the race
+  rm -f "$1" 2>/dev/null
+  ln -s "$thief:shell" "$1" 2>/dev/null
+  return 2
+}
+export FISHHAWK_VERIFY_LOCK_OWNER=runner
+export FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
+export FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=0
+_acquire_verify_lock_at "$LOCK" > "$tmproot/b5e.out" 2>&1; rc=$?
+eval "$B5E_SAVED_STEAL"
+assert_ne "b5e a lost re-acquisition does not let this invocation proceed" "0" "$rc"
+assert_contains "b5e the displacement warning is printed even when re-acquisition is lost" \
+  "$tmproot/b5e.out" "deposed pid $holderH"
+assert_contains "b5e that warning still states the contention consequence" \
+  "$tmproot/b5e.out" "two verifies may now contend"
+assert_contains "b5e the lost re-acquisition is named" \
+  "$tmproot/b5e.out" "will not displace again"
+assert_contains "b5e the steal-at-most-once guard refuses the second expiry" \
+  "$tmproot/b5e.out" "refusing rather than displacing twice"
+assert_eq "b5e the invocation that won the freed lock keeps it" "$thief:shell" "$(readlink "$LOCK")"
+assert_eq "b5e a refusal never sleeps" "0" "$(count_lines "$FX/logs/sleep.log")"
+lock_reset
+
+# b5f — the restart bail-out. A lock that keeps changing hands (dead holder
+# pruned, path re-taken, re-classified dead, ...) must TERMINATE in a refusal
+# rather than spin forever. `_verify_lock_try_acquire` is stubbed to re-plant a
+# dead holder and fail, which is that churn by construction; the assertion is
+# that the loop returns at all, non-zero, with the uncertain-state message.
+lock_reset
+deadpid="$(spawn_dead)"
+selfpid="$(spawn_live)"
+ln -s "$deadpid:shell" "$LOCK"
+B5F_SAVED_ACQ="$(declare -f _verify_lock_try_acquire)"
+_verify_lock_try_acquire() { # never succeeds; the path keeps re-filling
+  ln -s "$deadpid:shell" "$1" 2>/dev/null
+  return 1
+}
+export FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
+_acquire_verify_lock_at "$LOCK" > "$tmproot/b5f.out" 2>&1; rc=$?
+eval "$B5F_SAVED_ACQ"
+unset FISHHAWK_VERIFY_LOCK_SELF_PID
+assert_ne "b5f a lock that keeps changing hands ends in a refusal" "0" "$rc"
+assert_contains "b5f the refusal names the uncertain lock state" \
+  "$tmproot/b5f.out" "refusing rather than proceeding under an uncertain lock state"
+assert_contains "b5f the refusal names the paths to clear by hand" \
+  "$tmproot/b5f.out" "fishhawk-verify.lock.prune"
+lock_reset
+
 # b6 — RUNNER meets a live RUNNER holder past the budget: it REFUSES and does
 # NOT displace. "Did not displace" is asserted on STATE, not only on the message.
 lock_reset

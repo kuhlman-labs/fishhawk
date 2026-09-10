@@ -475,7 +475,7 @@ Semantics, by the kind of the invocation MEETING a live holder:
 |---|---|
 | SHELL meets any live holder | **Refuse immediately.** Non-zero, no sleep, no poll, and an actionable message naming `scripts/test single -run TestX ./your/package/...`. |
 | RUNNER meets a live SHELL holder | **Wait**, bounded by **600 seconds** at a **2-second** poll, announcing the wait once. Most holders finish inside that and the runner then acquires with no concurrency at all. |
-| RUNNER meets a live SHELL holder, budget EXPIRED | **Displace**, with a loud one-line warning naming the deposed pid and stating that two verifies may now contend. The wedged-holder escape hatch, not the normal path. It displaces at most once per invocation, and only against the holder it actually waited on — see "The displacement stays valid through the unlink". |
+| RUNNER meets a live SHELL holder, budget EXPIRED | **Displace**, with a loud one-line warning naming the deposed pid and stating that two verifies may now contend. That warning is printed on every COMPLETED displacement — including the one where the freed lock is then won by somebody else and this invocation refuses (the steal's `rc=2`), because the victim is running unprotected either way. The wedged-holder escape hatch, not the normal path. It displaces at most once per invocation, and only against the holder it actually waited on — see "The displacement stays valid through the unlink". |
 | RUNNER meets a live RUNNER holder | Wait on the same budget, then **refuse** naming both pids. Two concurrent runner verifies on one worktree family is a bug to surface, not one to paper over by stealing. |
 
 **Do not poll a refusal.** It is a fast failure, not a queue — retrying it in a
@@ -562,7 +562,10 @@ with a non-clobbering `ln -s` and the displacement is REFUSED, sending the calle
 back to re-classify and meet the new holder through the normal branches. It
 returns 0 when it displaced and acquired, 2 when it displaced but lost the free
 lock to someone else (which arms the never-displace-twice refusal), and 1 when no
-displacement happened at all.
+displacement happened at all. The caller prints the loud displacement warning for
+BOTH 0 and 2 — a `rc=2` displacement is no less complete than a `rc=0` one, so
+announcing only the case that ends holding the lock would let a real displacement
+pass silently — and adds a second line on 2 naming the lost re-acquisition.
 
 **Residual, stated:** the restore is a non-clobbering `ln -s`. If a THIRD
 invocation acquired the freed path between the mis-take and the restore, the
@@ -623,7 +626,11 @@ no Go toolchain) is wired into `_verify_gate_harnesses`, so a regression fails
   displacement under HOLDER TURNOVER (`b5b`), where the classified shell holder
   has been replaced by a RUNNER one before the unlink and the fresh runner lock
   must survive, with its positive control (`b5c`) and the live-pruner back-off
-  (`b5d`); runner-REFUSES-a-
+  (`b5d`); the COMPLETED-but-lost-re-acquisition displacement (`b5e`), which
+  pins that the warning is owed on the steal's `rc=2` and, in the same run, the
+  steal-at-most-once refusal it arms; the restart bail-out under repeated
+  dead/free churn (`b5f`), whose assertion is that the loop TERMINATES in a
+  refusal at all; runner-REFUSES-a-
   runner on expiry, asserted on lock STATE and not only on the message; all three
   no-locking degrades as separate cases; a real `git worktree add` proving a
   linked worktree resolves the SAME lock path (which is what makes the control

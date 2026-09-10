@@ -1485,6 +1485,9 @@ _verify_lock_recover_marker() {
 # Returns 0 when this invocation displaced the victim AND now holds the lock,
 # 2 when it displaced the victim but LOST the race to re-acquire (the caller
 # must never displace twice), and 1 when no displacement was performed at all.
+# 0 and 2 are both COMPLETED displacements — the victim's lock is gone in each —
+# so the caller owes the loud warning on both, not only on the one that ends
+# holding the lock.
 _verify_lock_steal() {
   local lock="$1" victim="$2" target="$3" marker self taken moved rc=1
   self="$(_verify_lock_self_pid)"
@@ -1621,14 +1624,25 @@ EOF
           # completes only against this exact holder.
           steal_rc=0
           _verify_lock_steal "$lock" "$holder:shell" "$target" || steal_rc=$?
+          # The warning is owed on EVERY COMPLETED displacement, not only on the
+          # one that ended with this invocation holding the lock. rc=2 means the
+          # victim's lock WAS removed and someone else won the freed path — the
+          # deposed verify is running unprotected either way, which is exactly
+          # the state the warning exists to announce. Gating the warning on rc=0
+          # would let a real displacement pass silently.
+          case "$steal_rc" in
+            0|2)
+              echo "scripts/test: WARNING: displacing a wedged shell verify holding $lock (deposed pid ${holder:-unknown}) after ${budget}s — two verifies may now contend on golangci-lint's global lock and the shared testcontainers Postgres." >&2
+              ;;
+          esac
           case "$steal_rc" in
             0)
-              echo "scripts/test: WARNING: displacing a wedged shell verify holding $lock (deposed pid ${holder:-unknown}) after ${budget}s — two verifies may now contend on golangci-lint's global lock and the shared testcontainers Postgres." >&2
               return 0
               ;;
             2)
               # The victim was displaced but another invocation won the free
               # lock. Never displace twice: the next expiry refuses.
+              echo "scripts/test: the freed verify lock at $lock was taken by another invocation before this one could re-acquire it — this invocation will not displace again." >&2
               stole=1
               ;;
           esac
