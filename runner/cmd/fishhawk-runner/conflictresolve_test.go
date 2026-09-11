@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -2220,6 +2221,97 @@ func TestConflictResolutionStage_TeardownOnRefusal(t *testing.T) {
 	}
 	if st := crGitOut(t, dispatch, "status", "--porcelain"); st != "" {
 		t.Errorf("dispatch checkout not clean:\n%s", st)
+	}
+}
+
+// TestConflictResolutionTeardown_FallbackOnLockedWorktree drives the teardown's
+// FAILURE arm: a LOCKED worktree makes the primary `git worktree remove --force`
+// refuse (a single --force will not remove a locked worktree), so the fallback
+// ladder (unlock, RemoveAll, prune) runs. It asserts the ladder actually removes
+// both the directory AND the git registration, and that the teardown names the
+// fallback DISTINCTLY (conflict_resolution_teardown_failed) rather than emitting
+// the success event over a possibly-stranded tree.
+//
+// Counterfactual: replace the teardown_failed branch with the plain
+// tree_removed event and the distinct-event assertion below goes RED.
+func TestConflictResolutionTeardown_FallbackOnLockedWorktree(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	tmp := t.TempDir()
+	origTmp := conflictTreeTempDir
+	conflictTreeTempDir = tmp
+	t.Cleanup(func() { conflictTreeTempDir = origTmp })
+
+	var sink strings.Builder
+	client := &crFakeUpload{}
+	treeDir, _, teardown, refusal := establishConflictResolutionTree(
+		context.Background(), crStageCfg(dispatch), client,
+		&upload.IssuedKey{PrivateKey: make([]byte, 64)}, crDispatchRequest(featureTip), &sink)
+	if refusal != nil {
+		t.Fatalf("establish refused: %+v", refusal)
+	}
+
+	// Lock the throwaway worktree so the teardown's primary `remove --force`
+	// fails and the fallback ladder runs.
+	crGit(t, dispatch, "worktree", "lock", treeDir)
+
+	teardown()
+
+	if !strings.Contains(sink.String(), "conflict_resolution_teardown_failed") {
+		t.Errorf("teardown did not name the fallback distinctly:\n%s", sink.String())
+	}
+	if strings.Contains(sink.String(), "conflict_resolution_tree_removed") {
+		t.Errorf("teardown emitted the success event on the fallback path:\n%s", sink.String())
+	}
+	// The directory is actually gone...
+	if _, err := os.Stat(treeDir); !os.IsNotExist(err) {
+		t.Errorf("tree directory still present after fallback teardown: err=%v", err)
+	}
+	// ...and so is its git worktree registration.
+	if paths := crWorktreePaths(t, dispatch); len(paths) != 1 {
+		t.Errorf("worktrees = %v, want only the dispatch checkout after fallback teardown", paths)
+	}
+	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+		t.Errorf("temp parent not empty after fallback teardown: %d entries", len(ents))
+	}
+}
+
+// TestConflictResolutionStage_FetchFailureRedactsCredential drives a run-branch
+// fetch error whose text embeds a token-in-URL remote through the stage and
+// asserts the SHIPPED Reason names the failure but does NOT leak the credential.
+// The error is injected through the fetchConflictBranchTip seam so the token is
+// deterministic across git versions (git's own URL-in-error redaction varies).
+//
+// Counterfactual: drop the redactString wrap on the branch-fetch-failed detail
+// and the leaked-credential assertion goes RED.
+func TestConflictResolutionStage_FetchFailureRedactsCredential(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	fp := &fakePusher{}
+	crStageHarness(t, fp, crResolveInWorkdir)
+
+	secret := "ghs_" + strings.Repeat("A", 40)
+	orig := fetchConflictBranchTip
+	fetchConflictBranchTip = func(_ context.Context, _, _, _, _ string) (string, error) {
+		return "", fmt.Errorf(
+			"fatal: unable to access 'https://x-access-token:%s@github.com/acme/widgets.git/': Connection refused", secret)
+	}
+	t.Cleanup(func() { fetchConflictBranchTip = orig })
+
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitFailure {
+		t.Fatalf("exit code = %d, want %d", code, exitFailure)
+	}
+	if len(client.ships) != 1 {
+		t.Fatalf("ships = %+v, want one report", client.ships)
+	}
+	got := client.ships[0].Reason
+	if !strings.Contains(got, reasonBranchFetchFailed) {
+		t.Fatalf("reason = %q, want it to name %q", got, reasonBranchFetchFailed)
+	}
+	if strings.Contains(got, secret) {
+		t.Fatalf("shipped reason leaked the fetch-URL credential: %q", got)
 	}
 }
 

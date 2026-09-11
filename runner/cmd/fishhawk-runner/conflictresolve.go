@@ -1250,9 +1250,15 @@ func establishConflictResolutionTree(ctx context.Context, cfg config, client upl
 	// later refusal may follow.
 	tip, err := fetchConflictBranchTip(ctx, dispatchDir, gitops.DefaultRemote, req.Branch, token)
 	if err != nil {
+		// Redact the transport error before it becomes the shipped Reason: a git
+		// fetch error echoes the remote URL, which carries embedded credentials
+		// when a remote is configured with a token-in-URL, and the backend records
+		// this Reason verbatim (no downstream redaction on that field). Same
+		// discipline as the trace-bundle refusal text (#3338).
+		detail, _ := redactString("fetch run-branch tip of " + req.Branch + ": " + err.Error())
 		return "", "", noop, &conflictTreeRefusal{
 			Reason:   reasonBranchFetchFailed,
-			Detail:   "fetch run-branch tip of " + req.Branch + ": " + err.Error(),
+			Detail:   detail,
 			Category: "C",
 		}
 	}
@@ -1284,9 +1290,13 @@ func establishConflictResolutionTree(ctx context.Context, cfg config, client upl
 	// refs/remotes/<baseRemote>/<baseBranch> — the exact ref the merge below
 	// reads.
 	if _, err := fetchConflictBranchTip(ctx, dispatchDir, baseRemote, baseBranch, token); err != nil {
+		// Redact for the same reason the run-branch fetch above does: the
+		// transport error can echo a token-in-URL remote into the verbatim-stored
+		// Reason (#3338).
+		detail, _ := redactString(fmt.Sprintf("fetch base %s from %s: %s", baseBranch, baseRemote, err.Error()))
 		return "", "", noop, &conflictTreeRefusal{
 			Reason:   reasonBaseFetchFailed,
-			Detail:   fmt.Sprintf("fetch base %s from %s: %s", baseBranch, baseRemote, err.Error()),
+			Detail:   detail,
 			Category: "C",
 		}
 	}
@@ -1328,7 +1338,8 @@ func establishConflictResolutionTree(ctx context.Context, cfg config, client upl
 		// cancellation of the pass so the throwaway tree is never stranded.
 		tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), conflictRecoveryTimeout)
 		defer tcancel()
-		if err := gitRun(tctx, dispatchDir, "worktree", "remove", "--force", tree); err != nil {
+		removeErr := gitRun(tctx, dispatchDir, "worktree", "remove", "--force", tree)
+		if removeErr != nil {
 			// A locked worktree refuses `remove --force` and is skipped by a plain
 			// `prune`, so unlock first, then RemoveAll, then prune the now-missing
 			// registration (the provisionAcceptanceTree ladder).
@@ -1337,6 +1348,18 @@ func establishConflictResolutionTree(ctx context.Context, cfg config, client upl
 			_ = gitRun(tctx, dispatchDir, "worktree", "prune")
 		}
 		_ = os.RemoveAll(parent)
+		if removeErr != nil {
+			// The primary remove failed and the fallback ladder ran. Name it
+			// DISTINCTLY rather than emitting the success event: the plan's step-3
+			// distinction (conflict_resolution_tree_removed OR _teardown_failed)
+			// exists precisely so a genuinely stranded tree — the fallback ladder
+			// discards each step's error — is not misreported as cleanly removed
+			// (#3340).
+			logEvent(logSink, "conflict_resolution_teardown_failed", map[string]string{
+				"path": tree, "remove_error": removeErr.Error(),
+			})
+			return
+		}
 		logEvent(logSink, "conflict_resolution_tree_removed", map[string]string{"path": tree})
 	}
 	return tree, mergeRef, teardown, nil

@@ -252,7 +252,14 @@ base ref and derive `(remote, branch)` from the **qualified** ref
 `git worktree add --detach` a throwaway tree at the anchor under `os.MkdirTemp`
 (`conflict_resolution_tree_provision_failed`, category C, else). The agent AND
 the pass then run in that tree, and the push is pinned to the gate-authorized
-SHA exactly as before; the tree is torn down after the terminal report.
+SHA exactly as before; the tree is torn down after the terminal report. Teardown
+is best-effort and logs `conflict_resolution_tree_removed`, or
+`conflict_resolution_teardown_failed` when the primary `git worktree remove
+--force` fails and the unlock/RemoveAll/prune fallback ladder runs — so a
+stranded tree is never misreported as cleanly removed. The two fetch-failure
+reasons (`_branch_fetch_failed` / `_base_fetch_failed`) are redacted before
+shipping, because a git transport error can echo a token-in-URL remote and the
+backend records the reason verbatim.
 
 Every establishment refusal fires **before any working-tree, branch or checkout
 mutation** of the dispatch checkout. The one side effect a later refusal may
