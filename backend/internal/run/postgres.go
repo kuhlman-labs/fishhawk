@@ -446,6 +446,33 @@ func (r *postgresRepo) SetRunPredictedRuntimeMinutes(ctx context.Context, id uui
 	return rowToRun(row), nil
 }
 
+// DeletePendingAcceptanceStage physically removes the stage row identified by
+// id when — and only when — it is a PENDING acceptance stage (E72.1 / #3325).
+// The plan gate's acceptance-omission hook calls it after the approved plan
+// declares verification.acceptance_surface: none, so the run is genuinely
+// minted without an acceptance stage instead of carrying one that would only
+// ever short-circuit. Returns true when a row was deleted and false when the
+// predicates matched nothing (already gone, not pending, or not an acceptance
+// stage) — the predicates are the refusal, so there is no prior read to race.
+//
+// audit_entries.stage_id and approvals.stage_id are ON DELETE RESTRICT: a row
+// referencing the stage makes the DELETE fail and the error is returned
+// wrapped, never swallowed, so the caller can fail open with the stage intact.
+//
+// Like SetRunPredictedRuntimeMinutes above, deliberately NOT part of the
+// run.Repository interface: the server consumes it through an optional
+// capability assertion (acceptanceStageOmitter in
+// internal/server/acceptance_omission.go), so the many test fakes that never
+// omit a stage need no stub.
+func (r *postgresRepo) DeletePendingAcceptanceStage(ctx context.Context, id uuid.UUID) (bool, error) {
+	q := rundb.New(r.pool)
+	rows, err := q.DeletePendingAcceptanceStage(ctx, id)
+	if err != nil {
+		return false, fmt.Errorf("delete pending acceptance stage: %w", err)
+	}
+	return rows > 0, nil
+}
+
 // SumWorkflowCostInRange sums runs.cost_usd_total across every run of
 // one workflow in a repo whose created_at falls in the half-open
 // calendar period [from, to) (ADR-030 advisory budgets, #688). The

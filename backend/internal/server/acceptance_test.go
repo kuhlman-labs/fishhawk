@@ -2909,6 +2909,122 @@ func TestAcceptanceGateState_SkipMarkerReadError_FailsClosed(t *testing.T) {
 	}
 }
 
+// seedAcceptanceOmissionMarker seeds one acceptance_stage_omitted marker (E72.1 /
+// #3325) scoped to the PLAN stage, naming the omitted acceptance stage id in its
+// payload the way omitAcceptanceStageForSurfaceNone writes it.
+func seedAcceptanceOmissionMarker(au *auditFake, runID, planStageID, omittedStageID uuid.UUID) {
+	rid, sid := runID, planStageID
+	p, _ := json.Marshal(acceptanceStageOmittedPayload{
+		OmittedStageID: omittedStageID, OmittedSequence: 2, Basis: acceptanceStageOmissionBasis,
+	})
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: CategoryAcceptanceStageOmitted, Sequence: 9, Payload: p,
+	})
+}
+
+// TestAcceptanceGateState_NoStage_OmittedMarker_MergeEligible pins the E72.1 /
+// #3325 done-means: the spec declares an acceptance stage, NO stage row exists
+// (the plan gate deleted it), and the run carries an acceptance_stage_omitted
+// marker → the merge-eligible acceptanceGateOmitted disposition, NOT
+// acceptance_pending. Counterfactual: delete the no-row marker read in
+// acceptanceGateState and this returns acceptance_pending.
+func TestAcceptanceGateState_NoStage_OmittedMarker_MergeEligible(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	seedAcceptanceOmissionMarker(au, runID, uuid.New(), uuid.New())
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), nil)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateOmitted {
+		t.Errorf("state = %q, want %q (no stage row + omission marker)", got, acceptanceGateOmitted)
+	}
+	if !acceptanceGateAdmitsMerge(got) {
+		t.Errorf("acceptanceGateAdmitsMerge(%q) = false, want true", got)
+	}
+}
+
+// TestAcceptanceGateState_NoStage_NoMarker_StillPending is the control beside
+// the omitted case (and the retained MissingStage_Pending test above): with no
+// stage row AND no marker the stage is genuinely not yet materialized, so the
+// gate stays pending — the new read changes nothing for such a run.
+func TestAcceptanceGateState_NoStage_NoMarker_StillPending(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	// A marker on a DIFFERENT run must not leak in: the read is run-scoped.
+	seedAcceptanceOmissionMarker(au, uuid.New(), uuid.New(), uuid.New())
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), nil)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGatePending {
+		t.Errorf("state = %q, want %q (no stage row, no marker for THIS run)", got, acceptanceGatePending)
+	}
+}
+
+// TestAcceptanceGateState_OmittedMarkerReadError_FailsClosed pins the fail-closed
+// posture of the omission-marker read: the verdict read succeeds (no entries),
+// no stage row exists, and ONLY the omission-marker category read errors — the
+// error is propagated and the state never resolves merge-eligible.
+func TestAcceptanceGateState_OmittedMarkerReadError_FailsClosed(t *testing.T) {
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &categoryErrAuditRepo{
+		auditFake:   au,
+		errCategory: CategoryAcceptanceStageOmitted,
+		err:         errors.New("omission-marker read boom"),
+	}})
+	runID := uuid.New()
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), nil)
+	if err == nil {
+		t.Fatal("err = nil, want the propagated omission-marker read error (fail-closed)")
+	}
+	if acceptanceGateAdmitsMerge(got) && got != acceptanceGateNotDeclared {
+		t.Errorf("state = %q, must never resolve to a merge-eligible state on a read error", got)
+	}
+	if got != "" {
+		t.Errorf("state = %q, want \"\" alongside the error", got)
+	}
+}
+
+// TestAcceptanceGateState_MarkerWithStagePresent_UsesStagePath pins that the
+// omission marker is consulted ONLY when no stage row exists: with the marker
+// present but the pending acceptance stage STILL PRESENT (the delete failed
+// after the append — partial state (ii)), the gate takes the ordinary stage
+// path and reports pending, never admitting a merge on the marker alone.
+func TestAcceptanceGateState_MarkerWithStagePresent_UsesStagePath(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	acc := acceptanceStage(runID, run.StageStatePending)
+	seedAcceptanceOmissionMarker(au, runID, uuid.New(), acc.ID)
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), []*run.Stage{acc})
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGatePending {
+		t.Errorf("state = %q, want %q (marker + live pending stage row takes the stage path)", got, acceptanceGatePending)
+	}
+	if acceptanceGateAdmitsMerge(got) {
+		t.Errorf("acceptanceGateAdmitsMerge(%q) = true; the marker must not admit a merge while a stage row exists", got)
+	}
+}
+
+// TestAcceptanceGateAdmitsMerge_Omitted pins the fifth merge-eligible
+// disposition (E72.1 / #3325) as a DISTINCT string admitted by the shared
+// predicate.
+func TestAcceptanceGateAdmitsMerge_Omitted(t *testing.T) {
+	if !acceptanceGateAdmitsMerge(acceptanceGateOmitted) {
+		t.Error("acceptanceGateAdmitsMerge(acceptance_stage_omitted) = false, want true (merge-eligible)")
+	}
+	if acceptanceGateOmitted != CategoryAcceptanceStageOmitted {
+		t.Errorf("acceptanceGateOmitted = %q, want the audit category %q (they must not diverge)", acceptanceGateOmitted, CategoryAcceptanceStageOmitted)
+	}
+	for _, other := range []string{acceptanceGatePassed, acceptanceGateNotValidated, acceptanceGateSkippedOutOfScope, acceptanceGateUndecidable, acceptanceGateArbitrated} {
+		if acceptanceGateOmitted == other {
+			t.Errorf("acceptance_stage_omitted aliases %q; it must be a DISTINCT state string", other)
+		}
+	}
+}
+
 // TestAcceptanceGateState_VerdictWinsOverSkipMarker pins that a recorded verdict
 // always takes precedence over the skip marker on every surface: passed -> passed,
 // failed -> triage, even when a skip marker is also present.

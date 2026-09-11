@@ -173,6 +173,7 @@ var KnownCategories = map[string]struct{}{
 	"acceptance_recorded":                     {},
 	"acceptance_reopened":                     {},
 	"acceptance_skipped_out_of_scope":         {},
+	"acceptance_stage_omitted":                {},
 	"acceptance_triage_arbitrated":            {},
 	"acceptance_triage_decided":               {},
 	"agent_request_failed_alert":              {},

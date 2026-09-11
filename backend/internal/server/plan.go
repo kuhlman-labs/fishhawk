@@ -1716,6 +1716,11 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 			BlockingCount:       acceptance.BlockingCount,
 			OutOfScopeCount:     acceptance.OutOfScopeCount,
 			AllSkipShortCircuit: acceptance.AllSkipShortCircuit,
+			// E72.1 / #3325: the observable-surface facts ride the same
+			// payload → evidence mapping so the plan-review prompt renders the
+			// acceptance_surface: none headline and the restates-test count.
+			AcceptanceSurfaceNone: acceptance.AcceptanceSurfaceNone,
+			RestatesTestCount:     acceptance.RestatesTestCount,
 		}
 		for _, f := range acceptance.Findings {
 			ap.Findings = append(ap.Findings, prompt.AcceptanceFindingEvidence{

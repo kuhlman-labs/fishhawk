@@ -282,6 +282,23 @@ UPDATE stages
  WHERE id = $1
 RETURNING *;
 
+-- name: DeletePendingAcceptanceStage :execrows
+-- Physically removes a run's PENDING acceptance stage row (E72.1 / #3325):
+-- the plan gate calls it when the approved plan declares
+-- verification.acceptance_surface: none, so the run is genuinely minted
+-- WITHOUT an acceptance stage rather than carrying one that would only ever
+-- short-circuit. The two predicates ARE the refusal — a stage that is not
+-- pending (already dispatched/settled) or not an acceptance stage matches
+-- ZERO rows (execrows returns 0), so there is no check-then-write window.
+-- audit_entries.stage_id and approvals.stage_id are ON DELETE RESTRICT, so a
+-- row referencing the stage makes the DELETE error instead of cascading; the
+-- caller treats that as fail-open (stage retained). Hand-mirrored into
+-- db/queries.sql.go (see the preserve-on-regeneration note there).
+DELETE FROM stages
+ WHERE id = $1
+   AND state = 'pending'
+   AND stage_type = 'acceptance';
+
 -- name: RecordStageProgress :execrows
 -- Last-writer-wins projection of the runner's stage_progress heartbeat onto
 -- the stage row (#2541). The terminal-state predicate IS the refusal: a
