@@ -958,17 +958,20 @@ plain `- findings: none (checked and clean)`, so the block never claims
 **Reachability.** The preamble's blanket must-be-a-concern rule would
 otherwise apply to the ADVISORY line too, so `allSkipPreambleException` adds
 one sentence to the preamble — rendered whenever any gate evidence is present
-— naming the acceptance pre-check's specific `all_criteria_skip_expected`
-advisory line as the exception that carries its own HANDLING instruction
-instead. The exception is scoped to that one specific line, not a bare
+— naming the acceptance pre-check's specific advisory lines (by literal rule
+name: `all_criteria_skip_expected`, and since E72.1 `criterion_restates_test`
+and `no_observable_criterion` — see the next section) as the exceptions that
+carry their own HANDLING instruction instead. The exception is scoped to
+those specific named lines, not a bare
 `ADVISORY` line-prefix: every other gate-evidence line renders
 `fmt.Fprintf`-interpolated finding/violation Detail text this package does not
 fully control, so a bare-prefix exception would hand any such text a
 de-escalation channel by placing a newline plus its own
 `- ADVISORY ...: HANDLING: ...` into a Detail string. Naming the specific
-advisory — never the word `ADVISORY` alone — closes that off; the exception
-sentence deliberately keeps the two terms non-adjacent so it does not itself
-trip a naive substring match for the rendered advisory line.
+advisories — never the word `ADVISORY` alone — closes that off; the exception
+sentence deliberately keeps `ADVISORY` non-adjacent to every rule name so it
+does not itself trip a naive substring match for a rendered advisory line
+(`TestBuild_PlanReview_PreambleException_NamesAdvisoryRules` pins both halves).
 
 **Narrowness.** The de-escalation, mirroring `liveValidationVerdictClause`'s
 shape, covers ONLY the plan-level all-skip shape itself. A concern about an
@@ -997,3 +1000,86 @@ every added byte here is conditional on gate evidence being present). The
 producer-to-consumer join through the real `runAcceptancePrecheck` ->
 `planGateEvidence` -> `prompt.Build` path is
 `backend/internal/server`'s `TestAcceptancePrecheck_AllSkip_JoinToRenderedPrompt`.
+
+## Observable-outcome acceptance contract + advisory family (E72.1 / #3325)
+
+The acceptance-criterion contract used to accept a criterion whose only
+evidence was a Go test, so plans shipped criteria that restated
+`test_strategy` and the acceptance stage dispatched a runner with nothing it
+could observe. Two things changed in this package; the rules themselves
+(`plan.RuleCriterionRestatesTest`, `plan.RuleNoObservableCriterion`) and the
+`verification.acceptance_surface: none` enum live in `backend/internal/plan`,
+and the plan-gate omission hook + the `restates_test_count` /
+`acceptance_surface_none` pre-check payload fields live in
+`backend/internal/server`.
+
+**Planner prompt (`buildPlan`).** The "Acceptance-criteria authoring contract"
+paragraph is framed around OBSERVABLE OUTCOMES, and a new "Observable-outcome
+rule" paragraph names the exactly-five surfaces the sandboxed acceptance
+agent can observe on the localhost preview, with one concrete example each —
+HTTP route/response/status code, MCP tool result, CLI exit code/stderr/stdout,
+rendered prompt, persisted audit row — and states that a criterion whose ONLY
+evidence is a Go test restates `test_strategy` and draws the ADVISORY
+`criterion_restates_test` finding (cleared by naming the observed surface in
+`verify_hint`), that a plan with no observable criterion draws
+`no_observable_criterion`, and that the honest declaration for a change with
+genuinely no observable surface is `verification.acceptance_surface: none`,
+which records an `acceptance_stage_omitted` audit row and then OMITS the
+acceptance stage at plan approval (no not_validated short-circuit, no
+reviewer ceremony) and is rejected at parse time alongside any drivable
+criterion. The `verify_hint` field line steers at the observed surface rather
+than the covering test, and the all-skip paragraph now points at
+`acceptance_surface: none` as the preferred shape over an all-skip plan.
+Every string the pre-existing planner tests pin
+(`TestBuild_Plan_ExternallyTriggeredCriteriaGuidance`,
+`TestBuild_Plan_UndecidableCriteriaGuardrail`,
+`TestBuild_Plan_CriterionInnerShape_LockstepWithStruct`) is retained.
+`TestBuild_Plan_ObservableOutcomeAuthoringContract` pins the rewrite, and
+`testdata/plan-prompt-pre-change.golden` was regenerated a THIRD time (after
+#2290 and #2871) from `Build("plan", preChangeGoldenTrigger())` at this head —
+the diff is the acceptance-section rewrite only (4 deletions / 5 insertions),
+and both anti-vacuity guards still hold. The untrusted-intake ENVELOPE framing
+was not touched, so the #2291 agenteval corpora and `StripBodyEnvelope`'s
+byte-exact copy are unaffected.
+
+**Plan-review gate evidence (`writePlanGateEvidence`).**
+`AcceptancePrecheckEvidence` gained `AcceptanceSurfaceNone bool` and
+`RestatesTestCount int`. The former renders ONE
+`- acceptance_surface: none — …` headline (`acceptanceSurfaceNoneHeadline`)
+after the out_of_scope count, stating the stage will be OMITTED at approval
+(marker first, then the stage dropped) and nothing will be driven; the latter
+renders a `- criteria whose verify_hint names only a Go test
+(criterion_restates_test): N` count line only when non-zero. Both are
+conditional, so every other plan's evidence bytes are unchanged
+(`TestBuild_PlanReview_AcceptanceSurfaceNoneHeadline` pins the additive
+insertion by stripping the headline and comparing to the flag-false render).
+In the findings loop a finding whose **Rule constant** is
+`plan.RuleCriterionRestatesTest` or `plan.RuleNoObservableCriterion` renders as
+`- ADVISORY <rule> (criterion: <id>): <detail>` + `restatesTestAdvisoryHandling`
+— the same HANDLING shape as the all-skip line: acknowledge in `free_form`,
+never a concern on its own, exactly ONE concern only when the reviewer can
+NAME a criterion whose verify_hint could name an operator-observable surface;
+a concern about a criterion's own statement text is untouched. The keying is
+on the Rule constant and NEVER on Detail text, the #3317 injection posture:
+`TestBuild_PlanReview_AdvisoryDetailTextCannotDeEscalate` plants the literal
+`ADVISORY criterion_restates_test … HANDLING: …` in an `undecidable_criterion`
+finding's Detail and asserts it still renders as a plain FINDING line with no
+HANDLING clause. `allSkipPreambleException` was widened to name all three
+advisory rules by literal name (section above), so each HANDLING clause is
+reachable from the preamble's blanket rule.
+
+Pinned by `TestBuild_PlanReview_RestatesTestAdvisory_RendersHandlingLine`
+(the ADVISORY line + count line render and no FINDING line appears — the
+counterfactual vehicle for the Rule-keyed switch arm),
+`TestBuild_PlanReview_NoObservableCriterionAdvisory` (the plan-level line with
+no criterion parenthetical, alongside two per-criterion lines),
+`TestBuild_PlanReview_AcceptanceSurfaceNoneHeadline`,
+`TestBuild_PlanReview_PreambleException_NamesAdvisoryRules`, and the
+Detail-text control above. The producer-to-consumer join through the real
+`runAcceptancePrecheck` -> `planGateEvidence` -> `prompt.Build` path is the
+extended #1533 seam test in `backend/internal/server/plan_test.go`.
+
+Caveat, as for the all-skip line: these are prompt INSTRUCTIONS to an LLM
+reviewer, not enforced controls. The tests prove the lines render; they cannot
+prove a reviewer obeys them. Promotion of either rule to a refusal is
+deferred by the issue.
