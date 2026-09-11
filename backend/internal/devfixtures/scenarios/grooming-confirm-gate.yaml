@@ -1,0 +1,115 @@
+# grooming-confirm-gate — the backlog_grooming done-means shape (E72.2 / #3326).
+#
+# A grooming run whose groom (plan, agent) stage SUCCEEDED carrying a
+# grooming_report artifact and one approval, and whose confirm (review,
+# human) stage is parked at awaiting_approval. There is deliberately NO
+# implement stage: the human_review_gate_parked classifier reads exactly
+# this stage set (a succeeded plan, a human review awaiting approval, no
+# implement), so an acceptance criterion can assert it from GET
+# /v0/runs/{id}/stages alone.
+#
+# Handles (`key`) are scenario-local; every Apply mints fresh ids.
+runs:
+  - key: groom-run
+    repo: kuhlman-labs/fishhawk
+    workflow_id: backlog_grooming
+    trigger_ref: "issue:1"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        backlog_grooming:
+          description: Seeded fixture grooming workflow (grooming-confirm-gate).
+          autonomy: low
+          applies_to:
+            trigger: [on_demand]
+          stages:
+            - id: groom
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: grooming_report
+                  schema: grooming_report_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: confirm
+              type: review
+              executor:
+                human: true
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [agent]
+
+stages:
+  - key: groom
+    run: groom-run
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: confirm
+    run: groom-run
+    sequence: 2
+    type: review
+    executor_kind: human
+    executor_ref: human
+    requires_approval: true
+    state: awaiting_approval
+
+artifacts:
+  - key: report
+    stage: groom
+    kind: grooming_report
+    schema_version: grooming_report_v1
+    content: |
+      {
+        "kind": "grooming_report",
+        "report_version": "grooming_report_v1",
+        "ticket_reference": {
+          "type": "github_issue",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/1",
+          "id": "kuhlman-labs/fishhawk#1"
+        },
+        "generated_by": {
+          "agent": "claude-code",
+          "model": "claude-opus-4-8",
+          "timestamp": "2026-01-01T09:00:00Z"
+        },
+        "summary": "Seeded fixture grooming report: one cited ordering entry.",
+        "ordering": [
+          {
+            "id": "ordering:github/kuhlman-labs/fishhawk#1",
+            "item_ref": {
+              "type": "github_issue",
+              "id": "kuhlman-labs/fishhawk#1",
+              "url": "https://github.com/kuhlman-labs/fishhawk/issues/1"
+            },
+            "rank": 1,
+            "score": 9.0,
+            "rubric_citations": [{"rubric_id": "V1"}]
+          }
+        ],
+        "duplicates": [],
+        "hygiene_defects": [],
+        "dependency_edges": [],
+        "vision_drift": [],
+        "decomposition_suggestions": []
+      }
+
+approvals:
+  - stage: groom
+    approver_subject: fixture-operator
+    decision: approve
+    comment: Seeded fixture approval of the grooming report.
+    surface: api
