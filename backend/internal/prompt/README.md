@@ -451,6 +451,34 @@ validator. The tests prove the instruction renders, not that a validator obeys
 it. The failure direction is safe — a non-compliant validator produces at worst
 today's spurious failure, never a silent pass.
 
+## Acceptance-prompt seeded fixtures (E72.2 / #3326)
+
+`writeAcceptanceSeededFixtures` renders a `### Seeded fixtures` section in
+`buildAcceptance`, BEFORE `### Output contract` (so, like the #2581 blocks, its
+backtick tokens fall outside the region the closed-field-set count guard
+measures — `TestBuild_Acceptance_ClosedFieldSet_LockstepWithValidator` stays
+green) and introducing NO verdict field: its one rule reuses only the
+already-enumerated `result`=`skipped` / `expectation_basis` of Posture A.
+
+It tells the validator that a fresh preview is EMPTY and that it holds no
+credential to create a run, then names the preview's dev-only surface:
+`GET /v0/dev/fixtures` lists the catalog; `POST /v0/dev/fixtures {scenario}`
+materializes one and answers 201 with FRESH run and stage ids on every call
+(read them from that body — never assume a stable id or grep a list);
+`POST /v0/dev/sign` signs a raw trace bundle with the `private_key` from
+`POST /v0/runs/{run_id}/signing-key` so no local Ed25519 tooling is assumed;
+criteria cite scenarios by CATALOG NAME in `verify_hint` (the plan gate's
+`undecidable_criterion` classifier reads the same names —
+`plan.verifyHintNamesSeedScenario`); and the `trace-upload-target` spend
+baseline is seeded and uploaded contiguously. The load-bearing rule is the
+last one: a 404 on `GET /v0/dev/fixtures` means the target was NOT provisioned
+with the surface — a provisioning fact, not evidence against the change — so
+every seeded criterion is `skipped` under Posture A, never `failed`.
+`TestBuild_Acceptance_SeededFixturesSection` pins presence, position, all three
+routes and the 404 rule. Same caveat as the #2581 blocks: this is an
+instruction to an LLM validator; the test proves it renders, not that it is
+obeyed, and the failure direction is a spurious skip, never a silent pass.
+
 ## Fix-up reporting obligations (#2737)
 
 `writeFixupReportObligations` renders the binding "### Reporting obligations

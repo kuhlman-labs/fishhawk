@@ -850,6 +850,147 @@ func TestUnevaluableCriteria_VerifyHintExemption_DetailGuidance(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// undecidable_criterion seeded-scenario verify_hint exemption (E72.2 / #3326)
+// ---------------------------------------------------------------------------
+
+// TestVerifyHintNamesSeedScenario is the NO/YES table for the E72.2 predicate.
+// The NO rows are the CONTROL: a generic "seed", a route mention with an
+// unknown name, a route mention with no name, a prefixed / suffixed / partial
+// catalog name, and a real name placed in the STATEMENT only (empty hint) must
+// all return false — the membership test is seedScenarioNames membership over whole
+// acceptanceTokens of verify_hint ALONE, with no generic-word branch and no
+// route-substring branch. The YES rows pin every catalog name bare, a
+// case-and-punctuation variant, and the name at the start / middle / end of a
+// sentence.
+func TestVerifyHintNamesSeedScenario(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statement string
+		hint      string
+		want      bool
+	}{
+		// NO rows.
+		{name: "no_generic_seed_word", hint: "seed the run and check the state", want: false},
+		{name: "no_unknown_name_on_route", hint: "seed does-not-exist via POST /v0/dev/fixtures", want: false},
+		{name: "no_route_mention_without_name", hint: "POST /v0/dev/fixtures then GET /v0/runs/{id}", want: false},
+		{name: "no_seeded_run_phrase", hint: "seeded run", want: false},
+		{name: "no_seedling_prefix_of_seed", hint: "seedling", want: false},
+		{name: "no_suffixed_catalog_name", hint: "plan-gate-parked-v2", want: false},
+		{name: "no_prefixed_catalog_name", hint: "xgrooming-confirm-gate", want: false},
+		{name: "no_name_in_statement_only_empty_hint", statement: "seed plan-gate-parked and confirm the stage parks", hint: "", want: false},
+		{name: "no_empty_hint", hint: "", want: false},
+		// YES rows: each catalog name bare.
+		{name: "yes_bare_grooming_confirm_gate", hint: "grooming-confirm-gate", want: true},
+		{name: "yes_bare_plan_gate_parked", hint: "plan-gate-parked", want: true},
+		{name: "yes_bare_trace_upload_target", hint: "trace-upload-target", want: true},
+		// YES rows: case + trailing punctuation, and sentence positions.
+		{name: "yes_uppercase_with_trailing_comma", hint: "Seed PLAN-GATE-PARKED, then GET /v0/runs/{id}", want: true},
+		{name: "yes_name_at_start", hint: "trace-upload-target seeded via POST /v0/dev/fixtures, then upload a bundle", want: true},
+		{name: "yes_name_in_middle", hint: "seed grooming-confirm-gate via POST /v0/dev/fixtures and read the confirm stage", want: true},
+		{name: "yes_name_at_end_with_period", hint: "POST /v0/dev/fixtures with scenario plan-gate-parked.", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := AcceptanceCriterion{ID: "a1", Statement: tc.statement, VerifyHint: tc.hint}
+			if got := verifyHintNamesSeedScenario(c); got != tc.want {
+				t.Errorf("verifyHintNamesSeedScenario(hint=%q) = %v, want %v", tc.hint, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUnevaluableCriteria_SeedScenarioHintSuppressesTriggerClass is the
+// MOTIVATING E72.2 / #3326 row: a non-liveTarget capability statement (a live
+// MCP client, corpus index 0) whose verify_hint names a KNOWN seeded scenario
+// draws NO undecidable_criterion finding — the preview's dev fixture surface can
+// materialize that scenario, so the sandbox can decide the criterion. The
+// hint carries none of the #3163 harness markers, so the suppression can come
+// ONLY from the verifyHintNamesSeedScenario disjunct.
+//
+// COUNTERFACTUAL (run, not reasoned): delete `|| verifyHintNamesSeedScenario(c)`
+// from the conjunction in UnevaluableCriteria → this test is RED
+// ("undecidable_criterion count = 1, want 0"); restore → GREEN.
+func TestUnevaluableCriteria_SeedScenarioHintSuppressesTriggerClass(t *testing.T) {
+	const hint = "seed trace-upload-target via POST /v0/dev/fixtures, then drive the plan stage"
+	if verifyHintDeclaresInRepo(AcceptanceCriterion{VerifyHint: hint}) {
+		t.Fatalf("fixture hint %q must carry no #3163 harness marker, or the row cannot isolate the seed disjunct", hint)
+	}
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		{
+			ID: "a1", Statement: "a live MCP client drives the seeded plan stage to awaiting_approval",
+			Source: CriterionSourceExplicit, SourceRef: "#3326", VerifyHint: hint,
+		},
+	}}
+	findings := EvaluateAcceptanceCriteria(v)
+	if got := findingsFor(findings, RuleUndecidableCriterion); len(got) != 0 {
+		t.Fatalf("undecidable_criterion count = %d, want 0 (a known seeded-scenario name in verify_hint is sandbox-decidable evidence): %+v", len(got), got)
+	}
+	if got := findingsFor(findings, RuleMissingLiveValidationMarker); len(got) != 0 {
+		t.Fatalf("missing_live_validation_marker count = %d, want 0 (an MCP-client statement is not a live target): %+v", len(got), got)
+	}
+}
+
+// TestUnevaluableCriteria_UnknownSeedNameDoesNotSuppress is the CONTROL for the
+// membership test: the same non-liveTarget statement with a hint that mentions
+// the dev route and a seed verb but names a scenario the catalog does NOT carry
+// still draws the finding. Nothing about "seed" or "/v0/dev/fixtures" earns the
+// exemption — only seedScenarioNames membership over the hint's tokens does.
+//
+// COUNTERFACTUAL (targets the EXECUTED membership line): mutate the
+// `if seedScenarioNames[tok]` test in verifyHintNamesSeedScenario
+// (backend/internal/plan/acceptance_check.go) to `if seedScenarioNames[tok] || true`,
+// prove it landed with `grep -n '|| true' backend/internal/plan/acceptance_check.go`,
+// run → this test is RED ("undecidable_criterion count = 0, want 1"); restore →
+// GREEN.
+func TestUnevaluableCriteria_UnknownSeedNameDoesNotSuppress(t *testing.T) {
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		{
+			ID: "a1", Statement: "a live MCP client drives the seeded plan stage to awaiting_approval",
+			Source: CriterionSourceExplicit, SourceRef: "#3326",
+			VerifyHint: "seed not-a-scenario via POST /v0/dev/fixtures",
+		},
+	}}
+	findings := EvaluateAcceptanceCriteria(v)
+	got := findingsFor(findings, RuleUndecidableCriterion)
+	if len(got) != 1 {
+		t.Fatalf("undecidable_criterion count = %d, want 1 (an unknown scenario name earns no exemption): %+v", len(got), got)
+	}
+	if !strings.Contains(got[0].Detail, "a live MCP client / MCP tool call") {
+		t.Errorf("Detail = %q, want it to name the MCP-client capability", got[0].Detail)
+	}
+}
+
+// TestUnevaluableCriteria_SeedHintDoesNotSuppressLiveTarget preserves #2845
+// under the new disjunct: a liveTarget statement (a live forge round-trip)
+// whose verify_hint names a REAL catalog scenario still draws BOTH the
+// undecidable_criterion finding and the missing_live_validation_marker finding
+// — no seeded scenario stands up a live forge, and the disjunct sits under the
+// same !uc.liveTarget conjunct as #3163.
+//
+// COUNTERFACTUAL: delete `!uc.liveTarget &&` from the conjunction so the hint
+// alone suppresses → this test is RED ("undecidable_criterion count = 0, want
+// 1"); restore → GREEN.
+func TestUnevaluableCriteria_SeedHintDoesNotSuppressLiveTarget(t *testing.T) {
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		{
+			ID: "a1", Statement: "a live GitHub round-trip closes the issue after the seeded run merges",
+			Source: CriterionSourceExplicit, SourceRef: "#3326",
+			VerifyHint: "seed plan-gate-parked via POST /v0/dev/fixtures, approve, then watch the issue close",
+		},
+	}}
+	findings := EvaluateAcceptanceCriteria(v)
+	got := findingsFor(findings, RuleUndecidableCriterion)
+	if len(got) != 1 {
+		t.Fatalf("undecidable_criterion count = %d, want 1 (a seeded scenario never stands up a live forge): %+v", len(got), got)
+	}
+	if !strings.Contains(got[0].Detail, "a live forge round-trip") {
+		t.Errorf("Detail = %q, want it to name the live-forge capability", got[0].Detail)
+	}
+	if mllv := findingsFor(findings, RuleMissingLiveValidationMarker); len(mllv) != 1 {
+		t.Fatalf("missing_live_validation_marker count = %d, want 1 (#2845 unchanged): %+v", len(mllv), mllv)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // missing_live_validation_marker (#2845, E54.31)
 //
 // FIXTURE-COLLISION SWEEP (run BEFORE any production edit, per the approved
