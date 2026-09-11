@@ -501,3 +501,76 @@ func TestAcceptanceSeam_SurfaceNone_OmittedRunClearsMergeGate(t *testing.T) {
 		t.Errorf("acceptanceGateAdmitsMerge(%q) = false, want true", got)
 	}
 }
+
+// (i) TestApprovePlan_AcceptanceSurfaceNone_PlanLoadError_FailsOpen: a store
+// fault while loading the approved plan retains the stage, writes no marker,
+// performs no omission-marker read, and WARNs naming the failed load. The hook
+// is driven directly (an artifact-list fault set before the HTTP approval would
+// fail the budget check first, never reaching the hook). Counterfactual: delete
+// the loadApprovedPlanForRun error branch → the nil plan falls through the
+// "not a none plan" return silently and the WARN assertion goes RED.
+func TestApprovePlan_AcceptanceSurfaceNone_PlanLoadError_FailsOpen(t *testing.T) {
+	h := newOmissionHarness(t, surfaceNonePlan())
+	h.art.listErr = errors.New("injected: artifact store unavailable")
+	h.s.omitAcceptanceStageForSurfaceNone(context.Background(), h.plan)
+
+	if row := h.acceptanceRow(t); row == nil || row.State != run.StageStatePending {
+		t.Fatalf("acceptance row = %+v, want present and pending on a plan load error", row)
+	}
+	if got := len(h.omissionMarkers(t)); got != 0 {
+		t.Errorf("acceptance_stage_omitted rows = %d, want 0", got)
+	}
+	if calls := h.rr.deleteCallsSnapshot(); len(calls) != 0 {
+		t.Errorf("DeletePendingAcceptanceStage calls = %v, want none", calls)
+	}
+	if n := h.au.readsOf(CategoryAcceptanceStageOmitted); n != 0 {
+		t.Errorf("omission-marker reads = %d, want 0 (the hook returns before any audit read when the plan cannot be loaded)", n)
+	}
+	if !strings.Contains(h.logBuf.String(), "load approved plan failed") {
+		t.Errorf("want a WARN naming the failed plan load; logs:\n%s", h.logBuf.String())
+	}
+}
+
+// (j) TestApprovePlan_AcceptanceSurfaceNone_CorruptMarkers_DoNotAnchorIdempotency:
+// pre-existing acceptance_stage_omitted rows whose payload is undecodable or
+// names uuid.Nil are seeded BY CONSTRUCTION into the audit fake's history. They
+// cannot name a stage, so they must not anchor idempotency: the hook still
+// appends exactly ONE well-formed marker for the pending stage and deletes it.
+// Counterfactual: make acceptanceOmissionMarkers fail the whole read on an
+// undecodable row (return the unmarshal error) → nothing is written, the stage
+// survives, and the marker-count assertion goes RED.
+func TestApprovePlan_AcceptanceSurfaceNone_CorruptMarkers_DoNotAnchorIdempotency(t *testing.T) {
+	h := newOmissionHarness(t, surfaceNonePlan())
+	rid := h.run.ID
+	pid := h.plan.ID
+	h.au.seeded = append(h.au.seeded,
+		&audit.Entry{RunID: &rid, StageID: &pid, Category: CategoryAcceptanceStageOmitted, Payload: json.RawMessage(`{not json`)},
+		&audit.Entry{RunID: &rid, StageID: &pid, Category: CategoryAcceptanceStageOmitted, Payload: json.RawMessage(`{"omitted_stage_id":"00000000-0000-0000-0000-000000000000","basis":"acceptance_surface_none"}`)},
+	)
+	marked, err := h.s.acceptanceOmissionMarkers(context.Background(), h.run.ID)
+	if err != nil {
+		t.Fatalf("acceptanceOmissionMarkers: %v (a corrupt row must be skipped, not fail the read)", err)
+	}
+	if len(marked) != 0 {
+		t.Fatalf("marker set from corrupt rows = %v, want empty", marked)
+	}
+
+	h.approve(t)
+
+	if row := h.acceptanceRow(t); row != nil {
+		t.Fatalf("acceptance stage %s still present after approval with only corrupt markers; want it deleted", row.ID)
+	}
+	markers := h.omissionMarkers(t)
+	if len(markers) != 1 || markers[0].OmittedStageID != h.acc.ID {
+		t.Fatalf("well-formed acceptance_stage_omitted rows = %+v, want exactly one naming %s", markers, h.acc.ID)
+	}
+	if calls := h.rr.deleteCallsSnapshot(); len(calls) != 1 || calls[0] != h.acc.ID {
+		t.Errorf("DeletePendingAcceptanceStage calls = %v, want exactly [%s]", calls, h.acc.ID)
+	}
+	// The well-formed marker now anchors idempotency alongside the corrupt
+	// rows: a re-approval writes nothing further.
+	h.s.omitAcceptanceStageForSurfaceNone(context.Background(), h.plan)
+	if got := len(h.omissionMarkers(t)); got != 1 {
+		t.Errorf("acceptance_stage_omitted rows after re-approval = %d, want 1", got)
+	}
+}
