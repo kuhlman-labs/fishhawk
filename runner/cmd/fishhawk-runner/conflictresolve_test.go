@@ -424,6 +424,145 @@ func TestConflictResolutionPass_CommitFailure(t *testing.T) {
 	}
 }
 
+// TestConflictResolutionPass_HeadReadFailure drives step (1)'s
+// reasonHeadReadFailed return end to end: `git rev-parse HEAD` failing BEFORE
+// any mutation, so there is nothing to recover from and the agent must never
+// be invoked.
+func TestConflictResolutionPass_HeadReadFailure(t *testing.T) {
+	assertRefusal := func(t *testing.T, res conflictResolutionResult) {
+		t.Helper()
+		if res.Reason != reasonHeadReadFailed {
+			t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonHeadReadFailed)
+		}
+		if !res.Recovered {
+			t.Errorf("Recovered = false, want true (nothing to recover from)")
+		}
+		if res.BaseSHA != "" {
+			t.Errorf("BaseSHA = %q, want empty", res.BaseSHA)
+		}
+		if res.Detail == "" {
+			t.Error("Detail is empty")
+		}
+	}
+	failIfInvoked := func(t *testing.T) func(context.Context) error {
+		return func(context.Context) error {
+			t.Error("agent invoked after a pre-mutation HEAD read failure")
+			return nil
+		}
+	}
+
+	t.Run("not_a_work_tree", func(t *testing.T) {
+		if _, err := exec.LookPath("git"); err != nil {
+			t.Skip("git not available")
+		}
+		dir := t.TempDir()
+		res := runConflictResolutionPass(context.Background(), dir, "origin", crRequest("deadbeef"),
+			failIfInvoked(t), nil)
+		assertRefusal(t, res)
+	})
+
+	t.Run("unborn_head", func(t *testing.T) {
+		repo, head := crRepo(t)
+		headPath := filepath.Join(repo, ".git", "HEAD")
+		if err := os.WriteFile(headPath, []byte("ref: refs/heads/unborn\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+			failIfInvoked(t), nil)
+		assertRefusal(t, res)
+
+		// Nothing was mutated: the refusal happens before any git write.
+		if _, err := os.Stat(filepath.Join(repo, ".git", "MERGE_HEAD")); !os.IsNotExist(err) {
+			t.Errorf(".git/MERGE_HEAD present after a pre-mutation refusal (err=%v)", err)
+		}
+		if b, err := os.ReadFile(filepath.Join(repo, "conflict.txt")); err != nil || string(b) != "ours\n" {
+			t.Errorf("conflict.txt = %q, %v, want %q, nil", b, err, "ours\n")
+		}
+
+		if err := os.WriteFile(headPath, []byte("ref: refs/heads/feature\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		crAssertRestored(t, repo, head)
+	})
+}
+
+// TestConflictResolutionPass_ObserveFailure drives step (5)'s
+// reasonObserveFailed return through the pass's OWN git/filesystem reads
+// (readWorkingFile, readMergeMessage) from repository state, rather than the
+// injectable readGitConfigFn / readConflictedAttributesFn seams that
+// TestConflictResolutionPass_ConfigReadFailures and _AttributeReadFailures
+// already drive through the pass. The agent stub IS the seam here: it runs
+// (step 4) immediately before observeConflictState's reads (step 5), so no
+// new hook variable is needed to reach these failures from repository state.
+//
+// Both cases rest on Unix error semantics verified on the planning host:
+// os.ReadFile on a directory returns a non-ErrNotExist error (EISDIR), and
+// `git merge --abort` refuses a directory-shaped conflicted path with "would
+// lose untracked files in it", forcing the reset --hard + clean -fd
+// escalation. Both hold on Linux; an unexplained failure of this test on a
+// non-Unix GOOS is a platform artifact, not necessarily a recovery
+// regression.
+func TestConflictResolutionPass_ObserveFailure(t *testing.T) {
+	cases := []struct {
+		name   string
+		agent  func(t *testing.T, repo string) func(context.Context) error
+		detail string
+	}{
+		{
+			name: "conflicted_path_is_directory",
+			agent: func(t *testing.T, repo string) func(context.Context) error {
+				return func(context.Context) error {
+					path := filepath.Join(repo, "conflict.txt")
+					if err := os.Remove(path); err != nil {
+						return err
+					}
+					if err := os.MkdirAll(path, 0o755); err != nil {
+						return err
+					}
+					return os.WriteFile(filepath.Join(path, "inner"), []byte("x\n"), 0o644)
+				}
+			},
+			detail: "read conflicted path",
+		},
+		{
+			name: "merge_msg_unreadable",
+			agent: func(t *testing.T, repo string) func(context.Context) error {
+				return func(ctx context.Context) error {
+					if err := crResolve(t, repo)(ctx); err != nil {
+						return err
+					}
+					gitDir := crGitOut(t, repo, "rev-parse", "--absolute-git-dir")
+					msgPath := filepath.Join(gitDir, "MERGE_MSG")
+					if err := os.Remove(msgPath); err != nil {
+						return err
+					}
+					return os.Mkdir(msgPath, 0o755)
+				}
+			},
+			detail: "read MERGE_MSG",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, head := crRepo(t)
+			res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+				tc.agent(t, repo), nil)
+
+			if res.Reason != reasonObserveFailed {
+				t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, reasonObserveFailed)
+			}
+			if !strings.Contains(res.Detail, tc.detail) {
+				t.Errorf("Detail = %q, want substring %q", res.Detail, tc.detail)
+			}
+			if !res.Recovered {
+				t.Errorf("recovery not verified: %s", res.RecoveryDetail)
+			}
+			crAssertRestored(t, repo, head)
+		})
+	}
+}
+
 // TestConflictResolutionRecoveryOutlivesCancellation is the ROUND-2 recovery
 // requirement. exec.CommandContext kills the child the instant the context is
 // done, so a cancellation while the agent ran previously made the abort, the
