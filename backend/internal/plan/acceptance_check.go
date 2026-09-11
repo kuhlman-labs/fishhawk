@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -83,17 +84,60 @@ const (
 	// exactly that case — the rule exists so the approver is asked the
 	// question, not so the shape is banned.
 	//
-	// It fires exactly when AcceptanceSkippableAllSkipWithBasis(v) is true and
-	// deliberately REUSES that predicate rather than re-deriving the condition,
-	// so the plan-gate advisory and the orchestrator's runtime short-circuit
-	// are the SAME boolean by construction and cannot drift — including on the
+	// It fires exactly when AcceptanceSkippableAllSkipWithBasis(v) is true AND
+	// the plan does not declare acceptance_surface: none, and deliberately
+	// REUSES that predicate rather than re-deriving the condition, so the
+	// plan-gate advisory and the orchestrator's runtime short-circuit are the
+	// SAME boolean by construction and cannot drift — including on the
 	// whitespace-only expectation_basis edge, where both agree the plan is NOT
-	// all-skip and acceptance dispatches normally.
+	// all-skip and acceptance dispatches normally. The one narrowing (E72.1 /
+	// #3325) reads "fires when the short-circuit WOULD run": under
+	// acceptance_surface: none the stage is omitted at plan approval, so the
+	// short-circuit never runs and the advisory is suppressed as moot; the
+	// predicate itself is untouched, so a stage that still exists
+	// short-circuits exactly as before.
 	//
 	// Like the two rules above it applies NO cross-rule suppression: an
 	// all-skip plan whose criteria name a live target still draws its
 	// missing_live_validation_marker findings, one per criterion.
 	RuleAllCriteriaSkipExpected = "all_criteria_skip_expected"
+	// RuleCriterionRestatesTest flags a criterion whose verify_hint names ONLY
+	// in-repository Go tests — a `_test.go` path, a bare `TestFoo` name, `go
+	// test`, `scripts/test`, a unit/table/golden test, pgtest/httptest — and
+	// NO operator-observable surface (E72.1 / #3325). Such a criterion RESTATES
+	// the plan's test_strategy: the acceptance agent cannot observe a Go test
+	// passing on the localhost preview, so the criterion adds nothing the
+	// implement-verify gate does not already prove. The five surfaces the
+	// acceptance agent CAN observe are an HTTP route/response/status code, an
+	// MCP tool result (`fishhawk_*`), a CLI exit code/stderr/stdout, a
+	// rendered prompt, and a persisted audit row.
+	//
+	// It is ADVISORY and never refuses a plan (promotion to a refusal is
+	// deferred by the issue). EXEMPT: a criterion already declared
+	// skip_expected-with-basis or requires_live_validation (the sanctioned
+	// declarations — re-flagging them trains the operator to ignore the
+	// rule), and an EMPTY verify_hint (the rule is conservative: it fires on
+	// positive test-only evidence, never on the absence of a hint). RESIDUAL,
+	// stated honestly: an author can clear the finding by naming a surface in
+	// prose; acceptable for an advisory rule. Refinement intake is
+	// structurally inert here because drafts carry no verify_hint.
+	RuleCriterionRestatesTest = "criterion_restates_test"
+	// RuleNoObservableCriterion is the PLAN-LEVEL companion of
+	// criterion_restates_test (E72.1 / #3325): the plan declares at least one
+	// criterion, is NOT the all-skip shape, does NOT declare
+	// acceptance_surface: none, and EVERY criterion is either a sanctioned
+	// declaration (skip_expected-with-basis / requires_live_validation) or
+	// drew criterion_restates_test — so the acceptance stage would dispatch a
+	// runner with nothing it can observe. One finding per plan, empty
+	// CriterionID. ADVISORY. The honest remedies are the same two the
+	// per-criterion rule names: give one criterion an observable surface, or
+	// declare acceptance_surface: none so the stage is omitted at approval.
+	// It is NOT emitted for an all-skip plan (that shape already draws
+	// all_criteria_skip_expected — the two advisories would say the same
+	// thing twice) and NOT under acceptance_surface: none (the declaration IS
+	// the answer). Those are the only two cross-rule suppressions this file
+	// applies.
+	RuleNoObservableCriterion = "no_observable_criterion"
 )
 
 // EvaluateAcceptanceCriteria runs the deterministic acceptance-criteria rules
@@ -129,10 +173,19 @@ const (
 //     requires_live_validation. Its exemption is that marker ALONE:
 //     skip_expected-with-basis does not exempt, because only the marker files
 //     the tracked operator-validation walk (#2845). Advisory only.
+//   - criterion_restates_test — a criterion whose verify_hint names only
+//     in-repository Go test evidence and no operator-observable surface, so it
+//     restates test_strategy (E72.1 / #3325). Exempt for skip_expected-with-
+//     basis / requires_live_validation; silent on an empty hint. Advisory only.
+//   - no_observable_criterion — PLAN-LEVEL: at least one criterion, not
+//     all-skip, no acceptance_surface: none, and every criterion is a declared
+//     skip or restates a test (E72.1 / #3325). One finding per plan. Advisory.
 //   - all_criteria_skip_expected — the plan declares at least one acceptance
 //     criterion and EVERY one is skip_expected-with-basis, so acceptance will
 //     short-circuit to not_validated having verified ZERO criteria (#3026).
-//     One finding per PLAN, never one per criterion. Advisory only.
+//     One finding per PLAN, never one per criterion. Advisory only. Suppressed
+//     under acceptance_surface: none, where the stage is omitted at approval
+//     and the short-circuit never runs (E72.1 / #3325).
 func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 	findings := []AcceptanceFinding{}
 
@@ -189,13 +242,27 @@ func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 	// for the same reason — one evaluator, both surfaces, no second copy.
 	findings = append(findings, MissingLiveValidationMarker(v)...)
 
+	// E72.1 (#3325): the test-only-evidence matcher rides the same call. The
+	// per-criterion findings are computed ONCE and the plan-level
+	// no_observable_criterion rule reads that same slice, so the two cannot
+	// disagree about which criteria restate a test.
+	restates := TestOnlyCriteria(v)
+	findings = append(findings, restates...)
+	findings = append(findings, noObservableCriterion(v, restates)...)
+
 	// #3026 (E32.50): the all-skip short-circuit advisory rides the same call,
 	// for the same single-source reason. It is PLAN-LEVEL, so it emits at most
 	// ONE finding with an empty CriterionID — the shape no_blocking_criterion
 	// already uses for a presence-level condition. The condition is READ from
 	// AcceptanceSkippableAllSkipWithBasis, the very predicate the orchestrator
 	// short-circuits on, so gate advisory and runtime behaviour are one boolean.
-	if AcceptanceSkippableAllSkipWithBasis(v) {
+	//
+	// E72.1 (#3325) NARROWS the invariant to "fires when the short-circuit
+	// WOULD run": under acceptance_surface: none the acceptance stage is
+	// omitted at plan approval, so the short-circuit never runs and the
+	// advisory about it is moot — it is suppressed. A plan carrying the stage
+	// (no declaration) keeps the exact prior boolean.
+	if AcceptanceSkippableAllSkipWithBasis(v) && !DeclaresNoAcceptanceSurface(v) {
 		findings = append(findings, AcceptanceFinding{
 			Rule: RuleAllCriteriaSkipExpected,
 			Detail: "every acceptance criterion is marked skip_expected with an expectation_basis, so the acceptance stage " +
@@ -1153,4 +1220,154 @@ func MissingLiveValidationMarker(v Verification) []AcceptanceFinding {
 		})
 	}
 	return findings
+}
+
+// ---------------------------------------------------------------------------
+// criterion_restates_test / no_observable_criterion (E72.1, #3325)
+// ---------------------------------------------------------------------------
+
+// testOnlyHintMarkers are the SUBSTRING markers that name in-repository Go
+// test evidence in a verify_hint. Lowercase; matched against the lowered hint.
+// A bare Go test function name is matched separately by goTestNamePattern,
+// because `TestFoo` is case-bearing and a substring list cannot express it.
+var testOnlyHintMarkers = []string{
+	"_test.go", "go test", "scripts/test", "unit test", "table test",
+	"table-driven", "golden file", "pgtest", "httptest",
+}
+
+// goTestNamePattern matches a bare Go test function name (`TestFoo`,
+// `TestParse_Example`) in the ORIGINAL-cased hint. It is applied before
+// lowering: `TestX` is the evidence, and "test" in ordinary prose is not.
+var goTestNamePattern = regexp.MustCompile(`\bTest[A-Z][A-Za-z0-9_]*`)
+
+// observableSurfaceTokenMarkers are the single-TOKEN markers naming one of the
+// five operator-observable surfaces. They are matched via acceptanceTokens /
+// tokenIn, NOT as substrings, so `cli` does not match `client` and `prompt`
+// does not match `prompted` by accident — a token match is what keeps the rule
+// from being cleared by an unrelated longer word.
+var observableSurfaceTokenMarkers = []string{
+	"http", "https", "endpoint", "response", "curl", "cli", "stderr", "stdout",
+	"prompt", "localhost", "preview", "healthz", "next_actions", "gate-view",
+}
+
+// observableSurfaceSubstringMarkers are the multi-word / path-shaped markers
+// naming an observable surface. Lowercase; matched as substrings of the
+// lowered hint because they carry internal spaces, slashes or underscores that
+// tokenization would split.
+var observableSurfaceSubstringMarkers = []string{
+	"get /", "post /", "put /", "patch /", "delete /", "/v0/",
+	"status code", "response body",
+	"mcp tool", "tool result", "tool call", "fishhawk_",
+	"exit code", "exit status",
+	"rendered prompt",
+	"audit row", "audit entry", "audit log", "audit_",
+	"issue comment", "pr comment", "status comment",
+}
+
+// verifyHintNamesTestOnly reports whether a verify_hint names in-repository
+// Go test evidence — a test-only marker substring in the lowered hint, or a
+// bare Go test function name in the original-cased hint.
+func verifyHintNamesTestOnly(hint string) bool {
+	return containsAnyPhrase(strings.ToLower(hint), testOnlyHintMarkers) ||
+		goTestNamePattern.MatchString(hint)
+}
+
+// verifyHintNamesObservableSurface reports whether a verify_hint names one of
+// the five operator-observable surfaces, via a token marker or a substring
+// marker. A single named surface is enough: the acceptance agent then has
+// something to observe, however many tests the hint also cites.
+func verifyHintNamesObservableSurface(hint string) bool {
+	lowered := strings.ToLower(hint)
+	if containsAnyPhrase(lowered, observableSurfaceSubstringMarkers) {
+		return true
+	}
+	for _, tok := range acceptanceTokens(lowered) {
+		if tokenIn(tok, observableSurfaceTokenMarkers) {
+			return true
+		}
+	}
+	return false
+}
+
+// criterionRestatesTestDetail is the criterion_restates_test finding text. It
+// names the five surfaces and BOTH remedies so the author is not sent on a
+// two-step (fix the hint, then learn the declaration existed).
+const criterionRestatesTestDetail = "criterion verify_hint names only in-repository Go tests and no operator-observable surface, so it RESTATES the " +
+	"plan's test_strategy — the acceptance agent cannot observe a Go test passing on the localhost preview. Name the surface the " +
+	"acceptance agent observes in verify_hint (an HTTP route/response/status code, an MCP tool result / fishhawk_* tool, a CLI exit " +
+	"code/stderr/stdout, a rendered prompt, or a persisted audit row), or — if the change genuinely has no observable surface — " +
+	"declare verification.acceptance_surface: none so the acceptance stage is omitted at plan approval. Advisory; never refuses the plan."
+
+// TestOnlyCriteria flags every acceptance criterion whose verify_hint names
+// ONLY in-repository Go test evidence and NO operator-observable surface
+// (criterion_restates_test, E72.1 / #3325). It reads verify_hint ALONE — never
+// the statement, never expectation_basis — for the same reason
+// verifyHintDeclaresInRepo does: the hint is the field that states how the
+// criterion is verified.
+//
+// A criterion already declared skip_expected-with-basis or
+// requires_live_validation is exempt (criterionDeclaresUnevaluable, the
+// exemption every advisory rule in this file shares), and an empty or
+// whitespace-only verify_hint is never flagged (no marker matches it, so the
+// rule fires on positive test-only evidence, never on absence). Returns a
+// non-nil empty slice when nothing is flagged; findings come out in criteria
+// order.
+func TestOnlyCriteria(v Verification) []AcceptanceFinding {
+	findings := []AcceptanceFinding{}
+	for _, c := range v.AcceptanceCriteria {
+		if criterionDeclaresUnevaluable(c) {
+			continue
+		}
+		// An empty / whitespace-only hint is silent BY CONSTRUCTION — no
+		// test-only marker matches it — so there is deliberately no explicit
+		// emptiness guard here (it would be a dead branch no test could redden).
+		if !verifyHintNamesTestOnly(c.VerifyHint) || verifyHintNamesObservableSurface(c.VerifyHint) {
+			continue
+		}
+		findings = append(findings, AcceptanceFinding{
+			Rule:        RuleCriterionRestatesTest,
+			CriterionID: c.ID,
+			Detail:      criterionRestatesTestDetail,
+		})
+	}
+	return findings
+}
+
+// noObservableCriterion is the plan-level rule (no_observable_criterion). It
+// takes the criterion_restates_test findings ALREADY computed by the caller so
+// both rules read one evaluation. Fires exactly when:
+//   - at least one criterion exists,
+//   - the plan does NOT declare acceptance_surface: none,
+//   - the plan is NOT the all-skip shape (that draws
+//     all_criteria_skip_expected instead — no double advisory), and
+//   - EVERY criterion is either a sanctioned declaration or drew
+//     criterion_restates_test.
+//
+// Returns a non-nil empty slice when silent, one finding when it fires.
+func noObservableCriterion(v Verification, restates []AcceptanceFinding) []AcceptanceFinding {
+	findings := []AcceptanceFinding{}
+	if len(v.AcceptanceCriteria) == 0 || DeclaresNoAcceptanceSurface(v) || AcceptanceSkippableAllSkipWithBasis(v) {
+		return findings
+	}
+	restated := make(map[string]struct{}, len(restates))
+	for _, f := range restates {
+		restated[f.CriterionID] = struct{}{}
+	}
+	for _, c := range v.AcceptanceCriteria {
+		if criterionDeclaresUnevaluable(c) {
+			continue
+		}
+		if _, ok := restated[c.ID]; ok {
+			continue
+		}
+		return findings
+	}
+	return append(findings, AcceptanceFinding{
+		Rule: RuleNoObservableCriterion,
+		Detail: "no acceptance criterion names an operator-observable surface: every criterion is either a declared skip or restates an " +
+			"in-repository Go test, so the acceptance stage would dispatch a runner with nothing it can observe on the localhost preview. " +
+			"Give at least one criterion a verify_hint naming an HTTP route/response/status code, an MCP tool result / fishhawk_* tool, " +
+			"a CLI exit code/stderr/stdout, a rendered prompt, or a persisted audit row — or declare verification.acceptance_surface: none " +
+			"so the acceptance stage is omitted at plan approval instead. Advisory; never refuses the plan.",
+	})
 }

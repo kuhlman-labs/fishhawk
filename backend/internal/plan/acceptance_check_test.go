@@ -1925,3 +1925,268 @@ func TestMissingLiveValidationMarker_AcceptedSubstringAnchorMixedCase(t *testing
 		t.Fatalf("accepted mixed-case residual (see the doc block above liveTargetAnchors): want 0 findings; got %d: %+v", len(got), got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E72.1 (#3325) — criterion_restates_test / no_observable_criterion /
+// acceptance_surface: none
+// ---------------------------------------------------------------------------
+
+// hintCriterion builds a drivable explicit criterion carrying the given
+// verify_hint — the field the two new rules read.
+func hintCriterion(id, hint string) AcceptanceCriterion {
+	return AcceptanceCriterion{
+		ID: id, Statement: "the change behaves as specified",
+		Source: CriterionSourceExplicit, SourceRef: "#3325", VerifyHint: hint,
+	}
+}
+
+// (DONE-MEANS) A verify_hint naming ONLY a Go test draws
+// criterion_restates_test. Three test-only shapes: a bare TestFoo name, a
+// _test.go path, and a go test invocation. This is the case the counterfactual
+// deletion of the TestOnlyCriteria rule body must redden.
+func TestEvaluateAcceptanceCriteria_CriterionRestatesTest_FiresOnTestOnlyHint(t *testing.T) {
+	for _, tc := range []struct{ name, hint string }{
+		{"bare test name", "TestEvaluateAcceptanceCriteria_AllSkipWithBasis_FlagsOnce passes"},
+		{"_test.go path", "covered by backend/internal/plan/acceptance_check_test.go"},
+		{"go test invocation", "run go test ./backend/internal/plan/... and observe green"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{AcceptanceCriteria: []AcceptanceCriterion{hintCriterion("c1", tc.hint)}}
+			findings := EvaluateAcceptanceCriteria(v)
+			if n := countFindings(findings, RuleCriterionRestatesTest, "c1"); n != 1 {
+				t.Fatalf("want exactly 1 criterion_restates_test for c1; got %d in %+v", n, findings)
+			}
+			f := findingFor(findings, RuleCriterionRestatesTest)
+			for _, want := range []string{"HTTP", "MCP tool result", "CLI exit", "rendered prompt", "audit row", "acceptance_surface: none", "verify_hint"} {
+				if !strings.Contains(f.Detail, want) {
+					t.Errorf("Detail must name %q; got %q", want, f.Detail)
+				}
+			}
+		})
+	}
+}
+
+// (suppression) ONE named observable surface clears the finding, even when the
+// same hint ALSO names a Go test — one row per surface.
+func TestEvaluateAcceptanceCriteria_CriterionRestatesTest_ObservableSurfaceSuppresses(t *testing.T) {
+	for _, tc := range []struct{ name, hint string }{
+		{"http status code", "TestGetRun covers it; GET /v0/runs/{id} returns status code 200"},
+		{"mcp tool result", "the fishhawk_get_plan tool result carries the field (also pinned in plan_test.go)"},
+		{"cli exit code / stderr", "fishhawk validate exits with exit code 1 naming the field on stderr; go test ./cli/... too"},
+		{"rendered prompt", "the rendered prompt for the implement stage contains the section (golden file updated)"},
+		{"audit row", "an audit row of category plan_acceptance_precheck is persisted; see TestRunAcceptancePrecheck"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{AcceptanceCriteria: []AcceptanceCriterion{hintCriterion("c1", tc.hint)}}
+			findings := EvaluateAcceptanceCriteria(v)
+			if findingFor(findings, RuleCriterionRestatesTest) != nil {
+				t.Fatalf("an observable surface must suppress criterion_restates_test; got %+v", findings)
+			}
+		})
+	}
+}
+
+// (conservative) An empty or whitespace-only verify_hint is NEVER flagged —
+// the rule fires on positive test-only evidence, not on absence.
+func TestEvaluateAcceptanceCriteria_CriterionRestatesTest_EmptyHintSilent(t *testing.T) {
+	for _, hint := range []string{"", "   \t\n"} {
+		v := Verification{AcceptanceCriteria: []AcceptanceCriterion{hintCriterion("c1", hint)}}
+		findings := EvaluateAcceptanceCriteria(v)
+		if findingFor(findings, RuleCriterionRestatesTest) != nil {
+			t.Fatalf("hint %q must not fire criterion_restates_test; got %+v", hint, findings)
+		}
+		if findingFor(findings, RuleNoObservableCriterion) != nil {
+			t.Fatalf("hint %q must not fire no_observable_criterion; got %+v", hint, findings)
+		}
+	}
+}
+
+// (exemption) A criterion already declared skip_expected-with-basis is exempt
+// even when its verify_hint is test-only.
+func TestEvaluateAcceptanceCriteria_CriterionRestatesTest_DeclaredSkipExempt(t *testing.T) {
+	c := skipCriterion("c1", "the helper is renamed", "covered by the unit test")
+	c.VerifyHint = "TestRenamedHelper passes"
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{c}}
+	findings := EvaluateAcceptanceCriteria(v)
+	if findingFor(findings, RuleCriterionRestatesTest) != nil {
+		t.Fatalf("skip_expected-with-basis must exempt criterion_restates_test; got %+v", findings)
+	}
+}
+
+// (exemption) A requires_live_validation criterion is exempt.
+func TestEvaluateAcceptanceCriteria_CriterionRestatesTest_RequiresLiveValidationExempt(t *testing.T) {
+	c := hintCriterion("c1", "go test ./backend/internal/forge/... with a fake forge")
+	c.RequiresLiveValidation = true
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{c}}
+	findings := EvaluateAcceptanceCriteria(v)
+	if findingFor(findings, RuleCriterionRestatesTest) != nil {
+		t.Fatalf("requires_live_validation must exempt criterion_restates_test; got %+v", findings)
+	}
+}
+
+// (token matching) The single-token surface markers are matched on TOKENS, so
+// `client` is not `cli`: a hint "TestX drives a fake client" still fires. The
+// control pairs the same hint with the genuine token, which suppresses.
+func TestEvaluateAcceptanceCriteria_CriterionRestatesTest_TokenMatchDoesNotFireOnClient(t *testing.T) {
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{hintCriterion("c1", "TestX drives a fake client")}}
+	if findingFor(EvaluateAcceptanceCriteria(v), RuleCriterionRestatesTest) == nil {
+		t.Fatal("`client` must not count as the `cli` surface marker; want criterion_restates_test")
+	}
+	v = Verification{AcceptanceCriteria: []AcceptanceCriterion{hintCriterion("c1", "TestX drives the cli, which prints the plan")}}
+	if f := findingFor(EvaluateAcceptanceCriteria(v), RuleCriterionRestatesTest); f != nil {
+		t.Fatalf("the `cli` token must suppress; got %+v", f)
+	}
+}
+
+// (plan-level, DONE-MEANS for the issue headline) Every criterion restates a
+// test -> exactly ONE no_observable_criterion finding with an empty
+// CriterionID, alongside the per-criterion findings.
+func TestEvaluateAcceptanceCriteria_NoObservableCriterion_Fires(t *testing.T) {
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		hintCriterion("c1", "TestFoo passes"),
+		hintCriterion("c2", "covered by foo_test.go"),
+	}}
+	findings := EvaluateAcceptanceCriteria(v)
+	if n := countFindings(findings, RuleNoObservableCriterion, ""); n != 1 {
+		t.Fatalf("want exactly 1 plan-level no_observable_criterion; got %d in %+v", n, findings)
+	}
+	if n := countFindings(findings, RuleCriterionRestatesTest, "c1") + countFindings(findings, RuleCriterionRestatesTest, "c2"); n != 2 {
+		t.Errorf("want both per-criterion findings retained; got %d in %+v", n, findings)
+	}
+	f := findingFor(findings, RuleNoObservableCriterion)
+	if !strings.Contains(f.Detail, "acceptance_surface: none") || !strings.Contains(f.Detail, "verify_hint") {
+		t.Errorf("Detail must name both remedies; got %q", f.Detail)
+	}
+}
+
+// (suppression) ONE observable criterion suppresses the plan-level finding;
+// the other criterion's per-criterion finding is unchanged.
+func TestEvaluateAcceptanceCriteria_NoObservableCriterion_SuppressedByOneObservable(t *testing.T) {
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		hintCriterion("c1", "TestFoo passes"),
+		hintCriterion("c2", "GET /v0/runs/{run_id} returns 200 with the field"),
+	}}
+	findings := EvaluateAcceptanceCriteria(v)
+	if findingFor(findings, RuleNoObservableCriterion) != nil {
+		t.Fatalf("one observable criterion must suppress no_observable_criterion; got %+v", findings)
+	}
+	if n := countFindings(findings, RuleCriterionRestatesTest, "c1"); n != 1 {
+		t.Errorf("c1 must still draw criterion_restates_test; got %d in %+v", n, findings)
+	}
+}
+
+// (suppression) acceptance_surface: none IS the answer — no plan-level finding.
+// The criteria here are all-skip (the only shape Parse admits under none), so
+// the per-criterion rule is exempt too; the plan-level guard is asserted
+// directly against the predicate as well so the suppression is not merely a
+// side effect of the exemption.
+func TestEvaluateAcceptanceCriteria_NoObservableCriterion_SuppressedBySurfaceNone(t *testing.T) {
+	v := Verification{
+		AcceptanceSurface: AcceptanceSurfaceValueNone,
+		AcceptanceCriteria: []AcceptanceCriterion{
+			skipCriterion("c1", "the helper is renamed", "covered by the unit test"),
+		},
+	}
+	findings := EvaluateAcceptanceCriteria(v)
+	if findingFor(findings, RuleNoObservableCriterion) != nil {
+		t.Fatalf("acceptance_surface: none must suppress no_observable_criterion; got %+v", findings)
+	}
+	// Direct proof against the plan-level rule: the same criteria WITHOUT the
+	// declaration and WITHOUT the all-skip shape (a requires_live_validation
+	// criterion is declared-unevaluable but not all-skip) fire; adding the
+	// declaration alone silences it.
+	live := hintCriterion("c1", "go test ./...")
+	live.RequiresLiveValidation = true
+	if n := countFindings(EvaluateAcceptanceCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{live}}), RuleNoObservableCriterion, ""); n != 1 {
+		t.Fatalf("control: a wholly-declared, non-all-skip plan fires no_observable_criterion; got %d", n)
+	}
+	if n := countFindings(EvaluateAcceptanceCriteria(Verification{AcceptanceSurface: AcceptanceSurfaceValueNone, AcceptanceCriteria: []AcceptanceCriterion{live}}), RuleNoObservableCriterion, ""); n != 0 {
+		t.Fatalf("acceptance_surface: none alone must suppress no_observable_criterion; got %d", n)
+	}
+}
+
+// (no double advisory) An all-skip plan draws all_criteria_skip_expected, NOT
+// no_observable_criterion as well.
+func TestEvaluateAcceptanceCriteria_NoObservableCriterion_NotDoubledWhenAllSkip(t *testing.T) {
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		skipCriterion("c1", "the CLI prints the resolved plan", "covered by a unit test"),
+		skipCriterion("c2", "the payload records the count", "covered by the server integration test"),
+	}}
+	findings := EvaluateAcceptanceCriteria(v)
+	if findingFor(findings, RuleNoObservableCriterion) != nil {
+		t.Fatalf("an all-skip plan must not also draw no_observable_criterion; got %+v", findings)
+	}
+	if countFindings(findings, RuleAllCriteriaSkipExpected, "") != 1 {
+		t.Fatalf("all_criteria_skip_expected must still fire; got %+v", findings)
+	}
+}
+
+// (silent) Zero criteria -> no plan-level finding.
+func TestEvaluateAcceptanceCriteria_NoObservableCriterion_SilentWithZeroCriteria(t *testing.T) {
+	for _, v := range []Verification{{}, {OutOfScope: []string{"doc-only"}}, {AcceptanceSurface: AcceptanceSurfaceValueNone}} {
+		if f := findingFor(EvaluateAcceptanceCriteria(v), RuleNoObservableCriterion); f != nil {
+			t.Fatalf("zero criteria must not fire no_observable_criterion; got %+v", f)
+		}
+	}
+}
+
+// (all-skip suppression under none) The #3026 advisory is moot when the stage
+// is omitted at approval: same all-skip criteria, add the declaration, the
+// finding disappears. This is the case the counterfactual deletion of the
+// `&& !DeclaresNoAcceptanceSurface(v)` guard must redden. The un-declared
+// twin is asserted in the same test so the boolean is proven to move on the
+// declaration alone.
+func TestEvaluateAcceptanceCriteria_AllSkip_SuppressedBySurfaceNone(t *testing.T) {
+	criteria := []AcceptanceCriterion{
+		skipCriterion("c1", "the CLI prints the resolved plan", "covered by a unit test"),
+		skipCriterion("c2", "the payload records the count", "covered by the server integration test"),
+	}
+	if n := countFindings(EvaluateAcceptanceCriteria(Verification{AcceptanceCriteria: criteria}), RuleAllCriteriaSkipExpected, ""); n != 1 {
+		t.Fatalf("control: undeclared all-skip plan must fire all_criteria_skip_expected once; got %d", n)
+	}
+	v := Verification{AcceptanceSurface: AcceptanceSurfaceValueNone, AcceptanceCriteria: criteria}
+	findings := EvaluateAcceptanceCriteria(v)
+	if findingFor(findings, RuleAllCriteriaSkipExpected) != nil {
+		t.Fatalf("acceptance_surface: none must suppress all_criteria_skip_expected; got %+v", findings)
+	}
+	// The orchestrator predicate itself is UNCHANGED — the stage, if it still
+	// exists (a delete that failed after the marker), short-circuits as before.
+	if !AcceptanceSkippableAllSkipWithBasis(v) {
+		t.Error("AcceptanceSkippableAllSkipWithBasis must be unaffected by acceptance_surface")
+	}
+}
+
+// (predicate) Exact match only — no trimming, no casing.
+func TestDeclaresNoAcceptanceSurface(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"none", true}, {"", false}, {"None", false}, {" none", false}, {"http", false},
+	} {
+		if got := DeclaresNoAcceptanceSurface(Verification{AcceptanceSurface: tc.value}); got != tc.want {
+			t.Errorf("DeclaresNoAcceptanceSurface(%q) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+	if AcceptanceSurfaceValueNone != "none" {
+		t.Errorf("AcceptanceSurfaceValueNone = %q, want none", AcceptanceSurfaceValueNone)
+	}
+}
+
+// (rule names) The wire contract consumers key on.
+func TestE72Rules_RuleNames(t *testing.T) {
+	if RuleCriterionRestatesTest != "criterion_restates_test" {
+		t.Errorf("rule = %q, want criterion_restates_test", RuleCriterionRestatesTest)
+	}
+	if RuleNoObservableCriterion != "no_observable_criterion" {
+		t.Errorf("rule = %q, want no_observable_criterion", RuleNoObservableCriterion)
+	}
+}
+
+// (non-nil) TestOnlyCriteria returns a non-nil empty slice on a clean plan.
+func TestTestOnlyCriteria_NonNilOnCleanPlan(t *testing.T) {
+	got := TestOnlyCriteria(Verification{})
+	if got == nil || len(got) != 0 {
+		t.Fatalf("want non-nil empty slice; got %#v", got)
+	}
+}

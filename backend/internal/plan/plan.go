@@ -537,6 +537,37 @@ type Verification struct {
 	// OutOfScope lists what the change deliberately does NOT cover, so
 	// reviewers and downstream acceptance don't treat an omission as a gap.
 	OutOfScope []string `json:"out_of_scope,omitempty"`
+	// AcceptanceSurface is the plan's explicit declaration about the
+	// operator-observable surface the change exposes (E72.1 / #3325). The
+	// schema enumerates exactly ONE value, AcceptanceSurfaceValueNone: the
+	// change has no HTTP route/response, MCP tool result, CLI exit/stderr/
+	// stdout, rendered prompt, or persisted audit row an acceptance agent
+	// could observe. When set, the plan gate records an
+	// acceptance_stage_omitted audit row and then omits the run's acceptance
+	// stage at approval instead of minting a not_validated short-circuit, and
+	// the moot all_criteria_skip_expected advisory is suppressed.
+	// semanticCheck rejects it alongside ANY drivable criterion — a drivable
+	// criterion needs no declaration, its verify_hint names the surface.
+	// Observable-surface values are deliberately NOT enumerated for that same
+	// reason. Additive-optional within standard_v1; empty means undeclared.
+	AcceptanceSurface string `json:"acceptance_surface,omitempty"`
+}
+
+// AcceptanceSurfaceValueNone is the sole legal Verification.AcceptanceSurface
+// value: the plan declares that no operator-observable surface exists
+// (E72.1 / #3325). The schema enum constrains the wire value, so
+// DeclaresNoAcceptanceSurface compares exactly — no trimming, no casing.
+const AcceptanceSurfaceValueNone = "none"
+
+// DeclaresNoAcceptanceSurface reports whether a plan's verification declares
+// acceptance_surface: none. It is the single predicate the plan gate's
+// acceptance-stage omission hook, the acceptance pre-check headline, and the
+// all_criteria_skip_expected suppression dispatch through, so the three agree
+// by construction. Exact match only: the schema enum already constrains the
+// value, and a decoded struct built in-process with a variant spelling is a
+// caller bug this predicate must not paper over.
+func DeclaresNoAcceptanceSurface(v Verification) bool {
+	return v.AcceptanceSurface == AcceptanceSurfaceValueNone
 }
 
 // AcceptanceCriterion is one entry in Verification.AcceptanceCriteria. Its
