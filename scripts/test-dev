@@ -2258,8 +2258,17 @@ else
   fail "_preview_seed_apply 404 should invoke both teardown helpers (got: $(cat "$sp_wd/teardown" 2>/dev/null))"
 fi
 # Transport failure (curl non-zero, no status): same fail-loud + teardown.
-rm -f "$sp_wd/teardown"
-print '#!/bin/sh\necho "curl: (7) Failed to connect" >&2\nexit 7\n' > "$sp_wd/bin/curl"; chmod +x "$sp_wd/bin/curl"
+# This stub ALSO records its argv: it stays the active curl for the
+# malformed-name case below, whose "no request attempted" assertion is only
+# meaningful if the stub in force would have left a record had it run.
+rm -f "$sp_wd/teardown" "$sp_wd/curl.argv"
+cat > "$sp_wd/bin/curl" <<EOS
+#!/bin/sh
+printf '%s\\n' "\$*" >> "$sp_wd/curl.argv"
+echo "curl: (7) Failed to connect" >&2
+exit 7
+EOS
+chmod +x "$sp_wd/bin/curl"
 (
   _preview_kill_tracked() { print "kill_tracked $1" >> "$sp_wd/teardown" }
   _preview_remove_worktree() { print "remove_worktree $1" >> "$sp_wd/teardown" }
@@ -2273,8 +2282,16 @@ if [[ "$(cat "$sp_wd/rc")" != "0" ]] && grep -q 'Failed to connect' "$sp_wd/err"
 else
   fail "_preview_seed_apply transport failure should fail loud + tear down (rc=$(cat "$sp_wd/rc"), err: $(cat "$sp_wd/err"))"
 fi
-# Malformed name at the apply seam: refused BEFORE curl runs (no argv captured),
-# teardown invoked.
+# Anti-vacuity control for the malformed-name case: the SAME stub that stays
+# on PATH below demonstrably writes curl.argv when it is invoked, so the
+# absence of that file there means no request was attempted.
+if grep -q '/v0/dev/fixtures' "$sp_wd/curl.argv" 2>/dev/null; then
+  pass "_preview_seed_apply transport-failure stub records its invocation (malformed-name no-request check is live)"
+else
+  fail "the transport-failure curl stub must record argv, or the malformed-name no-request assertion is vacuous (got: $(cat "$sp_wd/curl.argv" 2>/dev/null))"
+fi
+# Malformed name at the apply seam: refused BEFORE curl runs (no argv captured
+# by the recording stub still on PATH), teardown invoked.
 rm -f "$sp_wd/teardown" "$sp_wd/curl.argv"
 (
   _preview_kill_tracked() { print "kill_tracked $1" >> "$sp_wd/teardown" }

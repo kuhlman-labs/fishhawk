@@ -76,11 +76,16 @@ dates the row at `Now`. This is what lets `trace-upload-target` seed a
 spend baseline in PRIOR hour buckets: `spendalert.Evaluate` averages the
 populated prior buckets inside its 24h window, so a ~$5 upload in the
 seed hour OR the hour after trips `spend_alert` against the ≈$0.001
-baseline. The `1h5m` row is what keeps the youngest populated prior
-bucket at seed-hour minus one (`TestScenario_TraceUploadTarget_BaselineSurvivesHourBoundary`
-asserts exactly that at pinned clocks); without it the youngest is
-seed-hour minus two. Seed and upload contiguously — the baseline ages
-with wall-clock time. Backdated timestamps do not disturb the audit
+baseline. Guaranteed at every seed clock: the `2h` / `3h` / `4h` rows
+populate three distinct prior buckets (seed-hour minus 2/3/4). The `1h5m`
+row reaches seed-hour minus one only when the seed clock is at or past
+:05 — `TestScenario_TraceUploadTarget_BaselineSurvivesHourBoundary` pins
+that at 10:59:59Z (four buckets, youngest = seed-hour minus one) — while
+an earlier seed folds it into the `2h` row's bucket, which
+`TestScenario_TraceUploadTarget_EarlyHourSeedSharesBucket` pins at
+10:02:00Z (three buckets, one summing $0.002, youngest = seed-hour minus
+two; the alert still trips at ratio ≈ 3750). Seed and upload
+contiguously — the baseline ages with wall-clock time. Backdated timestamps do not disturb the audit
 chain: `AppendChained` links by sequence, not by timestamp, and
 `TestApply_TraceUploadTarget_StageDispatchedWithBackdatedSpendBaseline`
 recomputes every stored hash to prove it.

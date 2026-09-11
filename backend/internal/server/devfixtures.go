@@ -65,6 +65,15 @@ const devSignPrivateKeyHeader = "X-Fishhawk-Dev-Private-Key"
 // while keeping the dev route from being a memory sink.
 const devSignMaxBodyBytes = 32 * 1024 * 1024
 
+// devFixturesMaxBodyBytes bounds the body POST /v0/dev/fixtures decodes,
+// applied via http.MaxBytesReader BEFORE the decoder reads (the
+// stage_progress / refinement pattern). The expected body is a one-field
+// object, so 4 KiB is generous; a body past it fails the decode and keeps
+// the existing 400 validation_failed shape. Dev-only and loopback-only
+// already, so this is defence in depth matching the sibling
+// devSignMaxBodyBytes rather than a reachable-defect fix.
+const devFixturesMaxBodyBytes = 4 << 10
+
 // devFixturesRequest is the POST /v0/dev/fixtures body.
 type devFixturesRequest struct {
 	Scenario string `json:"scenario"`
@@ -123,6 +132,7 @@ func (s *Server) handleDevListFixtures(w http.ResponseWriter, r *http.Request) {
 // reads the returned ids rather than assuming stable ones.
 func (s *Server) handleDevApplyFixture(w http.ResponseWriter, r *http.Request) {
 	var req devFixturesRequest
+	r.Body = http.MaxBytesReader(w, r.Body, devFixturesMaxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {

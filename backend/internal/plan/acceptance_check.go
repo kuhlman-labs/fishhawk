@@ -1156,7 +1156,11 @@ func verifyHintNamesSeedScenario(c AcceptanceCriterion) bool {
 // preview's dev-only POST /v0/dev/fixtures route can materialize (E72.2 /
 // #3326). It is the catalog verifyHintNamesSeedScenario tests membership
 // against; adding a scenario to the dev fixture surface means adding its name
-// here, or a hint naming it earns nothing.
+// here, or a hint naming it earns nothing. Carried inline (not imported) so
+// this package's production import graph stays free of repo packages;
+// TestSeedScenarioNamesMatchCatalog binds it to devfixtures/catalog.Names()
+// in both directions through a test-only import, so a name added on either
+// side without the other fails in-loop.
 var seedScenarioNames = map[string]bool{
 	"grooming-confirm-gate": true,
 	"plan-gate-parked":      true,

@@ -17365,7 +17365,8 @@ paths:
         stable ones. The `trace-upload-target` scenario carries a
         four-row backdated `cost_recorded` spend baseline (aged 1h5m, 2h,
         3h, 4h from apply time), so seed and upload contiguously: the
-        baseline ages with wall-clock time. Loopback peers only.
+        baseline ages with wall-clock time. Loopback peers only. Body cap
+        4 KiB (a body past it fails the decode as `400 validation_failed`).
       tags: [dev]
       security: []
       requestBody:

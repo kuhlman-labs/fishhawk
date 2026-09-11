@@ -387,6 +387,83 @@ func TestScenario_TraceUploadTarget_BaselineSurvivesHourBoundary(t *testing.T) {
 	}
 }
 
+// TestScenario_TraceUploadTarget_EarlyHourSeedSharesBucket is the early-hour
+// sibling of the boundary test above (#3326 fix-up, review concern 53854d82):
+// with the seed clock pinned at 10:02:00Z the 1h5m row lands at 08:57Z and
+// SHARES bucket 08 with the 2h row (08:02Z), so the four rows populate only
+// THREE distinct prior buckets (08/07/06), the youngest populated prior
+// bucket is seed-hour MINUS TWO, and that bucket sums both rows' spend. This
+// pins what the YAML header and docs/acceptance-preview.md now state as the
+// clock-independent guarantee: three distinct prior buckets inside the 24h
+// Window and a tripped alert at both the same-hour and post-crossing upload
+// clocks — NOT four distinct buckets, which holds only for a seed at or past
+// :05. The boundary test's 10:59:59 pin is unchanged.
+//
+// COUNTERFACTUAL (run against the YAML, observed): drop the 2h row → RED
+// ("rows landed in buckets [8 7 6], want [8 8 7 6]"); had the bucket list
+// matched, the shared-bucket sum and PriorHours == 3 assertions each fail
+// independently on a missing 1h5m / 2h row.
+func TestScenario_TraceUploadTarget_EarlyHourSeedSharesBucket(t *testing.T) {
+	s := mustLoad(t, "trace-upload-target")
+	seedClock := time.Date(2026, 1, 1, 10, 2, 0, 0, time.UTC)
+	wantYoungest := seedClock.Truncate(time.Hour).Add(-2 * time.Hour) // 08:00Z
+
+	var baseline []spendalert.Sample
+	wantBuckets := []int{8, 8, 7, 6}
+	var gotBuckets []int
+	var sharedBucketUSD float64
+	for _, row := range s.Audit {
+		age, err := row.AgeDuration()
+		if err != nil {
+			t.Fatalf("age %q: %v", row.Age, err)
+		}
+		usd := costUSD(t, row.Payload)
+		at := seedClock.Add(-age)
+		gotBuckets = append(gotBuckets, at.Hour())
+		if at.Truncate(time.Hour).Equal(wantYoungest) {
+			sharedBucketUSD += usd
+		}
+		t.Logf("row age=%s → %s (bucket %02d:00Z) usd=%g", row.Age, at.Format(time.RFC3339), at.Hour(), usd)
+		baseline = append(baseline, spendalert.Sample{Time: at, USD: usd})
+	}
+	if !slices.Equal(gotBuckets, wantBuckets) {
+		t.Fatalf("rows landed in buckets %v, want %v (1h5m and 2h share bucket 08 at a :02 seed)", gotBuckets, wantBuckets)
+	}
+	if sharedBucketUSD <= costUSD(t, s.Audit[0].Payload) {
+		t.Fatalf("shared bucket %s sums usd %g, want the 1h5m AND 2h rows folded together", wantYoungest.Format(time.RFC3339), sharedBucketUSD)
+	}
+
+	for _, clock := range []time.Time{
+		seedClock, // same hour as the seed
+		time.Date(2026, 1, 1, 11, 0, 1, 0, time.UTC), // hour boundary crossed
+	} {
+		t.Run(clock.Format("15:04:05"), func(t *testing.T) {
+			samples := append(slices.Clone(baseline), spendalert.Sample{Time: clock, USD: 5})
+			d := spendalert.Evaluate(samples, clock, 0)
+			t.Logf("clock=%s tripped=%v prior=%d avg=%g ratio=%g", clock.Format(time.RFC3339), d.Tripped, d.PriorHours, d.RollingAvgUSD, d.Ratio)
+			if !d.Tripped {
+				t.Fatalf("spend alert did not trip at %s: %+v", clock.Format(time.RFC3339), d)
+			}
+			if d.PriorHours != 3 {
+				t.Fatalf("PriorHours = %d, want 3 (four rows in three distinct prior buckets)", d.PriorHours)
+			}
+			uploadHour := clock.Truncate(time.Hour)
+			var youngest time.Time
+			for _, smp := range baseline {
+				if b := smp.Time.Truncate(time.Hour); b.Before(uploadHour) && b.After(youngest) {
+					youngest = b
+				}
+			}
+			if !youngest.Equal(wantYoungest) {
+				t.Fatalf("youngest populated prior bucket = %s, want %s (seed hour − 2h at an early-hour seed)", youngest.Format(time.RFC3339), wantYoungest.Format(time.RFC3339))
+			}
+			if gap := uploadHour.Sub(youngest); gap >= spendalert.Window {
+				t.Fatalf("youngest prior bucket is %s before the upload hour, outside the %s window", gap, spendalert.Window)
+			}
+		})
+	}
+}
+
 func mustLoad(t *testing.T, name string) *devfixtures.Scenario {
 	t.Helper()
 	s, err := devfixtures.Load(name)

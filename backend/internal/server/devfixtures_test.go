@@ -268,6 +268,50 @@ func TestDevFixtures_MalformedBody400(t *testing.T) {
 	}
 }
 
+// TestDevFixtures_BodyTooLarge400: a body over devFixturesMaxBodyBytes is
+// refused at the decoder (http.MaxBytesReader) with the existing 400
+// validation_failed shape, and the applier is never called. The oversized
+// body is a VALID one-field object padded with a long scenario value, so
+// the refusal is the cap and not the JSON grammar; the control is that the
+// same shape one byte under the cap decodes and reaches the applier.
+// COUNTERFACTUAL: delete the MaxBytesReader line → the over-cap case
+// decodes, reaches the applier, and this test is RED.
+func TestDevFixtures_BodyTooLarge400(t *testing.T) {
+	// {"scenario":"<pad>"} — the pad is sized so the whole body lands
+	// exactly at cap+1 (over) or cap (under).
+	bodyOfLen := func(n int) []byte {
+		const frame = `{"scenario":""}`
+		return []byte(`{"scenario":"` + strings.Repeat("x", n-len(frame)) + `"}`)
+	}
+	t.Run("over_cap_400", func(t *testing.T) {
+		fake := &fakeDevApplier{}
+		s := newDevServer(t, fake)
+		body := bodyOfLen(devFixturesMaxBodyBytes + 1)
+		w := devRequest(t, s, http.MethodPost, "/v0/dev/fixtures", body, devLoopbackPeer, nil)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", w.Code, w.Body.String())
+		}
+		if code := decodeErrorCode(t, w); code != "validation_failed" {
+			t.Errorf("code = %q, want validation_failed", code)
+		}
+		if len(fake.applied) != 0 {
+			t.Errorf("applier called with %v on an over-cap body", fake.applied)
+		}
+	})
+	t.Run("at_cap_reaches_applier", func(t *testing.T) {
+		fake := &fakeDevApplier{}
+		s := newDevServer(t, fake)
+		body := bodyOfLen(devFixturesMaxBodyBytes)
+		w := devRequest(t, s, http.MethodPost, "/v0/dev/fixtures", body, devLoopbackPeer, nil)
+		if w.Code == http.StatusBadRequest {
+			t.Fatalf("an at-cap body was refused 400 — the cap is off by one\n%s", w.Body.String())
+		}
+		if len(fake.applied) != 1 {
+			t.Fatalf("applier called %d times on an at-cap body, want 1 (the cap must not swallow a legal body)", len(fake.applied))
+		}
+	})
+}
+
 // TestDevFixtures_ApplyError500: any non-catalog Apply error is a 500
 // internal_error whose body carries the error_ref but NOT the cause
 // (the writeError 5xx redaction), with the cause in the operator log.

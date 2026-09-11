@@ -4509,6 +4509,13 @@ func TestGitLabProjectRegistry_LooksUpTheGitLabProvider(t *testing.T) {
 // the store is selected iff the dev flag is on, no bucket is configured
 // and nothing else wired one. This is the done-means test for the
 // wiring — a no-op touch of serve.go that drops the helper fails it.
+//
+// `selected` must be true EXACTLY on the mem row: serve.go gates the
+// "trace store: in-memory (dev fixtures)" boot line on it, so a true on a
+// passthrough row (an already-wired store handed back unchanged) would
+// make the log announce a dev store that was never minted (#3326 fix-up,
+// concern f37940f4). COUNTERFACTUAL: make the helper return `current, true`
+// on its passthrough arm → the four non-mem rows go RED (observed).
 func TestResolveDevTraceStore(t *testing.T) {
 	s3 := tracestore.NewS3Storage(nil, "bucket")
 	for _, tc := range []struct {
@@ -4526,7 +4533,10 @@ func TestResolveDevTraceStore(t *testing.T) {
 		{"on/no-bucket but already wired → current", true, "", s3, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := resolveDevTraceStore(tc.devFixtures, tc.bucket, tc.current)
+			got, selected := resolveDevTraceStore(tc.devFixtures, tc.bucket, tc.current)
+			if selected != tc.wantMem {
+				t.Fatalf("selected = %v, want %v (true only when the helper minted the mem store)", selected, tc.wantMem)
+			}
 			_, isMem := got.(*tracestore.MemStorage)
 			switch {
 			case tc.wantMem && !isMem:

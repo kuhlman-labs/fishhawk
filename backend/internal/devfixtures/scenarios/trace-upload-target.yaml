@@ -2,14 +2,21 @@
 # receive POST /v0/runs/{id}/trace, plus a backdated spend baseline
 # (E72.2 / #3326, closing #1874's preview gap).
 #
-# The four cost_recorded rows are aged 1h5m / 2h / 3h / 4h so that,
-# relative to Apply's clock, they land in FOUR DISTINCT PRIOR hour
-# buckets; spendalert.Evaluate averages the populated prior buckets inside
-# its 24h Window, so a ~$5 upload in the seed hour OR the hour after it
-# trips spend_alert at ratio ≈ 5000 against the ≈$0.001 baseline. The
-# 1h5m row is what keeps the youngest populated prior bucket at
-# seed-hour minus one (without it the youngest is seed-hour minus two).
-# Seed and upload contiguously: the baseline ages with wall-clock time.
+# The four cost_recorded rows are aged 1h5m / 2h / 3h / 4h relative to
+# Apply's clock. What that GUARANTEES at every seed clock: the 2h / 3h /
+# 4h rows land in THREE distinct prior hour buckets (seed-hour minus 2, 3
+# and 4), all inside spendalert.Evaluate's 24h Window, so a ~$5 upload in
+# the seed hour OR the hour after it trips spend_alert against the
+# ≈$0.001 baseline. What depends on WHERE in the hour the seed lands: the
+# 1h5m row reaches seed-hour minus one only when the seed clock is at or
+# past :05 (a 10:59:59 seed puts it at 09:54 → four distinct buckets,
+# youngest = seed-hour minus one); an earlier seed folds it into the 2h
+# row's bucket (a 10:02 seed puts it at 08:57 beside 08:02 → three
+# buckets, that one summing $0.002, youngest = seed-hour minus two).
+# Either way the alert trips (ratio ≈ 3750–5000); the two pinned clocks
+# are TestScenario_TraceUploadTarget_BaselineSurvivesHourBoundary and
+# _EarlyHourSeedSharesBucket. Seed and upload contiguously: the baseline
+# ages with wall-clock time.
 #
 # Handles (`key`) are scenario-local; every Apply mints fresh ids.
 runs:

@@ -1,8 +1,11 @@
 package plan
 
 import (
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures/catalog"
 )
 
 // ptrBool is a small helper for building explicit *bool blocking values.
@@ -2329,5 +2332,40 @@ func TestTestOnlyCriteria_NonNilOnCleanPlan(t *testing.T) {
 	got := TestOnlyCriteria(Verification{})
 	if got == nil || len(got) != 0 {
 		t.Fatalf("want non-nil empty slice; got %#v", got)
+	}
+}
+
+// TestSeedScenarioNamesMatchCatalog binds the classifier's inline
+// seedScenarioNames set to the devfixtures catalog in BOTH directions (E72.2 /
+// #3326 fix-up). The set is carried inline so the plan package's PRODUCTION
+// import graph stays empty of repo packages; this TEST-ONLY import of the
+// name-only catalog leaf (which itself imports nothing but the standard
+// library, so it cannot cycle) is what stops the copy drifting silently. A
+// scenario added to the catalog + YAML set would otherwise validate, apply,
+// and be listed by GET /v0/dev/fixtures while a verify_hint naming it earned
+// no undecidable_criterion suppression — and no test would go red.
+//
+// COUNTERFACTUALS: add a phantom name to seedScenarioNames → RED ("not in
+// catalog"); remove a real name → RED ("missing from seedScenarioNames").
+func TestSeedScenarioNamesMatchCatalog(t *testing.T) {
+	want := catalog.Names()
+	got := make([]string, 0, len(seedScenarioNames))
+	for name, member := range seedScenarioNames {
+		if !member {
+			t.Errorf("seedScenarioNames[%q] = false; a non-member entry has no meaning in a closed set", name)
+		}
+		if !catalog.Known(name) {
+			t.Errorf("seedScenarioNames carries %q, which is not in catalog.Names() %v", name, want)
+		}
+		got = append(got, name)
+	}
+	for _, name := range want {
+		if !seedScenarioNames[name] {
+			t.Errorf("catalog scenario %q is missing from seedScenarioNames — a verify_hint naming it earns no suppression", name)
+		}
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Errorf("seedScenarioNames = %v, want catalog.Names() = %v", got, want)
 	}
 }

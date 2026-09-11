@@ -2255,13 +2255,16 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.String("bucket", *s3Bucket),
 			slog.String("region", *s3Region),
 			slog.String("endpoint", *s3Endpoint))
-	} else if resolved := resolveDevTraceStore(*devFixtures, *s3Bucket, cfg.TraceStore); resolved != nil {
+	} else if resolved, selected := resolveDevTraceStore(*devFixtures, *s3Bucket, cfg.TraceStore); selected {
 		// Dev-fixtures trace store (E72.2 / #3326, closing #1874): under the
 		// dev flag with no bucket, an in-memory store stands in so the
 		// preview's POST /v0/runs/{id}/trace → recordCost → spend / unpriced
 		// alerts are drivable end to end. A configured bucket always wins
 		// (the branch above), and the 503 warning below is reserved for the
-		// case where NEITHER store is selected.
+		// case where NEITHER store is selected. Gated on `selected`, not on
+		// a non-nil return: the helper's passthrough arm hands back an
+		// already-wired store unchanged, and this line must only ever claim
+		// a store this branch actually minted.
 		cfg.TraceStore = resolved
 		logger.Info("trace store: in-memory (dev fixtures)")
 	} else {
@@ -3750,14 +3753,17 @@ func parseInstallationHostAllowlist(raw string) []string {
 }
 
 // resolveDevTraceStore picks the trace store the dev-fixtures flag implies
-// (E72.2 / #3326): tracestore.NewMem() iff the flag is on, no S3 bucket is
-// configured, and nothing else already wired a store; otherwise current is
-// returned unchanged. Pure so serve_test can table it without booting.
-func resolveDevTraceStore(devFixtures bool, s3Bucket string, current tracestore.Storage) tracestore.Storage {
+// (E72.2 / #3326): tracestore.NewMem() with selected=true iff the flag is on,
+// no S3 bucket is configured, and nothing else already wired a store;
+// otherwise current is returned unchanged with selected=false. The boolean is
+// what the boot log keys on — a non-nil return alone cannot distinguish a
+// freshly minted dev store from a passthrough of an already-wired one. Pure
+// so serve_test can table it without booting.
+func resolveDevTraceStore(devFixtures bool, s3Bucket string, current tracestore.Storage) (resolved tracestore.Storage, selected bool) {
 	if devFixtures && s3Bucket == "" && current == nil {
-		return tracestore.NewMem()
+		return tracestore.NewMem(), true
 	}
-	return current
+	return current, false
 }
 
 // envOrBool resolves a boolean env var via strconv.ParseBool so the operator-
