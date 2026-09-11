@@ -3359,6 +3359,16 @@ func buildAcceptance(t Trigger) string {
 			"operator before driving the instance.\n\n")
 	}
 
+	// Seeded fixtures (E72.2 / #3326). The preview's dev-only fixture surface
+	// lets a criterion that needs pre-existing state (a run parked at a gate, a
+	// spend baseline) be driven from the credential-free sandbox. Rendered
+	// BEFORE the output contract so its backtick tokens fall outside the region
+	// the ClosedFieldSet count guard measures
+	// (TestBuild_Acceptance_ClosedFieldSet_LockstepWithValidator), and it adds
+	// NO verdict field — the 404 rule reuses only result=skipped /
+	// expectation_basis, which Posture A below already enumerates.
+	writeAcceptanceSeededFixtures(&b)
+
 	// Output contract (transport — the signed evidence bundle — is E31.7's
 	// runner scope; the prompt states the shape the agent must produce).
 	b.WriteString("### Output contract\n\n")
@@ -3472,6 +3482,50 @@ func buildAcceptance(t Trigger) string {
 		"change into triage.\n")
 
 	return b.String()
+}
+
+// writeAcceptanceSeededFixtures renders the "### Seeded fixtures" section of the
+// acceptance prompt (E72.2 / #3326): how the validator materializes a named
+// scenario into the preview target, how it signs a raw trace bundle without
+// local Ed25519 tooling, and the one rule that keeps a missing surface from
+// reading as a defect — a 404 on GET /v0/dev/fixtures is a PROVISIONING fact
+// (the target was not started with FISHHAWKD_DEV_FIXTURES=1), so every seeded
+// criterion is `skipped` under Posture A, never `failed`.
+//
+// The routes are dev-only and loopback-only; the catalog names are the closed
+// set seedScenarioNames in backend/internal/plan/acceptance_check.go, and the plan gate's
+// undecidable_criterion classifier treats a verify_hint carrying one of those
+// names as sandbox-decidable evidence (plan.verifyHintNamesSeedScenario), which
+// is why criteria are told to cite scenarios by CATALOG NAME in verify_hint.
+func writeAcceptanceSeededFixtures(b *strings.Builder) {
+	b.WriteString("### Seeded fixtures\n\n")
+	b.WriteString("A freshly provisioned preview target is EMPTY — no runs, no stages, no audit " +
+		"history — and you hold no credential that could create a run through the public " +
+		"surface. When a criterion needs pre-existing state, seed it through the target's " +
+		"dev-only fixture surface instead of improvising:\n\n")
+	b.WriteString("- `GET /v0/dev/fixtures` lists the catalog of seedable scenarios as " +
+		"`{\"scenarios\":[{\"name\",\"description\"}]}`. Read it first.\n")
+	b.WriteString("- `POST /v0/dev/fixtures` with body `{\"scenario\":\"<name>\"}` materializes " +
+		"that scenario and answers 201 with " +
+		"`{\"scenario\",\"runs\":{\"<run-key>\":{\"run_id\",\"stages\":{\"<stage-key>\":\"<stage_id>\"}}}}`. " +
+		"Every call mints FRESH ids — read the run and stage ids from the 201 body you " +
+		"received; never assume a stable id and never search a list for a seeded run.\n")
+	b.WriteString("- `POST /v0/dev/sign` signs a raw trace bundle for you: obtain a key with " +
+		"`POST /v0/runs/{run_id}/signing-key` (its `private_key` is base64), send the bundle " +
+		"bytes as the body with header `X-Fishhawk-Dev-Private-Key: <private_key>`, and use " +
+		"the returned `{\"signature\"}` on `POST /v0/runs/{run_id}/trace`. No local Ed25519 " +
+		"tooling is assumed.\n")
+	b.WriteString("- Criteria reference scenarios by CATALOG NAME in their `verify_hint` (for " +
+		"example `plan-gate-parked` or `trace-upload-target`); seed exactly the named " +
+		"scenario, not a neighbour you judge equivalent.\n")
+	b.WriteString("- The `trace-upload-target` spend baseline ages with wall-clock time: seed " +
+		"and upload CONTIGUOUSLY, in the same few minutes, or the baseline drifts out of " +
+		"the window the alert evaluates.\n")
+	b.WriteString("- A 404 on `GET /v0/dev/fixtures` means the target was NOT provisioned with " +
+		"the fixture surface. That is a provisioning fact, not evidence against the change: " +
+		"mark every criterion that depends on a seeded scenario `result`=`skipped` under " +
+		"Posture A with the reason in its `expectation_basis` — never `failed`, and never a " +
+		"top-level `verdict`=`failed` on that basis alone.\n\n")
 }
 
 // RetiredAcceptanceCriterion is one acceptance criterion the operator retired

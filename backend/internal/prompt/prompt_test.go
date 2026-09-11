@@ -10014,6 +10014,66 @@ func TestBuild_Acceptance_CannotExhibitContract(t *testing.T) {
 	}
 }
 
+// TestBuild_Acceptance_SeededFixturesSection pins the E72.2 / #3326 "### Seeded
+// fixtures" section of the acceptance prompt: it renders, it renders BEFORE
+// "### Output contract" (so its backtick tokens fall outside the region the
+// closed-field-set count guard measures — TestBuild_Acceptance_ClosedFieldSet_
+// LockstepWithValidator stays green alongside), it names all three dev routes,
+// the fresh-ids rule, the catalog-name-in-verify_hint rule, the contiguous
+// seed-then-upload rule, and the 404 ⇒ Posture A skip rule. Deleting the
+// writeAcceptanceSeededFixtures call leaves this RED on the first want.
+func TestBuild_Acceptance_SeededFixturesSection(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	const section = "### Seeded fixtures"
+	const outputContract = "### Output contract"
+	si := strings.Index(got, section)
+	if si < 0 {
+		t.Fatalf("acceptance prompt missing %q section\n---\n%s", section, got)
+	}
+	if strings.Count(got, section) != 1 {
+		t.Errorf("acceptance prompt renders %q %d times, want exactly once", section, strings.Count(got, section))
+	}
+	oi := strings.Index(got, outputContract)
+	if oi < 0 {
+		t.Fatalf("acceptance prompt missing %q section\n---\n%s", outputContract, got)
+	}
+	if si > oi {
+		t.Errorf("%q at %d must render BEFORE %q at %d so its backticks stay outside the closed-field-set region",
+			section, si, outputContract, oi)
+	}
+	body := got[si:oi]
+	for _, want := range []string{
+		// The three dev routes.
+		"`GET /v0/dev/fixtures`",
+		"`POST /v0/dev/fixtures`",
+		"`POST /v0/dev/sign`",
+		// The signing-key source and the header the sign helper reads.
+		"`POST /v0/runs/{run_id}/signing-key`",
+		"X-Fishhawk-Dev-Private-Key",
+		// Fresh ids on every apply.
+		"Every call mints FRESH ids",
+		// Catalog names in verify_hint.
+		"CATALOG NAME in their `verify_hint`",
+		"`plan-gate-parked`",
+		"`trace-upload-target`",
+		// Contiguous seed-then-upload for the spend baseline.
+		"seed " + "and upload CONTIGUOUSLY",
+		// The 404 rule: provisioning fact, Posture A skip, never failed.
+		"A 404 on `GET /v0/dev/fixtures`",
+		"NOT provisioned",
+		"`result`=`skipped`",
+		"Posture A",
+		"never `failed`",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("seeded-fixtures section missing %q\n---\n%s", want, body)
+		}
+	}
+}
+
 // TestAcceptanceTreePath pins the run/stage-keyed merge-candidate checkout path
 // literal (#1881) — the prompt side of the byte-identical lockstep pair the
 // runner's acceptanceTreePath mirrors (runner/cmd/fishhawk-runner/acceptancetree.go),
