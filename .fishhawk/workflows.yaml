@@ -306,9 +306,24 @@ workflows:
           # loop, so a formatting or lint defect fails here too.
           # max_iterations: 1 allows a single fix attempt; 0, or removing
           # this block, makes the stage single-shot.
+          #
+          # timeout was 15m and is now 40m (#3383). The runner enforces this
+          # cap on BOTH the per-iteration gate and the #960 strict full
+          # re-verify of the committed SHA, and on expiry it SIGKILLs the
+          # command's process group. A full `scripts/test verify` on this
+          # repo already exceeds 10 minutes on clean main; a slice whose
+          # changed-package set makes the patch-coverage loop instrument a
+          # large package (e.g. backend/internal/server) runs well past 15m,
+          # so the gate was killed mid-run. That surfaces as a verify FAILURE
+          # whose captured output contains no failing test at all — it simply
+          # stops where the process died — which cost run bafae5d7 slice 2
+          # four full-verify attempts and two category-A failures.
+          # Raise the cap so the gate measures the tree rather than the clock.
+          # Making a killed gate self-describing (and retryable as infra
+          # rather than agent-output-invalid) is tracked separately in #3383.
           verify:
             command: "scripts/test verify"
-            timeout: "15m"
+            timeout: "40m"
             max_iterations: 1
         # Advisory implement review: the same two providers read the diff
         # against the approved plan and surface verdicts, including a
