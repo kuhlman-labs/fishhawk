@@ -297,6 +297,18 @@ func semanticCheck(p *Plan) error {
 		}
 		seenCriteria[c.ID] = struct{}{}
 	}
+	// acceptance_surface: none is MUTUALLY EXCLUSIVE with any drivable
+	// criterion (E72.1 / #3325). The declaration says no operator-observable
+	// surface exists, and at the plan gate it OMITS the acceptance stage
+	// outright — so a drivable criterion (one not marked skip_expected with a
+	// non-whitespace expectation_basis) alongside it would be a criterion the
+	// plan promises to verify on a stage the plan also promises to drop. A
+	// schema if/then cannot express "every array element satisfies X when a
+	// sibling property is set", so this is enforced here, like duplicate ids.
+	// Zero criteria plus none is legal (with or without out_of_scope).
+	if err := checkAcceptanceSurfaceNone(p.Verification); err != nil {
+		return err
+	}
 	// split_proposal STRUCTURAL invariants (#2055, E50.3). These run on a
 	// non-decomposed plan too, so they precede the decomposition early return.
 	//
@@ -632,4 +644,28 @@ func joinPointer(parts []string) string {
 		out += "/" + p
 	}
 	return out
+}
+
+// checkAcceptanceSurfaceNone is the E72.1 / #3325 semantic guard: a plan
+// declaring verification.acceptance_surface: none may carry no drivable
+// acceptance criterion. Drivable means NOT (skip_expected with a
+// non-whitespace expectation_basis) — the same TrimSpace reading
+// AcceptanceSkippableAllSkipWithBasis applies, so a plan that passes here with
+// at least one criterion is exactly the all-skip shape by construction. The
+// error names the offending criterion id and both remedies.
+func checkAcceptanceSurfaceNone(v Verification) error {
+	if !DeclaresNoAcceptanceSurface(v) {
+		return nil
+	}
+	for _, c := range v.AcceptanceCriteria {
+		if c.SkipExpected && strings.TrimSpace(c.ExpectationBasis) != "" {
+			continue
+		}
+		return &SemanticError{
+			Message: fmt.Sprintf("verification.acceptance_surface: %q declares no operator-observable surface, but acceptance criterion %q is drivable; "+
+				"mark it skip_expected with an expectation_basis, or drop acceptance_surface so the acceptance stage is dispatched",
+				AcceptanceSurfaceValueNone, c.ID),
+		}
+	}
+	return nil
 }
