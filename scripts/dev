@@ -2904,11 +2904,168 @@ _preview_branch_env() {
   if [[ -n "${TZ:-}" ]]; then reply+=("TZ=${TZ}"); fi
 }
 
-# `scripts/dev preview [<sha-or-ref>]` — build and serve the merge candidate.
-# The positional arg defaults to $FISHHAWK_PREVIEW_SHA so the runner's
-# provisioning hook can invoke the command bare.
+# Seeded preview (E72.2 / #3326): `scripts/dev preview <ref> [--seed <name>]`
+# materializes a named fixture scenario into the freshly provisioned target
+# via the preview binary's dev-only, loopback-only POST /v0/dev/fixtures. The
+# surface exists ONLY under FISHHAWKD_DEV_FIXTURES=1, which cmd_preview passes
+# on the serve exec line (never on migrate — the flag is a serve concern).
+# Scenario names are catalog names ([a-z0-9-]); the catalog lives in
+# backend/internal/devfixtures and is listed by GET /v0/dev/fixtures.
+PREVIEW_USAGE="usage: scripts/dev preview <sha-or-ref> [--seed <scenario>]"
+
+# Pure: does <name> look like a catalog scenario name? The name is spliced
+# into a JSON body by _preview_seed_apply, so anything outside [a-z0-9-] is
+# refused up front rather than escaped — a quote or backslash can never reach
+# the request. Empty is refused too.
+_preview_seed_name_valid() {
+  [[ "$1" =~ '^[a-z0-9-]+$' ]]
+}
+
+# Pure: parse the `preview` argv into reply=(ref seed). One positional <ref>
+# (env fallback FISHHAWK_PREVIEW_SHA, so the runner's provisioning hook can
+# invoke the command bare); `--seed <name>` or `--seed=<name>` (env fallback
+# FISHHAWK_PREVIEW_SEED). An unknown flag, a second positional, `--seed`
+# without a value, or a malformed scenario name prints the offending word plus
+# PREVIEW_USAGE to stderr and returns 1. cmd_preview calls this FIRST — before
+# .env is sourced and before any DB work — so a bad invocation fails on usage
+# alone; the env fallbacks are re-applied after .env lands (the FISHHAWK_PREVIEW_*
+# overrides may live only there). Every branch is a tested context (#631).
+_preview_parse_args() {
+  local ref="${FISHHAWK_PREVIEW_SHA:-}" seed="${FISHHAWK_PREVIEW_SEED:-}"
+  local have_ref=0
+  reply=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --seed)
+        if (( $# < 2 )) || [[ -z "$2" ]]; then
+          print -u2 "error: --seed requires a scenario name"
+          print -u2 "$PREVIEW_USAGE"
+          return 1
+        fi
+        seed="$2"
+        shift 2
+        ;;
+      --seed=*)
+        seed="${1#--seed=}"
+        if [[ -z "$seed" ]]; then
+          print -u2 "error: --seed requires a scenario name"
+          print -u2 "$PREVIEW_USAGE"
+          return 1
+        fi
+        shift
+        ;;
+      -*)
+        print -u2 "error: unknown flag '$1'"
+        print -u2 "$PREVIEW_USAGE"
+        return 1
+        ;;
+      *)
+        if (( have_ref )); then
+          print -u2 "error: unexpected argument '$1' (one <sha-or-ref> only)"
+          print -u2 "$PREVIEW_USAGE"
+          return 1
+        fi
+        ref="$1"
+        have_ref=1
+        shift
+        ;;
+    esac
+  done
+  if [[ -n "$seed" ]] && ! _preview_seed_name_valid "$seed"; then
+    print -u2 "error: --seed scenario name '${seed}' is not a catalog name ([a-z0-9-] only)"
+    print -u2 "$PREVIEW_USAGE"
+    return 1
+  fi
+  reply=("$ref" "$seed")
+}
+
+# Pure: render a 201 body from POST /v0/dev/fixtures — the compact Go-marshaled
+# {"scenario":..,"runs":{<key>:{"run_id":..,"stages":{<key>:<id>}}}} — as
+# operator-legible lines: the scenario name, each run key with its run id, and
+# each stage key with its stage id. This output IS the evidence the operator
+# reads and acts on (bafae5d7 / f955f98b condition 1), so it is never a raw
+# JSON dump; a body carrying no recognizable run is echoed verbatim under a
+# warning rather than dropped. Regex-driven (zsh =~ with $match/$MEND) — no jq
+# dependency on the operator host.
+_preview_seed_render() {
+  local body="$1"
+  local scenario="" rest="" srest="" seen=0
+  if [[ "$body" =~ '"scenario":"([^"]*)"' ]]; then scenario="${match[1]}"; fi
+  print "preview: seeded scenario ${scenario:-(unnamed)}"
+  rest="$body"
+  while [[ "$rest" =~ '"([^"]+)":\{"run_id":"([^"]*)","stages":\{([^}]*)\}' ]]; do
+    print "  run ${match[1]}: ${match[2]}"
+    srest="${match[3]}"
+    rest="${rest:$MEND}"
+    seen=1
+    while [[ "$srest" =~ '"([^"]+)":"([^"]*)"' ]]; do
+      print "    stage ${match[1]}: ${match[2]}"
+      srest="${srest:$MEND}"
+    done
+  done
+  if (( ! seen )); then
+    print "warning: no runs recognized in the fixtures response; raw body follows"
+    print -r -- "$body"
+  fi
+}
+
+# POST {"scenario":<name>} to <base-url>/v0/dev/fixtures on the just-gated
+# preview and print the minted ids via _preview_seed_render. Fail-loud
+# contract: ANY outcome other than HTTP 201 — a non-201 status (404 = unknown
+# scenario or a preview built WITHOUT the surface, 403 = non-loopback peer,
+# 500 = apply failure) or a transport failure — prints the response body (or
+# curl's error) to stderr, tears the preview down (_preview_kill_tracked +
+# _preview_remove_worktree, so a half-provisioned target never lingers
+# looking healthy), and returns 1; cmd_preview exits 1 on that. The name is
+# re-validated here (same teardown) because this is the function that builds
+# the JSON body — _preview_parse_args is the front door, not the only door.
+_preview_seed_apply() {
+  local base="$1" name="$2"
+  if ! _preview_seed_name_valid "$name"; then
+    print -u2 "error: refusing to seed '${name}' — not a catalog name ([a-z0-9-] only)"
+    _preview_kill_tracked "$PREVIEW_PID_FILE"
+    _preview_remove_worktree "$PREVIEW_WORKTREE"
+    return 1
+  fi
+  local tmp http_status curl_rc=0
+  # Explicit template under ${TMPDIR:-/tmp}: macOS `mktemp -t` does not
+  # reliably honor TMPDIR, and scripts/test-dev pins no-litter under a
+  # fixture TMPDIR.
+  tmp="$(mktemp "${TMPDIR:-/tmp}/fishhawk-preview-seed.XXXXXX")"
+  print "preview: seeding scenario ${name} via POST ${base}/v0/dev/fixtures..."
+  http_status="$(curl -sS -o "$tmp" -w '%{http_code}' -H 'Content-Type: application/json' \
+    -X POST "${base}/v0/dev/fixtures" -d "{\"scenario\":\"${name}\"}" 2>"${tmp}.err")" || curl_rc=$?
+  if (( curl_rc != 0 )) || [[ "$http_status" != "201" ]]; then
+    print -u2 "error: seeding scenario '${name}' failed — POST ${base}/v0/dev/fixtures returned HTTP ${http_status:-none} (curl exit ${curl_rc})"
+    if [[ -s "${tmp}.err" ]]; then cat "${tmp}.err" >&2; fi
+    if [[ -s "$tmp" ]]; then cat "$tmp" >&2; print -u2 ""; fi
+    if [[ "$http_status" == "404" ]]; then
+      print -u2 "hint: 404 means either an unknown scenario name (GET ${base}/v0/dev/fixtures lists the catalog) or a preview binary predating the dev-fixtures surface"
+    fi
+    rm -f "$tmp" "${tmp}.err"
+    _preview_kill_tracked "$PREVIEW_PID_FILE"
+    _preview_remove_worktree "$PREVIEW_WORKTREE"
+    return 1
+  fi
+  _preview_seed_render "$(cat "$tmp")"
+  rm -f "$tmp" "${tmp}.err"
+}
+
+# `scripts/dev preview <sha-or-ref> [--seed <scenario>]` — build and serve the
+# merge candidate, optionally seeding a fixture scenario into it. The
+# positional arg defaults to $FISHHAWK_PREVIEW_SHA so the runner's provisioning
+# hook can invoke the command bare; --seed defaults to $FISHHAWK_PREVIEW_SEED.
 cmd_preview() {
   print "preview: starting"
+
+  # Argument parsing FIRST (E72.2 / #3326): an unknown flag or a malformed
+  # --seed fails on usage alone, before .env is read or any DB is touched.
+  local ref="" seed=""
+  if ! _preview_parse_args "$@"; then
+    exit 1
+  fi
+  ref="${reply[1]}"
+  seed="${reply[2]}"
 
   # Environment (same posture as cmd_up): FISHHAWKD_DATABASE_URL and the
   # FISHHAWK_PREVIEW_* overrides may live only in .env.
@@ -2921,7 +3078,13 @@ cmd_preview() {
     print "warning: .env not found — using current shell environment"
   fi
 
-  local ref="${1:-${FISHHAWK_PREVIEW_SHA:-}}"
+  # Re-apply the env fallbacks now that .env has landed (the parser ran
+  # before it, so an .env-only FISHHAWK_PREVIEW_SHA / _SEED is honored here).
+  if [[ -z "$ref" ]]; then ref="${FISHHAWK_PREVIEW_SHA:-}"; fi
+  if [[ -z "$seed" ]]; then seed="${FISHHAWK_PREVIEW_SEED:-}"; fi
+  if [[ -n "$seed" ]] && ! _preview_seed_name_valid "$seed"; then
+    _die "FISHHAWK_PREVIEW_SEED '${seed}' is not a catalog name ([a-z0-9-] only)"
+  fi
   if [[ -z "$ref" ]]; then
     _die "no SHA to preview — pass one (scripts/dev preview <sha-or-ref>) or set FISHHAWK_PREVIEW_SHA"
   fi
@@ -3034,8 +3197,11 @@ cmd_preview() {
   local paddr
   paddr="$(_preview_addr)"
   mkdir -p "$LOG_DIR"
+  # FISHHAWKD_DEV_FIXTURES=1 registers the dev-only, loopback-only fixtures
+  # surface (E72.2 / #3326) and, with no S3 bucket, an in-memory trace store —
+  # the seeded target can then take POST /v0/runs/{id}/trace (#1874).
   _preview_branch_env
-  "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "FISHHAWKD_ADDR=$paddr" "$pbin" serve >> "$PREVIEW_LOG_FILE" 2>&1 &
+  "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "FISHHAWKD_ADDR=$paddr" "FISHHAWKD_DEV_FIXTURES=1" "$pbin" serve >> "$PREVIEW_LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PREVIEW_PID_FILE"
@@ -3047,6 +3213,16 @@ cmd_preview() {
     _preview_kill_tracked "$PREVIEW_PID_FILE"
     _preview_remove_worktree "$PREVIEW_WORKTREE"
     exit 1
+  fi
+
+  # Seed AFTER the identity-gated readiness check: the scenario must land in
+  # the merge candidate's own database, and a non-201 tears the preview down
+  # inside _preview_seed_apply (fail-loud — never a healthy-looking target
+  # that silently lacks its fixtures).
+  if [[ -n "$seed" ]]; then
+    if ! _preview_seed_apply "http://localhost:$(_preview_port)" "$seed"; then
+      exit 1
+    fi
   fi
 
   print "preview fishhawkd started (pid ${pid}, git_sha ${short_sha}) on ${paddr} — db ${preview_db}, logs: ${PREVIEW_LOG_FILE}"
@@ -3183,7 +3359,7 @@ cmd_sweep() {
 }
 
 _usage() {
-  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|post-merge [<issue>] [--start-deps]|preview [<sha-or-ref>]|preview-down|sweep [--days N] [--yes] [--dry-run]|k8s|k8s-down|down>"
+  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|post-merge [<issue>] [--start-deps]|preview <sha-or-ref> [--seed <scenario>]|preview-down|sweep [--days N] [--yes] [--dry-run]|k8s|k8s-down|down>"
   print -u2 ""
   print -u2 "  sweep removes merged-clean operator worktrees under .claude/worktrees"
   print -u2 "  (never a dirty one, never the current worktree) and prunes aged run/tmp"
