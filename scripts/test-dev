@@ -2028,6 +2028,274 @@ else
   fail "_preview_db_reset should carry the docker-exec psql fallback"
 fi
 
+# 15l. Seeded preview (E72.2 / #3326): `scripts/dev preview <ref> [--seed <name>]`.
+# _preview_parse_args is pure (argv + env → reply=(ref seed)), so drive one case
+# per named mode; the wiring into cmd_preview and the serve exec line are
+# body-greps; _preview_seed_apply is driven hermetically with a curl stub and
+# stubbed teardown helpers. Each helper call runs in a tested context so the
+# ZERR trap stays silent.
+
+# Parse table: bare ref; --seed x; --seed=x; env fallbacks for both.
+sp_ok=0
+if _preview_parse_args abc1234 2>/dev/null && [[ "${reply[1]}" == "abc1234" && "${reply[2]}" == "" ]]; then
+  pass "_preview_parse_args: bare ref → reply=(ref '')"
+else
+  fail "_preview_parse_args: bare ref should yield (abc1234 '') (got: ${(j:|:)reply})"
+fi
+if _preview_parse_args abc1234 --seed plan-gate-parked 2>/dev/null && [[ "${reply[1]}" == "abc1234" && "${reply[2]}" == "plan-gate-parked" ]]; then
+  pass "_preview_parse_args: --seed <name> (separate word)"
+else
+  fail "_preview_parse_args: --seed <name> should yield (abc1234 plan-gate-parked) (got: ${(j:|:)reply})"
+fi
+if _preview_parse_args --seed=trace-upload-target abc1234 2>/dev/null && [[ "${reply[1]}" == "abc1234" && "${reply[2]}" == "trace-upload-target" ]]; then
+  pass "_preview_parse_args: --seed=<name> form, flag before the ref"
+else
+  fail "_preview_parse_args: --seed=<name> should yield (abc1234 trace-upload-target) (got: ${(j:|:)reply})"
+fi
+if FISHHAWK_PREVIEW_SHA=envsha FISHHAWK_PREVIEW_SEED=grooming-confirm-gate _preview_parse_args 2>/dev/null \
+   && [[ "${reply[1]}" == "envsha" && "${reply[2]}" == "grooming-confirm-gate" ]]; then
+  pass "_preview_parse_args: FISHHAWK_PREVIEW_SHA + FISHHAWK_PREVIEW_SEED env fallbacks (bare invocation)"
+else
+  fail "_preview_parse_args: env fallbacks should yield (envsha grooming-confirm-gate) (got: ${(j:|:)reply})"
+fi
+if FISHHAWK_PREVIEW_SHA=envsha FISHHAWK_PREVIEW_SEED=envseed _preview_parse_args argsha --seed argseed 2>/dev/null \
+   && [[ "${reply[1]}" == "argsha" && "${reply[2]}" == "argseed" ]]; then
+  pass "_preview_parse_args: argv wins over the env fallbacks"
+else
+  fail "_preview_parse_args: argv should override env (got: ${(j:|:)reply})"
+fi
+# Refusal modes, each asserted on BOTH the exit status and the stderr text
+# (usage line + the offending word): unknown flag; --seed with no value (last
+# word); --seed= empty; a second positional; a malformed scenario name.
+sp_err="$(_preview_parse_args abc1234 --bogus 2>&1 >/dev/null)"; sp_rc=$?
+if (( sp_rc != 0 )) && [[ "$sp_err" == *"unknown flag '--bogus'"* && "$sp_err" == *"usage: scripts/dev preview <sha-or-ref> [--seed <scenario>]"* ]]; then
+  pass "_preview_parse_args: unknown flag → 1, names the flag + usage on stderr"
+else
+  fail "_preview_parse_args: unknown flag should return 1 with usage naming --bogus (rc=$sp_rc, got: $sp_err)"
+fi
+sp_err="$(_preview_parse_args abc1234 --seed 2>&1 >/dev/null)"; sp_rc=$?
+if (( sp_rc != 0 )) && [[ "$sp_err" == *"--seed requires a scenario name"* && "$sp_err" == *"usage: scripts/dev preview"* ]]; then
+  pass "_preview_parse_args: trailing --seed without a value → 1 + usage"
+else
+  fail "_preview_parse_args: --seed without a value should return 1 (rc=$sp_rc, got: $sp_err)"
+fi
+sp_err="$(_preview_parse_args abc1234 --seed= 2>&1 >/dev/null)"; sp_rc=$?
+if (( sp_rc != 0 )) && [[ "$sp_err" == *"--seed requires a scenario name"* ]]; then
+  pass "_preview_parse_args: --seed= (empty) → 1"
+else
+  fail "_preview_parse_args: --seed= should return 1 (rc=$sp_rc, got: $sp_err)"
+fi
+sp_err="$(_preview_parse_args abc1234 def5678 2>&1 >/dev/null)"; sp_rc=$?
+if (( sp_rc != 0 )) && [[ "$sp_err" == *"unexpected argument 'def5678'"* && "$sp_err" == *"usage: scripts/dev preview"* ]]; then
+  pass "_preview_parse_args: a second positional → 1 + usage"
+else
+  fail "_preview_parse_args: a second positional should return 1 (rc=$sp_rc, got: $sp_err)"
+fi
+sp_err="$(_preview_parse_args abc1234 --seed 'plan"gate' 2>&1 >/dev/null)"; sp_rc=$?
+if (( sp_rc != 0 )) && [[ "$sp_err" == *"not a catalog name"* && "$sp_err" == *"usage: scripts/dev preview"* ]]; then
+  pass "_preview_parse_args: a scenario name outside [a-z0-9-] → 1 (quote can never reach the JSON body)"
+else
+  fail "_preview_parse_args: a quoted scenario name should return 1 (rc=$sp_rc, got: $sp_err)"
+fi
+# The validator itself: the closed alphabet, empty refused.
+if _preview_seed_name_valid 'trace-upload-target' && ! _preview_seed_name_valid '' \
+   && ! _preview_seed_name_valid 'Plan-Gate' && ! _preview_seed_name_valid 'a b' && ! _preview_seed_name_valid 'a\b'; then
+  pass "_preview_seed_name_valid accepts [a-z0-9-]+ only (empty/upper/space/backslash refused)"
+else
+  fail "_preview_seed_name_valid should accept only [a-z0-9-]+"
+fi
+
+# cmd_preview wiring (body-greps, section-13b style). The parse call must be
+# the FIRST thing after the entry line — before .env is sourced — so a bad
+# flag fails on usage alone (line-order via grep -n on the function body).
+preview_body="$(typeset -f cmd_preview)"
+sp_parse_ln="$(print -r -- "$preview_body" | grep -n '_preview_parse_args' | head -n 1 | cut -d: -f1)"
+sp_env_ln="$(print -r -- "$preview_body" | grep -n 'source "${REPO_ROOT}/.env"' | head -n 1 | cut -d: -f1)"
+if [[ -n "$sp_parse_ln" && -n "$sp_env_ln" ]] && (( sp_parse_ln < sp_env_ln )); then
+  pass "cmd_preview parses argv (_preview_parse_args) BEFORE sourcing .env"
+else
+  fail "cmd_preview should call _preview_parse_args before sourcing .env (parse line ${sp_parse_ln:-none}, env line ${sp_env_ln:-none})"
+fi
+# DONE-MEANS for the env wiring: FISHHAWKD_DEV_FIXTURES=1 rides on the SERVE
+# exec line (the one carrying FISHHAWKD_ADDR and `serve`), and NOT on migrate.
+sp_serve_line="$(print -r -- "$preview_body" | grep -F '"$pbin" serve' | head -n 1)"
+if [[ "$sp_serve_line" == *'FISHHAWKD_DEV_FIXTURES=1'* && "$sp_serve_line" == *'FISHHAWKD_ADDR=$paddr'* ]]; then
+  pass "cmd_preview passes FISHHAWKD_DEV_FIXTURES=1 on the preview serve exec line"
+else
+  fail "cmd_preview should carry FISHHAWKD_DEV_FIXTURES=1 on the serve exec line (got: $sp_serve_line)"
+fi
+sp_migrate_line="$(print -r -- "$preview_body" | grep -F '"$pbin" migrate up' | head -n 1)"
+if [[ -n "$sp_migrate_line" && "$sp_migrate_line" != *'FISHHAWKD_DEV_FIXTURES'* ]]; then
+  pass "cmd_preview does NOT pass FISHHAWKD_DEV_FIXTURES on the migrate line"
+else
+  fail "cmd_preview migrate line should not carry FISHHAWKD_DEV_FIXTURES (got: $sp_migrate_line)"
+fi
+# The serve line still runs under the credential-stripped prefix (regression
+# guard: the new var must be appended AFTER "${reply[@]}", not replace it).
+if [[ "$sp_serve_line" == *'"${reply[@]}"'* ]]; then
+  pass "cmd_preview serve line keeps the env -i credential-stripped prefix"
+else
+  fail "cmd_preview serve line must keep the \"\${reply[@]}\" prefix (got: $sp_serve_line)"
+fi
+# Line order: the seed POST happens AFTER the healthz identity gate.
+sp_healthz_ln="$(print -r -- "$preview_body" | grep -n '_await_preview_healthz' | head -n 1 | cut -d: -f1)"
+sp_seed_ln="$(print -r -- "$preview_body" | grep -n '_preview_seed_apply' | head -n 1 | cut -d: -f1)"
+if [[ -n "$sp_healthz_ln" && -n "$sp_seed_ln" ]] && (( sp_seed_ln > sp_healthz_ln )); then
+  pass "cmd_preview invokes _preview_seed_apply AFTER _await_preview_healthz"
+else
+  fail "cmd_preview should seed after the healthz gate (healthz line ${sp_healthz_ln:-none}, seed line ${sp_seed_ln:-none})"
+fi
+# The .env-only fallback: the exact re-apply assignment must sit AFTER the
+# .env source line (a bare name grep would be satisfied by the _die message).
+sp_seedenv_ln="$(print -r -- "$preview_body" | grep -nF 'seed="${FISHHAWK_PREVIEW_SEED:-}"' | head -n 1 | cut -d: -f1)"
+sp_shaenv_ln="$(print -r -- "$preview_body" | grep -nF 'ref="${FISHHAWK_PREVIEW_SHA:-}"' | head -n 1 | cut -d: -f1)"
+if [[ -n "$sp_seedenv_ln" && -n "$sp_shaenv_ln" && -n "$sp_env_ln" ]] && (( sp_seedenv_ln > sp_env_ln )) && (( sp_shaenv_ln > sp_env_ln )); then
+  pass "cmd_preview re-applies the FISHHAWK_PREVIEW_SHA/_SEED fallbacks AFTER .env lands"
+else
+  fail "cmd_preview should re-apply both env fallbacks after sourcing .env (seed line ${sp_seedenv_ln:-none}, sha line ${sp_shaenv_ln:-none}, env line ${sp_env_ln:-none})"
+fi
+if grep -F 'usage: scripts/dev <up' "${REPO_ROOT}/scripts/dev" | grep -qF 'preview <sha-or-ref> [--seed <scenario>]'; then
+  pass "scripts/dev top-level usage names preview <sha-or-ref> [--seed <scenario>]"
+else
+  fail "scripts/dev top-level usage should name the --seed flag"
+fi
+
+# _preview_seed_render: the operator-legible rendering (condition 1) — the
+# scenario name, each run key with its run id, each stage key with its id.
+sp_body='{"scenario":"trace-upload-target","runs":{"target-run":{"run_id":"11111111-1111-1111-1111-111111111111","stages":{"implement":"22222222-2222-2222-2222-222222222222","plan":"33333333-3333-3333-3333-333333333333"}},"second":{"run_id":"44444444-4444-4444-4444-444444444444","stages":{}}}}'
+sp_out="$(_preview_seed_render "$sp_body")"
+if [[ "$sp_out" == *"seeded scenario trace-upload-target"* \
+   && "$sp_out" == *"run target-run: 11111111-1111-1111-1111-111111111111"* \
+   && "$sp_out" == *"stage implement: 22222222-2222-2222-2222-222222222222"* \
+   && "$sp_out" == *"stage plan: 33333333-3333-3333-3333-333333333333"* \
+   && "$sp_out" == *"run second: 44444444-4444-4444-4444-444444444444"* ]]; then
+  pass "_preview_seed_render prints scenario, each run key+id, each stage key+id"
+else
+  fail "_preview_seed_render should render every run and stage (got: $sp_out)"
+fi
+if [[ "$sp_out" != *'"run_id"'* ]]; then
+  pass "_preview_seed_render is not a raw JSON dump"
+else
+  fail "_preview_seed_render must not echo raw JSON on the happy path (got: $sp_out)"
+fi
+sp_out="$(_preview_seed_render '{"unexpected":true}')"
+if [[ "$sp_out" == *"no runs recognized"* && "$sp_out" == *'{"unexpected":true}'* ]]; then
+  pass "_preview_seed_render echoes an unrecognized body verbatim under a warning (evidence never dropped)"
+else
+  fail "_preview_seed_render should warn + echo an unrecognized body (got: $sp_out)"
+fi
+
+# _preview_seed_apply driven with a curl stub (FIRST on PATH) that writes
+# $SEED_BODY to the -o target and prints $SEED_STATUS as the -w code, plus
+# stubbed teardown helpers that record their invocation. Run in a subshell so
+# the stubs never leak into later sections.
+sp_wd="$(mktemp -d -t test-dev-seed.XXXXXX)"
+mkdir -p "$sp_wd/bin"
+cat > "$sp_wd/bin/curl" <<EOS
+#!/bin/sh
+printf '%s\\n' "\$*" >> "$sp_wd/curl.argv"
+out=""; prev=""
+for a in "\$@"; do if [ "\$prev" = "-o" ]; then out="\$a"; fi; prev="\$a"; done
+printf '%s' "\$SEED_BODY" > "\$out"
+printf '%s' "\$SEED_STATUS"
+EOS
+chmod +x "$sp_wd/bin/curl"
+# Every subshell points TMPDIR at a fixture dir so the no-litter assertion at
+# the end is hermetic (_preview_seed_apply templates under ${TMPDIR:-/tmp}).
+mkdir -p "$sp_wd/tmp"
+# 201 path: exit 0, ids printed, NO teardown.
+(
+  _preview_kill_tracked() { print "kill_tracked $1" >> "$sp_wd/teardown" }
+  _preview_remove_worktree() { print "remove_worktree $1" >> "$sp_wd/teardown" }
+  PREVIEW_PID_FILE="$sp_wd/preview.pid"; PREVIEW_WORKTREE="$sp_wd/wt"
+  export TMPDIR="$sp_wd/tmp"
+  export SEED_STATUS=201
+  export SEED_BODY='{"scenario":"plan-gate-parked","runs":{"parked":{"run_id":"aaaaaaaa-0000-0000-0000-000000000001","stages":{"plan":"bbbbbbbb-0000-0000-0000-000000000002"}}}}'
+  PATH="$sp_wd/bin:$PATH" _preview_seed_apply http://localhost:8090 plan-gate-parked > "$sp_wd/out" 2> "$sp_wd/err"
+  print $? > "$sp_wd/rc"
+)
+if [[ "$(cat "$sp_wd/rc")" == "0" ]] && grep -q 'run parked: aaaaaaaa-0000-0000-0000-000000000001' "$sp_wd/out" && grep -q 'stage plan: bbbbbbbb-0000-0000-0000-000000000002' "$sp_wd/out"; then
+  pass "_preview_seed_apply 201 → exit 0 and the run/stage ids are printed"
+else
+  fail "_preview_seed_apply 201 should exit 0 printing ids (rc=$(cat "$sp_wd/rc"), out: $(cat "$sp_wd/out"))"
+fi
+if [[ ! -f "$sp_wd/teardown" ]]; then
+  pass "_preview_seed_apply 201 path does NOT tear the preview down"
+else
+  fail "_preview_seed_apply 201 path must not invoke teardown (got: $(cat "$sp_wd/teardown"))"
+fi
+sp_argv="$(cat "$sp_wd/curl.argv" 2>/dev/null)"
+if [[ "$sp_argv" == *'-X POST http://localhost:8090/v0/dev/fixtures'* && "$sp_argv" == *'{"scenario":"plan-gate-parked"}'* && "$sp_argv" == *'Content-Type: application/json'* ]]; then
+  pass "_preview_seed_apply POSTs {\"scenario\":<name>} as JSON to <base>/v0/dev/fixtures"
+else
+  fail "_preview_seed_apply should POST the scenario JSON to /v0/dev/fixtures (got: $sp_argv)"
+fi
+# 404 path: exit 1, response body on stderr, BOTH teardown helpers invoked.
+rm -f "$sp_wd/teardown" "$sp_wd/curl.argv"
+(
+  _preview_kill_tracked() { print "kill_tracked $1" >> "$sp_wd/teardown" }
+  _preview_remove_worktree() { print "remove_worktree $1" >> "$sp_wd/teardown" }
+  PREVIEW_PID_FILE="$sp_wd/preview.pid"; PREVIEW_WORKTREE="$sp_wd/wt"
+  export TMPDIR="$sp_wd/tmp"
+  export SEED_STATUS=404
+  export SEED_BODY='{"error":"fixture_scenario_unknown","details":{"known":["grooming-confirm-gate"]}}'
+  PATH="$sp_wd/bin:$PATH" _preview_seed_apply http://localhost:8090 not-a-scenario > "$sp_wd/out" 2> "$sp_wd/err"
+  print $? > "$sp_wd/rc"
+)
+if [[ "$(cat "$sp_wd/rc")" != "0" ]]; then
+  pass "_preview_seed_apply 404 → non-zero"
+else
+  fail "_preview_seed_apply 404 should return non-zero"
+fi
+if grep -q 'fixture_scenario_unknown' "$sp_wd/err" && grep -q 'HTTP 404' "$sp_wd/err"; then
+  pass "_preview_seed_apply 404 prints the response body + status to stderr"
+else
+  fail "_preview_seed_apply 404 should print the body and status on stderr (got: $(cat "$sp_wd/err"))"
+fi
+if grep -q "kill_tracked $sp_wd/preview.pid" "$sp_wd/teardown" 2>/dev/null && grep -q "remove_worktree $sp_wd/wt" "$sp_wd/teardown" 2>/dev/null; then
+  pass "_preview_seed_apply 404 tears the preview down (_preview_kill_tracked + _preview_remove_worktree with the tracked paths)"
+else
+  fail "_preview_seed_apply 404 should invoke both teardown helpers (got: $(cat "$sp_wd/teardown" 2>/dev/null))"
+fi
+# Transport failure (curl non-zero, no status): same fail-loud + teardown.
+rm -f "$sp_wd/teardown"
+print '#!/bin/sh\necho "curl: (7) Failed to connect" >&2\nexit 7\n' > "$sp_wd/bin/curl"; chmod +x "$sp_wd/bin/curl"
+(
+  _preview_kill_tracked() { print "kill_tracked $1" >> "$sp_wd/teardown" }
+  _preview_remove_worktree() { print "remove_worktree $1" >> "$sp_wd/teardown" }
+  PREVIEW_PID_FILE="$sp_wd/preview.pid"; PREVIEW_WORKTREE="$sp_wd/wt"
+  export TMPDIR="$sp_wd/tmp"
+  PATH="$sp_wd/bin:$PATH" _preview_seed_apply http://localhost:8090 plan-gate-parked > "$sp_wd/out" 2> "$sp_wd/err"
+  print $? > "$sp_wd/rc"
+)
+if [[ "$(cat "$sp_wd/rc")" != "0" ]] && grep -q 'Failed to connect' "$sp_wd/err" && grep -q 'curl exit 7' "$sp_wd/err" && grep -q 'kill_tracked' "$sp_wd/teardown" 2>/dev/null; then
+  pass "_preview_seed_apply transport failure → non-zero, curl error on stderr, teardown"
+else
+  fail "_preview_seed_apply transport failure should fail loud + tear down (rc=$(cat "$sp_wd/rc"), err: $(cat "$sp_wd/err"))"
+fi
+# Malformed name at the apply seam: refused BEFORE curl runs (no argv captured),
+# teardown invoked.
+rm -f "$sp_wd/teardown" "$sp_wd/curl.argv"
+(
+  _preview_kill_tracked() { print "kill_tracked $1" >> "$sp_wd/teardown" }
+  _preview_remove_worktree() { print "remove_worktree $1" >> "$sp_wd/teardown" }
+  PREVIEW_PID_FILE="$sp_wd/preview.pid"; PREVIEW_WORKTREE="$sp_wd/wt"
+  export TMPDIR="$sp_wd/tmp"
+  PATH="$sp_wd/bin:$PATH" _preview_seed_apply http://localhost:8090 'plan"gate' > "$sp_wd/out" 2> "$sp_wd/err"
+  print $? > "$sp_wd/rc"
+)
+if [[ "$(cat "$sp_wd/rc")" != "0" ]] && grep -q 'not a catalog name' "$sp_wd/err" && [[ ! -f "$sp_wd/curl.argv" ]] && grep -q 'kill_tracked' "$sp_wd/teardown" 2>/dev/null; then
+  pass "_preview_seed_apply refuses a malformed name before any request + tears down"
+else
+  fail "_preview_seed_apply should refuse a malformed name without curling (rc=$(cat "$sp_wd/rc"), err: $(cat "$sp_wd/err"))"
+fi
+if [[ -z "$(ls -A "$sp_wd/tmp")" ]]; then
+  pass "_preview_seed_apply leaves no temp files behind on any path (201/404/transport/malformed)"
+else
+  fail "_preview_seed_apply left temp files behind: $(ls -A "$sp_wd/tmp")"
+fi
+rm -rf "$sp_wd"
+
 # 15i. _preview_role_setup body-greps (E31.19 / #1577): least-privilege role
 # provisioning + dev-DB CONNECT denial. Pins the binding approval conditions.
 role_setup_body="$(typeset -f _preview_role_setup)"
