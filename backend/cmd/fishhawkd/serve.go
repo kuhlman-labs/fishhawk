@@ -40,6 +40,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures"
 	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -1485,7 +1486,14 @@ func runServe(args []string, logSink io.Writer) int {
 		envOr("FISHHAWKD_GITLAB_WEBHOOK_SECRET", ""),
 		"secret token GitLab sends VERBATIM in X-Gitlab-Token (no HMAC); when empty, /webhooks/gitlab responds 503")
 	s3Bucket := fs.String("s3-bucket", envOr("FISHHAWKD_S3_BUCKET", ""),
-		"S3 bucket for trace bundle storage; when empty, /v0/runs/{id}/trace responds 503")
+		"S3 bucket for trace bundle storage; when empty, /v0/runs/{id}/trace responds 503 "+
+			"(unless --dev-fixtures selects the in-memory dev store)")
+	devFixtures := fs.Bool("dev-fixtures", envOrBool("FISHHAWKD_DEV_FIXTURES", false),
+		"DEV ONLY (E72.2 / #3326): register the loopback-only seeded-fixture routes "+
+			"(GET/POST /v0/dev/fixtures, POST /v0/dev/sign) so an acceptance preview can materialize "+
+			"named scenarios; requires --db (without one the surface stays off). With --s3-bucket unset "+
+			"it also selects an in-memory trace store so /v0/runs/{id}/trace is drivable (#1874). "+
+			"Never enable in production")
 	s3Region := fs.String("s3-region", envOr("FISHHAWKD_S3_REGION", "us-east-1"),
 		"AWS region for the trace bundle bucket")
 	s3Endpoint := fs.String("s3-endpoint", envOr("FISHHAWKD_S3_ENDPOINT", ""),
@@ -2125,6 +2133,20 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.AuditRepo = audit.NewPostgresRepository(pool)
 		cfg.ApprovalRepo = approval.NewPostgresRepository(pool)
 		cfg.ArtifactRepo = artifact.NewPostgresRepository(pool)
+		// Dev-only seeded-fixture applier (E72.2 / #3326). Bound to the
+		// Postgres repositories just wired — cfg.RunRepo is the concrete
+		// run.Repository, which satisfies devfixtures.RunStore directly.
+		// Non-nil Config.DevFixtures is what REGISTERS the /v0/dev routes.
+		if *devFixtures {
+			cfg.DevFixtures = devfixtures.NewApplier(devfixtures.Deps{
+				Runs:      cfg.RunRepo,
+				Artifacts: cfg.ArtifactRepo,
+				Audit:     cfg.AuditRepo,
+				Approvals: cfg.ApprovalRepo,
+				Now:       time.Now,
+			})
+			logger.Warn("dev fixtures surface ENABLED: GET/POST /v0/dev/fixtures and POST /v0/dev/sign are registered (dev-only, loopback-only peers)")
+		}
 		cfg.StageCheckRepo = stagecheck.NewPostgresRepository(pool)
 		cfg.APITokenRepo = apitoken.NewPostgresRepository(pool)
 		cfg.MCPTokenRepo = mcptoken.NewPostgresRepository(pool)
@@ -2233,8 +2255,23 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.String("bucket", *s3Bucket),
 			slog.String("region", *s3Region),
 			slog.String("endpoint", *s3Endpoint))
+	} else if resolved, selected := resolveDevTraceStore(*devFixtures, *s3Bucket, cfg.TraceStore); selected {
+		// Dev-fixtures trace store (E72.2 / #3326, closing #1874): under the
+		// dev flag with no bucket, an in-memory store stands in so the
+		// preview's POST /v0/runs/{id}/trace → recordCost → spend / unpriced
+		// alerts are drivable end to end. A configured bucket always wins
+		// (the branch above), and the 503 warning below is reserved for the
+		// case where NEITHER store is selected. Gated on `selected`, not on
+		// a non-nil return: the helper's passthrough arm hands back an
+		// already-wired store unchanged, and this line must only ever claim
+		// a store this branch actually minted.
+		cfg.TraceStore = resolved
+		logger.Info("trace store: in-memory (dev fixtures)")
 	} else {
 		logger.Warn("FISHHAWKD_S3_BUCKET not set; /v0/runs/{id}/trace will respond 503")
+	}
+	if *devFixtures && cfg.DevFixtures == nil {
+		logger.Warn("dev fixtures requested but no database configured; surface stays off")
 	}
 
 	// Webhook receiver wiring. Secret + delivery store both need
@@ -3713,6 +3750,20 @@ func parseInstallationHostAllowlist(raw string) []string {
 		out = append(out, entry)
 	}
 	return out
+}
+
+// resolveDevTraceStore picks the trace store the dev-fixtures flag implies
+// (E72.2 / #3326): tracestore.NewMem() with selected=true iff the flag is on,
+// no S3 bucket is configured, and nothing else already wired a store;
+// otherwise current is returned unchanged with selected=false. The boolean is
+// what the boot log keys on — a non-nil return alone cannot distinguish a
+// freshly minted dev store from a passthrough of an already-wired one. Pure
+// so serve_test can table it without booting.
+func resolveDevTraceStore(devFixtures bool, s3Bucket string, current tracestore.Storage) (resolved tracestore.Storage, selected bool) {
+	if devFixtures && s3Bucket == "" && current == nil {
+		return tracestore.NewMem(), true
+	}
+	return current, false
 }
 
 // envOrBool resolves a boolean env var via strconv.ParseBool so the operator-

@@ -1078,6 +1078,91 @@ the call-site wiring (the `if !` degrade-not-abort wrapper, the
 real client flags are unproven until a live delivery — a stub accepts any
 argv — so flag correctness is a live-validation matter.
 
+## Seeded acceptance preview (E72.2 / [#3326](https://github.com/kuhlman-labs/fishhawk/issues/3326))
+
+`scripts/dev preview <sha-or-ref> [--seed <scenario>]` builds and serves
+the merge candidate as before and, with `--seed`, materializes a named
+fixture scenario into the freshly provisioned target through the preview
+binary's dev-only, loopback-only `POST /v0/dev/fixtures`. The catalog of
+scenario names (`grooming-confirm-gate`, `plan-gate-parked`,
+`trace-upload-target`) lives in `backend/internal/devfixtures` and is
+listed by `GET /v0/dev/fixtures`; the target-side contract is in
+`docs/acceptance-preview.md`.
+
+### Invocation
+
+- `--seed <scenario>` or `--seed=<scenario>`; env fallback
+  `FISHHAWK_PREVIEW_SEED` (argv wins). The positional ref keeps its
+  `FISHHAWK_PREVIEW_SHA` fallback so the runner's provisioning hook can
+  still invoke the command bare — a bare hook invocation seeds nothing.
+- Scenario names are catalog names, `[a-z0-9-]+`. Anything else is
+  refused up front (usage + exit 1) rather than escaped, so a quote or
+  backslash can never reach the JSON body `{"scenario":"<name>"}`.
+- `_preview_parse_args` runs FIRST in `cmd_preview` — before `.env` is
+  sourced and before any DB work — so an unknown flag, a second
+  positional, a `--seed` without a value, or a malformed name fails on
+  usage alone. The `FISHHAWK_PREVIEW_SHA` / `_SEED` fallbacks are
+  re-applied after `.env` lands, because those overrides may live only
+  there.
+
+### What the serve line carries
+
+`cmd_preview` appends `FISHHAWKD_DEV_FIXTURES=1` to the preview **serve**
+exec line (still under the `env -i` credential-stripped prefix from
+`_preview_branch_env`; the `migrate up` line does not carry it). Under
+that flag the preview binary registers `GET`/`POST /v0/dev/fixtures` and
+`POST /v0/dev/sign`, refuses them to any non-loopback peer, and — with no
+`FISHHAWKD_S3_BUCKET` — serves an in-memory trace store so the seeded
+target takes `POST /v0/runs/{id}/trace` (closing
+[#1874](https://github.com/kuhlman-labs/fishhawk/issues/1874)). The flag
+is on unconditionally, `--seed` or not: it is what makes a preview a
+seedable target, and an unseeded preview with the surface registered is
+still loopback-only and dev-only.
+
+### Fail-loud contract (`_preview_seed_apply`)
+
+The seed POST runs only AFTER `_await_preview_healthz` has proven the
+listener is the merge candidate (git_sha-gated), so the scenario lands in
+the candidate's own `_preview` database. On HTTP 201 the response is
+rendered by `_preview_seed_render` as operator-legible lines — the
+scenario name, each run key with its run id, each stage key with its
+stage id — never a raw JSON dump (an unrecognized 201 body is echoed
+verbatim under a warning so evidence is never dropped):
+
+```
+preview: seeded scenario trace-upload-target
+  run target-run: 6f1c…
+    stage plan: 9b2e…
+```
+
+ANY other outcome — a non-201 status (404: unknown scenario, or a
+preview binary predating the surface; 403: non-loopback peer; 500: apply
+failure) or a curl transport failure — prints the response body (or
+curl's error) to stderr, tears the preview down
+(`_preview_kill_tracked` + `_preview_remove_worktree`, so a
+half-provisioned target never lingers looking healthy), and
+`cmd_preview` exits 1. A malformed name reaching the apply seam takes the
+same teardown. No temp file survives any path.
+
+### Testing
+
+`scripts/test-dev` §15l pins: the `_preview_parse_args` table (bare ref,
+`--seed x`, `--seed=x`, both env fallbacks, argv-over-env) and one case
+per refusal mode (unknown flag, trailing `--seed`, `--seed=`, second
+positional, malformed name — each asserted on exit status AND the usage
+line on stderr); the `_preview_seed_name_valid` alphabet; body/line-order
+greps on `cmd_preview` (parse before `.env`, `FISHHAWKD_DEV_FIXTURES=1`
+on the serve line and NOT the migrate line, the `env -i` prefix kept,
+`_preview_seed_apply` after `_await_preview_healthz`); the renderer on a
+two-run body and on an unrecognized body; and `_preview_seed_apply`
+driven with a stub `curl` first on `PATH` plus stubbed teardown helpers
+through the 201 path (exit 0, ids printed, no teardown, the exact POST
+argv), the 404 path (non-zero, body + status on stderr, both teardown
+helpers invoked with the tracked paths), a transport failure, the
+malformed-name seam (no request made), and a hermetic no-temp-litter
+check under a fixture `TMPDIR`. Every control was deleted → RED →
+restored (record in the PR notes for #3326).
+
 ## Docs-site voice gate (E12.1 / [#2261](https://github.com/kuhlman-labs/fishhawk/issues/2261))
 
 `docs/BRAND_FOUNDATIONS.md` §5 ("Things we never say") bans a specific

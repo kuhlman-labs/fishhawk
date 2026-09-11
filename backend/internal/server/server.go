@@ -112,6 +112,13 @@ type Config struct {
 	// by the /v0/runs/{id}/trace handler; nil leaves it 503.
 	TraceStore tracestore.Storage
 
+	// DevFixtures is the dev-only seeded-fixture applier (E72.2 / #3326).
+	// Non-nil REGISTERS GET/POST /v0/dev/fixtures and POST /v0/dev/sign
+	// (loopback-only); nil leaves the surface absent — the mux never
+	// learns the paths. Wired by fishhawkd --dev-fixtures with a database;
+	// never set in production. Contract: devfixtures.go.
+	DevFixtures DevFixtureApplier
+
 	// AuditRepo writes the audit log entries that pair with every
 	// state change. Wired by the trace-upload handler; nil leaves
 	// it 503.

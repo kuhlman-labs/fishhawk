@@ -128,6 +128,16 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/work-items", s.handleFileWorkItem)
 	mux.HandleFunc("GET /v0/calibration", s.handleGetCalibration)
 	mux.HandleFunc("GET /v0/acceptance-triage/stats", s.handleGetAcceptanceTriageStats)
+	// Dev-only seeded-fixture surface (E72.2 / #3326): registered ONLY
+	// when a DevFixtures applier is configured, so a production server
+	// answers the router's 404 on every path. Each route is loopback-only.
+	// No csrfExemptPath entry: the routes are called credential-less and
+	// the csrf middleware passes a session-less identity (devfixtures.go).
+	if s.cfg.DevFixtures != nil {
+		mux.HandleFunc("GET /v0/dev/fixtures", s.devLoopbackOnly(s.handleDevListFixtures))
+		mux.HandleFunc("POST /v0/dev/fixtures", s.devLoopbackOnly(s.handleDevApplyFixture))
+		mux.HandleFunc("POST /v0/dev/sign", s.devLoopbackOnly(s.handleDevSign))
+	}
 	mux.HandleFunc("POST /v0/runs/{run_id}/signing-key", s.requireRunAccount(adminWrite, s.handleIssueSigningKey))
 	mux.HandleFunc("POST /v0/runs/{run_id}/trace", s.requireRunAccount(memberWrite, s.handleShipTrace))
 	mux.HandleFunc("POST /v0/runs/{run_id}/plan", s.requireRunAccount(memberWrite, s.handleShipPlan))

@@ -8,8 +8,10 @@ import (
 
 // acceptance_check.go holds the pure, deterministic acceptance-criteria rule
 // set (#1596, E34.5 / ADR-052). It lives in the plan package — which already
-// owns Verification/AcceptanceCriterion and imports no project packages — so it
-// is the SINGLE source both the server's plan-gate pre-check
+// owns Verification/AcceptanceCriterion and imports no project package (the
+// E72.2 / #3326 seeded-scenario NAMES are the closed set seedScenarioNames
+// below, carried inline so the plan package stays a leaf and can never form a
+// cycle with the packages that import it) — so it is the SINGLE source both the server's plan-gate pre-check
 // (runAcceptancePrecheck) and the refinement intake pre-check
 // (refinement.EvaluateDraftCriteria) dispatch through. Keeping the rules here
 // means there is no second copy to drift: a rule added to the set applies to
@@ -44,9 +46,11 @@ const (
 	// criterion up front. For a genuinely undecidable capability that means
 	// skip_expected + expectation_basis (or requires_live_validation); but for
 	// a hermetic in-process check of an external TRIGGER the correct fix is to
-	// NAME its in-repository harness in verify_hint (#3163), which suppresses
-	// the finding rather than skipping a check the executor could actually
-	// perform. See UnevaluableCriteria for the conjunctive suppression.
+	// NAME its in-repository harness in verify_hint (#3163) — or, for state
+	// the acceptance preview can seed, the seeded-scenario CATALOG NAME
+	// (E72.2 / #3326) — which suppresses the finding rather than skipping a
+	// check the executor could actually perform. See UnevaluableCriteria for
+	// the conjunctive suppression.
 	RuleUndecidableCriterion = "undecidable_criterion"
 	// RuleMissingLiveValidationMarker flags a criterion whose STATEMENT names a
 	// LIVE forge/deploy/external TARGET but which is NOT marked
@@ -165,9 +169,13 @@ const (
 //     repository-local harness: a hermetic in-process test genuinely CAN drive
 //     an external TRIGGER (an MCP client, an operator session, a webhook
 //     delivery), so a named harness is positive evidence the executor can
-//     decide the criterion. A liveTarget capability (a live forge/deploy/
-//     external instance) is never exempted this way — no in-repository harness
-//     stands one up (#2845 preserved). Advisory only.
+//     decide the criterion. As of E72.2 / #3326 the same non-liveTarget
+//     exemption is ALSO earned by a verify_hint carrying a KNOWN seeded-
+//     scenario catalog name as a whole token (verifyHintNamesSeedScenario —
+//     the acceptance preview's dev-only fixture surface materializes that
+//     scenario for the sandbox). A liveTarget capability (a live forge/deploy/
+//     external instance) is never exempted either way — no in-repository
+//     harness or seeded scenario stands one up (#2845 preserved). Advisory only.
 //   - missing_live_validation_marker — a criterion whose statement names a LIVE
 //     forge/deploy/external TARGET and which is NOT marked
 //     requires_live_validation. Its exemption is that marker ALONE:
@@ -308,7 +316,7 @@ func AcceptanceSkippableOutOfScope(v Verification) bool {
 // the no-trace short-circuited stage from the trace-required rule. Defining the
 // key and its sole legal value ONCE here — the plan package is imported by both
 // backend/internal/orchestrator and backend/internal/auditcomplete and imports
-// no project packages, so there is no import cycle — makes a producer/consumer
+// nothing from the repo, so there is no import cycle — makes a producer/consumer
 // payload-shape drift a compile error rather than a silent runtime miss. The
 // emit helper, the auditcomplete reader, and both packages' tests all reference
 // these constants instead of free-typed strings.
@@ -346,7 +354,7 @@ const (
 // short-circuit. That keeps it unforgeable by a validator and keeps an existing
 // recorded `passed` verdict at its exact prior meaning (no migration).
 //
-// Defining them HERE — the plan package imports no project packages and is
+// Defining them HERE — the plan package imports nothing from the repo and is
 // already imported by orchestrator, server, and auditcomplete — makes a
 // producer/consumer drift a compile error rather than a silent runtime miss.
 const (
@@ -442,7 +450,7 @@ func LiveValidationCriteria(v Verification) []AcceptanceCriterion {
 
 // Undecidable acceptance vocabulary (#2512, E48.78 layer 4). These three
 // constants name the third acceptance disposition, and they exist here — in the
-// plan package, which imports no project packages and is already imported by
+// plan package, which imports nothing from the repo and is already imported by
 // server, orchestrator and auditcomplete — so a producer/consumer drift is a
 // COMPILE error rather than a silent runtime miss, exactly as #2347 did for
 // not_validated.
@@ -595,6 +603,12 @@ var unevaluableCapabilities = []unevaluableCapability{
 //   - verifyHintDeclaresInRepo reads verify_hint ALONE — positive evidence the
 //     sandboxed executor CAN decide the criterion (buildAcceptance's Posture B
 //     sanctions repository-local validation on exactly that signal).
+//   - verifyHintNamesSeedScenario (E72.2 / #3326) is OR-ed with it under the
+//     SAME !liveTarget conjunct: a verify_hint naming a known seeded-scenario
+//     catalog name is positive evidence the sandbox can materialize the state
+//     the criterion needs (buildAcceptance's "Seeded fixtures" section), so an
+//     external-TRIGGER match whose hint says which scenario to seed is
+//     sandbox-decidable. The disjunct never widens the liveTarget classes.
 //
 // The suppression uses `continue`, NOT `break`: a suppressed non-liveTarget
 // match must not stop the scan, so a LATER liveTarget capability in the SAME
@@ -616,9 +630,11 @@ func UnevaluableCriteria(v Verification) []AcceptanceFinding {
 				continue
 			}
 			// #3163: a non-liveTarget capability whose verify_hint names an
-			// in-repository harness is sandbox-decidable. continue (not break)
-			// so a later liveTarget capability in the same statement still fires.
-			if !uc.liveTarget && verifyHintDeclaresInRepo(c) {
+			// in-repository harness is sandbox-decidable; E72.2 / #3326 extends
+			// the same conjunct to a hint naming a known seeded scenario.
+			// continue (not break) so a later liveTarget capability in the same
+			// statement still fires.
+			if !uc.liveTarget && (verifyHintDeclaresInRepo(c) || verifyHintNamesSeedScenario(c)) {
 				continue
 			}
 			detail := "criterion statement requires " + uc.capability +
@@ -1108,6 +1124,47 @@ func verifyHintDeclaresInRepo(c AcceptanceCriterion) bool {
 	hint := strings.ToLower(c.VerifyHint)
 	return containsAnyPhrase(hint, inRepoVerificationMarkers) ||
 		containsAnyPhrase(hint, verifyHintHarnessMarkers)
+}
+
+// verifyHintNamesSeedScenario is the E72.2 / #3326 evidence predicate, the
+// sibling of verifyHintDeclaresInRepo under the same !liveTarget conjunct in
+// UnevaluableCriteria: the criterion's verify_hint — and ONLY verify_hint, for
+// the same two reasons that predicate states — carries a KNOWN seeded-scenario
+// catalog name as a WHOLE token. The acceptance preview's dev-only fixture
+// surface (POST /v0/dev/fixtures) materializes that scenario, so a hint that
+// names one is positive evidence the sandbox can produce the state the
+// criterion needs.
+//
+// The membership test IS seedScenarioNames membership over acceptanceTokens: there is
+// deliberately no generic "seed" branch and no route-substring branch, so a
+// hint that merely says "seed the run" or mentions POST /v0/dev/fixtures with
+// an unknown name earns nothing. Tokenization is the shared acceptanceTokens
+// (whitespace split, surrounding punctuation trimmed, interior hyphens kept),
+// so "plan-gate-parked," matches while "plan-gate-parked-v2", "xgrooming-
+// confirm-gate" and "seedling" stay single non-matching tokens. Lowercased
+// first because every catalog name is lowercase and the lookup is case-sensitive.
+func verifyHintNamesSeedScenario(c AcceptanceCriterion) bool {
+	for _, tok := range acceptanceTokens(strings.ToLower(c.VerifyHint)) {
+		if seedScenarioNames[tok] {
+			return true
+		}
+	}
+	return false
+}
+
+// seedScenarioNames is the closed set of seeded-scenario names the acceptance
+// preview's dev-only POST /v0/dev/fixtures route can materialize (E72.2 /
+// #3326). It is the catalog verifyHintNamesSeedScenario tests membership
+// against; adding a scenario to the dev fixture surface means adding its name
+// here, or a hint naming it earns nothing. Carried inline (not imported) so
+// this package's production import graph stays free of repo packages;
+// TestSeedScenarioNamesMatchCatalog binds it to devfixtures/catalog.Names()
+// in both directions through a test-only import, so a name added on either
+// side without the other fails in-loop.
+var seedScenarioNames = map[string]bool{
+	"grooming-confirm-gate": true,
+	"plan-gate-parked":      true,
+	"trace-upload-target":   true,
 }
 
 // liveTargetCorpusMatch is M1: the statement names a live TARGET via a phrase

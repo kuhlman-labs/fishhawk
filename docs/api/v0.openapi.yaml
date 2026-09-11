@@ -17305,6 +17305,179 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  # ---------------------------------------------------------------------
+  # Dev-only seeded-fixture surface (E72.2 / #3326, closing #1874).
+  # Registered ONLY when fishhawkd runs with --dev-fixtures /
+  # FISHHAWKD_DEV_FIXTURES=1 and a database; otherwise every path below is
+  # the router's 404 (not a 503 — a production server never advertises
+  # that a fixture-minting route could exist). Every route refuses a
+  # non-loopback peer with 403 dev_surface_loopback_only. Credential-less:
+  # no cookie, no bearer, and no CSRF token — the csrf middleware passes a
+  # session-less identity, so no exemption entry exists.
+  # ---------------------------------------------------------------------
+  /v0/dev/fixtures:
+    get:
+      operationId: listDevFixtures
+      summary: List the seeded fixture scenarios (dev only)
+      description: |
+        Renders the closed catalog of fixture scenarios in sorted-name
+        order with a one-line description of each. Registered only under
+        `FISHHAWKD_DEV_FIXTURES=1`; a 404 here means the target was NOT
+        provisioned with the surface, which an acceptance agent reads as
+        "mark seeded criteria skipped (Posture A), never failed".
+        Loopback peers only.
+      tags: [dev]
+      security: []
+      responses:
+        '200':
+          description: The catalog.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [scenarios]
+                properties:
+                  scenarios:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, description]
+                      properties:
+                        name:
+                          type: string
+                          description: Catalog name, e.g. `plan-gate-parked`.
+                        description:
+                          type: string
+        '403':
+          description: '`dev_surface_loopback_only` — the peer is not a loopback address (or `RemoteAddr` is unparseable).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: The surface is not registered (server not started with `--dev-fixtures`).
+    post:
+      operationId: applyDevFixture
+      summary: Materialize a seeded fixture scenario (dev only)
+      description: |
+        Applies one named scenario through the run / artifact / audit /
+        approval repositories and returns the ids it minted. EVERY call
+        mints FRESH rows — read the returned ids rather than assuming
+        stable ones. The `trace-upload-target` scenario carries a
+        four-row backdated `cost_recorded` spend baseline (aged 1h5m, 2h,
+        3h, 4h from apply time), so seed and upload contiguously: the
+        baseline ages with wall-clock time. Loopback peers only. Body cap
+        4 KiB (a body past it fails the decode as `400 validation_failed`).
+      tags: [dev]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scenario]
+              additionalProperties: false
+              properties:
+                scenario:
+                  type: string
+                  description: A catalog name from `GET /v0/dev/fixtures`.
+      responses:
+        '201':
+          description: Scenario applied; the minted ids keyed by the scenario's run and stage handles.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [scenario, runs]
+                properties:
+                  scenario: { type: string }
+                  runs:
+                    type: object
+                    description: Keyed by the scenario's run handle (e.g. `target-run`).
+                    additionalProperties:
+                      type: object
+                      required: [run_id, stages]
+                      properties:
+                        run_id: { $ref: '#/components/schemas/UUID' }
+                        stages:
+                          type: object
+                          description: Keyed by the scenario's stage handle (e.g. `plan`).
+                          additionalProperties: { $ref: '#/components/schemas/UUID' }
+        '400':
+          description: '`validation_failed` — body is not valid JSON or carries an unknown field.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: '`dev_surface_loopback_only`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`fixture_scenario_unknown` — `details.known` lists the catalog. (Also the router 404 when the surface is not registered.)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — a repository write failed; the cause is in the operator log keyed by `error_ref`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v0/dev/sign:
+    post:
+      operationId: devSignBody
+      summary: Sign a raw body with a run's Ed25519 private key (dev only)
+      description: |
+        Computes the signature `POST /v0/runs/{run_id}/trace` expects in
+        `X-Fishhawk-Signature` — `hex(Ed25519.Sign(key, sha256(body)))` —
+        for the private key carried in `X-Fishhawk-Dev-Private-Key` (the
+        base64 `private_key` `POST /v0/runs/{run_id}/signing-key`
+        returned). Exists because the acceptance sandbox cannot be
+        assumed to carry Ed25519 tooling. Touches no repository; the key
+        is never logged. Body cap 32 MiB. Loopback peers only.
+      tags: [dev]
+      security: []
+      parameters:
+        - name: X-Fishhawk-Dev-Private-Key
+          in: header
+          required: true
+          schema: { type: string }
+          description: Base64 of the 64-byte Ed25519 private key.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: The hex signature.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [signature]
+                properties:
+                  signature:
+                    type: string
+                    description: Hex-encoded Ed25519 signature over `sha256(body)`.
+        '400':
+          description: '`validation_failed` — `details.reason` is one of `missing`, `not_base64`, `wrong_length`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: '`dev_surface_loopback_only`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: The surface is not registered.
+        '413':
+          description: '`body_too_large` — body exceeds 32 MiB.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
 tags:
   - name: diagnostics
     description: Liveness, readiness, build info.
@@ -17336,3 +17509,5 @@ tags:
     description: MCP tool surface served over streamable HTTP (ADR-076).
   - name: oauth
     description: OAuth 2.1 authorization server for MCP clients (ADR-076 slice 3, #2436).
+  - name: dev
+    description: Dev-only seeded-fixture surface for the acceptance preview (E72.2 / #3326); registered only under FISHHAWKD_DEV_FIXTURES=1, loopback-only.

@@ -49,6 +49,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgitlab "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/gitlab"
@@ -4499,5 +4500,140 @@ func TestGitLabProjectRegistry_LooksUpTheGitLabProvider(t *testing.T) {
 	}
 	if q.gotRef != "gitlab:4242" {
 		t.Errorf("installation_ref = %q, want gitlab:4242", q.gotRef)
+	}
+}
+
+// --- Dev-fixtures wiring (E72.2 / #3326) ---------------------------------
+
+// TestResolveDevTraceStore tables the pure in-memory trace-store default:
+// the store is selected iff the dev flag is on, no bucket is configured
+// and nothing else wired one. This is the done-means test for the
+// wiring — a no-op touch of serve.go that drops the helper fails it.
+//
+// `selected` must be true EXACTLY on the mem row: serve.go gates the
+// "trace store: in-memory (dev fixtures)" boot line on it, so a true on a
+// passthrough row (an already-wired store handed back unchanged) would
+// make the log announce a dev store that was never minted (#3326 fix-up,
+// concern f37940f4). COUNTERFACTUAL: make the helper return `current, true`
+// on its passthrough arm → the four non-mem rows go RED (observed).
+func TestResolveDevTraceStore(t *testing.T) {
+	s3 := tracestore.NewS3Storage(nil, "bucket")
+	for _, tc := range []struct {
+		name        string
+		devFixtures bool
+		bucket      string
+		current     tracestore.Storage
+		wantMem     bool
+		wantCurrent bool
+	}{
+		{"off/no-bucket → nil", false, "", nil, false, false},
+		{"on/no-bucket → mem", true, "", nil, true, false},
+		{"on/bucket → current unchanged", true, "b", s3, false, true},
+		{"off/bucket → current", false, "b", s3, false, true},
+		{"on/no-bucket but already wired → current", true, "", s3, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, selected := resolveDevTraceStore(tc.devFixtures, tc.bucket, tc.current)
+			if selected != tc.wantMem {
+				t.Fatalf("selected = %v, want %v (true only when the helper minted the mem store)", selected, tc.wantMem)
+			}
+			_, isMem := got.(*tracestore.MemStorage)
+			switch {
+			case tc.wantMem && !isMem:
+				t.Fatalf("got %T, want *tracestore.MemStorage", got)
+			case tc.wantCurrent && got != tc.current:
+				t.Fatalf("got %T, want the current store unchanged", got)
+			case !tc.wantMem && !tc.wantCurrent && got != nil:
+				t.Fatalf("got %T, want nil", got)
+			}
+		})
+	}
+}
+
+// captureServerConfig hooks the newServer seam so a test can read the
+// FULLY CONSTRUCTED server.Config that runServe hands to server.New —
+// reachable because the bootstrapAbortFlag aborts AFTER newServer(cfg).
+func captureServerConfig(t *testing.T) *server.Config {
+	t.Helper()
+	captured := &server.Config{}
+	orig := newServer
+	newServer = func(cfg server.Config) *server.Server {
+		*captured = cfg
+		return orig(cfg)
+	}
+	t.Cleanup(func() { newServer = orig })
+	return captured
+}
+
+// TestServe_DevFixturesFlagWiresApplierAndMemTraceStore: a DB-backed boot
+// with -dev-fixtures reaches server.New with a non-nil DevFixtures applier
+// AND a *tracestore.MemStorage trace store (no -s3-bucket). Counterfactual:
+// delete the pool-block `if *devFixtures { cfg.DevFixtures = ... }` → RED
+// on the applier assertion.
+func TestServe_DevFixturesFlagWiresApplierAndMemTraceStore(t *testing.T) {
+	captured := captureServerConfig(t)
+	code, log := serveWithProfile(t, "-db", pgtest.NewURL(t), "-dev-fixtures", "-s3-bucket=", bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d (aborts at the invalid review-resolution, AFTER newServer); log:\n%s", code, exitFailure, log)
+	}
+	if captured.DevFixtures == nil {
+		t.Fatalf("captured server.Config.DevFixtures is nil — the -dev-fixtures flag did not wire the applier; log:\n%s", log)
+	}
+	if _, ok := captured.TraceStore.(*tracestore.MemStorage); !ok {
+		t.Fatalf("captured server.Config.TraceStore = %T, want *tracestore.MemStorage; log:\n%s", captured.TraceStore, log)
+	}
+	if !strings.Contains(log, "trace store: in-memory (dev fixtures)") {
+		t.Errorf("log does not announce the in-memory trace store:\n%s", log)
+	}
+	if !strings.Contains(log, "dev fixtures surface ENABLED") {
+		t.Errorf("log does not carry the dev-only / loopback-only WARN:\n%s", log)
+	}
+	// The in-memory store CLOSES the 503, so the S3-unset warning that
+	// announces it must not fire alongside — a stale claim in the boot log.
+	if strings.Contains(log, "/v0/runs/{id}/trace will respond 503") {
+		t.Errorf("log still warns the trace route will 503 although the dev store was selected:\n%s", log)
+	}
+	// The applier is the real one: it lists the catalog.
+	if names := captured.DevFixtures.Names(); len(names) == 0 {
+		t.Errorf("wired applier lists no scenarios")
+	}
+}
+
+// TestServe_DevFixturesWithoutDB_StaysOff: the flag without -db leaves the
+// applier nil (the routes never register) and logs the reason. The
+// in-memory trace store is still selected — it does not need a pool.
+func TestServe_DevFixturesWithoutDB_StaysOff(t *testing.T) {
+	captured := captureServerConfig(t)
+	code, log := serveWithProfile(t, "-dev-fixtures", "-s3-bucket=", bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+	}
+	if captured.DevFixtures != nil {
+		t.Fatalf("captured server.Config.DevFixtures = %T without a database, want nil", captured.DevFixtures)
+	}
+	if !strings.Contains(log, "dev fixtures requested but no database configured; surface stays off") {
+		t.Errorf("log does not carry the no-database reason:\n%s", log)
+	}
+}
+
+// TestServe_DevFixturesOff_LeavesConfigNil: the default (flag off) wires
+// neither the applier nor an in-memory trace store, even with a database.
+func TestServe_DevFixturesOff_LeavesConfigNil(t *testing.T) {
+	captured := captureServerConfig(t)
+	code, log := serveWithProfile(t, "-db", pgtest.NewURL(t), "-s3-bucket=", bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+	}
+	if captured.DevFixtures != nil {
+		t.Fatalf("captured server.Config.DevFixtures = %T with the flag off, want nil", captured.DevFixtures)
+	}
+	if captured.TraceStore != nil {
+		t.Fatalf("captured server.Config.TraceStore = %T with the flag off and no bucket, want nil", captured.TraceStore)
+	}
+	if strings.Contains(log, "dev fixtures") {
+		t.Errorf("flag-off boot mentions dev fixtures:\n%s", log)
+	}
+	if !strings.Contains(log, "/v0/runs/{id}/trace will respond 503") {
+		t.Errorf("flag-off, bucket-less boot must keep the S3-unset 503 warning:\n%s", log)
 	}
 }
