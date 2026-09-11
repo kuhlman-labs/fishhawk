@@ -15565,7 +15565,13 @@ paths:
             Body did not validate against the schema its `kind` selects, or
             path/query parameters were malformed. Codes:
 
-            - `plan_invalid` — the plan artifact failed `standard_v1`.
+            - `plan_invalid` — the plan artifact failed `standard_v1`, or
+              declared `verification.acceptance_surface: none` beside a
+              drivable acceptance criterion (E72.6 / #3381; `details.error`
+              names the criterion id). Refused BEFORE the artifact is
+              stored — so a byte-identical re-upload of a plan stored
+              before this refusal existed is refused too, not returned 200
+              from the content-hash cache.
             - `clarification_request_invalid` — the clarification sibling
               failed `clarification-request-v1` or its unique-question-id rule.
             - `grooming_report_invalid` — the grooming report failed

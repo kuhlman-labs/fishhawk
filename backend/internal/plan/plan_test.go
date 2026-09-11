@@ -2368,6 +2368,71 @@ func TestParse_AcceptanceSurfaceNone_RejectsDrivableCriterion(t *testing.T) {
 	}
 }
 
+// TestCheckAcceptanceSurface_Bytes pins the NARROW exported entry point the
+// plan-upload path calls (E72.6 / #3381): plan.Parse is unreachable from
+// handleShipPlan, so CheckAcceptanceSurface is what makes the guard fire on
+// the ship path. The refusal cases mirror TestParse_AcceptanceSurfaceNone_RejectsDrivableCriterion
+// (same guard, same message), the admit cases prove the check is inert for
+// every non-none plan, and the non-JSON case pins the FAIL-CLOSED decode
+// branch: a non-nil error that is NOT a *SemanticError. Counterfactual:
+// replace CheckAcceptanceSurface's body with `return nil` → every refusal
+// row and the non-JSON row go RED.
+func TestCheckAcceptanceSurface_Bytes(t *testing.T) {
+	skipped := map[string]any{
+		"id": "skipped", "statement": "the helper is renamed", "source": "explicit",
+		"skip_expected": true, "expectation_basis": "covered by the unit test",
+	}
+	drivable := map[string]any{"id": "drivable", "statement": "GET /v0/runs returns 200", "source": "explicit"}
+	for _, tc := range []struct {
+		name   string
+		opts   []planfixture.Option
+		wantID string // non-empty → expect a *SemanticError naming this id
+	}{
+		{"none + unmarked drivable", []planfixture.Option{acceptanceCriteriaOption(drivable), acceptanceSurfaceOption("none")}, "drivable"},
+		{"none + whitespace basis", []planfixture.Option{acceptanceCriteriaOption(map[string]any{
+			"id": "blank-basis", "statement": "x", "source": "explicit", "skip_expected": true, "expectation_basis": "  \t",
+		}), acceptanceSurfaceOption("none")}, "blank-basis"},
+		{"none + drivable after skipped", []planfixture.Option{acceptanceCriteriaOption(skipped, drivable), acceptanceSurfaceOption("none")}, "drivable"},
+		{"none + all skip with basis", []planfixture.Option{acceptanceCriteriaOption(skipped), acceptanceSurfaceOption("none")}, ""},
+		{"none + zero criteria", []planfixture.Option{acceptanceSurfaceOption("none")}, ""},
+		{"no surface + drivable", []planfixture.Option{acceptanceCriteriaOption(drivable)}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := plan.CheckAcceptanceSurface(marshalFixture(t, planfixture.Valid(tc.opts...)))
+			if tc.wantID == "" {
+				if err != nil {
+					t.Fatalf("CheckAcceptanceSurface = %v, want nil", err)
+				}
+				return
+			}
+			var se *plan.SemanticError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %v, want *SemanticError", err)
+			}
+			msg := se.Error()
+			for _, want := range []string{"acceptance_surface", `"` + tc.wantID + `"`, "skip_expected", "expectation_basis", "drop acceptance_surface"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("SemanticError should contain %q, got %q", want, msg)
+				}
+			}
+		})
+	}
+
+	t.Run("not JSON fails closed", func(t *testing.T) {
+		err := plan.CheckAcceptanceSurface([]byte("not json"))
+		if err == nil {
+			t.Fatal("CheckAcceptanceSurface(non-JSON) = nil, want a non-nil decode error (fail closed)")
+		}
+		var se *plan.SemanticError
+		if errors.As(err, &se) {
+			t.Fatalf("err = %v is a *SemanticError, want a plain decode error", err)
+		}
+		if !strings.Contains(err.Error(), "acceptance_surface check: decode verification") {
+			t.Errorf("err = %q, want the decode-branch wrapping", err.Error())
+		}
+	})
+}
+
 // TestParse_AcceptanceSurfaceNone_AcceptsAllSkipCriteria proves the legal
 // pairing round-trips: `none` with every criterion skip_expected-with-basis
 // parses and decodes into Verification.AcceptanceSurface, and the predicate
