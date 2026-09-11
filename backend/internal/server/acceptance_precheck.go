@@ -56,6 +56,20 @@ const categoryPlanAcceptancePrecheck = "plan_acceptance_precheck"
 // false ones included, so a machine reader can distinguish "checked, not
 // all-skip" (present and false) from "written by a pre-#3026 binary" (key
 // absent). Also ADVISORY — the pre-check never refuses a plan on it.
+//
+// RestatesTestCount and AcceptanceSurfaceNone (E72.1 / #3325) carry the two
+// observable-surface facts. RestatesTestCount counts the criteria the shared
+// rule set flagged criterion_restates_test — one per criterion whose
+// verify_hint names only an in-repository Go test and no operator-observable
+// surface. AcceptanceSurfaceNone is true when the plan declares
+// verification.acceptance_surface: none, in which case the plan gate records
+// an acceptance_stage_omitted marker and drops the run's pending acceptance
+// stage on approval (acceptance_omission.go). Both json tags carry NO omitempty,
+// matching the #3026 present-and-false posture: a machine reader distinguishes
+// "checked, zero/false" from "written by a pre-#3325 binary". Neither is
+// derived from plan prose — a count and a bool — so no redaction path is
+// involved (the #3338 hold: a future plan-derived text field routes through
+// the established redaction path, never a second one). Also ADVISORY.
 type AcceptancePrecheckPayload struct {
 	WorkflowID        string              `json:"workflow_id"`
 	AcceptanceStageID string              `json:"acceptance_stage_id"`
@@ -68,6 +82,9 @@ type AcceptancePrecheckPayload struct {
 	LiveValidationMarkerCount int `json:"live_validation_marker_count"`
 
 	AllSkipShortCircuit bool `json:"all_skip_short_circuit"`
+
+	RestatesTestCount     int  `json:"restates_test_count"`
+	AcceptanceSurfaceNone bool `json:"acceptance_surface_none"`
 }
 
 // AcceptanceFinding is one deterministic defect the acceptance pre-check
@@ -90,6 +107,8 @@ const (
 	acceptanceRuleUndecidableCriterion        = plan.RuleUndecidableCriterion
 	acceptanceRuleMissingLiveValidationMarker = plan.RuleMissingLiveValidationMarker
 	acceptanceRuleAllCriteriaSkipExpected     = plan.RuleAllCriteriaSkipExpected
+	acceptanceRuleCriterionRestatesTest       = plan.RuleCriterionRestatesTest
+	acceptanceRuleNoObservableCriterion       = plan.RuleNoObservableCriterion
 )
 
 // runAcceptancePrecheck evaluates an uploaded plan's
@@ -192,9 +211,18 @@ func (s *Server) runAcceptancePrecheck(ctx context.Context, runID, stageID uuid.
 	// plan.AcceptanceSkippableAllSkipWithBasis a second time here — the finding
 	// IS the evaluation, and re-deriving it in the server would reintroduce
 	// exactly the second copy this design exists to avoid.
+	//
+	// E72.1 / #3325: criterion_restates_test rides the same call and is counted
+	// the same way (one per criterion). no_observable_criterion is plan-level
+	// and carried in Findings only — its headline is the count being equal to
+	// the drivable-criterion total, which the reader derives, not a second
+	// field. acceptance_surface_none is read off the raw-decoded verification
+	// via the plan package's own predicate, so the server never re-spells the
+	// enum value.
 	undecidableCount := 0
 	liveValidationMarkerCount := 0
 	allSkipShortCircuit := false
+	restatesTestCount := 0
 	for _, f := range findings {
 		switch f.Rule {
 		case acceptanceRuleUndecidableCriterion:
@@ -203,6 +231,8 @@ func (s *Server) runAcceptancePrecheck(ctx context.Context, runID, stageID uuid.
 			liveValidationMarkerCount++
 		case acceptanceRuleAllCriteriaSkipExpected:
 			allSkipShortCircuit = true
+		case acceptanceRuleCriterionRestatesTest:
+			restatesTestCount++
 		}
 	}
 
@@ -217,6 +247,9 @@ func (s *Server) runAcceptancePrecheck(ctx context.Context, runID, stageID uuid.
 
 		LiveValidationMarkerCount: liveValidationMarkerCount,
 		AllSkipShortCircuit:       allSkipShortCircuit,
+
+		RestatesTestCount:     restatesTestCount,
+		AcceptanceSurfaceNone: plan.DeclaresNoAcceptanceSurface(v),
 	}
 	payload, _ := json.Marshal(result)
 	systemKind := audit.ActorKind("system")

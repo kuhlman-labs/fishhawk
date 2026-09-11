@@ -265,6 +265,11 @@
           "type": "array",
           "items": { "type": "string", "minLength": 1 },
           "description": "Optional. Statements of what this change deliberately does NOT cover, so reviewers and downstream acceptance don't treat an omission as a gap."
+        },
+        "acceptance_surface": {
+          "type": "string",
+          "enum": ["none"],
+          "description": "Optional (E72.1 / #3325). Explicit declaration that the change exposes NO operator-observable surface — no HTTP route/response/status code, MCP tool result, CLI exit code/stderr/stdout, rendered prompt, or persisted audit row an acceptance agent could observe. When set, the plan gate records an acceptance_stage_omitted audit row and then omits the run's acceptance stage on approval (marker first, then stage delete) instead of minting a not_validated short-circuit, and the all_criteria_skip_expected advisory is suppressed. Mutually exclusive with any drivable acceptance criterion: plan.Parse rejects it alongside a criterion that is not skip_expected with an expectation_basis. Observable-surface values are deliberately not enumerated — a drivable criterion needs no declaration, its verify_hint names the surface."
         }
       }
     },

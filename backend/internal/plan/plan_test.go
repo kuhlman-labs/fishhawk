@@ -1616,7 +1616,11 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
 // standard_v1.x, or for an ANNOTATION-only description correction that changes
-// no validation behavior — most recently the #2862 top-level
+// no validation behavior — most recently the E72.1 / #3325
+// verification.acceptance_surface enum (`none`: the plan's explicit declaration
+// that no operator-observable surface exists, which the plan gate reads to omit
+// the acceptance stage at approval and semanticCheck rejects alongside any
+// drivable criterion). Before that: the #2862 top-level
 // raw_predicted_runtime_minutes field (the planner's PRE-calibration runtime
 // estimate, which the implement-budget gate reads via Plan.GateRuntimeMinutes as
 // max(predicted, raw) so a sub-1.0 fleet calibration factor cannot dissolve a
@@ -1640,7 +1644,7 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "6d4433c40030e02acc8e72cbc5e366efead73b0a1344ab7457bcd1693a47eab4"
+	const wantHash = "7eafe7db7db1064efd6937cd722a43011a0ebbfe31bf9422f9bf86a298323713"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)
@@ -2311,5 +2315,139 @@ func TestGateRuntimeMinutes(t *testing.T) {
 					got, tc.want, tc.predicted, tc.raw)
 			}
 		})
+	}
+}
+
+// --- verification.acceptance_surface (E72.1 / #3325) ---
+
+// acceptanceSurfaceOption returns an Option that sets
+// verification.acceptance_surface to the given value.
+func acceptanceSurfaceOption(value string) func(map[string]any) {
+	return func(m map[string]any) {
+		m["verification"].(map[string]any)["acceptance_surface"] = value
+	}
+}
+
+// TestParse_AcceptanceSurfaceNone_RejectsDrivableCriterion asserts the
+// semanticCheck guard: `none` alongside a drivable criterion is a
+// *SemanticError naming the criterion id and both remedies. Three drivable
+// shapes — unmarked, skip_expected with a whitespace basis (the schema's
+// presence-aware conditional admits a non-empty-but-blank string; the
+// TrimSpace reading here matches AcceptanceSkippableAllSkipWithBasis), and a
+// drivable criterion AFTER a correctly-skipped one (the scan does not stop at
+// the first exempt entry). This is the case the counterfactual deletion of
+// checkAcceptanceSurfaceNone must redden.
+func TestParse_AcceptanceSurfaceNone_RejectsDrivableCriterion(t *testing.T) {
+	skipped := map[string]any{
+		"id": "skipped", "statement": "the helper is renamed", "source": "explicit",
+		"skip_expected": true, "expectation_basis": "covered by the unit test",
+	}
+	for _, tc := range []struct {
+		name     string
+		criteria []map[string]any
+		wantID   string
+	}{
+		{"unmarked", []map[string]any{{"id": "drivable", "statement": "GET /v0/runs returns 200", "source": "explicit"}}, "drivable"},
+		{"whitespace basis", []map[string]any{{"id": "blank-basis", "statement": "x", "source": "explicit", "skip_expected": true, "expectation_basis": "  \t"}}, "blank-basis"},
+		{"drivable after skipped", []map[string]any{skipped, {"id": "later", "statement": "x", "source": "explicit"}}, "later"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := planfixture.Valid(acceptanceCriteriaOption(tc.criteria...), acceptanceSurfaceOption("none"))
+			_, err := plan.Parse(marshalFixture(t, m))
+			var se *plan.SemanticError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %v, want *SemanticError", err)
+			}
+			msg := se.Error()
+			for _, want := range []string{"acceptance_surface", `"` + tc.wantID + `"`, "skip_expected", "expectation_basis", "drop acceptance_surface"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("SemanticError should contain %q, got %q", want, msg)
+				}
+			}
+		})
+	}
+}
+
+// TestParse_AcceptanceSurfaceNone_AcceptsAllSkipCriteria proves the legal
+// pairing round-trips: `none` with every criterion skip_expected-with-basis
+// parses and decodes into Verification.AcceptanceSurface, and the predicate
+// reads it.
+func TestParse_AcceptanceSurfaceNone_AcceptsAllSkipCriteria(t *testing.T) {
+	m := planfixture.Valid(acceptanceCriteriaOption(
+		map[string]any{
+			"id": "s1", "statement": "the helper is renamed", "source": "explicit",
+			"skip_expected": true, "expectation_basis": "covered by acceptance_check_test.go",
+		},
+		map[string]any{
+			"id": "s2", "statement": "the caller is updated", "source": "inferred", "rationale": "a rename implies its caller moves",
+			"skip_expected": true, "expectation_basis": "covered by the same table test",
+		},
+	), acceptanceSurfaceOption("none"))
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := p.Verification.AcceptanceSurface; got != plan.AcceptanceSurfaceValueNone {
+		t.Errorf("AcceptanceSurface = %q, want %q", got, plan.AcceptanceSurfaceValueNone)
+	}
+	if !plan.DeclaresNoAcceptanceSurface(p.Verification) {
+		t.Error("DeclaresNoAcceptanceSurface must read the decoded field")
+	}
+}
+
+// TestParse_AcceptanceSurfaceNone_AcceptsZeroCriteria: `none` with zero
+// criteria is legal with or without out_of_scope.
+func TestParse_AcceptanceSurfaceNone_AcceptsZeroCriteria(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []planfixture.Option
+	}{
+		{"no out_of_scope", nil},
+		{"with out_of_scope", []planfixture.Option{func(m map[string]any) {
+			m["verification"].(map[string]any)["out_of_scope"] = []any{"no observable surface"}
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := append([]planfixture.Option{acceptanceSurfaceOption("none")}, tc.opts...)
+			m := planfixture.Valid(opts...)
+			if _, err := plan.Parse(marshalFixture(t, m)); err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+		})
+	}
+}
+
+// TestParse_AcceptanceSurfaceNone_SchemaRejectsUnknownValue: the enum admits
+// exactly `none` — observable-surface values are deliberately not enumerated.
+func TestParse_AcceptanceSurfaceNone_SchemaRejectsUnknownValue(t *testing.T) {
+	for _, value := range []string{"http", "None", ""} {
+		m := planfixture.Valid(acceptanceSurfaceOption(value))
+		err := plan.Validate(marshalFixture(t, m))
+		var se *plan.SchemaError
+		if !errors.As(err, &se) {
+			t.Errorf("acceptance_surface %q: err = %v, want *SchemaError", value, err)
+		}
+	}
+}
+
+// TestParse_AcceptanceSurfaceNone_Fixture parses the committed valid corpus
+// entry so the fixture stays a working example of the legal shape.
+func TestParse_AcceptanceSurfaceNone_Fixture(t *testing.T) {
+	p, err := plan.Parse(readFixture(t, "valid/acceptance-surface-none.json"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !plan.DeclaresNoAcceptanceSurface(p.Verification) {
+		t.Fatal("fixture must declare acceptance_surface: none")
+	}
+	if got := len(p.Verification.AcceptanceCriteria); got != 1 {
+		t.Fatalf("fixture criteria = %d, want 1", got)
+	}
+	// A `none` fixture draws neither the all-skip advisory (moot: the stage is
+	// omitted) nor the plan-level no_observable_criterion.
+	for _, f := range plan.EvaluateAcceptanceCriteria(p.Verification) {
+		if f.Rule == plan.RuleAllCriteriaSkipExpected || f.Rule == plan.RuleNoObservableCriterion {
+			t.Errorf("fixture must not draw %s; got %+v", f.Rule, f)
+		}
 	}
 }

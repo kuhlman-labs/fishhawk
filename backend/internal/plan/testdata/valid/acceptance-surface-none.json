@@ -1,0 +1,40 @@
+{
+  "plan_version": "standard_v1",
+  "ticket_reference": {
+    "type": "github_issue",
+    "url": "https://github.com/kuhlman-labs/fishhawk/issues/3325",
+    "id": "kuhlman-labs/fishhawk#3325"
+  },
+  "generated_by": {
+    "agent": "claude-code",
+    "model": "claude-opus-5",
+    "timestamp": "2026-09-10T09:00:00Z"
+  },
+  "summary": "Rename an internal helper; no operator-observable surface changes.",
+  "scope": {
+    "files": [
+      { "path": "backend/internal/plan/acceptance_check.go", "operation": "modify" }
+    ]
+  },
+  "approach": [
+    { "step": 1, "description": "Rename the helper and update its single caller." }
+  ],
+  "verification": {
+    "test_strategy": "go test ./backend/internal/plan/... — the existing table tests cover the renamed helper.",
+    "rollback_plan": "Revert the PR. The change is a pure rename with no data or wire consequences.",
+    "acceptance_surface": "none",
+    "acceptance_criteria": [
+      {
+        "id": "helper-renamed",
+        "statement": "The renamed helper is exercised by the existing acceptance_check_test.go table.",
+        "source": "inferred",
+        "rationale": "A rename has no observable surface; the only evidence is the in-repository test.",
+        "skip_expected": true,
+        "expectation_basis": "backend/internal/plan/acceptance_check_test.go exercises the renamed helper directly."
+      }
+    ],
+    "out_of_scope": ["No HTTP, MCP, CLI, prompt, or audit surface is touched by this change."]
+  },
+  "predicted_runtime_minutes": 8,
+  "predicted_runtime_confidence": "high"
+}

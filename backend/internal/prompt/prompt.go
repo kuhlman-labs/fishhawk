@@ -1606,13 +1606,29 @@ type GateViolation struct {
 // flag-false/finding-present value renders the raw FINDING line unchanged,
 // preserving the documented invariant honestly rather than silently dropping
 // a finding no one asked to fold.
+//
+// AcceptanceSurfaceNone and RestatesTestCount (E72.1 / #3325) carry the
+// pre-check's two observable-surface facts. AcceptanceSurfaceNone is true when
+// the plan declares `verification.acceptance_surface: none`: it renders ONE
+// `- acceptance_surface: none — …` headline stating that the acceptance stage
+// will be OMITTED at plan approval (an `acceptance_stage_omitted` audit row is
+// recorded first, then the pending stage is dropped), so the reviewer knows
+// nothing will be driven. RestatesTestCount is the number of criteria that
+// drew `criterion_restates_test`; it renders one count line only when
+// non-zero. Both render NOTHING when zero/false, so every other plan's
+// gate-evidence bytes are unchanged. The two E72.1 rules themselves
+// (`criterion_restates_test`, `no_observable_criterion`) render from Findings
+// as Rule-keyed ADVISORY lines carrying a HANDLING clause — see
+// writePlanGateEvidence / restatesTestAdvisoryHandling.
 type AcceptancePrecheckEvidence struct {
-	AcceptanceStageID   string
-	CriteriaCount       int
-	BlockingCount       int
-	OutOfScopeCount     int
-	AllSkipShortCircuit bool
-	Findings            []AcceptanceFindingEvidence
+	AcceptanceStageID     string
+	CriteriaCount         int
+	BlockingCount         int
+	OutOfScopeCount       int
+	AllSkipShortCircuit   bool
+	AcceptanceSurfaceNone bool
+	RestatesTestCount     int
+	Findings              []AcceptanceFindingEvidence
 }
 
 // AcceptanceFindingEvidence is one deterministic acceptance-criteria defect
@@ -3955,10 +3971,13 @@ func buildPlan(t Trigger) string {
 	b.WriteString("\n")
 	b.WriteString("Acceptance-criteria authoring contract: verification.acceptance_criteria is an OPTIONAL array (additive / " +
 		"x-intended-required) that you SHOULD author for a feature change so the downstream acceptance stage has a binding, " +
-		"machine-checkable checklist. It is NOT in the required-fields list above — do NOT invent criteria for a test-only or " +
-		"doc-only change (use verification.out_of_scope, below, to declare that case). Describe criteria in language " +
-		"toolchain-agnostic prose (state what must hold, never a shell or Go command). Each entry is an object with this exact shape " +
-		"(mirrors docs/spec/plan-standard-v1.schema.json $defs.acceptance-criterion):\n")
+		"machine-checkable checklist of OBSERVABLE OUTCOMES. Each criterion must state what an operator — or the sandboxed " +
+		"acceptance agent driving the localhost preview — can OBSERVE after the change, on one of the five surfaces the " +
+		"Observable-outcome rule below names; a Go test passing is NOT one of them. It is NOT in the required-fields list above — " +
+		"do NOT invent criteria for a test-only or doc-only change (declare that case with verification.acceptance_surface: none " +
+		"or verification.out_of_scope, below). Describe criteria in language toolchain-agnostic prose (state what must hold, never " +
+		"a shell or Go command). Each entry is an object with this exact shape (mirrors docs/spec/plan-standard-v1.schema.json " +
+		"$defs.acceptance-criterion):\n")
 	b.WriteString("- `id` (REQUIRED): a lowercase slug matching the pattern `^[a-z0-9][a-z0-9-]*$` — start with a lowercase letter " +
 		"or digit, then only lowercase letters, digits, and hyphens. GOOD: `plan-validates-first-shot`. INVALID: `AC1`, `AC-1`, " +
 		"`Plan_Validates` — uppercase letters and underscores are rejected. The id MUST be UNIQUE within acceptance_criteria (it is " +
@@ -3970,8 +3989,9 @@ func buildPlan(t Trigger) string {
 	b.WriteString("- `blocking`: an optional boolean; when omitted it defaults to `true` (a failing criterion blocks acceptance). " +
 		"Set it to `false` only for a non-blocking/advisory criterion.\n")
 	b.WriteString("- `source_ref`, `verify_hint`, `preconditions` are OPTIONAL: `source_ref` points at where an explicit criterion " +
-		"came from (an issue anchor or spec section); `verify_hint` hints how to verify it; `preconditions` is an array of strings " +
-		"that must hold before the criterion can be checked.\n")
+		"came from (an issue anchor or spec section); `verify_hint` hints how to verify it — name the OBSERVABLE surface the " +
+		"acceptance agent checks (see the Observable-outcome rule below), not the Go test that covers it; `preconditions` is an " +
+		"array of strings that must hold before the criterion can be checked.\n")
 	b.WriteString("- `skip_expected`, `expectation_basis` are OPTIONAL (see the Externally-triggered criteria rule below): set " +
 		"`skip_expected` to `true` on a criterion the sandboxed acceptance agent cannot validate against the localhost preview, and " +
 		"then `expectation_basis` (REQUIRED when `skip_expected` is `true`) MUST cite where the behavior is actually validated (the " +
@@ -3983,9 +4003,31 @@ func buildPlan(t Trigger) string {
 		"mark `skip_expected: true` with an `expectation_basis` — the two travel together so acceptance short-circuits via " +
 		"all-skip-with-basis rather than dispatching an unvalidatable live-target criterion to the acceptance agent. Omit it on a " +
 		"drivable criterion.\n")
+	b.WriteString("Observable-outcome rule: the acceptance agent can observe exactly FIVE surfaces on the localhost preview, and a " +
+		"criterion (its statement and its `verify_hint`) must name one of them — one concrete example each: (1) an HTTP " +
+		"route/response/status code — `GET /v0/runs/{run_id}` returns 200 and the body carries field X; (2) an MCP tool result — " +
+		"the `fishhawk_get_plan` tool returns Y; (3) a CLI exit code/stderr/stdout — `fishhawk validate` exits 1 naming Z on " +
+		"stderr; (4) a rendered prompt — `GET /v0/stages/{stage_id}/prompt` contains section W; (5) a persisted audit row — " +
+		"`GET /v0/runs/{run_id}/audit` carries an entry of category V. A criterion whose ONLY evidence is a Go test (a `_test.go` " +
+		"path, a bare `TestFoo` name, `go test`, `scripts/test`, a unit/table/golden test, pgtest/httptest) RESTATES the plan's " +
+		"test_strategy: the acceptance agent cannot observe a test passing, and the implement-verify gate already proves it. The " +
+		"plan gate runs the deterministic `criterion_restates_test` check over each criterion's `verify_hint` and reports one " +
+		"whose hint names only a Go test and no observable surface as an ADVISORY finding on the plan-review gate evidence; to " +
+		"clear it, make `verify_hint` name the surface the acceptance agent observes. A plan with at least one criterion and NO " +
+		"observable criterion (every criterion is a declared skip or restates a test) additionally draws the ADVISORY " +
+		"`no_observable_criterion` finding. Both rules are advisory — they never refuse the plan — and both are exempt for a " +
+		"criterion already marked `skip_expected` with an `expectation_basis` or `requires_live_validation`, and silent on an " +
+		"empty `verify_hint`. When a change GENUINELY has no observable surface (a refactor, a test-only or doc-only change, an " +
+		"internal helper with no route/tool/CLI/prompt/audit consequence), the honest declaration is " +
+		"`verification.acceptance_surface: none` (a schema enum whose sole value is `none`): at plan approval the plan gate " +
+		"records an `acceptance_stage_omitted` audit row and then OMITS the run's acceptance stage — no not_validated " +
+		"short-circuit is minted and no reviewer ceremony runs. It is REJECTED at parse time alongside any drivable criterion " +
+		"(one not marked `skip_expected` with a basis), so never pair it with a criterion you expect the agent to drive; a plan " +
+		"declaring it may carry zero criteria, or only skip-expected-with-basis ones.\n")
 	b.WriteString("verification.out_of_scope escape hatch: an OPTIONAL array of non-empty strings stating what the change deliberately " +
 		"does NOT cover. It is the mechanism a test-only or doc-only change uses to declare it intentionally authors no " +
-		"acceptance_criteria — populate out_of_scope with the reason instead of leaving the intent unstated. Author " +
+		"acceptance_criteria — populate out_of_scope with the reason instead of leaving the intent unstated, and pair it with " +
+		"`acceptance_surface: none` when there is genuinely nothing to observe. Author " +
 		"acceptance_criteria for feature changes; reach for out_of_scope when concrete criteria genuinely do not apply.\n")
 	b.WriteString("Externally-triggered criteria rule: the acceptance stage runs the acceptance agent under a DEFAULT-DENY egress " +
 		"sandbox against the localhost preview ONLY — it CANNOT reach GitHub or any third-party service to close an issue, push a " +
@@ -4000,8 +4042,10 @@ func buildPlan(t Trigger) string {
 		"having verified NOTHING (#2347): it is not a pass, and the operator is told so. Do not treat an all-skip plan as a cheap " +
 		"green — author a drivable criterion whenever one genuinely exists. The plan gate now flags that whole-plan shape up front as " +
 		"the ADVISORY `all_criteria_skip_expected` finding on the plan-review gate evidence, so the approver sees the zero-verification " +
-		"consequence before approving; it never refuses the plan. The marker is OPTIONAL and the plan gate does not reject " +
-		"a legacy unmarked plan.\n")
+		"consequence before approving; it never refuses the plan. When the all-skip shape is the honest one because the change " +
+		"has NO observable surface at all, prefer `verification.acceptance_surface: none` (Observable-outcome rule above) over an " +
+		"all-skip plan: it omits the stage outright instead of minting a not_validated verdict that verified nothing. The marker " +
+		"is OPTIONAL and the plan gate does not reject a legacy unmarked plan.\n")
 	b.WriteString("Live-validation criteria rule: a NARROWER case of the above — when a criterion's true verification needs a LIVE " +
 		"forge/deploy/external target (a real GitHub API round-trip, a deployed environment, a third-party surface), not merely an " +
 		"external event, the sandbox can never stand that target up. Classify it up front by setting `requires_live_validation: true`. " +
@@ -4680,6 +4724,12 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 		b.WriteString("Acceptance pre-check (verification.acceptance_criteria evaluated against the configured acceptance stage):\n\n")
 		fmt.Fprintf(b, "- criteria: %d (blocking: %d)\n", ap.CriteriaCount, ap.BlockingCount)
 		fmt.Fprintf(b, "- out_of_scope entries: %d\n", ap.OutOfScopeCount)
+		if ap.AcceptanceSurfaceNone {
+			b.WriteString(acceptanceSurfaceNoneHeadline)
+		}
+		if ap.RestatesTestCount > 0 {
+			fmt.Fprintf(b, "- criteria whose verify_hint names only a Go test (criterion_restates_test): %d\n", ap.RestatesTestCount)
+		}
 		if ap.AllSkipShortCircuit {
 			b.WriteString(allSkipAdvisoryLine)
 		}
@@ -4703,10 +4753,23 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 			}
 		} else {
 			for _, f := range other {
+				// The two E72.1 observable-surface rules render as ADVISORY
+				// lines with their own HANDLING clause, keyed on the Rule
+				// CONSTANT — never on Detail text, which this package does not
+				// control end to end (the #3317 posture): a Detail that merely
+				// contains the literal `ADVISORY criterion_restates_test` still
+				// renders as a plain FINDING line.
+				label := "FINDING"
+				handling := ""
+				switch f.Rule {
+				case plan.RuleCriterionRestatesTest, plan.RuleNoObservableCriterion:
+					label = "ADVISORY"
+					handling = restatesTestAdvisoryHandling
+				}
 				if f.CriterionID != "" {
-					fmt.Fprintf(b, "- FINDING %s (criterion: %s): %s\n", f.Rule, f.CriterionID, f.Detail)
+					fmt.Fprintf(b, "- %s %s (criterion: %s): %s%s\n", label, f.Rule, f.CriterionID, f.Detail, handling)
 				} else {
-					fmt.Fprintf(b, "- FINDING %s: %s\n", f.Rule, f.Detail)
+					fmt.Fprintf(b, "- %s %s: %s%s\n", label, f.Rule, f.Detail, handling)
 				}
 			}
 		}
@@ -6445,9 +6508,10 @@ const allSkipAdvisoryLine = "- ADVISORY all_criteria_skip_expected: every accept
 
 // allSkipPreambleException is appended to the gate-evidence preamble's
 // blanket "a violation or finding listed here MUST be recorded as a
-// high-severity concern" rule (#3317). It names the ONE specific line that
-// carries its own HANDLING instruction in place of that rule, which is what
-// makes allSkipAdvisoryLine's de-escalation reachable from the rule it
+// high-severity concern" rule (#3317). It names, by literal rule name, each
+// specific advisory line that carries its own HANDLING instruction in place
+// of that rule, which is what makes allSkipAdvisoryLine's (and, since E72.1,
+// restatesTestAdvisoryHandling's) de-escalation reachable from the rule it
 // modifies. Renders whenever any gate evidence is present, mirroring the
 // escape-valve paragraph it precedes.
 //
@@ -6458,17 +6522,54 @@ const allSkipAdvisoryLine = "- ADVISORY all_criteria_skip_expected: every accept
 // attacker-influenced text). A bare-prefix exception would hand any such
 // text a de-escalation channel by placing a newline followed by its own
 // `- ADVISORY ...: HANDLING: ...` line into a Detail field. Naming the
-// specific all_criteria_skip_expected advisory — not the word ADVISORY as a
+// specific advisories by rule name — not the word ADVISORY as a
 // prefix — closes that off. (The wording below keeps `ADVISORY` and
-// `all_criteria_skip_expected` non-adjacent on purpose, so this sentence
+// every rule name non-adjacent on purpose, so this sentence
 // itself, which renders unconditionally whenever any gate evidence is
-// present, does not trip a naive substring match for the rendered advisory
-// line — see TestBuild_PlanReview_AllSkipAdvisory_FlagFalseFindingStillRenders.)
-const allSkipPreambleException = "One exception: the acceptance pre-check's `all_criteria_skip_expected` advisory " +
-	"line below (identified by its own literal text, not by the word `ADVISORY` occurring as a bare line prefix) " +
+// present, does not trip a naive substring match for a rendered advisory
+// line — see TestBuild_PlanReview_AllSkipAdvisory_FlagFalseFindingStillRenders
+// and TestBuild_PlanReview_PreambleException_NamesAdvisoryRules.)
+//
+// Widened by E72.1 / #3325 to name the two observable-surface advisories
+// (`criterion_restates_test`, `no_observable_criterion`) alongside the
+// all-skip one, each by its literal rule name — the same non-adjacent wording
+// discipline applies to all three.
+const allSkipPreambleException = "One exception: each acceptance pre-check advisory line below — the " +
+	"`all_criteria_skip_expected`, `criterion_restates_test` and `no_observable_criterion` advisories (each identified " +
+	"by its own literal rule name, not by the word `ADVISORY` occurring as a bare line prefix) — " +
 	"carries its own HANDLING instruction in place of the rule above — follow that instruction instead. Any OTHER " +
 	"line — including one that merely begins with, or elsewhere contains, the word `ADVISORY` — remains subject to " +
 	"the must-be-a-concern rule above.\n\n"
+
+// acceptanceSurfaceNoneHeadline is the single gate-evidence line rendered when
+// the plan declares `verification.acceptance_surface: none` (E72.1 / #3325).
+// It is a statement of consequence, not a finding: the plan gate will record
+// an `acceptance_stage_omitted` audit row and then drop the pending acceptance
+// stage at approval, so no short-circuit verdict is minted and nothing is
+// driven. It renders before the all-skip advisory line (which the plan
+// package suppresses under `none` anyway, so the two never both render from
+// the real path).
+const acceptanceSurfaceNoneHeadline = "- acceptance_surface: none — the plan declares no operator-observable surface, " +
+	"so the acceptance stage will be OMITTED at plan approval (an `acceptance_stage_omitted` audit row is recorded " +
+	"first, then the pending stage is dropped); nothing will be driven and no not_validated short-circuit is minted.\n"
+
+// restatesTestAdvisoryHandling is the HANDLING clause appended to the
+// `criterion_restates_test` and `no_observable_criterion` ADVISORY lines
+// (E72.1 / #3325). Both rules are advisory by contract (the plan package
+// never refuses on them) and both share one remedy — name the surface the
+// acceptance agent observes in verify_hint, or declare
+// `verification.acceptance_surface: none` — so the de-escalation is the same
+// shape as allSkipAdvisoryLine's: acknowledge in free_form, never a concern on
+// its own, exactly one concern only when the reviewer can NAME a criterion
+// whose verify_hint could name an operator-observable surface. The reviewer's
+// ability to raise a concern about a criterion's own statement text is
+// untouched. Rendered ONLY for a finding whose Rule is one of those two
+// constants — never keyed on Detail text (see writePlanGateEvidence).
+const restatesTestAdvisoryHandling = " HANDLING: acknowledge this in `free_form`. Do NOT record it as a concern and do " +
+	"NOT let it, on its own, drive a `reject` or `approve_with_concerns` verdict. Record exactly ONE concern ONLY if you " +
+	"can NAME a criterion in this plan whose verify_hint could name an operator-observable surface (an HTTP " +
+	"route/response/status code, an MCP tool result, a CLI exit code/stderr/stdout, a rendered prompt, or a persisted " +
+	"audit row) — name that criterion id in the concern. A concern about a criterion's own statement text is unaffected."
 
 // writeAcceptanceCriteriaForReview renders a plan's typed
 // verification.acceptance_criteria (and out_of_scope) for the review-agent
