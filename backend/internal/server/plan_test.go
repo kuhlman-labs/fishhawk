@@ -2948,51 +2948,104 @@ func TestShipPlan_ReviewAgents_GateEvidenceReachesReviewPrompt(t *testing.T) {
 // prompt's acceptance gate-evidence block — crossing the audit-persist ->
 // planGateEvidence -> prompt-render consumer boundary the per-layer tests
 // cannot exercise.
+//
+// Since E72.1 / #3325 it ALSO threads the two observable-surface facts across
+// the same seam: a test-only verify_hint ships as a criterion_restates_test
+// finding + restates_test_count in the persisted entry AND as an `ADVISORY
+// criterion_restates_test` line with its HANDLING clause (never a `- FINDING`
+// line) in the rendered prompt; and an acceptance_surface: none plan ships as
+// acceptance_surface_none in the entry AND the `acceptance_surface: none`
+// headline in the prompt.
 func TestShipPlan_ReviewAgents_AcceptancePrecheckReachesReviewPrompt(t *testing.T) {
-	runID, stageID := uuid.New(), uuid.New()
-	reviewer := &fakePlanReviewer{
-		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
-		model:   "claude-sonnet-4-6",
+	shipAndCapture := func(t *testing.T, body []byte) (AcceptancePrecheckPayload, string) {
+		t.Helper()
+		runID, stageID := uuid.New(), uuid.New()
+		reviewer := &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+			model:   "claude-sonnet-4-6",
+		}
+		s, sf, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewersWithAcceptance)
+		priv, _ := sf.issue(t, runID)
+		w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+		// Gating review (human: 0) runs synchronously; the captured prompt is
+		// ready as soon as the upload returns.
+		entry := lastAcceptancePrecheckEntry(t, au)
+		if entry.AcceptanceStageID != "acceptance" {
+			t.Errorf("AcceptanceStageID = %q, want acceptance", entry.AcceptanceStageID)
+		}
+		reviewer.mu.Lock()
+		defer reviewer.mu.Unlock()
+		if len(reviewer.calls) != 1 {
+			t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
+		}
+		return entry, reviewer.calls[0]
 	}
-	s, sf, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewersWithAcceptance)
-	priv, _ := sf.issue(t, runID)
-	// A schema-valid plan with NO acceptance_criteria and NO out_of_scope:
-	// the pre-check flags no_blocking_criterion.
-	body := validPlanBytes(t)
-
-	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
-	if w.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
-	}
-	// Gating review (human: 0) runs synchronously; the captured prompt is
-	// ready as soon as the upload returns.
-
-	// (a) The audit entry persists the finding.
-	entry := lastAcceptancePrecheckEntry(t, au)
-	if hasAcceptanceFinding(entry, acceptanceRuleNoBlockingCriterion) == nil {
-		t.Fatalf("want a persisted no_blocking_criterion finding; got %+v", entry.Findings)
-	}
-	if entry.AcceptanceStageID != "acceptance" {
-		t.Errorf("AcceptanceStageID = %q, want acceptance", entry.AcceptanceStageID)
-	}
-
-	// (b) The SAME finding renders in the plan-review prompt.
-	reviewer.mu.Lock()
-	defer reviewer.mu.Unlock()
-	if len(reviewer.calls) != 1 {
-		t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
-	}
-	got := reviewer.calls[0]
-	wants := []string{
-		"### Gate evidence (machine-verified — outranks text-level findings)",
-		"Acceptance pre-check (verification.acceptance_criteria evaluated against the configured acceptance stage)",
-		"FINDING no_blocking_criterion",
-	}
-	for _, want := range wants {
-		if !strings.Contains(got, want) {
-			t.Errorf("plan-review prompt missing acceptance gate-evidence element %q — threading seam broken:\n%s", want, got)
+	assertRendered := func(t *testing.T, got string, wants []string) {
+		t.Helper()
+		for _, want := range wants {
+			if !strings.Contains(got, want) {
+				t.Errorf("plan-review prompt missing acceptance gate-evidence element %q — threading seam broken:\n%s", want, got)
+			}
 		}
 	}
+
+	t.Run("no_blocking_criterion", func(t *testing.T) {
+		// A schema-valid plan with NO acceptance_criteria and NO out_of_scope:
+		// the pre-check flags no_blocking_criterion.
+		entry, got := shipAndCapture(t, validPlanBytes(t))
+		// (a) The audit entry persists the finding.
+		if hasAcceptanceFinding(entry, acceptanceRuleNoBlockingCriterion) == nil {
+			t.Fatalf("want a persisted no_blocking_criterion finding; got %+v", entry.Findings)
+		}
+		// (b) The SAME finding renders in the plan-review prompt.
+		assertRendered(t, got, []string{
+			"### Gate evidence (machine-verified — outranks text-level findings)",
+			"Acceptance pre-check (verification.acceptance_criteria evaluated against the configured acceptance stage)",
+			"FINDING no_blocking_criterion",
+		})
+	})
+
+	t.Run("criterion_restates_test", func(t *testing.T) {
+		// E72.1: one criterion whose verify_hint names ONLY a Go test.
+		body := acceptancePlanBody(t, []map[string]any{
+			testOnlyCriterion("c1", "the hook deletes the pending acceptance stage",
+				"TestApprovePlan_AcceptanceSurfaceNone_OmitsAcceptanceStage passes"),
+		}, nil)
+		entry, got := shipAndCapture(t, body)
+		// (a) Persisted: the finding and the headline count.
+		if hasAcceptanceFinding(entry, acceptanceRuleCriterionRestatesTest) == nil {
+			t.Fatalf("want a persisted criterion_restates_test finding; got %+v", entry.Findings)
+		}
+		if entry.RestatesTestCount != 1 {
+			t.Errorf("persisted restates_test_count = %d, want 1", entry.RestatesTestCount)
+		}
+		// (b) Rendered: the ADVISORY line with its HANDLING clause, keyed on the
+		// rule constant — and NOT a plain FINDING line for the same rule.
+		assertRendered(t, got, []string{
+			"- criteria whose verify_hint names only a Go test (criterion_restates_test): 1",
+			"- ADVISORY criterion_restates_test (criterion: c1):",
+			"HANDLING: acknowledge this in `free_form`. Do NOT record it as a concern",
+		})
+		if strings.Contains(got, "- FINDING criterion_restates_test") {
+			t.Errorf("plan-review prompt renders criterion_restates_test as a plain FINDING line; want the ADVISORY line only:\n%s", got)
+		}
+	})
+
+	t.Run("acceptance_surface_none", func(t *testing.T) {
+		// E72.1: a zero-criteria plan declaring acceptance_surface: none.
+		body := acceptancePlanBodyWithSurface(t, nil, []string{"a comment-only change has no observable surface"}, plan.AcceptanceSurfaceValueNone)
+		entry, got := shipAndCapture(t, body)
+		if !entry.AcceptanceSurfaceNone {
+			t.Error("persisted acceptance_surface_none = false, want true")
+		}
+		assertRendered(t, got, []string{
+			"- acceptance_surface: none — the plan declares no operator-observable surface, so the acceptance stage will be OMITTED at plan approval",
+			"`acceptance_stage_omitted`",
+		})
+	})
 }
 
 // TestShipPlan_ReviewAgents_ScopeRegressionReachesReviewPrompt is the #1257

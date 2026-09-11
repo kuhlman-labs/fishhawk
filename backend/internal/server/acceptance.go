@@ -1283,6 +1283,25 @@ const (
 	// disposition: an undecidable row is not a defect, so there is nothing to fix
 	// up or retry.
 	acceptanceGateUndecidable = "acceptance_undecidable"
+	// acceptanceGateOmitted is the FIFTH merge-eligible terminal disposition
+	// (E72.1 / #3325): the approved plan declared
+	// verification.acceptance_surface: none, so the plan gate recorded an
+	// acceptance_stage_omitted marker and DELETED the run's pending acceptance
+	// stage before the orchestrator ever saw it. The workflow SPEC still
+	// declares the stage — that is why acceptanceGateState gets past its
+	// off-switch — but no stage ROW exists, and without this disposition every
+	// such run would wedge at acceptance_pending ("not yet materialized").
+	//
+	// It is deliberately NOT acceptanceGatePassed: nothing was verified, because
+	// the stage never existed to verify anything — a materially different claim
+	// from a pass, and from not_validated (which is decided by a stage that DID
+	// exist and short-circuited). The state STRING carries that distinction to
+	// every consumer. It is read ONLY when no acceptance stage row exists: a
+	// marker with the stage still present (the delete failed after the append)
+	// takes the ordinary stage path, so the gate never admits a merge on the
+	// marker alone while a stage row is live. Value is the audit category
+	// itself so the marker string and the gate state cannot diverge.
+	acceptanceGateOmitted = CategoryAcceptanceStageOmitted
 )
 
 // acceptanceGateAdmitsMerge reports whether an acceptanceGateState value admits
@@ -1295,9 +1314,11 @@ const (
 // The admitted set: not-declared (the workflow declares no acceptance stage),
 // passed (a validated pass), skipped-out-of-scope (E38.3 / #1877), not-validated
 // (#2347, zero criteria verified), arbitrated (#2474, an operator discharged
-// a paged triage), and undecidable (#2512, the stage ran and could not decide a
-// criterion, with nothing failing). Everything else — pending, triage,
-// settled-outcome-unknown, and any future state — is refused.
+// a paged triage), undecidable (#2512, the stage ran and could not decide a
+// criterion, with nothing failing), and omitted (E72.1 / #3325, the plan
+// declared no acceptance surface and the stage was dropped at approval).
+// Everything else — pending, triage, settled-outcome-unknown, and any future
+// state — is refused.
 //
 // Callers must STILL gate on a nil read error themselves: this predicate sees
 // only the state string, and acceptanceGateState returns ("", err) on a read
@@ -1306,7 +1327,8 @@ func acceptanceGateAdmitsMerge(state string) bool {
 	switch state {
 	case acceptanceGateNotDeclared, acceptanceGatePassed,
 		acceptanceGateSkippedOutOfScope, acceptanceGateNotValidated,
-		acceptanceGateArbitrated, acceptanceGateUndecidable:
+		acceptanceGateArbitrated, acceptanceGateUndecidable,
+		acceptanceGateOmitted:
 		return true
 	default:
 		return false
@@ -1497,8 +1519,12 @@ func arbitrationOutcomeSequence(payload []byte) (int64, bool) {
 //     out-of-scope skip — a legitimate merge-eligible disposition).
 //   - acceptanceGateOutcomeUnknown— no readable verdict, the acceptance stage
 //     is terminal, and NO skip marker (the genuine settled-outcome-unknown hole).
+//   - acceptanceGateOmitted       — no verdict, NO acceptance stage row at all,
+//     and the run carries an acceptance_stage_omitted marker (E72.1 / #3325:
+//     the plan declared acceptance_surface: none and the plan gate dropped the
+//     stage). Merge-eligible; NOT a pass. Read only when no stage row exists.
 //   - acceptanceGatePending       — no verdict yet and the acceptance stage is
-//     non-terminal or not yet materialized.
+//     non-terminal, or not yet materialized with no omission marker.
 //
 // For a workflow with no acceptance stage it returns acceptanceGateNotDeclared
 // ("") — the merge is never acceptance-gated. FAIL-CLOSED (binding condition):
@@ -1568,7 +1594,39 @@ func (s *Server) acceptanceGateState(ctx context.Context, runRow *run.Run, stage
 		}
 		return acceptanceGateOutcomeUnknown, nil
 	}
+	// No acceptance stage ROW at all (the spec declares one — the off-switch
+	// above passed). E72.1 / #3325: the plan gate deletes the pending stage when
+	// the approved plan declares acceptance_surface: none, leaving an
+	// acceptance_stage_omitted marker; that marker is the merge-eligible
+	// disposition. Consulted ONLY on the no-row branch — a marker beside a live
+	// stage row (delete failed after append) took the stage path above. No
+	// marker → the stage is genuinely not yet materialized → pending, unchanged.
+	// FAIL-CLOSED: the marker read error is PROPAGATED, same posture as the
+	// verdict and skip-marker reads.
+	if acceptanceStageOf(stages) == nil {
+		omitted, oerr := s.acceptanceStageOmitted(ctx, runRow.ID)
+		if oerr != nil {
+			return "", oerr
+		}
+		if omitted {
+			return acceptanceGateOmitted, nil
+		}
+	}
 	return acceptanceGatePending, nil
+}
+
+// acceptanceStageOmitted reports whether the run's audit chain carries at least
+// one acceptance_stage_omitted marker (E72.1 / #3325) — the plan gate's durable
+// record that it dropped the run's pending acceptance stage because the
+// approved plan declared acceptance_surface: none. Propagates the read error so
+// acceptanceGateState fails closed rather than resolving a merge-eligible state
+// on an unreadable chain.
+func (s *Server) acceptanceStageOmitted(ctx context.Context, runID uuid.UUID) (bool, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceStageOmitted)
+	if err != nil {
+		return false, err
+	}
+	return len(entries) > 0, nil
 }
 
 // acceptanceStageSkippedOutOfScope reports whether the run's audit chain carries

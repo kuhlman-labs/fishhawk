@@ -1095,6 +1095,40 @@ func (q *Queries) ParkScopeCompleteness(ctx context.Context, arg ParkScopeComple
 	return i, err
 }
 
+// PRESERVE ON REGENERATION (E72.1 / #3325): this block is a HAND-MIRRORED copy
+// of backend/internal/run/queries.sql's DeletePendingAcceptanceStage, which is
+// the AUTHORITY. `sqlc generate` regenerates every package in this repo and
+// produces out-of-scope churn, so the .sql and this constant are edited in
+// lockstep by hand, and THIS constant is the copy that actually executes. Drift
+// is caught behaviorally by the run/postgres_test.go
+// TestPostgres_DeletePendingAcceptanceStage_* table (pending row deleted,
+// non-pending and non-acceptance rows untouched, RESTRICT error surfaced).
+const deletePendingAcceptanceStage = `-- name: DeletePendingAcceptanceStage :execrows
+DELETE FROM stages
+ WHERE id = $1
+   AND state = 'pending'
+   AND stage_type = 'acceptance'
+`
+
+// Physically removes a run's PENDING acceptance stage row (E72.1 / #3325):
+// the plan gate calls it when the approved plan declares
+// verification.acceptance_surface: none, so the run is genuinely minted
+// WITHOUT an acceptance stage rather than carrying one that would only ever
+// short-circuit. The two predicates ARE the refusal — a stage that is not
+// pending (already dispatched/settled) or not an acceptance stage matches
+// ZERO rows (execrows returns 0), so there is no check-then-write window.
+// audit_entries.stage_id and approvals.stage_id are ON DELETE RESTRICT, so a
+// row referencing the stage makes the DELETE error instead of cascading; the
+// caller treats that as fail-open (stage retained). Hand-mirrored into
+// db/queries.sql.go (see the preserve-on-regeneration note there).
+func (q *Queries) DeletePendingAcceptanceStage(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deletePendingAcceptanceStage, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 // PRESERVE ON REGENERATION (#3083, #3084): TWO elements of the statement below
 // are HAND-MIRRORED copies of backend/internal/run/queries.sql's
 // RecordStageProgress, which is the AUTHORITY — (1) the terminal-state IN-list

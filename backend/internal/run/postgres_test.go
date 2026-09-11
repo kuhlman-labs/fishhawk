@@ -3159,3 +3159,138 @@ func TestPostgres_RecordStageProgress_RefusedOnSupersededStage(t *testing.T) {
 			"is missing 'superseded' in queries.sql, in the hand-mirrored db/queries.sql.go constant, or both")
 	}
 }
+
+// acceptanceStageOmitter is the narrow capability the server's plan-gate
+// acceptance-omission hook asserts on the RunRepo (E72.1 / #3325). Declared
+// here rather than imported so the test pins the POSTGRES repository's shape
+// against the consumer's expectation without a server import.
+type acceptanceStageOmitter interface {
+	DeletePendingAcceptanceStage(ctx context.Context, id uuid.UUID) (bool, error)
+}
+
+func omitterStore(t *testing.T, repo run.Repository) acceptanceStageOmitter {
+	t.Helper()
+	o, ok := repo.(acceptanceStageOmitter)
+	if !ok {
+		t.Fatalf("postgres repo does not implement DeletePendingAcceptanceStage; the server's optional capability assertion would silently retain every stage")
+	}
+	return o
+}
+
+// TestPostgres_DeletePendingAcceptanceStage_DeletesPending is the done-means
+// (E72.1 / #3325): a pending acceptance stage is removed and true is returned.
+func TestPostgres_DeletePendingAcceptanceStage_DeletesPending(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	makeTypedStage(t, repo, r.ID, 0, run.StageTypePlan)
+	acc := makeTypedStage(t, repo, r.ID, 1, run.StageTypeAcceptance)
+
+	deleted, err := omitterStore(t, repo).DeletePendingAcceptanceStage(ctx, acc.ID)
+	if err != nil {
+		t.Fatalf("DeletePendingAcceptanceStage: %v", err)
+	}
+	if !deleted {
+		t.Fatal("deleted = false, want true for a pending acceptance stage")
+	}
+	if _, err := repo.GetStage(ctx, acc.ID); !errors.Is(err, run.ErrNotFound) {
+		t.Errorf("GetStage after delete err = %v, want ErrNotFound", err)
+	}
+	stages, err := repo.ListStagesForRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	for _, st := range stages {
+		if st.Type == run.StageTypeAcceptance {
+			t.Errorf("acceptance stage %s still listed after delete", st.ID)
+		}
+	}
+	if len(stages) != 1 {
+		t.Errorf("stages after delete = %d, want 1 (the plan stage survives)", len(stages))
+	}
+}
+
+// TestPostgres_DeletePendingAcceptanceStage_RefusesNonPending pins the state
+// predicate: a succeeded acceptance stage matches zero rows and is retained.
+func TestPostgres_DeletePendingAcceptanceStage_RefusesNonPending(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	acc := makeTypedStage(t, repo, r.ID, 0, run.StageTypeAcceptance)
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning, run.StageStateSucceeded} {
+		if _, err := repo.TransitionStage(ctx, acc.ID, to, nil); err != nil {
+			t.Fatalf("→ %s: %v", to, err)
+		}
+	}
+
+	deleted, err := omitterStore(t, repo).DeletePendingAcceptanceStage(ctx, acc.ID)
+	if err != nil {
+		t.Fatalf("DeletePendingAcceptanceStage: %v", err)
+	}
+	if deleted {
+		t.Error("deleted = true for a SUCCEEDED acceptance stage: the state = 'pending' predicate is missing from queries.sql, the hand-mirrored db/queries.sql.go constant, or both")
+	}
+	got, err := repo.GetStage(ctx, acc.ID)
+	if err != nil {
+		t.Fatalf("GetStage after refused delete: %v (row must be intact)", err)
+	}
+	if got.State != run.StageStateSucceeded {
+		t.Errorf("state = %q, want succeeded (row untouched)", got.State)
+	}
+}
+
+// TestPostgres_DeletePendingAcceptanceStage_RefusesNonAcceptance pins the type
+// predicate: a pending IMPLEMENT stage matches zero rows and is retained.
+func TestPostgres_DeletePendingAcceptanceStage_RefusesNonAcceptance(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	impl := makeTypedStage(t, repo, r.ID, 0, run.StageTypeImplement)
+
+	deleted, err := omitterStore(t, repo).DeletePendingAcceptanceStage(ctx, impl.ID)
+	if err != nil {
+		t.Fatalf("DeletePendingAcceptanceStage: %v", err)
+	}
+	if deleted {
+		t.Error("deleted = true for a pending IMPLEMENT stage: the stage_type = 'acceptance' predicate is missing from queries.sql, the hand-mirrored db/queries.sql.go constant, or both")
+	}
+	if _, err := repo.GetStage(ctx, impl.ID); err != nil {
+		t.Fatalf("GetStage after refused delete: %v (row must be intact)", err)
+	}
+}
+
+// TestPostgres_DeletePendingAcceptanceStage_RefusedByReferencingAuditRow pins
+// the ON DELETE RESTRICT posture the omission hook's fail-open relies on: an
+// audit_entries row scoped to the pending acceptance stage makes the DELETE
+// error (never cascade), and the stage row stays intact.
+func TestPostgres_DeletePendingAcceptanceStage_RefusedByReferencingAuditRow(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	acc := makeTypedStage(t, repo, r.ID, 0, run.StageTypeAcceptance)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO audit_entries (id, run_id, stage_id, category, payload, entry_hash)
+		 VALUES ($1, $2, $3, 'stage_permissions_declared', '{}'::jsonb, 'h')`,
+		uuid.New(), r.ID, acc.ID); err != nil {
+		t.Fatalf("seed referencing audit row: %v", err)
+	}
+
+	deleted, err := omitterStore(t, repo).DeletePendingAcceptanceStage(ctx, acc.ID)
+	if err == nil {
+		t.Fatalf("DeletePendingAcceptanceStage returned nil error (deleted=%v) with a RESTRICT-referencing audit row; want a foreign-key error", deleted)
+	}
+	if deleted {
+		t.Error("deleted = true alongside an error")
+	}
+	if _, err := repo.GetStage(ctx, acc.ID); err != nil {
+		t.Fatalf("GetStage after refused delete: %v (row must be intact)", err)
+	}
+}

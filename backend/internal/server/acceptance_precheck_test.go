@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1227,5 +1228,218 @@ func TestShipPlan_AbsenceAssertionWithInRepoBasis_NoMarkerFinding(t *testing.T) 
 	}
 	if entry.LiveValidationMarkerCount != 0 {
 		t.Errorf("persisted live_validation_marker_count = %d, want 0", entry.LiveValidationMarkerCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// E72.1 / #3325: restates_test_count, no_observable_criterion,
+// acceptance_surface_none.
+// ---------------------------------------------------------------------------
+
+// acceptancePlanBodyWithSurface is acceptancePlanBody plus a
+// verification.acceptance_surface value (empty = omitted), for the E72.1 cases.
+func acceptancePlanBodyWithSurface(t *testing.T, criteria []map[string]any, outOfScope []string, surface string) []byte {
+	t.Helper()
+	body := acceptancePlanBody(t, criteria, outOfScope)
+	if surface == "" {
+		return body
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("unmarshal plan body: %v", err)
+	}
+	v, ok := m["verification"].(map[string]any)
+	if !ok {
+		t.Fatal("plan body has no verification object")
+	}
+	v["acceptance_surface"] = surface
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan body: %v", err)
+	}
+	return out
+}
+
+// testOnlyCriterion is a drivable criterion whose verify_hint names ONLY a Go
+// test — the criterion_restates_test shape.
+func testOnlyCriterion(id, statement, hint string) map[string]any {
+	return map[string]any{
+		"id": id, "statement": statement, "source": "explicit", "source_ref": "#3325",
+		"verify_hint": hint,
+	}
+}
+
+// (E72.1) A test-only-hint criterion draws criterion_restates_test and the
+// payload's restates_test_count headline is 1 — read off the ONE evaluator call.
+func TestRunAcceptancePrecheck_RestatesTestCount(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		testOnlyCriterion("c1", "the omission hook deletes the stage", "TestApprovePlan_AcceptanceSurfaceNone_OmitsAcceptanceStage passes"),
+		{"id": "c2", "statement": "the gate view reports the omission", "source": "explicit", "source_ref": "#3325",
+			"verify_hint": "GET /v0/runs/{run_id} returns 200 with acceptance state acceptance_stage_omitted"},
+	}, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if got.RestatesTestCount != 1 {
+		t.Errorf("RestatesTestCount = %d, want 1", got.RestatesTestCount)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	f := hasAcceptanceFinding(entry, acceptanceRuleCriterionRestatesTest)
+	if f == nil {
+		t.Fatalf("want a criterion_restates_test finding; got %+v", entry.Findings)
+	}
+	if f.CriterionID != "c1" {
+		t.Errorf("CriterionID = %q, want c1", f.CriterionID)
+	}
+	if entry.RestatesTestCount != 1 {
+		t.Errorf("persisted restates_test_count = %d, want 1", entry.RestatesTestCount)
+	}
+	if hasAcceptanceFinding(entry, acceptanceRuleNoObservableCriterion) != nil {
+		t.Errorf("c2 names an HTTP route, so no_observable_criterion must NOT fire; got %+v", entry.Findings)
+	}
+}
+
+// (E72.1) The issue-title headline: an ALL-test-restating plan draws
+// no_observable_criterion in the persisted entry.
+func TestRunAcceptancePrecheck_NoObservableCriterion_Fires(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		testOnlyCriterion("c1", "the hook appends the marker", "TestApprovePlan_AcceptanceSurfaceNone_OmitsAcceptanceStage"),
+		testOnlyCriterion("c2", "the query refuses a non-pending row", "go test ./backend/internal/run/... -run TestPostgres_DeletePendingAcceptanceStage"),
+	}, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if got.RestatesTestCount != 2 {
+		t.Errorf("RestatesTestCount = %d, want 2", got.RestatesTestCount)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	f := hasAcceptanceFinding(entry, acceptanceRuleNoObservableCriterion)
+	if f == nil {
+		t.Fatalf("want a no_observable_criterion finding on an all-test-restating plan; got %+v", entry.Findings)
+	}
+	if f.CriterionID != "" {
+		t.Errorf("CriterionID = %q, want empty (plan-level finding)", f.CriterionID)
+	}
+}
+
+// (E72.1, control) ONE observable criterion suppresses no_observable_criterion
+// while the test-only sibling still draws criterion_restates_test.
+func TestRunAcceptancePrecheck_NoObservableCriterion_SuppressedByObservable(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		testOnlyCriterion("c1", "the hook appends the marker", "TestApprovePlan_AcceptanceSurfaceNone_OmitsAcceptanceStage"),
+		testOnlyCriterion("c2", "the run status reports the omission", "GET /v0/runs/{run_id} returns 200 and TestX also covers it"),
+	}, nil)
+
+	if got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body); got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	if hasAcceptanceFinding(entry, acceptanceRuleNoObservableCriterion) != nil {
+		t.Errorf("want NO no_observable_criterion finding when one criterion names an HTTP route; got %+v", entry.Findings)
+	}
+	if entry.RestatesTestCount != 1 {
+		t.Errorf("restates_test_count = %d, want 1 (only c1 restates)", entry.RestatesTestCount)
+	}
+}
+
+// (E72.1, control) acceptance_surface: none with every criterion declared
+// skip_expected-with-basis suppresses no_observable_criterion AND the moot
+// all_criteria_skip_expected advisory, and sets the acceptance_surface_none
+// headline. (The plan package's semantic guard forbids none beside a drivable
+// criterion, so the suppression is exercised on the only legal none shape.)
+func TestRunAcceptancePrecheck_NoObservableCriterion_SuppressedBySurfaceNone(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBodyWithSurface(t, []map[string]any{
+		allSkipCriterion("c1", "the hook appends the marker", "covered by TestApprovePlan_AcceptanceSurfaceNone_OmitsAcceptanceStage"),
+		allSkipCriterion("c2", "the query refuses a non-pending row", "covered by the pgtest table"),
+	}, nil, plan.AcceptanceSurfaceValueNone)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	if hasAcceptanceFinding(entry, acceptanceRuleNoObservableCriterion) != nil {
+		t.Errorf("want NO no_observable_criterion finding under acceptance_surface: none; got %+v", entry.Findings)
+	}
+	if hasAcceptanceFinding(entry, acceptanceRuleAllCriteriaSkipExpected) != nil {
+		t.Errorf("want NO all_criteria_skip_expected finding under acceptance_surface: none (the stage is omitted, the short-circuit never runs); got %+v", entry.Findings)
+	}
+	if !got.AcceptanceSurfaceNone || !entry.AcceptanceSurfaceNone {
+		t.Errorf("AcceptanceSurfaceNone = (result %v, persisted %v), want true/true", got.AcceptanceSurfaceNone, entry.AcceptanceSurfaceNone)
+	}
+	if got.AllSkipShortCircuit {
+		t.Errorf("AllSkipShortCircuit = true under none, want false (the finding is suppressed and the headline reads off the finding)")
+	}
+}
+
+// (E72.1) The acceptance_surface_none headline on a zero-criteria none plan:
+// true, and no all_criteria_skip_expected finding.
+func TestRunAcceptancePrecheck_AcceptanceSurfaceNoneHeadline(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBodyWithSurface(t, nil, []string{"a comment-only change has no observable surface"}, plan.AcceptanceSurfaceValueNone)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if !got.AcceptanceSurfaceNone {
+		t.Error("AcceptanceSurfaceNone = false, want true")
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	if !entry.AcceptanceSurfaceNone {
+		t.Error("persisted acceptance_surface_none = false, want true")
+	}
+	if hasAcceptanceFinding(entry, acceptanceRuleAllCriteriaSkipExpected) != nil {
+		t.Errorf("want NO all_criteria_skip_expected finding; got %+v", entry.Findings)
+	}
+}
+
+// (E72.1, wire contract) A clean plan writes BOTH new keys present-and-zero /
+// present-and-false — byte-level JSON key presence, the #3026 posture: a
+// machine reader distinguishes "checked, clean" from "pre-#3325 binary".
+func TestRunAcceptancePrecheck_CleanPlanKeysPresentAndFalse(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		{"id": "c1", "statement": "the run status reports the state", "source": "explicit", "source_ref": "#3325",
+			"verify_hint": "GET /v0/runs/{run_id} returns 200"},
+	}, nil)
+	if got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body); got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var raw map[string]any
+	for _, ap := range au.appended {
+		if ap.Category == categoryPlanAcceptancePrecheck {
+			if err := json.Unmarshal(ap.Payload, &raw); err != nil {
+				t.Fatalf("unmarshal raw payload: %v", err)
+			}
+			break
+		}
+	}
+	if raw == nil {
+		t.Fatal("no plan_acceptance_precheck entry appended")
+	}
+	rc, ok := raw["restates_test_count"]
+	if !ok {
+		t.Fatalf("payload is missing restates_test_count — the tag must carry NO omitempty: %v", raw)
+	}
+	if rc != float64(0) {
+		t.Errorf("restates_test_count = %v, want 0 (present-and-zero)", rc)
+	}
+	sn, ok := raw["acceptance_surface_none"]
+	if !ok {
+		t.Fatalf("payload is missing acceptance_surface_none — the tag must carry NO omitempty: %v", raw)
+	}
+	if sn != false {
+		t.Errorf("acceptance_surface_none = %v, want false (present-and-false)", sn)
 	}
 }

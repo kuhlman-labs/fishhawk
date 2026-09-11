@@ -1334,6 +1334,22 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 		return nil, &approveActionError{failedAt: gateActionAdvance, err: err}
 	}
 
+	// Acceptance-stage omission (E72.1 / #3325): when the approved plan
+	// declares verification.acceptance_surface: none, record the
+	// acceptance_stage_omitted marker and THEN delete the run's pending
+	// acceptance stage. It runs HERE — after the approve-advance CAS admitted
+	// exactly this approval, and BEFORE the Orchestrator.Advance block — so
+	// the orchestrator never observes a stage the plan declared moot (it
+	// would otherwise dispatch or short-circuit it). Marker-first ordering
+	// makes the stage-less-and-marker-less state unreachable: a failure
+	// between the two writes leaves the run with its stage and is repaired by
+	// the next approval. Best-effort like the sibling hooks below — it never
+	// unwinds the approval; a plan without the declaration is a no-op with no
+	// audit read at all.
+	if p.Decision == approval.DecisionApprove && advanced.Type == run.StageTypePlan {
+		s.omitAcceptanceStageForSurfaceNone(ctx, advanced)
+	}
+
 	// Hand off to the orchestrator on both approve AND reject — approve
 	// dispatches the next stage; reject walks the run's state machine to
 	// terminal. Best-effort: the gate already passed/rejected and the audit
