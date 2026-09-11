@@ -669,3 +669,32 @@ func checkAcceptanceSurfaceNone(v Verification) error {
 	}
 	return nil
 }
+
+// CheckAcceptanceSurface is the NARROW exported entry point for the E72.1
+// acceptance_surface guard, for the plan-upload path (E72.6 / #3381).
+//
+// checkAcceptanceSurfaceNone runs inside semanticCheck, which only plan.Parse
+// reaches — and handleShipPlan validates SCHEMA only (plan.Validate), so
+// without this a plan declaring verification.acceptance_surface: none beside
+// a drivable criterion is stored, reaches the gate, and approval deletes the
+// run's acceptance stage. The ship path must NOT call plan.Parse wholesale
+// (its over-cap gate deliberately decodes with json.Unmarshal so the
+// semanticCheck over_cap ⇒ split_proposal coupling cannot reject a monolith
+// before the count-derived gate sees it; see the cap-gate comment in
+// handleShipPlan), so this is the ONE semantic rule the ship path enforces
+// directly. It decodes ONLY `verification` from the raw
+// bytes (no DisallowUnknownFields, no other semanticCheck rule) and delegates
+// to the same guard plan.Parse runs, so the two paths cannot disagree.
+//
+// A decode failure is returned non-nil (wrapped, not a *SemanticError) so the
+// caller FAILS CLOSED: schema-valid bytes cannot fail this decode, so the
+// branch is defensive, not a fail-open leg.
+func CheckAcceptanceSurface(data []byte) error {
+	var v struct {
+		Verification Verification `json:"verification"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return fmt.Errorf("acceptance_surface check: decode verification: %w", err)
+	}
+	return checkAcceptanceSurfaceNone(v.Verification)
+}

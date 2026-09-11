@@ -379,52 +379,49 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !coercionOK {
-			// Transient-retry backstop (#646): before failing-B, attempt a
-			// bounded in-run re-dispatch of the plan stage with the
-			// validation error fed back. A transient generation slip
-			// recovers on the re-attempt; a deterministic/structural
-			// violation fails the same validation twice and exhausts the
-			// budget, falling through to the unchanged fail-B path below.
-			if s.trySchemaRetry(r, runID, stageID, reportErr) {
-				// The 400 lets the now-finished runner exit cleanly (exactly
-				// as the fail-B path does). retry_scheduled signals to the
-				// local operator/driver that a re-attempt was set up rather
-				// than a terminal failure — the re-opened plan stage is
-				// re-driven automatically on the github_actions path and by a
-				// fresh fishhawk_run_stage --stage plan on the local path.
-				s.writeError(w, r, http.StatusBadRequest, "plan_invalid",
-					"plan does not validate against standard_v1; a bounded in-run retry was scheduled",
-					map[string]any{"error": reportErr.Error(), "retry_scheduled": true})
-				return
-			}
-
 			// Coercion could not help (non-string type or re-validation
-			// still fails) and the schema-retry budget is exhausted or
-			// unavailable. Fail the stage as category-B and walk the run
-			// to terminal failed (#527 / #603). The trace handler now
-			// leaves a plan stage in running (it no longer advances plan
-			// stages without a plan artifact), so FailStage walks
-			// running → failed; under a future plan-first reordering it
-			// walks from whatever non-terminal state the stage is in.
-			// advanceAfterFailure then drives the orchestrator so the run
-			// doesn't strand with a failed stage but a pending/running run.
-			// Best-effort: a transition / advance error logs but doesn't
-			// change the upload response.
-			cat := run.FailureB
-			reason := "plan_invalid: " + reportErr.Error()
-			if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
-				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-					"plan upload: transition to failed-B after validation error failed",
-					slog.String("run_id", runID.String()),
-					slog.String("stage_id", stageID.String()),
-					slog.String("error", ferr.Error()))
-			}
-			s.advanceAfterFailure(r, runID, stageID)
-			s.writeError(w, r, http.StatusBadRequest, "plan_invalid",
-				"plan does not validate against standard_v1",
-				map[string]any{"error": reportErr.Error()})
+			// still fails): refuse through the shared plan_invalid tail.
+			s.refusePlanInvalid(w, r, runID, stageID, reportErr)
 			return
 		}
+	}
+
+	// Ship-path acceptance_surface guard (E72.6 / #3381). The E72.1 rule
+	// "acceptance_surface: none is mutually exclusive with a drivable
+	// criterion" lives in plan.checkAcceptanceSurfaceNone, which only
+	// semanticCheck → plan.Parse reaches — and this handler validates SCHEMA
+	// only (plan.Validate, above), while omitAcceptanceStageForSurfaceNone
+	// keys SOLELY on DeclaresNoAcceptanceSurface. So without this call a plan
+	// declaring none beside a drivable criterion was stored, reached the
+	// gate, and approval deleted the run's acceptance stage — the plan
+	// dropping the stage that would have verified its own criterion.
+	//
+	// Unconditional: not gated on plan reviewers or a reviewer backend
+	// (runPlanReviews reaches plan.Parse only with agent reviewers AND a
+	// backend, and records plan_review_failed, never a 4xx). Deliberately
+	// NOT a wholesale switch to plan.Parse: the over-cap gate below decodes
+	// with json.Unmarshal so the semanticCheck over_cap ⇒ split_proposal
+	// coupling cannot pre-empt the count-derived reject, and that reasoning
+	// stands — this is the ONE semantic rule enforced directly here.
+	//
+	// Placement: after Validate/coercion (so the post-coercion body is
+	// checked) and BEFORE contentHash/GetByHash/ArtifactRepo.Create and every
+	// precheck, which is what guarantees a refused plan leaves NO artifact,
+	// NO plan_acceptance_precheck entry and NO acceptance_stage_omitted
+	// marker, with the acceptance stage row retained. Because it precedes
+	// the GetByHash lookup, a byte-identical re-upload of an artifact stored
+	// BEFORE this guard existed is refused rather than served from the
+	// content-hash cache — the correct outcome for a plan that would delete
+	// its own acceptance stage. The refusal shares the #646 schema-retry
+	// budget (one bounded re-dispatch with the guard message fed back as the
+	// validation_error, then fail-B); both branches' 400 bodies carry the
+	// guard message in details.error, which names the offending criterion
+	// id. A decode failure on schema-valid bytes is an internal
+	// inconsistency and is treated FAIL-CLOSED (refusal), unlike the
+	// over-cap gate's documented fail-open.
+	if err := plan.CheckAcceptanceSurface(body); err != nil {
+		s.refusePlanInvalid(w, r, runID, stageID, err)
+		return
 	}
 
 	contentHash := sha256Hex(body)
@@ -979,6 +976,55 @@ func (s *Server) consumeRetryBudget(ctx context.Context, runID, stageID uuid.UUI
 	return true, captured
 }
 
+// refusePlanInvalid is the shared plan_invalid refusal tail of handleShipPlan:
+// the schema-failure path (post-coercion) and the ship-path acceptance_surface
+// guard (E72.6 / #3381) both route here so the two refusals cannot diverge in
+// audit, stage state, run advancement, or response shape. reportErr is the
+// validation error fed back to the agent and echoed as details.error.
+//
+// Transient-retry backstop (#646): before failing-B, attempt a bounded in-run
+// re-dispatch of the plan stage with the validation error fed back. A
+// transient generation slip recovers on the re-attempt; a
+// deterministic/structural violation fails the same validation twice and
+// exhausts the budget, falling through to the fail-B path below.
+func (s *Server) refusePlanInvalid(w http.ResponseWriter, r *http.Request, runID, stageID uuid.UUID, reportErr error) {
+	if s.trySchemaRetry(r, runID, stageID, reportErr) {
+		// The 400 lets the now-finished runner exit cleanly (exactly
+		// as the fail-B path does). retry_scheduled signals to the
+		// local operator/driver that a re-attempt was set up rather
+		// than a terminal failure — the re-opened plan stage is
+		// re-driven automatically on the github_actions path and by a
+		// fresh fishhawk_run_stage --stage plan on the local path.
+		s.writeError(w, r, http.StatusBadRequest, "plan_invalid",
+			"plan does not validate against standard_v1; a bounded in-run retry was scheduled",
+			map[string]any{"error": reportErr.Error(), "retry_scheduled": true})
+		return
+	}
+
+	// The schema-retry budget is exhausted or unavailable. Fail the stage
+	// as category-B and walk the run to terminal failed (#527 / #603). The
+	// trace handler now leaves a plan stage in running (it no longer
+	// advances plan stages without a plan artifact), so FailStage walks
+	// running → failed; under a future plan-first reordering it walks from
+	// whatever non-terminal state the stage is in. advanceAfterFailure then
+	// drives the orchestrator so the run doesn't strand with a failed stage
+	// but a pending/running run. Best-effort: a transition / advance error
+	// logs but doesn't change the upload response.
+	cat := run.FailureB
+	reason := "plan_invalid: " + reportErr.Error()
+	if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan upload: transition to failed-B after validation error failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", ferr.Error()))
+	}
+	s.advanceAfterFailure(r, runID, stageID)
+	s.writeError(w, r, http.StatusBadRequest, "plan_invalid",
+		"plan does not validate against standard_v1",
+		map[string]any{"error": reportErr.Error()})
+}
+
 // trySchemaRetry attempts a bounded in-run re-dispatch of a plan stage
 // whose uploaded plan failed standard_v1 validation after coercion
 // (#646). It returns true when the re-dispatch was set up (caller
@@ -1431,9 +1477,11 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 
 	// Parse plan for the self-review guard (GeneratedBy.Model) and for the
 	// plan_review prompt builder. handleShipPlan validated SCHEMA only
-	// (plan.Validate); plan.Parse additionally runs semanticCheck, so a
-	// schema-valid plan can still fail here — most commonly a decomposition
-	// that scopes one file into two slices (checkCrossSliceSharedFiles, #1472).
+	// (plan.Validate) — with ONE exception, the acceptance_surface guard it
+	// additionally enforces via plan.CheckAcceptanceSurface (E72.6 / #3381);
+	// plan.Parse additionally runs the full semanticCheck, so a schema-valid
+	// plan can still fail here — most commonly a decomposition that scopes
+	// one file into two slices (checkCrossSliceSharedFiles, #1472).
 	// Without surfacing, the stage parks at awaiting_approval, no audit entry
 	// is emitted, and reviewStatusFor resolves to 'none' — a silently-hung
 	// review. Emit a terminal plan_review_failed entry carrying the validator
