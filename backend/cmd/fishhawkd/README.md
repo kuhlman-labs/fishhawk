@@ -104,6 +104,20 @@ resolved IP), so no operator-settable knob can aim the loopback round-trip — a
 every caller's raw bearer — off-host. Long-form contract:
 `backend/internal/server/README.md`.
 
+## Dev fixtures (`--dev-fixtures`, E72.2 / #3326)
+
+DEV ONLY. `scripts/dev preview` sets it on the acceptance-preview serve line so
+the sandboxed acceptance agent can materialize named scenarios; never enable
+it on a production deployment.
+
+| Env var | Flag | Effect | Default |
+|---|---|---|---|
+| `FISHHAWKD_DEV_FIXTURES` | `--dev-fixtures` | With `--db`: registers `GET/POST /v0/dev/fixtures` and `POST /v0/dev/sign` (a `WARN` names the surface at boot). Every route refuses a non-loopback peer `403 dev_surface_loopback_only` and is credential-less (no CSRF exemption is needed — the csrf middleware passes a session-less identity). Without `--db` the surface stays OFF and the log says so (`dev fixtures requested but no database configured; surface stays off`). **Trace-store consequence:** with `FISHHAWKD_S3_BUCKET` unset the daemon selects an in-memory trace store (`trace store: in-memory (dev fixtures)`) so the preview's `POST /v0/runs/{id}/trace` → `cost_recorded` → `spend_alert` / `unpriced_model_alert` path is drivable (#1874); a configured bucket always wins. | `false` |
+
+Route contract: `docs/api/v0.md` § "Dev fixtures (preview only)"; scenario
+catalog and applier: `backend/internal/devfixtures/README.md`; agent-facing
+rules: `docs/acceptance-preview.md` § "Seeded fixtures".
+
 ## OAuth 2.1 authorization server (ADR-076 slice 3 / E66.19 #2436)
 
 Five flags/env vars configure the embedded OAuth 2.1 authorization server that
