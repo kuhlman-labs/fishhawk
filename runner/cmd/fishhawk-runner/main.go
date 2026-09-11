@@ -714,15 +714,21 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 
-		// Conflict-resolution pass (E64.62 / #3202). ORDERING is load-bearing:
-		// this routes BEFORE the lineage-worktree block and before every
-		// implement-path branch / worktree / verify wiring below, because the
-		// pass is not an implement pass — it runs ON the run branch already
-		// checked out in this working tree, merges the advanced base LOCALLY,
-		// gates the agent to the conflicted hunks, pushes its single merge
-		// commit itself, and REPORTS the terminal outcome. Taking any of the
-		// implement wiring first would relocate the working directory out from
-		// under the merge the pass is about to perform.
+		// Conflict-resolution pass (E64.62 / #3202, #3340). ORDERING is
+		// load-bearing: this routes BEFORE the lineage-worktree block and before
+		// every implement-path branch / worktree / verify wiring below, because
+		// the pass is not an implement pass. It ESTABLISHES its OWN detached
+		// throwaway tree at the run-branch tip fetched fresh from the remote
+		// (establishConflictResolutionTree, #3340) — it does NOT assume the
+		// dispatch checkout sits at that tip, because on the local loop it does
+		// not: the dispatch checkout is the operator's main checkout on `main`,
+		// and the lineage worktree the block below would provision is detached
+		// back to its pre-agent ref by working_tree_restored, so neither ever
+		// sits at the run-branch tip. The pass merges the advanced base in that
+		// throwaway tree, gates the agent to the conflicted hunks, pushes its
+		// single merge commit itself, and REPORTS the terminal outcome. Taking
+		// any of the implement wiring first would relocate the working directory
+		// out from under the establishment the pass owns.
 		//
 		// promptConflictResolution is nil unless the backend served a fully
 		// populated instruction (conflictResolutionFromPrompt refuses a

@@ -213,29 +213,90 @@ git worktree remove /tmp/fishhawk-runner-fix
 
 **Residual, stated honestly:** the binary that verifies the change is then built from an **unmerged branch**, which is exactly why doing this automatically (option 2 in #3086) is deferred to its own discussion — see [#3086](https://github.com/kuhlman-labs/fishhawk/issues/3086).
 
+The **bounded conflict-resolution pass** below is a sibling case: it too runs under `bin/fishhawk-runner` built from `main`, so a run fixing the pass itself hits the same bootstrap deadlock and takes the same scratch-worktree escape before `fishhawk_rebase_run_branch`.
+
 ## Bounded conflict-resolution pass ([E64.62 / #3202](https://github.com/kuhlman-labs/fishhawk/issues/3202))
 
 When `fishhawk_rebase_run_branch` hits a base merge conflict, the backend may
 authorize ONE agent-driven conflict-resolution pass and re-open the implement
 stage for it. The runner recognises the pass by the four `conflict_resolution*`
 prompt-response fields and routes to `runConflictResolutionStage` **before** any
-implement / fix-up branch, worktree or verify wiring — the pass runs ON the run
-branch already checked out in the working tree, not in a relocated lineage
-worktree. `conflictResolutionFromPrompt` refuses a HALF-populated instruction
-(the flag set but a missing branch, base ref or anchor): a runner handed an
-empty base ref would merge nothing and then refuse naming the wrong cause,
-burning the ceiling-of-one budget on a serve bug.
+implement / fix-up branch, worktree or verify wiring.
+`conflictResolutionFromPrompt` refuses a HALF-populated instruction (the flag set
+but a missing branch, base ref or anchor): a runner handed an empty base ref
+would merge nothing and then refuse naming the wrong cause, burning the
+ceiling-of-one budget on a serve bug.
 
-The pass's git sequence is ordered and every step is load-bearing:
+**The pass ESTABLISHES its own tree — it does NOT assume the dispatch checkout
+sits at the run-branch tip ([#3340](https://github.com/kuhlman-labs/fishhawk/issues/3340)).**
+On the local loop the dispatch checkout is the operator's main checkout on
+`main`, and the lineage worktree the implement path would provision is detached
+back to its pre-agent ref by `working_tree_restored` — so NEITHER ever sits at
+the run-branch tip, and a `rev-parse HEAD` of the dispatch checkout reads `main`,
+not the anchor. Reading the local HEAD would have refused
+`conflict_resolution_unexpected_head` on EVERY real pass while every hermetic
+test stayed green. So `runConflictResolutionStage` runs **step 0** first,
+described below, and only then hands a fresh throwaway tree to the pass.
 
-1. Verify the checked-out tip equals the trigger's `expected_head_sha` —
+**Step 0 — establishment (`establishConflictResolutionTree`):** in the dispatch
+checkout, (a) require it to be a git work tree (`conflict_resolution_tree_unavailable`,
+category C, else); (b) mint a fresh base-auth token (never fatal — degrades to
+ambient auth); (c) fetch the run-branch tip from `origin` and (d) refuse
+`conflict_resolution_unexpected_head` (category B — the remote branch moved past
+the trigger's anchor) if it differs from `expected_head_sha`; (e) qualify the
+base ref and derive `(remote, branch)` from the **qualified** ref
+(`conflictBaseFetchTarget`), refusing `conflict_resolution_base_ref_unfetchable`
+(category B) for a shape with no fetchable `<remote>/<branch>` (e.g.
+`refs/tags/…`); (f) fetch the base branch from **that** remote
+(`conflict_resolution_base_fetch_failed`, category C, else); then (g)
+`git worktree add --detach` a throwaway tree at the anchor under `os.MkdirTemp`
+(`conflict_resolution_tree_provision_failed`, category C, else). The agent AND
+the pass then run in that tree, and the push is pinned to the gate-authorized
+SHA exactly as before; the tree is torn down after the terminal report. Teardown
+is best-effort and logs `conflict_resolution_tree_removed`, or
+`conflict_resolution_teardown_failed` when the primary `git worktree remove
+--force` fails and the unlock/RemoveAll/prune fallback ladder runs — so a
+stranded tree is never misreported as cleanly removed. The two fetch-failure
+reasons (`_branch_fetch_failed` / `_base_fetch_failed`) are redacted before
+shipping, because a git transport error can echo a token-in-URL remote and the
+backend records the reason verbatim.
+
+Every establishment refusal fires **before any working-tree, branch or checkout
+mutation** of the dispatch checkout. The one side effect a later refusal may
+follow is a **remote-tracking-ref refresh**: step (c) refreshes
+`refs/remotes/origin/<branch>` and step (f) refreshes
+`refs/remotes/<baseRemote>/<baseBranch>`. Those are ref-only updates — never
+HEAD, index, working files or local branches — so they are benign, but they are
+NOT claimed away.
+
+**Fetch and merge name the SAME object, for every accepted base-ref shape.**
+`conflictBaseFetchTarget` maps `refs/heads/<b>` → `(origin, b)`,
+`refs/remotes/<r>/<b>` → `(r, b)`, and a remote-qualified `<r>/<b>` → `(r, b)`.
+The pass is then handed the remote-tracking ref
+`refs/remotes/<baseRemote>/<baseBranch>` as its base ref, so the object the
+step-(f) fetch REFRESHED is exactly the object the merge reads — including for a
+fully-qualified `refs/heads/main`, which names a stale LOCAL branch nothing
+refreshes and which the earlier design would have fetched-then-merged
+inconsistently. A `refs/heads/<b>` therefore merges the FRESH `origin/<b>` tip,
+not the stale local branch. `upstream/main` fetches from `upstream`, never
+`origin`. WHY a throwaway DETACHED tree: it never moves the operator's checkout
+(the #1866 base-contamination class), claims no branch name (the #1361 collision
+class), and the fix-up path's `checkout -B` can run only inside the lineage
+worktree this pass bypasses.
+
+The pass's own git sequence is ordered and every step is load-bearing:
+
+1. Verify the tree's tip equals the trigger's `expected_head_sha` —
    `conflict_resolution_unexpected_head` refuses **before** mutating anything.
-2. `git merge --no-commit --no-ff <ref>`, where `<ref>` is qualified by
-   `qualifyMergeRef`: an explicit `refs/...` path passes through, a ref whose
-   FIRST path segment names a **configured remote** passes through, and
-   everything else is prefixed with the remote. The rule is deliberately not
-   "contains a slash → already qualified" — that left `release/1.2` unqualified
-   and burned the budget on a naming bug.
+   This is a backstop to step 0(d): the tree was created at the fetched tip, so
+   this fires only if that tip moved between establishment and the pass.
+2. `git merge --no-commit --no-ff <ref>`, where `<ref>` is the remote-tracking
+   ref step 0 handed down (already `refs/...`, so `qualifyMergeRef` passes it
+   through). `qualifyMergeRef` still qualifies a raw ref: an explicit `refs/...`
+   path passes through, a ref whose FIRST path segment names a **configured
+   remote** passes through, and everything else is prefixed with the remote. The
+   rule is deliberately not "contains a slash → already qualified" — that left
+   `release/1.2` unqualified and burned the budget on a naming bug.
 3. A merge that completes CLEANLY refuses `conflict_resolution_no_conflict`: the
    base advanced past the conflict, and the operator authorized a resolution,
    not an unreviewed clean merge.
@@ -428,8 +489,21 @@ process-scoped `authConfigEnv` auth, PINS the push to the gate-authorized SHA
 and CONFIRMS the remote tip advanced to it, and the terminal outcome is reported as
 `{outcome:"conflict_resolution_pushed"}`. A refusal reports
 `{outcome:"failed", category:"B"}` carrying the NAMED refusal reason and the
-recovery verdict; a push failure reports category C. Neither arm may leave the
-stage in `running` — that strand is the failure this whole change removes.
+recovery verdict; a push failure reports category C. An establishment refusal
+(step 0) reports the same shape with the refusal's own category — C for
+`conflict_resolution_tree_unavailable` / `_branch_fetch_failed` /
+`_base_fetch_failed` / `_tree_provision_failed`, B for
+`conflict_resolution_unexpected_head` (the remote branch moved past the anchor)
+and `conflict_resolution_base_ref_unfetchable`. Neither arm may leave the stage
+in `running` — that strand is the failure this whole change removes.
+
+**Push-failure residual after teardown.** The merge commit is created in the
+throwaway tree, which shares the dispatch checkout's object store, and pushed
+before teardown. If the push FAILS, the terminal report's reason carries the
+commit SHA, but once the tree is torn down that commit is UNREACHABLE in the
+shared object store — `git gc` prunes unreachable loose objects only after
+`gc.pruneExpire` (2 weeks default, git-gc(1)), so the operator's
+resolve-push-vouch route keys off the SHA in the reason rather than a live ref.
 
 **The publish is PINNED, not merely confirmed.** `PushCommittedBranch` pushes
 `<HeadSHA>:refs/heads/<branch>`, never `HEAD:refs/heads/<branch>`, and refuses a

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -471,65 +472,74 @@ func crStageCfg(repo string) config {
 }
 
 // TestConflictResolutionStage_PushesAndReports is the publish-and-report
-// requirement: a passing gate must PUSH the merge commit through the authorized
-// pusher seam and then report the TERMINAL outcome. Neither arm may leave the
-// stage in `running`.
+// requirement, driven through the production-shaped fixture (a dispatch checkout
+// on `main`, a bare origin holding the run branch): the stage ESTABLISHES its
+// own tree at the fetched run-branch tip, a passing gate PUSHES the merge commit
+// through the authorized pusher seam, and it reports the TERMINAL outcome. The
+// merge commit is verified in the SHARED object store (the throwaway tree is
+// torn down before the assertions run), its parents are (anchor, live base tip),
+// and the dispatch checkout is left untouched with no leftover worktree.
 func TestConflictResolutionStage_PushesAndReports(t *testing.T) {
-	repo, head := crRepo(t)
+	dispatch, _, featureTip, baseTip := crDispatchRepo(t)
 	fp := &fakePusher{}
-	origPusher := newPusher
-	newPusher = func() pusher { return fp }
-	t.Cleanup(func() { newPusher = origPusher })
-
-	origAgent := conflictResolutionAgentInvoker
-	t.Cleanup(func() { conflictResolutionAgentInvoker = origAgent })
-	conflictResolutionAgentInvoker = func(_ context.Context, cfg config, _ io.Writer) error {
-		crWrite(t, cfg.workingDir, "conflict.txt", "ours\n")
-		return nil
-	}
+	tmp := crStageHarness(t, fp, crResolveInWorkdir)
 
 	client := &crFakeUpload{}
-	code := runConflictResolutionStage(context.Background(), crStageCfg(repo), crRequest(head),
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
 		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
 
 	if code != exitOK {
 		t.Fatalf("exit code = %d, want %d", code, exitOK)
 	}
-	mergeSHA := crGitOut(t, repo, "rev-parse", "HEAD")
 	if fp.pushCommittedArgs == nil {
 		t.Fatal("the merge commit was never pushed")
 	}
-	if fp.pushCommittedArgs.HeadSHA != mergeSHA || fp.pushCommittedArgs.Branch != "feature" {
-		t.Errorf("push args = %+v, want branch feature at %s", fp.pushCommittedArgs, mergeSHA)
+	mergeSHA := fp.pushCommittedArgs.HeadSHA
+	if fp.pushCommittedArgs.Branch != "feature" {
+		t.Errorf("push branch = %q, want feature", fp.pushCommittedArgs.Branch)
+	}
+	if err := exec.Command("git", "-C", dispatch, "cat-file", "-e", mergeSHA+"^{commit}").Run(); err != nil {
+		t.Errorf("merge commit %s absent from the shared object store: %v", mergeSHA, err)
+	}
+	if p1, p2 := crParents(t, dispatch, mergeSHA); p1 != featureTip || p2 != baseTip {
+		t.Errorf("merge parents = [%s %s], want [%s %s]", p1, p2, featureTip, baseTip)
+	}
+	if blob := crGitOut(t, dispatch, "show", mergeSHA+":conflict.txt"); blob != "ours" {
+		t.Errorf("resolved blob = %q, want ours", blob)
 	}
 	if len(client.ships) != 1 {
 		t.Fatalf("ships = %d, want exactly one terminal report", len(client.ships))
 	}
 	got := client.ships[0]
-	if got.Outcome != "conflict_resolution_pushed" || got.HeadSHA != mergeSHA || got.BaseSHA != head {
-		t.Errorf("report = %+v, want conflict_resolution_pushed at %s from %s", got, mergeSHA, head)
+	if got.Outcome != "conflict_resolution_pushed" || got.HeadSHA != mergeSHA || got.BaseSHA != featureTip {
+		t.Errorf("report = %+v, want conflict_resolution_pushed at %s from %s", got, mergeSHA, featureTip)
+	}
+	if hd := crGitOut(t, dispatch, "rev-parse", "--abbrev-ref", "HEAD"); hd != "main" {
+		t.Errorf("dispatch HEAD = %q, want main untouched", hd)
+	}
+	if paths := crWorktreePaths(t, dispatch); len(paths) != 1 {
+		t.Errorf("worktrees = %v, want only the dispatch checkout", paths)
+	}
+	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+		t.Errorf("throwaway temp parent not empty: %d entries", len(ents))
 	}
 }
 
 // TestConflictResolutionStage_RefusalReportsNamedReason: a refused pass must
-// still REPORT, carrying the named refusal reason, and must not push.
+// still REPORT, carrying the named refusal reason, and must not push. The
+// dispatch checkout is left on `main`, untouched.
 func TestConflictResolutionStage_RefusalReportsNamedReason(t *testing.T) {
-	repo, head := crRepo(t)
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
 	fp := &fakePusher{}
-	origPusher := newPusher
-	newPusher = func() pusher { return fp }
-	t.Cleanup(func() { newPusher = origPusher })
-
-	origAgent := conflictResolutionAgentInvoker
-	conflictResolutionAgentInvoker = func(_ context.Context, cfg config, _ io.Writer) error {
-		crWrite(t, cfg.workingDir, "quiet.txt", "tampered\n")
-		crWrite(t, cfg.workingDir, "conflict.txt", "ours\n")
-		return nil
-	}
-	t.Cleanup(func() { conflictResolutionAgentInvoker = origAgent })
+	crStageHarness(t, fp, func(cfg config) error {
+		if err := os.WriteFile(filepath.Join(cfg.workingDir, "quiet.txt"), []byte("tampered\n"), 0o644); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(cfg.workingDir, "conflict.txt"), []byte("ours\n"), 0o644)
+	})
 
 	client := &crFakeUpload{}
-	code := runConflictResolutionStage(context.Background(), crStageCfg(repo), crRequest(head),
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
 		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
 
 	if code != exitFailure {
@@ -548,28 +558,24 @@ func TestConflictResolutionStage_RefusalReportsNamedReason(t *testing.T) {
 	if !strings.Contains(got.Reason, "conflict_resolution_unstaged_change_outside_set") {
 		t.Errorf("reason = %q, want the NAMED refusal reason", got.Reason)
 	}
-	crAssertRestored(t, repo, head)
+	if hd := crGitOut(t, dispatch, "rev-parse", "--abbrev-ref", "HEAD"); hd != "main" {
+		t.Errorf("dispatch HEAD = %q, want main untouched", hd)
+	}
+	if st := crGitOut(t, dispatch, "status", "--porcelain"); st != "" {
+		t.Errorf("dispatch checkout not clean after refusal:\n%s", st)
+	}
 }
 
 // TestConflictResolutionStage_PushFailureReportsCategoryC pins the push-failure
 // branch: a transport failure is category C, not a judgment, and it still
 // settles the stage.
 func TestConflictResolutionStage_PushFailureReportsCategoryC(t *testing.T) {
-	repo, head := crRepo(t)
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
 	fp := &fakePusher{pushCommittedErr: errors.New("remote hung up")}
-	origPusher := newPusher
-	newPusher = func() pusher { return fp }
-	t.Cleanup(func() { newPusher = origPusher })
-
-	origAgent := conflictResolutionAgentInvoker
-	conflictResolutionAgentInvoker = func(_ context.Context, cfg config, _ io.Writer) error {
-		crWrite(t, cfg.workingDir, "conflict.txt", "ours\n")
-		return nil
-	}
-	t.Cleanup(func() { conflictResolutionAgentInvoker = origAgent })
+	crStageHarness(t, fp, crResolveInWorkdir)
 
 	client := &crFakeUpload{}
-	if code := runConflictResolutionStage(context.Background(), crStageCfg(repo), crRequest(head),
+	if code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
 		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard); code != exitFailure {
 		t.Fatalf("exit code = %d, want %d", code, exitFailure)
 	}
@@ -584,22 +590,14 @@ func TestConflictResolutionStage_PushFailureReportsCategoryC(t *testing.T) {
 // TestConflictResolutionStage_BadRepoSlugFailsClosed pins the owner/name guard:
 // an unresolvable repo slug must be reported, never silently skipped.
 func TestConflictResolutionStage_BadRepoSlugFailsClosed(t *testing.T) {
-	repo, head := crRepo(t)
-	origPusher := newPusher
-	newPusher = func() pusher { return &fakePusher{} }
-	t.Cleanup(func() { newPusher = origPusher })
-	origAgent := conflictResolutionAgentInvoker
-	conflictResolutionAgentInvoker = func(_ context.Context, cfg config, _ io.Writer) error {
-		crWrite(t, cfg.workingDir, "conflict.txt", "ours\n")
-		return nil
-	}
-	t.Cleanup(func() { conflictResolutionAgentInvoker = origAgent })
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	crStageHarness(t, &fakePusher{}, crResolveInWorkdir)
 	t.Setenv("GITHUB_REPOSITORY", "")
 
-	cfg := crStageCfg(repo)
+	cfg := crStageCfg(dispatch)
 	cfg.githubRepo = "not-a-slug"
 	client := &crFakeUpload{}
-	if code := runConflictResolutionStage(context.Background(), cfg, crRequest(head),
+	if code := runConflictResolutionStage(context.Background(), cfg, crDispatchRequest(featureTip),
 		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard); code != exitFailure {
 		t.Fatalf("exit code = %d, want %d", code, exitFailure)
 	}
@@ -892,17 +890,12 @@ func TestConflictResolutionStage_ReportShipFailures(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			repo, head := crRepo(t)
-			origPusher := newPusher
-			newPusher = func() pusher { return &fakePusher{} }
-			t.Cleanup(func() { newPusher = origPusher })
-			origAgent := conflictResolutionAgentInvoker
-			conflictResolutionAgentInvoker = func(_ context.Context, cfg config, _ io.Writer) error { return tc.agent(cfg) }
-			t.Cleanup(func() { conflictResolutionAgentInvoker = origAgent })
+			dispatch, _, featureTip, _ := crDispatchRepo(t)
+			crStageHarness(t, &fakePusher{}, tc.agent)
 
 			var sb strings.Builder
 			client := &crFakeUpload{err: errors.New("backend unreachable")}
-			if code := runConflictResolutionStage(context.Background(), crStageCfg(repo), crRequest(head),
+			if code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
 				client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, &sb); code != exitFailure {
 				t.Fatalf("exit code = %d, want %d", code, exitFailure)
 			}
@@ -1567,6 +1560,787 @@ func TestConflictResolutionPass_AttributeReadFailures(t *testing.T) {
 				t.Fatalf("reason = %q (%s), want %q", res.Reason, res.Detail, tc.reason)
 			}
 			crAssertRestored(t, repo, head)
+		})
+	}
+}
+
+// --- tree establishment: the dispatch checkout is not the run-branch tip (#3340) ---
+
+// crDispatchRepo builds the PRODUCTION-SHAPED fixture. A seed repo carries a
+// conflicting main/feature history; a `--bare` clone is the origin; a working
+// clone is the "dispatch checkout" left on `main` — mirroring the local loop,
+// where fishhawk_dispatch_stage runs against the operator's main checkout on
+// `main`, never the run-branch tip. `feature` exists only as a remote-tracking
+// ref in the dispatch clone (clone materializes a local branch only for the
+// checked-out HEAD), while `main` is a real local branch — which is what lets
+// the fully-qualified `refs/heads/main` case name a stale LOCAL ref.
+//
+// It returns (dispatchDir, bareDir, featureTip, baseTip).
+func crDispatchRepo(t *testing.T) (dispatchDir, bareDir, featureTip, baseTip string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	seed := t.TempDir()
+	crGit(t, seed, "init", "--initial-branch=main")
+	crGit(t, seed, "config", "user.name", "test")
+	crGit(t, seed, "config", "user.email", "test@example.com")
+	crWrite(t, seed, "conflict.txt", "base\n")
+	crWrite(t, seed, "quiet.txt", "untouched\n")
+	crGit(t, seed, "add", "-A")
+	crGit(t, seed, "commit", "-m", "initial")
+
+	crGit(t, seed, "checkout", "-b", "feature")
+	crWrite(t, seed, "conflict.txt", "ours\n")
+	crGit(t, seed, "commit", "-am", "ours")
+
+	crGit(t, seed, "checkout", "main")
+	crWrite(t, seed, "conflict.txt", "theirs\n")
+	crWrite(t, seed, "cleanly-advanced.txt", "new on base\n")
+	crGit(t, seed, "add", "-A")
+	crGit(t, seed, "commit", "-m", "theirs")
+
+	bareDir = filepath.Join(t.TempDir(), "origin.git")
+	crGit(t, seed, "clone", "--bare", seed, bareDir)
+
+	dispatchDir = filepath.Join(t.TempDir(), "dispatch")
+	crGit(t, seed, "clone", bareDir, dispatchDir)
+	crGit(t, dispatchDir, "config", "user.name", "test")
+	crGit(t, dispatchDir, "config", "user.email", "test@example.com")
+	crGit(t, dispatchDir, "checkout", "main")
+
+	featureTip = crGitOut(t, dispatchDir, "rev-parse", "refs/remotes/origin/feature")
+	baseTip = crGitOut(t, dispatchDir, "rev-parse", "refs/remotes/origin/main")
+	return dispatchDir, bareDir, featureTip, baseTip
+}
+
+// crDispatchRequest is the trigger for the dispatch fixture: run branch
+// `feature`, base branch `main`, anchored to the run-branch tip.
+func crDispatchRequest(head string) conflictResolutionRequest {
+	return conflictResolutionRequest{Branch: "feature", BaseRef: "main", ExpectedHeadSHA: head}
+}
+
+// crResolveInWorkdir is the stage-level stub agent: it resolves conflict.txt to
+// ours in the ESTABLISHED tree (cfg.workingDir, which the stage redirects).
+func crResolveInWorkdir(cfg config) error {
+	return os.WriteFile(filepath.Join(cfg.workingDir, "conflict.txt"), []byte("ours\n"), 0o644)
+}
+
+// crStageHarness wires the fake pusher, a stub agent, and a redirected throwaway
+// temp parent for a stage-level test, restoring every seam via t.Cleanup. It
+// returns the temp parent so a test can assert it is EMPTY after teardown.
+func crStageHarness(t *testing.T, fp *fakePusher, agent func(cfg config) error) string {
+	t.Helper()
+	origPusher := newPusher
+	newPusher = func() pusher { return fp }
+	t.Cleanup(func() { newPusher = origPusher })
+
+	origAgent := conflictResolutionAgentInvoker
+	conflictResolutionAgentInvoker = func(_ context.Context, cfg config, _ io.Writer) error { return agent(cfg) }
+	t.Cleanup(func() { conflictResolutionAgentInvoker = origAgent })
+
+	tmp := t.TempDir()
+	origTmp := conflictTreeTempDir
+	conflictTreeTempDir = tmp
+	t.Cleanup(func() { conflictTreeTempDir = origTmp })
+	return tmp
+}
+
+// crWorktreePaths reads `git worktree list --porcelain -z` through the same
+// splitNUL the production code uses (NUL framing, no newline parser) and returns
+// the `worktree <path>` records.
+func crWorktreePaths(t *testing.T, repo string) []string {
+	t.Helper()
+	raw := crGitOutBytes(t, repo, "worktree", "list", "--porcelain", "-z")
+	var paths []string
+	for _, rec := range splitNUL(raw) {
+		if p, ok := strings.CutPrefix(rec, "worktree "); ok {
+			paths = append(paths, p)
+		}
+	}
+	return paths
+}
+
+// crParents returns a commit's two parents via SEPARATE single-SHA rev-parse
+// calls (no field splitting of a combined line).
+func crParents(t *testing.T, repo, sha string) (p1, p2 string) {
+	t.Helper()
+	return crGitOut(t, repo, "rev-parse", sha+"^1"), crGitOut(t, repo, "rev-parse", sha+"^2")
+}
+
+// crAdvanceOriginBranch adds a NEW commit to the bare origin's <branch> and
+// returns its SHA. It clones the bare into a scratch dir, commits, and pushes, so
+// the dispatch checkout's local ref and its `refs/remotes/origin/<branch>`
+// tracking ref are left STALE — a fetch is required to observe the advance.
+func crAdvanceOriginBranch(t *testing.T, bareDir, branch, content string) string {
+	t.Helper()
+	parent := t.TempDir()
+	scratch := filepath.Join(parent, "advance")
+	crGit(t, parent, "clone", bareDir, scratch)
+	crGit(t, scratch, "config", "user.name", "test")
+	crGit(t, scratch, "config", "user.email", "test@example.com")
+	crGit(t, scratch, "checkout", branch)
+	crWrite(t, scratch, "conflict.txt", content)
+	crGit(t, scratch, "commit", "-am", "advance")
+	crGit(t, scratch, "push", "origin", branch)
+	return crGitOut(t, scratch, "rev-parse", "HEAD")
+}
+
+// crAdvanceOrigin advances the bare origin's `main`.
+func crAdvanceOrigin(t *testing.T, bareDir, content string) string {
+	t.Helper()
+	return crAdvanceOriginBranch(t, bareDir, "main", content)
+}
+
+// TestConflictResolutionStage_RemoteBranchMovedPastAnchor pins the (d) refusal:
+// the remote run branch advanced past the trigger's anchor, so the pass must
+// refuse unexpected_head / B, push nothing, and leave no worktree — AND the
+// run-branch fetch must already have refreshed refs/remotes/origin/feature (the
+// one ref-only side effect a later refusal may follow), while the dispatch
+// checkout is untouched. Counterfactual: drop the tip-vs-anchor compare and the
+// stage proceeds to a merge/push instead of refusing.
+func TestConflictResolutionStage_RemoteBranchMovedPastAnchor(t *testing.T) {
+	dispatch, bare, featureTip, _ := crDispatchRepo(t)
+	newFeatureTip := crAdvanceOriginBranch(t, bare, "feature", "ours advanced\n")
+	if newFeatureTip == featureTip {
+		t.Fatal("fixture not discriminating: origin feature did not advance")
+	}
+	fp := &fakePusher{}
+	tmp := crStageHarness(t, fp, crResolveInWorkdir)
+
+	client := &crFakeUpload{}
+	var sink strings.Builder
+	dispatchTip := crGitOut(t, dispatch, "rev-parse", "HEAD")
+	// Anchor to the OLD tip; the remote has since moved.
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, &sink)
+
+	if code != exitFailure {
+		t.Fatalf("exit code = %d, want %d", code, exitFailure)
+	}
+	if fp.pushCommittedArgs != nil {
+		t.Fatal("a moved-anchor pass pushed anyway")
+	}
+	if len(client.ships) != 1 {
+		t.Fatalf("ships = %d, want one report", len(client.ships))
+	}
+	got := client.ships[0]
+	if got.Category != "B" || !strings.Contains(got.Reason, reasonUnexpectedHead) {
+		t.Errorf("report = %+v, want category B naming %q", got, reasonUnexpectedHead)
+	}
+	if !strings.Contains(got.Reason, newFeatureTip) || !strings.Contains(got.Reason, featureTip) {
+		t.Errorf("reason = %q, want both the moved tip %s and the anchor %s", got.Reason, newFeatureTip, featureTip)
+	}
+	// (d) refuses BEFORE provisioning the tree: no tree-established event. This is
+	// the observable that isolates the (d) check from the pass's own step-1
+	// backstop (which would establish the tree, then refuse, then tear it down).
+	if strings.Contains(sink.String(), "conflict_resolution_tree_established") {
+		t.Errorf("a moved-anchor refusal established a tree — (d) should refuse first:\n%s", sink.String())
+	}
+	// The run-branch tracking ref WAS refreshed (the ref-only side effect), while
+	// the dispatch working tree is untouched.
+	if ref := crGitOut(t, dispatch, "rev-parse", "refs/remotes/origin/feature"); ref != newFeatureTip {
+		t.Errorf("refs/remotes/origin/feature = %s, want the fetched %s", ref, newFeatureTip)
+	}
+	if hd := crGitOut(t, dispatch, "rev-parse", "HEAD"); hd != dispatchTip {
+		t.Errorf("dispatch HEAD moved to %s", hd)
+	}
+	if st := crGitOut(t, dispatch, "status", "--porcelain"); st != "" {
+		t.Errorf("dispatch checkout not clean:\n%s", st)
+	}
+	if paths := crWorktreePaths(t, dispatch); len(paths) != 1 {
+		t.Errorf("worktrees = %v, want only the dispatch checkout", paths)
+	}
+	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+		t.Errorf("temp parent not empty: %d entries", len(ents))
+	}
+}
+
+// TestConflictResolutionStage_DispatchCheckoutOnDefaultBranch is the DONE-MEANS
+// test. The dispatch checkout is on `main` — NOT the run-branch tip — exactly as
+// the local loop dispatches it. The stage must establish its own tree at the
+// fetched run-branch tip, push the resolved merge commit, and leave the dispatch
+// checkout untouched with no leftover worktree. RED on the pre-fix code, which
+// reads the dispatch checkout's HEAD (main) and refuses unexpected_head.
+func TestConflictResolutionStage_DispatchCheckoutOnDefaultBranch(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	fp := &fakePusher{}
+	tmp := crStageHarness(t, fp, crResolveInWorkdir)
+
+	client := &crFakeUpload{}
+	dispatchTip := crGitOut(t, dispatch, "rev-parse", "HEAD")
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (dispatch on main must still resolve)", code, exitOK)
+	}
+	if len(client.ships) != 1 || client.ships[0].Outcome != "conflict_resolution_pushed" {
+		t.Fatalf("ships = %+v, want one conflict_resolution_pushed", client.ships)
+	}
+	if fp.pushCommittedArgs == nil {
+		t.Fatal("nothing was pushed")
+	}
+	if hd := crGitOut(t, dispatch, "rev-parse", "HEAD"); hd != dispatchTip {
+		t.Errorf("dispatch HEAD moved to %s, want %s untouched", hd, dispatchTip)
+	}
+	if st := crGitOut(t, dispatch, "status", "--porcelain"); st != "" {
+		t.Errorf("dispatch checkout not clean:\n%s", st)
+	}
+	if paths := crWorktreePaths(t, dispatch); len(paths) != 1 {
+		t.Errorf("worktrees = %v, want only the dispatch checkout", paths)
+	}
+	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+		t.Errorf("throwaway temp parent not empty: %d entries", len(ents))
+	}
+}
+
+// TestConflictResolutionStage_QualifiedBaseRefMergesFetchedTip is the operator's
+// BINDING-CONDITION test: for a fully-qualified `refs/heads/main` BaseRef, the
+// merge must consume the ref the fetch REFRESHED (refs/remotes/origin/main), not
+// the stale LOCAL `refs/heads/main`. The bare origin's main is advanced AFTER the
+// dispatch clone, so local main lags; a merge against the stale local ref would
+// produce a merge commit whose ^2 is the stale tip, while a merge against the
+// refreshed remote tip produces one whose ^2 is the fresh tip. Counterfactual:
+// revert to merging the qualified LOCAL ref and this goes RED on the ^2 parent.
+func TestConflictResolutionStage_QualifiedBaseRefMergesFetchedTip(t *testing.T) {
+	dispatch, bare, featureTip, staleBaseTip := crDispatchRepo(t)
+	freshBaseTip := crAdvanceOrigin(t, bare, "theirs advanced\n")
+	if freshBaseTip == staleBaseTip {
+		t.Fatal("fixture not discriminating: origin main did not advance")
+	}
+	fp := &fakePusher{}
+	crStageHarness(t, fp, crResolveInWorkdir)
+
+	req := crDispatchRequest(featureTip)
+	req.BaseRef = "refs/heads/main" // fully-qualified LOCAL branch
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), req,
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d", code, exitOK)
+	}
+	if fp.pushCommittedArgs == nil {
+		t.Fatal("nothing was pushed")
+	}
+	_, p2 := crParents(t, dispatch, fp.pushCommittedArgs.HeadSHA)
+	if p2 != freshBaseTip {
+		t.Errorf("merge ^2 = %s, want the FETCHED fresh tip %s (stale local was %s)", p2, freshBaseTip, staleBaseTip)
+	}
+}
+
+// TestConflictResolutionStage_StaleLocalBaseRefIsRefreshed pins the base fetch
+// for the BARE `main` shape: the dispatch clone's origin/main lags the advanced
+// bare origin, and the base fetch must refresh it so the pass conflicts against —
+// and merges — the LIVE base tip. Counterfactual: delete the base fetch and ^2
+// is the stale tip.
+func TestConflictResolutionStage_StaleLocalBaseRefIsRefreshed(t *testing.T) {
+	dispatch, bare, featureTip, staleBaseTip := crDispatchRepo(t)
+	freshBaseTip := crAdvanceOrigin(t, bare, "theirs advanced\n")
+	if freshBaseTip == staleBaseTip {
+		t.Fatal("fixture not discriminating: origin main did not advance")
+	}
+	fp := &fakePusher{}
+	crStageHarness(t, fp, crResolveInWorkdir)
+
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d", code, exitOK)
+	}
+	if fp.pushCommittedArgs == nil {
+		t.Fatal("nothing was pushed")
+	}
+	if _, p2 := crParents(t, dispatch, fp.pushCommittedArgs.HeadSHA); p2 != freshBaseTip {
+		t.Errorf("merge ^2 = %s, want the refreshed live base tip %s", p2, freshBaseTip)
+	}
+}
+
+// crFetchRecorder wraps the fetch seam to record the (remote, branch) each fetch
+// targeted, delegating to the real implementation. Restored via t.Cleanup. The
+// stage runs synchronously, so a plain slice needs no lock.
+func crFetchRecorder(t *testing.T) *[]struct{ remote, branch string } {
+	t.Helper()
+	var calls []struct{ remote, branch string }
+	orig := fetchConflictBranchTip
+	fetchConflictBranchTip = func(ctx context.Context, repoDir, remote, branch, token string) (string, error) {
+		calls = append(calls, struct{ remote, branch string }{remote, branch})
+		return orig(ctx, repoDir, remote, branch, token)
+	}
+	t.Cleanup(func() { fetchConflictBranchTip = orig })
+	return &calls
+}
+
+// crDispatchRepoWithUpstream builds the fixture for the non-default-remote case:
+// origin holds feature=ours and a NON-conflicting main (the merge-base), while a
+// second bare `upstream` holds a main that carries the conflicting `theirs`
+// commit. BaseRef `upstream/main` must fetch from upstream and merge upstream's
+// tip. Returns (dispatchDir, featureTip, upstreamMainTip).
+func crDispatchRepoWithUpstream(t *testing.T) (dispatchDir, featureTip, upstreamMainTip string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	seed := t.TempDir()
+	crGit(t, seed, "init", "--initial-branch=main")
+	crGit(t, seed, "config", "user.name", "test")
+	crGit(t, seed, "config", "user.email", "test@example.com")
+	crWrite(t, seed, "conflict.txt", "base\n")
+	crGit(t, seed, "add", "-A")
+	crGit(t, seed, "commit", "-m", "initial")
+
+	crGit(t, seed, "checkout", "-b", "feature")
+	crWrite(t, seed, "conflict.txt", "ours\n")
+	crGit(t, seed, "commit", "-am", "ours")
+	crGit(t, seed, "checkout", "main")
+
+	// origin is cloned BEFORE main advances, so origin/main stays at the base
+	// (the merge-base, non-conflicting with feature).
+	originBare := filepath.Join(t.TempDir(), "origin.git")
+	crGit(t, seed, "clone", "--bare", seed, originBare)
+
+	// Advance seed's main to the conflicting `theirs`, then clone upstream from
+	// it so ONLY upstream/main carries the conflict.
+	crWrite(t, seed, "conflict.txt", "theirs\n")
+	crGit(t, seed, "commit", "-am", "theirs")
+	upstreamBare := filepath.Join(t.TempDir(), "upstream.git")
+	crGit(t, seed, "clone", "--bare", seed, upstreamBare)
+
+	dispatchDir = filepath.Join(t.TempDir(), "dispatch")
+	crGit(t, seed, "clone", originBare, dispatchDir)
+	crGit(t, dispatchDir, "config", "user.name", "test")
+	crGit(t, dispatchDir, "config", "user.email", "test@example.com")
+	crGit(t, dispatchDir, "checkout", "main")
+	crGit(t, dispatchDir, "remote", "add", "upstream", upstreamBare)
+
+	featureTip = crGitOut(t, dispatchDir, "rev-parse", "refs/remotes/origin/feature")
+	upstreamMainTip = crGitOut(t, upstreamBare, "rev-parse", "main")
+	return dispatchDir, featureTip, upstreamMainTip
+}
+
+// TestConflictResolutionStage_BaseRefOnNonDefaultRemoteFetchesFromThatRemote
+// (finding 2): a `upstream/main` BaseRef must fetch from `upstream`, never
+// origin, and merge upstream's tip. Counterfactual: hard-code gitops.DefaultRemote
+// at the base fetch and the recorded base fetch is (origin, main), going RED.
+func TestConflictResolutionStage_BaseRefOnNonDefaultRemoteFetchesFromThatRemote(t *testing.T) {
+	dispatch, featureTip, upstreamMainTip := crDispatchRepoWithUpstream(t)
+	calls := crFetchRecorder(t)
+	fp := &fakePusher{}
+	crStageHarness(t, fp, crResolveInWorkdir)
+
+	req := crDispatchRequest(featureTip)
+	req.BaseRef = "upstream/main"
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), req,
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d; ships=%+v", code, exitOK, client.ships)
+	}
+	// The base fetch (the second fetch; the first is the run branch) targeted
+	// upstream, not origin.
+	foundUpstream := false
+	for _, c := range *calls {
+		if c.remote == "upstream" && c.branch == "main" {
+			foundUpstream = true
+		}
+	}
+	if !foundUpstream {
+		t.Errorf("fetch calls = %+v, want a base fetch of (upstream, main)", *calls)
+	}
+	if fp.pushCommittedArgs == nil {
+		t.Fatal("nothing was pushed")
+	}
+	if _, p2 := crParents(t, dispatch, fp.pushCommittedArgs.HeadSHA); p2 != upstreamMainTip {
+		t.Errorf("merge ^2 = %s, want upstream's main tip %s", p2, upstreamMainTip)
+	}
+}
+
+// TestConflictResolutionStage_BaseRefUnfetchableIsCategoryB: a base ref with no
+// fetchable <remote>/<branch> shape (a tag ref) is refused base_ref_unfetchable
+// / B, AFTER the single run-branch fetch and BEFORE any base fetch. Counterfactual:
+// remove the !ok refusal and it falls through to a base fetch of an empty branch,
+// reported base_fetch_failed / C instead.
+func TestConflictResolutionStage_BaseRefUnfetchableIsCategoryB(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	crGit(t, dispatch, "tag", "v1")
+	calls := crFetchRecorder(t)
+	fp := &fakePusher{}
+	crStageHarness(t, fp, crResolveInWorkdir)
+
+	req := crDispatchRequest(featureTip)
+	req.BaseRef = "refs/tags/v1"
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), req,
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitFailure {
+		t.Fatalf("exit code = %d, want %d", code, exitFailure)
+	}
+	if fp.pushCommittedArgs != nil {
+		t.Fatal("an unfetchable base ref pushed anyway")
+	}
+	if len(client.ships) != 1 {
+		t.Fatalf("ships = %d, want one report", len(client.ships))
+	}
+	got := client.ships[0]
+	if got.Category != "B" || !strings.Contains(got.Reason, reasonBaseRefUnfetchable) {
+		t.Errorf("report = %+v, want category B naming %q", got, reasonBaseRefUnfetchable)
+	}
+	if len(*calls) != 1 {
+		t.Errorf("fetch calls = %+v, want exactly the run-branch fetch (base fetch never reached)", *calls)
+	}
+}
+
+// TestConflictResolutionStage_BranchFetchFailureIsCategoryC: an unreachable
+// origin makes the run-branch fetch fail, reported branch_fetch_failed / C, with
+// no push and no worktree.
+func TestConflictResolutionStage_BranchFetchFailureIsCategoryC(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	crGit(t, dispatch, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "does-not-exist.git"))
+	fp := &fakePusher{}
+	tmp := crStageHarness(t, fp, crResolveInWorkdir)
+
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitFailure {
+		t.Fatalf("exit code = %d, want %d", code, exitFailure)
+	}
+	if fp.pushCommittedArgs != nil {
+		t.Fatal("a fetch failure pushed anyway")
+	}
+	if len(client.ships) != 1 || client.ships[0].Category != "C" ||
+		!strings.Contains(client.ships[0].Reason, reasonBranchFetchFailed) {
+		t.Fatalf("ships = %+v, want one category-C %q report", client.ships, reasonBranchFetchFailed)
+	}
+	if paths := crWorktreePaths(t, dispatch); len(paths) != 1 {
+		t.Errorf("worktrees = %v, want only the dispatch checkout", paths)
+	}
+	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+		t.Errorf("temp parent not empty: %d entries", len(ents))
+	}
+}
+
+// TestConflictResolutionStage_BaseFetchFailureIsCategoryC: the base branch is
+// deleted from the bare origin (HEAD re-pointed first), so the base fetch fails
+// while the run-branch fetch succeeds — reported base_fetch_failed / C.
+func TestConflictResolutionStage_BaseFetchFailureIsCategoryC(t *testing.T) {
+	dispatch, bare, featureTip, _ := crDispatchRepo(t)
+	crGit(t, bare, "symbolic-ref", "HEAD", "refs/heads/feature")
+	crGit(t, bare, "branch", "-D", "main")
+	fp := &fakePusher{}
+	crStageHarness(t, fp, crResolveInWorkdir)
+
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitFailure {
+		t.Fatalf("exit code = %d, want %d", code, exitFailure)
+	}
+	if fp.pushCommittedArgs != nil {
+		t.Fatal("a base fetch failure pushed anyway")
+	}
+	if len(client.ships) != 1 || client.ships[0].Category != "C" ||
+		!strings.Contains(client.ships[0].Reason, reasonBaseFetchFailed) {
+		t.Fatalf("ships = %+v, want one category-C %q report", client.ships, reasonBaseFetchFailed)
+	}
+}
+
+// TestConflictResolutionStage_DispatchDirNotAWorkTree: a dispatch dir that is not
+// a git work tree is refused tree_unavailable / C BEFORE any fetch. Counterfactual:
+// remove the isGitWorkTree guard and the run-branch fetch runs against a non-repo,
+// changing the reason.
+func TestConflictResolutionStage_DispatchDirNotAWorkTree(t *testing.T) {
+	empty := t.TempDir()
+	calls := crFetchRecorder(t)
+	fp := &fakePusher{}
+	crStageHarness(t, fp, crResolveInWorkdir)
+
+	cfg := crStageCfg(empty)
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), cfg, crDispatchRequest(strings.Repeat("d", 40)),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitFailure {
+		t.Fatalf("exit code = %d, want %d", code, exitFailure)
+	}
+	if len(client.ships) != 1 || client.ships[0].Category != "C" ||
+		!strings.Contains(client.ships[0].Reason, reasonTreeUnavailable) {
+		t.Fatalf("ships = %+v, want one category-C %q report", client.ships, reasonTreeUnavailable)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("fetch calls = %+v, want none (refused before any fetch)", *calls)
+	}
+	if fp.pushCommittedArgs != nil {
+		t.Fatal("a non-work-tree dispatch dir pushed anyway")
+	}
+}
+
+// TestConflictResolutionStage_TreeProvisionFailureIsCategoryC (finding 3) drives
+// BOTH provisioning sub-failures through the REAL path.
+func TestConflictResolutionStage_TreeProvisionFailureIsCategoryC(t *testing.T) {
+	t.Run("mkdirtemp_fails", func(t *testing.T) {
+		dispatch, _, featureTip, _ := crDispatchRepo(t)
+		fp := &fakePusher{}
+		crStageHarness(t, fp, crResolveInWorkdir)
+		// Point the temp parent at a regular FILE so os.MkdirTemp fails ENOTDIR.
+		notADir := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		conflictTreeTempDir = notADir
+
+		client := &crFakeUpload{}
+		dispatchTip := crGitOut(t, dispatch, "rev-parse", "HEAD")
+		code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
+			client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+		if code != exitFailure {
+			t.Fatalf("exit code = %d, want %d", code, exitFailure)
+		}
+		if fp.pushCommittedArgs != nil {
+			t.Fatal("a provisioning failure pushed anyway")
+		}
+		if len(client.ships) != 1 || client.ships[0].Category != "C" ||
+			!strings.Contains(client.ships[0].Reason, reasonTreeProvisionFailed) {
+			t.Fatalf("ships = %+v, want one category-C %q report", client.ships, reasonTreeProvisionFailed)
+		}
+		if hd := crGitOut(t, dispatch, "rev-parse", "HEAD"); hd != dispatchTip {
+			t.Errorf("dispatch HEAD moved to %s", hd)
+		}
+		if paths := crWorktreePaths(t, dispatch); len(paths) != 1 {
+			t.Errorf("worktrees = %v, want only the dispatch checkout", paths)
+		}
+	})
+
+	t.Run("worktree_add_fails", func(t *testing.T) {
+		dispatch, _, featureTip, _ := crDispatchRepo(t)
+		fp := &fakePusher{}
+		tmp := crStageHarness(t, fp, crResolveInWorkdir)
+		// A regular file at .git/worktrees makes `git worktree add` fail
+		// "Not a directory" (probed on git 2.50).
+		gitDir := crGitOut(t, dispatch, "rev-parse", "--absolute-git-dir")
+		if err := os.WriteFile(filepath.Join(gitDir, "worktrees"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		client := &crFakeUpload{}
+		dispatchTip := crGitOut(t, dispatch, "rev-parse", "HEAD")
+		code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
+			client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+		if code != exitFailure {
+			t.Fatalf("exit code = %d, want %d", code, exitFailure)
+		}
+		if fp.pushCommittedArgs != nil {
+			t.Fatal("a provisioning failure pushed anyway")
+		}
+		if len(client.ships) != 1 || client.ships[0].Category != "C" ||
+			!strings.Contains(client.ships[0].Reason, reasonTreeProvisionFailed) {
+			t.Fatalf("ships = %+v, want one category-C %q report", client.ships, reasonTreeProvisionFailed)
+		}
+		if hd := crGitOut(t, dispatch, "rev-parse", "HEAD"); hd != dispatchTip {
+			t.Errorf("dispatch HEAD moved to %s", hd)
+		}
+		// The MkdirTemp parent was removed on the worktree-add failure path.
+		if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+			t.Errorf("temp parent not cleaned up on worktree-add failure: %d entries", len(ents))
+		}
+	})
+}
+
+// TestConflictResolutionStage_AgentRunsInEstablishedTree: the agent must spawn in
+// the throwaway tree (detached HEAD at the anchor), NOT the dispatch checkout,
+// and its resolution must reach the pushed merge commit. Counterfactual: drop the
+// cfg.workingDir = treeDir redirect and the recorded dir is the dispatch dir.
+func TestConflictResolutionStage_AgentRunsInEstablishedTree(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	fp := &fakePusher{}
+	var agentDir, agentHead string
+	crStageHarness(t, fp, func(cfg config) error {
+		agentDir = cfg.workingDir
+		agentHead = crGitOut(t, cfg.workingDir, "rev-parse", "HEAD")
+		return os.WriteFile(filepath.Join(cfg.workingDir, "conflict.txt"), []byte("resolved-in-tree\n"), 0o644)
+	})
+
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d; ships=%+v", code, exitOK, client.ships)
+	}
+	if agentDir == dispatch {
+		t.Fatalf("agent ran in the dispatch checkout %s, not an established tree", dispatch)
+	}
+	if agentHead != featureTip {
+		t.Errorf("agent tree HEAD = %s, want the anchor %s (detached)", agentHead, featureTip)
+	}
+	// The recorded dir must have been a registered worktree at call time. It is
+	// torn down now, so assert it was UNDER the throwaway temp dir instead.
+	if !strings.HasPrefix(agentDir, conflictTreeTempDir) {
+		t.Errorf("agent dir %s is not under the throwaway temp dir %s", agentDir, conflictTreeTempDir)
+	}
+	if fp.pushCommittedArgs == nil {
+		t.Fatal("nothing was pushed")
+	}
+	if blob := crGitOut(t, dispatch, "show", fp.pushCommittedArgs.HeadSHA+":conflict.txt"); blob != "resolved-in-tree" {
+		t.Errorf("pushed blob = %q, want the stub's in-tree resolution", blob)
+	}
+}
+
+// TestConflictResolutionStage_TeardownOnRefusal: a refused pass still tears the
+// throwaway tree down, leaving the dispatch checkout clean and the temp parent
+// empty. Counterfactual: drop the deferred teardown and the temp parent is not
+// empty.
+func TestConflictResolutionStage_TeardownOnRefusal(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	fp := &fakePusher{}
+	tmp := crStageHarness(t, fp, func(cfg config) error {
+		// Tamper an out-of-set file so the gate refuses.
+		return os.WriteFile(filepath.Join(cfg.workingDir, "quiet.txt"), []byte("tampered\n"), 0o644)
+	})
+
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitFailure {
+		t.Fatalf("exit code = %d, want %d", code, exitFailure)
+	}
+	if paths := crWorktreePaths(t, dispatch); len(paths) != 1 {
+		t.Errorf("worktrees = %v, want only the dispatch checkout after teardown", paths)
+	}
+	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+		t.Errorf("throwaway temp parent not empty after refusal teardown: %d entries", len(ents))
+	}
+	if st := crGitOut(t, dispatch, "status", "--porcelain"); st != "" {
+		t.Errorf("dispatch checkout not clean:\n%s", st)
+	}
+}
+
+// TestConflictResolutionTeardown_FallbackOnLockedWorktree drives the teardown's
+// FAILURE arm: a LOCKED worktree makes the primary `git worktree remove --force`
+// refuse (a single --force will not remove a locked worktree), so the fallback
+// ladder (unlock, RemoveAll, prune) runs. It asserts the ladder actually removes
+// both the directory AND the git registration, and that the teardown names the
+// fallback DISTINCTLY (conflict_resolution_teardown_failed) rather than emitting
+// the success event over a possibly-stranded tree.
+//
+// Counterfactual: replace the teardown_failed branch with the plain
+// tree_removed event and the distinct-event assertion below goes RED.
+func TestConflictResolutionTeardown_FallbackOnLockedWorktree(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	tmp := t.TempDir()
+	origTmp := conflictTreeTempDir
+	conflictTreeTempDir = tmp
+	t.Cleanup(func() { conflictTreeTempDir = origTmp })
+
+	var sink strings.Builder
+	client := &crFakeUpload{}
+	treeDir, _, teardown, refusal := establishConflictResolutionTree(
+		context.Background(), crStageCfg(dispatch), client,
+		&upload.IssuedKey{PrivateKey: make([]byte, 64)}, crDispatchRequest(featureTip), &sink)
+	if refusal != nil {
+		t.Fatalf("establish refused: %+v", refusal)
+	}
+
+	// Lock the throwaway worktree so the teardown's primary `remove --force`
+	// fails and the fallback ladder runs.
+	crGit(t, dispatch, "worktree", "lock", treeDir)
+
+	teardown()
+
+	if !strings.Contains(sink.String(), "conflict_resolution_teardown_failed") {
+		t.Errorf("teardown did not name the fallback distinctly:\n%s", sink.String())
+	}
+	if strings.Contains(sink.String(), "conflict_resolution_tree_removed") {
+		t.Errorf("teardown emitted the success event on the fallback path:\n%s", sink.String())
+	}
+	// The directory is actually gone...
+	if _, err := os.Stat(treeDir); !os.IsNotExist(err) {
+		t.Errorf("tree directory still present after fallback teardown: err=%v", err)
+	}
+	// ...and so is its git worktree registration.
+	if paths := crWorktreePaths(t, dispatch); len(paths) != 1 {
+		t.Errorf("worktrees = %v, want only the dispatch checkout after fallback teardown", paths)
+	}
+	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+		t.Errorf("temp parent not empty after fallback teardown: %d entries", len(ents))
+	}
+}
+
+// TestConflictResolutionStage_FetchFailureRedactsCredential drives a run-branch
+// fetch error whose text embeds a token-in-URL remote through the stage and
+// asserts the SHIPPED Reason names the failure but does NOT leak the credential.
+// The error is injected through the fetchConflictBranchTip seam so the token is
+// deterministic across git versions (git's own URL-in-error redaction varies).
+//
+// Counterfactual: drop the redactString wrap on the branch-fetch-failed detail
+// and the leaked-credential assertion goes RED.
+func TestConflictResolutionStage_FetchFailureRedactsCredential(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	fp := &fakePusher{}
+	crStageHarness(t, fp, crResolveInWorkdir)
+
+	secret := "ghs_" + strings.Repeat("A", 40)
+	orig := fetchConflictBranchTip
+	fetchConflictBranchTip = func(_ context.Context, _, _, _, _ string) (string, error) {
+		return "", fmt.Errorf(
+			"fatal: unable to access 'https://x-access-token:%s@github.com/acme/widgets.git/': Connection refused", secret)
+	}
+	t.Cleanup(func() { fetchConflictBranchTip = orig })
+
+	client := &crFakeUpload{}
+	code := runConflictResolutionStage(context.Background(), crStageCfg(dispatch), crDispatchRequest(featureTip),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+	if code != exitFailure {
+		t.Fatalf("exit code = %d, want %d", code, exitFailure)
+	}
+	if len(client.ships) != 1 {
+		t.Fatalf("ships = %+v, want one report", client.ships)
+	}
+	got := client.ships[0].Reason
+	if !strings.Contains(got, reasonBranchFetchFailed) {
+		t.Fatalf("reason = %q, want it to name %q", got, reasonBranchFetchFailed)
+	}
+	if strings.Contains(got, secret) {
+		t.Fatalf("shipped reason leaked the fetch-URL credential: %q", got)
+	}
+}
+
+// TestConflictBaseFetchTarget pins the (remote, branch) derivation over every
+// qualified-ref shape qualifyMergeRef produces.
+func TestConflictBaseFetchTarget(t *testing.T) {
+	remotes := []string{"origin", "upstream"}
+	cases := []struct {
+		name, qualified string
+		wantRemote      string
+		wantBranch      string
+		wantOK          bool
+	}{
+		{"bare_main_qualified", "origin/main", "origin", "main", true},
+		{"refs_heads_main", "refs/heads/main", "origin", "main", true},
+		{"refs_remotes_upstream_main", "refs/remotes/upstream/main", "upstream", "main", true},
+		{"upstream_main_configured", "upstream/main", "upstream", "main", true},
+		{"upstream_release_slash", "upstream/release/1.2", "upstream", "release/1.2", true},
+		{"origin_release_slash", "origin/release/1.2", "origin", "release/1.2", true},
+		{"refs_tags_v1", "refs/tags/v1", "", "", false},
+		{"empty", "", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, b, ok := conflictBaseFetchTarget(tc.qualified, remotes)
+			if r != tc.wantRemote || b != tc.wantBranch || ok != tc.wantOK {
+				t.Errorf("conflictBaseFetchTarget(%q) = (%q, %q, %t), want (%q, %q, %t)",
+					tc.qualified, r, b, ok, tc.wantRemote, tc.wantBranch, tc.wantOK)
+			}
 		})
 	}
 }

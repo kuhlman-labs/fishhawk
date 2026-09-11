@@ -76,6 +76,46 @@ const (
 	// conflict_resolution_merge_message_changed, which reads MERGE_MSG BEFORE
 	// the commit: this one catches a rewrite that happens DURING it.
 	reasonCommittedMessageChanged = "conflict_resolution_committed_message_changed"
+
+	// --- tree-establishment refusals (#3340) ---
+	//
+	// The stage ESTABLISHES its own detached throwaway tree at the run-branch
+	// tip rather than assuming the dispatch checkout sits there (it does not on
+	// the local loop: main.go routes to the pass BEFORE lineage-worktree
+	// provisioning, and the lineage worktree is detached back to its pre-agent
+	// ref by working_tree_restored). Each refusal below fires BEFORE any
+	// WORKING-TREE, BRANCH or CHECKOUT mutation — the dispatch checkout's HEAD,
+	// index and files are untouched. The one side effect a later refusal may
+	// follow is a REMOTE-TRACKING-REF refresh: the run-branch fetch at step (c)
+	// refreshes refs/remotes/origin/<branch> and the base fetch at step (f)
+	// refreshes refs/remotes/<baseRemote>/<baseBranch> before a subsequent step
+	// can refuse. Those are ref-only updates — never HEAD, index, working files
+	// or local branches — so they are benign, but they are NOT claimed away.
+
+	// reasonTreeUnavailable — the dispatch checkout is empty or not a git work
+	// tree, so there is nothing to fetch the run-branch tip against and no clone
+	// to hang a throwaway worktree off. Refused before the run-branch fetch, so
+	// no tracking ref has been refreshed. Category C: an environment problem, not
+	// a judgment about the change.
+	reasonTreeUnavailable = "conflict_resolution_tree_unavailable"
+	// reasonBranchFetchFailed — the run-branch tip could not be fetched from the
+	// remote. Category C: transport, not judgment.
+	reasonBranchFetchFailed = "conflict_resolution_branch_fetch_failed"
+	// reasonBaseRefUnfetchable — the qualified base ref has no fetchable
+	// <remote>/<branch> shape (e.g. refs/tags/…), so the pass cannot fetch the
+	// base tip the merge will read. Refused AFTER the run-branch fetch refreshed
+	// refs/remotes/origin/<branch> but BEFORE any base fetch. Category B: an
+	// input the pass cannot honor, and a retry against the same trigger refuses
+	// identically.
+	reasonBaseRefUnfetchable = "conflict_resolution_base_ref_unfetchable"
+	// reasonBaseFetchFailed — the base branch could not be fetched from the
+	// remote the qualified ref names. Category C: transport, not judgment.
+	reasonBaseFetchFailed = "conflict_resolution_base_fetch_failed"
+	// reasonTreeProvisionFailed — the throwaway parent directory or the
+	// `git worktree add --detach` could not be created. Refused after both
+	// tracking refs were refreshed but before any working-tree/branch/checkout
+	// mutation. Category C: an environment problem.
+	reasonTreeProvisionFailed = "conflict_resolution_tree_provision_failed"
 )
 
 // conflictResolutionRequest is the runner's view of the backend's
@@ -160,6 +200,23 @@ var (
 	// the neutralization, i.e. by shipping a bypass.
 	conflictPostAddHook func(repoDir string)
 )
+
+// fetchConflictBranchTip fetches a branch's live tip into
+// refs/remotes/<remote>/<branch> WITHOUT moving any working tree, returning the
+// fetched tip SHA. Production wires it to gitops.FetchBaseTip; it is a
+// package-level var for the same reason fetchDiffBaseTip is (main.go): the
+// fake-pusher tests must never fetch against the runner's own source repo, and
+// the establishment tests wrap it to record the (remote, branch) each fetch
+// targeted. The run-branch fetch AND the base fetch both flow through it, so the
+// tracking ref it refreshes is exactly the one the merge later resolves.
+var fetchConflictBranchTip = gitops.FetchBaseTip
+
+// conflictTreeTempDir is the parent directory os.MkdirTemp creates the
+// throwaway worktree under. Empty means the OS default temp dir (os.TempDir).
+// A var so tests redirect it to a t.TempDir (avoiding /tmp pollution and
+// parallel races) and can point it at a regular FILE to induce the MkdirTemp
+// failure branch.
+var conflictTreeTempDir = ""
 
 // gitOut runs git in repoDir and returns trimmed stdout.
 func gitOut(ctx context.Context, repoDir string, args ...string) (string, error) {
@@ -348,6 +405,67 @@ func configuredRemotes(ctx context.Context, repoDir string) []string {
 		}
 	}
 	return names
+}
+
+// conflictBaseFetchTarget derives the (remote, branch) the base fetch must
+// target from the OUTPUT of qualifyMergeRef — never from the raw BaseRef, so
+// the fetch and the merge cannot disagree about which remote or branch is meant.
+// The stage then forces the merge to read refs/remotes/<remote>/<branch>, the
+// exact tracking ref this fetch refreshes, so for EVERY accepted shape the
+// object the fetch refreshed is the object the merge consumes (#3340).
+//
+// Shapes, all as qualifyMergeRef produces them:
+//
+//	refs/heads/<b>              → (DefaultRemote, b): the operator named a LOCAL
+//	                              branch, but a stale local ref is the defect this
+//	                              change closes, so the fresh remote tip is fetched
+//	                              and merged instead.
+//	refs/remotes/<r>/<b>        → (r, b): b may itself contain slashes.
+//	<r>/<b>, r a known remote   → (r, b): the already-remote-qualified case;
+//	                              b may contain slashes. DefaultRemote is always
+//	                              accepted (it is the runner's own remote and
+//	                              qualifyMergeRef's prefixing fallback), even when
+//	                              `git remote` degraded to an empty list.
+//	anything else (refs/tags/…, // → ok=false: no fetchable branch, so the caller
+//	an unknown remote prefix)      refuses reasonBaseRefUnfetchable rather than
+//	                               fetching from a guessed remote.
+func conflictBaseFetchTarget(qualified string, remotes []string) (fetchRemote, branch string, ok bool) {
+	if qualified == "" {
+		return "", "", false
+	}
+	if b, found := strings.CutPrefix(qualified, "refs/heads/"); found {
+		if b == "" {
+			return "", "", false
+		}
+		return gitops.DefaultRemote, b, true
+	}
+	if rest, found := strings.CutPrefix(qualified, "refs/remotes/"); found {
+		r, b, cut := strings.Cut(rest, "/")
+		if !cut || r == "" || b == "" {
+			return "", "", false
+		}
+		return r, b, true
+	}
+	if strings.HasPrefix(qualified, "refs/") {
+		// refs/tags/… or any other non-branch ref path: not fetchable as a branch.
+		return "", "", false
+	}
+	// A non-refs value is <remote>/<branch>: qualifyMergeRef leaves it unprefixed
+	// only when the first segment names a configured remote, and otherwise
+	// prefixes DefaultRemote — so the first segment is a remote name.
+	first, rest, cut := strings.Cut(qualified, "/")
+	if !cut || first == "" || rest == "" {
+		return "", "", false
+	}
+	if first == gitops.DefaultRemote {
+		return first, rest, true
+	}
+	for _, r := range remotes {
+		if r == first {
+			return first, rest, true
+		}
+	}
+	return "", "", false
 }
 
 // runConflictResolutionPass performs the whole local pass: verify, merge,
@@ -1082,8 +1200,174 @@ var conflictResolutionAgentInvoker = func(ctx context.Context, cfg config, logSi
 	return nil
 }
 
+// conflictTreeRefusal is the establishment step's failure: a named reason, an
+// operator-readable detail, and the terminal-report category.
+type conflictTreeRefusal struct {
+	Reason   string
+	Detail   string
+	Category string
+}
+
+// establishConflictResolutionTree provisions the throwaway detached worktree the
+// pass runs in, at the run-branch tip fetched fresh from the remote — instead of
+// assuming the dispatch checkout sits at that tip (#3340). It returns the tree
+// directory, the fully-qualified base ref the pass must merge (the exact
+// remote-tracking ref the base fetch refreshed, so fetch and merge name the same
+// object for every accepted BaseRef shape), a teardown func that is ALWAYS
+// non-nil and best-effort, and a refusal (nil on success).
+//
+// Every refusal fires BEFORE any WORKING-TREE, BRANCH or CHECKOUT mutation of
+// the dispatch checkout — its HEAD, index and files are untouched. The only side
+// effects a later refusal can follow are REMOTE-TRACKING-REF refreshes: step (c)
+// refreshes refs/remotes/origin/<branch> and step (f) refreshes
+// refs/remotes/<baseRemote>/<baseBranch>. Those are ref-only and benign, and are
+// not claimed away.
+func establishConflictResolutionTree(ctx context.Context, cfg config, client uploadClient,
+	issued *upload.IssuedKey, req conflictResolutionRequest, logSink io.Writer) (treeDir, mergeRef string, teardown func(), refusal *conflictTreeRefusal) {
+
+	noop := func() {}
+
+	// (a) The dispatch checkout must be a git work tree to fetch against and to
+	// hang the throwaway worktree off. Refused before any tracking ref moves.
+	dispatchDir := cfg.workingDir
+	if dispatchDir == "" {
+		dispatchDir = "."
+	}
+	if !isGitWorkTree(ctx, dispatchDir) {
+		return "", "", noop, &conflictTreeRefusal{
+			Reason:   reasonTreeUnavailable,
+			Detail:   "dispatch checkout " + dispatchDir + " is empty or not a git work tree",
+			Category: "C",
+		}
+	}
+
+	// (b) Mint a fresh base-auth token for the fetches. NEVER fatal: a mint
+	// failure degrades to ambient auth (#1951), it is not a refusal.
+	token := mintBaseAuthToken(ctx, cfg, client, issued, logSink)
+
+	// (c) Fetch the run-branch tip and compare it to the trigger's anchor. This
+	// refreshes refs/remotes/origin/<branch> — the one ref-only side effect a
+	// later refusal may follow.
+	tip, err := fetchConflictBranchTip(ctx, dispatchDir, gitops.DefaultRemote, req.Branch, token)
+	if err != nil {
+		// Redact the transport error before it becomes the shipped Reason: a git
+		// fetch error echoes the remote URL, which carries embedded credentials
+		// when a remote is configured with a token-in-URL, and the backend records
+		// this Reason verbatim (no downstream redaction on that field). Same
+		// discipline as the trace-bundle refusal text (#3338).
+		detail, _ := redactString("fetch run-branch tip of " + req.Branch + ": " + err.Error())
+		return "", "", noop, &conflictTreeRefusal{
+			Reason:   reasonBranchFetchFailed,
+			Detail:   detail,
+			Category: "C",
+		}
+	}
+	// (d) The remote branch must still be at the anchor the trigger authorized.
+	// A moved tip means the remote branch advanced past the anchor, so merging
+	// into it would push a commit the operator never anchored to. Category B: a
+	// decision, retry against the same trigger refuses identically.
+	if tip != req.ExpectedHeadSHA {
+		return "", "", noop, &conflictTreeRefusal{
+			Reason:   reasonUnexpectedHead,
+			Detail:   fmt.Sprintf("remote tip of %s is %s, trigger anchored to %s", req.Branch, tip, req.ExpectedHeadSHA),
+			Category: "B",
+		}
+	}
+
+	// (e) Resolve the base ref and derive the (remote, branch) the fetch must
+	// target from the QUALIFIED ref, so the fetch and the merge cannot disagree.
+	qualified := qualifyMergeRef(ctx, dispatchDir, gitops.DefaultRemote, req.BaseRef)
+	baseRemote, baseBranch, ok := conflictBaseFetchTarget(qualified, configuredRemotes(ctx, dispatchDir))
+	if !ok {
+		return "", "", noop, &conflictTreeRefusal{
+			Reason:   reasonBaseRefUnfetchable,
+			Detail:   "base ref " + qualified + " has no fetchable <remote>/<branch> shape",
+			Category: "B",
+		}
+	}
+
+	// (f) Fetch the base tip from THAT remote, refreshing
+	// refs/remotes/<baseRemote>/<baseBranch> — the exact ref the merge below
+	// reads.
+	if _, err := fetchConflictBranchTip(ctx, dispatchDir, baseRemote, baseBranch, token); err != nil {
+		// Redact for the same reason the run-branch fetch above does: the
+		// transport error can echo a token-in-URL remote into the verbatim-stored
+		// Reason (#3338).
+		detail, _ := redactString(fmt.Sprintf("fetch base %s from %s: %s", baseBranch, baseRemote, err.Error()))
+		return "", "", noop, &conflictTreeRefusal{
+			Reason:   reasonBaseFetchFailed,
+			Detail:   detail,
+			Category: "C",
+		}
+	}
+	// The pass must merge the ref the fetch just refreshed. Handing it the
+	// remote-tracking ref (which begins with refs/, so qualifyMergeRef passes it
+	// through unchanged) makes fetch and merge name the SAME object for the bare,
+	// remote-prefixed AND fully-qualified refs/heads/* shapes alike (#3340).
+	mergeRef = fmt.Sprintf("refs/remotes/%s/%s", baseRemote, baseBranch)
+
+	// (g) Provision the throwaway detached worktree at the anchor. The parent
+	// dir is created OUTSIDE the repo (os.MkdirTemp), the tree a child of it, so
+	// teardown is a single RemoveAll of the parent plus the worktree unregister.
+	parent, err := os.MkdirTemp(conflictTreeTempDir, "fishhawk-conflict-*")
+	if err != nil {
+		return "", "", noop, &conflictTreeRefusal{
+			Reason:   reasonTreeProvisionFailed,
+			Detail:   "create throwaway parent dir: " + err.Error(),
+			Category: "C",
+		}
+	}
+	tree := filepath.Join(parent, "tree")
+	if _, err := gitOutRaw(ctx, dispatchDir, "worktree", "add", "--detach", tree, tip); err != nil {
+		// Leave no half-registered worktree or leftover dir behind.
+		_ = os.RemoveAll(parent)
+		_ = gitRun(ctx, dispatchDir, "worktree", "prune")
+		return "", "", noop, &conflictTreeRefusal{
+			Reason:   reasonTreeProvisionFailed,
+			Detail:   "git worktree add: " + err.Error(),
+			Category: "C",
+		}
+	}
+	logEvent(logSink, "conflict_resolution_tree_established", map[string]string{
+		"path": tree, "head_sha": tip, "base_remote": baseRemote,
+		"base_branch": baseBranch, "merge_ref": mergeRef,
+	})
+
+	teardown = func() {
+		// Detached + bounded, mirroring reportCtx: teardown must outlive a
+		// cancellation of the pass so the throwaway tree is never stranded.
+		tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), conflictRecoveryTimeout)
+		defer tcancel()
+		removeErr := gitRun(tctx, dispatchDir, "worktree", "remove", "--force", tree)
+		if removeErr != nil {
+			// A locked worktree refuses `remove --force` and is skipped by a plain
+			// `prune`, so unlock first, then RemoveAll, then prune the now-missing
+			// registration (the provisionAcceptanceTree ladder).
+			_ = gitRun(tctx, dispatchDir, "worktree", "unlock", tree)
+			_ = os.RemoveAll(tree)
+			_ = gitRun(tctx, dispatchDir, "worktree", "prune")
+		}
+		_ = os.RemoveAll(parent)
+		if removeErr != nil {
+			// The primary remove failed and the fallback ladder ran. Name it
+			// DISTINCTLY rather than emitting the success event: the plan's step-3
+			// distinction (conflict_resolution_tree_removed OR _teardown_failed)
+			// exists precisely so a genuinely stranded tree — the fallback ladder
+			// discards each step's error — is not misreported as cleanly removed
+			// (#3340).
+			logEvent(logSink, "conflict_resolution_teardown_failed", map[string]string{
+				"path": tree, "remove_error": removeErr.Error(),
+			})
+			return
+		}
+		logEvent(logSink, "conflict_resolution_tree_removed", map[string]string{"path": tree})
+	}
+	return tree, mergeRef, teardown, nil
+}
+
 // runConflictResolutionStage is the runner's whole conflict-resolution stage:
-// it performs the local pass, and then — this is the half round 1 omitted —
+// it ESTABLISHES its own detached throwaway tree at the run-branch tip (#3340),
+// performs the local pass there, and then — this is the half round 1 omitted —
 // PUBLISHES a passing result and REPORTS the terminal outcome either way.
 // Neither arm may leave the stage in `running`.
 //
@@ -1091,10 +1375,42 @@ var conflictResolutionAgentInvoker = func(ctx context.Context, cfg config, logSi
 func runConflictResolutionStage(ctx context.Context, cfg config, req conflictResolutionRequest,
 	client uploadClient, issued *upload.IssuedKey, logSink io.Writer) int {
 
-	repoDir := cfg.workingDir
-	if repoDir == "" {
-		repoDir = "."
+	// Establish the tree the pass runs in BEFORE anything else. On a refusal,
+	// report the terminal failure with the refusal's category so the stage never
+	// strands in `running`, exactly as the refused-pass arm below does.
+	treeDir, mergeRef, teardown, refusal := establishConflictResolutionTree(ctx, cfg, client, issued, req, logSink)
+	if refusal != nil {
+		reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), conflictRecoveryTimeout)
+		defer cancel()
+		reason := refusal.Reason
+		if refusal.Detail != "" {
+			reason += ": " + refusal.Detail
+		}
+		if _, err := client.ShipPullRequest(reportCtx, upload.ShipPullRequestArgs{
+			RunID:      cfg.runID,
+			StageID:    cfg.stageID,
+			PrivateKey: issued.PrivateKey,
+			Outcome:    "failed",
+			Category:   refusal.Category,
+			Reason:     reason,
+		}); err != nil {
+			logEvent(logSink, "conflict_resolution_report_failed", map[string]string{"error": err.Error()})
+			return exitFailure
+		}
+		logEvent(logSink, "runner_failed", map[string]string{"reason": refusal.Reason, "detail": refusal.Detail})
+		return exitFailure
 	}
+	// Registered BEFORE the pass so every return path tears the tree down.
+	defer teardown()
+
+	// The pass, the agent and the push all run in the throwaway tree. Redirect
+	// cfg.workingDir so the agent invoker spawns there, and merge the ref the
+	// fetch refreshed. No other cfg.workingDir reader remains below the redirect:
+	// the pass and the push both take repoDir as an explicit argument (treeDir),
+	// and the terminal reports key off cfg.runID/cfg.stageID, never workingDir.
+	cfg.workingDir = treeDir
+	req.BaseRef = mergeRef
+	repoDir := treeDir
 
 	invoke := func(ictx context.Context) error {
 		return conflictResolutionAgentInvoker(ictx, cfg, logSink)
