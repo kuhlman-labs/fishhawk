@@ -1,0 +1,102 @@
+# plan-gate-parked — a feature_change run parked at its plan gate
+# (E72.2 / #3326).
+#
+# The plan stage is at awaiting_approval carrying a minimal but VALID
+# standard_v1 plan artifact, so an acceptance criterion can read the plan
+# back through GET /v0/runs/{id}/plan or drive the approval surface.
+#
+# Handles (`key`) are scenario-local; every Apply mints fresh ids.
+runs:
+  - key: parked-run
+    repo: kuhlman-labs/fishhawk
+    workflow_id: feature_change
+    trigger_ref: "issue:2"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (plan-gate-parked).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+
+stages:
+  - key: plan
+    run: parked-run
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: awaiting_approval
+
+artifacts:
+  - key: plan
+    stage: plan
+    kind: plan
+    schema_version: standard_v1
+    content: |
+      {
+        "plan_version": "standard_v1",
+        "ticket_reference": {
+          "type": "github_issue",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/2",
+          "id": "kuhlman-labs/fishhawk#2"
+        },
+        "generated_by": {
+          "agent": "claude-code",
+          "model": "claude-opus-4-8",
+          "timestamp": "2026-01-01T09:00:00Z"
+        },
+        "summary": "Seeded fixture plan parked at the plan gate.",
+        "scope": {
+          "files": [
+            {"path": "README.md", "operation": "modify"}
+          ]
+        },
+        "approach": [
+          {"step": 1, "description": "Edit README.md."}
+        ],
+        "verification": {
+          "test_strategy": "None: this is a seeded fixture, never implemented.",
+          "rollback_plan": "Revert the PR."
+        },
+        "predicted_runtime_minutes": 5,
+        "predicted_runtime_confidence": "high"
+      }

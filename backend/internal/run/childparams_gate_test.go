@@ -73,6 +73,11 @@ var childParamsAllowed = map[string]string{
 	// driver. Same reason: the request, not a parent run, is the source.
 	"backend/internal/server/runs.go::(*Server).CreateRunForTrigger": "request-driven fresh mint — no parent run exists",
 
+	// The seeded-fixture fresh mint (E72.2 / #3326): a devfixtures
+	// scenario, not a parent run, is the source of every field. Same
+	// reason as the webhook and request-driven mints above.
+	"backend/internal/devfixtures/apply.go::applyRun": "seeded-fixture fresh mint — no parent run exists",
+
 	// The helper itself is where the sanctioned literal lives.
 	"backend/internal/run/childparams.go::ChildParamsFrom": "the sanctioned construction point",
 }
