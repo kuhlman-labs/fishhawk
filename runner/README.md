@@ -749,6 +749,10 @@ That recursion is pinned POSITIVELY by `TestSweepStaleCounterfactualReport_NonEm
 
 **The `fixup_counterfactuals` event kind is retained for the initial pass ON PURPOSE.** `composeGateEvidence`, `bundle.GateEvidence.FixupCounterfactuals` and the backend's `server/trace.go` mapping were already pass-agnostic, so reusing the kind means NO wire change and a pinned older backend keeps parsing a newer runner. Renaming it would be silently DROPPED by that backend's `composeGateEvidence` switch — evidence lost with no error, in both skew directions. The reviewer-facing block is correspondingly retitled pass-agnostically (`### Counterfactual self-report (agent CLAIM — not a runner observation)`).
 
+## Replayable scenario corpus (E72.4 / [#3328](https://github.com/kuhlman-labs/fishhawk/issues/3328))
+
+The acceptance stage replays previously recorded scenarios (`acceptance/scenarios/**`) FIRST against each new preview head, then records this pass's drivable passes and merges approved retirements into `acceptance/scenarios/retired.yaml`, committing ONLY that directory onto the run branch after the verdict ships. Knobs (runner-process env, never agent env): `FISHHAWK_ACCEPTANCE_REPLAY_MAX_SCENARIOS` (default 25, `0` disables) and `FISHHAWK_ACCEPTANCE_REPLAY_TIME_CAP_SECS` (default 600). A served retirement that cannot be persisted is reported as `acceptance_scenario_retirement_dropped` on every exit path after the prompt fetch. Contract: `runner/cmd/fishhawk-runner/README.md` § "Replayable scenario corpus"; operator view: `docs/acceptance-preview.md`.
+
 ## Releases
 
 The release workflow at `.github/workflows/runner-release.yml` triggers on tags matching `runner/v*`. To cut a release:

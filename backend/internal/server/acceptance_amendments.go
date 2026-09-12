@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -27,7 +28,46 @@ import (
 const (
 	acceptanceAmendActionRetire  = "retire"
 	acceptanceAmendActionRestate = "restate"
+	// acceptanceAmendActionRetireScenario retires a persisted replay SCENARIO
+	// (E72.4 / #3328), not a plan criterion: the id carries the scenario:
+	// prefix, a reason is required, no statement, and the entry does NOT count
+	// toward the all-retired anti-silencing gate (it names no plan criterion).
+	// The FULL entry {id, reason, run_id, pr, retired_at} is recorded on the
+	// approval_submitted row as retired_scenarios and served to the acceptance
+	// runner, which merges it into acceptance/scenarios/retired.yaml.
+	acceptanceAmendActionRetireScenario = "retire_scenario"
 )
+
+// acceptanceScenarioRetirementUnpersistableCode is the 400 code refusing a
+// retire_scenario on a plan whose shape guarantees NO acceptance runner ever
+// spawns (E72.4 / #3328): the retirement would be approved, never served, and
+// silently dropped — the drop window the runtime
+// acceptance_scenario_retirement_dropped report cannot cover because there is
+// no runtime.
+const acceptanceScenarioRetirementUnpersistableCode = "acceptance_scenario_retirement_unpersistable"
+
+// acceptanceRunnerNeverSpawns reports whether the approved plan's shape makes
+// the orchestrator settle the acceptance stage server-side with NO runner
+// spawn. PREDICATE COUPLING (binding condition 3): this is the SAME predicate
+// set orchestrator.tryShortCircuitAcceptanceCore (the three
+// plan.AcceptanceSkippable* short-circuits) and omitAcceptanceStageForSurfaceNone
+// (plan.DeclaresNoAcceptanceSurface) branch on. TestAcceptanceRetirementRefusal_
+// PredicateSetEqualsShortCircuitSet scans all three call sites and FAILS when
+// the sets diverge, so a later short-circuit predicate cannot silently reopen
+// the drop window.
+func acceptanceRunnerNeverSpawns(v plan.Verification) (bool, string) {
+	switch {
+	case plan.DeclaresNoAcceptanceSurface(v):
+		return true, "acceptance_surface_none"
+	case plan.AcceptanceSkippableOutOfScope(v):
+		return true, "out_of_scope"
+	case plan.AcceptanceSkippableEmptyCriteria(v):
+		return true, "empty_criteria"
+	case plan.AcceptanceSkippableAllSkipWithBasis(v):
+		return true, "all_skip_with_basis"
+	}
+	return false, ""
+}
 
 // acceptanceRetirementSourceOperator tags a retirement recorded through the
 // operator's explicit approve-time channel. There is deliberately exactly ONE
@@ -94,6 +134,20 @@ type effectiveAcceptanceCriteria struct {
 	Retired  []retiredCriterion
 	Restated []string
 	AllIDs   []string
+	// RetiredScenarios is every approved retire_scenario entry recorded on the
+	// run's approval chain (E72.4 / #3328), in ascending approval order, FULL
+	// entries with the reason intact. Served as acceptance_retired_scenarios.
+	// It is NOT an amendment to the criteria set (amended() ignores it).
+	RetiredScenarios []retiredScenarioEntry
+}
+
+// retiredScenarioIDSet returns the recorded retired scenario ids as a set.
+func (e effectiveAcceptanceCriteria) retiredScenarioIDSet() map[string]struct{} {
+	out := make(map[string]struct{}, len(e.RetiredScenarios))
+	for _, r := range e.RetiredScenarios {
+		out[r.ID] = struct{}{}
+	}
+	return out
 }
 
 // amended reports whether any recorded or pending amendment actually changed the
@@ -143,7 +197,22 @@ func (e effectiveAcceptanceCriteria) retiredIDSet() map[string]struct{} {
 // silence).
 func (s *Server) resolveEffectiveAcceptanceCriteria(ctx context.Context, runID uuid.UUID, p *plan.Plan, pending []acceptanceCriteriaAmendment) (effectiveAcceptanceCriteria, error) {
 	var eff effectiveAcceptanceCriteria
-	if p == nil || len(p.Verification.AcceptanceCriteria) == 0 {
+	if p == nil {
+		return eff, nil
+	}
+	recorded, err := s.recordedAcceptanceAmendments(ctx, runID)
+	if err != nil {
+		return effectiveAcceptanceCriteria{}, err
+	}
+	// Scenario retirements (E72.4) ride the same approval rows but are
+	// independent of the criteria set: collected BEFORE the zero-criteria
+	// return so a plan-with-no-criteria run still serves them. (Such a
+	// retirement is refused at the gate as unpersistable, so the branch is
+	// defensive; it keeps the seam total rather than partial.)
+	for _, rec := range recorded {
+		eff.RetiredScenarios = append(eff.RetiredScenarios, rec.retiredScenarios...)
+	}
+	if len(p.Verification.AcceptanceCriteria) == 0 {
 		return eff, nil
 	}
 	// Seed the live set from the plan in plan order; AllIDs carries every plan
@@ -155,14 +224,14 @@ func (s *Server) resolveEffectiveAcceptanceCriteria(ctx context.Context, runID u
 		planOrder[c.ID] = i
 	}
 
-	recorded, err := s.recordedAcceptanceAmendments(ctx, runID)
-	if err != nil {
-		return effectiveAcceptanceCriteria{}, err
-	}
-
 	retired := map[string]retiredCriterion{}
 	restated := map[string]struct{}{}
 	apply := func(a acceptanceCriteriaAmendment, seq int64) {
+		if a.Action == acceptanceAmendActionRetireScenario {
+			// A scenario retirement names no plan criterion; it is carried on
+			// RetiredScenarios above and never touches Live/Retired.
+			return
+		}
 		if _, already := retired[a.ID]; already {
 			// Retire is absorbing and a restate of a retired criterion is a
 			// no-op here; both are refused at the gate.
@@ -222,6 +291,8 @@ func (s *Server) resolveEffectiveAcceptanceCriteria(ctx context.Context, runID u
 type recordedAmendmentEntry struct {
 	sequence   int64
 	amendments []acceptanceCriteriaAmendment
+	// retiredScenarios is the row's FULL retire_scenario record (E72.4).
+	retiredScenarios []retiredScenarioEntry
 }
 
 // recordedAcceptanceAmendments reads the run's approval_submitted entries and
@@ -245,19 +316,24 @@ func (s *Server) recordedAcceptanceAmendments(ctx context.Context, runID uuid.UU
 	var out []recordedAmendmentEntry
 	for _, e := range sorted {
 		var payload struct {
-			Decision   string                        `json:"decision"`
-			Amendments []acceptanceCriteriaAmendment `json:"amend_acceptance_criteria"`
+			Decision         string                        `json:"decision"`
+			Amendments       []acceptanceCriteriaAmendment `json:"amend_acceptance_criteria"`
+			RetiredScenarios []retiredScenarioEntry        `json:"retired_scenarios"`
 		}
 		if err := json.Unmarshal(e.Payload, &payload); err != nil {
 			continue
 		}
-		if payload.Decision != "approve" || len(payload.Amendments) == 0 {
+		if payload.Decision != "approve" || (len(payload.Amendments) == 0 && len(payload.RetiredScenarios) == 0) {
 			continue
 		}
 		if !s.approvalEntryStageIsPlan(ctx, e) {
 			continue
 		}
-		out = append(out, recordedAmendmentEntry{sequence: e.Sequence, amendments: payload.Amendments})
+		out = append(out, recordedAmendmentEntry{
+			sequence:         e.Sequence,
+			amendments:       payload.Amendments,
+			retiredScenarios: payload.RetiredScenarios,
+		})
 	}
 	return out, nil
 }
@@ -312,10 +388,25 @@ func (s *Server) checkAmendAcceptanceCriteria(w http.ResponseWriter, r *http.Req
 		return nil, false
 	}
 
-	// R9: fail closed on a plan that cannot be loaded or carries no acceptance
-	// criteria — never record an amendment that anchors to nothing.
+	// Partition scenario retirements (E72.4 / #3328) off the criterion
+	// amendments: they are validated against the scenario ledger, not the plan's
+	// criteria, and are PERMITTED with zero plan criteria (R9 below applies to
+	// criterion amendments only).
+	var criterionAmendments, scenarioAmendments []acceptanceCriteriaAmendment
+	for _, a := range amendments {
+		if strings.TrimSpace(a.Action) == acceptanceAmendActionRetireScenario {
+			scenarioAmendments = append(scenarioAmendments, a)
+			continue
+		}
+		criterionAmendments = append(criterionAmendments, a)
+	}
+
+	// R9: fail closed on a plan that cannot be loaded — never record an
+	// amendment that anchors to nothing. A loaded plan with no criteria is
+	// refused here ONLY for criterion amendments; a scenario retirement on such
+	// a plan is refused below as unpersistable (its shape short-circuits).
 	approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), stage.RunID)
-	if err != nil || approvedPlan == nil || len(approvedPlan.Verification.AcceptanceCriteria) == 0 {
+	if err != nil || approvedPlan == nil || (len(criterionAmendments) > 0 && len(approvedPlan.Verification.AcceptanceCriteria) == 0) {
 		details := map[string]any{"stage_id": stage.ID.String()}
 		if err != nil {
 			details["error"] = err.Error()
@@ -325,6 +416,28 @@ func (s *Server) checkAmendAcceptanceCriteria(w http.ResponseWriter, r *http.Req
 			details)
 		return nil, false
 	}
+
+	// UNPERSISTABLE REFUSAL (E72.4 / #3328, binding condition 4 of the plan): a
+	// retire_scenario on a plan whose shape guarantees no acceptance runner
+	// spawns would be approved and then silently dropped — refuse it 400 so it is
+	// never approved. Decided by acceptanceRunnerNeverSpawns, the SAME predicate
+	// set the orchestrator short-circuit and the surface-none omission use.
+	if len(scenarioAmendments) > 0 {
+		if never, shape := acceptanceRunnerNeverSpawns(approvedPlan.Verification); never {
+			s.writeError(w, r, http.StatusBadRequest, acceptanceScenarioRetirementUnpersistableCode,
+				"retire_scenario cannot be persisted on this plan: its shape ("+shape+") settles the acceptance stage server-side with no runner spawn, so the retirement would never reach acceptance/scenarios/retired.yaml; retire the scenario on a run whose acceptance stage executes",
+				map[string]any{"field": "amend_acceptance_criteria", "rule": "scenario_retirement_unpersistable", "plan_shape": shape, "stage_id": stage.ID.String()})
+			return nil, false
+		}
+	}
+	scenarioOut, ok := s.checkRetireScenarioAmendments(w, r, stage, scenarioAmendments, refuse)
+	if !ok {
+		return nil, false
+	}
+	if len(criterionAmendments) == 0 {
+		return scenarioOut, true
+	}
+	amendments = criterionAmendments
 
 	// The PRIOR effective set: what the chain already records. Fail CLOSED on an
 	// unreadable chain — the anti-silencing refusals cannot be evaluated without
@@ -422,7 +535,101 @@ func (s *Server) checkAmendAcceptanceCriteria(w http.ResponseWriter, r *http.Req
 			})
 		return nil, false
 	}
+	return append(out, scenarioOut...), true
+}
+
+// checkRetireScenarioAmendments validates the retire_scenario entries of a
+// plan-stage approve (E72.4 / #3328), each refusal 400 with details.rule:
+//
+//	scenario_id_prefix_required — the id does not carry the scenario: prefix
+//	reason_required             — blank/whitespace reason
+//	statement_not_allowed       — a statement was supplied (retire only)
+//	duplicate_id                — the same scenario id twice in one request
+//	already_retired             — a prior approval already retired the id
+//
+// The already-retired check reads the run's recorded retired_scenarios and
+// FAILS CLOSED on an unreadable chain. Returns the canonical (trimmed,
+// text-capped) entries; nil, true when there are none.
+func (s *Server) checkRetireScenarioAmendments(w http.ResponseWriter, r *http.Request, stage *run.Stage, amendments []acceptanceCriteriaAmendment, refuse func(rule, msg string, extra map[string]any)) ([]acceptanceCriteriaAmendment, bool) {
+	if len(amendments) == 0 {
+		return nil, true
+	}
+	recorded, err := s.recordedAcceptanceAmendments(r.Context(), stage.RunID)
+	if err != nil {
+		s.writeError(w, r, http.StatusUnprocessableEntity, "acceptance_criteria_unavailable",
+			"the run's prior scenario retirements could not be read, so the retirement cannot be validated",
+			map[string]any{"stage_id": stage.ID.String(), "error": err.Error()})
+		return nil, false
+	}
+	prior := map[string]struct{}{}
+	for _, rec := range recorded {
+		for _, e := range rec.retiredScenarios {
+			prior[e.ID] = struct{}{}
+		}
+	}
+	seen := make(map[string]struct{}, len(amendments))
+	out := make([]acceptanceCriteriaAmendment, 0, len(amendments))
+	for _, a := range amendments {
+		id := strings.TrimSpace(a.ID)
+		reason := strings.TrimSpace(a.Reason)
+		if !isScenarioRow(id) || len(id) == len(acceptanceScenarioIDPrefix) {
+			refuse("scenario_id_prefix_required",
+				"retire_scenario requires a scenario id carrying the scenario: prefix (scenario:issue-<N>/<criterion-id>)",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		if reason == "" {
+			refuse("reason_required",
+				"each retire_scenario entry requires a reason — it is the reconstructable why",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		if strings.TrimSpace(a.Statement) != "" {
+			refuse("statement_not_allowed",
+				"retire_scenario takes no statement; a scenario is retired, never restated",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		if _, dup := seen[id]; dup {
+			refuse("duplicate_id",
+				"retire_scenario names the same scenario id twice in one request",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		if _, already := prior[id]; already {
+			refuse("already_retired",
+				"retire_scenario names a scenario a prior approval already retired; a retirement cannot be re-reasoned or undone",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		seen[id] = struct{}{}
+		reason, _ = prompt.CapText(reason, maxAcceptanceAmendmentTextBytes)
+		out = append(out, acceptanceCriteriaAmendment{ID: id, Action: acceptanceAmendActionRetireScenario, Reason: reason})
+	}
 	return out, true
+}
+
+// retiredScenarioEntriesFor renders the FULL retired_scenarios record for an
+// approval_submitted row from the canonical retire_scenario amendments
+// (E72.4 / #3328): {id, reason, run_id, pr: 0, retired_at}. pr is 0 at
+// approval — the acceptance prompt fetch fills it from the run's
+// pull_request_opened ledger. nil when the approve carried no scenario
+// retirement, so the payload key is omitted and the row is byte-identical.
+func retiredScenarioEntriesFor(runID uuid.UUID, amendments []acceptanceCriteriaAmendment, now time.Time) []retiredScenarioEntry {
+	var out []retiredScenarioEntry
+	for _, a := range amendments {
+		if a.Action != acceptanceAmendActionRetireScenario {
+			continue
+		}
+		out = append(out, retiredScenarioEntry{
+			ID:        a.ID,
+			Reason:    a.Reason,
+			RunID:     runID.String(),
+			PR:        0,
+			RetiredAt: now.UTC().Format(time.RFC3339),
+		})
+	}
+	return out
 }
 
 // acceptanceDowngradeBasisRetiredOnly is the only downgrade basis recorded

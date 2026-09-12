@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -4173,5 +4174,236 @@ func TestAcceptanceCriteriaTally_CountsUndecidable(t *testing.T) {
 	if passed != 1 || failed != 1 || skipped != 1 || undecidable != 2 || total != 5 {
 		t.Errorf("tally = %d/%d/%d/%d of %d, want 1/1/1/2 of 5",
 			passed, failed, skipped, undecidable, total)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// E72.4 / #3328: replayed-scenario rows, the shared replay golden, attribution.
+// ---------------------------------------------------------------------------
+
+// wireGoldenAcceptanceReplayBytes reads the SHARED replay verdict golden
+// testdata/wire/acceptance_replay_verdict.json — the same bytes the runner's
+// record-then-replay test asserts its real loader + InjectReplay produce.
+// Anchored via runtime.Caller like wireGoldenHeldCommitBytes.
+func wireGoldenAcceptanceReplayBytes(t *testing.T) []byte {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "acceptance_replay_verdict.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared wire golden %s: %v", path, err)
+	}
+	return b
+}
+
+// shipReplayGolden ships the shared golden through the real handler and returns
+// the recorded acceptance_outcome_recorded payload plus the audit fake.
+func shipReplayGolden(t *testing.T, body []byte) (map[string]any, *auditFake, acceptanceBody) {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedValidatedHead(au, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	entry := findAppendedByCategory(t, au, CategoryAcceptanceOutcomeRecorded)
+	var payload map[string]any
+	if err := json.Unmarshal(entry.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	var acc acceptanceBody
+	if err := json.Unmarshal(body, &acc); err != nil {
+		t.Fatal(err)
+	}
+	if err := acc.validate(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	return payload, au, acc
+}
+
+// TestShipAcceptance_ScenarioRowsPartitioned: the scenario: row never enters the
+// criterion tallies — criteria_total counts the plan rows only, and the failed
+// scenario row is counted under replay.scenarios_failed.
+func TestShipAcceptance_ScenarioRowsPartitioned(t *testing.T) {
+	payload, _, _ := shipReplayGolden(t, wireGoldenAcceptanceReplayBytes(t))
+	if payload["criteria_total"] != float64(1) || payload["criteria_failed"] != float64(0) || payload["criteria_passed"] != float64(1) {
+		t.Errorf("criterion tallies leaked the scenario row: total=%v failed=%v passed=%v", payload["criteria_total"], payload["criteria_failed"], payload["criteria_passed"])
+	}
+	replay, _ := payload["replay"].(map[string]any)
+	if replay["scenarios_failed"] != float64(1) || replay["scenarios_passed"] != float64(0) {
+		t.Errorf("replay tallies = %v, want scenarios_failed 1", replay)
+	}
+	// The verdict is still recorded failed: the shipped failed verdict is never
+	// softened by moving the row out of the criterion partition.
+	if payload["verdict"] != "failed" {
+		t.Errorf("verdict = %v, want failed", payload["verdict"])
+	}
+}
+
+// TestShipAcceptance_ReplayHeaderCopiedVerbatim: cap / corpus_size / served /
+// sampled_out / retired_excluded / seed on the recorded outcome are the golden's
+// values byte-for-byte. The golden's cap, corpus_size and sampled_out are
+// pairwise distinct, so a swapped field fails here.
+func TestShipAcceptance_ReplayHeaderCopiedVerbatim(t *testing.T) {
+	payload, _, acc := shipReplayGolden(t, wireGoldenAcceptanceReplayBytes(t))
+	replay, _ := payload["replay"].(map[string]any)
+	if replay == nil {
+		t.Fatalf("replay block absent from outcome payload: %v", payload)
+	}
+	if acc.Replay.Cap == acc.Replay.CorpusSize || acc.Replay.Cap == acc.Replay.SampledOut || acc.Replay.CorpusSize == acc.Replay.SampledOut {
+		t.Fatalf("golden cap/corpus_size/sampled_out must be pairwise distinct: %+v", acc.Replay)
+	}
+	want := map[string]any{
+		"cap": float64(acc.Replay.Cap), "corpus_size": float64(acc.Replay.CorpusSize), "served": float64(acc.Replay.Served),
+		"sampled_out": float64(acc.Replay.SampledOut), "retired_excluded": float64(acc.Replay.RetiredExcluded), "seed": acc.Replay.Seed,
+		"served_mismatch": false,
+	}
+	for k, v := range want {
+		if replay[k] != v {
+			t.Errorf("replay.%s = %v, want %v", k, replay[k], v)
+		}
+	}
+	// Self-consistency of the golden (binding condition 2): one entry per
+	// served scenario.
+	if len(acc.Replay.Scenarios) != acc.Replay.Served {
+		t.Errorf("golden has %d replay.scenarios entries but served=%d", len(acc.Replay.Scenarios), acc.Replay.Served)
+	}
+}
+
+// TestShipAcceptance_AbsentReplay_RecordsNull: a body with no runner replay
+// records replay:null, not a zero header.
+func TestShipAcceptance_AbsentReplay_RecordsNull(t *testing.T) {
+	payload, _, _ := shipReplayGolden(t, validAcceptanceBytes(t))
+	v, present := payload["replay"]
+	if !present || v != nil {
+		t.Errorf("replay = %v (present=%v), want an explicit null", v, present)
+	}
+}
+
+// TestShipAcceptance_FailedScenarioRow_RecordsRegressionFromReplayScenarios: the
+// regression entry's origin_pr is the replay entry's 742 — NOT the issue 101 —
+// and its class-1 concern note names PR #742.
+func TestShipAcceptance_FailedScenarioRow_RecordsRegressionFromReplayScenarios(t *testing.T) {
+	payload, au, acc := shipReplayGolden(t, wireGoldenAcceptanceReplayBytes(t))
+	_ = payload
+	if n := countByCategory(au, CategoryAcceptanceScenarioRegression); n != 1 {
+		t.Fatalf("acceptance_scenario_regression entries = %d, want 1", n)
+	}
+	entry := findAppendedByCategory(t, au, CategoryAcceptanceScenarioRegression)
+	var reg map[string]any
+	if err := json.Unmarshal(entry.Payload, &reg); err != nil {
+		t.Fatal(err)
+	}
+	if reg["scenario_id"] != "scenario:issue-101/crit-b" {
+		t.Errorf("scenario_id = %v", reg["scenario_id"])
+	}
+	if reg["origin_pr"] != float64(742) {
+		t.Errorf("origin_pr = %v, want 742 (from replay.scenarios)", reg["origin_pr"])
+	}
+	if reg["origin_pr"] == float64(101) {
+		t.Errorf("origin_pr must never be the issue number")
+	}
+	if reg["origin_issue"] != float64(101) || reg["path"] != "acceptance/scenarios/issue-101/crit-b.yaml" {
+		t.Errorf("origin_issue/path = %v/%v", reg["origin_issue"], reg["path"])
+	}
+	if _, present := reg["origin_unresolved"]; present {
+		t.Errorf("origin_unresolved must be absent when the PR resolved: %v", reg)
+	}
+	if reg["expected"] != "the run row lists the acceptance stage" || reg["repro_handle"] == "" {
+		t.Errorf("observed/expected/repro not carried: %v", reg)
+	}
+	// Class 1 with a note naming the recording PR.
+	class, ids, _ := classifyAcceptanceFailure(acc, nil)
+	if class != acceptanceClass1 || len(ids) != 1 || ids[0] != "scenario:issue-101/crit-b" {
+		t.Errorf("classify = %s %v, want class 1 keyed on the scenario id", class, ids)
+	}
+	concerns := synthesizeAcceptanceConcerns(acc, nil, ids, "r")
+	if len(concerns) != 1 || !strings.Contains(concerns[0].Note, "PR #742") {
+		t.Errorf("concern note = %+v, want 'PR #742'", concerns)
+	}
+}
+
+// TestShipAcceptance_FailedScenarioRow_NoReplayEntry_RecordsOriginUnresolved: a
+// failed scenario row with no matching replay entry (or origin_pr 0) records
+// origin_pr ABSENT + origin_unresolved:true — never an issue-derived fallback.
+func TestShipAcceptance_FailedScenarioRow_NoReplayEntry_RecordsOriginUnresolved(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(m map[string]any)
+	}{
+		{"no replay entry", func(m map[string]any) { m["replay"].(map[string]any)["scenarios"] = []any{} }},
+		{"origin_pr 0", func(m map[string]any) {
+			e := m["replay"].(map[string]any)["scenarios"].([]any)[0].(map[string]any)
+			delete(e, "origin_pr")
+		}},
+		{"no replay at all", func(m map[string]any) { delete(m, "replay") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var m map[string]any
+			if err := json.Unmarshal(wireGoldenAcceptanceReplayBytes(t), &m); err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(m)
+			body, _ := json.Marshal(m)
+			_, au, acc := shipReplayGolden(t, body)
+			entry := findAppendedByCategory(t, au, CategoryAcceptanceScenarioRegression)
+			var reg map[string]any
+			if err := json.Unmarshal(entry.Payload, &reg); err != nil {
+				t.Fatal(err)
+			}
+			if _, present := reg["origin_pr"]; present {
+				t.Errorf("origin_pr = %v, want ABSENT", reg["origin_pr"])
+			}
+			if reg["origin_unresolved"] != true {
+				t.Errorf("origin_unresolved = %v, want true", reg["origin_unresolved"])
+			}
+			concerns := synthesizeAcceptanceConcerns(acc, nil, []string{"scenario:issue-101/crit-b"}, "r")
+			if len(concerns) != 1 || !strings.Contains(concerns[0].Note, "originating PR unknown") || strings.Contains(concerns[0].Note, "#101") {
+				t.Errorf("concern note = %+v, want '(originating PR unknown)' and never #101", concerns)
+			}
+		})
+	}
+}
+
+// TestClassifyAcceptanceFailure_ScenarioSkipsNeverPage: a skipped or
+// undecidable scenario row is excluded from the skip partition — it can route
+// neither class 2 nor class 5 — and a skipped scenario alongside a failed
+// criterion does not change that criterion's class.
+func TestClassifyAcceptanceFailure_ScenarioSkipsNeverPage(t *testing.T) {
+	explicit := plan.CriterionSourceExplicit
+	criteria := []plan.AcceptanceCriterion{{ID: "crit-a", Statement: "s", Source: explicit}}
+	reason := "budget"
+	scenarioSkip := acceptanceCriterionResult{ID: "scenario:issue-1/x", Result: acceptanceResultSkipped, ExpectationBasis: "replay_budget_exhausted"}
+	scenarioUndecidable := acceptanceCriterionResult{ID: "scenario:issue-1/y", Result: acceptanceResultUndecidable, UndecidableReason: &reason}
+	// Only scenario skips, no criterion failed: falls to class 4, never 2/5.
+	acc := acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail",
+		normalizedCriteria: []acceptanceCriterionResult{{ID: "crit-a", Result: acceptanceResultPassed}},
+		scenarioRows:       []acceptanceCriterionResult{scenarioSkip, scenarioUndecidable}}
+	if class, _, _ := classifyAcceptanceFailure(acc, criteria); class == acceptanceClass2 || class == acceptanceClass5 {
+		t.Errorf("scenario skips routed class %s; must never route 2 or 5", class)
+	}
+	// A criterion skip still routes class 2 regardless of scenario rows.
+	acc.normalizedCriteria = []acceptanceCriterionResult{{ID: "crit-a", Result: acceptanceResultSkipped}}
+	if class, _, _ := classifyAcceptanceFailure(acc, criteria); class != acceptanceClass2 {
+		t.Errorf("criterion skip class = %s, want 2", class)
+	}
+}
+
+// TestShipAcceptance_ScenarioUndecidableDoesNotClampRun: an undecidable
+// scenario row never raises the recorded verdict to undecidable.
+func TestShipAcceptance_ScenarioUndecidableDoesNotClampRun(t *testing.T) {
+	body := []byte(`{"verdict":"passed","criteria":[{"id":"crit-a","result":"passed"},{"id":"scenario:issue-1/x","result":"undecidable","undecidable_reason":"replay budget exhausted"}],"replay":{"cap":1,"corpus_size":1,"served":1,"sampled_out":0,"retired_excluded":0,"seed":"s","scenarios":[]}}`)
+	payload, _, _ := shipReplayGolden(t, body)
+	if payload["verdict"] != "passed" {
+		t.Errorf("verdict = %v, want passed (a scenario row must not clamp the run)", payload["verdict"])
+	}
+	replay, _ := payload["replay"].(map[string]any)
+	if replay["scenarios_skipped"] != float64(1) || replay["served_mismatch"] != true {
+		t.Errorf("replay = %v, want scenarios_skipped 1 and served_mismatch true (served 1, zero entries)", replay)
 	}
 }

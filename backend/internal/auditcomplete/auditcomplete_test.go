@@ -2434,3 +2434,24 @@ func TestCompute_SupersededStageExemptsTraceRule(t *testing.T) {
 		}
 	})
 }
+
+// TestHeadReportCategories_AcceptanceScenariosPushedWinsPrecedence (E72.4 /
+// #3328): the acceptance runner's post-verdict scenario-corpus commit is the
+// newest run-authored commit, so its head wins over a fixup_pushed head even
+// at a lower sequence — and it sits FIRST in HeadReportCategoriesByPrecedence.
+func TestHeadReportCategories_AcceptanceScenariosPushedWinsPrecedence(t *testing.T) {
+	if auditcomplete.HeadReportCategoriesByPrecedence[0] != "acceptance_scenarios_pushed" {
+		t.Fatalf("HeadReportCategoriesByPrecedence[0] = %q, want acceptance_scenarios_pushed", auditcomplete.HeadReportCategoriesByPrecedence[0])
+	}
+	entry := func(cat, sha string, seq int64) *audit.Entry {
+		return &audit.Entry{Category: cat, Sequence: seq, Payload: json.RawMessage(`{"head_sha":"` + sha + `"}`)}
+	}
+	got, ok := auditcomplete.LatestReportedHeadSHA([]*audit.Entry{
+		entry("pull_request_opened", "pr", 1),
+		entry("fixup_pushed", "fix", 9),
+		entry("acceptance_scenarios_pushed", "scenario", 5),
+	})
+	if !ok || got != "scenario" {
+		t.Errorf("LatestReportedHeadSHA = (%q, %v), want (scenario, true)", got, ok)
+	}
+}

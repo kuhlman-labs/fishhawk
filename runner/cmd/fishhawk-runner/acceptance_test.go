@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/acceptenv"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/scenario"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
@@ -1849,5 +1852,246 @@ func TestRun_AcceptanceStage_ExpectedHeadSHASeam_JSONToGate(t *testing.T) {
 	}
 	if invoker.callIdx != 0 {
 		t.Errorf("agent invoked %d times, want 0", invoker.callIdx)
+	}
+}
+
+// --- Replayable scenario corpus, cross-run (E72.4 / #3328, slice C) --------
+
+// TestAcceptanceReplay_RetirementCrossesRuns (two-run test, ONE shared git
+// repo): run 1 serves a FULL retirement {id, reason, run_id, pr, retired_at}
+// for crit-c → persist commits retired.yaml onto the run branch; the committed
+// file carries the reason byte-identical. main then advances to that commit
+// (run 1 merged), a run-2 branch deletes the retired scenario file and adds a
+// sibling; run 2 (different run id, NO served retirements) neither
+// category-Bs (the deletion is ledgered) nor lists the retired id, while the
+// sibling IS listed, and the ledger run 2 read at its head still carries the
+// reason byte-identical.
+func TestAcceptanceReplay_RetirementCrossesRuns(t *testing.T) {
+	repo, origin, fu, args := acceptanceReplayStageSetup(t)
+	const reason = "behaviour replaced by #3327"
+	fu.promptResp.AcceptanceRetiredScenarios = []scenario.RetiredEntry{{ID: "scenario:issue-7/crit-c", Reason: reason, RunID: acceptanceTestRunID, PR: 742, RetiredAt: "2026-09-12T00:00:00Z"}}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(okVerdict)}})
+	var stderr1 strings.Builder
+	if got := run(args, &stderr1); got != exitOK {
+		t.Fatalf("run 1 = %d, want exitOK:\n%s", got, stderr1.String())
+	}
+	pr := pushedReport(fu)
+	if pr == nil || pr.Branch != "fishhawk/run-x" {
+		t.Fatalf("run 1 pushed report = %+v\n%s", pr, stderr1.String())
+	}
+	// The committed ledger on origin carries the reason byte-identical.
+	ledgerDir := t.TempDir()
+	mustWrite(t, filepath.Join(ledgerDir, scenario.RetiredFile), tgit(t, origin, "show", pr.HeadSHA+":acceptance/scenarios/retired.yaml")+"\n")
+	committed, err := scenario.LoadRetired(ledgerDir)
+	if err != nil || len(committed) != 1 || committed[0].Reason != reason || committed[0].PR != 742 || committed[0].RunID != acceptanceTestRunID {
+		t.Fatalf("run 1 committed ledger = %+v (%v), want the full entry with reason %q", committed, err, reason)
+	}
+
+	// Run 1 merges: main advances to the persisted commit. A run-2 branch
+	// deletes the retired scenario (ledgered → sanctioned) and adds a sibling.
+	tgit(t, repo, "fetch", "-q", origin, "fishhawk/run-x")
+	tgit(t, repo, "checkout", "-q", "-B", "main", pr.HeadSHA)
+	tgit(t, repo, "push", "-q", "-f", origin, "main:main")
+	tgit(t, repo, "checkout", "-q", "-b", "fishhawk/run-y")
+	tgit(t, repo, "rm", "-q", "acceptance/scenarios/issue-7/crit-c.yaml")
+	if err := os.MkdirAll(filepath.Join(repo, "acceptance/scenarios/issue-7"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "acceptance/scenarios/issue-7/crit-e.yaml"), scenarioYAML("scenario:issue-7/crit-e", 7, 700, "r0", time.Date(2020, 1, 2, 0, 0, 0, 0, time.UTC)))
+	tgit(t, repo, "add", "-A")
+	tgit(t, repo, "commit", "-q", "-m", "retire crit-c (ledgered), add crit-e")
+	tgit(t, repo, "push", "-q", origin, "fishhawk/run-y:fishhawk/run-y")
+	run2Head := gitHead(t, repo)
+
+	const run2ID = "aaaaaaaa-2222-3333-4444-555555555555"
+	const run2Stage = "bbbbbbbb-3333-4444-5555-666666666666"
+	fu.promptResp.StageID = run2Stage
+	fu.promptResp.AcceptanceExpectedHeadSHA = run2Head
+	fu.promptResp.AcceptanceRunBranch = "fishhawk/run-y"
+	fu.promptResp.AcceptanceRetiredScenarios = nil
+	var prompt2 string
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(
+		`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"},{"id":"AC2","result":"passed"},{"id":"scenario:issue-7/crit-e","result":"passed"}]}`)},
+		onInvoke: func(_ int, inv agent.Invocation) { prompt2 = inv.Prompt }})
+	args2 := append([]string(nil), args...)
+	for i := range args2 {
+		switch args2[i] {
+		case acceptanceTestRunID:
+			args2[i] = run2ID
+		case acceptanceTestStageID:
+			args2[i] = run2Stage
+		}
+	}
+	var stderr2 strings.Builder
+	if got := run(args2, &stderr2); got != exitOK {
+		t.Fatalf("run 2 = %d, want exitOK (no category-B on a ledgered deletion):\n%s", got, stderr2.String())
+	}
+	out2 := stderr2.String()
+	if strings.Contains(out2, `"category":"B"`) || !strings.Contains(out2, `"event":"acceptance_scenario_guard_passed"`) || !strings.Contains(out2, `"ledgered_ids":"scenario:issue-7/crit-c"`) {
+		t.Errorf("run 2 guard must pass on the ledgered deletion and name the ledger entry:\n%s", out2)
+	}
+	if strings.Contains(prompt2, "scenario:issue-7/crit-c") || !strings.Contains(prompt2, "- scenario: scenario:issue-7/crit-e") {
+		t.Errorf("run 2 prompt must list crit-e and not the retired crit-c:\n%s", prompt2)
+	}
+	if dropReport(fu) != nil {
+		t.Errorf("no drop report expected across both runs: %+v", dropReport(fu))
+	}
+	// The ledger run 2 read (retired.yaml at its merge-candidate head) still
+	// carries run 1's reason byte-identical.
+	ledgerDir2 := t.TempDir()
+	mustWrite(t, filepath.Join(ledgerDir2, scenario.RetiredFile), tgit(t, repo, "show", run2Head+":acceptance/scenarios/retired.yaml")+"\n")
+	loaded, err := scenario.LoadRetired(ledgerDir2)
+	if err != nil || len(loaded) != 1 || loaded[0] != committed[0] {
+		t.Fatalf("run 2 loaded ledger = %+v (%v), want byte-identical to run 1's committed entry %+v", loaded, err, committed[0])
+	}
+}
+
+// TestAcceptanceReplay_RecordThenReplayEndToEnd: run 1 (issue 101, PR 742)
+// passes crit-b with steps_taken → the REAL Compose/Write/commit records the
+// YAML on the run branch. Run 2 (run id …202) runs with newUploadClient
+// overridden to a REAL upload.Client against an httptest backend: REAL loader
+// (cap 1 over a corpus of 4 — the recorded scenario is the newest), REAL
+// renderer (the prompt names scenario:issue-101/crit-b and origin PR #742),
+// the fake invoker (the only stand-in) fails that row, REAL
+// validateAcceptanceVerdict (served ids ∪ scenario ids), REAL InjectReplay,
+// REAL upload serialization — and the captured body is JSON-equivalent to the
+// SAME golden testdata/wire/acceptance_replay_verdict.json the backend
+// attribution test ingests, INCLUDING replay.cap/corpus_size/sampled_out.
+func TestAcceptanceReplay_RecordThenReplayEndToEnd(t *testing.T) {
+	repo, origin, fu, args := acceptanceReplayStageSetup(t)
+	const run1ID = "2b7c1d4e-0000-4000-8000-000000000101"
+	const run2ID = "2b7c1d4e-0000-4000-8000-000000000202"
+	const stage1 = "2b7c1d4e-0000-4000-8000-00000000a101"
+	const stage2 = "2b7c1d4e-0000-4000-8000-00000000a202"
+	fu.promptResp.StageID = stage1
+	fu.promptResp.AcceptanceRetiredScenarios = nil
+	fu.promptResp.AcceptanceCriteriaIDs = []string{"crit-b"}
+	fu.promptResp.AcceptanceCriteria = []upload.AcceptanceCriterionEntry{{ID: "crit-b", Statement: "the run row lists the acceptance stage", Drivable: true}}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(
+		`{"verdict":"passed","criteria":[{"id":"crit-b","result":"passed","observed":"the run row lists the acceptance stage","expected":"the run row lists the acceptance stage","steps_taken":"GET /runs/<id> on the preview","repro_handle":"curl -s http://127.0.0.1:8080/v0/runs/` + run1ID + `"}],"target_url":"http://127.0.0.1:8080"}`)}})
+	args1 := append([]string(nil), args...)
+	for i := range args1 {
+		switch args1[i] {
+		case acceptanceTestRunID:
+			args1[i] = run1ID
+		case acceptanceTestStageID:
+			args1[i] = stage1
+		}
+	}
+	var stderr1 strings.Builder
+	if got := run(args1, &stderr1); got != exitOK {
+		t.Fatalf("run 1 = %d, want exitOK:\n%s", got, stderr1.String())
+	}
+	pr := pushedReport(fu)
+	if pr == nil || len(pr.ScenarioIDs) != 1 || pr.ScenarioIDs[0] != "scenario:issue-101/crit-b" {
+		t.Fatalf("run 1 pushed report = %+v\n%s", pr, stderr1.String())
+	}
+	recorded := tgit(t, origin, "show", pr.HeadSHA+":acceptance/scenarios/issue-101/crit-b.yaml")
+	if !strings.Contains(recorded, "issue: 101") || !strings.Contains(recorded, "pr: 742") || !strings.Contains(recorded, "run_id: "+run1ID) {
+		t.Fatalf("recorded YAML wrong:\n%s", recorded)
+	}
+
+	// Run 1 merges; main gains 2 OLDER scenarios (the setup already seeded
+	// issue-7/crit-c) so the corpus is 4 with the recorded one newest. Run
+	// 2's merge candidate is main's tip.
+	tgit(t, repo, "fetch", "-q", origin, "fishhawk/run-x")
+	tgit(t, repo, "checkout", "-q", "-B", "main", pr.HeadSHA)
+	older := filepath.Join(repo, "acceptance/scenarios/issue-9")
+	if err := os.MkdirAll(older, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		mustWrite(t, filepath.Join(older, fmt.Sprintf("c%d.yaml", i)), scenarioYAML(fmt.Sprintf("scenario:issue-9/c%d", i), 9, 900, "r0", time.Date(2020, 1, 1+i, 0, 0, 0, 0, time.UTC)))
+	}
+	tgit(t, repo, "add", "-A")
+	tgit(t, repo, "commit", "-q", "-m", "older corpus")
+	run2Head := gitHead(t, repo)
+	t.Setenv("FISHHAWK_ACCEPTANCE_REPLAY_MAX_SCENARIOS", "1")
+
+	// REAL wire client against an httptest backend: signing key, prompt
+	// (acceptance stage, crit-a served, no run branch → persist skipped),
+	// trace, and the acceptance ship whose body is captured.
+	var captured []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/signing-key"):
+			_, priv, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Error(err)
+				http.Error(w, "keygen", 500)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"run_id": run2ID, "public_key": base64.StdEncoding.EncodeToString(priv.Public().(ed25519.PublicKey)),
+				"private_key": base64.StdEncoding.EncodeToString(priv),
+				"issued_at":   time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC), "expires_at": time.Date(2026, 9, 12, 12, 30, 0, 0, time.UTC),
+			})
+		case strings.HasSuffix(r.URL.Path, "/prompt"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"stage_id": stage2, "stage_type": "acceptance", "prompt": "Validate the running instance against the criteria.",
+				"prompt_hash": "deadbeef", "acceptance_criteria_ids": []string{"crit-a"},
+				"acceptance_expected_head_sha": run2Head, "acceptance_issue_number": 101, "acceptance_pull_request_number": 743,
+			})
+		case strings.HasSuffix(r.URL.Path, "/trace"):
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"run_id": run2ID, "stage_id": stage2, "variant": r.URL.Query().Get("variant"), "content_hash": "deadbeef"})
+		case strings.HasSuffix(r.URL.Path, "/acceptance"):
+			b, _ := io.ReadAll(r.Body)
+			captured = b
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "00000000-0000-0000-0000-000000000ccc", "stage_id": stage2, "content_hash": "feedface", "verdict": "failed"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(backend.Close)
+	origClient := newUploadClient
+	newUploadClient = func(string) uploadClient { return upload.New(backend.URL) }
+	t.Cleanup(func() { newUploadClient = origClient })
+
+	var prompt2 string
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(
+		`{"verdict":"failed","failure_mode":"assertion_fail","criteria":[` +
+			`{"id":"crit-a","result":"passed","observed":"the preview lists the seeded run","expected":"the preview lists the seeded run","steps_taken":"GET /runs on the preview","repro_handle":"curl -s http://127.0.0.1:8080/v0/runs"},` +
+			`{"id":"scenario:issue-101/crit-b","result":"failed","observed":"the run row omitted the acceptance stage","expected":"the run row lists the acceptance stage","steps_taken":"GET /runs/<id> on the preview","expectation_basis":"scenario:issue-101/crit-b assertions.expected","repro_handle":"curl -s http://127.0.0.1:8080/v0/runs/` + run1ID + `"}],` +
+			`"target_url":"http://127.0.0.1:8080"}`)},
+		onInvoke: func(_ int, inv agent.Invocation) { prompt2 = inv.Prompt }})
+	var stderr2 strings.Builder
+	if got := run([]string{
+		"--run-id", run2ID, "--backend-url", backend.URL, "--workflow", "feature_change",
+		"--stage", "acceptance", "--stage-id", stage2, "--fetch-prompt", "--working-dir", repo, "--upload-trace",
+	}, &stderr2); got != exitOK {
+		t.Fatalf("run 2 = %d, want exitOK:\n%s", got, stderr2.String())
+	}
+	for _, want := range []string{"### Regression corpus", "- scenario: scenario:issue-101/crit-b", "origin PR #742"} {
+		if !strings.Contains(prompt2, want) {
+			t.Errorf("run 2 prompt missing %q:\n%s", want, prompt2)
+		}
+	}
+	if strings.Count(prompt2, "- scenario: ") != 1 {
+		t.Errorf("cap 1 must serve exactly one scenario:\n%s", prompt2)
+	}
+	if !strings.Contains(stderr2.String(), `"corpus_size":"4"`) || !strings.Contains(stderr2.String(), `"sampled_out":"3"`) {
+		t.Errorf("corpus_loaded event must report corpus 4 / sampled_out 3:\n%s", stderr2.String())
+	}
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	golden, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "acceptance_replay_verdict.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got, want any
+	if err := json.Unmarshal(captured, &got); err != nil {
+		t.Fatalf("captured body: %v\n%s", err, captured)
+	}
+	if err := json.Unmarshal(golden, &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("shipped body != shared golden:\n got %s\nwant %s", captured, golden)
 	}
 }

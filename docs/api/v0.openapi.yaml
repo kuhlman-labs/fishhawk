@@ -3506,7 +3506,7 @@ components:
           example: 3
         outcome:
           type: string
-          enum: [failed, pushed, fixup_pushed, fixup_no_changes, scope_park]
+          enum: [failed, pushed, fixup_pushed, fixup_no_changes, scope_park, conflict_resolution_pushed, acceptance_scenarios_pushed, acceptance_scenario_retirement_dropped]
           description: |
             Present only on the non-success variants. `failed` (#742)
             reports a commit/push/PR-open failure (PR fields absent;
@@ -3546,6 +3546,44 @@ components:
             partial one records nothing and is NOT a 400 (rejecting it would
             strand the implement stage in `running`). A PRE-push failure omits
             all four, which is byte-identical to the pre-#2169 failure body.
+
+            `acceptance_scenarios_pushed` (E72.4 / #3328) reports the
+            ACCEPTANCE runner's post-verdict scenario-corpus commit — new
+            scenario YAML under `acceptance/scenarios/` and/or the merged
+            retirement ledger `acceptance/scenarios/retired.yaml` — pushed to
+            the run branch (`branch` + `head_sha` + `base_sha` required;
+            `scenario_ids` + `retired` optional). Accepted ONLY on an
+            acceptance stage (400 `validation_failed` elsewhere). It appends
+            ONE `acceptance_scenarios_pushed` audit entry (idempotent on
+            `stage_id` + `head_sha`), refreshes the status comment, and
+            returns 200; it performs NO stage transition and NEVER re-opens
+            the settled acceptance verdict — the verdict stays bound to the
+            pre-scenario head while the commit attributes as run lineage
+            (it is a reported-head ledger category, first in precedence).
+            `acceptance_scenario_retirement_dropped` (E72.4 / #3328) reports
+            that served retirements were NOT persisted: the acceptance runner
+            exited after its prompt fetch on a path that pushed no ledger
+            commit (`retired` non-empty + `reason` required; no head fields).
+            Also acceptance-stage only; appends ONE
+            `acceptance_scenario_retirement_dropped` audit entry (idempotent
+            per `stage_id` + `reason`), refreshes the status comment, 200, no
+            transition.
+        scenario_ids:
+          type: array
+          items: { type: string }
+          description: |
+            `acceptance_scenarios_pushed` only (E72.4 / #3328): the ids of
+            the scenarios the commit persisted, each
+            `scenario:issue-<N>/<criterion-id>`.
+        retired:
+          type: array
+          items:
+            $ref: '#/components/schemas/RetiredScenarioEntry'
+          description: |
+            `acceptance_scenarios_pushed` (the served retirements merged into
+            `retired.yaml`) and `acceptance_scenario_retirement_dropped` (the
+            served retirements that were NOT persisted). FULL entries — the
+            reason travels with the id.
         category:
           type: string
           enum: [B, C]
@@ -3965,6 +4003,69 @@ components:
             (E31.16 / #1567): a benign top-level remark that would otherwise
             fail closed against the strict-unknown-fields decode. Free text,
             stored verbatim. Optional.
+        replay:
+          $ref: '#/components/schemas/AcceptanceReplay'
+
+    AcceptanceReplay:
+      type: object
+      description: |
+        RUNNER-INJECTED replay evidence (E72.4 / #3328), set on the validated
+        verdict AFTER the agent's output passed the closed agent-facing schema
+        (an agent-authored `replay` is refused by the runner). The cap header
+        (`cap`, `corpus_size`, `served`, `sampled_out`, `retired_excluded`,
+        `seed`) is computed ONCE at the runner's sampling site and copied
+        VERBATIM onto `acceptance_outcome_recorded.replay` (alongside
+        `scenarios_passed` / `scenarios_failed` / `scenarios_skipped` counted
+        from the `scenario:`-prefixed verdict rows and `served_mismatch`); the
+        backend never reconstructs it. Absent → the recorded outcome carries
+        `replay: null`. Verdict rows whose `id` carries the `scenario:` prefix
+        are PARTITIONED out of every criterion tally, downgrade and precedence
+        computation; each FAILED scenario row appends an
+        `acceptance_scenario_regression` audit entry whose `origin_pr` /
+        `origin_issue` / `origin_run_id` / `path` come ONLY from the matching
+        `scenarios[]` entry (no entry, or `origin_pr` 0 → `origin_pr` absent
+        and `origin_unresolved: true`, never the issue number) and routes
+        triage class 1; a skipped / undecidable scenario row never routes
+        class 2 / 5 and never clamps the run verdict.
+      required: [cap, corpus_size, served, sampled_out, retired_excluded, seed, scenarios]
+      properties:
+        cap: { type: integer }
+        corpus_size: { type: integer }
+        served: { type: integer }
+        sampled_out: { type: integer }
+        retired_excluded: { type: integer }
+        seed: { type: string }
+        scenarios:
+          type: array
+          items:
+            type: object
+            required: [scenario_id, origin_issue, origin_run_id, path]
+            properties:
+              scenario_id: { type: string }
+              origin_pr:
+                type: integer
+                description: Omitted when the originating PR was unknown at record time.
+              origin_issue: { type: integer }
+              origin_run_id: { type: string }
+              path: { type: string }
+
+    RetiredScenarioEntry:
+      type: object
+      description: |
+        ONE shape for a scenario retirement (E72.4 / #3328): the
+        `approval_submitted` `retired_scenarios` record, the acceptance prompt's
+        `acceptance_retired_scenarios` element, the `retired.yaml` row the
+        runner writes, and the pull-request report element — so the reason is
+        never lost at a conversion boundary. `pr` is 0 at approval and is
+        filled from the run's `pull_request_opened` ledger at the acceptance
+        prompt fetch.
+      required: [id, reason, run_id, pr, retired_at]
+      properties:
+        id: { type: string }
+        reason: { type: string }
+        run_id: { type: string }
+        pr: { type: integer }
+        retired_at: { type: string }
 
     AcceptanceUploadResponse:
       type: object
@@ -12446,7 +12547,8 @@ paths:
                       The run's merge-candidate identity — the newest
                       `head_sha` across the run's reported-head ledger
                       entries (`pull_request_opened` / `child_pushed` /
-                      `fixup_pushed`, the same ADR-035 lineage source as
+                      `fixup_pushed` / `acceptance_scenarios_pushed`, the same
+                      ADR-035 lineage source as
                       `fixup_expected_head_sha`), falling back to the newest
                       `integration_commit_recorded` `merge_sha` on the run's
                       own chain when that ledger is empty (#3091), which is
@@ -12465,6 +12567,54 @@ paths:
                       proceeding unverified (#3091): with no expectation
                       there is nothing to verify the target against, so a
                       recorded verdict would bind to no tree.
+                  acceptance_run_branch:
+                    type: string
+                    description: |
+                      The run branch the acceptance runner pushes its
+                      scenario-corpus commit to (E72.4 / #3328): the branch of
+                      the run's newest reported-head ledger entry. Served ONLY
+                      on acceptance stages; absent when unresolvable, in which
+                      case the runner skips persistence
+                      (`persist_skipped` / `no_run_branch`) and reports
+                      `acceptance_scenario_retirement_dropped` when retirements
+                      were served.
+                  acceptance_pull_request_number:
+                    type: integer
+                    description: |
+                      The run's PR number from its newest `pull_request_opened`
+                      ledger entry (E72.4 / #3328), recorded as each persisted
+                      scenario's `origin.pr`. Acceptance stages only; absent
+                      (0) when unresolvable — never substituted with the issue
+                      number.
+                  acceptance_criteria:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, statement, drivable]
+                      properties:
+                        id: { type: string }
+                        statement: { type: string }
+                        verify_hint: { type: string }
+                        preconditions:
+                          type: array
+                          items: { type: string }
+                        drivable:
+                          type: boolean
+                          description: False when the criterion is `skip_expected`.
+                    description: |
+                      The EFFECTIVE acceptance criteria set (restatements
+                      applied, retired criteria removed) the runner's scenario
+                      Compose reads (E72.4 / #3328). Acceptance stages only.
+                  acceptance_retired_scenarios:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RetiredScenarioEntry'
+                    description: |
+                      Every approved `retire_scenario` entry on the run's
+                      approval chain, FULL entries with `pr` filled from the
+                      `pull_request_opened` ledger (E72.4 / #3328). The runner
+                      merges them into `acceptance/scenarios/retired.yaml`.
+                      Acceptance stages only.
                   open_pr_from_held_commit:
                     type: boolean
                     description: |
@@ -12800,6 +12950,31 @@ paths:
                   acceptance_expected_head_sha:
                     type: string
                     description: The run's merge-candidate identity — the newest `head_sha` across the run's reported-head ledger entries (the ADR-035 lineage source, same as `fixup_expected_head_sha`), falling back to the newest `integration_commit_recorded` `merge_sha` on the run's own chain for a decomposed parent whose reported-head ledger is empty (#3091); served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when resolution fails, in which case the runner fails the stage pre-spawn category-C `acceptance_expected_head_unresolved` rather than proceeding unverified (#3091).
+                  acceptance_run_branch:
+                    type: string
+                    description: The run branch the acceptance runner pushes its scenario-corpus commit to (E72.4 / #3328); acceptance stages only, absent when unresolvable.
+                  acceptance_pull_request_number:
+                    type: integer
+                    description: The run's PR number from its newest `pull_request_opened` ledger entry, recorded as each persisted scenario's `origin.pr` (E72.4 / #3328); acceptance stages only, absent (0) when unresolvable — never the issue number.
+                  acceptance_criteria:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, statement, drivable]
+                      properties:
+                        id: { type: string }
+                        statement: { type: string }
+                        verify_hint: { type: string }
+                        preconditions:
+                          type: array
+                          items: { type: string }
+                        drivable: { type: boolean }
+                    description: The EFFECTIVE acceptance criteria set the runner's scenario Compose reads (E72.4 / #3328); acceptance stages only.
+                  acceptance_retired_scenarios:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RetiredScenarioEntry'
+                    description: Every approved `retire_scenario` entry, FULL entries with `pr` filled from the ledger (E72.4 / #3328); acceptance stages only.
                   open_pr_from_held_commit:
                     type: boolean
                     description: True ONLY when this implement stage's scope-completeness park (#1231) was resolved `exempt` (#2501) — the runner then opens the PR from the held commit with NO agent re-invocation. Absent on every other dispatch, including an undecided or `fail`-decided park.
@@ -13390,7 +13565,7 @@ paths:
                           `verification.acceptance_criteria`.
                       action:
                         type: string
-                        enum: [retire, restate]
+                        enum: [retire, restate, retire_scenario]
                       reason:
                         type: string
                         description: |
@@ -13432,6 +13607,27 @@ paths:
                     REFUSES rather than ignores elsewhere, so a dropped amendment
                     can never diverge from what the chain records. Omitting the
                     field is byte-identical to today.
+
+                    `retire_scenario` (E72.4 / #3328) retires a persisted
+                    REPLAY SCENARIO, not a plan criterion: `id` is the scenario
+                    id (`scenario:issue-<N>/<criterion-id>`), `reason` is
+                    REQUIRED, no `statement`; it never counts toward
+                    `acceptance_criteria_all_retired` and is permitted with
+                    zero plan criteria. The FULL entry `{id, reason, run_id,
+                    pr, retired_at}` is recorded on the same `approval_submitted`
+                    payload as `retired_scenarios` (`pr` 0 at approval), served
+                    to the acceptance runner as `acceptance_retired_scenarios`,
+                    and merged by it into `acceptance/scenarios/retired.yaml`.
+                    Refused `400 validation_failed` with `details.rule` one of
+                    `scenario_id_prefix_required`, `reason_required`,
+                    `statement_not_allowed`, `duplicate_id`, `already_retired`;
+                    refused `400 acceptance_scenario_retirement_unpersistable`
+                    (`details.plan_shape` one of `acceptance_surface_none`,
+                    `out_of_scope`, `empty_criteria`, `all_skip_with_basis`)
+                    when the plan's shape settles the acceptance stage
+                    server-side with no runner spawn — the retirement would be
+                    approved and silently dropped, so it is never approved;
+                    retire it on a run whose acceptance stage executes.
                 claims_concern_ids:
                   type: array
                   items:

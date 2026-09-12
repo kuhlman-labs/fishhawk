@@ -273,8 +273,9 @@ type promptResponse struct {
 	AcceptanceCriteriaIDs []string `json:"acceptance_criteria_ids,omitempty"`
 	// AcceptanceExpectedHeadSHA is the run's merge-candidate identity — the
 	// newest head_sha across the run's reported-head ledger entries
-	// (pull_request_opened / child_pushed / fixup_pushed, the same ADR-035
-	// lineage source FixupExpectedHeadSHA resolves from), falling back to
+	// (pull_request_opened / child_pushed / fixup_pushed /
+	// acceptance_scenarios_pushed, the same ADR-035 lineage source
+	// FixupExpectedHeadSHA resolves from), falling back to
 	// the newest integration_commit_recorded merge_sha on the run's own
 	// chain for a decomposed parent whose reported-head ledger is empty
 	// (#3091) — served ONLY on acceptance stages (E31.18 / #1569). The
@@ -298,6 +299,37 @@ type promptResponse struct {
 	// acceptance dispatch category-C rather than degrading the gate to an
 	// unverifiable warn, so the drift is loud but total.
 	AcceptanceExpectedHeadSHA string `json:"acceptance_expected_head_sha,omitempty"`
+	// Replayable scenario corpus inputs (E72.4 / #3328), served ONLY on
+	// acceptance stages and all omitempty so every other response is
+	// byte-identical. AcceptanceRunBranch is the run branch the acceptance
+	// runner pushes its scenario-corpus commit to (the branch of the run's
+	// newest reported-head ledger entry; empty when unresolvable, which makes
+	// the runner take persist_skipped{no_run_branch} and report the drop).
+	// AcceptancePullRequestNumber is the run's PR number from its newest
+	// pull_request_opened ledger entry, 0 when unresolvable — the runner
+	// records it as the scenario's origin.pr, never substituting the issue.
+	// AcceptanceCriteria is the EFFECTIVE criteria set the runner's Compose
+	// reads (id / statement / verify_hint / preconditions / drivable).
+	// AcceptanceRetiredScenarios is the FULL retirement entry list the
+	// operator approved via retire_scenario, each with its reason, run_id,
+	// pr (filled here from the ledger) and retired_at, which the runner merges
+	// into acceptance/scenarios/retired.yaml.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+	// the runner's upload.FetchedPrompt decoders (runner/internal/upload/
+	// upload.go) and, for the element types, to runner/internal/scenario.
+	// RetiredEntry and upload.AcceptanceCriterionEntry — pinned by the
+	// wirecontract manifest. A tag drift silently drops a retirement.
+	AcceptanceRunBranch         string                     `json:"acceptance_run_branch,omitempty"`
+	AcceptancePullRequestNumber int                        `json:"acceptance_pull_request_number,omitempty"`
+	AcceptanceCriteria          []acceptanceCriterionEntry `json:"acceptance_criteria,omitempty"`
+	AcceptanceRetiredScenarios  []retiredScenarioEntry     `json:"acceptance_retired_scenarios,omitempty"`
+	// AcceptanceIssueNumber is the run's trigger issue number (E72.4 /
+	// #3328, scope amendment 604519dc): the runner keys each recorded scenario
+	// `scenario:issue-<N>/<criterion-id>` and its origin.issue on it. Served
+	// ONLY on acceptance stages, omitempty; 0 (a non-issue trigger) makes the
+	// runner skip recording rather than substitute the PR number.
+	AcceptanceIssueNumber int `json:"acceptance_issue_number,omitempty"`
 	// OpenPRFromHeldCommit / HeldCommitSHA / HeldCommitBranch are the
 	// scope-completeness EXEMPT resolution fields (#1231's zero-re-run promise,
 	// finally emitted by #2501). They are served ONLY when the implement stage's
@@ -394,6 +426,41 @@ type promptScopeConstraint struct {
 type scopeExemption struct {
 	Path   string `json:"path"`
 	Reason string `json:"reason"`
+}
+
+// acceptanceCriterionEntry is one effective acceptance criterion served to
+// the acceptance runner's scenario Compose (E72.4 / #3328): the plan text plus
+// whether the criterion is drivable (not skip_expected).
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+// runner's upload.AcceptanceCriterionEntry decoder (runner/internal/upload/
+// upload.go); the wirecontract manifest pins the pair ModeExact.
+type acceptanceCriterionEntry struct {
+	ID            string   `json:"id"`
+	Statement     string   `json:"statement"`
+	VerifyHint    string   `json:"verify_hint,omitempty"`
+	Preconditions []string `json:"preconditions,omitempty"`
+	Drivable      bool     `json:"drivable"`
+}
+
+// retiredScenarioEntry is the FULL scenario-retirement entry (E72.4 / #3328):
+// ONE shape for the approval_submitted `retired_scenarios` record, the served
+// acceptance_retired_scenarios prompt field, and the acceptance_scenarios_pushed
+// / acceptance_scenario_retirement_dropped report elements — so a retirement's
+// reason cannot be lost at a conversion boundary. PR is 0 at approval and is
+// filled from the run's pull_request_opened ledger at the acceptance prompt
+// fetch.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+// runner/internal/scenario.RetiredEntry (runner/internal/scenario/scenario.go),
+// the type the runner decodes the served field into AND writes to
+// retired.yaml; the wirecontract manifest pins the pair ModeExact.
+type retiredScenarioEntry struct {
+	ID        string `json:"id"`
+	Reason    string `json:"reason"`
+	RunID     string `json:"run_id"`
+	PR        int    `json:"pr"`
+	RetiredAt string `json:"retired_at"`
 }
 
 // fixupApplyPatch is one entry in promptResponse.FixupApplyPatches: a single
@@ -1508,6 +1575,8 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		resp.EgressTargetHosts = s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow)
 		resp.AcceptanceCriteriaIDs = acceptanceCriteriaIDsFromPlan(trigger.ApprovedPlan)
 		resp.AcceptanceExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
+		s.fillAcceptanceReplayFields(r.Context(), runRow.ID, stage.ID, trigger.ApprovedPlan, &resp)
+		resp.AcceptanceIssueNumber = trigger.IssueNumber
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
@@ -2138,6 +2207,8 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		resp.EgressTargetHosts = s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow)
 		resp.AcceptanceCriteriaIDs = acceptanceCriteriaIDsFromPlan(trigger.ApprovedPlan)
 		resp.AcceptanceExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
+		s.fillAcceptanceReplayFields(r.Context(), runRow.ID, stage.ID, trigger.ApprovedPlan, &resp)
+		resp.AcceptanceIssueNumber = trigger.IssueNumber
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
@@ -4311,6 +4382,91 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 }
 
 // resolveNewestReportedHeadSHA is the shared reported-head ledger walk behind
+// fillAcceptanceReplayFields populates the E72.4 / #3328 replayable-scenario
+// inputs on an acceptance-stage prompt response: the run branch + PR number
+// from the reported-head ledger (resolveAcceptanceRunBranchAndPR), the
+// effective criteria set (through the single resolveEffectiveAcceptanceCriteria
+// seam; FAILS OPEN to the plan's full set on a read error, the same direction
+// resolveAcceptancePromptCriteria takes), and the FULL approved
+// retire_scenario entries with pr filled from the ledger. Every field is
+// omitempty, so an acceptance response with nothing to serve is unchanged.
+func (s *Server) fillAcceptanceReplayFields(ctx context.Context, runID, stageID uuid.UUID, p *plan.Plan, resp *promptResponse) {
+	resp.AcceptanceRunBranch, resp.AcceptancePullRequestNumber = s.resolveAcceptanceRunBranchAndPR(ctx, runID, stageID)
+	eff, err := s.resolveEffectiveAcceptanceCriteria(ctx, runID, p, nil)
+	live := eff.Live
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: effective acceptance criteria unreadable for the replay corpus; serving the full plan set",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+		if p != nil {
+			live = p.Verification.AcceptanceCriteria
+		}
+	}
+	for _, c := range live {
+		resp.AcceptanceCriteria = append(resp.AcceptanceCriteria, acceptanceCriterionEntry{
+			ID:            c.ID,
+			Statement:     c.Statement,
+			VerifyHint:    c.VerifyHint,
+			Preconditions: c.Preconditions,
+			Drivable:      !c.SkipExpected,
+		})
+	}
+	for _, e := range eff.RetiredScenarios {
+		if e.PR == 0 {
+			e.PR = resp.AcceptancePullRequestNumber
+		}
+		resp.AcceptanceRetiredScenarios = append(resp.AcceptanceRetiredScenarios, e)
+	}
+}
+
+// resolveAcceptanceRunBranchAndPR returns the run branch and PR number the
+// acceptance runner persists its scenario commit against (E72.4 / #3328): the
+// branch of the NEWEST reported-head ledger entry (the same
+// lineageLedgerCategories walk resolveNewestReportedHeadSHA uses) and the
+// pr_number of the newest pull_request_opened entry. ("", 0) on an
+// unconfigured AuditRepo, no entry, or any read error — WARN-and-omit, so a
+// degraded read makes the runner skip persistence (and report the drop)
+// rather than push to a guessed branch.
+func (s *Server) resolveAcceptanceRunBranchAndPR(ctx context.Context, runID, stageID uuid.UUID) (string, int) {
+	if s.cfg.AuditRepo == nil {
+		return "", 0
+	}
+	var newest, newestPR *audit.Entry
+	branch, prNumber := "", 0
+	for _, cat := range lineageLedgerCategories {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"prompt: list reported-head audit entries failed; omitting acceptance run branch",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("category", cat),
+				slog.String("error", err.Error()))
+			return "", 0
+		}
+		for _, e := range entries {
+			var payload struct {
+				Branch   string `json:"branch"`
+				PRNumber int    `json:"pr_number"`
+			}
+			if err := json.Unmarshal(e.Payload, &payload); err != nil {
+				continue
+			}
+			isNewer := func(cur *audit.Entry) bool {
+				return cur == nil || e.Timestamp.After(cur.Timestamp) ||
+					(e.Timestamp.Equal(cur.Timestamp) && e.Sequence > cur.Sequence)
+			}
+			if payload.Branch != "" && isNewer(newest) {
+				newest, branch = e, payload.Branch
+			}
+			if cat == "pull_request_opened" && payload.PRNumber > 0 && isNewer(newestPR) {
+				newestPR, prNumber = e, payload.PRNumber
+			}
+		}
+	}
+	return branch, prNumber
+}
+
 // resolveFixupExpectedHeadSHA and resolveAcceptanceExpectedHeadSHA: the newest
 // head_sha across lineageLedgerCategories, "" (WARN-and-omit, logging forField
 // as the omitted wire field) when the AuditRepo is unconfigured, no entry
