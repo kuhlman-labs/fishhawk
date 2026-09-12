@@ -331,10 +331,27 @@ func Write(dir string, s Scenario) (string, error) {
 // it, but a symlinked leaf is still not a path the corpus owns). root itself
 // is deliberately NOT checked: a symlinked temp root (macOS t.TempDir(),
 // a TMPDIR under /var → /private/var) is legitimate and is not
-// attacker-committed content. Any other Lstat error propagates.
+// attacker-committed content. Any other Lstat error propagates. rel is
+// also refused when it carries a `..` component or is absolute: the walk
+// below joins each component with filepath.Join, which would normalize a
+// `..` UP and out of root before the lstat ever ran, so the guard must not
+// depend on every caller having pre-validated rel the way PathFor does.
 func RefuseSymlinks(root, rel string) error {
+	rel = filepath.ToSlash(rel)
+	if strings.HasPrefix(rel, "/") {
+		return fmt.Errorf("%s: refusing absolute path %q", root, rel)
+	}
+	comps := strings.Split(rel, "/")
+	// Scanned BEFORE the walk: the walk returns nil at the first absent
+	// component, so a `..` behind a not-yet-created prefix would otherwise
+	// never be reached.
+	for _, comp := range comps {
+		if comp == ".." {
+			return fmt.Errorf("%s: refusing parent-directory path component in %q", root, rel)
+		}
+	}
 	cur := root
-	for _, comp := range strings.Split(filepath.ToSlash(rel), "/") {
+	for _, comp := range comps {
 		if comp == "" || comp == "." {
 			continue
 		}

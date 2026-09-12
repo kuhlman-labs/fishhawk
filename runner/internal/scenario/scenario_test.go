@@ -505,6 +505,28 @@ func TestRefuseSymlinks_NonDirectoryComponentAndMissingTail(t *testing.T) {
 	}
 }
 
+// TestRefuseSymlinks_RejectsParentAndAbsoluteRel: RefuseSymlinks is
+// exported, so it cannot rely on every caller feeding it PathFor output —
+// a `..` component (which filepath.Join would normalize UP and out of root
+// before any lstat) and an absolute rel are refused by the function itself,
+// and nothing outside root is lstat-walked or created.
+func TestRefuseSymlinks_RejectsParentAndAbsoluteRel(t *testing.T) {
+	root := t.TempDir()
+	for _, rel := range []string{"a/../../x.yaml", "../x.yaml", "..", "a/.."} {
+		err := RefuseSymlinks(root, rel)
+		if err == nil || !strings.Contains(err.Error(), "parent-directory path component") {
+			t.Errorf("RefuseSymlinks(%q) err = %v, want a parent-directory refusal", rel, err)
+		}
+	}
+	err := RefuseSymlinks(root, "/etc/x.yaml")
+	if err == nil || !strings.Contains(err.Error(), "refusing absolute path") {
+		t.Errorf("absolute rel err = %v, want an absolute-path refusal", err)
+	}
+	if err := RefuseSymlinks(root, "a/./b.yaml"); err != nil {
+		t.Errorf("a `.` component is inert and must pass: %v", err)
+	}
+}
+
 func TestWireTypes_ExactJSONKeys(t *testing.T) {
 	keys := func(v any) []string {
 		b, _ := json.Marshal(v)

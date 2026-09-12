@@ -49,7 +49,12 @@ apply it to the corpus-root components it owns (`acceptance/`,
 Contract: every existing component of `rel` under `root` is `Lstat`ed; a
 symlink → `refusing to write through symlinked path component "<comp>"`;
 an existing intermediate that is not a directory → `non-directory path
-component "<comp>"`; the walk stops at the first absent component (nothing
+component "<comp>"`; a `..` component → `refusing parent-directory path
+component`, and an absolute `rel` → `refusing absolute path`, BOTH before
+any lstat (the walk joins with `filepath.Join`, which would normalize a
+`..` up and out of `root` — so the function does not depend on a caller
+having pre-validated `rel` the way `PathFor` does); the walk stops at the
+first absent component (nothing
 that does not exist can redirect `MkdirAll`); the leaf is checked too
 (`rename(2)` onto a symlink replaces the link entry, not the target, so this
 half is belt-and-braces). Residuals, stated: `root` itself is NOT checked
@@ -61,7 +66,8 @@ writer is accepted for the runner's own detached checkout. Pinned by
 `TestWrite_RefusesSymlinkedDirComponent`, `TestWrite_RefusesSymlinkedLeaf`,
 `TestWriteRetired_RefusesSymlinkedLedger` (real `os.Symlink`, outside dir
 asserted empty / target bytes unchanged) and
-`TestRefuseSymlinks_NonDirectoryComponentAndMissingTail`.
+`TestRefuseSymlinks_NonDirectoryComponentAndMissingTail`; the `..` /
+absolute refusals by `TestRefuseSymlinks_RejectsParentAndAbsoluteRel`.
 
 Hand-authored YAML trap: a value carrying ` #` (a reason like
 `behaviour replaced by #3327`) MUST be quoted, or YAML reads the tail as a
