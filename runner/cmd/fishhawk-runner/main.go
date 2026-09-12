@@ -50,6 +50,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/otelemit"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/reachability"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/scenario"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
@@ -538,6 +539,20 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// produced and consumed within run().
 	var acceptanceExpectedHeadSHA string
 
+	// Replayable scenario corpus (E72.4 / #3328), acceptance stage only.
+	// acceptanceReplayIn is the prompt-served input bundle (run branch, PR +
+	// issue numbers, effective criteria, served FULL retirement entries);
+	// acceptanceReplaySet is the cap evidence + attribution loadReplayCorpus
+	// computed from the LOADED corpus files, injected into the validated
+	// verdict body; retirementDrop is the deferred drop reporter, armed the
+	// instant the fetch returns served retirements (binding condition 1) and
+	// disarmed only by a successful acceptance_scenarios_pushed report.
+	var (
+		acceptanceReplayIn  acceptanceReplayInputs
+		acceptanceReplaySet scenario.ReplaySet
+		retirementDrop      *retirementDropReporter
+	)
+
 	// diffCoverage is the stage's spec-declared `diff_coverage` constraint
 	// (#1888), served only when the workflow declares it. Nil on every
 	// non-declaring workflow and on local replay without --fetch-prompt, in
@@ -566,11 +581,29 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
 			return exitFailure
+		}
+		// Arm the retirement-drop reporter IMMEDIATELY (E72.4 / #3328, binding
+		// condition 1): from this line on, every return from run() — the
+		// version-skew and agent-version checks, the lineage block, the
+		// acceptance target gate, provisionAcceptanceTree, the removal guard,
+		// the verdict capture/validation, the ship and the persist step — is
+		// covered by the deferred report, so an approved retirement the fetch
+		// served can never be dropped silently. The closure reads client /
+		// cfg / issuedKey by reference so the pre-terminal key refresh is
+		// honored. Nil (no-op) when nothing was served.
+		acceptanceReplayIn = promptAcceptanceReplay
+		if sType == "acceptance" && len(acceptanceReplayIn.retired) > 0 {
+			retirementDrop = newRetirementDropReporter(acceptanceReplayIn.retired)
+			defer func() { retirementDrop.report(ctx, client, cfg, issuedKey, logSink) }()
+			logEvent(logSink, "acceptance_scenario_retirement_reporter_armed", map[string]string{
+				"run_id": cfg.runID, "stage_id": cfg.stageID,
+				"retired_ids": strings.Join(retiredIDs(acceptanceReplayIn.retired), ","),
+			})
 		}
 		// Version-skew check: if the backend requires a newer runner, exit
 		// immediately rather than invoking the agent with potentially
@@ -1043,11 +1076,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	//      authority boundary is that the invocation env carries no
 	//      repo-write credential of any kind (acceptenv denies
 	//      GITHUB_TOKEN / GH_TOKEN / FISHHAWK_GITHUB_TOKEN and the
-	//      MCP-token block above never runs), the acceptance stage
+	//      MCP-token block above never runs), the acceptance AGENT
 	//      performs no git add/commit/push and never opens a PR (every
-	//      commit/PR path below is stage-gated to implement), and
-	//      hostile filesystem writes remain the documented OS-sandbox
-	//      residual (ADR-050; runner README residual note; #611-class).
+	//      agent-driven commit/PR path below is stage-gated to implement;
+	//      the one acceptance-stage write — the post-verdict scenario-corpus
+	//      commit, E72.4 / #3328 — is made by the RUNNER with host
+	//      credentials, confined to acceptance/scenarios/**, after the
+	//      agent has exited), and hostile filesystem writes remain the
+	//      documented OS-sandbox residual (ADR-050; runner README residual
+	//      note; #611-class).
 	//   2. The ADR-050 egress proxy starts with the composed allow-list
 	//      (spec-declared target hosts + model APIs + backend). A start
 	//      error fails the stage category-C BEFORE any agent spawn — the
@@ -1142,6 +1179,50 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			},
 			logSink)
 		defer acceptanceTreeTeardown()
+
+		// Replayable scenario corpus, pre-spawn (E72.4 / #3328). All three
+		// steps read the provisioned acceptance tree (the merge candidate):
+		//   1. scenarioRemovalGuard — a scenario deleted/modified without a
+		//      ledger entry, or a ledger entry not backed by this run's
+		//      approval, fails category-B BEFORE any spawn (the deferred drop
+		//      reporter above then names the guard as the exit path);
+		//   2. loadReplayCorpus — cap evidence + attribution from the LOADED
+		//      files, served retirements excluded; an unreadable corpus skips
+		//      replay and the stage proceeds;
+		//   3. appendPromptSection — the "### Regression corpus" section the
+		//      agent replays FIRST, appended to the fetched prompt file.
+		acceptanceTree := acceptanceTreePath(cfg.runID, cfg.stageID)
+		if guardReason, guardDetail := scenarioRemovalGuard(ctx, acceptanceTree,
+			resolveImplementBaseRef(cfg), acceptanceReplayIn.retired, cfg.runID, logSink); guardReason != "" {
+			retirementDrop.note(guardReason)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":%q,"category":"B","detail":%q}`+"\n",
+				guardReason, guardDetail)
+			return exitFailure
+		}
+		if set, section, err := loadReplayCorpus(acceptanceTree, acceptanceReplayIn.retired,
+			replayCorpusConfigFromEnv(), cfg.runID, logSink); err == nil {
+			acceptanceReplaySet = set
+			if section != "" {
+				if err := appendPromptSection(cfg.promptFile, section); err != nil {
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"runner_failed","reason":"acceptance_replay_prompt","category":"C","detail":%q}`+"\n",
+						err.Error())
+					return exitFailure
+				}
+				// inv.Prompt was read from the file BEFORE this block; re-read
+				// so the agent sees the appended section (the file stays the
+				// single source of the prompt text).
+				appended, err := os.ReadFile(cfg.promptFile)
+				if err != nil {
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"runner_failed","reason":"acceptance_replay_prompt","category":"C","detail":%q}`+"\n",
+						err.Error())
+					return exitFailure
+				}
+				inv.Prompt = string(appended)
+			}
+		}
 
 		baseEnv, refused := acceptenv.Env(os.Environ(), proxy.URL())
 		if len(refused) > 0 {
@@ -1900,6 +1981,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		rawVerdict, capErr := captureAcceptanceVerdict(res,
 			acceptanceVerdictPath(cfg.runID, cfg.stageID), legacyAcceptanceVerdictPath, acceptanceWarn)
 		if capErr != nil {
+			retirementDrop.note("acceptance_verdict_missing")
 			res.OK = false
 			res.FailureCategory = "B"
 			res.FailureReason = "acceptance_verdict_missing: " + capErr.Error()
@@ -1907,8 +1989,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"acceptance_verdict_missing","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, capErr.Error())
-		} else if coercedVerdict, valErr := validateAcceptanceVerdict(rawVerdict, acceptanceCriteriaIDs,
-			acceptanceWarn); valErr != nil {
+		} else if coercedVerdict, valErr := validateAcceptanceVerdict(rawVerdict,
+			acceptanceServedVerdictIDs(acceptanceCriteriaIDs, acceptanceReplaySet), acceptanceWarn); valErr != nil {
+			retirementDrop.note("acceptance_verdict_invalid")
 			res.OK = false
 			res.FailureCategory = "B"
 			res.FailureReason = "acceptance_verdict_invalid: " + valErr.Error()
@@ -1920,6 +2003,30 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// Use the normalized (possibly coerced) verdict bytes for redaction
 			// and ship so downstream carries the canonical shape.
 			rawVerdict = coercedVerdict
+			// Inject the runner-computed `replay` set AFTER validation (the
+			// closed agent-facing schema refuses an agent-authored replay) and
+			// BEFORE redaction, so the backend's attribution source is the
+			// loaded corpus files, never agent prose (E72.4 / #3328). Injected
+			// ONLY when the corpus held at least one scenario (served, sampled
+			// out or retired-excluded): an empty or absent corpus ships the
+			// body unchanged and the backend records replay:null, while the
+			// runner log's acceptance_replay_corpus_loaded still carries the
+			// zero counts. An injection failure is category-B: the verdict
+			// cannot carry the cap evidence the backend records verbatim.
+			if replaySetHasCorpus(acceptanceReplaySet) {
+				if injected, injErr := upload.InjectReplay(rawVerdict, acceptanceReplaySet); injErr != nil {
+					retirementDrop.note("acceptance_replay_inject_failed")
+					res.OK = false
+					res.FailureCategory = "B"
+					res.FailureReason = "acceptance_replay_inject_failed: " + injErr.Error()
+					invokeErr = injErr
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"acceptance_replay_inject_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+						cfg.runID, cfg.stageID, injErr.Error())
+				} else {
+					rawVerdict = injected
+				}
+			}
 			redacted, hits := redactAcceptanceVerdict(rawVerdict)
 			acceptanceVerdictRedacted = redacted
 			if len(hits) > 0 {
@@ -2569,6 +2676,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"acceptance_shipped","run_id":%q,"stage_id":%q,"artifact_id":%q,"verdict":%q,"content_hash":%q,"idempotent":%t}`+"\n",
 				cfg.runID, cfg.stageID, shipRes.ID, shipRes.Verdict, shipRes.ContentHash, shipRes.Idempotent)
+			// Scenario-corpus persistence (E72.4 / #3328), AFTER the verdict is
+			// shipped and bound to the pre-scenario head: record the pass, merge
+			// the served retirements, commit acceptance/scenarios/** onto the run
+			// branch and report acceptance_scenarios_pushed. Best-effort — the
+			// verdict outcome is settled; every non-pushed path notes its reason
+			// on the deferred drop reporter, which only a successful report (or
+			// an already-ledgered retirement set) disarms.
+			persistAndReportAcceptanceScenarios(ctx, cfg, client, issuedKey, acceptanceReplayIn,
+				acceptanceExpectedHeadSHA, acceptanceVerdictRedacted, retirementDrop, logSink)
 		}
 
 		// Implement-stage post-processing: commit + push + open PR
@@ -3069,16 +3185,19 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // acceptanceExpectedHeadSHA (E31.18 / #1569) is the merge-candidate head the
 // acceptance pre-spawn target-identity gate compares the declared target's
 // /healthz git_sha against; empty degrades the gate to unverifiable-warn.
+// acceptanceReplay (E72.4 / #3328) bundles the replayable-scenario inputs
+// (run branch, PR + issue numbers, effective criteria, served retirements)
+// served only on acceptance stages; zero-valued everywhere else.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -3086,20 +3205,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), nil
 }
 
 func logStartup(w io.Writer, cfg config) {

@@ -324,6 +324,12 @@ type promptResponse struct {
 	AcceptancePullRequestNumber int                        `json:"acceptance_pull_request_number,omitempty"`
 	AcceptanceCriteria          []acceptanceCriterionEntry `json:"acceptance_criteria,omitempty"`
 	AcceptanceRetiredScenarios  []retiredScenarioEntry     `json:"acceptance_retired_scenarios,omitempty"`
+	// AcceptanceIssueNumber is the run's trigger issue number (E72.4 /
+	// #3328, scope amendment 604519dc): the runner keys each recorded scenario
+	// `scenario:issue-<N>/<criterion-id>` and its origin.issue on it. Served
+	// ONLY on acceptance stages, omitempty; 0 (a non-issue trigger) makes the
+	// runner skip recording rather than substitute the PR number.
+	AcceptanceIssueNumber int `json:"acceptance_issue_number,omitempty"`
 	// OpenPRFromHeldCommit / HeldCommitSHA / HeldCommitBranch are the
 	// scope-completeness EXEMPT resolution fields (#1231's zero-re-run promise,
 	// finally emitted by #2501). They are served ONLY when the implement stage's
@@ -1570,6 +1576,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		resp.AcceptanceCriteriaIDs = acceptanceCriteriaIDsFromPlan(trigger.ApprovedPlan)
 		resp.AcceptanceExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
 		s.fillAcceptanceReplayFields(r.Context(), runRow.ID, stage.ID, trigger.ApprovedPlan, &resp)
+		resp.AcceptanceIssueNumber = trigger.IssueNumber
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
@@ -2201,6 +2208,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		resp.AcceptanceCriteriaIDs = acceptanceCriteriaIDsFromPlan(trigger.ApprovedPlan)
 		resp.AcceptanceExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
 		s.fillAcceptanceReplayFields(r.Context(), runRow.ID, stage.ID, trigger.ApprovedPlan, &resp)
+		resp.AcceptanceIssueNumber = trigger.IssueNumber
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }

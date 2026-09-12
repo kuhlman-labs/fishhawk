@@ -12978,6 +12978,13 @@ func TestPromptResponse_AcceptanceReplayFieldsServedOnlyOnAcceptanceStage(t *tes
 	if resp.AcceptanceRunBranch != "fishhawk/run-x/stage-y" || resp.AcceptancePullRequestNumber != 742 {
 		t.Errorf("run branch/PR = %q/%d, want fishhawk/run-x/stage-y/742", resp.AcceptanceRunBranch, resp.AcceptancePullRequestNumber)
 	}
+	// acceptance_issue_number (scope amendment 604519dc) is the TRIGGER issue
+	// (1534 here), asserted as a value distinct from the PR number so an
+	// implementation reaching for the PR where the issue belongs fails.
+	if resp.AcceptanceIssueNumber != 1534 || resp.AcceptanceIssueNumber == resp.AcceptancePullRequestNumber ||
+		!strings.Contains(w.Body.String(), `"acceptance_issue_number":1534`) {
+		t.Errorf("acceptance_issue_number = %d, want the trigger issue 1534 (distinct from PR 742):\n%s", resp.AcceptanceIssueNumber, w.Body.String())
+	}
 	if len(resp.AcceptanceCriteria) != 2 || resp.AcceptanceCriteria[0].ID != "ac-create" || !resp.AcceptanceCriteria[0].Drivable {
 		t.Errorf("AcceptanceCriteria = %+v, want the two plan criteria, drivable", resp.AcceptanceCriteria)
 	}
