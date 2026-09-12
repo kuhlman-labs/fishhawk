@@ -2130,6 +2130,28 @@ if [[ -n "$sp_migrate_line" && "$sp_migrate_line" != *'FISHHAWKD_DEV_FIXTURES'* 
 else
   fail "cmd_preview migrate line should not carry FISHHAWKD_DEV_FIXTURES (got: $sp_migrate_line)"
 fi
+# DONE-MEANS for the stub-forge wiring (E72.3 / #3327): FISHHAWKD_DEV_STUB_FORGE=1
+# rides on the SAME serve exec line (so the preview mounts the in-process stub
+# forge behind /v0/dev/forge*), and NOT on migrate — a no-op touch of
+# scripts/dev, or the var landing on the wrong line, fails here.
+if [[ "$sp_serve_line" == *'FISHHAWKD_DEV_STUB_FORGE=1'* && "$sp_serve_line" == *'FISHHAWKD_ADDR=$paddr'* ]]; then
+  pass "cmd_preview passes FISHHAWKD_DEV_STUB_FORGE=1 on the preview serve exec line"
+else
+  fail "cmd_preview should carry FISHHAWKD_DEV_STUB_FORGE=1 on the serve exec line (got: $sp_serve_line)"
+fi
+if [[ -n "$sp_migrate_line" && "$sp_migrate_line" != *'FISHHAWKD_DEV_STUB_FORGE'* ]]; then
+  pass "cmd_preview does NOT pass FISHHAWKD_DEV_STUB_FORGE on the migrate line"
+else
+  fail "cmd_preview migrate line should not carry FISHHAWKD_DEV_STUB_FORGE (got: $sp_migrate_line)"
+fi
+# The two dev flags are on the ONE serve line, not a second spawn: exactly one
+# `"$pbin" serve` line exists in cmd_preview.
+sp_serve_count="$(print -r -- "$preview_body" | grep -cF '"$pbin" serve')"
+if [[ "$sp_serve_count" == 1 ]]; then
+  pass "cmd_preview spawns exactly one serve line carrying both dev flags"
+else
+  fail "cmd_preview should have exactly one \"\$pbin\" serve line (got $sp_serve_count)"
+fi
 # The serve line still runs under the credential-stripped prefix (regression
 # guard: the new var must be appended AFTER "${reply[@]}", not replace it).
 if [[ "$sp_serve_line" == *'"${reply[@]}"'* ]]; then

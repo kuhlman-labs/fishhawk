@@ -2909,6 +2909,8 @@ _preview_branch_env() {
 # via the preview binary's dev-only, loopback-only POST /v0/dev/fixtures. The
 # surface exists ONLY under FISHHAWKD_DEV_FIXTURES=1, which cmd_preview passes
 # on the serve exec line (never on migrate — the flag is a serve concern).
+# The same line carries FISHHAWKD_DEV_STUB_FORGE=1 (E72.3 / #3327), mounting
+# the in-process stub forge behind the loopback-only /v0/dev/forge* routes.
 # Scenario names are catalog names ([a-z0-9-]); the catalog lives in
 # backend/internal/devfixtures and is listed by GET /v0/dev/fixtures.
 PREVIEW_USAGE="usage: scripts/dev preview <sha-or-ref> [--seed <scenario>]"
@@ -3200,8 +3202,13 @@ cmd_preview() {
   # FISHHAWKD_DEV_FIXTURES=1 registers the dev-only, loopback-only fixtures
   # surface (E72.2 / #3326) and, with no S3 bucket, an in-memory trace store —
   # the seeded target can then take POST /v0/runs/{id}/trace (#1874).
+  # FISHHAWKD_DEV_STUB_FORGE=1 mounts the in-process stub forge (E72.3 /
+  # #3327): both forge families served from in-memory state behind the
+  # loopback-only /v0/dev/forge* control routes, so a forge-driven criterion
+  # (a signed webhook delivery, a parent close) is drivable from the sandbox.
+  # Both are serve concerns — never on the migrate line.
   _preview_branch_env
-  "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "FISHHAWKD_ADDR=$paddr" "FISHHAWKD_DEV_FIXTURES=1" "$pbin" serve >> "$PREVIEW_LOG_FILE" 2>&1 &
+  "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "FISHHAWKD_ADDR=$paddr" "FISHHAWKD_DEV_FIXTURES=1" "FISHHAWKD_DEV_STUB_FORGE=1" "$pbin" serve >> "$PREVIEW_LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PREVIEW_PID_FILE"
@@ -3225,7 +3232,7 @@ cmd_preview() {
     fi
   fi
 
-  print "preview fishhawkd started (pid ${pid}, git_sha ${short_sha}) on ${paddr} — db ${preview_db}, logs: ${PREVIEW_LOG_FILE}"
+  print "preview fishhawkd started (pid ${pid}, git_sha ${short_sha}) on ${paddr} — db ${preview_db}, dev fixtures + stub forge on, logs: ${PREVIEW_LOG_FILE}"
 }
 
 # `scripts/dev preview-down` — TERM→KILL the tracked preview daemon, remove

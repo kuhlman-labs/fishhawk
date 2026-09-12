@@ -3369,6 +3369,12 @@ func buildAcceptance(t Trigger) string {
 	// expectation_basis, which Posture A below already enumerates.
 	writeAcceptanceSeededFixtures(&b)
 
+	// Stub forge (E72.3 / #3327). Same placement rationale as the seeded
+	// fixtures above: rendered BEFORE the output contract so its backtick tokens
+	// stay outside the closed-field-set region, and it adds NO verdict field —
+	// its 404 rule reuses only result=skipped / expectation_basis.
+	writeAcceptanceStubForge(&b)
+
 	// Output contract (transport — the signed evidence bundle — is E31.7's
 	// runner scope; the prompt states the shape the agent must produce).
 	b.WriteString("### Output contract\n\n")
@@ -3524,6 +3530,75 @@ func writeAcceptanceSeededFixtures(b *strings.Builder) {
 	b.WriteString("- A 404 on `GET /v0/dev/fixtures` means the target was NOT provisioned with " +
 		"the fixture surface. That is a provisioning fact, not evidence against the change: " +
 		"mark every criterion that depends on a seeded scenario `result`=`skipped` under " +
+		"Posture A with the reason in its `expectation_basis` — never `failed`, and never a " +
+		"top-level `verdict`=`failed` on that basis alone.\n\n")
+}
+
+// writeAcceptanceStubForge renders the "### Stub forge" section of the
+// acceptance prompt (E72.3 / #3327), immediately after "### Seeded fixtures":
+// the preview serves BOTH forge families (GitHub and GitLab) from an in-process
+// stub, and a loopback-only control surface on the same listener lets the
+// credential-free validator inspect forge state, seed issues and pull
+// requests, and enqueue a SIGNED webhook delivery that the preview's real
+// receivers consume synchronously. The stub lives in-process because the
+// sandbox reaches only the spec-declared egress host — a second port would be
+// unreachable by the agent this surface exists for.
+//
+// This is STATIC renderer text, not untrusted-intake rendering (no issue-body
+// or verify-output bytes flow through it), so the #2291 injection/envelope
+// corpora need no re-run; the offline containment gate still runs in verify.
+//
+// The one load-bearing rule mirrors the seeded-fixtures section: a 404 on
+// GET /v0/dev/forge is a PROVISIONING fact (the target was not started with
+// FISHHAWKD_DEV_STUB_FORGE=1), so every criterion that depends on the stub is
+// `skipped` under Posture A, never `failed`.
+func writeAcceptanceStubForge(b *strings.Builder) {
+	b.WriteString("### Stub forge\n\n")
+	b.WriteString("The preview serves BOTH forge families — GitHub and GitLab — from an " +
+		"in-process stub forge: the preview's own webhook receivers, watchers and forge " +
+		"adapters run unchanged against persistent in-memory forge state, and a dev-only, " +
+		"loopback-only control surface on the same listener lets you drive them without " +
+		"any forge credential. No real forge is reachable from the sandbox; do not try " +
+		"one.\n\n")
+	b.WriteString("- `GET /v0/dev/forge` returns a snapshot of the stub's state " +
+		"(`{\"github\":{\"issues\",\"pulls\"},\"gitlab\":{\"issues\",\"merge_requests\"}," +
+		"\"requests\"}`) — the issues, pull/merge requests and comments the preview has " +
+		"seeded or written, plus the arrival-ordered log of every forge API request the " +
+		"preview made. Read it to observe what the product DID to the forge.\n")
+	b.WriteString("- `POST /v0/dev/forge/issues` seeds an issue in one family: body " +
+		"`{\"forge\":\"github\"|\"gitlab\",\"repo\":\"<owner/name>\",\"project_id\":<int, gitlab " +
+		"only>,\"number\":<int>,\"state\",\"title\",\"comments\":[\"<text>\"]}`; answers 201 " +
+		"with the seeded issue. `GET /v0/dev/forge/issues?forge=&repo=&project_id=&number=` " +
+		"reads one back with its comments in arrival order (404 `stub_issue_not_found` when " +
+		"absent). `POST /v0/dev/forge/pulls` seeds a pull/merge request the same way " +
+		"(plus `merged`, `merge_commit_sha`, `merged_at`, `head_sha`).\n")
+	b.WriteString("- `POST /v0/dev/forge/deliveries` signs and dispatches a webhook delivery " +
+		"SYNCHRONOUSLY through the preview's real receiver: body " +
+		"`{\"forge\":\"github\"|\"gitlab\",\"event\":\"<event>\",\"delivery_id\":\"<optional>\"," +
+		"\"payload\":{...}}`. The preview computes the signature itself " +
+		"(`X-Hub-Signature-256` for GitHub, `X-Gitlab-Token` for GitLab) over the bytes " +
+		"it sends, so you never need the webhook secret, and it answers 200 " +
+		"`{\"delivery_id\",\"status\",\"body\"}` where `status` is the receiver's own HTTP " +
+		"status (202 = accepted). Because the receivers run their consumers before " +
+		"answering, every side effect of the delivery (a parent close, a comment, an " +
+		"audit row) has ALREADY happened when the 200 returns — read state immediately, " +
+		"no polling. A GitHub `issues` payload needs `installation.id`, " +
+		"`repository.full_name`, `action` and `issue.number`; a GitLab `Issue Hook` " +
+		"payload needs `project.id`, `project.path_with_namespace`, " +
+		"`object_attributes.iid` and `object_attributes.action`. The payload object is " +
+		"re-marshaled before signing, so key order may differ from your input; that is " +
+		"harmless.\n")
+	b.WriteString("- The `split-parent-linked` seeded scenario (via `POST /v0/dev/fixtures`) " +
+		"supplies the `split_children_filed` linkage rows that the parent-close watcher " +
+		"reads — parent `stub/parent-close#100`, contract child `#103`, one row per forge " +
+		"family. Seed it BEFORE the delivery a parent-close criterion depends on; without " +
+		"it the receiver has no linkage to act on and the delivery is a correct no-op.\n")
+	b.WriteString("- `DELETE /v0/dev/forge` resets the stub to empty (204). Reset between " +
+		"criteria that would otherwise see each other's issues, comments or request log, " +
+		"so an exactly-one assertion is measured against state you seeded.\n")
+	b.WriteString("- A 404 on `GET /v0/dev/forge` means the target was NOT provisioned with " +
+		"the stub forge. That is a provisioning fact, not evidence against the change: " +
+		"mark every criterion that depends on the stub forge `result`=`skipped` under " +
 		"Posture A with the reason in its `expectation_basis` — never `failed`, and never a " +
 		"top-level `verdict`=`failed` on that basis alone.\n\n")
 }
