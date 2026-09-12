@@ -12947,3 +12947,74 @@ func TestGetStagePrompt_NoConflictTriggerServesNothing(t *testing.T) {
 		t.Fatalf("ordinary dispatch served a pass: %+v", resp)
 	}
 }
+
+// TestPromptResponse_AcceptanceReplayFieldsServedOnlyOnAcceptanceStage (E72.4 /
+// #3328): an acceptance-stage prompt carries the run branch + PR 742 from the
+// seeded pull_request_opened ledger entry, the effective criteria with
+// drivable flags, and the FULL approved retire_scenario entries (reason
+// intact, pr filled from the ledger); the PR number is 0 and the entries are
+// absent when nothing is recorded; and none of the four fields is served on a
+// plan stage.
+func TestPromptResponse_AcceptanceReplayFieldsServedOnlyOnAcceptanceStage(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	au := s.cfg.AuditRepo.(*auditFake)
+	seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{
+		"head_sha": "prhead", "branch": "fishhawk/run-x/stage-y", "pr_number": 742})
+	au.seeded[len(au.seeded)-1].Timestamp = time.Now()
+	planStageID := s.cfg.RunRepo.(*promptRunRepo).stagesByRunID[runID][0].ID
+	seedHeadEntry(au, runID, &planStageID, "approval_submitted", 2, map[string]any{
+		"stage_id": planStageID.String(), "decision": "approve",
+		"retired_scenarios": []retiredScenarioEntry{{ID: "scenario:issue-101/crit-b", Reason: "behaviour replaced", RunID: runID.String(), PR: 0, RetiredAt: "2026-09-12T00:00:00Z"}},
+	})
+
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.AcceptanceRunBranch != "fishhawk/run-x/stage-y" || resp.AcceptancePullRequestNumber != 742 {
+		t.Errorf("run branch/PR = %q/%d, want fishhawk/run-x/stage-y/742", resp.AcceptanceRunBranch, resp.AcceptancePullRequestNumber)
+	}
+	if len(resp.AcceptanceCriteria) != 2 || resp.AcceptanceCriteria[0].ID != "ac-create" || !resp.AcceptanceCriteria[0].Drivable {
+		t.Errorf("AcceptanceCriteria = %+v, want the two plan criteria, drivable", resp.AcceptanceCriteria)
+	}
+	if len(resp.AcceptanceRetiredScenarios) != 1 {
+		t.Fatalf("AcceptanceRetiredScenarios = %+v, want one entry", resp.AcceptanceRetiredScenarios)
+	}
+	if e := resp.AcceptanceRetiredScenarios[0]; e.Reason != "behaviour replaced" || e.PR != 742 || e.ID != "scenario:issue-101/crit-b" {
+		t.Errorf("retired entry = %+v, want reason intact and pr filled from the ledger (742)", e)
+	}
+	for _, tag := range []string{`"acceptance_run_branch":"fishhawk/run-x/stage-y"`, `"acceptance_pull_request_number":742`, `"acceptance_retired_scenarios":[{"id":"scenario:issue-101/crit-b","reason":"behaviour replaced"`, `"drivable":true`} {
+		if !strings.Contains(w.Body.String(), tag) {
+			t.Errorf("response missing wire tag %s:\n%s", tag, w.Body.String())
+		}
+	}
+
+	t.Run("no ledger entries", func(t *testing.T) {
+		s2, runID2, acc2, priv2, _ := newAcceptancePromptServer(t)
+		w := promptRequest(t, s2, runID2, acc2, priv2, "")
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.AcceptancePullRequestNumber != 0 || resp.AcceptanceRunBranch != "" || len(resp.AcceptanceRetiredScenarios) != 0 {
+			t.Errorf("want pr 0 / empty branch / no retirements, got %d %q %+v", resp.AcceptancePullRequestNumber, resp.AcceptanceRunBranch, resp.AcceptanceRetiredScenarios)
+		}
+		for _, tag := range []string{`acceptance_pull_request_number`, `acceptance_run_branch`, `acceptance_retired_scenarios`} {
+			if strings.Contains(w.Body.String(), tag) {
+				t.Errorf("empty field %s must be omitted", tag)
+			}
+		}
+	})
+	t.Run("plan stage omits every field", func(t *testing.T) {
+		w := promptRequest(t, s, runID, planStageID, priv, "")
+		for _, tag := range []string{`acceptance_pull_request_number`, `acceptance_run_branch`, `acceptance_retired_scenarios`, `"acceptance_criteria":`} {
+			if strings.Contains(w.Body.String(), tag) {
+				t.Errorf("plan stage served %s", tag)
+			}
+		}
+	})
+}

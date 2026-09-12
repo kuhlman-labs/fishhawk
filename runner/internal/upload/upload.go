@@ -37,6 +37,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/reachability"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/scenario"
 )
 
 // Default backoff parameters for ShipTrace. Public so tests can
@@ -703,6 +704,25 @@ type FetchedPrompt struct {
 	// category-C rather than degrading it to an unverifiable warn, so the
 	// drift is loud but total.
 	AcceptanceExpectedHeadSHA string `json:"acceptance_expected_head_sha,omitempty"`
+	// Replayable scenario corpus inputs (E72.4 / #3328), served ONLY on
+	// acceptance stages. AcceptanceRunBranch is the run branch the acceptance
+	// runner pushes its scenario-corpus commit to (empty → persist_skipped,
+	// no_run_branch, and the retirement-drop report fires when retirements
+	// were served). AcceptancePullRequestNumber is the run's PR number (0 =
+	// unresolvable; recorded as the scenario's origin.pr, NEVER substituted
+	// with the issue number). AcceptanceCriteria is the effective criteria set
+	// scenario.Compose reads. AcceptanceRetiredScenarios is the FULL approved
+	// retirement entry list (reason intact) merged into retired.yaml.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+	// the backend's promptResponse (backend/internal/server/prompt.go); the
+	// element types pair with the backend's acceptanceCriterionEntry /
+	// retiredScenarioEntry in the wirecontract manifest. A tag drift silently
+	// drops a retirement or the origin PR.
+	AcceptanceRunBranch         string                     `json:"acceptance_run_branch,omitempty"`
+	AcceptancePullRequestNumber int                        `json:"acceptance_pull_request_number,omitempty"`
+	AcceptanceCriteria          []AcceptanceCriterionEntry `json:"acceptance_criteria,omitempty"`
+	AcceptanceRetiredScenarios  []scenario.RetiredEntry    `json:"acceptance_retired_scenarios,omitempty"`
 }
 
 // FixupApplyPatch is one entry in FetchedPrompt.FixupApplyPatches: a single
@@ -1850,6 +1870,15 @@ type ShipPullRequestArgs struct {
 	// and on every pre-push failure, where the body stays byte-identical to today.
 	PRTitle string
 	PRBody  string
+
+	// ScenarioIDs and RetiredScenarios carry the acceptance scenario-corpus
+	// report payloads (E72.4 / #3328): on OutcomeAcceptanceScenariosPushed the
+	// persisted scenario ids and the FULL served retirements merged into
+	// retired.yaml (Branch/HeadSHA/BaseSHA carry the commit); on
+	// OutcomeAcceptanceScenarioRetirementDropped the dropped entries, with
+	// Reason naming the exit path. Unused on every other outcome.
+	ScenarioIDs      []string
+	RetiredScenarios []scenario.RetiredEntry
 }
 
 // pullRequestFailureBody is the failure-report wire shape ShipPullRequest
@@ -1885,6 +1914,95 @@ type pullRequestFailureBody struct {
 	// failure body — and therefore every signature and content hash over it — is
 	// BYTE-IDENTICAL. Populated only alongside a real checkpoint.
 	HeldCommitPRText
+}
+
+// AcceptanceCriterionEntry is one effective acceptance criterion the backend
+// serves on an acceptance-stage prompt (E72.4 / #3328), the input to
+// scenario.Compose: the plan text plus whether the criterion is drivable.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+// backend's acceptanceCriterionEntry (backend/internal/server/prompt.go); the
+// wirecontract manifest pins the pair ModeExact.
+type AcceptanceCriterionEntry struct {
+	ID            string   `json:"id"`
+	Statement     string   `json:"statement"`
+	VerifyHint    string   `json:"verify_hint,omitempty"`
+	Preconditions []string `json:"preconditions,omitempty"`
+	Drivable      bool     `json:"drivable"`
+}
+
+// Acceptance-stage scenario-corpus report outcomes (E72.4 / #3328), the
+// Args.Outcome discriminators ShipPullRequest marshals for the acceptance
+// runner's post-verdict scenario commit and for a served retirement the
+// runner could not persist.
+const (
+	OutcomeAcceptanceScenariosPushed           = "acceptance_scenarios_pushed"
+	OutcomeAcceptanceScenarioRetirementDropped = "acceptance_scenario_retirement_dropped"
+)
+
+// pullRequestAcceptanceScenariosPushedBody is the wire shape for
+// Outcome=="acceptance_scenarios_pushed": the scenario-corpus commit's
+// coordinates plus the persisted scenario ids and the FULL served retirement
+// entries merged into retired.yaml. The backend decodes it from the same
+// pullRequestBody union as every other variant (retired element tags mirror
+// scenario.RetiredEntry).
+type pullRequestAcceptanceScenariosPushedBody struct {
+	Outcome     string                  `json:"outcome"`
+	Branch      string                  `json:"branch"`
+	HeadSHA     string                  `json:"head_sha"`
+	BaseSHA     string                  `json:"base_sha"`
+	ScenarioIDs []string                `json:"scenario_ids,omitempty"`
+	Retired     []scenario.RetiredEntry `json:"retired,omitempty"`
+}
+
+// pullRequestAcceptanceRetirementDroppedBody is the wire shape for
+// Outcome=="acceptance_scenario_retirement_dropped": the served retirement
+// entries that were NOT persisted and the exit path that dropped them. No head
+// fields — nothing was pushed.
+type pullRequestAcceptanceRetirementDroppedBody struct {
+	Outcome string                  `json:"outcome"`
+	Retired []scenario.RetiredEntry `json:"retired"`
+	Reason  string                  `json:"reason"`
+}
+
+// InjectReplay sets the top-level `replay` field on an ALREADY-VALIDATED
+// acceptance verdict body (E72.4 / #3328). The agent-facing verdict schema is
+// closed and does not admit `replay` (validateAcceptanceVerdict decodes with
+// DisallowUnknownFields, so an agent-authored `replay` is refused before this
+// runs); the runner injects the set it computed from the LOADED corpus files
+// AFTER validation and BEFORE redaction, so the backend's attribution source is
+// never agent prose. It refuses a body that already carries `replay` (a
+// double-injection or a validation bypass) and any body that is not a single
+// JSON object.
+func InjectReplay(body []byte, set scenario.ReplaySet) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&fields); err != nil {
+		return nil, fmt.Errorf("upload: inject replay: verdict body is not a JSON object: %w", err)
+	}
+	if dec.More() {
+		return nil, errors.New("upload: inject replay: verdict body must be a single JSON object")
+	}
+	if fields == nil {
+		return nil, errors.New("upload: inject replay: verdict body is null")
+	}
+	if _, present := fields["replay"]; present {
+		return nil, errors.New("upload: inject replay: verdict body already carries a replay field")
+	}
+	if set.Scenarios == nil {
+		set.Scenarios = []scenario.ReplayedScenario{}
+	}
+	raw, err := json.Marshal(set)
+	if err != nil {
+		return nil, fmt.Errorf("upload: inject replay: marshal replay set: %w", err)
+	}
+	fields["replay"] = raw
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("upload: inject replay: marshal verdict body: %w", err)
+	}
+	return out, nil
 }
 
 // pullRequestChildPushBody is the success-report wire shape ShipPullRequest
@@ -2057,6 +2175,37 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		})
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request push body: %w", err)
+		}
+		body = marshalled
+	case OutcomeAcceptanceScenariosPushed:
+		// Acceptance scenario-corpus push report (E72.4 / #3328): the commit
+		// coordinates plus the scenario ids and the served retirement entries.
+		marshalled, err := json.Marshal(pullRequestAcceptanceScenariosPushedBody{
+			Outcome:     args.Outcome,
+			Branch:      args.Branch,
+			HeadSHA:     args.HeadSHA,
+			BaseSHA:     args.BaseSHA,
+			ScenarioIDs: args.ScenarioIDs,
+			Retired:     args.RetiredScenarios,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("upload: marshal acceptance scenarios-pushed body: %w", err)
+		}
+		body = marshalled
+	case OutcomeAcceptanceScenarioRetirementDropped:
+		// Dropped-retirement report (E72.4 / #3328): the served entries that
+		// were not persisted and the exit path; no head fields.
+		retired := args.RetiredScenarios
+		if retired == nil {
+			retired = []scenario.RetiredEntry{}
+		}
+		marshalled, err := json.Marshal(pullRequestAcceptanceRetirementDroppedBody{
+			Outcome: args.Outcome,
+			Retired: retired,
+			Reason:  args.Reason,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("upload: marshal acceptance retirement-dropped body: %w", err)
 		}
 		body = marshalled
 	case "scope_park":

@@ -3554,3 +3554,126 @@ func TestFailPullRequestStage_OrdinaryFixupFailureUnaffected(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E72.4 / #3328: acceptance scenario-corpus reports.
+// ---------------------------------------------------------------------------
+
+func newAcceptanceScenarioPRServer(t *testing.T) (*Server, *signingFake, *auditFake, *promptRunRepo, *pageClassRecorder, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, rr := newPRServer(t, runID, stageID)
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeAcceptance, State: run.StageStateSucceeded}
+	rec := &pageClassRecorder{}
+	s.issueNotifier = rec
+	return s, sf, au, rr, rec, runID, stageID
+}
+
+var scenarioPushedBody = []byte(`{"outcome":"acceptance_scenarios_pushed","branch":"fishhawk/run-x/stage-y","head_sha":"3333333333333333333333333333333333333333","base_sha":"1111111111111111111111111111111111111111","scenario_ids":["scenario:issue-101/crit-a"],"retired":[{"id":"scenario:issue-101/crit-b","reason":"behaviour replaced","run_id":"r1","pr":742,"retired_at":"2026-09-12T00:00:00Z"}]}`)
+
+func TestShipPullRequest_AcceptanceScenariosPushed(t *testing.T) {
+	s, sf, au, rr, rec, runID, stageID := newAcceptanceScenarioPRServer(t)
+	priv, _ := sf.issue(t, runID)
+	w := shipPRRequest(t, s, runID, stageID, priv, scenarioPushedBody, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := countByCategory(au, CategoryAcceptanceScenariosPushed); n != 1 {
+		t.Fatalf("acceptance_scenarios_pushed entries = %d, want 1", n)
+	}
+	entry := findAppendedByCategory(t, au, CategoryAcceptanceScenariosPushed)
+	p := string(entry.Payload)
+	for _, want := range []string{`"head_sha":"3333333333333333333333333333333333333333"`, `"scenario_count":1`, `"reason":"behaviour replaced"`, `"pr":742`, `"scenario_ids":["scenario:issue-101/crit-a"]`} {
+		if !strings.Contains(p, want) {
+			t.Errorf("payload missing %s: %s", want, p)
+		}
+	}
+	if len(rr.transitionStageCalls) != 0 {
+		t.Errorf("stage transitions = %v, want none", rr.transitionStageCalls)
+	}
+	if n := countByCategory(au, CategoryAcceptanceReopened); n != 0 {
+		t.Errorf("acceptance_reopened entries = %d, want 0 (no reopen on a scenario push)", n)
+	}
+	if len(rec.status) != 1 {
+		t.Errorf("status comment refreshes = %d, want 1", len(rec.status))
+	}
+	// Idempotent on (stage_id, head_sha).
+	w = shipPRRequest(t, s, runID, stageID, priv, scenarioPushedBody, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("replay status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if n := countByCategory(au, CategoryAcceptanceScenariosPushed); n != 1 {
+		t.Errorf("acceptance_scenarios_pushed entries after replay = %d, want 1", n)
+	}
+}
+
+func TestShipPullRequest_AcceptanceScenariosPushed_Refusals(t *testing.T) {
+	t.Run("non-acceptance stage", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		s, sf, _, au, _ := newPRServer(t, runID, stageID) // implement-typed stage
+		priv, _ := sf.issue(t, runID)
+		w := shipPRRequest(t, s, runID, stageID, priv, scenarioPushedBody, "")
+		if w.Code != http.StatusBadRequest || !bodyHasCode(w, "validation_failed") {
+			t.Fatalf("status = %d, want 400 validation_failed:\n%s", w.Code, w.Body.String())
+		}
+		if n := countByCategory(au, CategoryAcceptanceScenariosPushed); n != 0 {
+			t.Errorf("entries = %d, want 0", n)
+		}
+	})
+	for _, tc := range []struct{ name, body string }{
+		{"missing branch", `{"outcome":"acceptance_scenarios_pushed","head_sha":"a","base_sha":"b"}`},
+		{"missing head_sha", `{"outcome":"acceptance_scenarios_pushed","branch":"x","base_sha":"b"}`},
+		{"missing base_sha", `{"outcome":"acceptance_scenarios_pushed","branch":"x","head_sha":"a"}`},
+		{"dropped without retired", `{"outcome":"acceptance_scenario_retirement_dropped","reason":"persist_failed"}`},
+		{"dropped without reason", `{"outcome":"acceptance_scenario_retirement_dropped","retired":[{"id":"scenario:x","reason":"r","run_id":"r","pr":0,"retired_at":"t"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, sf, _, _, _, runID, stageID := newAcceptanceScenarioPRServer(t)
+			priv, _ := sf.issue(t, runID)
+			w := shipPRRequest(t, s, runID, stageID, priv, []byte(tc.body), "")
+			if w.Code != http.StatusBadRequest || !bodyHasCode(w, "pull_request_invalid") {
+				t.Fatalf("status = %d, want 400 pull_request_invalid:\n%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+var retirementDroppedBody = []byte(`{"outcome":"acceptance_scenario_retirement_dropped","reason":"persist_failed","retired":[{"id":"scenario:issue-101/crit-b","reason":"behaviour replaced","run_id":"r1","pr":742,"retired_at":"2026-09-12T00:00:00Z"}]}`)
+
+func TestShipPullRequest_AcceptanceScenarioRetirementDropped(t *testing.T) {
+	s, sf, au, rr, rec, runID, stageID := newAcceptanceScenarioPRServer(t)
+	priv, _ := sf.issue(t, runID)
+	w := shipPRRequest(t, s, runID, stageID, priv, retirementDroppedBody, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	entry := findAppendedByCategory(t, au, CategoryAcceptanceScenarioRetirementDropped)
+	p := string(entry.Payload)
+	for _, want := range []string{`"reason":"persist_failed"`, `"id":"scenario:issue-101/crit-b"`, `"reason":"behaviour replaced"`, `"scenario_ids":["scenario:issue-101/crit-b"]`} {
+		if !strings.Contains(p, want) {
+			t.Errorf("payload missing %s: %s", want, p)
+		}
+	}
+	if len(rr.transitionStageCalls) != 0 {
+		t.Errorf("stage transitions = %v, want none", rr.transitionStageCalls)
+	}
+	if len(rec.status) != 1 {
+		t.Errorf("status comment refreshes = %d, want 1 (the operator-visible surface)", len(rec.status))
+	}
+	// Idempotent per (stage_id, reason).
+	w = shipPRRequest(t, s, runID, stageID, priv, retirementDroppedBody, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("replay status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if n := countByCategory(au, CategoryAcceptanceScenarioRetirementDropped); n != 1 {
+		t.Errorf("entries after replay = %d, want 1", n)
+	}
+	// A different exit path on the same stage is a distinct record.
+	other := []byte(strings.Replace(string(retirementDroppedBody), "persist_failed", "no_run_branch", 1))
+	if w = shipPRRequest(t, s, runID, stageID, priv, other, ""); w.Code != http.StatusOK {
+		t.Fatalf("second-reason status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if n := countByCategory(au, CategoryAcceptanceScenarioRetirementDropped); n != 2 {
+		t.Errorf("entries after a second reason = %d, want 2", n)
+	}
+}

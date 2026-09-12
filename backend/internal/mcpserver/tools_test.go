@@ -14643,3 +14643,26 @@ func TestApprovePlan_NoClaimsAllOpenPlanConcerns_OmitsFieldOnTheWire(t *testing.
 		t.Errorf("claims_all_open_plan_concerns = true when none declared, want false")
 	}
 }
+
+// TestApprovePlan_RetireScenarioAdvertised (E72.4 / #3328): the
+// amend_acceptance_criteria input's schema text names the retire_scenario
+// action, the scenario id shape, and the unpersistable refusal code, so an
+// operator discovers the channel from the tool listing rather than the docs.
+func TestApprovePlan_RetireScenarioAdvertised(t *testing.T) {
+	var in ApprovePlanInput
+	tag := reflect.TypeOf(in)
+	f, ok := tag.FieldByName("AmendAcceptanceCriteria")
+	if !ok {
+		t.Fatal("ApprovePlanInput has no AmendAcceptanceCriteria field")
+	}
+	desc := f.Tag.Get("jsonschema")
+	for _, want := range []string{"retire_scenario", "scenario:issue-<N>/<criterion-id>", "acceptance_scenario_retirement_unpersistable", "retired.yaml"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("amend_acceptance_criteria description missing %q", want)
+		}
+	}
+	af, _ := reflect.TypeOf(AcceptanceCriteriaAmendment{}).FieldByName("Action")
+	if !strings.Contains(af.Tag.Get("jsonschema"), "retire_scenario") {
+		t.Errorf("AcceptanceCriteriaAmendment.Action description does not name retire_scenario")
+	}
+}

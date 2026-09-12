@@ -2279,6 +2279,13 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	// channel marshals byte-identically to today.
 	if app.Decision == approval.DecisionApprove && len(amendAcceptanceCriteria) > 0 {
 		auditPayload["amend_acceptance_criteria"] = amendAcceptanceCriteria
+		// Scenario retirements (E72.4 / #3328): the FULL entry {id, reason,
+		// run_id, pr, retired_at} rides the same row so the reason is carried
+		// intact to the served prompt field and the retirement ledger. Omitted
+		// when the approve retired no scenario.
+		if retired := retiredScenarioEntriesFor(stage.RunID, amendAcceptanceCriteria, time.Now()); len(retired) > 0 {
+			auditPayload["retired_scenarios"] = retired
+		}
 	}
 	if app.Decision == approval.DecisionApprove && len(claimsConcernIDs) > 0 {
 		auditPayload["claims_concern_ids"] = claimsConcernIDs

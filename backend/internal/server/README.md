@@ -705,6 +705,68 @@ the example's schema-validity to the suite. Per-slice unit coverage:
 `acceptance_stats_test.go`. Runner-side schema↔validator lockstep:
 `TestAcceptanceVerdictSchema_LockstepWithValidator`.
 
+## Replayable scenario corpus — backend half (E72.4 / #3328)
+
+The acceptance runner persists each passing drivable criterion as a scenario
+YAML under `acceptance/scenarios/` and replays prior scenarios against every
+new preview head (`runner/internal/scenario`). The backend half is four seams:
+
+- **Prompt fields** (`prompt.go::fillAcceptanceReplayFields`, acceptance
+  stages only, all omitempty): `acceptance_run_branch` +
+  `acceptance_pull_request_number` from the reported-head ledger
+  (`resolveAcceptanceRunBranchAndPR` — the newest `lineageLedgerCategories`
+  entry's `branch`, the newest `pull_request_opened` entry's `pr_number`; 0 =
+  unresolvable, NEVER the issue number), `acceptance_criteria` (the EFFECTIVE
+  set through `resolveEffectiveAcceptanceCriteria`, fail-open to the plan set)
+  and `acceptance_retired_scenarios` (FULL `retiredScenarioEntry` rows with
+  `pr` filled from the ledger). The element types are wirecontract-pinned
+  ModeExact against `runner/internal/scenario.RetiredEntry` and
+  `upload.AcceptanceCriterionEntry`.
+- **Retirement request channel** (`acceptance_amendments.go`,
+  `checkRetireScenarioAmendments`): `amend_acceptance_criteria` action
+  `retire_scenario` (scenario: prefix required, reason required, no
+  statement, duplicate / already-retired refused 400, never counted toward
+  `acceptance_criteria_all_retired`, permitted with zero criteria). The FULL
+  entry is recorded on `approval_submitted` as `retired_scenarios`
+  (`retiredScenarioEntriesFor`, `pr` 0 at approval). **Unpersistable
+  refusal**: `acceptanceRunnerNeverSpawns` refuses 400
+  `acceptance_scenario_retirement_unpersistable` when the plan's shape
+  (`DeclaresNoAcceptanceSurface` / `AcceptanceSkippableOutOfScope` /
+  `AcceptanceSkippableEmptyCriteria` / `AcceptanceSkippableAllSkipWithBasis`)
+  settles acceptance server-side with no runner spawn — the SAME predicate set
+  `orchestrator.tryShortCircuitAcceptanceCore` and
+  `omitAcceptanceStageForSurfaceNone` branch on;
+  `TestAcceptanceRetirementRefusal_PredicateSetEqualsShortCircuitSet` scans all
+  three call sites with `go/ast` and fails on divergence, so a later
+  short-circuit predicate cannot silently reopen the drop window.
+- **Verdict ingest** (`acceptance.go`): `acceptanceBody.Replay` is the
+  runner-injected `replay` object (twin of `scenario.ReplaySet`, ModeExact).
+  `validate()` PARTITIONS `scenario:`-prefixed rows out of
+  `normalizedCriteria` into `scenarioRows`, so every criterion consumer (tally,
+  #2581 downgrade, #2512 precedence ladder, triage, concern synthesis) reads
+  criterion rows only; `acceptance_outcome_recorded.replay` copies the cap
+  header VERBATIM (`acceptanceReplayPayload`; absent → `replay: null`) plus
+  scenario tallies and `served_mismatch`; each FAILED scenario row appends
+  `acceptance_scenario_regression` attributed ONLY from `replay.scenarios`
+  (`recordAcceptanceScenarioRegressions`: no entry or `origin_pr` 0 →
+  `origin_pr` absent + `origin_unresolved: true`); `classifyAcceptanceFailure`
+  routes a failed scenario row class 1 and never lets a skipped/undecidable
+  scenario row reach the class-2/5 skip partition or clamp the run.
+- **Reports** (`pullrequest.go`): `acceptance_scenarios_pushed` (acceptance
+  stage only; ONE audit entry idempotent on `stage_id`+`head_sha`; status
+  comment; NO transition, NO acceptance reopen — the verdict stays bound to
+  the dispatch-anchored pre-scenario head while the commit attributes as run
+  lineage via `auditcomplete.HeadReportCategoriesByPrecedence` (first) and
+  `lineageLedgerCategories`) and `acceptance_scenario_retirement_dropped`
+  (audit entry idempotent per `stage_id`+`reason` + status comment).
+
+Residual, stated: an operator-invoked `fishhawk_retry_stage` on the settled
+acceptance stage AFTER a scenario push sees recorded-head ≠ current-head
+(`retry.go` Option C) and is admitted as a stale-head reopen — deliberate
+operator action, not an automatic reopen. A run cancelled before its
+acceptance stage spawns drops an approved retirement silently (out of scope;
+tracked separately by the operator).
+
 ## Pre-spawn acceptance-dispatch admission (E31.23 / #1928)
 
 `acceptance_admission.go::handleAcceptanceAdmission` —

@@ -1706,3 +1706,60 @@ func TestVerifyBranchLineage_IntegrationCommitRecordedReadErrorFailsOpen(t *test
 		t.Error("fail-open path must not fail the stage")
 	}
 }
+
+// TestLineage_FixupExpectedHeadAfterScenarioPush (E72.4 / #3328): the
+// acceptance runner's scenario-corpus commit is run lineage — lineageLedgerCategories
+// admits acceptance_scenarios_pushed, so the reported-head resolvers see the
+// scenario head as the run's newest tip.
+func TestLineage_FixupExpectedHeadAfterScenarioPush(t *testing.T) {
+	found := false
+	for _, c := range lineageLedgerCategories {
+		if c == "acceptance_scenarios_pushed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("lineageLedgerCategories = %v, want acceptance_scenarios_pushed", lineageLedgerCategories)
+	}
+	runID, stageID := uuid.New(), uuid.New()
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr})
+	ts := time.Now()
+	seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{"head_sha": "prhead", "branch": "fishhawk/run-x/stage-y", "pr_number": 742})
+	au.seeded[len(au.seeded)-1].Timestamp = ts
+	seedHeadEntry(au, runID, &stageID, "acceptance_scenarios_pushed", 2, map[string]any{"head_sha": "scenariohead", "branch": "fishhawk/run-x/stage-y"})
+	au.seeded[len(au.seeded)-1].Timestamp = ts.Add(time.Second)
+	if got := s.resolveNewestReportedHeadSHA(context.Background(), runID, stageID, "fixup_expected_head_sha"); got != "scenariohead" {
+		t.Errorf("newest reported head = %q, want scenariohead", got)
+	}
+}
+
+// TestVerifyBranchLineage_AdmitsScenarioCommitParent (E72.4 / #3328): a fix-up
+// pushed on top of the scenario-corpus commit is clean lineage — the scenario
+// head is a ledger member, so it is not a foreign commit.
+func TestVerifyBranchLineage_AdmitsScenarioCommitParent(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const h1 = "1111111111111111111111111111111111111111" // PR-open head
+	const hs = "3333333333333333333333333333333333333333" // scenario-corpus commit
+	const h2 = "2222222222222222222222222222222222222222" // fix-up head
+	stub := &lineageGitHub{baseRef: "main", commitsByBase: map[string][]string{"main": {h1, hs, h2}}}
+	gh := newLineageGitHubClient(t, stub)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99), PullRequestURL: &prURL}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement, State: run.StageStateRunning, RequiresApproval: true}
+	s, sf, au, _ := newLineageServer(t, gh, runRow, stage)
+	au.seeded = append(au.seeded,
+		&audit.Entry{RunID: &runID, Category: "pull_request_opened", Payload: json.RawMessage(fmt.Sprintf(`{"head_sha":%q}`, h1))},
+		&audit.Entry{RunID: &runID, Category: "acceptance_scenarios_pushed", Payload: json.RawMessage(fmt.Sprintf(`{"head_sha":%q}`, hs))},
+	)
+	priv, _ := sf.issue(t, runID)
+	w := shipPRRequest(t, s, runID, stageID, priv, mustFixupBody(t, h2), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+	if v := foreignViolation(au); v != nil {
+		t.Fatalf("scenario-corpus commit flagged as foreign: %+v", v)
+	}
+}
