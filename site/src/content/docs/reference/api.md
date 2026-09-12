@@ -15,6 +15,16 @@ the human companion is
 `GET /healthz` needs no credential and reports the build's commit and its
 embedded schema hashes. Everything else requires a bearer token.
 
+Two runner-facing report bodies share one endpoint each and are discriminated
+by an `outcome` field the table below does not spell out: the pull-request
+report (`POST /v0/runs/{run_id}/pull-request`) accepts the implement stage's
+success, failure, child-push, fix-up, park and conflict-resolution shapes plus
+the acceptance runner's scenario-corpus reports (`acceptance_scenarios_pushed`,
+`acceptance_scenario_retirement_dropped`), and the acceptance verdict (`POST
+/v0/runs/{run_id}/acceptance`) may carry a runner-injected `replay` object
+alongside the agent's rows. The shape of each is in the companion
+[`docs/api/v0.md`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.md).
+
 ## Generated operation reference
 
 <!-- BEGIN GENERATED api -->

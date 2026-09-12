@@ -222,7 +222,30 @@ type pullRequestBody struct {
 	// tags (path/reason) on scopeExemption match the runner's
 	// scopeExemptionEvidence marshal — the cross-boundary seam.
 	SupplementalScopeExemptions []scopeExemption `json:"supplemental_scope_exemptions,omitempty"`
+
+	// ScenarioIDs and RetiredScenarios form the acceptance-stage scenario-corpus
+	// report variants (E72.4 / #3328). Outcome=="acceptance_scenarios_pushed":
+	// the acceptance runner committed + pushed its scenario-corpus commit
+	// (new scenarios and/or the merged retirement ledger) to the run branch —
+	// branch/head_sha/base_sha carry the commit, ScenarioIDs the persisted
+	// scenario ids, RetiredScenarios the FULL served retirement entries merged
+	// into retired.yaml. Outcome=="acceptance_scenario_retirement_dropped": the
+	// runner exited after the prompt fetch on a path that pushed no ledger
+	// commit while served retirements existed — RetiredScenarios carries the
+	// dropped entries and Reason names the exit path; no head fields. Both are
+	// accepted ONLY on an acceptance stage, transition nothing, and never
+	// re-open the settled verdict. Declared here (with omitempty) so the
+	// DisallowUnknownFields decoder accepts them; absent on every other variant.
+	// The retired element tags mirror runner/internal/scenario.RetiredEntry.
+	ScenarioIDs      []string               `json:"scenario_ids,omitempty"`
+	RetiredScenarios []retiredScenarioEntry `json:"retired,omitempty"`
 }
+
+// Acceptance-stage scenario-corpus report outcomes (E72.4 / #3328).
+const (
+	outcomeAcceptanceScenariosPushed           = "acceptance_scenarios_pushed"
+	outcomeAcceptanceScenarioRetirementDropped = "acceptance_scenario_retirement_dropped"
+)
 
 // validate returns a human-readable error if any required field is
 // missing. PR upload is irreversible (real PR exists on GitHub by
@@ -329,8 +352,33 @@ func (p *pullRequestBody) validate() error {
 		}
 		return nil
 	}
+	// Scenario-corpus push report (E72.4 / #3328): require the commit
+	// coordinates so the audit entry (a reported-head ledger row) pins what
+	// landed.
+	if p.Outcome == outcomeAcceptanceScenariosPushed {
+		switch {
+		case p.Branch == "":
+			return errors.New("branch is required for an acceptance_scenarios_pushed outcome")
+		case p.HeadSHA == "":
+			return errors.New("head_sha is required for an acceptance_scenarios_pushed outcome")
+		case p.BaseSHA == "":
+			return errors.New("base_sha is required for an acceptance_scenarios_pushed outcome")
+		}
+		return nil
+	}
+	// Dropped-retirement report (E72.4 / #3328): no head fields; require the
+	// dropped entries and the exit-path reason so the audit row is actionable.
+	if p.Outcome == outcomeAcceptanceScenarioRetirementDropped {
+		switch {
+		case len(p.RetiredScenarios) == 0:
+			return errors.New("retired is required (non-empty) for an acceptance_scenario_retirement_dropped outcome")
+		case p.Reason == "":
+			return errors.New("reason is required for an acceptance_scenario_retirement_dropped outcome")
+		}
+		return nil
+	}
 	if p.Outcome != "" {
-		return fmt.Errorf("outcome must be \"failed\", \"pushed\", \"fixup_pushed\", \"fixup_no_changes\", \"scope_park\", or \"conflict_resolution_pushed\" when set, got %q", p.Outcome)
+		return fmt.Errorf("outcome must be \"failed\", \"pushed\", \"fixup_pushed\", \"fixup_no_changes\", \"scope_park\", \"conflict_resolution_pushed\", \"acceptance_scenarios_pushed\", or \"acceptance_scenario_retirement_dropped\" when set, got %q", p.Outcome)
 	}
 	switch {
 	case p.PRNumber <= 0:
@@ -542,6 +590,25 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// branch.
 	if pr.Outcome == "conflict_resolution_pushed" {
 		s.succeedConflictResolutionPushStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
+		return
+	}
+
+	// Acceptance scenario-corpus reports (E72.4 / #3328): the run-authored
+	// scenario commit (a reported-head ledger row, no transition, no acceptance
+	// reopen) and the dropped-retirement marker (audit + status comment only).
+	// Both are refused off an acceptance stage.
+	if pr.Outcome == outcomeAcceptanceScenariosPushed || pr.Outcome == outcomeAcceptanceScenarioRetirementDropped {
+		if stage.Type != run.StageTypeAcceptance {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				pr.Outcome+" is accepted only on an acceptance stage",
+				map[string]any{"stage_id": stageID.String(), "stage_type": string(stage.Type), "outcome": pr.Outcome})
+			return
+		}
+		if pr.Outcome == outcomeAcceptanceScenariosPushed {
+			s.recordAcceptanceScenariosPushed(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
+		} else {
+			s.recordAcceptanceScenarioRetirementDropped(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
+		}
 		return
 	}
 
@@ -1820,4 +1887,153 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 		Branch:  pr.Branch,
 		HeadSHA: pr.HeadSHA,
 	})
+}
+
+// pullRequestAcceptanceScenarioResponse is the 200 body for both acceptance
+// scenario-corpus report variants (E72.4 / #3328). HeadSHA is empty on the
+// dropped-retirement variant, which carries no head.
+type pullRequestAcceptanceScenarioResponse struct {
+	StageID uuid.UUID `json:"stage_id"`
+	Outcome string    `json:"outcome"`
+	Branch  string    `json:"branch,omitempty"`
+	HeadSHA string    `json:"head_sha,omitempty"`
+}
+
+// recordAcceptanceScenariosPushed handles Outcome=="acceptance_scenarios_pushed"
+// (E72.4 / #3328): the acceptance runner pushed its scenario-corpus commit to
+// the run branch AFTER the verdict was recorded. It appends ONE
+// acceptance_scenarios_pushed chained entry {branch, head_sha, base_sha,
+// scenario_ids, scenario_count, retired: [full entries with reason]},
+// idempotent on (stage_id, head_sha), refreshes the status comment, and
+// responds 200. It performs NO stage transition and NO acceptance reopen: the
+// verdict stays bound to the pre-scenario head (acceptanceValidatedHeadSHA is
+// dispatch-anchored) while the commit attributes as run lineage through
+// auditcomplete.HeadReportCategoriesByPrecedence + lineageLedgerCategories.
+func (s *Server) recordAcceptanceScenariosPushed(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
+	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
+	stageID := stage.ID
+	respond := func() {
+		s.writeJSON(w, r, http.StatusOK, pullRequestAcceptanceScenarioResponse{
+			StageID: stageID, Outcome: outcomeAcceptanceScenariosPushed, Branch: pr.Branch, HeadSHA: pr.HeadSHA,
+		})
+	}
+	// Dedup on (stage_id, head_sha), fail-open on a read error like the sibling
+	// push reports.
+	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryAcceptanceScenariosPushed); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"acceptance scenario push report: list audit entries failed; proceeding without idempotency guard",
+			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()), slog.String("error", err.Error()))
+	} else if childPushAlreadyRecorded(entries, stageID, pr.HeadSHA) {
+		respond()
+		return
+	}
+	scenarioIDs := pr.ScenarioIDs
+	if scenarioIDs == nil {
+		scenarioIDs = []string{}
+	}
+	retired := pr.RetiredScenarios
+	if retired == nil {
+		retired = []retiredScenarioEntry{}
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":         runID.String(),
+		"stage_id":       stageID.String(),
+		"branch":         pr.Branch,
+		"head_sha":       pr.HeadSHA,
+		"base_sha":       pr.BaseSHA,
+		"scenario_ids":   scenarioIDs,
+		"scenario_count": len(scenarioIDs),
+		"retired":        retired,
+		"auth_method":    authMethod,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryAcceptanceScenariosPushed,
+		ActorKind:    &actorKind,
+		ActorSubject: actorSubject,
+		Payload:      payload,
+	}); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"append audit entry failed", map[string]any{"error": err.Error()})
+		return
+	}
+	s.notifyStatusUpdate(r.Context(), runID, outcomeAcceptanceScenariosPushed)
+	respond()
+}
+
+// recordAcceptanceScenarioRetirementDropped handles
+// Outcome=="acceptance_scenario_retirement_dropped" (E72.4 / #3328): the
+// acceptance runner fetched served retirements and then exited on a path that
+// pushed no ledger commit (persist_failed, persist_refused, no_run_branch, a
+// pre-spawn guard, a verdict validation failure). It appends ONE
+// acceptance_scenario_retirement_dropped chained entry {retired: [full
+// entries], reason}, idempotent per (stage_id, reason), refreshes the status
+// comment so the operator sees each dropped id and reason on the run's
+// anchor, and responds 200 with no transition.
+func (s *Server) recordAcceptanceScenarioRetirementDropped(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
+	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
+	stageID := stage.ID
+	respond := func() {
+		s.writeJSON(w, r, http.StatusOK, pullRequestAcceptanceScenarioResponse{
+			StageID: stageID, Outcome: outcomeAcceptanceScenarioRetirementDropped,
+		})
+	}
+	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryAcceptanceScenarioRetirementDropped); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"acceptance retirement-drop report: list audit entries failed; proceeding without idempotency guard",
+			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()), slog.String("error", err.Error()))
+	} else if retirementDropAlreadyRecorded(entries, stageID, pr.Reason) {
+		respond()
+		return
+	}
+	ids := make([]string, 0, len(pr.RetiredScenarios))
+	for _, e := range pr.RetiredScenarios {
+		ids = append(ids, e.ID)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":       runID.String(),
+		"stage_id":     stageID.String(),
+		"retired":      pr.RetiredScenarios,
+		"scenario_ids": ids,
+		"reason":       pr.Reason,
+		"auth_method":  authMethod,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryAcceptanceScenarioRetirementDropped,
+		ActorKind:    &actorKind,
+		ActorSubject: actorSubject,
+		Payload:      payload,
+	}); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"append audit entry failed", map[string]any{"error": err.Error()})
+		return
+	}
+	s.notifyStatusUpdate(r.Context(), runID, outcomeAcceptanceScenarioRetirementDropped)
+	respond()
+}
+
+// retirementDropAlreadyRecorded reports whether an
+// acceptance_scenario_retirement_dropped entry for stageID with the same
+// reason is already on the chain — the idempotency key for the drop report.
+func retirementDropAlreadyRecorded(entries []*audit.Entry, stageID uuid.UUID, reason string) bool {
+	for _, e := range entries {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Reason == reason {
+			return true
+		}
+	}
+	return false
 }

@@ -67,6 +67,28 @@ const (
 	// artifact + its settled verdict. Written by handleShipAcceptance on every
 	// successful artifact persist.
 	CategoryAcceptanceOutcomeRecorded = "acceptance_outcome_recorded"
+	// CategoryAcceptanceScenarioRegression records ONE failed replayed-scenario
+	// row (E72.4 / #3328): a prior run's persisted scenario the acceptance agent
+	// replayed against this head and observed to FAIL. Written by
+	// handleShipAcceptance on the fresh-create path, one entry per failed
+	// `scenario:`-prefixed row, with origin attribution taken ONLY from the
+	// runner-injected body.replay.scenarios entry — never from agent prose and
+	// never from the trigger issue.
+	CategoryAcceptanceScenarioRegression = "acceptance_scenario_regression"
+	// CategoryAcceptanceScenariosPushed records the acceptance runner's
+	// post-verdict scenario-corpus commit (E72.4 / #3328): the run-authored
+	// commit that persisted new scenarios and/or merged served retirements into
+	// acceptance/scenarios/retired.yaml on the run branch. It is a reported-head
+	// ledger category (auditcomplete.HeadReportCategoriesByPrecedence and
+	// lineageLedgerCategories both admit it) so the scenario commit attributes
+	// as run lineage without re-opening the settled acceptance verdict.
+	CategoryAcceptanceScenariosPushed = "acceptance_scenarios_pushed"
+	// CategoryAcceptanceScenarioRetirementDropped records that an APPROVED
+	// scenario retirement served to the acceptance runner was NOT persisted to
+	// the ledger (E72.4 / #3328): the runner exited after the prompt fetch on a
+	// path that pushed no scenario commit. Audit-only plus a status-comment
+	// refresh; it transitions nothing.
+	CategoryAcceptanceScenarioRetirementDropped = "acceptance_scenario_retirement_dropped"
 	// CategoryAcceptanceTriageDecided records the deterministic triage of a
 	// failed acceptance verdict (E31.8 / #1536, ADR-049 decision #2). One
 	// chained entry per triage, written AFTER acting so the disposition records
@@ -266,6 +288,21 @@ type acceptanceBody struct {
 	// in the artifact and covered by the existing whole-verdict redaction on
 	// the runner side. The wire twin of acceptanceVerdict.Notes.
 	Notes string `json:"notes,omitempty"`
+	// Replay is the RUNNER-INJECTED replay evidence (E72.4 / #3328): the cap
+	// header computed once at the sampling site plus one attribution entry per
+	// served scenario, built from the loaded corpus files. The runner injects
+	// it AFTER validating the agent's verdict against the closed agent-facing
+	// schema (upload.InjectReplay), so an agent-authored `replay` never reaches
+	// this decoder. Optional: absent on every pre-corpus runner and on a
+	// replay-disabled stage, where the recorded outcome carries replay:null.
+	Replay *acceptanceReplay `json:"replay,omitempty"`
+
+	// scenarioRows is the `scenario:`-prefixed partition of the verdict rows
+	// (E72.4 / #3328), split out of normalizedCriteria by validate() so every
+	// criterion-keyed consumer (tally, downgrade, precedence ladder, triage,
+	// concern synthesis) reads criterion rows ONLY and a replayed scenario can
+	// never be mistaken for a plan criterion. Unexported, never marshalled.
+	scenarioRows []acceptanceCriterionResult
 
 	// normalizedEvidenceHashes is the coerced/validated flat slice, populated
 	// by validate() from EvidenceHashes. Unexported (no json tag) so it never
@@ -280,6 +317,68 @@ type acceptanceBody struct {
 	// (tally, triage classifier, plan-review-miss + concern synthesis) reads it
 	// instead of the raw Criteria field.
 	normalizedCriteria []acceptanceCriterionResult
+}
+
+// acceptanceReplay is the backend twin of the runner's scenario.ReplaySet
+// (E72.4 / #3328): the top-level `replay` object the acceptance runner injects
+// into the validated verdict body. cap / corpus_size / served / sampled_out /
+// retired_excluded / seed are computed ONCE by scenario.Sample at the sampling
+// site and copied VERBATIM onto acceptance_outcome_recorded.replay — the
+// backend never reconstructs them.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+// runner/internal/scenario.ReplaySet (runner/internal/scenario/scenario.go);
+// the wirecontract manifest pins the pair ModeExact. A tag drift silently
+// drops the cap evidence from the recorded outcome.
+type acceptanceReplay struct {
+	Cap             int                          `json:"cap"`
+	CorpusSize      int                          `json:"corpus_size"`
+	Served          int                          `json:"served"`
+	SampledOut      int                          `json:"sampled_out"`
+	RetiredExcluded int                          `json:"retired_excluded"`
+	Seed            string                       `json:"seed"`
+	Scenarios       []acceptanceReplayedScenario `json:"scenarios"`
+}
+
+// acceptanceReplayedScenario is the backend twin of the runner's
+// scenario.ReplayedScenario: the per-served-scenario attribution built from
+// the LOADED corpus file. It is the ONLY source of origin_* on an
+// acceptance_scenario_regression entry; origin_pr 0 means the originating PR
+// was unknown at record time and is recorded as origin_unresolved rather than
+// substituted with the issue number.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+// runner/internal/scenario.ReplayedScenario; the wirecontract manifest pins
+// the pair ModeExact.
+type acceptanceReplayedScenario struct {
+	ScenarioID  string `json:"scenario_id"`
+	OriginPR    int    `json:"origin_pr,omitempty"`
+	OriginIssue int    `json:"origin_issue"`
+	OriginRunID string `json:"origin_run_id"`
+	Path        string `json:"path"`
+}
+
+// isScenarioRow reports whether a verdict row is a replayed-scenario row
+// (E72.4): its id carries the runner's scenario.IDPrefix. The literal is
+// mirrored here because the backend cannot import the runner module.
+func isScenarioRow(id string) bool {
+	return strings.HasPrefix(id, acceptanceScenarioIDPrefix)
+}
+
+// acceptanceScenarioIDPrefix mirrors runner/internal/scenario.IDPrefix.
+const acceptanceScenarioIDPrefix = "scenario:"
+
+// partitionScenarioRows splits rows into (criterion rows, scenario rows) by
+// the scenario: prefix, preserving order within each partition.
+func partitionScenarioRows(rows []acceptanceCriterionResult) (criteria, scenarios []acceptanceCriterionResult) {
+	for _, r := range rows {
+		if isScenarioRow(r.ID) {
+			scenarios = append(scenarios, r)
+			continue
+		}
+		criteria = append(criteria, r)
+	}
+	return criteria, scenarios
 }
 
 // validate returns a human-readable error if any field is missing or
@@ -404,6 +503,9 @@ func (a *acceptanceBody) validate(ctx context.Context, logger *slog.Logger) erro
 			"acceptance verdict: coerced schemeless target_url to an http:// URL",
 			slog.String("target_url", a.TargetURL))
 	}
+	// Scenario-row partition (E72.4 / #3328): replayed-scenario rows leave the
+	// criterion slice HERE so no downstream criterion consumer ever sees one.
+	a.normalizedCriteria, a.scenarioRows = partitionScenarioRows(a.normalizedCriteria)
 	return nil
 }
 
@@ -946,6 +1048,11 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		if undecidableBasis != "" {
 			fields["undecidable_basis"] = undecidableBasis
 		}
+		// Replay evidence (E72.4 / #3328): the runner-injected cap header copied
+		// VERBATIM plus the scenario-row tallies counted here. Absent body.replay
+		// records replay:null so a consumer can tell "no corpus replayed" from a
+		// zero-valued header.
+		fields["replay"] = acceptanceReplayPayload(acc)
 		p, _ := json.Marshal(fields)
 		return p
 	}
@@ -1033,6 +1140,13 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 			"append audit entry failed", map[string]any{"error": err.Error()})
 		return
 	}
+
+	// Scenario regressions (E72.4 / #3328): one acceptance_scenario_regression
+	// entry per FAILED replayed-scenario row, attributed ONLY from the runner's
+	// replay.scenarios entry. Fresh-create path only, so a re-delivered verdict
+	// cannot double-record. Best-effort: an append failure WARN-logs and never
+	// unwinds the artifact + outcome already committed.
+	s.recordAcceptanceScenarioRegressions(r.Context(), runID, stageID, created.ID.String(), acc, actorKind, actorSubject)
 
 	// Refresh the run's sticky living-anchor comment so the acceptance outcome
 	// surfaces on the issue timeline (the acceptance audit categories render
@@ -2001,6 +2115,19 @@ func classifyAcceptanceFailure(acc acceptanceBody, criteria []plan.AcceptanceCri
 			"failure_mode=error: the code errored attempting the behavior; routing to a bounded fix-up pass"
 	}
 
+	// Replayed-scenario regression (E72.4 / #3328): a FAILED scenario row is a
+	// prior run's recorded behaviour objectively broken by this head — class 1,
+	// a bounded fix-up pass, keyed on the scenario ids (plus any failed criterion
+	// ids so the disposition names everything that failed). Scenario rows never
+	// enter the skip partition below: a skipped or undecidable replay is a
+	// replay-budget signal, not an environment flake, so it can never route
+	// class 2 / class 5 on its own.
+	if regressed := failedCriterionIDs(acc.scenarioRows); len(regressed) > 0 {
+		ids := append(regressed, failedCriterionIDs(acc.normalizedCriteria)...)
+		return acceptanceClass1, ids,
+			"assertion_fail: a replayed scenario regressed; the code objectively breaks behaviour a prior run recorded — routing to a bounded fix-up pass"
+	}
+
 	// assertion_fail (validate() guarantees failure_mode is error or
 	// assertion_fail on a failed verdict). Partition the criteria results.
 	var failed []string
@@ -2061,6 +2188,105 @@ func classifyAcceptanceFailure(acc acceptanceBody, criteria []plan.AcceptanceCri
 	// works-as-planned, disputed (class 4).
 	return acceptanceClass4, nil,
 		"unitemized or provenance-ungroundable failure; works-as-planned/disputed — paging the human"
+}
+
+// acceptanceReplayPayload renders the acceptance_outcome_recorded `replay`
+// block (E72.4 / #3328): nil (JSON null) when the body carried no runner
+// replay; otherwise the header fields copied VERBATIM from body.replay plus
+// scenarios_passed / scenarios_failed / scenarios_skipped (skipped +
+// undecidable) counted from the scenario rows, and served_mismatch:true when
+// the runner's attribution list length disagrees with its own served count.
+func acceptanceReplayPayload(acc acceptanceBody) map[string]any {
+	if acc.Replay == nil {
+		return nil
+	}
+	passed, failed, skipped, undecidable, _ := acceptanceCriteriaTally(acc.scenarioRows)
+	return map[string]any{
+		"cap":               acc.Replay.Cap,
+		"corpus_size":       acc.Replay.CorpusSize,
+		"served":            acc.Replay.Served,
+		"sampled_out":       acc.Replay.SampledOut,
+		"retired_excluded":  acc.Replay.RetiredExcluded,
+		"seed":              acc.Replay.Seed,
+		"scenarios_passed":  passed,
+		"scenarios_failed":  failed,
+		"scenarios_skipped": skipped + undecidable,
+		"served_mismatch":   len(acc.Replay.Scenarios) != acc.Replay.Served,
+	}
+}
+
+// recordAcceptanceScenarioRegressions appends one acceptance_scenario_regression
+// chained entry per FAILED scenario row (E72.4 / #3328). origin_pr /
+// origin_issue / origin_run_id / path come ONLY from the matching
+// body.replay.scenarios entry: a row with no entry, or an entry whose
+// origin_pr is 0, records origin_pr ABSENT and origin_unresolved:true — never
+// the trigger issue number, never prose. Best-effort: every failure WARN-logs.
+func (s *Server) recordAcceptanceScenarioRegressions(ctx context.Context, runID, stageID uuid.UUID, artifactID string, acc acceptanceBody, actorKind audit.ActorKind, actorSubject *string) {
+	byID := map[string]acceptanceReplayedScenario{}
+	if acc.Replay != nil {
+		for _, e := range acc.Replay.Scenarios {
+			byID[e.ScenarioID] = e
+		}
+	}
+	for _, row := range acc.scenarioRows {
+		if row.Result != acceptanceResultFailed {
+			continue
+		}
+		fields := map[string]any{
+			"run_id":       runID.String(),
+			"stage_id":     stageID.String(),
+			"artifact_id":  artifactID,
+			"scenario_id":  row.ID,
+			"observed":     row.Observed,
+			"expected":     row.Expected,
+			"repro_handle": row.ReproHandle,
+		}
+		entry, attributed := byID[row.ID]
+		switch {
+		case attributed && entry.OriginPR > 0:
+			fields["origin_pr"] = entry.OriginPR
+			fields["origin_issue"] = entry.OriginIssue
+			fields["origin_run_id"] = entry.OriginRunID
+			fields["path"] = entry.Path
+		case attributed:
+			fields["origin_issue"] = entry.OriginIssue
+			fields["origin_run_id"] = entry.OriginRunID
+			fields["path"] = entry.Path
+			fields["origin_unresolved"] = true
+		default:
+			fields["origin_unresolved"] = true
+		}
+		payload, _ := json.Marshal(fields)
+		if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:        runID,
+			StageID:      &stageID,
+			Timestamp:    time.Now().UTC(),
+			Category:     CategoryAcceptanceScenarioRegression,
+			ActorKind:    &actorKind,
+			ActorSubject: actorSubject,
+			Payload:      payload,
+		}); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"acceptance: append scenario regression entry failed",
+				slog.String("run_id", runID.String()),
+				slog.String("scenario_id", row.ID),
+				slog.String("error", err.Error()))
+		}
+	}
+}
+
+// scenarioRegressionOriginNote renders the concern-note attribution for a
+// failed replayed scenario: the recording PR when known, otherwise an explicit
+// unknown — never the trigger issue number.
+func scenarioRegressionOriginNote(acc acceptanceBody, scenarioID string) string {
+	if acc.Replay != nil {
+		for _, e := range acc.Replay.Scenarios {
+			if e.ScenarioID == scenarioID && e.OriginPR > 0 {
+				return fmt.Sprintf("Regression against scenario %s recorded by PR #%d", scenarioID, e.OriginPR)
+			}
+		}
+	}
+	return fmt.Sprintf("Regression against scenario %s (originating PR unknown)", scenarioID)
 }
 
 // failedCriterionIDs returns the ids of criteria whose result is failed, in
@@ -2364,10 +2590,19 @@ func synthesizeAcceptanceConcerns(acc acceptanceBody, criteria []plan.Acceptance
 	for _, c := range criteria {
 		statementByID[c.ID] = c.Statement
 	}
-	failedByID := make(map[string]acceptanceCriterionResult, len(acc.normalizedCriteria))
+	failedByID := make(map[string]acceptanceCriterionResult, len(acc.normalizedCriteria)+len(acc.scenarioRows))
 	for _, c := range acc.normalizedCriteria {
 		if c.Result == acceptanceResultFailed {
 			failedByID[c.ID] = c
+		}
+	}
+	// Failed replayed-scenario rows (E72.4) synthesize a concern too, with the
+	// recording PR (or an explicit unknown) as the statement line so the fix-up
+	// agent sees which prior behaviour regressed.
+	for _, c := range acc.scenarioRows {
+		if c.Result == acceptanceResultFailed {
+			failedByID[c.ID] = c
+			statementByID[c.ID] = scenarioRegressionOriginNote(acc, c.ID)
 		}
 	}
 

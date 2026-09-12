@@ -64,7 +64,9 @@ const (
 	bindingsFile  = "backend/internal/server/binding_assertions.go"
 	pullRequestGo = "backend/internal/server/pullrequest.go"
 	scopeCompFile = "backend/internal/server/scope_completeness.go"
+	acceptanceGo  = "backend/internal/server/acceptance.go"
 	uploadFile    = "runner/internal/upload/upload.go"
+	scenarioFile  = "runner/internal/scenario/scenario.go"
 )
 
 // SeedManifest is the repo's cross-module wire contract manifest. Verified
@@ -112,6 +114,36 @@ func SeedManifest() Manifest {
 				Consumer: Endpoint{File: uploadFile, Type: "BindingAssertionReport"},
 				Mode:     ModeExact,
 			},
+			// ---- E72.4 / #3328 replayable scenario corpus (ModeExact) ----
+			// The runner PRODUCES ReplaySet / ReplayedScenario (injected into the
+			// validated verdict) and CONSUMES RetiredEntry / AcceptanceCriterionEntry
+			// (served on the acceptance prompt). Exact mode pins the cap fields
+			// (cap / corpus_size / served / sampled_out) so a renamed tag cannot
+			// silently drop the replay-cap evidence from the recorded outcome.
+			{
+				Name: "acceptance_replay_set", Anchor: "#3328",
+				Emitter:  Endpoint{File: scenarioFile, Type: "ReplaySet"},
+				Consumer: Endpoint{File: acceptanceGo, Type: "acceptanceReplay"},
+				Mode:     ModeExact,
+			},
+			{
+				Name: "acceptance_replayed_scenario", Anchor: "#3328",
+				Emitter:  Endpoint{File: scenarioFile, Type: "ReplayedScenario"},
+				Consumer: Endpoint{File: acceptanceGo, Type: "acceptanceReplayedScenario"},
+				Mode:     ModeExact,
+			},
+			{
+				Name: "acceptance_retired_scenario", Anchor: "#3328",
+				Emitter:  Endpoint{File: promptFile, Type: "retiredScenarioEntry"},
+				Consumer: Endpoint{File: scenarioFile, Type: "RetiredEntry"},
+				Mode:     ModeExact,
+			},
+			{
+				Name: "acceptance_criterion_entry", Anchor: "#3328",
+				Emitter:  Endpoint{File: promptFile, Type: "acceptanceCriterionEntry"},
+				Consumer: Endpoint{File: uploadFile, Type: "AcceptanceCriterionEntry"},
+				Mode:     ModeExact,
+			},
 			// ---- ModeSubset: prompt response -> fetched prompt ----
 			{
 				Name: "prompt_response", Anchor: "#2501/#2596",
@@ -154,7 +186,9 @@ func SeedManifest() Manifest {
 			bindingsFile,
 			pullRequestGo,
 			scopeCompFile,
+			acceptanceGo,
 			uploadFile,
+			scenarioFile,
 		},
 		UnpairedExemptions: []Endpoint{
 			// ShipPlanArgs carries the marker on its Reachability field, but the
