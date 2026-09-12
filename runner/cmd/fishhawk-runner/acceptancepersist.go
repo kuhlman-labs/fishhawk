@@ -25,8 +25,11 @@ import (
  * replayable scenarios and folds the run's approved retirements into the
  * ledger, then commits ONLY acceptance/scenarios/** onto the run branch:
  *
- *   persistAcceptanceScenarios — Compose+Write on a passed verdict, MergeRetired
- *       on every verdict, then a scenario-only commit pushed to
+ *   persistAcceptanceScenarios — refuses a tree that is dirty ANYWHERE before
+ *       it writes (the acceptance agent's WorkingDir is hygiene, not a
+ *       boundary — ADR-050), then Compose+Write on a passed verdict,
+ *       MergeRetired on every verdict, and a commit staging EXACTLY the paths
+ *       it wrote (never `add -A` over the corpus dir) pushed to
  *       fetched.AcceptanceRunBranch. Every failure is BEST-EFFORT (the verdict
  *       outcome never changes); the result names the exit path so the drop
  *       reporter can carry it.
@@ -198,9 +201,14 @@ type acceptancePersistResult struct {
 }
 
 // persistAcceptanceScenarios records the pass and merges the retirements,
-// then commits and pushes acceptance/scenarios/** to the run branch. It never
-// returns an error: every branch resolves to an acceptancePersistResult
-// naming the exit path, and the caller keeps the verdict outcome unchanged.
+// then commits and pushes exactly the corpus paths it wrote to the run
+// branch. It never returns an error: every branch resolves to an
+// acceptancePersistResult naming the exit path, and the caller keeps the
+// verdict outcome unchanged. Only bytes the runner itself produced this pass
+// (scenario.Write / scenario.WriteRetired output) can enter the commit: a
+// path dirty before the first write, or dirty afterwards without having been
+// written, is persist_refused whether it sits inside acceptance/scenarios/**
+// or outside it.
 func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs, p pusher, logSink io.Writer) acceptancePersistResult {
 	skip := func(reason string) acceptancePersistResult {
 		return acceptancePersistResult{outcome: persistSkipped, reason: reason}
@@ -218,15 +226,39 @@ func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs,
 		return skip("no_run_branch")
 	}
 	corpusDir := filepath.Join(in.treeDir, filepath.FromSlash(scenario.CorpusDir))
+	ledgerPath := scenario.CorpusDir + "/" + scenario.RetiredFile
 
-	// (a) Verdict passed → Compose + Write one scenario per drivable criterion
+	// (a) BEFORE anything is written, the tree must be PRISTINE. It is a
+	// detached checkout of the merge candidate, and the acceptance agent's
+	// temp-dir WorkingDir is hygiene, not a filesystem boundary (ADR-050
+	// residual: a hostile agent or hostile merge-candidate code can write
+	// anywhere on the runner host), so ANY dirty path — inside
+	// acceptance/scenarios/** exactly as much as outside it — is a write the
+	// runner did not make, and the commit is REFUSED. Refusing here, before
+	// LoadRetired reads the ledger, is what keeps a planted retired.yaml from
+	// being merged as if it were HEAD's, and a planted scenario file from being
+	// promoted into a credentialed push as run-authored. retirementsLedgered
+	// stays false on every refusal: a tampered tree proves nothing about the
+	// ledger, so the drop reporter stays armed.
+	dirty, err := gitPorcelainPaths(ctx, in.treeDir)
+	if err != nil {
+		return fail("status: " + err.Error())
+	}
+	if len(dirty) > 0 {
+		return acceptancePersistResult{outcome: persistRefused, reason: "dirty_before_write: " + strings.Join(dirty, ",")}
+	}
+
+	// (b) Verdict passed → Compose + Write one scenario per drivable criterion
 	// whose row passed. A missing issue number cannot key the id, so it records
 	// nothing (never the PR number) — the retirement merge below still runs.
+	// wrote is the exact repo-relative path set this pass produced (the Write
+	// return paths plus the ledger): it is the ONLY thing that may be staged.
 	var v acceptanceVerdict
 	if err := json.Unmarshal(in.verdict, &v); err != nil {
 		return fail("verdict_undecodable: " + err.Error())
 	}
 	var written []string
+	wrote := map[string]bool{}
 	if v.Verdict == "passed" && in.issue > 0 {
 		rows, _, err := coerceAcceptanceCriteria(v.Criteria)
 		if err != nil {
@@ -251,9 +283,11 @@ func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs,
 			RecordedAt: in.now().UTC().Truncate(time.Second),
 		}
 		for _, s := range scenario.Compose(crits, results, origin) {
-			if _, err := scenario.Write(corpusDir, s); err != nil {
+			rel, err := scenario.Write(corpusDir, s)
+			if err != nil {
 				return fail("scenario_write: " + err.Error())
 			}
+			wrote[scenario.CorpusDir+"/"+rel] = true
 			written = append(written, s.ID)
 		}
 	} else if v.Verdict == "passed" && in.issue == 0 {
@@ -262,9 +296,10 @@ func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs,
 		})
 	}
 
-	// (b) Regardless of verdict, merge the served FULL entries into the ledger,
+	// (c) Regardless of verdict, merge the served FULL entries into the ledger,
 	// reason preserved (MergeRetired keeps an existing entry whole on a
-	// duplicate id). Write only when the merge grew the ledger.
+	// duplicate id). Write only when the merge grew the ledger. The ledger read
+	// here is HEAD's: (a) proved the tree clean before any write.
 	ledgered := false
 	if len(in.retired) > 0 {
 		existing, err := scenario.LoadRetired(corpusDir)
@@ -276,28 +311,27 @@ func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs,
 			if err := scenario.WriteRetired(corpusDir, merged); err != nil {
 				return fail("retired_ledger_write: " + err.Error())
 			}
+			wrote[ledgerPath] = true
 		} else {
 			ledgered = true
 		}
 	}
 
-	// (c)/(d) The dirty set must be confined to acceptance/scenarios/**: the
-	// tree is a pristine detached checkout, so anything else dirty means a
-	// foreign write landed in it and the commit is REFUSED rather than
-	// carrying it onto the run branch. Then stage the corpus dir only and
-	// re-assert on the staged set.
-	dirty, err := gitPorcelainPaths(ctx, in.treeDir)
+	// (d) The dirty set must now be a SUBSET of wrote: a path that turned dirty
+	// since (a) and that this pass did not write landed from outside the
+	// runner and is REFUSED, never staged around. Then stage those exact paths
+	// (never a directory, never `add -A`) and re-assert on the staged set.
+	dirty, err = gitPorcelainPaths(ctx, in.treeDir)
 	if err != nil {
 		return fail("status: " + err.Error())
 	}
-	if stray := outsideCorpus(dirty); len(stray) > 0 {
-		return acceptancePersistResult{outcome: persistRefused,
-			reason: "dirty_outside_corpus: " + strings.Join(stray, ","), retirementsLedgered: ledgered}
+	if stray := notWritten(dirty, wrote); len(stray) > 0 {
+		return acceptancePersistResult{outcome: persistRefused, reason: "dirty_unwritten: " + strings.Join(stray, ",")}
 	}
 	if len(dirty) == 0 {
 		return acceptancePersistResult{outcome: persistSkipped, reason: "unchanged", retirementsLedgered: ledgered}
 	}
-	if out, err := gitTree(ctx, in.treeDir, "add", "-A", "--", scenario.CorpusDir); err != nil {
+	if out, err := gitTree(ctx, in.treeDir, append([]string{"add", "--"}, dirty...)...); err != nil {
 		return fail("add: " + strings.TrimSpace(out))
 	}
 	stagedOut, err := gitTree(ctx, in.treeDir, "diff", "--cached", "--name-only", "-z")
@@ -305,9 +339,8 @@ func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs,
 		return fail("diff --cached: " + strings.TrimSpace(stagedOut))
 	}
 	staged := splitNUL([]byte(stagedOut))
-	if stray := outsideCorpus(staged); len(stray) > 0 {
-		return acceptancePersistResult{outcome: persistRefused,
-			reason: "staged_outside_corpus: " + strings.Join(stray, ","), retirementsLedgered: ledgered}
+	if stray := notWritten(staged, wrote); len(stray) > 0 {
+		return acceptancePersistResult{outcome: persistRefused, reason: "staged_unwritten: " + strings.Join(stray, ",")}
 	}
 	if len(staged) == 0 {
 		return acceptancePersistResult{outcome: persistSkipped, reason: "unchanged", retirementsLedgered: ledgered}
@@ -385,11 +418,12 @@ func gitPorcelainPaths(ctx context.Context, dir string) ([]string, error) {
 	return paths, nil
 }
 
-// outsideCorpus returns the paths not under acceptance/scenarios/.
-func outsideCorpus(paths []string) []string {
+// notWritten returns the paths in paths that are not in wrote — the exact
+// repo-relative set persistAcceptanceScenarios produced this pass.
+func notWritten(paths []string, wrote map[string]bool) []string {
 	var out []string
 	for _, p := range paths {
-		if !strings.HasPrefix(p, scenario.CorpusDir+"/") {
+		if !wrote[p] {
 			out = append(out, p)
 		}
 	}

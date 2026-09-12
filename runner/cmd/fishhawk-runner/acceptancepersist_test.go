@@ -126,7 +126,8 @@ func TestPersistAcceptanceScenarios_PushesScenarioOnlyCommit(t *testing.T) {
 
 // TestPersist_RefusesDirtyOutsideCorpus: a stray file seeded BY CONSTRUCTION
 // in the acceptance tree makes the commit persist_refused — nothing is
-// committed, nothing pushed — even though a scenario WAS composed.
+// committed, nothing pushed — and the refusal lands BEFORE any write (no
+// scenario file appears in the tree).
 func TestPersist_RefusesDirtyOutsideCorpus(t *testing.T) {
 	_, tree, origin, head := persistRepo(t, nil)
 	mustWrite(t, filepath.Join(tree, "stray.txt"), "planted\n")
@@ -135,15 +136,109 @@ func TestPersist_RefusesDirtyOutsideCorpus(t *testing.T) {
 		criteria: []upload.AcceptanceCriterionEntry{{ID: "crit-b", Statement: "s", Drivable: true}},
 		verdict:  passedVerdictFor("crit-b"),
 	}, &gitops.Pusher{}, &strings.Builder{})
-	if res.outcome != persistRefused || !strings.Contains(res.reason, "stray.txt") {
-		t.Fatalf("outcome = %s (%s), want persist_refused naming stray.txt", res.outcome, res.reason)
+	if res.outcome != persistRefused || !strings.HasPrefix(res.reason, "dirty_before_write: ") || !strings.Contains(res.reason, "stray.txt") {
+		t.Fatalf("outcome = %s (%s), want persist_refused dirty_before_write naming stray.txt", res.outcome, res.reason)
 	}
+	assertPersistRefusedUntouched(t, tree, origin, head)
+	if _, err := os.Stat(filepath.Join(tree, "acceptance", "scenarios", "issue-101", "crit-b.yaml")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("refusal must precede the scenario write, stat err = %v", err)
+	}
+}
+
+// plantFile writes body at path, creating parent directories.
+func plantFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, path, body)
+}
+
+// assertPersistRefusedUntouched: a refused persist commits nothing in the
+// tree and pushes nothing to origin.
+func assertPersistRefusedUntouched(t *testing.T, tree, origin, head string) {
+	t.Helper()
 	if out, err := exec.Command("git", "-C", origin, "rev-parse", "--verify", "refs/heads/fishhawk/run-r1").CombinedOutput(); err == nil {
 		t.Errorf("refused persist must push nothing, but origin has the run branch: %s", out)
 	}
 	if tgit(t, tree, "rev-parse", "HEAD") != head {
 		t.Error("refused persist must not commit")
 	}
+	if staged := tgit(t, tree, "diff", "--cached", "--name-only"); staged != "" {
+		t.Errorf("refused persist must stage nothing, staged: %s", staged)
+	}
+}
+
+// TestPersist_RefusesPlantedInsideCorpus: content the runner did not write
+// this pass — planted INSIDE acceptance/scenarios/** — never enters the
+// commit (the [high/security] + [medium/security] fix-up: the acceptance
+// WorkingDir is not a filesystem boundary, so an agent-planted corpus file
+// must not be promoted into a credentialed push as run-authored).
+func TestPersist_RefusesPlantedInsideCorpus(t *testing.T) {
+	crit := []upload.AcceptanceCriterionEntry{{ID: "crit-b", Statement: "s", Drivable: true}}
+	served := []scenario.RetiredEntry{{ID: "scenario:issue-101/crit-z", Reason: "approved retirement", RunID: "r1", PR: 742, RetiredAt: "2026-09-12T00:00:00Z"}}
+
+	t.Run("planted scenario file before the write is refused", func(t *testing.T) {
+		_, tree, origin, head := persistRepo(t, nil)
+		planted := filepath.Join(tree, filepath.FromSlash(scenario.CorpusDir), "issue-101", "planted.yaml")
+		plantFile(t, planted, "id: scenario:issue-101/planted\nstatement: exfil\n")
+		res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{
+			treeDir: tree, runBranch: "fishhawk/run-r1", remoteURL: origin, issue: 101, prNumber: 742, headSHA: head, runID: "r1",
+			criteria: crit, retired: served, verdict: passedVerdictFor("crit-b"),
+		}, &gitops.Pusher{}, &strings.Builder{})
+		if res.outcome != persistRefused || res.reason != "dirty_before_write: acceptance/scenarios/issue-101/planted.yaml" {
+			t.Fatalf("outcome = %s (%s), want persist_refused dirty_before_write naming the planted file", res.outcome, res.reason)
+		}
+		if res.retirementsLedgered {
+			t.Error("a refusal must keep the drop reporter armed (retirementsLedgered=false)")
+		}
+		assertPersistRefusedUntouched(t, tree, origin, head)
+	})
+
+	t.Run("tampered ledger is refused, not merged, and does not disarm", func(t *testing.T) {
+		// The committed ledger is empty; the working-tree copy is hand-edited
+		// to carry a FORGED retirement nobody approved. Without the pre-write
+		// check LoadRetired would read the tampered copy, MergeRetired would
+		// keep the forged row alongside the served one, and the push would
+		// publish a retirement (i.e. a scenario removal) as run-authored.
+		_, tree, origin, head := persistRepo(t, map[string]string{"retired.yaml": "retired: []\n"})
+		mustWrite(t, filepath.Join(tree, filepath.FromSlash(scenario.CorpusDir), scenario.RetiredFile),
+			"retired:\n  - id: scenario:issue-101/forged\n    reason: forged\n    run_id: r1\n    pr: 742\n    retired_at: \"2026-09-12T00:00:00Z\"\n")
+		res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{
+			treeDir: tree, runBranch: "fishhawk/run-r1", remoteURL: origin, issue: 101, prNumber: 742, headSHA: head, runID: "r1",
+			criteria: crit, retired: served, verdict: []byte(`{"verdict":"failed","failure_mode":"error"}`),
+		}, &gitops.Pusher{}, &strings.Builder{})
+		if res.outcome != persistRefused || res.reason != "dirty_before_write: acceptance/scenarios/retired.yaml" || res.retirementsLedgered {
+			t.Fatalf("got %+v, want persist_refused dirty_before_write on retired.yaml with retirementsLedgered=false", res)
+		}
+		assertPersistRefusedUntouched(t, tree, origin, head)
+	})
+
+	t.Run("file planted between the clean check and the write is refused and never staged", func(t *testing.T) {
+		// in.now runs AFTER the pre-write clean check and BEFORE the scenario
+		// write, so a write from it models a hostile process racing the
+		// persist step. Exact-path staging plus the post-write subset check
+		// must refuse it; a directory-wide `add -A` would have staged it.
+		_, tree, origin, head := persistRepo(t, nil)
+		planted := filepath.Join(tree, filepath.FromSlash(scenario.CorpusDir), "issue-101", "raced.yaml")
+		res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{
+			treeDir: tree, runBranch: "fishhawk/run-r1", remoteURL: origin, issue: 101, prNumber: 742, headSHA: head, runID: "r1",
+			criteria: crit, retired: served, verdict: passedVerdictFor("crit-b"),
+			now: func() time.Time {
+				plantFile(t, planted, "id: scenario:issue-101/raced\nstatement: exfil\n")
+				return time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC)
+			},
+		}, &gitops.Pusher{}, &strings.Builder{})
+		if res.outcome != persistRefused || res.reason != "dirty_unwritten: acceptance/scenarios/issue-101/raced.yaml" || res.retirementsLedgered {
+			t.Fatalf("got %+v, want persist_refused dirty_unwritten naming raced.yaml", res)
+		}
+		assertPersistRefusedUntouched(t, tree, origin, head)
+		// The runner's own writes DID land (the refusal is about the stray,
+		// not the pass), proving the subset check discriminates by path.
+		if _, err := os.Stat(filepath.Join(tree, filepath.FromSlash(scenario.CorpusDir), "issue-101", "crit-b.yaml")); err != nil {
+			t.Errorf("runner-written scenario missing: %v", err)
+		}
+	})
 }
 
 // TestPersist_WritesFullRetirementOnFailedVerdict: a FAILED verdict records no
@@ -276,11 +371,11 @@ func TestRetirementDropReporter(t *testing.T) {
 		fu := newFakeUploader(t)
 		key := &upload.IssuedKey{PrivateKey: fu.priv}
 		r := newRetirementDropReporter(entries)
-		r.note("persist_refused:dirty_outside_corpus")
+		r.note("persist_refused:dirty_before_write")
 		var log strings.Builder
 		r.report(context.Background(), fu, cfg, key, &log)
 		if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != upload.OutcomeAcceptanceScenarioRetirementDropped ||
-			fu.gotPRArgs.Reason != "persist_refused:dirty_outside_corpus" || len(fu.gotPRArgs.RetiredScenarios) != 1 ||
+			fu.gotPRArgs.Reason != "persist_refused:dirty_before_write" || len(fu.gotPRArgs.RetiredScenarios) != 1 ||
 			fu.gotPRArgs.RetiredScenarios[0].Reason != "behaviour replaced by #3327" {
 			t.Fatalf("drop report = %+v", fu.gotPRArgs)
 		}
@@ -633,7 +728,7 @@ func TestReportRetirementDrop_PersistRefused(t *testing.T) {
 	if got := run(args, &stderr); got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
 	}
-	if dr := dropReport(fu); dr == nil || !strings.HasPrefix(dr.Reason, "persist_refused:dirty_outside_corpus") {
+	if dr := dropReport(fu); dr == nil || !strings.HasPrefix(dr.Reason, "persist_refused:dirty_before_write") {
 		t.Fatalf("drop report = %+v, want persist_refused\n%s", dr, stderr.String())
 	}
 	if pushedReport(fu) != nil || tgit(t, origin, "rev-parse", "refs/heads/fishhawk/run-x") != fu.promptResp.AcceptanceExpectedHeadSHA {
