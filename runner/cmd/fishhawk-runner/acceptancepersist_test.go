@@ -2,12 +2,20 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -239,6 +247,110 @@ func TestPersist_RefusesPlantedInsideCorpus(t *testing.T) {
 			t.Errorf("runner-written scenario missing: %v", err)
 		}
 	})
+}
+
+// symlinkPersistRepo is persistRepo with ONE committed symlink at linkRel
+// (repo-relative, slash form) pointing at a fresh OUTSIDE directory. The
+// link is committed, so the detached acceptance tree checks it out as a
+// symlink and `git status` is CLEAN — the case the dirty-tree refusal cannot
+// see (#3396). Returns the tree, the bare origin, the merge-candidate SHA and
+// the outside dir.
+func symlinkPersistRepo(t *testing.T, linkRel string) (tree, origin, head, outside string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "README.md"), "hello\n")
+	outside = filepath.Join(t.TempDir(), "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(repo, filepath.FromSlash(linkRel))
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "commit hostile symlink")
+	head = gitHead(t, repo)
+	origin = filepath.Join(t.TempDir(), "origin.git")
+	if out, err := exec.Command("git", "init", "--bare", "--initial-branch=main", origin).CombinedOutput(); err != nil {
+		t.Fatalf("init bare: %v\n%s", err, out)
+	}
+	runGit("push", origin, "main:main")
+	tree = filepath.Join(t.TempDir(), "tree")
+	runGit("worktree", "add", "--detach", tree, head)
+	if fi, err := os.Lstat(filepath.Join(tree, filepath.FromSlash(linkRel))); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("fixture: %s must be checked out as a symlink (err %v)", linkRel, err)
+	}
+	if dirty := tgit(t, tree, "status", "--porcelain"); dirty != "" {
+		t.Fatalf("fixture: tree must be clean with the symlink committed, got %q", dirty)
+	}
+	return tree, origin, head, outside
+}
+
+// assertOutsideEmpty: nothing — no scenario yaml, no retired.yaml, no leaked
+// .*.tmp — landed in the outside dir the symlink pointed at.
+func assertOutsideEmpty(t *testing.T, outside string) {
+	t.Helper()
+	ents, err := os.ReadDir(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		t.Errorf("a write escaped the tree through the symlink: outside/%s", e.Name())
+	}
+}
+
+// TestPersist_RefusesSymlinkedCorpusRoot (#3396): acceptance/scenarios is a
+// COMMITTED symlink to a directory outside the tree. The tree is clean, so
+// only the corpus-root component check can catch it: persist_refused naming
+// the component, retirementsLedgered false (the drop reporter stays armed and
+// ships this reason), nothing written outside, nothing committed or pushed.
+func TestPersist_RefusesSymlinkedCorpusRoot(t *testing.T) {
+	tree, origin, head, outside := symlinkPersistRepo(t, scenario.CorpusDir)
+	served := []scenario.RetiredEntry{{ID: "scenario:issue-7/old", Reason: "behaviour replaced by #3327", RunID: "r0", PR: 700, RetiredAt: "2026-09-01T00:00:00Z"}}
+	res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{
+		treeDir: tree, runBranch: "fishhawk/run-r1", remoteURL: origin, issue: 101, prNumber: 742, headSHA: head, runID: "r1",
+		criteria: []upload.AcceptanceCriterionEntry{{ID: "crit-b", Statement: "s", Drivable: true}},
+		retired:  served, verdict: passedVerdictFor("crit-b"),
+	}, &gitops.Pusher{}, &strings.Builder{})
+	if res.outcome != persistRefused || !strings.HasPrefix(res.reason, "symlinked_corpus_path: ") || !strings.Contains(res.reason, `"scenarios"`) {
+		t.Errorf("outcome = %s (%s), want persist_refused symlinked_corpus_path naming the scenarios component", res.outcome, res.reason)
+	}
+	if res.retirementsLedgered {
+		t.Error("a symlink refusal must keep the drop reporter armed (retirementsLedgered=false)")
+	}
+	assertOutsideEmpty(t, outside)
+	assertPersistRefusedUntouched(t, tree, origin, head)
+}
+
+// TestPersist_RefusesSymlinkedIssueDir (#3396): the symlink sits BELOW the
+// corpus root (acceptance/scenarios/issue-101 → outside), where the
+// persist-level check does not look; scenario.Write's own guard refuses it
+// and the persist step surfaces persist_failed scenario_write: naming the
+// component. Nothing lands outside; origin's tip is unchanged.
+func TestPersist_RefusesSymlinkedIssueDir(t *testing.T) {
+	tree, origin, head, outside := symlinkPersistRepo(t, scenario.CorpusDir+"/issue-101")
+	res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{
+		treeDir: tree, runBranch: "fishhawk/run-r1", remoteURL: origin, issue: 101, prNumber: 742, headSHA: head, runID: "r1",
+		criteria: []upload.AcceptanceCriterionEntry{{ID: "crit-b", Statement: "s", Drivable: true}},
+		verdict:  passedVerdictFor("crit-b"),
+	}, &gitops.Pusher{}, &strings.Builder{})
+	if res.outcome != persistFailed || !strings.HasPrefix(res.reason, "scenario_write: ") || !strings.Contains(res.reason, `symlinked path component "issue-101"`) {
+		t.Errorf("outcome = %s (%s), want persist_failed scenario_write naming issue-101", res.outcome, res.reason)
+	}
+	if res.retirementsLedgered {
+		t.Error("retirementsLedgered must stay false")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "crit-b.yaml")); err == nil {
+		t.Error("crit-b.yaml landed outside the tree through the symlinked issue dir")
+	}
+	assertOutsideEmpty(t, outside)
+	assertPersistRefusedUntouched(t, tree, origin, head)
 }
 
 // TestPersist_WritesFullRetirementOnFailedVerdict: a FAILED verdict records no
@@ -751,6 +863,136 @@ func TestReportRetirementDrop_PushFailure(t *testing.T) {
 	}
 	if dr := dropReport(fu); dr == nil || !strings.HasPrefix(dr.Reason, "persist_failed:push: ") {
 		t.Fatalf("drop report = %+v, want persist_failed:push\n%s", dr, stderr.String())
+	}
+}
+
+// TestReportRetirementDrop_PromptFileIOFails (#3396): the wire DELIVERED the
+// served retirement but the prompt temp file cannot be created — a REAL
+// fault: TMPDIR points at a nonexistent directory, and os.CreateTemp("",…)
+// resolves through os.TempDir(), which on Unix returns $TMPDIR when set. The
+// reporter must be armed from the parsed wire response BEFORE the
+// fetch_prompt exit, so the drop ships with reason fetch_prompt_failed.
+//
+// Condition 1 (operator): this drives the reason through the REAL
+// upload.Client to an httptest backend and asserts on the SERIALIZED body the
+// backend receives — not on the fake uploader's recorded args. The backend
+// half (that `reason` lands verbatim in the acceptance_scenario_retirement_
+// dropped audit row) is pinned by backend/internal/server/pullrequest_test.go
+// TestShipPullRequest_AcceptanceScenarioRetirementDropped.
+//
+// Condition 2 (TMPDIR poisoning): between the fetch and the prompt-file write
+// nothing else consults os.TempDir() — fetchPromptToFile goes FetchPrompt →
+// prompt_fetched log → os.CreateTemp (main.go). The only earlier consumer on
+// this path is probeAgentVersion (main.go, agentbin.go), which degrades to
+// agent_version "unknown" on a MkdirTemp failure and changes no control
+// flow; the fake/real clients are in-memory/HTTP. All fixture t.TempDir()
+// calls precede the Setenv, and nothing after run() creates a temp path.
+// The runner_failed detail is asserted to be `create prompt temp file`, so
+// the test fails for the reason it names. t.Setenv forbids t.Parallel.
+func TestReportRetirementDrop_PromptFileIOFails(t *testing.T) {
+	_, _, fu, args := acceptanceReplayStageSetup(t)
+
+	// REAL wire client against an httptest backend: signing key + prompt
+	// served from the fixture's promptResp; the pull-request POST body is
+	// captured verbatim.
+	var (
+		mu     sync.Mutex
+		bodies []string
+	)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/signing-key"):
+			_, priv, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				http.Error(w, "keygen", 500)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"run_id":      acceptanceTestRunID,
+				"public_key":  base64.StdEncoding.EncodeToString(priv.Public().(ed25519.PublicKey)),
+				"private_key": base64.StdEncoding.EncodeToString(priv),
+				"issued_at":   time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC),
+				"expires_at":  time.Date(2026, 7, 2, 12, 30, 0, 0, time.UTC),
+			})
+		case strings.HasSuffix(r.URL.Path, "/prompt"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(fu.promptResp)
+		case strings.HasSuffix(r.URL.Path, "/pull-request"):
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			bodies = append(bodies, string(b))
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"e1","stage_id":"` + acceptanceTestStageID + `"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(backend.Close)
+	origClient := newUploadClient
+	newUploadClient = func(string) uploadClient { return upload.New(backend.URL) }
+	t.Cleanup(func() { newUploadClient = origClient })
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(okVerdict)}})
+
+	// The REAL fault, injected LAST (every fixture temp dir already exists).
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "absent"))
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"reason":"fetch_prompt"`) || !strings.Contains(out, "create prompt temp file") {
+		t.Fatalf("expected the prompt temp-file create failure:\n%s", out)
+	}
+	armed, failed := strings.Index(out, "acceptance_scenario_retirement_reporter_armed"), strings.Index(out, `"event":"runner_failed"`)
+	if armed < 0 || failed < 0 || armed > failed {
+		t.Errorf("reporter must be armed BEFORE the fetch_prompt exit (armed@%d failed@%d):\n%s", armed, failed, out)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 1 {
+		t.Fatalf("pull-request POSTs = %d, want exactly one drop report:\n%s", len(bodies), out)
+	}
+	var body struct {
+		Outcome string                  `json:"outcome"`
+		Reason  string                  `json:"reason"`
+		Retired []scenario.RetiredEntry `json:"retired"`
+	}
+	if err := json.Unmarshal([]byte(bodies[0]), &body); err != nil {
+		t.Fatalf("decode shipped body: %v\n%s", err, bodies[0])
+	}
+	if body.Outcome != upload.OutcomeAcceptanceScenarioRetirementDropped || body.Reason != "fetch_prompt_failed" {
+		t.Errorf("shipped body = %s, want outcome acceptance_scenario_retirement_dropped reason fetch_prompt_failed", bodies[0])
+	}
+	if len(body.Retired) != 1 || body.Retired[0].ID != "scenario:issue-7/crit-c" || body.Retired[0].Reason != "behaviour replaced by #3327" {
+		t.Errorf("shipped retired = %+v, want the served entry with its reason intact", body.Retired)
+	}
+	if !strings.Contains(bodies[0], `"reason":"fetch_prompt_failed"`) {
+		t.Errorf("serialized body must carry the reason verbatim: %s", bodies[0])
+	}
+}
+
+// TestReportRetirementDrop_NetworkFailureReportsNothing (#3396 control): a
+// FetchPrompt that never delivers arms nothing — there is no served entry to
+// report and no key-bearing report is attempted.
+func TestReportRetirementDrop_NetworkFailureReportsNothing(t *testing.T) {
+	_, _, fu, args := acceptanceReplayStageSetup(t)
+	fu.promptErr = errors.New("backend down")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"reason":"fetch_prompt"`) {
+		t.Fatalf("expected the fetch_prompt failure:\n%s", stderr.String())
+	}
+	if dr := dropReport(fu); dr != nil {
+		t.Errorf("nothing was delivered, so nothing may be reported: %+v", dr)
+	}
+	if strings.Contains(stderr.String(), "acceptance_scenario_retirement_reporter_armed") {
+		t.Error("the reporter must not arm on a network failure")
 	}
 }
 

@@ -318,8 +318,17 @@ Notes:
     `retire_scenario` the runner could not persist (it exited after the prompt
     fetch on a path that pushed no ledger commit: `persist_failed`,
     `persist_refused`, `no_run_branch`, a pre-spawn guard, a verdict validation
-    failure). **The audit entry is the operator-visible surface for the drop
-    today, NOT the status comment:** the `notifyStatusUpdate` refresh rebuilds
+    failure, and — since #3396 — `fetch_prompt_failed`: the wire delivered the
+    retirements but the prompt temp file could not be created/written). The
+    SAME category has a SECOND writer since #3396: the dispatch prompt path
+    (`server/prompt.go` `recordAcceptanceRetirementsUnserved`) appends it with
+    reason `approval_chain_unreadable` and an EMPTY `retired` list (the
+    approval-chain read that would name the entries is the one that failed;
+    an `error` field carries the read error), idempotent per stage+reason,
+    actor `system`, with NO `notifyStatusUpdate` refresh and never from the
+    preview render. The ship-path validator's non-empty-`retired` rule applies
+    to the RUNNER report, not to this row. **The audit entry is the
+    operator-visible surface for the drop today, NOT the status comment:** the `notifyStatusUpdate` refresh rebuilds
     the anchor, but `status_template.go`'s closed `activityCategories` set does
     not admit `acceptance_scenario_retirement_dropped`, so the rebuild renders
     NO line for it — read the ids and reasons from `GET /v0/runs/{run_id}/audit`.

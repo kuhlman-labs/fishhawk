@@ -5,6 +5,10 @@
 // how many prior scenarios a new acceptance pass replays, and the prompt
 // section that asks the acceptance agent to replay them FIRST.
 //
+// Every corpus write (Write, WriteRetired) refuses a symlinked path component
+// under the corpus dir before creating anything (RefuseSymlinks, #3396), so a
+// committed symlink cannot redirect a write outside the tree.
+//
 // The package imports only the standard library and gopkg.in/yaml.v3. It
 // deliberately references NO runner/internal/upload symbol and NO backend
 // symbol: it is the slice that PRODUCES the replay wire types, so it must
@@ -288,16 +292,21 @@ func MergeRetired(existing, incoming []RetiredEntry) []RetiredEntry {
 }
 
 // WriteRetired writes dir/retired.yaml atomically (temp file + rename in
-// the same directory), creating dir when needed.
+// the same directory), creating dir when needed. It shares writeAtomic with
+// Write, so a symlinked retired.yaml (or a symlinked dir component) is
+// refused by RefuseSymlinks before anything is created.
 func WriteRetired(dir string, entries []RetiredEntry) error {
 	b, err := yaml.Marshal(retiredLedger{Retired: entries})
 	if err != nil {
 		return fmt.Errorf("retired ledger: marshal: %w", err)
 	}
-	return writeAtomic(filepath.Join(dir, RetiredFile), b)
+	return writeAtomic(dir, RetiredFile, b)
 }
 
-// Write persists s under dir at PathFor(s.ID), atomically.
+// Write persists s under dir at PathFor(s.ID), atomically. A symlinked
+// component of that path under dir (the issue-<N> directory or the leaf) is
+// refused by RefuseSymlinks BEFORE the directory is created, so a committed
+// symlink cannot redirect the write outside dir (#3396).
 func Write(dir string, s Scenario) (string, error) {
 	rel, err := PathFor(s.ID)
 	if err != nil {
@@ -307,13 +316,71 @@ func Write(dir string, s Scenario) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("scenario %s: marshal: %w", s.ID, err)
 	}
-	if err := writeAtomic(filepath.Join(dir, filepath.FromSlash(rel)), b); err != nil {
+	if err := writeAtomic(dir, rel, b); err != nil {
 		return "", err
 	}
 	return rel, nil
 }
 
-func writeAtomic(path string, b []byte) error {
+// RefuseSymlinks walks every component of rel (slash form) under root and
+// refuses — naming the component — when an EXISTING component is a symlink
+// or an existing intermediate is not a directory. The walk stops at the
+// first component that does not exist: MkdirAll will create the remainder,
+// and nothing that does not exist can redirect it. The LEAF is checked too
+// (rename(2) onto a symlink replaces the link entry rather than following
+// it, but a symlinked leaf is still not a path the corpus owns). root itself
+// is deliberately NOT checked: a symlinked temp root (macOS t.TempDir(),
+// a TMPDIR under /var → /private/var) is legitimate and is not
+// attacker-committed content. Any other Lstat error propagates. rel is
+// also refused when it carries a `..` component or is absolute: the walk
+// below joins each component with filepath.Join, which would normalize a
+// `..` UP and out of root before the lstat ever ran, so the guard must not
+// depend on every caller having pre-validated rel the way PathFor does.
+func RefuseSymlinks(root, rel string) error {
+	rel = filepath.ToSlash(rel)
+	if strings.HasPrefix(rel, "/") {
+		return fmt.Errorf("%s: refusing absolute path %q", root, rel)
+	}
+	comps := strings.Split(rel, "/")
+	// Scanned BEFORE the walk: the walk returns nil at the first absent
+	// component, so a `..` behind a not-yet-created prefix would otherwise
+	// never be reached.
+	for _, comp := range comps {
+		if comp == ".." {
+			return fmt.Errorf("%s: refusing parent-directory path component in %q", root, rel)
+		}
+	}
+	cur := root
+	for _, comp := range comps {
+		if comp == "" || comp == "." {
+			continue
+		}
+		cur = filepath.Join(cur, comp)
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("%s: lstat %q: %w", root, comp, err)
+		}
+		if fi.Mode()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("%s: refusing to write through symlinked path component %q", root, comp)
+		}
+		if !fi.IsDir() && cur != filepath.Join(root, filepath.FromSlash(rel)) {
+			return fmt.Errorf("%s: refusing to write through non-directory path component %q", root, comp)
+		}
+	}
+	return nil
+}
+
+// writeAtomic writes b to root/rel via temp file + rename in the target
+// directory. RefuseSymlinks runs FIRST — before MkdirAll, which would
+// otherwise already have followed a symlinked component out of root.
+func writeAtomic(root, rel string, b []byte) error {
+	if err := RefuseSymlinks(root, rel); err != nil {
+		return err
+	}
+	path := filepath.Join(root, filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("%s: mkdir: %w", path, err)
 	}

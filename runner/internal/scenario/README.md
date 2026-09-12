@@ -37,7 +37,37 @@ an id without the prefix, a missing `origin.run_id` or
 file's corpus-relative path — never a silent skip. A missing directory is an
 empty corpus. `Write(dir, s)` writes atomically (temp + rename) at
 `PathFor(s.ID)` and refuses an id without the prefix or one carrying `..` /
-a leading `/`.
+a leading `/`. It ALSO refuses — by component name, BEFORE `MkdirAll`
+creates anything — a symlinked component of that path under `dir` (the
+`issue-<N>` directory or the `.yaml` leaf), so a committed symlink cannot
+redirect the write outside the tree (#3396; `MkdirAll` would already have
+followed the link, which is why the check precedes it).
+
+`RefuseSymlinks(root, rel)` is that check, exported so the persist step can
+apply it to the corpus-root components it owns (`acceptance/`,
+`acceptance/scenarios/`) which sit ABOVE the `dir` this package receives.
+Contract: every existing component of `rel` under `root` is `Lstat`ed; a
+symlink → `refusing to write through symlinked path component "<comp>"`;
+an existing intermediate that is not a directory → `non-directory path
+component "<comp>"`; a `..` component → `refusing parent-directory path
+component`, and an absolute `rel` → `refusing absolute path`, BOTH before
+any lstat (the walk joins with `filepath.Join`, which would normalize a
+`..` up and out of `root` — so the function does not depend on a caller
+having pre-validated `rel` the way `PathFor` does); the walk stops at the
+first absent component (nothing
+that does not exist can redirect `MkdirAll`); the leaf is checked too
+(`rename(2)` onto a symlink replaces the link entry, not the target, so this
+half is belt-and-braces). Residuals, stated: `root` itself is NOT checked
+(a symlinked temp root — macOS `t.TempDir()` under `/var` → `/private/var` —
+is legitimate and not attacker-committed), `Load` / `LoadRetired` still READ
+through a symlinked component (disclosure into the prompt, not a write
+escape), and the lstat→`MkdirAll` window against a concurrent host-side
+writer is accepted for the runner's own detached checkout. Pinned by
+`TestWrite_RefusesSymlinkedDirComponent`, `TestWrite_RefusesSymlinkedLeaf`,
+`TestWriteRetired_RefusesSymlinkedLedger` (real `os.Symlink`, outside dir
+asserted empty / target bytes unchanged) and
+`TestRefuseSymlinks_NonDirectoryComponentAndMissingTail`; the `..` /
+absolute refusals by `TestRefuseSymlinks_RejectsParentAndAbsoluteRel`.
 
 Hand-authored YAML trap: a value carrying ` #` (a reason like
 `behaviour replaced by #3327`) MUST be quoted, or YAML reads the tail as a
@@ -51,7 +81,9 @@ lose it (`testdata/retired.yaml` shows the quoted form).
 for a malformed one (undecodable, unknown field, entry without `id`).
 `MergeRetired(existing, incoming)` is idempotent on `id` and KEEPS the
 existing entry whole on a duplicate id — the reason recorded first is the
-reason that survives. `WriteRetired` is atomic.
+reason that survives. `WriteRetired` is atomic and shares `Write`'s
+`writeAtomic` helper, so a symlinked `retired.yaml` (or a symlinked
+component above it under `dir`) is refused the same way.
 
 ## Sampling — `Sample(list, cap, seed)`
 
