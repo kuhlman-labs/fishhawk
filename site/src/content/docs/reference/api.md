@@ -25,7 +25,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **121 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **127 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -150,5 +150,11 @@ The v0 REST API exposes **121 operations** across the paths below, generated fro
 | `GET` | `/v0/dev/fixtures` | List the seeded fixture scenarios (dev only) |
 | `POST` | `/v0/dev/fixtures` | Materialize a seeded fixture scenario (dev only) |
 | `POST` | `/v0/dev/sign` | Sign a raw body with a run's Ed25519 private key (dev only) |
+| `GET` | `/v0/dev/forge` | Snapshot the in-process stub forge (dev only) |
+| `DELETE` | `/v0/dev/forge` | Reset the in-process stub forge (dev only) |
+| `GET` | `/v0/dev/forge/issues` | Read one stub forge issue (dev only) |
+| `POST` | `/v0/dev/forge/issues` | Seed one stub forge issue (dev only) |
+| `POST` | `/v0/dev/forge/pulls` | Seed one stub forge pull / merge request (dev only) |
+| `POST` | `/v0/dev/forge/deliveries` | Sign and dispatch a webhook delivery in-process (dev only) |
 
 <!-- END GENERATED api -->

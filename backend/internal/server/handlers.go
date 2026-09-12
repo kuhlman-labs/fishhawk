@@ -138,6 +138,17 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST /v0/dev/fixtures", s.devLoopbackOnly(s.handleDevApplyFixture))
 		mux.HandleFunc("POST /v0/dev/sign", s.devLoopbackOnly(s.handleDevSign))
 	}
+	// Dev-only stub-forge control surface (E72.3 / #3327): registered ONLY
+	// when an in-process stub forge is configured, same absent-not-disabled
+	// posture and loopback-only wrap as the fixture surface (devforge.go).
+	if s.cfg.DevStubForge != nil {
+		mux.HandleFunc("GET /v0/dev/forge", s.devLoopbackOnly(s.handleDevForgeSnapshot))
+		mux.HandleFunc("DELETE /v0/dev/forge", s.devLoopbackOnly(s.handleDevForgeReset))
+		mux.HandleFunc("GET /v0/dev/forge/issues", s.devLoopbackOnly(s.handleDevForgeGetIssue))
+		mux.HandleFunc("POST /v0/dev/forge/issues", s.devLoopbackOnly(s.handleDevForgeSeedIssue))
+		mux.HandleFunc("POST /v0/dev/forge/pulls", s.devLoopbackOnly(s.handleDevForgeSeedPull))
+		mux.HandleFunc("POST /v0/dev/forge/deliveries", s.devLoopbackOnly(s.handleDevForgeDeliver))
+	}
 	mux.HandleFunc("POST /v0/runs/{run_id}/signing-key", s.requireRunAccount(adminWrite, s.handleIssueSigningKey))
 	mux.HandleFunc("POST /v0/runs/{run_id}/trace", s.requireRunAccount(memberWrite, s.handleShipTrace))
 	mux.HandleFunc("POST /v0/runs/{run_id}/plan", s.requireRunAccount(memberWrite, s.handleShipPlan))

@@ -32,6 +32,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -118,6 +119,15 @@ type Config struct {
 	// learns the paths. Wired by fishhawkd --dev-fixtures with a database;
 	// never set in production. Contract: devfixtures.go.
 	DevFixtures DevFixtureApplier
+
+	// DevStubForge is the dev-only in-process stub forge (E72.3 / #3327).
+	// Non-nil REGISTERS the six loopback-only /v0/dev/forge* control
+	// routes (snapshot, reset, seed/read issues, seed pulls, signed
+	// in-process webhook delivery); nil leaves the surface absent — the
+	// mux never learns the paths. Wired by fishhawkd --dev-stub-forge,
+	// which also points GitHub / the gitlab forge at the same stub; never
+	// set in production. Contract: devforge.go.
+	DevStubForge *stub.Forge
 
 	// AuditRepo writes the audit log entries that pair with every
 	// state change. Wired by the trace-upload handler; nil leaves
