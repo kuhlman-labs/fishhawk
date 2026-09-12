@@ -641,8 +641,11 @@ deterministic triage.
   `stub_issue_not_found`), `POST /v0/dev/forge/pulls` (seed a pull /
   merge request with its merge facts; 201), and `POST
   /v0/dev/forge/deliveries` `{forge, event, delivery_id?, payload}` — the
-  load-bearing one: it re-marshals `payload`, signs it exactly as the real
-  receiver verifies it (`X-Hub-Signature-256` via
+  load-bearing one: it sends the `payload` bytes VERBATIM (object-ness is
+  proven by decoding the top level into `map[string]json.RawMessage`, never
+  a `map[string]any` re-marshal, which rounds integers above 2^53 through
+  float64 and would deliver a different identifier than the one seeded),
+  signs them exactly as the real receiver verifies them (`X-Hub-Signature-256` via
   `stub.SignGitHubDelivery(cfg.GitHubWebhookSecret, body)`;
   `X-Gitlab-Token` = `cfg.GitLabWebhookSecret` verbatim), mints a UUID
   delivery id when absent, and dispatches the request IN-PROCESS through

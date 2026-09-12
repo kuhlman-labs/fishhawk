@@ -85,10 +85,14 @@ type devForgePullRequest struct {
 }
 
 // devForgeDeliveryRequest is the POST /v0/dev/forge/deliveries body.
-// Payload is the webhook event object exactly as the forge would send it;
-// it is re-marshaled before signing, so key ORDER may differ from the
-// caller's input — harmless, because the signature is computed over the
-// bytes this route sends, which are the bytes the receiver verifies.
+// Payload is the webhook event object exactly as the forge would send it.
+// The bytes the route signs and sends are the payload's bytes VERBATIM —
+// never decoded into map[string]any and re-marshaled, which would round
+// every number through float64 and silently turn an identifier above
+// 2^53 (9007199254740993) into a neighbouring even integer, so the
+// receiver would consume a different id than the one seeded. Object-ness
+// is proven by decoding the top level into map[string]json.RawMessage,
+// which validates the whole document without re-encoding any value.
 type devForgeDeliveryRequest struct {
 	Forge      string          `json:"forge"`
 	Event      string          `json:"event"`
@@ -338,18 +342,18 @@ func (s *Server) handleDevForgeDeliver(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The payload must be a JSON object: a webhook body is always an
-	// object, and re-marshaling through map[string]any also proves it
-	// decodes so a truncated literal never reaches the signer.
-	var payload map[string]any
-	if len(req.Payload) == 0 || json.Unmarshal(req.Payload, &payload) != nil || payload == nil {
+	// object, and decoding the top level into raw members proves the whole
+	// document parses (so a truncated literal never reaches the signer)
+	// WITHOUT re-encoding any value. The body sent is the payload's bytes
+	// verbatim: a re-marshal through map[string]any would round integers
+	// above 2^53 through float64 and deliver a different identifier than
+	// the one the caller seeded (TestDevForge_Deliver_PreservesLargeIntegers).
+	var members map[string]json.RawMessage
+	if len(req.Payload) == 0 || json.Unmarshal(req.Payload, &members) != nil || members == nil {
 		s.writeDevForgeAddressError(w, r, "payload", "payload must be a JSON object")
 		return
 	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		s.writeDevForgeAddressError(w, r, "payload", "payload could not be re-encoded: "+err.Error())
-		return
-	}
+	body := []byte(req.Payload)
 	deliveryID := req.DeliveryID
 	if deliveryID == "" {
 		deliveryID = uuid.NewString()

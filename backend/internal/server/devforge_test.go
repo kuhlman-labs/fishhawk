@@ -19,6 +19,7 @@ import (
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -61,7 +62,9 @@ type devForgeAudit struct {
 	seq     int64
 }
 
-func (a *devForgeAudit) seedLinkage(t *testing.T, family, parentRepo string, parentIssue, contractChild int) {
+// linkagePayloadJSON is the split_children_filed payload the watcher keys
+// on, shared by the in-memory fake and the Postgres-backed end-to-end case.
+func linkagePayloadJSON(t *testing.T, family, parentRepo string, parentIssue, contractChild int) json.RawMessage {
 	t.Helper()
 	payload, err := json.Marshal(splitChildrenFiledPayload{
 		ContractClassification: "contract",
@@ -74,6 +77,12 @@ func (a *devForgeAudit) seedLinkage(t *testing.T, family, parentRepo string, par
 	if err != nil {
 		t.Fatalf("marshal linkage payload: %v", err)
 	}
+	return payload
+}
+
+func (a *devForgeAudit) seedLinkage(t *testing.T, family, parentRepo string, parentIssue, contractChild int) {
+	t.Helper()
+	payload := linkagePayloadJSON(t, family, parentRepo, parentIssue, contractChild)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.seq++
@@ -142,7 +151,7 @@ const (
 // stub. The sibling board-sync reconciler on the same issues.closed event
 // has its conventions loader stubbed to a hard error so it exits at once
 // (the split_parent_close_test.go pattern).
-func newDevForgeServer(t *testing.T, st *stub.Forge, au *devForgeAudit, opts ...func(*Config)) *Server {
+func newDevForgeServer(t *testing.T, st *stub.Forge, au audit.Repository, opts ...func(*Config)) *Server {
 	t.Helper()
 	prev := conventionsLoader
 	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
@@ -780,5 +789,219 @@ func TestDevForge_UnsignedDeliveryIsRefusedByReceiver(t *testing.T) {
 	}, body)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("unsigned delivery status = %d, want 401\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestDevForge_Deliver_PreservesLargeIntegers is the boundary-value pin
+// for the delivery contract: the payload bytes are signed and dispatched
+// VERBATIM. A contract child numbered 2^53+1 (9007199254740993) is exactly
+// representable as an int but NOT as a float64, so a route that decoded
+// the payload into map[string]any and re-marshaled it would deliver
+// 9007199254740992 — an identifier the seeded linkage does not name — and
+// the watcher would leave the parent open. Both families are driven
+// through the real receivers so the assertion is on the COMMITTED parent
+// state, not on the bytes the test believes it sent.
+func TestDevForge_Deliver_PreservesLargeIntegers(t *testing.T) {
+	const bigChild = 9007199254740993 // 2^53 + 1
+	// Sanity: the fixture must straddle float64 precision, or the test
+	// cannot discriminate a verbatim body from a re-marshaled one.
+	if float64(bigChild) != float64(bigChild-1) {
+		t.Fatalf("test fixture %d must not be exactly representable as float64", bigChild)
+	}
+	t.Run("github", func(t *testing.T) {
+		st := stub.New()
+		au := &devForgeAudit{}
+		au.seedLinkage(t, "github", devForgeRepo, devForgeParent, bigChild)
+		s := newDevForgeServer(t, st, au)
+		seedIssue(t, s, map[string]any{"forge": "github", "repo": devForgeRepo, "number": devForgeParent})
+		res := deliver(t, s, map[string]any{
+			"forge": "github", "event": "issues",
+			"payload": githubIssuesClosedPayload(devForgeRepo, bigChild),
+		})
+		if res.Status != http.StatusAccepted {
+			t.Fatalf("receiver status = %d, want 202 (body %s)", res.Status, res.Body)
+		}
+		parent := readIssue(t, s, fmt.Sprintf("forge=github&repo=%s&number=%d", devForgeRepo, devForgeParent))
+		if parent.State != "closed" {
+			t.Fatalf("parent state = %q, want closed: the delivered issue.number did not match the seeded contract child %d (a float64 round-trip would deliver %d)", parent.State, bigChild, bigChild-1)
+		}
+		if len(parent.Comments) != 1 || !strings.Contains(parent.Comments[0], "#"+fmt.Sprint(bigChild)) {
+			t.Errorf("linking comment must name the contract child #%d verbatim: %v", bigChild, parent.Comments)
+		}
+	})
+	t.Run("gitlab", func(t *testing.T) {
+		st := stub.New()
+		au := &devForgeAudit{}
+		au.seedLinkage(t, "gitlab", devForgeRepo, devForgeParent, bigChild)
+		s := newDevForgeServer(t, st, au)
+		seedIssue(t, s, map[string]any{"forge": "gitlab", "repo": devForgeRepo, "project_id": devForgeProjectID, "number": devForgeParent})
+		res := deliver(t, s, map[string]any{
+			"forge": "gitlab", "event": "Issue Hook",
+			"payload": gitlabIssueClosePayload(devForgeProjectID, devForgeRepo, bigChild),
+		})
+		if res.Status != http.StatusAccepted {
+			t.Fatalf("receiver status = %d, want 202 (body %s)", res.Status, res.Body)
+		}
+		parent := readIssue(t, s, fmt.Sprintf("forge=gitlab&project_id=%d&number=%d", devForgeProjectID, devForgeParent))
+		if parent.State != "closed" {
+			t.Fatalf("parent state = %q, want closed: the delivered object_attributes.iid did not match the seeded contract child %d (a float64 round-trip would deliver %d)", parent.State, bigChild, bigChild-1)
+		}
+		if len(parent.Comments) != 1 || !strings.Contains(parent.Comments[0], "#"+fmt.Sprint(bigChild)) {
+			t.Errorf("linking note must name the contract child #%d verbatim: %v", bigChild, parent.Comments)
+		}
+	})
+}
+
+// devForgeBodyOfLen returns a syntactically valid JSON body for the route
+// whose total length is exactly n bytes: the fixed fields plus a "pad"
+// string (a seed's issue body / a delivery payload member) sized to fit.
+func devForgeBodyOfLen(t *testing.T, prefix, suffix string, n int) []byte {
+	t.Helper()
+	pad := n - len(prefix) - len(suffix)
+	if pad < 0 {
+		t.Fatalf("body of %d bytes cannot hold %d bytes of fixed fields", n, len(prefix)+len(suffix))
+	}
+	b := prefix + strings.Repeat("x", pad) + suffix
+	if len(b) != n || !json.Valid([]byte(b)) {
+		t.Fatalf("fixture body is %d bytes / valid=%v, want %d bytes of valid JSON", len(b), json.Valid([]byte(b)), n)
+	}
+	return []byte(b)
+}
+
+// TestDevForge_BodyCap pins the devForgeMaxBodyBytes boundary that
+// decodeDevForgeBody enforces via http.MaxBytesReader, on BOTH mutating
+// routes: a body of exactly the cap is accepted, one byte over is refused
+// 400 validation_failed BEFORE any mutation (the oversized seed leaves no
+// record — GET answers 404) or dispatch (the oversized delivery's id is
+// never marked seen by the receiver's dedup store, so a later Mark of the
+// same id is a first write). Removing MaxBytesReader accepts both
+// oversized bodies and turns each assertion red.
+func TestDevForge_BodyCap(t *testing.T) {
+	store := webhook.NewMemoryStore(0)
+	st := stub.New()
+	s := newDevForgeServer(t, st, nil, func(c *Config) { c.WebhookDeliveries = store })
+
+	t.Run("seed at cap accepted", func(t *testing.T) {
+		body := devForgeBodyOfLen(t, `{"forge":"github","repo":"o/r","number":1,"body":"`, `"}`, devForgeMaxBodyBytes)
+		w := devRequest(t, s, http.MethodPost, "/v0/dev/forge/issues", body, devLoopbackPeer, nil)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("seed of exactly %d bytes: status = %d, want 201\n%.200s", devForgeMaxBodyBytes, w.Code, w.Body.String())
+		}
+	})
+	t.Run("seed over cap refused before mutation", func(t *testing.T) {
+		body := devForgeBodyOfLen(t, `{"forge":"github","repo":"o/r","number":2,"body":"`, `"}`, devForgeMaxBodyBytes+1)
+		w := devRequest(t, s, http.MethodPost, "/v0/dev/forge/issues", body, devLoopbackPeer, nil)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("seed of %d bytes: status = %d, want 400\n%.200s", devForgeMaxBodyBytes+1, w.Code, w.Body.String())
+		}
+		if code := decodeErrorCode(t, w); code != "validation_failed" {
+			t.Errorf("error code = %q, want validation_failed", code)
+		}
+		if _, ok := st.GetIssue("github", "o/r", 0, 2); ok {
+			t.Error("an oversized seed must not reach the stub, but o/r#2 was stored")
+		}
+		if w := devRequest(t, s, http.MethodGet, "/v0/dev/forge/issues?forge=github&repo=o/r&number=2", nil, devLoopbackPeer, nil); w.Code != http.StatusNotFound {
+			t.Errorf("GET after the refused seed: status = %d, want 404", w.Code)
+		}
+	})
+	t.Run("delivery over cap refused before dispatch", func(t *testing.T) {
+		body := devForgeBodyOfLen(t, `{"forge":"github","event":"ping","delivery_id":"cap-1","payload":{"pad":"`, `"}}`, devForgeMaxBodyBytes+1)
+		w := devRequest(t, s, http.MethodPost, "/v0/dev/forge/deliveries", body, devLoopbackPeer, nil)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("delivery of %d bytes: status = %d, want 400\n%.200s", devForgeMaxBodyBytes+1, w.Code, w.Body.String())
+		}
+		if code := decodeErrorCode(t, w); code != "validation_failed" {
+			t.Errorf("error code = %q, want validation_failed", code)
+		}
+		if err := store.Mark("cap-1"); err != nil {
+			t.Errorf("Mark(cap-1) after the refused delivery = %v, want nil: the receiver must never have seen it", err)
+		}
+	})
+	t.Run("delivery at cap dispatched", func(t *testing.T) {
+		body := devForgeBodyOfLen(t, `{"forge":"github","event":"ping","delivery_id":"cap-2","payload":{"pad":"`, `"}}`, devForgeMaxBodyBytes)
+		w := devRequest(t, s, http.MethodPost, "/v0/dev/forge/deliveries", body, devLoopbackPeer, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("delivery of exactly %d bytes: status = %d, want 200\n%.200s", devForgeMaxBodyBytes, w.Code, w.Body.String())
+		}
+		if err := store.Mark("cap-2"); !errors.Is(err, webhook.ErrDeliveryDuplicate) {
+			t.Errorf("Mark(cap-2) after the dispatched delivery = %v, want ErrDeliveryDuplicate (the receiver marked it)", err)
+		}
+	})
+}
+
+// TestDevForge_ParentClosedObservation_PostgresAudit_ReadableAnonymously
+// closes the observation-path gap in approval condition 1 with REAL
+// storage: the audit repository is the Postgres-backed one (pgtest), the
+// linkage row is written through the real AppendGlobalChained, the
+// watcher's split_parent_closed row lands in the real audit_entries table
+// (untenanted, account_id NULL), and it is read back through GET
+// /v0/audit?category=split_parent_closed with NO Authorization header —
+// the real handler, the real ListAll (ListAuditEntriesAll's
+// `$3 IS NULL OR account_id = $3 OR account_id IS NULL` filter, with the
+// anonymous caller's empty AccountID mapping to a NULL $3), the real rows.
+// Whether a watcher-WRITTEN row is visible to the credential-free
+// acceptance agent is therefore established here, not assumed from the
+// in-memory fake's documented semantics.
+func TestDevForge_ParentClosedObservation_PostgresAudit_ReadableAnonymously(t *testing.T) {
+	ctx := context.Background()
+	systemKind := audit.ActorSystem
+	for _, tc := range []struct {
+		family, event string
+		seed          map[string]any
+		payload       map[string]any
+		query         string
+	}{
+		{
+			family: "github", event: "issues",
+			seed:    map[string]any{"forge": "github", "repo": devForgeRepo, "number": devForgeParent},
+			payload: githubIssuesClosedPayload(devForgeRepo, devForgeContract),
+			query:   fmt.Sprintf("forge=github&repo=%s&number=%d", devForgeRepo, devForgeParent),
+		},
+		{
+			family: "gitlab", event: "Issue Hook",
+			seed:    map[string]any{"forge": "gitlab", "repo": devForgeRepo, "project_id": devForgeProjectID, "number": devForgeParent},
+			payload: gitlabIssueClosePayload(devForgeProjectID, devForgeRepo, devForgeContract),
+			query:   fmt.Sprintf("forge=gitlab&project_id=%d&number=%d", devForgeProjectID, devForgeParent),
+		},
+	} {
+		t.Run(tc.family, func(t *testing.T) {
+			pool := pgtest.NewPool(t)
+			au := audit.NewPostgresRepository(pool)
+			if _, err := au.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
+				Timestamp: time.Now().UTC(),
+				Category:  splitChildrenFiledCategory,
+				ActorKind: &systemKind,
+				Payload:   linkagePayloadJSON(t, tc.family, devForgeRepo, devForgeParent, devForgeContract),
+			}); err != nil {
+				t.Fatalf("seed linkage row: %v", err)
+			}
+			s := newDevForgeServer(t, stub.New(), au)
+			seedIssue(t, s, tc.seed)
+			for i := 0; i < 2; i++ {
+				if res := deliver(t, s, map[string]any{"forge": tc.family, "event": tc.event, "payload": tc.payload}); res.Status != http.StatusAccepted {
+					t.Fatalf("delivery %d: receiver status = %d, want 202 (body %s)", i, res.Status, res.Body)
+				}
+			}
+			if parent := readIssue(t, s, tc.query); parent.State != "closed" {
+				t.Fatalf("parent state = %q, want closed", parent.State)
+			}
+			// The persisted row is untenanted — the precondition the
+			// NULL-allow filter keys on — and both observations come back
+			// through the anonymous HTTP read, newest first.
+			cat := splitParentClosedCategory
+			rows, err := au.ListAll(ctx, audit.ListAllParams{Category: &cat})
+			if err != nil {
+				t.Fatalf("ListAll: %v", err)
+			}
+			if len(rows) != 2 {
+				t.Fatalf("persisted %d split_parent_closed rows, want 2", len(rows))
+			}
+			for _, e := range rows {
+				if e.AccountID != nil || e.RunID != nil {
+					t.Errorf("watcher row account_id=%v run_id=%v, want both NULL (untenanted global-chain row)", e.AccountID, e.RunID)
+				}
+			}
+			assertParentClosedObservations(t, s, devForgeRepo, splitParentOutcomeClosed, splitParentOutcomeAlreadyClosed)
+		})
 	}
 }

@@ -17788,9 +17788,11 @@ paths:
         via `GET /v0/dev/forge/issues`. The receiver's own verdict is
         REPORTED in `status`/`body`, never mapped: 202 accepted (also
         for a duplicate `delivery_id`, which the dedup store acknowledges
-        without re-running consumers), 4xx malformed. `payload` is
-        re-marshaled before signing, so key order may differ from the
-        input — harmless, the signature covers the bytes actually sent.
+        without re-running consumers), 4xx malformed. `payload` is signed
+        and delivered VERBATIM — never re-marshaled — so key order and
+        every numeric value (including identifiers above 2^53, which a
+        float64 round-trip would alter) reach the receiver exactly as
+        sent.
         A GitHub `issues` payload needs `installation.id`,
         `repository.full_name` and `issue.number`; a GitLab `Issue Hook`
         payload needs `project.id`, `project.path_with_namespace` and

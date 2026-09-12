@@ -3585,9 +3585,9 @@ func writeAcceptanceStubForge(b *strings.Builder) {
 		"no polling. A GitHub `issues` payload needs `installation.id`, " +
 		"`repository.full_name`, `action` and `issue.number`; a GitLab `Issue Hook` " +
 		"payload needs `project.id`, `project.path_with_namespace`, " +
-		"`object_attributes.iid` and `object_attributes.action`. The payload object is " +
-		"re-marshaled before signing, so key order may differ from your input; that is " +
-		"harmless.\n")
+		"`object_attributes.iid` and `object_attributes.action`. The payload bytes are " +
+		"signed and delivered VERBATIM (no re-marshal), so key order and every numeric " +
+		"value, including identifiers above 2^53, reach the receiver exactly as sent.\n")
 	b.WriteString("- The `split-parent-linked` seeded scenario (via `POST /v0/dev/fixtures`) " +
 		"supplies the `split_children_filed` linkage rows that the parent-close watcher " +
 		"reads — parent `stub/parent-close#100`, contract child `#103`, one row per forge " +
