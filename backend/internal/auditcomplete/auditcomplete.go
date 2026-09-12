@@ -285,10 +285,12 @@ func ReviewPresent(in ReviewPresenceInputs) (present, backstopElapsed bool) {
 type PRHeadFetcher func(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, prNumber int) (headSHA string, err error)
 
 // HeadReportCategoriesByPrecedence lists a run's own-chain head-reporting
-// audit categories in DESCENDING precedence (#1682): the newest fixup_pushed
-// head (the most recently pushed commit) wins over a child_pushed head, which
-// wins over the pull_request_opened (PR-open) head. Within a category the
-// winner is the highest-sequence entry.
+// audit categories in DESCENDING precedence (#1682): the acceptance runner's
+// acceptance_scenarios_pushed head (E72.4 / #3328 — the post-verdict
+// scenario-corpus commit, always the newest run-authored commit when present)
+// wins over the newest fixup_pushed head, which wins over a child_pushed
+// head, which wins over the pull_request_opened (PR-open) head. Within a
+// category the winner is the highest-sequence entry.
 //
 // This single ordering is the shared enabler consumed by BOTH the server-side
 // resolver (server.latestRunHeadSHA — acceptance head binding + Option C's
@@ -297,7 +299,7 @@ type PRHeadFetcher func(ctx context.Context, scope forge.CredentialScope, repo f
 // resolution between the acceptance/retry path and audit_complete publishing is
 // exactly the failure this centralization prevents: both import this package so
 // they cannot drift.
-var HeadReportCategoriesByPrecedence = []string{"fixup_pushed", "child_pushed", "pull_request_opened"}
+var HeadReportCategoriesByPrecedence = []string{"acceptance_scenarios_pushed", "fixup_pushed", "child_pushed", "pull_request_opened"}
 
 // LatestReportedHeadSHA applies HeadReportCategoriesByPrecedence to a run's
 // chained audit entries: for the highest-precedence category that carries at

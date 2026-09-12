@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -1647,4 +1648,95 @@ func localSeamAcceptanceBody(t *testing.T, notes string) []byte {
 		t.Fatal(err)
 	}
 	return body
+}
+
+// TestAcceptanceReplayRoundTrip is the cross-boundary E72.4 / #3328 seam on ONE
+// server: an approved retire_scenario (recorded on the approval chain with its
+// reason) reaches the acceptance prompt as a FULL entry with pr filled from the
+// pull_request_opened ledger (742); the SHARED replay golden ships through the
+// real ingest and records a regression attributed to PR #742 (never issue
+// 101), routed class 1; the runner's acceptance_scenarios_pushed report then
+// lands as a reported-head ledger row, so LatestReportedHeadSHA moves to the
+// scenario head while acceptance_outcome_recorded.head_sha stays the
+// pre-scenario head, the acceptance stage is not reopened, and the run stays
+// merge-eligible.
+func TestAcceptanceReplayRoundTrip(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	au := s.cfg.AuditRepo.(*auditFake)
+	rr := s.cfg.RunRepo.(*promptRunRepo)
+	planStageID := rr.stagesByRunID[runID][0].ID
+	const preHead = "1111111111111111111111111111111111111111"
+	const scenarioHead = "3333333333333333333333333333333333333333"
+	base := time.Now().Add(-time.Minute)
+	seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{"head_sha": preHead, "branch": "fishhawk/run-x/stage-y", "pr_number": 742})
+	au.seeded[len(au.seeded)-1].Timestamp = base
+	seedHeadEntry(au, runID, &acceptanceStageID, CategoryAcceptanceDispatched, 2, map[string]any{"stage_id": acceptanceStageID.String()})
+	au.seeded[len(au.seeded)-1].Timestamp = base.Add(time.Second)
+	seedHeadEntry(au, runID, &planStageID, "approval_submitted", 3, map[string]any{
+		"stage_id": planStageID.String(), "decision": "approve",
+		"retired_scenarios": []retiredScenarioEntry{{ID: "scenario:issue-101/crit-b", Reason: "behaviour replaced", RunID: runID.String(), RetiredAt: "2026-09-12T00:00:00Z"}},
+	})
+
+	// 1. Prompt fetch: the full entry + PR 742 + run branch.
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.AcceptancePullRequestNumber != 742 || resp.AcceptanceRunBranch != "fishhawk/run-x/stage-y" ||
+		len(resp.AcceptanceRetiredScenarios) != 1 || resp.AcceptanceRetiredScenarios[0].Reason != "behaviour replaced" || resp.AcceptanceRetiredScenarios[0].PR != 742 {
+		t.Fatalf("prompt replay fields = pr %d branch %q retired %+v", resp.AcceptancePullRequestNumber, resp.AcceptanceRunBranch, resp.AcceptanceRetiredScenarios)
+	}
+
+	// 2. Ship the shared golden through the real ingest.
+	golden := wireGoldenAcceptanceReplayBytes(t)
+	w = shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, golden, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("acceptance status = %d:\n%s", w.Code, w.Body.String())
+	}
+	outcome := findAppendedByCategory(t, au, CategoryAcceptanceOutcomeRecorded)
+	var op map[string]any
+	_ = json.Unmarshal(outcome.Payload, &op)
+	if op["head_sha"] != preHead {
+		t.Errorf("outcome head_sha = %v, want the pre-scenario head", op["head_sha"])
+	}
+	replay, _ := op["replay"].(map[string]any)
+	if replay["cap"] != float64(1) || replay["corpus_size"] != float64(4) || replay["sampled_out"] != float64(3) || replay["served"] != float64(1) {
+		t.Errorf("outcome replay header = %v, want the golden's cap 1 / corpus_size 4 / sampled_out 3 / served 1", replay)
+	}
+	reg := findAppendedByCategory(t, au, CategoryAcceptanceScenarioRegression)
+	var rp map[string]any
+	_ = json.Unmarshal(reg.Payload, &rp)
+	if rp["origin_pr"] != float64(742) || rp["origin_pr"] == float64(101) {
+		t.Errorf("regression origin_pr = %v, want 742", rp["origin_pr"])
+	}
+	triage := findAppendedByCategory(t, au, CategoryAcceptanceTriageDecided)
+	if !strings.Contains(string(triage.Payload), `"class":"1"`) {
+		t.Errorf("triage payload = %s, want class 1", triage.Payload)
+	}
+
+	// 3. The runner's scenario-corpus push report lands as a ledger row.
+	pushed := []byte(`{"outcome":"acceptance_scenarios_pushed","branch":"fishhawk/run-x/stage-y","head_sha":"` + scenarioHead + `","base_sha":"` + preHead + `","scenario_ids":["scenario:issue-101/crit-a"],"retired":[{"id":"scenario:issue-101/crit-b","reason":"behaviour replaced","run_id":"` + runID.String() + `","pr":742,"retired_at":"2026-09-12T00:00:00Z"}]}`)
+	w = shipPRRequest(t, s, runID, acceptanceStageID, priv, pushed, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("scenarios-pushed status = %d:\n%s", w.Code, w.Body.String())
+	}
+	latest, ok, err := s.latestRunHeadSHA(context.Background(), runID)
+	if err != nil || !ok || latest != scenarioHead {
+		t.Errorf("LatestReportedHeadSHA = %q/%v/%v, want the scenario head", latest, ok, err)
+	}
+	if n := countByCategory(au, CategoryAcceptanceReopened); n != 0 {
+		t.Errorf("acceptance_reopened = %d, want 0", n)
+	}
+	// The recorded outcome is untouched by the push: still bound to preHead.
+	outcome2 := findAppendedByCategory(t, au, CategoryAcceptanceOutcomeRecorded)
+	if !strings.Contains(string(outcome2.Payload), `"head_sha":"`+preHead+`"`) {
+		t.Errorf("outcome rebound after the scenario push: %s", outcome2.Payload)
+	}
+	if !strings.Contains(string(findAppendedByCategory(t, au, CategoryAcceptanceScenariosPushed).Payload), `"reason":"behaviour replaced"`) {
+		t.Errorf("scenarios_pushed entry lost the retirement reason")
+	}
 }

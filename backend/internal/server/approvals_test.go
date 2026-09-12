@@ -11016,3 +11016,26 @@ func TestSubmitApproval_BudgetCheck_CrossingAppendFails_GateUnaffected(t *testin
 		t.Errorf("approval rows = %d (err=%v), want 0", len(rows), err)
 	}
 }
+
+// TestRetiredScenarioEntriesFor (E72.4 / #3328): the approval audit row's
+// retired_scenarios record is built ONLY from retire_scenario amendments —
+// criterion retire/restate entries never produce one — and each entry carries
+// the reason, the run id, pr 0 (filled later from the ledger) and an RFC3339
+// retired_at. nil when the approve retired no scenario, so the payload key is
+// omitted and the row is byte-identical to today.
+func TestRetiredScenarioEntriesFor(t *testing.T) {
+	runID := uuid.New()
+	now := time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC)
+	got := retiredScenarioEntriesFor(runID, []acceptanceCriteriaAmendment{
+		{ID: "crit-1", Action: acceptanceAmendActionRetire, Reason: "not this"},
+		{ID: "crit-2", Action: acceptanceAmendActionRestate, Reason: "nor this", Statement: "s"},
+		{ID: "scenario:issue-101/crit-b", Action: acceptanceAmendActionRetireScenario, Reason: "behaviour replaced"},
+	}, now)
+	want := []retiredScenarioEntry{{ID: "scenario:issue-101/crit-b", Reason: "behaviour replaced", RunID: runID.String(), PR: 0, RetiredAt: "2026-09-12T10:00:00Z"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("retiredScenarioEntriesFor = %+v, want %+v", got, want)
+	}
+	if got := retiredScenarioEntriesFor(runID, []acceptanceCriteriaAmendment{{ID: "crit-1", Action: acceptanceAmendActionRetire, Reason: "r"}}, now); got != nil {
+		t.Errorf("criterion-only amendments must yield nil, got %+v", got)
+	}
+}

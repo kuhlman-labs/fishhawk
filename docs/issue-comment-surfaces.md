@@ -305,6 +305,33 @@ Notes:
     payload; a malformed payload degrades to a count-free phrase). Deduped on
     the `clarification_requested` `Sequence`.
   - **CI failure** — `ci_failure_retry_dispatched` / `ci_retry_exhausted`.
+  - **Acceptance scenario-corpus reports (E72.4, #3328)** — two audit-only
+    kinds written by `server/pullrequest.go` on the acceptance runner's
+    post-verdict report, each followed by a `notifyStatusUpdate` anchor
+    rebuild (no new comment surface, no page-class ping):
+    `acceptance_scenarios_pushed` `{branch, head_sha, base_sha, scenario_ids,
+    scenario_count, retired: [{id, reason, run_id, pr, retired_at}]}` — the
+    run-authored scenario-corpus commit (a reported-head ledger row, first in
+    `auditcomplete.HeadReportCategoriesByPrecedence`; NO stage transition, NO
+    acceptance reopen); and `acceptance_scenario_retirement_dropped`
+    `{retired: [...full entries], scenario_ids, reason}` — an APPROVED
+    `retire_scenario` the runner could not persist (it exited after the prompt
+    fetch on a path that pushed no ledger commit: `persist_failed`,
+    `persist_refused`, `no_run_branch`, a pre-spawn guard, a verdict validation
+    failure). **The audit entry is the operator-visible surface for the drop
+    today, NOT the status comment:** the `notifyStatusUpdate` refresh rebuilds
+    the anchor, but `status_template.go`'s closed `activityCategories` set does
+    not admit `acceptance_scenario_retirement_dropped`, so the rebuild renders
+    NO line for it — read the ids and reasons from `GET /v0/runs/{run_id}/audit`.
+    Rendering each dropped id and reason on the anchor (a category entry plus a
+    `renderAcceptanceRetirementDroppedLine` case) is a tracked follow-up, kept
+    out of #3328 to stay under the implement stage's file cap. A
+    third kind, `acceptance_scenario_regression` `{scenario_id, origin_pr?,
+    origin_issue, origin_run_id, path, origin_unresolved?, observed, expected,
+    repro_handle}`, is written by `server/acceptance.go` per FAILED replayed
+    scenario row and reaches the operator through the class-1 triage route
+    (a synthesized concern naming `PR #<origin_pr>` or `(originating PR
+    unknown)`), not through its own comment.
   - **Acceptance triage decision (E31.8, #1536)** — `acceptance_triage_decided`.
     A failed acceptance verdict was triaged (`server/acceptance.go::triageAcceptanceFailure`)
     and the disposition needs a human — the paged variants only (`paged`,

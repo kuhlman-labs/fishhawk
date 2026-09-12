@@ -1,0 +1,18 @@
+# A well-formed corpus entry: the shape Write emits and Load reads back.
+# origin.pr is 0 here on purpose — an UNKNOWN originating PR is a valid
+# record, not a load error.
+id: scenario:issue-101/crit-b
+statement: Opening a run parks it at the plan gate
+verify_hint: POST /v0/runs then GET the run and read status
+seed: split-parent-linked
+steps: POST /v0/runs with the fixture body; GET /v0/runs/{id}; read `status`
+assertions:
+  expected: status is awaiting_plan_approval
+  observed_at_record: status was awaiting_plan_approval
+  repro_handle: curl -s localhost:8090/v0/runs/abc
+origin:
+  issue: 101
+  pr: 0
+  run_id: 11111111-1111-1111-1111-111111111111
+  head_sha: 0123456789abcdef0123456789abcdef01234567
+  recorded_at: 2026-09-01T10:00:00Z

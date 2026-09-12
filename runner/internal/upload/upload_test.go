@@ -13,6 +13,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/reachability"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/scenario"
 )
 
 // fakeBackend builds a httptest.Server with handlers that mimic the
@@ -3375,5 +3380,173 @@ func TestShipPullRequest_ConflictResolutionPushedBody(t *testing.T) {
 	}
 	if got["files_changed_count"] != float64(2) {
 		t.Errorf("files_changed_count = %v, want 2", got["files_changed_count"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// E72.4 / #3328: replay injection, scenario-corpus report bodies, prompt fields.
+// ---------------------------------------------------------------------------
+
+func TestInjectReplay_SetsTopLevelFieldOnly(t *testing.T) {
+	body := []byte(`{"verdict":"failed","failure_mode":"assertion_fail","criteria":[{"id":"scenario:issue-101/crit-b","result":"failed"}],"notes":"n"}`)
+	set := scenario.ReplaySet{Cap: 1, CorpusSize: 4, Served: 1, SampledOut: 3, Seed: "run-1",
+		Scenarios: []scenario.ReplayedScenario{{ScenarioID: "scenario:issue-101/crit-b", OriginPR: 742, OriginIssue: 101, OriginRunID: "r", Path: "acceptance/scenarios/issue-101/crit-b.yaml"}}}
+	out, err := InjectReplay(body, set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got, want map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &want); err != nil {
+		t.Fatal(err)
+	}
+	replayRaw, _ := json.Marshal(set)
+	var replay any
+	_ = json.Unmarshal(replayRaw, &replay)
+	want["replay"] = replay
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("InjectReplay changed more than the replay field:\n got %v\nwant %v", got, want)
+	}
+	// Refusals: an existing replay field, a non-object, trailing data, null.
+	for name, in := range map[string][]byte{
+		"already carries replay": out,
+		"array":                  []byte(`[]`),
+		"trailing":               []byte(`{"verdict":"passed"}{"verdict":"failed"}`),
+		"null":                   []byte(`null`),
+	} {
+		if _, err := InjectReplay(in, set); err == nil {
+			t.Errorf("%s: want an error", name)
+		}
+	}
+	// A nil Scenarios slice marshals as [] not null so the backend decodes a
+	// list.
+	out2, err := InjectReplay(body, scenario.ReplaySet{Cap: 0, Seed: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out2), `"scenarios":[]`) {
+		t.Errorf("nil scenarios must marshal as []: %s", out2)
+	}
+}
+
+// TestInjectReplay_GoldenRoundTrip: the shared golden's own body minus its
+// replay field, re-injected with the golden's replay set, is JSON-equivalent
+// to the golden — the runner-side half of the backend's attribution seam.
+func TestInjectReplay_GoldenRoundTrip(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	golden, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "acceptance_replay_verdict.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(golden, &fields); err != nil {
+		t.Fatal(err)
+	}
+	var set scenario.ReplaySet
+	if err := json.Unmarshal(fields["replay"], &set); err != nil {
+		t.Fatal(err)
+	}
+	if len(set.Scenarios) != set.Served {
+		t.Fatalf("golden inconsistent: %d entries, served=%d", len(set.Scenarios), set.Served)
+	}
+	delete(fields, "replay")
+	stripped, _ := json.Marshal(fields)
+	out, err := InjectReplay(stripped, set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got, want any
+	_ = json.Unmarshal(out, &got)
+	_ = json.Unmarshal(golden, &want)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("re-injected body != golden:\n got %s\nwant %s", out, golden)
+	}
+}
+
+func TestShipPullRequest_AcceptanceScenarioBodies(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = nil
+		_ = json.Unmarshal(b, &got)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"stage_id":"s","outcome":"x"}`))
+	}))
+	defer srv.Close()
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	retired := []scenario.RetiredEntry{{ID: "scenario:issue-101/crit-b", Reason: "behaviour replaced", RunID: "r1", PR: 742, RetiredAt: "2026-09-12T00:00:00Z"}}
+
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+		Outcome: OutcomeAcceptanceScenariosPushed,
+		Branch:  "fishhawk/run-1", HeadSHA: "h", BaseSHA: "b",
+		ScenarioIDs: []string{"scenario:issue-101/crit-a"}, RetiredScenarios: retired,
+	}); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	for k, want := range map[string]any{"outcome": "acceptance_scenarios_pushed", "branch": "fishhawk/run-1", "head_sha": "h", "base_sha": "b"} {
+		if got[k] != want {
+			t.Errorf("body[%q] = %v, want %v", k, got[k], want)
+		}
+	}
+	if ids, _ := got["scenario_ids"].([]any); len(ids) != 1 || ids[0] != "scenario:issue-101/crit-a" {
+		t.Errorf("scenario_ids = %v", got["scenario_ids"])
+	}
+	r0, _ := got["retired"].([]any)
+	if len(r0) != 1 || r0[0].(map[string]any)["reason"] != "behaviour replaced" || r0[0].(map[string]any)["pr"] != float64(742) {
+		t.Errorf("retired = %v, want the full entry with its reason", got["retired"])
+	}
+	for _, absent := range []string{"pr_number", "title", "files_changed_count", "reason"} {
+		if _, ok := got[absent]; ok {
+			t.Errorf("pushed body must not carry %s", absent)
+		}
+	}
+
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+		Outcome: OutcomeAcceptanceScenarioRetirementDropped,
+		Reason:  "persist_failed", RetiredScenarios: retired,
+	}); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	if got["outcome"] != "acceptance_scenario_retirement_dropped" || got["reason"] != "persist_failed" {
+		t.Errorf("dropped body = %v", got)
+	}
+	if r0, _ := got["retired"].([]any); len(r0) != 1 || r0[0].(map[string]any)["reason"] != "behaviour replaced" {
+		t.Errorf("dropped retired = %v", got["retired"])
+	}
+	for _, absent := range []string{"branch", "head_sha", "base_sha"} {
+		if _, ok := got[absent]; ok {
+			t.Errorf("dropped body must not carry %s", absent)
+		}
+	}
+}
+
+func TestFetchedPrompt_DecodesAcceptanceReplayFields(t *testing.T) {
+	raw := `{"stage_id":"s","stage_type":"acceptance","prompt":"p","prompt_hash":"h","agent_timeout_seconds":1,
+	"acceptance_run_branch":"fishhawk/run-x/stage-y","acceptance_pull_request_number":742,
+	"acceptance_criteria":[{"id":"crit-a","statement":"s","verify_hint":"v","preconditions":["seed"],"drivable":true}],
+	"acceptance_retired_scenarios":[{"id":"scenario:issue-101/crit-b","reason":"behaviour replaced","run_id":"r1","pr":742,"retired_at":"2026-09-12T00:00:00Z"}]}`
+	var fp FetchedPrompt
+	if err := json.Unmarshal([]byte(raw), &fp); err != nil {
+		t.Fatal(err)
+	}
+	if fp.AcceptanceRunBranch != "fishhawk/run-x/stage-y" || fp.AcceptancePullRequestNumber != 742 {
+		t.Errorf("branch/pr = %q/%d", fp.AcceptanceRunBranch, fp.AcceptancePullRequestNumber)
+	}
+	if len(fp.AcceptanceCriteria) != 1 || !fp.AcceptanceCriteria[0].Drivable || fp.AcceptanceCriteria[0].Preconditions[0] != "seed" {
+		t.Errorf("criteria = %+v", fp.AcceptanceCriteria)
+	}
+	if len(fp.AcceptanceRetiredScenarios) != 1 || fp.AcceptanceRetiredScenarios[0].Reason != "behaviour replaced" || fp.AcceptanceRetiredScenarios[0].PR != 742 {
+		t.Errorf("retired = %+v, want the full scenario.RetiredEntry", fp.AcceptanceRetiredScenarios)
 	}
 }

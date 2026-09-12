@@ -309,6 +309,22 @@ A **no-epic** campaign (an explicit `items` list, or a `grooming_run_id` order) 
 
 Pinned by `TestIssueSetClientTimeoutExceedsPermittedServerBudget` (the constant relationship + the wiring), `TestCreateCampaign_RoutesThroughTheIssueSetClient` (the routing, which the constant pin cannot see), `TestCreateCampaignDecodesServerTimeout504` and its CONTROL (the ordering is what produces the counts), and the cross-boundary trio `TestStartCampaignIssueSetTimeoutRendersCounts` / `…NoSuggestionRenders` / `…ClampedBudgetOnTheWire`, which drive the REAL server's 504 through the REAL decoder into the REAL renderer.
 
+### `fishhawk_approve_plan` `retire_scenario` amendment ([E72.4 / #3328](https://github.com/kuhlman-labs/fishhawk/issues/3328))
+
+`amend_acceptance_criteria` admits a third action, `retire_scenario`: `id` is a
+replay-corpus scenario id (`scenario:issue-<N>/<criterion-id>`), `reason` is
+required, no `statement`. It retires a PERSISTED scenario, not a plan
+criterion — it never counts toward the all-retired gate and is permitted with
+zero plan criteria — and the backend records the FULL entry `{id, reason,
+run_id, pr, retired_at}` on the approval row, serves it to the acceptance
+runner, which merges it into `acceptance/scenarios/retired.yaml`. It is refused
+`400 acceptance_scenario_retirement_unpersistable` when the plan's shape
+(`acceptance_surface: none`, out-of-scope with no criteria, empty criteria, or
+every criterion `skip_expected` with a basis) settles the acceptance stage with
+no runner spawn: the retirement would be approved and silently dropped, so
+retire it on a run whose acceptance stage executes. The tool description
+carries all of this (`TestApprovePlan_RetireScenarioAdvertised`); no new tool.
+
 ## Progress notifications (`fishhawk_run_stage`)
 
 `fishhawk_run_stage` spawns the runner and relays its stderr JSONL lines as MCP `notifications/progress` updates — but **only when a `progressToken` is present** on the call. A `progressToken` is client-supplied MCP request metadata, **not a tool input**: a tool-calling caller cannot set it, so whether live streaming is available is a property of your MCP client, not a knob you can reach (the MCP opt-in progress model). The durable signal is unaffected either way: the runner's events are still returned post-hoc in the final result's `events` list, and in the audit log and signed trace bundle.

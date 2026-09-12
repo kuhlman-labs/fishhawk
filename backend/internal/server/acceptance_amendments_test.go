@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -815,4 +818,183 @@ func TestDowngrade_SurvivingUndecidableOutsideRetirement_RecordsUndecidable(t *t
 		t.Errorf("recorded verdict = %v, want undecidable (a SURVIVING undecidable row reaches the ladder)",
 			payload["verdict"])
 	}
+}
+
+// ---------------------------------------------------------------------------
+// E72.4 / #3328: retire_scenario — the scenario-retirement request channel.
+// ---------------------------------------------------------------------------
+
+// newAmendServerWithVerification is newAmendServer for a plan whose FULL
+// Verification block matters (the four unpersistable shapes).
+func newAmendServerWithVerification(t *testing.T, v plan.Verification) (*Server, *amendAuditFake, *fakeApprovalRepo, *run.Run, *run.Stage) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	au := newAmendAuditFake()
+	app := newFakeApprovalRepo()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingApproval)
+	seedBudgetPlanArtifact(t, art, stage.ID, &plan.Plan{PlanVersion: "standard_v1", Verification: v})
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art, AuditRepo: au, ApprovalRepo: app,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	return s, au, app, runRow, stage
+}
+
+const retireScenarioBody = `[{"id":"scenario:issue-101/crit-b","action":"retire_scenario","reason":"behaviour replaced"}]`
+
+func TestAmendments_RetireScenario_FullEntryOnApprovalSubmitted(t *testing.T) {
+	s, _, au, _, runRow, stage := newAmendServer(t, amendCriteria())
+	w := submitApproval(t, s, stage.ID, amendBody(retireScenarioBody))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	retired, _ := payload["retired_scenarios"].([]any)
+	if len(retired) != 1 {
+		t.Fatalf("retired_scenarios = %v, want one FULL entry", payload["retired_scenarios"])
+	}
+	e, _ := retired[0].(map[string]any)
+	if e["id"] != "scenario:issue-101/crit-b" || e["reason"] != "behaviour replaced" ||
+		e["run_id"] != runRow.ID.String() || e["pr"] != float64(0) || e["retired_at"] == "" {
+		t.Errorf("retired_scenarios[0] = %v, want {id, reason, run_id, pr:0, retired_at}", e)
+	}
+	// The criterion set is untouched: a scenario retirement is not a criterion
+	// amendment, so the seam still reports the plan set verbatim plus the entry.
+	// findApprovalSubmittedPayload reads the captured append; the seam reads
+	// byRunCategory, so seed the recorded row by construction for the read.
+	au.seedApprovalEntry(runRow.ID, stage.ID, 1, "approve", nil)
+	rawEntry, _ := json.Marshal(map[string]any{"decision": "approve", "retired_scenarios": retired})
+	au.byRunCategory[runRow.ID.String()+":approval_submitted"][0].Payload = rawEntry
+	eff, err := s.resolveEffectiveAcceptanceCriteria(context.Background(), runRow.ID, &plan.Plan{
+		Verification: plan.Verification{AcceptanceCriteria: amendCriteria()},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eff.amended() || len(eff.Live) != 3 {
+		t.Errorf("a scenario retirement must not amend the criteria set: amended=%v live=%d", eff.amended(), len(eff.Live))
+	}
+	if len(eff.RetiredScenarios) != 1 || eff.RetiredScenarios[0].Reason != "behaviour replaced" {
+		t.Errorf("RetiredScenarios = %+v, want the full entry with its reason", eff.RetiredScenarios)
+	}
+}
+
+func TestAmendments_RetireScenario_Refusals(t *testing.T) {
+	cases := []struct {
+		name, body, rule string
+	}{
+		{"missing prefix", `[{"id":"issue-101/crit-b","action":"retire_scenario","reason":"r"}]`, "scenario_id_prefix_required"},
+		{"bare prefix", `[{"id":"scenario:","action":"retire_scenario","reason":"r"}]`, "scenario_id_prefix_required"},
+		{"blank reason", `[{"id":"scenario:issue-101/crit-b","action":"retire_scenario","reason":"  "}]`, "reason_required"},
+		{"statement supplied", `[{"id":"scenario:issue-101/crit-b","action":"retire_scenario","reason":"r","statement":"x"}]`, "statement_not_allowed"},
+		{"duplicate", `[{"id":"scenario:issue-101/crit-b","action":"retire_scenario","reason":"r"},{"id":"scenario:issue-101/crit-b","action":"retire_scenario","reason":"r2"}]`, "duplicate_id"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au, app, _, stage := newAmendServerWithVerification(t, plan.Verification{AcceptanceCriteria: amendCriteria()})
+			w := submitApproval(t, s, stage.ID, amendBody(tc.body))
+			assertAmendRefused(t, w, app, au, http.StatusBadRequest, "validation_failed", tc.rule)
+		})
+	}
+	t.Run("already retired by a prior approval", func(t *testing.T) {
+		s, au, app, runRow, stage := newAmendServerWithVerification(t, plan.Verification{AcceptanceCriteria: amendCriteria()})
+		raw, _ := json.Marshal(map[string]any{"decision": "approve", "retired_scenarios": []retiredScenarioEntry{{ID: "scenario:issue-101/crit-b", Reason: "old"}}})
+		rid, sid := runRow.ID, stage.ID
+		au.byRunCategory[runRow.ID.String()+":approval_submitted"] = []*audit.Entry{{ID: uuid.New(), Sequence: 1, RunID: &rid, StageID: &sid, Category: "approval_submitted", Payload: raw}}
+		w := submitApproval(t, s, stage.ID, amendBody(retireScenarioBody))
+		assertAmendRefused(t, w, app, au, http.StatusBadRequest, "validation_failed", "already_retired")
+	})
+	t.Run("does not count toward all-retired", func(t *testing.T) {
+		// Two of three criteria retired plus a scenario: the union is 2 < 3, so
+		// the anti-silencing gate must NOT fire on the scenario entry.
+		s, _, _, _, stage := newAmendServerWithVerification(t, plan.Verification{AcceptanceCriteria: amendCriteria()})
+		w := submitApproval(t, s, stage.ID, amendBody(`[{"id":"crit-1","action":"retire","reason":"r"},{"id":"crit-2","action":"retire","reason":"r"},{"id":"scenario:issue-101/crit-b","action":"retire_scenario","reason":"r"}]`))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+	})
+}
+
+// TestAmendments_RetireScenario_Unpersistable: one case per plan shape whose
+// acceptance stage settles server-side with no runner spawn — each refused 400
+// acceptance_scenario_retirement_unpersistable naming the shape.
+func TestAmendments_RetireScenario_Unpersistable(t *testing.T) {
+	cases := []struct {
+		name  string
+		v     plan.Verification
+		shape string
+	}{
+		{"acceptance_surface none", plan.Verification{AcceptanceSurface: plan.AcceptanceSurfaceValueNone, AcceptanceCriteria: amendCriteria()}, "acceptance_surface_none"},
+		{"out_of_scope", plan.Verification{OutOfScope: []string{"the deploy"}}, "out_of_scope"},
+		{"empty criteria", plan.Verification{}, "empty_criteria"},
+		{"all skip with basis", plan.Verification{AcceptanceCriteria: []plan.AcceptanceCriterion{
+			{ID: "c1", Statement: "s", Source: plan.CriterionSourceExplicit, SkipExpected: true, ExpectationBasis: "posture A"},
+		}}, "all_skip_with_basis"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au, app, _, stage := newAmendServerWithVerification(t, tc.v)
+			w := submitApproval(t, s, stage.ID, amendBody(retireScenarioBody))
+			assertAmendRefused(t, w, app, au, http.StatusBadRequest, acceptanceScenarioRetirementUnpersistableCode, "scenario_retirement_unpersistable")
+			if !strings.Contains(w.Body.String(), `"plan_shape":"`+tc.shape+`"`) {
+				t.Errorf("want plan_shape=%s, got %s", tc.shape, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestAcceptanceRetirementRefusal_PredicateSetEqualsShortCircuitSet pins the
+// PREDICATE COUPLING (binding condition 3): the plan.* predicates
+// acceptanceRunnerNeverSpawns branches on must equal, as a SET, the predicates
+// orchestrator.tryShortCircuitAcceptanceCore and
+// omitAcceptanceStageForSurfaceNone branch on. A short-circuit predicate added
+// to either without being added here would reopen the silent-drop window.
+func TestAcceptanceRetirementRefusal_PredicateSetEqualsShortCircuitSet(t *testing.T) {
+	refusal := planPredicateCalls(t, "acceptance_amendments.go", "acceptanceRunnerNeverSpawns")
+	shortCircuit := planPredicateCalls(t, "../orchestrator/orchestrator.go", "tryShortCircuitAcceptanceCore")
+	for k := range planPredicateCalls(t, "acceptance_omission.go", "omitAcceptanceStageForSurfaceNone") {
+		shortCircuit[k] = struct{}{}
+	}
+	if len(refusal) == 0 || len(shortCircuit) == 0 {
+		t.Fatalf("vacuous: refusal=%v shortCircuit=%v", refusal, shortCircuit)
+	}
+	if !reflect.DeepEqual(refusal, shortCircuit) {
+		t.Fatalf("refusal predicate set %v != short-circuit predicate set %v — add the missing plan.* predicate to acceptanceRunnerNeverSpawns", refusal, shortCircuit)
+	}
+}
+
+// planPredicateCalls returns the set of plan.AcceptanceSkippable* /
+// plan.DeclaresNoAcceptanceSurface selector names called inside the named
+// function of the given file (relative to this package dir).
+func planPredicateCalls(t *testing.T, file, fn string) map[string]struct{} {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	out := map[string]struct{}{}
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != fn {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if x, ok := sel.X.(*ast.Ident); ok && x.Name == "plan" &&
+				(strings.HasPrefix(sel.Sel.Name, "AcceptanceSkippable") || sel.Sel.Name == "DeclaresNoAcceptanceSurface") {
+				out[sel.Sel.Name] = struct{}{}
+			}
+			return true
+		})
+	}
+	if len(out) == 0 {
+		t.Fatalf("%s.%s: no plan.* predicate call found (function missing or renamed?)", file, fn)
+	}
+	return out
 }

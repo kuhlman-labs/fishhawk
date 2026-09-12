@@ -19,10 +19,11 @@ import (
 
 // lineageLedgerCategories are the audit categories whose entries carry
 // a reported head_sha for THIS run's own commits: the PR-open report,
-// the decomposed-child push report, and the fix-up push report. Their
+// the decomposed-child push report, the fix-up push report, and the
+// acceptance runner's scenario-corpus push report (E72.4 / #3328). Their
 // union (∪ the current report's head_sha) is the set of commits the
 // run is allowed to have placed on its branch.
-var lineageLedgerCategories = []string{"pull_request_opened", "child_pushed", "fixup_pushed"}
+var lineageLedgerCategories = []string{"pull_request_opened", "child_pushed", "fixup_pushed", "acceptance_scenarios_pushed"}
 
 // lineageVouchLedgerCategory is the audit category carrying an operator's
 // vouched-commit declaration (#1044). Unlike the own-chain head categories
@@ -462,8 +463,9 @@ func (s *Server) resolveLineageBaseRef(ctx context.Context, runRow *run.Run,
 }
 
 // buildReportedHeadLedger collects the set of head SHAs this run has
-// reported across its pull_request_opened / child_pushed / fixup_pushed
-// audit entries, plus the commits an operator has VOUCHED as run-authored
+// reported across its lineageLedgerCategories audit entries
+// (pull_request_opened / child_pushed / fixup_pushed /
+// acceptance_scenarios_pushed), plus the commits an operator has VOUCHED as run-authored
 // lineage (operator_commit_vouched, #1044 — read from the vouched_sha
 // field, not head_sha), plus an explicit ledgerSeedSHA bootstrap (when
 // non-empty).
