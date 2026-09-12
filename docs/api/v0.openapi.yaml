@@ -80,6 +80,124 @@ components:
   # canonical types every endpoint returns.
   # -------------------------------------------------------------------------
   schemas:
+    DevStubForgeIssue:
+      type: object
+      description: |
+        One issue in the dev stub forge (E72.3 / #3327), in its family's
+        NATIVE state vocabulary. `project_id` is present for `gitlab`
+        only; `comments` are in arrival order.
+      required: [forge, number, title, body, state, comments]
+      properties:
+        forge: { type: string, enum: [github, gitlab] }
+        repo: { type: string, description: 'GitHub `owner/name`, or the GitLab namespaced path registered for lookups.' }
+        project_id: { type: integer, description: GitLab numeric project id. }
+        number: { type: integer }
+        title: { type: string }
+        body: { type: string }
+        state: { type: string, description: '`open`/`closed` (GitHub) or `opened`/`closed` (GitLab).' }
+        state_reason: { type: string, description: 'GitHub only: `completed`, `not_planned`, …' }
+        comments:
+          type: array
+          items: { type: string }
+    DevStubForgeIssueSeed:
+      type: object
+      description: The `POST /v0/dev/forge/issues` body. Unknown fields are refused.
+      required: [forge, number]
+      properties:
+        forge: { type: string, enum: [github, gitlab] }
+        repo: { type: string, description: 'Required for `github` (`owner/name`); optional path for `gitlab`.' }
+        project_id: { type: integer, minimum: 1, description: Required for `gitlab`. }
+        number: { type: integer, minimum: 1 }
+        state: { type: string, description: 'Native state; empty defaults to the family''s open word.' }
+        state_reason: { type: string }
+        title: { type: string }
+        body: { type: string }
+        comments:
+          type: array
+          items: { type: string }
+    DevStubForgePull:
+      type: object
+      description: One pull request (GitHub) or merge request (GitLab) in the dev stub forge.
+      required: [forge, number, title, body, state, merged]
+      properties:
+        forge: { type: string, enum: [github, gitlab] }
+        repo: { type: string }
+        project_id: { type: integer }
+        number: { type: integer }
+        title: { type: string }
+        body: { type: string }
+        state: { type: string, description: '`open`/`closed` (GitHub) or `opened`/`closed`/`merged` (GitLab).' }
+        merged: { type: boolean }
+        merge_commit_sha: { type: string }
+        merged_at: { type: string, format: date-time }
+        head_sha: { type: string }
+        head_ref: { type: string }
+        base_ref: { type: string }
+    DevStubForgePullSeed:
+      type: object
+      description: The `POST /v0/dev/forge/pulls` body. Unknown fields are refused.
+      required: [forge, number]
+      properties:
+        forge: { type: string, enum: [github, gitlab] }
+        repo: { type: string }
+        project_id: { type: integer, minimum: 1 }
+        number: { type: integer, minimum: 1 }
+        state: { type: string }
+        title: { type: string }
+        body: { type: string }
+        merged: { type: boolean }
+        merge_commit_sha: { type: string }
+        merged_at: { type: string, format: date-time }
+        head_sha: { type: string }
+        head_ref: { type: string }
+        base_ref: { type: string }
+    DevStubForgeSnapshot:
+      type: object
+      description: The whole dev stub forge, records sorted by key, plus the arrival-ordered request log.
+      required: [github, gitlab, requests]
+      properties:
+        github:
+          type: object
+          properties:
+            issues:
+              type: array
+              items: { $ref: '#/components/schemas/DevStubForgeIssue' }
+            pulls:
+              type: array
+              items: { $ref: '#/components/schemas/DevStubForgePull' }
+        gitlab:
+          type: object
+          properties:
+            issues:
+              type: array
+              items: { $ref: '#/components/schemas/DevStubForgeIssue' }
+            merge_requests:
+              type: array
+              items: { $ref: '#/components/schemas/DevStubForgePull' }
+        requests:
+          type: array
+          items: { type: string }
+          description: '`"<op> <key>"` per served request, in arrival order.'
+    DevStubForgeDelivery:
+      type: object
+      description: The `POST /v0/dev/forge/deliveries` body. Unknown fields are refused.
+      required: [forge, event, payload]
+      properties:
+        forge: { type: string, enum: [github, gitlab] }
+        event: { type: string, description: 'The event header value: e.g. `issues` (GitHub) or `Issue Hook` (GitLab).' }
+        delivery_id: { type: string, description: Optional; a UUID is minted when absent. Reusing one exercises the receiver''s dedup. }
+        payload:
+          type: object
+          additionalProperties: true
+          description: The webhook event object exactly as the forge would send it.
+    DevStubForgeDeliveryResult:
+      type: object
+      description: The receiver's verdict for one in-process delivery.
+      required: [delivery_id, status, body]
+      properties:
+        delivery_id: { type: string }
+        status: { type: integer, description: The HTTP status the real receiver answered. }
+        body: { description: The receiver's response body verbatim (JSON; a non-JSON body is reported as a JSON string). }
     GroomingDispositions:
       type: object
       description: |
@@ -17474,6 +17592,238 @@ paths:
           description: The surface is not registered.
         '413':
           description: '`body_too_large` — body exceeds 32 MiB.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------------
+  # Dev-only stub-forge control surface (E72.3 / #3327).
+  # Registered ONLY when fishhawkd runs with --dev-stub-forge /
+  # FISHHAWKD_DEV_STUB_FORGE=1, which also serves GitHub and GitLab from
+  # ONE in-process stub forge (backend/internal/forge/stub) in place of a
+  # real forge; otherwise every path below is the router's 404. Same
+  # loopback-only (403 dev_surface_loopback_only) and credential-less
+  # posture as the seeded-fixture surface above. Every POST body is capped
+  # at 256 KiB and refuses unknown fields (400 validation_failed).
+  # ---------------------------------------------------------------------
+  /v0/dev/forge:
+    get:
+      operationId: getDevStubForge
+      summary: Snapshot the in-process stub forge (dev only)
+      description: |
+        Every record the stub holds, per family, in each forge's NATIVE
+        state vocabulary (GitHub `open`/`closed` + `state_reason`; GitLab
+        `opened`/`closed`), plus the arrival-ordered request log
+        (`"<op> <key>"` strings, e.g. `github.post_comment github:o/r#100`)
+        — the comment-before-close invariant is an ORDERING property, so
+        the log is the evidence for it. Loopback peers only.
+      tags: [dev]
+      security: []
+      responses:
+        '200':
+          description: The whole stub.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DevStubForgeSnapshot' }
+        '403':
+          description: '`dev_surface_loopback_only`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: The surface is not registered (no `--dev-stub-forge`).
+    delete:
+      operationId: resetDevStubForge
+      summary: Reset the in-process stub forge (dev only)
+      description: |
+        Drops every record, the request log and every injected fault so an
+        acceptance criterion starts from an empty forge. Loopback peers only.
+      tags: [dev]
+      security: []
+      responses:
+        '204':
+          description: Reset.
+        '403':
+          description: '`dev_surface_loopback_only`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: The surface is not registered.
+  /v0/dev/forge/issues:
+    get:
+      operationId: getDevStubForgeIssue
+      summary: Read one stub forge issue (dev only)
+      description: |
+        Reads one issue by address — `forge=github&repo=<owner/name>&number=N`
+        or `forge=gitlab&project_id=P&number=N` — with its comments in
+        arrival order. This is how a criterion observes COMMITTED state
+        after a delivery (the parent's `state`, `state_reason`, and the
+        exact comment count). Loopback peers only.
+      tags: [dev]
+      security: []
+      parameters:
+        - name: forge
+          in: query
+          required: true
+          schema: { type: string, enum: [github, gitlab] }
+        - name: repo
+          in: query
+          required: false
+          schema: { type: string }
+          description: GitHub `owner/name` full name (required for `github`).
+        - name: project_id
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+          description: GitLab numeric project id (required for `gitlab`).
+        - name: number
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: The issue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DevStubForgeIssue' }
+        '400':
+          description: '`validation_failed` — `details.field` names the offending query parameter (`forge`, `repo`, `project_id`, `number`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: '`dev_surface_loopback_only`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`stub_issue_not_found` — nothing is seeded at that address. (Also the router 404 when the surface is not registered.)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    post:
+      operationId: seedDevStubForgeIssue
+      summary: Seed one stub forge issue (dev only)
+      description: |
+        Stores one issue, REPLACING any record at the same address, and
+        answers 201 with the stored copy. An empty `state` defaults to the
+        family's native open word. A GitLab issue with a non-empty `repo`
+        registers that namespaced path for the adapter's project lookup.
+        Loopback peers only.
+      tags: [dev]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DevStubForgeIssueSeed' }
+      responses:
+        '201':
+          description: The stored issue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DevStubForgeIssue' }
+        '400':
+          description: '`validation_failed` — unknown `forge`, non-positive `number`, `github` without `repo`, `gitlab` without a positive `project_id`, or a malformed / unknown-field body; `details.field` names the parameter when one is at fault.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: '`dev_surface_loopback_only`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: The surface is not registered.
+  /v0/dev/forge/pulls:
+    post:
+      operationId: seedDevStubForgePull
+      summary: Seed one stub forge pull / merge request (dev only)
+      description: |
+        Stores one pull request (GitHub) or merge request (GitLab) with the
+        merge facts the product reads back (`merged`, `merge_commit_sha`,
+        `merged_at`, `head_sha`). A GitLab record with `merged: true` is
+        stored in the native `merged` state. Loopback peers only.
+      tags: [dev]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DevStubForgePullSeed' }
+      responses:
+        '201':
+          description: The stored pull / merge request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DevStubForgePull' }
+        '400':
+          description: '`validation_failed` — same address rules as `POST /v0/dev/forge/issues`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: '`dev_surface_loopback_only`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: The surface is not registered.
+  /v0/dev/forge/deliveries:
+    post:
+      operationId: deliverDevStubForgeWebhook
+      summary: Sign and dispatch a webhook delivery in-process (dev only)
+      description: |
+        Builds the raw webhook body from `payload`, signs it exactly as
+        the REAL receiver verifies it — GitHub: `X-GitHub-Event`,
+        `X-GitHub-Delivery`, `X-Hub-Signature-256` = `sha256=` +
+        hex(HMAC-SHA256(configured GitHub webhook secret, body)); GitLab:
+        `X-Gitlab-Event`, `X-Gitlab-Event-UUID`, `X-Gitlab-Token` = the
+        configured GitLab secret verbatim — and dispatches it IN-PROCESS
+        through the genuine `/webhooks/github` or `/webhooks/gitlab`
+        receiver. The receivers run their consumers SYNCHRONOUSLY, so
+        when this route's 200 returns any forge state the delivery caused
+        (e.g. the E50.6 parent close) is already committed and readable
+        via `GET /v0/dev/forge/issues`. The receiver's own verdict is
+        REPORTED in `status`/`body`, never mapped: 202 accepted (also
+        for a duplicate `delivery_id`, which the dedup store acknowledges
+        without re-running consumers), 4xx malformed. `payload` is signed
+        and delivered VERBATIM — never re-marshaled — so key order and
+        every numeric value (including identifiers above 2^53, which a
+        float64 round-trip would alter) reach the receiver exactly as
+        sent.
+        A GitHub `issues` payload needs `installation.id`,
+        `repository.full_name` and `issue.number`; a GitLab `Issue Hook`
+        payload needs `project.id`, `project.path_with_namespace` and
+        `object_attributes.iid`/`action`. Loopback peers only.
+      tags: [dev]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DevStubForgeDelivery' }
+      responses:
+        '200':
+          description: The delivery was dispatched; the receiver's verdict is inside.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DevStubForgeDeliveryResult' }
+        '400':
+          description: '`validation_failed` — unknown `forge`, empty `event`, `payload` not a JSON object, or a malformed / unknown-field body; `details.field` names the parameter.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: '`dev_surface_loopback_only`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: The surface is not registered.
+        '503':
+          description: '`stub_forge_webhook_unconfigured` — the named family''s receiver has no secret configured, so the delivery cannot be signed (`--dev-stub-forge` defaults both secrets, so this is only reachable when a secret was explicitly emptied).'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

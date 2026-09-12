@@ -46,6 +46,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegithub "github.com/kuhlman-labs/fishhawk/backend/internal/forge/github"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -1494,6 +1495,12 @@ func runServe(args []string, logSink io.Writer) int {
 			"named scenarios; requires --db (without one the surface stays off). With --s3-bucket unset "+
 			"it also selects an in-memory trace store so /v0/runs/{id}/trace is drivable (#1874). "+
 			"Never enable in production")
+	devStubForge := fs.Bool("dev-stub-forge", envOrBool("FISHHAWKD_DEV_STUB_FORGE", false),
+		"DEV ONLY (E72.3 / #3327): serve GitHub and GitLab from an in-process stub forge and register "+
+			"the loopback-only /v0/dev/forge* control routes so an acceptance preview can seed forge state "+
+			"and dispatch signed webhook deliveries without a real forge. Refuses to coexist with a "+
+			"configured GitHub App or GitLab token; defaults both webhook secrets when unset. "+
+			"Never enable in production")
 	s3Region := fs.String("s3-region", envOr("FISHHAWKD_S3_REGION", "us-east-1"),
 		"AWS region for the trace bundle bucket")
 	s3Endpoint := fs.String("s3-endpoint", envOr("FISHHAWKD_S3_ENDPOINT", ""),
@@ -2287,6 +2294,21 @@ func runServe(args []string, logSink io.Writer) int {
 	// memory dedup can spot the hazard.
 	const webhookRetention = 24 * time.Hour
 	var webhookEvictor *webhook.PostgresStore
+	// Dev-only stub forge (E72.3 / #3327): resolved BEFORE the secret +
+	// delivery-store block below so both receivers and the dedup store come
+	// up on the stub's fixed dev secrets when the operator supplied none.
+	// The coexistence refusal is a boot failure, not a downgrade: a real
+	// GitHub App or GitLab token beside the stub would leave the operator
+	// unsure which forge a delivery reached.
+	stubForgeWiring, err := resolveDevStubForge(*devStubForge, *githubAppIDStr, *gitlabToken, *webhookSecret, *gitlabWebhookSecret)
+	if err != nil {
+		logger.Error("dev stub forge misconfigured", slog.String("error", err.Error()))
+		return exitFailure
+	}
+	if stubForgeWiring.Enabled {
+		*webhookSecret = stubForgeWiring.GitHubWebhookSecret
+		*gitlabWebhookSecret = stubForgeWiring.GitLabWebhookSecret
+	}
 	if *webhookSecret != "" {
 		cfg.GitHubWebhookSecret = []byte(*webhookSecret)
 	} else {
@@ -2409,6 +2431,33 @@ func runServe(args []string, logSink io.Writer) int {
 		if *projectsToken == "" {
 			logger.Info("FISHHAWKD_PROJECTS_TOKEN not set; user-owned Projects v2 board placement stays best-effort boarded:false (#1107)")
 		}
+	} else if stubForgeWiring.Enabled {
+		// Dev-only stub forge (E72.3 / #3327). Sits in the GitHub-App block
+		// position on purpose: cfg.GitHub must be set BEFORE the dispatcher /
+		// orchestrator below capture it. Both families are served from ONE
+		// in-process stub through an in-process round-tripper — no socket,
+		// no second port — and the gitlab adapter is registered here as the
+		// ONLY gitlab registration on this path (resolveDevStubForge refused
+		// a configured --gitlab-token, so resolveGitLabForge below returns
+		// nil and cannot double-register).
+		st := stub.New()
+		cfg.GitHubTokens = stub.StaticTokens{Value: stub.InstallationToken}
+		cfg.GitHub = &githubclient.Client{
+			BaseURL: stub.GitHubBaseURL,
+			Tokens:  cfg.GitHubTokens,
+			HTTP:    st.HTTPClient(),
+		}
+		cfg.GateMerger = githubAutoMerger{gh: cfg.GitHub}
+		forge.Register(forgegitlab.New(stub.GitLabBaseURL,
+			forgegitlab.NewStaticCredentialProvider(stub.InstallationToken),
+			forgegitlab.WithHTTPClient(st.HTTPClient())))
+		cfg.DevStubForge = st
+		logger.Warn("DEV STUB FORGE ENABLED: GitHub and GitLab are served from an in-process stub and "+
+			"the loopback-only /v0/dev/forge* control routes are registered — never run this in production",
+			slog.String("github_base_url", stub.GitHubBaseURL),
+			slog.String("gitlab_base_url", stub.GitLabBaseURL),
+			slog.Bool("github_webhook_secret_defaulted", stubForgeWiring.GitHubWebhookSecretDefaulted),
+			slog.Bool("gitlab_webhook_secret_defaulted", stubForgeWiring.GitLabWebhookSecretDefaulted))
 	} else {
 		logger.Warn("FISHHAWKD_GITHUB_APP_ID not set; webhook dispatch and GitHub-side actions will be disabled")
 	}
@@ -3764,6 +3813,49 @@ func resolveDevTraceStore(devFixtures bool, s3Bucket string, current tracestore.
 		return tracestore.NewMem(), true
 	}
 	return current, false
+}
+
+// devStubForgeWiring is what resolveDevStubForge hands runServe: whether the
+// stub is on, and the webhook secret each receiver must be configured with
+// (the operator's value when supplied, else the stub's fixed dev constant —
+// the *Defaulted flags say which, for the boot log).
+type devStubForgeWiring struct {
+	Enabled                      bool
+	GitHubWebhookSecret          string
+	GitHubWebhookSecretDefaulted bool
+	GitLabWebhookSecret          string
+	GitLabWebhookSecretDefaulted bool
+}
+
+// resolveDevStubForge decides the dev stub forge posture (E72.3 / #3327).
+// Disabled returns the zero value: nothing changes. Enabled with a
+// configured GitHub App id OR GitLab token is refused with an error the
+// caller turns into exitFailure — the stub replaces cfg.GitHub and the
+// gitlab forge registration wholesale, so a real credential beside it
+// would be silently unused and the operator could not tell which forge a
+// delivery reached. Otherwise the resolved receiver secrets are returned:
+// the operator's when non-empty, else stub.GitHubWebhookSecret /
+// stub.GitLabWebhookToken, so both receivers come up without the operator
+// minting throwaway secrets. Pure so serve_test can table it without
+// booting.
+func resolveDevStubForge(enabled bool, githubAppID, gitlabToken, githubSecret, gitlabSecret string) (devStubForgeWiring, error) {
+	if !enabled {
+		return devStubForgeWiring{}, nil
+	}
+	if githubAppID != "" || gitlabToken != "" {
+		return devStubForgeWiring{}, errors.New("--dev-stub-forge cannot coexist with a configured GitHub App or GitLab token" +
+			" (unset FISHHAWKD_GITHUB_APP_ID / FISHHAWKD_GITLAB_TOKEN, or drop --dev-stub-forge)")
+	}
+	w := devStubForgeWiring{Enabled: true, GitHubWebhookSecret: githubSecret, GitLabWebhookSecret: gitlabSecret}
+	if w.GitHubWebhookSecret == "" {
+		w.GitHubWebhookSecret = stub.GitHubWebhookSecret
+		w.GitHubWebhookSecretDefaulted = true
+	}
+	if w.GitLabWebhookSecret == "" {
+		w.GitLabWebhookSecret = stub.GitLabWebhookToken
+		w.GitLabWebhookSecretDefaulted = true
+	}
+	return w, nil
 }
 
 // envOrBool resolves a boolean env var via strconv.ParseBool so the operator-

@@ -37,6 +37,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
@@ -4547,6 +4548,179 @@ func TestResolveDevTraceStore(t *testing.T) {
 				t.Fatalf("got %T, want nil", got)
 			}
 		})
+	}
+}
+
+// TestResolveDevStubForge tables the dev stub forge posture (E72.3 / #3327):
+// disabled is the zero value, enabled defaults BOTH receiver secrets to the
+// stub constants, an operator-supplied secret wins per family, and a
+// configured GitHub App id OR GitLab token is refused — each coexistence
+// refusal is its own row so deleting either half of the guard reddens a
+// named case.
+func TestResolveDevStubForge(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		enabled      bool
+		githubAppID  string
+		gitlabToken  string
+		githubSecret string
+		gitlabSecret string
+		want         devStubForgeWiring
+		wantErr      bool
+	}{
+		{name: "disabled → zero value even with credentials", enabled: false, githubAppID: "12", gitlabToken: "glpat", githubSecret: "s"},
+		{name: "enabled defaults both secrets", enabled: true, want: devStubForgeWiring{
+			Enabled:                      true,
+			GitHubWebhookSecret:          stub.GitHubWebhookSecret,
+			GitHubWebhookSecretDefaulted: true,
+			GitLabWebhookSecret:          stub.GitLabWebhookToken,
+			GitLabWebhookSecretDefaulted: true,
+		}},
+		{name: "operator github secret wins, gitlab defaulted", enabled: true, githubSecret: "op-gh", want: devStubForgeWiring{
+			Enabled:                      true,
+			GitHubWebhookSecret:          "op-gh",
+			GitLabWebhookSecret:          stub.GitLabWebhookToken,
+			GitLabWebhookSecretDefaulted: true,
+		}},
+		{name: "operator gitlab secret wins, github defaulted", enabled: true, gitlabSecret: "op-gl", want: devStubForgeWiring{
+			Enabled:                      true,
+			GitHubWebhookSecret:          stub.GitHubWebhookSecret,
+			GitHubWebhookSecretDefaulted: true,
+			GitLabWebhookSecret:          "op-gl",
+		}},
+		{name: "github_app_configured", enabled: true, githubAppID: "12", wantErr: true},
+		{name: "gitlab_token_configured", enabled: true, gitlabToken: "glpat-x", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveDevStubForge(tc.enabled, tc.githubAppID, tc.gitlabToken, tc.githubSecret, tc.gitlabSecret)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected a coexistence refusal, got nil error and %+v", got)
+				}
+				if !strings.Contains(err.Error(), "--dev-stub-forge cannot coexist") {
+					t.Errorf("error = %q, want it to name --dev-stub-forge and the coexistence rule", err)
+				}
+				if got != (devStubForgeWiring{}) {
+					t.Errorf("refusal must return the zero wiring, got %+v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("wiring = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestServe_DevStubForgeFlagWiresStubAndReceivers: a boot with
+// -dev-stub-forge (no DB, no App, no GitLab token) reaches server.New with
+// the stub mounted: DevStubForge non-nil, cfg.GitHub pointed at the stub's
+// base URL over its transport, a static token provider, BOTH receiver
+// secrets defaulted to the stub constants, the delivery store wired (so
+// both receivers accept), the gate merger bound, the gitlab forge
+// registered in the process registry, and the never-in-production WARN in
+// the log. Counterfactual: delete the `else if stubForgeWiring.Enabled`
+// arm → RED on the DevStubForge assertion.
+func TestServe_DevStubForgeFlagWiresStubAndReceivers(t *testing.T) {
+	captured := captureServerConfig(t)
+	code, log := serveWithProfile(t, "-dev-stub-forge", "-s3-bucket=", bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d (aborts at the invalid review-resolution, AFTER newServer); log:\n%s", code, exitFailure, log)
+	}
+	if captured.DevStubForge == nil {
+		t.Fatalf("captured server.Config.DevStubForge is nil — the -dev-stub-forge flag did not mount the stub; log:\n%s", log)
+	}
+	if captured.GitHub == nil || captured.GitHub.BaseURL != stub.GitHubBaseURL {
+		t.Fatalf("captured cfg.GitHub = %+v, want a client at %s", captured.GitHub, stub.GitHubBaseURL)
+	}
+	if _, ok := captured.GitHubTokens.(stub.StaticTokens); !ok {
+		t.Errorf("captured cfg.GitHubTokens = %T, want stub.StaticTokens", captured.GitHubTokens)
+	}
+	if string(captured.GitHubWebhookSecret) != stub.GitHubWebhookSecret {
+		t.Errorf("GitHubWebhookSecret = %q, want the stub default", captured.GitHubWebhookSecret)
+	}
+	if string(captured.GitLabWebhookSecret) != stub.GitLabWebhookToken {
+		t.Errorf("GitLabWebhookSecret = %q, want the stub default", captured.GitLabWebhookSecret)
+	}
+	if captured.WebhookDeliveries == nil {
+		t.Error("WebhookDeliveries is nil — the delivery store must come up on the defaulted secrets")
+	}
+	if captured.GateMerger == nil {
+		t.Error("GateMerger is nil — the stub path must bind it as the App block does")
+	}
+	if _, err := forge.Get("gitlab"); err != nil {
+		t.Errorf("gitlab forge not registered on the stub path: %v", err)
+	}
+	if !strings.Contains(log, "DEV STUB FORGE ENABLED") {
+		t.Errorf("log does not carry the never-in-production WARN:\n%s", log)
+	}
+	// The stub is REACHABLE through the captured client: the wired transport
+	// serves a seeded issue with no socket.
+	if _, err := captured.DevStubForge.SeedIssue(stub.Issue{Forge: "github", Repo: "o/r", Number: 1}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	resp, err := captured.GitHub.HTTP.Get(stub.GitHubBaseURL + "/repos/o/r/issues/1")
+	if err != nil {
+		t.Fatalf("GET through the wired client: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /repos/o/r/issues/1 through the stub transport = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestServe_DevStubForgeOperatorSecretWins: an operator-supplied receiver
+// secret is kept verbatim beside the stub; only the absent one defaults.
+func TestServe_DevStubForgeOperatorSecretWins(t *testing.T) {
+	captured := captureServerConfig(t)
+	code, log := serveWithProfile(t, "-dev-stub-forge", "-github-webhook-secret=op-gh", "-s3-bucket=", bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+	}
+	if string(captured.GitHubWebhookSecret) != "op-gh" {
+		t.Errorf("GitHubWebhookSecret = %q, want the operator's op-gh", captured.GitHubWebhookSecret)
+	}
+	if string(captured.GitLabWebhookSecret) != stub.GitLabWebhookToken {
+		t.Errorf("GitLabWebhookSecret = %q, want the stub default", captured.GitLabWebhookSecret)
+	}
+}
+
+// TestServe_DevStubForgeRefusesCoexistence: -dev-stub-forge beside a
+// configured GitLab token (one representative of the two refusals the pure
+// helper tables) fails boot BEFORE newServer with the named reason.
+func TestServe_DevStubForgeRefusesCoexistence(t *testing.T) {
+	captured := captureServerConfig(t)
+	code, log := serveWithProfile(t, "-dev-stub-forge", "-gitlab-token=glpat-x", "-s3-bucket=", bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+	}
+	if !strings.Contains(log, "dev stub forge misconfigured") || !strings.Contains(log, "cannot coexist") {
+		t.Errorf("log does not carry the coexistence refusal:\n%s", log)
+	}
+	if captured.DevStubForge != nil {
+		t.Errorf("newServer must not be reached after the refusal; captured DevStubForge = %v", captured.DevStubForge)
+	}
+}
+
+// TestServe_DevStubForgeOff_LeavesConfigNil: the default (flag off) leaves
+// DevStubForge nil and cfg.GitHub unset, and never mentions the stub.
+func TestServe_DevStubForgeOff_LeavesConfigNil(t *testing.T) {
+	captured := captureServerConfig(t)
+	code, log := serveWithProfile(t, "-s3-bucket=", bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+	}
+	if captured.DevStubForge != nil {
+		t.Errorf("DevStubForge = %v with the flag off, want nil", captured.DevStubForge)
+	}
+	if captured.GitHub != nil {
+		t.Errorf("cfg.GitHub = %+v with the flag off and no App, want nil", captured.GitHub)
+	}
+	if strings.Contains(log, "STUB FORGE") {
+		t.Errorf("flag-off boot mentions the stub forge:\n%s", log)
 	}
 }
 

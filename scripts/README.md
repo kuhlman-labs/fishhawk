@@ -1119,6 +1119,24 @@ is on unconditionally, `--seed` or not: it is what makes a preview a
 seedable target, and an unseeded preview with the surface registered is
 still loopback-only and dev-only.
 
+The same serve line carries `FISHHAWKD_DEV_STUB_FORGE=1` (E72.3 /
+[#3327](https://github.com/kuhlman-labs/fishhawk/issues/3327)): the
+preview binary mounts an in-process stub forge serving BOTH forge
+families (GitHub and GitLab) from in-memory state, wires its own forge
+clients to it, and registers the loopback-only `/v0/dev/forge*` control
+routes (snapshot, reset, seed issues / pulls, read one issue back, and
+`POST /v0/dev/forge/deliveries`, which signs a webhook delivery
+preview-side and dispatches it synchronously through the real receivers).
+This is what makes a forge-driven acceptance criterion — a contract-child
+close that must close its parent — drivable from the credential-free
+sandbox, which reaches only `localhost:8090` and so could never reach a
+stub on a second port. It is also unconditional and, like the fixtures
+flag, a serve concern only: the `migrate up` line carries neither var.
+The preview is the ONLY place `scripts/dev` sets it — `up`/`reload`
+never do, and a production deployment never should. Acceptance-side
+contract (routes, the delivery body, the 404 ⇒ skip rule):
+`docs/acceptance-preview.md` § "Stub forge".
+
 ### Fail-loud contract (`_preview_seed_apply`)
 
 The seed POST runs only AFTER `_await_preview_healthz` has proven the
@@ -1152,7 +1170,8 @@ per refusal mode (unknown flag, trailing `--seed`, `--seed=`, second
 positional, malformed name — each asserted on exit status AND the usage
 line on stderr); the `_preview_seed_name_valid` alphabet; body/line-order
 greps on `cmd_preview` (parse before `.env`, `FISHHAWKD_DEV_FIXTURES=1`
-on the serve line and NOT the migrate line, the `env -i` prefix kept,
+AND `FISHHAWKD_DEV_STUB_FORGE=1` each on the serve line and NOT the
+migrate line, exactly one serve line, the `env -i` prefix kept,
 `_preview_seed_apply` after `_await_preview_healthz`); the renderer on a
 two-run body and on an unrecognized body; and `_preview_seed_apply`
 driven with a stub `curl` first on `PATH` plus stubbed teardown helpers
