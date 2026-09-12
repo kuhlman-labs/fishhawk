@@ -1,0 +1,150 @@
+# split-parent-linked — two runs carrying the E50.6 parent-close LINKAGE,
+# one per forge family (E72.3 / #3327).
+#
+# Each run holds ONE `split_children_filed` audit row in the exact shape
+# server.writeSplitChildrenFiledAudit produces, naming parent
+# `stub/parent-close#100`, contract child `#103`, and `parent_forge`
+# "github" / "gitlab". The parent-close watcher (resolveSplitParentLinkage)
+# enumerates that category with AuditRepo.ListAll — which spans BOTH the
+# per-run and the global chains and, for an untenanted row, every caller —
+# so after this scenario is applied a signed `issues.closed` (GitHub) or
+# `Issue Hook` close (GitLab) delivery for #103 against the preview's
+# in-process stub forge closes parent #100 and leaves exactly one comment.
+# The linkage row is filed under a DIFFERENT family per run, so a GitHub
+# delivery cannot resolve the GitLab linkage or vice versa (#2900).
+#
+# `children` is empty on purpose: the watcher reads only parent_repo,
+# parent_issue, contract_child_number and parent_forge, and the preview has
+# no sibling children to name. Both runs are otherwise minimal — a single
+# plan stage at succeeded — because the watcher never resolves a run.
+#
+# Handles (`key`) are scenario-local; every Apply mints fresh ids.
+runs:
+  - key: github-run
+    repo: stub/parent-close
+    workflow_id: feature_change
+    trigger_ref: "issue:100"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (split-parent-linked, github).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+  - key: gitlab-run
+    repo: stub/parent-close
+    workflow_id: feature_change
+    trigger_ref: "issue:100"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (split-parent-linked, gitlab).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+
+stages:
+  - key: github-plan
+    run: github-run
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: gitlab-plan
+    run: gitlab-run
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+
+audit:
+  - run: github-run
+    stage: github-plan
+    category: split_children_filed
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"contract_classification":"contract","children":[],"contract_child_number":103,"deferral_issue":0,"parent_repo":"stub/parent-close","parent_issue":100,"parent_forge":"github"}'
+  - run: gitlab-run
+    stage: gitlab-plan
+    category: split_children_filed
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"contract_classification":"contract","children":[],"contract_child_number":103,"deferral_issue":0,"parent_repo":"stub/parent-close","parent_issue":100,"parent_forge":"gitlab"}'

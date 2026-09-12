@@ -102,6 +102,79 @@ func TestEmbeddedScenarios_DeclaredShapes(t *testing.T) {
 			t.Fatalf("ages = %v, want %v", ages, want)
 		}
 	})
+	// split-parent-linked (E72.3 / #3327): two runs on stub/parent-close,
+	// two split_children_filed rows, EXACTLY one per parent_forge family,
+	// each naming parent #100 and contract child #103 — the shape the
+	// E50.6 watcher's resolveSplitParentLinkage keys on, so a stub-forge
+	// issues.closed delivery for #103 resolves exactly one parent per family.
+	t.Run("split-parent-linked", func(t *testing.T) {
+		s := mustLoad(t, "split-parent-linked")
+		if len(s.Runs) != 2 {
+			t.Fatalf("want two runs (one per forge family), got %+v", s.Runs)
+		}
+		for _, r := range s.Runs {
+			if r.Repo != "stub/parent-close" || r.WorkflowID != "feature_change" {
+				t.Fatalf("run %q = repo %q workflow %q, want stub/parent-close feature_change", r.Key, r.Repo, r.WorkflowID)
+			}
+		}
+		if len(s.Stages) != 2 {
+			t.Fatalf("want one plan stage per run, got %+v", s.Stages)
+		}
+		for _, st := range s.Stages {
+			if st.Type != "plan" || st.State != "succeeded" {
+				t.Fatalf("stage %q = %s/%s, want plan/succeeded", st.Key, st.Type, st.State)
+			}
+		}
+		if len(s.Artifacts) != 0 || len(s.Approvals) != 0 {
+			t.Fatalf("want no artifacts and no approvals, got %d / %d", len(s.Artifacts), len(s.Approvals))
+		}
+		if len(s.Audit) != 2 {
+			t.Fatalf("want exactly two audit rows, got %+v", s.Audit)
+		}
+		forges := map[string]int{}
+		runs := map[string]int{}
+		for _, row := range s.Audit {
+			if row.Category != "split_children_filed" {
+				t.Fatalf("every audit row must be split_children_filed, got %q", row.Category)
+			}
+			p := linkagePayload(t, row.Payload)
+			if p.ParentRepo != "stub/parent-close" || p.ParentIssue != 100 || p.ContractChildNumber != 103 || p.ContractClassification != "contract" {
+				t.Fatalf("linkage payload = %+v, want parent stub/parent-close#100, contract child #103, classification contract", p)
+			}
+			if len(p.Children) != 0 {
+				t.Fatalf("children = %v, want an empty list", p.Children)
+			}
+			forges[p.ParentForge]++
+			runs[row.Run]++
+		}
+		if forges["github"] != 1 || forges["gitlab"] != 1 || len(forges) != 2 {
+			t.Fatalf("parent_forge counts = %v, want exactly one github and one gitlab row", forges)
+		}
+		if len(runs) != 2 {
+			t.Fatalf("linkage rows span runs %v, want one row per run", runs)
+		}
+	})
+}
+
+// linkagePayloadShape mirrors the fields of server.splitChildrenFiledPayload
+// the E50.6 watcher reads (json tags verbatim), so the scenario's rows are
+// asserted in the vocabulary the consumer decodes rather than as opaque JSON.
+type linkagePayloadShape struct {
+	ContractClassification string `json:"contract_classification"`
+	Children               []any  `json:"children"`
+	ContractChildNumber    int    `json:"contract_child_number"`
+	ParentRepo             string `json:"parent_repo"`
+	ParentIssue            int    `json:"parent_issue"`
+	ParentForge            string `json:"parent_forge"`
+}
+
+func linkagePayload(t *testing.T, payload string) linkagePayloadShape {
+	t.Helper()
+	var p linkagePayloadShape
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		t.Fatalf("payload %q: %v", payload, err)
+	}
+	return p
 }
 
 // TestNames_MatchesEmbeddedScenarioSet is the TWO-WAY binding between the
