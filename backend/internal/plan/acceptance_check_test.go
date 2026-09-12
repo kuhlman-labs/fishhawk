@@ -994,6 +994,130 @@ func TestUnevaluableCriteria_SeedHintDoesNotSuppressLiveTarget(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// undecidable_criterion stub-forge verify_hint exemption (E72.3 / #3327)
+// ---------------------------------------------------------------------------
+
+// TestVerifyHintNamesStubForge is the NO/YES table for the E72.3 predicate.
+// The NO rows are the CONTROL: an empty hint, a generic "forge" / "webhook"
+// mention, the sibling dev route (/v0/dev/fixtures), a route that merely
+// SHARES the /v0/dev/forge prefix without a slash boundary (/v0/dev/forgery,
+// /v0/dev/forge-proxy), a stub-forge mention in the STATEMENT only, and the
+// words "stub" and "forge" apart must all return false — the match is a
+// token-anchored route family plus the phrase "stub forge", over verify_hint
+// ALONE. The YES rows pin the bare root, every control sub-route, the
+// case-and-punctuation variants, and the phrase inside a sentence.
+func TestVerifyHintNamesStubForge(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statement string
+		hint      string
+		want      bool
+	}{
+		// NO rows.
+		{name: "no_empty_hint", hint: "", want: false},
+		{name: "no_generic_forge_word", hint: "post a comment on the forge and read it back", want: false},
+		{name: "no_generic_webhook_word", hint: "deliver the webhook and read the audit log", want: false},
+		{name: "no_sibling_fixtures_route", hint: "POST /v0/dev/fixtures with scenario split-parent-linked", want: false},
+		{name: "no_prefix_without_slash_boundary", hint: "GET /v0/dev/forgery", want: false},
+		{name: "no_hyphen_suffix_on_root", hint: "GET /v0/dev/forge-proxy", want: false},
+		{name: "no_stub_and_forge_apart", hint: "the stub answers; the forge state is read", want: false},
+		{name: "no_route_in_statement_only_empty_hint", statement: "POST /v0/dev/forge/deliveries closes the parent", hint: "", want: false},
+		{name: "no_phrase_in_statement_only_empty_hint", statement: "the stub forge closes the parent", hint: "", want: false},
+		// YES rows: the route root and every control sub-route.
+		{name: "yes_bare_root", hint: "/v0/dev/forge", want: true},
+		{name: "yes_get_root", hint: "GET /v0/dev/forge", want: true},
+		{name: "yes_delete_root_with_trailing_period", hint: "reset with DELETE /v0/dev/forge.", want: true},
+		{name: "yes_issues_subroute", hint: "seed parent #100 via POST /v0/dev/forge/issues", want: true},
+		{name: "yes_pulls_subroute", hint: "POST /v0/dev/forge/pulls, then read the merge", want: true},
+		{name: "yes_deliveries_subroute", hint: "POST /v0/dev/forge/deliveries with an issues.closed payload for #103", want: true},
+		{name: "yes_issues_subroute_with_query", hint: "GET /v0/dev/forge/issues?forge=github&repo=stub/parent-close&number=100", want: true},
+		{name: "yes_uppercase_route", hint: "GET /V0/DEV/FORGE", want: true},
+		// YES rows: the phrase.
+		{name: "yes_phrase_bare", hint: "stub forge", want: true},
+		{name: "yes_phrase_capitalised_in_sentence", hint: "drive the Stub Forge on the preview, then read /v0/audit", want: true},
+		{name: "yes_phrase_at_end", hint: "the delivery is dispatched by the preview's stub forge.", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := AcceptanceCriterion{ID: "a1", Statement: tc.statement, VerifyHint: tc.hint}
+			if got := verifyHintNamesStubForge(c); got != tc.want {
+				t.Errorf("verifyHintNamesStubForge(hint=%q) = %v, want %v", tc.hint, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUnevaluableCriteria_StubForgeHintSuppressesWebhookTrigger is the
+// MOTIVATING E72.3 / #3327 row — the exact shape the #3327 plan gate
+// misjudged: a "real webhook delivery" statement (corpus index 4, NOT a
+// liveTarget) whose verify_hint drives POST /v0/dev/forge/deliveries on the
+// preview draws NO undecidable_criterion finding. The hint carries no #3163
+// harness marker and no catalog scenario name, so the suppression can come
+// ONLY from the verifyHintNamesStubForge disjunct — which is why the fixture
+// names repo acme/parent-close rather than the scenario's stub/parent-close:
+// "stub" is itself an inRepoVerificationMarkers substring, and a hint
+// carrying it would be suppressed by verifyHintDeclaresInRepo before the
+// route disjunct is ever consulted.
+//
+// COUNTERFACTUAL (run, not reasoned): mutate verifyHintNamesStubForge to
+// `return false` as its first statement, prove it landed with
+// `grep -n 'return false // cf' backend/internal/plan/acceptance_check.go`,
+// run → this test is RED ("undecidable_criterion count = 1, want 0");
+// restore → GREEN.
+func TestUnevaluableCriteria_StubForgeHintSuppressesWebhookTrigger(t *testing.T) {
+	const hint = "POST /v0/dev/forge/deliveries with a GitHub issues.closed payload for #103, then GET /v0/dev/forge/issues?forge=github&repo=acme/parent-close&number=100 shows state closed"
+	probe := AcceptanceCriterion{VerifyHint: hint}
+	if verifyHintDeclaresInRepo(probe) || verifyHintNamesSeedScenario(probe) {
+		t.Fatalf("fixture hint %q must carry no #3163 harness marker and no catalog scenario name, or the row cannot isolate the stub-forge disjunct", hint)
+	}
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		{
+			ID: "a1", Statement: "a real webhook delivery for the contract child closes the parent issue with one comment",
+			Source: CriterionSourceExplicit, SourceRef: "#3327", VerifyHint: hint,
+		},
+	}}
+	findings := EvaluateAcceptanceCriteria(v)
+	if got := findingsFor(findings, RuleUndecidableCriterion); len(got) != 0 {
+		t.Fatalf("undecidable_criterion count = %d, want 0 (a /v0/dev/forge route in verify_hint is sandbox-decidable evidence): %+v", len(got), got)
+	}
+	if got := findingsFor(findings, RuleMissingLiveValidationMarker); len(got) != 0 {
+		t.Fatalf("missing_live_validation_marker count = %d, want 0 (a webhook-delivery statement is not a live target): %+v", len(got), got)
+	}
+}
+
+// TestUnevaluableCriteria_StubForgeHintDoesNotSuppressLiveTarget preserves
+// #2845 under the third disjunct: a liveTarget statement (a real GitLab
+// instance — the "real gitlab" live-forge phrase) whose verify_hint names the
+// stub forge still draws BOTH the undecidable_criterion finding and the
+// missing_live_validation_marker finding. The stub is not a live forge, and
+// the disjunct sits under the same !uc.liveTarget conjunct as its siblings.
+//
+// COUNTERFACTUAL (the partition control): mutate verifyHintNamesStubForge to
+// `return true` as its first statement → this test must stay GREEN (the
+// !liveTarget conjunct, not the predicate, is what protects the live-target
+// classes); delete `!uc.liveTarget &&` from the conjunction instead → RED
+// ("undecidable_criterion count = 0, want 1"); restore → GREEN.
+func TestUnevaluableCriteria_StubForgeHintDoesNotSuppressLiveTarget(t *testing.T) {
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		{
+			ID: "a1", Statement: "closing the contract child on a real GitLab instance closes the parent",
+			Source: CriterionSourceExplicit, SourceRef: "#3327",
+			VerifyHint: "seed the stub forge via POST /v0/dev/forge/issues, then POST /v0/dev/forge/deliveries and read the parent back",
+		},
+	}}
+	findings := EvaluateAcceptanceCriteria(v)
+	got := findingsFor(findings, RuleUndecidableCriterion)
+	if len(got) != 1 {
+		t.Fatalf("undecidable_criterion count = %d, want 1 (the stub forge never stands up a live forge): %+v", len(got), got)
+	}
+	if !strings.Contains(got[0].Detail, "a live forge round-trip") {
+		t.Errorf("Detail = %q, want it to name the live-forge capability", got[0].Detail)
+	}
+	if mllv := findingsFor(findings, RuleMissingLiveValidationMarker); len(mllv) != 1 {
+		t.Fatalf("missing_live_validation_marker count = %d, want 1 (#2845 unchanged): %+v", len(mllv), mllv)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // missing_live_validation_marker (#2845, E54.31)
 //
 // FIXTURE-COLLISION SWEEP (run BEFORE any production edit, per the approved

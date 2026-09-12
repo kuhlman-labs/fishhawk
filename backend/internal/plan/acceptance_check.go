@@ -173,9 +173,12 @@ const (
 //     exemption is ALSO earned by a verify_hint carrying a KNOWN seeded-
 //     scenario catalog name as a whole token (verifyHintNamesSeedScenario —
 //     the acceptance preview's dev-only fixture surface materializes that
-//     scenario for the sandbox). A liveTarget capability (a live forge/deploy/
-//     external instance) is never exempted either way — no in-repository
-//     harness or seeded scenario stands one up (#2845 preserved). Advisory only.
+//     scenario for the sandbox), and as of E72.3 / #3327 by a verify_hint
+//     naming the preview's in-process stub forge (verifyHintNamesStubForge —
+//     a /v0/dev/forge route token or the phrase "stub forge"). A liveTarget
+//     capability (a live forge/deploy/external instance) is never exempted any
+//     of these ways — no in-repository harness, seeded scenario or stub forge
+//     stands one up (#2845 preserved). Advisory only.
 //   - missing_live_validation_marker — a criterion whose statement names a LIVE
 //     forge/deploy/external TARGET and which is NOT marked
 //     requires_live_validation. Its exemption is that marker ALONE:
@@ -609,6 +612,13 @@ var unevaluableCapabilities = []unevaluableCapability{
 //     the criterion needs (buildAcceptance's "Seeded fixtures" section), so an
 //     external-TRIGGER match whose hint says which scenario to seed is
 //     sandbox-decidable. The disjunct never widens the liveTarget classes.
+//   - verifyHintNamesStubForge (E72.3 / #3327) is the third disjunct under the
+//     same conjunct: a verify_hint naming the preview's in-process stub forge
+//     (a /v0/dev/forge route token or the phrase "stub forge") is positive
+//     evidence the sandbox can fabricate a webhook delivery through the real
+//     receivers, so a "real webhook delivery" statement whose hint drives the
+//     stub is sandbox-decidable. Same !liveTarget bound: it never suppresses a
+//     live forge / deploy / external-instance match.
 //
 // The suppression uses `continue`, NOT `break`: a suppressed non-liveTarget
 // match must not stop the scan, so a LATER liveTarget capability in the SAME
@@ -631,10 +641,11 @@ func UnevaluableCriteria(v Verification) []AcceptanceFinding {
 			}
 			// #3163: a non-liveTarget capability whose verify_hint names an
 			// in-repository harness is sandbox-decidable; E72.2 / #3326 extends
-			// the same conjunct to a hint naming a known seeded scenario.
+			// the same conjunct to a hint naming a known seeded scenario, and
+			// E72.3 / #3327 to one naming the preview's in-process stub forge.
 			// continue (not break) so a later liveTarget capability in the same
 			// statement still fires.
-			if !uc.liveTarget && (verifyHintDeclaresInRepo(c) || verifyHintNamesSeedScenario(c)) {
+			if !uc.liveTarget && (verifyHintDeclaresInRepo(c) || verifyHintNamesSeedScenario(c) || verifyHintNamesStubForge(c)) {
 				continue
 			}
 			detail := "criterion statement requires " + uc.capability +
@@ -1164,7 +1175,56 @@ func verifyHintNamesSeedScenario(c AcceptanceCriterion) bool {
 var seedScenarioNames = map[string]bool{
 	"grooming-confirm-gate": true,
 	"plan-gate-parked":      true,
+	"split-parent-linked":   true,
 	"trace-upload-target":   true,
+}
+
+// stubForgeRoutePrefix is the dev-only stub-forge control surface the
+// acceptance preview mounts in-process (E72.3 / #3327): GET/DELETE
+// /v0/dev/forge plus the /v0/dev/forge/{issues,pulls,deliveries} routes
+// beneath it. A verify_hint token that IS the root or begins with the
+// root followed by a slash names that family.
+const stubForgeRoutePrefix = "/v0/dev/forge"
+
+// stubForgePhrases are the prose spellings of the same surface.
+var stubForgePhrases = []string{"stub forge"}
+
+// verifyHintNamesStubForge is the E72.3 / #3327 evidence predicate, the third
+// disjunct under the same !liveTarget conjunct in UnevaluableCriteria beside
+// verifyHintDeclaresInRepo and verifyHintNamesSeedScenario: the criterion's
+// verify_hint — and ONLY verify_hint, for the same two reasons
+// verifyHintDeclaresInRepo states — names the acceptance preview's in-process
+// STUB FORGE, either as a whole acceptanceTokens token that is the
+// /v0/dev/forge route root or one of its sub-routes (/v0/dev/forge/issues,
+// /v0/dev/forge/deliveries, …), or as the phrase "stub forge". The preview
+// serves both forge families from that stub and POST /v0/dev/forge/deliveries
+// signs and dispatches a webhook delivery through the preview's REAL
+// receivers, so a hint naming it is positive evidence the sandbox can
+// fabricate the external TRIGGER a "real webhook delivery" statement asks for.
+//
+// This is what closes the plan-gate bootstrapping quirk recorded on #3327:
+// the gate classifies criteria with the classifier as it exists on main, so
+// the change that INTRODUCES a sandbox capability always has its own criteria
+// misjudged; every run after this one classifies a /v0/dev/forge-driven
+// criterion as sandbox-decidable.
+//
+// The route match is token-anchored (not a bare substring) so "/v0/dev/forgery"
+// or "/v0/dev/forge-proxy" earn nothing; the phrase match is a substring like
+// every other corpus phrase. It sits under !liveTarget: a hint naming the stub
+// never suppresses a live forge / deploy / external-instance match (#2845
+// preserved) — the stub is not a live forge and a statement that says it
+// needs one keeps its finding.
+func verifyHintNamesStubForge(c AcceptanceCriterion) bool {
+	hint := strings.ToLower(c.VerifyHint)
+	if containsAnyPhrase(hint, stubForgePhrases) {
+		return true
+	}
+	for _, tok := range acceptanceTokens(hint) {
+		if tok == stubForgeRoutePrefix || strings.HasPrefix(tok, stubForgeRoutePrefix+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // liveTargetCorpusMatch is M1: the statement names a live TARGET via a phrase

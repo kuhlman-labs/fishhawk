@@ -334,3 +334,80 @@ func TestApply_FreshRowsPerCall(t *testing.T) {
 		}
 	}
 }
+
+// TestApply_SplitParentLinked_LinkageRowsListableByCategory reads the
+// E72.3 / #3327 linkage back the way the E50.6 parent-close watcher does:
+// AuditRepo.ListAll(Category=split_children_filed) — the query that spans
+// both chains — must return BOTH seeded rows, one attributed to each run,
+// with parent_forge github and gitlab exactly once each and the parent /
+// contract-child numbers the watcher keys on. It also reads them back as
+// an UNTENANTED caller (AccountID empty), the posture the credential-free
+// acceptance agent's GET /v0/audit has on the preview.
+func TestApply_SplitParentLinked_LinkageRowsListableByCategory(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repos := newPGRepos(pool)
+	ctx := context.Background()
+
+	res, err := devfixtures.NewApplier(repos.deps(time.Now)).Apply(ctx, "split-parent-linked")
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	gh, gl := res.Runs["github-run"], res.Runs["gitlab-run"]
+	if gh.ID == uuid.Nil || gl.ID == uuid.Nil || gh.ID == gl.ID {
+		t.Fatalf("Result runs = %+v, want two distinct run ids", res.Runs)
+	}
+	for _, rr := range []devfixtures.RunResult{gh, gl} {
+		r, err := repos.runs.GetRun(ctx, rr.ID)
+		if err != nil {
+			t.Fatalf("GetRun(%s): %v", rr.ID, err)
+		}
+		if r.Repo != "stub/parent-close" || r.State != run.StateRunning || r.AccountID != "" {
+			t.Errorf("run %s = repo %q state %s account %q, want stub/parent-close running untenanted", rr.ID, r.Repo, r.State, r.AccountID)
+		}
+		stages := stagesByKey(t, repos, rr)
+		if len(stages) != 1 {
+			t.Fatalf("run %s carries %d stages, want 1", rr.ID, len(stages))
+		}
+		for _, st := range stages {
+			if st.Type != run.StageTypePlan || st.State != run.StageStateSucceeded {
+				t.Errorf("run %s stage = %s/%s, want plan/succeeded", rr.ID, st.Type, st.State)
+			}
+		}
+	}
+
+	cat := "split_children_filed"
+	entries, err := repos.audit.ListAll(ctx, audit.ListAllParams{Category: &cat})
+	if err != nil {
+		t.Fatalf("ListAll(split_children_filed): %v", err)
+	}
+	// The shared test database may carry rows from sibling tests; keep only
+	// the two this Apply minted, keyed by run id.
+	byRun := map[uuid.UUID]*audit.Entry{}
+	for _, e := range entries {
+		if e.RunID != nil && (*e.RunID == gh.ID || *e.RunID == gl.ID) {
+			if prev, dup := byRun[*e.RunID]; dup {
+				t.Fatalf("run %s carries two split_children_filed rows (%s, %s), want exactly one", *e.RunID, prev.ID, e.ID)
+			}
+			byRun[*e.RunID] = e
+		}
+	}
+	if len(byRun) != 2 {
+		t.Fatalf("ListAll returned linkage rows for %d of the 2 seeded runs; want both listable by category", len(byRun))
+	}
+	for id, wantForge := range map[uuid.UUID]string{gh.ID: "github", gl.ID: "gitlab"} {
+		e := byRun[id]
+		if e.Category != cat {
+			t.Errorf("run %s entry category = %q, want %q", id, e.Category, cat)
+		}
+		p := linkagePayload(t, string(e.Payload))
+		if p.ParentForge != wantForge {
+			t.Errorf("run %s parent_forge = %q, want %q", id, p.ParentForge, wantForge)
+		}
+		if p.ParentRepo != "stub/parent-close" || p.ParentIssue != 100 || p.ContractChildNumber != 103 {
+			t.Errorf("run %s linkage = %+v, want parent stub/parent-close#100 → contract child #103", id, p)
+		}
+		if e.AccountID != nil {
+			t.Errorf("run %s entry account_id = %s, want untenanted (universally listable)", id, *e.AccountID)
+		}
+	}
+}
