@@ -479,6 +479,49 @@ routes and the 404 rule. Same caveat as the #2581 blocks: this is an
 instruction to an LLM validator; the test proves it renders, not that it is
 obeyed, and the failure direction is a spurious skip, never a silent pass.
 
+## Acceptance-prompt stub forge (E72.3 / #3327)
+
+`writeAcceptanceStubForge` renders a `### Stub forge` section in
+`buildAcceptance` immediately AFTER `### Seeded fixtures` and BEFORE
+`### Output contract` — the same placement rationale: its backtick tokens fall
+outside the closed-field-set count region, and it introduces NO verdict field
+(its one rule reuses only `result`=`skipped` / `expectation_basis` of Posture
+A). It is STATIC renderer text — no issue-body or verify-output bytes flow
+through it — so it is not untrusted-intake rendering and the #2291
+injection/envelope corpora need no re-run; the offline containment gate still
+runs in verify and would fail if the section landed inside an envelope span.
+
+It tells the validator that the preview serves BOTH forge families (GitHub and
+GitLab) from an in-process stub — the preview's real receivers, watchers and
+adapters run against in-memory forge state, and no real forge is reachable
+from the sandbox — then names the loopback-only, credential-free control
+surface on the same listener: `GET /v0/dev/forge` snapshots state (issues,
+pulls/merge requests, comments, the arrival-ordered request log);
+`POST /v0/dev/forge/issues` / `POST /v0/dev/forge/pulls` seed;
+`GET /v0/dev/forge/issues?forge=&repo=&project_id=&number=` reads one issue
+back with its comments (404 `stub_issue_not_found`);
+`POST /v0/dev/forge/deliveries` signs a webhook delivery preview-side
+(`X-Hub-Signature-256` / `X-Gitlab-Token` — the agent never holds the secret)
+and dispatches it SYNCHRONOUSLY through the real receiver, answering 200
+`{delivery_id, status, body}` with the receiver's own status, so every side
+effect has already happened when the 200 returns (no polling); a GitHub
+`issues` payload needs `installation.id`, `repository.full_name`, `action`,
+`issue.number`, a GitLab `Issue Hook` payload needs `project.id`,
+`project.path_with_namespace`, `object_attributes.iid` / `.action`; the
+`split-parent-linked` seeded scenario supplies the `split_children_filed`
+linkage rows the parent-close watcher reads (seed it BEFORE the delivery);
+`DELETE /v0/dev/forge` resets between criteria. The load-bearing rule is the
+last one: a 404 on `GET /v0/dev/forge` means the target was NOT provisioned
+with the stub forge (`FISHHAWKD_DEV_STUB_FORGE=1`) — a provisioning fact, not
+evidence against the change — so every dependent criterion is `skipped` under
+Posture A, never `failed`. `TestBuild_Acceptance_StubForgeSection` pins
+presence-exactly-once, position (after seeded fixtures, before the output
+contract, no heading between), every route, the delivery contract and payload
+fields, the scenario, the 404 rule, and ABSENCE from every non-acceptance
+render. Same caveat as the seeded-fixtures block: the test proves the
+instruction renders, not that an LLM validator obeys it; the failure direction
+is a spurious skip, never a silent pass.
+
 ## Fix-up reporting obligations (#2737)
 
 `writeFixupReportObligations` renders the binding "### Reporting obligations
@@ -963,7 +1006,10 @@ the same machine-derived duplicate — the operator waived the identical pair of
 concerns 14 times across one campaign, always for the same reason: the
 acceptance preview is a separate, empty `*_preview` database behind a
 localhost:8090-only allow-list with no forge client, so no criterion is
-drivable.
+drivable. (That was the preview of the time; since E72.2 seeded fixtures
+and the E72.3 in-process stub forge, forge-driven and state-dependent
+criteria ARE drivable there, which is exactly the "could actually be driven"
+case the HANDLING clause below reserves a concern for.)
 
 `writePlanGateEvidence` now writes ONE `- ADVISORY all_criteria_skip_expected:`
 line (`allSkipAdvisoryLine`) in place of the CONSEQUENCE line, carrying the

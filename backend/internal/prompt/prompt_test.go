@@ -10074,6 +10074,101 @@ func TestBuild_Acceptance_SeededFixturesSection(t *testing.T) {
 	}
 }
 
+// TestBuild_Acceptance_StubForgeSection pins the E72.3 / #3327 "### Stub forge"
+// section of the acceptance prompt: it renders exactly once on the acceptance
+// render, immediately AFTER "### Seeded fixtures" and BEFORE "### Output
+// contract" (so its backtick tokens fall outside the closed-field-set count
+// region — TestBuild_Acceptance_ClosedFieldSet_LockstepWithValidator stays
+// green alongside), it names every /v0/dev/forge route, the synchronous
+// delivery contract with both families' required payload fields, the
+// split-parent-linked scenario, the reset rule and the 404 ⇒ Posture A skip
+// rule; and it is ABSENT from every non-acceptance render. Deleting the
+// writeAcceptanceStubForge call leaves this RED on the first want.
+func TestBuild_Acceptance_StubForgeSection(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	const section = "### Stub forge"
+	const seeded = "### Seeded fixtures"
+	const outputContract = "### Output contract"
+	si := strings.Index(got, section)
+	if si < 0 {
+		t.Fatalf("acceptance prompt missing %q section\n---\n%s", section, got)
+	}
+	if n := strings.Count(got, section); n != 1 {
+		t.Errorf("acceptance prompt renders %q %d times, want exactly once", section, n)
+	}
+	fi := strings.Index(got, seeded)
+	if fi < 0 {
+		t.Fatalf("acceptance prompt missing %q section\n---\n%s", seeded, got)
+	}
+	oi := strings.Index(got, outputContract)
+	if oi < 0 {
+		t.Fatalf("acceptance prompt missing %q section\n---\n%s", outputContract, got)
+	}
+	if fi >= si || si >= oi {
+		t.Errorf("%q at %d must render AFTER %q at %d and BEFORE %q at %d",
+			section, si, seeded, fi, outputContract, oi)
+	}
+	// "Immediately after": no other "### " heading sits between the two.
+	if between := got[fi+len(seeded) : si]; strings.Contains(between, "\n### ") {
+		t.Errorf("a heading intervenes between %q and %q\n---\n%s", seeded, section, between)
+	}
+	body := got[si:oi]
+	for _, want := range []string{
+		// Every control route, by method + path.
+		"`GET /v0/dev/forge`",
+		"`DELETE /v0/dev/forge`",
+		"`GET /v0/dev/forge/issues?forge=&repo=&project_id=&number=`",
+		"`POST /v0/dev/forge/issues`",
+		"`POST /v0/dev/forge/pulls`",
+		"`POST /v0/dev/forge/deliveries`",
+		// Both families served in-process.
+		"BOTH forge families",
+		"in-process stub forge",
+		// The delivery contract: synchronous, preview-signed, receiver status echoed.
+		"SYNCHRONOUSLY",
+		"`X-Hub-Signature-256`",
+		"`X-Gitlab-Token`",
+		"`{\"delivery_id\",\"status\",\"body\"}`",
+		"ALREADY happened when the 200 returns",
+		// Required payload fields per family.
+		"`installation.id`",
+		"`repository.full_name`",
+		"`project.id`",
+		"`project.path_with_namespace`",
+		"`object_attributes.iid`",
+		"`object_attributes.action`",
+		// The linkage scenario.
+		"`split-parent-linked`",
+		"`split_children_filed`",
+		// The 404 rule: provisioning fact, Posture A skip, never failed.
+		"A 404 on `GET /v0/dev/forge`",
+		"NOT provisioned",
+		"`result`=`skipped`",
+		"Posture A",
+		"never `failed`",
+		// 404 on the stub-issue read.
+		"`stub_issue_not_found`",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("stub-forge section missing %q\n---\n%s", want, body)
+		}
+	}
+
+	// Absent from every non-acceptance render.
+	for _, stage := range []string{"plan", "plan_review", "implement", "implement_review"} {
+		out, err := Build(stage, Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan(), IssueNumber: 1, IssueTitle: "t", IssueBody: "b"})
+		if err != nil {
+			t.Fatalf("Build(%s): %v", stage, err)
+		}
+		if strings.Contains(out, section) || strings.Contains(out, "/v0/dev/forge") {
+			t.Errorf("%s render must not carry the stub-forge section\n---\n%s", stage, out)
+		}
+	}
+}
+
 // TestAcceptanceTreePath pins the run/stage-keyed merge-candidate checkout path
 // literal (#1881) — the prompt side of the byte-identical lockstep pair the
 // runner's acceptanceTreePath mirrors (runner/cmd/fishhawk-runner/acceptancetree.go),
