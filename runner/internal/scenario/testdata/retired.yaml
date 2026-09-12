@@ -1,0 +1,10 @@
+# A retirement ledger with one full entry; the reason is the field the
+# cross-run test asserts survives byte-identical. A reason carrying `#`
+# MUST be quoted in hand-authored YAML (an unquoted ` #` starts a comment);
+# WriteRetired quotes it itself.
+retired:
+  - id: scenario:issue-100/crit-a
+    reason: "behaviour replaced by #3327"
+    run_id: 22222222-2222-2222-2222-222222222222
+    pr: 742
+    retired_at: 2026-09-02T09:30:00Z
