@@ -1182,8 +1182,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 
 		// Replayable scenario corpus, pre-spawn (E72.4 / #3328). All three
 		// steps read the provisioned acceptance tree (the merge candidate):
-		//   1. scenarioRemovalGuard — a scenario deleted/modified without a
-		//      ledger entry, or a ledger entry not backed by this run's
+		//   1. scenarioRemovalGuard — a scenario deleted/modified/type-changed
+		//      (any status but A) without a ledger entry, or a ledger entry
+		//      not backed by this run's
 		//      approval, fails category-B BEFORE any spawn (the deferred drop
 		//      reporter above then names the guard as the exit path);
 		//   2. loadReplayCorpus — cap evidence + attribution from the LOADED

@@ -378,6 +378,26 @@ func TestScenarioRemovalGuard(t *testing.T) {
 		{"modified without retirement → B", "", nil, func(repo string, _ func(...string)) {
 			mustWrite(t, filepath.Join(repo, "acceptance/scenarios/issue-101/crit-b.yaml"), scenarioYAML("scenario:issue-101/crit-b", 101, 742, "r0", time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)))
 		}, guardRemovedWithoutRetirement, "M acceptance/scenarios/issue-101/crit-b.yaml"},
+		{"replaced by a symlink (T) without retirement → B", "", nil, func(repo string, runGit func(...string)) {
+			// A type change is neither D nor M: the path survives but its blob
+			// mode flips to a symlink whose target is not a scenario document.
+			target := filepath.Join(repo, "acceptance/scenarios/issue-101/crit-b.yaml")
+			if err := os.Remove(target); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("../../../README.md", target); err != nil {
+				t.Fatal(err)
+			}
+		}, guardRemovedWithoutRetirement, "T acceptance/scenarios/issue-101/crit-b.yaml"},
+		{"replaced by a symlink (T), only in served → proceeds", "", servedB, func(repo string, _ func(...string)) {
+			target := filepath.Join(repo, "acceptance/scenarios/issue-101/crit-b.yaml")
+			if err := os.Remove(target); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("../../../README.md", target); err != nil {
+				t.Fatal(err)
+			}
+		}, "", ""},
 		{"ledger entry new at HEAD, not served → B", "", nil, func(repo string, _ func(...string)) {
 			mustWrite(t, filepath.Join(repo, "acceptance/scenarios/retired.yaml"), ledgerCritB)
 		}, guardRetirementUnledgered, "scenario:issue-101/crit-b"},

@@ -38,7 +38,8 @@ import (
  *       ships outcome acceptance_scenario_retirement_dropped so an approved
  *       retirement can never vanish silently.
  *   scenarioRemovalGuard — pre-spawn category-B refusal of a scenario file
- *       deleted or modified without a ledger entry, and of a ledger entry not
+ *       deleted, modified or type-changed (any status but A) without a
+ *       ledger entry, and of a ledger entry not
  *       backed by this run's approval.
  */
 
@@ -405,8 +406,9 @@ const (
 // acceptance/scenarios/` in treeDir and returns a non-empty category-B reason
 // (plus detail) when:
 //
-//   - a scenario file was DELETED or MODIFIED and its id is in neither
-//     retired.yaml@HEAD nor the served retirement set
+//   - a scenario file was DELETED, MODIFIED or TYPE-CHANGED (T: replaced by
+//     a symlink, or any status other than a pure addition) and its id is in
+//     neither retired.yaml@HEAD nor the served retirement set
 //     (acceptance_scenario_removed_without_retirement) — a retirement is the
 //     only sanctioned way a scenario leaves the corpus;
 //   - retired.yaml gained an entry at HEAD whose id is not in the served set
@@ -472,7 +474,15 @@ func scenarioRemovalGuard(ctx context.Context, treeDir, baseRef string, served [
 			ledgerChanged = true
 			continue
 		}
-		if status == "" || (status[0] != 'D' && status[0] != 'M') {
+		// ALLOW-list, not a deny-list: only a pure addition (A) leaves the
+		// existing corpus intact. Every other status — D, M, and T (a file
+		// replaced by a symlink or vice versa; with --no-renames R/C cannot
+		// appear) — replaces or removes a scenario that existed at the merge
+		// base, and a T whose symlink target is not a scenario document would
+		// otherwise make scenario.Load fail and skip replay wholesale without
+		// any retirement. An unknown status is treated the same way (fail
+		// closed).
+		if status == "" || status[0] == 'A' {
 			continue
 		}
 		id := scenarioIDForPath(path)
