@@ -1575,7 +1575,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		resp.EgressTargetHosts = s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow)
 		resp.AcceptanceCriteriaIDs = acceptanceCriteriaIDsFromPlan(trigger.ApprovedPlan)
 		resp.AcceptanceExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
-		s.fillAcceptanceReplayFields(r.Context(), runRow.ID, stage.ID, trigger.ApprovedPlan, &resp)
+		s.fillAcceptanceReplayFields(r.Context(), runRow.ID, stage.ID, trigger.ApprovedPlan, &resp, true)
 		resp.AcceptanceIssueNumber = trigger.IssueNumber
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
@@ -2207,7 +2207,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		resp.EgressTargetHosts = s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow)
 		resp.AcceptanceCriteriaIDs = acceptanceCriteriaIDsFromPlan(trigger.ApprovedPlan)
 		resp.AcceptanceExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
-		s.fillAcceptanceReplayFields(r.Context(), runRow.ID, stage.ID, trigger.ApprovedPlan, &resp)
+		s.fillAcceptanceReplayFields(r.Context(), runRow.ID, stage.ID, trigger.ApprovedPlan, &resp, false)
 		resp.AcceptanceIssueNumber = trigger.IssueNumber
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
@@ -4390,16 +4390,32 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 // resolveAcceptancePromptCriteria takes), and the FULL approved
 // retire_scenario entries with pr filled from the ledger. Every field is
 // omitempty, so an acceptance response with nothing to serve is unchanged.
-func (s *Server) fillAcceptanceReplayFields(ctx context.Context, runID, stageID uuid.UUID, p *plan.Plan, resp *promptResponse) {
+//
+// recordDrop selects the dispatch path (handleGetStagePrompt, true) over the
+// preview render (handleGetStagePromptRender, false): on an approval-chain
+// read error the criteria direction is unchanged (fail-open), but the
+// approved retirements that read would have named are NOT served — and
+// nothing else on that fetch can say so (#3396). The dispatch path therefore
+// WARN-logs the named event acceptance_retirements_unserved and best-effort
+// appends ONE acceptance_scenario_retirement_dropped row for the stage with
+// reason approval_chain_unreadable (retired: [] — the read that would name
+// them is the one that failed), idempotent per (stage, reason). A preview
+// render never mints the row.
+func (s *Server) fillAcceptanceReplayFields(ctx context.Context, runID, stageID uuid.UUID, p *plan.Plan, resp *promptResponse, recordDrop bool) {
 	resp.AcceptanceRunBranch, resp.AcceptancePullRequestNumber = s.resolveAcceptanceRunBranchAndPR(ctx, runID, stageID)
 	eff, err := s.resolveEffectiveAcceptanceCriteria(ctx, runID, p, nil)
 	live := eff.Live
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"prompt: effective acceptance criteria unreadable for the replay corpus; serving the full plan set",
-			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+			"prompt: acceptance_retirements_unserved: approval chain unreadable; approved scenario retirements NOT served this fetch (criteria fail open to the full plan set)",
+			slog.String("event", acceptanceRetirementsUnservedEvent),
+			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
 		if p != nil {
 			live = p.Verification.AcceptanceCriteria
+		}
+		if recordDrop && s.cfg.AuditRepo != nil {
+			s.recordAcceptanceRetirementsUnserved(ctx, runID, stageID, err)
 		}
 	}
 	for _, c := range live {
@@ -4416,6 +4432,57 @@ func (s *Server) fillAcceptanceReplayFields(ctx context.Context, runID, stageID 
 			e.PR = resp.AcceptancePullRequestNumber
 		}
 		resp.AcceptanceRetiredScenarios = append(resp.AcceptanceRetiredScenarios, e)
+	}
+}
+
+// acceptanceRetirementsUnservedEvent is the WARN log event the dispatch and
+// render prompt paths emit when the approval-chain read behind the replay
+// corpus fails (#3396) — the floor of the operator surface; the audit row
+// below is the ceiling (it may itself fail on a degraded store).
+const acceptanceRetirementsUnservedEvent = "acceptance_retirements_unserved"
+
+// acceptanceRetirementDropReasonChainUnreadable is the reason the backend
+// writes on the acceptance_scenario_retirement_dropped row it mints from the
+// dispatch prompt path when the approval-chain read fails. Unlike the
+// runner-reported reasons this row carries retired: [] — the failed read is
+// the only source of the entries it would name.
+const acceptanceRetirementDropReasonChainUnreadable = "approval_chain_unreadable"
+
+// recordAcceptanceRetirementsUnserved best-effort appends ONE
+// acceptance_scenario_retirement_dropped entry for stageID with reason
+// approval_chain_unreadable (#3396), idempotent via
+// retirementDropAlreadyRecorded (a list error is WARN + proceed, mirroring
+// recordAcceptanceScenarioRetirementDropped). An append failure is WARN-logged
+// and never unwinds the prompt response. No notifyStatusUpdate: the row is the
+// operator surface for this category.
+func (s *Server) recordAcceptanceRetirementsUnserved(ctx context.Context, runID, stageID uuid.UUID, readErr error) {
+	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceScenarioRetirementDropped); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: acceptance retirements-unserved drop: list audit entries failed; proceeding without idempotency guard",
+			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()), slog.String("error", err.Error()))
+	} else if retirementDropAlreadyRecorded(entries, stageID, acceptanceRetirementDropReasonChainUnreadable) {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":       runID.String(),
+		"stage_id":     stageID.String(),
+		"retired":      []retiredScenarioEntry{},
+		"scenario_ids": []string{},
+		"reason":       acceptanceRetirementDropReasonChainUnreadable,
+		"error":        readErr.Error(),
+	})
+	actorKind := audit.ActorSystem
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryAcceptanceScenarioRetirementDropped,
+		ActorKind: &actorKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: acceptance retirements-unserved drop: append audit entry failed",
+			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()), slog.String("error", err.Error()))
 	}
 }
 

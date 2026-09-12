@@ -358,6 +358,151 @@ func TestWrite_RoundTripsLoad(t *testing.T) {
 	if _, err := Write(dir, Scenario{ID: "scenario:../escape"}); err == nil {
 		t.Error("path traversal must be refused")
 	}
+	// Positive control for the #3396 guard: a nested NON-symlink dir that
+	// does not exist yet is still created and written (MkdirAll unchanged).
+	nested := want
+	nested.ID = "scenario:issue-303/crit-z"
+	if _, err := Write(dir, nested); err != nil {
+		t.Fatalf("plain nested write must succeed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "issue-303", "crit-z.yaml")); err != nil {
+		t.Errorf("nested write missing: %v", err)
+	}
+}
+
+// symlinkFixture returns a corpus root and an OUTSIDE directory (a sibling
+// under the same t.TempDir so the two are never nested) plus a scenario to
+// write; the caller plants the hostile symlink under root.
+func symlinkFixture(t *testing.T) (root, outside string, s Scenario) {
+	t.Helper()
+	base := t.TempDir()
+	root, outside = filepath.Join(base, "root"), filepath.Join(base, "outside")
+	for _, d := range []string{root, outside} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s = Scenario{
+		ID: "scenario:issue-101/crit-b", Statement: "st", Steps: "steps",
+		Origin: Origin{Issue: 101, RunID: "run", RecordedAt: time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)},
+	}
+	return root, outside, s
+}
+
+// assertOutsideUntouched: the outside dir holds exactly want entries (no
+// scenario yaml, no retired.yaml, no leaked .*.tmp) and every named path
+// under root is STILL a symlink (the guard neither followed nor replaced it).
+func assertOutsideUntouched(t *testing.T, outside string, want []string, stillLinks ...string) {
+	t.Helper()
+	ents, err := os.ReadDir(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range ents {
+		got = append(got, e.Name())
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("outside dir entries = %v, want %v (a write escaped root)", got, want)
+	}
+	for _, p := range stillLinks {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Errorf("%s must still be a symlink after the refusal: lstat: %v", p, err)
+		} else if fi.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("%s must still be a symlink after the refusal, mode %v (the write replaced it)", p, fi.Mode())
+		}
+	}
+}
+
+// TestWrite_RefusesSymlinkedDirComponent (#3396): root/issue-101 is a REAL
+// symlink to a directory outside root. Write must refuse, naming the
+// component, and nothing — not the yaml, not a temp file — may land outside.
+func TestWrite_RefusesSymlinkedDirComponent(t *testing.T) {
+	root, outside, s := symlinkFixture(t)
+	link := filepath.Join(root, "issue-101")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Write(root, s)
+	if err == nil || !strings.Contains(err.Error(), `symlinked path component "issue-101"`) {
+		t.Errorf("Write err = %v, want a refusal naming issue-101", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "crit-b.yaml")); err == nil {
+		t.Error("crit-b.yaml landed outside root through the symlink")
+	}
+	assertOutsideUntouched(t, outside, nil, link)
+}
+
+// TestWrite_RefusesSymlinkedLeaf (#3396): the LEAF crit-b.yaml is a symlink
+// to a file outside root with known bytes. Write refuses naming the leaf and
+// the target's bytes are unchanged (rename onto a symlink would replace the
+// link entry, not the target — the refusal is belt-and-braces).
+func TestWrite_RefusesSymlinkedLeaf(t *testing.T) {
+	root, outside, s := symlinkFixture(t)
+	target := filepath.Join(outside, "target.yaml")
+	if err := os.WriteFile(target, []byte("known\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "issue-101"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "issue-101", "crit-b.yaml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Write(root, s)
+	if err == nil || !strings.Contains(err.Error(), `symlinked path component "crit-b.yaml"`) {
+		t.Errorf("Write err = %v, want a refusal naming crit-b.yaml", err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "known\n" {
+		t.Errorf("target bytes changed: %q", b)
+	}
+	assertOutsideUntouched(t, outside, []string{"target.yaml"}, link)
+}
+
+// TestWriteRetired_RefusesSymlinkedLedger (#3396): WriteRetired shares
+// writeAtomic, so a symlinked retired.yaml is refused the same way.
+func TestWriteRetired_RefusesSymlinkedLedger(t *testing.T) {
+	root, outside, _ := symlinkFixture(t)
+	target := filepath.Join(outside, "x.yaml")
+	if err := os.WriteFile(target, []byte("known\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, RetiredFile)
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	err := WriteRetired(root, []RetiredEntry{{ID: "scenario:issue-7/old", Reason: "r"}})
+	if err == nil || !strings.Contains(err.Error(), `symlinked path component "retired.yaml"`) {
+		t.Errorf("WriteRetired err = %v, want a refusal naming retired.yaml", err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "known\n" {
+		t.Errorf("target bytes changed: %q", b)
+	}
+	assertOutsideUntouched(t, outside, []string{"x.yaml"}, link)
+}
+
+// TestRefuseSymlinks_NonDirectoryComponentAndMissingTail: an existing
+// intermediate that is a regular FILE is refused by name; a path whose
+// components do not exist yet passes (MkdirAll creates them).
+func TestRefuseSymlinks_NonDirectoryComponentAndMissingTail(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "issue-101"), []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := RefuseSymlinks(root, "issue-101/crit-b.yaml")
+	if err == nil || !strings.Contains(err.Error(), `non-directory path component "issue-101"`) {
+		t.Fatalf("err = %v, want a non-directory refusal naming issue-101", err)
+	}
+	if err := RefuseSymlinks(root, "issue-202/deep/crit-b.yaml"); err != nil {
+		t.Fatalf("absent components must pass: %v", err)
+	}
+	if err := RefuseSymlinks(root, "issue-101"); err != nil {
+		t.Fatalf("a regular-file LEAF is overwritable, not refused: %v", err)
+	}
 }
 
 func TestWireTypes_ExactJSONKeys(t *testing.T) {

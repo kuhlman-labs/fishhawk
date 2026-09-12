@@ -545,7 +545,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// acceptanceReplaySet is the cap evidence + attribution loadReplayCorpus
 	// computed from the LOADED corpus files, injected into the validated
 	// verdict body; retirementDrop is the deferred drop reporter, armed the
-	// instant the fetch returns served retirements (binding condition 1) and
+	// instant the WIRE delivers served retirements — before the prompt file
+	// exists and before the fetchErr check (binding condition 1, #3396) — and
 	// disarmed only by a successful acceptance_scenarios_pushed report.
 	var (
 		acceptanceReplayIn  acceptanceReplayInputs
@@ -582,14 +583,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		issuedKey = key
 		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
-		if fetchErr != nil {
-			_, _ = fmt.Fprintf(logSink,
-				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
-			return exitFailure
-		}
 		// Arm the retirement-drop reporter IMMEDIATELY (E72.4 / #3328, binding
-		// condition 1): from this line on, every return from run() — the
-		// version-skew and agent-version checks, the lineage block, the
+		// condition 1) — and BEFORE the fetchErr check (#3396): the guarantee
+		// starts the moment the WIRE delivered the retirements, not the moment
+		// the prompt file exists. fetchPromptToFile populates sType and the
+		// replay inputs as soon as FetchPrompt succeeds, so a prompt-file I/O
+		// failure (temp create/chmod/write/close) arrives here with them set
+		// and ships fetch_prompt_failed; a network failure arrives with both
+		// zero and arms nothing (nothing was delivered, nothing to report).
+		// From this line on, every return from run() — the fetch_prompt exit,
+		// the version-skew and agent-version checks, the lineage block, the
 		// acceptance target gate, provisionAcceptanceTree, the removal guard,
 		// the verdict capture/validation, the ship and the persist step — is
 		// covered by the deferred report, so an approved retirement the fetch
@@ -604,6 +607,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				"run_id": cfg.runID, "stage_id": cfg.stageID,
 				"retired_ids": strings.Join(retiredIDs(acceptanceReplayIn.retired), ","),
 			})
+		}
+		if fetchErr != nil {
+			retirementDrop.note("fetch_prompt_failed")
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
+			return exitFailure
 		}
 		// Version-skew check: if the backend requires a newer runner, exit
 		// immediately rather than invoking the agent with potentially
@@ -3204,20 +3213,27 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
 		got.StageID, got.StageType, got.PromptHash, len(got.Prompt),
 	)
+	// The wire delivered: capture the stage type and the acceptance replay
+	// inputs NOW so every prompt-file I/O failure below still returns them
+	// and run() can arm the retirement-drop reporter (#3396) — a served
+	// retirement that reached this process must never vanish because the
+	// temp file could not be created.
+	stageType = got.StageType
+	acceptanceReplay = acceptanceReplayInputsFromPrompt(got)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, fmt.Errorf("write prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, fmt.Errorf("close prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, fmt.Errorf("close prompt temp file: %w", err)
 	}
 	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), nil
 }

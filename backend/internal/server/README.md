@@ -762,6 +762,23 @@ new preview head (`runner/internal/scenario`). The backend half is four seams:
   that does NOT yet render the drop — `issuecomment`'s `activityCategories`
   excludes the kind, so the audit entry is the operator-visible surface;
   rendering it is a tracked follow-up, see `docs/issue-comment-surfaces.md`).
+  `acceptance_scenario_retirement_dropped` has a SECOND writer (#3396): the
+  dispatch prompt path (`prompt.go` `fillAcceptanceReplayFields(…,
+  recordDrop=true)` → `recordAcceptanceRetirementsUnserved`) appends it with
+  reason `approval_chain_unreadable` and `retired: []` when the
+  approval-chain read behind the replay corpus fails — the criteria still
+  fail OPEN to the plan's full set (#2581 direction unchanged) but the
+  approved retirements that read would have named are NOT served, and this
+  row is the alertable record of that. Idempotent per stage+reason via the
+  same `retirementDropAlreadyRecorded`, actor `system`, best-effort (a list
+  error is WARN + proceed; an append error is WARN-logged, never a non-200),
+  NO status refresh, and NEVER from `handleGetStagePromptRender`
+  (`recordDrop=false`). Both paths WARN-log the named event
+  `acceptance_retirements_unserved {run_id, stage_id, error}` — the floor of
+  the surface when the store itself is degraded. Pinned by
+  `TestPromptResponse_AcceptanceReplay_DegradedChainReadRecordsDrop`
+  (`prompt_test.go`), which reads the row back through
+  `GET /v0/runs/{id}/audit?category=acceptance_scenario_retirement_dropped`.
 
 Residual, stated: an operator-invoked `fishhawk_retry_stage` on the settled
 acceptance stage AFTER a scenario push sees recorded-head ≠ current-head

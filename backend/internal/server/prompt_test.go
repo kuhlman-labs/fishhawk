@@ -12999,6 +12999,12 @@ func TestPromptResponse_AcceptanceReplayFieldsServedOnlyOnAcceptanceStage(t *tes
 			t.Errorf("response missing wire tag %s:\n%s", tag, w.Body.String())
 		}
 	}
+	// A healthy read never mints the #3396 approval_chain_unreadable row.
+	for _, p := range au.appended {
+		if p.Category == CategoryAcceptanceScenarioRetirementDropped {
+			t.Errorf("healthy fetch appended a drop row: %s", p.Payload)
+		}
+	}
 
 	t.Run("no ledger entries", func(t *testing.T) {
 		s2, runID2, acc2, priv2, _ := newAcceptancePromptServer(t)
@@ -13022,6 +13028,146 @@ func TestPromptResponse_AcceptanceReplayFieldsServedOnlyOnAcceptanceStage(t *tes
 			if strings.Contains(w.Body.String(), tag) {
 				t.Errorf("plan stage served %s", tag)
 			}
+		}
+	})
+}
+
+// TestPromptResponse_AcceptanceReplay_DegradedChainReadRecordsDrop (#3396):
+// ONLY the approval_submitted read fails (the ledger read, the drop-category
+// idempotency read and the append still work). The dispatch prompt path keeps
+// the #2581 fail-open criteria direction, serves NO retirements, WARN-logs the
+// named event acceptance_retirements_unserved, and mints exactly ONE
+// acceptance_scenario_retirement_dropped row for the acceptance stage with
+// reason approval_chain_unreadable and retired: [] — asserted through the
+// run-audit REST response an operator reads (condition 1a), not only the
+// fake's appended slice. A second fetch appends nothing (idempotent); the
+// preview render never mints the row; an append failure is best-effort.
+func TestPromptResponse_AcceptanceReplay_DegradedChainReadRecordsDrop(t *testing.T) {
+	seed := func(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey, *auditFake, *bytes.Buffer) {
+		t.Helper()
+		s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+		au := s.cfg.AuditRepo.(*auditFake)
+		seedHeadEntry(au, runID, nil, "pull_request_opened", 1, map[string]any{
+			"head_sha": "prhead", "branch": "fishhawk/run-x/stage-y", "pr_number": 742})
+		au.seeded[len(au.seeded)-1].Timestamp = time.Now()
+		planStageID := s.cfg.RunRepo.(*promptRunRepo).stagesByRunID[runID][0].ID
+		seedHeadEntry(au, runID, &planStageID, "approval_submitted", 2, map[string]any{
+			"stage_id": planStageID.String(), "decision": "approve",
+			"retired_scenarios": []retiredScenarioEntry{{ID: "scenario:issue-101/crit-b", Reason: "behaviour replaced", RunID: runID.String(), PR: 0, RetiredAt: "2026-09-12T00:00:00Z"}},
+		})
+		au.listByCategoryErrCategory = "approval_submitted"
+		var logBuf bytes.Buffer
+		s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		return s, runID, acceptanceStageID, priv, au, &logBuf
+	}
+	dropRows := func(au *auditFake) []audit.ChainAppendParams {
+		var out []audit.ChainAppendParams
+		au.mu.Lock()
+		defer au.mu.Unlock()
+		for _, p := range au.appended {
+			if p.Category == CategoryAcceptanceScenarioRetirementDropped {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+
+	s, runID, acceptanceStageID, priv, au, logBuf := seed(t)
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail-open):\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.AcceptanceCriteria) != 2 || resp.AcceptanceCriteria[0].ID != "ac-create" {
+		t.Errorf("AcceptanceCriteria = %+v, want the plan's two (fail-open direction unchanged)", resp.AcceptanceCriteria)
+	}
+	if len(resp.AcceptanceRetiredScenarios) != 0 || strings.Contains(w.Body.String(), "acceptance_retired_scenarios") {
+		t.Errorf("no retirement may be served from a failed read:\n%s", w.Body.String())
+	}
+	rows := dropRows(au)
+	if len(rows) != 1 {
+		t.Fatalf("acceptance_scenario_retirement_dropped rows = %d, want exactly 1", len(rows))
+	}
+	if rows[0].StageID == nil || *rows[0].StageID != acceptanceStageID {
+		t.Errorf("row stage = %v, want the acceptance stage %s", rows[0].StageID, acceptanceStageID)
+	}
+	// The observable an operator reads: GET /v0/runs/{id}/audit?category=….
+	items := auditFeedItems(t, s, runID, CategoryAcceptanceScenarioRetirementDropped)
+	if len(items) != 1 {
+		t.Fatalf("run-audit items = %d, want 1", len(items))
+	}
+	var payload struct {
+		Reason  string           `json:"reason"`
+		Error   string           `json:"error"`
+		Retired []map[string]any `json:"retired"`
+		StageID string           `json:"stage_id"`
+	}
+	if err := json.Unmarshal(items[0].Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v\n%s", err, items[0].Payload)
+	}
+	if payload.Reason != "approval_chain_unreadable" || payload.Error == "" || payload.StageID != acceptanceStageID.String() {
+		t.Errorf("payload = %s, want reason approval_chain_unreadable + error + the acceptance stage", items[0].Payload)
+	}
+	if payload.Retired == nil || len(payload.Retired) != 0 || !strings.Contains(string(items[0].Payload), `"retired":[]`) {
+		t.Errorf("retired must be an EMPTY LIST (not null): %s", items[0].Payload)
+	}
+	// Named WARN event, exactly once.
+	if n := strings.Count(logBuf.String(), `"event":"acceptance_retirements_unserved"`); n != 1 {
+		t.Errorf("acceptance_retirements_unserved log lines = %d, want 1:\n%s", n, logBuf.String())
+	}
+	// Idempotent per (stage, reason): a second fetch appends nothing.
+	if w := promptRequest(t, s, runID, acceptanceStageID, priv, ""); w.Code != http.StatusOK {
+		t.Fatalf("second fetch status = %d", w.Code)
+	}
+	if n := len(dropRows(au)); n != 1 {
+		t.Errorf("rows after a second fetch = %d, want 1 (idempotent)", n)
+	}
+
+	t.Run("preview render mints no row", func(t *testing.T) {
+		s, _, acceptanceStageID, _, au, logBuf := seed(t)
+		w := promptRenderRequest(t, s, acceptanceStageID)
+		if w.Code != http.StatusOK {
+			t.Fatalf("render status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(resp.AcceptanceCriteria) != 2 {
+			t.Errorf("render must still fail open to the plan criteria, got %+v", resp.AcceptanceCriteria)
+		}
+		if n := len(dropRows(au)); n != 0 {
+			t.Errorf("render appended %d drop rows, want 0", n)
+		}
+		if !strings.Contains(logBuf.String(), `"event":"acceptance_retirements_unserved"`) {
+			t.Error("render must still WARN the named event")
+		}
+	})
+	t.Run("append failure is best-effort", func(t *testing.T) {
+		s, runID, acceptanceStageID, priv, au, logBuf := seed(t)
+		au.appendErrCategory = CategoryAcceptanceScenarioRetirementDropped
+		w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 despite the append failure:\n%s", w.Code, w.Body.String())
+		}
+		if n := len(dropRows(au)); n != 0 {
+			t.Errorf("rows = %d, want 0", n)
+		}
+		if !strings.Contains(logBuf.String(), "append audit entry failed") {
+			t.Errorf("append failure must be WARN-logged:\n%s", logBuf.String())
+		}
+	})
+	t.Run("idempotency read failure still appends", func(t *testing.T) {
+		s, runID, acceptanceStageID, priv, au, _ := seed(t)
+		au.listByCategoryErr = errors.New("store down")
+		if w := promptRequest(t, s, runID, acceptanceStageID, priv, ""); w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if n := len(dropRows(au)); n != 1 {
+			t.Errorf("rows = %d, want 1 (list error is WARN + proceed)", n)
 		}
 	})
 }

@@ -34,7 +34,8 @@ import (
  *       outcome never changes); the result names the exit path so the drop
  *       reporter can carry it.
  *   retirementDropReporter — the single deferred reporter armed the moment the
- *       prompt fetch returns served retirements (BEFORE the target gate and
+ *       WIRE delivers served retirements (before the prompt temp file is even
+ *       written — #3396 — and BEFORE the target gate and
  *       provisionAcceptanceTree — binding condition 1) and disarmed ONLY by a
  *       successful acceptance_scenarios_pushed report (or by proving every
  *       served id already sits in the ledger at HEAD). On every other exit it
@@ -246,6 +247,19 @@ func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs,
 	}
 	if len(dirty) > 0 {
 		return acceptancePersistResult{outcome: persistRefused, reason: "dirty_before_write: " + strings.Join(dirty, ",")}
+	}
+	// (a') The corpus root components ABOVE the dir scenario.Write receives
+	// (acceptance/, acceptance/scenarios/) sit outside the package-level
+	// guard's view, so a COMMITTED symlink there (the tree is clean, (a)
+	// passes) would redirect every write below it out of the tree (#3396).
+	// Refuse by component name before the first write; retirementsLedgered
+	// stays false so the drop reporter ships this reason. treeDir itself is
+	// deliberately unchecked (a symlinked temp root is legitimate). A symlink
+	// BELOW the corpus dir (issue-<N>/ or a leaf) is refused inside
+	// scenario.Write / WriteRetired and surfaces as scenario_write: /
+	// retired_ledger_write: naming the component.
+	if err := scenario.RefuseSymlinks(in.treeDir, scenario.CorpusDir); err != nil {
+		return acceptancePersistResult{outcome: persistRefused, reason: "symlinked_corpus_path: " + err.Error()}
 	}
 
 	// (b) Verdict passed → Compose + Write one scenario per drivable criterion
