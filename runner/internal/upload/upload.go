@@ -723,6 +723,12 @@ type FetchedPrompt struct {
 	AcceptancePullRequestNumber int                        `json:"acceptance_pull_request_number,omitempty"`
 	AcceptanceCriteria          []AcceptanceCriterionEntry `json:"acceptance_criteria,omitempty"`
 	AcceptanceRetiredScenarios  []scenario.RetiredEntry    `json:"acceptance_retired_scenarios,omitempty"`
+	// AcceptanceIssueNumber is the run's trigger issue number (scope amendment
+	// 604519dc on E72.4 / #3328): the key of every recorded scenario id
+	// (`scenario:issue-<N>/<criterion-id>`) and its origin.issue. 0 = no issue
+	// trigger, in which case nothing is recorded — the PR number is NEVER
+	// substituted. Tag mirrors promptResponse.AcceptanceIssueNumber.
+	AcceptanceIssueNumber int `json:"acceptance_issue_number,omitempty"`
 }
 
 // FixupApplyPatch is one entry in FetchedPrompt.FixupApplyPatches: a single
