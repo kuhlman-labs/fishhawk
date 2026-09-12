@@ -619,6 +619,68 @@ deterministic triage.
   under the #3163 entry) reads the same catalog. Contract:
   `backend/internal/devfixtures/README.md`; operator view:
   `docs/acceptance-preview.md` § "Seeded fixtures".
+- **Stub forge control surface (dev-only, E72.3 / #3327)**: `devforge.go`
+  registers six routes ONLY when `Config.DevStubForge` (a
+  `*stub.Forge`, `backend/internal/forge/stub`) is non-nil — `fishhawkd
+  --dev-stub-forge` / `FISHHAWKD_DEV_STUB_FORGE=1`, which ALSO points
+  `cfg.GitHub` and the registered `gitlab` forge at the same stub through
+  its socket-free round-tripper, defaults both webhook secrets to the stub
+  constants, and refuses to coexist with a configured GitHub App or GitLab
+  token (`serve.go::resolveDevStubForge`, pinned by
+  `TestResolveDevStubForge` + the `TestServe_DevStubForge*` boot tests). A
+  nil stub leaves the paths unregistered (router 404, never a "disabled"
+  503 — `TestDevForge_RoutesAbsentWhenUnconfigured`); every route is
+  wrapped by the same `devLoopbackOnly` as the fixture surface
+  (`TestDevForge_NonLoopbackRefused` asserts the 403 AND that the stub saw
+  zero requests) and needs no `csrfExemptPath` entry. Routes: `GET
+  /v0/dev/forge` (`stub.Snapshot`: every record per family in NATIVE state
+  words plus the arrival-ordered request log), `DELETE /v0/dev/forge`
+  (`Reset` → 204), `POST /v0/dev/forge/issues` (seed, replacing the
+  address; 201 the stored copy), `GET /v0/dev/forge/issues?forge=&repo=&
+  project_id=&number=` (200 the issue + comments in arrival order; 404
+  `stub_issue_not_found`), `POST /v0/dev/forge/pulls` (seed a pull /
+  merge request with its merge facts; 201), and `POST
+  /v0/dev/forge/deliveries` `{forge, event, delivery_id?, payload}` — the
+  load-bearing one: it re-marshals `payload`, signs it exactly as the real
+  receiver verifies it (`X-Hub-Signature-256` via
+  `stub.SignGitHubDelivery(cfg.GitHubWebhookSecret, body)`;
+  `X-Gitlab-Token` = `cfg.GitLabWebhookSecret` verbatim), mints a UUID
+  delivery id when absent, and dispatches the request IN-PROCESS through
+  `s.Handler()` into a minimal recorder (no `httptest` import in
+  production code), answering 200 `{delivery_id, status, body}` with the
+  RECEIVER's verdict reported, never mapped. Because both receivers run
+  their consumers synchronously, the parent close the E50.6 watcher
+  performs is committed before the 200 returns. Every POST body is bounded
+  by `http.MaxBytesReader` at `devForgeMaxBodyBytes` (256 KiB) and refuses
+  unknown fields; the address is validated ONCE (`devForgeAddress.validate`
+  mirrors `stub.validateSeed`) so a bad `forge` / non-positive `number` /
+  `github` without `repo` / `gitlab` without `project_id` answers 400
+  `validation_failed` naming `details.field` BEFORE the stub sees it
+  (`TestDevForge_Validation`, `TestDevForge_Deliver_Validation` — one row
+  per branch); an empty receiver secret answers 503
+  `stub_forge_webhook_unconfigured` per family
+  (`TestDevForge_Deliver_WebhookUnconfigured`). The END-TO-END done-means
+  is `TestDevForge_GitHubIssueClosed_ClosesParentThroughRealReceiver` /
+  `…GitLabIssueClosed…` / `TestDevForge_Redelivery_LeavesOneComment`: a
+  `New(cfg)` server whose ONLY forges are the stub (`cfg.GitHub` over
+  `stub.Transport` with `stub.StaticTokens{Value: stub.InstallationToken}`;
+  `cfg.ForgeResolver` → a real `*forgegitlab.Forge` over the same
+  transport), audit pre-seeded with the `split_children_filed` linkage
+  rows, driven ONLY through the control API, asserting the parent's
+  COMMITTED state (closed / `completed`, exactly one comment whose last
+  line is the `splitfiling.ParentCloseCommentKey` marker, comment-before-
+  close on the request log). The `split_parent_closed` observation is read
+  back through `GET /v0/audit?category=split_parent_closed` with NO
+  `Authorization` header — the credential-free acceptance agent's exact
+  observation path — against an audit fake whose `AppendGlobalChained` rows
+  land in the list `ListAll` serves and which honours
+  `ListAllParams.AccountID` with the documented NULL-allow semantics; the
+  watcher writes with a nil `AccountID` (untenanted partition), and
+  `handleListGlobalAudit` passes the anonymous identity's empty
+  `AccountID` (unconstrained), so the row IS globally visible — an
+  established fact, not an assumption. Contract:
+  `backend/internal/forge/stub/README.md`; operator view:
+  `docs/acceptance-preview.md` § "Stub forge".
 - **Ingest + triage**: `acceptance.go::handleShipAcceptance` verifies
   the Ed25519 signature (or an operator bearer), persists an
   `artifact.KindAcceptance` row + an `acceptance_outcome_recorded`
@@ -1521,7 +1583,7 @@ Post-fix-up implement re-review is dispatched from `succeedFixupPushStage`'s pat
   - **`hasInRepoVerification` (the #3016 conjunct S) is deliberately left untouched and UNSHARED.** The two predicates answer different questions: #3016 asks whether a polarity-negated live-target assertion is verified in-repository (a both-fields question — either `verify_hint` OR `expectation_basis`), while `verifyHintDeclaresInRepo` asks whether a sandbox-decidable trigger's harness is NAMED in the hint (a hint-only question). Reading `expectation_basis` in the #3163 predicate would let an unmarked, genuinely-undecidable criterion escape the finding by citing a test — a comment on each predicate says why they must not be merged.
   - **Advisory, and the finding Detail is now conditional**: a NON-liveTarget finding that was NOT suppressed appends guidance to name the in-repository harness in `verify_hint` rather than marking it `skip_expected`; the liveTarget Detail is left BYTE-IDENTICAL to the pre-#3163 text so a live-target plan's audit payload bytes do not move.
   - **Honest residual**: the exemption is author-controllable — an author can suppress a genuinely-undecidable non-live-target criterion by writing harness words into `verify_hint` with no such harness existing (the rule is advisory and never refuses a plan, so the fail direction is a missed advisory, the same direction every other residual in this rule set accepts). And a criterion whose STATEMENT quotes a live-target phrase still draws the advisory findings BY DESIGN — the b-shaped case (`TestUnevaluableCriteria_VerifyHintExemption` case b): conjunct L blocks suppression for a liveTarget capability regardless of how in-repository the `verify_hint` reads, so #2845's live-target contract is preserved rather than narrowed. Pinned by the tests above rather than papered over.
-  - **Seeded-scenario extension (E72.2 / #3326).** Conjunct H has a second, OR-ed form under the SAME conjunct L: `verifyHintNamesSeedScenario` returns true when some whole token of `verify_hint` (the shared `acceptanceTokens` split — surrounding punctuation trimmed, interior hyphens kept, lowercased first) is a member of `seedScenarioNames` in `backend/internal/plan/acceptance_check.go`, the closed set of names the preview's dev-only `POST /v0/dev/fixtures` route can materialize (`grooming-confirm-gate`, `plan-gate-parked`, `trace-upload-target`). A hint that names one is positive evidence the sandbox can PRODUCE the state an external-trigger criterion needs, so the finding is suppressed exactly as a named in-repository harness suppresses it — and for the same non-`liveTarget` classes only, so #2845 is untouched (`TestUnevaluableCriteria_SeedHintDoesNotSuppressLiveTarget`). The membership test IS `seedScenarioNames` membership — there is no generic "seed" branch and no route-substring branch, so `seed the run`, `seeded run`, `seedling`, a route mention with an unknown name, `plan-gate-parked-v2` / `xgrooming-confirm-gate`, and a real name in the STATEMENT only all earn nothing (`TestVerifyHintNamesSeedScenario` NO rows; `TestUnevaluableCriteria_UnknownSeedNameDoesNotSuppress`, whose counterfactual mutates the `if seedScenarioNames[tok]` test to `if seedScenarioNames[tok] || true` and lands on the executed line). The set is carried inline so the plan package keeps importing nothing from the repo and cannot cycle with the packages that import it; `TestSeedScenarioNamesMatchCatalog` (a TEST-ONLY import of the name-only `devfixtures/catalog` leaf) binds it to `catalog.Names()` in both directions, so a scenario added to the catalog without the classifier — or vice versa — fails in-loop rather than drifting silently. The audit payload bytes of a plan whose hints name no scenario do not move.
+  - **Seeded-scenario extension (E72.2 / #3326).** Conjunct H has a second, OR-ed form under the SAME conjunct L: `verifyHintNamesSeedScenario` returns true when some whole token of `verify_hint` (the shared `acceptanceTokens` split — surrounding punctuation trimmed, interior hyphens kept, lowercased first) is a member of `seedScenarioNames` in `backend/internal/plan/acceptance_check.go`, the closed set of names the preview's dev-only `POST /v0/dev/fixtures` route can materialize (`grooming-confirm-gate`, `plan-gate-parked`, `trace-upload-target`, `split-parent-linked`). A hint that names one is positive evidence the sandbox can PRODUCE the state an external-trigger criterion needs, so the finding is suppressed exactly as a named in-repository harness suppresses it — and for the same non-`liveTarget` classes only, so #2845 is untouched (`TestUnevaluableCriteria_SeedHintDoesNotSuppressLiveTarget`). The membership test IS `seedScenarioNames` membership — there is no generic "seed" branch and no route-substring branch, so `seed the run`, `seeded run`, `seedling`, a route mention with an unknown name, `plan-gate-parked-v2` / `xgrooming-confirm-gate`, and a real name in the STATEMENT only all earn nothing (`TestVerifyHintNamesSeedScenario` NO rows; `TestUnevaluableCriteria_UnknownSeedNameDoesNotSuppress`, whose counterfactual mutates the `if seedScenarioNames[tok]` test to `if seedScenarioNames[tok] || true` and lands on the executed line). The set is carried inline so the plan package keeps importing nothing from the repo and cannot cycle with the packages that import it; `TestSeedScenarioNamesMatchCatalog` (a TEST-ONLY import of the name-only `devfixtures/catalog` leaf) binds it to `catalog.Names()` in both directions, so a scenario added to the catalog without the classifier — or vice versa — fails in-loop rather than drifting silently. The audit payload bytes of a plan whose hints name no scenario do not move.
 - **`missing_live_validation_marker` (#2845, E54.31)** — the second advisory rule on the same shared evaluator, and NOT a duplicate of `undecidable_criterion`. It flags a criterion whose statement names a LIVE forge/deploy/external **target** but which is not marked `requires_live_validation`. Two matchers, either sufficient: **M1** reuses the shared `unevaluableCapabilities` corpus, restricted to entries flagged `liveTarget` (the live-forge-round-trip and running-external-instance/deployed-environment entries) — corpus REUSE, so no second phrase list can drift, and no phrase string moved, leaving `undecidable_criterion`'s output byte-identical; **M2** is a three-conjunct proximity matcher for named-system prose no fixed phrase list anticipates — a liveness qualifier within 4 tokens of a live-ACTION noun, AND `against` within 4 tokens of an external-target noun, AND no sandbox marker in that against-phrase window.
   - **Exemption is `requires_live_validation` ALONE**, unlike `undecidable_criterion`'s either-declaration exemption. That difference IS the fix: only the marker auto-files the tracked operator-validation walk on plan approval, so a live-target criterion marked `skip_expected`-with-basis alone was exempt from `undecidable_criterion`, drew no finding at all, and silently lost its walk — observed across four runs in #2845.
   - **Deliberate non-coverage** of the MCP-client / operator-session / webhook-delivery capabilities (`liveTarget: false`). The plan artifact schema scopes `requires_live_validation` to a live forge/deploy/external target, "not merely an external trigger event, which `skip_expected` covers" — for those three, `skip_expected` with a basis is the doctrinally complete marking and no walk is owed, so demanding the marker would fire on correctly-authored criteria. Widening is a one-line `liveTarget` flip; the decision is recorded by a control test.
