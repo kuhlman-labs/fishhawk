@@ -318,8 +318,14 @@ Notes:
     `retire_scenario` the runner could not persist (it exited after the prompt
     fetch on a path that pushed no ledger commit: `persist_failed`,
     `persist_refused`, `no_run_branch`, a pre-spawn guard, a verdict validation
-    failure). The status comment is the operator-visible surface for the drop:
-    the anchor rebuild reads the entry's ids and reasons from the chain. A
+    failure). **The audit entry is the operator-visible surface for the drop
+    today, NOT the status comment:** the `notifyStatusUpdate` refresh rebuilds
+    the anchor, but `status_template.go`'s closed `activityCategories` set does
+    not admit `acceptance_scenario_retirement_dropped`, so the rebuild renders
+    NO line for it — read the ids and reasons from `GET /v0/runs/{run_id}/audit`.
+    Rendering each dropped id and reason on the anchor (a category entry plus a
+    `renderAcceptanceRetirementDroppedLine` case) is a tracked follow-up, kept
+    out of #3328 to stay under the implement stage's file cap. A
     third kind, `acceptance_scenario_regression` `{scenario_id, origin_pr?,
     origin_issue, origin_run_id, path, origin_unresolved?, observed, expected,
     repro_handle}`, is written by `server/acceptance.go` per FAILED replayed

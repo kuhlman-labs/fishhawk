@@ -595,7 +595,8 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Acceptance scenario-corpus reports (E72.4 / #3328): the run-authored
 	// scenario commit (a reported-head ledger row, no transition, no acceptance
-	// reopen) and the dropped-retirement marker (audit + status comment only).
+	// reopen) and the dropped-retirement marker (audit entry + a status comment
+	// refresh that does not yet render it — see the handler doc).
 	// Both are refused off an acceptance stage.
 	if pr.Outcome == outcomeAcceptanceScenariosPushed || pr.Outcome == outcomeAcceptanceScenarioRetirementDropped {
 		if stage.Type != run.StageTypeAcceptance {
@@ -1969,9 +1970,13 @@ func (s *Server) recordAcceptanceScenariosPushed(w http.ResponseWriter, r *http.
 // pushed no ledger commit (persist_failed, persist_refused, no_run_branch, a
 // pre-spawn guard, a verdict validation failure). It appends ONE
 // acceptance_scenario_retirement_dropped chained entry {retired: [full
-// entries], reason}, idempotent per (stage_id, reason), refreshes the status
-// comment so the operator sees each dropped id and reason on the run's
-// anchor, and responds 200 with no transition.
+// entries], reason}, idempotent per (stage_id, reason), triggers a status
+// comment refresh, and responds 200 with no transition. The AUDIT ENTRY is
+// the operator-visible surface today: the refresh rebuilds the anchor, but
+// issuecomment's closed activityCategories set does not yet admit this
+// category, so the rebuild renders NO line for the drop — rendering each
+// dropped id and reason on the anchor is a tracked follow-up (see
+// docs/issue-comment-surfaces.md).
 func (s *Server) recordAcceptanceScenarioRetirementDropped(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
 	stageID := stage.ID

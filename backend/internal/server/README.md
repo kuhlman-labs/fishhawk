@@ -758,7 +758,10 @@ new preview head (`runner/internal/scenario`). The backend half is four seams:
   the dispatch-anchored pre-scenario head while the commit attributes as run
   lineage via `auditcomplete.HeadReportCategoriesByPrecedence` (first) and
   `lineageLedgerCategories`) and `acceptance_scenario_retirement_dropped`
-  (audit entry idempotent per `stage_id`+`reason` + status comment).
+  (audit entry idempotent per `stage_id`+`reason` + a status comment refresh
+  that does NOT yet render the drop — `issuecomment`'s `activityCategories`
+  excludes the kind, so the audit entry is the operator-visible surface;
+  rendering it is a tracked follow-up, see `docs/issue-comment-surfaces.md`).
 
 Residual, stated: an operator-invoked `fishhawk_retry_stage` on the settled
 acceptance stage AFTER a scenario push sees recorded-head ≠ current-head
