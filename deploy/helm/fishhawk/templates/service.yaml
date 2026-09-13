@@ -50,7 +50,7 @@ spec:
     {{- include "fishhawk.selectorLabels" (dict "root" . "role" "api") | nindent 4 }}
     {{- else }}
     # allInOne mode: select ONLY the fishhawkd pod (component=server), deliberately
-    # excluding the postgres/minio/jaeger pods and both hook Jobs' pods, whose bare
+    # excluding the postgres/rustfs/jaeger pods and both hook Jobs' pods, whose bare
     # name+instance labels the bare selector would otherwise match (svc/fishhawk
     # then routed to an arbitrary pod — the jaeger-logs symptom). Both arms select
     # exactly one workload; the component discriminator is what makes that true.
