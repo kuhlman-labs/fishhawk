@@ -1,14 +1,14 @@
 id: scenario:issue-3394/auto-preview-tool-description-names-teardown
 statement: The fishhawk_dispatch_stage tool's auto_preview parameter description, as returned in the MCP tool listing, states that the dispatch sets both FISHHAWK_ACCEPTANCE_PREVIEW_CMD and FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD (scripts/dev preview-down) on the spawned runner and that an operator-set value of either wins.
 verify_hint: 'MCP tool result: list tools against the preview''s /mcp route and read the fishhawk_dispatch_stage input schema''s auto_preview description for `FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD` and `scripts/dev preview-down`.'
-steps: Confirmed target identity (/healthz git_sha 49073640 == sanctioned checkout HEAD 49073640). /mcp requires a bearer token and no dev route mints one, so I issued a bootstrap token with the preview's own binary (`fishhawkd token issue` against the preview's isolated fishhawk_preview DB). Called sessionless tools/list (protocol 2026-07-28 with _meta) and read fishhawk_dispatch_stage.inputSchema.properties.auto_preview.description.
+steps: Same live tools/list read on the preview's /mcp route; asserted the fragments FISHHAWK_ACCEPTANCE_PREVIEW_CMD, FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD, 'scripts/dev preview-down' and the operator-wins sentence in the auto_preview description. Also confirmed fishhawk_run_stage and fishhawk_drive_run expose no auto_preview property (matches the out-of-scope note).
 assertions:
-    expected: auto_preview description names both env vars, `scripts/dev preview-down`, and states an operator-set value of either wins.
-    observed_at_record: 'Description: ''It sets FISHHAWK_ACCEPTANCE_PREVIEW_CMD="scripts/dev preview" AND FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD="scripts/dev preview-down" on the SPAWNED RUNNER ... tears the preview down on every exit path ... An operator-set value of EITHER variable in this process ALWAYS wins and is passed through unchanged; the teardown default is injected only when the provision default is''. All four needles present (both env names, `scripts/dev preview-down`, operator-wins clause).'
-    repro_handle: 'curl -X POST http://localhost:8090/mcp -H ''Authorization: Bearer <fhk_token>'' -H ''Mcp-Protocol-Version: 2026-07-28'' -H ''Mcp-Method: tools/list'' -H ''Accept: application/json, text/event-stream'' -d ''{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'' | grep -o ''FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD'''
+    expected: Description states the dispatch sets both variables (scripts/dev preview-down) on the spawned runner and that an operator-set value of either wins.
+    observed_at_record: 'All four fragments present: both env vars, ''scripts/dev preview-down'', and ''An operator-set value of EITHER variable in this process ALWAYS wins and is passed through unchanged''.'
+    repro_handle: POST /mcp tools/list (see scenario row) -> fishhawk_dispatch_stage.inputSchema.properties.auto_preview.description
 origin:
     issue: 3394
     pr: 3405
     run_id: 70831a75-4890-4088-bfa9-74411166e7b3
-    head_sha: 490736406d54b6bc2784ab5abb48b9bb8738c92a
-    recorded_at: 2026-09-13T18:32:47Z
+    head_sha: 5d6812482488feec8cd41c0016dc4d8b0819ce89
+    recorded_at: 2026-09-13T20:33:44Z
