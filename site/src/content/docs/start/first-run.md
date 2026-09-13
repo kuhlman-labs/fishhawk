@@ -40,7 +40,7 @@ confusing failure rather than as a missing dependency.
 |---|---|---|
 | Git | You clone the Fishhawk repository to build from, and Fishhawk drives git in your repository | `git --version` |
 | [Go](https://go.dev/dl/) 1.25.0 or newer | Every module in the workspace declares `go 1.25`/`go 1.25.0`; an older toolchain refuses the build outright | `go version` |
-| A container runtime with Compose v2 | `make up` shells to `docker compose up -d` for Postgres and MinIO | `docker compose version` |
+| A container runtime with Compose v2 | `make up` shells to `docker compose up -d` for Postgres and RustFS | `docker compose version` |
 | `make` | The repository's loops are Makefile targets | `make --version` |
 | The [Claude Code](https://claude.com/claude-code) CLI on `PATH` as `claude`, with `ANTHROPIC_API_KEY` exported | The runner spawns that binary for the default `claude-code` executor and reads that variable for the key | `claude --version` |
 | [`gh`](https://cli.github.com/), authenticated | `fishhawk run start --issue` shells to `gh issue view` to ship the issue body inline | `gh auth status` |
@@ -111,7 +111,7 @@ artifacts are rolling container images
 
 ```sh
 cp .env.example .env     # optional now; GitHub App credentials go here later
-make up                  # docker compose: Postgres :5432, MinIO :9000/:9001
+make up                  # docker compose: Postgres :5432, RustFS :9000/:9001
 make migrate             # apply the backend migrations — required before first serve
 make dev-backend         # runs fishhawkd on :8080 in the foreground
 ```

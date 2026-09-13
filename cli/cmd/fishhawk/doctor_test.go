@@ -154,13 +154,13 @@ func TestDoctorCheck_PostgresContainerHealthy(t *testing.T) {
 	}
 }
 
-// TestDoctorCheck_MinioContainerAbsent verifies checkMinioContainer returns
+// TestDoctorCheck_RustfsContainerAbsent verifies checkRustfsContainer returns
 // fail when docker ps returns empty output (container not running).
-func TestDoctorCheck_MinioContainerAbsent(t *testing.T) {
+func TestDoctorCheck_RustfsContainerAbsent(t *testing.T) {
 	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
 		return "", nil // docker ps returned empty — no matching container
 	})
-	r := checkMinioContainer()
+	r := checkRustfsContainer()
 	if r.status != "fail" {
 		t.Errorf("status = %q, want fail", r.status)
 	}
@@ -169,19 +169,21 @@ func TestDoctorCheck_MinioContainerAbsent(t *testing.T) {
 	}
 }
 
-// TestDoctorCheck_MinioContainerUpHealthFailed verifies checkMinioContainer
-// returns warn when the container is up but the health HTTP probe fails.
-func TestDoctorCheck_MinioContainerUpHealthFailed(t *testing.T) {
+// TestDoctorCheck_RustfsContainerUpHealthFailed verifies checkRustfsContainer
+// returns warn when the container is up but the GET /health probe fails. The
+// stub fails ONLY the /health path, so a probe pointed anywhere else (the old
+// /minio/health/live, or `/`) would read the 200 fallback and turn this red.
+func TestDoctorCheck_RustfsContainerUpHealthFailed(t *testing.T) {
 	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
-		return "fishhawk-minio", nil
+		return "fishhawk-rustfs", nil
 	})
 	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
-		if strings.Contains(req.URL.Path, "/minio/health/live") {
+		if req.URL.Path == "/health" {
 			return nil, errors.New("connection refused")
 		}
 		return fakeHTTPResponse(http.StatusOK, ""), nil
 	})
-	r := checkMinioContainer()
+	r := checkRustfsContainer()
 	if r.status != "warn" {
 		t.Errorf("status = %q, want warn", r.status)
 	}
@@ -190,16 +192,38 @@ func TestDoctorCheck_MinioContainerUpHealthFailed(t *testing.T) {
 	}
 }
 
-// TestDoctorCheck_MinioContainerHealthy verifies checkMinioContainer returns
-// ok when the container is up and the health probe returns 200.
-func TestDoctorCheck_MinioContainerHealthy(t *testing.T) {
+// TestDoctorCheck_RustfsContainerUpHealthNon200 verifies checkRustfsContainer
+// returns warn naming the status code when the container is up and GET /health
+// answers but not with 200 (the 503 rustfs serves on `/` is the live example).
+func TestDoctorCheck_RustfsContainerUpHealthNon200(t *testing.T) {
 	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
-		return "fishhawk-minio", nil
+		return "fishhawk-rustfs", nil
+	})
+	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusServiceUnavailable, ""), nil
+	})
+	r := checkRustfsContainer()
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn", r.status)
+	}
+	if !strings.Contains(r.detail, "HTTP 503") {
+		t.Errorf("detail = %q, want to name HTTP 503", r.detail)
+	}
+	if !strings.Contains(r.remediate, "docker logs fishhawk-rustfs") {
+		t.Errorf("remediate = %q, want docker logs hint", r.remediate)
+	}
+}
+
+// TestDoctorCheck_RustfsContainerHealthy verifies checkRustfsContainer returns
+// ok when the container is up and the health probe returns 200.
+func TestDoctorCheck_RustfsContainerHealthy(t *testing.T) {
+	withFakeDoctorRunOutput(t, func(_ string, _ ...string) (string, error) {
+		return "fishhawk-rustfs", nil
 	})
 	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusOK, ""), nil
 	})
-	r := checkMinioContainer()
+	r := checkRustfsContainer()
 	if r.status != "ok" {
 		t.Errorf("status = %q, want ok; detail: %s", r.status, r.detail)
 	}
@@ -966,7 +990,7 @@ func TestRunDoctor_SpecOnly_ExitZero(t *testing.T) {
 	}
 	// Every infra/backend/MCP/git/gh rung label must be ABSENT.
 	for _, notWant := range []string{
-		"docker daemon running", "postgres container", "minio container",
+		"docker daemon running", "postgres container", "rustfs container",
 		"backend reachable", "token valid", "runner binary found",
 		"MCP registered", "git remote origin", "gh CLI authenticated",
 		"backend SHA drift", "runner schema drift", "CLI version",
@@ -1403,7 +1427,7 @@ func writeValidSpec(t *testing.T, dir string) {
 }
 
 // externalRepoDoctorHTTP builds the HTTP stub shared by the two external-repo
-// end-to-end tests: /healthz + /v0/runs green, minio health green, and the
+// end-to-end tests: /healthz + /v0/runs green, rustfs health green, and the
 // readiness endpoint serving the supplied payload.
 func externalRepoDoctorHTTP(readinessJSON string) func(*http.Request) (*http.Response, error) {
 	return func(req *http.Request) (*http.Response, error) {

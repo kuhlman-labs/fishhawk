@@ -2,12 +2,12 @@
 #
 # Brings up the services that mirror production (per ADR-001 / ADR-003):
 # - Postgres 16 (the primary state store)
-#
-# MinIO (S3-compatible storage) will land alongside the audit log
-# implementation under E2 (#2) and E13 (#13).
+# - RustFS (S3-compatible object storage for trace bundles; production
+#   points the same aws-sdk-go-v2 client at AWS S3)
 #
 # Usage:
 #   docker compose up -d
+#   make s3-init          # one-shot: create the fishhawk-traces bucket (idempotent)
 #   FISHHAWKD_DATABASE_URL=postgres://fishhawk:fishhawk@localhost:5432/fishhawk?sslmode=disable \
 #     go run ./backend/cmd/fishhawkd migrate
 #   go run ./backend/cmd/fishhawkd serve
@@ -31,34 +31,79 @@ services:
       timeout: 2s
       retries: 15
 
-  minio:
-    # MinIO is the local-dev S3 backend per ADR-003 (#67). The Go
-    # tracestore package uses aws-sdk-go-v2 against this endpoint
+  rustfs:
+    # RustFS is the local-dev S3 backend (ADR-003 / #67; #3386 replaced
+    # MinIO after its server and mc images were removed from Docker Hub).
+    # The Go tracestore package uses aws-sdk-go-v2 against this endpoint
     # with path-style addressing; production points the same SDK at
     # AWS S3.
-    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
-    container_name: fishhawk-minio
+    #
+    # rustfs/rustfs:1.0.0-rc.6 is a 1.0.0 release candidate (Apache-2.0),
+    # verified pullable on 2026-09-13 (#3386). No `command:` override: the
+    # image Cmd is `rustfs` and RUSTFS_VOLUMES defaults to /data.
+    image: rustfs/rustfs:1.0.0-rc.6
+    container_name: fishhawk-rustfs
     restart: unless-stopped
-    command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: fishhawk
-      MINIO_ROOT_PASSWORD: fishhawk-dev-secret
+      RUSTFS_ACCESS_KEY: fishhawk
+      RUSTFS_SECRET_KEY: fishhawk-dev-secret
     ports:
       - "9000:9000"  # S3 API
       - "9001:9001"  # web console
     volumes:
-      - fishhawk-minio-data:/data
+      - fishhawk-rustfs-data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      # curl ships in the image. GET /health answers 200 once the server is
+      # up; GET / answers 503, so it is NOT a usable readiness path.
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+  s3-init:
+    # One-shot bucket bootstrap, gated behind the `init` profile so it does
+    # NOT start under the default `docker compose up -d`. `make s3-init`
+    # runs it via `docker compose --profile init run --rm s3-init`.
+    #
+    # The rustfs image ships no bucket CLI (MinIO's `mc` is gone with it),
+    # so this uses the AWS CLI. `entrypoint:` overrides the image's `aws`
+    # ENTRYPOINT so the shell runs the script rather than `aws /bin/sh ...`.
+    # With a custom --endpoint-url the CLI does not force path-style
+    # addressing, so AWS_CONFIG_FILE pins `addressing_style = path` —
+    # otherwise a DNS-compatible bucket name resolves to
+    # `fishhawk-traces.rustfs`, which compose DNS cannot answer.
+    #
+    # Exit-status contract: `set -e` plus the `head-bucket || create-bucket`
+    # list means an EXISTING bucket exits 0 with no create attempted, an
+    # absent bucket is created (exit 0), and a create that genuinely fails
+    # exits NON-ZERO — the trailing echo never masks a failed create.
+    image: amazon/aws-cli:2.36.44
+    profiles: ["init"]
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: fishhawk
+      AWS_SECRET_ACCESS_KEY: fishhawk-dev-secret
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_CONFIG_FILE: /tmp/aws-config
+      S3_ENDPOINT: http://rustfs:9000
+      S3_BUCKET: fishhawk-traces
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        printf '[default]\ns3 =\n  addressing_style = path\n' > "$$AWS_CONFIG_FILE"
+        aws --endpoint-url "$$S3_ENDPOINT" s3api head-bucket --bucket "$$S3_BUCKET" >/dev/null 2>&1 \
+          || aws --endpoint-url "$$S3_ENDPOINT" s3api create-bucket --bucket "$$S3_BUCKET" >/dev/null
+        echo "bucket $$S3_BUCKET ready"
 
   jaeger:
     # Opt-in local OTLP collector for inspecting the runner's #649
     # GenAI trace spans end-to-end (#679). Gated behind the `otel`
     # profile so it does NOT start under the default `docker compose
-    # up -d` — the default loop and scripts/dev's pg/minio-only
+    # up -d` — the default loop and scripts/dev's pg/rustfs-only
     # preflight are unaffected. Start it explicitly with:
     #   docker compose --profile otel up -d
     # then point the runner at it via OTEL_EXPORTER_OTLP_ENDPOINT and
@@ -86,4 +131,4 @@ services:
 
 volumes:
   fishhawk-postgres-data:
-  fishhawk-minio-data:
+  fishhawk-rustfs-data:
