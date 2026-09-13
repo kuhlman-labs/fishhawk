@@ -1173,6 +1173,7 @@ func verifyHintNamesSeedScenario(c AcceptanceCriterion) bool {
 // in both directions through a test-only import, so a name added on either
 // side without the other fails in-loop.
 var seedScenarioNames = map[string]bool{
+	"acceptance-dispatched": true,
 	"grooming-confirm-gate": true,
 	"plan-gate-parked":      true,
 	"split-parent-linked":   true,

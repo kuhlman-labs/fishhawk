@@ -4005,6 +4005,136 @@ components:
             stored verbatim. Optional.
         replay:
           $ref: '#/components/schemas/AcceptanceReplay'
+        transcript:
+          $ref: '#/components/schemas/AcceptanceTranscriptRef'
+
+    AcceptanceTranscriptRef:
+      type: object
+      description: |
+        RUNNER-INJECTED ref (E72.5 / #3329) to the `acceptance_transcript`
+        artifact shipped to `POST /v0/runs/{run_id}/acceptance/transcript`
+        BEFORE this verdict, injected AFTER the agent's output passed the
+        runner's closed agent-facing schema (an agent-authored `transcript` is
+        refused by the runner). The backend cross-checks it FAIL-CLOSED: the
+        artifact must exist, be kind `acceptance_transcript`, belong to THIS
+        stage and carry exactly `content_hash`, or the verdict is rejected
+        400 `acceptance_invalid` (`details.error` one of
+        `transcript_ref_invalid`, `transcript_artifact_not_found`,
+        `transcript_artifact_kind_mismatch`,
+        `transcript_artifact_stage_mismatch`,
+        `transcript_content_hash_mismatch`) and nothing is persisted. Absent →
+        the recorded outcome carries `transcript: null`.
+
+        RECORDED OUTCOME BLOCK. On success the `acceptance_outcome_recorded`
+        audit payload gains `transcript: {artifact_id, content_hash,
+        criteria: [{id, outcome, request_count, failing_request:
+        {method, path, status} | null}] | null, summary_suppressed?,
+        disagreeing_ids?}`, derived by the backend from the STORED
+        `acceptance_transcript` artifact — never from the verdict body. This
+        is the ONE shape every consumer reads (`fishhawk_get_run_status`, the
+        anchor comment's outcome line, the implement-review gate evidence).
+
+        FAILING-REQUEST RULE: for a `failed` criterion, `failing_request` is
+        the LAST recorded request regardless of its status code (the request
+        whose response the failing assertion evaluated — an assertion failure
+        on a 200 is the common shape); it is `null` only when the failed
+        criterion recorded zero requests, and always `null` on a non-failed
+        criterion. It lives INSIDE `criteria[]`; there is no top-level
+        failing request.
+
+        VERDICT AUTHORITY: the verdict is authoritative and the transcript is
+        descriptive. When a transcript row's outcome disagrees with the
+        verdict row of the same id, or names a criterion the verdict did not
+        report, `criteria` is `null` and `summary_suppressed` names the reason
+        (`criterion_outcome_disagrees` / `criterion_not_in_verdict`) with the
+        offending ids in `disagreeing_ids`; the artifact ref is kept so the
+        transcript stays one fetch away. A disagreement NEVER changes the
+        recorded verdict.
+      required: [artifact_id, content_hash]
+      properties:
+        artifact_id: { $ref: '#/components/schemas/UUID' }
+        content_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+
+    AcceptanceTranscriptBody:
+      type: object
+      description: |
+        Wire shape posted to `POST /v0/runs/{run_id}/acceptance/transcript`
+        (E72.5 / #3329) and stored verbatim as the `acceptance_transcript`
+        artifact's content. CLOSED: unknown fields are rejected. Every bound
+        below is enforced at ingest; a violation is rejected, never truncated.
+      required: [criteria]
+      additionalProperties: false
+      properties:
+        criteria:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: One entry per criterion row the validator reported; ids unique.
+          items:
+            type: object
+            required: [id, requests, assertion, outcome, wall_ms]
+            additionalProperties: false
+            properties:
+              id:
+                type: string
+                maxLength: 128
+                pattern: '^(scenario:issue-[0-9]+/)?[a-z0-9][a-z0-9-]*$'
+                description: The plan criterion id, optionally under the runner's `scenario:issue-<N>/` replay prefix.
+              seed:
+                type: string
+                maxLength: 200
+                pattern: '^[a-z0-9][a-z0-9-]*$'
+                description: The fixture scenario materialized for this criterion, when one was.
+              requests:
+                type: array
+                maxItems: 200
+                description: Recorded in the order sent.
+                items:
+                  type: object
+                  required: [method, path, status, elapsed_ms]
+                  additionalProperties: false
+                  properties:
+                    method: { type: string, enum: [GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS] }
+                    path:
+                      type: string
+                      maxLength: 512
+                      pattern: "^/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]*$"
+                      description: RFC 3986 pchar + `/` + `?` — no whitespace, control byte, backtick or `|`.
+                    request_body:
+                      type: string
+                      maxLength: 4096
+                      description: Runner-redacted; stored-only, never rendered.
+                    status: { type: integer, minimum: 100, maximum: 599 }
+                    response_body:
+                      type: string
+                      maxLength: 4096
+                      description: Runner-redacted; stored-only, never rendered.
+                    elapsed_ms: { type: integer, minimum: 0 }
+              assertion:
+                type: string
+                maxLength: 2000
+                description: The check evaluated. Stored-only, never rendered.
+              outcome: { type: string, enum: [passed, failed, skipped, undecidable] }
+              wall_ms: { type: integer, minimum: 0 }
+        target_url:
+          type: string
+          description: The instance driven, when declared. http(s) only.
+
+    AcceptanceTranscriptResponse:
+      type: object
+      description: |
+        Echoed by `POST /v0/runs/{run_id}/acceptance/transcript`. `idempotent`
+        is true when the upload matched an existing artifact for the stage.
+      required: [id, stage_id, content_hash, idempotent]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        content_hash:
+          type: string
+          description: Hex sha256 of the transcript bytes shipped.
+        idempotent: { type: boolean }
 
     AcceptanceReplay:
       type: object
@@ -4128,7 +4258,7 @@ components:
         stage_id: { $ref: '#/components/schemas/UUID' }
         kind:
           type: string
-          enum: [plan, pull_request, deployment]
+          enum: [plan, pull_request, deployment, acceptance, release_notes, grooming_report, acceptance_transcript]
         schema_version:
           type: [string, "null"]
           example: standard_v1
@@ -16197,6 +16327,15 @@ paths:
 
         v0 has no formal JSON Schema for the body — required-field checks
         happen in the handler.
+
+        Transcript linkage (E72.5 / #3329): when the body carries the
+        runner-injected `transcript` ref (`AcceptanceTranscriptRef`) it is
+        cross-checked against the stored `acceptance_transcript` artifact
+        BEFORE any persistence (400 `acceptance_invalid` on any mismatch,
+        nothing persisted), and the `acceptance_outcome_recorded` payload
+        gains a `transcript` block (shape on `AcceptanceTranscriptRef`) derived
+        from the STORED content — explicit `transcript: null` when no ref
+        shipped.
       tags: [runner]
       security: []
       parameters:
@@ -16250,6 +16389,95 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '413':
           description: Acceptance body exceeds the per-stage size cap (32 KiB).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/acceptance/transcript:
+    post:
+      operationId: shipAcceptanceTranscript
+      summary: Record an acceptance transcript artifact for an acceptance stage
+      description: |
+        Persists the acceptance TRANSCRIPT (E72.5 / #3329) — the per-criterion
+        record of every request sent, every response observed, the assertion
+        evaluated, its outcome and wall time — as an `acceptance_transcript`
+        artifact (migration 0083). The runner ships it BEFORE the verdict and
+        then injects a `transcript: {artifact_id, content_hash}` ref into the
+        verdict body it posts to `POST /v0/runs/{run_id}/acceptance`, which
+        cross-checks the ref against the stored artifact fail-closed and
+        summarizes the STORED content onto `acceptance_outcome_recorded`
+        as `transcript` (shape documented on `AcceptanceTranscriptRef`). No audit entry is
+        written here; `GET /v0/stages/{stage_id}/artifacts` lists the artifact
+        by kind and `GET /v0/artifacts/{id}` returns its verbatim content —
+        the response bodies are ONE artifact fetch away and are rendered on
+        no prompt or comment surface.
+
+        The body shape is CLOSED and every rule is enforced at ingest,
+        fail-closed: anything outside the grammar is REJECTED (400
+        `acceptance_transcript_invalid` with `details.error` naming the
+        field), never truncated or sanitised. That is what makes every value a
+        downstream surface renders (`criteria[].id`, `seed`, `method`, `path`,
+        `status`) render-safe by construction regardless of which client wrote
+        the transcript: `id` matches
+        `^(scenario:issue-[0-9]+/)?[a-z0-9][a-z0-9-]*$` (<= 128 bytes, unique),
+        `seed` `^[a-z0-9][a-z0-9-]*$` (<= 200), `method` is a closed enum,
+        `path` is the RFC 3986 pchar + `/` + `?` charset (<= 512 bytes — no
+        whitespace, control byte, backtick or `|`), `status` 100..599.
+        `assertion` (<= 2000 bytes) and the request/response bodies (<= 4096
+        bytes each) are stored-only.
+
+        Same auth ladder, guard order, size-cap posture (256 KiB) and
+        (stage_id, content_hash) idempotency as `POST /v0/runs/{run_id}/acceptance`.
+      tags: [runner]
+      security: []
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: stage_id, in: query, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: X-Fishhawk-Signature
+          in: header
+          required: false
+          schema:
+            type: string
+            description: Hex-encoded 64-byte Ed25519 signature over sha256(body).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AcceptanceTranscriptBody' }
+      responses:
+        '201':
+          description: Transcript accepted; new artifact row created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptanceTranscriptResponse' }
+        '200':
+          description: |
+            A transcript with this content_hash already exists for the stage
+            (idempotent re-upload returns the existing artifact unchanged).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptanceTranscriptResponse' }
+        '400':
+          description: |
+            Body outside the closed grammar (`code:
+            acceptance_transcript_invalid`, `details.error` names the failing
+            field and rule), or path/query parameters malformed, or the stage
+            is not an acceptance stage / does not belong to the run
+            (`validation_failed`). Nothing is persisted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            Auth failed. Possible codes:
+            - `signature_invalid` — `X-Fishhawk-Signature` did not verify against the run's public key.
+            - `signature_or_bearer_required` — request included neither `X-Fishhawk-Signature` nor an authenticated bearer token with `write:runs` scope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413':
+          description: Transcript body exceeds the size cap (256 KiB).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

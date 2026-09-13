@@ -86,6 +86,54 @@ func TestEmbeddedScenarios_DeclaredShapes(t *testing.T) {
 			t.Fatalf("want one standard_v1 plan artifact, got %+v", s.Artifacts)
 		}
 	})
+	// acceptance-dispatched (E72.5 / #3329): the first scenario past the
+	// plan stage — exactly one acceptance stage at dispatched, an
+	// acceptance_dispatched row on it, and a pull_request_opened row carrying
+	// head_sha that PRECEDES the anchor, so acceptanceValidatedHeadSHA
+	// resolves and a shipped verdict is not clamped to undecidable.
+	t.Run("acceptance-dispatched", func(t *testing.T) {
+		s := mustLoad(t, "acceptance-dispatched")
+		if len(s.Runs) != 1 || s.Runs[0].WorkflowID != "feature_change" || s.Runs[0].State != "running" {
+			t.Fatalf("want one running feature_change run, got %+v", s.Runs)
+		}
+		var acceptanceKey string
+		acceptanceStages := 0
+		for _, st := range s.Stages {
+			if st.Type == "acceptance" {
+				acceptanceStages++
+				acceptanceKey = st.Key
+				if st.State != "dispatched" || st.ExecutorKind != "agent" {
+					t.Fatalf("acceptance stage must be agent/dispatched, got %+v", st)
+				}
+			} else if st.State != "succeeded" {
+				t.Fatalf("non-acceptance stage %q must be succeeded, got %s", st.Key, st.State)
+			}
+		}
+		if acceptanceStages != 1 {
+			t.Fatalf("want exactly one acceptance stage, got %d", acceptanceStages)
+		}
+		prIdx, anchorIdx := -1, -1
+		for i, row := range s.Audit {
+			switch row.Category {
+			case "pull_request_opened":
+				var p struct {
+					HeadSHA string `json:"head_sha"`
+				}
+				if err := json.Unmarshal([]byte(row.Payload), &p); err != nil || len(p.HeadSHA) != 40 {
+					t.Fatalf("pull_request_opened payload must carry a 40-hex head_sha: %s (%v)", row.Payload, err)
+				}
+				prIdx = i
+			case "acceptance_dispatched":
+				if row.Stage != acceptanceKey {
+					t.Fatalf("acceptance_dispatched must sit on the acceptance stage, got %q", row.Stage)
+				}
+				anchorIdx = i
+			}
+		}
+		if prIdx < 0 || anchorIdx < 0 || prIdx > anchorIdx {
+			t.Fatalf("want pull_request_opened (idx %d) BEFORE acceptance_dispatched (idx %d)", prIdx, anchorIdx)
+		}
+	})
 	t.Run("trace-upload-target", func(t *testing.T) {
 		s := mustLoad(t, "trace-upload-target")
 		if len(s.Stages) != 1 || s.Stages[0].Type != "plan" || s.Stages[0].State != "dispatched" {

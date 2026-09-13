@@ -1,0 +1,127 @@
+# acceptance-dispatched — a feature_change run whose plan / implement /
+# review stages SUCCEEDED and whose acceptance stage is DISPATCHED, ready
+# to receive POST /v0/runs/{id}/acceptance/transcript and then POST
+# /v0/runs/{id}/acceptance (E72.5 / #3329). The first catalog scenario
+# past the plan stage (the #3397 problem-1 gap).
+#
+# The two audit rows are ORDERED for acceptanceValidatedHeadSHA: a
+# pull_request_opened row on the implement stage reporting head_sha, then
+# the acceptance_dispatched anchor on the acceptance stage (shaped after
+# emitHostDispatchAcceptanceAnchor). The anchor is the NEWER row, so the
+# head resolves and a shipped verdict is NOT clamped to
+# undecidable(basis=head_unresolved) by the #3091 unbound-head clamp.
+#
+# The workflow_spec's acceptance stage is shaped after
+# .fishhawk/workflows.yaml (agent executor, egress.target_hosts naming the
+# preview host, produces: acceptance) so spec parse accepts it.
+#
+# Handles (`key`) are scenario-local; every Apply mints fresh ids.
+runs:
+  - key: target-run
+    repo: kuhlman-labs/fishhawk
+    workflow_id: feature_change
+    trigger_ref: "issue:3329"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (acceptance-dispatched).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: acceptance
+              type: acceptance
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+                - artifact: pull_request
+                  from_stage: implement
+              egress:
+                target_hosts:
+                  - localhost:8090
+              produces:
+                - artifact: acceptance
+
+stages:
+  - key: plan
+    run: target-run
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: implement
+    run: target-run
+    sequence: 2
+    type: implement
+    executor_kind: agent
+    executor_ref: claude-code
+    state: succeeded
+  - key: review
+    run: target-run
+    sequence: 3
+    type: review
+    executor_kind: human
+    executor_ref: human
+    requires_approval: true
+    state: succeeded
+  - key: acceptance
+    run: target-run
+    sequence: 4
+    type: acceptance
+    executor_kind: agent
+    executor_ref: claude-code
+    state: dispatched
+
+audit:
+  - run: target-run
+    stage: implement
+    category: pull_request_opened
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"head_sha":"0123456789abcdef0123456789abcdef01234567","pr_number":3329,"pr_url":"https://github.com/kuhlman-labs/fishhawk/pull/3329"}'
+  - run: target-run
+    stage: acceptance
+    category: acceptance_dispatched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"sequence":4,"executor":"agent","source":"host_dispatch"}'
