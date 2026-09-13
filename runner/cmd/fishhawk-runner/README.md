@@ -105,6 +105,28 @@ In practice a TERMed runner exits gracefully and its deferred release removes th
 
 Shape lockstep (schema ↔ runner validator ↔ backend validator) is guarded by `TestAcceptanceVerdictSchema_LockstepWithValidator`.
 
+### Acceptance transcript sidecar (E72.5 / [#3329](https://github.com/kuhlman-labs/fishhawk/issues/3329))
+
+`acceptancetranscript.go` — capture/bound/validate/redact of the per-criterion TRANSCRIPT the acceptance agent writes BESIDE its verdict, and the ship-before-verdict wiring in `main.go::run`. The verdict stays the contract; the transcript is descriptive evidence. **The VERDICT is authoritative and the transcript is descriptive**: nothing in this path can change the verdict outcome, the failure category or the exit code — every transcript problem is a named, non-fatal runner-log event and the verdict ships exactly as it would have without the transcript.
+
+**Sidecar contract.** The prompt's `### Transcript` section (`prompt.writeAcceptanceTranscriptContract`) tells the agent to write ONE JSON object to the run/stage-KEYED path `acceptanceTranscriptPath(run, stage)` = `/tmp/fishhawk-acceptance-transcript-<run>-<stage>.json` — keyed only, NO legacy fixed path (the transcript is new, so no older prompt ever named one). The format string is pinned byte-identically from both sides (`TestAcceptanceTranscriptPath_PinnedFormat` here and in `backend/internal/prompt`), and it matches the `fishhawk-acceptance-*-*.json` glob `scripts/dev sweep` already prunes. The closed shape is `{criteria:[{id, seed?, requests:[{method, path, request_body?, status, response_body?, elapsed_ms}], assertion, outcome, wall_ms}], target_url?}`; the wire structs live in `upload.AcceptanceTranscript*` and are pinned ModeExact against the backend twins by `backend/internal/wirecontract`. `sweepStaleAcceptanceVerdict` clears the keyed transcript path pre-invoke alongside the verdict paths, so a prior invocation's transcript can never be shipped beside a fresh verdict.
+
+**Pipeline (`captureAcceptanceTranscript`), run only after the verdict validated:**
+
+1. `readSidecarBounded` (E64.12 / #3106, the 1 MiB ceiling). Not-exist / empty / unreadable → `acceptance_transcript_missing`. Over the ceiling → `acceptance_transcript_oversize` and the file is REMOVED with the #3142 CHECKED shape — a failed `os.Remove` emits `acceptance_transcript_unremovable` BESIDE the oversize event, never instead of it.
+2. Strict decode (`DisallowUnknownFields`, single object) → `acceptance_transcript_invalid` naming the field on failure.
+3. Body truncation BEFORE validation: each `request_body` / `response_body` over 4096 bytes is clipped (on a rune boundary) with a trailing `...[truncated N bytes]` marker, reported once as `acceptance_transcript_bodies_truncated`. Bodies are stored-only on the backend (never rendered into any prompt or comment), so bounding them is safe. Ids, seeds and paths are NEVER truncated — they are rejected, exactly as the backend does.
+4. `validateAcceptanceTranscript` — the twin of the backend ingest validator, every bound mirrored (id `^(scenario:issue-[0-9]+/)?[a-z0-9][a-z0-9-]*$` ≤128 bytes, seed charset ≤200, method enum, path RFC 3986 pchar+`/`+`?` ≤512, status 100..599, bodies ≤4096, ≤200 requests, ≤100 criteria, assertion ≤2000, outcome enum) PLUS the runner's SECOND-LAYER served-criterion-id membership (`acceptanceServedVerdictIDs`, the same set the verdict is checked against). The backend grammar is what establishes the render-safety property for the independently callable endpoint; the membership check is this side's own defense against pinning evidence to a criterion the plan never declared. Failure → `acceptance_transcript_invalid`.
+5. `redaction.RedactDefault` over the canonical bytes (the verdict's posture) → `acceptance_transcript_redacted` with the hit list. The REDACTED bytes are re-validated: a placeholder can be longer than the secret it replaced and push a body past the backend's cap, which would otherwise ship to a 400 (`acceptance_transcript_invalid` with a `post-redaction:` detail).
+6. Ship bound: post-redaction bytes over `acceptanceTranscriptShipMaxBytes` (256 KiB, the backend's request cap; a plain const pinned by `TestAcceptanceTranscriptShipMaxBytesValue`) → `acceptance_transcript_oversize` (this branch does NOT remove the file — only the read-ceiling branch does).
+7. Success → `acceptance_transcript_captured` (bytes, criteria count).
+
+**Ship order (`main.go`, the post-trace acceptance block).** When a transcript was captured, `client.ShipAcceptanceTranscript` (signed POST to `/v0/runs/{run}/acceptance/transcript?stage_id=`, the `ShipAcceptance` retry/classification contract, 400 `acceptance_transcript_invalid` → `upload.ErrAcceptanceTranscriptInvalid`) runs FIRST; on success the backend-minted `{artifact_id, content_hash}` is injected into the already-redacted verdict by `upload.InjectTranscript` (the `InjectReplay` pattern — refuses a body already carrying `transcript`, a non-object or null; safe post-redaction because the ref carries only backend-minted values) and `acceptance_transcript_shipped` is logged; then the unchanged `ShipAcceptance` ships the verdict, whose backend handler cross-checks the ref against the stored artifact fail-closed. A transcript ship (or injection) failure logs `acceptance_transcript_upload_failed` and the verdict ships WITHOUT a ref — the failure category never changes. The trace bundle's `acceptance_evidence` event is composed pre-trace and therefore lacks the ref by design; no backend consumer reads that event for it.
+
+**Where the response is.** Only method/path/status ever render on a review prompt or issue comment; request and response bodies (redacted) live in the stored artifact and are one fetch away via `GET /v0/artifacts/{id}` (the id is in the `acceptance_transcript_shipped` log line, the `transcript.artifact_id` block on `acceptance_outcome_recorded`, and `GET /v0/stages/{stage_id}/artifacts` by kind `acceptance_transcript`).
+
+Pinned by `acceptancetranscript_test.go`: the path format, every branch above (one case per named rule including the served-id violation, the checked removal and the unremovable sibling, the truncation marker, the redaction placeholder in the SHIPPED bytes, the post-redaction re-validation and the 256 KiB bound), the shared golden `testdata/wire/acceptance_transcript.json` round trip (the same bytes the backend ingests through its real router in `backend/internal/server/trace_test.go`), and the `run()` end-to-end trio — `TestRun_Acceptance_TranscriptShippedBeforeVerdict` (call order + the ref in the shipped verdict), `TestRun_Acceptance_TranscriptShipFailureStillDeliversVerdict` (ref-less verdict, stage still succeeds) and `TestRun_Acceptance_NoTranscriptSidecar` (no transcript ship, verdict bytes unchanged).
+
 ## Plan-stage sibling artifacts ([#2833](https://github.com/kuhlman-labs/fishhawk/issues/2833))
 
 A `plan`-typed stage may emit an additive **standard_v1 sibling** at the
@@ -904,7 +926,13 @@ The seven governed loaders and their events: `loadCounterfactualReport`
 paths, `acceptance_verdict_oversize`). All SEVEN REMOVE the oversize file
 (`loadAgentAuthoredPR` reuses `prBodyReasonHandoffUnreadable` — an oversize
 handoff is a present-but-unusable one, so no sixth wire reason is added; the
-distinct log event carries the discrimination).
+distinct log event carries the discrimination). An EIGHTH reader,
+`captureAcceptanceTranscript` (`acceptance_transcript_oversize` /
+`acceptance_transcript_unremovable`, E72.5 / #3329), adopts the same bounded
+read and checked-removal shape but is deliberately NOT in the governed set
+above: it is best-effort evidence, so its oversize branch drops the transcript
+with a named event and never fails the stage — see "Acceptance transcript
+sidecar" under the acceptance executor section.
 
 Every removal is CHECKED (the #3106 fix-up): the `os.Remove` result is captured
 and a failed removal gets its own named event BESIDE the `*_oversize` one, never

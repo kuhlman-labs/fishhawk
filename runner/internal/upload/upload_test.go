@@ -3550,3 +3550,239 @@ func TestFetchedPrompt_DecodesAcceptanceReplayFields(t *testing.T) {
 		t.Errorf("retired = %+v, want the full scenario.RetiredEntry", fp.AcceptanceRetiredScenarios)
 	}
 }
+
+// ---- ShipAcceptanceTranscript / InjectTranscript (E72.5 / #3329) ----
+
+type transcriptFakeBackend struct {
+	mu           sync.Mutex
+	status       int
+	body         string
+	idempotent   bool
+	errCount     int
+	calls        int
+	receivedBody []byte
+	receivedSig  string
+	receivedPath string
+	receivedQry  string
+}
+
+func newTranscriptFakeBackend(t *testing.T) (*transcriptFakeBackend, *httptest.Server) {
+	t.Helper()
+	tf := &transcriptFakeBackend{status: http.StatusCreated}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/acceptance/transcript", func(w http.ResponseWriter, r *http.Request) {
+		tf.mu.Lock()
+		tf.calls++
+		if tf.errCount > 0 {
+			tf.errCount--
+			tf.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		s, body, idem := tf.status, tf.body, tf.idempotent
+		raw, _ := io.ReadAll(r.Body)
+		tf.receivedBody = raw
+		tf.receivedSig = r.Header.Get("X-Fishhawk-Signature")
+		tf.receivedPath = r.URL.Path
+		tf.receivedQry = r.URL.RawQuery
+		tf.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(s)
+		if (s == http.StatusCreated || s == http.StatusOK) && body == "" {
+			d := sha256.Sum256(raw)
+			_ = json.NewEncoder(w).Encode(ShipAcceptanceTranscriptResult{
+				ID: "00000000-0000-0000-0000-000000000ddd", StageID: r.URL.Query().Get("stage_id"),
+				ContentHash: hex.EncodeToString(d[:]), Idempotent: idem,
+			})
+		} else if body != "" {
+			_, _ = io.WriteString(w, body)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return tf, srv
+}
+
+const transcriptTestBody = `{"criteria":[{"id":"crit-a","requests":[{"method":"GET","path":"/healthz","status":200,"elapsed_ms":1}],"assertion":"200","outcome":"passed","wall_ms":1}]}`
+
+func TestShipAcceptanceTranscript_HappyPath_Created(t *testing.T) {
+	tf, srv := newTranscriptFakeBackend(t)
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	body := []byte(transcriptTestBody)
+	res, err := c.ShipAcceptanceTranscript(context.Background(), ShipAcceptanceTranscriptArgs{
+		RunID: "run-abc", StageID: "stage-xyz", Body: body, PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("ShipAcceptanceTranscript: %v", err)
+	}
+	if res.ID != "00000000-0000-0000-0000-000000000ddd" || res.Idempotent || res.StageID != "stage-xyz" {
+		t.Errorf("result = %+v", res)
+	}
+	d := sha256.Sum256(body)
+	if res.ContentHash != hex.EncodeToString(d[:]) {
+		t.Errorf("content_hash = %q", res.ContentHash)
+	}
+	if !bytes.Equal(tf.receivedBody, body) || tf.receivedPath != "/v0/runs/run-abc/acceptance/transcript" || tf.receivedQry != "stage_id=stage-xyz" {
+		t.Errorf("backend received path=%q query=%q body=%q", tf.receivedPath, tf.receivedQry, tf.receivedBody)
+	}
+	sig, err := hex.DecodeString(tf.receivedSig)
+	if err != nil {
+		t.Fatalf("signature not hex: %v", err)
+	}
+	if !ed25519.Verify(priv.Public().(ed25519.PublicKey), d[:], sig) {
+		t.Error("X-Fishhawk-Signature does not verify against sha256(body)")
+	}
+}
+
+func TestShipAcceptanceTranscript_Idempotent200(t *testing.T) {
+	tf, srv := newTranscriptFakeBackend(t)
+	tf.status = http.StatusOK
+	tf.idempotent = true
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	res, err := c.ShipAcceptanceTranscript(context.Background(), ShipAcceptanceTranscriptArgs{
+		RunID: "run-abc", StageID: "stage-xyz", Body: []byte(transcriptTestBody), PrivateKey: priv,
+	})
+	if err != nil || !res.Idempotent {
+		t.Fatalf("res=%+v err=%v, want Idempotent=true on 200", res, err)
+	}
+}
+
+func TestShipAcceptanceTranscript_Invalid400(t *testing.T) {
+	tf, srv := newTranscriptFakeBackend(t)
+	tf.status = http.StatusBadRequest
+	tf.body = `{"error":{"code":"acceptance_transcript_invalid","message":"criteria[0].path: must match"}}`
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	_, err := c.ShipAcceptanceTranscript(context.Background(), ShipAcceptanceTranscriptArgs{
+		RunID: "run-abc", StageID: "stage-xyz", Body: []byte(transcriptTestBody), PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrAcceptanceTranscriptInvalid) {
+		t.Fatalf("err = %v, want ErrAcceptanceTranscriptInvalid", err)
+	}
+	if tf.calls != 1 {
+		t.Errorf("400 must not retry, calls = %d", tf.calls)
+	}
+}
+
+func TestShipAcceptanceTranscript_PlainBadRequest_NotTyped(t *testing.T) {
+	tf, srv := newTranscriptFakeBackend(t)
+	tf.status = http.StatusBadRequest
+	tf.body = `{"error":{"code":"validation_failed"}}`
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	_, err := c.ShipAcceptanceTranscript(context.Background(), ShipAcceptanceTranscriptArgs{
+		RunID: "run-abc", StageID: "stage-xyz", Body: []byte(transcriptTestBody), PrivateKey: priv,
+	})
+	if err == nil || errors.Is(err, ErrAcceptanceTranscriptInvalid) {
+		t.Fatalf("err = %v, want an untyped 400 error", err)
+	}
+}
+
+func TestShipAcceptanceTranscript_SignatureRejected_401(t *testing.T) {
+	tf, srv := newTranscriptFakeBackend(t)
+	tf.status = http.StatusUnauthorized
+	tf.body = `{"error":{"code":"signature_invalid"}}`
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	_, err := c.ShipAcceptanceTranscript(context.Background(), ShipAcceptanceTranscriptArgs{
+		RunID: "run-abc", StageID: "stage-xyz", Body: []byte(transcriptTestBody), PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrSignatureRejected) {
+		t.Fatalf("err = %v, want ErrSignatureRejected", err)
+	}
+}
+
+func TestShipAcceptanceTranscript_NotFound_404(t *testing.T) {
+	tf, srv := newTranscriptFakeBackend(t)
+	tf.status = http.StatusNotFound
+	tf.body = `{"error":{"code":"stage_not_found"}}`
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	_, err := c.ShipAcceptanceTranscript(context.Background(), ShipAcceptanceTranscriptArgs{
+		RunID: "run-abc", StageID: "stage-xyz", Body: []byte(transcriptTestBody), PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestShipAcceptanceTranscript_RetriesOn5xxThenSucceeds(t *testing.T) {
+	tf, srv := newTranscriptFakeBackend(t)
+	tf.errCount = 2
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	if _, err := c.ShipAcceptanceTranscript(context.Background(), ShipAcceptanceTranscriptArgs{
+		RunID: "run-abc", StageID: "stage-xyz", Body: []byte(transcriptTestBody), PrivateKey: priv,
+	}); err != nil {
+		t.Fatalf("after transient 5xx: %v", err)
+	}
+	if tf.calls != 3 {
+		t.Errorf("calls = %d, want 3", tf.calls)
+	}
+}
+
+func TestShipAcceptanceTranscript_5xxExhaustedIsError(t *testing.T) {
+	tf, srv := newTranscriptFakeBackend(t)
+	tf.errCount = 100
+	c := quickClient(srv)
+	c.MaxRetries = 2
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	_, err := c.ShipAcceptanceTranscript(context.Background(), ShipAcceptanceTranscriptArgs{
+		RunID: "run-abc", StageID: "stage-xyz", Body: []byte(transcriptTestBody), PrivateKey: priv,
+	})
+	if err == nil || !strings.Contains(err.Error(), "exhausted retries") {
+		t.Fatalf("err = %v", err)
+	}
+	if tf.calls != 3 {
+		t.Errorf("calls = %d, want 3", tf.calls)
+	}
+}
+
+func TestShipAcceptanceTranscript_RejectsEmptyBodyAndBadKey(t *testing.T) {
+	_, srv := newTranscriptFakeBackend(t)
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	if _, err := c.ShipAcceptanceTranscript(context.Background(), ShipAcceptanceTranscriptArgs{RunID: "r", StageID: "s", PrivateKey: priv}); err == nil {
+		t.Error("empty body must be refused")
+	}
+	if _, err := c.ShipAcceptanceTranscript(context.Background(), ShipAcceptanceTranscriptArgs{RunID: "r", StageID: "s", Body: []byte("{}"), PrivateKey: []byte("short")}); err == nil {
+		t.Error("bad key must be refused")
+	}
+}
+
+func TestInjectTranscript_Injects(t *testing.T) {
+	out, err := InjectTranscript([]byte(`{"verdict":"passed","criteria":[]}`), AcceptanceTranscriptRef{ArtifactID: "id-1", ContentHash: "h"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(out, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if string(fields["transcript"]) != `{"artifact_id":"id-1","content_hash":"h"}` || string(fields["verdict"]) != `"passed"` {
+		t.Errorf("out = %s", out)
+	}
+}
+
+// TestInjectTranscript_RefusesExisting is the double-injection counterfactual
+// vehicle: a body already carrying `transcript` is refused.
+func TestInjectTranscript_RefusesExisting(t *testing.T) {
+	_, err := InjectTranscript([]byte(`{"verdict":"passed","transcript":{}}`), AcceptanceTranscriptRef{ArtifactID: "id-1", ContentHash: "h"})
+	if err == nil || !strings.Contains(err.Error(), "already carries a transcript field") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestInjectTranscript_RefusesNonObjectNullAndEmptyRef(t *testing.T) {
+	ref := AcceptanceTranscriptRef{ArtifactID: "id-1", ContentHash: "h"}
+	for _, body := range []string{`[1]`, `null`, `{"a":1}{"b":2}`, `not json`} {
+		if _, err := InjectTranscript([]byte(body), ref); err == nil {
+			t.Errorf("body %q must be refused", body)
+		}
+	}
+	if _, err := InjectTranscript([]byte(`{}`), AcceptanceTranscriptRef{}); err == nil {
+		t.Error("an empty ref must be refused")
+	}
+}

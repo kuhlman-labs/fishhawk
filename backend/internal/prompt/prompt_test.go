@@ -15697,3 +15697,156 @@ func TestBuild_ConcurrentVerifyRule_StaysRepoAgnostic(t *testing.T) {
 		}
 	}
 }
+
+// ---- Acceptance transcript (E72.5 / #3329) ----
+
+// TestAcceptanceTranscriptPath_PinnedFormat pins the keyed transcript sidecar
+// path byte-for-byte: the runner's acceptanceTranscriptPath mirrors this exact
+// format (runner/cmd/fishhawk-runner/acceptancetranscript.go pins the same
+// literal from its side), and the path must match the scripts/dev sweep glob
+// `fishhawk-acceptance-*-*.json`.
+func TestAcceptanceTranscriptPath_PinnedFormat(t *testing.T) {
+	got := AcceptanceTranscriptPath("RUN", "STAGE")
+	if got != "/tmp/fishhawk-acceptance-transcript-RUN-STAGE.json" {
+		t.Fatalf("AcceptanceTranscriptPath = %q (the runner mirrors this exact format)", got)
+	}
+}
+
+// TestBuild_Acceptance_TranscriptSection: with both ids threaded the acceptance
+// prompt renders the `### Transcript` section naming the keyed path, AFTER the
+// closed-field-set paragraph and BEFORE the "cannot exhibit" section; without
+// ids the section is absent (no legacy path exists).
+func TestBuild_Acceptance_TranscriptSection(t *testing.T) {
+	const runID = "11111111-2222-3333-4444-555555555555"
+	const stageID = "66666666-7777-8888-9999-000000000000"
+	keyed, err := Build("acceptance", Trigger{
+		Repo: "x/y", ApprovedPlan: acceptanceFixturePlan(),
+		AcceptanceRunID: runID, AcceptanceStageID: stageID,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	want := AcceptanceTranscriptPath(runID, stageID)
+	if !strings.Contains(keyed, "### Transcript\n\n") || !strings.Contains(keyed, "the per-criterion transcript — to "+want+".") {
+		t.Fatalf("acceptance prompt missing the transcript section naming %s:\n%s", want, keyed)
+	}
+	for _, w := range []string{
+		"It NEVER gates the verdict: the verdict is authoritative",
+		"`outcome`: one of passed|failed|skipped|undecidable",
+		"`method` one of GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS",
+		"<= 4096 bytes",
+		"for a failed criterion the LAST request is what reviewers see named as the failing request",
+	} {
+		if !strings.Contains(keyed, w) {
+			t.Errorf("transcript section missing %q", w)
+		}
+	}
+	closed := strings.Index(keyed, "The verdict may contain ONLY these fields")
+	tr := strings.Index(keyed, "### Transcript")
+	cannot := strings.Index(keyed, "### When the target cannot exhibit a criterion")
+	if closed >= tr || tr >= cannot {
+		t.Errorf("section order: closed-field-set@%d transcript@%d cannot-exhibit@%d", closed, tr, cannot)
+	}
+
+	legacy, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(legacy, "### Transcript") || strings.Contains(legacy, "fishhawk-acceptance-transcript-") {
+		t.Errorf("without ids the transcript section must be absent:\n%s", legacy)
+	}
+}
+
+func gateTranscriptFixture() *GateAcceptanceTranscript {
+	return &GateAcceptanceTranscript{
+		ArtifactID: "0f0f0f0f-0000-4000-8000-00000000abcd",
+		Criteria: []GateAcceptanceTranscriptCriterion{
+			{ID: "crit-a", Outcome: "failed", RequestCount: 2, FailingMethod: "GET", FailingPath: "/v0/runs/abc/audit?category=acceptance_outcome_recorded", FailingStatus: 200},
+			{ID: "scenario:issue-12/crit-b", Outcome: "passed", RequestCount: 1},
+			{ID: "crit-c", Outcome: "failed", RequestCount: 0},
+		},
+	}
+}
+
+// TestWriteGateEvidence_AcceptanceTranscript_Renders pins the block: heading,
+// artifact id + retrieval pointer, one row per criterion, the failing-request
+// clause ONLY on a failed row with a recorded request, and the
+// verdict-is-authoritative statement.
+func TestWriteGateEvidence_AcceptanceTranscript_Renders(t *testing.T) {
+	got := implementReviewWithGateEvidence(t, &GateEvidence{AcceptanceTranscript: gateTranscriptFixture()})
+	for _, w := range []string{
+		"#### Prior acceptance transcript (machine-derived)",
+		"transcript artifact `0f0f0f0f-0000-4000-8000-00000000abcd` (retrievable via GET /v0/artifacts/<id>",
+		"The VERDICT is authoritative; this summary is descriptive",
+		"- crit-a: failed (2 requests) — failing request: GET `/v0/runs/abc/audit?category=acceptance_outcome_recorded` -> 200\n",
+		"- scenario:issue-12/crit-b: passed (1 requests)\n",
+		"- crit-c: failed (0 requests)\n",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("prompt missing %q:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "crit-c: failed (0 requests) —") {
+		t.Errorf("a failed row with zero requests must carry no failing-request clause:\n%s", got)
+	}
+	if strings.Contains(got, "more criteria truncated") {
+		t.Errorf("3 rows must not truncate:\n%s", got)
+	}
+}
+
+// TestWriteGateEvidence_AcceptanceTranscript_Bounds pins the 20-row bound and
+// the 120-char path clip.
+func TestWriteGateEvidence_AcceptanceTranscript_Bounds(t *testing.T) {
+	tr := &GateAcceptanceTranscript{ArtifactID: "art"}
+	longPath := "/" + strings.Repeat("p", 200)
+	for i := 0; i < 25; i++ {
+		tr.Criteria = append(tr.Criteria, GateAcceptanceTranscriptCriterion{
+			ID: fmt.Sprintf("crit-%02d", i), Outcome: "failed", RequestCount: 1,
+			FailingMethod: "POST", FailingPath: longPath, FailingStatus: 500,
+		})
+	}
+	got := implementReviewWithGateEvidence(t, &GateEvidence{AcceptanceTranscript: tr})
+	if !strings.Contains(got, "- crit-19: failed") || strings.Contains(got, "- crit-20: failed") {
+		t.Errorf("rows must stop at 20:\n%s", got)
+	}
+	if !strings.Contains(got, "...[5 more criteria truncated]\n") {
+		t.Errorf("missing truncation tail:\n%s", got)
+	}
+	clipped := "`" + longPath[:120] + "...`"
+	if !strings.Contains(got, clipped) || strings.Contains(got, longPath) {
+		t.Errorf("path must be clipped to 120 chars + ...:\n%s", got)
+	}
+}
+
+// TestWriteGateEvidence_AcceptanceTranscript_Suppressed: when the backend
+// withheld the rows (transcript/verdict disagreement) only the artifact id and
+// the reason render — no per-criterion story that could contradict the verdict.
+func TestWriteGateEvidence_AcceptanceTranscript_Suppressed(t *testing.T) {
+	// Rows are deliberately populated alongside the suppression reason: the
+	// renderer must withhold them on the REASON alone (defense in depth over
+	// the backend/mapper, which already send nil rows when suppressed).
+	got := implementReviewWithGateEvidence(t, &GateEvidence{AcceptanceTranscript: &GateAcceptanceTranscript{
+		ArtifactID: "art-1", SummarySuppressed: "criterion_outcome_disagrees",
+		Criteria: []GateAcceptanceTranscriptCriterion{{ID: "crit-a", Outcome: "failed", RequestCount: 1}},
+	}})
+	if !strings.Contains(got, "Per-criterion rows withheld: the transcript disagreed with the verdict (`criterion_outcome_disagrees`)") {
+		t.Errorf("missing suppression line:\n%s", got)
+	}
+	if strings.Contains(got, "requests)") || strings.Contains(got, "No per-criterion rows were recorded") {
+		t.Errorf("suppressed block must render neither rows nor the empty-rows line:\n%s", got)
+	}
+}
+
+// TestWriteGateEvidence_AcceptanceTranscript_NilByteIdentical: nil keeps the
+// implement-review prompt byte-identical (prompt-hash replay stability).
+func TestWriteGateEvidence_AcceptanceTranscript_NilByteIdentical(t *testing.T) {
+	base := &GateEvidence{VerifySummary: &GateVerifySummary{Outcome: "passed", Iterations: 1, MaxIterations: 3}}
+	without := implementReviewWithGateEvidence(t, base)
+	withNil := implementReviewWithGateEvidence(t, &GateEvidence{VerifySummary: base.VerifySummary, AcceptanceTranscript: nil})
+	if without != withNil {
+		t.Fatal("nil AcceptanceTranscript must render byte-identically")
+	}
+	if strings.Contains(without, "Prior acceptance transcript") {
+		t.Fatalf("nil must render no block:\n%s", without)
+	}
+}

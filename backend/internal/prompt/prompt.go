@@ -121,6 +121,17 @@ func AcceptanceVerdictPath(runID, stageID string) string {
 	return fmt.Sprintf("/tmp/fishhawk-acceptance-%s-%s.json", runID, stageID)
 }
 
+// AcceptanceTranscriptPath is the run/stage-keyed absolute path the acceptance
+// agent writes its per-criterion TRANSCRIPT to (E72.5 / #3329) — the sidecar
+// beside the verdict carrying each request/response, the assertion and its
+// outcome. KEYED ONLY: the transcript is new, so no legacy fixed path exists
+// and acceptanceTranscriptPathForTrigger renders nothing without both ids. MUST
+// stay byte-identical to the runner's acceptanceTranscriptPath format string
+// (runner/cmd/fishhawk-runner/acceptancetranscript.go); pinned from both sides.
+func AcceptanceTranscriptPath(runID, stageID string) string {
+	return fmt.Sprintf("/tmp/fishhawk-acceptance-transcript-%s-%s.json", runID, stageID)
+}
+
 // LegacyAcceptanceVerdictPath is the fixed shared path the acceptance prompt
 // named before #1780 keyed it. Retained as the resolver's fallback when a
 // trigger threads no run/stage ids, and mirrored by the runner's
@@ -1019,6 +1030,27 @@ type GateEvidence struct {
 	// FixupRoutedConcernCount is how many concerns the fix-up pass routed, the
 	// denominator for the two fields above.
 	FixupRoutedConcernCount int
+	// AcceptanceTranscript carries the bounded, machine-derived per-criterion
+	// summary of the run's newest recorded acceptance transcript (E72.5 /
+	// #3329), stamped backend-side at implement-review dispatch from the
+	// acceptance_outcome_recorded payload's `transcript` block — NOT
+	// bundle-carried, so nil keeps the prompt byte-identical (prompt-hash
+	// replay stability). RENDER-SAFETY: writeGateEvidence renders it WITHOUT
+	// an untrusted-intake envelope, deliberately. The #2290 / #3192 envelopes
+	// (writeUntrustedIssueBody / writeUntrustedVerifyOutput) exist for FREE
+	// TEXT carried verbatim; this block carries none. Every rendered value is
+	// grammar- and length-bounded at BACKEND INGEST
+	// (backend/internal/server/acceptance_transcript.go): id
+	// ^(scenario:issue-[0-9]+/)?[a-z0-9][a-z0-9-]*$ <= 128 bytes, outcome enum,
+	// request_count int, method enum, status int 100..599, path the RFC 3986
+	// pchar+'/'+'?' charset <= 512 bytes (no whitespace, control byte,
+	// backtick or '|', so the backtick span cannot be broken). Assertion text,
+	// seed prose and bodies are never carried here. EVIDENCE ONLY: it never
+	// fails, re-opens or re-budgets the pass, and the VERDICT (rendered
+	// elsewhere) is authoritative — the backend withholds Criteria when the
+	// transcript disagreed with the verdict (SummarySuppressed names why), so
+	// this block is structurally incapable of contradicting the verdict headline.
+	AcceptanceTranscript *GateAcceptanceTranscript
 	// OperatorScopeUndelivered carries the operator-deliberately-added scope
 	// paths (an add_scope_files path folded at plan approval, or an approved
 	// mid-stage scope amendment) that the implement commit left UNTOUCHED
@@ -1306,6 +1338,36 @@ type GateFixupObligationReport struct {
 	ID     string
 	Status string
 }
+
+// GateAcceptanceTranscript is the review-prompt projection of the
+// acceptance_outcome_recorded `transcript` block (E72.5 / #3329). Criteria is
+// nil with SummarySuppressed set when the backend withheld the per-criterion
+// rows because the transcript disagreed with the verdict (approval condition
+// 1); writeGateEvidence then renders only the artifact id and the reason.
+type GateAcceptanceTranscript struct {
+	ArtifactID        string
+	Criteria          []GateAcceptanceTranscriptCriterion
+	SummarySuppressed string
+}
+
+// GateAcceptanceTranscriptCriterion is one bounded summary row. The Failing*
+// fields are set only for a `failed` row that recorded at least one request:
+// the LAST request recorded, regardless of status.
+type GateAcceptanceTranscriptCriterion struct {
+	ID            string
+	Outcome       string
+	RequestCount  int
+	FailingMethod string
+	FailingPath   string
+	FailingStatus int
+}
+
+// Bounds on the rendered acceptance-transcript block: at most this many rows,
+// and a path clipped to this many characters with a trailing `...` marker.
+const (
+	gateAcceptanceTranscriptMaxRows      = 20
+	gateAcceptanceTranscriptMaxPathChars = 120
+)
 
 // GateFixupReportingObligation is one routed reporting obligation the review
 // must surface (#2737): the stable id, the routed channel it came from, its
@@ -3155,6 +3217,17 @@ func acceptanceVerdictPathForTrigger(t Trigger) string {
 	return LegacyAcceptanceVerdictPath
 }
 
+// acceptanceTranscriptPathForTrigger resolves the keyed transcript sidecar
+// path (E72.5 / #3329) ONLY when the trigger threads BOTH AcceptanceRunID and
+// AcceptanceStageID; otherwise "" and the `### Transcript` section is omitted —
+// there is no legacy path to fall back to.
+func acceptanceTranscriptPathForTrigger(t Trigger) string {
+	if t.AcceptanceRunID != "" && t.AcceptanceStageID != "" {
+		return AcceptanceTranscriptPath(t.AcceptanceRunID, t.AcceptanceStageID)
+	}
+	return ""
+}
+
 // acceptanceTreePathForTrigger resolves the run/stage-keyed merge-candidate
 // checkout path the acceptance prompt names as the ONLY sanctioned tree for
 // repository-content (Posture B) criteria (#1881). It returns AcceptanceTreePath
@@ -3303,6 +3376,45 @@ func buildImplementFixup(t Trigger) string {
 // instance section → output contract. A nil ApprovedPlan or empty criteria set
 // renders an explicit no-criteria warning (the plan_acceptance_precheck gate
 // normally prevents this — fail loud, not silent).
+// writeAcceptanceTranscriptContract renders the acceptance prompt's
+// `### Transcript` section (E72.5 / #3329): the closed shape of the
+// per-criterion transcript sidecar the validator writes BESIDE the verdict.
+// The grammar it states mirrors the backend ingest validator
+// (backend/internal/server/acceptance_transcript.go) and the runner twin, so
+// a transcript written to this contract is accepted by both. It never gates
+// the verdict: the VERDICT is authoritative, the transcript is descriptive.
+func writeAcceptanceTranscriptContract(b *strings.Builder, path string) {
+	b.WriteString("### Transcript\n\n")
+	b.WriteString("Beside the verdict, write ONE JSON object — the per-criterion transcript — to " +
+		path + ". It is descriptive evidence of what you exercised: the runner reads it, " +
+		"redacts it, and ships it beside the verdict. It NEVER gates the verdict: the verdict " +
+		"is authoritative and a missing or malformed transcript is dropped with a logged reason, " +
+		"never a stage failure. Its shape is CLOSED (any other field is rejected):\n\n")
+	b.WriteString("- `criteria` (REQUIRED, 1..100 entries, one per criterion row you report in the " +
+		"verdict, ids unique): each `{id, seed?, requests, assertion, outcome, wall_ms}`.\n")
+	b.WriteString("  - `id`: the SAME id as the verdict row — the criterion id from the plan " +
+		"(lowercase `[a-z0-9][a-z0-9-]*`, <= 128 bytes) or the replayed-scenario id exactly as " +
+		"served (`scenario:issue-<N>/<criterion-id>`). Never invent one.\n")
+	b.WriteString("  - `seed` (OPTIONAL): the fixture scenario name you materialized for this " +
+		"criterion, when one was (`[a-z0-9][a-z0-9-]*`, <= 200 bytes).\n")
+	b.WriteString("  - `requests`: <= 200 entries in the ORDER SENT, each `{method, path, " +
+		"request_body?, status, response_body?, elapsed_ms}` — `method` one of GET|HEAD|POST|PUT|" +
+		"PATCH|DELETE|OPTIONS; `path` the request path + query only (RFC 3986 characters, no " +
+		"scheme/host, no whitespace, <= 512 bytes); `status` the integer response status " +
+		"100..599; bodies as strings, each <= 4096 bytes (longer bodies are truncated by the " +
+		"runner — put the decisive fragment first).\n")
+	b.WriteString("  - `assertion`: the check you evaluated, <= 2000 bytes.\n")
+	b.WriteString("  - `outcome`: one of passed|failed|skipped|undecidable — the SAME value as " +
+		"the verdict row's `result`; a transcript row that disagrees with its verdict row is " +
+		"withheld from every summary.\n")
+	b.WriteString("  - `wall_ms`: integer wall time for the criterion.\n")
+	b.WriteString("- `target_url` (OPTIONAL): the http(s) URL you drove.\n\n")
+	b.WriteString("Record every request you actually sent for a criterion, including the one whose " +
+		"response the failing assertion evaluated — for a failed criterion the LAST request is what " +
+		"reviewers see named as the failing request. Do NOT put prose, secrets or the verdict itself " +
+		"in the transcript.\n\n")
+}
+
 func buildAcceptance(t Trigger) string {
 	var b strings.Builder
 	b.WriteString("You are the acceptance validator for a change in the repository ")
@@ -3412,6 +3524,17 @@ func buildAcceptance(t Trigger) string {
 	b.WriteString("The result is shipped via the signed evidence bundle — keep evidence blobs " +
 		"customer-side and reference them by content hash; only the structured verdict + hashes " +
 		"cross to Fishhawk.\n\n")
+
+	// Transcript sidecar contract (E72.5 / #3329). Rendered AFTER the
+	// closed-field-set region and BEFORE the "cannot exhibit" section so its
+	// backtick tokens fall outside the ClosedFieldSet count guard's span, and
+	// it adds NO verdict field — the transcript is a SEPARATE file. STATIC
+	// renderer text: no issue-body or verify-output bytes flow through it.
+	// Omitted entirely when the trigger threads no run/stage ids (no legacy
+	// path exists for the transcript).
+	if trPath := acceptanceTranscriptPathForTrigger(t); trPath != "" {
+		writeAcceptanceTranscriptContract(&b, trPath)
+	}
 
 	// The sanctioned behavior when the running target cannot exhibit a criterion
 	// (#1612). Rendered AFTER the closed-field-set region above so its backtick
@@ -6489,6 +6612,10 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		b.WriteString("This whole signal is ADVISORY — it did NOT fail, re-open, or re-budget the pass.\n\n")
 	}
 
+	if ev.AcceptanceTranscript != nil {
+		writeGateAcceptanceTranscript(b, ev.AcceptanceTranscript)
+	}
+
 	if len(ev.PolicyViolations) > 0 {
 		b.WriteString("Constraint violations (policy gate):\n\n")
 		for _, pv := range ev.PolicyViolations {
@@ -6506,6 +6633,51 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		}
 		b.WriteString("\n")
 	}
+}
+
+// writeGateAcceptanceTranscript renders the bounded, machine-derived acceptance
+// transcript summary (E72.5 / #3329). NOT enveloped — see
+// GateEvidence.AcceptanceTranscript for the render-safety statement: every
+// value printed here is grammar-bounded at backend ingest, so no whitespace,
+// control byte, backtick or '|' can reach this block. The verdict is
+// authoritative; this block is descriptive and is withheld (Criteria nil +
+// SummarySuppressed) when the transcript disagreed with the verdict.
+func writeGateAcceptanceTranscript(b *strings.Builder, tr *GateAcceptanceTranscript) {
+	b.WriteString("#### Prior acceptance transcript (machine-derived)\n\n")
+	fmt.Fprintf(b, "The run's newest recorded acceptance verdict carries a transcript artifact `%s` "+
+		"(retrievable via GET /v0/artifacts/<id>; request and response bodies live there and are never "+
+		"rendered here). The VERDICT is authoritative; this summary is descriptive and machine-derived "+
+		"from the stored transcript — it carries no agent prose.\n\n", tr.ArtifactID)
+	if tr.SummarySuppressed != "" {
+		fmt.Fprintf(b, "Per-criterion rows withheld: the transcript disagreed with the verdict (`%s`). "+
+			"Read the verdict, not the transcript, for criterion outcomes.\n\n", tr.SummarySuppressed)
+		return
+	}
+	if len(tr.Criteria) == 0 {
+		b.WriteString("No per-criterion rows were recorded.\n\n")
+		return
+	}
+	rows := tr.Criteria
+	truncated := 0
+	if len(rows) > gateAcceptanceTranscriptMaxRows {
+		truncated = len(rows) - gateAcceptanceTranscriptMaxRows
+		rows = rows[:gateAcceptanceTranscriptMaxRows]
+	}
+	for _, c := range rows {
+		fmt.Fprintf(b, "- %s: %s (%d requests)", c.ID, c.Outcome, c.RequestCount)
+		if c.Outcome == "failed" && c.FailingMethod != "" {
+			path := c.FailingPath
+			if len(path) > gateAcceptanceTranscriptMaxPathChars {
+				path = path[:gateAcceptanceTranscriptMaxPathChars] + "..."
+			}
+			fmt.Fprintf(b, " — failing request: %s `%s` -> %d", c.FailingMethod, path, c.FailingStatus)
+		}
+		b.WriteString("\n")
+	}
+	if truncated > 0 {
+		fmt.Fprintf(b, "...[%d more criteria truncated]\n", truncated)
+	}
+	b.WriteString("\n")
 }
 
 // writePlanForReview renders a standard_v1 plan for the review-agent prompt.

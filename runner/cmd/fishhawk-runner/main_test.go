@@ -347,6 +347,14 @@ type fakeUploader struct {
 	// vacuous.
 	requestAmendmentDecision string
 
+	// Acceptance-transcript ship seam (E72.5 / #3329): gotTranscriptArgs
+	// records the call, transcriptErr forces a failure, and shipCallOrder
+	// records the ORDER of ShipAcceptanceTranscript ("transcript") vs
+	// ShipAcceptance ("acceptance") calls for the ship-before-verdict pin.
+	gotTranscriptArgs *upload.ShipAcceptanceTranscriptArgs
+	transcriptErr     error
+	shipCallOrder     []string
+
 	// Canned prompt response. If nil, FetchPrompt returns a default
 	// one matching the requested stage_id.
 	promptResp *upload.FetchedPrompt
@@ -491,6 +499,7 @@ func (f *fakeUploader) ShipPlan(_ context.Context, args upload.ShipPlanArgs) (*u
 func (f *fakeUploader) ShipAcceptance(_ context.Context, args upload.ShipAcceptanceArgs) (*upload.ShipAcceptanceResult, error) {
 	a := args
 	f.gotAcceptanceArgs = &a
+	f.shipCallOrder = append(f.shipCallOrder, "acceptance")
 	if err := f.rejectIfStaleKey(args.PrivateKey); err != nil {
 		return nil, err
 	}
@@ -508,6 +517,27 @@ func (f *fakeUploader) ShipAcceptance(_ context.Context, args upload.ShipAccepta
 		ContentHash: "feedface",
 		Verdict:     acc.Verdict,
 		FailureMode: acc.FailureMode,
+	}, nil
+}
+
+// ShipAcceptanceTranscript stubs the E72.5 / #3329 transcript-ship endpoint.
+// Records the args and appends "transcript" to shipCallOrder (ShipAcceptance
+// appends "acceptance") so tests can assert the ship-before-verdict ORDER.
+func (f *fakeUploader) ShipAcceptanceTranscript(_ context.Context, args upload.ShipAcceptanceTranscriptArgs) (*upload.ShipAcceptanceTranscriptResult, error) {
+	a := args
+	f.gotTranscriptArgs = &a
+	f.shipCallOrder = append(f.shipCallOrder, "transcript")
+	if err := f.rejectIfStaleKey(args.PrivateKey); err != nil {
+		return nil, err
+	}
+	if f.transcriptErr != nil {
+		return nil, f.transcriptErr
+	}
+	return &upload.ShipAcceptanceTranscriptResult{
+		ID:          "00000000-0000-0000-0000-000000000ddd",
+		StageID:     args.StageID,
+		ContentHash: "cafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00d",
+		Idempotent:  false,
 	}, nil
 }
 
@@ -4849,6 +4879,11 @@ func TestSweepStaleAcceptanceVerdict(t *testing.T) {
 	if err := os.WriteFile(legacyAcceptanceVerdictPath, []byte("stale legacy\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The keyed TRANSCRIPT sidecar (E72.5 / #3329) is swept by the same pass.
+	transcript := acceptanceTranscriptPath("r", "s")
+	if err := os.WriteFile(transcript, []byte("stale transcript\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	var stderr strings.Builder
 	if !sweepStaleAcceptanceVerdict(cfg, &stderr) {
 		t.Errorf("swept files must return ok, got false:\n%s", stderr.String())
@@ -4859,9 +4894,12 @@ func TestSweepStaleAcceptanceVerdict(t *testing.T) {
 	if _, statErr := os.Stat(legacyAcceptanceVerdictPath); !os.IsNotExist(statErr) {
 		t.Errorf("legacy stale verdict must be swept, stat err = %v", statErr)
 	}
+	if _, statErr := os.Stat(transcript); !os.IsNotExist(statErr) {
+		t.Errorf("keyed stale transcript must be swept, stat err = %v", statErr)
+	}
 	swept := strings.Count(stderr.String(), `"event":"acceptance_verdict_swept"`)
-	if swept != 2 {
-		t.Errorf("expected 2 acceptance_verdict_swept events (keyed + legacy), got %d:\n%s", swept, stderr.String())
+	if swept != 3 {
+		t.Errorf("expected 3 acceptance_verdict_swept events (keyed + legacy + transcript), got %d:\n%s", swept, stderr.String())
 	}
 }
 

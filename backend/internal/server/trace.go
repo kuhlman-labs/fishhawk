@@ -4306,6 +4306,35 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		}
 	}
 
+	// Prior acceptance transcript gate evidence (E72.5 / #3329). When the run's
+	// NEWEST acceptance_outcome_recorded entry carries a transcript block, map
+	// it onto prompt.GateAcceptanceTranscript so the reviewer sees the bounded,
+	// machine-derived per-criterion summary (id / outcome / request count /
+	// failing request) — every value grammar-bounded at backend ingest, bodies
+	// never carried. The VERDICT is authoritative and the transcript
+	// descriptive: the backend already withholds the rows when the transcript
+	// disagreed with the verdict (SummarySuppressed), so what is stamped here
+	// cannot contradict the verdict headline.
+	//
+	// EVIDENCE ONLY, byte-for-byte the #1407/#2737 posture: it sets a prompt
+	// field and NEVER touches the review outcome, res, the stage result or the
+	// fix-up budget. A read error WARN-logs and stamps nothing; no recorded
+	// outcome / transcript:null stamps nothing and keeps the prompt
+	// byte-identical — pinned by TestRunImplementReviews_AcceptanceTranscript_*.
+	if outcome, oerr := s.latestAcceptanceOutcome(ctx, runID); oerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: read acceptance outcome for transcript gate evidence failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", oerr.Error()),
+		)
+	} else if outcome.Recorded && outcome.Transcript != nil {
+		if gateEvidence == nil {
+			gateEvidence = &prompt.GateEvidence{}
+			trig.GateEvidence = gateEvidence
+		}
+		gateEvidence.AcceptanceTranscript = gateAcceptanceTranscriptFromSummary(outcome.Transcript)
+	}
+
 	// Routed-concern NOT-ATTEMPTED pre-review signal (#2896). A fix-up pass
 	// reports `succeeded` with no mechanical check that each routed concern was
 	// even attempted — the verify gate certifies only the tree and this review is
@@ -7994,4 +8023,26 @@ func pickRedactedTraceHash(entries []*audit.Entry, stageID uuid.UUID) (string, b
 		return payload.ContentHash, true
 	}
 	return "", false
+}
+
+// gateAcceptanceTranscriptFromSummary maps the acceptance_outcome_recorded
+// `transcript` block (E72.5 / #3329) onto the review-prompt projection. Rows
+// are carried only when the backend did NOT withhold them; a failed row's
+// failing request (the LAST recorded request, per the one rule
+// summarizeAcceptanceTranscript applies) becomes the three Failing* fields.
+func gateAcceptanceTranscriptFromSummary(sum *acceptanceTranscriptSummary) *prompt.GateAcceptanceTranscript {
+	out := &prompt.GateAcceptanceTranscript{ArtifactID: sum.ArtifactID, SummarySuppressed: sum.SummarySuppressed}
+	if sum.SummarySuppressed != "" {
+		return out
+	}
+	for _, c := range sum.Criteria {
+		row := prompt.GateAcceptanceTranscriptCriterion{ID: c.ID, Outcome: c.Outcome, RequestCount: c.RequestCount}
+		if c.FailingRequest != nil {
+			row.FailingMethod = c.FailingRequest.Method
+			row.FailingPath = c.FailingRequest.Path
+			row.FailingStatus = c.FailingRequest.Status
+		}
+		out.Criteria = append(out.Criteria, row)
+	}
+	return out
 }
