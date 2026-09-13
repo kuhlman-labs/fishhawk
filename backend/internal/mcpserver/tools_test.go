@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -40,6 +41,7 @@ import (
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
@@ -14664,5 +14666,357 @@ func TestApprovePlan_RetireScenarioAdvertised(t *testing.T) {
 	af, _ := reflect.TypeOf(AcceptanceCriteriaAmendment{}).FieldByName("Action")
 	if !strings.Contains(af.Tag.Get("jsonschema"), "retire_scenario") {
 		t.Errorf("AcceptanceCriteriaAmendment.Action description does not name retire_scenario")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// acceptance transcript on fishhawk_get_run_status (E72.5 / #3329)
+// ---------------------------------------------------------------------------
+
+// seedAcceptanceOutcomeAudit appends an acceptance_outcome_recorded entry
+// carrying the given `transcript` block (a decoded map, or nil for the
+// explicit transcript:null the backend records when no transcript shipped).
+func seedAcceptanceOutcomeAudit(fb *fakeBackend, runID uuid.UUID, transcript any) {
+	seedRawReviewAudit(fb, runID, auditCategoryAcceptanceOutcomeRecorded, map[string]any{
+		"outcome": "rejected", "verdict": "failed", "criteria_passed": 1, "criteria_total": 2,
+		"transcript": transcript,
+	})
+}
+
+// sampleTranscriptBlock is the payload shape slice 0's
+// buildAcceptanceTranscriptSummary records (server/acceptance_transcript.go):
+// failing_request INSIDE criteria[], the LAST request of the failed row.
+func sampleTranscriptBlock(artifactID string) map[string]any {
+	return map[string]any{
+		"artifact_id":  artifactID,
+		"content_hash": strings.Repeat("c", 64),
+		"criteria": []any{
+			map[string]any{"id": "crit-a", "outcome": "failed", "request_count": 2,
+				"failing_request": map[string]any{"method": "GET", "path": "/v0/runs/abc/audit?category=acceptance_outcome_recorded", "status": 200}},
+			map[string]any{"id": "scenario:issue-12/crit-b", "outcome": "passed", "request_count": 1, "failing_request": nil},
+		},
+	}
+}
+
+func acceptanceStatusRun(fb *fakeBackend, runID uuid.UUID) {
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 4, Type: "acceptance", State: "succeeded"},
+	}
+}
+
+// TestGetRunStatus_AcceptanceTranscript_Populated: a recorded outcome carrying
+// a transcript block surfaces the typed field with the REST retrieval path
+// and the per-criterion rows, failing_request inside criteria[].
+func TestGetRunStatus_AcceptanceTranscript_Populated(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	acceptanceStatusRun(fb, runID)
+	artifactID := uuid.NewString()
+	seedAcceptanceOutcomeAudit(fb, runID, sampleTranscriptBlock(artifactID))
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	tr := out.AcceptanceTranscript
+	if tr == nil {
+		t.Fatal("AcceptanceTranscript = nil, want the recorded block")
+	}
+	if tr.ArtifactID != artifactID || tr.ContentHash != strings.Repeat("c", 64) {
+		t.Errorf("ref = %s/%s, want %s/%s", tr.ArtifactID, tr.ContentHash, artifactID, strings.Repeat("c", 64))
+	}
+	if tr.ArtifactPath != "/v0/artifacts/"+artifactID {
+		t.Errorf("ArtifactPath = %q, want the REST retrieval pointer", tr.ArtifactPath)
+	}
+	if tr.SummarySuppressed != "" || len(tr.DisagreeingIDs) != 0 {
+		t.Errorf("agreeing block carries suppression: %+v", tr)
+	}
+	if len(tr.Criteria) != 2 {
+		t.Fatalf("Criteria = %+v, want 2 rows", tr.Criteria)
+	}
+	fr := tr.Criteria[0].FailingRequest
+	if tr.Criteria[0].ID != "crit-a" || tr.Criteria[0].Outcome != "failed" || tr.Criteria[0].RequestCount != 2 ||
+		fr == nil || fr.Method != "GET" || fr.Status != 200 || fr.Path != "/v0/runs/abc/audit?category=acceptance_outcome_recorded" {
+		t.Errorf("Criteria[0] = %+v (failing_request %+v), want the failed row with its LAST request", tr.Criteria[0], fr)
+	}
+	if tr.Criteria[1].ID != "scenario:issue-12/crit-b" || tr.Criteria[1].FailingRequest != nil {
+		t.Errorf("Criteria[1] = %+v, want the passed row with a null failing_request", tr.Criteria[1])
+	}
+}
+
+// TestGetRunStatus_AcceptanceTranscript_NullOmitted: the explicit
+// transcript:null a pre-transcript runner (or a failed transcript ship)
+// records leaves the field omitted.
+func TestGetRunStatus_AcceptanceTranscript_NullOmitted(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	acceptanceStatusRun(fb, runID)
+	seedAcceptanceOutcomeAudit(fb, runID, nil)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.AcceptanceTranscript != nil {
+		t.Errorf("AcceptanceTranscript = %+v, want nil on transcript:null", out.AcceptanceTranscript)
+	}
+	raw, _ := json.Marshal(out)
+	if strings.Contains(string(raw), `"acceptance_transcript"`) {
+		t.Errorf("wire carries acceptance_transcript on a null block:\n%s", raw)
+	}
+}
+
+// TestGetRunStatus_AcceptanceTranscript_NoAcceptanceStage_NoRead: the read is
+// cost-gated on an acceptance stage — a run without one issues NO
+// acceptance_outcome_recorded category read at all (asserted on the fake's
+// per-category call log), even when such an entry exists, so ordinary runs
+// pay nothing and stay byte-identical.
+func TestGetRunStatus_AcceptanceTranscript_NoAcceptanceStage_NoRead(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+	}
+	seedAcceptanceOutcomeAudit(fb, runID, sampleTranscriptBlock(uuid.NewString()))
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.AcceptanceTranscript != nil {
+		t.Errorf("AcceptanceTranscript = %+v, want nil without an acceptance stage", out.AcceptanceTranscript)
+	}
+	fb.mu.Lock()
+	reads := fb.perRunAuditCategoryReads[auditCategoryAcceptanceOutcomeRecorded]
+	fb.mu.Unlock()
+	if reads != 0 {
+		t.Errorf("acceptance_outcome_recorded category reads = %d, want 0 (cost-gated on an acceptance stage)", reads)
+	}
+}
+
+// TestGetRunStatus_AcceptanceTranscript_SuppressedCarriesReason: when the
+// backend found the transcript disagreeing with the verdict it recorded
+// criteria:null plus summary_suppressed (approval condition 1 — the verdict is
+// authoritative, the transcript descriptive). The surface carries that
+// verbatim — the ref stays one fetch away, no rows are synthesized.
+func TestGetRunStatus_AcceptanceTranscript_SuppressedCarriesReason(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	acceptanceStatusRun(fb, runID)
+	artifactID := uuid.NewString()
+	seedAcceptanceOutcomeAudit(fb, runID, map[string]any{
+		"artifact_id": artifactID, "content_hash": strings.Repeat("d", 64),
+		"criteria": nil, "summary_suppressed": "criterion_outcome_disagrees", "disagreeing_ids": []any{"crit-a"},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	tr := out.AcceptanceTranscript
+	if tr == nil || tr.ArtifactID != artifactID || tr.ArtifactPath != "/v0/artifacts/"+artifactID {
+		t.Fatalf("AcceptanceTranscript = %+v, want the ref retained", tr)
+	}
+	if tr.SummarySuppressed != "criterion_outcome_disagrees" || len(tr.DisagreeingIDs) != 1 || tr.DisagreeingIDs[0] != "crit-a" {
+		t.Errorf("suppression = %q/%v, want criterion_outcome_disagrees/[crit-a]", tr.SummarySuppressed, tr.DisagreeingIDs)
+	}
+	if tr.Criteria != nil {
+		t.Errorf("Criteria = %+v, want nil on a suppressed summary", tr.Criteria)
+	}
+}
+
+// TestGetRunStatus_AcceptanceTranscript_NewestWins: a re-run's fresh verdict
+// (higher sequence) supersedes an older outcome's transcript.
+func TestGetRunStatus_AcceptanceTranscript_NewestWins(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	acceptanceStatusRun(fb, runID)
+	oldID, newID := uuid.NewString(), uuid.NewString()
+	seedAcceptanceOutcomeAudit(fb, runID, sampleTranscriptBlock(oldID))
+	seedAcceptanceOutcomeAudit(fb, runID, sampleTranscriptBlock(newID))
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.AcceptanceTranscript == nil || out.AcceptanceTranscript.ArtifactID != newID {
+		t.Errorf("AcceptanceTranscript = %+v, want the newest entry's artifact %s", out.AcceptanceTranscript, newID)
+	}
+}
+
+// TestDecodeAcceptanceTranscriptStatus pins the consumer-side decode rule:
+// nil on null / absent / undecodable / artifact_id-less, never a zero block.
+func TestDecodeAcceptanceTranscriptStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"absent", ""},
+		{"null", "null"},
+		{"undecodable", `{"artifact_id": 12}`},
+		{"not an object", `[1,2]`},
+		{"no artifact_id", `{"content_hash":"x","criteria":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := decodeAcceptanceTranscriptStatus(json.RawMessage(tc.raw)); got != nil {
+				t.Errorf("decode(%q) = %+v, want nil", tc.raw, got)
+			}
+		})
+	}
+	got := decodeAcceptanceTranscriptStatus(json.RawMessage(`{"artifact_id":"a1","content_hash":"h","criteria":[{"id":"c","outcome":"passed","request_count":0,"failing_request":null}]}`))
+	if got == nil || got.ArtifactPath != "/v0/artifacts/a1" || len(got.Criteria) != 1 || got.Criteria[0].FailingRequest != nil {
+		t.Errorf("decode(valid) = %+v", got)
+	}
+}
+
+// TestGetRunStatus_AcceptanceTranscript_EndpointProducedThroughRealRouter
+// closes approval condition 2 for the fishhawk_get_run_status consumer: no
+// seeded payload anywhere. A transcript is POSTed to the REAL
+// /v0/runs/{id}/acceptance/transcript route over REAL Postgres, the verdict
+// carrying its ref is POSTed to the REAL /v0/runs/{id}/acceptance route, and
+// the REAL MCP resolver over the REAL api client reads the run status back —
+// so the acceptance_transcript block is whatever the backend DERIVED FROM THE
+// STORED ARTIFACT, and every mirrored field must decode populated (a json-tag
+// mismatch across the hand mirror leaves a zero value here while the call
+// itself still returns nil). This consumer is representative because it is
+// the only one that decodes the block through a SECOND serialization hop
+// (backend JSON → REST → MCP DTO); the anchor comment renders in-process from
+// the same audit payload.
+func TestGetRunStatus_AcceptanceTranscript_EndpointProducedThroughRealRouter(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	artRepo := artifact.NewPostgresRepository(pool)
+	signRepo := signing.NewPostgresRepository(pool)
+
+	runRow, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef",
+		TriggerSource: runpkg.TriggerCLI, RunnerKind: runpkg.RunnerKindLocal,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	acceptance, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: runRow.ID, Sequence: 1, Type: runpkg.StageTypeAcceptance,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage acceptance: %v", err)
+	}
+	key, err := signRepo.Issue(ctx, runRow.ID, time.Hour)
+	if err != nil {
+		t.Fatalf("issue signing key: %v", err)
+	}
+
+	backend := server.New(server.Config{
+		RunRepo: runRepo, AuditRepo: auditRepo, ArtifactRepo: artRepo, SigningRepo: signRepo,
+	})
+	httpSrv := httptest.NewServer(backend.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	signedPost := func(path string, body []byte) (int, []byte) {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, httpSrv.URL+path, strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Fishhawk-Signature", hex.EncodeToString(ed25519.Sign(key.PrivateKey, signing.ComputeMessage(body))))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, raw
+	}
+
+	// 1) The transcript, through the real route: a failed criterion whose
+	// LAST request is a 200 (the assertion-failure-on-2xx Done-means case).
+	const failingPath = "/v0/runs/abc/audit?category=acceptance_outcome_recorded"
+	transcript := []byte(`{"criteria":[` +
+		`{"id":"crit-a","requests":[` +
+		`{"method":"POST","path":"/v0/dev/fixtures","request_body":"{\"scenario\":\"acceptance-dispatched\"}","status":201,"response_body":"{\"ok\":true}","elapsed_ms":12},` +
+		`{"method":"GET","path":"` + failingPath + `","status":200,"response_body":"{\"items\":[]}","elapsed_ms":3}],` +
+		`"assertion":"newest acceptance_outcome_recorded carries transcript.artifact_id","outcome":"failed","wall_ms":20},` +
+		`{"id":"crit-b","requests":[{"method":"GET","path":"/healthz","status":200,"elapsed_ms":1}],"assertion":"200","outcome":"passed","wall_ms":2}]}`)
+	code, raw := signedPost("/v0/runs/"+runRow.ID.String()+"/acceptance/transcript?stage_id="+acceptance.ID.String(), transcript)
+	if code != http.StatusCreated {
+		t.Fatalf("ship transcript = %d:\n%s", code, raw)
+	}
+	var trResp struct {
+		ID          string `json:"id"`
+		ContentHash string `json:"content_hash"`
+	}
+	if err := json.Unmarshal(raw, &trResp); err != nil || trResp.ID == "" {
+		t.Fatalf("transcript response %s: %v", raw, err)
+	}
+
+	// 2) The verdict carrying the runner-injected ref, rows agreeing with the
+	// transcript.
+	verdict := []byte(`{"verdict":"failed","failure_mode":"assertion_fail",` +
+		`"criteria":[{"id":"crit-a","result":"failed","observed":"items empty"},{"id":"crit-b","result":"passed"}],` +
+		`"transcript":{"artifact_id":"` + trResp.ID + `","content_hash":"` + trResp.ContentHash + `"}}`)
+	code, raw = signedPost("/v0/runs/"+runRow.ID.String()+"/acceptance?stage_id="+acceptance.ID.String(), verdict)
+	if code != http.StatusCreated {
+		t.Fatalf("ship verdict = %d:\n%s", code, raw)
+	}
+
+	// 3) THE CONSUMER: the real resolver over the real api client.
+	resolver := &runResolver{
+		api:    newAPIClient(config{backendURL: httpSrv.URL}),
+		getenv: envFuncFromMap(nil),
+	}
+	_, out, err := resolver.getRunStatus(ctx, nil, GetRunStatusInput{RunID: runRow.ID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus through the MCP tool handler: %v", err)
+	}
+	tr := out.AcceptanceTranscript
+	if tr == nil {
+		t.Fatal("acceptance_transcript absent on a run whose verdict carried an endpoint-produced transcript ref")
+	}
+	if tr.ArtifactID != trResp.ID || tr.ContentHash != trResp.ContentHash {
+		t.Errorf("ref = %s/%s, want the endpoint-minted %s/%s", tr.ArtifactID, tr.ContentHash, trResp.ID, trResp.ContentHash)
+	}
+	if tr.ArtifactPath != "/v0/artifacts/"+trResp.ID {
+		t.Errorf("artifact_path = %q", tr.ArtifactPath)
+	}
+	if tr.SummarySuppressed != "" {
+		t.Errorf("summary_suppressed = %q on an agreeing transcript", tr.SummarySuppressed)
+	}
+	if len(tr.Criteria) != 2 {
+		t.Fatalf("criteria = %+v, want the 2 rows derived from the STORED artifact", tr.Criteria)
+	}
+	a := tr.Criteria[0]
+	if a.ID != "crit-a" || a.Outcome != "failed" || a.RequestCount != 2 || a.FailingRequest == nil ||
+		a.FailingRequest.Method != "GET" || a.FailingRequest.Path != failingPath || a.FailingRequest.Status != 200 {
+		t.Errorf("criteria[0] = %+v / failing_request %+v, want the failed row's LAST request (a 200)", a, a.FailingRequest)
+	}
+	b := tr.Criteria[1]
+	if b.ID != "crit-b" || b.Outcome != "passed" || b.RequestCount != 1 || b.FailingRequest != nil {
+		t.Errorf("criteria[1] = %+v, want the passed row with a null failing_request", b)
+	}
+
+	// 4) The pointer is real: GET artifact_path through the same router
+	// returns the stored transcript (kind + verbatim content).
+	resp, err := http.Get(httpSrv.URL + tr.ArtifactPath)
+	if err != nil {
+		t.Fatalf("GET %s: %v", tr.ArtifactPath, err)
+	}
+	defer resp.Body.Close()
+	var art struct {
+		Kind    string          `json:"kind"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&art); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d: %v", tr.ArtifactPath, resp.StatusCode, err)
+	}
+	if art.Kind != string(artifact.KindAcceptanceTranscript) || !strings.Contains(string(art.Content), failingPath) {
+		t.Errorf("artifact_path returned kind=%q content=%q, want the stored acceptance_transcript", art.Kind, art.Content)
 	}
 }

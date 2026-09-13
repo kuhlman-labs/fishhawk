@@ -127,6 +127,18 @@ func maximalRunStatusOutput(runID string) GetRunStatusOutput {
 			Number: i, RuleID: "go/sql-injection", Severity: "high",
 		})
 	}
+	// The acceptance-transcript block (E72.5 / #3329) rides the ladder with
+	// the fixture so its T3 drop is measured, not assumed.
+	out.AcceptanceTranscript = &AcceptanceTranscriptStatus{
+		ArtifactID: uuid.NewString(), ContentHash: strings.Repeat("a", 64),
+	}
+	out.AcceptanceTranscript.ArtifactPath = "/v0/artifacts/" + out.AcceptanceTranscript.ArtifactID
+	for i := 0; i < 8; i++ {
+		out.AcceptanceTranscript.Criteria = append(out.AcceptanceTranscript.Criteria, AcceptanceTranscriptCriterion{
+			ID: fmt.Sprintf("crit-%d", i), Outcome: "failed", RequestCount: 2,
+			FailingRequest: &AcceptanceTranscriptRequest{Method: "GET", Path: "/v0/runs/abc/audit?category=acceptance_outcome_recorded", Status: 200},
+		})
+	}
 	for i := 0; i < 12; i++ {
 		out.DriveStatus.AutoAdvanced = append(out.DriveStatus.AutoAdvanced, RunAutoAdvance{Rule: "reviews_settled_gate", From: "a", To: "b", Timestamp: now})
 	}
@@ -260,6 +272,7 @@ func TestBound_UnderBudget_ReturnsTheInputBytesUnchanged(t *testing.T) {
 	// or "unchanged" would be trivially true.
 	if in.Run.IssueContext == nil || in.Cost == nil || in.ChildrenStatus == nil ||
 		len(in.RecentAudit) <= recentAuditTierCap || len(in.SecurityFindings) == 0 ||
+		in.AcceptanceTranscript == nil || len(in.AcceptanceTranscript.Criteria) == 0 ||
 		len(in.NextActions.Actions) <= nextActionsTierCap {
 		t.Fatalf("the fixture does not carry every tier's target — an unchanged result would prove nothing: %+v", in)
 	}
@@ -509,6 +522,7 @@ func TestElisions_DroppedSetCarriesCount(t *testing.T) {
 	fixture := maximalRunStatusOutput(runID)
 	want := map[string]int{
 		"security_findings":          len(fixture.SecurityFindings),
+		"acceptance_transcript":      len(fixture.AcceptanceTranscript.Criteria),
 		"implement_reviews":          len(fixture.ImplementReviews),
 		"run.concerns.items":         len(fixture.Run.Concerns.Items),
 		"run.review_authority":       len(fixture.Run.ReviewAuthority),

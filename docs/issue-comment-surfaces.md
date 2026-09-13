@@ -186,9 +186,13 @@ Notes:
     operator-deleted comment (`ErrNotFound` on edit) is re-created.
   - **Per-criterion table source.** The table is loaded from the
     `KindAcceptance` artifact body via `ListForStage` — the per-criterion
-    detail is NOT in the `acceptance_outcome_recorded` audit payload (which
-    carries only aggregate tallies + `target_url` + `head_sha`). When the
-    artifact is unretrievable the table degrades to the tally line.
+    VERDICT detail (result, observed, expected) is NOT in the
+    `acceptance_outcome_recorded` audit payload, which carries the aggregate
+    tallies + `target_url` + `head_sha` and, since E72.5 / #3329, only the
+    bounded `transcript` summary block (`{id, outcome, request_count,
+    failing_request}` per transcript row — not the verdict's observed/expected
+    prose). When the artifact is unretrievable the table degrades to the tally
+    line.
   - **Body cap.** Capped at `MaxIssueCommentBodyBytes` by a degradation ladder
     that drops the acceptance criteria table detail first (collapsing to the
     tally line), then the fix-up history, always preserving the header, the
@@ -1183,6 +1187,37 @@ Notes:
   carries the same wording under the neutral ❓ icon — it is neither an
   acceptance nor a rejection. Every pre-#2347 payload simply lacks
   `criteria_live_validation` and decodes to zero, so no existing render changes.
+- **The `acceptance_outcome_recorded` row names the acceptance TRANSCRIPT
+  (E72.5 / #3329).** The ingest records an additive `transcript` block on the
+  payload — `{artifact_id, content_hash, criteria: [{id, outcome,
+  request_count, failing_request: {method, path, status} | null}]}`, derived
+  from the STORED `acceptance_transcript` artifact, or the explicit
+  `transcript: null` when no transcript shipped — and
+  `decodeAcceptanceActivity` reads it additively (every pre-change payload
+  decodes to empty). `renderAcceptanceOutcomeLine` then appends, on the
+  generic and undecidable branches, "; transcript /v0/artifacts/`<artifact_id>`"
+  (the REST path is the pointer: request/response BODIES are stored-only, never
+  rendered on any comment, and are one artifact fetch away) and, on a
+  `rejected` outcome, " — failing request: `` `<METHOD> <path>` `` -> `<status>`"
+  naming the FIRST failed criterion's non-null `failing_request` — which is the
+  LAST request that criterion recorded, regardless of its status code (an
+  assertion failure on a 200 is the common shape). The clause is render-safe by
+  construction, not by escaping: method/path/status are grammar-bounded at
+  backend ingest (method enum; RFC 3986 path charset with no whitespace,
+  control byte, backtick or `|`; status 100..599), so the backtick span and the
+  row cannot break. **The VERDICT is authoritative and the transcript
+  descriptive:** when the backend found the transcript's rows disagreeing with
+  the verdict it recorded `criteria: null` plus `summary_suppressed`
+  (`criterion_not_in_verdict` | `criterion_outcome_disagrees`), and the row
+  renders the pointer with "(summary suppressed: `<reason>`)" and NO
+  failing-request clause — it can never tell a story that contradicts its own
+  headline. The `not_validated` branch is untouched by construction (that
+  verdict is minted pre-spawn and never carries a transcript); a payload with
+  no transcript, or `transcript: null`, renders byte-identically to before.
+  No `@`-mention is added, so `notifier.go` stays uninvolved (same exemption as
+  the acceptance kinds above). Pinned by
+  `TestRenderStatusBody_AcceptanceTranscriptClauses` (one case per clause and
+  per gate) and `TestRenderStatusBody_AcceptanceOutcome_ByteIdenticalWithoutTranscript`.
 - The operator-gated acceptance re-open audit kind — `acceptance_reopened`
   (E31.16 / #1567) — is a **system-/user-actor audit kind with NO dedicated
   Notifier method and NO dedicated timeline render**, following the same

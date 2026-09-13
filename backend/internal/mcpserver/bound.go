@@ -587,6 +587,9 @@ var runStatusPathTable = []pathClassification{
 	{Path: "security_findings", Tier: "T3", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
 		return []retrievalPointer{pointerListAudit(runID, "implement_security_findings", 0)}
 	}},
+	{Path: "acceptance_transcript", Tier: "T3", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
+		return []retrievalPointer{pointerListAudit(runID, "acceptance_outcome_recorded", 0)}
+	}},
 	{Path: "elisions", Tier: tierNever},
 
 	// --- run.* -----------------------------------------------------------
@@ -783,7 +786,10 @@ type runStatusTier struct {
 var runStatusTiers = []runStatusTier{
 	{name: "T1", apply: tierDerivedEconomics},
 	{name: "T2", apply: tierChildrenDetail},
-	{name: "T3", apply: tierSecurityFindings},
+	{name: "T3", apply: func(out *GetRunStatusOutput, runID string, led *elisionLedger) {
+		tierSecurityFindings(out, runID, led)
+		tierAcceptanceTranscript(out, runID, led)
+	}},
 	{name: "T4", apply: tierImplementReviews},
 	{name: "T5", apply: tierRecentAuditCap},
 	{name: "T6", apply: tierRecentAuditDrop},
@@ -832,6 +838,21 @@ func tierSecurityFindings(out *GetRunStatusOutput, runID string, led *elisionLed
 	out.SecurityFindings = nil
 	led.add(classified("security_findings", runID,
 		"the full findings list is stored on the newest implement_security_findings audit entry", n))
+}
+
+// tierAcceptanceTranscript drops the acceptance-transcript summary (E72.5 /
+// #3329) in the same T3 slot as security_findings: like it, the block is a
+// stored audit projection (the `transcript` block on the newest
+// acceptance_outcome_recorded entry), so the pointer retrieves AT LEAST what
+// was omitted. omitted_count is the per-criterion row count.
+func tierAcceptanceTranscript(out *GetRunStatusOutput, runID string, led *elisionLedger) {
+	if out.AcceptanceTranscript == nil {
+		return
+	}
+	n := len(out.AcceptanceTranscript.Criteria)
+	out.AcceptanceTranscript = nil
+	led.add(classified("acceptance_transcript", runID,
+		"the per-criterion transcript summary is stored on the newest acceptance_outcome_recorded audit entry (transcript block); the full transcript is one artifact fetch away", n))
 }
 
 func tierImplementReviews(out *GetRunStatusOutput, runID string, led *elisionLedger) {

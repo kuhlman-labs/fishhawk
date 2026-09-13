@@ -38,10 +38,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 279 identifiers, not 3
+## Exported surface: why 282 identifiers, not 3
 
-The package presents **279** exported top-level identifiers, but only the three
-above are intended entry points. The other 272 are the tool I/O
+The package presents **282** exported top-level identifiers, but only the three
+above are intended entry points. The other 275 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema, so **unexporting them would break tool registration**. In `package
@@ -682,6 +682,18 @@ For a **decomposed parent**, `fishhawk_get_run_status` carries a `children_statu
 - `integration_phase` — the fan-in phase classified from the `slices_integrated` / `slice_integration_conflict` audit kinds (ADR-041 / #1142): `running_children` (a child is still in flight), `ready_to_integrate` (all children succeeded, no fan-in yet), `integrated` (a clean fan-in — `consolidated_branch` is surfaced), or `integration_conflict` (a slice branch failed to merge — `conflicting_child_run_id` is surfaced).
 - **Best-effort:** a per-child read failure degrades that child to `state="unknown"` and never fails the snapshot.
 - **Cost-gated:** the per-child fetch runs only for a top-level run (no `parent_run_id`) whose implement stage is `awaiting_children` **or** whose recent-audit window carries a decomposition marker (`plan_decomposed` / `slices_integrated` / `slice_integration_conflict`). An ordinary run makes **zero** extra calls (no `plan_decomposed` read), and the block is omitted for non-decomposed runs. The `next_actions` `implement_awaiting_children` arm points the operator at `fishhawk_run_children` plus this block.
+
+### Acceptance transcript on the run snapshot (`acceptance_transcript`, [E72.5 / #3329](https://github.com/kuhlman-labs/fishhawk/issues/3329))
+
+`fishhawk_get_run_status` carries a typed `acceptance_transcript` block projecting the `transcript` block the acceptance ingest recorded on the NEWEST `acceptance_outcome_recorded` audit entry — the bounded per-criterion summary the backend derived from the STORED `acceptance_transcript` artifact, never from anything the runner's verdict body carried:
+
+- `artifact_id` / `content_hash` — the stored artifact ref (backend-minted values). `artifact_path` is `GET /v0/artifacts/<artifact_id>`: the MCP surface has no artifact-fetch tool, so the REST pointer is what makes the full transcript one fetch away. Request/response BODIES are stored-only and never surface on this tool (nor on any prompt or comment) — that is the untrusted-intake posture this repo's injection corpus exists to protect, and the reason the Done-means is satisfied through the artifact rather than inline.
+- `criteria[]` — `{id, outcome, request_count, failing_request}` per transcript row. `failing_request` applies ONE rule: for a `failed` criterion it is the LAST recorded request — the one whose response the failing assertion evaluated — REGARDLESS of its status code (an assertion failure on a 200 is the common shape); `null` for a non-failed row or a failed row that recorded zero requests. Method/path/status only, grammar-bounded at backend ingest.
+- **The VERDICT is authoritative and the transcript descriptive.** When the backend found the transcript's rows disagreeing with the verdict's own rows it recorded `criteria: null` plus `summary_suppressed` (`criterion_not_in_verdict` | `criterion_outcome_disagrees`) and `disagreeing_ids`; this block carries those verbatim and synthesizes no rows, so it can never tell a per-criterion story that contradicts the verdict headline. A transcript problem never changes the verdict — `acceptance_stage_wait_status` and `next_actions` are derived exactly as before.
+- **Cost-gated:** the dedicated `acceptance_outcome_recorded` category read (`runResolver.acceptanceTranscriptFor`, mirroring `securityFindingsFor` so the block cannot age out of the recent slice) is issued only when the run has an acceptance stage (`acceptance_stage_wait_status != nil`); every other run issues no read and stays byte-identical. Pinned by `TestGetRunStatus_AcceptanceTranscript_NoAcceptanceStage_NoRead` on the fake's per-category call log.
+- **Best-effort:** a read/decode error, no recorded outcome, or the explicit `transcript: null` (a pre-transcript runner, or a transcript ship that failed while the verdict still landed) leaves the field OMITTED — never fails the snapshot. Newest entry wins, so a re-run's fresh verdict supersedes an older transcript.
+- **Byte budget:** classified `T3` / `stored` in `runStatusPathTable`, dropped in the same tier step as `security_findings` with `omitted_count = len(criteria)` and the pointer `fishhawk_list_audit(category=acceptance_outcome_recorded, since_sequence=0)`.
+- **Producer → consumer is tested end to end, not seeded:** `TestGetRunStatus_AcceptanceTranscript_EndpointProducedThroughRealRouter` POSTs a transcript and a verdict through the REAL `/v0/runs/{id}/acceptance/transcript` + `/v0/runs/{id}/acceptance` routes over REAL Postgres and reads the block back through the REAL MCP resolver, then GETs `artifact_path` through the same router — so the serialization boundary between the ingest's payload and this DTO (the only consumer that crosses a SECOND JSON hop, backend → REST → MCP) is exercised on endpoint-produced bytes.
 
 ## Server-suggested next actions (`next_actions`, #1024)
 
@@ -1624,7 +1636,7 @@ The precedence is the issue's, verbatim: **when a client advertises a limit, Fis
 |---|---|---|---|
 | T1 | `cost` / `cache_efficiency` / `latency` / `budget` | computed | — |
 | T2 | `children_status` per-child detail (phase + counts retained) | computed | — |
-| T3 | `security_findings` | stored | `fishhawk_list_audit(category=implement_security_findings)` |
+| T3 | `security_findings` + `acceptance_transcript` | stored | `fishhawk_list_audit(category=implement_security_findings)` / `(acceptance_outcome_recorded)` |
 | T4 | the whole `implement_reviews` slice | stored (**two** entries, one per originating category) | `fishhawk_list_audit(category=implement_reviewed)` + `(implement_review_skipped)` |
 | T5 | `recent_audit` capped to the newest N | stored | anchored `fishhawk_list_audit` |
 | T6 | `recent_audit` dropped entirely | stored | anchored `fishhawk_list_audit` |

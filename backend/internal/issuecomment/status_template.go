@@ -471,6 +471,24 @@ func renderAcceptanceLine(verb string) string {
 // when nothing at all was decided — 4/4 undecided is a legitimate shape, not a
 // degenerate one, and the phrasing deliberately never claims a partial
 // verification it cannot support.
+//
+// The transcript clauses (E72.5 / #3329) are additive on the generic and
+// undecidable branches: "; transcript /v0/artifacts/<id>" names the stored
+// acceptance_transcript artifact (request/response bodies are stored-only and
+// one artifact fetch away — never rendered here), and on a REJECTED outcome
+// " — failing request: `<METHOD> <path>` -> <status>" names the first failed
+// criterion's failing request. Both are render-safe by construction: the
+// artifact id is backend-minted and the method/path/status triple is
+// grammar-bounded at backend ingest (method enum, RFC 3986 path charset with
+// no whitespace, control byte, backtick or '|', status 100..599), so the
+// backtick span and the row cannot be broken. The VERDICT is authoritative
+// and the transcript descriptive: when the backend recorded the summary as
+// suppressed (its rows disagreed with the verdict) no failing-request clause
+// can render — the payload carries no criteria — and the suppression reason
+// (a closed enum) is named instead, so the row never tells a story that
+// contradicts its own headline. The not_validated branch is untouched by
+// construction: that verdict is minted pre-spawn and never carries a
+// transcript.
 func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 	a := decodeAcceptanceActivity(payload)
 	if a.outcome == acceptanceOutcomeUndecidable {
@@ -479,7 +497,7 @@ func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 			line = fmt.Sprintf("Acceptance undecidable — %d/%d criteria could not be decided (%d passed)",
 				a.criteriaUndecidable, a.criteriaTotal, a.criteriaPassed)
 		}
-		return line
+		return line + acceptanceTranscriptClause(a)
 	}
 	if a.outcome == acceptanceOutcomeNotValidated {
 		line := "Acceptance not validated — 0 criteria verified (the plan declared none)"
@@ -491,15 +509,45 @@ func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 		}
 		return line
 	}
+	var line string
 	switch {
 	case a.outcome != "" && a.criteriaTotal > 0:
-		return fmt.Sprintf("Acceptance recorded — %s (%d/%d criteria passed)", a.outcome, a.criteriaPassed, a.criteriaTotal)
+		line = fmt.Sprintf("Acceptance recorded — %s (%d/%d criteria passed)", a.outcome, a.criteriaPassed, a.criteriaTotal)
 	case a.outcome != "":
-		return fmt.Sprintf("Acceptance recorded — %s", a.outcome)
+		line = fmt.Sprintf("Acceptance recorded — %s", a.outcome)
 	case a.criteriaTotal > 0:
-		return fmt.Sprintf("Acceptance recorded — %d/%d criteria passed", a.criteriaPassed, a.criteriaTotal)
+		line = fmt.Sprintf("Acceptance recorded — %d/%d criteria passed", a.criteriaPassed, a.criteriaTotal)
+	default:
+		line = "Acceptance recorded"
 	}
-	return "Acceptance recorded"
+	line += acceptanceTranscriptClause(a)
+	if a.outcome == acceptanceOutcomeRejected && a.failingMethod != "" {
+		line += fmt.Sprintf(" — failing request: `%s %s` -> %d", a.failingMethod, a.failingPath, a.failingStatus)
+	}
+	return line
+}
+
+// acceptanceOutcomeRejected is the `outcome` label the acceptance ingest
+// records for a failed verdict (server/acceptance.go acceptanceOutcomeLabel).
+// Mirrored, not imported, like its not_validated / undecidable peers; pinned by
+// the same-package test that renders the failing-request clause.
+const acceptanceOutcomeRejected = "rejected"
+
+// acceptanceTranscriptClause renders the "; transcript /v0/artifacts/<id>"
+// pointer when the payload's transcript block carries an artifact id, with a
+// "(summary suppressed: <reason>)" tail when the backend refused to record
+// per-criterion rows. Empty — byte-identical to today — on every payload with
+// no transcript (pre-transcript runners, a failed transcript ship, or the
+// explicit transcript:null).
+func acceptanceTranscriptClause(a acceptanceActivity) string {
+	if a.transcriptArtifactID == "" {
+		return ""
+	}
+	clause := "; transcript /v0/artifacts/" + a.transcriptArtifactID
+	if a.transcriptSuppressed != "" {
+		clause += " (summary suppressed: " + a.transcriptSuppressed + ")"
+	}
+	return clause
 }
 
 // acceptanceOutcomeNotValidated is the `outcome` value the orchestrator's
@@ -557,6 +605,19 @@ type acceptanceActivity struct {
 	// reported as `undecidable` (#2512). Zero on every pre-#2512 payload and on
 	// every outcome whose rows all decided, so no existing render path changes.
 	criteriaUndecidable int
+	// transcriptArtifactID is the `transcript.artifact_id` of the stored
+	// acceptance_transcript artifact (E72.5 / #3329); empty on transcript:null
+	// and on every pre-transcript payload. transcriptSuppressed carries the
+	// backend's `transcript.summary_suppressed` reason (a closed enum) when it
+	// recorded no per-criterion rows. failingMethod/failingPath/failingStatus
+	// are the FIRST failed criterion's non-null `failing_request` — the last
+	// request that criterion recorded — all grammar-bounded at backend ingest.
+	// Every field is additive: a pre-change payload decodes to the zero value.
+	transcriptArtifactID string
+	transcriptSuppressed string
+	failingMethod        string
+	failingPath          string
+	failingStatus        int
 }
 
 // decodeAcceptanceActivity reads the {outcome, criteria_passed, criteria_total,
@@ -581,11 +642,26 @@ func decodeAcceptanceActivity(payload json.RawMessage) acceptanceActivity {
 		// acceptance agent could not DECIDE. Additive: every pre-change payload
 		// lacks it and decodes to zero, so no existing render path changes.
 		CriteriaUndecidable int `json:"criteria_undecidable"`
+		// transcript (E72.5 / #3329) is the bounded summary block the ingest
+		// derives from the STORED transcript artifact — null when none shipped.
+		// Additive: absent/null/undecodable leaves every transcript field empty.
+		Transcript *struct {
+			ArtifactID        string `json:"artifact_id"`
+			SummarySuppressed string `json:"summary_suppressed"`
+			Criteria          []struct {
+				Outcome        string `json:"outcome"`
+				FailingRequest *struct {
+					Method string `json:"method"`
+					Path   string `json:"path"`
+					Status int    `json:"status"`
+				} `json:"failing_request"`
+			} `json:"criteria"`
+		} `json:"transcript"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return acceptanceActivity{}
 	}
-	return acceptanceActivity{
+	a := acceptanceActivity{
 		outcome:                p.Outcome,
 		criteriaPassed:         p.CriteriaPassed,
 		criteriaTotal:          p.CriteriaTotal,
@@ -594,6 +670,19 @@ func decodeAcceptanceActivity(payload json.RawMessage) acceptanceActivity {
 		criteriaLiveValidation: p.CriteriaLiveValidation,
 		criteriaUndecidable:    p.CriteriaUndecidable,
 	}
+	if p.Transcript != nil {
+		a.transcriptArtifactID = p.Transcript.ArtifactID
+		a.transcriptSuppressed = p.Transcript.SummarySuppressed
+		for _, c := range p.Transcript.Criteria {
+			if c.Outcome == "failed" && c.FailingRequest != nil {
+				a.failingMethod = c.FailingRequest.Method
+				a.failingPath = c.FailingRequest.Path
+				a.failingStatus = c.FailingRequest.Status
+				break
+			}
+		}
+	}
+	return a
 }
 
 // renderFixupPushedLine renders a fixup_pushed activity row (E42.6 / #1789):
