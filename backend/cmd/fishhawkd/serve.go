@@ -1504,7 +1504,7 @@ func runServe(args []string, logSink io.Writer) int {
 	s3Region := fs.String("s3-region", envOr("FISHHAWKD_S3_REGION", "us-east-1"),
 		"AWS region for the trace bundle bucket")
 	s3Endpoint := fs.String("s3-endpoint", envOr("FISHHAWKD_S3_ENDPOINT", ""),
-		"override the S3 endpoint (e.g. http://minio:9000 in dev); empty uses the AWS default")
+		"override the S3 endpoint (e.g. http://rustfs:9000 in dev); empty uses the AWS default")
 	githubAppIDStr := fs.String("github-app-id", envOr("FISHHAWKD_GITHUB_APP_ID", ""),
 		"GitHub App numeric ID; required to issue installation tokens")
 	githubAppKeyFile := fs.String("github-app-private-key-file",
@@ -2242,7 +2242,7 @@ func runServe(args []string, logSink io.Writer) int {
 	}, accountQueries, logger)
 
 	// Trace storage wiring. The S3 client uses path-style requests
-	// so the same code works against AWS S3 and MinIO. An empty
+	// so the same code works against AWS S3 and RustFS. An empty
 	// bucket leaves /v0/runs/{id}/trace at 503.
 	if *s3Bucket != "" {
 		awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),

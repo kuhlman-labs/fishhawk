@@ -16,8 +16,8 @@ import (
 
 // S3API is the subset of *s3.Client we use. Defining it as an
 // interface lets tests substitute fakes if they ever need to
-// without spinning a MinIO container — though the actual tests in
-// this package use MinIO so behavior is exercised against real S3
+// without spinning a RustFS container — though the actual tests in
+// this package use RustFS so behavior is exercised against real S3
 // semantics, not a mock.
 type S3API interface {
 	PutObject(ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error)
@@ -29,7 +29,7 @@ type S3API interface {
 // S3Storage is the S3-backed Storage implementation. Construct
 // directly with the bucket name and an *s3.Client; the package does
 // not own credential / endpoint configuration so callers can wire
-// up AWS production, MinIO local dev, or whatever else they like
+// up AWS production, RustFS local dev, or whatever else they like
 // (e.g. a moto-server in CI) the same way.
 type S3Storage struct {
 	client S3API
