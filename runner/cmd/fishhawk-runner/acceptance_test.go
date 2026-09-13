@@ -1703,7 +1703,8 @@ func TestRun_AcceptanceStage_ProvisionWithoutTeardown_WarnsMissingTeardown(t *te
 	}
 	out := stderr.String()
 	if !strings.Contains(out, `"event":"acceptance_preview_teardown_missing"`) ||
-		!strings.Contains(out, "dispatch with auto_preview:true, which injects both") {
+		!strings.Contains(out, "an operator-supplied provision command never receives a default teardown, even under auto_preview:true") ||
+		!strings.Contains(out, "dispatch with auto_preview:true, which injects both defaults") {
 		t.Errorf("missing acceptance_preview_teardown_missing diagnostic naming the auto_preview remedy: %s", out)
 	}
 	if fu.gotAcceptanceArgs == nil {

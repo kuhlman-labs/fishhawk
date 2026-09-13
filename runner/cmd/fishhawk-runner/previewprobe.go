@@ -389,7 +389,7 @@ func acceptanceTargetGate(ctx context.Context, gcfg previewGateConfig, targetHos
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":%q,"run_id":%q,"host":%q,"reason":%q}`+"\n",
 			acceptanceEventTeardownMissing, runID, host,
-			previewCmdEnv+" is set but "+previewTeardownCmdEnv+" is not — the provisioned preview instance will not be torn down; set it, or dispatch with auto_preview:true, which injects both")
+			previewCmdEnv+" is set but "+previewTeardownCmdEnv+" is not — the provisioned preview instance will not be torn down; set it (an operator-supplied provision command never receives a default teardown, even under auto_preview:true), or leave "+previewCmdEnv+" unset and dispatch with auto_preview:true, which injects both defaults")
 	}
 
 	if gcfg.teardownCmd != "" {
