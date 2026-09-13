@@ -61,6 +61,16 @@ func TestMain(m *testing.M) {
 // runTestMain does TestMain's work in a func so its cleanup defer runs
 // before os.Exit (os.Exit skips deferred funcs).
 func runTestMain(m *testing.M) int {
+	// On an Actions pull-request build GITHUB_REF_NAME is the "N/merge" ref,
+	// which no throwaway fixture repository carries, so the
+	// --base-branch > GITHUB_REF_NAME > "main" ladder (resolveImplementBaseRef)
+	// resolves an unresolvable merge base and e.g. scenarioRemovalGuard skips
+	// (guard_unresolved) where tests assert it fires (#3402). Unset both here
+	// so every run()-driving test sees the local-runner posture the package
+	// is proven green under; a test that needs the Actions env opts in via
+	// t.Setenv (implementEnv and the diff-coverage tests already do).
+	os.Unsetenv("GITHUB_REF_NAME")
+	os.Unsetenv("GITHUB_REPOSITORY")
 	if _, err := exec.LookPath("git"); err != nil {
 		return m.Run() // git unavailable — degrade to the original CWD.
 	}
@@ -99,6 +109,60 @@ func runTestMain(m *testing.M) int {
 		return m.Run() // chdir failed — degrade to the original CWD.
 	}
 	return m.Run()
+}
+
+// TestHarnessNeutralizesActionsEnv pins the runTestMain posture directly:
+// GITHUB_REF_NAME and GITHUB_REPOSITORY must read empty inside this
+// package's test process, because runTestMain unsets both before m.Run()
+// (#3402). Deleting that unset turns this RED under
+// `GITHUB_REF_NAME=x go test`.
+func TestHarnessNeutralizesActionsEnv(t *testing.T) {
+	if v := os.Getenv("GITHUB_REF_NAME"); v != "" {
+		t.Errorf("GITHUB_REF_NAME = %q, want empty — runTestMain's os.Unsetenv(\"GITHUB_REF_NAME\") (#3402) did not take effect", v)
+	}
+	if v := os.Getenv("GITHUB_REPOSITORY"); v != "" {
+		t.Errorf("GITHUB_REPOSITORY = %q, want empty — runTestMain's os.Unsetenv(\"GITHUB_REPOSITORY\") (#3402) did not take effect", v)
+	}
+}
+
+// TestResolveImplementBaseRef pins the --base-branch > GITHUB_REF_NAME >
+// "main" ladder in resolveImplementBaseRef, proving the runTestMain
+// package-wide unset removes only the AMBIENT default and not the env rung
+// itself (a test that opts in via t.Setenv still sees it honored).
+func TestResolveImplementBaseRef(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     config
+		refName string
+		want    string
+	}{
+		{
+			name:    "flag wins over env",
+			cfg:     config{baseBranch: "develop"},
+			refName: "3401/merge",
+			want:    "develop",
+		},
+		{
+			name:    "env honored when flag absent",
+			cfg:     config{},
+			refName: "release",
+			want:    "release",
+		},
+		{
+			name:    "main when both empty",
+			cfg:     config{},
+			refName: "",
+			want:    "main",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GITHUB_REF_NAME", tt.refName)
+			if got := resolveImplementBaseRef(tt.cfg); got != tt.want {
+				t.Errorf("resolveImplementBaseRef() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 // openBundleForTest is a thin wrapper around bundle.Open so the
