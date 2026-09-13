@@ -2,6 +2,7 @@ package issuecomment_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -845,6 +846,191 @@ func TestRenderStatusBody_DecisionClassActivity_NotFilteredAsNoise(t *testing.T)
 		if !strings.Contains(body, want) {
 			t.Errorf("decision-class kind dropped as noise; missing %q\n---\n%s", want, body)
 		}
+	}
+	if strings.Contains(body, "trace_uploaded") {
+		t.Errorf("noise category leaked into the activity section\n---\n%s", body)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// acceptance_scenario_retirement_dropped (E72.4 / #3328, rendered #3392).
+// ---------------------------------------------------------------------------
+
+// TestRenderStatusBody_AcceptanceRetirementDropped_NamesEveryIdAndReason pins
+// the binding rejection-feedback fix (this issue): every dropped scenario id
+// and reason renders UNCONDITIONALLY, with no five-item cut. Seven entries —
+// deliberately more than the five the rejected plan truncated at.
+func TestRenderStatusBody_AcceptanceRetirementDropped_NamesEveryIdAndReason(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	retired := make([]map[string]any, 0, 7)
+	for i := 1; i <= 7; i++ {
+		retired = append(retired, map[string]any{
+			"id":     fmt.Sprintf("scenario:issue-101/crit-%d", i),
+			"reason": fmt.Sprintf("reason-%d", i),
+		})
+	}
+	entries := []*audit.Entry{
+		auditEntry(runID, 1, "acceptance_scenario_retirement_dropped", "system", now,
+			map[string]any{"reason": "persist_failed:push: rejected", "retired": retired}),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	wants := []string{"7 scenarios still replayed", "(persist_failed:push: rejected)"}
+	for i := 1; i <= 7; i++ {
+		wants = append(wants,
+			fmt.Sprintf("`scenario:issue-101/crit-%d`", i),
+			fmt.Sprintf("reason-%d", i))
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q\n---\n%s", want, body)
+		}
+	}
+}
+
+// TestRenderStatusBody_AcceptanceRetirementDropped_LongReasonCutVisiblyIdIntact
+// pins the per-reason oneLine cap: a 1,000-byte reason is cut with a visible
+// "..." marker while the full scenario id survives untouched, and the
+// rendered line stays well under the raw reason's length.
+func TestRenderStatusBody_AcceptanceRetirementDropped_LongReasonCutVisiblyIdIntact(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	longReason := strings.Repeat("a", 1000)
+	entries := []*audit.Entry{
+		auditEntry(runID, 1, "acceptance_scenario_retirement_dropped", "system", now,
+			map[string]any{
+				"reason":  "drop-x",
+				"retired": []map[string]any{{"id": "scenario:issue-1/big", "reason": longReason}},
+			}),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	if !strings.Contains(body, "`scenario:issue-1/big`") {
+		t.Errorf("full id must survive the reason cut\n---\n%s", body)
+	}
+	var line string
+	for _, l := range strings.Split(body, "\n") {
+		if strings.Contains(l, "scenario:issue-1/big") {
+			line = l
+			break
+		}
+	}
+	if line == "" {
+		t.Fatalf("no rendered line found for the entry\n---\n%s", body)
+	}
+	if !strings.Contains(line, "...") {
+		t.Errorf("expected a visible cut marker on the long reason: %q", line)
+	}
+	if len(line) >= 400 {
+		t.Errorf("rendered line should stay well under the raw 1000-byte reason; got %d bytes: %q", len(line), line)
+	}
+}
+
+// TestRenderStatusBody_AcceptanceRetirementDropped_EmptyRetiredRendersHonestly
+// pins the #3396 second-writer shape (approval_chain_unreadable, retired: []):
+// the row must read as "no scenario entries on the record", never "0
+// scenarios", which would tell the operator nothing was dropped.
+func TestRenderStatusBody_AcceptanceRetirementDropped_EmptyRetiredRendersHonestly(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	entries := []*audit.Entry{
+		auditEntry(runID, 1, "acceptance_scenario_retirement_dropped", "system", now,
+			map[string]any{"reason": "approval_chain_unreadable", "retired": []map[string]any{}, "scenario_ids": []string{}}),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	if !strings.Contains(body, "no scenario entries on the record — read the run's audit chain") {
+		t.Errorf("expected the honest empty-retired clause\n---\n%s", body)
+	}
+	if strings.Contains(body, "0 scenario") {
+		t.Errorf("must never render '0 scenario...' — reads as nothing dropped\n---\n%s", body)
+	}
+}
+
+// TestRenderStatusBody_AcceptanceRetirementDropped_Degrades covers each
+// degrade branch: empty/undecodable payload falls back to the bare verb, an
+// entry with an empty reason renders as a bare id with no parenthetical, and
+// an absent drop reason omits the leading parenthetical.
+func TestRenderStatusBody_AcceptanceRetirementDropped_Degrades(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	cases := []struct {
+		name    string
+		payload json.RawMessage
+		want    string
+		notWant string
+	}{
+		{"empty payload", json.RawMessage(`{}`), "Acceptance scenario retirement dropped · ", ""},
+		{"undecodable payload", json.RawMessage("{not json"), "Acceptance scenario retirement dropped · ", ""},
+		{
+			"entry with empty reason renders bare id",
+			json.RawMessage(`{"reason":"persist_failed","retired":[{"id":"scenario:issue-1/a"}]}`),
+			"still replayed — `scenario:issue-1/a`",
+			"`scenario:issue-1/a` (",
+		},
+		{
+			"missing drop reason omits the parenthetical",
+			json.RawMessage(`{"retired":[{"id":"scenario:issue-1/b","reason":"some reason"}]}`),
+			"Acceptance scenario retirement dropped: 1 scenario still replayed — `scenario:issue-1/b` (some reason)",
+			"Acceptance scenario retirement dropped (",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &audit.Entry{
+				ID:        uuid.New(),
+				Sequence:  1,
+				RunID:     &runID,
+				Timestamp: now,
+				Category:  "acceptance_scenario_retirement_dropped",
+				Payload:   tc.payload,
+			}
+			body := issuecomment.RenderStatusBody(r, stages, []*audit.Entry{e}, "https://x", now)
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("expected %q\n---\n%s", tc.want, body)
+			}
+			if tc.notWant != "" && strings.Contains(body, tc.notWant) {
+				t.Errorf("did not expect %q\n---\n%s", tc.notWant, body)
+			}
+		})
+	}
+}
+
+// TestRenderStatusBody_AcceptanceRetirementDropped_ScenarioIdsFallback pins
+// the defensive scenario_ids fallback: when `retired` is absent but
+// `scenario_ids` is non-empty, the ids still render (with empty reasons).
+func TestRenderStatusBody_AcceptanceRetirementDropped_ScenarioIdsFallback(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	entries := []*audit.Entry{
+		auditEntry(runID, 1, "acceptance_scenario_retirement_dropped", "system", now,
+			map[string]any{"reason": "persist_failed", "scenario_ids": []string{"scenario:issue-1/a"}}),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	if !strings.Contains(body, "`scenario:issue-1/a`") {
+		t.Errorf("expected the scenario_ids fallback id to render\n---\n%s", body)
+	}
+}
+
+// TestRenderStatusBody_AcceptanceRetirementDropped_NotFilteredAsNoise proves
+// the category survives pickActivity's noise filter (it is a member of
+// activityCategories) — a comment-only touch of the set fails this — while a
+// genuine noise category (trace_uploaded) alongside it is dropped.
+func TestRenderStatusBody_AcceptanceRetirementDropped_NotFilteredAsNoise(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	entries := []*audit.Entry{
+		auditEntry(runID, 1, "acceptance_scenario_retirement_dropped", "system", now.Add(-1*time.Minute),
+			map[string]any{"reason": "persist_failed", "retired": []map[string]any{{"id": "scenario:issue-1/a", "reason": "r"}}}),
+		auditEntry(runID, 2, "trace_uploaded", "system", now, nil),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	if !strings.Contains(body, "`scenario:issue-1/a`") {
+		t.Errorf("acceptance_scenario_retirement_dropped dropped as noise\n---\n%s", body)
 	}
 	if strings.Contains(body, "trace_uploaded") {
 		t.Errorf("noise category leaked into the activity section\n---\n%s", body)

@@ -185,6 +185,17 @@ var activityCategories = map[string]struct{}{
 	"concern_waived":          {},
 	"concern_deferred":        {},
 	"scope_amendment_decided": {},
+	// Acceptance scenario-corpus retirement drop (E72.4 / #3328, rendered
+	// #3392). Like the fixup/concern/scope-amendment kinds above, this is a
+	// system/runner-actor audit kind with NO dedicated Notifier method — it
+	// renders data-drivenly through this set (and renderActivityLine below),
+	// so a dropped retirement (the runner served it but exited on a path that
+	// pushed no ledger commit) surfaces every dropped scenario id and reason
+	// on the anchor / status comment timeline instead of only the audit
+	// chain. Absent from anchor_template.go's informationalTimelineCategories,
+	// so selectAnchorTimeline RETAINS it under the row cap like the other
+	// decision-class kinds.
+	"acceptance_scenario_retirement_dropped": {},
 }
 
 // actorRenderers supplies the actor-identity render functions
@@ -264,6 +275,8 @@ func renderActivityLine(e *audit.Entry, r actorRenderers) string {
 		return renderConcernDeferredLine(e.Payload)
 	case "scope_amendment_decided":
 		return renderScopeAmendmentDecidedLine(e.Payload)
+	case "acceptance_scenario_retirement_dropped":
+		return renderAcceptanceRetirementDroppedLine(e.Payload)
 	default:
 		if actor == "" {
 			return e.Category
@@ -819,6 +832,111 @@ func decodeScopeAmendmentDecision(payload json.RawMessage) scopeAmendmentDecisio
 		return scopeAmendmentDecision{}
 	}
 	return scopeAmendmentDecision{decision: p.Decision, reason: p.Reason}
+}
+
+// acceptanceRetirementDropEntry is one scenario the acceptance runner served
+// as a retirement but could not persist: its id and the per-entry reason the
+// approved retire_scenario request carried for it.
+type acceptanceRetirementDropEntry struct {
+	id     string
+	reason string
+}
+
+// acceptanceRetirementDrop carries the fields an
+// acceptance_scenario_retirement_dropped audit payload contributes to its
+// rendered activity line (E72.4 / #3328, rendered #3392): the exit-path
+// reason the runner reported, and every retired scenario entry it served but
+// could not persist.
+type acceptanceRetirementDrop struct {
+	reason  string
+	entries []acceptanceRetirementDropEntry
+}
+
+// decodeAcceptanceRetirementDrop reads {reason, retired, scenario_ids} out of
+// an acceptance_scenario_retirement_dropped payload — the shape both writers
+// stamp: server/pullrequest.go's recordAcceptanceScenarioRetirementDropped
+// (the runner-reported drop) and server/prompt.go's
+// recordAcceptanceRetirementsUnserved (the #3396 approval-chain-unreadable
+// second writer, which writes `retired: []`). Entries come from `retired`;
+// when it is empty but `scenario_ids` is non-empty (defensive — no current
+// writer produces this shape), falls back to bare ids with empty reasons.
+// Returns the zero value on an empty/undecodable payload, so the line
+// degrades to its bare verb.
+func decodeAcceptanceRetirementDrop(payload json.RawMessage) acceptanceRetirementDrop {
+	if len(payload) == 0 {
+		return acceptanceRetirementDrop{}
+	}
+	var p struct {
+		Reason  string `json:"reason"`
+		Retired []struct {
+			ID     string `json:"id"`
+			Reason string `json:"reason"`
+		} `json:"retired"`
+		ScenarioIDs []string `json:"scenario_ids"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return acceptanceRetirementDrop{}
+	}
+	d := acceptanceRetirementDrop{reason: p.Reason}
+	switch {
+	case len(p.Retired) > 0:
+		d.entries = make([]acceptanceRetirementDropEntry, 0, len(p.Retired))
+		for _, e := range p.Retired {
+			d.entries = append(d.entries, acceptanceRetirementDropEntry{id: e.ID, reason: e.Reason})
+		}
+	case len(p.ScenarioIDs) > 0:
+		d.entries = make([]acceptanceRetirementDropEntry, 0, len(p.ScenarioIDs))
+		for _, id := range p.ScenarioIDs {
+			d.entries = append(d.entries, acceptanceRetirementDropEntry{id: id})
+		}
+	}
+	return d
+}
+
+// renderAcceptanceRetirementDroppedLine renders an
+// acceptance_scenario_retirement_dropped activity row (#3392): the acceptance
+// runner served a scenario retirement but exited on a path that pushed no
+// ledger commit, so every named entry is STILL being replayed against the
+// corpus. Every scenario id renders UNCONDITIONALLY, never truncated — an id
+// is a slug (`scenario:issue-<N>/<criterion-id>`) and the count is bounded by
+// the run's approved retire_scenario set (duplicates and already-retired ids
+// are refused at the approval gate), so there is no size pressure that
+// justifies eliding one. The only real pressure is the REASONS: a retirement
+// reason is capped at 12,000 bytes at the approval gate and the drop reason
+// can carry git output, so a handful uncapped would exceed the GitHub issue
+// comment body limit and trip RenderAnchorBody's degradation ladder, which
+// drops the WHOLE timeline — a far worse invisibility than a per-reason cut.
+// So every reason clause (the drop reason and each per-entry reason) passes
+// through the same oneLine (200 bytes, visible "..." marker) every other
+// reason clause on this timeline already uses; the full text stays on the
+// audit row, and nothing is hidden, so no overflow counter is rendered. A
+// zero-entry payload that still carries a drop reason (the #3396
+// approval-chain-unreadable second writer) renders an honest "no scenario
+// entries on the record" clause — never "0 scenarios", which would read as
+// nothing having been dropped. An empty/undecodable payload degrades to the
+// bare verb.
+func renderAcceptanceRetirementDroppedLine(payload json.RawMessage) string {
+	d := decodeAcceptanceRetirementDrop(payload)
+	verb := "Acceptance scenario retirement dropped"
+	if d.reason != "" {
+		verb = fmt.Sprintf("%s (%s)", verb, oneLine(d.reason))
+	}
+	if len(d.entries) == 0 {
+		if d.reason == "" {
+			return verb
+		}
+		return verb + ": no scenario entries on the record — read the run's audit chain"
+	}
+	parts := make([]string, 0, len(d.entries))
+	for _, e := range d.entries {
+		if e.reason != "" {
+			parts = append(parts, fmt.Sprintf("`%s` (%s)", e.id, oneLine(e.reason)))
+		} else {
+			parts = append(parts, fmt.Sprintf("`%s`", e.id))
+		}
+	}
+	return fmt.Sprintf("%s: %d scenario%s still replayed — %s",
+		verb, len(d.entries), plural(len(d.entries)), strings.Join(parts, "; "))
 }
 
 func retryAttemptSuffix(payload json.RawMessage) string {
