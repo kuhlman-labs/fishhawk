@@ -22,7 +22,7 @@ Bring it up with `docker compose --profile otel up -d`, set `OTEL_EXPORTER_OTLP_
 
 ## Local collector (k8s, #895)
 
-The Helm chart ships the same Jaeger all-in-one as a dev-only in-cluster service gated by `jaeger.enabled` (default false in `values.yaml`; `values-local.yaml` turns it on; `fishhawk.validateSecrets` fails the render outside `profile: local`, mirroring the postgres/minio dev-only guards).
+The Helm chart ships the same Jaeger all-in-one as a dev-only in-cluster service gated by `jaeger.enabled` (default false in `values.yaml`; `values-local.yaml` turns it on; `fishhawk.validateSecrets` fails the render outside `profile: local`, mirroring the postgres/rustfs dev-only guards).
 
 `deploy/helm/fishhawk/templates/jaeger.yaml` is a single-replica Deployment + ClusterIP Service exposing the UI (16686) + OTLP HTTP (4318) + OTLP gRPC (4317) with in-memory storage (no PVC; ephemeral is fine for local inspection).
 

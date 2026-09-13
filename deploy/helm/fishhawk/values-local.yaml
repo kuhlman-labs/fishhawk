@@ -5,7 +5,7 @@
 # chartManaged with dev placeholders (#849), permitted only by profile: local.
 
 # Local profile: acknowledges the dev-only conveniences (chart-managed Secret +
-# in-cluster Postgres/MinIO default credentials) so fishhawk.validateSecrets
+# in-cluster Postgres/RustFS default credentials) so fishhawk.validateSecrets
 # permits them. A real cluster MUST keep profile: prod (values.yaml default).
 profile: local
 
@@ -32,9 +32,9 @@ resources:
 config:
   addr: ":8080"
   s3Region: "us-east-1"
-  # Points at the in-cluster MinIO Service below. Assumes `helm install fishhawk`
+  # Points at the in-cluster RustFS Service below. Assumes `helm install fishhawk`
   # so fishhawk.fullname renders to `fishhawk` (release name contains chart name).
-  s3Endpoint: "http://fishhawk-minio:9000"
+  s3Endpoint: "http://fishhawk-rustfs:9000"
   s3Bucket: "fishhawk-traces"
   externalUrl: "http://localhost:5173"
   # Dev OAuth client id — the PUBLIC enablement signal that completes the local
@@ -66,13 +66,13 @@ workers:
   childCompletionSweeper: false
   invariantMonitor: false
 
-# Self-contained local stack: in-cluster Postgres + MinIO. fishhawkd's
+# Self-contained local stack: in-cluster Postgres + RustFS. fishhawkd's
 # FISHHAWKD_DATABASE_URL is overridden by the Deployment to target the in-cluster
-# postgres Service; config.s3Endpoint above points at the in-cluster minio.
+# postgres Service; config.s3Endpoint above points at the in-cluster rustfs.
 postgres:
   enabled: true
 
-minio:
+rustfs:
   enabled: true
 
 # In-cluster Jaeger all-in-one (the local OTLP trace collector). DEV-ONLY; the
@@ -108,8 +108,8 @@ secrets:
     githubWebhookSecret: "dev-webhook-secret"
     oauthClientSecret: "dev-oauth-client-secret"
     anthropicApiKey: "dev-anthropic-key"
-    # Equal to minio.rootUser / minio.rootPassword so fishhawkd reaches the
-    # in-cluster MinIO bucket (trace storage).
+    # Equal to rustfs.accessKey / rustfs.secretKey so fishhawkd reaches the
+    # in-cluster RustFS bucket (trace storage).
     awsAccessKeyId: "fishhawk"
     awsSecretAccessKey: "fishhawk-dev-secret"
     # No githubAppPrivateKey: the local profile runs with the GitHub App disabled

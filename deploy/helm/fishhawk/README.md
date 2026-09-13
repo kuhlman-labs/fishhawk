@@ -48,7 +48,7 @@ future split-mode guard must be wired into
   8080; a ClusterIP Service on 8080.
 - The Service selector carries an `app.kubernetes.io/component`
   discriminator so it selects EXACTLY the fishhawkd pod, never the
-  in-cluster postgres/minio/jaeger pods or the migrate/minio-bucket
+  in-cluster postgres/rustfs/jaeger pods or the migrate/rustfs-bucket
   hook Job pods (all of which carry the same bare `name`+`instance`
   labels). In `allInOne` mode the discriminator is
   `component: server`; in `split` mode it is `component: api`, so HTTP
@@ -98,7 +98,7 @@ pick ONE of the two remedies, which are NOT interchangeable:
    ```
 
 Either path causes a brief API downtime while the fishhawkd pod is recreated.
-The in-cluster postgres/minio/jaeger workloads are untouched — they already
+The in-cluster postgres/rustfs/jaeger workloads are untouched — they already
 carried a `component` label — and in **`split` mode the `-api` and `-worker`
 Deployments are unaffected**, because they already selected on
 `component: api`/`worker` before 0.3.0; only the allInOne Deployment's
@@ -408,7 +408,7 @@ render outside `profile: local` when a dev-only convenience is active:
 
 - `chartManaged` mode;
 - in-cluster Postgres with the default password;
-- in-cluster MinIO with the default rootPassword;
+- in-cluster RustFS with the default secretKey;
 - the in-cluster Jaeger trace collector (`jaeger.enabled` —
   ephemeral/unauthenticated, dev/dogfooding only).
 
@@ -546,26 +546,60 @@ marks the version dirty, so the NEXT run refuses rather than proceeding;
 `MigrateUp` enriches that refusal with the dirty version and the
 recovery step instead of golang-migrate's bare text.
 
-## Optional in-cluster Postgres + MinIO
+## Optional in-cluster Postgres + RustFS
 
 Mirroring `docker-compose.yml`, gated by `postgres.enabled` /
-`minio.enabled` (both default false, so the prod baseline points at
+`rustfs.enabled` (both default false, so the prod baseline points at
 external DB/S3). Each is a single-replica Deployment + `ReadWriteOnce`
 PVC + ClusterIP Service (`<fullname>-postgres` on 5432,
-`<fullname>-minio` on 9000/9001), plus a post-install/upgrade
-bucket-bootstrap Job (`minio.createBucket`) that retries
-`mc alias set` then `mc mb --ignore-existing`.
+`<fullname>-rustfs` on 9000/9001), plus a post-install/upgrade
+bucket-bootstrap Job (`rustfs.createBucket`) on the AWS CLI
+(`rustfs.bootstrapImage`) that retries `aws s3api list-buckets` until
+RustFS accepts requests, then `head-bucket || create-bucket` (a rerun
+against an existing bucket succeeds; a create-bucket that fails exits
+the Job non-zero, so Helm reports the failed hook rather than a clean
+install with no bucket). Path-style addressing is forced through
+`AWS_CONFIG_FILE`, since with a custom `--endpoint-url` the CLI would
+otherwise address `<bucket>.<service>:9000`, which cluster DNS cannot
+resolve. `scripts/test-helm-render` **r18** renders these and RUNS the
+extracted bootstrap script against a stubbed `aws` for the
+absent/exists/create-fails/not-ready cases.
 
-`minio.mcImage` is pinned **independently** of `minio.image` — mc and
-the MinIO server are **not** co-versioned, so `minio/mc` has no tag for
-every `minio/minio` release, and the pin must name a tag that actually
-exists in the registry. Because the bucket Job is a Helm **hook**, a
-nonexistent tag surfaces only as a `helm upgrade` timeout (never a named
-`ImagePullBackOff`) — the class of failure #2913 reports.
-`scripts/test-helm-render` **r15** fail-closes the render gate on an
-unpublished third-party image tag, and `scripts/dev k8s` dumps hook Job
-+ pod state (naming the pull reason) on a helm failure. Verify a new
-pin is pullable before bumping.
+The rustfs pod sets `securityContext.fsGroup: 10001` (the image's uid)
+so the PVC mount at `/data` is group-writable on provisioners that do
+not create a world-writable directory. `rustfs.accessKey` /
+`rustfs.secretKey` become `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` and
+must equal `secrets.values.awsAccessKeyId` / `awsSecretAccessKey`, as
+`values-local.yaml` does. Readiness is `GET /health` on 9000.
+
+`rustfs.bootstrapImage` is pinned **independently** of `rustfs.image`
+and must name a tag that actually exists in the registry. Because the
+bucket Job is a Helm **hook**, a nonexistent tag surfaces only as a
+`helm upgrade` timeout (never a named `ImagePullBackOff`) — the class
+of failure #2913 reports. `scripts/test-helm-render` **r15**
+fail-closes the render gate on an unpublished third-party image tag,
+and `scripts/dev k8s` dumps hook Job + pod state (naming the pull
+reason) on a helm failure. Verify a new pin is pullable before bumping.
+
+**Breaking rename in chart 0.4.0 (#3386).** The in-cluster store moved
+from MinIO to RustFS after the MinIO images were deleted from Docker
+Hub, and the values block was renamed rather than left half-renamed.
+An out-of-tree values file written against 0.3.0 must be updated:
+
+| 0.3.0 (`minio.*`) | 0.4.0 (`rustfs.*`) |
+|---|---|
+| `minio.enabled` | `rustfs.enabled` |
+| `minio.image` | `rustfs.image` (`rustfs/rustfs:1.0.0-rc.6`) |
+| `minio.mcImage` | `rustfs.bootstrapImage` (`amazon/aws-cli:2.36.44`) |
+| `minio.rootUser` / `minio.rootPassword` | `rustfs.accessKey` / `rustfs.secretKey` |
+| `minio.{pullPolicy,apiPort,consolePort,bucket,createBucket,persistence,resources}` | same keys under `rustfs.` |
+| Service / PVC / Deployment `<fullname>-minio` | `<fullname>-rustfs` (`config.s3Endpoint` must follow) |
+| hook Job `<fullname>-minio-bucket` (component `minio-bucket`) | `<fullname>-rustfs-bucket` (component `rustfs-bucket`) |
+
+A `minio.*` key left in a values file is silently ignored by 0.4.0 (no
+template reads it), so the upgrade surfaces as `rustfs.enabled: false`
+— fishhawkd pointed at a Service that no longer exists. The old
+`<fullname>-minio` PVC is left behind; it holds dev-only trace bundles.
 
 When `postgres.enabled`, the fishhawkd Deployment gets an explicit
 container-level `FISHHAWKD_DATABASE_URL` env pointing at the in-cluster
@@ -614,7 +648,7 @@ Worker-singleton leader-election remains out of scope (#851).
 
 | File | Posture |
 |---|---|
-| `values-local.yaml` | localhost dev — in-cluster Postgres/MinIO/Jaeger, `chartManaged` secrets, ingress off |
+| `values-local.yaml` | localhost dev — in-cluster Postgres/RustFS/Jaeger, `chartManaged` secrets, ingress off |
 | `values-prod.yaml` | production baseline — ingress + cert-manager TLS, `existing` secrets, derived URLs |
 | `values-single-tenant.yaml` | ADR-057 **Mode 1** — one customer, own perimeter, `singleTenant.*` set |
 | `values-cell.yaml` | ADR-057 **Mode 2** / ADR-062 — one regional cell, `cell.homeRegion` + `cell.modelBaseUrl`, workers on |
@@ -649,7 +683,7 @@ unreachable registry can never green the case), and a
 **selector-integrity check** ([r17](https://github.com/kuhlman-labs/fishhawk/issues/2916),
 run in BOTH allInOne and split renders): r17a asserts every rendered
 Service selects EXACTLY ONE workload pod, over a universe that includes
-the migrate and minio-bucket **Job** pod templates (they carry the same
+the migrate and rustfs-bucket **Job** pod templates (they carry the same
 bare labels and are part of the shipped defect); r17b asserts
 `svc/fishhawk`'s selector is the FULL `{name,instance,component}` set
 (`server` allInOne, `api` split), not just the discriminator; r17c
@@ -658,8 +692,16 @@ EQUALS its pod-template set and that the primary Deployment carries the
 full expected set; r17d asserts no pod set satisfies two DISTINCT
 Deployment selectors. The complete mutation-to-verdict counterfactual
 matrix (M0–M4) is recorded in the r17 header comment in
-`scripts/test-helm-render`. A render + lint of
-every profile rounds out the suite. It **skips with a printed reason
+`scripts/test-helm-render`. The **RustFS done-means** ([r18](https://github.com/kuhlman-labs/fishhawk/issues/3386))
+asserts the rustfs Deployment's `RUSTFS_*` env, `/health` readiness
+and `fsGroup: 10001`, the aws-cli bootstrap Job's image and script
+text, that no `minio/` image ref survives, and the renamed
+`rustfs.secretKey` fail-closed guard — and then EXTRACTS the bootstrap
+script from the rendered Job and RUNS it under a stubbed `aws`:
+bucket absent + create succeeds → 0; bucket exists → 0 with no create
+attempted; create FAILS → non-zero (the case a render assertion cannot
+observe); not-ready → the readiness retry loops then succeeds. A
+render + lint of every profile rounds out the suite. It **skips with a printed reason
 and exits 0** when `helm` is absent from PATH, so a helm-less host is
 not red-lined; the cost is honest — on such a host the chart is
 unguarded, the same residual the zsh guard already accepts for
@@ -774,7 +816,7 @@ is an operator gate walked at merge, not part of `scripts/test verify`.
 ## Verify
 
 `values-local.yaml` is a localhost-flavored override that turns
-Postgres + MinIO on for a self-contained Docker-Desktop stack and
+Postgres + RustFS on for a self-contained Docker-Desktop stack and
 renders standalone.
 
 ```sh

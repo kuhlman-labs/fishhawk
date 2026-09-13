@@ -1585,7 +1585,7 @@ fi
 # ---------------------------------------------------------------------------
 # r17 — SELECTOR INTEGRITY (E69.5 / #2916). The allInOne fishhawkd Service +
 #       Deployment must select ONLY the fishhawkd pod, not the
-#       postgres/minio/jaeger pods or the migrate/minio-bucket hook Job pods whose
+#       postgres/rustfs/jaeger pods or the migrate/rustfs-bucket hook Job pods whose
 #       bare name+instance labels a bare selector matched. Four named assertions,
 #       ALL run in BOTH allInOne and split renders, over a pod universe that
 #       includes the two Job pod templates (they are part of the shipped defect:
@@ -1750,13 +1750,13 @@ r17_assertions() { # <mode-label> <primary-deployment-name> <svc-component> <ren
   # runs and the Job-collision coverage goes vacuous while the universe-size check
   # still passes on the Deployments alone. So track that each expected Job was found
   # AND checked, and fail loudly if either was not — in BOTH render modes.
-  local comp found_migrate=0 found_minio=0
+  local comp found_migrate=0 found_rustfs=0
   while IFS= read -r -d '' doc; do
     name=$(doc_name "$doc")
     comp=$(identity_lines "$(pod_labels_block "$doc")" | sed -n 's#^app.kubernetes.io/component: ##p')
     case "$name" in
       *-migrate)       found_migrate=1; assert_equals "r17 ($mode) migrate Job pod component is migrate" "$comp" "migrate" ;;
-      *-minio-bucket)  found_minio=1;   assert_equals "r17 ($mode) minio-bucket Job pod component is minio-bucket" "$comp" "minio-bucket" ;;
+      *-rustfs-bucket) found_rustfs=1;  assert_equals "r17 ($mode) rustfs-bucket Job pod component is rustfs-bucket" "$comp" "rustfs-bucket" ;;
     esac
   done < <(docs_of_kind "$manifest" Job)
   if [ "$found_migrate" -eq 1 ]; then
@@ -1764,14 +1764,216 @@ r17_assertions() { # <mode-label> <primary-deployment-name> <svc-component> <ren
   else
     fail "r17 ($mode) migrate Job pod template absent/unparsed/renamed — component assertion never ran"
   fi
-  if [ "$found_minio" -eq 1 ]; then
-    pass "r17 ($mode) minio-bucket Job pod template was found and its component asserted"
+  if [ "$found_rustfs" -eq 1 ]; then
+    pass "r17 ($mode) rustfs-bucket Job pod template was found and its component asserted"
   else
-    fail "r17 ($mode) minio-bucket Job pod template absent/unparsed/renamed — component assertion never ran"
+    fail "r17 ($mode) rustfs-bucket Job pod template absent/unparsed/renamed — component assertion never ran"
   fi
 }
 r17_assertions allInOne fishhawk server -f "$CHART/values-local.yaml"
 r17_assertions split fishhawk-api api -f "$CHART/values-local.yaml" --set deployment.mode=split
+
+# ---------------------------------------------------------------------------
+# r18 — RUSTFS DONE-MEANS + BOOTSTRAP-SCRIPT BEHAVIOUR (#3386). MinIO's images
+#       were deleted from Docker Hub, so the chart's in-cluster S3 store moved to
+#       rustfs/rustfs with the `minio.*` values block renamed to `rustfs.*` and
+#       the bucket-bootstrap hook Job re-implemented on the AWS CLI. Everything
+#       here is YAML + an inline shell script that no compiler checks, so a
+#       comment-only touch of either template would pass every gate above.
+#
+#       r18a — the rustfs Deployment renders the RUSTFS_ACCESS_KEY /
+#              RUSTFS_SECRET_KEY env (a container started without them falls back
+#              to the image's built-in credentials and fishhawkd's static-cred
+#              client is refused), a readinessProbe on /health (rustfs answers 503
+#              on `/`), and pod fsGroup 10001 (the image's uid; a PVC mount that
+#              is not group-writable by it fails readiness with a permission
+#              error in the logs).
+#       r18b — the rustfs-bucket hook Job renders the aws-cli bootstrapImage and a
+#              /bin/sh command whose script carries `set -e`, the list-buckets
+#              readiness retry, head-bucket, create-bucket, and the path-style
+#              addressing config (with a custom --endpoint-url the CLI would
+#              otherwise address `<bucket>.<service>:9000`, unresolvable in
+#              cluster DNS).
+#       r18c — no `minio/` image ref survives in the values-local render.
+#       r18d — the renamed dev-only guard fails closed: `profile=prod` +
+#              `rustfs.enabled` with the default secretKey renders non-zero naming
+#              `rustfs.secretKey`; overriding the key renders. Deleting the guard
+#              clause in _helpers.tpl reddens the fail-closed case.
+#       r18e — BEHAVIOURAL (approval condition 1): a render assertion reads the
+#              command TEXT and structurally cannot observe its exit status, so
+#              the script is EXTRACTED from the rendered Job and RUN under a
+#              stubbed `aws` (and a no-op `sleep`) on PATH:
+#                (a) bucket absent, create succeeds     -> exit 0, create attempted;
+#                (b) bucket already exists              -> exit 0, NO create attempted;
+#                (c) bucket absent, create FAILS        -> NON-ZERO exit, stderr names
+#                                                          the failure (the case that
+#                                                          the pre-condition script
+#                                                          passed silently);
+#                (d) rustfs not ready for two probes    -> the readiness retry loops
+#                                                          and then succeeds.
+#              Deleting `set -e` AND the `|| { …; exit 1; }` handler from the
+#              template turns (c) GREEN in the old sense (exit 0 from the trailing
+#              echo) and so reddens r18e-c — the deletion-observed control.
+# ---------------------------------------------------------------------------
+
+# _r18_job_script <job-doc> — the inline shell script of the Job's
+# `command: [/bin/sh, -c, |]` block, de-indented so it runs as written. Captures
+# every line after the `- |` literal-block marker that is indented at least as
+# deep as the script's first line; stops at the first shallower line.
+_r18_job_script() {
+  printf '%s' "$1" | awk '
+    !f && /^[[:space:]]*- \|[[:space:]]*$/ { f = 1; next }
+    f {
+      if ($0 ~ /^[[:space:]]*$/) { print ""; next }
+      match($0, /^[[:space:]]*/)
+      if (ind == 0) ind = RLENGTH
+      if (RLENGTH < ind) exit
+      print substr($0, ind + 1)
+    }
+  '
+}
+
+# _r18_run_script <script-file> <head-rc> <create-rc> <list-fail-first> — run
+# the extracted bootstrap script with a stub `aws` on PATH whose head-bucket /
+# create-bucket exit codes and number of initially-failing list-buckets probes
+# are injected, plus a no-op `sleep` so the readiness retry does not wait.
+# Sets r18_rc, r18_out, r18_err, r18_calls (one stub invocation per line) and
+# r18_cfg (the AWS_CONFIG_FILE the script wrote).
+_r18_run_script() {
+  local script="$1" head_rc="$2" create_rc="$3" list_fail_first="$4"
+  local stubdir; stubdir="$(mktemp -d "$tmproot/r18-stub.XXXXXX")"
+  cat > "$stubdir/aws" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
+case " $* " in
+  *" s3api list-buckets "*)
+    n=$(grep -c 's3api list-buckets' "$FAKE_AWS_LOG")
+    if [ "$n" -gt "${FAKE_AWS_LIST_FAIL_FIRST:-0}" ]; then exit 0; else exit 255; fi ;;
+  *" s3api head-bucket "*)   exit "${FAKE_AWS_HEAD_RC:-0}" ;;
+  *" s3api create-bucket "*) echo "create-bucket: injected failure" >&2; exit "${FAKE_AWS_CREATE_RC:-0}" ;;
+  *) echo "stub aws: unexpected invocation: $*" >&2; exit 2 ;;
+esac
+STUB
+  printf '#!/bin/sh\nexit 0\n' > "$stubdir/sleep"
+  chmod +x "$stubdir/aws" "$stubdir/sleep"
+  : > "$stubdir/calls.log"
+  r18_out="$(PATH="$stubdir:$PATH" FAKE_AWS_LOG="$stubdir/calls.log" \
+    FAKE_AWS_HEAD_RC="$head_rc" FAKE_AWS_CREATE_RC="$create_rc" \
+    FAKE_AWS_LIST_FAIL_FIRST="$list_fail_first" AWS_CONFIG_FILE="$stubdir/aws-config" \
+    sh "$script" 2>"$stubdir/stderr")"
+  r18_rc=$?
+  r18_err="$(cat "$stubdir/stderr")"
+  r18_calls="$(cat "$stubdir/calls.log")"
+  r18_cfg="$(cat "$stubdir/aws-config" 2>/dev/null || true)"
+}
+
+render -f "$CHART/values-local.yaml"
+assert_render_ok "r18 values-local renders for the rustfs done-means checks"
+
+# r18a — the rustfs Deployment.
+r18_dep=""
+while IFS= read -r -d '' doc; do
+  case "$(doc_name "$doc")" in *-rustfs) r18_dep="$doc" ;; esac
+done < <(docs_of_kind "$out" Deployment)
+if [ -n "$r18_dep" ]; then
+  pass "r18a the rustfs Deployment (<fullname>-rustfs) is rendered"
+  r18_env="$(yaml_block "$r18_dep" env)"
+  assert_contains "r18a rustfs Deployment env carries RUSTFS_ACCESS_KEY" "$r18_env" "- name: RUSTFS_ACCESS_KEY"
+  assert_contains "r18a rustfs Deployment env carries RUSTFS_SECRET_KEY" "$r18_env" "- name: RUSTFS_SECRET_KEY"
+  assert_contains "r18a rustfs Deployment env carries RUSTFS_SECRET_KEY=fishhawk-dev-secret (values-local default)" "$r18_env" 'value: "fishhawk-dev-secret"'
+  assert_contains "r18a rustfs Deployment image is rustfs/rustfs" "$r18_dep" 'image: "rustfs/rustfs:'
+  r18_probe="$(yaml_block "$r18_dep" readinessProbe)"
+  assert_contains "r18a rustfs readinessProbe path is /health (rustfs answers 503 on /)" "$r18_probe" "path: /health"
+  assert_absent "r18a rustfs readinessProbe does not use the MinIO health path" "$r18_probe" "/minio/health"
+  r18_sc="$(yaml_block "$r18_dep" securityContext)"
+  assert_contains "r18a rustfs pod securityContext sets fsGroup 10001 (the image uid)" "$r18_sc" "fsGroup: 10001"
+else
+  fail "r18a the rustfs Deployment (<fullname>-rustfs) is absent from the values-local render"
+fi
+
+# r18b — the rustfs-bucket hook Job.
+r18_job=""
+while IFS= read -r -d '' doc; do
+  case "$(doc_name "$doc")" in *-rustfs-bucket) r18_job="$doc" ;; esac
+done < <(docs_of_kind "$out" Job)
+if [ -n "$r18_job" ]; then
+  pass "r18b the rustfs-bucket hook Job (<fullname>-rustfs-bucket) is rendered"
+  assert_contains "r18b bootstrap Job image is amazon/aws-cli:2.36.44 (rustfs.bootstrapImage)" "$r18_job" 'image: "amazon/aws-cli:2.36.44"'
+  assert_contains "r18b bootstrap Job stays a post-install/post-upgrade hook" "$r18_job" '"helm.sh/hook": post-install,post-upgrade'
+  r18_cmd="$(yaml_block "$r18_job" command)"
+  assert_equals "r18b bootstrap Job command begins with /bin/sh (a k8s command overrides the aws ENTRYPOINT)" \
+    "$(printf '%s\n' "$r18_cmd" | sed -n '1s/^[[:space:]]*- //p')" "/bin/sh"
+  r18_script="$(_r18_job_script "$r18_job")"
+  if [ -n "$r18_script" ]; then
+    pass "r18b bootstrap script extracted from the rendered Job (non-empty)"
+  else
+    fail "r18b bootstrap script extraction returned nothing — the command block shape changed"
+  fi
+  assert_contains "r18b bootstrap script starts with set -e" "$(printf '%s\n' "$r18_script" | sed -n 1p)" "set -e"
+  assert_contains "r18b bootstrap script retries on s3api list-buckets (readiness gate)" "$r18_script" "s3api list-buckets"
+  assert_contains "r18b bootstrap script probes with s3api head-bucket" "$r18_script" "s3api head-bucket"
+  assert_contains "r18b bootstrap script creates with s3api create-bucket" "$r18_script" "s3api create-bucket"
+  assert_contains "r18b bootstrap script forces path-style addressing via AWS_CONFIG_FILE" "$r18_script" "addressing_style = path"
+  assert_contains "r18b bootstrap script targets the rustfs Service on the api port" "$r18_script" 'endpoint="http://fishhawk-rustfs:9000"'
+  assert_contains "r18b bootstrap script targets the configured bucket" "$r18_script" 'bucket="fishhawk-traces"'
+  r18_jobenv="$(yaml_block "$r18_job" env)"
+  assert_contains "r18b bootstrap Job env sets AWS_CONFIG_FILE (the path-style config target)" "$r18_jobenv" "- name: AWS_CONFIG_FILE"
+  assert_contains "r18b bootstrap Job env carries AWS_ACCESS_KEY_ID from rustfs.accessKey" "$r18_jobenv" "- name: AWS_ACCESS_KEY_ID"
+  assert_contains "r18b bootstrap Job env carries AWS_SECRET_ACCESS_KEY from rustfs.secretKey" "$r18_jobenv" "- name: AWS_SECRET_ACCESS_KEY"
+else
+  fail "r18b the rustfs-bucket hook Job (<fullname>-rustfs-bucket) is absent from the values-local render"
+  r18_script=""
+fi
+
+# r18c — no MinIO image ref survives.
+r18_refs="$(_r15_extract_refs "$out")"
+assert_absent "r18c no minio/ image ref remains in the values-local render" "$r18_refs" "minio/"
+assert_absent "r18c no minio Deployment/Service/Job name remains in the values-local render" "$out" "name: fishhawk-minio"
+
+# r18d — the renamed dev-only guard.
+render --set profile=prod --set rustfs.enabled=true
+assert_render_fails "r18d profile=prod + rustfs.enabled with the default secretKey fails closed naming rustfs.secretKey" "rustfs.secretKey"
+render --set profile=prod --set rustfs.enabled=true --set rustfs.secretKey=not-the-default
+assert_render_ok "r18d profile=prod + rustfs.enabled with an overridden secretKey renders"
+
+# r18e — RUN the extracted bootstrap script (approval condition 1).
+if [ -n "$r18_script" ]; then
+  r18_script_file="$tmproot/r18-bootstrap.sh"
+  printf '%s\n' "$r18_script" > "$r18_script_file"
+
+  # (a) bucket absent (head-bucket 254), create succeeds -> 0, create attempted.
+  _r18_run_script "$r18_script_file" 254 0 0
+  assert_equals "r18e-a bucket absent + create succeeds -> exit 0" "$r18_rc" "0"
+  assert_contains "r18e-a create-bucket was attempted" "$r18_calls" "s3api create-bucket --bucket fishhawk-traces"
+  assert_contains "r18e-a the script reports the bucket ready" "$r18_out" "bucket fishhawk-traces ready"
+  assert_contains "r18e-a the script wrote the path-style AWS config" "$r18_cfg" "addressing_style = path"
+
+  # (b) bucket already exists (head-bucket 0) -> 0, NO create attempted.
+  _r18_run_script "$r18_script_file" 0 1 0
+  assert_equals "r18e-b bucket already exists -> exit 0 (rerun is idempotent)" "$r18_rc" "0"
+  assert_absent "r18e-b no create-bucket attempted when head-bucket succeeds" "$r18_calls" "s3api create-bucket"
+  assert_contains "r18e-b head-bucket was consulted" "$r18_calls" "s3api head-bucket --bucket fishhawk-traces"
+
+  # (c) bucket absent, create FAILS -> NON-ZERO. The case the pre-condition
+  # script (`head-bucket || create-bucket` then an unconditional echo) passed.
+  _r18_run_script "$r18_script_file" 254 1 0
+  if [ "$r18_rc" -ne 0 ]; then
+    pass "r18e-c bucket absent + create FAILS -> non-zero exit ($r18_rc)"
+  else
+    fail "r18e-c bucket absent + create FAILS exited 0 — a failed create-bucket is masked and the hook Job would report success with no bucket"
+  fi
+  assert_contains "r18e-c the failure names create-bucket on stderr" "$r18_err" "create-bucket failed for bucket fishhawk-traces"
+  assert_absent "r18e-c the script does NOT report the bucket ready after a failed create" "$r18_out" "bucket fishhawk-traces ready"
+
+  # (d) rustfs not ready for the first two list-buckets probes -> retries, then 0.
+  _r18_run_script "$r18_script_file" 254 0 2
+  assert_equals "r18e-d readiness retry tolerates a not-yet-up rustfs -> exit 0" "$r18_rc" "0"
+  assert_equals "r18e-d list-buckets was probed three times (two failures, one success)" \
+    "$(printf '%s\n' "$r18_calls" | grep -c 's3api list-buckets')" "3"
+  assert_contains "r18e-d the retry loop logged its wait" "$r18_out" "rustfs not ready yet; retrying"
+else
+  fail "r18e bootstrap script unavailable — the behavioural cases (a)-(d) never ran"
+fi
 
 fi  # end r1–r14 (skipped under FISHHAWK_HELM_RENDER_SELFTEST)
 
@@ -1779,9 +1981,10 @@ fi  # end r1–r14 (skipped under FISHHAWK_HELM_RENDER_SELFTEST)
 # r15 — REGISTRY EXISTENCE of every third-party image the chart RENDERS (#2913).
 #       A rendered-output gate structurally CANNOT catch a nonexistent tag: the
 #       manifest is valid YAML naming an image that does not exist, and the
-#       minio bucket Job is a Helm HOOK, so the pull failure surfaces to the
+#       rustfs bucket Job is a Helm HOOK, so the pull failure surfaces to the
 #       operator only as a `helm upgrade` timeout, never a named
-#       ImagePullBackOff — exactly why the bad minio/mc pin shipped past every
+#       ImagePullBackOff — exactly why the bad minio/mc pin (#2913, the MinIO
+#       predecessor of today's rustfs.bootstrapImage) shipped past every
 #       render assertion above. This case extracts each rendered image ref (from
 #       `helm template` output, NOT grepped from values.yaml) and classifies it
 #       against the registry by an anonymous Docker Hub registry-v2 manifest HEAD.
@@ -1995,14 +2198,14 @@ else
   assert_equals "r15a probe non-Docker-Hub ref -> unsupported" \
     "$(_registry_probe ghcr.io/kuhlman-labs/fishhawkd:dev-local)" "unsupported"
   assert_equals "r15a probe digest-pinned ref -> unsupported" \
-    "$(_registry_probe minio/mc@sha256:0000000000000000000000000000000000000000000000000000000000000000)" "unsupported"
+    "$(_registry_probe rustfs/rustfs@sha256:0000000000000000000000000000000000000000000000000000000000000000)" "unsupported"
   assert_equals "r15a probe tagless ref -> unsupported" \
-    "$(_registry_probe minio/mc)" "unsupported"
+    "$(_registry_probe rustfs/rustfs)" "unsupported"
   # Binding condition 5: the REGISTRY_AUTH_URL override makes the token-fetch
   # failure (-> indeterminate) deterministically testable. 127.0.0.1:1 refuses,
   # so the token is empty and the probe short-circuits to indeterminate.
   assert_equals "r15a probe unreachable token endpoint -> indeterminate" \
-    "$(FISHHAWK_REGISTRY_AUTH_URL=http://127.0.0.1:1 _registry_probe minio/mc:RELEASE.2025-08-13T08-35-41Z)" "indeterminate"
+    "$(FISHHAWK_REGISTRY_AUTH_URL=http://127.0.0.1:1 _registry_probe rustfs/rustfs:1.0.0-rc.6)" "indeterminate"
   # The MANIFEST-HEAD failure branch (the token twin): with the default auth
   # endpoint the token fetch succeeds, then FISHHAWK_REGISTRY_URL=http://127.0.0.1:1
   # refuses the HEAD, so `curl -I` reports 000 and the probe maps to indeterminate
@@ -2011,7 +2214,7 @@ else
   # fetch itself fails first, still yielding indeterminate, so the assertion holds
   # either way.
   assert_equals "r15a probe reachable auth + unreachable manifest endpoint -> indeterminate" \
-    "$(FISHHAWK_REGISTRY_URL=http://127.0.0.1:1 _registry_probe minio/mc:RELEASE.2025-08-13T08-35-41Z)" "indeterminate"
+    "$(FISHHAWK_REGISTRY_URL=http://127.0.0.1:1 _registry_probe rustfs/rustfs:1.0.0-rc.6)" "indeterminate"
 
   # r15a STALL + DETERMINISTIC-MANIFEST branches (high + low untested-path, #2913).
   # The 127.0.0.1:1 cases above REFUSE immediately, so they never exercise the
@@ -2025,7 +2228,7 @@ else
     if ! command -v python3 >/dev/null 2>&1; then
       echo "scripts/test-helm-render: python3 absent — SKIPPING the r15a stall/deterministic-manifest tests (curl timeouts UNEXERCISED on this host)"
     else
-      _r15_good_ref="minio/mc:RELEASE.2025-08-13T08-35-41Z"
+      _r15_good_ref="amazon/aws-cli:2.36.44"
       # (1) TOKEN-curl stall: a blackhole auth endpoint that ACCEPTS but never
       # responds. With --max-time the probe returns ~2s; without it, ~20s.
       if _r15_bh="$(_r15_mock_server blackhole)"; then
@@ -2086,28 +2289,38 @@ else
     fi
   fi
 
-  # r15b THE SENTINEL / ANTI-VACUITY GUARD. Probe the known-bad ref from #2913 and
-  # require `missing`. Anything else prints the reason and SKIPS the live checks,
-  # so an unreachable registry can never green r15c. SHARED-DEPENDENCE RESIDUAL
-  # (binding condition 4): this sentinel AND r15d's counterfactual both hinge on a
-  # live 404 for this exact tag. If Docker Hub ever publishes it, r15b skips and
-  # r15d skips with it, silently removing the counterfactual guard with no signal.
-  # Recorded in scripts/README.md's r15 row.
-  SENTINEL_REF="minio/mc:RELEASE.2025-01-20T14-49-07Z"
+  # r15b THE SENTINEL / ANTI-VACUITY GUARD. Probe a known-missing ref and require
+  # `missing`. Anything else prints the reason and SKIPS the live checks, so an
+  # unreachable registry can never green r15c. The sentinel MUST be a missing TAG
+  # in an EXISTING repository (#3386): Docker Hub answers a manifest HEAD for a
+  # nonexistent REPOSITORY with 401, which classifies `indeterminate`, so when
+  # minio/mc was deleted repository-wide the old sentinel
+  # (minio/mc:RELEASE.2025-01-20T14-49-07Z, #2913) stopped classifying `missing`
+  # and r15 silently skipped every live probe — the gate went vacuous with no
+  # signal. The MinIO-style date tag below cannot exist in rustfs/rustfs's
+  # semver-tagged repository; the operator verified it answers 404 on
+  # 2026-09-13. SHARED-DEPENDENCE RESIDUAL (binding condition 4, #2913): this
+  # sentinel AND r15d's counterfactual both hinge on a live 404 for this exact
+  # tag. If Docker Hub ever publishes it, r15b skips and r15d skips with it,
+  # silently removing the counterfactual guard with no signal. Recorded in
+  # scripts/README.md's r15 row.
+  SENTINEL_REF="rustfs/rustfs:RELEASE.2025-01-20T14-49-07Z"
   sentinel_verdict="$(_registry_probe "$SENTINEL_REF")"
   if [ "$sentinel_verdict" != "missing" ]; then
     echo "scripts/test-helm-render: r15 sentinel $SENTINEL_REF classified '$sentinel_verdict', not 'missing' — registry unreachable/rate-limited or the tag became published; SKIPPING the live registry probes (chart image pins UNGUARDED on this host)"
   else
     pass "r15b sentinel known-bad ref classifies missing (anti-vacuity guard is live)"
 
-    # r15c THE LIVE CHECK. Render values-local (enables minio, postgres, jaeger),
+    # r15c THE LIVE CHECK. Render values-local (enables rustfs, postgres, jaeger),
     # extract every third-party image ref, and require the detector to find none
-    # missing. Extraction is sanity-checked first (the mc image must be present),
-    # so an empty extraction cannot vacuously pass.
+    # missing. Extraction is sanity-checked first (both the rustfs server image
+    # and the aws-cli bootstrap image must be present), so an empty extraction
+    # cannot vacuously pass.
     render -f "$CHART/values-local.yaml"
     assert_render_ok "r15c values-local renders for image extraction"
     r15c_refs="$(_r15_extract_refs "$out")"
-    assert_contains "r15c extraction finds the minio/mc image (extraction works)" "$r15c_refs" "minio/mc:"
+    assert_contains "r15c extraction finds the amazon/aws-cli bootstrap image (extraction works)" "$r15c_refs" "amazon/aws-cli:"
+    assert_contains "r15c extraction finds the rustfs/rustfs server image (extraction works)" "$r15c_refs" "rustfs/rustfs:"
     assert_absent "r15c extraction drops the locally-built fishhawkd image" "$r15c_refs" "fishhawkd"
     if r15c_out="$(_r15_probe_refs "$out")"; then
       # No ref probed `missing`. But return-0 alone collapses "all exist" with
@@ -2126,17 +2339,18 @@ else
       fail "r15c a rendered third-party image is MISSING from the registry: $r15c_missing"
     fi
 
-    # r15d THE COUNTERFACTUAL. Render with the exact nonexistent tag from #2913
-    # and assert the SAME detector reports it missing — the condition that shipped
-    # this bug is now detected. Deleting the `missing` accumulation in
+    # r15d THE COUNTERFACTUAL. Render with the sentinel's nonexistent tag as the
+    # bootstrap image (the #2913 shape: a hook-Job image pinned to a tag that does
+    # not exist) and assert the SAME detector reports it missing — the condition
+    # that shipped that bug is now detected. Deleting the `missing` accumulation in
     # _r15_probe_refs makes the detector return 0 here, so the else-branch fires
     # and r15d goes RED (observed by execution), while r15c stays green.
-    render -f "$CHART/values-local.yaml" --set minio.mcImage="$SENTINEL_REF"
-    assert_render_ok "r15d values-local + bad mc tag renders (the manifest is valid; only the tag is bogus)"
+    render -f "$CHART/values-local.yaml" --set rustfs.bootstrapImage="$SENTINEL_REF"
+    assert_render_ok "r15d values-local + bad bootstrapImage tag renders (the manifest is valid; only the tag is bogus)"
     if r15d_missing="$(_r15_probe_refs "$out")"; then
-      fail "r15d counterfactual FAILED to detect the nonexistent mc tag $SENTINEL_REF (the missing-detection branch is broken)"
+      fail "r15d counterfactual FAILED to detect the nonexistent bootstrapImage tag $SENTINEL_REF (the missing-detection branch is broken)"
     else
-      assert_contains "r15d counterfactual: the detector reports the shipped-bug mc tag missing" "$r15d_missing" "$SENTINEL_REF"
+      assert_contains "r15d counterfactual: the detector reports the bogus bootstrapImage tag missing" "$r15d_missing" "$SENTINEL_REF"
     fi
   fi
 

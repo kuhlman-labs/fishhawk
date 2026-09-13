@@ -12,7 +12,7 @@ spec:
   # The allInOne fishhawkd workload carries an app.kubernetes.io/component: server
   # discriminator so its Service + Deployment select ONLY the fishhawkd pod. The
   # bare name+instance selector is a strict superset of the
-  # postgres/minio/jaeger/migrate/minio-bucket pod labels, so without the
+  # postgres/rustfs/jaeger/migrate/rustfs-bucket pod labels, so without the
   # component the Service and Deployment matched all of them (svc/fishhawk picked
   # an arbitrary pod — the jaeger-logs symptom). `server` is a DIFFERENT axis from
   # the fishhawkd pod-spec role `all` below (which selects subprocesses), so both

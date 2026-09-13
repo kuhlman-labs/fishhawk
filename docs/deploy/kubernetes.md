@@ -195,8 +195,8 @@ Local uses port-forward (or a NodePort) rather than an Ingress;
 now resolve **deterministically** to the fishhawkd pod. The Service + Deployment
 carry an `app.kubernetes.io/component: server` discriminator
 ([#2916](https://github.com/kuhlman-labs/fishhawk/issues/2916)), so the selector
-no longer also matches the in-cluster postgres/minio/jaeger pods or the
-migrate/minio-bucket hook Job pods — before this, a selector-resolving command
+no longer also matches the in-cluster postgres/rustfs/jaeger pods or the
+migrate/rustfs-bucket hook Job pods — before this, a selector-resolving command
 picked an arbitrary matching pod and could return jaeger's logs. Confirm exactly
 one pod backs the Service:
 
@@ -539,7 +539,7 @@ The chart ships four worked override files (see the chart row in
 | | `values-local.yaml` | `values-prod.yaml` |
 |---|---|---|
 | `profile` | `local` (permits dev-only conveniences) | `prod` |
-| Postgres / MinIO | in-cluster (`postgres.enabled`, `minio.enabled`) | external DB / S3 |
+| Postgres / RustFS | in-cluster (`postgres.enabled`, `rustfs.enabled`) | external DB / S3 |
 | Jaeger (tracing) | in-cluster (`jaeger.enabled`) | off (dev-only) |
 | Secrets | `chartManaged` dev Secret with dev values | `existing` / `externalSecrets` |
 | GitHub App | off (generate a throwaway key to enable — see above) | App id + PEM in the Secret |
@@ -552,7 +552,7 @@ hostname, real ClusterIssuer — substitute your own and pre-create the Secret):
 ADR-062 — see [hosted-regional.md](hosted-regional.md)).
 
 The `profile: local` signal is what lets `fishhawk.validateSecrets` permit the
-chart-managed Secret, the default in-cluster DB/MinIO credentials, and the
+chart-managed Secret, the default in-cluster DB/RustFS credentials, and the
 dev-only Jaeger collector; a real cluster MUST keep `profile: prod` (which fails
 the render if any of those is left on).
 

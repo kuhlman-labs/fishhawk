@@ -95,9 +95,9 @@ Regional cell (ADR-062):
 {{- end }}
 {{- end }}
 
-{{- if and (eq .Values.profile "local") (or (and .Values.postgres.enabled (eq .Values.postgres.auth.password "fishhawk")) (and .Values.minio.enabled (eq .Values.minio.rootPassword "fishhawk-dev-secret"))) }}
+{{- if and (eq .Values.profile "local") (or (and .Values.postgres.enabled (eq .Values.postgres.auth.password "fishhawk")) (and .Values.rustfs.enabled (eq .Values.rustfs.secretKey "fishhawk-dev-secret"))) }}
 
-NOTE: in-cluster Postgres/MinIO are using well-known DEFAULT credentials
+NOTE: in-cluster Postgres/RustFS are using well-known DEFAULT credentials
 (permitted by profile: local). These are NOT secret — do not expose this
 deployment outside your dev machine.
 {{- end }}

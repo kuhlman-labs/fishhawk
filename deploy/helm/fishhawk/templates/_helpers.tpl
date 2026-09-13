@@ -49,7 +49,7 @@ app.kubernetes.io/managed-by: {{ $root.Release.Service }}
 
 {{/*
 Selector labels. Accepts either the chart root context (`.`) — emitting the bare
-two-label set (byte-identical to the postgres/minio/jaeger dependency call sites,
+two-label set (byte-identical to the postgres/rustfs/jaeger dependency call sites,
 which append their own literal component line) — or a dict
 `(dict "root" $ "role" R)` where a non-empty role adds an
 `app.kubernetes.io/component: <role>` label.
@@ -61,11 +61,11 @@ Component values the chart ships:
                       and Job pod, so a bare selector matched all of them).
   api, worker       — split-mode fishhawkd Deployments (the Service selects api,
                       excluding worker from its endpoints).
-  postgres, minio,
+  postgres, rustfs,
   jaeger            — the dev-dependency workloads (each appends its own literal
                       component line next to a bare selectorLabels call).
   migrate,
-  minio-bucket      — stamped literally on the two hook Jobs' pod templates.
+  rustfs-bucket     — stamped literally on the two hook Jobs' pod templates.
 
 `server` is the RATIFIED allInOne value and is a DIFFERENT axis from the fishhawkd
 pod-spec role `all` (fishhawk.fishhawkdPodSpec), which selects which subprocesses
@@ -143,7 +143,7 @@ render runs it. Calls `fail` when a dev-only convenience is active outside the
 `local` profile:
   - secrets.mode == chartManaged (the chart would bake plaintext secrets);
   - in-cluster Postgres with the well-known default password `fishhawk`;
-  - in-cluster MinIO with the well-known default rootPassword `fishhawk-dev-secret`.
+  - in-cluster RustFS with the well-known default secretKey `fishhawk-dev-secret`.
 Independently, `externalSecrets` mode requires a non-empty secretStoreRef.name in
 any profile. The message names the offending toggle and the override required.
 */}}
@@ -155,8 +155,8 @@ any profile. The message names the offending toggle and the override required.
 {{- if and .Values.postgres.enabled (eq .Values.postgres.auth.password "fishhawk") -}}
 {{- fail "postgres.enabled with the default password 'fishhawk' is DEV-ONLY: set profile=local to acknowledge, or override postgres.auth.password for a real deploy." -}}
 {{- end -}}
-{{- if and .Values.minio.enabled (eq .Values.minio.rootPassword "fishhawk-dev-secret") -}}
-{{- fail "minio.enabled with the default rootPassword 'fishhawk-dev-secret' is DEV-ONLY: set profile=local to acknowledge, or override minio.rootPassword for a real deploy." -}}
+{{- if and .Values.rustfs.enabled (eq .Values.rustfs.secretKey "fishhawk-dev-secret") -}}
+{{- fail "rustfs.enabled with the default secretKey 'fishhawk-dev-secret' is DEV-ONLY: set profile=local to acknowledge, or override rustfs.secretKey for a real deploy." -}}
 {{- end -}}
 {{- if .Values.jaeger.enabled -}}
 {{- fail "jaeger.enabled deploys an ephemeral, unauthenticated all-in-one trace collector and is DEV/DOGFOODING-ONLY: set profile=local to acknowledge, or disable jaeger for a real deploy." -}}
