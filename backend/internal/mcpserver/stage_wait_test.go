@@ -838,6 +838,9 @@ func TestFixupRecoverySchemaDisclosesNeutralization(t *testing.T) {
 	for _, tc := range []struct{ jsonName string }{
 		{"source_failure_reason"},
 		{"source_failure_category"},
+		// #3395: concern_reopen_error carries store error text and takes the
+		// same neutralize-then-cap path, so it carries the same disclosure.
+		{"concern_reopen_error"},
 	} {
 		var desc string
 		var found bool

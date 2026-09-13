@@ -1178,9 +1178,12 @@ func TestE2E_Fixup_FailedRedispatchRestoresReviewGate(t *testing.T) {
 	}
 	parkAtGate(t, ctx, fx.runRepo, review.ID)
 
-	// 2. Record the implement-review concern and trigger the fix-up through
-	// the real fishhawk-mcp binary — re-opens implement → pending, re-parks
-	// review → pending, writes stage_fixup_triggered.
+	// 2. Record the implement-review round (started with ConfiguredAgents:1,
+	// so the count-gated status path — not the #1127 fallback — is what the
+	// #3395 assertions below exercise) and its concern, then trigger the
+	// fix-up through the real fishhawk-mcp binary — re-opens implement →
+	// pending, re-parks review → pending, writes stage_fixup_triggered.
+	seedImplementReviewStarted(t, ctx, auditRepo, fx.runID, impl.ID)
 	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
 		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "address the drift"})
 
@@ -1198,6 +1201,11 @@ func TestE2E_Fixup_FailedRedispatchRestoresReviewGate(t *testing.T) {
 	}
 	if result.IsError {
 		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+	}
+	// The fix-up opened a round that is purely the MCP floor: the round-1
+	// verdict now sits below it and the status reads pending (#894).
+	if st := getImplementReviewStatus(t, ctx, session, fx.runID); st == nil || st.Status != "pending" {
+		t.Fatalf("implement_review_status after fix-up = %+v, want pending (the trigger floors the round-1 verdict)", st)
 	}
 
 	// 3. Ship the re-dispatched implement's trace bundle carrying push_fixup —
@@ -1261,6 +1269,7 @@ func TestE2E_Fixup_FailedRedispatchRestoresReviewGate(t *testing.T) {
 		RestoredState         string `json:"restored_state"`
 		RestoredReviewStageID string `json:"restored_review_stage_id"`
 		SourceFailureCategory string `json:"source_failure_category"`
+		DeliveredNothing      *bool  `json:"delivered_nothing"`
 	}
 	if err := json.Unmarshal(recovered[0].Payload, &payload); err != nil {
 		t.Fatalf("unmarshal stage_fixup_recovered payload: %v", err)
@@ -1273,6 +1282,179 @@ func TestE2E_Fixup_FailedRedispatchRestoresReviewGate(t *testing.T) {
 	}
 	if payload.SourceFailureCategory != "C" {
 		t.Errorf("source_failure_category = %q, want C", payload.SourceFailureCategory)
+	}
+	// 6. #3395: the pass pushed nothing (no fixup_pushed after the trigger),
+	// so the recovery closed the round it opened — stamped on the entry ...
+	if payload.DeliveredNothing == nil || !*payload.DeliveredNothing {
+		t.Fatalf("delivered_nothing = %v, want true (no fixup_pushed landed after the trigger)", payload.DeliveredNothing)
+	}
+	// ... and read by the real fishhawk-mcp binary: the server-written flag
+	// voids the trigger as the status floor, so the round-1 verdict
+	// resurfaces and the status reads complete. Before this change it read
+	// pending with reviews:[] forever (run 91006d10 step 4).
+	st := getImplementReviewStatus(t, ctx, session, fx.runID)
+	if st == nil || st.Status != "complete" {
+		t.Fatalf("implement_review_status after delivered-nothing recovery = %+v, want complete", st)
+	}
+	if len(st.Reviews) != 1 {
+		t.Errorf("implement_review_status reviews = %d, want the 1 round-1 verdict to resurface", len(st.Reviews))
+	}
+	// 7. fishhawk_await_review returns complete immediately rather than
+	// holding for a round nothing will ever settle.
+	if out := callAwaitReview(t, ctx, session, fx.runID, 2); out.Status != "complete" {
+		t.Errorf("await_review status = %q, want complete without waiting", out.Status)
+	}
+}
+
+// TestE2E_Fixup_DeliveredNothingRecoveryReopensConcern drives the #3395
+// concern half of the round closure across the real seams: a concern routed
+// by stable id through the real fishhawk-mcp binary sits addressed_pending
+// while the pass is live; the pass dies having pushed nothing; the recovery
+// (running in the /pull-request handler against real Postgres) rolls the row
+// back to `reopened` with a state_reason naming the recovery, and the gate
+// view lists it open with the fix-up's outcome `recovered`. Both the fix-up
+// serving server and the failure-reporting server carry the concern store,
+// following bulk_concern_settlement_test.go.
+func TestE2E_Fixup_DeliveredNothingRecoveryReopensConcern(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	concernRepo := concern.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signing.NewPostgresRepository(fx.pool),
+		ConcernRepo:  concernRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	if _, err := fx.runRepo.TransitionRun(ctx, fx.runID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun → running: %v", err)
+	}
+	impl, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: false,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(implement): %v", err)
+	}
+	walkToSucceeded(t, ctx, fx.runRepo, impl.ID)
+	review, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         2,
+		Type:             runpkg.StageTypeReview,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(review): %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, review.ID)
+
+	// A raised implement concern in the durable store, routed by stable id.
+	rows, err := concernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID:                fx.runID,
+		StageID:              impl.ID,
+		StageKind:            concern.StageKindImplement,
+		ReviewerModel:        "claude-opus-4-8",
+		OriginReviewSequence: 1,
+		Concerns:             []concern.RaisedConcern{{Severity: "high", Category: "correctness", Note: "nil deref on the empty path"}},
+	})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("InsertRaised: rows=%d err=%v", len(rows), err)
+	}
+	routed := rows[0]
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id":    impl.ID.String(),
+			"concern_ids": []string{routed.ID.String()},
+			"reason":      "address the nil deref",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+	}
+	if got, _ := concernRepo.GetByIDs(ctx, []uuid.UUID{routed.ID}); len(got) != 1 || got[0].State != concern.StateAddressedPending {
+		t.Fatalf("routed concern after fix-up = %+v, want addressed_pending", got)
+	}
+
+	shipPushFixupTraceViaBackend(t, ctx, fx, impl.ID)
+	failPushPRViaBackendWithConcerns(t, ctx, fx, impl.ID, concernRepo)
+
+	// The durable row rolled back to the open state `reopened`, naming why.
+	got, err := concernRepo.GetByIDs(ctx, []uuid.UUID{routed.ID})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("GetByIDs: rows=%d err=%v", len(got), err)
+	}
+	if got[0].State != concern.StateReopened {
+		t.Errorf("routed concern state = %q, want reopened", got[0].State)
+	}
+	if !strings.Contains(got[0].StateReason, "delivered nothing") {
+		t.Errorf("state_reason = %q, want it to name the delivered-nothing recovery", got[0].StateReason)
+	}
+
+	// The recovery entry names the reopened id.
+	recovered, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupRecovered)
+	if err != nil || len(recovered) != 1 {
+		t.Fatalf("stage_fixup_recovered entries = %d, err=%v, want 1", len(recovered), err)
+	}
+	var payload struct {
+		DeliveredNothing   *bool    `json:"delivered_nothing"`
+		ReopenedConcernIDs []string `json:"reopened_concern_ids"`
+		ConcernReopenError string   `json:"concern_reopen_error"`
+	}
+	if err := json.Unmarshal(recovered[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.DeliveredNothing == nil || !*payload.DeliveredNothing {
+		t.Errorf("delivered_nothing = %v, want true", payload.DeliveredNothing)
+	}
+	if len(payload.ReopenedConcernIDs) != 1 || payload.ReopenedConcernIDs[0] != routed.ID.String() {
+		t.Errorf("reopened_concern_ids = %v, want [%s]", payload.ReopenedConcernIDs, routed.ID)
+	}
+	if payload.ConcernReopenError != "" {
+		t.Errorf("concern_reopen_error = %q, want empty on a clean reopen", payload.ConcernReopenError)
+	}
+
+	// The gate view lists the concern OPEN with the fix-up's outcome recovered.
+	gvBody := getJSON(t, ctx, httpSrv.URL+"/v0/runs/"+fx.runID.String()+"/gate-view", fx.operatorTok)
+	var gv struct {
+		Open []struct {
+			ID     string `json:"id"`
+			State  string `json:"state"`
+			Fixups []struct {
+				Outcome string `json:"outcome"`
+			} `json:"fixups"`
+		} `json:"open"`
+	}
+	if err := json.Unmarshal(gvBody, &gv); err != nil {
+		t.Fatalf("decode gate-view body: %v\n%s", err, gvBody)
+	}
+	if len(gv.Open) != 1 || gv.Open[0].ID != routed.ID.String() {
+		t.Fatalf("gate-view open concerns = %+v, want the reopened concern:\n%s", gv.Open, gvBody)
+	}
+	if gv.Open[0].State != string(concern.StateReopened) {
+		t.Errorf("gate-view state = %q, want reopened", gv.Open[0].State)
+	}
+	if len(gv.Open[0].Fixups) != 1 || gv.Open[0].Fixups[0].Outcome != "recovered" {
+		t.Errorf("gate-view fixups = %+v, want one with outcome recovered:\n%s", gv.Open[0].Fixups, gvBody)
 	}
 }
 
@@ -1287,6 +1469,14 @@ func TestE2E_Fixup_FailedRedispatchRestoresReviewGate(t *testing.T) {
 // leg, where the old Advance completed the run with its review gate open.
 func failPushPRViaBackend(t *testing.T, ctx context.Context, fx *e2eFixture, stageID uuid.UUID) {
 	t.Helper()
+	failPushPRViaBackendWithConcerns(t, ctx, fx, stageID, nil)
+}
+
+// failPushPRViaBackendWithConcerns is failPushPRViaBackend with a concern
+// store wired (nil for none), so the #3395 recovery's concern reopen runs
+// against the real Postgres repository.
+func failPushPRViaBackendWithConcerns(t *testing.T, ctx context.Context, fx *e2eFixture, stageID uuid.UUID, concernRepo concern.Repository) {
+	t.Helper()
 	s := server.New(server.Config{
 		Addr:         "127.0.0.1:0",
 		RunRepo:      fx.runRepo,
@@ -1294,6 +1484,7 @@ func failPushPRViaBackend(t *testing.T, ctx context.Context, fx *e2eFixture, sta
 		AuditRepo:    audit.NewPostgresRepository(fx.pool),
 		ArtifactRepo: artifact.NewPostgresRepository(fx.pool),
 		Orchestrator: &orchestrator.Orchestrator{Runs: fx.runRepo},
+		ConcernRepo:  concernRepo,
 	})
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()

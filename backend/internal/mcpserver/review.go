@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -498,7 +500,7 @@ func (*runResolver) reviewStatusFallback(stage string, reviewed, skipped, failed
 }
 
 // latestImplementFixupSeq returns the MAX audit Sequence among the run's
-// stage_fixup_triggered entries (0 when none exist), the fix-up boundary
+// LIVE stage_fixup_triggered entries (0 when none exist), the fix-up boundary
 // reviewStatusFor floors the implement stage's terminal-verdict reads to
 // (#894). It is RUN-scoped, not stage-scoped, to match reviewStatusFor's
 // existing run-scoped audit reads (decodeReviewVerdicts filters by
@@ -506,6 +508,21 @@ func (*runResolver) reviewStatusFallback(stage string, reviewed, skipped, failed
 // implement stages is out of scope here and unchanged from today's
 // run-scoped behavior. Reuses categoryStageFixupTriggered from
 // review_action_hint.go.
+//
+// VOID RULE (#3395). A fix-up trigger writes no implement_review_started
+// entry — the round it opens is purely this floor — so a pass that then died
+// having pushed NOTHING would leave the prior round's real verdicts below the
+// floor and the status pending forever. The backend's recovery records that
+// case as a stage_fixup_recovered entry carrying delivered_nothing:true, and
+// such a trigger is VOID: it no longer floors, the prior round's verdicts
+// resurface, and the status reads complete again. The pairing is per
+// trigger window (the recovery must be sequenced after the trigger and
+// before the next one) and per stage. A legacy stage_fixup_recovered entry
+// without the delivered_nothing key never voids — runs recovered before
+// #3395 keep the pre-#3395 behaviour — and a recovery with
+// delivered_nothing:false (the pass pushed before it died) keeps its trigger
+// as the floor because the pushed head's re-review round governs. The rule
+// itself is the pure liveFixupFloor.
 func (r *runResolver) latestImplementFixupSeq(ctx context.Context, runID uuid.UUID) (int64, error) {
 	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: categoryStageFixupTriggered,
@@ -514,13 +531,92 @@ func (r *runResolver) latestImplementFixupSeq(ctx context.Context, runID uuid.UU
 	if err != nil {
 		return 0, err
 	}
-	var latestSeq int64
+	triggers := make([]floorEntry, 0, len(entries))
 	for _, e := range entries {
-		if e.Sequence > latestSeq {
-			latestSeq = e.Sequence
+		triggers = append(triggers, floorEntry{Sequence: e.Sequence, StageID: derefString(e.StageID)})
+	}
+	if len(triggers) == 0 {
+		return 0, nil
+	}
+	// The recovery read is BEST-EFFORT, unlike the trigger read: a failure
+	// falls back to the un-voided floor (every trigger live), which is the
+	// pre-#3395 answer — `pending` — never a false `complete`. Failing the
+	// whole status derivation here would turn an advisory read into a hard
+	// dependency for every fishhawk_get_run_status snapshot.
+	recEntries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: categoryStageFixupRecovered,
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return liveFixupFloor(triggers, nil), nil
+	}
+	recoveries := make([]floorEntry, 0, len(recEntries))
+	for _, e := range recEntries {
+		fe := floorEntry{Sequence: e.Sequence, StageID: derefString(e.StageID)}
+		// Marshal-then-unmarshal, the fixupRecoveryFor idiom: the client
+		// decodes Payload as a generic any. An undecodable payload or an
+		// absent key leaves DeliveredNothing false — a legacy entry never voids.
+		if raw, merr := json.Marshal(e.Payload); merr == nil {
+			var p struct {
+				DeliveredNothing bool `json:"delivered_nothing"`
+			}
+			if json.Unmarshal(raw, &p) == nil {
+				fe.DeliveredNothing = p.DeliveredNothing
+			}
+		}
+		recoveries = append(recoveries, fe)
+	}
+	return liveFixupFloor(triggers, recoveries), nil
+}
+
+// floorEntry is one stage_fixup_triggered or stage_fixup_recovered audit
+// entry reduced to what liveFixupFloor needs.
+type floorEntry struct {
+	Sequence         int64
+	StageID          string
+	DeliveredNothing bool
+}
+
+// liveFixupFloor is the pure #3395 void rule behind latestImplementFixupSeq:
+// with triggers sorted ascending, trigger T[i] is VOID iff some recovery R
+// has T[i].Sequence < R.Sequence < T[i+1].Sequence (open-ended for the
+// newest trigger), R.DeliveredNothing is true, and the stage ids match (an
+// empty id on either side matches — a backend that does not stamp stage_id
+// on one category must not silently disable the rule). It returns the max
+// Sequence among the NON-void triggers, 0 when none.
+func liveFixupFloor(triggers []floorEntry, recoveries []floorEntry) int64 {
+	sorted := make([]floorEntry, len(triggers))
+	copy(sorted, triggers)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Sequence < sorted[j].Sequence })
+	var floor int64
+	for i, t := range sorted {
+		hi := int64(math.MaxInt64)
+		if i+1 < len(sorted) {
+			hi = sorted[i+1].Sequence
+		}
+		void := false
+		for _, rec := range recoveries {
+			if !rec.DeliveredNothing || rec.Sequence <= t.Sequence || rec.Sequence >= hi {
+				continue
+			}
+			if rec.StageID != "" && t.StageID != "" && rec.StageID != t.StageID {
+				continue
+			}
+			void = true
+			break
+		}
+		if !void && t.Sequence > floor {
+			floor = t.Sequence
 		}
 	}
-	return latestSeq, nil
+	return floor
+}
+
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // latestPlanRevisedSeq returns the MAX audit Sequence among the run's
@@ -730,8 +826,9 @@ func reviewerLabel(p PlanReview) string {
 //	(5) the started entry's timestamp is BEFORE that boot instant.
 //
 // (4) failing is UNDECIDABLE — the wait continues unchanged. (5) failing is a
-// positive NOT-stranded: the reviewers were dispatched by the daemon serving
-// this request, so they are genuinely still running.
+// positive NOT-stranded: the round's dispatch postdates the serving daemon's
+// boot, so a restart did not orphan it — a timestamp ordering, not observed
+// reviewer liveness (#3395).
 func (r *runResolver) reviewRoundStrand(ctx context.Context, runID uuid.UUID, stage string, boundary healthBoundary) (*reviewStrand, error) {
 	round, err := r.loadReviewRound(ctx, runID, stage)
 	if err != nil {
@@ -772,7 +869,7 @@ func reviewRoundStrandFrom(round reviewRound, boundary healthBoundary) *reviewSt
 	}
 	out.DaemonProcessStart = boundary.ProcessStart
 	if !started.Timestamp.Before(boundary.ProcessStart) {
-		out.Reason = "the review was dispatched by the fishhawkd process now serving this request, so its reviewers are still running"
+		out.Reason = "the round's latest dispatch postdates the serving fishhawkd's boot, so a restart did not orphan it (a timestamp ordering, not observed reviewer liveness)"
 		return out
 	}
 	out.Stranded = true
@@ -1322,8 +1419,10 @@ func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start t
 	// the legacy-round edge. DaemonProcessStart is set ONLY after boundary.OK,
 	// so a non-zero value IS the proof the comparison happened.
 	if strand != nil && !strand.Stranded && !strand.Undecidable && !strand.DaemonProcessStart.IsZero() {
-		verified = "verified: the round was dispatched by the fishhawkd process currently serving, so its reviewer(s) are " +
-			"still running rather than orphaned by a restart"
+		verified = "verified only that the round's dispatch postdates the serving fishhawkd's boot, so it was NOT orphaned " +
+			"by a restart — a timestamp ordering, not observed reviewer liveness; if this round was opened by a fix-up " +
+			"re-park whose pass then died without pushing, fishhawk_get_run_status carries a fixup_recovery marker for " +
+			"the implement stage"
 	}
 	out.Message = fmt.Sprintf("%s review still pending after %ds — the review is still running (%s). The wait holds "+
 		"nothing: re-call fishhawk_await_review to resume it, or poll fishhawk_get_run_status every %ds (the "+

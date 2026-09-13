@@ -155,13 +155,17 @@ type gateViewDispute struct {
 
 // gateViewFixup is one fix-up routing claim reconstructed from the
 // stage_fixup_triggered audit entry that named this concern, joined to the
-// outcome from the earliest following fixup_pushed / fixup_no_changes entry.
+// outcome from the earliest following fixup_pushed / fixup_no_changes /
+// stage_fixup_recovered entry.
 type gateViewFixup struct {
 	Sequence int64  `json:"sequence"`
 	Reason   string `json:"reason,omitempty"`
 	// Outcome is "pushed" (a fix-up commit landed), "no_changes" (the pass
-	// produced nothing), or "pending" (the trigger has no following outcome
-	// entry yet).
+	// produced nothing), "recovered" (#3395: the pass FAILED and the stage was
+	// restored to its pre-fix-up gate — delivered-nothing when the audit entry
+	// carries delivered_nothing:true; a pushed-then-recovered pass still reads
+	// pushed because the earliest following outcome wins), or "pending" (the
+	// trigger has no following outcome entry yet).
 	Outcome   string `json:"outcome"`
 	ApplyPath string `json:"apply_path,omitempty"`
 	HeadSHA   string `json:"head_sha,omitempty"`
@@ -244,6 +248,7 @@ var gateViewHistoryCategories = []string{
 	CategoryStageFixupTriggered,
 	"fixup_pushed",
 	"fixup_no_changes",
+	CategoryStageFixupRecovered,
 	"implement_reviewed",
 	"plan_reviewed",
 	concernRelitigationSuppressedCategory,
@@ -461,7 +466,7 @@ type gateViewTrigger struct {
 type gateViewOutcome struct {
 	sequence  int64
 	stageID   *uuid.UUID
-	outcome   string // "pushed" | "no_changes"
+	outcome   string // "pushed" | "no_changes" | "recovered"
 	applyPath string
 	headSHA   string
 }
@@ -534,6 +539,17 @@ func (s *Server) loadGateViewHistory(ctx context.Context, runID uuid.UUID, resp 
 				headSHA:   p.HeadSHA,
 			})
 		}
+	}
+	// #3395: a recovered (failed, restored) pass is a third outcome. Only the
+	// entry's own sequence/stage are read — nothing is decoded from the
+	// payload — so a malformed payload cannot drop a recovered pass back to
+	// "pending" forever.
+	for _, e := range byCategory[CategoryStageFixupRecovered] {
+		h.outcomes = append(h.outcomes, gateViewOutcome{
+			sequence: e.Sequence,
+			stageID:  e.StageID,
+			outcome:  "recovered",
+		})
 	}
 	for _, cat := range []string{"implement_reviewed", "plan_reviewed"} {
 		implement := cat == "implement_reviewed"

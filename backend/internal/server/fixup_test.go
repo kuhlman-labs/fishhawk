@@ -2010,6 +2010,271 @@ func TestMaybeRecoverFixupFailure_RecoversAndEmits(t *testing.T) {
 	if payload["restored_review_stage_id"] != review.ID.String() {
 		t.Errorf("restored_review_stage_id = %v, want %s", payload["restored_review_stage_id"], review.ID)
 	}
+	// #3395: no fixup_pushed entry was seeded, so the recovery verified the
+	// pass delivered nothing and closed the round it opened.
+	if payload["delivered_nothing"] != true {
+		t.Errorf("delivered_nothing = %v, want true (no fixup_pushed after the trigger)", payload["delivered_nothing"])
+	}
+}
+
+// --- #3395 delivered-nothing round closure ---
+
+// seedFixupTriggeredWithConcernsSeq seeds a stage_fixup_triggered entry at
+// an explicit Sequence carrying the routed concern_ids and pass_ordinal the
+// #3395 recovery reads to close the round. Uses the plain auditFake so
+// sibling fixup_pushed entries can be sequenced relative to it.
+func seedFixupTriggeredWithConcernsSeq(au *auditFake, runID, stageID uuid.UUID, seq int64, priorState run.StageState, reviewID *uuid.UUID, concernIDs []string) {
+	fields := map[string]any{
+		"stage_id":     stageID.String(),
+		"prior_state":  string(priorState),
+		"concern_ids":  concernIDs,
+		"pass_ordinal": 2,
+	}
+	if reviewID != nil {
+		fields["reparked_review_stage_id"] = reviewID.String()
+	}
+	payload, _ := json.Marshal(fields)
+	rid := runID
+	sid := stageID
+	au.mu.Lock()
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: CategoryStageFixupTriggered, Sequence: seq, Payload: payload})
+	au.mu.Unlock()
+}
+
+// seedAddressedPendingConcern inserts a concern row for the run and moves it
+// to addressed_pending — the state a routed concern sits in while a fix-up
+// pass is live.
+func seedAddressedPendingConcern(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID) *concern.Concern {
+	t.Helper()
+	row := seedConcernRow(t, cr, runID, stageID, "implement", 1, "routed concern")
+	if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{row.ID}, "routed"); err != nil {
+		t.Fatalf("MarkAddressedPending: %v", err)
+	}
+	return row
+}
+
+// recoveredPayload returns the single stage_fixup_recovered payload for the run.
+func recoveredPayload(t *testing.T, au *auditFake, runID uuid.UUID) map[string]any {
+	t.Helper()
+	entries, err := au.ListForRunByCategory(context.Background(), runID, CategoryStageFixupRecovered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("stage_fixup_recovered entries = %d, want 1", len(entries))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	return payload
+}
+
+func TestMaybeRecoverFixupFailure_DeliveredNothing_ReopensRoutedConcerns(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ConcernRepo: cr})
+	ctx := context.Background()
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	routed := seedAddressedPendingConcern(t, cr, runRow.ID, impl.ID)
+	// A sibling routed concern the operator waived DURING the pass must stay
+	// waived: only addressed_pending rows roll back.
+	waived := seedAddressedPendingConcern(t, cr, runRow.ID, impl.ID)
+	if _, err := cr.ApplyResolution(ctx, waived.ID, concern.StateWaived, "operator waived"); err != nil {
+		t.Fatalf("waive sibling: %v", err)
+	}
+	seedFixupTriggeredWithConcernsSeq(au, runRow.ID, impl.ID, 10, run.StageStateSucceeded, &review.ID,
+		[]string{routed.ID.String(), waived.ID.String()})
+
+	if !s.maybeRecoverFixupFailure(ctx, runRow.ID, impl.ID) {
+		t.Fatal("maybeRecoverFixupFailure = false, want true")
+	}
+
+	rows, _ := cr.GetByIDs(ctx, []uuid.UUID{routed.ID, waived.ID})
+	if rows[0].State != concern.StateReopened {
+		t.Errorf("routed concern state = %q, want reopened", rows[0].State)
+	}
+	if !strings.Contains(rows[0].StateReason, "delivered nothing") || !strings.Contains(rows[0].StateReason, "pass 2") {
+		t.Errorf("routed concern state_reason = %q, want it to name the delivered-nothing recovery and the pass", rows[0].StateReason)
+	}
+	if rows[1].State != concern.StateWaived {
+		t.Errorf("waived sibling state = %q, want waived (untouched)", rows[1].State)
+	}
+
+	payload := recoveredPayload(t, au, runRow.ID)
+	if payload["delivered_nothing"] != true {
+		t.Errorf("delivered_nothing = %v, want true", payload["delivered_nothing"])
+	}
+	ids, _ := payload["reopened_concern_ids"].([]any)
+	if len(ids) != 1 || ids[0] != routed.ID.String() {
+		t.Errorf("reopened_concern_ids = %v, want [%s]", payload["reopened_concern_ids"], routed.ID)
+	}
+	if _, ok := payload["concern_reopen_error"]; ok {
+		t.Errorf("concern_reopen_error present = %v, want absent on a clean reopen", payload["concern_reopen_error"])
+	}
+}
+
+func TestMaybeRecoverFixupFailure_PushedPass_KeepsConcernsAddressedPending(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ConcernRepo: cr})
+	ctx := context.Background()
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	routed := seedAddressedPendingConcern(t, cr, runRow.ID, impl.ID)
+	seedFixupTriggeredWithConcernsSeq(au, runRow.ID, impl.ID, 10, run.StageStateSucceeded, &review.ID, []string{routed.ID.String()})
+	// The pass pushed a commit before it died: the push is sequenced AFTER
+	// the trigger, so the pushed head's re-review round governs.
+	seedFixupPushedSeq(au, runRow.ID, impl.ID, 11)
+
+	if !s.maybeRecoverFixupFailure(ctx, runRow.ID, impl.ID) {
+		t.Fatal("maybeRecoverFixupFailure = false, want true")
+	}
+	rows, _ := cr.GetByIDs(ctx, []uuid.UUID{routed.ID})
+	if rows[0].State != concern.StateAddressedPending {
+		t.Errorf("routed concern state = %q, want addressed_pending (the pass pushed)", rows[0].State)
+	}
+	payload := recoveredPayload(t, au, runRow.ID)
+	if payload["delivered_nothing"] != false {
+		t.Errorf("delivered_nothing = %v, want false", payload["delivered_nothing"])
+	}
+	if _, ok := payload["reopened_concern_ids"]; ok {
+		t.Errorf("reopened_concern_ids present = %v, want absent", payload["reopened_concern_ids"])
+	}
+}
+
+func TestMaybeRecoverFixupFailure_PushBeforeTriggerStillDeliveredNothing(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	ctx := context.Background()
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	// An EARLIER pass's push (sequenced before this trigger) is not this
+	// pass's delivery — the window is per-trigger, as in fixupRefundedPasses.
+	seedFixupPushedSeq(au, runRow.ID, impl.ID, 5)
+	seedFixupTriggeredWithConcernsSeq(au, runRow.ID, impl.ID, 10, run.StageStateSucceeded, &review.ID, nil)
+
+	if !s.maybeRecoverFixupFailure(ctx, runRow.ID, impl.ID) {
+		t.Fatal("maybeRecoverFixupFailure = false, want true")
+	}
+	if payload := recoveredPayload(t, au, runRow.ID); payload["delivered_nothing"] != true {
+		t.Errorf("delivered_nothing = %v, want true (the only push predates this trigger)", payload["delivered_nothing"])
+	}
+}
+
+func TestMaybeRecoverFixupFailure_PushedReadError_OmitsDeliveredNothing(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newAuditFake()
+	au.listByCategoryErrCategory = CategoryFixupPushed
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ConcernRepo: cr})
+	ctx := context.Background()
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	routed := seedAddressedPendingConcern(t, cr, runRow.ID, impl.ID)
+	seedFixupTriggeredWithConcernsSeq(au, runRow.ID, impl.ID, 10, run.StageStateSucceeded, &review.ID, []string{routed.ID.String()})
+
+	if !s.maybeRecoverFixupFailure(ctx, runRow.ID, impl.ID) {
+		t.Fatal("maybeRecoverFixupFailure = false, want true (the restore landed; the closure read is best-effort)")
+	}
+	rows, _ := cr.GetByIDs(ctx, []uuid.UUID{routed.ID})
+	if rows[0].State != concern.StateAddressedPending {
+		t.Errorf("routed concern state = %q, want addressed_pending (undecided → untouched)", rows[0].State)
+	}
+	payload := recoveredPayload(t, au, runRow.ID)
+	if _, ok := payload["delivered_nothing"]; ok {
+		t.Errorf("delivered_nothing present = %v, want absent when the fixup_pushed read failed", payload["delivered_nothing"])
+	}
+	if _, ok := payload["reopened_concern_ids"]; ok {
+		t.Errorf("reopened_concern_ids present = %v, want absent", payload["reopened_concern_ids"])
+	}
+}
+
+func TestMaybeRecoverFixupFailure_NilConcernRepo_StillStampsDeliveredNothing(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	ctx := context.Background()
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	seedFixupTriggeredWithConcernsSeq(au, runRow.ID, impl.ID, 10, run.StageStateSucceeded, &review.ID, []string{uuid.New().String()})
+
+	if !s.maybeRecoverFixupFailure(ctx, runRow.ID, impl.ID) {
+		t.Fatal("maybeRecoverFixupFailure = false, want true")
+	}
+	payload := recoveredPayload(t, au, runRow.ID)
+	if payload["delivered_nothing"] != true {
+		t.Errorf("delivered_nothing = %v, want true", payload["delivered_nothing"])
+	}
+	if _, ok := payload["reopened_concern_ids"]; ok {
+		t.Errorf("reopened_concern_ids present = %v, want absent", payload["reopened_concern_ids"])
+	}
+	// The reopen could not be ATTEMPTED — the payload says so, naming why,
+	// so a reader never mistakes the empty id list for a clean ledger.
+	reopenErr, _ := payload["concern_reopen_error"].(string)
+	if !strings.Contains(reopenErr, "no concern repository configured") {
+		t.Errorf("concern_reopen_error = %q, want it to name the missing concern repository", reopenErr)
+	}
+}
+
+func TestMaybeRecoverFixupFailure_ApplyResolutionError_ContinuesBestEffort(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	cr.applyResolutionErr = errors.New("concern store: connection reset")
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ConcernRepo: cr})
+	ctx := context.Background()
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	routed := seedAddressedPendingConcern(t, cr, runRow.ID, impl.ID)
+	seedFixupTriggeredWithConcernsSeq(au, runRow.ID, impl.ID, 10, run.StageStateSucceeded, &review.ID, []string{routed.ID.String()})
+
+	if !s.maybeRecoverFixupFailure(ctx, runRow.ID, impl.ID) {
+		t.Fatal("maybeRecoverFixupFailure = false, want true (recovery is never unwound by a concern failure)")
+	}
+	rows, _ := cr.GetByIDs(ctx, []uuid.UUID{routed.ID})
+	if rows[0].State != concern.StateAddressedPending {
+		t.Errorf("routed concern state = %q, want addressed_pending (transition failed)", rows[0].State)
+	}
+	payload := recoveredPayload(t, au, runRow.ID)
+	if payload["delivered_nothing"] != true {
+		t.Errorf("delivered_nothing = %v, want true", payload["delivered_nothing"])
+	}
+	if _, ok := payload["reopened_concern_ids"]; ok {
+		t.Errorf("reopened_concern_ids present = %v, want absent (nothing transitioned)", payload["reopened_concern_ids"])
+	}
+	reopenErr, _ := payload["concern_reopen_error"].(string)
+	if !strings.Contains(reopenErr, routed.ID.String()) || !strings.Contains(reopenErr, "connection reset") {
+		t.Errorf("concern_reopen_error = %q, want it to name the concern and the store error", reopenErr)
+	}
+}
+
+func TestMaybeRecoverFixupFailure_NoRoutedConcerns_NoReopenError(t *testing.T) {
+	rr := &fixupRecoveryRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	ctx := context.Background()
+
+	runRow, impl, review := seedFailedFixupRun(rr)
+	// No concern_ids on the trigger and no concern repo: nothing to reopen,
+	// which is a CLEAN outcome, not a failure to attempt.
+	seedFixupTriggeredWithConcernsSeq(au, runRow.ID, impl.ID, 10, run.StageStateSucceeded, &review.ID, nil)
+
+	if !s.maybeRecoverFixupFailure(ctx, runRow.ID, impl.ID) {
+		t.Fatal("maybeRecoverFixupFailure = false, want true")
+	}
+	payload := recoveredPayload(t, au, runRow.ID)
+	if payload["delivered_nothing"] != true {
+		t.Errorf("delivered_nothing = %v, want true", payload["delivered_nothing"])
+	}
+	if _, ok := payload["concern_reopen_error"]; ok {
+		t.Errorf("concern_reopen_error present = %v, want absent (no routed concerns)", payload["concern_reopen_error"])
+	}
 }
 
 func TestMaybeRecoverFixupFailure_NoPriorEntryReturnsFalse(t *testing.T) {
@@ -2179,6 +2444,9 @@ type fakeConcernRepo struct {
 	insertErr   error
 	listErr     error
 	getByIDsErr error
+	// applyResolutionErr, when set, makes ApplyResolution fail without
+	// transitioning — the #3395 recovery's per-row best-effort branch.
+	applyResolutionErr error
 }
 
 func newFakeConcernRepo() *fakeConcernRepo { return &fakeConcernRepo{} }
@@ -2291,6 +2559,9 @@ func (f *fakeConcernRepo) MarkAddressedPending(ctx context.Context, ids []uuid.U
 }
 
 func (f *fakeConcernRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to concern.State, reason string) (*concern.Concern, error) {
+	if f.applyResolutionErr != nil {
+		return nil, f.applyResolutionErr
+	}
 	rows, err := f.GetByIDs(ctx, []uuid.UUID{id})
 	if err != nil {
 		return nil, err

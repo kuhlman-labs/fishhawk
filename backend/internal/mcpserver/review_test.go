@@ -1407,6 +1407,228 @@ func seedRunFixupTriggeredAudit(fb *fakeBackend, runID uuid.UUID) {
 	fb.mu.Unlock()
 }
 
+// seedRunFixupRecoveredAudit mirrors seedRunFixupTriggeredAudit for the
+// stage_fixup_recovered category (#3395): deliveredNothing nil seeds a LEGACY
+// payload without the delivered_nothing key; non-nil stamps the key.
+func seedRunFixupRecoveredAudit(fb *fakeBackend, runID uuid.UUID, stageID string, deliveredNothing *bool) {
+	payload := map[string]any{"restored_state": "succeeded"}
+	if deliveredNothing != nil {
+		payload["delivered_nothing"] = *deliveredNothing
+	}
+	var sid *string
+	if stageID != "" {
+		sid = &stageID
+	}
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		StageID:  sid,
+		Category: categoryStageFixupRecovered,
+		Payload:  payload,
+	})
+	fb.mu.Unlock()
+}
+
+// --- #3395 live fix-up floor ---
+
+func TestLiveFixupFloor(t *testing.T) {
+	tr := func(seq int64, stage string) floorEntry { return floorEntry{Sequence: seq, StageID: stage} }
+	rec := func(seq int64, stage string, dn bool) floorEntry {
+		return floorEntry{Sequence: seq, StageID: stage, DeliveredNothing: dn}
+	}
+	cases := []struct {
+		name       string
+		triggers   []floorEntry
+		recoveries []floorEntry
+		want       int64
+	}{
+		{"no triggers", nil, []floorEntry{rec(5, "s", true)}, 0},
+		{"one trigger, no recovery", []floorEntry{tr(10, "s")}, nil, 10},
+		{"trigger voided by delivered-nothing recovery", []floorEntry{tr(10, "s")}, []floorEntry{rec(11, "s", true)}, 0},
+		{"recovery with delivered_nothing:false keeps the floor", []floorEntry{tr(10, "s")}, []floorEntry{rec(11, "s", false)}, 10},
+		// A legacy entry decodes to DeliveredNothing=false — same row as above,
+		// stated separately so the legacy pin survives a change to the false case.
+		{"legacy recovery lacking the key keeps the floor", []floorEntry{tr(10, "s")}, []floorEntry{rec(11, "s", false)}, 10},
+		{"two triggers, only the newest voided → the older floors", []floorEntry{tr(10, "s"), tr(20, "s")}, []floorEntry{rec(21, "s", true)}, 10},
+		{"two triggers both voided", []floorEntry{tr(10, "s"), tr(20, "s")}, []floorEntry{rec(11, "s", true), rec(21, "s", true)}, 0},
+		{"recovery after the NEXT trigger does not void the earlier one", []floorEntry{tr(10, "s"), tr(20, "s")}, []floorEntry{rec(21, "s", true)}, 10},
+		{"recovery before its trigger does not void", []floorEntry{tr(10, "s")}, []floorEntry{rec(9, "s", true)}, 10},
+		{"stage-id mismatch does not void", []floorEntry{tr(10, "s")}, []floorEntry{rec(11, "other", true)}, 10},
+		{"empty stage id on the recovery matches", []floorEntry{tr(10, "s")}, []floorEntry{rec(11, "", true)}, 0},
+		{"unsorted triggers are sorted before pairing", []floorEntry{tr(20, "s"), tr(10, "s")}, []floorEntry{rec(11, "s", true)}, 20},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := liveFixupFloor(tc.triggers, tc.recoveries); got != tc.want {
+				t.Errorf("liveFixupFloor = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReviewStatusFor_Implement_CompleteAfterDeliveredNothingRecovery is the
+// #3395 shape: round 1 landed every configured verdict, a fix-up was triggered
+// (opening a round that is purely a floor), and the pass died having pushed
+// nothing. The backend's recovery stamps delivered_nothing:true, which VOIDS
+// the trigger as the floor — the round-1 verdicts resurface and the status
+// reads complete. Before the fix it read pending with reviews:[] forever.
+func TestReviewStatusFor_Implement_CompleteAfterDeliveredNothingRecovery(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 2, "advisory")
+	seedImplementReviewAudit(fb, runID, withConcerns(2))
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	seedRunFixupTriggeredAudit(fb, runID)
+	dn := true
+	seedRunFixupRecoveredAudit(fb, runID, "", &dn)
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Errorf("Status = %q, want complete (the delivered-nothing recovery voids the trigger floor)", st.Status)
+	}
+	if len(st.Reviews) != 2 {
+		t.Errorf("Reviews = %d rows, want the 2 round-1 verdicts to resurface", len(st.Reviews))
+	}
+}
+
+// TestReviewStatusFor_Implement_RecoveredReadErrorFallsBackToPending pins
+// the best-effort recovery read: when ONLY the stage_fixup_recovered read
+// fails, the status derivation does not error — it falls back to the
+// un-voided floor and reads pending (the pre-#3395 answer), never a false
+// complete. The trigger read stays fail-closed as before.
+func TestReviewStatusFor_Implement_RecoveredReadErrorFallsBackToPending(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "advisory")
+	seedImplementReviewAudit(fb, runID, withConcerns(2))
+	seedRunFixupTriggeredAudit(fb, runID)
+	dn := true
+	seedRunFixupRecoveredAudit(fb, runID, "", &dn)
+	fb.reviewFlip = func(category string) {
+		if category == categoryStageFixupRecovered {
+			fb.perRunAuditStatus = http.StatusInternalServerError
+			return
+		}
+		fb.perRunAuditStatus = http.StatusOK
+	}
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor errored on a failing stage_fixup_recovered read: %v (the recovery read must be best-effort)", err)
+	}
+	if st.Status != "pending" {
+		t.Errorf("Status = %q, want pending (fall back to the un-voided floor, never a false complete)", st.Status)
+	}
+}
+
+// TestReviewStatusFor_Implement_LegacyRecoveryStaysPending pins that a
+// stage_fixup_recovered entry WITHOUT the delivered_nothing key (pre-#3395)
+// does not void the trigger: runs recovered before this change keep the
+// pre-#3395 behaviour.
+func TestReviewStatusFor_Implement_LegacyRecoveryStaysPending(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "advisory")
+	seedImplementReviewAudit(fb, runID, withConcerns(2))
+	seedRunFixupTriggeredAudit(fb, runID)
+	seedRunFixupRecoveredAudit(fb, runID, "", nil)
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "pending" {
+		t.Errorf("Status = %q, want pending (a legacy recovery without delivered_nothing never voids)", st.Status)
+	}
+}
+
+// TestAwaitReview_ResolvesAfterDeliveredNothingRecovery drives the same seed
+// through the await loop: it must return complete without waiting.
+func TestAwaitReview_ResolvesAfterDeliveredNothingRecovery(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "advisory")
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	seedRunFixupTriggeredAudit(fb, runID)
+	dn := true
+	seedRunFixupRecoveredAudit(fb, runID, "", &dn)
+	r := newResolver(srv, nil)
+
+	_, out, err := r.awaitReview(context.Background(), nil, AwaitReviewInput{RunID: runID.String(), Stage: "implement", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "complete" {
+		t.Errorf("Status = %q, want complete without waiting", out.Status)
+	}
+	if len(out.Reviews) != 1 {
+		t.Errorf("Reviews = %d, want 1", len(out.Reviews))
+	}
+}
+
+// TestReviewRoundStrandFrom_NotStrandedReasonIsTimestampOrdering pins that the
+// positive not-stranded reason states what was VERIFIED (a dispatch-after-boot
+// timestamp ordering) and no longer infers reviewer liveness from it (#3395).
+func TestReviewRoundStrandFrom_NotStrandedReasonIsTimestampOrdering(t *testing.T) {
+	boot := time.Now().Add(-time.Hour)
+	out := reviewRoundStrandFrom(reviewRound{
+		Started: startedRound{Exists: true, ConfiguredAgents: 2, Timestamp: boot.Add(time.Minute)},
+	}, healthBoundary{OK: true, ProcessStart: boot})
+	if out.Stranded || out.Undecidable {
+		t.Fatalf("strand = %+v, want a positive not-stranded verdict", out)
+	}
+	if strings.Contains(out.Reason, "still running") {
+		t.Errorf("reason infers liveness it never observed: %q", out.Reason)
+	}
+	for _, want := range []string{"postdates", "timestamp ordering", "not observed reviewer liveness"} {
+		if !strings.Contains(out.Reason, want) {
+			t.Errorf("reason missing %q: %q", want, out.Reason)
+		}
+	}
+}
+
+// TestAwaitPendingTimeoutOutput_VerifiedWordingNamesTimestampOrdering pins the
+// exact claim the verified timeout branch makes (#3395, binding condition 2):
+// what was checked was a dispatch timestamp ordering against the daemon's
+// boot, not reviewer liveness, and the message points at the fixup_recovery
+// marker for the fix-up-opened-round case. Acceptance cannot drive this
+// wording (it needs a reviewer round that times out), so this unit pin is the
+// control.
+func TestAwaitPendingTimeoutOutput_VerifiedWordingNamesTimestampOrdering(t *testing.T) {
+	r := &runResolver{}
+	start := time.Now()
+	out := r.awaitPendingTimeoutOutput("implement", 360, start, false, false, 600, &reviewStrand{
+		LandedTerminal: 0, ConfiguredAgents: 2,
+		StartedAt:          start.Add(-10 * time.Minute),
+		DaemonProcessStart: start.Add(-30 * time.Minute),
+	})
+	for _, forbidden := range []string{"reviewer(s) are still running", "reviewers are still running", "genuinely still running"} {
+		if strings.Contains(out.Message, forbidden) {
+			t.Errorf("verified timeout message still asserts unobserved liveness %q: %q", forbidden, out.Message)
+		}
+	}
+	const wantExact = "verified only that the round's dispatch postdates the serving fishhawkd's boot, so it was NOT orphaned " +
+		"by a restart — a timestamp ordering, not observed reviewer liveness; if this round was opened by a fix-up " +
+		"re-park whose pass then died without pushing, fishhawk_get_run_status carries a fixup_recovery marker for " +
+		"the implement stage"
+	if !strings.Contains(out.Message, wantExact) {
+		t.Errorf("verified timeout message does not carry the exact bounded claim\nwant substring: %q\ngot: %q", wantExact, out.Message)
+	}
+	for _, want := range []string{"timestamp ordering", "fixup_recovery"} {
+		if !strings.Contains(out.Message, want) {
+			t.Errorf("verified timeout message missing %q: %q", want, out.Message)
+		}
+	}
+}
+
 // --- fix-up-boundary flooring (#894) ---
 
 // TestReviewStatusFor_Implement_PendingAfterFixup is the #894 regression:

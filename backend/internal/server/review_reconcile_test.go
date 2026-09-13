@@ -626,6 +626,9 @@ func TestReconcileStageOrphanedReviews_SkipReasons(t *testing.T) {
 		name       string
 		seed       func(t *testing.T, au *auditFake, runID, stageID uuid.UUID)
 		wantReason string
+		// wantLanded is the LandedBefore the skip must report (#3395: real on
+		// every skip past the anchor checks, no longer 0 on an in-flight skip).
+		wantLanded int
 	}{
 		{
 			name:       "no started entry",
@@ -657,6 +660,36 @@ func TestReconcileStageOrphanedReviews_SkipReasons(t *testing.T) {
 					map[string]any{"verdict": "approve"})
 			},
 			wantReason: reconcileSkipAlreadySettled,
+			wantLanded: 1,
+		},
+		{
+			// #3395: a settled round dispatched AFTER boot reports
+			// round_already_settled — the count runs before the boot gate, so
+			// settled takes precedence over in-flight.
+			name: "settled round dispatched after boot",
+			seed: func(t *testing.T, au *auditFake, runID, stageID uuid.UUID) {
+				seedReviewAuditEntry(t, au, runID, stageID, 1, afterBoot, "plan_review_started",
+					planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+				seedReviewAuditEntry(t, au, runID, stageID, 2, afterBoot, "plan_reviewed",
+					map[string]any{"verdict": "approve"})
+				seedReviewAuditEntry(t, au, runID, stageID, 3, afterBoot, "plan_reviewed",
+					map[string]any{"verdict": "approve"})
+			},
+			wantReason: reconcileSkipAlreadySettled,
+			wantLanded: 2,
+		},
+		{
+			// #3395: an in-flight round with a shortfall still skips as
+			// in-flight, but landed_before is now the REAL count (was 0).
+			name: "in-flight round dispatched after boot with one landed",
+			seed: func(t *testing.T, au *auditFake, runID, stageID uuid.UUID) {
+				seedReviewAuditEntry(t, au, runID, stageID, 1, afterBoot, "plan_review_started",
+					planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+				seedReviewAuditEntry(t, au, runID, stageID, 2, afterBoot, "plan_reviewed",
+					map[string]any{"verdict": "approve"})
+			},
+			wantReason: reconcileSkipInFlight,
+			wantLanded: 1,
 		},
 	}
 	for _, tc := range cases {
@@ -674,6 +707,9 @@ func TestReconcileStageOrphanedReviews_SkipReasons(t *testing.T) {
 			}
 			if !got.Skipped || got.SkipReason != tc.wantReason {
 				t.Fatalf("skip = (%v, %q), want (true, %q)", got.Skipped, got.SkipReason, tc.wantReason)
+			}
+			if got.LandedBefore != tc.wantLanded {
+				t.Fatalf("landed_before = %d, want %d", got.LandedBefore, tc.wantLanded)
 			}
 		})
 	}

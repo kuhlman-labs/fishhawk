@@ -1621,8 +1621,10 @@ func (s *Server) maybeRecoverFixupFailure(ctx context.Context, runID, stageID uu
 	}
 
 	var payload struct {
-		PriorState            string `json:"prior_state"`
-		ReparkedReviewStageID string `json:"reparked_review_stage_id"`
+		PriorState            string   `json:"prior_state"`
+		ReparkedReviewStageID string   `json:"reparked_review_stage_id"`
+		ConcernIDs            []string `json:"concern_ids"`
+		PassOrdinal           int      `json:"pass_ordinal"`
 	}
 	if err := json.Unmarshal(triggered.Payload, &payload); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -1663,20 +1665,179 @@ func (s *Server) maybeRecoverFixupFailure(ctx context.Context, runID, stageID uu
 		return false
 	}
 
-	s.writeFixupRecoveredAudit(ctx, runID, recovery)
+	// #3395: close the round the fix-up opened. A fix-up trigger writes no
+	// implement_review_started entry — the "round" it opens is purely the
+	// floor the MCP status derivation applies at the trigger's sequence — so a
+	// pass that pushed NOTHING leaves the prior round's verdicts below that
+	// floor and the status pending forever, while its routed concerns sit in
+	// addressed_pending looking addressed. The recovery already knows the
+	// pass delivered nothing (the same fixup_pushed veto fixupRefundedPasses
+	// applies) and already restores two states; the orphaned round is the
+	// third. It stamps delivered_nothing on the recovery entry (the MCP floor
+	// reads it to void the trigger) and rolls the routed concerns back to the
+	// open state `reopened`. Every step is best-effort and runs AFTER the
+	// restore committed, so the return value is unchanged: true iff the
+	// restore landed.
+	closure := fixupRoundClosure{}
+	deliveredNothing, known := s.fixupDeliveredNothing(ctx, runID, stageID, triggered.Sequence)
+	if known {
+		closure.DeliveredNothing = &deliveredNothing
+		if deliveredNothing {
+			reason := fmt.Sprintf("fix-up pass %d delivered nothing (recovered after category %s failure: %s); re-opened, not addressed",
+				payload.PassOrdinal, fixupRecoveryCategoryLabel(recovery.PriorFailureCategory),
+				fixupRecoveryReasonLabel(recovery.PriorFailureReason))
+			closure.ReopenedConcernIDs, closure.ReopenError = s.reopenRoutedConcernsAfterDeliveredNothing(ctx, runID, stageID, payload.ConcernIDs, reason)
+		}
+	}
+
+	s.writeFixupRecoveredAudit(ctx, runID, recovery, closure)
 	s.notifyStatusUpdate(ctx, runID, "stage_fixup_recovered")
 	return true
 }
 
+// fixupRoundClosure carries the #3395 delivered-nothing round-closure
+// outcome onto the stage_fixup_recovered payload. DeliveredNothing is nil
+// when the fixup_pushed read failed (the key is then OMITTED, so a reader
+// falls back to pre-#3395 behaviour rather than trusting a guess).
+// ReopenedConcernIDs lists the routed concerns actually transitioned
+// addressed_pending → reopened. ReopenError is non-empty when the reopen
+// could not be attempted or partially failed — it is what lets a reader
+// distinguish "no concern needed reopening" from "reopening did not happen",
+// so an empty ReopenedConcernIDs is never read as a clean ledger on the
+// failure paths.
+type fixupRoundClosure struct {
+	DeliveredNothing   *bool
+	ReopenedConcernIDs []string
+	ReopenError        string
+}
+
+// fixupRecoveryCategoryLabel / fixupRecoveryReasonLabel render the source
+// failure metadata for the concern state_reason, tolerating the nil case
+// (a failed stage that carried no metadata).
+func fixupRecoveryCategoryLabel(c *run.FailureCategory) string {
+	if c == nil {
+		return "unknown"
+	}
+	return string(*c)
+}
+
+func fixupRecoveryReasonLabel(r *string) string {
+	if r == nil || strings.TrimSpace(*r) == "" {
+		return "no reason recorded"
+	}
+	return truncate(*r, 200)
+}
+
+// fixupDeliveredNothing reports whether the fix-up pass opened by the
+// trigger at triggerSeq pushed nothing: true iff NO fixup_pushed entry for
+// the stage is sequenced after the trigger. This is the identical push veto
+// fixupRefundedPasses applies per trigger window, so the refund, the
+// recovery marker and the round closure can never disagree about whether a
+// pass delivered. known is false when the fixup_pushed read failed — the
+// caller then omits the key rather than guessing.
+func (s *Server) fixupDeliveredNothing(ctx context.Context, runID, stageID uuid.UUID, triggerSeq int64) (deliveredNothing bool, known bool) {
+	pushed, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryFixupPushed)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup recovery: fixup_pushed read failed — delivered_nothing left undecided",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return false, false
+	}
+	for _, e := range pushed {
+		if e.StageID != nil && *e.StageID == stageID && e.Sequence > triggerSeq {
+			return false, true
+		}
+	}
+	return true, true
+}
+
+// reopenRoutedConcernsAfterDeliveredNothing rolls the trigger's routed
+// concerns that are still addressed_pending back to the open state
+// `reopened`, with reason as the state_reason. Rows in any other state
+// (waived / deferred / addressed during the pass) are left untouched. It
+// returns the ids actually transitioned and a non-empty error string when
+// the reopen could not be attempted (no concern store) or any row failed —
+// best-effort, mirroring MarkAddressedPending's posture: per-row failures
+// WARN-log and continue, and the recovery itself is never unwound.
+func (s *Server) reopenRoutedConcernsAfterDeliveredNothing(ctx context.Context, runID, stageID uuid.UUID, rawIDs []string, reason string) ([]string, string) {
+	if len(rawIDs) == 0 {
+		return nil, ""
+	}
+	if s.cfg.ConcernRepo == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup recovery: routed concerns not re-opened — no concern repository configured",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()))
+		return nil, fmt.Sprintf("%d routed concern(s) not re-opened: no concern repository configured", len(rawIDs))
+	}
+	var ids []uuid.UUID
+	var failures []string
+	for _, raw := range rawIDs {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"fixup recovery: unparseable routed concern id skipped",
+				slog.String("run_id", runID.String()),
+				slog.String("concern_id", raw))
+			failures = append(failures, fmt.Sprintf("concern id %q is not a UUID", raw))
+			continue
+		}
+		ids = append(ids, id)
+	}
+	var reopened []string
+	if len(ids) > 0 {
+		rows, err := s.cfg.ConcernRepo.GetByIDs(ctx, ids)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"fixup recovery: resolve routed concerns failed — not re-opened",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()))
+			failures = append(failures, fmt.Sprintf("resolve %d routed concern(s): %s", len(ids), err.Error()))
+			rows = nil
+		}
+		for _, row := range rows {
+			if row.State != concern.StateAddressedPending {
+				continue
+			}
+			if _, err := s.cfg.ConcernRepo.ApplyResolution(ctx, row.ID, concern.StateReopened, reason); err != nil {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+					"fixup recovery: re-open routed concern failed — left addressed_pending",
+					slog.String("run_id", runID.String()),
+					slog.String("concern_id", row.ID.String()),
+					slog.String("error", err.Error()))
+				failures = append(failures, fmt.Sprintf("concern %s: %s", row.ID, err.Error()))
+				continue
+			}
+			reopened = append(reopened, row.ID.String())
+		}
+	}
+	return reopened, strings.Join(failures, "; ")
+}
+
 // writeFixupRecoveredAudit appends a stage_fixup_recovered entry capturing
 // the restored implement state, the re-parked review stage id (when any),
-// and the source failure category/reason the fix-up re-dispatch failed
-// with. Best-effort: the recovery transition is already committed, so a
-// failure here logs but doesn't unwind.
-func (s *Server) writeFixupRecoveredAudit(ctx context.Context, runID uuid.UUID, rec *run.FixupRecovery) {
+// the source failure category/reason the fix-up re-dispatch failed with,
+// and (#3395) the round-closure outcome: delivered_nothing (present only
+// when the fixup_pushed read succeeded), reopened_concern_ids (present only
+// when non-empty) and concern_reopen_error (present only when the reopen
+// could not be attempted or partially failed). Best-effort: the recovery
+// transition is already committed, so a failure here logs but doesn't unwind.
+func (s *Server) writeFixupRecoveredAudit(ctx context.Context, runID uuid.UUID, rec *run.FixupRecovery, closure fixupRoundClosure) {
 	fields := map[string]any{
 		"stage_id":       rec.Stage.ID.String(),
 		"restored_state": string(rec.Stage.State),
+	}
+	if closure.DeliveredNothing != nil {
+		fields["delivered_nothing"] = *closure.DeliveredNothing
+	}
+	if len(closure.ReopenedConcernIDs) > 0 {
+		fields["reopened_concern_ids"] = closure.ReopenedConcernIDs
+	}
+	if closure.ReopenError != "" {
+		fields["concern_reopen_error"] = closure.ReopenError
 	}
 	if rec.RestoredReview != nil {
 		fields["restored_review_stage_id"] = rec.RestoredReview.ID.String()
