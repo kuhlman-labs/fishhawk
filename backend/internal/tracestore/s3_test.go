@@ -21,82 +21,98 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/google/uuid"
 	"github.com/testcontainers/testcontainers-go"
-	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 )
 
 const (
-	minioUser  = "fishhawk-test"
-	minioPass  = "fishhawk-test-secret-key"
-	minioImage = "minio/minio:RELEASE.2025-01-20T14-49-07Z"
-	minioPort  = "9000/tcp"
+	rustfsUser = "fishhawk-test"
+	rustfsPass = "fishhawk-test-secret-key"
+	// rustfs/rustfs replaced the MinIO image after it was deleted from
+	// Docker Hub (#3386). 1.0.0-rc.6 is a release candidate, verified pullable
+	// by the operator on 2026-09-13.
+	rustfsImage = "rustfs/rustfs:1.0.0-rc.6"
+	rustfsPort  = "9000/tcp"
 )
 
-// minioRunOptions returns the container customizers used to start the shared
-// MinIO container. It is pure and needs no Docker, so the shipped wait-strategy
-// configuration is assertable in TestMinioRunOptions_IncludeAPortResolvingWait.
+// rustfsRunOptions returns the container customizers used to start the shared
+// RustFS container. It is pure and needs no Docker, so the shipped container
+// configuration is assertable in TestRustfsRunOptions_IncludeAPortResolvingWait.
 //
-// The load-bearing choice is WithAdditionalWaitStrategy over WithWaitStrategy:
-// the minio module's Run sets a default wait.ForHTTP("/minio/health/live")
-// .WithPort("9000") and then applies these opts. WithWaitStrategy REPLACES that
-// default (options.go WithWaitStrategyAndDeadline assigns req.WaitingFor
-// outright); WithAdditionalWaitStrategy APPENDS (it prepends the existing
-// req.WaitingFor). A log-only wait (wait.ForLog) never resolves the published
-// port mapping, so ConnectionString = Host()+MappedPort() can fail immediately
-// on Docker Desktop, where the published port is served by an asynchronously
-// started proxy. Both the retained ForHTTP default and the added
-// ForListeningPort retry MappedPort until the mapping resolves; ForListeningPort
-// additionally dials host:port, proving the proxy is serving. SkipInternalCheck
-// drops the in-container /bin/sh probe so the strategy depends only on the
-// host-side dial. See #2948.
-func minioRunOptions() []testcontainers.ContainerCustomizer {
+// There is no testcontainers module for RustFS, so the container is started
+// with the generic testcontainers.Run and carries NO module default wait
+// strategy to preserve — WithWaitStrategy (which REPLACES req.WaitingFor) is
+// therefore the correct customizer here, unlike the minio-module era where
+// WithAdditionalWaitStrategy was needed to keep the module's default. What
+// still matters is #2948: the strategy set MUST carry a port-bearing member. A
+// log-only wait (wait.ForLog) never resolves the published port mapping, so
+// PortEndpoint = Host()+MappedPort() can fail immediately on Docker Desktop,
+// where the published port is served by an asynchronously started proxy. Both
+// members below retry MappedPort until the mapping resolves: ForHTTP("/health")
+// .WithPort(rustfsPort) proves the S3 API answers (RustFS returns 200 on
+// /health once up; `/` returns 503, so it is NOT a usable readiness path), and
+// ForListeningPort additionally dials host:port, proving the proxy is serving.
+// SkipInternalCheck drops the in-container /bin/sh probe so the strategy
+// depends only on the host-side dial.
+//
+// The RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY env is load-bearing too: a
+// container started without them falls back to the image's built-in
+// rustfsadmin credentials and the static-credential client below would 403.
+func rustfsRunOptions() []testcontainers.ContainerCustomizer {
 	return []testcontainers.ContainerCustomizer{
-		tcminio.WithUsername(minioUser),
-		tcminio.WithPassword(minioPass),
-		testcontainers.WithAdditionalWaitStrategy(
-			wait.ForListeningPort(minioPort).SkipInternalCheck(),
+		testcontainers.WithEnv(map[string]string{
+			"RUSTFS_ACCESS_KEY": rustfsUser,
+			"RUSTFS_SECRET_KEY": rustfsPass,
+		}),
+		testcontainers.WithExposedPorts(rustfsPort),
+		testcontainers.WithWaitStrategy(
+			wait.ForHTTP("/health").WithPort(rustfsPort).WithStartupTimeout(60*time.Second),
+			wait.ForListeningPort(rustfsPort).SkipInternalCheck(),
 		),
 	}
 }
 
-// sharedMinIO is process-scoped MinIO state started at most once per package
+// sharedRustFS is process-scoped RustFS state started at most once per package
 // process (not the cross-process pgtest reuse — this needs no lease bookkeeping
 // and is unaffected by TESTCONTAINERS_RYUK_DISABLED because TestMain terminates
 // it deterministically). Collapsing the suite's per-test containers to one
 // removes the daemon pressure that opens the port-mapping race.
-type sharedMinIOState struct {
-	container *tcminio.MinioContainer
+type sharedRustFSState struct {
+	container *testcontainers.DockerContainer
 	endpoint  string
 	err       error
 }
 
 var (
-	sharedMinIOOnce sync.Once
-	sharedMinIO     sharedMinIOState
+	sharedRustFSOnce sync.Once
+	sharedRustFS     sharedRustFSState
 )
 
-func resolveSharedMinIO() sharedMinIOState {
-	sharedMinIOOnce.Do(func() {
+func resolveSharedRustFS() sharedRustFSState {
+	sharedRustFSOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 
-		c, err := tcminio.Run(ctx, minioImage, minioRunOptions()...)
+		c, err := testcontainers.Run(ctx, rustfsImage, rustfsRunOptions()...)
 		if err != nil {
 			// Keep any partially-started container handle so TestMain can
 			// terminate it.
-			sharedMinIO = sharedMinIOState{container: c, err: err}
+			sharedRustFS = sharedRustFSState{container: c, err: err}
 			return
 		}
-		endpoint, err := c.ConnectionString(ctx)
+		// host:port — the same shape the minio module's ConnectionString
+		// produced (it was PortEndpoint(ctx, "9000/tcp", "") under the hood),
+		// and the same errdefs.ErrNotFound port-not-found error the
+		// rustfsSkipReason classifier keys on when the mapping never resolves.
+		endpoint, err := c.PortEndpoint(ctx, rustfsPort, "")
 		if err != nil {
-			sharedMinIO = sharedMinIOState{container: c, err: err}
+			sharedRustFS = sharedRustFSState{container: c, err: err}
 			return
 		}
-		sharedMinIO = sharedMinIOState{container: c, endpoint: endpoint}
+		sharedRustFS = sharedRustFSState{container: c, endpoint: endpoint}
 	})
-	return sharedMinIO
+	return sharedRustFS
 }
 
 // finalExitCode is TestMain's exit-code policy for a shared-container
@@ -115,30 +131,30 @@ func finalExitCode(testCode int, terminateErr error) int {
 func TestMain(m *testing.M) {
 	code := m.Run()
 	// Terminate the shared container using a FRESH context — the 90s start
-	// context is cancelled by resolveSharedMinIO's defer. Tolerate a nil handle
+	// context is cancelled by resolveSharedRustFS's defer. Tolerate a nil handle
 	// (every test skipped, or the Once stored a start error before a container
 	// existed), so a skip host cannot turn a clean skip into a package failure.
-	if sharedMinIO.container != nil {
+	if sharedRustFS.container != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := sharedMinIO.container.Terminate(ctx)
+		err := sharedRustFS.container.Terminate(ctx)
 		cancel()
 		// Surface a possible orphan on stderr: with Ryuk disabled (scripts/test
 		// sets TESTCONTAINERS_RYUK_DISABLED=true) nothing else reaps this
 		// container, so a failed Terminate leaks one. Reporting only — the exit
 		// code is decided by finalExitCode, which deliberately does NOT escalate.
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "tracestore: shared MinIO container terminate failed (possible orphan): %v\n", err)
+			fmt.Fprintf(os.Stderr, "tracestore: shared RustFS container terminate failed (possible orphan): %v\n", err)
 		}
 		code = finalExitCode(code, err)
 	}
 	os.Exit(code)
 }
 
-// startMinIO returns an S3 client bound to the shared MinIO container plus a
+// startRustFS returns an S3 client bound to the shared RustFS container plus a
 // fresh per-test bucket (the uuid-suffixed name keeps tests isolated even
 // though they share the container). It skips only for the environmental
-// preconditions minioSkipReason recognises, and fatals on anything else.
-func startMinIO(t *testing.T) (*s3.Client, string) {
+// preconditions rustfsSkipReason recognises, and fatals on anything else.
+func startRustFS(t *testing.T) (*s3.Client, string) {
 	t.Helper()
 
 	// FISHHAWK_SKIP_INTEGRATION is an unconditional pre-startup gate: it must be
@@ -148,12 +164,12 @@ func startMinIO(t *testing.T) (*s3.Client, string) {
 		t.Skip(skipMsg("FISHHAWK_SKIP_INTEGRATION is set"))
 	}
 
-	shared := resolveSharedMinIO()
+	shared := resolveSharedRustFS()
 	if shared.err != nil {
-		if reason, ok := minioSkipReason(shared.err); ok {
+		if reason, ok := rustfsSkipReason(shared.err); ok {
 			t.Skip(reason)
 		}
-		t.Fatalf("start minio: %v", shared.err)
+		t.Fatalf("start rustfs: %v", shared.err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -162,7 +178,7 @@ func startMinIO(t *testing.T) (*s3.Client, string) {
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion("us-east-1"),
 		config.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(minioUser, minioPass, ""),
+			credentials.NewStaticCredentialsProvider(rustfsUser, rustfsPass, ""),
 		),
 	)
 	if err != nil {
@@ -170,8 +186,9 @@ func startMinIO(t *testing.T) (*s3.Client, string) {
 	}
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String("http://" + shared.endpoint)
-		// MinIO requires path-style requests; AWS S3 also accepts
-		// them, so this is the safe choice in either environment.
+		// RustFS is addressed path-style (there is no virtual-host DNS for
+		// a container); AWS S3 also accepts path-style requests, so this is
+		// the safe choice in either environment.
 		o.UsePathStyle = true
 	})
 
@@ -193,17 +210,17 @@ func skipMsg(reason string) string {
 		"Check `docker ps` and restart Docker Desktop if the daemon is loaded. See #2948.", reason)
 }
 
-// minioSkipReason classifies a MinIO container-start / endpoint-resolution error
-// into a fail-soft skip. It returns an actionable reason and true for exactly
-// the environmental preconditions this suite cannot control, and false for
-// everything else so a genuine tracestore regression still fails. It is reached
-// ONLY from the container-start / endpoint path in startMinIO, never from an S3
-// operation.
-func minioSkipReason(err error) (string, bool) {
+// rustfsSkipReason classifies a RustFS container-start / endpoint-resolution
+// error into a fail-soft skip. It returns an actionable reason and true for
+// exactly the environmental preconditions this suite cannot control, and false
+// for everything else so a genuine tracestore regression still fails. It is
+// reached ONLY from the container-start / endpoint path in startRustFS, never
+// from an S3 operation.
+func rustfsSkipReason(err error) (string, bool) {
 	if err == nil {
 		return "", false
 	}
-	// (a) explicit opt-out. Also honoured as a pre-startup gate in startMinIO.
+	// (a) explicit opt-out. Also honoured as a pre-startup gate in startRustFS.
 	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
 		return skipMsg("FISHHAWK_SKIP_INTEGRATION is set"), true
 	}
@@ -228,13 +245,13 @@ func minioSkipReason(err error) (string, bool) {
 	// unrelated Docker not-found.
 	portNotFound := strings.Contains(msg, `port "9000/tcp" not found`)
 	if errors.Is(err, errdefs.ErrNotFound) && portNotFound {
-		return skipMsg(`MinIO published port "9000/tcp" not found (errdefs.ErrNotFound); ` +
+		return skipMsg(`RustFS published port "9000/tcp" not found (errdefs.ErrNotFound); ` +
 			`the Docker Desktop port proxy never resolved the mapping`), true
 	}
 	// A bare port-not-found string carrying no sentinel is strictly narrower and
 	// still unambiguously ours.
 	if portNotFound {
-		return skipMsg(`MinIO published port "9000/tcp" not found; ` +
+		return skipMsg(`RustFS published port "9000/tcp" not found; ` +
 			`the Docker Desktop port proxy never resolved the mapping`), true
 	}
 	return "", false
@@ -303,10 +320,10 @@ func TestBundleRef_Validate(t *testing.T) {
 	}
 }
 
-// --- MinIO-backed integration tests ---
+// --- RustFS-backed integration tests ---
 
 func TestS3_PutAndGetRoundTrip(t *testing.T) {
-	client, bucket := startMinIO(t)
+	client, bucket := startRustFS(t)
 	store := tracestore.NewS3Storage(client, bucket)
 
 	body := []byte("dummy gzipped trace payload")
@@ -334,7 +351,7 @@ func TestS3_PutAndGetRoundTrip(t *testing.T) {
 }
 
 func TestS3_Get_NotFound(t *testing.T) {
-	client, bucket := startMinIO(t)
+	client, bucket := startRustFS(t)
 	store := tracestore.NewS3Storage(client, bucket)
 
 	ref := tracestore.BundleRef{
@@ -349,7 +366,7 @@ func TestS3_Get_NotFound(t *testing.T) {
 }
 
 func TestS3_Stat_NotFound(t *testing.T) {
-	client, bucket := startMinIO(t)
+	client, bucket := startRustFS(t)
 	store := tracestore.NewS3Storage(client, bucket)
 
 	ref := tracestore.BundleRef{
@@ -364,7 +381,7 @@ func TestS3_Stat_NotFound(t *testing.T) {
 }
 
 func TestS3_StatReturnsSizeAndETag(t *testing.T) {
-	client, bucket := startMinIO(t)
+	client, bucket := startRustFS(t)
 	store := tracestore.NewS3Storage(client, bucket)
 
 	body := []byte("0123456789abcdef")
@@ -395,7 +412,7 @@ func TestS3_Put_DedupsIdenticalContent(t *testing.T) {
 	// Putting byte-identical bundles a second time should be a no-op
 	// at the API level: same key (content-addressed), same bytes,
 	// Get returns the same content.
-	client, bucket := startMinIO(t)
+	client, bucket := startRustFS(t)
 	store := tracestore.NewS3Storage(client, bucket)
 
 	body := []byte("identical bytes")
@@ -421,7 +438,7 @@ func TestS3_Put_DedupsIdenticalContent(t *testing.T) {
 }
 
 func TestS3_ListReturnsBundlesUnderRun(t *testing.T) {
-	client, bucket := startMinIO(t)
+	client, bucket := startRustFS(t)
 	store := tracestore.NewS3Storage(client, bucket)
 
 	runID := uuid.New()
@@ -465,7 +482,7 @@ func TestS3_List_IgnoresForeignObjects(t *testing.T) {
 	// An object whose key doesn't fit the canonical layout (e.g.
 	// dropped there by an unrelated process) should be ignored by
 	// List rather than returned as a half-broken BundleRef.
-	client, bucket := startMinIO(t)
+	client, bucket := startRustFS(t)
 	store := tracestore.NewS3Storage(client, bucket)
 	runID := uuid.New()
 
@@ -500,7 +517,7 @@ func TestS3_List_IgnoresForeignObjects(t *testing.T) {
 }
 
 func TestS3_List_ZeroRunIDRejected(t *testing.T) {
-	client, bucket := startMinIO(t)
+	client, bucket := startRustFS(t)
 	store := tracestore.NewS3Storage(client, bucket)
 
 	if _, err := store.List(context.Background(), uuid.Nil); err == nil {
@@ -509,7 +526,7 @@ func TestS3_List_ZeroRunIDRejected(t *testing.T) {
 }
 
 func TestS3_Operations_RejectInvalidRef(t *testing.T) {
-	client, bucket := startMinIO(t)
+	client, bucket := startRustFS(t)
 	store := tracestore.NewS3Storage(client, bucket)
 
 	bad := tracestore.BundleRef{} // all-zero, fails Validate
@@ -563,34 +580,31 @@ func strategyResolvesPort(s wait.Strategy) bool {
 	}
 }
 
-// TestMinioRunOptions_IncludeAPortResolvingWait is the done-means test: the
+// TestRustfsRunOptions_IncludeAPortResolvingWait is the done-means test: the
 // change's correctness is configuration, not compilation, so presence-of-touch
-// proves nothing. It pre-seeds req.WaitingFor with a log-only stand-in, applies
-// the shipped minioRunOptions() customizers, and asserts the result APPENDS —
-// retaining the seeded log strategy AND adding a port-resolving one. A revert to
-// the replacing WithWaitStrategy(wait.ForLog(...)) drops the seeded strategy and
-// fails here, which is what makes counterfactual (i) meaningful. It needs no
-// Docker, so it runs everywhere including CI.
+// proves nothing. It applies the shipped rustfsRunOptions() customizers to a
+// bare request and asserts the SHIPPED container configuration: at least one
+// port-resolving wait strategy is present (a portless-HTTP-only config fails it
+// — the #2948 trap), the S3 port is declared exposed (otherwise no mapping can
+// ever resolve), and the RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY env is set (a
+// container started without them serves the image's built-in rustfsadmin
+// credentials and the static-credential client would 403). There is no module
+// default to preserve any more, so the minio-era seeded-log APPEND assertion is
+// gone. It needs no Docker, so it runs everywhere including CI.
 //
 // The portless-HTTP sub-case pins the strategyResolvesPort guard (item B, #2948).
 // Counterfactual (b) — reverting that guard's HTTPStrategy arm to an
-// unconditional `return true` — observed RED:
-//
-//	--- FAIL: TestMinioRunOptions_IncludeAPortResolvingWait/portless_HTTP_wait_does_not_satisfy_the_port_requirement (0.00s)
-//	    s3_test.go:670: a portless HTTP wait must not count as port-resolving; the guard v.Port.Port() != "" was bypassed
-//
-// The parent test's own assertions stayed GREEN under that revert (the shipped
-// config carries no portless HTTP wait), which is exactly why the sub-case is
-// required to make the guard falsifiable.
-func TestMinioRunOptions_IncludeAPortResolvingWait(t *testing.T) {
-	const seededLog = "seeded-log-sentinel"
+// unconditional `return true` — is observed RED on the sub-case, while the
+// parent test's own assertions stay GREEN under that revert (the shipped config
+// carries no portless HTTP wait), which is exactly why the sub-case is required
+// to make the guard falsifiable.
+func TestRustfsRunOptions_IncludeAPortResolvingWait(t *testing.T) {
 	req := testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
-			Env:        map[string]string{},
-			WaitingFor: wait.ForLog(seededLog),
+			Env: map[string]string{},
 		},
 	}
-	for _, opt := range minioRunOptions() {
+	for _, opt := range rustfsRunOptions() {
 		if err := opt.Customize(&req); err != nil {
 			t.Fatalf("customize: %v", err)
 		}
@@ -601,57 +615,62 @@ func TestMinioRunOptions_IncludeAPortResolvingWait(t *testing.T) {
 		t.Fatal("no wait strategy present after applying options")
 	}
 
-	var haveSeededLog, havePort, haveNonSeededLog bool
+	var havePort bool
 	for _, s := range strategies {
-		if lg, ok := s.(*wait.LogStrategy); ok && lg.Log == seededLog {
-			haveSeededLog = true
-			continue
-		}
-		haveNonSeededLog = true
 		if strategyResolvesPort(s) {
 			havePort = true
 		}
 	}
-
-	if !haveSeededLog {
-		t.Error("append lost the pre-seeded log strategy: WithWaitStrategy replaced instead of appending")
-	}
 	if !havePort {
 		t.Error("no port-resolving wait strategy present (*wait.HostPortStrategy or *wait.HTTPStrategy with a port)")
 	}
-	if !haveNonSeededLog {
-		t.Error("wait strategy set is log-only; the port-mapping wait was dropped")
+
+	var exposed bool
+	for _, p := range req.ExposedPorts {
+		if p == rustfsPort {
+			exposed = true
+		}
+	}
+	if !exposed {
+		t.Errorf("exposed ports %v do not include %s; the S3 port mapping can never resolve", req.ExposedPorts, rustfsPort)
+	}
+
+	if got := req.Env["RUSTFS_ACCESS_KEY"]; got != rustfsUser {
+		t.Errorf("RUSTFS_ACCESS_KEY = %q, want %q; the static-credential client would 403", got, rustfsUser)
+	}
+	if got := req.Env["RUSTFS_SECRET_KEY"]; got != rustfsPass {
+		t.Errorf("RUSTFS_SECRET_KEY = %q, want %q; the static-credential client would 403", got, rustfsPass)
 	}
 
 	// Sub-case (item B, #2948): a PORTLESS HTTP wait must NOT count as
 	// port-resolving. The shipped configuration contains no portless HTTP wait,
 	// so the strategyResolvesPort guard is otherwise unfalsifiable and a revert
-	// to an unconditional true would redden no test. Seed a portless
-	// wait.ForHTTP("/health") ALONGSIDE the log strategy, apply the shipped
-	// options, and assert the port requirement is satisfied by the
-	// ForListeningPort HostPortStrategy — never by the portless HTTP wait.
+	// to an unconditional true would redden no test. Apply the shipped options,
+	// then APPEND a portless wait.ForHTTP("/health") alongside them, and assert
+	// the port requirement is satisfied only by the port-bearing members
+	// (the ForListeningPort HostPortStrategy and the WithPort HTTP wait) — never
+	// by the portless HTTP wait.
 	t.Run("portless HTTP wait does not satisfy the port requirement", func(t *testing.T) {
 		req := testcontainers.GenericContainerRequest{
 			ContainerRequest: testcontainers.ContainerRequest{
 				Env: map[string]string{},
-				WaitingFor: wait.ForAll(
-					wait.ForLog(seededLog),
-					wait.ForHTTP("/health"),
-				),
 			},
 		}
-		for _, opt := range minioRunOptions() {
+		opts := append(rustfsRunOptions(),
+			testcontainers.WithAdditionalWaitStrategy(wait.ForHTTP("/health")),
+		)
+		for _, opt := range opts {
 			if err := opt.Customize(&req); err != nil {
 				t.Fatalf("customize: %v", err)
 			}
 		}
 
-		var portFromHostPort, sawPortlessHTTP, portlessHTTPResolvesPort bool
+		var portFromBearing, sawPortlessHTTP, portlessHTTPResolvesPort bool
 		for _, s := range flattenStrategies(req.WaitingFor) {
 			switch v := s.(type) {
 			case *wait.HostPortStrategy:
 				if strategyResolvesPort(s) {
-					portFromHostPort = true
+					portFromBearing = true
 				}
 			case *wait.HTTPStrategy:
 				if v.Port.Port() == "" {
@@ -659,6 +678,8 @@ func TestMinioRunOptions_IncludeAPortResolvingWait(t *testing.T) {
 					if strategyResolvesPort(s) {
 						portlessHTTPResolvesPort = true
 					}
+				} else if strategyResolvesPort(s) {
+					portFromBearing = true
 				}
 			}
 		}
@@ -669,20 +690,20 @@ func TestMinioRunOptions_IncludeAPortResolvingWait(t *testing.T) {
 		if portlessHTTPResolvesPort {
 			t.Error(`a portless HTTP wait must not count as port-resolving; the guard v.Port.Port() != "" was bypassed`)
 		}
-		if !portFromHostPort {
-			t.Error("expected the ForListeningPort HostPortStrategy to satisfy the port requirement")
+		if !portFromBearing {
+			t.Error("expected a port-bearing member (ForListeningPort or ForHTTP.WithPort) to satisfy the port requirement")
 		}
 	})
 }
 
-// TestMinioSkipReason asserts one case per named branch of the fail-soft
-// classifier, plus two negative controls, so the skip cannot mask a genuine
+// TestRustfsSkipReason asserts one case per named branch of the fail-soft
+// classifier, plus the negative controls, so the skip cannot mask a genuine
 // tracestore regression. It asserts on the returned reason text, not only the
 // bool.
-func TestMinioSkipReason(t *testing.T) {
+func TestRustfsSkipReason(t *testing.T) {
 	t.Run("FISHHAWK_SKIP_INTEGRATION set", func(t *testing.T) {
 		t.Setenv("FISHHAWK_SKIP_INTEGRATION", "1")
-		reason, ok := minioSkipReason(errors.New("anything at all"))
+		reason, ok := rustfsSkipReason(errors.New("anything at all"))
 		if !ok {
 			t.Fatal("expected skip when FISHHAWK_SKIP_INTEGRATION is set")
 		}
@@ -703,7 +724,7 @@ func TestMinioSkipReason(t *testing.T) {
 	}
 	for _, marker := range dockerMarkers {
 		t.Run("docker unavailable: "+marker, func(t *testing.T) {
-			reason, ok := minioSkipReason(fmt.Errorf("run minio: %s", marker))
+			reason, ok := rustfsSkipReason(fmt.Errorf("run rustfs: %s", marker))
 			if !ok {
 				t.Fatalf("expected skip for docker-unavailable marker %q", marker)
 			}
@@ -716,7 +737,7 @@ func TestMinioSkipReason(t *testing.T) {
 	t.Run("errdefs.ErrNotFound port-not-found", func(t *testing.T) {
 		err := fmt.Errorf("connection string: %w",
 			errdefs.ErrNotFound.WithMessage(`port "9000/tcp" not found`))
-		reason, ok := minioSkipReason(err)
+		reason, ok := rustfsSkipReason(err)
 		if !ok {
 			t.Fatal("expected skip for errdefs.ErrNotFound-wrapped port-not-found")
 		}
@@ -732,7 +753,7 @@ func TestMinioSkipReason(t *testing.T) {
 	})
 
 	t.Run("bare port-not-found string", func(t *testing.T) {
-		reason, ok := minioSkipReason(errors.New(`port "9000/tcp" not found`))
+		reason, ok := rustfsSkipReason(errors.New(`port "9000/tcp" not found`))
 		if !ok {
 			t.Fatal("expected skip for bare port-not-found string")
 		}
@@ -745,8 +766,8 @@ func TestMinioSkipReason(t *testing.T) {
 	t.Run("errdefs.ErrNotFound unrelated message does not skip", func(t *testing.T) {
 		// The exact hole C1 closes: ErrNotFound is a generic sentinel raised for
 		// a missing image/container/network too.
-		err := errdefs.ErrNotFound.WithMessage("No such image: minio/minio:latest")
-		if reason, ok := minioSkipReason(err); ok {
+		err := errdefs.ErrNotFound.WithMessage("No such image: rustfs/rustfs:latest")
+		if reason, ok := rustfsSkipReason(err); ok {
 			t.Errorf("ErrNotFound with an unrelated message must not skip; got reason %q", reason)
 		}
 	})
@@ -756,19 +777,19 @@ func TestMinioSkipReason(t *testing.T) {
 		// message, so a not-found naming a DIFFERENT port (e.g. postgres 5432)
 		// must fall through and fatal, not be swallowed as ours.
 		err := errdefs.ErrNotFound.WithMessage(`port "5432/tcp" not found`)
-		if reason, ok := minioSkipReason(err); ok {
+		if reason, ok := rustfsSkipReason(err); ok {
 			t.Errorf("ErrNotFound naming a different port must not skip; got reason %q", reason)
 		}
 	})
 
 	t.Run("unrelated S3 error does not skip", func(t *testing.T) {
-		if reason, ok := minioSkipReason(errors.New("NoSuchBucket: the specified bucket does not exist")); ok {
+		if reason, ok := rustfsSkipReason(errors.New("NoSuchBucket: the specified bucket does not exist")); ok {
 			t.Errorf("unrelated S3 error must not skip; got reason %q", reason)
 		}
 	})
 
 	t.Run("plain error does not skip", func(t *testing.T) {
-		if reason, ok := minioSkipReason(errors.New("boom")); ok {
+		if reason, ok := rustfsSkipReason(errors.New("boom")); ok {
 			t.Errorf("plain error must not skip; got reason %q", reason)
 		}
 	})

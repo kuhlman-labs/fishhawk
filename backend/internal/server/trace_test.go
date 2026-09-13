@@ -105,7 +105,7 @@ func (f *signingFake) Verify(_ context.Context, runID uuid.UUID, message, signat
 }
 
 // traceStoreFake records the last Put so tests can assert what was
-// stored without standing up MinIO. tracestore.Storage has more
+// stored without standing up RustFS. tracestore.Storage has more
 // methods than we need here; the unused ones return errors so an
 // accidental call is loud.
 type traceStoreFake struct {

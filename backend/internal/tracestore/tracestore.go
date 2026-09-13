@@ -1,8 +1,8 @@
 // Package tracestore persists agent trace bundles to an S3-compatible
 // object store (E2.2 / #23). Per ADR-003 (#67) production runs against
-// AWS S3; local dev and tests run against MinIO with the same code
-// path — the SDK is identical, only the endpoint and credentials
-// differ.
+// AWS S3; local dev and tests run against RustFS (an S3-compatible
+// store) with the same code path — the SDK is identical, only the
+// endpoint and credentials differ.
 //
 // Bundles are content-addressed: the key embeds the sha256 of the
 // (already gzipped) payload bytes, which gives free dedup on
@@ -88,7 +88,7 @@ type Stat struct {
 
 // Storage is the abstraction over the trace bundle store. The S3-
 // backed implementation works against AWS S3 in production and
-// MinIO in local dev / tests — same code, different endpoint.
+// RustFS in local dev / tests — same code, different endpoint.
 type Storage interface {
 	// Put writes the bundle bytes at the canonical key. Idempotent
 	// at the storage layer: writing identical bytes a second time
