@@ -1681,6 +1681,20 @@ type GetRunStatusOutput struct {
 	// fails the snapshot). Omitted when the run has no findings (no scan
 	// yet, a clean scan, or a clean re-scan after a fix-up cleared them).
 	SecurityFindings []SecurityFinding `json:"security_findings,omitempty" jsonschema:"unresolved high-severity code-scanning (CodeQL/SAST) findings on the implement diff (#1096), from the newest scan. A SEPARATE signal from implement-review concerns — held by its own merge gate and routed to its own fix-up pass, never consuming a design-concern budget. Omitted when the run has no findings (no scan, a clean scan, or a clean re-scan after a fix-up)"`
+	// AcceptanceTranscript surfaces the acceptance transcript summary (E72.5 /
+	// #3329) recorded as the `transcript` block on the newest
+	// acceptance_outcome_recorded audit entry: the artifact ref, the REST
+	// retrieval path (the MCP surface has no artifact-fetch tool) and the
+	// bounded per-criterion rows the backend derived from the STORED
+	// transcript. Cost-gated on an acceptance stage existing — a run without
+	// one issues no read and stays byte-identical. Best-effort: a read/decode
+	// error, a null block (no transcript shipped) or an absent block all leave
+	// it nil, never failing the snapshot. The VERDICT is authoritative and
+	// the transcript descriptive: when the backend found the transcript's
+	// rows disagreeing with the verdict it recorded no per-criterion rows and
+	// named why in summary_suppressed, and this field carries that verbatim
+	// rather than rendering a story that could contradict the verdict.
+	AcceptanceTranscript *AcceptanceTranscriptStatus `json:"acceptance_transcript,omitempty" jsonschema:"acceptance transcript summary (E72.5 / #3329) from the newest acceptance_outcome_recorded entry's transcript block: artifact_id + content_hash of the stored acceptance_transcript artifact, artifact_path (the REST GET path that returns the full transcript — request/response bodies are stored-only and never surfaced here), and criteria[] rows {id, outcome, request_count, failing_request{method,path,status}|null} where failing_request is the LAST request of a failed criterion. The verdict is authoritative and the transcript descriptive: criteria is omitted and summary_suppressed names the reason (criterion_not_in_verdict | criterion_outcome_disagrees) when the backend found the transcript disagreeing with the verdict rows. Omitted when the run has no acceptance stage, no recorded outcome, or the outcome carries no transcript"`
 	// Elisions records what the response byte budget removed (ADR-077 /
 	// #2508). omitempty, so an UNDER-budget response is byte-identical to the
 	// pre-#2508 wire and the block never appears on the happy path. See
@@ -1701,6 +1715,45 @@ type SecurityFinding struct {
 	Path        string `json:"path" jsonschema:"repo-relative file the finding points at"`
 	StartLine   int    `json:"start_line,omitempty" jsonschema:"1-based line of the finding; 0 when GitHub omits a location"`
 	HTMLURL     string `json:"html_url,omitempty" jsonschema:"link to the alert on GitHub"`
+}
+
+// AcceptanceTranscriptStatus is the MCP run-status projection of the
+// `transcript` block on acceptance_outcome_recorded (E72.5 / #3329). It
+// mirrors the backend's acceptanceTranscriptSummary wire shape field for
+// field (mirrored, not imported — the #875 compile trap) and adds
+// artifact_path, the REST pointer to the full stored transcript.
+type AcceptanceTranscriptStatus struct {
+	ArtifactID   string `json:"artifact_id" jsonschema:"id of the stored acceptance_transcript artifact"`
+	ContentHash  string `json:"content_hash" jsonschema:"sha256 of the stored transcript bytes"`
+	ArtifactPath string `json:"artifact_path" jsonschema:"REST path returning the full transcript (request/response bodies included): GET /v0/artifacts/<artifact_id>"`
+	// Criteria is nil when the backend suppressed the summary; see
+	// SummarySuppressed. Never rendered against a disagreeing verdict.
+	Criteria []AcceptanceTranscriptCriterion `json:"criteria,omitempty" jsonschema:"bounded per-criterion rows derived by the backend from the STORED transcript; absent when summary_suppressed is set"`
+	// SummarySuppressed is the backend's named reason for recording no
+	// per-criterion rows: criterion_not_in_verdict or
+	// criterion_outcome_disagrees. Empty on an agreeing transcript.
+	SummarySuppressed string `json:"summary_suppressed,omitempty" jsonschema:"why criteria is absent: criterion_not_in_verdict (a transcript id names no verdict row) or criterion_outcome_disagrees (a transcript outcome differs from the verdict row's result). The verdict stands; the transcript is descriptive"`
+	// DisagreeingIDs lists the transcript ids that broke the agreement.
+	DisagreeingIDs []string `json:"disagreeing_ids,omitempty" jsonschema:"the transcript criterion ids that broke agreement with the verdict rows; present only with summary_suppressed"`
+}
+
+// AcceptanceTranscriptCriterion is one row of AcceptanceTranscriptStatus.
+type AcceptanceTranscriptCriterion struct {
+	ID           string `json:"id" jsonschema:"criterion id (plan id, or scenario:issue-<N>/<id> for a replayed scenario row)"`
+	Outcome      string `json:"outcome" jsonschema:"passed | failed | skipped | undecidable"`
+	RequestCount int    `json:"request_count" jsonschema:"how many requests the transcript recorded for this criterion"`
+	// FailingRequest is the LAST recorded request of a failed criterion —
+	// the one whose response the failing assertion evaluated — regardless of
+	// status; nil for a non-failed criterion or a failed one with zero
+	// requests. Method/path/status only: bodies are stored-only.
+	FailingRequest *AcceptanceTranscriptRequest `json:"failing_request" jsonschema:"for a failed criterion, its LAST recorded request (method/path/status only) regardless of status code — the request whose response the failing assertion evaluated; null otherwise. Bodies are stored-only: fetch artifact_path"`
+}
+
+// AcceptanceTranscriptRequest is the grammar-bounded request triple.
+type AcceptanceTranscriptRequest struct {
+	Method string `json:"method" jsonschema:"HTTP method"`
+	Path   string `json:"path" jsonschema:"request path (RFC 3986 charset, bounded at backend ingest)"`
+	Status int    `json:"status" jsonschema:"HTTP response status"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -2073,6 +2126,17 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// snapshot.
 	securityFindings := r.securityFindingsFor(ctx, runID)
 
+	// Best-effort acceptance-transcript surface (E72.5 / #3329). Cost-gated on
+	// an acceptance stage existing, so a run without one issues no read and
+	// stays byte-identical. A dedicated newest-entry read of
+	// acceptance_outcome_recorded rather than the recent slice, so the block
+	// cannot age out. On any error the field stays nil — never fails the
+	// snapshot.
+	var acceptanceTranscript *AcceptanceTranscriptStatus
+	if acceptanceStageWaitStatus != nil {
+		acceptanceTranscript = r.acceptanceTranscriptFor(ctx, runID)
+	}
+
 	// Compact-by-default projection (#1727), applied AFTER all reads and
 	// helper computations (next_actions/wait-status/hints saw the full
 	// data) but BEFORE serialization, so the heavy free-text is stripped
@@ -2146,6 +2210,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 		NextActions:               nextActions,
 		ChildrenStatus:            childrenStatus,
 		SecurityFindings:          securityFindings,
+		AcceptanceTranscript:      acceptanceTranscript,
 	}
 
 	// Response byte bound (ADR-077 / #2508). Runs at ONE call site, AFTER the
@@ -2235,6 +2300,74 @@ func (r *runResolver) securityFindingsFor(ctx context.Context, runID uuid.UUID) 
 		})
 	}
 	return out
+}
+
+// acceptanceTranscriptFor projects the `transcript` block of the NEWEST
+// acceptance_outcome_recorded entry (E72.5 / #3329) — a dedicated category
+// read, mirroring securityFindingsFor, so the block never ages out of the
+// recent slice. Returns nil (the field is omitted) on any read/decode error,
+// when no outcome is recorded, or when the newest outcome's transcript is
+// null/absent/undecodable (no transcript shipped, or a pre-transcript verdict).
+// Newest wins: a re-run's fresh verdict supersedes an older one's transcript.
+// The block is carried as the backend recorded it — including a suppressed
+// summary — because the verdict is authoritative and this surface must not
+// synthesize a per-criterion story the backend refused to record.
+func (r *runResolver) acceptanceTranscriptFor(ctx context.Context, runID uuid.UUID) *AcceptanceTranscriptStatus {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: auditCategoryAcceptanceOutcomeRecorded,
+	})
+	if err != nil || len(entries) == 0 {
+		return nil
+	}
+	newest := entries[0]
+	for _, e := range entries[1:] {
+		if e.Sequence > newest.Sequence {
+			newest = e
+		}
+	}
+	if newest.Payload == nil {
+		return nil
+	}
+	raw, merr := json.Marshal(newest.Payload)
+	if merr != nil {
+		return nil
+	}
+	var payload struct {
+		Transcript json.RawMessage `json:"transcript"`
+	}
+	if uerr := json.Unmarshal(raw, &payload); uerr != nil {
+		return nil
+	}
+	return decodeAcceptanceTranscriptStatus(payload.Transcript)
+}
+
+// decodeAcceptanceTranscriptStatus decodes one `transcript` block: nil on
+// null, absent, undecodable, or an artifact_id-less block (the consumer-side
+// twin of the backend's decodeAcceptanceTranscriptSummary rule). artifact_path
+// is derived here — the MCP surface has no artifact-fetch tool, so the REST
+// pointer is what makes the full transcript one fetch away.
+func decodeAcceptanceTranscriptStatus(raw json.RawMessage) *AcceptanceTranscriptStatus {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var block struct {
+		ArtifactID        string                          `json:"artifact_id"`
+		ContentHash       string                          `json:"content_hash"`
+		Criteria          []AcceptanceTranscriptCriterion `json:"criteria"`
+		SummarySuppressed string                          `json:"summary_suppressed"`
+		DisagreeingIDs    []string                        `json:"disagreeing_ids"`
+	}
+	if err := json.Unmarshal(raw, &block); err != nil || block.ArtifactID == "" {
+		return nil
+	}
+	return &AcceptanceTranscriptStatus{
+		ArtifactID:        block.ArtifactID,
+		ContentHash:       block.ContentHash,
+		ArtifactPath:      "/v0/artifacts/" + block.ArtifactID,
+		Criteria:          block.Criteria,
+		SummarySuppressed: block.SummarySuppressed,
+		DisagreeingIDs:    block.DisagreeingIDs,
+	}
 }
 
 // latestFixupSequenceFor returns the audit sequence of the most-recent
