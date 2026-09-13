@@ -1,0 +1,14 @@
+id: scenario:issue-3394/auto-preview-tool-description-names-teardown
+statement: The fishhawk_dispatch_stage tool's auto_preview parameter description, as returned in the MCP tool listing, states that the dispatch sets both FISHHAWK_ACCEPTANCE_PREVIEW_CMD and FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD (scripts/dev preview-down) on the spawned runner and that an operator-set value of either wins.
+verify_hint: 'MCP tool result: list tools against the preview''s /mcp route and read the fishhawk_dispatch_stage input schema''s auto_preview description for `FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD` and `scripts/dev preview-down`.'
+steps: Same live tools/list read on the preview's /mcp route; asserted the fragments FISHHAWK_ACCEPTANCE_PREVIEW_CMD, FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD, 'scripts/dev preview-down' and the operator-wins sentence in the auto_preview description. Also confirmed fishhawk_run_stage and fishhawk_drive_run expose no auto_preview property (matches the out-of-scope note).
+assertions:
+    expected: Description states the dispatch sets both variables (scripts/dev preview-down) on the spawned runner and that an operator-set value of either wins.
+    observed_at_record: 'All four fragments present: both env vars, ''scripts/dev preview-down'', and ''An operator-set value of EITHER variable in this process ALWAYS wins and is passed through unchanged''.'
+    repro_handle: POST /mcp tools/list (see scenario row) -> fishhawk_dispatch_stage.inputSchema.properties.auto_preview.description
+origin:
+    issue: 3394
+    pr: 3405
+    run_id: 70831a75-4890-4088-bfa9-74411166e7b3
+    head_sha: 5d6812482488feec8cd41c0016dc4d8b0819ce89
+    recorded_at: 2026-09-13T20:33:44Z

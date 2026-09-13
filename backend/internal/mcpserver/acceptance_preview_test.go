@@ -61,6 +61,81 @@ func TestResolveAcceptancePreviewCmd_Arms(t *testing.T) {
 	})
 }
 
+// TestResolveAcceptancePreviewTeardownCmd_EnvWinsOverAutoPreview mirrors the
+// provision-side precedence pin for the teardown half (#3394): an operator-set
+// FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD is returned VERBATIM with source
+// "env" even when the provision resolved from auto_preview. Deleting the
+// env-first branch reddens it.
+func TestResolveAcceptancePreviewTeardownCmd_EnvWinsOverAutoPreview(t *testing.T) {
+	const operatorCmd = "make preview-target-down"
+	env := map[string]string{acceptancePreviewTeardownCmdEnv: operatorCmd}
+	cmd, src := resolveAcceptancePreviewTeardownCmd(envFuncFromMap(env), "auto_preview")
+	if cmd != operatorCmd {
+		t.Errorf("cmd = %q, want the operator value %q verbatim (auto_preview must not overwrite it)", cmd, operatorCmd)
+	}
+	if src != "env" {
+		t.Errorf("source = %q, want %q", src, "env")
+	}
+	if cmd == acceptancePreviewDefaultTeardownCmd {
+		t.Errorf("cmd = the built-in default; the operator's value was overwritten")
+	}
+}
+
+// TestResolveAcceptancePreviewTeardownCmd_Arms table-drives the teardown
+// resolver's three arms (#3394). The load-bearing rows are the two EMPTY ones
+// under a non-auto_preview provision source: the default teardown is keyed on
+// the PROVISION SOURCE, so an operator provision hook ("env") never has
+// `scripts/dev preview-down` paired with it. Keying the resolver on a raw flag
+// instead reddens the "no env, provision env -> EMPTY" row.
+func TestResolveAcceptancePreviewTeardownCmd_Arms(t *testing.T) {
+	tests := []struct {
+		name            string
+		env             map[string]string
+		provisionSource string
+		wantCmd         string
+		wantSource      string
+	}{
+		{"env set, provision env -> env", map[string]string{acceptancePreviewTeardownCmdEnv: "x down"}, "env", "x down", "env"},
+		{"env set, provision auto_preview -> env wins", map[string]string{acceptancePreviewTeardownCmdEnv: "x down"}, "auto_preview", "x down", "env"},
+		{"no env, provision auto_preview -> default", nil, "auto_preview", acceptancePreviewDefaultTeardownCmd, "auto_preview"},
+		{"no env, provision env -> EMPTY (operator hook owns its teardown)", nil, "env", "", ""},
+		{"no env, no provision -> EMPTY", nil, "", "", ""},
+		{"empty env value, provision auto_preview -> default", map[string]string{acceptancePreviewTeardownCmdEnv: ""}, "auto_preview", acceptancePreviewDefaultTeardownCmd, "auto_preview"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd, src := resolveAcceptancePreviewTeardownCmd(envFuncFromMap(tc.env), tc.provisionSource)
+			if cmd != tc.wantCmd || src != tc.wantSource {
+				t.Errorf("got (%q, %q), want (%q, %q)", cmd, src, tc.wantCmd, tc.wantSource)
+			}
+		})
+	}
+	t.Run("nil getenv degrades to the auto_preview arm", func(t *testing.T) {
+		cmd, src := resolveAcceptancePreviewTeardownCmd(nil, "auto_preview")
+		if cmd != acceptancePreviewDefaultTeardownCmd || src != "auto_preview" {
+			t.Errorf("got (%q, %q), want the default under auto_preview", cmd, src)
+		}
+	})
+}
+
+// TestAcceptancePreviewTeardownLiterals pins the two cross-boundary literals
+// the runner reads from its own process env (#3394). The modules cannot
+// import each other and no wirecontract guard covers env names, so the exact
+// strings are asserted here and in runner/cmd/fishhawk-runner (the same
+// diff-only substitute acceptancePreviewCmdEnv relies on). A no-op touch
+// cannot satisfy these.
+func TestAcceptancePreviewTeardownLiterals(t *testing.T) {
+	if acceptancePreviewTeardownCmdEnv != "FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD" {
+		t.Errorf("acceptancePreviewTeardownCmdEnv = %q, want the runner's previewTeardownCmdEnv literal", acceptancePreviewTeardownCmdEnv)
+	}
+	if acceptancePreviewDefaultTeardownCmd != "scripts/dev preview-down" {
+		t.Errorf("acceptancePreviewDefaultTeardownCmd = %q, want %q (the counterpart of %q)", acceptancePreviewDefaultTeardownCmd, "scripts/dev preview-down", acceptancePreviewDefaultCmd)
+	}
+	if acceptancePreviewCmdEnv != "FISHHAWK_ACCEPTANCE_PREVIEW_CMD" {
+		t.Errorf("acceptancePreviewCmdEnv = %q, want the runner's previewCmdEnv literal", acceptancePreviewCmdEnv)
+	}
+}
+
 // TestAcceptancePreviewDisplayCommand_DefaultsAndSHA is the REVISION-1 renderer
 // table: the DEFAULT lives in the renderer, so a zero-valued cmd still produces
 // a concrete command. Removing the default (returning cmd unchanged) reddens

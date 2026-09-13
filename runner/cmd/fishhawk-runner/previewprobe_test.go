@@ -544,6 +544,63 @@ func TestAcceptanceTargetGate_TeardownFailureLoggedNonFatal(t *testing.T) {
 	}
 }
 
+// TestAcceptanceTargetGate_TeardownRunsAfterContextCancel is the cancel-path
+// pin for #3394: the teardown closure is invoked (via the caller's defer) AFTER
+// the runner ctx is already cancelled — the SIGTERM chain from the MCP verb.
+// exec.CommandContext refuses to Start on a done context, so a closure bound to
+// the parent ctx never forks the teardown and the preview leaks. The marker
+// file is the committed-state read: reverting the closure to `ctx` reddens
+// this because the marker is never written.
+func TestAcceptanceTargetGate_TeardownRunsAfterContextCancel(t *testing.T) {
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	gcfg := fastGateConfig()
+	gcfg.provisionCmd = "true"
+	marker := markerPath(t)
+	gcfg.teardownCmd = "echo torn > " + marker
+	var log strings.Builder
+	ctx, cancel := context.WithCancel(context.Background())
+	teardown, reason, detail := acceptanceTargetGate(ctx, gcfg, []string{hostOf(ts)}, testExpectedSHA, "run-1", &log)
+	if reason != "" {
+		t.Fatalf("reason = %q (%s), want proceed", reason, detail)
+	}
+	if teardown == nil {
+		t.Fatal("teardown must be returned")
+	}
+	cancel() // the stage is cancelled BEFORE the deferred teardown fires
+	teardown()
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("teardown did not run after the runner ctx was cancelled (marker missing: %v); log:\n%s", err, log.String())
+	}
+	if strings.Contains(log.String(), `"event":"acceptance_preview_teardown_failed"`) {
+		t.Errorf("teardown reported a failure on the cancelled path: %s", log.String())
+	}
+}
+
+// TestAcceptanceTargetGate_TeardownStillBoundedByTimeout pins that detaching
+// the teardown from the runner's cancellation (#3394) did NOT remove its bound:
+// a hung teardown still times out after provisionTimeout and is logged as
+// acceptance_preview_teardown_failed with the `timed out after` detail. It
+// asserts the error EVENT, not an elapsed bound.
+func TestAcceptanceTargetGate_TeardownStillBoundedByTimeout(t *testing.T) {
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	gcfg := fastGateConfig()
+	gcfg.provisionCmd = "true"
+	gcfg.provisionTimeout = 200 * time.Millisecond
+	gcfg.teardownCmd = "sleep 5"
+	var log strings.Builder
+	ctx, cancel := context.WithCancel(context.Background())
+	teardown, reason, detail := acceptanceTargetGate(ctx, gcfg, []string{hostOf(ts)}, testExpectedSHA, "run-1", &log)
+	if reason != "" {
+		t.Fatalf("reason = %q (%s), want proceed", reason, detail)
+	}
+	cancel()
+	teardown()
+	if !strings.Contains(log.String(), `"event":"acceptance_preview_teardown_failed"`) ||
+		!strings.Contains(log.String(), "timed out after") {
+		t.Errorf("missing acceptance_preview_teardown_failed{timed out after}: %s", log.String())
+	}
+}
+
 // A host that cannot form a request URL (defense-in-depth: the egress
 // proxy's allow-list build rejects malformed hosts before the gate runs)
 // classifies unreachable rather than panicking.
