@@ -3677,3 +3677,56 @@ func TestShipPullRequest_AcceptanceScenarioRetirementDropped(t *testing.T) {
 		t.Errorf("entries after a second reason = %d, want 2", n)
 	}
 }
+
+// TestShipPullRequest_AcceptanceScenarioRetirementDropped_RendersOnStatusComment
+// is the cross-boundary route-level check binding condition 1 requires
+// (#3392): it drives the REAL HTTP surface end to end — a signed
+// POST /v0/runs/{run_id}/pull-request (outcome
+// acceptance_scenario_retirement_dropped) followed by a real
+// GET /v0/runs/{run_id}/status-comment through handleGetStatusComment's
+// AuditRepo.ListForRun read path — rather than calling
+// issuecomment.RenderStatusBody directly over the fake's appended entries.
+// newAcceptanceScenarioPRServer's promptRunRepo lacks the read-path fixtures
+// GetRun/ListStagesForRun need, so this test seeds them (rr.getRuns +
+// rr.stagesByRunID) rather than falling back to a direct render call.
+func TestShipPullRequest_AcceptanceScenarioRetirementDropped_RendersOnStatusComment(t *testing.T) {
+	s, sf, _, rr, _, runID, stageID := newAcceptanceScenarioPRServer(t)
+	rr.getRuns[runID] = &run.Run{
+		ID:           runID,
+		Repo:         "x/y",
+		WorkflowID:   "feature_change",
+		State:        run.StateRunning,
+		IssueContext: &run.IssueContext{Number: 101, Title: "t", Body: "b", URL: "https://github.com/x/y/issues/101"},
+	}
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {rr.getStages[stageID]}}
+
+	priv, _ := sf.issue(t, runID)
+	body := []byte(`{"outcome":"acceptance_scenario_retirement_dropped","reason":"persist_failed:push: rejected","retired":[` +
+		`{"id":"scenario:issue-101/crit-b","reason":"behaviour replaced","run_id":"r1","pr":742,"retired_at":"2026-09-12T00:00:00Z"},` +
+		`{"id":"scenario:issue-101/crit-c","reason":"superseded by crit-d","run_id":"r1","pr":742,"retired_at":"2026-09-12T00:00:00Z"}` +
+		`]}`)
+	w := shipPRRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("ship status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s/status-comment", runID), nil)
+	gw := httptest.NewRecorder()
+	s.Handler().ServeHTTP(gw, req)
+	if gw.Code != http.StatusOK {
+		t.Fatalf("status-comment GET status = %d, want 200:\n%s", gw.Code, gw.Body.String())
+	}
+	var resp statusCommentResponse
+	if err := json.Unmarshal(gw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode status-comment response: %v", err)
+	}
+	for _, want := range []string{
+		"`scenario:issue-101/crit-b`", "behaviour replaced",
+		"`scenario:issue-101/crit-c`", "superseded by crit-d",
+		"2 scenarios still replayed", "(persist_failed:push: rejected)",
+	} {
+		if !strings.Contains(resp.Body, want) {
+			t.Errorf("status-comment body missing %q:\n%s", want, resp.Body)
+		}
+	}
+}

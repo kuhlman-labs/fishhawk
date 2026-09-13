@@ -122,7 +122,8 @@ Notes:
   `selectAnchorTimeline` (`anchor_template.go`) partitions the recognized rows
   into a **retained** class — gate decisions, `plan_generated`, stage/outcome
   terminals, `fixup_pushed`, `concern_waived` / `concern_deferred`,
-  `scope_amendment_decided` — and an **informational** class
+  `scope_amendment_decided`, `acceptance_scenario_retirement_dropped` (#3392)
+  — and an **informational** class
   (`informationalTimelineCategories`: `run_dispatched`, `acceptance_dispatched`,
   `deployment_dispatched`, `model_resolved`). `acceptance_dispatched` has TWO
   emit sites since E64.53 / #3174 (see below); both render identically here —
@@ -309,10 +310,14 @@ Notes:
     payload; a malformed payload degrades to a count-free phrase). Deduped on
     the `clarification_requested` `Sequence`.
   - **CI failure** — `ci_failure_retry_dispatched` / `ci_retry_exhausted`.
-  - **Acceptance scenario-corpus reports (E72.4, #3328)** — two audit-only
-    kinds written by `server/pullrequest.go` on the acceptance runner's
-    post-verdict report, each followed by a `notifyStatusUpdate` anchor
-    rebuild (no new comment surface, no page-class ping):
+  - **Acceptance scenario-corpus reports (E72.4, #3328)** — two kinds written
+    by `server/pullrequest.go` on the acceptance runner's post-verdict report,
+    each followed by a `notifyStatusUpdate` anchor rebuild (no new comment
+    surface, no page-class ping). `acceptance_scenarios_pushed` stays
+    audit-only — `activityCategories` does not admit it, so the rebuild
+    renders no line for it; `acceptance_scenario_retirement_dropped` is
+    admitted (#3392, see below) and DOES render on the anchor/status comment
+    timeline:
     `acceptance_scenarios_pushed` `{branch, head_sha, base_sha, scenario_ids,
     scenario_count, retired: [{id, reason, run_id, pr, retired_at}]}` — the
     run-authored scenario-corpus commit (a reported-head ledger row, first in
@@ -331,14 +336,29 @@ Notes:
     an `error` field carries the read error), idempotent per stage+reason,
     actor `system`, with NO `notifyStatusUpdate` refresh and never from the
     preview render. The ship-path validator's non-empty-`retired` rule applies
-    to the RUNNER report, not to this row. **The audit entry is the
-    operator-visible surface for the drop today, NOT the status comment:** the `notifyStatusUpdate` refresh rebuilds
-    the anchor, but `status_template.go`'s closed `activityCategories` set does
-    not admit `acceptance_scenario_retirement_dropped`, so the rebuild renders
-    NO line for it — read the ids and reasons from `GET /v0/runs/{run_id}/audit`.
-    Rendering each dropped id and reason on the anchor (a category entry plus a
-    `renderAcceptanceRetirementDroppedLine` case) is a tracked follow-up, kept
-    out of #3328 to stay under the implement stage's file cap. A
+    to the RUNNER report, not to this row. **The anchor / status comment is a
+    LIVE surface for the drop (#3392):** `status_template.go`'s
+    `activityCategories` admits `acceptance_scenario_retirement_dropped`, and
+    `renderActivityLine` dispatches it to `renderAcceptanceRetirementDroppedLine`,
+    which renders data-drivenly as "Acceptance scenario retirement dropped
+    (`<reason>`): `<N>` scenario(s) still replayed — `<id>` (`<reason>`); …" —
+    EVERY dropped scenario id renders UNCONDITIONALLY (never truncated; the
+    count is bounded by the run's approved `retire_scenario` set), each reason
+    clause is `oneLine`-capped (200 bytes, visible `...` marker — the same cap
+    every other reason clause on this timeline uses) so a handful of long
+    reasons can never blow the anchor's body-size ladder and drop the WHOLE
+    timeline, and the row is **retained** (not informational) under the
+    anchor's 12-row cap. The `notifyStatusUpdate` refresh from the
+    runner-reported writer rebuilds the anchor immediately; the empty-`retired`
+    #3396 second writer emits no refresh of its own, so that row surfaces on
+    the anchor's NEXT rebuild, rendering an honest "no scenario entries on the
+    record — read the run's audit chain" clause (never "0 scenarios", which
+    would read as nothing dropped). No `@`-mention, matching the rest of this
+    timeline. A completeness gate
+    (`backend/internal/issuecomment/activity_categories_completeness_test.go`)
+    now pins `activityCategories` ↔ `renderActivityLine` parity in both
+    directions, which is what would have caught this category's original
+    omission. A
     third kind, `acceptance_scenario_regression` `{scenario_id, origin_pr?,
     origin_issue, origin_run_id, path, origin_unresolved?, observed, expected,
     repro_handle}`, is written by `server/acceptance.go` per FAILED replayed
@@ -1169,6 +1189,14 @@ Notes:
   render-only edit surfaces; the paged variants ALSO fire the page-class ping
   registered above. The class-3 entry keyed by `criterion_ids` is the durable
   per-criterion disposition record E31.11 consumes.
+- **`acceptance_scenario_retirement_dropped` is ALSO a system-actor audit kind
+  with NO dedicated Notifier method (E72.4 / #3328, rendered #3392)** — like
+  the acceptance-evidence kinds directly above, nothing in `issuecomment`
+  posts it via a dedicated method; it renders data-drivenly through
+  `activityCategories` + `renderActivityLine`
+  (`renderAcceptanceRetirementDroppedLine`). See the writer-side detail under
+  "Acceptance scenario-corpus reports (E72.4, #3328)" above for the payload
+  shape, the render contract, and the two writers.
 - **The `not_validated` outcome renders its OWN row (#2347).** When the
   orchestrator's pre-spawn short-circuit settles an acceptance stage it records
   `outcome: not_validated` — the stage verified ZERO criteria (no runner, no

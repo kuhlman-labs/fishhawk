@@ -154,6 +154,42 @@ func TestRenderAnchorBody_AcceptanceTimeline(t *testing.T) {
 	}
 }
 
+// TestRenderAnchorBody_AcceptanceRetirementDroppedTimeline pins #3392: a
+// dropped acceptance-scenario retirement surfaces on the living anchor with
+// every retired scenario id and reason, and (like every other anchor-
+// timeline row) no @-mention.
+func TestRenderAnchorBody_AcceptanceRetirementDroppedTimeline(t *testing.T) {
+	payload, _ := json.Marshal(map[string]any{
+		"reason": "persist_failed:push: rejected",
+		"retired": []map[string]any{
+			{"id": "scenario:issue-101/crit-b", "reason": "behaviour replaced"},
+			{"id": "scenario:issue-101/crit-c", "reason": "superseded by crit-d"},
+		},
+	})
+	entries := []*audit.Entry{
+		{Sequence: 9, Category: "acceptance_scenario_retirement_dropped", Payload: payload, Timestamp: time.Unix(9, 0).UTC()},
+	}
+	body := RenderAnchorBody(AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypeAcceptance, State: run.StageStateSucceeded}},
+		Audit:       entries,
+		ExternalURL: "https://app.example",
+		Now:         time.Unix(1000, 0).UTC(),
+	})
+	for _, want := range []string{
+		"`scenario:issue-101/crit-b`", "behaviour replaced",
+		"`scenario:issue-101/crit-c`", "superseded by crit-d",
+		"2 scenarios still replayed", "(persist_failed:push: rejected)",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("anchor timeline missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "@") {
+		t.Errorf("anchor timeline must never @-mention: %q", body)
+	}
+}
+
 // TestRenderAnchorBody_ModelRecommendationAndResolved pins #1013: the anchor
 // renders the plan's model_recommendation (implement_model + rationale) under
 // the plan, and the gate's resolved model_resolved {value, source} as a
@@ -553,22 +589,27 @@ func TestSelectAnchorTimeline_Partition(t *testing.T) {
 		entries := []*audit.Entry{
 			activityEntry(1, "run_dispatched", nil),
 			activityEntry(2, "fixup_pushed", map[string]any{"files_changed_count": 1}),
+			activityEntry(3, "acceptance_scenario_retirement_dropped",
+				map[string]any{"reason": "persist_failed", "retired": []map[string]any{{"id": "scenario:issue-1/a", "reason": "r"}}}),
 		}
 		got := selectAnchorTimeline(entries, anchorTimelineLimit)
-		if len(got) != 2 {
-			t.Fatalf("got %d rows, want 2", len(got))
+		if len(got) != 3 {
+			t.Fatalf("got %d rows, want 3", len(got))
 		}
-		if got[0].Sequence != 2 || got[1].Sequence != 1 {
-			t.Errorf("not most-recent-first: %d then %d", got[0].Sequence, got[1].Sequence)
+		if got[0].Sequence != 3 || got[1].Sequence != 2 || got[2].Sequence != 1 {
+			t.Errorf("not most-recent-first: %d, %d, %d", got[0].Sequence, got[1].Sequence, got[2].Sequence)
 		}
 	})
 	t.Run("over-cap keeps all retained, drops oldest informational", func(t *testing.T) {
 		var entries []*audit.Entry
-		// 4 retained (fix-ups at seq 1..4) + 10 informational (run_dispatched 5..14).
+		// 5 retained (fix-ups at seq 1..4 + one retirement-drop at seq 5) + 10
+		// informational (run_dispatched 6..15).
 		for i := int64(1); i <= 4; i++ {
 			entries = append(entries, activityEntry(i, "fixup_pushed", map[string]any{"files_changed_count": int(i)}))
 		}
-		for i := int64(5); i <= 14; i++ {
+		entries = append(entries, activityEntry(5, "acceptance_scenario_retirement_dropped",
+			map[string]any{"reason": "persist_failed", "retired": []map[string]any{{"id": "scenario:issue-1/a", "reason": "r"}}}))
+		for i := int64(6); i <= 15; i++ {
 			entries = append(entries, activityEntry(i, "run_dispatched", nil))
 		}
 		got := selectAnchorTimeline(entries, anchorTimelineLimit)
@@ -576,13 +617,20 @@ func TestSelectAnchorTimeline_Partition(t *testing.T) {
 			t.Fatalf("got %d rows, want %d", len(got), anchorTimelineLimit)
 		}
 		retained := 0
+		sawRetirementDrop := false
 		for _, e := range got {
 			if e.Category == "fixup_pushed" {
 				retained++
 			}
+			if e.Category == "acceptance_scenario_retirement_dropped" {
+				sawRetirementDrop = true
+			}
 		}
 		if retained != 4 {
-			t.Errorf("kept %d retained rows, want all 4", retained)
+			t.Errorf("kept %d retained fixup_pushed rows, want all 4", retained)
+		}
+		if !sawRetirementDrop {
+			t.Errorf("acceptance_scenario_retirement_dropped was treated as informational and dropped under the cap")
 		}
 		// Most-recent-first + bounded.
 		for i := 1; i < len(got); i++ {

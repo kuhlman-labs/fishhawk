@@ -759,9 +759,10 @@ new preview head (`runner/internal/scenario`). The backend half is four seams:
   lineage via `auditcomplete.HeadReportCategoriesByPrecedence` (first) and
   `lineageLedgerCategories`) and `acceptance_scenario_retirement_dropped`
   (audit entry idempotent per `stage_id`+`reason` + a status comment refresh
-  that does NOT yet render the drop — `issuecomment`'s `activityCategories`
-  excludes the kind, so the audit entry is the operator-visible surface;
-  rendering it is a tracked follow-up, see `docs/issue-comment-surfaces.md`).
+  that renders the drop as a LIVE anchor/status-comment surface —
+  `issuecomment`'s `activityCategories` admits the kind and
+  `renderAcceptanceRetirementDroppedLine` names every dropped scenario id and
+  reason unconditionally, see `docs/issue-comment-surfaces.md`).
   `acceptance_scenario_retirement_dropped` has a SECOND writer (#3396): the
   dispatch prompt path (`prompt.go` `fillAcceptanceReplayFields(…,
   recordDrop=true)` → `recordAcceptanceRetirementsUnserved`) appends it with
