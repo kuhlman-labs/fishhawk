@@ -1,0 +1,112 @@
+{{- if .Values.rustfs.enabled }}
+# Optional in-cluster RustFS (rustfs.enabled), the local S3-compatible trace
+# store. Single-replica Deployment + PVC + ClusterIP Service exposing the S3 API
+# (9000) + web console (9001), mirroring docker-compose.yml. Not for production —
+# the prod baseline (values.yaml, rustfs.enabled:false) points fishhawkd at
+# external S3. Replaced MinIO after its images were deleted from Docker Hub
+# (#3386).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-rustfs
+  labels:
+    {{- include "fishhawk.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rustfs
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.rustfs.persistence.size }}
+  {{- with .Values.rustfs.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-rustfs
+  labels:
+    {{- include "fishhawk.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rustfs
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "fishhawk.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: rustfs
+  template:
+    metadata:
+      labels:
+        {{- include "fishhawk.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: rustfs
+    spec:
+      # The rustfs image runs as uid 10001. fsGroup makes the PVC mount at /data
+      # group-writable by that uid, so a provisioner that does not create a
+      # world-writable directory does not leave the pod failing readiness with a
+      # permission error in its logs.
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: rustfs
+          image: {{ .Values.rustfs.image | quote }}
+          imagePullPolicy: {{ .Values.rustfs.pullPolicy }}
+          # No args: the image Cmd is `rustfs` and RUSTFS_VOLUMES defaults to
+          # /data; both are stated explicitly below for readability only.
+          ports:
+            - name: api
+              containerPort: 9000
+              protocol: TCP
+            - name: console
+              containerPort: 9001
+              protocol: TCP
+          env:
+            - name: RUSTFS_ACCESS_KEY
+              value: {{ .Values.rustfs.accessKey | quote }}
+            - name: RUSTFS_SECRET_KEY
+              value: {{ .Values.rustfs.secretKey | quote }}
+            - name: RUSTFS_VOLUMES
+              value: /data
+          readinessProbe:
+            # /health answers 200 once the server is up; `/` answers 503.
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            {{- toYaml .Values.rustfs.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "fishhawk.fullname" . }}-rustfs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-rustfs
+  labels:
+    {{- include "fishhawk.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rustfs
+spec:
+  type: ClusterIP
+  ports:
+    - name: api
+      port: {{ .Values.rustfs.apiPort }}
+      targetPort: api
+      protocol: TCP
+    - name: console
+      port: {{ .Values.rustfs.consolePort }}
+      targetPort: console
+      protocol: TCP
+  selector:
+    {{- include "fishhawk.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: rustfs
+{{- end }}

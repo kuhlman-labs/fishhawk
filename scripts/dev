@@ -90,9 +90,13 @@ _pg_ready() {
   fi
 }
 
-_minio_ready() {
-  local endpoint="${MINIO_ENDPOINT:-http://localhost:9000}"
-  curl --silent --fail --max-time 3 "${endpoint}/minio/health/live" &>/dev/null
+# GET /health is the rustfs readiness endpoint (200 once up; `/` answers 503).
+# rustfs also serves /minio/health/live as a compatibility shim, but /health is
+# the documented path and the one the compose healthcheck, the k8s
+# readinessProbe and `fishhawk doctor` all converge on.
+_s3_ready() {
+  local endpoint="${S3_ENDPOINT:-http://localhost:9000}"
+  curl --silent --fail --max-time 3 "${endpoint}/health" &>/dev/null
 }
 
 # Derive the fishhawkd listen port from FISHHAWKD_ADDR (default ':8080').
@@ -520,8 +524,8 @@ _k8s_jaeger_endpoints() {
 
 # _k8s_dump_hook_diagnostics — on a helm failure, surface WHY. Helm blocks on a
 # hook resource until it is ready and reports only a --timeout on failure, hiding
-# an ImagePullBackOff on a hook pod. The minio bucket-bootstrap Job is a
-# post-install/post-upgrade HOOK, so a nonexistent mcImage tag turns into a
+# an ImagePullBackOff on a hook pod. The rustfs bucket-bootstrap Job is a
+# post-install/post-upgrade HOOK, so a nonexistent bootstrapImage tag turns into a
 # six-minute unexplained `helm upgrade` hang with no named cause (#2913). This
 # dumps Jobs + Pods to stderr, then for every pod NOT in a healthy state
 # describes it and, on an image-pull failure, prints a one-line named cause with
@@ -552,7 +556,7 @@ _k8s_dump_hook_diagnostics() {
 # seconds (default 10). Returns 0 on the first healthy response. Returns 1 early
 # if the process has already exited (kill -0 fails — spawn-then-die fails fast
 # instead of waiting the full deadline) or if the deadline elapses. Reuses the
-# minio curl flags for consistency; runs the checks inside if-conditions so
+# rustfs curl flags for consistency; runs the checks inside if-conditions so
 # `set -e` does not abort the loop.
 _await_healthz() {
   local pid="$1"
@@ -2048,30 +2052,30 @@ cmd_up() {
   fi
 
   # Containers preflight — check each independently, but run docker compose up -d at most once.
-  local pg_running=0 minio_running=0
+  local pg_running=0 rustfs_running=0
   if [[ -n "$(docker ps --filter 'name=^/fishhawk-postgres$' --format '{{.Names}}')" ]]; then pg_running=1; fi
-  if [[ -n "$(docker ps --filter 'name=^/fishhawk-minio$' --format '{{.Names}}')" ]]; then minio_running=1; fi
+  if [[ -n "$(docker ps --filter 'name=^/fishhawk-rustfs$' --format '{{.Names}}')" ]]; then rustfs_running=1; fi
 
-  if (( !pg_running || !minio_running )); then
+  if (( !pg_running || !rustfs_running )); then
     if (( start_deps )); then
       print "starting containers..."
       docker compose up -d
       local i=0
       while (( i < 30 )); do
-        _pg_ready && _minio_ready && break
+        _pg_ready && _s3_ready && break
         sleep 2
         (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
       done
       _pg_ready || _die "postgres did not become ready within 60s — check: docker logs fishhawk-postgres"
-      _minio_ready || _die "minio did not become ready within 60s — check: docker logs fishhawk-minio"
+      _s3_ready || _die "rustfs did not become ready within 60s — check: docker logs fishhawk-rustfs"
       print "postgres: ready"
-      print "minio: ready"
+      print "rustfs: ready"
     else
-      _die 'postgres/minio containers not up — run "docker compose up -d", then retry (or pass --start-deps)'
+      _die 'postgres/rustfs containers not up — run "docker compose up -d", then retry (or pass --start-deps)'
     fi
   else
     print "postgres: running"
-    print "minio: running"
+    print "rustfs: running"
   fi
 
   # Build
@@ -2474,7 +2478,7 @@ cmd_k8s_up() {
 
   print "helm upgrade --install fishhawk..."
   # Catch the helm failure ourselves: a hook Job whose pod cannot pull its image
-  # (the minio bucket-bootstrap Job is a post-install/post-upgrade HOOK) makes
+  # (the rustfs bucket-bootstrap Job is a post-install/post-upgrade HOOK) makes
   # `helm upgrade` block until its --timeout and exit non-zero, reporting only a
   # timeout with no named cause (#2913). Dump hook Job + pod state and name the
   # image-pull reason before exiting, mirroring the rollout and /healthz legs'

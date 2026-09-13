@@ -23,7 +23,6 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/testcontainers/testcontainers-go v0.44.0
-	github.com/testcontainers/testcontainers-go/modules/minio v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
 	gopkg.in/yaml.v3 v3.0.1
 )

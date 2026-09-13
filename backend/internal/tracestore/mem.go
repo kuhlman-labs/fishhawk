@@ -16,7 +16,7 @@ import (
 // MemStorage is an in-memory trace bundle store. All operations are
 // mutex-guarded; safe for concurrent use from multiple goroutines
 // (e.g. an httptest.Server handling parallel raw + redacted uploads).
-// Intended for tests that cannot spin a MinIO container.
+// Intended for tests that cannot spin a RustFS container.
 type MemStorage struct {
 	mu   sync.Mutex
 	data map[string][]byte

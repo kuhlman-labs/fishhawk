@@ -4,7 +4,7 @@
 
 # Deployment profile: `prod` (default) or `local`. This is the local-vs-prod
 # signal the Secret guard (fishhawk.validateSecrets) keys off of — dev-only
-# conveniences (a chart-managed Secret, in-cluster Postgres/MinIO default
+# conveniences (a chart-managed Secret, in-cluster Postgres/RustFS default
 # credentials) are permitted ONLY when profile is `local`. values-local.yaml
 # sets profile: local. An operator copying values-local for a real cluster MUST
 # change this back to prod (and supply real secrets) or the render fails loud.
@@ -141,7 +141,7 @@ probes:
 config:
   # Listen address. fishhawkd defaults to :8080; the probes/Service assume 8080.
   addr: ":8080"
-  # Trace storage (S3 / MinIO). Bucket empty disables /v0/runs/{id}/trace.
+  # Trace storage (S3 / RustFS). Bucket empty disables /v0/runs/{id}/trace.
   s3Region: "us-east-1"
   s3Endpoint: ""
   s3Bucket: ""
@@ -418,29 +418,32 @@ postgres:
       cpu: 500m
       memory: 256Mi
 
-# Optional in-cluster MinIO (S3-compatible trace store), gated by minio.enabled.
-# Default false so the prod baseline points at external S3. Mirrors
-# docker-compose.yml (minio RELEASE.2025-01-20T14-49-07Z, path-style). When
+# Optional in-cluster RustFS (S3-compatible trace store), gated by
+# rustfs.enabled. Default false so the prod baseline points at external S3.
+# Mirrors docker-compose.yml (rustfs/rustfs:1.0.0-rc.6, path-style). When
 # enabled, set config.s3Endpoint/s3Bucket to the in-cluster Service (see
 # values-local.yaml). createBucket runs a post-install/upgrade Job that creates
-# the bucket via mc.
-minio:
+# the bucket via the AWS CLI (bootstrapImage). RustFS replaced MinIO after the
+# MinIO server and mc images were deleted from Docker Hub (#3386).
+rustfs:
   enabled: false
-  image: minio/minio:RELEASE.2025-01-20T14-49-07Z
-  # mc client image for the bucket-bootstrap Job. mc and the MinIO server are NOT
-  # co-versioned — minio/mc does not publish a tag for every minio/minio server
-  # release (the 2025-01-20 server tag has no matching mc tag), so this is pinned
-  # INDEPENDENTLY of minio.image and must be a tag that actually EXISTS in the
-  # registry. A nonexistent tag ships silently: the bucket Job is a Helm HOOK, so
-  # an ImagePullBackOff there surfaces only as a `helm upgrade` timeout (#2913).
+  # rustfs/rustfs is Apache-2.0; 1.0.0-rc.6 is a 1.0.0 release candidate.
+  # Verified pullable by the operator on 2026-09-13 (#3386).
+  image: rustfs/rustfs:1.0.0-rc.6
+  # Image for the bucket-bootstrap hook Job (rustfs-bucket-job.yaml). Pinned
+  # INDEPENDENTLY of rustfs.image and MUST be a tag that actually EXISTS in the
+  # registry: the bucket Job is a Helm HOOK, so a nonexistent tag ships silently
+  # — the ImagePullBackOff surfaces only as a `helm upgrade` timeout (#2913).
   # scripts/test-helm-render r15 fail-closes the render gate on an unpublished
   # tag, and `scripts/dev k8s` dumps hook pod state on a helm failure. Verify a
   # new pin is pullable before bumping, per CLAUDE.md's run-time image-pinning
   # rule.
-  mcImage: minio/mc:RELEASE.2025-08-13T08-35-41Z
+  bootstrapImage: amazon/aws-cli:2.36.44
   pullPolicy: IfNotPresent
-  rootUser: fishhawk
-  rootPassword: fishhawk-dev-secret
+  # RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY. The default secretKey is DEV-ONLY:
+  # fishhawk.validateSecrets fails the render outside profile: local.
+  accessKey: fishhawk
+  secretKey: fishhawk-dev-secret
   apiPort: 9000
   consolePort: 9001
   bucket: fishhawk-traces
@@ -533,8 +536,8 @@ secrets:
     githubWebhookSecret: ""   # FISHHAWKD_GITHUB_WEBHOOK_SECRET
     oauthClientSecret: ""     # FISHHAWKD_OAUTH_CLIENT_SECRET
     anthropicApiKey: ""       # FISHHAWKD_ANTHROPIC_API_KEY
-    awsAccessKeyId: ""        # AWS_ACCESS_KEY_ID (S3 / MinIO)
-    awsSecretAccessKey: ""    # AWS_SECRET_ACCESS_KEY (S3 / MinIO)
+    awsAccessKeyId: ""        # AWS_ACCESS_KEY_ID (S3 / RustFS)
+    awsSecretAccessKey: ""    # AWS_SECRET_ACCESS_KEY (S3 / RustFS)
     # PEM contents for the GitHub App private key (rendered under the dotted
     # secretKey above and mounted as a file, NOT injected as env).
     githubAppPrivateKey: ""

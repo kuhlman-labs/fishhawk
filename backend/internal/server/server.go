@@ -109,7 +109,7 @@ type Config struct {
 	// /v0/runs/{id}/signing-key handler; nil leaves it 503.
 	SigningRepo signing.Repository
 
-	// TraceStore persists agent trace bundles to S3 / MinIO. Wired
+	// TraceStore persists agent trace bundles to S3 / RustFS. Wired
 	// by the /v0/runs/{id}/trace handler; nil leaves it 503.
 	TraceStore tracestore.Storage
 

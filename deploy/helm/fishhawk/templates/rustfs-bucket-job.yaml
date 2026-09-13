@@ -1,0 +1,79 @@
+{{- if and .Values.rustfs.enabled .Values.rustfs.createBucket }}
+# Bucket-bootstrap Job: creates the trace bucket in the in-cluster RustFS after
+# install/upgrade, using the AWS CLI (rustfs.bootstrapImage). That image is
+# pinned INDEPENDENTLY of rustfs.image, so it must name a tag that actually
+# exists (see values.yaml; scripts/test-helm-render r15). This Job is a
+# post-install/post-upgrade HOOK, so a pull failure here surfaces to the operator
+# ONLY as a `helm upgrade` timeout, never as a named ImagePullBackOff (#2913) —
+# which is why `scripts/dev k8s` dumps hook pod state on a helm failure.
+#
+# The script: `aws s3api list-buckets` is retried until RustFS accepts requests
+# (retry-until-ready), then `head-bucket` decides whether `create-bucket` runs
+# (idempotent on rerun — an existing bucket is a success, never a failure). A
+# create-bucket that FAILS exits the Job NON-ZERO (`set -e` plus an explicit
+# `|| exit 1`), so Helm reports the failed hook instead of a clean install with
+# no bucket. scripts/test-helm-render r18 extracts this script from the rendered
+# Job and RUNS it against a stubbed `aws` for each of those outcomes, because a
+# render assertion reads the command text and cannot observe its exit status.
+# Path-style addressing is forced via AWS_CONFIG_FILE: with a custom
+# --endpoint-url the CLI would otherwise address `<bucket>.<service>:9000`,
+# which cluster DNS cannot resolve.
+# A Kubernetes `command` overrides the image ENTRYPOINT (`aws`), so /bin/sh runs.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-rustfs-bucket
+  labels:
+    {{- include "fishhawk.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rustfs-bucket
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "fishhawk.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: rustfs-bucket
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap
+          image: {{ .Values.rustfs.bootstrapImage | quote }}
+          imagePullPolicy: {{ .Values.rustfs.pullPolicy }}
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: {{ .Values.rustfs.accessKey | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              value: {{ .Values.rustfs.secretKey | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"
+            - name: AWS_CONFIG_FILE
+              value: /tmp/aws-config
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              printf '[default]\ns3 =\n  addressing_style = path\n' > "$AWS_CONFIG_FILE"
+              endpoint="http://{{ include "fishhawk.fullname" . }}-rustfs:{{ .Values.rustfs.apiPort }}"
+              bucket="{{ .Values.rustfs.bucket }}"
+              echo "waiting for rustfs at $endpoint"
+              until aws --endpoint-url "$endpoint" s3api list-buckets >/dev/null 2>&1; do
+                echo "rustfs not ready yet; retrying in 2s"
+                sleep 2
+              done
+              if aws --endpoint-url "$endpoint" s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
+                echo "bucket $bucket already exists"
+              else
+                aws --endpoint-url "$endpoint" s3api create-bucket --bucket "$bucket" || {
+                  echo "create-bucket failed for bucket $bucket at $endpoint" >&2
+                  exit 1
+                }
+                echo "bucket $bucket created"
+              fi
+              echo "bucket $bucket ready"
+{{- end }}
