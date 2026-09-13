@@ -470,7 +470,12 @@ named resolver: the spec's `base_ref` wins when declared; an OMITTED
 `--base-branch` > `GITHUB_REF_NAME` > `main` ladder the implement push
 uses, so the measurement's base and the PR's base can never disagree. It
 never returns empty, and `diffcov.ChangedLines` still fails closed on an
-empty ref rather than trusting that.
+empty ref rather than trusting that. The package test harness
+(`runTestMain`) unsets `GITHUB_REF_NAME`/`GITHUB_REPOSITORY` before
+`m.Run()`, because an Actions PR build's `N/merge` ref exists in no
+fixture repo and would silently move the ladder's default off `main`
+(#3402); a test that wants the env rung sets it explicitly with
+`t.Setenv`.
 
 **Report hygiene.** The report is written inside the throwaway checkout and
 swept with it, so it never lands in the real working tree as untracked
