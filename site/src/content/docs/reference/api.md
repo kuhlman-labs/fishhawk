@@ -35,7 +35,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **127 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **128 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -146,6 +146,7 @@ The v0 REST API exposes **127 operations** across the paths below, generated fro
 | `POST` | `/v0/runs/{run_id}/pull-request` | Upload a pull-request artifact for an implement stage |
 | `POST` | `/v0/runs/{run_id}/deployment` | Record a deployment artifact for a deploy stage |
 | `POST` | `/v0/runs/{run_id}/acceptance` | Record an acceptance-evidence artifact for an acceptance stage |
+| `POST` | `/v0/runs/{run_id}/acceptance/transcript` | Record an acceptance transcript artifact for an acceptance stage |
 | `POST` | `/v0/runs/{run_id}/deployment/rollback` | Re-dispatch a delegating deploy's rollback path |
 | `POST` | `/v0/runs/{run_id}/installation-token` | Mint a GitHub App installation token for the run's repo |
 | `POST` | `/v0/runs/{run_id}/mcp-token` | Mint a short-lived MCP bearer token for the run |

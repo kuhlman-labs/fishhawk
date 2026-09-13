@@ -3980,6 +3980,74 @@ func TestMigrateDown_ArtifactGroomingReportReversal(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_ArtifactAcceptanceTranscriptReversal pins 0083 (#3329,
+// E72.5) in BOTH directions, mirroring the 0073 test above: after MigrateUp
+// the artifacts kind CHECK ADMITS an 'acceptance_transcript' row, and after
+// rolling back through 0083 it REFUSES one (SQLSTATE 23514 naming
+// artifacts_kind_check) while every prior kind — 0073's 'grooming_report'
+// included — still inserts. A comment-only touch of the migration fails
+// here: the assertion is on the INSERT, not on the rendered constraint text.
+func TestMigrateDown_ArtifactAcceptanceTranscriptReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	runID, stageID := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'pending', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 0, 'acceptance', 'agent', 'claude-code', 'dispatched')`,
+		stageID, runID,
+	); err != nil {
+		t.Fatalf("seed acceptance stage: %v", err)
+	}
+	insertArtifact := func(kind string) error {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO artifacts (id, stage_id, kind, schema_version, content, content_hash)
+			 VALUES ($1, $2, $3, NULL, '{}'::jsonb, 'hash-'||$3)`,
+			uuid.New(), stageID, kind)
+		return err
+	}
+
+	// BEHAVIOR after MigrateUp: the row inserts.
+	if err := insertArtifact("acceptance_transcript"); err != nil {
+		t.Fatalf("insert kind='acceptance_transcript' after MigrateUp: %v — 0083 must make the row insertable", err)
+	}
+	// Remove it before rolling back: 0083's down restores a CHECK the row would
+	// violate (the documented revert-before-use contract).
+	if _, err := pool.Exec(ctx, `DELETE FROM artifacts WHERE kind = 'acceptance_transcript'`); err != nil {
+		t.Fatalf("clear acceptance_transcript artifacts before rollback: %v", err)
+	}
+
+	downThrough(t, url, "0083")
+
+	var checkErr *pgconn.PgError
+	if err := insertArtifact("acceptance_transcript"); !errors.As(err, &checkErr) || checkErr.Code != "23514" {
+		t.Fatalf("insert kind='acceptance_transcript' after rollback returned %v, want SQLSTATE 23514 from artifacts_kind_check", err)
+	}
+	if checkErr.ConstraintName != "artifacts_kind_check" {
+		t.Errorf("rejecting constraint = %q, want artifacts_kind_check", checkErr.ConstraintName)
+	}
+	// The six prior kinds survive the rollback — asserted by inserting each.
+	for _, kind := range []string{"plan", "pull_request", "deployment", "acceptance", "release_notes", "grooming_report"} {
+		if err := insertArtifact(kind); err != nil {
+			t.Errorf("insert kind=%q after 0083 rollback: %v — the rollback must disturb no earlier widening", kind, err)
+		}
+	}
+}
+
 // stagesDispatchedAtColumnSQL counts whether stages.dispatched_at (0072, #2744)
 // exists. 1 after MigrateUp, 0 after the one-step rollback.
 const stagesDispatchedAtColumnSQL = `SELECT count(*) FROM information_schema.columns

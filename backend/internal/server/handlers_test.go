@@ -236,6 +236,28 @@ func TestReleaseNotesPreviewRouteRegistered(t *testing.T) {
 	}
 }
 
+// TestAcceptanceTranscriptRouteRegistered guards the route table: POST
+// /v0/runs/{run_id}/acceptance/transcript (E72.5 / #3329) must reach
+// handleShipAcceptanceTranscript. With no repositories configured
+// requireRunAccount falls through and the handler's dependency guard answers
+// 503 acceptance_transcript_upload_unconfigured — an UNregistered route would
+// instead 404 with the mux's default body, so the 503 code proves the wiring.
+func TestAcceptanceTranscriptRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost,
+		"/v0/runs/"+uuid.New().String()+"/acceptance/transcript?stage_id="+uuid.New().String(),
+		strings.NewReader(`{}`))
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (route reaches handleShipAcceptanceTranscript):\n%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "acceptance_transcript_upload_unconfigured") {
+		t.Errorf("body = %s, want acceptance_transcript_upload_unconfigured", rec.Body.String())
+	}
+}
+
 // TestAccessDeniedRouteRegistered guards the route table: GET
 // /access-denied (E44.31 / #2467) must reach handleAccessDenied. The route is
 // PUBLIC and unauthenticated by design — the operator arriving here has no

@@ -72,4 +72,14 @@ const (
 	// with KindDeployment, 0045 with KindAcceptance, and 0051 with
 	// KindReleaseNotes.
 	KindGroomingReport Kind = "grooming_report"
+	// KindAcceptanceTranscript is E72.5's per-criterion acceptance TRANSCRIPT
+	// (#3329): the runner-shipped record of every request sent, response
+	// observed, assertion evaluated and its outcome, persisted by POST
+	// /v0/runs/{run_id}/acceptance/transcript beside the boolean verdict
+	// (KindAcceptance), whose runner-injected `transcript` ref is
+	// cross-checked against it. Admitted by migration 0083, which widens
+	// artifacts_kind_check; the constant and migration ship together (a
+	// Create with this kind fails SQLSTATE 23514 against the un-widened
+	// CHECK), exactly as 0073 paired with KindGroomingReport.
+	KindAcceptanceTranscript Kind = "acceptance_transcript"
 )

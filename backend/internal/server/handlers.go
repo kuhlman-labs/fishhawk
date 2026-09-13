@@ -156,6 +156,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/deployment", s.requireRunAccount(memberWrite, s.handleShipDeployment))
 	mux.HandleFunc("POST /v0/runs/{run_id}/deployment/rollback", s.requireRunAccount(adminWrite, s.handleRollbackDeployment))
 	mux.HandleFunc("POST /v0/runs/{run_id}/acceptance", s.requireRunAccount(memberWrite, s.handleShipAcceptance))
+	mux.HandleFunc("POST /v0/runs/{run_id}/acceptance/transcript", s.requireRunAccount(memberWrite, s.handleShipAcceptanceTranscript))
 	mux.HandleFunc("POST /v0/runs/{run_id}/installation-token", s.requireRunAccount(adminWrite, s.handleIssueInstallationToken))
 	mux.HandleFunc("POST /v0/runs/{run_id}/mcp-token", s.requireRunAccount(adminWrite, s.handleIssueMCPToken))
 	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments", s.requireRunAccount(memberWrite, s.handleRequestScopeAmendment))

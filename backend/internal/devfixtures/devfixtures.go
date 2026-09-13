@@ -228,6 +228,8 @@ var knownArtifactKinds = map[artifact.Kind]struct{}{
 	artifact.KindAcceptance:     {},
 	artifact.KindReleaseNotes:   {},
 	artifact.KindGroomingReport: {},
+	// E72.5 / #3329: the acceptance transcript beside the verdict.
+	artifact.KindAcceptanceTranscript: {},
 }
 
 var knownActorKinds = map[audit.ActorKind]struct{}{
