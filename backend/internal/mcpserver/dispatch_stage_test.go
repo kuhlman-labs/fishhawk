@@ -2356,16 +2356,20 @@ func autoPreviewStaleTargetFake(t *testing.T) (*dispatchAutoDriveFake, *httptest
 }
 
 // TestDispatchStage_AutoPreviewInjectsProvisionCmdIntoSpawnEnv is the
-// CROSS-BOUNDARY done-means for #3321 proposal 2, asserting in ONE test the two
-// halves that must agree for the runner to actually provision:
+// CROSS-BOUNDARY done-means for #3321 proposal 2, asserting in ONE test the
+// halves that must agree for the runner to actually provision AND tear down:
 //
 //	(1) the verb took the PROCEED branch — a spawned handle, not a needs_target
-//	    park — against a stale REACHABLE target that otherwise refuses; and
-//	(2) the captured spawn env carries FISHHAWK_ACCEPTANCE_PREVIEW_CMD=<default>.
+//	    park — against a stale REACHABLE target that otherwise refuses;
+//	(2) the captured spawn env carries FISHHAWK_ACCEPTANCE_PREVIEW_CMD=<default>;
+//	(3) it ALSO carries FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD=<default
+//	    counterpart> (#3394) — without it the runner provisions, warns
+//	    acceptance_preview_teardown_missing, and leaks the preview instance on
+//	    the target port.
 //
 // Deleting the env append reddens (2) while (1) still passes — precisely the
 // silent degradation (gate proceeds, runner provisions nothing) this exists to
-// catch (#3321 failure mode (c)).
+// catch (#3321 failure mode (c)); deleting the teardown append reddens (3).
 func TestDispatchStage_AutoPreviewInjectsProvisionCmdIntoSpawnEnv(t *testing.T) {
 	f, srv := autoPreviewStaleTargetFake(t)
 	r := &runResolver{
@@ -2398,6 +2402,14 @@ func TestDispatchStage_AutoPreviewInjectsProvisionCmdIntoSpawnEnv(t *testing.T) 
 	if got != acceptancePreviewDefaultCmd {
 		t.Errorf("%s = %q, want %q", acceptancePreviewCmdEnv, got, acceptancePreviewDefaultCmd)
 	}
+	// (3) ...and its teardown counterpart (#3394).
+	gotDown, found := envValue(cap.envs[0], acceptancePreviewTeardownCmdEnv)
+	if !found {
+		t.Fatalf("spawn env carries NO %s — the runner would provision and then leak the preview instance", acceptancePreviewTeardownCmdEnv)
+	}
+	if gotDown != acceptancePreviewDefaultTeardownCmd {
+		t.Errorf("%s = %q, want %q", acceptancePreviewTeardownCmdEnv, gotDown, acceptancePreviewDefaultTeardownCmd)
+	}
 	// The verb returns the durable handle immediately; it performs no bring-up
 	// itself (the ratified design deviation, #3321 condition 6).
 	if out.StageID == "" {
@@ -2406,6 +2418,9 @@ func TestDispatchStage_AutoPreviewInjectsProvisionCmdIntoSpawnEnv(t *testing.T) 
 	joined := strings.Join(out.Warnings, "\n")
 	if !strings.Contains(joined, acceptancePreviewDefaultCmd) {
 		t.Errorf("warnings = %q, want one naming the command the runner will run", joined)
+	}
+	if !strings.Contains(joined, acceptancePreviewDefaultTeardownCmd) {
+		t.Errorf("warnings = %q, want one naming the teardown command the runner will run", joined)
 	}
 }
 
@@ -2437,6 +2452,10 @@ func TestDispatchStage_AutoPreviewInertOnImplementStage(t *testing.T) {
 	if got, found := envValue(cap.envs[0], acceptancePreviewCmdEnv); found {
 		t.Errorf("%s = %q injected on an IMPLEMENT dispatch; auto_preview must be inert outside the acceptance stage",
 			acceptancePreviewCmdEnv, got)
+	}
+	if got, found := envValue(cap.envs[0], acceptancePreviewTeardownCmdEnv); found {
+		t.Errorf("%s = %q injected on an IMPLEMENT dispatch; auto_preview must be inert outside the acceptance stage",
+			acceptancePreviewTeardownCmdEnv, got)
 	}
 }
 
@@ -2484,6 +2503,116 @@ func TestDispatchStage_AutoPreviewPassesOperatorEnvThroughUnchanged(t *testing.T
 	}
 	if got != operatorCmd {
 		t.Errorf("%s = %q, want the OPERATOR value %q — auto_preview must never overwrite it", acceptancePreviewCmdEnv, got, operatorCmd)
+	}
+}
+
+// TestDispatchStage_AutoPreviewPassesOperatorTeardownThroughUnchanged is the
+// teardown-side pass-through pin (#3394): an operator-set
+// FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD under auto_preview:true (default
+// provision) is what the runner resolves — the built-in `scripts/dev
+// preview-down` never overwrites it. The value is read through the same
+// envValue seam the adjacent tests use (NOT by slice position — duplicate-key
+// precedence is the child's to resolve), and the default is additionally
+// asserted absent from the WHOLE env so a shadowing append cannot hide.
+func TestDispatchStage_AutoPreviewPassesOperatorTeardownThroughUnchanged(t *testing.T) {
+	const operatorDown = "make preview-target-down"
+	f, srv := autoPreviewStaleTargetFake(t)
+	r := &runResolver{
+		api: newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(k string) string {
+			if k == acceptancePreviewTeardownCmdEnv {
+				return operatorDown
+			}
+			return ""
+		},
+	}
+	cap := captureAutoPreviewSpawn(t)
+	// os.Environ() is what the verb builds the spawn env from, so the operator's
+	// value must genuinely be there for the pass-through claim to be observable.
+	t.Setenv(acceptancePreviewTeardownCmdEnv, operatorDown)
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", WorkingDir: t.TempDir(), PushAndOpenPR: boolPtr(false),
+		RunnerBinary: "/fake/fishhawk-runner",
+		AutoPreview:  true,
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if out.NeedsTarget != nil {
+		t.Fatalf("NeedsTarget = %+v, want the proceed branch", out.NeedsTarget)
+	}
+	if cap.calls != 1 {
+		t.Fatalf("spawn seam invoked %d times, want exactly 1", cap.calls)
+	}
+	// The provision default is still injected — only the TEARDOWN is operator-owned here.
+	if got, _ := envValue(cap.envs[0], acceptancePreviewCmdEnv); got != acceptancePreviewDefaultCmd {
+		t.Errorf("%s = %q, want the default %q", acceptancePreviewCmdEnv, got, acceptancePreviewDefaultCmd)
+	}
+	got, found := envValue(cap.envs[0], acceptancePreviewTeardownCmdEnv)
+	if !found {
+		t.Fatalf("spawn env carries no %s", acceptancePreviewTeardownCmdEnv)
+	}
+	if got != operatorDown {
+		t.Errorf("%s = %q, want the OPERATOR value %q — auto_preview must never overwrite it", acceptancePreviewTeardownCmdEnv, got, operatorDown)
+	}
+	for _, kv := range cap.envs[0] {
+		if kv == acceptancePreviewTeardownCmdEnv+"="+acceptancePreviewDefaultTeardownCmd {
+			t.Errorf("spawn env carries the built-in teardown default %q alongside the operator's value", kv)
+		}
+	}
+	joined := strings.Join(out.Warnings, "\n")
+	if !strings.Contains(joined, operatorDown) || strings.Contains(joined, acceptancePreviewDefaultTeardownCmd) {
+		t.Errorf("warnings = %q, want the operator teardown named and the default absent", joined)
+	}
+}
+
+// TestDispatchStage_AutoPreviewOperatorProvisionGetsNoDefaultTeardown is the
+// provision-source keying pin (#3394): an operator-set
+// FISHHAWK_ACCEPTANCE_PREVIEW_CMD (source "env") with NO teardown set and
+// auto_preview:true gets NO FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD injected —
+// `scripts/dev preview-down` only knows how to take down what `scripts/dev
+// preview` stood up, so pairing it with a foreign provision hook would tear
+// down the wrong thing. Keying the resolver on the raw flag instead of the
+// provision source reddens this.
+func TestDispatchStage_AutoPreviewOperatorProvisionGetsNoDefaultTeardown(t *testing.T) {
+	const operatorCmd = "make preview-target"
+	f, srv := autoPreviewStaleTargetFake(t)
+	r := &runResolver{
+		api: newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(k string) string {
+			if k == acceptancePreviewCmdEnv {
+				return operatorCmd
+			}
+			return ""
+		},
+	}
+	cap := captureAutoPreviewSpawn(t)
+	t.Setenv(acceptancePreviewCmdEnv, operatorCmd)
+	t.Setenv(acceptancePreviewTeardownCmdEnv, "")
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", WorkingDir: t.TempDir(), PushAndOpenPR: boolPtr(false),
+		RunnerBinary: "/fake/fishhawk-runner",
+		AutoPreview:  true,
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if out.NeedsTarget != nil {
+		t.Fatalf("NeedsTarget = %+v, want the proceed branch (operator provision hook)", out.NeedsTarget)
+	}
+	if cap.calls != 1 {
+		t.Fatalf("spawn seam invoked %d times, want exactly 1", cap.calls)
+	}
+	if got, _ := envValue(cap.envs[0], acceptancePreviewCmdEnv); got != operatorCmd {
+		t.Errorf("%s = %q, want the operator value %q", acceptancePreviewCmdEnv, got, operatorCmd)
+	}
+	if got, found := envValue(cap.envs[0], acceptancePreviewTeardownCmdEnv); found && got != "" {
+		t.Errorf("%s = %q injected next to an OPERATOR provision hook; the default teardown must be keyed on the provision SOURCE, not the flag",
+			acceptancePreviewTeardownCmdEnv, got)
 	}
 }
 

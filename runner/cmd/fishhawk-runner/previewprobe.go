@@ -44,8 +44,17 @@ import (
  *   teardown  — FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD runs best-effort
  *               via defer at the call site, so it covers BOTH the
  *               after-the-verdict-ships happy path and every
- *               post-provision failure return. A teardown failure logs
- *               an event and never changes the stage outcome.
+ *               post-provision failure return. It runs DETACHED from the
+ *               runner's cancellation (context.WithoutCancel) but still
+ *               bounded by the provision timeout (#3394): exec.CommandContext
+ *               refuses to Start on an already-done context, so a stage
+ *               cancelled or killed mid-validation (the SIGTERM chain from the
+ *               MCP verb) would otherwise have its teardown refused and leak
+ *               the preview instance on the target port. The residual is a
+ *               SIGKILL of the runner process itself, which no defer survives
+ *               — covered by `scripts/dev preview`'s pre-provision port
+ *               reclaim on the NEXT provision. A teardown failure logs an
+ *               event and never changes the stage outcome.
  *
  * The probe dials DIRECT from the runner process, never through the
  * ADR-050 egress proxy — the proxy contains the agent, not the runner.
@@ -380,12 +389,21 @@ func acceptanceTargetGate(ctx context.Context, gcfg previewGateConfig, targetHos
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":%q,"run_id":%q,"host":%q,"reason":%q}`+"\n",
 			acceptanceEventTeardownMissing, runID, host,
-			previewCmdEnv+" is set but "+previewTeardownCmdEnv+" is not — the provisioned preview instance will not be torn down")
+			previewCmdEnv+" is set but "+previewTeardownCmdEnv+" is not — the provisioned preview instance will not be torn down; set it, or dispatch with auto_preview:true, which injects both")
 	}
 
 	if gcfg.teardownCmd != "" {
 		teardown = func() {
-			if err := runPreviewCommand(ctx, gcfg.teardownCmd, expectedSHA, host, gcfg.hookDir, gcfg.provisionTimeout); err != nil {
+			// DETACHED from the runner's cancellation, deliberately (#3394): the
+			// defer runs AFTER a cancelled stage's ctx is already done, and
+			// exec.CommandContext returns ctx.Err() from Start on a done context
+			// — so under the parent ctx the teardown never even forks and the
+			// provisioned instance leaks on exactly the cancel path. The
+			// provision timeout still bounds it (runPreviewCommand re-wraps in
+			// WithTimeout), so a hung teardown cannot stall runner exit
+			// indefinitely. Do NOT collapse this back to ctx: the teardown must
+			// outlive the cancellation that triggered it.
+			if err := runPreviewCommand(context.WithoutCancel(ctx), gcfg.teardownCmd, expectedSHA, host, gcfg.hookDir, gcfg.provisionTimeout); err != nil {
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"acceptance_preview_teardown_failed","run_id":%q,"host":%q,"detail":%q}`+"\n",
 					runID, host, err.Error())

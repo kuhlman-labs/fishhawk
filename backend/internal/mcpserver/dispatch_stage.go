@@ -31,7 +31,7 @@ type DispatchStageInput struct {
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement stage; defaults to main. It applies even when push_and_open_pr is false — the runner passes --base-branch (and --check-base-ref for every implement stage) unconditionally and provisions the run worktree from it"`
 	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1), same as fishhawk_run_stage. A bare omitted value resolves to true. On a STANDALONE implement stage false is supported and unchanged (the E22.8/#406 commit-yourself flow): the agent's work is left in the working tree for the operator to commit, and the stage settles on its trace upload. On a DECOMPOSITION CHILD or a FIX-UP pass false is REFUSED (#2691), because those stages settle on a push this flag suppresses — use fishhawk_run_children for a decomposition child, and re-dispatch without push_and_open_pr=false for a fix-up"`
 	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary, then PATH"`
-	AutoPreview   bool   `json:"auto_preview,omitempty" jsonschema:"ACCEPTANCE STAGE ONLY (inert on every other stage): stand the acceptance preview target up as part of this dispatch instead of provisioning it by hand first. It sets FISHHAWK_ACCEPTANCE_PREVIEW_CMD=\"scripts/dev preview\" on the SPAWNED RUNNER, so the runner performs the bring-up through its existing provision -> readiness -> identity -> teardown pipeline (docs/acceptance-preview.md) and this verb still returns the durable handle immediately. An operator-set FISHHAWK_ACCEPTANCE_PREVIEW_CMD in this process ALWAYS wins and is passed through unchanged. Defaults to false, which resolves the preview command from the environment exactly as before"`
+	AutoPreview   bool   `json:"auto_preview,omitempty" jsonschema:"ACCEPTANCE STAGE ONLY (inert on every other stage): stand the acceptance preview target up as part of this dispatch instead of provisioning it by hand first. It sets FISHHAWK_ACCEPTANCE_PREVIEW_CMD=\"scripts/dev preview\" AND FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD=\"scripts/dev preview-down\" on the SPAWNED RUNNER, so the runner performs the bring-up through its existing provision -> readiness -> identity -> teardown pipeline (docs/acceptance-preview.md) and tears the preview down on every exit path, and this verb still returns the durable handle immediately. An operator-set value of EITHER variable in this process ALWAYS wins and is passed through unchanged; the teardown default is injected only when the provision default is (an operator provision hook keeps ownership of its own teardown). Defaults to false, which resolves the preview command from the environment exactly as before"`
 }
 
 // DispatchStageOutput is the non-blocking dispatch handle (#1232). Unlike
@@ -152,11 +152,14 @@ exists to enable no longer requires hand-polling to see.
 
 For a local ACCEPTANCE stage, auto_preview=true collapses the
 provision-then-re-dispatch dance into ONE call (E68.43 / #3321): it sets
-FISHHAWK_ACCEPTANCE_PREVIEW_CMD on the spawned runner, which brings the target
-up itself through its existing provision/readiness/identity pipeline, so a
-dispatch against a stale or absent preview returns a spawned handle instead of
-a needs_target park. An operator-set FISHHAWK_ACCEPTANCE_PREVIEW_CMD wins over
-the built-in default, and the flag is inert on every non-acceptance stage. When
+FISHHAWK_ACCEPTANCE_PREVIEW_CMD and its teardown counterpart
+FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD on the spawned runner (#3394), which
+brings the target up itself through its existing provision/readiness/identity
+pipeline and tears it down afterwards, so a dispatch against a stale or absent
+preview returns a spawned handle instead of a needs_target park. An
+operator-set value of either variable wins over the built-in default, the
+teardown default is injected only alongside the provision default, and the
+flag is inert on every non-acceptance stage. When
 a dispatch DOES park at needs_target, the refusal now names the exact bring-up
 command to run.
 
@@ -306,6 +309,16 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	// source "env" and is ALREADY in os.Environ() above, so nothing is appended
 	// and the operator's value is passed through unchanged.
 	//
+	// The TEARDOWN counterpart rides the same resolution (#3394): the built-in
+	// `scripts/dev preview-down` is injected ONLY when the provision resolved to
+	// the built-in default (provisionSource "auto_preview"), never keyed on the
+	// raw flag — an operator provision hook keeps ownership of its own teardown,
+	// because the default teardown only knows how to take down what the default
+	// provision stood up. An operator-set teardown resolves with source "env",
+	// is already in os.Environ(), and passes through unchanged. Without this
+	// pairing the runner emitted acceptance_preview_teardown_missing and leaked
+	// the preview fishhawkd on the target port (observed on #3328).
+	//
 	// LOCAL-ONLY BY CONSTRUCTION — recorded here so the next reader need not
 	// re-derive it (#3321 operator constraint item 2). This verb's ONLY spawn is
 	// dispatchSpawnDetached (below), whose production value is
@@ -327,9 +340,18 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	previewCmd, previewSource := resolveAcceptancePreviewCmd(r.getenv, in.AutoPreview && in.Stage == "acceptance")
 	if previewSource == "auto_preview" {
 		env = append(env, acceptancePreviewCmdEnv+"="+previewCmd)
+		teardownCmd, teardownSource := resolveAcceptancePreviewTeardownCmd(r.getenv, previewSource)
+		teardownNote := fmt.Sprintf("%s was not set in this process, so the built-in default applies", acceptancePreviewCmdEnv)
+		switch teardownSource {
+		case "auto_preview":
+			env = append(env, acceptancePreviewTeardownCmdEnv+"="+teardownCmd)
+			teardownNote += fmt.Sprintf("; %s was not set either, so its built-in counterpart is injected alongside", acceptancePreviewTeardownCmdEnv)
+		case "env":
+			teardownNote += fmt.Sprintf("; the operator-set %s is passed through unchanged", acceptancePreviewTeardownCmdEnv)
+		}
 		warnings = append(warnings, fmt.Sprintf(
-			"auto_preview: the spawned runner will run %q in %s to provision the acceptance target before validating, and tear it down afterwards (%s was not set in this process, so the built-in default applies).",
-			previewCmd, workingDir, acceptancePreviewCmdEnv))
+			"auto_preview: the spawned runner will run %q in %s to provision the acceptance target before validating, and %q to tear it down afterwards on every exit path (%s).",
+			previewCmd, workingDir, teardownCmd, teardownNote))
 	}
 
 	// (6) Spawn DETACHED — start and return; the runner outlives this call. The

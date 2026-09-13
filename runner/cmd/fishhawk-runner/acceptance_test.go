@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -1701,14 +1702,65 @@ func TestRun_AcceptanceStage_ProvisionWithoutTeardown_WarnsMissingTeardown(t *te
 		t.Fatalf("run = %d, want exitOK (teardown-missing is advisory, not fail-closed):\n%s", got, stderr.String())
 	}
 	out := stderr.String()
-	if !strings.Contains(out, `"event":"acceptance_preview_teardown_missing"`) {
-		t.Errorf("missing acceptance_preview_teardown_missing diagnostic: %s", out)
+	if !strings.Contains(out, `"event":"acceptance_preview_teardown_missing"`) ||
+		!strings.Contains(out, "dispatch with auto_preview:true, which injects both") {
+		t.Errorf("missing acceptance_preview_teardown_missing diagnostic naming the auto_preview remedy: %s", out)
 	}
 	if fu.gotAcceptanceArgs == nil {
 		t.Error("verdict must still ship (advisory warning does not block the stage)")
 	}
 	if invoker.callIdx != 1 {
 		t.Errorf("agent invoked %d times, want 1 (provisioning proceeds after the warning)", invoker.callIdx)
+	}
+}
+
+// TestRun_AcceptanceStage_Cancelled_TeardownRuns is the end-to-end pin for the
+// issue's "tear down on every exit path" ask on the CANCELLED path (#3394),
+// across main.go's defer ordering: the target is verified and the preview
+// provisioned, the runner ctx is then cancelled while the agent is running
+// (the SIGTERM chain from the MCP verb, via the newRunnerContext seam), and the
+// deferred gate teardown must STILL fork `sh -c <teardown>` even though ctx is
+// already done — exec.CommandContext would refuse to Start it under the parent
+// ctx, which is exactly how the leak observed on #3328 arose. The marker file
+// is the committed-state read; reverting the closure to the parent ctx reddens
+// this.
+func TestRun_AcceptanceStage_Cancelled_TeardownRuns(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	marker := markerPath(t)
+	t.Setenv(previewCmdEnv, "true")
+	t.Setenv(previewTeardownCmdEnv, "echo torn > "+marker)
+
+	cancel := withCancelableRunnerContext(t)
+	// Cancel from INSIDE the agent invocation — i.e. deterministically AFTER
+	// the gate provisioned and verified the target, so the teardown has
+	// something to tear down (a timed cancel can land before the gate runs).
+	invoker := &fakeInvoker{
+		canned:    agent.Result{OK: false, FailureCategory: "A", FailureReason: "cancelled mid-stage"},
+		returnErr: context.Canceled,
+		onInvoke:  func(_ int, _ agent.Invocation) { cancel() },
+	}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	out := stderr.String()
+	if got != exitCancelled {
+		t.Fatalf("run = %d, want exitCancelled:\n%s", got, out)
+	}
+	if !strings.Contains(out, `"event":"runner_cancelled"`) {
+		t.Errorf("missing runner_cancelled: %s", out)
+	}
+	if !strings.Contains(out, `"event":"acceptance_target_verified"`) {
+		t.Fatalf("the gate must have verified (and provisioned) BEFORE the cancel landed, else this test proves nothing: %s", out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("teardown must run on a CANCELLED stage (marker missing: %v) — the preview instance leaked:\n%s", err, out)
+	}
+	if strings.Contains(out, `"event":"acceptance_preview_teardown_failed"`) {
+		t.Errorf("teardown reported a failure on the cancelled path: %s", out)
 	}
 }
 

@@ -17,17 +17,19 @@ Both hooks run via `sh -c` in the operator's dispatch `working_dir` — the chec
 | `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` | **provision** — build and serve the merge candidate | once, before the identity gate |
 | `FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD` | **teardown** — stop and remove the preview instance | deferred; on **every** post-provision return |
 
-The teardown hook is deferred the moment it is configured, so it runs on the happy path (after the verdict ships) **and** on every pre-spawn failure that occurs after provisioning began (readiness timeout, stale/unreachable target, any gate failure). It is best-effort: a non-zero teardown exit logs `acceptance_preview_teardown_failed` and never changes the stage outcome.
+The teardown hook is deferred the moment it is configured, so it runs on the happy path (after the verdict ships) **and** on every pre-spawn failure that occurs after provisioning began (readiness timeout, stale/unreachable target, any gate failure) **and** on a stage cancelled or killed mid-validation (the SIGTERM chain from the MCP verb). It is best-effort: a non-zero teardown exit logs `acceptance_preview_teardown_failed` and never changes the stage outcome.
+
+The teardown is **detached from the runner's cancellation** and **bounded by `FISHHAWK_ACCEPTANCE_PREVIEW_TIMEOUT_SECS`** ([#3394](https://github.com/kuhlman-labs/fishhawk/issues/3394)). The deferred closure runs *after* a cancelled stage's context is already done, and `exec.CommandContext` refuses to start a process on a done context — so a teardown bound to the runner context was refused before it forked and the preview leaked on exactly the cancel path. It now runs under `context.WithoutCancel` re-wrapped in the provision timeout, so it outlives the cancellation that triggered it without being able to stall runner exit indefinitely. The residual is a `SIGKILL` of the runner process itself, which no defer survives; the next `scripts/dev preview` reclaims the port (below).
 
 ### `auto_preview`: the loop-side entry point to the same contract (E68.43 / [#3321](https://github.com/kuhlman-labs/fishhawk/issues/3321))
 
-`FISHHAWK_ACCEPTANCE_PREVIEW_CMD` need not be exported by hand. `fishhawk_dispatch_stage(stage:"acceptance", auto_preview:true)` sets it **on the spawned runner's environment** for that dispatch, so the runner provisions the target through exactly the pipeline this document specifies — nothing about the hook contract, the injected variables, the timeouts, the readiness contract or the exit-code semantics changes. It is one call instead of the provision-then-re-dispatch dance.
+Neither variable need be exported by hand. `fishhawk_dispatch_stage(stage:"acceptance", auto_preview:true)` sets **both** `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` and `FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD` **on the spawned runner's environment** for that dispatch ([#3394](https://github.com/kuhlman-labs/fishhawk/issues/3394)), so the runner provisions the target and tears it down through exactly the pipeline this document specifies — nothing about the hook contract, the injected variables, the timeouts, the readiness contract or the exit-code semantics changes. It is one call instead of the provision-then-re-dispatch dance.
 
 Three properties worth stating explicitly:
 
-- **The operator's value always wins.** An exported `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` is already in the verb's `os.Environ()`, so `auto_preview` appends nothing and the runner receives that value unchanged.
-- **The built-in default is `scripts/dev preview`**, which is **fishhawk's own dogfood default** and is meaningless in a non-fishhawk checkout. A non-fishhawk stack must set `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` — which, per the point above, overrides the default everywhere it is used or rendered. Without it, an `auto_preview` dispatch in such a repo results in the ordinary category-C `acceptance_preview_provision_failed` with a bounded output tail.
-- **Non-goal: `auto_preview` does NOT set the teardown hook.** `FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD` remains an operator-configured variable under the contract above. A provision without a teardown leaves the preview running after the verdict ships, exactly as it does when the provision hook is exported by hand.
+- **The operator's value always wins, for either variable.** An exported `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` or `FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD` is already in the verb's `os.Environ()`, so `auto_preview` appends nothing for it and the runner receives that value unchanged.
+- **The built-in defaults are `scripts/dev preview` and its counterpart `scripts/dev preview-down`**, which are **fishhawk's own dogfood defaults** and are meaningless in a non-fishhawk checkout. A non-fishhawk stack must set `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` — which, per the point above, overrides the default everywhere it is used or rendered. Without it, an `auto_preview` dispatch in such a repo results in the ordinary category-C `acceptance_preview_provision_failed` with a bounded output tail.
+- **The default teardown is injected only alongside the default provision.** The teardown resolver keys on the provision's *source*, not on the `auto_preview` flag: an operator-set `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` with no teardown set gets **no** `scripts/dev preview-down` injected, because that command only knows how to take down what `scripts/dev preview` stood up — pairing it with a foreign provision hook would tear down the wrong thing. Such an operator keeps ownership of their own teardown and the runner still emits the advisory `acceptance_preview_teardown_missing` when none is configured. Before #3394 `auto_preview` injected only the provision hook, so every auto_preview dispatch drew that warning and leaked the preview `fishhawkd` on the target port; the leak then blocked the next run's provision.
 
 The same default command is rendered — as a **`run_preview`** action naming `scripts/dev preview <expected head sha>` — on the `needs_target` dispatch refusal and in `next_actions` immediately before a suggested acceptance dispatch, so the bring-up is visible whether or not `auto_preview` is used. Details: `backend/internal/mcpserver/README.md`.
 
@@ -73,10 +75,20 @@ Without a provision command the gate is single-shot against a fixed instance: on
 | provision succeeds, target stale | stage fails pre-spawn, category C, reason `acceptance_target_stale` (expected-vs-got in the detail); teardown runs |
 | provision succeeds, target never ready | stage fails pre-spawn, category C, reason `acceptance_target_unreachable` (`not ready within <budget>` in the detail); teardown runs |
 | provision succeeds, target unverifiable | warn `acceptance_target_unverified`, agent spawns |
+| stage cancelled after provision (SIGTERM chain, mid-validation) | runner exits `130` with `runner_cancelled`; **teardown runs** — it is detached from the runner's cancellation and bounded by the provision timeout (#3394) |
 | declared target, backend sent NO expected head SHA | stage fails pre-spawn, category C, reason `acceptance_expected_head_unresolved`; **no provision command runs** and no teardown is returned |
 | teardown exits non-zero | logged `acceptance_preview_teardown_failed`; **stage outcome unchanged** |
 
 A category-C failure is a pre-spawn infrastructure failure: the acceptance agent never runs, and no verdict ships.
+
+### Leaked previous-run preview
+
+Two controls already hold, so a preview that outlived its run (a `SIGKILL`ed runner, or a pre-#3394 `auto_preview` dispatch) can never silently become the next run's validated target:
+
+- **`scripts/dev preview` reclaims the port before provisioning.** It runs the same `_down_port_fallback` reclaim `scripts/dev down` uses ([#1675](https://github.com/kuhlman-labs/fishhawk/issues/1675)): a stale `fishhawkd`-named listener on the preview port is `TERM`→`KILL`ed and provisioning proceeds; a **foreign** holder fails loud — `preview port <port> already has a foreign listener — run 'scripts/dev preview-down', or kill the pid, then retry` — and is never killed.
+- **The identity gate fails closed on a SHA mismatch.** A squatter serving a different `git_sha` (or a `-dirty` one) is classified `stale` and the stage fails pre-spawn, category C, `acceptance_target_stale` (`TestAcceptanceTargetGate_Stale`), never validated.
+
+Both are on the `scripts/dev` / runner-gate side; there is no separate reclaim step in the verb.
 
 ## Event vocabulary
 

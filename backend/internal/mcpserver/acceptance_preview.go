@@ -12,8 +12,9 @@ import (
  * `scripts/dev preview <head>` by hand, re-dispatch — lived in operator memory
  * and nowhere in the loop's own surfaces. This file holds the shared, PURE
  * renderers that put it on two surfaces (the needs_target refusal and the
- * get_run_status / run_stage next_actions block) plus the resolver that decides
- * whether the SPAWNED RUNNER is the one that provisions.
+ * get_run_status / run_stage next_actions block) plus the two resolvers that
+ * decide whether the SPAWNED RUNNER is the one that provisions AND what it runs
+ * to tear the provisioned instance down afterwards (#3394).
  *
  * The load-bearing split (#3321 operator constraint item 1): the GATE DECISION
  * and the DISPLAY RENDERING are separate concerns and must stay separate.
@@ -21,6 +22,10 @@ import (
  *     means "do not take the preview-cmd proceed branch and do not inject
  *     anything into the spawn env". Defaulting it would make every needs_target
  *     dispatch proceed while provisioning nothing.
+ *   - resolveAcceptancePreviewTeardownCmd is the GATE decision's other half
+ *     (#3394): it keys the built-in `scripts/dev preview-down` on the PROVISION
+ *     SOURCE, not on the raw auto_preview flag, so the default teardown is only
+ *     ever paired with the default provision it is the counterpart of.
  *   - acceptancePreviewDisplayCommand owns the DISPLAY default, so the most
  *     common configuration (no FISHHAWK_ACCEPTANCE_PREVIEW_CMD, auto_preview
  *     false) still renders a CONCRETE command instead of an empty string.
@@ -32,6 +37,22 @@ import (
 // overrides it by setting FISHHAWK_ACCEPTANCE_PREVIEW_CMD, which wins
 // everywhere (docs/acceptance-preview.md).
 const acceptancePreviewDefaultCmd = "scripts/dev preview"
+
+// acceptancePreviewTeardownCmdEnv is the runner's teardown hook
+// (FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD). It byte-mirrors the runner's
+// previewTeardownCmdEnv (runner/cmd/fishhawk-runner/previewprobe.go): the two
+// modules cannot import each other, so each package's tests pin the literal —
+// the same diff-only substitute acceptancePreviewCmdEnv already relies on.
+const acceptancePreviewTeardownCmdEnv = "FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD"
+
+// acceptancePreviewDefaultTeardownCmd is the built-in counterpart of
+// acceptancePreviewDefaultCmd: what tears down the instance `scripts/dev
+// preview` stood up. It is injected ONLY alongside the default provision
+// command (#3394) — an operator who supplied their own provision hook keeps
+// ownership of its teardown, because pairing a foreign provision with
+// `scripts/dev preview-down` would tear down something fishhawk did not
+// provision.
+const acceptancePreviewDefaultTeardownCmd = "scripts/dev preview-down"
 
 // acceptancePreviewActionName is the next_actions / refusal action name for the
 // preview bring-up. It is a named RITUAL STEP, not an MCP tool: the bring-up
@@ -92,6 +113,37 @@ func resolveAcceptancePreviewCmd(getenv func(string) string, autoPreview bool) (
 	}
 	if autoPreview {
 		return acceptancePreviewDefaultCmd, "auto_preview"
+	}
+	return "", ""
+}
+
+// resolveAcceptancePreviewTeardownCmd is the teardown half of the GATE
+// decision (#3394). It answers: does dispatch inject
+// FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD into the spawned runner's env, and
+// with what?
+//
+//   - operator-set FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD -> (that value,
+//     "env"). The operator's value ALWAYS wins, whatever the provision source.
+//   - else provisionSource == "auto_preview" ->
+//     (acceptancePreviewDefaultTeardownCmd, "auto_preview"): the provision
+//     resolved to the built-in default, so its built-in counterpart is injected
+//     next to it.
+//   - else ("", ""): inject NOTHING.
+//
+// The default is keyed on the PROVISION SOURCE, deliberately not on the raw
+// auto_preview flag: an operator-set FISHHAWK_ACCEPTANCE_PREVIEW_CMD resolves
+// with source "env" and gets NO default teardown even under auto_preview:true,
+// because `scripts/dev preview-down` only knows how to take down what
+// `scripts/dev preview` stood up. That operator keeps today's behaviour (the
+// runner warns acceptance_preview_teardown_missing when no teardown is set).
+func resolveAcceptancePreviewTeardownCmd(getenv func(string) string, provisionSource string) (cmd, source string) {
+	if getenv != nil {
+		if v := getenv(acceptancePreviewTeardownCmdEnv); v != "" {
+			return v, "env"
+		}
+	}
+	if provisionSource == "auto_preview" {
+		return acceptancePreviewDefaultTeardownCmd, "auto_preview"
 	}
 	return "", ""
 }
