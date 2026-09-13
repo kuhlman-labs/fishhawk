@@ -456,6 +456,152 @@ func TestRenderStatusBody_AcceptanceActivity(t *testing.T) {
 	}
 }
 
+// acceptanceTranscriptPayload builds an acceptance_outcome_recorded payload
+// carrying the `transcript` block in the shape the ingest records
+// (server/acceptance_transcript.go buildAcceptanceTranscriptSummary):
+// failing_request INSIDE criteria[], the LAST request of a failed row.
+func acceptanceTranscriptPayload(outcome string, passed, total int, criteria []map[string]any) map[string]any {
+	return map[string]any{
+		"outcome": outcome, "criteria_passed": passed, "criteria_total": total,
+		"transcript": map[string]any{
+			"artifact_id":  "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+			"content_hash": strings.Repeat("c", 64),
+			"criteria":     criteria,
+		},
+	}
+}
+
+// TestRenderStatusBody_AcceptanceTranscriptClauses pins E72.5 / #3329: the
+// outcome row names the stored transcript's REST path and, on a rejected
+// outcome with a failed criterion, that criterion's failing request — one case
+// per clause, plus the gates that keep the clause OFF (a non-rejected outcome,
+// a suppressed summary, transcript:null).
+func TestRenderStatusBody_AcceptanceTranscriptClauses(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	const artifactPath = "; transcript /v0/artifacts/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+	failedRow := map[string]any{"id": "crit-a", "outcome": "failed", "request_count": 2,
+		"failing_request": map[string]any{"method": "GET", "path": "/v0/runs/abc/audit?category=acceptance_outcome_recorded", "status": 200}}
+	passedRow := map[string]any{"id": "crit-b", "outcome": "passed", "request_count": 1, "failing_request": nil}
+	cases := []struct {
+		name    string
+		payload map[string]any
+		want    string
+		absent  string
+	}{
+		{
+			name:    "rejected outcome names the transcript path and the failing request",
+			payload: acceptanceTranscriptPayload("rejected", 1, 2, []map[string]any{passedRow, failedRow}),
+			want:    "Acceptance recorded — rejected (1/2 criteria passed)" + artifactPath + " — failing request: `GET /v0/runs/abc/audit?category=acceptance_outcome_recorded` -> 200",
+		},
+		{
+			name:    "accepted outcome names the transcript path only",
+			payload: acceptanceTranscriptPayload("accepted", 2, 2, []map[string]any{passedRow, passedRow}),
+			want:    "Acceptance recorded — accepted (2/2 criteria passed)" + artifactPath,
+			absent:  "failing request",
+		},
+		{
+			// The render gate on the OUTCOME: a failed row under a non-rejected
+			// headline never renders a failing request (the backend suppresses
+			// such a summary anyway; this is the second layer).
+			name:    "non-rejected outcome never renders a failing request",
+			payload: acceptanceTranscriptPayload("accepted", 2, 2, []map[string]any{failedRow}),
+			want:    "Acceptance recorded — accepted (2/2 criteria passed)" + artifactPath,
+			absent:  "failing request",
+		},
+		{
+			// The row gate: the clause names the first FAILED row's request,
+			// never a non-failed row's — a passed row carrying a failing_request
+			// is a malformed block (the backend nulls it on non-failed rows) and
+			// must not be mistaken for the failure.
+			name: "failing clause names the first FAILED row, skipping a non-failed row",
+			payload: acceptanceTranscriptPayload("rejected", 1, 2, []map[string]any{
+				{"id": "crit-z", "outcome": "passed", "request_count": 1, "failing_request": map[string]any{"method": "DELETE", "path": "/wrong", "status": 204}},
+				failedRow,
+			}),
+			want:   " — failing request: `GET /v0/runs/abc/audit?category=acceptance_outcome_recorded` -> 200",
+			absent: "/wrong",
+		},
+		{
+			name:    "rejected with a failed row that recorded zero requests has no failing clause",
+			payload: acceptanceTranscriptPayload("rejected", 0, 1, []map[string]any{{"id": "crit-a", "outcome": "failed", "request_count": 0, "failing_request": nil}}),
+			want:    "Acceptance recorded — rejected (0/1 criteria passed)" + artifactPath,
+			absent:  "failing request",
+		},
+		{
+			name: "undecidable outcome names the transcript path",
+			payload: map[string]any{"outcome": plan.AcceptanceOutcomeUndecidable, "criteria_passed": 1, "criteria_total": 2, "criteria_undecidable": 1,
+				"transcript": map[string]any{"artifact_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "content_hash": strings.Repeat("c", 64), "criteria": []map[string]any{passedRow}}},
+			want:   "Acceptance undecidable — 1/2 criteria could not be decided (1 passed)" + artifactPath,
+			absent: "failing request",
+		},
+		{
+			// Approval condition 1: the verdict is authoritative. A suppressed
+			// summary (criteria:null + the named reason) keeps the pointer and
+			// names the reason; it can carry no failing request by construction.
+			name: "suppressed summary names the reason and renders no failing request",
+			payload: map[string]any{"outcome": "rejected", "criteria_passed": 1, "criteria_total": 2,
+				"transcript": map[string]any{"artifact_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "content_hash": strings.Repeat("c", 64),
+					"criteria": nil, "summary_suppressed": "criterion_outcome_disagrees", "disagreeing_ids": []string{"crit-a"}}},
+			want:   "Acceptance recorded — rejected (1/2 criteria passed)" + artifactPath + " (summary suppressed: criterion_outcome_disagrees)",
+			absent: "failing request",
+		},
+		{
+			name:    "explicit transcript:null renders the pre-transcript row",
+			payload: map[string]any{"outcome": "rejected", "criteria_passed": 1, "criteria_total": 2, "transcript": nil},
+			want:    "Acceptance recorded — rejected (1/2 criteria passed) · ",
+			absent:  "transcript",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := []*audit.Entry{
+				auditEntry(runID, 1, "acceptance_outcome_recorded", "system", now.Add(-1*time.Minute), tc.payload),
+			}
+			body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("expected %q in the activity section\n---\n%s", tc.want, body)
+			}
+			if tc.absent != "" && strings.Contains(body, tc.absent) {
+				t.Errorf("did not expect %q in the activity section\n---\n%s", tc.absent, body)
+			}
+		})
+	}
+}
+
+// TestRenderStatusBody_AcceptanceOutcome_ByteIdenticalWithoutTranscript is
+// the backward-compatibility control: a payload with no transcript key and one
+// carrying the explicit transcript:null render the SAME bytes as each other,
+// and neither mentions a transcript — a pre-transcript runner's anchor is
+// unchanged.
+func TestRenderStatusBody_AcceptanceOutcome_ByteIdenticalWithoutTranscript(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	render := func(payload map[string]any) string {
+		entries := []*audit.Entry{
+			auditEntry(runID, 1, "acceptance_outcome_recorded", "system", now.Add(-1*time.Minute), payload),
+		}
+		return issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	}
+	legacy := render(map[string]any{"outcome": "rejected", "criteria_passed": 1, "criteria_total": 2})
+	withNull := render(map[string]any{"outcome": "rejected", "criteria_passed": 1, "criteria_total": 2, "transcript": nil})
+	if legacy != withNull {
+		t.Errorf("transcript:null changed the render:\n--- legacy ---\n%s\n--- null ---\n%s", legacy, withNull)
+	}
+	if strings.Contains(legacy, "transcript") || strings.Contains(legacy, "failing request") {
+		t.Errorf("a transcript-less payload rendered a transcript clause:\n%s", legacy)
+	}
+	// Non-vacuity: the same fixture WITH a transcript does change the bytes.
+	withTranscript := render(acceptanceTranscriptPayload("rejected", 1, 2, []map[string]any{
+		{"id": "crit-a", "outcome": "failed", "request_count": 1, "failing_request": map[string]any{"method": "GET", "path": "/healthz", "status": 500}},
+	}))
+	if withTranscript == legacy {
+		t.Fatal("the transcript fixture rendered byte-identically to the legacy payload — the control proves nothing")
+	}
+}
+
 // TestRenderStatusBody_AcceptanceNotValidated_NeverReadsAsCertification is the
 // #2347 done-means assertion on the SHIPPED string. This is a rendered-vocabulary
 // change whose correctness compilation cannot enforce — a comment-only or no-op

@@ -20,6 +20,7 @@ import "sort"
 // without a description (a nil-description row would be a confusing list
 // entry for the acceptance agent that reads it).
 var descriptions = map[string]string{
+	"acceptance-dispatched": "feature_change run: plan, implement and review succeeded, acceptance stage (agent) dispatched with a pull_request_opened head and an acceptance_dispatched anchor, ready to receive an acceptance transcript and verdict.",
 	"grooming-confirm-gate": "backlog_grooming run: groom (plan, agent) succeeded with a grooming_report and one approval; confirm (review, human) parked at awaiting_approval; no implement stage.",
 	"plan-gate-parked":      "feature_change run: plan stage parked at awaiting_approval carrying a valid standard_v1 plan artifact.",
 	"split-parent-linked":   "two feature_change runs on repo stub/parent-close (one per forge family), each carrying one split_children_filed linkage row (parent #100, contract child #103, parent_forge github / gitlab) so a stub-forge issues.closed delivery for #103 closes the parent through the E50.6 watcher.",

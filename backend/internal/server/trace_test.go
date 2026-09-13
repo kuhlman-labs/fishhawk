@@ -15,7 +15,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -11768,5 +11770,190 @@ func TestImplementReviewed_RejectWithoutConcernFlag(t *testing.T) {
 				t.Errorf("the key must be OMITTED entirely so pre-#3319 payloads stay byte-identical\npayload: %s", raw[0])
 			}
 		})
+	}
+}
+
+// ---- Acceptance transcript gate evidence (E72.5 / #3329) ----
+
+// acceptanceTranscriptGoldenBytes reads the SHARED golden
+// testdata/wire/acceptance_transcript.json — the same bytes the runner's
+// TestCaptureAcceptanceTranscript_GoldenRoundTrip validates — so the backend
+// validator (exercised at ingest by the real router below) and the runner
+// twin are proven to accept identical bytes.
+func acceptanceTranscriptGoldenBytes(t *testing.T) []byte {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "acceptance_transcript.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// implementReviewPrompt runs runImplementReviews against the harness and
+// returns the single reviewer prompt it rendered.
+func implementReviewPrompt(t *testing.T, s *Server, reviewer *fakePlanReviewer, runID, stageID uuid.UUID) string {
+	t.Helper()
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+	if s.runImplementReviews(t.Context(), runID, stageID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	return reviewer.calls[0]
+}
+
+// TestRunImplementReviews_AcceptanceTranscript_ProducerToConsumer closes the
+// producer-to-consumer gap (approval condition 2) for the implement-review
+// gate evidence: the golden transcript is POSTed through the REAL router
+// (ingest validation), the verdict carrying the runner-shaped ref is POSTed
+// through the real router (summary derived from the STORED artifact onto
+// acceptance_outcome_recorded), and the reviewer prompt is then asserted to
+// render rows that could only have come from that stored artifact — no
+// seeded fixture anywhere between the endpoint and the render.
+func TestRunImplementReviews_AcceptanceTranscript_ProducerToConsumer(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-7"}
+	s, sf, au, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	accStage := rr.seedStage(runRow.ID, 3, run.StageStateSucceeded)
+	accStage.Type = run.StageTypeAcceptance
+	seedValidatedHead(au, runRow.ID, accStage.ID)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	// 1) Transcript through the real router.
+	golden := acceptanceTranscriptGoldenBytes(t)
+	w := shipTranscriptRequest(t, s, runRow.ID, accStage.ID, priv, golden, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("ship transcript status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var trResp acceptanceTranscriptResponse
+	_ = json.NewDecoder(w.Body).Decode(&trResp)
+
+	// 2) Verdict carrying the ref, rows agreeing with the golden.
+	verdict, _ := json.Marshal(acceptanceBody{
+		Verdict: "failed", FailureMode: "assertion_fail",
+		Criteria: critRaw(
+			acceptanceCriterionResult{ID: "crit-a", Result: "failed", Observed: "items empty"},
+			acceptanceCriterionResult{ID: "scenario:issue-12/crit-b", Result: "passed"},
+		),
+		Transcript: &acceptanceTranscriptRef{ArtifactID: trResp.ID.String(), ContentHash: trResp.ContentHash},
+	})
+	if w = shipAcceptanceRequest(t, s, runRow.ID, accStage.ID, priv, verdict, ""); w.Code != http.StatusCreated {
+		t.Fatalf("ship verdict status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	// 3) Consumer: the implement-review prompt renders from the STORED artifact.
+	got := implementReviewPrompt(t, s, reviewer, runRow.ID, implStage.ID)
+	for _, want := range []string{
+		"#### Prior acceptance transcript (machine-derived)",
+		"transcript artifact `" + trResp.ID.String() + "`",
+		"- crit-a: failed (2 requests) — failing request: GET `/v0/runs/2b7c1d4e-0000-4000-8000-000000000101/audit?category=acceptance_outcome_recorded` -> 200\n",
+		"- scenario:issue-12/crit-b: passed (1 requests)\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt missing %q:\n%s", want, got)
+		}
+	}
+	// Bodies and assertion text are stored-only: none may reach the prompt.
+	for _, leak := range []string{`{\"items\":[]}`, "newest acceptance_outcome_recorded carries", "acceptance-dispatched"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("stored-only transcript text %q leaked into the reviewer prompt", leak)
+		}
+	}
+}
+
+// TestRunImplementReviews_AcceptanceTranscript_SuppressedRendersNoRows: a
+// transcript whose outcomes DISAGREE with the verdict (approval condition 1)
+// reaches the reviewer as the artifact id plus the withheld reason only —
+// never a per-criterion story contradicting the verdict headline.
+func TestRunImplementReviews_AcceptanceTranscript_SuppressedRendersNoRows(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-7"}
+	s, sf, au, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	accStage := rr.seedStage(runRow.ID, 3, run.StageStateSucceeded)
+	accStage.Type = run.StageTypeAcceptance
+	seedValidatedHead(au, runRow.ID, accStage.ID)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	w := shipTranscriptRequest(t, s, runRow.ID, accStage.ID, priv, acceptanceTranscriptGoldenBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("ship transcript status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var trResp acceptanceTranscriptResponse
+	_ = json.NewDecoder(w.Body).Decode(&trResp)
+	// The golden says crit-a FAILED; the verdict says it passed.
+	verdict, _ := json.Marshal(acceptanceBody{
+		Verdict: "passed",
+		Criteria: critRaw(
+			acceptanceCriterionResult{ID: "crit-a", Result: "passed"},
+			acceptanceCriterionResult{ID: "scenario:issue-12/crit-b", Result: "passed"},
+		),
+		Transcript: &acceptanceTranscriptRef{ArtifactID: trResp.ID.String(), ContentHash: trResp.ContentHash},
+	})
+	if w = shipAcceptanceRequest(t, s, runRow.ID, accStage.ID, priv, verdict, ""); w.Code != http.StatusCreated {
+		t.Fatalf("ship verdict status = %d:\n%s", w.Code, w.Body.String())
+	}
+	got := implementReviewPrompt(t, s, reviewer, runRow.ID, implStage.ID)
+	if !strings.Contains(got, "Per-criterion rows withheld: the transcript disagreed with the verdict (`criterion_outcome_disagrees`)") {
+		t.Errorf("missing suppression line:\n%s", got)
+	}
+	if strings.Contains(got, "crit-a: failed") {
+		t.Errorf("a suppressed transcript must not render the contradicting row:\n%s", got)
+	}
+}
+
+// TestRunImplementReviews_AcceptanceTranscript_NoneByteIdentical: no recorded
+// outcome, an outcome with transcript:null, and an audit read error all stamp
+// nothing — the reviewer prompt is byte-identical to today's.
+func TestRunImplementReviews_AcceptanceTranscript_NoneByteIdentical(t *testing.T) {
+	render := func(t *testing.T, seed func(au *auditFake, runID uuid.UUID)) string {
+		t.Helper()
+		reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-7"}
+		s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+		if seed != nil {
+			seed(au, runRow.ID)
+		}
+		return implementReviewPrompt(t, s, reviewer, runRow.ID, implStage.ID)
+	}
+	baseline := render(t, nil)
+	if strings.Contains(baseline, "Prior acceptance transcript") {
+		t.Fatalf("baseline must carry no transcript block:\n%s", baseline)
+	}
+	withNull := render(t, func(au *auditFake, runID uuid.UUID) {
+		seedHeadEntry(au, runID, nil, CategoryAcceptanceOutcomeRecorded, 7, map[string]any{"verdict": "passed", "transcript": nil})
+	})
+	if withNull != baseline {
+		t.Error("transcript:null must render byte-identically to no outcome")
+	}
+	withErr := render(t, func(au *auditFake, _ uuid.UUID) {
+		au.listByCategoryErrCategory = CategoryAcceptanceOutcomeRecorded
+	})
+	if withErr != baseline {
+		t.Error("an acceptance-outcome read error must degrade to no block (warn-only)")
+	}
+}
+
+// TestGateAcceptanceTranscriptFromSummary pins the mapping: failing request →
+// Failing* fields, null → empty, suppressed → no rows.
+func TestGateAcceptanceTranscriptFromSummary(t *testing.T) {
+	got := gateAcceptanceTranscriptFromSummary(&acceptanceTranscriptSummary{
+		ArtifactID: "art", Criteria: []acceptanceTranscriptCriterionSummary{
+			{ID: "a", Outcome: "failed", RequestCount: 2, FailingRequest: &acceptanceTranscriptFailingRequest{Method: "POST", Path: "/x", Status: 500}},
+			{ID: "b", Outcome: "passed", RequestCount: 1},
+		},
+	})
+	if got.ArtifactID != "art" || len(got.Criteria) != 2 || got.Criteria[0].FailingMethod != "POST" || got.Criteria[0].FailingPath != "/x" || got.Criteria[0].FailingStatus != 500 || got.Criteria[1].FailingMethod != "" {
+		t.Errorf("mapped = %+v", got)
+	}
+	// Rows populated alongside the reason: the mapper must drop them on the
+	// REASON alone, so a suppressed summary can never carry rows to the render.
+	sup := gateAcceptanceTranscriptFromSummary(&acceptanceTranscriptSummary{ArtifactID: "art", SummarySuppressed: "criterion_not_in_verdict",
+		Criteria: []acceptanceTranscriptCriterionSummary{{ID: "a", Outcome: "failed", RequestCount: 1}}})
+	if sup.SummarySuppressed != "criterion_not_in_verdict" || len(sup.Criteria) != 0 {
+		t.Errorf("suppressed = %+v", sup)
 	}
 }

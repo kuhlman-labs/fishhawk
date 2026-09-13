@@ -4407,3 +4407,134 @@ func TestShipAcceptance_ScenarioUndecidableDoesNotClampRun(t *testing.T) {
 		t.Errorf("replay = %v, want scenarios_skipped 1 and served_mismatch true (served 1, zero entries)", replay)
 	}
 }
+
+// --- transcript linkage (E72.5 / #3329) ------------------------------------
+
+// TestShipAcceptance_WithTranscriptRef_RecordsDerivedBlock: a verdict carrying
+// a resolving transcript ref records the `transcript` block DERIVED from the
+// stored artifact (artifact_id + the last-request rule) on the outcome.
+func TestShipAcceptance_WithTranscriptRef_RecordsDerivedBlock(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedValidatedHead(au, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	tr := seedTranscriptArtifact(t, ar, stageID, artifact.KindAcceptanceTranscript)
+	body, _ := json.Marshal(acceptanceBody{
+		Verdict: "failed", FailureMode: "assertion_fail",
+		Criteria: critRaw(
+			acceptanceCriterionResult{ID: "crit-a", Result: "failed"},
+			acceptanceCriterionResult{ID: "scenario:issue-12/crit-b", Result: "passed"},
+		),
+		Transcript: &acceptanceTranscriptRef{ArtifactID: tr.ID.String(), ContentHash: tr.ContentHash},
+	})
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var payload struct {
+		Transcript *acceptanceTranscriptSummary `json:"transcript"`
+	}
+	if err := json.Unmarshal(lastAppendedByCategory(t, au, CategoryAcceptanceOutcomeRecorded).Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Transcript == nil || payload.Transcript.ArtifactID != tr.ID.String() || len(payload.Transcript.Criteria) != 2 {
+		t.Fatalf("transcript block = %+v", payload.Transcript)
+	}
+	if fr := payload.Transcript.Criteria[0].FailingRequest; fr == nil || fr.Status != 200 || fr.Method != "GET" {
+		t.Errorf("criteria[0].failing_request = %+v, want the last request (GET -> 200)", fr)
+	}
+	out, err := s.latestAcceptanceOutcome(context.Background(), runID)
+	if err != nil || out.Transcript == nil || out.Transcript.ArtifactID != tr.ID.String() {
+		t.Errorf("latestAcceptanceOutcome.Transcript = %+v err=%v", out.Transcript, err)
+	}
+}
+
+// TestShipAcceptance_WithoutTranscript_RecordsExplicitNull: no ref → the
+// outcome carries transcript:null (present, not absent) and the consumer
+// decodes nil.
+func TestShipAcceptance_WithoutTranscript_RecordsExplicitNull(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedValidatedHead(au, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	raw := string(lastAppendedByCategory(t, au, CategoryAcceptanceOutcomeRecorded).Payload)
+	if !strings.Contains(raw, `"transcript":null`) {
+		t.Errorf("payload missing explicit transcript:null: %s", raw)
+	}
+	out, err := s.latestAcceptanceOutcome(context.Background(), runID)
+	if err != nil || out.Transcript != nil {
+		t.Errorf("Transcript = %+v err=%v, want nil", out.Transcript, err)
+	}
+}
+
+// TestShipAcceptance_TranscriptRefMismatch_RejectsAndPersistsNothing is the
+// counterfactual vehicle for the cross-check: bad state is seeded BY
+// CONSTRUCTION (a real transcript artifact plus a ref that disagrees with it
+// on hash / stage / kind), and the assertion is on COMMITTED STATE — no
+// artifact, no outcome — not only on the error.
+func TestShipAcceptance_TranscriptRefMismatch_RejectsAndPersistsNothing(t *testing.T) {
+	cases := []struct {
+		name string
+		ref  func(ar *fakeArtifactRepo, stageID uuid.UUID) acceptanceTranscriptRef
+		want string
+	}{
+		{"hash mismatch", func(ar *fakeArtifactRepo, stageID uuid.UUID) acceptanceTranscriptRef {
+			tr := seedTranscriptArtifact(t, ar, stageID, artifact.KindAcceptanceTranscript)
+			return acceptanceTranscriptRef{ArtifactID: tr.ID.String(), ContentHash: strings.Repeat("f", 64)}
+		}, transcriptContentHashMismatch},
+		{"stage mismatch", func(ar *fakeArtifactRepo, _ uuid.UUID) acceptanceTranscriptRef {
+			tr := seedTranscriptArtifact(t, ar, uuid.New(), artifact.KindAcceptanceTranscript)
+			return acceptanceTranscriptRef{ArtifactID: tr.ID.String(), ContentHash: tr.ContentHash}
+		}, transcriptArtifactStageMismatch},
+		{"kind mismatch", func(ar *fakeArtifactRepo, stageID uuid.UUID) acceptanceTranscriptRef {
+			tr := seedTranscriptArtifact(t, ar, stageID, artifact.KindAcceptance)
+			return acceptanceTranscriptRef{ArtifactID: tr.ID.String(), ContentHash: tr.ContentHash}
+		}, transcriptArtifactKindMismatch},
+		{"not found", func(_ *fakeArtifactRepo, _ uuid.UUID) acceptanceTranscriptRef {
+			return acceptanceTranscriptRef{ArtifactID: uuid.New().String(), ContentHash: strings.Repeat("0", 64)}
+		}, transcriptArtifactNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			s, sf, ar, au, _ := newAcceptanceServer(t, runID, stageID)
+			seedValidatedHead(au, runID, stageID)
+			priv, _ := sf.issue(t, runID)
+			ref := tc.ref(ar, stageID)
+			before := len(ar.all)
+			body, _ := json.Marshal(acceptanceBody{
+				Verdict:    "passed",
+				Criteria:   critRaw(acceptanceCriterionResult{ID: "crit-a", Result: "passed"}),
+				Transcript: &ref,
+			})
+			w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "acceptance_invalid") || !strings.Contains(w.Body.String(), tc.want) {
+				t.Fatalf("status = %d, want 400 acceptance_invalid/%s:\n%s", w.Code, tc.want, w.Body.String())
+			}
+			if len(ar.all) != before {
+				t.Errorf("artifacts grew %d -> %d: a rejected verdict must persist nothing", before, len(ar.all))
+			}
+			if n := countByCategory(au, CategoryAcceptanceOutcomeRecorded); n != 0 {
+				t.Errorf("acceptance_outcome_recorded entries = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// lastAppendedByCategory returns the newest appended entry of a category.
+func lastAppendedByCategory(t *testing.T, au *auditFake, category string) audit.ChainAppendParams {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for i := len(au.appended) - 1; i >= 0; i-- {
+		if au.appended[i].Category == category {
+			return au.appended[i]
+		}
+	}
+	t.Fatalf("no appended %s entry", category)
+	return audit.ChainAppendParams{}
+}

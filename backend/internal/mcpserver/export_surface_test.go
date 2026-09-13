@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 279 names are tool I/O request/response structs. The MCP
+// The bulk of these 282 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -35,6 +35,12 @@ var exportBaseline = []string{
 	"AcceptanceNeedsTarget",
 	"AcceptanceSlot",
 	"AcceptanceSlotClaim",
+	// E72.5 / #3329: the typed acceptance_transcript block on
+	// fishhawk_get_run_status (status + per-criterion row + failing-request
+	// triple), exported for the SDK's jsonschema reflection like every DTO.
+	"AcceptanceTranscriptCriterion",
+	"AcceptanceTranscriptRequest",
+	"AcceptanceTranscriptStatus",
 	"AnswerClarificationInput",
 	"AnswerClarificationOutput",
 	"ApproveDeployInput",

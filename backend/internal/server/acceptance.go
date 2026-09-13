@@ -296,6 +296,17 @@ type acceptanceBody struct {
 	// this decoder. Optional: absent on every pre-corpus runner and on a
 	// replay-disabled stage, where the recorded outcome carries replay:null.
 	Replay *acceptanceReplay `json:"replay,omitempty"`
+	// Transcript is the RUNNER-INJECTED ref to the acceptance transcript
+	// artifact (E72.5 / #3329) shipped to POST
+	// /v0/runs/{run_id}/acceptance/transcript BEFORE this verdict. Like
+	// Replay it is injected AFTER the agent's verdict validated against the
+	// runner's closed agent-facing schema (upload.InjectTranscript), so an
+	// agent-authored `transcript` never reaches this decoder. Optional: absent
+	// on every pre-transcript runner and when the transcript ship failed
+	// (best-effort — the verdict still ships), where the recorded outcome
+	// carries transcript:null. handleShipAcceptance cross-checks the ref
+	// against the stored artifact fail-closed (resolveAcceptanceTranscriptRef).
+	Transcript *acceptanceTranscriptRef `json:"transcript,omitempty"`
 
 	// scenarioRows is the `scenario:`-prefixed partition of the verdict rows
 	// (E72.4 / #3328), split out of normalizedCriteria by validate() so every
@@ -866,6 +877,34 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Transcript ref cross-check (E72.5 / #3329), fail-closed and BEFORE any
+	// persistence: a ref that does not resolve to THIS stage's stored
+	// acceptance_transcript with the referenced hash is a malformed verdict
+	// body (a runner defect or a forged ref) and rejects the ship outright.
+	// The per-criterion summary is then derived from the STORED content —
+	// never from anything the verdict body carried — and cross-checked
+	// against the verdict's own rows; a disagreement suppresses the rendered
+	// summary but NEVER changes the verdict (approval condition 1: the
+	// verdict is authoritative, the transcript descriptive).
+	var transcriptSummary *acceptanceTranscriptSummary
+	if acc.Transcript != nil {
+		art, terr := s.resolveAcceptanceTranscriptRef(r.Context(), stageID, *acc.Transcript)
+		if terr != nil {
+			s.writeError(w, r, http.StatusBadRequest, "acceptance_invalid",
+				"acceptance transcript ref does not resolve to this stage's stored transcript",
+				map[string]any{"error": terr.Error()})
+			return
+		}
+		sum, serr := buildAcceptanceTranscriptSummary(art, append(append([]acceptanceCriterionResult(nil), acc.normalizedCriteria...), acc.scenarioRows...))
+		if serr != nil {
+			s.writeError(w, r, http.StatusBadRequest, "acceptance_invalid",
+				"stored acceptance transcript no longer validates",
+				map[string]any{"error": serr.Error()})
+			return
+		}
+		transcriptSummary = &sum
+	}
+
 	contentHash := sha256Hex(body)
 	passed, failed, skipped, undecidable, total := acceptanceCriteriaTally(acc.normalizedCriteria)
 
@@ -1053,6 +1092,14 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		// records replay:null so a consumer can tell "no corpus replayed" from a
 		// zero-valued header.
 		fields["replay"] = acceptanceReplayPayload(acc)
+		// Transcript summary (E72.5 / #3329): derived from the STORED
+		// artifact. Absent body.transcript records transcript:null so a
+		// consumer can tell "no transcript shipped" from a zero-valued block.
+		if transcriptSummary != nil {
+			fields["transcript"] = transcriptSummary
+		} else {
+			fields["transcript"] = nil
+		}
 		p, _ := json.Marshal(fields)
 		return p
 	}
@@ -1462,6 +1509,10 @@ type acceptanceOutcome struct {
 	CriteriaSkipped int
 	StageID         *uuid.UUID
 	Recorded        bool
+	// Transcript is the decoded `transcript` block (E72.5 / #3329): nil when
+	// the payload carries null, no block, or an undecodable one. The producer
+	// symbol the implement-review gate-evidence stamping consumes.
+	Transcript *acceptanceTranscriptSummary
 }
 
 // latestAcceptanceOutcome returns the newest (highest-Sequence)
@@ -1496,9 +1547,10 @@ func (s *Server) latestAcceptanceOutcome(ctx context.Context, runID uuid.UUID) (
 	}
 	out := acceptanceOutcome{Sequence: latest.Sequence, StageID: latest.StageID, Recorded: true}
 	var p struct {
-		Verdict         string `json:"verdict"`
-		CriteriaFailed  int    `json:"criteria_failed"`
-		CriteriaSkipped int    `json:"criteria_skipped"`
+		Verdict         string          `json:"verdict"`
+		CriteriaFailed  int             `json:"criteria_failed"`
+		CriteriaSkipped int             `json:"criteria_skipped"`
+		Transcript      json.RawMessage `json:"transcript"`
 	}
 	if uerr := json.Unmarshal(latest.Payload, &p); uerr != nil {
 		// A malformed outcome payload is a recorded-but-unreadable verdict:
@@ -1509,6 +1561,7 @@ func (s *Server) latestAcceptanceOutcome(ctx context.Context, runID uuid.UUID) (
 	out.Verdict = p.Verdict
 	out.CriteriaFailed = p.CriteriaFailed
 	out.CriteriaSkipped = p.CriteriaSkipped
+	out.Transcript = decodeAcceptanceTranscriptSummary(p.Transcript)
 	return out, nil
 }
 
