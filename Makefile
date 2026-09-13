@@ -27,7 +27,7 @@ help: ## Show this help.
 # ----- local stack ---------------------------------------------------------
 
 .PHONY: up
-up: ## Bring up Postgres + MinIO via docker compose.
+up: ## Bring up Postgres + RustFS via docker compose.
 	docker compose up -d
 
 .PHONY: down
@@ -46,14 +46,9 @@ k8s-up: ## Build the image + helm-install the chart on Docker-Desktop k8s, gate 
 k8s-down: ## Tear down the local k8s deployment (port-forward + helm uninstall).
 	scripts/dev k8s-down
 
-.PHONY: minio-init
-minio-init: ## Create the MinIO trace bucket on the local stack (idempotent).
-	@docker compose exec -T minio mc alias set local http://localhost:9000 fishhawk fishhawk-dev-secret >/dev/null
-	@if docker compose exec -T minio mc ls local/fishhawk-traces >/dev/null 2>&1; then \
-		echo "bucket fishhawk-traces already exists; nothing to do"; \
-	else \
-		docker compose exec -T minio mc mb local/fishhawk-traces; \
-	fi
+.PHONY: s3-init
+s3-init: ## Create the RustFS trace bucket on the local stack (idempotent; exits non-zero if the bucket cannot be created).
+	docker compose --profile init run --rm s3-init
 
 .PHONY: migrate
 migrate: ## Apply backend Postgres migrations.

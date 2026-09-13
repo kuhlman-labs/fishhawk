@@ -218,7 +218,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		checks = []checkResult{
 			checkDockerDaemon(),
 			checkPostgresContainer(),
-			checkMinioContainer(),
+			checkRustfsContainer(),
 			checkBackend(*cf.backendURL),
 			checkToken(*cf.backendURL, cred, readiness),
 			checkSpec(*workingDir),
@@ -322,30 +322,31 @@ func checkPostgresContainer() checkResult {
 	return checkResult{label: label, detail: "accepting connections", status: "ok"}
 }
 
-// checkMinioContainer verifies the fishhawk-minio container is running and
-// its health endpoint returns 200.
-func checkMinioContainer() checkResult {
-	label := "minio container"
-	out, err := doctorRunOutput("docker", "ps", "--filter", "name=^/fishhawk-minio$", "--format", "{{.Names}}")
+// checkRustfsContainer verifies the fishhawk-rustfs container is running and
+// its GET /health endpoint returns 200 (rustfs answers 503 on `/`, so the
+// root path is not a usable probe).
+func checkRustfsContainer() checkResult {
+	label := "rustfs container"
+	out, err := doctorRunOutput("docker", "ps", "--filter", "name=^/fishhawk-rustfs$", "--format", "{{.Names}}")
 	if err != nil || strings.TrimSpace(out) == "" {
 		return checkResult{label: label, detail: "not running", status: "fail",
 			remediate: "run: docker compose up -d"}
 	}
-	// Port 9000 is hardcoded; if .env overrides MINIO_PORT this rung will not read it (v1 limitation).
-	req, reqErr := http.NewRequest(http.MethodGet, "http://localhost:9000/minio/health/live", nil)
+	// Port 9000 is hardcoded; if .env overrides FISHHAWKD_S3_ENDPOINT this rung will not read it (v1 limitation).
+	req, reqErr := http.NewRequest(http.MethodGet, "http://localhost:9000/health", nil)
 	if reqErr != nil {
 		return checkResult{label: label, detail: reqErr.Error(), status: "warn",
-			remediate: "minio container is up but health probe failed; check logs with docker logs fishhawk-minio"}
+			remediate: "rustfs container is up but health probe failed; check logs with docker logs fishhawk-rustfs"}
 	}
 	resp, doErr := doctorHTTPDo(req)
 	if doErr != nil {
 		return checkResult{label: label, detail: "container up, health probe failed", status: "warn",
-			remediate: "minio container is up but health probe failed; check logs with docker logs fishhawk-minio"}
+			remediate: "rustfs container is up but health probe failed; check logs with docker logs fishhawk-rustfs"}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return checkResult{label: label, detail: fmt.Sprintf("container up, health probe returned HTTP %d", resp.StatusCode), status: "warn",
-			remediate: "minio container is up but health probe failed; check logs with docker logs fishhawk-minio"}
+			remediate: "rustfs container is up but health probe failed; check logs with docker logs fishhawk-rustfs"}
 	}
 	return checkResult{label: label, detail: "healthy", status: "ok"}
 }

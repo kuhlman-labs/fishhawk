@@ -10,7 +10,7 @@ Fishhawk develops itself through Fishhawk: since Day 22 of the v0 build (2026-05
 
 ## Quickstart
 
-Local setup brings up the backend against a Postgres + MinIO stack and validates a workflow.
+Local setup brings up the backend against a Postgres + RustFS stack and validates a workflow.
 
 **Prerequisites:** [Go 1.25+](https://go.dev/dl/), [Docker](https://www.docker.com/), and — only for the Web UI — [Node 22+](https://nodejs.org/) with [pnpm 10+](https://pnpm.io/).
 
@@ -18,7 +18,7 @@ The [`Makefile`](Makefile) wraps the common loops (`make help` lists every targe
 
 ```sh
 cp .env.example .env        # optional: populate later for GitHub App / OAuth / trace storage
-make up                     # docker compose: Postgres :5432, MinIO :9000/:9001
+make up                     # docker compose: Postgres :5432, RustFS :9000/:9001
 make migrate                # apply backend migrations
 make dev-backend            # run fishhawkd on :8080 — http://localhost:8080/healthz
 make validate               # validate .fishhawk/workflows.yaml with the CLI
@@ -30,7 +30,7 @@ The Web UI (plan review, approvals, per-run audit log) is optional:
 make dev-frontend           # in another terminal: http://localhost:5173 (proxies /v0)
 ```
 
-Without a GitHub App configured, the OAuth and webhook endpoints respond 503 — runs, plans, and the audit log still work. Trace storage is opt-in: run `make minio-init` once, then uncomment the trace-storage block in `.env`. To wire up sign-in and GitHub events, see [`docs/github-app/README.md`](docs/github-app/README.md).
+Without a GitHub App configured, the OAuth and webhook endpoints respond 503 — runs, plans, and the audit log still work. Trace storage is opt-in: run `make s3-init` once (it creates the `fishhawk-traces` bucket in the RustFS container and is safe to rerun), then uncomment the trace-storage block in `.env`. A stack created before RustFS replaced MinIO (#3386) keeps its old `fishhawk-minio` container and `fishhawk-minio-data` volume: `make up` creates the new `fishhawk-rustfs` service alongside them; remove the leftovers with `docker rm -f fishhawk-minio && docker volume rm fishhawk_fishhawk-minio-data`. To wire up sign-in and GitHub events, see [`docs/github-app/README.md`](docs/github-app/README.md).
 
 ### A sample workflow
 
