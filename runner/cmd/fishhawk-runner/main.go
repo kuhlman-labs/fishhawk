@@ -101,6 +101,7 @@ type uploadClient interface {
 	ShipTrace(ctx context.Context, args upload.ShipArgs) (*upload.ShipResult, error)
 	ShipPlan(ctx context.Context, args upload.ShipPlanArgs) (*upload.ShipPlanResult, error)
 	ShipAcceptance(ctx context.Context, args upload.ShipAcceptanceArgs) (*upload.ShipAcceptanceResult, error)
+	ShipAcceptanceTranscript(ctx context.Context, args upload.ShipAcceptanceTranscriptArgs) (*upload.ShipAcceptanceTranscriptResult, error)
 	ShipPullRequest(ctx context.Context, args upload.ShipPullRequestArgs) (*upload.ShipPullRequestResult, error)
 	FetchPrompt(ctx context.Context, args upload.FetchPromptArgs) (*upload.FetchedPrompt, error)
 	FetchInstallationToken(ctx context.Context, args upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error)
@@ -1980,6 +1981,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// routing the failure is E31.8's scope. acceptanceVerdictRedacted
 	// carries the redacted bytes to the post-trace ShipAcceptance below.
 	var acceptanceVerdictRedacted []byte
+	// acceptanceTranscriptRedacted carries the validated + redacted
+	// acceptance transcript (E72.5 / #3329) to the post-trace ship below;
+	// nil when the agent wrote none or it was dropped (never a failure).
+	var acceptanceTranscriptRedacted []byte
 	if stageType == "acceptance" && res.OK {
 		// Shared runner-log seam for the capture (legacy-path deprecation) and
 		// validate (coercion) events.
@@ -2050,6 +2055,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// consumers dispatch on the raw variant too (the same posture
 			// as composeGateEvidence, #963/#793).
 			res.Events = append(res.Events, composeAcceptanceEvidence(redacted))
+			// Transcript capture (E72.5 / #3329), AFTER the verdict validated
+			// and only then: the transcript is evidence beside a settled
+			// verdict, never a gate on it. Every drop is a named non-fatal
+			// event inside captureAcceptanceTranscript. The trace bundle's
+			// acceptance_evidence event above deliberately lacks the
+			// transcript ref — it is composed pre-trace, before the ship.
+			acceptanceTranscriptRedacted = captureAcceptanceTranscript(
+				acceptanceTranscriptPath(cfg.runID, cfg.stageID),
+				acceptanceServedVerdictIDs(acceptanceCriteriaIDs, acceptanceReplaySet), acceptanceWarn)
 		}
 	}
 
@@ -2663,6 +2677,36 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// demoted to B above) never ships, and only fires on the
 		// acceptance stage type.
 		if res.OK && stageType == "acceptance" {
+			// Transcript ship FIRST (E72.5 / #3329), so the verdict can carry
+			// the backend-minted ref. BEST-EFFORT: a ship failure logs
+			// acceptance_transcript_upload_failed and the verdict ships WITHOUT
+			// a ref — the failure category never changes, because the verdict
+			// is authoritative and the transcript is descriptive. The ref is
+			// injected AFTER the verdict's redaction, which is safe because it
+			// carries only backend-minted values (artifact id, content hash).
+			if len(acceptanceTranscriptRedacted) > 0 {
+				trRes, trErr := client.ShipAcceptanceTranscript(ctx, upload.ShipAcceptanceTranscriptArgs{
+					RunID:      cfg.runID,
+					StageID:    cfg.stageID,
+					Body:       acceptanceTranscriptRedacted,
+					PrivateKey: issuedKey.PrivateKey,
+				})
+				if trErr != nil {
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"acceptance_transcript_upload_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+						cfg.runID, cfg.stageID, trErr.Error())
+				} else if injected, injErr := upload.InjectTranscript(acceptanceVerdictRedacted,
+					upload.AcceptanceTranscriptRef{ArtifactID: trRes.ID, ContentHash: trRes.ContentHash}); injErr != nil {
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"acceptance_transcript_upload_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+						cfg.runID, cfg.stageID, "inject ref: "+injErr.Error())
+				} else {
+					acceptanceVerdictRedacted = injected
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"acceptance_transcript_shipped","run_id":%q,"stage_id":%q,"artifact_id":%q,"content_hash":%q,"idempotent":%t}`+"\n",
+						cfg.runID, cfg.stageID, trRes.ID, trRes.ContentHash, trRes.Idempotent)
+				}
+			}
 			shipRes, err := client.ShipAcceptance(ctx, upload.ShipAcceptanceArgs{
 				RunID:      cfg.runID,
 				StageID:    cfg.stageID,
@@ -10238,6 +10282,10 @@ func sweepStaleAcceptanceVerdict(cfg config, logSink io.Writer) bool {
 	for _, path := range []string{
 		acceptanceVerdictPath(cfg.runID, cfg.stageID),
 		legacyAcceptanceVerdictPath,
+		// The keyed transcript sidecar (E72.5 / #3329) — same freshness
+		// defense: a prior invocation's transcript at this run/stage key must
+		// never be shipped beside a fresh verdict.
+		acceptanceTranscriptPath(cfg.runID, cfg.stageID),
 	} {
 		rerr := os.Remove(path)
 		switch {

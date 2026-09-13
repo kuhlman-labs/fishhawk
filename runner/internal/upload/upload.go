@@ -77,8 +77,15 @@ var (
 	// the protocol layer: the agent's verdict is bad, not the network,
 	// so the call site classifies it category-B (E31.7 / #1535).
 	ErrAcceptanceInvalid = errors.New("upload: acceptance verdict rejected as invalid")
-	ErrAlreadyIssued     = errors.New("upload: signing key already issued for this run")
-	ErrNotFound          = errors.New("upload: run or signing key not found")
+	// ErrAcceptanceTranscriptInvalid surfaces when the backend rejects the
+	// acceptance transcript body (400 acceptance_transcript_invalid) — a
+	// value outside the ingest grammar (E72.5 / #3329). Permanent at the
+	// protocol layer; the call site logs acceptance_transcript_upload_failed
+	// and ships the verdict WITHOUT a transcript ref (best-effort — a
+	// transcript problem never changes the verdict outcome).
+	ErrAcceptanceTranscriptInvalid = errors.New("upload: acceptance transcript rejected as invalid")
+	ErrAlreadyIssued               = errors.New("upload: signing key already issued for this run")
+	ErrNotFound                    = errors.New("upload: run or signing key not found")
 	// ErrUnsupportedStage means the backend has no prompt template
 	// for this stage type. Non-retryable; the runner should fail
 	// the stage rather than guess.
@@ -2007,6 +2014,218 @@ func InjectReplay(body []byte, set scenario.ReplaySet) ([]byte, error) {
 	out, err := json.Marshal(fields)
 	if err != nil {
 		return nil, fmt.Errorf("upload: inject replay: marshal verdict body: %w", err)
+	}
+	return out, nil
+}
+
+// AcceptanceTranscript is the acceptance transcript wire shape (E72.5 /
+// #3329): the per-criterion record the acceptance agent writes beside its
+// verdict, which the runner validates (validateAcceptanceTranscript, the twin
+// of the backend validator), redacts and ships to
+// POST /v0/runs/{run_id}/acceptance/transcript BEFORE the verdict.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+// backend's acceptanceTranscriptBody (backend/internal/server/
+// acceptance_transcript.go); the wirecontract manifest pins the pair ModeExact.
+type AcceptanceTranscript struct {
+	Criteria  []AcceptanceTranscriptCriterion `json:"criteria"`
+	TargetURL string                          `json:"target_url,omitempty"`
+}
+
+// AcceptanceTranscriptCriterion is one criterion's transcript.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+// backend's acceptanceTranscriptCriterion; the wirecontract manifest pins the
+// pair ModeExact.
+type AcceptanceTranscriptCriterion struct {
+	ID        string                        `json:"id"`
+	Seed      string                        `json:"seed,omitempty"`
+	Requests  []AcceptanceTranscriptRequest `json:"requests"`
+	Assertion string                        `json:"assertion"`
+	Outcome   string                        `json:"outcome"`
+	WallMs    int                           `json:"wall_ms"`
+}
+
+// AcceptanceTranscriptRequest is one request/response pair. Bodies are
+// redacted by the runner and stored-only on the backend (never rendered).
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+// backend's acceptanceTranscriptRequest; the wirecontract manifest pins the
+// pair ModeExact.
+type AcceptanceTranscriptRequest struct {
+	Method       string `json:"method"`
+	Path         string `json:"path"`
+	RequestBody  string `json:"request_body,omitempty"`
+	Status       int    `json:"status"`
+	ResponseBody string `json:"response_body,omitempty"`
+	ElapsedMs    int    `json:"elapsed_ms"`
+}
+
+// AcceptanceTranscriptRef is the runner-injected verdict field naming the
+// already-persisted transcript: both values are BACKEND-minted (the ship
+// response's id and hash), which is why InjectTranscript is safe to run AFTER
+// the verdict's redaction.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+// backend's acceptanceTranscriptRef; the wirecontract manifest pins the pair
+// ModeExact.
+type AcceptanceTranscriptRef struct {
+	ArtifactID  string `json:"artifact_id"`
+	ContentHash string `json:"content_hash"`
+}
+
+// ShipAcceptanceTranscriptArgs collects everything ShipAcceptanceTranscript
+// needs. Body is the validated + redacted transcript bytes; they are the bytes
+// the backend verifies the signature against and stores verbatim.
+type ShipAcceptanceTranscriptArgs struct {
+	RunID      string
+	StageID    string
+	Body       []byte
+	PrivateKey ed25519.PrivateKey
+}
+
+// ShipAcceptanceTranscriptResult is the (id, stage, content_hash, idempotent)
+// tuple the backend echoes on 201 / 200.
+type ShipAcceptanceTranscriptResult struct {
+	ID          string `json:"id"`
+	StageID     string `json:"stage_id"`
+	ContentHash string `json:"content_hash"`
+	Idempotent  bool   `json:"idempotent"`
+}
+
+// ShipAcceptanceTranscript signs the transcript bytes and POSTs them to
+// /v0/runs/{run_id}/acceptance/transcript?stage_id=… (E72.5 / #3329), the
+// ShipAcceptance retry/classification contract: transient failures (5xx,
+// network) retry with the ShipTrace backoff; permanent failures bubble up:
+//
+//   - 400 acceptance_transcript_invalid → ErrAcceptanceTranscriptInvalid
+//   - 401 signature_*                   → ErrSignatureRejected
+//   - 404 stage/key                     → ErrNotFound
+func (c *Client) ShipAcceptanceTranscript(ctx context.Context, args ShipAcceptanceTranscriptArgs) (*ShipAcceptanceTranscriptResult, error) {
+	if len(args.Body) == 0 {
+		return nil, errors.New("upload: empty acceptance transcript body")
+	}
+	if len(args.PrivateKey) != ed25519.PrivateKeySize {
+		return nil, errors.New("upload: invalid private key length")
+	}
+
+	digest := sha256.Sum256(args.Body)
+	signature := ed25519.Sign(args.PrivateKey, digest[:])
+	sigHex := hex.EncodeToString(signature)
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s/acceptance/transcript?stage_id=%s",
+		c.BaseURL,
+		url.PathEscape(args.RunID),
+		url.PathEscape(args.StageID),
+	)
+
+	maxRetries := c.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = DefaultMaxRetries
+	}
+	backoff := c.Backoff
+	if backoff == 0 {
+		backoff = DefaultBackoff
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(args.Body))
+		if err != nil {
+			return nil, fmt.Errorf("upload: build acceptance transcript request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Fishhawk-Signature", sigHex)
+		req.Header.Set("Accept", "application/json")
+		req.ContentLength = int64(len(args.Body))
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("upload: ship acceptance transcript: %w", err)
+			continue
+		}
+
+		switch {
+		case resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK:
+			var out ShipAcceptanceTranscriptResult
+			err := json.NewDecoder(resp.Body).Decode(&out)
+			_ = resp.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("upload: decode acceptance transcript response: %w", err)
+			}
+			return &out, nil
+		case resp.StatusCode == http.StatusBadRequest:
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			if strings.Contains(detail, "acceptance_transcript_invalid") {
+				return nil, fmt.Errorf("%w: %s", ErrAcceptanceTranscriptInvalid, detail)
+			}
+			return nil, fmt.Errorf("upload: ship acceptance transcript: 400: %s", detail)
+		case resp.StatusCode == http.StatusUnauthorized:
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("%w: %s", ErrSignatureRejected, detail)
+		case resp.StatusCode == http.StatusNotFound:
+			_ = resp.Body.Close()
+			return nil, ErrNotFound
+		case resp.StatusCode >= 500:
+			lastErr = statusError("ship acceptance transcript", resp)
+			_ = resp.Body.Close()
+			continue
+		default:
+			lastErr = statusError("ship acceptance transcript", resp)
+			_ = resp.Body.Close()
+			return nil, lastErr
+		}
+	}
+	return nil, fmt.Errorf("upload: ship acceptance transcript exhausted retries: %w", lastErr)
+}
+
+// InjectTranscript sets the top-level `transcript` ref on an ALREADY-VALIDATED
+// (and already-redacted) acceptance verdict body (E72.5 / #3329), mirroring
+// InjectReplay: the closed agent-facing verdict schema does not admit
+// `transcript`, so an agent-authored ref is refused by validateAcceptanceVerdict
+// before this runs, and the ref injected here carries only backend-minted values
+// (the transcript ship response's artifact id and content hash) — which is what
+// makes injecting AFTER redaction safe. It refuses a body that already carries
+// `transcript` (a double-injection or a validation bypass), a non-object body
+// and a null body.
+func InjectTranscript(body []byte, ref AcceptanceTranscriptRef) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&fields); err != nil {
+		return nil, fmt.Errorf("upload: inject transcript: verdict body is not a JSON object: %w", err)
+	}
+	if dec.More() {
+		return nil, errors.New("upload: inject transcript: verdict body must be a single JSON object")
+	}
+	if fields == nil {
+		return nil, errors.New("upload: inject transcript: verdict body is null")
+	}
+	if _, present := fields["transcript"]; present {
+		return nil, errors.New("upload: inject transcript: verdict body already carries a transcript field")
+	}
+	if ref.ArtifactID == "" || ref.ContentHash == "" {
+		return nil, errors.New("upload: inject transcript: ref must carry artifact_id and content_hash")
+	}
+	raw, err := json.Marshal(ref)
+	if err != nil {
+		return nil, fmt.Errorf("upload: inject transcript: marshal ref: %w", err)
+	}
+	fields["transcript"] = raw
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("upload: inject transcript: marshal verdict body: %w", err)
 	}
 	return out, nil
 }

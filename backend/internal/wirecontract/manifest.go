@@ -65,8 +65,11 @@ const (
 	pullRequestGo = "backend/internal/server/pullrequest.go"
 	scopeCompFile = "backend/internal/server/scope_completeness.go"
 	acceptanceGo  = "backend/internal/server/acceptance.go"
-	uploadFile    = "runner/internal/upload/upload.go"
-	scenarioFile  = "runner/internal/scenario/scenario.go"
+	// acceptanceTranscriptGo holds the backend twins of the runner's
+	// acceptance-transcript wire shapes (E72.5 / #3329).
+	acceptanceTranscriptGo = "backend/internal/server/acceptance_transcript.go"
+	uploadFile             = "runner/internal/upload/upload.go"
+	scenarioFile           = "runner/internal/scenario/scenario.go"
 )
 
 // SeedManifest is the repo's cross-module wire contract manifest. Verified
@@ -144,6 +147,36 @@ func SeedManifest() Manifest {
 				Consumer: Endpoint{File: uploadFile, Type: "AcceptanceCriterionEntry"},
 				Mode:     ModeExact,
 			},
+			// ---- ModeExact: acceptance transcript (E72.5 / #3329) ----
+			// The runner PRODUCES the transcript body (validated + redacted,
+			// shipped to POST /v0/runs/{run_id}/acceptance/transcript) and the
+			// runner-injected verdict ref; the backend decodes both. Exact mode
+			// so a renamed tag cannot silently drop a field the backend
+			// validator bounds at ingest (the render-safety property).
+			{
+				Name: "acceptance_transcript", Anchor: "#3329",
+				Emitter:  Endpoint{File: uploadFile, Type: "AcceptanceTranscript"},
+				Consumer: Endpoint{File: acceptanceTranscriptGo, Type: "acceptanceTranscriptBody"},
+				Mode:     ModeExact,
+			},
+			{
+				Name: "acceptance_transcript_criterion", Anchor: "#3329",
+				Emitter:  Endpoint{File: uploadFile, Type: "AcceptanceTranscriptCriterion"},
+				Consumer: Endpoint{File: acceptanceTranscriptGo, Type: "acceptanceTranscriptCriterion"},
+				Mode:     ModeExact,
+			},
+			{
+				Name: "acceptance_transcript_request", Anchor: "#3329",
+				Emitter:  Endpoint{File: uploadFile, Type: "AcceptanceTranscriptRequest"},
+				Consumer: Endpoint{File: acceptanceTranscriptGo, Type: "acceptanceTranscriptRequest"},
+				Mode:     ModeExact,
+			},
+			{
+				Name: "acceptance_transcript_ref", Anchor: "#3329",
+				Emitter:  Endpoint{File: uploadFile, Type: "AcceptanceTranscriptRef"},
+				Consumer: Endpoint{File: acceptanceTranscriptGo, Type: "acceptanceTranscriptRef"},
+				Mode:     ModeExact,
+			},
 			// ---- ModeSubset: prompt response -> fetched prompt ----
 			{
 				Name: "prompt_response", Anchor: "#2501/#2596",
@@ -187,6 +220,7 @@ func SeedManifest() Manifest {
 			pullRequestGo,
 			scopeCompFile,
 			acceptanceGo,
+			acceptanceTranscriptGo,
 			uploadFile,
 			scenarioFile,
 		},
