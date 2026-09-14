@@ -1,14 +1,14 @@
 id: scenario:issue-3400/implement-prompt-names-commit-body-section
 statement: For an implement stage whose plan was approved with conditions, the rendered implement prompt instructs the agent to end the commit-message sidecar body with an `Approval conditions:` section carrying one entry per condition, including the explicit `no action required because` form; the same prompt for a plan approved without conditions contains no such instruction.
 verify_hint: GET /v0/stages/{implement_stage_id}/prompt on the localhost preview for a run approved with a non-empty reason contains the `Approval conditions:` heading instruction inside the 'Write the commit message' section; the same route for a run approved with no reason does not.
-steps: No catalog scenario carries a runnable implement stage (acceptance-dispatched's is succeeded -> 409 stage_not_runnable; plan-gate-parked seeds only a plan stage), so I created two runs via POST /v0/runs with the plan-gate-parked workflow spec inline (plan/implement/review), shipped a valid standard_v1 plan artifact to each via the signed POST /v0/runs/{id}/plan (signature from POST /v0/dev/sign), approved run A's plan with a two-condition comment and run B's plan with no comment, then fetched each implement stage's prompt through the signed GET /v0/stages/{id}/prompt (X-Fishhawk-Signature over sha256('prompt:'+stage_id)).
+steps: Same two-run drive as the replayed scenario (run A approved with two numbered conditions, run B approved with no comment); compared the rendered implement prompts.
 assertions:
-    expected: 'With conditions: the ''Write the commit message'' section instructs the agent to end the sidecar body with an `Approval conditions:` section, one entry per condition, including the explicit `no action required because` form. Without conditions: no such instruction.'
-    observed_at_record: 'Run A (b514f1d7-8bee-41cc-8c65-b6a11ad4ea7c, implement 07ccfdbd-439d-4c54-8da6-002ee2f70154): the ''### Write the commit message'' section contains the bullet ''Operator approval conditions are attached to this run, so the commit body MUST END with a line that is exactly `Approval conditions:` followed by one entry per condition, in the operator''s order: `- condition N: <how this change satisfies it>`, or `- condition N: no action required because <reason>` when you deliberately do not act on it.'' Run B (029d384a-8b0f-4abc-89a0-0076f4e4845e, implement 6bee95da-59fe-4ac3-9571-a3331da795ec): the same section has no such bullet; ''Approval conditions'' and ''no action required because'' occur nowhere in the prompt.'
-    repro_handle: GET http://localhost:8090/v0/stages/07ccfdbd-439d-4c54-8da6-002ee2f70154/prompt (signed) vs GET http://localhost:8090/v0/stages/6bee95da-59fe-4ac3-9571-a3331da795ec/prompt (signed); or /prompt-render with a bearer token
+    expected: Conditions-approved prompt carries the `Approval conditions:` heading instruction including the `no action required because` form; no-conditions prompt does not.
+    observed_at_record: 'Run A: the commit-message section instructs the agent to END the sidecar body with a line exactly `Approval conditions:` followed by one entry per condition in operator order, `- condition N: <how this change satisfies it>` or `- condition N: no action required because <reason>`, and says the section is peeked into the review''s gate evidence. Run B: no such instruction (its commit-message bullets only say the approval-condition checklist stays in the PR description).'
+    repro_handle: GET /v0/stages/813e19b1-7bf7-4324-bef8-5457a61ab659/prompt (run A, conditions) vs GET /v0/stages/8a9b7b61-24d4-44e0-8b0b-d4795a452957/prompt (run B, none), signed; ids are from this session — re-create runs to reproduce.
 origin:
     issue: 3400
     pr: 3411
     run_id: 23a04dc1-478f-4a83-96bf-9f7bfad75060
-    head_sha: bb55567a46fbbe253b26a9bbb5d975a99e33cdee
-    recorded_at: 2026-09-14T03:58:46Z
+    head_sha: aba62b6dc88b763822143458f9d237096b822846
+    recorded_at: 2026-09-14T04:49:16Z
