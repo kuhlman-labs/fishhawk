@@ -911,6 +911,326 @@ func TestCompute_Rule5_FixupPushedHead_NotForeign(t *testing.T) {
 	}
 }
 
+// --- #3415: rule 5 honors operator_commit_vouched ---
+
+// vouchPayload renders the payload server.handleVouchCommit writes, using the
+// STORED-ROW literals rather than the exported constants so the seam pin
+// below (TestVouchSeamConstants_MatchStoredRowLiterals) is not circular.
+func vouchPayload(sha string) json.RawMessage {
+	return json.RawMessage(`{"run_id":"r","vouched_sha":"` + sha + `","reason":"remediation"}`)
+}
+
+// foreignCommitDetail returns the foreign_commit item's detail, or "".
+func foreignCommitDetail(missing []auditcomplete.MissingItem) string {
+	for _, m := range missing {
+		if m.Kind == auditcomplete.MissingForeignCommit {
+			return m.Detail
+		}
+	}
+	return ""
+}
+
+// TestCompute_Rule5_VouchedHead_NotForeign is the unit-level #3415 pin: the
+// live PR HEAD is an operator remediation commit recorded ONLY in an
+// operator_commit_vouched entry (the PR-open artifact still carries the
+// agent's head). Rule 5 must read the vouch as Fishhawk-recorded lineage and
+// pass. Counterfactual: deleting the own-chain addVouchedSHAs call in
+// gatherForeignCommitInputs turns this RED with foreign_commit.
+func TestCompute_Rule5_VouchedHead_NotForeign(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const vouched = "0a9e170000000000000000000000000000000000"
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(vouched))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, vouched, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (vouched head must not be foreign); missing=%+v", state, missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("vouched sha should be a known SHA, not foreign_commit; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_ChildVouchedHead_NotForeign pins the decomposition half
+// of the parity with buildReportedHeadLedger: a vouch recorded on a
+// decomposition CHILD's chain (an operator vouching against the child rather
+// than the parent) unions into the parent's rule-5 known set. Counterfactual:
+// deleting only the child-walk union turns this RED.
+func TestCompute_Rule5_ChildVouchedHead_NotForeign(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const vouched = "0a9e170000000000000000000000000000000000"
+	childID := uuid.New()
+	parent := runID
+	runs.childPages = map[uuid.UUID][]*run.Run{
+		runID: {{ID: childID, DecomposedFrom: &parent}},
+	}
+	ar.appendChained(t, childID, nil, "operator_commit_vouched", vouchPayload(vouched))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, vouched, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (child-vouched head must not be foreign); missing=%+v", state, missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("child-chain vouched sha should be a known SHA, not foreign_commit; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_VouchOtherSha_StillForeign is the fail-closed control: a
+// vouch names ONE sha. When the live head is a DIFFERENT un-vouched commit,
+// rule 5 still fires foreign_commit, and the detail lists the vouched sha
+// among the known set (proving the vouch was read and simply did not match).
+func TestCompute_Rule5_VouchOtherSha_StillForeign(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const vouched = "0a9e170000000000000000000000000000000000"
+	const liveForeign = "deadbeef1111deadbeef1111deadbeef11111111"
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(vouched))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, liveForeign, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail (un-vouched live head is still foreign); missing=%+v", state, missing)
+	}
+	detail := foreignCommitDetail(missing)
+	if detail == "" {
+		t.Fatalf("expected foreign_commit; got %+v", missing)
+	}
+	if !strings.Contains(detail, liveForeign[:7]) {
+		t.Errorf("detail should name the live head %s: %s", liveForeign[:7], detail)
+	}
+	if !strings.Contains(detail, vouched[:7]) {
+		t.Errorf("detail should list the vouched sha %s as known: %s", vouched[:7], detail)
+	}
+}
+
+// TestCompute_Rule5_VouchReadError_Pending: a transient read failure on the
+// operator_commit_vouched category aborts the gather as head_fetch_failed
+// (pending), never a silent under-population that false-flags a vouched head
+// as foreign. Counterfactual: replacing the abort with `continue` makes this
+// RED — the state becomes fail with foreign_commit.
+func TestCompute_Rule5_VouchReadError_Pending(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const vouched = "0a9e170000000000000000000000000000000000"
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(vouched))
+	ar.catErr = map[string]error{"operator_commit_vouched": errors.New("db down")}
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, vouched, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (vouch read error is transient); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingHeadFetchFail) {
+		t.Errorf("expected head_fetch_failed; got %+v", missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("a vouch read error must never surface as foreign_commit; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_ChildListError_Pending: a transient ListRuns failure on
+// the decomposition-child enumeration aborts the gather the same way.
+func TestCompute_Rule5_ChildListError_Pending(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	runs.listRunsErr = errors.New("db down")
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, recordedSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (child list error is transient); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingHeadFetchFail) {
+		t.Errorf("expected head_fetch_failed; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_ChildVouchReadError_Pending: the own-run vouch read
+// SUCCEEDS and a decomposition CHILD's vouch read then fails. The child-read
+// error must propagate out of the child walk exactly as an own-run read error
+// does — head_fetch_failed, pending — never a silent under-population that
+// evaluates the head against the partial known set. catCalls proves the
+// ordering: the parent's own operator_commit_vouched read lands (and is not
+// the injected failure) before the child's read aborts the gather.
+// Counterfactual: replacing the child-walk `return err` with `continue` makes
+// this RED — the vouched head still passes, so state becomes pass and the
+// head_fetch_failed assertion fails.
+func TestCompute_Rule5_ChildVouchReadError_Pending(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const vouched = "0a9e170000000000000000000000000000000000"
+	childID := uuid.New()
+	parent := runID
+	runs.childPages = map[uuid.UUID][]*run.Run{
+		runID: {{ID: childID, DecomposedFrom: &parent}},
+	}
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(vouched))
+	ar.catErrByRun = map[uuid.UUID]map[string]error{
+		childID: {"operator_commit_vouched": errors.New("db down")},
+	}
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, vouched, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (child vouch read error is transient); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingHeadFetchFail) {
+		t.Errorf("expected head_fetch_failed; got %+v", missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("a child vouch read error must never surface as foreign_commit; got %+v", missing)
+	}
+	// Ordering proof: the own-run read happened, succeeded (it is not in
+	// catErrByRun), and preceded the child read that failed.
+	ownRead := runID.String() + "/operator_commit_vouched"
+	childRead := childID.String() + "/operator_commit_vouched"
+	ownIdx, childIdx := -1, -1
+	for i, c := range ar.catCalls {
+		switch c {
+		case ownRead:
+			if ownIdx < 0 {
+				ownIdx = i
+			}
+		case childRead:
+			if childIdx < 0 {
+				childIdx = i
+			}
+		}
+	}
+	if ownIdx < 0 || childIdx < 0 || ownIdx > childIdx {
+		t.Errorf("expected a successful own-run vouch read BEFORE the failing child read; calls=%v", ar.catCalls)
+	}
+}
+
+// TestCompute_Rule5_ChildOverflow_ReadsPartialSetAsIs pins rule 5's consumer
+// of listDecompositionChildren's OVERFLOW arm (a child enumeration that hits
+// childPageCeiling without a short page). Rule 5 discards `exhausted` and
+// reads the partial child set as-is — unlike rule 2b, which treats overflow
+// as a hard stop — because a vouch on an UNread child can only leave that
+// sha UNknown, the fail-closed direction. Two assertions make that concrete:
+// (a) an un-vouched live head still yields foreign_commit (state fail, NOT
+// pending/head_fetch_failed — overflow is not an abort); (b) a head vouched
+// on the run's OWN chain still passes under the same overflow, proving the
+// partial read neither aborts nor drops the reads that did land.
+// Counterfactual: making rule 5 abort on !exhausted turns (a) and (b) RED
+// with pending/head_fetch_failed.
+func TestCompute_Rule5_ChildOverflow_ReadsPartialSetAsIs(t *testing.T) {
+	const vouched = "0a9e170000000000000000000000000000000000"
+	const liveForeign = "deadbeef1111deadbeef1111deadbeef11111111"
+
+	// (a) un-vouched live head under overflow → foreign_commit, not an abort.
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	runs.alwaysFullPage = true
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(vouched))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, liveForeign, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail (overflowed child read must not abort; un-vouched head is still foreign); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("expected foreign_commit under overflow; got %+v", missing)
+	}
+	if containsKind(missing, auditcomplete.MissingHeadFetchFail) {
+		t.Errorf("overflow is a partial read, not a transient failure; must not surface head_fetch_failed: %+v", missing)
+	}
+
+	// (b) own-chain vouched head under the same overflow → pass.
+	d.PRHead = stubPRHead(t, vouched, nil)
+	state, missing, err = auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (own-chain vouch survives an overflowed child read); missing=%+v", state, missing)
+	}
+}
+
+// TestCompute_Rule5_MalformedVouchPayload_Skipped: a vouch row whose
+// vouched_sha does not decode as a string, or that lacks the field, contributes
+// nothing and does not abort — the live head (the artifact-recorded sha here)
+// still evaluates normally, and a foreign head is still foreign. (The rows are
+// well-formed JSON because the chain hash canonicalizes the payload; a
+// non-JSON payload cannot be appended to a chain at all.)
+func TestCompute_Rule5_MalformedVouchPayload_Skipped(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", json.RawMessage(`{"vouched_sha":42}`))
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", json.RawMessage(`{"reason":"no sha field"}`))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, recordedSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (malformed vouch rows are skipped); missing=%+v", state, missing)
+	}
+
+	const liveForeign = "deadbeef1111deadbeef1111deadbeef11111111"
+	d.PRHead = stubPRHead(t, liveForeign, nil)
+	state, missing, err = auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail || !containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("malformed vouch rows must not whitelist anything; state=%s missing=%+v", state, missing)
+	}
+}
+
+// TestVouchSeamConstants_MatchStoredRowLiterals pins the exported seam
+// constants the server aliases (CategoryOperatorCommitVouched /
+// VouchedSHAField) to the literals the stored operator_commit_vouched rows
+// carry, so neither side can drift from the other on a rename.
+func TestVouchSeamConstants_MatchStoredRowLiterals(t *testing.T) {
+	if auditcomplete.CategoryOperatorCommitVouched != "operator_commit_vouched" {
+		t.Errorf("CategoryOperatorCommitVouched = %q, want the stored-row literal", auditcomplete.CategoryOperatorCommitVouched)
+	}
+	if auditcomplete.VouchedSHAField != "vouched_sha" {
+		t.Errorf("VouchedSHAField = %q, want the stored-row literal", auditcomplete.VouchedSHAField)
+	}
+	var row map[string]string
+	if err := json.Unmarshal(vouchPayload("x"), &row); err != nil {
+		t.Fatal(err)
+	}
+	if row[auditcomplete.VouchedSHAField] != "x" {
+		t.Errorf("stored payload does not carry %q: %v", auditcomplete.VouchedSHAField, row)
+	}
+}
+
 // TestLatestReportedHeadSHA covers the shared resolver's precedence + ordering
 // (#1682): fixup_pushed wins over child_pushed wins over pull_request_opened;
 // within a category the highest-sequence entry wins; no head → (_, false).
@@ -1758,6 +2078,14 @@ type fakeAudit struct {
 	// rule-7 fail-open tests can drive a read failure on exactly the
 	// securityscan / fixup category without disturbing the other reads.
 	catErr map[string]error
+	// catErrByRun injects a per-(run, category) error so the #3415 rule-5
+	// tests can fail the vouch read on a decomposition CHILD's chain while
+	// the parent's own read succeeds. Consulted after catErr.
+	catErrByRun map[uuid.UUID]map[string]error
+	// catCalls records every ListForRunByCategory call as
+	// "<runID>/<category>" in call order, so a test can prove which reads
+	// happened (and in what order) before an injected failure aborted.
+	catCalls []string
 }
 
 // appendChained mirrors what the real audit.Repository.AppendChained
@@ -1864,7 +2192,11 @@ func (f *fakeAudit) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Ent
 }
 
 func (f *fakeAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	f.catCalls = append(f.catCalls, runID.String()+"/"+category)
 	if err := f.catErr[category]; err != nil {
+		return nil, err
+	}
+	if err := f.catErrByRun[runID][category]; err != nil {
 		return nil, err
 	}
 	out := []*audit.Entry{}

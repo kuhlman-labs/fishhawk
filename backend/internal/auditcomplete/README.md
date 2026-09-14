@@ -7,7 +7,7 @@ Audit-complete derivation (#229, #282, #947, #3092): derives the `fishhawk_audit
 - [The six rules](../../../docs/architecture/audit-complete.md#the-six-rules)
 - [Normalization for rule 4](../../../docs/architecture/audit-complete.md#normalization-rule-4-specifics) (#302/#308)
 - [Rule 2b decomposition trace resolution](../../../docs/architecture/audit-complete.md#rule-2b-decomposition-trace-resolution-3092-details) (#3092)
-- [Rule 5 live-HEAD check](../../../docs/architecture/audit-complete.md#rule-5-live-head-check-details) (#282)
+- [Rule 5 live-HEAD check](../../../docs/architecture/audit-complete.md#rule-5-live-head-check-details) (#282). The known set unions `operator_commit_vouched` `vouched_sha`s on each walked run's own chain AND its decomposition children (#3415 — rule 5 was the second reader of the vouch concept and never learned the exemption `server/lineage.go` honored); the seam constants `CategoryOperatorCommitVouched` / `VouchedSHAField` are exported from this package and aliased by the server. A vouch or child-list read error → `head_fetch_failed` (pending), never a silent under-population.
 - [Rule 6 review-presence gate](../../../docs/architecture/audit-complete.md#rule-6-review-presence-gate-947-details) (#947)
 - [State output](../../../docs/architecture/audit-complete.md#state-output)
 - [Integration points](../../../docs/architecture/audit-complete.md#integration-points)

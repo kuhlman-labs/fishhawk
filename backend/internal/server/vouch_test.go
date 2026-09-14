@@ -14,8 +14,10 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -318,6 +320,13 @@ type vouchRepublishOpts struct {
 	noGitHubClient bool
 	// noPublisher leaves s.auditCheckPublisher nil (the dev/CLI posture).
 	noPublisher bool
+	// agentHeadSHA, when non-empty, seeds a pull_request artifact on the
+	// implement stage carrying {head_sha: agentHeadSHA, pr_number: 7} (the
+	// number the run's PullRequestURL names). That is what ACTIVATES rule 5
+	// of auditcomplete.ComputeResult against the httptest forge's live head
+	// (#3415): without an artifact-recorded head + PR number the gather
+	// returns nothing to compare and rule 5 never runs.
+	agentHeadSHA string
 }
 
 // newVouchPRGitHubClient builds a *githubclient.Client pointed at an httptest
@@ -397,10 +406,24 @@ func newVouchRepublishServerOpts(t *testing.T, creator *vouchCheckCreator, opts 
 		runRow.PullRequestURL = &prURL
 	}
 	stage := &run.Stage{ID: implID, RunID: runID, Type: run.StageTypeImplement}
+	if opts.agentHeadSHA != "" {
+		// Rule 5 only runs once every non-review stage is TERMINAL (the
+		// mid-flight branch returns stage_not_terminal first), so the #3415
+		// reproduction needs a succeeded implement stage.
+		stage.State = run.StageStateSucceeded
+	}
 	repo.mu.Lock()
 	repo.runs[runID] = runRow
 	repo.stagesByRun[runID] = []*run.Stage{stage}
 	repo.mu.Unlock()
+	if opts.agentHeadSHA != "" {
+		body, _ := json.Marshal(map[string]any{"head_sha": opts.agentHeadSHA, "pr_number": 7})
+		if _, err := ar.Create(context.Background(), artifact.CreateParams{
+			StageID: implID, Kind: artifact.KindPullRequest, Content: body,
+		}); err != nil {
+			t.Fatalf("seed pull_request artifact: %v", err)
+		}
+	}
 	if opts.noPublisher {
 		return s, au, runID
 	}
@@ -824,5 +847,116 @@ func TestVouchCommit_NoPublisherWired_NoWarning(t *testing.T) {
 	}
 	if vouchAudit(au) == nil {
 		t.Error("operator_commit_vouched entry not recorded")
+	}
+}
+
+// --- #3415: the vouched head must not recompute as foreign_commit ---
+
+// agentHeadSHA is the head the implement agent's PR-open artifact recorded —
+// the sha the run itself pushed BEFORE the operator's remediation commit.
+const agentHeadSHA = "0a9e170000000000000000000000000000000000"
+
+// TestVouchCommit_RepublishedCheckDoesNotFlagVouchedHeadForeign is the
+// end-to-end reproduction of #3415, spanning HTTP handler → audit append →
+// auditcomplete.ComputeResult (rule 5) → auditcheckpublisher → forge
+// CreateCheckRun fake. The run's PR-open artifact records agentHeadSHA; the
+// httptest forge serves vouchedSHA as the LIVE PR head (an operator
+// remediation commit on top). The operator vouches the live head. The vouch's
+// own re-post recomputes audit-complete at that head, and the recomputed Check
+// Run must NOT carry foreign_commit: the vouch is exactly the declaration that
+// the head is Fishhawk-recorded lineage.
+//
+// Against the pre-#3415 tree this test is RED: rule 5's known set was built
+// from the PR artifact + HeadReportCategoriesByPrecedence only and never read
+// operator_commit_vouched, so the re-posted check named the vouched head as
+// "not a Fishhawk-recorded commit". Counterfactual: deleting the vouch union
+// in auditcomplete.gatherForeignCommitInputs turns it RED the same way.
+func TestVouchCommit_RepublishedCheckDoesNotFlagVouchedHeadForeign(t *testing.T) {
+	creator := &vouchCheckCreator{}
+	s, au, runID := newVouchRepublishServerOpts(t, creator, vouchRepublishOpts{
+		pr:           vouchPRStub{headSHA: vouchedSHA},
+		agentHeadSHA: agentHeadSHA,
+	})
+
+	w := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: vouchedSHA, Reason: "sync-schemas remediation commit"}, withVouchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp vouchCommitResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.AuditCheckRepublished {
+		t.Fatalf("audit_check_republished = false, want true; warning=%q", resp.AuditCheckRepublishWarning)
+	}
+	if vouchAudit(au) == nil {
+		t.Fatal("operator_commit_vouched entry not recorded")
+	}
+	calls := vouchCreatorCalls(creator)
+	if len(calls) != 1 {
+		t.Fatalf("check run creations = %d, want exactly 1", len(calls))
+	}
+	if got := calls[0].HeadSHA; got != vouchedSHA {
+		t.Errorf("check run head_sha = %q, want the vouched sha %q", got, vouchedSHA)
+	}
+	for _, field := range []struct{ name, text string }{
+		{"OutputSummary", calls[0].OutputSummary},
+		{"OutputText", calls[0].OutputText},
+	} {
+		if strings.Contains(field.text, string(auditcomplete.MissingForeignCommit)) {
+			t.Errorf("re-posted check %s flags the VOUCHED head as foreign_commit (#3415):\n%s", field.name, field.text)
+		}
+	}
+}
+
+// TestVouchCommit_RepublishedCheckStillFlagsUnvouchedForeignHead is the
+// fail-closed control for #3415: the exemption is keyed to the VOUCHED sha,
+// not to "a vouch exists". The live head is vouchedSHA but the operator
+// vouches an unrelated third sha, so (a) the publish bound takes the MISMATCH
+// arm (no Check Run posted) and (b) a direct auditcomplete.ComputeResult over
+// the same deps still reports foreign_commit for the live head — the vouched
+// sha is now KNOWN, but the live head is not.
+func TestVouchCommit_RepublishedCheckStillFlagsUnvouchedForeignHead(t *testing.T) {
+	creator := &vouchCheckCreator{}
+	s, au, runID := newVouchRepublishServerOpts(t, creator, vouchRepublishOpts{
+		pr:           vouchPRStub{headSHA: vouchedSHA},
+		agentHeadSHA: agentHeadSHA,
+	})
+
+	w := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: unrelatedPRHeadSHA, Reason: "vouching the wrong commit"}, withVouchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp vouchCommitResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.AuditCheckRepublished {
+		t.Error("audit_check_republished = true, want false (vouched sha is not the live head)")
+	}
+	if vouchAudit(au) == nil {
+		t.Fatal("operator_commit_vouched entry not recorded")
+	}
+	if calls := vouchCreatorCalls(creator); len(calls) != 0 {
+		t.Fatalf("check run creations = %d, want 0 (mismatch arm skips the publish)", len(calls))
+	}
+
+	res, err := auditcomplete.ComputeResult(context.Background(), runID, s.auditCompleteDeps())
+	if err != nil {
+		t.Fatalf("ComputeResult: %v", err)
+	}
+	var foreign *auditcomplete.MissingItem
+	for i := range res.Missing {
+		if res.Missing[i].Kind == auditcomplete.MissingForeignCommit {
+			foreign = &res.Missing[i]
+		}
+	}
+	if foreign == nil {
+		t.Fatalf("live head %s is UNVOUCHED and must still be foreign_commit; missing=%+v", vouchedSHA[:7], res.Missing)
+	}
+	if !strings.Contains(foreign.Detail, unrelatedPRHeadSHA[:7]) {
+		t.Errorf("foreign_commit detail should list the vouched sha %s as known: %s", unrelatedPRHeadSHA[:7], foreign.Detail)
 	}
 }
