@@ -3920,9 +3920,11 @@ components:
             the rows with a total precedence ladder: any `failed` row →
             `failed`; else any `undecidable` row → `undecidable` (including an
             all-undecidable set, where nothing was verified); else if every
-            non-retired row is `skipped` OR no rows were itemized at all →
-            `not_validated` (bases `all-skip-observed` / `no-rows-observed`,
-            #3397 — the validator ran but verified nothing); else `passed`. The
+            non-retired row is `skipped`, or no rows were itemized at all, or
+            every itemized row was retired →
+            `not_validated` (bases `all-skip-observed` / `no-rows-observed` /
+            `all-retired-observed`, #3397 — the validator ran but verified
+            nothing); else `passed`. The
             recorded verdict is resolved severity-monotone as
             `max(shipped, derived)` over `passed < not_validated < undecidable <
             failed`, so a shipped `failed` is never softened (a shipped `failed`
@@ -14834,8 +14836,8 @@ paths:
         settles the stage from the plan alone, so it produces no per-criterion
         rows (bases `empty_criteria` / `all_skip_with_basis`). The ship endpoint
         can ALSO record `not_validated` POST-RUN (#3397, bases
-        `all-skip-observed` / `no-rows-observed`) when a validator ran but
-        verified nothing. Both origins stay disjoint from the `undecidable`
+        `all-skip-observed` / `no-rows-observed` / `all-retired-observed`) when a
+        validator ran but verified nothing. Both origins stay disjoint from the `undecidable`
         verdict (#2512) and its `acceptance_undecidable` gate state by a single
         severity ladder (`passed < not_validated < undecidable < failed`): a run
         with any undecidable row records `undecidable`. All are merge-eligible;

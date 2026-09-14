@@ -407,8 +407,9 @@ func ComputeResult(ctx context.Context, runID uuid.UUID, deps Deps) (Result, err
 	// "all-skip-with-basis" (every criterion skip_expected with basis), the
 	// shared plan.AcceptanceBasisEmptyCriteria / plan.AcceptanceBasisAllSkipWithBasis
 	// constants. Any OTHER basis is NOT exempted. In particular the POST-RUN
-	// not_validated bases #3397 added — "all-skip-observed" and "no-rows-observed"
-	// (plan.AcceptanceBasisAllSkipObserved / plan.AcceptanceBasisNoRowsObserved) —
+	// not_validated bases #3397 added — "all-skip-observed", "no-rows-observed"
+	// and "all-retired-observed" (plan.AcceptanceBasisAllSkipObserved /
+	// plan.AcceptanceBasisNoRowsObserved / plan.AcceptanceBasisAllRetiredObserved) —
 	// are DELIBERATELY not exempted: a runner DID spawn for those, so the stage
 	// owes its trace exactly like a normally-dispatched one, which is pinned by a
 	// non-exempt regression row. A normal validator-recorded verdict never sets

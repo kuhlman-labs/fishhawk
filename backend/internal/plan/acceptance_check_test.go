@@ -399,21 +399,34 @@ func TestAcceptanceNotValidatedVocabulary(t *testing.T) {
 }
 
 // TestAcceptanceObservedBases pins the #3397 POST-RUN basis constants: each is
-// non-empty, they differ from each other, and both differ from the two
+// non-empty, they differ from each other, and all differ from the two
 // PRE-SPAWN bases auditcomplete's trace exemption honors — the distinction that
-// keeps an observed all-skip / no-rows verdict owing its trace.
+// keeps an observed all-skip / no-rows / all-retired verdict owing its trace.
 func TestAcceptanceObservedBases(t *testing.T) {
-	if AcceptanceBasisAllSkipObserved == "" || AcceptanceBasisNoRowsObserved == "" {
-		t.Fatal("observed basis constants must be non-empty")
+	observed := []string{
+		AcceptanceBasisAllSkipObserved,
+		AcceptanceBasisNoRowsObserved,
+		AcceptanceBasisAllRetiredObserved,
 	}
-	if AcceptanceBasisAllSkipObserved == AcceptanceBasisNoRowsObserved {
-		t.Errorf("the two observed bases must be distinct, both = %q", AcceptanceBasisAllSkipObserved)
+	for _, o := range observed {
+		if o == "" {
+			t.Fatal("observed basis constants must be non-empty")
+		}
+	}
+	// Every observed basis must be distinct from every other — the three
+	// verified-nothing origins must stay tellable apart on the recorded payload.
+	seen := map[string]struct{}{}
+	for _, o := range observed {
+		if _, dup := seen[o]; dup {
+			t.Errorf("observed bases must be distinct, duplicated %q", o)
+		}
+		seen[o] = struct{}{}
 	}
 	preSpawn := []string{AcceptanceBasisEmptyCriteria, AcceptanceBasisAllSkipWithBasis}
-	for _, observed := range []string{AcceptanceBasisAllSkipObserved, AcceptanceBasisNoRowsObserved} {
+	for _, o := range observed {
 		for _, pre := range preSpawn {
-			if observed == pre {
-				t.Errorf("observed basis %q collides with pre-spawn basis %q (auditcomplete would wrongly exempt it)", observed, pre)
+			if o == pre {
+				t.Errorf("observed basis %q collides with pre-spawn basis %q (auditcomplete would wrongly exempt it)", o, pre)
 			}
 		}
 	}

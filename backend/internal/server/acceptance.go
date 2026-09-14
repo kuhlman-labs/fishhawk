@@ -1034,10 +1034,21 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		// as an all-skip set does. Ladder against not_validated so a shipped
 		// `passed` becomes not_validated while a shipped `failed` with an empty set
 		// stays failed (severity-monotone, so the guard's anti-softening purpose is
-		// intact). A separate basis keeps the two verified-nothing origins tellable
+		// intact). A separate basis keeps the verified-nothing origins tellable
 		// apart.
 		recordedVerdict = acceptanceVerdictAtLeast(recordedVerdict, acceptanceVerdictNotValidated)
-		observedBasis = plan.AcceptanceBasisNoRowsObserved
+		// NAME THE ORIGIN HONESTLY (fix-up, medium/untested-path): an empty
+		// non-retired set has TWO distinct origins, which must not share one
+		// operator-facing sentence. If the validator itemized rows but the operator
+		// retired EVERY one (the #2581 all-rows-retired path), record
+		// all-retired-observed — rows WERE recorded, so the no-rows wording
+		// ("recorded no criteria") would be inaccurate. Only a truly empty
+		// itemization records no-rows-observed.
+		if len(acc.normalizedCriteria) > 0 {
+			observedBasis = plan.AcceptanceBasisAllRetiredObserved
+		} else {
+			observedBasis = plan.AcceptanceBasisNoRowsObserved
+		}
 	}
 	// Step (4), UNBOUND-HEAD CLAMP (#3091). A verdict whose validated head could
 	// not be resolved names no tree: nothing ties the AGENT'S claimed pass to the

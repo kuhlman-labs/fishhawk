@@ -525,6 +525,14 @@ func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 				a.criteriaPassed, a.criteriaTotal) + acceptanceTranscriptClause(a)
 		case acceptanceBasisNoRowsObserved:
 			return "Acceptance not validated — the validator recorded no criteria (verified nothing)" + acceptanceTranscriptClause(a)
+		case acceptanceBasisAllRetiredObserved:
+			// Rows WERE recorded here — every one was retired at the approval gate —
+			// so the wording names the retirement, never "recorded no criteria".
+			if a.criteriaTotal > 0 {
+				return fmt.Sprintf("Acceptance not validated — all %d recorded criteria were retired (verified nothing)",
+					a.criteriaTotal) + acceptanceTranscriptClause(a)
+			}
+			return "Acceptance not validated — every recorded criterion was retired (verified nothing)" + acceptanceTranscriptClause(a)
 		}
 		// PRE-SPAWN not_validated: byte-identical to before — no transcript.
 		line := "Acceptance not validated — 0 criteria verified (the plan declared none)"
@@ -595,9 +603,16 @@ const acceptanceOutcomeNotValidated = "not_validated"
 // against plan.AcceptanceBasisAllSkipObserved / plan.AcceptanceBasisNoRowsObserved.
 // The two PRE-SPAWN bases carry no distinct render — a pre-spawn not_validated
 // payload has an empty/absent basis and renders through the unchanged branch.
+// acceptanceBasisAllRetiredObserved is the THIRD POST-RUN not_validated `basis`
+// value (#3397 fix-up): the validator itemized rows but the operator retired
+// EVERY one, so the non-retired set was empty. Distinct from no-rows-observed
+// because rows WERE recorded — the render must not claim "recorded no criteria".
+// Mirrored (not imported) like its peers and pinned against
+// plan.AcceptanceBasisAllRetiredObserved by status_template_test.go.
 const (
-	acceptanceBasisAllSkipObserved = "all-skip-observed"
-	acceptanceBasisNoRowsObserved  = "no-rows-observed"
+	acceptanceBasisAllSkipObserved    = "all-skip-observed"
+	acceptanceBasisNoRowsObserved     = "no-rows-observed"
+	acceptanceBasisAllRetiredObserved = "all-retired-observed"
 )
 
 // acceptanceOutcomeUndecidable is the `outcome` value the acceptance ingest

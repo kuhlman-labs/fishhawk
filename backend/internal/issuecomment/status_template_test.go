@@ -431,6 +431,15 @@ func TestRenderStatusBody_AcceptanceActivity(t *testing.T) {
 			want:     "Acceptance not validated — the validator recorded no criteria (verified nothing)",
 		},
 		{
+			// all-retired-observed: rows WERE recorded but the operator retired
+			// every one, so the wording names the retirement — never "recorded no
+			// criteria", which would be inaccurate for this origin.
+			name:     "all-retired-observed names the retirement, not a missing itemization",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "basis": plan.AcceptanceBasisAllRetiredObserved, "criteria_total": 2},
+			want:     "Acceptance not validated — all 2 recorded criteria were retired (verified nothing)",
+		},
+		{
 			// A POST-RUN not_validated DID run, so it can carry a transcript — the
 			// pre-spawn variant never does. The clause must append here.
 			name:     "all-skip-observed appends the transcript clause",

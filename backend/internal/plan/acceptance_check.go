@@ -367,6 +367,19 @@ const (
 	// tellable apart on the recorded payload. Like all-skip-observed it is NOT
 	// exempted by auditcomplete's trace rule.
 	AcceptanceBasisNoRowsObserved = "no-rows-observed"
+	// AcceptanceBasisAllRetiredObserved is the THIRD POST-RUN basis for the
+	// empty-non-retired-set door (#3397, fix-up for the medium/untested-path
+	// concern): the validator RAN and DID itemize per-criterion rows, but the
+	// operator retired EVERY one of them at the approval gate, so the non-retired
+	// set the ladder runs over is empty. It is a DISTINCT origin from
+	// no-rows-observed — rows WERE recorded here — and must not share its
+	// operator-facing sentence, which claims the validator "recorded no criteria".
+	// Reached only via the #2581 retirement path (a shipped `failed` whose every
+	// failure names a retired criterion downgrades to passed, then this ladder
+	// raises it to not_validated). Like the two sibling observed bases it is NOT
+	// exempted by auditcomplete's trace rule — a runner spawned, so the trace is
+	// owed.
+	AcceptanceBasisAllRetiredObserved = "all-retired-observed"
 )
 
 // Acceptance short-circuit verdict vocabulary (#2347). The pre-spawn

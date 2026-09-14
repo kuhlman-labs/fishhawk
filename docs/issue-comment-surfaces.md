@@ -1226,7 +1226,12 @@ Notes:
   by `basis` — `all-skip-observed` renders "Acceptance not validated —
   `<passed>`/`<total>` criteria verified (the validator skipped every
   criterion)"; `no-rows-observed` renders "Acceptance not validated — the
-  validator recorded no criteria (verified nothing)". Because the POST-RUN stage
+  validator recorded no criteria (verified nothing)"; `all-retired-observed`
+  (rows WERE itemized but the operator retired every one, so nothing non-retired
+  remained) renders "Acceptance not validated — all `<total>` recorded criteria
+  were retired (verified nothing)" — a DISTINCT sentence from `no-rows-observed`
+  because criteria WERE recorded here, so claiming the validator "recorded no
+  criteria" would be inaccurate. Because the POST-RUN stage
   actually ran, both observed rows ALSO append the transcript clause (below),
   which the pre-spawn row never carries. Neither shape reuses the "Acceptance
   recorded — `<outcome>` (`<passed>`/`<total>` criteria passed)" certification
@@ -1263,8 +1268,9 @@ Notes:
   failing-request clause — it can never tell a story that contradicts its own
   headline. A PRE-SPAWN `not_validated` branch is untouched by construction
   (that verdict is minted pre-spawn and never carries a transcript); a POST-RUN
-  `not_validated` (basis `all-skip-observed` / `no-rows-observed`, #3397) DID
-  run, so its observed row appends the transcript clause too. A payload with
+  `not_validated` (basis `all-skip-observed` / `no-rows-observed` /
+  `all-retired-observed`, #3397) DID run, so its observed row appends the
+  transcript clause too. A payload with
   no transcript, or `transcript: null`, renders byte-identically to before.
   No `@`-mention is added, so `notifier.go` stays uninvolved (same exemption as
   the acceptance kinds above). Pinned by

@@ -3359,6 +3359,15 @@ func retireCrit2() []acceptanceCriteriaAmendment {
 	}}
 }
 
+// retireCrit1And2 retires BOTH criteria the all-retired-observed tests itemize,
+// so a verdict reporting only crit-1 and crit-2 leaves an empty non-retired set.
+func retireCrit1And2() []acceptanceCriteriaAmendment {
+	return []acceptanceCriteriaAmendment{
+		{ID: "crit-1", Action: "retire", Reason: "criterion superseded at the approval gate"},
+		{ID: "crit-2", Action: "retire", Reason: "approval condition 1 replaced the server-budget surface"},
+	}
+}
+
 // acceptanceVerdictBytes marshals a verdict body with the given mode + results.
 func acceptanceVerdictBytes(t *testing.T, verdict, failureMode string, results ...acceptanceCriterionResult) []byte {
 	t.Helper()
@@ -4345,6 +4354,82 @@ func TestDowngrade_AllSurvivingRowsSkipped_RecordsNotValidated(t *testing.T) {
 	}
 	if payload["downgrade_basis"] == nil {
 		t.Errorf("downgrade_basis missing; the retirement attribution must survive: %v", payload)
+	}
+}
+
+// TestShipAcceptance_AllRowsRetired_ShippedPassed_RecordsAllRetiredBasis pins the
+// distinct THIRD origin of an empty non-retired set (fix-up, medium/untested-path):
+// a validator ships a `passed` verdict itemizing rows, but the operator retired
+// EVERY itemized criterion at the approval gate. The non-retired set is empty, so
+// the ladder records not_validated — but with basis all-retired-observed, NOT
+// no-rows-observed, because rows WERE recorded (criteria_total is non-zero). The
+// two origins must stay tellable apart on the payload so the operator-facing
+// render never claims the validator "recorded no criteria".
+//
+// This is the ACTUALLY-REACHABLE all-retired path. The #2581 downgrade does NOT
+// participate: its D3 precondition requires a SURVIVING non-retired row, so an
+// all-retired verdict never downgrades — the not_validated verdict here is reached
+// purely by the ladder over the empty non-retired set on a shipped `passed`.
+func TestShipAcceptance_AllRowsRetired_ShippedPassed_RecordsAllRetiredBasis(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit1And2())
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "passed"},
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != "not_validated" {
+		t.Errorf("recorded verdict = %v, want not_validated (all itemized rows retired)", payload["verdict"])
+	}
+	if payload["verdict_reported"] != "passed" {
+		t.Errorf("verdict_reported = %v, want passed", payload["verdict_reported"])
+	}
+	if payload["basis"] != plan.AcceptanceBasisAllRetiredObserved {
+		t.Errorf("basis = %v, want %q (rows recorded but all retired — NOT no-rows-observed)", payload["basis"], plan.AcceptanceBasisAllRetiredObserved)
+	}
+	// The distinguishing fact: criteria_total is NON-ZERO here, which is exactly
+	// what makes the no-rows wording ("recorded no criteria") inaccurate.
+	if payload["criteria_total"] == float64(0) {
+		t.Errorf("criteria_total = 0, want non-zero (rows WERE recorded, then retired)")
+	}
+}
+
+// TestShipAcceptance_AllRowsRetired_ShippedFailed_StaysFailed is the anti-softening
+// pin for the all-retired origin (the case the concern literally named). Tracing
+// it end to end corrected the concern's mechanical prediction: the #2581 downgrade
+// CANNOT fire on an all-retired verdict (D3 requires a surviving non-retired row),
+// so a shipped `failed` whose every itemized row is retired is NOT downgraded, and
+// the severity ladder over the empty non-retired set leaves failed (2) above
+// not_validated (1) untouched. The verdict stays failed and carries NO basis key —
+// so the all-retired-observed basis is unreachable from a shipped `failed`, and the
+// inaccurate-wording hazard the concern flagged for THIS combination never occurs.
+func TestShipAcceptance_AllRowsRetired_ShippedFailed_StaysFailed(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit1And2())
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "failed", Observed: "still broken"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed", Observed: "still broken"},
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != "failed" {
+		t.Errorf("recorded verdict = %v, want failed (all-retired never softens a shipped failed)", payload["verdict"])
+	}
+	if _, present := payload["basis"]; present {
+		t.Errorf("basis present on a shipped-failed all-retired verdict: %v", payload)
+	}
+	// The downgrade must NOT have fired (D3): no retirement attribution recorded.
+	if _, present := payload["downgrade_basis"]; present {
+		t.Errorf("downgrade_basis present: the D3 survivor precondition should block the downgrade on an all-retired verdict: %v", payload)
 	}
 }
 
