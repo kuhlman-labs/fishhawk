@@ -1418,6 +1418,12 @@ func TestNextActions_AcceptanceNotValidated_AcknowledgementPrompt(t *testing.T) 
 		if !strings.Contains(reason, "acknowledge") {
 			t.Errorf("reason dropped the acknowledgement ask (#2347 condition 1):\n%s", reason)
 		}
+		// (c) #3397: the reason now names the POST-RUN origin too — the validator
+		// ran and skipped every criterion — so an operator reading it after an
+		// observed all-skip verdict is not misled into thinking it short-circuited.
+		if !strings.Contains(reason, "skipped every criterion") {
+			t.Errorf("reason no longer names the #3397 run-then-skip origin ('skipped every criterion'):\n%s", reason)
+		}
 		// The prompt must not read as a pass.
 		if strings.Contains(reason, "the acceptance stage passed") {
 			t.Errorf("reason still reads as a validated pass:\n%s", reason)

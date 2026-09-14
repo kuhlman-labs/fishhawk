@@ -15,7 +15,9 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -342,6 +344,226 @@ func TestDevFixtures_TraceUploadPath_EmitsSpendAlert_EndToEnd(t *testing.T) {
 		}
 		if got := listAuditByCategory(t, s, "spend_alert"); len(got) != 0 {
 			t.Fatalf("spend_alert rows = %d without a baseline, want 0 — the seeded baseline was not load-bearing: %s", len(got), got[0].Payload)
+		}
+	})
+}
+
+// seedAcceptanceDispatched POSTs the acceptance-dispatched scenario and returns
+// the minted run id plus the acceptance stage id.
+func seedAcceptanceDispatched(t *testing.T, s *Server) (runID, acceptanceID uuid.UUID) {
+	t.Helper()
+	w := devRequest(t, s, http.MethodPost, "/v0/dev/fixtures", []byte(`{"scenario":"acceptance-dispatched"}`), devLoopbackPeer, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /v0/dev/fixtures: status = %d, want 201\n%s", w.Code, w.Body.String())
+	}
+	var res devfixtures.Result
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	rr := res.Runs["target-run"]
+	return rr.ID, rr.Stages["acceptance"]
+}
+
+// TestDevFixtures_AcceptanceDispatched_PromptCarriesCriteria_AllSkipRecordsNotValidated_EndToEnd
+// is the #3397 cross-boundary walk over one shared Postgres: seed the enriched
+// scenario → fetch the signed acceptance prompt (it serves the two seeded
+// criteria ids and the resolvable expected head) → ship an all-skip verdict →
+// read back not_validated with basis all-skip-observed → the merge gate resolves
+// acceptance_not_validated. A fresh-seed control ships one passed + one skipped
+// and records passed/accepted with no basis. The problem-1 counterfactual strips
+// the plan artifact and re-applies, proving the prompt then serves no criteria.
+func TestDevFixtures_AcceptanceDispatched_PromptCarriesCriteria_AllSkipRecordsNotValidated_EndToEnd(t *testing.T) {
+	d := newDevPGServer(t)
+	s := d.s
+	s.promptIssueGetterOverride = &stubIssueGetter{issue: &githubclient.Issue{
+		Number: 3329, Title: "Acceptance dispatched fixture", Body: "seed", State: "open",
+	}}
+	const seededHead = "0123456789abcdef0123456789abcdef01234567"
+
+	runID, acceptanceID := seedAcceptanceDispatched(t, s)
+	priv := issueDevSigningKey(t, s, runID)
+
+	// Fetch the signed acceptance prompt.
+	promptSig := devSignBody(t, s, priv, []byte("prompt:"+acceptanceID.String()))
+	pw := devRequest(t, s, http.MethodGet, "/v0/stages/"+acceptanceID.String()+"/prompt", nil, devLoopbackPeer,
+		map[string]string{"X-Fishhawk-Signature": promptSig})
+	if pw.Code != http.StatusOK {
+		t.Fatalf("GET prompt: status = %d, want 200\n%s", pw.Code, pw.Body.String())
+	}
+	var prompt struct {
+		AcceptanceCriteriaIDs     []string `json:"acceptance_criteria_ids"`
+		AcceptanceExpectedHeadSHA string   `json:"acceptance_expected_head_sha"`
+	}
+	if err := json.Unmarshal(pw.Body.Bytes(), &prompt); err != nil {
+		t.Fatalf("decode prompt: %v", err)
+	}
+	gotIDs := map[string]bool{}
+	for _, id := range prompt.AcceptanceCriteriaIDs {
+		gotIDs[id] = true
+	}
+	if len(prompt.AcceptanceCriteriaIDs) != 2 || !gotIDs["run-readable"] || !gotIDs["stages-listed"] {
+		t.Fatalf("acceptance_criteria_ids = %v, want run-readable + stages-listed", prompt.AcceptanceCriteriaIDs)
+	}
+	if prompt.AcceptanceExpectedHeadSHA != seededHead {
+		t.Errorf("acceptance_expected_head_sha = %q, want %q", prompt.AcceptanceExpectedHeadSHA, seededHead)
+	}
+
+	// Ship an all-skip verdict: the validator ran and skipped every criterion.
+	body, _ := json.Marshal(acceptanceBody{Verdict: "passed", Criteria: critRaw(
+		acceptanceCriterionResult{ID: "run-readable", Result: "skipped", ExpectationBasis: "preview offline"},
+		acceptanceCriterionResult{ID: "stages-listed", Result: "skipped", ExpectationBasis: "preview offline"},
+	)})
+	sig := devSignBody(t, s, priv, body)
+	aw := devRequest(t, s, http.MethodPost,
+		"/v0/runs/"+runID.String()+"/acceptance?stage_id="+acceptanceID.String(), body, devLoopbackPeer,
+		map[string]string{"X-Fishhawk-Signature": sig, "Content-Type": "application/json"})
+	if aw.Code != http.StatusCreated {
+		t.Fatalf("POST acceptance: status = %d, want 201\n%s", aw.Code, aw.Body.String())
+	}
+	var aresp acceptanceResponse
+	if err := json.Unmarshal(aw.Body.Bytes(), &aresp); err != nil {
+		t.Fatalf("decode acceptance response: %v", err)
+	}
+	if aresp.EffectiveVerdict != acceptanceVerdictNotValidated {
+		t.Errorf("effective_verdict = %q, want not_validated", aresp.EffectiveVerdict)
+	}
+
+	// Read the recorded outcome back through GET /v0/audit.
+	rows := listAuditByCategory(t, s, "acceptance_outcome_recorded")
+	var newest *auditEntryResponse
+	for i := range rows {
+		if rows[i].RunID != nil && *rows[i].RunID == runID {
+			if newest == nil || rows[i].Sequence > newest.Sequence {
+				newest = &rows[i]
+			}
+		}
+	}
+	if newest == nil {
+		t.Fatalf("no acceptance_outcome_recorded row for run %s", runID)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(newest.Payload, &p); err != nil {
+		t.Fatalf("decode outcome payload: %v", err)
+	}
+	if p["verdict"] != "not_validated" || p["outcome"] != "not_validated" {
+		t.Errorf("recorded verdict/outcome = %v/%v, want not_validated", p["verdict"], p["outcome"])
+	}
+	if p["basis"] != plan.AcceptanceBasisAllSkipObserved {
+		t.Errorf("basis = %v, want all-skip-observed", p["basis"])
+	}
+	if p["verdict_reported"] != "passed" {
+		t.Errorf("verdict_reported = %v, want passed", p["verdict_reported"])
+	}
+	if p["criteria_passed"] != float64(0) {
+		t.Errorf("criteria_passed = %v, want 0", p["criteria_passed"])
+	}
+
+	// The merge gate resolves acceptance_not_validated.
+	runRow, err := s.cfg.RunRepo.GetRun(t.Context(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(t.Context(), runID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	gate, err := s.acceptanceGateState(t.Context(), runRow, stages)
+	if err != nil {
+		t.Fatalf("acceptanceGateState: %v", err)
+	}
+	if gate != acceptanceGateNotValidated {
+		t.Errorf("gate = %q, want acceptance_not_validated", gate)
+	}
+
+	// Control: a fresh seed that ships one passed + one skipped records
+	// passed/accepted with no basis.
+	t.Run("mixed_passed_and_skipped_records_passed", func(t *testing.T) {
+		runID2, accID2 := seedAcceptanceDispatched(t, s)
+		priv2 := issueDevSigningKey(t, s, runID2)
+		body2, _ := json.Marshal(acceptanceBody{Verdict: "passed", Criteria: critRaw(
+			acceptanceCriterionResult{ID: "run-readable", Result: "passed"},
+			acceptanceCriterionResult{ID: "stages-listed", Result: "skipped", ExpectationBasis: "advisory"},
+		)})
+		sig2 := devSignBody(t, s, priv2, body2)
+		w := devRequest(t, s, http.MethodPost,
+			"/v0/runs/"+runID2.String()+"/acceptance?stage_id="+accID2.String(), body2, devLoopbackPeer,
+			map[string]string{"X-Fishhawk-Signature": sig2, "Content-Type": "application/json"})
+		if w.Code != http.StatusCreated {
+			t.Fatalf("control ship: status = %d, want 201\n%s", w.Code, w.Body.String())
+		}
+		var cr acceptanceResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &cr); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if cr.EffectiveVerdict != "" {
+			t.Errorf("control effective_verdict = %q, want empty (a genuine pass)", cr.EffectiveVerdict)
+		}
+		rows := listAuditByCategory(t, s, "acceptance_outcome_recorded")
+		var got *auditEntryResponse
+		for i := range rows {
+			if rows[i].RunID != nil && *rows[i].RunID == runID2 {
+				if got == nil || rows[i].Sequence > got.Sequence {
+					got = &rows[i]
+				}
+			}
+		}
+		if got == nil {
+			t.Fatalf("no outcome row for control run %s", runID2)
+		}
+		var cp map[string]any
+		if err := json.Unmarshal(got.Payload, &cp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if cp["verdict"] != "passed" || cp["outcome"] != "accepted" {
+			t.Errorf("control verdict/outcome = %v/%v, want passed/accepted", cp["verdict"], cp["outcome"])
+		}
+		if _, present := cp["basis"]; present {
+			t.Errorf("control payload carries a basis on a genuine pass: %v", cp)
+		}
+	})
+
+	// Problem-1 counterfactual: strip the plan artifact before Apply and the
+	// prompt then serves no acceptance criteria — proving the seeded plan
+	// artifact is what makes the criteria drivable.
+	t.Run("stripped_plan_serves_no_criteria", func(t *testing.T) {
+		sc, err := devfixtures.Load("acceptance-dispatched")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		kept := sc.Artifacts[:0]
+		var strippedPlan bool
+		for _, a := range sc.Artifacts {
+			if a.Kind == "plan" {
+				strippedPlan = true
+				continue
+			}
+			kept = append(kept, a)
+		}
+		sc.Artifacts = kept
+		if !strippedPlan {
+			t.Fatal("scenario carried no plan artifact to strip")
+		}
+		res, err := devfixtures.Apply(t.Context(), d.deps, sc)
+		if err != nil {
+			t.Fatalf("Apply stripped scenario: %v", err)
+		}
+		rid := res.Runs["target-run"].ID
+		aid := res.Runs["target-run"].Stages["acceptance"]
+		p := issueDevSigningKey(t, s, rid)
+		psig := devSignBody(t, s, p, []byte("prompt:"+aid.String()))
+		pw := devRequest(t, s, http.MethodGet, "/v0/stages/"+aid.String()+"/prompt", nil, devLoopbackPeer,
+			map[string]string{"X-Fishhawk-Signature": psig})
+		if pw.Code != http.StatusOK {
+			t.Fatalf("GET prompt (stripped): status = %d, want 200\n%s", pw.Code, pw.Body.String())
+		}
+		var pr struct {
+			AcceptanceCriteriaIDs []string `json:"acceptance_criteria_ids"`
+		}
+		if err := json.Unmarshal(pw.Body.Bytes(), &pr); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(pr.AcceptanceCriteriaIDs) != 0 {
+			t.Errorf("acceptance_criteria_ids = %v, want empty without the plan artifact", pr.AcceptanceCriteriaIDs)
 		}
 	})
 }

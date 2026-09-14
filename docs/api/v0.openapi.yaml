@@ -3908,9 +3908,9 @@ components:
           description: |
             The settled acceptance disposition SHIPPED BY THE VALIDATOR. The
             enum is deliberately INCOMPLETE with respect to the verdict the
-            server records: `not_validated` (#2347) and `undecidable` (#2512)
-            are SERVER-DERIVED and are rejected here, so a wire producer can
-            forge neither.
+            server records: `not_validated` (#2347, #3397) and `undecidable`
+            (#2512) are SERVER-DERIVED and are rejected here, so a wire producer
+            can forge neither.
 
             An agent that could not decide one or more criteria reports that
             PER CRITERION (`criteria[].result: "undecidable"` with an
@@ -3919,11 +3919,15 @@ components:
             verdict `failed`. The server then derives the recorded verdict from
             the rows with a total precedence ladder: any `failed` row →
             `failed`; else any `undecidable` row → `undecidable` (including an
-            all-undecidable set, where nothing was verified); else `passed`.
-            The recorded verdict is resolved severity-monotone as
-            `max(shipped, derived)` over `passed < undecidable < failed`, so a
-            shipped `failed` is never softened and a row set containing an
-            undecidable row can never be recorded as `passed`. When the
+            all-undecidable set, where nothing was verified); else if every
+            non-retired row is `skipped` OR no rows were itemized at all →
+            `not_validated` (bases `all-skip-observed` / `no-rows-observed`,
+            #3397 — the validator ran but verified nothing); else `passed`. The
+            recorded verdict is resolved severity-monotone as
+            `max(shipped, derived)` over `passed < not_validated < undecidable <
+            failed`, so a shipped `failed` is never softened (a shipped `failed`
+            with an all-skip/empty set stays `failed`) and a row set containing
+            an undecidable row can never be recorded as `passed`. When the
             recorded verdict differs from the shipped one, the
             `acceptance_outcome_recorded` payload carries `verdict_reported`
             with what the agent said.
@@ -4219,17 +4223,25 @@ components:
         failure_mode: { type: string, enum: [error, assertion_fail] }
         effective_verdict:
           type: string
-          enum: [passed]
+          enum: [passed, not_validated, undecidable, failed]
           description: |
-            Present ONLY when a `failed` verdict was NEUTRALIZED because every
-            failure it reported named an acceptance criterion the operator
-            RETIRED at the plan-approval gate (#2581, `amend_acceptance_criteria`).
-            `verdict`/`failure_mode` keep echoing what the producer shipped and the
-            stored artifact bytes are untouched; the governance
-            `acceptance_outcome_recorded` entry records this value as its
-            `verdict` alongside `verdict_reported`, `downgrade_basis` and
-            `retired_criterion_ids`. Omitted otherwise — additive either way, since
-            the runner decodes this body without `DisallowUnknownFields`.
+            Present whenever the RECORDED verdict differs from the one the
+            producer SHIPPED. The `[passed]`-only enum was already stale for
+            #2512 (a shipped `passed` carrying an undecidable/failed row records
+            `undecidable`/`failed`) and #3091 (an unbound head clamps to
+            `undecidable`); #3397 adds `not_validated` (a shipped `passed` whose
+            non-retired rows are all skipped, or that itemized no rows). The
+            original #2581 case is one instance: a `failed` verdict NEUTRALIZED
+            because every failure named an acceptance criterion the operator
+            RETIRED at the plan-approval gate (`amend_acceptance_criteria`)
+            records `passed`. In every case `verdict`/`failure_mode` keep echoing
+            what the producer shipped and the stored artifact bytes are
+            untouched; the governance `acceptance_outcome_recorded` entry records
+            this value as its `verdict` alongside `verdict_reported` (and, per
+            origin, `downgrade_basis` + `retired_criterion_ids`,
+            `undecidable_basis`, or `basis`). Omitted when the recorded verdict
+            IS the shipped one — additive either way, since the runner decodes
+            this body without `DisallowUnknownFields`.
             On an IDEMPOTENT replay (`idempotent: true`) this field ECHOES the
             already-recorded `acceptance_outcome_recorded` entry rather than a
             fresh recomputation, so a retirement recorded after the original ship
@@ -14818,17 +14830,20 @@ paths:
         `acceptance_not_validated` state, the MCP `next_actions` state of
         the same name, and a distinct status-comment row.
 
-        It is disjoint BY CONSTRUCTION from the `undecidable` verdict
-        (#2512) and its `acceptance_undecidable` gate state: this
-        short-circuit settles the stage PRE-SPAWN from the plan alone, so
-        it can produce no per-criterion rows at all, while `undecidable`
-        is derived POST-RUN from rows the agent actually reported. Both
-        are merge-eligible; neither is a pass. The payload also
-        carries `criteria_live_validation`, the count of criteria marked
-        `requires_live_validation`. This verdict is SERVER-INTERNAL: the
-        ship-acceptance endpoint (`POST /v0/runs/{run_id}/acceptance`)
-        deliberately still admits only `passed`/`failed`, so a validator
-        can never forge it.
+        This endpoint records the PRE-SPAWN origin of `not_validated`: it
+        settles the stage from the plan alone, so it produces no per-criterion
+        rows (bases `empty_criteria` / `all_skip_with_basis`). The ship endpoint
+        can ALSO record `not_validated` POST-RUN (#3397, bases
+        `all-skip-observed` / `no-rows-observed`) when a validator ran but
+        verified nothing. Both origins stay disjoint from the `undecidable`
+        verdict (#2512) and its `acceptance_undecidable` gate state by a single
+        severity ladder (`passed < not_validated < undecidable < failed`): a run
+        with any undecidable row records `undecidable`. All are merge-eligible;
+        none is a pass. The payload also carries `criteria_live_validation`, the
+        count of criteria marked `requires_live_validation`. `not_validated` is
+        SERVER-DERIVED: the ship-acceptance endpoint
+        (`POST /v0/runs/{run_id}/acceptance`) deliberately still admits only
+        `passed`/`failed`, so a validator can never forge it directly.
 
         The admissible stage states are `pending` and
         `awaiting_host_dispatch`. A `dispatched` acceptance stage is NOT

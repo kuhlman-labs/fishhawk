@@ -414,6 +414,30 @@ func TestRenderStatusBody_AcceptanceActivity(t *testing.T) {
 			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "criteria_passed": 0, "criteria_total": 4, "criteria_live_validation": 2},
 			want:     "Acceptance not validated — 0/4 criteria verified (all criteria skip-expected); 2 require live validation",
 		},
+		// #3397: the POST-RUN observed bases render honest, distinct wording that
+		// names the validator's inaction (it RAN) rather than the pre-spawn plan
+		// shape. The basis value comes from the plan-package constant, so these
+		// double as the byte-identity pin for the package-local mirror.
+		{
+			name:     "all-skip-observed names the validator skipping every criterion",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "basis": plan.AcceptanceBasisAllSkipObserved, "criteria_passed": 0, "criteria_total": 3},
+			want:     "Acceptance not validated — 0/3 criteria verified (the validator skipped every criterion)",
+		},
+		{
+			name:     "no-rows-observed names the validator recording no criteria",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "basis": plan.AcceptanceBasisNoRowsObserved},
+			want:     "Acceptance not validated — the validator recorded no criteria (verified nothing)",
+		},
+		{
+			// A POST-RUN not_validated DID run, so it can carry a transcript — the
+			// pre-spawn variant never does. The clause must append here.
+			name:     "all-skip-observed appends the transcript clause",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "basis": plan.AcceptanceBasisAllSkipObserved, "criteria_passed": 0, "criteria_total": 2, "transcript": map[string]any{"artifact_id": "abc123"}},
+			want:     "Acceptance not validated — 0/2 criteria verified (the validator skipped every criterion); transcript /v0/artifacts/abc123",
+		},
 		// #2512: the ladder-derived undecidable outcome renders its OWN row.
 		// Same construction as the not_validated rows above — the outcome value
 		// comes from the plan-package constant the ingest emits, so these double

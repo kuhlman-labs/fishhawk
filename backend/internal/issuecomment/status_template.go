@@ -499,9 +499,11 @@ func renderAcceptanceLine(verb string) string {
 // suppressed (its rows disagreed with the verdict) no failing-request clause
 // can render — the payload carries no criteria — and the suppression reason
 // (a closed enum) is named instead, so the row never tells a story that
-// contradicts its own headline. The not_validated branch is untouched by
-// construction: that verdict is minted pre-spawn and never carries a
-// transcript.
+// contradicts its own headline. The not_validated branch now has TWO shapes
+// (#3397): a PRE-SPAWN verdict (empty/absent basis) is byte-identical to
+// before and carries no transcript, while a POST-RUN verdict (basis
+// all-skip-observed / no-rows-observed) DID run and so appends the transcript
+// clause on its own honest wording.
 func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 	a := decodeAcceptanceActivity(payload)
 	if a.outcome == acceptanceOutcomeUndecidable {
@@ -513,6 +515,18 @@ func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 		return line + acceptanceTranscriptClause(a)
 	}
 	if a.outcome == acceptanceOutcomeNotValidated {
+		// POST-RUN not_validated (#3397): the validator RAN, so unlike the
+		// pre-spawn variant it can carry a transcript. The two observed bases get
+		// honest wording that names the validator's inaction rather than the
+		// pre-spawn "the plan declared none" / "all criteria skip-expected".
+		switch a.basis {
+		case acceptanceBasisAllSkipObserved:
+			return fmt.Sprintf("Acceptance not validated — %d/%d criteria verified (the validator skipped every criterion)",
+				a.criteriaPassed, a.criteriaTotal) + acceptanceTranscriptClause(a)
+		case acceptanceBasisNoRowsObserved:
+			return "Acceptance not validated — the validator recorded no criteria (verified nothing)" + acceptanceTranscriptClause(a)
+		}
+		// PRE-SPAWN not_validated: byte-identical to before — no transcript.
 		line := "Acceptance not validated — 0 criteria verified (the plan declared none)"
 		if a.criteriaTotal > 0 {
 			line = fmt.Sprintf("Acceptance not validated — %d/%d criteria verified (all criteria skip-expected)", a.criteriaPassed, a.criteriaTotal)
@@ -573,6 +587,19 @@ func acceptanceTranscriptClause(a acceptanceActivity) string {
 // stops rendering the not-validated row and fails there.
 const acceptanceOutcomeNotValidated = "not_validated"
 
+// acceptanceBasisAllSkipObserved / acceptanceBasisNoRowsObserved are the two
+// POST-RUN not_validated `basis` values the server ingest records (#3397): the
+// validator RAN and either skipped every non-retired criterion, or itemized no
+// rows at all. Mirrored here rather than imported for the same pure-render
+// reason as the outcome constants above, and pinned by status_template_test.go
+// against plan.AcceptanceBasisAllSkipObserved / plan.AcceptanceBasisNoRowsObserved.
+// The two PRE-SPAWN bases carry no distinct render — a pre-spawn not_validated
+// payload has an empty/absent basis and renders through the unchanged branch.
+const (
+	acceptanceBasisAllSkipObserved = "all-skip-observed"
+	acceptanceBasisNoRowsObserved  = "no-rows-observed"
+)
+
 // acceptanceOutcomeUndecidable is the `outcome` value the acceptance ingest
 // records when the precedence ladder derives an undecidable verdict from the
 // agent's per-criterion rows (#2512). Mirrored here rather than imported for
@@ -618,6 +645,10 @@ type acceptanceActivity struct {
 	// reported as `undecidable` (#2512). Zero on every pre-#2512 payload and on
 	// every outcome whose rows all decided, so no existing render path changes.
 	criteriaUndecidable int
+	// basis is the not_validated `basis` payload value (#3397): all-skip-observed
+	// or no-rows-observed for a POST-RUN verdict, empty for a pre-spawn one or any
+	// non-not_validated outcome. Additive: every pre-#3397 payload lacks it.
+	basis string
 	// transcriptArtifactID is the `transcript.artifact_id` of the stored
 	// acceptance_transcript artifact (E72.5 / #3329); empty on transcript:null
 	// and on every pre-transcript payload. transcriptSuppressed carries the
@@ -655,6 +686,9 @@ func decodeAcceptanceActivity(payload json.RawMessage) acceptanceActivity {
 		// acceptance agent could not DECIDE. Additive: every pre-change payload
 		// lacks it and decodes to zero, so no existing render path changes.
 		CriteriaUndecidable int `json:"criteria_undecidable"`
+		// basis (#3397) names WHY a POST-RUN not_validated verdict was derived.
+		// Additive: absent on every pre-#3397 and every non-not_validated payload.
+		Basis string `json:"basis"`
 		// transcript (E72.5 / #3329) is the bounded summary block the ingest
 		// derives from the STORED transcript artifact — null when none shipped.
 		// Additive: absent/null/undecodable leaves every transcript field empty.
@@ -682,6 +716,7 @@ func decodeAcceptanceActivity(payload json.RawMessage) acceptanceActivity {
 		disposition:            p.Disposition,
 		criteriaLiveValidation: p.CriteriaLiveValidation,
 		criteriaUndecidable:    p.CriteriaUndecidable,
+		basis:                  p.Basis,
 	}
 	if p.Transcript != nil {
 		a.transcriptArtifactID = p.Transcript.ArtifactID

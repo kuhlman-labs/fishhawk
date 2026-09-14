@@ -325,9 +325,15 @@ func AcceptanceSkippableOutOfScope(v Verification) bool {
 // these constants instead of free-typed strings.
 const (
 	// AcceptanceBasisKey is the acceptance_outcome_recorded payload key naming
-	// the short-circuit basis. A normally server-recorded verdict never sets
-	// it, so its presence unambiguously discriminates the pre-spawn
-	// short-circuit from an ordinary validator-shipped verdict.
+	// WHY a not_validated verdict was recorded. It has TWO producer classes:
+	// the orchestrator's PRE-SPAWN short-circuit (bases empty-criteria /
+	// all-skip-with-basis, no runner) and, since #3397, the SERVER INGEST when
+	// a validator RAN but verified nothing (bases all-skip-observed /
+	// no-rows-observed). It is set ONLY on a recorded not_validated verdict, so
+	// an ordinary passed/failed/undecidable outcome still never carries it. The
+	// basis VALUE — not the mere presence of the key — is what discriminates a
+	// pre-spawn short-circuit (auditcomplete trace-exempt) from a post-run
+	// verified-nothing verdict (trace still owed).
 	AcceptanceBasisKey = "basis"
 	// AcceptanceBasisEmptyCriteria is a basis value auditcomplete honors for the
 	// trace exemption (#1728): an approved plan with ZERO acceptance_criteria AND
@@ -338,8 +344,29 @@ const (
 	// acceptance criterion carries skip_expected with a non-empty
 	// expectation_basis — so there is nothing the sandboxed acceptance agent
 	// could observe and the stage short-circuits with no runner spawn. Any basis
-	// value OTHER than these two is NOT exempted.
+	// value OTHER than the two PRE-SPAWN values above is NOT exempted.
 	AcceptanceBasisAllSkipWithBasis = "all-skip-with-basis"
+	// AcceptanceBasisAllSkipObserved is the POST-RUN basis the SERVER INGEST
+	// records (handleShipAcceptance), NOT the pre-spawn short-circuit: the
+	// validator RAN — a runner spawned, the preview came up — and shipped a
+	// verdict whose EVERY non-retired per-criterion row is `skipped` (zero
+	// passed, zero failed, zero undecidable). The precedence ladder derives
+	// not_validated from those rows because nothing was actually verified
+	// (#3397). It is DELIBERATELY distinct from the two pre-spawn bases above:
+	// auditcomplete's trace exemption honors ONLY those two, so an observed
+	// all-skip stage still OWES its trace (a runner spawned; a trace is owed).
+	AcceptanceBasisAllSkipObserved = "all-skip-observed"
+	// AcceptanceBasisNoRowsObserved is the sibling POST-RUN basis for the
+	// NEIGHBOURING door (#3397, binding condition 1): the validator RAN and
+	// shipped a verdict that itemized ZERO non-retired per-criterion rows at all
+	// (e.g. `{"verdict":"passed"}` with no criteria array). That verified
+	// nothing exactly as an all-skip set does, so the ingest ladders a shipped
+	// `passed` to not_validated while a shipped `failed` with an empty set stays
+	// failed (severity-monotone). It carries its OWN basis value so the two
+	// verified-nothing origins — all rows skipped vs no rows at all — stay
+	// tellable apart on the recorded payload. Like all-skip-observed it is NOT
+	// exempted by auditcomplete's trace rule.
+	AcceptanceBasisNoRowsObserved = "no-rows-observed"
 )
 
 // Acceptance short-circuit verdict vocabulary (#2347). The pre-spawn
@@ -350,20 +377,23 @@ const (
 // ABSENCE of verification rendered as certification. These two constants are the
 // third, honest disposition the short-circuit emits instead.
 //
-// SERVER-INTERNAL ONLY — no WIRE producer may ship this verdict. The acceptance
+// SERVER-DERIVED ONLY — no WIRE producer may ship this verdict. The acceptance
 // ship endpoint (POST /v0/runs/{run_id}/acceptance) deliberately still rejects
 // any verdict other than passed/failed (acceptanceBody.validate), so
-// not_validated can ONLY originate server-side from the orchestrator
-// short-circuit. That keeps it unforgeable by a validator and keeps an existing
-// recorded `passed` verdict at its exact prior meaning (no migration).
+// not_validated can ONLY originate server-side: from the orchestrator's
+// pre-spawn short-circuit, OR (since #3397) from the ingest precedence ladder
+// when a validator RAN but every non-retired row was skipped or no rows were
+// shipped. Either way a validator cannot forge it directly, and an existing
+// recorded `passed` verdict keeps its exact prior meaning (no migration).
 //
 // Defining them HERE — the plan package imports nothing from the repo and is
 // already imported by orchestrator, server, and auditcomplete — makes a
 // producer/consumer drift a compile error rather than a silent runtime miss.
 const (
 	// AcceptanceVerdictNotValidated is the acceptance_outcome_recorded `verdict`
-	// value for a short-circuited stage: merge-eligible, but recorded as having
-	// verified nothing.
+	// value for a stage that verified nothing: merge-eligible, but recorded as
+	// having verified ZERO criteria. Either short-circuited pre-spawn, or (since
+	// #3397) laddered from an observed all-skip / no-rows verdict.
 	AcceptanceVerdictNotValidated = "not_validated"
 	// AcceptanceOutcomeNotValidated is the render-vocabulary twin of
 	// accepted/rejected — the `outcome` field the issue-comment and PR-comment
@@ -458,26 +488,34 @@ func LiveValidationCriteria(v Verification) []AcceptanceCriterion {
 // COMPILE error rather than a silent runtime miss, exactly as #2347 did for
 // not_validated.
 //
-// THE PARTITION. Three names share ONE contract (merge-eligible, never a pass,
+// THE PARTITION. The names share ONE contract (merge-eligible, never a pass,
 // a distinct state string, operator acknowledgement in the merge verdict) and
 // are partitioned by a single total question — was there evidence, and what did
 // it say?
 //
-//   - NO EVIDENCE WAS POSSIBLE: the orchestrator's PRE-SPAWN short-circuit
-//     settles from the PLAN alone (zero criteria, or every criterion
-//     skip_expected-with-basis). No runner, no preview, no observation. That is
-//     AcceptanceVerdictNotValidated, and it is unchanged.
+//   - VERIFIED NOTHING: AcceptanceVerdictNotValidated. It now has TWO origins.
+//     (a) PRE-SPAWN, plan-only: the orchestrator short-circuits from the PLAN
+//     alone (zero criteria, or every criterion skip_expected-with-basis) — no
+//     runner, no preview, no rows, bases empty-criteria / all-skip-with-basis.
+//     (b) OBSERVED ALL-SKIP (#3397): the stage RAN and shipped rows of which
+//     EVERY non-retired one is `skipped`, or shipped NO rows at all — the
+//     server ingest ladders that to not_validated, bases all-skip-observed /
+//     no-rows-observed. It STILL stays disjoint from undecidable and failed,
+//     because the disposition is decided by one total ladder over the row set
+//     (failed ≻ undecidable ≻ all-skipped→not_validated ≻ passed).
 //   - EVIDENCE SAYS A CRITERION FAILED: a real defect. `failed` ->
 //     acceptance_triage, unchanged, discharged only by the #2474 arbitration
 //     verb.
 //   - EVIDENCE SAYS A CRITERION COULD NOT BE DECIDED: the stage RAN, drove the
 //     preview, and reported per-criterion rows of which at least one is
-//     undecidable. That is the new `undecidable`.
+//     undecidable. That is `undecidable`.
 //
-// The three are MUTUALLY EXCLUSIVE BY CONSTRUCTION, not by convention:
-// not_validated skips dispatch entirely so no criteria rows can exist, and the
-// precedence ladder puts failed strictly above undecidable so a single failed
-// row keeps the run in triage exactly as today.
+// The dispositions are MUTUALLY EXCLUSIVE BY CONSTRUCTION, not by convention:
+// the precedence ladder puts failed strictly above undecidable strictly above
+// the all-skipped→not_validated case, so a single failed row keeps the run in
+// triage and a single undecidable row keeps it undecidable exactly as today.
+// auditcomplete's trace exemption honors ONLY the two PRE-SPAWN bases; an
+// OBSERVED all-skip / no-rows verdict still owes its trace.
 //
 // SERVER-DERIVED AND UNFORGEABLE. Only the PER-CRITERION row value
 // (AcceptanceResultUndecidable) may cross the wire: the acceptance ship

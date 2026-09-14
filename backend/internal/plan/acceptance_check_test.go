@@ -398,6 +398,27 @@ func TestAcceptanceNotValidatedVocabulary(t *testing.T) {
 	}
 }
 
+// TestAcceptanceObservedBases pins the #3397 POST-RUN basis constants: each is
+// non-empty, they differ from each other, and both differ from the two
+// PRE-SPAWN bases auditcomplete's trace exemption honors — the distinction that
+// keeps an observed all-skip / no-rows verdict owing its trace.
+func TestAcceptanceObservedBases(t *testing.T) {
+	if AcceptanceBasisAllSkipObserved == "" || AcceptanceBasisNoRowsObserved == "" {
+		t.Fatal("observed basis constants must be non-empty")
+	}
+	if AcceptanceBasisAllSkipObserved == AcceptanceBasisNoRowsObserved {
+		t.Errorf("the two observed bases must be distinct, both = %q", AcceptanceBasisAllSkipObserved)
+	}
+	preSpawn := []string{AcceptanceBasisEmptyCriteria, AcceptanceBasisAllSkipWithBasis}
+	for _, observed := range []string{AcceptanceBasisAllSkipObserved, AcceptanceBasisNoRowsObserved} {
+		for _, pre := range preSpawn {
+			if observed == pre {
+				t.Errorf("observed basis %q collides with pre-spawn basis %q (auditcomplete would wrongly exempt it)", observed, pre)
+			}
+		}
+	}
+}
+
 // (clean contract) A fully clean criteria set returns a NON-NIL empty slice, so
 // a payload can distinguish "checked and clean" ([]) from "never checked".
 func TestEvaluateAcceptanceCriteria_CleanReturnsNonNilEmpty(t *testing.T) {

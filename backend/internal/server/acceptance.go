@@ -191,10 +191,13 @@ const (
 	// ever originate here, derived from the rows by aggregateAcceptanceResults.
 	//
 	// THE PARTITION (settled once, by construction rather than by convention):
-	// not_validated is decided PRE-SPAWN from the plan with ZERO observation, so
-	// it can carry no criteria rows at all; undecidable is decided POST-RUN from
-	// the agent's own evidence rows; failed outranks both. The three are mutually
-	// exclusive.
+	// the dispositions are decided by ONE total ladder over the row set
+	// (acceptanceVerdictSeverity: passed < not_validated < undecidable < failed).
+	// not_validated is reached PRE-SPAWN from the plan (no rows) OR POST-RUN when
+	// every non-retired row is skipped / no rows shipped (#3397); undecidable is
+	// reached POST-RUN when ≥1 row is undecidable and none failed; failed outranks
+	// both. Because one ladder decides, the recorded verdicts stay mutually
+	// exclusive even though not_validated can now carry all-skipped rows.
 	acceptanceVerdictUndecidable = plan.AcceptanceVerdictUndecidable
 
 	// acceptanceUndecidableBasisHeadUnresolved is the acceptance_outcome_recorded
@@ -684,46 +687,65 @@ func acceptanceCriteriaTally(criteria []acceptanceCriterionResult) (passed, fail
 }
 
 // aggregateAcceptanceResults is the TOTAL precedence ladder over per-criterion
-// rows (#2512, E48.78 layer 4): any failed row -> failed; else any undecidable
-// row -> undecidable, INCLUDING when EVERY row is undecidable and nothing was
-// verified; else passed.
+// rows: any failed row -> failed (#2512); else any undecidable row ->
+// undecidable, INCLUDING when EVERY row is undecidable (#2512); else if EVERY
+// row is skipped (a non-empty set with zero passed/failed/undecidable) ->
+// not_validated, because a validator that ran and skipped every criterion
+// verified nothing (#3397); else passed.
 //
 // PRECONDITION (load-bearing, enforced at the single call site): callers MUST
 // guard on len(rows) > 0. The function is total, so it answers an EMPTY row set
 // with `passed` — and "no evidence at all means passed" is precisely the hazard
-// #2512 exists to remove. The guard, not this function, is what keeps that
+// #2512/#3397 exist to remove. The guard, not this function, is what keeps that
 // answer unreachable; TestAggregateAcceptanceResults_EmptyRowSet pins the
-// behaviour so a caller that drops the guard cannot claim surprise, and
-// TestShipAcceptance_NoCriteriaRows_ShippedVerdictRecordedUnchanged pins the
-// guard itself at the seam.
+// behaviour so a caller that drops the guard cannot claim surprise, and the
+// empty-set door itself is closed at the seam (binding condition 1, #3397): the
+// call site ladders an empty non-retired set against not_validated directly.
 //
 // A row set containing an undecidable row can NEVER aggregate to passed: a green
 // light over an unevaluated criterion is the dangerous direction, because nobody
-// looks behind it.
+// looks behind it. The same reasoning extends to an all-skip set (#3397): a
+// validator that skipped every criterion verified nothing, so recording `passed`
+// would certify an absence of verification.
 func aggregateAcceptanceResults(rows []acceptanceCriterionResult) string {
 	sawUndecidable := false
+	sawVerifying := false // any passed row — the only row that actually verifies
 	for _, c := range rows {
 		switch c.Result {
 		case acceptanceResultFailed:
 			return acceptanceVerdictFailed
 		case acceptanceResultUndecidable:
 			sawUndecidable = true
+		case acceptanceResultPassed:
+			sawVerifying = true
 		}
 	}
 	if sawUndecidable {
 		return acceptanceVerdictUndecidable
 	}
+	// #3397: a non-empty set with no failed/undecidable row and NO passed row is
+	// all-skipped — the validator observed nothing. len(rows) > 0 is the caller's
+	// precondition, so reaching here with !sawVerifying means every row is skipped.
+	if !sawVerifying && len(rows) > 0 {
+		return acceptanceVerdictNotValidated
+	}
 	return acceptanceVerdictPassed
 }
 
-// acceptanceVerdictSeverity ranks the three recordable dispositions on the total
-// order passed < undecidable < failed. Anything unrecognized ranks lowest, so it
-// can never dominate a real verdict.
+// acceptanceVerdictSeverity ranks the recordable dispositions on the total order
+// passed < not_validated < undecidable < failed (binding condition 3, #3397).
+// not_validated sits BELOW undecidable so an all-skip ship on an unbound head is
+// clamped to undecidable(head_unresolved) — "we do not know which tree was
+// validated" outranks "we verified nothing on a known tree". Anything
+// unrecognized ranks lowest (with passed), so it can never dominate a real
+// verdict.
 func acceptanceVerdictSeverity(v string) int {
 	switch v {
 	case acceptanceVerdictFailed:
-		return 2
+		return 3
 	case acceptanceVerdictUndecidable:
+		return 2
+	case acceptanceVerdictNotValidated:
 		return 1
 	default:
 		return 0
@@ -732,13 +754,15 @@ func acceptanceVerdictSeverity(v string) int {
 
 // acceptanceVerdictAtLeast resolves the shipped-verdict/derived-verdict mismatch
 // SEVERITY-MONOTONE: it returns max(a, b) on the total order passed <
-// undecidable < failed, so the recorded verdict is a LOWER BOUND on what either
-// source claims and nothing is ever softened below either one.
+// not_validated < undecidable < failed, so the recorded verdict is a LOWER BOUND
+// on what either source claims and nothing is ever softened below either one.
 //
-// The three mismatch cases fall out of the single rule: shipped passed with a
-// failed row records failed; shipped passed with an undecidable row and no
-// failed row records undecidable; shipped failed deriving passed-or-undecidable
-// still records failed.
+// The mismatch cases fall out of the single rule: shipped passed with a failed
+// row records failed; shipped passed with an undecidable row and no failed row
+// records undecidable; shipped passed whose rows are all skipped (or empty)
+// records not_validated (#3397); and a shipped failed deriving anything lower
+// still records failed — so the class-5 all-skip-with-basis triage path is
+// unchanged.
 func acceptanceVerdictAtLeast(a, b string) string {
 	if acceptanceVerdictSeverity(b) > acceptanceVerdictSeverity(a) {
 		return b
@@ -750,12 +774,13 @@ func acceptanceVerdictAtLeast(a, b string) string {
 // (accepted | not_validated | rejected) — the `outcome` field
 // issuecomment/status_template.go's renderAcceptanceOutcomeLine reads.
 //
-// not_validated (#2347) is mapped explicitly rather than falling into the
-// binary default: a short-circuited stage that verified zero criteria is
-// neither an acceptance nor a rejection, and rendering it as "rejected" would be
-// as dishonest in the other direction as the "accepted" it replaces. Only a
-// server-internal short-circuit can produce that verdict — the wire endpoint
-// still admits passed/failed only.
+// not_validated (#2347 / #3397) is mapped explicitly rather than falling into
+// the binary default: a stage that verified zero criteria is neither an
+// acceptance nor a rejection, and rendering it as "rejected" would be as
+// dishonest in the other direction as the "accepted" it replaces. It is
+// server-derived only (pre-spawn short-circuit OR the ingest ladder over an
+// all-skip / no-rows verdict) — the wire endpoint still admits passed/failed
+// only, so a validator cannot ship it directly.
 func acceptanceOutcomeLabel(verdict string) string {
 	switch verdict {
 	case acceptanceVerdictPassed:
@@ -976,7 +1001,13 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	// The len(rows) > 0 guard is aggregateAcceptanceResults' documented
 	// PRECONDITION — without it an empty row set would answer `passed` and
 	// soften a shipped failed verdict into a pass, which is the exact hazard
-	// this ticket removes.
+	// #2512/#3397 remove.
+	//
+	// observedBasis names WHY a POST-RUN not_validated was derived, distinct from
+	// the two pre-spawn bases (#3397). It is emitted on the payload ONLY when the
+	// recorded verdict actually ends up not_validated (see buildOutcomePayload),
+	// so a shipped `failed` whose empty/all-skip set the ladder leaves at failed
+	// carries no basis.
 	recordedVerdict := acc.Verdict
 	if downgradedVerdict != "" {
 		recordedVerdict = downgradedVerdict
@@ -987,8 +1018,26 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 			nonRetired = append(nonRetired, c)
 		}
 	}
+	observedBasis := ""
 	if len(nonRetired) > 0 {
-		recordedVerdict = acceptanceVerdictAtLeast(recordedVerdict, aggregateAcceptanceResults(nonRetired))
+		derived := aggregateAcceptanceResults(nonRetired)
+		recordedVerdict = acceptanceVerdictAtLeast(recordedVerdict, derived)
+		if derived == acceptanceVerdictNotValidated {
+			// Every non-retired row was skipped: the validator ran and verified
+			// nothing (#3397).
+			observedBasis = plan.AcceptanceBasisAllSkipObserved
+		}
+	} else {
+		// THE NEIGHBOURING DOOR (binding condition 1, #3397): an empty non-retired
+		// row set — the validator shipped a verdict itemizing zero drivable rows
+		// (e.g. {"verdict":"passed"} with no criteria) — verified nothing exactly
+		// as an all-skip set does. Ladder against not_validated so a shipped
+		// `passed` becomes not_validated while a shipped `failed` with an empty set
+		// stays failed (severity-monotone, so the guard's anti-softening purpose is
+		// intact). A separate basis keeps the two verified-nothing origins tellable
+		// apart.
+		recordedVerdict = acceptanceVerdictAtLeast(recordedVerdict, acceptanceVerdictNotValidated)
+		observedBasis = plan.AcceptanceBasisNoRowsObserved
 	}
 	// Step (4), UNBOUND-HEAD CLAMP (#3091). A verdict whose validated head could
 	// not be resolved names no tree: nothing ties the AGENT'S claimed pass to the
@@ -1086,6 +1135,15 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		// resolvable head marshals byte-identically to before.
 		if undecidableBasis != "" {
 			fields["undecidable_basis"] = undecidableBasis
+		}
+		// basis (#3397) names WHY a POST-RUN not_validated verdict was derived —
+		// all-skip-observed or no-rows-observed. Emitted ONLY when the recorded
+		// verdict is not_validated: a clamp that raised it to undecidable carries
+		// undecidable_basis + verdict_reported and NO basis, and every other
+		// outcome marshals byte-identically to before. The value is distinct from
+		// the two pre-spawn bases, which the orchestrator (not this handler) emits.
+		if recordedVerdict == acceptanceVerdictNotValidated && observedBasis != "" {
+			fields[plan.AcceptanceBasisKey] = observedBasis
 		}
 		// Replay evidence (E72.4 / #3328): the runner-injected cap header copied
 		// VERBATIM plus the scenario-row tallies counted here. Absent body.replay
@@ -1218,7 +1276,11 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	// deterministic classifier to read — so it routes to operator arbitration
 	// rather than through a classifier fed an empty mode. An `undecidable`
 	// recorded verdict routes NO triage at all: an undecidable row is not a
-	// defect, so there is nothing to fix up or retry.
+	// defect, so there is nothing to fix up or retry. A #3397 not_validated
+	// recorded verdict likewise routes no triage — it can only arise from a
+	// shipped `passed` (acc.Verdict != failed), so this branch is not entered;
+	// a shipped `failed` whose rows are all-skip stays recorded `failed` and
+	// still routes class-5 triage exactly as before.
 	paged := false
 	if acc.Verdict == acceptanceVerdictFailed && downgradedVerdict == "" {
 		disposition := s.triageAcceptanceFailure(r.Context(), runID, stage, acc, created.ID.String())
@@ -1393,9 +1455,11 @@ const (
 	acceptanceGateSkippedOutOfScope = CategoryAcceptanceSkippedOutOfScope
 	// acceptanceGateNotValidated is the second merge-eligible terminal
 	// disposition (#2347): the acceptance stage settled with a recorded
-	// not_validated verdict — the orchestrator short-circuited it because the
-	// approved plan carried zero acceptance criteria, or every criterion was
-	// skip_expected with an expectation_basis. ZERO criteria were verified.
+	// not_validated verdict. Two origins reach it: the orchestrator
+	// short-circuited PRE-SPAWN (zero acceptance criteria, or every criterion
+	// skip_expected with an expectation_basis), OR (since #3397) the stage RAN
+	// and shipped a verdict whose every non-retired row was skipped / no rows at
+	// all. Either way ZERO criteria were verified.
 	//
 	// It is merge-ELIGIBLE on purpose: a change with no live target must not be
 	// stranded, and blocking here would trade a dishonest pass for a wedge. The
@@ -1438,9 +1502,9 @@ const (
 	// acknowledgement in the merge verdict instead.
 	//
 	// It is deliberately NOT acceptanceGatePassed (nothing verified that
-	// criterion) and NOT acceptanceGateNotValidated (which is decided PRE-SPAWN
-	// from the plan and can carry no criteria rows at all — the two are mutually
-	// exclusive by construction). It routes NO acceptance_triage_decided
+	// criterion) and NOT acceptanceGateNotValidated (verified nothing at all —
+	// no passed/failed/undecidable row; the two stay mutually exclusive because
+	// one severity ladder decides between them). It routes NO acceptance_triage_decided
 	// disposition: an undecidable row is not a defect, so there is nothing to fix
 	// up or retry.
 	acceptanceGateUndecidable = "acceptance_undecidable"
@@ -1667,14 +1731,14 @@ func arbitrationOutcomeSequence(payload []byte) (int64, bool) {
 // Returns, for a run whose workflow declares an acceptance stage:
 //   - acceptanceGatePassed        — newest recorded verdict is passed (merge OK).
 //   - acceptanceGateNotValidated  — newest recorded verdict is not_validated
-//     (#2347: the pre-spawn short-circuit settled the stage having verified ZERO
-//     criteria). Merge-eligible, but a distinct state so the operator surface can
-//     say so rather than reporting a pass.
+//     (#2347 pre-spawn short-circuit, OR #3397 the stage RAN and shipped an
+//     all-skip / no-rows verdict — either way ZERO criteria verified).
+//     Merge-eligible, but a distinct state so the operator surface can say so
+//     rather than reporting a pass.
 //   - acceptanceGateUndecidable   — newest recorded verdict is undecidable
 //     (#2512: the stage RAN and reported at least one criterion it could not
 //     decide, with nothing failing). Merge-eligible; NOT a pass. Disjoint from
-//     not_validated by construction — that one is settled pre-spawn and carries
-//     no criteria rows at all.
+//     not_validated because one severity ladder decides between them.
 //   - acceptanceGateTriage        — newest recorded verdict is failed and no
 //     operator arbitration discharges it.
 //   - acceptanceGateArbitrated    — newest recorded verdict is failed BUT an
@@ -1728,10 +1792,11 @@ func (s *Server) acceptanceGateState(ctx context.Context, runRow *run.Run, stage
 			}
 			return acceptanceGateTriage, nil
 		case acceptanceVerdictNotValidated:
-			// #2347: a short-circuited stage that verified zero criteria. Merge-
-			// eligible, but NOT acceptanceGatePassed — and explicitly handled here
-			// rather than falling through to the settled-outcome-unknown hole
-			// below, which would wedge every no-live-target run at a 409.
+			// #2347 / #3397: a stage that verified zero criteria — short-circuited
+			// pre-spawn, or run-then-all-skip/no-rows. Merge-eligible, but NOT
+			// acceptanceGatePassed — and explicitly handled here rather than falling
+			// through to the settled-outcome-unknown hole below, which would wedge
+			// every verified-nothing run at a 409.
 			return acceptanceGateNotValidated, nil
 		case acceptanceVerdictUndecidable:
 			// #2512: the stage ran and reported evidence that could not decide at
@@ -2822,13 +2887,17 @@ type acceptanceResponse struct {
 	ContentHash string    `json:"content_hash"`
 	Verdict     string    `json:"verdict"`
 	FailureMode string    `json:"failure_mode,omitempty"`
-	// EffectiveVerdict is populated ONLY when a failed verdict was neutralized
-	// because every failure it reported named a criterion the operator retired at
-	// the approval gate (#2581). Verdict/FailureMode keep echoing what the
-	// producer shipped; this field names what the governance record settled on.
-	// Omitted otherwise, so a deployed runner sees a byte-identical body. Additive
-	// for that runner either way: runner/internal/upload decodes the 200/201 body
-	// with a plain json.Decoder and does NOT call DisallowUnknownFields.
+	// EffectiveVerdict is populated whenever the RECORDED verdict differs from the
+	// one the producer shipped: a #2581 retirement neutralization (failed →
+	// passed), a #2512 ladder derivation (a shipped passed carrying a failed /
+	// undecidable row), a #3091 unbound-head clamp (→ undecidable), or a #3397
+	// verified-nothing verdict (a shipped passed whose rows are all-skip / empty →
+	// not_validated). Verdict/FailureMode keep echoing what the producer shipped;
+	// this field names what the governance record settled on. Omitted when the
+	// recorded verdict IS the shipped one, so a deployed runner sees a
+	// byte-identical body. Additive for that runner either way:
+	// runner/internal/upload decodes the 200/201 body with a plain json.Decoder
+	// and does NOT call DisallowUnknownFields.
 	EffectiveVerdict string `json:"effective_verdict,omitempty"`
 	Idempotent       bool   `json:"idempotent"`
 }

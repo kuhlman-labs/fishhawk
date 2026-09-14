@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	planpkg "github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -294,6 +296,110 @@ func TestApply_PlanGateParked_PlanAwaitingApprovalWithPlanArtifact(t *testing.T)
 	}
 	if entries, _ := repos.audit.ListForRun(ctx, rr.ID); len(entries) != 0 {
 		t.Errorf("plan-gate-parked wrote %d audit rows, want 0", len(entries))
+	}
+}
+
+// TestApply_AcceptanceDispatched_ApprovedPlanWithCriteriaAndPRArtifact reads
+// the #3397 post-approval artifact set back through the real repositories: the
+// plan stage carries a standard_v1 plan whose verification.acceptance_criteria
+// declares run-readable + stages-listed and an approve approval; the implement
+// stage carries a pull_request artifact whose head_sha equals the
+// pull_request_opened audit head (and whose content_hash is sha256 of the
+// declared bytes); and the acceptance stage is dispatched.
+func TestApply_AcceptanceDispatched_ApprovedPlanWithCriteriaAndPRArtifact(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repos := newPGRepos(pool)
+	ctx := context.Background()
+
+	res, err := devfixtures.NewApplier(repos.deps(time.Now)).Apply(ctx, "acceptance-dispatched")
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	rr := res.Runs["target-run"]
+	stages := stagesByKey(t, repos, rr)
+
+	acceptance := stages["acceptance"]
+	if acceptance == nil || acceptance.State != run.StageStateDispatched || acceptance.Type != run.StageTypeAcceptance {
+		t.Fatalf("acceptance stage = %+v, want dispatched acceptance", acceptance)
+	}
+
+	// Plan stage: one standard_v1 plan carrying the two drivable criteria.
+	planStage := stages["plan"]
+	planArts, err := repos.artifacts.ListForStage(ctx, planStage.ID)
+	if err != nil {
+		t.Fatalf("ListForStage(plan): %v", err)
+	}
+	if len(planArts) != 1 || planArts[0].Kind != artifact.KindPlan ||
+		planArts[0].SchemaVersion == nil || *planArts[0].SchemaVersion != "standard_v1" {
+		t.Fatalf("plan artifacts = %+v, want one plan/standard_v1", planArts)
+	}
+	var p planpkg.Plan
+	if err := json.Unmarshal(planArts[0].Content, &p); err != nil {
+		t.Fatalf("decode plan artifact: %v", err)
+	}
+	gotIDs := map[string]bool{}
+	for _, c := range p.Verification.AcceptanceCriteria {
+		if c.SkipExpected {
+			t.Errorf("criterion %q is skip_expected; fixture criteria must be drivable", c.ID)
+		}
+		gotIDs[c.ID] = true
+	}
+	if !gotIDs["run-readable"] || !gotIDs["stages-listed"] {
+		t.Fatalf("acceptance_criteria ids = %v, want run-readable + stages-listed", gotIDs)
+	}
+
+	// Plan stage: exactly one approve approval.
+	aps, err := repos.approvals.ListForStage(ctx, planStage.ID)
+	if err != nil {
+		t.Fatalf("ListForStage(approvals): %v", err)
+	}
+	if len(aps) != 1 || aps[0].Decision != approval.DecisionApprove || aps[0].Surface != approval.SurfaceAPI {
+		t.Fatalf("plan approvals = %+v, want one approve via api", aps)
+	}
+
+	// Implement stage: one pull_request artifact whose head_sha equals the
+	// pull_request_opened audit head, content_hash = sha256(declared bytes).
+	implementStage := stages["implement"]
+	prArts, err := repos.artifacts.ListForStage(ctx, implementStage.ID)
+	if err != nil {
+		t.Fatalf("ListForStage(implement): %v", err)
+	}
+	if len(prArts) != 1 || prArts[0].Kind != artifact.KindPullRequest {
+		t.Fatalf("implement artifacts = %+v, want one pull_request", prArts)
+	}
+	var pr struct {
+		HeadSHA string `json:"head_sha"`
+	}
+	if err := json.Unmarshal(prArts[0].Content, &pr); err != nil {
+		t.Fatalf("decode pull_request artifact: %v", err)
+	}
+	sc := mustLoad(t, "acceptance-dispatched")
+	var declaredPR string
+	for _, a := range sc.Artifacts {
+		if a.Kind == "pull_request" {
+			declaredPR = a.Content
+		}
+	}
+	sum := sha256.Sum256([]byte(declaredPR))
+	if prArts[0].ContentHash != hex.EncodeToString(sum[:]) {
+		t.Errorf("pull_request content_hash = %s, want sha256 of declared content %s", prArts[0].ContentHash, hex.EncodeToString(sum[:]))
+	}
+
+	opened, err := repos.audit.ListForRunByCategory(ctx, rr.ID, "pull_request_opened")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(pull_request_opened): %v", err)
+	}
+	if len(opened) != 1 {
+		t.Fatalf("pull_request_opened rows = %d, want 1", len(opened))
+	}
+	var openedHead struct {
+		HeadSHA string `json:"head_sha"`
+	}
+	if err := json.Unmarshal(opened[0].Payload, &openedHead); err != nil {
+		t.Fatalf("decode pull_request_opened payload: %v", err)
+	}
+	if pr.HeadSHA != openedHead.HeadSHA || pr.HeadSHA == "" {
+		t.Errorf("pull_request artifact head_sha %q != pull_request_opened head %q", pr.HeadSHA, openedHead.HeadSHA)
 	}
 }
 

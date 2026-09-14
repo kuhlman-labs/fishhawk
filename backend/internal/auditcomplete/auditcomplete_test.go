@@ -259,6 +259,10 @@ func TestCompute_AcceptanceShortCircuit_ExemptsTraceRule(t *testing.T) {
 		{name: "foreign basis (not honored) -> trace_missing", payload: shortCircuitPayload(t, "bogus-basis")},
 		{name: "no basis, normal passed verdict -> trace_missing", payload: shortCircuitPayloadWithVerdict(t, "", "passed", "accepted")},
 		{name: "no basis, not_validated verdict -> trace_missing", payload: shortCircuitPayload(t, "")},
+		// #3397: the POST-RUN not_validated bases are DELIBERATELY not exempted —
+		// a runner spawned, so the trace is owed exactly like a normal run.
+		{name: "all-skip-observed basis -> trace_missing", payload: shortCircuitPayload(t, plan.AcceptanceBasisAllSkipObserved)},
+		{name: "no-rows-observed basis -> trace_missing", payload: shortCircuitPayload(t, plan.AcceptanceBasisNoRowsObserved)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runID, accID, d := buildWithPayload(t, tc.payload)

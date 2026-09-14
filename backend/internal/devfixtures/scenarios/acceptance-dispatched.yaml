@@ -4,6 +4,14 @@
 # /v0/runs/{id}/acceptance (E72.5 / #3329). The first catalog scenario
 # past the plan stage (the #3397 problem-1 gap).
 #
+# It carries the full post-approval artifact set so the acceptance stage is
+# actually DRIVABLE (#3397): a standard_v1 plan artifact on the plan stage
+# whose verification.acceptance_criteria declares two drivable criteria
+# (run-readable / stages-listed) — so the acceptance prompt serves real
+# acceptance_criteria_ids; an approve approval on the plan stage; and a
+# pull_request artifact on the implement stage whose head_sha matches the
+# pull_request_opened audit row.
+#
 # The two audit rows are ORDERED for acceptanceValidatedHeadSHA: a
 # pull_request_opened row on the implement stage reporting head_sha, then
 # the acceptance_dispatched anchor on the acceptance stage (shaped after
@@ -111,6 +119,78 @@ stages:
     executor_kind: agent
     executor_ref: claude-code
     state: dispatched
+
+artifacts:
+  - key: plan
+    stage: plan
+    kind: plan
+    schema_version: standard_v1
+    content: |
+      {
+        "plan_version": "standard_v1",
+        "ticket_reference": {
+          "type": "github_issue",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/3329",
+          "id": "kuhlman-labs/fishhawk#3329"
+        },
+        "generated_by": {
+          "agent": "claude-code",
+          "model": "claude-opus-4-8",
+          "timestamp": "2026-01-01T09:00:00Z"
+        },
+        "summary": "Seeded fixture plan for the acceptance-dispatched scenario.",
+        "scope": {
+          "files": [
+            {"path": "README.md", "operation": "modify"}
+          ]
+        },
+        "approach": [
+          {"step": 1, "description": "Edit README.md."}
+        ],
+        "verification": {
+          "test_strategy": "None: this is a seeded fixture, never implemented.",
+          "rollback_plan": "Revert the PR.",
+          "acceptance_criteria": [
+            {
+              "id": "run-readable",
+              "statement": "GET /v0/runs/{run_id} returns 200 with the seeded run's fields.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#3329",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id} -> 200"
+            },
+            {
+              "id": "stages-listed",
+              "statement": "GET /v0/runs/{run_id}/stages lists the run's stages.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#3329",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id}/stages -> 200"
+            }
+          ]
+        },
+        "predicted_runtime_minutes": 5,
+        "predicted_runtime_confidence": "high"
+      }
+  - key: pr
+    stage: implement
+    kind: pull_request
+    content: |
+      {
+        "pr_number": 3329,
+        "pr_url": "https://github.com/kuhlman-labs/fishhawk/pull/3329",
+        "branch": "e72.5-acceptance-dispatched",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "base_sha": "fedcba9876543210fedcba9876543210fedcba98",
+        "title": "Seeded fixture pull request (acceptance-dispatched).",
+        "files_changed_count": 1
+      }
+
+approvals:
+  - stage: plan
+    approver_subject: operator:devfixtures
+    decision: approve
+    surface: api
 
 audit:
   - run: target-run

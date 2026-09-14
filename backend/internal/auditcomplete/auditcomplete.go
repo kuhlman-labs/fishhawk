@@ -402,13 +402,17 @@ func ComputeResult(ctx context.Context, runID uuid.UUID, deps Deps) (Result, err
 	// #2347's change of that verdict from "passed" to plan.AcceptanceVerdictNotValidated
 	// leaves it firing exactly as before — pinned by a regression test asserting
 	// the exemption still applies to a not_validated entry. The exemption accepts
-	// ONLY the two known basis values —
+	// ONLY the two PRE-SPAWN basis values —
 	// "empty-criteria" (zero acceptance_criteria / zero out_of_scope) and
 	// "all-skip-with-basis" (every criterion skip_expected with basis), the
 	// shared plan.AcceptanceBasisEmptyCriteria / plan.AcceptanceBasisAllSkipWithBasis
-	// constants: any OTHER basis — or a normal validator-recorded verdict, which
-	// never sets basis at all — is NOT exempted and still requires its trace, so a
-	// normally-dispatched acceptance stage is unaffected. A read failure is
+	// constants. Any OTHER basis is NOT exempted. In particular the POST-RUN
+	// not_validated bases #3397 added — "all-skip-observed" and "no-rows-observed"
+	// (plan.AcceptanceBasisAllSkipObserved / plan.AcceptanceBasisNoRowsObserved) —
+	// are DELIBERATELY not exempted: a runner DID spawn for those, so the stage
+	// owes its trace exactly like a normally-dispatched one, which is pinned by a
+	// non-exempt regression row. A normal validator-recorded verdict never sets
+	// basis at all, so it too still requires its trace. A read failure is
 	// transient (matching the skip-marker read above): return it so the caller
 	// retries rather than silently under- or over-gating.
 	outcomeEntries, err := deps.Audit.ListForRunByCategory(ctx, runID, "acceptance_outcome_recorded")
