@@ -321,11 +321,13 @@ func Amend(prev, next Scenario) (Scenario, AmendReport) {
 		// clearing it on a fallback keep would strand prev's still-kept steps
 		// beside next's fresh origin with no disclosure (#3412 condition 1).
 		out.StepsCarriedFrom = prev.StepsCarriedFrom
-		if !newIsFallback && prev.StepsCarriedFrom == "" {
-			// Genuine new steps were displaced by the richer prior steps and
-			// prev disclosed nothing — synthesize the origin they came from.
-			// The fallback case adds no NEW disclosure (nothing was displaced
-			// this pass) but must not DELETE prev's existing one, above.
+		if prev.StepsCarriedFrom == "" {
+			// The kept steps are prev's while the Origin written is next's, so
+			// they predate it — disclose, whatever next carried. Gating this on
+			// next being genuine loses the TWO-pass case (genuine steps at head
+			// A, then a fallback re-record): nothing is "displaced", prev has no
+			// disclosure to preserve, and the file would assert head B's origin
+			// beside head A's steps in silence (#3412 condition 1).
 			out.StepsCarriedFrom = carriedFromLabel(prev.Origin)
 		}
 	}

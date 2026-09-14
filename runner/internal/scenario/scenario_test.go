@@ -633,13 +633,18 @@ func TestAmend(t *testing.T) {
 			t.Errorf("tie must take new: kept=%s steps=%q", rep.StepsKept, out.Steps)
 		}
 	})
-	t.Run("new fallback keeps prior steps without disclosure", func(t *testing.T) {
+	t.Run("new fallback keeps prior steps AND discloses", func(t *testing.T) {
+		// Superseded rule: this case previously asserted NO disclosure on a
+		// fallback keep, on the reasoning that nothing was displaced. That was
+		// wrong — displacement is not the test. The kept steps are prev's while
+		// the Origin written is next's, so they predate it and the file must
+		// say so or it is quietly wrong about itself (#3412 condition 1).
 		out, rep := Amend(prev(shortGenuine), next(StepsNotRecorded, Assertions{Expected: "e"}))
 		if rep.StepsKept != "prior" || out.Steps != shortGenuine {
 			t.Fatalf("a fallback re-record must keep genuine prior steps: kept=%s steps=%q", rep.StepsKept, out.Steps)
 		}
-		if out.StepsCarriedFrom != "" {
-			t.Errorf("a fallback displaced nothing, so no disclosure: %q", out.StepsCarriedFrom)
+		if out.StepsCarriedFrom == "" {
+			t.Errorf("kept prior steps predate the origin written; disclosure must not be empty")
 		}
 	})
 	t.Run("prior fallback never wins (condition 2)", func(t *testing.T) {
@@ -695,6 +700,24 @@ func TestAmend(t *testing.T) {
 		}
 		if out.StepsCarriedFrom != p.StepsCarriedFrom {
 			t.Errorf("a fallback keep must NOT delete prev's existing disclosure: %q", out.StepsCarriedFrom)
+		}
+	})
+	t.Run("fallback next over an UNdisclosed prior synthesizes a disclosure", func(t *testing.T) {
+		// The TWO-pass case: pass 1 recorded genuine steps at head A with no
+		// disclosure; pass 2 records the fallback. Prev's steps are kept and
+		// the Origin written is pass 2's, so the steps predate the origin and
+		// the file MUST say so. Nothing was "displaced" this pass and there is
+		// no prior disclosure to preserve, so a synthesis gated on next being
+		// genuine would leave this silently misattributed (#3412 condition 1).
+		out, rep := Amend(prev(longSteps), next(StepsNotRecorded, Assertions{Expected: "e"}))
+		if rep.StepsKept != "prior" || out.Steps != longSteps {
+			t.Fatalf("a fallback re-record must keep genuine prior steps: kept=%s steps=%q", rep.StepsKept, out.Steps)
+		}
+		if out.Origin != nextOrigin {
+			t.Fatalf("origin must be next's: %+v", out.Origin)
+		}
+		if out.StepsCarriedFrom == "" {
+			t.Errorf("steps predate the origin written; disclosure must not be empty")
 		}
 	})
 	t.Run("displaced steps from a zero-origin prior disclose a generic label", func(t *testing.T) {
