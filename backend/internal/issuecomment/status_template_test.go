@@ -440,6 +440,16 @@ func TestRenderStatusBody_AcceptanceActivity(t *testing.T) {
 			want:     "Acceptance not validated — all 2 recorded criteria were retired (verified nothing)",
 		},
 		{
+			// The criteria_total == 0 FALLBACK of the same branch. Defensive by
+			// construction (an all-retired-observed payload implies rows were
+			// recorded), but an unexercised render line is an unverified claim —
+			// the class this issue exists to close. Pin the sentence it emits.
+			name:     "all-retired-observed with no tally falls back to the count-free sentence",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "basis": plan.AcceptanceBasisAllRetiredObserved},
+			want:     "Acceptance not validated — every recorded criterion was retired (verified nothing)",
+		},
+		{
 			// A POST-RUN not_validated DID run, so it can carry a transcript — the
 			// pre-spawn variant never does. The clause must append here.
 			name:     "all-skip-observed appends the transcript clause",

@@ -263,6 +263,7 @@ func TestCompute_AcceptanceShortCircuit_ExemptsTraceRule(t *testing.T) {
 		// a runner spawned, so the trace is owed exactly like a normal run.
 		{name: "all-skip-observed basis -> trace_missing", payload: shortCircuitPayload(t, plan.AcceptanceBasisAllSkipObserved)},
 		{name: "no-rows-observed basis -> trace_missing", payload: shortCircuitPayload(t, plan.AcceptanceBasisNoRowsObserved)},
+		{name: "all-retired-observed basis -> trace_missing", payload: shortCircuitPayload(t, plan.AcceptanceBasisAllRetiredObserved)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runID, accID, d := buildWithPayload(t, tc.payload)
