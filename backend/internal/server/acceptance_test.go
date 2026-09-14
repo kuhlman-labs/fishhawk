@@ -3359,6 +3359,15 @@ func retireCrit2() []acceptanceCriteriaAmendment {
 	}}
 }
 
+// retireCrit1And2 retires BOTH criteria the all-retired-observed tests itemize,
+// so a verdict reporting only crit-1 and crit-2 leaves an empty non-retired set.
+func retireCrit1And2() []acceptanceCriteriaAmendment {
+	return []acceptanceCriteriaAmendment{
+		{ID: "crit-1", Action: "retire", Reason: "criterion superseded at the approval gate"},
+		{ID: "crit-2", Action: "retire", Reason: "approval condition 1 replaced the server-budget surface"},
+	}
+}
+
 // acceptanceVerdictBytes marshals a verdict body with the given mode + results.
 func acceptanceVerdictBytes(t *testing.T, verdict, failureMode string, results ...acceptanceCriterionResult) []byte {
 	t.Helper()
@@ -4084,9 +4093,23 @@ func TestAggregateAcceptanceResults(t *testing.T) {
 		{"passed-and-skipped", []acceptanceCriterionResult{
 			{ID: "a", Result: acceptanceResultPassed}, {ID: "b", Result: acceptanceResultSkipped},
 		}, acceptanceVerdictPassed},
+		// #3397: a non-empty set with no passed/failed/undecidable row verified
+		// nothing — not_validated, not passed.
+		{"all-skipped-verified-nothing", []acceptanceCriterionResult{
+			{ID: "a", Result: acceptanceResultSkipped}, {ID: "b", Result: acceptanceResultSkipped},
+		}, acceptanceVerdictNotValidated},
+		{"single-skipped-verified-nothing", []acceptanceCriterionResult{
+			{ID: "a", Result: acceptanceResultSkipped},
+		}, acceptanceVerdictNotValidated},
+		{"any-passed-with-skips-still-passed", []acceptanceCriterionResult{
+			{ID: "a", Result: acceptanceResultSkipped}, {ID: "b", Result: acceptanceResultPassed},
+		}, acceptanceVerdictPassed},
 		{"any-failed-outranks-undecidable", []acceptanceCriterionResult{
 			u("a"), {ID: "b", Result: acceptanceResultFailed},
 		}, acceptanceVerdictFailed},
+		{"any-undecidable-outranks-all-skip", []acceptanceCriterionResult{
+			{ID: "a", Result: acceptanceResultSkipped}, u("b"),
+		}, acceptanceVerdictUndecidable},
 		{"any-undecidable-outranks-passed", []acceptanceCriterionResult{
 			{ID: "a", Result: acceptanceResultPassed}, u("b"),
 		}, acceptanceVerdictUndecidable},
@@ -4107,8 +4130,8 @@ func TestAggregateAcceptanceResults(t *testing.T) {
 }
 
 // TestAcceptanceVerdictAtLeast pins the severity-monotone max() on the total
-// order passed < undecidable < failed. Nothing is ever softened below what
-// either source claims.
+// order passed < not_validated < undecidable < failed (#3397). Nothing is ever
+// softened below what either source claims.
 func TestAcceptanceVerdictAtLeast(t *testing.T) {
 	cases := []struct{ a, b, want string }{
 		{acceptanceVerdictPassed, acceptanceVerdictPassed, acceptanceVerdictPassed},
@@ -4119,6 +4142,14 @@ func TestAcceptanceVerdictAtLeast(t *testing.T) {
 		// The shipped-failed floor: a derived undecidable never softens it.
 		{acceptanceVerdictFailed, acceptanceVerdictUndecidable, acceptanceVerdictFailed},
 		{acceptanceVerdictUndecidable, acceptanceVerdictFailed, acceptanceVerdictFailed},
+		// #3397: not_validated sits at rank 1 — above passed, below undecidable.
+		{acceptanceVerdictPassed, acceptanceVerdictNotValidated, acceptanceVerdictNotValidated},
+		{acceptanceVerdictNotValidated, acceptanceVerdictPassed, acceptanceVerdictNotValidated},
+		{acceptanceVerdictNotValidated, acceptanceVerdictUndecidable, acceptanceVerdictUndecidable},
+		{acceptanceVerdictUndecidable, acceptanceVerdictNotValidated, acceptanceVerdictUndecidable},
+		// The shipped-failed floor holds against not_validated too.
+		{acceptanceVerdictFailed, acceptanceVerdictNotValidated, acceptanceVerdictFailed},
+		{acceptanceVerdictNotValidated, acceptanceVerdictFailed, acceptanceVerdictFailed},
 	}
 	for _, tc := range cases {
 		t.Run(tc.a+"+"+tc.b, func(t *testing.T) {
@@ -4126,6 +4157,299 @@ func TestAcceptanceVerdictAtLeast(t *testing.T) {
 				t.Errorf("acceptanceVerdictAtLeast(%q,%q) = %q, want %q", tc.a, tc.b, got, tc.want)
 			}
 		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// #3397: an observed all-skip / no-rows verdict records not_validated.
+// --------------------------------------------------------------------------
+
+// shipAcceptanceOutcome ships body through the real handler and returns the
+// decoded response plus the recorded acceptance_outcome_recorded payload. The
+// control's effect is COMMITTED audit state, so the assertions read the appended
+// payload, not the HTTP body alone.
+func shipAcceptanceOutcome(t *testing.T, seedHead bool, body []byte) (acceptanceResponse, map[string]any, *auditFake) {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	if seedHead {
+		seedValidatedHead(au, runID, stageID)
+	}
+	priv, _ := sf.issue(t, runID)
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var resp acceptanceResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return resp, decodeAcceptanceOutcome(t, au), au
+}
+
+// TestShipAcceptance_AllSkipRows_RecordsNotValidated: a shipped `passed` verdict
+// whose every row is `skipped` verified nothing, so the ingest ladder records
+// not_validated with basis all-skip-observed. The rows are authored skipped BY
+// CONSTRUCTION, so deleting the aggregate's all-skip branch REDs this on the
+// verdict assertion.
+func TestShipAcceptance_AllSkipRows_RecordsNotValidated(t *testing.T) {
+	body, _ := json.Marshal(acceptanceBody{Verdict: "passed", Criteria: critRaw(
+		acceptanceCriterionResult{ID: "ac-create", Result: "skipped", ExpectationBasis: "target unavailable"},
+		acceptanceCriterionResult{ID: "ac-list", Result: "skipped", ExpectationBasis: "target unavailable"},
+	)})
+	resp, payload, au := shipAcceptanceOutcome(t, true, body)
+	if resp.EffectiveVerdict != acceptanceVerdictNotValidated {
+		t.Errorf("effective_verdict = %q, want not_validated", resp.EffectiveVerdict)
+	}
+	if payload["verdict"] != "not_validated" || payload["outcome"] != "not_validated" {
+		t.Errorf("recorded verdict/outcome = %v/%v, want not_validated", payload["verdict"], payload["outcome"])
+	}
+	if payload["verdict_reported"] != "passed" {
+		t.Errorf("verdict_reported = %v, want passed", payload["verdict_reported"])
+	}
+	if payload["basis"] != plan.AcceptanceBasisAllSkipObserved {
+		t.Errorf("basis = %v, want %q", payload["basis"], plan.AcceptanceBasisAllSkipObserved)
+	}
+	if payload["criteria_passed"] != float64(0) {
+		t.Errorf("criteria_passed = %v, want 0", payload["criteria_passed"])
+	}
+	if _, present := payload["undecidable_basis"]; present {
+		t.Errorf("undecidable_basis present on a resolvable-head all-skip verdict: %v", payload)
+	}
+	if _, present := payload["downgrade_basis"]; present {
+		t.Errorf("downgrade_basis present with no retirement: %v", payload)
+	}
+	if n := countAppendedByCategory(au, CategoryAcceptanceTriageDecided); n != 0 {
+		t.Errorf("triage entries = %d, want 0 (a passed-shipped verdict routes no triage)", n)
+	}
+}
+
+// TestShipAcceptance_NoRows_RecordsNotValidated is the NEIGHBOURING DOOR
+// (binding condition 1): a shipped `passed` verdict that itemized NO rows at all
+// records not_validated with basis no-rows-observed — it verified nothing.
+func TestShipAcceptance_NoRows_RecordsNotValidated(t *testing.T) {
+	body, _ := json.Marshal(acceptanceBody{Verdict: "passed"})
+	resp, payload, _ := shipAcceptanceOutcome(t, true, body)
+	if resp.EffectiveVerdict != acceptanceVerdictNotValidated {
+		t.Errorf("effective_verdict = %q, want not_validated", resp.EffectiveVerdict)
+	}
+	if payload["verdict"] != "not_validated" || payload["verdict_reported"] != "passed" {
+		t.Errorf("verdict/verdict_reported = %v/%v, want not_validated/passed", payload["verdict"], payload["verdict_reported"])
+	}
+	if payload["basis"] != plan.AcceptanceBasisNoRowsObserved {
+		t.Errorf("basis = %v, want %q", payload["basis"], plan.AcceptanceBasisNoRowsObserved)
+	}
+	if payload["criteria_total"] != float64(0) {
+		t.Errorf("criteria_total = %v, want 0", payload["criteria_total"])
+	}
+}
+
+// TestShipAcceptance_AllSkipRows_UnboundHead_ClampsToUndecidable: with no
+// resolvable validated head the #3091 clamp raises the derived not_validated to
+// undecidable(head_unresolved) — "we do not know which tree" outranks "we
+// verified nothing on a known tree" (binding condition 3). The clamp carries
+// undecidable_basis and NO basis key.
+func TestShipAcceptance_AllSkipRows_UnboundHead_ClampsToUndecidable(t *testing.T) {
+	body, _ := json.Marshal(acceptanceBody{Verdict: "passed", Criteria: critRaw(
+		acceptanceCriterionResult{ID: "ac-create", Result: "skipped", ExpectationBasis: "target unavailable"},
+	)})
+	resp, payload, _ := shipAcceptanceOutcome(t, false, body) // no seeded head
+	if resp.EffectiveVerdict != acceptanceVerdictUndecidable {
+		t.Errorf("effective_verdict = %q, want undecidable (unbound-head clamp)", resp.EffectiveVerdict)
+	}
+	if payload["verdict"] != "undecidable" {
+		t.Errorf("recorded verdict = %v, want undecidable", payload["verdict"])
+	}
+	if payload["undecidable_basis"] != acceptanceUndecidableBasisHeadUnresolved {
+		t.Errorf("undecidable_basis = %v, want head_unresolved", payload["undecidable_basis"])
+	}
+	if _, present := payload["basis"]; present {
+		t.Errorf("basis key present on a clamped-to-undecidable verdict: %v", payload)
+	}
+}
+
+// TestShipAcceptance_MixedPassedAndSkipped_StillPassed is the control: a passed
+// row alongside a skipped one verified something, so it records passed with NO
+// basis and marshals byte-identically to before.
+func TestShipAcceptance_MixedPassedAndSkipped_StillPassed(t *testing.T) {
+	body, _ := json.Marshal(acceptanceBody{Verdict: "passed", Criteria: critRaw(
+		acceptanceCriterionResult{ID: "ac-create", Result: "passed"},
+		acceptanceCriterionResult{ID: "ac-list", Result: "skipped", ExpectationBasis: "advisory"},
+	)})
+	resp, payload, _ := shipAcceptanceOutcome(t, true, body)
+	if resp.EffectiveVerdict != "" {
+		t.Errorf("effective_verdict = %q, want empty (recorded IS the shipped passed)", resp.EffectiveVerdict)
+	}
+	if payload["verdict"] != "passed" {
+		t.Errorf("recorded verdict = %v, want passed", payload["verdict"])
+	}
+	if _, present := payload["basis"]; present {
+		t.Errorf("basis present on a genuine pass: %v", payload)
+	}
+	if _, present := payload["verdict_reported"]; present {
+		t.Errorf("verdict_reported present on an unchanged verdict: %v", payload)
+	}
+}
+
+// TestShipAcceptance_ShippedFailedAllSkip_StaysFailed is the anti-softening pin
+// (binding condition 1): a shipped `failed` verdict whose rows are all skipped
+// still records failed — the severity ladder never softens it — and carries NO
+// basis key, so the class-5 triage path is unchanged.
+func TestShipAcceptance_ShippedFailedAllSkip_StaysFailed(t *testing.T) {
+	body := failedAcceptanceBytes(t, "assertion_fail", []acceptanceCriterionResult{
+		{ID: "ac-create", Result: "skipped", ExpectationBasis: "target unavailable"},
+		{ID: "ac-list", Result: "skipped", ExpectationBasis: "target unavailable"},
+	})
+	resp, payload, _ := shipAcceptanceOutcome(t, true, body)
+	if resp.EffectiveVerdict != "" {
+		t.Errorf("effective_verdict = %q, want empty (recorded IS the shipped failed)", resp.EffectiveVerdict)
+	}
+	if payload["verdict"] != "failed" {
+		t.Errorf("recorded verdict = %v, want failed (a shipped failed is never softened)", payload["verdict"])
+	}
+	if _, present := payload["basis"]; present {
+		t.Errorf("basis present on a shipped-failed all-skip verdict: %v", payload)
+	}
+}
+
+// TestShipAcceptance_NoRows_ShippedFailed_StaysFailed pins the empty-set
+// anti-softening property (binding condition 1): a shipped `failed` verdict with
+// no rows stays failed, carrying no basis.
+func TestShipAcceptance_NoRows_ShippedFailed_StaysFailed(t *testing.T) {
+	body, _ := json.Marshal(acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail"})
+	_, payload, _ := shipAcceptanceOutcome(t, true, body)
+	if payload["verdict"] != "failed" {
+		t.Errorf("recorded verdict = %v, want failed (empty set never softens a failed ship)", payload["verdict"])
+	}
+	if _, present := payload["basis"]; present {
+		t.Errorf("basis present on a shipped-failed no-rows verdict: %v", payload)
+	}
+}
+
+// TestDowngrade_AllSurvivingRowsSkipped_RecordsNotValidated: a #2581 retirement
+// neutralizes the failed criterion (crit-2), leaving only a non-blocking skipped
+// survivor (crit-3) — an all-skip non-retired set — so the recorded verdict is
+// not_validated, carrying BOTH the downgrade attribution and the observed basis.
+func TestDowngrade_AllSurvivingRowsSkipped_RecordsNotValidated(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit2())
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-3", Result: "skipped", ExpectationBasis: "advisory only"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed", Observed: "still broken"},
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != "not_validated" {
+		t.Errorf("recorded verdict = %v, want not_validated (retirement + all-skip survivor)", payload["verdict"])
+	}
+	if payload["verdict_reported"] != "failed" {
+		t.Errorf("verdict_reported = %v, want failed", payload["verdict_reported"])
+	}
+	if payload["basis"] != plan.AcceptanceBasisAllSkipObserved {
+		t.Errorf("basis = %v, want all-skip-observed", payload["basis"])
+	}
+	if payload["downgrade_basis"] == nil {
+		t.Errorf("downgrade_basis missing; the retirement attribution must survive: %v", payload)
+	}
+}
+
+// TestShipAcceptance_AllRowsRetired_ShippedPassed_RecordsAllRetiredBasis pins the
+// distinct THIRD origin of an empty non-retired set (fix-up, medium/untested-path):
+// a validator ships a `passed` verdict itemizing rows, but the operator retired
+// EVERY itemized criterion at the approval gate. The non-retired set is empty, so
+// the ladder records not_validated — but with basis all-retired-observed, NOT
+// no-rows-observed, because rows WERE recorded (criteria_total is non-zero). The
+// two origins must stay tellable apart on the payload so the operator-facing
+// render never claims the validator "recorded no criteria".
+//
+// This is the ACTUALLY-REACHABLE all-retired path. The #2581 downgrade does NOT
+// participate: its D3 precondition requires a SURVIVING non-retired row, so an
+// all-retired verdict never downgrades — the not_validated verdict here is reached
+// purely by the ladder over the empty non-retired set on a shipped `passed`.
+func TestShipAcceptance_AllRowsRetired_ShippedPassed_RecordsAllRetiredBasis(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit1And2())
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "passed"},
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != "not_validated" {
+		t.Errorf("recorded verdict = %v, want not_validated (all itemized rows retired)", payload["verdict"])
+	}
+	if payload["verdict_reported"] != "passed" {
+		t.Errorf("verdict_reported = %v, want passed", payload["verdict_reported"])
+	}
+	if payload["basis"] != plan.AcceptanceBasisAllRetiredObserved {
+		t.Errorf("basis = %v, want %q (rows recorded but all retired — NOT no-rows-observed)", payload["basis"], plan.AcceptanceBasisAllRetiredObserved)
+	}
+	// The distinguishing fact: criteria_total is NON-ZERO here, which is exactly
+	// what makes the no-rows wording ("recorded no criteria") inaccurate.
+	if payload["criteria_total"] == float64(0) {
+		t.Errorf("criteria_total = 0, want non-zero (rows WERE recorded, then retired)")
+	}
+}
+
+// TestShipAcceptance_AllRowsRetired_ShippedFailed_StaysFailed is the anti-softening
+// pin for the all-retired origin (the case the concern literally named). Tracing
+// it end to end corrected the concern's mechanical prediction: the #2581 downgrade
+// CANNOT fire on an all-retired verdict (D3 requires a surviving non-retired row),
+// so a shipped `failed` whose every itemized row is retired is NOT downgraded, and
+// the severity ladder over the empty non-retired set leaves failed (3) above
+// not_validated (1) untouched. The verdict stays failed and carries NO basis key —
+// so the all-retired-observed basis is unreachable from a shipped `failed`, and the
+// inaccurate-wording hazard the concern flagged for THIS combination never occurs.
+func TestShipAcceptance_AllRowsRetired_ShippedFailed_StaysFailed(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedRetirementFixture(t, ar, au, rr, runID, retireCrit1And2())
+	priv, _ := sf.issue(t, runID)
+	body := acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "failed", Observed: "still broken"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed", Observed: "still broken"},
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if payload["verdict"] != "failed" {
+		t.Errorf("recorded verdict = %v, want failed (all-retired never softens a shipped failed)", payload["verdict"])
+	}
+	if _, present := payload["basis"]; present {
+		t.Errorf("basis present on a shipped-failed all-retired verdict: %v", payload)
+	}
+	// The downgrade must NOT have fired (D3): no retirement attribution recorded.
+	if _, present := payload["downgrade_basis"]; present {
+		t.Errorf("downgrade_basis present: the D3 survivor precondition should block the downgrade on an all-retired verdict: %v", payload)
+	}
+}
+
+// TestAcceptanceGateState_ObservedAllSkip_NotValidated: a recorded not_validated
+// verdict carrying the observed all-skip basis resolves the merge gate to
+// acceptance_not_validated (the gate reads the verdict, not the basis, so the
+// observed origin is merge-eligible just like the pre-spawn one).
+func TestAcceptanceGateState_ObservedAllSkip_NotValidated(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	rid := runID
+	p, _ := json.Marshal(map[string]any{"verdict": acceptanceVerdictNotValidated, "basis": plan.AcceptanceBasisAllSkipObserved})
+	au.seeded = append(au.seeded, &audit.Entry{RunID: &rid, Category: CategoryAcceptanceOutcomeRecorded, Sequence: 10, Payload: p})
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateNotValidated {
+		t.Errorf("state = %q, want %q", got, acceptanceGateNotValidated)
 	}
 }
 

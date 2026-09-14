@@ -1,0 +1,14 @@
+id: scenario:issue-3397/all-skip-verdict-records-not-validated
+statement: 'After seeding the acceptance-dispatched scenario and issuing a signing key, shipping a signed verdict of `passed` whose every criterion row is `skipped` to POST /v0/runs/{run_id}/acceptance?stage_id={acceptance_stage_id} returns 201 with `effective_verdict: "not_validated"`, and the run''s newest acceptance_outcome_recorded audit row carries verdict `not_validated`, outcome `not_validated`, `basis: "all-skip-observed"`, `criteria_passed: 0`, `criteria_skipped` equal to `criteria_total`, and `verdict_reported: "passed"` — never the word `passed`/`accepted`.'
+verify_hint: Seed scenario acceptance-dispatched via POST /v0/dev/fixtures, POST /v0/runs/{run_id}/signing-key, sign the body with POST /v0/dev/sign, ship to POST /v0/runs/{run_id}/acceptance, then read GET /v0/audit?category=acceptance_outcome_recorded and inspect the newest row for that run_id.
+steps: Seeded acceptance-dispatched (run 6b672f61-…, acceptance stage ecb9c09b-…), issued a signing key, fetched the signed prompt, signed and shipped {verdict:passed, criteria:[run-readable skipped, stages-listed skipped]} to POST /v0/runs/{run}/acceptance?stage_id={acc}, then read GET /v0/audit?category=acceptance_outcome_recorded and took the newest row for that run_id.
+assertions:
+    expected: 201 with effective_verdict not_validated; audit verdict/outcome not_validated, basis all-skip-observed, criteria_passed 0, criteria_skipped == criteria_total, verdict_reported passed; never passed/accepted.
+    observed_at_record: '201 with effective_verdict="not_validated" (verdict echo "passed"). Newest audit row (sequence 3): verdict=not_validated, outcome=not_validated, basis=all-skip-observed, criteria_passed=0, criteria_skipped=2, criteria_total=2, criteria_failed=0, criteria_undecidable=0, verdict_reported=passed, head_sha=0123456789abcdef0123456789abcdef01234567.'
+    repro_handle: POST /v0/dev/fixtures {"scenario":"acceptance-dispatched"}; POST /v0/runs/{run}/signing-key; POST /v0/dev/sign (X-Fishhawk-Dev-Private-Key) over the verdict bytes; POST /v0/runs/{run}/acceptance?stage_id={acc} with X-Fishhawk-Signature; GET /v0/audit?category=acceptance_outcome_recorded&limit=200
+origin:
+    issue: 3397
+    pr: 3413
+    run_id: 45ece84f-d599-4878-b116-2860f2c9cc09
+    head_sha: 5eb1e9a66903f6989e9f9be261437fa1b783e157
+    recorded_at: 2026-09-14T06:39:17Z

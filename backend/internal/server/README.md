@@ -4084,14 +4084,18 @@ a single total question: *was there evidence, and what did it say?*
 
 | | decided | evidence | outcome |
 |---|---|---|---|
-| `not_validated` (#2347) | PRE-SPAWN, from the plan alone | none — no runner, no preview, no observation, and therefore NO criteria rows | merge-eligible |
+| `not_validated` (#2347, #3397) | PRE-SPAWN from the plan (no rows), OR POST-RUN when every non-retired row is `skipped` / no rows were itemized / every itemized row was retired | verified nothing — pre-spawn: no runner/preview (bases `empty-criteria` / `all-skip-with-basis`); post-run: the stage RAN but observed nothing (bases `all-skip-observed` / `no-rows-observed` / `all-retired-observed`) | merge-eligible |
 | `undecidable` (#2512) | POST-RUN, from the agent's own rows | the stage ran and drove the preview; at least one row could not be decided | merge-eligible |
 | `failed` → `acceptance_triage` (#2474) | POST-RUN, from the agent's own rows | a criterion genuinely failed | blocked until arbitrated |
 
-They are MUTUALLY EXCLUSIVE by construction: the short-circuit skips dispatch
-entirely so no criteria rows can exist for the ladder to read, and the precedence
-ladder puts `failed` strictly above `undecidable` so one failed row keeps the run
-in triage exactly as today. `undecidable` routes NO `acceptance_triage_decided`
+They stay MUTUALLY EXCLUSIVE by construction because ONE total severity ladder
+decides between them (`passed < not_validated < undecidable < failed`): `failed`
+strictly above `undecidable` strictly above the all-skip/no-rows `not_validated`
+case, so one failed row keeps the run in triage and one undecidable row keeps it
+undecidable — even though `not_validated` can now carry all-skipped rows. (The
+`not_validated` recorded here is server-derived; auditcomplete's trace exemption
+still honors ONLY the two pre-spawn bases, so a POST-RUN all-skip/no-rows verdict
+still owes its trace — a runner spawned.) `undecidable` routes NO `acceptance_triage_decided`
 disposition and never enters the class-1..5 triage classifier — an undecidable row
 is not a defect, so there is nothing to fix up or retry. That is the #2474
 wedge-surface reduction: the run lands merge-eligible with no arbitration.
@@ -4101,15 +4105,27 @@ Disjointness is pinned by
 **The aggregation is a TOTAL, EXPLICIT precedence ladder** over the per-criterion
 rows (`aggregateAcceptanceResults`): any `failed` row → `failed`; else any
 `undecidable` row → `undecidable`, **including when EVERY row is undecidable and
-nothing was verified**; else `passed`. Read that last clause literally — this is
-NOT "verified some criteria and could not evaluate others". A run that verified
-nothing at all is admitted by the ladder, and it is exactly the case an operator
-most needs described correctly. A row set containing an undecidable row can NEVER
-be recorded as `passed`: a green light over an unevaluated criterion is the
-dangerous direction, because nobody looks behind it.
+nothing was verified**; else if every row is `skipped` (a non-empty set with no
+passed/failed/undecidable row) → `not_validated` (#3397 — a validator that
+skipped every criterion verified nothing); else `passed`. Read those clauses
+literally — an all-undecidable or all-skip set is a run that verified nothing at
+all, exactly the case an operator most needs described correctly. A row set
+containing an undecidable row can NEVER be recorded as `passed`, and an all-skip
+set can never be `passed` either: a green light over an unevaluated criterion is
+the dangerous direction, because nobody looks behind it. The seam layers the
+empty-row-set door on top (binding condition 1, #3397): an empty non-retired set
+is laddered against `not_validated` directly, so a shipped `passed` that itemized
+no rows records `not_validated` while a shipped `failed` with no rows stays
+`failed`. The empty non-retired set has TWO distinct origins, recorded under
+distinct bases so they stay tellable apart: `no-rows-observed` (the validator
+itemized nothing) and `all-retired-observed` (rows WERE itemized but the operator
+retired every one). The `all-retired-observed` origin is reachable only from a
+shipped `passed` — the #2581 downgrade's D3 precondition requires a surviving
+non-retired row, so an all-retired shipped `failed` never downgrades and the
+severity ladder leaves it `failed`.
 
 The shipped-verdict/derived-verdict mismatch resolves SEVERITY-MONOTONE as a
-lower bound on the total order `passed < undecidable < failed`:
+lower bound on the total order `passed < not_validated < undecidable < failed`:
 `recorded = acceptanceVerdictAtLeast(shipped, derived)`. Nothing is ever softened
 below what either source claims. **Compatibility note (not purely additive):** an
 already-valid body shipping top-level `passed` with a `failed` criterion row
@@ -4120,11 +4136,22 @@ dishonest direction. Pinned by
 `TestAcceptanceSeam_ShippedPassed_FailedRow_NowRecordsFailed`.
 
 `aggregateAcceptanceResults` is TOTAL and answers an EMPTY row set with `passed`.
-That is safe ONLY behind the caller-side `len(rows) > 0` guard at its single call
-site; the hazard is pinned openly by
-`TestAggregateAcceptanceResults/EMPTY-row-set-answers-passed-the-documented-hazard`
-and the guard by
-`TestAcceptanceSeam_NoCriteriaRows_ShippedVerdictRecordedUnchanged`.
+That answer is never taken as-is: its single call site guards on `len(rows) > 0`
+and, on an empty non-retired set, ladders the shipped verdict against
+`not_validated` DIRECTLY (#3397, binding condition 1) rather than calling the
+function — so a shipped `passed` with no rows records `not_validated`
+(`no-rows-observed`), a shipped `passed` whose every itemized row was retired
+records `not_validated` (`all-retired-observed`), and a shipped `failed` with no
+rows (or all rows retired) stays `failed`. The
+function's empty-set answer is pinned openly by
+`TestAggregateAcceptanceResults/EMPTY-row-set-answers-passed-the-documented-hazard`;
+the shipped-`failed`-with-no-rows anti-softening property by
+`TestAcceptanceSeam_NoCriteriaRows_ShippedVerdictRecordedUnchanged` and
+`TestShipAcceptance_NoRows_ShippedFailed_StaysFailed`; the shipped-`passed`
+neighbouring-door by `TestShipAcceptance_NoRows_RecordsNotValidated`; and the
+all-retired origin (both directions) by
+`TestShipAcceptance_AllRowsRetired_ShippedPassed_RecordsAllRetiredBasis` and
+`TestShipAcceptance_AllRowsRetired_ShippedFailed_StaysFailed`.
 
 **Ordering at the ingest seam is load-bearing.** The #2581 retired-criterion
 downgrade runs FIRST over the retired-id set; the ladder then runs over the

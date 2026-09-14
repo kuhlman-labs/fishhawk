@@ -1211,24 +1211,37 @@ Notes:
   (`renderAcceptanceRetirementDroppedLine`). See the writer-side detail under
   "Acceptance scenario-corpus reports (E72.4, #3328)" above for the payload
   shape, the render contract, and the two writers.
-- **The `not_validated` outcome renders its OWN row (#2347).** When the
-  orchestrator's pre-spawn short-circuit settles an acceptance stage it records
-  `outcome: not_validated` — the stage verified ZERO criteria (no runner, no
-  preview, no observation). `renderAcceptanceOutcomeLine` gives it a distinct
+- **The `not_validated` outcome renders its OWN row (#2347, #3397).** A
+  `not_validated` outcome means the stage verified ZERO criteria, and it now has
+  TWO origins carried by the `basis` payload field. **PRE-SPAWN** (empty/absent
+  basis): the orchestrator's short-circuit settles the stage with no runner, no
+  preview, no observation. `renderAcceptanceOutcomeLine` gives it a distinct
   row: "Acceptance not validated — `<passed>`/`<total>` criteria verified (all
   criteria skip-expected)", or "Acceptance not validated — 0 criteria verified
   (the plan declared none)" when the total is zero, with
   "; `<n>` require live validation" appended when the additive
   `criteria_live_validation` payload field is non-zero (a skip carrying a tracked
-  operator-validation walk, #2338 / #2345). It deliberately does NOT reuse the
-  "Acceptance recorded — `<outcome>` (`<passed>`/`<total>` criteria passed)"
-  shape: that sentence is the one an operator reads as certification, and merely
-  swapping the word into it would keep the framing. The **PR-comment** surface
-  (`pr_status_template.go`'s `renderPRAcceptanceHeadline`, shared by BOTH
-  fidelities, so the degradation ladder's collapsed tally line is honest too)
-  carries the same wording under the neutral ❓ icon — it is neither an
-  acceptance nor a rejection. Every pre-#2347 payload simply lacks
-  `criteria_live_validation` and decodes to zero, so no existing render changes.
+  operator-validation walk, #2338 / #2345). **POST-RUN** (#3397): the validator
+  RAN and shipped a verdict the ingest ladder recorded as `not_validated`, keyed
+  by `basis` — `all-skip-observed` renders "Acceptance not validated —
+  `<passed>`/`<total>` criteria verified (the validator skipped every
+  criterion)"; `no-rows-observed` renders "Acceptance not validated — the
+  validator recorded no criteria (verified nothing)"; `all-retired-observed`
+  (rows WERE itemized but the operator retired every one, so nothing non-retired
+  remained) renders "Acceptance not validated — all `<total>` recorded criteria
+  were retired (verified nothing)" — a DISTINCT sentence from `no-rows-observed`
+  because criteria WERE recorded here, so claiming the validator "recorded no
+  criteria" would be inaccurate. Because the POST-RUN stage
+  actually ran, both observed rows ALSO append the transcript clause (below),
+  which the pre-spawn row never carries. Neither shape reuses the "Acceptance
+  recorded — `<outcome>` (`<passed>`/`<total>` criteria passed)" certification
+  sentence. The **PR-comment** surface (`pr_status_template.go`'s
+  `renderPRAcceptanceHeadline`, shared by BOTH fidelities, so the degradation
+  ladder's collapsed tally line is honest too) carries the same wording under
+  the neutral ❓ icon — it is neither an acceptance nor a rejection. Every
+  pre-#2347 payload simply lacks `criteria_live_validation`, and every
+  pre-#3397 payload lacks `basis`, decoding to the pre-spawn branch, so no
+  existing render changes.
 - **The `acceptance_outcome_recorded` row names the acceptance TRANSCRIPT
   (E72.5 / #3329).** The ingest records an additive `transcript` block on the
   payload — `{artifact_id, content_hash, criteria: [{id, outcome,
@@ -1253,8 +1266,11 @@ Notes:
   (`criterion_not_in_verdict` | `criterion_outcome_disagrees`), and the row
   renders the pointer with "(summary suppressed: `<reason>`)" and NO
   failing-request clause — it can never tell a story that contradicts its own
-  headline. The `not_validated` branch is untouched by construction (that
-  verdict is minted pre-spawn and never carries a transcript); a payload with
+  headline. A PRE-SPAWN `not_validated` branch is untouched by construction
+  (that verdict is minted pre-spawn and never carries a transcript); a POST-RUN
+  `not_validated` (basis `all-skip-observed` / `no-rows-observed` /
+  `all-retired-observed`, #3397) DID run, so its observed row appends the
+  transcript clause too. A payload with
   no transcript, or `transcript: null`, renders byte-identically to before.
   No `@`-mention is added, so `notifier.go` stays uninvolved (same exemption as
   the acceptance kinds above). Pinned by

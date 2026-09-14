@@ -133,6 +133,62 @@ func TestEmbeddedScenarios_DeclaredShapes(t *testing.T) {
 		if prIdx < 0 || anchorIdx < 0 || prIdx > anchorIdx {
 			t.Fatalf("want pull_request_opened (idx %d) BEFORE acceptance_dispatched (idx %d)", prIdx, anchorIdx)
 		}
+		// #3397: the drivable post-approval artifact set. Exactly one plan
+		// artifact decoding into a plan.Plan with >=2 acceptance criteria, none
+		// skip_expected (so the acceptance prompt serves real, drivable ids);
+		// exactly one pull_request artifact on the implement stage whose head_sha
+		// equals the pull_request_opened head; and exactly one approve approval on
+		// the plan stage.
+		var planArtifacts, prArtifacts int
+		var prArtifactHead string
+		for _, a := range s.Artifacts {
+			switch artifact.Kind(a.Kind) {
+			case artifact.KindPlan:
+				planArtifacts++
+				var p plan.Plan
+				if err := json.Unmarshal([]byte(a.Content), &p); err != nil {
+					t.Fatalf("plan artifact %q does not decode into plan.Plan: %v", a.Key, err)
+				}
+				if n := len(p.Verification.AcceptanceCriteria); n < 2 {
+					t.Fatalf("plan artifact %q carries %d acceptance_criteria, want >= 2", a.Key, n)
+				}
+				for _, c := range p.Verification.AcceptanceCriteria {
+					if c.SkipExpected {
+						t.Fatalf("acceptance criterion %q is skip_expected; the fixture's criteria must be DRIVABLE", c.ID)
+					}
+				}
+			case artifact.KindPullRequest:
+				prArtifacts++
+				if a.Stage != "implement" {
+					t.Fatalf("pull_request artifact must sit on the implement stage, got %q", a.Stage)
+				}
+				var pr struct {
+					HeadSHA string `json:"head_sha"`
+				}
+				if err := json.Unmarshal([]byte(a.Content), &pr); err != nil {
+					t.Fatalf("pull_request artifact %q does not decode: %v", a.Key, err)
+				}
+				prArtifactHead = pr.HeadSHA
+			}
+		}
+		if planArtifacts != 1 {
+			t.Fatalf("want exactly one plan artifact, got %d", planArtifacts)
+		}
+		if prArtifacts != 1 {
+			t.Fatalf("want exactly one pull_request artifact, got %d", prArtifacts)
+		}
+		var openedHead string
+		if err := json.Unmarshal([]byte(s.Audit[prIdx].Payload), &struct {
+			HeadSHA *string `json:"head_sha"`
+		}{HeadSHA: &openedHead}); err != nil {
+			t.Fatalf("decode pull_request_opened head: %v", err)
+		}
+		if prArtifactHead != openedHead {
+			t.Fatalf("pull_request artifact head_sha %q != pull_request_opened head %q", prArtifactHead, openedHead)
+		}
+		if len(s.Approvals) != 1 || s.Approvals[0].Decision != "approve" || s.Approvals[0].Stage != "plan" {
+			t.Fatalf("want exactly one approve approval on the plan stage, got %+v", s.Approvals)
+		}
 	})
 	t.Run("trace-upload-target", func(t *testing.T) {
 		s := mustLoad(t, "trace-upload-target")

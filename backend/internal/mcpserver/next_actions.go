@@ -532,7 +532,7 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 			// succeeded_pr_open, itself merge-eligible.
 			if acceptanceVerdict == acceptanceVerdictNotValidated {
 				return &NextActions{State: "succeeded_acceptance_not_validated", Actions: mergeRitualActions(run,
-					"the run succeeded with its PR open; the acceptance stage verified ZERO acceptance criteria (short-circuited with no runner and no preview, #2347) — merge-eligible, but NOT a validated pass: acknowledge in your merge verdict that acceptance validated nothing")}
+					"the run succeeded with its PR open; the acceptance stage verified ZERO acceptance criteria — either it short-circuited pre-spawn with no runner and no preview (#2347), or the validator RAN and skipped every criterion / itemized none (#3397) — merge-eligible, but NOT a validated pass: acknowledge in your merge verdict that acceptance validated nothing")}
 			}
 			// #2512: the terminal-run twin of the acceptance_undecidable arm. The
 			// stage RAN and reported at least one criterion it could not DECIDE,
@@ -1443,11 +1443,11 @@ func dispatchOrPollActions(run *Run, stageType string, stage *Stage) []Suggested
 // wins over the flag; a marker aged out of the window (flag false) degrades to
 // the read-first outcome-unknown arm (fail toward read, never toward merge).
 //
-// The verdict switch has four arms, and the two non-pass, non-fail ones are
-// mutually exclusive BY CONSTRUCTION rather than by convention: not_validated
-// (#2347) is settled PRE-SPAWN from the plan, so no criteria rows can exist,
-// while undecidable (#2512) is derived POST-RUN from rows the agent actually
-// reported. Both are merge-eligible and neither is a pass.
+// The verdict switch has four arms, and the two non-pass, non-fail ones stay
+// mutually exclusive BY CONSTRUCTION rather than by convention: one severity
+// ladder decides between them, so not_validated (#2347 pre-spawn, or #3397 an
+// observed all-skip / no-rows verdict) and undecidable (#2512, ≥1 undecidable
+// row) can never collide. Both are merge-eligible and neither is a pass.
 //
 // arbitrated is the E66.37 / #2474 flag: an operator recorded an
 // acceptance_triage_arbitrated discharge BOUND by outcome_sequence to the newest
@@ -1513,13 +1513,14 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		return &NextActions{State: "acceptance_passed", Actions: mergeRitualActions(run,
 			"the acceptance stage passed (ADR-049 decision #6: the merge is gated on the acceptance_passed evidence condition)")}
 	case acceptanceVerdictNotValidated:
-		// #2347: the pre-spawn short-circuit settled the stage having verified
-		// ZERO criteria — every criterion was skip_expected with an
-		// expectation_basis, or the plan declared none at all. No runner spawned,
-		// no preview came up, nothing was observed. The run is MERGE-ELIGIBLE (a
-		// change with no live target must not be stranded), so this returns the
-		// merge ritual — but the state string and this reason are what stop the
-		// outcome reading as a certification it is not.
+		// #2347 / #3397: the stage verified ZERO criteria. Two origins reach this
+		// verdict — the pre-spawn short-circuit (every criterion skip_expected
+		// with a basis, or the plan declared none; no runner, no preview), OR the
+		// validator RAN and shipped a verdict whose every non-retired row was
+		// skipped / no rows at all. Either way nothing was verified. The run is
+		// MERGE-ELIGIBLE (a change with no observable must not be stranded), so
+		// this returns the merge ritual — but the state string and this reason are
+		// what stop the outcome reading as a certification it is not.
 		//
 		// The acknowledgement ask is DELIBERATELY a prompt, not a gate: enforcing
 		// it would mean text-matching operator prose to decide whether a merge may
@@ -1529,7 +1530,7 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		// pins its two load-bearing claims (zero criteria verified; say so in the
 		// merge verdict) so a refactor cannot silently drop them.
 		return &NextActions{State: "acceptance_not_validated", Actions: mergeRitualActions(run,
-			"the acceptance stage verified ZERO acceptance criteria — it was short-circuited with no runner and no preview because every criterion was skip-expected with a basis, or the plan declared none (#2347). The run is merge-eligible, but this is NOT a validated pass: acknowledge in your merge verdict that acceptance validated nothing")}
+			"the acceptance stage verified ZERO acceptance criteria — either it was short-circuited pre-spawn with no runner and no preview because every criterion was skip-expected with a basis or the plan declared none (#2347), or the validator RAN and skipped every criterion / itemized none (#3397). The run is merge-eligible, but this is NOT a validated pass: acknowledge in your merge verdict that acceptance validated nothing")}
 	case acceptanceVerdictUndecidable:
 		// #2512: the acceptance stage RAN — a runner spawned, the preview came up,
 		// the agent drove it — and reported per-criterion rows of which at least
@@ -1537,9 +1538,9 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		// ladder derives this verdict from the rows; a producer cannot ship it.
 		//
 		// This is the OTHER half of the partition from not_validated above, and
-		// the two are mutually exclusive by construction: not_validated is settled
-		// PRE-SPAWN from the plan and can carry no criteria rows at all, while
-		// undecidable is decided POST-RUN from the agent's own evidence. It is
+		// the two stay mutually exclusive by construction: one severity ladder
+		// decides between them (not_validated ranks below undecidable), so a run
+		// with ≥1 undecidable row is undecidable even if the rest were skipped. It is
 		// also deliberately not the failed arm: an undecidable row is not a
 		// defect, so there is nothing to fix up, retry, or arbitrate — which is
 		// exactly the #2474 wedge-surface reduction #2512 delivers. Before it, a
