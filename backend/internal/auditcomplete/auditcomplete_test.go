@@ -1068,6 +1068,116 @@ func TestCompute_Rule5_ChildListError_Pending(t *testing.T) {
 	}
 }
 
+// TestCompute_Rule5_ChildVouchReadError_Pending: the own-run vouch read
+// SUCCEEDS and a decomposition CHILD's vouch read then fails. The child-read
+// error must propagate out of the child walk exactly as an own-run read error
+// does — head_fetch_failed, pending — never a silent under-population that
+// evaluates the head against the partial known set. catCalls proves the
+// ordering: the parent's own operator_commit_vouched read lands (and is not
+// the injected failure) before the child's read aborts the gather.
+// Counterfactual: replacing the child-walk `return err` with `continue` makes
+// this RED — the vouched head still passes, so state becomes pass and the
+// head_fetch_failed assertion fails.
+func TestCompute_Rule5_ChildVouchReadError_Pending(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const vouched = "0a9e170000000000000000000000000000000000"
+	childID := uuid.New()
+	parent := runID
+	runs.childPages = map[uuid.UUID][]*run.Run{
+		runID: {{ID: childID, DecomposedFrom: &parent}},
+	}
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(vouched))
+	ar.catErrByRun = map[uuid.UUID]map[string]error{
+		childID: {"operator_commit_vouched": errors.New("db down")},
+	}
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, vouched, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (child vouch read error is transient); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingHeadFetchFail) {
+		t.Errorf("expected head_fetch_failed; got %+v", missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("a child vouch read error must never surface as foreign_commit; got %+v", missing)
+	}
+	// Ordering proof: the own-run read happened, succeeded (it is not in
+	// catErrByRun), and preceded the child read that failed.
+	ownRead := runID.String() + "/operator_commit_vouched"
+	childRead := childID.String() + "/operator_commit_vouched"
+	ownIdx, childIdx := -1, -1
+	for i, c := range ar.catCalls {
+		switch c {
+		case ownRead:
+			if ownIdx < 0 {
+				ownIdx = i
+			}
+		case childRead:
+			if childIdx < 0 {
+				childIdx = i
+			}
+		}
+	}
+	if ownIdx < 0 || childIdx < 0 || ownIdx > childIdx {
+		t.Errorf("expected a successful own-run vouch read BEFORE the failing child read; calls=%v", ar.catCalls)
+	}
+}
+
+// TestCompute_Rule5_ChildOverflow_ReadsPartialSetAsIs pins rule 5's consumer
+// of listDecompositionChildren's OVERFLOW arm (a child enumeration that hits
+// childPageCeiling without a short page). Rule 5 discards `exhausted` and
+// reads the partial child set as-is — unlike rule 2b, which treats overflow
+// as a hard stop — because a vouch on an UNread child can only leave that
+// sha UNknown, the fail-closed direction. Two assertions make that concrete:
+// (a) an un-vouched live head still yields foreign_commit (state fail, NOT
+// pending/head_fetch_failed — overflow is not an abort); (b) a head vouched
+// on the run's OWN chain still passes under the same overflow, proving the
+// partial read neither aborts nor drops the reads that did land.
+// Counterfactual: making rule 5 abort on !exhausted turns (a) and (b) RED
+// with pending/head_fetch_failed.
+func TestCompute_Rule5_ChildOverflow_ReadsPartialSetAsIs(t *testing.T) {
+	const vouched = "0a9e170000000000000000000000000000000000"
+	const liveForeign = "deadbeef1111deadbeef1111deadbeef11111111"
+
+	// (a) un-vouched live head under overflow → foreign_commit, not an abort.
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	runs.alwaysFullPage = true
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(vouched))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, liveForeign, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail (overflowed child read must not abort; un-vouched head is still foreign); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("expected foreign_commit under overflow; got %+v", missing)
+	}
+	if containsKind(missing, auditcomplete.MissingHeadFetchFail) {
+		t.Errorf("overflow is a partial read, not a transient failure; must not surface head_fetch_failed: %+v", missing)
+	}
+
+	// (b) own-chain vouched head under the same overflow → pass.
+	d.PRHead = stubPRHead(t, vouched, nil)
+	state, missing, err = auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (own-chain vouch survives an overflowed child read); missing=%+v", state, missing)
+	}
+}
+
 // TestCompute_Rule5_MalformedVouchPayload_Skipped: a vouch row whose
 // vouched_sha does not decode as a string, or that lacks the field, contributes
 // nothing and does not abort — the live head (the artifact-recorded sha here)
@@ -1968,6 +2078,14 @@ type fakeAudit struct {
 	// rule-7 fail-open tests can drive a read failure on exactly the
 	// securityscan / fixup category without disturbing the other reads.
 	catErr map[string]error
+	// catErrByRun injects a per-(run, category) error so the #3415 rule-5
+	// tests can fail the vouch read on a decomposition CHILD's chain while
+	// the parent's own read succeeds. Consulted after catErr.
+	catErrByRun map[uuid.UUID]map[string]error
+	// catCalls records every ListForRunByCategory call as
+	// "<runID>/<category>" in call order, so a test can prove which reads
+	// happened (and in what order) before an injected failure aborted.
+	catCalls []string
 }
 
 // appendChained mirrors what the real audit.Repository.AppendChained
@@ -2074,7 +2192,11 @@ func (f *fakeAudit) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Ent
 }
 
 func (f *fakeAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	f.catCalls = append(f.catCalls, runID.String()+"/"+category)
 	if err := f.catErr[category]; err != nil {
+		return nil, err
+	}
+	if err := f.catErrByRun[runID][category]; err != nil {
 		return nil, err
 	}
 	out := []*audit.Entry{}
