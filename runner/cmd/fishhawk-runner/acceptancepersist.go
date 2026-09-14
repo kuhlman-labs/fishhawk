@@ -27,10 +27,13 @@ import (
  *
  *   persistAcceptanceScenarios — refuses a tree that is dirty ANYWHERE before
  *       it writes (the acceptance agent's WorkingDir is hygiene, not a
- *       boundary — ADR-050), then Compose+Write on a passed verdict,
+ *       boundary — ADR-050), then Compose+Amend+Write on a passed verdict,
  *       MergeRetired on every verdict, and a commit staging EXACTLY the paths
  *       it wrote (never `add -A` over the corpus dir) pushed to
- *       fetched.AcceptanceRunBranch. Every failure is BEST-EFFORT (the verdict
+ *       fetched.AcceptanceRunBranch. A re-record is Compose+Amend+Write: an
+ *       existing corpus file at HEAD is READ and the new pass is AMENDED onto it
+ *       (scenario.Existing → scenario.Amend) so the richer prior reproduction
+ *       recipe is not silently replaced (#3412). Every failure is BEST-EFFORT (the verdict
  *       outcome never changes); the result names the exit path so the drop
  *       reporter can carry it.
  *   retirementDropReporter — the single deferred reporter armed the moment the
@@ -195,6 +198,10 @@ type acceptancePersistResult struct {
 	baseSHA string
 	// scenarioIDs are the ids written this pass (persistPushed only).
 	scenarioIDs []string
+	// amended are the ids that AMENDED a prior corpus file this pass (a subset
+	// of scenarioIDs). Log-only: never on the acceptance_scenarios_pushed wire
+	// report.
+	amended []string
 	// retirementsLedgered is true when every served retirement is already in
 	// retired.yaml at HEAD — a re-run after a prior successful persist — so
 	// the drop reporter may disarm even though nothing was pushed this pass.
@@ -272,6 +279,7 @@ func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs,
 		return fail("verdict_undecodable: " + err.Error())
 	}
 	var written []string
+	var amended []string
 	wrote := map[string]bool{}
 	if v.Verdict == "passed" && in.issue > 0 {
 		rows, _, err := coerceAcceptanceCriteria(v.Criteria)
@@ -297,6 +305,26 @@ func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs,
 			RecordedAt: in.now().UTC().Truncate(time.Second),
 		}
 		for _, s := range scenario.Compose(crits, results, origin) {
+			// Re-record: AMEND onto the prior corpus file at HEAD rather than
+			// blindly replacing it, so the richer prior reproduction recipe is
+			// not lost (#3412). The tree was proven clean at (a), so the file
+			// Existing reads IS HEAD's. An undecodable prior file is replaced as
+			// before (logged) — failing closed would strand a corrupted scenario
+			// permanently, since a hand edit is refused by the removal guard.
+			if prev, found, err := scenario.Existing(corpusDir, s.ID); err != nil {
+				logEvent(logSink, "acceptance_scenario_amend_skipped", map[string]string{
+					"run_id": in.runID, "scenario_id": s.ID, "detail": err.Error(),
+				})
+			} else if found {
+				var rep scenario.AmendReport
+				s, rep = scenario.Amend(prev, s)
+				amended = append(amended, s.ID)
+				logEvent(logSink, "acceptance_scenario_amended", map[string]string{
+					"run_id": in.runID, "scenario_id": s.ID,
+					"prior_run_id": prev.Origin.RunID, "prior_head_sha": prev.Origin.HeadSHA,
+					"steps_kept": rep.StepsKept,
+				})
+			}
 			rel, err := scenario.Write(corpusDir, s)
 			if err != nil {
 				return fail("scenario_write: " + err.Error())
@@ -378,8 +406,8 @@ func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs,
 	if authorEmail == "" {
 		authorEmail = gitops.DefaultAuthorEmail
 	}
-	msg := fmt.Sprintf("chore(acceptance): record scenario corpus for run %s\n\nScenarios recorded: %d. Retirements merged: %d.\n",
-		in.runID, len(written), len(in.retired))
+	msg := fmt.Sprintf("chore(acceptance): record scenario corpus for run %s\n\nScenarios recorded: %d (amended: %d). Retirements merged: %d.\n",
+		in.runID, len(written), len(amended), len(in.retired))
 	commitArgs := append(gitops.HardeningArgs(),
 		"-c", "user.name="+authorName, "-c", "user.email="+authorEmail,
 		"commit", "--signoff", "-m", msg)
@@ -401,7 +429,8 @@ func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs,
 		return acceptancePersistResult{outcome: persistFailed, reason: "push: " + err.Error(), baseSHA: baseSHA, headSHA: headSHA}
 	}
 	sort.Strings(written)
-	return acceptancePersistResult{outcome: persistPushed, headSHA: headSHA, baseSHA: baseSHA, scenarioIDs: written, retirementsLedgered: true}
+	sort.Strings(amended)
+	return acceptancePersistResult{outcome: persistPushed, headSHA: headSHA, baseSHA: baseSHA, scenarioIDs: written, amended: amended, retirementsLedgered: true}
 }
 
 // gitTree runs git in dir and returns its combined output.
@@ -675,7 +704,8 @@ func persistAndReportAcceptanceScenarios(ctx context.Context, cfg config, client
 	logEvent(logSink, "acceptance_scenarios_persisted", map[string]string{
 		"run_id": cfg.runID, "stage_id": cfg.stageID, "outcome": res.outcome, "reason": res.reason,
 		"head_sha": res.headSHA, "base_sha": res.baseSHA, "branch": in.runBranch,
-		"scenario_ids": strings.Join(res.scenarioIDs, ","), "retired_ids": strings.Join(retiredIDs(in.retired), ","),
+		"scenario_ids": strings.Join(res.scenarioIDs, ","), "amended_ids": strings.Join(res.amended, ","),
+		"retired_ids": strings.Join(retiredIDs(in.retired), ","),
 	})
 	if res.outcome != persistPushed {
 		if res.retirementsLedgered {

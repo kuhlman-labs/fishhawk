@@ -577,6 +577,8 @@ func TestRenderPromptSection(t *testing.T) {
 		"origin PR unknown",
 		"10m0s",
 		"expectation_basis: replay_budget_exhausted",
+		"COMPLETE, standalone reproduction recipe",
+		"Never write it by reference to another scenario",
 	} {
 		if !strings.Contains(sec, want) {
 			t.Errorf("missing %q in:\n%s", want, sec)
@@ -590,6 +592,182 @@ func TestRenderPromptSection(t *testing.T) {
 	}
 	if RenderPromptSection(nil, time.Minute) != "" {
 		t.Error("no scenarios → empty section")
+	}
+}
+
+func TestAmend(t *testing.T) {
+	// A prior genuine recording and a fresh re-record; the two differ in every
+	// field so a wrong pick is visible.
+	priorOrigin := Origin{Issue: 101, PR: 700, RunID: "r0", HeadSHA: "abc", RecordedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	nextOrigin := Origin{Issue: 101, PR: 742, RunID: "r1", HeadSHA: "def", RecordedAt: time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC)}
+	longSteps := strings.Repeat("drive the two-run replay and assert the corpus. ", 6) // >200 chars
+	shortGenuine := "GET /runs/<id>"
+
+	prev := func(steps string) Scenario {
+		return Scenario{ID: "scenario:issue-101/crit-b", Statement: "OLD statement", VerifyHint: "old hint", Seed: "old-seed",
+			Steps: steps, Assertions: Assertions{Expected: "old exp", ObservedAtRecord: "old obs", ReproHandle: "old-handle"}, Origin: priorOrigin}
+	}
+	next := func(steps string, a Assertions) Scenario {
+		return Scenario{ID: "scenario:issue-101/crit-b", Statement: "NEW statement", VerifyHint: "new hint", Seed: "new-seed",
+			Steps: steps, Assertions: a, Origin: nextOrigin}
+	}
+
+	t.Run("shorter new keeps prior steps and discloses", func(t *testing.T) {
+		out, rep := Amend(prev(longSteps), next(shortGenuine, Assertions{Expected: "new exp", ObservedAtRecord: "new obs", ReproHandle: "new-handle"}))
+		if rep.StepsKept != "prior" || out.Steps != longSteps {
+			t.Fatalf("want prior steps kept, got kept=%s steps=%q", rep.StepsKept, out.Steps)
+		}
+		if out.StepsCarriedFrom == "" || !strings.Contains(out.StepsCarriedFrom, "abc") {
+			t.Errorf("displaced genuine steps must be disclosed naming the prior origin, got %q", out.StepsCarriedFrom)
+		}
+	})
+	t.Run("longer new takes new steps and discloses nothing", func(t *testing.T) {
+		out, rep := Amend(prev(shortGenuine), next(longSteps, Assertions{Expected: "e"}))
+		if rep.StepsKept != "new" || out.Steps != longSteps || out.StepsCarriedFrom != "" {
+			t.Fatalf("want new steps, no disclosure: kept=%s steps=%q carried=%q", rep.StepsKept, out.Steps, out.StepsCarriedFrom)
+		}
+	})
+	t.Run("equal length ties to new", func(t *testing.T) {
+		out, rep := Amend(prev("aaaa"), next("bbbb", Assertions{Expected: "e"}))
+		if rep.StepsKept != "new" || out.Steps != "bbbb" {
+			t.Errorf("tie must take new: kept=%s steps=%q", rep.StepsKept, out.Steps)
+		}
+	})
+	t.Run("new fallback keeps prior steps AND discloses", func(t *testing.T) {
+		// Superseded rule: this case previously asserted NO disclosure on a
+		// fallback keep, on the reasoning that nothing was displaced. That was
+		// wrong — displacement is not the test. The kept steps are prev's while
+		// the Origin written is next's, so they predate it and the file must
+		// say so or it is quietly wrong about itself (#3412 condition 1).
+		out, rep := Amend(prev(shortGenuine), next(StepsNotRecorded, Assertions{Expected: "e"}))
+		if rep.StepsKept != "prior" || out.Steps != shortGenuine {
+			t.Fatalf("a fallback re-record must keep genuine prior steps: kept=%s steps=%q", rep.StepsKept, out.Steps)
+		}
+		if out.StepsCarriedFrom == "" {
+			t.Errorf("kept prior steps predate the origin written; disclosure must not be empty")
+		}
+	})
+	t.Run("prior fallback never wins (condition 2)", func(t *testing.T) {
+		// prev is the fallback (28 chars); next is genuine but SHORTER (14).
+		out, rep := Amend(prev(StepsNotRecorded), next(shortGenuine, Assertions{Expected: "e"}))
+		if rep.StepsKept != "new" || out.Steps != shortGenuine {
+			t.Fatalf("a prior fallback must not beat genuine new steps: kept=%s steps=%q", rep.StepsKept, out.Steps)
+		}
+		if out.StepsCarriedFrom != "" {
+			t.Errorf("no genuine prior steps were kept, so no disclosure: %q", out.StepsCarriedFrom)
+		}
+	})
+	t.Run("both fallback takes new", func(t *testing.T) {
+		out, rep := Amend(prev(StepsNotRecorded), next(StepsNotRecorded, Assertions{Expected: "e"}))
+		if rep.StepsKept != "new" || out.Steps != StepsNotRecorded {
+			t.Errorf("both fallback: kept=%s steps=%q", rep.StepsKept, out.Steps)
+		}
+	})
+	t.Run("empty new assertions keep prior, non-empty take new", func(t *testing.T) {
+		out, _ := Amend(prev(longSteps), next(shortGenuine, Assertions{Expected: "  ", ObservedAtRecord: "", ReproHandle: "new-handle"}))
+		if out.Assertions.Expected != "old exp" || out.Assertions.ObservedAtRecord != "old obs" {
+			t.Errorf("blank new assertions must keep prior: %+v", out.Assertions)
+		}
+		if out.Assertions.ReproHandle != "new-handle" {
+			t.Errorf("non-empty new repro_handle must take new: %q", out.Assertions.ReproHandle)
+		}
+	})
+	t.Run("origin statement verify_hint seed always new", func(t *testing.T) {
+		out, _ := Amend(prev(longSteps), next(shortGenuine, Assertions{Expected: "e"}))
+		if out.Origin != nextOrigin || out.Statement != "NEW statement" || out.VerifyHint != "new hint" || out.Seed != "new-seed" {
+			t.Errorf("plan-authoritative fields must come from next: %+v", out)
+		}
+	})
+	t.Run("chained disclosure preserves the original source", func(t *testing.T) {
+		p := prev(longSteps)
+		p.StepsCarriedFrom = "head ORIGINAL recorded_at 2025-01-01T00:00:00Z"
+		out, _ := Amend(p, next(shortGenuine, Assertions{Expected: "e"}))
+		if out.StepsCarriedFrom != p.StepsCarriedFrom {
+			t.Errorf("a chained re-record must keep the deepest disclosure: %q", out.StepsCarriedFrom)
+		}
+	})
+	t.Run("fallback next over disclosed prior preserves the disclosure", func(t *testing.T) {
+		// pass 3 of the chain: prev already discloses (pass-2 kept pass-1's
+		// steps over shorter genuine ones), and this pass records the fallback
+		// → steps are kept but the disclosure must NOT be dropped, else the
+		// file asserts pass-3's fresh origin beside steps predating head A with
+		// no disclosure (#3412 condition-1 chained-fallback gap).
+		p := prev(longSteps)
+		p.StepsCarriedFrom = "head ORIGINAL recorded_at 2025-01-01T00:00:00Z"
+		out, rep := Amend(p, next(StepsNotRecorded, Assertions{Expected: "e"}))
+		if rep.StepsKept != "prior" || out.Steps != longSteps {
+			t.Fatalf("a fallback re-record must keep genuine prior steps: kept=%s steps=%q", rep.StepsKept, out.Steps)
+		}
+		if out.StepsCarriedFrom != p.StepsCarriedFrom {
+			t.Errorf("a fallback keep must NOT delete prev's existing disclosure: %q", out.StepsCarriedFrom)
+		}
+	})
+	t.Run("fallback next over an UNdisclosed prior synthesizes a disclosure", func(t *testing.T) {
+		// The TWO-pass case: pass 1 recorded genuine steps at head A with no
+		// disclosure; pass 2 records the fallback. Prev's steps are kept and
+		// the Origin written is pass 2's, so the steps predate the origin and
+		// the file MUST say so. Nothing was "displaced" this pass and there is
+		// no prior disclosure to preserve, so a synthesis gated on next being
+		// genuine would leave this silently misattributed (#3412 condition 1).
+		out, rep := Amend(prev(longSteps), next(StepsNotRecorded, Assertions{Expected: "e"}))
+		if rep.StepsKept != "prior" || out.Steps != longSteps {
+			t.Fatalf("a fallback re-record must keep genuine prior steps: kept=%s steps=%q", rep.StepsKept, out.Steps)
+		}
+		if out.Origin != nextOrigin {
+			t.Fatalf("origin must be next's: %+v", out.Origin)
+		}
+		if out.StepsCarriedFrom == "" {
+			t.Errorf("steps predate the origin written; disclosure must not be empty")
+		}
+	})
+	t.Run("displaced steps from a zero-origin prior disclose a generic label", func(t *testing.T) {
+		// prev has genuine steps but a HeadSHA-less, zero-time origin, so the
+		// synthesized disclosure falls back to the generic phrase.
+		p := prev(longSteps)
+		p.Origin = Origin{Issue: 101, RunID: "r0"}
+		out, _ := Amend(p, next(shortGenuine, Assertions{Expected: "e"}))
+		if out.StepsCarriedFrom != "an earlier recording" {
+			t.Errorf("zero-origin displaced steps must disclose the generic label, got %q", out.StepsCarriedFrom)
+		}
+	})
+}
+
+func TestExisting(t *testing.T) {
+	dir := t.TempDir()
+	if _, found, err := Existing(dir, "scenario:issue-101/crit-b"); err != nil || found {
+		t.Fatalf("absent → (_, false, nil), got found=%v err=%v", found, err)
+	}
+	want := Scenario{ID: "scenario:issue-101/crit-b", Statement: "st", Steps: "steps",
+		Assertions: Assertions{Expected: "e"}, Origin: Origin{Issue: 101, RunID: "r", RecordedAt: time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)}}
+	if _, err := Write(dir, want); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := Existing(dir, "scenario:issue-101/crit-b")
+	if err != nil || !found || got.ID != want.ID || got.Path != "issue-101/crit-b.yaml" {
+		t.Fatalf("valid → loaded, got %+v found=%v err=%v", got, found, err)
+	}
+	// An id PathFor refuses (no prefix) → named error, not found.
+	if _, found, err := Existing(dir, "issue-101/crit-b"); err == nil || found || !strings.Contains(err.Error(), IDPrefix) {
+		t.Errorf("prefixless id → PathFor error, got found=%v err=%v", found, err)
+	}
+	// Malformed → named error.
+	writeFile(t, filepath.Join(dir, "issue-9", "bad.yaml"), "id: scenario:issue-9/bad\nbogus_field: 1\n")
+	if _, _, err := Existing(dir, "scenario:issue-9/bad"); err == nil || !strings.Contains(err.Error(), "issue-9/bad.yaml") {
+		t.Errorf("malformed → named error, got %v", err)
+	}
+	// Symlinked leaf → named refusal.
+	base := t.TempDir()
+	root, outside := filepath.Join(base, "root"), filepath.Join(base, "outside")
+	for _, d := range []string{filepath.Join(root, "issue-101"), outside} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(outside, "target.yaml"), filepath.Join(root, "issue-101", "crit-b.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Existing(root, "scenario:issue-101/crit-b"); err == nil || !strings.Contains(err.Error(), `symlinked path component "crit-b.yaml"`) {
+		t.Errorf("symlinked leaf → named refusal, got %v", err)
 	}
 }
 

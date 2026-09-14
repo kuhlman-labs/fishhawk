@@ -77,10 +77,19 @@ type Scenario struct {
 	VerifyHint string `yaml:"verify_hint,omitempty" json:"verify_hint,omitempty"`
 	// Seed names the E72.2 seeded-fixture scenario the criterion needs
 	// materialized before it can be driven; empty when none.
-	Seed       string     `yaml:"seed,omitempty" json:"seed,omitempty"`
-	Steps      string     `yaml:"steps" json:"steps"`
-	Assertions Assertions `yaml:"assertions" json:"assertions"`
-	Origin     Origin     `yaml:"origin" json:"origin"`
+	Seed  string `yaml:"seed,omitempty" json:"seed,omitempty"`
+	Steps string `yaml:"steps" json:"steps"`
+	// StepsCarriedFrom discloses that Steps predate the Origin this file
+	// carries: a re-record (Amend) kept the richer PRIOR steps over genuine
+	// new ones, so the drive Steps describes is NOT the drive Origin names. It
+	// names the origin the steps were carried forward from (head + recorded_at)
+	// so a reader of the file ALONE can tell (#3412). Empty when Steps and
+	// Origin agree — a first record, or a re-record that took the new steps, or
+	// one whose new steps were the StepsNotRecorded fallback (nothing was
+	// displaced, so nothing to disclose).
+	StepsCarriedFrom string     `yaml:"steps_carried_from,omitempty" json:"steps_carried_from,omitempty"`
+	Assertions       Assertions `yaml:"assertions" json:"assertions"`
+	Origin           Origin     `yaml:"origin" json:"origin"`
 
 	// Path is the corpus-relative file the scenario was loaded from (set by
 	// Load, never serialized).
@@ -234,6 +243,124 @@ func loadOne(path string) (Scenario, error) {
 		return Scenario{}, errors.New("origin.recorded_at: missing")
 	}
 	return s, nil
+}
+
+// AmendReport tells the caller which STEPS an Amend chose so the log can say
+// so. StepsKept is "prior" when the richer prior steps were retained, "new"
+// otherwise.
+type AmendReport struct {
+	StepsKept string
+}
+
+// Existing loads the corpus file for id under dir, if present. It is the
+// re-record read: PathFor(id) resolves the corpus-relative path, RefuseSymlinks
+// refuses a symlinked component (a committed symlink cannot redirect the read),
+// an absent file is (zero, false, nil), a decodable file is (s, true, nil) with
+// Path set, and a malformed file is (zero, false, named-error).
+//
+// The CALLER must have proven the tree clean before calling: Existing reads the
+// file on disk, which equals HEAD's content only because persist refused a
+// dirty tree first. A planted file never reaches this call.
+func Existing(dir, id string) (Scenario, bool, error) {
+	rel, err := PathFor(id)
+	if err != nil {
+		return Scenario{}, false, err
+	}
+	if err := RefuseSymlinks(dir, rel); err != nil {
+		return Scenario{}, false, err
+	}
+	path := filepath.Join(dir, filepath.FromSlash(rel))
+	s, err := loadOne(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return Scenario{}, false, nil
+		}
+		return Scenario{}, false, fmt.Errorf("scenario %s: %w", filepath.ToSlash(rel), err)
+	}
+	s.Path = filepath.ToSlash(rel)
+	return s, true, nil
+}
+
+// Amend merges a re-recorded scenario (next) onto the prior corpus file (prev),
+// so a re-record does not blindly REPLACE the prior recording and lose the
+// expensive reproduction recipe (#3412). The volatile, plan-authoritative
+// fields always come from next — ID, Statement, VerifyHint, Seed and the WHOLE
+// Origin (issue, pr, run_id, head_sha, recorded_at) — so the file attributes
+// itself to THIS pass. The durable evidence is kept when next did not improve
+// it:
+//
+//   - Steps: the richer text wins, richness approximated as longer after a
+//     whitespace trim (ties go to next). TWO fallback guards make that safe:
+//     a prior StepsNotRecorded fallback NEVER wins (else the fallback string
+//     could beat genuine-but-shorter new steps — the bug inverted, #3412
+//     condition 2), and a new StepsNotRecorded fallback never displaces genuine
+//     prior steps.
+//   - Assertions (ReproHandle / Expected / ObservedAtRecord): next's value when
+//     non-empty after a trim, else prev's.
+//
+// When the richer PRIOR steps are kept AND next carried GENUINE (non-fallback)
+// steps that were displaced, StepsCarriedFrom is set to disclose it — so a
+// reader of the file alone can tell the steps predate the Origin it now carries
+// (#3412 condition 1). A displaced-nothing keep (next was the fallback) adds no
+// NEW disclosure — but a chain preserves the DEEPEST source, so prev's EXISTING
+// disclosure is carried forward whether or not next was the fallback: clearing
+// it on a fallback keep would strand prev's still-kept steps beside next's fresh
+// origin with no disclosure, the exact defect condition 1 targets.
+func Amend(prev, next Scenario) (Scenario, AmendReport) {
+	out := next
+	rep := AmendReport{StepsKept: "new"}
+
+	newIsFallback := next.Steps == StepsNotRecorded
+	priorIsFallback := prev.Steps == StepsNotRecorded
+	priorRicher := len(strings.TrimSpace(next.Steps)) < len(strings.TrimSpace(prev.Steps))
+	if !priorIsFallback && (newIsFallback || priorRicher) {
+		out.Steps = prev.Steps
+		rep.StepsKept = "prior"
+		// A chain preserves the DEEPEST source, so prev's own disclosure is
+		// carried forward REGARDLESS of whether next was the fallback —
+		// clearing it on a fallback keep would strand prev's still-kept steps
+		// beside next's fresh origin with no disclosure (#3412 condition 1).
+		out.StepsCarriedFrom = prev.StepsCarriedFrom
+		if prev.StepsCarriedFrom == "" {
+			// The kept steps are prev's while the Origin written is next's, so
+			// they predate it — disclose, whatever next carried. Gating this on
+			// next being genuine loses the TWO-pass case (genuine steps at head
+			// A, then a fallback re-record): nothing is "displaced", prev has no
+			// disclosure to preserve, and the file would assert head B's origin
+			// beside head A's steps in silence (#3412 condition 1).
+			out.StepsCarriedFrom = carriedFromLabel(prev.Origin)
+		}
+	}
+
+	out.Assertions.ReproHandle = coalesceTrimmed(next.Assertions.ReproHandle, prev.Assertions.ReproHandle)
+	out.Assertions.Expected = coalesceTrimmed(next.Assertions.Expected, prev.Assertions.Expected)
+	out.Assertions.ObservedAtRecord = coalesceTrimmed(next.Assertions.ObservedAtRecord, prev.Assertions.ObservedAtRecord)
+
+	return out, rep
+}
+
+// coalesceTrimmed returns a when it is non-empty after a whitespace trim, else b.
+func coalesceTrimmed(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
+}
+
+// carriedFromLabel names the origin some carried-forward steps were recorded
+// against, for the StepsCarriedFrom disclosure.
+func carriedFromLabel(o Origin) string {
+	var parts []string
+	if o.HeadSHA != "" {
+		parts = append(parts, "head "+o.HeadSHA)
+	}
+	if !o.RecordedAt.IsZero() {
+		parts = append(parts, "recorded_at "+o.RecordedAt.UTC().Format(time.RFC3339))
+	}
+	if len(parts) == 0 {
+		return "an earlier recording"
+	}
+	return strings.Join(parts, " ")
 }
 
 // retiredLedger is the retired.yaml document shape.
@@ -525,6 +652,7 @@ func RenderPromptSection(chosen []Scenario, timeCap time.Duration) string {
 		len(chosen), IDPrefix)
 	fmt.Fprintf(&b, "Replay time cap: %s in total. A scenario you do not reach before the cap is reported `skipped` with `expectation_basis: %s` — never `failed`, never omitted.\n\n",
 		timeCap.String(), BudgetExhaustedBasis)
+	b.WriteString("Write every `steps_taken` you report — for a replayed scenario above AND for a criterion — as a COMPLETE, standalone reproduction recipe. Never write it by reference to another scenario listed here (e.g. \"same as the replayed scenario\"): a passing criterion is re-recorded as a scenario file, and a back-reference points at a recording that later re-records rewrite, so the referent disappears.\n\n")
 	for _, s := range chosen {
 		fmt.Fprintf(&b, "- scenario: %s\n", s.ID)
 		fmt.Fprintf(&b, "  statement: %s\n", s.Statement)

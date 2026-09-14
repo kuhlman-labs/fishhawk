@@ -28,6 +28,7 @@ rows into criterion rows and replayed-scenario rows.
 | `statement`, `verify_hint` | copied from the approved criterion |
 | `seed` | the E72.2 seeded-fixture scenario the criterion needs; omitted when none |
 | `steps` | the passing row's `steps_taken`; an empty one records the literal `StepsNotRecorded` (`not recorded by the validator`), never an empty string |
+| `steps_carried_from` | set ONLY by a re-record that kept the richer prior `steps` over genuine new ones (`Amend`); names the origin those steps predate; omitted otherwise (#3412) |
 | `assertions.expected`, `assertions.observed_at_record`, `assertions.repro_handle` | the passing row's `expected` / `observed` / `repro_handle` |
 | `origin.issue`, `origin.pr`, `origin.run_id`, `origin.head_sha`, `origin.recorded_at` | attribution; `pr: 0` means UNKNOWN and is never substituted with the issue number |
 
@@ -103,6 +104,51 @@ One `Scenario` per criterion that is `Drivable` (not `skip_expected`) AND
 whose verdict row is `passed`. A skipped/failed/undecidable row, a criterion
 with no row, and a non-drivable criterion are all excluded.
 
+## Amend on re-record — `Existing(dir, id)` + `Amend(prev, next)`
+
+A fix-up push re-opens the acceptance stage, and the second pass re-records
+the same scenario id. Before #3412 `Write` REPLACED the file wholesale, so a
+new pass whose `steps_taken` was a back-reference (`"same two-run drive as
+the replayed scenario …"`) overwrote the expensive prior recipe with a
+pointer to the recording it was deleting. Re-record is now Compose + **Amend**
++ Write.
+
+`Existing(dir, id)` is the re-record read: `PathFor(id)` resolves the path,
+`RefuseSymlinks` refuses a symlinked component, an absent file is
+`(zero, false, nil)`, a decodable file is `(s, true, nil)` with `Path` set,
+a malformed file is `(zero, false, named-error)`. The caller MUST have proven
+the tree clean first (persist refuses a dirty tree before this call), so the
+file read IS HEAD's and a planted file never reaches it.
+
+`Amend(prev, next)` merges the re-record onto the prior file:
+
+| field | rule |
+|---|---|
+| `id`, `statement`, `verify_hint`, `seed`, whole `origin` | ALWAYS from `next` (plan-authoritative + the volatile head/run/recorded_at, so the file attributes itself to THIS pass) |
+| `steps` | the richer text wins — longer after a whitespace trim, ties to `next`. TWO fallback guards: a PRIOR `StepsNotRecorded` fallback never wins (else it could beat genuine-but-shorter new steps — the bug inverted), and a NEW `StepsNotRecorded` fallback never displaces genuine prior steps |
+| `assertions.*` | `next`'s value when non-empty after a trim, else `prev`'s |
+| `steps_carried_from` | SET when the richer PRIOR steps are kept AND `next` carried genuine (non-fallback) steps that were displaced — the disclosure (see below); empty otherwise |
+
+`AmendReport.StepsKept` is `prior` or `new` for the caller's log.
+
+**Disclosure (`steps_carried_from`).** When Amend keeps the prior steps over
+genuine new ones, the written file could otherwise assert a fresh `origin`
+(head, run, recorded_at) beside steps describing a DIFFERENT, older drive —
+a record quietly wrong about itself. So `steps_carried_from` names the origin
+the kept steps came from (`head <sha> recorded_at <ts>`), and a reader of the
+file ALONE can tell the steps predate the origin (#3412). A chain preserves
+the DEEPEST source: a re-record over a file that already carries a disclosure
+keeps that disclosure rather than re-pointing it at the intermediate origin —
+and that hold is UNCONDITIONAL on `next` being the fallback. No NEW disclosure
+is synthesized when `next`'s steps were the fallback (nothing was displaced this
+pass) or when the new steps won, but a fallback keep still carries prev's
+EXISTING disclosure forward: clearing it would strand prev's kept steps beside
+`next`'s fresh origin with no disclosure (the chained-fallback gap). Pinned by `TestAmend` and, end to end
+through persist → git → bare origin, by
+`TestPersist_ReRecordAmendsPriorRecording` /
+`TestPersist_ReRecordTakesRicherNewSteps` /
+`TestPersist_ReRecordOverUndecodablePriorReplaces` (runner cmd).
+
 ## Prompt section — `RenderPromptSection(chosen, timeCap)`
 
 The `### Regression corpus` markdown the runner appends to the acceptance
@@ -111,7 +157,11 @@ statement, seed when set, steps, expected, `origin PR #n` or
 `origin PR unknown`), the total time cap, and the rule that an unreached
 scenario is reported `skipped` with `expectation_basis:
 replay_budget_exhausted` (`BudgetExhaustedBasis`). Empty when nothing is
-served.
+served. It ALSO instructs the agent that every `steps_taken` — for a replayed
+scenario and for a criterion — must be a COMPLETE standalone recipe, never a
+back-reference to another listed scenario, because a re-record rewrites the
+referenced file and the referent disappears (#3412) — the source-side half of
+the same fix `Amend` protects the corpus from structurally.
 
 ## Wire types (CROSS-MODULE WIRE CONTRACT)
 
