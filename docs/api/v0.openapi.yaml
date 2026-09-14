@@ -1315,7 +1315,15 @@ components:
             auto-advance is `ci_failed` — the review evidence settled
             but a required PR check concluded red, parking the run for
             operator classification (fix-up, an operator commit +
-            vouch, or a checks re-run). Never a persisted run state:
+            vouch, or a checks re-run). A later `ci_recovered`
+            auto-advance (#3414) SUPERSEDES `ci_failed` and clears this
+            field: the red conclusion that parked the run was
+            `cancelled`/`stale` — a head superseded by a newer push,
+            carrying no verdict about the code — so no red verdict
+            remains at the latest observed rows. `ci_recovered` is a
+            rule value, NOT a `derived_status` (the field goes absent
+            while the remaining required checks conclude). Never a
+            persisted run state:
             `state` stays `running` while parked here, and the
             transition table in `backend/internal/run/transition.go` is
             unchanged. Emitted by `GET /v0/runs/{run_id}` ONLY
@@ -2312,7 +2320,12 @@ components:
         `reviews_settled_gate`, `fixup_rereview_repark`,
         `checks_green_awaiting_merge`, `ci_failed` (the negative mirror
         of `checks_green_awaiting_merge`: a required PR check concluded
-        red).
+        a red VERDICT), `ci_recovered` (#3414 — the `ci_failed` park
+        lifting because no required check carries a red verdict at the
+        latest observed rows: the parking conclusion was `cancelled`/
+        `stale`, a head superseded by a newer push, so the run returns
+        to awaiting its remaining checks rather than the `ci_failed`
+        dead end).
       required: [rule, from, to, ts]
       properties:
         rule:

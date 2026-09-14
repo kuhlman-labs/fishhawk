@@ -1510,6 +1510,48 @@ func TestGetRun_Drive_AcceptancePendingRestampAfterRepark_DerivesAcceptancePendi
 	}
 }
 
+// TestGetRun_Drive_CIRecoveredSupersedesCIFailed_OmitsDerivedStatus pins the
+// read-model half of the #3414 recovery: a ci_failed stamp superseded by a
+// LATER ci_recovered entry means the latest run_auto_advanced entry is
+// ci_recovered, which is a RULE value with no derived_status mapping — so
+// derived_status goes EMPTY (not ci_failed) and next_action is await_checks.
+// Derived through the REAL applyDriveSurfaces path (seed the entries and let
+// sort-by-Sequence-take-last pick the winner; the field is NOT hand-set), so
+// the observer->surface seam is exercised. Also pins condition 5: the ci_recovered
+// entry carries a deliberately NON-default To value, proving the surfaced posture
+// (empty derived_status + await_checks next_action) comes from the rule and
+// next_action, NOT from the To field.
+func TestGetRun_Drive_CIRecoveredSupersedesCIFailed_OmitsDerivedStatus(t *testing.T) {
+	s, _, au, seeded := newDriveGetServer(t)
+	pr := "https://github.com/x/y/pull/7"
+	seeded.PullRequestURL = &pr
+
+	t0 := time.Now().UTC().Add(-5 * time.Minute)
+	// 1. The run parked ci_failed (would surface derived_status ci_failed alone).
+	seedAutoAdvance(t, au, seeded.ID, 5, t0, drive.Advance{
+		Rule: drive.RuleCIFailed, From: "review:awaiting_approval", To: "ci_failed",
+		NextAction: &drive.NextAction{Action: "classify_ci_failure", PRURL: pr},
+	})
+	// 2. ci_recovered supersedes it as the latest entry. The To field is set to a
+	// deliberately non-default value to prove derived_status/next_action do not key
+	// on To (condition 5).
+	seedAutoAdvance(t, au, seeded.ID, 8, t0.Add(2*time.Minute), drive.Advance{
+		Rule: drive.RuleCIRecovered, From: "ci_failed", To: "review:already_approved_at_recovery",
+		NextAction: &drive.NextAction{Action: "await_checks", PRURL: pr},
+	})
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if _, present := raw["derived_status"]; present {
+		t.Errorf("derived_status present (%v), want absent — ci_recovered is a rule value with no derived_status", raw["derived_status"])
+	}
+	if resp.DerivedStatus != "" {
+		t.Errorf("derived_status = %q, want empty (ci_recovered supersedes ci_failed)", resp.DerivedStatus)
+	}
+	if resp.NextAction == nil || resp.NextAction.Action != "await_checks" {
+		t.Errorf("next_action = %+v, want await_checks", resp.NextAction)
+	}
+}
+
 // TestGetRun_Drive_AcceptancePending_NoPR_OmitsDerivedStatus: like
 // awaiting_merge / ci_failed, an acceptance-gate derived_status requires an
 // open PR on the row.
