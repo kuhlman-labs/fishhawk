@@ -26,6 +26,10 @@ The scan loop reads the child's stream-json via the shared `agent.TraceLineReade
 
 A genuine non-EOF read error on the stdout pipe (which truncation cannot absorb) is the reader's `Err()`; the terminal switch maps it to the peer sentinel `agent.ErrTraceStreamRead` (`err_class=trace_stream_read`, category `"A"` retained), NOT `ErrAgentFailed`.
 
+## Prompt too large: E2BIG at `Start` (#3408)
+
+The prompt travels as the single `-p <prompt>` argv string, so a prompt past the OS argument-size limit is refused by `cmd.Start` with `E2BIG`. `invokeOnce` classifies it — after the binary-missing arm — via `agent.IsArgListTooLong` into `agent.ErrPromptTooLarge` (`err_class=prompt_too_large`), wrapping the prompt byte count and `agent.ArgvBytes(binary + args)` so the diagnostic names how far past the limit the spawn was. No `Result` fields are set (no failure category — the agent never ran) and no event beyond `invocation_start` is emitted. The thinking-block retry loop never re-spends it: the retry keys only on the thinking-block signal. `TestInvoke_PromptTooLarge_NamedSentinel` performs a REAL spawn through `forwardingHelperCommand` (which forwards the adapter's argv, unlike the other helpers) with a 4 MiB prompt and asserts the named sentinel on the live `fork/exec` error.
+
 Two exported TEST seams, peers of `Cmd`/`Now`: `TraceLineMaxBytes int` (0 → `agent.MaxTraceLineBytes`) substitutes the cap so a test injects a small limit instead of emitting genuine >4 MiB lines; `TraceStream func(io.Reader) io.Reader` (nil → identity) substitutes the SOURCE so a test drives a genuine read error through the real adapter into the real classifier. Both are nil/zero in production, so the spawn is byte-identical.
 
 ## Model-quota-exhaustion classification (#2085)

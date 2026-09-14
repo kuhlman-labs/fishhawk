@@ -269,6 +269,14 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 				"binary_not_found",
 			), agent.ErrBinaryNotFound
 		}
+		// E2BIG: the prompt travels as ONE argv string (the trailing `codex
+		// exec` positional), so a prompt past the OS argument-size limit dies
+		// here before the agent runs (#3408). Name the cause with byte counts
+		// rather than leaking a raw fork/exec string.
+		if agent.IsArgListTooLong(err) {
+			return res, fmt.Errorf("%w: prompt %d bytes, argv %d bytes (%s): %v",
+				agent.ErrPromptTooLarge, len(inv.Prompt), agent.ArgvBytes(append([]string{binary}, args...)), binary, err)
+		}
 		return res, fmt.Errorf("codex: start: %w", err)
 	}
 
