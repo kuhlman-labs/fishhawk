@@ -4404,7 +4404,7 @@ func TestShipAcceptance_AllRowsRetired_ShippedPassed_RecordsAllRetiredBasis(t *t
 // it end to end corrected the concern's mechanical prediction: the #2581 downgrade
 // CANNOT fire on an all-retired verdict (D3 requires a surviving non-retired row),
 // so a shipped `failed` whose every itemized row is retired is NOT downgraded, and
-// the severity ladder over the empty non-retired set leaves failed (2) above
+// the severity ladder over the empty non-retired set leaves failed (3) above
 // not_validated (1) untouched. The verdict stays failed and carries NO basis key —
 // so the all-retired-observed basis is unreachable from a shipped `failed`, and the
 // inaccurate-wording hazard the concern flagged for THIS combination never occurs.

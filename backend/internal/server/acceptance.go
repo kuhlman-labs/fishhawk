@@ -1055,7 +1055,7 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	// commit that was validated, so it can never be recorded as a pass. It is
 	// laddered through the SAME severity-monotone acceptanceVerdictAtLeast
 	// machinery, so the direction is fixed by construction: passed (0) <
-	// undecidable (1) is raised, and a shipped failed (2) is NEVER softened. The
+	// undecidable (2) is raised, and a shipped failed (3) is NEVER softened. The
 	// clamp is the LAST rewrite, after the retirement downgrade and the row
 	// aggregation, because an unbound head invalidates whatever those two
 	// concluded about the tree.
