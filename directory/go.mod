@@ -1,9 +1,9 @@
 module github.com/kuhlman-labs/fishhawk/directory
 
-go 1.25.0
+go 1.25.11
 
 require (
-	github.com/golang-migrate/migrate/v4 v4.19.1
+	github.com/golang-migrate/migrate/v4 v4.20.1
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
 )
