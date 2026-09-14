@@ -779,6 +779,20 @@ Notes:
   a malformed trigger payload, a rename-indeterminate diff, an empty candidate
   union, or an unpinnable delta each emit nothing. Listed here only so a future
   reader grepping the audit categories doesn't mistake it for a comment surface.
+- The approval-conditions-unrecorded audit kind — `approval_conditions_unrecorded`
+  (#3400), written by the implement-review assembly path
+  (`trace.go::runImplementReviews`) before any reviewer verdict — is an
+  **internal, advisory audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it. It fires when the run carries operator approval
+  conditions, the round's gate evidence is bundle-derived (so the runner had the
+  chance to peek the commit-message sidecar), and that evidence carries no
+  `approval_condition_responses` member — the agent's proposed commit message
+  had no `Approval conditions:` section. Payload `{head_sha, source_pass}`
+  (`source_pass` is `implement` or `fixup`). It is the durable operator signal
+  distinguishing an agent that declined a condition WITH a reason from one that
+  silently ignored it; the reviewer records ONE low-severity
+  `approval_conditions_unrecorded` concern in parallel. Exactly one row per
+  review round. EVIDENCE ONLY.
 - The routed-reporting-obligation audit kind —
   `fixup_reporting_obligation_undelivered` (#2737), written by the
   implement-review assembly path (`trace.go::runImplementReviews`) before any

@@ -813,3 +813,53 @@ func TestComposeGateEvidence_NoFixupCounterfactualsField(t *testing.T) {
 		t.Errorf("payload %s carries a fixup_counterfactuals member, want it omitted", ev.Payload)
 	}
 }
+
+// approvalConditionResponsesWireFixture is the SHARED literal JSON pinning the
+// runner↔backend gate-evidence wire contract for #3400. A byte-for-byte twin
+// lives in backend/internal/bundle/bundle_test.go (asserted to DECODE it into
+// GateEvidence.ApprovalConditionResponses with every field populated). No
+// import can cross the module seam, so a one-sided json-tag edit fails on the
+// other side — the same lockstep defense fixup_counterfactuals uses. The
+// member order (source, text, truncated) is the order encoding/json emits from
+// the struct field order.
+const approvalConditionResponsesWireFixture = `"approval_condition_responses":` +
+	`{"source":"implement_commitmsg","text":"- condition 1: added the drift test\n- condition 2: no action required because the path is a permission","truncated":true}`
+
+// TestComposeGateEvidence_ApprovalConditionResponses drives the REAL composer
+// with the event peekApprovalConditionResponses emits and asserts the packed
+// gate_evidence payload carries the shared wire fixture BYTE-FOR-BYTE; the
+// event-less compose omits the member entirely (byte-identical default).
+func TestComposeGateEvidence_ApprovalConditionResponses(t *testing.T) {
+	ev := composeGateEvidence([]agent.Event{{
+		Kind: "approval_condition_responses",
+		Payload: agent.MakePayload(map[string]any{
+			"run_id":    "r",
+			"stage_id":  "s",
+			"source":    "implement_commitmsg",
+			"text":      "- condition 1: added the drift test\n- condition 2: no action required because the path is a permission",
+			"truncated": true,
+		}),
+	}}, 1)
+	if ev == nil {
+		t.Fatal("composeGateEvidence returned nil; an approval_condition_responses event must count as a gate")
+	}
+	raw := string(ev.Payload)
+	if !strings.Contains(raw, approvalConditionResponsesWireFixture) {
+		t.Errorf("gate_evidence payload does not carry the shared wire fixture.\ngot:  %s\nwant substring: %s",
+			raw, approvalConditionResponsesWireFixture)
+	}
+	p := decodeEvidence(t, ev)
+	if p.ApprovalConditionResponses == nil || p.ApprovalConditionResponses.Source != "implement_commitmsg" ||
+		!p.ApprovalConditionResponses.Truncated {
+		t.Errorf("ApprovalConditionResponses = %+v", p.ApprovalConditionResponses)
+	}
+
+	// Event-less compose (a verify_run alone) omits the member.
+	plain := composeGateEvidence([]agent.Event{{
+		Kind:    "verify_run",
+		Payload: agent.MakePayload(map[string]any{"command": "x", "exit_code": 0, "outcome": "passed"}),
+	}}, 1)
+	if strings.Contains(string(plain.Payload), "approval_condition_responses") {
+		t.Errorf("event-less compose must omit the member: %s", plain.Payload)
+	}
+}

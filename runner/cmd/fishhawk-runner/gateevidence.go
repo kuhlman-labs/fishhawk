@@ -112,6 +112,28 @@ type gateEvidencePayload struct {
 	// mirror; a drift silently DISABLES the gate, because the backend then
 	// sees no signal and the constraint reports nothing wrong.
 	DiffCoverage *diffCoverageEvidence `json:"diff_coverage,omitempty"`
+	// ApprovalConditionResponses carries the `Approval conditions:` section the
+	// agent wrote at the end of its PROPOSED commit-message sidecar (#3400),
+	// peeked at pack time by peekApprovalConditionResponses: bounded (4 KiB,
+	// Truncated flag), pre-redacted, and rendered by the backend inside an
+	// UNTRUSTED envelope as the agent's OWN response to each operator approval
+	// condition. Absent (the byte-identical default) when no conditions were
+	// answered or no sidecar carried the section. The json tag MUST stay
+	// identical to the backend's bundle.ApprovalConditionResponsesEvidence
+	// mirror — a one-sided edit silently DISABLES the signal, which is why the
+	// pair is pinned from BOTH modules against one shared literal JSON fixture.
+	ApprovalConditionResponses *approvalConditionResponsesEvidence `json:"approval_condition_responses,omitempty"`
+}
+
+// approvalConditionResponsesEvidence is the peeked commit-body responses
+// section (#3400): Source names the sidecar it came from
+// (implement_commitmsg | fixup_commitmsg), Text is the bounded pre-redacted
+// section text and Truncated reports whether the 4 KiB bound cut it. Mirrors
+// bundle.ApprovalConditionResponsesEvidence — json tags MUST stay identical.
+type approvalConditionResponsesEvidence struct {
+	Source    string `json:"source"`
+	Text      string `json:"text"`
+	Truncated bool   `json:"truncated,omitempty"`
 }
 
 // diffCoverageEvidence digests one diff-coverage measurement (#1888).
@@ -316,7 +338,7 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 	gateRan := false
 	for _, e := range events {
 		switch e.Kind {
-		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "fixup_counterfactuals", "diff_coverage":
+		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "fixup_counterfactuals", "diff_coverage", "approval_condition_responses":
 			gateRan = true
 		}
 	}
@@ -442,6 +464,15 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 				continue
 			}
 			payload.FixupCounterfactuals = append(payload.FixupCounterfactuals, w.Counterfactuals...)
+		case "approval_condition_responses":
+			var w approvalConditionResponsesEvidence
+			if json.Unmarshal(e.Payload, &w) != nil {
+				continue
+			}
+			// Already bounded + pre-redacted at the emit site
+			// (peekApprovalConditionResponses); carried verbatim.
+			acr := w
+			payload.ApprovalConditionResponses = &acr
 		case "diff_coverage":
 			var w diffCoverageEvidence
 			if json.Unmarshal(e.Payload, &w) != nil {

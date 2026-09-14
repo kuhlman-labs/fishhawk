@@ -1573,3 +1573,47 @@ func TestExtractGateEvidence_OlderBundleWithoutFixupCounterfactuals(t *testing.T
 		t.Errorf("FixupCounterfactuals = %+v, want nil for an older/non-fix-up bundle", got.FixupCounterfactuals)
 	}
 }
+
+// approvalConditionResponsesWireFixture is the SHARED literal JSON that pins
+// the runner↔backend gate-evidence wire contract for #3400. Its byte-for-byte
+// twin lives in runner/cmd/fishhawk-runner/gateevidence_test.go, where the
+// REAL composer is asserted to EMIT exactly this; here the backend is asserted
+// to DECODE exactly this. No import can cross the module seam, so a one-sided
+// json-tag edit fails on the other side. Member order (source, text,
+// truncated) is encoding/json's struct-field order.
+const approvalConditionResponsesWireFixture = `"approval_condition_responses":` +
+	`{"source":"implement_commitmsg","text":"- condition 1: added the drift test\n- condition 2: no action required because the path is a permission","truncated":true}`
+
+// TestExtractGateEvidence_DecodesApprovalConditionResponses is the backend
+// half of the #3400 lockstep pair: the shared literal decodes with EVERY field
+// populated, and a payload without the key decodes to nil (older runner).
+func TestExtractGateEvidence_DecodesApprovalConditionResponses(t *testing.T) {
+	payload := json.RawMessage(`{"scope_facts":{"declared_files":1},` + approvalConditionResponsesWireFixture + `}`)
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGateEvidence, Data: payload},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractGateEvidence(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	want := &ApprovalConditionResponsesEvidence{
+		Source:    "implement_commitmsg",
+		Text:      "- condition 1: added the drift test\n- condition 2: no action required because the path is a permission",
+		Truncated: true,
+	}
+	if got.ApprovalConditionResponses == nil || *got.ApprovalConditionResponses != *want {
+		t.Errorf("ApprovalConditionResponses = %+v, want %+v — the runner↔backend json tags diverged",
+			got.ApprovalConditionResponses, want)
+	}
+
+	older := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGateEvidence, Data: json.RawMessage(`{"scope_facts":{"declared_files":1}}`)},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	if got, err := ExtractGateEvidence(packLines(t, older)); err != nil || got.ApprovalConditionResponses != nil {
+		t.Errorf("older bundle: err=%v ApprovalConditionResponses=%+v, want nil", err, got.ApprovalConditionResponses)
+	}
+}
