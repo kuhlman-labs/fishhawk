@@ -301,6 +301,22 @@ type PRHeadFetcher func(ctx context.Context, scope forge.CredentialScope, repo f
 // they cannot drift.
 var HeadReportCategoriesByPrecedence = []string{"acceptance_scenarios_pushed", "fixup_pushed", "child_pushed", "pull_request_opened"}
 
+// CategoryOperatorCommitVouched is the audit category an operator's
+// fishhawk_vouch_commit declaration is recorded under (ADR-035 remediation,
+// #1044), and VouchedSHAField the payload field carrying the vouched commit.
+// Together they are the write→read seam for a vouch: server.handleVouchCommit
+// WRITES the entry, and it has TWO readers — the ADR-035 branch-lineage ledger
+// (server/lineage.go, addVouchedSHAs) and rule 5's known set here
+// (gatherForeignCommitInputs). #3415 was the second reader missing the union:
+// the lineage ledger honored a vouch while rule 5 still recomputed the vouched
+// head as foreign_commit. The constants live in this package because
+// auditcomplete cannot import server; the server aliases them so a literal
+// typo on either side is a compile-time drift, not a silent one.
+const (
+	CategoryOperatorCommitVouched = "operator_commit_vouched"
+	VouchedSHAField               = "vouched_sha"
+)
+
 // LatestReportedHeadSHA applies HeadReportCategoriesByPrecedence to a run's
 // chained audit entries: for the highest-precedence category that carries at
 // least one entry with a non-empty head_sha payload field, it returns the
@@ -920,10 +936,12 @@ type foreignCommitInputs struct {
 
 // gatherForeignCommitInputs walks runID upward via parent_run_id
 // (#216) and collects every implement-stage `pull_request`
-// artifact's head_sha + the PR's number. Returns (inputs, true, nil)
-// when there's enough to call PRHead; (_, false, nil) when there's
-// no implement stage / no installation / no PR yet; error only on
-// transient I/O.
+// artifact's head_sha + the PR's number, every walked run's own
+// head-report heads (#1682), and every walked run's operator-vouched
+// commits plus those of its decomposition children (#3415). Returns
+// (inputs, true, nil) when there's enough to call PRHead; (_, false,
+// nil) when there's no implement stage / no installation / no PR yet;
+// error only on transient I/O.
 func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) (foreignCommitInputs, bool, error) {
 	known := make(map[string]struct{})
 	var (
@@ -1012,6 +1030,37 @@ func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) 
 			}
 		}
 
+		// #3415: an operator's fishhawk_vouch_commit declaration names a
+		// commit that appears in NO head-report category — it is precisely
+		// the commit the run did NOT push. The ADR-035 lineage ledger
+		// (server/lineage.go buildReportedHeadLedger) already unions the
+		// vouched_sha of every operator_commit_vouched entry on the run's
+		// own chain AND on each decomposition child's chain; rule 5 is the
+		// SECOND reader of that concept and never learned the exemption, so
+		// the vouch handler's own re-post recomputed the vouched head as
+		// foreign_commit. Union the same set here, at PARITY with the
+		// ledger's walk (own chain + children, nothing more). A read failure
+		// on either the vouch category or the child list is transient I/O
+		// and aborts the gather (→ head_fetch_failed, pending), matching the
+		// head-category posture above — never a silent under-population
+		// that false-flags a vouched head. Fail-closed is preserved: a
+		// vouch names ONE sha, so an un-vouched foreign head still flags.
+		if err := addVouchedSHAs(ctx, deps, r.ID, known); err != nil {
+			return foreignCommitInputs{}, false, err
+		}
+		children, _, err := listDecompositionChildren(ctx, deps, r.ID)
+		if err != nil {
+			return foreignCommitInputs{}, false, err
+		}
+		for _, child := range children {
+			if child == nil {
+				continue
+			}
+			if err := addVouchedSHAs(ctx, deps, child.ID, known); err != nil {
+				return foreignCommitInputs{}, false, err
+			}
+		}
+
 		if r.ParentRunID == nil {
 			break
 		}
@@ -1049,6 +1098,31 @@ func decodePRArtifact(content []byte) (string, int) {
 	return body.HeadSHA, body.PRNumber
 }
 
+// addVouchedSHAs adds every non-empty VouchedSHAField payload value from
+// runID's CategoryOperatorCommitVouched audit entries to known (#3415). A
+// malformed payload is skipped (the vouch handler is the one writer and
+// always emits the field; an unparseable row is not evidence either way). A
+// read error is returned wrapped so the caller aborts the gather as
+// transient I/O rather than under-populating the known set.
+func addVouchedSHAs(ctx context.Context, deps Deps, runID uuid.UUID, known map[string]struct{}) error {
+	entries, err := deps.Audit.ListForRunByCategory(ctx, runID, CategoryOperatorCommitVouched)
+	if err != nil {
+		return fmt.Errorf("list %s for %s: %w", CategoryOperatorCommitVouched, shortID(runID), err)
+	}
+	for _, e := range entries {
+		if e == nil {
+			continue
+		}
+		var p struct {
+			VouchedSHA string `json:"vouched_sha"`
+		}
+		if json.Unmarshal(e.Payload, &p) == nil && p.VouchedSHA != "" {
+			known[p.VouchedSHA] = struct{}{}
+		}
+	}
+	return nil
+}
+
 // parseRepo splits "owner/name" into a RepoRef. Mirrors the
 // helpers in other packages; duplicated here to keep auditcomplete
 // import-free of higher layers.
@@ -1076,6 +1150,33 @@ const (
 	childPageSize    = 100
 	childPageCeiling = 100
 )
+
+// listDecompositionChildren pages ListRuns(DecomposedFrom = runID) with
+// childPageSize up to childPageCeiling pages and returns every child read
+// plus whether a SHORT page proved the set exhausted. exhausted=false with a
+// non-empty result is the page-ceiling OVERFLOW: the caller decides what a
+// partial read means (rule 2b fails closed on it; rule 5's vouch union reads
+// the partial set as-is, which can only leave a vouch UNknown — the
+// fail-closed direction). A ListRuns error is returned wrapped as transient
+// I/O. Shared by rule 2b and rule 5 (#3415) so the two walk the child set
+// identically.
+func listDecompositionChildren(ctx context.Context, deps Deps, runID uuid.UUID) (children []*run.Run, exhausted bool, err error) {
+	for page := 0; page < childPageCeiling; page++ {
+		batch, err := deps.Runs.ListRuns(ctx, run.ListRunsFilter{
+			DecomposedFrom: &runID,
+			Limit:          childPageSize,
+			Offset:         page * childPageSize,
+		})
+		if err != nil {
+			return nil, false, fmt.Errorf("list decomposition children of %s: %w", shortID(runID), err)
+		}
+		children = append(children, batch...)
+		if len(batch) < childPageSize {
+			return children, true, nil
+		}
+	}
+	return children, false, nil
+}
 
 // childResolutionOutcome is resolveImplementTracesFromChildren's structured
 // verdict. Exactly one of resolution / pending / childMisses is meaningful in
@@ -1135,22 +1236,9 @@ type childResolutionOutcome struct {
 func resolveImplementTracesFromChildren(ctx context.Context, deps Deps, runID uuid.UUID, implementStage *run.Stage) (childResolutionOutcome, error) {
 	var out childResolutionOutcome
 
-	var children []*run.Run
-	exhausted := false
-	for page := 0; page < childPageCeiling; page++ {
-		batch, err := deps.Runs.ListRuns(ctx, run.ListRunsFilter{
-			DecomposedFrom: &runID,
-			Limit:          childPageSize,
-			Offset:         page * childPageSize,
-		})
-		if err != nil {
-			return out, fmt.Errorf("list decomposition children of %s: %w", shortID(runID), err)
-		}
-		children = append(children, batch...)
-		if len(batch) < childPageSize {
-			exhausted = true
-			break
-		}
+	children, exhausted, err := listDecompositionChildren(ctx, deps, runID)
+	if err != nil {
+		return out, err
 	}
 	if len(children) == 0 {
 		// No children: not a decomposed run (or the fan-out never minted

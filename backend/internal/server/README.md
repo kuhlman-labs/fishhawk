@@ -1042,15 +1042,29 @@ Mechanics:
 - The handler appends an `operator_commit_vouched` audit entry
   (operator/`ActorUser` actor; payload
   `{run_id, vouched_sha, reason}`, with `vouched_sha` keyed on the
-  shared `lineageVouchedSHAField` constant).
-- `lineage.go::buildReportedHeadLedger` unions vouched SHAs
-  (`lineageVouchLedgerCategory`, read via `addVouchedSHAs` from the
-  `vouched_sha` field — parallel to `addReportedHeads`/`head_sha`) into
-  the reported-head ledger on the run's OWN chain AND inside the
-  per-child decomposition loop. The union therefore flows automatically
-  to BOTH the #858 report-boundary check (`verifyBranchLineage`) and
-  the merge-resolution re-check (`ReverifyBranchLineage`) with no
-  caller edits — un-wedging the run an operator commit had parked.
+  shared `lineageVouchedSHAField` constant — an alias of
+  `auditcomplete.VouchedSHAField`, as `CategoryOperatorCommitVouched` is
+  of `auditcomplete.CategoryOperatorCommitVouched`; auditcomplete owns
+  the literals because it cannot import this package).
+- The entry has TWO readers, and the union flows to BOTH ledgers:
+  - `lineage.go::buildReportedHeadLedger` unions vouched SHAs
+    (`lineageVouchLedgerCategory`, read via `addVouchedSHAs` from the
+    `vouched_sha` field — parallel to `addReportedHeads`/`head_sha`) into
+    the reported-head ledger on the run's OWN chain AND inside the
+    per-child decomposition loop. The union therefore flows automatically
+    to BOTH the #858 report-boundary check (`verifyBranchLineage`) and
+    the merge-resolution re-check (`ReverifyBranchLineage`) with no
+    caller edits — un-wedging the run an operator commit had parked.
+  - `auditcomplete.gatherForeignCommitInputs` (rule 5 of
+    `fishhawk_audit_complete`, the `foreign_commit` known set) unions the
+    same `vouched_sha`s on each walked run's own chain AND its
+    decomposition children (#3415). This reader was added AFTER the
+    lineage ledger without the union, so a vouched head attributed cleanly
+    under ADR-035 while the re-post below recomputed it as
+    `foreign_commit` and stamped a FAILURE at the vouched head — the
+    #3415 symptom. The issue title blamed the write path ("does not union
+    the sha into the reported-head ledger"); the write path was fine, the
+    second reader was blind.
 - **Re-posts the `fishhawk_audit_complete` check at the vouched head
   (E64.14 / #3109).** After the `operator_commit_vouched` entry is
   durable, the handler calls
@@ -1061,9 +1075,12 @@ Mechanics:
   This is load-bearing for the base-advance
   wedge: an operator-pushed head appears in NO head-report audit category
   (`fixup_pushed` / `child_pushed` / `pull_request_opened`), so the
-  publisher's normal `findHeadSHA` resolution would recompute correctly
-  and then publish against a STALE sha — leaving the check absent from
-  the merged head rather than red on it. The re-post is best-effort for
+  publisher's normal `findHeadSHA` resolution would publish against a
+  STALE sha — leaving the check absent from the merged head rather than
+  red on it. The recompute itself reads the vouch through rule 5's known
+  set (#3415, above), so the state stamped at the vouched head is a
+  non-foreign one; before #3415 the re-post landed at the right sha with
+  the wrong verdict. The re-post is best-effort for
   the vouch's success but its outcome is REPORTED on the response
   (`audit_check_republished` / `audit_check_republish_warning`), NOT
   swallowed — the merge reconciler's heal (`RepublishAuditCheck`) uses

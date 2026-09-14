@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -21,20 +22,28 @@ import (
 // the vouch handler writes when an operator declares a foreign commit on
 // a run branch to be run-authored lineage (ADR-035 remediation, #1044).
 // It is a durable, operator-authored declaration: the payload names the
-// run, the vouched SHA, and the operator's reason. The reported-head
-// ledger (lineage.go) unions vouched SHAs alongside the run's own
-// pull_request_opened / child_pushed / fixup_pushed provenance, so an
+// run, the vouched SHA, and the operator's reason. The entry has TWO
+// readers, and both must union it: the ADR-035 reported-head ledger
+// (lineage.go, addVouchedSHAs) unions vouched SHAs alongside the run's own
+// pull_request_opened / child_pushed / fixup_pushed provenance so an
 // operator's mechanical remediation commit no longer wedges the run it
-// fixed. Internal audit kind — NOT an issue-comment surface (the living
-// anchor comment #1067 projects it via the audit chain).
-const CategoryOperatorCommitVouched = "operator_commit_vouched"
+// fixed; and rule 5 of fishhawk_audit_complete (auditcomplete
+// gatherForeignCommitInputs) unions them into its foreign_commit known set
+// so the re-post at the vouched head recomputes as Fishhawk-recorded rather
+// than foreign (#3415 — the second reader was added without the union, so
+// the lineage ledger honored a vouch the audit check still flagged). The
+// value is aliased from auditcomplete, which owns it because that package
+// cannot import server. Internal audit kind — NOT an issue-comment surface
+// (the living anchor comment #1067 projects it via the audit chain).
+const CategoryOperatorCommitVouched = auditcomplete.CategoryOperatorCommitVouched
 
 // lineageVouchedSHAField is the payload field carrying the vouched commit
 // SHA on an operator_commit_vouched entry. It is the write→read seam: the
-// vouch handler writes it (handleVouchCommit) and the reported-head ledger
-// reads it (addVouchedSHAs). Both sides reference this single constant so
+// vouch handler writes it (handleVouchCommit) and BOTH readers — the
+// reported-head ledger (lineage.go addVouchedSHAs) and rule 5's known set
+// (auditcomplete addVouchedSHAs) — read it. Aliased from auditcomplete so
 // the seam cannot drift on a literal typo.
-const lineageVouchedSHAField = "vouched_sha"
+const lineageVouchedSHAField = auditcomplete.VouchedSHAField
 
 // vouchCommitRequest is the JSON body of POST
 // /v0/runs/{run_id}/vouch-commit. Both fields are required: the vouch is
@@ -255,14 +264,19 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 
 	// Re-post the fishhawk_audit_complete Check Run AT the vouched sha (E64.14 /
 	// #3109). This runs ONLY after the operator_commit_vouched entry is durably
-	// appended, so the recompute observes the vouch in the reported-head ledger.
-	// The vouched commit is an operator-pushed head that appears in NO
-	// head-report audit category, so the publisher's normal head resolution
-	// (fixup_pushed > child_pushed > pull_request_opened) would republish
-	// against a STALE sha and leave the required check absent from the live
-	// merge head — the exact wedge this endpoint closes. The head override
-	// targets the vouched sha directly — but ONLY once the publish bound below
-	// has confirmed that sha IS the run's own live pull-request head.
+	// appended, so the recompute observes the vouch in BOTH readers of it: the
+	// ADR-035 reported-head ledger (lineage.go) AND rule 5's foreign_commit
+	// known set (auditcomplete gatherForeignCommitInputs). #3415 was the second
+	// reader missing the union — the ledger attributed the vouched commit
+	// cleanly while this very re-post recomputed it as foreign_commit and
+	// stamped a FAILURE at the vouched head. The vouched commit is an
+	// operator-pushed head that appears in NO head-report audit category, so
+	// the publisher's normal head resolution (fixup_pushed > child_pushed >
+	// pull_request_opened) would republish against a STALE sha and leave the
+	// required check absent from the live merge head — the exact wedge this
+	// endpoint closes. The head override targets the vouched sha directly —
+	// but ONLY once the publish bound below has confirmed that sha IS the
+	// run's own live pull-request head.
 	//
 	// A re-post failure does NOT fail the vouch — the declaration is already
 	// durable. But it is NOT swallowed either (binding condition 1b): the
