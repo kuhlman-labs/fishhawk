@@ -393,6 +393,138 @@ func TestPersist_UnknownPRRecordsZeroNotIssue(t *testing.T) {
 	}
 }
 
+// reRecordCorpusFile renders a committed corpus file with an explicit steps
+// recipe, repro_handle, statement, run_id and head_sha so a re-record's amend
+// can be observed against known prior content.
+func reRecordCorpusFile(id string, issue, pr int, statement, steps, reproHandle, runID, headSHA string, recordedAt time.Time) string {
+	return fmt.Sprintf("id: %s\nstatement: %s\nverify_hint: old hint\nsteps: %q\nassertions:\n  expected: old expected\n  observed_at_record: old observed\n  repro_handle: %s\norigin:\n  issue: %d\n  pr: %d\n  run_id: %s\n  head_sha: %s\n  recorded_at: %s\n",
+		id, statement, steps, reproHandle, issue, pr, runID, headSHA, recordedAt.UTC().Format(time.RFC3339))
+}
+
+// loadCommittedScenario reads the corpus file at <corpusRel> from commit sha on
+// the bare origin and parses it through the REAL scenario loader — robust to
+// yaml.v3 line-wrapping of long scalars, which a raw substring match is not.
+func loadCommittedScenario(t *testing.T, origin, sha, corpusRel string) scenario.Scenario {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, filepath.FromSlash(corpusRel))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, p, tgit(t, origin, "show", sha+":acceptance/scenarios/"+corpusRel)+"\n")
+	got, err := scenario.Load(dir)
+	if err != nil {
+		t.Fatalf("load committed %s: %v", corpusRel, err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 committed scenario at %s, got %d", corpusRel, len(got))
+	}
+	return got[0]
+}
+
+// TestPersist_ReRecordAmendsPriorRecording (#3412): a re-record whose new
+// steps_taken is a SHORT back-reference must NOT overwrite the prior long
+// reproduction recipe. The committed YAML keeps the long steps verbatim,
+// carries the NEW origin/repro_handle/statement (plan-authoritative), discloses
+// that the steps predate the origin (condition 1), and the log records
+// steps_kept=prior. The done-means test for the shipped behaviour.
+func TestPersist_ReRecordAmendsPriorRecording(t *testing.T) {
+	longSteps := strings.Repeat("drive the two-run replay and assert the corpus is rewritten. ", 4) // >200 chars
+	_, tree, origin, head := persistRepo(t, map[string]string{
+		"issue-101/crit-b.yaml": reRecordCorpusFile("scenario:issue-101/crit-b", 101, 700,
+			"the ORIGINAL criterion statement", longSteps, "old-handle", "r0", "abcdef0", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)),
+	})
+	var log strings.Builder
+	res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{
+		treeDir: tree, runBranch: "fishhawk/run-r1", remoteURL: origin, issue: 101, prNumber: 742, headSHA: head, runID: "r1",
+		criteria: []upload.AcceptanceCriterionEntry{{ID: "crit-b", Statement: "the RESTATED criterion statement", Drivable: true}},
+		verdict:  []byte(`{"verdict":"passed","criteria":[{"id":"crit-b","result":"passed","observed":"NEW observed","expected":"NEW expected","steps_taken":"Same two-run drive as the replayed scenario","repro_handle":"curl-new"}]}`),
+		now:      func() time.Time { return time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC) },
+	}, &gitops.Pusher{}, &log)
+	if res.outcome != persistPushed || len(res.amended) != 1 || res.amended[0] != "scenario:issue-101/crit-b" {
+		t.Fatalf("outcome=%s (%s) amended=%v, want persist_pushed amended=[crit-b]\n%s", res.outcome, res.reason, res.amended, log.String())
+	}
+	sc := loadCommittedScenario(t, origin, res.headSHA, "issue-101/crit-b.yaml")
+	if sc.Steps != longSteps {
+		t.Errorf("re-record dropped the prior long steps recipe:\ngot  %q\nwant %q", sc.Steps, longSteps)
+	}
+	if sc.Assertions.ReproHandle != "curl-new" || sc.Assertions.Expected != "NEW expected" || sc.Assertions.ObservedAtRecord != "NEW observed" {
+		t.Errorf("new assertions must land: %+v", sc.Assertions)
+	}
+	if sc.Origin.RunID != "r1" || sc.Origin.HeadSHA != head || sc.Origin.PR != 742 {
+		t.Errorf("new origin must land: %+v", sc.Origin)
+	}
+	if sc.Statement != "the RESTATED criterion statement" { // condition 3
+		t.Errorf("new statement must land: %q", sc.Statement)
+	}
+	if sc.StepsCarriedFrom == "" || !strings.Contains(sc.StepsCarriedFrom, "abcdef0") { // condition 1
+		t.Errorf("steps_carried_from must disclose the prior origin: %q", sc.StepsCarriedFrom)
+	}
+	if !strings.Contains(log.String(), `"event":"acceptance_scenario_amended"`) || !strings.Contains(log.String(), `"steps_kept":"prior"`) {
+		t.Errorf("log missing amend event with steps_kept=prior:\n%s", log.String())
+	}
+	files := strings.Split(tgit(t, origin, "diff-tree", "--no-commit-id", "--name-only", "-r", res.headSHA), "\n")
+	for _, f := range files {
+		if f != "" && !strings.HasPrefix(f, "acceptance/scenarios/") {
+			t.Errorf("commit touches %s outside the corpus", f)
+		}
+	}
+	if body := tgit(t, origin, "log", "-1", "--format=%b", res.headSHA); !strings.Contains(body, "(amended: 1)") {
+		t.Errorf("commit body must record the amend count: %q", body)
+	}
+}
+
+// TestPersist_ReRecordTakesRicherNewSteps: when the new pass records a LONGER
+// genuine recipe, it wins and no disclosure is written (steps_kept=new).
+func TestPersist_ReRecordTakesRicherNewSteps(t *testing.T) {
+	_, tree, origin, head := persistRepo(t, map[string]string{
+		"issue-101/crit-b.yaml": reRecordCorpusFile("scenario:issue-101/crit-b", 101, 700,
+			"stmt", "GET /", "old-handle", "r0", "abcdef0", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)),
+	})
+	longSteps := strings.Repeat("a much richer new reproduction recipe with many steps. ", 4)
+	var log strings.Builder
+	res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{
+		treeDir: tree, runBranch: "fishhawk/run-r1", remoteURL: origin, issue: 101, prNumber: 742, headSHA: head, runID: "r1",
+		criteria: []upload.AcceptanceCriterionEntry{{ID: "crit-b", Statement: "stmt", Drivable: true}},
+		verdict:  []byte(`{"verdict":"passed","criteria":[{"id":"crit-b","result":"passed","observed":"o","expected":"e","steps_taken":"` + strings.TrimSpace(longSteps) + `"}]}`),
+	}, &gitops.Pusher{}, &log)
+	if res.outcome != persistPushed || len(res.amended) != 1 {
+		t.Fatalf("outcome=%s (%s) amended=%v\n%s", res.outcome, res.reason, res.amended, log.String())
+	}
+	sc := loadCommittedScenario(t, origin, res.headSHA, "issue-101/crit-b.yaml")
+	if sc.Steps != strings.TrimSpace(longSteps) || sc.StepsCarriedFrom != "" {
+		t.Errorf("richer new steps must win with no disclosure: steps=%q carried=%q", sc.Steps, sc.StepsCarriedFrom)
+	}
+	if !strings.Contains(log.String(), `"steps_kept":"new"`) {
+		t.Errorf("log must record steps_kept=new:\n%s", log.String())
+	}
+}
+
+// TestPersist_ReRecordOverUndecodablePriorReplaces: an undecodable prior corpus
+// file is REPLACED (today's behaviour), logged acceptance_scenario_amend_skipped
+// — failing closed would strand a corrupted scenario permanently.
+func TestPersist_ReRecordOverUndecodablePriorReplaces(t *testing.T) {
+	_, tree, origin, head := persistRepo(t, map[string]string{
+		"issue-101/crit-b.yaml": "id: scenario:issue-101/crit-b\nbogus_field: 1\n",
+	})
+	var log strings.Builder
+	res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{
+		treeDir: tree, runBranch: "fishhawk/run-r1", remoteURL: origin, issue: 101, prNumber: 742, headSHA: head, runID: "r1",
+		criteria: []upload.AcceptanceCriterionEntry{{ID: "crit-b", Statement: "s", Drivable: true}},
+		verdict:  passedVerdictFor("crit-b"),
+	}, &gitops.Pusher{}, &log)
+	if res.outcome != persistPushed || len(res.amended) != 0 {
+		t.Fatalf("outcome=%s (%s) amended=%v, want persist_pushed with no amend\n%s", res.outcome, res.reason, res.amended, log.String())
+	}
+	if !strings.Contains(log.String(), `"event":"acceptance_scenario_amend_skipped"`) {
+		t.Errorf("undecodable prior must log amend_skipped:\n%s", log.String())
+	}
+	sc := loadCommittedScenario(t, origin, res.headSHA, "issue-101/crit-b.yaml")
+	if sc.Steps != "GET /" || sc.Statement != "s" {
+		t.Errorf("undecodable prior must be replaced by the new record: %+v", sc)
+	}
+}
+
 // TestPersist_BestEffort: one case per non-pushed exit — each resolves to a
 // named outcome/reason and never panics or returns an error.
 func TestPersist_BestEffort(t *testing.T) {
