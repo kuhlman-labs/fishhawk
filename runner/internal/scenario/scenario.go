@@ -301,9 +301,11 @@ func Existing(dir, id string) (Scenario, bool, error) {
 // When the richer PRIOR steps are kept AND next carried GENUINE (non-fallback)
 // steps that were displaced, StepsCarriedFrom is set to disclose it — so a
 // reader of the file alone can tell the steps predate the Origin it now carries
-// (#3412 condition 1). A displaced-nothing keep (next was the fallback) sets no
-// disclosure. A chain preserves the ORIGINAL attribution: if prev already
-// carried a disclosure, it is kept rather than re-pointed at prev's own origin.
+// (#3412 condition 1). A displaced-nothing keep (next was the fallback) adds no
+// NEW disclosure — but a chain preserves the DEEPEST source, so prev's EXISTING
+// disclosure is carried forward whether or not next was the fallback: clearing
+// it on a fallback keep would strand prev's still-kept steps beside next's fresh
+// origin with no disclosure, the exact defect condition 1 targets.
 func Amend(prev, next Scenario) (Scenario, AmendReport) {
 	out := next
 	rep := AmendReport{StepsKept: "new"}
@@ -314,16 +316,17 @@ func Amend(prev, next Scenario) (Scenario, AmendReport) {
 	if !priorIsFallback && (newIsFallback || priorRicher) {
 		out.Steps = prev.Steps
 		rep.StepsKept = "prior"
-		out.StepsCarriedFrom = ""
-		if !newIsFallback {
-			// Genuine new steps were displaced by the richer prior steps —
-			// disclose the origin they came from. Preserve prev's own
-			// disclosure across a chain so the deepest source is named.
-			if prev.StepsCarriedFrom != "" {
-				out.StepsCarriedFrom = prev.StepsCarriedFrom
-			} else {
-				out.StepsCarriedFrom = carriedFromLabel(prev.Origin)
-			}
+		// A chain preserves the DEEPEST source, so prev's own disclosure is
+		// carried forward REGARDLESS of whether next was the fallback —
+		// clearing it on a fallback keep would strand prev's still-kept steps
+		// beside next's fresh origin with no disclosure (#3412 condition 1).
+		out.StepsCarriedFrom = prev.StepsCarriedFrom
+		if !newIsFallback && prev.StepsCarriedFrom == "" {
+			// Genuine new steps were displaced by the richer prior steps and
+			// prev disclosed nothing — synthesize the origin they came from.
+			// The fallback case adds no NEW disclosure (nothing was displaced
+			// this pass) but must not DELETE prev's existing one, above.
+			out.StepsCarriedFrom = carriedFromLabel(prev.Origin)
 		}
 	}
 

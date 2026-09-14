@@ -138,9 +138,12 @@ a record quietly wrong about itself. So `steps_carried_from` names the origin
 the kept steps came from (`head <sha> recorded_at <ts>`), and a reader of the
 file ALONE can tell the steps predate the origin (#3412). A chain preserves
 the DEEPEST source: a re-record over a file that already carries a disclosure
-keeps that disclosure rather than re-pointing it at the intermediate origin.
-No disclosure is written when `next`'s steps were the fallback (nothing was
-displaced) or when the new steps won. Pinned by `TestAmend` and, end to end
+keeps that disclosure rather than re-pointing it at the intermediate origin —
+and that hold is UNCONDITIONAL on `next` being the fallback. No NEW disclosure
+is synthesized when `next`'s steps were the fallback (nothing was displaced this
+pass) or when the new steps won, but a fallback keep still carries prev's
+EXISTING disclosure forward: clearing it would strand prev's kept steps beside
+`next`'s fresh origin with no disclosure (the chained-fallback gap). Pinned by `TestAmend` and, end to end
 through persist → git → bare origin, by
 `TestPersist_ReRecordAmendsPriorRecording` /
 `TestPersist_ReRecordTakesRicherNewSteps` /

@@ -681,6 +681,32 @@ func TestAmend(t *testing.T) {
 			t.Errorf("a chained re-record must keep the deepest disclosure: %q", out.StepsCarriedFrom)
 		}
 	})
+	t.Run("fallback next over disclosed prior preserves the disclosure", func(t *testing.T) {
+		// pass 3 of the chain: prev already discloses (pass-2 kept pass-1's
+		// steps over shorter genuine ones), and this pass records the fallback
+		// → steps are kept but the disclosure must NOT be dropped, else the
+		// file asserts pass-3's fresh origin beside steps predating head A with
+		// no disclosure (#3412 condition-1 chained-fallback gap).
+		p := prev(longSteps)
+		p.StepsCarriedFrom = "head ORIGINAL recorded_at 2025-01-01T00:00:00Z"
+		out, rep := Amend(p, next(StepsNotRecorded, Assertions{Expected: "e"}))
+		if rep.StepsKept != "prior" || out.Steps != longSteps {
+			t.Fatalf("a fallback re-record must keep genuine prior steps: kept=%s steps=%q", rep.StepsKept, out.Steps)
+		}
+		if out.StepsCarriedFrom != p.StepsCarriedFrom {
+			t.Errorf("a fallback keep must NOT delete prev's existing disclosure: %q", out.StepsCarriedFrom)
+		}
+	})
+	t.Run("displaced steps from a zero-origin prior disclose a generic label", func(t *testing.T) {
+		// prev has genuine steps but a HeadSHA-less, zero-time origin, so the
+		// synthesized disclosure falls back to the generic phrase.
+		p := prev(longSteps)
+		p.Origin = Origin{Issue: 101, RunID: "r0"}
+		out, _ := Amend(p, next(shortGenuine, Assertions{Expected: "e"}))
+		if out.StepsCarriedFrom != "an earlier recording" {
+			t.Errorf("zero-origin displaced steps must disclose the generic label, got %q", out.StepsCarriedFrom)
+		}
+	})
 }
 
 func TestExisting(t *testing.T) {
@@ -696,6 +722,10 @@ func TestExisting(t *testing.T) {
 	got, found, err := Existing(dir, "scenario:issue-101/crit-b")
 	if err != nil || !found || got.ID != want.ID || got.Path != "issue-101/crit-b.yaml" {
 		t.Fatalf("valid → loaded, got %+v found=%v err=%v", got, found, err)
+	}
+	// An id PathFor refuses (no prefix) → named error, not found.
+	if _, found, err := Existing(dir, "issue-101/crit-b"); err == nil || found || !strings.Contains(err.Error(), IDPrefix) {
+		t.Errorf("prefixless id → PathFor error, got found=%v err=%v", found, err)
 	}
 	// Malformed → named error.
 	writeFile(t, filepath.Join(dir, "issue-9", "bad.yaml"), "id: scenario:issue-9/bad\nbogus_field: 1\n")
