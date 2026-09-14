@@ -142,6 +142,17 @@ type config struct {
 	// declared paths; empty falls back to `git add -A`.
 	scopeFiles []upload.ScopeFile
 
+	// approvedAmendments is set at runtime (not a flag) by
+	// refreshScopeAmendments (#961): EVERY approved scope-amendment row the
+	// fold fetch read on this pass, including rows whose paths were already
+	// present in scopeFiles (a retry_stage after a late approval). Consumers
+	// that receive cfg BY VALUE after the fold — runVerifyFixLoop's fix
+	// prompt and the unused-grant check (#3390) — read it to name the
+	// authorizing amendment id and the operator's decision_reason per path;
+	// scopeFiles alone cannot tell a planned path from a granted one. nil
+	// when the fold did not run or fetched nothing.
+	approvedAmendments []upload.ScopeAmendment
+
 	// agentSelfRetry, maxRetriesSnapshot, and retryAttempt are set at
 	// runtime from the fetched prompt response (ADR-023). Not CLI flags.
 	// agentSelfRetry gates the retry loop; the other two compute the
