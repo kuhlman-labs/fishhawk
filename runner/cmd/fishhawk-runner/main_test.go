@@ -888,6 +888,8 @@ func TestClassifyErr(t *testing.T) {
 		{fmt.Errorf("wrapped: %w", agent.ErrAgentQuotaUnavailable), "agent_quota_unavailable"},
 		{agent.ErrTraceStreamRead, "trace_stream_read"},
 		{fmt.Errorf("wrapped: %w", agent.ErrTraceStreamRead), "trace_stream_read"},
+		{agent.ErrPromptTooLarge, "prompt_too_large"},
+		{fmt.Errorf("%w: prompt 5 bytes, argv 9 bytes (claude): fork/exec claude: argument list too long", agent.ErrPromptTooLarge), "prompt_too_large"},
 		{agent.ErrAgentFailed, "agent_failed"},
 		{fmt.Errorf("wrapped: %w", agent.ErrAgentFailed), "agent_failed"},
 		{errors.New("anything else"), "other"},
@@ -11993,9 +11995,14 @@ func TestRun_VerifyGateCommitted_InfraFlakeRetry_PassProceeds(t *testing.T) {
 // Gap-1/Gap-2 persistent case: EVERY fix re-invocation returns an infra error.
 // The loop must (a) hard-bound the fix-Invokes at maxFixInvokeInfraRetries per
 // iteration — total Invoke calls EXACTLY 1 (initial) + maxFixInvokeInfraRetries
-// — (b) route exhaustion through the non-blocking skip (verify_fix_skipped),
-// NOT category-A, (c) let the real push proceed, and (d) emit verify_summary
-// EXACTLY ONCE with outcome=skipped.
+// — (b) route exhaustion through the non-blocking reinvoke-exhausted path
+// (verify_fix_reinvoke_exhausted), NOT category-A and NOT the pre-commit
+// verify_fix_skipped path, (c) let the real push proceed, and (d) emit
+// verify_summary EXACTLY ONCE with outcome=failed carrying a detail that names
+// the re-invoke error (#3408): the verify verdict WAS reached and was red, so
+// the recorded outcome is authoritative, and terminalVerifyOutcome — the
+// runner-side consumer the backend prompt's binding rules read through — must
+// return "failed" for the shipped bundle.
 func TestRun_VerifyFixLoop_PersistentFixInvokeError_NonBlockingSkip(t *testing.T) {
 	repo := verifyFixBaseRepo(t)
 	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
@@ -12044,19 +12051,24 @@ func TestRun_VerifyFixLoop_PersistentFixInvokeError_NonBlockingSkip(t *testing.T
 	if invoker.callIdx != wantCalls {
 		t.Errorf("Invoke call count = %d, want %d (initial + maxFixInvokeInfraRetries)", invoker.callIdx, wantCalls)
 	}
-	// Exhaustion is a non-blocking skip, NEVER a category-A code failure.
+	// Exhaustion is non-blocking, NEVER a category-A code failure.
 	if strings.Contains(stderr.String(), `"category":"A"`) {
 		t.Errorf("fix-invoke infra exhaustion must NOT demote to category-A:\n%s", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "verify_fix_skipped") {
-		t.Errorf("expected verify_fix_skipped non-blocking skip:\n%s", stderr.String())
+	if !strings.Contains(stderr.String(), "verify_fix_reinvoke_exhausted") {
+		t.Errorf("expected verify_fix_reinvoke_exhausted log line:\n%s", stderr.String())
 	}
-	// The real push proceeds after the skip.
+	// The pre-commit infra skip is a DIFFERENT path (outcome=skipped); a red
+	// verify whose repair channel died must not be relabelled as it.
+	if strings.Contains(stderr.String(), "verify_fix_skipped") {
+		t.Errorf("re-invoke exhaustion must NOT emit verify_fix_skipped:\n%s", stderr.String())
+	}
+	// The real push proceeds after the exhaustion.
 	if fp.gotArgs == nil {
-		t.Error("CommitAndPush should run after a non-blocking verify-fix skip")
+		t.Error("CommitAndPush should run after a non-blocking verify-fix re-invoke exhaustion")
 	}
 	if fpr.gotArgs == nil {
-		t.Error("OpenPR should run after a non-blocking verify-fix skip")
+		t.Error("OpenPR should run after a non-blocking verify-fix re-invoke exhaustion")
 	}
 
 	events := readBundleEvents(t, bundlePath)
@@ -12076,14 +12088,53 @@ func TestRun_VerifyFixLoop_PersistentFixInvokeError_NonBlockingSkip(t *testing.T
 	if summaries != 1 {
 		t.Errorf("verify_summary event count = %d, want exactly 1", summaries)
 	}
-	assertVerifySummary(t, events, "skipped", 1, 1)
+	assertVerifySummary(t, events, "failed", 1, 1)
+	detail := verifySummaryDetail(t, events)
+	if !strings.Contains(detail, "fix re-invocation failed") || !strings.Contains(detail, agent.ErrAgentFailed.Error()) {
+		t.Errorf("verify_summary detail = %q, want it to name the re-invoke error %q", detail, agent.ErrAgentFailed.Error())
+	}
+	// The consumer the backend's binding rules read through must see the
+	// determinate outcome, not just the emitted event.
+	if got := terminalVerifyOutcome(bundleLinesToEvents(events)); got != "failed" {
+		t.Errorf("terminalVerifyOutcome(bundle) = %q, want failed", got)
+	}
+}
+
+// verifySummaryDetail returns the detail field of the bundle's verify_summary
+// event ("" when absent).
+func verifySummaryDetail(t *testing.T, events []bundle.Line) string {
+	t.Helper()
+	for _, ev := range events {
+		if ev.Kind != "verify_summary" {
+			continue
+		}
+		var got struct {
+			Detail string `json:"detail"`
+		}
+		if err := json.Unmarshal(ev.Data, &got); err != nil {
+			t.Fatalf("verify_summary payload unmarshal: %v (%s)", err, ev.Data)
+		}
+		return got.Detail
+	}
+	t.Fatalf("no verify_summary event in bundle:\n%+v", events)
+	return ""
+}
+
+// bundleLinesToEvents re-shapes shipped bundle lines into the agent.Event form
+// the runner-side consumers (terminalVerifyOutcome) read.
+func bundleLinesToEvents(lines []bundle.Line) []agent.Event {
+	out := make([]agent.Event, 0, len(lines))
+	for _, l := range lines {
+		out = append(out, agent.Event{Kind: l.Kind, Payload: l.Data})
+	}
+	return out
 }
 
 // TestRun_VerifyFixLoop_InfraExhaustedReinvoke_ReemitsIdenticalDiff is the #870
 // advisory-review binding-condition test for the infra-retry-exhausted reinvoke
 // path: the loop set reinvoked=true (it reached the reinvoke block) but every
-// fix-Invoke errored, so it exits via the non-blocking skip with res.OK still
-// true. The post-loop gate (res.OK && implement && !noPR && reinvoked &&
+// fix-Invoke errored, so it exits via the non-blocking reinvoke-exhausted path
+// (#3408: outcome=failed, not skipped) with res.OK still true. The post-loop gate (res.OK && implement && !noPR && reinvoked &&
 // checkBaseRef) therefore still calls reemitScopedGitDiff. This path is HARMLESS
 // and intentional: the failed agent never rewrote the tree, so StageScoped
 // produces an identical scope-only diff and last-write-wins == first-write-wins.
@@ -12128,8 +12179,8 @@ func TestRun_VerifyFixLoop_InfraExhaustedReinvoke_ReemitsIdenticalDiff(t *testin
 	if got := run(args, &stderr); got != exitOK {
 		t.Fatalf("run = %d, want exitOK (non-blocking skip):\n%s", got, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "verify_fix_skipped") {
-		t.Fatalf("expected verify_fix_skipped non-blocking skip:\n%s", stderr.String())
+	if !strings.Contains(stderr.String(), "verify_fix_reinvoke_exhausted") {
+		t.Fatalf("expected verify_fix_reinvoke_exhausted non-blocking exhaustion:\n%s", stderr.String())
 	}
 
 	patches := gitDiffPatches(t, readBundleEvents(t, bundlePath))
@@ -14571,6 +14622,241 @@ func TestRunVerifyFixLoop_ExhaustionReturnsEmptyTree(t *testing.T) {
 	}
 	if res.OK || res.FailureCategory != "A" {
 		t.Errorf("exhaustion must demote to category-A; OK=%t category=%q", res.OK, res.FailureCategory)
+	}
+}
+
+// TestBoundVerifyFixOutput pins the pure head+tail bound (#3408): unchanged
+// at or under the limit, and over it an explicit marker naming the exact
+// elided byte count between a line-snapped head and tail.
+func TestBoundVerifyFixOutput(t *testing.T) {
+	const head, tail = verifyFixOutputHeadBytes, verifyFixOutputTailBytes
+	line := func(n int, ch byte) string { return strings.Repeat(string(ch), n-1) + "\n" }
+
+	t.Run("under limit unchanged", func(t *testing.T) {
+		in := "ok\nFAIL\n"
+		got, elided := boundVerifyFixOutput(in)
+		if got != in || elided != 0 {
+			t.Errorf("got (%q, %d), want (%q, 0)", got, elided, in)
+		}
+	})
+	t.Run("exactly head+tail unchanged", func(t *testing.T) {
+		in := strings.Repeat("y", head+tail)
+		got, elided := boundVerifyFixOutput(in)
+		if got != in || elided != 0 {
+			t.Errorf("len(got)=%d elided=%d, want unchanged input, 0", len(got), elided)
+		}
+	})
+	t.Run("over limit snaps to line boundaries", func(t *testing.T) {
+		// 100-byte lines: the head window ends mid-line, as does the tail
+		// window's start, so both must snap to a '\n'.
+		var b strings.Builder
+		for i := 0; b.Len() < 300<<10; i++ {
+			b.WriteString(line(100, byte('a'+i%26)))
+		}
+		in := b.String() + "FAIL marker-tail\n"
+		got, elided := boundVerifyFixOutput(in)
+		if elided <= 0 {
+			t.Fatalf("elided = %d, want > 0", elided)
+		}
+		marker := fmt.Sprintf("[... %d bytes of verify output elided here", elided)
+		if !strings.Contains(got, marker) {
+			t.Errorf("excerpt lacks marker %q:\n%.300s", marker, got)
+		}
+		if !strings.HasPrefix(got, in[:100]) {
+			t.Error("excerpt must start with the head of the input")
+		}
+		if !strings.HasSuffix(got, "FAIL marker-tail\n") {
+			t.Error("excerpt must end with the tail of the input")
+		}
+		if len(got) > head+tail+len(marker)+200 {
+			t.Errorf("len(excerpt) = %d, want <= head+tail+marker", len(got))
+		}
+		// Line snapping: the byte before the marker is a newline and the marker
+		// line itself ends in one, so neither window cuts a line in half.
+		mi := strings.Index(got, marker)
+		if got[mi-1] != '\n' {
+			t.Errorf("head window must end on a line boundary, got byte %q before the marker", got[mi-1])
+		}
+		// The elided count is exact: head + elided + tail == len(in).
+		headKept := mi
+		tailKept := len(got) - (mi + strings.Index(got[mi:], "...]\n") + len("...]\n"))
+		if headKept+elided+tailKept != len(in) {
+			t.Errorf("head %d + elided %d + tail %d = %d, want len(in) %d", headKept, elided, tailKept, headKept+elided+tailKept, len(in))
+		}
+		if headKept > head || tailKept > tail {
+			t.Errorf("head kept %d (max %d), tail kept %d (max %d)", headKept, head, tailKept, tail)
+		}
+	})
+	t.Run("no newline keeps raw byte windows", func(t *testing.T) {
+		in := strings.Repeat("z", head+tail+1000)
+		got, elided := boundVerifyFixOutput(in)
+		if elided != 1000 {
+			t.Errorf("elided = %d, want 1000", elided)
+		}
+		if !strings.HasPrefix(got, in[:head]) {
+			t.Error("head window must be the raw first head bytes when no newline exists")
+		}
+		if !strings.HasSuffix(got, in[len(in)-tail:]) {
+			t.Error("tail window must be the raw last tail bytes when no newline exists")
+		}
+		if !strings.Contains(got, "[... 1000 bytes of verify output elided here") {
+			t.Errorf("excerpt lacks the marker:\n%.200s", got)
+		}
+	})
+}
+
+// TestRunVerifyFixLoop_FixPromptBounded drives the REAL loop against a verify
+// command emitting ~300 KiB then failing (#3408). The fix prompt handed to the
+// agent must be bounded (< 128 KiB, the Linux per-argument limit), carry the
+// elision marker, still end with the tail failure line, and the
+// verify_fix_reinvoke log line must report the elided byte count.
+func TestRunVerifyFixLoop_FixPromptBounded(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, `head -c 300000 /dev/zero | tr '\0' x; echo; echo 'FAIL marker-tail'; exit 1`)
+	cfg.verifyMaxIterations = 1
+	res := agent.Result{OK: true}
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	var logSink strings.Builder
+	if _, _, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink); err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if invoker.gotInv == nil {
+		t.Fatalf("no fix re-invoke captured\n%s", logSink.String())
+	}
+	prompt := invoker.gotInv.Prompt
+	if len(prompt) >= 128<<10 {
+		t.Errorf("fix prompt is %d bytes, want < 128 KiB (Linux MAX_ARG_STRLEN)", len(prompt))
+	}
+	if !strings.Contains(prompt, "bytes of verify output elided here") {
+		t.Errorf("fix prompt lacks the elision marker:\n%.400s", prompt)
+	}
+	if !strings.Contains(prompt, "FAIL marker-tail") {
+		t.Error("fix prompt must keep the tail failure line")
+	}
+	var elided int
+	for _, ln := range strings.Split(logSink.String(), "\n") {
+		if !strings.Contains(ln, `"event":"verify_fix_reinvoke"`) {
+			continue
+		}
+		var got struct {
+			PromptBytes int `json:"prompt_bytes"`
+			OutputBytes int `json:"output_bytes"`
+			Elided      int `json:"output_elided_bytes"`
+		}
+		if err := json.Unmarshal([]byte(ln), &got); err != nil {
+			t.Fatalf("verify_fix_reinvoke unmarshal: %v (%s)", err, ln)
+		}
+		elided = got.Elided
+		if got.PromptBytes != len(prompt) || got.OutputBytes < 300000 {
+			t.Errorf("verify_fix_reinvoke = %+v, want prompt_bytes=%d output_bytes>=300000", got, len(prompt))
+		}
+	}
+	if elided <= 0 {
+		t.Errorf("verify_fix_reinvoke output_elided_bytes = %d, want > 0:\n%s", elided, logSink.String())
+	}
+}
+
+// TestRunVerifyFixLoop_PromptTooLargeNotRetried pins the deterministic no-retry
+// (#3408): an ErrPromptTooLarge from the fix re-invoke is spent ONCE, not
+// maxFixInvokeInfraRetries times, and the summary records outcome=failed with a
+// detail naming the sentinel.
+func TestRunVerifyFixLoop_PromptTooLargeNotRetried(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, "false")
+	cfg.verifyMaxIterations = 1
+	res := agent.Result{OK: true}
+	invoker := &fakeInvoker{
+		cannedSeq: []agent.Result{{}},
+		errSeq:    []error{fmt.Errorf("x: %w", agent.ErrPromptTooLarge)},
+	}
+	var logSink strings.Builder
+	_, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if tree != "" {
+		t.Errorf("verified tree = %q, want empty (no pass)", tree)
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (deterministic E2BIG must not be retried; maxFixInvokeInfraRetries=%d)", invoker.callIdx, maxFixInvokeInfraRetries)
+	}
+	if !res.OK || res.FailureCategory != "" {
+		t.Errorf("exhaustion must stay non-blocking: OK=%t category=%q", res.OK, res.FailureCategory)
+	}
+	reinvokeErrs := 0
+	var summary map[string]any
+	for _, ev := range res.Events {
+		switch ev.Kind {
+		case "verify_fix_reinvoke_error":
+			reinvokeErrs++
+		case "verify_summary":
+			if err := json.Unmarshal(ev.Payload, &summary); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if reinvokeErrs != 1 {
+		t.Errorf("verify_fix_reinvoke_error events = %d, want exactly 1", reinvokeErrs)
+	}
+	if summary == nil {
+		t.Fatal("no verify_summary event")
+	}
+	if summary["outcome"] != "failed" {
+		t.Errorf("verify_summary outcome = %v, want failed", summary["outcome"])
+	}
+	detail, _ := summary["detail"].(string)
+	if !strings.Contains(detail, agent.ErrPromptTooLarge.Error()) || !strings.Contains(detail, "after 1 attempt(s)") {
+		t.Errorf("verify_summary detail = %q, want it to name %q after 1 attempt(s)", detail, agent.ErrPromptTooLarge.Error())
+	}
+	if !strings.Contains(logSink.String(), "verify_fix_reinvoke_exhausted") || strings.Contains(logSink.String(), "verify_fix_skipped") {
+		t.Errorf("want verify_fix_reinvoke_exhausted and no verify_fix_skipped:\n%s", logSink.String())
+	}
+}
+
+// TestRunVerifyFixLoop_PreCommitInfraSkipStaysSkipped is the CONTROL that the
+// two non-blocking paths are distinct after #3408: a PRE-commit infra failure
+// (a non-git working dir, so StageScoped fails before any verify runs) still
+// records verify_summary outcome=skipped + verify_fix_skipped — no verdict was
+// reached — and never the re-invoke-exhausted outcome=failed path.
+func TestRunVerifyFixLoop_PreCommitInfraSkipStaysSkipped(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	cfg := config{
+		workingDir:          t.TempDir(), // not a git repo → StageScoped errors
+		verifyCmd:           "true",
+		verifyMaxIterations: 1,
+		scopeFiles:          []upload.ScopeFile{{Path: "a.txt", Operation: "modify"}},
+	}
+	res := agent.Result{OK: true}
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	var logSink strings.Builder
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("pre-commit infra error must be non-blocking, got %v\n%s", err, logSink.String())
+	}
+	if reinvoked || invoker.callIdx != 0 || tree != "" {
+		t.Errorf("reinvoked=%t calls=%d tree=%q, want false/0/\"\" (no verify ran)", reinvoked, invoker.callIdx, tree)
+	}
+	if !res.OK || res.FailureCategory != "" {
+		t.Errorf("skip must not demote: OK=%t category=%q", res.OK, res.FailureCategory)
+	}
+	var summary map[string]any
+	for _, ev := range res.Events {
+		if ev.Kind == "verify_summary" {
+			if err := json.Unmarshal(ev.Payload, &summary); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if summary == nil || summary["outcome"] != "skipped" {
+		t.Errorf("verify_summary = %v, want outcome skipped", summary)
+	}
+	if detail, _ := summary["detail"].(string); !strings.Contains(detail, "stage scoped") {
+		t.Errorf("verify_summary detail = %q, want the stage-scoped infra error", detail)
+	}
+	if !strings.Contains(logSink.String(), "verify_fix_skipped") || strings.Contains(logSink.String(), "verify_fix_reinvoke_exhausted") {
+		t.Errorf("want verify_fix_skipped and no verify_fix_reinvoke_exhausted:\n%s", logSink.String())
 	}
 }
 

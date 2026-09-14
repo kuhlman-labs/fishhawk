@@ -416,6 +416,15 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 				"binary_not_found",
 			), false, agent.ErrBinaryNotFound
 		}
+		// E2BIG: the prompt travels as ONE argv string (`-p <prompt>`), so a
+		// prompt past the OS argument-size limit dies here before the agent
+		// runs (#3408). Name the cause with byte counts rather than leaking a
+		// raw fork/exec string; the sentinel is deterministic, so the
+		// thinking-block retry below never re-spends it.
+		if agent.IsArgListTooLong(err) {
+			return res, false, fmt.Errorf("%w: prompt %d bytes, argv %d bytes (%s): %v",
+				agent.ErrPromptTooLarge, len(inv.Prompt), agent.ArgvBytes(append([]string{binary}, args...)), binary, err)
+		}
 		return res, false, fmt.Errorf("claudecode: start: %w", err)
 	}
 

@@ -169,6 +169,22 @@ func helperCommand(mode string) func(ctx context.Context, name string, args ...s
 	}
 }
 
+// forwardingHelperCommand re-execs the test binary as the `codex` stand-in
+// AND forwards the adapter's real argv after the -test.run selector. The other
+// helpers drop the adapter's args, so no test built on them can reach the OS
+// argument-size limit; this one carries the prompt through to execve so the
+// E2BIG classification (#3408) is exercised against a REAL spawn.
+func forwardingHelperCommand(mode string) func(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		c := exec.CommandContext(ctx, os.Args[0], append([]string{"-test.run=TestHelperProcess"}, args...)...)
+		c.Env = append(os.Environ(),
+			"GO_HELPER_PROCESS=1",
+			"HELPER_MODE="+mode,
+		)
+		return c
+	}
+}
+
 // capturingHelperCommand wraps the "happy" helper process but records the argv
 // it was built with into *captured, so a test can assert the presence or
 // absence of the --model flag (#1013).
@@ -1002,5 +1018,41 @@ func TestCodex_TraceStreamReadErrorIsNotAgentFailed(t *testing.T) {
 	}
 	if res.FailureCategory != "A" {
 		t.Errorf("FailureCategory = %q, want A (retained)", res.FailureCategory)
+	}
+}
+
+// TestInvoke_PromptTooLarge_NamedSentinel performs a REAL spawn with a 4 MiB
+// single-argument prompt (#3408). That exceeds Linux's per-string
+// MAX_ARG_STRLEN (32 pages — 128 KiB on 4 KiB pages, still under 4 MiB at a
+// 64 KiB page size) and macOS's kern.argmax total (1 MiB), so fork/exec fails
+// with E2BIG on every CI host. The adapter must surface it as the named
+// agent.ErrPromptTooLarge carrying the prompt byte count, never a raw
+// fork/exec string, and must emit nothing beyond invocation_start.
+func TestInvoke_PromptTooLarge_NamedSentinel(t *testing.T) {
+	prompt := strings.Repeat("x", 4<<20)
+	inv := &Invoker{
+		Cmd: forwardingHelperCommand("happy"),
+		Now: frozenNow(),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: prompt})
+	if err == nil {
+		t.Fatal("Invoke succeeded with a 4 MiB argv prompt; expected the OS to refuse the spawn with E2BIG")
+	}
+	if !errors.Is(err, agent.ErrPromptTooLarge) {
+		t.Fatalf("err = %v, want errors.Is(err, agent.ErrPromptTooLarge)", err)
+	}
+	if want := fmt.Sprintf("prompt %d bytes", len(prompt)); !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %q, want it to name %q", err.Error(), want)
+	}
+	if !strings.Contains(err.Error(), "argv ") {
+		t.Errorf("err = %q, want it to name the argv byte count", err.Error())
+	}
+	if errors.Is(err, agent.ErrAgentFailed) {
+		t.Errorf("err = %v must not wrap ErrAgentFailed (peer sentinel)", err)
+	}
+	for _, ev := range res.Events {
+		if ev.Kind != "invocation_start" {
+			t.Errorf("unexpected event %q after a refused spawn", ev.Kind)
+		}
 	}
 }

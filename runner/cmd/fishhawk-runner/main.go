@@ -3388,6 +3388,10 @@ func classifyErr(err error) string {
 		return "external_api"
 	case errors.Is(err, agent.ErrAgentQuotaUnavailable):
 		return "agent_quota_unavailable"
+	case errors.Is(err, agent.ErrPromptTooLarge):
+		// The OS refused the spawn with E2BIG (#3408): a peer sentinel that
+		// does not wrap ErrAgentFailed, labelled by its cause.
+		return "prompt_too_large"
 	case errors.Is(err, agent.ErrTraceStreamRead):
 		// Placed BEFORE the ErrAgentFailed arm defensively — the sentinel is a
 		// peer that does not wrap ErrAgentFailed (agent_test pins that), so the
@@ -4294,8 +4298,13 @@ func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, e
 // runVerifyFixLoop call is therefore O(verifyMaxIterations * maxFixInvokeInfraRetries)
 // — finite. A transient blip here must not advance the outer iteration counter
 // (the verify that consumed this iteration already ran and was counted), so a
-// retry does not burn a fix-loop budget unit. Exhausting all attempts routes to
-// the existing non-blocking skip path (verify_fix_skipped), never category-A.
+// retry does not burn a fix-loop budget unit. Exhausting all attempts records
+// verify_summary outcome=failed with the re-invoke error as detail and proceeds
+// to the push non-blocking (verify_fix_reinvoke_exhausted, #3408) — the verify
+// verdict WAS reached and was red; only the repair channel is gone — never
+// category-A. A deterministic ErrPromptTooLarge (E2BIG) is not retried at all:
+// the second in-place attempt would fail identically, so the loop breaks after
+// the first.
 const maxFixInvokeInfraRetries = 2
 
 // pushFailureCategory maps a failed implement push to its MVP_SPEC §6 failure
@@ -4692,8 +4701,14 @@ func verifyFailureExcerpt(out string) string {
 //
 //   - A PRE-commit infra error (StageScoped / commitVerifyWIP / commit produced
 //     nothing) left HEAD untouched, so it routes through the NON-BLOCKING skip
-//     path (verify_fix_skipped, nil return) — never invent a failure from gate
-//     plumbing; the real push runs its own #728/#800 gate.
+//     path (verify_fix_skipped, nil return, outcome=skipped) — never invent a
+//     failure from gate plumbing; the real push runs its own #728/#800 gate.
+//   - A fix RE-INVOKE that fails after every in-place attempt (#804, #3408) is
+//     also non-blocking (verify_fix_reinvoke_exhausted, nil return) — but the
+//     verify verdict on the committed tree WAS reached and was red, so the
+//     summary records outcome=failed with the re-invoke error as detail, not
+//     the indeterminate "skipped" the pre-commit path uses. The implement
+//     review then reads an authoritative failed outcome.
 //   - A POST-commit gitResetSoftHEAD1 failure is FATAL, not a skip. Once the
 //     throwaway commit is materialized, a failed undo leaves HEAD on the
 //     throwaway commit, so openPRAndShipArtifact's real CommitAndPush would
@@ -4746,7 +4761,8 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		attempts        int
 		lastOutput      string
 		verifiedTreeSHA string // set only on a passing iteration's real verify (#960)
-		lastIterErr     error  // non-nil only on a PRE-commit infra failure → non-blocking skip
+		lastIterErr     error  // non-nil only on a PRE-commit infra failure → non-blocking skip (outcome=skipped)
+		reinvokeErr     error  // non-nil when every fix re-invoke attempt failed → non-blocking, outcome=failed (#3408)
 		fatalErr        error  // non-nil on a POST-commit reset failure (#816) or a passed-but-unresolvable verified tree (#960) → hard abort
 		flakeRetried    bool   // once-per-stage testcontainers infra-flake absorb (#972) already spent
 		autoformatted   bool   // once-per-stage gofmt/goimports auto-format absorb (#3316) already spent
@@ -4976,11 +4992,16 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		// verify output. The agent edits the same repoDir working tree; the
 		// next iteration re-commits scope-only onto the same base.
 		reinvoked = true
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"verify_fix_reinvoke","run_id":%q,"stage_id":%q,"iteration":%d}`+"\n",
-			cfg.runID, cfg.stageID, iter+1)
 		fixInv := baseInv
-		fixInv.Prompt = verifyFixPrompt(cfg.verifyCmd, out)
+		// The embedded verify output is BOUNDED (#3408): the adapters pass the
+		// whole prompt as one argv string, so an unbounded CombinedOutput can
+		// push the spawn past the OS argument-size limit (E2BIG). The full
+		// output remains on the verify_run trace event.
+		var elided int
+		fixInv.Prompt, elided = verifyFixPrompt(cfg.verifyCmd, out)
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"verify_fix_reinvoke","run_id":%q,"stage_id":%q,"iteration":%d,"prompt_bytes":%d,"output_bytes":%d,"output_elided_bytes":%d}`+"\n",
+			cfg.runID, cfg.stageID, iter+1, len(fixInv.Prompt), len(out), elided)
 
 		// Bounded infra-retry on the fix re-invocation (#804). A transient
 		// agent-API/transport failure (invoker.Invoke returns a non-nil error,
@@ -4991,14 +5012,18 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		// silently swallowed: each failed attempt emits a verify_fix_reinvoke_error
 		// log line AND an auditable trace event on res.Events. Only a SUCCESSFUL
 		// invoke (fixErr == nil) contributes events/tokens/model to res; an errored
-		// zero-value fixRes contributes nothing. Exhausting all attempts is an
-		// infra failure that aborts the loop into the non-blocking skip path
-		// below (verify_fix_skipped), never a category-A code failure.
+		// zero-value fixRes contributes nothing. Exhausting all attempts aborts
+		// the loop into the non-blocking reinvoke-exhausted path below
+		// (verify_fix_reinvoke_exhausted, outcome=failed), never a category-A
+		// code failure. A deterministic ErrPromptTooLarge (E2BIG, #3408) breaks
+		// after its first attempt: the same prompt would fail identically.
 		var (
-			fixRes agent.Result
-			fixErr error
+			fixRes       agent.Result
+			fixErr       error
+			attemptsMade int
 		)
 		for attempt := 1; attempt <= maxFixInvokeInfraRetries; attempt++ {
+			attemptsMade = attempt
 			fixRes, fixErr = invoker.Invoke(ctx, fixInv)
 			if fixErr == nil {
 				break
@@ -5014,13 +5039,17 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 					"detail":    fixErr.Error(),
 				}),
 			})
+			if errors.Is(fixErr, agent.ErrPromptTooLarge) {
+				break
+			}
 		}
 		if fixErr != nil {
-			// Every fix-Invoke attempt for this iteration failed on infra. Route
-			// through the existing non-blocking skip — the verify already ran and
-			// was counted; the iteration counter is NOT advanced.
-			lastIterErr = fmt.Errorf("verify-fix: fix re-invocation failed after %d attempts: %w",
-				maxFixInvokeInfraRetries, fixErr)
+			// Every fix-Invoke attempt for this iteration failed. The verify
+			// already ran and was counted (red), so this is recorded as
+			// outcome=failed with the re-invoke error as detail; the iteration
+			// counter is NOT advanced and the stage still proceeds to push.
+			reinvokeErr = fmt.Errorf("verify-fix: committed tree failed verify and the fix re-invocation failed after %d attempt(s): %w",
+				attemptsMade, fixErr)
 			break
 		}
 		res.Events = append(res.Events, fixRes.Events...)
@@ -5042,7 +5071,10 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 	// stage hard, so it is "failed" (carrying the abort detail) and returns a
 	// hard error; a PRE-commit infra abort short-circuits into the non-blocking
 	// skip below, so it is "skipped" (carrying the abort detail), NOT "failed" —
-	// the old `if !passed` form mislabelled the errored-exit path as failed.
+	// the old `if !passed` form mislabelled the errored-exit path as failed. A
+	// fix re-invoke exhausted after a red verify is "failed" WITH a detail
+	// naming the re-invoke error (#3408): the verdict was reached, so the
+	// review must not read it as the indeterminate "skipped".
 	summary := map[string]any{
 		"iterations":     attempts,
 		"max_iterations": cfg.verifyMaxIterations,
@@ -5051,6 +5083,9 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 	case fatalErr != nil:
 		summary["outcome"] = "failed"
 		summary["detail"] = fatalErr.Error()
+	case reinvokeErr != nil:
+		summary["outcome"] = "failed"
+		summary["detail"] = reinvokeErr.Error()
 	case lastIterErr != nil:
 		summary["outcome"] = "skipped"
 		summary["detail"] = lastIterErr.Error()
@@ -5070,6 +5105,17 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		// Abort the stage hard — the call site demotes to category-B so the real
 		// push never ships an unverified or throwaway-stacked commit.
 		return reinvoked, "", fatalErr
+	}
+
+	if reinvokeErr != nil {
+		// Every fix re-invoke attempt failed after a red verify (#804, #3408).
+		// Non-blocking: the stage proceeds to the real push and the implement
+		// review reads the authoritative outcome=failed recorded above, exactly
+		// the #804 flow minus the "skipped" mislabel.
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"verify_fix_reinvoke_exhausted","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, reinvokeErr.Error())
+		return reinvoked, "", nil
 	}
 
 	if lastIterErr != nil {
@@ -5251,11 +5297,52 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	return events, verifiedTreeSHA, nil
 }
 
+// verifyFixOutputHeadBytes / verifyFixOutputTailBytes bound the verify output
+// embedded in the fix prompt (#3408). Both adapters pass the whole prompt to
+// the agent as ONE argv string, and Linux caps a single execve argument at
+// MAX_ARG_STRLEN (32 pages, 128 KiB on 4 KiB pages) while macOS caps the total
+// argv+envp at kern.argmax (1 MiB). A 64 KiB excerpt keeps the fix prompt under
+// the Linux per-string limit with margin. The head keeps a lint-first abort
+// (verify runs lint first and stops on it); the tail keeps the `--- FAIL` /
+// `FAIL pkg` lines. The full output stays on the verify_run trace event.
+const (
+	verifyFixOutputHeadBytes = 16 << 10
+	verifyFixOutputTailBytes = 48 << 10
+)
+
+// boundVerifyFixOutput returns out unchanged (elided=0) when it fits within
+// head+tail bytes; otherwise the first head bytes and the last tail bytes,
+// each snapped to a line boundary inside its window when one exists, joined by
+// an explicit marker line naming the elided byte count. A window with no
+// newline keeps its raw byte slice so the bound holds regardless of content.
+func boundVerifyFixOutput(out string) (excerpt string, elided int) {
+	const head, tail = verifyFixOutputHeadBytes, verifyFixOutputTailBytes
+	if len(out) <= head+tail {
+		return out, 0
+	}
+	headEnd := head
+	if i := strings.LastIndexByte(out[:head], '\n'); i >= 0 {
+		headEnd = i + 1
+	}
+	tailStart := len(out) - tail
+	if i := strings.IndexByte(out[tailStart:], '\n'); i >= 0 {
+		tailStart += i + 1
+	}
+	elided = tailStart - headEnd
+	marker := fmt.Sprintf("[... %d bytes of verify output elided here so the fix prompt fits the OS argument-size limit; the first %d and last %d bytes are kept — re-run the command yourself for the full output ...]\n",
+		elided, headEnd, len(out)-tailStart)
+	return out[:headEnd] + marker + out[tailStart:], elided
+}
+
 // verifyFixPrompt builds the fix-iteration prompt fed back to the agent when
 // the committed-tree verify command fails. It embeds the failing command and
-// its captured output and instructs the agent to make the tests pass without
-// relying on files outside the approved scope.
-func verifyFixPrompt(verifyCmd, output string) string {
+// its captured output — BOUNDED through boundVerifyFixOutput so no caller can
+// build a fix prompt the OS refuses to spawn (#3408) — and instructs the agent
+// to make the tests pass without relying on files outside the approved scope.
+// It returns the prompt and the number of output bytes elided (0 when the
+// output fit).
+func verifyFixPrompt(verifyCmd, output string) (prompt string, elidedBytes int) {
+	excerpt, elided := boundVerifyFixOutput(output)
 	return fmt.Sprintf(`The verify command failed against the committed scope-only tree.
 
 Command:
@@ -5268,7 +5355,7 @@ Edit the code so this command passes. The fix must live in the files you are
 already allowed to change (the approved scope) — a change that only works
 because of an out-of-scope file will be dropped when the commit is scoped and
 will fail verification again. Make the smallest change that turns the command
-green.`, verifyCmd, output)
+green.`, verifyCmd, excerpt), elided
 }
 
 // baseRebaseConflictPrompt builds the re-invoke prompt fed to the agent when

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -323,7 +324,41 @@ var (
 	// stage retryability and the bundle signal are unchanged — only the label
 	// moves off the agent.
 	ErrTraceStreamRead = errors.New("agent: trace stream read failed")
+
+	// ErrPromptTooLarge marks a spawn that the OS refused with E2BIG
+	// ("argument list too long"): every adapter hands the whole prompt to the
+	// child as ONE argv string, so a prompt past the per-string (Linux
+	// MAX_ARG_STRLEN, 128 KiB) or total (macOS kern.argmax, 1 MiB) execve
+	// limit dies at fork/exec before the agent sees a byte (#3408). Like the
+	// sentinels above it is a PEER and does NOT wrap ErrAgentFailed, so
+	// err_class classification stays unambiguous (prompt_too_large). It is
+	// DETERMINISTIC — the same prompt fails the same way every time — so it is
+	// never retried in-driver and the verify-fix loop does not spend its
+	// second in-place attempt on it. Adapters wrap it with the prompt and
+	// argv byte counts (ArgvBytes) so the cause is named, never a raw
+	// fork/exec string.
+	ErrPromptTooLarge = errors.New("agent: prompt exceeds the OS argument-size limit")
 )
+
+// ArgvBytes returns the execve accounting size of args: the length of each
+// string plus its NUL terminator. It is the number an E2BIG diagnostic should
+// name alongside the prompt length, so the operator sees how far past the OS
+// limit the spawn was.
+func ArgvBytes(args []string) int {
+	n := 0
+	for _, a := range args {
+		n += len(a) + 1
+	}
+	return n
+}
+
+// IsArgListTooLong reports whether err is the OS E2BIG spawn refusal.
+// exec.Cmd.Start surfaces it as *fs.PathError{Op: "fork/exec"} wrapping a
+// syscall.Errno, and errors.Is unwraps through PathError, so the test is a
+// single errors.Is against syscall.E2BIG.
+func IsArgListTooLong(err error) bool {
+	return errors.Is(err, syscall.E2BIG)
+}
 
 // MakePayload marshals v to a json.RawMessage or panics. Helper for
 // adapters; payloads are constructed from typed Go values whose

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"reflect"
+	"syscall"
 	"testing"
 )
 
@@ -143,6 +145,15 @@ func TestErrors_AreDistinct(t *testing.T) {
 		{ErrTraceStreamRead, ErrLoopDetected},
 		{ErrTraceStreamRead, ErrExternalAPI},
 		{ErrTraceStreamRead, ErrAgentQuotaUnavailable},
+		{ErrPromptTooLarge, ErrAgentFailed},
+		{ErrPromptTooLarge, ErrBudgetExceeded},
+		{ErrPromptTooLarge, ErrTimeout},
+		{ErrPromptTooLarge, ErrBinaryNotFound},
+		{ErrPromptTooLarge, ErrAgentThinkingBlock},
+		{ErrPromptTooLarge, ErrLoopDetected},
+		{ErrPromptTooLarge, ErrExternalAPI},
+		{ErrPromptTooLarge, ErrAgentQuotaUnavailable},
+		{ErrPromptTooLarge, ErrTraceStreamRead},
 	}
 	for _, p := range pairs {
 		if errors.Is(p.a, p.b) {
@@ -170,5 +181,65 @@ func TestAgentSentinels_TraceStreamReadIsPeer(t *testing.T) {
 	}
 	if errors.Is(wrapped, ErrAgentFailed) {
 		t.Error("wrapped ErrTraceStreamRead matched ErrAgentFailed, want false")
+	}
+}
+
+// TestAgentSentinels_PromptTooLargeIsPeer pins that ErrPromptTooLarge (#3408)
+// is a PEER of ErrAgentFailed in both directions, so classifyErr labels it
+// prompt_too_large rather than agent_failed, and that a wrapped instance is
+// still recognised.
+func TestAgentSentinels_PromptTooLargeIsPeer(t *testing.T) {
+	if errors.Is(ErrPromptTooLarge, ErrAgentFailed) {
+		t.Error("errors.Is(ErrPromptTooLarge, ErrAgentFailed) = true, want false (peer, not wrapper)")
+	}
+	if errors.Is(ErrAgentFailed, ErrPromptTooLarge) {
+		t.Error("errors.Is(ErrAgentFailed, ErrPromptTooLarge) = true, want false")
+	}
+	wrapped := fmt.Errorf("%w: prompt 5 bytes, argv 9 bytes (claude): fork/exec claude: argument list too long", ErrPromptTooLarge)
+	if !errors.Is(wrapped, ErrPromptTooLarge) {
+		t.Error("wrapped ErrPromptTooLarge not recognized by errors.Is")
+	}
+	if errors.Is(wrapped, ErrAgentFailed) {
+		t.Error("wrapped ErrPromptTooLarge matched ErrAgentFailed, want false")
+	}
+}
+
+// TestArgvBytes pins the execve accounting: each string plus its NUL.
+func TestArgvBytes(t *testing.T) {
+	cases := []struct {
+		args []string
+		want int
+	}{
+		{nil, 0},
+		{[]string{}, 0},
+		{[]string{"a", "bc"}, 5},
+		{[]string{""}, 1},
+	}
+	for _, c := range cases {
+		if got := ArgvBytes(c.args); got != c.want {
+			t.Errorf("ArgvBytes(%q) = %d, want %d", c.args, got, c.want)
+		}
+	}
+}
+
+// TestIsArgListTooLong pins that the classifier sees E2BIG through the
+// *fs.PathError exec.Cmd.Start wraps it in, and nothing else.
+func TestIsArgListTooLong(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"fork/exec E2BIG", &fs.PathError{Op: "fork/exec", Path: "/usr/bin/claude", Err: syscall.E2BIG}, true},
+		{"bare E2BIG", syscall.E2BIG, true},
+		{"wrapped E2BIG", fmt.Errorf("start: %w", &fs.PathError{Op: "fork/exec", Path: "codex", Err: syscall.E2BIG}), true},
+		{"fork/exec ENOENT", &fs.PathError{Op: "fork/exec", Path: "/usr/bin/claude", Err: syscall.ENOENT}, false},
+		{"plain error", errors.New("argument list too long"), false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		if got := IsArgListTooLong(c.err); got != c.want {
+			t.Errorf("%s: IsArgListTooLong(%v) = %v, want %v", c.name, c.err, got, c.want)
+		}
 	}
 }
