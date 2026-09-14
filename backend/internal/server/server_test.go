@@ -422,6 +422,213 @@ func TestObserveParkedReview_ChecksGreen_StampsAwaitingMerge(t *testing.T) {
 	}
 }
 
+// --- ci_recovered lifecycle (#3414) ----------------------------------------
+
+// seedResolvedSnapshotRun re-seeds the harness run with a required-checks
+// snapshot so reviewChecksResolution reports resolved=true (the checks
+// branch is reached).
+func (h *driveObserverHarness) seedResolvedSnapshotRun(contexts ...string) {
+	h.repo.seedRun(&run.Run{
+		ID: h.runID, Drive: true, State: run.StateRunning,
+		RequiredChecksSnapshot: &run.RequiredChecksSnapshot{Contexts: contexts},
+	})
+}
+
+// countRule counts appended (observer-stamped) run_auto_advanced entries
+// naming rule.
+func (h *driveObserverHarness) countRule(t *testing.T, rule drive.Rule) int {
+	t.Helper()
+	n := 0
+	for _, a := range h.driveAdvances(t) {
+		if a.Rule == rule {
+			n++
+		}
+	}
+	return n
+}
+
+// T1: a superseded cancelled/stale required check carries NO red verdict,
+// so it must NOT park ci_failed — only reviews_settled_gate is stamped
+// (#3414). Done-means for control 1 (RedVerdict in reviewChecksFailed).
+func TestObserveParkedReview_CancelledRequiredCheck_DoesNotParkCIFailed(t *testing.T) {
+	for _, conclusion := range []string{"cancelled", "stale"} {
+		t.Run(conclusion, func(t *testing.T) {
+			h := newDriveObserverHarness(t, true)
+			h.seedImplementReviewRound(t, 1, 1, 10)
+			h.seedResolvedSnapshotRun("ci_pass")
+			h.scs.seedWithConclusion(h.stage.ID, "ci_pass", stagecheck.StateFail, conclusion)
+
+			h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+			advances := h.driveAdvances(t)
+			if len(advances) != 1 || advances[0].Rule != drive.RuleReviewsSettledGate {
+				t.Fatalf("run_auto_advanced = %+v, want only reviews_settled_gate (a %s conclusion carries no red verdict)", advances, conclusion)
+			}
+		})
+	}
+}
+
+// T2: a `failure` required check DOES carry a red verdict and still parks
+// ci_failed — the positive control so T1 cannot pass by never reaching the
+// branch.
+func TestObserveParkedReview_FailureConclusion_StillParksCIFailed(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedResolvedSnapshotRun("ci_pass")
+	h.scs.seedWithConclusion(h.stage.ID, "ci_pass", stagecheck.StateFail, "failure")
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleCIFailed || advances[1].To != "ci_failed" {
+		t.Fatalf("run_auto_advanced = %+v, want settled + ci_failed on a genuine failure conclusion", advances)
+	}
+}
+
+// T3: the run's latest auto-advance is ci_failed but no required check
+// carries a red verdict at the latest rows (one superseded cancelled, one
+// pending) → exactly one ci_recovered stamp, From ci_failed, next_action
+// await_checks, Detail naming the outstanding contexts (#3414). Done-means
+// for control 2 (the ci_recovered block). Also pins condition 5: the
+// surfaced posture is the rule + next_action, independent of the To field.
+func TestObserveParkedReview_CIFailedLatest_NoRedAtLatestRows_StampsCIRecovered(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedResolvedSnapshotRun("ci_pass", "fishhawk_audit_complete")
+	h.seedRunAutoAdvanced(40, drive.RuleCIFailed) // prior park is the latest entry
+	h.scs.seedWithConclusion(h.stage.ID, "ci_pass", stagecheck.StateFail, "cancelled")
+	h.scs.seed(h.stage.ID, "fishhawk_audit_complete", stagecheck.StatePending)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	if n := h.countRule(t, drive.RuleCIRecovered); n != 1 {
+		t.Fatalf("ci_recovered stamps = %d, want exactly 1", n)
+	}
+	var rec drive.Advance
+	for _, a := range h.driveAdvances(t) {
+		if a.Rule == drive.RuleCIRecovered {
+			rec = a
+		}
+	}
+	if rec.From != "ci_failed" {
+		t.Errorf("ci_recovered From = %q, want ci_failed", rec.From)
+	}
+	if rec.NextAction == nil || rec.NextAction.Action != "await_checks" {
+		t.Fatalf("ci_recovered NextAction = %+v, want await_checks", rec.NextAction)
+	}
+	if !strings.Contains(rec.NextAction.Detail, "fishhawk_audit_complete") {
+		t.Errorf("ci_recovered Detail = %q, want it to name the pending fishhawk_audit_complete", rec.NextAction.Detail)
+	}
+	// Condition 5: the recovery posture consumers read is the rule string
+	// and next_action — NOT the To field, which is a fixed presentation
+	// label. Pin that the load-bearing surface fields are set as designed so
+	// a future To change cannot be mistaken for a posture change.
+	if rec.To != "review:awaiting_approval" {
+		t.Errorf("ci_recovered To = %q, want review:awaiting_approval (a fixed label; consumers key on Rule+NextAction, not To)", rec.To)
+	}
+}
+
+// T4: with ci_recovered already the latest entry and the same rows, a fresh
+// tick appends NO duplicate ci_recovered — anti-oscillation (#3414). The
+// recovery stamp fires only when the latest entry is ci_failed.
+func TestObserveParkedReview_CIRecoveredLatest_NoDuplicate(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedResolvedSnapshotRun("ci_pass")
+	h.seedRunAutoAdvanced(30, drive.RuleCIFailed)
+	h.seedRunAutoAdvanced(40, drive.RuleCIRecovered) // already the latest entry
+	h.scs.seedWithConclusion(h.stage.ID, "ci_pass", stagecheck.StateFail, "cancelled")
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	if n := h.countRule(t, drive.RuleCIRecovered); n != 0 {
+		t.Fatalf("ci_recovered stamps = %d, want 0 (already latest — no oscillation)", n)
+	}
+}
+
+// T5: a genuine red verdict AFTER a recovery re-parks ci_failed. The prior
+// ci_failed@30 was ever-recorded, so only a LatestRuleIs guard (not
+// Recorded) re-stamps — done-means for control 3 (the ci_failed guard).
+func TestObserveParkedReview_RedAgainAfterRecovery_RestampsCIFailed(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedResolvedSnapshotRun("ci_pass")
+	h.seedRunAutoAdvanced(30, drive.RuleCIFailed)
+	h.seedRunAutoAdvanced(40, drive.RuleCIRecovered) // recovery is the latest entry
+	h.scs.seedWithConclusion(h.stage.ID, "ci_pass", stagecheck.StateFail, "failure")
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	if n := h.countRule(t, drive.RuleCIFailed); n != 1 {
+		t.Fatalf("fresh ci_failed stamps = %d, want 1 (a new red re-parks after ci_recovered)", n)
+	}
+}
+
+// T6: a run that went green AFTER a ci_failed (or ci_recovered) latest entry
+// re-stamps checks_green_awaiting_merge although it was ever-recorded —
+// done-means for control 4 (the awaiting_merge carve-out).
+func TestObserveParkedReview_GreenAfterCIFailedPark_RestampsAwaitingMerge(t *testing.T) {
+	for _, park := range []drive.Rule{drive.RuleCIFailed, drive.RuleCIRecovered} {
+		t.Run(string(park), func(t *testing.T) {
+			h := newDriveObserverHarness(t, true)
+			h.seedImplementReviewRound(t, 1, 1, 10)
+			h.seedResolvedSnapshotRun("ci_pass")
+			h.seedRunAutoAdvanced(30, drive.RuleChecksGreenAwaitingMerge)
+			h.seedRunAutoAdvanced(40, park) // the CI park is the latest entry
+			h.scs.seed(h.stage.ID, "ci_pass", stagecheck.StatePass)
+
+			h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+			if n := h.countRule(t, drive.RuleChecksGreenAwaitingMerge); n != 1 {
+				t.Fatalf("fresh awaiting_merge stamps = %d, want 1 (must re-assert after a %s park went green)", n, park)
+			}
+			var adv drive.Advance
+			for _, a := range h.driveAdvances(t) {
+				if a.Rule == drive.RuleChecksGreenAwaitingMerge {
+					adv = a
+				}
+			}
+			if adv.NextAction == nil || adv.NextAction.Action != "merge_pr" {
+				t.Errorf("re-stamped awaiting_merge NextAction = %+v, want merge_pr", adv.NextAction)
+			}
+		})
+	}
+}
+
+// T7: with checks_green_awaiting_merge already the latest entry, a fresh
+// tick appends NO duplicate — the retained Recorded posture (#2122) when no
+// CI park intervened.
+func TestObserveParkedReview_AwaitingMergeLatest_NoDuplicate(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedResolvedSnapshotRun("ci_pass")
+	h.seedRunAutoAdvanced(40, drive.RuleChecksGreenAwaitingMerge) // already latest
+	h.scs.seed(h.stage.ID, "ci_pass", stagecheck.StatePass)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	if n := h.countRule(t, drive.RuleChecksGreenAwaitingMerge); n != 0 {
+		t.Fatalf("awaiting_merge stamps = %d, want 0 (already latest, no CI park — Recorded dedup holds)", n)
+	}
+}
+
+// T8: a fixup_rereview_repark latest entry does NOT re-stamp awaiting_merge
+// — the carve-out is narrow to CI parks, so the #2122 scoping survives.
+func TestObserveParkedReview_ReparkLatest_AwaitingMergeStaysRecorded(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedResolvedSnapshotRun("ci_pass")
+	h.seedRunAutoAdvanced(30, drive.RuleChecksGreenAwaitingMerge)
+	h.seedRunAutoAdvanced(40, drive.RuleFixupRereviewRepark) // a NON-CI supersession is latest
+	h.scs.seed(h.stage.ID, "ci_pass", stagecheck.StatePass)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	if n := h.countRule(t, drive.RuleChecksGreenAwaitingMerge); n != 0 {
+		t.Fatalf("awaiting_merge stamps = %d, want 0 (a fixup repark is not a CI park; #2122 Recorded scoping intact)", n)
+	}
+}
+
 // --- Advisory-qualified awaiting_merge detail (#2487) ----------------------
 
 // Legacy clean strings kept byte-for-byte by the clean advisory branch.
@@ -987,12 +1194,16 @@ func TestObserveParkedReview_AcceptancePendingIdempotent(t *testing.T) {
 
 // seedRunAutoAdvanced seeds a run_auto_advanced audit entry naming rule at the
 // given Sequence, so LatestRuleIs (and applyDriveSurfaces) can pick the latest
-// unambiguously — the auditFake assigns no Sequence to appended entries.
+// unambiguously — the auditFake assigns no Sequence to appended entries. The
+// entry carries the harness stage id so BOTH the run-wide LatestRuleIs read and
+// the per-(run,stage) Recorded read observe it — the ci_failed / awaiting_merge
+// guard counterfactuals (#3414) need Recorded to see the seeded prior state.
 func (h *driveObserverHarness) seedRunAutoAdvanced(seq int64, rule drive.Rule) {
 	payload, _ := json.Marshal(drive.Advance{Rule: rule})
 	rid := h.runID
+	sid := h.stage.ID
 	h.au.seeded = append(h.au.seeded, &audit.Entry{
-		RunID: &rid, Sequence: seq, Category: drive.Category, Payload: payload,
+		RunID: &rid, StageID: &sid, Sequence: seq, Category: drive.Category, Payload: payload,
 	})
 }
 

@@ -14,6 +14,17 @@ State derivation lives in `DeriveState(status, conclusion)`:
 - fail on `failure`/`timed_out`/`cancelled`/`action_required`/`stale`/`startup_failure`
 - pending on anything still in progress or carrying a conclusion we haven't catalogued
 
+### RedVerdict vs StateFail (#3414)
+
+`DeriveState` maps `cancelled` and `stale` to `StateFail` — a check superseded by a newer head reads not-green, keeping the SPA fail rendering and the conservative approval/merge-gate posture unchanged. But a superseded conclusion carries **no verdict about the code**: `cancelled` is what `ci.yml`'s `concurrency: cancel-in-progress` assigns to the in-flight run's check runs when a new push lands, and `stale` is what GitHub assigns when a check run is superseded.
+
+Two predicates express that distinction WITHOUT touching `DeriveState`:
+
+- `ConclusionSuperseded(conclusion)` — true for exactly `cancelled` and `stale`; nil and every other value false.
+- `(*Check).RedVerdict()` — `State == StateFail && !ConclusionSuperseded(Conclusion)`. A `StateFail` with a nil conclusion stays red (production never produces it, so it can only come from a fake, and the conservative direction is to park).
+
+**The drive `ci_failed` park keys on `RedVerdict`, not `StateFail`** (`server.go::reviewChecksFailed`), so a superseded cancelled/stale conclusion never trips `ci_failed`; the recovery lifecycle is in `backend/internal/drive/README.md`.
+
 ## Ingest and read paths
 
 - Ingest: `backend/internal/server/checkrun.go::ingestCheckRun` parses the `check_run` event, walks `pull_requests[]`, asks the repo for matching stages via `(pr_number, head_sha, check_name)`, and appends a row per match.

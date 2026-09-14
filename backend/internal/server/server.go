@@ -1402,21 +1402,26 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 	}
 	green, checksResolved := s.reviewChecksResolution(ctx, runRow, stage)
 	if checksResolved && !green {
-		// Negative mirror (#1045): review evidence is complete but a
-		// required check concluded red → park in the derived ci_failed
-		// state with a classify next action naming the failed check(s). A
-		// merely-pending check (none failed) returns silently — only a
-		// terminal red trips ci_failed, so a still-running check can never
-		// over-claim a failure. Guarded on checksResolved: an UNRESOLVED
-		// run (nil snapshot, #2497) deliberately falls THROUGH to the
-		// acceptance gate and the awaiting_merge stamp rather than parking
-		// — the local MCP loop never captures a snapshot, so parking would
-		// suppress checks_green_awaiting_merge on every local run and wedge
-		// merge_run (delegation.evalGatesResolvedCIGreen keys may_merge on
-		// that rule). reviewChecksFailed already returns nil for a nil
-		// snapshot, so this mirror is unreachable when unresolved anyway.
+		// Negative mirror (#1045) + recovery (#3414): review evidence is
+		// complete but the required checks are not all green. Guarded on
+		// checksResolved: an UNRESOLVED run (nil snapshot, #2497)
+		// deliberately falls THROUGH to the acceptance gate and the
+		// awaiting_merge stamp rather than parking — the local MCP loop
+		// never captures a snapshot, so parking would suppress
+		// checks_green_awaiting_merge on every local run and wedge merge_run
+		// (delegation.evalGatesResolvedCIGreen keys may_merge on that rule).
+		// reviewChecksFailed / reviewChecksPending both return nil for a nil
+		// snapshot, so this branch is inert when unresolved anyway.
 		if failed := s.reviewChecksFailed(ctx, runRow, stage); len(failed) > 0 {
-			if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleCIFailed) {
+			// A required check carries a RED VERDICT (not merely a
+			// superseded cancelled/stale conclusion, #3414) → park in the
+			// derived ci_failed state with a classify next action naming the
+			// failed check(s). Idempotent on LatestRuleIs, NOT Recorded: a
+			// persistent red across ticks still stamps once, but a NEW red
+			// after a ci_recovered (or awaiting_merge) supersession re-parks
+			// — the park is re-evaluated against the live rows every tick
+			// rather than latched at the first observation.
+			if s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleCIFailed) {
 				return
 			}
 			names := strings.Join(failed, ", ")
@@ -1428,6 +1433,30 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 				NextAction: &drive.NextAction{
 					Action: "classify_ci_failure",
 					Detail: "required PR checks concluded red (" + names + "); classify the failure and route per the next_actions arms",
+					PRURL:  prURL,
+				},
+			})
+			return
+		}
+		// No required check carries a red verdict, yet the checks are not
+		// green — they are pending or were superseded by a newer head
+		// (cancelled/stale). If the run's LATEST auto-advance is ci_failed,
+		// the park tripped on a superseded conclusion (the #3414 wedge):
+		// stamp ci_recovered, which supersedes the derived ci_failed status
+		// so next_actions leaves the ci_failed_unroutable dead end. When the
+		// latest is NOT ci_failed there is nothing to recover — return
+		// silently as before (a merely-pending check never advances).
+		if s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleCIFailed) {
+			pending := s.reviewChecksPending(ctx, runRow, stage)
+			names := strings.Join(pending, ", ")
+			s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
+				Rule:  drive.RuleCIRecovered,
+				From:  "ci_failed",
+				To:    "review:awaiting_approval",
+				Event: "no required PR check carries a red verdict at the latest observed head; awaiting: " + names,
+				NextAction: &drive.NextAction{
+					Action: "await_checks",
+					Detail: "the red conclusion that parked this run was superseded by a newer head; wait for the remaining required checks (" + names + ") to conclude",
 					PRURL:  prURL,
 				},
 			})
@@ -1545,7 +1574,20 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		// upgrades a prior acceptance_pending stamp to awaiting_merge once
 		// acceptance passes, is skipped, or settles not-validated.
 	}
-	if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleChecksGreenAwaitingMerge) {
+	// Idempotent on Recorded (per-(run,stage) ever-recorded) EXCEPT when the
+	// run's latest entry is a CI park (ci_failed or ci_recovered): a run that
+	// reached awaiting_merge, then parked ci_failed on a superseded head, must
+	// RE-ASSERT awaiting_merge once the checks go green — delegation's
+	// evalGatesResolvedCIGreen and applyDriveSurfaces' derived_status both key
+	// on the LATEST entry, so a stale checks_green stamp buried under the
+	// ci_failed park would leave the run wedged (#3414). Every OTHER
+	// supersession — in particular fixup_rereview_repark — keeps the #2122
+	// Recorded scoping, so this carve-out is deliberately narrow. The
+	// acceptance arms above already dedup on LatestRuleIs, so an
+	// acceptance-declaring run re-stamps on its own after a recovery and needs
+	// no carve-out here.
+	if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleChecksGreenAwaitingMerge) &&
+		!s.ciParkIsLatest(ctx, stage.RunID) {
 		return
 	}
 	adv := s.advisoryOutstandingFor(ctx, stage.RunID, roundState.rejects, roundState.verdictsUnreadable)
@@ -1862,14 +1904,29 @@ func checksAcceptanceLead(resolved bool) string {
 	return "required checks were not resolved for this run (no protection snapshot) and must be verified on the PR before merging"
 }
 
+// ciParkIsLatest reports whether the run's latest run_auto_advanced entry
+// is a CI park — ci_failed or ci_recovered (#3414). It is the narrow
+// carve-out on the checks_green_awaiting_merge Recorded guard: a run that
+// went green after a CI park must re-assert awaiting_merge because
+// delegation.evalGatesResolvedCIGreen and derived_status both key on the
+// LATEST entry. Fail-open exactly like LatestRuleIs (a degraded audit read
+// re-stamps rather than suppressing awaiting_merge forever).
+func (s *Server) ciParkIsLatest(ctx context.Context, runID uuid.UUID) bool {
+	return s.drive.LatestRuleIs(ctx, runID, drive.RuleCIFailed) ||
+		s.drive.LatestRuleIs(ctx, runID, drive.RuleCIRecovered)
+}
+
 // reviewChecksFailed returns the required-check contexts whose latest
-// state recorded against the review stage is stagecheck.StateFail — the
-// red mirror of reviewChecksResolution (#1045). Only StateFail counts as
-// red: a StatePending (in-flight) or StateNotTracked (no row) check is
-// not failed, so a still-running check can never trip ci_failed.
-// Conservative on any gap: a nil OR empty snapshot or an unwired
-// StageCheckRepo returns nil, so ci_failed can never be over-claimed
-// (in particular an unresolved run never mirrors a failure — #2497).
+// row recorded against the review stage carries a RED VERDICT — the red
+// mirror of reviewChecksResolution (#1045). Only a RedVerdict counts as
+// red: a superseded cancelled/stale conclusion carries no verdict about
+// the code and never trips ci_failed (#3414), and a StatePending
+// (in-flight) or StateNotTracked (no row) check is not failed either — so
+// neither a still-running check nor a head superseded by a newer push can
+// over-claim a failure. Conservative on any gap: a nil OR empty snapshot
+// or an unwired StageCheckRepo returns nil, so ci_failed can never be
+// over-claimed (in particular an unresolved run never mirrors a failure —
+// #2497).
 func (s *Server) reviewChecksFailed(ctx context.Context, runRow *run.Run, stage *run.Stage) []string {
 	if runRow.RequiredChecksSnapshot == nil || len(runRow.RequiredChecksSnapshot.Contexts) == 0 {
 		return nil
@@ -1883,11 +1940,41 @@ func (s *Server) reviewChecksFailed(ctx context.Context, runRow *run.Run, stage 
 		if err != nil {
 			continue
 		}
-		if check.State == stagecheck.StateFail {
+		if check.RedVerdict() {
 			failed = append(failed, name)
 		}
 	}
 	return failed
+}
+
+// reviewChecksPending returns the required-check contexts whose latest
+// row against the review stage is neither a pass nor a red verdict —
+// pending (in-flight), superseded (cancelled/stale), or untracked (no
+// row). Used ONLY to name the outstanding contexts in the ci_recovered
+// Event/Detail prose (#3414); it makes no gate decision. Conservative on
+// any gap exactly like reviewChecksFailed: a nil OR empty snapshot or an
+// unwired StageCheckRepo returns nil.
+func (s *Server) reviewChecksPending(ctx context.Context, runRow *run.Run, stage *run.Stage) []string {
+	if runRow.RequiredChecksSnapshot == nil || len(runRow.RequiredChecksSnapshot.Contexts) == 0 {
+		return nil
+	}
+	if s.cfg.StageCheckRepo == nil {
+		return nil
+	}
+	var pending []string
+	for _, name := range runRow.RequiredChecksSnapshot.Contexts {
+		check, err := s.cfg.StageCheckRepo.LatestForStageAndName(ctx, stage.ID, name)
+		if err != nil {
+			// No row (ErrNotFound) or a read error → the context is not
+			// green and not a red verdict; name it as still-outstanding.
+			pending = append(pending, name)
+			continue
+		}
+		if check.State != stagecheck.StatePass && !check.RedVerdict() {
+			pending = append(pending, name)
+		}
+	}
+	return pending
 }
 
 // seedIdentityProviderMaps returns the forge-keyed provider and

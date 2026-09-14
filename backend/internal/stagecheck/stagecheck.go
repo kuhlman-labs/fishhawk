@@ -135,3 +135,41 @@ func DeriveState(status string, conclusion *string) State {
 		return StatePending
 	}
 }
+
+// ConclusionSuperseded reports whether a check-run conclusion means the
+// check was SUPERSEDED by a newer head rather than judged on the code —
+// exactly GitHub's `cancelled` and `stale`. `cancelled` is what ci.yml's
+// concurrency: cancel-in-progress assigns to the in-flight run's check
+// runs when a new push lands in the same group; `stale` is what GitHub
+// itself assigns when a check run is superseded. Neither carries a
+// verdict about the diff, so the drive ci_failed park must not trip on
+// them (#3414). nil and every other conclusion (including `failure` and
+// `timed_out`) are NOT superseded — false.
+//
+// This is deliberately NARROWER than DeriveState's fail set: DeriveState
+// still maps cancelled/stale to StateFail (the SPA fail rendering and the
+// conservative approval/merge-gate posture are unchanged), while this
+// predicate lets the drive park distinguish a superseded head from a real
+// red verdict.
+func ConclusionSuperseded(conclusion *string) bool {
+	if conclusion == nil {
+		return false
+	}
+	switch *conclusion {
+	case "cancelled", "stale":
+		return true
+	default:
+		return false
+	}
+}
+
+// RedVerdict reports whether the check carries a RED VERDICT about the
+// code: a StateFail whose conclusion is not a supersession (#3414). The
+// drive ci_failed park keys on this rather than State == StateFail, so a
+// superseded cancelled/stale conclusion never trips ci_failed. A StateFail
+// with a nil Conclusion stays red — production never produces it
+// (DeriveState maps nil to pending), so it can only come from a fake, and
+// the conservative direction is to park.
+func (c *Check) RedVerdict() bool {
+	return c.State == StateFail && !ConclusionSuperseded(c.Conclusion)
+}

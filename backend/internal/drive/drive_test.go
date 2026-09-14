@@ -59,6 +59,7 @@ func TestMechanical_RuleTable(t *testing.T) {
 		RuleFixupRereviewRepark,
 		RuleChecksGreenAwaitingMerge,
 		RuleCIFailed,
+		RuleCIRecovered,
 		RuleAcceptancePending,
 		RuleAcceptanceOutcomeUnknown,
 		RuleAcceptanceTriage,
@@ -68,6 +69,11 @@ func TestMechanical_RuleTable(t *testing.T) {
 		if !Mechanical(rule) {
 			t.Errorf("Mechanical(%q) = false, want true", rule)
 		}
+	}
+	// ci_recovered (#3414) is a persisted rule value read back by
+	// applyDriveSurfaces; pin the literal so a rename is a caught break.
+	if RuleCIRecovered != "ci_recovered" {
+		t.Errorf("RuleCIRecovered = %q, want ci_recovered", RuleCIRecovered)
 	}
 	// The acceptance-gate rules (E31.17 / #1568) must byte-match the MCP
 	// next_actions.state strings so the two surfaces cannot diverge; the failed

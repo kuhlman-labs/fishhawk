@@ -1793,6 +1793,17 @@ func (f *fakeStageCheckRepo) seed(stageID uuid.UUID, name string, state stageche
 		StageID: stageID, Name: name, State: state,
 	}
 }
+
+// seedWithConclusion is seed plus the verbatim GitHub conclusion, so the
+// drive ci_failed park's RedVerdict predicate (#3414) — StateFail minus a
+// superseded cancelled/stale conclusion — can be exercised. The plain seed
+// leaves Conclusion nil.
+func (f *fakeStageCheckRepo) seedWithConclusion(stageID uuid.UUID, name string, state stagecheck.State, conclusion string) {
+	c := conclusion
+	f.byKey[f.keyFor(stageID, name)] = &stagecheck.Check{
+		StageID: stageID, Name: name, State: state, Conclusion: &c,
+	}
+}
 func (f *fakeStageCheckRepo) Append(context.Context, stagecheck.AppendParams) (*stagecheck.Check, error) {
 	return nil, errors.New("not used")
 }

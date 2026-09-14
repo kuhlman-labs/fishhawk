@@ -120,6 +120,21 @@ const (
 	// never advances — the remediation (fix-up, an operator commit +
 	// vouch, or a checks re-run) stays the operator's call.
 	RuleCIFailed Rule = "ci_failed"
+	// RuleCIRecovered lifts a ci_failed park that never carried a real red
+	// verdict at the latest observed rows (#3414). ci.yml's
+	// concurrency: cancel-in-progress concludes the superseded head's check
+	// runs `cancelled`, which stagecheck.DeriveState maps to StateFail — so a
+	// newer green/pending head would otherwise stay parked ci_failed forever
+	// (the ci_failed stamp and the checks_green_awaiting_merge stamp are both
+	// guarded, so nothing supersedes the park). When the run's latest
+	// auto-advance is ci_failed but no required check carries a red VERDICT at
+	// the latest rows and the checks are not yet green (pending / superseded),
+	// the observer stamps ci_recovered (From ci_failed, To
+	// review:awaiting_approval), which supersedes the derived ci_failed status
+	// so next_actions leaves the ci_failed_unroutable dead end. Detection only,
+	// like RuleCIFailed (ADR-040 bucket 1, zero judgment): it parks and never
+	// advances — the remaining required checks concluding is the real edge.
+	RuleCIRecovered Rule = "ci_recovered"
 	// RuleAcceptancePending covers a run whose workflow declares an
 	// acceptance stage where review evidence is terminal and required PR
 	// checks are green, but the acceptance stage has not yet settled a
@@ -207,6 +222,7 @@ var mechanical = map[Rule]bool{
 	RuleFixupRereviewRepark:      true,
 	RuleChecksGreenAwaitingMerge: true,
 	RuleCIFailed:                 true,
+	RuleCIRecovered:              true,
 	RuleAcceptancePending:        true,
 	RuleAcceptanceOutcomeUnknown: true,
 	RuleAcceptanceTriage:         true,
