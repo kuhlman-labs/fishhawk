@@ -35,7 +35,10 @@ var reconcileOrphanedReviewStates = []run.State{run.StatePending, run.StateRunni
 
 // reconcileSkip* are the recorded reasons a stage's reconcile was a no-op.
 // The boot sweep ignores them; the on-demand endpoint (#2712) reports them so
-// an operator sees WHY nothing was healed instead of a silent success.
+// an operator sees WHY nothing was healed instead of a silent success. Since
+// #3395 the round's landed-terminal count runs BEFORE the boot-marker gate,
+// so reconcileSkipAlreadySettled takes precedence over reconcileSkipInFlight
+// and LandedBefore is real on every skip past the three anchor checks.
 const (
 	reconcileSkipNoStartedEntry = "no_review_started_entry"
 	reconcileSkipNoConfigured   = "no_configured_agents"
@@ -343,19 +346,17 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 		return skip(reconcileSkipNoStageID), nil
 	}
 
-	// Boot-marker gate: a review whose latest started entry is NOT before the
-	// current process boot is still legitimately in-flight in THIS process —
-	// never fail it. At startup processStart == now, so every prior-process
-	// dispatch predates it; the comparison is load-bearing only if the pass is
-	// ever invoked mid-process-life.
-	if !latest.Timestamp.Before(s.processStart) {
-		return skip(reconcileSkipInFlight), nil
-	}
-
 	// Count landed terminals for THIS round only: audit sequence strictly
 	// greater than the latest started entry's sequence. A prior round's landed
 	// verdicts carry a lower sequence and are excluded — the attempt-mixing
-	// fix (binding condition 1).
+	// fix (binding condition 1). Counted BEFORE the boot-marker gate (#3395)
+	// so LandedBefore is real on EVERY skip and a settled round reports
+	// round_already_settled rather than review_dispatched_by_this_process:
+	// counted after the gate, an in-flight skip always reported landed_before
+	// 0, which an operator read as "the round is genuinely empty" when it was
+	// the count that had never run. Costs three reads on an in-flight skip
+	// (boot sweep + on-demand verb only; not a polling path); synthesis
+	// behaviour is unchanged.
 	landed := 0
 	for _, cat := range stage.terminals {
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
@@ -371,7 +372,17 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 	out.LandedBefore = landed
 	if landed >= payload.ConfiguredAgents {
 		// Already settled for this round — idempotent no-op on a second pass.
+		// Takes precedence over the boot-marker gate below.
 		return skip(reconcileSkipAlreadySettled), nil
+	}
+
+	// Boot-marker gate: a review whose latest started entry is NOT before the
+	// current process boot is still legitimately in-flight in THIS process —
+	// never fail it. At startup processStart == now, so every prior-process
+	// dispatch predates it; the comparison is load-bearing only if the pass is
+	// ever invoked mid-process-life.
+	if !latest.Timestamp.Before(s.processStart) {
+		return skip(reconcileSkipInFlight), nil
 	}
 
 	// Emit exactly (ConfiguredAgents - landed) terminal *_review_failed

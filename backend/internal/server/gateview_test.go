@@ -522,6 +522,51 @@ func TestGateView_FixupJoin(t *testing.T) {
 	}
 }
 
+// TestGateView_FixupJoin_RecoveredOutcome pins the #3395 third outcome: a
+// trigger followed only by a stage_fixup_recovered entry reads "recovered"
+// (before this it read "pending" forever), while a trigger followed by
+// fixup_pushed and THEN stage_fixup_recovered still reads "pushed" because
+// earliestOutcomeAfter picks the earliest following outcome. The recovered
+// entry's payload is deliberately malformed to pin that nothing is decoded
+// from it — a bad payload cannot hide a recovered pass.
+func TestGateView_FixupJoin_RecoveredOutcome(t *testing.T) {
+	s, repo, au, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	stageID := uuid.New()
+	c := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 5, "high", "correctness", "note", "")
+	id := c.ID.String()
+
+	seedHeadEntry(au, runID, &stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "pass1"})
+	seedHeadEntry(au, runID, &stageID, "fixup_pushed", 25, map[string]any{"head_sha": "deadbeef", "apply_path": "agent"})
+	seedHeadEntry(au, runID, &stageID, CategoryStageFixupRecovered, 27, map[string]any{"delivered_nothing": false})
+	seedHeadEntry(au, runID, &stageID, CategoryStageFixupTriggered, 40, map[string]any{"concern_ids": []string{id}, "reason": "pass2"})
+	rid := runID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &stageID, Category: CategoryStageFixupRecovered, Sequence: 45, Payload: []byte(`{not json`),
+	})
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if len(resp.Open) != 1 {
+		t.Fatalf("Open = %d, want 1", len(resp.Open))
+	}
+	fx := resp.Open[0].Fixups
+	if len(fx) != 2 {
+		t.Fatalf("Fixups = %d, want 2: %+v", len(fx), fx)
+	}
+	if fx[0].Outcome != "pushed" || fx[0].HeadSHA != "deadbeef" {
+		t.Errorf("fixup[0] = %+v, want pushed/deadbeef (a pushed-then-recovered pass reads pushed)", fx[0])
+	}
+	if fx[1].Outcome != "recovered" {
+		t.Errorf("fixup[1] outcome = %q, want recovered", fx[1].Outcome)
+	}
+	if fx[1].HeadSHA != "" || fx[1].ApplyPath != "" {
+		t.Errorf("fixup[1] = %+v, want no head_sha/apply_path on a recovered outcome", fx[1])
+	}
+	if resp.HistoryIncomplete {
+		t.Errorf("history_incomplete = true, want false (a malformed recovered payload is not decoded, so it is not a gap)")
+	}
+}
+
 // TestGateView_NilStageLegacyJoin covers the legacy nil-stage-id join
 // (sameStage's nil-nil match inside earliestOutcomeAfter, gateview.go:521) and
 // gateViewRound's nil-stageID trigger skip (gateview.go:488): an audit entry

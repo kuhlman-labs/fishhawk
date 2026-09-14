@@ -2158,7 +2158,8 @@ components:
       description: |
         One fix-up routing claim reconstructed from the
         `stage_fixup_triggered` entry that named this concern, joined to the
-        outcome from the earliest following `fixup_pushed` / `fixup_no_changes`.
+        outcome from the earliest following `fixup_pushed` / `fixup_no_changes`
+        / `stage_fixup_recovered`.
       required: [sequence, outcome]
       properties:
         sequence: { type: integer, format: int64 }
@@ -2167,10 +2168,15 @@ components:
           description: The operator/driver routing reason recorded on the trigger.
         outcome:
           type: string
-          enum: [pushed, no_changes, pending]
+          enum: [pushed, no_changes, recovered, pending]
           description: |
             `pushed` — a fix-up commit landed; `no_changes` — the pass
-            produced nothing; `pending` — no following outcome entry yet.
+            produced nothing; `recovered` — the pass FAILED and the stage was
+            restored to its pre-fix-up gate (#3395; delivered-nothing when the
+            `stage_fixup_recovered` audit entry carries
+            `delivered_nothing:true` — a pass that pushed and then died still
+            reads `pushed`, the earliest following outcome wins); `pending` —
+            no following outcome entry yet.
         apply_path:
           type: string
           description: Fix-up apply provenance (`applied`/`agent`/…), present on a `pushed` outcome.
@@ -9633,7 +9639,13 @@ paths:
                           type: integer
                           description: |
                             Terminal verdicts already landed for the round
-                            before this call. These are preserved.
+                            before this call. These are preserved. Reported on
+                            EVERY skip past the anchor checks (#3395): the
+                            count runs before the boot-marker gate, so
+                            `round_already_settled` takes precedence over
+                            `review_dispatched_by_this_process` and an
+                            in-flight skip reporting 0 means the round
+                            genuinely has no landed verdict.
                         synthesized:
                           type: integer
                           description: |

@@ -31,7 +31,7 @@ type ReconcileReviewsInput struct {
 type ReconcileReviewsStage struct {
 	Stage            string `json:"stage" jsonschema:"the review-bearing stage: plan or implement"`
 	ConfiguredAgents int    `json:"configured_agents" jsonschema:"how many agent reviewers the current round was dispatched with"`
-	LandedBefore     int    `json:"landed_before" jsonschema:"how many terminal verdicts had already landed for the round before this call; these are preserved, never re-paid for"`
+	LandedBefore     int    `json:"landed_before" jsonschema:"how many terminal verdicts had already landed for the round before this call; these are preserved, never re-paid for. Since #3395 it is the REAL count on every skip (the count runs before the boot-marker gate), so a review_dispatched_by_this_process skip reporting 0 means the round genuinely has no landed verdict, not that the count never ran"`
 	Synthesized      int    `json:"synthesized" jsonschema:"how many terminal *_review_failed entries this call appended (configured_agents minus landed_before); 0 when nothing needed healing"`
 	Skipped          bool   `json:"skipped,omitempty" jsonschema:"true when this stage healed nothing"`
 	SkipReason       string `json:"skip_reason,omitempty" jsonschema:"why nothing was healed: no_review_started_entry, no_configured_agents, started_entry_has_no_stage_id, round_already_settled, or review_dispatched_by_this_process (the live-review refusal)"`
@@ -71,7 +71,19 @@ still reads back verbatim at the gate. Calling it twice is a no-op
 What it refuses. It will NOT terminate a review the SERVING daemon still has in
 flight: the server compares the round's dispatch timestamp against its own boot
 instant and answers skip_reason=review_dispatched_by_this_process. So invoking
-it against a healthy, genuinely-running review changes nothing.
+it against a healthy, genuinely-running review changes nothing. The round's
+landed count is taken BEFORE that gate, so a round that already settled answers
+skip_reason=round_already_settled (it takes precedence) and landed_before is
+the real count on every skip.
+
+What it CANNOT clear. A pending implement_review_status after a fix-up pass
+that died having pushed nothing is NOT a strand this verb can clear: the
+fix-up opened no server-side round (no implement_review_started entry), so
+there is nothing to synthesize. Since #3395 that status resolves itself — the
+backend's recovery voids the fix-up as the review floor and the prior round's
+verdicts read complete again — and fishhawk_get_run_status carries a
+fixup_recovery marker (delivered_nothing, reopened_concern_ids) for the
+implement stage.
 
 Input:
   - run_id (required) — the Fishhawk run UUID.

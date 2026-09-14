@@ -138,7 +138,12 @@ type fixupRecoverySignal struct {
 	RestoredReviewStageID string
 	SourceFailureReason   string
 	SourceFailureCategory string
-	Parsed                bool
+	// #3395 round closure: DeliveredNothing is nil when the payload carried
+	// no delivered_nothing key (a legacy entry or an undecided read).
+	DeliveredNothing   *bool
+	ReopenedConcernIDs []string
+	ConcernReopenError string
+	Parsed             bool
 }
 
 // latestFixupRecovery is the PURE firing rule for the #3081 marker, stated once
@@ -204,6 +209,16 @@ func latestFixupRecovery(triggerSeqs []int64, recoveries []fixupRecoverySignal) 
 		// carry no injection surface and are passed through unchanged.
 		rec.RestoredState = winner.RestoredState
 		rec.RestoredReviewStageID = winner.RestoredReviewStageID
+		// #3395: delivered_nothing and reopened_concern_ids are backend-authored
+		// (a bool and UUIDs) and pass through unchanged; concern_reopen_error
+		// carries store error text, so it takes the same neutralize-then-cap
+		// path as the reason.
+		if winner.DeliveredNothing != nil {
+			v := *winner.DeliveredNothing
+			rec.DeliveredNothing = &v
+		}
+		rec.ReopenedConcernIDs = winner.ReopenedConcernIDs
+		rec.ConcernReopenError = capJSONString(neutralizeUntrustedFailureText(winner.ConcernReopenError), fixupRecoveryReasonCap)
 	}
 	rec.Message = fixupRecoveryMessage(rec)
 	return rec
@@ -221,9 +236,12 @@ func latestFixupRecovery(triggerSeqs []int64, recoveries []fixupRecoverySignal) 
 // marker this reads.
 //
 // It states four things an operator acting on a bare `succeeded` would get
-// wrong: the fix-up pass FAILED and pushed no commit; the stage was RESTORED to
-// its prior state, which is why the status reads succeeded; the PR head still
-// carries the pre-fix-up commit and the routed concerns were NOT addressed; and
+// wrong: the fix-up pass FAILED and pushed no commit (or, when the backend
+// verified it DID push before dying, that the PR head carries that commit and
+// the re-review of it governs — the two outcomes must never share a sentence
+// that is true of only one); the stage was RESTORED to its prior state, which
+// is why the status reads succeeded; the PR head still carries the pre-fix-up
+// commit and the routed concerns were NOT addressed; and
 // the fix-up BUDGET rule as it stands today — a pass that delivered NOTHING to
 // the PR branch is refunded whether it died category-A (harness, #3085) or
 // category-C (infrastructure, #1957), or produced no commit at all (#967),
@@ -235,7 +253,16 @@ func fixupRecoveryMessage(rec *FixupRecovery) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("the fix-up pass FAILED and pushed no commit; the stage was restored to its prior state (which is why status reads 'succeeded') — the PR head still carries the pre-fix-up commit and your routed concerns were NOT addressed.")
+	// The opening and the `git log` confirmation are keyed to what the backend
+	// actually verified about the PR branch (#3395 fix-up): a pass that
+	// PUSHED before it died must not be described as having pushed nothing,
+	// nor told to confirm an absent commit that is present.
+	pushed := rec.DeliveredNothing != nil && !*rec.DeliveredNothing
+	if pushed {
+		b.WriteString("the fix-up pass FAILED after pushing a commit; the stage was restored to its prior state (which is why status reads 'succeeded') — the PR head carries that fix-up commit, but the pass died before it finished, so treat your routed concerns as NOT confirmed addressed until the re-review of that head reports.")
+	} else {
+		b.WriteString("the fix-up pass FAILED and pushed no commit; the stage was restored to its prior state (which is why status reads 'succeeded') — the PR head still carries the pre-fix-up commit and your routed concerns were NOT addressed.")
+	}
 	switch {
 	case !rec.DetailsAvailable:
 		b.WriteString(" The recovery audit entry could not be decoded, so no source failure detail is available (details_available=false); read the stage_fixup_recovered entry with fishhawk_list_audit.")
@@ -259,8 +286,44 @@ func fixupRecoveryMessage(rec *FixupRecovery) string {
 		}
 		b.WriteString(" " + fixupRecoveryUntrustedClose)
 	}
-	b.WriteString(" Confirm with `git log` on the PR head: the fix-up commit is absent.")
+	if pushed {
+		b.WriteString(" Confirm with `git log` on the PR head: the fix-up commit is present.")
+	} else {
+		b.WriteString(" Confirm with `git log` on the PR head: the fix-up commit is absent.")
+	}
+	b.WriteString(fixupRoundClosureSentence(rec))
 	b.WriteString(" Fix-up budget, as it stands today: a fix-up pass that delivered NOTHING to the PR branch is refunded against the normal budget — whether it died category-A (harness, #3085) or category-C (infrastructure, #1957), or produced no commit at all (#967). A category-B (policy) failure still CONSUMES a pass, as does any pass that pushed a commit before it died. Since #3335 a delivered-nothing pass is credited against the hard ceiling as well as the normal budget, capped at 3 such credits, so the absolute bound is 6 triggered passes.")
+	return b.String()
+}
+
+// fixupRoundClosureSentence renders the #3395 round-closure outcome. It keeps
+// three states DISTINCT, because the reassuring one is false on exactly the
+// paths where the other two apply: (a) the pass delivered nothing and the
+// backend re-opened N concerns, or verified none needed re-opening; (b) the
+// pass delivered nothing but the re-open could not be attempted or partially
+// failed — named, with the reason, so an empty id list is never read as a
+// clean ledger; (c) the pass pushed before it died, so the re-review of that
+// head governs. A legacy entry (DeliveredNothing nil) renders nothing.
+func fixupRoundClosureSentence(rec *FixupRecovery) string {
+	if rec.DeliveredNothing == nil {
+		return ""
+	}
+	if !*rec.DeliveredNothing {
+		return " The pass pushed a commit before it died; the re-review of that head governs."
+	}
+	var b strings.Builder
+	b.WriteString(" The backend verified the pass pushed nothing, so the PREVIOUS review round stands again: implement_review_status reads its verdicts (not pending), and")
+	n := len(rec.ReopenedConcernIDs)
+	switch {
+	case rec.ConcernReopenError != "" && n > 0:
+		fmt.Fprintf(&b, " %d routed concern(s) were re-opened (state reopened) but re-opening the rest FAILED (%s) — those may still read addressed_pending at the gate although the pass did not address them; verify with fishhawk_get_gate_view before trusting an addressed reading.", n, rec.ConcernReopenError)
+	case rec.ConcernReopenError != "":
+		fmt.Fprintf(&b, " re-opening the routed concerns could NOT be completed (%s) — they may still read addressed_pending at the gate although the pass did not address them; verify with fishhawk_get_gate_view before trusting an addressed reading.", rec.ConcernReopenError)
+	case n > 0:
+		fmt.Fprintf(&b, " %d routed concern(s) were re-opened (state reopened) so they read as open at the gate.", n)
+	default:
+		b.WriteString(" no routed concern needed re-opening (none was still addressed_pending).")
+	}
 	return b.String()
 }
 
@@ -313,16 +376,22 @@ func (r *runResolver) fixupRecoveryFor(ctx context.Context, runID, stageID uuid.
 		// FIRES the marker (details_available=false) rather than dropping it.
 		if raw, merr := json.Marshal(e.Payload); merr == nil {
 			var p struct {
-				RestoredState         string `json:"restored_state"`
-				RestoredReviewStageID string `json:"restored_review_stage_id"`
-				SourceFailureReason   string `json:"source_failure_reason"`
-				SourceFailureCategory string `json:"source_failure_category"`
+				RestoredState         string   `json:"restored_state"`
+				RestoredReviewStageID string   `json:"restored_review_stage_id"`
+				SourceFailureReason   string   `json:"source_failure_reason"`
+				SourceFailureCategory string   `json:"source_failure_category"`
+				DeliveredNothing      *bool    `json:"delivered_nothing"`
+				ReopenedConcernIDs    []string `json:"reopened_concern_ids"`
+				ConcernReopenError    string   `json:"concern_reopen_error"`
 			}
 			if json.Unmarshal(raw, &p) == nil {
 				sig.RestoredState = p.RestoredState
 				sig.RestoredReviewStageID = p.RestoredReviewStageID
 				sig.SourceFailureReason = p.SourceFailureReason
 				sig.SourceFailureCategory = p.SourceFailureCategory
+				sig.DeliveredNothing = p.DeliveredNothing
+				sig.ReopenedConcernIDs = p.ReopenedConcernIDs
+				sig.ConcernReopenError = p.ConcernReopenError
 				sig.Parsed = true
 			}
 		}

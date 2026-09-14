@@ -1427,7 +1427,13 @@ Notes:
   pre-fix-up review gate (the implement stage restored `failed → succeeded`/`awaiting_approval`
   and the re-parked review stage restored `pending → awaiting_approval`), with a
   `system` actor and payload `{stage_id, restored_state, restored_review_stage_id,
-  restored_review_state, source_failure_category, source_failure_reason}`. It is the
+  restored_review_state, source_failure_category, source_failure_reason,
+  delivered_nothing?, reopened_concern_ids?, concern_reopen_error?}` (the three
+  optional keys are the #3395 round closure: `delivered_nothing` is present only
+  when the `fixup_pushed` read succeeded, `reopened_concern_ids` only when at least
+  one routed concern was rolled `addressed_pending → reopened`, and
+  `concern_reopen_error` only when the reopen could not be attempted or partially
+  failed). It is the
   durable record that a fix-up failure was absorbed without making the run a failed
   casualty. Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
