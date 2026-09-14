@@ -185,6 +185,7 @@ var KnownCategories = map[string]struct{}{
 	"api_token_revoked":                       {},
 	"approval_comment_refused":                {},
 	"approval_conditions_truncated":           {},
+	"approval_conditions_unrecorded":          {},
 	"approval_predicate_rejected":             {},
 	"approval_sla_elapsed":                    {},
 	"approval_submitted":                      {},

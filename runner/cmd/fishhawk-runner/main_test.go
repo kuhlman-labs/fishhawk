@@ -28104,3 +28104,175 @@ func TestRunVerifyGateCommitted_NeverCarriesThePackagesVar(t *testing.T) {
 		t.Errorf("the single-shot committed gate is missing the owner marker: %q", lines[0])
 	}
 }
+
+// TestImplementPrePackRegion_PeeksApprovalConditionResponses is the #3400
+// end-to-end runner pin: a seeded commit-message sidecar carrying the
+// `Approval conditions:` section, driven through the REAL peek → the REAL
+// composeGateEvidence → bundle.PackBytes, leaves an approval_condition_responses
+// event on the stage's events and an `approval_condition_responses` member on
+// the packed gate_evidence; the same sidecar WITHOUT the section leaves neither
+// (the payload is byte-identical to a section-less run).
+func TestImplementPrePackRegion_PeeksApprovalConditionResponses(t *testing.T) {
+	cfg := config{runID: "run-3400-e2e", stageID: "stage-3400-e2e"}
+	pack := func(t *testing.T, sidecar string) (events []agent.Event, payload string) {
+		t.Helper()
+		redirectCommitMessageDirs(t)
+		if err := os.WriteFile(implementCommitMessagePath(cfg.runID, cfg.stageID), []byte(sidecar), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var logSink strings.Builder
+		events = []agent.Event{{
+			Kind:    "verify_run",
+			Payload: agent.MakePayload(map[string]any{"command": "scripts/test verify", "exit_code": 0, "outcome": "passed"}),
+		}}
+		if ev := peekApprovalConditionResponses(cfg, &logSink); ev != nil {
+			events = append(events, *ev)
+		}
+		ge := composeGateEvidence(events, 1)
+		if ge == nil {
+			t.Fatal("composeGateEvidence returned nil")
+		}
+		events = append(events, *ge)
+		// The real pack must accept the event set (gzipped JSONL, so the
+		// member assertion reads the composed gate_evidence payload).
+		if _, _, err := bundle.PackBytes(bundle.PackInputs{RunID: cfg.runID, StageID: cfg.stageID, Agent: "claude-code"}, events); err != nil {
+			t.Fatalf("PackBytes: %v", err)
+		}
+		return events, string(ge.Payload)
+	}
+
+	withEvents, withPayload := pack(t, acrSidecarWithSection)
+	if !hasEventKind(withEvents, "approval_condition_responses") {
+		t.Errorf("section-bearing sidecar left no approval_condition_responses event on res.Events")
+	}
+	if !strings.Contains(withPayload, `"approval_condition_responses":{"source":"implement_commitmsg"`) {
+		t.Errorf("packed gate_evidence lacks the member:\n%s", withPayload)
+	}
+
+	withoutEvents, withoutPayload := pack(t, "feat: x\n\nbody with no section\n")
+	if hasEventKind(withoutEvents, "approval_condition_responses") {
+		t.Errorf("section-less sidecar must leave no approval_condition_responses event")
+	}
+	if strings.Contains(withoutPayload, "approval_condition_responses") {
+		t.Errorf("section-less run must pack a payload byte-free of the member:\n%s", withoutPayload)
+	}
+}
+
+func hasEventKind(events []agent.Event, kind string) bool {
+	for _, e := range events {
+		if e.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// TestImplementBranch_PeeksApprovalConditionResponsesEvidenceOnly pins the
+// WIRING (#3400): the `stageType == "implement"` branch in run() calls
+// peekApprovalConditionResponses and, being EVIDENCE ONLY, never assigns
+// res.OK / res.FailureCategory. That the peek actually emits is asserted
+// behaviorally above; this proves the branch reaches it and precedes
+// composeGateEvidence in source order.
+func TestImplementBranch_PeeksApprovalConditionResponsesEvidenceOnly(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: could not resolve this test file's path")
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "main.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+	const cond = `stageType == "implement"`
+	var body *ast.BlockStmt
+	var peekPos, composePos token.Pos
+	ast.Inspect(file, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if id, ok := call.Fun.(*ast.Ident); ok {
+				switch id.Name {
+				case "peekApprovalConditionResponses":
+					peekPos = call.Pos()
+				case "composeGateEvidence":
+					composePos = call.Pos()
+				}
+			}
+		}
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		var buf strings.Builder
+		if err := printNode(&buf, fset, ifStmt.Cond); err != nil {
+			return true
+		}
+		if strings.Join(strings.Fields(buf.String()), " ") == cond {
+			var bb strings.Builder
+			if err := printNode(&bb, fset, ifStmt.Body); err == nil && strings.Contains(bb.String(), "peekApprovalConditionResponses(") {
+				body = ifStmt.Body
+			}
+		}
+		return true
+	})
+	if body == nil {
+		t.Fatalf("no %q branch calling peekApprovalConditionResponses found in main.go", cond)
+	}
+	var buf strings.Builder
+	if err := printNode(&buf, fset, body); err != nil {
+		t.Fatalf("print branch body: %v", err)
+	}
+	for _, forbidden := range []string{"res.OK =", "res.FailureCategory ="} {
+		if strings.Contains(buf.String(), forbidden) {
+			t.Errorf("EVIDENCE ONLY: the peek branch must not assign %s:\n%s", forbidden, buf.String())
+		}
+	}
+	if peekPos == token.NoPos || composePos == token.NoPos || peekPos >= composePos {
+		t.Errorf("peekApprovalConditionResponses (pos %v) must precede composeGateEvidence (pos %v) so the event is folded", peekPos, composePos)
+	}
+}
+
+// TestOpenPRAndShipArtifact_LogsApprovalConditionResponsesCommittedAfterCommit
+// pins that the persistence half (#3400) is wired AFTER CommitAndPush inside
+// openPRAndShipArtifact — the one point where the commit is known to exist —
+// and nowhere earlier. The log helper's own behavior is pinned by
+// TestLogApprovalConditionResponsesCommitted.
+func TestOpenPRAndShipArtifact_LogsApprovalConditionResponsesCommittedAfterCommit(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller")
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "main.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if f, ok := d.(*ast.FuncDecl); ok && f.Name.Name == "openPRAndShipArtifact" {
+			fn = f
+		}
+	}
+	if fn == nil {
+		t.Fatal("openPRAndShipArtifact not found")
+	}
+	var commitPos, logPos token.Pos
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch f := call.Fun.(type) {
+		case *ast.SelectorExpr:
+			if f.Sel.Name == "CommitAndPush" && commitPos == token.NoPos {
+				commitPos = call.Pos()
+			}
+		case *ast.Ident:
+			if f.Name == "logApprovalConditionResponsesCommitted" {
+				logPos = call.Pos()
+			}
+		}
+		return true
+	})
+	if commitPos == token.NoPos || logPos == token.NoPos || logPos <= commitPos {
+		t.Errorf("logApprovalConditionResponsesCommitted (pos %v) must be called AFTER CommitAndPush (pos %v)", logPos, commitPos)
+	}
+}

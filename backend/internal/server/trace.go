@@ -3247,6 +3247,26 @@ type operatorScopeUndeliveredPayload struct {
 // ONLY: it never fails, re-opens, or re-budgets the pass.
 const fixupReportingObligationUndeliveredCategory = "fixup_reporting_obligation_undelivered"
 
+// approvalConditionsUnrecordedCategory is the audit-log category for the
+// advisory pre-review signal (#3400) emitted when operator approval conditions
+// were attached to the run but the implement pass's proposed commit message
+// carried no `Approval conditions:` section — so there is no per-condition
+// response for the reviewer to verify. It is the durable operator signal that
+// distinguishes an agent that declined a condition WITH a reason (a recorded
+// `no action required because …`) from one that silently ignored it. Internal
+// advisory audit kind written by the trace handler before the reviewer verdict
+// — NOT an issue-comment surface (nothing in issuecomment emits it). EVIDENCE
+// ONLY: it never fails, re-opens, or re-budgets the pass.
+const approvalConditionsUnrecordedCategory = "approval_conditions_unrecorded"
+
+// approvalConditionsUnrecordedPayload is the audit payload for an
+// approval_conditions_unrecorded entry (#3400): the head under review and
+// which pass kind's commit-message sidecar was expected to carry the section.
+type approvalConditionsUnrecordedPayload struct {
+	HeadSHA    string `json:"head_sha,omitempty"`
+	SourcePass string `json:"source_pass"`
+}
+
 // fixupReportingObligationUndeliveredPayload is the audit payload for a
 // fixup_reporting_obligation_undelivered entry (#2737).
 type fixupReportingObligationUndeliveredPayload struct {
@@ -3863,6 +3883,11 @@ var reviewDispatchMu sync.Mutex
 // Per-invocation errors are WARN-logged and skipped so a transient
 // reviewer failure doesn't block the stage — the diff is already stored.
 func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA string, gateEvidence *prompt.GateEvidence) bool {
+	// #3400: decide whether this round's gate evidence came from an uploaded
+	// bundle at ENTRY, before any of the allocate-if-nil blocks below
+	// (operator-scope-undelivered, per-slice verify, obligations) can conjure a
+	// non-nil GateEvidence that no bundle produced.
+	bundleDerivedGateEvidence := isBundleDerivedGateEvidence(gateEvidence)
 	if s.cfg.RunRepo == nil {
 		return false
 	}
@@ -4198,6 +4223,45 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 				Payload:   payload,
 			}); aerr != nil {
 				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: append operator_scope_path_undelivered audit entry failed",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", stageID.String()),
+					slog.String("error", aerr.Error()),
+				)
+			}
+		}
+	}
+
+	// Approval-condition responses signal (#3400). When the trigger carries
+	// operator approval conditions AND this round's gate evidence is
+	// BUNDLE-DERIVED — non-nil and not the #3042 VerifyEvidenceUnavailableReason
+	// placeholder allocated with no bundle in hand — the runner had the chance
+	// to peek the commit-message sidecar, so the ABSENCE of a responses section
+	// is meaningful. Set ApprovalConditionsAttached so writeGateEvidence renders
+	// the unrecorded bullet, and append ONE advisory audit row so the operator
+	// can tell "declined with a reason" from "silently ignored" on the run
+	// surface. A placeholder-only evidence (no bundle) sets neither: the
+	// section may well be in a sidecar this round never saw. The
+	// decomposed-parent review path (nil gate evidence, no bundle) is likewise
+	// untouched. EVIDENCE ONLY, the #1407/#2737 posture: never touches the
+	// review outcome, the stage result, or the fix-up budget.
+	if trig.ApprovalConditions != nil && gateEvidence != nil && bundleDerivedGateEvidence {
+		gateEvidence.ApprovalConditionsAttached = true
+		if gateEvidence.ApprovalConditionResponses == nil && s.cfg.AuditRepo != nil {
+			sourcePass := "implement"
+			if hasFixupRoutedConcern(trig.PriorConcerns) {
+				sourcePass = "fixup"
+			}
+			payload, _ := json.Marshal(approvalConditionsUnrecordedPayload{HeadSHA: headSHA, SourcePass: sourcePass})
+			systemKind := audit.ActorKind("system")
+			if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+				RunID:     runID,
+				StageID:   &stageID,
+				Timestamp: time.Now().UTC(),
+				Category:  approvalConditionsUnrecordedCategory,
+				ActorKind: &systemKind,
+				Payload:   payload,
+			}); aerr != nil {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: append approval_conditions_unrecorded audit entry failed",
 					slog.String("run_id", runID.String()),
 					slog.String("stage_id", stageID.String()),
 					slog.String("error", aerr.Error()),
@@ -7205,6 +7269,26 @@ func fixupAttemptCandidates(approvedPlan *plan.Plan, committed map[string]struct
 	return out
 }
 
+// isBundleDerivedGateEvidence reports whether a review round's gate evidence
+// came from an uploaded trace bundle (#3400), as opposed to the #3042
+// placeholder maybeBackstopFixupReReview allocates when NO bundle could be
+// loaded — a GateEvidence carrying ONLY VerifyEvidenceUnavailableReason. The
+// distinction gates the approval_conditions_unrecorded signal: only a round
+// that had a bundle can say the runner's sidecar peek found no section. It is
+// keyed on the placeholder's exact shape (reason set, nothing else populated)
+// rather than on `reason != ""`, because resolveStageGateEvidence's PARTIAL
+// path returns a real bundle WITH a reason stamped on it.
+func isBundleDerivedGateEvidence(ev *prompt.GateEvidence) bool {
+	if ev == nil {
+		return false
+	}
+	if ev.VerifyEvidenceUnavailableReason == "" {
+		return true
+	}
+	return len(ev.VerifyRuns) > 0 || ev.VerifySummary != nil || ev.ScopeFacts != nil ||
+		len(ev.PolicyViolations) > 0 || ev.ApprovalConditionResponses != nil
+}
+
 // gateEvidenceForReview maps the bundle's gate_evidence wire struct into
 // the prompt package's mirror (#963), keeping prompt free of a bundle
 // import — the same boundary pattern renderDiffForReview applies to
@@ -7304,6 +7388,16 @@ func gateEvidenceForReview(ev bundle.GateEvidence, folded []string) *prompt.Gate
 			Observed:    cf.Observed,
 			Restored:    cf.Restored,
 		})
+	}
+	// Commit-body approval-condition responses (#3400): the agent's OWN
+	// statement, peeked from its PROPOSED commit message at pack time. Rendered
+	// by writeGateEvidence inside an untrusted envelope; nil stays nil.
+	if ev.ApprovalConditionResponses != nil {
+		out.ApprovalConditionResponses = &prompt.GateApprovalConditionResponses{
+			Source:    ev.ApprovalConditionResponses.Source,
+			Text:      ev.ApprovalConditionResponses.Text,
+			Truncated: ev.ApprovalConditionResponses.Truncated,
+		}
 	}
 	return out
 }

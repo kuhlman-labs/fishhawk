@@ -1,0 +1,14 @@
+id: scenario:issue-3400/implement-prompt-names-commit-body-section
+statement: For an implement stage whose plan was approved with conditions, the rendered implement prompt instructs the agent to end the commit-message sidecar body with an `Approval conditions:` section carrying one entry per condition, including the explicit `no action required because` form; the same prompt for a plan approved without conditions contains no such instruction.
+verify_hint: GET /v0/stages/{implement_stage_id}/prompt on the localhost preview for a run approved with a non-empty reason contains the `Approval conditions:` heading instruction inside the 'Write the commit message' section; the same route for a run approved with no reason does not.
+steps: Same two-run drive as the replayed scenario (run A approved with two numbered conditions, run B approved with no comment); compared the rendered implement prompts.
+assertions:
+    expected: Conditions-approved prompt carries the `Approval conditions:` heading instruction including the `no action required because` form; no-conditions prompt does not.
+    observed_at_record: 'Run A: the commit-message section instructs the agent to END the sidecar body with a line exactly `Approval conditions:` followed by one entry per condition in operator order, `- condition N: <how this change satisfies it>` or `- condition N: no action required because <reason>`, and says the section is peeked into the review''s gate evidence. Run B: no such instruction (its commit-message bullets only say the approval-condition checklist stays in the PR description).'
+    repro_handle: GET /v0/stages/813e19b1-7bf7-4324-bef8-5457a61ab659/prompt (run A, conditions) vs GET /v0/stages/8a9b7b61-24d4-44e0-8b0b-d4795a452957/prompt (run B, none), signed; ids are from this session — re-create runs to reproduce.
+origin:
+    issue: 3400
+    pr: 3411
+    run_id: 23a04dc1-478f-4a83-96bf-9f7bfad75060
+    head_sha: aba62b6dc88b763822143458f9d237096b822846
+    recorded_at: 2026-09-14T04:49:16Z

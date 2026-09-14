@@ -2387,6 +2387,24 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		emitInitialCounterfactuals(cfg, scopePaths(cfg.scopeFiles), &res, logSink)
 	}
 
+	// Approval-condition responses (#3400). On EVERY implement pass kind
+	// (initial, decomposed child, fix-up) PEEK the pass's commit-message sidecar
+	// — read, never delete; the consuming loader still deletes it at commit
+	// time — and carry its `Approval conditions:` section into gate_evidence so
+	// the implement review can VERIFY the agent's own response to each operator
+	// condition instead of raising an evidence-placement concern the operator
+	// cannot discharge. The sidecar is the only thing that exists at pack time
+	// (the commit is made after the #742 forward-gated upload), so this is the
+	// agent's PROPOSED commit message; the persistence half is
+	// logApprovalConditionResponsesCommitted at the commit site. EVIDENCE ONLY:
+	// like its siblings this block NEVER touches res.OK / res.FailureCategory /
+	// budget.
+	if stageType == "implement" {
+		if ev := peekApprovalConditionResponses(cfg, logSink); ev != nil {
+			res.Events = append(res.Events, *ev)
+		}
+	}
+
 	// Emit the GenAI observability span for this stage as soon as the
 	// agent invocation (and any self-retries) settled — before bundle
 	// packing / upload, so a downstream upload failure doesn't lose
@@ -8156,6 +8174,10 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	if err != nil {
 		return fmt.Errorf("commit+push: %w", err)
 	}
+	// #3400: the commit now exists, so this is the ONE point where the
+	// approval-condition responses the pre-pack peek captured from the
+	// PROPOSED message can honestly be reported as committed.
+	logApprovalConditionResponsesCommitted(cfg, commitMessage, cap.HeadSHA, logSink)
 	if len(cap.ScopeDrift) > 0 {
 		driftJSON, _ := json.Marshal(cap.ScopeDrift)
 		_, _ = fmt.Fprintf(logSink,
@@ -10190,22 +10212,16 @@ func loadFixupCommitMessage(cfg config, logSink io.Writer) (subject, body string
 	// return path so a stale sidecar is never reused by a later pass.
 	defer func() { _ = os.Remove(path) }()
 
-	// TrimSpace strips leading/trailing whitespace (incl. leading blank lines),
-	// so an empty/whitespace-only sidecar is treated as missing (fallback wins).
-	text := strings.TrimSpace(strings.ReplaceAll(string(raw), "\r\n", "\n"))
-	if text == "" {
+	// parseCommitMessageSidecar (shared with the #3400 pre-pack peek, so the
+	// two read one grammar): CRLF-normalize + TrimSpace, so an empty/
+	// whitespace-only sidecar is treated as missing (fallback wins); first line
+	// is the subject, the trimmed remainder the body.
+	subject, body, ok = parseCommitMessageSidecar(raw)
+	if !ok {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"fixup_commitmsg_empty","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
 			cfg.runID, cfg.stageID, path)
 		return "", "", false
-	}
-	// First line is the subject; the remainder after the first newline (leading
-	// blank lines trimmed) is the body. text is already TrimSpace'd, so the
-	// first line is non-empty.
-	lines := strings.SplitN(text, "\n", 2)
-	subject = strings.TrimSpace(lines[0])
-	if len(lines) == 2 {
-		body = strings.TrimSpace(lines[1])
 	}
 	return subject, body, true
 }
@@ -10394,22 +10410,16 @@ func loadImplementCommitMessage(cfg config, logSink io.Writer) (subject, body st
 	// return path so a stale sidecar is never reused by a later run/stage.
 	defer func() { _ = os.Remove(path) }()
 
-	// TrimSpace strips leading/trailing whitespace (incl. leading blank lines),
-	// so an empty/whitespace-only sidecar is treated as missing (fallback wins).
-	text := strings.TrimSpace(strings.ReplaceAll(string(raw), "\r\n", "\n"))
-	if text == "" {
+	// parseCommitMessageSidecar (shared with the #3400 pre-pack peek, so the
+	// two read one grammar): CRLF-normalize + TrimSpace, so an empty/
+	// whitespace-only sidecar is treated as missing (fallback wins); first line
+	// is the subject, the trimmed remainder the body.
+	subject, body, ok = parseCommitMessageSidecar(raw)
+	if !ok {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"implement_commitmsg_empty","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
 			cfg.runID, cfg.stageID, path)
 		return "", "", false
-	}
-	// First line is the subject; the remainder after the first newline (leading
-	// blank lines trimmed) is the body. text is already TrimSpace'd, so the
-	// first line is non-empty.
-	lines := strings.SplitN(text, "\n", 2)
-	subject = strings.TrimSpace(lines[0])
-	if len(lines) == 2 {
-		body = strings.TrimSpace(lines[1])
 	}
 	return subject, body, true
 }

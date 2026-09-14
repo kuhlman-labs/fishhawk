@@ -350,6 +350,29 @@ type GateEvidence struct {
 	// The json tag MUST stay identical to the runner's composer; a drift
 	// silently DISABLES the gate.
 	DiffCoverage *DiffCoverageEvidence `json:"diff_coverage,omitempty"`
+	// ApprovalConditionResponses carries the `Approval conditions:` section the
+	// implement agent wrote at the end of its PROPOSED commit-message sidecar
+	// (#3400), peeked by the runner at bundle-pack time — BEFORE the commit
+	// exists — bounded (4 KiB, Truncated) and pre-redacted. It is agent-authored
+	// free text and the implement review renders it ONLY inside an UNTRUSTED
+	// envelope, framed as the agent's own response to each operator approval
+	// condition to be VERIFIED against the diff. Nil (the byte-identical
+	// default) on an older bundle or when no sidecar carried the section. The
+	// json tag MUST stay identical to the runner's composer — a one-sided edit
+	// silently DISABLES the signal, which is why the pair is pinned from BOTH
+	// modules against one shared literal JSON fixture.
+	ApprovalConditionResponses *ApprovalConditionResponsesEvidence `json:"approval_condition_responses,omitempty"`
+}
+
+// ApprovalConditionResponsesEvidence is the peeked commit-body responses
+// section (#3400). Source names the sidecar it came from (implement_commitmsg |
+// fixup_commitmsg), Text the bounded pre-redacted section text, Truncated
+// whether the runner's 4 KiB bound cut it. Mirrors the runner's
+// approvalConditionResponsesEvidence — json tags MUST stay identical.
+type ApprovalConditionResponsesEvidence struct {
+	Source    string `json:"source"`
+	Text      string `json:"text"`
+	Truncated bool   `json:"truncated,omitempty"`
 }
 
 // DiffCoverageEvidence is one diff-coverage measurement (#1888). Mirrors

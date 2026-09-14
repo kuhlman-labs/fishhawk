@@ -11957,3 +11957,309 @@ func TestGateAcceptanceTranscriptFromSummary(t *testing.T) {
 		t.Errorf("suppressed = %+v", sup)
 	}
 }
+
+// makeGateEvidenceBundle builds a gzip JSONL bundle whose gate_evidence event
+// carries the given payload verbatim — runner-shaped bytes for the #3400
+// cross-boundary tests (bundle.ExtractGateEvidence → gateEvidenceForReview →
+// prompt render → audit row).
+func makeGateEvidenceBundle(t *testing.T, gateEvidencePayload string) []byte {
+	t.Helper()
+	type line struct {
+		Seq  int             `json:"seq"`
+		TS   time.Time       `json:"ts"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	lines := []line{
+		{Seq: 1, Kind: bundle.EventKindManifest, Data: json.RawMessage(`{"bundle_schema":"v1","agent_failed":false}`)},
+		{Seq: 2, Kind: bundle.EventKindGateEvidence, Data: json.RawMessage(gateEvidencePayload)},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, err := json.Marshal(l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(raw.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gz.Bytes()
+}
+
+// bundleGateEvidenceForReview runs runner-shaped bundle bytes through the REAL
+// extractor and mapper, exactly as handleUploadTrace does.
+func bundleGateEvidenceForReview(t *testing.T, bundleBytes []byte) *prompt.GateEvidence {
+	t.Helper()
+	ev, err := bundle.ExtractGateEvidence(bundleBytes)
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	return gateEvidenceForReview(ev, nil)
+}
+
+// approvalConditionResponsesGatePayload is a runner-shaped gate_evidence
+// payload carrying the #3400 member (the shared wire fixture's shape).
+const approvalConditionResponsesGatePayload = `{"verify_runs":[{"command":"scripts/test verify","exit_code":0,"outcome":"passed"}],` +
+	`"scope_facts":{"declared_files":1},` +
+	`"approval_condition_responses":{"source":"implement_commitmsg","text":"- condition 1: added the drift test\n- condition 2: no action required because pkg/bar/perm.go is a permission"}}`
+
+const noApprovalConditionResponsesGatePayload = `{"verify_runs":[{"command":"scripts/test verify","exit_code":0,"outcome":"passed"}],` +
+	`"scope_facts":{"declared_files":1}}`
+
+func TestGateEvidenceForReview_ApprovalConditionResponses(t *testing.T) {
+	got := bundleGateEvidenceForReview(t, makeGateEvidenceBundle(t, `{"scope_facts":{"declared_files":1},`+
+		`"approval_condition_responses":{"source":"fixup_commitmsg","text":"- condition 1: done","truncated":true}}`))
+	want := &prompt.GateApprovalConditionResponses{Source: "fixup_commitmsg", Text: "- condition 1: done", Truncated: true}
+	if got.ApprovalConditionResponses == nil || *got.ApprovalConditionResponses != *want {
+		t.Errorf("ApprovalConditionResponses = %+v, want %+v", got.ApprovalConditionResponses, want)
+	}
+	if got.ApprovalConditionsAttached {
+		t.Errorf("the mapper must never set the backend-only Attached flag")
+	}
+	if plain := gateEvidenceForReview(bundle.GateEvidence{}, nil); plain.ApprovalConditionResponses != nil {
+		t.Errorf("payload without the key must map to nil")
+	}
+}
+
+// approvalConditionsUnrecordedRows returns the appended
+// approval_conditions_unrecorded payloads.
+func approvalConditionsUnrecordedRows(t *testing.T, au *auditFake) []approvalConditionsUnrecordedPayload {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var rows []approvalConditionsUnrecordedPayload
+	for i := range au.appended {
+		if au.appended[i].Category != approvalConditionsUnrecordedCategory {
+			continue
+		}
+		var p approvalConditionsUnrecordedPayload
+		if err := json.Unmarshal(au.appended[i].Payload, &p); err != nil {
+			t.Fatalf("unmarshal approval_conditions_unrecorded payload: %v", err)
+		}
+		if au.appended[i].ActorKind == nil || *au.appended[i].ActorKind != audit.ActorKind("system") {
+			t.Errorf("approval_conditions_unrecorded must carry the system actor")
+		}
+		rows = append(rows, p)
+	}
+	return rows
+}
+
+// TestRunImplementReviews_ApprovalConditionsUnrecorded_AuditRow is the #3400
+// cross-boundary pin: a trigger carrying approval conditions whose
+// runner-shaped bundle gate_evidence lacks the member appends EXACTLY ONE
+// approval_conditions_unrecorded row (system actor, head_sha, source_pass
+// implement) and hands the reviewer the unrecorded bullet.
+func TestRunImplementReviews_ApprovalConditionsUnrecorded_AuditRow(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	au.seeded = append(au.seeded, makeApproveWithCommentEntry(runRow.ID, "1. Add the drift test."))
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+	ev := bundleGateEvidenceForReview(t, makeGateEvidenceBundle(t, noApprovalConditionResponsesGatePayload))
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "deadbeef", ev) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	rows := approvalConditionsUnrecordedRows(t, au)
+	if len(rows) != 1 {
+		t.Fatalf("approval_conditions_unrecorded rows = %d, want exactly 1", len(rows))
+	}
+	if rows[0].HeadSHA != "deadbeef" || rows[0].SourcePass != "implement" {
+		t.Errorf("payload = %+v, want head_sha deadbeef / source_pass implement", rows[0])
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	if !strings.Contains(got, "`approval_conditions_unrecorded`") {
+		t.Errorf("reviewer prompt lacks the unrecorded bullet:\n%s", got)
+	}
+	if strings.Contains(got, "<<<BEGIN UNTRUSTED COMMIT-BODY RESPONSES>>>") {
+		t.Errorf("no responses → no envelope")
+	}
+}
+
+// TestRunImplementReviews_ApprovalConditionResponses_Rendered: a bundle
+// carrying the member renders the envelope in the reviewer prompt and appends
+// NO unrecorded row.
+func TestRunImplementReviews_ApprovalConditionResponses_Rendered(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	au.seeded = append(au.seeded, makeApproveWithCommentEntry(runRow.ID, "1. Add the drift test.\n2. Leave pkg/bar/perm.go untouched."))
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+	ev := bundleGateEvidenceForReview(t, makeGateEvidenceBundle(t, approvalConditionResponsesGatePayload))
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "deadbeef", ev) {
+		t.Fatal("gating approve must not gate")
+	}
+	if rows := approvalConditionsUnrecordedRows(t, au); len(rows) != 0 {
+		t.Errorf("responses present must append no unrecorded row; got %+v", rows)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	got := reviewer.calls[0]
+	for _, w := range []string{
+		"\n<<<BEGIN UNTRUSTED COMMIT-BODY RESPONSES>>>\n",
+		"| - condition 2: no action required because pkg/bar/perm.go is a permission",
+		"\n<<<END UNTRUSTED COMMIT-BODY RESPONSES>>>\n",
+		"`evidence_conflict`",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("reviewer prompt missing %q:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "approval_conditions_unrecorded") {
+		t.Errorf("responses present must not render the unrecorded bullet")
+	}
+}
+
+// TestRunImplementReviews_NoApprovalConditions_NoSignal: no conditions → no
+// flag, no row, and the prompt is byte-identical to a conditions-less render.
+func TestRunImplementReviews_NoApprovalConditions_NoSignal(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+	ev := bundleGateEvidenceForReview(t, makeGateEvidenceBundle(t, noApprovalConditionResponsesGatePayload))
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "deadbeef", ev) {
+		t.Fatal("gating approve must not gate")
+	}
+	if rows := approvalConditionsUnrecordedRows(t, au); len(rows) != 0 {
+		t.Errorf("no conditions must append no row; got %+v", rows)
+	}
+	if ev.ApprovalConditionsAttached {
+		t.Errorf("no conditions must not set Attached")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	for _, w := range []string{"approval_conditions_unrecorded", "UNTRUSTED COMMIT-BODY RESPONSES", "Approval-condition responses"} {
+		if strings.Contains(reviewer.calls[0], w) {
+			t.Errorf("conditions-less prompt leaks %q", w)
+		}
+	}
+}
+
+// TestRunImplementReviews_FixupBackstopPlaceholder_NoUnrecordedRow: the #3042
+// placeholder (a GateEvidence carrying ONLY VerifyEvidenceUnavailableReason —
+// no bundle in hand) with conditions attached sets neither the flag nor the
+// row: the round never saw the sidecar peek, so absence means nothing.
+// COUNTERFACTUAL: delete the bundle-derived guard and this goes RED.
+func TestRunImplementReviews_FixupBackstopPlaceholder_NoUnrecordedRow(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	au.seeded = append(au.seeded, makeApproveWithCommentEntry(runRow.ID, "1. Add the drift test."))
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+	placeholder := &prompt.GateEvidence{VerifyEvidenceUnavailableReason: "no_redacted_trace_for_stage"}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "deadbeef", placeholder) {
+		t.Fatal("gating approve must not gate")
+	}
+	if rows := approvalConditionsUnrecordedRows(t, au); len(rows) != 0 {
+		t.Errorf("placeholder evidence must append no row; got %+v", rows)
+	}
+	if placeholder.ApprovalConditionsAttached {
+		t.Errorf("placeholder evidence must not set Attached")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if strings.Contains(reviewer.calls[0], "approval_conditions_unrecorded") {
+		t.Errorf("placeholder round must not render the unrecorded bullet")
+	}
+	// The nil-evidence (consolidated / decomposed-parent) path is likewise silent.
+	s2, _, au2, _, runRow2, implStage2 := newImplementReviewServer(t, &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-7"}, specImplementGatingReviewers)
+	au2.seeded = append(au2.seeded, makeApproveWithCommentEntry(runRow2.ID, "1. Add the drift test."))
+	s2.runImplementReviews(t.Context(), runRow2.ID, implStage2.ID, diff, nil, "deadbeef", nil)
+	if rows := approvalConditionsUnrecordedRows(t, au2); len(rows) != 0 {
+		t.Errorf("nil evidence must append no row; got %+v", rows)
+	}
+}
+
+// TestRunImplementReviews_ApprovalConditionsUnrecorded_SignalDoesNotAlterOutcome
+// mirrors the #2737 outcome-invariance pin: the firing arm and the baseline
+// arm agree on review dispatch result, stage state and fix-up budget.
+func TestRunImplementReviews_ApprovalConditionsUnrecorded_SignalDoesNotAlterOutcome(t *testing.T) {
+	type outcome struct {
+		gated       bool
+		stageState  run.StageState
+		fixupPasses int
+		signalFired int
+	}
+	arm := func(t *testing.T, payload string) outcome {
+		t.Helper()
+		reviewer := &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+			model:   "claude-opus-4-7",
+		}
+		s, _, au, rr, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+		au.seeded = append(au.seeded, makeApproveWithCommentEntry(runRow.ID, "1. Add the drift test."))
+		diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+		ev := bundleGateEvidenceForReview(t, makeGateEvidenceBundle(t, payload))
+		gated := s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "deadbeef", ev)
+		passes, err := s.countFixupPasses(t.Context(), runRow.ID, implStage.ID)
+		if err != nil {
+			t.Fatalf("countFixupPasses: %v", err)
+		}
+		st, err := rr.GetStage(t.Context(), implStage.ID)
+		if err != nil {
+			t.Fatalf("GetStage: %v", err)
+		}
+		return outcome{gated: gated, stageState: st.State, fixupPasses: passes,
+			signalFired: countAppendedByCategory(au, approvalConditionsUnrecordedCategory)}
+	}
+	fired := arm(t, noApprovalConditionResponsesGatePayload)
+	baseline := arm(t, approvalConditionResponsesGatePayload)
+	if fired.signalFired != 1 || baseline.signalFired != 0 {
+		t.Fatalf("arms not discriminating: fired=%d baseline=%d", fired.signalFired, baseline.signalFired)
+	}
+	if fired.gated != baseline.gated || fired.stageState != baseline.stageState || fired.fixupPasses != baseline.fixupPasses {
+		t.Errorf("signal altered the outcome: fired=%+v baseline=%+v", fired, baseline)
+	}
+}
+
+// TestRunImplementReviews_ApprovalConditionsUnrecorded_AppendFailureIsBestEffort:
+// an AuditRepo failure on the advisory row is WARN-logged and the review still
+// dispatches with the unrecorded bullet — the signal never gates the round.
+func TestRunImplementReviews_ApprovalConditionsUnrecorded_AppendFailureIsBestEffort(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	au.seeded = append(au.seeded, makeApproveWithCommentEntry(runRow.ID, "1. Add the drift test."))
+	au.appendErrCategory = approvalConditionsUnrecordedCategory
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+	ev := bundleGateEvidenceForReview(t, makeGateEvidenceBundle(t, noApprovalConditionResponsesGatePayload))
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "deadbeef", ev) {
+		t.Fatal("gating approve must not gate")
+	}
+	if rows := approvalConditionsUnrecordedRows(t, au); len(rows) != 0 {
+		t.Errorf("append failed, so no row must be recorded; got %+v", rows)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 || !strings.Contains(reviewer.calls[0], "`approval_conditions_unrecorded`") {
+		t.Errorf("review must still dispatch with the unrecorded bullet after an append failure")
+	}
+}
