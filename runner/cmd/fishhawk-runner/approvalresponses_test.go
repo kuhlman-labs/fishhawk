@@ -239,6 +239,32 @@ func TestPeekApprovalConditionResponses(t *testing.T) {
 		}
 	})
 
+	t.Run("credential straddling the byte bound leaves no fragment", func(t *testing.T) {
+		// Redaction must run BEFORE bounding: a ghp_ token needs exactly 36
+		// trailing chars to match, so cutting first would leave an
+		// unrecognizable prefix (ghp_ + leading bytes) in the carried text.
+		// Place the token so the 4096-byte cut lands in its middle.
+		redirectCommitMessageDirs(t)
+		const secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab"
+		pad := strings.Repeat("a", approvalConditionResponsesMaxBytes-len("- condition 1: ")-len(secret)/2)
+		section := "- condition 1: " + pad + secret + " used to verify\n"
+		if got := len(section); got <= approvalConditionResponsesMaxBytes {
+			t.Fatalf("fixture must exceed the bound: len=%d", got)
+		}
+		msg := "feat: x\n\nApproval conditions:\n" + section
+		if err := os.WriteFile(implementCommitMessagePath(cfg.runID, cfg.stageID), []byte(msg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var logSink strings.Builder
+		p := decodeACR(t, peekApprovalConditionResponses(cfg, &logSink))
+		if strings.Contains(p.Text, "ghp_") {
+			t.Fatalf("credential fragment reached the event payload: %q", p.Text[len(p.Text)-64:])
+		}
+		if !p.Truncated || len(p.Text) > approvalConditionResponsesMaxBytes {
+			t.Errorf("truncated=%v len=%d", p.Truncated, len(p.Text))
+		}
+	})
+
 	t.Run("over-bound section → truncated=true", func(t *testing.T) {
 		redirectCommitMessageDirs(t)
 		msg := "feat: x\n\nApproval conditions:\n" + strings.Repeat("- condition 1: long\n", 400)

@@ -109,7 +109,12 @@ func approvalConditionResponsesSource(cfg config) (path, source string) {
 //
 // The text is pre-redacted with redactString: the implement review dispatches
 // on the RAW bundle (#793), so a credential the agent pasted into its commit
-// body would otherwise reach the reviewer prompt unredacted.
+// body would otherwise reach the reviewer prompt unredacted. Redaction runs
+// BEFORE the byte bound: a credential straddling the cut would otherwise be
+// truncated to a prefix the patterns no longer recognize (ghp_ needs exactly
+// 36 trailing chars), leaking the leading bytes of a token; redacting the
+// full text first means the cut can only fall inside a marker, never a
+// secret, and the bound still holds because it is applied last.
 func peekApprovalConditionResponses(cfg config, logSink io.Writer) *agent.Event {
 	path, source := approvalConditionResponsesSource(cfg)
 	// readSidecarBounded is the ceiling control: over maxSidecarBytes it
@@ -129,8 +134,8 @@ func peekApprovalConditionResponses(cfg config, logSink io.Writer) *agent.Event 
 	if !found {
 		return nil
 	}
-	text, truncated := boundApprovalConditionResponses(text)
 	text, _ = redactString(text)
+	text, truncated := boundApprovalConditionResponses(text)
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"approval_condition_responses_captured","run_id":%q,"stage_id":%q,"source":%q,"bytes":%d,"truncated":%t}`+"\n",
 		cfg.runID, cfg.stageID, source, len(text), truncated)
