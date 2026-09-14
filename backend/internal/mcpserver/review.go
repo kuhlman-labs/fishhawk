@@ -19,10 +19,12 @@ import (
 //   - "none"     — no review was configured (no *_review_started entry).
 //   - "pending"  — a review was dispatched (a *_review_started entry exists)
 //     but fewer than the configured agent count of terminal entries have
-//     landed yet. The round is still running. A reviewer that errors or
-//     times out now writes a terminal *_review_failed entry (#664), so
-//     "pending" no longer subsumes a silent failure — it means genuinely
-//     still-in-flight. Since #1127 "pending" also covers the PARTIAL-LANDING
+//     landed yet. A reviewer that errors or times out now writes a terminal
+//     *_review_failed entry (#664), so "pending" no longer subsumes a
+//     reviewer-side silent failure — but it is an audit-trail reading, not
+//     observed liveness: a fishhawkd restart (#2712) or a delivered-nothing
+//     fix-up (#3395) can leave a round pending with no reviewer behind it.
+//     Since #1127 "pending" also covers the PARTIAL-LANDING
 //     window in the heterogeneous topology: when the first of N configured
 //     reviewers has landed but the others have not, the status stays
 //     "pending" rather than reporting a half result as "complete".
@@ -1354,8 +1356,10 @@ func (*runResolver) awaitStrandedOutput(stage string, s *reviewStrand, start tim
 // switch to fishhawk_get_run_status polling) as the next step and carries
 // the server-suggested poll cadence. Since #664 a reviewer that errors or
 // times out writes a terminal *_review_failed entry that resolves to a
-// definite 'failed' status, so a lingering 'pending' still means the review
-// is genuinely in flight.
+// definite 'failed' status, so a lingering 'pending' means no terminal
+// verdict has landed — NOT that the reviewer is observed running (#3395: a
+// restart or a delivered-nothing fix-up can leave a round pending with no
+// reviewer behind it).
 //
 // terminalInFlight (#1915): when the run went terminal while the review was
 // still in flight, the verdict IS recorded server-side (unguarded) and will
@@ -1424,7 +1428,11 @@ func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start t
 			"re-park whose pass then died without pushing, fishhawk_get_run_status carries a fixup_recovery marker for " +
 			"the implement stage"
 	}
-	out.Message = fmt.Sprintf("%s review still pending after %ds — the review is still running (%s). The wait holds "+
+	// The outer clause states only what is observable from the audit trail — no
+	// terminal verdict has landed — never that the reviewer is running. The
+	// old "the review is still running (…)" prefix asserted exactly the
+	// liveness the parenthetical disclaims (#3395 fix-up).
+	out.Message = fmt.Sprintf("%s review still pending after %ds — no terminal verdict has landed (%s). The wait holds "+
 		"nothing: re-call fishhawk_await_review to resume it, or poll fishhawk_get_run_status every %ds (the "+
 		"authoritative path). Check the fishhawkd logs if this persists.",
 		stage, timeout, verified, suggestedReviewPollIntervalSeconds)

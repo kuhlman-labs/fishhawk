@@ -218,16 +218,22 @@ func TestLatestFixupRecovery_RoundClosureFields(t *testing.T) {
 			wantAbsent:   []string{"no routed concern needed re-opening"},
 		},
 		{
-			name:         "pushed before death",
-			sig:          fixupRecoverySignal{Sequence: 11, Parsed: true, DeliveredNothing: &fal},
-			wantDN:       &fal,
-			wantContains: []string{"The pass pushed a commit before it died; the re-review of that head governs."},
-			wantAbsent:   []string{"PREVIOUS review round stands again", "re-opening"},
+			// The pushed outcome must be CONSISTENT end to end: the opening
+			// and the `git log` confirmation may not describe an absent commit
+			// the closure sentence then says was pushed.
+			name:   "pushed before death",
+			sig:    fixupRecoverySignal{Sequence: 11, Parsed: true, DeliveredNothing: &fal},
+			wantDN: &fal,
+			wantContains: []string{"the fix-up pass FAILED after pushing a commit", "the fix-up commit is present",
+				"NOT confirmed addressed", "The pass pushed a commit before it died; the re-review of that head governs."},
+			wantAbsent: []string{"pushed no commit", "the fix-up commit is absent", "were NOT addressed",
+				"PREVIOUS review round stands again", "re-opening"},
 		},
 		{
-			name:       "legacy entry without the key says nothing about the round",
-			sig:        fixupRecoverySignal{Sequence: 11, Parsed: true},
-			wantAbsent: []string{"PREVIOUS review round stands again", "The pass pushed a commit before it died", "re-opening"},
+			name:         "legacy entry without the key says nothing about the round",
+			sig:          fixupRecoverySignal{Sequence: 11, Parsed: true},
+			wantContains: []string{"pushed no commit", "the fix-up commit is absent"},
+			wantAbsent:   []string{"PREVIOUS review round stands again", "The pass pushed a commit before it died", "re-opening", "FAILED after pushing"},
 		},
 	}
 	for _, tc := range cases {
@@ -266,6 +272,29 @@ func TestLatestFixupRecovery_RoundClosureFields(t *testing.T) {
 // carries store error text, so it gets the same structure-neutralization the
 // reason does — a newline or a fence in it cannot break the marker's one-line
 // prose.
+// TestFixupRecoveryMessage_PushedOutcomeCompleteAdvisory pins the COMPLETE
+// advisory for the pushed-before-death outcome (#3395 fix-up). A substring
+// test on the closure sentence alone accepted a message whose opening said
+// "pushed no commit" and whose confirmation said "the fix-up commit is absent"
+// immediately before the closure said the pass pushed one; pinning the whole
+// string is what makes a contradictory clause anywhere in it a red test.
+func TestFixupRecoveryMessage_PushedOutcomeCompleteAdvisory(t *testing.T) {
+	fal := false
+	msg := fixupRecoveryMessage(&FixupRecovery{RestoredState: "succeeded", DetailsAvailable: true, DeliveredNothing: &fal})
+	const want = "the fix-up pass FAILED after pushing a commit; the stage was restored to its prior state (which is why " +
+		"status reads 'succeeded') — the PR head carries that fix-up commit, but the pass died before it finished, so treat " +
+		"your routed concerns as NOT confirmed addressed until the re-review of that head reports. Confirm with `git log` " +
+		"on the PR head: the fix-up commit is present. The pass pushed a commit before it died; the re-review of that head " +
+		"governs. Fix-up budget, as it stands today: a fix-up pass that delivered NOTHING to the PR branch is refunded " +
+		"against the normal budget — whether it died category-A (harness, #3085) or category-C (infrastructure, #1957), or " +
+		"produced no commit at all (#967). A category-B (policy) failure still CONSUMES a pass, as does any pass that pushed " +
+		"a commit before it died. Since #3335 a delivered-nothing pass is credited against the hard ceiling as well as the " +
+		"normal budget, capped at 3 such credits, so the absolute bound is 6 triggered passes."
+	if msg != want {
+		t.Errorf("pushed-outcome advisory is not the exact consistent message\nwant: %q\ngot:  %q", want, msg)
+	}
+}
+
 func TestLatestFixupRecovery_ReopenErrorIsNeutralized(t *testing.T) {
 	tru := true
 	rec := latestFixupRecovery([]int64{10}, []fixupRecoverySignal{{

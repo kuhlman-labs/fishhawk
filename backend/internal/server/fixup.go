@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 
@@ -1721,11 +1722,83 @@ func fixupRecoveryCategoryLabel(c *run.FailureCategory) string {
 	return string(*c)
 }
 
+// The reason is UNTRUSTED: it was produced while an agent ran commands
+// against an untrusted repository, and from here it lands in the durable
+// concern ledger's state_reason, which the gate view returns and issue-comment
+// surfaces may render. So it is structure-neutralized BEFORE it is bounded
+// (neutralize first so the cap bounds the bytes that actually ship), the same
+// discipline the MCP choke point applies to the recovery marker
+// (mcpserver.neutralizeUntrustedFailureText).
 func fixupRecoveryReasonLabel(r *string) string {
 	if r == nil || strings.TrimSpace(*r) == "" {
 		return "no reason recorded"
 	}
-	return truncate(*r, 200)
+	return truncate(neutralizeUntrustedFixupText(*r), 200)
+}
+
+// neutralizeUntrustedFixupText defangs the injection-shaped STRUCTURE of an
+// untrusted fix-up failure string while preserving every word of it, before
+// the text is written into a concern's state_reason (#3395 fix-up). Two
+// transforms, neither of which deletes a word:
+//
+//   - every control character (newline, carriage return, tab, any other
+//     unicode.IsControl rune) becomes a single space, so injected line
+//     structure cannot let the text pose as a new section, a new speaker turn
+//     or a fresh set of rules on whichever surface renders the reason;
+//   - runs of three or more of ANY structural rune — '<', '>', '`' or '~' —
+//     are RUN-SPLIT into chunks of two separated by a space, so the text can
+//     neither emit a live `<<<BEGIN …>>>` / `<<<END …>>>` quarantine
+//     delimiter nor open or close a fenced block around surrounding prose.
+//
+// It is a byte-for-byte duplicate of mcpserver.neutralizeUntrustedFailureText
+// (and mirrors prompt.neutralizeEnvelopeDelimiters); both are unexported in
+// other packages and the server must not import the MCP tool library for one
+// helper. The run-splitter is deliberately NOT a pairwise strings.ReplaceAll,
+// which is non-overlapping and leaves ">>>>" as a live "> >>>". Pure,
+// deterministic and idempotent.
+func neutralizeUntrustedFixupText(s string) string {
+	var out strings.Builder
+	out.Grow(len(s) + len(s)/2 + 1)
+	runes := []rune(s)
+	for i := 0; i < len(runes); {
+		c := runes[i]
+		if !isUntrustedFixupStructuralRune(c) {
+			if unicode.IsControl(c) {
+				out.WriteByte(' ')
+			} else {
+				out.WriteRune(c)
+			}
+			i++
+			continue
+		}
+		j := i
+		for j < len(runes) && runes[j] == c {
+			j++
+		}
+		run := j - i
+		if run < 3 {
+			out.WriteString(string(runes[i:j]))
+			i = j
+			continue
+		}
+		for k := 0; k < run; k += 2 {
+			if k > 0 {
+				out.WriteByte(' ')
+			}
+			out.WriteRune(c)
+			if k+1 < run {
+				out.WriteRune(c)
+			}
+		}
+		i = j
+	}
+	return out.String()
+}
+
+// isUntrustedFixupStructuralRune names the runes neutralizeUntrustedFixupText
+// run-splits: the two envelope-delimiter halves and the two fence characters.
+func isUntrustedFixupStructuralRune(c rune) bool {
+	return c == '<' || c == '>' || c == '`' || c == '~'
 }
 
 // fixupDeliveredNothing reports whether the fix-up pass opened by the

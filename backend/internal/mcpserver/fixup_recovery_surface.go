@@ -236,9 +236,12 @@ func latestFixupRecovery(triggerSeqs []int64, recoveries []fixupRecoverySignal) 
 // marker this reads.
 //
 // It states four things an operator acting on a bare `succeeded` would get
-// wrong: the fix-up pass FAILED and pushed no commit; the stage was RESTORED to
-// its prior state, which is why the status reads succeeded; the PR head still
-// carries the pre-fix-up commit and the routed concerns were NOT addressed; and
+// wrong: the fix-up pass FAILED and pushed no commit (or, when the backend
+// verified it DID push before dying, that the PR head carries that commit and
+// the re-review of it governs — the two outcomes must never share a sentence
+// that is true of only one); the stage was RESTORED to its prior state, which
+// is why the status reads succeeded; the PR head still carries the pre-fix-up
+// commit and the routed concerns were NOT addressed; and
 // the fix-up BUDGET rule as it stands today — a pass that delivered NOTHING to
 // the PR branch is refunded whether it died category-A (harness, #3085) or
 // category-C (infrastructure, #1957), or produced no commit at all (#967),
@@ -250,7 +253,16 @@ func fixupRecoveryMessage(rec *FixupRecovery) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("the fix-up pass FAILED and pushed no commit; the stage was restored to its prior state (which is why status reads 'succeeded') — the PR head still carries the pre-fix-up commit and your routed concerns were NOT addressed.")
+	// The opening and the `git log` confirmation are keyed to what the backend
+	// actually verified about the PR branch (#3395 fix-up): a pass that
+	// PUSHED before it died must not be described as having pushed nothing,
+	// nor told to confirm an absent commit that is present.
+	pushed := rec.DeliveredNothing != nil && !*rec.DeliveredNothing
+	if pushed {
+		b.WriteString("the fix-up pass FAILED after pushing a commit; the stage was restored to its prior state (which is why status reads 'succeeded') — the PR head carries that fix-up commit, but the pass died before it finished, so treat your routed concerns as NOT confirmed addressed until the re-review of that head reports.")
+	} else {
+		b.WriteString("the fix-up pass FAILED and pushed no commit; the stage was restored to its prior state (which is why status reads 'succeeded') — the PR head still carries the pre-fix-up commit and your routed concerns were NOT addressed.")
+	}
 	switch {
 	case !rec.DetailsAvailable:
 		b.WriteString(" The recovery audit entry could not be decoded, so no source failure detail is available (details_available=false); read the stage_fixup_recovered entry with fishhawk_list_audit.")
@@ -274,7 +286,11 @@ func fixupRecoveryMessage(rec *FixupRecovery) string {
 		}
 		b.WriteString(" " + fixupRecoveryUntrustedClose)
 	}
-	b.WriteString(" Confirm with `git log` on the PR head: the fix-up commit is absent.")
+	if pushed {
+		b.WriteString(" Confirm with `git log` on the PR head: the fix-up commit is present.")
+	} else {
+		b.WriteString(" Confirm with `git log` on the PR head: the fix-up commit is absent.")
+	}
 	b.WriteString(fixupRoundClosureSentence(rec))
 	b.WriteString(" Fix-up budget, as it stands today: a fix-up pass that delivered NOTHING to the PR branch is refunded against the normal budget — whether it died category-A (harness, #3085) or category-C (infrastructure, #1957), or produced no commit at all (#967). A category-B (policy) failure still CONSUMES a pass, as does any pass that pushed a commit before it died. Since #3335 a delivered-nothing pass is credited against the hard ceiling as well as the normal budget, capped at 3 such credits, so the absolute bound is 6 triggered passes.")
 	return b.String()

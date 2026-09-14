@@ -1610,22 +1610,48 @@ func TestAwaitPendingTimeoutOutput_VerifiedWordingNamesTimestampOrdering(t *test
 		StartedAt:          start.Add(-10 * time.Minute),
 		DaemonProcessStart: start.Add(-30 * time.Minute),
 	})
-	for _, forbidden := range []string{"reviewer(s) are still running", "reviewers are still running", "genuinely still running"} {
+	// Any "still running" phrasing is forbidden ANYWHERE in the message — not
+	// just the three historical forms. The outer clause used to read "the
+	// review is still running (…)", asserting exactly the liveness the
+	// parenthetical disclaims; a bare substring check is what lets that
+	// composite survive a fix that only rewrites the parenthetical.
+	for _, forbidden := range []string{"still running", "is running", "are running", "genuinely"} {
 		if strings.Contains(out.Message, forbidden) {
 			t.Errorf("verified timeout message still asserts unobserved liveness %q: %q", forbidden, out.Message)
 		}
 	}
-	const wantExact = "verified only that the round's dispatch postdates the serving fishhawkd's boot, so it was NOT orphaned " +
-		"by a restart — a timestamp ordering, not observed reviewer liveness; if this round was opened by a fix-up " +
-		"re-park whose pass then died without pushing, fishhawk_get_run_status carries a fixup_recovery marker for " +
-		"the implement stage"
-	if !strings.Contains(out.Message, wantExact) {
-		t.Errorf("verified timeout message does not carry the exact bounded claim\nwant substring: %q\ngot: %q", wantExact, out.Message)
+	// The COMPLETE emitted message is pinned, so no clause outside the
+	// bounded claim can re-introduce a liveness assertion unnoticed.
+	const wantExact = "implement review still pending after 360s — no terminal verdict has landed (verified only that the " +
+		"round's dispatch postdates the serving fishhawkd's boot, so it was NOT orphaned by a restart — a timestamp " +
+		"ordering, not observed reviewer liveness; if this round was opened by a fix-up re-park whose pass then died " +
+		"without pushing, fishhawk_get_run_status carries a fixup_recovery marker for the implement stage). The wait " +
+		"holds nothing: re-call fishhawk_await_review to resume it, or poll fishhawk_get_run_status every 15s (the " +
+		"authoritative path). Check the fishhawkd logs if this persists."
+	if out.Message != wantExact {
+		t.Errorf("verified timeout message is not the exact bounded message\nwant: %q\ngot:  %q", wantExact, out.Message)
 	}
 	for _, want := range []string{"timestamp ordering", "fixup_recovery"} {
 		if !strings.Contains(out.Message, want) {
 			t.Errorf("verified timeout message missing %q: %q", want, out.Message)
 		}
+	}
+}
+
+// TestAwaitPendingTimeoutOutput_NeutralWordingClaimsNoLiveness covers the
+// OTHER supported timeout branch — the pre-#2712 neutral fallback taken when
+// the boundary comparison never ran (nil strand) — so that no branch of the
+// pending-after-timeout message asserts reviewer liveness (#3395 fix-up).
+func TestAwaitPendingTimeoutOutput_NeutralWordingClaimsNoLiveness(t *testing.T) {
+	r := &runResolver{}
+	out := r.awaitPendingTimeoutOutput("plan", 120, time.Now(), false, false, 600, nil)
+	for _, forbidden := range []string{"still running", "is running", "are running", "genuinely"} {
+		if strings.Contains(out.Message, forbidden) {
+			t.Errorf("neutral timeout message asserts unobserved liveness %q: %q", forbidden, out.Message)
+		}
+	}
+	if !strings.HasPrefix(out.Message, "plan review still pending after 120s — no terminal verdict has landed (no terminal audit entry yet;") {
+		t.Errorf("neutral timeout message does not open with the audit-trail reading: %q", out.Message)
 	}
 }
 
