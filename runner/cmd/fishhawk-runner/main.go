@@ -2230,6 +2230,35 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
+	// Unused approved mid-stage grant (#3390). An operator APPROVED a scope
+	// amendment for this stage, the fold put its paths into cfg.scopeFiles,
+	// and yet the agent never touched the granted file — run faf4cf76's shape,
+	// where the grant was in force but the fresh fix agent was never told and
+	// the stage died in the verify-fix loop with the granted file unedited.
+	// Compare this stage's approved-amendment paths against the working
+	// tree's dirty set and, for each untouched grant, emit a
+	// scope_amendment_grant_unused JSONL line + policy_event, and — ONLY when
+	// the stage is already failing — append the one-line attribution
+	// `amendment <id> granted <path> (<op>); file not modified` to the reason.
+	//
+	// PLACEMENT is load-bearing: here the working tree still carries the
+	// agent's edits (the fix loop's `git reset --soft HEAD~1` keeps them and
+	// the index), while the #943 drift cleanup / working_tree_restored that
+	// would erase the evidence runs later. On the SUCCESS path the pre-push
+	// scope-completeness gate (#1151, MissingScopeFiles over the folded
+	// gateScopeFiles) is what fails an unused grant category-B; this block adds
+	// the amendment-id attribution that gate cannot name, and covers the
+	// FAILURE path the #1151 gate structurally never reaches. It runs on both
+	// paths (the event is evidence) and NEVER touches res.OK /
+	// res.FailureCategory / invokeErr — every degrade is fail-open.
+	if stageType == "implement" && !cfg.noPR && len(cfg.approvedAmendments) > 0 {
+		unused, unusedEvents := detectUnusedScopeAmendmentGrants(ctx, cfg, logSink)
+		res.Events = append(res.Events, unusedEvents...)
+		if !res.OK && len(unused) > 0 {
+			res.FailureReason = annotateUnusedAmendmentFailure(res.FailureReason, unused)
+		}
+	}
+
 	// Diff-coverage measurement (#1888 / ADR-059). Placed AFTER the
 	// committed-tree verify gates above — the tree is final and the agent
 	// has stopped writing — and BEFORE composeGateEvidence folds the event
@@ -4998,7 +5027,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		// push the spawn past the OS argument-size limit (E2BIG). The full
 		// output remains on the verify_run trace event.
 		var elided int
-		fixInv.Prompt, elided = verifyFixPrompt(cfg.verifyCmd, out)
+		fixInv.Prompt, elided = verifyFixPrompt(cfg.verifyCmd, out, cfg.scopeFiles, cfg.approvedAmendments)
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_fix_reinvoke","run_id":%q,"stage_id":%q,"iteration":%d,"prompt_bytes":%d,"output_bytes":%d,"output_elided_bytes":%d}`+"\n",
 			cfg.runID, cfg.stageID, iter+1, len(fixInv.Prompt), len(out), elided)
@@ -5341,21 +5370,121 @@ func boundVerifyFixOutput(out string) (excerpt string, elided int) {
 // to make the tests pass without relying on files outside the approved scope.
 // It returns the prompt and the number of output bytes elided (0 when the
 // output fit).
-func verifyFixPrompt(verifyCmd, output string) (prompt string, elidedBytes int) {
+//
+// The prompt names the EFFECTIVE scope explicitly (#3390): the fix agent is a
+// FRESH invocation that never saw the original prompt's scope list, and the
+// fold (refreshScopeAmendments) runs BEFORE this loop, so a path an operator
+// granted mid-stage is editable here yet was invisible to the agent — run
+// faf4cf76 spent both fix iterations without touching the granted file. When
+// scope is non-empty it is listed as the only editable set; when it is empty
+// (the `git add -A` fallback) the section is omitted. When granted is
+// non-empty a GRANTED MID-STAGE block names each amendment id, its paths and
+// the operator's decision_reason (trusted operator text, the same standing as
+// an approval condition); the agent-authored amendment `reason` is
+// deliberately NOT rendered so untrusted agent prose is never re-injected
+// into a later invocation.
+func verifyFixPrompt(verifyCmd, output string, scope []upload.ScopeFile, granted []upload.ScopeAmendment) (prompt string, elidedBytes int) {
 	excerpt, elided := boundVerifyFixOutput(output)
-	return fmt.Sprintf(`The verify command failed against the committed scope-only tree.
+	var b strings.Builder
+	fmt.Fprintf(&b, `The verify command failed against the committed scope-only tree.
 
 Command:
 %s
 
 Output:
 %s
+`, verifyCmd, excerpt)
 
-Edit the code so this command passes. The fix must live in the files you are
-already allowed to change (the approved scope) — a change that only works
+	if scopeLines := renderEffectiveScope(scope); scopeLines != "" {
+		b.WriteString("\n" + verifyFixEffectiveScopeHeader + "\n")
+		b.WriteString(scopeLines)
+	}
+	if grantLines := renderGrantedAmendments(granted); grantLines != "" {
+		b.WriteString("\n" + verifyFixGrantedMarker + "\n")
+		b.WriteString(grantLines)
+		b.WriteString(`These paths were added to your scope by an OPERATOR DECISION after the
+original prompt was written and are in force for this fix. If the failure
+above is what the amendment was requested to fix, make the edit in the granted
+file now. Do not work around it in another file, and do not treat the grant as
+pending or denied.
+`)
+	}
+
+	allowed := "the files you are\nalready allowed to change (the approved scope)"
+	if len(scope) > 0 {
+		allowed = "the files listed under\n\"Effective scope\" above"
+	}
+	fmt.Fprintf(&b, `
+Edit the code so this command passes. The fix must live in %s — a change that only works
 because of an out-of-scope file will be dropped when the commit is scoped and
 will fail verification again. Make the smallest change that turns the command
-green.`, verifyCmd, excerpt), elided
+green.`, allowed)
+	return b.String(), elided
+}
+
+// verifyFixGrantedMarker heads the GRANTED MID-STAGE block of the fix prompt
+// (#3390). A named constant so the e2e prompt assertions and the renderer
+// cannot drift apart.
+const verifyFixGrantedMarker = "GRANTED MID-STAGE — approved scope amendment(s) now IN FORCE:"
+
+// verifyFixEffectiveScopeHeader heads the effective-scope list of the fix
+// prompt (#3390), rendered only when the scope is non-empty.
+const verifyFixEffectiveScopeHeader = "Effective scope — the ONLY files you may edit:"
+
+// renderEffectiveScope renders one `- <path> (<operation>)` line per
+// non-empty scope path, in scope order. Empty when the scope is empty (the
+// `git add -A` fallback), so the caller omits the section.
+func renderEffectiveScope(scope []upload.ScopeFile) string {
+	var b strings.Builder
+	for _, f := range scope {
+		if f.Path == "" {
+			continue
+		}
+		if f.Operation != "" {
+			fmt.Fprintf(&b, "- %s (%s)\n", f.Path, f.Operation)
+		} else {
+			fmt.Fprintf(&b, "- %s\n", f.Path)
+		}
+	}
+	return b.String()
+}
+
+// renderGrantedAmendments renders one line per approved amendment —
+// `- amendment <id> granted <path> (<op>)[, <path> (<op>)...]` — followed by
+// `  Operator decision reason: <decision_reason>` only when the operator left
+// one. An amendment with zero non-empty paths renders its id alone,
+// mirroring annotateUndecidedAmendmentFailure. Empty for an empty list.
+func renderGrantedAmendments(granted []upload.ScopeAmendment) string {
+	var b strings.Builder
+	for _, a := range granted {
+		paths := renderAmendmentPaths(a.Paths)
+		if len(paths) == 0 {
+			fmt.Fprintf(&b, "- amendment %s\n", a.ID)
+		} else {
+			fmt.Fprintf(&b, "- amendment %s granted %s\n", a.ID, strings.Join(paths, ", "))
+		}
+		if a.DecisionReason != "" {
+			fmt.Fprintf(&b, "  Operator decision reason: %s\n", a.DecisionReason)
+		}
+	}
+	return b.String()
+}
+
+// renderAmendmentPaths formats each non-empty amendment path as
+// `<path> (<op>)` (the parenthetical omitted when the operation is empty).
+func renderAmendmentPaths(paths []upload.ScopeAmendmentPath) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p.Path == "" {
+			continue
+		}
+		if p.Operation != "" {
+			out = append(out, fmt.Sprintf("%s (%s)", p.Path, p.Operation))
+		} else {
+			out = append(out, p.Path)
+		}
+	}
+	return out
 }
 
 // baseRebaseConflictPrompt builds the re-invoke prompt fed to the agent when
@@ -8986,6 +9115,12 @@ func emitPendingScopeAmendments(seen map[string]struct{}, items []upload.ScopeAm
 // path is never in `added`, so an approved-but-NOT-folded path stays as
 // real drift downstream. nil (no event) on the no-op guards and when
 // nothing was folded — mirroring the absent scope_drift event.
+//
+// Separately from the fold, a successful fetch records EVERY approved row on
+// cfg.approvedAmendments (#3390) — the by-value consumers after the fold
+// (the verify-fix prompt, the unused-grant check) need the amendment id and
+// decision_reason that cfg.scopeFiles cannot carry. The no-op guards and the
+// fetch-error path leave it nil.
 func refreshScopeAmendments(ctx context.Context, client uploadClient, cfg *config, mcpToken string, logSink io.Writer) []agent.Event {
 	if client == nil || mcpToken == "" || len(cfg.scopeFiles) == 0 {
 		return nil
@@ -9004,11 +9139,20 @@ func refreshScopeAmendments(ctx context.Context, client uploadClient, cfg *confi
 	for _, f := range cfg.scopeFiles {
 		existing[f.Path] = struct{}{}
 	}
+	// Record EVERY approved row — not just the ones that fold a new path —
+	// on cfg.approvedAmendments (#3390). An approved row whose paths were
+	// already in scope (a retry_stage after a late approval) is still a grant
+	// IN FORCE for this pass, and the by-value consumers downstream (the
+	// verify-fix prompt, the unused-grant check) need the id/decision_reason
+	// that cfg.scopeFiles cannot carry. Set BEFORE the len(added)==0 return
+	// so the record does not depend on whether this fold was a no-op.
+	cfg.approvedAmendments = nil
 	var added []string
 	for _, a := range items {
 		if a.Status != "approved" {
 			continue
 		}
+		cfg.approvedAmendments = append(cfg.approvedAmendments, a)
 		for _, p := range a.Paths {
 			if p.Path == "" {
 				continue
