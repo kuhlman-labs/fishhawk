@@ -328,7 +328,18 @@ func TestE2E_CancelledRequiredCheck_NeverParksCIFailed(t *testing.T) {
 	if got := getDerivedStatus(t, ctx, session, run.ID); got != "" {
 		t.Fatalf("derived_status on a cancelled check = %q, want empty (never parks ci_failed)", got)
 	}
-	if na := getNextActions(t, ctx, session, run.ID); na != nil && strings.HasPrefix(na.State, "ci_failed") {
+	// The next_actions surface must be PRESENT and carry a routed, non-empty
+	// state that is not a ci_failed_* arm — a nil block (the surface vanishing)
+	// no longer satisfies this, so it cannot vacuously pass (#3414 fix-up: the
+	// prior `na != nil &&` short-circuit permitted disappearance).
+	na := getNextActions(t, ctx, session, run.ID)
+	if na == nil {
+		t.Fatal("next_actions absent on a cancelled check — recovery must EXPOSE a routed state, not remove the surface")
+	}
+	if na.State == "" {
+		t.Fatal("next_actions.state empty on a cancelled check — want a present, routed state")
+	}
+	if strings.HasPrefix(na.State, "ci_failed") {
 		t.Fatalf("next_actions.state = %q, want a non-ci_failed_* arm on a cancelled check", na.State)
 	}
 }
@@ -393,7 +404,17 @@ func TestE2E_CIRecovered_PersistsAcrossRealRepositories(t *testing.T) {
 	if got := getDerivedStatus(t, ctx, session, run.ID); got == "ci_failed" {
 		t.Fatalf("derived_status after recovery = %q, want NOT ci_failed", got)
 	}
-	if na := getNextActions(t, ctx, session, run.ID); na != nil && strings.HasPrefix(na.State, "ci_failed") {
+	// Recovery must EXPOSE a routed, non-empty next_actions state off the
+	// ci_failed arm — a vanished surface (nil) no longer satisfies this
+	// (#3414 fix-up: the prior `na != nil &&` short-circuit permitted it).
+	na := getNextActions(t, ctx, session, run.ID)
+	if na == nil {
+		t.Fatal("next_actions absent after recovery — recovery must EXPOSE a routed state, not remove the surface")
+	}
+	if na.State == "" {
+		t.Fatal("next_actions.state empty after recovery — want a present, routed state")
+	}
+	if strings.HasPrefix(na.State, "ci_failed") {
 		t.Fatalf("next_actions.state after recovery = %q, want a non-ci_failed_* arm", na.State)
 	}
 }
