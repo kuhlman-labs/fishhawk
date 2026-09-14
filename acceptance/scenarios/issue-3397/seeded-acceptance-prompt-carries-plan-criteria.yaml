@@ -1,0 +1,14 @@
+id: scenario:issue-3397/seeded-acceptance-prompt-carries-plan-criteria
+statement: After POST /v0/dev/fixtures with scenario acceptance-dispatched (201), a signed GET /v0/stages/{acceptance_stage_id}/prompt returns 200 whose body carries a non-empty `acceptance_criteria_ids` list equal to the seeded plan's criterion ids and an `acceptance_expected_head_sha` equal to the seeded pull_request_opened head — so a criterion observable only at or after the acceptance stage is drivable without a write:runs or write:approvals bearer.
+verify_hint: POST /v0/dev/fixtures {"scenario":"acceptance-dispatched"}, take runs.target-run.stages.acceptance from the 201 body, POST /v0/runs/{run_id}/signing-key, sign the prompt canonical message for that stage via POST /v0/dev/sign, GET /v0/stages/{stage_id}/prompt with X-Fishhawk-Signature and inspect acceptance_criteria_ids and acceptance_expected_head_sha.
+steps: POST /v0/dev/fixtures acceptance-dispatched -> 201 (runs.target-run.stages.acceptance = ecb9c09b-…); POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over 'prompt:{stage_id}'; GET /v0/stages/{stage_id}/prompt with X-Fishhawk-Signature; GET /v0/runs/{run}/audit?category=pull_request_opened to read the seeded head from the target itself.
+assertions:
+    expected: 200 with non-empty acceptance_criteria_ids equal to the seeded plan's criterion ids and acceptance_expected_head_sha equal to the seeded pull_request_opened head.
+    observed_at_record: Prompt 200; acceptance_criteria_ids=["run-readable","stages-listed"], acceptance_expected_head_sha=0123456789abcdef0123456789abcdef01234567, acceptance_pull_request_number=3329, and the rendered prompt lists both criteria. The run's pull_request_opened audit row carries head_sha 0123456789abcdef0123456789abcdef01234567 — equal. No bearer was used anywhere in the walk (only the run signing key and the loopback dev routes).
+    repro_handle: 'POST /v0/dev/fixtures {"scenario":"acceptance-dispatched"}; POST /v0/runs/{run}/signing-key; POST /v0/dev/sign body ''prompt:{acc}''; GET /v0/stages/{acc}/prompt -H ''X-Fishhawk-Signature: <sig>'''
+origin:
+    issue: 3397
+    pr: 3413
+    run_id: 45ece84f-d599-4878-b116-2860f2c9cc09
+    head_sha: 5eb1e9a66903f6989e9f9be261437fa1b783e157
+    recorded_at: 2026-09-14T06:39:17Z

@@ -1,0 +1,14 @@
+id: scenario:issue-3397/mixed-rows-still-record-passed
+statement: On a FRESH acceptance-dispatched seed, shipping a signed `passed` verdict with one `passed` row and one `skipped` row records an acceptance_outcome_recorded row with verdict `passed` and outcome `accepted` and NO `basis` field — the all-skip rule fires only when nothing at all was verified.
+verify_hint: Same walk as all-skip-verdict-records-not-validated against a second POST /v0/dev/fixtures seed of acceptance-dispatched (fresh ids), then GET /v0/audit?category=acceptance_outcome_recorded filtered to the new run_id.
+steps: Fresh POST /v0/dev/fixtures acceptance-dispatched (run d8fa7a32-…, acceptance stage 20d5a78a-…), signing key, signed ship of {verdict:passed, criteria:[run-readable passed, stages-listed skipped]}, then read the newest acceptance_outcome_recorded row for the new run_id.
+assertions:
+    expected: verdict passed, outcome accepted, no basis field.
+    observed_at_record: '201 with no effective_verdict field (verdict "passed"). Newest audit row (sequence 6): verdict=passed, outcome=accepted, criteria_passed=1, criteria_skipped=1, criteria_total=2; no basis key present in the payload.'
+    repro_handle: Same walk as all-skip-verdict-records-not-validated against a fresh seed with criteria [{id:run-readable,result:passed},{id:stages-listed,result:skipped}]
+origin:
+    issue: 3397
+    pr: 3413
+    run_id: 45ece84f-d599-4878-b116-2860f2c9cc09
+    head_sha: 5eb1e9a66903f6989e9f9be261437fa1b783e157
+    recorded_at: 2026-09-14T06:39:17Z

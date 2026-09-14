@@ -1,0 +1,14 @@
+id: scenario:issue-3397/catalog-describes-enriched-scenario
+statement: GET /v0/dev/fixtures lists `acceptance-dispatched` with a description that names the approved plan carrying acceptance criteria, the pull_request artifact on the implement stage, and the dispatched acceptance stage.
+verify_hint: GET /v0/dev/fixtures on the preview and read the acceptance-dispatched entry's description.
+steps: GET /v0/dev/fixtures and read the acceptance-dispatched entry's description.
+assertions:
+    expected: Description names the approved plan carrying acceptance criteria, the pull_request artifact on the implement stage, and the dispatched acceptance stage.
+    observed_at_record: '"feature_change run: plan, implement and review succeeded, acceptance stage (agent) dispatched with a pull_request_opened head and an acceptance_dispatched anchor; carries an approved standard_v1 plan whose verification.acceptance_criteria declares two drivable criteria plus a pull_request artifact, so the acceptance prompt serves real criteria ids — ready to receive an acceptance transcript and verdict." Names the approved plan with acceptance criteria, the pull_request artifact, and the dispatched acceptance stage. It does not literally say the pull_request artifact sits ON the implement stage, though ''implement ... succeeded'' and the artifact are both named; judged sufficient for a catalog gloss.'
+    repro_handle: curl -s http://localhost:8090/v0/dev/fixtures
+origin:
+    issue: 3397
+    pr: 3413
+    run_id: 45ece84f-d599-4878-b116-2860f2c9cc09
+    head_sha: 5eb1e9a66903f6989e9f9be261437fa1b783e157
+    recorded_at: 2026-09-14T06:39:17Z
