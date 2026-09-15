@@ -1,0 +1,14 @@
+id: scenario:issue-2787/non-string-reason-refused
+statement: '`POST /v0/runs/{run_id}/acceptance?stage_id={acceptance_stage_id}` with `{"verdict":"passed","criteria":[{"id":"c1","result":"undecidable","undecidable_reason":7}]}` returns HTTP 400 `acceptance_invalid`.'
+verify_hint: 'HTTP: POST the body; assert status 400 and `acceptance_invalid` in the response body.'
+steps: Same run/stage/signing key as above. POST /v0/dev/sign over the exact bytes {"verdict":"passed","criteria":[{"id":"c1","result":"undecidable","undecidable_reason":7}]}; POST /v0/runs/{run}/acceptance?stage_id={acc} with X-Fishhawk-Signature and that body.
+assertions:
+    expected: HTTP 400 acceptance_invalid.
+    observed_at_record: HTTP 400 {error:{code:acceptance_invalid, message:'acceptance body missing or malformed fields', details:{error:'criteria[0].undecidable_reason must be a JSON string when result is undecidable, got 7'}}}.
+    repro_handle: POST http://localhost:8090/v0/runs/bfef778e-7235-4cf4-921f-64c6099c0188/acceptance?stage_id=8ec4ba07-37da-47be-9b97-c1277f413300 body {"verdict":"passed","criteria":[{"id":"c1","result":"undecidable","undecidable_reason":7}]} signed
+origin:
+    issue: 2787
+    pr: 3441
+    run_id: cc824c91-6a61-442e-aa27-afb11d0fa386
+    head_sha: 0a655a9ce9d81f28563642de43e562274800368d
+    recorded_at: 2026-09-15T04:20:30Z

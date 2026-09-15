@@ -3981,11 +3981,15 @@ components:
                 type: string
                 description: |
                   Why this criterion could not be decided (#2512). REQUIRED,
-                  and required to be non-whitespace, when `result` is
-                  `undecidable`. REJECTED whenever the field is PRESENT on any
-                  other result — including present-and-empty, which both
-                  validators decide on field PRESENCE rather than emptiness, so
-                  `{"result":"passed","undecidable_reason":""}` is refused.
+                  and required to be a non-whitespace JSON string, when
+                  `result` is `undecidable` (an explicit `null` or any
+                  non-string value is refused there too, #2787). REJECTED
+                  whenever the field is PRESENT on any other result —
+                  including present-and-empty, an explicit JSON `null` and any
+                  non-string value: both validators decide PRESENCE on the raw
+                  bytes rather than on emptiness or a nil pointer, so
+                  `{"result":"passed","undecidable_reason":""}` and
+                  `{"result":"passed","undecidable_reason":null}` are refused.
               observed: { type: string }
               expected: { type: string }
               steps_taken: { type: string }

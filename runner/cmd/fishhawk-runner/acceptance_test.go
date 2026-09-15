@@ -813,25 +813,45 @@ func TestValidateAcceptanceVerdict_Corpus(t *testing.T) {
 
 // TestValidateAcceptanceVerdict_UndecidableReasonPresence pins BINDING
 // CONDITION 1 directly at the runner validator: undecidable_reason is decided on
-// field PRESENCE, never on emptiness. The middle case is the one a plain-string
-// decode silently admits, because Go's encoding/json cannot distinguish an
-// absent field from a present empty one.
+// field PRESENCE, never on emptiness or value. The present-and-EMPTY case is
+// the one a plain-string decode silently admits, because Go's encoding/json
+// cannot distinguish an absent field from a present empty one; the
+// present-and-NULL cases are the ones a *string decode silently admits (#2787:
+// null collapses onto nil). The null and non-string cases on an UNDECIDABLE
+// row pin the raw-bytes decode: the four bytes `null` are never read as the
+// text 'null', and a number is not a reason — both draw the 'must be a JSON
+// string' message so the branch is distinguished from the absent one.
 func TestValidateAcceptanceVerdict_UndecidableReasonPresence(t *testing.T) {
 	cases := []struct {
 		name    string
 		raw     string
 		wantErr bool
+		// wantMsg, when set, must appear in the rejection so the branch that
+		// fired is the named one and not a neighbour.
+		wantMsg string
 	}{
 		{"absent-on-passed-row-accepted",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`, false},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`, false, ""},
 		{"present-and-EMPTY-on-passed-row-rejected",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":""}]}`, true},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":""}]}`, true, "must be omitted when result is"},
 		{"present-and-non-empty-on-passed-row-rejected",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":"why"}]}`, true},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":"why"}]}`, true, "must be omitted when result is"},
 		{"present-on-skipped-row-rejected",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"skipped","undecidable_reason":"why"}]}`, true},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"skipped","undecidable_reason":"why"}]}`, true, "must be omitted when result is"},
+		{"present-and-NULL-on-passed-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":null}]}`, true, "must be omitted when result is"},
+		{"present-and-NULL-on-failed-row-rejected",
+			`{"verdict":"failed","failure_mode":"assertion_fail","criteria":[{"id":"AC1","result":"failed","undecidable_reason":null}]}`, true, "must be omitted when result is"},
+		{"present-and-NULL-on-skipped-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"skipped","undecidable_reason":null}]}`, true, "must be omitted when result is"},
+		{"present-non-string-on-passed-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":{}}]}`, true, "must be omitted when result is"},
 		{"absent-on-undecidable-row-rejected",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable"}]}`, true},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable"}]}`, true, "is required and must be non-whitespace"},
+		{"null-on-undecidable-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":null}]}`, true, "must be a JSON string"},
+		{"non-string-on-undecidable-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":7}]}`, true, "must be a JSON string"},
 		// \t and \n here are the two-character JSON ESCAPE sequences (a Go raw
 		// string leaves them uninterpreted), so the decoder turns them into real
 		// whitespace and the TrimSpace rule is what rejects the row. Embedding
@@ -840,9 +860,9 @@ func TestValidateAcceptanceVerdict_UndecidableReasonPresence(t *testing.T) {
 		// literal" before the rule is ever reached, and the subtest then goes
 		// green for the wrong reason, surviving deletion of the trim check.
 		{"whitespace-only-on-undecidable-row-rejected",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"  \t\n "}]}`, true},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"  \t\n "}]}`, true, "is required and must be non-whitespace"},
 		{"non-empty-on-undecidable-row-accepted",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"no seam"}]}`, false},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"no seam"}]}`, false, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -850,10 +870,47 @@ func TestValidateAcceptanceVerdict_UndecidableReasonPresence(t *testing.T) {
 			if tc.wantErr && err == nil {
 				t.Fatal("want rejection, got admitted")
 			}
+			if tc.wantErr && tc.wantMsg != "" && !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Fatalf("error = %v, want it to contain %q", err, tc.wantMsg)
+			}
 			if !tc.wantErr && err != nil {
 				t.Fatalf("want admitted, got %v", err)
 			}
 		})
+	}
+}
+
+// TestValidateAcceptanceVerdict_CoercedRemarshalOmitsAbsentReason is the
+// byte-level pin that the object-keyed coercion's re-marshal cannot feed the
+// now-strict backend twin a null (#2787). UndecidableReason is a
+// json.RawMessage with omitempty: a row that carried no reason must re-emit NO
+// undecidable_reason key at all (a `"undecidable_reason":null` would be
+// REJECTED on ship by the backend's presence rule), and an undecidable row
+// must carry its string verbatim.
+func TestValidateAcceptanceVerdict_CoercedRemarshalOmitsAbsentReason(t *testing.T) {
+	raw := `{"verdict":"passed","criteria":{"AC1":{"result":"passed"},"AC2":{"result":"undecidable","undecidable_reason":"no seam"}}}`
+	out, err := validateAcceptanceVerdict([]byte(raw), []string{"AC1", "AC2"}, nil)
+	if err != nil {
+		t.Fatalf("want valid, got %v", err)
+	}
+	var got acceptanceVerdict
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("normalized bytes do not decode: %v", err)
+	}
+	crit := string(got.Criteria)
+	if strings.Contains(crit, `"undecidable_reason":null`) {
+		t.Fatalf("re-marshal emitted an explicit null for a reason-less row (the backend rejects it on ship): %s", crit)
+	}
+	if strings.Count(crit, `"undecidable_reason"`) != 1 {
+		t.Fatalf("want exactly one undecidable_reason key (the undecidable row's), got: %s", crit)
+	}
+	if !strings.Contains(crit, `"undecidable_reason":"no seam"`) {
+		t.Fatalf("undecidable row's reason not carried verbatim: %s", crit)
+	}
+	// The normalized bytes re-validate cleanly against this twin, the same
+	// rule set the backend re-runs on ship.
+	if _, err := validateAcceptanceVerdict(out, []string{"AC1", "AC2"}, nil); err != nil {
+		t.Errorf("normalized verdict fails re-validation: %v", err)
 	}
 }
 

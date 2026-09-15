@@ -68,6 +68,42 @@
       "reason": "Same presence rule on a skipped row. skipped and undecidable are distinct dispositions."
     },
     {
+      "name": "undecidable-reason-on-passed-row-null",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "passed", "undecidable_reason": null}]},
+      "admitted": false,
+      "reason": "#2787: an explicit JSON null is PRESENT -- the third state beside absent and empty. A validator that decodes the field into a *string collapses null onto nil and admits this row as if the key were absent, bypassing the presence rule the -empty row pins. Decided on the raw bytes (the #2699 pattern), null is a present value and is rejected."
+    },
+    {
+      "name": "undecidable-reason-on-failed-row-null",
+      "body": {"verdict": "failed", "failure_mode": "assertion_fail", "criteria": [{"id": "crit-1", "result": "failed", "undecidable_reason": null}]},
+      "admitted": false,
+      "reason": "#2787: same null-is-present rule on a failed row."
+    },
+    {
+      "name": "undecidable-reason-on-skipped-row-null",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "skipped", "undecidable_reason": null}]},
+      "admitted": false,
+      "reason": "#2787: same null-is-present rule on a skipped row."
+    },
+    {
+      "name": "undecidable-row-reason-null",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "undecidable", "undecidable_reason": null}]},
+      "admitted": false,
+      "reason": "#2787: on an undecidable row the raw bytes must decode to a non-whitespace JSON STRING. The four bytes `null` are never read as the text 'null' -- a validator that trimmed the raw bytes instead of string-decoding them would admit this row."
+    },
+    {
+      "name": "undecidable-row-reason-non-string",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "undecidable", "undecidable_reason": 7}]},
+      "admitted": false,
+      "reason": "#2787: a raw-bytes decode opens the non-string shape that a *string decode rejected at decode time, so it is pinned closed here: a number is not a reason."
+    },
+    {
+      "name": "undecidable-reason-on-passed-row-non-string",
+      "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "passed", "undecidable_reason": {}}]},
+      "admitted": false,
+      "reason": "#2787: any present value, string or not, is rejected on a non-undecidable row."
+    },
+    {
       "name": "passed-row-reason-absent-accepted",
       "body": {"verdict": "passed", "criteria": [{"id": "crit-1", "result": "passed"}, {"id": "crit-2", "result": "skipped"}]},
       "admitted": true,

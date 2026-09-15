@@ -228,20 +228,23 @@ type acceptanceCriterionResult struct {
 	ID     string `json:"id"`
 	Result string `json:"result"`
 	// UndecidableReason names WHAT the validator could not determine and WHY
-	// (#2512). REQUIRED and non-whitespace when Result is undecidable; REJECTED
-	// on every other result.
+	// (#2512). REQUIRED and a non-whitespace JSON string when Result is
+	// undecidable; REJECTED whenever PRESENT on every other result.
 	//
-	// It is a POINTER so the decoder preserves field PRESENCE (binding
-	// condition 1): Go's encoding/json makes an ABSENT field indistinguishable
-	// from a PRESENT empty string when the target is a plain string, so
-	// `{"result":"passed","undecidable_reason":""}` would be silently admitted
-	// while violating the rule. Every check below tests the POINTER, never the
-	// value's emptiness. A literal JSON `null` decodes to nil and is treated as
-	// absent (the standard Go/JSON convention).
-	UndecidableReason *string `json:"undecidable_reason,omitempty"`
-	Observed          string  `json:"observed,omitempty"`
-	Expected          string  `json:"expected,omitempty"`
-	StepsTaken        string  `json:"steps_taken,omitempty"`
+	// It is a json.RawMessage so PRESENCE is decided on the raw bytes (the
+	// #2699 pattern, validateReapExpectedState): absent = nil raw; every PRESENT
+	// value — a string, the empty string, an explicit JSON `null`, a number, an
+	// object — keeps its raw bytes. A *string (the previous type) collapses an
+	// explicit `null` onto nil, so `{"result":"passed","undecidable_reason":null}`
+	// was admitted as if the key were absent, bypassing the presence rule
+	// (#2787); a plain string would likewise admit `""`. Absent, null and empty
+	// are THREE states, and only absent is admitted on a non-undecidable row.
+	// decodeUndecidableReason is the single reader; the runner twin carries a
+	// byte-identical copy, and the shared corpus pins their agreement.
+	UndecidableReason json.RawMessage `json:"undecidable_reason,omitempty"`
+	Observed          string          `json:"observed,omitempty"`
+	Expected          string          `json:"expected,omitempty"`
+	StepsTaken        string          `json:"steps_taken,omitempty"`
 	// ExpectationBasis cites where the expectation came from (the criterion's
 	// statement, the issue text, a spec section) so a failed assertion is
 	// auditable against its source. Optional (E31.7 verdict shape, #1535).
@@ -468,16 +471,31 @@ func (a *acceptanceBody) validate(ctx context.Context, logger *slog.Logger) erro
 			// a whitespace-only reason is the named divergence risk between this
 			// validator and the runner's, pinned by the shared corpus row
 			// undecidable-row-reason-whitespace-only.
-			if c.UndecidableReason == nil || strings.TrimSpace(*c.UndecidableReason) == "" {
+			present, text, derr := decodeUndecidableReason(c.UndecidableReason)
+			if !present {
+				return fmt.Errorf(
+					"criteria[%d].undecidable_reason is required and must be non-whitespace when result is undecidable", i)
+			}
+			// #2787: the raw bytes must be a JSON STRING. An explicit `null` and
+			// every non-string shape (a number, an object) reject here, on a
+			// message distinct from the absent branch — `null` is never read as
+			// the four-character text 'null'.
+			if derr != nil {
+				return fmt.Errorf(
+					"criteria[%d].undecidable_reason must be a JSON string when result is undecidable, got %s",
+					i, string(bytes.TrimSpace(c.UndecidableReason)))
+			}
+			if strings.TrimSpace(text) == "" {
 				return fmt.Errorf(
 					"criteria[%d].undecidable_reason is required and must be non-whitespace when result is undecidable", i)
 			}
 		case acceptanceResultPassed, acceptanceResultFailed, acceptanceResultSkipped:
-			// The field is rejected on PRESENCE, not on emptiness (binding
-			// condition 1): `"undecidable_reason": ""` on a passed row is a
-			// producer error exactly as a non-empty one is, and it is the shape a
-			// plain-string decode would silently admit.
-			if c.UndecidableReason != nil {
+			// The field is rejected on PRESENCE, not on emptiness or value
+			// (binding condition 1, #2787): `"undecidable_reason": ""` and
+			// `"undecidable_reason": null` on a passed row are producer errors
+			// exactly as a non-empty one is — the shapes a plain-string and a
+			// *string decode respectively would silently admit.
+			if present, _, _ := decodeUndecidableReason(c.UndecidableReason); present {
 				return fmt.Errorf(
 					"criteria[%d].undecidable_reason must be omitted when result is %q", i, c.Result)
 			}
@@ -562,6 +580,29 @@ func coerceEvidenceHashes(raw json.RawMessage) ([]string, bool, error) {
 	default:
 		return nil, false, errors.New("evidence_hashes must be a flat array of strings or a string-valued object map")
 	}
+}
+
+// decodeUndecidableReason reads a criterion row's undecidable_reason from its
+// raw bytes (#2787, the #2699 pattern). present is false ONLY when the field
+// was absent from the wire (nil / zero-length raw); every present value —
+// including an explicit JSON `null` — reports present=true. When present, the
+// bytes must decode to a JSON string: text carries it and err is nil;
+// otherwise err names the shape (a `null` decodes to a nil string pointer and
+// is rejected explicitly, so it is never reported as the text 'null'). The
+// runner twin carries a byte-identical copy; the shared corpus pins agreement.
+func decodeUndecidableReason(raw json.RawMessage) (present bool, text string, err error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return false, "", nil
+	}
+	var decoded *string
+	if uerr := json.Unmarshal(trimmed, &decoded); uerr != nil {
+		return true, "", fmt.Errorf("undecidable_reason must be a JSON string: %w", uerr)
+	}
+	if decoded == nil {
+		return true, "", errors.New("undecidable_reason must be a JSON string, got null")
+	}
+	return true, *decoded, nil
 }
 
 // coerceAcceptanceCriteria normalizes the acceptance verdict's criteria field.

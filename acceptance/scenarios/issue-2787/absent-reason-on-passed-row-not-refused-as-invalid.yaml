@@ -1,0 +1,14 @@
+id: scenario:issue-2787/absent-reason-on-passed-row-not-refused-as-invalid
+statement: 'The control for the criterion above: the identical body with the `undecidable_reason` key OMITTED is NOT refused with `acceptance_invalid` — `POST /v0/runs/{run_id}/acceptance?stage_id={acceptance_stage_id}` with `{"verdict":"passed","criteria":[{"id":"c1","result":"passed"}]}` returns either 201 or a non-`acceptance_invalid` error (a later precondition), never a 400 `acceptance_invalid`.'
+verify_hint: 'HTTP: same route and token as the previous criterion, body without the key; assert the response body does not carry `acceptance_invalid`.'
+steps: Same run bfef778e-7235-4cf4-921f-64c6099c0188 / acceptance stage 8ec4ba07-37da-47be-9b97-c1277f413300 and signing key as the null-on-passed criterion. POST /v0/dev/sign over the exact bytes {"verdict":"passed","criteria":[{"id":"c1","result":"passed"}]}; POST /v0/runs/{run}/acceptance?stage_id={acc} with X-Fishhawk-Signature and that body (sent AFTER the three rejection bodies, which persisted nothing).
+assertions:
+    expected: 201 or a non-acceptance_invalid error; never 400 acceptance_invalid.
+    observed_at_record: HTTP 201 {id:152228c2-662f-49d4-82d2-739bfdd1bbb5, stage_id:8ec4ba07-..., content_hash:06347ff9..., verdict:passed, idempotent:false}. No acceptance_invalid in the response.
+    repro_handle: POST http://localhost:8090/v0/runs/bfef778e-7235-4cf4-921f-64c6099c0188/acceptance?stage_id=8ec4ba07-37da-47be-9b97-c1277f413300 body {"verdict":"passed","criteria":[{"id":"c1","result":"passed"}]} signed (re-sending now answers idempotent:true or a state precondition, not acceptance_invalid)
+origin:
+    issue: 2787
+    pr: 3441
+    run_id: cc824c91-6a61-442e-aa27-afb11d0fa386
+    head_sha: 0a655a9ce9d81f28563642de43e562274800368d
+    recorded_at: 2026-09-15T04:20:30Z
