@@ -101,6 +101,27 @@ func (r *prEventsRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, err
 	return nil, run.ErrNotFound
 }
 
+// GetStage searches the seeded stage fixtures (overlaying any recorded
+// transition) and returns run.ErrNotFound otherwise. approvalEntryStageIsPlan
+// (the #3389 cancel-sink's approval-chain read) calls it, and the embedded nil
+// run.Repository would panic on that call.
+func (r *prEventsRunRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, sts := range r.stages {
+		for _, st := range sts {
+			if st.ID == id {
+				cp := *st
+				if cur, ok := r.curState[st.ID]; ok {
+					cp.State = cur
+				}
+				return &cp, nil
+			}
+		}
+	}
+	return nil, run.ErrNotFound
+}
+
 // ListStagesForRun overlays any state recorded by TransitionStage onto
 // the seeded stage fixtures so a caller reading stages AFTER a review
 // transition (the orchestrator's completeRun stage scan) observes the
@@ -249,6 +270,13 @@ type prEventsAuditRepo struct {
 	// rollup's per-child audit read (#2100), keyed by run id. Nil-safe: an
 	// un-seeded run id returns no entries.
 	byCategory map[uuid.UUID][]*audit.Entry
+	// byRunCategory is consulted BEFORE byCategory for an exact (run,
+	// category) match (#3389): the cancel sink reads approval_submitted and
+	// acceptance_scenario_retirement_dropped by category, and the #2100
+	// fixtures rely on byCategory ignoring the category, so a per-category
+	// map keeps both semantics. Appended rows are ALSO served for a matching
+	// category so the sink's idempotency read sees its own writes.
+	byRunCategory map[uuid.UUID]map[string][]*audit.Entry
 }
 
 func (r *prEventsAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
@@ -273,9 +301,21 @@ func (r *prEventsAuditRepo) ListForRun(_ context.Context, _ uuid.UUID) ([]*audit
 // ListForRunByCategory serves the per-run cost ledger the economics lineage
 // rollup reads for each decomposition child (#2100). Returns the seeded slice
 // for the run id (nil when unseeded); category is always cost_recorded here.
-func (r *prEventsAuditRepo) ListForRunByCategory(_ context.Context, runID uuid.UUID, _ string) ([]*audit.Entry, error) {
+func (r *prEventsAuditRepo) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if byCat, ok := r.byRunCategory[runID]; ok {
+		out := append([]*audit.Entry(nil), byCat[category]...)
+		for i := range r.appended {
+			ap := r.appended[i]
+			if ap.RunID != runID || ap.Category != category {
+				continue
+			}
+			rid := ap.RunID
+			out = append(out, &audit.Entry{RunID: &rid, StageID: ap.StageID, Category: ap.Category, Payload: ap.Payload})
+		}
+		return out, nil
+	}
 	if r.byCategory == nil {
 		return nil, nil
 	}
@@ -868,6 +908,78 @@ func TestResolveReviewFromPollState_ClosedUnmerged_DrivesRunToCancelled(t *testi
 	}
 	if got := rr.runStates[runID]; got != run.StateCancelled {
 		t.Errorf("run state = %q, want cancelled", got)
+	}
+}
+
+// TestResolveReviewFromPollState_ClosedUnmerged_RecordsDroppedRetirements is
+// the end-to-end proof of the orchestrator cancel sink (#3389) through the
+// REAL server.New wiring: a closed-unmerged PR cancels the review stage, the
+// real orchestrator.completeRun resolves the run to cancelled and notifies
+// the RunCancelledObserver server.New wired (the Server itself), which reads
+// the approved retirement off the approval chain and appends exactly one
+// acceptance_scenario_retirement_dropped row on the still-pending acceptance
+// stage with cancel_source stage_cancelled. Counterfactuals (D) and (E):
+// deleting the OnRunCancelled call in completeRun, OR the
+// `cfg.Orchestrator.RunCancelled = s` assignment in server.New, each leaves
+// zero rows — the latter proves the test exercises the production wiring,
+// not a test-injected observer.
+func TestResolveReviewFromPollState_ClosedUnmerged_RecordsDroppedRetirements(t *testing.T) {
+	runID := uuid.New()
+	planStageID, reviewStageID, acceptanceStageID := uuid.New(), uuid.New(), uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, State: run.StateRunning, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {
+				{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded},
+				{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+				{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+				{ID: acceptanceStageID, RunID: runID, Type: run.StageTypeAcceptance, State: run.StageStatePending},
+			},
+		},
+	}
+	approvalPayload, _ := json.Marshal(map[string]any{
+		"stage_id": planStageID.String(), "decision": "approve",
+		"retired_scenarios": cancelDropRetired,
+	})
+	rid := runID
+	ar := &prEventsAuditRepo{byRunCategory: map[uuid.UUID]map[string][]*audit.Entry{
+		runID: {"approval_submitted": {{RunID: &rid, StageID: &planStageID, Category: "approval_submitted", Sequence: 1, Payload: approvalPayload}}},
+	}}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    ar,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID, false, prURL); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+	if got := rr.runStates[runID]; got != run.StateCancelled {
+		t.Fatalf("run state = %q, want cancelled (fixture must actually cancel the run)", got)
+	}
+
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+	var rows []audit.ChainAppendParams
+	for _, p := range ar.appended {
+		if p.Category == CategoryAcceptanceScenarioRetirementDropped {
+			rows = append(rows, p)
+		}
+	}
+	if len(rows) != 1 {
+		t.Fatalf("acceptance_scenario_retirement_dropped rows = %d, want exactly 1", len(rows))
+	}
+	if rows[0].StageID == nil || *rows[0].StageID != acceptanceStageID {
+		t.Errorf("row stage = %v, want the acceptance stage %s", rows[0].StageID, acceptanceStageID)
+	}
+	p := decodeCancelDrop(t, rows[0])
+	if p.CancelSource != cancelSourceStageCancelled || p.Reason != acceptanceRetirementDropReasonRunCancelled {
+		t.Errorf("payload = %s, want cancel_source stage_cancelled + reason run_cancelled_before_acceptance", rows[0].Payload)
+	}
+	if len(p.ScenarioIDs) != 1 || p.ScenarioIDs[0] != cancelDropRetired[0].ID || p.AcceptanceStageState != string(run.StageStatePending) {
+		t.Errorf("payload = %s, want the scenario id and acceptance_stage_state pending", rows[0].Payload)
 	}
 }
 

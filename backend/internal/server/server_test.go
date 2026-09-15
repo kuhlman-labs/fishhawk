@@ -1335,6 +1335,25 @@ func TestNew_WiresConsolidatedReviewDispatcher(t *testing.T) {
 	}
 }
 
+// TestNew_WiresRunCancelledObserver pins the #3389 production wiring: server.New
+// must set cfg.Orchestrator.RunCancelled to the constructed Server, exactly
+// as it does ConsolidatedReview. Without it completeRun's cancelled resolution
+// (the PR-closed-without-merge path) never reaches the dropped-retirement
+// recorder and that cancel sink is silently inert in the real binary — the
+// same constructor-seam regression class as #1060. Counterfactual (E):
+// deleting the assignment in New fails this AND
+// TestResolveReviewFromPollState_ClosedUnmerged_RecordsDroppedRetirements.
+func TestNew_WiresRunCancelledObserver(t *testing.T) {
+	orch := &orchestrator.Orchestrator{}
+	s := New(Config{Orchestrator: orch})
+	if orch.RunCancelled == nil {
+		t.Fatal("server.New did not wire cfg.Orchestrator.RunCancelled — the orchestrator cancel sink is inert in production")
+	}
+	if orch.RunCancelled != s {
+		t.Fatal("cfg.Orchestrator.RunCancelled is not the constructed Server")
+	}
+}
+
 // TestNew_WiresAnchorPlanArtifactLister pins the #1069 production wiring:
 // server.New must thread cfg.ArtifactRepo into issuecomment.New so the
 // living anchor (#1054) renders its plan section in the real binary.

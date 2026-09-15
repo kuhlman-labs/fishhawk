@@ -2873,6 +2873,12 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #3389: a run carrying approved-but-unpersisted retire_scenario entries
+	// whose acceptance stage never spawned drops them on cancel; record that
+	// on the chain (best-effort, idempotent — the already-cancelled 200
+	// re-enters here and appends nothing new). The 200 body is unchanged.
+	s.recordAcceptanceRetirementsDroppedOnCancel(r.Context(), runID, cancelSourceOperator)
+
 	s.writeJSON(w, r, http.StatusOK, toRunResponse(got))
 }
 

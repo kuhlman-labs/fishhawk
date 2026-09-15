@@ -1041,6 +1041,118 @@ func TestCompleteRun_RefusesSucceededWithNonTerminalStage(t *testing.T) {
 	}
 }
 
+// recordingRunCancelledObserver is a RunCancelledObserver fake that records
+// every OnRunCancelled call (#3389).
+type recordingRunCancelledObserver struct {
+	mu    sync.Mutex
+	calls []struct {
+		runID  uuid.UUID
+		source string
+	}
+}
+
+func (o *recordingRunCancelledObserver) OnRunCancelled(_ context.Context, runID uuid.UUID, source string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.calls = append(o.calls, struct {
+		runID  uuid.UUID
+		source string
+	}{runID, source})
+}
+
+// TestCompleteRun_Cancelled_NotifiesRunCancelledObserver pins the #3389
+// observer seam: when completeRun resolves a run to `cancelled` (a cancelled
+// stage — the PR-closed-without-merge path) the wired RunCancelledObserver
+// receives (runID, "stage_cancelled") exactly once, AFTER the run state is
+// cancelled. Counterfactual (D): deleting the o.RunCancelled.OnRunCancelled
+// call in completeRun leaves zero calls.
+func TestCompleteRun_Cancelled_NotifiesRunCancelledObserver(t *testing.T) {
+	o, rs, _ := newOrchestrator(t)
+	obs := &recordingRunCancelledObserver{}
+	o.RunCancelled = obs
+	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStateCancelled},
+		{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, State: run.StageStatePending},
+	})
+
+	out, err := o.completeRun(context.Background(), r, stages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeRunCompleted {
+		t.Errorf("Outcome = %q, want run_completed", out)
+	}
+	if got := rs.runs[r.ID].State; got != run.StateCancelled {
+		t.Fatalf("run state = %q, want cancelled", got)
+	}
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.calls) != 1 {
+		t.Fatalf("OnRunCancelled calls = %d, want exactly 1", len(obs.calls))
+	}
+	if obs.calls[0].runID != r.ID || obs.calls[0].source != "stage_cancelled" {
+		t.Errorf("OnRunCancelled(%s, %q), want (%s, stage_cancelled)", obs.calls[0].runID, obs.calls[0].source, r.ID)
+	}
+}
+
+// TestCompleteRun_FailedOrSucceeded_DoesNotNotifyObserver: the observer fires
+// ONLY on the cancelled resolution. `failed` is not absorbing (a revive can
+// re-run the acceptance stage and persist the retirement), so notifying on it
+// would be a false report; `succeeded` dropped nothing.
+func TestCompleteRun_FailedOrSucceeded_DoesNotNotifyObserver(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		final run.StageState
+		want  run.State
+	}{
+		{"failed", run.StageStateFailed, run.StateFailed},
+		{"succeeded", run.StageStateSucceeded, run.StateSucceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, rs, _ := newOrchestrator(t)
+			obs := &recordingRunCancelledObserver{}
+			o.RunCancelled = obs
+			r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+				{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+				{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: tc.final},
+			})
+			if _, err := o.completeRun(context.Background(), r, stages); err != nil {
+				t.Fatal(err)
+			}
+			if got := rs.runs[r.ID].State; got != tc.want {
+				t.Fatalf("run state = %q, want %q", got, tc.want)
+			}
+			obs.mu.Lock()
+			defer obs.mu.Unlock()
+			if len(obs.calls) != 0 {
+				t.Errorf("OnRunCancelled calls = %d, want 0 on a %s resolution", len(obs.calls), tc.want)
+			}
+		})
+	}
+}
+
+// TestCompleteRun_Cancelled_NilObserver_NoPanic: the CLI/dev posture leaves
+// RunCancelled nil and a cancelled resolution must complete normally.
+func TestCompleteRun_Cancelled_NilObserver_NoPanic(t *testing.T) {
+	o, rs, _ := newOrchestrator(t)
+	if o.RunCancelled != nil {
+		t.Fatal("fixture must leave RunCancelled nil")
+	}
+	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStateCancelled},
+	})
+	out, err := o.completeRun(context.Background(), r, stages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeRunCompleted || rs.runs[r.ID].State != run.StateCancelled {
+		t.Errorf("outcome/state = %q/%q, want run_completed/cancelled", out, rs.runs[r.ID].State)
+	}
+}
+
 // TestCompleteRun_CompletesAroundSupersededStage is the orchestrator half of
 // the merge-supersede change (E64.2 / #3083). NOTHING in
 // backend/internal/orchestrator/orchestrator.go is edited by that change: the

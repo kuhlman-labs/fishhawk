@@ -116,3 +116,73 @@ func TestCancelRun_NilRepo(t *testing.T) {
 		t.Errorf("status = %d, want 503", w.Code)
 	}
 }
+
+// TestCancelRun_RecordsDroppedScenarioRetirements is the operator-cancel sink
+// proof (#3389): POST /v0/runs/{id}/cancel on a run carrying an approved
+// retire_scenario whose acceptance stage is still pending returns 200 with
+// the run cancelled AND appends exactly one
+// acceptance_scenario_retirement_dropped row (cancel_source operator_cancel),
+// read back through the REST audit feed an operator uses. The idempotent
+// second cancel returns 200 and the count stays 1. Counterfactual (A):
+// deleting the helper call in handleCancelRun leaves zero rows.
+func TestCancelRun_RecordsDroppedScenarioRetirements(t *testing.T) {
+	c := newCancelDropSeam(t, run.StageStatePending, true, cancelDropRetired)
+	cancel := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/v0/runs/%s/cancel", c.runID), nil)
+		req.SetPathValue("run_id", c.runID.String())
+		w := httptest.NewRecorder()
+		c.s.handleCancelRun(w, withAuth(req))
+		return w
+	}
+	w := cancel()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got.State != string(run.StateCancelled) {
+		t.Fatalf("State = %q, want cancelled", got.State)
+	}
+	items := auditFeedItems(t, c.s, c.runID, CategoryAcceptanceScenarioRetirementDropped)
+	if len(items) != 1 {
+		t.Fatalf("run-audit acceptance_scenario_retirement_dropped items = %d, want exactly 1", len(items))
+	}
+	var p struct {
+		Reason       string   `json:"reason"`
+		CancelSource string   `json:"cancel_source"`
+		ScenarioIDs  []string `json:"scenario_ids"`
+	}
+	if err := json.Unmarshal(items[0].Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v\n%s", err, items[0].Payload)
+	}
+	if p.Reason != acceptanceRetirementDropReasonRunCancelled || p.CancelSource != cancelSourceOperator {
+		t.Errorf("payload = %s, want reason run_cancelled_before_acceptance + cancel_source operator_cancel", items[0].Payload)
+	}
+	if len(p.ScenarioIDs) != 1 || p.ScenarioIDs[0] != "scenario:issue-101/crit-b" {
+		t.Errorf("scenario_ids = %v", p.ScenarioIDs)
+	}
+	// Idempotent: the already-cancelled 200 re-enters the sink and appends
+	// nothing new.
+	if w := cancel(); w.Code != http.StatusOK {
+		t.Fatalf("second cancel status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(auditFeedItems(t, c.s, c.runID, CategoryAcceptanceScenarioRetirementDropped)); n != 1 {
+		t.Errorf("items after the idempotent second cancel = %d, want 1", n)
+	}
+}
+
+// TestCancelRun_NoRetirements_NoDropRow: a cancel of a run whose approval
+// carried no retire_scenario appends nothing (the common case).
+func TestCancelRun_NoRetirements_NoDropRow(t *testing.T) {
+	c := newCancelDropSeam(t, run.StageStatePending, true, nil)
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/v0/runs/%s/cancel", c.runID), nil)
+	req.SetPathValue("run_id", c.runID.String())
+	w := httptest.NewRecorder()
+	c.s.handleCancelRun(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(c.dropRows()); n != 0 {
+		t.Errorf("drop rows = %d, want 0", n)
+	}
+}

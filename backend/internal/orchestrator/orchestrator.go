@@ -102,6 +102,19 @@ type ConsolidatedReviewDispatcher interface {
 	DispatchConsolidatedReview(ctx context.Context, parentRunID uuid.UUID, base, head string)
 }
 
+// RunCancelledObserver is notified AFTER completeRun resolves a run to the
+// `cancelled` terminal state (#3389) — the PR-closed-without-merge path,
+// where a review stage cancelled by the forge event cancels the run without
+// any server-side cancel verb firing. It is implemented server-side
+// (*server.Server), which owns the audit + approval-chain machinery the
+// observer needs, so the orchestrator cannot call it directly without an
+// import cycle. `source` names the cancel sink ("stage_cancelled" from here).
+// Best-effort and fire-and-forget: the implementation never returns an error
+// and the orchestrator never blocks on it.
+type RunCancelledObserver interface {
+	OnRunCancelled(ctx context.Context, runID uuid.UUID, source string)
+}
+
 // Orchestrator wires the run repository to a GitHub client to
 // advance a run's stages. Construct directly via the public fields;
 // every dependency is required (the orchestrator no-ops if any is
@@ -137,6 +150,14 @@ type Orchestrator struct {
 	// present (#1060). Nil disables the dispatch — ordinary (non-
 	// decomposed) runs and the CLI/dev posture are unaffected.
 	ConsolidatedReview ConsolidatedReviewDispatcher
+
+	// RunCancelled, when wired, is notified after completeRun transitions a
+	// run to `cancelled` (#3389) so the server can record any approved
+	// acceptance-scenario retirement the cancel dropped. Wired by server.New
+	// as a back-reference exactly like ConsolidatedReview; nil = the CLI/dev
+	// posture, no observer, no notification. Never fired on a failed or
+	// succeeded resolution.
+	RunCancelled RunCancelledObserver
 
 	// MaxParallelChildren is the global default cap on how many decomposed
 	// child runs may dispatch concurrently (E24.6 / #1146), wired from
@@ -2623,6 +2644,9 @@ func (o *Orchestrator) completeRun(ctx context.Context, r *run.Run, stages []*ru
 		slog.String("run_id", r.ID.String()),
 		slog.String("state", string(target)),
 	)
+	if target == run.StateCancelled && o.RunCancelled != nil {
+		o.RunCancelled.OnRunCancelled(ctx, r.ID, "stage_cancelled")
+	}
 	if r.DecomposedFrom != nil {
 		o.maybeAdvanceDecomposedParent(ctx, *r.DecomposedFrom)
 	}

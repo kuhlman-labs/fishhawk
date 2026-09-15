@@ -781,12 +781,68 @@ new preview head (`runner/internal/scenario`). The backend half is four seams:
   (`prompt_test.go`), which reads the row back through
   `GET /v0/runs/{id}/audit?category=acceptance_scenario_retirement_dropped`.
 
+  `acceptance_scenario_retirement_dropped` has a THIRD writer (#3389,
+  `acceptance_retirement_cancel.go` `recordAcceptanceRetirementsDroppedOnCancel`):
+  the run-CANCEL sinks. A run carrying approved retire_scenario entries whose
+  acceptance stage never spawned a runner has nobody to report the drop — the
+  runner-reported reasons and `approval_chain_unreadable` both start at the
+  prompt fetch — so every run-cancel sink reachable AFTER plan approval calls
+  ONE helper immediately after its successful cancel transition:
+  `handleCancelRun` (`cancel_source: operator_cancel`, the REST verb behind
+  `fishhawk_cancel_run`; the idempotent already-cancelled 200 re-enters it and
+  appends nothing new), the run-budget tripwire (`trace.go` `checkRunBudget`,
+  `run_budget_exceeded`), the BLOCKING stage-budget tripwire
+  (`checkStageBudget`, `stage_budget_exceeded`; an advisory breach cancels
+  nothing and records nothing), and `orchestrator.completeRun` resolving a
+  run to `cancelled` (`stage_cancelled`, the PR-closed-without-merge path)
+  through the nil-safe `orchestrator.RunCancelledObserver` seam
+  (`Server.OnRunCancelled`) that `server.New` wires exactly like
+  `ConsolidatedReview`. The helper reads the run's approved retirements
+  through `approvedScenarioRetirements` (the scenario-only projection of the
+  `resolveEffectiveAcceptanceCriteria` seam — one shared flatten,
+  `scenarioRetirementsFromRecorded`); a run with no retirements costs one
+  `approval_submitted` read and appends nothing. **Spawn gate:** it records
+  when the acceptance stage is `pending` / `awaiting_host_dispatch` /
+  `dispatched` and SKIPS (DEBUG log, no row) when it is `running` or terminal,
+  because the signed prompt fetch flips dispatched→running
+  (`markStageRunningOnPromptFetch`) in the same handler that serves the
+  retirements and the runner arms its deferred reporter the moment
+  `FetchPrompt` returns — `running`+ proves the wire delivered them and the
+  runner's #3328 window owns the report. `dispatched` is a spawn attempt whose
+  fetch may not have landed (the flip is best-effort), so a double report with
+  a DIFFERENT reason on that race is the fail-safe direction. The row lands on
+  the acceptance stage — or, with no acceptance stage, on the PLAN stage that
+  recorded the approval with `acceptance_stage_absent: true` — with payload
+  `{run_id, stage_id, retired: [full entries], scenario_ids, reason:
+  run_cancelled_before_acceptance, cancel_source, acceptance_stage_state}`,
+  actor `system`, idempotent per stage+reason via the same
+  `retirementDropAlreadyRecorded` (a list error is WARN + proceed), and UNLIKE
+  #3396 is followed by a `notifyStatusUpdate` refresh so the #3392 renderer
+  surfaces every dropped id on the anchor now. On an approval-chain read error
+  it mirrors #3396: WARN the named event
+  `acceptance_retirements_cancel_chain_unreadable {run_id, cancel_source,
+  error}` and append the row with `retired: []` plus an `error` field. An
+  append failure is WARN-logged and never unwinds the caller. Pinned by
+  `acceptance_retirement_cancel_test.go` (the spawn-gate table over every
+  stage state, no-retirement / idempotent / chain-read-error / append-error /
+  no-acceptance-stage / nil-repo branches, and
+  `TestCancelRun_DroppedRetirement_RendersOnStatusComment` over the real
+  routes), `TestCancelRun_RecordsDroppedScenarioRetirements`, the two
+  `RecordsDroppedRetirements` tripwire tests in `trace_test.go`, and
+  `TestResolveReviewFromPollState_ClosedUnmerged_RecordsDroppedRetirements`
+  through the production `server.New` wiring.
+
 Residual, stated: an operator-invoked `fishhawk_retry_stage` on the settled
 acceptance stage AFTER a scenario push sees recorded-head ≠ current-head
 (`retry.go` Option C) and is admitted as a stale-head reopen — deliberate
-operator action, not an automatic reopen. A run cancelled before its
-acceptance stage spawns drops an approved retirement silently (out of scope;
-tracked separately by the operator).
+operator action, not an automatic reopen. Terminal-FAILED runs are
+deliberately NOT hooked by the cancel writer: `failed` is not absorbing
+(`runRetryTransitions` failed→running via revive/redrive), so a drop row at
+failure would be a false report once the run is revived and its acceptance
+stage persists the retirement; `cancelled` IS absorbing, which is what makes
+the cancel row safe to write. `applies_to.go`'s `abandonUnauditedOverrideRun`
+is not hooked either — it fires at run creation before any approval can carry
+a retirement, and its audit store is the thing that just failed.
 
 ## Pre-spawn acceptance-dispatch admission (E31.23 / #1928)
 

@@ -1133,6 +1133,10 @@ func New(cfg Config) *Server {
 	// and slice-1's drive gate parks every fan-out parent forever.
 	if cfg.Orchestrator != nil {
 		cfg.Orchestrator.ConsolidatedReview = s
+		// #3389: completeRun's cancelled resolution (a PR closed without
+		// merge cancels the review stage, then the run) reaches the same
+		// dropped-retirement recorder the REST and budget cancel sinks call.
+		cfg.Orchestrator.RunCancelled = s
 	}
 	if cfg.GitHub != nil {
 		s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{

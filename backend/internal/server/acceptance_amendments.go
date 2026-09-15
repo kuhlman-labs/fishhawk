@@ -184,6 +184,15 @@ func (e effectiveAcceptanceCriteria) retiredIDSet() map[string]struct{} {
 //  4. handleShipAcceptance (acceptance-verdict ingest), which uses the recorded
 //     retired-id set as the strict key for the downgrade preconditions.
 //
+// RetiredScenarios is explicitly NOT part of the criteria set the no-recompute
+// rule above protects: it is a scenario-only projection of the same approval
+// rows that never touches Live/Retired/Restated/AllIDs. Its ONE flatten is
+// scenarioRetirementsFromRecorded, which this seam and
+// approvedScenarioRetirements (the scenario-only projection consumed by
+// recordAcceptanceRetirementsDroppedOnCancel, #3389) both call — so a run
+// cancelled before its acceptance stage spawns reads the identical set the
+// prompt path would have served.
+//
 // Ordering: prior recorded amendments are applied in ASCENDING audit Sequence,
 // then the caller's pending amendments. Retire is ABSORBING (a repeat retire of
 // an already-retired id no-ops here; it is REFUSED at the gate). Restate
@@ -209,9 +218,7 @@ func (s *Server) resolveEffectiveAcceptanceCriteria(ctx context.Context, runID u
 	// return so a plan-with-no-criteria run still serves them. (Such a
 	// retirement is refused at the gate as unpersistable, so the branch is
 	// defensive; it keeps the seam total rather than partial.)
-	for _, rec := range recorded {
-		eff.RetiredScenarios = append(eff.RetiredScenarios, rec.retiredScenarios...)
-	}
+	eff.RetiredScenarios = scenarioRetirementsFromRecorded(recorded)
 	if len(p.Verification.AcceptanceCriteria) == 0 {
 		return eff, nil
 	}
@@ -283,6 +290,33 @@ func (s *Server) resolveEffectiveAcceptanceCriteria(ctx context.Context, runID u
 		return planOrder[eff.Restated[i]] < planOrder[eff.Restated[j]]
 	})
 	return eff, nil
+}
+
+// scenarioRetirementsFromRecorded flattens the FULL retire_scenario entries of
+// every recorded approval row in ASCENDING approval order (E72.4). It is the
+// single flatten behind effectiveAcceptanceCriteria.RetiredScenarios and
+// approvedScenarioRetirements; nil when no row carries one (the caller's
+// `len(...) == 0` is the "no retirements" test either way).
+func scenarioRetirementsFromRecorded(recorded []recordedAmendmentEntry) []retiredScenarioEntry {
+	var out []retiredScenarioEntry
+	for _, rec := range recorded {
+		out = append(out, rec.retiredScenarios...)
+	}
+	return out
+}
+
+// approvedScenarioRetirements is the scenario-only projection of the run's
+// approval chain: recordedAcceptanceAmendments + scenarioRetirementsFromRecorded.
+// The audit read error is PROPAGATED with NO partial set (the same fail shape
+// as resolveEffectiveAcceptanceCriteria), so the one consumer —
+// recordAcceptanceRetirementsDroppedOnCancel (#3389) — can distinguish "no
+// retirements" from "could not read the rows that would name them".
+func (s *Server) approvedScenarioRetirements(ctx context.Context, runID uuid.UUID) ([]retiredScenarioEntry, error) {
+	recorded, err := s.recordedAcceptanceAmendments(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	return scenarioRetirementsFromRecorded(recorded), nil
 }
 
 // recordedAmendmentEntry is one approval_submitted row's recorded amendments,

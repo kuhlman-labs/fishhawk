@@ -2759,6 +2759,9 @@ func (s *Server) checkRunBudget(ctx context.Context, runID, stageID uuid.UUID) b
 			slog.String("error", err.Error()))
 		return true
 	}
+	// #3389: the halt cancelled the run; an approved scenario retirement whose
+	// acceptance stage never spawned is dropped by it. Best-effort record.
+	s.recordAcceptanceRetirementsDroppedOnCancel(ctx, runID, cancelSourceRunBudget)
 
 	payload, _ := json.Marshal(map[string]any{
 		"dimension":      d.Dimension,
@@ -3052,6 +3055,10 @@ func (s *Server) checkStageBudget(ctx context.Context, runID, stageID uuid.UUID)
 				slog.String("error", err.Error()))
 			return true
 		}
+		// #3389: the blocking halt cancelled the run; record the dropped
+		// approved scenario retirements (if any) before the breach audit.
+		// An advisory breach never reaches here — it cancels nothing.
+		s.recordAcceptanceRetirementsDroppedOnCancel(ctx, runID, cancelSourceStageBudget)
 	}
 
 	payload, _ := json.Marshal(map[string]any{
