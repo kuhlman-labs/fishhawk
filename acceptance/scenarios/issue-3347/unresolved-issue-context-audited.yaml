@@ -1,0 +1,14 @@
+id: scenario:issue-3347/unresolved-issue-context-audited
+statement: When an issue-anchored run's stage prompt is built with no issue title and no body (no cached issue_context and no usable credential/fetch path for the run's forge), the run's audit log carries an issue_context_unresolved entry naming the issue number, the forge family and a reason, and the prompt still renders with HTTP 200.
+verify_hint: Start a run with trigger issue:N, NO issue_context, against a repo the configured GitHub App is not installed on (installation resolves nil); GET /v0/stages/{stage_id}/prompt-render returns 200; GET /v0/runs/{run_id}/audit then lists one entry with category issue_context_unresolved whose payload has reason=no_credential and forge=github.
+steps: 'DELETE /v0/dev/forge -> 204. POST /v0/dev/fixtures {scenario:trace-upload-target} -> 201 (run 82490d86-6ca1-463d-bf36-b41f9f63819b, plan stage 73a10341-aa4b-453c-95a5-a886682fec14, dispatched). GET /v0/runs/{run}: repo kuhlman-labs/fishhawk, trigger_ref issue:3, installation_id null, installation_ref null, issue_context null. POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over ''prompt:73a10341-aa4b-453c-95a5-a886682fec14''; GET /v0/stages/73a10341-aa4b-453c-95a5-a886682fec14/prompt with X-Fishhawk-Signature; GET /v0/stages/73a10341-aa4b-453c-95a5-a886682fec14/prompt-render (unsigned and signed). GET /v0/runs/{run}/audit?category=issue_context_unresolved. GET /v0/dev/forge to read the stub request log.'
+assertions:
+    expected: 200 prompt; audit entry with category issue_context_unresolved naming the issue number, forge family and a reason (no_credential, forge=github).
+    observed_at_record: 'prompt and prompt-render both 200; prompt text has ''Triggering issue: #3'' with no title, no body and zero https://github.com/ issue links; audit lists issue_context_unresolved rows (one per render, 4 for 4 renders) each with payload {issue:3, forge:''github'', reason:''no_credential'', run_id, stage_id, hint:''the prompt rendered with no issue title or body; pass issue_context inline at run creation or fix the run''s credential/forge wiring''}; stub forge request log empty (no fetch attempted).'
+    repro_handle: curl http://localhost:8090/v0/stages/73a10341-aa4b-453c-95a5-a886682fec14/prompt-render; curl 'http://localhost:8090/v0/runs/82490d86-6ca1-463d-bf36-b41f9f63819b/audit?category=issue_context_unresolved'
+origin:
+    issue: 3347
+    pr: 3435
+    run_id: 49f642b8-1830-4b14-9f42-76fed7af467c
+    head_sha: dcbb99244c15e10549703dbf8b805a5c9f6dfd9c
+    recorded_at: 2026-09-15T00:20:03Z
