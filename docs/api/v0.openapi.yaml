@@ -7513,6 +7513,22 @@ paths:
         Transitions the run and any non-terminal stages to `cancelled`.
         Idempotent — calling on an already-cancelled or already-terminal
         run returns 409 unless `state` already equals `cancelled`.
+
+        When the run carries approved `retire_scenario` entries (E72.4) and
+        its acceptance stage never spawned a runner (still `pending` /
+        `awaiting_host_dispatch` / `dispatched`), the cancel also appends ONE
+        `acceptance_scenario_retirement_dropped` audit row for that stage
+        (reason `run_cancelled_before_acceptance`, `cancel_source:
+        operator_cancel`, the full `retired` entries + `scenario_ids`) and
+        refreshes the status comment, so the dropped scenario ids surface on
+        the issue anchor (#3389). Best-effort and idempotent per stage+reason:
+        the 200 body is unchanged, and the already-cancelled 200 appends
+        nothing new. A run with no approved retirements, or whose acceptance
+        stage already fetched them (`running` or terminal — the runner owns
+        the report from there), records no row. The same row, with
+        `cancel_source` `run_budget_exceeded`, `stage_budget_exceeded` or
+        `stage_cancelled`, is written by the budget tripwires and by a pull
+        request closed without merge.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }

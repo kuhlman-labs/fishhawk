@@ -12263,3 +12263,156 @@ func TestRunImplementReviews_ApprovalConditionsUnrecorded_AppendFailureIsBestEff
 		t.Errorf("review must still dispatch with the unrecorded bullet after an append failure")
 	}
 }
+
+// -----------------------------------------------------------------------------
+// #3389: the budget tripwires are run-cancel sinks. A run cancelled by either
+// tripwire while carrying an approved retire_scenario whose acceptance stage
+// never spawned must append the acceptance_scenario_retirement_dropped row
+// (cancel_source run_budget_exceeded / stage_budget_exceeded) alongside the
+// existing budget row. Counterfactual (F): deleting the helper call in the
+// respective tripwire leaves zero drop rows.
+// -----------------------------------------------------------------------------
+
+// seedCancelDropApproval seeds the approval_submitted row (on planStageID,
+// decision approve) carrying the shared cancelDropRetired entry.
+func seedCancelDropApproval(au *auditFake, runID, planStageID uuid.UUID) {
+	seedHeadEntry(au, runID, &planStageID, "approval_submitted", 1, map[string]any{
+		"stage_id": planStageID.String(), "decision": "approve",
+		"retired_scenarios": cancelDropRetired,
+	})
+}
+
+// cancelDropRowsBySource returns the appended drop rows whose payload carries
+// cancel_source == source.
+func cancelDropRowsBySource(t *testing.T, au *auditFake, source string) []cancelDropPayload {
+	t.Helper()
+	var out []cancelDropPayload
+	for _, row := range appendedOfCategory(au, CategoryAcceptanceScenarioRetirementDropped) {
+		p := decodeCancelDrop(t, row)
+		if p.CancelSource == source {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// TestShipTrace_RunBudgetTripwire_RecordsDroppedRetirements clones the
+// run-budget halt fixture (TestShipTrace_RunBudgetTripwire_HaltsRun) with a
+// pending acceptance stage and an approved retirement recorded on the traced
+// plan stage, and asserts the drop row lands next to run_budget_exceeded.
+func TestShipTrace_RunBudgetTripwire_RecordsDroppedRetirements(t *testing.T) {
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+	rr := newOrchestratorRepo()
+
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched) // Type plan
+	acceptance := rr.seedStage(runRow.ID, 1, run.StageStatePending)
+	acceptance.Type = run.StageTypeAcceptance
+	seedCancelDropApproval(au, runRow.ID, stage.ID)
+
+	const model = "claude-opus-4-8"
+	const inTok, outTok = 1000, 2000
+	bundleUSD, ok := pricing.Cost(model, inTok, outTok)
+	if !ok || bundleUSD <= 0 {
+		t.Fatalf("pricing.Cost(%q) ok=%v usd=%v — fixture model must be priced", model, ok, bundleUSD)
+	}
+	runRow.CostUSDTotal = bundleUSD * 0.5
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        runRow.ID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+		MaxRunUSD:    bundleUSD,
+	})
+	priv, _ := sf.issue(t, runRow.ID)
+	if w := shipRequest(t, s, runRow.ID, stage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	got, _ := rr.GetRun(t.Context(), runRow.ID)
+	if got.State != run.StateCancelled {
+		t.Fatalf("run.State = %q, want cancelled (fixture must actually trip the wire)", got.State)
+	}
+	if n := countAppendedByCategory(au, "run_budget_exceeded"); n != 1 {
+		t.Fatalf("run_budget_exceeded rows = %d, want 1 (the existing budget row is unchanged)", n)
+	}
+	rows := cancelDropRowsBySource(t, au, cancelSourceRunBudget)
+	if len(rows) != 1 {
+		t.Fatalf("drop rows with cancel_source run_budget_exceeded = %d, want exactly 1", len(rows))
+	}
+	if rows[0].Reason != acceptanceRetirementDropReasonRunCancelled || rows[0].StageID != acceptance.ID.String() ||
+		len(rows[0].ScenarioIDs) != 1 || rows[0].ScenarioIDs[0] != cancelDropRetired[0].ID {
+		t.Errorf("drop row = %+v, want reason run_cancelled_before_acceptance on the acceptance stage naming the scenario", rows[0])
+	}
+}
+
+// TestShipTrace_StageBudgetBlocking_RecordsDroppedRetirements clones the
+// blocking stage-budget fixture (T4) with a plan stage carrying the approval
+// and a pending acceptance stage: the blocking halt appends the drop row
+// with cancel_source stage_budget_exceeded next to stage_budget_exceeded,
+// while an ADVISORY breach — which cancels nothing — appends no drop row.
+func TestShipTrace_StageBudgetBlocking_RecordsDroppedRetirements(t *testing.T) {
+	seed := func(t *testing.T, enforcement string) (*Server, *signingFake, *auditFake, *approvalRunRepo, uuid.UUID, *run.Stage, *run.Stage) {
+		t.Helper()
+		s, sf, au, rr := newStageBudgetServer(t)
+		rr.transitionRunEnabled = true
+		runID := uuid.New()
+		cost := sbBundleUSD(t)
+		sbSeedRun(rr, runID, sbV2ImplementSpec(fmtUSD(cost/2), enforcement))
+		planStage := rr.seedStageOnRunSeq(runID, 0, run.StageTypePlan, run.StageStateSucceeded)
+		implement := rr.seedStageOnRunSeq(runID, 1, run.StageTypeImplement, run.StageStateRunning)
+		acceptance := rr.seedStageOnRunSeq(runID, 2, run.StageTypeAcceptance, run.StageStatePending)
+		seedCancelDropApproval(au, runID, planStage.ID)
+		return s, sf, au, rr, runID, implement, acceptance
+	}
+
+	t.Run("blocking breach records the drop", func(t *testing.T) {
+		s, sf, au, rr, runID, implement, acceptance := seed(t, "blocking")
+		if w := sbUpload(t, s, sf, runID, implement.ID, sbModel, sbInTok, sbOutTok); w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+		}
+		if got, _ := rr.GetRun(context.Background(), runID); got.State != run.StateCancelled {
+			t.Fatalf("run.State = %q, want cancelled (fixture must actually trip the wire)", got.State)
+		}
+		if n := countStageBudgetEntries(au); n != 1 {
+			t.Fatalf("stage_budget_exceeded rows = %d, want 1 (the existing budget row is unchanged)", n)
+		}
+		rows := cancelDropRowsBySource(t, au, cancelSourceStageBudget)
+		if len(rows) != 1 {
+			t.Fatalf("drop rows with cancel_source stage_budget_exceeded = %d, want exactly 1", len(rows))
+		}
+		if rows[0].Reason != acceptanceRetirementDropReasonRunCancelled || rows[0].StageID != acceptance.ID.String() ||
+			len(rows[0].ScenarioIDs) != 1 || rows[0].ScenarioIDs[0] != cancelDropRetired[0].ID {
+			t.Errorf("drop row = %+v, want reason run_cancelled_before_acceptance on the acceptance stage naming the scenario", rows[0])
+		}
+	})
+
+	t.Run("advisory breach cancels nothing and records no drop", func(t *testing.T) {
+		s, sf, au, rr, runID, implement, _ := seed(t, "advisory")
+		if w := sbUpload(t, s, sf, runID, implement.ID, sbModel, sbInTok, sbOutTok); w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+		}
+		if n := countStageBudgetEntries(au); n != 1 {
+			t.Fatalf("stage_budget_exceeded rows = %d, want 1 (the advisory breach is still audited)", n)
+		}
+		if got, _ := rr.GetRun(context.Background(), runID); got.State == run.StateCancelled {
+			t.Fatal("run was cancelled on an advisory breach")
+		}
+		if n := countAppendedByCategory(au, CategoryAcceptanceScenarioRetirementDropped); n != 0 {
+			t.Errorf("drop rows = %d, want 0 (nothing was cancelled, nothing was dropped)", n)
+		}
+	})
+}

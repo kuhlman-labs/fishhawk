@@ -150,6 +150,12 @@ Degrades to `(false, nil, nil)` with a WARN, never an error, on ABSENT input: a 
 
 The merge itself is the existing `IntegrateSlices` primitive — the same one `/consolidate` and `/integrate-wave` use — so conflict provenance, pagination, incremental merge-SHA recording and idempotency are inherited rather than reimplemented.
 
+## Run-cancelled observer (#3389)
+
+`Orchestrator.RunCancelled` (`RunCancelledObserver`, one method `OnRunCancelled(ctx, runID, source)`) sits next to `ConsolidatedReview` and follows the same back-reference pattern: `server.New` assigns the constructed `*server.Server` to it (`cfg.Orchestrator.RunCancelled = s`, pinned by `TestNew_WiresRunCancelledObserver`), because the observer needs the server's audit + approval-chain machinery and the orchestrator cannot import `server` without a cycle. Nil is the CLI/dev posture — no observer, no notification.
+
+`completeRun` fires it AFTER a successful `TransitionRun` and ONLY when the target is `cancelled` (a cancelled stage — the PR-closed-without-merge path resolved by `ResolveReviewFromPollState` / the `pull_request.closed` webhook), with `source == "stage_cancelled"`. Never on `failed` or `succeeded`: `failed` is not absorbing (`runRetryTransitions` admits failed→running via revive/redrive) so a drop recorded there could be contradicted by a later acceptance run, while `cancelled` has no retry edge out. The server-side implementation (`server/acceptance_retirement_cancel.go`) records the approved acceptance-scenario retirements the cancel dropped; the seam itself is fire-and-forget and never returns an error. Pinned by `TestCompleteRun_Cancelled_NotifiesRunCancelledObserver`, `TestCompleteRun_FailedOrSucceeded_DoesNotNotifyObserver`, and `TestCompleteRun_Cancelled_NilObserver_NoPanic`; the end-to-end proof through the real wiring is `server`'s `TestResolveReviewFromPollState_ClosedUnmerged_RecordsDroppedRetirements`.
+
 ## Startup run-completion recovery (#727)
 
 `ReconcileStuckRuns(ctx)` is a one-shot self-heal called from `serve.go` at boot (gated only on `Orchestrator != nil && RunRepo != nil`, best-effort/non-fatal).

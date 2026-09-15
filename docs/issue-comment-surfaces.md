@@ -336,7 +336,24 @@ Notes:
     an `error` field carries the read error), idempotent per stage+reason,
     actor `system`, with NO `notifyStatusUpdate` refresh and never from the
     preview render. The ship-path validator's non-empty-`retired` rule applies
-    to the RUNNER report, not to this row. **The anchor / status comment is a
+    to the RUNNER report, not to this row. And a THIRD writer since #3389:
+    the run-CANCEL sinks (`server/acceptance_retirement_cancel.go`
+    `recordAcceptanceRetirementsDroppedOnCancel`, called from
+    `handleCancelRun`, both budget tripwires in `trace.go`, and
+    `orchestrator.completeRun`'s cancelled resolution via the
+    `RunCancelledObserver` seam) append it with reason
+    `run_cancelled_before_acceptance`, the FULL approved `retired` entries +
+    `scenario_ids`, and a `cancel_source` naming the sink — `operator_cancel`,
+    `run_budget_exceeded`, `stage_budget_exceeded`, or `stage_cancelled` (a PR
+    closed without merge) — plus `acceptance_stage_state` (or
+    `acceptance_stage_absent: true` when the row had to land on the plan
+    stage), ONLY when the acceptance stage is still `pending` /
+    `awaiting_host_dispatch` / `dispatched` (a `running` or terminal stage
+    means the runner fetched the retirements and owns the report). Idempotent
+    per stage+reason, actor `system`, and — UNLIKE the #3396 writer — followed
+    by a `notifyStatusUpdate` refresh, so the drop renders on the anchor at
+    cancel time. Its own chain-read failure mirrors #3396 (`retired: []` + an
+    `error` field). **The anchor / status comment is a
     LIVE surface for the drop (#3392):** `status_template.go`'s
     `activityCategories` admits `acceptance_scenario_retirement_dropped`, and
     `renderActivityLine` dispatches it to `renderAcceptanceRetirementDroppedLine`,
@@ -349,9 +366,9 @@ Notes:
     reasons can never blow the anchor's body-size ladder and drop the WHOLE
     timeline, and the row is **retained** (not informational) under the
     anchor's 12-row cap. The `notifyStatusUpdate` refresh from the
-    runner-reported writer rebuilds the anchor immediately; the empty-`retired`
-    #3396 second writer emits no refresh of its own, so that row surfaces on
-    the anchor's NEXT rebuild, rendering an honest "no scenario entries on the
+    runner-reported writer and the #3389 cancel writer rebuild the anchor
+    immediately; the empty-`retired` #3396 second writer emits no refresh of
+    its own, so that row surfaces on the anchor's NEXT rebuild, rendering an honest "no scenario entries on the
     record — read the run's audit chain" clause (never "0 scenarios", which
     would read as nothing dropped). No `@`-mention, matching the rest of this
     timeline. A completeness gate
@@ -1210,7 +1227,7 @@ Notes:
   `activityCategories` + `renderActivityLine`
   (`renderAcceptanceRetirementDroppedLine`). See the writer-side detail under
   "Acceptance scenario-corpus reports (E72.4, #3328)" above for the payload
-  shape, the render contract, and the two writers.
+  shape, the render contract, and the three writers.
 - **The `not_validated` outcome renders its OWN row (#2347, #3397).** A
   `not_validated` outcome means the stage verified ZERO criteria, and it now has
   TWO origins carried by the `basis` payload field. **PRE-SPAWN** (empty/absent
