@@ -45,6 +45,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/diffcov"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/egressproxy"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gateiso"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/otelemit"
@@ -372,6 +373,24 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	cfg.agentVersion = probeAgentVersion(ctx, cfg.agentBinary)
 
 	logStartup(logSink, cfg)
+
+	// Gate isolation configuration (ADR-063 / #2134): parse the three
+	// FISHHAWK_GATE_ISOLATION / FISHHAWK_GATE_IMAGE / FISHHAWK_DEPLOYMENT_PROFILE
+	// variables right after the startup line and BEFORE any backend contact,
+	// so a misconfigured runner (an invalid mode or profile, or a hosted
+	// profile combined with an explicit fallback mode) fails at startup as a
+	// config error rather than per gate. The execution PATH is decided
+	// lazily on the first gate exec (gateIsolationState.selection); the
+	// deferred cleanup clears the process-wide state on every exit path.
+	gateState, gerr := configureGateIsolation(os.Getenv, gateiso.DefaultProbes(), logSink)
+	if gerr != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"runner_failed","reason":"config","detail":%q}`+"\n", gerr.Error())
+		return exitUsage
+	}
+	gateIsolation = gateState
+	defer gateState.cleanup()
+
 	_, _ = fmt.Fprintf(logSink, `{"event":"coercion_registry","summary":%q}`+"\n", plan.CoercionRegistrySummary())
 
 	// GenAI observability (#649). Bootstrap is gated by
@@ -4793,6 +4812,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		lastIterErr     error  // non-nil only on a PRE-commit infra failure → non-blocking skip (outcome=skipped)
 		reinvokeErr     error  // non-nil when every fix re-invoke attempt failed → non-blocking, outcome=failed (#3408)
 		fatalErr        error  // non-nil on a POST-commit reset failure (#816) or a passed-but-unresolvable verified tree (#960) → hard abort
+		refused         bool   // a gate-isolation refusal (ADR-063 / #2134) → category C, no fix re-invoke
 		flakeRetried    bool   // once-per-stage testcontainers infra-flake absorb (#972) already spent
 		autoformatted   bool   // once-per-stage gofmt/goimports auto-format absorb (#3316) already spent
 	)
@@ -4905,6 +4925,23 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 
 		if outcome != "failed" {
 			passed = true
+			break
+		}
+
+		// Gate-isolation refusal (ADR-063 / #2134): the gate never executed
+		// because no acceptable execution path exists (a hosted profile with
+		// no safe container runtime or image, or an explicit mode whose path
+		// is unavailable). That is a deployment-configuration outcome, not a
+		// red tree and not a flake: it breaks the loop BEFORE the infra
+		// absorb (the selection is fixed for the process, so a re-run would
+		// refuse identically) and never re-invokes the fix agent (there is
+		// nothing for it to fix). The stage fails category C so it is
+		// retryable in place once the deployment is corrected.
+		if isGateIsolationRefusal(out) {
+			refused = true
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"verify_gate_refused","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, iter+1, strings.TrimSpace(out))
 			break
 		}
 
@@ -5158,6 +5195,13 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		return reinvoked, "", nil
 	}
 
+	if refused {
+		res.OK = false
+		res.FailureCategory = "C"
+		res.FailureReason = lastOutput
+		return reinvoked, "", nil
+	}
+
 	if !passed {
 		res.OK = false
 		res.FailureCategory = "A"
@@ -5264,7 +5308,11 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	// ErrVerifyInfraFailure when the signature persists, ErrCommittedTestsFailed
 	// otherwise; the single-shot gate has no loop, so the retry is inherently
 	// once-per-stage.
-	if outcome == "failed" && isVerifyInfraFailure(out) {
+	// A gate-isolation refusal (ADR-063 / #2134) never enters the absorb:
+	// the selection is fixed for the process, so a re-run would refuse
+	// identically. It is classified at (f) as category C.
+	refused := outcome == "failed" && isGateIsolationRefusal(out)
+	if !refused && outcome == "failed" && isVerifyInfraFailure(out) {
 		const detail = "infrastructure-failure signature in verify output (container-start timeout or lint-lock contention); re-running verify once"
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
@@ -5316,6 +5364,12 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	// ErrVerifyInfraFailure and the stage stays retryable in place. A failure
 	// matching no infra signature keeps ErrCommittedTestsFailed verbatim.
 	if outcome == "failed" {
+		if refused {
+			// Category C (retryable in place), distinguishable from an infra
+			// flake by errGateIsolationRefused: the gate never executed.
+			return events, "", fmt.Errorf("%w: %w: committed tree verify command %q was refused by gate isolation: %s",
+				gitops.ErrVerifyInfraFailure, errGateIsolationRefused, cfg.verifyCmd, strings.TrimSpace(out))
+		}
 		if isVerifyInfraFailure(out) {
 			return events, "", fmt.Errorf("%w: committed tree verify command %q failed for an infrastructure reason: %s; %d file(s) outside scope are build/test-required: %s\n%s",
 				gitops.ErrVerifyInfraFailure, cfg.verifyCmd, verifyFailureExcerpt(out), len(drift), strings.Join(drift, ", "), out)
@@ -5667,10 +5721,11 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 }
 
 // runVerifyCommittedTree runs the verify command against the committed HEAD
-// SHA in an isolated git worktree (#651), reusing the #728/#800 worktree
-// pattern: `git worktree add --detach` checks out the committed scope-only
-// tree without disturbing the runner's working tree, so the verify command
-// sees the drift-excluded tree and not the dirty working tree. It emits a
+// SHA in an isolated throwaway checkout (#651): since ADR-063 / #2134 an
+// INDEPENDENT `--no-hardlinks` clone (materializeGateCheckout), no longer a
+// `git worktree add --detach` of the primary, so the verify command sees the
+// drift-excluded committed tree — not the dirty working tree — and anything
+// it plants (a ref, a hook) stays in the clone. It emits a
 // verify_run event carrying the committed head_sha + tree_sha and returns the
 // captured output plus an explicit outcome string: "passed" (command exited
 // zero), "failed" (non-zero exit), or "skipped" (gate infra never ran the
@@ -5681,7 +5736,7 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 // Setpgid + cmd.Cancel kill the whole process group on context cancellation
 // so the verify command's grandchildren (e.g. `go test` subprocesses) don't
 // keep the output pipe open and block CombinedOutput — the same hazard
-// runVerifyGate handles. A worktree-tmp/worktree-add failure (infra) returns
+// runVerifyGate handles. A temp-dir or clone failure (infra) returns
 // outcome "skipped"; the gate call sites map that to their existing tolerant
 // behavior (no failure invented from gate plumbing — reclassification is
 // #959's scope), while the #960 re-verify treats it as not-verified.
@@ -5708,21 +5763,29 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 	if err != nil {
 		return verifyRunEvent(verifyCmd, headSHA, treeSHA, -1, "worktree_tmp: "+err.Error(), "skipped"), "", "skipped"
 	}
-	wt := filepath.Join(parent, "tree")
-	defer func() {
-		_ = exec.CommandContext(ctx, "git", "-C", repoDir, "worktree", "remove", "--force", wt).Run()
-		_ = os.RemoveAll(parent)
-	}()
-	if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
-		"worktree", "add", "--detach", wt, headSHA).CombinedOutput(); err != nil {
+	defer func() { _ = os.RemoveAll(parent) }()
+	// An independent clone, not a linked worktree (ADR-063 / #2134): a gate
+	// that plants a ref or a hook writes into the throwaway tree, never the
+	// primary. A materialization failure keeps the pre-#2134 outcome —
+	// "skipped", with a clone: reason.
+	wt, err := materializeGateCheckout(ctx, repoDir, headSHA, parent)
+	if err != nil {
 		return verifyRunEvent(verifyCmd, headSHA, treeSHA, -1,
-			"worktree_add: "+strings.TrimSpace(string(out)), "skipped"), "", "skipped"
+			"clone: "+strings.TrimSpace(err.Error()), "skipped"), "", "skipped"
 	}
 
 	// Owner marker always; package set only when one was derived. verifyScopeEnv
 	// returns its input UNCHANGED for an empty set, so the full form's extraEnv
 	// carries exactly one entry and the packages variable is ABSENT, not empty.
 	extraEnv := verifyScopeEnv(verifyLockOwnerEnv(nil), scopePkgs)
+	// The clone has its OWN git common dir, so without an override
+	// `scripts/test`'s lock would key there and contend with nothing (#2645
+	// would reopen). Inject the PRIMARY's lock path on every host path; the
+	// container path cannot see the primary's filesystem, so the variable
+	// would name an unreachable file there and is left out.
+	if gateIsolation.selection(ctx).Path != gateiso.PathContainer {
+		extraEnv = verifyLockPathEnv(extraEnv, repoDir)
+	}
 
 	output, exitCode := runBoundedGateCommand(ctx, verifyCmd, wt,
 		filepath.Join(parent, "golangci-lint-cache"), timeout, extraEnv...)
@@ -5803,7 +5866,57 @@ func runBoundedGateCommand(ctx context.Context, command, dir, lintCacheDir strin
 // ambient environment, which sanitizedGateEnv's default-deny allow-list has
 // already dropped. Do NOT use extraEnv to smuggle a credential past the
 // allow-list; that is the exact decision the allow-list exists to make explicit.
+//
+// ISOLATION LAYER (ADR-063 / #2134). Since #2134 this function is ALSO the
+// one place the execution PATH is chosen, so the verify gates, diff_coverage
+// and the auto-format absorb inherit it together and there is still no
+// second exec path. The layered contract is:
+//
+//   - env is built exactly as before (sanitized → isolated lint cache →
+//     extraEnv drop-then-append) and is what the gate sees on EVERY path;
+//   - the selection (gateIsolationState.selection — nil state = the
+//     pre-#2134 host exec) then routes:
+//     refused       → return the refusal text and -1 WITHOUT executing
+//     (the gates classify it category C, never a flake, never a fix
+//     re-invoke);
+//     container     → runGateInContainer: fresh empty caches, host-side
+//     module seed, argv built under the resolved-path mount guard, exec via
+//     execBoundedHostArgvFn with the RUNNER's env (the sanitized env crosses
+//     via -e), `rm -f` on -1;
+//     clone-sandbox → gateiso.WrapSandbox(argv) on the host;
+//     clone         → argv on the host (the pre-#2134 behaviour; the
+//     throwaway checkout is a clone either way, see materializeGateCheckout).
+//
+// The process-level contract (bounded child context, Setpgid + group SIGKILL,
+// CombinedOutput, the 0 / child-code / -1 mapping) lives in
+// execBoundedHostArgv, which every path reaches through the
+// execBoundedHostArgvFn seam.
 func runBoundedGateArgv(ctx context.Context, argv []string, dir, lintCacheDir string, timeout time.Duration, extraEnv ...string) (string, int) {
+	if len(argv) == 0 {
+		return "", -1
+	}
+	sanitized := withIsolatedLintCache(sanitizedGateEnv(), lintCacheDir)
+	env := appendGateExtraEnv(sanitized, extraEnv)
+	sel := gateIsolation.selection(ctx)
+	switch sel.Path {
+	case gateiso.PathRefused:
+		return gateRefusalMessage(sel), -1
+	case gateiso.PathContainer:
+		return runGateInContainer(ctx, sel, argv, dir, lintCacheDir, sanitized, extraEnv, timeout)
+	case gateiso.PathCloneSandbox:
+		return execBoundedHostArgvFn(ctx, gateiso.WrapSandbox(argv), dir, env, timeout)
+	default:
+		return execBoundedHostArgvFn(ctx, argv, dir, env, timeout)
+	}
+}
+
+// execBoundedHostArgv is the HOST half of the containment contract: a child
+// context bounded by timeout, Setpgid + process-group SIGKILL on
+// cancellation, CombinedOutput, and the 0 / child-code / -1 exit mapping. env
+// is passed as-is — runBoundedGateArgv has already built the sanitized gate
+// env for the host paths, and passes the runner's own environment for the
+// container runtime CLI. It is reached only through execBoundedHostArgvFn.
+func execBoundedHostArgv(ctx context.Context, argv []string, dir string, env []string, timeout time.Duration) (string, int) {
 	if len(argv) == 0 {
 		return "", -1
 	}
@@ -5811,7 +5924,7 @@ func runBoundedGateArgv(ctx context.Context, argv []string, dir, lintCacheDir st
 	defer childCancel()
 	cmd := exec.CommandContext(childCtx, argv[0], argv[1:]...)
 	cmd.Dir = dir
-	cmd.Env = appendGateExtraEnv(withIsolatedLintCache(sanitizedGateEnv(), lintCacheDir), extraEnv)
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
@@ -5838,10 +5951,10 @@ func runBoundedGateArgv(ctx context.Context, argv []string, dir, lintCacheDir st
 // timeout — a coverage run is a test run.
 const diffCoverageTimeout = 10 * time.Minute
 
-// diffCoverageCleanupTimeout bounds the two cleanup git commands (worktree
-// removal, reset --soft) that MUST run even after ctx was cancelled to kill
-// a wedged coverage command. They are detached from ctx's cancellation but
-// never unbounded.
+// diffCoverageCleanupTimeout bounds the cleanup commands (the reset --soft,
+// and the container `rm -f` after a timed-out gate exec) that MUST run even
+// after ctx was cancelled to kill a wedged coverage command. They are
+// detached from ctx's cancellation but never unbounded.
 const diffCoverageCleanupTimeout = 30 * time.Second
 
 // runDiffCoverageGate MEASURES the stage's new-line coverage for the
@@ -5859,8 +5972,9 @@ const diffCoverageCleanupTimeout = 30 * time.Second
 // zero is an auditable vacuous pass.
 //
 // EXECUTION ENVIRONMENT. The customer command runs in a THROWAWAY
-// `git worktree add --detach` checkout of the stage's committed scope-only
-// tree — the same isolation runVerifyCommittedTree gives the verify gate,
+// independent clone (materializeGateCheckout, ADR-063 / #2134) of the
+// stage's committed scope-only tree — the same isolation
+// runVerifyCommittedTree gives the verify gate,
 // and what this constraint's schema/API documentation promises. Two things
 // follow, and both are load-bearing:
 //
@@ -5996,24 +6110,16 @@ func measureDiffCoverage(ctx context.Context, ev diffCoverageEvidence, dc *uploa
 		ev.Reason = "could not create the throwaway-checkout temp dir: " + err.Error()
 		return ev
 	}
-	wt := filepath.Join(parent, "tree")
-	defer func() {
-		// --force because the coverage command's own output (the report,
-		// build artifacts) leaves the checkout dirty by construction.
-		// Detached from ctx's cancellation for the same reason the reset is
-		// — a killed coverage command cancels ctx, and the throwaway
-		// checkout must still be swept — but bounded. RemoveAll is the
-		// backstop that guarantees nothing survives on disk either way.
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), diffCoverageCleanupTimeout)
-		defer cleanupCancel()
-		_ = exec.CommandContext(cleanupCtx, "git", "-C", repoDir, "worktree", "remove", "--force", wt).Run()
-		_ = os.RemoveAll(parent)
-	}()
-	if out, werr := exec.CommandContext(ctx, "git", "-C", repoDir,
-		"worktree", "add", "--detach", wt, headSHA).CombinedOutput(); werr != nil {
+	// The throwaway checkout is an independent CLONE (ADR-063 / #2134), so
+	// there is no worktree to unregister: RemoveAll sweeps the clone, its
+	// own .git and the coverage command's report/build artifacts together,
+	// and runs even after a killed coverage command cancelled ctx.
+	defer func() { _ = os.RemoveAll(parent) }()
+	wt, werr := materializeGateCheckout(ctx, repoDir, headSHA, parent)
+	if werr != nil {
 		ev.ExitCode = -1
 		ev.Reason = fmt.Sprintf("could not create the throwaway checkout of %s to measure: %s",
-			headSHA, strings.TrimSpace(string(out)))
+			headSHA, strings.TrimSpace(werr.Error()))
 		return ev
 	}
 
