@@ -339,8 +339,19 @@ func TestForbidSocketMounts_InnocuousSymlinkToVarRunRefused(t *testing.T) {
 	// Permitted deliberately covers the resolved target's ancestor "/" so
 	// that ONLY the forbidden-root rule can refuse it.
 	err := ForbidSocketMounts(MountPolicy{Permitted: []string{"/"}}, link)
-	if err == nil || !strings.Contains(err.Error(), "forbidden root") || !strings.Contains(err.Error(), "/var/run") {
+	if err == nil || !strings.Contains(err.Error(), "under forbidden root") {
 		t.Fatalf("err = %v", err)
+	}
+	// On Linux /var/run is itself a symlink to /run, so the refusal names
+	// the RESOLVED root ("/run"); on macOS it is a real directory and the
+	// message names "/var/run". Accept either the link path or the
+	// resolved root — the platform decides which one the control reports.
+	want := "/var/run"
+	if resolved, rerr := filepath.EvalSymlinks("/var/run"); rerr == nil {
+		want = resolved
+	}
+	if !strings.Contains(err.Error(), `"`+want+`"`) && !strings.Contains(err.Error(), "/var/run") {
+		t.Fatalf("err = %v: names neither %q nor /var/run", err, want)
 	}
 }
 
