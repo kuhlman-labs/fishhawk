@@ -667,7 +667,9 @@ func (c seedCanary) assertUntouched(t *testing.T, step string) {
 // go.work / go.work.sum symlinked to a host file outside the checkout, a
 // go.work `use` of a directory outside it (directly and through a symlinked
 // directory), and a directory `replace` outside it (in go.work and in a
-// workspace module's go.mod) are each REFUSED with ErrSeedCheckout BEFORE any
+// workspace module's go.mod), and a directory `replace` target inside the
+// checkout whose own go.mod is symlinked to a host file (go reads the
+// replacement's go.mod) are each REFUSED with ErrSeedCheckout BEFORE any
 // go process runs — the exec seam is never reached — and the canary is
 // untouched. Deleting checkSeedCheckout turns every row red (the seam is
 // reached with the hostile checkout).
@@ -724,6 +726,15 @@ func TestSeedModCache_RefusesMetadataReachingOutsideCheckout(t *testing.T) {
 			writeFile(t, filepath.Join(co, "m", "go.mod"), "module x\n\ngo 1.21\n")
 			mustSymlink(t, canary.path, filepath.Join(co, "m", "go.sum"))
 		}, "go.sum is not a regular file"},
+		{"go.mod replace target go.mod symlink to host file", func(t *testing.T, co string) {
+			writeFile(t, filepath.Join(co, "go.mod"), "module x\n\ngo 1.21\n\nrequire example.com/local v0.0.0\n\nreplace example.com/local => ./local\n")
+			mustSymlink(t, canary.path, filepath.Join(co, "local", "go.mod"))
+		}, "local/go.mod is not a regular file"},
+		{"go.work replace target go.mod symlink to host file", func(t *testing.T, co string) {
+			writeFile(t, filepath.Join(co, "go.mod"), "module x\n\ngo 1.21\n")
+			writeFile(t, filepath.Join(co, "go.work"), "go 1.21\n\nuse .\n\nreplace example.com/local => ./local\n")
+			mustSymlink(t, canary.path, filepath.Join(co, "local", "go.mod"))
+		}, "local/go.mod is not a regular file"},
 		{"unparsable go.work", func(t *testing.T, co string) {
 			writeFile(t, filepath.Join(co, "go.mod"), "module x\n\ngo 1.21\n")
 			writeFile(t, filepath.Join(co, "go.work"), "use (\n")

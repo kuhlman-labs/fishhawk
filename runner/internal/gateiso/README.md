@@ -236,10 +236,12 @@ container has been given.
   no `go` binary; (3) REFUSES with `ErrSeedCheckout`, BEFORE any go process
   runs, when the checkout's module metadata would let the host-side seed read
   or write outside the checkout — `go.mod` / `go.sum` / `go.work` /
-  `go.work.sum` that is a symlink or not a regular file, a `go.work` `use`
-  directory or a directory `replace` target (in `go.work` or in any workspace
-  module's `go.mod`) resolving outside the `EvalSymlinks`-resolved checkout, or
-  a metadata file that does not parse; (4) runs `go mod download all` under
+  `go.work.sum` that is a symlink or not a regular file (at the root, in every
+  `go.work` `use` directory and in every directory `replace` target, whose
+  own `go.mod` go reads), a `go.work` `use` directory or a directory `replace`
+  target (in `go.work` or in any workspace module's `go.mod`) resolving
+  outside the `EvalSymlinks`-resolved checkout, or a metadata file that does
+  not parse; (4) runs `go mod download all` under
   `baseEnv` — the runner passes its SANITIZED gate env (`sanitizedGateEnv`,
   ADR-029), never `os.Environ()`, so no runner credential reaches the go
   process — with `GOMODCACHE=dest`, a throwaway `GOCACHE`/`GOPATH` under the
@@ -254,9 +256,13 @@ container has been given.
   network (during seeding; the container itself runs `GOPROXY=off`). The
   `go env GOMODCACHE` probe (when `hostModCache` is empty) runs in the cache
   root, NOT in the checkout, under `GOTOOLCHAIN=local` + `GOWORK=off`.
+  In `runGateInContainer` the seed runs only AFTER the mount guard has
+  accepted every bind source, so a checkout the guard refuses is never handed
+  to a host-side go process (`TestRunGateInContainer_MountGuardPrecedesSeed`).
   External-canary fixtures: `TestSeedModCache_RefusesMetadataReachingOutsideCheckout`
-  (every hostile-metadata row refused with the exec seam never reached and the
-  host canary untouched), `TestSeedModCache_LiveGoSumSymlinkNeverWrittenThrough`
+  (every hostile-metadata row — thirteen, including a directory `replace`
+  target whose `go.mod` links to the canary — refused with the exec seam never
+  reached and the host canary untouched), `TestSeedModCache_LiveGoSumSymlinkNeverWrittenThrough`
   (the REAL go: without the guard it reads THROUGH the planted `go.sum` link),
   `TestSeedModCache_EnvIsBaseEnvPlusPinsNeverProcessEnv`, and the runner-seam
   `TestRunGateInContainer_SeedUnderSanitizedEnvRefusesHostileMetadata`.

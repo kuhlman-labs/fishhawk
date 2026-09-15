@@ -217,12 +217,14 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 }
 
 // runGateInContainer is the container branch of runBoundedGateArgv: fresh
-// empty visible caches, host-side module-cache seed run under the SANITIZED
-// gate env (never the runner's inherited environment — no runner credential
-// reaches the `go mod download`, and the checkout's module metadata is
-// refused before any go process runs when it would reach outside the
-// checkout), argv build under the resolved-path mount guard, exec through
-// the host seam with the RUNNER's inherited environment BOUND to the
+// empty visible caches, argv build under the resolved-path mount guard
+// (FIRST — a checkout the guard refuses is never handed to the host-side
+// seed, so no go process runs against a checkout the container would not
+// have been given), THEN the host-side module-cache seed run under the
+// SANITIZED gate env (never the runner's inherited environment — no runner
+// credential reaches the `go mod download`, and the checkout's module
+// metadata is refused before any go process runs when it would reach outside
+// the checkout), exec through the host seam with the RUNNER's inherited environment BOUND to the
 // validated endpoint (the runtime CLI needs PATH and its config dir from the
 // inherited env; DOCKER_HOST / DOCKER_CONTEXT / CONTAINER_HOST /
 // CONTAINER_CONNECTION are dropped and the selection's socket re-pinned, and
@@ -240,9 +242,6 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		return "gate container: " + err.Error(), -1
 	}
 	defer func() { _ = vc.Remove() }()
-	if _, err := seedModCacheFn(ctx, nil, dir, "", vc, sanitizedEnv, gateSeedTimeout); err != nil {
-		return "gate container: seed module cache: " + err.Error(), -1
-	}
 	if err := os.MkdirAll(lintCacheDir, 0o700); err != nil {
 		return "gate container: create lint cache dir: " + err.Error(), -1
 	}
@@ -268,6 +267,11 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	})
 	if err != nil {
 		return "gate container: " + err.Error(), -1
+	}
+	// Seed only AFTER the mount guard accepted every source: the seed is the
+	// one host-side process the container path runs against the checkout.
+	if _, err := seedModCacheFn(ctx, nil, dir, "", vc, sanitizedEnv, gateSeedTimeout); err != nil {
+		return "gate container: seed module cache: " + err.Error(), -1
 	}
 	// The runtime CLI's env is the runner's inherited environment with the
 	// endpoint bound to the socket the selection validated (concern: a

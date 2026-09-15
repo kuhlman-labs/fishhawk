@@ -393,17 +393,21 @@ the first gate exec from `FISHHAWK_GATE_ISOLATION` × `FISHHAWK_DEPLOYMENT_PROFI
 - **refused** → the refusal text (`gate isolation refused: …`) and `-1`
   WITHOUT executing; the gates classify it **category C** — never an infra
   flake, never a fix-agent re-invoke (`verify_gate_refused`);
-- **container** → `runGateInContainer`: fresh EMPTY per-exec caches, a
-  host-side module-cache seed (the host `GOMODCACHE` is a `file://` proxy
-  source, never a mount) run under the SANITIZED gate env — never
-  `os.Environ()`, so no runner credential reaches the `go mod download` —
-  with `GOTOOLCHAIN=local`, and REFUSED before any go process runs when the
-  checkout's module metadata (a symlinked `go.mod`/`go.sum`/`go.work`/
-  `go.work.sum`, a `go.work` `use` or a directory `replace` resolving outside
-  the checkout) would let the seed read or write an unrelated host file
-  (`gateiso.ErrSeedCheckout`); the runtime argv built under the resolved-path
-  socket-mount guard (`gateiso.ForbidSocketMounts` — a refused source returns
-  `-1` with no exec), `--network=none --cap-drop=ALL
+- **container** → `runGateInContainer`: fresh EMPTY per-exec caches; the
+  runtime argv built under the resolved-path socket-mount guard FIRST
+  (`gateiso.ForbidSocketMounts` — a refused source returns `-1` with no exec
+  AND no seed, so `go mod download` never runs against a checkout the
+  container would not have been given;
+  `TestRunGateInContainer_MountGuardPrecedesSeed`); THEN a host-side
+  module-cache seed (the host `GOMODCACHE` is a `file://` proxy source, never
+  a mount) run under the SANITIZED gate env — never `os.Environ()`, so no
+  runner credential reaches the `go mod download` — with `GOTOOLCHAIN=local`,
+  and REFUSED before any go process runs when the checkout's module metadata
+  (a symlinked `go.mod`/`go.sum`/`go.work`/`go.work.sum` at the root, in a
+  `use` directory or in a directory `replace` target; a `go.work` `use` or a
+  directory `replace` resolving outside the checkout) would let the seed read
+  or write an unrelated host file (`gateiso.ErrSeedCheckout`); the container
+  runs `--network=none --cap-drop=ALL
   --security-opt=no-new-privileges --entrypoint ''` with the sanitized env
   crossing via `-e` and the RUNNER's own env going to the runtime CLI BOUND
   to the endpoint the selection validated (`gateiso.Runtime.BindEndpointEnv`:

@@ -185,9 +185,11 @@ type SeedReport struct {
 //     go.work, or no `go` binary is on PATH.
 //  3. REFUSES with ErrSeedCheckout, before any go process runs, when
 //     go.mod / go.sum / go.work / go.work.sum is a symlink or not a regular
-//     file, or when a go.work `use` directory or a directory `replace`
-//     target (in go.work or in any workspace module's go.mod) resolves
-//     outside the checkout, or when a metadata file does not parse.
+//     file (at the root, in every go.work `use` directory and in every
+//     directory `replace` target), or when a go.work `use` directory or a
+//     directory `replace` target (in go.work or in any workspace module's
+//     go.mod) resolves outside the checkout, or when a metadata file does
+//     not parse.
 //  4. Runs `go mod download all` in checkout under baseEnv — the caller's
 //     SANITIZED gate env, never os.Environ() — with GOMODCACHE=dest, a
 //     throwaway GOCACHE and GOPATH under dest.Root, GOFLAGS=-mod=mod
@@ -308,7 +310,7 @@ var seedMetadataFiles = []string{"go.mod", "go.sum", "go.work", "go.work.sum"}
 // the resolved checkout root: the four metadata files at the root, every
 // go.work `use` directory (and that module's own metadata files and
 // directory `replace` targets), and every directory `replace` target in
-// go.work or the root go.mod. It returns the resolved root and the go.work
+// go.work or the root go.mod (and that target's own metadata files). It returns the resolved root and the go.work
 // path to bind GOWORK to ("" when the checkout has none).
 func checkSeedCheckout(checkout string) (root, workFile string, err error) {
 	root, err = filepath.EvalSymlinks(checkout)
@@ -406,14 +408,20 @@ func seedCheckGoModReplaces(root, modDir string) error {
 // version as written.
 func seedKeepVersion(_, version string) (string, error) { return version, nil }
 
-// seedRequireDirInside is seedResolveInside for a replace target: a module
-// path (not a directory path) needs no check.
+// seedRequireDirInside is seedResolveInside for a replace target — a module
+// path (not a directory path) needs no check — plus seedRequireRegularMetadata
+// on the resolved directory: go reads the replacement's own go.mod, so a
+// symlinked one there is a read through a link the outside-root check alone
+// would not see.
 func seedRequireDirInside(root, base, path, what string) error {
 	if !modfile.IsDirectoryPath(path) {
 		return nil
 	}
-	_, err := seedResolveInside(root, base, path, what)
-	return err
+	dir, err := seedResolveInside(root, base, path, what)
+	if err != nil {
+		return err
+	}
+	return seedRequireRegularMetadata(dir)
 }
 
 // seedResolveInside resolves path (relative to base when not absolute)

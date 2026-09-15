@@ -285,6 +285,47 @@ func TestRunBoundedGateCommand_ContainerRefusesSocketInCheckout(t *testing.T) {
 	}
 }
 
+// TestRunGateInContainer_MountGuardPrecedesSeed: the mount guard runs BEFORE
+// the host-side seed, so a checkout the guard refuses (here: carrying a unix
+// socket) is never handed to `go mod download` — the seed seam is not
+// invoked at all, and the runtime CLI is not reached. Moving the seed back
+// ahead of BuildArgv turns this red (the seed seam observes the checkout).
+func TestRunGateInContainer_MountGuardPrecedesSeed(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "fh-gate-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(dir, "s.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("unix socket unavailable: %v", err)
+	}
+	defer l.Close()
+	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	var seeded []string
+	prev := seedModCacheFn
+	seedModCacheFn = func(_ context.Context, _ gateiso.SeedExecFunc, checkout, _ string, _ *gateiso.VisibleCaches, _ []string, _ time.Duration) (gateiso.SeedReport, error) {
+		seeded = append(seeded, checkout)
+		return gateiso.SeedReport{}, nil
+	}
+	t.Cleanup(func() { seedModCacheFn = prev })
+	calls := captureHostExec(t, true, 0)
+	out, code := runBoundedGateCommand(context.Background(), "true", dir, filepath.Join(t.TempDir(), "lc"), time.Minute)
+	if code != -1 || !strings.Contains(out, "unix socket") {
+		t.Errorf("exit %d out %q; want -1 with the socket-mount refusal", code, out)
+	}
+	if len(seeded) != 0 {
+		t.Errorf("seed ran against a checkout the mount guard refused: %q", seeded)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("runtime CLI reached with %q", *calls)
+	}
+}
+
 // TestRunGateInContainer_ArgvAndTimeoutKill: the container path hands the
 // runtime CLI a BuildArgv line (endpoint binding opens it, entrypoint reset
 // precedes the image, the checkout is mounted at /work, GOPROXY=off crosses
