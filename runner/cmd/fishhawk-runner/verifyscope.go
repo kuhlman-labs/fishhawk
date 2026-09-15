@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"path"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Scoped-verify wire contract (#3315).
@@ -23,8 +25,16 @@ import (
 //
 //	FISHHAWK_VERIFY_PACKAGES=<comma-joined repo-relative package dirs>
 //	FISHHAWK_VERIFY_LOCK_OWNER=runner
+//	FISHHAWK_VERIFY_LOCK_PATH=<primary git-common-dir>/fishhawk-verify.lock
 //
-// Those two names and the comma joiner are a BARE STRING CONTRACT duplicated
+// The third (ADR-063 / #2134) exists because the runner's throwaway verify
+// checkout is a `git clone --no-hardlinks` with a common dir of its OWN, not a
+// linked worktree sharing the primary's: left to `scripts/test`'s own
+// derivation the runner's lock would be keyed to a directory no shell verify
+// ever looks at, silently reopening the #2645 contention. The runner resolves
+// the PRIMARY repository's lock path and injects it after sanitization.
+//
+// Those three names and the comma joiner are a BARE STRING CONTRACT duplicated
 // across a bash script and a Go module that cannot import it — the shape
 // backend/internal/wirecontract exists for. They are declared here as package
 // consts so the Go side has ONE source of truth, and they are pinned from both
@@ -49,6 +59,22 @@ const (
 	// verifyLockOwnerRunner is the one value that marks an invocation as the
 	// runner's own authoritative gate.
 	verifyLockOwnerRunner = "runner"
+
+	// verifyLockPathEnvVar is the verify-lock LOCATION override `scripts/test`
+	// honours FIRST, before its own common-dir derivation (ADR-063 / #2134).
+	// The runner sets it to the primary repository's lock path so a verify run
+	// from the throwaway CLONE still contends with a shell verify in the
+	// primary's worktree family.
+	verifyLockPathEnvVar = "FISHHAWK_VERIFY_LOCK_PATH"
+
+	// verifyLockFileName is the lock's basename under the git common dir —
+	// the same literal `scripts/test`'s `_verify_lock_path` appends.
+	verifyLockFileName = "fishhawk-verify.lock"
+
+	// verifyLockPathResolveTimeout bounds the single `git rev-parse` the
+	// resolver runs. Resolution is best-effort: a slow or wedged git degrades
+	// to "unchanged env" (no injection), never to a stalled gate.
+	verifyLockPathResolveTimeout = 10 * time.Second
 
 	// verifyPackagesSeparator joins the package set into the env value. It is
 	// the reason a package path containing a comma makes verifyScopePackages
@@ -154,6 +180,31 @@ func verifyScopeEnv(env []string, pkgs []string) []string {
 func verifyLockOwnerEnv(env []string) []string {
 	out := dropEnvKey(env, verifyLockOwnerEnvVar)
 	return append(out, verifyLockOwnerEnvVar+"="+verifyLockOwnerRunner)
+}
+
+// verifyLockPathEnv returns env with FISHHAWK_VERIFY_LOCK_PATH set to the
+// PRIMARY repository's `<git-common-dir>/fishhawk-verify.lock`, dropping any
+// inherited entry first (same rationale as verifyScopeEnv). repoDir is the
+// primary checkout (or any linked worktree of it — `--git-common-dir` resolves
+// the SHARED common dir either way), NOT the throwaway clone the gate runs in:
+// the clone's common dir is its own, and a lock keyed there contends with
+// nothing.
+//
+// When the common dir cannot be resolved — repoDir is not a git work tree, git
+// is absent, or the command fails/times out — env is returned UNCHANGED with no
+// variable appended. That is deliberate: `scripts/test` then falls back to its
+// own derivation, which in the clone degrades to the clone's own common dir
+// (still a lock, just an uncontended one) — the pre-#2134 behaviour, never a
+// gate failure. The injection is a contention guard, not a correctness gate.
+func verifyLockPathEnv(env []string, repoDir string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), verifyLockPathResolveTimeout)
+	defer cancel()
+	common, err := gitOut(ctx, repoDir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil || common == "" {
+		return env
+	}
+	out := dropEnvKey(env, verifyLockPathEnvVar)
+	return append(out, verifyLockPathEnvVar+"="+strings.TrimRight(common, "/")+"/"+verifyLockFileName)
 }
 
 // dropEnvKey returns a copy of env with every "key=…" entry removed. It always

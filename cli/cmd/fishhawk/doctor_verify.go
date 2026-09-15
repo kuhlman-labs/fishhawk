@@ -378,19 +378,24 @@ var verifyEnvAllowPrefix = []string{"CGO_", "LC_"}
 // verifyEnvDeny is the explicit known-secret denylist layered on top of the
 // default-deny allow-list. These keys are dropped unconditionally.
 //
-// The last two entries are not secrets: they are the #3315 scoped-verify
-// control variables. FISHHAWK_VERIFY_PACKAGES narrows `scripts/test verify`'s
-// test loop and FISHHAWK_VERIFY_LOCK_OWNER claims runner-kind ownership of the
-// verify lock, so neither may be inherited from an ambient environment into a
-// gate child. The PRIMARY protection is the default-deny allow-list (neither
-// name is on verifyEnvAllowExact, verifyEnvAllowGo, nor verifyEnvAllowPrefix,
-// which is CGO_/LC_ only); these entries are redundant defence against a future
-// allow-rule re-widening, the #2504 shape.
+// The last three entries are not secrets: they are the #3315 scoped-verify
+// control variables plus the ADR-063 / #2134 lock-location override.
+// FISHHAWK_VERIFY_PACKAGES narrows `scripts/test verify`'s test loop,
+// FISHHAWK_VERIFY_LOCK_OWNER claims runner-kind ownership of the verify lock,
+// and FISHHAWK_VERIFY_LOCK_PATH re-keys that lock to an arbitrary path (one
+// nothing else contends on would reopen #2645 while looking locked), so none
+// may be inherited from an ambient environment into a gate child. The PRIMARY
+// protection is the default-deny allow-list (no name is on verifyEnvAllowExact,
+// verifyEnvAllowGo, nor verifyEnvAllowPrefix, which is CGO_/LC_ only); these
+// entries are redundant defence against a future allow-rule re-widening, the
+// #2504 shape.
 //
 // Kept IDENTICAL to runner/cmd/fishhawk-runner/gateenv.go's gateEnvDeny by the
 // runner's TestGateEnvListsMatchCLICopy — editing one copy fails that suite.
-// The runner copy spells these two via its verifyPackagesEnvVar /
-// verifyLockOwnerEnvVar consts; the VALUES must match these literals.
+// The runner copy spells these three via its verifyPackagesEnvVar /
+// verifyLockOwnerEnvVar / verifyLockPathEnvVar consts; the VALUES must match
+// these literals. TestVerifyEnvDenied_VerifyControlVariables pins each BY NAME
+// on this side, so a dropped entry reddens here without the runner's suite.
 var verifyEnvDeny = map[string]struct{}{
 	"FISHHAWK_GITHUB_TOKEN":      {},
 	"FISHHAWK_GITLAB_TOKEN":      {},
@@ -401,6 +406,7 @@ var verifyEnvDeny = map[string]struct{}{
 	"FISHHAWK_API_TOKEN":         {},
 	"FISHHAWK_VERIFY_PACKAGES":   {},
 	"FISHHAWK_VERIFY_LOCK_OWNER": {},
+	"FISHHAWK_VERIFY_LOCK_PATH":  {},
 }
 
 // verifyEnvDenyPrefix lists key prefixes dropped unconditionally — the
