@@ -4409,13 +4409,21 @@ falling through to the settled-outcome-unknown hole (which would wedge every
 undecidable run at a 409), and `acceptanceGateAdmitsMerge` admits it — one
 predicate, so all three merge consumers (#2474) admit it at once.
 
-**`undecidable_reason` is decided on field PRESENCE, never on emptiness.** It is
-decoded as a `*string` on both validators: Go's `encoding/json` makes an ABSENT
-field indistinguishable from a PRESENT empty one on a plain `string`, so
-`{"result":"passed","undecidable_reason":""}` would be silently admitted while
-violating the rule that the field belongs only on an undecidable row. Absent is
-accepted on a non-undecidable row; present — empty or not — is rejected. A literal
-JSON `null` decodes to nil and is treated as absent.
+**`undecidable_reason` is decided on field PRESENCE from the RAW BYTES, never on
+emptiness or on a nil pointer (#2787, the #2699 `validateReapExpectedState`
+pattern).** It is decoded as a `json.RawMessage` on both validators and read
+through one byte-identical helper, `decodeUndecidableReason`: absent (nil raw) is
+the ONLY admitted shape on a passed/failed/skipped row; ANY present value — a
+string, the empty string, an explicit JSON `null`, a number, an object — is
+rejected there. On an undecidable row the raw bytes must decode to a JSON STRING
+with non-whitespace content: absent, `null`, `""`, whitespace-only and every
+non-string all reject (`null` and non-string draw a distinct `must be a JSON
+string` message; the four bytes `null` are never read as the text `null`). Absent,
+`null` and empty are THREE states. The previous `*string` decode collapsed an
+explicit `null` onto nil and admitted `{"result":"passed","undecidable_reason":null}`
+as if the key were absent — the bypass #2787 closed; a plain `string` would
+likewise admit `""`, since Go's `encoding/json` makes an ABSENT field
+indistinguishable from a PRESENT empty one.
 
 **Corpus agreement, not byte-carrying.** The wire shape is validated by two
 hand-maintained twins that cannot import each other:
@@ -4426,10 +4434,15 @@ dirs by `scripts/sync-schemas`, is the shared proof surface: each side runs the
 SAME rows and must produce the SAME admit/reject partition, and CI's schema-sync
 gate red-lines a mirror that drifts. The claim established is corpus agreement —
 NOT that any test carries bytes returned by one validator into the other, which is
-unimplementable across the module boundary. The sharpest row is a WHITESPACE-ONLY
-`undecidable_reason`: the shape one side would admit and the other reject if
-either compared against `""` instead of trimming, which would strand a completed
-acceptance stage while both suites stayed green.
+unimplementable across the module boundary. The sharpest rows are a WHITESPACE-ONLY
+`undecidable_reason` (the shape one side would admit and the other reject if
+either compared against `""` instead of trimming) and, since #2787, the explicit
+`null` rows — `undecidable-reason-on-{passed,failed,skipped}-row-null`,
+`undecidable-row-reason-null` — plus the non-string rows
+`undecidable-row-reason-non-string` and `undecidable-reason-on-passed-row-non-string`:
+the shapes one side would admit if it still decoded into a `*string` or trimmed
+the raw bytes instead of string-decoding them. Any such divergence would strand a
+completed acceptance stage while both suites stayed green.
 
 The backend half proves the partition at the WIRE, not only at the decoder:
 EVERY row — both halves — is POSTed VERBATIM to the real ship endpoint, an

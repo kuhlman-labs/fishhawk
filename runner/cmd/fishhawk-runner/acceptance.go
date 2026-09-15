@@ -129,20 +129,27 @@ var errAcceptanceVerdictMissing = errors.New(
 type acceptanceCriterionResult struct {
 	ID     string `json:"id"`
 	Result string `json:"result"`
-	// UndecidableReason is a POINTER so the decoder preserves field PRESENCE
-	// (#2512, E48.78 binding condition 1). Go's encoding/json makes an ABSENT
-	// field indistinguishable from a PRESENT empty string when the target is a
-	// plain string, so `{"result":"passed","undecidable_reason":""}` would be
-	// silently admitted while violating the rule that the field belongs ONLY on
-	// an undecidable row. Every check below therefore tests the POINTER, never
-	// the value's emptiness. A literal JSON `null` decodes to nil and is treated
-	// as absent (the standard Go/JSON convention).
-	UndecidableReason *string `json:"undecidable_reason,omitempty"`
-	Observed          string  `json:"observed,omitempty"`
-	Expected          string  `json:"expected,omitempty"`
-	StepsTaken        string  `json:"steps_taken,omitempty"`
-	ExpectationBasis  string  `json:"expectation_basis,omitempty"`
-	ReproHandle       string  `json:"repro_handle,omitempty"`
+	// UndecidableReason is a json.RawMessage so PRESENCE is decided on the raw
+	// bytes (#2512 / E48.78 binding condition 1, tightened by #2787 on the
+	// #2699 pattern): absent = nil raw; every PRESENT value — a string, the
+	// empty string, an explicit JSON `null`, a number, an object — keeps its raw
+	// bytes. Go's encoding/json makes an ABSENT field indistinguishable from a
+	// PRESENT empty string when the target is a plain string, and a *string
+	// (the previous type) collapses an explicit `null` onto nil, so
+	// `{"result":"passed","undecidable_reason":null}` was admitted as if the
+	// key were absent while violating the rule that the field belongs ONLY on
+	// an undecidable row. Absent, null and empty are THREE states, and only
+	// absent is admitted on a non-undecidable row. decodeUndecidableReason is
+	// the single reader; the backend twin carries a byte-identical copy, and
+	// the shared corpus pins their agreement. omitempty drops a nil raw on the
+	// coerced-criteria re-marshal, so a reason-less row never re-emits
+	// `"undecidable_reason":null` into the strict backend.
+	UndecidableReason json.RawMessage `json:"undecidable_reason,omitempty"`
+	Observed          string          `json:"observed,omitempty"`
+	Expected          string          `json:"expected,omitempty"`
+	StepsTaken        string          `json:"steps_taken,omitempty"`
+	ExpectationBasis  string          `json:"expectation_basis,omitempty"`
+	ReproHandle       string          `json:"repro_handle,omitempty"`
 }
 
 // acceptanceVerdict mirrors the backend's acceptanceBody by json tag.
@@ -341,15 +348,31 @@ func validateAcceptanceVerdict(raw []byte, servedCriteriaIDs []string, warn func
 			// silently dropped criterion. Mirrors the backend twin exactly; the
 			// shared docs/spec/acceptance-verdict-fixtures.json corpus pins the
 			// agreement (sharply, the whitespace-only row).
-			if c.UndecidableReason == nil || strings.TrimSpace(*c.UndecidableReason) == "" {
+			present, text, derr := decodeUndecidableReason(c.UndecidableReason)
+			if !present {
+				return nil, fmt.Errorf(
+					"criteria[%d].undecidable_reason is required and must be non-whitespace when result is undecidable", i)
+			}
+			// #2787: the raw bytes must be a JSON STRING. An explicit `null` and
+			// every non-string shape (a number, an object) reject here, on a
+			// message distinct from the absent branch — `null` is never read as
+			// the four-character text 'null'.
+			if derr != nil {
+				return nil, fmt.Errorf(
+					"criteria[%d].undecidable_reason must be a JSON string when result is undecidable, got %s",
+					i, string(bytes.TrimSpace(c.UndecidableReason)))
+			}
+			if strings.TrimSpace(text) == "" {
 				return nil, fmt.Errorf(
 					"criteria[%d].undecidable_reason is required and must be non-whitespace when result is undecidable", i)
 			}
 		case "passed", "failed", "skipped":
-			// The field is rejected on PRESENCE, not on emptiness (binding
-			// condition 1): `"undecidable_reason": ""` on a passed row is a
-			// producer error exactly as a non-empty one is.
-			if c.UndecidableReason != nil {
+			// The field is rejected on PRESENCE, not on emptiness or value
+			// (binding condition 1, #2787): `"undecidable_reason": ""` and
+			// `"undecidable_reason": null` on a passed row are producer errors
+			// exactly as a non-empty one is — the shapes a plain-string and a
+			// *string decode respectively would silently admit.
+			if present, _, _ := decodeUndecidableReason(c.UndecidableReason); present {
 				return nil, fmt.Errorf(
 					"criteria[%d].undecidable_reason must be omitted when result is %q", i, c.Result)
 			}
@@ -458,6 +481,29 @@ func coerceAcceptanceEvidenceHashes(raw json.RawMessage) ([]string, bool, error)
 	default:
 		return nil, false, errors.New("evidence_hashes must be a flat array of strings or a string-valued object map")
 	}
+}
+
+// decodeUndecidableReason reads a criterion row's undecidable_reason from its
+// raw bytes (#2787, the #2699 pattern). present is false ONLY when the field
+// was absent from the wire (nil / zero-length raw); every present value —
+// including an explicit JSON `null` — reports present=true. When present, the
+// bytes must decode to a JSON string: text carries it and err is nil;
+// otherwise err names the shape (a `null` decodes to a nil string pointer and
+// is rejected explicitly, so it is never reported as the text 'null'). The
+// backend twin carries a byte-identical copy; the shared corpus pins agreement.
+func decodeUndecidableReason(raw json.RawMessage) (present bool, text string, err error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return false, "", nil
+	}
+	var decoded *string
+	if uerr := json.Unmarshal(trimmed, &decoded); uerr != nil {
+		return true, "", fmt.Errorf("undecidable_reason must be a JSON string: %w", uerr)
+	}
+	if decoded == nil {
+		return true, "", errors.New("undecidable_reason must be a JSON string, got null")
+	}
+	return true, *decoded, nil
 }
 
 // coerceAcceptanceCriteria normalizes the verdict's criteria field. It returns

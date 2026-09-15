@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -3964,12 +3965,22 @@ func TestAcceptanceVerdictCorpus_BackendPartitionMatchesRunner(t *testing.T) {
 	}
 }
 
+// rawReason builds the raw JSON-string bytes an undecidable row carries in
+// its undecidable_reason field (#2787: the field is a json.RawMessage so
+// presence is decided on the raw bytes, and a Go-side constructor must supply
+// a quoted string, not a pointer).
+func rawReason(s string) json.RawMessage {
+	return json.RawMessage(strconv.Quote(s))
+}
+
 // TestAcceptanceBody_UndecidableReasonPresence pins BINDING CONDITION 1 at the
 // backend validator: undecidable_reason is decided on field PRESENCE, never on
-// emptiness. The present-and-EMPTY case is the one a plain-string decode
-// silently admits — Go's encoding/json cannot distinguish it from an absent
-// field — so it is the case that goes RED under a mutation collapsing presence
-// back to a string compare.
+// emptiness or value. The present-and-EMPTY case is the one a plain-string
+// decode silently admits — Go's encoding/json cannot distinguish it from an
+// absent field — and the present-and-NULL cases are the ones a *string decode
+// silently admits (#2787: null collapses onto nil), so those are the cases
+// that go RED under a mutation collapsing presence back to a string or
+// pointer compare.
 func TestAcceptanceBody_UndecidableReasonPresence(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -3986,6 +3997,14 @@ func TestAcceptanceBody_UndecidableReasonPresence(t *testing.T) {
 			`{"verdict":"failed","failure_mode":"assertion_fail","criteria":[{"id":"AC1","result":"failed","undecidable_reason":""}]}`, true},
 		{"present-on-skipped-row-rejected",
 			`{"verdict":"passed","criteria":[{"id":"AC1","result":"skipped","undecidable_reason":"why"}]}`, true},
+		{"present-and-NULL-on-passed-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":null}]}`, true},
+		{"present-and-NULL-on-failed-row-rejected",
+			`{"verdict":"failed","failure_mode":"assertion_fail","criteria":[{"id":"AC1","result":"failed","undecidable_reason":null}]}`, true},
+		{"present-and-NULL-on-skipped-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"skipped","undecidable_reason":null}]}`, true},
+		{"present-non-string-on-passed-row-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","undecidable_reason":{}}]}`, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3996,6 +4015,9 @@ func TestAcceptanceBody_UndecidableReasonPresence(t *testing.T) {
 			err := a.validate(context.Background(), nil)
 			if tc.wantErr && err == nil {
 				t.Fatal("want rejection, got admitted")
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), "must be omitted when result is") {
+				t.Fatalf("want the presence rejection, got %v", err)
 			}
 			if !tc.wantErr && err != nil {
 				t.Fatalf("want admitted, got %v", err)
@@ -4005,23 +4027,31 @@ func TestAcceptanceBody_UndecidableReasonPresence(t *testing.T) {
 }
 
 // TestAcceptanceBody_UndecidableReasonRequired pins the other half of the rule:
-// an undecidable row REQUIRES a non-whitespace reason. The whitespace-only case
-// is the named twin-divergence risk — a validator that compared against "" would
-// admit it, stranding a completed acceptance stage while both suites stay green.
+// an undecidable row REQUIRES a non-whitespace JSON STRING reason. The
+// whitespace-only case is the named twin-divergence risk — a validator that
+// compared against "" would admit it, stranding a completed acceptance stage
+// while both suites stay green. The null and non-string cases (#2787) pin the
+// raw-bytes decode: the four bytes `null` are never read as the text 'null',
+// and a number is not a reason; both draw the 'must be a JSON string' message
+// so the branch is distinguished from the absent one.
 func TestAcceptanceBody_UndecidableReasonRequired(t *testing.T) {
 	cases := []struct {
 		name    string
 		raw     string
-		wantErr bool
+		wantErr string // "" = admitted
 	}{
 		{"absent-rejected",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable"}]}`, true},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable"}]}`, "is required and must be non-whitespace"},
 		{"empty-rejected",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":""}]}`, true},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":""}]}`, "is required and must be non-whitespace"},
 		{"whitespace-only-rejected",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"  \t\n "}]}`, true},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"  \t\n "}]}`, "is required and must be non-whitespace"},
+		{"null-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":null}]}`, "must be a JSON string"},
+		{"non-string-rejected",
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":7}]}`, "must be a JSON string"},
 		{"non-empty-accepted",
-			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"no seam"}]}`, false},
+			`{"verdict":"passed","criteria":[{"id":"AC1","result":"undecidable","undecidable_reason":"no seam"}]}`, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -4030,10 +4060,16 @@ func TestAcceptanceBody_UndecidableReasonRequired(t *testing.T) {
 				t.Fatalf("decode: %v", err)
 			}
 			err := a.validate(context.Background(), nil)
-			if tc.wantErr && err == nil {
-				t.Fatal("want rejection, got admitted")
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatal("want rejection, got admitted")
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
 			}
-			if !tc.wantErr && err != nil {
+			if err != nil {
 				t.Fatalf("want admitted, got %v", err)
 			}
 		})
@@ -4078,9 +4114,8 @@ func TestAcceptanceBody_TopLevelUndecidableVerdictRejected(t *testing.T) {
 // is pinned at the seam by
 // TestShipAcceptance_NoCriteriaRows_ShippedVerdictRecordedUnchanged.
 func TestAggregateAcceptanceResults(t *testing.T) {
-	reason := "no seam"
 	u := func(id string) acceptanceCriterionResult {
-		return acceptanceCriterionResult{ID: id, Result: acceptanceResultUndecidable, UndecidableReason: &reason}
+		return acceptanceCriterionResult{ID: id, Result: acceptanceResultUndecidable, UndecidableReason: rawReason("no seam")}
 	}
 	cases := []struct {
 		name string
@@ -4487,13 +4522,12 @@ func TestAcceptanceGateAdmitsMerge_Undecidable(t *testing.T) {
 // TestAcceptanceCriteriaTally_CountsUndecidable pins the new tally arm that
 // feeds the criteria_undecidable payload field.
 func TestAcceptanceCriteriaTally_CountsUndecidable(t *testing.T) {
-	reason := "no seam"
 	passed, failed, skipped, undecidable, total := acceptanceCriteriaTally([]acceptanceCriterionResult{
 		{ID: "a", Result: acceptanceResultPassed},
 		{ID: "b", Result: acceptanceResultFailed},
 		{ID: "c", Result: acceptanceResultSkipped},
-		{ID: "d", Result: acceptanceResultUndecidable, UndecidableReason: &reason},
-		{ID: "e", Result: acceptanceResultUndecidable, UndecidableReason: &reason},
+		{ID: "d", Result: acceptanceResultUndecidable, UndecidableReason: rawReason("no seam")},
+		{ID: "e", Result: acceptanceResultUndecidable, UndecidableReason: rawReason("no seam")},
 	})
 	if passed != 1 || failed != 1 || skipped != 1 || undecidable != 2 || total != 5 {
 		t.Errorf("tally = %d/%d/%d/%d of %d, want 1/1/1/2 of 5",
@@ -4701,9 +4735,8 @@ func TestShipAcceptance_FailedScenarioRow_NoReplayEntry_RecordsOriginUnresolved(
 func TestClassifyAcceptanceFailure_ScenarioSkipsNeverPage(t *testing.T) {
 	explicit := plan.CriterionSourceExplicit
 	criteria := []plan.AcceptanceCriterion{{ID: "crit-a", Statement: "s", Source: explicit}}
-	reason := "budget"
 	scenarioSkip := acceptanceCriterionResult{ID: "scenario:issue-1/x", Result: acceptanceResultSkipped, ExpectationBasis: "replay_budget_exhausted"}
-	scenarioUndecidable := acceptanceCriterionResult{ID: "scenario:issue-1/y", Result: acceptanceResultUndecidable, UndecidableReason: &reason}
+	scenarioUndecidable := acceptanceCriterionResult{ID: "scenario:issue-1/y", Result: acceptanceResultUndecidable, UndecidableReason: rawReason("budget")}
 	// Only scenario skips, no criterion failed: falls to class 4, never 2/5.
 	acc := acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail",
 		normalizedCriteria: []acceptanceCriterionResult{{ID: "crit-a", Result: acceptanceResultPassed}},

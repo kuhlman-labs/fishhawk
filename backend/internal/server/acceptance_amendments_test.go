@@ -616,10 +616,11 @@ func TestAmendCriteria_OversizedText_Capped(t *testing.T) {
 
 // --- #2512: the D4 arm's undecidable extension, and the ordering it depends on ---
 
-// undecidableResult builds an undecidable per-criterion row. The reason is a
-// pointer because the wire rule is decided on field PRESENCE, not emptiness.
+// undecidableResult builds an undecidable per-criterion row. The reason is
+// raw JSON-string bytes because the wire rule is decided on field PRESENCE
+// from the raw bytes, not on emptiness or a nil pointer (#2787).
 func undecidableResult(id, reason string) acceptanceCriterionResult {
-	return acceptanceCriterionResult{ID: id, Result: acceptanceResultUndecidable, UndecidableReason: &reason}
+	return acceptanceCriterionResult{ID: id, Result: acceptanceResultUndecidable, UndecidableReason: rawReason(reason)}
 }
 
 // TestDowngrade_SurvivingBlockingUndecidable_NotDowngraded is the #2512

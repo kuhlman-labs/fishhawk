@@ -1036,7 +1036,7 @@ func outcomePayloadOf(t *testing.T, seam *exampleAcceptanceSeam) map[string]any 
 }
 
 func undecidableRow(id, reason string) acceptanceCriterionResult {
-	return acceptanceCriterionResult{ID: id, Result: acceptanceResultUndecidable, UndecidableReason: &reason}
+	return acceptanceCriterionResult{ID: id, Result: acceptanceResultUndecidable, UndecidableReason: rawReason(reason)}
 }
 
 // TestAcceptanceSeam_AllUndecidableCrossesToMergeEligible is the #2512 DONE-MEANS
