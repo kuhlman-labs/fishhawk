@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -234,6 +236,122 @@ func envHas(env []string, want string) bool {
 }
 
 // ---------------------------------------------------------------------------
+// D2. verifyLockPathEnv — the ADR-063 / #2134 lock-location injection.
+//
+// The runner's throwaway verify checkout is a CLONE with its own common dir, so
+// the lock `scripts/test` would derive there contends with nothing. The
+// resolver must yield the PRIMARY's lock from either the primary or one of its
+// linked worktrees, and must leave env UNCHANGED when there is no repository
+// to resolve.
+// ---------------------------------------------------------------------------
+
+// primaryLockPath is the expected injected value for repo: git's own absolute
+// common dir plus the lock basename. Computed through git (not filepath.Join on
+// the temp dir) so a symlinked TMPDIR (macOS /var -> /private/var) cannot fail
+// the byte comparison.
+func primaryLockPath(t *testing.T, repo string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse --git-common-dir in %s: %v\n%s", repo, err, out)
+	}
+	return strings.TrimRight(strings.TrimSpace(string(out)), "/") + "/" + verifyLockFileName
+}
+
+func TestVerifyLockPathEnv(t *testing.T) {
+	primary := initRepo(t)
+	want := primaryLockPath(t, primary)
+	base := []string{"PATH=/usr/bin", "HOME=/home/x"}
+
+	t.Run("primary checkout resolves its own common dir", func(t *testing.T) {
+		got := verifyLockPathEnv(base, primary)
+		if len(got) != len(base)+1 || got[len(got)-1] != verifyLockPathEnvVar+"="+want {
+			t.Fatalf("verifyLockPathEnv = %q, want %q appended to base", got, verifyLockPathEnvVar+"="+want)
+		}
+	})
+
+	t.Run("a LINKED worktree resolves the PRIMARY lock, not its own gitdir", func(t *testing.T) {
+		linked := filepath.Join(t.TempDir(), "linked")
+		cmd := exec.Command("git", "-C", primary, "worktree", "add", "-q", "--detach", linked)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git worktree add: %v\n%s", err, out)
+		}
+		t.Cleanup(func() {
+			_ = exec.Command("git", "-C", primary, "worktree", "remove", "--force", linked).Run()
+		})
+		got := verifyLockPathEnv(base, linked)
+		if !envHas(got, verifyLockPathEnvVar+"="+want) {
+			t.Fatalf("from a linked worktree verifyLockPathEnv = %q, want the PRIMARY lock %q", got, want)
+		}
+		for _, kv := range got {
+			if strings.HasPrefix(kv, verifyLockPathEnvVar+"=") && strings.Contains(kv, "/worktrees/") {
+				t.Fatalf("the injected lock is keyed under the linked worktree's private gitdir: %q", kv)
+			}
+		}
+	})
+
+	t.Run("a CLONE resolves the CLONE's common dir — why the runner passes the primary", func(t *testing.T) {
+		// Documents the hazard the injection closes: asked about the clone
+		// itself, the resolver (like scripts/test's derivation) yields a lock
+		// nothing else contends on. The runner therefore passes the PRIMARY.
+		clone := filepath.Join(t.TempDir(), "clone")
+		cmd := exec.Command("git", "clone", "-q", "--no-hardlinks", primary, clone)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git clone: %v\n%s", err, out)
+		}
+		got := verifyLockPathEnv(base, clone)
+		if envHas(got, verifyLockPathEnvVar+"="+want) {
+			t.Fatalf("a clone resolved the primary's lock %q — the fixture is not a clone with its own common dir", want)
+		}
+		if !envHas(got, verifyLockPathEnvVar+"="+primaryLockPath(t, clone)) {
+			t.Fatalf("a clone did not resolve its own common dir: %q", got)
+		}
+	})
+
+	t.Run("a non-git directory leaves env UNCHANGED", func(t *testing.T) {
+		got := verifyLockPathEnv(base, t.TempDir())
+		if !reflect.DeepEqual(got, base) {
+			t.Fatalf("verifyLockPathEnv on a non-git dir = %q, want base unchanged %q", got, base)
+		}
+	})
+
+	t.Run("a nonexistent directory leaves env UNCHANGED", func(t *testing.T) {
+		got := verifyLockPathEnv(base, filepath.Join(t.TempDir(), "missing"))
+		if !reflect.DeepEqual(got, base) {
+			t.Fatalf("verifyLockPathEnv on a missing dir = %q, want base unchanged %q", got, base)
+		}
+	})
+
+	t.Run("an inherited entry is dropped, never duplicated", func(t *testing.T) {
+		withAmbient := append([]string{verifyLockPathEnvVar + "=/nowhere/attacker.lock"}, base...)
+		got := verifyLockPathEnv(withAmbient, primary)
+		n := 0
+		for _, kv := range got {
+			if strings.HasPrefix(kv, verifyLockPathEnvVar+"=") {
+				n++
+				if kv != verifyLockPathEnvVar+"="+want {
+					t.Fatalf("the ambient lock path survived: %q", kv)
+				}
+			}
+		}
+		if n != 1 {
+			t.Fatalf("verifyLockPathEnv left %d %s entries, want exactly 1: %q", n, verifyLockPathEnvVar, got)
+		}
+		// The input slice is never aliased or mutated.
+		if withAmbient[0] != verifyLockPathEnvVar+"=/nowhere/attacker.lock" {
+			t.Fatalf("verifyLockPathEnv mutated its input: %q", withAmbient)
+		}
+	})
+
+	t.Run("the injected name is not admitted by sanitization — only injection delivers it", func(t *testing.T) {
+		if gateEnvAllowed(verifyLockPathEnvVar) || !gateEnvDenied(verifyLockPathEnvVar) {
+			t.Fatalf("%s must be denied by both layers so only the runner's own post-sanitization injection can set it", verifyLockPathEnvVar)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // F. NAME PIN — the cheap complement to the executable test below.
 //
 // The runner's consts and `scripts/test` are a bare string contract across a
@@ -251,10 +369,16 @@ func TestVerifyPackagesEnvNameMatchesScriptsTest(t *testing.T) {
 		t.Fatalf("go.work found at %s but scripts/test could not be read: %v", root, err)
 	}
 	src := string(data)
-	for _, name := range []string{verifyPackagesEnvVar, verifyLockOwnerEnvVar} {
+	for _, name := range []string{verifyPackagesEnvVar, verifyLockOwnerEnvVar, verifyLockPathEnvVar} {
 		if !strings.Contains(src, name) {
 			t.Errorf("scripts/test does not reference %q — the runner injects a variable the shell never reads", name)
 		}
+	}
+	// The lock BASENAME is load-bearing too: the runner appends it to the
+	// primary's common dir, and the shell's own derivation appends the same
+	// literal — a rename on one side keys the two lock kinds to different files.
+	if !strings.Contains(src, verifyLockFileName) {
+		t.Errorf("scripts/test does not reference %q — the runner's injected lock path and the shell's derived one would name different files", verifyLockFileName)
 	}
 	// The owner VALUE is load-bearing too: scripts/test compares the variable
 	// against this exact string to select runner-kind semantics.
@@ -455,6 +579,95 @@ func TestRunnerEnvDrivesRealScriptsTestVerify(t *testing.T) {
 	}
 	if !sawBackend || !sawCLI {
 		t.Errorf("unscoped verify skipped a module (backend=%v cli=%v): %q", sawBackend, sawCLI, full)
+	}
+
+	// --- LOCK-PATH OVERRIDE arm (ADR-063 / #2134) --------------------------
+	// The runner's throwaway verify checkout is a CLONE with its own common dir.
+	// This arm runs the REAL scripts/test verify FROM such a clone of the
+	// fixture, with FISHHAWK_VERIFY_LOCK_PATH produced by CALLING
+	// verifyLockPathEnv against the PRIMARY fixture, against a live
+	// `<pid>:shell` holder pre-seeded at that exact path. Runner-kind at a
+	// 1-second budget (the fixture's `sleep` is a recording stub, so the wait
+	// never really elapses) the run must DISPLACE that holder and say so on
+	// stderr NAMING the override path — proof the two sides agree on the
+	// variable's NAME and that its VALUE is consumed verbatim. The control arm
+	// runs the same clone verify WITHOUT the variable: the clone keys its lock
+	// to its own common dir, never meets the holder, prints no warning, and the
+	// holder is left standing — the reopened-#2645 shape the override closes.
+	clone := filepath.Join(t.TempDir(), "clone")
+	cloneCmd := exec.Command("git", "clone", "-q", "--no-hardlinks", fixture, clone)
+	cloneCmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("cloning the fixture: %v\n%s", err, out)
+	}
+	// The fixture's logs/ is created after its base commit, so the clone lacks
+	// it; scripts/test itself writes nothing there, but the recording stubs
+	// resolve their log dir from the ORIGINAL fixture, so only mkdir is needed.
+	if err := os.MkdirAll(filepath.Join(clone, "logs"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	lockEnv := verifyLockPathEnv(verifyScopeEnv(verifyLockOwnerEnv(base), pkgs), fixture)
+	lockPath := ""
+	for _, kv := range lockEnv {
+		if v, ok := strings.CutPrefix(kv, verifyLockPathEnvVar+"="); ok {
+			lockPath = v
+		}
+	}
+	if lockPath == "" {
+		t.Fatalf("verifyLockPathEnv against the primary fixture injected nothing: %q", lockEnv)
+	}
+	if got := primaryLockPath(t, fixture); lockPath != got {
+		t.Fatalf("injected lock path %q != the primary's common-dir lock %q", lockPath, got)
+	}
+	if primaryLockPath(t, clone) == lockPath {
+		t.Fatalf("the clone shares the primary's common dir (%q) — the arm cannot discriminate", lockPath)
+	}
+	seedHolder := func(t *testing.T) {
+		t.Helper()
+		_ = os.Remove(lockPath)
+		// Our own pid is live by construction; the kind is shell so a
+		// runner-kind verify may displace it after the budget.
+		if err := os.Symlink(fmt.Sprintf("%d:shell", os.Getpid()), lockPath); err != nil {
+			t.Fatalf("seeding the shell holder at %s: %v", lockPath, err)
+		}
+	}
+	runCloneVerify := func(t *testing.T, env []string) (string, error) {
+		t.Helper()
+		cmd := exec.Command("bash", filepath.Join(clone, "scripts", "test"), "verify") //nolint:gosec // fixture path
+		cmd.Dir = clone
+		cmd.Env = append(append([]string{}, env...), "FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=1")
+		var stderr strings.Builder
+		cmd.Stdout = io.Discard
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		return stderr.String(), err
+	}
+	t.Cleanup(func() { _ = os.Remove(lockPath) })
+
+	seedHolder(t)
+	stderr, err := runCloneVerify(t, lockEnv)
+	if err != nil {
+		t.Fatalf("the clone verify under the lock-path override failed: %v\n%s", err, stderr)
+	}
+	wantWarn := "displacing a wedged shell verify holding " + lockPath
+	if !strings.Contains(stderr, wantWarn) {
+		t.Errorf("the override arm did not displace the holder at the injected path (want %q on stderr):\n%s", wantWarn, stderr)
+	}
+	if _, serr := os.Lstat(lockPath); serr == nil {
+		t.Errorf("the runner-kind verify did not release the override lock at %s on exit", lockPath)
+	}
+
+	// Control arm: identical env MINUS the variable.
+	seedHolder(t)
+	stderrCtl, err := runCloneVerify(t, dropEnvKey(lockEnv, verifyLockPathEnvVar))
+	if err != nil {
+		t.Fatalf("the control clone verify failed: %v\n%s", err, stderrCtl)
+	}
+	if strings.Contains(stderrCtl, "displacing") {
+		t.Errorf("without %s the clone verify still met the primary's holder — the arm does not discriminate:\n%s", verifyLockPathEnvVar, stderrCtl)
+	}
+	if target, rerr := os.Readlink(lockPath); rerr != nil || target != fmt.Sprintf("%d:shell", os.Getpid()) {
+		t.Errorf("without the override the primary's holder should be untouched; readlink = %q, %v", target, rerr)
 	}
 }
 

@@ -61,6 +61,20 @@ func TestMain(m *testing.M) {
 // runTestMain does TestMain's work in a func so its cleanup defer runs
 // before os.Exit (os.Exit skips deferred funcs).
 func runTestMain(m *testing.M) int {
+	// Gate-isolation e2e sentinel (ADR-063 / #2134, approval condition 3).
+	// Eligibility comes from an INDEPENDENT runtime probe — never from
+	// gateiso.DetectRuntime's Safe verdict — so a DetectRuntime regression
+	// that skips every docker-gated fixture on a genuinely safe host still
+	// fails the binary here rather than passing an all-skipped run green.
+	dockerFixturesEligible = independentRuntimeProbe()
+	runSuite := func() int {
+		code := m.Run()
+		if code == 0 && gateE2ESentinelShouldFire(dockerFixturesEligible, dockerFixturesRan, gateE2ESentinelRunFilter(), testing.Short()) {
+			fmt.Fprintln(os.Stderr, gateSentinelReport(dockerFixturesRan))
+			return 1
+		}
+		return code
+	}
 	// On an Actions pull-request build GITHUB_REF_NAME is the "N/merge" ref,
 	// which no throwaway fixture repository carries, so the
 	// --base-branch > GITHUB_REF_NAME > "main" ladder (resolveImplementBaseRef)
@@ -72,11 +86,11 @@ func runTestMain(m *testing.M) int {
 	os.Unsetenv("GITHUB_REF_NAME")
 	os.Unsetenv("GITHUB_REPOSITORY")
 	if _, err := exec.LookPath("git"); err != nil {
-		return m.Run() // git unavailable — degrade to the original CWD.
+		return runSuite() // git unavailable — degrade to the original CWD.
 	}
 	dir, err := os.MkdirTemp("", "fishhawk-runner-main-test-*")
 	if err != nil {
-		return m.Run()
+		return runSuite()
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 
@@ -103,12 +117,12 @@ func runTestMain(m *testing.M) int {
 		setupErr = runGit("commit", "-q", "-m", "seed")
 	}
 	if setupErr != nil {
-		return m.Run() // setup failed — degrade to the original CWD.
+		return runSuite() // setup failed — degrade to the original CWD.
 	}
 	if err := os.Chdir(dir); err != nil {
-		return m.Run() // chdir failed — degrade to the original CWD.
+		return runSuite() // chdir failed — degrade to the original CWD.
 	}
-	return m.Run()
+	return runSuite()
 }
 
 // TestHarnessNeutralizesActionsEnv pins the runTestMain posture directly:
@@ -14266,7 +14280,8 @@ func verifiedTreeCfg(repo, verifyCmd string) config {
 
 // unresolvableTreeVerifyCmd returns a verify command that PASSES (exit 0) but
 // leaves the throwaway commit's tree unresolvable in the main repo: running in
-// the gate's isolated worktree (shared object store), it soft-resets the main
+// the gate's throwaway clone (reaching the main repo by ABSOLUTE path, since
+// the clone shares nothing with it — ADR-063 / #2134), it soft-resets the main
 // repo's HEAD off the throwaway commit FIRST (so the gate's own post-verify
 // reset still resolves HEAD~1 — the fixture needs two base commits for that
 // second step back) and then deletes the throwaway commit's loose object, so
@@ -14887,9 +14902,17 @@ func TestRunVerifyCommittedTree_OutcomeStrings(t *testing.T) {
 	if _, _, outcome := runVerifyCommittedTree(context.Background(), "false", repo, head, time.Minute, nil); outcome != "failed" {
 		t.Errorf("non-zero outcome = %q, want failed", outcome)
 	}
+	// A materialization failure (the head is not a commit in the clone) keeps
+	// the tolerant "skipped" outcome with a clone: reason (ADR-063 / #2134
+	// replaced `git worktree add` with an independent clone; the outcome
+	// contract is unchanged).
 	bogus := strings.Repeat("deadbeef", 5)
-	if ev, _, outcome := runVerifyCommittedTree(context.Background(), "true", repo, bogus, time.Minute, nil); outcome != "skipped" {
-		t.Errorf("worktree_add-failure outcome = %q, want skipped (%s)", outcome, ev.Payload)
+	ev, out, outcome := runVerifyCommittedTree(context.Background(), "true", repo, bogus, time.Minute, nil)
+	if outcome != "skipped" {
+		t.Errorf("clone-failure outcome = %q, want skipped (%s)", outcome, ev.Payload)
+	}
+	if out != "" || !strings.Contains(string(ev.Payload), "clone: ") {
+		t.Errorf("clone-failure event must carry a clone: reason and no gate output: out=%q payload=%s", out, ev.Payload)
 	}
 }
 
@@ -16458,7 +16481,7 @@ exit 0
 
 	// Any non-empty verifiedTreeSHA arms the invariant; the base tree stands
 	// in for a gate pass (running the real gate here would fire the hook on
-	// the gate's own worktree add and fail-close there instead).
+	// the gate's own throwaway clone and fail-close there instead).
 	verifiedTree, err := gitRevParseTreeOf(context.Background(), repo, "HEAD")
 	if err != nil {
 		t.Fatal(err)
@@ -20383,9 +20406,16 @@ func TestRunDiffCoverageGate_RunsInAThrowawayCheckout(t *testing.T) {
 	repo := diffCovRepo(t)
 	headBefore := gitHead(t, repo)
 
+	// The command also records what its checkout's .git IS — written OUTSIDE
+	// the checkout, which is swept on return — so the test can assert the
+	// checkout is an independent clone (ADR-063 / #2134): a .git DIRECTORY
+	// that is its own common dir, not a worktree gitfile pointing into the
+	// primary.
+	probe := filepath.Join(t.TempDir(), "gitprobe")
 	dc := &upload.DiffCoverageConfig{
 		Command: `printf 'SF:app.go\nDA:1,1\nDA:3,1\nend_of_record\n' > coverage.lcov; ` +
-			`echo scribble > SIDE_EFFECT; rm -f base.go`,
+			`echo scribble > SIDE_EFFECT; rm -f base.go; ` +
+			`{ test -d .git && echo dotgit=dir || echo dotgit=other; printf 'common=%s\n' "$(git rev-parse --path-format=absolute --git-common-dir)"; } > ` + probe,
 		ReportPath:         "coverage.lcov",
 		MinNewLineCoverage: 80,
 	}
@@ -20393,12 +20423,25 @@ func TestRunDiffCoverageGate_RunsInAThrowawayCheckout(t *testing.T) {
 	if got.Outcome != "measured" {
 		t.Fatalf("outcome = %q reason = %q, want measured", got.Outcome, got.Reason)
 	}
+	probeOut, err := os.ReadFile(probe)
+	if err != nil {
+		t.Fatalf("git probe: %v", err)
+	}
+	if !strings.Contains(string(probeOut), "dotgit=dir\n") {
+		t.Errorf("the throwaway checkout's .git is not a directory (a worktree gitfile shares the primary):\n%s", probeOut)
+	}
+	if strings.Contains(string(probeOut), "common="+repo+"/.git") || !strings.Contains(string(probeOut), "fishhawk-diffcov-") {
+		t.Errorf("the throwaway checkout's common dir must be its own, not the primary's:\n%s", probeOut)
+	}
+	if wl, _ := exec.Command("git", "-C", repo, "worktree", "list").Output(); strings.Count(string(wl), "\n") != 1 {
+		t.Errorf("a worktree is registered against the primary:\n%s", wl)
+	}
 	if got.NewLines != 2 || got.CoveredNewLines != 2 {
 		t.Errorf("covered/total = %d/%d, want 2/2", got.CoveredNewLines, got.NewLines)
 	}
 	for _, p := range []string{"SIDE_EFFECT", "coverage.lcov"} {
 		if _, err := os.Stat(filepath.Join(repo, p)); !os.IsNotExist(err) {
-			t.Errorf("%q leaked into the real checkout (err=%v); the command must run in a throwaway worktree", p, err)
+			t.Errorf("%q leaked into the real checkout (err=%v); the command must run in a throwaway clone", p, err)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(repo, "base.go")); err != nil {
@@ -20841,6 +20884,10 @@ func TestRunDiffCoverageGate_PostCommitResetFailureFatal(t *testing.T) {
 	repo := diffCovRepo(t)
 	headBefore := gitHead(t, repo)
 
+	// The lock is planted through the PRIMARY's ABSOLUTE .git path: the
+	// coverage command runs in an independent clone (ADR-063 / #2134), so a
+	// relative `.git/...` would land in the clone and the primary's reset
+	// would succeed.
 	lock := filepath.Join(repo, ".git", "refs", "heads", "main.lock")
 	t.Cleanup(func() { _ = os.Remove(lock) })
 	dc := &upload.DiffCoverageConfig{

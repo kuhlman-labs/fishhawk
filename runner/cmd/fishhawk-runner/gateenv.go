@@ -133,15 +133,17 @@ var gateEnvAllowPrefix = []string{"CGO_", "LC_"}
 
 // gateEnvDeny is the explicit known-secret denylist (belt-and-suspenders on top
 // of the default-deny allow-list). These keys are dropped unconditionally.
-// The last two entries are not secrets: they are the #3315 scoped-verify
-// control variables (verifyPackagesEnvVar / verifyLockOwnerEnvVar). The PRIMARY
-// protection for them is the default-deny allow-list — neither name is on
+// The last three entries are not secrets: they are the #3315 scoped-verify
+// control variables (verifyPackagesEnvVar / verifyLockOwnerEnvVar) and the
+// ADR-063 / #2134 lock-location override (verifyLockPathEnvVar). The PRIMARY
+// protection for them is the default-deny allow-list — none of the names is on
 // gateEnvAllowExact, gateEnvAllowGo, nor gateEnvAllowPrefix (which is CGO_/LC_
 // only), so an ambient value is ALREADY dropped and these entries are redundant
 // defence. They are listed anyway so a future allow-rule that re-widened (the
 // #2504 shape) could not silently let an agent's ambient value narrow the
-// runner's authoritative pre-push gate or claim runner-kind ownership of the
-// verify lock. Because BOTH layers hold independently, the attainable
+// runner's authoritative pre-push gate, claim runner-kind ownership of the
+// verify lock, or re-key the lock to a path nothing else contends on (which
+// would reopen #2645 while looking locked). Because BOTH layers hold independently, the attainable
 // counterfactual for this control mutates BOTH — widen the allow-list AND
 // delete these entries — which is what TestGateEnvBothLayersStripVerifyControls
 // documents and gateenv_test.go's counterfactual note records.
@@ -161,6 +163,7 @@ var gateEnvDeny = map[string]struct{}{
 	"FISHHAWK_API_TOKEN":    {},
 	verifyPackagesEnvVar:    {},
 	verifyLockOwnerEnvVar:   {},
+	verifyLockPathEnvVar:    {},
 }
 
 // gateEnvDenyPrefix lists key prefixes dropped unconditionally — the

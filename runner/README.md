@@ -190,6 +190,96 @@ Consequences, all deliberate:
 
 **The lock is a contention guard, not an adversarial control.** The agent's own shell environment is not the runner's, so an agent can set either variable in its own shell. What it cannot do is narrow the **authoritative** gate: the runner invokes that one itself with the packages variable unset. The shell half of the contract — the `--packages` flag, the lock's kind encoding, the wait budget and every degrade — is documented in `scripts/README.md`.
 
+## Gate isolation (ADR-063 / [E51.1 / #2134](https://github.com/kuhlman-labs/fishhawk/issues/2134))
+
+Every spec-supplied gate command — the committed-tree verify gates, the
+`diff_coverage` measurement and the auto-format absorb — reaches the runner's
+ONE gate-exec seam, `runBoundedGateArgv`, and since #2134 that seam is also
+where the execution PATH is chosen. The pure pieces live in
+[`runner/internal/gateiso`](internal/gateiso/README.md) (the long-form
+contract); `cmd/fishhawk-runner/gateisolation.go` is the runner-side glue.
+
+**Three startup variables.** `FISHHAWK_GATE_ISOLATION` (`auto` default |
+`container` | `clone-sandbox` | `clone`), `FISHHAWK_GATE_IMAGE` (empty default
+— the container path is unavailable without it, so a default runner's
+behaviour is unchanged except for the clone materialization below) and
+`FISHHAWK_DEPLOYMENT_PROFILE` (`local` default | `self-hosted` | `hosted`). A
+bad value, or `hosted` with an explicit fallback mode, fails the runner with
+`runner_failed reason=config` before it contacts the backend; a valid config
+logs `gate_isolation_configured`, and the first gate exec logs
+`gate_isolation_selected` with the whole selection (path, inputs, the classified
+runtime endpoint, the reason).
+
+**The four paths.** `container` (a safe LOCAL docker/podman daemon + an image:
+`--network=none --cap-drop=ALL --security-opt=no-new-privileges --entrypoint ''`,
+every invocation — run and `rm -f` — bound to the validated socket with
+`--host`/`--url unix://<socket>` so a later context switch cannot redirect it,
+four bind mounts only — the checkout and three EMPTY per-exec caches, the
+module cache seeded host-side under the sanitized env with `GOTOOLCHAIN=local`
+and refused when the checkout's module metadata reaches outside the checkout —
+the sanitized gate env via `-e`, `rm -f` after a timeout); `clone-sandbox` (Linux
+`unshare -rn`, probed not assumed); `clone` (host exec — the pre-#2134
+behaviour); `refused` (the gate never runs). `auto` prefers container, then
+sandbox, then clone; `hosted` refuses every non-container path. A refusal is
+**category C** — the `gate isolation refused:` signature is recognised by the
+verify gates, never absorbed as an infra flake, never handed to the fix agent
+(`verify_gate_refused`), and `runVerifyCommittedTree` reports `failed`, never
+the tolerant `skipped`.
+
+**What changed for EVERY runner, image or not.** Both gate sites'
+throwaway checkout is now an INDEPENDENT `--no-hardlinks` clone
+(`materializeGateCheckout`) instead of a `git worktree add --detach`: a linked
+worktree shares the primary's refs, objects and hooks, so a gate that ran
+`git update-ref` or wrote a hook planted it in the operator's repository. The
+clone has its own git common dir, so `scripts/test verify`'s per-repository
+lock (#3315) would key there and contend with nothing; the runner injects
+`FISHHAWK_VERIFY_LOCK_PATH` naming the PRIMARY's lock on every host path
+(`verifyLockPathEnv`, after sanitization like the owner marker) and leaves it
+out on the container path, where the primary is unreachable. The variable is
+on `gateEnvDeny` and the CLI's `verifyEnvDeny`, so an ambient value never
+reaches a gate. `acceptancetree.go` is NOT a gate site: the acceptance
+merge-candidate checkout stays a linked worktree by design (its posture is
+prompt-directed read-only + egress containment, ADR-050), and no spec-supplied
+command runs in it.
+
+**Safe runtime means the EFFECTIVE endpoint.** `gateiso.DetectRuntime`
+requires `DOCKER_HOST` (if set) AND the active docker context's
+`Endpoints.docker.Host` to BOTH be a local, dialable unix socket (podman:
+`RemoteSocket.Exists && Rootless` plus a local-unix connection); `tcp`/`ssh`/
+`npipe`, an unresolvable node, and a runner that is itself inside a container
+(docker-outside-of-docker) are UNSAFE with a named reason. The mount guard
+`EvalSymlinks` every bind-mount source and refuses `/run`, `/var/run`, a
+symlink outside the permitted roots, any socket within a depth-8 walk, and the
+detected daemon socket. The host `GOMODCACHE` is never mounted: each container
+exec seeds a fresh empty module cache host-side through a `file://` proxy and
+runs with a cold `GOCACHE` (the documented per-exec cost of the opt-in
+container path).
+
+**Two documented, test-pinned residuals (approval condition 6).** The profile
+is DECLARED, not detected — a hosted deployment that forgets
+`FISHHAWK_DEPLOYMENT_PROFILE=hosted` gets fallback, not refusal; and the
+socket walk is bounded to depth 8. Neither is to be widened silently.
+
+**Dogfood consequence.** macOS has no unprivileged no-network sandbox, so with
+no image configured `auto` selects `clone` — today's behaviour plus the clone
+materialization and the lock-path injection. This repo's own
+`scripts/test verify` needs the testcontainers Postgres, which neither the
+`--network=none` container nor the Linux sandbox's netns can reach; until
+[#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137) a Linux host
+that would otherwise select `clone-sandbox` sets `FISHHAWK_GATE_ISOLATION=clone`.
+
+**End-to-end fixtures.** `cmd/fishhawk-runner/gateisolation_e2e_test.go`
+drives the real wiring against a real runtime and the pinned
+`docker.io/alpine/git:v2.47.2` (`.git` unreachability, no network, host fs
+unreadable, no daemon socket + planted-socket refusal, env allow-list, timeout
+kill, ownership, the cache-symlink invariant; plus clone independence with its
+`git worktree add` discrimination sibling, the Linux sandbox, and hosted
+refusal end to end). Docker-gated fixtures skip with the detected reason where
+no runtime is safe, and the package `TestMain` sentinel — gated on an
+INDEPENDENT runtime probe, not `DetectRuntime` (approval condition 3) — fails
+the binary when a runtime is present but no docker-gated fixture ran. On a
+docker host, run them with `scripts/test single -run 'TestGate' ./cmd/fishhawk-runner/`.
+
 ## Self-hosting bootstrap deadlock ([E64.5 / #3086](https://github.com/kuhlman-labs/fishhawk/issues/3086))
 
 `fishhawk-runner` is a **separate binary**, built from `main`, respawned fresh from `bin/` on every host dispatch (the same design that lets the escape below work). So a run whose job is to **fix a defect in the runner itself** executes under the *unfixed* runner: the stage runs `bin/fishhawk-runner` built from `main`, hits the very defect the run is fixing, and cannot pass its own gates. This is a bootstrap deadlock.
