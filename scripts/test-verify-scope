@@ -22,7 +22,11 @@
 #      pruners cannot both proceed, and recovering a marker left by a dead pruner
 #      is itself exclusive (a victim-keyed claim plus a conditional re-read), so
 #      two recoverers cannot both proceed either; and three distinct conditions
-#      degrade to no locking at all.
+#      degrade to no locking at all. FISHHAWK_VERIFY_LOCK_PATH (ADR-063 /
+#      #2134) overrides the key: the runner's throwaway verify checkout is a
+#      CLONE with its own common dir, so the runner injects the primary's lock
+#      path — honoured first when set; a missing parent dir degrades to no
+#      locking naming the variable; unset keeps the common-dir derivation.
 #
 # Hermetic: temp-dir git fixtures with stubbed `go`, `golangci-lint`, `sleep` and
 # `docker` on PATH. No network, no real Docker, no real Go toolchain. Bash (no
@@ -228,6 +232,7 @@ run_verify() {
     env -u FISHHAWK_VERIFY_PACKAGES -u FISHHAWK_VERIFY_LOCK_OWNER \
         -u FISHHAWK_VERIFY_LOCK_SELF_PID -u FISHHAWK_SKIP_PATCH_COVERAGE \
         -u FISHHAWK_DIFF_BASE -u FISHHAWK_VERIFY_LOCK_WAIT_SECONDS \
+        -u FISHHAWK_VERIFY_LOCK_PATH \
         PATH="$fx/bin:$PATH" \
         FISHHAWK_TEST_P=4 \
         FISHHAWK_TEST_LEASE_DIR="$fx/leases" \
@@ -446,6 +451,7 @@ lock_reset() {
   VERIFY_LOCK_HELD=""; VERIFY_LOCK_TARGET=""; VERIFY_PRUNE_MARKER=""
   unset FISHHAWK_VERIFY_LOCK_OWNER FISHHAWK_VERIFY_LOCK_SELF_PID
   unset FISHHAWK_VERIFY_LOCK_WAIT_SECONDS FISHHAWK_VERIFY_LOCK_POLL_SECONDS
+  unset FISHHAWK_VERIFY_LOCK_PATH
   unset FIXTURE_SLEEP_RELEASE
   : > "$FX/logs/sleep.log"
 }
@@ -894,6 +900,100 @@ rm -f "$LOCK"; ln -s "not-a-pid:shell" "$LOCK";  assert_eq "b13 a non-numeric ta
 rm -f "$LOCK"; ln -s "$livepid:bogus" "$LOCK";   assert_eq "b13 an unknown kind is garbage" "garbage" "$(_verify_lock_classify "$LOCK")"
 rm -f "$LOCK"; mkdir -p "$LOCK";                 assert_eq "b13 a dir-form leftover is garbage" "garbage" "$(_verify_lock_classify "$LOCK")"
 rm -rf "$LOCK"
+lock_reset
+
+# b14 — FISHHAWK_VERIFY_LOCK_PATH is honoured FIRST: a set override whose parent
+# dir exists IS the lock path, regardless of $ROOT's own common dir. This is the
+# ADR-063 / #2134 hook: the runner's throwaway verify checkout is a clone with a
+# common dir of its own, so without the override its lock would be keyed to a
+# directory nothing else contends on. Driven END TO END through the real verify
+# from a CLONE of the fixture (a genuinely separate common dir) against a live
+# shell holder at the override path: the shell-kind refusal names the OVERRIDE
+# path, and the clone's own common dir gets no lock. Then, RUNNER-kind at a
+# zero budget, the displacement warning names the override path — which is
+# the observable the Go executable pin (verifyscope_test.go) also asserts.
+lock_reset
+git clone -q --no-hardlinks "$FX" "$tmproot/clone" >/dev/null 2>&1
+mkdir -p "$tmproot/clone/logs"; : > "$tmproot/clone/logs/go.log"
+ovdir="$tmproot/override-lock"; mkdir -p "$ovdir"
+OVLOCK="$ovdir/fishhawk-verify.lock"
+livepid="$(spawn_live)"
+ln -s "$livepid:shell" "$OVLOCK"
+RV_ENV=(FISHHAWK_VERIFY_LOCK_PATH="$OVLOCK")
+run_verify "$tmproot/clone" --packages backend/internal/alpha
+rc=$?
+assert_ne "b14 shell verify from a CLONE meeting a live holder at the OVERRIDE path refuses" "0" "$rc"
+assert_contains "b14 the refusal names the override path" "$tmproot/clone/logs/stderr.log" "holds the lock at $OVLOCK"
+assert_eq "b14 the override holder's lock is untouched" "$livepid:shell" "$(readlink "$OVLOCK")"
+if [ -L "$tmproot/clone/.git/fishhawk-verify.lock" ]; then
+  fail "b14 the clone's OWN common dir got no lock"
+else pass "b14 the clone's OWN common dir got no lock"; fi
+# RUNNER-kind at a zero budget: displaces the shell holder AT THE OVERRIDE PATH.
+RV_ENV=(FISHHAWK_VERIFY_LOCK_PATH="$OVLOCK" FISHHAWK_VERIFY_LOCK_OWNER=runner FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=0)
+run_verify "$tmproot/clone" --packages backend/internal/alpha
+rc=$?
+assert_eq "b14 runner-kind from the clone displaces the shell holder at the override path and proceeds" "0" "$rc"
+assert_contains "b14 the displacement warning names the override path" \
+  "$tmproot/clone/logs/stderr.log" "displacing a wedged shell verify holding $OVLOCK"
+if [ -L "$OVLOCK" ]; then fail "b14 the runner released the override lock on exit"; else pass "b14 the runner released the override lock on exit"; fi
+# WITHOUT the override, the same runner-kind verify from the clone keys its lock
+# to the clone's own common dir and never sees the holder: no warning, and the
+# override holder is left standing — the reopened-#2645 shape the override closes.
+ln -s "$livepid:shell" "$OVLOCK"
+RV_ENV=(FISHHAWK_VERIFY_LOCK_OWNER=runner FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=0)
+run_verify "$tmproot/clone" --packages backend/internal/alpha
+rc=$?
+assert_eq "b14 without the override the clone verify proceeds unaware of the holder" "0" "$rc"
+assert_not_contains "b14 without the override no displacement warning is printed" "$tmproot/clone/logs/stderr.log" "displacing"
+assert_eq "b14 without the override the holder at the override path is untouched" "$livepid:shell" "$(readlink "$OVLOCK")"
+rm -f "$OVLOCK"
+# Unit-level: the resolved path IS the override, byte-exact.
+ROOT_SAVED="$ROOT"; ROOT="$FX"
+export FISHHAWK_VERIFY_LOCK_PATH="$OVLOCK"
+got="$(_verify_lock_path 2>"$tmproot/b14.err")"; rc=$?
+unset FISHHAWK_VERIFY_LOCK_PATH
+ROOT="$ROOT_SAVED"
+assert_eq "b14 _verify_lock_path resolves the override byte-exact" "$OVLOCK" "$got"
+assert_eq "b14 _verify_lock_path exits 0 on a usable override" "0" "$rc"
+assert_eq "b14 a usable override prints no degrade reason" "0" "$(count_lines "$tmproot/b14.err")"
+lock_reset
+
+# b15 — an override whose PARENT directory does not exist DEGRADES to no locking
+# with a one-line reason naming the variable: never a lock silently keyed
+# elsewhere, never a failure.
+lock_reset
+ROOT_SAVED="$ROOT"; ROOT="$FX"
+export FISHHAWK_VERIFY_LOCK_PATH="$tmproot/no-such-dir/fishhawk-verify.lock"
+_verify_lock_path > "$tmproot/b15.out" 2>&1; rc=$?
+_acquire_verify_lock > "$tmproot/b15b.out" 2>&1; arc=$?
+unset FISHHAWK_VERIFY_LOCK_PATH
+ROOT="$ROOT_SAVED"
+assert_ne "b15 missing parent: no lock path" "0" "$rc"
+assert_contains "b15 missing parent names the variable" "$tmproot/b15.out" "FISHHAWK_VERIFY_LOCK_PATH="
+assert_contains "b15 missing parent prints the degrade reason" "$tmproot/b15.out" "parent directory does not exist — running verify without the concurrency lock"
+assert_eq "b15 missing parent DEGRADES (verify proceeds unlocked)" "0" "$arc"
+if [ -L "$LOCK" ]; then fail "b15 missing parent takes no lock in the common dir"; else pass "b15 missing parent takes no lock in the common dir"; fi
+if [ -e "$tmproot/no-such-dir" ]; then fail "b15 missing parent is never created"; else pass "b15 missing parent is never created"; fi
+lock_reset
+
+# b16 — UNSET keeps the common-dir derivation byte-identical (the b11 path).
+# An EMPTY value counts as unset — `${VAR:-}` — so an exported-but-empty
+# variable cannot resolve to a lock at "" either.
+lock_reset
+ROOT_SAVED="$ROOT"; ROOT="$FX"
+unset FISHHAWK_VERIFY_LOCK_PATH
+got_unset="$(_verify_lock_path 2>/dev/null)"; rc_unset=$?
+export FISHHAWK_VERIFY_LOCK_PATH=""
+got_empty="$(_verify_lock_path 2>/dev/null)"; rc_empty=$?
+unset FISHHAWK_VERIFY_LOCK_PATH
+ROOT="$ROOT_SAVED"
+# Compared against git's OWN absolute common dir (not $LOCK) so a symlinked
+# TMPDIR (macOS /var -> /private/var) does not fail the byte comparison.
+common_lock="$(git -C "$FX" rev-parse --path-format=absolute --git-common-dir)/fishhawk-verify.lock"
+assert_eq "b16 unset resolves the common-dir lock" "$common_lock" "$got_unset"
+assert_eq "b16 unset exits 0" "0" "$rc_unset"
+assert_eq "b16 an EMPTY override is treated as unset" "$common_lock" "$got_empty"
+assert_eq "b16 empty override exits 0" "0" "$rc_empty"
 lock_reset
 
 echo
