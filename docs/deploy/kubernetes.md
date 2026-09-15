@@ -22,11 +22,47 @@ it renders with both profiles unset.
 ## Prerequisites
 
 - **Docker Desktop with Kubernetes enabled** (Settings → Kubernetes → Enable
-  Kubernetes). Docker Desktop's Kubernetes shares the host Docker daemon's image
-  store, so an image built locally with `docker build` is directly resolvable
-  in-cluster — no registry push or `kind load` is required.
-- **`helm`** (v3) and **`kubectl`** on `PATH`, with the current context pointed
-  at the Docker-Desktop cluster (`kubectl config use-context docker-desktop`).
+  Kubernetes). Whether the cluster can see a locally built image depends on
+  WHICH provisioner Docker Desktop installed — see the next section; the
+  bring-up detects it and never needs a registry push.
+- **`helm`** (v3) and **`kubectl`** (≥ 1.27 — `kubectl debug --profile` is
+  required on the kind-based provisioner) on `PATH`, with the current context
+  pointed at the Docker-Desktop cluster (`kubectl config use-context
+  docker-desktop`).
+
+### Image store: two provisioners
+
+Docker Desktop has shipped two Kubernetes provisioners, and they differ in the
+one property this bring-up depends on
+([#3344](https://github.com/kuhlman-labs/fishhawk/issues/3344)):
+
+| Provisioner | `kubectl get nodes -o name` | Image store |
+|---|---|---|
+| classic (cri-dockerd on the host daemon) | `node/docker-desktop` | **shared** with the host daemon — a `docker build` is directly visible to the kubelet |
+| kind-based (what current Docker Desktop installs) | `node/desktop-control-plane` | **isolated** — the node runs its own containerd that the host daemon cannot see (`docker ps -a` shows no node container) |
+
+On the kind-based provisioner a `docker build` never reaches the kubelet, and
+`pullPolicy: IfNotPresent` turns "the image never arrived" into "reuse whatever
+`dev-local` the node already holds": the bring-up used to go green while the
+cluster served a STALE fishhawkd. `scripts/dev k8s` now:
+
+- detects the provisioner **before** building (`kubectl get nodes -o name`),
+  and **refuses** an unrecognised node list — it cannot tell whether the image
+  it is about to build will ever reach the node, and proceeding is exactly the
+  silent-stale outcome above;
+- on the isolated provisioner, loads the built image into every node with ONE
+  `docker save` + a privileged node-debug pod (`kubectl debug node/<n>
+  --profile=sysadmin --image=debian:12-slim`, glibc so it can exec the node's
+  own `ctr`) + `kubectl cp` + `ctr -n k8s.io images import`. Never a registry
+  push (the [#2918](https://github.com/kuhlman-labs/fishhawk/issues/2918)
+  egress discipline);
+- **verifies image identity** after the readiness gate, fail-closed — see
+  [Image identity](#image-identity-what-a-green-bring-up-now-proves).
+
+Manual cross-check of the provisioner: `kubectl get nodes -o
+jsonpath='{.items[*].status.nodeInfo.containerRuntimeVersion}'` prints
+`docker://…` on the classic provisioner and `containerd://…` on the kind-based
+one.
 
 ## Bring up
 
@@ -36,22 +72,39 @@ scripts/dev k8s        # or: make k8s-up
 
 This:
 
-1. Builds the fishhawkd image into the host Docker daemon as
+1. Detects the image-store provisioner from `kubectl get nodes -o name`
+   (`shared` / `isolated` / `unknown`, see above) and **fails closed** on
+   `unknown` before building anything. `FISHHAWK_K8S_SKIP_IDENTITY=1` downgrades
+   that refusal to a warning (and skips step 8).
+2. Builds the fishhawkd image into the host Docker daemon as
    `ghcr.io/kuhlman-labs/fishhawkd:dev-local`, for the host architecture —
    BuildKit's `TARGETARCH` automatic platform ARG defaults to the host
    platform, so on an Apple Silicon host the image is arm64 and runs
-   natively on the Docker-Desktop node rather than under emulation.
-2. Runs `helm upgrade --install fishhawk deploy/helm/fishhawk -f
+   natively on the Docker-Desktop node rather than under emulation. The
+   stamped `GIT_SHA` build arg is computed ONCE and reused by step 8.
+3. On the isolated provisioner only: `docker save`s the image once and imports
+   it into each node through a node-debug pod (kept alive for step 8, deleted
+   on every exit path). On the shared provisioner this step prints `no load
+   needed`.
+4. Runs `helm upgrade --install fishhawk deploy/helm/fishhawk -f
    deploy/helm/fishhawk/values-local.yaml --set image.tag=dev-local --set
    image.pullPolicy=IfNotPresent`. The `--set` overrides point the chart at the
    local build instead of the `main` ghcr tag `values-local.yaml` declares.
    `helm upgrade --install` is idempotent, so re-running the command is safe.
-3. Waits for the Deployment rollout (`kubectl rollout status`, 120s timeout).
-4. Opens `kubectl port-forward svc/fishhawk <pf-port>:8080` in the background and
+5. Runs `kubectl rollout restart deployment/fishhawk` unconditionally: an
+   unchanged rendered manifest (same tag, same values) triggers no rollout, so
+   without this a rebuilt image would never be scheduled and the old pod would
+   keep serving. On a fresh install it costs one extra rollout.
+6. Waits for the Deployment rollout (`kubectl rollout status`, 120s timeout).
+7. Opens `kubectl port-forward svc/fishhawk <pf-port>:8080` in the background and
    polls `http://localhost:<pf-port>/healthz` until fishhawkd answers healthy.
    `<pf-port>` defaults to `8080`; see [Overriding the forwarded host
    ports](#overriding-the-forwarded-host-ports).
-5. If the dev-only in-cluster Jaeger is present (`values-local.yaml` enables it),
+8. Verifies **image identity** — the pod's running image ID equals the image
+   step 2 built AND `/healthz` `git_sha` equals the stamped build SHA — and
+   exits non-zero on any mismatch or unresolvable identity. See the next
+   section.
+9. If the dev-only in-cluster Jaeger is present (`values-local.yaml` enables it),
    opens a second forward for its UI (`16686`) and OTLP HTTP receiver (`4318`).
    See [Tracing (Jaeger)](#tracing-jaeger) below.
 
@@ -62,7 +115,53 @@ multi-minute build followed by a misleading 60s `/healthz` timeout
 ([#2917](https://github.com/kuhlman-labs/fishhawk/issues/2917)). After the
 readiness gate passes it also verifies the listener on that port really is the
 forward it spawned (the #965 identity check), so a squatter that raced in after
-the preflight cannot answer the gate on the forward's behalf.
+the preflight cannot answer the gate on the forward's behalf — and only THEN
+runs the image-identity gate of step 8, so a wrong listener is never mistaken
+for a wrong image.
+
+### Image identity: what a green bring-up now proves
+
+A healthy `/healthz` through the right forward proves a fishhawkd is serving; it
+does not prove it is the one you just built. `scripts/dev k8s` therefore ends
+with `_verify_k8s_image_identity`, which returns 0 ONLY when BOTH checks match
+and exits the bring-up non-zero otherwise — there is no warn-and-continue code:
+
+- **Primary — image ID.** `docker image inspect
+  ghcr.io/kuhlman-labs/fishhawkd:dev-local --format '{{.Id}}'` (the image
+  CONFIG digest, which survives `docker save` → `ctr images import` unchanged)
+  must equal the newest fishhawkd pod's `status.containerStatuses[0].imageID`.
+  The kubelet reports that value as `docker://sha256:…` /
+  `containerd://sha256:…` (compared directly) or as `<repo>@sha256:<manifest
+  digest>`, which is resolved to its config digest via `ctr -n k8s.io content
+  get` in the retained node-debug pod (isolated provisioner) or `docker image
+  inspect <repo>@<digest>` against the shared host daemon. An OCI index costs
+  exactly one extra hop.
+- **Secondary — `git_sha`.** `/healthz` must report the SHA stamped into the
+  build. Two dirty builds at the same commit carry the SAME `-dirty` SHA, so
+  this check alone cannot tell a fresh build from the previous one — which is
+  exactly why the image ID is the primary check, not a nicety.
+
+Every fail-closed branch names what was missing (`identity: image id
+mismatch`, `identity: /healthz carries no git_sha`, `identity: build sha
+unknown`, `identity: pod reports no imageID`, …) and the single escape hatch:
+`FISHHAWK_K8S_SKIP_IDENTITY=1` skips the gate (and downgrades the
+unknown-provisioner refusal) with a loud stderr warning that the deployed image
+was NOT verified. Only the exact value `1` disables it; a blank
+`FISHHAWK_K8S_SKIP_IDENTITY=` in `.env` does not.
+
+By hand, the same three reads:
+
+```sh
+curl -fsS http://localhost:8080/healthz | jq -r .git_sha
+docker image inspect ghcr.io/kuhlman-labs/fishhawkd:dev-local --format '{{.Id}}'
+kubectl get pod -l app.kubernetes.io/component=server \
+  --sort-by=.metadata.creationTimestamp \
+  -o jsonpath='{.items[-1:].status.containerStatuses[0].imageID}'
+```
+
+The first must equal `git rev-parse --short HEAD` (with `-dirty` on a dirty
+tree); the second must equal the third once any `<repo>@sha256:` repo digest is
+resolved to its config digest.
 
 ### Overriding the forwarded host ports
 
@@ -370,7 +469,7 @@ against an unmigrated database, so its FAILURE path is the one worth knowing.
 ## When the build fails with `x509: certificate signed by unknown authority`
 
 This covers a host behind a TLS-inspecting corporate egress proxy, where
-`docker build -f backend/Dockerfile` (step 1 of `## Bring up`, above) fails
+`docker build -f backend/Dockerfile` (step 2 of `## Bring up`, above) fails
 before the image is even built. The certificate that fixes it is
 site-specific and is deliberately NOT vendored into this repo or into
 `backend/Dockerfile`.
@@ -497,12 +596,12 @@ half leaves half the problem live.
 
 ### Residual: `scripts/dev k8s` cannot carry the certificate
 
-`scripts/dev k8s` builds the image with exactly (`scripts/dev:2263`; `_k8s_image_ref`
-resolves to `ghcr.io/kuhlman-labs/fishhawkd:dev-local`, per `## Bring up`
-step 1 above):
+`scripts/dev k8s` builds the image with exactly (`cmd_k8s_up` in `scripts/dev`;
+`_k8s_image_ref` resolves to `ghcr.io/kuhlman-labs/fishhawkd:dev-local`, per
+`## Bring up` step 2 above):
 
 ```sh
-docker build --build-arg GIT_SHA="$(_dev_git_sha)" -t "$(_k8s_image_ref)" -f backend/Dockerfile .
+docker build --build-arg GIT_SHA="$build_sha" -t "$(_k8s_image_ref)" -f backend/Dockerfile .
 ```
 
 It passes no `--build-context` and exposes no hook for extra build
@@ -512,13 +611,76 @@ certificate through on a host behind a TLS-inspecting proxy. On such a host:
 1. Run the `docker build --build-context cacontext=...` command above by
    hand (with the local, uncommitted Dockerfile edit from the build-side fix
    section), or make the equivalent local, uncommitted edit to `scripts/dev`.
-2. Then run the `helm upgrade --install` command from `## Bring up` step 2
-   directly.
+2. On the kind-based provisioner (`node/desktop-control-plane`), load the
+   image into the node by hand — the same sequence step 3 runs:
+
+   ```sh
+   docker save ghcr.io/kuhlman-labs/fishhawkd:dev-local -o /tmp/fishhawk-image.tar
+   kubectl debug node/desktop-control-plane --profile=sysadmin --image=debian:12-slim -- sleep 3600
+   # note the printed node-debugger-<node>-<id> pod name, then:
+   kubectl wait --for=condition=Ready pod/<pod> --timeout=120s
+   kubectl cp /tmp/fishhawk-image.tar <pod>:/tmp/fishhawk-image.tar
+   kubectl exec <pod> -- /host/usr/local/bin/ctr --address /host/run/containerd/containerd.sock -n k8s.io images import /tmp/fishhawk-image.tar
+   kubectl delete pod <pod> --wait=false
+   ```
+
+3. Then run the `helm upgrade --install` command from `## Bring up` step 4
+   directly, followed by `kubectl rollout restart deployment/fishhawk` and
+   `kubectl rollout status deployment/fishhawk --timeout=120s`.
+4. Run the by-hand identity check from [Image
+   identity](#image-identity-what-a-green-bring-up-now-proves) — the script's
+   gate did not run, so nothing else has proven the pod runs your build.
 
 Both the Dockerfile CA-injection lines and the certificate file are a LOCAL,
 UNCOMMITTED edit — the certificate is site-specific and must not be vendored.
 An optional empty-by-default named context wired into the committed
 Dockerfile is a possible follow-up if this recurs, not part of this change.
+
+## When the bring-up fails with `identity: image id mismatch` / `stale fishhawkd image`
+
+The pod is running an image whose config digest differs from the one this run
+built. On the kind-based provisioner that means the load in step 3 did not
+re-point the `dev-local` tag on the node, or the pod sampled was not the
+restarted one. Remedy: `kubectl get pods -l app.kubernetes.io/component=server`
+— if an old pod is still `Terminating`, wait and re-run `scripts/dev k8s`;
+otherwise `kubectl delete deployment fishhawk` and re-run so the kubelet has no
+prior `dev-local` to reuse. Do NOT reach for `FISHHAWK_K8S_SKIP_IDENTITY=1` as
+a fix — it only silences the gate.
+
+## When the bring-up fails with `identity: /healthz carries no git_sha`
+
+The serving fishhawkd predates GitSHA stamping
+([#1007](https://github.com/kuhlman-labs/fishhawk/issues/1007)) or was built
+outside `scripts/dev` without `--build-arg GIT_SHA`. Rebuild through
+`scripts/dev k8s`; if you built by hand, pass `--build-arg
+GIT_SHA="$(git rev-parse --short HEAD)"`.
+
+## When the bring-up fails with `identity: build sha unknown`
+
+`git rev-parse HEAD` failed in the checkout `scripts/dev` runs from (not a git
+work tree?), so the build was stamped `unknown` and cannot be corroborated. Run
+from a git checkout; `FISHHAWK_K8S_SKIP_IDENTITY=1` brings up the unverified
+image deliberately.
+
+## When the bring-up fails with `cannot tell whether this cluster shares the host image store`
+
+`kubectl get nodes -o name` printed neither `node/docker-desktop` nor a
+kind-style `*-control-plane` / `*-worker` node (or nothing at all — is
+`kubectl` pointed at the Docker Desktop context?). Fix the context (`kubectl
+config use-context docker-desktop`), or set `FISHHAWK_K8S_SKIP_IDENTITY=1` to
+proceed with no image load and no identity check.
+
+## Leftover `node-debugger-*` pods
+
+The loader keeps its node-debug pod alive until the bring-up exits (the
+identity resolver reads the node's content store through it) and deletes it
+from an EXIT trap on every path, including failures. A bring-up killed by a
+signal (Ctrl-C mid-`kubectl cp`) can leave one behind:
+
+```sh
+kubectl get pods | grep node-debugger-
+kubectl delete pod node-debugger-<node>-<id> --wait=false
+```
 
 ## Chart render gate
 

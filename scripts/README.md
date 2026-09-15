@@ -746,13 +746,38 @@ Helm chart on Docker Desktop's Kubernetes.
 
 `cmd_k8s_up`:
 
+- Installs a function-scoped `trap '_k8s_up_cleanup' EXIT` first thing
+  (fires on normal return AND on every `exit 1` leg — verified on zsh
+  5.9, pinned behaviourally by `scripts/test-dev` D1), which deletes the
+  retained node-debug pods and any leftover image tarball.
+- Detects the image-store provisioner BEFORE the docker build
+  (`_k8s_image_store_shared` over `kubectl get nodes -o name`: `shared`
+  for `node/docker-desktop`, `isolated` for a kind-style
+  `*-control-plane`/`*-worker` list, `unknown` otherwise) and FAILS
+  CLOSED on `unknown` — it cannot tell whether the image it is about to
+  build will ever reach the kubelet (#3344, the #2917 fail-fast
+  discipline). `FISHHAWK_K8S_SKIP_IDENTITY=1` downgrades that to a
+  warning.
 - Builds the fishhawkd image into the host Docker daemon as
-  `ghcr.io/kuhlman-labs/fishhawkd:dev-local` (Docker-Desktop k8s shares
-  that image store — no registry push / kind load).
+  `ghcr.io/kuhlman-labs/fishhawkd:dev-local`. ONE `build_sha`
+  (`_dev_git_sha`) feeds both `--build-arg GIT_SHA=` and the identity
+  gate below.
+- On the `isolated` provisioner, loads the image into every node via
+  `_k8s_load_image`: ONE hoisted `docker save`, then per node a
+  privileged node-debug pod (`kubectl debug node/<n> --profile=sysadmin
+  --image=debian:12-slim`, glibc so it can exec the node's own `ctr`),
+  `kubectl wait`, `kubectl cp`, `ctr -n k8s.io images import`. The pod
+  is RETAINED on success (the identity resolver reads the node's content
+  store through it; the EXIT trap deletes it) and deleted on every
+  failure after it exists; the tarball is removed on every path by the
+  loader's `always` block. Never a registry push (#2918). `shared`
+  prints `no load needed`.
 - `helm upgrade --install`s the chart with `values-local.yaml` plus
   `--set image.tag=dev-local --set image.pullPolicy=IfNotPresent`
   (overriding values-local's `main`/`Always` so the local build is
-  used).
+  used), then `kubectl rollout restart deployment/fishhawk`
+  unconditionally — an unchanged rendered manifest triggers no rollout,
+  so a rebuilt image would otherwise never be scheduled.
 - Waits for the rollout, then opens a
   `kubectl port-forward svc/fishhawk <host>:8080` and gates on `/healthz`
   via the same `_await_healthz` poll `cmd_up` uses — the authoritative
@@ -770,6 +795,81 @@ Helm chart on Docker Desktop's Kubernetes.
   path — a healthy `/healthz` through a DEAD forward is proof of
   nothing, since a squatter that raced in after the preflight answers
   the same gate).
+- After the listener identity check, runs the fail-closed IMAGE
+  identity gate `_verify_k8s_image_identity <url> <build_sha> <ref>
+  <provisioner>` — see the next section — and tears the forward down +
+  exits 1 on any refusal. `FISHHAWK_K8S_SKIP_IDENTITY=1` (the ONLY
+  hatch; exactly the value `1`) skips it with a loud stderr warning.
+
+### Image identity + provisioner detection (E69.8 / [#3344](https://github.com/kuhlman-labs/fishhawk/issues/3344))
+
+Docker Desktop's kind-based provisioner (node `desktop-control-plane`)
+runs its own containerd that the host daemon cannot see, so a `docker
+build` never reaches the kubelet and `IfNotPresent` reuses whatever
+`dev-local` the node already holds — a green bring-up serving a STALE
+image. `_verify_k8s_image_identity` returns 0 ONLY when BOTH checks
+match, 1 otherwise; there is no rc=2 warn-and-continue code (pinned
+by a body-grep):
+
+- PRIMARY — image ID: `docker image inspect <ref> --format '{{.Id}}'`
+  (the config digest, which survives `docker save` → `ctr images
+  import` unchanged) equals the NEWEST fishhawkd pod's
+  `containerStatuses[0].imageID` (`--sort-by=.metadata.creationTimestamp`,
+  `{.items[-1:]}`, so a still-Terminating pre-restart pod is never
+  sampled), resolved by `_k8s_resolve_running_image_id`: an `id:` form
+  compares directly; a `repo-digest:` form resolves via `docker image
+  inspect <repo>@<digest>` on `shared` or `ctr -n k8s.io content get`
+  through the retained debug pod on `isolated` (an OCI index costs
+  exactly one extra hop; no retained pod is a refusal, never a pass).
+- SECONDARY — `/healthz` `git_sha` equals `build_sha`. Two dirty builds
+  at one commit share the same `-dirty` SHA and only the image ID tells
+  them apart — why the image ID is primary.
+- Each fail-closed branch carries a DISTINCT reason literal (`identity:
+  local image id unresolved` / `pod reports no imageID` / `running
+  image id unresolved` / `image id mismatch` / `build sha unknown` /
+  `/healthz unreachable` / `/healthz carries no git_sha` / `git_sha
+  mismatch`) plus the skip-knob pointer, so a test pins WHICH branch
+  fired and a deleted early return that falls through to a later
+  mismatch still reddens.
+
+Helper inventory (all pure helpers always exit 0 and are
+command-substitution safe, the `_k8s_pf_port` rule):
+
+| Helper | Role |
+|---|---|
+| `_k8s_image_store_shared <nodes>` | `shared` / `isolated` / `unknown` from `kubectl get nodes -o name` output |
+| `_k8s_node_names <nodes>` | strips `node/`, one name per line |
+| `_k8s_identity_skipped` | `FISHHAWK_K8S_SKIP_IDENTITY == 1` (the single hatch) |
+| `_k8s_normalise_image_id <raw>` | `id:sha256:…` / `repo-digest:sha256:…` / `unrecognised:<raw>` after stripping `docker://`, `docker-pullable://`, `containerd://` |
+| `_k8s_config_digest_from_manifest <json>` | config digest from a manifest, `index:<first digest>` from an OCI index, nothing otherwise — grep/sed only; its comment names the compact-single-object assumption |
+| `_k8s_node_ctr <pod> <args…>` | the node's `ctr` through a debug pod (`/host/usr/local/bin/ctr --address /host/run/containerd/containerd.sock -n k8s.io`) |
+| `_k8s_debug_pod_start <node>` | creates + waits for the debug pod; STDOUT IS THE POD NAME ONLY (every inner kubectl's stdout is captured or sent to stderr — `kubectl wait` prints `condition met` on stdout) |
+| `_k8s_debug_pod_delete <pod>` | `kubectl delete pod --wait=false`, always 0 |
+| `_k8s_load_image_into_node <tar> <node> [ref]` | debug → wait → cp → import; retains the pod on success |
+| `_k8s_load_image <ref> <node…>` | one `docker save`, per-node import, tarball removed by `always` |
+| `_k8s_up_cleanup` | EXIT-trap sweep of `K8S_DEBUG_PODS` + `K8S_IMAGE_TAR` |
+| `_k8s_resolve_running_image_id <raw> <prov>` | kubelet imageID → config digest, or 1 naming why |
+| `_k8s_identity_fail <reason> <detail>` | the one-line refusal format |
+| `_verify_k8s_image_identity <url> <sha> <ref> <prov>` | the gate |
+
+`scripts/test-dev` section 9b-quinquies covers it without a cluster
+(PATH stubs for `docker`/`kubectl`/`helm` recording `<tool> $*`, plus
+the one-shot `/healthz` responder): A1–A4 pure tables (provisioner,
+node names, normaliser, manifest parser including the not-a-layer-digest
+and index cases, skip predicate exactness); B1–B13 the gate, one named
+case per fail-closed branch with the branch literal AND the absence of
+the later mismatch literals asserted; C1–C6 the loader (`docker save`
+recorded EXACTLY once across two nodes, debug→wait→cp→import order, pods
+retained with clean names — the stub's `wait` prints a realistic
+`pod/<name> condition met` on stdout so a dropped redirect reddens —
+tarball removed, and each of import/debug-parse/save/wait/cp failures
+with its delete-or-no-delete expectation); D1–D4 `cmd_k8s_up` end to
+end (load before helm + EXIT-trap pod delete after the stubbed helm
+failure; no save on `docker-desktop`; unknown refuses BEFORE `docker
+build`; the skip knob continues with a warning); E body-grep ordering
+pins including NO `return 2`. Residual, stated honestly: the load and
+resolve paths are stub-tested in-loop and cluster-verified only by the
+operator walk on a real kind-provisioner host.
 
 ### Overridable host ports (E69.6 / [#2917](https://github.com/kuhlman-labs/fishhawk/issues/2917))
 
@@ -895,7 +995,7 @@ mirroring `PID_FILE`) and `helm uninstall`s (idempotent).
 
 The pure helpers `_k8s_image_ref` / `_k8s_healthz_url` / `_k8s_pf_port`
 / `_k8s_jaeger_ui_port` / `_k8s_jaeger_otlp_port` / `_k8s_forward_arg`
-/ `_k8s_validate_port` are unit-tested by `scripts/test-dev`, which
+/ `_k8s_validate_port` (and the #3344 set above) are unit-tested by `scripts/test-dev`, which
 also drives `_preflight_port_free` behaviorally against a real `nc -l`
 squatter (free / squatted / silent-detection / lsof-absent), asserts
 that an override reaches BOTH the printed `/healthz` URL and the
@@ -911,8 +1011,9 @@ lines), and a distinct-but-`nc`-squatted port (warn-and-skip). Section
 19h records the observed counterfactual RED for every control in this
 area. Operator quickstart + the values-local-vs-prod
 split: `docs/deploy/kubernetes.md`. The true end-to-end path (image
-build → chart install → `/healthz` green) is an operator smoke test
-against a Docker-Desktop cluster, not run in CI.
+build → node load → chart install → `/healthz` green → image identity
+verified) is an operator smoke test against a Docker-Desktop cluster,
+not run in CI.
 
 `scripts/test-dev` also asserts that the SHIPPED `backend/Dockerfile`
 derives its `go build` `GOARCH` from BuildKit's `TARGETARCH` automatic
