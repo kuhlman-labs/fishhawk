@@ -261,6 +261,7 @@ var KnownCategories = map[string]struct{}{
 	"integration_commit_recorded":             {},
 	"invariant_violation":                     {},
 	"issue_commented":                         {},
+	"issue_context_unresolved":                {},
 	"lineage_violation":                       {},
 	"mcp_token_issued":                        {},
 	"merge_observation_recorded":              {},

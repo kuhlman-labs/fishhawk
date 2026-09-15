@@ -79,7 +79,7 @@ import (
 // FORGE-NEUTRAL SINCE E50.17 / #2900. Every forge call goes through the
 // standalone forge.IssueOperations capability (FetchIssue / FetchIssueComments
 // / PostIssueComment / SetIssueState), resolved per forge FAMILY by
-// splitParentIssueOpsFor: a github-family delivery resolves ONLY through
+// issueOpsFor: a github-family delivery resolves ONLY through
 // s.cfg.GitHub, any other family ONLY through s.cfg.ForgeResolver (defaulting
 // to forge.Get) plus a type assertion to the capability — so registry
 // availability can never change a GitHub outcome. A GitLab issue close arrives
@@ -241,9 +241,12 @@ func splitParentRepoRef(full string) (forge.RepoRef, bool) {
 	return forge.RepoRef{Owner: full[:i], Name: full[i+1:]}, true
 }
 
-// splitParentIssueOpsFor resolves the forge.IssueOperations for a forge FAMILY,
+// issueOpsFor resolves the forge.IssueOperations for a forge FAMILY,
 // mirroring the UNAMBIGUOUS per-family ladder prStateReaderFor codifies for the
-// merge-observation verb (E64.40 / #3151):
+// merge-observation verb (E64.40 / #3151). Two consumers share it: this
+// file's split-parent auto-close watcher (E50.17 / #2900) and the prompt
+// handler's forge-neutral issue fetch (prompt.go::fillIssueContext, E45.42 /
+// #3347). The ladder:
 //
 //   - a github-family delivery resolves ONLY through s.cfg.GitHub, wrapped by
 //     forgegithub.New. It NEVER falls through to ForgeResolver or the process
@@ -255,10 +258,12 @@ func splitParentRepoRef(full string) (forge.RepoRef, bool) {
 //     a forge that does not implement the capability is a nil result, never a
 //     fabricated no-op.
 //
-// A nil result keeps the pre-#2900 posture for the nil-GitHub case: the caller
-// logs at INFO and returns WITHOUT an audit observation, because an
-// unconfigured forge is a server misconfiguration, not a fact about the split.
-func (s *Server) splitParentIssueOpsFor(forgeID string) forge.IssueOperations {
+// A nil result keeps the pre-#2900 posture for the nil-GitHub case: the
+// split-parent caller logs at INFO and returns WITHOUT an audit observation,
+// because an unconfigured forge is a server misconfiguration, not a fact
+// about the split; the prompt caller reports it as the forge_unresolved
+// reason on its issue_context_unresolved audit row.
+func (s *Server) issueOpsFor(forgeID string) forge.IssueOperations {
 	if forgeID == forgeNameGitHub {
 		if s.cfg.GitHub == nil {
 			return nil
@@ -352,7 +357,7 @@ func (s *Server) handleContractChildClosed(ctx context.Context, ev webhook.Event
 			splitParentOutcomeNoInstallation, false, nil)
 		return
 	}
-	ops := s.splitParentIssueOpsFor(forgeID)
+	ops := s.issueOpsFor(forgeID)
 	if ops == nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "split parent close: no issue-operations forge configured for family; skipping",
 			slog.String("forge", forgeID),

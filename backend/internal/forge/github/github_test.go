@@ -276,7 +276,7 @@ var (
 func TestFetchIssueMapsFields(t *testing.T) {
 	a := newIssuesAdapter(t)
 	a.mux.HandleFunc("GET /repos/o/n/issues/7", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, `{"number":7,"title":"Parent","body":"text","state":"closed","state_reason":"completed","labels":[{"name":"type:epic"},"area:server"]}`)
+		writeJSON(w, http.StatusOK, `{"number":7,"title":"Parent","body":"text","state":"closed","state_reason":"completed","labels":[{"name":"type:epic"},"area:server"],"html_url":"https://github.com/o/n/issues/7"}`)
 	})
 
 	var ops forge.IssueOperations = a.f
@@ -284,8 +284,8 @@ func TestFetchIssueMapsFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchIssue: %v", err)
 	}
-	want := forge.Issue{Number: 7, Title: "Parent", Body: "text", State: "closed", StateReason: "completed", Labels: []string{"type:epic", "area:server"}}
-	if is.Number != want.Number || is.Title != want.Title || is.Body != want.Body || is.State != want.State || is.StateReason != want.StateReason {
+	want := forge.Issue{Number: 7, Title: "Parent", Body: "text", State: "closed", StateReason: "completed", Labels: []string{"type:epic", "area:server"}, HTMLURL: "https://github.com/o/n/issues/7"}
+	if is.Number != want.Number || is.Title != want.Title || is.Body != want.Body || is.State != want.State || is.StateReason != want.StateReason || is.HTMLURL != want.HTMLURL {
 		t.Errorf("Issue = %+v, want %+v", *is, want)
 	}
 	if len(is.Labels) != 2 || is.Labels[0] != "type:epic" || is.Labels[1] != "area:server" {

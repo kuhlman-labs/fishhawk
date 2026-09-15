@@ -1123,7 +1123,7 @@ func TestGitLabForge_FetchIssue_NormalizesState(t *testing.T) {
 		t.Run(tc.native, func(t *testing.T) {
 			a := newIssueForge(t)
 			a.mux.HandleFunc("GET /api/v4/projects/5/issues/7", func(w http.ResponseWriter, r *http.Request) {
-				writeJSON(w, http.StatusOK, `{"iid":7,"title":"Parent","description":"text","state":"`+tc.native+`","labels":["type:epic"]}`)
+				writeJSON(w, http.StatusOK, `{"iid":7,"title":"Parent","description":"text","state":"`+tc.native+`","labels":["type:epic"],"web_url":"https://gitlab.example/g/sub/p/-/issues/7"}`)
 			})
 			var ops forge.IssueOperations = a.f
 			is, err := ops.FetchIssue(context.Background(), gitlabScope("5"), forge.RepoRef{Owner: "g/sub", Name: "p"}, 7)
@@ -1138,6 +1138,12 @@ func TestGitLabForge_FetchIssue_NormalizesState(t *testing.T) {
 			}
 			if is.Number != 7 || is.Title != "Parent" || is.Body != "text" || len(is.Labels) != 1 || is.Labels[0] != "type:epic" {
 				t.Errorf("Issue = %+v, want iid 7 / Parent / text / [type:epic]", *is)
+			}
+			// web_url is carried as the forge-neutral browse URL (E45.42 /
+			// #3347) so the prompt handler never fabricates a github.com
+			// link for a GitLab issue.
+			if is.HTMLURL != "https://gitlab.example/g/sub/p/-/issues/7" {
+				t.Errorf("HTMLURL = %q, want the payload's web_url", is.HTMLURL)
 			}
 			calls := a.calls()
 			if len(calls) != 1 || calls[0].Method != http.MethodGet || calls[0].Path != "/api/v4/projects/5/issues/7" {

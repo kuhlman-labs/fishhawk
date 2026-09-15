@@ -1522,7 +1522,7 @@ func TestSplitFiling_ProducerToConsumer_ParentCloseEndToEnd(t *testing.T) {
 //
 // Every test below drives the REAL tokened GitLab receiver — postGitLab ->
 // s.Handler() -> handleWebhookGitLab -> isIssueClosedDelivery ->
-// handleContractChildClosed -> splitParentIssueOpsFor -> a real
+// handleContractChildClosed -> issueOpsFor -> a real
 // *forgegitlab.Forge -> the stateful GitLab fake — and asserts COMMITTED STATE
 // on the fake (native issue state, note count and BODIES, call ORDER), never an
 // error value. The GitLab issue object has no state_reason, so every payload
@@ -2207,7 +2207,7 @@ func TestSplitParentClose_ForgeFamilyBinding(t *testing.T) {
 type splitParentNoIssueOpsForge struct{ forge.Forge }
 
 // TestSplitParentClose_GitLab_ResolverNilRungs pins each fail-closed nil rung
-// of splitParentIssueOpsFor for a non-github family: a resolver error, a nil
+// of issueOpsFor for a non-github family: a resolver error, a nil
 // forge, a TYPED-nil forge wrapped in a non-nil interface, and a forge lacking
 // the capability. Each is the pre-#2900 nil-GitHub posture — INFO log, ZERO
 // forge calls, NO observation (a server misconfiguration is not a fact about the

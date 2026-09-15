@@ -24,7 +24,7 @@ The implement-stage prompt renders the issue as `Triggering issue: #N · <title>
 
 The plan-stage prompt still renders the body verbatim via `writeIssueContext`.
 
-`Trigger.IssueURL` is populated from `repo + IssueNumber` in `fillIssueContext` before the GetIssue call, so the link block is intact even when the API fetch is partial.
+`Trigger.IssueURL` is populated by `fillIssueContext` (`internal/server/prompt.go`) through a forge-neutral ladder since E45.42 / #3347: the run row's cached `IssueContext.URL` → the browse URL the forge fetch returned (`forge.Issue.HTMLURL`: GitHub `html_url` / GitLab `web_url`) → for a github-family run ONLY, the `https://github.com/<owner>/<name>/issues/<n>` format string → empty. The ladder runs on every exit, so a partial GitHub fetch still leaves the link block intact; a non-GitHub run with neither a cached nor a fetched URL renders NO `URL:` line rather than a fabricated github.com one. A prompt built with neither an issue title nor a body draws one `issue_context_unresolved` audit row + one WARN (see the server README's "Local-runner issue context" bullet).
 
 ## Spec-governed agent timeout (#452) + plan-stage render (#479)
 

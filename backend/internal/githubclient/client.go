@@ -697,6 +697,10 @@ type Issue struct {
 	// derivation (#1616): a child's parent epic's area:* label is copied
 	// onto the filing.
 	Labels []string
+	// HTMLURL is GitHub's `html_url` for the issue — its browse URL.
+	// Additive (E45.42 / #3347): empty when the payload carries none;
+	// consumers must not fabricate one from repo + number in its place.
+	HTMLURL string
 }
 
 // GetIssue fetches a single issue by number.
@@ -747,6 +751,7 @@ func (c *Client) GetIssue(ctx context.Context, scope forge.CredentialScope, repo
 		Body        string `json:"body"`
 		State       string `json:"state"`
 		StateReason string `json:"state_reason"`
+		HTMLURL     string `json:"html_url"`
 		// labels entries are string-or-object per the REST Issues schema;
 		// json.RawMessage defers the shape decision to decodeLabelNames.
 		Labels []json.RawMessage `json:"labels"`
@@ -761,6 +766,7 @@ func (c *Client) GetIssue(ctx context.Context, scope forge.CredentialScope, repo
 		State:       body.State,
 		StateReason: body.StateReason,
 		Labels:      decodeLabelNames(body.Labels),
+		HTMLURL:     body.HTMLURL,
 	}, nil
 }
 

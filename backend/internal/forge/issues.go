@@ -73,6 +73,12 @@ type Issue struct {
 	StateReason string
 	// Labels is the issue's label names.
 	Labels []string
+	// HTMLURL is the issue's browse URL as the forge reports it (GitHub
+	// `html_url`, GitLab `web_url`). EMPTY when the forge payload carries
+	// none — never fabricated from repo + number, so a consumer that
+	// renders it (the prompt handler's issue link, E45.42 / #3347) can
+	// tell "the forge said nothing" from a guessed github.com URL.
+	HTMLURL string
 }
 
 // IssueComment is one entry of an issue's comment thread as

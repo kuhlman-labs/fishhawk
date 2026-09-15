@@ -437,12 +437,16 @@ type Trigger struct {
 	// Empty/nil for non-issue triggers, issues with no comments, or
 	// runs whose issue_context predates #618.
 	IssueComments []IssueComment
-	// IssueURL is the canonical github.com URL for the triggering
-	// issue. Set by the server-side prompt handler from
-	// repo + IssueNumber. Used by the implement-stage prompt's
-	// link-only rendering (#244) so the agent can fetch fresh
-	// content via its GitHub tooling rather than reasoning from
-	// the snapshot taken at plan-stage trigger time.
+	// IssueURL is the triggering issue's browse URL. Set by the
+	// server-side prompt handler (fillIssueContext, E45.42 / #3347) from
+	// the run row's cached IssueContext.URL, else the URL the forge
+	// fetch returned (GitHub html_url / GitLab web_url), else — for a
+	// github-family run ONLY — the github.com URL derived from
+	// repo + IssueNumber. EMPTY for a non-GitHub run with neither; the
+	// renderers omit the URL line rather than fabricate one. Used by the
+	// implement-stage prompt's link-only rendering (#244) so the agent
+	// can fetch fresh content via its forge tooling rather than
+	// reasoning from the snapshot taken at plan-stage trigger time.
 	IssueURL string
 	// Repo is the "owner/name" the run is operating on, surfaced in
 	// the prompt so the agent's reasoning can reference it.

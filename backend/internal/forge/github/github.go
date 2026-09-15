@@ -120,6 +120,7 @@ func (f *Forge) FetchIssue(ctx context.Context, scope forge.CredentialScope, rep
 		State:       is.State,
 		StateReason: is.StateReason,
 		Labels:      is.Labels,
+		HTMLURL:     is.HTMLURL,
 	}, nil
 }
 
