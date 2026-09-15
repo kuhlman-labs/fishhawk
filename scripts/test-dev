@@ -1139,6 +1139,10 @@ fi
 # build, so this fixture pins the forward to a port proven free rather than
 # inheriting the default 8080 — on a host already running `scripts/dev up` the
 # preflight would (correctly) abort before helm ever ran.
+# E69.8 / #3344: cmd_k8s_up now also detects the image-store provisioner BEFORE
+# the build and REFUSES an unrecognised node list, so the stub answers
+# `get nodes -o name` with the classic shared-store node (no load path) to keep
+# this fixture on the helm leg it exists to pin.
 if (
   set +e
   kstub="$(mktemp -d)"
@@ -1150,6 +1154,7 @@ if (
   cat > "${kstub}/kubectl" <<STUB
 #!/usr/bin/env zsh
 case "\$*" in
+  "get nodes -o name")     print "node/docker-desktop"; exit 0 ;;
   "get jobs"*)             print "NAME                     STATUS   COMPLETIONS"; print "fishhawk-rustfs-bucket   Running  0/1"; exit 0 ;;
   "get pods --no-headers") print "fishhawk-rustfs-bucket-abc   0/1   ImagePullBackOff   0   3m"; exit 0 ;;
   "get pods"*)             print "NAME                        READY   STATUS             RESTARTS   AGE"; print "fishhawk-rustfs-bucket-abc   0/1     ImagePullBackOff   0          3m"; exit 0 ;;
@@ -1725,6 +1730,484 @@ if print -r -- "$down_body" | grep -qE 'rm -f .*NONCE_FILE'; then
 else
   fail "cmd_down should rm the NONCE_FILE"
 fi
+
+# 9b-quinquies (E69.8 / #3344). Provisioner detection, the explicit image load
+# and the fail-closed image-identity gate — all cluster-free: docker/kubectl/helm
+# are PATH stubs that record `<tool> $*` to $REC and answer from STUB_* env vars,
+# and /healthz is the one-shot _serve_healthz_once responder (the #1018 fixture
+# family, defined in 14b above — which is why this section sits after it).
+# Sub-blocks: A pure tables · B _verify_k8s_image_identity · C _k8s_load_image ·
+# D cmd_k8s_up end to end · E body-grep wiring pins.
+q_hex_l="$(printf '1%.0s' {1..64})"   # local image id (docker image inspect .Id)
+q_hex_r="$(printf '2%.0s' {1..64})"   # a DIFFERENT running image id
+q_hex_m="$(printf '3%.0s' {1..64})"   # a manifest (repo) digest
+q_hex_y="$(printf '4%.0s' {1..64})"   # a layer digest (must never be returned)
+q_hex_i="$(printf '5%.0s' {1..64})"   # an index-entry manifest digest
+
+# --- A. pure tables -----------------------------------------------------------
+for spec in \
+  "node/docker-desktop|shared" \
+  "node/desktop-control-plane|isolated" \
+  $'node/kind-control-plane\nnode/kind-worker|isolated' \
+  "node/some-node|unknown" \
+  "|unknown" \
+  $'node/docker-desktop\nnode/x-worker|unknown'; do
+  q_in="${spec%|*}"; q_want="${spec##*|}"
+  q_got="$(_k8s_image_store_shared "$q_in")"
+  if [[ "$q_got" == "$q_want" ]]; then
+    pass "A1 _k8s_image_store_shared '${q_in//$'\n'/,}' -> ${q_want}"
+  else
+    fail "A1 _k8s_image_store_shared '${q_in//$'\n'/,}' should be ${q_want} (got: ${q_got})"
+  fi
+done
+if [[ "$(_k8s_node_names $'node/a\nnode/b\n')" == $'a\nb' ]]; then
+  pass "A1 _k8s_node_names strips the node/ prefix, one name per line"
+else
+  fail "A1 _k8s_node_names should print a and b (got: $(_k8s_node_names $'node/a\nnode/b\n'))"
+fi
+for spec in \
+  "docker://sha256:${q_hex_l}|id:sha256:${q_hex_l}" \
+  "sha256:${q_hex_l}|id:sha256:${q_hex_l}" \
+  "containerd://sha256:${q_hex_l}|id:sha256:${q_hex_l}" \
+  "docker-pullable://ghcr.io/x/y@sha256:${q_hex_m}|repo-digest:sha256:${q_hex_m}" \
+  "ghcr.io/x/y@sha256:${q_hex_m}|repo-digest:sha256:${q_hex_m}" \
+  "garbage|unrecognised:garbage" \
+  "|unrecognised:"; do
+  q_in="${spec%|*}"; q_want="${spec##*|}"
+  q_got="$(_k8s_normalise_image_id "$q_in")"
+  if [[ "$q_got" == "$q_want" ]]; then
+    pass "A2 _k8s_normalise_image_id '${q_in:0:40}' -> ${q_want%%:*}"
+  else
+    fail "A2 _k8s_normalise_image_id '${q_in}' should be ${q_want} (got: ${q_got})"
+  fi
+done
+q_manifest_a="{\"schemaVersion\":2,\"layers\":[{\"mediaType\":\"l\",\"digest\":\"sha256:${q_hex_y}\",\"size\":2}],\"config\":{\"mediaType\":\"c\",\"digest\":\"sha256:${q_hex_l}\",\"size\":1}}"
+q_manifest_b="{\"schemaVersion\":2,\"config\":{\"size\":1,\"digest\":\"sha256:${q_hex_l}\",\"mediaType\":\"c\"},\"layers\":[{\"digest\":\"sha256:${q_hex_y}\",\"size\":2}]}"
+q_index="{\n  \"schemaVersion\": 2,\n  \"manifests\": [\n    {\"mediaType\": \"m\", \"digest\": \"sha256:${q_hex_i}\", \"size\": 3, \"platform\": {\"os\": \"linux\"}}\n  ]\n}"
+for spec in "layers-then-config|${q_manifest_a}" "size-before-digest|${q_manifest_b}"; do
+  q_got="$(_k8s_config_digest_from_manifest "${spec#*|}")"
+  if [[ "$q_got" == "sha256:${q_hex_l}" ]]; then
+    pass "A3 _k8s_config_digest_from_manifest (${spec%%|*}) returns the config digest, not the layer digest"
+  else
+    fail "A3 _k8s_config_digest_from_manifest (${spec%%|*}) should return sha256:${q_hex_l} (got: ${q_got})"
+  fi
+done
+if [[ "$(_k8s_config_digest_from_manifest "$(print -- "$q_index")")" == "index:sha256:${q_hex_i}" ]]; then
+  pass "A3 _k8s_config_digest_from_manifest returns index:<first manifest digest> for an OCI index"
+else
+  fail "A3 _k8s_config_digest_from_manifest should return index:sha256:${q_hex_i} (got: $(_k8s_config_digest_from_manifest "$(print -- "$q_index")"))"
+fi
+if [[ -z "$(_k8s_config_digest_from_manifest 'garbage')" && -z "$(_k8s_config_digest_from_manifest '')" ]]; then
+  pass "A3 _k8s_config_digest_from_manifest prints nothing for garbage / empty input"
+else
+  fail "A3 _k8s_config_digest_from_manifest should print nothing for garbage (got: $(_k8s_config_digest_from_manifest 'garbage'))"
+fi
+if ( FISHHAWK_K8S_SKIP_IDENTITY=1 _k8s_identity_skipped ); then
+  pass "A4 _k8s_identity_skipped is true for FISHHAWK_K8S_SKIP_IDENTITY=1"
+else
+  fail "A4 _k8s_identity_skipped should be true for =1"
+fi
+for q_v in "" "0" "true"; do
+  if ( FISHHAWK_K8S_SKIP_IDENTITY="$q_v" _k8s_identity_skipped ); then
+    fail "A4 _k8s_identity_skipped must be false for '${q_v}' (only the exact value 1 disables the gate)"
+  else
+    pass "A4 _k8s_identity_skipped is false for '${q_v}'"
+  fi
+done
+
+# --- shared stub dir for B/C/D -------------------------------------------------
+q_stub="$(mktemp -d)"
+export REC="${q_stub}/rec"
+: > "$REC"
+cat > "${q_stub}/docker" <<'STUB'
+#!/usr/bin/env zsh
+print -r -- "docker $*" >> "$REC"
+case "$*" in
+  "image inspect "*) print -r -- "${STUB_LOCAL_ID:-}"; exit "${STUB_INSPECT_RC:-0}" ;;
+  "save "*)          exit "${STUB_SAVE_RC:-0}" ;;
+  *)                 exit 0 ;;
+esac
+STUB
+cat > "${q_stub}/kubectl" <<'STUB'
+#!/usr/bin/env zsh
+print -r -- "kubectl $*" >> "$REC"
+case "$*" in
+  "get nodes -o name")        print -r -- "${STUB_NODES:-}"; exit 0 ;;
+  "get pod "*imageID*)        print -rn -- "${STUB_POD_IMAGE_ID:-}"; exit 0 ;;
+  "exec "*"content get "*)
+    # First content-get answers from STUB_MANIFEST_1, every later one from
+    # STUB_MANIFEST_2 (the index -> manifest hop). The count includes this call.
+    n="$(grep -c 'content get' "$REC")"
+    if (( n <= 1 )); then cat "${STUB_MANIFEST_1:-/dev/null}"; else cat "${STUB_MANIFEST_2:-/dev/null}"; fi
+    exit 0 ;;
+  "debug node/"*)
+    node="${2#node/}"
+    if [[ -n "${STUB_DEBUG_OUT:-}" ]]; then print -r -- "$STUB_DEBUG_OUT"; exit 1; fi
+    print -r -- "Creating debugging pod node-debugger-${node}-abcde with container debugger on node ${node}."
+    exit 0 ;;
+  "wait "*)
+    # Realistic kubectl: "pod/<name> condition met" on STDOUT on success — the
+    # line that would pollute _k8s_debug_pod_start's captured pod name if its
+    # stdout redirect were dropped (approval condition 1).
+    print -r -- "${3} condition met"
+    exit "${STUB_WAIT_RC:-0}" ;;
+  "cp "*)                     exit "${STUB_CP_RC:-0}" ;;
+  "exec "*"images import"*)   exit "${STUB_IMPORT_RC:-0}" ;;
+  *)                          exit 0 ;;
+esac
+STUB
+print -r -- $'#!/usr/bin/env zsh\nprint -r -- "helm $*" >> "$REC"\nexit 1' > "${q_stub}/helm"
+chmod +x "${q_stub}/docker" "${q_stub}/kubectl" "${q_stub}/helm"
+q_orig_path="$PATH"
+PATH="${q_stub}:$PATH"
+print -r -- "$q_manifest_a" > "${q_stub}/manifest.json"
+print -- "$q_index" > "${q_stub}/index.json"
+q_ref="ghcr.io/kuhlman-labs/fishhawkd:dev-local"
+
+# --- B. _verify_k8s_image_identity ---------------------------------------------
+# Each case: seed the stubs by construction, run the gate, assert rc + the
+# BRANCH-SPECIFIC reason literal (and, for the fail-closed early returns, the
+# ABSENCE of the later mismatch literals, so deleting an early `return 1` that
+# falls through to a mismatch still reddens — approval condition 2). Responders
+# are always reaped so an unconsumed one never leaks a listener.
+_q_reap() { kill "$responder_pid" 2>/dev/null; wait "$responder_pid" 2>/dev/null; }
+_q_run_identity() {   # <expected> <prov> -> sets q_out (stdout) q_err (stderr) q_rc
+  local exp="$1" prov="$2" errf="${q_stub}/err"
+  q_out="$(_verify_k8s_image_identity "$q_url" "$exp" "$q_ref" "$prov" 2>"$errf")"
+  q_rc=$?
+  q_err="$(cat "$errf")"
+}
+export STUB_LOCAL_ID="sha256:${q_hex_l}"
+export STUB_MANIFEST_1="${q_stub}/manifest.json" STUB_MANIFEST_2="${q_stub}/manifest.json"
+unset STUB_INSPECT_RC
+
+# B1 both match -> 0.
+q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
+export STUB_POD_IMAGE_ID="docker://sha256:${q_hex_l}"
+_serve_healthz_once "$q_port" '{"status":"ok","git_sha":"abc1234"}'
+_q_run_identity abc1234 shared; _q_reap
+if (( q_rc == 0 )) && [[ "$q_out" == *"image identity verified"* ]]; then
+  pass "B1 _verify_k8s_image_identity returns 0 and reports verified when image id AND git_sha match"
+else
+  fail "B1 _verify_k8s_image_identity should pass on a full match (rc=${q_rc} out=${q_out} err=${q_err})"
+fi
+
+# B2 image ids match, git_sha differs -> 1 naming both shas + stale.
+q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
+_serve_healthz_once "$q_port" '{"status":"ok","git_sha":"aaaa111"}'
+_q_run_identity bbb2222 shared; _q_reap
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: git_sha mismatch"* && "$q_err" == *aaaa111* && "$q_err" == *bbb2222* && "$q_err" == *stale* ]]; then
+  pass "B2 git_sha mismatch -> 1, names both shas + stale"
+else
+  fail "B2 git_sha mismatch should return 1 naming aaaa111, bbb2222 and stale (rc=${q_rc} err=${q_err})"
+fi
+
+# B3 body with NO git_sha -> 1 (fail-closed), branch literal, NOT a mismatch.
+q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
+_serve_healthz_once "$q_port" '{"status":"ok","version":"dev"}'
+_q_run_identity abc1234 shared; _q_reap
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: /healthz carries no git_sha"* && "$q_err" == *FISHHAWK_K8S_SKIP_IDENTITY* && "$q_err" != *"identity: git_sha mismatch"* && "$q_err" != *"identity: image id mismatch"* ]]; then
+  pass "B3 absent git_sha -> 1 via its OWN branch (no git_sha literal, skip knob named, no mismatch literal)"
+else
+  fail "B3 absent git_sha should fail closed on the no-git_sha branch only (rc=${q_rc} err=${q_err})"
+fi
+
+# B4 expected 'unknown' against a responder serving a REAL sha -> 1 on its own branch.
+q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
+_serve_healthz_once "$q_port" '{"status":"ok","git_sha":"abc1234"}'
+_q_run_identity unknown shared; _q_reap
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: build sha unknown"* && "$q_err" == *unknown* && "$q_err" != *"identity: git_sha mismatch"* && "$q_err" != *"identity: image id mismatch"* ]]; then
+  pass "B4 expected sha 'unknown' -> 1 via its OWN branch (no fall-through to the git_sha mismatch)"
+else
+  fail "B4 an unknown build sha should fail closed on the build-sha-unknown branch only (rc=${q_rc} err=${q_err})"
+fi
+
+# B5 unreachable /healthz -> 1.
+q_url="http://localhost:1/healthz"
+_q_run_identity abc1234 shared
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: /healthz unreachable"* ]]; then
+  pass "B5 unreachable /healthz -> 1"
+else
+  fail "B5 unreachable /healthz should return 1 on the unreachable branch (rc=${q_rc} err=${q_err})"
+fi
+
+# B6 image id MISMATCH with a MATCHING git_sha -> 1 (the same-commit discriminator).
+q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
+export STUB_POD_IMAGE_ID="docker://sha256:${q_hex_r}"
+_serve_healthz_once "$q_port" '{"status":"ok","git_sha":"abc1234"}'
+_q_run_identity abc1234 shared; _q_reap
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: image id mismatch"* && "$q_err" == *"sha256:${q_hex_l}"* && "$q_err" == *"sha256:${q_hex_r}"* && "$q_err" == *same-commit* ]]; then
+  pass "B6 image id mismatch with a matching git_sha -> 1 naming both ids + same-commit"
+else
+  fail "B6 image id mismatch should fail even when git_sha matches (rc=${q_rc} err=${q_err})"
+fi
+
+# B7 kubectl reports an EMPTY imageID -> 1.
+export STUB_POD_IMAGE_ID=""
+_q_run_identity abc1234 shared
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: pod reports no imageID"* && "$q_err" != *"identity: running image id unresolved"* && "$q_err" != *"identity: image id mismatch"* ]]; then
+  pass "B7 empty kubelet imageID -> 1 via its OWN branch (no fall-through to the resolver)"
+else
+  fail "B7 an empty imageID should fail closed on the no-imageID branch only (rc=${q_rc} err=${q_err})"
+fi
+
+# B13 docker image inspect of the local image fails -> 1 on its own branch.
+export STUB_POD_IMAGE_ID="docker://sha256:${q_hex_l}"
+export STUB_INSPECT_RC=1 STUB_LOCAL_ID=""
+_q_run_identity abc1234 shared
+unset STUB_INSPECT_RC; export STUB_LOCAL_ID="sha256:${q_hex_l}"
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: local image id unresolved"* && "$q_err" != *"identity: image id mismatch"* ]]; then
+  pass "B13 unreadable local image id -> 1 via its OWN branch (no fall-through to the mismatch)"
+else
+  fail "B13 a failed docker image inspect should fail closed on the local-id branch only (rc=${q_rc} err=${q_err})"
+fi
+
+# B8 isolated + repo digest resolved through the retained debug pod -> 0.
+q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
+export STUB_POD_IMAGE_ID="ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m}"
+K8S_DEBUG_PODS=(node-debugger-x)
+: > "$REC"
+_serve_healthz_once "$q_port" '{"status":"ok","git_sha":"abc1234"}'
+_q_run_identity abc1234 isolated; _q_reap
+if (( q_rc == 0 )) && grep -q "^kubectl exec node-debugger-x -- .*content get sha256:${q_hex_m}$" "$REC"; then
+  pass "B8 isolated repo digest resolves via 'ctr content get' in the retained debug pod -> 0"
+else
+  fail "B8 isolated repo digest should resolve through the debug pod (rc=${q_rc} err=${q_err} rec=$(cat "$REC"))"
+fi
+
+# B9 isolated + repo digest + NO debug pod -> 1 (fail-closed, never a pass).
+K8S_DEBUG_PODS=()
+_q_run_identity abc1234 isolated
+if (( q_rc == 1 )) && [[ "$q_err" == *"no node-debug pod"* && "$q_err" == *"identity: running image id unresolved"* ]]; then
+  pass "B9 isolated repo digest with no debug pod -> 1 naming the missing pod"
+else
+  fail "B9 a repo digest with no debug pod must fail closed (rc=${q_rc} err=${q_err})"
+fi
+
+# B10 shared + docker-pullable repo digest resolved via the host daemon -> 0.
+q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
+export STUB_POD_IMAGE_ID="docker-pullable://ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m}"
+: > "$REC"
+_serve_healthz_once "$q_port" '{"status":"ok","git_sha":"abc1234"}'
+_q_run_identity abc1234 shared; _q_reap
+if (( q_rc == 0 )) && grep -q "^docker image inspect ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m} " "$REC"; then
+  pass "B10 shared repo digest resolves via 'docker image inspect <repo>@<digest>' -> 0"
+else
+  fail "B10 shared repo digest should resolve through the host daemon (rc=${q_rc} err=${q_err} rec=$(cat "$REC"))"
+fi
+
+# B11 isolated + an OCI index needs exactly ONE extra hop -> 0, two content gets.
+q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
+export STUB_POD_IMAGE_ID="ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m}"
+export STUB_MANIFEST_1="${q_stub}/index.json" STUB_MANIFEST_2="${q_stub}/manifest.json"
+K8S_DEBUG_PODS=(node-debugger-x)
+: > "$REC"
+_serve_healthz_once "$q_port" '{"status":"ok","git_sha":"abc1234"}'
+_q_run_identity abc1234 isolated; _q_reap
+q_gets="$(grep -c 'content get' "$REC")"
+if (( q_rc == 0 && q_gets == 2 )) && grep -q "content get sha256:${q_hex_i}$" "$REC"; then
+  pass "B11 an OCI index costs exactly one extra 'content get' hop -> 0"
+else
+  fail "B11 index resolution should make exactly 2 content gets and pass (rc=${q_rc} gets=${q_gets} err=${q_err})"
+fi
+export STUB_MANIFEST_1="${q_stub}/manifest.json"
+K8S_DEBUG_PODS=()
+
+# B12 unrecognised imageID -> 1.
+export STUB_POD_IMAGE_ID="garbage"
+_q_run_identity abc1234 shared
+if (( q_rc == 1 )) && [[ "$q_err" == *recognise* && "$q_err" == *"identity: running image id unresolved"* ]]; then
+  pass "B12 unrecognised imageID -> 1 naming the recognition failure"
+else
+  fail "B12 an unrecognised imageID should fail closed (rc=${q_rc} err=${q_err})"
+fi
+unset STUB_POD_IMAGE_ID
+
+# --- C. _k8s_load_image ---------------------------------------------------------
+# TMPDIR is pinned to a fresh dir per case so the "tarball removed" assertion is
+# a glob over a directory this test owns.
+# The loader runs in THIS shell (stdout to a file, not a `$( )` subshell) so
+# its K8S_DEBUG_PODS mutation is observable.
+_q_run_load() {   # <nodes...> -> q_rc q_err q_out; tarball dir in q_tmp
+  local errf="${q_stub}/lerr" outf="${q_stub}/lout"
+  q_tmp="$(mktemp -d)"
+  : > "$REC"
+  K8S_DEBUG_PODS=()
+  TMPDIR="$q_tmp" _k8s_load_image "$q_ref" "$@" >"$outf" 2>"$errf"
+  q_rc=$?
+  q_out="$(cat "$outf")"
+  q_err="$(cat "$errf")"
+  q_left=( "$q_tmp"/fishhawk-image.*(N) )
+}
+unset STUB_SAVE_RC STUB_WAIT_RC STUB_CP_RC STUB_IMPORT_RC STUB_DEBUG_OUT
+
+# C1 two nodes, everything succeeds.
+_q_run_load a b
+q_saves="$(grep -c '^docker save' "$REC")"
+q_seq="$(grep -E '^kubectl (debug|wait|cp|exec)' "$REC" | awk '{print $2}' | tr '\n' ' ')"
+if (( q_rc == 0 && q_saves == 1 )) && [[ "$q_seq" == "debug wait cp exec debug wait cp exec " ]] \
+  && ! grep -q '^kubectl delete pod' "$REC" \
+  && [[ "${K8S_DEBUG_PODS[*]}" == "node-debugger-a-abcde node-debugger-b-abcde" ]] \
+  && (( ${#q_left[@]} == 0 )) \
+  && [[ "$q_out" == *"loaded into node a"* && "$q_out" == *"loaded into node b"* ]]; then
+  pass "C1 loader: ONE docker save across two nodes, debug->wait->cp->import per node, pods retained with clean names, tarball removed"
+else
+  fail "C1 loader happy path (rc=${q_rc} saves=${q_saves} seq='${q_seq}' pods='${K8S_DEBUG_PODS[*]}' left=${#q_left[@]} out=${q_out} err=${q_err})"
+fi
+rm -rf "$q_tmp"
+
+# C2 ctr import fails -> 1, pod deleted, tarball removed.
+export STUB_IMPORT_RC=1
+_q_run_load a
+if (( q_rc == 1 )) && [[ "$q_err" == *"images import"* ]] && grep -q '^kubectl delete pod node-debugger-a-abcde' "$REC" && (( ${#q_left[@]} == 0 )) && (( ${#K8S_DEBUG_PODS[@]} == 0 )); then
+  pass "C2 import failure -> 1, names the import, deletes the pod, removes the tarball"
+else
+  fail "C2 import failure handling (rc=${q_rc} err=${q_err} rec=$(cat "$REC") left=${#q_left[@]})"
+fi
+unset STUB_IMPORT_RC; rm -rf "$q_tmp"
+
+# C3 kubectl debug prints an old-kubectl error -> 1, NO delete, tarball removed.
+export STUB_DEBUG_OUT="error: unknown flag: --profile"
+_q_run_load a
+if (( q_rc == 1 )) && [[ "$q_err" == *"node-debugger pod name"* && "$q_err" == *"unknown flag: --profile"* ]] && ! grep -q '^kubectl delete pod' "$REC" && (( ${#q_left[@]} == 0 )); then
+  pass "C3 unparseable 'kubectl debug' output -> 1 naming the pod-name failure, no delete, tarball removed"
+else
+  fail "C3 debug-output failure handling (rc=${q_rc} err=${q_err} rec=$(cat "$REC") left=${#q_left[@]})"
+fi
+unset STUB_DEBUG_OUT; rm -rf "$q_tmp"
+
+# C4 docker save fails -> 1, no debug pod ever created, tarball removed.
+export STUB_SAVE_RC=1
+_q_run_load a
+if (( q_rc == 1 )) && [[ "$q_err" == *"docker save"* ]] && ! grep -q '^kubectl debug' "$REC" && (( ${#q_left[@]} == 0 )); then
+  pass "C4 docker save failure -> 1, no kubectl debug, tarball removed"
+else
+  fail "C4 save failure handling (rc=${q_rc} err=${q_err} rec=$(cat "$REC") left=${#q_left[@]})"
+fi
+unset STUB_SAVE_RC; rm -rf "$q_tmp"
+
+# C5 kubectl wait fails -> 1 naming wait, pod deleted, tarball removed.
+export STUB_WAIT_RC=1
+_q_run_load a
+if (( q_rc == 1 )) && [[ "$q_err" == *"kubectl wait"* ]] && grep -q '^kubectl delete pod node-debugger-a-abcde' "$REC" && (( ${#q_left[@]} == 0 )); then
+  pass "C5 kubectl wait failure -> 1 naming wait, deletes the pod, removes the tarball"
+else
+  fail "C5 wait failure handling (rc=${q_rc} err=${q_err} rec=$(cat "$REC") left=${#q_left[@]})"
+fi
+unset STUB_WAIT_RC; rm -rf "$q_tmp"
+
+# C6 kubectl cp fails -> 1 naming cp, pod deleted, tarball removed.
+export STUB_CP_RC=1
+_q_run_load a
+if (( q_rc == 1 )) && [[ "$q_err" == *"kubectl cp"* ]] && grep -q '^kubectl delete pod node-debugger-a-abcde' "$REC" && (( ${#q_left[@]} == 0 )); then
+  pass "C6 kubectl cp failure -> 1 naming cp, deletes the pod, removes the tarball"
+else
+  fail "C6 cp failure handling (rc=${q_rc} err=${q_err} rec=$(cat "$REC") left=${#q_left[@]})"
+fi
+unset STUB_CP_RC; rm -rf "$q_tmp"
+K8S_DEBUG_PODS=()
+
+# --- D. cmd_k8s_up end to end (helm stubbed to fail, so the run ends before any
+# port-forward/mkdir — the 9b-quater subshell contract) ---------------------------
+_q_run_up() {   # <nodes> [skip] -> q_rc q_out q_err
+  local errf="${q_stub}/uerr"
+  : > "$REC"
+  q_out="$(
+    set +e
+    export STUB_NODES="$1"
+    if [[ "${2:-}" == "skip" ]]; then export FISHHAWK_K8S_SKIP_IDENTITY=1; else unset FISHHAWK_K8S_SKIP_IDENTITY; fi
+    FISHHAWK_K8S_PF_PORT="$(_free_high_port)"; export FISHHAWK_K8S_PF_PORT
+    cmd_k8s_up 2>"$errf"
+  )"
+  q_rc=$?
+  q_err="$(cat "$errf")"
+}
+_q_line() { grep -n -- "$1" "$REC" | head -n 1 | cut -d: -f1; }
+
+# D1 isolated: build -> save -> debug -> ... -> helm -> EXIT-trap pod delete.
+_q_run_up "node/desktop-control-plane"
+q_l_build="$(_q_line '^docker build')"; q_l_save="$(_q_line '^docker save')"; q_l_debug="$(_q_line '^kubectl debug')"
+q_l_helm="$(_q_line '^helm upgrade')"; q_l_del="$(_q_line '^kubectl delete pod node-debugger-desktop-control-plane-abcde')"
+if (( q_rc != 0 )) && [[ -n "$q_l_build" && -n "$q_l_save" && -n "$q_l_debug" && -n "$q_l_helm" && -n "$q_l_del" ]] \
+  && (( q_l_build < q_l_save && q_l_save < q_l_debug && q_l_debug < q_l_helm && q_l_helm < q_l_del )) \
+  && [[ "$q_out" == *"loaded into node desktop-control-plane"* ]]; then
+  pass "D1 cmd_k8s_up on the kind provisioner: build -> save -> debug -> helm -> EXIT-trap deletes the retained pod after the helm failure"
+else
+  fail "D1 cmd_k8s_up isolated ordering (rc=${q_rc} build=${q_l_build} save=${q_l_save} debug=${q_l_debug} helm=${q_l_helm} del=${q_l_del} out=${q_out} err=${q_err})"
+fi
+
+# D2 shared: no save, 'no load needed'.
+_q_run_up "node/docker-desktop"
+if ! grep -q '^docker save' "$REC" && [[ "$q_out" == *"no load needed"* ]] && grep -q '^helm upgrade' "$REC"; then
+  pass "D2 cmd_k8s_up on the classic provisioner: no docker save, reports no load needed"
+else
+  fail "D2 cmd_k8s_up shared path (rc=${q_rc} out=${q_out} rec=$(cat "$REC"))"
+fi
+
+# D3 unknown provisioner: refuses BEFORE the build.
+_q_run_up "node/something-else"
+if (( q_rc != 0 )) && ! grep -q '^docker build' "$REC" && [[ "$q_err" == *"cannot tell"* && "$q_err" == *FISHHAWK_K8S_SKIP_IDENTITY* ]]; then
+  pass "D3 cmd_k8s_up refuses an unknown provisioner before any docker build, naming the skip knob"
+else
+  fail "D3 cmd_k8s_up unknown provisioner should refuse pre-build (rc=${q_rc} err=${q_err} rec=$(cat "$REC"))"
+fi
+
+# D4 unknown provisioner + the skip knob: continues with a loud warning.
+_q_run_up "node/something-else" skip
+if grep -q '^docker build' "$REC" && [[ "$q_err" == *warning* && "$q_err" == *"NOT loaded"* ]]; then
+  pass "D4 cmd_k8s_up with FISHHAWK_K8S_SKIP_IDENTITY=1 continues past an unknown provisioner with a warning"
+else
+  fail "D4 cmd_k8s_up skip knob (rc=${q_rc} err=${q_err} rec=$(cat "$REC"))"
+fi
+
+PATH="$q_orig_path"
+unset STUB_LOCAL_ID STUB_MANIFEST_1 STUB_MANIFEST_2 STUB_NODES REC
+rm -rf "$q_stub"
+
+# --- E. body-grep wiring pins ---------------------------------------------------
+q_up="$(typeset -f cmd_k8s_up)"
+q_ident="$(typeset -f _verify_k8s_image_identity)"
+if print -r -- "$q_up" | grep -qF "trap '_k8s_up_cleanup' EXIT"; then
+  pass "E cmd_k8s_up installs the _k8s_up_cleanup EXIT trap"
+else
+  fail "E cmd_k8s_up should install trap '_k8s_up_cleanup' EXIT"
+fi
+q_o_listener="$(print -r -- "$q_up" | grep -n '_verify_listener_identity' | head -1 | cut -d: -f1)"
+q_o_ident="$(print -r -- "$q_up" | grep -n '_verify_k8s_image_identity' | head -1 | cut -d: -f1)"
+if [[ -n "$q_o_listener" && -n "$q_o_ident" ]] && (( q_o_ident > q_o_listener )); then
+  pass "E cmd_k8s_up runs _verify_k8s_image_identity AFTER _verify_listener_identity"
+else
+  fail "E cmd_k8s_up should call _verify_k8s_image_identity after _verify_listener_identity (listener=${q_o_listener} identity=${q_o_ident})"
+fi
+q_o_helm="$(print -r -- "$q_up" | grep -n 'helm upgrade' | head -1 | cut -d: -f1)"
+q_o_restart="$(print -r -- "$q_up" | grep -n 'kubectl rollout restart deployment/fishhawk' | head -1 | cut -d: -f1)"
+q_o_status="$(print -r -- "$q_up" | grep -n 'kubectl rollout status' | head -1 | cut -d: -f1)"
+if [[ -n "$q_o_helm" && -n "$q_o_restart" && -n "$q_o_status" ]] && (( q_o_helm < q_o_restart && q_o_restart < q_o_status )); then
+  pass "E cmd_k8s_up runs 'kubectl rollout restart deployment/fishhawk' between helm upgrade and rollout status"
+else
+  fail "E cmd_k8s_up should rollout-restart between helm upgrade and rollout status (helm=${q_o_helm} restart=${q_o_restart} status=${q_o_status})"
+fi
+if print -r -- "$q_up" | grep -A3 'if _k8s_identity_skipped' | grep -q 'warning'; then
+  pass "E cmd_k8s_up guards the identity call with _k8s_identity_skipped and warns on the skip"
+else
+  fail "E cmd_k8s_up should guard _verify_k8s_image_identity with _k8s_identity_skipped + a warning"
+fi
+if print -r -- "$q_up" | grep -q -- '--build-arg GIT_SHA="\$build_sha"' && print -r -- "$q_up" | grep -q '_verify_k8s_image_identity .*"\$build_sha"'; then
+  pass "E cmd_k8s_up uses ONE build_sha for both the docker build arg and the identity call"
+else
+  fail "E cmd_k8s_up should thread \$build_sha into both --build-arg GIT_SHA= and _verify_k8s_image_identity"
+fi
+if print -r -- "$q_up" | grep -q -- '--sort-by=.metadata.creationTimestamp' || print -r -- "$q_ident" | grep -q -- '--sort-by=.metadata.creationTimestamp'; then
+  pass "E the identity check samples the NEWEST fishhawkd pod (--sort-by creationTimestamp)"
+else
+  fail "E _verify_k8s_image_identity should select the newest pod via --sort-by=.metadata.creationTimestamp"
+fi
+if print -r -- "$q_ident" | grep -q 'return 2'; then
+  fail "E _verify_k8s_image_identity must have NO 'return 2' warn-and-continue code"
+else
+  pass "E _verify_k8s_image_identity has no rc=2 warn-and-continue path"
+fi
+unset q_hex_l q_hex_r q_hex_m q_hex_y q_hex_i q_manifest_a q_manifest_b q_index q_ref q_url q_port q_rc q_out q_err
 
 # 15. Acceptance preview (E31.18 / #1569) — pure DB derivation. The preview
 # database name must be the base name with an `_preview` suffix and can NEVER

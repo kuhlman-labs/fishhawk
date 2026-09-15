@@ -801,10 +801,13 @@ can verify — it needs a live cluster. The operator walk is a concrete
 command, not "install it somewhere and check health":
 
 ```sh
-scripts/dev k8s   # builds the image into Docker Desktop's shared store,
-                  # helm-installs with values-local.yaml, waits for the
-                  # rollout, port-forwards svc/fishhawk 8080:8080, and gates
-                  # on /healthz
+scripts/dev k8s   # detects the provisioner, builds the image, loads it into
+                  # the node when Docker Desktop's kind-based provisioner does
+                  # not share the host image store, helm-installs with
+                  # values-local.yaml, restarts + waits for the rollout,
+                  # port-forwards svc/fishhawk 8080:8080, gates on /healthz,
+                  # then verifies the pod's image ID + git_sha against the
+                  # build — identity-gated, fail-closed (#3344)
 curl -fsS http://localhost:8080/healthz   # then probe health directly
 ```
 

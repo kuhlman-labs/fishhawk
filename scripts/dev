@@ -384,9 +384,13 @@ _clean_stray_nonce_files() {
 }
 
 # Local image tag the Docker-Desktop Kubernetes bring-up builds and the chart is
-# pointed at via `--set image.tag=dev-local`. Docker Desktop's k8s shares the host
-# Docker daemon image store, so a locally built image under this tag is resolvable
-# in-cluster with pullPolicy: IfNotPresent — no registry push / kind load needed.
+# pointed at via `--set image.tag=dev-local`. Whether a locally built image under
+# this tag is visible in-cluster depends on the PROVISIONER (#3344): the classic
+# `docker-desktop` node shares the host daemon's store, the kind-based
+# `desktop-control-plane` node does not and needs the explicit load
+# (_k8s_load_image); either way pullPolicy: IfNotPresent resolves the tag on the
+# node and the post-gate identity check (_verify_k8s_image_identity) proves the
+# pod runs THIS build. Never a registry push.
 # Pure (no git/cluster), so scripts/test-dev can assert the tag directly.
 _k8s_image_ref() {
   print "ghcr.io/kuhlman-labs/fishhawkd:dev-local"
@@ -550,6 +554,368 @@ _k8s_dump_hook_diagnostics() {
       print -u2 "  pod ${name}: image pull failed (ImagePullBackOff/ErrImagePull) for image ${img:-<unknown>}"
     fi
   done < <(kubectl get pods --no-headers 2>/dev/null || true)
+}
+
+# ---------------------------------------------------------------------------
+# E69.8 / #3344 — image-store provisioner detection, explicit image load, and
+# the fail-closed image-identity gate for `scripts/dev k8s`.
+#
+# Docker Desktop ships two Kubernetes provisioners. The classic one (node
+# `docker-desktop`, cri-dockerd) shares the host daemon's image store, so a
+# `docker build` is visible to the kubelet. The kind-based one current
+# installs use (node `desktop-control-plane`) runs its own containerd that the
+# host daemon cannot see — a `docker build` never reaches the node, and
+# `pullPolicy: IfNotPresent` turns "never arrived" into "reuse whatever
+# dev-local the node already holds": a green bring-up serving a STALE image.
+# ---------------------------------------------------------------------------
+
+# Node-debug pods RETAINED after a successful image load (one per node), so the
+# identity resolver can read the node's content store through the same pod,
+# plus the hoisted `docker save` tarball. Both are swept by _k8s_up_cleanup,
+# installed as cmd_k8s_up's function-scoped EXIT trap (fires on normal return
+# AND on every `exit 1` leg — verified on zsh 5.9, pinned by scripts/test-dev).
+K8S_DEBUG_PODS=()
+K8S_IMAGE_TAR=""
+
+# Classify `kubectl get nodes -o name` output. Prints exactly one of:
+#   shared    — every line is node/docker-desktop (classic provisioner, the host
+#               daemon's store IS the cluster's store)
+#   isolated  — every non-empty line is a kind-style <cluster>-control-plane /
+#               <cluster>-worker[N] node (own containerd, host store invisible)
+#   unknown   — empty output or any other node name
+# Pure and always exit 0 (command-substitution safe, the _k8s_pf_port rule).
+_k8s_image_store_shared() {
+  local nodes="$1" line
+  local n_shared=0 n_kind=0 n_other=0
+  for line in ${(f)nodes}; do
+    [[ -n "${line//[[:space:]]/}" ]] || continue
+    if [[ "$line" == "node/docker-desktop" ]]; then
+      n_shared=$(( n_shared + 1 ))
+    elif [[ "$line" =~ '^node/[A-Za-z0-9.-]+-(control-plane|worker)[0-9]*$' ]]; then
+      n_kind=$(( n_kind + 1 ))
+    else
+      n_other=$(( n_other + 1 ))
+    fi
+  done
+  if (( n_other == 0 && n_kind == 0 && n_shared > 0 )); then
+    print shared
+  elif (( n_other == 0 && n_shared == 0 && n_kind > 0 )); then
+    print isolated
+  else
+    print unknown
+  fi
+}
+
+# Strip the `node/` prefix from `kubectl get nodes -o name` output, one name per
+# line, skipping blank lines. Pure, always exit 0.
+_k8s_node_names() {
+  local nodes="$1" line
+  for line in ${(f)nodes}; do
+    [[ -n "${line//[[:space:]]/}" ]] || continue
+    print -r -- "${line#node/}"
+  done
+}
+
+# The SINGLE escape hatch from the identity gate (and from the unknown-
+# provisioner refusal). Accepts exactly the value 1 (the _dev_tls_enabled
+# idiom) so a stray empty `FISHHAWK_K8S_SKIP_IDENTITY=` in .env cannot silently
+# disable the gate. Dev-only: scripts/dev never runs under the runner's
+# default-deny gate env.
+_k8s_identity_skipped() {
+  [[ "${FISHHAWK_K8S_SKIP_IDENTITY:-}" == "1" ]]
+}
+
+# Normalise a kubelet-reported containerStatuses[].imageID into one of:
+#   id:sha256:<64hex>           — a bare image (config) ID: docker://sha256:…,
+#                                 containerd://sha256:…, or sha256:… (compare
+#                                 directly against `docker image inspect .Id`)
+#   repo-digest:sha256:<64hex>  — <repo>@sha256:<manifest digest> (must be
+#                                 resolved to the config digest first)
+#   unrecognised:<raw>          — anything else, including empty
+# Pure, always exit 0.
+_k8s_normalise_image_id() {
+  local raw="${1:-}" v="${1:-}"
+  v="${v#docker-pullable://}"
+  v="${v#docker://}"
+  v="${v#containerd://}"
+  if [[ "$v" =~ '^sha256:[0-9a-f]{64}$' ]]; then
+    print -r -- "id:${v}"
+  elif [[ "$v" =~ '^.+@sha256:[0-9a-f]{64}$' ]]; then
+    print -r -- "repo-digest:${v##*@}"
+  else
+    print -r -- "unrecognised:${raw}"
+  fi
+}
+
+# Extract the image CONFIG digest from an OCI/Docker image manifest document
+# (the output of `ctr -n k8s.io content get <manifest digest>`). Prints
+# `sha256:<64hex>` for a manifest, `index:sha256:<first manifest digest>` for
+# an OCI index / manifest list (the caller does exactly one more hop), or
+# nothing when neither shape is recognised.
+#
+# IMPLEMENTATION ASSUMPTION (grep/sed only — no jq, matching
+# _git_sha_from_healthz_body): the document is a SINGLE JSON OBJECT whose
+# `"config"` value is a flat descriptor object (`mediaType`/`digest`/`size` in
+# any order, no nested object such as `annotations`). Whitespace and newlines
+# are removed first so both compact (`docker save` output) and pretty-printed
+# (`ctr content get` of a registry-pulled blob) forms parse identically, and
+# the config span is bounded by the FIRST `}` after `"config":{` — a nested
+# object inside the descriptor would truncate the span and could miss the
+# digest, which surfaces as the caller's "manifest carried no config digest"
+# refusal (never a wrong digest: only `sha256:` values INSIDE the span are
+# read, so a layer digest elsewhere in the document is never returned). An
+# INDEX document (`"manifests":[…]`, no `"config"`) yields the first manifest
+# entry's digest with the `index:` prefix; a nested index (index → index) is
+# refused by the caller after its single extra hop. If a future containerd
+# changes either shape, this is the helper to revisit.
+_k8s_config_digest_from_manifest() {
+  local doc="${1:-}" compact="" span="" digest=""
+  compact="$(print -r -- "$doc" | tr -d ' \n\t\r')"
+  if span="$(print -r -- "$compact" | grep -Eo '"config":\{[^}]*\}' | head -n 1)" && [[ -n "$span" ]]; then
+    digest="$(print -r -- "$span" | grep -Eo 'sha256:[0-9a-f]{64}' | head -n 1)"
+    if [[ -n "$digest" ]]; then print -r -- "$digest"; fi
+    return 0
+  fi
+  if span="$(print -r -- "$compact" | grep -Eo '"manifests":\[.*' | head -n 1)" && [[ -n "$span" ]]; then
+    digest="$(print -r -- "$span" | grep -Eo 'sha256:[0-9a-f]{64}' | head -n 1)"
+    if [[ -n "$digest" ]]; then print -r -- "index:${digest}"; fi
+    return 0
+  fi
+  return 0
+}
+
+# Run the NODE's ctr through a retained node-debug pod. `--profile=sysadmin`
+# mounts the node filesystem at /host (privileged + hostPID), so the kind
+# node's own ctr binary and containerd socket are reachable at these paths.
+_k8s_node_ctr() {
+  local pod="$1"; shift
+  kubectl exec "$pod" -- /host/usr/local/bin/ctr --address /host/run/containerd/containerd.sock -n k8s.io "$@"
+}
+
+# Start a privileged node-debug pod on <node> and wait for it to be Ready.
+# STDOUT CONTRACT: THE POD NAME ONLY. Every kubectl call here other than the
+# final `print` has its stdout captured or redirected — `kubectl wait` prints
+# "pod/<name> condition met" to stdout on success and would otherwise pollute
+# the name the caller captures. glibc `debian:12-slim` is deliberate: an
+# alpine (musl) image cannot exec the node's ctr. Requires kubectl >= 1.27
+# (`--profile`); an older kubectl prints `unknown flag: --profile`, which
+# surfaces as the pod-name parse failure below. Returns 1 naming the failure;
+# a pod that was created but never became Ready is deleted here.
+_k8s_debug_pod_start() {
+  local node="$1" out="" pod=""
+  out="$(kubectl debug "node/${node}" --profile=sysadmin --image=debian:12-slim -- sleep 3600 2>&1)" || true
+  pod="$(print -r -- "$out" | grep -Eo 'node-debugger-[A-Za-z0-9.-]+' | head -n 1)"
+  if [[ -z "$pod" ]]; then
+    print -u2 -r -- "$out"
+    print -u2 "error: could not determine the node-debugger pod name for node ${node} (kubectl >= 1.27 with --profile support is required)"
+    return 1
+  fi
+  if ! kubectl wait --for=condition=Ready "pod/${pod}" --timeout=120s >&2; then
+    print -u2 "error: kubectl wait: node-debug pod ${pod} did not become Ready within 120s (can the node pull debian:12-slim?)"
+    _k8s_debug_pod_delete "$pod"
+    return 1
+  fi
+  print -r -- "$pod"
+}
+
+# Delete a node-debug pod without waiting. Always exit 0 (cleanup path).
+_k8s_debug_pod_delete() {
+  local pod="$1"
+  kubectl delete pod "$pod" --wait=false >&2 2>&1 || true
+}
+
+# Import an already-saved image tarball into ONE node's containerd via a fresh
+# node-debug pod. On success the pod is RETAINED in K8S_DEBUG_PODS for the
+# identity resolver (cmd_k8s_up's EXIT trap deletes it); on every failure after
+# the pod exists the pod is deleted here and 1 is returned naming the step.
+_k8s_load_image_into_node() {
+  local tar="$1" node="$2" ref="${3:-$(_k8s_image_ref)}" pod=""
+  if ! pod="$(_k8s_debug_pod_start "$node")"; then
+    return 1
+  fi
+  if ! kubectl cp "$tar" "${pod}:/tmp/fishhawk-image.tar" >&2; then
+    print -u2 "error: kubectl cp of the image tarball into ${pod} failed"
+    _k8s_debug_pod_delete "$pod"
+    return 1
+  fi
+  if ! _k8s_node_ctr "$pod" images import /tmp/fishhawk-image.tar >&2; then
+    print -u2 "error: ctr images import of the image tarball failed on node ${node} (via ${pod})"
+    _k8s_debug_pod_delete "$pod"
+    return 1
+  fi
+  K8S_DEBUG_PODS+=("$pod")
+  print "image ${ref} loaded into node ${node} (kind provisioner does not share the host image store, #3344)"
+}
+
+# Load <ref> into every listed node: ONE `docker save` (hoisted out of the
+# per-node loop), then one import per node. The tarball is removed on EVERY
+# path by the always-block (zsh runs it on `return`), and belt-and-braces by
+# _k8s_up_cleanup. Never a registry push (#2918 egress discipline).
+_k8s_load_image() {
+  local ref="$1"; shift
+  local node
+  if ! K8S_IMAGE_TAR="$(mktemp -t fishhawk-image.XXXXXX)"; then
+    print -u2 "error: mktemp failed for the image tarball"
+    K8S_IMAGE_TAR=""
+    return 1
+  fi
+  if ! docker save "$ref" -o "$K8S_IMAGE_TAR" >&2; then
+    print -u2 "error: docker save ${ref} failed — did the image build succeed?"
+    rm -f "$K8S_IMAGE_TAR"
+    K8S_IMAGE_TAR=""
+    return 1
+  fi
+  {
+    for node in "$@"; do
+      if ! _k8s_load_image_into_node "$K8S_IMAGE_TAR" "$node" "$ref"; then
+        return 1
+      fi
+    done
+  } always {
+    rm -f "$K8S_IMAGE_TAR"
+    K8S_IMAGE_TAR=""
+  }
+}
+
+# cmd_k8s_up's EXIT-trap cleanup: delete every retained node-debug pod and any
+# leftover tarball. Every command is tested / `|| true` so the trap itself can
+# never abort (#631).
+_k8s_up_cleanup() {
+  local pod
+  for pod in "${K8S_DEBUG_PODS[@]}"; do
+    _k8s_debug_pod_delete "$pod"
+  done
+  K8S_DEBUG_PODS=()
+  if [[ -n "$K8S_IMAGE_TAR" ]]; then
+    rm -f "$K8S_IMAGE_TAR"
+    K8S_IMAGE_TAR=""
+  fi
+}
+
+# Resolve a kubelet-reported imageID to the running image's CONFIG digest (the
+# value `docker image inspect --format '{{.Id}}'` prints, which survives
+# `docker save` → `ctr images import` unchanged). Prints the digest, or returns
+# 1 naming why:
+#   id:            printed directly
+#   repo-digest:   shared   → the host daemon resolves <repo>@<digest> (its
+#                             store IS the node's store)
+#                  isolated → `ctr content get <digest>` through the retained
+#                             node-debug pod; an OCI index costs exactly one
+#                             more hop
+#                  unknown  → refused (unreachable in practice: cmd_k8s_up
+#                             refuses an unknown provisioner before the build)
+#   unrecognised:  refused
+_k8s_resolve_running_image_id() {
+  local raw="${1:-}" prov="${2:-}" norm="" digest="" stripped="" repo="" id="" pod="" doc="" cfg="" sub=""
+  norm="$(_k8s_normalise_image_id "$raw")"
+  case "$norm" in
+    id:*) print -r -- "${norm#id:}"; return 0 ;;
+    repo-digest:*) digest="${norm#repo-digest:}" ;;
+    *)
+      print -u2 "error: cannot recognise the pod's imageID '${raw}' (expected docker://sha256:…, containerd://sha256:… or <repo>@sha256:…)"
+      return 1 ;;
+  esac
+  case "$prov" in
+    shared)
+      stripped="${raw#docker-pullable://}"; stripped="${stripped#docker://}"; stripped="${stripped#containerd://}"
+      repo="${stripped%@*}"
+      if ! id="$(docker image inspect "${repo}@${digest}" --format '{{.Id}}' 2>/dev/null)" || [[ -z "$id" ]]; then
+        print -u2 "error: the host daemon cannot resolve ${repo}@${digest} to an image id (docker image inspect failed)"
+        return 1
+      fi
+      print -r -- "$id" ;;
+    isolated)
+      pod="${K8S_DEBUG_PODS[1]:-}"
+      if [[ -z "$pod" ]]; then
+        print -u2 "error: no node-debug pod available to resolve the manifest digest ${digest} (was the image load skipped?)"
+        return 1
+      fi
+      if ! doc="$(_k8s_node_ctr "$pod" content get "$digest" 2>/dev/null)"; then
+        print -u2 "error: ctr content get ${digest} failed via ${pod}"
+        return 1
+      fi
+      cfg="$(_k8s_config_digest_from_manifest "$doc")"
+      if [[ "$cfg" == index:* ]]; then
+        sub="${cfg#index:}"
+        if ! doc="$(_k8s_node_ctr "$pod" content get "$sub" 2>/dev/null)"; then
+          print -u2 "error: ctr content get ${sub} (index entry of ${digest}) failed via ${pod}"
+          return 1
+        fi
+        cfg="$(_k8s_config_digest_from_manifest "$doc")"
+      fi
+      if [[ -z "$cfg" || "$cfg" == index:* ]]; then
+        print -u2 "error: manifest ${digest} carried no config digest (nested index, or an unrecognised manifest format — see _k8s_config_digest_from_manifest)"
+        return 1
+      fi
+      print -r -- "$cfg" ;;
+    *)
+      print -u2 "error: cannot resolve the repo digest ${digest} on an unknown provisioner"
+      return 1 ;;
+  esac
+}
+
+# One failure line for the identity gate: a DISTINCT reason literal per branch
+# (so a test can pin which branch fired), the detail, and the single escape
+# hatch. Always exit 0; the caller returns 1.
+_k8s_identity_fail() {
+  local reason="$1" detail="$2"
+  print -u2 "error: ${reason}: ${detail} — set FISHHAWK_K8S_SKIP_IDENTITY=1 to bring up an unverified image deliberately; see docs/deploy/kubernetes.md § 'Image identity'"
+}
+
+# Post-gate image-identity check (#3344). Returns 0 ONLY when BOTH checks
+# match, 1 otherwise — there is no warn-and-continue code.
+#   PRIMARY   the locally built image's config ID (`docker image inspect .Id`)
+#             equals the newest fishhawkd pod's running imageID (resolved via
+#             _k8s_resolve_running_image_id). Two dirty builds at one commit
+#             carry the SAME `-dirty` git_sha; only the image ID tells them
+#             apart, which is why this is the primary check.
+#   SECONDARY /healthz `git_sha` equals the SHA stamped into this build.
+# Branch reason literals (each distinct, each fail-closed):
+#   identity: local image id unresolved · identity: pod reports no imageID ·
+#   identity: running image id unresolved · identity: image id mismatch ·
+#   identity: build sha unknown · identity: /healthz unreachable ·
+#   identity: /healthz carries no git_sha · identity: git_sha mismatch
+_verify_k8s_image_identity() {
+  local url="$1" expected="$2" ref="$3" prov="$4"
+  local local_id="" raw="" running_id="" body="" actual=""
+
+  if ! local_id="$(docker image inspect "$ref" --format '{{.Id}}' 2>/dev/null)" || [[ -z "$local_id" ]]; then
+    _k8s_identity_fail "identity: local image id unresolved" "cannot read the local image ID of ${ref} (docker image inspect failed — was the build successful?)"
+    return 1
+  fi
+  # Newest pod by creationTimestamp: after `rollout restart` the pre-restart
+  # pod may still be Terminating and must never be the one sampled.
+  if ! raw="$(kubectl get pod -l app.kubernetes.io/component=server --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].status.containerStatuses[0].imageID}' 2>/dev/null)" || [[ -z "$raw" ]]; then
+    _k8s_identity_fail "identity: pod reports no imageID" "no fishhawkd pod (app.kubernetes.io/component=server) reports a containerStatuses[0].imageID"
+    return 1
+  fi
+  if ! running_id="$(_k8s_resolve_running_image_id "$raw" "$prov")"; then
+    _k8s_identity_fail "identity: running image id unresolved" "could not resolve the pod's imageID '${raw}' to an image id (see the line above)"
+    return 1
+  fi
+  if [[ "$running_id" != "$local_id" ]]; then
+    _k8s_identity_fail "identity: image id mismatch" "the fishhawkd pod is running image ${running_id}, not the image this bring-up built (${local_id}) — the cluster is serving a STALE fishhawkd image (#3344); a same-commit rebuild is indistinguishable by git_sha, which is why the image ID is the primary check (kubelet imageID: ${raw})"
+    return 1
+  fi
+
+  if [[ "$expected" == "unknown" ]]; then
+    _k8s_identity_fail "identity: build sha unknown" "the build SHA is unknown (not a git work tree?) so the deployed binary cannot be corroborated against /healthz"
+    return 1
+  fi
+  if ! body="$(curl -fsS --max-time 5 "$url" 2>/dev/null)"; then
+    _k8s_identity_fail "identity: /healthz unreachable" "GET ${url} failed"
+    return 1
+  fi
+  actual="$(_git_sha_from_healthz_body "$body")"
+  if [[ -z "$actual" ]]; then
+    _k8s_identity_fail "identity: /healthz carries no git_sha" "the running fishhawkd predates GitSHA stamping (#1007) or is not this tree's build"
+    return 1
+  fi
+  if [[ "$actual" != "$expected" ]]; then
+    _k8s_identity_fail "identity: git_sha mismatch" "/healthz git_sha is '${actual}', not the stamped build SHA '${expected}' — stale fishhawkd image (#3344)"
+    return 1
+  fi
+  print "image identity verified (image id ${local_id}, /healthz git_sha ${actual}, #3344)"
 }
 
 # Poll <url> until fishhawkd <pid> answers GET /healthz, for up to <deadline>
@@ -2414,13 +2780,22 @@ cmd_post_merge() {
   cmd_reload "$@"
 }
 
-# Local Kubernetes bring-up against Docker Desktop's cluster. Builds the
-# fishhawkd image into the host Docker daemon (which Docker-Desktop k8s shares,
-# so no registry push / kind load), helm-installs the chart with values-local
-# overriding the image to the local build, waits for the rollout, then opens a
-# port-forward and gates on /healthz — the authoritative readiness signal
-# (rollout status can report available before the post-install migrate Job
-# finishes; fishhawkd only answers healthy after its own startup completes).
+# Local Kubernetes bring-up against Docker Desktop's cluster. Detects the
+# provisioner FIRST (fail-closed on an unrecognised node name, #3344), builds
+# the fishhawkd image into the host Docker daemon, loads it into the node when
+# the provisioner is the kind-based one whose containerd does not share the
+# host store (one `docker save` + a privileged node-debug pod + `ctr images
+# import`; never a registry push), helm-installs the chart with values-local
+# overriding the image to the local build, `rollout restart`s the deployment
+# (an unchanged manifest triggers no rollout, so a rebuilt image would never be
+# scheduled), waits for the rollout, then opens a port-forward and gates on
+# /healthz — the authoritative readiness signal (rollout status can report
+# available before the post-install migrate Job finishes; fishhawkd only
+# answers healthy after its own startup completes). After the listener identity
+# check it runs the fail-closed IMAGE identity gate
+# (_verify_k8s_image_identity): the pod's running image ID must equal the
+# image this bring-up built AND /healthz git_sha must equal the stamped build
+# SHA; the single escape hatch is FISHHAWK_K8S_SKIP_IDENTITY=1 (loud warning).
 # Fails loud (kubectl logs + pods tail, non-zero exit) on a stuck rollout or a
 # /healthz timeout, mirroring cmd_up's readiness-gate contract. This is the
 # operator smoke test for the chart — not exercised in CI (no cluster).
@@ -2436,6 +2811,9 @@ cmd_post_merge() {
 # policy and both of its refusal conditions live in _k8s_jaeger_decide).
 cmd_k8s_up() {
   print "k8s: starting"
+  # Function-scoped EXIT trap (fires on normal return AND on every `exit 1`
+  # leg below): deletes the retained node-debug pods + any leftover tarball.
+  trap '_k8s_up_cleanup' EXIT
 
   # Load .env first (mirrors cmd_up / cmd_preview) so the FISHHAWK_K8S_* port
   # overrides can live there rather than only in the invoking shell.
@@ -2473,8 +2851,42 @@ cmd_k8s_up() {
     print "  with FISHHAWK_K8S_PF_PORT=${pf_port}, add --set config.oauthCallbackUrl=http://localhost:${pf_port}/v0/auth/github/callback for OAuth sign-in"
   fi
 
+  # Provisioner detection BEFORE the build (fail fast, #2917 preflight
+  # discipline). `unknown` is REFUSED: the bring-up cannot tell whether the
+  # image it is about to build will ever reach the kubelet, and proceeding is
+  # exactly the silently-stale outcome #3344 reports. The only way past is the
+  # single escape hatch, which also skips the identity gate.
+  local nodes provisioner
+  nodes="$(kubectl get nodes -o name 2>/dev/null || true)"
+  provisioner="$(_k8s_image_store_shared "$nodes")"
+  if [[ "$provisioner" == "unknown" ]]; then
+    if _k8s_identity_skipped; then
+      print -u2 "warning: FISHHAWK_K8S_SKIP_IDENTITY=1 — provisioner unknown (nodes: ${${nodes//$'\n'/ }:-<none>}), image NOT loaded into the node, identity NOT verified"
+    else
+      print -u2 "error: cannot tell whether this cluster shares the host image store — nodes: ${${nodes//$'\n'/ }:-<none>} (expected node/docker-desktop or a kind-style *-control-plane)"
+      print -u2 "  fix: point kubectl at the Docker Desktop cluster, or set FISHHAWK_K8S_SKIP_IDENTITY=1 to proceed unverified"
+      exit 1
+    fi
+  fi
+
+  # One build SHA for BOTH the image stamp and the identity corroboration, so a
+  # tree that turns dirty between the build and the check cannot produce a
+  # spurious git_sha mismatch.
+  local build_sha
+  build_sha="$(_dev_git_sha)"
+
   print "building image $(_k8s_image_ref)..."
-  (cd "${REPO_ROOT}" && docker build --build-arg GIT_SHA="$(_dev_git_sha)" -t "$(_k8s_image_ref)" -f backend/Dockerfile .)
+  (cd "${REPO_ROOT}" && docker build --build-arg GIT_SHA="$build_sha" -t "$(_k8s_image_ref)" -f backend/Dockerfile .)
+
+  case "$provisioner" in
+    shared)
+      print "image store shared with the host daemon (node docker-desktop) — no load needed" ;;
+    isolated)
+      if ! _k8s_load_image "$(_k8s_image_ref)" ${(f)"$(_k8s_node_names "$nodes")"}; then
+        print -u2 "error: could not load $(_k8s_image_ref) into the cluster node(s) — the kubelet would otherwise reuse a stale dev-local image (#3344)"
+        exit 1
+      fi ;;
+  esac
 
   print "helm upgrade --install fishhawk..."
   # Catch the helm failure ourselves: a hook Job whose pod cannot pull its image
@@ -2489,6 +2901,15 @@ cmd_k8s_up() {
     --set image.pullPolicy=IfNotPresent; then
     print -u2 "error: helm upgrade --install fishhawk failed — a hook Job that cannot pull its image reports only a Helm timeout here"
     _k8s_dump_hook_diagnostics
+    exit 1
+  fi
+
+  # An UNCHANGED rendered manifest (same tag, same values) triggers no rollout,
+  # so a rebuilt image would never be scheduled and the old pod would keep
+  # serving — restart unconditionally (#3344). On a fresh install this costs
+  # one extra rollout.
+  if ! kubectl rollout restart deployment/fishhawk; then
+    print -u2 "error: kubectl rollout restart deployment/fishhawk failed — the rebuilt image cannot be scheduled"
     exit 1
   fi
 
@@ -2535,6 +2956,20 @@ cmd_k8s_up() {
     kill "$pf_pid" 2>/dev/null || true
     rm -f "$K8S_PF_PID_FILE"
     exit 1
+  fi
+
+  # Image identity gate (#3344): a healthy listener that IS our forward still
+  # proves nothing about WHICH image answers. Fail closed on any mismatch or
+  # unresolvable identity; the single escape hatch warns loudly.
+  if _k8s_identity_skipped; then
+    print -u2 "warning: FISHHAWK_K8S_SKIP_IDENTITY=1 — the deployed image was NOT verified against this build;"
+    print -u2 "  a green bring-up does NOT mean the cluster runs the working tree (#3344)"
+  else
+    if ! _verify_k8s_image_identity "$(_k8s_healthz_url "$pf_port")" "$build_sha" "$(_k8s_image_ref)" "$provisioner"; then
+      kill "$pf_pid" 2>/dev/null || true
+      rm -f "$K8S_PF_PID_FILE"
+      exit 1
+    fi
   fi
 
   print "fishhawkd reachable at $(_k8s_healthz_url "$pf_port") (port-forward pid ${pf_pid})"
@@ -3390,8 +3825,11 @@ _usage() {
   print -u2 "  readiness on /healthz echoing the stamped git_sha; preview-down tears it"
   print -u2 "  down. This is the acceptance-stage provisioning hook (E31.18 / #1569)."
   print -u2 ""
-  print -u2 "  k8s builds the fishhawkd image, helm-installs the chart with values-local"
-  print -u2 "  against the Docker-Desktop cluster, and gates on /healthz; k8s-down kills"
+  print -u2 "  k8s builds the fishhawkd image, loads it into the node when Docker Desktop's"
+  print -u2 "  kind-based provisioner does not share the host image store, helm-installs"
+  print -u2 "  the chart with values-local, restarts the rollout, gates on /healthz, then"
+  print -u2 "  verifies the pod's image ID + git_sha against the build (fail-closed;"
+  print -u2 "  FISHHAWK_K8S_SKIP_IDENTITY=1 is the only bypass, #3344); k8s-down kills"
   print -u2 "  the port-forward and helm-uninstalls. See docs/deploy/kubernetes.md."
   print -u2 ""
   print -u2 "  Set FISHHAWK_DEV_TLS=1 in .env to add an opt-in loopback-only TLS front end"
