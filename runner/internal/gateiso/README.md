@@ -96,11 +96,31 @@ a refused connection are all `Local=false` with a named reason.
 `ContainerSpec.BuildArgv(MountPolicy)` renders exactly:
 
 ```
-<docker|podman> run --rm --name fishhawk-gate-<hex> --network=none --cap-drop=ALL
+<docker --host | podman --url> unix://<validated socket>
+  run --rm --name fishhawk-gate-<hex> --network=none --cap-drop=ALL
   --security-opt=no-new-privileges --workdir /work (--user <uid>:<gid> | --userns=keep-id)
   -v <checkout>:/work -v <gocache>:/gocache -v <gomodcache>:/gomodcache -v <lintcache>:/lintcache
   -e K=V … --entrypoint '' <image> <argv…>
 ```
+
+- **The validated endpoint is BOUND to every invocation.** `DetectRuntime`
+  validates the endpoint once, at selection, but the CLI re-resolves its
+  endpoint on EVERY invocation from mutable state (`docker context use`,
+  `~/.docker/config.json`, `DOCKER_HOST`/`DOCKER_CONTEXT`,
+  `CONTAINER_HOST`/`CONTAINER_CONNECTION`, `containers.conf`), so a context
+  switch between two gates would otherwise send the next bind-mount request to
+  a daemon nobody validated. `Runtime.EndpointArgs` renders the global
+  endpoint flag (`docker --host unix://<socket>` / `podman --url
+  unix://<socket>`, which overrides both the context store and the
+  environment) between the binary and the subcommand of BOTH `BuildArgv` and
+  `KillArgv`; `Runtime.BindEndpointEnv(base)` drops the four override
+  variables from the CLI's env and re-pins `DOCKER_HOST` / `CONTAINER_HOST`
+  to the same socket; a `Runtime` with no `SocketPath` renders NOTHING
+  (`ErrContainerSpec`). Pinned by `TestBuildArgv_EndpointBindingPrecedesRun`,
+  `TestBindEndpointEnv_DropsOverridesAndPins`, the runner-seam
+  `TestRunGateInContainer_EndpointBoundAfterSelection` (selection recorded,
+  THEN `DOCKER_HOST`/`DOCKER_CONTEXT` redirected, run + rm still bound) and
+  the live fixture (l) `TestGateContainer_EndpointBoundAcrossContextSwitch`.
 
 - **Four mounts, nothing else.** The checkout at `/work` (the working
   directory) and the three per-exec throwaway caches. No socket, no `/run`, no
@@ -113,10 +133,12 @@ a refused connection are all `Local=false` with a named reason.
 - **Rootless podman gets `--userns=keep-id`; everything else `--user uid:gid`**
   so bind-mount writes are owned by the runner user on Linux
   (`TestGateContainer_LinuxOwnership`).
-- **`KillArgv` = `<runtime> rm -f <name>`.** Killing the runtime CLI does not
-  stop the container, so the runner runs this on a detached, bounded context
-  whenever the exec returned -1 (`TestGateContainer_TimeoutKillsContainer`
-  goes red without it).
+- **`KillArgv` = `<runtime> (--host|--url) unix://<socket> rm -f <name>`.**
+  Killing the runtime CLI does not stop the container, so the runner runs this
+  on a detached, bounded context whenever the exec returned -1
+  (`TestGateContainer_TimeoutKillsContainer` goes red without it), under the
+  same endpoint binding as the run — cleanup reaches the daemon that ran the
+  container and no other.
 
 **The resolved-path socket-mount guard.** `ForbidSocketMounts(policy, sources…)`
 runs over every source BEFORE any `-v` token is emitted and returns the refusal
@@ -144,9 +166,10 @@ container: only `TZ`/`LANG`/`TERM`, `LC_*`, `CGO_*` and `GO*` survive, then
 `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` are appended drop-then-append, then the
 runner's `extraEnv` entries drop-then-append so a caller-supplied value wins.
 The RUNNER's own inherited environment goes to the runtime CLI (it needs
-`DOCKER_HOST` / `DOCKER_CONTEXT` / `CONTAINER_HOST` / `PATH`); the sanitized
-env crosses into the container via `-e` only
-(`TestGateContainer_EnvAllowList`).
+`PATH` and its config dir) with the endpoint BOUND (`BindEndpointEnv`:
+`DOCKER_HOST` / `DOCKER_CONTEXT` / `CONTAINER_HOST` / `CONTAINER_CONNECTION`
+dropped, the validated socket re-pinned); the sanitized env crosses into the
+container via `-e` only (`TestGateContainer_EnvAllowList`).
 
 ## The throwaway clone (`clone.go`)
 
@@ -206,16 +229,41 @@ directories (`NewVisibleCaches`: `fishhawk-gatecache-*` under the OS temp dir,
 one exec, and removed afterwards. Host seeding never opens a directory a
 container has been given.
 
-- `SeedModCache(ctx, run, checkout, hostModCache, dest, timeout)`
+- `SeedModCache(ctx, run, checkout, hostModCache, dest, baseEnv, timeout)`
   (1) REFUSES with `ErrDestinationNotEmpty` when `dest.GoModCache` already has
   entries — the invariant's control, so a destination a container has touched
   is never re-seeded; (2) skips when the checkout has no `go.mod`/`go.work` or
-  no `go` binary; (3) runs `go mod download all` with `GOMODCACHE=dest`,
-  `GOFLAGS=-mod=mod -modcacherw` and
-  `GOPROXY=file://<hostModCache>/cache/download,<host GOPROXY | https://proxy.golang.org>,direct`
+  no `go` binary; (3) REFUSES with `ErrSeedCheckout`, BEFORE any go process
+  runs, when the checkout's module metadata would let the host-side seed read
+  or write outside the checkout — `go.mod` / `go.sum` / `go.work` /
+  `go.work.sum` that is a symlink or not a regular file, a `go.work` `use`
+  directory or a directory `replace` target (in `go.work` or in any workspace
+  module's `go.mod`) resolving outside the `EvalSymlinks`-resolved checkout, or
+  a metadata file that does not parse; (4) runs `go mod download all` under
+  `baseEnv` — the runner passes its SANITIZED gate env (`sanitizedGateEnv`,
+  ADR-029), never `os.Environ()`, so no runner credential reaches the go
+  process — with `GOMODCACHE=dest`, a throwaway `GOCACHE`/`GOPATH` under the
+  cache root, `GOFLAGS=-mod=mod -modcacherw`, `GOTOOLCHAIN=local` (an
+  untrusted `go`/`toolchain` directive fails the seed by name instead of
+  downloading and executing a toolchain), `GOWORK` bound to the checkout's own
+  `go.work` or `off` (no parent-directory walk),
+  `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null`, `GIT_TERMINAL_PROMPT=0` and
+  `GOPROXY=file://<hostModCache>/cache/download,<baseEnv GOPROXY | https://proxy.golang.org,direct>`
   — the host cache is a READ-ONLY proxy source, so every module already on the
   host is copied into the destination and only genuinely new modules reach the
-  network (during seeding; the container itself runs `GOPROXY=off`).
+  network (during seeding; the container itself runs `GOPROXY=off`). The
+  `go env GOMODCACHE` probe (when `hostModCache` is empty) runs in the cache
+  root, NOT in the checkout, under `GOTOOLCHAIN=local` + `GOWORK=off`.
+  External-canary fixtures: `TestSeedModCache_RefusesMetadataReachingOutsideCheckout`
+  (every hostile-metadata row refused with the exec seam never reached and the
+  host canary untouched), `TestSeedModCache_LiveGoSumSymlinkNeverWrittenThrough`
+  (the REAL go: without the guard it reads THROUGH the planted `go.sum` link),
+  `TestSeedModCache_EnvIsBaseEnvPlusPinsNeverProcessEnv`, and the runner-seam
+  `TestRunGateInContainer_SeedUnderSanitizedEnvRefusesHostileMetadata`.
+  **Residual, stated:** `GOTOOLCHAIN=local` means a checkout whose `go.mod`
+  requires a newer Go than the runner host has fails the seed with a named
+  error rather than auto-downloading — accepted over a toolchain
+  download-and-exec driven by untrusted metadata.
 - `GOCACHE` has NO seed: a cold build cache per container exec.
 - `VisibleCaches.Remove` is SYMLINK-SAFE (approval condition 2 of #2134): the
   chmod walk examines every entry with Lstat semantics, SKIPS (unlink-only) any
@@ -280,6 +328,7 @@ docker-present-but-image-unpullable) is a loud failure, not a green.
 | (f) `TestGateContainer_TimeoutKillsContainer` | `sleep 60` at a scaled 2s timeout → -1 within the bound and `ps -a` no longer lists the container |
 | (g) `TestGateContainer_LinuxOwnership` | `id -u` is the runner's uid; on Linux a written file is owned by `os.Getuid()` |
 | (k) `TestGateContainer_CacheSymlinkNeverReachesHost` | the cache invariant + symlink-safe cleanup, above |
+| (l) `TestGateContainer_EndpointBoundAcrossContextSwitch` | selection recorded against the real socket, THEN `DOCKER_HOST`/`CONTAINER_HOST` redirected to an unreachable tcp endpoint and `DOCKER_CONTEXT`/`CONTAINER_CONNECTION` to a nonexistent context → the gate still runs on the validated daemon; the argv opens with the binding; the CLI env pins the validated socket with the redirecting variables dropped |
 | (h) `TestGateClone_PlantedRefNeverReachesPrimary` | clone path: plant never reaches the primary, lock path injected; the `git worktree add` sibling DOES leak the plant |
 | (i) `TestGateCloneSandbox_NoNetwork` | Linux-only: a loopback connect fails under `clone-sandbox` through `runBoundedGateCommand` and succeeds under the host-exec control |
 | (j) `TestGateHosted_RefusesEndToEnd` | hosted + auto with a REALLY detected runtime whose endpoint is pinned remote (`DOCKER_HOST=tcp://…` via the Getenv probe) → single-shot gate category C, fix loop category C, fix agent never invoked, verify command never ran |

@@ -85,6 +85,11 @@ var gateIsolation *gateIsolationState
 // execBoundedHostArgv.
 var execBoundedHostArgvFn = execBoundedHostArgv
 
+// seedModCacheFn is the host-side module-cache seed the container path runs
+// (gateiso.SeedModCache). A package var SOLELY so a test can capture the
+// environment the seed is handed; production leaves it gateiso.SeedModCache.
+var seedModCacheFn = gateiso.SeedModCache
+
 // dockerFixturesEligible / dockerFixturesRan are the end-to-end fixture
 // sentinel (gateisolation_e2e_test.go increments Ran at the END of every
 // docker-gated fixture; main_test.go's TestMain fails the binary when a
@@ -212,13 +217,22 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 }
 
 // runGateInContainer is the container branch of runBoundedGateArgv: fresh
-// empty visible caches, host-side module-cache seed, argv build under the
-// resolved-path mount guard, exec through the host seam with the RUNNER's
-// inherited environment (the runtime CLI needs DOCKER_HOST / DOCKER_CONTEXT /
-// CONTAINER_HOST / PATH; the SANITIZED gate env crosses into the container via
-// -e only), and `rm -f` on a detached context when the exec returned -1
-// (killing the CLI does not stop the container). Every failure before the
-// exec returns -1 WITHOUT executing.
+// empty visible caches, host-side module-cache seed run under the SANITIZED
+// gate env (never the runner's inherited environment — no runner credential
+// reaches the `go mod download`, and the checkout's module metadata is
+// refused before any go process runs when it would reach outside the
+// checkout), argv build under the resolved-path mount guard, exec through
+// the host seam with the RUNNER's inherited environment BOUND to the
+// validated endpoint (the runtime CLI needs PATH and its config dir from the
+// inherited env; DOCKER_HOST / DOCKER_CONTEXT / CONTAINER_HOST /
+// CONTAINER_CONNECTION are dropped and the selection's socket re-pinned, and
+// the argv carries the same binding as a global flag, so a docker-context
+// switch between gates cannot redirect a bind-mount request to a daemon the
+// selection never validated; the SANITIZED gate env crosses into the
+// container via -e only), and `rm -f` — under the same binding — on a
+// detached context when the exec returned -1 (killing the CLI does not stop
+// the container). Every failure before the exec returns -1 WITHOUT
+// executing.
 func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []string, dir, lintCacheDir string, sanitizedEnv, extraEnv []string, timeout time.Duration) (string, int) {
 	st := gateIsolation
 	vc, err := gateiso.NewVisibleCaches()
@@ -226,7 +240,7 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		return "gate container: " + err.Error(), -1
 	}
 	defer func() { _ = vc.Remove() }()
-	if _, err := gateiso.SeedModCache(ctx, nil, dir, "", vc, gateSeedTimeout); err != nil {
+	if _, err := seedModCacheFn(ctx, nil, dir, "", vc, sanitizedEnv, gateSeedTimeout); err != nil {
 		return "gate container: seed module cache: " + err.Error(), -1
 	}
 	if err := os.MkdirAll(lintCacheDir, 0o700); err != nil {
@@ -255,11 +269,18 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	if err != nil {
 		return "gate container: " + err.Error(), -1
 	}
-	out, code := execBoundedHostArgvFn(ctx, runArgv, dir, os.Environ(), timeout)
+	// The runtime CLI's env is the runner's inherited environment with the
+	// endpoint bound to the socket the selection validated (concern: a
+	// context switch after selection must not redirect launch or cleanup).
+	cliEnv, err := sel.Runtime.BindEndpointEnv(os.Environ())
+	if err != nil {
+		return "gate container: " + err.Error(), -1
+	}
+	out, code := execBoundedHostArgvFn(ctx, runArgv, dir, cliEnv, timeout)
 	if code == -1 {
 		killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), diffCoverageCleanupTimeout)
 		defer cancel()
-		_, _ = execBoundedHostArgvFn(killCtx, spec.KillArgv(), dir, os.Environ(), diffCoverageCleanupTimeout)
+		_, _ = execBoundedHostArgvFn(killCtx, spec.KillArgv(), dir, cliEnv, diffCoverageCleanupTimeout)
 	}
 	return out, code
 }

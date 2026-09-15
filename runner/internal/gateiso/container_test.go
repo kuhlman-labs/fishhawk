@@ -43,7 +43,15 @@ func newMounts(t *testing.T) mountSet {
 	return m
 }
 
+// testSock is the validated daemon socket every rendered spec binds to; it
+// need not exist for BuildArgv (ForbidSocketMounts keeps an unresolvable
+// DaemonSocket literal).
+const testSock = "/nonexistent/daemon.sock"
+
 func specFor(m mountSet, rt Runtime) ContainerSpec {
+	if rt.SocketPath == "" && rt.Kind != KindNone {
+		rt.SocketPath = testSock
+	}
 	return ContainerSpec{
 		Runtime: rt, Image: "docker.io/alpine/git:v2.47.2", Name: "fishhawk-gate-0a1b2c3d4e5f",
 		Checkout: m.checkout, GoCache: m.gocache, GoModCache: m.gomod, LintCache: m.lint,
@@ -69,7 +77,7 @@ func TestBuildArgv_Golden(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := append([]string{"docker", "run", "--rm", "--name", "fishhawk-gate-0a1b2c3d4e5f"}, common...)
+		want := append([]string{"docker", "--host", "unix://" + testSock, "run", "--rm", "--name", "fishhawk-gate-0a1b2c3d4e5f"}, common...)
 		want = append(want, "--user", "501:20")
 		want = append(want, mounts...)
 		if !reflect.DeepEqual(got, want) {
@@ -81,7 +89,7 @@ func TestBuildArgv_Golden(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := append([]string{"podman", "run", "--rm", "--name", "fishhawk-gate-0a1b2c3d4e5f"}, common...)
+		want := append([]string{"podman", "--url", "unix://" + testSock, "run", "--rm", "--name", "fishhawk-gate-0a1b2c3d4e5f"}, common...)
 		want = append(want, "--userns=keep-id")
 		want = append(want, mounts...)
 		if !reflect.DeepEqual(got, want) {
@@ -173,11 +181,87 @@ func TestBuildArgv_RefusedMountReturnsNoArgv(t *testing.T) {
 	}
 }
 
+// TestBuildArgv_EndpointBindingPrecedesRun pins the endpoint binding: the
+// runtime's global endpoint flag carries the VALIDATED socket and sits
+// between the binary and `run` (a global flag after the subcommand is a
+// `run` option the CLI rejects), KillArgv carries the same binding, and a
+// Runtime with no validated SocketPath renders NOTHING — so a later docker
+// context switch cannot redirect a bind-mount request. Deleting the
+// EndpointArgs call in BuildArgv or KillArgv turns this red.
+func TestBuildArgv_EndpointBindingPrecedesRun(t *testing.T) {
+	m := newMounts(t)
+	policy := MountPolicy{Permitted: []string{m.root}}
+	for _, tc := range []struct {
+		rt   Runtime
+		flag string
+	}{
+		{Runtime{Kind: KindDocker, Safe: true, SocketPath: "/tmp/validated/docker.sock"}, "--host"},
+		{Runtime{Kind: KindPodman, Safe: true, Rootless: true, SocketPath: "/tmp/validated/podman.sock"}, "--url"},
+	} {
+		spec := specFor(m, tc.rt)
+		got, err := spec.BuildArgv(policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "unix://" + tc.rt.SocketPath
+		f, r := idx(got, tc.flag), idx(got, "run")
+		if f != 1 || got[2] != want || r != 3 {
+			t.Errorf("%s: argv must open <bin> %s %s run, got %q", tc.rt.Kind, tc.flag, want, got[:4])
+		}
+		if n := strings.Count(strings.Join(got, "\x00"), want); n != 1 {
+			t.Errorf("%s: the socket must appear exactly once (the binding), %d times in %q", tc.rt.Kind, n, got)
+		}
+		kill := spec.KillArgv()
+		if wantKill := []string{string(tc.rt.Kind), tc.flag, want, "rm", "-f", spec.Name}; !reflect.DeepEqual(kill, wantKill) {
+			t.Errorf("%s: KillArgv = %q, want %q", tc.rt.Kind, kill, wantKill)
+		}
+	}
+	unbound := specFor(m, Runtime{Kind: KindDocker, Safe: true})
+	unbound.Runtime.SocketPath = ""
+	if got, err := unbound.BuildArgv(policy); !errors.Is(err, ErrContainerSpec) || got != nil || !strings.Contains(err.Error(), "socket path") {
+		t.Errorf("no SocketPath: got %q, %v; want ErrContainerSpec naming the socket path", got, err)
+	}
+	if got := unbound.KillArgv(); got != nil {
+		t.Errorf("no SocketPath: KillArgv = %q, want nil", got)
+	}
+}
+
+// TestBindEndpointEnv_DropsOverridesAndPins: every variable through which
+// the CLI's endpoint could be redirected is dropped from the base env and the
+// validated socket re-pinned; the process environment is never consulted.
+func TestBindEndpointEnv_DropsOverridesAndPins(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://process-env.invalid:2375")
+	base := []string{"PATH=/usr/bin", "DOCKER_HOST=tcp://10.0.0.5:2376", "DOCKER_CONTEXT=remote",
+		"CONTAINER_HOST=ssh://core@machine", "CONTAINER_CONNECTION=machine", "HOME=/home/r", "DOCKER_CONFIG=/home/r/.docker"}
+	for _, tc := range []struct {
+		rt  Runtime
+		pin string
+	}{
+		{Runtime{Kind: KindDocker, SocketPath: "/tmp/v/docker.sock"}, "DOCKER_HOST=unix:///tmp/v/docker.sock"},
+		{Runtime{Kind: KindPodman, SocketPath: "/tmp/v/podman.sock"}, "CONTAINER_HOST=unix:///tmp/v/podman.sock"},
+	} {
+		got, err := tc.rt.BindEndpointEnv(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"PATH=/usr/bin", "HOME=/home/r", "DOCKER_CONFIG=/home/r/.docker", tc.pin}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: env = %q, want %q", tc.rt.Kind, got, want)
+		}
+	}
+	for _, rt := range []Runtime{{Kind: KindDocker}, {Kind: KindNone, SocketPath: "/tmp/v/s"}} {
+		if got, err := rt.BindEndpointEnv(base); !errors.Is(err, ErrContainerSpec) || got != nil {
+			t.Errorf("%+v: got %q, %v; want ErrContainerSpec", rt, got, err)
+		}
+	}
+}
+
 func TestBuildArgv_IncompleteSpec(t *testing.T) {
 	m := newMounts(t)
 	base := specFor(m, Runtime{Kind: KindDocker, Safe: true})
 	mutations := map[string]func(s *ContainerSpec){
 		"no runtime":  func(s *ContainerSpec) { s.Runtime = Runtime{Kind: KindNone} },
+		"no socket":   func(s *ContainerSpec) { s.Runtime.SocketPath = "" },
 		"no image":    func(s *ContainerSpec) { s.Image = "" },
 		"no name":     func(s *ContainerSpec) { s.Name = "" },
 		"no argv":     func(s *ContainerSpec) { s.Argv = nil },
@@ -195,8 +279,8 @@ func TestBuildArgv_IncompleteSpec(t *testing.T) {
 }
 
 func TestKillArgv(t *testing.T) {
-	s := ContainerSpec{Runtime: Runtime{Kind: KindPodman}, Name: "fishhawk-gate-abc"}
-	if got := s.KillArgv(); !reflect.DeepEqual(got, []string{"podman", "rm", "-f", "fishhawk-gate-abc"}) {
+	s := ContainerSpec{Runtime: Runtime{Kind: KindPodman, SocketPath: "/run/user/501/podman/podman.sock"}, Name: "fishhawk-gate-abc"}
+	if got := s.KillArgv(); !reflect.DeepEqual(got, []string{"podman", "--url", "unix:///run/user/501/podman/podman.sock", "rm", "-f", "fishhawk-gate-abc"}) {
 		t.Fatalf("KillArgv = %q", got)
 	}
 }

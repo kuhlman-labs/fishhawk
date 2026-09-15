@@ -286,9 +286,10 @@ func TestRunBoundedGateCommand_ContainerRefusesSocketInCheckout(t *testing.T) {
 }
 
 // TestRunGateInContainer_ArgvAndTimeoutKill: the container path hands the
-// runtime CLI a BuildArgv line (entrypoint reset precedes the image, the
-// checkout is mounted at /work, GOPROXY=off crosses via -e) and a -1 from the
-// exec triggers `rm -f <name>` (deleting the KillArgv call turns this red).
+// runtime CLI a BuildArgv line (endpoint binding opens it, entrypoint reset
+// precedes the image, the checkout is mounted at /work, GOPROXY=off crosses
+// via -e) and a -1 from the exec triggers `rm -f <name>` under the same
+// binding (deleting the KillArgv call turns this red).
 func TestRunGateInContainer_ArgvAndTimeoutKill(t *testing.T) {
 	dir := t.TempDir()
 	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
@@ -301,8 +302,8 @@ func TestRunGateInContainer_ArgvAndTimeoutKill(t *testing.T) {
 		t.Fatalf("seam calls = %d, want run + rm -f: %q", len(*calls), *calls)
 	}
 	run := (*calls)[0]
-	if run[0] != "docker" || run[1] != "run" {
-		t.Errorf("argv[0..1] = %q, want docker run", run[:2])
+	if strings.Join(run[:4], " ") != "docker --host unix:///nonexistent/daemon.sock run" {
+		t.Errorf("argv[0..3] = %q, want docker --host unix:///nonexistent/daemon.sock run", run[:4])
 	}
 	joined := strings.Join(run, " ")
 	for _, want := range []string{"--network=none", "--entrypoint  img:1 sh -c sleep 60", "-v " + dir + ":/work", "-e GOPROXY=off"} {
@@ -310,9 +311,135 @@ func TestRunGateInContainer_ArgvAndTimeoutKill(t *testing.T) {
 			t.Errorf("argv %q lacks %q", joined, want)
 		}
 	}
-	name := run[4]
-	if kill := (*calls)[1]; strings.Join(kill, " ") != "docker rm -f "+name {
-		t.Errorf("kill argv = %q, want docker rm -f %s", kill, name)
+	name := run[6]
+	if kill := (*calls)[1]; strings.Join(kill, " ") != "docker --host unix:///nonexistent/daemon.sock rm -f "+name {
+		t.Errorf("kill argv = %q, want docker --host unix:///nonexistent/daemon.sock rm -f %s", kill, name)
+	}
+}
+
+// captureHostExecEnv is captureHostExec recording the ENV each seam call was
+// handed alongside its argv.
+func captureHostExecEnv(t *testing.T, code int) *[][2][]string {
+	t.Helper()
+	prev := execBoundedHostArgvFn
+	var calls [][2][]string
+	execBoundedHostArgvFn = func(_ context.Context, argv []string, _ string, env []string, _ time.Duration) (string, int) {
+		calls = append(calls, [2][]string{append([]string(nil), argv...), append([]string(nil), env...)})
+		return "captured", code
+	}
+	t.Cleanup(func() { execBoundedHostArgvFn = prev })
+	return &calls
+}
+
+// TestRunGateInContainer_EndpointBoundAfterSelection pins the endpoint
+// binding at the runner seam: the selection is recorded against socket S,
+// THEN the runtime configuration changes (DOCKER_HOST → a remote tcp
+// endpoint, DOCKER_CONTEXT → another context — the `docker context use`
+// shape between two gates), and BOTH the run and the rm the runner launches
+// still carry `--host unix://S` in argv and `DOCKER_HOST=unix://S` in env
+// with the redirecting variables dropped. Deleting BindEndpointEnv in
+// runGateInContainer (passing os.Environ()) turns the env half red; deleting
+// EndpointArgs in BuildArgv/KillArgv turns the argv half red.
+func TestRunGateInContainer_EndpointBoundAfterSelection(t *testing.T) {
+	const sock = "/nonexistent/validated.sock"
+	st := containerState("img:1", sock, io.Discard)
+	installGateState(t, st)
+	if sel := st.selection(context.Background()); sel.Path != gateiso.PathContainer || sel.Runtime.SocketPath != sock {
+		t.Fatalf("selection = %+v", sel)
+	}
+	// Runtime configuration changes AFTER the validated selection.
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2376")
+	t.Setenv("DOCKER_CONTEXT", "remote")
+	t.Setenv("CONTAINER_HOST", "ssh://core@machine")
+	t.Setenv("CONTAINER_CONNECTION", "machine")
+	calls := captureHostExecEnv(t, -1)
+	_, code := runBoundedGateCommand(context.Background(), "true", t.TempDir(), filepath.Join(t.TempDir(), "lc"), time.Second)
+	if code != -1 || len(*calls) != 2 {
+		t.Fatalf("exit %d, seam calls %d; want -1 with run + rm", code, len(*calls))
+	}
+	for i, what := range []string{"run", "rm"} {
+		argv, env := (*calls)[i][0], (*calls)[i][1]
+		if argv[0] != "docker" || argv[1] != "--host" || argv[2] != "unix://"+sock || argv[3] != what {
+			t.Errorf("%s argv not bound to the validated socket: %q", what, argv[:4])
+		}
+		bound := false
+		for _, kv := range env {
+			k, v, _ := strings.Cut(kv, "=")
+			switch k {
+			case "DOCKER_HOST":
+				if v != "unix://"+sock {
+					t.Errorf("%s env DOCKER_HOST=%q, want unix://%s", what, v, sock)
+				}
+				bound = true
+			case "DOCKER_CONTEXT", "CONTAINER_HOST", "CONTAINER_CONNECTION":
+				t.Errorf("%s env carries redirecting variable %s", what, kv)
+			}
+		}
+		if !bound {
+			t.Errorf("%s env lacks DOCKER_HOST=unix://%s: %q", what, sock, env)
+		}
+	}
+}
+
+// TestRunGateInContainer_SeedUnderSanitizedEnvRefusesHostileMetadata pins
+// the seed half of the container path at the runner seam: (1) the seed is
+// handed the SANITIZED gate env — a runner credential set in the process
+// environment is absent from it — never os.Environ(); (2) a checkout whose
+// go.sum is a symlink to a host canary is REFUSED by the real
+// gateiso.SeedModCache before the runtime CLI is reached, and the canary is
+// untouched.
+func TestRunGateInContainer_SeedUnderSanitizedEnvRefusesHostileMetadata(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not on PATH")
+	}
+	secret := "seed-canary-" + fmt.Sprint(os.Getpid())
+	t.Setenv("FISHHAWK_GITHUB_TOKEN", secret)
+	t.Setenv("ANTHROPIC_API_KEY", secret)
+	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+
+	var seedEnv []string
+	prev := seedModCacheFn
+	seedModCacheFn = func(ctx context.Context, run gateiso.SeedExecFunc, checkout, host string, dest *gateiso.VisibleCaches, baseEnv []string, timeout time.Duration) (gateiso.SeedReport, error) {
+		seedEnv = append([]string(nil), baseEnv...)
+		return prev(ctx, run, checkout, host, dest, baseEnv, timeout)
+	}
+	t.Cleanup(func() { seedModCacheFn = prev })
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	canary := filepath.Join(t.TempDir(), "canary")
+	if err := os.WriteFile(canary, []byte("canary\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(canary, filepath.Join(dir, "go.sum")); err != nil {
+		t.Fatal(err)
+	}
+	calls := captureHostExec(t, true, 0)
+	out, code := runBoundedGateCommand(context.Background(), "true", dir, filepath.Join(t.TempDir(), "lc"), time.Minute)
+	if code != -1 || !strings.Contains(out, "seed module cache") || !strings.Contains(out, "go.sum is not a regular file") {
+		t.Errorf("exit %d out %q; want -1 with the ErrSeedCheckout refusal naming go.sum", code, out)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("runtime CLI reached despite the refused seed: %q", *calls)
+	}
+	if b, _ := os.ReadFile(canary); string(b) != "canary\n" {
+		t.Errorf("canary changed: %q", b)
+	}
+	if seedEnv == nil {
+		t.Fatal("seed never invoked")
+	}
+	for _, kv := range seedEnv {
+		k, v, _ := strings.Cut(kv, "=")
+		if v == secret || k == "FISHHAWK_GITHUB_TOKEN" || k == "ANTHROPIC_API_KEY" {
+			t.Errorf("runner credential reached the seed env: %s", k)
+		}
+	}
+	for _, want := range []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null"} {
+		if !containsString(seedEnv, want) {
+			t.Errorf("seed env is not the sanitized gate env (lacks %s): %q", want, seedEnv)
+		}
 	}
 }
 

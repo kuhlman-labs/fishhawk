@@ -147,16 +147,28 @@ func recordHostExec(t *testing.T) *[][]string {
 }
 
 // containerRunArgv returns the first `run` invocation recorded by
-// recordHostExec.
+// recordHostExec (the subcommand follows the binary and its endpoint
+// binding pair: `<bin> --host|--url unix://<socket> run …`).
 func containerRunArgv(t *testing.T, calls [][]string) []string {
 	t.Helper()
 	for _, c := range calls {
-		if len(c) > 2 && c[1] == "run" {
+		if len(c) > 4 && c[3] == "run" {
 			return c
 		}
 	}
 	t.Fatalf("no `run` argv recorded: %q", calls)
 	return nil
+}
+
+// endpointBindingValue returns the value of the runtime argv's endpoint
+// binding flag (`--host` for docker, `--url` for podman), "" when absent.
+func endpointBindingValue(argv []string) string {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == "--host" || argv[i] == "--url" {
+			return argv[i+1]
+		}
+	}
+	return ""
 }
 
 // runtimeArgvBeforeImage returns the runtime-side tokens of a BuildArgv line:
@@ -374,10 +386,20 @@ func TestGateContainer_NoDaemonSocket(t *testing.T) {
 	}
 	// Only the RUNTIME-side tokens (everything before the image) are scanned:
 	// the gate command after the image is this fixture's own text and names
-	// the socket paths it probes for.
+	// the socket paths it probes for. The ONE legitimate socket token is the
+	// endpoint binding value (`--host`/`--url unix://<validated socket>`),
+	// which tells the CLI where to CONNECT; it is asserted equal to the
+	// validated socket and excluded from the mount scan — no other token,
+	// and no -v source, may name a socket.
 	run := containerRunArgv(t, *calls)
+	if got, want := endpointBindingValue(run), "unix://"+rt.SocketPath; got != want {
+		t.Errorf("endpoint binding = %q, want %q (the validated socket)", got, want)
+	}
 	runtimeSide := runtimeArgvBeforeImage(t, run)
-	for _, tok := range runtimeSide {
+	for i, tok := range runtimeSide {
+		if i > 0 && (runtimeSide[i-1] == "--host" || runtimeSide[i-1] == "--url") {
+			continue
+		}
 		if strings.Contains(tok, "docker.sock") || strings.Contains(tok, "podman.sock") || strings.HasPrefix(tok, "/var/run") || strings.HasPrefix(tok, "/run/") {
 			t.Errorf("runtime argv carries a socket token %q: %q", tok, run)
 		}
@@ -405,6 +427,66 @@ func TestGateContainer_NoDaemonSocket(t *testing.T) {
 	}
 	if len(*calls) != before {
 		t.Errorf("runtime CLI reached despite the planted socket: %q", (*calls)[before:])
+	}
+	dockerFixturesRan++
+}
+
+// (l) TestGateContainer_EndpointBoundAcrossContextSwitch: the endpoint the
+// selection validated is the one a LATER gate connects to, even after the
+// runtime configuration changes underneath it. The selection is recorded
+// against the real detected socket, then DOCKER_HOST / CONTAINER_HOST are
+// redirected to an unreachable tcp endpoint and DOCKER_CONTEXT /
+// CONTAINER_CONNECTION to a nonexistent context — the `docker context use`
+// shape between two gates — and a gate still executes in a container on the
+// validated daemon (exit 0, `ok` printed), the recorded argv opens with the
+// binding, and the env the CLI received pins the validated socket with the
+// redirecting variables dropped. Deleting the binding turns this red: the
+// CLI follows the redirected endpoint and the gate never runs.
+func TestGateContainer_EndpointBoundAcrossContextSwitch(t *testing.T) {
+	rt, image := requireGateImage(t)
+	st := liveContainerState(t, rt, image)
+	if sel := st.selection(context.Background()); sel.Runtime.SocketPath != rt.SocketPath {
+		t.Fatalf("selection socket %q != detected %q", sel.Runtime.SocketPath, rt.SocketPath)
+	}
+	t.Setenv("DOCKER_HOST", "tcp://127.0.0.1:1")
+	t.Setenv("CONTAINER_HOST", "tcp://127.0.0.1:1")
+	t.Setenv("DOCKER_CONTEXT", "fishhawk-nonexistent-context")
+	t.Setenv("CONTAINER_CONNECTION", "fishhawk-nonexistent-connection")
+	var envs [][]string
+	prev := execBoundedHostArgvFn
+	execBoundedHostArgvFn = func(ctx context.Context, argv []string, dir string, env []string, timeout time.Duration) (string, int) {
+		envs = append(envs, append([]string(nil), env...))
+		return prev(ctx, argv, dir, env, timeout)
+	}
+	t.Cleanup(func() { execBoundedHostArgvFn = prev })
+	calls := recordHostExec(t)
+	out, code := runBoundedGateCommand(context.Background(), "echo ok", t.TempDir(), filepath.Join(t.TempDir(), "lc"), 2*time.Minute)
+	if code != 0 || strings.TrimSpace(out) != "ok" {
+		t.Fatalf("gate under a redirected runtime configuration: exit %d out %q; want 0/ok on the validated daemon", code, out)
+	}
+	run := containerRunArgv(t, *calls)
+	if got, want := endpointBindingValue(run), "unix://"+rt.SocketPath; got != want {
+		t.Errorf("endpoint binding = %q, want %q", got, want)
+	}
+	if len(envs) == 0 {
+		t.Fatal("no env recorded")
+	}
+	pin := "DOCKER_HOST=unix://" + rt.SocketPath
+	if rt.Kind == gateiso.KindPodman {
+		pin = "CONTAINER_HOST=unix://" + rt.SocketPath
+	}
+	found := false
+	for _, kv := range envs[0] {
+		k, _, _ := strings.Cut(kv, "=")
+		switch {
+		case kv == pin:
+			found = true
+		case k == "DOCKER_CONTEXT", k == "CONTAINER_CONNECTION", kv == "DOCKER_HOST=tcp://127.0.0.1:1", kv == "CONTAINER_HOST=tcp://127.0.0.1:1":
+			t.Errorf("redirecting variable reached the runtime CLI: %s", kv)
+		}
+	}
+	if !found {
+		t.Errorf("runtime CLI env lacks %s", pin)
 	}
 	dockerFixturesRan++
 }

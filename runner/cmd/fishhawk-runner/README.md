@@ -395,13 +395,25 @@ the first gate exec from `FISHHAWK_GATE_ISOLATION` × `FISHHAWK_DEPLOYMENT_PROFI
   flake, never a fix-agent re-invoke (`verify_gate_refused`);
 - **container** → `runGateInContainer`: fresh EMPTY per-exec caches, a
   host-side module-cache seed (the host `GOMODCACHE` is a `file://` proxy
-  source, never a mount), the runtime argv built under the resolved-path
+  source, never a mount) run under the SANITIZED gate env — never
+  `os.Environ()`, so no runner credential reaches the `go mod download` —
+  with `GOTOOLCHAIN=local`, and REFUSED before any go process runs when the
+  checkout's module metadata (a symlinked `go.mod`/`go.sum`/`go.work`/
+  `go.work.sum`, a `go.work` `use` or a directory `replace` resolving outside
+  the checkout) would let the seed read or write an unrelated host file
+  (`gateiso.ErrSeedCheckout`); the runtime argv built under the resolved-path
   socket-mount guard (`gateiso.ForbidSocketMounts` — a refused source returns
   `-1` with no exec), `--network=none --cap-drop=ALL
   --security-opt=no-new-privileges --entrypoint ''` with the sanitized env
-  crossing via `-e` and the RUNNER's own env going to the runtime CLI, and
-  `rm -f` on a detached bounded context whenever the exec returned `-1`
-  (killing the CLI does not stop the container);
+  crossing via `-e` and the RUNNER's own env going to the runtime CLI BOUND
+  to the endpoint the selection validated (`gateiso.Runtime.BindEndpointEnv`:
+  `DOCKER_HOST`/`DOCKER_CONTEXT`/`CONTAINER_HOST`/`CONTAINER_CONNECTION`
+  dropped and the validated socket re-pinned, and the argv opens with
+  `--host`/`--url unix://<socket>` — so a docker-context switch between two
+  gates cannot redirect a bind-mount request to a daemon the selection never
+  validated), and `rm -f` under the same binding on a detached bounded
+  context whenever the exec returned `-1` (killing the CLI does not stop the
+  container);
 - **clone-sandbox** → `gateiso.WrapSandbox(argv)` (Linux `unshare -rn`) on the host;
 - **clone** → the argv on the host — the pre-#2134 behaviour, and what the
   nil (unconfigured) state selects, so every direct `runBoundedGateCommand`

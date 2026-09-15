@@ -212,8 +212,12 @@ runtime endpoint, the reason).
 
 **The four paths.** `container` (a safe LOCAL docker/podman daemon + an image:
 `--network=none --cap-drop=ALL --security-opt=no-new-privileges --entrypoint ''`,
-four bind mounts only — the checkout and three EMPTY per-exec caches — the
-sanitized gate env via `-e`, `rm -f` after a timeout); `clone-sandbox` (Linux
+every invocation — run and `rm -f` — bound to the validated socket with
+`--host`/`--url unix://<socket>` so a later context switch cannot redirect it,
+four bind mounts only — the checkout and three EMPTY per-exec caches, the
+module cache seeded host-side under the sanitized env with `GOTOOLCHAIN=local`
+and refused when the checkout's module metadata reaches outside the checkout —
+the sanitized gate env via `-e`, `rm -f` after a timeout); `clone-sandbox` (Linux
 `unshare -rn`, probed not assumed); `clone` (host exec — the pre-#2134
 behaviour); `refused` (the gate never runs). `auto` prefers container, then
 sandbox, then clone; `hosted` refuses every non-container path. A refusal is

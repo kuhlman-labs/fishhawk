@@ -211,6 +211,75 @@ func underRoot(path, root string) bool {
 // ErrContainerSpec is wrapped by BuildArgv for an incomplete spec.
 var ErrContainerSpec = errors.New("incomplete container spec")
 
+// Endpoint binding. DetectRuntime validates the endpoint the CLI would talk
+// to at SELECTION time, but the CLI re-resolves its endpoint on EVERY
+// invocation from mutable state — the active docker context
+// (~/.docker/config.json, `docker context use`), DOCKER_HOST/DOCKER_CONTEXT,
+// CONTAINER_HOST/CONTAINER_CONNECTION, containers.conf — so a context switch
+// between two gates would otherwise send the next bind-mount request to a
+// daemon nobody validated. Every runtime invocation the runner builds
+// therefore BINDS the validated socket explicitly, in the argv (EndpointArgs:
+// `docker --host unix://<socket>` / `podman --url unix://<socket>`, the
+// global flag that overrides the context store and the environment) AND in
+// the exec environment (BindEndpointEnv: the override variables dropped and
+// DOCKER_HOST / CONTAINER_HOST re-pinned to the same socket). A Runtime with
+// no validated SocketPath cannot be rendered at all.
+
+// endpointOverrideVars are the environment variables through which the
+// docker / podman CLI's effective endpoint can be redirected; BindEndpointEnv
+// drops every one of them before re-pinning the validated socket.
+var endpointOverrideVars = []string{"DOCKER_HOST", "DOCKER_CONTEXT", "CONTAINER_HOST", "CONTAINER_CONNECTION"}
+
+// EndpointArgs returns the runtime CLI's global endpoint flag bound to the
+// validated socket: the tokens go between the binary and the subcommand. It
+// fails (ErrContainerSpec) for an unsupported kind or an empty SocketPath.
+func (r Runtime) EndpointArgs() ([]string, error) {
+	if r.SocketPath == "" {
+		return nil, fmt.Errorf("%w: runtime %q has no validated socket path to bind", ErrContainerSpec, r.Kind)
+	}
+	switch r.Kind {
+	case KindDocker:
+		return []string{"--host", "unix://" + r.SocketPath}, nil
+	case KindPodman:
+		return []string{"--url", "unix://" + r.SocketPath}, nil
+	}
+	return nil, fmt.Errorf("%w: runtime kind %q", ErrContainerSpec, r.Kind)
+}
+
+// BindEndpointEnv returns base with every endpoint override variable removed
+// and the validated socket re-pinned (DOCKER_HOST for docker, CONTAINER_HOST
+// for podman). It never reads the process environment; the caller supplies
+// base (the runtime CLI needs PATH and its config dir from it).
+func (r Runtime) BindEndpointEnv(base []string) ([]string, error) {
+	if r.SocketPath == "" {
+		return nil, fmt.Errorf("%w: runtime %q has no validated socket path to bind", ErrContainerSpec, r.Kind)
+	}
+	var pin string
+	switch r.Kind {
+	case KindDocker:
+		pin = "DOCKER_HOST=unix://" + r.SocketPath
+	case KindPodman:
+		pin = "CONTAINER_HOST=unix://" + r.SocketPath
+	default:
+		return nil, fmt.Errorf("%w: runtime kind %q", ErrContainerSpec, r.Kind)
+	}
+	out := make([]string, 0, len(base)+1)
+	for _, kv := range base {
+		k, _, _ := strings.Cut(kv, "=")
+		drop := false
+		for _, v := range endpointOverrideVars {
+			if k == v {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			out = append(out, kv)
+		}
+	}
+	return append(out, pin), nil
+}
+
 // BuildArgv renders the runtime command line. It applies ForbidSocketMounts
 // to every bind-mount source BEFORE emitting any -v token and returns the
 // refusal with no argv. The exact shape is:
@@ -238,13 +307,18 @@ func (s ContainerSpec) BuildArgv(policy MountPolicy) ([]string, error) {
 	case s.Checkout == "" || s.GoCache == "" || s.GoModCache == "" || s.LintCache == "":
 		return nil, fmt.Errorf("%w: every mount source (checkout, gocache, gomodcache, lintcache) must be set", ErrContainerSpec)
 	}
+	endpoint, err := s.Runtime.EndpointArgs()
+	if err != nil {
+		return nil, err
+	}
 	if err := ForbidSocketMounts(policy, s.Checkout, s.GoCache, s.GoModCache, s.LintCache); err != nil {
 		return nil, err
 	}
-	argv := []string{bin, "run", "--rm", "--name", s.Name,
+	argv := append([]string{bin}, endpoint...)
+	argv = append(argv, "run", "--rm", "--name", s.Name,
 		"--network=none", "--cap-drop=ALL", "--security-opt=no-new-privileges",
 		"--workdir", MountWork,
-	}
+	)
 	if s.Runtime.Kind == KindPodman && s.Runtime.Rootless {
 		argv = append(argv, "--userns=keep-id")
 	} else {
@@ -266,9 +340,16 @@ func (s ContainerSpec) BuildArgv(policy MountPolicy) ([]string, error) {
 
 // KillArgv is the command that removes the container after a timeout: killing
 // the CLI does not stop the container, so the runner runs this on a detached
-// context whenever the exec returns -1.
+// context whenever the exec returns -1. It carries the same endpoint binding
+// as BuildArgv, so cleanup reaches the daemon that ran the container and no
+// other; it is nil when the runtime has no validated socket.
 func (s ContainerSpec) KillArgv() []string {
-	return []string{s.Runtime.Kind.Binary(), "rm", "-f", s.Name}
+	endpoint, err := s.Runtime.EndpointArgs()
+	if err != nil {
+		return nil
+	}
+	argv := append([]string{s.Runtime.Kind.Binary()}, endpoint...)
+	return append(argv, "rm", "-f", s.Name)
 }
 
 // containerEnvPins are appended (drop-then-append) after the allow-list.
