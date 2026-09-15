@@ -249,7 +249,7 @@ change to make from the runner side alone.
 
 Helpers:
 
-- `runVerifyCommittedTree` — isolated `git worktree add --detach` at the throwaway-commit SHA, reusing the #728/#800 pattern + `runVerifyGate`'s process-group SIGKILL.
+- `runVerifyCommittedTree` — an isolated, INDEPENDENT `--no-hardlinks` clone at the throwaway-commit SHA (`materializeGateCheckout` → `gateiso.MaterializeClone`, ADR-063 / #2134 — it replaced the #728/#800 `git worktree add --detach`, which shared the primary's refs, objects and hooks) + `runVerifyGate`'s process-group SIGKILL, with `FISHHAWK_VERIFY_LOCK_PATH` injected on the host paths so the clone's verify still contends on the PRIMARY's lock (#3315). A refused isolation selection (see "Gate isolation" below) returns `failed` with the `gate isolation refused:` signature, never the tolerant `skipped`.
 - `commitVerifyWIP` — throwaway scope-only commit.
 - `gitResetSoftHEAD1` — undo, preserving working-tree edits + index.
 - `verifyFixPrompt` — fix-iteration prompt embedding the captured output, BOUNDED through `boundVerifyFixOutput` (#3408, see below); it returns the prompt plus the elided byte count so no caller can build an unbounded fix prompt. Since #3390 it also renders the EFFECTIVE scope (`cfg.scopeFiles`, every path + operation — the fix agent is a FRESH invocation that never saw the original prompt's scope list) and, when `cfg.approvedAmendments` is non-empty, a `GRANTED MID-STAGE` block naming each approved amendment's id, paths and operator `decision_reason` (see the #3390 section below). An empty scope (the `git add -A` fallback) omits the scope section and keeps the older "approved scope" wording.
@@ -380,6 +380,42 @@ caller uses when it has a list of arguments rather than a command string;
 routing through the argv form is how a new caller stays on the ONE
 containment implementation instead of adding a second exec path.
 
+**Gate isolation layer (ADR-063 / [#2134](https://github.com/kuhlman-labs/fishhawk/issues/2134)).**
+Since #2134 `runBoundedGateArgv` is ALSO the one place the execution PATH is
+chosen, so the verify gates, `diff_coverage` and the auto-format absorb inherit
+it together and there is still no second exec path. The env is built exactly
+as before (sanitized → isolated lint cache → `extraEnv` drop-then-append) and
+is what the gate sees on EVERY path; then the process-wide selection
+(`gateisolation.go::gateIsolationState.selection`, decided ONCE per process on
+the first gate exec from `FISHHAWK_GATE_ISOLATION` × `FISHHAWK_DEPLOYMENT_PROFILE`
+× `FISHHAWK_GATE_IMAGE` × the detected runtime × the sandbox probe) routes:
+
+- **refused** → the refusal text (`gate isolation refused: …`) and `-1`
+  WITHOUT executing; the gates classify it **category C** — never an infra
+  flake, never a fix-agent re-invoke (`verify_gate_refused`);
+- **container** → `runGateInContainer`: fresh EMPTY per-exec caches, a
+  host-side module-cache seed (the host `GOMODCACHE` is a `file://` proxy
+  source, never a mount), the runtime argv built under the resolved-path
+  socket-mount guard (`gateiso.ForbidSocketMounts` — a refused source returns
+  `-1` with no exec), `--network=none --cap-drop=ALL
+  --security-opt=no-new-privileges --entrypoint ''` with the sanitized env
+  crossing via `-e` and the RUNNER's own env going to the runtime CLI, and
+  `rm -f` on a detached bounded context whenever the exec returned `-1`
+  (killing the CLI does not stop the container);
+- **clone-sandbox** → `gateiso.WrapSandbox(argv)` (Linux `unshare -rn`) on the host;
+- **clone** → the argv on the host — the pre-#2134 behaviour, and what the
+  nil (unconfigured) state selects, so every direct `runBoundedGateCommand`
+  test is byte-unchanged.
+
+The process-level contract (bounded child context, group SIGKILL,
+`CombinedOutput`, the `0 / child-code / -1` mapping) lives in
+`execBoundedHostArgv`, reached by every path through the `execBoundedHostArgvFn`
+seam. Every gate site — including the `diff_coverage` measurement below —
+inherits the selected path, so `--network=none` applies to a customer coverage
+command exactly as it does to the verify gate. Long-form contract, env vars,
+selection table, mount guard, cache invariant and the e2e fixture table:
+[`runner/internal/gateiso/README.md`](../../internal/gateiso/README.md).
+
 ### Gate-env allow-list
 
 `gateenv.go::sanitizedGateEnv` builds the child env for every gate exec site
@@ -430,13 +466,22 @@ to BOTH copies**, or that test fails.
 
 **Filesystem isolation: a throwaway checkout.** `runBoundedGateCommand`
 contains the process and the environment; only a separate checkout contains
-the **filesystem**. So the command runs in a disposable
-`git worktree add --detach` checkout of the stage's committed scope-only
-tree — the same isolation `runVerifyCommittedTree` gives the verify gate,
-and what the schema and API documentation promise. Build artifacts, deleted
-or modified sources, and the report itself land in the throwaway checkout
-and are swept with it; the operator's real repository is untouched, and the
-command cannot mutate the tree AFTER it was verified.
+the **filesystem**. So the command runs in a disposable, INDEPENDENT
+`--no-hardlinks` clone of the stage's committed scope-only tree
+(`materializeGateCheckout` → `gateiso.MaterializeClone`, ADR-063 / #2134) —
+the same isolation `runVerifyCommittedTree` gives the verify gate, and what
+the schema and API documentation promise. Build artifacts, deleted or
+modified sources, and the report itself land in the throwaway checkout and
+are swept with it; the operator's real repository is untouched, and the
+command cannot mutate the tree AFTER it was verified. WHY a clone and not the
+`git worktree add --detach` this used before #2134: a linked worktree shares
+the primary's refs, objects and hooks, so a coverage command that ran
+`git update-ref` or wrote a hook planted it in the operator's repository;
+the clone shares nothing, so the plant stays in the throwaway tree
+(`TestGateClone_PlantedRefNeverReachesPrimary` proves both halves, and
+`TestRunDiffCoverageGate_RunsInAThrowawayCheckout` asserts the independent
+`.git` and that no worktree is registered against the primary). On the
+container path the clone is what is bind-mounted at `/work`.
 
 Materializing that tree reuses the #651 scaffolding — `StageScoped` +
 `commitVerifyWIP` + `git reset --soft HEAD~1`. As in
@@ -445,12 +490,14 @@ failure: HEAD left on the throwaway commit would make the real commit stack
 on top and push a WIP commit into the PR. `runDiffCoverageGate` returns it
 as an error and the call site demotes the stage category-B
 (`TestRunDiffCoverageGate_PostCommitResetFailureFatal` provokes the branch
-by having the coverage command plant the branch's ref lock, and asserts HEAD
-is left on the throwaway commit — which is precisely why the error must
-reach the call site). Both cleanup
-commands (worktree removal, `reset --soft`) run on a **bounded context
-detached from `ctx`'s cancellation** — a wedged coverage command is killed
-by cancelling `ctx`, and the undo must still happen.
+by having the coverage command plant the branch's ref lock — through the
+PRIMARY's absolute `.git` path, since the clone shares nothing with it — and
+asserts HEAD is left on the throwaway commit — which is precisely why the
+error must reach the call site). Both cleanup commands (the clone's
+`os.RemoveAll` — there is no worktree to unregister — and `reset --soft`) run
+on a **bounded context detached from `ctx`'s cancellation** — a wedged
+coverage command is killed by cancelling `ctx`, and the undo must still
+happen.
 
 **One snapshot, pinned merge base.** The checkout is clean and detached at
 the committed head, so `ChangedLines`' merge-base → work-tree diff taken
