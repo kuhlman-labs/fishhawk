@@ -1100,7 +1100,9 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	if runRow.TriggerRef != nil {
 		if number, ok := parseIssueRef(*runRow.TriggerRef); ok {
 			trigger.IssueNumber = number
-			s.fillIssueContext(r.Context(), github, runRow, number, &trigger)
+			if reason := s.fillIssueContext(r.Context(), github, runRow, number, &trigger); reason != "" {
+				s.emitIssueContextUnresolved(r.Context(), runRow, stage.ID, number, runForge(runRow), reason)
+			}
 		}
 	}
 	// Plan-as-contract (#223): for implement stages, the approved
@@ -1784,7 +1786,9 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	if runRow.TriggerRef != nil {
 		if number, ok := parseIssueRef(*runRow.TriggerRef); ok {
 			trigger.IssueNumber = number
-			s.fillIssueContext(r.Context(), github, runRow, number, &trigger)
+			if reason := s.fillIssueContext(r.Context(), github, runRow, number, &trigger); reason != "" {
+				s.emitIssueContextUnresolved(r.Context(), runRow, stage.ID, number, runForge(runRow), reason)
+			}
 		}
 	}
 	// Plan-as-contract (#223): for implement stages, the approved
@@ -2477,50 +2481,92 @@ func (s *Server) emitPlanMissingForImplement(ctx context.Context, runID, stageID
 	}
 }
 
-// fillIssueContext populates the trigger's IssueTitle, IssueBody,
-// and IssueURL.
-//
-// Resolution order (#415):
-//  1. The run row's cached IssueContext — present when the CLI
-//     ran `gh issue view` at run-create time and shipped the
-//     payload inline. Used as-is; no GitHub call.
-//  2. The webhook-dispatched path: when the run carries an
-//     installation_id but no cached payload, fetch via GitHub
-//     App token (unchanged behavior).
-//  3. Otherwise leave the title + body empty; the prompt
-//     template falls back to a "URL only" shape the agent can
-//     navigate via its own tools.
-//
-// IssueURL is derived from `repo + IssueNumber` rather than the
-// API response's html_url — the canonical github.com URL is fully
-// determined by those two fields, and avoiding the response
-// dependency means the field is set even on a partial fetch.
-func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRow *run.Run, issueNumber int, trigger *prompt.Trigger) {
-	// Set the URL up front so any of the three branches below
-	// leave the link-only renderer with a working fallback.
-	repo, err := parseRepoOwnerName(runRow.Repo)
-	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parse repo failed",
-			slog.String("run_id", runRow.ID.String()),
-			slog.String("repo", runRow.Repo),
-			slog.String("error", err.Error()),
-		)
-		return
-	}
-	trigger.IssueURL = fmt.Sprintf("https://github.com/%s/%s/issues/%d",
-		repo.Owner, repo.Name, issueNumber)
+// Unresolved reasons fillIssueContext returns (E45.42 / #3347). Each names
+// the rung of the resolution ladder that left the trigger with NEITHER a
+// title NOR a body; the prompt handlers record the reason on the
+// issue_context_unresolved audit row so an operator can tell a missing
+// credential from a forge that could not be resolved from a fetch that
+// failed, instead of every shape landing on one silent "(no issue context
+// provided)" prompt.
+const (
+	// issueContextReasonNoCredential: the run carries no usable credential
+	// scope — a github-family run with a nil/zero installation_id, or a
+	// non-GitHub run with an empty installation_ref.
+	issueContextReasonNoCredential = "no_credential"
+	// issueContextReasonForgeUnresolved: issueOpsFor returned nil for the
+	// run's forge family (resolver error, nil/typed-nil forge, or a forge
+	// lacking forge.IssueOperations). A server misconfiguration.
+	issueContextReasonForgeUnresolved = "forge_unresolved"
+	// issueContextReasonFetchFailed: the forge fetch of the issue itself
+	// errored (comments are best-effort and never produce this reason).
+	issueContextReasonFetchFailed = "fetch_failed"
+	// issueContextReasonCachedContextEmpty: the run row's cached
+	// IssueContext was present but carried neither a title nor a body.
+	issueContextReasonCachedContextEmpty = "cached_context_empty"
+	// issueContextReasonRepoUnparseable: the run's Repo could not be split
+	// into a forge repo reference.
+	issueContextReasonRepoUnparseable = "repo_unparseable"
+)
 
-	// Branch 1: operator's `gh` fetch at run-create time
-	// pre-populated the title + body on the row. Prefer this
-	// over a fresh GitHub call so local-runner runs (which lack
-	// an installation_id) get the full prompt context.
+// issueContextUnresolvedCategory is the audit category
+// emitIssueContextUnresolved writes (E45.42 / #3347). Registered in
+// backend/internal/audit/categories.go.
+const issueContextUnresolvedCategory = "issue_context_unresolved"
+
+// fillIssueContext populates the trigger's IssueTitle, IssueBody,
+// IssueComments and IssueURL, FORGE-NEUTRALLY since E45.42 / #3347. It
+// returns "" when the context resolved (title OR body populated) and
+// otherwise one of the issueContextReason* constants naming the rung that
+// left both empty; the caller records that on an issue_context_unresolved
+// audit row. The prompt still renders either way — enforcing an issue
+// context is E45.40's, not this function's.
+//
+// The forge family is derived by runForge (fail-closed: gitlab on EITHER a
+// "gitlab:<id>" installation_ref OR the gitlab_ci runner kind).
+//
+// Title/body/comments resolution order (#415, #618, #621):
+//  1. The run row's cached IssueContext — present when the CLI ran
+//     `gh issue view` at run-create time and shipped the payload inline, or
+//     the operator passed issue_context. Used as-is; no forge call.
+//  2. github family: the webhook-dispatched path — fetch via the GitHub App
+//     installation token through the issueGetter seam (byte-for-byte the
+//     pre-#3347 path; it NEVER consults cfg.ForgeResolver).
+//     Any other family: resolve forge.IssueOperations through the shared
+//     issueOpsFor ladder (cfg.ForgeResolver / forge.Get, isNilForge, the
+//     capability assertion), authenticate with forge.FromRef(installation_ref)
+//     and map FetchIssue / FetchIssueComments onto the trigger exactly as the
+//     GitHub branch does. This branch never touches the issueGetter.
+//
+// IssueURL ladder, applied ONCE at the end over whatever the branch above
+// learned: the cached IssueContext.URL when present → the browse URL the
+// forge fetch returned (forge.Issue.HTMLURL: GitHub html_url / GitLab
+// web_url) → for a github-family run ONLY, the github.com format string
+// derived from repo + number → empty. A non-GitHub run therefore never gets
+// a fabricated github.com URL; the link-only renderer omits the URL line.
+func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRow *run.Run, issueNumber int, trigger *prompt.Trigger) (reason string) {
+	family := runForge(runRow)
+	var (
+		cachedURL  string
+		fetchedURL string
+	)
+	// The URL ladder runs on EVERY exit below, including the unresolved
+	// ones, so a partial fetch still leaves the link-only renderer with
+	// whatever browse URL is legitimately known.
+	defer func() {
+		trigger.IssueURL = s.issueContextURL(ctx, family, runRow, issueNumber, cachedURL, fetchedURL)
+	}()
+
+	// Branch 1: operator's `gh` fetch at run-create time (or an inline
+	// issue_context) pre-populated the row. Prefer this over a fresh forge
+	// call so local-runner runs (which lack a credential) get the full
+	// prompt context.
 	if runRow.IssueContext != nil {
+		cachedURL = runRow.IssueContext.URL
 		trigger.IssueTitle = runRow.IssueContext.Title
 		trigger.IssueBody = runRow.IssueContext.Body
 		// Comments (#618): map the cached comment snapshot into the
 		// trigger so the plan-stage prompt can render comment-borne
-		// refinements. Branch 2 (webhook fetch) fetches comments via
-		// ListIssueComments below to populate the same shape.
+		// refinements. Branch 2 fetches comments to populate the same shape.
 		for _, c := range runRow.IssueContext.Comments {
 			trigger.IssueComments = append(trigger.IssueComments, prompt.IssueComment{
 				Author:    c.Author,
@@ -2529,13 +2575,30 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 			})
 		}
 		s.warnOverCapComments(ctx, runRow, issueNumber, trigger.IssueComments)
-		return
+		if trigger.IssueTitle == "" && trigger.IssueBody == "" {
+			return issueContextReasonCachedContextEmpty
+		}
+		return ""
 	}
 
-	// Branch 2: webhook-dispatched runs — fetch via the App's
-	// installation token. Unchanged from the pre-#415 behavior.
+	if family != forgeNameGitHub {
+		fetchedURL, reason = s.fillIssueContextViaForge(ctx, family, runRow, issueNumber, trigger)
+		return reason
+	}
+
+	// Branch 2, github family: webhook-dispatched runs — fetch via the
+	// App's installation token. Unchanged from the pre-#415 behavior.
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parse repo failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("repo", runRow.Repo),
+			slog.String("error", err.Error()),
+		)
+		return issueContextReasonRepoUnparseable
+	}
 	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
-		return
+		return issueContextReasonNoCredential
 	}
 	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
 	issue, err := github.GetIssue(ctx, scope, repo, issueNumber)
@@ -2545,10 +2608,11 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 			slog.Int("issue", issueNumber),
 			slog.String("error", err.Error()),
 		)
-		return
+		return issueContextReasonFetchFailed
 	}
 	trigger.IssueTitle = issue.Title
 	trigger.IssueBody = issue.Body
+	fetchedURL = issue.HTMLURL
 
 	// Comments (#621): fetch the issue's comment thread so webhook-
 	// triggered runs render comment-borne refinements identically to
@@ -2562,7 +2626,7 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 			slog.Int("issue", issueNumber),
 			slog.String("error", err.Error()),
 		)
-		return
+		return ""
 	}
 	for _, c := range comments {
 		trigger.IssueComments = append(trigger.IssueComments, prompt.IssueComment{
@@ -2572,6 +2636,145 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 		})
 	}
 	s.warnOverCapComments(ctx, runRow, issueNumber, trigger.IssueComments)
+	return ""
+}
+
+// fillIssueContextViaForge is fillIssueContext's branch 2 for a NON-GitHub
+// forge family (E45.42 / #3347): credential scope from the run's
+// installation_ref, forge.IssueOperations from the shared issueOpsFor
+// ladder, the repo split on its last slash (nested GitLab paths), then
+// FetchIssue (required) and FetchIssueComments (best-effort) mapped onto
+// the trigger. Returns the fetched browse URL (empty when the forge sent
+// none — never fabricated) and the unresolved reason, "" on success.
+func (s *Server) fillIssueContextViaForge(ctx context.Context, family string, runRow *run.Run, issueNumber int, trigger *prompt.Trigger) (fetchedURL, reason string) {
+	if runRow.InstallationRef == nil || *runRow.InstallationRef == "" {
+		return "", issueContextReasonNoCredential
+	}
+	scope := forge.FromRef(*runRow.InstallationRef)
+	ops := s.issueOpsFor(family)
+	if ops == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: no issue-operations forge configured for family",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("forge", family),
+			slog.Int("issue", issueNumber),
+		)
+		return "", issueContextReasonForgeUnresolved
+	}
+	repo, ok := splitParentRepoRef(runRow.Repo)
+	if !ok {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parse repo failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("repo", runRow.Repo),
+		)
+		return "", issueContextReasonRepoUnparseable
+	}
+	issue, err := ops.FetchIssue(ctx, scope, repo, issueNumber)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: get issue failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("forge", family),
+			slog.Int("issue", issueNumber),
+			slog.String("error", err.Error()),
+		)
+		return "", issueContextReasonFetchFailed
+	}
+	trigger.IssueTitle = issue.Title
+	trigger.IssueBody = issue.Body
+	fetchedURL = issue.HTMLURL
+
+	comments, err := ops.FetchIssueComments(ctx, scope, repo, issueNumber)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list issue comments failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("forge", family),
+			slog.Int("issue", issueNumber),
+			slog.String("error", err.Error()),
+		)
+		return fetchedURL, ""
+	}
+	for _, c := range comments {
+		trigger.IssueComments = append(trigger.IssueComments, prompt.IssueComment{
+			Author:    c.Author,
+			Body:      c.Body,
+			CreatedAt: c.CreatedAt,
+		})
+	}
+	s.warnOverCapComments(ctx, runRow, issueNumber, trigger.IssueComments)
+	return fetchedURL, ""
+}
+
+// issueContextURL applies the IssueURL ladder documented on
+// fillIssueContext: cached → fetched → (github family ONLY) the github.com
+// format string → empty. The github-family guard is the #3347 control: a
+// GitLab run with no forge-reported URL renders NO URL rather than a
+// fabricated github.com one.
+func (s *Server) issueContextURL(ctx context.Context, family string, runRow *run.Run, issueNumber int, cachedURL, fetchedURL string) string {
+	if cachedURL != "" {
+		return cachedURL
+	}
+	if fetchedURL != "" {
+		return fetchedURL
+	}
+	if family != forgeNameGitHub {
+		return ""
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parse repo failed; no issue URL derived",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("repo", runRow.Repo),
+			slog.String("error", err.Error()),
+		)
+		return ""
+	}
+	return fmt.Sprintf("https://github.com/%s/%s/issues/%d", repo.Owner, repo.Name, issueNumber)
+}
+
+// emitIssueContextUnresolved records that an issue-anchored run's prompt was
+// built with NEITHER an issue title NOR a body (E45.42 / #3347), beside
+// emitPlanMissingForImplement: ONE WARN line and, when an AuditRepo is
+// configured, ONE issue_context_unresolved audit row carrying the run/stage,
+// issue number, forge family and the ladder reason. Not an HTTP error — the
+// runner still gets a usable prompt — but the audit log captures that the
+// agent worked without the issue's content. One row per prompt build,
+// deliberately (both endpoints, every fetch/replay): rows are evidence, not
+// state, and dedup would hide a persisting misconfiguration.
+//
+// Best-effort: a failure to append the audit entry doesn't unwind the
+// prompt response; it WARNs and proceeds.
+func (s *Server) emitIssueContextUnresolved(ctx context.Context, runRow *run.Run, stageID uuid.UUID, issueNumber int, family, reason string) {
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: issue context unresolved; prompt built without issue title or body",
+		slog.String("run_id", runRow.ID.String()),
+		slog.String("stage_id", stageID.String()),
+		slog.Int("issue", issueNumber),
+		slog.String("forge", family),
+		slog.String("reason", reason),
+	)
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":   runRow.ID.String(),
+		"stage_id": stageID.String(),
+		"issue":    issueNumber,
+		"forge":    family,
+		"reason":   reason,
+		"hint":     "the prompt rendered with no issue title or body; pass issue_context inline at run creation or fix the run's credential/forge wiring",
+	})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runRow.ID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  issueContextUnresolvedCategory,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: append issue_context_unresolved failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // warnOverCapComments emits a single greppable WARN when any resolved issue

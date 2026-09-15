@@ -779,11 +779,12 @@ func (f *Forge) FetchIssue(ctx context.Context, scope forge.CredentialScope, _ f
 		return nil, mapError(err)
 	}
 	return &forge.Issue{
-		Number: is.IID,
-		Title:  is.Title,
-		Body:   is.Description,
-		State:  normalizeIssueState(is.State),
-		Labels: is.Labels,
+		Number:  is.IID,
+		Title:   is.Title,
+		Body:    is.Description,
+		State:   normalizeIssueState(is.State),
+		Labels:  is.Labels,
+		HTMLURL: is.WebURL,
 	}, nil
 }
 

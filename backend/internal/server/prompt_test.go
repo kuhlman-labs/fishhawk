@@ -29,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -41,6 +42,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
 // promptRunRepo is a run.Repository fake that supports GetStage +
@@ -1158,6 +1160,559 @@ func TestFillIssueContext_OverCapCommentWarn(t *testing.T) {
 		}
 		if !strings.Contains(buf.String(), "\"over_cap_comments\":1") {
 			t.Errorf("WARN must report over_cap_comments=1:\n%s", buf.String())
+		}
+	})
+}
+
+// =============================================================================
+// Forge-neutral issue context (E45.42 / #3347)
+// =============================================================================
+//
+// fillIssueContext used to fabricate https://github.com/<owner>/<name>/issues/<n>
+// unconditionally, had no fetch branch for a non-GitHub run, and left an
+// unresolved context silent. The tests below pin the three fixes end to end
+// through the REAL signed /prompt endpoint (and once through /prompt-render):
+// run row → runForge → issueOpsFor → a real *forgegitlab.Forge → an httptest
+// GitLab fake → prompt.Trigger → served prompt bytes.
+
+// issueContextUnresolvedWarn is the ONE WARN emitIssueContextUnresolved logs;
+// the counters below filter on it so sibling WARNs (the per-rung "get issue
+// failed" line, the request-logging middleware) never pollute the count.
+const issueContextUnresolvedWarn = "issue context unresolved"
+
+// issueContextHarness is the prompt-handler server with an audit repo (so
+// issue_context_unresolved rows are observable), a WARN-capturing logger, the
+// GitHub issueGetter stub and an injectable ForgeResolver.
+type issueContextHarness struct {
+	s    *Server
+	rr   *promptRunRepo
+	sf   *signingFake
+	gh   *stubIssueGetter
+	au   *planAuditRepo
+	logs *bytes.Buffer
+}
+
+func newIssueContextHarness(t *testing.T, resolver func(string) (forge.Forge, error)) *issueContextHarness {
+	t.Helper()
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	gh := &stubIssueGetter{}
+	au := &planAuditRepo{}
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		RunRepo:       rr,
+		SigningRepo:   sf,
+		AuditRepo:     au,
+		ForgeResolver: resolver,
+	})
+	s.promptIssueGetterOverride = gh
+	var buf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	return &issueContextHarness{s: s, rr: rr, sf: sf, gh: gh, au: au, logs: &buf}
+}
+
+// unresolvedRows returns the payloads of every issue_context_unresolved row
+// appended (an implement-stage fetch ALSO appends plan_missing_for_implement,
+// which is not this test's subject).
+func (h *issueContextHarness) unresolvedRows(t *testing.T) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, p := range h.au.appended {
+		if p.Category != issueContextUnresolvedCategory {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(p.Payload, &m); err != nil {
+			t.Fatalf("decode issue_context_unresolved payload: %v", err)
+		}
+		if p.ActorKind == nil || string(*p.ActorKind) != "system" {
+			t.Errorf("issue_context_unresolved actor kind = %v, want system", p.ActorKind)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func (h *issueContextHarness) unresolvedWarns() int {
+	return strings.Count(h.logs.String(), issueContextUnresolvedWarn)
+}
+
+// seed seeds a run row and a stage of the given type; returns the signing key.
+func (h *issueContextHarness) seed(t *testing.T, row *run.Run, stageType run.StageType) (runID, stageID uuid.UUID, priv ed25519.PrivateKey) {
+	t.Helper()
+	runID, stageID = uuid.New(), uuid.New()
+	priv, _ = h.sf.issue(t, runID)
+	row.ID = runID
+	if row.WorkflowID == "" {
+		row.WorkflowID = "feature_change"
+	}
+	if row.RequiresCharter == nil {
+		row.RequiresCharter = chFalse()
+	}
+	row.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	row.TriggerRef = &triggerRef
+	h.rr.runRow = row
+	h.rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: stageType}
+	return runID, stageID, priv
+}
+
+// promptOK serves the signed /prompt for the seeded stage and returns the
+// rendered prompt text, failing on a non-200.
+func (h *issueContextHarness) promptOK(t *testing.T, runID, stageID uuid.UUID, priv ed25519.PrivateKey) string {
+	t.Helper()
+	w := promptRequest(t, h.s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return resp.Prompt
+}
+
+// gitlabIssueFake is a minimal GitLab v4 fake serving one issue + its notes
+// for project 5 / iid 42. issueStatus overrides the issue GET's status (a 500
+// drives the fetch_failed rung); issueBody is the JSON served on 200.
+type gitlabIssueFake struct {
+	mu          sync.Mutex
+	issueStatus int
+	issueBody   string
+	notesBody   string
+	calls       []string
+}
+
+func (f *gitlabIssueFake) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v4/projects/5/issues/42", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.calls = append(f.calls, r.Method+" "+r.URL.Path)
+		f.mu.Unlock()
+		status := f.issueStatus
+		if status == 0 {
+			status = http.StatusOK
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if status == http.StatusOK {
+			_, _ = io.WriteString(w, f.issueBody)
+		} else {
+			_, _ = io.WriteString(w, `{"message":"boom"}`)
+		}
+	})
+	mux.HandleFunc("GET /api/v4/projects/5/issues/42/notes", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.calls = append(f.calls, r.Method+" "+r.URL.Path)
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		body := f.notesBody
+		if body == "" {
+			body = "[]"
+		}
+		_, _ = io.WriteString(w, body)
+	})
+	return mux
+}
+
+func (f *gitlabIssueFake) callLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+// newGitLabIssueForge stands up the fake and a REAL *forgegitlab.Forge over
+// it, returning a ForgeResolver that hands the forge out for the gitlab
+// family and fails the test if any other family is asked for.
+func newGitLabIssueForge(t *testing.T) (*gitlabIssueFake, func(string) (forge.Forge, error)) {
+	t.Helper()
+	f := &gitlabIssueFake{}
+	srv := httptest.NewServer(f.handler())
+	t.Cleanup(srv.Close)
+	gl := forgegitlab.New(srv.URL, forgegitlab.NewStaticCredentialProvider("test-gitlab-token"),
+		forgegitlab.WithHTTPClient(srv.Client()))
+	resolver := func(id string) (forge.Forge, error) {
+		if id != webhook.ForgeGitLab {
+			t.Errorf("resolver asked for family %q; only gitlab is served", id)
+			return nil, fmt.Errorf("no forge for %q", id)
+		}
+		return gl, nil
+	}
+	return f, resolver
+}
+
+// gitlabRun is the GitLab-family run row: nested project path, a gitlab:5
+// installation_ref (the scope the adapter addresses project 5 by) and the
+// gitlab_ci runner kind. No cached IssueContext, no InstallationID.
+func gitlabRun() *run.Run {
+	ref := "gitlab:5"
+	return &run.Run{
+		Repo:            "grp/sub/proj",
+		InstallationRef: &ref,
+		RunnerKind:      run.RunnerKindGitLabCI,
+	}
+}
+
+// TestFillIssueContext_CachedURLWins pins fix (1)'s first rung: a cached
+// IssueContext.URL (the operator's `gh issue view --json url` / inline
+// issue_context) is rendered verbatim — here a GitLab URL on a run whose
+// Repo would otherwise format as a github.com link — and no github.com
+// string is fabricated, no forge is called, no unresolved row is written.
+func TestFillIssueContext_CachedURLWins(t *testing.T) {
+	h := newIssueContextHarness(t, func(id string) (forge.Forge, error) {
+		t.Errorf("resolver must not be consulted when the context is cached (asked for %q)", id)
+		return nil, errors.New("unreachable")
+	})
+	const cachedURL = "https://gitlab.example/grp/sub/proj/-/issues/42"
+	row := gitlabRun()
+	row.IssueContext = &run.IssueContext{Number: 42, Title: "Cached GitLab title", Body: "Cached body", URL: cachedURL}
+	runID, stageID, priv := h.seed(t, row, run.StageTypeImplement)
+
+	got := h.promptOK(t, runID, stageID, priv)
+	if !strings.Contains(got, "URL: "+cachedURL) {
+		t.Errorf("prompt must render the cached URL line:\n%s", got)
+	}
+	if strings.Contains(got, "https://github.com/") {
+		t.Errorf("prompt fabricated a github.com URL despite a cached GitLab URL:\n%s", got)
+	}
+	if !strings.Contains(got, "Cached GitLab title") {
+		t.Errorf("prompt missing cached title:\n%s", got)
+	}
+	if h.gh.called {
+		t.Error("GitHub issueGetter must not be called on the cached branch")
+	}
+	if rows := h.unresolvedRows(t); len(rows) != 0 {
+		t.Errorf("resolved cached context wrote %d issue_context_unresolved rows, want 0: %v", len(rows), rows)
+	}
+	if n := h.unresolvedWarns(); n != 0 {
+		t.Errorf("resolved cached context logged %d unresolved WARNs, want 0:\n%s", n, h.logs.String())
+	}
+}
+
+// TestFillIssueContext_GitLabFamily_FetchesViaIssueOperations is the
+// cross-boundary integration test for fix (2): a gitlab-family run with NO
+// cached context resolves forge.IssueOperations through issueOpsFor → the
+// real GitLab adapter → the httptest fake, and the served prompt carries the
+// fetched title, body, web_url and note author. The GitHub issueGetter is
+// never touched, no github.com URL is fabricated, and no unresolved row is
+// written. Deleting the non-github branch in fillIssueContext reddens this
+// test (the run then lands on the github no_credential rung).
+func TestFillIssueContext_GitLabFamily_FetchesViaIssueOperations(t *testing.T) {
+	fake, resolver := newGitLabIssueForge(t)
+	fake.issueBody = `{"iid":42,"title":"GitLab fetched title","description":"GitLab fetched body","state":"opened","web_url":"https://gitlab.example/grp/sub/proj/-/issues/42"}`
+	fake.notesBody = `[{"id":1,"body":"note-borne refinement","system":false,"created_at":"2026-09-01T00:00:00Z","author":{"username":"glalice"}}]`
+	h := newIssueContextHarness(t, resolver)
+
+	// Plan stage renders title + body + comments.
+	runID, stageID, priv := h.seed(t, gitlabRun(), run.StageTypePlan)
+	planPrompt := h.promptOK(t, runID, stageID, priv)
+	for _, want := range []string{"GitLab fetched title", "GitLab fetched body", "note-borne refinement", "@glalice"} {
+		if !strings.Contains(planPrompt, want) {
+			t.Errorf("plan prompt missing %q:\n%s", want, planPrompt)
+		}
+	}
+	if strings.Contains(planPrompt, "https://github.com/") {
+		t.Errorf("plan prompt fabricated a github.com URL for a GitLab run:\n%s", planPrompt)
+	}
+	// Implement stage renders the link-only shape: title + the forge's web_url.
+	runID, stageID, priv = h.seed(t, gitlabRun(), run.StageTypeImplement)
+	implPrompt := h.promptOK(t, runID, stageID, priv)
+	if !strings.Contains(implPrompt, "URL: https://gitlab.example/grp/sub/proj/-/issues/42") {
+		t.Errorf("implement prompt must render the fetched web_url:\n%s", implPrompt)
+	}
+	if strings.Contains(implPrompt, "https://github.com/") {
+		t.Errorf("implement prompt fabricated a github.com URL for a GitLab run:\n%s", implPrompt)
+	}
+
+	if h.gh.called || h.gh.commentsCalled {
+		t.Errorf("GitHub issueGetter must not be touched on the non-github branch: %+v", h.gh)
+	}
+	calls := fake.callLog()
+	if len(calls) != 4 || calls[0] != "GET /api/v4/projects/5/issues/42" || calls[1] != "GET /api/v4/projects/5/issues/42/notes" {
+		t.Errorf("gitlab fake calls = %v, want issue GET then notes GET per prompt build (2 builds)", calls)
+	}
+	if rows := h.unresolvedRows(t); len(rows) != 0 {
+		t.Errorf("resolved GitLab fetch wrote %d issue_context_unresolved rows, want 0: %v", len(rows), rows)
+	}
+	if n := h.unresolvedWarns(); n != 0 {
+		t.Errorf("resolved GitLab fetch logged %d unresolved WARNs, want 0:\n%s", n, h.logs.String())
+	}
+}
+
+// TestFillIssueContext_GitLabFamily_NoURL_NeverFabricatesGitHub is the
+// operator's binding condition (1): the ONLY test that actually REACHES the
+// format-string fallback on a non-GitHub family. The run is gitlab-family
+// with NO cached IssueContext.URL, and the fetch returns NO web_url (arm one)
+// or FAILS outright (arm two). Both arms assert, through the real endpoint
+// AND a direct fillIssueContext call, that no https://github.com/ string is
+// rendered and the trigger URL is EMPTY. The Repo is deliberately the
+// TWO-segment "grp/proj" (not gitlabRun's nested path): parseRepoOwnerName
+// accepts it, so the format string is REACHABLE and only the family guard
+// stands between the run and a fabricated https://github.com/grp/proj/issues/42.
+// Deleting that guard in issueContextURL reddens BOTH arms; a nested path
+// would mask the deletion behind the splitter's own refusal.
+func TestFillIssueContext_GitLabFamily_NoURL_NeverFabricatesGitHub(t *testing.T) {
+	twoSegmentGitLabRun := func() *run.Run {
+		r := gitlabRun()
+		r.Repo = "grp/proj"
+		return r
+	}
+	t.Run("fetch_succeeds_without_web_url", func(t *testing.T) {
+		fake, resolver := newGitLabIssueForge(t)
+		fake.issueBody = `{"iid":42,"title":"No-URL title","description":"No-URL body","state":"opened"}`
+		h := newIssueContextHarness(t, resolver)
+		runID, stageID, priv := h.seed(t, twoSegmentGitLabRun(), run.StageTypeImplement)
+
+		got := h.promptOK(t, runID, stageID, priv)
+		if strings.Contains(got, "https://github.com/") {
+			t.Errorf("prompt fabricated a github.com URL for a GitLab run with no web_url:\n%s", got)
+		}
+		if strings.Contains(got, "URL: ") {
+			t.Errorf("prompt must render NO URL line when the forge sent none:\n%s", got)
+		}
+		if !strings.Contains(got, "No-URL title") {
+			t.Errorf("fetched title must still render:\n%s", got)
+		}
+		var trig prompt.Trigger
+		if reason := h.s.fillIssueContext(context.Background(), h.gh, h.rr.runRow, 42, &trig); reason != "" {
+			t.Errorf("reason = %q, want resolved", reason)
+		}
+		if trig.IssueURL != "" {
+			t.Errorf("trigger.IssueURL = %q, want EMPTY (never fabricated for a non-GitHub run)", trig.IssueURL)
+		}
+		if rows := h.unresolvedRows(t); len(rows) != 0 {
+			t.Errorf("wrote %d issue_context_unresolved rows, want 0 (title resolved)", len(rows))
+		}
+	})
+
+	t.Run("fetch_fails", func(t *testing.T) {
+		fake, resolver := newGitLabIssueForge(t)
+		fake.issueStatus = http.StatusInternalServerError
+		h := newIssueContextHarness(t, resolver)
+		runID, stageID, priv := h.seed(t, twoSegmentGitLabRun(), run.StageTypeImplement)
+
+		got := h.promptOK(t, runID, stageID, priv)
+		if strings.Contains(got, "https://github.com/") {
+			t.Errorf("prompt fabricated a github.com URL for a GitLab run whose fetch failed:\n%s", got)
+		}
+		if strings.Contains(got, "URL: ") {
+			t.Errorf("prompt must render NO URL line when the fetch failed:\n%s", got)
+		}
+		var trig prompt.Trigger
+		if reason := h.s.fillIssueContext(context.Background(), h.gh, h.rr.runRow, 42, &trig); reason != issueContextReasonFetchFailed {
+			t.Errorf("reason = %q, want %q", reason, issueContextReasonFetchFailed)
+		}
+		if trig.IssueURL != "" {
+			t.Errorf("trigger.IssueURL = %q, want EMPTY (never fabricated for a non-GitHub run)", trig.IssueURL)
+		}
+	})
+}
+
+// TestFillIssueContext_GitHubFamily_NeverConsultsResolver pins the GitHub
+// half of the family binding: a github-family run resolves ONLY through the
+// issueGetter seam (the resolver fails the test if reached), and the
+// forge-reported html_url — here a GHE host — wins over the github.com
+// format string.
+func TestFillIssueContext_GitHubFamily_NeverConsultsResolver(t *testing.T) {
+	h := newIssueContextHarness(t, func(id string) (forge.Forge, error) {
+		t.Errorf("a github-family run consulted the ForgeResolver (asked for %q)", id)
+		return nil, errors.New("unreachable")
+	})
+	installation := int64(99)
+	row := &run.Run{Repo: "o/n", InstallationID: &installation}
+	h.gh.issue = &githubclient.Issue{Number: 42, Title: "GHE title", Body: "GHE body", State: "open", HTMLURL: "https://ghe.example/o/n/issues/42"}
+	runID, stageID, priv := h.seed(t, row, run.StageTypeImplement)
+
+	got := h.promptOK(t, runID, stageID, priv)
+	if !strings.Contains(got, "URL: https://ghe.example/o/n/issues/42") {
+		t.Errorf("prompt must render the fetched html_url over the github.com format string:\n%s", got)
+	}
+	if strings.Contains(got, "https://github.com/o/n/issues/42") {
+		t.Errorf("format-string URL must not appear when the fetch returned html_url:\n%s", got)
+	}
+	if !h.gh.called || h.gh.gotInst != installation || h.gh.gotNum != 42 {
+		t.Errorf("issueGetter not called as expected: %+v", h.gh)
+	}
+	if rows := h.unresolvedRows(t); len(rows) != 0 {
+		t.Errorf("resolved GitHub fetch wrote %d issue_context_unresolved rows, want 0", len(rows))
+	}
+}
+
+// TestFillIssueContext_GitHubFamily_FormatStringFallbackWhenNoHTMLURL keeps
+// the pre-#3347 github.com URL for a github-family run whose fetch carries
+// no html_url — the ONE case the format string is still legitimate.
+func TestFillIssueContext_GitHubFamily_FormatStringFallbackWhenNoHTMLURL(t *testing.T) {
+	h := newIssueContextHarness(t, nil)
+	installation := int64(99)
+	row := &run.Run{Repo: "o/n", InstallationID: &installation}
+	h.gh.issue = &githubclient.Issue{Number: 42, Title: "T", Body: "B", State: "open"}
+	runID, stageID, priv := h.seed(t, row, run.StageTypeImplement)
+
+	got := h.promptOK(t, runID, stageID, priv)
+	if !strings.Contains(got, "URL: https://github.com/o/n/issues/42") {
+		t.Errorf("github-family run with no html_url must fall back to the github.com format string:\n%s", got)
+	}
+}
+
+// TestFillIssueContext_Unresolved_WarnsAndAudits is fix (3): one subtest per
+// unresolved reason. Each asserts a 200 (the prompt still renders), exactly
+// ONE issue_context_unresolved audit row carrying reason + forge, exactly ONE
+// unresolved WARN, and — for a non-github family — no github.com URL. The
+// resolved control asserts zero rows. One subtest drives /prompt-render to
+// pin the second handler's emit call.
+func TestFillIssueContext_Unresolved_WarnsAndAudits(t *testing.T) {
+	type tc struct {
+		name       string
+		resolver   func(*testing.T) func(string) (forge.Forge, error)
+		row        func() *run.Run
+		gh         func(*stubIssueGetter)
+		wantReason string
+		wantForge  string
+		render     bool // drive /prompt-render instead of the signed /prompt
+	}
+	ghRow := func() *run.Run { return &run.Run{Repo: "o/n"} }
+	ghRowWithInstallation := func() *run.Run {
+		inst := int64(99)
+		return &run.Run{Repo: "o/n", InstallationID: &inst}
+	}
+	nilResolver := func(*testing.T) func(string) (forge.Forge, error) { return nil }
+	cases := []tc{
+		{
+			name: "github_no_installation_no_credential", resolver: nilResolver, row: ghRow,
+			wantReason: issueContextReasonNoCredential, wantForge: "github",
+		},
+		{
+			name: "github_no_installation_no_credential_prompt_render", resolver: nilResolver, row: ghRow,
+			wantReason: issueContextReasonNoCredential, wantForge: "github", render: true,
+		},
+		{
+			name: "github_stub_error_fetch_failed", resolver: nilResolver, row: ghRowWithInstallation,
+			gh:         func(g *stubIssueGetter) { g.getErr = errors.New("api down") },
+			wantReason: issueContextReasonFetchFailed, wantForge: "github",
+		},
+		{
+			name: "github_repo_unparseable", resolver: nilResolver,
+			row:        func() *run.Run { r := ghRowWithInstallation(); r.Repo = "not-a-repo"; return r },
+			wantReason: issueContextReasonRepoUnparseable, wantForge: "github",
+		},
+		{
+			name:     "gitlab_ci_nil_ref_no_credential",
+			resolver: nilResolver,
+			row: func() *run.Run {
+				return &run.Run{Repo: "grp/sub/proj", RunnerKind: run.RunnerKindGitLabCI}
+			},
+			wantReason: issueContextReasonNoCredential, wantForge: webhook.ForgeGitLab,
+		},
+		{
+			name: "gitlab_resolver_error_forge_unresolved",
+			resolver: func(*testing.T) func(string) (forge.Forge, error) {
+				return func(string) (forge.Forge, error) { return nil, errors.New("registry unavailable") }
+			},
+			row: gitlabRun, wantReason: issueContextReasonForgeUnresolved, wantForge: webhook.ForgeGitLab,
+		},
+		{
+			name: "gitlab_nil_forge_forge_unresolved",
+			resolver: func(*testing.T) func(string) (forge.Forge, error) {
+				return func(string) (forge.Forge, error) { return nil, nil }
+			},
+			row: gitlabRun, wantReason: issueContextReasonForgeUnresolved, wantForge: webhook.ForgeGitLab,
+		},
+		{
+			name: "gitlab_typed_nil_forge_forge_unresolved",
+			resolver: func(*testing.T) func(string) (forge.Forge, error) {
+				return func(string) (forge.Forge, error) {
+					var f *forgegitlab.Forge
+					return f, nil
+				}
+			},
+			row: gitlabRun, wantReason: issueContextReasonForgeUnresolved, wantForge: webhook.ForgeGitLab,
+		},
+		{
+			name: "gitlab_forge_without_issue_operations_forge_unresolved",
+			resolver: func(*testing.T) func(string) (forge.Forge, error) {
+				return func(string) (forge.Forge, error) { return splitParentNoIssueOpsForge{}, nil }
+			},
+			row: gitlabRun, wantReason: issueContextReasonForgeUnresolved, wantForge: webhook.ForgeGitLab,
+		},
+		{
+			name: "gitlab_fake_500_fetch_failed",
+			resolver: func(t *testing.T) func(string) (forge.Forge, error) {
+				fake, r := newGitLabIssueForge(t)
+				fake.issueStatus = http.StatusInternalServerError
+				return r
+			},
+			row: gitlabRun, wantReason: issueContextReasonFetchFailed, wantForge: webhook.ForgeGitLab,
+		},
+		{
+			name: "gitlab_repo_unparseable",
+			resolver: func(t *testing.T) func(string) (forge.Forge, error) {
+				_, r := newGitLabIssueForge(t)
+				return r
+			},
+			row:        func() *run.Run { r := gitlabRun(); r.Repo = "trailing-slash/"; return r },
+			wantReason: issueContextReasonRepoUnparseable, wantForge: webhook.ForgeGitLab,
+		},
+		{
+			name: "cached_context_empty", resolver: nilResolver,
+			row: func() *run.Run {
+				r := gitlabRun()
+				r.IssueContext = &run.IssueContext{Number: 42}
+				return r
+			},
+			wantReason: issueContextReasonCachedContextEmpty, wantForge: webhook.ForgeGitLab,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newIssueContextHarness(t, c.resolver(t))
+			if c.gh != nil {
+				c.gh(h.gh)
+			}
+			runID, stageID, priv := h.seed(t, c.row(), run.StageTypeImplement)
+
+			var got string
+			if c.render {
+				w := promptRenderRequest(t, h.s, stageID)
+				if w.Code != http.StatusOK {
+					t.Fatalf("prompt-render status = %d, want 200:\n%s", w.Code, w.Body.String())
+				}
+				got = w.Body.String()
+			} else {
+				got = h.promptOK(t, runID, stageID, priv)
+			}
+			if c.wantForge != "github" && strings.Contains(got, "https://github.com/") {
+				t.Errorf("non-github run fabricated a github.com URL:\n%s", got)
+			}
+			rows := h.unresolvedRows(t)
+			if len(rows) != 1 {
+				t.Fatalf("wrote %d issue_context_unresolved rows, want exactly 1: %v", len(rows), rows)
+			}
+			if rows[0]["reason"] != c.wantReason || rows[0]["forge"] != c.wantForge {
+				t.Errorf("row = %v, want reason=%q forge=%q", rows[0], c.wantReason, c.wantForge)
+			}
+			if rows[0]["run_id"] != runID.String() || rows[0]["stage_id"] != stageID.String() || rows[0]["issue"] != float64(42) {
+				t.Errorf("row identity = %v, want run %s / stage %s / issue 42", rows[0], runID, stageID)
+			}
+			if n := h.unresolvedWarns(); n != 1 {
+				t.Errorf("logged %d unresolved WARNs, want exactly 1:\n%s", n, h.logs.String())
+			}
+			if !strings.Contains(h.logs.String(), `"reason":"`+c.wantReason+`"`) {
+				t.Errorf("WARN must carry reason %q:\n%s", c.wantReason, h.logs.String())
+			}
+		})
+	}
+
+	t.Run("resolved_control_zero_rows", func(t *testing.T) {
+		h := newIssueContextHarness(t, nil)
+		row := gitlabRun()
+		row.IssueContext = &run.IssueContext{Number: 42, Title: "T", Body: "B"}
+		runID, stageID, priv := h.seed(t, row, run.StageTypeImplement)
+		_ = h.promptOK(t, runID, stageID, priv)
+		if rows := h.unresolvedRows(t); len(rows) != 0 {
+			t.Errorf("resolved context wrote %d issue_context_unresolved rows, want 0", len(rows))
+		}
+		if n := h.unresolvedWarns(); n != 0 {
+			t.Errorf("resolved context logged %d unresolved WARNs, want 0", n)
 		}
 	})
 }

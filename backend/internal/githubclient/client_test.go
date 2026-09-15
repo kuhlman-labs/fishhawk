@@ -799,7 +799,7 @@ func TestReadBriefBody(t *testing.T) {
 
 func TestGetIssue_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
-	fg.getIssueBody = `{"number":42,"title":"Add foo","body":"Body text","state":"open"}`
+	fg.getIssueBody = `{"number":42,"title":"Add foo","body":"Body text","state":"open","html_url":"https://ghe.example/x/y/issues/42"}`
 	c, _ := newTestClient(t, srv, nil)
 
 	got, err := c.GetIssue(context.Background(), forge.FromGitHubInstallationID(99), RepoRef{Owner: "x", Name: "y"}, 42)
@@ -808,6 +808,11 @@ func TestGetIssue_HappyPath(t *testing.T) {
 	}
 	if got.Number != 42 || got.Title != "Add foo" || got.Body != "Body text" || got.State != "open" {
 		t.Errorf("decoded issue = %+v", got)
+	}
+	// html_url is decoded verbatim (E45.42 / #3347): the prompt handler
+	// prefers the forge-reported browse URL over a fabricated one.
+	if got.HTMLURL != "https://ghe.example/x/y/issues/42" {
+		t.Errorf("HTMLURL = %q, want the payload's html_url", got.HTMLURL)
 	}
 	if fg.gotMethod != "GET" {
 		t.Errorf("method = %q", fg.gotMethod)

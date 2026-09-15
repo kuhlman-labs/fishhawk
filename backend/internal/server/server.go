@@ -438,17 +438,18 @@ type Config struct {
 	PRStateReader PullRequestStateReader
 
 	// ForgeResolver is the injectable forge-registry lookup a NON-GitHub
-	// forge family is resolved through. Two consumers share it: the
+	// forge family is resolved through. Three consumers share it: the
 	// merge-observation verb's pull-request read (E64.40 / #3151, see
-	// PRStateReader) and the E50.6 split-parent auto-close watcher's
-	// forge.IssueOperations resolution (E50.17 / #2900, see
-	// splitParentIssueOpsFor), which additionally type-asserts the resolved
-	// forge to the capability and treats a forge lacking it as nil. Nil
+	// PRStateReader), and — through the shared issueOpsFor ladder, which
+	// additionally type-asserts the resolved forge to forge.IssueOperations
+	// and treats a forge lacking it as nil — the E50.6 split-parent
+	// auto-close watcher (E50.17 / #2900) and the prompt handler's
+	// forge-neutral issue fetch (fillIssueContext, E45.42 / #3347). Nil
 	// defaults to forge.Get, so production needs no serve.go wiring —
 	// serve.go already registers both forges at startup. It is the seam a
 	// test injects its own resolver through rather than depending on ambient
 	// global registration. A github-family run or delivery NEVER reaches it
-	// in either consumer — both resolve GitHub ONLY through cfg.GitHub — so
+	// in any consumer — all resolve GitHub ONLY through cfg.GitHub — so
 	// registry availability can never change a GitHub outcome.
 	ForgeResolver func(id string) (forge.Forge, error)
 
