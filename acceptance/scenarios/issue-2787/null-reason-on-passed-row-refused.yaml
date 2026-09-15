@@ -1,0 +1,14 @@
+id: scenario:issue-2787/null-reason-on-passed-row-refused
+statement: 'Shipping an acceptance verdict whose criteria row carries `"undecidable_reason": null` on a `passed` result is refused: `POST /v0/runs/{run_id}/acceptance?stage_id={acceptance_stage_id}` returns HTTP 400 with error code `acceptance_invalid` for body `{"verdict":"passed","criteria":[{"id":"c1","result":"passed","undecidable_reason":null}]}`.'
+verify_hint: 'HTTP: authenticate with a bearer token carrying write:runs, pick any run whose stage of type acceptance exists (GET /v0/runs, then its stages), POST the body above to /v0/runs/{run_id}/acceptance?stage_id={that stage id}; expect status 400 and `acceptance_invalid` in the response body. The validate step runs before any persistence precondition, so the stage''s state does not matter.'
+steps: 'POST /v0/dev/fixtures {scenario:acceptance-dispatched} -> 201 (run bfef778e-7235-4cf4-921f-64c6099c0188, acceptance stage 8ec4ba07-37da-47be-9b97-c1277f413300, state running). No bearer token exists on the preview, so the runner-equivalent auth was used: POST /v0/runs/{run}/signing-key, POST /v0/dev/sign over the exact body bytes with X-Fishhawk-Dev-Private-Key, then POST /v0/runs/{run}/acceptance?stage_id={acc} with X-Fishhawk-Signature: <sig> and body {"verdict":"passed","criteria":[{"id":"c1","result":"passed","undecidable_reason":null}]}. Also sent the failed-row and skipped-row variants with undecidable_reason:null.'
+assertions:
+    expected: HTTP 400 with error code acceptance_invalid.
+    observed_at_record: 'HTTP 400 {error:{code:acceptance_invalid, message:''acceptance body missing or malformed fields'', details:{error:''criteria[0].undecidable_reason must be omitted when result is "passed"''}}}. Failed-row and skipped-row null variants: 400 acceptance_invalid with the matching ''must be omitted when result is "failed"/"skipped"'' detail.'
+    repro_handle: POST http://localhost:8090/v0/runs/bfef778e-7235-4cf4-921f-64c6099c0188/acceptance?stage_id=8ec4ba07-37da-47be-9b97-c1277f413300 body {"verdict":"passed","criteria":[{"id":"c1","result":"passed","undecidable_reason":null}]} with X-Fishhawk-Signature from /v0/dev/sign
+origin:
+    issue: 2787
+    pr: 3441
+    run_id: cc824c91-6a61-442e-aa27-afb11d0fa386
+    head_sha: 0a655a9ce9d81f28563642de43e562274800368d
+    recorded_at: 2026-09-15T04:20:30Z
