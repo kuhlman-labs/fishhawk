@@ -649,6 +649,24 @@ Notes:
   prompt's gate-evidence section as a reviewer-judged advisory. Listed here
   only so a future reader grepping the audit categories doesn't mistake it
   for a comment surface.
+- The plan-gate generated-surface REFUSAL audit kind —
+  `plan_generated_surface_retry` (#3437), written by the plan upload handler
+  (`server/generated_surface_gate.go::tryGeneratedSurfaceRetry`) when it
+  refuses a plan scoping a canonical source without its generated
+  derivative(s) — is an **internal, system-actor audit kind, not an
+  issue-comment surface**. Nothing in `issuecomment` posts it to the issue
+  thread. It is the DETERMINISTIC counterpart to the advisory
+  `plan_test_sweep` `generated_surface` finding: re-derived scope-set-only
+  (independent of the GitHub Contents API), it re-opens and re-dispatches the
+  plan stage ONCE with the missing derivatives fed back. It is BOTH the
+  one-shot budget counter (`maxPlanGeneratedSurfaceRetries = 1`, counted
+  atomically) and the feedback source the corrective re-dispatch's binding
+  `### Generated-surface scope restoration` prompt section reads back. Payload
+  `{run_id, stage_id, attempt, findings:[{trigger_path, missing_tests,
+  generator, sub_plan_title}], required_scope_files}`. Fails closed on budget
+  exhaustion / any error (degrading to the advisory review path, never a
+  terminal fail). Listed here only so a future reader grepping the audit
+  categories doesn't mistake it for a comment surface.
 - The plan-gate warnings audit kind — `plan_warnings` (#1684), written by
   the plan upload handler (`server/plan_warnings.go::runPlanWarnings`)
   immediately after `plan_test_sweep` and before plan review — is an

@@ -1371,6 +1371,12 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// accessor is a pure projection. Set on BOTH prompt handlers so the
 		// signed prompt and the render preview stay byte-identical.
 		trigger.SurfaceCouplingPatterns = surfaceCouplingPatternsForPrompt()
+		// Generated-surface derivative map + restoration (#3437): thread the
+		// generated_surface rule-table projection (first-shot prevention) and,
+		// after a refusal, the binding restoration section. Set on BOTH prompt
+		// handlers so the signed prompt and the render preview stay byte-identical.
+		trigger.GeneratedSurfaceRelations = generatedSurfaceRelationsForPrompt()
+		trigger.GeneratedSurfaceRestoration = s.loadGeneratedSurfaceRestoration(r.Context(), runRow.ID, stage.ID)
 		if runRow.TriggerRef != nil {
 			// #2680: thread BOTH the feedback text and the rejecting run's id
 			// so buildPlan's truncation marker can name a concrete retrieval
@@ -2025,6 +2031,12 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// accessor is a pure projection. Set on BOTH prompt handlers so the
 		// signed prompt and the render preview stay byte-identical.
 		trigger.SurfaceCouplingPatterns = surfaceCouplingPatternsForPrompt()
+		// Generated-surface derivative map + restoration (#3437): thread the
+		// generated_surface rule-table projection (first-shot prevention) and,
+		// after a refusal, the binding restoration section. Set on BOTH prompt
+		// handlers so the signed prompt and the render preview stay byte-identical.
+		trigger.GeneratedSurfaceRelations = generatedSurfaceRelationsForPrompt()
+		trigger.GeneratedSurfaceRestoration = s.loadGeneratedSurfaceRestoration(r.Context(), runRow.ID, stage.ID)
 		if runRow.TriggerRef != nil {
 			// #2680: thread BOTH the feedback text and the rejecting run's id
 			// so buildPlan's truncation marker can name a concrete retrieval

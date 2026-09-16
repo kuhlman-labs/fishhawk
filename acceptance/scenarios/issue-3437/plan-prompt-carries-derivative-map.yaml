@@ -1,0 +1,14 @@
+id: scenario:issue-3437/plan-prompt-carries-derivative-map
+statement: The rendered plan-stage prompt for any run contains a 'Generated-surface derivative map' block that lists docs/api/v0.openapi.yaml generating site/src/content/docs/reference/api.md via scripts/gen-site-reference, and states the gate refuses a plan scoping a trigger without its derivatives.
+verify_hint: Start a run on any issue and GET /v0/stages/{plan_stage_id}/prompt-render (or /prompt); the body's prompt field contains 'Generated-surface derivative map' and the line naming scripts/gen-site-reference, docs/api/v0.openapi.yaml and site/src/content/docs/reference/api.md.
+steps: POST /v0/dev/fixtures {scenario:trace-upload-target} -> 201 (run efe72091-62a3-43ef-8ccf-ba92d9498610, plan stage f5a7762d-d2c6-4d02-bae0-1eabb65f80ab, dispatched). GET /v0/stages/{plan}/prompt-render (unsigned) -> 200; searched the prompt field for the block and the docs/api/v0.openapi.yaml line.
+assertions:
+    expected: Prompt contains a 'Generated-surface derivative map' block listing docs/api/v0.openapi.yaml generating site/src/content/docs/reference/api.md via scripts/gen-site-reference, and states the gate refuses a plan scoping a trigger without its derivatives.
+    observed_at_record: 'Prompt contains ''Generated-surface derivative map (#3437): the plan gate REFUSES — before any reviewer runs, with one bounded in-run re-dispatch — a plan that scopes a canonical source below without EVERY listed derivative in the SAME scope.files ...'' followed by ''- scripts/gen-site-reference: docs/api/v0.openapi.yaml generates [site/src/content/docs/reference/api.md]'' (plus the docs/spec schema and cli/internal/cmdinfo/cmdinfo.go relations and the scripts/sync-schemas mirrors).'
+    repro_handle: curl -s http://localhost:8090/v0/stages/f5a7762d-d2c6-4d02-bae0-1eabb65f80ab/prompt-render | grep -o 'Generated-surface derivative map.\{0,600\}'
+origin:
+    issue: 3437
+    pr: 3459
+    run_id: 473e1d81-2915-4b08-92b9-540ba42e7580
+    head_sha: abe16ebc6b9f64cdfe136501981f013e016bb650
+    recorded_at: 2026-09-16T15:27:44Z

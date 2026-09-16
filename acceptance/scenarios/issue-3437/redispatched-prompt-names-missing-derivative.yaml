@@ -1,0 +1,14 @@
+id: scenario:issue-3437/redispatched-prompt-names-missing-derivative
+statement: After a refusal, the re-dispatched plan stage's rendered prompt contains a 'Generated-surface scope restoration' section naming the trigger, the missing derivative path and the generator command, plus the refused plan to re-emit.
+verify_hint: After the refusal above, GET /v0/stages/{plan_stage_id}/prompt-render; the prompt field contains '### Generated-surface scope restoration (binding — this plan was REFUSED)', site/src/content/docs/reference/api.md, scripts/gen-site-reference and 'Refused plan'.
+steps: POST /v0/dev/fixtures {scenario:trace-upload-target} -> 201; POST /v0/runs/{run}/signing-key; signed GET /v0/stages/{plan}/prompt (stage running); signed POST /v0/runs/{run}/plan?stage_id={plan} with a standard_v1 plan scoping only docs/api/v0.openapi.yaml -> 201 and refused by the gate (plan_generated_surface_retry written, stage re-dispatched). On that run (07db90e7-5dea-4734-88a5-0bb3050474a2 / plan stage 1a9b079c-bc9a-4def-85aa-ed7a9935f95e) GET /v0/stages/{plan}/prompt-render -> 200 and searched the prompt field. Then signed GET /v0/stages/{plan}/prompt and signed POST /v0/runs/{run}/plan?stage_id={plan} with the derivative-carrying plan -> 201; re-read audit and stage.
+assertions:
+    expected: Prompt contains '### Generated-surface scope restoration (binding — this plan was REFUSED)', site/src/content/docs/reference/api.md, scripts/gen-site-reference and 'Refused plan' with the plan to re-emit.
+    observed_at_record: 'Prompt opens with ''### Generated-surface scope restoration (binding — this plan was REFUSED)'', lists ''- docs/api/v0.openapi.yaml generates site/src/content/docs/reference/api.md via `scripts/gen-site-reference`'', names the two admissible remedies, and carries ''Refused plan (re-emit it with the derivative paths added — do NOT replan blank-slate):'' followed by the exact refused plan JSON (scope.files = docs/api/v0.openapi.yaml only). The re-emitted plan with the derivative was admitted: retry entries remained 1 and the stage reached awaiting_approval.'
+    repro_handle: curl -s http://localhost:8090/v0/stages/1a9b079c-bc9a-4def-85aa-ed7a9935f95e/prompt-render (re-drive the refusal on a fresh seed first; this stage has since been admitted)
+origin:
+    issue: 3437
+    pr: 3459
+    run_id: 473e1d81-2915-4b08-92b9-540ba42e7580
+    head_sha: abe16ebc6b9f64cdfe136501981f013e016bb650
+    recorded_at: 2026-09-16T15:27:44Z
