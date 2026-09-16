@@ -28,7 +28,10 @@
 # so two verifies never contend on golangci-lint's global lock or the shared
 # testcontainers Postgres. A SHELL-kind invocation meeting a live holder REFUSES
 # immediately (it does not poll); a RUNNER-kind one (FISHHAWK_VERIFY_LOCK_OWNER=
-# runner) waits up to 600s. Long form: scripts/README.md.
+# runner) waits up to 600s. FISHHAWK_VERIFY_LOCK_PATH overrides the lock's
+# location: the runner's throwaway verify checkout is a CLONE with its own
+# common dir (ADR-063 / #2134), so the runner injects the primary repository's
+# lock path to keep contending with shell verifies. Long form: scripts/README.md.
 #
 # Frontend gates (pnpm format:check / typecheck / test) are NOT
 # covered here — they have their own conventions per docs/.
@@ -1209,13 +1212,17 @@ _verify_site_ia() {
 # the loser fails category-B behind a misleading scope-drift framing (#2645). The
 # lock makes that structurally impossible on the normal path.
 #
-# KEY: <git-common-dir>/fishhawk-verify.lock. The common dir is SHARED by the
-# main checkout and every linked worktree, so the runner's throwaway verify
-# worktree and the agent's run worktree genuinely contend — which a TMPDIR-keyed
-# path would not guarantee, since the runner's gate env is a default-deny
-# allow-list and a differing TMPDIR would leave the control inert while appearing
-# to work. Living inside .git also keeps it invisible to `git status`, so it can
-# never pollute the scope-completeness or untracked-file gates.
+# KEY: <git-common-dir>/fishhawk-verify.lock, or $FISHHAWK_VERIFY_LOCK_PATH when
+# set. The common dir is SHARED by the main checkout and every linked worktree,
+# so an agent's run worktree and a shell verify in the main checkout genuinely
+# contend — which a TMPDIR-keyed path would not guarantee, since the runner's
+# gate env is a default-deny allow-list and a differing TMPDIR would leave the
+# control inert while appearing to work. The runner's throwaway verify checkout
+# is a CLONE with a common dir of its own (ADR-063 / #2134), so the runner
+# injects the PRIMARY's lock path via FISHHAWK_VERIFY_LOCK_PATH; see
+# _verify_lock_path. Living inside .git also keeps it invisible to `git
+# status`, so it can never pollute the scope-completeness or untracked-file
+# gates.
 #
 # PRIMITIVE: an atomic symlink whose TARGET is `<pid>:<kind>` (kind is `runner`
 # or `shell`). `ln -s` is one symlink(2) that fails EEXIST if the path is taken,
@@ -1314,13 +1321,41 @@ _verify_lock_kind() {
   fi
 }
 
-# _verify_lock_path: <git-common-dir>/fishhawk-verify.lock, or non-zero plus a
-# printed reason when locking is not possible. Three DEGRADES, each to NO
-# locking rather than to a failure: git absent, $ROOT not a work tree, and a BARE
-# repo. The bare-repo case guards on the printed `--is-inside-work-tree` VALUE,
-# not its exit status, because a bare repo prints `false` yet exits 0 — the same
-# trap _verify_schema_sync documents.
+# _verify_lock_path: $FISHHAWK_VERIFY_LOCK_PATH when set, else
+# <git-common-dir>/fishhawk-verify.lock; or non-zero plus a printed reason when
+# locking is not possible.
+#
+# The OVERRIDE is consulted FIRST (ADR-063 / #2134). The runner's throwaway
+# verify checkout is no longer a linked worktree sharing this repository's
+# common dir — it is a `git clone --no-hardlinks` with a common dir of its OWN,
+# so the common-dir derivation below would key the runner's lock to a directory
+# nothing else ever looks at, and the #2645 contention (a runner verify and an
+# agent-shell verify racing on golangci-lint's global lock and the shared
+# testcontainers Postgres) would silently reopen. The runner therefore resolves
+# the PRIMARY repository's `<git-common-dir>/fishhawk-verify.lock` and injects it
+# as FISHHAWK_VERIFY_LOCK_PATH after sanitization — the same post-sanitization
+# injection FISHHAWK_VERIFY_LOCK_OWNER rides (the gate env is a default-deny
+# allow-list, so an ambient value never reaches the gate subprocess; the name is
+# additionally on the runner's and the CLI's explicit deny-lists). An override
+# whose PARENT directory does not exist degrades to NO locking with a one-line
+# reason naming the variable, never to a lock silently keyed elsewhere.
+#
+# Unset, the derivation is unchanged. Three DEGRADES, each to NO locking rather
+# than to a failure: git absent, $ROOT not a work tree, and a BARE repo. The
+# bare-repo case guards on the printed `--is-inside-work-tree` VALUE, not its
+# exit status, because a bare repo prints `false` yet exits 0 — the same trap
+# _verify_schema_sync documents.
 _verify_lock_path() {
+  if [ -n "${FISHHAWK_VERIFY_LOCK_PATH:-}" ]; then
+    local override="$FISHHAWK_VERIFY_LOCK_PATH" parent
+    parent="$(dirname "$override")"
+    if [ ! -d "$parent" ]; then
+      echo "scripts/test: FISHHAWK_VERIFY_LOCK_PATH=$override names a lock whose parent directory does not exist — running verify without the concurrency lock" >&2
+      return 1
+    fi
+    printf '%s' "$override"
+    return 0
+  fi
   if ! command -v git >/dev/null 2>&1; then
     echo "scripts/test: git not found — running verify without the concurrency lock" >&2
     return 1
@@ -1561,7 +1596,8 @@ _verify_lock_prune_and_acquire() {
 # _verify_lock_recover_marker's refusal to break a claim it did not create.
 VERIFY_LOCK_UNSETTLED_MSG='scripts/test: the verify lock never settled — refusing rather than proceeding under an uncertain lock state.
 If this repeats, a pruner was killed holding a recovery claim: inspect and remove
-<git-common-dir>/fishhawk-verify.lock.prune and its .reap.* siblings by hand.'
+<git-common-dir>/fishhawk-verify.lock.prune (or <FISHHAWK_VERIFY_LOCK_PATH>.prune when
+the override is set) and its .reap.* siblings by hand.'
 
 # _acquire_verify_lock_at <lockpath>: the acquisition loop. Returns 0 when this
 # invocation may proceed (it holds the lock), 1 when it must REFUSE. Split from

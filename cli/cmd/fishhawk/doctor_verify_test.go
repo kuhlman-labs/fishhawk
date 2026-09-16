@@ -742,6 +742,57 @@ func TestVerifyEnvDenied_GooglePrefix(t *testing.T) {
 	}
 }
 
+// TestVerifyEnvDenied_VerifyControlVariables pins the three verify-control
+// variables denied BY NAME on the CLI side: FISHHAWK_VERIFY_PACKAGES (narrows
+// `scripts/test verify`'s test loop), FISHHAWK_VERIFY_LOCK_OWNER (claims
+// runner-kind ownership of the verify lock) and FISHHAWK_VERIFY_LOCK_PATH
+// (re-keys that lock; ADR-063 / #2134). TestVerifyEnvDenied_GooglePrefix
+// above ranges over verifyEnvDeny ITSELF, so a DROPPED entry is invisible to
+// it — the map simply has one fewer key to check. Spelling each name here is
+// what makes a deletion from the CLI copy red on THIS side, without depending
+// on the runner's cross-module lockstep test. Each name is asserted against
+// BOTH layers (denied AND not allowed), so a single-layer regression reddens
+// too. Also asserts end to end through sanitizeVerifyEnv that an ambient value
+// of each is dropped while a toolchain var survives.
+func TestVerifyEnvDenied_VerifyControlVariables(t *testing.T) {
+	names := []string{
+		"FISHHAWK_VERIFY_PACKAGES",
+		"FISHHAWK_VERIFY_LOCK_OWNER",
+		"FISHHAWK_VERIFY_LOCK_PATH",
+	}
+	for _, k := range names {
+		if !verifyEnvDenied(k) {
+			t.Errorf("verifyEnvDenied(%q) = false — the verify-control deny entry is missing from the CLI copy", k)
+		}
+		if verifyEnvAllowed(k) {
+			t.Errorf("verifyEnvAllowed(%q) = true — the allow-list was widened to admit a verify-control variable", k)
+		}
+	}
+	base := []string{
+		"FISHHAWK_VERIFY_PACKAGES=attacker/pkg",
+		"FISHHAWK_VERIFY_LOCK_OWNER=runner",
+		"FISHHAWK_VERIFY_LOCK_PATH=/nowhere/attacker-keyed.lock",
+		"GOPATH=/home/op/go",
+	}
+	got := sanitizeVerifyEnv(base)
+	for _, kv := range got {
+		for _, k := range names {
+			if strings.HasPrefix(kv, k+"=") {
+				t.Errorf("sanitizeVerifyEnv admitted the ambient %s: %q", k, kv)
+			}
+		}
+	}
+	found := false
+	for _, kv := range got {
+		if kv == "GOPATH=/home/op/go" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("sanitizeVerifyEnv dropped the toolchain var GOPATH: %q", got)
+	}
+}
+
 // TestSanitizeVerifyEnv_DropsGoogleCredentials is the end-to-end pin over
 // sanitizeVerifyEnv: both Google credential keys are dropped while PATH and the
 // toolchain vars survive with their values intact.

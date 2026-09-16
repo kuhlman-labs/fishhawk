@@ -452,13 +452,34 @@ Two concurrent `scripts/test verify` invocations on one worktree family contend
 on golangci-lint's global lock and on the shared testcontainers Postgres, and the
 loser fails category-B behind a misleading scope-drift framing (#2645).
 
-- **Key**: `<git-common-dir>/fishhawk-verify.lock`. The common dir is SHARED by
-  the main checkout and every linked worktree, so the runner's throwaway verify
-  worktree and the agent's run worktree genuinely contend. A TMPDIR-keyed path
-  would not guarantee that (the runner's gate env is a default-deny allow-list, so
-  a differing TMPDIR would leave the control inert while appearing to work).
-  Living inside `.git` also keeps it invisible to `git status`, so it can never
-  pollute the scope-completeness or untracked-file gates.
+- **Key**: `<git-common-dir>/fishhawk-verify.lock`, or `$FISHHAWK_VERIFY_LOCK_PATH`
+  when set (below). The common dir is SHARED by the main checkout and every
+  linked worktree, so an agent's run worktree and a shell verify in the main
+  checkout genuinely contend. A TMPDIR-keyed path would not guarantee that (the
+  runner's gate env is a default-deny allow-list, so a differing TMPDIR would
+  leave the control inert while appearing to work). Living inside `.git` also
+  keeps it invisible to `git status`, so it can never pollute the
+  scope-completeness or untracked-file gates.
+- **Override** (`FISHHAWK_VERIFY_LOCK_PATH`, ADR-063 / #2134): `_verify_lock_path`
+  consults it FIRST. The runner's throwaway verify checkout is a
+  `git clone --no-hardlinks` with a common dir of its OWN — not a linked
+  worktree — so the derivation above would key the runner's lock to a directory
+  no shell verify ever looks at and the #2645 contention would reopen while
+  looking locked. The runner resolves the PRIMARY repository's
+  `<git-common-dir>/fishhawk-verify.lock` (`verifyLockPathEnv`,
+  `runner/cmd/fishhawk-runner/verifyscope.go`) and injects it after
+  sanitization, the same post-sanitization ride `FISHHAWK_VERIFY_LOCK_OWNER`
+  takes; the name is on BOTH explicit deny-lists (runner `gateEnvDeny`, CLI
+  `verifyEnvDeny`) as well as off every allow-list, so an ambient value can
+  never re-key a gate child's lock. Set with a usable parent directory → that
+  path is the lock, byte-exact. Set with a parent directory that does not exist
+  → DEGRADES to no locking with a one-line reason naming the variable (never a
+  lock silently keyed elsewhere, never a failure, never a `mkdir`). Unset or
+  empty → the common-dir derivation, unchanged. Pinned by
+  `scripts/test-verify-scope` b14–b16 (b14 drives the real verify from a clone
+  against a holder at the override path, and shows the same run WITHOUT the
+  variable never meets it) and, cross-boundary, by the runner's
+  `TestRunnerEnvDrivesRealScriptsTestVerify` lock-path arm.
 - **Primitive**: an atomic symlink whose TARGET is `<pid>:<kind>` — one
   `symlink(2)` that fails `EEXIST` if the path is taken, so the lock carries both
   its owner and its kind from the instant it exists. Same construction as the
@@ -487,6 +508,8 @@ the 600/2 defaults, and `FISHHAWK_VERIFY_LOCK_SELF_PID` injects this invocation'
 identity. All three are DEV-ONLY in the same sense as the other `FISHHAWK_*`
 knobs: the runner's gate env is a default-deny allow-list and `FISHHAWK_` is not
 an allowed prefix, so an ambient value never reaches the gate subprocess.
+`FISHHAWK_VERIFY_LOCK_PATH` is the one lock variable the runner DOES set — by
+its own post-sanitization injection only, never inherited (see "Override").
 
 ### The prune is SERIALISED, not merely narrowed
 
@@ -636,6 +659,18 @@ no Go toolchain) is wired into `_verify_gate_harnesses`, so a regression fails
   linked worktree resolves the SAME lock path (which is what makes the control
   contend at all); the three release branches; and one case per classification
   verdict.
+- **b14–b16** cover the `FISHHAWK_VERIFY_LOCK_PATH` override (ADR-063 / #2134):
+  `b14` runs the real verify from a `git clone` of the fixture (a genuinely
+  separate common dir) against a live shell holder at the override path — the
+  shell-kind refusal names the OVERRIDE path and the clone's own common dir gets
+  no lock; runner-kind at a zero budget displaces that holder naming the override
+  path and releases it on exit; and the SAME runner-kind run WITHOUT the
+  variable proceeds unaware of the holder, prints no warning and leaves it
+  standing (the reopened-#2645 shape the override closes); plus the byte-exact
+  unit resolution. `b15` is the missing-parent DEGRADE (non-zero from
+  `_verify_lock_path`, the reason names the variable, `_acquire_verify_lock`
+  proceeds unlocked, no lock in the common dir, the parent is never created).
+  `b16` pins that UNSET and EMPTY both resolve the common-dir lock unchanged.
 - There is deliberately **no wall-clock assertion anywhere**. The issue's "under
   10 minutes" outcome is established by measurement recorded in the #3315 PR
   notes, not by a timing bound that would be a flake risk.
