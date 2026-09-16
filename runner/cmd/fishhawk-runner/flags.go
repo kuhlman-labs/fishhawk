@@ -46,8 +46,10 @@ type config struct {
 	// implement stage and nil everywhere else. Same runtime-set idiom as
 	// agentBinary/agentVersion above.
 	//
-	// config is copied BY VALUE into every callee, but this field is a
-	// POINTER, so both openPRAndShipArtifact calls of a base-rebase-conflict
+	// config is copied BY VALUE into nearly every callee (runVerifyFixLoop
+	// takes *config since #3434 so its mid-loop re-fold writes back), but
+	// this field is a POINTER, so both openPRAndShipArtifact calls of a
+	// base-rebase-conflict
 	// re-invoke share ONE memo — without adding a 16th parameter to a function
 	// with 38 test call sites and two shared wire goldens that construct its
 	// args directly. A nil handoff is a pure load (agentHandoff's methods are
@@ -144,13 +146,17 @@ type config struct {
 
 	// approvedAmendments is set at runtime (not a flag) by
 	// refreshScopeAmendments (#961): EVERY approved scope-amendment row the
-	// fold fetch read on this pass, including rows whose paths were already
-	// present in scopeFiles (a retry_stage after a late approval). Consumers
-	// that receive cfg BY VALUE after the fold — runVerifyFixLoop's fix
-	// prompt and the unused-grant check (#3390) — read it to name the
-	// authorizing amendment id and the operator's decision_reason per path;
-	// scopeFiles alone cannot tell a planned path from a granted one. nil
-	// when the fold did not run or fetched nothing.
+	// fold fetch read on its most recent pass, including rows whose paths
+	// were already present in scopeFiles (a retry_stage after a late
+	// approval). The verify-fix prompt and the unused-grant check (#3390)
+	// read it to name the authorizing amendment id and the operator's
+	// decision_reason per path; scopeFiles alone cannot tell a planned path
+	// from a granted one. runVerifyFixLoop receives *config (#3434), and its
+	// mid-loop re-fold (refoldScopeAmendmentsMidLoop) RE-POPULATES this
+	// field after each successful fix re-invocation, so an approval that
+	// landed during iteration N is named in iteration N+1's fix prompt and
+	// seen by the post-loop unused-grant check. nil when the fold did not
+	// run or fetched nothing.
 	approvedAmendments []upload.ScopeAmendment
 
 	// agentSelfRetry, maxRetriesSnapshot, and retryAttempt are set at

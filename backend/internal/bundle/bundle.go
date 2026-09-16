@@ -718,8 +718,9 @@ func ExtractScopeDrift(bundleBytes []byte) ([]string, error) {
 	return nil, nil
 }
 
-// ExtractScopeAmendmentsFolded returns the `added` path list carried in the
-// bundle's scope_amendments_folded policy_event — the authoritative
+// ExtractScopeAmendmentsFolded returns the UNION of the `added` path lists
+// carried by EVERY scope_amendments_folded policy_event in the bundle, in
+// bundle order and deduped by path (first occurrence wins) — the authoritative
 // per-commit record of the approved scope-amendment paths the runner folded
 // into the effective scope for THIS commit (#1317). It contrasts with
 // ExtractScopeDrift, which returns the PRE-fold drift snapshot: the trace
@@ -727,18 +728,28 @@ func ExtractScopeDrift(bundleBytes []byte) ([]string, error) {
 // approved-amendment path that landed in the pushed HEAD is not reported to
 // the implement reviewer as drift-excluded.
 //
-// refreshScopeAmendments (runner/cmd/fishhawk-runner/main.go) emits the event
-// only when it folded at least one approved-and-not-already-present path, so
-// an absent event is the ordinary no-amendment case and is NOT an error —
-// it returns (nil, nil). Only a corrupt gzip frame / malformed line
-// propagates as an error. Like ExtractScopeDrift this is a lockstep
-// runner↔backend wire contract; the scopeAmendmentsFoldedPayload tags move
-// with the emitter.
+// The runner emits ONE event PER FOLD (#3434): refreshScopeAmendments
+// (runner/cmd/fishhawk-runner/main.go) emits it for the pre-loop fold, and
+// refoldScopeAmendmentsMidLoop emits another for each verify-fix iteration
+// whose re-fold grew the scope — an approval that landed DURING a fix
+// re-invocation. A mid-loop fold's path lands in the pushed HEAD exactly like
+// a pre-loop fold's, so the review-surface subtraction needs the union; the
+// pre-#3434 first-event-wins read would have left every later fold's path
+// reported as drift. Each event is emitted only when it folded at least one
+// approved-and-not-already-present path, so an absent event is the ordinary
+// no-amendment case and is NOT an error — it returns (nil, nil). Only a
+// corrupt gzip frame / malformed line propagates as an error. Like
+// ExtractScopeDrift this is a lockstep runner↔backend wire contract; the
+// scopeAmendmentsFoldedPayload tags move with the emitter.
 func ExtractScopeAmendmentsFolded(bundleBytes []byte) ([]string, error) {
 	lines, err := ReadEvents(bundleBytes)
 	if err != nil {
 		return nil, err
 	}
+	var (
+		union []string
+		seen  map[string]struct{}
+	)
 	for _, line := range lines {
 		if line.Kind != EventKindPolicyEvent {
 			continue
@@ -750,9 +761,18 @@ func ExtractScopeAmendmentsFolded(bundleBytes []byte) ([]string, error) {
 		if payload.Check != "scope_amendments_folded" {
 			continue
 		}
-		return payload.Added, nil
+		if seen == nil {
+			seen = make(map[string]struct{}, len(payload.Added))
+		}
+		for _, p := range payload.Added {
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			union = append(union, p)
+		}
 	}
-	return nil, nil
+	return union, nil
 }
 
 // ExtractHeadSHA returns the head_sha carried in the bundle's verify_run

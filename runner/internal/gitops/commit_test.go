@@ -4356,6 +4356,95 @@ func TestDirtyPaths_EnumeratesModifiedAndUntracked(t *testing.T) {
 	}
 }
 
+// TestStagedPaths_IndexColumnOnly: StagedPaths reads the INDEX column of
+// `git status --porcelain -uall` (#3434). A staged add, a staged modify and a
+// partially-staged `MM` file are returned; an unstaged modify, a tracked
+// delete not yet added, and an untracked file are NOT; a clean tree returns
+// empty. This is the discrimination the not_staged unused-grant disposition
+// rests on: DirtyPaths lists every one of these, StagedPaths only the ones
+// whose content the verified commit carried.
+func TestStagedPaths_IndexColumnOnly(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initRepo(t)
+
+	clean, err := StagedPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("StagedPaths (clean): %v", err)
+	}
+	if len(clean) != 0 {
+		t.Fatalf("StagedPaths on a clean tree = %v, want empty", clean)
+	}
+
+	for _, name := range []string{"staged-mod.txt", "partial.txt", "unstaged-mod.txt", "tracked-del.txt"} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte("base\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "seed tracked files")
+
+	// Staged add (A ), staged modify (M ), partially staged (MM).
+	if err := os.WriteFile(filepath.Join(repo, "staged-add.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "staged-mod.txt"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "partial.txt"), []byte("staged half\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "staged-add.txt", "staged-mod.txt", "partial.txt")
+	if err := os.WriteFile(filepath.Join(repo, "partial.txt"), []byte("staged half + unstaged half\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Unstaged modify ( M), tracked delete not added ( D), untracked (??).
+	if err := os.WriteFile(filepath.Join(repo, "unstaged-mod.txt"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(repo, "tracked-del.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "untracked.txt"), []byte("stray\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustGitOut(t, repo, "status", "--porcelain", "-uall"); !strings.Contains(got, "MM partial.txt") {
+		t.Fatalf("fixture did not produce an MM entry:\n%s", got)
+	}
+
+	staged, err := StagedPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("StagedPaths: %v", err)
+	}
+	got := make(map[string]bool, len(staged))
+	for _, p := range staged {
+		got[p] = true
+	}
+	for _, want := range []string{"staged-add.txt", "staged-mod.txt", "partial.txt"} {
+		if !got[want] {
+			t.Errorf("StagedPaths missing %q; got %v", want, staged)
+		}
+	}
+	for _, absent := range []string{"unstaged-mod.txt", "tracked-del.txt", "untracked.txt"} {
+		if got[absent] {
+			t.Errorf("StagedPaths must not report %q (not in the index); got %v", absent, staged)
+		}
+	}
+	if len(staged) != 3 {
+		t.Errorf("StagedPaths = %v, want exactly 3 paths", staged)
+	}
+	// DirtyPaths, by contrast, sees all six — the set difference is the
+	// not_staged disposition's input.
+	dirty, err := DirtyPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("DirtyPaths: %v", err)
+	}
+	if len(dirty) != 6 {
+		t.Errorf("DirtyPaths = %v, want exactly 6 paths", dirty)
+	}
+}
+
 // TestCleanDriftPaths_RevertsNamedLeavesUndeclared: one CleanDriftPaths call
 // reverts a tracked modification, a tracked deletion, and an untracked file
 // while an undeclared dirty path is untouched — the concrete test for the

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -131,31 +132,46 @@ func TestUnusedScopeAmendmentGrants(t *testing.T) {
 	}
 	mp := func(p, op string) upload.ScopeAmendmentPath { return upload.ScopeAmendmentPath{Path: p, Operation: op} }
 
+	nm := grantNotModified
 	cases := []struct {
-		name     string
-		approved []upload.ScopeAmendment
-		stageID  string
-		dirty    []string
-		want     []unusedScopeAmendmentGrant
+		name        string
+		approved    []upload.ScopeAmendment
+		stageID     string
+		dirty       []string
+		staged      []string
+		stagedKnown bool
+		want        []unusedScopeAmendmentGrant
 	}{
-		{"untouched modify -> unused", []upload.ScopeAmendment{row("a", mp("mod/other.go", "modify"))}, stage, []string{"mod/reg.go"},
-			[]unusedScopeAmendmentGrant{{"a", "mod/other.go", "modify"}}},
-		{"modified path in dirty set -> used", []upload.ScopeAmendment{row("a", mp("mod/other.go", "modify"))}, stage, []string{"mod/other.go"}, nil},
-		{"created path in dirty set -> used", []upload.ScopeAmendment{row("a", mp("mod/new.go", "create"))}, stage, []string{"mod/new.go"}, nil},
-		{"deleted path in dirty set -> used", []upload.ScopeAmendment{row("a", mp("mod/old.go", "delete"))}, stage, []string{"mod/old.go"}, nil},
-		{"other stage's row ignored", []upload.ScopeAmendment{{ID: "a", Status: "approved", StageID: undecidedOtherStageID, Paths: []upload.ScopeAmendmentPath{mp("mod/other.go", "modify")}}}, stage, nil, nil},
-		{"non-approved row ignored", []upload.ScopeAmendment{{ID: "a", Status: "pending", StageID: stage, Paths: []upload.ScopeAmendmentPath{mp("mod/other.go", "modify")}}}, stage, nil, nil},
-		{"empty stageID -> nil", []upload.ScopeAmendment{row("a", mp("mod/other.go", "modify"))}, "", nil, nil},
+		{"untouched modify -> unused (not_modified)", []upload.ScopeAmendment{row("a", mp("mod/other.go", "modify"))}, stage, []string{"mod/reg.go"}, nil, false,
+			[]unusedScopeAmendmentGrant{{"a", "mod/other.go", "modify", nm}}},
+		{"modified path in dirty set -> used", []upload.ScopeAmendment{row("a", mp("mod/other.go", "modify"))}, stage, []string{"mod/other.go"}, nil, false, nil},
+		{"created path in dirty set -> used", []upload.ScopeAmendment{row("a", mp("mod/new.go", "create"))}, stage, []string{"mod/new.go"}, nil, false, nil},
+		{"deleted path in dirty set -> used", []upload.ScopeAmendment{row("a", mp("mod/old.go", "delete"))}, stage, []string{"mod/old.go"}, nil, false, nil},
+		{"other stage's row ignored", []upload.ScopeAmendment{{ID: "a", Status: "approved", StageID: undecidedOtherStageID, Paths: []upload.ScopeAmendmentPath{mp("mod/other.go", "modify")}}}, stage, nil, nil, false, nil},
+		{"non-approved row ignored", []upload.ScopeAmendment{{ID: "a", Status: "pending", StageID: stage, Paths: []upload.ScopeAmendmentPath{mp("mod/other.go", "modify")}}}, stage, nil, nil, false, nil},
+		{"empty stageID -> nil", []upload.ScopeAmendment{row("a", mp("mod/other.go", "modify"))}, "", nil, nil, false, nil},
 		{"skip rules: trailing-slash, empty, absolute, dotdot", []upload.ScopeAmendment{row("a",
 			mp("corpus/new/", "create"), mp("", "modify"), mp("/etc/passwd", "modify"), mp("../up.go", "modify"), mp("keep.go", "modify"))},
-			stage, nil, []unusedScopeAmendmentGrant{{"a", "keep.go", "modify"}}},
+			stage, nil, nil, false, []unusedScopeAmendmentGrant{{"a", "keep.go", "modify", nm}}},
 		{"order preserved across rows and paths", []upload.ScopeAmendment{row("a", mp("z.go", "modify"), mp("y.go", "create")), row("b", mp("x.go", ""))},
-			stage, nil, []unusedScopeAmendmentGrant{{"a", "z.go", "modify"}, {"a", "y.go", "create"}, {"b", "x.go", ""}}},
-		{"no approved rows -> nil", nil, stage, []string{"a"}, nil},
+			stage, nil, nil, false, []unusedScopeAmendmentGrant{{"a", "z.go", "modify", nm}, {"a", "y.go", "create", nm}, {"b", "x.go", "", nm}}},
+		{"no approved rows -> nil", nil, stage, []string{"a"}, nil, false, nil},
+		// #3434 dispositions.
+		{"dirty+staged, stagedKnown -> used", []upload.ScopeAmendment{row("a", mp("mod/other.go", "modify"))}, stage,
+			[]string{"mod/other.go"}, []string{"mod/other.go"}, true, nil},
+		{"dirty+unstaged, stagedKnown -> not_staged", []upload.ScopeAmendment{row("a", mp("mod/other.go", "modify"))}, stage,
+			[]string{"mod/other.go"}, []string{"mod/reg.go"}, true, []unusedScopeAmendmentGrant{{"a", "mod/other.go", "modify", grantNotStaged}}},
+		{"dirty+unstaged, !stagedKnown -> used (refinement withheld)", []upload.ScopeAmendment{row("a", mp("mod/other.go", "modify"))}, stage,
+			[]string{"mod/other.go"}, nil, false, nil},
+		{"clean, stagedKnown -> not_modified", []upload.ScopeAmendment{row("a", mp("mod/other.go", "modify"))}, stage,
+			nil, nil, true, []unusedScopeAmendmentGrant{{"a", "mod/other.go", "modify", nm}}},
+		{"mixed: one not_modified, one not_staged, one used", []upload.ScopeAmendment{row("a", mp("a.go", "modify"), mp("b.go", "create"), mp("c.go", "modify"))}, stage,
+			[]string{"b.go", "c.go"}, []string{"c.go"}, true,
+			[]unusedScopeAmendmentGrant{{"a", "a.go", "modify", nm}, {"a", "b.go", "create", grantNotStaged}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := unusedScopeAmendmentGrants(tc.approved, tc.stageID, tc.dirty)
+			got := unusedScopeAmendmentGrants(tc.approved, tc.stageID, tc.dirty, tc.staged, tc.stagedKnown)
 			if len(got) != len(tc.want) {
 				t.Fatalf("got %+v, want %+v", got, tc.want)
 			}
@@ -174,8 +190,8 @@ func TestUnusedScopeAmendmentGrants(t *testing.T) {
 func TestAnnotateUnusedAmendmentFailure_ExactLine(t *testing.T) {
 	const reason = "verify command \"go test\" still failing after 2 iteration(s):\n--- FAIL: TestGet"
 	got := annotateUnusedAmendmentFailure(reason, []unusedScopeAmendmentGrant{
-		{"amd-e2e", "mod/other.go", "modify"},
-		{"amd-2", "pkg/noop.go", ""},
+		{"amd-e2e", "mod/other.go", "modify", grantNotModified},
+		{"amd-2", "pkg/noop.go", "", grantNotModified},
 	})
 	if !strings.HasPrefix(got, reason+"\n\n") {
 		t.Errorf("reason prefix not preserved:\n%s", got)
@@ -193,6 +209,72 @@ func TestAnnotateUnusedAmendmentFailure_ExactLine(t *testing.T) {
 	if same := annotateUnusedAmendmentFailure(reason, nil); same != reason {
 		t.Errorf("empty list must return reason unchanged, got:\n%s", same)
 	}
+	// A not_modified-only list renders NO not_staged sentence: the closing
+	// explanation is disposition-specific.
+	if strings.Contains(got, "not staged into the verified commit") || strings.Contains(got, "WAS edited") {
+		t.Errorf("not_modified-only annotation must carry no not_staged text:\n%s", got)
+	}
+}
+
+// TestAnnotateUnusedAmendmentFailure_NotStagedLine pins the exact #3434
+// not_staged line, its disposition-specific closing sentence, and that a
+// mixed list renders BOTH closing sentences (not_modified first).
+func TestAnnotateUnusedAmendmentFailure_NotStagedLine(t *testing.T) {
+	const reason = "verify command \"go test\" still failing after 2 iteration(s)"
+	got := annotateUnusedAmendmentFailure(reason, []unusedScopeAmendmentGrant{
+		{"amd-e2e", "mod/other.go", "modify", grantNotStaged},
+		{"amd-2", "pkg/noop.go", "", grantNotStaged},
+	})
+	if !strings.HasPrefix(got, reason+"\n\n") {
+		t.Errorf("reason prefix not preserved:\n%s", got)
+	}
+	for _, want := range []string{
+		"amendment amd-e2e granted mod/other.go (modify); file modified but not staged into the verified commit\n",
+		"amendment amd-2 granted pkg/noop.go; file modified but not staged into the verified commit\n",
+		"the granted file WAS edited",
+		"re-stage unstaged it",
+		"fishhawk_retry_stage",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("annotation missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "file not modified") || strings.Contains(got, "never edited") {
+		t.Errorf("not_staged-only annotation must carry no not_modified text:\n%s", got)
+	}
+	mixed := annotateUnusedAmendmentFailure(reason, []unusedScopeAmendmentGrant{
+		{"amd-1", "a.go", "modify", grantNotModified},
+		{"amd-2", "b.go", "create", grantNotStaged},
+	})
+	i, j := strings.Index(mixed, "never edited"), strings.Index(mixed, "WAS edited")
+	if i < 0 || j < 0 || j < i {
+		t.Errorf("mixed list must render both closing sentences, not_modified first (%d, %d):\n%s", i, j, mixed)
+	}
+}
+
+// TestUnusedGrantStagedKnown pins the run()-level predicate (#3434, approval
+// condition 2): the not_staged refinement is live exactly on the
+// committed-gate path (a verify command configured AND not the deterministic
+// fix-up apply path); the verifyCmd=="" and appliedFixup paths withhold it.
+func TestUnusedGrantStagedKnown(t *testing.T) {
+	cases := []struct {
+		name         string
+		appliedFixup bool
+		verifyCmd    string
+		want         bool
+	}{
+		{"committed gate ran (verifyCmd set, agent path)", false, "cd mod && go test ./...", true},
+		{"verifyCmd empty -> withheld", false, "", false},
+		{"appliedFixup -> withheld", true, "cd mod && go test ./...", false},
+		{"appliedFixup and verifyCmd empty -> withheld", true, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unusedGrantStagedKnown(tc.appliedFixup, tc.verifyCmd); got != tc.want {
+				t.Errorf("unusedGrantStagedKnown(%v, %q) = %v, want %v", tc.appliedFixup, tc.verifyCmd, got, tc.want)
+			}
+		})
+	}
 }
 
 // TestDetectUnusedScopeAmendmentGrants_GitErrorFailsOpen: a non-git workingDir
@@ -209,7 +291,7 @@ func TestDetectUnusedScopeAmendmentGrants_GitErrorFailsOpen(t *testing.T) {
 		approvedAmendments: []upload.ScopeAmendment{grantRow("amd-e2e", verifyFixStageID, "")},
 	}
 	var log bytes.Buffer
-	unused, events := detectUnusedScopeAmendmentGrants(context.Background(), cfg, &log)
+	unused, events := detectUnusedScopeAmendmentGrants(context.Background(), cfg, true, &log)
 	if unused != nil || events != nil {
 		t.Fatalf("got unused=%+v events=%+v, want nil,nil (fail-open)", unused, events)
 	}
@@ -235,7 +317,7 @@ func TestDetectUnusedScopeAmendmentGrants_OtherStageOnly_NoOp(t *testing.T) {
 		},
 	}
 	var log bytes.Buffer
-	unused, events := detectUnusedScopeAmendmentGrants(context.Background(), cfg, &log)
+	unused, events := detectUnusedScopeAmendmentGrants(context.Background(), cfg, true, &log)
 	if unused != nil || events != nil {
 		t.Fatalf("got unused=%+v events=%+v, want nil,nil", unused, events)
 	}
@@ -245,18 +327,24 @@ func TestDetectUnusedScopeAmendmentGrants_OtherStageOnly_NoOp(t *testing.T) {
 	// Empty stageID: same no-op, same silence.
 	cfg.stageID = ""
 	cfg.approvedAmendments = []upload.ScopeAmendment{grantRow("amd-e2e", "", "")}
-	if u, e := detectUnusedScopeAmendmentGrants(context.Background(), cfg, &log); u != nil || e != nil || log.Len() != 0 {
+	if u, e := detectUnusedScopeAmendmentGrants(context.Background(), cfg, true, &log); u != nil || e != nil || log.Len() != 0 {
 		t.Errorf("empty stageID must be a silent no-op, got unused=%+v events=%+v log=%q", u, e, log.String())
 	}
 }
 
 // TestEmitScopeAmendmentGrantUnused_SeamContract pins the JSONL field set
-// {event, run_id, stage_id, grants:[{amendment_id, path, operation}]} and the
+// {event, run_id, stage_id, grants:[{amendment_id, path, operation,
+// disposition}]} and the
 // policy_event payload {check, grants} against a REAL git repo whose dirty set
 // excludes the granted path.
 func TestEmitScopeAmendmentGrantUnused_SeamContract(t *testing.T) {
 	repo := verifyFixBaseRepo(t)
-	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy) // dirty, but not the grant
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy) // dirty AND staged: a used grant under stagedKnown
+	addCmd := exec.Command("git", "add", "mod/reg.go")
+	addCmd.Dir = repo
+	if out, err := addCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
 	cfg := config{
 		runID:      "run-abc",
 		stageID:    verifyFixStageID,
@@ -269,9 +357,9 @@ func TestEmitScopeAmendmentGrantUnused_SeamContract(t *testing.T) {
 		},
 	}
 	var log bytes.Buffer
-	unused, events := detectUnusedScopeAmendmentGrants(context.Background(), cfg, &log)
-	if len(unused) != 1 || unused[0] != (unusedScopeAmendmentGrant{"amd-7", "mod/other.go", "modify"}) {
-		t.Fatalf("unused = %+v, want exactly amd-7 mod/other.go", unused)
+	unused, events := detectUnusedScopeAmendmentGrants(context.Background(), cfg, true, &log)
+	if len(unused) != 1 || unused[0] != (unusedScopeAmendmentGrant{"amd-7", "mod/other.go", "modify", grantNotModified}) {
+		t.Fatalf("unused = %+v, want exactly amd-7 mod/other.go not_modified", unused)
 	}
 	lines := strings.Split(strings.TrimSpace(log.String()), "\n")
 	if len(lines) != 1 {
@@ -289,11 +377,11 @@ func TestEmitScopeAmendmentGrantUnused_SeamContract(t *testing.T) {
 		t.Fatalf("grants = %v, want a 1-element array", got["grants"])
 	}
 	row, _ := rows[0].(map[string]any)
-	if row["amendment_id"] != "amd-7" || row["path"] != "mod/other.go" || row["operation"] != "modify" {
+	if row["amendment_id"] != "amd-7" || row["path"] != "mod/other.go" || row["operation"] != "modify" || row["disposition"] != grantNotModified {
 		t.Errorf("grant row = %v", row)
 	}
-	if len(row) != 3 {
-		t.Errorf("grant row has %d fields, want exactly 3 {amendment_id, path, operation}: %v", len(row), row)
+	if len(row) != 4 {
+		t.Errorf("grant row has %d fields, want exactly 4 {amendment_id, path, operation, disposition}: %v", len(row), row)
 	}
 	if len(got) != 4 {
 		t.Errorf("line has %d fields, want exactly 4 {event, run_id, stage_id, grants}: %v", len(got), got)
@@ -310,6 +398,109 @@ func TestEmitScopeAmendmentGrantUnused_SeamContract(t *testing.T) {
 	}
 	if payload.Check != "scope_amendment_grant_unused" || len(payload.Grants) != 1 || payload.Grants[0]["amendment_id"] != "amd-7" {
 		t.Errorf("policy_event payload = %s", events[0].Payload)
+	}
+}
+
+// TestDetectUnusedScopeAmendmentGrants_ModifiedButUnstaged_NotStagedDisposition
+// is the #3434 incident shape on a REAL repo: the granted file is written and
+// `git add`ed, then `git reset -q` (StageScoped's leading mixed reset) leaves
+// it ` M` — modified, unstaged. A second granted path is written AND left
+// staged. With stagedKnown the check reports exactly ONE not_staged row for
+// the first and none for the second; with stagedKnown=false (the withheld
+// paths) it reports nothing at all. The counterfactual for the staged-set
+// comparison: delete it and the first row disappears (RED).
+func TestDetectUnusedScopeAmendmentGrants_ModifiedButUnstaged_NotStagedDisposition(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	// Seed both granted files as TRACKED so the unstaged one shows as ` M`,
+	// not `??` (the incident's post-mortem column).
+	mustWrite(t, filepath.Join(repo, "mod", "other.go"), "package mod\n")
+	mustWrite(t, filepath.Join(repo, "mod", "third.go"), "package mod\n")
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("add", "-A")
+	runGit("commit", "-q", "-m", "seed granted files")
+	// The fix agent edits + stages other.go; the loop's re-stage unstages it.
+	mustWrite(t, filepath.Join(repo, "mod", "other.go"), "package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
+	runGit("add", "mod/other.go")
+	runGit("reset", "-q")
+	// third.go is edited AND left staged (a folded path the commit carried).
+	mustWrite(t, filepath.Join(repo, "mod", "third.go"), "package mod\n\nvar third = 3\n")
+	runGit("add", "mod/third.go")
+
+	cfg := config{
+		runID:      verifyFixRunID,
+		stageID:    verifyFixStageID,
+		workingDir: repo,
+		approvedAmendments: []upload.ScopeAmendment{
+			grantRow("amd-e2e", verifyFixStageID, ""),
+			{ID: "amd-3", Status: "approved", StageID: verifyFixStageID, Paths: []upload.ScopeAmendmentPath{{Path: "mod/third.go", Operation: "modify"}}},
+		},
+	}
+	var log bytes.Buffer
+	unused, events := detectUnusedScopeAmendmentGrants(context.Background(), cfg, true, &log)
+	want := unusedScopeAmendmentGrant{"amd-e2e", "mod/other.go", "modify", grantNotStaged}
+	if len(unused) != 1 || unused[0] != want {
+		t.Fatalf("unused = %+v, want exactly %+v", unused, want)
+	}
+	if len(events) != 1 || !strings.Contains(string(events[0].Payload), `"disposition":"not_staged"`) {
+		t.Errorf("policy_event must carry the not_staged disposition: %+v", events)
+	}
+	if !strings.Contains(log.String(), `"disposition":"not_staged"`) || strings.Contains(log.String(), "mod/third.go") {
+		t.Errorf("JSONL line must name only the not_staged grant:\n%s", log.String())
+	}
+	if strings.Contains(log.String(), "scope_amendment_grant_check_failed") {
+		t.Errorf("no check_failed line expected on a healthy repo:\n%s", log.String())
+	}
+	// Withheld paths (stagedKnown=false): the dirty grant counts as used.
+	log.Reset()
+	if u, e := detectUnusedScopeAmendmentGrants(context.Background(), cfg, false, &log); u != nil || e != nil || log.Len() != 0 {
+		t.Errorf("stagedKnown=false must report nothing for a dirty-but-unstaged grant, got unused=%+v events=%+v log=%q", u, e, log.String())
+	}
+}
+
+// TestDetectUnusedScopeAmendmentGrants_StagedPathsErrorFailsOpen: when the
+// dirty set is readable but the staged set is not (stagedPathsFn seam — both
+// run the same `git status`, so a filesystem fault cannot fail one and not
+// the other), the check logs scope_amendment_grant_check_failed and DEGRADES
+// to stagedKnown=false: the not_modified row is still reported and the
+// dirty-but-unstaged grant counts as used — no not_staged row is ever
+// invented from an unreadable index.
+func TestDetectUnusedScopeAmendmentGrants_StagedPathsErrorFailsOpen(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "other.go"), "package mod\n") // dirty (untracked), never staged
+	orig := stagedPathsFn
+	stagedPathsFn = func(context.Context, string) ([]string, error) { return nil, errors.New("index locked") }
+	t.Cleanup(func() { stagedPathsFn = orig })
+
+	cfg := config{
+		runID:      verifyFixRunID,
+		stageID:    verifyFixStageID,
+		workingDir: repo,
+		approvedAmendments: []upload.ScopeAmendment{
+			grantRow("amd-e2e", verifyFixStageID, ""), // mod/other.go: dirty, unstaged
+			{ID: "amd-4", Status: "approved", StageID: verifyFixStageID, Paths: []upload.ScopeAmendmentPath{{Path: "mod/fourth.go", Operation: "create"}}}, // clean
+		},
+	}
+	var log bytes.Buffer
+	unused, events := detectUnusedScopeAmendmentGrants(context.Background(), cfg, true, &log)
+	want := unusedScopeAmendmentGrant{"amd-4", "mod/fourth.go", "create", grantNotModified}
+	if len(unused) != 1 || unused[0] != want {
+		t.Fatalf("unused = %+v, want exactly the not_modified row %+v (degraded to stagedKnown=false)", unused, want)
+	}
+	if len(events) != 1 {
+		t.Errorf("events = %+v, want the one unused policy_event", events)
+	}
+	if !strings.Contains(log.String(), `"event":"scope_amendment_grant_check_failed"`) || !strings.Contains(log.String(), "index locked") {
+		t.Errorf("missing scope_amendment_grant_check_failed naming the StagedPaths error:\n%s", log.String())
+	}
+	if strings.Contains(log.String(), "not_staged") || strings.Contains(log.String(), "mod/other.go") {
+		t.Errorf("an unreadable index must never yield a not_staged row:\n%s", log.String())
 	}
 }
 

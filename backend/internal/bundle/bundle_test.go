@@ -3,6 +3,7 @@ package bundle
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -746,6 +747,127 @@ func TestExtractScopeAmendmentsFolded_RawAndRedactedVariantsAgree(t *testing.T) 
 		if rawGot[i] != redGot[i] {
 			t.Errorf("path %d: raw %q vs redacted %q", i, rawGot[i], redGot[i])
 		}
+	}
+}
+
+func TestExtractScopeAmendmentsFolded_UnionsEveryFoldEvent(t *testing.T) {
+	// The runner emits one scope_amendments_folded policy_event PER FOLD
+	// (#3434): pre-loop and again for each verify-fix iteration whose re-fold
+	// grew the scope. The extractor must return the UNION in bundle order,
+	// deduped by path (first occurrence wins) — the pre-#3434 first-event
+	// early return would drop mod/third.go and the reviewer would read a
+	// landed path as drift. A co-present scope_drift event is skipped.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_drift","outcome":"excluded","undeclared":["mod/other.go","mod/third.go","real_drift.go"]}`)},
+		{Seq: 3, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_amendments_folded","added":["mod/other.go"]}`)},
+		{Seq: 4, Kind: "verify_run", Data: json.RawMessage(`{"head_sha":"abc"}`)},
+		{Seq: 5, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_amendments_folded","added":["mod/third.go","mod/other.go"]}`)},
+		{Seq: 6, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractScopeAmendmentsFolded(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractScopeAmendmentsFolded: %v", err)
+	}
+	want := []string{"mod/other.go", "mod/third.go"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("got %v, want the deduped union in bundle order %v", got, want)
+	}
+}
+
+// refoldRunnerBundleBase64 is the REAL bundle emitted by the runner e2e
+// TestRun_ScopeAmendmentsApprovedAcrossTwoFixIterations_BothFolded
+// (runner/cmd/fishhawk-runner/scopeamendrefold_test.go): a verify-fix loop
+// with max_iterations 2 in which the operator approved mod/other.go during
+// fix iteration 1 and mod/third.go during fix iteration 2, so the bundle
+// carries a pre-fold scope_drift naming both paths and TWO
+// scope_amendments_folded policy_events across two iterations. Captured with
+// FISHHAWK_REFOLD_FIXTURE_OUT (see that test's doc comment for the
+// regeneration command). Base64 of the gzipped JSONL, not a testdata file, so
+// the producer→consumer proof lives beside the consumer it pins.
+const refoldRunnerBundleBase64 = "" +
+	"H4sIAAAAAAAA/+yY32/juBHH3/tXsCwKJI3sUCRF/QAW2OvDFQX6uE8XBQJFDm0iEuVKVDZpkP+9oC3HijeJs+n9AK6nBwOS" +
+	"OGPOl6OZD/mAB/g3LuII+wEXmBIqFiRfxOILyQvOiyRb8jyP459whG+s07jArXTWwOBxhLX0EhcPuB6dbqAa1BpaiQt8G+MI" +
+	"96OrbDCIp2tBKaULxhhbcM75IpldOMKDlyvYWdDpOhq8ELMLR1iuwHlcYNXIUcNCdRpwhFfgoJcedCX9GyGR9KfdJB301RRa" +
+	"0ynZ4AhvxmFdSaerbgOu2vS48P0Ij49/muSip+SiM72su+2U9LZz1eBl7/GTG3bKDZu52XSNVfcV3IaYD9KrNagbXOBBdRuo" +
+	"dG9NeNuNXnUt4ALDnWpGDRpHeHQaVCN70Li4wm2nLzu/hn656nC0vfVr2+twez0fXCnpYdX19j9bwwe8kX4d8uC5g2nUPS7w" +
+	"38P87LDpBhvCxgX+2o2Nroy0TdV0o8aP0TM3T3/8vW6uD2vCT4mZzMRcWV9pa8xMyOmNky2EdfLjgCNcywGqHgwucCYIyROm" +
+	"OMs5pAIoo1LUuq5zU/M0USThudEkxxE2toHhWKoeVrsIJ+cF/uFYhh5WlYfBfzvuOsJubKvJMY2ClQpmIQi0WKysR/Ly8Deo" +
+	"nt2UzsFXFGxR22lAMSGC89JZp+EOkd21XJKEG5LEpVssFuhSw+2lG5umdBcXF0fuPn9GCxIRdBFHCfr8uXQXG6lu5Grrv3QX" +
+	"pbu4lT3qYWUH39+jT6iVm6vB99atrq3zD4+7QWZ0Cv0D/NkN2r08R9Z59IB68GPvnhxc3Vyjx9K9FOter8MM90/eGTUQmQsm" +
+	"3o764HMWev5K6LbddL1HJQ5G1q1KPIv2Cww+ROzR36bXyy/n6CGM8NZsxSjxXYnP0Z8/IU6nN6X3yx+ll405K3EYc3eOPqG/" +
+	"6gh9lc4jTksczWzPt0ZB5MfS4QhbN0AfPqEBFzE/fDLJiU9mXsVuobfmvupHNy8+XdvK7WulgwCoHAmhYveLVh0KMaLl5XK5" +
+	"xBGGO+urbZEO/WYNUlfDOrQLnnJjlIY6pSqLeaIMFUDSNFZxzSgzeSJkrmrxrLCFKrAta93oN2Oo9GEFf/zhn/8q9iqjM7Ik" +
+	"ZDgvHUIIzdaxSAv0JCM5qOiC+fTr4U62mwaWqmtDHpSeLHnGh/0gHGHfA0whaMMpy7WiYChnSSIgz1LIdK0kSZjIucmMiCHG" +
+	"B/XFKfXf10TS73HzShORWr/QFK6jo+4iW3C6BeeHynRNMDlEk52aBvuVkokQydOay7pmRss4i3maKV1LQ0QaUy2YjlOhM34i" +
+	"mf6CjtYfXR09WIb5XJdu+aRYwQoWFyi0TmMd6AINAPqVfEJX9WgbjXZ/ff1yWsUJp3EGIFNQrE4U0UqQWjDIIdW0lsAkmJjQ" +
+	"2ULkpxaCvyutYnLKT/KdeTWni/fnVXwKTan4xRKLPEssynSSiVzGqdRAmBQZpKY2VOk4TWksc2GMTlj+LLE2chieJ1Z3g9CL" +
+	"xYXmbDhefyM4YUblStRKQSYo4XWdUhbrVNE0SYkiLK/VvKzEp+CUpr8bwcTPItgpDKfZt4INY9vK/n4mmvVh17FrsizCrbyr" +
+	"5o/oC0HO5nCKXp/N4Teg1xnov8mvH0fcV3cEr3Mwf4OD9xOeIG5/+04qpCQBztQbVHhwOENC9goSbtHPOuvPzrd0O2Htltau" +
+	"0adtmzg7f41x/+D5P3j+wPPfqLb/VKbw9rfv1EtzSWst39Dr4PC9mT6l87O15xR9uxmhZFYCT+1G2BxcVtJDBbdWg1Mwq4OH" +
+	"frYrYf8LVL6Ahx/btHxkn7BvgJWXtvmVNzeh6I4b6AfY4tv27Cv6JbX8Dmb/CBwfa/nbsP3PrSp5EZs+xl8fIahjVd8E2//j" +
+	"4MWw5ZYjcCweXgrgFEQ+RtOWyUgViuUDfjqlPTDR9iB9/mB2lhsQa/g9Hf8e+sep8xQ+7x++D59mP+sc271rpbrR+R2Pq875" +
+	"8GgthzBRlVGTM6nrJK7jXGVMcm6EkIznROQkY0bUKuHScM4MpIqnoHOAWMcs4wxUoP3/BgAA///LRLu7bhkAAA=="
+
+// TestExtractScopeAmendmentsFolded_UnionsRealRunnerBundle is the
+// producer→consumer proof for #3434 (approval condition 1): over the runner's
+// REAL emitted bundle — not a hand-constructed event — ExtractScopeDrift
+// yields both out-of-scope paths, ExtractScopeAmendmentsFolded yields both
+// folded paths as a union, and the review-surface subtraction (the same set
+// difference server.subtractPaths applies in the trace handler, mirrored
+// here because that helper is server-private and importing it would cycle)
+// removes BOTH from the drift. With the first-event early return restored
+// mod/third.go survives the subtraction — RED.
+func TestExtractScopeAmendmentsFolded_UnionsRealRunnerBundle(t *testing.T) {
+	bundleBytes, err := base64.StdEncoding.DecodeString(refoldRunnerBundleBase64)
+	if err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	drift, err := ExtractScopeDrift(bundleBytes)
+	if err != nil {
+		t.Fatalf("ExtractScopeDrift: %v", err)
+	}
+	if strings.Join(drift, ",") != "mod/other.go,mod/third.go" {
+		t.Fatalf("scope_drift undeclared = %v, want [mod/other.go mod/third.go] (the fixture's pre-fold snapshot)", drift)
+	}
+	folded, err := ExtractScopeAmendmentsFolded(bundleBytes)
+	if err != nil {
+		t.Fatalf("ExtractScopeAmendmentsFolded: %v", err)
+	}
+	if strings.Join(folded, ",") != "mod/other.go,mod/third.go" {
+		t.Fatalf("folded union = %v, want [mod/other.go mod/third.go] across the two fold events", folded)
+	}
+	// The fixture really carries TWO fold events (one per iteration).
+	lines, err := ReadEvents(bundleBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foldEvents := 0
+	for _, l := range lines {
+		if l.Kind == EventKindPolicyEvent && strings.Contains(string(l.Data), `"scope_amendments_folded"`) {
+			foldEvents++
+		}
+	}
+	if foldEvents != 2 {
+		t.Fatalf("fixture carries %d scope_amendments_folded events, want 2", foldEvents)
+	}
+	// The review-surface subtraction: every folded path leaves the drift.
+	remove := make(map[string]struct{}, len(folded))
+	for _, p := range folded {
+		remove[p] = struct{}{}
+	}
+	var reviewDrift []string
+	for _, p := range drift {
+		if _, ok := remove[p]; ok {
+			continue
+		}
+		reviewDrift = append(reviewDrift, p)
+	}
+	if len(reviewDrift) != 0 {
+		t.Fatalf("review-surface drift after subtracting the fold union = %v, want empty (both folded paths subtracted)", reviewDrift)
 	}
 }
 

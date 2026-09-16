@@ -2109,6 +2109,39 @@ func stashTip(ctx context.Context, p *Pusher, repoDir string) string {
 	return strings.TrimSpace(out)
 }
 
+// StagedPaths enumerates every repo-relative path whose content is STAGED in
+// the index — `git status --porcelain -uall` lines whose INDEX column X is
+// not ' ' (index matches HEAD), '?' (untracked) or '!' (ignored), i.e. the
+// M/A/D/R/C/T index states of git-status(1) "Short Format". It is the
+// index-column twin of DirtyPaths (which returns every dirty path regardless
+// of column) and exists for the #3434 unused-grant disposition: after a
+// committed-tree verify gate the index equals the verified throwaway commit's
+// staged set (`git reset --soft` does not touch the index), so a granted path
+// that is in DirtyPaths but NOT here was modified in the working tree yet
+// EXCLUDED from the verified commit. A partially-staged `MM` entry counts as
+// staged (its index content is in the commit); a rename returns the
+// destination path, as porcelainPath does everywhere else.
+func StagedPaths(ctx context.Context, repoDir string) ([]string, error) {
+	out, err := (&Pusher{}).runOut(ctx, repoDir, "status", "--porcelain", "-uall")
+	if err != nil {
+		return nil, fmt.Errorf("gitops: status: %w", err)
+	}
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		switch line[0] {
+		case ' ', '?', '!':
+			continue
+		}
+		if p := porcelainPath(line); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths, nil
+}
+
 // porcelainPath extracts the repo-relative path from one `git status
 // --porcelain` line. Returns "" for blank/short lines. For a rename
 // ("R  old -> new") it returns the destination path, which is what a
