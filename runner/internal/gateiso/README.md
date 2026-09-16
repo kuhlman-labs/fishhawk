@@ -301,6 +301,18 @@ infra-flake absorb, and `runVerifyFixLoop` breaks with `verify_gate_refused`
 and never re-invokes the fix agent. The signature matches none of
 `isVerifyInfraFailure`'s classes, so a refusal is never absorbed as a flake.
 
+**Both `run()`-level committed-gate call sites now agree on category C
+(#3449).** The fix-loop path (`executor.verify.max_iterations > 0`) always
+routed `verify_gate_refused` to category C. The DEFAULT single-shot path
+(`max_iterations == 0`, `runner/cmd/fishhawk-runner/main.go`'s `res.OK &&
+!appliedFixup && stageType == "implement"` block) used to hardcode category B
+for EVERY `runVerifyGateCommitted` error, contradicting this section. It now
+maps the returned error through `committedGateFailureCategory`:
+`errors.Is(err, gitops.ErrVerifyInfraFailure)` → category C — covering BOTH
+the gate-isolation refusal above (`errGateIsolationRefused`) and the
+post-absorb persistent infra signature (#2645) below — and everything else
+(a red committed tree, `gitops.ErrCommittedTestsFailed`) stays category B.
+
 ## Bind-mount sources on Docker Desktop
 
 Docker Desktop for Mac shares `/Users`, `/Volumes`, `/private`, `/tmp` and
@@ -338,6 +350,20 @@ docker-present-but-image-unpullable) is a loud failure, not a green.
 | (h) `TestGateClone_PlantedRefNeverReachesPrimary` | clone path: plant never reaches the primary, lock path injected; the `git worktree add` sibling DOES leak the plant |
 | (i) `TestGateCloneSandbox_NoNetwork` | Linux-only: a loopback connect fails under `clone-sandbox` through `runBoundedGateCommand` and succeeds under the host-exec control |
 | (j) `TestGateHosted_RefusesEndToEnd` | hosted + auto with a REALLY detected runtime whose endpoint is pinned remote (`DOCKER_HOST=tcp://…` via the Getenv probe) → single-shot gate category C, fix loop category C, fix agent never invoked, verify command never ran |
+
+`runner/cmd/fishhawk-runner/main_test.go` pins the #3449 fix at the `run()`
+level, on the DEFAULT `max_iterations == 0` call site, driving the refusal
+through the REAL `configureGateIsolation(os.Getenv, gateiso.DefaultProbes())`
+(the same `DOCKER_HOST`/`CONTAINER_HOST` remote-endpoint recipe as (j), since
+`run()` re-derives gate isolation from `os.Getenv` on every invocation and
+overwrites the process-wide state — `installGateState` cannot inject the
+refusal here): `TestRun_VerifyGateCommitted_HostedRefusal_CategoryC` (hosted
+profile refusal → category C, verify command never executed) and
+`TestRun_VerifyGateCommitted_PersistentInfraFailure_CategoryC` (a lint-lock
+signature persisting past the one-shot absorb → category C, two `verify_run`
+events, one `verify_infra_flake_retry`). `TestRun_VerifyGateCommitted_DriftExcludedFailureBlocks`
+is the over-broadening guard: a genuine red committed tree still classifies
+category B.
 
 ## What the sibling issues own
 
