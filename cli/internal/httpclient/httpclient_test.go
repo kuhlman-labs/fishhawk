@@ -580,7 +580,11 @@ func TestSubmitRevise_RequestShaping(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, `{"id":"`+stageID.String()+`","run_id":"`+runID.String()+`",`+
 			`"sequence":1,"type":"plan","executor":{"kind":"agent","ref":"claude-code"},`+
-			`"state":"pending","created_at":"2026-06-15T00:00:00Z","updated_at":"2026-06-15T00:00:00Z"}`)
+			`"state":"pending","created_at":"2026-06-15T00:00:00Z","updated_at":"2026-06-15T00:00:00Z",`+
+			`"revision_base":{"original_bytes":63761,"cap_bytes":60000,"elided":true,"mode":"digest",`+
+			`"rendered_bytes":41000,"elided_bytes":22761,`+
+			`"elisions":[{"field":"summary","bytes_shown":2000,"bytes_dropped":3073}],`+
+			`"elisions_omitted":2,"unrendered_keys":["generated_by","ticket_reference"]}}`)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -591,6 +595,22 @@ func TestSubmitRevise_RequestShaping(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("SubmitRevise: %v", err)
+	}
+	// #3442: every revision_base key decodes (the CLI mirror of the backend's
+	// prompt.RevisionBaseAssessment is a convention copy — this pins it).
+	rb := got.RevisionBase
+	if rb == nil {
+		t.Fatalf("revision_base did not decode: %+v", got)
+	}
+	if rb.OriginalBytes != 63761 || rb.CapBytes != 60000 || !rb.Elided || rb.Mode != RevisionBaseModeDigest ||
+		rb.RenderedBytes != 41000 || rb.ElidedBytes != 22761 || rb.ElisionsOmitted != 2 {
+		t.Errorf("revision_base scalars = %+v, want the fixture's", rb)
+	}
+	if len(rb.Elisions) != 1 || rb.Elisions[0].Field != "summary" || rb.Elisions[0].BytesShown != 2000 || rb.Elisions[0].BytesDropped != 3073 {
+		t.Errorf("revision_base.elisions = %+v, want [{summary 2000 3073}]", rb.Elisions)
+	}
+	if len(rb.UnrenderedKeys) != 2 || rb.UnrenderedKeys[0] != "generated_by" {
+		t.Errorf("revision_base.unrendered_keys = %v, want [generated_by ticket_reference]", rb.UnrenderedKeys)
 	}
 	if gotMethod != http.MethodPost {
 		t.Errorf("method = %s, want POST", gotMethod)
@@ -606,6 +626,51 @@ func TestSubmitRevise_RequestShaping(t *testing.T) {
 	}
 	if got.ID != stageID || got.State != "pending" {
 		t.Errorf("stage = (%s, %s), want (%s, pending)", got.ID, got.State, stageID)
+	}
+}
+
+// TestSubmitRevise_LegacyBody_NilRevisionBase: a pre-#3442 Stage-only 200
+// body decodes with a nil RevisionBase (the older-backend degrade).
+func TestSubmitRevise_LegacyBody_NilRevisionBase(t *testing.T) {
+	stageID := uuid.New()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"`+stageID.String()+`","run_id":"`+uuid.New().String()+`",`+
+			`"sequence":1,"type":"plan","executor":{"kind":"agent","ref":"claude-code"},"state":"pending"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	got, err := New(srv.URL, "").SubmitRevise(context.Background(), stageID, SubmitReviseInput{Constraint: "x"})
+	if err != nil {
+		t.Fatalf("SubmitRevise: %v", err)
+	}
+	if got.ID != stageID || got.RevisionBase != nil {
+		t.Errorf("legacy body decoded (%s, %+v), want (%s, nil revision_base)", got.ID, got.RevisionBase, stageID)
+	}
+}
+
+// TestRevisionBaseNotice_WordingAgreesWithMode pins approval condition 1 of
+// #3442 on the CLI side: "step-complete digest" only for the digest modes, a
+// distinct byte-cut sentence for mode cut, nothing for whole/nil.
+func TestRevisionBaseNotice_WordingAgreesWithMode(t *testing.T) {
+	base := RevisionBaseAssessment{OriginalBytes: 70000, CapBytes: 60000, Elided: true, RenderedBytes: 60000, ElidedBytes: 10000}
+	for _, tc := range []struct{ mode, want, reject string }{
+		{RevisionBaseModeDigest, "step-complete digest", "byte-cut"},
+		{RevisionBaseModeDigestShrunk, "SHRUNKEN step-complete digest", "byte-cut"},
+		{RevisionBaseModeCut, "byte-cut prefix", "step-complete"},
+	} {
+		a := base
+		a.Mode = tc.mode
+		got := RevisionBaseNotice(&a)
+		if !strings.Contains(got, tc.want) || strings.Contains(got, tc.reject) || !strings.Contains(got, "70000") {
+			t.Errorf("mode %q notice = %q, want %q and not %q", tc.mode, got, tc.want, tc.reject)
+		}
+	}
+	whole := base
+	whole.Elided, whole.Mode = false, RevisionBaseModeWhole
+	if RevisionBaseNotice(&whole) != "" || RevisionBaseNotice(nil) != "" {
+		t.Errorf("a whole/nil assessment produced a notice")
 	}
 }
 

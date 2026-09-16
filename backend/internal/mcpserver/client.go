@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
 // apiClient is the MCP server's typed wrapper around the Fishhawk
@@ -1813,16 +1815,30 @@ type reviseRequest struct {
 //     one more pass is available via forceAdditionalPass)
 //   - 409 revise_ceiling_reached (the hard ceiling of 3 total passes is
 //     reached; the override cannot push past it — reject → fresh-run replan)
-func (c *apiClient) SubmitRevise(ctx context.Context, stageID uuid.UUID, constraint string, forceAdditionalPass bool) (*Stage, error) {
+//
+// Since #3442 the 200 body ALSO carries an optional `revision_base` object —
+// the server's measurement of the prior plan against the revision-base cap —
+// decoded here straight into prompt.RevisionBaseAssessment (mcpserver lives
+// in the backend module, so there is one definition and nothing to drift).
+// Absent on a pre-#3442 backend or when no plan artifact was loadable.
+func (c *apiClient) SubmitRevise(ctx context.Context, stageID uuid.UUID, constraint string, forceAdditionalPass bool) (*reviseResult, error) {
 	body, err := json.Marshal(reviseRequest{Constraint: constraint, ForceAdditionalPass: forceAdditionalPass})
 	if err != nil {
 		return nil, fmt.Errorf("marshal revise: %w", err)
 	}
-	var s Stage
-	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/revise", body, &s); err != nil {
+	var res reviseResult
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/revise", body, &res); err != nil {
 		return nil, err
 	}
-	return &s, nil
+	return &res, nil
+}
+
+// reviseResult mirrors the backend's revise 200 body
+// (`backend/internal/server/revise.go::reviseResponse`): the re-opened Stage
+// with the optional `revision_base` measurement (#3442).
+type reviseResult struct {
+	Stage
+	RevisionBase *prompt.RevisionBaseAssessment `json:"revision_base,omitempty"`
 }
 
 // waiveConcernRequest mirrors the backend's

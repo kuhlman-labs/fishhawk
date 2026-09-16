@@ -105,7 +105,7 @@ func planRevise(args []string, stdout, stderr io.Writer) int {
 		return exitCode
 	}
 
-	stage, err := client.SubmitRevise(ctx, planStage.ID, httpclient.SubmitReviseInput{
+	res, err := client.SubmitRevise(ctx, planStage.ID, httpclient.SubmitReviseInput{
 		Constraint:          *constraint,
 		ForceAdditionalPass: *force,
 	})
@@ -116,12 +116,19 @@ func planRevise(args []string, stdout, stderr io.Writer) int {
 
 	switch *outputFmt {
 	case "json":
-		if err := json.NewEncoder(stdout).Encode(stage); err != nil {
+		// The whole ReviseResult, so revision_base rides along (#3442).
+		if err := json.NewEncoder(stdout).Encode(res); err != nil {
 			_, _ = fmt.Fprintf(stderr, "%s: encode: %v\n", name, err)
 			return exitFailure
 		}
 	default:
-		printStage(stdout, stage)
+		// #3442: an elided revision base is a notice on stderr BEFORE the
+		// normal stage echo, worded by mode (a digest is claimed only when
+		// the mode is a digest). Exit stays 0 — the revise succeeded.
+		if notice := httpclient.RevisionBaseNotice(res.RevisionBase); notice != "" {
+			_, _ = fmt.Fprintf(stderr, "%s: notice — %s\n", name, notice)
+		}
+		printStage(stdout, &res.Stage)
 	}
 	return exitOK
 }

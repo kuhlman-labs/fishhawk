@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -13,10 +14,12 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -974,5 +977,345 @@ func TestLoadRevisionConstraint_UnderCapLogsInfoNotWarn(t *testing.T) {
 	}
 	if !strings.Contains(logged, "loaded revision constraint") {
 		t.Errorf("an under-cap load did not INFO-log:\n%s", logged)
+	}
+}
+
+// --- revision-base elision is an operator-visible fact (#3442) -----------
+
+// seedRevisionBaseArtifact stores planJSON as the stage's plan artifact so
+// loadRevisionBasePlan resolves it as the revision base. Like plan_test.go's
+// seedReviseBase but WITHOUT the plan_revised entry — the revise under test
+// must still have its budget.
+func seedRevisionBaseArtifact(t *testing.T, art *fakeArtifactRepo, stageID uuid.UUID, planJSON []byte) {
+	t.Helper()
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       stageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planJSON,
+		ContentHash:   fmt.Sprintf("base-%s", stageID),
+	}); err != nil {
+		t.Fatalf("seed base plan artifact: %v", err)
+	}
+}
+
+// revisionBasePlanJSON marshals a standard_v1 plan with the given number of
+// approach steps of roughly bodyBytes each.
+func revisionBasePlanJSON(t *testing.T, steps, bodyBytes int) []byte {
+	t.Helper()
+	p := plan.Plan{
+		PlanVersion:                "standard_v1",
+		Summary:                    "revise the retry helper",
+		PredictedRuntimeMinutes:    33,
+		PredictedRuntimeConfidence: plan.RuntimeConfidence("medium"),
+		Scope:                      plan.Scope{Files: []plan.ScopeFile{{Path: "a/one.go", Operation: plan.FileOpModify}}},
+		Verification: plan.Verification{
+			TestStrategy: "table-driven unit tests",
+			RollbackPlan: "revert the PR",
+			AcceptanceCriteria: []plan.AcceptanceCriterion{
+				{ID: "ac-1", Statement: "the whole prior plan is delivered", Source: plan.CriterionSourceExplicit},
+			},
+		},
+	}
+	for i := 1; i <= steps; i++ {
+		p.Approach = append(p.Approach, plan.ApproachStep{Step: i, Description: fmt.Sprintf("step %d: ", i) + strings.Repeat("d", bodyBytes)})
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return raw
+}
+
+// overCapPlanJSON builds a prior plan whose loadRevisionBasePlan form
+// (json.MarshalIndent of the typed plan — the form the prompt renders) is
+// OVER prompt.MaxRevisionBasePlanBytes, and ASSERTS that in the helper so the
+// over-cap cases can never go vacuous (approval condition 3).
+func overCapPlanJSON(t *testing.T) []byte {
+	t.Helper()
+	// 25 steps x 2500-byte bodies: over the cap as a document (~65 KB
+	// indented), while the FIRST-pass digest (bodies capped at 2000) fits —
+	// so the tests pin mode=digest, not digest_shrunk.
+	raw := revisionBasePlanJSON(t, 25, 2500)
+	var p plan.Plan
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("unmarshal fixture: %v", err)
+	}
+	indented, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		t.Fatalf("indent fixture: %v", err)
+	}
+	if len(indented) <= prompt.MaxRevisionBasePlanBytes {
+		t.Fatalf("fixture is %d bytes as rendered, want > %d (the over-cap case would be vacuous)",
+			len(indented), prompt.MaxRevisionBasePlanBytes)
+	}
+	return raw
+}
+
+// reviseBodyWithBase is the revise 200 body decoded with an EXPORTED,
+// json-tagged field (approval condition 2), so the over-cap assertions can
+// observe the value rather than passing vacuously on a nil the decoder never
+// populated.
+type reviseBodyWithBase struct {
+	stageResponse
+	RevisionBase *prompt.RevisionBaseAssessment `json:"revision_base"`
+}
+
+// newRevisionBaseReviseServer wires RunRepo + AuditRepo + ArtifactRepo (with
+// the stage listed for the run, so loadRevisionBasePlan resolves it) and a
+// captured INFO-level logger, seeding a plan stage parked at
+// awaiting_approval. planJSON, when non-nil, is stored as the stage's plan
+// artifact.
+func newRevisionBaseReviseServer(t *testing.T, runID, stageID uuid.UUID, planJSON []byte) (*Server, *auditFake, *bytes.Buffer) {
+	t.Helper()
+	rr := newPromptRunRepo()
+	au := newAuditFake()
+	art := newFakeArtifactRepo()
+	st := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
+	rr.getStages[stageID] = st
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {st}}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change"}
+	if planJSON != nil {
+		seedRevisionBaseArtifact(t, art, stageID, planJSON)
+	}
+	var logBuf bytes.Buffer
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ArtifactRepo: art,
+		Logger: slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	return s, au, &logBuf
+}
+
+// decodeReviseAuditRevisionBase returns the single appended plan_revised
+// entry's revision_base object (nil when the key is absent) plus the raw
+// payload keys.
+func decodeReviseAuditRevisionBase(t *testing.T, au *auditFake) (*prompt.RevisionBaseAssessment, map[string]json.RawMessage) {
+	t.Helper()
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("decode plan_revised payload: %v", err)
+	}
+	raw, ok := payload["revision_base"]
+	if !ok {
+		return nil, payload
+	}
+	var a prompt.RevisionBaseAssessment
+	if err := json.Unmarshal(raw, &a); err != nil {
+		t.Fatalf("decode revision_base payload key: %v", err)
+	}
+	return &a, payload
+}
+
+// TestRevisePlan_OverCapBase_SurfacesElision is the #3442 done-means at the
+// REST seam: a >60 KB prior plan seeded through the artifact repo makes the
+// revise 200 body carry revision_base (elided, mode digest, the byte
+// accounting), stamps the SAME object on the plan_revised audit payload, and
+// WARN-logs the elision. Deleting the assessRevisionBase call reddens the
+// body AND the audit assertion; deleting the WARN reddens the log assertion.
+func TestRevisePlan_OverCapBase_SurfacesElision(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, au, logBuf := newRevisionBaseReviseServer(t, runID, stageID, overCapPlanJSON(t))
+
+	w := revisePlan(t, s, stageID, `{"constraint":"keep the change additive"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp reviseBodyWithBase
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.RevisionBase == nil {
+		t.Fatalf("200 body carries no revision_base:\n%s", w.Body.String())
+	}
+	a := resp.RevisionBase
+	if !a.Elided || a.Mode != prompt.RevisionBaseModeDigest {
+		t.Errorf("revision_base = (elided=%v, mode=%q), want (true, digest)", a.Elided, a.Mode)
+	}
+	if a.OriginalBytes <= prompt.MaxRevisionBasePlanBytes || a.CapBytes != prompt.MaxRevisionBasePlanBytes {
+		t.Errorf("original/cap = %d/%d, want > %d / %d", a.OriginalBytes, a.CapBytes, prompt.MaxRevisionBasePlanBytes, prompt.MaxRevisionBasePlanBytes)
+	}
+	if a.RenderedBytes+a.ElidedBytes != a.OriginalBytes {
+		t.Errorf("accounting: %d rendered + %d elided != %d original", a.RenderedBytes, a.ElidedBytes, a.OriginalBytes)
+	}
+	if len(a.Elisions) == 0 {
+		t.Errorf("revision_base carries no named elisions")
+	}
+
+	// The audit row carries the same measurement.
+	audited, _ := decodeReviseAuditRevisionBase(t, au)
+	if audited == nil {
+		t.Fatalf("plan_revised payload has no revision_base key:\n%s", au.appended[0].Payload)
+	}
+	if audited.OriginalBytes != a.OriginalBytes || audited.Mode != a.Mode || !audited.Elided {
+		t.Errorf("audit revision_base = (%d, %q, %v), want the response's (%d, %q, true)",
+			audited.OriginalBytes, audited.Mode, audited.Elided, a.OriginalBytes, a.Mode)
+	}
+
+	// The WARN line names the elision by mode with the byte accounting.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "level=WARN") ||
+		!strings.Contains(logged, "step-complete digest") ||
+		!strings.Contains(logged, fmt.Sprintf("original_bytes=%d", a.OriginalBytes)) ||
+		!strings.Contains(logged, "mode=digest") {
+		t.Errorf("over-cap base did not WARN-log the digest elision with its accounting:\n%s", logged)
+	}
+}
+
+// TestRevisePlan_CutModeBase_WordingSaysCutNotDigest pins approval condition
+// 1 on the server surface: a prior plan artifact that is over cap but
+// UNDECODABLE as a plan carrying approach steps (here: zero steps) reports
+// mode cut, and the WARN line says the planner receives a byte-cut prefix —
+// it must NOT claim a step-complete digest.
+func TestRevisePlan_CutModeBase_WordingSaysCutNotDigest(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	// A zero-step plan with an over-cap summary: decodes as a plan, but there
+	// is nothing step-complete to say, so the renderer takes the cut path.
+	p := plan.Plan{PlanVersion: "standard_v1", Summary: strings.Repeat("s", prompt.MaxRevisionBasePlanBytes+1)}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, au, logBuf := newRevisionBaseReviseServer(t, runID, stageID, raw)
+
+	w := revisePlan(t, s, stageID, `{"constraint":"keep the change additive"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp reviseBodyWithBase
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.RevisionBase == nil || !resp.RevisionBase.Elided || resp.RevisionBase.Mode != prompt.RevisionBaseModeCut {
+		t.Fatalf("revision_base = %+v, want elided cut mode", resp.RevisionBase)
+	}
+	if audited, _ := decodeReviseAuditRevisionBase(t, au); audited == nil || audited.Mode != prompt.RevisionBaseModeCut {
+		t.Errorf("audit revision_base = %+v, want mode cut", audited)
+	}
+	logged := logBuf.String()
+	if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "byte-cut prefix") || !strings.Contains(logged, "mode=cut") {
+		t.Errorf("cut-mode base did not WARN-log the cut wording:\n%s", logged)
+	}
+	if strings.Contains(logged, "step-complete digest") {
+		t.Errorf("cut-mode WARN claims a step-complete digest the planner does not receive:\n%s", logged)
+	}
+}
+
+// TestRevisePlan_UnderCapBase_NotElided is the whole-delivery control: a small
+// prior plan yields revision_base present with elided:false / mode whole on
+// the body and the audit row, and NO WARN line — so the WARN is a signal
+// about an anomaly, not noise on every revise.
+func TestRevisePlan_UnderCapBase_NotElided(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, au, logBuf := newRevisionBaseReviseServer(t, runID, stageID, revisionBasePlanJSON(t, 3, 100))
+
+	w := revisePlan(t, s, stageID, `{"constraint":"keep the change additive"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp reviseBodyWithBase
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.RevisionBase == nil {
+		t.Fatalf("200 body carries no revision_base for a loadable under-cap base:\n%s", w.Body.String())
+	}
+	if resp.RevisionBase.Elided || resp.RevisionBase.Mode != prompt.RevisionBaseModeWhole || resp.RevisionBase.ElidedBytes != 0 {
+		t.Errorf("revision_base = %+v, want (elided=false, mode=whole, elided_bytes=0)", resp.RevisionBase)
+	}
+	if audited, _ := decodeReviseAuditRevisionBase(t, au); audited == nil || audited.Elided || audited.Mode != prompt.RevisionBaseModeWhole {
+		t.Errorf("audit revision_base = %+v, want whole/not elided", audited)
+	}
+	if logged := logBuf.String(); strings.Contains(logged, "level=WARN") {
+		t.Errorf("an under-cap base WARN-logged:\n%s", logged)
+	}
+}
+
+// TestRevisePlan_NoBase_OmitsRevisionBase is the byte-identical degrade: with
+// no ArtifactRepo (the existing newReviseServer wiring) the raw 200 body has
+// NO revision_base key and the plan_revised payload has NO revision_base key,
+// so every pre-#3442 consumer sees the same bytes.
+func TestRevisePlan_NoBase_OmitsRevisionBase(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, au := newReviseServer(t, runID, stageID, run.StageStateAwaitingApproval, run.StageTypePlan)
+
+	w := revisePlan(t, s, stageID, `{"constraint":"keep the change additive"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := body["revision_base"]; present {
+		t.Errorf("200 body carries a revision_base key with no loadable base:\n%s", w.Body.String())
+	}
+	if audited, payload := decodeReviseAuditRevisionBase(t, au); audited != nil {
+		t.Errorf("plan_revised payload carries a revision_base key with no loadable base: %s", payload["revision_base"])
+	}
+}
+
+// TestRevisePlan_CrossLayer_OverCapBase_PromptAndSurfaceAgree is the
+// cross-boundary test: a >60 KB plan artifact is seeded through the artifact
+// repo, the revise 200 body reports revision_base, and the re-dispatched
+// plan prompt (GET /v0/stages/{id}/prompt, signed) carries the ELIDED notice
+// AND a digest header whose "%d original bytes, %d rendered bytes, %d elided
+// bytes" line equals the response's numbers — REST body, audit row and
+// rendered prompt are proven to be ONE measurement across the server→prompt
+// seam.
+func TestRevisePlan_CrossLayer_OverCapBase_PromptAndSurfaceAgree(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+
+	sf := newSigningFake()
+	priv, _ := sf.issue(t, runID)
+	rr := newPromptRunRepo()
+	au := newAuditFake()
+	art := newFakeArtifactRepo()
+	st := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
+	rr.getStages[stageID] = st
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {st}}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI, RequiresCharter: chFalse()}
+	seedRevisionBaseArtifact(t, art, stageID, overCapPlanJSON(t))
+
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, SigningRepo: sf, ArtifactRepo: art})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := revisePlan(t, s, stageID, `{"constraint":"keep the change additive; do not bump the schema major version"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("revise status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp reviseBodyWithBase
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.RevisionBase == nil || !resp.RevisionBase.Elided || resp.RevisionBase.Mode != prompt.RevisionBaseModeDigest {
+		t.Fatalf("revise body revision_base = %+v, want an elided digest", resp.RevisionBase)
+	}
+	audited, _ := decodeReviseAuditRevisionBase(t, au)
+	if audited == nil || audited.OriginalBytes != resp.RevisionBase.OriginalBytes || audited.RenderedBytes != resp.RevisionBase.RenderedBytes {
+		t.Fatalf("audit revision_base = %+v, want the response's figures %+v", audited, resp.RevisionBase)
+	}
+
+	pw := promptRequest(t, s, runID, stageID, priv, "")
+	if pw.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want 200:\n%s", pw.Code, pw.Body.String())
+	}
+	var pr promptResponse
+	if err := json.NewDecoder(pw.Body).Decode(&pr); err != nil {
+		t.Fatalf("decode prompt: %v", err)
+	}
+	if !strings.Contains(pr.Prompt, "did NOT fit whole and was ELIDED") {
+		t.Errorf("re-dispatched plan prompt missing the revision-base ELIDED notice")
+	}
+	header := fmt.Sprintf("%d original bytes, %d rendered bytes, %d elided bytes",
+		resp.RevisionBase.OriginalBytes, resp.RevisionBase.RenderedBytes, resp.RevisionBase.ElidedBytes)
+	if !strings.Contains(pr.Prompt, header) {
+		t.Errorf("re-dispatched plan prompt's digest header does not carry the revise response's accounting %q", header)
+	}
+	if !strings.Contains(pr.Prompt, "STEP-COMPLETE DIGEST") {
+		t.Errorf("re-dispatched plan prompt did not take the digest path the response reports (mode=%q)", resp.RevisionBase.Mode)
 	}
 }

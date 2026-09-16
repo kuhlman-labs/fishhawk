@@ -3335,6 +3335,102 @@ components:
                 the reviewer. Omitted when empty.
               items:
                 $ref: '#/components/schemas/PRBodyObligation'
+    ReviseResponse:
+      description: |
+        The `POST /v0/stages/{stage_id}/revise` 200 body (#3442): the re-opened
+        Stage with an OPTIONAL `revision_base` field. All the Stage fields
+        appear at the top level exactly as before; `revision_base` is present
+        only when the prior plan artifact was loadable, so a revise with no
+        loadable base serves a byte-identical Stage response.
+      allOf:
+        - $ref: '#/components/schemas/Stage'
+        - type: object
+          properties:
+            revision_base:
+              $ref: '#/components/schemas/RevisionBaseAssessment'
+    RevisionBaseAssessment:
+      type: object
+      description: |
+        How the prior plan — the revision base the re-plan agent receives —
+        was rendered against the revision-base cap (#3442). Measured
+        server-side by the same renderer the re-dispatched plan prompt uses,
+        on the identical serialization, so these figures equal the prompt's
+        digest header (`original bytes, rendered bytes, elided bytes`). The
+        same object is stamped on the `plan_revised` audit payload under
+        `revision_base`.
+      required: [original_bytes, cap_bytes, elided, mode, rendered_bytes, elided_bytes]
+      additionalProperties: false
+      properties:
+        original_bytes:
+          type: integer
+          description: Byte length of the prior plan as serialized for the prompt.
+        cap_bytes:
+          type: integer
+          description: The revision-base cap (60000).
+        elided:
+          type: boolean
+          description: |
+            `false` — the prompt carries the whole prior plan. `true` — it does
+            not; `mode` says what it carries instead.
+        mode:
+          type: string
+          enum: [whole, digest, digest_shrunk, cut]
+          description: |
+            `whole`: under the cap, delivered verbatim. `digest`: over the cap;
+            the planner receives a step-complete digest (every approach-step
+            identity, bodies capped at 2000 bytes with named inline elisions).
+            `digest_shrunk`: the first-pass digest still overflowed, so step and
+            criterion bodies are withheld entirely and auxiliary lists are
+            counted. `cut`: over the cap AND the artifact did not decode as a
+            plan carrying approach steps (malformed, or zero steps) — the
+            planner receives a byte-cut prefix with an elision marker, NOT a
+            digest.
+        rendered_bytes:
+          type: integer
+          description: |
+            Source bytes of the prior plan actually carried into the prompt
+            (the digest header's `rendered bytes`; in `cut` mode the marker's
+            bytes-shown figure). Equals `original_bytes` when `mode` is `whole`.
+        elided_bytes:
+          type: integer
+          description: |
+            `original_bytes - rendered_bytes` — every byte not carried forward.
+            0 when `mode` is `whole`.
+        elisions:
+          type: array
+          description: |
+            The NAMED per-body elisions the digest performed — the very cuts it
+            marks inline (`...[ELIDED — <field>: …]` / `[<field> elided — …]`).
+            Bounded at 50 entries; `elisions_omitted` counts the rest. Omitted
+            when empty (always in `whole` and `cut` modes).
+          items:
+            $ref: '#/components/schemas/RevisionBaseElision'
+        elisions_omitted:
+          type: integer
+          description: Named elisions past the 50-entry bound of `elisions`. Omitted when 0.
+        unrendered_keys:
+          type: array
+          description: |
+            Sorted top-level keys of the prior plan the digest does not render
+            — the same list the prompt's elision manifest names. Omitted when
+            empty.
+          items:
+            type: string
+    RevisionBaseElision:
+      type: object
+      description: One named per-body elision the revision-base digest performed (#3442).
+      required: [field, bytes_shown, bytes_dropped]
+      additionalProperties: false
+      properties:
+        field:
+          type: string
+          description: The body's label as it appears in the digest's inline marker (e.g. `summary`, `approach step 4 body`).
+        bytes_shown:
+          type: integer
+          description: Bytes of the body carried into the digest (0 for a body withheld entirely in the shrink pass).
+        bytes_dropped:
+          type: integer
+          description: Bytes of the body not carried; `bytes_shown + bytes_dropped` is the body's original length.
     PRBodyObligation:
       type: object
       description: |
@@ -14675,10 +14771,26 @@ paths:
             The plan stage was re-opened `awaiting_approval` → `pending` and
             the orchestrator re-dispatches it. The body is the re-opened
             `Stage` shape (pending, or dispatched once the orchestrator
-            advances it before the response returns).
+            advances it before the response returns) plus an OPTIONAL
+            `revision_base` object (#3442): the server's measurement of the
+            prior plan against the 60000-byte revision-base cap, taken via the
+            identical serialization the re-dispatched prompt renders, so the
+            response, the `plan_revised` audit payload (same object under
+            `revision_base`) and the prompt's digest header report one set of
+            numbers. Present whenever the prior plan artifact was loadable;
+            absent otherwise, leaving the body a byte-identical `Stage`.
+            `elided: false` (mode `whole`) means the re-plan prompt carries
+            the whole prior plan. `elided: true` means it does NOT — read
+            `mode`: `digest` / `digest_shrunk` means the planner receives a
+            step-complete digest (every approach-step identity, bodies
+            capped or withheld, the named cuts in `elisions`); `cut` means the
+            prior artifact did not decode as a plan carrying approach steps
+            and the planner receives a byte-cut prefix with an elision
+            marker, NOT a digest. An elided base is also WARN-logged
+            server-side. The cap is unchanged and no refusal is added.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Stage' }
+              schema: { $ref: '#/components/schemas/ReviseResponse' }
         '400':
           description: |
             `validation_failed` — the `stage_id` is not a valid UUID, the body

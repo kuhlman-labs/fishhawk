@@ -1421,7 +1421,14 @@ Notes:
   `POST /v0/stages/{stage_id}/revise`) writes it once on a successful re-open,
   with the acting token's subject and a kind selected from it, and payload
   `{stage_id, prior_state, conditions, pass_ordinal, max_passes, hard_ceiling,
-  remaining_budget, forced, actor}`. It serves double duty: the canonical
+  remaining_budget, forced, actor, revision_base?}` — `revision_base` is
+  optional (#3442): the server's measurement of the prior plan against the
+  60000-byte revision-base cap (`{original_bytes, cap_bytes, elided, mode
+  whole|digest|digest_shrunk|cut, rendered_bytes, elided_bytes, elisions,
+  elisions_omitted, unrendered_keys}`), the same object the revise 200 body
+  returns, present only when the prior plan artifact was loadable, and the
+  durable hash-chained record that the re-plan prompt's revision base was (or
+  was not) elided. It serves double duty: the canonical
   receipt of who re-planned the plan stage in place against which binding
   operator constraint, AND **the durable revise-pass counter** — the bound
   (default 1) is enforced by counting prior `plan_revised` entries for the

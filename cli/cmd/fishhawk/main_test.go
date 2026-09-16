@@ -221,6 +221,10 @@ type fakeBackend struct {
 	// 200 — serves the #986 duplicate-labeled shape with the literal
 	// duplicate_submission/prior_decision/prior_submitted_at keys.
 	approvalRawResp string
+	// reviseRawResp is written verbatim on the revise 200 (#3442) — serves
+	// the real wire shape with the optional revision_base key; empty →
+	// a plain pending Stage for the resolved plan stage.
+	reviseRawResp string
 	// retryResp returned by POST /v0/stages/{id}/retry
 	retryResp httpclient.Stage
 	// retryErrCode lets a test request a 4xx response with a typed
@@ -336,6 +340,19 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(fb.retryResp)
+	})
+	mux.HandleFunc("POST /v0/stages/{stage_id}/revise", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fb.mu.Lock()
+		raw := fb.reviseRawResp
+		fb.mu.Unlock()
+		if raw != "" {
+			_, _ = w.Write([]byte(raw))
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"id":%q,"run_id":%q,"sequence":1,"type":"plan","state":"pending","executor":{"kind":"agent","ref":"claude-code"}}`,
+			r.PathValue("stage_id"), uuid.Nil)
 	})
 	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", func(w http.ResponseWriter, r *http.Request) {
 		var in httpclient.SubmitApprovalInput
@@ -2125,5 +2142,123 @@ func TestHarvestRobustToNewlineLeadingUsage(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Errorf("harvest produced phantom flags: %v", got)
+	}
+}
+
+// --- plan revise: the revision-base elision notice (#3442) ---------------
+
+// reviseElidedRawResp is the revise 200 body for a >60 KB prior plan: the
+// Stage fields at the top level plus a digest-mode revision_base.
+func reviseElidedRawResp(planStageID, runID uuid.UUID, mode string) string {
+	return fmt.Sprintf(
+		`{"id":%q,"run_id":%q,"sequence":1,"type":"plan","state":"pending","executor":{"kind":"agent","ref":"claude-code"},`+
+			`"revision_base":{"original_bytes":63761,"cap_bytes":60000,"elided":true,"mode":%q,"rendered_bytes":41000,"elided_bytes":22761,`+
+			`"elisions":[{"field":"summary","bytes_shown":2000,"bytes_dropped":3073}],"unrendered_keys":["generated_by"]}}`,
+		planStageID, runID, mode)
+}
+
+func TestPlanRevise_ElidedBase_TextNoticeOnStderr(t *testing.T) {
+	// #3442: an elided revision_base prints a stderr notice BEFORE the
+	// normal stage echo; exit stays 0 (the revise succeeded).
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stages := planApproveStages(runID, "awaiting_approval")
+	planStageID := stages[0].ID
+	fb.stagesForRun[runID] = stages
+	fb.reviseRawResp = reviseElidedRawResp(planStageID, runID, "digest")
+
+	var stdout, stderr strings.Builder
+	got := run([]string{"plan", "revise", "--constraint", "keep it additive", runID.String()}, &stdout, &stderr)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK (an elided base keeps exit 0): %s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "plan revise: notice — the prior plan is 63761 bytes, over the 60000-byte revision-base cap; the re-plan agent receives a step-complete digest (41000 rendered / 22761 elided bytes), not the whole plan") {
+		t.Errorf("stderr missing the elision notice: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), planStageID.String()) {
+		t.Errorf("stdout missing stage echo: %s", stdout.String())
+	}
+}
+
+func TestPlanRevise_CutModeBase_NoticeSaysCutNotDigest(t *testing.T) {
+	// Approval condition 1 (#3442): the cut fallback gets its own sentence
+	// and never claims a step-complete digest.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stages := planApproveStages(runID, "awaiting_approval")
+	fb.stagesForRun[runID] = stages
+	fb.reviseRawResp = reviseElidedRawResp(stages[0].ID, runID, "cut")
+
+	var stderr strings.Builder
+	if got := run([]string{"plan", "revise", "--constraint", "keep it additive", runID.String()}, io.Discard, &stderr); got != exitOK {
+		t.Fatalf("status = %d, want exitOK: %s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "byte-cut prefix") || !strings.Contains(stderr.String(), "NOT a digest") {
+		t.Errorf("cut-mode notice lacks the cut wording: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "step-complete digest") {
+		t.Errorf("cut-mode notice claims a step-complete digest: %s", stderr.String())
+	}
+}
+
+func TestPlanRevise_JSONCarriesRevisionBase(t *testing.T) {
+	// #3442: --output json encodes the whole ReviseResult so revision_base
+	// rides along for scripts.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stages := planApproveStages(runID, "awaiting_approval")
+	planStageID := stages[0].ID
+	fb.stagesForRun[runID] = stages
+	fb.reviseRawResp = reviseElidedRawResp(planStageID, runID, "digest")
+
+	var stdout, stderr strings.Builder
+	if got := run([]string{"plan", "revise", "--output", "json", "--constraint", "keep it additive", runID.String()}, &stdout, &stderr); got != exitOK {
+		t.Fatalf("status = %d: %s", got, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"revision_base"`) || !strings.Contains(stdout.String(), `"elided":true`) {
+		t.Errorf("json output missing revision_base: %s", stdout.String())
+	}
+	var decoded httpclient.ReviseResult
+	if err := json.NewDecoder(strings.NewReader(stdout.String())).Decode(&decoded); err != nil {
+		t.Fatalf("decode json: %v\nstdout: %s", err, stdout.String())
+	}
+	if decoded.ID != planStageID || decoded.RevisionBase == nil || !decoded.RevisionBase.Elided || decoded.RevisionBase.Mode != "digest" {
+		t.Errorf("decoded = (%s, %+v), want (%s, elided digest)", decoded.ID, decoded.RevisionBase, planStageID)
+	}
+}
+
+func TestPlanRevise_WholeBase_NoNotice(t *testing.T) {
+	// Control: a whole (not elided) base, and a legacy Stage-only body,
+	// print NO notice.
+	for _, tc := range []struct{ name, raw string }{
+		{"whole base", ""},
+		{"legacy stage-only body", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			withBackend(t, srv)
+			runID := uuid.New()
+			stages := planApproveStages(runID, "awaiting_approval")
+			fb.stagesForRun[runID] = stages
+			if tc.name == "whole base" {
+				fb.reviseRawResp = fmt.Sprintf(
+					`{"id":%q,"run_id":%q,"sequence":1,"type":"plan","state":"pending","executor":{"kind":"agent","ref":"claude-code"},`+
+						`"revision_base":{"original_bytes":18000,"cap_bytes":60000,"elided":false,"mode":"whole","rendered_bytes":18000,"elided_bytes":0}}`,
+					stages[0].ID, runID)
+			}
+			var stdout, stderr strings.Builder
+			if got := run([]string{"plan", "revise", "--constraint", "keep it additive", runID.String()}, &stdout, &stderr); got != exitOK {
+				t.Fatalf("status = %d: %s", got, stderr.String())
+			}
+			if stderr.String() != "" {
+				t.Errorf("stderr = %q, want empty for a non-elided base", stderr.String())
+			}
+			if !strings.Contains(stdout.String(), stages[0].ID.String()) {
+				t.Errorf("stdout missing stage echo: %s", stdout.String())
+			}
+		})
 	}
 }

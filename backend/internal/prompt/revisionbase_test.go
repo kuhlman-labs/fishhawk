@@ -548,6 +548,224 @@ func TestRenderRevisionBase_ZeroApproachSteps_LoudElision(t *testing.T) {
 	}
 }
 
+// --- (h): the operator-visible assessment (#3442) ------------------------
+
+// TestAssessRevisionBase_UnderCap_Whole pins the whole-delivery mode: a base
+// at the cap reports elided=false, mode whole, rendered == original, zero
+// elided bytes and no named elisions.
+func TestAssessRevisionBase_UnderCap_Whole(t *testing.T) {
+	base := strings.Repeat("z", MaxRevisionBasePlanBytes)
+	a := AssessRevisionBase(base)
+	if a.Elided || a.Mode != RevisionBaseModeWhole {
+		t.Errorf("at-cap base assessed (elided=%v, mode=%q), want (false, whole)", a.Elided, a.Mode)
+	}
+	if a.OriginalBytes != len(base) || a.CapBytes != MaxRevisionBasePlanBytes {
+		t.Errorf("original/cap = %d/%d, want %d/%d", a.OriginalBytes, a.CapBytes, len(base), MaxRevisionBasePlanBytes)
+	}
+	if a.RenderedBytes != a.OriginalBytes || a.ElidedBytes != 0 {
+		t.Errorf("rendered/elided = %d/%d, want %d/0", a.RenderedBytes, a.ElidedBytes, a.OriginalBytes)
+	}
+	if len(a.Elisions) != 0 || a.ElisionsOmitted != 0 || len(a.UnrenderedKeys) != 0 {
+		t.Errorf("whole delivery reported elisions=%v omitted=%d keys=%v, want none", a.Elisions, a.ElisionsOmitted, a.UnrenderedKeys)
+	}
+}
+
+// TestAssessRevisionBase_OverCapPlan_DigestMatchesInlineMarkers is the >60 KB
+// prior-plan pin the #3442 done-means asks for: every NAMED elision the
+// assessment reports matches, byte-for-byte, the inline marker the digest text
+// carries, and the header accounting line equals the reported figures — so
+// the operator surface and the planner's prompt are one measurement. Deleting
+// the noteElision call in capField reddens it on len(Elisions)==0.
+func TestAssessRevisionBase_OverCapPlan_DigestMatchesInlineMarkers(t *testing.T) {
+	// 20 steps x 2500-byte bodies + a 9000-byte summary + a 7000-byte test
+	// strategy: over the cap as a document, but the FIRST-pass digest (each
+	// body capped at 2000) fits, so this pins mode=digest not digest_shrunk.
+	p := basePlanFixture(20, 2500)
+	p.Summary = strings.Repeat("s", 9000)
+	p.Verification.TestStrategy = strings.Repeat("t", 7000)
+	p.TicketReference = plan.TicketReference{Type: plan.TicketTypeGitHubIssue, URL: "https://x/y/1", ID: "1"}
+	base := overCapBase(t, p)
+
+	a := AssessRevisionBase(base)
+	rendered, elided := renderRevisionBase(base)
+	if !elided || !a.Elided || a.Mode != RevisionBaseModeDigest {
+		t.Fatalf("over-cap plan assessed (elided=%v, mode=%q), want (true, digest)", a.Elided, a.Mode)
+	}
+	if a.OriginalBytes != len(base) || a.CapBytes != MaxRevisionBasePlanBytes {
+		t.Errorf("original/cap = %d/%d, want %d/%d", a.OriginalBytes, a.CapBytes, len(base), MaxRevisionBasePlanBytes)
+	}
+	if a.RenderedBytes+a.ElidedBytes != a.OriginalBytes {
+		t.Errorf("accounting: %d rendered + %d elided != %d original", a.RenderedBytes, a.ElidedBytes, a.OriginalBytes)
+	}
+	header := fmt.Sprintf("%d original bytes, %d rendered bytes, %d elided bytes", a.OriginalBytes, a.RenderedBytes, a.ElidedBytes)
+	if !strings.Contains(rendered, header) {
+		t.Errorf("digest header does not carry the assessment's figures %q:\n%s", header, headOf(rendered, 1500))
+	}
+	if len(a.Elisions) == 0 {
+		t.Fatalf("over-cap plan with over-long bodies reported no named elisions")
+	}
+	if a.ElisionsOmitted != 0 {
+		t.Errorf("elisions_omitted = %d, want 0 (under the %d-entry bound)", a.ElisionsOmitted, maxRevisionBaseElisionEntries)
+	}
+	fields := map[string]bool{}
+	for _, e := range a.Elisions {
+		fields[e.Field] = true
+		want := fmt.Sprintf("...[ELIDED — %s: %d of %d bytes shown, %d bytes dropped]",
+			e.Field, e.BytesShown, e.BytesShown+e.BytesDropped, e.BytesDropped)
+		if !strings.Contains(rendered, want) {
+			t.Errorf("reported elision has no matching inline marker %q", want)
+		}
+	}
+	for _, want := range []string{"summary", "verification.test_strategy", "approach step 1 body"} {
+		if !fields[want] {
+			t.Errorf("named elisions missing %q: %v", want, a.Elisions)
+		}
+	}
+	// The unrendered-key list IS the manifest's list.
+	keys := map[string]bool{}
+	for _, k := range a.UnrenderedKeys {
+		keys[k] = true
+		if !strings.Contains(rendered, "- "+k+"\n") {
+			t.Errorf("unrendered key %q is not named in the manifest", k)
+		}
+	}
+	for _, want := range []string{"generated_by", "ticket_reference"} {
+		if !keys[want] {
+			t.Errorf("unrendered_keys missing %q: %v", want, a.UnrenderedKeys)
+		}
+	}
+	for _, rendered := range []string{"approach", "summary", "verification"} {
+		if keys[rendered] {
+			t.Errorf("unrendered_keys wrongly lists rendered key %q", rendered)
+		}
+	}
+}
+
+// TestAssessRevisionBase_ShrinkPass_ModeAndBound drives the pathological
+// step-count plan into the shrink pass and pins the bounded list: exactly
+// maxRevisionBaseElisionEntries named entries, a non-zero omitted counter, and
+// listed + omitted == the number of named markers in the rendered text — so
+// the bound can never drop an entry silently.
+func TestAssessRevisionBase_ShrinkPass_ModeAndBound(t *testing.T) {
+	const steps = maxRevisionBaseStepIdentities + 150
+	base := overCapBase(t, basePlanFixture(steps, 400))
+	a := AssessRevisionBase(base)
+	rendered, _ := renderRevisionBase(base)
+	if a.Mode != RevisionBaseModeDigestShrunk || !a.Elided {
+		t.Fatalf("shrink-pass plan assessed (elided=%v, mode=%q), want (true, digest_shrunk)", a.Elided, a.Mode)
+	}
+	if len(a.Elisions) != maxRevisionBaseElisionEntries {
+		t.Errorf("len(Elisions) = %d, want the bound %d", len(a.Elisions), maxRevisionBaseElisionEntries)
+	}
+	if a.ElisionsOmitted <= 0 {
+		t.Errorf("elisions_omitted = %d, want > 0 past the bound", a.ElisionsOmitted)
+	}
+	// Count every named marker in the text: the shrink pass's withheld
+	// bodies plus any partial cuts.
+	withheld := regexp.MustCompile(`\[[^\[\]]+ elided — \d+ bytes withheld\]`).FindAllString(rendered, -1)
+	cut := regexp.MustCompile(`\.\.\.\[ELIDED — [^:]+: \d+ of \d+ bytes shown, \d+ bytes dropped\]`).FindAllString(rendered, -1)
+	if total := len(withheld) + len(cut); len(a.Elisions)+a.ElisionsOmitted != total {
+		t.Errorf("listed %d + omitted %d != %d named markers in the digest", len(a.Elisions), a.ElisionsOmitted, total)
+	}
+	for _, e := range a.Elisions {
+		if e.BytesShown != 0 {
+			continue
+		}
+		want := fmt.Sprintf("[%s elided — %d bytes withheld]", e.Field, e.BytesDropped)
+		if !strings.Contains(rendered, want) {
+			t.Errorf("withheld-body elision has no matching inline marker %q", want)
+		}
+	}
+	if a.RenderedBytes+a.ElidedBytes != a.OriginalBytes {
+		t.Errorf("accounting: %d rendered + %d elided != %d original", a.RenderedBytes, a.ElidedBytes, a.OriginalBytes)
+	}
+}
+
+// TestAssessRevisionBase_UndecodableBase_Cut pins the cut mode for both
+// undecodable shapes (a malformed blob and a zero-step plan): mode cut,
+// rendered == the cap, elided == len - cap, and — since there is no digest —
+// no named elisions or unrendered keys. The mode is what selects the
+// operator-facing wording on every surface, so a digest claim here would be a
+// lie about what the planner receives.
+func TestAssessRevisionBase_UndecodableBase_Cut(t *testing.T) {
+	zero := basePlanFixture(0, 0)
+	zero.Summary = strings.Repeat("s", MaxRevisionBasePlanBytes)
+	for _, tc := range []struct{ name, base string }{
+		{"malformed blob", "{not json at all " + strings.Repeat("m", MaxRevisionBasePlanBytes)},
+		{"zero-step plan", overCapBase(t, zero)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := AssessRevisionBase(tc.base)
+			if !a.Elided || a.Mode != RevisionBaseModeCut {
+				t.Fatalf("%s assessed (elided=%v, mode=%q), want (true, cut)", tc.name, a.Elided, a.Mode)
+			}
+			if a.RenderedBytes != MaxRevisionBasePlanBytes || a.ElidedBytes != len(tc.base)-MaxRevisionBasePlanBytes {
+				t.Errorf("rendered/elided = %d/%d, want %d/%d", a.RenderedBytes, a.ElidedBytes,
+					MaxRevisionBasePlanBytes, len(tc.base)-MaxRevisionBasePlanBytes)
+			}
+			if len(a.Elisions) != 0 || a.ElisionsOmitted != 0 || len(a.UnrenderedKeys) != 0 {
+				t.Errorf("cut mode reported digest-only fields: elisions=%v omitted=%d keys=%v", a.Elisions, a.ElisionsOmitted, a.UnrenderedKeys)
+			}
+			rendered, _ := renderRevisionBase(tc.base)
+			if !strings.Contains(rendered, fmt.Sprintf("%d of %d bytes shown", a.RenderedBytes, a.OriginalBytes)) {
+				t.Errorf("cut marker does not carry the assessment's shown/original figures:\n%s", tailOf(rendered, 700))
+			}
+		})
+	}
+}
+
+// TestRevisionBaseElisionSummary_WordingAgreesWithMode pins approval
+// condition 1 of #3442: the operator-facing sentence claims a "step-complete
+// digest" ONLY in the digest modes, the cut fallback (a malformed or
+// zero-step base) gets its own distinct sentence, and a whole base yields no
+// sentence at all.
+func TestRevisionBaseElisionSummary_WordingAgreesWithMode(t *testing.T) {
+	zero := basePlanFixture(0, 0)
+	zero.Summary = strings.Repeat("s", MaxRevisionBasePlanBytes)
+	digestPlan := basePlanFixture(20, 2500)
+	digestPlan.Summary = strings.Repeat("s", 9000)
+	for _, tc := range []struct {
+		name         string
+		base         string
+		wantMode     string
+		want, reject string
+	}{
+		{"whole", strings.Repeat("z", 10), RevisionBaseModeWhole, "", "prior plan"},
+		{"digest", overCapBase(t, digestPlan), RevisionBaseModeDigest, "step-complete digest", "byte-cut"},
+		{"digest_shrunk", overCapBase(t, basePlanFixture(maxRevisionBaseStepIdentities+150, 400)), RevisionBaseModeDigestShrunk, "SHRUNKEN step-complete digest", "byte-cut"},
+		{"cut malformed", "{not json at all " + strings.Repeat("m", MaxRevisionBasePlanBytes), RevisionBaseModeCut, "byte-cut prefix", "digest ("},
+		{"cut zero-step", overCapBase(t, zero), RevisionBaseModeCut, "NOT a digest", "step-complete"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := AssessRevisionBase(tc.base)
+			if a.Mode != tc.wantMode {
+				t.Fatalf("mode = %q, want %q", a.Mode, tc.wantMode)
+			}
+			got := RevisionBaseElisionSummary(&a)
+			if tc.want == "" {
+				if got != "" {
+					t.Errorf("whole base produced a summary: %q", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("summary for mode %q missing %q: %q", a.Mode, tc.want, got)
+			}
+			if strings.Contains(got, tc.reject) {
+				t.Errorf("summary for mode %q wrongly contains %q: %q", a.Mode, tc.reject, got)
+			}
+			for _, n := range []int{a.OriginalBytes, a.CapBytes, a.RenderedBytes, a.ElidedBytes} {
+				if !strings.Contains(got, strconv.Itoa(n)) {
+					t.Errorf("summary missing figure %d: %q", n, got)
+				}
+			}
+		})
+	}
+	if RevisionBaseElisionSummary(nil) != "" {
+		t.Errorf("nil assessment produced a summary")
+	}
+}
+
 // headOf returns the first n bytes of s (or all of s), for bounded failure
 // output.
 func headOf(s string, n int) string {
