@@ -202,6 +202,16 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Measure the prior plan against the revision-base cap (#3442) BEFORE
+	// every stateful step, through the SAME loader the re-dispatched prompt
+	// renders from (loadRevisionBasePlan: json.MarshalIndent of the typed
+	// plan) and the SAME renderer (prompt.AssessRevisionBase), so the
+	// figures returned here, stamped on the plan_revised payload and printed
+	// in the prompt's digest header are one measurement. Read-only and
+	// best-effort: a missing or unreadable artifact yields nil and the revise
+	// proceeds with the key absent, byte-identical to the pre-#3442 body.
+	assessment := s.assessRevisionBase(r.Context(), stage)
+
 	// Count prior revise passes for this stage to enforce the bound — the
 	// durable record is the plan_revised audit entry (no dedicated column),
 	// exactly as fixup counts stage_fixup_triggered.
@@ -242,7 +252,7 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 		ForceAdditionalPass: reqBody.ForceAdditionalPass,
 		HardCeiling:         defaultReviseCeiling,
 		OnAdmit: func(d *run.ReviseDecision) error {
-			return s.writeReviseAudit(r, d, constraint, priorPasses)
+			return s.writeReviseAudit(r, d, constraint, priorPasses, assessment)
 		},
 	})
 	if err != nil {
@@ -323,7 +333,57 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 	// back to pending / dispatched; the status comment should reflect that.
 	s.notifyStatusUpdate(r.Context(), dec.Stage.RunID, "plan_revised")
 
-	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+	s.writeJSON(w, r, http.StatusOK, toReviseResponse(dec.Stage, assessment))
+}
+
+// reviseResponse is the revise endpoint's 200 body (#3442): the re-opened
+// Stage with an OPTIONAL `revision_base` field carrying the server's
+// measurement of the prior plan against prompt.MaxRevisionBasePlanBytes. All
+// the Stage fields appear at the top level exactly as before; `revision_base`
+// is present only when the prior plan artifact was loadable, so a revise with
+// no loadable base serves a byte-identical Stage response. Mirrors
+// fixupResponse.
+type reviseResponse struct {
+	stageResponse
+	RevisionBase *prompt.RevisionBaseAssessment `json:"revision_base,omitempty"`
+}
+
+// toReviseResponse builds the revise 200 body from the re-opened stage and
+// the (possibly nil) revision-base assessment.
+func toReviseResponse(s *run.Stage, assessment *prompt.RevisionBaseAssessment) reviseResponse {
+	return reviseResponse{stageResponse: toStageResponse(s), RevisionBase: assessment}
+}
+
+// assessRevisionBase measures the run's prior plan — the revision base the
+// re-dispatched plan prompt will render — against the revision-base cap
+// (#3442). nil when no plan artifact is loadable (loadRevisionBasePlan is
+// best-effort), so the measurement never aborts a revise. An elided base is
+// WARN-logged with wording selected BY MODE: the planner receives a
+// step-complete digest only in the digest modes; in cut mode (a base that
+// did not decode as a plan carrying approach steps) it receives a byte-cut
+// prefix, and the log says so rather than claiming a digest.
+func (s *Server) assessRevisionBase(ctx context.Context, stage *run.Stage) *prompt.RevisionBaseAssessment {
+	base := s.loadRevisionBasePlan(ctx, stage.RunID)
+	if base == nil {
+		return nil
+	}
+	a := prompt.AssessRevisionBase(*base)
+	attrs := []slog.Attr{
+		slog.String("run_id", stage.RunID.String()),
+		slog.String("stage_id", stage.ID.String()),
+		slog.Int("original_bytes", a.OriginalBytes),
+		slog.Int("cap_bytes", a.CapBytes),
+		slog.String("mode", a.Mode),
+		slog.Int("rendered_bytes", a.RenderedBytes),
+		slog.Int("elided_bytes", a.ElidedBytes),
+	}
+	if !a.Elided {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"revise: prior plan fits under the revision-base cap; the re-plan prompt carries the whole plan", attrs...)
+		return &a
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "revise: "+prompt.RevisionBaseElisionSummary(&a), attrs...)
+	return &a
 }
 
 // supersedeReplanConcerns transitions every OPEN plan-review concern of
@@ -482,7 +542,13 @@ var errReviseAuditAppendFailed = errors.New("append plan_revised audit entry fai
 // the revise rather than let the orchestrator re-dispatch a constraint-less
 // plan (#1099). On failure it logs and returns errReviseAuditAppendFailed,
 // which RevisePlanStage propagates to leave the stage at its gate.
-func (s *Server) writeReviseAudit(r *http.Request, dec *run.ReviseDecision, constraint string, priorPasses int) error {
+//
+// When assessment is non-nil the payload ALSO carries it under
+// `revision_base` (#3442) — the durable, hash-chained record that the
+// re-plan prompt's revision base was (or was not) elided, and by how much. A
+// nil assessment (no loadable plan artifact) leaves the key absent, so
+// existing payload readers and fixtures are unchanged.
+func (s *Server) writeReviseAudit(r *http.Request, dec *run.ReviseDecision, constraint string, priorPasses int, assessment *prompt.RevisionBaseAssessment) error {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -501,6 +567,9 @@ func (s *Server) writeReviseAudit(r *http.Request, dec *run.ReviseDecision, cons
 		"remaining_budget": dec.RemainingBudget,
 		"forced":           dec.Forced,
 		"actor":            subject,
+	}
+	if assessment != nil {
+		fields["revision_base"] = assessment
 	}
 	payload, _ := json.Marshal(fields)
 

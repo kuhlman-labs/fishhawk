@@ -7,6 +7,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
 // RevisePlanInput is the fishhawk_revise_plan tool's input schema
@@ -26,6 +28,61 @@ type RevisePlanInput struct {
 type RevisePlanOutput struct {
 	Stage   Stage  `json:"stage"`
 	StageID string `json:"stage_id" jsonschema:"the resolved plan-stage UUID the revise was posted to"`
+	// RevisionBase is the server's measurement of the prior plan against the
+	// revision-base cap (#3442). Present whenever the prior plan artifact was
+	// loadable; nil on an older backend.
+	RevisionBase *prompt.RevisionBaseAssessment `json:"revision_base,omitempty" jsonschema:"the server's measurement of the prior plan (the revision base the re-plan agent receives) against the 60000-byte revision-base cap. elided:false with mode 'whole' means the re-plan prompt carries the whole prior plan. elided:true means it does NOT: mode 'digest' / 'digest_shrunk' means the agent receives a step-complete digest (every approach-step identity, bodies capped or withheld — the named cuts are listed in elisions, the unrendered top-level keys in unrendered_keys); mode 'cut' means the prior artifact did not decode as a plan carrying approach steps and the agent receives a byte-cut prefix with an elision marker, NOT a digest. original_bytes, cap_bytes, rendered_bytes and elided_bytes are the same figures the prompt's digest header prints. Absent when no prior plan artifact was loadable"`
+	// Warnings carries the operator-facing elision warning (one line) when
+	// the base was elided; nil otherwise.
+	Warnings []string `json:"warnings,omitempty" jsonschema:"operator-facing warnings; carries the revision-base elision warning (the byte accounting, the named elisions and the operator's levers) when revision_base.elided is true"`
+}
+
+// maxRevisionBaseWarningElisions bounds how many named elisions the warning
+// text lists; the rest are counted.
+const maxRevisionBaseWarningElisions = 5
+
+// revisionBaseElisionWarning renders the ONE operator-facing warning for an
+// elided revision base (#3442): the mode-selected summary sentence
+// (prompt.RevisionBaseElisionSummary — "step-complete digest" only when the
+// mode is a digest, a distinct sentence for the cut fallback), up to
+// maxRevisionBaseWarningElisions named elisions plus a count of the rest, the
+// unrendered top-level keys, and the operator's levers. Empty when the base
+// was not elided.
+func revisionBaseElisionWarning(a *prompt.RevisionBaseAssessment) string {
+	summary := prompt.RevisionBaseElisionSummary(a)
+	if summary == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("WARNING — revision base elided: ")
+	b.WriteString(summary)
+	b.WriteString(".")
+	if n := len(a.Elisions); n > 0 {
+		b.WriteString(" Named elisions:")
+		listed := n
+		if listed > maxRevisionBaseWarningElisions {
+			listed = maxRevisionBaseWarningElisions
+		}
+		for i := 0; i < listed; i++ {
+			e := a.Elisions[i]
+			if i > 0 {
+				b.WriteString(";")
+			}
+			fmt.Fprintf(&b, " %s: %d of %d bytes shown", e.Field, e.BytesShown, e.BytesShown+e.BytesDropped)
+		}
+		if more := n - listed + a.ElisionsOmitted; more > 0 {
+			fmt.Fprintf(&b, "; %d more", more)
+		}
+		b.WriteString(".")
+	} else if a.ElisionsOmitted > 0 {
+		fmt.Fprintf(&b, " %d named elisions.", a.ElisionsOmitted)
+	}
+	if len(a.UnrenderedKeys) > 0 {
+		fmt.Fprintf(&b, " Top-level keys not rendered: %s.", strings.Join(a.UnrenderedKeys, ", "))
+	}
+	b.WriteString(" The planner is instructed to record the gap in risks_and_assumptions and to fetch the full artifact via fishhawk_get_plan. " +
+		"If a section must survive verbatim, restate it in the constraint (force_additional_pass grants one more pass) or reject to a fresh-run replan.")
+	return b.String()
 }
 
 // registerRevisePlan wires the fishhawk_revise_plan tool (E22.X / #1099).
@@ -115,14 +172,33 @@ and the re-dispatched prompt renders it terminated by an explicit
 "--- END OF OPERATOR CONSTRAINT ---" line so a cut in transit is
 structurally detectable by the planner.
 
+Revision-base elision — visible at revise time (#3442): the prior plan is
+rendered into the re-dispatched prompt as the revision base, capped at
+60000 BYTES. Under the cap it rides WHOLE. Over the cap the planner does
+NOT receive the whole plan: a decodable plan carrying approach steps
+falls to a step-complete digest (every approach-step identity, bodies
+capped at 2000 bytes with NAMED inline elisions, or withheld entirely in
+the shrink pass), while a prior artifact that does not decode as such a
+plan falls to a byte-cut prefix with an elision marker — NOT a digest.
+The result reports which under revision_base (original_bytes, cap_bytes,
+elided, mode whole|digest|digest_shrunk|cut, rendered_bytes,
+elided_bytes, the named elisions and the unrendered top-level keys), and
+an elided base ALSO draws a warnings line plus a WARNING text result
+naming the byte accounting and your levers: restate a must-survive
+section in the constraint, or reject to a fresh-run replan. The same
+object is stamped on the plan_revised audit entry. The cap is not
+changed and no refusal is added — you cannot shrink a prior plan, so the
+assessment makes the elision visible before review rather than gating
+on it.
+
 Inputs:
   - run_id     : the run whose plan stage to revise.
   - constraint : REQUIRED binding design constraint to revise the plan
     against. Max 12000 bytes; over-cap is refused, not truncated.
   - force_additional_pass : bounded operator override (see above).
 
-Returns the re-opened Stage row (pending → dispatched) and the resolved
-plan-stage UUID. Returns a tool error on:
+Returns the re-opened Stage row (pending → dispatched), the resolved
+plan-stage UUID and the revision_base measurement. Returns a tool error on:
   - "no plan stage" (the run has no plan stage)
   - validation_failed (empty constraint, 400; or a constraint over the
     12000-byte cap, 400 — details carries bytes, max_bytes and
@@ -157,5 +233,15 @@ func (r *runResolver) revisePlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	if err != nil {
 		return nil, RevisePlanOutput{}, fmt.Errorf("submit revise: %w", err)
 	}
-	return nil, RevisePlanOutput{Stage: *updated, StageID: planStage.ID}, nil
+	out := RevisePlanOutput{Stage: updated.Stage, StageID: planStage.ID, RevisionBase: updated.RevisionBase}
+	// An elided revision base is surfaced in BOTH channels (#3442): the
+	// structured warnings line and a CallToolResult text WARNING — the
+	// start_run / dispatch_stage advisory pattern — so it is never visible
+	// only to a client that renders structured output.
+	if updated.RevisionBase != nil && updated.RevisionBase.Elided {
+		w := revisionBaseElisionWarning(updated.RevisionBase)
+		out.Warnings = []string{w}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: w}}}, out, nil
+	}
+	return nil, out, nil
 }

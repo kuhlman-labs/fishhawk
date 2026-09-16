@@ -82,8 +82,119 @@ const revisionBaseRetrievalPointer = "To recover what is not shown: read this ru
 // that removes the base's tail cannot also remove the instruction to notice it.
 const revisionBaseElidedNotice = "IMPORTANT: the revision base below did NOT fit whole and was ELIDED — what follows is a digest or a cut prefix, NOT the entire prior document. You MUST record in the plan's risks_and_assumptions that the revision base arrived incomplete, naming what you could not see. The elision manifest and byte accounting inside it state exactly what is missing and how to fetch it.\n\n"
 
+// RevisionBaseElision is one NAMED per-body elision the over-cap digest
+// performed — the very cut the digest marks inline as
+// "...[ELIDED — <field>: <shown> of <shown+dropped> bytes shown, <dropped>
+// bytes dropped]" (a partial cut) or "[<field> elided — <dropped> bytes
+// withheld]" (a shrink-pass drop, BytesShown == 0). Surfaced to the OPERATOR
+// at revise time (#3442) so the elision the planner is told about is also a
+// fact the revise response, the plan_revised audit row and the CLI report.
+type RevisionBaseElision struct {
+	Field        string `json:"field"`
+	BytesShown   int    `json:"bytes_shown"`
+	BytesDropped int    `json:"bytes_dropped"`
+}
+
+// Revision-base render modes reported by RevisionBaseAssessment.Mode. The
+// operator-facing wording on every surface (server log, MCP warning, CLI
+// notice, API doc) is selected BY MODE: "step-complete digest" is claimed only
+// when the mode is a digest, and the cut fallback gets its own sentence.
+const (
+	// RevisionBaseModeWhole — the base fit under MaxRevisionBasePlanBytes and
+	// rides verbatim; nothing was elided.
+	RevisionBaseModeWhole = "whole"
+	// RevisionBaseModeDigest — over cap; the planner receives the
+	// step-complete digest from the first pass (per-body cap
+	// maxRevisionBaseFieldBytes).
+	RevisionBaseModeDigest = "digest"
+	// RevisionBaseModeDigestShrunk — over cap; the first-pass digest still
+	// overflowed, so the planner receives the SHRINK-pass digest (step and
+	// criterion bodies withheld entirely, auxiliary lists counted).
+	RevisionBaseModeDigestShrunk = "digest_shrunk"
+	// RevisionBaseModeCut — over cap AND undecodable as a plan carrying
+	// approach steps (a malformed blob, a zero-step plan, a grooming
+	// report), so the planner receives a CapTextWithRetrieval byte-cut
+	// prefix with the ADR-077 marker — NOT a digest.
+	RevisionBaseModeCut = "cut"
+)
+
+// maxRevisionBaseElisionEntries bounds the NAMED elision list an assessment
+// carries. Past it only ElisionsOmitted increments, so the audit payload and
+// the tool result stay small while the digest's inline markers remain
+// complete — the list is an operator index into the digest, not a
+// replacement for it.
+const maxRevisionBaseElisionEntries = 50
+
+// RevisionBaseAssessment is the operator-visible accounting of how the
+// revision base was rendered (#3442): the byte figures the digest header
+// prints, the mode the renderer took, the named per-body elisions and the
+// unrendered top-level keys the elision manifest lists. It is produced by the
+// SAME code path that renders the prompt text (assessRevisionBase), so the
+// revise response, the plan_revised audit payload and the re-dispatched
+// prompt cannot disagree.
+type RevisionBaseAssessment struct {
+	OriginalBytes int    `json:"original_bytes"`
+	CapBytes      int    `json:"cap_bytes"`
+	Elided        bool   `json:"elided"`
+	Mode          string `json:"mode"`
+	// RenderedBytes and ElidedBytes are the digest header's own
+	// "%d rendered bytes, %d elided bytes" figures (rendered counts only
+	// source bytes carried forward; elided is derived as original -
+	// rendered). In cut mode they are the marker's shown / dropped figures.
+	RenderedBytes int `json:"rendered_bytes"`
+	ElidedBytes   int `json:"elided_bytes"`
+	// Elisions is bounded by maxRevisionBaseElisionEntries; ElisionsOmitted
+	// counts the entries past the bound, so len(Elisions)+ElisionsOmitted is
+	// the number of named markers in the digest text.
+	Elisions        []RevisionBaseElision `json:"elisions,omitempty"`
+	ElisionsOmitted int                   `json:"elisions_omitted,omitempty"`
+	// UnrenderedKeys is the sorted list the elision manifest names.
+	UnrenderedKeys []string `json:"unrendered_keys,omitempty"`
+}
+
+// AssessRevisionBase measures how the revision-base channel would render
+// base, returning only the accounting. It renders and discards the text —
+// cheap relative to a prompt build — which is what guarantees the operator
+// surface is computed by the identical code path as the prompt (#3442).
+func AssessRevisionBase(base string) RevisionBaseAssessment {
+	_, a := assessRevisionBase(base)
+	return a
+}
+
+// RevisionBaseElisionSummary is the ONE operator-facing sentence describing
+// an elided revision base, selected BY MODE so the wording can never claim a
+// step-complete digest the planner did not receive (#3442, approval
+// condition 1). The server WARN log and the MCP warning render it directly;
+// the CLI (a separate module) mirrors the same mode split. Empty for a base
+// that was not elided.
+func RevisionBaseElisionSummary(a *RevisionBaseAssessment) string {
+	if a == nil || !a.Elided {
+		return ""
+	}
+	switch a.Mode {
+	case RevisionBaseModeDigest:
+		return fmt.Sprintf("the prior plan is %d bytes, over the %d-byte revision-base cap; the re-plan agent receives a step-complete digest (%d rendered / %d elided bytes), not the whole plan",
+			a.OriginalBytes, a.CapBytes, a.RenderedBytes, a.ElidedBytes)
+	case RevisionBaseModeDigestShrunk:
+		return fmt.Sprintf("the prior plan is %d bytes, over the %d-byte revision-base cap; the re-plan agent receives a SHRUNKEN step-complete digest with step and criterion bodies withheld (%d rendered / %d elided bytes), not the whole plan",
+			a.OriginalBytes, a.CapBytes, a.RenderedBytes, a.ElidedBytes)
+	default:
+		return fmt.Sprintf("the prior plan is %d bytes, over the %d-byte revision-base cap, and did not decode as a plan carrying approach steps; the re-plan agent receives a byte-cut prefix (%d shown / %d dropped bytes) with an elision marker, NOT a digest",
+			a.OriginalBytes, a.CapBytes, a.RenderedBytes, a.ElidedBytes)
+	}
+}
+
 // renderRevisionBase is the pure entry point for the revision-base channel: it
-// returns the text to render and whether the base was elided.
+// returns the text to render and whether the base was elided. It is a thin
+// wrapper over assessRevisionBase so the rendered text stays byte-identical
+// to the #3087 contract while the accounting is available to the operator.
+func renderRevisionBase(base string) (string, bool) {
+	rendered, a := assessRevisionBase(base)
+	return rendered, a.Elided
+}
+
+// assessRevisionBase is the ONE core that produces both the rendered text and
+// its accounting.
 //
 // The boundary is strictly `>`, like every sibling channel (CapText,
 // CapTextWithRetrieval): a base of exactly MaxRevisionBasePlanBytes bytes
@@ -97,15 +208,34 @@ const revisionBaseElidedNotice = "IMPORTANT: the revision base below did NOT fit
 // marker with byte accounting, the INCOMPLETE statement and the retrieval
 // pointer. NEVER CapText's bare "...[truncated]", which severed the prior plan
 // mid-sentence and told the reader nothing about what was lost.
-func renderRevisionBase(base string) (string, bool) {
+func assessRevisionBase(base string) (string, RevisionBaseAssessment) {
+	a := RevisionBaseAssessment{OriginalBytes: len(base), CapBytes: MaxRevisionBasePlanBytes}
 	if len(base) <= MaxRevisionBasePlanBytes {
-		return base, false
+		a.Mode = RevisionBaseModeWhole
+		a.RenderedBytes = len(base)
+		return base, a
 	}
-	if digest, ok := revisionBaseDigest(base); ok {
-		return digest, true
+	a.Elided = true
+	if digest, r, shrunk, ok := revisionBaseDigest(base); ok {
+		a.Mode = RevisionBaseModeDigest
+		if shrunk {
+			a.Mode = RevisionBaseModeDigestShrunk
+		}
+		a.RenderedBytes = r.sourceBytes
+		a.ElidedBytes = len(base) - r.sourceBytes
+		a.Elisions = r.elisions
+		a.ElisionsOmitted = r.elisionsOmitted
+		a.UnrenderedKeys = r.unrenderedKeys
+		return digest, a
 	}
 	capped, _ := CapTextWithRetrieval(base, MaxRevisionBasePlanBytes, revisionBaseRetrievalPointer)
-	return capped, true
+	a.Mode = RevisionBaseModeCut
+	// The marker's own shown/dropped figures: the kept prefix is the cap
+	// minus any trailing partial rune ToValidUTF8 removed, so the assessment
+	// reports the same arithmetic the marker prints (#2946).
+	a.RenderedBytes = len(strings.ToValidUTF8(base[:MaxRevisionBasePlanBytes], ""))
+	a.ElidedBytes = len(base) - a.RenderedBytes
+	return capped, a
 }
 
 // writeRevisionBase renders the revision-base block shared by buildPlan and
@@ -142,27 +272,33 @@ func writeRevisionBase(b *strings.Builder, base, leadLine string) bool {
 // map so the digest can name every top-level key it does not render — a field
 // dropped by the typed decode is then listed in the elision manifest rather
 // than vanishing (#3087 approval condition 2).
-func revisionBaseDigest(base string) (string, bool) {
+//
+// It returns the render state alongside the text (the carried-byte counter,
+// the named elisions and the unrendered keys) and whether the SHRINK pass was
+// the one delivered, so the operator-facing assessment reports the figures of
+// the pass the planner actually receives.
+func revisionBaseDigest(base string) (digest string, r *revisionBaseRender, shrunk bool, ok bool) {
 	var p plan.Plan
 	if err := json.Unmarshal([]byte(base), &p); err != nil {
-		return "", false
+		return "", nil, false, false
 	}
 	if len(p.Approach) == 0 {
-		return "", false
+		return "", nil, false, false
 	}
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(base), &doc); err != nil {
-		return "", false
+		return "", nil, false, false
 	}
-	digest := renderRevisionBaseDigest(base, &p, doc, maxRevisionBaseFieldBytes, false)
+	digest, r = renderRevisionBaseDigest(base, &p, doc, maxRevisionBaseFieldBytes, false)
 	if len(digest) > MaxRevisionBasePlanBytes {
 		// Second pass (the shrink pass): drop step and criterion BODIES
 		// entirely, keeping every identity line, and replace the auxiliary
 		// lists with counted lines. This is what makes the identity contract
 		// hold whatever the input size — see maxRevisionBaseStepIdentities.
-		digest = renderRevisionBaseDigest(base, &p, doc, revisionBaseShrinkFieldBytes, true)
+		digest, r = renderRevisionBaseDigest(base, &p, doc, revisionBaseShrinkFieldBytes, true)
+		shrunk = true
 	}
-	return digest, true
+	return digest, r, shrunk, true
 }
 
 // revisionBaseRenderedKeys is the set of the prior plan's top-level JSON keys
@@ -195,6 +331,26 @@ type revisionBaseRender struct {
 	// reported elision is conservative in the safe direction.
 	sourceBytes int
 	fieldCap    int
+	// elisions is the bounded NAMED-elision list surfaced to the operator
+	// (#3442): one entry per capField cut and per droppedBody withhold, in
+	// render order, up to maxRevisionBaseElisionEntries; elisionsOmitted
+	// counts the rest. The inline digest markers are NOT bounded — this is
+	// the operator's index into them, not their replacement.
+	elisions        []RevisionBaseElision
+	elisionsOmitted int
+	// unrenderedKeys is the sorted top-level-key list the elision manifest
+	// names, so the assessment's list is the manifest's list.
+	unrenderedKeys []string
+}
+
+// noteElision records one named elision, bounded by
+// maxRevisionBaseElisionEntries.
+func (r *revisionBaseRender) noteElision(field string, shown, dropped int) {
+	if len(r.elisions) >= maxRevisionBaseElisionEntries {
+		r.elisionsOmitted++
+		return
+	}
+	r.elisions = append(r.elisions, RevisionBaseElision{Field: field, BytesShown: shown, BytesDropped: dropped})
 }
 
 // capField renders one variable-length body, accumulating the SOURCE bytes
@@ -222,14 +378,17 @@ func (r *revisionBaseRender) capField(label, s string) string {
 	}
 	kept := strings.ToValidUTF8(s[:r.fieldCap], "")
 	r.sourceBytes += len(kept)
+	r.noteElision(label, len(kept), len(s)-len(kept))
 	return neutralizeLineStructure(kept) + fmt.Sprintf("...[ELIDED — %s: %d of %d bytes shown, %d bytes dropped]",
 		label, len(kept), len(s), len(s)-len(kept))
 }
 
 // droppedBody renders a body that was withheld ENTIRELY, keeping the identity
 // the line exists to carry. It accumulates no source bytes: nothing was
-// carried, and the document-level accounting must say so.
-func droppedBody(label string, s string) string {
+// carried, and the document-level accounting must say so — but it IS a named
+// elision (BytesShown 0) in the operator-facing list.
+func (r *revisionBaseRender) droppedBody(label string, s string) string {
+	r.noteElision(label, 0, len(s))
 	return fmt.Sprintf("[%s elided — %d bytes withheld]", label, len(s))
 }
 
@@ -257,7 +416,7 @@ func (r *revisionBaseRender) remainderLine(kind string, listed, total int) {
 // per-field cap and by whether step/criterion bodies are dropped outright, so
 // the first pass and the shrink pass share one implementation and cannot
 // disagree about the step-identity invariant.
-func renderRevisionBaseDigest(base string, p *plan.Plan, doc map[string]json.RawMessage, fieldCap int, dropBodies bool) string {
+func renderRevisionBaseDigest(base string, p *plan.Plan, doc map[string]json.RawMessage, fieldCap int, dropBodies bool) (string, *revisionBaseRender) {
 	r := &revisionBaseRender{fieldCap: fieldCap}
 
 	// (b) plan-level scalars.
@@ -277,8 +436,10 @@ func renderRevisionBaseDigest(base string, p *plan.Plan, doc map[string]json.Raw
 		// elided bytes — the opposite of the conservative direction the
 		// accounting line claims.
 		label := fmt.Sprintf("approach step %d body", s.Step)
-		body := droppedBody(label, s.Description)
-		if !dropBodies {
+		var body string
+		if dropBodies {
+			body = r.droppedBody(label, s.Description)
+		} else {
 			body = r.capField(label, s.Description)
 		}
 		fmt.Fprintf(&r.b, "Step %d: %s\n", s.Step, body)
@@ -300,8 +461,10 @@ func renderRevisionBaseDigest(base string, p *plan.Plan, doc map[string]json.Raw
 			c := crit[i]
 			id := r.capField("acceptance criterion id", c.ID)
 			stmtLabel := fmt.Sprintf("acceptance criterion %q statement", c.ID)
-			stmt := droppedBody(stmtLabel, c.Statement)
-			if !dropBodies {
+			var stmt string
+			if dropBodies {
+				stmt = r.droppedBody(stmtLabel, c.Statement)
+			} else {
 				stmt = r.capField(stmtLabel, c.Statement)
 			}
 			fmt.Fprintf(&r.b, "- %s: %s\n", id, stmt)
@@ -334,9 +497,9 @@ func renderRevisionBaseDigest(base string, p *plan.Plan, doc map[string]json.Raw
 		"%d decomposition sub-plans, %d split_proposal phases, %d risks_and_assumptions entries.\n\n",
 		len(p.Approach), len(p.Scope.Files), len(p.Verification.AcceptanceCriteria),
 		len(subPlanTitles(p)), len(splitPhaseTitles(p)), len(p.RisksAndAssumptions))
-	writeRevisionBaseManifest(&h, doc)
+	r.unrenderedKeys = writeRevisionBaseManifest(&h, doc)
 
-	return h.String() + body
+	return h.String() + body, r
 }
 
 // writeAux renders one auxiliary title/entry list, or — in the shrink pass —
@@ -365,7 +528,10 @@ func (r *revisionBaseRender) writeAux(kind string, items []string, dropBodies bo
 // names are rendered through sanitizeScopePath: they are document-supplied text
 // landing inside a trusted prompt section, and a key carrying a newline would
 // otherwise put attacker-chosen text at column 0.
-func writeRevisionBaseManifest(h *strings.Builder, doc map[string]json.RawMessage) {
+//
+// It returns the sorted missing-key list it renders, so the operator-facing
+// assessment's unrendered_keys is the manifest's list (#3442).
+func writeRevisionBaseManifest(h *strings.Builder, doc map[string]json.RawMessage) []string {
 	var missing []string
 	for k := range doc {
 		if !revisionBaseRenderedKeys[k] {
@@ -374,7 +540,7 @@ func writeRevisionBaseManifest(h *strings.Builder, doc map[string]json.RawMessag
 	}
 	if len(missing) == 0 {
 		h.WriteString("Elision manifest: every top-level key of the prior plan is represented above.\n\n")
-		return
+		return nil
 	}
 	sort.Strings(missing)
 	listed := listBudget(len(missing), maxRevisionBaseListItems)
@@ -386,6 +552,7 @@ func writeRevisionBaseManifest(h *strings.Builder, doc map[string]json.RawMessag
 		fmt.Fprintf(h, "- ...[%d further top-level keys NOT named]\n", len(missing)-listed)
 	}
 	h.WriteString("\n")
+	return missing
 }
 
 // subPlanTitles returns the decomposition sub-plan titles, nil when the plan

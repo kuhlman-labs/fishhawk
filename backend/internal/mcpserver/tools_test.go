@@ -393,6 +393,11 @@ type fakeBackend struct {
 	reviseStatus     int
 	reviseErrBody    string
 	reviseCalledByID map[uuid.UUID]int
+	// reviseRevisionBase, when seeded for a stage id, is merged into the
+	// revise 200 body under the real wire key `revision_base` (#3442); an
+	// unseeded id serves the pre-#3442 Stage-only body (the legacy-backend
+	// degrade).
+	reviseRevisionBase map[uuid.UUID]*prompt.RevisionBaseAssessment
 
 	// #984 fixtures: POST /v0/concerns/{id}/waive.
 	// waiveBody captures the last decoded request body (the reason).
@@ -665,6 +670,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		reviseResp:                    map[uuid.UUID]Stage{},
 		reviseStatus:                  http.StatusOK,
 		reviseCalledByID:              map[uuid.UUID]int{},
+		reviseRevisionBase:            map[uuid.UUID]*prompt.RevisionBaseAssessment{},
 		waiveResp:                     map[uuid.UUID]WaivedConcern{},
 		waiveStatus:                   http.StatusOK,
 		waiveCalledByID:               map[uuid.UUID]int{},
@@ -1066,6 +1072,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		status := fb.reviseStatus
 		errBody := fb.reviseErrBody
 		resp, ok := fb.reviseResp[id]
+		revisionBase := fb.reviseRevisionBase[id]
 		fb.mu.Unlock()
 		w.WriteHeader(status)
 		if errBody != "" {
@@ -1075,7 +1082,12 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		if !ok {
 			resp = Stage{ID: id.String(), Type: "plan", State: "pending"}
 		}
-		_ = json.NewEncoder(w).Encode(resp)
+		// Encode the real wire shape: Stage fields at the top level plus the
+		// optional revision_base key (#3442).
+		_ = json.NewEncoder(w).Encode(struct {
+			Stage
+			RevisionBase *prompt.RevisionBaseAssessment `json:"revision_base,omitempty"`
+		}{Stage: resp, RevisionBase: revisionBase})
 	})
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

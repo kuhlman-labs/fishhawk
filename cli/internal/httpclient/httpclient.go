@@ -414,16 +414,90 @@ type SubmitReviseInput struct {
 // constraint (injected into the re-dispatched plan prompt with the prior
 // plan as the revision base), and returns the re-opened Stage (pending,
 // or dispatched once the orchestrator advances it).
-func (c *Client) SubmitRevise(ctx context.Context, stageID uuid.UUID, in SubmitReviseInput) (*Stage, error) {
+//
+// Since #3442 the 200 body also carries an optional `revision_base` object —
+// the server's measurement of the prior plan against the revision-base cap —
+// so the result is a ReviseResult (the Stage plus that field). Absent on an
+// older backend or when no prior plan artifact was loadable.
+func (c *Client) SubmitRevise(ctx context.Context, stageID uuid.UUID, in SubmitReviseInput) (*ReviseResult, error) {
 	body, err := json.Marshal(in)
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
 	}
-	var s Stage
-	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/revise", body, &s); err != nil {
+	var res ReviseResult
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/revise", body, &res); err != nil {
 		return nil, err
 	}
-	return &s, nil
+	return &res, nil
+}
+
+// ReviseResult mirrors the backend's revise 200 body
+// (`backend/internal/server/revise.go::reviseResponse`): the re-opened Stage
+// with the optional `revision_base` measurement (#3442). A convention mirror
+// like Stage — the CLI is a separate module.
+type ReviseResult struct {
+	Stage
+	RevisionBase *RevisionBaseAssessment `json:"revision_base,omitempty"`
+}
+
+// Revision-base render modes reported by RevisionBaseAssessment.Mode. Mirror
+// of the backend's prompt.RevisionBaseMode* constants.
+const (
+	RevisionBaseModeWhole        = "whole"
+	RevisionBaseModeDigest       = "digest"
+	RevisionBaseModeDigestShrunk = "digest_shrunk"
+	RevisionBaseModeCut          = "cut"
+)
+
+// RevisionBaseAssessment mirrors the backend's
+// `backend/internal/prompt.RevisionBaseAssessment` byte-for-byte on the wire
+// (#3442): how the prior plan — the revision base the re-plan agent
+// receives — was rendered against the revision-base cap. Elided=false with
+// Mode "whole" means the re-plan prompt carries the whole prior plan;
+// Elided=true means it does not, and Mode says what it carries instead: a
+// step-complete digest ("digest" / "digest_shrunk") or, for a prior artifact
+// that did not decode as a plan carrying approach steps, a byte-cut prefix
+// ("cut").
+type RevisionBaseAssessment struct {
+	OriginalBytes   int                   `json:"original_bytes"`
+	CapBytes        int                   `json:"cap_bytes"`
+	Elided          bool                  `json:"elided"`
+	Mode            string                `json:"mode"`
+	RenderedBytes   int                   `json:"rendered_bytes"`
+	ElidedBytes     int                   `json:"elided_bytes"`
+	Elisions        []RevisionBaseElision `json:"elisions,omitempty"`
+	ElisionsOmitted int                   `json:"elisions_omitted,omitempty"`
+	UnrenderedKeys  []string              `json:"unrendered_keys,omitempty"`
+}
+
+// RevisionBaseElision mirrors the backend's prompt.RevisionBaseElision: one
+// named per-body cut the digest performed.
+type RevisionBaseElision struct {
+	Field        string `json:"field"`
+	BytesShown   int    `json:"bytes_shown"`
+	BytesDropped int    `json:"bytes_dropped"`
+}
+
+// RevisionBaseNotice is the one operator-facing sentence for an elided
+// revision base, selected BY MODE (#3442): it claims a step-complete digest
+// only when the mode is a digest, and says byte-cut prefix for the cut
+// fallback — mirroring the backend's prompt.RevisionBaseElisionSummary.
+// Empty when the assessment is nil or not elided.
+func RevisionBaseNotice(a *RevisionBaseAssessment) string {
+	if a == nil || !a.Elided {
+		return ""
+	}
+	switch a.Mode {
+	case RevisionBaseModeDigest:
+		return fmt.Sprintf("the prior plan is %d bytes, over the %d-byte revision-base cap; the re-plan agent receives a step-complete digest (%d rendered / %d elided bytes), not the whole plan",
+			a.OriginalBytes, a.CapBytes, a.RenderedBytes, a.ElidedBytes)
+	case RevisionBaseModeDigestShrunk:
+		return fmt.Sprintf("the prior plan is %d bytes, over the %d-byte revision-base cap; the re-plan agent receives a SHRUNKEN step-complete digest with step and criterion bodies withheld (%d rendered / %d elided bytes), not the whole plan",
+			a.OriginalBytes, a.CapBytes, a.RenderedBytes, a.ElidedBytes)
+	default:
+		return fmt.Sprintf("the prior plan is %d bytes, over the %d-byte revision-base cap, and did not decode as a plan carrying approach steps; the re-plan agent receives a byte-cut prefix (%d shown / %d dropped bytes) with an elision marker, NOT a digest",
+			a.OriginalBytes, a.CapBytes, a.RenderedBytes, a.ElidedBytes)
+	}
 }
 
 // AuditEntry is the CLI-side projection of the OpenAPI AuditEntry
