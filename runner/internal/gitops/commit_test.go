@@ -5742,3 +5742,622 @@ func TestRedactConfigKeyName(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Post-verify push-token refresh + auth-rejected retry (E68.67 / #3443).
+//
+// The fault: the runner mints the push token BEFORE CommitAndPush's
+// VerifyCommit hook, which on the pushed-tree re-verify path runs 25-30 min —
+// long enough for a token the backend served with ~5 min of life to expire —
+// so the very first post-verify authenticated op (the lease ls-remote) failed
+// `remote: Invalid username or token`. These tests drive the REAL
+// CommitAndPush through real git over dumb HTTP against a RECORDING httptest
+// server that can 401 a chosen token once `expired` is set — the VerifyCommit
+// hook flips it, modelling the token dying DURING the re-verify — and assert
+// which token every /info/refs carried and what status it drew, PER call site.
+// ---------------------------------------------------------------------------
+
+// refreshWireReq records one request's path, its ?service= probe (git sends
+// git-upload-pack for fetch/ls-remote and git-receive-pack for the push's
+// probe, so the PUSH's auth is observable separately from the ls-remote's),
+// its Authorization values and the status the fixture served.
+type refreshWireReq struct {
+	path    string
+	service string
+	auth    []string
+	status  int
+}
+
+// refreshWireFixture is the recording dumb-HTTP remote + local repo the #3443
+// tests share. Once expire() is called, a request carrying rejectAuth draws a
+// 401 — on every path when rejectService is empty, or ONLY on the /info/refs
+// probe for that service (so the push's git-receive-pack probe can be
+// rejected while the ls-remote's git-upload-pack probe succeeds).
+type refreshWireFixture struct {
+	mu            sync.Mutex
+	reqs          []refreshWireReq
+	expired       bool
+	rejectAuth    string
+	rejectService string
+
+	local string
+	url   string
+}
+
+// wireAuthFor is the Basic value authConfigEnv puts on the wire for token.
+func wireAuthFor(token string) string {
+	return "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+}
+
+// gitNoPromptEnv pins the test's git so a 401 can never block on a tty
+// prompt, run an askpass program, or consult the operator's credential
+// helper (osxkeychain lives in the SYSTEM config on macOS): the failure is
+// the deterministic `could not read Username … terminal prompts disabled`.
+func gitNoPromptEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("GIT_TERMINAL_PROMPT", "0")
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+	t.Setenv("GIT_ASKPASS", "")
+	t.Setenv("SSH_ASKPASS", "")
+}
+
+func newRefreshWireFixture(t *testing.T, rejectToken, rejectService string) *refreshWireFixture {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	gitNoPromptEnv(t)
+	dir := t.TempDir()
+
+	seed := filepath.Join(dir, "seed")
+	bare := filepath.Join(dir, "remote.git")
+	if err := os.Mkdir(seed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, seed, "init", "--initial-branch=main")
+	mustGit(t, seed, "config", "user.name", "seed")
+	mustGit(t, seed, "config", "user.email", "seed@example.com")
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("# seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, seed, "add", "-A")
+	mustGit(t, seed, "commit", "-m", "seed")
+	mustGit(t, seed, "init", "--bare", bare)
+	mustGit(t, seed, "push", bare, "main")
+	mustGit(t, bare, "update-server-info")
+
+	f := &refreshWireFixture{rejectAuth: wireAuthFor(rejectToken), rejectService: rejectService}
+	fileSrv := http.FileServer(http.Dir(bare))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		reject := f.expired && r.Header.Get("Authorization") == f.rejectAuth &&
+			(f.rejectService == "" || (strings.HasSuffix(r.URL.Path, "/info/refs") && r.URL.Query().Get("service") == f.rejectService))
+		rec := refreshWireReq{path: r.URL.Path, service: r.URL.Query().Get("service"), auth: r.Header.Values("Authorization"), status: http.StatusOK}
+		if reject {
+			rec.status = http.StatusUnauthorized
+		}
+		f.reqs = append(f.reqs, rec)
+		f.mu.Unlock()
+		if reject {
+			// GitHub's 401 body for a dead installation token, verbatim.
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = fmt.Fprint(w, "Invalid username or token. Password authentication is not supported for Git operations.")
+			return
+		}
+		fileSrv.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	f.url = srv.URL
+
+	local := filepath.Join(dir, "local")
+	if err := os.Mkdir(local, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, local, "init", "--initial-branch=main")
+	mustGit(t, local, "config", "user.name", "init")
+	mustGit(t, local, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(local, "README.md"), []byte("# local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, local, "add", "-A")
+	mustGit(t, local, "commit", "-m", "local initial")
+	// The agent edit CommitAndPush commits.
+	if err := os.WriteFile(filepath.Join(local, "agent.txt"), []byte("agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.local = local
+	return f
+}
+
+// expire flips the fixture into rejecting rejectAuth — called from the
+// VerifyCommit hook to model the token dying during the re-verify.
+func (f *refreshWireFixture) expire() {
+	f.mu.Lock()
+	f.expired = true
+	f.mu.Unlock()
+}
+
+// infoRefs returns the recorded /info/refs probes in order, optionally
+// filtered to one ?service= value.
+func (f *refreshWireFixture) infoRefs(service string) []refreshWireReq {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []refreshWireReq
+	for _, r := range f.reqs {
+		if !strings.HasSuffix(r.path, "/info/refs") {
+			continue
+		}
+		if service != "" && r.service != service {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// authOf renders one probe's Authorization as the token name it carried
+// (given the two candidate tokens), so table assertions read as [old→401,
+// new→200] rather than base64.
+func authOf(r refreshWireReq, tokens map[string]string) string {
+	if len(r.auth) == 0 {
+		return "<unauthenticated>"
+	}
+	if len(r.auth) != 1 {
+		return fmt.Sprintf("<%d headers>", len(r.auth))
+	}
+	if name, ok := tokens[r.auth[0]]; ok {
+		return name
+	}
+	return "<unknown>"
+}
+
+// probeSeq renders probes as "token→status" strings for exact comparison.
+func probeSeq(rs []refreshWireReq, tokens map[string]string) []string {
+	out := make([]string, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, fmt.Sprintf("%s→%d", authOf(r, tokens), r.status))
+	}
+	return out
+}
+
+// seqHook returns a RefreshPushToken hook serving seq in order (the last
+// entry repeats; a "" entry with wantErr returns an error instead) and a
+// counter of how many times it was called.
+func seqHook(seq []string, errAt int) (func(context.Context) (string, error), *int) {
+	calls := 0
+	return func(context.Context) (string, error) {
+		calls++
+		if errAt > 0 && calls == errAt {
+			return "", errors.New("backend blip: installation-token endpoint unavailable")
+		}
+		i := calls - 1
+		if i >= len(seq) {
+			i = len(seq) - 1
+		}
+		return seq[i], nil
+	}, &calls
+}
+
+const (
+	refreshOldToken = "ghs_old_minted_before_verify"
+	refreshNewToken = "ghs_new_minted_after_verify"
+)
+
+func refreshTokenNames() map[string]string {
+	return map[string]string{wireAuthFor(refreshOldToken): "old", wireAuthFor(refreshNewToken): "new"}
+}
+
+// TestCommitAndPush_RefreshPushToken_AfterVerify_LeaseAndPushUseFreshToken is
+// the #3443 done-means at the gitops seam. PushToken=old; the VerifyCommit
+// hook expires old on the server (the token dies DURING the re-verify) and
+// asserts the refresh has NOT yet run (verify → refresh ordering); the hook
+// returns new. Every /info/refs after the hook — the lease ls-remote AND the
+// push's git-receive-pack probe — must carry EXACTLY the new token, the
+// server must have served NO 401, and the only failure is the dumb-HTTP push
+// by construction, which is NOT an auth rejection.
+//
+// Counterfactual: delete the post-verify refresh in CommitAndPush → the
+// ls-remote carries old, draws a 401 (and the retry then refreshes), so both
+// the no-401 and the every-post-verify-probe-is-new assertions go RED.
+func TestCommitAndPush_RefreshPushToken_AfterVerify_LeaseAndPushUseFreshToken(t *testing.T) {
+	f := newRefreshWireFixture(t, refreshOldToken, "")
+	hook, calls := seqHook([]string{refreshNewToken}, 0)
+	var preHookProbes int
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir: f.local, Branch: "fishhawk/run-3443/stage-a", CommitMessage: "agent change",
+		RemoteURL: f.url, FreshFetchBase: "main", ForceWithLease: true,
+		PushToken:        refreshOldToken,
+		RefreshPushToken: hook,
+		VerifyCommit: func(context.Context, string, []string) error {
+			if *calls != 0 {
+				t.Errorf("RefreshPushToken was called %d time(s) BEFORE the VerifyCommit hook; the refresh must come AFTER verify", *calls)
+			}
+			preHookProbes = len(f.infoRefs(""))
+			f.expire()
+			return nil
+		},
+	})
+	if err == nil {
+		t.Fatal("expected CommitAndPush to fail at the dumb-HTTP push (fetch-only)")
+	}
+	if isRemoteAuthRejected(err) {
+		t.Fatalf("the push-by-construction failure must NOT classify as an auth rejection: %v", err)
+	}
+	if *calls != 1 {
+		t.Errorf("RefreshPushToken calls = %d, want exactly 1 (the post-verify refresh; no retry needed)", *calls)
+	}
+
+	names := refreshTokenNames()
+	probes := f.infoRefs("")
+	if preHookProbes < 1 || probes[0].auth[0] != wireAuthFor(refreshOldToken) {
+		t.Errorf("the pre-verify FreshFetchBase fetch must carry the INITIAL token; probes = %v", probeSeq(probes, names))
+	}
+	post := probes[preHookProbes:]
+	if len(post) < 2 {
+		t.Fatalf("want >= 2 post-verify /info/refs probes (lease ls-remote + push service probe), got %v", probeSeq(post, names))
+	}
+	for i, r := range post {
+		if got := authOf(r, names); got != "new" {
+			t.Errorf("post-verify probe %d (%s service=%s) carried %s, want new", i, r.path, r.service, got)
+		}
+		if r.status != http.StatusOK {
+			t.Errorf("post-verify probe %d drew %d, want 200 (a 401 means the stale token reached the wire)", i, r.status)
+		}
+	}
+	if got := probeSeq(f.infoRefs("git-receive-pack"), names); !slices.Equal(got, []string{"new→200"}) {
+		t.Errorf("push service probes = %v, want [new→200]", got)
+	}
+}
+
+// TestCommitAndPush_NilRefreshPushToken_SingleTokenUnchanged pins the nil-hook
+// contract: with no RefreshPushToken every op carries the ORIGINAL token
+// (there is nothing to refresh to), and an auth rejection is returned AS-IS —
+// exactly one attempt, no `after push-token refresh` retry annotation.
+func TestCommitAndPush_NilRefreshPushToken_SingleTokenUnchanged(t *testing.T) {
+	names := refreshTokenNames()
+	t.Run("token stays valid: every probe carries the original token", func(t *testing.T) {
+		f := newRefreshWireFixture(t, refreshOldToken, "")
+		_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+			RepoDir: f.local, Branch: "fishhawk/run-3443/stage-b", CommitMessage: "agent change",
+			RemoteURL: f.url, FreshFetchBase: "main", ForceWithLease: true,
+			PushToken: refreshOldToken,
+		})
+		if err == nil || isRemoteAuthRejected(err) {
+			t.Fatalf("want the dumb-HTTP push failure, got %v", err)
+		}
+		probes := f.infoRefs("")
+		if len(probes) < 3 {
+			t.Fatalf("want >= 3 /info/refs probes (fetch, ls-remote, push probe), got %v", probeSeq(probes, names))
+		}
+		for i, r := range probes {
+			if got := authOf(r, names); got != "old" || r.status != http.StatusOK {
+				t.Errorf("probe %d = %s→%d, want old→200", i, got, r.status)
+			}
+		}
+	})
+	t.Run("token expires during verify: the rejection returns as-is with one attempt", func(t *testing.T) {
+		f := newRefreshWireFixture(t, refreshOldToken, "")
+		_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+			RepoDir: f.local, Branch: "fishhawk/run-3443/stage-c", CommitMessage: "agent change",
+			RemoteURL: f.url, FreshFetchBase: "main", ForceWithLease: true,
+			PushToken:    refreshOldToken,
+			VerifyCommit: func(context.Context, string, []string) error { f.expire(); return nil },
+		})
+		if !isRemoteAuthRejected(err) {
+			t.Fatalf("want the auth rejection returned verbatim, got %v", err)
+		}
+		if strings.Contains(err.Error(), "after push-token refresh") || strings.Contains(err.Error(), "push-token refresh after auth rejection") {
+			t.Errorf("a nil hook must never retry or mention a refresh: %v", err)
+		}
+		if got := probeSeq(f.infoRefs("")[1:], names); !slices.Equal(got, []string{"old→401"}) {
+			t.Errorf("post-fetch probes = %v, want exactly [old→401] (one attempt, no retry without a hook)", got)
+		}
+	})
+}
+
+// TestCommitAndPush_AuthRejectedLeaseLsRemote_RefreshesAndRetriesOnce drives
+// the exactly-once auth-rejected retry on the LEASE LS-REMOTE. In every row
+// the post-verify refresh returns the SAME dead token (the backend cache
+// serving a token it still considers live), so the ls-remote is rejected and
+// the retry is what decides the outcome.
+//
+// Counterfactual: delete the retry in authedRemoteOp → row 1 RED (the
+// ls-remote is attempted once, fails auth, refresh count 1).
+func TestCommitAndPush_AuthRejectedLeaseLsRemote_RefreshesAndRetriesOnce(t *testing.T) {
+	names := refreshTokenNames()
+	for _, tc := range []struct {
+		name         string
+		seq          []string
+		errAt        int
+		wantProbes   []string // /info/refs after the FreshFetchBase fetch, upload-pack only
+		wantCalls    int
+		wantAuthErr  bool
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name:       "retry with a fresh token succeeds",
+			seq:        []string{refreshOldToken, refreshNewToken},
+			wantProbes: []string{"old→401", "new→200"},
+			wantCalls:  2,
+			// The run then proceeds to the dumb-HTTP push failure — not auth.
+			wantAuthErr: false,
+			wantAbsent:  []string{"after push-token refresh"},
+		},
+		{
+			name:         "second consecutive rejection is bounded to two attempts",
+			seq:          []string{refreshOldToken, refreshOldToken},
+			wantProbes:   []string{"old→401", "old→401"},
+			wantCalls:    2,
+			wantAuthErr:  true,
+			wantContains: []string{"after push-token refresh", "could not read Username"},
+		},
+		{
+			name:         "refresh fails on the retry: error names both faults",
+			seq:          []string{refreshOldToken},
+			errAt:        2,
+			wantProbes:   []string{"old→401"},
+			wantCalls:    2,
+			wantAuthErr:  true,
+			wantContains: []string{"could not read Username", "push-token refresh after auth rejection also failed", "backend blip"},
+			wantAbsent:   []string{"after push-token refresh:"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRefreshWireFixture(t, refreshOldToken, "")
+			hook, calls := seqHook(tc.seq, tc.errAt)
+			_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+				RepoDir: f.local, Branch: "fishhawk/run-3443/stage-d", CommitMessage: "agent change",
+				RemoteURL: f.url, FreshFetchBase: "main", ForceWithLease: true,
+				PushToken:        refreshOldToken,
+				RefreshPushToken: hook,
+				VerifyCommit:     func(context.Context, string, []string) error { f.expire(); return nil },
+			})
+			if err == nil {
+				t.Fatal("expected an error (the dumb-HTTP push fails by construction even on the success row)")
+			}
+			if got := isRemoteAuthRejected(err); got != tc.wantAuthErr {
+				t.Errorf("isRemoteAuthRejected = %v, want %v: %v", got, tc.wantAuthErr, err)
+			}
+			for _, s := range tc.wantContains {
+				if !strings.Contains(err.Error(), s) {
+					t.Errorf("error missing %q: %v", s, err)
+				}
+			}
+			for _, s := range tc.wantAbsent {
+				if strings.Contains(err.Error(), s) {
+					t.Errorf("error must not contain %q: %v", s, err)
+				}
+			}
+			if *calls != tc.wantCalls {
+				t.Errorf("RefreshPushToken calls = %d, want %d (post-verify + exactly one retry)", *calls, tc.wantCalls)
+			}
+			// The ls-remote probes are the upload-pack /info/refs after the fetch's.
+			upload := f.infoRefs("git-upload-pack")
+			if len(upload) < 1 || authOf(upload[0], names) != "old" || upload[0].status != http.StatusOK {
+				t.Fatalf("the FreshFetchBase fetch must carry old→200 first; got %v", probeSeq(upload, names))
+			}
+			if got := probeSeq(upload[1:], names); !slices.Equal(got, tc.wantProbes) {
+				t.Errorf("ls-remote probes = %v, want %v (never a third attempt)", got, tc.wantProbes)
+			}
+		})
+	}
+}
+
+// TestCommitAndPush_AuthRejectedPush_RefreshesAndRetriesOnce is the
+// approval-condition-1 sibling: the auth-rejected retry on the PUSH op. The
+// fixture 401s ONLY the push's git-receive-pack /info/refs probe for the old
+// token, so the ls-remote (upload-pack) succeeds on old and the push is the
+// first op rejected. Asserts the recorded push probes exactly, the refresh
+// count (post-verify + exactly one more), and that a second consecutive 401
+// yields the `after push-token refresh` error with exactly two attempts.
+func TestCommitAndPush_AuthRejectedPush_RefreshesAndRetriesOnce(t *testing.T) {
+	names := refreshTokenNames()
+	for _, tc := range []struct {
+		name         string
+		seq          []string
+		errAt        int
+		wantProbes   []string
+		wantCalls    int
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name:       "push retry with a fresh token reaches the remote",
+			seq:        []string{refreshOldToken, refreshNewToken},
+			wantProbes: []string{"old→401", "new→200"},
+			wantCalls:  2,
+			// The retried push then fails by construction (dumb HTTP) — its
+			// error must not be misread as an auth rejection.
+			wantContains: []string{"after push-token refresh"},
+			wantAbsent:   []string{"could not read Username"},
+		},
+		{
+			name:         "second consecutive push rejection is bounded to two attempts",
+			seq:          []string{refreshOldToken, refreshOldToken},
+			wantProbes:   []string{"old→401", "old→401"},
+			wantCalls:    2,
+			wantContains: []string{"after push-token refresh", "could not read Username"},
+		},
+		{
+			name:         "refresh fails on the push retry: error names both faults",
+			seq:          []string{refreshOldToken},
+			errAt:        2,
+			wantProbes:   []string{"old→401"},
+			wantCalls:    2,
+			wantContains: []string{"could not read Username", "push-token refresh after auth rejection also failed", "backend blip"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRefreshWireFixture(t, refreshOldToken, "git-receive-pack")
+			hook, calls := seqHook(tc.seq, tc.errAt)
+			_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+				RepoDir: f.local, Branch: "fishhawk/run-3443/stage-e", CommitMessage: "agent change",
+				RemoteURL: f.url, FreshFetchBase: "main", ForceWithLease: true,
+				PushToken:        refreshOldToken,
+				RefreshPushToken: hook,
+				VerifyCommit:     func(context.Context, string, []string) error { f.expire(); return nil },
+			})
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.HasPrefix(err.Error(), "gitops: push ") {
+				t.Errorf("the rejection must surface on the PUSH op, got %v", err)
+			}
+			for _, s := range tc.wantContains {
+				if !strings.Contains(err.Error(), s) {
+					t.Errorf("error missing %q: %v", s, err)
+				}
+			}
+			for _, s := range tc.wantAbsent {
+				if strings.Contains(err.Error(), s) {
+					t.Errorf("error must not contain %q: %v", s, err)
+				}
+			}
+			if *calls != tc.wantCalls {
+				t.Errorf("RefreshPushToken calls = %d, want %d (post-verify + exactly one more)", *calls, tc.wantCalls)
+			}
+			// The ls-remote (upload-pack) succeeded on old, so the push probe is
+			// the first rejected op.
+			if got := probeSeq(f.infoRefs("git-upload-pack"), names); !slices.Equal(got, []string{"old→200", "old→200"}) {
+				t.Errorf("upload-pack probes (fetch, ls-remote) = %v, want [old→200 old→200]", got)
+			}
+			if got := probeSeq(f.infoRefs("git-receive-pack"), names); !slices.Equal(got, tc.wantProbes) {
+				t.Errorf("push probes = %v, want %v (never a third attempt)", got, tc.wantProbes)
+			}
+		})
+	}
+}
+
+// TestCommitAndPush_RefreshPushTokenEmpty_IsRefreshFailure pins approval
+// condition 2 at the gitops layer: a non-erroring RefreshPushToken that
+// returns "" is a REFRESH FAILURE — the held authEnv is kept (an empty token
+// would build authConfigEnv's nil and send the op UNauthenticated) and the
+// failure is recorded so a later auth rejection names it.
+//
+// Counterfactual: delete the empty-token guard in pushAuth.refresh → the
+// ls-remote arrives with NO Authorization header → RED on the
+// never-unauthenticated assertion in both rows.
+func TestCommitAndPush_RefreshPushTokenEmpty_IsRefreshFailure(t *testing.T) {
+	names := refreshTokenNames()
+	t.Run("held token still valid: the op runs on the HELD token, never unauthenticated", func(t *testing.T) {
+		f := newRefreshWireFixture(t, refreshOldToken, "")
+		hook, calls := seqHook([]string{""}, 0)
+		_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+			RepoDir: f.local, Branch: "fishhawk/run-3443/stage-f", CommitMessage: "agent change",
+			RemoteURL: f.url, FreshFetchBase: "main", ForceWithLease: true,
+			PushToken:        refreshOldToken,
+			RefreshPushToken: hook,
+		})
+		if err == nil || isRemoteAuthRejected(err) {
+			t.Fatalf("want the dumb-HTTP push failure on the held token, got %v", err)
+		}
+		if *calls != 1 {
+			t.Errorf("RefreshPushToken calls = %d, want 1 (no auth rejection, so no retry)", *calls)
+		}
+		for i, r := range f.infoRefs("") {
+			if got := authOf(r, names); got != "old" || r.status != http.StatusOK {
+				t.Errorf("probe %d = %s→%d, want old→200 (an empty refresh must keep the held credential)", i, got, r.status)
+			}
+		}
+	})
+	t.Run("held token expired: the rejection names the empty-token refresh failure", func(t *testing.T) {
+		f := newRefreshWireFixture(t, refreshOldToken, "")
+		hook, calls := seqHook([]string{""}, 0)
+		_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+			RepoDir: f.local, Branch: "fishhawk/run-3443/stage-g", CommitMessage: "agent change",
+			RemoteURL: f.url, FreshFetchBase: "main", ForceWithLease: true,
+			PushToken:        refreshOldToken,
+			RefreshPushToken: hook,
+			VerifyCommit:     func(context.Context, string, []string) error { f.expire(); return nil },
+		})
+		if !isRemoteAuthRejected(err) {
+			t.Fatalf("want an auth rejection, got %v", err)
+		}
+		for _, s := range []string{"returned an empty token", "the post-verify push-token refresh had already failed", "push-token refresh after auth rejection also failed"} {
+			if !strings.Contains(err.Error(), s) {
+				t.Errorf("error missing %q: %v", s, err)
+			}
+		}
+		if *calls != 2 {
+			t.Errorf("RefreshPushToken calls = %d, want 2 (post-verify + the one retry, both empty)", *calls)
+		}
+		if got := probeSeq(f.infoRefs("")[1:], names); !slices.Equal(got, []string{"old→401"}) {
+			t.Errorf("post-fetch probes = %v, want exactly [old→401] on the HELD token (never unauthenticated, never a third)", got)
+		}
+	})
+}
+
+// TestAuthedRemoteOp_PinsPromptAndLocale pins approval condition 3: every git
+// invocation authedRemoteOp runs carries GIT_TERMINAL_PROMPT=0, LC_ALL=C and
+// LANG=C AFTER the held auth entries (later entries win in exec's env), so the
+// classifier's English client-side wording is stable and a rejected credential
+// never blocks on a tty prompt. Counterfactual: delete the pins → RED.
+func TestAuthedRemoteOp_PinsPromptAndLocale(t *testing.T) {
+	authEnv := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.x.extraheader", "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic zz"}
+	var seen []string
+	err := (&Pusher{}).authedRemoteOp(context.Background(), CommitAndPushArgs{}, &pushAuth{env: authEnv}, func(env []string) error {
+		seen = env
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]string(nil), authEnv...), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "LANG=C")
+	if !slices.Equal(seen, want) {
+		t.Errorf("op env = %v, want auth entries then the three pins %v", seen, want)
+	}
+	// Non-auth failures pass through as the SAME error value with no retry.
+	nonAuth := errors.New("git push: exit status 1 (stderr: ! [rejected] main -> main (non-fast-forward))")
+	calls := 0
+	hook := func(context.Context) (string, error) { calls++; return "t", nil }
+	got := (&Pusher{}).authedRemoteOp(context.Background(), CommitAndPushArgs{RemoteURL: "https://x/y", RefreshPushToken: hook}, &pushAuth{}, func([]string) error {
+		return nonAuth
+	})
+	if got != nonAuth || calls != 0 {
+		t.Errorf("non-auth failure: err = %v (same value? %v), refresh calls = %d; want identical error and 0 refreshes", got, got == nonAuth, calls)
+	}
+}
+
+// TestIsRemoteAuthRejected classifies the four stderr shapes plus negatives,
+// AND the REAL git stderr the 401 fixture produces (so a git wording change
+// fails here rather than silently disarming the retry).
+func TestIsRemoteAuthRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"github remote line (#3443 verbatim)", errors.New("git ls-remote https://github.com/o/r refs/heads/b: exit status 128 (stderr: remote: Invalid username or token)"), true},
+		{"git http 401 wording", errors.New("git push: exit status 128 (stderr: fatal: Authentication failed for 'https://github.com/o/r/')"), true},
+		{"no credential under GIT_TERMINAL_PROMPT=0", errors.New("git ls-remote: exit status 128 (stderr: fatal: could not read Username for 'https://github.com': terminal prompts disabled)"), true},
+		{"literal 401", errors.New("git fetch: exit status 128 (stderr: error: The requested URL returned error: 401)"), true},
+		{"non-fast-forward", errors.New("git push: exit status 1 (stderr: ! [rejected] HEAD -> b (non-fast-forward))"), false},
+		{"stale lease", errors.New("git push: exit status 1 (stderr: ! [rejected] HEAD -> b (stale info))"), false},
+		{"connection refused", errors.New("git ls-remote: exit status 128 (stderr: fatal: unable to access 'http://127.0.0.1:1/': Failed to connect to 127.0.0.1 port 1: Connection refused)"), false},
+		{"403 forbidden body", errors.New("git push: exit status 128 (stderr: remote: Permission to o/r.git denied to bot. fatal: unable to access 'https://github.com/o/r/': The requested URL returned error: 403)"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isRemoteAuthRejected(tc.err); got != tc.want {
+				t.Errorf("isRemoteAuthRejected(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+	t.Run("real git stderr from a 401", func(t *testing.T) {
+		f := newRefreshWireFixture(t, refreshOldToken, "")
+		f.expire()
+		auth, err := authConfigEnv(f.url, refreshOldToken)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, lsErr := (&Pusher{}).observeRemoteHead(context.Background(), f.local, f.url, "main", (&pushAuth{env: auth}).pinnedEnv())
+		if lsErr == nil {
+			t.Fatal("expected the 401 fixture to reject the ls-remote")
+		}
+		if !isRemoteAuthRejected(lsErr) {
+			t.Errorf("the classifier does not match git's real 401 stderr — update remoteAuthRejectedMarkers: %v", lsErr)
+		}
+	})
+}
