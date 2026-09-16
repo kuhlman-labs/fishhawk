@@ -1,0 +1,14 @@
+id: scenario:issue-3442/revise-under-cap-plan-not-elided
+statement: Revising a plan stage whose plan artifact serializes to at most 60000 bytes returns 200 with `revision_base.elided` false and `mode` `whole`, and the fishhawk_revise_plan result carries no warnings entry.
+verify_hint: POST /v0/stages/{stage_id}/revise on a run with an ordinary (<60000-byte) plan artifact; the 200 body's revision_base.elided is false and mode is whole; the MCP fishhawk_revise_plan result has no warnings field.
+steps: 'POST /v0/dev/fixtures {scenario:plan-gate-parked} -> 201 (795-byte seeded plan, stage awaiting_approval); POST /v0/stages/{plan}/revise {constraint: ''Also update CONTRIBUTING.md alongside README.md.''} with the operator bearer; GET /v0/runs/{run}/audit?category=plan_revised. Then a second fresh plan-gate-parked seed and POST /mcp tools/call fishhawk_revise_plan {run_id, constraint} (Mcp-Name fishhawk_revise_plan, Mcp-Protocol-Version 2026-07-28).'
+assertions:
+    expected: 200 with revision_base.elided false and mode whole; the fishhawk_revise_plan result carries no warnings entry.
+    observed_at_record: 'REST: 200 with revision_base {original_bytes 795, cap_bytes 60000, elided false, mode whole, rendered_bytes 795, elided_bytes 0}; plan_revised payload.revision_base equals it. MCP: structuredContent keys are exactly revision_base, stage, stage_id — no warnings key; revision_base identical (elided false, whole); the only text content item is the JSON result, no WARNING text.'
+    repro_handle: POST /v0/dev/fixtures {"scenario":"plan-gate-parked"}; POST /v0/stages/{plan}/revise {"constraint":"..."}; POST /mcp tools/call fishhawk_revise_plan
+origin:
+    issue: 3442
+    pr: 3460
+    run_id: 8c15d3d6-9762-421a-b3f7-cf5b1b7a4265
+    head_sha: 48d06a7d0a0422340e740a2c6e91d461525d3c07
+    recorded_at: 2026-09-16T16:56:32Z
