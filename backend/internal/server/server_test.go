@@ -1036,6 +1036,51 @@ func TestObserveParkedReview_AcceptanceOutcomeUnknown_ParksNoMerge(t *testing.T)
 	}
 }
 
+// TestObserveParkedReview_AcceptanceVerdictUnshipped_ParksNoMerge pins the
+// E72.11 / #3447 arm: a succeeded acceptance stage carrying a LIVE stage-scoped
+// acceptance_verdict_unshipped marker (newer than its dispatch anchor and than
+// the stale first-attempt passed outcome) parks with
+// drive.RuleAcceptanceVerdictUnshipped / read_acceptance_audit and NEVER
+// stamps checks_green_awaiting_merge. Counterfactual: delete the
+// acceptanceGateVerdictUnshipped case in ObserveParkedReviewForDrive → RED,
+// because the default arm stamps the merge rule.
+func TestObserveParkedReview_AcceptanceVerdictUnshipped_ParksNoMerge(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateSucceeded))
+	var accID uuid.UUID
+	h.repo.mu.Lock()
+	for _, st := range h.repo.stages {
+		if st.Type == run.StageTypeAcceptance {
+			accID = st.ID
+		}
+	}
+	h.repo.mu.Unlock()
+	seedStageScoped(h.au, h.runID, accID, CategoryAcceptanceDispatched, 20)
+	seedStageScopedOutcome(h.au, h.runID, accID, 25, acceptanceVerdictPassed) // stale first attempt
+	seedStageScoped(h.au, h.runID, accID, CategoryAcceptanceReopened, 26)
+	seedStageScoped(h.au, h.runID, accID, CategoryAcceptanceDispatched, 27)
+	seedStageScoped(h.au, h.runID, accID, CategoryAcceptanceVerdictUnshipped, 30)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleAcceptanceVerdictUnshipped {
+		t.Fatalf("run_auto_advanced = %+v, want settled + acceptance_verdict_unshipped", advances)
+	}
+	if advances[1].To != "acceptance_verdict_unshipped" || advances[1].NextAction == nil || advances[1].NextAction.Action != "read_acceptance_audit" {
+		t.Errorf("entry = %+v, want acceptance_verdict_unshipped / read_acceptance_audit", advances[1])
+	}
+	if !strings.Contains(advances[1].NextAction.Detail, CategoryAcceptanceVerdictUnshipped) || !strings.Contains(advances[1].NextAction.Detail, "fishhawk_retry_stage") {
+		t.Errorf("detail = %q, want it to name the audit entry and fishhawk_retry_stage", advances[1].NextAction.Detail)
+	}
+	for _, a := range advances {
+		if a.Rule == drive.RuleChecksGreenAwaitingMerge {
+			t.Fatalf("checks_green_awaiting_merge stamped on an unshipped verdict: %+v", a)
+		}
+	}
+}
+
 // TestObserveParkedReview_AcceptanceTriage_ParksNoMerge pins the failed-verdict
 // arm: a failed acceptance verdict parks with read_acceptance_triage, never
 // merge_pr.

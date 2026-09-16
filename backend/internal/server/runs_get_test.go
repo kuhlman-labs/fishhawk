@@ -1405,6 +1405,9 @@ func TestGetRun_Drive_AcceptanceStates_SurfaceDerivedStatus(t *testing.T) {
 		{"pending", drive.RuleAcceptancePending, "acceptance_pending", "await_acceptance"},
 		{"outcome_unknown", drive.RuleAcceptanceOutcomeUnknown, "acceptance_settled_outcome_unknown", "read_acceptance_audit"},
 		{"triage", drive.RuleAcceptanceTriage, "acceptance_triage", "read_acceptance_triage"},
+		// E72.11 / #3447: the unshipped-verdict park surfaces as its rule name
+		// with the read_acceptance_audit next_action, never merge_pr.
+		{"verdict_unshipped", drive.RuleAcceptanceVerdictUnshipped, "acceptance_verdict_unshipped", "read_acceptance_audit"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

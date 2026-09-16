@@ -161,7 +161,12 @@ import "sort"
 // one of refused / decomposition_satisfied / override_acknowledged and NEVER
 // within_budget. It is written on EVERY one of those branches — including the
 // two that let the approval proceed — and is INTERNAL, audit-only: it renders
-// no issue comment and gates nothing.
+// no issue comment and gates nothing. E72.11 / #3447 added
+// acceptance_verdict_unshipped, the stage-scoped marker reap-failure appends
+// when an acceptance stage settled succeeded but its verdict upload never
+// landed (server/reap_failure.go); its liveness is decided by sequence against
+// the stage's newest acceptance_dispatched/acceptance_reopened anchor and any
+// later acceptance_outcome_recorded entry, and fishhawk_await_audit reads it.
 // When a new
 // canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
@@ -179,6 +184,7 @@ var KnownCategories = map[string]struct{}{
 	"acceptance_stage_omitted":                {},
 	"acceptance_triage_arbitrated":            {},
 	"acceptance_triage_decided":               {},
+	"acceptance_verdict_unshipped":            {},
 	"agent_request_failed_alert":              {},
 	"anchor_ping_posted":                      {},
 	"api_token_issued":                        {},

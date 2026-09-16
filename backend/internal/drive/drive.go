@@ -169,6 +169,22 @@ const (
 	// that prefix relationship so the drive presentation status and the MCP
 	// classifier cannot diverge.
 	RuleAcceptanceTriage Rule = "acceptance_triage"
+	// RuleAcceptanceVerdictUnshipped covers an acceptance-declaring run
+	// whose acceptance stage settled succeeded (the trace upload landed) but
+	// whose verdict never reached the backend — the runner's verdict ship
+	// failed (a 413 body_too_large, E72.11 / #3447) and the detached reaper's
+	// report was recorded as a stage-scoped acceptance_verdict_unshipped
+	// audit marker newer than the stage's latest dispatch/reopen anchor and
+	// newer than any stage-scoped acceptance_outcome_recorded entry. It parks
+	// with a read_acceptance_audit next action pointing at that marker and
+	// fishhawk_retry_stage — deliberately NEVER the merge ritual (the
+	// marker is a non-merge-admitting gate state; the re-open + re-dispatch
+	// moves the anchor past the marker and retires it by construction).
+	// Detection only, like RuleAcceptanceOutcomeUnknown. This name MUST
+	// byte-match the MCP next_actions.state string
+	// "acceptance_verdict_unshipped" and the audit category of the marker
+	// (the cross-module literal test pins both).
+	RuleAcceptanceVerdictUnshipped Rule = "acceptance_verdict_unshipped"
 	// RuleDeployInitialization covers a deploy-FIRST run's
 	// pending → awaiting_deploy_approval pre-execution park at run
 	// creation (E23.13 / #1429). A deploy stage has no agent or runner, so
@@ -213,24 +229,25 @@ const (
 // mechanical is the closed classification table (#1023): true rules
 // auto-advance under drive; false rules always park for the operator.
 var mechanical = map[Rule]bool{
-	RulePlanApprovedDispatch:     true,
-	RulePlanApprovedHumanGate:    true,
-	RuleReviseReplan:             true,
-	RuleRetryReopen:              true,
-	RuleRecoverRedispatch:        true,
-	RuleReviewsSettledGate:       true,
-	RuleFixupRereviewRepark:      true,
-	RuleChecksGreenAwaitingMerge: true,
-	RuleCIFailed:                 true,
-	RuleCIRecovered:              true,
-	RuleAcceptancePending:        true,
-	RuleAcceptanceOutcomeUnknown: true,
-	RuleAcceptanceTriage:         true,
-	RuleDeployInitialization:     true,
-	RuleChildrenDispatch:         true,
-	RuleGateApproval:             false,
-	RuleConcernRouting:           false,
-	RuleMerge:                    false,
+	RulePlanApprovedDispatch:       true,
+	RulePlanApprovedHumanGate:      true,
+	RuleReviseReplan:               true,
+	RuleRetryReopen:                true,
+	RuleRecoverRedispatch:          true,
+	RuleReviewsSettledGate:         true,
+	RuleFixupRereviewRepark:        true,
+	RuleChecksGreenAwaitingMerge:   true,
+	RuleCIFailed:                   true,
+	RuleCIRecovered:                true,
+	RuleAcceptancePending:          true,
+	RuleAcceptanceOutcomeUnknown:   true,
+	RuleAcceptanceTriage:           true,
+	RuleAcceptanceVerdictUnshipped: true,
+	RuleDeployInitialization:       true,
+	RuleChildrenDispatch:           true,
+	RuleGateApproval:               false,
+	RuleConcernRouting:             false,
+	RuleMerge:                      false,
 }
 
 // Mechanical reports whether rule is a mechanical transition

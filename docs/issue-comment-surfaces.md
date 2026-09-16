@@ -1763,8 +1763,32 @@ Notes:
   the eager, event-driven complement to the off-by-default dispatch watchdog and
   mirrors its `dispatch_watchdog_elapsed` precedent (FailStage category-C →
   chained audit → orchestrator Advance). The endpoint is idempotent — a report
-  against an already-terminal stage writes NO entry. Listed here only so a future
-  reader grepping the audit categories doesn't mistake it for a comment surface.
+  against an already-terminal stage writes NO entry, with the one named
+  exception below. Listed here only so a future reader grepping the audit
+  categories doesn't mistake it for a comment surface.
+- The unshipped-acceptance-verdict kind — `acceptance_verdict_unshipped`
+  (E72.11 / #3447) — is likewise an **internal, audit-only kind, not an
+  issue-comment surface**. Nothing in `issuecomment` posts it; it has no
+  Notifier method (the status-comment refresh rides the existing
+  `notifyStatusUpdate`). `server/reap_failure.go::recordAcceptanceVerdictUnshipped`
+  writes it via `AuditRepo.AppendChained` from the reap-failure handler's
+  already-terminal branch when the reaper's report lands against a
+  `succeeded` ACCEPTANCE stage with no stage-scoped
+  `acceptance_outcome_recorded` entry newer than its latest
+  `acceptance_dispatched` / `acceptance_reopened` anchor — the runner's verdict
+  ship failed (a 413 `body_too_large`) after the trace upload had already
+  settled the stage. The actor is `system`, the entry is stage-scoped, and the
+  payload is the `dispatch_reaper_failed` key set `{run_id, stage_id,
+  failure_category, reason, detail, exit_code, reported_at, auth_method}`. It
+  transitions nothing and never Advances. It is READ by the acceptance gate
+  (`acceptanceVerdictUnshippedLive`: live iff newer than the stage's anchor and
+  than any stage-scoped outcome → gate state `acceptance_verdict_unshipped`,
+  non-merge-admitting), by the drive observer (`drive.RuleAcceptanceVerdictUnshipped`
+  park, `read_acceptance_audit`) and by the MCP `next_actions` classifier
+  (`acceptance_verdict_unshipped` state: `fishhawk_list_audit` →
+  `fishhawk_retry_stage`, never the merge ritual). One marker per validation
+  episode: a live marker suppresses a second append, and a retry re-open +
+  re-dispatch retires it by construction.
 - The gating-reject PR-close audit kind — `pull_request_closed_after_review_reject`
   (#877) — is an **audit kind, not a triggering-issue comment surface**, but it
   DOES post a best-effort comment to the closed PR thread (not via the

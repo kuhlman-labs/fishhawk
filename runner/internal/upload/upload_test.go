@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -3784,5 +3785,261 @@ func TestInjectTranscript_RefusesNonObjectNullAndEmptyRef(t *testing.T) {
 	}
 	if _, err := InjectTranscript([]byte(`{}`), AcceptanceTranscriptRef{}); err == nil {
 		t.Error("an empty ref must be refused")
+	}
+}
+
+// --- E72.11 / #3447: acceptance verdict bound + 413 classification ---------
+
+// TestMaxAcceptanceVerdictBytesValue pins the runner's mirror of the backend
+// cap. Both are plain consts in modules that cannot import each other; if this
+// fails, update backend/internal/server/acceptance.go maxAcceptanceBundleBytes
+// (and both READMEs) in the SAME change — the two must stay in lockstep.
+func TestMaxAcceptanceVerdictBytesValue(t *testing.T) {
+	if MaxAcceptanceVerdictBytes != 256*1024 {
+		t.Fatalf("MaxAcceptanceVerdictBytes = %d, want 262144 — mirrors backend maxAcceptanceBundleBytes (backend/internal/server/acceptance.go); update both + runner/cmd/fishhawk-runner/README.md + backend/internal/server/README.md together", MaxAcceptanceVerdictBytes)
+	}
+	if AcceptanceEvidenceFieldBytes != 2048 || MinAcceptanceEvidenceFieldBytes != 128 {
+		t.Fatalf("ladder consts = %d/%d, want 2048/128", AcceptanceEvidenceFieldBytes, MinAcceptanceEvidenceFieldBytes)
+	}
+}
+
+// boundTestVerdict builds a verdict with n criteria rows whose prose fields
+// each carry ~fieldBytes of text, plus a replay block and notes.
+func boundTestVerdict(t *testing.T, n, fieldBytes int, prose string) []byte {
+	t.Helper()
+	type row struct {
+		ID                string `json:"id"`
+		Result            string `json:"result"`
+		Observed          string `json:"observed"`
+		Expected          string `json:"expected"`
+		StepsTaken        string `json:"steps_taken"`
+		ExpectationBasis  string `json:"expectation_basis"`
+		ReproHandle       string `json:"repro_handle"`
+		UndecidableReason string `json:"undecidable_reason,omitempty"`
+	}
+	fill := func() string {
+		var b strings.Builder
+		for b.Len() < fieldBytes {
+			b.WriteString(prose)
+		}
+		return b.String()
+	}
+	rows := make([]row, n)
+	for i := range rows {
+		rows[i] = row{ID: fmt.Sprintf("AC%d", i+1), Result: "passed",
+			Observed: fill(), Expected: fill(), StepsTaken: fill(), ExpectationBasis: fill(), ReproHandle: fill()}
+		if i%5 == 0 {
+			rows[i].Result = "undecidable"
+			rows[i].UndecidableReason = "  could not reach " + fill()
+		}
+	}
+	body, err := json.Marshal(map[string]any{
+		"verdict":         "passed",
+		"criteria":        rows,
+		"target_url":      "https://preview.example.test",
+		"evidence_hashes": []string{"sha256:abc"},
+		"notes":           fill(),
+		"replay":          scenario.ReplaySet{Scenarios: []scenario.ReplayedScenario{{ScenarioID: "scenario:issue-1/x", OriginIssue: 1, OriginRunID: "run-1", Path: "acceptance/scenarios/x.yaml"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func TestBoundAcceptanceVerdict_FitsIsByteIdentical(t *testing.T) {
+	// Non-canonical spacing + key order: a re-marshal would change the bytes.
+	body := []byte(`{"verdict": "passed",  "criteria": [{"id":"AC1","result":"passed","observed":"a & b <c>"}], "notes":"n"}`)
+	out, rep, err := BoundAcceptanceVerdict(body, MaxAcceptanceVerdictBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out, body) {
+		t.Fatalf("under-cap body was re-marshalled:\n got %s\nwant %s", out, body)
+	}
+	if rep.Bounded || !rep.Fits || rep.OriginalBytes != len(body) || rep.ShippedBytes != len(body) {
+		t.Fatalf("report = %+v, want Bounded=false Fits=true", rep)
+	}
+}
+
+func TestBoundAcceptanceVerdict_OversizedIsBoundedUnderCap(t *testing.T) {
+	body := boundTestVerdict(t, 125, 8*1024, "observed the thing & it <worked> ")
+	if len(body) <= MaxAcceptanceVerdictBytes {
+		t.Fatalf("fixture must be over the cap, got %d", len(body))
+	}
+	out, rep, err := BoundAcceptanceVerdict(body, MaxAcceptanceVerdictBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Bounded || !rep.Fits {
+		t.Fatalf("report = %+v, want Bounded=true Fits=true", rep)
+	}
+	if len(out) > MaxAcceptanceVerdictBytes {
+		t.Fatalf("bounded body = %d bytes, over cap %d", len(out), MaxAcceptanceVerdictBytes)
+	}
+	if rep.ShippedBytes != len(out) || rep.OriginalBytes != len(body) || rep.FieldsElided == 0 || rep.FieldCapBytes == 0 {
+		t.Fatalf("report = %+v", rep)
+	}
+	var in, got struct {
+		Verdict        string           `json:"verdict"`
+		TargetURL      string           `json:"target_url"`
+		EvidenceHashes []string         `json:"evidence_hashes"`
+		Replay         json.RawMessage  `json:"replay"`
+		Notes          string           `json:"notes"`
+		Criteria       []map[string]any `json:"criteria"`
+	}
+	if err := json.Unmarshal(body, &in); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("bounded body is not JSON: %v", err)
+	}
+	if got.Verdict != in.Verdict || got.TargetURL != in.TargetURL || !reflect.DeepEqual(got.EvidenceHashes, in.EvidenceHashes) {
+		t.Errorf("structural fields changed: %+v", got)
+	}
+	if !bytes.Equal(bytes.TrimSpace(got.Replay), bytes.TrimSpace(in.Replay)) {
+		t.Errorf("replay block changed:\n got %s\nwant %s", got.Replay, in.Replay)
+	}
+	if len(got.Criteria) != len(in.Criteria) {
+		t.Fatalf("criteria rows = %d, want %d", len(got.Criteria), len(in.Criteria))
+	}
+	for i, r := range got.Criteria {
+		if r["id"] != in.Criteria[i]["id"] || r["result"] != in.Criteria[i]["result"] {
+			t.Errorf("row %d id/result changed: %v", i, r)
+		}
+		obs, _ := r["observed"].(string)
+		if !strings.Contains(obs, "[truncated ") {
+			t.Errorf("row %d observed carries no truncation marker: %q", i, obs)
+		}
+		if len(obs) > rep.FieldCapBytes {
+			t.Errorf("row %d observed = %d bytes, over field cap %d", i, len(obs), rep.FieldCapBytes)
+		}
+		if reason, ok := r["undecidable_reason"].(string); ok {
+			if strings.TrimSpace(reason) == "" {
+				t.Errorf("row %d undecidable_reason elided to whitespace", i)
+			}
+			if !strings.HasPrefix(reason, "could not reach") {
+				t.Errorf("row %d undecidable_reason head lost: %q", i, reason[:40])
+			}
+		} else if in.Criteria[i]["result"] == "undecidable" {
+			t.Errorf("row %d lost its undecidable_reason", i)
+		}
+	}
+	if !strings.Contains(got.Notes, "[truncated ") || len(got.Notes) > rep.FieldCapBytes {
+		t.Errorf("notes not bounded: %d bytes", len(got.Notes))
+	}
+}
+
+func TestBoundAcceptanceVerdict_RuneSafe(t *testing.T) {
+	// Multi-byte payload (3-byte CJK + 4-byte emoji) so a byte-index cut would
+	// split a rune at almost every candidate boundary.
+	body := boundTestVerdict(t, 60, 8*1024, "観測した結果は🦅期待どおり ")
+	out, rep, err := BoundAcceptanceVerdict(body, MaxAcceptanceVerdictBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Fits {
+		t.Fatalf("report = %+v", rep)
+	}
+	var got struct {
+		Notes    string              `json:"notes"`
+		Criteria []map[string]string `json:"criteria"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	check := func(where, s string) {
+		t.Helper()
+		if !utf8.ValidString(s) {
+			t.Errorf("%s is not valid UTF-8 after elision", where)
+		}
+		if strings.ContainsRune(s, utf8.RuneError) {
+			t.Errorf("%s carries U+FFFD — a rune was split: %q", where, s)
+		}
+	}
+	check("notes", got.Notes)
+	for i, r := range got.Criteria {
+		for _, k := range acceptanceProseKeys {
+			if v, ok := r[k]; ok {
+				check(fmt.Sprintf("row %d %s", i, k), v)
+			}
+		}
+	}
+	// The elision helper itself never splits a rune and never exceeds max.
+	s := strings.Repeat("🦅観", 100)
+	for max := 1; max < len(s); max += 7 {
+		e := elideRunes(s, max)
+		if len(e) > max || !utf8.ValidString(e) {
+			t.Fatalf("elideRunes(max=%d) = %d bytes valid=%t", max, len(e), utf8.ValidString(e))
+		}
+	}
+}
+
+func TestBoundAcceptanceVerdict_UnfittableReportsFitsFalse(t *testing.T) {
+	// 200 rows × 5 prose fields: at the 128-byte floor with notes dropped the
+	// body is still over an 8 KiB cap — nil error, Fits=false, floor +
+	// NotesDropped reported.
+	const limit = 8 * 1024
+	body := boundTestVerdict(t, 200, 300, "x ")
+	out, rep, err := BoundAcceptanceVerdict(body, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Bounded || rep.Fits || !rep.NotesDropped || rep.FieldCapBytes != MinAcceptanceEvidenceFieldBytes {
+		t.Fatalf("report = %+v, want Bounded=true Fits=false NotesDropped=true cap=%d", rep, MinAcceptanceEvidenceFieldBytes)
+	}
+	if len(out) <= limit || rep.ShippedBytes != len(out) {
+		t.Fatalf("unfittable body = %d bytes (report %d)", len(out), rep.ShippedBytes)
+	}
+	if bytes.Contains(out, []byte(`"notes"`)) {
+		t.Error("notes survived the floor drop")
+	}
+}
+
+func TestBoundAcceptanceVerdict_NonObjectErrors(t *testing.T) {
+	for _, body := range []string{`[1,2]`, `null`, `{"verdict":"passed"} {"x":1}`, `"str"`, `{bad`} {
+		if _, _, err := BoundAcceptanceVerdict([]byte(body), MaxAcceptanceVerdictBytes); err == nil {
+			t.Errorf("BoundAcceptanceVerdict(%q) = nil error, want refusal", body)
+		}
+	}
+	if _, _, err := BoundAcceptanceVerdict([]byte(`{"verdict":"passed"}`), 0); err == nil {
+		t.Error("non-positive max must be refused")
+	}
+}
+
+func TestShipAcceptance_BodyTooLarge_413_Typed(t *testing.T) {
+	af, srv := newAcceptanceFakeBackend(t)
+	af.status = http.StatusRequestEntityTooLarge
+	af.body = `{"error":{"code":"body_too_large","message":"acceptance body exceeds size cap","details":{"limit_bytes":262144}}}`
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	_, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Body:       []byte(`{"verdict":"passed"}`),
+		PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrAcceptanceBodyTooLarge) {
+		t.Fatalf("err = %v, want ErrAcceptanceBodyTooLarge", err)
+	}
+	var tooLarge *AcceptanceBodyTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("err = %T, want *AcceptanceBodyTooLargeError", err)
+	}
+	if tooLarge.LimitBytes != 262144 {
+		t.Errorf("LimitBytes = %d, want 262144", tooLarge.LimitBytes)
+	}
+	if af.calls != 1 {
+		t.Errorf("calls = %d, want 1 (413 is permanent, never retried)", af.calls)
+	}
+
+	// A 413 whose body carries no limit_bytes (older backend) is still typed,
+	// with LimitBytes 0 so the ship site does not re-bound.
+	af.body = `{"error":{"code":"body_too_large","message":"too big"}}`
+	_, err = c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "run-abc", StageID: "stage-xyz", Body: []byte(`{"verdict":"passed"}`), PrivateKey: priv,
+	})
+	if !errors.As(err, &tooLarge) || tooLarge.LimitBytes != 0 {
+		t.Fatalf("err = %v, want typed with LimitBytes 0", err)
 	}
 }

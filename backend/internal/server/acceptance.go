@@ -27,12 +27,23 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
-// maxAcceptanceBundleBytes caps the acceptance evidence request body. Per
-// ADR-049 decision refinement #5 the evidence blobs (logs, screenshots,
-// traces) stay customer-side — only the structured verdict + per-criterion
-// results + content_hash references to those blobs cross to Fishhawk — so
-// 32 KB is well above any realistic payload, mirroring the deployment cap.
-const maxAcceptanceBundleBytes = 32 * 1024
+// maxAcceptanceBundleBytes caps the acceptance evidence request body at
+// 256 KiB (E72.11 / #3447). Per ADR-049 decision refinement #5 the evidence
+// blobs (logs, screenshots, traces) stay customer-side — only the structured
+// verdict + per-criterion results + content_hash references to those blobs
+// cross to Fishhawk — but the original 32 KiB figure predates the E72.4
+// runner-injected replay block (one entry per replayed scenario) and the
+// per-criterion prose fields (observed / steps_taken / expectation_basis),
+// which together crossed 32 KiB on an ordinary 20-criteria run and stranded a
+// PASSED verdict as settled-outcome-unknown. 256 KiB is the same plain-const
+// bound the sibling transcript endpoint uses (#3106 rule: a plain const, never
+// an env knob) and lands a 25-criteria × ~2 KiB-evidence verdict plus a
+// 25-scenario replay block with headroom. MIRRORED by the runner as
+// upload.MaxAcceptanceVerdictBytes (runner/internal/upload), which bounds the
+// verdict client-side BEFORE shipping; keep the two in lockstep — a skew in
+// either direction is absorbed at runtime by the runner re-bounding once to
+// the details.limit_bytes this handler declares on its 413.
+const maxAcceptanceBundleBytes = 256 * 1024
 
 // Acceptance audit categories (E31.6 / #1534, ADR-049). Open-set strings —
 // audit_entries.category has no CHECK, so these need no migration (only the
@@ -107,6 +118,21 @@ const (
 	// its own — the status refresh rides notifyStatusUpdate. Open-set string
 	// (audit_entries.category has no CHECK), so no migration.
 	CategoryAcceptanceReopened = "acceptance_reopened"
+	// CategoryAcceptanceVerdictUnshipped records that an acceptance stage
+	// settled `succeeded` (its trace upload landed) but the runner's verdict
+	// ship FAILED so NO acceptance_outcome_recorded entry exists for the
+	// validation episode (E72.11 / #3447 — the 413 body_too_large strand).
+	// Written by handleReapStageFailure's already-terminal branch
+	// (server/reap_failure.go) when the detached reaper's report lands against
+	// such a stage: one chained, stage-scoped entry carrying the reaper's
+	// reason/detail/exit_code, no state transition, no orchestrator advance.
+	// READ by acceptanceVerdictUnshippedLive, which treats the marker as LIVE
+	// only while it is newer than the stage's latest dispatch/reopen anchor
+	// AND newer than any stage-scoped acceptance_outcome_recorded entry — so a
+	// retry re-open + re-dispatch retires it by construction. Same name as
+	// drive.RuleAcceptanceVerdictUnshipped and the MCP next_actions state
+	// (cross-module literal pins). Open-set string, no migration.
+	CategoryAcceptanceVerdictUnshipped = "acceptance_verdict_unshipped"
 )
 
 // Acceptance triage class values (E31.8). Strings, matching
@@ -1579,6 +1605,20 @@ const (
 	// marker alone while a stage row is live. Value is the audit category
 	// itself so the marker string and the gate state cannot diverge.
 	acceptanceGateOmitted = CategoryAcceptanceStageOmitted
+	// acceptanceGateVerdictUnshipped is a NON-merge-admitting terminal state
+	// (E72.11 / #3447): the acceptance stage settled succeeded but carries a
+	// LIVE stage-scoped acceptance_verdict_unshipped marker — the runner's
+	// verdict ship failed (a 413 body_too_large) after the trace upload had
+	// already settled the stage. It is consulted BEFORE the verdict switch so
+	// that a STALE earlier outcome (a first attempt that passed, then a re-run
+	// whose verdict never shipped) cannot masquerade as the current verdict:
+	// the marker wins whenever it is newer than the newest recorded outcome.
+	// Deliberately NOT in acceptanceGateAdmitsMerge — nothing verified this
+	// head — and it never blocks retryAcceptanceOutcomeUnknown's re-open,
+	// which is the recovery (a fresh dispatch anchor retires the marker). The
+	// value is pinned to the drive rule so the drive presentation status, the
+	// audit-rule name, and the MCP next_actions.state string cannot diverge.
+	acceptanceGateVerdictUnshipped = string(drive.RuleAcceptanceVerdictUnshipped)
 )
 
 // acceptanceGateAdmitsMerge reports whether an acceptanceGateState value admits
@@ -1800,6 +1840,14 @@ func arbitrationOutcomeSequence(payload []byte) (int64, bool) {
 //     stage is terminal, AND it carries a stage-scoped
 //     acceptance_skipped_out_of_scope marker (E38.3 / #1877 auto-terminated
 //     out-of-scope skip — a legitimate merge-eligible disposition).
+//   - acceptanceGateVerdictUnshipped — the acceptance stage is terminal and
+//     carries a LIVE stage-scoped acceptance_verdict_unshipped marker (E72.11 /
+//     #3447: newer than the stage's latest dispatch/reopen anchor and newer
+//     than any stage-scoped acceptance_outcome_recorded entry), and either no
+//     outcome is recorded or the newest recorded outcome is OLDER than the
+//     marker. Consulted BEFORE the verdict switch so a stale earlier verdict
+//     cannot admit a merge over an unshipped re-run. NOT merge-eligible;
+//     the recovery is retry_stage (re-open + re-dispatch retires the marker).
 //   - acceptanceGateOutcomeUnknown— no readable verdict, the acceptance stage
 //     is terminal, and NO skip marker (the genuine settled-outcome-unknown hole).
 //   - acceptanceGateOmitted       — no verdict, NO acceptance stage row at all,
@@ -1823,6 +1871,24 @@ func (s *Server) acceptanceGateState(ctx context.Context, runRow *run.Run, stage
 	outcome, err := s.latestAcceptanceOutcome(ctx, runRow.ID)
 	if err != nil {
 		return "", err
+	}
+	// E72.11 / #3447: a LIVE unshipped-verdict marker on a terminal acceptance
+	// stage wins over any recorded outcome OLDER than it — the run-8b911565
+	// shape is a stale first-attempt `passed` outcome plus a newer marker from
+	// a re-run whose verdict never shipped, and reading the stale outcome would
+	// admit a merge over evidence the stage never delivered. An outcome NEWER
+	// than the marker means the verdict did ship after all (or a later episode
+	// shipped one), so the marker is ignored and the verdict switch decides.
+	// FAIL-CLOSED: the marker read error is PROPAGATED, never resolved to a
+	// merge-eligible state.
+	if acc := acceptanceStageOf(stages); acc != nil && acc.State.IsTerminal() {
+		markerSeq, live, merr := s.acceptanceVerdictUnshippedLive(ctx, runRow.ID, acc.ID)
+		if merr != nil {
+			return "", merr
+		}
+		if live && (!outcome.Recorded || outcome.Sequence < markerSeq) {
+			return acceptanceGateVerdictUnshipped, nil
+		}
 	}
 	if outcome.Recorded {
 		switch outcome.Verdict {
@@ -1933,6 +1999,58 @@ func (s *Server) acceptanceStageSkippedOutOfScope(ctx context.Context, runID, st
 		}
 	}
 	return false, nil
+}
+
+// acceptanceVerdictUnshippedLive reports whether the run's audit chain carries
+// a LIVE acceptance_verdict_unshipped marker scoped to stageID (E72.11 /
+// #3447), returning the marker's sequence when it does. Liveness is decided by
+// audit SEQUENCE, mirroring the outcome-anchoring helpers: with M the newest
+// stage-scoped marker, A the stage's newest validation-episode anchor
+// (max(latestAcceptanceDispatchSeq, latestAcceptanceEpisodeRestartSeq)) and O
+// the newest stage-scoped acceptance_outcome_recorded entry, the marker is live
+// iff M > A && M > O. A retry re-open appends an acceptance_reopened marker
+// and the re-dispatch appends a fresh acceptance_dispatched anchor, both at
+// sequences above M, so the recovery retires the marker by construction; a
+// verdict that ships after the marker (O > M) retires it the same way.
+//
+// Every read error is PROPAGATED so both callers fail closed: the gate never
+// resolves a merge-eligible state on an unreadable chain, and the reap handler
+// 500s (so the reaper's bounded retry re-attempts) rather than degrading to the
+// pre-#3447 silent no-op. latestAcceptanceDispatchSeq collapses its read error
+// into found=false by contract, so the dispatched anchor is read directly here
+// instead of through it.
+func (s *Server) acceptanceVerdictUnshippedLive(ctx context.Context, runID, stageID uuid.UUID) (int64, bool, error) {
+	markerSeq, err := s.newestStageScopedSeq(ctx, runID, stageID, CategoryAcceptanceVerdictUnshipped)
+	if err != nil {
+		return 0, false, err
+	}
+	if markerSeq == 0 {
+		return 0, false, nil
+	}
+	dispatchSeq, err := s.newestStageScopedSeq(ctx, runID, stageID, CategoryAcceptanceDispatched)
+	if err != nil {
+		return 0, false, err
+	}
+	reopenSeq, _, err := s.latestAcceptanceEpisodeRestartSeq(ctx, runID, stageID)
+	if err != nil {
+		return 0, false, err
+	}
+	anchor := max(dispatchSeq, reopenSeq)
+	outcomeSeq, err := s.newestStageScopedSeq(ctx, runID, stageID, CategoryAcceptanceOutcomeRecorded)
+	if err != nil {
+		return 0, false, err
+	}
+	// Anchor comparison: a marker at or below the newest dispatch/reopen anchor
+	// belongs to a PRIOR validation episode and is retired.
+	if markerSeq <= anchor {
+		return markerSeq, false, nil
+	}
+	// Outcome comparison: a stage-scoped verdict newer than the marker means
+	// the verdict shipped after all.
+	if markerSeq <= outcomeSeq {
+		return markerSeq, false, nil
+	}
+	return markerSeq, true, nil
 }
 
 // acceptanceStageOf returns the run's acceptance stage from the supplied slice,

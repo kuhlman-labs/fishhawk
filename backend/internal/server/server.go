@@ -1531,6 +1531,28 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 			})
 		}
 		return
+	case acceptanceGateVerdictUnshipped:
+		// E72.11 / #3447: the acceptance stage settled succeeded (trace upload
+		// landed) but its verdict never reached the backend — the detached
+		// reaper recorded a LIVE stage-scoped acceptance_verdict_unshipped
+		// marker. Park on read + retry, NEVER the merge ritual: the default arm
+		// below would stamp checks_green_awaiting_merge on a run with no
+		// recorded verdict. Idempotent on LatestRuleIs, not Recorded, for the
+		// same #2122 / #1961 reason as the sibling arms.
+		if !s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleAcceptanceVerdictUnshipped) {
+			s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
+				Rule:  drive.RuleAcceptanceVerdictUnshipped,
+				From:  "review:awaiting_approval",
+				To:    string(drive.RuleAcceptanceVerdictUnshipped),
+				Event: "review evidence terminal and " + checksEvidencePhrase(checksResolved) + "; acceptance stage succeeded but its verdict was never shipped",
+				NextAction: &drive.NextAction{
+					Action: "read_acceptance_audit",
+					Detail: checksAcceptanceLead(checksResolved) + "; the acceptance stage succeeded but the runner's verdict upload failed — read the " + CategoryAcceptanceVerdictUnshipped + " audit entry, then fishhawk_retry_stage the acceptance stage to re-run it (a re-dispatch retires the marker); never merge on it",
+					PRURL:  prURL,
+				},
+			})
+		}
+		return
 	case acceptanceGateTriage:
 		// Idempotent on LatestRuleIs, not Recorded: a fix-up re-park
 		// supersedes this stamp, so the current derived status is
