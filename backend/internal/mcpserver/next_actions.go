@@ -1497,6 +1497,15 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 			"the acceptance stage was auto-terminated because the approved plan declared verification.out_of_scope with no acceptance_criteria (E38.3 / #1877) — no verdict was recorded by design, and the run is merge-eligible")}
 	}
 
+	// E72.11 / #3447: the newest acceptance signal in the window is an
+	// acceptance_verdict_unshipped marker — the stage settled succeeded (trace
+	// upload landed) but the runner's verdict ship failed, so NO verdict exists
+	// for this episode. A NAMED state with the recovery verb, checked BEFORE
+	// the generic outcome-unknown arm; NEVER the merge ritual.
+	if verdict == acceptanceVerdictUnshipped {
+		return acceptanceVerdictUnshippedActions(run, acceptance)
+	}
+
 	// A terminal acceptance stage that never recorded a verdict in the recent
 	// window (verdict==""; the default audit_limit is 5, so the entry can age
 	// out), or a stage that failed/cancelled its own execution, falls to the
@@ -1636,6 +1645,39 @@ func acceptanceOutcomeUnknownActions(run *Run, acceptance *Stage) *NextActions {
 			},
 			pollAction(run, derivedStageWaitPollInterval(run, acceptance),
 				"re-poll fishhawk_get_run_status with a larger audit_limit to surface the acceptance_outcome_recorded / acceptance_triage_decided entries"),
+		},
+	}
+}
+
+// acceptanceVerdictUnshippedActions is the read-then-retry arm for a
+// `succeeded` acceptance stage carrying a live acceptance_verdict_unshipped
+// marker (E72.11 / #3447): the runner's verdict ship failed (a 413
+// body_too_large) after the trace upload had already settled the stage. The
+// state string byte-matches drive.RuleAcceptanceVerdictUnshipped and the
+// server gate's acceptance_verdict_unshipped (which refuses the merge 409).
+// Load-bearing: it NEVER offers the merge ritual — nothing verified this head.
+// The recovery is fishhawk_retry_stage: the re-open + re-dispatch append a
+// fresh anchor above the marker and retire it by construction.
+func acceptanceVerdictUnshippedActions(run *Run, acceptance *Stage) *NextActions {
+	return &NextActions{
+		State: "acceptance_verdict_unshipped",
+		Actions: []SuggestedAction{
+			{
+				Action:       "fishhawk_list_audit",
+				Params:       map[string]string{"run_id": run.ID, "category": auditCategoryAcceptanceVerdictUnshipped},
+				Precondition: "the acceptance stage settled succeeded but its verdict upload FAILED (the reap-failure report recorded an acceptance_verdict_unshipped marker newer than any acceptance_outcome_recorded entry) — the full verdict is on the trace bundle's acceptance_evidence event, not on the audit chain",
+				Consumes:     consumesNone,
+				Reason:       "read the runner's failure line (reason / detail / exit_code) from the marker before re-running — deliberately NOT the merge ritual (nothing verified this head; the server gate refuses the merge 409 acceptance_gate_not_passed)",
+			},
+			{
+				Action:       "fishhawk_retry_stage",
+				Params:       map[string]string{"stage_id": acceptance.ID},
+				Precondition: "after reading the marker: the stage settled succeeded with NO acceptance_outcome_recorded verdict for this episode, so the reopen is admitted (the server re-checks and 422s retry_not_applicable if a verdict IS recorded)",
+				Consumes:     consumesNone,
+				Reason:       "re-open the acceptance stage for a re-run (operator token only): the reopen + re-dispatch append a fresh dispatch anchor above the marker, retiring it; on the local runner the acceptance_pending arm's fishhawk_dispatch_stage then spawns the actual re-run",
+			},
+			pollAction(run, derivedStageWaitPollInterval(run, acceptance),
+				"re-poll fishhawk_get_run_status after the retry; the re-opened stage's dispatch arm serves the next move"),
 		},
 	}
 }
@@ -2137,6 +2179,23 @@ const (
 	// PAGED acceptance triage (E66.37 / #2474). MUST match
 	// backend/internal/server.CategoryAcceptanceTriageArbitrated.
 	auditCategoryAcceptanceTriageArbitrated = "acceptance_triage_arbitrated"
+	// auditCategoryAcceptanceVerdictUnshipped is the reap-failure handler's
+	// marker for a `succeeded` acceptance stage whose verdict ship FAILED after
+	// the trace upload settled it (E72.11 / #3447 — the 413 body_too_large
+	// strand). MUST match backend/internal/server.CategoryAcceptanceVerdictUnshipped
+	// AND drive.RuleAcceptanceVerdictUnshipped AND the next_actions.state string
+	// below; the cross-module literal test pins all three.
+	auditCategoryAcceptanceVerdictUnshipped = "acceptance_verdict_unshipped"
+
+	// acceptanceVerdictUnshipped is a CLASSIFIER-LOCAL sentinel, never a wire
+	// verdict (E72.11 / #3447): latestAcceptanceVerdict returns it when the
+	// newest entry among {acceptance_outcome_recorded, acceptance_verdict_unshipped}
+	// in the recent window is the unshipped marker, so the marker rides the
+	// existing verdict signal into acceptanceStageNextActions without widening
+	// nextActionsFor's signature. It is namespaced so it can never collide with
+	// the four real verdicts, and TestNextActions_AcceptanceVerdictUnshipped
+	// pins that it reaches ONLY the read/retry arm, never a merge arm.
+	acceptanceVerdictUnshipped = "verdict_unshipped"
 
 	// acceptanceArbitrationOutcomeSequenceField is the arbitration payload field
 	// carrying the acceptance_outcome_recorded sequence the discharge BINDS to.
@@ -2207,10 +2266,23 @@ func isAcceptancePagedDisposition(d string) bool {
 // acceptance_outcome_recorded audit entry in the recent slice (time-descending,
 // item 0 newest — the same slice mergeObservedIn scans), or "" when none is
 // present or the payload is malformed.
+//
+// E72.11 / #3447: the walk ALSO stops at an acceptance_verdict_unshipped
+// marker, returning the classifier-local acceptanceVerdictUnshipped sentinel
+// when the marker is NEWER than any recorded outcome in the window — the
+// reap-failure handler writes the marker only when no outcome exists for the
+// current validation episode, so "marker newest" is exactly "verdict never
+// shipped". An outcome newer than the marker (the verdict shipped after all,
+// or a later episode shipped one) wins as before. A marker aged out of the
+// window degrades to "" and the existing settled-outcome-unknown read arm
+// (fail toward read, never toward merge).
 func latestAcceptanceVerdict(recent []AuditEntry) string {
 	for _, e := range recent {
-		if e.Category == auditCategoryAcceptanceOutcomeRecorded {
+		switch e.Category {
+		case auditCategoryAcceptanceOutcomeRecorded:
 			return acceptancePayloadString(e.Payload, "verdict")
+		case auditCategoryAcceptanceVerdictUnshipped:
+			return acceptanceVerdictUnshipped
 		}
 	}
 	return ""

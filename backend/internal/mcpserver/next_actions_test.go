@@ -2536,15 +2536,120 @@ func TestAcceptanceStateStringsMatchDrive(t *testing.T) {
 		}
 	}
 
+	// E72.11 / #3447: the unshipped-verdict arm's state string MUST equal the
+	// drive rule AND the audit-category marker it is classified from, so the
+	// server gate (acceptanceGateVerdictUnshipped = string(drive rule)), the
+	// drive presentation and this surface agree.
+	if got := acceptanceStageNextActions(run, acc("succeeded"), false, false, acceptanceVerdictUnshipped, "").State; got != string(drive.RuleAcceptanceVerdictUnshipped) {
+		t.Errorf("verdict-unshipped state = %q, want %q (drive.RuleAcceptanceVerdictUnshipped)", got, drive.RuleAcceptanceVerdictUnshipped)
+	}
+	if string(drive.RuleAcceptanceVerdictUnshipped) != auditCategoryAcceptanceVerdictUnshipped {
+		t.Errorf("drive.RuleAcceptanceVerdictUnshipped = %q, want the audit-category marker %q", drive.RuleAcceptanceVerdictUnshipped, auditCategoryAcceptanceVerdictUnshipped)
+	}
+
 	// Lock the exact drive-rule literals too, so a coordinated rename that keeps
 	// the two surfaces internally consistent but drifts from the documented
 	// strings still trips here.
 	if drive.RuleAcceptancePending != "acceptance_pending" ||
 		drive.RuleAcceptanceOutcomeUnknown != "acceptance_settled_outcome_unknown" ||
-		drive.RuleAcceptanceTriage != "acceptance_triage" {
-		t.Errorf("drive acceptance rule literals drifted: pending=%q unknown=%q triage=%q",
-			drive.RuleAcceptancePending, drive.RuleAcceptanceOutcomeUnknown, drive.RuleAcceptanceTriage)
+		drive.RuleAcceptanceTriage != "acceptance_triage" ||
+		drive.RuleAcceptanceVerdictUnshipped != "acceptance_verdict_unshipped" {
+		t.Errorf("drive acceptance rule literals drifted: pending=%q unknown=%q triage=%q unshipped=%q",
+			drive.RuleAcceptancePending, drive.RuleAcceptanceOutcomeUnknown, drive.RuleAcceptanceTriage, drive.RuleAcceptanceVerdictUnshipped)
 	}
+}
+
+// naUnshippedEntry builds an acceptance_verdict_unshipped marker (E72.11 /
+// #3447) at the given sequence — the reap-failure handler's payload shape.
+func naUnshippedEntry(seq int64) AuditEntry {
+	return AuditEntry{
+		Category: auditCategoryAcceptanceVerdictUnshipped,
+		Sequence: seq,
+		Payload:  map[string]any{"reason": "acceptance_upload", "detail": "413 body_too_large", "exit_code": float64(1)},
+	}
+}
+
+// TestLatestAcceptanceVerdict_UnshippedMarker pins the E72.11 / #3447 fold of
+// the unshipped marker into the recent-window verdict signal: the walk is
+// newest-first, and whichever of {acceptance_outcome_recorded,
+// acceptance_verdict_unshipped} is hit FIRST decides — a marker newer than
+// every outcome yields the classifier-local sentinel; an outcome newer than
+// the marker yields that outcome's verdict (the verdict shipped after all, or
+// a later episode shipped one); a window with no marker is unchanged.
+func TestLatestAcceptanceVerdict_UnshippedMarker(t *testing.T) {
+	// Marker newest (run-8b911565 shape: a stale first-attempt passed outcome
+	// below a newer marker).
+	if got := latestAcceptanceVerdict([]AuditEntry{naUnshippedEntry(20), naOutcomeEntry(10, acceptanceVerdictPassed)}); got != acceptanceVerdictUnshipped {
+		t.Errorf("marker-newest verdict = %q, want the %q sentinel", got, acceptanceVerdictUnshipped)
+	}
+	// Outcome newer than the marker: the verdict arm wins.
+	if got := latestAcceptanceVerdict([]AuditEntry{naOutcomeEntry(30, acceptanceVerdictPassed), naUnshippedEntry(20)}); got != acceptanceVerdictPassed {
+		t.Errorf("outcome-newer verdict = %q, want passed", got)
+	}
+	// Marker aged out of the window: "" (settled-outcome-unknown arm).
+	if got := latestAcceptanceVerdict([]AuditEntry{{Category: "stage_transition", Sequence: 21}}); got != "" {
+		t.Errorf("no-marker verdict = %q, want empty", got)
+	}
+	// The sentinel is classifier-local: it must never equal a wire verdict.
+	for _, wire := range []string{acceptanceVerdictPassed, acceptanceVerdictFailed, acceptanceVerdictNotValidated, acceptanceVerdictUndecidable, ""} {
+		if wire == acceptanceVerdictUnshipped {
+			t.Errorf("sentinel %q collides with wire verdict %q", acceptanceVerdictUnshipped, wire)
+		}
+	}
+}
+
+// TestNextActions_AcceptanceVerdictUnshipped drives the E72.11 / #3447 arm end
+// to end through nextActionsFor: marker newest → the named
+// acceptance_verdict_unshipped state with fishhawk_list_audit (category =
+// the marker) then fishhawk_retry_stage keyed to the acceptance stage, and
+// NEVER a merge-ritual action; an outcome newer than the marker → the ordinary
+// verdict arm (acceptance_passed here); a marker aged out → the existing
+// settled-outcome-unknown arm. The counterfactual for the arm is deleting the
+// `verdict == acceptanceVerdictUnshipped` check in acceptanceStageNextActions:
+// the sentinel then falls to the outcome-unknown arm and the state assertion
+// goes RED.
+func TestNextActions_AcceptanceVerdictUnshipped(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naLocalRun("running")
+	run.PullRequestURL = &prURL
+	stages := naAcceptanceStages("succeeded")
+	acceptanceID := stages[2].ID
+
+	t.Run("marker newest → unshipped arm, no merge", func(t *testing.T) {
+		verdict := latestAcceptanceVerdict([]AuditEntry{naUnshippedEntry(20), naOutcomeEntry(10, acceptanceVerdictPassed)})
+		na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, verdict, "", releaseSignals{})
+		if na == nil || na.State != "acceptance_verdict_unshipped" {
+			t.Fatalf("state = %+v, want acceptance_verdict_unshipped", na)
+		}
+		if len(na.Actions) < 2 {
+			t.Fatalf("actions = %+v, want list_audit then retry_stage", na.Actions)
+		}
+		if na.Actions[0].Action != "fishhawk_list_audit" || na.Actions[0].Params["category"] != auditCategoryAcceptanceVerdictUnshipped {
+			t.Errorf("actions[0] = %+v, want fishhawk_list_audit on category %q", na.Actions[0], auditCategoryAcceptanceVerdictUnshipped)
+		}
+		if na.Actions[1].Action != "fishhawk_retry_stage" || na.Actions[1].Params["stage_id"] != acceptanceID {
+			t.Errorf("actions[1] = %+v, want fishhawk_retry_stage on the acceptance stage %q", na.Actions[1], acceptanceID)
+		}
+		for _, a := range na.Actions {
+			if a.Action == "approve_pr" || a.Action == "merge_pr" || a.Action == "fishhawk_merge_run" {
+				t.Fatalf("merge ritual action %q surfaced on an unshipped acceptance verdict — must fail toward read/retry, not merge", a.Action)
+			}
+		}
+	})
+	t.Run("outcome newer than marker → verdict arm", func(t *testing.T) {
+		verdict := latestAcceptanceVerdict([]AuditEntry{naOutcomeEntry(30, acceptanceVerdictPassed), naUnshippedEntry(20)})
+		na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, verdict, "", releaseSignals{})
+		if na == nil || na.State != "acceptance_passed" {
+			t.Fatalf("state = %+v, want acceptance_passed", na)
+		}
+	})
+	t.Run("marker aged out → settled-outcome-unknown arm", func(t *testing.T) {
+		verdict := latestAcceptanceVerdict(nil)
+		na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, verdict, "", releaseSignals{})
+		if na == nil || na.State != "acceptance_settled_outcome_unknown" {
+			t.Fatalf("state = %+v, want acceptance_settled_outcome_unknown", na)
+		}
+	})
 }
 
 // naReleaseRun builds a running delegating "release" workflow run — the shape

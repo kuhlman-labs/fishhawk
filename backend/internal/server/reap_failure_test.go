@@ -1955,3 +1955,206 @@ func TestReapStageFailure_GoldenConditionalBodyTakesConditionalPath(t *testing.T
 		t.Errorf("dispatch_reaper_failed entries = %d, want 0", len(got))
 	}
 }
+
+// --- acceptance_verdict_unshipped (E72.11 / #3447) --------------------------
+
+// reapAcceptanceServer is reapServer with the seeded stage retyped to
+// ACCEPTANCE (reapServer seeds a plan stage — which is exactly what keeps
+// TestReapStageFailure_AlreadyTerminalNoOp the type-gate control (d)).
+func reapAcceptanceServer(t *testing.T, stageState run.StageState) (*Server, *orchestratorRepo, *auditFake, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	s, rr, au, runID, stageID := reapServer(t, stageState)
+	rr.mu.Lock()
+	rr.stagesByID[stageID].Type = run.StageTypeAcceptance
+	rr.mu.Unlock()
+	return s, rr, au, runID, stageID
+}
+
+// unshippedAudit returns the acceptance_verdict_unshipped entries appended.
+func unshippedAudit(au *auditFake) []audit.ChainAppendParams {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == CategoryAcceptanceVerdictUnshipped {
+			out = append(out, au.appended[i])
+		}
+	}
+	return out
+}
+
+// (a) A succeeded ACCEPTANCE stage with a dispatch anchor and NO stage-scoped
+// outcome after it: the reaper's report appends ONE stage-scoped
+// acceptance_verdict_unshipped marker carrying the reaper's failure line,
+// answers 200 {transitioned:false, acceptance_verdict_unshipped_recorded:true},
+// leaves the stage succeeded, never Advances, and writes NO
+// dispatch_reaper_failed row. Counterfactual: delete the
+// recordAcceptanceVerdictUnshipped call in the already-terminal branch → RED
+// on the marker count and the response flag.
+func TestReapStageFailure_AcceptanceSucceededNoOutcome_RecordsUnshipped(t *testing.T) {
+	s, rr, au, runID, stageID := reapAcceptanceServer(t, run.StageStateSucceeded)
+	seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 2)
+
+	w := postReapFailure(t, s, runID, stageID,
+		reapFailureRequest{Category: "C", Reason: "acceptance_upload", Detail: "413 body_too_large", ExitCode: 1},
+		withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp reapFailureResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Transitioned || !resp.AcceptanceVerdictUnshippedRecorded || resp.StageState != string(run.StageStateSucceeded) {
+		t.Errorf("response = %+v, want {transitioned:false, unshipped_recorded:true, succeeded}", resp)
+	}
+	markers := unshippedAudit(au)
+	if len(markers) != 1 {
+		t.Fatalf("acceptance_verdict_unshipped entries = %d, want 1", len(markers))
+	}
+	if markers[0].StageID == nil || *markers[0].StageID != stageID {
+		t.Errorf("marker not stage-scoped: %+v", markers[0].StageID)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(markers[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]any{
+		"reason": "acceptance_upload", "detail": "413 body_too_large", "exit_code": float64(1),
+		"failure_category": "C", "stage_id": stageID.String(), "run_id": runID.String(),
+	} {
+		if payload[k] != want {
+			t.Errorf("payload[%s] = %v, want %v", k, payload[k], want)
+		}
+	}
+	if got := reapAudit(au); len(got) != 0 {
+		t.Errorf("dispatch_reaper_failed entries = %d, want 0", len(got))
+	}
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded (no transition)", cur.State)
+	}
+	curRun, _ := rr.GetRun(context.Background(), runID)
+	if curRun.State != run.StateRunning {
+		t.Errorf("run state = %q, want running (Advance not invoked)", curRun.State)
+	}
+}
+
+// (b) A stage-scoped acceptance_outcome_recorded entry NEWER than the dispatch
+// anchor means the verdict for this episode DID ship — no marker, the plain
+// no-op body. Counterfactual: delete the `outcomeSeq > anchor` predicate in
+// recordAcceptanceVerdictUnshipped → RED (a marker is appended).
+func TestReapStageFailure_AcceptanceSucceededWithOutcomeAfterAnchor_NoMarker(t *testing.T) {
+	s, _, au, runID, stageID := reapAcceptanceServer(t, run.StageStateSucceeded)
+	seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 2)
+	seedStageScopedOutcome(au, runID, stageID, 5, acceptanceVerdictPassed)
+
+	w := postReapFailure(t, s, runID, stageID,
+		reapFailureRequest{Category: "C", Reason: "late report"}, withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp reapFailureResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.AcceptanceVerdictUnshippedRecorded {
+		t.Error("acceptance_verdict_unshipped_recorded = true, want false (verdict shipped after the anchor)")
+	}
+	if n := len(unshippedAudit(au)); n != 0 {
+		t.Errorf("acceptance_verdict_unshipped entries = %d, want 0", n)
+	}
+}
+
+// (c) A LIVE marker already on the chain (a double-report / reaper retry)
+// appends NO second marker. The existing marker is seeded above the anchor so
+// its liveness is decided by sequence exactly as in production. Counterfactual:
+// delete the live-marker idempotence check in recordAcceptanceVerdictUnshipped
+// → RED (a second marker is appended).
+func TestReapStageFailure_AcceptanceUnshipped_DoubleReport_OneMarker(t *testing.T) {
+	s, _, au, runID, stageID := reapAcceptanceServer(t, run.StageStateSucceeded)
+	seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 2)
+	seedStageScoped(au, runID, stageID, CategoryAcceptanceVerdictUnshipped, 9)
+
+	w := postReapFailure(t, s, runID, stageID,
+		reapFailureRequest{Category: "C", Reason: "acceptance_upload"}, withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp reapFailureResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.AcceptanceVerdictUnshippedRecorded {
+		t.Error("acceptance_verdict_unshipped_recorded = true on a double-report, want false")
+	}
+	if n := len(unshippedAudit(au)); n != 0 {
+		t.Errorf("appended acceptance_verdict_unshipped entries = %d, want 0 (one live marker per episode)", n)
+	}
+}
+
+// (c') A RETIRED marker (a later dispatch anchor sits above it) is not live, so
+// a fresh report after the re-run appends a NEW marker.
+func TestReapStageFailure_AcceptanceUnshipped_RetiredMarker_NewMarker(t *testing.T) {
+	s, _, au, runID, stageID := reapAcceptanceServer(t, run.StageStateSucceeded)
+	seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 2)
+	seedStageScoped(au, runID, stageID, CategoryAcceptanceVerdictUnshipped, 9)
+	seedStageScoped(au, runID, stageID, CategoryAcceptanceReopened, 10)
+	seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 11)
+
+	w := postReapFailure(t, s, runID, stageID,
+		reapFailureRequest{Category: "C", Reason: "acceptance_upload"}, withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(unshippedAudit(au)); n != 1 {
+		t.Errorf("appended acceptance_verdict_unshipped entries = %d, want 1 (prior marker retired by the new anchor)", n)
+	}
+}
+
+// (d') A FAILED acceptance stage is terminal but not the unshipped shape (the
+// runner reported its own failure): plain no-op, no marker. Together with the
+// plan-typed TestReapStageFailure_AlreadyTerminalNoOp this pins the type+state
+// gate. Counterfactual: delete the type/state gate → RED here (a marker on a
+// failed stage) and on the plan-stage control.
+func TestReapStageFailure_AcceptanceFailed_NoMarker(t *testing.T) {
+	s, _, au, runID, stageID := reapAcceptanceServer(t, run.StageStateFailed)
+	w := postReapFailure(t, s, runID, stageID,
+		reapFailureRequest{Category: "C", Reason: "late report"}, withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(unshippedAudit(au)); n != 0 {
+		t.Errorf("acceptance_verdict_unshipped entries = %d, want 0 on a failed stage", n)
+	}
+}
+
+// (e') An audit read error on the already-terminal acceptance path is
+// FAIL-CLOSED: 500, no marker, so the reaper's bounded retry re-attempts
+// rather than the pre-#3447 silent no-op.
+func TestReapStageFailure_AcceptanceUnshipped_ReadError_500(t *testing.T) {
+	s, _, au, runID, stageID := reapAcceptanceServer(t, run.StageStateSucceeded)
+	au.listByCategoryErrCategory = CategoryAcceptanceOutcomeRecorded
+	w := postReapFailure(t, s, runID, stageID,
+		reapFailureRequest{Category: "C", Reason: "acceptance_upload"}, withReapOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (fail-closed):\n%s", w.Code, w.Body.String())
+	}
+	if n := len(unshippedAudit(au)); n != 0 {
+		t.Errorf("acceptance_verdict_unshipped entries = %d, want 0 on a read error", n)
+	}
+}
+
+// (f') The already-terminal no-op body for a NON-acceptance stage is
+// byte-for-byte unchanged: the omitempty flag is absent.
+func TestReapStageFailure_AlreadyTerminalNoOp_BodyUnchanged(t *testing.T) {
+	s, _, _, runID, stageID := reapServer(t, run.StageStateSucceeded)
+	w := postReapFailure(t, s, runID, stageID,
+		reapFailureRequest{Category: "C", Reason: "late report"}, withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte("acceptance_verdict_unshipped_recorded")) {
+		t.Errorf("no-op body carries the acceptance flag: %s", w.Body.String())
+	}
+}

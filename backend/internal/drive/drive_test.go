@@ -63,6 +63,7 @@ func TestMechanical_RuleTable(t *testing.T) {
 		RuleAcceptancePending,
 		RuleAcceptanceOutcomeUnknown,
 		RuleAcceptanceTriage,
+		RuleAcceptanceVerdictUnshipped,
 		RuleDeployInitialization,
 		RuleChildrenDispatch,
 	} {
@@ -86,6 +87,11 @@ func TestMechanical_RuleTable(t *testing.T) {
 	}
 	if RuleAcceptanceTriage != "acceptance_triage" {
 		t.Errorf("RuleAcceptanceTriage = %q, want acceptance_triage", RuleAcceptanceTriage)
+	}
+	// E72.11 / #3447: the unshipped-verdict rule is the MCP next_actions.state
+	// string AND the audit category of the marker it reads.
+	if RuleAcceptanceVerdictUnshipped != "acceptance_verdict_unshipped" {
+		t.Errorf("RuleAcceptanceVerdictUnshipped = %q, want acceptance_verdict_unshipped", RuleAcceptanceVerdictUnshipped)
 	}
 	for _, rule := range []Rule{
 		RuleGateApproval,

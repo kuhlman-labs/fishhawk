@@ -500,6 +500,38 @@ func TestMergeRun_AcceptanceOutcomeUnknown_Blocks(t *testing.T) {
 	}
 }
 
+// TestMergeRun_AcceptanceVerdictUnshipped_409 (E72.11 / #3447): a succeeded
+// acceptance stage carrying a LIVE acceptance_verdict_unshipped marker refuses
+// the merge 409 acceptance_gate_not_passed with acceptance_gate_state
+// acceptance_verdict_unshipped, even over a stale earlier passed outcome.
+// Counterfactual: widen acceptanceGateAdmitsMerge to admit the state → RED.
+func TestMergeRun_AcceptanceVerdictUnshipped_409(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	stages := acceptanceMergeStages(runID, run.StageStateSucceeded)
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, []byte(autoDriveAcceptanceSpecYAML), stages)
+	accID := stages[2].ID
+	seedStageScoped(au, runID, accID, CategoryAcceptanceDispatched, 2)
+	seedStageScopedOutcome(au, runID, accID, 5, acceptanceVerdictPassed) // stale first attempt
+	seedStageScoped(au, runID, accID, CategoryAcceptanceReopened, 6)
+	seedStageScoped(au, runID, accID, CategoryAcceptanceDispatched, 7)
+	seedStageScoped(au, runID, accID, CategoryAcceptanceVerdictUnshipped, 9)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	for _, want := range []string{"acceptance_gate_not_passed", `"acceptance_gate_state":"acceptance_verdict_unshipped"`} {
+		if !bytes.Contains(w.Body.Bytes(), []byte(want)) {
+			t.Errorf("body missing %s: %s", want, w.Body.String())
+		}
+	}
+	if merger.called != 0 || len(mergeVerdictRows(au)) != 0 {
+		t.Errorf("merger.called=%d rows=%d, want 0/0 (unshipped verdict blocks)", merger.called, len(mergeVerdictRows(au)))
+	}
+}
+
 func TestMergeRun_AcceptanceReadError_Blocks(t *testing.T) {
 	merger := &fakeMerger{}
 	s, repo, au := newAutoDriveMergeServer(t, merger)

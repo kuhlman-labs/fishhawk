@@ -9770,7 +9770,34 @@ paths:
         **Idempotent.** A report against an already-terminal stage (a
         double-report, or a race with the dispatch watchdog reaping the same
         stuck stage) is a benign no-op: 200 with `transitioned: false`, NO
-        audit entry, and NO advance.
+        audit entry, and NO advance — with ONE named exception below.
+
+        **Unshipped acceptance verdict (E72.11 / #3447).** When the report
+        lands against an ACCEPTANCE stage that is already `succeeded` (the
+        runner's trace upload settled it) and NO stage-scoped
+        `acceptance_outcome_recorded` entry is newer than the stage's latest
+        `acceptance_dispatched` / `acceptance_reopened` anchor, the runner's
+        verdict ship failed after the stage settled (the 413 `body_too_large`
+        strand). Instead of the bare no-op the handler appends ONE chained,
+        stage-scoped `acceptance_verdict_unshipped` audit entry (actor
+        `system`; payload is the `dispatch_reaper_failed` key set — `run_id`,
+        `stage_id`, `failure_category`, `reason`, `detail`, `exit_code`,
+        `reported_at`, `auth_method`) and answers 200 `{transitioned: false,
+        acceptance_verdict_unshipped_recorded: true}`. Still no transition
+        and no advance. The marker is LIVE only while it is newer than the
+        stage's latest dispatch/reopen anchor and than any stage-scoped
+        outcome; while live the acceptance gate reads
+        `acceptance_verdict_unshipped` (merge refused 409
+        `acceptance_gate_not_passed`), the drive presentation parks on
+        `read_acceptance_audit`, and the MCP `next_actions` surface points at
+        `fishhawk_retry_stage`. A retry re-open + re-dispatch moves the anchor
+        above the marker and retires it by construction. A second report
+        against a stage with a live marker is the plain no-op (one marker per
+        episode); a non-acceptance terminal stage, or a failed/cancelled
+        acceptance stage, keeps the byte-identical no-op. An audit read
+        error on this path is 500 `acceptance_verdict_unshipped_record_failed`
+        (fail-closed — the reaper's bounded retry re-attempts) rather than a
+        silent no-op.
 
         **Protected `awaiting_children` park (#1891).** A report against a
         stage in `awaiting_children` is the SAME benign no-op (200,
@@ -9895,6 +9922,16 @@ paths:
                   stage_state:
                     type: string
                     description: The resulting stage state.
+                  acceptance_verdict_unshipped_recorded:
+                    type: boolean
+                    description: |
+                      Present and `true` ONLY when this call appended an
+                      `acceptance_verdict_unshipped` marker on the
+                      already-terminal path (E72.11 / #3447): the stage is a
+                      `succeeded` acceptance stage with no stage-scoped
+                      `acceptance_outcome_recorded` entry newer than its
+                      latest dispatch/reopen anchor and no live marker yet.
+                      Omitted on every other response.
         '400':
           description: |
             Malformed body, an unknown field, a `category` other than
@@ -16450,7 +16487,14 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
         '413':
-          description: Acceptance body exceeds the per-stage size cap (32 KiB).
+          description: |
+            Acceptance body exceeds the per-stage size cap (256 KiB since
+            E72.11 / #3447; was 32 KiB, which the E72.4 runner-injected
+            replay block plus per-criterion prose crossed on an ordinary
+            20-criteria run). `details.limit_bytes` declares the cap; the
+            runner bounds the verdict client-side to its mirrored
+            `MaxAcceptanceVerdictBytes` before shipping and re-bounds ONCE to
+            the declared limit on a 413.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
