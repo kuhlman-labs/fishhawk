@@ -216,6 +216,103 @@ else
   fail "(a6) non-executable skip (rc=$rc out='$a6_out')"
 fi
 
+# (a7) #3451: a runner-injected verify lock override must NOT reach a gate
+# harness's OWN nested cmd_verify. Pre-hold a LIVE `<pid>:runner` lock (the
+# shape the runner's own verify holds while running _verify_gate_harnesses),
+# export it as the override + OWNER=runner (+ a 2s wait budget so a REGRESSION
+# is bounded rather than a 600s hang), then drive the REAL _verify_gate_harnesses
+# against a fake ROOT whose test-patch-coverage stub sources scripts/test
+# lib-only and runs the REAL cmd_verify against its OWN throwaway git repo. If
+# the override reaches that nested cmd_verify unchanged, it resolves the
+# PRE-HELD lock, classifies it live-runner (since OWNER=runner), and either
+# waits out the budget and refuses (kind runner) or refuses immediately (kind
+# shell) — exactly the #3451 self-deadlock. With the fix, the harness's
+# `unset FISHHAWK_VERIFY_LOCK_PATH FISHHAWK_VERIFY_LOCK_OWNER` subshell strips
+# both before exec, so the nested verify never sees them: it derives its OWN
+# lock at its OWN root's git-common-dir, acquires it as shell-kind (no OWNER),
+# runs its stubbed cmd_test, and releases it on exit — while the pre-held lock
+# is left completely untouched.
+a7_holder=""
+a7_saved_trap="$(trap -p EXIT)"
+trap 'kill "$a7_holder" 2>/dev/null; eval "$a7_saved_trap"' EXIT
+
+fake="$tmproot/harn_a7"
+make_harnesses "$fake" 0 0 0
+make_repo "$tmproot/a7repo"
+nested_lock_expected="$(git -C "$tmproot/a7repo" rev-parse --path-format=absolute --git-common-dir)/fishhawk-verify.lock"
+
+# The stub sources the REAL scripts/test lib-only and calls the REAL cmd_verify
+# on its own repo — REPO_ROOT/tmproot/fake are baked in as literal paths (an
+# exec'd child does not inherit this script's unexported shell variables), but
+# $VERIFY_LOCK_HELD and $(_verify_lock_kind) are escaped so they stay unevaluated
+# until the stub itself runs.
+cat > "$fake/scripts/test-patch-coverage" <<STUB
+#!/usr/bin/env bash
+FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+set +e
+ROOT="$tmproot/a7repo"
+cmd_lint() { :; }
+_verify_doc_line_budget() { :; }
+_verify_schema_sync() { :; }
+_verify_gate_harnesses() { :; }
+_verify_site_voice() { :; }
+_verify_site_ia() { :; }
+cmd_test() { : > "$fake/markers/nested"; echo "NESTED_LOCK:\$VERIFY_LOCK_HELD"; echo "NESTED_KIND:\$(_verify_lock_kind)"; }
+FISHHAWK_SKIP_PATCH_COVERAGE=1 cmd_verify
+STUB
+chmod +x "$fake/scripts/test-patch-coverage"
+
+sleep 300 &
+a7_holder=$!
+ln -s "${a7_holder}:runner" "$tmproot/a7.lock"
+
+(
+  set -e
+  export FISHHAWK_VERIFY_LOCK_PATH="$tmproot/a7.lock" FISHHAWK_VERIFY_LOCK_OWNER=runner \
+         FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=2 FISHHAWK_VERIFY_LOCK_POLL_SECONDS=1
+  ROOT="$fake"
+  _verify_gate_harnesses
+) >"$tmproot/a7.out" 2>&1
+rc=$?
+a7_out="$(cat "$tmproot/a7.out")"
+a7_lock_after="$(readlink "$tmproot/a7.lock" 2>/dev/null)"
+
+if [ "$rc" -eq 0 ] \
+   && ! printf '%s' "$a7_out" | grep -q 'waiting up to' \
+   && ! printf '%s' "$a7_out" | grep -q 'another RUNNER verify' \
+   && [ -e "$fake/markers/nested" ] \
+   && printf '%s' "$a7_out" | grep -qF "NESTED_LOCK:$nested_lock_expected" \
+   && printf '%s' "$a7_out" | grep -q 'NESTED_KIND:shell' \
+   && [ "$a7_lock_after" = "${a7_holder}:runner" ] \
+   && [ ! -e "$nested_lock_expected" ]; then
+  pass "(a7) a runner-injected verify lock override never reaches a gate harness's nested cmd_verify: no wait/refusal, nested verify keyed its own root as shell-kind, the pre-held lock is untouched, the nested lock is released"
+else
+  nested_marker=no; [ -e "$fake/markers/nested" ] && nested_marker=yes
+  fail "(a7) harness lock isolation (rc=$rc out='$a7_out' nested_lock_expected='$nested_lock_expected' a7_lock_after='$a7_lock_after' nested_marker=$nested_marker)"
+fi
+
+# Counterfactuals (approval condition 2 — the RED lines below are the ones
+# ACTUALLY OBSERVED running each mutation by hand, not predicted; each was
+# restored byte-identically afterward):
+#   (c1) delete the `unset ...` from _verify_gate_harnesses in scripts/test ->
+#        (a7) RED: rc=1, and a7.out carries both
+#          "scripts/test: waiting up to 2s for the verify lock at .../a7.lock (holder pid <pid>, kind runner)"
+#          "scripts/test: another RUNNER verify still holds the lock at .../a7.lock after 2s"
+#        (~2s wall clock, bounded by the exported WAIT_SECONDS=2).
+#   (c2) unset only FISHHAWK_VERIFY_LOCK_OWNER (keep PATH in the unset) ->
+#        (a7) RED: rc=1 immediately, a7.out carries
+#          "scripts/test: another verify already holds the lock at .../a7.lock (pid <pid>, kind runner)."
+#        — the shell-kind immediate-refusal branch, not the wait loop.
+#   (c3) unset only FISHHAWK_VERIFY_LOCK_PATH (keep OWNER in the unset) ->
+#        (a7) RED: rc=0 (the nested verify degrades to deriving its own lock
+#        at $tmproot/a7repo/.git/fishhawk-verify.lock as this case expects),
+#        but NESTED_KIND:shell is MISSING — the inherited OWNER=runner makes
+#        the nested verify acquire ITS OWN lock as kind runner instead
+#        (a7.out carries "NESTED_KIND:runner"), so the grep for
+#        'NESTED_KIND:shell' fails and the case goes red.
+kill "$a7_holder" 2>/dev/null
+eval "$a7_saved_trap"
+
 # ---------------------------------------------------------------------------
 # (b) _patch_cov_base ladder.
 # ---------------------------------------------------------------------------
@@ -585,18 +682,30 @@ _verify_schema_sync() { :; }
 # MUST be stubbed: the real one re-executes THIS harness (cmd_verify runs both
 # gate harnesses), which would recurse without bound.
 _verify_gate_harnesses() { :; }
-cmd_test() { echo "PLAIN_TEST"; }
 cmd_test_with_patch_coverage() { echo "COV_TEST:$1"; }
 _verify_patch_coverage() { echo "COV_GATE:$1"; }
+
+# #3451, layer 2: this block drives the REAL cmd_verify, which acquires the
+# REAL verify lock. Export a HARNESS-OWNED lock path (never the runner-injected
+# override — a by-hand `scripts/test-patch-coverage` run under an inherited
+# FISHHAWK_VERIFY_LOCK_PATH/OWNER=runner env must not have its nested verifies
+# contend on that inherited key) and unset OWNER so every (f) case acquires as
+# shell-kind. cmd_test is extended to report the lock path it observed so (f1)
+# can assert both the key used and that it is released when cmd_verify returns.
+export FISHHAWK_VERIFY_LOCK_PATH="$tmproot/f-verify.lock"
+unset FISHHAWK_VERIFY_LOCK_OWNER
+cmd_test() { echo "PLAIN_TEST"; echo "LOCK_HELD:$VERIFY_LOCK_HELD"; }
 
 ROOT="$tmproot/testonly"          # a _test.go-only diff -> nothing to gate
 out="$(cmd_verify 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
    && printf '%s' "$out" | grep -q 'no changed Go packages' \
-   && ! printf '%s' "$out" | grep -q 'COV_GATE'; then
-  pass "(f1) no changed Go packages: plain cmd_test, printed reason, gate not run"
+   && ! printf '%s' "$out" | grep -q 'COV_GATE' \
+   && printf '%s' "$out" | grep -qF "LOCK_HELD:$tmproot/f-verify.lock" \
+   && [ ! -e "$tmproot/f-verify.lock" ]; then
+  pass "(f1) no changed Go packages: plain cmd_test, printed reason, gate not run, own lock key acquired and released"
 else
-  fail "(f1) no-changed-Go path (rc=$rc out='$out')"
+  fail "(f1) no-changed-Go path (rc=$rc out='$out' lock_exists=$([ -e "$tmproot/f-verify.lock" ] && echo yes || echo no))"
 fi
 
 ROOT="$tmproot/buckets"
@@ -644,6 +753,10 @@ if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
 else
   fail "(f6) git-absent path (rc=$rc out='$out')"
 fi
+
+# The (f) block's own lock override must not leak into later cases (the (g)
+# end-to-end block and everything after it resolve the lock the normal way).
+unset FISHHAWK_VERIFY_LOCK_PATH
 
 # ---------------------------------------------------------------------------
 # (g) END-TO-END across the shell layer: the real cmd_test_with_patch_coverage
