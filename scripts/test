@@ -1148,6 +1148,21 @@ _verify_patch_coverage() {
 # harness enforce anything: a harness that exists but is never invoked satisfies
 # the scope-completeness gate while enforcing nothing.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
+#
+# Every harness runs with FISHHAWK_VERIFY_LOCK_PATH and FISHHAWK_VERIFY_LOCK_OWNER
+# unset (#3451). A harness is a CHILD of the verify invocation that is already
+# holding the per-repository lock at that path (the runner injects both vars
+# into its gate env per ADR-063 / #2134). scripts/test-patch-coverage's (f)
+# block drives the REAL `cmd_verify` against its own temp git roots — if the
+# runner-injected override reached it unchanged, that nested cmd_verify would
+# resolve the PARENT verify's own lock, classify it live-runner (OWNER=runner),
+# wait up to 600s, and refuse: every runner-driven `scripts/test verify` on
+# main was RED this way (run be4f59f4). The unset uses the shell BUILTIN
+# `unset` in a subshell, never the external `env -u`: case (a5) in
+# scripts/test-patch-coverage drives this very loop under an EMPTY PATH, and
+# `env -u` would fail exec with 127 there instead of degrading. The subshell's
+# exit status still propagates to `set -e` in the caller, so a failing harness
+# still aborts the loop (a3).
 _verify_gate_harnesses() {
   local h
   for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope; do
@@ -1163,7 +1178,7 @@ _verify_gate_harnesses() {
       continue
     fi
     printf '>>> scripts/%s\n' "$h"
-    "$ROOT/scripts/$h"
+    ( unset FISHHAWK_VERIFY_LOCK_PATH FISHHAWK_VERIFY_LOCK_OWNER; "$ROOT/scripts/$h" )
   done
 }
 

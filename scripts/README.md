@@ -321,6 +321,19 @@ harness fails verify. `test-patch-coverage` must stub
 `_verify_gate_harnesses` wherever it calls the real `cmd_verify`, or it
 re-executes itself without bound.
 
+`_verify_gate_harnesses` runs every harness with `FISHHAWK_VERIFY_LOCK_PATH`
+and `FISHHAWK_VERIFY_LOCK_OWNER` unset (#3451): a harness is a CHILD of the
+verify invocation that is already holding the lock at that path, so an
+inherited override would make a harness's OWN nested `cmd_verify` (the
+`test-patch-coverage` (f) block) resolve the PARENT's lock instead of its own —
+see "The verify lock" below. The unset uses the shell BUILTIN `unset` in a
+subshell, never the external `env -u`, because case (a5) drives this loop
+under an EMPTY PATH and `env -u` would fail exec with 127 there. Pinned by
+`test-patch-coverage` (a7); the (f) block additionally exports its own
+harness-owned `FISHHAWK_VERIFY_LOCK_PATH` (OWNER left unset) so its nested
+verifies never contend even when the harness itself is run by hand under an
+inherited runner env.
+
 Binary-safe path handling is pinned on both sides with REAL files whose
 names carry a double quote, a backslash, a space and a non-ASCII
 character (`test-check-coverage` (p), `test-patch-coverage` (c7)) —
@@ -480,6 +493,15 @@ loser fails category-B behind a misleading scope-drift framing (#2645).
   against a holder at the override path, and shows the same run WITHOUT the
   variable never meets it) and, cross-boundary, by the runner's
   `TestRunnerEnvDrivesRealScriptsTestVerify` lock-path arm.
+- **Gate-harness carve-out** (#3451): `_verify_gate_harnesses` strips both
+  `FISHHAWK_VERIFY_LOCK_PATH` and `FISHHAWK_VERIFY_LOCK_OWNER` (builtin `unset`
+  in a subshell around each harness exec) before running any harness, because a
+  harness is a CHILD of the verify invocation already holding that lock.
+  Without the strip, a harness driving its own nested `cmd_verify`
+  (`test-patch-coverage`'s (f) block) inherits the override and classifies the
+  PARENT's own lock as `live-runner`, waiting out the budget and then refusing
+  — the 600s-per-harness counterfactual observed on every runner-driven verify
+  on `main`, run be4f59f4. Pinned by `test-patch-coverage` (a7).
 - **Primitive**: an atomic symlink whose TARGET is `<pid>:<kind>` — one
   `symlink(2)` that fails `EEXIST` if the path is taken, so the lock carries both
   its owner and its kind from the instant it exists. Same construction as the
