@@ -28,7 +28,9 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/agenteval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -4894,4 +4896,350 @@ func lastAppendedByCategory(t *testing.T, au *auditFake, category string) audit.
 	}
 	t.Fatalf("no appended %s entry", category)
 	return audit.ChainAppendParams{}
+}
+
+// TestAcceptanceBodyCapValue pins maxAcceptanceBundleBytes at 256 KiB as a
+// PLAIN CONST (E72.11 / #3447; the #3106 rule — never an env knob). The
+// runner mirrors this value as upload.MaxAcceptanceVerdictBytes; the two must
+// move in lockstep (both READMEs state the mirror relationship).
+func TestAcceptanceBodyCapValue(t *testing.T) {
+	if maxAcceptanceBundleBytes != 256*1024 {
+		t.Fatalf("maxAcceptanceBundleBytes = %d, want 256*1024 (mirror: runner/internal/upload.MaxAcceptanceVerdictBytes)", maxAcceptanceBundleBytes)
+	}
+}
+
+// TestShipAcceptance_BodyTooLarge_LimitBytesDeclared pins that the 413 body
+// declares the cap the runner re-bounds to (details.limit_bytes) at the NEW
+// value — the runner's 413 re-bound reads it off the wire.
+func TestShipAcceptance_BodyTooLarge_LimitBytesDeclared(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, _, _ := newAcceptanceServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body := bytes.Repeat([]byte("x"), maxAcceptanceBundleBytes+1)
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413:\n%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Error struct {
+			Details struct {
+				LimitBytes int `json:"limit_bytes"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error.Details.LimitBytes != 256*1024 {
+		t.Errorf("error.details.limit_bytes = %d, want %d:\n%s", resp.Error.Details.LimitBytes, 256*1024, w.Body.String())
+	}
+}
+
+// largeAcceptanceBytes builds the #3447 done-means body: 25 criteria, each
+// carrying ~2 KiB of observed + steps_taken prose, plus a 25-entry
+// runner-injected replay block with one passed scenario row per entry.
+func largeAcceptanceBytes(t *testing.T) []byte {
+	t.Helper()
+	prose := strings.Repeat("observed evidence line; ", 40) // ~1 KiB
+	rows := make([]acceptanceCriterionResult, 0, 50)
+	for i := 0; i < 25; i++ {
+		rows = append(rows, acceptanceCriterionResult{
+			ID: fmt.Sprintf("ac-%02d", i), Result: "passed",
+			Observed: prose, StepsTaken: prose,
+		})
+	}
+	scen := make([]acceptanceReplayedScenario, 0, 25)
+	for i := 0; i < 25; i++ {
+		id := fmt.Sprintf("scenario:s-%02d", i)
+		rows = append(rows, acceptanceCriterionResult{ID: id, Result: "passed", Observed: "replayed ok"})
+		scen = append(scen, acceptanceReplayedScenario{ScenarioID: id, OriginIssue: 1, OriginRunID: uuid.NewString(), Path: "acceptance/scenarios/s.yaml"})
+	}
+	body, err := json.Marshal(acceptanceBody{
+		Verdict:        "passed",
+		Criteria:       critRaw(rows...),
+		TargetURL:      "https://preview.example.test",
+		EvidenceHashes: json.RawMessage(`["sha256:abc"]`),
+		Replay: &acceptanceReplay{
+			Cap: 25, CorpusSize: 25, Served: 25, Seed: "seed", Scenarios: scen,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// TestShipAcceptance_25CriteriaWith2KBEvidence_Created is the #3447
+// done-means: a 25-criteria × ~2 KiB-evidence verdict plus a 25-scenario
+// replay block lands 201 without bounding. It FAILS on the old 32 KiB const
+// (the body is well over 32 KiB by construction — asserted below so the test
+// cannot go vacuous if the fixture shrinks).
+func TestShipAcceptance_25CriteriaWith2KBEvidence_Created(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedValidatedHead(au, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body := largeAcceptanceBytes(t)
+	if len(body) <= 32*1024 {
+		t.Fatalf("fixture is %d bytes; must exceed the old 32 KiB cap to be a done-means", len(body))
+	}
+	if len(body) > maxAcceptanceBundleBytes {
+		t.Fatalf("fixture is %d bytes; must fit the %d cap", len(body), maxAcceptanceBundleBytes)
+	}
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if n := countByCategory(au, CategoryAcceptanceOutcomeRecorded); n != 1 {
+		t.Fatalf("acceptance_outcome_recorded entries = %d, want 1", n)
+	}
+}
+
+// --- acceptance_verdict_unshipped gate table (E72.11 / #3447) ---
+
+// seedStageScoped seeds one stage-scoped entry of the given category at seq.
+func seedStageScoped(au *auditFake, runID, stageID uuid.UUID, category string, seq int64) {
+	rid, sid := runID, stageID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: category, Sequence: seq, Payload: []byte(`{}`),
+	})
+}
+
+// seedStageScopedOutcome seeds one stage-scoped acceptance_outcome_recorded
+// entry carrying the verdict at seq.
+func seedStageScopedOutcome(au *auditFake, runID, stageID uuid.UUID, seq int64, verdict string) {
+	rid, sid := runID, stageID
+	p, _ := json.Marshal(map[string]any{"verdict": verdict})
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: CategoryAcceptanceOutcomeRecorded, Sequence: seq, Payload: p,
+	})
+}
+
+// TestAcceptanceGateState_VerdictUnshipped drives the marker-liveness table
+// through acceptanceGateState. Named counterfactuals: deleting the ANCHOR
+// comparison (`markerSeq <= anchor`) in acceptanceVerdictUnshippedLive turns
+// "marker older than a later dispatch anchor" RED (it would classify
+// unshipped); deleting the pre-switch marker consult in acceptanceGateState
+// turns "live marker" and "stale earlier outcome + newer marker" RED.
+func TestAcceptanceGateState_VerdictUnshipped(t *testing.T) {
+	cases := []struct {
+		name string
+		seed func(au *auditFake, runID, stageID uuid.UUID)
+		want string
+	}{
+		{
+			name: "live marker, no outcome → unshipped",
+			seed: func(au *auditFake, runID, stageID uuid.UUID) {
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 2)
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceVerdictUnshipped, 9)
+			},
+			want: acceptanceGateVerdictUnshipped,
+		},
+		{
+			name: "marker older than a later dispatch anchor → not unshipped (retired)",
+			seed: func(au *auditFake, runID, stageID uuid.UUID) {
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 2)
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceVerdictUnshipped, 9)
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceReopened, 10)
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 11)
+			},
+			want: acceptanceGateOutcomeUnknown,
+		},
+		{
+			name: "marker older than a later stage-scoped outcome → that outcome's state",
+			seed: func(au *auditFake, runID, stageID uuid.UUID) {
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 2)
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceVerdictUnshipped, 9)
+				seedStageScopedOutcome(au, runID, stageID, 12, acceptanceVerdictPassed)
+			},
+			want: acceptanceGatePassed,
+		},
+		{
+			name: "stale earlier outcome + newer marker → unshipped (run-8b911565 shape)",
+			seed: func(au *auditFake, runID, stageID uuid.UUID) {
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 2)
+				seedStageScopedOutcome(au, runID, stageID, 5, acceptanceVerdictPassed)
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceReopened, 6)
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 7)
+				seedStageScoped(au, runID, stageID, CategoryAcceptanceVerdictUnshipped, 9)
+			},
+			want: acceptanceGateVerdictUnshipped,
+		},
+		{
+			name: "marker scoped to another stage → ignored",
+			seed: func(au *auditFake, runID, stageID uuid.UUID) {
+				seedStageScoped(au, runID, uuid.New(), CategoryAcceptanceVerdictUnshipped, 9)
+			},
+			want: acceptanceGateOutcomeUnknown,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au := newAcceptanceGateServer(t)
+			runID := uuid.New()
+			acc := acceptanceStage(runID, run.StageStateSucceeded)
+			tc.seed(au, runID, acc.ID)
+			got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), []*run.Stage{acc})
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if got != tc.want {
+				t.Errorf("state = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAcceptanceGateState_VerdictUnshipped_NotMergeAdmitting pins that the new
+// state is outside acceptanceGateAdmitsMerge (the shared predicate every
+// merge-adjacent consumer uses). Counterfactual: widen the predicate → RED.
+func TestAcceptanceGateState_VerdictUnshipped_NotMergeAdmitting(t *testing.T) {
+	if acceptanceGateAdmitsMerge(acceptanceGateVerdictUnshipped) {
+		t.Fatalf("acceptanceGateAdmitsMerge(%q) = true, want false", acceptanceGateVerdictUnshipped)
+	}
+	const want = "acceptance_verdict_unshipped"
+	for name, got := range map[string]string{
+		"gate state":     acceptanceGateVerdictUnshipped,
+		"drive rule":     string(drive.RuleAcceptanceVerdictUnshipped),
+		"audit category": CategoryAcceptanceVerdictUnshipped,
+	} {
+		if got != want {
+			t.Errorf("%s = %q, want %q (one literal across gate, drive and audit)", name, got, want)
+		}
+	}
+}
+
+// TestAcceptanceGateState_VerdictUnshippedMarkerReadError_FailsClosed: a read
+// error on the marker category is PROPAGATED, never resolved to a state.
+func TestAcceptanceGateState_VerdictUnshippedMarkerReadError_FailsClosed(t *testing.T) {
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &categoryErrAuditRepo{
+		auditFake:   au,
+		errCategory: CategoryAcceptanceVerdictUnshipped,
+		err:         errors.New("marker read boom"),
+	}})
+	runID := uuid.New()
+	acc := acceptanceStage(runID, run.StageStateSucceeded)
+	seedStageScopedOutcome(au, runID, acc.ID, 5, acceptanceVerdictPassed)
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), []*run.Stage{acc})
+	if err == nil {
+		t.Fatal("err = nil, want the propagated marker read error (fail-closed)")
+	}
+	if got != "" {
+		t.Errorf("state = %q, want empty on a read error", got)
+	}
+}
+
+// TestAcceptanceVerdictUnshipped_EndToEnd drives the E72.11 / #3447 seam as
+// ONE path through the real HTTP handlers with a sequence-stamping audit repo
+// (the shared auditFake reads every appended row back at sequence 0, which
+// would make marker liveness vacuous):
+//
+//	reap-failure on the succeeded acceptance stage → acceptance_verdict_unshipped
+//	marker → gate acceptance_verdict_unshipped → merge 409 → retry_stage re-open
+//	→ fresh acceptance_dispatched anchor → gate acceptance_pending → the re-run
+//	settles → the OLD marker is retired (gate settled-outcome-unknown, NOT
+//	unshipped) → a shipped outcome → gate passed → merge proceeds.
+//
+// The fresh dispatch anchor is appended directly, standing in for the
+// host-dispatch endpoint's emitHostDispatchAcceptanceAnchor (this test does not
+// spawn a runner).
+func TestAcceptanceVerdictUnshipped_EndToEnd(t *testing.T) {
+	merger := &fakeMerger{}
+	repo := &autoDriveRepo{driveE2ERepo: &driveE2ERepo{fakeRepo: newFakeRepo()}}
+	sa := newSeqAuditRepo(newAuditFake())
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		AuditRepo:    sa,
+		ConcernRepo:  newFakeConcernRepo(),
+		ApprovalRepo: newFakeApprovalRepo(),
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+		GateMerger:   merger,
+	})
+	runID := uuid.New()
+	stages := acceptanceMergeStages(runID, run.StageStateSucceeded)
+	runRow := seedMergeRun(t, repo, runID, run.StateRunning, mergePR, []byte(autoDriveAcceptanceSpecYAML), stages)
+	acc := stages[2]
+	ctx := context.Background()
+	gate := func() string {
+		t.Helper()
+		cur, err := repo.ListStagesForRun(ctx, runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := s.acceptanceGateState(ctx, runRow, cur)
+		if err != nil {
+			t.Fatalf("gate: %v", err)
+		}
+		return st
+	}
+	// First validation episode: the dispatch anchor, then the runner's trace
+	// upload settled the stage succeeded (seeded), then the verdict ship 413'd.
+	seedStageScoped(sa.auditFake, runID, acc.ID, CategoryAcceptanceDispatched, 2)
+
+	// 1. The detached reaper reports the non-zero exit → marker.
+	w := postReapFailure(t, s, runID, acc.ID,
+		reapFailureRequest{Category: "C", Reason: "acceptance_upload", Detail: "413 body_too_large", ExitCode: 1},
+		withReapOperator)
+	if w.Code != http.StatusOK || !bytes.Contains(w.Body.Bytes(), []byte(`"acceptance_verdict_unshipped_recorded":true`)) {
+		t.Fatalf("reap: status = %d body = %s, want 200 + acceptance_verdict_unshipped_recorded:true", w.Code, w.Body.String())
+	}
+	if got := gate(); got != acceptanceGateVerdictUnshipped {
+		t.Fatalf("gate after reap = %q, want %q", got, acceptanceGateVerdictUnshipped)
+	}
+
+	// 2. Merge refused 409 on the marker.
+	w = postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict || !bytes.Contains(w.Body.Bytes(), []byte(`"acceptance_gate_state":"acceptance_verdict_unshipped"`)) {
+		t.Fatalf("merge: status = %d body = %s, want 409 acceptance_verdict_unshipped", w.Code, w.Body.String())
+	}
+	if merger.called != 0 {
+		t.Fatalf("merger called %d times on an unshipped verdict, want 0", merger.called)
+	}
+
+	// 3. retry_stage re-opens the stage (the marker never blocks the reopen).
+	w = postRetry(t, s, acc.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry: status = %d body = %s, want 200", w.Code, w.Body.String())
+	}
+	cur, _ := repo.GetStage(ctx, acc.ID)
+	if cur.State.IsTerminal() {
+		t.Fatalf("stage state after reopen = %q, want non-terminal", cur.State)
+	}
+	if got := gate(); got != acceptanceGatePending {
+		t.Fatalf("gate after reopen = %q, want %q", got, acceptanceGatePending)
+	}
+
+	// 4. The re-dispatch appends a fresh anchor ABOVE the marker.
+	sid := acc.ID
+	if _, err := sa.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: runID, StageID: &sid, Timestamp: time.Now().UTC(),
+		Category: CategoryAcceptanceDispatched, Payload: []byte(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 5. The re-run settles succeeded again: the old marker is RETIRED by the
+	// anchor — the gate reads the ordinary settled-outcome-unknown hole, never
+	// the stale unshipped state.
+	repo.mu.Lock()
+	cur.State = run.StageStateSucceeded
+	repo.mu.Unlock()
+	if got := gate(); got != acceptanceGateOutcomeUnknown {
+		t.Fatalf("gate after re-dispatch anchor = %q, want %q (marker retired by construction)", got, acceptanceGateOutcomeUnknown)
+	}
+	// 6. The re-run's verdict ships → passed → merge proceeds.
+	if _, err := sa.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: runID, StageID: &sid, Timestamp: time.Now().UTC(),
+		Category: CategoryAcceptanceOutcomeRecorded, Payload: []byte(`{"verdict":"passed"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := gate(); got != acceptanceGatePassed {
+		t.Fatalf("gate after shipped verdict = %q, want %q", got, acceptanceGatePassed)
+	}
+	w = postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusOK || merger.called != 1 {
+		t.Fatalf("merge after recovery: status = %d merger.called = %d body = %s, want 200 / 1", w.Code, merger.called, w.Body.String())
+	}
 }

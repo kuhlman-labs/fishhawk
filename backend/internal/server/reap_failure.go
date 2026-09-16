@@ -182,6 +182,13 @@ func validateReapExpectedState(raw json.RawMessage) (conditional bool, expected 
 type reapFailureResponse struct {
 	Transitioned bool   `json:"transitioned"`
 	StageState   string `json:"stage_state"`
+	// AcceptanceVerdictUnshippedRecorded is true ONLY on the already-terminal
+	// no-op path when this call appended an acceptance_verdict_unshipped
+	// marker (E72.11 / #3447): the stage is a `succeeded` acceptance stage
+	// with no stage-scoped acceptance_outcome_recorded entry newer than its
+	// latest dispatch/reopen anchor and no live marker yet. omitempty so every
+	// other response body is byte-for-byte what it was.
+	AcceptanceVerdictUnshippedRecorded bool `json:"acceptance_verdict_unshipped_recorded,omitempty"`
 }
 
 // handleReapStageFailure implements
@@ -199,10 +206,15 @@ type reapFailureResponse struct {
 // best-effort logging order.
 //
 // Idempotent: a report against an already-terminal stage is a benign no-op
-// (200 {transitioned:false}) with NO audit entry and NO advance. A report
-// against an awaiting_children stage is the same benign no-op (#1891): that
-// state is a live decomposition park owned by its children, and failing it
-// would destroy the fan-in park a doomed mis-dispatched runner never owned.
+// (200 {transitioned:false}) with NO audit entry and NO advance — with ONE
+// named exception (E72.11 / #3447): an unconditional report against a
+// `succeeded` ACCEPTANCE stage whose verdict never shipped for the current
+// validation episode appends a stage-scoped acceptance_verdict_unshipped
+// marker (still no transition, no advance; see
+// recordAcceptanceVerdictUnshipped). A report against an awaiting_children
+// stage is the same benign no-op (#1891): that state is a live decomposition
+// park owned by its children, and failing it would destroy the fan-in park a
+// doomed mis-dispatched runner never owned.
 func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "reap_failure_unconfigured",
@@ -353,9 +365,26 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 	// stage would return a transition error, which we would otherwise have to
 	// classify here.
 	if stage.State.IsTerminal() {
+		// E72.11 / #3447: a `succeeded` ACCEPTANCE stage whose runner then
+		// exited non-zero is the verdict-unshipped shape — the trace upload
+		// settled the stage before the verdict ship failed (a 413). Record a
+		// NAMED, stage-scoped marker instead of the bare no-op so the gate,
+		// the drive observer and the MCP surface can classify it. No
+		// transition, no Advance. Type-gated: every other terminal stage keeps
+		// the byte-identical no-op. FAIL-CLOSED on the audit reads: a read
+		// error 500s so the reaper's bounded retry re-attempts rather than
+		// silently degrading to the pre-#3447 no-op.
+		recorded, rerr := s.recordAcceptanceVerdictUnshipped(r.Context(), runID, stage, req, cat)
+		if rerr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "acceptance_verdict_unshipped_record_failed",
+				"could not decide or record the acceptance_verdict_unshipped marker",
+				map[string]any{"stage_id": stageID.String(), "error": rerr.Error()})
+			return
+		}
 		s.writeJSON(w, r, http.StatusOK, reapFailureResponse{
-			Transitioned: false,
-			StageState:   string(stage.State),
+			Transitioned:                       false,
+			StageState:                         string(stage.State),
+			AcceptanceVerdictUnshippedRecorded: recorded,
 		})
 		return
 	}
@@ -560,6 +589,97 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		Transitioned: true,
 		StageState:   string(run.StageStateFailed),
 	})
+}
+
+// recordAcceptanceVerdictUnshipped is the already-terminal branch's
+// acceptance arm (E72.11 / #3447). It appends ONE chained, stage-scoped
+// acceptance_verdict_unshipped marker and returns true when ALL of:
+//   - stage.Type == acceptance and stage.State == succeeded (type gate: a
+//     terminal non-acceptance stage, or a failed/cancelled acceptance stage,
+//     is the unchanged no-op);
+//   - no stage-scoped acceptance_outcome_recorded entry is newer than the
+//     stage's latest dispatch/reopen anchor (the verdict for THIS episode never
+//     shipped — an outcome after the anchor means it did, and the reaper's
+//     non-zero exit was something else);
+//   - no LIVE marker already exists (idempotence: the reaper's bounded retry
+//     and a watchdog race must not stack markers).
+//
+// The payload is the dispatch_reaper_failed key set (run_id, stage_id,
+// failure_category, reason, detail, exit_code, reported_at, auth_method) so
+// the reaper's failure line is preserved verbatim on the chain. Every audit
+// read error is PROPAGATED (never a silent false) so the handler fails closed.
+func (s *Server) recordAcceptanceVerdictUnshipped(ctx context.Context, runID uuid.UUID, stage *run.Stage, req reapFailureRequest, cat run.FailureCategory) (bool, error) {
+	if stage.Type != run.StageTypeAcceptance || stage.State != run.StageStateSucceeded {
+		return false, nil
+	}
+	// Anchor: the newest validation episode for this stage. A read error on the
+	// dispatched anchor must not collapse into "no anchor" here (that is
+	// latestAcceptanceDispatchSeq's fail-closed-for-head-sha contract, not
+	// ours), so both anchors are read with the error surfaced.
+	dispatchSeq, err := s.newestStageScopedSeq(ctx, runID, stage.ID, CategoryAcceptanceDispatched)
+	if err != nil {
+		return false, err
+	}
+	reopenSeq, _, err := s.latestAcceptanceEpisodeRestartSeq(ctx, runID, stage.ID)
+	if err != nil {
+		return false, err
+	}
+	anchor := max(dispatchSeq, reopenSeq)
+	outcomeSeq, err := s.newestStageScopedSeq(ctx, runID, stage.ID, CategoryAcceptanceOutcomeRecorded)
+	if err != nil {
+		return false, err
+	}
+	// Outcome-after-anchor predicate: the verdict for this episode DID ship.
+	if outcomeSeq > anchor {
+		return false, nil
+	}
+	// Live-marker idempotence: one marker per episode.
+	if _, live, err := s.acceptanceVerdictUnshippedLive(ctx, runID, stage.ID); err != nil {
+		return false, err
+	} else if live {
+		return false, nil
+	}
+	stageIDCopy := stage.ID
+	systemKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":           runID.String(),
+		"stage_id":         stage.ID.String(),
+		"failure_category": string(cat),
+		"reason":           req.Reason,
+		"detail":           req.Detail,
+		"exit_code":        req.ExitCode,
+		"reported_at":      time.Now().UTC().Format(time.RFC3339Nano),
+		"auth_method":      "bearer",
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageIDCopy,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryAcceptanceVerdictUnshipped,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		return false, err
+	}
+	s.notifyStatusUpdate(ctx, runID, CategoryAcceptanceVerdictUnshipped)
+	return true, nil
+}
+
+// newestStageScopedSeq returns the highest audit sequence among the run's
+// entries of the given category scoped to stageID (0 when none), propagating
+// the read error.
+func (s *Server) newestStageScopedSeq(ctx context.Context, runID, stageID uuid.UUID, category string) (int64, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, category)
+	if err != nil {
+		return 0, err
+	}
+	var seq int64
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID && e.Sequence > seq {
+			seq = e.Sequence
+		}
+	}
+	return seq, nil
 }
 
 // reapFailMaxAttempts bounds reapFailCAS's re-anchor loop, mirroring run's
