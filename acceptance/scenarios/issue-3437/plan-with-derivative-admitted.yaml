@@ -1,0 +1,14 @@
+id: scenario:issue-3437/plan-with-derivative-admitted
+statement: 'A plan that scopes docs/api/v0.openapi.yaml together with site/src/content/docs/reference/api.md is admitted to the gate as today: no plan_generated_surface_retry entry is written and the plan stage reaches awaiting_approval.'
+verify_hint: GET /v0/runs/{run_id}/audit?category=plan_generated_surface_retry returns zero entries and GET /v0/runs/{run_id} shows the plan stage awaiting_approval.
+steps: 'POST /v0/dev/fixtures {scenario:trace-upload-target} -> 201 (run 30b321bf-851b-4937-b4a8-e972bc84e5e9, plan stage 5e82a2f8-af06-42a5-8671-e06f82118a42). POST /v0/runs/{run}/signing-key. Signed GET /v0/stages/{plan}/prompt -> 200 (stage running). Same plan as the refused case plus scope.files entry {path: site/src/content/docs/reference/api.md, operation: modify} and approach step 2 "Run scripts/gen-site-reference to regenerate ...". POST /v0/dev/sign over the bytes; POST /v0/runs/{run}/plan?stage_id={plan} -> 201 (content_hash 939fad04...). GET /v0/runs/{run}/audit?category=plan_generated_surface_retry; GET /v0/stages/{plan}.'
+assertions:
+    expected: Zero plan_generated_surface_retry entries; plan stage awaiting_approval.
+    observed_at_record: 'Audit: plan_generated, plan_scope_precheck (scanned_files 2, violations []), plan_surface_sweep (findings [], applied_exemptions []) and no plan_generated_surface_retry (category filter returns 0 items). Plan stage state awaiting_approval.'
+    repro_handle: curl http://localhost:8090/v0/stages/5e82a2f8-af06-42a5-8671-e06f82118a42
+origin:
+    issue: 3437
+    pr: 3459
+    run_id: 473e1d81-2915-4b08-92b9-540ba42e7580
+    head_sha: 908aaf0d0ac9aa96d2d7f83350dc812c2252ba1e
+    recorded_at: 2026-09-16T14:45:30Z
