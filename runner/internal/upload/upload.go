@@ -84,8 +84,19 @@ var (
 	// and ships the verdict WITHOUT a transcript ref (best-effort — a
 	// transcript problem never changes the verdict outcome).
 	ErrAcceptanceTranscriptInvalid = errors.New("upload: acceptance transcript rejected as invalid")
-	ErrAlreadyIssued               = errors.New("upload: signing key already issued for this run")
-	ErrNotFound                    = errors.New("upload: run or signing key not found")
+	// ErrAcceptanceBodyTooLarge surfaces when the backend refuses the
+	// acceptance verdict body 413 body_too_large (E72.11 / #3447). Permanent
+	// for THESE bytes, never retried; the concrete error is an
+	// *AcceptanceBodyTooLargeError carrying the backend-declared
+	// details.limit_bytes so the ship site can re-bound ONCE to the limit the
+	// backend actually enforces (version skew in either direction) and
+	// re-ship. A persistent 413 stays category-C at the call site but is
+	// logged as the NAMED acceptance_verdict_unshipped event, so the
+	// settled-outcome-unknown shape run 8b911565 stranded in is diagnosable
+	// from the runner log alone.
+	ErrAcceptanceBodyTooLarge = errors.New("upload: acceptance verdict rejected as too large")
+	ErrAlreadyIssued          = errors.New("upload: signing key already issued for this run")
+	ErrNotFound               = errors.New("upload: run or signing key not found")
 	// ErrUnsupportedStage means the backend has no prompt template
 	// for this stage type. Non-retryable; the runner should fail
 	// the stage rather than guess.
@@ -1657,6 +1668,9 @@ type ShipAcceptanceResult struct {
 //     category-B at the call site)
 //   - 401 signature_*        → ErrSignatureRejected
 //   - 404 stage/key          → ErrNotFound
+//   - 413 body_too_large     → *AcceptanceBodyTooLargeError (matches
+//     ErrAcceptanceBodyTooLarge; carries details.limit_bytes — the ship
+//     site re-bounds once to it, E72.11 / #3447)
 //
 // On 201 the backend created a fresh artifact; on 200 the upload
 // matched an existing one (Result.Idempotent==true).
@@ -1738,6 +1752,13 @@ func (c *Client) ShipAcceptance(ctx context.Context, args ShipAcceptanceArgs) (*
 		case resp.StatusCode == http.StatusNotFound:
 			_ = resp.Body.Close()
 			return nil, ErrNotFound
+		case resp.StatusCode == http.StatusRequestEntityTooLarge:
+			// 413 body_too_large (E72.11 / #3447): permanent for these bytes,
+			// never retried. Typed so the ship site can re-bound ONCE to the
+			// backend-declared limit; limit_bytes is 0 when absent.
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			return nil, &AcceptanceBodyTooLargeError{LimitBytes: parseErrorLimitBytes(detail), Detail: detail}
 		case resp.StatusCode >= 500:
 			lastErr = statusError("ship acceptance", resp)
 			_ = resp.Body.Close()
@@ -1976,6 +1997,317 @@ type pullRequestAcceptanceRetirementDroppedBody struct {
 	Outcome string                  `json:"outcome"`
 	Retired []scenario.RetiredEntry `json:"retired"`
 	Reason  string                  `json:"reason"`
+}
+
+// MaxAcceptanceVerdictBytes is the runner-side bound on the acceptance
+// verdict body shipped to POST /v0/runs/{run_id}/acceptance (E72.11 / #3447).
+// It MIRRORS the backend's maxAcceptanceBundleBytes
+// (backend/internal/server/acceptance.go, 256 KiB) — a plain const in both
+// modules (#3106 rule), kept in LOCKSTEP by hand because the two modules
+// cannot import each other; TestMaxAcceptanceVerdictBytesValue pins this
+// side's number and names the backend const to update with it. A skew in
+// either direction is absorbed at runtime, not by discovery: the backend
+// declares the limit it enforces as details.limit_bytes on its 413, and the
+// ship site re-bounds ONCE to that value (AcceptanceBodyTooLargeError). The
+// number matches the sibling transcript ship bound
+// (acceptanceTranscriptShipMaxBytes in runner/cmd/fishhawk-runner) for the
+// same reason: both endpoints cap at the same backend const.
+const MaxAcceptanceVerdictBytes = 256 * 1024
+
+// AcceptanceEvidenceFieldBytes is the STARTING per-field cap
+// BoundAcceptanceVerdict elides each criterion prose field (and the top-level
+// notes) to when the verdict is over MaxAcceptanceVerdictBytes; 2 KiB is the
+// per-criterion evidence size the 256 KiB backend cap was sized against (a 25
+// × ~2 KiB verdict plus a 25-scenario replay block lands with headroom), so
+// a verdict that is over the cap by prose alone usually fits after the first
+// pass. The ladder halves it toward MinAcceptanceEvidenceFieldBytes.
+const AcceptanceEvidenceFieldBytes = 2048
+
+// MinAcceptanceEvidenceFieldBytes is the per-field FLOOR of the elision
+// ladder: below 128 bytes a head+tail excerpt no longer carries the leading
+// classification and the trailing summary the elision exists to preserve, so
+// the ladder stops here, drops notes, and reports Fits=false rather than
+// shipping a verdict whose evidence is all marker.
+const MinAcceptanceEvidenceFieldBytes = 128
+
+// acceptanceProseKeys are the per-criterion fields BoundAcceptanceVerdict may
+// elide: agent-authored free text with no structural meaning to the backend.
+// id and result are NEVER touched (join key + enum the gate reads);
+// undecidable_reason IS elided but stays non-whitespace by construction (the
+// elision trims before cutting, so the head starts on a non-space byte), which
+// keeps the #2512 presence rule the backend re-validates.
+var acceptanceProseKeys = []string{
+	"observed", "expected", "steps_taken", "expectation_basis", "repro_handle", "undecidable_reason",
+}
+
+// AcceptanceBoundReport describes what BoundAcceptanceVerdict did to a body.
+type AcceptanceBoundReport struct {
+	// Bounded is true when the body was over maxBytes and elision ran; a
+	// body that already fit is returned byte-identical with Bounded=false.
+	Bounded bool
+	// Fits is true when the returned body is within maxBytes. Bounded &&
+	// !Fits means the ladder reached its floor (notes dropped, every prose
+	// field at MinAcceptanceEvidenceFieldBytes) and the body is STILL over —
+	// the caller ships it anyway and lets the backend's 413 name the strand.
+	Fits bool
+	// OriginalBytes / ShippedBytes are the input and output lengths.
+	OriginalBytes int
+	ShippedBytes  int
+	// FieldCapBytes is the per-field cap the returned body was elided at (0
+	// when not bounded); FieldsElided counts the prose fields (criteria rows
+	// + notes) whose text was actually cut at that cap.
+	FieldCapBytes int
+	FieldsElided  int
+	// NotesDropped is true when the top-level notes field was removed at the
+	// floor because the elided body still did not fit.
+	NotesDropped bool
+}
+
+// BoundAcceptanceVerdict bounds an ALREADY-VALIDATED, already-redacted
+// acceptance verdict body to maxBytes before it ships (E72.11 / #3447). A body
+// that already fits is returned BYTE-IDENTICAL (the ship signature is over
+// these bytes, and the common case must not be re-marshalled). Otherwise each
+// criteria row's prose fields (acceptanceProseKeys — only when the value is a
+// JSON string) and the top-level notes are elided to a rune-safe head+tail
+// excerpt with an explicit "… [truncated N bytes] …" marker (the #1791 / #3408
+// TruncateReason shape), the body is re-marshalled and MEASURED, and the
+// per-field cap is halved from AcceptanceEvidenceFieldBytes toward
+// MinAcceptanceEvidenceFieldBytes until the MARSHALLED body fits; at the floor
+// notes are dropped outright; a body still over then returns Fits=false with
+// a nil error (the caller ships and classifies on the backend's answer).
+//
+// Measuring the serialized form is the point (#2570): encoding/json HTML-
+// escapes <, > and & to six-byte sequences and replaces invalid UTF-8 with the
+// three-byte U+FFFD, so a raw-length clamp can GROW on re-marshal. Cuts land
+// on rune boundaries (utf8.RuneStart) for the same reason. Never touched:
+// verdict, failure_mode, criteria[].id, criteria[].result, target_url,
+// evidence_hashes, replay, transcript — the fields the backend gate, the
+// scenario attribution and the transcript cross-check read. The full
+// unbounded verdict still reaches the trace bundle's acceptance_evidence
+// event; only the wire body shrinks. A non-object, multi-object or null body
+// is refused with an error (the InjectReplay pattern).
+func BoundAcceptanceVerdict(body []byte, maxBytes int) ([]byte, AcceptanceBoundReport, error) {
+	rep := AcceptanceBoundReport{OriginalBytes: len(body), ShippedBytes: len(body)}
+	if maxBytes <= 0 {
+		return nil, rep, fmt.Errorf("upload: bound acceptance verdict: max bytes must be positive, got %d", maxBytes)
+	}
+	var fields map[string]json.RawMessage
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&fields); err != nil {
+		return nil, rep, fmt.Errorf("upload: bound acceptance verdict: verdict body is not a JSON object: %w", err)
+	}
+	if dec.More() {
+		return nil, rep, errors.New("upload: bound acceptance verdict: verdict body must be a single JSON object")
+	}
+	if fields == nil {
+		return nil, rep, errors.New("upload: bound acceptance verdict: verdict body is null")
+	}
+	if len(body) <= maxBytes {
+		rep.Fits = true
+		return body, rep, nil
+	}
+	rep.Bounded = true
+
+	// Decode the criteria rows ONCE; each ladder step re-elides from these
+	// originals (never from the previous step's output, so a marker is never
+	// truncated inside another marker).
+	var rows []map[string]json.RawMessage
+	if raw, ok := fields["criteria"]; ok {
+		if err := json.Unmarshal(raw, &rows); err != nil {
+			return nil, rep, fmt.Errorf("upload: bound acceptance verdict: criteria is not an array of objects: %w", err)
+		}
+	}
+	var notes string
+	hasNotes := false
+	if raw, ok := fields["notes"]; ok {
+		if err := json.Unmarshal(raw, &notes); err == nil {
+			hasNotes = true
+		}
+	}
+
+	for capBytes := AcceptanceEvidenceFieldBytes; ; capBytes /= 2 {
+		if capBytes < MinAcceptanceEvidenceFieldBytes {
+			capBytes = MinAcceptanceEvidenceFieldBytes
+		}
+		out, elided, err := marshalElidedVerdict(fields, rows, notes, hasNotes, capBytes)
+		if err != nil {
+			return nil, rep, err
+		}
+		rep.FieldCapBytes = capBytes
+		rep.FieldsElided = elided
+		rep.ShippedBytes = len(out)
+		if len(out) <= maxBytes {
+			rep.Fits = true
+			return out, rep, nil
+		}
+		if capBytes > MinAcceptanceEvidenceFieldBytes {
+			continue
+		}
+		// Floor reached: drop notes outright and re-measure once.
+		if hasNotes {
+			rep.NotesDropped = true
+			out, elided, err = marshalElidedVerdict(fields, rows, "", false, capBytes)
+			if err != nil {
+				return nil, rep, err
+			}
+			rep.FieldsElided = elided
+			rep.ShippedBytes = len(out)
+			if len(out) <= maxBytes {
+				rep.Fits = true
+				return out, rep, nil
+			}
+		}
+		rep.Fits = false
+		return out, rep, nil
+	}
+}
+
+// marshalElidedVerdict re-marshals fields with every criteria prose field and
+// the notes elided to capBytes, returning the body and the count of fields
+// whose text was actually cut. hasNotes=false removes the notes key entirely.
+func marshalElidedVerdict(fields map[string]json.RawMessage, rows []map[string]json.RawMessage, notes string, hasNotes bool, capBytes int) ([]byte, int, error) {
+	elided := 0
+	out := make(map[string]json.RawMessage, len(fields))
+	for k, v := range fields {
+		out[k] = v
+	}
+	if rows != nil {
+		bounded := make([]map[string]json.RawMessage, len(rows))
+		for i, row := range rows {
+			nrow := make(map[string]json.RawMessage, len(row))
+			for k, v := range row {
+				nrow[k] = v
+			}
+			for _, key := range acceptanceProseKeys {
+				raw, ok := row[key]
+				if !ok {
+					continue
+				}
+				var s string
+				if err := json.Unmarshal(raw, &s); err != nil {
+					continue // not a JSON string: never touched
+				}
+				cut := elideRunes(s, capBytes)
+				if cut == s {
+					continue
+				}
+				enc, err := json.Marshal(cut)
+				if err != nil {
+					return nil, 0, fmt.Errorf("upload: bound acceptance verdict: marshal %s: %w", key, err)
+				}
+				nrow[key] = enc
+				elided++
+			}
+			bounded[i] = nrow
+		}
+		enc, err := json.Marshal(bounded)
+		if err != nil {
+			return nil, 0, fmt.Errorf("upload: bound acceptance verdict: marshal criteria: %w", err)
+		}
+		out["criteria"] = enc
+	}
+	if hasNotes {
+		cut := elideRunes(notes, capBytes)
+		if cut != notes {
+			enc, err := json.Marshal(cut)
+			if err != nil {
+				return nil, 0, fmt.Errorf("upload: bound acceptance verdict: marshal notes: %w", err)
+			}
+			out["notes"] = enc
+			elided++
+		}
+	} else {
+		delete(out, "notes")
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil, 0, fmt.Errorf("upload: bound acceptance verdict: marshal verdict body: %w", err)
+	}
+	return b, elided, nil
+}
+
+// elideRunes is TruncateReason's head+tail elision cut on RUNE boundaries: a
+// string over max bytes is trimmed, then reduced to a head + a
+// "\n… [truncated N bytes] …\n" marker + a tail, with the head end snapped
+// backward and the tail start snapped forward via utf8.RuneStart so no
+// multi-byte character is split (a split byte would marshal as a three-byte
+// U+FFFD and GROW the body being bounded). The result never exceeds max and
+// is always valid UTF-8 when the input was. Trimming BEFORE cutting keeps a
+// non-whitespace input's head non-whitespace (the undecidable_reason
+// presence rule). A string that already fits is returned unchanged.
+func elideRunes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 0 {
+		return ""
+	}
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	const markerFmt = "\n… [truncated %d bytes] …\n"
+	upper := fmt.Sprintf(markerFmt, len(s))
+	keep := max - len(upper)
+	if keep <= 0 {
+		return clampRunes(s, max)
+	}
+	head := keep / 2
+	for head > 0 && !utf8.RuneStart(s[head]) {
+		head--
+	}
+	tailStart := len(s) - (keep - head)
+	if tailStart < head {
+		tailStart = head
+	}
+	for tailStart < len(s) && !utf8.RuneStart(s[tailStart]) {
+		tailStart++
+	}
+	elided := tailStart - head
+	marker := fmt.Sprintf(markerFmt, elided)
+	return s[:head] + marker + s[tailStart:]
+}
+
+// AcceptanceBodyTooLargeError is the concrete error behind
+// ErrAcceptanceBodyTooLarge (E72.11 / #3447): the backend's 413 body_too_large
+// answer to ShipAcceptance, carrying the details.limit_bytes it declared (0
+// when the response carried none — a backend older than the field). errors.Is
+// matches ErrAcceptanceBodyTooLarge.
+type AcceptanceBodyTooLargeError struct {
+	// LimitBytes is the backend-declared cap (details.limit_bytes), 0 if absent.
+	LimitBytes int
+	// Detail is the brief response body excerpt.
+	Detail string
+}
+
+func (e *AcceptanceBodyTooLargeError) Error() string {
+	return fmt.Sprintf("%s (limit_bytes=%d): %s", ErrAcceptanceBodyTooLarge.Error(), e.LimitBytes, e.Detail)
+}
+
+// Is makes errors.Is(err, ErrAcceptanceBodyTooLarge) true for the typed error.
+func (*AcceptanceBodyTooLargeError) Is(target error) bool {
+	return target == ErrAcceptanceBodyTooLarge
+}
+
+// parseErrorLimitBytes extracts error.details.limit_bytes from an error
+// envelope body, 0 when absent or unparseable (fail-open: the ship site
+// treats 0 as "no declared limit" and does not re-bound).
+func parseErrorLimitBytes(detail string) int {
+	var env struct {
+		Error struct {
+			Details struct {
+				LimitBytes int `json:"limit_bytes"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(detail), &env); err != nil {
+		return 0
+	}
+	if env.Error.Details.LimitBytes < 0 {
+		return 0
+	}
+	return env.Error.Details.LimitBytes
 }
 
 // InjectReplay sets the top-level `replay` field on an ALREADY-VALIDATED

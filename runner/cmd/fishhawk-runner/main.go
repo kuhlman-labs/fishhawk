@@ -2744,7 +2744,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// with the re-issued signing key. Mirrors the uploadPlan slot's
 		// classification contract: ErrAcceptanceInvalid (the backend
 		// rejected the verdict shape) is category-B — the agent's output
-		// is bad; everything else (network, 5xx-exhausted) is category-C
+		// is bad; everything else (network, 5xx-exhausted, a persistent
+		// 413 after the E72.11 bound + one re-bound) is category-C
 		// infra. Gated on res.OK, so a missing/invalid verdict (already
 		// demoted to B above) never ships, and only fires on the
 		// acceptance stage type.
@@ -2779,12 +2780,60 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 						cfg.runID, cfg.stageID, trRes.ID, trRes.ContentHash, trRes.Idempotent)
 				}
 			}
+			// Bound the wire body BEFORE shipping (E72.11 / #3447): a verdict
+			// over upload.MaxAcceptanceVerdictBytes (the runner's mirror of the
+			// backend's 256 KiB cap) has its per-criterion prose and notes
+			// elided to a rune-safe head+tail excerpt until the MARSHALLED body
+			// fits; one that already fits ships byte-identical. The FULL
+			// unbounded verdict is already on the trace bundle's
+			// acceptance_evidence event and stays the input to the scenario
+			// persistence below. A bound error means the validated verdict is
+			// not a JSON object — the agent's output is bad → category-B.
+			shipBody, boundRep, berr := upload.BoundAcceptanceVerdict(acceptanceVerdictRedacted, upload.MaxAcceptanceVerdictBytes)
+			if berr != nil {
+				res.OK = false
+				res.FailureCategory = "B"
+				res.FailureReason = berr.Error()
+				invokeErr = berr
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"acceptance_verdict_bound_failed","detail":%q}`+"\n", berr.Error())
+				logCompletion(logSink, res, invokeErr)
+				return exitFailure
+			}
+			logAcceptanceBounded := func(attempt int, rep upload.AcceptanceBoundReport) {
+				if !rep.Bounded {
+					return
+				}
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"acceptance_verdict_bounded","run_id":%q,"stage_id":%q,"attempt":%d,"original_bytes":%d,"shipped_bytes":%d,"field_cap_bytes":%d,"fields_elided":%d,"notes_dropped":%t,"fits":%t}`+"\n",
+					cfg.runID, cfg.stageID, attempt, rep.OriginalBytes, rep.ShippedBytes, rep.FieldCapBytes, rep.FieldsElided, rep.NotesDropped, rep.Fits)
+			}
+			logAcceptanceBounded(1, boundRep)
 			shipRes, err := client.ShipAcceptance(ctx, upload.ShipAcceptanceArgs{
 				RunID:      cfg.runID,
 				StageID:    cfg.stageID,
-				Body:       acceptanceVerdictRedacted,
+				Body:       shipBody,
 				PrivateKey: issuedKey.PrivateKey,
 			})
+			// A 413 carrying a backend-declared details.limit_bytes SMALLER
+			// than what we shipped means the mirror const is skewed (an older
+			// backend); re-bound ONCE to the declared limit and re-ship. A 413
+			// with no limit (0) or a limit we already satisfy is not
+			// re-bounded — a second attempt could not change the answer.
+			var tooLarge *upload.AcceptanceBodyTooLargeError
+			if errors.As(err, &tooLarge) && tooLarge.LimitBytes > 0 && tooLarge.LimitBytes < len(shipBody) {
+				rebound, rep2, rerr := upload.BoundAcceptanceVerdict(acceptanceVerdictRedacted, tooLarge.LimitBytes)
+				if rerr == nil {
+					shipBody = rebound
+					logAcceptanceBounded(2, rep2)
+					shipRes, err = client.ShipAcceptance(ctx, upload.ShipAcceptanceArgs{
+						RunID:      cfg.runID,
+						StageID:    cfg.stageID,
+						Body:       shipBody,
+						PrivateKey: issuedKey.PrivateKey,
+					})
+				}
+			}
 			if err != nil {
 				res.OK = false
 				if errors.Is(err, upload.ErrAcceptanceInvalid) {
@@ -2794,6 +2843,21 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				}
 				res.FailureReason = err.Error()
 				invokeErr = err
+				if errors.Is(err, upload.ErrAcceptanceBodyTooLarge) {
+					// Persistent 413: the verdict the agent produced is settled
+					// but NOT on the backend. Name it — the backend's reap-failure
+					// handler records the matching acceptance_verdict_unshipped
+					// audit marker from the runner_failed line that follows, so
+					// the operator sees a named state instead of
+					// settled-outcome-unknown (run 8b911565).
+					limit := 0
+					if errors.As(err, &tooLarge) {
+						limit = tooLarge.LimitBytes
+					}
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"acceptance_verdict_unshipped","run_id":%q,"stage_id":%q,"body_bytes":%d,"limit_bytes":%d,"detail":%q}`+"\n",
+						cfg.runID, cfg.stageID, len(shipBody), limit, err.Error())
+				}
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"runner_failed","reason":"acceptance_upload","detail":%q}`+"\n", err.Error())
 				logCompletion(logSink, res, invokeErr)

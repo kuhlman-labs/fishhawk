@@ -372,6 +372,14 @@ type fakeUploader struct {
 	gotMCPTokenArgs   *upload.FetchMCPTokenArgs
 	gotRetryArgs      []upload.RetryStageArgs
 	gotAcceptanceArgs *upload.ShipAcceptanceArgs
+	// Acceptance body-cap seam (E72.11 / #3447). When acceptanceLimitBytes > 0
+	// a ShipAcceptance body longer than it answers the backend's 413 shape —
+	// a typed *upload.AcceptanceBodyTooLargeError declaring that limit — so a
+	// test can model the mirror-const skew the ship site re-bounds against.
+	// acceptanceBodies records EVERY shipped body in order (gotAcceptanceArgs
+	// is last-wins), so the bound-then-re-bound sequence is observable.
+	acceptanceLimitBytes int
+	acceptanceBodies     [][]byte
 	// Progress-report seam (#2541): records every ReportStageProgress call,
 	// guarded by a mutex because the tee POSTs from an async goroutine.
 	progressMu      sync.Mutex
@@ -577,12 +585,19 @@ func (f *fakeUploader) ShipPlan(_ context.Context, args upload.ShipPlanArgs) (*u
 func (f *fakeUploader) ShipAcceptance(_ context.Context, args upload.ShipAcceptanceArgs) (*upload.ShipAcceptanceResult, error) {
 	a := args
 	f.gotAcceptanceArgs = &a
+	f.acceptanceBodies = append(f.acceptanceBodies, append([]byte(nil), args.Body...))
 	f.shipCallOrder = append(f.shipCallOrder, "acceptance")
 	if err := f.rejectIfStaleKey(args.PrivateKey); err != nil {
 		return nil, err
 	}
 	if f.acceptanceErr != nil {
 		return nil, f.acceptanceErr
+	}
+	if f.acceptanceLimitBytes > 0 && len(args.Body) > f.acceptanceLimitBytes {
+		return nil, &upload.AcceptanceBodyTooLargeError{
+			LimitBytes: f.acceptanceLimitBytes,
+			Detail:     fmt.Sprintf(`{"error":{"code":"body_too_large","details":{"limit_bytes":%d}}}`, f.acceptanceLimitBytes),
+		}
 	}
 	var acc struct {
 		Verdict     string `json:"verdict"`
