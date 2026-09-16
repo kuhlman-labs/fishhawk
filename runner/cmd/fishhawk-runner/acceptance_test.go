@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -1427,6 +1428,246 @@ func TestRun_AcceptanceStage_RedactionInShipAndBundle(t *testing.T) {
 		if strings.Contains(string(plain), secret) {
 			t.Errorf("credential survived into the %s bundle", call.Variant)
 		}
+	}
+}
+
+// --- E72.11 / #3447: acceptance verdict bound + 413 re-bound at the ship site
+
+// oversizedAcceptanceVerdict builds a served-criteria-valid verdict whose two
+// rows carry ~perField bytes of prose each with a sentinel buried in the MIDDLE
+// of every prose field, so an elided ship body loses the sentinel while the
+// trace bundle's full acceptance_evidence event keeps it.
+func oversizedAcceptanceVerdict(t *testing.T, perField int, sentinel string) []byte {
+	t.Helper()
+	prose := func(i int) string {
+		half := strings.Repeat("observed the preview answer correctly. ", perField/2/40+1)
+		return half + sentinel + fmt.Sprintf("-%d ", i) + half
+	}
+	body, err := json.Marshal(map[string]any{
+		"verdict": "passed",
+		"criteria": []map[string]any{
+			{"id": "AC1", "result": "passed", "observed": prose(1), "expected": prose(2), "steps_taken": prose(3)},
+			{"id": "AC2", "result": "undecidable", "undecidable_reason": prose(4), "observed": prose(5)},
+		},
+		"notes": prose(6),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// TestRun_AcceptanceStage_OversizedVerdict_ShipsBounded: a verdict over the
+// 256 KiB mirror cap ships BOUNDED (acceptance_verdict_bounded logged, body
+// under the cap, ids/results intact, sentinels elided) while the trace
+// bundle's acceptance_evidence event still carries the FULL verdict.
+func TestRun_AcceptanceStage_OversizedVerdict_ShipsBounded(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	const sentinel = "MIDDLE-SENTINEL-ELIDED"
+	verdict := oversizedAcceptanceVerdict(t, 96*1024, sentinel)
+	if len(verdict) <= upload.MaxAcceptanceVerdictBytes {
+		t.Fatalf("fixture must exceed the cap: %d", len(verdict))
+	}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: verdict}})
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"event":"acceptance_verdict_bounded"`) || !strings.Contains(out, `"attempt":1`) || !strings.Contains(out, `"fits":true`) {
+		t.Errorf("missing acceptance_verdict_bounded attempt-1 event: %s", out)
+	}
+	if strings.Contains(out, `"event":"acceptance_verdict_unshipped"`) {
+		t.Errorf("a bounded ship that succeeded must not log acceptance_verdict_unshipped: %s", out)
+	}
+	if len(fu.acceptanceBodies) != 1 {
+		t.Fatalf("ShipAcceptance calls = %d, want 1", len(fu.acceptanceBodies))
+	}
+	shipped := fu.acceptanceBodies[0]
+	if len(shipped) > upload.MaxAcceptanceVerdictBytes {
+		t.Errorf("shipped body = %d bytes, over the %d cap", len(shipped), upload.MaxAcceptanceVerdictBytes)
+	}
+	if bytes.Contains(shipped, []byte(sentinel)) {
+		t.Error("shipped body still carries the mid-field sentinel — prose was not elided")
+	}
+	var sb struct {
+		Verdict  string              `json:"verdict"`
+		Criteria []map[string]string `json:"criteria"`
+	}
+	if err := json.Unmarshal(shipped, &sb); err != nil {
+		t.Fatalf("shipped body not JSON: %v", err)
+	}
+	if sb.Verdict != "passed" || len(sb.Criteria) != 2 || sb.Criteria[0]["id"] != "AC1" || sb.Criteria[1]["result"] != "undecidable" {
+		t.Errorf("structural fields changed: %+v", sb)
+	}
+	if strings.TrimSpace(sb.Criteria[1]["undecidable_reason"]) == "" {
+		t.Error("undecidable_reason elided to whitespace")
+	}
+	// The trace bundle keeps the FULL verdict on acceptance_evidence.
+	if len(fu.gotShipCalls) != 2 {
+		t.Fatalf("ShipTrace calls = %d, want 2", len(fu.gotShipCalls))
+	}
+	for _, call := range fu.gotShipCalls {
+		plain, err := gunzip(call.Bundle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(plain, []byte("acceptance_evidence")) || !bytes.Contains(plain, []byte(sentinel+"-1 ")) {
+			t.Errorf("%s bundle's acceptance_evidence lost the full verdict", call.Variant)
+		}
+	}
+}
+
+// TestRun_AcceptanceStage_UnderCapVerdict_ShipsByteIdentical: the common case
+// is untouched — no bounded event, and the shipped bytes are exactly the
+// redacted (transcript-injected) verdict.
+func TestRun_AcceptanceStage_UnderCapVerdict_ShipsByteIdentical(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	verdict := []byte(`{"verdict":"passed",  "criteria":[{"id":"AC1","result":"passed","observed":"a <b> & c"}],"notes":"n"}`)
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: verdict}})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "acceptance_verdict_bounded") {
+		t.Errorf("under-cap verdict must not log acceptance_verdict_bounded: %s", stderr.String())
+	}
+	if len(fu.acceptanceBodies) != 1 {
+		t.Fatalf("ShipAcceptance calls = %d, want 1", len(fu.acceptanceBodies))
+	}
+	// The verdict passes through validation/redaction (which may
+	// re-marshal); the bound itself must not alter the bytes that reach the
+	// ship — assert the shipped body decodes to the same value AND the
+	// ship-site bound of those bytes is a no-op.
+	shipped := fu.acceptanceBodies[0]
+	rebound, rep, err := upload.BoundAcceptanceVerdict(shipped, upload.MaxAcceptanceVerdictBytes)
+	if err != nil || rep.Bounded || !bytes.Equal(rebound, shipped) {
+		t.Fatalf("bound of the shipped body is not a no-op: rep=%+v err=%v", rep, err)
+	}
+	var v struct {
+		Criteria []map[string]string `json:"criteria"`
+		Notes    string              `json:"notes"`
+	}
+	if err := json.Unmarshal(shipped, &v); err != nil || v.Notes != "n" || v.Criteria[0]["observed"] != "a <b> & c" {
+		t.Fatalf("shipped body altered: %s (%v)", shipped, err)
+	}
+}
+
+// TestRun_AcceptanceStage_413ThenRebound_Succeeds: the backend declares a
+// SMALLER limit than the runner's mirror (a skewed older backend). The first
+// ship is refused 413 with limit_bytes; the site re-bounds ONCE to that limit
+// and the second ship lands — exit OK, two ShipAcceptance calls, the second
+// under the declared limit, attempt:2 bounded event, no unshipped event.
+func TestRun_AcceptanceStage_413ThenRebound_Succeeds(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	// Below what the first 2 KiB-per-field pass yields (~12 KiB for six
+	// prose fields) so the first ship is genuinely refused.
+	const declared = 8 * 1024
+	fu.acceptanceLimitBytes = declared
+	verdict := oversizedAcceptanceVerdict(t, 96*1024, "MIDDLE-SENTINEL")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: verdict}})
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if len(fu.acceptanceBodies) != 2 {
+		t.Fatalf("ShipAcceptance calls = %d, want 2 (413 then re-bound)", len(fu.acceptanceBodies))
+	}
+	if len(fu.acceptanceBodies[0]) <= declared {
+		t.Errorf("first ship = %d bytes, should have exceeded the declared %d", len(fu.acceptanceBodies[0]), declared)
+	}
+	if len(fu.acceptanceBodies[1]) > declared {
+		t.Errorf("re-bound ship = %d bytes, over the declared %d", len(fu.acceptanceBodies[1]), declared)
+	}
+	if !strings.Contains(out, `"event":"acceptance_verdict_bounded"`) || !strings.Contains(out, `"attempt":2`) {
+		t.Errorf("missing attempt-2 bounded event: %s", out)
+	}
+	if strings.Contains(out, "acceptance_verdict_unshipped") || !strings.Contains(out, `"event":"acceptance_shipped"`) {
+		t.Errorf("re-bound ship must land as acceptance_shipped: %s", out)
+	}
+}
+
+// TestRun_AcceptanceStage_UnfittableLimit_CategoryC_Unshipped: the declared
+// limit is below what even the floor of the ladder can reach; the re-bound
+// ship is refused 413 again → category-C, the NAMED acceptance_verdict_unshipped
+// event (body/limit bytes) precedes runner_failed acceptance_upload, and no
+// third ship is attempted.
+func TestRun_AcceptanceStage_UnfittableLimit_CategoryC_Unshipped(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	fu.acceptanceLimitBytes = 512
+	verdict := oversizedAcceptanceVerdict(t, 96*1024, "MIDDLE-SENTINEL")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: verdict}})
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if len(fu.acceptanceBodies) != 2 {
+		t.Fatalf("ShipAcceptance calls = %d, want exactly 2 (one re-bound, never a third)", len(fu.acceptanceBodies))
+	}
+	unshipped := strings.Index(out, `"event":"acceptance_verdict_unshipped"`)
+	failed := strings.Index(out, `"reason":"acceptance_upload"`)
+	if unshipped < 0 || failed < 0 || unshipped > failed {
+		t.Fatalf("want acceptance_verdict_unshipped BEFORE runner_failed acceptance_upload: %s", out)
+	}
+	if !strings.Contains(out, `"limit_bytes":512`) || !strings.Contains(out, `"body_bytes":`) {
+		t.Errorf("unshipped event must carry body_bytes + limit_bytes: %s", out)
+	}
+	if !strings.Contains(out, `"category":"C"`) {
+		t.Errorf("persistent 413 must stay category-C: %s", out)
+	}
+}
+
+// TestRun_AcceptanceStage_413WithoutLimit_NoRebound: a 413 from a backend
+// that declares NO limit_bytes (0) is not re-bounded — a second attempt could
+// not change the answer — so exactly ONE ship happens, the stage fails
+// category-C and the unshipped event reports limit_bytes 0.
+func TestRun_AcceptanceStage_413WithoutLimit_NoRebound(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	fu.acceptanceErr = &upload.AcceptanceBodyTooLargeError{LimitBytes: 0, Detail: "too big"}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if len(fu.acceptanceBodies) != 1 {
+		t.Fatalf("ShipAcceptance calls = %d, want 1 (no declared limit → no re-bound)", len(fu.acceptanceBodies))
+	}
+	if !strings.Contains(out, `"event":"acceptance_verdict_unshipped"`) || !strings.Contains(out, `"limit_bytes":0`) ||
+		!strings.Contains(out, `"reason":"acceptance_upload"`) || !strings.Contains(out, `"category":"C"`) {
+		t.Errorf("want unshipped(limit 0) + acceptance_upload category-C: %s", out)
+	}
+}
+
+// TestRun_AcceptanceStage_413LimitAlreadyMet_NoRebound: a 413 whose declared
+// limit the shipped body ALREADY satisfies (a backend refusing for some other
+// reason under the 413 code) is not re-bounded either — the bound would be a
+// no-op and the re-ship a wasted identical request. One ship, category-C,
+// named unshipped event.
+func TestRun_AcceptanceStage_413LimitAlreadyMet_NoRebound(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	fu.acceptanceErr = &upload.AcceptanceBodyTooLargeError{LimitBytes: 1 << 20, Detail: "refused"}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if len(fu.acceptanceBodies) != 1 {
+		t.Fatalf("ShipAcceptance calls = %d, want 1 (limit already met → no re-bound)", len(fu.acceptanceBodies))
+	}
+	if out := stderr.String(); !strings.Contains(out, `"event":"acceptance_verdict_unshipped"`) || !strings.Contains(out, `"category":"C"`) {
+		t.Errorf("want unshipped + category-C: %s", out)
 	}
 }
 
