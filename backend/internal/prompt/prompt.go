@@ -2720,6 +2720,17 @@ func sanitizeScopePath(p string) string {
 	return s
 }
 
+// SanitizeScopePath is the exported wrapper over sanitizeScopePath (#3437 review).
+// The server's generated-surface refusal reason (generated_surface_gate.go)
+// interpolates plan-authored strings (a sub-plan title, canonical/derivative
+// paths, a generator command) into a stage FailureReason that is surfaced back
+// to agents and operators. Routing them through THIS function neutralizes their
+// line structure IDENTICALLY to the prompt-side restoration render rather than
+// growing a second, subtly weaker escaper — the whole reason this transform was
+// factored out. It stays pure and deterministic, so an ordinary path passes
+// through byte-unchanged.
+func SanitizeScopePath(p string) string { return sanitizeScopePath(p) }
+
 // neutralizeLineStructure is the line-safety transform sanitizeScopePath is
 // built on, factored out so any OTHER renderer that lands document-supplied
 // text inside a trusted prompt section escapes it IDENTICALLY rather than

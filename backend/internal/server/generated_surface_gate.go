@@ -138,15 +138,25 @@ func (s *Server) tryGeneratedSurfaceRetry(r *http.Request, runID, stageID uuid.U
 	// CAPPED at maxSchemaValidationErrorBytes exactly as the sibling scope-retry
 	// path caps its reason — a stage failure reason is surfaced back to agents
 	// and operators, so it must never outgrow the prompt-injection cap.
+	// Every plan-authored component (sub-plan title, canonical/derivative paths,
+	// generator command) is neutralized through prompt.SanitizeScopePath before
+	// it lands in the reason — the SAME transform the prompt-side restoration
+	// render applies (#3437 review). The reason is surfaced back to agents and
+	// operators, so a crafted sub-plan title carrying newlines must not inject
+	// prompt-shaped lines into that surface.
 	reasonParts := make([]string, 0, len(findings))
 	for _, f := range findings {
-		label := f.TriggerPath
+		label := prompt.SanitizeScopePath(f.TriggerPath)
 		if f.SubPlanTitle != "" {
-			label = "sub-plan \"" + f.SubPlanTitle + "\" " + f.TriggerPath
+			label = "sub-plan \"" + prompt.SanitizeScopePath(f.SubPlanTitle) + "\" " + prompt.SanitizeScopePath(f.TriggerPath)
+		}
+		missing := make([]string, 0, len(f.MissingTests))
+		for _, m := range f.MissingTests {
+			missing = append(missing, prompt.SanitizeScopePath(m))
 		}
 		reasonParts = append(reasonParts, fmt.Sprintf(
 			"canonical source %s scoped without its generated derivative(s) %s (regenerate with `%s`)",
-			label, strings.Join(f.MissingTests, ", "), f.Generator))
+			label, strings.Join(missing, ", "), prompt.SanitizeScopePath(f.Generator)))
 	}
 	reason := "plan_generated_surface_retry: " + strings.Join(reasonParts, "; ")
 	if len(reason) > maxSchemaValidationErrorBytes {
