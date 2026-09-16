@@ -163,6 +163,13 @@ The sweep this change owed. One row per fixed cap reachable while rendering a pl
 
 Read the table by its middle column: the caps that are **bounded by construction** (a repo path, a validator-generated error, a path list bounded by `max_files_changed`) are safe because no input can realistically reach them. The caps meeting **unbounded** text are safe only where a GATE refuses above them or the elision is LOUD. `MaxConditionBytes` is the one row that is neither — unbounded operator text against a bare cut — and it is deliberately left to #3063 rather than changed here.
 
+## Generated-surface derivative map + restoration (#3437)
+
+Two plan-stage `Trigger` fields, both nil/empty on every non-plan build (so those prompts render byte-unchanged) and threaded IN from the server (`prompt` cannot import `server`):
+
+- **`GeneratedSurfaceRelations []GeneratedSurfaceRelation`** — the `generated_surface` rule-table projection (`server.generatedSurfaceRelationsForPrompt`). `buildPlan` renders it, directly after the Surface-coupling sibling map, as a **Generated-surface derivative map** block: one `- <generator>: <trigger> generates [<derivatives>]` line per relation, prefaced with the notice that the plan gate REFUSES (with one bounded in-run re-dispatch) a plan scoping a canonical source without EVERY derivative in the SAME scope, plus the `surface_sweep_exemptions {"pattern": "<generator>", "sibling": "<derivative>"}` escape-hatch shape. Guarded on `len>0`.
+- **`GeneratedSurfaceRestoration *GeneratedSurfaceRestoration`** (`{Findings []GeneratedSurfaceRefusal; RefusedPlan *string}`) — set on the corrective re-dispatch after a refusal (`server.loadGeneratedSurfaceRestoration`). `buildPlan` renders a binding `### Generated-surface scope restoration (binding — this plan was REFUSED)` section: one line per finding (`[sub-plan "T": ]<trigger> generates <missing…> via `<generator>``, each path through `sanitizeScopePath` so a crafted path cannot break the line), the two admissible remedies (scope the derivative / declare the exemption), and — when `RefusedPlan` is non-nil — the refused plan via `writeRevisionBase` so the planner re-emits it with the derivatives added rather than replanning blank-slate. Nil (and empty `Findings`) omits the section; `RefusedPlan` is nil-safe.
+
 ## Structured scope amendment (#824)
 
 The approval request body carries an optional authoritative `add_scope_files []string` (`server/approvals.go`), recorded on the `approval_submitted` audit payload under `add_scope_files`.

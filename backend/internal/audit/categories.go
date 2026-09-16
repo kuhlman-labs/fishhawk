@@ -286,6 +286,7 @@ var KnownCategories = map[string]struct{}{
 	"plan_comment_only_override_refused":      {},
 	"plan_decomposed":                         {},
 	"plan_generated":                          {},
+	"plan_generated_surface_retry":            {},
 	"plan_missing_for_implement":              {},
 	"plan_missing_required_tests":             {},
 	"plan_periodic_budget_tier_acknowledged":  {},

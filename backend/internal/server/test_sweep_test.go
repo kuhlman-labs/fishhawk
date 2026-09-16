@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
 // Counterfactual record for #3203 (binding approval condition 3 — every
@@ -1285,5 +1286,236 @@ func TestShipPlan_TestSweep_FailOpenUploadStillSucceeds(t *testing.T) {
 	}
 	if n := countTestSweepEntries(au); n != 0 {
 		t.Fatalf("want no plan_test_sweep entry on fail-open, got %d", n)
+	}
+}
+
+// planForGate builds a plan.Plan value for the pure evaluateGeneratedSurfaceGate
+// tests: a flat parent scope, optional decomposition sub-plans, and optional
+// surface_sweep_exemptions — assembled directly (not via JSON) since the gate is
+// a pure function over the parsed plan.
+func mkScope(paths ...string) plan.Scope {
+	files := make([]plan.ScopeFile, 0, len(paths))
+	for _, p := range paths {
+		files = append(files, plan.ScopeFile{Path: p, Operation: plan.FileOpModify})
+	}
+	return plan.Scope{Files: files}
+}
+
+// TestEvaluateGeneratedSurfaceGate pins the pure gate evaluator (#3437): a
+// generated_surface miss fires; a scoped derivative is silent; the migration_walk
+// row is ignored (only generated_surface findings are kept); a partial exemption
+// keeps the remainder; a backslash-path exemption matches; sub-plan attribution;
+// and a two-generator trigger yields two findings.
+func TestEvaluateGeneratedSurfaceGate(t *testing.T) {
+	const (
+		openapi   = "docs/api/v0.openapi.yaml"
+		apiMd     = "site/src/content/docs/reference/api.md"
+		wmCanon   = "docs/spec/work-management-v0.schema.json"
+		wmBackend = "backend/internal/workmgmt/schemas/work-management-v0.schema.json"
+		wmCli     = "cli/internal/spec/schemas/work-management-v0.schema.json"
+		wf2Canon  = "docs/spec/workflow-v2.schema.json"
+		wf2Site   = "site/src/content/docs/reference/workflow-spec.md"
+		wf2Back   = "backend/internal/spec/schemas/workflow-v2.schema.json"
+		wf2Cli    = "cli/internal/spec/schemas/workflow-v2.schema.json"
+	)
+	tests := []struct {
+		name string
+		plan *plan.Plan
+		want []TestSweepFinding
+	}{
+		{
+			name: "missing derivative fires",
+			plan: &plan.Plan{Scope: mkScope(openapi)},
+			want: []TestSweepFinding{{
+				Rule:         testSweepRuleGeneratedSurface,
+				TriggerPath:  openapi,
+				MissingTests: []string{apiMd},
+				Generator:    testSweepGeneratorSiteReference,
+			}},
+		},
+		{
+			name: "scoped derivative silent",
+			plan: &plan.Plan{Scope: mkScope(openapi, apiMd)},
+			want: nil,
+		},
+		{
+			name: "migration_walk row ignored",
+			plan: &plan.Plan{Scope: mkScope("backend/internal/postgres/migrations/0099_x.up.sql")},
+			want: nil,
+		},
+		{
+			name: "partial exemption keeps remainder",
+			plan: &plan.Plan{
+				Scope: mkScope(wmCanon),
+				SurfaceSweepExemptions: []plan.SurfaceSweepExemption{
+					{Pattern: testSweepGeneratorSyncSchemas, Sibling: wmCli, Reason: "cli mirror byte-identical"},
+				},
+			},
+			want: []TestSweepFinding{{
+				Rule:         testSweepRuleGeneratedSurface,
+				TriggerPath:  wmCanon,
+				MissingTests: []string{wmBackend},
+				Generator:    testSweepGeneratorSyncSchemas,
+			}},
+		},
+		{
+			name: "full exemption drops finding",
+			plan: &plan.Plan{
+				Scope: mkScope(openapi),
+				SurfaceSweepExemptions: []plan.SurfaceSweepExemption{
+					{Pattern: testSweepGeneratorSiteReference, Sibling: apiMd, Reason: "comment-only"},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "mismatched exemption pattern does not exempt",
+			plan: &plan.Plan{
+				Scope: mkScope(openapi),
+				SurfaceSweepExemptions: []plan.SurfaceSweepExemption{
+					{Pattern: "not-the-generator", Sibling: apiMd, Reason: "wrong pattern"},
+				},
+			},
+			want: []TestSweepFinding{{
+				Rule:         testSweepRuleGeneratedSurface,
+				TriggerPath:  openapi,
+				MissingTests: []string{apiMd},
+				Generator:    testSweepGeneratorSiteReference,
+			}},
+		},
+		{
+			name: "backslash-path exemption matches",
+			plan: &plan.Plan{
+				Scope: mkScope(openapi),
+				SurfaceSweepExemptions: []plan.SurfaceSweepExemption{
+					{Pattern: testSweepGeneratorSiteReference, Sibling: `site\src\content\docs\reference\api.md`, Reason: "byte-identical"},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "sub-plan attribution",
+			plan: &plan.Plan{
+				Scope: mkScope("backend/internal/foo/foo.go"),
+				Decomposition: &plan.Decomposition{
+					SubPlans: []plan.SubPlanSummary{
+						{Title: "docs slice", Scope: ptrScope(mkScope(openapi))},
+					},
+				},
+			},
+			want: []TestSweepFinding{{
+				Rule:         testSweepRuleGeneratedSurface,
+				TriggerPath:  openapi,
+				MissingTests: []string{apiMd},
+				Generator:    testSweepGeneratorSiteReference,
+				SubPlanTitle: "docs slice",
+			}},
+		},
+		{
+			name: "two-generator trigger yields two findings",
+			plan: &plan.Plan{Scope: mkScope(wf2Canon)},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleGeneratedSurface,
+					TriggerPath:  wf2Canon,
+					MissingTests: []string{wf2Site},
+					Generator:    testSweepGeneratorSiteReference,
+				},
+				{
+					Rule:         testSweepRuleGeneratedSurface,
+					TriggerPath:  wf2Canon,
+					MissingTests: []string{wf2Back, wf2Cli},
+					Generator:    testSweepGeneratorSyncSchemas,
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := evaluateGeneratedSurfaceGate(tt.plan)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("evaluateGeneratedSurfaceGate() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func ptrScope(s plan.Scope) *plan.Scope { return &s }
+
+// TestGeneratedSurfaceGate_NilPlan pins the nil-plan fail-safe (an undecodable
+// body hands the gate a nil plan → no findings → no refusal).
+func TestGeneratedSurfaceGate_NilPlan(t *testing.T) {
+	if got := evaluateGeneratedSurfaceGate(nil); got != nil {
+		t.Errorf("evaluateGeneratedSurfaceGate(nil) = %+v, want nil", got)
+	}
+}
+
+// TestGeneratedSurfaceRelationsForPrompt_MirrorsRuleTable pins the projection to
+// the rule table as the single source of truth (#3437): every generated_surface
+// row appears in table order with the same trigger, derivatives, and generator,
+// and no other rule leaks in.
+func TestGeneratedSurfaceRelationsForPrompt_MirrorsRuleTable(t *testing.T) {
+	got := generatedSurfaceRelationsForPrompt()
+	var want []prompt.GeneratedSurfaceRelation
+	for _, r := range testSweepPathTriggerRules {
+		if r.Rule != testSweepRuleGeneratedSurface {
+			continue
+		}
+		want = append(want, prompt.GeneratedSurfaceRelation{
+			Trigger:     r.TriggerGlob,
+			Derivatives: append([]string(nil), r.RequiredPaths...),
+			Generator:   r.Generator,
+		})
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("generatedSurfaceRelationsForPrompt() diverged from the rule table:\n got = %+v\nwant = %+v", got, want)
+	}
+	// Count must equal the generated_surface row count — a new row without the
+	// projection picking it up (or vice-versa) fails here.
+	nRows := 0
+	for _, r := range testSweepPathTriggerRules {
+		if r.Rule == testSweepRuleGeneratedSurface {
+			nRows++
+		}
+	}
+	if len(got) != nRows {
+		t.Errorf("projection count = %d, want %d generated_surface rows", len(got), nRows)
+	}
+}
+
+// TestEvaluatePathTriggerRules_MatchesTestSweepPathFindings proves the #3437
+// extraction is inert: evaluatePathTriggerRules produces exactly the
+// path-trigger findings evaluateTestSweep emits (the two share the same table),
+// so pulling the loop out left the plan_test_sweep payload byte-identical.
+func TestEvaluatePathTriggerRules_MatchesTestSweepPathFindings(t *testing.T) {
+	scope := []plan.ScopeFile{
+		{Path: "docs/api/v0.openapi.yaml", Operation: plan.FileOpModify},
+		{Path: "backend/internal/postgres/migrations/0099_x.up.sql", Operation: plan.FileOpCreate},
+	}
+	// evaluateTestSweep with an empty listings map yields ONLY path-trigger
+	// findings (stem-sibling / new-test need listings), so its output is the
+	// path-trigger subset — which must equal evaluatePathTriggerRules run
+	// through the same dedup+sort.
+	full := evaluateTestSweep(scope, map[string][]string{}, defaultTestConventions)
+	raw := evaluatePathTriggerRules(scope)
+	raw = dedupTestSweepFindings(raw)
+	// evaluateTestSweep sorts (rule, trigger, generator); mirror that here.
+	sortFindings := func(fs []TestSweepFinding) {
+		for i := 1; i < len(fs); i++ {
+			for j := i; j > 0; j-- {
+				a, b := fs[j-1], fs[j]
+				less := a.Rule < b.Rule ||
+					(a.Rule == b.Rule && a.TriggerPath < b.TriggerPath) ||
+					(a.Rule == b.Rule && a.TriggerPath == b.TriggerPath && a.Generator < b.Generator)
+				if less {
+					break
+				}
+				fs[j-1], fs[j] = fs[j], fs[j-1]
+			}
+		}
+	}
+	sortFindings(raw)
+	if !reflect.DeepEqual(full, raw) {
+		t.Errorf("evaluateTestSweep path-trigger output diverged from evaluatePathTriggerRules:\n full = %+v\n raw  = %+v", full, raw)
 	}
 }

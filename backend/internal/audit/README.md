@@ -43,10 +43,12 @@ and append a fresh chained entry only when that count is below `maxEntries`,
 returning `ErrRetryBudgetExhausted` (writing nothing) when the budget is spent.
 The payload is built by a `stamp(attempt)` callback with `attempt = count+1`, so
 the recorded attempt number is truthful. They back the plan-retry budgets the
-server enforces on both the schema-retry (`plan_schema_retry`) and scope-retry
-(`plan_scope_retry`) paths, where the old count-then-append had a non-atomic
-window: two concurrent plan ships could both read a below-budget count and both
-consume the one-shot budget.
+server enforces on all three retry paths — the schema-retry (`plan_schema_retry`),
+scope-retry (`plan_scope_retry`), and generated-surface-retry
+(`plan_generated_surface_retry`, #3437) — where the old count-then-append had a
+non-atomic window: two concurrent plan ships could both read a below-budget count
+and both consume the one-shot budget. Each path counts its OWN category, so the
+three one-shot budgets are independent.
 
 **Ordering is load-bearing** and must stay: `LockRunForUpdate(run)` FIRST, THEN
 count, THEN append. Because the count runs *after* the row lock is granted, and

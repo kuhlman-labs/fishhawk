@@ -13264,6 +13264,10 @@ func TestPromptRender_NonGrooming_ByteIdenticalWithInertSeam(t *testing.T) {
 				golden.ImplementStageID = stageID.String()
 			} else {
 				golden.SurfaceCouplingPatterns = surfaceCouplingPatternsForPrompt()
+				// #3437: both plan-prompt handlers thread the generated-surface
+				// derivative map identically. Restoration stays nil — no refusal
+				// recorded in this inert-seam fixture.
+				golden.GeneratedSurfaceRelations = generatedSurfaceRelationsForPrompt()
 			}
 			want, err := prompt.Build(string(stageType), golden)
 			if err != nil {

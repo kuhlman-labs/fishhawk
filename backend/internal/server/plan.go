@@ -612,6 +612,43 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 		gatingRejected = s.tryScopeRetry(r, runID, stageID, regression, regressionBase)
 	}
 
+	// Decode the plan ONCE for the three server-authoritative gates below (the
+	// generated-surface refusal, the over-cap reject, the applies_to gate).
+	// json.Unmarshal, NOT plan.Parse: the body already passed plan.Validate
+	// (schema) above, and Parse additionally runs semanticCheck couplings that
+	// would pre-empt some of these gates (see the over-cap note below). A
+	// decode failure on schema-valid bytes is an internal inconsistency: the
+	// advisory gates fail OPEN (skip), the applies_to gate fails CLOSED (nil
+	// plan) — each documented at its call site.
+	var parsedForCap plan.Plan
+	capDecoded := json.Unmarshal(body, &parsedForCap) == nil
+
+	// Plan-gate generated-surface REFUSAL (#3437). The plan_test_sweep advisory
+	// above records a canonical source scoped without its generated derivative
+	// (a byte-exact site Reference region, an embedded schema/preset mirror),
+	// but the plan still walks to the gate, and BOTH plan reviewers reject/flag
+	// it every time (#3437) — the deterministic dual-reject class the surface
+	// sweep's own refusal (#2516 sibling) exists to close. Refuse it instead:
+	// evaluateGeneratedSurfaceGate re-derives the miss from the SAME rule table,
+	// INDEPENDENTLY of runTestSweep (which fails open with no GitHub client / no
+	// installation / failed listings), and tryGeneratedSurfaceRetry re-opens and
+	// re-dispatches the plan stage ONCE with the missing derivatives fed back —
+	// ZERO reviewer passes and ZERO operator add_scope_files grants spent. The
+	// exemption escape hatch (a surface_sweep_exemptions entry naming the
+	// generator as pattern and the derivative as sibling) is subtracted inside
+	// the evaluator for an edit that provably leaves the derivative byte-identical.
+	//
+	// Fail-open legs, all falling through UNCHANGED to today's advisory review:
+	// undecodable body (capDecoded false), nil Orchestrator/AuditRepo, budget
+	// exhausted. Skipped when the scope refusal already re-opened the stage
+	// (#2516): a stage is failed once. On false it falls through to the over-cap
+	// reject below on the same decoded struct.
+	if capDecoded && !gatingRejected {
+		if gs := evaluateGeneratedSurfaceGate(&parsedForCap); len(gs) > 0 {
+			gatingRejected = s.tryGeneratedSurfaceRetry(r, runID, stageID, gs)
+		}
+	}
+
 	// Plan-gate over-cap split rejection (E50.3 / #2055): the
 	// SERVER-AUTHORITATIVE, count-derived HARD reject — the E50 keystone. When
 	// scope.files exceeds the resolved implement-stage max_files_changed cap BY
@@ -642,9 +679,8 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// a stage is failed once, and layering the terminal category-B reject onto
 	// a stage already re-opened to pending would destroy the recoverable
 	// refusal. The refused plan is re-dispatched; its successor is evaluated
-	// against this gate when it ships.
-	var parsedForCap plan.Plan
-	capDecoded := json.Unmarshal(body, &parsedForCap) == nil
+	// against this gate when it ships. parsedForCap / capDecoded are the single
+	// decode hoisted above the generated-surface gate.
 	if capDecoded && !gatingRejected {
 		if reason := s.overCapSplitRejection(r.Context(), runID, &parsedForCap); reason != "" {
 			s.emitReviewFailed(r.Context(), runID, stageID, "plan_review_failed", planreview.AuthorityGating, "", reason, false)

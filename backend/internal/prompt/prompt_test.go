@@ -16069,3 +16069,186 @@ func TestWriteGateEvidence_OperatorScopeCumulative_PointsAtResponses(t *testing.
 		t.Errorf("stage-cumulative bullet must point at the responses block:\n%s", got)
 	}
 }
+
+// TestBuild_Plan_GeneratedSurfaceDerivativeMap_Rendered pins the first-shot
+// prevention block (#3437): the relations render with generator, trigger, each
+// derivative, the REFUSES wording, and the exemption JSON shape.
+func TestBuild_Plan_GeneratedSurfaceDerivativeMap_Rendered(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 3437,
+		IssueTitle:  "Plan a generated-surface change",
+		Repo:        "x/y",
+		GeneratedSurfaceRelations: []GeneratedSurfaceRelation{
+			{
+				Trigger:     "docs/api/v0.openapi.yaml",
+				Derivatives: []string{"site/src/content/docs/reference/api.md"},
+				Generator:   "scripts/gen-site-reference",
+			},
+			{
+				Trigger:     "docs/spec/workflow-v2.schema.json",
+				Derivatives: []string{"backend/internal/spec/schemas/workflow-v2.schema.json", "cli/internal/spec/schemas/workflow-v2.schema.json"},
+				Generator:   "scripts/sync-schemas",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Generated-surface derivative map (#3437)",
+		"the plan gate REFUSES",
+		"- scripts/gen-site-reference: docs/api/v0.openapi.yaml generates [site/src/content/docs/reference/api.md]",
+		"- scripts/sync-schemas: docs/spec/workflow-v2.schema.json generates [backend/internal/spec/schemas/workflow-v2.schema.json, cli/internal/spec/schemas/workflow-v2.schema.json]",
+		// the exemption escape-hatch shape.
+		"surface_sweep_exemptions",
+		"\"pattern\": \"<generator>\"",
+		"\"sibling\": \"<derivative>\"",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing generated-surface derivative-map anchor %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Plan_GeneratedSurfaceDerivativeMap_EmptyOmitsSubsection pins the
+// guard (#3437): with no relations the subsection must NOT render, keeping the
+// plan prompt byte-unchanged for a caller that threads none (and every non-plan
+// build).
+func TestBuild_Plan_GeneratedSurfaceDerivativeMap_EmptyOmitsSubsection(t *testing.T) {
+	got, err := Build("plan", Trigger{IssueNumber: 3437, Repo: "x/y"})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "Generated-surface derivative map") {
+		t.Errorf("derivative map must be omitted when no relations are threaded:\n%s", got)
+	}
+}
+
+// TestBuild_Plan_GeneratedSurfaceRestoration_Rendered pins the binding
+// restoration section (#3437): heading, each finding line, sub-plan prefix,
+// generator, both remedies, the refused-plan lead line, and sanitizeScopePath
+// neutralizing a newline-bearing path.
+func TestBuild_Plan_GeneratedSurfaceRestoration_Rendered(t *testing.T) {
+	refused := `{"plan_version":"standard_v1","summary":"refused"}`
+	got, err := Build("plan", Trigger{
+		IssueNumber: 3437,
+		Repo:        "x/y",
+		GeneratedSurfaceRestoration: &GeneratedSurfaceRestoration{
+			Findings: []GeneratedSurfaceRefusal{
+				{
+					TriggerPath: "docs/api/v0.openapi.yaml",
+					Missing:     []string{"site/src/content/docs/reference/api.md"},
+					Generator:   "scripts/gen-site-reference",
+				},
+				{
+					TriggerPath:  "docs/spec/workflow-v2.schema.json",
+					Missing:      []string{"backend/internal/spec/schemas/workflow-v2.schema.json"},
+					Generator:    "scripts/sync-schemas",
+					SubPlanTitle: "schema slice",
+				},
+				{
+					// a newline-bearing path must be neutralized, not break the line.
+					TriggerPath: "a/evil.go\ninjected banner",
+					Missing:     []string{"x/derived.md"},
+					Generator:   "scripts/gen-site-reference",
+				},
+			},
+			RefusedPlan: &refused,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Generated-surface scope restoration (binding — this plan was REFUSED)",
+		"was NOT admitted to review",
+		"- docs/api/v0.openapi.yaml generates site/src/content/docs/reference/api.md via `scripts/gen-site-reference`",
+		"sub-plan \"schema slice\": docs/spec/workflow-v2.schema.json generates backend/internal/spec/schemas/workflow-v2.schema.json via `scripts/sync-schemas`",
+		"1. SCOPE the derivative(s) into the SAME scope.files",
+		"2. DECLARE a top-level surface_sweep_exemptions entry",
+		"Refused plan (re-emit it with the derivative paths added",
+		// the newline-bearing path is neutralized to a visible \n, not a real break.
+		"a/evil.go\\ninjected banner generates x/derived.md",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing generated-surface restoration anchor %q:\n%s", w, got)
+		}
+	}
+	// The neutralization must have prevented a raw newline inside the bullet:
+	// no line may begin with "injected banner" at column 0.
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "injected banner") {
+			t.Errorf("newline-bearing path was NOT neutralized; a line began with the injected text:\n%s", got)
+		}
+	}
+}
+
+// TestBuild_Plan_GeneratedSurfaceRestoration_NilOmitsSection pins the guard: a
+// nil restoration (and an empty-Findings one) renders nothing.
+func TestBuild_Plan_GeneratedSurfaceRestoration_NilOmitsSection(t *testing.T) {
+	got, err := Build("plan", Trigger{IssueNumber: 3437, Repo: "x/y"})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "Generated-surface scope restoration") {
+		t.Errorf("restoration section must be omitted when nil:\n%s", got)
+	}
+	// Empty Findings also omits.
+	got2, err := Build("plan", Trigger{IssueNumber: 3437, Repo: "x/y",
+		GeneratedSurfaceRestoration: &GeneratedSurfaceRestoration{}})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got2, "Generated-surface scope restoration") {
+		t.Errorf("restoration section must be omitted when Findings is empty:\n%s", got2)
+	}
+}
+
+// TestBuild_Plan_GeneratedSurfaceRestoration_NilRefusedPlan pins that the
+// section renders without the refused-plan blob when RefusedPlan is nil (still
+// naming the derivatives).
+func TestBuild_Plan_GeneratedSurfaceRestoration_NilRefusedPlan(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 3437, Repo: "x/y",
+		GeneratedSurfaceRestoration: &GeneratedSurfaceRestoration{
+			Findings: []GeneratedSurfaceRefusal{{
+				TriggerPath: "docs/api/v0.openapi.yaml",
+				Missing:     []string{"site/src/content/docs/reference/api.md"},
+				Generator:   "scripts/gen-site-reference",
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### Generated-surface scope restoration") {
+		t.Errorf("section missing:\n%s", got)
+	}
+	if strings.Contains(got, "Refused plan (re-emit it") {
+		t.Errorf("refused-plan lead line must be omitted when RefusedPlan is nil:\n%s", got)
+	}
+	if !strings.Contains(got, "site/src/content/docs/reference/api.md") {
+		t.Errorf("missing derivative must still be named without the refused plan:\n%s", got)
+	}
+}
+
+// TestBuild_Implement_GeneratedSurfaceBlocks_Absent pins that neither #3437
+// block appears on a non-plan build even if the fields were (defensively) set —
+// buildImplement never reads them.
+func TestBuild_Implement_GeneratedSurfaceBlocks_Absent(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		IssueNumber:               3437,
+		Repo:                      "x/y",
+		GeneratedSurfaceRelations: []GeneratedSurfaceRelation{{Trigger: "docs/api/v0.openapi.yaml", Derivatives: []string{"site/x.md"}, Generator: "scripts/gen-site-reference"}},
+		GeneratedSurfaceRestoration: &GeneratedSurfaceRestoration{Findings: []GeneratedSurfaceRefusal{{
+			TriggerPath: "docs/api/v0.openapi.yaml", Missing: []string{"site/x.md"}, Generator: "scripts/gen-site-reference"}}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "Generated-surface derivative map") || strings.Contains(got, "Generated-surface scope restoration") {
+		t.Errorf("generated-surface blocks must not render on a non-plan build:\n%s", got)
+	}
+}

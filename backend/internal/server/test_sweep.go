@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -498,6 +499,160 @@ func dedupTestSweepFindings(findings []TestSweepFinding) []TestSweepFinding {
 	return out
 }
 
+// evaluatePathTriggerRules is the pure, scope-set-only matcher for the
+// testSweepPathTriggerRules table (extracted from evaluateTestSweep's inline
+// loop in #3437). For each scoped path matching a row's trigger glob it reports
+// the row's RequiredPaths absent from the scope set, carrying the row's
+// Generator on generated_surface findings. It consults NEITHER dirListings nor
+// the conventions — the triggers (migration .sql, the #3203 generated canonical
+// sources) are not production source files — so it fires even when every
+// directory listing failed open. path.Match errors only on a malformed pattern;
+// the table is curated constants, so a bad row simply never matches (fail-open).
+//
+// evaluateTestSweep calls it and merges its output into the combined finding
+// set; evaluateGeneratedSurfaceGate (#3437) calls it INDEPENDENTLY of
+// runTestSweep's GitHub-client preconditions to drive the deterministic
+// plan-gate refusal. The output is NOT deduped or sorted here — each caller
+// owns that (evaluateTestSweep dedups+sorts the combined set; the gate keeps
+// only generated_surface findings, subtracts exemptions, then dedups+sorts).
+func evaluatePathTriggerRules(scopeFiles []plan.ScopeFile) []TestSweepFinding {
+	scope := make(map[string]bool, len(scopeFiles))
+	for _, f := range scopeFiles {
+		scope[filepath.ToSlash(f.Path)] = true
+	}
+	var findings []TestSweepFinding
+	for _, f := range scopeFiles {
+		p := filepath.ToSlash(f.Path)
+		for _, rule := range testSweepPathTriggerRules {
+			if matched, _ := path.Match(rule.TriggerGlob, p); !matched {
+				continue
+			}
+			var missing []string
+			for _, req := range rule.RequiredPaths {
+				if !scope[req] {
+					missing = append(missing, req)
+				}
+			}
+			if len(missing) > 0 {
+				findings = append(findings, TestSweepFinding{
+					Rule:         rule.Rule,
+					TriggerPath:  p,
+					MissingTests: missing,
+					Generator:    rule.Generator,
+				})
+			}
+		}
+	}
+	return findings
+}
+
+// generatedSurfaceRelationsForPrompt maps the generated_surface rows of the
+// testSweepPathTriggerRules table into the prompt-package wire type so the
+// plan-stage prompt handler can thread the derivative map into the plan prompt
+// (#3437). The table stays the SINGLE SOURCE OF TRUTH — this accessor is a pure
+// structural projection with no second copy of the coupling knowledge, so a
+// row edit propagates to the prompt with no drift. Rows are emitted in table
+// order, mirroring surfaceCouplingPatternsForPrompt. Called only from the
+// StageTypePlan block of the two prompt handlers so the signed prompt and the
+// render preview stay byte-identical.
+func generatedSurfaceRelationsForPrompt() []prompt.GeneratedSurfaceRelation {
+	var out []prompt.GeneratedSurfaceRelation
+	for _, r := range testSweepPathTriggerRules {
+		if r.Rule != testSweepRuleGeneratedSurface {
+			continue
+		}
+		out = append(out, prompt.GeneratedSurfaceRelation{
+			Trigger:     r.TriggerGlob,
+			Derivatives: append([]string(nil), r.RequiredPaths...),
+			Generator:   r.Generator,
+		})
+	}
+	return out
+}
+
+// evaluateGeneratedSurfaceGate is the pure, scope-set-only evaluator behind the
+// deterministic plan-gate generated-surface REFUSAL (#3437). It runs
+// evaluatePathTriggerRules over the flat parent scope AND every decomposition
+// sub-plan scope (tagging findings with the sub-plan title), keeps ONLY
+// generated_surface findings, then subtracts every missing derivative for which
+// the plan declares a surface_sweep_exemptions entry whose (pattern, sibling)
+// equals (generator, derived path) — the escape hatch for an edit that
+// genuinely leaves the derivative byte-identical, since scoping a file the
+// implement pass never touches parks the scope-completeness gate. A finding
+// whose every missing path is exempted is dropped; a partial exemption keeps
+// the remainder. Output is deduped (rule, trigger, sub-plan, generator) and
+// sorted (rule, trigger, generator, sub-plan) for determinism.
+//
+// It consults NO dirListings and NO GitHub client, so it is INDEPENDENT of
+// runTestSweep's fail-open preconditions (nil GitHub client, no installation,
+// failed listings): the refusal fires on the scope set alone. A nil plan
+// demonstrates no scope and yields no findings.
+func evaluateGeneratedSurfaceGate(p *plan.Plan) []TestSweepFinding {
+	if p == nil {
+		return nil
+	}
+
+	var findings []TestSweepFinding
+	for _, f := range evaluatePathTriggerRules(p.Scope.Files) {
+		if f.Rule == testSweepRuleGeneratedSurface {
+			findings = append(findings, f)
+		}
+	}
+	if p.Decomposition != nil {
+		for _, sp := range p.Decomposition.SubPlans {
+			if sp.Scope == nil {
+				continue
+			}
+			for _, f := range evaluatePathTriggerRules(sp.Scope.Files) {
+				if f.Rule != testSweepRuleGeneratedSurface {
+					continue
+				}
+				f.SubPlanTitle = sp.Title
+				findings = append(findings, f)
+			}
+		}
+	}
+
+	// Subtract exemptions: (pattern, sibling) == (generator, derived path).
+	// toSlashPath normalizes a backslash-separated declared path so it still
+	// matches the slash-form generator/derivative (mirrors the surface sweep).
+	type exKey struct{ generator, path string }
+	exempt := make(map[exKey]bool, len(p.SurfaceSweepExemptions))
+	for _, e := range p.SurfaceSweepExemptions {
+		exempt[exKey{toSlashPath(e.Pattern), toSlashPath(e.Sibling)}] = true
+	}
+	var kept []TestSweepFinding
+	for _, f := range findings {
+		var remaining []string
+		for _, mp := range f.MissingTests {
+			if exempt[exKey{f.Generator, toSlashPath(mp)}] {
+				continue
+			}
+			remaining = append(remaining, mp)
+		}
+		if len(remaining) == 0 {
+			continue
+		}
+		f.MissingTests = remaining
+		kept = append(kept, f)
+	}
+
+	kept = dedupTestSweepFindings(kept)
+	sort.Slice(kept, func(i, j int) bool {
+		if kept[i].Rule != kept[j].Rule {
+			return kept[i].Rule < kept[j].Rule
+		}
+		if kept[i].TriggerPath != kept[j].TriggerPath {
+			return kept[i].TriggerPath < kept[j].TriggerPath
+		}
+		if kept[i].Generator != kept[j].Generator {
+			return kept[i].Generator < kept[j].Generator
+		}
+		return kept[i].SubPlanTitle < kept[j].SubPlanTitle
+	})
+	return kept
+}
+
 // evaluateTestSweep is the pure matcher (#942, generalized to data-driven
 // conventions in #1004). dirListings maps a slash-normalized directory
 // path to the base names of the files that exist in it on the base ref; a
@@ -554,33 +709,18 @@ func evaluateTestSweep(scopeFiles []plan.ScopeFile, dirListings map[string][]str
 
 	recognizers := testFileRecognizers(conventions)
 
-	var findings []TestSweepFinding
+	// Path-trigger rules run independent of the conventions and of
+	// dirListings (their triggers — migration .sql, the #3203 generated
+	// canonical sources — are not production source files), so they are
+	// evaluated by the pure evaluatePathTriggerRules helper up front. The
+	// output is byte-identical to the pre-extraction inline loop: the
+	// helper appends path-trigger findings in the same order, and the final
+	// dedup (keyed on rule, which the stem-sibling / new-test rules never
+	// share) plus the total sort below are unaffected by pulling the block
+	// out of the per-file loop.
+	findings := evaluatePathTriggerRules(scopeFiles)
 	for _, f := range scopeFiles {
 		p := filepath.ToSlash(f.Path)
-
-		// Path-trigger rules run independent of the conventions: their
-		// triggers (migration .sql files) are not production source files.
-		// path.Match errors only on a malformed pattern; the table is
-		// curated constants, so a bad row simply never matches (fail-open).
-		for _, rule := range testSweepPathTriggerRules {
-			if matched, _ := path.Match(rule.TriggerGlob, p); !matched {
-				continue
-			}
-			var missing []string
-			for _, req := range rule.RequiredPaths {
-				if !scope[req] {
-					missing = append(missing, req)
-				}
-			}
-			if len(missing) > 0 {
-				findings = append(findings, TestSweepFinding{
-					Rule:         rule.Rule,
-					TriggerPath:  p,
-					MissingTests: missing,
-					Generator:    rule.Generator,
-				})
-			}
-		}
 
 		base := path.Base(p)
 
