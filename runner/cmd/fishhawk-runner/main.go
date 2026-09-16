@@ -7136,7 +7136,10 @@ var runnerNow = time.Now
 // at mint. A GitHub App installation token lives ~1 hour, so a full-hour stage
 // can push the gate-verified commit successfully and then die `401 Bad
 // credentials` at PR-open, failing the whole stage after the work already landed
-// on the run branch.
+// on the run branch. Since #3443 the push path ALSO refreshes the token after
+// the verify hook (gitops RefreshPushToken), rebinding the credential this
+// helper receives — so the PR-open normally holds a seconds-old token and this
+// 401-reauth is the backstop for the forge write, not the primary defence.
 //
 // The contract, all three parts load-bearing:
 //
@@ -7790,23 +7793,34 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// Backend's githubapp.CachedProvider returns the cached token
 	// when it's still valid (with refresh-lead headroom) and mints
 	// a fresh one otherwise — either way the runner gets a token
-	// with maximum remaining life right when it needs to push.
+	// with at least RefreshLeadTime of remaining life NOW; the
+	// post-verify refresh below is what makes it fresh right when
+	// it needs to push (#3443).
 	//
-	// Audit gets two `installation_token_issued` events per
+	// Audit gets three `installation_token_issued` events per
 	// implement stage: the OIDC one at workflow start (used by
-	// actions/checkout) and the Ed25519 one here (used by push +
-	// PR). Both attribute to the App; auth_method on each entry
+	// actions/checkout), the Ed25519 one here, and the Ed25519
+	// post-verify refresh below (#3443, used by the lease ls-remote +
+	// push + PR). All attribute to the App; auth_method on each entry
 	// identifies which path served. (#201.)
 	//
-	// MINTING HERE IS NOT SUFFICIENT (#2730). This mint is at the TOP of the
-	// function, but the forge write is far below, AFTER CommitAndPush — whose
-	// committed-tree verify (and its verify-fix loop) can run for minutes. The
-	// backend cache only guarantees RefreshLeadTime (5m) of remaining life at
-	// mint (backend/internal/githubapp/cache.go), so the credential can die in
-	// that gap: the push on this token succeeds and the PR-open 401s, failing
-	// the whole stage after the gate-verified commit already landed. The
-	// PR-open call therefore routes through openChangeRequestWithReauth, which
-	// re-mints and re-attempts exactly once on a 401.
+	// MINTING HERE IS NOT SUFFICIENT — two layers close the gap. This mint
+	// is at the TOP of the function, but every authenticated write happens
+	// far below, AFTER CommitAndPush's VerifyCommit hook — the committed-tree
+	// gate plus, on verified_tree_mismatch, the FULL pushed-tree re-verify —
+	// which can hold the token for 25-30 minutes. The backend cache only
+	// guarantees RefreshLeadTime (5m) of remaining life at mint
+	// (backend/internal/githubapp/cache.go), so the credential can die in
+	// that gap. Layer one (#3443): the gitops RefreshPushToken hook below
+	// re-mints AFTER the verify hook returns and BEFORE the first post-verify
+	// git op (the lease ls-remote, then the push), and gitops retries an
+	// auth-rejected ls-remote/push exactly once on a further refresh — so the
+	// git ops never run on a token older than seconds. Layer two (#2730): the
+	// PR-open call routes through openChangeRequestWithReauth, which re-mints
+	// and re-attempts exactly once on a 401 — the backstop for the forge
+	// write. The refresh rebinds `token` + `tokenHeldSince`, so the PR-open
+	// also uses the freshest credential and its token_held_seconds measures
+	// from the refresh (still a lower bound on true token age).
 	token, err := mintImplementToken(ctx, cfg, client, issued, logSink)
 	if err != nil {
 		return err
@@ -7814,6 +7828,36 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	tokenHeldSince := runnerNow()
 	remintImplementToken := func(rctx context.Context) (string, error) {
 		return mintImplementToken(rctx, cfg, client, issued, logSink)
+	}
+	// refreshPushToken is the gitops RefreshPushToken hook (#3443): the
+	// ordering is mint (above) → VerifyCommit hook (possibly 30 min) →
+	// THIS refresh → lease ls-remote → push → PR-open. On success it emits
+	// push_token_refreshed and rebinds the held token; on failure — a mint
+	// error OR an empty token, which is a refresh failure, not a credential —
+	// it emits push_token_refresh_failed, leaves the held token bound, and
+	// returns the error so gitops degrades to the token it already holds
+	// (the verified commit must not die on a backend blip). token_held_seconds
+	// keeps its #2730 lower-bound meaning. GitLab's static
+	// FISHHAWK_GITLAB_TOKEN and the gh-CLI fallback flow through unchanged
+	// (same token, changed:false).
+	refreshPushToken := func(rctx context.Context) (string, error) {
+		heldSeconds := int64(runnerNow().Sub(tokenHeldSince) / time.Second)
+		fresh, mintErr := mintImplementToken(rctx, cfg, client, issued, logSink)
+		if mintErr == nil && fresh == "" {
+			mintErr = errors.New("the credential mint returned an empty token")
+		}
+		if mintErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"push_token_refresh_failed","run_id":%q,"stage_id":%q,"token_held_seconds":%d,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, heldSeconds, mintErr.Error())
+			return "", mintErr
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"push_token_refreshed","run_id":%q,"stage_id":%q,"token_held_seconds":%d,"changed":%t}`+"\n",
+			cfg.runID, cfg.stageID, heldSeconds, fresh != token)
+		token = fresh
+		tokenHeldSince = runnerNow()
+		return fresh, nil
 	}
 
 	// Repo: --github-repo flag > GITHUB_REPOSITORY env. The flag
@@ -8492,6 +8536,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// including the decomposed-child path (#766, see above) — the gate
 		// runs on every implement push.
 		VerifyCommit: verifyCommit,
+		// Post-verify push-token refresh (#3443): mint at the top of this
+		// function → VerifyCommit (possibly 30 min on the pushed-tree
+		// re-verify) → refresh → lease ls-remote → push. Without it the
+		// first post-verify git op ran on a token the backend served with
+		// as little as 5 min of life, failing category-C `Invalid username
+		// or token` with the verified commit stranded locally.
+		RefreshPushToken: refreshPushToken,
 	})
 	if err != nil {
 		return fmt.Errorf("commit+push: %w", err)

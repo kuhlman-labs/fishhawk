@@ -409,6 +409,8 @@ type CommitAndPushArgs struct {
 	//
 	// Empty value (the default) means "use ambient auth" — caller trusts
 	// whatever extraheader the environment (e.g. actions/checkout) set up.
+	// It is the PRE-verify credential; see RefreshPushToken for the
+	// post-verify refresh the lease ls-remote and push run on (#3443).
 	PushToken string
 
 	// ForceWithLease, when true, adds --force-with-lease to the push
@@ -523,6 +525,30 @@ type CommitAndPushArgs struct {
 	// caller-supplied callback keeps gitops toolchain-agnostic. Never
 	// invoked on the NoChanges short-circuit paths.
 	VerifyCommit func(ctx context.Context, headSHA string, drift []string) error
+
+	// RefreshPushToken, when non-nil, re-resolves the push credential AFTER
+	// the VerifyCommit hook returns and BEFORE the first post-verify
+	// authenticated git op (observeRemoteHead's lease ls-remote, then the
+	// push), rebuilding the process-scoped auth via authConfigEnv(RemoteURL,
+	// fresh) (#3443). The fault it closes: PushToken is minted at the top of
+	// the runner's push path, but VerifyCommit — the committed-tree gate and,
+	// on verified_tree_mismatch, the FULL pushed-tree re-verify — can hold it
+	// for 25-30 minutes, and the backend's CachedProvider guarantees only ~5
+	// minutes of remaining life at mint. So the very first post-verify op
+	// could fail `remote: Invalid username or token` on a token that was
+	// valid when handed in.
+	//
+	// Contract: called EXACTLY ONCE on the post-verify path. A non-nil error
+	// OR an empty token is a refresh FAILURE — the held auth is kept and the
+	// failure is recorded, never aborting the verified commit on a backend
+	// blip; it is annotated onto any subsequent auth rejection. The hook is
+	// then ALSO the retry credential: an auth-rejected ls-remote or push
+	// (isRemoteAuthRejected) refreshes and re-attempts EXACTLY ONCE per op.
+	// The pre-verify FreshFetchBase / RebaseFromRemote fetches deliberately
+	// keep the initial PushToken — they run seconds after the mint. A nil
+	// hook keeps the single-token behavior byte-identical (no refresh, no
+	// auth-rejected retry).
+	RefreshPushToken func(ctx context.Context) (string, error)
 }
 
 // CommitAndPushResult captures the SHAs the runner needs to populate
@@ -835,13 +861,22 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		}
 	}
 
-	// authEnv (computed once above) carries the freshly-minted run token to
-	// the push as process-scoped git config. This is the long-running-stage
-	// path: the workflow's initial actions/checkout set an extraheader with
-	// the auth pre-step's token, but App installation tokens are ~1-hour TTL —
-	// agents that take >55min outlive the original. The runner pre-fetches a
-	// fresh token and hands it here so the push always authenticates with a
-	// non-expired credential, without persisting it to any config file (#1933).
+	// Post-verify push-token refresh (#3443). authEnv was built from the
+	// token the runner minted BEFORE the VerifyCommit hook above, which can
+	// run for 25-30 minutes on the pushed-tree re-verify path — long enough
+	// for a token the backend served with ~5 minutes of life to expire. So
+	// when the caller supplied RefreshPushToken, re-resolve the credential
+	// NOW, after verify and before the first post-verify authenticated op
+	// (the lease ls-remote, then the push). A failed refresh (error or empty
+	// token) keeps the held authEnv and is recorded on auth — the verified
+	// commit must not die on a backend blip; the auth-rejected retry inside
+	// authedRemoteOp gives it one more chance per op. Nothing is persisted
+	// to any config file on either token (#1933).
+	auth := &pushAuth{env: authEnv}
+	if args.RefreshPushToken != nil {
+		auth.refreshErr = auth.refresh(ctx, args)
+	}
+
 	pushArgs := []string{"push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch)}
 	if args.ForceWithLease {
 		// A *bare* --force-with-lease compares the push against the local
@@ -864,7 +899,12 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 			// the remote head DIRECTLY via ls-remote and bind the lease to it.
 			// A stale self-owned ref is overwritten exactly as observed, while a
 			// ref that MOVED after observation still fails the lease.
-			observed, lsErr := p.observeRemoteHead(ctx, args.RepoDir, args.RemoteURL, args.Branch, authEnv)
+			var observed string
+			lsErr := p.authedRemoteOp(ctx, args, auth, func(env []string) error {
+				var err error
+				observed, err = p.observeRemoteHead(ctx, args.RepoDir, args.RemoteURL, args.Branch, env)
+				return err
+			})
 			if lsErr != nil {
 				return nil, fmt.Errorf("gitops: observe remote head for lease: %w", lsErr)
 			}
@@ -879,7 +919,9 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 			pushArgs = append(pushArgs, lease)
 		}
 	}
-	if err := p.runEnv(ctx, args.RepoDir, authEnv, pushArgs...); err != nil {
+	if err := p.authedRemoteOp(ctx, args, auth, func(env []string) error {
+		return p.runEnv(ctx, args.RepoDir, env, pushArgs...)
+	}); err != nil {
 		return nil, fmt.Errorf("gitops: push %s: %w", remote, err)
 	}
 
@@ -1751,6 +1793,118 @@ func (p *Pusher) observeRemoteHead(ctx context.Context, repoDir, remoteURL, bran
 		return fields[0], nil
 	}
 	return "", nil
+}
+
+// pushAuth is the mutable process-scoped auth the post-verify git ops run
+// under: env is authConfigEnv's GIT_CONFIG_* entries (nil = ambient auth) and
+// refreshErr is the most recent FAILED RefreshPushToken call, cleared once a
+// refresh succeeds, so an auth rejection can name the refresh failure that
+// preceded it (#3443).
+type pushAuth struct {
+	env        []string
+	refreshErr error
+}
+
+// refresh calls args.RefreshPushToken exactly once and, on success, rebuilds
+// env from the fresh token. A non-nil error OR an empty token is a refresh
+// FAILURE: env is left holding the credential it already had (an empty token
+// would otherwise yield authConfigEnv's nil — an UNauthenticated op — which
+// is strictly worse than retrying the held one) and the failure is returned
+// for the caller to record, never to abort on.
+func (a *pushAuth) refresh(ctx context.Context, args CommitAndPushArgs) error {
+	fresh, err := args.RefreshPushToken(ctx)
+	if err != nil {
+		return err
+	}
+	if fresh == "" {
+		return errors.New("RefreshPushToken returned an empty token")
+	}
+	env, err := authConfigEnv(args.RemoteURL, fresh)
+	if err != nil {
+		return err
+	}
+	a.env = env
+	a.refreshErr = nil
+	return nil
+}
+
+// authedRemoteOpEnvPins are appended to the env of every git invocation
+// authedRemoteOp runs: GIT_TERMINAL_PROMPT=0 so a rejected credential fails
+// fast (`could not read Username`) instead of blocking on a tty prompt, and
+// LC_ALL=C + LANG=C so git's client-side wording is the English text
+// isRemoteAuthRejected matches regardless of the host locale. Later entries
+// win in exec's environment, so these override any inherited value.
+var authedRemoteOpEnvPins = []string{"GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "LANG=C"}
+
+// authedRemoteOp runs one post-verify authenticated git op (the lease
+// ls-remote or the push) under auth.env plus authedRemoteOpEnvPins. When the
+// op fails with an auth rejection (isRemoteAuthRejected) AND the caller
+// supplied RefreshPushToken, it refreshes the credential and re-runs the op
+// EXACTLY ONCE — straight-line code, never a loop — so a runner whose
+// post-verify refresh fell through on a failed refresh still gets one more
+// chance instead of a terminal category-C with the verified commit stranded
+// locally (#3443). Every other failure (network, non-fast-forward, a lease
+// rejection) is returned as the SAME error value: no refresh, no second
+// attempt. A second auth rejection is wrapped `after push-token refresh:`;
+// a failed retry refresh is annotated onto the original rejection; and a
+// post-verify refresh that had already failed (auth.refreshErr) is named on
+// either path so the record shows both faults.
+func (*Pusher) authedRemoteOp(ctx context.Context, args CommitAndPushArgs, auth *pushAuth, op func(env []string) error) error {
+	err := op(auth.pinnedEnv())
+	if err == nil || !isRemoteAuthRejected(err) || args.RefreshPushToken == nil {
+		return err
+	}
+	priorNote := ""
+	if auth.refreshErr != nil {
+		priorNote = fmt.Sprintf("; the post-verify push-token refresh had already failed: %v", auth.refreshErr)
+	}
+	if rerr := auth.refresh(ctx, args); rerr != nil {
+		return fmt.Errorf("%w (push-token refresh after auth rejection also failed: %v%s)", err, rerr, priorNote)
+	}
+	if err2 := op(auth.pinnedEnv()); err2 != nil {
+		return fmt.Errorf("after push-token refresh%s: %w", priorNote, err2)
+	}
+	return nil
+}
+
+// pinnedEnv returns env plus authedRemoteOpEnvPins as a fresh slice, so the
+// held auth entries are never appended to in place.
+func (a *pushAuth) pinnedEnv() []string {
+	out := make([]string, 0, len(a.env)+len(authedRemoteOpEnvPins))
+	out = append(out, a.env...)
+	return append(out, authedRemoteOpEnvPins...)
+}
+
+// remoteAuthRejectedMarkers are the stderr fragments runOutEnv folds into a
+// git error when the remote rejected the credential: GitHub's `remote:` line
+// verbatim from the #3443 logs, git's own HTTP-401 wording, git's
+// no-credential-available wording under GIT_TERMINAL_PROMPT=0 (the shape a
+// 401 on an extraheader-authenticated request produces), and a literal 401.
+// TestIsRemoteAuthRejected classifies REAL git stderr captured from a 401
+// fixture, so a git wording change fails there rather than silently
+// disarming the retry.
+var remoteAuthRejectedMarkers = []string{
+	"Invalid username or token",
+	"Authentication failed for",
+	"could not read Username",
+	"returned error: 401",
+}
+
+// isRemoteAuthRejected reports whether err (a runOutEnv-wrapped git failure)
+// carries a remote credential rejection, per remoteAuthRejectedMarkers. A
+// non-fast-forward, a `stale info` lease rejection, a connection refusal and
+// a 403 are all NOT auth rejections.
+func isRemoteAuthRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	for _, m := range remoteAuthRejectedMarkers {
+		if strings.Contains(text, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // RemoteConfigured reports whether the named remote (defaulting to

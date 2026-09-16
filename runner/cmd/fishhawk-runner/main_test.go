@@ -3689,6 +3689,14 @@ type fakePusher struct {
 	pushCommittedArgs   *gitops.PushCommittedBranchArgs
 	pushCommittedResult *gitops.PushCommittedBranchResult
 	pushCommittedErr    error
+
+	// invokeRefresh, when set, makes CommitAndPush call args.RefreshPushToken
+	// exactly once (after onCommit, modelling the post-verify refresh point,
+	// #3443) and record what it returned in refreshedToken / refreshErr. A
+	// nil hook is recorded as refreshErr so the wiring assertion fails loud.
+	invokeRefresh  bool
+	refreshedToken string
+	refreshErr     error
 }
 
 func (f *fakePusher) PushCommittedBranch(_ context.Context, args gitops.PushCommittedBranchArgs) (*gitops.PushCommittedBranchResult, error) {
@@ -3710,6 +3718,13 @@ func (f *fakePusher) CommitAndPush(_ context.Context, args gitops.CommitAndPushA
 	f.calls++
 	if f.onCommit != nil {
 		f.onCommit(args)
+	}
+	if f.invokeRefresh {
+		if args.RefreshPushToken == nil {
+			f.refreshErr = errors.New("fakePusher: RefreshPushToken hook is nil")
+		} else {
+			f.refreshedToken, f.refreshErr = args.RefreshPushToken(context.Background())
+		}
 	}
 	if len(f.errSeq) > 0 {
 		if idx >= len(f.errSeq) {
@@ -28607,5 +28622,237 @@ func TestOpenPRAndShipArtifact_LogsApprovalConditionResponsesCommittedAfterCommi
 	})
 	if commitPos == token.NoPos || logPos == token.NoPos || logPos <= commitPos {
 		t.Errorf("logApprovalConditionResponsesCommitted (pos %v) must be called AFTER CommitAndPush (pos %v)", logPos, commitPos)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Post-verify push-token refresh wiring (E68.67 / #3443). The gitops layer
+// owns the ordering (verify → refresh → lease ls-remote → push, pinned in
+// runner/internal/gitops); these tests pin the RUNNER half: the hook reaches
+// gitops non-nil, mints through mintImplementToken, logs the two events with
+// token_held_seconds, and rebinds the PR-open credential.
+// ---------------------------------------------------------------------------
+
+// refreshRunArgs is the implement-stage run() invocation the #3443 tests share.
+func refreshRunArgs(extra ...string) []string {
+	return append([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, extra...)
+}
+
+func refreshPromptResp() *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+}
+
+// withMutableRunnerNow pins runnerNow to a clock the test advances.
+func withMutableRunnerNow(t *testing.T, start time.Time) *time.Time {
+	t.Helper()
+	now := start
+	orig := runnerNow
+	runnerNow = func() time.Time { return now }
+	t.Cleanup(func() { runnerNow = orig })
+	return &now
+}
+
+// TestImplementPush_RefreshPushTokenWiredToMint is the cross-boundary
+// done-means: run() the implement stage with a two-token mint sequence and a
+// fake pusher that invokes the hook. The hook must reach gitops non-nil,
+// return the SECOND minted token, log push_token_refreshed with
+// token_held_seconds == 600 (the clock is advanced 10 minutes inside the
+// pusher, before the hook fires), and rebind the PR-open credential.
+//
+// Counterfactual: delete `RefreshPushToken: refreshPushToken` from the
+// CommitAndPushArgs literal → RED on the nil-hook assertion.
+func TestImplementPush_RefreshPushTokenWiredToMint(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	now := withMutableRunnerNow(t, time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
+	fu := newFakeUploader(t)
+	fu.promptResp = refreshPromptResp()
+	fu.instTokenSeq = []string{"ghs_old", "ghs_new"}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{invokeRefresh: true}
+	// Model the 30-minute verify: the clock moves 10 min between the
+	// top-of-function mint and the post-verify refresh.
+	fp.onCommit = func(gitops.CommitAndPushArgs) { *now = now.Add(10 * time.Minute) }
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	if got := run(refreshRunArgs(), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	if fp.gotArgs.RefreshPushToken == nil {
+		t.Fatal("CommitAndPushArgs.RefreshPushToken is nil — the post-verify refresh hook is not wired (#3443)")
+	}
+	if fp.refreshErr != nil {
+		t.Fatalf("refresh hook returned an error: %v\n%s", fp.refreshErr, stderr.String())
+	}
+	if fp.gotArgs.PushToken != "ghs_old" || fp.refreshedToken != "ghs_new" {
+		t.Errorf("PushToken/refreshed = %q/%q, want ghs_old/ghs_new (the refresh must mint a SECOND token)", fp.gotArgs.PushToken, fp.refreshedToken)
+	}
+	if fu.instTokenCalls != 2 {
+		t.Errorf("FetchInstallationToken calls = %d, want 2 (top-of-function mint + post-verify refresh)", fu.instTokenCalls)
+	}
+	wantEvent := `{"event":"push_token_refreshed","run_id":"11111111-2222-3333-4444-555555555555","stage_id":"22222222-3333-4444-5555-666666666666","token_held_seconds":600,"changed":true}`
+	if !strings.Contains(stderr.String(), wantEvent) {
+		t.Errorf("missing %s in:\n%s", wantEvent, stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"push_token_refresh_failed"`) {
+		t.Errorf("a successful refresh must not log push_token_refresh_failed:\n%s", stderr.String())
+	}
+	if fpr.gotToken != "ghs_new" {
+		t.Errorf("PR opener token = %q, want ghs_new (the refresh must rebind the PR-open credential)", fpr.gotToken)
+	}
+}
+
+// TestImplementPush_RefreshPushTokenFailureLogsAndDegrades pins the
+// refresh-error branch: the second mint fails, push_token_refresh_failed is
+// logged with token_held_seconds, the hook returns the error (gitops degrades
+// to the held token), the PR-open still runs on the HELD token, and the stage
+// completes — a backend blip never fails the verified commit.
+func TestImplementPush_RefreshPushTokenFailureLogsAndDegrades(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	now := withMutableRunnerNow(t, time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
+	fu := newFakeUploader(t)
+	fu.promptResp = refreshPromptResp()
+	fu.instTokenSeq = []string{"ghs_old"}
+	fu.instTokenHook = func() {
+		if fu.instTokenCalls == 2 {
+			fu.instTokenErr = errors.New("backend: installation_token_issuance_failed")
+		}
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{invokeRefresh: true}
+	fp.onCommit = func(gitops.CommitAndPushArgs) { *now = now.Add(7 * time.Minute) }
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	if got := run(refreshRunArgs(), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK (a refresh failure degrades, never fails the stage):\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil || fp.gotArgs.RefreshPushToken == nil {
+		t.Fatal("RefreshPushToken hook not wired")
+	}
+	if fp.refreshErr == nil || !strings.Contains(fp.refreshErr.Error(), "installation_token_issuance_failed") {
+		t.Errorf("hook error = %v, want the mint failure (gitops degrades to the held token on it)", fp.refreshErr)
+	}
+	if fp.refreshedToken != "" {
+		t.Errorf("hook returned token %q on failure, want empty", fp.refreshedToken)
+	}
+	wantEvent := `{"event":"push_token_refresh_failed","run_id":"11111111-2222-3333-4444-555555555555","stage_id":"22222222-3333-4444-5555-666666666666","token_held_seconds":420,"detail":"fetch installation token: backend: installation_token_issuance_failed"}`
+	if !strings.Contains(stderr.String(), wantEvent) {
+		t.Errorf("missing %s in:\n%s", wantEvent, stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"push_token_refreshed"`) {
+		t.Errorf("a failed refresh must not log push_token_refreshed:\n%s", stderr.String())
+	}
+	if fpr.gotToken != "ghs_old" {
+		t.Errorf("PR opener token = %q, want the HELD ghs_old (a failed refresh must not rebind)", fpr.gotToken)
+	}
+}
+
+// TestImplementPush_RefreshPushTokenEmptyIsFailure pins approval condition 2
+// at the runner layer: a mint that returns an EMPTY token with no error is a
+// refresh FAILURE — push_token_refresh_failed (not push_token_refreshed) is
+// logged, the hook returns an error, and the PR-open token is NOT rebound.
+//
+// Counterfactual: delete the empty-token guard in refreshPushToken → RED
+// (push_token_refreshed logged, PR opener handed "").
+func TestImplementPush_RefreshPushTokenEmptyIsFailure(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	withMutableRunnerNow(t, time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
+	fu := newFakeUploader(t)
+	fu.promptResp = refreshPromptResp()
+	fu.instTokenSeq = []string{"ghs_old", ""}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{invokeRefresh: true}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	if got := run(refreshRunArgs(), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil || fp.gotArgs.RefreshPushToken == nil {
+		t.Fatal("RefreshPushToken hook not wired")
+	}
+	if fp.refreshErr == nil || !strings.Contains(fp.refreshErr.Error(), "empty token") {
+		t.Errorf("hook error = %v, want an empty-token refresh failure", fp.refreshErr)
+	}
+	if fp.refreshedToken != "" {
+		t.Errorf("hook returned %q, want empty", fp.refreshedToken)
+	}
+	if !strings.Contains(stderr.String(), `"event":"push_token_refresh_failed"`) || !strings.Contains(stderr.String(), `"detail":"the credential mint returned an empty token"`) {
+		t.Errorf("want push_token_refresh_failed naming the empty token in:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"push_token_refreshed"`) {
+		t.Errorf("an empty token must not log push_token_refreshed:\n%s", stderr.String())
+	}
+	if fpr.gotToken != "ghs_old" {
+		t.Errorf("PR opener token = %q, want the HELD ghs_old (an empty refresh must not rebind)", fpr.gotToken)
+	}
+}
+
+// TestImplementPush_GitLabRefreshReturnsStaticToken pins the GitLab forge:
+// the refresh re-reads the static FISHHAWK_GITLAB_TOKEN, logs
+// push_token_refreshed with changed:false, and never calls the GitHub App
+// broker.
+func TestImplementPush_GitLabRefreshReturnsStaticToken(t *testing.T) {
+	implementEnv(t, "group/project", "main")
+	t.Setenv("FISHHAWK_GITLAB_TOKEN", "glpat-static")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	withMutableRunnerNow(t, time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
+	fu := newFakeUploader(t)
+	fu.promptResp = refreshPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{invokeRefresh: true}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	fmr := &fakeMROpener{}
+	origMR := newMROpener
+	newMROpener = func(token, baseURL string) mrOpener {
+		fmr.gotToken = token
+		fmr.gotBaseURL = baseURL
+		return fmr
+	}
+	t.Cleanup(func() { newMROpener = origMR })
+
+	var stderr strings.Builder
+	if got := run(refreshRunArgs("--forge", "gitlab", "--gitlab-base-url", "https://gitlab.example.com"), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil || fp.gotArgs.RefreshPushToken == nil {
+		t.Fatal("RefreshPushToken hook not wired")
+	}
+	if fp.refreshErr != nil || fp.refreshedToken != "glpat-static" || fp.gotArgs.PushToken != "glpat-static" {
+		t.Errorf("refresh = (%q, %v), PushToken = %q; want the same static glpat-static", fp.refreshedToken, fp.refreshErr, fp.gotArgs.PushToken)
+	}
+	if fu.instTokenCalls != 0 {
+		t.Errorf("FetchInstallationToken calls = %d, want 0 on the gitlab forge", fu.instTokenCalls)
+	}
+	if !strings.Contains(stderr.String(), `"event":"push_token_refreshed"`) || !strings.Contains(stderr.String(), `"changed":false`) {
+		t.Errorf("want push_token_refreshed with changed:false in:\n%s", stderr.String())
+	}
+	if fmr.gotToken != "glpat-static" {
+		t.Errorf("MR opener token = %q, want glpat-static", fmr.gotToken)
+	}
+	if fpr.gotArgs != nil {
+		t.Error("gitlab forge must not invoke the GitHub PR opener")
 	}
 }

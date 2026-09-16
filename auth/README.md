@@ -58,7 +58,7 @@ The alternative (workflow's `GITHUB_TOKEN`) would force customers to enable the 
 
 ## Token TTL and long-running stages
 
-App installation tokens have a ~1-hour TTL. The token this action mints is used by `actions/checkout` for the initial clone; the Fishhawk runner action then mints a **second** App token immediately before its `git push` so an agent run that takes longer than ~55 minutes doesn't fail at the push step on a stale credential. The audit log records both issuances: the OIDC one (this step) and the Ed25519 one (signed by the per-run signing key right before push), each with `auth_method` recorded so the trail is unambiguous about which credential authenticated which git operation.
+App installation tokens have a ~1-hour TTL. The token this action mints is used by `actions/checkout` for the initial clone; the Fishhawk runner action then mints a **second** App token at the top of its push path and **re-mints** it after the committed-tree verify, immediately before its `git push` (#3443 — the verify can hold a token for 25-30 minutes), so an agent run that takes longer than ~55 minutes doesn't fail at the push step on a stale credential. The audit log records three issuances per implement stage: the OIDC one (this step) and the two Ed25519 ones (signed by the per-run signing key — the top-of-push mint and the post-verify refresh), each with `auth_method` recorded so the trail is unambiguous about which credential authenticated which git operation.
 
 ## Failure modes
 
