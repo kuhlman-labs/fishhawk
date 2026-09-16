@@ -623,7 +623,7 @@ func TestRunVerifyFixLoop_RefusedIsCategoryC(t *testing.T) {
 	res := agent.Result{OK: true}
 	var log strings.Builder
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
-	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &log)
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &log)
 	if err != nil || reinvoked || tree != "" {
 		t.Fatalf("err=%v reinvoked=%t tree=%q", err, reinvoked, tree)
 	}

@@ -12484,7 +12484,7 @@ func TestRunVerifyFixLoop_PostCommitResetFailureFatal(t *testing.T) {
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 	res := agent.Result{OK: true}
 	var logSink strings.Builder
-	_, _, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	_, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
 	if err == nil {
 		t.Fatal("a post-commit reset failure must be FATAL (hard error), not a non-blocking skip")
 	}
@@ -14592,7 +14592,7 @@ func TestRunVerifyFixLoop_InfraFailureAbsorbedWithoutFixInvoke(t *testing.T) {
 	cfg.verifyMaxIterations = 1
 	res := agent.Result{OK: true}
 	var logSink strings.Builder
-	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
 	}
@@ -14623,7 +14623,7 @@ func TestRunVerifyFixLoop_ReturnsVerifiedTreeSHA(t *testing.T) {
 	cfg := verifiedTreeCfg(repo, "true")
 	cfg.verifyMaxIterations = 1
 	res := agent.Result{OK: true}
-	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, io.Discard)
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, io.Discard)
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v", err)
 	}
@@ -14643,7 +14643,7 @@ func TestRunVerifyFixLoop_ExhaustionReturnsEmptyTree(t *testing.T) {
 	cfg := verifiedTreeCfg(repo, "false")
 	cfg.verifyMaxIterations = 1
 	res := agent.Result{OK: true}
-	_, tree, err := runVerifyFixLoop(context.Background(), cfg, &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, io.Discard)
+	_, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, io.Discard)
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v", err)
 	}
@@ -14747,7 +14747,7 @@ func TestRunVerifyFixLoop_FixPromptBounded(t *testing.T) {
 	res := agent.Result{OK: true}
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 	var logSink strings.Builder
-	if _, _, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink); err != nil {
+	if _, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink); err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
 	}
 	if invoker.gotInv == nil {
@@ -14800,7 +14800,7 @@ func TestRunVerifyFixLoop_PromptTooLargeNotRetried(t *testing.T) {
 		errSeq:    []error{fmt.Errorf("x: %w", agent.ErrPromptTooLarge)},
 	}
 	var logSink strings.Builder
-	_, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	_, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
 	}
@@ -14861,7 +14861,7 @@ func TestRunVerifyFixLoop_PreCommitInfraSkipStaysSkipped(t *testing.T) {
 	res := agent.Result{OK: true}
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 	var logSink strings.Builder
-	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
 	if err != nil {
 		t.Fatalf("pre-commit infra error must be non-blocking, got %v\n%s", err, logSink.String())
 	}
@@ -16428,7 +16428,7 @@ func TestRunVerifyFixLoop_PassedButUnresolvableTree_FailsClosed(t *testing.T) {
 	cfg := verifiedTreeCfg(repo, unresolvableTreeVerifyCmd(repo))
 	cfg.verifyMaxIterations = 1
 	res := agent.Result{OK: true}
-	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, io.Discard)
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, io.Discard)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
 	}
@@ -24709,7 +24709,7 @@ func TestVerifyFixLoop_DerivedInvocationCarriesBaseEnv(t *testing.T) {
 	wantBaseEnv := []string{"PATH=/bin"}
 	baseInv := agent.Invocation{BaseEnv: wantBaseEnv}
 	res := agent.Result{OK: true}
-	_, _, _ = runVerifyFixLoop(context.Background(), cfg, invoker, baseInv, &res, io.Discard)
+	_, _, _ = runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, baseInv, &res, io.Discard)
 
 	if invoker.callIdx == 0 {
 		t.Fatal("the verify-fix loop never re-invoked the agent; the assertion below would be vacuous")
@@ -27925,7 +27925,7 @@ func TestRunVerifyFixLoop_FormatOnlyFailureAutoformattedWithoutFixInvoke(t *test
 	count := stubFormatter(t, `printf 'package p\n' > fmtme.go; exit 0`)
 	res := agent.Result{OK: true}
 	var logSink strings.Builder
-	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg,
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "",
 		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
@@ -27962,7 +27962,7 @@ func TestRunVerifyFixLoop_NonFormatLintFailureStillReinvokesAgent(t *testing.T) 
 	count := stubFormatter(t, `printf 'package p\n' > fmtme.go; exit 0`)
 	res := agent.Result{OK: true}
 	var logSink strings.Builder
-	reinvoked, _, err := runVerifyFixLoop(context.Background(), cfg,
+	reinvoked, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "",
 		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
@@ -27990,7 +27990,7 @@ func TestRunVerifyFixLoop_AutoformatFiresAtMostOncePerStage(t *testing.T) {
 	count := stubFormatter(t, `printf 'package p // %s\n' "$(date +%s%N)$RANDOM" > fmtme.go; exit 0`)
 	res := agent.Result{OK: true}
 	var logSink strings.Builder
-	_, tree, err := runVerifyFixLoop(context.Background(), cfg,
+	_, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "",
 		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
@@ -28021,7 +28021,7 @@ func TestRunVerifyFixLoop_AutoformatInvokesFormatterAtMostOncePerStage(t *testin
 	count := stubFormatter(t, `exit 0`) // changes nothing
 	res := agent.Result{OK: true}
 	var logSink strings.Builder
-	if _, _, err := runVerifyFixLoop(context.Background(), cfg,
+	if _, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "",
 		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink); err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
 	}
@@ -28055,7 +28055,7 @@ func TestRunVerifyFixLoop_AutoformatSkippedNoEligibleFiles(t *testing.T) {
 	count := stubFormatter(t, `printf 'package p\n' > fmtme.go; exit 0`)
 	res := agent.Result{OK: true}
 	var logSink strings.Builder
-	reinvoked, _, err := runVerifyFixLoop(context.Background(), cfg,
+	reinvoked, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "",
 		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
@@ -28082,7 +28082,7 @@ func TestRunVerifyFixLoop_AutoformatSkippedWhenFormatterFails(t *testing.T) {
 	stubFormatter(t, `printf 'boom\n' >&2; exit 3`)
 	res := agent.Result{OK: true}
 	var logSink strings.Builder
-	reinvoked, _, err := runVerifyFixLoop(context.Background(), cfg,
+	reinvoked, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "",
 		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
@@ -28108,7 +28108,7 @@ func TestRunVerifyFixLoop_AutoformatNoChangeAddsNoExtraVerifyRun(t *testing.T) {
 	stubFormatter(t, `exit 0`)
 	res := agent.Result{OK: true}
 	var logSink strings.Builder
-	if _, _, err := runVerifyFixLoop(context.Background(), cfg,
+	if _, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "",
 		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink); err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
 	}
@@ -28270,7 +28270,7 @@ func TestRunVerifyFixLoop_ScopedThenFullOnPass(t *testing.T) {
 	var logSink strings.Builder
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 
-	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
 	if err != nil {
 		t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
 	}
@@ -28314,7 +28314,7 @@ func TestRunVerifyFixLoop_EmptyScopeRunsOneFullVerify(t *testing.T) {
 	var logSink strings.Builder
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 
-	_, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	_, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
 	if err != nil {
 		t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
 	}
@@ -28342,7 +28342,7 @@ func TestRunVerifyFixLoop_UndecodableScopeRunsOneFullVerify(t *testing.T) {
 	var logSink strings.Builder
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 
-	if _, _, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink); err != nil {
+	if _, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink); err != nil {
 		t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
 	}
 	lines := readVerifyFormLog(t, logPath)
@@ -28363,7 +28363,7 @@ func TestRunVerifyFixLoop_ScopedFailureReinvokesWithBudget(t *testing.T) {
 	var logSink strings.Builder
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 
-	reinvoked, _, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+	reinvoked, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
 	if err != nil {
 		t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
 	}
@@ -28390,7 +28390,7 @@ func TestRunVerifyFixLoop_ScopedPassFullFailIsAnOrdinaryFailure(t *testing.T) {
 		var logSink strings.Builder
 		invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 
-		reinvoked, _, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+		reinvoked, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
 		if err != nil {
 			t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
 		}
@@ -28413,7 +28413,7 @@ func TestRunVerifyFixLoop_ScopedPassFullFailIsAnOrdinaryFailure(t *testing.T) {
 		var logSink strings.Builder
 		invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 
-		reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &logSink)
+		reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
 		if err != nil {
 			t.Fatalf("fix loop returned an error: %v\n%s", err, logSink.String())
 		}

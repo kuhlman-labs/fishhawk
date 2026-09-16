@@ -792,7 +792,7 @@ func TestGateHosted_RefusesEndToEnd(t *testing.T) {
 	res := agent.Result{OK: true}
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 	log.Reset()
-	reinvoked, tree, err := runVerifyFixLoop(context.Background(), cfg, invoker, agent.Invocation{}, &res, &log)
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &log)
 	if err != nil || reinvoked || tree != "" {
 		t.Fatalf("fix loop: err=%v reinvoked=%t tree=%q", err, reinvoked, tree)
 	}

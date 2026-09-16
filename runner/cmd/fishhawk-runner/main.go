@@ -2178,7 +2178,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// to category-B (park for re-scope/re-plan; no self-retry), mirroring
 		// runVerifyGateCommitted's treatment of its post-commit reset failure.
 		var ferr error
-		reinvoked, verifiedTreeSHA, ferr = runVerifyFixLoop(ctx, cfg, invoker, inv, &res, logSink)
+		reinvoked, verifiedTreeSHA, ferr = runVerifyFixLoop(ctx, &cfg, client, mcpBearerToken, invoker, inv, &res, logSink)
 		if ferr != nil {
 			res.OK = false
 			res.FailureCategory = "B"
@@ -2270,8 +2270,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// FAILURE path the #1151 gate structurally never reaches. It runs on both
 	// paths (the event is evidence) and NEVER touches res.OK /
 	// res.FailureCategory / invokeErr — every degrade is fail-open.
+	//
+	// stagedKnown (#3434, unusedGrantStagedKnown): a granted path that is
+	// dirty but UNSTAGED is reported as not_staged only when a committed-tree
+	// gate ran StageScoped last, so the index IS the verified commit's staged
+	// set; on the verifyCmd=="" and appliedFixup paths the refinement is
+	// withheld and a dirty grant counts as used, as before.
 	if stageType == "implement" && !cfg.noPR && len(cfg.approvedAmendments) > 0 {
-		unused, unusedEvents := detectUnusedScopeAmendmentGrants(ctx, cfg, logSink)
+		unused, unusedEvents := detectUnusedScopeAmendmentGrants(ctx, cfg, unusedGrantStagedKnown(appliedFixup, cfg.verifyCmd), logSink)
 		res.Events = append(res.Events, unusedEvents...)
 		if !res.OK && len(unused) > 0 {
 			res.FailureReason = annotateUnusedAmendmentFailure(res.FailureReason, unused)
@@ -4736,8 +4742,11 @@ func verifyFailureExcerpt(out string) string {
 //
 //  4. on FAIL with budget remaining: undoes the throwaway commit, then
 //     re-invokes the agent in-place with a fix prompt embedding the captured
-//     verify output. The next iteration re-commits scope-only onto the SAME
-//     base — one converged commit, never a stack of fix commits on a bad base;
+//     verify output. The next iteration RE-FOLDS approved amendments
+//     (refoldScopeAmendmentsMidLoop, #3434 — an approval that landed DURING
+//     the fix invocation enters cfg.scopeFiles and the scoped-verify package
+//     set) then re-commits scope-only onto the SAME base — one converged
+//     commit, never a stack of fix commits on a bad base;
 //
 //  5. on FAIL with the budget exhausted (iter == max_iterations): undoes the
 //     throwaway commit and demotes res to category-A. This is TERMINAL — the
@@ -4781,27 +4790,54 @@ func verifyFailureExcerpt(out string) string {
 // (ErrPushedTreeNotVerified, hard error → category-B at the call site) — an
 // empty tree would silently disable the invariant. Empty is returned only on
 // the no-verdict paths: nothing-staged pass, skip, and exhaustion.
-func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, baseInv agent.Invocation, res *agent.Result, logSink io.Writer) (bool, string, error) {
+//
+// cfg is a POINTER (#3434): the mid-loop re-fold writes approved amendment
+// paths into cfg.scopeFiles, and every post-loop consumer in run()
+// (CommitAndPush.ScopeFiles, gateScopeFiles/MissingScopeFiles,
+// reemitScopedGitDiff, the unused-grant check) must see that same folded set
+// — otherwise the real push would commit a NARROWER tree than the one the
+// loop verified and gitops.VerifyCommit would fail closed
+// (ErrPushedTreeNotVerified). client + mcpToken are the fold's fetch seam; a
+// nil client or empty token makes the re-fold a guaranteed no-op.
+func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcpToken string, invoker agent.Invoker, baseInv agent.Invocation, res *agent.Result, logSink io.Writer) (bool, string, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
 	}
-	scopeFiles := scopePaths(cfg.scopeFiles)
 	timeout := cfg.verifyTimeout
 	if timeout == 0 {
 		timeout = 10 * time.Minute
 	}
 
-	// Derive the scoped-verify package set ONCE (#3315). A non-empty set makes
-	// every ITERATION verify the touched packages only; the iteration that
-	// passes then re-verifies the same committed SHA with the FULL form before
-	// the loop may report success. An EMPTY set (no Go scope files, or an
-	// undecodable path) skips the pre-pass entirely, so a non-Go change pays
-	// exactly ONE full verify per iteration — what it paid before this change.
-	scopePkgs := verifyScopePackages(scopeFiles)
-	_, _ = fmt.Fprintf(logSink,
-		`{"event":"verify_scope_resolved","run_id":%q,"stage_id":%q,"packages":%q,"form":%q}`+"\n",
-		cfg.runID, cfg.stageID, strings.Join(scopePkgs, ","), verifyFormName(scopePkgs))
+	// Derive the scope path set and the scoped-verify package set (#3315)
+	// from cfg.scopeFiles. A non-empty package set makes every ITERATION
+	// verify the touched packages only; the iteration that passes then
+	// re-verifies the same committed SHA with the FULL form before the loop
+	// may report success. An EMPTY set (no Go scope files, or an undecodable
+	// path) skips the pre-pass entirely, so a non-Go change pays exactly ONE
+	// full verify per iteration — what it paid before #3315.
+	//
+	// Resolved once before the loop and AGAIN after every mid-loop re-fold
+	// that grew cfg.scopeFiles (#3434), so iteration N+1's StageScoped and
+	// scoped pre-pass include a path the operator approved during iteration
+	// N's fix invocation. verify_scope_resolved is logged on the first
+	// resolution and whenever the package set changes.
+	var (
+		scopeFiles []string
+		scopePkgs  []string
+	)
+	resolveScope := func(first bool) {
+		scopeFiles = scopePaths(cfg.scopeFiles)
+		pkgs := verifyScopePackages(scopeFiles)
+		changed := first || strings.Join(pkgs, ",") != strings.Join(scopePkgs, ",")
+		scopePkgs = pkgs
+		if changed {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"verify_scope_resolved","run_id":%q,"stage_id":%q,"packages":%q,"form":%q}`+"\n",
+				cfg.runID, cfg.stageID, strings.Join(scopePkgs, ","), verifyFormName(scopePkgs))
+		}
+	}
+	resolveScope(true)
 
 	var (
 		passed          bool
@@ -4824,7 +4860,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 			lastIterErr = fmt.Errorf("verify-fix: stage scoped: %w", err)
 			break
 		}
-		committed, err := commitVerifyWIP(ctx, cfg, repoDir)
+		committed, err := commitVerifyWIP(ctx, *cfg, repoDir)
 		if err != nil {
 			lastIterErr = err
 			break
@@ -4860,7 +4896,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		res.Events = append(res.Events, ev)
 		attempts++
 		lastOutput = out
-		logVerifyFormOutcome(logSink, cfg, iter+1, verifyFormName(scopePkgs), outcome)
+		logVerifyFormOutcome(logSink, *cfg, iter+1, verifyFormName(scopePkgs), outcome)
 
 		// (c2) FULL re-verify on the passing iteration (#3315). A scoped pass
 		// proves only the named packages; a change can break a test in a package
@@ -4889,7 +4925,7 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 			res.Events = append(res.Events, fev)
 			out, outcome = fout, foutcome
 			lastOutput = fout
-			logVerifyFormOutcome(logSink, cfg, iter+1, verifyFormFull, outcome)
+			logVerifyFormOutcome(logSink, *cfg, iter+1, verifyFormFull, outcome)
 		}
 
 		// Capture the verified tree's object hash BEFORE the reset (#960).
@@ -5011,13 +5047,13 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		if outcome == "failed" && isFormatOnlyLintFailure(out) {
 			switch {
 			case autoformatted:
-				logAutoformatSkipped(logSink, cfg, iter+1, "already_absorbed",
+				logAutoformatSkipped(logSink, *cfg, iter+1, "already_absorbed",
 					"the auto-format absorb already fired for this stage; falling through to the fix agent")
 			default:
 				eligible := eligibleAutoformatFiles(repoDir, cfg.scopeFiles)
 				if len(eligible) == 0 {
 					// No invocation happens, so the once-flag is NOT spent.
-					logAutoformatSkipped(logSink, cfg, iter+1, "no_eligible_files",
+					logAutoformatSkipped(logSink, *cfg, iter+1, "no_eligible_files",
 						"no regular, non-symlinked, on-disk in-scope .go file to format; falling through to the fix agent")
 					break
 				}
@@ -5026,9 +5062,9 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 				changed, ferr := runAutoformat(ctx, repoDir, eligible, timeout)
 				switch {
 				case ferr != nil:
-					logAutoformatSkipped(logSink, cfg, iter+1, "formatter_failed", ferr.Error())
+					logAutoformatSkipped(logSink, *cfg, iter+1, "formatter_failed", ferr.Error())
 				case len(changed) == 0:
-					logAutoformatSkipped(logSink, cfg, iter+1, "no_change",
+					logAutoformatSkipped(logSink, *cfg, iter+1, "no_change",
 						"the formatter left every eligible in-scope .go file byte-identical; falling through to the fix agent")
 				default:
 					detail := fmt.Sprintf("verify failure was exclusively gofmt/goimports findings; reformatted %d in-scope file(s) and re-running verify without consuming a fix iteration", len(changed))
@@ -5129,6 +5165,28 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		res.CacheWriteInputTokens += fixRes.CacheWriteInputTokens
 		if fixRes.Model != "" {
 			res.Model = fixRes.Model
+		}
+
+		// Mid-loop scope-amendment RE-FOLD (#3434). The fix agent has just
+		// returned; an amendment the operator approved DURING that invocation
+		// is folded into cfg.scopeFiles here — settle-wait then fold, the same
+		// pair run() uses pre-loop — so the next iteration's StageScoped and
+		// commitVerifyWIP carry the granted path instead of unstaging the
+		// agent's edit and repeating the identical verify failure. Placed
+		// AFTER a SUCCESSFUL re-invoke and BEFORE the loop's next (a): the
+		// infra-absorb / auto-format `iter--; continue` paths above never
+		// reach here (no agent ran, nothing new can have been filed) and
+		// neither does the exhaustion break. The fold's events (the
+		// scope_amendments_folded policy_event among them) ride on res.Events
+		// so the bundle carries one fold record PER FOLD; the settle-wait
+		// evidence is kept even when nothing new was folded. On growth the
+		// scope path + package sets are re-resolved so the pointer write-back
+		// is what the NEXT iteration verifies — and, via *cfg, what run()
+		// later pushes (#960 verified tree == pushed tree).
+		added, refoldEvents := refoldScopeAmendmentsMidLoop(ctx, client, cfg, mcpToken, "implement", iter+1, logSink)
+		res.Events = append(res.Events, refoldEvents...)
+		if added {
+			resolveScope(false)
 		}
 	}
 
@@ -9248,11 +9306,14 @@ func emitPendingScopeAmendments(seen map[string]struct{}, items []upload.ScopeAm
 // retained run-bound fhm_ bearer (mcpToken, from the FetchMCPToken
 // call that fed the agent's FISHHAWK_API_TOKEN env) and folds the
 // paths of every APPROVED amendment into cfg.scopeFiles, deduped by
-// path (E22.X / #961). Called once, after the agent invocation settles
-// and BEFORE any committed-tree gate or StageScoped call reads
+// path (E22.X / #961). Called after the agent invocation settles and
+// BEFORE any committed-tree gate or StageScoped call reads
 // cfg.scopeFiles, so the verify gates and the push see the same folded
 // tree (#960 invariant) and the #818/#825 created-out-of-scope gate
-// honors approved creates.
+// honors approved creates — and called AGAIN at every verify-fix
+// iteration boundary by refoldScopeAmendmentsMidLoop (#3434), so an
+// approval that landed during a fix re-invocation is folded before the
+// next throwaway commit. It remains the SINGLE writer of cfg.scopeFiles.
 //
 // No-ops when the token is absent (fetch failed / never ran) or when
 // the scope is empty — an empty scope is the `git add -A` fallback,
@@ -9261,10 +9322,12 @@ func emitPendingScopeAmendments(seen map[string]struct{}, items []upload.ScopeAm
 // failure logs scope_amendment_refresh_failed and the original scope
 // stays authoritative.
 // The returned []agent.Event carries a single scope_amendments_folded
-// policy_event recording EXACTLY the paths this call folded into
-// cfg.scopeFiles for this commit (the approved-and-not-already-present
-// set) — the authoritative per-commit fold record. The backend reads it
-// via bundle.ExtractScopeAmendmentsFolded and subtracts it from the
+// policy_event recording EXACTLY the paths THIS CALL folded into
+// cfg.scopeFiles (the approved-and-not-already-present set) — one event
+// per fold, so a stage with a mid-loop re-fold carries several and the
+// per-commit fold record is their union. The backend reads them
+// via bundle.ExtractScopeAmendmentsFolded (which unions every such
+// event, #3434) and subtracts the union from the
 // review-surface scope_drift, so an approved-amendment path that landed
 // in the pushed HEAD is no longer reported to the implement reviewer as
 // drift-excluded (#1317). The slice is sourced ONLY from the fold (never
