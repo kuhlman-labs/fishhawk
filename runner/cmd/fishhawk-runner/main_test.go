@@ -12327,6 +12327,203 @@ func TestRun_VerifyGateCommitted_DriftExcludedFailureBlocks(t *testing.T) {
 	}
 }
 
+// TestRun_VerifyGateCommitted_HostedRefusal_CategoryC pins the #3449 fix on
+// the DEFAULT single-shot call site (max_iterations == 0): a hosted-profile
+// gate-isolation refusal must classify category C, matching the fix-loop
+// path's verify_gate_refused → C and the gateiso README's documented
+// contract — before #3449 this call site hardcoded category B. The refusal
+// is driven through run()'s REAL configureGateIsolation(os.Getenv,
+// gateiso.DefaultProbes()) by env, the same recipe TestGateHosted_RefusesEndToEnd
+// uses via the Getenv probe: hosted profile + auto mode (empty) + no gate
+// image (containerOK is false regardless of the host runtime, select.go) +
+// DOCKER_HOST/CONTAINER_HOST pinned to a remote tcp endpoint, which
+// detectDocker/podman classify UNSAFE before any daemon dial — so the test
+// cannot hang on the unreachable address.
+func TestRun_VerifyGateCommitted_HostedRefusal_CategoryC(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	// Marker-writing verify command, outside the worktree: proves the verify
+	// command never executed (the gate refuses before exec).
+	markerDir := t.TempDir()
+	marker := filepath.Join(markerDir, "ran")
+	verifyScript := filepath.Join(markerDir, "verify.sh")
+	mustWrite(t, verifyScript, "#!/bin/sh\n: > "+marker+"\nexit 0\n")
+
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "sh " + verifyScript,
+		VerifyMaxIterations: 0, // single-shot committed gate (#802)
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	t.Setenv(deploymentProfileEnvVar, "hosted")
+	t.Setenv(gateIsolationModeEnvVar, "") // auto: an ambient explicit fallback mode would fail startup under hosted
+	t.Setenv(gateImageEnvVar, "")         // no image -> containerOK false regardless of the host runtime
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2376")
+	t.Setenv("CONTAINER_HOST", "tcp://10.0.0.5:2376")
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"C"`) {
+		t.Errorf("expected category-C demote on a hosted-profile gate-isolation refusal:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("hosted refusal must NOT classify category B:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "gate_isolation_selected") || !strings.Contains(stderr.String(), `"path":"refused"`) {
+		t.Errorf("expected gate_isolation_selected with path=refused:\n%s", stderr.String())
+	}
+	if !isGateIsolationRefusal(stderr.String()) && !strings.Contains(stderr.String(), gateIsolationRefusedSignature) {
+		t.Errorf("runner_completed reason must carry the gate-isolation-refused signature:\n%s", stderr.String())
+	}
+	// Single-shot: no fix re-invoke.
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (single-shot committed gate, no re-invoke)", invoker.callIdx)
+	}
+	// Blocked: no push, no PR.
+	if fp.gotArgs != nil {
+		t.Error("CommitAndPush must not run after a gate-isolation refusal")
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run after a gate-isolation refusal")
+	}
+	// The verify command itself never executed.
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("verify command marker exists: the verify command executed despite the refusal")
+	}
+
+	events := readBundleEvents(t, bundlePath)
+	var verifyRuns, retries, summaries int
+	var sawFailedSignature bool
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_run":
+			verifyRuns++
+			if strings.Contains(string(ev.Data), `"outcome":"failed"`) && strings.Contains(string(ev.Data), gateIsolationRefusedSignature) {
+				sawFailedSignature = true
+			}
+		case "verify_infra_flake_retry":
+			retries++
+		case "verify_summary":
+			summaries++
+		}
+	}
+	if verifyRuns != 1 {
+		t.Errorf("verify_run events = %d, want 1", verifyRuns)
+	}
+	if !sawFailedSignature {
+		t.Error("expected exactly one failed verify_run carrying the refusal signature")
+	}
+	if retries != 0 {
+		t.Errorf("verify_infra_flake_retry events = %d, want 0 (the absorb must not fire on a refusal)", retries)
+	}
+	if summaries != 0 {
+		t.Errorf("verify_summary events = %d, want 0 (single-shot gate never emits it)", summaries)
+	}
+}
+
+// TestRun_VerifyGateCommitted_PersistentInfraFailure_CategoryC pins the
+// second latent #3449 instance: a post-absorb PERSISTENT infra signature
+// (#2645, golangci-lint lock contention) on the default single-shot gate
+// must also classify category C, matching what runner/cmd/fishhawk-runner/README.md
+// and docs/ARCHITECTURE.md already document for this case.
+func TestRun_VerifyGateCommitted_PersistentInfraFailure_CategoryC(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       scriptedVerifyCmd(t, lintLockOutput2645), // fails every invocation with the #2645 signature
+		VerifyMaxIterations: 0,                                        // single-shot committed gate (#802)
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"C"`) {
+		t.Errorf("expected category-C demote on a persistent infra signature:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("persistent infra failure must NOT classify category B:\n%s", stderr.String())
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (single-shot committed gate, no re-invoke)", invoker.callIdx)
+	}
+	if fp.gotArgs != nil {
+		t.Error("CommitAndPush must not run after a committed-tree gate block")
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run after a committed-tree gate block")
+	}
+
+	events := readBundleEvents(t, bundlePath)
+	var verifyRuns, failedRuns, retries, summaries int
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_run":
+			verifyRuns++
+			if strings.Contains(string(ev.Data), `"outcome":"failed"`) {
+				failedRuns++
+			}
+		case "verify_infra_flake_retry":
+			retries++
+		case "verify_summary":
+			summaries++
+		}
+	}
+	if verifyRuns != 2 || failedRuns != 2 {
+		t.Errorf("verify_run=%d (failed=%d), want 2 (both failed): the absorb must re-run once before classifying", verifyRuns, failedRuns)
+	}
+	if retries != 1 {
+		t.Errorf("verify_infra_flake_retry events = %d, want 1", retries)
+	}
+	if summaries != 0 {
+		t.Errorf("verify_summary events = %d, want 0 (single-shot gate never emits it)", summaries)
+	}
+}
+
 // TestRun_VerifyGateCommitted_PassProceeds: when the fix lives in a scope file
 // so the committed scope-only tree is green, the single-shot gate passes and the
 // push proceeds.
@@ -14551,6 +14748,9 @@ func TestRunVerifyGateCommitted_InfraFailureClassifiesInfraSentinel(t *testing.T
 			if got := pushFailureCategory(err); got != "C" {
 				t.Errorf("pushFailureCategory = %q, want C", got)
 			}
+			if got := committedGateFailureCategory(err); got != "C" {
+				t.Errorf("committedGateFailureCategory = %q, want C", got)
+			}
 			if tree != "" {
 				t.Errorf("failing gate must return an empty verified tree, got %q", tree)
 			}
@@ -14590,10 +14790,63 @@ func TestRunVerifyGateCommitted_SignalDeathStaysCategoryB(t *testing.T) {
 	if got := pushFailureCategory(err); got != "B" {
 		t.Errorf("pushFailureCategory = %q, want B", got)
 	}
+	if got := committedGateFailureCategory(err); got != "B" {
+		t.Errorf("committedGateFailureCategory = %q, want B", got)
+	}
 	for _, ev := range events {
 		if ev.Kind == "verify_infra_flake_retry" {
 			t.Error("the committed-tree absorb must not fire on a signal death")
 		}
+	}
+}
+
+// TestCommittedGateFailureCategory pins committedGateFailureCategory's
+// dispatch table directly, including the ORDERING-SENSITIVITY row (#3449
+// approval condition 1): an error wrapping BOTH the infra sentinel and a
+// category-B sentinel must still resolve to C, mirroring
+// pushFailureCategory's disjunctive-errors.Is rationale.
+func TestCommittedGateFailureCategory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "gate-isolation refusal wraps infra + refused sentinels",
+			err:  fmt.Errorf("%w: %w: refused", gitops.ErrVerifyInfraFailure, errGateIsolationRefused),
+			want: "C",
+		},
+		{
+			name: "bare post-absorb persistent infra signature",
+			err:  fmt.Errorf("%w: lint lock contention", gitops.ErrVerifyInfraFailure),
+			want: "C",
+		},
+		{
+			name: "red committed tree",
+			err:  fmt.Errorf("%w: tests failed", gitops.ErrCommittedTestsFailed),
+			want: "B",
+		},
+		{
+			name: "unresolvable verified tree",
+			err:  fmt.Errorf("%w: could not resolve", gitops.ErrPushedTreeNotVerified),
+			want: "B",
+		},
+		{
+			name: "fatal post-commit reset error (no sentinel)",
+			err:  errors.New("git reset --soft HEAD~1: exit status 128"),
+			want: "B",
+		},
+		{
+			name: "ordering-sensitive double wrap: infra + category-B sentinel",
+			err:  fmt.Errorf("%w: %w: both", gitops.ErrVerifyInfraFailure, gitops.ErrCommittedTestsFailed),
+			want: "C",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := committedGateFailureCategory(tc.err); got != tc.want {
+				t.Errorf("committedGateFailureCategory(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 

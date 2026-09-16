@@ -1,0 +1,14 @@
+id: scenario:issue-3449/retry-admitted-after-hosted-refusal
+statement: 'After the hosted-refusal failure above, the stage is retryable in place: the retry-stage endpoint (or the fishhawk_retry_stage tool) accepts the request and re-opens the implement stage rather than refusing it as a non-retryable category-B failure.'
+verify_hint: POST /v0/runs/{run_id}/stages/{stage_id}/retry (or the fishhawk_retry_stage MCP tool) returns success and GET /v0/runs/{run_id} shows the implement stage re-opened; previously the same call was refused for a category-B failure.
+steps: 'On the hosted-refusal dispatch run 43741029-20f9-4dfc-ba1e-33f7f566c6eb / implement 6d3e4ee8-3db5-4126-8832-95fe69d79810 (GET /v0/stages/{implement}: failed, failure_category C): POST /v0/stages/{implement}/retry {} with an operator bearer. First attempt with a bearer lacking write:stages -> 403 insufficient_scope (my token); minted a bearer with write:stages,write:retries via `fishhawkd token issue -db <preview db>` and repeated. Then GET /v0/stages/{implement}, GET /v0/runs/{run}/stages, GET /v0/runs/{run}, GET /v0/runs/{run}/audit.'
+assertions:
+    expected: Retry accepted and the implement stage re-opened rather than refused as a non-retryable category-B failure.
+    observed_at_record: 'POST retry -> 200 with the stage row {type implement, state awaiting_host_dispatch, failure_category null, failure_reason null, ended_at null}. GET stage: awaiting_host_dispatch; run state running; audit gains stage_retried after dispatch_reaper_failed. Caveat: the backend-side C that admitted the retry was stamped by the dispatch reaper (unconditional C for a non-zero runner exit, #1747), which also stamped C for the red-tree control, so retry admission on this target does not by itself isolate the runner-side reclassification; the runner-side C is evidenced in hosted-refusal-single-shot-is-category-c.'
+    repro_handle: 'POST /v0/stages/6d3e4ee8-3db5-4126-8832-95fe69d79810/retry -H ''Authorization: Bearer <write:stages>'' -d ''{}''; GET /v0/stages/6d3e4ee8-3db5-4126-8832-95fe69d79810'
+origin:
+    issue: 3449
+    pr: 3462
+    run_id: 900c96d0-4f99-41e9-b5b9-61ed5a60db7f
+    head_sha: c00c4dc53352ce19229796e2f3c15985ca93f1fa
+    recorded_at: 2026-09-16T19:38:42Z

@@ -594,6 +594,9 @@ func TestRunVerifyGateCommitted_RefusedIsCategoryC(t *testing.T) {
 	if !errors.Is(err, gitops.ErrVerifyInfraFailure) || !errors.Is(err, errGateIsolationRefused) {
 		t.Fatalf("err = %v, want ErrVerifyInfraFailure + errGateIsolationRefused", err)
 	}
+	if got := committedGateFailureCategory(err); got != "C" {
+		t.Errorf("committedGateFailureCategory = %q, want C", got)
+	}
 	if tree != "" {
 		t.Errorf("a refused gate must not yield a verified tree")
 	}

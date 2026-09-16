@@ -2215,10 +2215,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// the language-agnostic single-shot twin of the #728/#800 Go gate. This
 	// catches a drift-excluded test failure (#780/#776) for ANY language
 	// without the fix-loop cost; the older max_iterations==0 path ran against
-	// the dirty working tree and false-greened that class. A failure blocks
+	// the dirty working tree and false-greened that class. A red tree blocks
 	// as category B (artifact broken → park for re-scope/re-plan; category B
 	// does not self-retry, consistent with the operator opting OUT of the fix
-	// loop at max_iterations==0). Placed here — a sibling of runVerifyFixLoop,
+	// loop at max_iterations==0). A gate-isolation refusal or a post-absorb
+	// persistent infra signature (gitops.ErrVerifyInfraFailure) instead fails
+	// category C — a deployment/infrastructure condition the operator
+	// corrects and then fishhawk_retry_stage re-runs in place, matching
+	// runVerifyFixLoop's verify_gate_refused → C and the gateiso README
+	// (#3449). committedGateFailureCategory carries the classification.
+	// Placed here — a sibling of runVerifyFixLoop,
 	// OUTSIDE the ADR-023 self-retry for{} loop and BEFORE EmitStage so the
 	// throwaway-commit work is reflected and the demotion happens before
 	// openPRAndShipArtifact. The three verify guards still partition the
@@ -2239,7 +2245,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		verifiedTreeSHA = tree
 		if demote != nil {
 			res.OK = false
-			res.FailureCategory = "B"
+			res.FailureCategory = committedGateFailureCategory(demote)
 			// A stage blocked on an unanswered operator says so, with both
 			// recovery verbs, instead of reporting a bare verify failure. Only on
 			// the FAILURE path: a green stage with a pending amendment stays green
@@ -4457,6 +4463,27 @@ func pushFailureCategory(err error) string {
 	return "C"
 }
 
+// committedGateFailureCategory maps a runVerifyGateCommitted error to its
+// MVP_SPEC §6 failure category for the single-shot call site (#802, #3449).
+// gitops.ErrVerifyInfraFailure is checked FIRST — mirroring
+// pushFailureCategory's disjunctive-errors.Is ordering rationale above, since
+// an error wrapping both the infra sentinel and a category-B sentinel must
+// still resolve to C — and covers BOTH shapes the infra sentinel wraps:
+// errGateIsolationRefused (the gate never executed, ADR-063 / #2134) and the
+// bare post-absorb persistent infra signature (#2645). Everything else
+// (gitops.ErrCommittedTestsFailed, gitops.ErrPushedTreeNotVerified, and the
+// fatal post-commit gitResetSoftHEAD1 error, which carries no sentinel) stays
+// "B": a red tree or an unresolvable verified tree is an artifact defect, not
+// an infrastructure condition, and does not self-retry. Deliberately NOT
+// pushFailureCategory: that classifier's default arm is "C", which would
+// silently flip the fatal-reset error's verdict.
+func committedGateFailureCategory(err error) string {
+	if errors.Is(err, gitops.ErrVerifyInfraFailure) {
+		return "C"
+	}
+	return "B"
+}
+
 // isTestcontainersStartFlake reports whether a failed verify's output matches
 // the testcontainers container-start-timeout signature (#972): under
 // full-suite parallel load a developer-Mac Docker daemon intermittently times
@@ -5356,7 +5383,11 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 //     the failure as below.
 //   - A non-zero verify exit returns the events plus an error wrapping
 //     gitops.ErrCommittedTestsFailed, naming the drift files + captured output
-//     (category-B at the call site, symmetric with #800).
+//     (category-B at the call site, symmetric with #800). A gate-isolation
+//     refusal (wraps gitops.ErrVerifyInfraFailure + errGateIsolationRefused)
+//     or a post-absorb persistent infra signature (#2645, wraps bare
+//     gitops.ErrVerifyInfraFailure) instead classifies category C at the
+//     call site via committedGateFailureCategory (#3449).
 //   - A POST-commit gitResetSoftHEAD1 failure is FATAL, not a skip (#802
 //     approval condition). After the throwaway commit is materialized, a failed
 //     undo leaves HEAD on the throwaway commit, so openPRAndShipArtifact's real
