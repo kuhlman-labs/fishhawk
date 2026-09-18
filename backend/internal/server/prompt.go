@@ -2515,6 +2515,14 @@ const (
 	// issueContextReasonCachedContextEmpty: the run row's cached
 	// IssueContext was present but carried neither a title nor a body.
 	issueContextReasonCachedContextEmpty = "cached_context_empty"
+	// issueContextReasonFetchedContextEmpty: the forge fetch of the issue
+	// itself SUCCEEDED but the returned issue carried neither a title nor a
+	// body (#3436) — the fetched-shape mirror of
+	// issueContextReasonCachedContextEmpty. Decided at the end of the
+	// fetch branch, after the best-effort comment fetch, on both the
+	// comment-success and comment-error paths, so fetched comments and the
+	// browse URL still reach the trigger.
+	issueContextReasonFetchedContextEmpty = "fetched_context_empty"
 	// issueContextReasonRepoUnparseable: the run's Repo could not be split
 	// into a forge repo reference.
 	issueContextReasonRepoUnparseable = "repo_unparseable"
@@ -2547,7 +2555,11 @@ const issueContextUnresolvedCategory = "issue_context_unresolved"
 //     issueOpsFor ladder (cfg.ForgeResolver / forge.Get, isNilForge, the
 //     capability assertion), authenticate with forge.FromRef(installation_ref)
 //     and map FetchIssue / FetchIssueComments onto the trigger exactly as the
-//     GitHub branch does. This branch never touches the issueGetter.
+//     GitHub branch does. This branch never touches the issueGetter. Both
+//     fetch branches treat a successful fetch that returns neither a title
+//     nor a body as unresolved (issueContextReasonFetchedContextEmpty,
+//     #3436), decided after the best-effort comment fetch on either comment
+//     outcome — mirroring cached_context_empty for the fetched shape.
 //
 // IssueURL ladder, applied ONCE at the end over whatever the branch above
 // learned: the cached IssueContext.URL when present → the browse URL the
@@ -2638,16 +2650,19 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 			slog.Int("issue", issueNumber),
 			slog.String("error", err.Error()),
 		)
-		return ""
+	} else {
+		for _, c := range comments {
+			trigger.IssueComments = append(trigger.IssueComments, prompt.IssueComment{
+				Author:    c.Author,
+				Body:      c.Body,
+				CreatedAt: c.CreatedAt,
+			})
+		}
+		s.warnOverCapComments(ctx, runRow, issueNumber, trigger.IssueComments)
 	}
-	for _, c := range comments {
-		trigger.IssueComments = append(trigger.IssueComments, prompt.IssueComment{
-			Author:    c.Author,
-			Body:      c.Body,
-			CreatedAt: c.CreatedAt,
-		})
+	if trigger.IssueTitle == "" && trigger.IssueBody == "" {
+		return issueContextReasonFetchedContextEmpty
 	}
-	s.warnOverCapComments(ctx, runRow, issueNumber, trigger.IssueComments)
 	return ""
 }
 
@@ -2657,7 +2672,10 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 // ladder, the repo split on its last slash (nested GitLab paths), then
 // FetchIssue (required) and FetchIssueComments (best-effort) mapped onto
 // the trigger. Returns the fetched browse URL (empty when the forge sent
-// none — never fabricated) and the unresolved reason, "" on success.
+// none — never fabricated) and the unresolved reason: "" on a populated
+// fetch, issueContextReasonFetchedContextEmpty (#3436) when the fetch
+// succeeded but the issue carried neither a title nor a body, decided after
+// the best-effort comment fetch on either comment outcome.
 func (s *Server) fillIssueContextViaForge(ctx context.Context, family string, runRow *run.Run, issueNumber int, trigger *prompt.Trigger) (fetchedURL, reason string) {
 	if runRow.InstallationRef == nil || *runRow.InstallationRef == "" {
 		return "", issueContextReasonNoCredential
@@ -2702,16 +2720,19 @@ func (s *Server) fillIssueContextViaForge(ctx context.Context, family string, ru
 			slog.Int("issue", issueNumber),
 			slog.String("error", err.Error()),
 		)
-		return fetchedURL, ""
+	} else {
+		for _, c := range comments {
+			trigger.IssueComments = append(trigger.IssueComments, prompt.IssueComment{
+				Author:    c.Author,
+				Body:      c.Body,
+				CreatedAt: c.CreatedAt,
+			})
+		}
+		s.warnOverCapComments(ctx, runRow, issueNumber, trigger.IssueComments)
 	}
-	for _, c := range comments {
-		trigger.IssueComments = append(trigger.IssueComments, prompt.IssueComment{
-			Author:    c.Author,
-			Body:      c.Body,
-			CreatedAt: c.CreatedAt,
-		})
+	if trigger.IssueTitle == "" && trigger.IssueBody == "" {
+		return fetchedURL, issueContextReasonFetchedContextEmpty
 	}
-	s.warnOverCapComments(ctx, runRow, issueNumber, trigger.IssueComments)
 	return fetchedURL, ""
 }
 

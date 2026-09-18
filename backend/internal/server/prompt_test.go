@@ -1275,10 +1275,14 @@ func (h *issueContextHarness) promptOK(t *testing.T, runID, stageID uuid.UUID, p
 // gitlabIssueFake is a minimal GitLab v4 fake serving one issue + its notes
 // for project 5 / iid 42. issueStatus overrides the issue GET's status (a 500
 // drives the fetch_failed rung); issueBody is the JSON served on 200.
+// notesStatus overrides the notes GET's status (0 -> 200; non-zero -> that
+// status with {"message":"boom"}), driving the comment-fetch-error path
+// through the real forgegitlab adapter (#3436).
 type gitlabIssueFake struct {
 	mu          sync.Mutex
 	issueStatus int
 	issueBody   string
+	notesStatus int
 	notesBody   string
 	calls       []string
 }
@@ -1305,7 +1309,16 @@ func (f *gitlabIssueFake) handler() http.Handler {
 		f.mu.Lock()
 		f.calls = append(f.calls, r.Method+" "+r.URL.Path)
 		f.mu.Unlock()
+		status := f.notesStatus
+		if status == 0 {
+			status = http.StatusOK
+		}
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if status != http.StatusOK {
+			_, _ = io.WriteString(w, `{"message":"boom"}`)
+			return
+		}
 		body := f.notesBody
 		if body == "" {
 			body = "[]"
@@ -1568,7 +1581,8 @@ func TestFillIssueContext_Unresolved_WarnsAndAudits(t *testing.T) {
 		gh         func(*stubIssueGetter)
 		wantReason string
 		wantForge  string
-		render     bool // drive /prompt-render instead of the signed /prompt
+		wantURL    string // when non-empty, assert the prompt renders "URL: "+wantURL
+		render     bool   // drive /prompt-render instead of the signed /prompt
 	}
 	ghRow := func() *run.Run { return &run.Run{Repo: "o/n"} }
 	ghRowWithInstallation := func() *run.Run {
@@ -1661,6 +1675,42 @@ func TestFillIssueContext_Unresolved_WarnsAndAudits(t *testing.T) {
 			},
 			wantReason: issueContextReasonCachedContextEmpty, wantForge: webhook.ForgeGitLab,
 		},
+		{
+			name: "github_fetch_empty_fetched_context_empty", resolver: nilResolver, row: ghRowWithInstallation,
+			gh:         func(g *stubIssueGetter) { g.issue = &githubclient.Issue{Number: 42, State: "open"} },
+			wantReason: issueContextReasonFetchedContextEmpty, wantForge: "github",
+		},
+		{
+			name: "github_fetch_empty_comments_error_fetched_context_empty", resolver: nilResolver, row: ghRowWithInstallation,
+			gh: func(g *stubIssueGetter) {
+				g.issue = &githubclient.Issue{Number: 42, State: "open"}
+				g.commentsErr = errors.New("boom")
+			},
+			wantReason: issueContextReasonFetchedContextEmpty, wantForge: "github",
+		},
+		{
+			name: "gitlab_fetch_empty_fetched_context_empty",
+			resolver: func(t *testing.T) func(string) (forge.Forge, error) {
+				fake, r := newGitLabIssueForge(t)
+				fake.issueBody = `{"iid":42,"title":"","description":"","state":"opened","web_url":"https://gitlab.example/grp/sub/proj/-/issues/42"}`
+				return r
+			},
+			row:        gitlabRun,
+			wantReason: issueContextReasonFetchedContextEmpty, wantForge: webhook.ForgeGitLab,
+			wantURL: "https://gitlab.example/grp/sub/proj/-/issues/42",
+		},
+		{
+			name: "gitlab_fetch_empty_notes_500_fetched_context_empty",
+			resolver: func(t *testing.T) func(string) (forge.Forge, error) {
+				fake, r := newGitLabIssueForge(t)
+				fake.issueBody = `{"iid":42,"title":"","description":"","state":"opened","web_url":"https://gitlab.example/grp/sub/proj/-/issues/42"}`
+				fake.notesStatus = http.StatusInternalServerError
+				return r
+			},
+			row:        gitlabRun,
+			wantReason: issueContextReasonFetchedContextEmpty, wantForge: webhook.ForgeGitLab,
+			wantURL: "https://gitlab.example/grp/sub/proj/-/issues/42",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1682,6 +1732,9 @@ func TestFillIssueContext_Unresolved_WarnsAndAudits(t *testing.T) {
 			}
 			if c.wantForge != "github" && strings.Contains(got, "https://github.com/") {
 				t.Errorf("non-github run fabricated a github.com URL:\n%s", got)
+			}
+			if c.wantURL != "" && !strings.Contains(got, "URL: "+c.wantURL) {
+				t.Errorf("prompt must still render the fetched URL %q:\n%s", c.wantURL, got)
 			}
 			rows := h.unresolvedRows(t)
 			if len(rows) != 1 {
@@ -1715,6 +1768,219 @@ func TestFillIssueContext_Unresolved_WarnsAndAudits(t *testing.T) {
 			t.Errorf("resolved context logged %d unresolved WARNs, want 0", n)
 		}
 	})
+
+	// resolved_control_github_comments_error_zero_rows is the operator's
+	// binding condition: a POPULATED github fetch whose best-effort comment
+	// fetch errors must still render title+body unchanged and write ZERO
+	// issue_context_unresolved rows — pinning the tail check's `&&` (not
+	// `||`) directly, since a `||` slip would fire fetched_context_empty
+	// here despite the title/body being non-empty.
+	t.Run("resolved_control_github_comments_error_zero_rows", func(t *testing.T) {
+		h := newIssueContextHarness(t, nil)
+		installation := int64(99)
+		row := &run.Run{Repo: "o/n", InstallationID: &installation}
+		h.gh.issue = &githubclient.Issue{Number: 42, Title: "Populated title", Body: "Populated body", State: "open"}
+		h.gh.commentsErr = errors.New("boom")
+		runID, stageID, priv := h.seed(t, row, run.StageTypePlan)
+
+		got := h.promptOK(t, runID, stageID, priv)
+		if !strings.Contains(got, "Populated title") || !strings.Contains(got, "Populated body") {
+			t.Errorf("populated title/body must render unchanged on a comment-fetch error:\n%s", got)
+		}
+		if strings.Contains(got, "### Issue comments") {
+			t.Errorf("no comments section expected when the comment fetch failed:\n%s", got)
+		}
+		if rows := h.unresolvedRows(t); len(rows) != 0 {
+			t.Errorf("populated github fetch wrote %d issue_context_unresolved rows, want 0: %v", len(rows), rows)
+		}
+		if n := h.unresolvedWarns(); n != 0 {
+			t.Errorf("populated github fetch logged %d unresolved WARNs, want 0:\n%s", n, h.logs.String())
+		}
+	})
+
+	// resolved_control_gitlab_notes_error_zero_rows is the GitLab-family
+	// twin of the control above, through the real forgegitlab adapter: a
+	// POPULATED fetch whose notes GET 500s must still render title+body and
+	// the fetched web_url, and write ZERO issue_context_unresolved rows.
+	t.Run("resolved_control_gitlab_notes_error_zero_rows", func(t *testing.T) {
+		issueBody := `{"iid":42,"title":"Populated GitLab title","description":"Populated GitLab body","state":"opened","web_url":"https://gitlab.example/grp/sub/proj/-/issues/42"}`
+
+		// Plan stage renders title + body via writeIssueContext.
+		fake, resolver := newGitLabIssueForge(t)
+		fake.issueBody = issueBody
+		fake.notesStatus = http.StatusInternalServerError
+		h := newIssueContextHarness(t, resolver)
+		runID, stageID, priv := h.seed(t, gitlabRun(), run.StageTypePlan)
+		planGot := h.promptOK(t, runID, stageID, priv)
+		if !strings.Contains(planGot, "Populated GitLab title") || !strings.Contains(planGot, "Populated GitLab body") {
+			t.Errorf("populated title/body must render unchanged on a notes-fetch error:\n%s", planGot)
+		}
+		if rows := h.unresolvedRows(t); len(rows) != 0 {
+			t.Errorf("populated gitlab fetch wrote %d issue_context_unresolved rows, want 0: %v", len(rows), rows)
+		}
+		if n := h.unresolvedWarns(); n != 0 {
+			t.Errorf("populated gitlab fetch logged %d unresolved WARNs, want 0:\n%s", n, h.logs.String())
+		}
+
+		// Implement stage renders the link-only shape (title + web_url, no
+		// body — #244) via writeIssueLink; a fresh fake+harness because the
+		// GitLab client's underlying transport is single-use per httptest server.
+		fake2, resolver2 := newGitLabIssueForge(t)
+		fake2.issueBody = issueBody
+		fake2.notesStatus = http.StatusInternalServerError
+		h2 := newIssueContextHarness(t, resolver2)
+		runID2, stageID2, priv2 := h2.seed(t, gitlabRun(), run.StageTypeImplement)
+		implGot := h2.promptOK(t, runID2, stageID2, priv2)
+		if !strings.Contains(implGot, "URL: https://gitlab.example/grp/sub/proj/-/issues/42") {
+			t.Errorf("fetched web_url must still render:\n%s", implGot)
+		}
+		if rows := h2.unresolvedRows(t); len(rows) != 0 {
+			t.Errorf("populated gitlab fetch wrote %d issue_context_unresolved rows, want 0: %v", len(rows), rows)
+		}
+		if n := h2.unresolvedWarns(); n != 0 {
+			t.Errorf("populated gitlab fetch logged %d unresolved WARNs, want 0:\n%s", n, h2.logs.String())
+		}
+	})
+
+	// discriminating_control_github_comments_error_title_only_zero_rows closes
+	// the evidence-conflict gap in the two "populated title AND body" controls
+	// above: with BOTH fields non-empty, `title=="" && body==""` and
+	// `title=="" || body==""` evaluate identically (false), so those fixtures
+	// cannot tell the tail's real `&&` apart from a `||` slip. Here title is
+	// populated and body is EMPTY: under the correct `&&` this is
+	// false&&true=false (resolved, zero rows); under a `||` mutant it is
+	// false||true=true (wrongly unresolved, one row) — so only this asymmetric
+	// fixture actually discriminates the operator, on top of the same
+	// comment-fetch-error shape.
+	t.Run("discriminating_control_github_comments_error_title_only_zero_rows", func(t *testing.T) {
+		h := newIssueContextHarness(t, nil)
+		installation := int64(99)
+		row := &run.Run{Repo: "o/n", InstallationID: &installation}
+		h.gh.issue = &githubclient.Issue{Number: 42, Title: "Populated title", Body: "", State: "open"}
+		h.gh.commentsErr = errors.New("boom")
+		runID, stageID, priv := h.seed(t, row, run.StageTypePlan)
+
+		got := h.promptOK(t, runID, stageID, priv)
+		if !strings.Contains(got, "Populated title") {
+			t.Errorf("populated title must render unchanged on a comment-fetch error:\n%s", got)
+		}
+		if rows := h.unresolvedRows(t); len(rows) != 0 {
+			t.Errorf("title-only github fetch wrote %d issue_context_unresolved rows, want 0: %v", len(rows), rows)
+		}
+		if n := h.unresolvedWarns(); n != 0 {
+			t.Errorf("title-only github fetch logged %d unresolved WARNs, want 0:\n%s", n, h.logs.String())
+		}
+	})
+
+	// discriminating_control_gitlab_notes_error_title_only_zero_rows is the
+	// GitLab-family twin of the control above, through the real forgegitlab
+	// adapter, pinning the same asymmetric title-only/body-empty shape against
+	// fillIssueContextViaForge's tail check.
+	t.Run("discriminating_control_gitlab_notes_error_title_only_zero_rows", func(t *testing.T) {
+		fake, resolver := newGitLabIssueForge(t)
+		fake.issueBody = `{"iid":42,"title":"Populated GitLab title","description":"","state":"opened","web_url":"https://gitlab.example/grp/sub/proj/-/issues/42"}`
+		fake.notesStatus = http.StatusInternalServerError
+		h := newIssueContextHarness(t, resolver)
+		runID, stageID, priv := h.seed(t, gitlabRun(), run.StageTypePlan)
+
+		got := h.promptOK(t, runID, stageID, priv)
+		if !strings.Contains(got, "Populated GitLab title") {
+			t.Errorf("populated title must render unchanged on a notes-fetch error:\n%s", got)
+		}
+		if rows := h.unresolvedRows(t); len(rows) != 0 {
+			t.Errorf("title-only gitlab fetch wrote %d issue_context_unresolved rows, want 0: %v", len(rows), rows)
+		}
+		if n := h.unresolvedWarns(); n != 0 {
+			t.Errorf("title-only gitlab fetch logged %d unresolved WARNs, want 0:\n%s", n, h.logs.String())
+		}
+	})
+}
+
+// TestFillIssueContext_FetchedContextEmpty_KeepsCommentsAndURL pins the
+// fetched_context_empty tail's promise (#3436): even though the fetch is
+// classified unresolved, the fetched COMMENTS and browse URL still reach
+// the trigger — the tail decides the RETURNED REASON, not what gets
+// written onto trig. Direct fillIssueContext calls, one per family.
+func TestFillIssueContext_FetchedContextEmpty_KeepsCommentsAndURL(t *testing.T) {
+	t.Run("github", func(t *testing.T) {
+		h := newIssueContextHarness(t, nil)
+		installation := int64(99)
+		row := &run.Run{Repo: "o/n", InstallationID: &installation}
+		h.gh.issue = &githubclient.Issue{Number: 42, State: "open", HTMLURL: "https://github.example/o/n/issues/42"}
+		h.gh.comments = []githubclient.FetchedIssueComment{{Author: "alice", Body: "hello", CreatedAt: "2026-09-01T00:00:00Z"}}
+		h.seed(t, row, run.StageTypeImplement)
+
+		var trig prompt.Trigger
+		if reason := h.s.fillIssueContext(context.Background(), h.gh, h.rr.runRow, 42, &trig); reason != issueContextReasonFetchedContextEmpty {
+			t.Errorf("reason = %q, want %q", reason, issueContextReasonFetchedContextEmpty)
+		}
+		if len(trig.IssueComments) != 1 || trig.IssueComments[0].Author != "alice" || trig.IssueComments[0].Body != "hello" {
+			t.Errorf("comments = %+v, want one alice/hello comment", trig.IssueComments)
+		}
+		if trig.IssueURL != "https://github.example/o/n/issues/42" {
+			t.Errorf("trigger.IssueURL = %q, want the fetched html_url", trig.IssueURL)
+		}
+	})
+
+	t.Run("gitlab", func(t *testing.T) {
+		fake, resolver := newGitLabIssueForge(t)
+		fake.issueBody = `{"iid":42,"title":"","description":"","state":"opened","web_url":"https://gitlab.example/grp/sub/proj/-/issues/42"}`
+		fake.notesBody = `[{"id":1,"body":"gitlab note","system":false,"created_at":"2026-09-01T00:00:00Z","author":{"username":"glalice"}}]`
+		h := newIssueContextHarness(t, resolver)
+		h.seed(t, gitlabRun(), run.StageTypeImplement)
+
+		var trig prompt.Trigger
+		if reason := h.s.fillIssueContext(context.Background(), h.gh, h.rr.runRow, 42, &trig); reason != issueContextReasonFetchedContextEmpty {
+			t.Errorf("reason = %q, want %q", reason, issueContextReasonFetchedContextEmpty)
+		}
+		if len(trig.IssueComments) != 1 || trig.IssueComments[0].Author != "glalice" || trig.IssueComments[0].Body != "gitlab note" {
+			t.Errorf("comments = %+v, want one glalice/gitlab note comment", trig.IssueComments)
+		}
+		if trig.IssueURL != "https://gitlab.example/grp/sub/proj/-/issues/42" {
+			t.Errorf("trigger.IssueURL = %q, want the fetched web_url", trig.IssueURL)
+		}
+	})
+}
+
+// TestIssueContextURL_CachedNoURL_RepoUnparseable_NoURLDerived is the
+// sibling low concern: a cached IssueContext with a title/body but NO URL,
+// on a github-family run whose Repo cannot be split, must fall through
+// issueContextURL's format-string rung to empty — one WARN naming the parse
+// failure, no fabricated URL line, and (since the cached branch already
+// resolved title/body) zero issue_context_unresolved rows/WARNs. The
+// issueGetter must never be consulted: the cached branch short-circuits
+// before any fetch.
+func TestIssueContextURL_CachedNoURL_RepoUnparseable_NoURLDerived(t *testing.T) {
+	h := newIssueContextHarness(t, func(id string) (forge.Forge, error) {
+		t.Errorf("resolver must not be consulted on the cached branch (asked for %q)", id)
+		return nil, errors.New("unreachable")
+	})
+	row := &run.Run{Repo: "not-a-repo"}
+	row.IssueContext = &run.IssueContext{Number: 42, Title: "Cached title", Body: "Cached body"}
+	runID, stageID, priv := h.seed(t, row, run.StageTypeImplement)
+
+	got := h.promptOK(t, runID, stageID, priv)
+	if !strings.Contains(got, "Cached title") {
+		t.Errorf("prompt must render the cached title:\n%s", got)
+	}
+	if strings.Contains(got, "URL: ") {
+		t.Errorf("prompt must render NO URL line when Repo cannot be parsed:\n%s", got)
+	}
+	if strings.Contains(got, "https://github.com/") {
+		t.Errorf("prompt fabricated a github.com URL despite an unparseable Repo:\n%s", got)
+	}
+	if rows := h.unresolvedRows(t); len(rows) != 0 {
+		t.Errorf("resolved cached context wrote %d issue_context_unresolved rows, want 0: %v", len(rows), rows)
+	}
+	if n := h.unresolvedWarns(); n != 0 {
+		t.Errorf("resolved cached context logged %d issue_context_unresolved WARNs, want 0:\n%s", n, h.logs.String())
+	}
+	if got := strings.Count(h.logs.String(), "parse repo failed; no issue URL derived"); got != 1 {
+		t.Errorf("logged %d 'parse repo failed; no issue URL derived' WARNs, want exactly 1:\n%s", got, h.logs.String())
+	}
+	if h.gh.called {
+		t.Error("issueGetter must not be called on the cached branch")
+	}
 }
 
 // TestGetStagePrompt_CachedIssueContext_NoComments guards the
