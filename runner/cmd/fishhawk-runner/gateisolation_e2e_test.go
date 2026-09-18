@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -245,26 +246,45 @@ func outputField(out, key string) string {
 	return ""
 }
 
-// listenLoopback opens a TCP listener on 127.0.0.1 that accepts (and drops)
-// connections, returning its port: the host-loopback target the no-network
-// fixtures must FAIL to reach.
+// listenLoopback serves HTTP on 127.0.0.1 (every request answered 200 `ok`),
+// returning its port: the host-loopback target the no-network fixtures must
+// FAIL to reach. It ANSWERS rather than accept-and-drop (#3448 note 3) so a
+// host-side positive control can prove the listener is live — a container
+// `loopback=failed` then discriminates on --network=none, not on a dead
+// listener that would fail the fetch from anywhere.
 func listenLoopback(t *testing.T) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = l.Close() })
-	go func() {
-		for {
-			c, err := l.Accept()
-			if err != nil {
-				return
-			}
-			_ = c.Close()
-		}
-	}()
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("ok"))
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	go func() { _ = srv.Serve(l) }()
 	return l.Addr().(*net.TCPAddr).Port
+}
+
+// requireLoopbackAnswers is the host-side positive control for listenLoopback:
+// an http.Get from the test process must return 200 before a container is
+// asked to reach the same port. It fails (never skips) on any transport error
+// or non-200, so a dead listener cannot green the container's
+// `loopback=failed` assertion.
+func requireLoopbackAnswers(t *testing.T, port int) {
+	t.Helper()
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	if err != nil {
+		t.Fatalf("positive control: host-side GET of the loopback listener on 127.0.0.1:%d failed: %v", port, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("positive control: host-side GET of 127.0.0.1:%d returned %d, want 200", port, resp.StatusCode)
+	}
 }
 
 // (a) TestGateContainer_PrimaryGitUnreachable: on the container path the
@@ -278,7 +298,7 @@ func TestGateContainer_PrimaryGitUnreachable(t *testing.T) {
 	primary, linked, head := primaryWithLinkedWorktree(t)
 	liveContainerState(t, rt, image)
 	primaryAbs, _ := filepath.EvalSymlinks(primary)
-	_, out, outcome := runVerifyCommittedTree(context.Background(), plantCmd(primaryAbs), linked, head, 3*time.Minute, nil)
+	_, out, outcome, _ := runVerifyCommittedTree(context.Background(), plantCmd(primaryAbs), linked, head, 3*time.Minute, nil)
 	if outcome != "passed" {
 		t.Fatalf("outcome %q:\n%s", outcome, out)
 	}
@@ -300,12 +320,15 @@ func TestGateContainer_PrimaryGitUnreachable(t *testing.T) {
 
 // (b) TestGateContainer_NoNetwork: an external fetch and a fetch of a LIVE
 // host-loopback listener both fail, and no ethernet interface is present.
-// (/sys/class/net is asserted for the ABSENCE of eth*, not for "only lo":
-// Docker Desktop's VM kernel lists tunnel pseudo-devices such as gre0 in
-// every network namespace.)
+// The listener is proven live from the HOST first (requireLoopbackAnswers,
+// #3448 note 3), so `loopback=failed` inside the container discriminates on
+// --network=none rather than on a dead listener. (/sys/class/net is asserted
+// for the ABSENCE of eth*, not for "only lo": Docker Desktop's VM kernel
+// lists tunnel pseudo-devices such as gre0 in every network namespace.)
 func TestGateContainer_NoNetwork(t *testing.T) {
 	rt, image := requireGateImage(t)
 	port := listenLoopback(t)
+	requireLoopbackAnswers(t, port)
 	liveContainerState(t, rt, image)
 	cmd := fmt.Sprintf(`wget -q -T 3 -O /dev/null http://example.com/ && echo external=reached || echo external=failed; `+
 		`wget -q -T 3 -O /dev/null http://127.0.0.1:%d/ && echo loopback=reached || echo loopback=failed; `+
@@ -668,7 +691,7 @@ func TestGateClone_PlantedRefNeverReachesPrimary(t *testing.T) {
 	}
 	primary, linked, head := primaryWithLinkedWorktree(t)
 	primaryAbs, _ := filepath.EvalSymlinks(primary)
-	_, out, outcome := runVerifyCommittedTree(context.Background(), plantCmd(primaryAbs), linked, head, time.Minute, nil)
+	_, out, outcome, _ := runVerifyCommittedTree(context.Background(), plantCmd(primaryAbs), linked, head, time.Minute, nil)
 	if outcome != "passed" || outputField(out, "planted") != "ok" {
 		t.Fatalf("outcome %q:\n%s", outcome, out)
 	}
@@ -780,7 +803,7 @@ func TestGateHosted_RefusesEndToEnd(t *testing.T) {
 		if err := json.Unmarshal(ev.Payload, &p); err != nil {
 			t.Fatalf("verify_run payload: %v", err)
 		}
-		if p.Outcome == "failed" && isGateIsolationRefusal(p.Output) {
+		if p.Outcome == "failed" && strings.HasPrefix(p.Output, gateIsolationRefusedSignature) {
 			failedRuns++
 		}
 	}
@@ -796,7 +819,7 @@ func TestGateHosted_RefusesEndToEnd(t *testing.T) {
 	if err != nil || reinvoked || tree != "" {
 		t.Fatalf("fix loop: err=%v reinvoked=%t tree=%q", err, reinvoked, tree)
 	}
-	if res.OK || res.FailureCategory != "C" || !isGateIsolationRefusal(res.FailureReason) {
+	if res.OK || res.FailureCategory != "C" || !strings.HasPrefix(res.FailureReason, gateIsolationRefusedSignature) {
 		t.Errorf("res = OK:%t cat:%q reason:%q, want category C with the signature", res.OK, res.FailureCategory, res.FailureReason)
 	}
 	if invoker.callIdx != 0 {

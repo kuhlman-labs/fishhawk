@@ -288,18 +288,76 @@ exec); there is no persistent shared cache; the per-exec repopulation and the
 cold `GOCACHE` are accepted. The first container exec also pulls the image
 through the daemon inside the gate timeout — pre-pull it.
 
-## Refusal → category C
+## Never-executed gates → category C
 
-A `refused` selection makes `runBoundedGateArgv` return the text
-`gate isolation refused: <reason> (mode=… profile=… image=… runtime=… safe=…)`
-and `-1` WITHOUT executing. The verify gates recognise the LEADING signature
-(`isGateIsolationRefusal`; a mid-stream literal in untrusted verify output does
-not count) and classify it **category C**: `runVerifyCommittedTree` reports
-`failed` (never the tolerant `skipped`), `runVerifyGateCommitted` wraps
-`gitops.ErrVerifyInfraFailure` + `errGateIsolationRefused` and skips the
-infra-flake absorb, and `runVerifyFixLoop` breaks with `verify_gate_refused`
-and never re-invokes the fix agent. The signature matches none of
-`isVerifyInfraFailure`'s classes, so a refusal is never absorbed as a flake.
+**Classification is OUT OF BAND (#3448).** The runner's exec seam carries a
+`gateDisposition` beside the output and exit code
+(`runBoundedGateArgvDisposed` / `runBoundedGateCommandDisposed` in
+`runner/cmd/fishhawk-runner/main.go`; the un-suffixed names are one-line
+delegates that drop it, so every pre-existing caller is unchanged and there
+is still one containment implementation), `runGateInContainer` returns one
+per pre-exec branch, and `runVerifyCommittedTree` returns it as a FOURTH
+value that the two classifying gate sites (`runVerifyFixLoop`,
+`runVerifyGateCommitted`) read. Nothing matches a literal in the verify
+output any more — that output is untrusted, and a test that printed the
+refusal literal as its first line must not be able to steer its own red tree
+to category C (`isGateIsolationRefusal` is deleted;
+`TestRunVerifyFixLoop_PrintedRefusalLiteralIsNotRefused` pins the
+counterfactual). The `gate isolation refused:` lead survives as operator-facing
+TEXT in the refusal message and the FailureReason only. Of
+`runVerifyCommittedTree`'s SIX production call sites (the fix loop's scoped
+pass + full re-verify, the single-shot gate's run + absorb re-run, and the
+#960 strict re-verify's run + absorb re-run), the first four read the
+disposition and the #960 pair receives `_` — that site keeps its
+`isReverifyInfraFailure` classification, out of scope for #3448.
+
+The four dispositions, by classification:
+
+- **`executed`** — the argv ran (or the tolerant tmp-dir / clone `skipped`
+  branch fired); output + exit code are the verdict, classified exactly as
+  before. The zero value, so a `_`-receiving call site and the `skipped`
+  branches are never category C by construction
+  (`TestRunVerifyCommittedTree_SkipIsExecutedDisposition`).
+- **`refused`** — a `refused` selection makes the seam return
+  `gate isolation refused: <reason> (mode=… profile=… image=… runtime=… safe=…)`
+  and `-1` WITHOUT executing. **Category C**: `runVerifyCommittedTree` reports
+  `failed` (never the tolerant `skipped`), `runVerifyGateCommitted` wraps
+  `gitops.ErrVerifyInfraFailure` + `errGateIsolationRefused` and skips the
+  infra-flake absorb, and `runVerifyFixLoop` breaks with `verify_gate_refused`
+  and never re-invokes the fix agent.
+- **`unavailable`** — the container path failed BEFORE exec for a reason on
+  the HOST, not in the tree: visible-cache root creation, the lint-cache dir,
+  the resolved-path mount-guard refusal, the host `GOMODCACHE` probe or
+  `go mod download` (an offline host), or endpoint binding. The gate never
+  executed, so its verdict says nothing about the tree — the same argument
+  the refusal rests on — so it is **category C** exactly like a refusal:
+  `runVerifyGateCommitted` wraps `gitops.ErrVerifyInfraFailure` +
+  `errGateContainerUnavailable` (distinguishable from a refusal and from a
+  persistent infra signature with `errors.Is`), `runVerifyFixLoop` breaks
+  with `verify_gate_unavailable`, neither absorbs and neither invokes the fix
+  agent. One row per branch, including a stubbed endpoint binder, in
+  `TestRunGateInContainer_PreExecFailures`; the classification end to end in
+  `TestRunVerifyFixLoop_ContainerUnavailableIsCategoryC` and
+  `TestRunVerifyGateCommitted_ContainerUnavailableIsCategoryC`. Trade-off,
+  stated: a `go mod download` failure can in principle be tree-caused (a
+  bogus `require`) and now parks category C on the container path where the
+  host path fails it category B at build; bounded by the failure-safety
+  argument `isVerifyInfraFailure` documents — the push decision reads the
+  verify OUTCOME, never the classification, so a red seed costs an operator
+  `retry_stage`, never a verified-tree bypass.
+- **`checkout_refused`** — the host-side seed refused the checkout's OWN
+  module metadata (`errors.Is(err, ErrSeedCheckout)`: a symlinked `go.sum`, a
+  `replace` outside the checkout). That is TREE-attributable, so it keeps the
+  executed-failure classification (category A/B): the fix agent sees the
+  message naming the refused file
+  (`TestRunVerifyFixLoop_SeedCheckoutRefusedReachesFixAgent`). **Deliberate
+  residual:** a legitimate tree whose `replace` target sits outside the
+  checkout (`replace => ../sibling`) draws the same `ErrSeedCheckout` and
+  reaches the fix agent with the refusing message rather than parking C.
+
+Every pre-exec output (refusal text included) matches none of
+`isVerifyInfraFailure`'s classes, so a never-executed gate is never absorbed
+as a flake.
 
 **Both `run()`-level committed-gate call sites now agree on category C
 (#3449).** The fix-loop path (`executor.verify.max_iterations > 0`) always
@@ -334,12 +392,17 @@ sentinel (main_test.go) fails the binary when an INDEPENDENT runtime probe — a
 raw `docker version`/`podman version` plus a local-socket `Lstat`, never
 `DetectRuntime`'s own verdict (approval condition 3) — sees a runtime but no
 docker-gated fixture ran, so an all-skipped run on a docker host (including
-docker-present-but-image-unpullable) is a loud failure, not a green.
+docker-present-but-image-unpullable) is a loud failure, not a green. That
+eligibility routes through `gateE2EEligible(probe, detect)` (#3448 note 4),
+which returns `probe()` and is handed `DetectRuntime` precisely so
+`TestGateE2ESentinel_FiresOnIndependentProbeNotDetectRuntime` can inject a
+counting UNSAFE detect stub and assert eligible with ZERO detect calls on
+every host — no runtime skip, no refused-state theater.
 
 | Fixture | Proves |
 |---|---|
 | (a) `TestGateContainer_PrimaryGitUnreachable` | the verify gate's clone has its `.git` INSIDE `/work`; the primary's absolute path is unreachable; a planted hook + ref never reach the primary; `FISHHAWK_VERIFY_LOCK_PATH` is not injected on the container path |
-| (b) `TestGateContainer_NoNetwork` | external `wget` and `wget` to a LIVE host-loopback listener both fail; no `eth*` interface (Docker Desktop's VM kernel lists tunnel pseudo-devices, so the assertion is eth-absence, not "only lo") |
+| (b) `TestGateContainer_NoNetwork` | external `wget` and `wget` to a LIVE host-loopback listener both fail; no `eth*` interface (Docker Desktop's VM kernel lists tunnel pseudo-devices, so the assertion is eth-absence, not "only lo"). The listener SERVES HTTP (200 `ok`) and a host-side `http.Get` positive control must succeed BEFORE the container exec (#3448 note 3), so `loopback=failed` discriminates on `--network=none`, not on a dead listener |
 | (c) `TestGateContainer_HostFSUnreadable` | a marker outside the four mounts is unreadable; the host-exec control reads it |
 | (d) `TestGateContainer_NoDaemonSocket` | no docker/podman socket node inside; no socket under the mounts; the RUNTIME-side argv carries no socket token; a checkout with a planted unix socket is refused BEFORE the real seam |
 | (e) `TestGateContainer_EnvAllowList` | runner credentials set in the runner's env are absent inside; `GOPROXY=off` and the cache pins present; `extraEnv` preserved |

@@ -35,6 +35,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agentenv"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gateiso"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan/planfixture"
@@ -66,7 +67,9 @@ func runTestMain(m *testing.M) int {
 	// gateiso.DetectRuntime's Safe verdict — so a DetectRuntime regression
 	// that skips every docker-gated fixture on a genuinely safe host still
 	// fails the binary here rather than passing an all-skipped run green.
-	dockerFixturesEligible = independentRuntimeProbe()
+	// gateE2EEligible is the seam that pins that (#3448 note 4): it is handed
+	// DetectRuntime and must never consult it.
+	dockerFixturesEligible = gateE2EEligible(independentRuntimeProbe, gateiso.DetectRuntime)
 	runSuite := func() int {
 		code := m.Run()
 		if code == 0 && gateE2ESentinelShouldFire(dockerFixturesEligible, dockerFixturesRan, gateE2ESentinelRunFilter(), testing.Short()) {
@@ -12395,7 +12398,7 @@ func TestRun_VerifyGateCommitted_HostedRefusal_CategoryC(t *testing.T) {
 	if !strings.Contains(stderr.String(), "gate_isolation_selected") || !strings.Contains(stderr.String(), `"path":"refused"`) {
 		t.Errorf("expected gate_isolation_selected with path=refused:\n%s", stderr.String())
 	}
-	if !isGateIsolationRefusal(stderr.String()) && !strings.Contains(stderr.String(), gateIsolationRefusedSignature) {
+	if !strings.Contains(stderr.String(), gateIsolationRefusedSignature) {
 		t.Errorf("runner_completed reason must carry the gate-isolation-refused signature:\n%s", stderr.String())
 	}
 	// Single-shot: no fix re-invoke.
@@ -13567,7 +13570,7 @@ func TestVerifyCommittedTree_StripsRunnerCredsFromSubprocess(t *testing.T) {
 	runGit("commit", "-m", "seed commit")
 	head := gitHead(t, repo)
 
-	_, out, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute, nil)
+	_, out, _, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute, nil)
 	if strings.Contains(out, canary) {
 		t.Errorf("runVerifyCommittedTree leaked the runner secret into the gate subprocess env:\n%s", out)
 	}
@@ -13619,8 +13622,8 @@ func TestVerifyCommittedTree_IsolatesLintCachePerInvocation(t *testing.T) {
 	runGit("commit", "-m", "seed commit")
 	head := gitHead(t, repo)
 
-	_, out1, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute, nil)
-	_, out2, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute, nil)
+	_, out1, _, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute, nil)
+	_, out2, _, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute, nil)
 
 	c1 := extractEnvGateVal(out1, "GOLANGCI_LINT_CACHE")
 	c2 := extractEnvGateVal(out2, "GOLANGCI_LINT_CACHE")
@@ -15253,10 +15256,10 @@ func TestRunVerifyCommittedTree_OutcomeStrings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if ev, _, outcome := runVerifyCommittedTree(context.Background(), "true", repo, head, time.Minute, nil); outcome != "passed" {
+	if ev, _, outcome, _ := runVerifyCommittedTree(context.Background(), "true", repo, head, time.Minute, nil); outcome != "passed" {
 		t.Errorf("exit-0 outcome = %q, want passed (%s)", outcome, ev.Payload)
 	}
-	if _, _, outcome := runVerifyCommittedTree(context.Background(), "false", repo, head, time.Minute, nil); outcome != "failed" {
+	if _, _, outcome, _ := runVerifyCommittedTree(context.Background(), "false", repo, head, time.Minute, nil); outcome != "failed" {
 		t.Errorf("non-zero outcome = %q, want failed", outcome)
 	}
 	// A materialization failure (the head is not a commit in the clone) keeps
@@ -15264,7 +15267,7 @@ func TestRunVerifyCommittedTree_OutcomeStrings(t *testing.T) {
 	// replaced `git worktree add` with an independent clone; the outcome
 	// contract is unchanged).
 	bogus := strings.Repeat("deadbeef", 5)
-	ev, out, outcome := runVerifyCommittedTree(context.Background(), "true", repo, bogus, time.Minute, nil)
+	ev, out, outcome, _ := runVerifyCommittedTree(context.Background(), "true", repo, bogus, time.Minute, nil)
 	if outcome != "skipped" {
 		t.Errorf("clone-failure outcome = %q, want skipped (%s)", outcome, ev.Payload)
 	}
@@ -19511,8 +19514,8 @@ func TestFixupSelfReport_VocabularyMatchesProductionVerifyOutcome(t *testing.T) 
 	headSHA := gitHead(t, repo)
 	ctx := context.Background()
 
-	_, _, prodPass := runVerifyCommittedTree(ctx, "true", repo, headSHA, time.Minute, nil)
-	_, _, prodFail := runVerifyCommittedTree(ctx, "false", repo, headSHA, time.Minute, nil)
+	_, _, prodPass, _ := runVerifyCommittedTree(ctx, "true", repo, headSHA, time.Minute, nil)
+	_, _, prodFail, _ := runVerifyCommittedTree(ctx, "false", repo, headSHA, time.Minute, nil)
 	if prodPass == prodFail {
 		t.Fatalf("production pass/fail verify literals must differ, both = %q", prodPass)
 	}
