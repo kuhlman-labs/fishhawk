@@ -913,20 +913,38 @@ command-substitution safe, the `_k8s_pf_port` rule):
 (PATH stubs for `docker`/`kubectl`/`helm` recording `<tool> $*`, plus
 the one-shot `/healthz` responder): A1–A4 pure tables (provisioner,
 node names, normaliser, manifest parser including the not-a-layer-digest
-and index cases, skip predicate exactness); B1–B13 the gate, one named
-case per fail-closed branch with the branch literal AND the absence of
-the later mismatch literals asserted; C1–C6 the loader (`docker save`
-recorded EXACTLY once across two nodes, debug→wait→cp→import order, pods
-retained with clean names — the stub's `wait` prints a realistic
-`pod/<name> condition met` on stdout so a dropped redirect reddens —
-tarball removed, and each of import/debug-parse/save/wait/cp failures
-with its delete-or-no-delete expectation); D1–D4 `cmd_k8s_up` end to
-end (load before helm + EXIT-trap pod delete after the stubbed helm
-failure; no save on `docker-desktop`; unknown refuses BEFORE `docker
-build`; the skip knob continues with a warning); E body-grep ordering
-pins including NO `return 2`. Residual, stated honestly: the load and
-resolve paths are stub-tested in-loop and cluster-verified only by the
-operator walk on a real kind-provisioner host.
+and index cases, skip predicate exactness), plus two setup-step sanity
+checks (#3445) confirming the `noconfig.json` and `index.json` fixtures
+genuinely route to the branches B14–B18 below rely on, before those
+cases assert against them; B1–B18 the gate, one named case per
+fail-closed branch with the branch literal AND the absence of the
+later mismatch literals asserted — B14–B18 (#3445) round out
+`_k8s_resolve_running_image_id`'s four fail-closed branches via two
+per-call rc knobs: `STUB_CONTENT_FAIL_AT=<n>` fails the n-th `ctr
+content get` (B14 the first fetch, B15 the index-hop fetch), and
+`STUB_INSPECT_DIGEST_RC` fails ONLY `docker image inspect
+<repo>@sha256:…` (B18, the shared-provisioner digest resolve, distinct
+from `STUB_INSPECT_RC`'s local-ref inspect that B13 already covers);
+B16 seeds a manifest with no `config` key (the no-config-digest
+branch) and B17 nests `index.json` as its own second-hop response (the
+same branch via true index self-nesting, exactly 2 content gets, no
+third hop); C1–C6 the loader (`docker save` recorded EXACTLY once
+across two nodes, debug→wait→cp→import order, pods retained with clean
+names — the stub's `wait` prints a realistic `pod/<name> condition
+met` on stdout so a dropped redirect reddens — tarball removed, and
+each of import/debug-parse/save/wait/cp failures with its
+delete-or-no-delete expectation); D1–D4 `cmd_k8s_up` end to end (load
+before helm + EXIT-trap pod delete after the stubbed helm failure; no
+save on `docker-desktop`; unknown refuses BEFORE `docker build`; the
+skip knob continues with a warning); E body-grep ordering pins
+including NO `return 2`, plus (#3445) an awk-range extraction from the
+`if ! _verify_k8s_image_identity` line to ITS OWN closing `fi` (never
+a fixed `-A4`, which would bleed into the sibling
+`_verify_listener_identity` leg's identical kill/rm/exit shape a few
+lines above) pinning that leg's port-forward kill, pid-file removal
+and `exit 1`. Residual, stated honestly: the load and resolve paths
+are stub-tested in-loop and cluster-verified only by the operator walk
+on a real kind-provisioner host.
 
 ### Overridable host ports (E69.6 / [#2917](https://github.com/kuhlman-labs/fishhawk/issues/2917))
 
