@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -848,6 +849,105 @@ func TestSeedModCache_AcceptsInsideMetadata(t *testing.T) {
 	}
 	if !containsEnv(seen, "GOWORK=off") {
 		t.Fatalf("plain module env = %q; want GOWORK=off", seen)
+	}
+}
+
+// TestSeedModCache_ReplaceTargetDirectoryBoundary pins the replace-target
+// boundary of the seed guard (#3448 item 5). The guard's job is to refuse
+// reads through symlinks and outside the checkout root — NOT to police
+// go.mod presence, which is go's own concern and surfaces as go's own
+// error. So a directory `replace` target that EXISTS inside the checkout
+// but carries no go.mod is ACCEPTED: `go mod download all` runs (a
+// download failure then surfaces as the named download error, never as
+// ErrSeedCheckout), in both the go.mod and the go.work replace form. A
+// target that does NOT EXIST is unresolvable, so it is REFUSED with
+// ErrSeedCheckout naming `unresolvable`, before any go process runs and
+// with the destination left empty. Making seedResolveInside tolerate an
+// unresolvable path turns the refuse rows red (go runs, no ErrSeedCheckout).
+func TestSeedModCache_ReplaceTargetDirectoryBoundary(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not on PATH")
+	}
+	const goModReplace = "module x\n\ngo 1.21\n\nrequire example.com/local v0.0.0\n\nreplace example.com/local => %s\n"
+	const goWorkReplace = "go 1.21\n\nuse .\n\nreplace example.com/local => %s\n"
+	forms := []struct {
+		name  string
+		plant func(t *testing.T, co, target string)
+	}{
+		{"go.mod replace", func(t *testing.T, co, target string) {
+			writeFile(t, filepath.Join(co, "go.mod"), fmt.Sprintf(goModReplace, target))
+		}},
+		{"go.work replace", func(t *testing.T, co, target string) {
+			writeFile(t, filepath.Join(co, "go.mod"), "module x\n\ngo 1.21\n")
+			writeFile(t, filepath.Join(co, "go.work"), fmt.Sprintf(goWorkReplace, target))
+		}},
+	}
+	newDest := func(t *testing.T) *VisibleCaches {
+		t.Helper()
+		vc, err := NewVisibleCaches()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = vc.Remove() })
+		return vc
+	}
+	for _, form := range forms {
+		t.Run(form.name, func(t *testing.T) {
+			t.Run("existing target dir without go.mod is accepted", func(t *testing.T) {
+				co := t.TempDir()
+				form.plant(t, co, "./local")
+				if err := os.Mkdir(filepath.Join(co, "local"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				var seen [][]string
+				run := func(_ context.Context, _ string, _ []string, _ string, args ...string) ([]byte, error) {
+					seen = append(seen, args)
+					return nil, nil
+				}
+				if _, err := SeedModCache(context.Background(), run, co, "/host/mod", newDest(t), nil, time.Minute); err != nil {
+					t.Fatalf("err = %v; want the guard to accept an existing go.mod-less replace target", err)
+				}
+				var sawDownload bool
+				for _, args := range seen {
+					if strings.Join(args, " ") == "mod download all" {
+						sawDownload = true
+					}
+				}
+				if !sawDownload {
+					t.Fatalf("go invocations = %q; want `go mod download all` to run", seen)
+				}
+				// A download failure against that tree is go's own verdict,
+				// named as the download error — never re-attributed to the
+				// guard.
+				failing := func(context.Context, string, []string, string, ...string) ([]byte, error) {
+					return []byte("no go.mod in replacement"), errors.New("exit status 1")
+				}
+				dest := newDest(t)
+				_, err := SeedModCache(context.Background(), failing, co, "/host/mod", dest, nil, time.Minute)
+				if err == nil || errors.Is(err, ErrSeedCheckout) {
+					t.Fatalf("err = %v; want a download failure that is NOT ErrSeedCheckout", err)
+				}
+				if !strings.Contains(err.Error(), "go mod download into "+dest.GoModCache) || !strings.Contains(err.Error(), "no go.mod in replacement") {
+					t.Fatalf("err = %v; want the named download failure with go's output", err)
+				}
+			})
+			t.Run("nonexistent target dir is refused", func(t *testing.T) {
+				co := t.TempDir()
+				form.plant(t, co, "./missing")
+				run := func(_ context.Context, dir string, _ []string, name string, args ...string) ([]byte, error) {
+					t.Errorf("go must not run against a refused checkout; ran %s %q in %s", name, args, dir)
+					return nil, errors.New("must not run")
+				}
+				vc := newDest(t)
+				_, err := SeedModCache(context.Background(), run, co, "/host/mod", vc, nil, time.Minute)
+				if !errors.Is(err, ErrSeedCheckout) || !strings.Contains(err.Error(), "unresolvable") {
+					t.Fatalf("err = %v; want ErrSeedCheckout containing %q", err, "unresolvable")
+				}
+				if entries, _ := os.ReadDir(vc.GoModCache); len(entries) != 0 {
+					t.Fatalf("destination gained %d entries", len(entries))
+				}
+			})
+		})
 	}
 }
 
