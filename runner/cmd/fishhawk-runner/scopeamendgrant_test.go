@@ -690,11 +690,25 @@ func TestRun_ApprovedScopeAmendment_GrantUsed_NoUnusedSignal(t *testing.T) {
 // runnerCompletedLine finds the run's single runner_completed JSONL line and
 // decodes its outcome + reason (approval condition 1, #3433): a direct read
 // of the observable completion event, not an inference from the ABSENCE of a
-// substring across the whole log — logCompletion never renders a "reason" key
-// at all when res.OK, so a stderr-only negative for the annotation text would
-// stay green whether or not the annotation ever had a chance to fire on this
-// path. An absent key decodes to the zero value, so reason=="" covers both
-// "no reason key" (the OK shape) and "reason key present but empty".
+// substring across the whole log. An absent key decodes to the zero value, so
+// reason=="" covers both "no reason key" (the OK shape) and "reason key
+// present but empty".
+//
+// VERIFIED LIMIT (#3433 fix-up review): this direct decode has the SAME
+// blind spot as the stderr-negative substring it supplements, not a
+// different one. logCompletion's res.OK branch never renders a "reason" key
+// at all — regardless of res.FailureReason's value — so it cannot observe
+// whether annotateUnusedAmendmentFailure ran on a passing result. Confirmed
+// by counterfactual: removing the `!res.OK &&` guard at the run()-level call
+// site (main.go) and re-running
+// TestRun_ApprovedScopeAmendment_OnePathUsedOneUnused_EventOnPassingPath left
+// it GREEN. What this decode DOES add over the substring check: it reads a
+// structured field instead of grepping free text, so it would catch a
+// regression that changed logCompletion to render "reason" on the OK path
+// with a non-empty value. It does not, and cannot, catch the annotation
+// itself running unconditionally while res.OK stays true — that would need a
+// surface independent of logCompletion's OK/failure branch, which does not
+// exist today.
 func runnerCompletedLine(t *testing.T, log string) (outcome, reason string) {
 	t.Helper()
 	for _, line := range strings.Split(log, "\n") {
@@ -816,11 +830,15 @@ func TestRun_ApprovedScopeAmendment_OnePathUsedOneUnused_EventOnPassingPath(t *t
 		t.Errorf("a passing run must carry no unused-grant failure annotation:\n%s", stderr.String())
 	}
 	// Approval condition 1: assert res.FailureReason == "" DIRECTLY via the
-	// runner_completed line's reason field rather than relying only on the
-	// stderr-negative substring check above, which is vacuous on this path —
-	// logCompletion emits no "reason" key at all when res.OK, so the negative
-	// substring check would stay green even if the annotation call were
-	// wired to run unconditionally instead of guarded by !res.OK.
+	// runner_completed line's reason field, structured-field-read alongside
+	// the stderr-negative substring check above rather than a replacement for
+	// it. Neither arm can observe an unconditional annotation call on a
+	// passing result (see runnerCompletedLine's VERIFIED LIMIT doc comment,
+	// confirmed by counterfactual on #3433 fix-up review) because
+	// logCompletion's res.OK branch renders no "reason" key at all,
+	// independent of res.FailureReason's value. Kept for what it DOES catch:
+	// a regression in logCompletion itself that starts rendering "reason" on
+	// the OK path.
 	outcome, reason := runnerCompletedLine(t, stderr.String())
 	if outcome != "ok" || reason != "" {
 		t.Errorf("runner_completed outcome/reason = %q/%q, want \"ok\"/\"\"", outcome, reason)
