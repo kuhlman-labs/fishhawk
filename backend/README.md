@@ -29,9 +29,16 @@ From the repo root (workspace-aware):
 
 Integration tests under `internal/run/postgres_test.go` require Docker (testcontainers spins up Postgres 16). Devs without Docker get a `t.Skip`.
 
-To regenerate sqlc code after editing `internal/run/queries.sql`:
+To regenerate sqlc code after editing `internal/run/queries.sql`, run the FULL
+config in a throwaway copy and copy back ONLY the target package's `db/`:
 
-    cd backend && sqlc generate
+    cp -r backend /tmp/sqlc-x && (cd /tmp/sqlc-x && sqlc generate) && cp /tmp/sqlc-x/internal/run/db/*.go backend/internal/run/db/
+
+The full `sqlc.yaml` parses (#2880 fixed the two pre-existing query errors that
+used to abort it), but every OTHER `internal/*/db` package is hand-maintained
+and a full run rewrites all of them — never run `sqlc generate` in the
+worktree, and `git status --porcelain` afterwards must list only the intended
+package. Long-form: `internal/run/README.md` § sqlc.
 
 ## Status
 

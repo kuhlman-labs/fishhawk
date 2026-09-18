@@ -190,7 +190,7 @@ func (q *Queries) GetLastGlobalAuditEntryUntenanted(ctx context.Context) (AuditE
 
 const listAuditEntriesForRunChain = `-- name: ListAuditEntriesForRunChain :many
 WITH RECURSIVE run_chain AS (
-    SELECT id FROM runs WHERE id = $1
+    SELECT runs.id FROM runs WHERE runs.id = $1
     UNION ALL
     SELECT r.id FROM runs r
     JOIN run_chain rc ON r.parent_run_id = rc.id

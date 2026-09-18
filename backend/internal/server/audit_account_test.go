@@ -10,11 +10,13 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -22,6 +24,8 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
@@ -261,6 +265,134 @@ func TestIdentityAccountID_Branches(t *testing.T) {
 				t.Fatalf("got %s, want nil", *got)
 			case tc.want != nil && (got == nil || *got != *tc.want):
 				t.Fatalf("got %v, want %s", got, *tc.want)
+			}
+		})
+	}
+}
+
+// TestAuditExport_TenantedRunThroughUpdateRunState_AccountVisiblePage is the
+// cross-boundary pin for #2880: a run row whose stored state was written by
+// the sqlc UpdateRunState path (RunRepo.TransitionRun) still carries its
+// account_id through run.Repository → the JSON export handler → the HTTP
+// body, where accountVisiblePage decides what each caller sees. Tenant A
+// exports A's run plus the untenanted run and NOT B's; tenant B the mirror;
+// an unbound operator sees all three. Asserted on the exported run ids in
+// the response body — the HTTP surface — not on the helper directly.
+func TestAuditExport_TenantedRunThroughUpdateRunState_AccountVisiblePage(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	auditRepo := audit.NewPostgresRepository(pool)
+	runRepo := run.NewPostgresRepository(pool)
+	s := New(Config{
+		AuditRepo:    auditRepo,
+		RunRepo:      runRepo,
+		SigningRepo:  signing.NewPostgresRepository(pool),
+		APITokenRepo: apitoken.NewPostgresRepository(pool),
+	})
+
+	acctA := uuid.New()
+	acctB := uuid.New()
+	for _, a := range []struct {
+		id  uuid.UUID
+		key string
+	}{{acctA, "acct-a"}, {acctB, "acct-b"}} {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`, a.id, a.key); err != nil {
+			t.Fatalf("insert account %s: %v", a.key, err)
+		}
+	}
+
+	// One repo per test so the repo filter isolates this test's runs from
+	// any other rows sharing the pgtest clone.
+	repo := "acme/tenanted-" + uuid.NewString()[:8]
+	// seed creates a run, binds it to acct (nil = untenanted), drives it
+	// through TransitionRun (UpdateRunState) and appends one audit entry.
+	seed := func(acct *uuid.UUID) uuid.UUID {
+		t.Helper()
+		r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+			Repo:          repo,
+			WorkflowID:    "feature_change",
+			WorkflowSHA:   "deadbeef",
+			TriggerSource: run.TriggerCLI,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		if acct != nil {
+			if _, err := pool.Exec(ctx, `UPDATE runs SET account_id = $1 WHERE id = $2`, *acct, r.ID); err != nil {
+				t.Fatalf("bind account: %v", err)
+			}
+		}
+		if _, err := runRepo.TransitionRun(ctx, r.ID, run.StateRunning); err != nil {
+			t.Fatalf("TransitionRun: %v", err)
+		}
+		kind := audit.ActorKind("system")
+		subject := "system"
+		if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:        r.ID,
+			Timestamp:    time.Now().UTC(),
+			Category:     "run_created",
+			ActorKind:    &kind,
+			ActorSubject: &subject,
+			Payload:      json.RawMessage(`{}`),
+		}); err != nil {
+			t.Fatalf("append audit entry: %v", err)
+		}
+		return r.ID
+	}
+	runA := seed(&acctA)
+	runB := seed(&acctB)
+	runPlain := seed(nil)
+
+	// export drives GET /v0/audit/export under the given identity (a
+	// read:audit-export-scoped token) and returns the exported run-id set.
+	export := func(id Identity) map[string]bool {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/v0/audit/export?repo="+repo+"&include_global=false", nil)
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+		w := httptest.NewRecorder()
+		s.handleAuditExport(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("export status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+		}
+		var body struct {
+			Runs map[string]json.RawMessage `json:"runs"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode export body: %v", err)
+		}
+		got := make(map[string]bool, len(body.Runs))
+		for k := range body.Runs {
+			got[k] = true
+		}
+		return got
+	}
+	scoped := func(subject, acct string) Identity {
+		return Identity{Subject: subject, TokenID: "tok-" + subject, Scopes: []string{scopeAuditExport}, AccountID: acct}
+	}
+
+	cases := []struct {
+		name    string
+		id      Identity
+		visible []uuid.UUID
+		hidden  []uuid.UUID
+	}{
+		{"tenant A", scoped("github:alice", acctA.String()), []uuid.UUID{runA, runPlain}, []uuid.UUID{runB}},
+		{"tenant B", scoped("github:bob", acctB.String()), []uuid.UUID{runB, runPlain}, []uuid.UUID{runA}},
+		{"operator", scoped("operator", ""), []uuid.UUID{runA, runB, runPlain}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := export(tc.id)
+			for _, id := range tc.visible {
+				if !got[id.String()] {
+					t.Errorf("%s: exported runs %v missing %s", tc.name, got, id)
+				}
+			}
+			for _, id := range tc.hidden {
+				if got[id.String()] {
+					t.Errorf("%s: exported runs %v leak another tenant's run %s", tc.name, got, id)
+				}
 			}
 		})
 	}

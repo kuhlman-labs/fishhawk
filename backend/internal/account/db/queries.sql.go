@@ -336,10 +336,13 @@ func (q *Queries) ListAccountsByAccountKey(ctx context.Context, accountKey strin
 const listAutoJoinAccountsByKeys = `-- name: ListAutoJoinAccountsByKeys :many
 SELECT a.id, a.account_key, a.granularity, a.auto_join_role
   FROM accounts a
-  JOIN unnest($2::text[], $3::text[])
-       AS p(account_key, granularity)
-    ON a.account_key = p.account_key
-   AND a.granularity = p.granularity
+  JOIN unnest($2::text[]) WITH ORDINALITY
+       AS k(account_key, ord)
+    ON a.account_key = k.account_key
+  JOIN unnest($3::text[]) WITH ORDINALITY
+       AS g(granularity, ord)
+    ON g.ord = k.ord
+   AND a.granularity = g.granularity
  WHERE a.provider = $1
    AND a.auto_join_role IS NOT NULL
  ORDER BY a.account_key ASC, a.granularity ASC

@@ -10,7 +10,12 @@ sqlc surface (`accountdb`) — `Account` / `Installation` / `AccountMember` mode
 plus basic upsert/get queries — that later E44 children build on: endpoint
 resolution (#1826), handler authz (#1829), and RLS (#1830). Like the other
 `internal/*/db` packages, sqlc is **not regenerated locally** (established
-convention); `db/*.go` is hand-written to match sqlc's output shape.
+convention); `db/*.go` is hand-written to match sqlc's output shape. Since
+#2880 the package's `queries.sql` PARSES under the full `backend/sqlc.yaml`
+(the two-argument `unnest` it used to carry was the one construct sqlc's
+catalog rejects), so a throwaway full-config `sqlc generate` can be used to
+check a hand-mirrored constant against the generator's output — but the
+`db/*.go` here is still hand-maintained, not copied back from that run.
 
 ## The three identity tables
 
@@ -35,9 +40,13 @@ convention); `db/*.go` is hand-written to match sqlc's output shape.
 ## The auto-join intersection query is PAIR-WISE (E44.3, generalized in E44.8 / #1832)
 
 `ListAutoJoinAccountsByKeys` takes TWO string arrays — `account_keys` and
-`granularities` — that are **positionally paired**, `unnest`ed together and
-joined against `accounts`, so index *i*'s key only ever matches index *i*'s
-granularity. It is deliberately NOT
+`granularities` — that are **positionally paired** and joined against
+`accounts`, so index *i*'s key only ever matches index *i*'s granularity. The
+pairing is expressed as two `unnest(...) WITH ORDINALITY` sources joined on
+their ordinal (`g.ord = k.ord`) — the same guarantee as the two-argument
+`unnest(keys, granularities)` it replaced (#2880), in a form sqlc's catalog
+parses; for the equal-length arrays the caller always passes the two forms are
+equivalent. It is deliberately NOT
 `account_key = ANY(keys) AND granularity = ANY(granularities)`: those are
 independent predicates whose cartesian product would admit a user who is merely
 an org member of "acme" into an `enterprise`-granularity account keyed "acme"

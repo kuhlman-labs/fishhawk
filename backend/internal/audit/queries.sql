@@ -76,7 +76,7 @@ SELECT * FROM audit_entries
 -- NULL are pruned from the walk so the result covers only the CI-
 -- retry chain. When true, all descendants are included.
 WITH RECURSIVE run_chain AS (
-    SELECT id FROM runs WHERE id = $1
+    SELECT runs.id FROM runs WHERE runs.id = $1
     UNION ALL
     SELECT r.id FROM runs r
     JOIN run_chain rc ON r.parent_run_id = rc.id
