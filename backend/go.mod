@@ -3,7 +3,7 @@ module github.com/kuhlman-labs/fishhawk/backend
 go 1.25.0
 
 require (
-	github.com/anthropics/anthropic-sdk-go v1.68.0
+	github.com/anthropics/anthropic-sdk-go v1.73.0
 	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.5
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.5
