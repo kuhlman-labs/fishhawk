@@ -15001,6 +15001,80 @@ func TestBoundVerifyFixOutput(t *testing.T) {
 			t.Errorf("excerpt lacks the marker:\n%.200s", got)
 		}
 	})
+	// keptTail parses the excerpt's marker to recover the exact tail byte count
+	// kept, mirroring the arithmetic in "over limit snaps to line boundaries".
+	keptTail := func(t *testing.T, got string, elided int) int {
+		t.Helper()
+		marker := fmt.Sprintf("[... %d bytes of verify output elided here", elided)
+		mi := strings.Index(got, marker)
+		if mi < 0 {
+			t.Fatalf("marker not found in excerpt:\n%.200s", got)
+		}
+		return len(got) - (mi + strings.Index(got[mi:], "...]\n") + len("...]\n"))
+	}
+	t.Run("tail snap below floor keeps raw window", func(t *testing.T) {
+		// The last `tail` bytes of the input are a single line whose only
+		// newline is its final byte, so the line-snap alone would keep 0
+		// bytes and elide the failure content the tail exists to preserve.
+		var b strings.Builder
+		for b.Len() < 200<<10 {
+			b.WriteString(line(100, 'a'))
+		}
+		b.WriteString(line(tail, 'z'))
+		in := b.String()
+		got, elided := boundVerifyFixOutput(in)
+		if elided <= 0 {
+			t.Fatalf("elided = %d, want > 0", elided)
+		}
+		if got := keptTail(t, got, elided); got != tail {
+			t.Errorf("tailKept = %d, want raw window %d (degenerate snap must fall back)", got, tail)
+		}
+		if !strings.HasSuffix(got, in[len(in)-tail:]) {
+			t.Errorf("excerpt must end with the raw last %d bytes of input", tail)
+		}
+		wantMarker := fmt.Sprintf("and last %d bytes are kept", tail)
+		if !strings.Contains(got, wantMarker) {
+			t.Errorf("excerpt marker must report the full raw tail kept, want %q:\n%.300s", wantMarker, got[len(got)-300:])
+		}
+		marker := fmt.Sprintf("[... %d bytes of verify output elided here", elided)
+		if len(got) > head+tail+len(marker)+200 {
+			t.Errorf("len(excerpt) = %d, want <= head+tail+marker", len(got))
+		}
+	})
+	t.Run("tail snap at floor still snaps", func(t *testing.T) {
+		const floor = verifyFixOutputTailFloorBytes
+		prefix := strings.Repeat("p", head+1000)
+		tailRaw := []byte(strings.Repeat("z", tail))
+		tailRaw[tail-floor-1] = '\n' // snap keeps exactly floor bytes
+		in := prefix + string(tailRaw)
+		got, elided := boundVerifyFixOutput(in)
+		if elided <= 0 {
+			t.Fatalf("elided = %d, want > 0", elided)
+		}
+		if got := keptTail(t, got, elided); got != floor {
+			t.Errorf("tailKept = %d, want floor %d (snap must apply, not fall back)", got, floor)
+		}
+		if !strings.HasSuffix(got, in[len(in)-floor:]) {
+			t.Errorf("excerpt tail must be exactly the last %d bytes of input", floor)
+		}
+	})
+	t.Run("tail snap one under floor falls back", func(t *testing.T) {
+		const floor = verifyFixOutputTailFloorBytes
+		prefix := strings.Repeat("p", head+1000)
+		tailRaw := []byte(strings.Repeat("z", tail))
+		tailRaw[tail-floor] = '\n' // snap would keep floor-1 bytes
+		in := prefix + string(tailRaw)
+		got, elided := boundVerifyFixOutput(in)
+		if elided <= 0 {
+			t.Fatalf("elided = %d, want > 0", elided)
+		}
+		if got := keptTail(t, got, elided); got != tail {
+			t.Errorf("tailKept = %d, want raw window %d (snap keeping floor-1 must fall back)", got, tail)
+		}
+		if !strings.HasSuffix(got, in[len(in)-tail:]) {
+			t.Errorf("excerpt tail must fall back to the raw last %d bytes of input", tail)
+		}
+	})
 }
 
 // TestRunVerifyFixLoop_FixPromptBounded drives the REAL loop against a verify

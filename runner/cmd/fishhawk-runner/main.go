@@ -5544,13 +5544,24 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 const (
 	verifyFixOutputHeadBytes = 16 << 10
 	verifyFixOutputTailBytes = 48 << 10
+	// verifyFixOutputTailFloorBytes is the minimum tail the line-snap below may
+	// keep before falling back to the raw byte window (#3431). A degenerate
+	// window whose only newline is its final byte (e.g. one very long
+	// once-terminated line filling the tail) would otherwise snap to 0 kept
+	// bytes and elide the failure lines the tail exists to preserve.
+	verifyFixOutputTailFloorBytes = 4 << 10
 )
 
 // boundVerifyFixOutput returns out unchanged (elided=0) when it fits within
-// head+tail bytes; otherwise the first head bytes and the last tail bytes,
-// each snapped to a line boundary inside its window when one exists, joined by
-// an explicit marker line naming the elided byte count. A window with no
-// newline keeps its raw byte slice so the bound holds regardless of content.
+// head+tail bytes; otherwise the first head bytes and the last tail bytes.
+// The head is snapped to a line boundary inside its window when one exists.
+// The tail is snapped to a line boundary inside its window when one exists
+// AND the snap keeps at least verifyFixOutputTailFloorBytes; otherwise the
+// raw tail byte window is kept instead. Either way the retained tail never
+// exceeds the original tail-byte window, so the excerpt never exceeds
+// head+tail bytes and the OS argument-size bound below still holds. A window
+// with no newline likewise keeps its raw byte slice so the bound holds
+// regardless of content.
 func boundVerifyFixOutput(out string) (excerpt string, elided int) {
 	const head, tail = verifyFixOutputHeadBytes, verifyFixOutputTailBytes
 	if len(out) <= head+tail {
@@ -5560,9 +5571,13 @@ func boundVerifyFixOutput(out string) (excerpt string, elided int) {
 	if i := strings.LastIndexByte(out[:head], '\n'); i >= 0 {
 		headEnd = i + 1
 	}
-	tailStart := len(out) - tail
+	rawTailStart := len(out) - tail
+	tailStart := rawTailStart
 	if i := strings.IndexByte(out[tailStart:], '\n'); i >= 0 {
 		tailStart += i + 1
+	}
+	if len(out)-tailStart < verifyFixOutputTailFloorBytes {
+		tailStart = rawTailStart
 	}
 	elided = tailStart - headEnd
 	marker := fmt.Sprintf("[... %d bytes of verify output elided here so the fix prompt fits the OS argument-size limit; the first %d and last %d bytes are kept — re-run the command yourself for the full output ...]\n",
