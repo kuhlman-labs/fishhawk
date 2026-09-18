@@ -21,9 +21,10 @@ import (
 
 // ---------------------------------------------------------------------------
 // Gate isolation wiring (ADR-063 / #2134): configuration, selection, the
-// refusal signature, the exec-path switch, and the clone materialization at
-// the two gate sites. The gateiso package's own tests pin the pure pieces;
-// these pin that the runner reaches them through its ONE gate-exec seam.
+// out-of-band gate disposition (#3448), the exec-path switch, and the clone
+// materialization at the two gate sites. The gateiso package's own tests pin
+// the pure pieces; these pin that the runner reaches them through its ONE
+// gate-exec seam and classifies on the disposition, never on output text.
 // ---------------------------------------------------------------------------
 
 // installGateState installs st as the process-wide isolation state for the
@@ -237,11 +238,14 @@ func TestRunBoundedGateCommand_RefusedDoesNotExecute(t *testing.T) {
 	captureHostExec(t, true, 0)
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "ran")
-	out, code := runBoundedGateCommand(context.Background(), "touch "+marker, dir, filepath.Join(dir, "lc"), time.Minute)
+	out, code, disp := runBoundedGateCommandDisposed(context.Background(), "touch "+marker, dir, filepath.Join(dir, "lc"), time.Minute)
 	if code != -1 {
 		t.Errorf("exit = %d, want -1", code)
 	}
-	if !strings.HasPrefix(out, gateIsolationRefusedSignature) || !isGateIsolationRefusal(out) {
+	if disp != gateRefused {
+		t.Errorf("disposition = %s, want refused", disp)
+	}
+	if !strings.HasPrefix(out, gateIsolationRefusedSignature) {
 		t.Errorf("output %q must lead with the refusal signature", out)
 	}
 	if _, err := os.Stat(marker); err == nil {
@@ -249,39 +253,172 @@ func TestRunBoundedGateCommand_RefusedDoesNotExecute(t *testing.T) {
 	}
 }
 
-// TestRunBoundedGateCommand_ContainerRefusesSocketInCheckout: on the container
-// path a checkout carrying a unix socket is refused by the mount guard BEFORE
-// the runtime CLI is reached (deleting the BuildArgv guard turns this red: the
-// seam is called).
-func TestRunBoundedGateCommand_ContainerRefusesSocketInCheckout(t *testing.T) {
-	// A SHORT path: unix socket paths are capped at ~104 bytes on macOS, and a
-	// t.TempDir under the long test-name directory exceeds it (bind: invalid
-	// argument → a silent SKIP that would leave this control unpinned).
+// stubSeed swaps the container path's host-side seed for fn for the test.
+func stubSeed(t *testing.T, fn func(checkout string) error) {
+	t.Helper()
+	prev := seedModCacheFn
+	seedModCacheFn = func(_ context.Context, _ gateiso.SeedExecFunc, checkout, _ string, _ *gateiso.VisibleCaches, _ []string, _ time.Duration) (gateiso.SeedReport, error) {
+		return gateiso.SeedReport{}, fn(checkout)
+	}
+	t.Cleanup(func() { seedModCacheFn = prev })
+}
+
+// stubBindEndpointEnv swaps the runtime CLI's endpoint binder for one that
+// fails with err (approval condition 1 of #3448).
+func stubBindEndpointEnv(t *testing.T, err error) {
+	t.Helper()
+	prev := bindEndpointEnvFn
+	bindEndpointEnvFn = func(gateiso.Runtime, []string) ([]string, error) { return nil, err }
+	t.Cleanup(func() { bindEndpointEnvFn = prev })
+}
+
+// shortTempDir is a SHORT checkout path for a row that plants a unix socket:
+// socket paths are capped at ~104 bytes on macOS, and a t.TempDir under the
+// long test-name directory exceeds it (bind: invalid argument → a silent SKIP
+// that would leave the control unpinned).
+func shortTempDir(t *testing.T) string {
+	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "fh-gate-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	sock := filepath.Join(dir, "nested", "s.sock")
-	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
-		t.Fatal(err)
+	return dir
+}
+
+// TestRunGateInContainer_PreExecFailures is the disposition table for every
+// pre-exec branch of runGateInContainer (#3448): each row makes exactly ONE
+// branch fail and asserts exit -1, the disposition, the output lead, that the
+// runtime CLI was never reached, and that the output matches no infra
+// signature (so the gates can never absorb it as a flake). The seed rows
+// discriminate the classification decision — a HOST-caused seed failure is
+// gateUnavailable (category C) while one wrapping gateiso.ErrSeedCheckout is
+// gateCheckoutRefused (tree-attributable). Collapsing the two into one
+// disposition in runGateInContainer turns the ErrSeedCheckout row red.
+func TestRunGateInContainer_PreExecFailures(t *testing.T) {
+	offline := errors.New("go mod download all: dial tcp: lookup proxy.golang.org: no such host")
+	rows := []struct {
+		name  string
+		setup func(t *testing.T) (dir, lintCacheDir string)
+		seed  func(checkout string) error // nil = the seed must NOT be reached
+		bind  error                       // non-nil = the endpoint binder fails
+		want  gateDisposition
+		leads []string // every substring the output must carry
+	}{
+		{
+			name: "visible-cache root creation fails",
+			setup: func(t *testing.T) (string, string) {
+				base := t.TempDir()
+				// TMPDIR is read by os.MkdirTemp at call time; point it at a
+				// directory that does not exist AFTER the row's own temp
+				// paths are created.
+				t.Setenv("TMPDIR", filepath.Join(base, "missing"))
+				return base, filepath.Join(base, "lc")
+			},
+			want:  gateUnavailable,
+			leads: []string{"gate container: gateiso: create visible cache root"},
+		},
+		{
+			name: "lint-cache dir under a regular file",
+			setup: func(t *testing.T) (string, string) {
+				base := t.TempDir()
+				file := filepath.Join(base, "file")
+				if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return base, filepath.Join(file, "lc")
+			},
+			want:  gateUnavailable,
+			leads: []string{"gate container: create lint cache dir:"},
+		},
+		{
+			name: "mount guard refuses a unix socket in the checkout",
+			setup: func(t *testing.T) (string, string) {
+				dir := shortTempDir(t)
+				sock := filepath.Join(dir, "nested", "s.sock")
+				if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				l, err := net.Listen("unix", sock)
+				if err != nil {
+					t.Fatalf("unix socket unavailable: %v", err)
+				}
+				t.Cleanup(func() { _ = l.Close() })
+				return dir, filepath.Join(t.TempDir(), "lc")
+			},
+			want:  gateUnavailable,
+			leads: []string{"gate container:", "unix socket", "refused"},
+		},
+		{
+			name:  "seed fails on the host (offline)",
+			setup: func(t *testing.T) (string, string) { return t.TempDir(), filepath.Join(t.TempDir(), "lc") },
+			seed:  func(string) error { return offline },
+			want:  gateUnavailable,
+			leads: []string{"gate container: seed module cache:", offline.Error()},
+		},
+		{
+			name:  "seed refuses the checkout's own metadata",
+			setup: func(t *testing.T) (string, string) { return t.TempDir(), filepath.Join(t.TempDir(), "lc") },
+			seed: func(string) error {
+				return fmt.Errorf("%w: go.sum is not a regular file", gateiso.ErrSeedCheckout)
+			},
+			want:  gateCheckoutRefused,
+			leads: []string{"gate container: seed module cache:", "go.sum is not a regular file"},
+		},
+		{
+			name:  "endpoint binding fails",
+			setup: func(t *testing.T) (string, string) { return t.TempDir(), filepath.Join(t.TempDir(), "lc") },
+			seed:  func(string) error { return nil },
+			bind:  fmt.Errorf("%w: runtime %q has no validated socket path to bind", gateiso.ErrContainerSpec, gateiso.KindDocker),
+			want:  gateUnavailable,
+			leads: []string{"gate container:", "no validated socket path to bind"},
+		},
 	}
-	l, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatalf("unix socket unavailable: %v", err)
-	}
-	defer l.Close()
-	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
-	calls := captureHostExec(t, true, 0)
-	out, code := runBoundedGateCommand(context.Background(), "true", dir, filepath.Join(t.TempDir(), "lc"), time.Minute)
-	if code != -1 {
-		t.Errorf("exit = %d, want -1", code)
-	}
-	if !strings.Contains(out, "unix socket") || !strings.Contains(out, "refused") {
-		t.Errorf("output %q must carry the ForbidSocketMounts refusal", out)
-	}
-	if len(*calls) != 0 {
-		t.Errorf("runtime CLI reached with %q", *calls)
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			dir, lc := r.setup(t)
+			installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+			calls := captureHostExec(t, true, 0)
+			var seeded []string
+			stubSeed(t, func(checkout string) error {
+				seeded = append(seeded, checkout)
+				if r.seed == nil {
+					t.Errorf("seed reached for a row whose failing branch precedes it (checkout %q)", checkout)
+					return nil
+				}
+				return r.seed(checkout)
+			})
+			if r.bind != nil {
+				stubBindEndpointEnv(t, r.bind)
+			}
+			out, code, disp := runBoundedGateCommandDisposed(context.Background(), "true", dir, lc, time.Minute)
+			if code != -1 {
+				t.Errorf("exit = %d, want -1", code)
+			}
+			if disp != r.want {
+				t.Errorf("disposition = %s, want %s (out %q)", disp, r.want, out)
+			}
+			if !strings.HasPrefix(out, "gate container:") {
+				t.Errorf("output %q must lead with the container pre-exec prefix", out)
+			}
+			for _, lead := range r.leads {
+				if !strings.Contains(out, lead) {
+					t.Errorf("output %q lacks %q", out, lead)
+				}
+			}
+			if r.seed != nil && len(seeded) != 1 {
+				t.Errorf("seed invoked %d times, want 1", len(seeded))
+			}
+			if len(*calls) != 0 {
+				t.Errorf("runtime CLI reached with %q", *calls)
+			}
+			if isVerifyInfraFailure(out) {
+				t.Errorf("pre-exec output must never match an infra signature (the gates would absorb it): %q", out)
+			}
+			if disp.neverExecutedInfra() != (r.want == gateUnavailable) {
+				t.Errorf("neverExecutedInfra() = %t for %s", disp.neverExecutedInfra(), disp)
+			}
+		})
 	}
 }
 
@@ -504,18 +641,61 @@ func TestRunBoundedGateArgv_CloneSandboxWrapsArgv(t *testing.T) {
 	}
 }
 
-// TestIsGateIsolationRefusal_NotAnInfraFailure: the refusal text must never
-// be absorbed as an infra flake, and only a LEADING signature is a refusal.
-func TestIsGateIsolationRefusal_NotAnInfraFailure(t *testing.T) {
+// TestGateRefusalMessage_NotAnInfraFailure: the operator-facing refusal text
+// must never be absorbed as an infra flake, and it leads with the signature.
+func TestGateRefusalMessage_NotAnInfraFailure(t *testing.T) {
 	msg := gateRefusalMessage(refusedState(io.Discard).selection(context.Background()))
 	if isVerifyInfraFailure(msg) {
 		t.Errorf("refusal must not match an infra signature: %q", msg)
 	}
-	if !isGateIsolationRefusal("\n" + msg) {
-		t.Errorf("leading signature not recognised: %q", msg)
+	if !strings.HasPrefix(msg, gateIsolationRefusedSignature) {
+		t.Errorf("refusal text %q must lead with the signature", msg)
 	}
-	if isGateIsolationRefusal("--- FAIL: TestX\n" + msg) {
-		t.Errorf("a mid-stream literal must not be a refusal")
+}
+
+// TestGateDisposition_String: every named disposition renders its label
+// (the log lines and test failures read it), and an out-of-range value
+// renders the numeric fallback rather than an empty string.
+func TestGateDisposition_String(t *testing.T) {
+	for _, tc := range []struct {
+		d    gateDisposition
+		want string
+	}{
+		{gateExecuted, "executed"},
+		{gateCheckoutRefused, "checkout_refused"},
+		{gateRefused, "refused"},
+		{gateUnavailable, "unavailable"},
+		{gateDisposition(99), "gateDisposition(99)"},
+	} {
+		if got := tc.d.String(); got != tc.want {
+			t.Errorf("gateDisposition(%d).String() = %q, want %q", int(tc.d), got, tc.want)
+		}
+	}
+}
+
+// TestRunBoundedGateArgvDisposed_EmptyArgvIsExecuted: an empty argv is a
+// caller bug, not a deployment condition — ("", -1, gateExecuted), never a
+// category-C disposition.
+func TestRunBoundedGateArgvDisposed_EmptyArgvIsExecuted(t *testing.T) {
+	installGateState(t, nil)
+	out, code, disp := runBoundedGateArgvDisposed(context.Background(), nil, t.TempDir(), "", time.Second)
+	if out != "" || code != -1 || disp != gateExecuted {
+		t.Errorf("empty argv = (%q, %d, %s), want (\"\", -1, executed)", out, code, disp)
+	}
+}
+
+// TestRunVerifyCommittedTree_SkipIsExecutedDisposition: the tolerant clone
+// "skipped" branch (an unresolvable head) carries gateExecuted, so a gate
+// site can never classify gate plumbing's own skip as category C.
+func TestRunVerifyCommittedTree_SkipIsExecutedDisposition(t *testing.T) {
+	installGateState(t, nil)
+	repo, _ := gateRepoWithCommit(t)
+	_, out, outcome, disp := runVerifyCommittedTree(context.Background(), "true", repo, "0000000000000000000000000000000000000000", time.Minute, nil)
+	if outcome != "skipped" {
+		t.Fatalf("outcome = %q out = %q, want the tolerant skipped", outcome, out)
+	}
+	if disp != gateExecuted || disp.neverExecutedInfra() {
+		t.Errorf("skip disposition = %s, want executed (never category C)", disp)
 	}
 }
 
@@ -537,9 +717,9 @@ func gateRepoWithCommit(t *testing.T) (string, string) {
 func TestRunVerifyCommittedTree_RefusedIsFailedNeverSkipped(t *testing.T) {
 	installGateState(t, refusedState(io.Discard))
 	repo, head := gateRepoWithCommit(t)
-	_, out, outcome := runVerifyCommittedTree(context.Background(), "true", repo, head, time.Minute, nil)
-	if outcome != "failed" || !isGateIsolationRefusal(out) {
-		t.Errorf("outcome = %q out = %q, want failed with the refusal signature", outcome, out)
+	_, out, outcome, disp := runVerifyCommittedTree(context.Background(), "true", repo, head, time.Minute, nil)
+	if outcome != "failed" || disp != gateRefused || !strings.HasPrefix(out, gateIsolationRefusedSignature) {
+		t.Errorf("outcome = %q disp = %s out = %q, want failed / refused with the refusal signature", outcome, disp, out)
 	}
 }
 
@@ -555,7 +735,7 @@ func TestRunVerifyCommittedTree_CloneIsIndependentAndCarriesPrimaryLock(t *testi
 		t.Fatal(err)
 	}
 	cmd := `printf 'common=%s\nlock=%s\n' "$(git rev-parse --path-format=absolute --git-common-dir)" "$FISHHAWK_VERIFY_LOCK_PATH"`
-	_, out, outcome := runVerifyCommittedTree(context.Background(), cmd, repo, head, time.Minute, nil)
+	_, out, outcome, _ := runVerifyCommittedTree(context.Background(), cmd, repo, head, time.Minute, nil)
 	if outcome != "passed" {
 		t.Fatalf("outcome %q: %s", outcome, out)
 	}
@@ -630,7 +810,7 @@ func TestRunVerifyFixLoop_RefusedIsCategoryC(t *testing.T) {
 	if err != nil || reinvoked || tree != "" {
 		t.Fatalf("err=%v reinvoked=%t tree=%q", err, reinvoked, tree)
 	}
-	if res.OK || res.FailureCategory != "C" || !isGateIsolationRefusal(res.FailureReason) {
+	if res.OK || res.FailureCategory != "C" || !strings.HasPrefix(res.FailureReason, gateIsolationRefusedSignature) {
 		t.Errorf("res = OK:%t cat:%q reason:%q, want category C with the signature", res.OK, res.FailureCategory, res.FailureReason)
 	}
 	if invoker.callIdx != 0 {
@@ -646,6 +826,163 @@ func TestRunVerifyFixLoop_RefusedIsCategoryC(t *testing.T) {
 	}
 	if strings.Contains(log.String(), "verify_infra_flake_retry") || strings.Contains(log.String(), "verify_fix_reinvoke") {
 		t.Errorf("absorb or re-invoke fired on a refusal:\n%s", log.String())
+	}
+}
+
+// unavailableContainerState installs a container-path state whose host-side
+// seed fails for a HOST reason (an offline proxy lookup) — the
+// gateUnavailable shape — and fails the test if the runtime CLI is reached.
+func unavailableContainerState(t *testing.T) {
+	t.Helper()
+	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	captureHostExec(t, true, 0)
+	stubSeed(t, func(string) error {
+		return errors.New("go mod download all: dial tcp: lookup proxy.golang.org: no such host")
+	})
+}
+
+// TestRunVerifyFixLoop_ContainerUnavailableIsCategoryC pins the #3448
+// classification decision end to end through the fix loop: a host-caused
+// container pre-exec failure (the seed cannot reach the proxy) is category C
+// with verify_gate_unavailable logged, the fix agent NEVER invoked, and no
+// absorb. Deleting the gateUnavailable case in runVerifyFixLoop turns this
+// red: the failure falls through to the fix agent and demotes category A.
+func TestRunVerifyFixLoop_ContainerUnavailableIsCategoryC(t *testing.T) {
+	unavailableContainerState(t)
+	cfg, logPath := verifyFixLoopScopeFixture(t, verifyScopeGoFiles, 0, 0)
+	cfg.verifyMaxIterations = 2
+	res := agent.Result{OK: true}
+	var log strings.Builder
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &log)
+	if err != nil || reinvoked || tree != "" {
+		t.Fatalf("err=%v reinvoked=%t tree=%q", err, reinvoked, tree)
+	}
+	if res.OK || res.FailureCategory != "C" || !strings.Contains(res.FailureReason, "seed module cache") {
+		t.Errorf("res = OK:%t cat:%q reason:%q, want category C naming the seed failure", res.OK, res.FailureCategory, res.FailureReason)
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("fix agent invoked %d times, want 0", invoker.callIdx)
+	}
+	if lines := readVerifyFormLog(t, logPath); len(lines) != 0 {
+		t.Errorf("the verify command executed %d time(s) despite the unavailable container", len(lines))
+	}
+	for _, want := range []string{`"event":"verify_gate_unavailable"`, `"outcome":"failed"`} {
+		if !strings.Contains(log.String(), want) {
+			t.Errorf("log lacks %s:\n%s", want, log.String())
+		}
+	}
+	for _, never := range []string{"verify_infra_flake_retry", "verify_fix_reinvoke", "verify_gate_refused"} {
+		if strings.Contains(log.String(), never) {
+			t.Errorf("%s fired on an unavailable container:\n%s", never, log.String())
+		}
+	}
+}
+
+// TestRunVerifyGateCommitted_ContainerUnavailableIsCategoryC: the single-shot
+// gate wraps a host-caused container pre-exec failure in
+// ErrVerifyInfraFailure + errGateContainerUnavailable (category C), NOT
+// errGateIsolationRefused, runs verify exactly once and never absorbs.
+func TestRunVerifyGateCommitted_ContainerUnavailableIsCategoryC(t *testing.T) {
+	unavailableContainerState(t)
+	repo, _, _ := verifiedTreeRepo(t)
+	var log strings.Builder
+	events, tree, err := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), &log)
+	if !errors.Is(err, gitops.ErrVerifyInfraFailure) || !errors.Is(err, errGateContainerUnavailable) {
+		t.Fatalf("err = %v, want ErrVerifyInfraFailure + errGateContainerUnavailable", err)
+	}
+	if errors.Is(err, errGateIsolationRefused) {
+		t.Errorf("an unavailable container must not read as a refusal: %v", err)
+	}
+	if got := committedGateFailureCategory(err); got != "C" {
+		t.Errorf("committedGateFailureCategory = %q, want C", got)
+	}
+	if tree != "" {
+		t.Errorf("an unavailable gate must not yield a verified tree")
+	}
+	runs, retries := 0, 0
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_run":
+			runs++
+		case "verify_infra_flake_retry":
+			retries++
+		}
+	}
+	if runs != 1 || retries != 0 {
+		t.Errorf("verify_run = %d retries = %d, want 1 / 0", runs, retries)
+	}
+	if strings.Contains(log.String(), "verify_infra_flake_retry") {
+		t.Errorf("absorb fired on an unavailable container:\n%s", log.String())
+	}
+}
+
+// TestRunVerifyFixLoop_SeedCheckoutRefusedReachesFixAgent pins the other half
+// of the #3448 decision: a seed failure wrapping gateiso.ErrSeedCheckout is
+// the checkout's OWN metadata being refused — tree-attributable — so it stays
+// on the fix-agent path (invoked once, category A on exhaustion, the reason
+// naming the refused file) and fires no verify_gate_* event. Collapsing
+// gateCheckoutRefused into gateUnavailable in runGateInContainer turns this
+// red (category C, agent never invoked).
+func TestRunVerifyFixLoop_SeedCheckoutRefusedReachesFixAgent(t *testing.T) {
+	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	captureHostExec(t, true, 0)
+	stubSeed(t, func(string) error {
+		return fmt.Errorf("%w: go.sum is not a regular file", gateiso.ErrSeedCheckout)
+	})
+	cfg, _ := verifyFixLoopScopeFixture(t, verifyScopeGoFiles, 0, 0)
+	cfg.verifyMaxIterations = 1
+	res := agent.Result{OK: true}
+	var log strings.Builder
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &log)
+	if err != nil || !reinvoked || tree != "" {
+		t.Fatalf("err=%v reinvoked=%t tree=%q, want a re-invoked loop", err, reinvoked, tree)
+	}
+	if res.OK || res.FailureCategory != "A" || !strings.Contains(res.FailureReason, "go.sum is not a regular file") {
+		t.Errorf("res = OK:%t cat:%q reason:%q, want category A naming the refused file", res.OK, res.FailureCategory, res.FailureReason)
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("fix agent invoked %d times, want 1", invoker.callIdx)
+	}
+	if !strings.Contains(log.String(), `"event":"verify_fix_reinvoke"`) {
+		t.Errorf("log lacks verify_fix_reinvoke:\n%s", log.String())
+	}
+	if strings.Contains(log.String(), "verify_gate_refused") || strings.Contains(log.String(), "verify_gate_unavailable") {
+		t.Errorf("a tree-attributable seed refusal must fire no verify_gate_* event:\n%s", log.String())
+	}
+}
+
+// TestRunVerifyFixLoop_PrintedRefusalLiteralIsNotRefused is the
+// counterfactual for #3448 note 2: a verify command that PRINTS the refusal
+// literal as its first line and exits 1 is an ordinary red tree (category A,
+// fix agent invoked, no verify_gate_refused), because classification reads
+// the out-of-band disposition, never the untrusted output. Reinstating
+// leading-prefix matching on the output in runVerifyFixLoop turns this red
+// (category C, agent never invoked).
+func TestRunVerifyFixLoop_PrintedRefusalLiteralIsNotRefused(t *testing.T) {
+	installGateState(t, nil)
+	cfg, _ := verifyFixLoopScopeFixture(t, verifyScopeGoFiles, 0, 0)
+	cfg.verifyCmd = fmt.Sprintf("printf '%%s planted by a test\\n' %q; exit 1", gateIsolationRefusedSignature)
+	cfg.verifyMaxIterations = 1
+	res := agent.Result{OK: true}
+	var log strings.Builder
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &log)
+	if err != nil || !reinvoked || tree != "" {
+		t.Fatalf("err=%v reinvoked=%t tree=%q, want a re-invoked loop", err, reinvoked, tree)
+	}
+	if res.OK || res.FailureCategory != "A" {
+		t.Errorf("res = OK:%t cat:%q reason:%q, want category A (a printed literal is not a refusal)", res.OK, res.FailureCategory, res.FailureReason)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(res.FailureReason), "verify command") || !strings.Contains(res.FailureReason, gateIsolationRefusedSignature) {
+		t.Errorf("reason %q should be the ordinary exhaustion reason carrying the printed output", res.FailureReason)
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("fix agent invoked %d times, want 1", invoker.callIdx)
+	}
+	if strings.Contains(log.String(), "verify_gate_refused") {
+		t.Errorf("a printed literal fired verify_gate_refused:\n%s", log.String())
 	}
 }
 
@@ -709,6 +1046,16 @@ func independentRuntimeProbe() bool {
 	return false
 }
 
+// gateE2EEligible is the TestMain eligibility decision for the e2e sentinel:
+// it returns probe() — the INDEPENDENT runtime probe — and NEVER consults
+// detect (gateiso.DetectRuntime). The detect argument exists so the
+// regression "eligibility gates on DetectRuntime.Safe" is pinnable: a
+// DetectRuntime bug that misclassifies a safe local runtime as UNSAFE makes
+// every docker-gated fixture skip, and the sentinel must still fire.
+func gateE2EEligible(probe func() bool, _ func(context.Context, gateiso.Probes) gateiso.Runtime) bool {
+	return probe()
+}
+
 // gateE2ESentinelShouldFire is the TestMain decision: a runtime is present
 // (independent probe), the whole package ran (no -run filter, not -short) and
 // no docker-gated fixture recorded a run.
@@ -725,20 +1072,31 @@ func gateE2ESentinelRunFilter() string {
 }
 
 // TestGateE2ESentinel_FiresOnIndependentProbeNotDetectRuntime pins condition
-// 3: with DetectRuntime stubbed to UNSAFE (the regression that makes every
-// docker-gated fixture skip) on a host where the independent probe sees a
-// runtime, the sentinel still fires. An implementation gating eligibility on
-// DetectRuntime's Safe verdict would go quiet here.
+// 3 of #2134 through the seam TestMain actually uses (gateE2EEligible, #3448
+// note 4): with a probe that sees a runtime and a DetectRuntime stub that is
+// UNSAFE (the regression that makes every docker-gated fixture skip), the
+// sentinel is eligible and fires, and detect was consulted ZERO times. It
+// runs on every host — no independentRuntimeProbe skip — because the probe
+// is a stub. An implementation gating eligibility on detect's Safe verdict
+// turns both the eligibility and the zero-call assertion red.
 func TestGateE2ESentinel_FiresOnIndependentProbeNotDetectRuntime(t *testing.T) {
-	if !independentRuntimeProbe() {
-		t.Skip("no container runtime on this host (independent probe)")
+	detectCalls := 0
+	detect := func(context.Context, gateiso.Probes) gateiso.Runtime {
+		detectCalls++
+		return unsafeRuntime()
 	}
-	st := refusedState(io.Discard) // detect stubbed to UNSAFE
-	if sel := st.selection(context.Background()); sel.Runtime.Safe {
-		t.Fatalf("fixture: DetectRuntime stub must report UNSAFE, got %+v", sel.Runtime)
+	eligible := gateE2EEligible(func() bool { return true }, detect)
+	if !eligible {
+		t.Errorf("eligible = false while the independent probe sees a runtime — eligibility must not read DetectRuntime")
 	}
-	if !gateE2ESentinelShouldFire(dockerFixturesEligible, 0, "", false) {
-		t.Errorf("sentinel silent: eligible=%t (TestMain's independent probe) while DetectRuntime is UNSAFE — eligibility must not read DetectRuntime", dockerFixturesEligible)
+	if detectCalls != 0 {
+		t.Errorf("DetectRuntime consulted %d time(s) for eligibility, want 0", detectCalls)
+	}
+	if !gateE2ESentinelShouldFire(eligible, 0, "", false) {
+		t.Errorf("sentinel silent with eligible=%t and no fixture run", eligible)
+	}
+	if gateE2EEligible(func() bool { return false }, detect) || detectCalls != 0 {
+		t.Errorf("a probe that sees no runtime must make eligibility false regardless of detect (calls=%d)", detectCalls)
 	}
 	if gateE2ESentinelShouldFire(true, 1, "", false) || gateE2ESentinelShouldFire(true, 0, "TestX", false) || gateE2ESentinelShouldFire(true, 0, "", true) || gateE2ESentinelShouldFire(false, 0, "", false) {
 		t.Errorf("sentinel must be quiet when a fixture ran, under a -run filter, under -short, or without a runtime")

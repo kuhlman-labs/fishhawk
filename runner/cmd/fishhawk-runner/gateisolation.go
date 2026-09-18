@@ -18,12 +18,13 @@ import (
 // Gate isolation wiring (ADR-063 / #2134). This file resolves the operator's
 // isolation configuration ONCE at startup, decides the execution path ONCE per
 // process (lazily, on the first gate exec), and owns the runner-side pieces
-// the gateiso package leaves to its caller: the refusal signature the
-// verify gates classify as category C, the ONE throwaway-checkout
-// materializer both gate sites call, and the host-exec seam the container /
-// sandbox paths route through. The exec-path switch itself lives on
-// runBoundedGateArgv (main.go) so there is still exactly ONE containment
-// implementation.
+// the gateiso package leaves to its caller: the gate DISPOSITION the verify
+// gates classify on (gateDisposition — an out-of-band channel, never the
+// gate's output text, #3448), the operator-facing refusal text, the ONE
+// throwaway-checkout materializer both gate sites call, and the host-exec
+// seam the container / sandbox paths route through. The exec-path switch
+// itself lives on runBoundedGateArgvDisposed (main.go) so there is still
+// exactly ONE containment implementation.
 
 // Environment variables the runner reads at startup.
 const (
@@ -41,12 +42,69 @@ const (
 	deploymentProfileEnvVar = "FISHHAWK_DEPLOYMENT_PROFILE"
 )
 
-// gateIsolationRefusedSignature leads every refusal output. The verify gates
-// recognise it (isGateIsolationRefusal) and classify the failure as category
-// C WITHOUT the infra absorb and WITHOUT handing it to the fix agent — a
-// refusal is a deployment-configuration outcome, not a red tree and not a
-// flake. It deliberately matches none of isVerifyInfraFailure's signatures.
+// gateIsolationRefusedSignature leads every refusal output. It is
+// operator-facing TEXT only: since #3448 the verify gates classify a refusal
+// on the out-of-band gateDisposition (gateRefused), never by matching this
+// literal in the gate's output — verify output is untrusted, and a test that
+// printed the literal must not be able to steer its own red tree to category
+// C. It deliberately matches none of isVerifyInfraFailure's signatures so the
+// text is never absorbed as a flake either.
 const gateIsolationRefusedSignature = "gate isolation refused:"
+
+// gateDisposition reports HOW a gate exec ended, OUT OF BAND of its output
+// (#3448). The two classifying gate sites (runVerifyFixLoop,
+// runVerifyGateCommitted) read it instead of matching a leading literal in
+// the untrusted verify output. The values are documented by CLASSIFICATION;
+// the zero value is gateExecuted so every `_`-receiving call site — and the
+// tolerant tmp-dir / clone `skipped` branches of runVerifyCommittedTree — is
+// safe by construction (never category C).
+type gateDisposition int
+
+const (
+	// gateExecuted: the gate argv ran (or the tolerant pre-exec skip fired);
+	// the output and exit code ARE the gate's verdict. Classified exactly as
+	// before #3448: pass, red tree (category A/B), or an absorbed infra flake.
+	gateExecuted gateDisposition = iota
+	// gateCheckoutRefused: container path — the host-side seed refused the
+	// checkout's OWN module metadata (errors.Is(err, gateiso.ErrSeedCheckout)).
+	// That is TREE-attributable, so it is classified exactly like an executed
+	// failure: the fix agent sees the message naming the refused file.
+	gateCheckoutRefused
+	// gateRefused: the isolation selection refused every path (a hosted
+	// profile with no safe runtime or image, or an explicit mode whose path
+	// is unavailable). A deployment-configuration outcome: category C, never
+	// absorbed as a flake, never handed to the fix agent.
+	gateRefused
+	// gateUnavailable: container path — a pre-exec failure whose cause is the
+	// HOST, not the tree: visible-cache creation, the lint-cache dir, the
+	// mount-guard refusal, the host GOMODCACHE probe / `go mod download` (an
+	// offline host), or endpoint binding. The gate never executed, so its
+	// verdict says nothing about the tree: category C exactly like a refusal
+	// (verify_gate_unavailable / errGateContainerUnavailable).
+	gateUnavailable
+)
+
+// neverExecutedInfra reports whether the disposition is one the gates
+// classify category C without an absorb and without the fix agent: the gate
+// never ran for a reason the tree cannot have caused.
+func (d gateDisposition) neverExecutedInfra() bool {
+	return d == gateRefused || d == gateUnavailable
+}
+
+// String renders the disposition for log lines and test failures.
+func (d gateDisposition) String() string {
+	switch d {
+	case gateExecuted:
+		return "executed"
+	case gateCheckoutRefused:
+		return "checkout_refused"
+	case gateRefused:
+		return "refused"
+	case gateUnavailable:
+		return "unavailable"
+	}
+	return fmt.Sprintf("gateDisposition(%d)", int(d))
+}
 
 // gateSeedTimeout bounds the host-side module-cache seed before a container
 // exec (gateiso.SeedModCache); the gate's own timeout does not cover it.
@@ -89,6 +147,12 @@ var execBoundedHostArgvFn = execBoundedHostArgv
 // (gateiso.SeedModCache). A package var SOLELY so a test can capture the
 // environment the seed is handed; production leaves it gateiso.SeedModCache.
 var seedModCacheFn = gateiso.SeedModCache
+
+// bindEndpointEnvFn binds the runtime CLI's environment to the validated
+// socket (gateiso.Runtime.BindEndpointEnv). A package var SOLELY so a test
+// can make the binder fail and pin that branch's disposition (#3448);
+// production leaves it the method expression.
+var bindEndpointEnvFn = gateiso.Runtime.BindEndpointEnv
 
 // dockerFixturesEligible / dockerFixturesRan are the end-to-end fixture
 // sentinel (gateisolation_e2e_test.go increments Ran at the END of every
@@ -186,18 +250,14 @@ func (s *gateIsolationState) cleanup() {
 	}
 }
 
-// gateRefusalMessage renders the output a refused gate returns instead of
-// executing. It always starts with gateIsolationRefusedSignature.
+// gateRefusalMessage renders the operator-facing output a refused gate
+// returns instead of executing. It always starts with
+// gateIsolationRefusedSignature, but that lead is TEXT for the operator and
+// the FailureReason — classification reads the gateRefused disposition
+// runBoundedGateArgvDisposed returns beside it, not this string.
 func gateRefusalMessage(sel gateiso.Selection) string {
 	return fmt.Sprintf("%s %s (mode=%s profile=%s image=%q runtime=%s safe=%t)",
 		gateIsolationRefusedSignature, sel.Reason, sel.Mode, sel.Profile, sel.Image, sel.Runtime.Kind, sel.Runtime.Safe)
-}
-
-// isGateIsolationRefusal reports whether a gate's output is a refusal (the
-// gate never executed). Only a LEADING signature counts: verify output is
-// untrusted and a test could print the literal mid-stream.
-func isGateIsolationRefusal(output string) bool {
-	return strings.HasPrefix(strings.TrimLeft(output, " \t\r\n"), gateIsolationRefusedSignature)
 }
 
 // materializeGateCheckout is the ONE throwaway-checkout materializer both
@@ -234,16 +294,26 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 // container via -e only), and `rm -f` — under the same binding — on a
 // detached context when the exec returned -1 (killing the CLI does not stop
 // the container). Every failure before the exec returns -1 WITHOUT
-// executing.
-func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []string, dir, lintCacheDir string, sanitizedEnv, extraEnv []string, timeout time.Duration) (string, int) {
+// executing, and the third value names WHY out of band (#3448): a HOST-caused
+// pre-exec failure — visible-cache creation, the lint-cache dir, the
+// mount-guard refusal, a seed failure NOT wrapping gateiso.ErrSeedCheckout
+// (the host GOMODCACHE probe or `go mod download` on an offline host), or
+// endpoint binding — is gateUnavailable (category C at the gates, like a
+// refusal); a seed failure wrapping ErrSeedCheckout is the checkout's OWN
+// metadata being refused, so it is gateCheckoutRefused (tree-attributable,
+// classified as an executed failure); the exec path is gateExecuted whatever
+// the exit code. Deliberate residual: a legitimate tree whose `replace`
+// target sits outside the checkout draws ErrSeedCheckout too and reaches the
+// fix agent with the refusing message rather than parking category C.
+func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []string, dir, lintCacheDir string, sanitizedEnv, extraEnv []string, timeout time.Duration) (string, int, gateDisposition) {
 	st := gateIsolation
 	vc, err := gateiso.NewVisibleCaches()
 	if err != nil {
-		return "gate container: " + err.Error(), -1
+		return "gate container: " + err.Error(), -1, gateUnavailable
 	}
 	defer func() { _ = vc.Remove() }()
 	if err := os.MkdirAll(lintCacheDir, 0o700); err != nil {
-		return "gate container: create lint cache dir: " + err.Error(), -1
+		return "gate container: create lint cache dir: " + err.Error(), -1, gateUnavailable
 	}
 	spec := gateiso.ContainerSpec{
 		Runtime:    sel.Runtime,
@@ -266,19 +336,24 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		DaemonSocket: sel.Runtime.SocketPath,
 	})
 	if err != nil {
-		return "gate container: " + err.Error(), -1
+		return "gate container: " + err.Error(), -1, gateUnavailable
 	}
 	// Seed only AFTER the mount guard accepted every source: the seed is the
 	// one host-side process the container path runs against the checkout.
 	if _, err := seedModCacheFn(ctx, nil, dir, "", vc, sanitizedEnv, gateSeedTimeout); err != nil {
-		return "gate container: seed module cache: " + err.Error(), -1
+		disp := gateUnavailable
+		if errors.Is(err, gateiso.ErrSeedCheckout) {
+			// The checkout's OWN metadata was refused: tree-attributable.
+			disp = gateCheckoutRefused
+		}
+		return "gate container: seed module cache: " + err.Error(), -1, disp
 	}
 	// The runtime CLI's env is the runner's inherited environment with the
 	// endpoint bound to the socket the selection validated (concern: a
 	// context switch after selection must not redirect launch or cleanup).
-	cliEnv, err := sel.Runtime.BindEndpointEnv(os.Environ())
+	cliEnv, err := bindEndpointEnvFn(sel.Runtime, os.Environ())
 	if err != nil {
-		return "gate container: " + err.Error(), -1
+		return "gate container: " + err.Error(), -1, gateUnavailable
 	}
 	out, code := execBoundedHostArgvFn(ctx, runArgv, dir, cliEnv, timeout)
 	if code == -1 {
@@ -286,10 +361,17 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		defer cancel()
 		_, _ = execBoundedHostArgvFn(killCtx, spec.KillArgv(), dir, cliEnv, diffCoverageCleanupTimeout)
 	}
-	return out, code
+	return out, code, gateExecuted
 }
 
 // errGateIsolationRefused is joined (alongside gitops.ErrVerifyInfraFailure)
 // into the single-shot gate's refusal error so a caller can distinguish a
 // refusal from an ordinary infra failure with errors.Is.
 var errGateIsolationRefused = errors.New("gate isolation refused")
+
+// errGateContainerUnavailable is joined (alongside gitops.ErrVerifyInfraFailure)
+// into the single-shot gate's error for a gateUnavailable disposition (#3448):
+// the container path failed BEFORE exec for a host-caused reason, so the gate
+// never executed. Distinguishable from a refusal (errGateIsolationRefused)
+// and from an absorbed-then-persistent infra signature with errors.Is.
+var errGateContainerUnavailable = errors.New("gate container unavailable")
