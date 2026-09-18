@@ -17633,8 +17633,18 @@ func countBundleEventKind(events []bundle.Line, kind string) int {
 // prompt text and not something Go can drive deterministically. The agent-side
 // half of the contract is pinned as TEXT by
 // TestBuild_ScopeAmendment_ExpiryDistinctFromDeny (backend/internal/prompt).
+//
+// The #3343 settle wait runs BEFORE the verify loop whenever the stage has a
+// pending amendment at agent exit, and the fake uploader here answers
+// `pending` on every fetch, so without pinning the settle budget this test
+// spends the full production wait before reaching the undecided path it
+// pins. pinSettleTuningForE2E bounds that wait to milliseconds while still
+// EXPIRING with the row pending — the same pin
+// TestRun_ScopeAmendmentStaysPending_UnchangedUndecidedPath already uses to
+// reach this path (#3475).
 func TestRun_UndecidedScopeAmendment_NoVerifyFixReinvoke(t *testing.T) {
 	pinAmendmentWatchInterval(t)
+	pinSettleTuningForE2E(t, scaledD(200*time.Millisecond))
 	repo := verifyFixBaseRepo(t)
 	// The committed scope-only tree fails verify (empty registry, test wants 42).
 	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
@@ -17752,8 +17762,14 @@ func TestRun_DeniedScopeAmendment_FixLoopReinvokesAsBefore(t *testing.T) {
 // on a stage whose committed tree PASSES verify (the agent adapted in-scope, the
 // b0c3c543 shape) stays green — the event is emitted for the record, the push
 // proceeds, and no failure annotation is applied.
+//
+// As in TestRun_UndecidedScopeAmendment_NoVerifyFixReinvoke, the fake uploader
+// answers `pending` on every fetch, so the #3343 settle wait must be pinned
+// (same pin, same reasoning) or this test spends the full production settle
+// budget before reaching the undecided path (#3475).
 func TestRun_UndecidedScopeAmendment_GreenStageStaysGreen(t *testing.T) {
 	pinAmendmentWatchInterval(t)
+	pinSettleTuningForE2E(t, scaledD(200*time.Millisecond))
 	repo := verifyFixBaseRepo(t)
 	// The committed scope-only tree PASSES verify.
 	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)

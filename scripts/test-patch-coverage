@@ -833,6 +833,82 @@ fi
 modules() { printf './backend\n./cli\n'; }
 
 # ---------------------------------------------------------------------------
+# (g3) explicit -timeout on every loop line (#3475). Go's per-package default
+#     is 10m, and the runner package alone sits near it under load, so every
+#     `go test -race` invocation must carry an explicit -timeout with
+#     headroom instead of relying on the silent default. Reuses the (g)
+#     stub shape: run the real cmd_test_with_patch_coverage with one changed
+#     module and assert -timeout reaches BOTH the instrumented (-coverpkg)
+#     branch and the plain branch's argv.
+# ---------------------------------------------------------------------------
+: > "$GOLOG"
+saved_trap="$(trap -p EXIT)"
+pushd "$ROOT" >/dev/null
+PATH="$tmproot/stubbin:$PATH" TMPDIR="$tmproot" \
+  cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" main >/dev/null 2>&1
+g3_default_rc=$?
+popd >/dev/null
+eval "$saved_trap"
+_patchcov_cleanup
+
+g3_backend_cmd="$(grep '/backend|' "$GOLOG" | head -1)"
+g3_cli_cmd="$(grep '/cli|' "$GOLOG" | head -1)"
+if [ "$g3_default_rc" -eq 0 ] \
+   && printf '%s' "$g3_backend_cmd" | grep -q -- '-timeout 20m' \
+   && printf '%s' "$g3_cli_cmd" | grep -q -- '-timeout 20m'; then
+  pass "(g3) default -timeout 20m reaches both the instrumented and plain branches"
+else
+  fail "(g3) default -timeout (rc=$g3_default_rc backend='$g3_backend_cmd' cli='$g3_cli_cmd')"
+fi
+
+# FISHHAWK_TEST_TIMEOUT must be set BEFORE sourcing scripts/test: TEST_TIMEOUT's
+# default-expansion ("${FISHHAWK_TEST_TIMEOUT:-20m}") happens at assignment
+# time when the lib is sourced, not when cmd_test_with_patch_coverage runs.
+FISHHAWK_TEST_TIMEOUT=7m FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+set +e
+modules() { printf './backend\n./cli\n'; }
+_arm_container_lease() { :; }
+: > "$GOLOG"
+saved_trap="$(trap -p EXIT)"
+pushd "$ROOT" >/dev/null
+PATH="$tmproot/stubbin:$PATH" TMPDIR="$tmproot" \
+  cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" main >/dev/null 2>&1
+g3_override_rc=$?
+popd >/dev/null
+eval "$saved_trap"
+_patchcov_cleanup
+
+g3o_backend_cmd="$(grep '/backend|' "$GOLOG" | head -1)"
+g3o_cli_cmd="$(grep '/cli|' "$GOLOG" | head -1)"
+if [ "$g3_override_rc" -eq 0 ] \
+   && printf '%s' "$g3o_backend_cmd" | grep -q -- '-timeout 7m' \
+   && printf '%s' "$g3o_cli_cmd" | grep -q -- '-timeout 7m'; then
+  pass "(g3) FISHHAWK_TEST_TIMEOUT=7m is reflected in both branches' argv"
+else
+  fail "(g3) FISHHAWK_TEST_TIMEOUT override (rc=$g3_override_rc backend='$g3o_backend_cmd' cli='$g3o_cli_cmd')"
+fi
+
+# Restore the default-TEST_TIMEOUT lib for every case after this one.
+unset FISHHAWK_TEST_TIMEOUT
+FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+set +e
+modules() { printf './backend\n./cli\n'; }
+_arm_container_lease() { :; }
+
+# (g3 static) a future loop line added to cmd_test / cmd_test_scoped /
+# cmd_coverage without -timeout must fail this harness rather than only prose.
+g3_test_body="$(declare -f cmd_test)"
+g3_scoped_body="$(declare -f cmd_test_scoped)"
+g3_coverage_body="$(declare -f cmd_coverage)"
+if printf '%s' "$g3_test_body" | grep -q -- '-timeout "\$TEST_TIMEOUT"' \
+   && printf '%s' "$g3_scoped_body" | grep -q -- '-timeout "\$TEST_TIMEOUT"' \
+   && printf '%s' "$g3_coverage_body" | grep -q -- '-timeout "\$TEST_TIMEOUT"'; then
+  pass "(g3 static) cmd_test / cmd_test_scoped / cmd_coverage all carry -timeout \"\$TEST_TIMEOUT\""
+else
+  fail "(g3 static) missing -timeout \"\$TEST_TIMEOUT\" in cmd_test/cmd_test_scoped/cmd_coverage"
+fi
+
+# ---------------------------------------------------------------------------
 # (i) module enumeration failing INSIDE the coverage loop. Feeding the loop
 #     straight from a failing `modules` would iterate zero times and still exit
 #     0 — verify reporting success having tested nothing. The coverage loop
