@@ -210,21 +210,31 @@ SELECT m.account_id, m.origin, a.account_key, a.granularity, a.auto_join_role
 -- policy is set and whose (account_key, granularity) PAIR appears in the
 -- membership set the resolver derived for this login.
 --
--- The two arrays are POSITIONALLY PAIRED via unnest — never two independent
--- ANY() predicates. Their cartesian product would admit across granularities
+-- The two arrays are POSITIONALLY PAIRED — never two independent ANY()
+-- predicates. Their cartesian product would admit across granularities
 -- (a live GitHub org key "acme" admitting an ENTERPRISE account keyed "acme",
 -- or a derived enterprise short code admitting an organization account of the
 -- same key), which is unauthorized admission. Each key stays bound to the
--- granularity it was derived from.
+-- granularity it was derived from. The pairing is expressed as two
+-- unnest(...) WITH ORDINALITY sources joined on their ordinal (g.ord = k.ord)
+-- rather than the two-argument unnest(a, b) form: sqlc's catalog has no
+-- two-argument unnest and aborts the FULL-config generate on it (#2880).
+-- For equal-length arrays (the only shape the caller passes) the two forms
+-- are equivalent; for unequal lengths unnest(a, b) NULL-pads the shorter
+-- array, which never matches a NOT NULL granularity, while the ordinality
+-- join yields no row for the unmatched ordinal — observably identical.
 --
 -- Stable (account_key, granularity) order keeps the callback's
 -- deterministic-first pick reproducible.
 SELECT a.id, a.account_key, a.granularity, a.auto_join_role
   FROM accounts a
-  JOIN unnest(sqlc.arg(account_keys)::text[], sqlc.arg(granularities)::text[])
-       AS p(account_key, granularity)
-    ON a.account_key = p.account_key
-   AND a.granularity = p.granularity
+  JOIN unnest(sqlc.arg(account_keys)::text[]) WITH ORDINALITY
+       AS k(account_key, ord)
+    ON a.account_key = k.account_key
+  JOIN unnest(sqlc.arg(granularities)::text[]) WITH ORDINALITY
+       AS g(granularity, ord)
+    ON g.ord = k.ord
+   AND a.granularity = g.granularity
  WHERE a.provider = $1
    AND a.auto_join_role IS NOT NULL
  ORDER BY a.account_key ASC, a.granularity ASC;

@@ -177,6 +177,151 @@ func TestPostgres_AccountID_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestPostgres_AccountID_PopulatedOnEveryRunReturningPath pins the runtime
+// effect of the E45.22 / #2043 sqlc regeneration recorded in #2880: account_id
+// is scanned on EVERY Run-returning query, not only GetRun / ListRuns. One
+// subtest per path — the state-writing ones (TransitionRun and RetryRun via
+// UpdateRunState, SetRunPullRequestURL, AddRunCost,
+// SetRunPredictedRuntimeMinutes) and the read paths (GetRunByIdempotencyKey,
+// ListRuns) — so a single RETURNING/SELECT list missing the column names its
+// query. An untenanted control walks the same paths and still reads "".
+// Binding is a raw UPDATE, as in TestPostgres_AccountID_RoundTrip: CreateRun
+// does not set account_id (#1830 NULL-allow window).
+func TestPostgres_AccountID_PopulatedOnEveryRunReturningPath(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	// AddRunCost / SetRunPredictedRuntimeMinutes are optional capabilities the
+	// handlers type-assert on the concrete repo (costRepo / predictionRepo
+	// below), not run.Repository methods.
+	cr, ok := repo.(costRepo)
+	if !ok {
+		t.Fatal("postgres repo does not implement AddRunCost")
+	}
+	pr, ok := repo.(predictionRepo)
+	if !ok {
+		t.Fatal("postgres repo does not implement SetRunPredictedRuntimeMinutes")
+	}
+
+	acctID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO accounts (id, account_key) VALUES ($1, $2)`,
+		acctID, "acct-"+acctID.String()[:8]); err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+
+	// createKeyed creates a run under an idempotency key so the
+	// GetRunByIdempotencyKey path has a row to resolve.
+	createKeyed := func(t *testing.T, key string) *run.Run {
+		t.Helper()
+		r, err := repo.CreateRun(ctx, run.CreateRunParams{
+			Repo:           "kuhlman-labs/fishhawk",
+			WorkflowID:     "feature_change",
+			WorkflowSHA:    "deadbeef",
+			TriggerSource:  run.TriggerCLI,
+			IdempotencyKey: &key,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		return r
+	}
+
+	// paths enumerates every Run-returning repository path under test; each
+	// returns the *run.Run the path itself handed back (never a fresh GetRun,
+	// which would mask a missing RETURNING column on the path).
+	paths := []struct {
+		name string
+		call func(t *testing.T, r *run.Run, key string) *run.Run
+	}{
+		{"TransitionRun", func(t *testing.T, r *run.Run, _ string) *run.Run {
+			got, err := repo.TransitionRun(ctx, r.ID, run.StateRunning)
+			if err != nil {
+				t.Fatalf("TransitionRun: %v", err)
+			}
+			return got
+		}},
+		{"RetryRun", func(t *testing.T, r *run.Run, _ string) *run.Run {
+			for _, to := range []run.State{run.StateRunning, run.StateFailed} {
+				if _, err := repo.TransitionRun(ctx, r.ID, to); err != nil {
+					t.Fatalf("TransitionRun(%s): %v", to, err)
+				}
+			}
+			got, err := repo.RetryRun(ctx, r.ID, run.StateRunning)
+			if err != nil {
+				t.Fatalf("RetryRun: %v", err)
+			}
+			return got
+		}},
+		{"SetRunPullRequestURL", func(t *testing.T, r *run.Run, _ string) *run.Run {
+			got, err := repo.SetRunPullRequestURL(ctx, r.ID, "https://github.com/kuhlman-labs/fishhawk/pull/1")
+			if err != nil {
+				t.Fatalf("SetRunPullRequestURL: %v", err)
+			}
+			return got
+		}},
+		{"AddRunCost", func(t *testing.T, r *run.Run, _ string) *run.Run {
+			got, err := cr.AddRunCost(ctx, r.ID, 0.25, "claude-sonnet-5")
+			if err != nil {
+				t.Fatalf("AddRunCost: %v", err)
+			}
+			return got
+		}},
+		{"SetRunPredictedRuntimeMinutes", func(t *testing.T, r *run.Run, _ string) *run.Run {
+			got, err := pr.SetRunPredictedRuntimeMinutes(ctx, r.ID, 26)
+			if err != nil {
+				t.Fatalf("SetRunPredictedRuntimeMinutes: %v", err)
+			}
+			return got
+		}},
+		{"GetRunByIdempotencyKey", func(t *testing.T, r *run.Run, key string) *run.Run {
+			got, err := repo.GetRunByIdempotencyKey(ctx, r.Repo, key)
+			if err != nil {
+				t.Fatalf("GetRunByIdempotencyKey: %v", err)
+			}
+			return got
+		}},
+		{"ListRuns", func(t *testing.T, r *run.Run, _ string) *run.Run {
+			rs, err := repo.ListRuns(ctx, run.ListRunsFilter{Limit: 1000})
+			if err != nil {
+				t.Fatalf("ListRuns: %v", err)
+			}
+			for _, cand := range rs {
+				if cand.ID == r.ID {
+					return cand
+				}
+			}
+			t.Fatalf("ListRuns did not return run %s", r.ID)
+			return nil
+		}},
+	}
+
+	for _, p := range paths {
+		t.Run(p.name, func(t *testing.T) {
+			// Tenant-bound run: the path must hand the account back.
+			key := "tenanted-" + p.name + "-" + uuid.NewString()
+			tenanted := createKeyed(t, key)
+			if _, err := pool.Exec(ctx, `UPDATE runs SET account_id = $1 WHERE id = $2`, acctID, tenanted.ID); err != nil {
+				t.Fatalf("bind account: %v", err)
+			}
+			got := p.call(t, tenanted, key)
+			if got.ID != tenanted.ID {
+				t.Fatalf("%s returned run %s, want %s", p.name, got.ID, tenanted.ID)
+			}
+			if got.AccountID != acctID.String() {
+				t.Errorf("%s AccountID = %q, want %q", p.name, got.AccountID, acctID.String())
+			}
+
+			// Untenanted control: the same path still reads "".
+			plainKey := "plain-" + p.name + "-" + uuid.NewString()
+			plain := createKeyed(t, plainKey)
+			gotPlain := p.call(t, plain, plainKey)
+			if gotPlain.AccountID != "" {
+				t.Errorf("untenanted %s AccountID = %q, want empty", p.name, gotPlain.AccountID)
+			}
+		})
+	}
+}
+
 // TestPostgres_ListRuns_AccountFilter exercises ListRunsFilter.AccountID
 // (ADR-057 / E44.5): a set filter keeps same-account runs PLUS untenanted
 // (NULL account_id) runs, and excludes other accounts' runs.
@@ -973,8 +1118,10 @@ func TestPostgres_StageLifecycle(t *testing.T) {
 // deadline derivation relies on: dispatched_at (migration 0072 trigger) is
 // RE-STAMPED on every transition into 'dispatched', so a fix-up re-dispatch
 // resets it, while started_at (written under COALESCE) stays frozen at the
-// original start. All timestamps are DB-stamped and compared against each other
-// (same clock domain — no cross-clock skew, #3048).
+// original start. The reset is proven by comparing the two dispatched_at values
+// against EACH OTHER — both DB-stamped by the trigger (same clock domain) —
+// never against started_at, which TransitionStage stamps from the Go-side clock
+// (a cross-clock comparison, #3048).
 func TestPostgres_StageDispatchedAtResetsOnRedispatch(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
@@ -983,8 +1130,7 @@ func TestPostgres_StageDispatchedAtResetsOnRedispatch(t *testing.T) {
 	r := makeRun(t, repo)
 	s := makeStage(t, repo, r.ID, 0)
 
-	// First dispatch → running: dispatched_at and started_at both stamped, with
-	// started_at strictly after the first dispatch.
+	// First dispatch → running: dispatched_at and started_at both stamped.
 	dispatched1, err := repo.TransitionStage(ctx, s.ID, run.StageStateDispatched, nil)
 	if err != nil {
 		t.Fatalf("→dispatched: %v", err)
@@ -992,6 +1138,7 @@ func TestPostgres_StageDispatchedAtResetsOnRedispatch(t *testing.T) {
 	if dispatched1.DispatchedAt == nil {
 		t.Fatal("DispatchedAt should be stamped on first entry to dispatched")
 	}
+	dispatchedAt1 := *dispatched1.DispatchedAt
 	running, err := repo.TransitionStage(ctx, s.ID, run.StageStateRunning, nil)
 	if err != nil {
 		t.Fatalf("→running: %v", err)
@@ -1014,13 +1161,14 @@ func TestPostgres_StageDispatchedAtResetsOnRedispatch(t *testing.T) {
 		t.Fatalf("→dispatched (re-dispatch): %v", err)
 	}
 
-	// dispatched_at RESET: the re-dispatch is stamped AFTER the original start,
-	// proving the trigger re-fired (the first dispatch predated started1).
+	// dispatched_at RESET: the re-dispatch is stamped strictly AFTER the first
+	// dispatch (both DB now(), separate transactions), proving the trigger
+	// re-fired rather than the column surviving under COALESCE.
 	if dispatched2.DispatchedAt == nil {
 		t.Fatal("DispatchedAt should be re-stamped on re-dispatch")
 	}
-	if !dispatched2.DispatchedAt.After(started1) {
-		t.Errorf("re-dispatch DispatchedAt = %v, want strictly after the original start %v (reset)", dispatched2.DispatchedAt, started1)
+	if !dispatched2.DispatchedAt.After(dispatchedAt1) {
+		t.Errorf("re-dispatch DispatchedAt = %v, want strictly after the first dispatch %v (reset)", dispatched2.DispatchedAt, dispatchedAt1)
 	}
 	// started_at FROZEN under COALESCE: unchanged by the re-dispatch.
 	if dispatched2.StartedAt == nil || !dispatched2.StartedAt.Equal(started1) {
@@ -2219,6 +2367,21 @@ func TestPostgres_ParkScopeCompletenessAndAppend_RoundTrip(t *testing.T) {
 	}
 	if stage.State != run.StageStateAwaitingScopeDecision {
 		t.Errorf("stage state = %q, want awaiting_scope_decision", stage.State)
+	}
+	// The Stage the park returns carries the row's dispatch clock (#2880: the
+	// E45.22 / #2043 regeneration restored progress + dispatched_at to the
+	// ParkScopeCompleteness RETURNING list). Compared against the row's own
+	// dispatched_at read back from Postgres — the same clock domain — never a
+	// Go-side time.Now() (#3048).
+	if stage.DispatchedAt == nil {
+		t.Fatal("returned Stage.DispatchedAt = nil, want the dispatched row's dispatched_at")
+	}
+	var rowDispatchedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT dispatched_at FROM stages WHERE id = $1`, running.ID).Scan(&rowDispatchedAt); err != nil {
+		t.Fatalf("read dispatched_at: %v", err)
+	}
+	if !stage.DispatchedAt.Equal(rowDispatchedAt) {
+		t.Errorf("returned Stage.DispatchedAt = %v, want the row's dispatched_at %v", stage.DispatchedAt, rowDispatchedAt)
 	}
 
 	// The park payload round-trips through the JSONB column on a fresh read.

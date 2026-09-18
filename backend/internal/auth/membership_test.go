@@ -404,6 +404,38 @@ func TestMembership_KeyGranularityPairing_NoCrossGranularityAdmission(t *testing
 	})
 }
 
+// TestMembership_TwoPairMixedGranularity_NoCrossAdmission is the
+// counterfactual vehicle for the ListAutoJoinAccountsByKeys pairing
+// predicate itself (#2880). The two pairing tests above each resolve a
+// SINGLE (key, granularity) pair per ListAutoJoinAccounts call, and a
+// cartesian product of one-element arrays is indistinguishable from
+// positional pairing — so they stay GREEN with the `g.ord = k.ord`
+// predicate deleted. This test drives ONE call carrying TWO pairs of MIXED
+// granularity — ("beta", organization) from the live org listing and
+// ("acme", enterprise) from the EMU short code of login "alice_acme" — and
+// seeds the two CROSS accounts, ("acme", organization) and ("beta",
+// enterprise). Positional pairing matches neither; the cartesian product
+// admits both. Both must be DENIED.
+func TestMembership_TwoPairMixedGranularity_NoCrossAdmission(t *testing.T) {
+	pool, lister, r := newEMUFixture(t)
+	role := "member"
+	crossOrg := seedGitHubAccount(t, pool, "acme", "organization", &role)
+	crossEnt := seedGitHubAccount(t, pool, "beta", "enterprise", &role)
+	lister.keys = []string{"beta"} // org membership of beta only
+
+	got, err := r.ResolveAccounts(context.Background(), "github", "gho_tok",
+		auth.GitHubProfile{ID: 42, Login: "alice_acme"})
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("admitted = %v, want deny of both cross-granularity accounts (org acme=%s, enterprise beta=%s): the two-pair call must match positionally, never as a cartesian product",
+			got, crossOrg, crossEnt)
+	}
+	assertMemberRowCount(t, pool, crossOrg, 0)
+	assertMemberRowCount(t, pool, crossEnt, 0)
+}
+
 // EMU posture: an enterprise-granularity policy account keyed by the
 // login's short code ADMITS and mints an audited grant. A no-op change
 // leaving the query at granularity='organization' fails this.

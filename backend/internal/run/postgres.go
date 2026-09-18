@@ -1022,8 +1022,9 @@ func rowToRun(r rundb.Run) *Run {
 	// RETURNING/SELECT list and scans it — CreateRun, GetRun, ListRuns,
 	// GetRunByIdempotencyKey, LockRunForUpdate, and the Update* / AddRunCost /
 	// SetRunPullRequestURL set — so the binding is populated on every read
-	// path. This is UNLIKE AccountID above, which only GetRun / ListRuns select
-	// and the other queries leave "".
+	// path. AccountID above rides the same contract since the E45.22 / #2043
+	// regeneration (pinned by TestPostgres_AccountID_PopulatedOnEveryRunReturningPath,
+	// #2880): every one of those queries scans account_id too.
 	out.WorkingDir = r.WorkingDir
 	// PredictedRuntimeMinutes rides the same single shared row mapper (E48.62
 	// / #2489): every Run-returning sqlc query carries
