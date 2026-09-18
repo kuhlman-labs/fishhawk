@@ -4665,19 +4665,13 @@ const acceptanceRetirementDropReasonChainUnreadable = "approval_chain_unreadable
 
 // recordAcceptanceRetirementsUnserved best-effort appends ONE
 // acceptance_scenario_retirement_dropped entry for stageID with reason
-// approval_chain_unreadable (#3396), idempotent via
-// retirementDropAlreadyRecorded (a list error is WARN + proceed, mirroring
-// recordAcceptanceScenarioRetirementDropped). An append failure is WARN-logged
-// and never unwinds the prompt response. No notifyStatusUpdate: the row is the
-// operator surface for this category.
+// approval_chain_unreadable (#3396), idempotent per (stage_id, reason) via
+// appendRetirementDropOnce (#3439: atomic under the run-row lock on the
+// Postgres repo; on a non-capable repo a list error is WARN + proceed,
+// mirroring recordAcceptanceScenarioRetirementDropped). An append failure is
+// WARN-logged and never unwinds the prompt response. No notifyStatusUpdate:
+// the row is the operator surface for this category.
 func (s *Server) recordAcceptanceRetirementsUnserved(ctx context.Context, runID, stageID uuid.UUID, readErr error) {
-	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceScenarioRetirementDropped); err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"prompt: acceptance retirements-unserved drop: list audit entries failed; proceeding without idempotency guard",
-			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()), slog.String("error", err.Error()))
-	} else if retirementDropAlreadyRecorded(entries, stageID, acceptanceRetirementDropReasonChainUnreadable) {
-		return
-	}
 	payload, _ := json.Marshal(map[string]any{
 		"run_id":       runID.String(),
 		"stage_id":     stageID.String(),
@@ -4687,14 +4681,15 @@ func (s *Server) recordAcceptanceRetirementsUnserved(ctx context.Context, runID,
 		"error":        readErr.Error(),
 	})
 	actorKind := audit.ActorSystem
-	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
-		RunID:     runID,
-		StageID:   &stageID,
-		Timestamp: time.Now().UTC(),
-		Category:  CategoryAcceptanceScenarioRetirementDropped,
-		ActorKind: &actorKind,
-		Payload:   payload,
-	}); err != nil {
+	if _, err := s.appendRetirementDropOnce(ctx, runID, stageID, acceptanceRetirementDropReasonChainUnreadable,
+		"prompt: acceptance retirements-unserved drop", audit.ChainAppendParams{
+			RunID:     runID,
+			StageID:   &stageID,
+			Timestamp: time.Now().UTC(),
+			Category:  CategoryAcceptanceScenarioRetirementDropped,
+			ActorKind: &actorKind,
+			Payload:   payload,
+		}); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"prompt: acceptance retirements-unserved drop: append audit entry failed",
 			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()), slog.String("error", err.Error()))

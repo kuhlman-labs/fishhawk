@@ -1985,14 +1985,6 @@ func (s *Server) recordAcceptanceScenarioRetirementDropped(w http.ResponseWriter
 			StageID: stageID, Outcome: outcomeAcceptanceScenarioRetirementDropped,
 		})
 	}
-	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryAcceptanceScenarioRetirementDropped); err != nil {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-			"acceptance retirement-drop report: list audit entries failed; proceeding without idempotency guard",
-			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()), slog.String("error", err.Error()))
-	} else if retirementDropAlreadyRecorded(entries, stageID, pr.Reason) {
-		respond()
-		return
-	}
 	ids := make([]string, 0, len(pr.RetiredScenarios))
 	for _, e := range pr.RetiredScenarios {
 		ids = append(ids, e.ID)
@@ -2005,40 +1997,28 @@ func (s *Server) recordAcceptanceScenarioRetirementDropped(w http.ResponseWriter
 		"reason":       pr.Reason,
 		"auth_method":  authMethod,
 	})
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
-		RunID:        runID,
-		StageID:      &stageID,
-		Timestamp:    time.Now().UTC(),
-		Category:     CategoryAcceptanceScenarioRetirementDropped,
-		ActorKind:    &actorKind,
-		ActorSubject: actorSubject,
-		Payload:      payload,
-	}); err != nil {
+	// Idempotent per (stage_id, reason); atomic on the Postgres repo via
+	// appendRetirementDropOnce's DedupedChainAppender path (#3439). A replay
+	// is 200 with no refresh, exactly as before.
+	appended, err := s.appendRetirementDropOnce(r.Context(), runID, stageID, pr.Reason,
+		"acceptance retirement-drop report", audit.ChainAppendParams{
+			RunID:        runID,
+			StageID:      &stageID,
+			Timestamp:    time.Now().UTC(),
+			Category:     CategoryAcceptanceScenarioRetirementDropped,
+			ActorKind:    &actorKind,
+			ActorSubject: actorSubject,
+			Payload:      payload,
+		})
+	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"append audit entry failed", map[string]any{"error": err.Error()})
 		return
 	}
+	if !appended {
+		respond()
+		return
+	}
 	s.notifyStatusUpdate(r.Context(), runID, outcomeAcceptanceScenarioRetirementDropped)
 	respond()
-}
-
-// retirementDropAlreadyRecorded reports whether an
-// acceptance_scenario_retirement_dropped entry for stageID with the same
-// reason is already on the chain — the idempotency key for the drop report.
-func retirementDropAlreadyRecorded(entries []*audit.Entry, stageID uuid.UUID, reason string) bool {
-	for _, e := range entries {
-		if e.StageID == nil || *e.StageID != stageID {
-			continue
-		}
-		var payload struct {
-			Reason string `json:"reason"`
-		}
-		if err := json.Unmarshal(e.Payload, &payload); err != nil {
-			continue
-		}
-		if payload.Reason == reason {
-			return true
-		}
-	}
-	return false
 }

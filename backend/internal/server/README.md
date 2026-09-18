@@ -758,7 +758,8 @@ new preview head (`runner/internal/scenario`). The backend half is four seams:
   the dispatch-anchored pre-scenario head while the commit attributes as run
   lineage via `auditcomplete.HeadReportCategoriesByPrecedence` (first) and
   `lineageLedgerCategories`) and `acceptance_scenario_retirement_dropped`
-  (audit entry idempotent per `stage_id`+`reason` + a status comment refresh
+  (audit entry idempotent per `stage_id`+`reason`, enforced under the run-row
+  lock via `appendRetirementDropOnce` — see below — + a status comment refresh
   that renders the drop as a LIVE anchor/status-comment surface —
   `issuecomment`'s `activityCategories` admits the kind and
   `renderAcceptanceRetirementDroppedLine` names every dropped scenario id and
@@ -771,8 +772,8 @@ new preview head (`runner/internal/scenario`). The backend half is four seams:
   fail OPEN to the plan's full set (#2581 direction unchanged) but the
   approved retirements that read would have named are NOT served, and this
   row is the alertable record of that. Idempotent per stage+reason via the
-  same `retirementDropAlreadyRecorded`, actor `system`, best-effort (a list
-  error is WARN + proceed; an append error is WARN-logged, never a non-200),
+  same `appendRetirementDropOnce`, actor `system`, best-effort (an append
+  error is WARN-logged, never a non-200),
   NO status refresh, and NEVER from `handleGetStagePromptRender`
   (`recordDrop=false`). Both paths WARN-log the named event
   `acceptance_retirements_unserved {run_id, stage_id, error}` — the floor of
@@ -816,7 +817,7 @@ new preview head (`runner/internal/scenario`). The backend half is four seams:
   `{run_id, stage_id, retired: [full entries], scenario_ids, reason:
   run_cancelled_before_acceptance, cancel_source, acceptance_stage_state}`,
   actor `system`, idempotent per stage+reason via the same
-  `retirementDropAlreadyRecorded` (a list error is WARN + proceed), and UNLIKE
+  `appendRetirementDropOnce`, and UNLIKE
   #3396 is followed by a `notifyStatusUpdate` refresh so the #3392 renderer
   surfaces every dropped id on the anchor now. On an approval-chain read error
   it mirrors #3396: WARN the named event
@@ -831,6 +832,44 @@ new preview head (`runner/internal/scenario`). The backend half is four seams:
   `RecordsDroppedRetirements` tripwire tests in `trace_test.go`, and
   `TestResolveReviewFromPollState_ClosedUnmerged_RecordsDroppedRetirements`
   through the production `server.New` wiring.
+
+  **All three writers route through ONE helper, `appendRetirementDropOnce`
+  (`acceptance_retirement_drop.go`, #3439), and the (stage_id, reason)
+  idempotency key is enforced UNDER THE RUN-ROW LOCK.** Before #3439 each
+  writer listed the category via `ListForRunByCategory` and matched
+  `retirementDropAlreadyRecorded` OUTSIDE the append's transaction — a
+  check-then-act — so two cancel sinks racing on one run (operator cancel + a
+  budget tripwire, or the orchestrator's `stage_cancelled` resolution) could
+  each pass the scan and each append, over-reporting one drop as two. The
+  helper type-asserts the OPTIONAL `audit.DedupedChainAppender` capability
+  (the production Postgres repo; `audit/postgres.go` carries the compile-time
+  assertion) and drives `AppendChainedDeduped` with `DedupeSpec{StageID,
+  PayloadKey: "reason", PayloadValue: reason}` — `LockRunForUpdate` FIRST,
+  then the same-transaction scan, then `AppendChainedTx` — mapping
+  `*audit.DedupedDuplicateError` to `(false, nil)` (DEBUG line naming the
+  surviving sequence; the writer skips its refresh) and any other error to
+  `(false, err)` for the writer's own handling (the cancel and prompt writers
+  WARN, the PR route 500s `internal_error` "append audit entry failed",
+  unchanged). The key is deliberately (stage_id, reason) and NOT
+  `cancel_source`: two sinks racing are ONE drop, while the dispatched-race
+  second row with a DIFFERENT reason stays legal. A non-capable repo (the
+  in-memory fakes only) takes the prior non-atomic list-then-append leg
+  byte-for-byte — a list error is still WARN "proceeding without idempotency
+  guard" + proceed — behind a DEBUG "falling back" line; the residual is that
+  atomicity holds only for the Postgres repository. No backstop unique index
+  is added (rationale in `backend/internal/audit/README.md`). Pinned by
+  `acceptance_retirement_drop_test.go` (the `dedupedAuditFake`, the ONLY
+  server fake carrying the capability, so every pre-existing test keeps
+  exercising the fallback; per-branch helper cases for both legs; the cancel
+  writer over three cancel sources → 1 row / 1 refresh; the unserved writer's
+  duplicate → no row / no refresh),
+  `TestShipPullRequest_AcceptanceScenarioRetirementDropped_CapabilityPath`
+  (wire contract unchanged on the capability path), and — the atomicity
+  proof on REAL Postgres — `acceptance_retirement_drop_pg_test.go`
+  (`_PG_ConcurrentSinksExactlyOne`: 8 racing sinks → exactly one committed
+  row; `_PG_CapabilityWired` guards that the production repo carries the
+  capability so the race test cannot silently run the fallback), alongside
+  `audit.TestPostgres_AppendChainedDeduped_*` on the primitive.
 
 Residual, stated: an operator-invoked `fishhawk_retry_stage` on the settled
 acceptance stage AFTER a scenario push sees recorded-head ≠ current-head

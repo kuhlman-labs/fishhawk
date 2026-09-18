@@ -515,6 +515,29 @@ func (r *postgresRepo) AppendChainedAnchored(ctx context.Context, p ChainAppendP
 	return nil, &AnchoredDuplicateError{Existing: existing}
 }
 
+// AppendChainedDeduped implements DedupedChainAppender: the atomic
+// scan-and-append (#3439). It is a thin pgx.BeginFunc wrapper delegating to
+// AppendChainedDedupedTx, exactly as AppendChained wraps AppendChainedTx.
+// TxOptions are deliberately NOT set — the in-transaction scan is correct ONLY
+// at the server-default READ COMMITTED isolation (see AppendChainedDedupedTx's
+// ordering note). A *DedupedDuplicateError from the core rolls the tx back
+// (nothing was written) and propagates as-is to the caller's duplicate branch.
+func (r *postgresRepo) AppendChainedDeduped(ctx context.Context, p ChainAppendParams, spec DedupeSpec) (*Entry, error) {
+	var result *Entry
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		entry, aerr := AppendChainedDedupedTx(ctx, tx, p, spec)
+		if aerr != nil {
+			return aerr
+		}
+		result = entry
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // findAnchoredDuplicate re-reads the committed entry that collided with the
 // backstop unique index, keyed EXACTLY as the index is: run_id, category, and a
 // TEXT comparison of payload->>'<DedupePayloadKey>' against the decimal
@@ -753,6 +776,13 @@ var _ RetryBudgetAppender = (*postgresRepo)(nil)
 // non-atomic re-read-then-append leg, reopening the check-to-append window; this
 // turns that regression into a build failure rather than a runtime degrade.
 var _ AnchoredChainAppender = (*postgresRepo)(nil)
+
+// Compile-time check that the production repo carries the atomic deduped-append
+// capability (#3439). A production repo that silently lost AppendChainedDeduped
+// would make the three acceptance_scenario_retirement_dropped writers fall back
+// to their non-atomic list-then-append leg, reopening the check-then-act window;
+// this turns that regression into a build failure rather than a runtime degrade.
+var _ DedupedChainAppender = (*postgresRepo)(nil)
 
 // Compile-time check that the production repo carries the grooming capture/apply
 // window capability (#2991). A production repo that silently lost it would make

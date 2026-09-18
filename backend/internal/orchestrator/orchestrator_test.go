@@ -1048,27 +1048,48 @@ type recordingRunCancelledObserver struct {
 	calls []struct {
 		runID  uuid.UUID
 		source string
+		// observedState is the run's state AT NOTIFICATION TIME, read via
+		// stateAt — so a test can pin that completeRun notifies AFTER its
+		// TransitionRun, not before (#3439 reviewer note). Zero when stateAt
+		// is nil.
+		observedState run.State
 	}
+	// stateAt, when set, reads the run's current state; the test wires it to
+	// the store under rs.mu.
+	stateAt func(uuid.UUID) run.State
 }
 
 func (o *recordingRunCancelledObserver) OnRunCancelled(_ context.Context, runID uuid.UUID, source string) {
+	var observed run.State
+	if o.stateAt != nil {
+		observed = o.stateAt(runID)
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.calls = append(o.calls, struct {
-		runID  uuid.UUID
-		source string
-	}{runID, source})
+		runID         uuid.UUID
+		source        string
+		observedState run.State
+	}{runID, source, observed})
 }
 
 // TestCompleteRun_Cancelled_NotifiesRunCancelledObserver pins the #3389
 // observer seam: when completeRun resolves a run to `cancelled` (a cancelled
 // stage — the PR-closed-without-merge path) the wired RunCancelledObserver
 // receives (runID, "stage_cancelled") exactly once, AFTER the run state is
-// cancelled. Counterfactual (D): deleting the o.RunCancelled.OnRunCancelled
-// call in completeRun leaves zero calls.
+// cancelled — the observer snapshots the run's state at notification time and
+// must see `cancelled`, because the cancel-sink drop writer behind the seam
+// keys on the absorbing cancelled state. Counterfactual (D): deleting the
+// o.RunCancelled.OnRunCancelled call in completeRun leaves zero calls;
+// hoisting it ABOVE TransitionRun makes observedState `running`.
 func TestCompleteRun_Cancelled_NotifiesRunCancelledObserver(t *testing.T) {
 	o, rs, _ := newOrchestrator(t)
 	obs := &recordingRunCancelledObserver{}
+	obs.stateAt = func(id uuid.UUID) run.State {
+		rs.mu.Lock()
+		defer rs.mu.Unlock()
+		return rs.runs[id].State
+	}
 	o.RunCancelled = obs
 	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
 		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
@@ -1094,6 +1115,9 @@ func TestCompleteRun_Cancelled_NotifiesRunCancelledObserver(t *testing.T) {
 	}
 	if obs.calls[0].runID != r.ID || obs.calls[0].source != "stage_cancelled" {
 		t.Errorf("OnRunCancelled(%s, %q), want (%s, stage_cancelled)", obs.calls[0].runID, obs.calls[0].source, r.ID)
+	}
+	if obs.calls[0].observedState != run.StateCancelled {
+		t.Errorf("run state at notification time = %q, want cancelled (the observer must fire AFTER TransitionRun)", obs.calls[0].observedState)
 	}
 }
 
