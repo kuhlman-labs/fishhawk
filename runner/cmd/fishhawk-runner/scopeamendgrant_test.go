@@ -512,6 +512,21 @@ func approvedGrantRow() upload.ScopeAmendment {
 	return a
 }
 
+// approvedSecondGrantRow is a SECOND approved row for THIS stage, granting a
+// path the fake agent never writes — the OK+unused quadrant partner to
+// approvedGrantRow's USED grant (#3433).
+func approvedSecondGrantRow() upload.ScopeAmendment {
+	return upload.ScopeAmendment{
+		ID:             "amd-e2e-2",
+		RunID:          verifyFixRunID,
+		StageID:        verifyFixStageID,
+		Status:         "approved",
+		Paths:          []upload.ScopeAmendmentPath{{Path: "mod/second.go", Operation: "create"}},
+		Reason:         "the fix also needs a helper file",
+		DecisionReason: "add the helper in mod/second.go",
+	}
+}
+
 // grantFixPromptAssertions checks a captured iteration-1 fix prompt carries
 // the grant: amendment id, `path (op)`, the operator decision reason, the
 // GRANTED MID-STAGE marker, and the effective-scope list (which includes the
@@ -669,6 +684,146 @@ func TestRun_ApprovedScopeAmendment_GrantUsed_NoUnusedSignal(t *testing.T) {
 	}
 	if fp.gotArgs == nil {
 		t.Error("CommitAndPush must run: the fix converged")
+	}
+}
+
+// runnerCompletedLine finds the run's single runner_completed JSONL line and
+// decodes its outcome + reason (approval condition 1, #3433): a direct read
+// of the observable completion event, not an inference from the ABSENCE of a
+// substring across the whole log — logCompletion never renders a "reason" key
+// at all when res.OK, so a stderr-only negative for the annotation text would
+// stay green whether or not the annotation ever had a chance to fire on this
+// path. An absent key decodes to the zero value, so reason=="" covers both
+// "no reason key" (the OK shape) and "reason key present but empty".
+func runnerCompletedLine(t *testing.T, log string) (outcome, reason string) {
+	t.Helper()
+	for _, line := range strings.Split(log, "\n") {
+		if !strings.Contains(line, `"event":"runner_completed"`) {
+			continue
+		}
+		var decoded struct {
+			Outcome string `json:"outcome"`
+			Reason  string `json:"reason"`
+		}
+		if err := json.Unmarshal([]byte(line), &decoded); err != nil {
+			t.Fatalf("runner_completed line is not valid JSON: %v (%q)", err, line)
+		}
+		return decoded.Outcome, decoded.Reason
+	}
+	t.Fatal("no runner_completed line in log")
+	return "", ""
+}
+
+// TestRun_ApprovedScopeAmendment_OnePathUsedOneUnused_EventOnPassingPath is
+// the missing OK+unused quadrant (#3390/#3434, #3433): TWO approved grants
+// for THIS stage — amd-e2e (mod/other.go, USED by the fix, so iteration 2
+// converges) and amd-e2e-2 (mod/second.go, create, NEVER touched, seeded bad
+// by construction: the fake agent simply never writes it). The stage still
+// reaches exitOK — the unused check never sets res.OK/res.FailureCategory on
+// the passing path — yet the event fires: the JSONL line + policy_event name
+// ONLY the untouched amd-e2e-2/mod/second.go, never the used
+// amd-e2e/mod/other.go, and no failure-reason attribution appears anywhere
+// (the annotation is failure-only). This proves the README's "emitted on
+// BOTH the passing and failing paths" claim was not vacuously true just
+// because the failing twin (FixPromptCarriesGrant_UnusedGrantFailsLoud) has
+// it — that test never exercises a PASSING run with an unused grant at all.
+func TestRun_ApprovedScopeAmendment_OnePathUsedOneUnused_EventOnPassingPath(t *testing.T) {
+	pinAmendmentWatchInterval(t)
+	repo := verifyFixBaseRepo(t)
+	baseSHA := gitHead(t, repo)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	var fixPrompt string
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke: func(idx int, inv agent.Invocation) {
+			if idx == 1 {
+				fixPrompt = inv.Prompt
+				// The fix lands in the USED grant only, exactly as the seed-init
+				// shape of the discriminating twin above; mod/second.go (the
+				// second grant) is deliberately never written.
+				mustWrite(t, filepath.Join(repo, "mod", "other.go"),
+					"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = undecidedVerifyFixPrompt()
+	fu.amendments = []upload.ScopeAmendment{approvedGrantRow(), approvedSecondGrantRow()}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	args := append(verifyFixRunArgs(repo, bundlePath), "--check-base-ref", baseSHA)
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	// (a) the fix prompt names BOTH grants.
+	grantFixPromptAssertions(t, fixPrompt)
+	for _, want := range []string{
+		"- amendment amd-e2e-2 granted mod/second.go (create)\n",
+		"- mod/second.go (create)\n",
+	} {
+		if !strings.Contains(fixPrompt, want) {
+			t.Errorf("fix prompt missing %q:\n%s", want, fixPrompt)
+		}
+	}
+	// (b) converged and pushed.
+	if invoker.callIdx != 2 {
+		t.Errorf("Invoke call count = %d, want 2 (initial + 1 fix that converged)", invoker.callIdx)
+	}
+	if fp.gotArgs == nil {
+		t.Error("CommitAndPush must run: the fix converged")
+	}
+	// (c) the unused signal names ONLY the untouched grant.
+	if !strings.Contains(stderr.String(), `"event":"scope_amendment_grant_unused"`) {
+		t.Fatalf("missing the scope_amendment_grant_unused JSONL signal:\n%s", stderr.String())
+	}
+	var unusedLine string
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		if strings.Contains(line, `"event":"scope_amendment_grant_unused"`) {
+			unusedLine = line
+			break
+		}
+	}
+	for _, want := range []string{`"amendment_id":"amd-e2e-2"`, `"path":"mod/second.go"`, `"disposition":"not_modified"`} {
+		if !strings.Contains(unusedLine, want) {
+			t.Errorf("unused JSONL line missing %q:\n%s", want, unusedLine)
+		}
+	}
+	if strings.Contains(unusedLine, `"path":"mod/other.go"`) {
+		t.Errorf("unused JSONL line must not name the USED grant:\n%s", unusedLine)
+	}
+	// (d) the trace bundle carries the policy_event too.
+	if !hasPolicyEvent(readBundleEvents(t, bundlePath), "scope_amendment_grant_unused") {
+		t.Error("bundle missing the scope_amendment_grant_unused policy_event")
+	}
+	// (e) no failure-reason attribution anywhere in the log — a stderr
+	// negative, kept as a second arm alongside the direct check below. Both
+	// literals are copied from the failure-path annotation in
+	// scopeamendgrant.go (annotateUnusedAmendmentFailure): "file not
+	// modified" is the not_modified disposition's suffix, and "The scope
+	// amendment above was APPROVED" opens the anyNotModified closing sentence.
+	if strings.Contains(stderr.String(), "file not modified") || strings.Contains(stderr.String(), "The scope amendment above was APPROVED") {
+		t.Errorf("a passing run must carry no unused-grant failure annotation:\n%s", stderr.String())
+	}
+	// Approval condition 1: assert res.FailureReason == "" DIRECTLY via the
+	// runner_completed line's reason field rather than relying only on the
+	// stderr-negative substring check above, which is vacuous on this path —
+	// logCompletion emits no "reason" key at all when res.OK, so the negative
+	// substring check would stay green even if the annotation call were
+	// wired to run unconditionally instead of guarded by !res.OK.
+	outcome, reason := runnerCompletedLine(t, stderr.String())
+	if outcome != "ok" || reason != "" {
+		t.Errorf("runner_completed outcome/reason = %q/%q, want \"ok\"/\"\"", outcome, reason)
 	}
 }
 
