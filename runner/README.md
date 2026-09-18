@@ -221,10 +221,21 @@ the sanitized gate env via `-e`, `rm -f` after a timeout); `clone-sandbox` (Linu
 `unshare -rn`, probed not assumed); `clone` (host exec — the pre-#2134
 behaviour); `refused` (the gate never runs). `auto` prefers container, then
 sandbox, then clone; `hosted` refuses every non-container path. A refusal is
-**category C** — the `gate isolation refused:` signature is recognised by the
-verify gates, never absorbed as an infra flake, never handed to the fix agent
-(`verify_gate_refused`), and `runVerifyCommittedTree` reports `failed`, never
-the tolerant `skipped`.
+**category C** — never absorbed as an infra flake, never handed to the fix
+agent (`verify_gate_refused`), and `runVerifyCommittedTree` reports `failed`,
+never the tolerant `skipped`. So is a container pre-exec failure whose cause
+is the HOST (visible-cache / lint-cache creation, the mount guard, the host
+`GOMODCACHE` probe or `go mod download` on an offline host, endpoint binding):
+`verify_gate_unavailable` / `errGateContainerUnavailable`, same treatment.
+Both are classified on the OUT-OF-BAND `gateDisposition` the gate seam returns
+beside the output (#3448) — never by matching the `gate isolation refused:`
+text, which is untrusted verify output and survives only as the operator-facing
+message. A seed refusal of the checkout's OWN metadata
+(`gateiso.ErrSeedCheckout`) is tree-attributable and stays on the fix-agent
+path. `runVerifyCommittedTree` has six production call sites; the four at the
+two classifying gates read the disposition, the #960 strict re-verify pair
+drops it. Long-form: `runner/internal/gateiso/README.md` § "Never-executed
+gates → category C".
 
 **What changed for EVERY runner, image or not.** Both gate sites'
 throwaway checkout is now an INDEPENDENT `--no-hardlinks` clone

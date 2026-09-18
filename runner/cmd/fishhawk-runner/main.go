@@ -2222,8 +2222,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// persistent infra signature (gitops.ErrVerifyInfraFailure) instead fails
 	// category C — a deployment/infrastructure condition the operator
 	// corrects and then fishhawk_retry_stage re-runs in place, matching
-	// runVerifyFixLoop's verify_gate_refused → C and the gateiso README
-	// (#3449). committedGateFailureCategory carries the classification.
+	// runVerifyFixLoop's verify_gate_refused / verify_gate_unavailable → C
+	// and the gateiso README (#3449, #3448). committedGateFailureCategory
+	// carries the classification.
 	// Placed here — a sibling of runVerifyFixLoop,
 	// OUTSIDE the ADR-023 self-retry for{} loop and BEFORE EmitStage so the
 	// throwaway-commit work is reflected and the demotion happens before
@@ -4940,6 +4941,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		reinvokeErr     error  // non-nil when every fix re-invoke attempt failed → non-blocking, outcome=failed (#3408)
 		fatalErr        error  // non-nil on a POST-commit reset failure (#816) or a passed-but-unresolvable verified tree (#960) → hard abort
 		refused         bool   // a gate-isolation refusal (ADR-063 / #2134) → category C, no fix re-invoke
+		unavailable     bool   // a host-caused container pre-exec failure (#3448) → category C, no fix re-invoke
 		flakeRetried    bool   // once-per-stage testcontainers infra-flake absorb (#972) already spent
 		autoformatted   bool   // once-per-stage gofmt/goimports auto-format absorb (#3316) already spent
 	)
@@ -4983,7 +4985,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// (c) Verify against the committed tree. With a scope set in force this
 		// is the SCOPED form — a fast pre-pass over the touched packages, NOT
 		// the authority.
-		ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
+		ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
 		res.Events = append(res.Events, ev)
 		attempts++
 		lastOutput = out
@@ -5012,9 +5014,9 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// — the scoped call above WAS the full form, so re-running it would
 		// double every iteration's cost for no added coverage.
 		if len(scopePkgs) > 0 && outcome == "passed" {
-			fev, fout, foutcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
+			fev, fout, foutcome, fdisp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 			res.Events = append(res.Events, fev)
-			out, outcome = fout, foutcome
+			out, outcome, disp = fout, foutcome, fdisp
 			lastOutput = fout
 			logVerifyFormOutcome(logSink, *cfg, iter+1, verifyFormFull, outcome)
 		}
@@ -5055,20 +5057,42 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			break
 		}
 
-		// Gate-isolation refusal (ADR-063 / #2134): the gate never executed
-		// because no acceptable execution path exists (a hosted profile with
-		// no safe container runtime or image, or an explicit mode whose path
-		// is unavailable). That is a deployment-configuration outcome, not a
-		// red tree and not a flake: it breaks the loop BEFORE the infra
-		// absorb (the selection is fixed for the process, so a re-run would
-		// refuse identically) and never re-invokes the fix agent (there is
-		// nothing for it to fix). The stage fails category C so it is
-		// retryable in place once the deployment is corrected.
-		if isGateIsolationRefusal(out) {
+		// Never-executed gate (ADR-063 / #2134, disposition channel #3448).
+		// The disposition — NOT the output text, which is untrusted and could
+		// carry the refusal literal printed by a test — says the gate never
+		// ran for a reason the tree cannot have caused:
+		//
+		//   gateRefused     → no acceptable execution path exists (a hosted
+		//                     profile with no safe container runtime or
+		//                     image, or an explicit mode whose path is
+		//                     unavailable): a deployment-configuration
+		//                     outcome, verify_gate_refused;
+		//   gateUnavailable → the container path failed BEFORE exec on the
+		//                     HOST (visible-cache / lint-cache creation, the
+		//                     mount guard, the host GOMODCACHE probe or
+		//                     `go mod download` on an offline host, endpoint
+		//                     binding): verify_gate_unavailable.
+		//
+		// Neither is a red tree and neither is a flake: both break the loop
+		// BEFORE the infra absorb (the selection is fixed for the process and
+		// an offline host does not come back inside one re-run) and never
+		// re-invoke the fix agent (there is nothing for it to fix). The stage
+		// fails category C so it is retryable in place once the deployment
+		// is corrected. gateCheckoutRefused (the seed refused the checkout's
+		// OWN metadata) and gateExecuted fall through: tree-attributable.
+		switch disp {
+		case gateRefused:
 			refused = true
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_gate_refused","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, iter+1, strings.TrimSpace(out))
+		case gateUnavailable:
+			unavailable = true
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"verify_gate_unavailable","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, iter+1, strings.TrimSpace(out))
+		}
+		if refused || unavailable {
 			break
 		}
 
@@ -5344,7 +5368,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		return reinvoked, "", nil
 	}
 
-	if refused {
+	if refused || unavailable {
 		res.OK = false
 		res.FailureCategory = "C"
 		res.FailureReason = lastOutput
@@ -5384,10 +5408,14 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 //   - A non-zero verify exit returns the events plus an error wrapping
 //     gitops.ErrCommittedTestsFailed, naming the drift files + captured output
 //     (category-B at the call site, symmetric with #800). A gate-isolation
-//     refusal (wraps gitops.ErrVerifyInfraFailure + errGateIsolationRefused)
-//     or a post-absorb persistent infra signature (#2645, wraps bare
+//     refusal (wraps gitops.ErrVerifyInfraFailure + errGateIsolationRefused),
+//     a host-caused container pre-exec failure (#3448, wraps
+//     gitops.ErrVerifyInfraFailure + errGateContainerUnavailable) or a
+//     post-absorb persistent infra signature (#2645, wraps bare
 //     gitops.ErrVerifyInfraFailure) instead classifies category C at the
-//     call site via committedGateFailureCategory (#3449).
+//     call site via committedGateFailureCategory (#3449). Both never-executed
+//     dispositions are read from runVerifyCommittedTree's out-of-band
+//     gateDisposition, never from the untrusted output text.
 //   - A POST-commit gitResetSoftHEAD1 failure is FATAL, not a skip (#802
 //     approval condition). After the throwaway commit is materialized, a failed
 //     undo leaves HEAD on the throwaway commit, so openPRAndShipArtifact's real
@@ -5448,7 +5476,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	// (d) Verify against the committed scope-only tree.
 	// nil scope set = the FULL verify form (#3315). runVerifyGateCommitted is
 	// the single-shot authoritative gate; it is never narrowed.
-	ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
+	ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 	events := []agent.Event{ev}
 
 	// Infrastructure-failure absorb (#972, widened by #2645): a failed verify
@@ -5461,11 +5489,14 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	// ErrVerifyInfraFailure when the signature persists, ErrCommittedTestsFailed
 	// otherwise; the single-shot gate has no loop, so the retry is inherently
 	// once-per-stage.
-	// A gate-isolation refusal (ADR-063 / #2134) never enters the absorb:
-	// the selection is fixed for the process, so a re-run would refuse
-	// identically. It is classified at (f) as category C.
-	refused := outcome == "failed" && isGateIsolationRefusal(out)
-	if !refused && outcome == "failed" && isVerifyInfraFailure(out) {
+	// A never-executed gate (ADR-063 / #2134, #3448) never enters the absorb:
+	// a refusal's selection is fixed for the process, so a re-run would refuse
+	// identically, and an unavailable container host does not come back
+	// inside one re-run. Both are read from the out-of-band disposition —
+	// never from the output text — and classified at (f) as category C.
+	refused := outcome == "failed" && disp == gateRefused
+	unavailable := outcome == "failed" && disp == gateUnavailable
+	if !refused && !unavailable && outcome == "failed" && isVerifyInfraFailure(out) {
 		const detail = "infrastructure-failure signature in verify output (container-start timeout or lint-lock contention); re-running verify once"
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
@@ -5477,8 +5508,13 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 				"detail":    detail,
 			}),
 		})
-		ev, out, outcome = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
+		ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 		events = append(events, ev)
+		// The re-run's own disposition decides (f): a host that went away
+		// between the two runs is classified as unavailable, not as a red
+		// tree.
+		refused = outcome == "failed" && disp == gateRefused
+		unavailable = outcome == "failed" && disp == gateUnavailable
 	}
 
 	// Capture the verified tree's object hash BEFORE the reset (#960). Only a
@@ -5522,6 +5558,13 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 			// flake by errGateIsolationRefused: the gate never executed.
 			return events, "", fmt.Errorf("%w: %w: committed tree verify command %q was refused by gate isolation: %s",
 				gitops.ErrVerifyInfraFailure, errGateIsolationRefused, cfg.verifyCmd, strings.TrimSpace(out))
+		}
+		if unavailable {
+			// Category C (retryable in place), distinguishable from both a
+			// refusal and an infra flake by errGateContainerUnavailable: the
+			// container path failed on the HOST before the gate executed.
+			return events, "", fmt.Errorf("%w: %w: committed tree verify command %q could not be executed by the gate container: %s",
+				gitops.ErrVerifyInfraFailure, errGateContainerUnavailable, cfg.verifyCmd, strings.TrimSpace(out))
 		}
 		if isVerifyInfraFailure(out) {
 			return events, "", fmt.Errorf("%w: committed tree verify command %q failed for an infrastructure reason: %s; %d file(s) outside scope are build/test-required: %s\n%s",
@@ -5922,14 +5965,24 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 // The scoped form is NOT authoritative: runVerifyFixLoop re-verifies the same
 // committed SHA with the FULL form before reporting success, and it is that
 // full run's tree that supplies the #960 pre-push verified tree.
-func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration, scopePkgs []string) (agent.Event, string, string) {
+//
+// The FOURTH value is the gate disposition (#3448) — the out-of-band channel
+// the two classifying gate sites read instead of matching a literal in the
+// untrusted output: gateRefused / gateUnavailable mean the gate never
+// executed for a reason the tree cannot have caused (category C at the
+// gates), gateCheckoutRefused means the container seed refused the
+// checkout's own metadata (tree-attributable, classified as an executed
+// failure). The tolerant tmp-dir and clone "skipped" branches return
+// gateExecuted: their pre-#2134 outcome mapping is unchanged and must never
+// become category C.
+func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration, scopePkgs []string) (agent.Event, string, string, gateDisposition) {
 	// Best-effort tree identity for the trace event: the enforcement-grade
 	// capture is the gates' fail-closed gitRevParseTreeOf; an empty tree_sha
 	// here only degrades the audit stamp, never the invariant.
 	treeSHA, _ := gitRevParseTreeOf(ctx, repoDir, headSHA)
 	parent, err := os.MkdirTemp("", "fishhawk-verify-*")
 	if err != nil {
-		return verifyRunEvent(verifyCmd, headSHA, treeSHA, -1, "worktree_tmp: "+err.Error(), "skipped"), "", "skipped"
+		return verifyRunEvent(verifyCmd, headSHA, treeSHA, -1, "worktree_tmp: "+err.Error(), "skipped"), "", "skipped", gateExecuted
 	}
 	defer func() { _ = os.RemoveAll(parent) }()
 	// An independent clone, not a linked worktree (ADR-063 / #2134): a gate
@@ -5939,7 +5992,7 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 	wt, err := materializeGateCheckout(ctx, repoDir, headSHA, parent)
 	if err != nil {
 		return verifyRunEvent(verifyCmd, headSHA, treeSHA, -1,
-			"clone: "+strings.TrimSpace(err.Error()), "skipped"), "", "skipped"
+			"clone: "+strings.TrimSpace(err.Error()), "skipped"), "", "skipped", gateExecuted
 	}
 
 	// Owner marker always; package set only when one was derived. verifyScopeEnv
@@ -5955,13 +6008,13 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 		extraEnv = verifyLockPathEnv(extraEnv, repoDir)
 	}
 
-	output, exitCode := runBoundedGateCommand(ctx, verifyCmd, wt,
+	output, exitCode, disp := runBoundedGateCommandDisposed(ctx, verifyCmd, wt,
 		filepath.Join(parent, "golangci-lint-cache"), timeout, extraEnv...)
 	outcome := "passed"
 	if exitCode != 0 {
 		outcome = "failed"
 	}
-	return verifyRunEvent(verifyCmd, headSHA, treeSHA, exitCode, output, outcome), output, outcome
+	return verifyRunEvent(verifyCmd, headSHA, treeSHA, exitCode, output, outcome), output, outcome, disp
 }
 
 // runBoundedGateCommand executes `sh -c command` in dir under the runner's
@@ -6000,7 +6053,17 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 // sanitization — see runBoundedGateArgv for what that does and does not widen.
 // It is variadic so every pre-existing call site stays source-compatible.
 func runBoundedGateCommand(ctx context.Context, command, dir, lintCacheDir string, timeout time.Duration, extraEnv ...string) (string, int) {
-	return runBoundedGateArgv(ctx, []string{"sh", "-c", command}, dir, lintCacheDir, timeout, extraEnv...)
+	out, code, _ := runBoundedGateCommandDisposed(ctx, command, dir, lintCacheDir, timeout, extraEnv...)
+	return out, code
+}
+
+// runBoundedGateCommandDisposed is runBoundedGateCommand's `sh -c` twin that
+// ALSO returns the gate disposition (#3448) — the out-of-band channel the
+// verify gates classify on. runBoundedGateCommand delegates here and drops
+// the disposition, so there is still exactly ONE containment implementation
+// (runBoundedGateArgvDisposed) and every pre-existing caller is unchanged.
+func runBoundedGateCommandDisposed(ctx context.Context, command, dir, lintCacheDir string, timeout time.Duration, extraEnv ...string) (string, int, gateDisposition) {
+	return runBoundedGateArgvDisposed(ctx, []string{"sh", "-c", command}, dir, lintCacheDir, timeout, extraEnv...)
 }
 
 // runBoundedGateArgv is the SHARED implementation of the gate-containment
@@ -6059,22 +6122,45 @@ func runBoundedGateCommand(ctx context.Context, command, dir, lintCacheDir strin
 // CombinedOutput, the 0 / child-code / -1 mapping) lives in
 // execBoundedHostArgv, which every path reaches through the
 // execBoundedHostArgvFn seam.
+//
+// CLASSIFICATION CHANNEL (#3448). The body lives in runBoundedGateArgvDisposed,
+// which additionally returns a gateDisposition naming out of band whether the
+// gate EXECUTED, was REFUSED by the selection, was UNAVAILABLE (a host-caused
+// container pre-exec failure) or had the CHECKOUT REFUSED by the seed. The
+// verify gates classify on that value — never on a leading literal in the
+// untrusted output, which a test could print. This function is a one-line
+// delegate that drops the disposition so every pre-existing call site
+// compiles byte-unchanged and no second exec path exists.
 func runBoundedGateArgv(ctx context.Context, argv []string, dir, lintCacheDir string, timeout time.Duration, extraEnv ...string) (string, int) {
+	out, code, _ := runBoundedGateArgvDisposed(ctx, argv, dir, lintCacheDir, timeout, extraEnv...)
+	return out, code
+}
+
+// runBoundedGateArgvDisposed is the disposition-bearing core of
+// runBoundedGateArgv (#3448): the same containment contract and exec-path
+// switch, plus the gateDisposition of the outcome — gateRefused for a refused
+// selection (the refusal text and -1, nothing executed), runGateInContainer's
+// own disposition on the container path, and gateExecuted on the sandbox and
+// clone paths (the argv ran; the exit code is the verdict). An empty argv is
+// ("", -1, gateExecuted): a caller bug, not a deployment condition.
+func runBoundedGateArgvDisposed(ctx context.Context, argv []string, dir, lintCacheDir string, timeout time.Duration, extraEnv ...string) (string, int, gateDisposition) {
 	if len(argv) == 0 {
-		return "", -1
+		return "", -1, gateExecuted
 	}
 	sanitized := withIsolatedLintCache(sanitizedGateEnv(), lintCacheDir)
 	env := appendGateExtraEnv(sanitized, extraEnv)
 	sel := gateIsolation.selection(ctx)
 	switch sel.Path {
 	case gateiso.PathRefused:
-		return gateRefusalMessage(sel), -1
+		return gateRefusalMessage(sel), -1, gateRefused
 	case gateiso.PathContainer:
 		return runGateInContainer(ctx, sel, argv, dir, lintCacheDir, sanitized, extraEnv, timeout)
 	case gateiso.PathCloneSandbox:
-		return execBoundedHostArgvFn(ctx, gateiso.WrapSandbox(argv), dir, env, timeout)
+		out, code := execBoundedHostArgvFn(ctx, gateiso.WrapSandbox(argv), dir, env, timeout)
+		return out, code, gateExecuted
 	default:
-		return execBoundedHostArgvFn(ctx, argv, dir, env, timeout)
+		out, code := execBoundedHostArgvFn(ctx, argv, dir, env, timeout)
+		return out, code, gateExecuted
 	}
 }
 
@@ -8541,7 +8627,9 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		}
 		// nil scope set = the FULL verify form (#3315): the #960 strict re-verify
 		// is the pre-push authority and is never narrowed.
-		ev, out, outcome := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
+		// The disposition is dropped here on purpose (#3448): this site keeps
+		// its isReverifyInfraFailure classification (out_of_scope for #3448).
+		ev, out, outcome, _ := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
 		// Emit the decisive re-verify's verify_run record unconditionally
 		// (pass or fail) before the outcome check (#969). The gate's first
 		// verify_run shipped inside the trace bundle, but the bundle is
@@ -8586,7 +8674,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, 1, detail)
-			ev, out, outcome = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
+			ev, out, outcome, _ = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
 			emitReverifyRun(ev)
 		}
 		if outcome != "passed" {
