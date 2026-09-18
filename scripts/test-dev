@@ -1738,6 +1738,11 @@ fi
 # family, defined in 14b above — which is why this section sits after it).
 # Sub-blocks: A pure tables · B _verify_k8s_image_identity · C _k8s_load_image ·
 # D cmd_k8s_up end to end · E body-grep wiring pins.
+# Two per-call rc knobs drive B14-B18, the resolver's fail-closed branches:
+# STUB_CONTENT_FAIL_AT=<n> fails the n-th 'ctr content get' (content-get-count
+# ordinal, includes the current call); STUB_INSPECT_DIGEST_RC fails ONLY
+# 'docker image inspect <repo>@sha256:…' (the shared-provisioner digest hop),
+# leaving the local-ref inspect's STUB_INSPECT_RC untouched.
 q_hex_l="$(printf '1%.0s' {1..64})"   # local image id (docker image inspect .Id)
 q_hex_r="$(printf '2%.0s' {1..64})"   # a DIFFERENT running image id
 q_hex_m="$(printf '3%.0s' {1..64})"   # a manifest (repo) digest
@@ -1784,6 +1789,10 @@ done
 q_manifest_a="{\"schemaVersion\":2,\"layers\":[{\"mediaType\":\"l\",\"digest\":\"sha256:${q_hex_y}\",\"size\":2}],\"config\":{\"mediaType\":\"c\",\"digest\":\"sha256:${q_hex_l}\",\"size\":1}}"
 q_manifest_b="{\"schemaVersion\":2,\"config\":{\"size\":1,\"digest\":\"sha256:${q_hex_l}\",\"mediaType\":\"c\"},\"layers\":[{\"digest\":\"sha256:${q_hex_y}\",\"size\":2}]}"
 q_index="{\n  \"schemaVersion\": 2,\n  \"manifests\": [\n    {\"mediaType\": \"m\", \"digest\": \"sha256:${q_hex_i}\", \"size\": 3, \"platform\": {\"os\": \"linux\"}}\n  ]\n}"
+# noconfig.json (B16): a well-formed manifest carrying only a layers entry —
+# no "config" key, no "manifests" key, so _k8s_config_digest_from_manifest
+# falls through both branches and prints nothing.
+q_manifest_noconfig="{\"schemaVersion\":2,\"layers\":[{\"mediaType\":\"l\",\"digest\":\"sha256:${q_hex_y}\",\"size\":2}]}"
 for spec in "layers-then-config|${q_manifest_a}" "size-before-digest|${q_manifest_b}"; do
   q_got="$(_k8s_config_digest_from_manifest "${spec#*|}")"
   if [[ "$q_got" == "sha256:${q_hex_l}" ]]; then
@@ -1801,6 +1810,24 @@ if [[ -z "$(_k8s_config_digest_from_manifest 'garbage')" && -z "$(_k8s_config_di
   pass "A3 _k8s_config_digest_from_manifest prints nothing for garbage / empty input"
 else
   fail "A3 _k8s_config_digest_from_manifest should print nothing for garbage (got: $(_k8s_config_digest_from_manifest 'garbage'))"
+fi
+# Setup step for B16: confirm the noconfig.json fixture genuinely carries no
+# config digest before B16 relies on it — a malformed fixture would otherwise
+# let B16 pass vacuously without ever exercising the no-config-digest branch.
+if [[ -z "$(_k8s_config_digest_from_manifest "$q_manifest_noconfig")" ]]; then
+  pass "A3 setup: the noconfig.json fixture (B16) carries no config digest"
+else
+  fail "A3 setup: the noconfig.json fixture must carry no config digest for B16 to test the right branch (got: $(_k8s_config_digest_from_manifest "$q_manifest_noconfig"))"
+fi
+# Setup step for B15/B17: confirm index.json genuinely routes to the
+# OCI-index branch (an "index:<digest>" config digest) — B17 reuses this
+# same fixture as the SECOND hop's response (self-nesting), so this also
+# confirms that second hop resolves to an index document, not incidentally
+# something else.
+if [[ "$(_k8s_config_digest_from_manifest "$(print -- "$q_index")")" == "index:sha256:${q_hex_i}" ]]; then
+  pass "A3 setup: the index.json fixture (B15/B17) resolves to an OCI-index config digest"
+else
+  fail "A3 setup: the index.json fixture must resolve to index:sha256:${q_hex_i} for B15/B17 to be meaningful"
 fi
 if ( FISHHAWK_K8S_SKIP_IDENTITY=1 _k8s_identity_skipped ); then
   pass "A4 _k8s_identity_skipped is true for FISHHAWK_K8S_SKIP_IDENTITY=1"
@@ -1823,6 +1850,11 @@ cat > "${q_stub}/docker" <<'STUB'
 #!/usr/bin/env zsh
 print -r -- "docker $*" >> "$REC"
 case "$*" in
+  "image inspect "*"@sha256:"*)
+    # Digest-form inspect (the shared-provisioner repo-digest resolve, B10/B18)
+    # answers via STUB_INSPECT_DIGEST_RC, distinct from STUB_INSPECT_RC below,
+    # which the local-ref inspect (B1-B13) alone consults.
+    print -r -- "${STUB_LOCAL_ID:-}"; exit "${STUB_INSPECT_DIGEST_RC:-0}" ;;
   "image inspect "*) print -r -- "${STUB_LOCAL_ID:-}"; exit "${STUB_INSPECT_RC:-0}" ;;
   "save "*)          exit "${STUB_SAVE_RC:-0}" ;;
   *)                 exit 0 ;;
@@ -1838,6 +1870,7 @@ case "$*" in
     # First content-get answers from STUB_MANIFEST_1, every later one from
     # STUB_MANIFEST_2 (the index -> manifest hop). The count includes this call.
     n="$(grep -c 'content get' "$REC")"
+    if [[ -n "${STUB_CONTENT_FAIL_AT:-}" ]] && (( n == STUB_CONTENT_FAIL_AT )); then exit 1; fi
     if (( n <= 1 )); then cat "${STUB_MANIFEST_1:-/dev/null}"; else cat "${STUB_MANIFEST_2:-/dev/null}"; fi
     exit 0 ;;
   "debug node/"*)
@@ -1862,6 +1895,7 @@ q_orig_path="$PATH"
 PATH="${q_stub}:$PATH"
 print -r -- "$q_manifest_a" > "${q_stub}/manifest.json"
 print -- "$q_index" > "${q_stub}/index.json"
+print -r -- "$q_manifest_noconfig" > "${q_stub}/noconfig.json"
 q_ref="ghcr.io/kuhlman-labs/fishhawkd:dev-local"
 
 # --- B. _verify_k8s_image_identity ---------------------------------------------
@@ -2011,6 +2045,113 @@ else
   fail "B11 index resolution should make exactly 2 content gets and pass (rc=${q_rc} gets=${q_gets} err=${q_err})"
 fi
 export STUB_MANIFEST_1="${q_stub}/manifest.json"
+K8S_DEBUG_PODS=()
+
+# B14 isolated: the FIRST 'ctr content get' fails -> 1 via its own branch, not
+# a fall-through to the no-config-digest or mismatch literals (#3445, approval
+# condition 2's counterfactual target). No /healthz responder is set up: the
+# resolver fails before _verify_k8s_image_identity ever reaches the healthz
+# fetch, so a leaked unconsumed responder cannot happen here.
+export STUB_POD_IMAGE_ID="ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m}"
+export STUB_CONTENT_FAIL_AT=1
+K8S_DEBUG_PODS=(node-debugger-x)
+: > "$REC"
+_q_run_identity abc1234 isolated
+q_gets="$(grep -c 'content get' "$REC")"
+if (( q_rc == 1 && q_gets == 1 )) \
+  && [[ "$q_err" == *"ctr content get sha256:${q_hex_m} failed via node-debugger-x"* \
+     && "$q_err" == *"identity: running image id unresolved"* \
+     && "$q_err" != *"carried no config digest"* \
+     && "$q_err" != *"identity: image id mismatch"* ]]; then
+  pass "B14 isolated: first 'ctr content get' failure -> 1 via its own branch (no fall-through)"
+else
+  fail "B14 first content-get failure should fail closed on its own branch (rc=${q_rc} gets=${q_gets} err=${q_err})"
+fi
+unset STUB_CONTENT_FAIL_AT
+
+# B15 isolated: the INDEX-HOP 'ctr content get' fails -> 1 via its own branch.
+# STUB_MANIFEST_1=index.json is the fixture the A3 setup step just confirmed
+# resolves to an OCI index, so the second hop this case fails IS the real
+# index-entry fetch, not a first-hop coincidence.
+export STUB_MANIFEST_1="${q_stub}/index.json"
+export STUB_CONTENT_FAIL_AT=2
+: > "$REC"
+_q_run_identity abc1234 isolated
+q_gets="$(grep -c 'content get' "$REC")"
+if (( q_rc == 1 && q_gets == 2 )) \
+  && [[ "$q_err" == *"ctr content get sha256:${q_hex_i} (index entry of sha256:${q_hex_m}) failed via node-debugger-x"* \
+     && "$q_err" == *"identity: running image id unresolved"* \
+     && "$q_err" != *"ctr content get sha256:${q_hex_m} failed"* \
+     && "$q_err" != *"carried no config digest"* \
+     && "$q_err" != *"identity: image id mismatch"* ]]; then
+  pass "B15 isolated: index-hop 'ctr content get' failure -> 1 via its own branch"
+else
+  fail "B15 index-hop content-get failure should fail closed on its own branch (rc=${q_rc} gets=${q_gets} err=${q_err})"
+fi
+unset STUB_CONTENT_FAIL_AT
+export STUB_MANIFEST_1="${q_stub}/manifest.json"
+
+# B16 isolated: a manifest with NO config field -> 1 via its own branch, one
+# content get, no fall-through to a mismatch.
+export STUB_MANIFEST_1="${q_stub}/noconfig.json"
+: > "$REC"
+_q_run_identity abc1234 isolated
+q_gets="$(grep -c 'content get' "$REC")"
+if (( q_rc == 1 && q_gets == 1 )) \
+  && [[ "$q_err" == *"manifest sha256:${q_hex_m} carried no config digest"* \
+     && "$q_err" == *"identity: running image id unresolved"* \
+     && "$q_err" != *"ctr content get"* \
+     && "$q_err" != *"identity: image id mismatch"* ]]; then
+  pass "B16 isolated: no-config manifest -> 1 via its own branch"
+else
+  fail "B16 no-config manifest should fail closed on its own branch (rc=${q_rc} gets=${q_gets} err=${q_err})"
+fi
+export STUB_MANIFEST_1="${q_stub}/manifest.json"
+
+# B17 isolated: a NESTED index — the index-hop's response is ALSO an index
+# document (index.json self-nesting, confirmed as real by the A3 setup step)
+# — -> 1 on the same no-config-digest branch, exactly 2 content gets, no
+# third hop attempted.
+export STUB_MANIFEST_1="${q_stub}/index.json" STUB_MANIFEST_2="${q_stub}/index.json"
+: > "$REC"
+_q_run_identity abc1234 isolated
+q_gets="$(grep -c 'content get' "$REC")"
+if (( q_rc == 1 && q_gets == 2 )) \
+  && [[ "$q_err" == *"manifest sha256:${q_hex_m} carried no config digest"* \
+     && "$q_err" == *"nested index"* \
+     && "$q_err" == *"identity: running image id unresolved"* \
+     && "$q_err" != *"identity: image id mismatch"* ]] \
+  && grep -q "content get sha256:${q_hex_i}$" "$REC"; then
+  pass "B17 isolated: nested index (self-referential) -> 1 via the no-config-digest branch, exactly 2 content gets"
+else
+  fail "B17 nested index should fail closed at 2 content gets (rc=${q_rc} gets=${q_gets} err=${q_err})"
+fi
+
+# B18 shared: 'docker image inspect <repo>@<digest>' fails -> 1 via its own
+# branch, distinct from B13 (the LOCAL-REF inspect failure). REC must show
+# BOTH inspect calls — the local ref succeeding, then the digest-form call
+# this case fails — proving STUB_INSPECT_DIGEST_RC targets only the latter.
+export STUB_POD_IMAGE_ID="docker-pullable://ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m}"
+export STUB_INSPECT_DIGEST_RC=1
+: > "$REC"
+_q_run_identity abc1234 shared
+if (( q_rc == 1 )) \
+  && [[ "$q_err" == *"cannot resolve ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m} to an image id"* \
+     && "$q_err" == *"identity: running image id unresolved"* \
+     && "$q_err" != *"identity: local image id unresolved"* \
+     && "$q_err" != *"identity: image id mismatch"* ]] \
+  && grep -q "^docker image inspect ghcr.io/kuhlman-labs/fishhawkd:dev-local " "$REC" \
+  && grep -q "^docker image inspect ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m} " "$REC"; then
+  pass "B18 shared: 'docker image inspect <repo>@<digest>' failure -> 1 via its own branch"
+else
+  fail "B18 digest-form docker image inspect failure should fail closed (rc=${q_rc} err=${q_err} rec=$(cat "$REC"))"
+fi
+unset STUB_INSPECT_DIGEST_RC
+
+# Restore every knob B14-B18 touched so B12 and block C see the pre-existing
+# fixture state (approval-plan step 5).
+unset STUB_CONTENT_FAIL_AT STUB_INSPECT_DIGEST_RC
+export STUB_MANIFEST_1="${q_stub}/manifest.json" STUB_MANIFEST_2="${q_stub}/manifest.json"
 K8S_DEBUG_PODS=()
 
 # B12 unrecognised imageID -> 1.
@@ -2207,7 +2348,22 @@ if print -r -- "$q_ident" | grep -q 'return 2'; then
 else
   pass "E _verify_k8s_image_identity has no rc=2 warn-and-continue path"
 fi
-unset q_hex_l q_hex_r q_hex_m q_hex_y q_hex_i q_manifest_a q_manifest_b q_index q_ref q_url q_port q_rc q_out q_err
+# E identity-failure teardown leg (#3445, approval condition 1): extract ONLY
+# the lines from the 'if ! _verify_k8s_image_identity' line to ITS OWN closing
+# 'fi' (an awk range, not a fixed -A4 that could bleed past this block into
+# the sibling _verify_listener_identity leg a few lines above, which shares
+# the same kill/rm/exit shape).
+q_ident_leg="$(print -r -- "$q_up" | awk '/_verify_k8s_image_identity/,/^[[:space:]]*fi[[:space:]]*$/')"
+if [[ -n "$q_ident_leg" ]] \
+  && print -r -- "$q_ident_leg" | grep -q 'kill "\$pf_pid"' \
+  && print -r -- "$q_ident_leg" | grep -q 'rm -f "\$K8S_PF_PID_FILE"' \
+  && print -r -- "$q_ident_leg" | grep -q 'exit 1' \
+  && ! print -r -- "$q_ident_leg" | grep -q '_verify_listener_identity'; then
+  pass "E cmd_k8s_up's image-identity-failure leg kills the port-forward, removes the pid file and exits 1"
+else
+  fail "E the extracted identity-failure leg should kill+rm+exit and never bleed into the listener leg (leg=${q_ident_leg})"
+fi
+unset q_hex_l q_hex_r q_hex_m q_hex_y q_hex_i q_manifest_a q_manifest_b q_manifest_noconfig q_index q_ref q_url q_port q_rc q_out q_err q_ident_leg
 
 # 15. Acceptance preview (E31.18 / #1569) — pure DB derivation. The preview
 # database name must be the base name with an `_preview` suffix and can NEVER
