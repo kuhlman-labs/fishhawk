@@ -189,9 +189,20 @@ return non-zero.
 
 ### One test loop, not two (`cmd_test_with_patch_coverage`)
 
-Verify runs the same per-module `go test -race -p "$TEST_P" ./...` loop
-it always did. A module owning changed packages additionally gets
-`-covermode=atomic -coverprofile=… -coverpkg=<its changed packages>`.
+Verify runs the same per-module `go test -race -p "$TEST_P" -timeout
+"$TEST_TIMEOUT" ./...` loop it always did. A module owning changed
+packages additionally gets `-covermode=atomic -coverprofile=…
+-coverpkg=<its changed packages>`.
+
+`TEST_TIMEOUT` (`"${FISHHAWK_TEST_TIMEOUT:-20m}"`) is an explicit
+per-package deadline passed to every `go test -race` loop line
+(`cmd_test`, the scoped verify loop, `cmd_coverage`, and both branches
+of `cmd_test_with_patch_coverage`) — Go's own default is a silent 10m
+panic, and the runner package alone sits near that under load (#3475).
+`FISHHAWK_TEST_TIMEOUT` is a DEV-ONLY override: the runner's gate env
+is a default-deny allow-list, so the verify gate always runs with the
+20m default. `scripts/test single` stays a raw passthrough — a caller
+passes its own `-timeout`.
 Restricting `-coverpkg` (rather than accepting Go's default per-package
 attribution) is load-bearing: the module's FULL test set then credits
 the changed packages, so a function exercised only by a SIBLING

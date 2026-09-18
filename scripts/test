@@ -502,6 +502,14 @@ NO_MODULES_MSG="scripts/test: could not enumerate go.work modules (go/jq unavail
 # FISHHAWK_TEST_P=2). `single` runs are unbounded.
 TEST_P="${FISHHAWK_TEST_P:-4}"
 
+# Go's per-package default is 10m ("go test -timeout d" panics the binary past
+# it), and the runner package alone sits near that under load (#3475) — so
+# every loop passes an explicit -timeout with headroom instead of relying on
+# the silent default. FISHHAWK_TEST_TIMEOUT is a DEV-ONLY override: the
+# runner's gate env is a default-deny allow-list (gateenv.go), so the verify
+# gate always runs with the 20m default. `single` stays a raw passthrough.
+TEST_TIMEOUT="${FISHHAWK_TEST_TIMEOUT:-20m}"
+
 cmd_test() {
   local mlist m
   if ! mlist="$(_module_list)"; then
@@ -511,7 +519,7 @@ cmd_test() {
   _arm_container_lease
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
-    (cd "$m" && go test -race -p "$TEST_P" ./...)
+    (cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" ./...)
   done <<< "$mlist"
 }
 
@@ -661,7 +669,7 @@ cmd_test_scoped() {
     # arguments this script built itself, and _verify_scope_buckets already
     # refused any entry carrying whitespace.
     # shellcheck disable=SC2086
-    (cd "$m" && go test -race -p "$TEST_P" $pkgs)
+    (cd "$m" && go test -race -p "$TEST_P" $pkgs -timeout "$TEST_TIMEOUT")
     ran=$((ran + 1))
   done <<< "$mlist"
   # Defence in depth against the module list changing between bucketing and this
@@ -678,7 +686,7 @@ cmd_coverage() {
   local profiles=()
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
-    (cd "$m" && go test -race -p "$TEST_P" -coverprofile=coverage.out -covermode=atomic ./...)
+    (cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" -coverprofile=coverage.out -covermode=atomic ./...)
     profiles+=("$m/coverage.out")
   done < <(modules)
   python3 "$ROOT/scripts/check-coverage.py" --threshold 80 --exclude '/db/' "${profiles[@]}"
@@ -1025,10 +1033,10 @@ cmd_test_with_patch_coverage() {
     if [ -n "$pkgs" ]; then
       (( ++cov_idx ))
       slug="$(printf '%s' "${m#./}" | tr '/' '_')"
-      (cd "$m" && go test -race -p "$TEST_P" -covermode=atomic \
+      (cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" -covermode=atomic \
         -coverprofile="$PATCHCOV_DIR/$cov_idx-$slug.out" -coverpkg="$pkgs" ./...)
     else
-      (cd "$m" && go test -race -p "$TEST_P" ./...)
+      (cd "$m" && go test -race -p "$TEST_P" ./... -timeout "$TEST_TIMEOUT")
     fi
   done <<< "$mlist"
 }
