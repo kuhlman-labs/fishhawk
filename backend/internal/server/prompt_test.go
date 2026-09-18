@@ -1841,6 +1841,59 @@ func TestFillIssueContext_Unresolved_WarnsAndAudits(t *testing.T) {
 			t.Errorf("populated gitlab fetch logged %d unresolved WARNs, want 0:\n%s", n, h2.logs.String())
 		}
 	})
+
+	// discriminating_control_github_comments_error_title_only_zero_rows closes
+	// the evidence-conflict gap in the two "populated title AND body" controls
+	// above: with BOTH fields non-empty, `title=="" && body==""` and
+	// `title=="" || body==""` evaluate identically (false), so those fixtures
+	// cannot tell the tail's real `&&` apart from a `||` slip. Here title is
+	// populated and body is EMPTY: under the correct `&&` this is
+	// false&&true=false (resolved, zero rows); under a `||` mutant it is
+	// false||true=true (wrongly unresolved, one row) — so only this asymmetric
+	// fixture actually discriminates the operator, on top of the same
+	// comment-fetch-error shape.
+	t.Run("discriminating_control_github_comments_error_title_only_zero_rows", func(t *testing.T) {
+		h := newIssueContextHarness(t, nil)
+		installation := int64(99)
+		row := &run.Run{Repo: "o/n", InstallationID: &installation}
+		h.gh.issue = &githubclient.Issue{Number: 42, Title: "Populated title", Body: "", State: "open"}
+		h.gh.commentsErr = errors.New("boom")
+		runID, stageID, priv := h.seed(t, row, run.StageTypePlan)
+
+		got := h.promptOK(t, runID, stageID, priv)
+		if !strings.Contains(got, "Populated title") {
+			t.Errorf("populated title must render unchanged on a comment-fetch error:\n%s", got)
+		}
+		if rows := h.unresolvedRows(t); len(rows) != 0 {
+			t.Errorf("title-only github fetch wrote %d issue_context_unresolved rows, want 0: %v", len(rows), rows)
+		}
+		if n := h.unresolvedWarns(); n != 0 {
+			t.Errorf("title-only github fetch logged %d unresolved WARNs, want 0:\n%s", n, h.logs.String())
+		}
+	})
+
+	// discriminating_control_gitlab_notes_error_title_only_zero_rows is the
+	// GitLab-family twin of the control above, through the real forgegitlab
+	// adapter, pinning the same asymmetric title-only/body-empty shape against
+	// fillIssueContextViaForge's tail check.
+	t.Run("discriminating_control_gitlab_notes_error_title_only_zero_rows", func(t *testing.T) {
+		fake, resolver := newGitLabIssueForge(t)
+		fake.issueBody = `{"iid":42,"title":"Populated GitLab title","description":"","state":"opened","web_url":"https://gitlab.example/grp/sub/proj/-/issues/42"}`
+		fake.notesStatus = http.StatusInternalServerError
+		h := newIssueContextHarness(t, resolver)
+		runID, stageID, priv := h.seed(t, gitlabRun(), run.StageTypePlan)
+
+		got := h.promptOK(t, runID, stageID, priv)
+		if !strings.Contains(got, "Populated GitLab title") {
+			t.Errorf("populated title must render unchanged on a notes-fetch error:\n%s", got)
+		}
+		if rows := h.unresolvedRows(t); len(rows) != 0 {
+			t.Errorf("title-only gitlab fetch wrote %d issue_context_unresolved rows, want 0: %v", len(rows), rows)
+		}
+		if n := h.unresolvedWarns(); n != 0 {
+			t.Errorf("title-only gitlab fetch logged %d unresolved WARNs, want 0:\n%s", n, h.logs.String())
+		}
+	})
 }
 
 // TestFillIssueContext_FetchedContextEmpty_KeepsCommentsAndURL pins the
