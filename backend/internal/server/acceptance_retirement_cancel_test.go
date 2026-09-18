@@ -192,8 +192,15 @@ func TestRecordRetirementsDroppedOnCancel_NoRetirements_NoRow(t *testing.T) {
 
 // TestRecordRetirementsDroppedOnCancel_Idempotent: a second invocation, from
 // ANY cancel source, appends nothing — the key is (stage, reason).
-// Counterfactual (C): deleting the retirementDropAlreadyRecorded check
-// yields two rows.
+// Counterfactual (C): this seam runs the plain auditFake, so it exercises
+// appendRetirementDropOnce's FALLBACK leg — deleting the
+// retirementDropAlreadyRecorded check in acceptance_retirement_drop.go yields
+// two rows. The CAPABILITY leg (the atomic audit.DedupedChainAppender path the
+// production Postgres repo takes, #3439) is pinned separately by
+// TestRecordRetirementsDroppedOnCancel_CapabilityPath_Idempotent over the
+// deduped fake (its counterfactual: deleting the in-transaction scan in
+// audit.AppendChainedDedupedTx) and, atomically, by
+// TestRecordRetirementsDroppedOnCancel_PG_ConcurrentSinksExactlyOne.
 func TestRecordRetirementsDroppedOnCancel_Idempotent(t *testing.T) {
 	c := newCancelDropSeam(t, run.StageStatePending, true, cancelDropRetired)
 	c.s.recordAcceptanceRetirementsDroppedOnCancel(context.Background(), c.runID, cancelSourceOperator)

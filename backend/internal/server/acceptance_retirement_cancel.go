@@ -153,14 +153,6 @@ func (s *Server) recordAcceptanceRetirementsDroppedOnCancel(ctx context.Context,
 	}
 	stageID := target.ID
 
-	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceScenarioRetirementDropped); err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"run cancel: acceptance retirement drop: list audit entries failed; proceeding without idempotency guard",
-			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()), slog.String("error", err.Error()))
-	} else if retirementDropAlreadyRecorded(entries, stageID, acceptanceRetirementDropReasonRunCancelled) {
-		return
-	}
-
 	ids := make([]string, 0, len(retired))
 	for _, e := range retired {
 		ids = append(ids, e.ID)
@@ -183,18 +175,26 @@ func (s *Server) recordAcceptanceRetirementsDroppedOnCancel(ctx context.Context,
 	}
 	payload, _ := json.Marshal(fields)
 	actorKind := audit.ActorSystem
-	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
-		RunID:     runID,
-		StageID:   &stageID,
-		Timestamp: time.Now().UTC(),
-		Category:  CategoryAcceptanceScenarioRetirementDropped,
-		ActorKind: &actorKind,
-		Payload:   payload,
-	}); err != nil {
+	// Idempotent per (stage_id, reason) — NOT cancel_source, so two sinks
+	// racing on one run collapse to one row (#3439). Atomic on the Postgres
+	// repo via appendRetirementDropOnce's DedupedChainAppender path.
+	appended, err := s.appendRetirementDropOnce(ctx, runID, stageID, acceptanceRetirementDropReasonRunCancelled,
+		"run cancel: acceptance retirement drop", audit.ChainAppendParams{
+			RunID:     runID,
+			StageID:   &stageID,
+			Timestamp: time.Now().UTC(),
+			Category:  CategoryAcceptanceScenarioRetirementDropped,
+			ActorKind: &actorKind,
+			Payload:   payload,
+		})
+	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"run cancel: acceptance retirement drop: append audit entry failed",
 			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()),
 			slog.String("cancel_source", cancelSource), slog.String("error", err.Error()))
+		return
+	}
+	if !appended {
 		return
 	}
 	s.notifyStatusUpdate(ctx, runID, CategoryAcceptanceScenarioRetirementDropped)

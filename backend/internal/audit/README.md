@@ -173,6 +173,60 @@ RETURNING`, an empty result meaning already-seen) and the
 `IsDuplicateOnConstraint` narrowings for #1983 / #2594 / #2622 below;
 `IsAcceptanceArbitrationDuplicate` is the #2536 member of that family.
 
+## Atomic deduped append (`DedupedChainAppender`, #3439)
+
+`AppendChainedDeduped` / `AppendChainedDedupedTx` are an **atomic
+scan-and-append**: they look for a prior entry of the appended category
+carrying the same `(stage_id, <payload key> = <string value>)` and, finding
+none, append — all in ONE transaction, under the run-row lock. They back the
+three `acceptance_scenario_retirement_dropped` writers in `server`
+(`recordAcceptanceRetirementsDroppedOnCancel`,
+`recordAcceptanceScenarioRetirementDropped`,
+`recordAcceptanceRetirementsUnserved`, routed through ONE helper
+`appendRetirementDropOnce`), whose idempotency scan sat OUTSIDE the append's
+transaction before #3439 — a check-then-act — so two cancel sinks racing on one
+run could each pass the `(stage_id, reason)` scan and each append.
+
+**Ordering is load-bearing** and mirrors `AppendChainedAnchoredTx`:
+`LockRunForUpdate(run)` FIRST, THEN the same-transaction
+`ListAuditEntriesByCategory` scan, THEN `AppendChainedTx`. Because the scan
+runs *after* the row lock is granted, and Postgres READ COMMITTED takes a fresh
+snapshot per statement, it observes any competing append that committed before
+the lock was granted. The transaction MUST run at the server-default READ
+COMMITTED isolation (`AppendChainedDeduped` sets no `TxOptions`).
+
+**The guarantee:** no second row for the same `(run, stage, category,
+key=value)` ever commits. `DedupeSpec.StageID`, when set, restricts the scan to
+rows carrying exactly that stage (a nil-stage row is never a duplicate of a
+stage-scoped spec); the key is decoded as a JSON **string** (`payloadString`,
+the mirror of `payloadInt64`), and a malformed payload, an absent key, or a
+non-string value is SKIPPED — an unusable row is not a duplicate, so the append
+proceeds. `*DedupedDuplicateError` carries the surviving entry so the caller
+can name its sequence.
+
+**No backstop unique index, deliberately.** The #2536 IndexDropped test proves
+the lock + in-transaction scan closes the window standing alone, so an index
+adds no guarantee. A partial unique index on `(run_id, stage_id,
+payload->>'reason')` would also FAIL TO BUILD on a production chain that
+already carries a raced duplicate — the race was live before #3439 landed —
+and audit rows cannot be deleted to repair it (migration 0002's triggers
+RAISE). The failure direction of a missed duplicate is a duplicate
+over-report on the status comment, never a lost record, so the migration cost
+is not justified. Revisit only if a consumer of this primitive ever writes a
+row whose duplication is a correctness (not a reporting) defect.
+
+`DedupedChainAppender` is an OPTIONAL capability kept OFF the `Repository`
+interface (the same reasoning as `AnchoredChainAppender` and
+`RetryBudgetAppender` above), with a `var _ DedupedChainAppender =
+(*postgresRepo)(nil)` compile-time assertion in `postgres.go`. The server
+helper's fallback for a non-capable repo (in-memory fakes only) is the prior
+non-atomic list-then-append and is debug-logged — a real residual: **the
+atomicity guarantee holds only for the Postgres repository.** Pinned by
+`deduped_test.go` (happy path chaining, in-transaction duplicate, the
+stage/reason key halves, unusable-key skipping, unknown run, 8-way
+`_ConcurrentExactlyOne` by direct count) and, end to end through the server
+helper, `server/acceptance_retirement_drop_pg_test.go`.
+
 ## Grooming capture/apply window (`GroomingWindowAppender`, #2991)
 
 `grooming_window.go` carries the capture/apply CONCURRENCY PROTOCOL that lets the

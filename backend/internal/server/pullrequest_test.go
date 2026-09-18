@@ -3678,6 +3678,68 @@ func TestShipPullRequest_AcceptanceScenarioRetirementDropped(t *testing.T) {
 	}
 }
 
+// TestShipPullRequest_AcceptanceScenarioRetirementDropped_CapabilityPath is
+// the PR handler over the DEDUPED fake (#3439): the wire contract is unchanged
+// when appendRetirementDropOnce takes the audit.DedupedChainAppender path —
+// first POST 200 + 1 row + 1 refresh, replay 200 + still 1 row + still 1
+// refresh, a second reason → 2 rows — and every append went through
+// AppendChainedDeduped, never the fallback list-then-append. Counterfactual:
+// deleting the `if !appended { respond(); return }` in the handler makes the
+// replay refresh a second time.
+func TestShipPullRequest_AcceptanceScenarioRetirementDropped_CapabilityPath(t *testing.T) {
+	s, sf, au, _, rec, runID, stageID := newAcceptanceScenarioPRServer(t)
+	dau := &dedupedAuditFake{auditFake: au}
+	s.cfg.AuditRepo = dau
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPRRequest(t, s, runID, stageID, priv, retirementDroppedBody, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := countByCategory(au, CategoryAcceptanceScenarioRetirementDropped); n != 1 {
+		t.Fatalf("entries = %d, want 1", n)
+	}
+	if len(rec.status) != 1 {
+		t.Errorf("status comment refreshes = %d, want 1", len(rec.status))
+	}
+	// Replay: 200, no new row, NO second refresh.
+	w = shipPRRequest(t, s, runID, stageID, priv, retirementDroppedBody, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("replay status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if n := countByCategory(au, CategoryAcceptanceScenarioRetirementDropped); n != 1 {
+		t.Errorf("entries after replay = %d, want 1", n)
+	}
+	if len(rec.status) != 1 {
+		t.Errorf("status comment refreshes after replay = %d, want still 1", len(rec.status))
+	}
+	// A different exit path on the same stage is a distinct record.
+	other := []byte(strings.Replace(string(retirementDroppedBody), "persist_failed", "no_run_branch", 1))
+	if w = shipPRRequest(t, s, runID, stageID, priv, other, ""); w.Code != http.StatusOK {
+		t.Fatalf("second-reason status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if n := countByCategory(au, CategoryAcceptanceScenarioRetirementDropped); n != 2 {
+		t.Errorf("entries after a second reason = %d, want 2", n)
+	}
+	if dau.dedupedCalls != 3 {
+		t.Errorf("AppendChainedDeduped calls = %d, want 3 (every POST takes the capability path)", dau.dedupedCalls)
+	}
+	if strings.Contains(logBuf.String(), "proceeding without idempotency guard") || strings.Contains(logBuf.String(), "falling back to the non-atomic") {
+		t.Errorf("capability path must never take the fallback:\n%s", logBuf.String())
+	}
+	// The capability append error is the same 500 the fallback returns.
+	dau.appendErrCategory = CategoryAcceptanceScenarioRetirementDropped
+	third := []byte(strings.Replace(string(retirementDroppedBody), "persist_failed", "persist_refused", 1))
+	if w = shipPRRequest(t, s, runID, stageID, priv, third, ""); w.Code != http.StatusInternalServerError || !bodyHasCode(w, "internal_error") {
+		t.Fatalf("append-error status = %d, want 500 internal_error:\n%s", w.Code, w.Body.String())
+	}
+	if n := countByCategory(au, CategoryAcceptanceScenarioRetirementDropped); n != 2 {
+		t.Errorf("entries after the append error = %d, want still 2", n)
+	}
+}
+
 // TestShipPullRequest_AcceptanceScenarioRetirementDropped_RendersOnStatusComment
 // is the cross-boundary route-level check binding condition 1 requires
 // (#3392): it drives the REAL HTTP surface end to end — a signed
