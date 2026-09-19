@@ -25,7 +25,7 @@ func TestResolvePredicates(t *testing.T) {
 	t.Run("satisfied: both predicates pass, each called once", func(t *testing.T) {
 		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin, member: true}
 		s := New(Config{IdentityProvider: idp})
-		outcome, res, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+		outcome, res, _ := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
 			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write", MemberOf: "acme/reviewers"}, spec.ComposedRequirements{}))
 		if outcome != predicateSatisfied {
 			t.Fatalf("outcome = %v, want satisfied", outcome)
@@ -44,7 +44,7 @@ func TestResolvePredicates(t *testing.T) {
 	t.Run("rejected: permission below required tier", func(t *testing.T) {
 		idp := &fakeIdentityProvider{perm: identity.PermissionWrite}
 		s := New(Config{IdentityProvider: idp})
-		outcome, res, predicate := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+		outcome, res, predicate := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
 			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "maintain"}, spec.ComposedRequirements{}))
 		if outcome != predicateRejected {
 			t.Fatalf("outcome = %v, want rejected", outcome)
@@ -60,7 +60,7 @@ func TestResolvePredicates(t *testing.T) {
 	t.Run("rejected: non-member", func(t *testing.T) {
 		idp := &fakeIdentityProvider{member: false}
 		s := New(Config{IdentityProvider: idp})
-		outcome, res, predicate := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+		outcome, res, predicate := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
 			effectiveApprovals(&spec.Approvals{Count: one, MemberOf: "acme/reviewers"}, spec.ComposedRequirements{}))
 		if outcome != predicateRejected {
 			t.Fatalf("outcome = %v, want rejected", outcome)
@@ -76,7 +76,7 @@ func TestResolvePredicates(t *testing.T) {
 	t.Run("unavailable: PermissionLevel error", func(t *testing.T) {
 		idp := &fakeIdentityProvider{permErr: identity.ErrRateLimited}
 		s := New(Config{IdentityProvider: idp})
-		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+		outcome, _, _ := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
 			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write"}, spec.ComposedRequirements{}))
 		if outcome != predicateUnavailable {
 			t.Fatalf("outcome = %v, want unavailable", outcome)
@@ -86,7 +86,7 @@ func TestResolvePredicates(t *testing.T) {
 	t.Run("unavailable: ResolveMembership error", func(t *testing.T) {
 		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin, memberErr: errors.New("boom")}
 		s := New(Config{IdentityProvider: idp})
-		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+		outcome, _, _ := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
 			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write", MemberOf: "acme/reviewers"}, spec.ComposedRequirements{}))
 		if outcome != predicateUnavailable {
 			t.Fatalf("outcome = %v, want unavailable", outcome)
@@ -96,7 +96,7 @@ func TestResolvePredicates(t *testing.T) {
 	t.Run("unavailable: empty repo when permission required (fail closed)", func(t *testing.T) {
 		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin, member: true}
 		s := New(Config{IdentityProvider: idp})
-		outcome, _, _ := s.resolvePredicates(context.Background(), "", "github:op",
+		outcome, _, _ := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "", "github:op",
 			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write"}, spec.ComposedRequirements{}))
 		if outcome != predicateUnavailable {
 			t.Fatalf("outcome = %v, want unavailable (empty repo)", outcome)
@@ -109,12 +109,170 @@ func TestResolvePredicates(t *testing.T) {
 	t.Run("unavailable: unparseable min_permission (fail closed)", func(t *testing.T) {
 		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin}
 		s := New(Config{IdentityProvider: idp})
-		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+		outcome, _, _ := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
 			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "superuser"}, spec.ComposedRequirements{}))
 		if outcome != predicateUnavailable {
 			t.Fatalf("outcome = %v, want unavailable (unparseable tier)", outcome)
 		}
 	})
+
+	// #3466: the provider is resolved PER RUN FORGE through the forge-keyed
+	// cfg.IdentityProviders map, never the GitHub-only singleton.
+	t.Run("gitlab forge routes to the gitlab provider", func(t *testing.T) {
+		gh := &fakeIdentityProvider{perm: identity.PermissionNone}
+		gl := &fakeIdentityProvider{perm: identity.PermissionMaintain}
+		s := New(Config{IdentityProvider: gh, IdentityProviders: map[string]identity.IdentityProvider{identity.ProviderGitLab: gl}})
+		outcome, res, _ := s.resolvePredicates(context.Background(), identity.ProviderGitLab, "acme/repo", "gitlab:alice",
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write"}, spec.ComposedRequirements{}))
+		if outcome != predicateSatisfied {
+			t.Fatalf("outcome = %v, want satisfied via the gitlab provider", outcome)
+		}
+		if res.ResolvedPermission != "maintain" {
+			t.Errorf("resolved permission = %q, want maintain", res.ResolvedPermission)
+		}
+		if gl.permCalls != 1 || gh.permCalls != 0 {
+			t.Errorf("permCalls = gitlab %d / github %d, want 1 / 0", gl.permCalls, gh.permCalls)
+		}
+	})
+
+	t.Run("gitlab forge member_of routes to the gitlab provider", func(t *testing.T) {
+		gh := &fakeIdentityProvider{member: false}
+		gl := &fakeIdentityProvider{member: true}
+		s := New(Config{IdentityProvider: gh, IdentityProviders: map[string]identity.IdentityProvider{identity.ProviderGitLab: gl}})
+		outcome, res, _ := s.resolvePredicates(context.Background(), identity.ProviderGitLab, "acme/repo", "gitlab:alice",
+			effectiveApprovals(&spec.Approvals{Count: one, MemberOf: "acme/reviewers"}, spec.ComposedRequirements{}))
+		if outcome != predicateSatisfied {
+			t.Fatalf("outcome = %v, want satisfied via the gitlab provider", outcome)
+		}
+		if res.MemberResolved == nil || !*res.MemberResolved {
+			t.Errorf("member resolved = %v, want true", res.MemberResolved)
+		}
+		if gl.memberCalls != 1 || gh.memberCalls != 0 {
+			t.Errorf("memberCalls = gitlab %d / github %d, want 1 / 0", gl.memberCalls, gh.memberCalls)
+		}
+	})
+
+	t.Run("gitlab forge with only a github provider is unconfigured, never rejected", func(t *testing.T) {
+		gh := &fakeIdentityProvider{perm: identity.PermissionAdmin, member: true}
+		s := New(Config{IdentityProvider: gh})
+		outcome, _, predicate := s.resolvePredicates(context.Background(), identity.ProviderGitLab, "acme/repo", "gitlab:alice",
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write"}, spec.ComposedRequirements{}))
+		if outcome != predicateUnconfigured {
+			t.Fatalf("outcome = %v, want unconfigured", outcome)
+		}
+		if predicate != "min_permission" {
+			t.Errorf("predicate = %q, want min_permission", predicate)
+		}
+		if gh.permCalls != 0 {
+			t.Errorf("github permCalls = %d, want 0 (the github singleton must not answer for a gitlab run)", gh.permCalls)
+		}
+	})
+
+	t.Run("no provider at all (NoOp default) is unconfigured, never rejected", func(t *testing.T) {
+		s := New(Config{})
+		outcome, _, predicate := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write"}, spec.ComposedRequirements{}))
+		if outcome != predicateUnconfigured {
+			t.Fatalf("outcome = %v, want unconfigured (a NoOp clean deny must not read as a 403)", outcome)
+		}
+		if predicate != "min_permission" {
+			t.Errorf("predicate = %q, want min_permission", predicate)
+		}
+	})
+
+	t.Run("no provider at all (NoOp default) member_of is unconfigured", func(t *testing.T) {
+		s := New(Config{})
+		outcome, _, predicate := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
+			effectiveApprovals(&spec.Approvals{Count: one, MemberOf: "acme/reviewers"}, spec.ComposedRequirements{}))
+		if outcome != predicateUnconfigured {
+			t.Fatalf("outcome = %v, want unconfigured", outcome)
+		}
+		if predicate != "member_of" {
+			t.Errorf("predicate = %q, want member_of", predicate)
+		}
+	})
+
+	t.Run("explicit NoOp in the map is not a provider", func(t *testing.T) {
+		s := New(Config{IdentityProviders: map[string]identity.IdentityProvider{identity.ProviderGitLab: identity.NewNoOp()}})
+		outcome, _, _ := s.resolvePredicates(context.Background(), identity.ProviderGitLab, "acme/repo", "gitlab:alice",
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write"}, spec.ComposedRequirements{}))
+		if outcome != predicateUnconfigured {
+			t.Fatalf("outcome = %v, want unconfigured (an explicit NoOp must be excluded by IsConfigured)", outcome)
+		}
+		outcome, _, _ = s.resolvePredicates(context.Background(), identity.ProviderGitLab, "acme/repo", "gitlab:alice",
+			effectiveApprovals(&spec.Approvals{Count: one, MemberOf: "acme/reviewers"}, spec.ComposedRequirements{}))
+		if outcome != predicateUnconfigured {
+			t.Fatalf("member_of outcome = %v, want unconfigured", outcome)
+		}
+	})
+
+	t.Run("precedence: empty repo shadows unconfigured on min_permission", func(t *testing.T) {
+		s := New(Config{})
+		outcome, _, _ := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "", "github:op",
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write"}, spec.ComposedRequirements{}))
+		if outcome != predicateUnavailable {
+			t.Fatalf("outcome = %v, want unavailable (empty repo runs before the provider lookup)", outcome)
+		}
+	})
+
+	t.Run("nil InstallationRef derives github and reaches the singular-seeded provider", func(t *testing.T) {
+		if got := observationForgeID(nil); got != identity.ProviderGitHub {
+			t.Fatalf("observationForgeID(nil) = %q, want %q", got, identity.ProviderGitHub)
+		}
+		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin}
+		s := New(Config{IdentityProvider: idp})
+		outcome, _, _ := s.resolvePredicates(context.Background(), observationForgeID(nil), "acme/repo", "github:op",
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write"}, spec.ComposedRequirements{}))
+		if outcome != predicateSatisfied {
+			t.Fatalf("outcome = %v, want satisfied", outcome)
+		}
+		if idp.permCalls != 1 {
+			t.Errorf("permCalls = %d, want 1", idp.permCalls)
+		}
+	})
+
+	t.Run("count-only approvals never touch the provider map", func(t *testing.T) {
+		s := New(Config{})
+		outcome, _, predicate := s.resolvePredicates(context.Background(), identity.ProviderGitLab, "acme/repo", "gitlab:alice",
+			effectiveApprovals(&spec.Approvals{Count: one}, spec.ComposedRequirements{}))
+		if outcome != predicateSatisfied || predicate != "" {
+			t.Fatalf("outcome = %v / predicate %q, want satisfied / \"\"", outcome, predicate)
+		}
+	})
+}
+
+func TestPredicateIdentityProvider(t *testing.T) {
+	fake := &fakeIdentityProvider{}
+	var typedNil *identity.GitLabIdentityProvider
+	cases := []struct {
+		name  string
+		cfg   Config
+		forge string
+		want  bool
+	}{
+		{"nil map", Config{}, identity.ProviderGitLab, false},
+		{"missing key", Config{IdentityProviders: map[string]identity.IdentityProvider{identity.ProviderGitHub: fake}}, identity.ProviderGitLab, false},
+		{"NoOp entry", Config{IdentityProviders: map[string]identity.IdentityProvider{identity.ProviderGitLab: identity.NewNoOp()}}, identity.ProviderGitLab, false},
+		{"typed-nil entry", Config{IdentityProviders: map[string]identity.IdentityProvider{identity.ProviderGitLab: typedNil}}, identity.ProviderGitLab, false},
+		{"configured fake", Config{IdentityProviders: map[string]identity.IdentityProvider{identity.ProviderGitLab: fake}}, identity.ProviderGitLab, true},
+		{"singular seeds github", Config{IdentityProvider: fake}, identity.ProviderGitHub, true},
+		{"NoOp default is not seeded under github", Config{}, identity.ProviderGitHub, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(tc.cfg)
+			p, ok := s.predicateIdentityProvider(tc.forge)
+			if ok != tc.want {
+				t.Fatalf("ok = %v, want %v", ok, tc.want)
+			}
+			if ok && p != fake {
+				t.Errorf("provider = %v, want the configured fake", p)
+			}
+			if !ok && p != nil {
+				t.Errorf("provider = %v on !ok, want nil", p)
+			}
+		})
+	}
 }
 
 func TestSplitProviderSubject(t *testing.T) {
@@ -1012,7 +1170,7 @@ func TestResolvePredicates_EscalatedConjunction(t *testing.T) {
 	t.Run("every group resolved: satisfied, one forge call per group", func(t *testing.T) {
 		idp := &fakeIdentityProvider{member: true}
 		s := New(Config{IdentityProvider: idp})
-		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+		outcome, _, _ := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
 			effectiveApprovals(base, escalated))
 		if outcome != predicateSatisfied {
 			t.Fatalf("outcome = %v, want satisfied", outcome)
@@ -1025,7 +1183,7 @@ func TestResolvePredicates_EscalatedConjunction(t *testing.T) {
 	t.Run("a member of only ONE composed group is refused", func(t *testing.T) {
 		idp := &perGroupIdentityProvider{member: map[string]bool{"acme/leads": true, "acme/security": false}}
 		s := New(Config{IdentityProvider: idp})
-		outcome, res, predicate := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+		outcome, res, predicate := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
 			effectiveApprovals(base, escalated))
 		if outcome != predicateRejected {
 			t.Fatalf("outcome = %v, want rejected — membership is a conjunction", outcome)
@@ -1044,7 +1202,7 @@ func TestResolvePredicates_EscalatedConjunction(t *testing.T) {
 			errs:   map[string]error{"acme/security": errors.New("forge down")},
 		}
 		s := New(Config{IdentityProvider: idp})
-		outcome, _, predicate := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+		outcome, _, predicate := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
 			effectiveApprovals(base, escalated))
 		if outcome != predicateUnavailable {
 			t.Fatalf("outcome = %v, want unavailable", outcome)
@@ -1058,7 +1216,7 @@ func TestResolvePredicates_EscalatedConjunction(t *testing.T) {
 		idp := &fakeIdentityProvider{member: false}
 		s := New(Config{IdentityProvider: idp})
 		countOnly := &spec.Approvals{Count: func(i int) *int { return &i }(1)}
-		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+		outcome, _, _ := s.resolvePredicates(context.Background(), identity.ProviderGitHub, "acme/repo", "github:op",
 			effectiveApprovals(countOnly, escalated))
 		if outcome != predicateRejected {
 			t.Fatalf("outcome = %v, want rejected — the escalation added the group this gate never declared", outcome)
@@ -1168,6 +1326,90 @@ func TestApproveStageAs_Escalation_CountTimeMembershipReValidation(t *testing.T)
 		}
 		if res2.Stage.State != run.StageStateSucceeded {
 			t.Fatalf("after two members state = %q, want succeeded — the re-validation must COUNT members, not only exclude non-members", res2.Stage.State)
+		}
+	})
+
+	// #3466: the count-time re-validation resolves the provider PER RUN FORGE.
+	setForge := func(rr *approvalRunRepo, stage *run.Stage, ref string) {
+		rr.mu.Lock()
+		rr.runs[stage.RunID].InstallationRef = &ref
+		rr.mu.Unlock()
+	}
+
+	t.Run("a gitlab run's escalated approvers are re-validated against the gitlab provider", func(t *testing.T) {
+		// The github singular provider denies EVERYONE; only the gitlab map
+		// entry knows r1/r2. A count that consulted the singleton would hold
+		// the gate; the per-forge lookup clears it.
+		gh := &perSubjectIdentityProvider{memberBySubject: map[string]bool{}}
+		gl := &perSubjectIdentityProvider{memberBySubject: map[string]bool{
+			"gitlab:r1": true,
+			"gitlab:r2": true,
+		}}
+		ar := newFakeApprovalRepo()
+		rr := newApprovalRunRepo()
+		au := newApprovalAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr, AuditRepo: au,
+			IdentityProvider:  gh,
+			IdentityProviders: map[string]identity.IdentityProvider{identity.ProviderGitLab: gl}})
+		stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+		setForge(rr, stage, "gitlab:42")
+
+		if _, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("gitlab:r1"),
+			approveActionParams{Stage: stage, Decision: approval.DecisionApprove}); err != nil {
+			t.Fatalf("r1 approve: %v", err)
+		}
+		res2, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("gitlab:r2"),
+			approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+		if err != nil {
+			t.Fatalf("r2 approve: %v", err)
+		}
+		if res2.Stage.State != run.StageStateSucceeded {
+			t.Fatalf("after two gitlab members state = %q, want succeeded — the count must credit the gitlab provider's members", res2.Stage.State)
+		}
+		if gl.memberCalls == 0 {
+			t.Errorf("gitlab memberCalls = 0, want the count-time re-validation to consult the gitlab provider")
+		}
+		if gh.memberCalls != 0 {
+			t.Errorf("github memberCalls = %d, want 0 (the singleton must not answer for a gitlab run)", gh.memberCalls)
+		}
+	})
+
+	t.Run("an unconfigured forge fails closed: ok=false, gate not advanced", func(t *testing.T) {
+		// Only a github provider is configured, yet the run is on gitlab: the
+		// count returns ok=false and the gate is made unreachable this pass,
+		// rather than crediting the github provider's (irrelevant) verdict.
+		gh := &perSubjectIdentityProvider{memberBySubject: map[string]bool{
+			"gitlab:r1": true,
+			"gitlab:r2": true,
+		}}
+		s, rr := newSrv(gh)
+		stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+		setForge(rr, stage, "gitlab:42")
+
+		n, ok := s.countEscalatedForgeApprovers(context.Background(), stage, []string{"gitlab:r1", "gitlab:r2"},
+			effectiveApprovals(&spec.Approvals{Count: func(i int) *int { return &i }(1)},
+				spec.ComposedRequirements{MemberOf: []string{"acme/security"}}))
+		if ok || n != 0 {
+			t.Fatalf("countEscalatedForgeApprovers = (%d, %v), want (0, false) on an unconfigured forge", n, ok)
+		}
+		if gh.memberCalls != 0 {
+			t.Errorf("github memberCalls = %d, want 0", gh.memberCalls)
+		}
+
+		if _, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("gitlab:r1"),
+			approveActionParams{Stage: stage, Decision: approval.DecisionApprove}); err != nil {
+			t.Fatalf("r1 approve: %v", err)
+		}
+		res2, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("gitlab:r2"),
+			approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+		if err != nil {
+			t.Fatalf("r2 approve: %v", err)
+		}
+		if res2.Stage.State != run.StageStateAwaitingApproval {
+			t.Fatalf("state = %q, want awaiting_approval — an unconfigured forge must hold the gate, not advance it", res2.Stage.State)
+		}
+		if len(rr.transitions) != 0 {
+			t.Errorf("recorded %d stage transitions, want 0 (the gate was held closed)", len(rr.transitions))
 		}
 	})
 }

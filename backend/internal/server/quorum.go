@@ -402,31 +402,38 @@ func (s *Server) distinctEligibleApproverSubjects(ctx context.Context, runID, st
 // byte-identical to today.
 //
 // FAIL CLOSED: any approver the forge cannot resolve (predicateUnavailable — a
-// forge error / rate-limit, an empty repo, a nil IdentityProvider) returns
-// ok=false, and the caller makes the gate unreachable this pass, the same
-// not-advancing posture the escErr branch takes (the post-Submit path has no 503
-// to return). A resolved-but-non-satisfying approver (predicateRejected) is
-// simply not counted — that is the TOCTOU closure, not a failure.
+// forge error / rate-limit, an empty repo — or predicateUnconfigured — no
+// configured identity provider for the run's forge, #3466) returns ok=false,
+// and the caller makes the gate unreachable this pass, the same not-advancing
+// posture the escErr branch takes (the post-Submit path has no 503 to return).
+// A resolved-but-non-satisfying approver (predicateRejected) is simply not
+// counted — that is the TOCTOU closure, not a failure.
+//
+// The provider is resolved PER RUN FORGE: the same GetRun read that yields the
+// repo also yields InstallationRef, whose forge family (observationForgeID —
+// github for a nil/empty ref or a failed read) keys cfg.IdentityProviders, so a
+// GitLab run's escalated approvers are re-validated against the GitLab provider
+// rather than the GitHub-only singleton.
 func (s *Server) countEscalatedForgeApprovers(ctx context.Context, stage *run.Stage, subjects []string, effective escalatedApprovals) (int, bool) {
-	if s.cfg.IdentityProvider == nil {
-		return 0, false
-	}
 	var repo string
+	var installationRef *string
 	if s.cfg.RunRepo != nil {
 		if runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID); err == nil {
 			repo = runRow.Repo
+			installationRef = runRow.InstallationRef
 		}
 	}
+	forge := observationForgeID(installationRef)
 	n := 0
 	for _, subject := range subjects {
-		outcome, _, _ := s.resolvePredicates(ctx, repo, subject, effective)
+		outcome, _, _ := s.resolvePredicates(ctx, forge, repo, subject, effective)
 		switch outcome {
 		case predicateSatisfied:
 			n++
 		case predicateRejected:
 			// Recorded but does not satisfy the escalated predicate now —
 			// excluded from the raised quorum. This is the TOCTOU closure.
-		default: // predicateUnavailable
+		default: // predicateUnavailable, predicateUnconfigured
 			return 0, false
 		}
 	}
@@ -553,6 +560,13 @@ const (
 	// error / rate-limit, an empty repo, or an unparseable required tier)
 	// — the gate fails CLOSED and the caller returns a retryable 503.
 	predicateUnavailable
+	// predicateUnconfigured: no configured identity provider exists for the
+	// run's forge (#3466), so the predicate was never evaluated — the gate
+	// fails CLOSED and the caller returns a 503 that is NOT retryable
+	// without operator configuration. Distinct from predicateUnavailable
+	// because a retry cannot clear it, and from predicateRejected because
+	// nothing was resolved: a NoOp's clean deny must never read as a 403.
+	predicateUnconfigured
 )
 
 // predicateResolution carries the forge-resolved values for the snapshot on
@@ -564,18 +578,61 @@ type predicateResolution struct {
 	MemberResolved     *bool
 }
 
+// predicateIdentityProvider returns the identity provider the approvals gate
+// evaluates forge predicates through for the given run forge ("github",
+// "gitlab", …), looking it up in the forge-keyed cfg.IdentityProviders map
+// (#3466). ok is false when no entry exists for the forge or the entry is not
+// a configured provider per identity.IsConfigured (a nil interface, a
+// typed-nil concrete provider, or the deny-by-default NoOp).
+//
+// It deliberately does NOT reuse configuredIdentityProviders(): that
+// enumeration additionally requires a DEVICE client id
+// (IdentityDeviceClientIDs[name] != "") because it serves device-flow
+// discovery, and quorum needs only the members/permission reads — a provider
+// with no device leg must still resolve predicates. This is a keyed lookup,
+// not a range, and is the single quorum-side seam into the map.
+//
+// The github entry is seeded from the singular cfg.IdentityProvider by
+// seedIdentityProviderMaps STRICTLY BEFORE New's NoOp default, so a NoOp can
+// never reach this lookup via the seed; the IsConfigured check is the second,
+// deliberately redundant layer (mirroring binding constraint 8's two layers)
+// so an explicit NoOp wired into the map is still refused.
+func (s *Server) predicateIdentityProvider(forge string) (identity.IdentityProvider, bool) {
+	p, ok := s.cfg.IdentityProviders[forge]
+	if !ok || !identity.IsConfigured(p) {
+		return nil, false
+	}
+	return p, true
+}
+
 // resolvePredicates evaluates the approvals block's forge predicates against
-// the submitter, calling IdentityProvider.PermissionLevel when MinPermission
-// is set and ResolveMembership when MemberOf is set. Each configured
+// the submitter, calling the run forge's IdentityProvider.PermissionLevel when
+// MinPermission is set and ResolveMembership when MemberOf is set. The
+// provider is resolved per forge through predicateIdentityProvider (#3466):
+// `forge` is the run's forge family as derived by observationForgeID from the
+// run row's InstallationRef (github for a nil/empty ref, which is what every
+// GitHub-seeded fixture and pre-#3466 run carries). Each configured
 // predicate is evaluated EXACTLY ONCE per call (no caching / memoization) so
 // mock call-count assertions hold and every approval event makes its own
-// forge calls. It returns one of three discriminated outcomes:
+// forge calls. It returns one of four discriminated outcomes:
 //
 //   - predicateUnavailable: any non-nil forge error (including
 //     identity.ErrRateLimited), an empty repo when a permission tier is
 //     required, or an unparseable MinPermission (fail-closed — never waved
 //     through). The returned *predicateResolution carries whatever resolved
 //     before the failure (best-effort provenance).
+//   - predicateUnconfigured: a forge predicate is configured but no
+//     configured identity provider exists for the run's forge (missing map
+//     entry, typed nil, or the NoOp default). Nothing was evaluated. The
+//     provider is looked up ONLY when a forge predicate is configured, so
+//     the count-only path never touches the provider map.
+//
+// PRECEDENCE: the min_permission empty-repo and unparseable-tier checks run
+// BEFORE the provider lookup, so on a min_permission gate those two
+// predicateUnavailable branches SHADOW predicateUnconfigured — an ad-hoc run
+// with no repo still reports the existing "no repo" unavailable even when no
+// provider is configured. A member_of-only gate has no such pre-checks and
+// reports unconfigured directly.
 //   - predicateRejected: a resolved permission below the required tier OR a
 //     resolved membership of false. The resolution carries the resolved
 //     value(s) for the rejection snapshot.
@@ -593,8 +650,9 @@ type predicateResolution struct {
 // for a control that may only raise. Any membership error still yields
 // predicateUnavailable, so the conjunction inherits the fail-closed posture
 // unchanged.
-func (s *Server) resolvePredicates(ctx context.Context, repo, subject string, approvals escalatedApprovals) (predicateOutcome, *predicateResolution, string) {
+func (s *Server) resolvePredicates(ctx context.Context, forge, repo, subject string, approvals escalatedApprovals) (predicateOutcome, *predicateResolution, string) {
 	res := &predicateResolution{}
+	var provider identity.IdentityProvider
 	if approvals.minPermission != "" {
 		// A repo permission tier cannot be resolved without a repo (a
 		// non-GitHub / ad-hoc trigger leaves run.Repo empty). Fail closed
@@ -609,7 +667,10 @@ func (s *Server) resolvePredicates(ctx context.Context, repo, subject string, ap
 			// satisfied.
 			return predicateUnavailable, res, "min_permission"
 		}
-		perm, err := s.cfg.IdentityProvider.PermissionLevel(ctx, repo, subject)
+		if provider, ok = s.predicateIdentityProvider(forge); !ok {
+			return predicateUnconfigured, res, "min_permission"
+		}
+		perm, err := provider.PermissionLevel(ctx, repo, subject)
 		if err != nil {
 			return predicateUnavailable, res, "min_permission"
 		}
@@ -618,8 +679,14 @@ func (s *Server) resolvePredicates(ctx context.Context, repo, subject string, ap
 			return predicateRejected, res, "min_permission"
 		}
 	}
+	if len(approvals.memberOf) > 0 && provider == nil {
+		var ok bool
+		if provider, ok = s.predicateIdentityProvider(forge); !ok {
+			return predicateUnconfigured, res, "member_of"
+		}
+	}
 	for _, group := range approvals.memberOf {
-		member, err := s.cfg.IdentityProvider.ResolveMembership(ctx, group, subject)
+		member, err := provider.ResolveMembership(ctx, group, subject)
 		if err != nil {
 			return predicateUnavailable, res, "member_of"
 		}

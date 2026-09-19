@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -1436,9 +1437,14 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 // not predicate-guarded (no approvals block, no predicate fields) or the
 // submission is a delegated / agent one that is recorded-but-never-counted
 // and so not forge-gated. It returns (nil, false) after writing the response
-// on a rejection (403 approver_predicate_unmet) or an unresolvable forge
-// (503 forge_unavailable) — in both cases no approval row is inserted, so a
-// corrected retry (or a retry once the forge is reachable) flows normally.
+// on a rejection (403 approver_predicate_unmet), an unresolvable forge (503
+// forge_unavailable, details.retryable:true), or a run forge with no
+// configured identity provider (503 forge_unavailable with
+// details.reason:identity_provider_unconfigured and details.retryable:false,
+// #3466 — the predicate was never evaluated, so no
+// approval_predicate_rejected audit entry is written) — in all three cases no
+// approval row is inserted, so a corrected retry (or a retry once the forge
+// is reachable / the provider is configured) flows normally.
 //
 // Fail-open on the gate READ: a nil approvals block or a spec-read error
 // falls through to today's path (matching checkApproverAuthorization's
@@ -1534,15 +1540,20 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 		return nil, true
 	}
 
-	// Resolve the run's target repo ("owner/name"). A read failure or an
-	// empty repo leaves resolvePredicates to fail closed (unavailable)
+	// Resolve the run's target repo ("owner/name") and its forge family
+	// (InstallationRef → observationForgeID; github for a nil ref or a
+	// failed read, matching countEscalatedForgeApprovers). A read failure or
+	// an empty repo leaves resolvePredicates to fail closed (unavailable)
 	// rather than wave the approver through.
 	var repo string
+	var installationRef *string
 	if runRow, rerr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID); rerr == nil {
 		repo = runRow.Repo
+		installationRef = runRow.InstallationRef
 	}
+	forge := observationForgeID(installationRef)
 
-	outcome, resolution, predicate := s.resolvePredicates(r.Context(), repo, subject, effective)
+	outcome, resolution, predicate := s.resolvePredicates(r.Context(), forge, repo, subject, effective)
 	switch outcome {
 	case predicateSatisfied:
 		return resolution, true
@@ -1563,6 +1574,23 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 				"result":              "rejected",
 			})
 		return nil, false
+	case predicateUnconfigured:
+		// No identity provider is configured for the run's forge (#3466):
+		// the predicate was never evaluated, so NO approval_predicate_rejected
+		// audit entry is written and the shape is the non-retryable 503 —
+		// clients must key retry on details.retryable, not the code alone.
+		s.writeError(w, r, http.StatusServiceUnavailable, "forge_unavailable",
+			"no identity provider is configured for the run's forge, so the gate's permission/membership predicate cannot be evaluated; the approval gate failed closed",
+			map[string]any{
+				"stage_id":     stage.ID.String(),
+				"retryable":    false,
+				"reason":       "identity_provider_unconfigured",
+				"forge":        forge,
+				"predicate":    predicate,
+				"ref":          renderMemberOf(effective.memberOf),
+				"next_actions": []string{identityProviderConfigHint(forge)},
+			})
+		return nil, false
 	default: // predicateUnavailable
 		s.writeError(w, r, http.StatusServiceUnavailable, "forge_unavailable",
 			"the forge permission/membership API was unavailable; the approval gate failed closed",
@@ -1576,6 +1604,20 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 				},
 			})
 		return nil, false
+	}
+}
+
+// identityProviderConfigHint names the operator action that makes an
+// identity provider available for the given forge, rendered into the
+// identity_provider_unconfigured 503's next_actions (#3466).
+func identityProviderConfigHint(forge string) string {
+	switch forge {
+	case identity.ProviderGitHub:
+		return "Set FISHHAWKD_OAUTH_CLIENT_ID (plus GitHub App credentials for authenticated permission reads) so fishhawkd constructs the GitHub identity provider"
+	case identity.ProviderGitLab:
+		return "Set FISHHAWKD_GITLAB_BASE_URL, FISHHAWKD_GITLAB_DEVICE_CLIENT_ID and FISHHAWKD_GITLAB_TOKEN so fishhawkd constructs the GitLab identity provider"
+	default:
+		return "Configure an identity provider for forge " + forge + " so fishhawkd can evaluate the gate's permission/membership predicate"
 	}
 }
 

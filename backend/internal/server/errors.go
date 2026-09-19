@@ -128,6 +128,8 @@ var redactableDetailKeys = map[string]struct{}{
 	"items_total":                    {},
 	"suggested_grooming_order_limit": {},
 	"budget_seconds":                 {},
+	// forge: the product-owned forge family enum (github|gitlab) derived from the run row's InstallationRef prefix, never an error/subprocess/third-party string (E45.49 / #3466).
+	"forge": {},
 }
 
 // redactErrorDetails returns a NEW map holding only the allow-listed keys of
