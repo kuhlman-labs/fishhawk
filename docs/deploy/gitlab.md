@@ -234,4 +234,8 @@ The workflow-spec issue trigger and the issue-content prompt path are forge-neut
 
 - **RESIDUAL — `fishhawk_doctor` has no not-applicable path for GitLab (#3348).** Its GitHub-only checks have no GitLab branch, so a GitLab deployment sees them as unconditional rather than skipped-as-not-applicable. Tracked in **E45.43 / #3348**.
 
-- **RESIDUAL — merge / auto-merger is GitHub-only (#3464).** The run-completion merge path is not yet wired for the GitLab forge. Tracked in **#3464**.
+- **Merge, merge reconciler and implement review are forge-resolved (E45.47 / #3464).** The run-completion merge seam (`POST /v0/runs/{run_id}/merge` and the delegated `may_merge`), the merge-status reconciler poll, and the four implement-review diff sites (consolidated review, post-fix-up re-review, fix-up delta, cumulative evaluation) all resolve by forge family, so a GitLab run reaches `awaiting_merge` and merges (`merge_when_pipeline_succeeds`, squash). The merge reconciler is off by default (`--enable-merge-reconciler`) and now starts on a GitLab-only deployment. Named residuals that remain:
+  - A conflicting GitLab MR is not classified — `prMergeConflicting` fails OPEN, so a conflict falls through to the merge queue rather than a `409 merge_conflicting` (the `forge.PullRequest` mergeability fields are zero on the GitLab adapter).
+  - `ReverifyBranchLineage` (ADR-035) is GitHub-only and fails open (`clean=true`) on GitLab, so a merged GitLab MR is not lineage-re-checked in the reconciler.
+  - The acceptance-complete Rule 5 board/no-op paths and campaign auto-drive still require a GitHub client (`newCampaignGateActor` refuses without one).
+  - A nested GitLab group path (`group/sub/project`) is refused at the merge seam only (`resolveObservationTarget` requires `owner/name`); the compare and reconciler paths tolerate it.

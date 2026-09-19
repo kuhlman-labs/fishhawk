@@ -658,10 +658,81 @@ func TestNewCampaignGateActor(t *testing.T) {
 	if cga.merger == nil {
 		t.Error("actor GitHubMerger is nil; a delegated may_merge could not be honoured")
 	}
+	// The merger is the forge-resolved server.ForgeMerger (E45.47 / #3464)
+	// wrapping the githubAutoMerger leaf, not the bare leaf.
+	fm, ok := cga.merger.(server.ForgeMerger)
+	if !ok {
+		t.Fatalf("actor merger = %T, want server.ForgeMerger", cga.merger)
+	}
+	if _, ok := fm.GitHub.(githubAutoMerger); !ok {
+		t.Errorf("ForgeMerger github leaf = %T, want githubAutoMerger", fm.GitHub)
+	}
 
 	// Fail-closed: no GitHub client → nil actor (the driver runs observe-only).
 	if got := newCampaignGateActor(server.Config{GitHub: nil}, srv, slog.Default()); got != nil {
 		t.Errorf("newCampaignGateActor(nil GitHub) = %T, want nil (observe-only fail-closed)", got)
+	}
+}
+
+// TestNewForgeMerger_NilGitHub_LeavesGitHubSeamNil pins the typed-nil trap
+// (E45.47 / #3464): with no GitHub client the ForgeMerger's github leaf must be
+// a NIL INTERFACE, not a githubAutoMerger wrapping a nil client (a non-nil
+// interface that would panic on a github-family merge). A github-family merge
+// through it must error, not panic.
+func TestNewForgeMerger_NilGitHub_LeavesGitHubSeamNil(t *testing.T) {
+	m := newForgeMerger(nil)
+	fm, ok := m.(server.ForgeMerger)
+	if !ok {
+		t.Fatalf("newForgeMerger(nil) = %T, want server.ForgeMerger", m)
+	}
+	if fm.GitHub != nil {
+		t.Errorf("ForgeMerger.GitHub = %v (%T), want a nil interface", fm.GitHub, fm.GitHub)
+	}
+	err := m.MergePullRequest(context.Background(), &runpkg.Run{ID: uuid.New()})
+	if err == nil {
+		t.Error("MergePullRequest(github family, nil leaf) = nil, want an error (no panic)")
+	}
+}
+
+// TestNewForgeMerger_WithGitHub_WrapsAutoMerger asserts a configured client is
+// carried as the githubAutoMerger leaf of the ForgeMerger.
+func TestNewForgeMerger_WithGitHub_WrapsAutoMerger(t *testing.T) {
+	gh := &githubclient.Client{}
+	fm, ok := newForgeMerger(gh).(server.ForgeMerger)
+	if !ok {
+		t.Fatalf("newForgeMerger(gh) not a server.ForgeMerger")
+	}
+	leaf, ok := fm.GitHub.(githubAutoMerger)
+	if !ok {
+		t.Fatalf("github leaf = %T, want githubAutoMerger", fm.GitHub)
+	}
+	if leaf.gh != gh {
+		t.Error("githubAutoMerger.gh does not carry the configured client")
+	}
+}
+
+// TestMergeReconcilerForgeAvailable pins the merge-reconciler startup gate: the
+// ticker starts when EITHER a GitHub client or a GitLab forge is configured.
+func TestMergeReconcilerForgeAvailable(t *testing.T) {
+	gh := &githubclient.Client{}
+	gl := &forgegitlab.Forge{}
+	cases := []struct {
+		name string
+		gh   *githubclient.Client
+		gl   *forgegitlab.Forge
+		want bool
+	}{
+		{"neither", nil, nil, false},
+		{"github only", gh, nil, true},
+		{"gitlab only", nil, gl, true},
+		{"both", gh, gl, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mergeReconcilerForgeAvailable(tc.gh, tc.gl); got != tc.want {
+				t.Errorf("mergeReconcilerForgeAvailable = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

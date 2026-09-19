@@ -7223,6 +7223,198 @@ func TestBackstopFixupReReview_ParseRepoError_NoDispatch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// #3464: the four implement-review diff sites resolve per forge family, so a
+// GitLab run's consolidated / fix-up re-review dispatches through the resolved
+// forge; a github-family run never consults the resolver.
+// ---------------------------------------------------------------------------
+
+func TestDispatchConsolidatedReview_GitLabFamily_DispatchesViaResolvedForge(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	parent, _ := seedConsolidatedParent(t, rr, art, specImplementGatingReviewers)
+	// Convert the parent to a gitlab-family run: no GitHub client, resolve via
+	// the ForgeResolver.
+	parent.InstallationRef = ptrString("gitlab:5")
+	parent.InstallationID = nil
+
+	fake := &fakeCompareForge{name: "gitlab", result: oneFileCompareResult()}
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		RunRepo:       rr,
+		ArtifactRepo:  art,
+		AuditRepo:     au,
+		ConcernRepo:   cr,
+		PlanReviewers: singleReviewerSet{reviewer},
+		ForgeResolver: func(string) (forge.Forge, error) { return fake, nil },
+	})
+
+	s.DispatchConsolidatedReview(context.Background(), parent.ID, "main", "gitlabhead")
+	s.waitBackgroundReviews()
+
+	started, _ := au.ListForRunByCategory(context.Background(), parent.ID, "implement_review_started")
+	if len(started) != 1 {
+		t.Fatalf("implement_review_started entries = %d, want 1", len(started))
+	}
+	reviewed, _ := au.ListForRunByCategory(context.Background(), parent.ID, "implement_reviewed")
+	if len(reviewed) != 1 {
+		t.Fatalf("implement_reviewed entries = %d, want 1", len(reviewed))
+	}
+	reviewer.mu.Lock()
+	calls := len(reviewer.calls)
+	reviewer.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("reviewer invocations = %d, want 1", calls)
+	}
+	if n, scope, _, _ := fake.snapshot(); n != 1 || scope.Ref() != "gitlab:5" {
+		t.Errorf("fake compare calls=%d scope=%q, want 1 / gitlab:5", n, scope.Ref())
+	}
+}
+
+func TestDispatchConsolidatedReview_GitHubFamily_NeverConsultsResolver(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	parent, _ := seedConsolidatedParent(t, rr, art, specImplementGatingReviewers)
+
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		RunRepo:       rr,
+		ArtifactRepo:  art,
+		AuditRepo:     au,
+		ConcernRepo:   cr,
+		PlanReviewers: singleReviewerSet{reviewer},
+		GitHub:        cannedComparePatchClient(t, cannedCompareOneFile),
+		ForgeResolver: func(string) (forge.Forge, error) {
+			t.Fatal("github-family consolidated review must NOT consult the resolver")
+			return nil, nil
+		},
+	})
+
+	s.DispatchConsolidatedReview(context.Background(), parent.ID, "main", "githead")
+	s.waitBackgroundReviews()
+
+	started, _ := au.ListForRunByCategory(context.Background(), parent.ID, "implement_review_started")
+	if len(started) != 1 {
+		t.Fatalf("implement_review_started entries = %d, want 1 (github family via cfg.GitHub)", len(started))
+	}
+}
+
+func TestBackstopFixupReReview_GitLabFamily_Dispatches(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, "", false)
+	// gitlab-family run, no GitHub client: resolve via the ForgeResolver.
+	runRow.InstallationRef = ptrString("gitlab:5")
+	runRow.InstallationID = nil
+	fake := &fakeCompareForge{name: "gitlab", result: oneFileCompareResult()}
+	s.cfg.ForgeResolver = func(string) (forge.Forge, error) { return fake, nil }
+
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	got := startedHeadSHAs(t, au, runRow.ID)
+	if len(got) != 2 || got[0] != "head-old" || got[1] != "head-new" {
+		t.Fatalf("implement_review_started heads = %v, want [head-old head-new] (gitlab backstop dispatched)", got)
+	}
+	if n, _, base, head := fake.snapshot(); n != 1 || base != "base-old" || head != "head-new" {
+		t.Errorf("fake compare calls=%d base=%q head=%q, want 1 / base-old / head-new", n, base, head)
+	}
+}
+
+func TestBackstopFixupReReview_GitLabFamily_TypedNilForge_NoDispatch(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, "", false)
+	runRow.InstallationRef = ptrString("gitlab:5")
+	runRow.InstallationID = nil
+	// A typed-nil forge in a non-nil interface: isNilForge must catch it, so the
+	// backstop skips rather than panicking on the first ComparePatch dispatch.
+	s.cfg.ForgeResolver = func(string) (forge.Forge, error) { return (*fakeCompareForge)(nil), nil }
+
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 || got[0] != "head-old" {
+		t.Errorf("implement_review_started heads = %v, want only [head-old] (typed-nil forge must not dispatch)", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (typed-nil forge fails closed)", len(reviewer.calls))
+	}
+}
+
+func TestResolveFixupDeltaDiff_GitLabFamily_UsesResolvedForge(t *testing.T) {
+	au := newAuditFake()
+	fake := &fakeCompareForge{name: "gitlab", result: oneFileCompareResult()}
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		AuditRepo:     au,
+		ForgeResolver: func(string) (forge.Forge, error) { return fake, nil },
+	})
+	runID, stageID := uuid.New(), uuid.New()
+	prURL := "https://gitlab.example.com/acme/widgets/-/merge_requests/7"
+	runRow := &run.Run{ID: runID, Repo: "acme/widgets", InstallationRef: ptrString("gitlab:5"), PullRequestURL: &prURL}
+
+	seedImplementReviewStarted(t, au, runID, stageID, "prior-head", time.Now().UTC())
+
+	diff, ok := s.resolveFixupDeltaDiff(context.Background(), runRow, runID, stageID, "cur-head")
+	if !ok {
+		t.Fatal("resolveFixupDeltaDiff ok = false, want true for a gitlab run resolved via the forge")
+	}
+	if len(diff.ChangedFiles) != 1 || diff.ChangedFiles[0].Path != "x.go" {
+		t.Errorf("delta diff = %+v, want the fake's single x.go file", diff.ChangedFiles)
+	}
+	if n, scope, base, head := fake.snapshot(); n != 1 || scope.Ref() != "gitlab:5" || base != "prior-head" || head != "cur-head" {
+		t.Errorf("fake compare calls=%d scope=%q base=%q head=%q, want 1 / gitlab:5 / prior-head / cur-head", n, scope.Ref(), base, head)
+	}
+}
+
+func TestResolveStageCumulativeEval_GitLabFamily_ResolvesViaForge(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-7"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	// gitlab-family run resolved via the forge.
+	runRow.InstallationRef = ptrString("gitlab:5")
+	runRow.InstallationID = nil
+	s.cfg.GitHub = nil
+	fake := &fakeCompareForge{name: "gitlab", result: oneFileCompareResult()}
+	s.cfg.ForgeResolver = func(string) (forge.Forge, error) { return fake, nil }
+
+	seedStageCumulativeLedger(au, runRow.ID, implStage.ID, "stagebase", "h2")
+
+	eval := s.resolveStageCumulativeEval(t.Context(), runRow, runRow.ID, implStage.ID, "h3",
+		policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}})
+
+	if !eval.StageCumulative {
+		t.Fatalf("StageCumulative = false (reason %q), want true — the gitlab forge established the cumulative state", eval.IncompleteReason)
+	}
+	if eval.IncompleteReason != "" {
+		t.Errorf("IncompleteReason = %q, want empty", eval.IncompleteReason)
+	}
+	if eval.StageBaseSHA != "stagebase" {
+		t.Errorf("StageBaseSHA = %q, want stagebase", eval.StageBaseSHA)
+	}
+	if n, _, base, head := fake.snapshot(); n != 1 || base != "stagebase" || head != "h3" {
+		t.Errorf("fake compare calls=%d base=%q head=%q, want 1 / stagebase / h3", n, base, head)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // #2737: routed reporting obligation undelivered signal.
 // ---------------------------------------------------------------------------
 

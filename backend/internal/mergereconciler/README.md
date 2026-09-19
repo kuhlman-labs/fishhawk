@@ -4,7 +4,16 @@ Merge-status reconciler (ADR-031 Phase 1 / #702): the catch-net for a missed `pu
 
 ## Tick loop
 
-Each tick lists review stages parked in `awaiting_approval`, reads each run's live PR state from the GitHub REST API (`GetPullRequest` via `runs.pull_request_url`), and resolves the gate ONLY on a terminal PR state — `merged → succeeded`, `closed && !merged → cancelled` (matching the ADR-018 webhook semantics; an open PR is left parked, no force-succeed).
+Each tick lists review stages parked in `awaiting_approval`, reads each run's live PR state off its forge (`GetPullRequest` via `runs.pull_request_url`), and resolves the gate ONLY on a terminal PR state — `merged → succeeded`, `closed && !merged → cancelled` (matching the ADR-018 webhook semantics; an open PR is left parked, no force-succeed).
+
+### Per-family poll (E45.47 / #3464)
+
+`reconcileStage` resolves the poll by the run's forge FAMILY (`forgeFamilyFromRef(InstallationRef)`, the local mirror of `server.observationForgeID`):
+
+- a **github-family** run (nil / bare-decimal / `github:` ref) polls ONLY through `PRGetter` with the GitHub installation scope; the URL is parsed by `parsePRURL` (the `…/pull/<n>` shape). A github-family run NEVER consults `ForgeResolver`, so registry availability can never change a GitHub outcome. A nil `PRGetter` (GitLab-only deployment) or nil `InstallationID` skips cleanly.
+- **any other family** parses the merge-request URL with `parseMergeRequestURL` (accepts the canonical `…/-/merge_requests/<n>` shape — checked FIRST so its own `/merge_requests/` substring is never mis-split — and the legacy `…/merge_requests/<n>` shape; a `/pull/` URL is rejected so a github-shaped URL on a gitlab ref skips rather than confirming another forge's PR), resolves the forge through `ForgeResolver` (defaulting to `forge.Get`, `isNilForge`-guarded against a typed-nil), and polls it with the run's forge-neutral `InstallationRef` scope.
+
+The republish heal, the `GetPullRequest` error log, the merged/closed/open switch, `LineageReverifier`, `healBoardTransition`, and `DriveObserver` are SHARED after resolution — byte-identical across families. `Run()` requires `PRGetter` OR `ForgeResolver` (a GitLab-only deployment starts on `ForgeResolver` alone). Residual: `LineageReverifier` (`ReverifyBranchLineage`) is GitHub-only and fails OPEN (`clean=true`) on a GitLab run, so a merged GitLab MR is not lineage-re-checked here.
 
 Resolution routes through `server.ResolveReviewFromPollState`, which delegates to the SAME `resolveReviewStageOnMerge` method the webhook handler uses — so webhook and poll are **idempotent against each other by construction** (`TransitionStage` is a no-op on an already-terminal stage; whichever fires first wins).
 

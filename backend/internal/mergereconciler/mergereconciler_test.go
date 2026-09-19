@@ -634,6 +634,92 @@ func TestParsePRURL(t *testing.T) {
 	}
 }
 
+func TestParseMergeRequestURL(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantOwner string
+		wantName  string
+		wantNum   int
+		wantErr   bool
+	}{
+		// canonical + legacy happy paths.
+		{"https://gitlab.example.com/acme/widgets/-/merge_requests/7", "acme", "widgets", 7, false},
+		{"https://gitlab.example.com/group/sub/project/-/merge_requests/9", "sub", "project", 9, false},
+		{"https://gitlab.example.com/acme/widgets/merge_requests/3", "acme", "widgets", 3, false},
+		// trailing segment/query/fragment after the number is trimmed.
+		{"https://gitlab.example.com/acme/widgets/-/merge_requests/7/notes", "acme", "widgets", 7, false},
+		// a github /pull/ url is rejected rather than confirmed under gitlab.
+		{"https://github.com/acme/widgets/pull/7", "", "", 0, true},
+		// url.Parse failure (invalid percent-escape).
+		{"http://%zz/-/merge_requests/1", "", "", 0, true},
+		// no merge_requests segment at all.
+		{"https://gitlab.example.com/acme/widgets", "", "", 0, true},
+		// non-numeric merge-request number.
+		{"https://gitlab.example.com/acme/widgets/-/merge_requests/abc", "", "", 0, true},
+		// zero / negative number rejected.
+		{"https://gitlab.example.com/acme/widgets/-/merge_requests/0", "", "", 0, true},
+		// project path with fewer than two segments.
+		{"https://gitlab.example.com/-/merge_requests/7", "", "", 0, true},
+		// two-plus segments but a middle empty one leaves owner or name blank.
+		{"https://gitlab.example.com/a//b/-/merge_requests/7", "", "", 0, true},
+	}
+	for _, c := range cases {
+		repo, n, err := parseMergeRequestURL(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("parseMergeRequestURL(%q) = (%+v, %d, nil), want error", c.in, repo, n)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseMergeRequestURL(%q) errored: %v", c.in, err)
+			continue
+		}
+		if repo.Owner != c.wantOwner || repo.Name != c.wantName || n != c.wantNum {
+			t.Errorf("parseMergeRequestURL(%q) = (%s/%s, %d), want (%s/%s, %d)",
+				c.in, repo.Owner, repo.Name, n, c.wantOwner, c.wantName, c.wantNum)
+		}
+	}
+}
+
+func TestForgeFamilyFromRef(t *testing.T) {
+	gitlab := "gitlab:5"
+	empty := ""
+	bareDecimal := "12345" // pre-0076 GitHub shape: no ':' separator.
+	cases := []struct {
+		name string
+		ref  *string
+		want string
+	}{
+		{"nil ref is github", nil, "github"},
+		{"empty ref is github", &empty, "github"},
+		{"bare decimal (no colon) is github", &bareDecimal, "github"},
+		{"prefixed ref names the forge", &gitlab, "gitlab"},
+	}
+	for _, c := range cases {
+		if got := forgeFamilyFromRef(c.ref); got != c.want {
+			t.Errorf("%s: forgeFamilyFromRef = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// valForge satisfies forge.Forge by value (nil embedded interface), so its
+// reflect.Kind is Struct — the isNilForge default arm that must report a
+// non-pointer value as NOT nil.
+type valForge struct{ forge.Forge }
+
+func TestIsNilForge(t *testing.T) {
+	if !isNilForge(nil) {
+		t.Error("isNilForge(nil) = false, want true")
+	}
+	if !isNilForge((*fakeForge)(nil)) {
+		t.Error("isNilForge(typed-nil pointer) = false, want true (interface wrapping a nil pointer)")
+	}
+	if isNilForge(valForge{}) {
+		t.Error("isNilForge(struct value) = true, want false (non-pointer kind is never nil)")
+	}
+}
+
 // stubDriveObserver records ObserveParkedReviewForDrive calls (#1023).
 type stubDriveObserver struct {
 	calls []resolveCall
@@ -885,5 +971,252 @@ func TestTick_ResolverUpgrade_DefaultsBoardHealer(t *testing.T) {
 	}
 	if res.stubBoardHealer.calls[0].event != "pr_opened" {
 		t.Errorf("board heal event = %q, want pr_opened", res.stubBoardHealer.calls[0].event)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #3464: per-family poll — a gitlab-family run polls the resolved forge; a
+// github-family run never consults the resolver.
+// ---------------------------------------------------------------------------
+
+// fakeForge records the GetPullRequest scope + number for the gitlab-family
+// poll. The rest embeds a nil forge.Forge, unreachable in these tests. It also
+// appends "poll" to an optional shared ordering log so a test can prove the
+// republish heal runs before the poll.
+type fakeForge struct {
+	forge.Forge
+	name   string
+	pr     *forge.PullRequest
+	err    error
+	calls  int
+	scope  forge.CredentialScope
+	number int
+	log    *[]string
+}
+
+func (f *fakeForge) Name() string { return f.name }
+
+func (f *fakeForge) GetPullRequest(_ context.Context, scope forge.CredentialScope, _ forge.RepoRef, number int) (*forge.PullRequest, error) {
+	f.calls++
+	f.scope = scope
+	f.number = number
+	if f.log != nil {
+		*f.log = append(*f.log, "poll")
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.pr, nil
+}
+
+// orderLogRepublisher appends "republish" to a shared log so the republish→poll
+// ordering is observable.
+type orderLogRepublisher struct{ log *[]string }
+
+func (r *orderLogRepublisher) RepublishAuditCheck(_ context.Context, _ uuid.UUID) {
+	*r.log = append(*r.log, "republish")
+}
+
+// gitlabReviewRun builds a gitlab-family run + parked review stage.
+func gitlabReviewRun(prURL string) (*run.Run, *run.Stage) {
+	runID := uuid.New()
+	r := &run.Run{ID: runID, Repo: "acme/widgets", InstallationRef: strPtr("gitlab:5")}
+	if prURL != "" {
+		r.PullRequestURL = strPtr(prURL)
+	}
+	s := &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}
+	return r, s
+}
+
+const canonicalMRURL = "https://gitlab.example.com/acme/widgets/-/merge_requests/7"
+
+func TestTick_GitLabFamily_Merged_ResolvesSucceeded(t *testing.T) {
+	r, s := gitlabReviewRun(canonicalMRURL)
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	fake := &fakeForge{name: "gitlab", pr: &forge.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return fake, nil }, Resolver: res}
+	tk.Tick(context.Background())
+
+	if len(res.calls) != 1 || !res.calls[0].merged || res.calls[0].runID != r.ID {
+		t.Fatalf("resolve calls = %+v, want one merged=true for %s", res.calls, r.ID)
+	}
+	if fake.scope.Ref() != "gitlab:5" || fake.number != 7 {
+		t.Errorf("poll scope=%q number=%d, want gitlab:5 / 7", fake.scope.Ref(), fake.number)
+	}
+}
+
+func TestTick_GitLabFamily_ClosedUnmerged_ResolvesCancelled(t *testing.T) {
+	r, s := gitlabReviewRun(canonicalMRURL)
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	fake := &fakeForge{name: "gitlab", pr: &forge.PullRequest{State: "closed", Merged: false}}
+	res := &stubResolver{}
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return fake, nil }, Resolver: res}
+	tk.Tick(context.Background())
+
+	if len(res.calls) != 1 || res.calls[0].merged {
+		t.Fatalf("resolve calls = %+v, want one merged=false (closed unmerged)", res.calls)
+	}
+}
+
+func TestTick_GitLabFamily_OpenPR_DriveObserverAndRepublisherInvoked(t *testing.T) {
+	r, s := gitlabReviewRun(canonicalMRURL)
+	r.Drive = true
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	var order []string
+	fake := &fakeForge{name: "gitlab", pr: &forge.PullRequest{State: "open"}, log: &order}
+	res := &stubResolver{}
+	obs := &stubDriveObserver{}
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return fake, nil }, Resolver: res}
+	tk.DriveObserver = obs
+	tk.AuditCheckRepublisher = &orderLogRepublisher{log: &order}
+	tk.Tick(context.Background())
+
+	if len(order) != 2 || order[0] != "republish" || order[1] != "poll" {
+		t.Fatalf("ordering = %v, want [republish poll] (heal before poll)", order)
+	}
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0 (open MR left parked)", len(res.calls))
+	}
+	if len(obs.calls) != 1 || obs.calls[0].runID != r.ID {
+		t.Errorf("observer calls = %+v, want one for %s", obs.calls, r.ID)
+	}
+}
+
+func TestTick_GitLabFamily_LegacyMergeRequestsURL_Resolves(t *testing.T) {
+	r, s := gitlabReviewRun("https://gitlab.example.com/acme/widgets/merge_requests/7")
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	fake := &fakeForge{name: "gitlab", pr: &forge.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return fake, nil }, Resolver: res}
+	tk.Tick(context.Background())
+
+	if len(res.calls) != 1 || !res.calls[0].merged {
+		t.Fatalf("resolve calls = %+v, want one merged=true from the legacy MR URL", res.calls)
+	}
+	if fake.number != 7 {
+		t.Errorf("poll number = %d, want 7", fake.number)
+	}
+}
+
+func TestTick_GitLabFamily_GitHubShapedURL_Skips(t *testing.T) {
+	r, s := gitlabReviewRun("https://github.com/acme/widgets/pull/7")
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	fake := &fakeForge{name: "gitlab", pr: &forge.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return fake, nil }, Resolver: res}
+	tk.Tick(context.Background())
+
+	if fake.calls != 0 {
+		t.Errorf("poll calls = %d, want 0 (github-shaped url on a gitlab ref must not poll)", fake.calls)
+	}
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0", len(res.calls))
+	}
+}
+
+func TestTick_GitLabFamily_ResolverError_Skips(t *testing.T) {
+	r, s := gitlabReviewRun(canonicalMRURL)
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	res := &stubResolver{}
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return nil, errors.New("boom") }, Resolver: res}
+	tk.Tick(context.Background())
+
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0 (unresolved forge must skip)", len(res.calls))
+	}
+}
+
+func TestTick_GitLabFamily_TypedNilForge_Skips(t *testing.T) {
+	r, s := gitlabReviewRun(canonicalMRURL)
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	res := &stubResolver{}
+	// A typed-nil forge in a non-nil interface: isNilForge must catch it, so the
+	// poll skips rather than panicking on the first GetPullRequest dispatch.
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return (*fakeForge)(nil), nil }, Resolver: res}
+	tk.Tick(context.Background())
+
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0 (typed-nil forge must skip, no panic)", len(res.calls))
+	}
+}
+
+func TestTick_GitLabFamily_NilResolver_DefaultsToRegistry(t *testing.T) {
+	snap := forge.SnapshotRegistry()
+	t.Cleanup(func() { forge.RestoreRegistry(snap) })
+	fake := &fakeForge{name: "gitlab", pr: &forge.PullRequest{State: "closed", Merged: true}}
+	forge.Register(fake)
+
+	r, s := gitlabReviewRun(canonicalMRURL)
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	res := &stubResolver{}
+	// ForgeResolver left nil → defaults to forge.Get, which finds the registered
+	// fake.
+	tk := &Ticker{Runs: repo, Resolver: res}
+	tk.Tick(context.Background())
+
+	if len(res.calls) != 1 || !res.calls[0].merged {
+		t.Fatalf("resolve calls = %+v, want one merged=true via the process registry default", res.calls)
+	}
+}
+
+func TestTick_GitHubFamily_NeverConsultsResolver(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	tk := &Ticker{
+		Runs:     repo,
+		PRGetter: pg,
+		ForgeResolver: func(string) (forge.Forge, error) {
+			t.Fatal("github-family run must NOT consult the forge resolver")
+			return nil, nil
+		},
+		Resolver: res,
+	}
+	tk.Tick(context.Background())
+
+	if len(res.calls) != 1 || !res.calls[0].merged {
+		t.Fatalf("resolve calls = %+v, want one merged=true via PRGetter", res.calls)
+	}
+	if pg.calls != 1 {
+		t.Errorf("PRGetter calls = %d, want 1", pg.calls)
+	}
+}
+
+func TestTick_GitHubFamily_NilPRGetter_Skips(t *testing.T) {
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	res := &stubResolver{}
+	// PRGetter nil, ForgeResolver set: a github-family run has no poll source and
+	// must skip cleanly (the resolver serves non-github families only).
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return &fakeForge{name: "gitlab"}, nil }, Resolver: res}
+	tk.Tick(context.Background())
+
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0 (github family with nil PRGetter skips)", len(res.calls))
+	}
+}
+
+func TestRun_RequiresPRGetterOrResolver(t *testing.T) {
+	// Both poll sources nil → error.
+	if err := (&Ticker{Runs: &fakeRepo{}, Resolver: &stubResolver{}}).Run(context.Background()); err == nil {
+		t.Error("Run with neither PRGetter nor ForgeResolver should error")
+	}
+	// ForgeResolver-only satisfies the precondition: Run starts and stops on cancel.
+	repo := &fakeRepo{}
+	res := &chanResolver{fired: make(chan struct{}, 1)}
+	tk := &Ticker{Runs: repo, ForgeResolver: forge.Get, Resolver: res, Interval: time.Hour}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- tk.Run(ctx) }()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run(resolver-only) returned %v, want nil on cancel", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run(resolver-only) did not return after cancel")
 	}
 }
