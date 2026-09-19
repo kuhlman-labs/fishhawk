@@ -184,6 +184,12 @@ const (
 	// removes. NO runner is spawned — the operator re-invokes once the transient
 	// clears.
 	stoppedHostDispatchFailed = "host_dispatch_failed"
+	// stoppedForgeUnresolved is the fail-CLOSED stop when the pre-loop forge
+	// target read (resolveRunForgeTarget, E45.46 / #3463) refuses: the run row
+	// was unreadable, carried an unknown forge, or is a gitlab run with no
+	// forge_base_url. NO runner is spawned — a gitlab run spawned as github
+	// would push to api.github.com — and the warning names the remedy.
+	stoppedForgeUnresolved = "forge_unresolved"
 	// stoppedContextCancelled is the stop when the drive context is cancelled
 	// (distinct from the run-state-derived 'cancelled', which reports a run the
 	// backend moved to the cancelled terminal state).
@@ -242,7 +248,7 @@ const driveRunnerKindLocal = "local"
 type DriveRunInput struct {
 	RunID        string `json:"run_id" jsonschema:"Fishhawk run UUID; the local runner_kind:local run to drive between human gates"`
 	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the runner runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path)"`
-	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
+	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
 	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR; defaults to main"`
 	RunnerBinary string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: input, FISHHAWK_RUNNER_BIN env, sibling to this binary, then PATH"`
 	MaxMinutes   int    `json:"max_minutes,omitempty" jsonschema:"wall-clock budget in minutes for this drive; clamped to [1,240], default 60. Every return is resumable by re-invoking with the same run_id"`
@@ -263,7 +269,7 @@ type DriveStep struct {
 type DriveRunOutput struct {
 	RunID              string       `json:"run_id"`
 	ResolvedWorkingDir string       `json:"resolved_working_dir,omitempty" jsonschema:"the absolute checkout directory the driver spawned runners against, after transport-conditional working_dir resolution (#2479)"`
-	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | context_cancelled"`
+	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | forge_unresolved | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | context_cancelled"`
 	RunState           string       `json:"run_state"`
 	StepsTaken         []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent          string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
@@ -389,11 +395,41 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 		}
 	}
 
+	// Forge target (E45.46 / #3463), resolved ONCE per drive invocation before
+	// the loop's first spawn — forge is immutable on a run row, and the loop's
+	// per-iteration fetchRunDriveView (the same single-run route) is
+	// deliberately NOT used for this: one derivation path, one helper. A
+	// refusal here is surfaced as a stopped_reason + warning with NO spawn (the
+	// drive contract for a pre-spawn refusal), never a github default.
+	var warnings []string
+	if ctx.Err() != nil {
+		// A context already cancelled before the first read keeps its distinct
+		// context_cancelled stop (the loop's own check would otherwise be
+		// pre-empted by the helper's read failing on the dead context).
+		return nil, DriveRunOutput{
+			RunID: runUUID.String(), ResolvedWorkingDir: workingDir,
+			StoppedReason: stoppedContextCancelled,
+			Warnings:      []string{"context cancelled: " + ctx.Err().Error()},
+		}, nil
+	}
+	forgeTarget, ferr := r.resolveRunForgeTarget(ctx, runUUID)
+	if ferr != nil {
+		return nil, DriveRunOutput{
+			RunID: runUUID.String(), ResolvedWorkingDir: workingDir,
+			StoppedReason: stoppedForgeUnresolved,
+			Warnings:      []string{ferr.Error()},
+		}, nil
+	}
+
 	// Resolve the repo once (best-effort): implement dispatch needs it, but a
 	// missing repo is a warning here — the per-stage spawn surfaces a real
-	// failure rather than blocking the whole drive.
-	var warnings []string
+	// failure rather than blocking the whole drive. A gitlab run defaults an
+	// omitted github_repo to the run row's project path and skips the
+	// github.com-only origin auto-detect entirely (E45.46 / #3463).
 	repo := in.GitHubRepo
+	if repo == "" && forgeTarget.Forge == startRunForgeGitLab {
+		repo = forgeTarget.Repo
+	}
 	if repo == "" {
 		if detected, derr := runStageDetectGitHubRepo(workingDir); derr == nil {
 			repo = detected
@@ -829,7 +865,7 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 				WorkingDir: in.WorkingDir,
 				GitHubRepo: repo,
 				BaseBranch: baseBranch,
-			}, disp.ID, repo, baseBranch, true)
+			}, disp.ID, repo, baseBranch, true, forgeTarget)
 			env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 			report := func(ctx context.Context, category, reason, detail string, exitCode int) error {
 				_, e := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, detail, exitCode)

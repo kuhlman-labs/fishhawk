@@ -1553,6 +1553,13 @@ func TestRunChildren_DecodesServerBaseBranchIntoArgv(t *testing.T) {
 			"id": stageID.String(), "run_id": child.String(), "type": "implement", "state": "pending",
 		}}})
 	})
+	// The parent's single-run read: resolveRunForgeTarget (E45.46 / #3463)
+	// REFUSES on an unreadable parent, so this fixture-driven mux serves a plain
+	// github row for it (forge omitted → github; no forge flags on the argv).
+	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Run{ID: r.PathValue("run_id"), Repo: "x/y", State: "running", RunnerKind: "local"})
+	})
 	// THE BOUNDARY: the raw fixture bytes, served verbatim.
 	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1862,4 +1869,165 @@ func TestFanOut_ChildAmendmentParkedAndDecidedMidFanOut(t *testing.T) {
 
 	t.Run("decision_reaches_child_and_it_proceeds", func(t *testing.T) { run(t, true) })
 	t.Run("no_decision_child_does_not_proceed", func(t *testing.T) { run(t, false) })
+}
+
+// --- forge target (E45.46 / #3463) -------------------------------------------
+
+// seedGitLabDecomposition seeds a gitlab PARENT (served on the single-run route
+// with the given base URL) and two parked local children that inherit the
+// parent's forge server-side (run.ChildParamsFrom copies installation_ref), so
+// each child row reads forge gitlab too. Children carry NO forge_base_url —
+// the parent's single-run read is the authority for every child argv.
+func seedGitLabDecomposition(fb *fakeBackend, parent uuid.UUID, baseURL string) []uuid.UUID {
+	seedGitLabRun(fb, parent, "acme/platform/widgets", baseURL)
+	children := []uuid.UUID{uuid.New(), uuid.New()}
+	for _, c := range children {
+		seedChildRunStage(fb, c, "running", "awaiting_host_dispatch")
+		fb.mu.Lock()
+		row := fb.getRunByID[c]
+		row.Repo = "acme/platform/widgets"
+		row.Forge = "gitlab"
+		fb.getRunByID[c] = row
+		fb.mu.Unlock()
+	}
+	ids := make([]string, 0, len(children))
+	for _, c := range children {
+		ids = append(ids, c.String())
+	}
+	seedPlanDecomposed(fb, parent, ids, 0)
+	return children
+}
+
+// TestRunChildren_GitLabParent_ChildArgvCarriesForgeFlags is the argv half of
+// approval-plan constraint 4: every inline child argv of a gitlab parent
+// carries `--forge gitlab --gitlab-base-url <url>` right after `--github-repo
+// <parent path_with_namespace>` (github_repo omitted → the parent row's repo;
+// the github.com-only origin detector is never consulted).
+func TestRunChildren_GitLabParent_ChildArgvCarriesForgeFlags(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeGitRemote(t, "git@gitlab.example.com:acme/platform/widgets.git", nil)
+	parent := uuid.New()
+	children := seedGitLabDecomposition(fb, parent, "https://gitlab.example.com")
+	spawn := withFakeDetachedSpawn(t)
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.DispatchedCount != len(children) {
+		t.Fatalf("dispatched_count = %d, want %d; children=%+v", out.DispatchedCount, len(children), out.Children)
+	}
+	calls := spawn.snapshot()
+	if len(calls) != len(children) {
+		t.Fatalf("spawned %d children, want %d", len(calls), len(children))
+	}
+	for _, c := range calls {
+		if !argvHasPair(c.argv, "--github-repo", "acme/platform/widgets") {
+			t.Errorf("child %s argv should default --github-repo from the parent row: %v", c.runID, c.argv)
+		}
+		if !argvHasPair(c.argv, "--forge", "gitlab") || !argvHasPair(c.argv, "--gitlab-base-url", "https://gitlab.example.com") {
+			t.Errorf("child %s argv should carry the gitlab forge flags: %v", c.runID, c.argv)
+		}
+		// Position parity with composeRunnerArgv: the forge flags follow
+		// --github-repo immediately and precede --base-branch.
+		joined := strings.Join(c.argv, " ")
+		if !strings.Contains(joined, "--github-repo acme/platform/widgets --forge gitlab --gitlab-base-url https://gitlab.example.com --base-branch") {
+			t.Errorf("child %s forge flags are not positioned right after --github-repo: %v", c.runID, c.argv)
+		}
+	}
+}
+
+// TestRunChildren_ForgeTarget_ReadViaSingleRunGet: the child spawns carried the
+// base URL the fake serves ONLY on the parent's single-run route (the child
+// rows and the list route omit it), and the list route was never read.
+// Counterfactual: derive the target from a list read (or from the child rows)
+// and this goes RED on the base-URL refusal.
+func TestRunChildren_ForgeTarget_ReadViaSingleRunGet(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	parent := uuid.New()
+	seedGitLabDecomposition(fb, parent, "https://gitlab.example.com")
+	fb.mu.Lock()
+	fb.listResp = listRunsResult{Items: []Run{fb.getRunByID[parent]}}
+	fb.mu.Unlock()
+	spawn := withFakeDetachedSpawn(t)
+
+	if _, _, err := r.runChildren(context.Background(), nil, runChildrenIn(parent)); err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	calls := spawn.snapshot()
+	if len(calls) == 0 {
+		t.Fatal("no child spawned")
+	}
+	for _, c := range calls {
+		if !argvHasPair(c.argv, "--gitlab-base-url", "https://gitlab.example.com") {
+			t.Fatalf("child %s spawn did not carry the parent's single-run-route base URL: %v", c.runID, c.argv)
+		}
+	}
+	fb.mu.Lock()
+	gets, lists := fb.getRunCalledByID[parent], fb.listRunCalls
+	fb.mu.Unlock()
+	if gets < 1 || lists != 0 {
+		t.Fatalf("parent single-run GETs = %d, list GETs = %d; the forge target must come from the parent's single-run route only", gets, lists)
+	}
+}
+
+// TestRunChildren_GitLabParent_NoBaseURL_RefusesBeforeAnyMarker: a gitlab
+// parent with no forge_base_url refuses the whole fan-out — no marker POST on
+// any child and no spawn. Counterfactual: delete the empty-ForgeBaseURL
+// refusal in resolveRunForgeTarget and this goes RED.
+func TestRunChildren_GitLabParent_NoBaseURL_RefusesBeforeAnyMarker(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	parent := uuid.New()
+	seedGitLabDecomposition(fb, parent, "")
+	spawn := withFakeDetachedSpawn(t)
+
+	_, _, err := r.runChildren(context.Background(), nil, runChildrenIn(parent))
+	if err == nil || !strings.Contains(err.Error(), "forge_base_url") {
+		t.Fatalf("expected the empty-base-URL refusal; got %v", err)
+	}
+	if calls := spawn.snapshot(); len(calls) != 0 {
+		t.Fatalf("spawned %d children despite the refusal", len(calls))
+	}
+	fb.mu.Lock()
+	markers := 0
+	for _, n := range fb.hostDispatchCalledByID {
+		markers += n
+	}
+	fb.mu.Unlock()
+	if markers != 0 {
+		t.Fatalf("host-dispatch marker POSTed %d times before the refusal", markers)
+	}
+}
+
+// TestRunChildren_GitHubParent_ArgvUnchanged: a github parent (no forge key —
+// the older-backend shape) composes the pre-#3463 child argv with no forge flag.
+func TestRunChildren_GitHubParent_ArgvUnchanged(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	parent := uuid.New()
+	child := uuid.New()
+	seedChildRunStage(fb, child, "running", "awaiting_host_dispatch")
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 0)
+	spawn := withFakeDetachedSpawn(t)
+
+	if _, _, err := r.runChildren(context.Background(), nil, runChildrenIn(parent)); err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	calls := spawn.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("spawned %d children, want 1", len(calls))
+	}
+	for _, tok := range calls[0].argv {
+		if tok == "--forge" || tok == "--gitlab-base-url" {
+			t.Fatalf("github child argv must carry no forge flag: %v", calls[0].argv)
+		}
+	}
+	if !strings.Contains(strings.Join(calls[0].argv, " "), "--github-repo x/y --base-branch main") {
+		t.Fatalf("github child argv shape changed: %v", calls[0].argv)
+	}
 }

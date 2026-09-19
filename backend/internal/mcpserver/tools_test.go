@@ -221,6 +221,21 @@ type fakeBackend struct {
 	createRunResp     Run
 	createRunStatus   int
 	createRunErrBody  string
+	// createRunRawBody captures the last POST /v0/runs body BYTES (E45.46 /
+	// #3463): the typed createRunBody decode cannot distinguish an absent
+	// `forge` key from `"forge":""`, and the start_run pin contract is about
+	// which key the wire carries, so the forge tests assert on the raw bytes.
+	createRunRawBody []byte
+	// createRunCalls counts POST /v0/runs so a client-side refusal can assert
+	// the backend was never dialed.
+	createRunCalls int
+
+	// getRunCalledByID counts GET /v0/runs/{run_id} per id and listRunCalls
+	// counts GET /v0/runs (E45.46 / #3463): the per-producer single-run-GET
+	// pins assert resolveRunForgeTarget read the single-run route exactly once
+	// and never the list route.
+	getRunCalledByID map[uuid.UUID]int
+	listRunCalls     int
 
 	// #978 fixtures: POST /v0/runs/{run_id}/recover. Same shape as the
 	// createRun fixtures; recoverParentID captures the path run_id.
@@ -616,6 +631,21 @@ func recordedReapExpectedState(fb *fakeBackend, stageID uuid.UUID) (string, bool
 	return *last.ExpectedState, true
 }
 
+// stripForgeBaseURL returns a copy of items with ForgeBaseURL cleared — the
+// list-route shape the real backend serves (E45.46 / #3463). See the GET
+// /v0/runs handler in newFakeBackend.
+func stripForgeBaseURL(items []Run) []Run {
+	if len(items) == 0 {
+		return items
+	}
+	out := make([]Run, len(items))
+	copy(out, items)
+	for i := range out {
+		out[i].ForgeBaseURL = ""
+	}
+	return out
+}
+
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	t.Helper()
 	fb := &fakeBackend{
@@ -629,6 +659,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		getRunByID:                    map[uuid.UUID]Run{},
 		getRunExtraByID:               map[uuid.UUID]map[string]any{},
 		getStatusByID:                 map[uuid.UUID]int{},
+		getRunCalledByID:              map[uuid.UUID]int{},
 		stagesByRun:                   map[uuid.UUID][]Stage{},
 		stagesStatusByRun:             map[uuid.UUID]int{},
 		artifactsByStage:              map[uuid.UUID][]Artifact{},
@@ -1302,10 +1333,13 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	})
 	mux.HandleFunc("POST /v0/runs", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		raw, _ := io.ReadAll(r.Body)
 		var body createRunRequest
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.Unmarshal(raw, &body)
 		fb.mu.Lock()
 		fb.createRunBody = body
+		fb.createRunRawBody = raw
+		fb.createRunCalls++
 		fb.createRunIdempKey = r.Header.Get("Idempotency-Key")
 		status := fb.createRunStatus
 		errBody := fb.createRunErrBody
@@ -1547,15 +1581,22 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	mux.HandleFunc("GET /v0/runs", func(w http.ResponseWriter, r *http.Request) {
 		fb.mu.Lock()
 		fb.lastListQuery = r.URL.RawQuery
+		fb.listRunCalls++
 		resp, override := fb.listByQuery[r.URL.RawQuery]
 		fb.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(fb.listStatus)
-		if override {
-			_ = json.NewEncoder(w).Encode(resp)
-			return
+		if !override {
+			resp = fb.listResp
 		}
-		_ = json.NewEncoder(w).Encode(fb.listResp)
+		// The list route DELIBERATELY omits forge_base_url (E45.46 / #3463),
+		// mirroring the real backend, which populates it on the single-run read
+		// ONLY. A producer that derived its forge target from a list read would
+		// therefore hit resolveRunForgeTarget's empty-base-URL refusal against
+		// this fake exactly as it would in production — that omission is what
+		// makes the per-producer single-run-GET pins discriminating.
+		resp.Items = stripForgeBaseURL(resp.Items)
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1565,6 +1606,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			return
 		}
 		fb.mu.Lock()
+		fb.getRunCalledByID[id]++
 		row, ok := fb.getRunByID[id]
 		extra := fb.getRunExtraByID[id]
 		status := fb.getStatus
@@ -8206,6 +8248,230 @@ func TestStartRun_OnDemandWithoutIssueContext_PassesThrough(t *testing.T) {
 	}
 	if fb.createRunBody.TriggerRef != nil {
 		t.Errorf("TriggerRef = %v, want nil — un-anchored, not silently defaulted", *fb.createRunBody.TriggerRef)
+	}
+}
+
+// --- fishhawk_start_run forge selector (E45.46 / #3463) ----------------------
+//
+// The contract under test is the no-github-fetch guarantee (constraint 1): the
+// gh fetch resolves against github.com regardless of the project's forge, so a
+// run created under a gh-fetched issue must PIN forge=github on the wire, a
+// gitlab run must never invoke gh, and a request that fetched nothing must
+// carry NO forge key so the backend's registry ladder decides. Because the
+// difference between "no key" and `"forge":""` is invisible to the typed
+// createRunBody decode, these tests assert on the RAW request bytes.
+
+// startRunRawBodyHasForge reports whether the last captured POST /v0/runs body
+// carries a top-level `forge` key at all, and its value when it does.
+func startRunRawBodyForge(t *testing.T, fb *fakeBackend) (present bool, value string) {
+	t.Helper()
+	fb.mu.Lock()
+	raw := append([]byte(nil), fb.createRunRawBody...)
+	fb.mu.Unlock()
+	if len(raw) == 0 {
+		t.Fatal("no POST /v0/runs body was captured")
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decode raw create body: %v (%s)", err, raw)
+	}
+	rv, ok := m["forge"]
+	if !ok {
+		return false, ""
+	}
+	if err := json.Unmarshal(rv, &value); err != nil {
+		t.Fatalf("forge is not a JSON string: %s", rv)
+	}
+	return true, value
+}
+
+// withRecordingGh swaps in a fake gh that records every invocation and either
+// returns the supplied JSON body or exits non-zero (fail=true), so a test can
+// assert BOTH that gh was attempted AND what the wire carried afterwards.
+func withRecordingGh(t *testing.T, jsonBody string, fail bool) *int {
+	t.Helper()
+	calls := new(int)
+	origCmd := ghIssueCommand
+	origLook := ghLookPath
+	ghIssueCommand = func(_ string, _ ...string) *exec.Cmd {
+		*calls++
+		if fail {
+			return exec.Command("/usr/bin/false")
+		}
+		return exec.Command("sh", "-c", "cat <<'BODY'\n"+jsonBody+"\nBODY")
+	}
+	ghLookPath = func(_ string) (string, error) { return "/fake/gh", nil }
+	t.Cleanup(func() {
+		ghIssueCommand = origCmd
+		ghLookPath = origLook
+	})
+	return calls
+}
+
+// TestStartRun_ForgePassthrough: an explicit forge reaches the wire verbatim.
+func TestStartRun_ForgePassthrough(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo: "acme/widgets", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
+		RunnerKind: "local", Forge: "gitlab",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if present, got := startRunRawBodyForge(t, fb); !present || got != "gitlab" {
+		t.Fatalf("raw body forge = (present=%v, %q), want gitlab", present, got)
+	}
+}
+
+// TestStartRun_InvalidForge_NoRoundTrip: a value outside {github, gitlab} is a
+// client-side tool error naming the field; the backend is never dialed.
+func TestStartRun_InvalidForge_NoRoundTrip(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec, Forge: "bitbucket",
+	})
+	if err == nil {
+		t.Fatal("expected a tool error for forge=bitbucket")
+	}
+	if !strings.Contains(err.Error(), "forge") || !strings.Contains(err.Error(), "github, gitlab") {
+		t.Errorf("error should name the field and the accepted set; got %v", err)
+	}
+	fb.mu.Lock()
+	calls := fb.createRunCalls
+	fb.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("POST /v0/runs was dialed %d times despite the client-side refusal", calls)
+	}
+}
+
+// TestStartRun_GitLabWithIssue_SkipsGhFetch: forge=gitlab with an issue and no
+// inline issue_context never shells to gh (the seam t.Fatal's if invoked); the
+// run mints with a warning naming issue_context as the supported path, and the
+// wire carries forge=gitlab. Counterfactual: delete the `forgeSelector !=
+// startRunForgeGitLab` conjunct in startRun's ghFetchAttempted and this goes RED
+// on the seam.
+func TestStartRun_GitLabWithIssue_SkipsGhFetch(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	origCmd := ghIssueCommand
+	origLook := ghLookPath
+	ghIssueCommand = func(_ string, _ ...string) *exec.Cmd {
+		t.Fatal("gh must NOT be invoked for a forge=gitlab run (a github.com fetch cannot serve a GitLab issue)")
+		return nil
+	}
+	ghLookPath = func(_ string) (string, error) { return "/fake/gh", nil }
+	t.Cleanup(func() {
+		ghIssueCommand = origCmd
+		ghLookPath = origLook
+	})
+
+	res, out, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo: "acme/widgets", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
+		RunnerKind: "local", Forge: "gitlab", Issue: "42",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if out.Run.ID == "" {
+		t.Fatal("run did not mint")
+	}
+	if fb.createRunBody.IssueContext != nil {
+		t.Errorf("issue_context should be absent (nothing was fetched); got %+v", fb.createRunBody.IssueContext)
+	}
+	if present, got := startRunRawBodyForge(t, fb); !present || got != "gitlab" {
+		t.Errorf("raw body forge = (present=%v, %q), want gitlab", present, got)
+	}
+	if res == nil || len(res.Content) == 0 {
+		t.Fatal("expected a warning on the tool result naming issue_context")
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "issue_context") || !strings.Contains(text, "forge=gitlab") {
+		t.Errorf("warning should name issue_context as the supported path for a gitlab issue; got %q", text)
+	}
+}
+
+// TestStartRun_OmittedForgeWithIssue_PinsGitHubAndInvokesGh: forge omitted +
+// issue given + no inline issue_context → gh IS invoked and the raw body pins
+// `"forge":"github"`. The pin lands on the fetch ATTEMPT: the gh-error subcase
+// still pins, so an absent/broken gh cannot make two otherwise-identical calls
+// mint runs of different forges. Counterfactual: delete the `requestForge =
+// startRunForgeGitHub` assignment in startRun and both subcases go RED.
+func TestStartRun_OmittedForgeWithIssue_PinsGitHubAndInvokesGh(t *testing.T) {
+	cases := []struct {
+		name   string
+		ghFail bool
+	}{
+		{"gh_succeeds", false},
+		{"gh_errors_still_pins", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			calls := withRecordingGh(t, `{"title":"Add foo","body":"We need foo.","url":"https://github.com/x/y/issues/42","number":42}`, tc.ghFail)
+
+			res, _, err := r.startRun(context.Background(), nil, StartRunInput{
+				Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec, Issue: "42",
+			})
+			if err != nil {
+				t.Fatalf("startRun: %v", err)
+			}
+			if *calls != 1 {
+				t.Fatalf("gh invoked %d times, want exactly 1 (the fetch was attempted)", *calls)
+			}
+			present, got := startRunRawBodyForge(t, fb)
+			if !present || got != "github" {
+				t.Fatalf("raw body forge = (present=%v, %q), want the github pin", present, got)
+			}
+			if tc.ghFail {
+				if fb.createRunBody.IssueContext != nil {
+					t.Errorf("issue_context should be absent after a gh failure; got %+v", fb.createRunBody.IssueContext)
+				}
+				if res == nil || len(res.Content) == 0 || !strings.Contains(res.Content[0].(*mcp.TextContent).Text, "issue fetch warning") {
+					t.Errorf("gh failure should surface the existing fetch warning; got %+v", res)
+				}
+			} else if fb.createRunBody.IssueContext == nil || fb.createRunBody.IssueContext.Number != 42 {
+				t.Errorf("issue_context not forwarded from the gh fetch: %+v", fb.createRunBody.IssueContext)
+			}
+		})
+	}
+}
+
+// TestStartRun_OmittedForgeNoIssue_SendsNoForge: with forge omitted and no
+// github.com fetch (no issue, or issue_context supplied INLINE — approval
+// condition 1), the raw body carries NO forge key and gh is never invoked, so
+// the backend's registry ladder derives the forge.
+func TestStartRun_OmittedForgeNoIssue_SendsNoForge(t *testing.T) {
+	cases := []struct {
+		name string
+		in   StartRunInput
+	}{
+		{"no_issue", StartRunInput{Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec}},
+		{"inline_issue_context", StartRunInput{
+			Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec, TriggerSource: "github_issue",
+			IssueContext: &IssueContext{Title: "Pre-fetched", Body: "Inline.", URL: "https://gitlab.example.com/x/y/-/issues/9", Number: 9},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			calls := withRecordingGh(t, `{}`, false)
+
+			if _, _, err := r.startRun(context.Background(), nil, tc.in); err != nil {
+				t.Fatalf("startRun: %v", err)
+			}
+			if *calls != 0 {
+				t.Fatalf("gh invoked %d times; want 0 (nothing to fetch)", *calls)
+			}
+			if present, got := startRunRawBodyForge(t, fb); present {
+				t.Fatalf("raw body carries forge=%q; want NO forge key so the backend derives it", got)
+			}
+		})
 	}
 }
 
