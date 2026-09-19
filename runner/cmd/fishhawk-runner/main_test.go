@@ -91,6 +91,33 @@ func runTestMain(m *testing.M) int {
 	if _, err := exec.LookPath("git"); err != nil {
 		return runSuite() // git unavailable — degrade to the original CWD.
 	}
+
+	// #3503: pin git's auto-maintenance off for every git child this test
+	// process spawns. A `git push` into a local bare repository makes the
+	// receiving git-receive-pack run `git maintenance run --auto --quiet
+	// --detach` (receive.autogc / maintenance.auto default true). Since git
+	// 2.46 that child DAEMONIZES — the parent exits and push returns while
+	// the forked child keeps running — and git 2.52's default --auto
+	// strategy can run a geometric-repack/commit-graph/worktree-prune task
+	// AFTER the fork, recreating objects/pack/ while a t.TempDir() bare
+	// origin fixture is mid-RemoveAll ("directory not empty", #3503).
+	// GIT_CONFIG_GLOBAL is the only channel that reaches receive-pack over a
+	// file-path push: git's connect.c scrubs repo-local config env
+	// (GIT_CONFIG_COUNT / GIT_CONFIG_PARAMETERS) for the file transport, so
+	// only a global config file — not a -c flag or GIT_CONFIG_COUNT — is
+	// honored by the spawned receive-pack. This file lives in its own temp
+	// dir (not the seeded CWD repo below, where an untracked file would show
+	// up in fixture `git status` output) and carries exactly this one key so
+	// the ambient scripts/test GIT_CONFIG_GLOBAL=/dev/null (#912,
+	// commit.gpgsign posture) is preserved rather than widened.
+	if gitConfigDir, err := os.MkdirTemp("", "fishhawk-runner-gitconfig-*"); err == nil {
+		defer func() { _ = os.RemoveAll(gitConfigDir) }()
+		gitConfigPath := filepath.Join(gitConfigDir, "gitconfig")
+		if err := os.WriteFile(gitConfigPath, []byte("[maintenance]\n\tauto = false\n"), 0o644); err == nil {
+			_ = os.Setenv("GIT_CONFIG_GLOBAL", gitConfigPath)
+		}
+	}
+
 	dir, err := os.MkdirTemp("", "fishhawk-runner-main-test-*")
 	if err != nil {
 		return runSuite()
@@ -139,6 +166,104 @@ func TestHarnessNeutralizesActionsEnv(t *testing.T) {
 	}
 	if v := os.Getenv("GITHUB_REPOSITORY"); v != "" {
 		t.Errorf("GITHUB_REPOSITORY = %q, want empty — runTestMain's os.Unsetenv(\"GITHUB_REPOSITORY\") (#3402) did not take effect", v)
+	}
+}
+
+// trace2ChildStartArgv is the subset of a GIT_TRACE2_EVENT JSONL line this
+// test cares about: the "start" event for the top-level process and any
+// "child_start" event it spawns each carry an "argv". Git's local-transport
+// receive-pack spawn is logged as a SINGLE joined command-line string
+// (e.g. `git-receive-pack '../origin.git'`) rather than split tokens, while
+// a re-exec'd "git" child (including a spawned "maintenance" run) is logged
+// with split argv — so callers must substring-match, not element-match.
+type trace2Event struct {
+	Event string   `json:"event"`
+	Argv  []string `json:"argv"`
+}
+
+// TestHarnessDisablesAutoMaintenanceOnLocalPush pins the runTestMain
+// GIT_CONFIG_GLOBAL maintenance.auto=false posture (#3503): a `git push`
+// into a local bare origin must not spawn a detached `git maintenance run
+// --auto --detach` child, because git >= 2.46 daemonizes that child (it
+// forks and the parent returns from push while the child keeps running),
+// and a later maintenance task recreating objects/pack/ can race a
+// t.TempDir() bare-origin fixture's RemoveAll cleanup with "directory not
+// empty".
+//
+// Deleting runTestMain's os.Setenv("GIT_CONFIG_GLOBAL", …) line (while
+// keeping the config file write) turns this RED under
+// `GIT_CONFIG_GLOBAL=/dev/null go test -run TestHarnessDisablesAutoMaintenanceOnLocalPush`
+// (the scripts/test posture): the ambient pin never reaches this process,
+// maintenance.auto defaults true, and receive-pack spawns the maintenance
+// child. The one residual false-green is an operator ~/.gitconfig that
+// itself sets maintenance.auto=false when this test is run outside
+// scripts/test and outside the runTestMain pin.
+//
+// Vacuity guard (operator condition 1): a trace2 file that never recorded
+// the push or the receive-pack child could satisfy the negative
+// "no maintenance child" assertion for the wrong reason — an empty or
+// unexercised trace, not a working pin. So this test first requires BOTH
+// the push "start" record and a receive-pack child_start record to be
+// present before trusting the absence of a maintenance one.
+func TestHarnessDisablesAutoMaintenanceOnLocalPush(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	origin := filepath.Join(t.TempDir(), "origin.git")
+	if out, err := exec.Command("git", "init", "-q", "--bare", "--initial-branch=main", origin).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare %s: %v\n%s", origin, err, out)
+	}
+
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "seed.txt"), "seed\n")
+	runGit("add", "-A")
+	runGit("commit", "-q", "-m", "seed")
+	runGit("remote", "add", "origin", origin)
+
+	tracePath := filepath.Join(t.TempDir(), "trace2.json")
+	cmd := exec.Command("git", "push", "-q", "origin", "main:main")
+	cmd.Dir = repo
+	cmd.Env = append(os.Environ(), "GIT_TRACE2_EVENT="+tracePath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git push: %v\n%s", err, out)
+	}
+
+	traceBytes, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatalf("read GIT_TRACE2_EVENT file %s: %v", tracePath, err)
+	}
+
+	var sawPushStart, sawReceivePackChild, sawMaintenanceChild bool
+	for _, line := range strings.Split(strings.TrimSpace(string(traceBytes)), "\n") {
+		if line == "" {
+			continue
+		}
+		var evt trace2Event
+		if err := json.Unmarshal([]byte(line), &evt); err != nil {
+			continue // non-JSON or non-matching trace2 line (e.g. "version"); not a fatal condition.
+		}
+		for _, arg := range evt.Argv {
+			switch {
+			case evt.Event == "start" && arg == "push":
+				sawPushStart = true
+			case evt.Event == "child_start" && strings.Contains(arg, "receive-pack"):
+				sawReceivePackChild = true
+			case evt.Event == "child_start" && strings.Contains(arg, "maintenance"):
+				sawMaintenanceChild = true
+			}
+		}
+	}
+
+	if !sawPushStart {
+		t.Fatalf("trace2 %s carries no \"start\" record with argv \"push\" — trace unexercised, not a pin verification:\n%s", tracePath, traceBytes)
+	}
+	if !sawReceivePackChild {
+		t.Fatalf("trace2 %s carries no \"child_start\" record naming receive-pack — trace unexercised, not a pin verification:\n%s", tracePath, traceBytes)
+	}
+
+	if sawMaintenanceChild {
+		t.Errorf("git push spawned a \"maintenance\" child — the runTestMain GIT_CONFIG_GLOBAL pin (#3503) did not take effect (GIT_CONFIG_GLOBAL=%q):\n%s", os.Getenv("GIT_CONFIG_GLOBAL"), traceBytes)
 	}
 }
 
