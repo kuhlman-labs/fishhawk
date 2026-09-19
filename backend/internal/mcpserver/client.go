@@ -858,18 +858,21 @@ func (c *apiClient) GetRunLatency(ctx context.Context, runID uuid.UUID) (*RunLat
 // OnboardingReadinessReport mirrors the backend's GET
 // /v0/onboarding/readiness body
 // (`backend/internal/server/onboarding.go::onboardingReadinessResponse`, E29.4 /
-// #1511): the five server-side-only readiness checks a repo's first run needs —
-// GitHub App installation, the committed workflow spec's parse/validate state,
-// per-reviewer availability on this deployment, the caller token's scope
-// adequacy, and whether the check Fishhawk publishes is actually required by
-// the repo's branch protection (#3161). Repeated here rather than imported
-// because the MCP server's apiClient is a thin local copy (the import direction
-// is `cli → backend`, not the reverse). Every field is a scalar/string/slice —
-// no UUID/raw-JSON field, so the #371 reflection trap does not apply. MUST stay
+// #1511): the server-side-only readiness checks a repo's first run needs —
+// five on GitHub, four on GitLab (E45.43 / #3348) — App installation (on
+// GitLab: project resolvability with the deployment credential), the committed
+// workflow spec's parse/validate state, per-reviewer availability on this
+// deployment, the caller token's scope adequacy, and (GitHub only) whether the
+// check Fishhawk publishes is actually required by the repo's branch
+// protection (#3161). Repeated here rather than imported because the MCP
+// server's apiClient is a thin local copy (the import direction is `cli →
+// backend`, not the reverse). Every field is a scalar/string/slice — no
+// UUID/raw-JSON field, so the #371 reflection trap does not apply. MUST stay
 // byte-identical with the backend response's json tags.
 type OnboardingReadinessReport struct {
-	Repo      string               `json:"repo" jsonschema:"the target repo as owner/name that was probed"`
-	App       OnboardingApp        `json:"app" jsonschema:"GitHub App installation readiness"`
+	Repo      string               `json:"repo" jsonschema:"the target repo that was probed: owner/name on GitHub, or a namespace/project path (nested groups allowed) on GitLab"`
+	Forge     string               `json:"forge,omitempty" jsonschema:"the forge family that answered: github or gitlab; absent against an older fishhawkd"`
+	App       OnboardingApp        `json:"app" jsonschema:"GitHub App installation readiness; on GitLab, whether the project is resolvable with the deployment credential (see note)"`
 	Spec      OnboardingSpec       `json:"spec" jsonschema:"committed workflow spec fetch/parse/validate readiness"`
 	Reviewers []OnboardingReviewer `json:"reviewers" jsonschema:"per spec-declared reviewer availability on this deployment; empty when the spec is unavailable or invalid"`
 	Scopes    OnboardingScopes     `json:"scopes" jsonschema:"caller-token run-driving scope adequacy"`
@@ -882,7 +885,13 @@ type OnboardingReadinessReport struct {
 	// over-claim #3161 exists to remove. nil ("the backend did not answer this
 	// question") is not the same claim as "unknown" ("the question was asked
 	// and could not be settled"), so it is rendered as neither.
-	MergeGate *OnboardingMergeGate `json:"merge_gate,omitempty" jsonschema:"whether the fishhawk_audit_complete check Fishhawk publishes is actually REQUIRED by the repo protection on its default branch; ABSENT (omitted, not zero-valued) against an older fishhawkd that does not serve the field - absence means this backend cannot answer, which is NOT the same as status unknown, and the object is never emitted with an empty status"`
+	//
+	// Since E45.43 / #3348 there is a THIRD reason for nil: a GitLab-family
+	// report OMITS merge_gate BY DESIGN — branch protection and rulesets are
+	// GitHub-only surfaces, so the backend never reads them there and renders
+	// no verdict rather than a `not_required` it never established. Still
+	// "no claim about the merge gate", not a stale backend.
+	MergeGate *OnboardingMergeGate `json:"merge_gate,omitempty" jsonschema:"whether the fishhawk_audit_complete check Fishhawk publishes is actually REQUIRED by the repo protection on its default branch; ABSENT (omitted, not zero-valued) against an older fishhawkd that does not serve the field AND on a gitlab-family report, where the protection surfaces are GitHub-only and the omission is deliberate - absence means the backend makes no claim, which is NOT the same as status unknown, and the object is never emitted with an empty status"`
 }
 
 // OnboardingMergeGate mirrors the backend mergeGateReadiness sub-object
@@ -897,8 +906,9 @@ type OnboardingReadinessReport struct {
 // is NOT evidence that the check is unrequired.
 //
 // A nil *OnboardingMergeGate is a FOURTH state, distinct from all three: the
-// backend served no `merge_gate` key (a pre-#3161 fishhawkd), so this report
-// makes no claim about the merge gate at all.
+// backend served no `merge_gate` key — a pre-#3161 fishhawkd, or a
+// GitLab-family report where the key is omitted by design (E45.43 / #3348) —
+// so this report makes no claim about the merge gate at all.
 type OnboardingMergeGate struct {
 	Status           string                   `json:"status" jsonschema:"'required' (a protection source requires the check), 'not_required' (both surfaces answered and neither does), or 'unknown' (the question could not be settled - reason names why; NOT evidence the check is unrequired)"`
 	Check            string                   `json:"check" jsonschema:"the status-check context that was probed (fishhawk_audit_complete)"`
@@ -929,10 +939,13 @@ type OnboardingMergeGateSrc struct {
 
 // OnboardingApp mirrors the backend appInstallReadiness sub-object: whether the
 // GitHub App is installed on the target repo, with reason set when it is not.
+// On a gitlab-family report installed means the project is resolvable with
+// the deployment credential (note says so) and installation_id is never set.
 type OnboardingApp struct {
-	Installed      bool   `json:"installed" jsonschema:"true when the GitHub App is installed on the target repo"`
-	InstallationID int64  `json:"installation_id,omitempty" jsonschema:"the resolved installation id when installed"`
+	Installed      bool   `json:"installed" jsonschema:"true when the GitHub App is installed on the target repo; on gitlab, true when the project is resolvable with the deployment credential"`
+	InstallationID int64  `json:"installation_id,omitempty" jsonschema:"the resolved installation id when installed (github only)"`
 	Reason         string `json:"reason,omitempty" jsonschema:"why the app is not installed / could not be resolved"`
+	Note           string `json:"note,omitempty" jsonschema:"context on what installed means for this forge, e.g. gitlab: project resolvable with the deployment credential"`
 }
 
 // OnboardingSpec mirrors the backend specReadiness sub-object: the committed
@@ -966,15 +979,22 @@ type OnboardingScopes struct {
 }
 
 // OnboardingReadiness fetches a repo's first-run readiness report via
-// `GET /v0/onboarding/readiness?repo=owner/name` (E29.4 / #1511). The endpoint
+// `GET /v0/onboarding/readiness?repo=<path>[&forge=github|gitlab]` (E29.4 /
+// #1511; forge-family-aware since E45.43 / #3348). forgeFamily is appended
+// only when non-empty — an empty value leaves the backend to resolve the
+// family from its account registry (defaulting to github). The endpoint
 // gates on AUTHENTICATION only (401 for anonymous) — scope adequacy is itself a
 // reported field, not a gate — so a token with a run-driving scope gap still
 // gets a 200 report naming its gap. 4xx surfaces as *apiError; the tool layer
 // maps authentication_required (401) and validation_failed (400, malformed
-// repo) onto clean tool errors.
-func (c *apiClient) OnboardingReadiness(ctx context.Context, repo string) (*OnboardingReadinessReport, error) {
+// repo or forge) onto clean tool errors.
+func (c *apiClient) OnboardingReadiness(ctx context.Context, repo, forgeFamily string) (*OnboardingReadinessReport, error) {
 	var out OnboardingReadinessReport
-	if err := c.do(ctx, http.MethodGet, "/v0/onboarding/readiness?repo="+url.QueryEscape(repo), nil, &out); err != nil {
+	path := "/v0/onboarding/readiness?repo=" + url.QueryEscape(repo)
+	if forgeFamily != "" {
+		path += "&forge=" + url.QueryEscape(forgeFamily)
+	}
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

@@ -407,7 +407,11 @@ whitespace (`acme//widgets`, `acme/platform//widgets`, `acme/widgets/`,
 `acme/ /widgets` and `acme/platform/ ` are refused, because GitLab never
 canonicalises a path carrying an empty or whitespace-only component) whose namespace segment
 equals the resolved `account_key`, each failure wrapping `ErrValidation` and
-naming the offending values. That keeps the fail-closed refusal a purely historical artifact — the
+naming the offending values. The shape half of that rule is exported as
+`ProjectPathWellFormed(path) bool` (E45.43 / #3348) so the onboarding-readiness
+endpoint, which has no account key to bind against, validates a nested GitLab
+path with the same predicate instead of restating it (`TestProjectPathWellFormed`
+pins the accept/reject table). That keeps the fail-closed refusal a purely historical artifact — the
 shape a pre-0078 row has — rather than something the supported write path can
 newly produce.
 

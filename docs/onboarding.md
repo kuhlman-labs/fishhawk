@@ -185,7 +185,15 @@ whole command.
 
 Four rungs are read from the readiness endpoint
 (`GET /v0/onboarding/readiness?repo=owner/name`) — they are server-side-only
-checks the CLI cannot perform locally:
+checks the CLI cannot perform locally. The endpoint is forge-family-aware
+(E45.43 / #3348): for a GitLab project `repo` is the `namespace/project` path
+(nested groups allowed, e.g. `group/subgroup/project`) and `forge=gitlab`
+selects the family explicitly (otherwise the account registry decides,
+defaulting to GitHub); there the **app installed** rung means the project is
+resolvable with the deployment GitLab credential (no App installation
+applies), and the `merge_gate` field is omitted entirely because branch
+protection and rulesets are GitHub-only surfaces — so no merge-gate rung
+exists on GitLab:
 
 | Rung | Fails when | Remediation |
 |---|---|---|

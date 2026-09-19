@@ -1,0 +1,14 @@
+id: scenario:issue-3348/github-nested-path-rejected
+statement: GET /v0/onboarding/readiness?repo=a/b/c&forge=github returns 400 validation_failed with details.field=repo and a message that names forge=gitlab as the way to address a nested project.
+verify_hint: 'HTTP: call the route with repo=a/b/c&forge=github; assert 400, error.code validation_failed, details.field repo.'
+steps: GET /v0/onboarding/readiness?repo=a/b/c&forge=github with the operator bearer; read GET /v0/dev/forge requests length immediately before and after a second identical call; also GET …?repo=a/b/c with no forge parameter (registry-resolved family).
+assertions:
+    expected: 400 validation_failed with details.field=repo and a message naming forge=gitlab as the way to address a nested project.
+    observed_at_record: 400 {error.code validation_failed, message 'github repositories are owner/name; a nested path is a GitLab project — pass forge=gitlab', details {field repo, got a/b/c}}; stub forge request log unchanged across the explicit forge=github call (2 -> 2, i.e. zero forge calls); registry-resolved a/b/c without forge -> the same 400.
+    repro_handle: 'curl -H ''Authorization: Bearer <tok>'' ''http://localhost:8090/v0/onboarding/readiness?repo=a/b/c&forge=github'''
+origin:
+    issue: 3348
+    pr: 3487
+    run_id: 5e502953-9cff-498b-a0a7-395150d5e219
+    head_sha: 1ff94a4a6dedd9fdfb8f062a56610b8eba3b61c5
+    recorded_at: 2026-09-19T06:25:03Z

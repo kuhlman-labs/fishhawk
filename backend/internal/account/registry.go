@@ -233,18 +233,34 @@ func ValidateGitLabProjectPath(accountKey, projectPath string) error {
 	if path == "" {
 		return fmt.Errorf("account: gitlab registrations must record the project path (--project-path <namespace>/<project>): %w", ErrValidation)
 	}
-	namespace, project, ok := strings.Cut(path, "/")
-	if !ok || namespace == "" || !allComponentsNonEmpty(project) {
+	if !ProjectPathWellFormed(path) {
 		return fmt.Errorf(
 			"account: gitlab project path %q must be of the form <namespace>/<project> with every component non-empty (nested groups allowed, e.g. acme/platform/widgets) (--project-path): %w",
 			path, ErrValidation)
 	}
+	namespace, _, _ := strings.Cut(path, "/")
 	if namespace != accountKey {
 		return fmt.Errorf(
 			"account: gitlab project path %q lives under namespace %q but the installation is owned by account_key %q; the namespace segment must equal the account key (--project-path): %w",
 			path, namespace, accountKey, ErrValidation)
 	}
 	return nil
+}
+
+// ProjectPathWellFormed is the SHAPE half of ValidateGitLabProjectPath,
+// exported so a caller that has no account key to bind against (the
+// onboarding-readiness endpoint, E45.43 / #3348) can reuse the one rule
+// rather than restate it: after trimming, the path splits on its FIRST "/"
+// into a non-empty namespace and a remainder whose every "/"-separated
+// component is non-empty after trimming. It accepts 'a/b' and any nested
+// depth ('a/b/c', 'gitlab-com/customer-success/.../gitlab-migrator') and
+// refuses the empty string, 'noslash', '/name', 'owner/', 'a//b', 'a/ /b', 'a/b/' and
+// ' / ' — the same set ValidateGitLabProjectPath refuses, whose namespace ==
+// accountKey rule is the only thing it adds on top.
+func ProjectPathWellFormed(path string) bool {
+	path = strings.TrimSpace(path)
+	namespace, rest, ok := strings.Cut(path, "/")
+	return ok && namespace != "" && allComponentsNonEmpty(rest)
 }
 
 // allComponentsNonEmpty reports whether remainder is a "/"-joined sequence of

@@ -1,0 +1,14 @@
+id: scenario:issue-3348/github-report-unchanged
+statement: GET /v0/onboarding/readiness?repo=owner/name with no forge parameter on a preview with no account registry entry for owner returns 200 with forge=github and a merge_gate object present (status unknown with a naming reason when GitHub is unconfigured), i.e. the legacy GitHub report shape is preserved.
+verify_hint: 'HTTP: call the route with a plain owner/name repo and no forge; assert 200, body.forge == github and the merge_gate key present with a status value.'
+steps: Confirmed via psql on the preview DB that the accounts table holds no row for account_key 'owner' (only the temporary gitlab/acme row from the 2975 replay, since deleted). GET /v0/onboarding/readiness?repo=owner/name with no forge parameter and the operator bearer; listed the body's keys and merge_gate.
+assertions:
+    expected: 200 with forge=github and a merge_gate object present (status unknown with a naming reason when GitHub is unconfigured).
+    observed_at_record: '200; keys [repo, forge, app, spec, reviewers, scopes, merge_gate]; forge github; app {installed false, reason ''githubclient: AppJWT not configured for App-level requests''}; spec {source unavailable, valid false, note …}; merge_gate {status unknown, check fishhawk_audit_complete, bypassable false, authoritative false, reason app_not_installed, detail ''GitHub App is not installed on the target repository; reading branch protection needs an installation token'', remediation ''Install the Fishhawk GitHub App on owner/name, then re-run the check.''}.'
+    repro_handle: 'curl -H ''Authorization: Bearer <tok>'' ''http://localhost:8090/v0/onboarding/readiness?repo=owner/name'''
+origin:
+    issue: 3348
+    pr: 3487
+    run_id: 5e502953-9cff-498b-a0a7-395150d5e219
+    head_sha: 1ff94a4a6dedd9fdfb8f062a56610b8eba3b61c5
+    recorded_at: 2026-09-19T06:25:03Z

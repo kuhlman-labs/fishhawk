@@ -13,9 +13,13 @@ import (
 
 // DoctorInput is the fishhawk_doctor tool's input schema (E29.6 / #1506).
 // Repo falls back to the GITHUB_REPOSITORY env when omitted (the in-runner
-// case), mirroring fishhawk_file_issue's resolver.
+// case), mirroring fishhawk_file_issue's resolver, then to GitLab CI's
+// CI_PROJECT_PATH (E45.43 / #3348). Forge names the family; omitted, it
+// defaults to gitlab only when CI_PROJECT_PATH supplied the repo, else the
+// backend resolves it from its account registry (defaulting to github).
 type DoctorInput struct {
-	Repo string `json:"repo,omitempty" jsonschema:"target repo as owner/name; falls back to GITHUB_REPOSITORY env when omitted"`
+	Repo  string `json:"repo,omitempty" jsonschema:"target repo: owner/name on GitHub, or a namespace/project path (nested groups allowed) on GitLab; falls back to GITHUB_REPOSITORY then CI_PROJECT_PATH env when omitted"`
+	Forge string `json:"forge,omitempty" jsonschema:"forge family of repo: github or gitlab; omitted → gitlab when CI_PROJECT_PATH supplied the repo, otherwise the backend resolves it from the account registry and defaults to github"`
 }
 
 // DoctorOutput wraps the readiness report. Kept under a `report` key so the
@@ -47,7 +51,9 @@ type InitOutput struct {
 // GET /v0/onboarding/readiness so a connecting Claude Code agent can drive a
 // conversational "help me onboard a repo" flow — one onboarding engine, another
 // frontend. Read-only per ADR-021. Five checks since #3161, the fifth being the
-// merge-gate reconciliation of the published check against the forge.
+// merge-gate reconciliation of the published check against the forge — and
+// forge-family-aware since E45.43 / #3348 (four checks on GitLab, where the
+// merge gate is omitted by design).
 func registerDoctor(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_doctor",
@@ -55,13 +61,19 @@ func registerDoctor(srv *mcp.Server, resolver *runResolver) {
 Use this when onboarding a repository to Fishhawk and you need its first-run
 readiness before starting a run — the in-band counterpart to the CLI
 ` + "`fishhawk doctor`" + ` (E29.4/E29.6). It wraps GET /v0/onboarding/readiness and
-returns five server-side-only checks the first feature_change run needs:
+returns five server-side-only checks the first feature_change run needs (four
+on GitLab — see merge_gate below):
 
   - app     — is the GitHub App installed on the target repo (installation_id
-              when it is, a reason when it is not).
+              when it is, a reason when it is not). On GitLab there is no App:
+              installed means the project is resolvable with the deployment
+              GitLab credential, and note says so; a not-visible project
+              carries a reason naming the fishhawkd installation register
+              command.
   - spec    — the committed .fishhawk/workflows.yaml fetch + parse + validate
               state (source fetched|unavailable, valid, error, note). Only
-              meaningful once the app is installed.
+              meaningful once the app is installed (on GitLab: once the
+              project resolved).
   - reviewers — per spec-declared reviewer availability on THIS deployment
               (available, plus a missing_hint naming the env var to set when a
               provider cannot be resolved). Empty when the spec is unavailable
@@ -84,12 +96,24 @@ returns five server-side-only checks the first feature_change run needs:
               an older fishhawkd that does not serve it — that absence means
               this backend cannot answer, which is NOT the same claim as
               status unknown, and merge_gate is never emitted with an empty
-              status.
+              status. The key is ALSO OMITTED on a GitLab-family report, by
+              design: branch protection and rulesets are GitHub-only surfaces
+              the backend never reads there, so its absence on GitLab is
+              deliberate, not a stale backend.
 
-repo defaults to GITHUB_REPOSITORY env when omitted. The endpoint gates on
-AUTHENTICATION only, so a token with a scope gap still gets a report naming its
-gap rather than a 403. Pair with fishhawk_init to scaffold a missing spec. Tool
-errors: authentication_required (401), validation_failed (400, malformed repo).
+The report's forge field names the family that answered (github|gitlab). repo
+is owner/name on GitHub, or a namespace/project path on GitLab — nested groups
+(group/subgroup/project) are accepted; a nested path on the github family is a
+400 telling you to pass forge=gitlab. forge is optional: omitted, the backend
+resolves the family from its account registry (the namespace registered via
+fishhawkd account create) and defaults to github when the owner is unknown —
+so pass forge=gitlab explicitly for a GitLab project whose namespace is not
+registered. repo defaults to GITHUB_REPOSITORY env when omitted, then to GitLab
+CI's CI_PROJECT_PATH (which also defaults forge to gitlab). The endpoint gates
+on AUTHENTICATION only, so a token with a scope gap still gets a report naming
+its gap rather than a 403. Pair with fishhawk_init to scaffold a missing spec.
+Tool errors: authentication_required (401), validation_failed (400, malformed
+repo or forge).
 `),
 	}, resolver.doctor)
 }
@@ -130,29 +154,42 @@ tiers.
 }
 
 // doctor is the fishhawk_doctor tool handler. It resolves repo from the env
-// when omitted (a fast local fail before the HTTP hop when neither is present)
-// and delegates the five readiness probes to the backend, mapping the two 4xx
+// when omitted (a fast local fail before the HTTP hop when none is present)
+// and delegates the readiness probes to the backend, mapping the two 4xx
 // surfaces onto clean tool errors.
+//
+// Repo ladder: in.Repo > GITHUB_REPOSITORY > CI_PROJECT_PATH (GitLab CI's
+// predefined path_with_namespace variable). Forge ladder: in.Forge > "gitlab"
+// when CI_PROJECT_PATH supplied the repo > "" (the backend resolves it from
+// the account registry, defaulting to github).
 func (r *runResolver) doctor(ctx context.Context, _ *mcp.CallToolRequest, in DoctorInput) (*mcp.CallToolResult, DoctorOutput, error) {
 	repo := strings.TrimSpace(in.Repo)
+	forgeFamily := strings.TrimSpace(in.Forge)
 	if repo == "" {
 		repo = strings.TrimSpace(r.getenv("GITHUB_REPOSITORY"))
 	}
 	if repo == "" {
-		return nil, DoctorOutput{}, fmt.Errorf("repo is required: pass repo as owner/name or set GITHUB_REPOSITORY in the environment")
+		if repo = strings.TrimSpace(r.getenv("CI_PROJECT_PATH")); repo != "" && forgeFamily == "" {
+			forgeFamily = "gitlab"
+		}
+	}
+	if repo == "" {
+		return nil, DoctorOutput{}, fmt.Errorf("repo is required: pass repo (owner/name, or a nested namespace/project path for GitLab) or set GITHUB_REPOSITORY / CI_PROJECT_PATH in the environment")
 	}
 
-	report, err := r.api.OnboardingReadiness(ctx, repo)
+	report, err := r.api.OnboardingReadiness(ctx, repo, forgeFamily)
 	if err != nil {
 		// Map the two backend 4xx surfaces onto operator-actionable tool
 		// errors rather than a bare "HTTP 401 (authentication_required)".
+		// The backend's validation message already names the accepted repo
+		// shapes per forge and the forge enum, so it is wrapped, not restated.
 		var ae *apiError
 		if errors.As(err, &ae) {
 			switch ae.Code {
 			case "authentication_required":
 				return nil, DoctorOutput{}, fmt.Errorf("onboarding readiness: %w: set FISHHAWK_API_TOKEN to an authenticated operator token", err)
 			case "validation_failed":
-				return nil, DoctorOutput{}, fmt.Errorf("onboarding readiness: %w: repo must be in owner/name format", err)
+				return nil, DoctorOutput{}, fmt.Errorf("onboarding readiness: %w: check the repo shape for the forge (owner/name on GitHub; namespace/project, nested groups allowed, on GitLab) and that forge is github or gitlab", err)
 			}
 		}
 		return nil, DoctorOutput{}, fmt.Errorf("onboarding readiness: %w", err)

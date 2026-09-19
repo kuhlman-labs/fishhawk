@@ -11,11 +11,13 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergegate"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -163,25 +165,61 @@ func TestOnboardingReadiness_AnonymousThroughHandler(t *testing.T) {
 	}
 }
 
-// TestOnboardingReadiness_MalformedRepo asserts a repo missing the owner/name
-// separator is rejected 400 validation_failed.
+// TestOnboardingReadiness_MalformedRepo asserts a repo failing the shared
+// shape rule (account.ProjectPathWellFormed: non-empty namespace, every
+// remaining component non-empty) is rejected 400 validation_failed under BOTH
+// families — the empty/whitespace-component cases (E45.43 / #3348) are refused
+// even with forge=gitlab, where nesting itself is allowed. "owner/name/extra"
+// is still 400 on the DEFAULT (github) family, now via the nested-on-github
+// branch whose message names forge=gitlab as the remedy.
 func TestOnboardingReadiness_MalformedRepo(t *testing.T) {
 	s := newOnboardingServer(t, nil, nil)
 	id := testOperatorIdentity()
-	for _, repo := range []string{"noslash", "", "/name", "owner/", "owner/name/extra"} {
-		w := httptest.NewRecorder()
-		s.handleGetOnboardingReadiness(w, onboardingReq(repo, &id))
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("repo=%q status = %d, want 400:\n%s", repo, w.Code, w.Body.String())
-		}
-		var env errorEnvelope
-		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
-			t.Fatalf("decode error: %v", err)
-		}
-		if env.Error.Code != "validation_failed" {
-			t.Errorf("repo=%q code = %q, want validation_failed", repo, env.Error.Code)
+	for _, repo := range []string{"noslash", "", "/name", "owner/", "a//b", "a/ /b", "a/b/", " / "} {
+		for _, forgeParam := range []string{"", "gitlab"} {
+			w := httptest.NewRecorder()
+			s.handleGetOnboardingReadiness(w, onboardingReqForge(repo, forgeParam, &id))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("repo=%q forge=%q status = %d, want 400:\n%s", repo, forgeParam, w.Code, w.Body.String())
+			}
+			var env errorEnvelope
+			if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+				t.Fatalf("decode error: %v", err)
+			}
+			if env.Error.Code != "validation_failed" {
+				t.Errorf("repo=%q forge=%q code = %q, want validation_failed", repo, forgeParam, env.Error.Code)
+			}
 		}
 	}
+
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, onboardingReq("owner/name/extra", &id))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("nested on default family: status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if env.Error.Code != "validation_failed" || !strings.Contains(env.Error.Message, "forge=gitlab") {
+		t.Errorf("nested on default family: code = %q message = %q, want validation_failed naming forge=gitlab",
+			env.Error.Code, env.Error.Message)
+	}
+}
+
+// onboardingReqForge is onboardingReq plus an optional `forge` query value
+// (omitted from the URL when empty, so the default-family path is exercised
+// exactly as a caller that never sends the parameter).
+func onboardingReqForge(repo, forgeParam string, id *Identity) *http.Request {
+	q := "repo=" + url.QueryEscape(repo)
+	if forgeParam != "" {
+		q += "&forge=" + url.QueryEscape(forgeParam)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v0/onboarding/readiness?"+q, nil)
+	if id != nil {
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, *id))
+	}
+	return req
 }
 
 // TestOnboardingReadiness_Installed asserts the installed-repo happy path:
@@ -812,16 +850,21 @@ func TestOnboardingReadiness_AnonymousBeforeVisibility(t *testing.T) {
 }
 
 // TestOnboardingReadiness_MalformedRepoBeforeVisibility pins the 400-before-403
-// ordering: an authenticated non-admin caller sending repo="owner/name/extra"
-// against a deny-all mirror still gets 400 validation_failed, and the mirror's
-// Visible is never called — the filter must never be handed a malformed key. If
-// the guard were hoisted above the format check this would go 403 (or ask the
-// mirror the malformed key), so the test discriminates.
+// ordering: an authenticated non-admin caller sending repo="owner//name" (an
+// empty component — malformed under BOTH families) against a deny-all mirror
+// still gets 400 validation_failed, and the mirror's Visible is never called —
+// the filter must never be handed a malformed key. If the guard were hoisted
+// above the format check this would go 403 (or ask the mirror the malformed
+// key), so the test discriminates. (Since E45.43 / #3348 "owner/name/extra" is
+// a WELL-FORMED nested path whose github-family rejection depends on when the
+// family is known — see _GitHub_NestedPathRejected_BeforeVisibility and
+// _ForgeFromRegistry_GitHub_NestedPathRejected_AfterVisibility for both
+// orders — so it is no longer this test's vehicle.)
 func TestOnboardingReadiness_MalformedRepoBeforeVisibility(t *testing.T) {
 	vis := newFakeRepoVisibility(map[string]bool{}) // denies everything
 	s := newOnboardingVisServer(t, nil, vis, fakeAccountRoles{role: account.RoleMember}, nil, nil)
 
-	w := runOnboarding(s, "owner/name/extra", memberIdentity())
+	w := runOnboarding(s, "owner//name", memberIdentity())
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (format check precedes visibility):\n%s", w.Code, w.Body.String())
 	}
@@ -1076,7 +1119,10 @@ func mergeGateReadinessFor(t *testing.T, f *mergeGateFixture) mergeGateReadiness
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", code)
 	}
-	return resp.MergeGate
+	if resp.MergeGate == nil {
+		t.Fatalf("merge_gate absent on the github family, want the probed object")
+	}
+	return *resp.MergeGate
 }
 
 // TestOnboardingReadiness_MergeGate_EndToEnd is the CROSS-BOUNDARY test. It
@@ -1449,5 +1495,577 @@ func TestOnboardingReadiness_MergeGate_RequiredViaClassicBypassable(t *testing.T
 	}
 	if mg.Remediation == "" {
 		t.Errorf("Remediation empty, want the narrow-the-bypass step")
+	}
+}
+
+// --- forge-family-aware readiness (E45.43 / #3348) -------------------------
+
+// onboardingNestedGitLabPath is the issue's five-segment project path: the
+// shape the pre-#3348 owner/name rule refused at parameter validation.
+const onboardingNestedGitLabPath = "gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator"
+
+// fakeGitLabForOnboarding is a minimal GitLab v4 stub for the readiness
+// endpoint's gitlab family: GET /api/v4/projects/<path> (project resolve) and
+// GET /api/v4/projects/<path>/repository/files/.fishhawk/workflows.yaml (the
+// Repository Files API). It is a CATCH-ALL handler switching on the DECODED
+// r.URL.Path rather than a mux pattern, because gitlabclient PathEscapes the
+// whole namespaced path into one %2F-bearing segment and ServeMux pattern
+// matching on such a path is ambiguous. It records the decoded project path
+// each call addressed, so a test can assert the FULL nested path reached the
+// forge on both calls.
+type fakeGitLabForOnboarding struct {
+	mu            sync.Mutex
+	projectStatus int
+	fileStatus    int
+	specYAML      string
+	projectPaths  []string
+	filePaths     []string
+}
+
+func newFakeGitLabForOnboarding(specYAML string) *fakeGitLabForOnboarding {
+	return &fakeGitLabForOnboarding{
+		projectStatus: http.StatusOK,
+		fileStatus:    http.StatusOK,
+		specYAML:      specYAML,
+	}
+}
+
+func (f *fakeGitLabForOnboarding) server(t *testing.T) *httptest.Server {
+	t.Helper()
+	const prefix = "/api/v4/projects/"
+	const fileSuffix = "/repository/files/" + githubclient.WorkflowSpecPath
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, prefix) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"404 Not Found"}`))
+			return
+		}
+		rest := strings.TrimPrefix(r.URL.Path, prefix)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if strings.HasSuffix(rest, fileSuffix) {
+			f.filePaths = append(f.filePaths, strings.TrimSuffix(rest, fileSuffix))
+			w.WriteHeader(f.fileStatus)
+			if f.fileStatus != http.StatusOK {
+				_, _ = w.Write([]byte(`{"message":"404 File Not Found"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"file_path":"` + githubclient.WorkflowSpecPath + `","blob_id":"blob_1","encoding":"base64","content":"` +
+				base64.StdEncoding.EncodeToString([]byte(f.specYAML)) + `"}`))
+			return
+		}
+		f.projectPaths = append(f.projectPaths, rest)
+		w.WriteHeader(f.projectStatus)
+		if f.projectStatus != http.StatusOK {
+			_, _ = w.Write([]byte(`{"message":"404 Project Not Found"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":5,"web_url":"` + srvURLPlaceholder + `"}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// srvURLPlaceholder stands in for the project's web_url; the readiness probe
+// never reads it.
+const srvURLPlaceholder = "https://gitlab.example/p"
+
+func (f *fakeGitLabForOnboarding) calls() (projects, files []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.projectPaths...), append([]string(nil), f.filePaths...)
+}
+
+// gitlabForgeOver wraps the stub in the REAL forgegitlab.Forge, the adapter
+// the production ForgeResolver hands back for the "gitlab" family.
+func gitlabForgeOver(glSrv *httptest.Server) *forgegitlab.Forge {
+	return forgegitlab.New(glSrv.URL, forgegitlab.NewStaticCredentialProvider("glpat-test"),
+		forgegitlab.WithHTTPClient(glSrv.Client()))
+}
+
+// newOnboardingGitLabServer builds a Server whose ForgeResolver answers the
+// gitlab family with glForge (or errors when glForge is nil, the
+// unconfigured-forge posture), with an optional GitHub fake, provider resolver
+// and reviewer set. resolverErr, when non-nil, is returned by the ForgeResolver
+// regardless of glForge.
+func newOnboardingGitLabServer(t *testing.T, ghSrv *httptest.Server, glForge forge.Forge,
+	providers ProviderResolver, reviewers ReviewerSet) *Server {
+	t.Helper()
+	cfg := Config{
+		Addr:          "127.0.0.1:0",
+		RepoProviders: providers,
+		PlanReviewers: reviewers,
+		ForgeResolver: func(id string) (forge.Forge, error) {
+			if id == observationForgeGitLab && glForge != nil {
+				return glForge, nil
+			}
+			return nil, errors.New("no forge registered for " + id + " in this test")
+		},
+	}
+	if ghSrv != nil {
+		cfg.GitHub = &githubclient.Client{
+			BaseURL: ghSrv.URL,
+			Tokens:  &ghTokensStub{tok: "ghs_test"},
+			HTTP:    &http.Client{Timeout: 5 * time.Second},
+			AppJWT:  func() (string, error) { return "gha_app_jwt_test", nil },
+		}
+	}
+	return New(cfg)
+}
+
+// rawReadiness runs the request and decodes the RAW 200 body into a map, so a
+// test can assert key PRESENCE/ABSENCE (`merge_gate`, `installation_id`)
+// rather than only zero values on the typed struct.
+func rawReadiness(t *testing.T, s *Server, req *http.Request) map[string]any {
+	t.Helper()
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw body: %v\n%s", err, w.Body.String())
+	}
+	return raw
+}
+
+func rawObject(t *testing.T, raw map[string]any, key string) map[string]any {
+	t.Helper()
+	obj, ok := raw[key].(map[string]any)
+	if !ok {
+		t.Fatalf("body[%q] = %v (%T), want an object", key, raw[key], raw[key])
+	}
+	return obj
+}
+
+// TestOnboardingReadiness_GitLab_NestedPath_EndToEnd is the CROSS-BOUNDARY
+// test for the gitlab family: HTTP request → handler → the REAL
+// forgegitlab.Forge → the v4 stub → decoded JSON. forge=gitlab plus the
+// issue's five-segment path answers 200 (the pre-#3348 rule refused it 400);
+// the RAW body carries forge=gitlab, app.installed with the gitlab note and NO
+// installation_id, a fetched+valid spec, both declared reviewers, scopes — and
+// NO merge_gate key at all (the counterfactual vehicle for the omission: a
+// zero-valued merge gate assigned on the gitlab arm turns this red). The stub
+// must have seen the FULL nested path on both the project and the file call,
+// so a RepoRef-splitting regression turns it red too.
+func TestOnboardingReadiness_GitLab_NestedPath_EndToEnd(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	reviewers := fakeReviewerSet{providers: map[string]PlanReviewer{
+		"anthropic": &fakePlanReviewer{},
+		"codex":     &fakePlanReviewer{},
+	}}
+	s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, reviewers)
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReqForge(onboardingNestedGitLabPath, "gitlab", &id))
+	if raw["repo"] != onboardingNestedGitLabPath {
+		t.Errorf("repo = %v, want the nested path echoed", raw["repo"])
+	}
+	if raw["forge"] != "gitlab" {
+		t.Errorf("forge = %v, want gitlab", raw["forge"])
+	}
+	app := rawObject(t, raw, "app")
+	if app["installed"] != true {
+		t.Errorf("app.installed = %v, want true", app["installed"])
+	}
+	if app["note"] != onboardingGitLabInstalledNote {
+		t.Errorf("app.note = %v, want %q", app["note"], onboardingGitLabInstalledNote)
+	}
+	if _, present := app["installation_id"]; present {
+		t.Errorf("app.installation_id present (%v); no App installation applies on GitLab", app["installation_id"])
+	}
+	sp := rawObject(t, raw, "spec")
+	if sp["source"] != "fetched" || sp["valid"] != true {
+		t.Errorf("spec = %v, want fetched + valid", sp)
+	}
+	rv, _ := raw["reviewers"].([]any)
+	if len(rv) != 2 {
+		t.Errorf("reviewers = %v, want the two declared tuples", raw["reviewers"])
+	}
+	if _, present := raw["scopes"]; !present {
+		t.Errorf("scopes absent, want the scope rung on every family")
+	}
+	if mg, present := raw["merge_gate"]; present {
+		t.Errorf("merge_gate present on the gitlab family: %v; the surface is never read there and must not render", mg)
+	}
+	projects, files := gl.calls()
+	if len(projects) != 1 || projects[0] != onboardingNestedGitLabPath {
+		t.Errorf("project calls = %v, want exactly one with the full nested path", projects)
+	}
+	if len(files) != 1 || files[0] != onboardingNestedGitLabPath {
+		t.Errorf("file calls = %v, want exactly one with the full nested path", files)
+	}
+}
+
+// TestOnboardingReadiness_GitLab_ProjectNotVisible: a 404 on the project
+// resolve (forge.ErrNotInstalled) yields installed:false with the reason
+// naming the register command, an unavailable spec, no merge_gate key, and
+// ZERO file reads.
+func TestOnboardingReadiness_GitLab_ProjectNotVisible(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gl.projectStatus = http.StatusNotFound
+	s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, nil)
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReqForge(onboardingNestedGitLabPath, "gitlab", &id))
+	app := rawObject(t, raw, "app")
+	if app["installed"] != false || app["reason"] != onboardingGitLabProjectNotVisible {
+		t.Errorf("app = %v, want installed:false with the register-command reason", app)
+	}
+	if !strings.Contains(onboardingGitLabProjectNotVisible, "fishhawkd installation register --provider gitlab") {
+		t.Errorf("reason does not name the register command: %q", onboardingGitLabProjectNotVisible)
+	}
+	sp := rawObject(t, raw, "spec")
+	if sp["source"] != "unavailable" || sp["note"] == "" {
+		t.Errorf("spec = %v, want unavailable with a note", sp)
+	}
+	if _, present := raw["merge_gate"]; present {
+		t.Errorf("merge_gate present on the gitlab family")
+	}
+	if rv, _ := raw["reviewers"].([]any); len(rv) != 0 {
+		t.Errorf("reviewers = %v, want empty", raw["reviewers"])
+	}
+	projects, files := gl.calls()
+	if len(projects) != 1 || len(files) != 0 {
+		t.Errorf("calls = project:%v file:%v, want one project resolve and ZERO file reads", projects, files)
+	}
+}
+
+// TestOnboardingReadiness_GitLab_SpecNotFound: project resolvable, spec file
+// 404 → source unavailable with the not-found note, reviewers empty.
+func TestOnboardingReadiness_GitLab_SpecNotFound(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gl.fileStatus = http.StatusNotFound
+	s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, nil)
+	id := testOperatorIdentity()
+
+	code, resp := decodeReadiness(t, s, onboardingReqForge("acme/platform/widgets", "gitlab", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if !resp.App.Installed {
+		t.Errorf("App = %+v, want installed", resp.App)
+	}
+	if resp.Spec.Source != "unavailable" || !strings.Contains(resp.Spec.Note, "no workflow spec found") {
+		t.Errorf("Spec = %+v, want unavailable + not-found note", resp.Spec)
+	}
+	if len(resp.Reviewers) != 0 {
+		t.Errorf("Reviewers = %+v, want empty", resp.Reviewers)
+	}
+	if resp.MergeGate != nil {
+		t.Errorf("MergeGate = %+v, want nil on gitlab", resp.MergeGate)
+	}
+}
+
+// TestOnboardingReadiness_GitLab_SpecInvalid / _SpecMalformed: the fetched
+// bytes reach the shared classifier — semantic-invalid and YAML-broken specs
+// are fetched + valid:false with an error, and the reviewer probe never runs.
+func TestOnboardingReadiness_GitLab_SpecInvalid(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingInvalidSpecYAML)
+	s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, nil)
+	id := testOperatorIdentity()
+
+	code, resp := decodeReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if resp.Spec.Source != "fetched" || resp.Spec.Valid || resp.Spec.Error == "" {
+		t.Errorf("Spec = %+v, want fetched + invalid with an error", resp.Spec)
+	}
+	if len(resp.Reviewers) != 0 {
+		t.Errorf("Reviewers = %+v, want empty on an invalid spec", resp.Reviewers)
+	}
+}
+
+func TestOnboardingReadiness_GitLab_SpecMalformed(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingMalformedSpecYAML)
+	s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, nil)
+	id := testOperatorIdentity()
+
+	code, resp := decodeReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if resp.Spec.Source != "fetched" || resp.Spec.Valid || resp.Spec.Error == "" {
+		t.Errorf("Spec = %+v, want fetched + invalid with a parse error", resp.Spec)
+	}
+	if len(resp.Reviewers) != 0 {
+		t.Errorf("Reviewers = %+v, want empty on a malformed spec", resp.Reviewers)
+	}
+}
+
+// TestOnboardingReadiness_GitLab_ForgeUnconfigured: the ForgeResolver errors
+// for "gitlab" → still 200, installed:false with the config-gap reason, spec
+// unavailable, no merge_gate.
+func TestOnboardingReadiness_GitLab_ForgeUnconfigured(t *testing.T) {
+	s := newOnboardingGitLabServer(t, nil, nil, nil, nil) // resolver errors for every id
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	app := rawObject(t, raw, "app")
+	if app["installed"] != false || app["reason"] != onboardingGitLabForgeUnconfigured {
+		t.Errorf("app = %v, want installed:false with the unconfigured reason", app)
+	}
+	sp := rawObject(t, raw, "spec")
+	if sp["source"] != "unavailable" || sp["note"] != onboardingGitLabForgeUnconfigured {
+		t.Errorf("spec = %v, want unavailable with the unconfigured note", sp)
+	}
+	if _, present := raw["merge_gate"]; present {
+		t.Errorf("merge_gate present on the gitlab family")
+	}
+}
+
+// TestOnboardingReadiness_GitLab_ForgeResolverTypedNil: a resolver returning a
+// typed nil (*forgegitlab.Forge)(nil) inside a non-nil interface is the same
+// as unconfigured — never a nil-pointer panic. Counterfactual vehicle for the
+// isNilForge guard in onboardingForgeFor.
+func TestOnboardingReadiness_GitLab_ForgeResolverTypedNil(t *testing.T) {
+	s := newOnboardingGitLabServer(t, nil, nil, nil, nil)
+	// Override the resolver so it hands back the typed nil inside a non-nil
+	// interface — the shape a plain `f == nil` check misses.
+	s.cfg.ForgeResolver = func(string) (forge.Forge, error) { return (*forgegitlab.Forge)(nil), nil }
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	app := rawObject(t, raw, "app")
+	if app["installed"] != false || app["reason"] != onboardingGitLabForgeUnconfigured {
+		t.Errorf("app = %v, want installed:false with the unconfigured reason (typed nil)", app)
+	}
+}
+
+// TestOnboardingReadiness_ForgeFromRegistry_GitLab: no forge param, the
+// account registry answers gitlab → the gitlab family runs (the stub's project
+// call is observed, the GitHub fake's installation call is not).
+func TestOnboardingReadiness_ForgeFromRegistry_GitLab(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gh := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	providers := &fakeProviderResolver{provider: "gitlab", found: true}
+	s := newOnboardingGitLabServer(t, gh.server(t), gitlabForgeOver(gl.server(t)), providers, nil)
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReqForge("acme/platform/widgets", "", &id))
+	if raw["forge"] != "gitlab" {
+		t.Errorf("forge = %v, want gitlab (registry-resolved)", raw["forge"])
+	}
+	if _, present := raw["merge_gate"]; present {
+		t.Errorf("merge_gate present on the registry-resolved gitlab family")
+	}
+	projects, _ := gl.calls()
+	if len(projects) != 1 {
+		t.Errorf("gitlab project calls = %v, want 1", projects)
+	}
+	if gh.installationCalls != 0 {
+		t.Errorf("github installation calls = %d, want 0", gh.installationCalls)
+	}
+}
+
+// TestOnboardingReadiness_ForgeFromRegistry_NotFound_DefaultsGitHub: no forge
+// param, the registry does not know the owner → github family (the legacy
+// default): the GitHub fake's installation call is observed and the raw body
+// carries the merge_gate key.
+func TestOnboardingReadiness_ForgeFromRegistry_NotFound_DefaultsGitHub(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gh := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	providers := &fakeProviderResolver{found: false}
+	s := newOnboardingGitLabServer(t, gh.server(t), gitlabForgeOver(gl.server(t)), providers, nil)
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReqForge("x/y", "", &id))
+	if raw["forge"] != "github" {
+		t.Errorf("forge = %v, want github (not-found default)", raw["forge"])
+	}
+	if _, present := raw["merge_gate"]; !present {
+		t.Errorf("merge_gate ABSENT on the github family; the pointer change must not drop it")
+	}
+	if gh.installationCalls != 1 {
+		t.Errorf("github installation calls = %d, want 1", gh.installationCalls)
+	}
+	if projects, _ := gl.calls(); len(projects) != 0 {
+		t.Errorf("gitlab project calls = %v, want 0", projects)
+	}
+}
+
+// TestOnboardingReadiness_ForgeFromRegistry_Fault: a resolver STORE fault after
+// visibility → 503 service_unavailable with ZERO forge calls on either family.
+// Counterfactual vehicle for the error return in onboardingForgeFamily.
+func TestOnboardingReadiness_ForgeFromRegistry_Fault(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gh := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	providers := &fakeProviderResolver{err: errors.New("accounts store down")}
+	s := newOnboardingGitLabServer(t, gh.server(t), gitlabForgeOver(gl.server(t)), providers, nil)
+	id := testOperatorIdentity() // admin-bypass posture: the visibility gate never asks the resolver
+
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, onboardingReqForge("x/y", "", &id))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if code := errorCode(t, w); code != "service_unavailable" {
+		t.Errorf("error.code = %q, want service_unavailable", code)
+	}
+	projects, _ := gl.calls()
+	if gh.installationCalls != 0 || len(projects) != 0 {
+		t.Errorf("forge calls = github:%d gitlab:%v, want 0/0", gh.installationCalls, projects)
+	}
+}
+
+// TestOnboardingReadiness_ForgeParam_Invalid: forge=bitbucket → 400
+// validation_failed on field forge, BEFORE visibility (mirror never asked) and
+// with ZERO forge calls. Counterfactual vehicle for the forge enum check: with
+// it deleted the value falls into the github branch and answers 200.
+func TestOnboardingReadiness_ForgeParam_Invalid(t *testing.T) {
+	gh := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	vis := newFakeRepoVisibility(map[string]bool{"x/y": true}) // would ALLOW if reached
+	s := newOnboardingVisServer(t, gh.server(t), vis, fakeAccountRoles{role: account.RoleMember}, nil, nil)
+
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, onboardingReqForge("x/y", "bitbucket", ptrIdentity(memberIdentity())))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if env.Error.Code != "validation_failed" || env.Error.Details["field"] != "forge" {
+		t.Errorf("error = %+v, want validation_failed on field forge", env.Error)
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror Visible calls = %d, want 0 (forge validated before visibility)", vis.callCount())
+	}
+	if gh.installationCalls != 0 {
+		t.Errorf("github installation calls = %d, want 0", gh.installationCalls)
+	}
+}
+
+func ptrIdentity(id Identity) *Identity { return &id }
+
+// TestOnboardingReadiness_GitHub_NestedPathRejected_BeforeVisibility pins
+// approval condition 1's first order: with forge=github EXPLICIT, a/b/c is
+// rejected 400 validation_failed (message naming forge=gitlab) BEFORE
+// enforceRepoVisibility — a deny-all mirror is never asked, and no GitHub call
+// is made. Counterfactual vehicle for the explicit-github nested rejection:
+// with it deleted the request reaches visibility and goes 403 here.
+func TestOnboardingReadiness_GitHub_NestedPathRejected_BeforeVisibility(t *testing.T) {
+	gh := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	vis := newFakeRepoVisibility(map[string]bool{}) // denies everything
+	s := newOnboardingVisServer(t, gh.server(t), vis, fakeAccountRoles{role: account.RoleMember}, nil, nil)
+
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, onboardingReqForge("a/b/c", "github", ptrIdentity(memberIdentity())))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (explicit github nested check precedes visibility):\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if env.Error.Code != "validation_failed" || !strings.Contains(env.Error.Message, "forge=gitlab") {
+		t.Errorf("error = %+v, want validation_failed naming forge=gitlab", env.Error)
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror Visible calls = %d, want 0", vis.callCount())
+	}
+	if gh.installationCalls != 0 || gh.specCalls != 0 {
+		t.Errorf("github calls = install:%d spec:%d, want 0/0", gh.installationCalls, gh.specCalls)
+	}
+}
+
+// TestOnboardingReadiness_ForgeFromRegistry_GitHub_NestedPathRejected_AfterVisibility
+// pins approval condition 1's second order: with forge OMITTED the family is
+// only known after registry resolution, which follows visibility — so a
+// registry-resolved github family rejects a/b/c 400 AFTER the mirror was
+// consulted (allowed sub-case: Visible called once, then 400 with zero GitHub
+// calls; denied sub-case: 403 wins and the nested check is never reached).
+// Counterfactual vehicle for the registry-resolved nested rejection: deleted,
+// the allowed sub-case answers 200 with Name "b/c".
+func TestOnboardingReadiness_ForgeFromRegistry_GitHub_NestedPathRejected_AfterVisibility(t *testing.T) {
+	providers := &fakeProviderResolver{provider: "github", found: true}
+
+	t.Run("visible_then_400", func(t *testing.T) {
+		gh := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+		vis := newFakeRepoVisibility(map[string]bool{"a/b/c": true})
+		s := newOnboardingVisServer(t, gh.server(t), vis, fakeAccountRoles{role: account.RoleMember}, providers, nil)
+
+		w := runOnboarding(s, "a/b/c", memberIdentity())
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (registry-resolved github rejects the nested path):\n%s", w.Code, w.Body.String())
+		}
+		var env errorEnvelope
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode error: %v", err)
+		}
+		if env.Error.Code != "validation_failed" || !strings.Contains(env.Error.Message, "forge=gitlab") {
+			t.Errorf("error = %+v, want validation_failed naming forge=gitlab", env.Error)
+		}
+		if vis.callCount() != 1 {
+			t.Errorf("mirror Visible calls = %d, want 1 (visibility ran BEFORE the family was known)", vis.callCount())
+		}
+		if gh.installationCalls != 0 || gh.specCalls != 0 {
+			t.Errorf("github calls = install:%d spec:%d, want 0/0", gh.installationCalls, gh.specCalls)
+		}
+	})
+
+	t.Run("denied_403_wins", func(t *testing.T) {
+		gh := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+		vis := newFakeRepoVisibility(map[string]bool{}) // denies everything
+		s := newOnboardingVisServer(t, gh.server(t), vis, fakeAccountRoles{role: account.RoleMember}, providers, nil)
+
+		w := runOnboarding(s, "a/b/c", memberIdentity())
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403 (visibility precedes the registry-resolved nested check):\n%s", w.Code, w.Body.String())
+		}
+		if gh.installationCalls != 0 {
+			t.Errorf("github installation calls = %d, want 0", gh.installationCalls)
+		}
+	})
+}
+
+// TestOnboardingReadiness_GitHub_MergeGateKeyPresent guards the pointer change
+// on the response type: the github family still SERIALIZES the merge_gate key
+// (raw-body assertion), and the body names forge=github.
+func TestOnboardingReadiness_GitHub_MergeGateKeyPresent(t *testing.T) {
+	gh := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	s := newOnboardingServer(t, gh.server(t), nil)
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReq("x/y", &id))
+	if raw["forge"] != "github" {
+		t.Errorf("forge = %v, want github", raw["forge"])
+	}
+	mg := rawObject(t, raw, "merge_gate")
+	if mg["status"] == "" || mg["status"] == nil {
+		t.Errorf("merge_gate.status = %v, want a verdict on the github family", mg["status"])
+	}
+	app := rawObject(t, raw, "app")
+	if _, present := app["note"]; present {
+		t.Errorf("app.note present on github (%v); the note is gitlab-only", app["note"])
+	}
+}
+
+// TestOnboardingReadiness_ExplicitForgeOverridesRegistry: forge=github with a
+// registry that says gitlab → the github path runs (installation call
+// observed, no gitlab project call, merge_gate present).
+func TestOnboardingReadiness_ExplicitForgeOverridesRegistry(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gh := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	providers := &fakeProviderResolver{provider: "gitlab", found: true}
+	s := newOnboardingGitLabServer(t, gh.server(t), gitlabForgeOver(gl.server(t)), providers, nil)
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReqForge("x/y", "github", &id))
+	if raw["forge"] != "github" {
+		t.Errorf("forge = %v, want github (explicit overrides registry)", raw["forge"])
+	}
+	if _, present := raw["merge_gate"]; !present {
+		t.Errorf("merge_gate absent on the explicit github family")
+	}
+	if gh.installationCalls != 1 {
+		t.Errorf("github installation calls = %d, want 1", gh.installationCalls)
+	}
+	if projects, _ := gl.calls(); len(projects) != 0 {
+		t.Errorf("gitlab project calls = %v, want 0", projects)
 	}
 }
