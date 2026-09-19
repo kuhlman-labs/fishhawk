@@ -476,6 +476,93 @@ func TestRunInstallationList_RendersNoUnboundMarkerForGitHub(t *testing.T) {
 	}
 }
 
+// TestRunInstallationRegister_PersistsDistinctBaseURLs is the cross-layer
+// #2976 counterfactual vehicle: CLI flags → account.RegisterInstallation →
+// sqlc UpsertInstallation → Postgres → the HAND-WRITTEN accountdb.ListInstallations
+// scan (backend/internal/account/db/queries.sql.go) → `installation list`
+// stdout. Every existing test registers with BOTH optional base URLs omitted,
+// so a transposition of the two adjacent scan targets, or of forgePtr/oauthPtr
+// in RegisterInstallation's UpsertInstallationParams literal, would be
+// invisible. Two DIFFERENT hostnames are used so a swap cannot be masked by
+// equal values.
+func TestRunInstallationRegister_PersistsDistinctBaseURLs(t *testing.T) {
+	url := pgtest.NewURL(t)
+	mustCreateAccount(t, url, "gitlab", "acme")
+
+	const forgeURL = "https://forge.example.test"
+	const oauthURL = "https://oauth.example.test"
+	registerInstallationWithBaseURLs(t, url, "gitlab", "acme", "gitlab:4242", "acme/widgets", forgeURL, oauthURL)
+
+	// A second installation WITHOUT base URLs: its row must carry both
+	// pointers nil, not an accidental carry-over from the first registration.
+	mustRegisterInstallation(t, url, "gitlab", "acme", "gitlab:9999", "acme/other")
+
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+
+	rows, err := accountdb.New(pool).ListInstallations(context.Background())
+	if err != nil {
+		t.Fatalf("ListInstallations: %v", err)
+	}
+	var withURLs, withoutURLs *accountdb.ListInstallationsRow
+	for i := range rows {
+		switch rows[i].InstallationRef {
+		case "gitlab:4242":
+			withURLs = &rows[i]
+		case "gitlab:9999":
+			withoutURLs = &rows[i]
+		}
+	}
+	if withURLs == nil {
+		t.Fatal("ListInstallations did not return the gitlab:4242 row")
+	}
+	if withURLs.ForgeBaseUrl == nil || *withURLs.ForgeBaseUrl != forgeURL {
+		t.Errorf("gitlab:4242 ForgeBaseUrl = %v, want %q", derefOrNil(withURLs.ForgeBaseUrl), forgeURL)
+	}
+	if withURLs.OauthBaseUrl == nil || *withURLs.OauthBaseUrl != oauthURL {
+		t.Errorf("gitlab:4242 OauthBaseUrl = %v, want %q", derefOrNil(withURLs.OauthBaseUrl), oauthURL)
+	}
+
+	if withoutURLs == nil {
+		t.Fatal("ListInstallations did not return the gitlab:9999 row")
+	}
+	if withoutURLs.ForgeBaseUrl != nil {
+		t.Errorf("gitlab:9999 ForgeBaseUrl = %q, want nil", *withoutURLs.ForgeBaseUrl)
+	}
+	if withoutURLs.OauthBaseUrl != nil {
+		t.Errorf("gitlab:9999 OauthBaseUrl = %q, want nil", *withoutURLs.OauthBaseUrl)
+	}
+
+	// The `installation list` verb renders only FORGE_BASE_URL
+	// (installation.go's runInstallationList / renderInstallationProjectPath
+	// column layout) — the oauth URL never appears in this stdout by design,
+	// so its ABSENCE here is expected, not a transposition tell on its own;
+	// the positive oauth-side assertion above (against the real scan) is what
+	// discriminates a swap.
+	listed := captureStdout(t, func() {
+		var log bytes.Buffer
+		if got := runInstallation([]string{"list", "--db", url}, &log); got != exitOK {
+			t.Fatalf("list exit = %d; log:\n%s", got, log.String())
+		}
+	})
+	if !strings.Contains(listed, forgeURL) {
+		t.Errorf("list %q missing the forge base url %q", listed, forgeURL)
+	}
+	if strings.Contains(listed, oauthURL) {
+		t.Errorf("list %q leaked the oauth base url %q (transposition tell)", listed, oauthURL)
+	}
+}
+
+func derefOrNil(s *string) any {
+	if s == nil {
+		return nil
+	}
+	return *s
+}
+
 func mustCreateAccount(t *testing.T, url, provider, key string) {
 	t.Helper()
 	var out bytes.Buffer
@@ -496,5 +583,27 @@ func mustRegisterInstallation(t *testing.T, url, provider, key, ref, projectPath
 	var out bytes.Buffer
 	if got := runInstallation(args, &out); got != exitOK {
 		t.Fatalf("mustRegisterInstallation %s/%s/%s exit = %d; log:\n%s", provider, key, ref, got, out.String())
+	}
+}
+
+// registerInstallationWithBaseURLs is a sibling of mustRegisterInstallation
+// that additionally supplies --forge-base-url / --oauth-base-url when
+// non-empty, keeping every existing mustRegisterInstallation call site
+// unchanged.
+func registerInstallationWithBaseURLs(t *testing.T, url, provider, key, ref, projectPath, forgeBaseURL, oauthBaseURL string) {
+	t.Helper()
+	args := []string{"register", "--db", url, "--provider", provider, "--account-key", key, "--installation-ref", ref}
+	if projectPath != "" {
+		args = append(args, "--project-path", projectPath)
+	}
+	if forgeBaseURL != "" {
+		args = append(args, "--forge-base-url", forgeBaseURL)
+	}
+	if oauthBaseURL != "" {
+		args = append(args, "--oauth-base-url", oauthBaseURL)
+	}
+	var out bytes.Buffer
+	if got := runInstallation(args, &out); got != exitOK {
+		t.Fatalf("registerInstallationWithBaseURLs %s/%s/%s exit = %d; log:\n%s", provider, key, ref, got, out.String())
 	}
 }
