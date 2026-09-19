@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -328,7 +329,7 @@ func TestTriggerDeploy_UnparseableSpec_FailsStage(t *testing.T) {
 
 // (7) github_actions with no installation_id fails the stage (cannot dispatch).
 func TestTriggerDeploy_GitHubActions_NoInstallationID_FailsStage(t *testing.T) {
-	s, _, rr, _ := newApprovalServer(t)
+	s, _, rr, au := newApprovalServer(t)
 	_, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
 	stage, _ := seedDispatchedDeploy(rr, deploySpecNoConstraints, nil)
@@ -339,6 +340,130 @@ func TestTriggerDeploy_GitHubActions_NoInstallationID_FailsStage(t *testing.T) {
 	}
 	if got.State != run.StageStateFailed {
 		t.Fatalf("stage state = %q, want failed (no installation id)", got.State)
+	}
+	// The non-GitLab arm keeps today's message byte-for-byte (#3465): the
+	// GitLab remedy is a SEPARATE branch ahead of it, not a rewording.
+	p := auditPayload(t, au, "deployment_dispatch_failed")
+	if p["reason"] != "deploy trigger: run has no installation_id; cannot dispatch the deploy workflow" {
+		t.Errorf("reason = %q, want the unchanged no-installation_id message", p["reason"])
+	}
+	if _, has := p["remedy"]; has {
+		t.Errorf("remedy key present on a non-GitLab run: %v", p["remedy"])
+	}
+}
+
+// TestIsGitLabRun_Table pins the two detection arms the deploy trigger's
+// GitLab remedy keys on (#3465) — RunnerKind gitlab_ci OR a gitlab: scheme
+// installation_ref — via the shared runForge classifier, and the GitHub
+// shapes (bare-decimal, empty, nil ref; nil run) that stay false.
+func TestIsGitLabRun_Table(t *testing.T) {
+	ref := func(v string) *string { return &v }
+	cases := []struct {
+		name string
+		r    *run.Run
+		want bool
+	}{
+		{"gitlab_ci runner kind, nil ref", &run.Run{RunnerKind: run.RunnerKindGitLabCI}, true},
+		{"local runner kind, gitlab ref", &run.Run{RunnerKind: run.RunnerKindLocal, InstallationRef: ref("gitlab:4242")}, true},
+		{"github_actions, bare decimal ref", &run.Run{RunnerKind: run.RunnerKindGitHubActions, InstallationRef: ref("12345")}, false},
+		{"nil ref", &run.Run{}, false},
+		{"empty ref", &run.Run{InstallationRef: ref("")}, false},
+		{"nil run", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isGitLabRun(tc.r); got != tc.want {
+				t.Errorf("isGitLabRun = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTriggerDeploy_GitHubActions_GitLabRun_NamesWebhookRemedy: a GitLab-
+// created run (either detection arm) under the github_actions delegate with
+// the GitHub client WIRED fails category C with ZERO outbound calls and a
+// deployment_dispatch_failed row whose reason names the webhook remedy
+// (#3465). Counterfactual vehicle: with the isGitLabRun branch deleted the
+// gitlab_ci arm (which carries an installation id) reaches the stub and
+// parks, and the ref arm draws the generic no-installation_id message.
+func TestTriggerDeploy_GitHubActions_GitLabRun_NamesWebhookRemedy(t *testing.T) {
+	cases := []struct {
+		name       string
+		runnerKind string
+		instRef    string
+		installID  *int64
+	}{
+		{"runner_kind gitlab_ci", run.RunnerKindGitLabCI, "", instID(99)},
+		{"installation_ref gitlab:", run.RunnerKindLocal, "gitlab:4242", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, rr, au := newApprovalServer(t)
+			stub, gh := newDeployTriggerGitHub(t)
+			s.cfg.GitHub = gh
+			stage, runRow := seedDispatchedDeploy(rr, deploySpecNoConstraints, tc.installID)
+			runRow.RunnerKind = tc.runnerKind
+			if tc.instRef != "" {
+				ref := tc.instRef
+				runRow.InstallationRef = &ref
+			}
+
+			got, err := s.triggerDeploy(context.Background(), stage)
+			if err != nil {
+				t.Fatalf("triggerDeploy: %v", err)
+			}
+			if got.State != run.StageStateFailed {
+				t.Fatalf("stage state = %q, want failed", got.State)
+			}
+			if got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+				t.Errorf("failure category = %v, want C", got.FailureCategory)
+			}
+			if stub.hits() != 0 {
+				t.Errorf("outbound GitHub requests = %d, want 0 (GitLab run must never dispatch)", stub.hits())
+			}
+			if n := countAppendedCategory(au, "deployment_dispatch_failed"); n != 1 {
+				t.Fatalf("deployment_dispatch_failed entries = %d, want 1", n)
+			}
+			p := auditPayload(t, au, "deployment_dispatch_failed")
+			reason, _ := p["reason"].(string)
+			if !strings.Contains(reason, "executor.delegate.target: webhook") {
+				t.Errorf("reason = %q, want it to name executor.delegate.target: webhook", reason)
+			}
+			if p["runner_kind"] != tc.runnerKind {
+				t.Errorf("runner_kind = %v, want %q", p["runner_kind"], tc.runnerKind)
+			}
+			if p["installation_ref"] != tc.instRef {
+				t.Errorf("installation_ref = %v, want %q", p["installation_ref"], tc.instRef)
+			}
+			if p["remedy"] != "executor.delegate.target: webhook" {
+				t.Errorf("remedy = %v, want executor.delegate.target: webhook", p["remedy"])
+			}
+		})
+	}
+}
+
+// TestTriggerDeploy_GitHubActions_GitLabRun_NoGitHubClient_StillFails pins
+// the PLACEMENT of the GitLab check ahead of the cfg.GitHub == nil guard
+// (#3465): on a GitLab-only deployment (no GitHub client) the stage FAILS
+// with the remedy instead of parking at dispatched forever.
+// TestTriggerDeploy_GitHubActions_NilClient_StaysDispatched remains the
+// non-GitLab control for that guard.
+func TestTriggerDeploy_GitHubActions_GitLabRun_NoGitHubClient_StillFails(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	s.cfg.GitHub = nil
+	stage, runRow := seedDispatchedDeploy(rr, deploySpecNoConstraints, nil)
+	runRow.RunnerKind = run.RunnerKindGitLabCI
+
+	got, err := s.triggerDeploy(context.Background(), stage)
+	if err != nil {
+		t.Fatalf("triggerDeploy: %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Fatalf("stage state = %q, want failed (GitLab run must not park on a GitLab-only deployment)", got.State)
+	}
+	p := auditPayload(t, au, "deployment_dispatch_failed")
+	if p["remedy"] != "executor.delegate.target: webhook" {
+		t.Errorf("remedy = %v, want executor.delegate.target: webhook", p["remedy"])
 	}
 }
 

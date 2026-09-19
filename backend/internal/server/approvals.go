@@ -28,6 +28,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
 
 // AuditCompleteCheckName is the reserved name for the
@@ -4909,10 +4910,18 @@ func (s *Server) checkDeployPreflight(w http.ResponseWriter, r *http.Request, st
 	for _, up := range requiredUp {
 		switch up {
 		case "ci_green":
-			if !s.deployCIGreen(ctx, runRow) {
-				s.refuseDeploy(w, r, stage, "deploy_upstream_not_satisfied",
-					"required upstream ci_green is not satisfied: not every required status check has reported green on the implement stage",
-					map[string]any{"required_upstream": up})
+			// The typed verdict (#3465) names WHICH branch refused —
+			// upstream unresolvable, no snapshot, repo unwired, no
+			// implement stage, read failure, pending or failed contexts
+			// — so the 422 is actionable instead of one generic line.
+			// required_upstream is merged on top of the branch details
+			// so every ci_green refusal keeps the key it always carried.
+			if v := s.deployCIGreenVerdict(ctx, runRow); !v.Satisfied {
+				details := map[string]any{"required_upstream": up}
+				for k, val := range v.Details {
+					details[k] = val
+				}
+				s.refuseDeploy(w, r, stage, "deploy_upstream_not_satisfied", v.Reason, details)
 				return false
 			}
 		case "review_merged":
@@ -5253,27 +5262,85 @@ func (s *Server) deployEvalRun(ctx context.Context, runRow *run.Run) *run.Run {
 	return up
 }
 
-// deployCIGreen evaluates the required_upstream `ci_green` pre-flight signal
-// (#1384): every required status check has reported green on the evaluated
-// run's implement stage, reusing aggregateCIGreen over that run's
+// deployUpstreamVerdict is the typed outcome of a required_upstream
+// pre-flight evaluation (#3465). Satisfied=false carries the Reason the 422
+// message names and the machine-readable Details the caller merges under
+// `required_upstream` — every branch sets `branch` so an operator (or a
+// test) can discriminate WHY ci_green refused without parsing prose.
+type deployUpstreamVerdict struct {
+	Satisfied bool
+	Reason    string
+	Details   map[string]any
+}
+
+// deployCIGreenVerdict evaluates the required_upstream `ci_green` pre-flight
+// signal (#1384): every required status check has reported green on the
+// evaluated run's implement stage, reusing aggregateCIGreen over that run's
 // RequiredChecksSnapshot. The evaluated run is resolved by deployEvalRun
 // (E23.11 / #1417) — the current run for an appended deploy, or the referenced
 // upstream feature_change run for a standalone deploy-only release run.
-// Returns false (not satisfied) when the upstream is unresolvable, the
-// snapshot or the stage-check repo is unwired, the implement stage is absent,
-// the check read errors, or the aggregate is nil/false — the safe direction
-// for a pre-execution deploy gate.
-func (s *Server) deployCIGreen(ctx context.Context, runRow *run.Run) bool {
+//
+// Every non-satisfied outcome is a NAMED branch (#3465) so the 422 says which
+// one refused, in this evaluation order:
+//
+//  1. upstream_unresolvable — deployEvalRun returned nil (fail-closed).
+//  2. snapshot_absent       — the evaluated run carries no
+//     RequiredChecksSnapshot. Evaluated BEFORE any stage/check I/O because it
+//     is a property of the run row alone and the one branch that is
+//     PERMANENT: no retry can clear it until the run carries a snapshot. A
+//     snapshot is captured only by the GitHub webhook run-creation path
+//     today; POST /v0/runs, the CLI and MCP runs carry none, and GitLab runs
+//     never receive one (#3490 tracks the GitLab ingester).
+//  3. stage_checks_unavailable — StageCheckRepo is unwired.
+//  4. no_implement_stage    — the evaluated run has no implement stage; the
+//     checks are READ from the implement stage today (the reader-stage move
+//     to review is #3489, not this change).
+//  5. stage_check_read_failed — LatestForStage errored (logged at WARN; the
+//     error text is NOT echoed into the response body).
+//  6. contexts_failed       — aggregateCIGreen is false; failed_contexts
+//     names the required contexts whose latest check is StateFail.
+//  7. contexts_pending      — aggregateCIGreen is nil with a present
+//     snapshot; pending_contexts names the required contexts that are
+//     unreported or non-terminal.
+//
+// The verdict itself is unchanged from the prior bool form — every branch
+// still refuses — only the REASON reported when several conditions hold at
+// once is now deterministic and specific. The safe direction for a
+// pre-execution deploy gate is preserved throughout.
+func (s *Server) deployCIGreenVerdict(ctx context.Context, runRow *run.Run) deployUpstreamVerdict {
+	refuse := func(branch, reason string, extra map[string]any) deployUpstreamVerdict {
+		details := map[string]any{"branch": branch}
+		for k, v := range extra {
+			details[k] = v
+		}
+		return deployUpstreamVerdict{Reason: reason, Details: details}
+	}
+
 	evalRun := s.deployEvalRun(ctx, runRow)
 	if evalRun == nil {
-		return false
+		return refuse("upstream_unresolvable",
+			"required upstream ci_green cannot be evaluated: the referenced upstream run could not be resolved (not found, a different repository, or not a feature_change run); an unevaluable upstream denies the deploy (fail-closed)",
+			nil)
+	}
+	// Branch (2): the permanent one, evaluated before any stage/check I/O.
+	// aggregateCIGreen would fold a nil snapshot to nil (unknown, #2497) and
+	// report it as contexts_pending — but "pending" implies a later retry
+	// can clear it, and for a snapshot-less run nothing ever will.
+	if evalRun.RequiredChecksSnapshot == nil {
+		return refuse("snapshot_absent",
+			fmt.Sprintf("required upstream ci_green is not satisfied: no required-checks snapshot was captured for the evaluated run %s, so there is nothing for ci_green to evaluate against and it cannot clear — retrying this approval will not change the verdict until the run carries a snapshot. A snapshot is captured only by the GitHub webhook run-creation path today; runs created via POST /v0/runs, the CLI or MCP carry none, and GitLab runs never receive one (tracked in #3490)", evalRun.ID),
+			map[string]any{"snapshot_present": false, "evaluated_run_id": evalRun.ID.String()})
 	}
 	if s.cfg.StageCheckRepo == nil {
-		return false
+		return refuse("stage_checks_unavailable",
+			"required upstream ci_green cannot be evaluated: the stage-check store is not wired on this backend, so no required status check can be read; an unevaluable upstream denies the deploy (fail-closed)",
+			nil)
 	}
 	implStage := s.findImplementStage(ctx, evalRun.ID)
 	if implStage == nil {
-		return false
+		return refuse("no_implement_stage",
+			fmt.Sprintf("required upstream ci_green cannot be evaluated: the evaluated run %s has no implement stage, and required status checks are read from the evaluated run's implement stage (the reader stage is under review in #3489); an unevaluable upstream denies the deploy (fail-closed)", evalRun.ID),
+			map[string]any{"evaluated_run_id": evalRun.ID.String()})
 	}
 	checks, err := s.cfg.StageCheckRepo.LatestForStage(ctx, implStage.ID)
 	if err != nil {
@@ -5281,15 +5348,63 @@ func (s *Server) deployCIGreen(ctx context.Context, runRow *run.Run) bool {
 			slog.String("run_id", evalRun.ID.String()),
 			slog.String("error", err.Error()),
 		)
-		return false
+		return refuse("stage_check_read_failed",
+			"required upstream ci_green cannot be evaluated: reading the evaluated run's implement-stage checks failed (see the server log); an unevaluable upstream denies the deploy (fail-closed)",
+			map[string]any{"evaluated_run_id": evalRun.ID.String()})
 	}
-	// A nil RequiredChecksSnapshot now resolves through aggregateCIGreen
-	// returning nil (unknown, #2497), which `g != nil && *g` maps to false
-	// — the same fail-closed verdict the removed `== nil` guard gave, but
-	// routed through the single chokepoint so the aggregate's nil arm is
-	// reachable from a caller and counterfactually testable.
+	// The verdict is aggregateCIGreen's, unchanged (the single chokepoint,
+	// #2497); requiredCheckBuckets only NAMES the contexts behind it.
 	g := aggregateCIGreen(evalRun.RequiredChecksSnapshot, checks)
-	return g != nil && *g
+	if g != nil && *g {
+		return deployUpstreamVerdict{Satisfied: true}
+	}
+	pending, failed := requiredCheckBuckets(evalRun.RequiredChecksSnapshot, checks)
+	if g != nil && !*g {
+		return refuse("contexts_failed",
+			fmt.Sprintf("required upstream ci_green is not satisfied: required status check(s) %s reported failure on the evaluated run's implement stage", strings.Join(failed, ", ")),
+			map[string]any{"snapshot_present": true, "evaluated_run_id": evalRun.ID.String(), "failed_contexts": failed})
+	}
+	return refuse("contexts_pending",
+		fmt.Sprintf("required upstream ci_green is not satisfied: required status check(s) %s have not reported green on the evaluated run's implement stage yet (unreported or still running)", strings.Join(pending, ", ")),
+		map[string]any{"snapshot_present": true, "evaluated_run_id": evalRun.ID.String(), "pending_contexts": pending})
+}
+
+// requiredCheckBuckets names the required contexts behind a non-green
+// aggregateCIGreen verdict (#3465): `pending` is every snapshot context whose
+// latest check is unreported or non-terminal, `failed` every one whose latest
+// check derives to StateFail. It walks snap.Contexts with the SAME rules as
+// aggregateCIGreen (skip auditCompleteCheckName; last check per name wins;
+// DeriveState decides) — deliberately a second walk rather than a refactor of
+// the chokepoint, whose file is outside this change's scope; the agreement
+// is pinned by TestRequiredCheckBuckets_AgreesWithAggregate. A nil snapshot
+// yields two nil slices (the caller has already refused on snapshot_absent).
+func requiredCheckBuckets(snap *run.RequiredChecksSnapshot, checks []*stagecheck.Check) (pending, failed []string) {
+	if snap == nil {
+		return nil, nil
+	}
+	latestByName := make(map[string]*stagecheck.Check, len(checks))
+	for _, c := range checks {
+		latestByName[c.Name] = c
+	}
+	for _, name := range snap.Contexts {
+		if name == auditCompleteCheckName {
+			continue
+		}
+		c, ok := latestByName[name]
+		if !ok {
+			pending = append(pending, name)
+			continue
+		}
+		switch stagecheck.DeriveState(c.Status, c.Conclusion) {
+		case stagecheck.StatePass:
+			// keep walking
+		case stagecheck.StateFail:
+			failed = append(failed, name)
+		default:
+			pending = append(pending, name)
+		}
+	}
+	return pending, failed
 }
 
 // deployReviewMerged evaluates the required_upstream `review_merged`

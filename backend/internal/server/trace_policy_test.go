@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -971,6 +972,102 @@ func TestShipTrace_PolicyReEval_VerificationReported(t *testing.T) {
 			}
 			if repo.stage.State != tc.wantState {
 				t.Errorf("stage state = %q, want %q", repo.stage.State, tc.wantState)
+			}
+		})
+	}
+}
+
+// testWorkflowSpecRequireCIGreen declares ci_green as a required outcome so
+// the trace-upload handler's permanent-deferral flag (#3465) is exercised
+// end to end.
+const testWorkflowSpecRequireCIGreen = `
+version: "0.3"
+roles:
+  eng_team:
+    members: ["@org/eng"]
+workflows:
+  feature_change:
+    description: Test workflow
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - required_outcomes:
+              - ci_green
+        gates:
+          - type: approval
+            approvers:
+              any_of: [eng_team]
+            sla: 4_hours
+`
+
+// TestShipTrace_PolicyReEval_CIGreenDeferral_MarkedUnresolvableWithoutSnapshot
+// is the CROSS-BOUNDARY assertion for #3465: a real trace upload on a run
+// whose cached spec declares required_outcomes [ci_green] flows bundle →
+// cached-spec constraints → run-row snapshot presence → persisted
+// policy_evaluated row. A NIL snapshot marks the (still passing) deferral
+// deferred_unresolvable; a PRESENT-but-empty snapshot keeps the plain #297
+// deferral; a spec that never declared ci_green carries neither key even on
+// a snapshot-less run. Counterfactual vehicle for the trace.go assignment:
+// delete it and only the nil-snapshot arm goes RED.
+func TestShipTrace_PolicyReEval_CIGreenDeferral_MarkedUnresolvableWithoutSnapshot(t *testing.T) {
+	changed := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+	cases := []struct {
+		name             string
+		specYAML         string
+		snapshot         *run.RequiredChecksSnapshot
+		wantDeferred     []string
+		wantUnresolvable []string
+	}{
+		{
+			name:             "ci_green declared, nil snapshot → unresolvable",
+			specYAML:         testWorkflowSpecRequireCIGreen,
+			snapshot:         nil,
+			wantDeferred:     []string{"ci_green"},
+			wantUnresolvable: []string{"ci_green"},
+		},
+		{
+			name:             "ci_green declared, present-but-empty snapshot → deferred only",
+			specYAML:         testWorkflowSpecRequireCIGreen,
+			snapshot:         &run.RequiredChecksSnapshot{},
+			wantDeferred:     []string{"ci_green"},
+			wantUnresolvable: nil,
+		},
+		{
+			name:             "ci_green not declared, nil snapshot → neither",
+			specYAML:         testWorkflowSpec,
+			snapshot:         nil,
+			wantDeferred:     nil,
+			wantUnresolvable: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, sf, repo, au := newPolicyTraceServer(t, changed)
+			repo.runRow.WorkflowSpec = []byte(tc.specYAML)
+			repo.runRow.RequiredChecksSnapshot = tc.snapshot
+			b := makeTestBundle(t, changed)
+			priv, _ := sf.issue(t, repo.runRow.ID)
+
+			w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, "")
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+
+			pl := decodePolicyPayload(t, au)
+			if !pl.Passed {
+				t.Errorf("Passed = false, want true (a deferred ci_green is never a violation): %+v", pl.Violations)
+			}
+			if !reflect.DeepEqual(pl.DeferredOutcomes, tc.wantDeferred) {
+				t.Errorf("DeferredOutcomes = %v, want %v", pl.DeferredOutcomes, tc.wantDeferred)
+			}
+			if !reflect.DeepEqual(pl.DeferredUnresolvable, tc.wantUnresolvable) {
+				t.Errorf("DeferredUnresolvable = %v, want %v", pl.DeferredUnresolvable, tc.wantUnresolvable)
+			}
+			if pl.Applied.CIGreenUnresolvable != (tc.wantUnresolvable != nil) {
+				t.Errorf("Applied.CIGreenUnresolvable = %v, want %v", pl.Applied.CIGreenUnresolvable, tc.wantUnresolvable != nil)
 			}
 		})
 	}

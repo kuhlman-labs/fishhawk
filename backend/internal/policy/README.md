@@ -31,6 +31,10 @@ Two deliberate omissions, both load-bearing:
 
 It is also **not deferrable**. `DeferredRequiredOutcomes` still returns only `ci_green` (whose missing signal defers to branch protection per #251 / ADR-017). Adding `verification_reported` there would reconstruct the vacuous pass it exists to remove.
 
+### Permanent `ci_green` deferral — `deferred_unresolvable` (#3465)
+
+The #297 deferral assumes a LATER signal: CI runs against the PR, the check-run webhook lands, and the post-CI re-evaluation (`backend/internal/server/policy_reeval.go`) supplies `CIGreen`. That re-evaluation keys on the run's `RequiredChecksSnapshot` (`isRequiredCheck` is false for every check on a nil snapshot), so on a run that carries NO snapshot — every run created via `POST /v0/runs`, the CLI or MCP, and every GitLab run (#3490) — the deferral can never clear. The vacuous pass was already visible as `deferred_outcomes: [ci_green]`; what was silent is that it is PERMANENT. `Constraints.CIGreenUnresolvable` (`applied_constraints.ci_green_unresolvable`) carries that fact: set at trace-upload time in `trace.go` ONLY when the stage declares `ci_green` and the run row's snapshot is nil, so every other payload is byte-identical. `UnresolvableDeferredOutcomes` derives the payload's `deferred_unresolvable` list from it — the deferred list INTERSECTED with the flag, never wider — and `EmitEvaluation` writes it beside `deferred_outcomes`. The evaluator never reads the flag: `TestEvaluate_CIGreenUnresolvableFlag_DoesNotChangeVerdict` pins that it is an honesty annotation, not a verdict input. The asymmetry to hold onto: `deferred_outcomes` says "not asserted here, branch protection decides"; `deferred_unresolvable` says "not asserted here, and nothing downstream will assert it either". The SPA renders only the former today (rendering the latter is a documented residual). The flag round-trips through the re-evaluation like every other tagged field (see "Audit round-trip invariant"); the re-evaluation only fires when a snapshot exists, at which point `CIGreen` is set and both lists are empty.
+
 ## The comment-only Go exemption (#2660)
 
 A doc-comment correction to a `.go` file has no behavior to test, yet `feature_change` requires `tests_added_or_updated` and `routine_change` forbids non-test `.go` paths — so it was unlandable through either workflow. `DetectCommentOnlyGo` (`commentonly.go`) adds the third satisfying case.
@@ -84,6 +88,7 @@ Returns **nil** (read as a violation, never a pass) when: the bundle carries no 
 - #1886 / ADR-059 — substance-aware `verification_reported` (workflow-v1.5).
 - #610 / #601 — the `tests_added_or_updated` heuristic and its docs-only scoping.
 - #297 / #251 (ADR-017) — deferred outcomes and branch protection.
+- #3465 — `deferred_unresolvable`: the permanent deferral on a snapshot-less run; #3490 the GitLab snapshot ingester that would resolve it.
 - #283 / #247 / #233 — constraints cache, always-emit, audit payload shape.
 - #963 / #1205 / #804 / #802 — gate evidence, superseded verify runs, verify summary, committed-tree gate.
 

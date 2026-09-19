@@ -44,6 +44,15 @@ type EvaluationPayload struct {
 	// at merge time. The SPA renders this as an info note next to
 	// the pass state. Omitted when nothing was deferred.
 	DeferredOutcomes []string `json:"deferred_outcomes,omitempty"`
+	// DeferredUnresolvable is the subset of DeferredOutcomes whose
+	// signal can never arrive for this run (#3465): `ci_green` on a run
+	// that carries no required-checks snapshot, where the post-CI
+	// re-evaluation that would normally resolve the deferral can never
+	// fire. It marks an honest gap, not a deferral pending branch
+	// protection. Derived by UnresolvableDeferredOutcomes from
+	// Applied.CIGreenUnresolvable; omitted when empty, so every payload
+	// without the flag is byte-identical to before the key existed.
+	DeferredUnresolvable []string `json:"deferred_unresolvable,omitempty"`
 }
 
 // SkipReason names why a policy evaluation couldn't be carried out.
@@ -128,12 +137,13 @@ func EmitEvaluation(
 	}
 
 	payload, err := json.Marshal(EvaluationPayload{
-		StageType:        stageType,
-		Diff:             entries,
-		Applied:          constraints,
-		Violations:       append([]Violation(nil), violations...),
-		Passed:           len(violations) == 0,
-		DeferredOutcomes: DeferredRequiredOutcomes(constraints),
+		StageType:            stageType,
+		Diff:                 entries,
+		Applied:              constraints,
+		Violations:           append([]Violation(nil), violations...),
+		Passed:               len(violations) == 0,
+		DeferredOutcomes:     DeferredRequiredOutcomes(constraints),
+		DeferredUnresolvable: UnresolvableDeferredOutcomes(constraints),
 	})
 	if err != nil {
 		return violations, fmt.Errorf("policy: marshal audit payload: %w", err)

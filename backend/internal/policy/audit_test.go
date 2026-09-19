@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -265,6 +266,64 @@ func TestEmitEvaluation_DeferredCIGreen_PassesAndRecordsDeferral(t *testing.T) {
 	}
 	if len(got.DeferredOutcomes) != 1 || got.DeferredOutcomes[0] != "ci_green" {
 		t.Errorf("DeferredOutcomes = %+v, want [ci_green]", got.DeferredOutcomes)
+	}
+}
+
+// TestEmitEvaluation_DeferredCIGreen_RecordsUnresolvableWhenFlagged pins the
+// #3465 payload shape: a flagged constraint set emits deferred_outcomes AND
+// deferred_unresolvable AND applied_constraints.ci_green_unresolvable, while
+// an unflagged one carries NEITHER new key at the byte level (the omitempty
+// pin that keeps every pre-#3465 payload identical).
+func TestEmitEvaluation_DeferredCIGreen_RecordsUnresolvableWhenFlagged(t *testing.T) {
+	emit := func(t *testing.T, c Constraints) []byte {
+		t.Helper()
+		repo := &fakeAuditRepo{}
+		violations, err := EmitEvaluation(context.Background(), repo, uuid.New(), uuid.New(),
+			"implement", diff("backend/main.go", "backend/main_test.go"), c, nil)
+		if err != nil {
+			t.Fatalf("EmitEvaluation: %v", err)
+		}
+		if len(violations) != 0 {
+			t.Fatalf("violations = %+v, want none (ci_green is deferred either way)", violations)
+		}
+		return repo.captured.Payload
+	}
+
+	flaggedRaw := emit(t, Constraints{RequiredOutcomes: []string{"ci_green"}, CIGreenUnresolvable: true})
+	var got EvaluationPayload
+	if err := json.Unmarshal(flaggedRaw, &got); err != nil {
+		t.Fatalf("payload unmarshal: %v", err)
+	}
+	if !got.Passed {
+		t.Errorf("Passed = false, want true")
+	}
+	if len(got.DeferredOutcomes) != 1 || got.DeferredOutcomes[0] != "ci_green" {
+		t.Errorf("DeferredOutcomes = %+v, want [ci_green]", got.DeferredOutcomes)
+	}
+	if len(got.DeferredUnresolvable) != 1 || got.DeferredUnresolvable[0] != "ci_green" {
+		t.Errorf("DeferredUnresolvable = %+v, want [ci_green]", got.DeferredUnresolvable)
+	}
+	if !got.Applied.CIGreenUnresolvable {
+		t.Errorf("Applied.CIGreenUnresolvable = false, want true (must round-trip through the payload)")
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(flaggedRaw, &raw); err != nil {
+		t.Fatalf("raw unmarshal: %v", err)
+	}
+	applied, _ := raw["applied_constraints"].(map[string]any)
+	if applied["ci_green_unresolvable"] != true {
+		t.Errorf("applied_constraints.ci_green_unresolvable = %v, want true", applied["ci_green_unresolvable"])
+	}
+
+	unflaggedRaw := emit(t, Constraints{RequiredOutcomes: []string{"ci_green"}})
+	if bytes.Contains(unflaggedRaw, []byte("deferred_unresolvable")) {
+		t.Errorf("unflagged payload carries deferred_unresolvable:\n%s", unflaggedRaw)
+	}
+	if bytes.Contains(unflaggedRaw, []byte("ci_green_unresolvable")) {
+		t.Errorf("unflagged payload carries ci_green_unresolvable:\n%s", unflaggedRaw)
+	}
+	if !bytes.Contains(unflaggedRaw, []byte(`"deferred_outcomes":["ci_green"]`)) {
+		t.Errorf("unflagged payload lost the #297 deferral:\n%s", unflaggedRaw)
 	}
 }
 

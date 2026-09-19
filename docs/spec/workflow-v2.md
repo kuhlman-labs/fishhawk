@@ -571,8 +571,8 @@ Deploy stages only. `executor.delegate` names the external pipeline via a `targe
 
 | `target` | Required | Optional | Meaning |
 |---|---|---|---|
-| `github_actions` | `workflow_ref` | `git_ref` | Dispatch a GitHub Actions workflow via `workflow_dispatch`. `workflow_ref` is the workflow file or id (e.g. `deploy.yml`); `git_ref` is the branch, tag or sha to dispatch against — absent means the provider default. |
-| `webhook` | `url` | — | POST the deploy trigger to a generic webhook endpoint. |
+| `github_actions` | `workflow_ref` | `git_ref` | Dispatch a GitHub Actions workflow via `workflow_dispatch`. `workflow_ref` is the workflow file or id (e.g. `deploy.yml`); `git_ref` is the branch, tag or sha to dispatch against — absent means the provider default. Requires a GitHub App installation on the run (`installation_id`); a run created for GitLab has none, so the deploy stage fails at trigger time with a message naming `webhook` (#3465). |
+| `webhook` | `url` | — | POST the deploy trigger to a generic webhook endpoint. Forge-neutral — the deploy path for GitLab-created runs ([docs/deploy/gitlab.md](../deploy/gitlab.md)). |
 
 ### Agent version compatibility
 
