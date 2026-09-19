@@ -5991,8 +5991,9 @@ func TestDeployGate_ChangeFreezeOverride_EmbeddedSubstringRefuses(t *testing.T) 
 	}
 }
 
-// (f') required_upstream ci_green MET: an aggregate-green implement stage
-// (RequiredChecksSnapshot ∩ LatestForStage all passing) proceeds to dispatch.
+// (f') required_upstream ci_green MET: an aggregate-green REVIEW stage (the
+// stage GitHub check_run rows are recorded against, #3489;
+// RequiredChecksSnapshot ∩ LatestForStage all passing) proceeds to dispatch.
 // This pins the SUCCESS branch of the ci_green pre-flight constraint, the
 // counterpart to TestDeployGate_RequiredUpstreamCIGreenUnmet.
 func TestDeployGate_RequiredUpstreamCIGreenMet(t *testing.T) {
@@ -6001,13 +6002,13 @@ func TestDeployGate_RequiredUpstreamCIGreenMet(t *testing.T) {
 	s.cfg.StageCheckRepo = scs
 
 	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
-	// The run carries a required-checks snapshot; the implement stage's
+	// The run carries a required-checks snapshot; the review stage's
 	// checks all report green, so aggregateCIGreen folds to true.
 	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
-	implStage := rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	reviewStage := rr.seedStageOnRun(runRow.ID, run.StageTypeReview, run.StageStateSucceeded)
 	success := "success"
-	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
-		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
+	scs.byKey[scs.keyFor(reviewStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: reviewStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
 	}
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
@@ -6027,7 +6028,7 @@ func TestDeployGate_RequiredUpstreamCIGreenMet(t *testing.T) {
 // narrowing (#2497): deployCIGreen dropped its own `RequiredChecksSnapshot
 // == nil` guard and now resolves the nil-snapshot verdict through
 // aggregateCIGreen (which returns nil → unsatisfied). A deploy run whose
-// evaluated upstream carries a NIL snapshot but has a passing implement-stage
+// evaluated upstream carries a NIL snapshot but has a passing review-stage
 // check must still report the ci_green pre-flight signal as NOT satisfied —
 // the guard narrowing must not silently flip a fail-closed deploy gate to
 // fail-open. The passing check is seeded by construction so the RED (if the
@@ -6039,12 +6040,12 @@ func TestDeployCIGreen_NilSnapshot_NotSatisfied(t *testing.T) {
 
 	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
 	// Deliberately NO RequiredChecksSnapshot on the run (nil — the common
-	// local path), yet a green implement-stage check is recorded.
+	// local path), yet a green review-stage check is recorded.
 	runRow.RequiredChecksSnapshot = nil
-	implStage := rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	reviewStage := rr.seedStageOnRun(runRow.ID, run.StageTypeReview, run.StageStateSucceeded)
 	success := "success"
-	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
-		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
+	scs.byKey[scs.keyFor(reviewStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: reviewStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
 	}
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
@@ -6112,7 +6113,7 @@ func TestDeployCIGreen_UpstreamUnresolvable_Verdict(t *testing.T) {
 	}
 }
 
-// Branch (2): a NIL snapshot with a GREEN implement-stage check seeded by
+// Branch (2): a NIL snapshot with a GREEN review-stage check seeded by
 // construction → the message names the missing snapshot and #3490, and the
 // details discriminate snapshot_absent. This is the counterfactual vehicle
 // for the nil-snapshot branch: with it deleted the verdict falls through to
@@ -6123,8 +6124,8 @@ func TestDeployCIGreen_NilSnapshot_MessageNamesMissingSnapshot(t *testing.T) {
 	s.cfg.StageCheckRepo = scs
 	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
 	runRow.RequiredChecksSnapshot = nil
-	implStage := rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
-	seedGreenCheck(scs, implStage.ID, "ci/build")
+	reviewStage := rr.seedStageOnRun(runRow.ID, run.StageTypeReview, run.StageStateSucceeded)
+	seedGreenCheck(scs, reviewStage.ID, "ci/build")
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
@@ -6156,7 +6157,7 @@ func TestDeployCIGreen_StageCheckRepoUnwired_Verdict(t *testing.T) {
 	s.cfg.StageCheckRepo = nil
 	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
 	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
-	rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	rr.seedStageOnRun(runRow.ID, run.StageTypeReview, run.StageStateSucceeded)
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
@@ -6169,22 +6170,25 @@ func TestDeployCIGreen_StageCheckRepoUnwired_Verdict(t *testing.T) {
 	}
 }
 
-// Branch (4): snapshot present, repo wired, but NO implement stage →
-// no_implement_stage naming the evaluated run.
-func TestDeployCIGreen_NoImplementStage_Verdict(t *testing.T) {
+// Branch (4): snapshot present, repo wired, an IMPLEMENT stage present but NO
+// review stage → no_ci_signal_stage naming the evaluated run (#3489). The
+// implement stage is seeded by construction so the RED (if the read reverted
+// to findImplementStage) lands on the branch assertion, not on setup.
+func TestDeployCIGreen_NoCISignalStage_Verdict(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	s.cfg.StageCheckRepo = newFakeStageCheckRepo()
 	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
 	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
+	rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
 	msg, details := decodeDeployRefusal(t, w)
-	if !strings.Contains(msg, "has no implement stage") {
-		t.Errorf("message = %q, want it to name the missing implement stage", msg)
+	if !strings.Contains(msg, "has no review stage") {
+		t.Errorf("message = %q, want it to name the missing review stage", msg)
 	}
-	if details["branch"] != "no_implement_stage" {
-		t.Errorf("details.branch = %v, want no_implement_stage", details["branch"])
+	if details["branch"] != "no_ci_signal_stage" {
+		t.Errorf("details.branch = %v, want no_ci_signal_stage", details["branch"])
 	}
 	if details["evaluated_run_id"] != runRow.ID.String() {
 		t.Errorf("details.evaluated_run_id = %v, want %s", details["evaluated_run_id"], runRow.ID)
@@ -6200,7 +6204,7 @@ func TestDeployCIGreen_CheckReadError_Verdict(t *testing.T) {
 	s.cfg.StageCheckRepo = scs
 	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
 	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
-	rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	rr.seedStageOnRun(runRow.ID, run.StageTypeReview, run.StageStateSucceeded)
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
@@ -6224,8 +6228,8 @@ func TestDeployCIGreen_Pending_MessageNamesContexts(t *testing.T) {
 	s.cfg.StageCheckRepo = scs
 	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
 	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build", "ci/lint"}}
-	implStage := rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
-	seedGreenCheck(scs, implStage.ID, "ci/build")
+	reviewStage := rr.seedStageOnRun(runRow.ID, run.StageTypeReview, run.StageStateSucceeded)
+	seedGreenCheck(scs, reviewStage.ID, "ci/build")
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
@@ -6254,9 +6258,9 @@ func TestDeployCIGreen_Failed_MessageNamesContexts(t *testing.T) {
 	s.cfg.StageCheckRepo = scs
 	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
 	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build", "ci/lint"}}
-	implStage := rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
-	seedFailedCheck(scs, implStage.ID, "ci/build")
-	seedGreenCheck(scs, implStage.ID, "ci/lint")
+	reviewStage := rr.seedStageOnRun(runRow.ID, run.StageTypeReview, run.StageStateSucceeded)
+	seedFailedCheck(scs, reviewStage.ID, "ci/build")
+	seedGreenCheck(scs, reviewStage.ID, "ci/lint")
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
@@ -6269,6 +6273,35 @@ func TestDeployCIGreen_Failed_MessageNamesContexts(t *testing.T) {
 	}
 	if got := stringsOf(t, details["failed_contexts"]); !reflect.DeepEqual(got, []string{"ci/build"}) {
 		t.Errorf("failed_contexts = %v, want [ci/build]", got)
+	}
+}
+
+// The IMPLEMENT stage is no longer consulted (#3489): a green check recorded
+// ONLY on the implement stage, with a review stage present and empty, leaves
+// the required context pending. This is the deploy-side counterfactual
+// vehicle — with the read reverted to findImplementStage the verdict is
+// Satisfied and the 200 fails this test.
+func TestDeployCIGreen_CheckOnImplementStageOnly_StaysPending(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
+	implStage := rr.seedStageOnRunSeq(runRow.ID, 0, run.StageTypeImplement, run.StageStateSucceeded)
+	rr.seedStageOnRunSeq(runRow.ID, 1, run.StageTypeReview, run.StageStateSucceeded)
+	seedGreenCheck(scs, implStage.ID, "ci/build")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+	msg, details := decodeDeployRefusal(t, w)
+	if !strings.Contains(msg, "ci/build") || !strings.Contains(msg, "review stage") {
+		t.Errorf("message = %q, want it to name ci/build as pending on the review stage", msg)
+	}
+	if details["branch"] != "contexts_pending" {
+		t.Errorf("details.branch = %v, want contexts_pending (implement-stage rows are not the CI signal)", details["branch"])
+	}
+	if got := stringsOf(t, details["pending_contexts"]); !reflect.DeepEqual(got, []string{"ci/build"}) {
+		t.Errorf("pending_contexts = %v, want [ci/build]", got)
 	}
 }
 
@@ -6369,8 +6402,9 @@ func seedUpstreamRun(rr *approvalRunRepo, deployRun *run.Run) *run.Run {
 
 // CROSS-RUN (E23.11 / #1417): a standalone deploy-only release run with
 // upstream_run_id SET evaluates the referenced upstream run's ci_green. The
-// deploy run has no implement stage of its own; the upstream's implement
-// stage reports green, so the gate proceeds to dispatch.
+// deploy run has no review stage of its own; the upstream's review stage
+// (the CI-signal stage, #3489) reports green, so the gate proceeds to
+// dispatch.
 func TestDeployGate_UpstreamCIGreen_CrossRun_Met(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	scs := newFakeStageCheckRepo()
@@ -6379,10 +6413,10 @@ func TestDeployGate_UpstreamCIGreen_CrossRun_Met(t *testing.T) {
 	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
 	up := seedUpstreamRun(rr, deployRun)
 	up.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
-	implStage := rr.seedStageOnRun(up.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	reviewStage := rr.seedStageOnRun(up.ID, run.StageTypeReview, run.StageStateSucceeded)
 	success := "success"
-	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
-		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
+	scs.byKey[scs.keyFor(reviewStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: reviewStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
 	}
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
@@ -6437,7 +6471,7 @@ func TestDeployGate_UpstreamUnresolvable_Refuses(t *testing.T) {
 }
 
 // FAIL-CLOSED mode (b) — upstream resolves but its checks are NOT green: the
-// upstream's implement-stage check reports failure, so aggregateCIGreen folds
+// upstream's review-stage check reports failure, so aggregateCIGreen folds
 // to false and the gate refuses (#1417).
 func TestDeployGate_UpstreamCIGreen_NotGreen_Refuses(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
@@ -6446,10 +6480,10 @@ func TestDeployGate_UpstreamCIGreen_NotGreen_Refuses(t *testing.T) {
 	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
 	up := seedUpstreamRun(rr, deployRun)
 	up.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
-	implStage := rr.seedStageOnRun(up.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	reviewStage := rr.seedStageOnRun(up.ID, run.StageTypeReview, run.StageStateSucceeded)
 	failure := "failure"
-	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
-		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &failure,
+	scs.byKey[scs.keyFor(reviewStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: reviewStage.ID, Name: "ci/build", Status: "completed", Conclusion: &failure,
 	}
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
@@ -6494,10 +6528,10 @@ func TestDeployGate_UpstreamWrongRepo_Refuses(t *testing.T) {
 	up := seedUpstreamRun(rr, deployRun)
 	// Make the upstream otherwise-satisfiable so ONLY the repo mismatch refuses.
 	up.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
-	implStage := rr.seedStageOnRun(up.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	reviewStage := rr.seedStageOnRun(up.ID, run.StageTypeReview, run.StageStateSucceeded)
 	success := "success"
-	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
-		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
+	scs.byKey[scs.keyFor(reviewStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: reviewStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
 	}
 	up.Repo = "other-org/other-repo" // cross-repo reference → unresolved → fail closed
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
@@ -6516,10 +6550,10 @@ func TestDeployGate_UpstreamWrongWorkflow_Refuses(t *testing.T) {
 	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
 	up := seedUpstreamRun(rr, deployRun)
 	up.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
-	implStage := rr.seedStageOnRun(up.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	reviewStage := rr.seedStageOnRun(up.ID, run.StageTypeReview, run.StageStateSucceeded)
 	success := "success"
-	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
-		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
+	scs.byKey[scs.keyFor(reviewStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: reviewStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
 	}
 	up.WorkflowID = "release" // not a feature_change run → unresolved → fail closed
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)

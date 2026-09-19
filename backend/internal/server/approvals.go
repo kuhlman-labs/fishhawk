@@ -5317,8 +5317,9 @@ type deployUpstreamVerdict struct {
 
 // deployCIGreenVerdict evaluates the required_upstream `ci_green` pre-flight
 // signal (#1384): every required status check has reported green on the
-// evaluated run's implement stage, reusing aggregateCIGreen over that run's
-// RequiredChecksSnapshot. The evaluated run is resolved by deployEvalRun
+// evaluated run's REVIEW stage (findCISignalStage — the stage ingestCheckRun
+// writes GitHub check_run rows against, #3489), reusing aggregateCIGreen over
+// that run's RequiredChecksSnapshot. The evaluated run is resolved by deployEvalRun
 // (E23.11 / #1417) — the current run for an appended deploy, or the referenced
 // upstream feature_change run for a standalone deploy-only release run.
 //
@@ -5334,9 +5335,11 @@ type deployUpstreamVerdict struct {
 //     today; POST /v0/runs, the CLI and MCP runs carry none, and GitLab runs
 //     never receive one (#3490 tracks the GitLab ingester).
 //  3. stage_checks_unavailable — StageCheckRepo is unwired.
-//  4. no_implement_stage    — the evaluated run has no implement stage; the
-//     checks are READ from the implement stage today (the reader-stage move
-//     to review is #3489, not this change).
+//  4. no_ci_signal_stage    — the evaluated run has no review stage, and the
+//     review stage is where GitHub check_run rows are recorded (stagecheck
+//     FindRunStagesForCheckRun filters stage_type = 'review', #254), so there
+//     is no stage to read the checks from. #3489 moved the read here from the
+//     implement stage, which never receives a row.
 //  5. stage_check_read_failed — LatestForStage errored (logged at WARN; the
 //     error text is NOT echoed into the response body).
 //  6. contexts_failed       — aggregateCIGreen is false; failed_contexts
@@ -5378,20 +5381,20 @@ func (s *Server) deployCIGreenVerdict(ctx context.Context, runRow *run.Run) depl
 			"required upstream ci_green cannot be evaluated: the stage-check store is not wired on this backend, so no required status check can be read; an unevaluable upstream denies the deploy (fail-closed)",
 			nil)
 	}
-	implStage := s.findImplementStage(ctx, evalRun.ID)
-	if implStage == nil {
-		return refuse("no_implement_stage",
-			fmt.Sprintf("required upstream ci_green cannot be evaluated: the evaluated run %s has no implement stage, and required status checks are read from the evaluated run's implement stage (the reader stage is under review in #3489); an unevaluable upstream denies the deploy (fail-closed)", evalRun.ID),
+	ciStage := s.findCISignalStage(ctx, evalRun.ID)
+	if ciStage == nil {
+		return refuse("no_ci_signal_stage",
+			fmt.Sprintf("required upstream ci_green cannot be evaluated: the evaluated run %s has no review stage, and GitHub check_run results are recorded against the run's review stage (stagecheck FindRunStagesForCheckRun, #254); an unevaluable upstream denies the deploy (fail-closed)", evalRun.ID),
 			map[string]any{"evaluated_run_id": evalRun.ID.String()})
 	}
-	checks, err := s.cfg.StageCheckRepo.LatestForStage(ctx, implStage.ID)
+	checks, err := s.cfg.StageCheckRepo.LatestForStage(ctx, ciStage.ID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "deploy gate: list stage checks failed",
 			slog.String("run_id", evalRun.ID.String()),
 			slog.String("error", err.Error()),
 		)
 		return refuse("stage_check_read_failed",
-			"required upstream ci_green cannot be evaluated: reading the evaluated run's implement-stage checks failed (see the server log); an unevaluable upstream denies the deploy (fail-closed)",
+			"required upstream ci_green cannot be evaluated: reading the evaluated run's review-stage checks failed (see the server log); an unevaluable upstream denies the deploy (fail-closed)",
 			map[string]any{"evaluated_run_id": evalRun.ID.String()})
 	}
 	// The verdict is aggregateCIGreen's, unchanged (the single chokepoint,
@@ -5403,11 +5406,11 @@ func (s *Server) deployCIGreenVerdict(ctx context.Context, runRow *run.Run) depl
 	pending, failed := requiredCheckBuckets(evalRun.RequiredChecksSnapshot, checks)
 	if g != nil && !*g {
 		return refuse("contexts_failed",
-			fmt.Sprintf("required upstream ci_green is not satisfied: required status check(s) %s reported failure on the evaluated run's implement stage", strings.Join(failed, ", ")),
+			fmt.Sprintf("required upstream ci_green is not satisfied: required status check(s) %s reported failure on the evaluated run's review stage", strings.Join(failed, ", ")),
 			map[string]any{"snapshot_present": true, "evaluated_run_id": evalRun.ID.String(), "failed_contexts": failed})
 	}
 	return refuse("contexts_pending",
-		fmt.Sprintf("required upstream ci_green is not satisfied: required status check(s) %s have not reported green on the evaluated run's implement stage yet (unreported or still running)", strings.Join(pending, ", ")),
+		fmt.Sprintf("required upstream ci_green is not satisfied: required status check(s) %s have not reported green on the evaluated run's review stage yet (unreported or still running)", strings.Join(pending, ", ")),
 		map[string]any{"snapshot_present": true, "evaluated_run_id": evalRun.ID.String(), "pending_contexts": pending})
 }
 

@@ -187,20 +187,28 @@ func (r *reevalAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendPa
 
 // reevalFixture wires the three repos + a *Server with sensible
 // defaults. Each test mutates the seeds it needs.
+//
+// stageID is the IMPLEMENT stage — the anchor of the prior
+// policy_evaluated seed and of the appended row. reviewStageID is
+// the REVIEW stage — the stage ingestCheckRun records GitHub
+// check_run rows against and therefore the one the re-eval READS
+// (#3489); seedCheck writes there.
 type reevalFixture struct {
-	srv     *Server
-	runs    *reevalRunRepo
-	audit   *reevalAuditRepo
-	checks  *stageCheckRepoFake
-	runID   uuid.UUID
-	stageID uuid.UUID
-	prURL   string
+	srv           *Server
+	runs          *reevalRunRepo
+	audit         *reevalAuditRepo
+	checks        *stageCheckRepoFake
+	runID         uuid.UUID
+	stageID       uuid.UUID
+	reviewStageID uuid.UUID
+	prURL         string
 }
 
 func newReevalFixture(t *testing.T, requiredContexts []string) *reevalFixture {
 	t.Helper()
 	runID := uuid.New()
 	stageID := uuid.New()
+	reviewStageID := uuid.New()
 	prURL := "https://github.com/x/y/pull/42"
 
 	runs := newReevalRunRepo()
@@ -215,7 +223,8 @@ func newReevalFixture(t *testing.T, requiredContexts []string) *reevalFixture {
 		},
 	}}
 	runs.stagesByRunID[runID] = []*run.Stage{
-		{ID: stageID, RunID: runID, Type: run.StageTypeImplement, State: run.StageStateRunning},
+		{ID: stageID, RunID: runID, Sequence: 0, Type: run.StageTypeImplement, State: run.StageStateRunning},
+		{ID: reviewStageID, RunID: runID, Sequence: 1, Type: run.StageTypeReview, State: run.StageStatePending},
 	}
 
 	aud := newReevalAuditRepo()
@@ -244,13 +253,14 @@ func newReevalFixture(t *testing.T, requiredContexts []string) *reevalFixture {
 	})
 
 	return &reevalFixture{
-		srv:     srv,
-		runs:    runs,
-		audit:   aud,
-		checks:  checks,
-		runID:   runID,
-		stageID: stageID,
-		prURL:   prURL,
+		srv:           srv,
+		runs:          runs,
+		audit:         aud,
+		checks:        checks,
+		runID:         runID,
+		stageID:       stageID,
+		reviewStageID: reviewStageID,
+		prURL:         prURL,
 	}
 }
 
@@ -275,15 +285,35 @@ func (f *reevalFixture) latestPolicyEvaluatedAppend(t *testing.T) *policy.Evalua
 	return nil
 }
 
-// seedCheck adds a stage_checks row for the implement stage.
+// seedCheck adds a stage_checks row for the REVIEW stage — the stage
+// ingestCheckRun writes against (#254) and the re-eval reads (#3489).
 func (f *reevalFixture) seedCheck(name, status string, conclusion *string) {
-	f.checks.seed(f.stageID, &stagecheck.Check{
-		StageID:    f.stageID,
+	f.seedCheckOnStage(f.reviewStageID, name, status, conclusion)
+}
+
+// seedCheckOnStage adds a stage_checks row for an explicit stage.
+func (f *reevalFixture) seedCheckOnStage(stageID uuid.UUID, name, status string, conclusion *string) {
+	f.checks.seed(stageID, &stagecheck.Check{
+		StageID:    stageID,
 		Name:       name,
 		Status:     status,
 		Conclusion: conclusion,
 		Timestamp:  time.Now().UTC(),
 	})
+}
+
+// latestPolicyEvaluatedAppendStageID returns the StageID the most-recent
+// appended policy_evaluated row was anchored to, or nil when nothing has
+// been written.
+func (f *reevalFixture) latestPolicyEvaluatedAppendStageID() *uuid.UUID {
+	f.audit.mu.Lock()
+	defer f.audit.mu.Unlock()
+	for i := len(f.audit.appended) - 1; i >= 0; i-- {
+		if f.audit.appended[i].Category == policy.CategoryPolicyEvaluated {
+			return f.audit.appended[i].StageID
+		}
+	}
+	return nil
 }
 
 func TestReevaluateCIPolicy_SingleRequired_FlipsToTrue(t *testing.T) {
@@ -305,6 +335,49 @@ func TestReevaluateCIPolicy_SingleRequired_FlipsToTrue(t *testing.T) {
 	}
 	if len(got.Violations) != 0 {
 		t.Errorf("Violations = %v, want empty (ci_green passed)", got.Violations)
+	}
+	// Only the READ moved to the review stage (#3489): the appended
+	// policy_evaluated row stays anchored to the implement stage.
+	if sid := fx.latestPolicyEvaluatedAppendStageID(); sid == nil || *sid != fx.stageID {
+		t.Errorf("appended policy_evaluated StageID = %v, want the implement stage %v", sid, fx.stageID)
+	}
+}
+
+// The IMPLEMENT stage is no longer consulted for the CI signal (#3489): a
+// green check recorded ONLY on the implement stage, with the review stage
+// present and empty, does not flip ci_green. This is the re-eval-side
+// counterfactual vehicle — with the read reverted to findImplementStage a
+// row with CIGreen=&true is appended and this test fails.
+func TestReevaluateCIPolicy_CheckOnImplementStageOnly_NoFlip(t *testing.T) {
+	fx := newReevalFixture(t, []string{"ci_pass"})
+	fx.seedCheckOnStage(fx.stageID, "ci_pass", "completed", ptrStr("success"))
+
+	body := makeCheckRunPayloadWithRepo("x/y", "completed", "ci_pass", "deadbeef", ptrStr("success"), []int{42})
+	fx.srv.reevaluateCIPolicy(context.Background(), body)
+
+	if got := fx.latestPolicyEvaluatedAppend(t); got != nil {
+		t.Errorf("a check on the implement stage alone must not flip ci_green; got %+v", got)
+	}
+}
+
+// A run with an implement stage but NO review stage has no CI-signal stage
+// to read from: the re-eval skips (WARN) and appends nothing (#3489).
+// Distinct from NoImplementStage_Skips, which has no evaluation anchor.
+func TestReevaluateCIPolicy_NoReviewStage_Skips(t *testing.T) {
+	fx := newReevalFixture(t, []string{"ci_pass"})
+	fx.runs.stagesByRunID[fx.runID] = []*run.Stage{
+		{ID: fx.stageID, RunID: fx.runID, Type: run.StageTypeImplement, State: run.StageStateRunning},
+	}
+	// A green check on the review stage id that is no longer listed —
+	// seeded so the skip is attributable to the missing stage, not to
+	// an absent check.
+	fx.seedCheck("ci_pass", "completed", ptrStr("success"))
+
+	body := makeCheckRunPayloadWithRepo("x/y", "completed", "ci_pass", "deadbeef", ptrStr("success"), []int{42})
+	fx.srv.reevaluateCIPolicy(context.Background(), body)
+
+	if got := fx.latestPolicyEvaluatedAppend(t); got != nil {
+		t.Errorf("run without a review stage should be skipped; got %+v", got)
 	}
 }
 
