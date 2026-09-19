@@ -19,6 +19,7 @@
     "cost_usd_total": 0,
     "created_at": "2026-01-01T00:00:00Z",
     "drive": true,
+    "forge": "github",
     "id": "00000000-0000-0000-0000-000000000001",
     "lineage_complete": false,
     "max_retries_snapshot": 1,

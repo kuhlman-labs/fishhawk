@@ -115,6 +115,39 @@ serve.go closure is a thin forge-neutral passthrough. Per-installation
 REST-client routing and per-installation GitLab-client construction (both
 needing a per-installation client factory) build on this resolver as follow-ups.
 
+## GitLabProjectResolver — the exact-path installation reader (E45.46 / #3463)
+
+`gitlabproject.go` is the `POST /v0/runs` forge seam: it lets the MCP / CLI
+surfaces create a GitLab run (stamped with a registered `installation_ref`)
+instead of the webhook receiver being the only entry point. It reads the same
+`installations` table `EndpointResolver` does, through one hand-written sqlc
+query, `ListGitLabInstallationsByProjectPath` (`provider = 'gitlab' AND
+project_path = $1`, exact and case-sensitive — the binding the run-creation
+authorization gate enforces; sqlc is not regenerated locally, and
+`TestResolveGitLabProject_Postgres` drives the query against the real column
+set so scan-order drift is caught).
+
+- `ResolveGitLabProject(ctx, projectPath)` → `(GitLabInstallation, found, err)`.
+  Trims the path; empty → not-found without a query. **Exactly one row
+  resolves.** Zero rows → not-found. MORE than one row (two refs bound to one
+  path, an operator error the schema does not forbid) is **AMBIGUOUS → not-found**,
+  never an arbitrary first row — the same posture `Resolver.ResolveProvider`
+  takes on a doubly-registered `account_key` — so the caller refuses with the
+  registration remedy instead of stamping a credential handle that may belong
+  to a different binding. A query error is **propagated** so the caller fails
+  closed on a transient fault rather than minting an unattributed run.
+- `ResolveGitLabInstallationByRef(ctx, ref)` is the reverse read (`provider =
+  'gitlab'`) the single-run `GET /v0/runs/{id}` uses to surface a gitlab run's
+  `forge_base_url`; `pgx.ErrNoRows` → not-found, any other error propagated.
+- `GitLabInstallation{InstallationRef, ProjectPath, ForgeBaseURL}` projects the
+  row; `ForgeBaseURL` collapses a NULL or whitespace-only column to `""` so the
+  consumer's deployment-default fallback (`FISHHAWKD_GITLAB_BASE_URL`) fires
+  for both states.
+- A `nil` resolver / `nil` query surface reports not-found without a query
+  (the no-database posture, mirroring `NewResolver`); `serve.go` wires it under
+  the same `pool != nil` gate as `RepoProviders`, and the server refuses a
+  gitlab run 503 `gitlab_unconfigured` when it is absent.
+
 ## RegionPinner — the cell-side region pin (E44.7 / #1831, ADR-062)
 
 `region.go` records which region owns an account, from a signed handoff the

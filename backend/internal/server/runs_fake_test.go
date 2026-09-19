@@ -103,9 +103,13 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		// HTTP-seam assertion reads back what handleCreateRun -> capture
 		// passed rather than a dropped nil.
 		RequiredChecksSnapshot: p.RequiredChecksSnapshot,
-		State:                  run.StatePending,
-		CreatedAt:              now,
-		UpdatedAt:              now,
+		// Same again for the gitlab installation_ref (E45.46 / #3463): the
+		// forge read surfaces derive from it, so a dropped ref would make the
+		// 201-body / GET forge:gitlab assertions vacuous.
+		InstallationRef: p.InstallationRef,
+		State:           run.StatePending,
+		CreatedAt:       now,
+		UpdatedAt:       now,
 	}
 	f.runs[r.ID] = r
 	return r, nil

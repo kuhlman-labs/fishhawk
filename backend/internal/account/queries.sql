@@ -118,6 +118,20 @@ RETURNING *;
 -- name: GetInstallationByRef :one
 SELECT * FROM installations WHERE provider = $1 AND installation_ref = $2;
 
+-- name: ListGitLabInstallationsByProjectPath :many
+-- The POST /v0/runs forge seam for a GitLab project (E45.46 / #3463): the
+-- registered gitlab installation(s) whose project_path (0078, E45.26 / #2877)
+-- EXACTLY equals the run's repo — the same exact-path binding the run-creation
+-- authorization gate enforces. Case-sensitive on purpose (GitLab paths are).
+-- More than one row is possible only through operator error (two refs bound to
+-- one path); the resolver treats that as AMBIGUOUS (found=false), never an
+-- arbitrary first row, so the stable installation_ref order matters only for
+-- deterministic diagnostics.
+SELECT * FROM installations
+ WHERE provider = 'gitlab'
+   AND project_path = $1
+ ORDER BY installation_ref ASC;
+
 -- name: ListInstallations :many
 -- The operator inventory read behind `fishhawkd installation list` (E45.33 /
 -- #2923): every registered installation JOINed with its owning account's
