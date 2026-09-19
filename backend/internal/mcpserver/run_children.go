@@ -55,7 +55,7 @@ type RunChildrenInput struct {
 	RunID        string `json:"run_id" jsonschema:"the DECOMPOSED PARENT run UUID; the tool discovers its children from the parent's plan_decomposed audit entry"`
 	Workflow     string `json:"workflow" jsonschema:"workflow ID matching the run's workflow (passed through to each child's runner)"`
 	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the children run in. OPTIONAL when the parent run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path). Each child provisions its OWN per-child worktree under this checkout's shared gitdir (--parallel-isolate), so the operator's tracked tree is untouched"`
-	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
+	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the parent run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
 	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"fallback base branch for a child's implement stage; defaults to main. The SERVER is the authority for a dependent fan-out child — the host-dispatch marker returns the consolidated base_branch and this value is used only when it returns none"`
 	MaxParallel  int    `json:"max_parallel,omitempty" jsonschema:"optional operator concurrency override; clamp-DOWN-only against the orchestrator-resolved effective cap (it can lower an unlimited/looser cap, never raise it). Omit (0) to use the effective cap as-is"`
 	RunnerBinary string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: this input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary, then PATH"`
@@ -275,9 +275,23 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 
 	var warnings []string
 
+	// Forge target of the PARENT, resolved once (E45.46 / #3463): children
+	// inherit the parent's installation_ref / forge server-side (run.ChildParamsFrom),
+	// so the parent's single-run read is the authority for every child argv.
+	// FAIL CLOSED before any marker or spawn — a refusal here dispatches nothing.
+	forgeTarget, err := r.resolveRunForgeTarget(ctx, parentUUID)
+	if err != nil {
+		return nil, RunChildrenOutput{}, err
+	}
+
 	// Children push to per-slice branches for the fan-in, so a repo is
-	// required — auto-detect from working_dir's origin when not supplied.
+	// required — a gitlab parent defaults it to the row's project path (the
+	// origin detector is github.com-only); otherwise auto-detect from
+	// working_dir's origin when not supplied.
 	repo := in.GitHubRepo
+	if repo == "" && forgeTarget.Forge == startRunForgeGitLab {
+		repo = forgeTarget.Repo
+	}
 	if repo == "" {
 		detected, derr := runStageDetectGitHubRepo(workingDir)
 		if derr != nil {
@@ -354,6 +368,7 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 			workingDir:   workingDir,
 			repo:         repo,
 			fallbackBase: fallbackBase,
+			forgeTarget:  forgeTarget,
 		})
 		results[d.runID] = res
 		if res.Dispatched && budget > 0 {
@@ -434,6 +449,9 @@ type dispatchChildParams struct {
 	workingDir   string
 	repo         string
 	fallbackBase string
+	// forgeTarget is the PARENT's resolved forge target (E45.46 / #3463);
+	// its argv() renders the gitlab flags onto every child argv.
+	forgeTarget runForgeTarget
 }
 
 // dispatchOneChild marks the host spawn for one dispatchable child and forks a
@@ -507,6 +525,13 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 		"--fetch-prompt",
 		"--upload-trace",
 		"--github-repo", p.repo,
+	}
+	// `--forge gitlab --gitlab-base-url <url>` for a gitlab parent, nothing for
+	// github — the same runForgeTarget.argv() composeRunnerArgv appends, placed
+	// at the same position (right after --github-repo) so the two producers
+	// cannot drift (E45.46 / #3463).
+	argv = append(argv, p.forgeTarget.argv()...)
+	argv = append(argv,
 		// --base-branch / --check-base-ref drives BOTH halves of a dependent
 		// wave's basing on its predecessors' merged tree: (a) the runner's
 		// PRE-INVOKE working-tree checkout of this base into the child worktree,
@@ -520,7 +545,7 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 		// OWN run id (run-<child>) instead of the shared parent root, so siblings
 		// get isolated checkouts (E24.4 / #1144).
 		"--parallel-isolate",
-	}
+	)
 
 	// The report + probe closures are built exactly as dispatch_stage.go builds
 	// them, bound to THIS child's (run, stage). report is BOTH the detached

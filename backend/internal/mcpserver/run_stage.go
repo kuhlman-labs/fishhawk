@@ -93,7 +93,7 @@ type RunStageInput struct {
 	Workflow      string `json:"workflow" jsonschema:"workflow ID matching the run's workflow"`
 	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review | acceptance. The acceptance stage (E31.9) validates the merged change against a running preview/target instance; prefer fishhawk_dispatch_stage for it (it runs long, non-blocking) and it takes neither --plan-out nor --check-base-ref"`
 	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path)"`
-	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
+	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement stage; defaults to main. It applies even when push_and_open_pr is false — the runner passes --base-branch (and --check-base-ref for every implement stage) unconditionally and provisions the run worktree from it"`
 	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1) so every run carries a pull_request_url for the review gate + merge reconciler. A bare omitted value resolves to true. On a STANDALONE implement stage false is supported and unchanged (the E22.8/#406 commit-yourself flow): the agent's work is left in the working tree for the operator to commit, and the stage settles on its trace upload. On a DECOMPOSITION CHILD or a FIX-UP pass false is REFUSED (#2691), because those stages settle on a push this flag suppresses — use fishhawk_run_children for a decomposition child, and re-dispatch without push_and_open_pr=false for a fix-up"`
 	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: FISHHAWK_RUNNER_BIN env, then fishhawk-runner sibling to this binary (os.Executable dir), then PATH"`
@@ -413,6 +413,16 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		return nil, RunStageOutput{}, guardErr
 	}
 
+	// Forge target (E45.46 / #3463): the ONE single-run read every spawn
+	// producer routes through. FAIL CLOSED before any state-committing step —
+	// a gitlab run spawned as github would push to api.github.com — so an
+	// unreadable run, an unknown forge, or a gitlab run with no instance root
+	// refuses here with no host-dispatch marker and no spawn.
+	forgeTarget, err := r.resolveRunForgeTarget(ctx, runUUID)
+	if err != nil {
+		return nil, RunStageOutput{}, err
+	}
+
 	// Resolve the stage id from (run_id, stage type), honouring an
 	// explicit stage_id when supplied (back-compat) and erroring when
 	// it disagrees. This replaces the hand-copied-UUID error class
@@ -600,7 +610,15 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		}
 	}
 
+	// A gitlab run defaults an omitted github_repo to the run row's own
+	// project path BEFORE the origin auto-detect (E45.46 / #3463): the
+	// detector is github.com-only (runStageParseGitHubRemote), so it would
+	// refuse a GitLab origin and the row already carries the authoritative
+	// path_with_namespace.
 	repo := in.GitHubRepo
+	if repo == "" && forgeTarget.Forge == startRunForgeGitLab {
+		repo = forgeTarget.Repo
+	}
 	if repo == "" {
 		detected, derr := runStageDetectGitHubRepo(workingDir)
 		switch {
@@ -621,7 +639,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	if baseBranch == "" {
 		baseBranch = "main"
 	}
-	argv := r.composeRunnerArgv(in, resolvedStageID, repo, baseBranch, pushAndOpenPR)
+	argv := r.composeRunnerArgv(in, resolvedStageID, repo, baseBranch, pushAndOpenPR, forgeTarget)
 
 	env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 
@@ -1116,6 +1134,70 @@ func resolveRunnerBinary(input string, getenv func(string) string) (string, erro
 	return binary, nil
 }
 
+// runForgeTarget is a run's resolved forge target (E45.46 / #3463): the forge
+// id, the GitLab instance root (gitlab only), and the run row's repo slug (the
+// gitlab default for an omitted github_repo).
+type runForgeTarget struct {
+	Forge         string
+	GitLabBaseURL string
+	Repo          string
+}
+
+// argv renders the target's runner flags: `--forge gitlab --gitlab-base-url
+// <url>` for a gitlab target, nothing for github. Both composeRunnerArgv and
+// the inline child argv in run_children.go append it so the two producers
+// cannot drift.
+func (t runForgeTarget) argv() []string {
+	if t.Forge != startRunForgeGitLab {
+		return nil
+	}
+	return []string{"--forge", startRunForgeGitLab, "--gitlab-base-url", t.GitLabBaseURL}
+}
+
+// resolveRunForgeTarget is the ONLY forge-target derivation for every
+// runner-spawn producer — run_stage, dispatch_stage, drive_run and
+// run_children all call it and nothing else derives a forge (E45.46 / #3463).
+// It performs exactly ONE single-run `GET /v0/runs/{id}` via r.api.GetRun —
+// NEVER a list-shaped read (`GET /v0/runs`, fetchRunDriveView's list
+// siblings, or the parent's plan_decomposed payload) — because the backend
+// populates forge_base_url ONLY on the single-run route (handleGetRun), and a
+// list read would make a correctly configured gitlab run hit the empty-base-URL
+// refusal below spuriously. drive_run calls it once per invocation BEFORE its
+// loop rather than reading view.Run inside the loop, even though that view is
+// the same route: one derivation path, one helper.
+//
+// Rules, each fail-closed (a gitlab run spawned as github would push to
+// api.github.com, so no guess is safe):
+//
+//   - a read error is a REFUSAL — no github default, no warning-and-proceed;
+//   - Forge == "" (an older backend that omits the field) → github, the only
+//     mixed-version degrade, because a pre-#3463 backend can only have minted
+//     github runs on this path;
+//   - Forge == gitlab with an empty ForgeBaseURL → REFUSAL naming BOTH remedies
+//     (set FISHHAWKD_GITLAB_BASE_URL on fishhawkd, or re-register the
+//     installation with --forge-base-url);
+//   - any other Forge → REFUSAL naming the value.
+func (r *runResolver) resolveRunForgeTarget(ctx context.Context, runUUID uuid.UUID) (runForgeTarget, error) {
+	got, err := r.api.GetRun(ctx, runUUID)
+	if err != nil {
+		return runForgeTarget{}, fmt.Errorf(
+			"could not read run %s to resolve its forge; not spawning (a gitlab run spawned as github would target api.github.com): %w", runUUID, err)
+	}
+	switch got.Forge {
+	case "", startRunForgeGitHub:
+		return runForgeTarget{Forge: startRunForgeGitHub, Repo: got.Repo}, nil
+	case startRunForgeGitLab:
+		if got.ForgeBaseURL == "" {
+			return runForgeTarget{}, fmt.Errorf(
+				"run %s is a gitlab run but carries no forge_base_url; not spawning (the runner needs the GitLab instance root to push and open the merge request). Set FISHHAWKD_GITLAB_BASE_URL on fishhawkd, or re-register the installation with `fishhawkd installation register --provider gitlab ... --forge-base-url <instance root>`", runUUID)
+		}
+		return runForgeTarget{Forge: startRunForgeGitLab, GitLabBaseURL: got.ForgeBaseURL, Repo: got.Repo}, nil
+	default:
+		return runForgeTarget{}, fmt.Errorf(
+			"run %s carries unknown forge %q; not spawning (this fishhawk-mcp knows github and gitlab — rebuild it against the backend that minted the run)", runUUID, got.Forge)
+	}
+}
+
 // composeRunnerArgv builds the fishhawk-runner argv shared by the synchronous
 // fishhawk_run_stage handler and the detached fishhawk_dispatch_stage verb
 // (#1232). Extracting it makes the two paths compose BYTE-IDENTICAL argv: the
@@ -1130,7 +1212,13 @@ func resolveRunnerBinary(input string, getenv func(string) string) (string, erro
 // callers resolve it transport-conditionally via resolveWorkingDir (#2479) and
 // set in.WorkingDir to the resulting ABSOLUTE path before calling this, so the
 // composer uses in.WorkingDir verbatim and never falls back to ".".
-func (r *runResolver) composeRunnerArgv(in RunStageInput, resolvedStageID, repo, baseBranch string, pushAndOpenPR bool) []string {
+//
+// target is the run's forge target from resolveRunForgeTarget (E45.46 /
+// #3463): a gitlab target appends `--forge gitlab --gitlab-base-url <url>`
+// right after `--github-repo` (the runner reuses --github-repo as the GitLab
+// project slug); a github target appends NOTHING, so the github argv is
+// byte-identical to its pre-#3463 shape.
+func (r *runResolver) composeRunnerArgv(in RunStageInput, resolvedStageID, repo, baseBranch string, pushAndOpenPR bool, target runForgeTarget) []string {
 	argv := []string{
 		"--run-id", in.RunID,
 		"--backend-url", r.api.baseURL,
@@ -1147,6 +1235,7 @@ func (r *runResolver) composeRunnerArgv(in RunStageInput, resolvedStageID, repo,
 	if repo != "" {
 		argv = append(argv, "--github-repo", repo)
 	}
+	argv = append(argv, target.argv()...)
 	argv = append(argv, "--base-branch", baseBranch)
 	// Only implement stages produce a diff to enforce. Passing
 	// --check-base-ref makes the runner run computeAndEmitDiff, which

@@ -2672,6 +2672,16 @@ var validStartRunTriggerSourcesMessage = func() string {
 	return strings.Join(names, ", ")
 }()
 
+// startRunForgeGitHub / startRunForgeGitLab are the two forge ids the
+// fishhawk_start_run `forge` selector admits (E45.46 / #3463), mirroring the
+// backend's `resolveCreateForge` set (`server/runs.go`). The same two literals
+// are what `Run.Forge` carries back on every run read, which is why
+// resolveRunForgeTarget (run_stage.go) switches on them too.
+const (
+	startRunForgeGitHub = "github"
+	startRunForgeGitLab = "gitlab"
+)
+
 // StartRunInput is the fishhawk_start_run tool's input schema
 // (E22.1 / #390, extended in #426). Mirrors `POST /v0/runs`'s body
 // shape so an agent running inside Claude Code can mint a run
@@ -2685,7 +2695,7 @@ var validStartRunTriggerSourcesMessage = func() string {
 // them, an MCP-minted run is stage-less and prompt-degraded, which
 // is useless for the local loop.
 type StartRunInput struct {
-	Repo           string `json:"repo" jsonschema:"GitHub repo as owner/name; the workflow spec must live at .fishhawk/workflows.yaml in this repo"`
+	Repo           string `json:"repo" jsonschema:"owner/name on GitHub, or the GitLab path_with_namespace (nested groups allowed); the workflow spec must live at .fishhawk/workflows.yaml in this repo"`
 	WorkflowID     string `json:"workflow_id" jsonschema:"workflow key in .fishhawk/workflows.yaml (e.g. 'feature_change')"`
 	WorkflowSHA    string `json:"workflow_sha,omitempty" jsonschema:"blob SHA of the spec file; auto-computed from the discovered spec when omitted and working_dir resolves a checkout"`
 	TriggerSource  string `json:"trigger_source,omitempty" jsonschema:"one of 'cli', 'github_issue', 'ui', 'on_demand'; defaults to 'cli' when omitted, auto-flips to 'github_issue' when issue or issue_context is set. Pass 'on_demand' explicitly to start a NON-DIFF run (e.g. backlog_grooming, whose applies_to declares trigger: [scheduled, on_demand]); an explicit value is never overridden by the auto-flip, so 'on_demand' can be combined with issue/issue_context"`
@@ -2735,6 +2745,16 @@ type StartRunInput struct {
 	// IssueContext from the result. Accepts the same forms as
 	// the CLI's --issue (a bare number, #N, or full URL).
 	Issue string `json:"issue,omitempty" jsonschema:"GitHub issue number, #N, or .../issues/N URL; the MCP server fetches via gh and ships inline"`
+
+	// Forge is the explicit forge selector (E45.46 / #3463). The LADDER
+	// DIFFERENCE against REST is stated in the schema text verbatim: REST
+	// derives from the registry when the field is omitted, while THIS tool
+	// pins github whenever it fetched the issue from github.com via gh —
+	// computed on the fetch ATTEMPT (issue given, no inline issue_context,
+	// forge omitted), not on gh success, so an absent gh binary or a
+	// transient gh error cannot make two otherwise-identical calls mint runs
+	// of different forges. Validated client-side; see startRun.
+	Forge string `json:"forge,omitempty" jsonschema:"github | gitlab. Omitted: if you also pass issue without issue_context this tool fetches the issue from github.com via gh and therefore PINS forge=github on the create request (a github.com-fetched issue is never attached to a gitlab run); otherwise the request omits forge and the backend derives it from the registered installation for the repo owner (default github). Pass gitlab explicitly for a GitLab project — it skips gh and names issue_context as the supported path."`
 
 	// BudgetOverride forces the run past a blocking periodic cost
 	// budget that is over its limit for the current period (#688 /
@@ -2985,6 +3005,17 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 		}
 	}
 
+	// (1b) Validate the explicit forge selector client-side (E45.46 /
+	// #3463) so a typo is a clean tool error naming the field, with no
+	// backend round-trip. Empty means "let the ladder below decide".
+	forgeSelector := strings.TrimSpace(in.Forge)
+	switch forgeSelector {
+	case "", startRunForgeGitHub, startRunForgeGitLab:
+	default:
+		return nil, StartRunOutput{}, fmt.Errorf(
+			"forge %q is not one of github, gitlab", in.Forge)
+	}
+
 	// (2) Parse the explicit issue argument up front so a typo
 	// surfaces before any disk walk or backend round-trip.
 	issueNumber, err := resolveIssueRef(in.Issue)
@@ -3072,9 +3103,31 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 	// (degraded prompt = pre-#415 shape). When the caller already
 	// supplied IssueContext inline, skip the fetch and use what
 	// they sent.
+	//
+	// Forge pin (E45.46 / #3463, the no-github-fetch guarantee): the gh fetch
+	// resolves against github.com regardless of the project's forge, so a
+	// gitlab run must never be minted under an issue fetched this way. The
+	// three arms, keyed on the fetch ATTEMPT rather than on gh success:
+	//
+	//   - forge omitted, issue given, no inline issue_context → gh is
+	//     attempted AND the request PINS forge=github. Pinning on attempt (not
+	//     success) means an absent gh binary or a transient gh error cannot
+	//     flip the run's forge between two otherwise-identical invocations —
+	//     the warning below already covers the degraded prompt.
+	//   - forge=gitlab with issue given and no inline issue_context → gh is
+	//     SKIPPED entirely (a github.com fetch cannot serve a GitLab issue) and
+	//     a warning names issue_context as the supported path.
+	//   - forge omitted and no gh fetch happened (no issue, or issue_context
+	//     supplied inline) → the request carries NO forge and the backend
+	//     derives it from the registered installation (the REST ladder).
 	issueContext := in.IssueContext
 	var warnings []string
-	if issueNumber > 0 && issueContext == nil {
+	requestForge := forgeSelector
+	ghFetchAttempted := issueNumber > 0 && issueContext == nil && forgeSelector != startRunForgeGitLab
+	if ghFetchAttempted {
+		if requestForge == "" {
+			requestForge = startRunForgeGitHub
+		}
 		ic, ferr := fetchIssueViaGh(in.Repo, issueNumber)
 		switch {
 		case ferr == nil:
@@ -3086,6 +3139,9 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 			warnings = append(warnings,
 				fmt.Sprintf("issue fetch warning: %v — proceeding without inline issue context", ferr))
 		}
+	} else if issueNumber > 0 && issueContext == nil {
+		warnings = append(warnings, fmt.Sprintf(
+			"forge=gitlab: issue %d was NOT fetched (the gh fetch resolves against github.com, not a GitLab project); pass issue_context inline (title, body, the GitLab web url, number, comments) — the supported path for a GitLab issue", issueNumber))
 	}
 
 	// Over-cap comment warning (#2946): scan the RESOLVED issue_context —
@@ -3152,6 +3208,7 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 
 		AppliesToOverride:       in.AppliesToOverride,
 		AppliesToOverrideReason: in.AppliesToOverrideReason,
+		Forge:                   requestForge,
 	})
 	if err != nil {
 		return nil, StartRunOutput{}, fmt.Errorf("start run: %w", err)

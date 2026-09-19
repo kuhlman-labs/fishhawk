@@ -54,9 +54,23 @@ type driveFakeBackend struct {
 	// zero value every legacy fixture carries) leaves derived_status absent, so
 	// those fixtures keep exercising the unchanged path.
 	derivedStatus string
-	stages        []Stage
-	audit         []AuditEntry
-	seq           int64
+	// forge / forgeBaseURL / forgeBaseURLPreLoopOnly model the E45.46 / #3463
+	// run-row fields. Empty forge leaves the key absent (the legacy fixtures
+	// keep exercising the older-backend → github path). When
+	// forgeBaseURLPreLoopOnly is set, forge_base_url is served only on GET
+	// /v0/runs/{id} reads made BEFORE the loop's first /audit or /stages read
+	// (loopStarted) — see TestDriveRun_ForgeTarget_ReadViaSingleRunGet.
+	forge                   string
+	forgeBaseURL            string
+	forgeBaseURLPreLoopOnly bool
+	loopStarted             bool
+	// requestLog records every request as "METHOD path" in arrival order, and
+	// getRunCalls counts GET /v0/runs/{id} — the forge-target pins read them.
+	requestLog  []string
+	getRunCalls int
+	stages      []Stage
+	audit       []AuditEntry
+	seq         int64
 
 	recordActErr bool // /acts returns 500 when true
 	gateErr      bool // /auto-drive returns 500 when true
@@ -219,6 +233,12 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		path := r.URL.Path
+		f.mu.Lock()
+		f.requestLog = append(f.requestLog, r.Method+" "+path)
+		if strings.HasSuffix(path, "/audit") || strings.HasSuffix(path, "/stages") {
+			f.loopStarted = true
+		}
+		f.mu.Unlock()
 		switch {
 		case r.Method == http.MethodPost && strings.HasSuffix(path, "/host-dispatch"):
 			f.mu.Lock()
@@ -344,7 +364,12 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 		default: // GET /v0/runs/{id}
 			f.mu.Lock()
 			defer f.mu.Unlock()
+			f.getRunCalls++
 			pr := "https://github.com/x/y/pull/7"
+			baseURL := f.forgeBaseURL
+			if f.forgeBaseURLPreLoopOnly && f.loopStarted {
+				baseURL = ""
+			}
 			// Embed Run plus derived_status so runDriveView decodes both from one
 			// body (#1961); a zero-value derivedStatus is omitted, so every legacy
 			// fixture keeps exercising the no-derived-signal path.
@@ -352,24 +377,44 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 				Run
 				DerivedStatus string `json:"derived_status,omitempty"`
 			}{
-				Run:           Run{ID: f.runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: f.runState, RunnerKind: f.runnerKind, WorkingDir: f.workingDir, PullRequestURL: &pr},
+				Run: Run{ID: f.runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: f.runState, RunnerKind: f.runnerKind, WorkingDir: f.workingDir, PullRequestURL: &pr,
+					Forge: f.forge, ForgeBaseURL: baseURL},
 				DerivedStatus: f.derivedStatus,
 			})
 		}
 	}
 }
 
-// spawnRecorder records the sequence of stage types the driver spawned.
+// spawnRecorder records the sequence of stage types the driver spawned, and
+// the argv of each spawn (argvs[i] pairs with stages[i]).
 type spawnRecorder struct {
 	mu     sync.Mutex
 	stages []string
+	argvs  [][]string
 	fail   bool
 }
 
 func (rec *spawnRecorder) add(typ string) {
+	rec.addArgv(typ, nil)
+}
+
+func (rec *spawnRecorder) addArgv(typ string, argv []string) {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	rec.stages = append(rec.stages, typ)
+	rec.argvs = append(rec.argvs, append([]string(nil), argv...))
+}
+
+// argvFor returns the argv of the first spawn of the given stage type.
+func (rec *spawnRecorder) argvFor(typ string) []string {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for i, s := range rec.stages {
+		if s == typ {
+			return rec.argvs[i]
+		}
+	}
+	return nil
 }
 
 func (rec *spawnRecorder) list() []string {
@@ -391,7 +436,7 @@ func newDriveResolver(t *testing.T, f *driveFakeBackend, rec *spawnRecorder) (*r
 		drivePollInterval: time.Millisecond,
 		driveSpawn: func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
 			typ := f.typeForStageID(stageID)
-			rec.add(typ)
+			rec.addArgv(typ, argv)
 			if rec.fail {
 				return "", errStub("spawn boom")
 			}
@@ -4474,5 +4519,193 @@ func TestDriveRun_AcceptanceNeedsTarget_StepNamesPreviewCommand(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("no drive step names the concrete bring-up command %q; steps: %+v", want, out.StepsTaken)
+	}
+}
+
+// --- forge target (E45.46 / #3463) -------------------------------------------
+
+// gitlabParkedImplementFake is the shared drive fixture for the forge pins: a
+// gitlab run whose implement stage is parked awaiting_host_dispatch, converging
+// to succeeded once spawned, so the loop performs exactly one implement spawn.
+func gitlabParkedImplementFake(baseURL string) *driveFakeBackend {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_host_dispatch", 1),
+	})
+	f.forge = "gitlab"
+	f.forgeBaseURL = baseURL
+	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
+		if typ == "implement" {
+			f.setState("implement", "running")
+		}
+	})
+	converge := 0
+	f.setOnStages(func(f *driveFakeBackend) {
+		converge++
+		if converge >= 2 && f.stateOf("implement") == "running" {
+			f.setState("implement", "succeeded")
+			f.runState = "succeeded"
+		}
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	return f
+}
+
+// TestDriveRun_GitLabRun_ImplementDispatchCarriesForgeFlags (approval condition
+// 2): github_repo OMITTED on a gitlab run → the implement dispatch argv carries
+// `--github-repo <run-row path_with_namespace>` plus `--forge gitlab
+// --gitlab-base-url <url>`, and the github.com-only origin auto-detect is never
+// consulted (the stub would refuse the GitLab origin and the drive would warn).
+// Counterfactual: delete the `repo = forgeTarget.Repo` default in driveRun and
+// this goes RED on --github-repo.
+func TestDriveRun_GitLabRun_ImplementDispatchCarriesForgeFlags(t *testing.T) {
+	withFakeGitRemote(t, "git@gitlab.example.com:x/y.git", nil)
+	f := gitlabParkedImplementFake("https://gitlab.example.com")
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 5 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String()})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q, want merged; warnings=%v", out.StoppedReason, out.Warnings)
+	}
+	argv := rec.argvFor("implement")
+	if argv == nil {
+		t.Fatalf("no implement spawn recorded; spawned %v", rec.list())
+	}
+	if !argvHasPair(argv, "--github-repo", "x/y") {
+		t.Errorf("implement argv should default --github-repo from the run row: %v", argv)
+	}
+	if !argvHasPair(argv, "--forge", "gitlab") || !argvHasPair(argv, "--gitlab-base-url", "https://gitlab.example.com") {
+		t.Errorf("implement argv should carry the gitlab forge flags: %v", argv)
+	}
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "origin auto-detect") {
+			t.Errorf("origin auto-detect ran for a gitlab run: %q", w)
+		}
+	}
+}
+
+// TestDriveRun_ForgeTarget_ReadViaSingleRunGet pins that drive_run derives its
+// forge target through resolveRunForgeTarget's OWN pre-loop GET /v0/runs/{id},
+// not from the loop's per-iteration view.Run. Because fetchRunDriveView hits
+// the SAME single-run route, the list-omission trick the other producers use
+// cannot discriminate here; the pin is instead (a) a call-count assertion —
+// GET /v0/runs/{id} is read exactly TWICE before the loop's first /audit read
+// (resolveWorkingDirForRun's read + the helper's), so removing the helper call
+// or moving the derivation into the loop turns 2 into 1 — and (b) the fake
+// serving forge_base_url on PRE-LOOP reads only, so a derivation from any read
+// the loop itself makes (view.Run) hits the empty-base-URL refusal and goes RED.
+func TestDriveRun_ForgeTarget_ReadViaSingleRunGet(t *testing.T) {
+	f := gitlabParkedImplementFake("https://gitlab.example.com")
+	f.forgeBaseURLPreLoopOnly = true
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 5 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q, want merged; warnings=%v", out.StoppedReason, out.Warnings)
+	}
+	if argv := rec.argvFor("implement"); !argvHasPair(argv, "--gitlab-base-url", "https://gitlab.example.com") {
+		t.Fatalf("implement argv did not carry the first-GET base URL: %v", argv)
+	}
+	f.mu.Lock()
+	log := append([]string(nil), f.requestLog...)
+	f.mu.Unlock()
+	preLoopGets := 0
+	for _, entry := range log {
+		if strings.HasSuffix(entry, "/audit") || strings.HasSuffix(entry, "/stages") {
+			break
+		}
+		if strings.HasPrefix(entry, "GET /v0/runs/"+f.runID.String()) {
+			preLoopGets++
+		}
+	}
+	if preLoopGets != 2 {
+		t.Fatalf("pre-loop GET /v0/runs/{id} count = %d, want 2 (resolveWorkingDirForRun + resolveRunForgeTarget); log=%v", preLoopGets, log)
+	}
+}
+
+// TestDriveRun_GitLabRun_NoBaseURL_StopsWithoutSpawn: a gitlab run with no
+// forge_base_url stops with forge_unresolved, a warning naming both remedies,
+// and ZERO spawns / marker calls / recorded acts. Counterfactual: delete the
+// empty-ForgeBaseURL refusal in resolveRunForgeTarget and this goes RED.
+func TestDriveRun_GitLabRun_NoBaseURL_StopsWithoutSpawn(t *testing.T) {
+	f := gitlabParkedImplementFake("")
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 5 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedForgeUnresolved {
+		t.Fatalf("stopped_reason = %q, want forge_unresolved", out.StoppedReason)
+	}
+	joined := strings.Join(out.Warnings, " ")
+	for _, want := range []string{"forge_base_url", "FISHHAWKD_GITLAB_BASE_URL", "--forge-base-url"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("warning should name %q; got %v", want, out.Warnings)
+		}
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v; want nothing on a forge refusal", got)
+	}
+	f.mu.Lock()
+	marker, acts := f.hostDispatchCalledN, len(f.recordedActs)
+	f.mu.Unlock()
+	if marker != 0 || acts != 0 {
+		t.Fatalf("marker calls = %d, recorded acts = %d; want 0/0 (the refusal precedes every state-committing step)", marker, acts)
+	}
+}
+
+// TestDriveRun_RunReadFails_StopsWithoutSpawn: an unreadable run row stops the
+// drive with forge_unresolved and no spawn — never a github default.
+func TestDriveRun_RunReadFails_StopsWithoutSpawn(t *testing.T) {
+	f := gitlabParkedImplementFake("https://gitlab.example.com")
+	rec := &spawnRecorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v0/runs/"+f.runID.String() {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"run read boom"}}`))
+			return
+		}
+		f.handler()(w, r)
+	}))
+	defer srv.Close()
+	r := &runResolver{
+		api:               newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv:            func(string) string { return "" },
+		drivePollInterval: time.Millisecond,
+		driveMaxWallclock: 5 * time.Second,
+		driveSpawn: func(_ string, argv, _ []string, _, stageID string, _ detachedFailureReporter, _ detachedStageStateProbe) (string, error) {
+			rec.addArgv(f.typeForStageID(stageID), argv)
+			return "/tmp/log", nil
+		},
+	}
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y", WorkingDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedForgeUnresolved {
+		t.Fatalf("stopped_reason = %q, want forge_unresolved", out.StoppedReason)
+	}
+	if !strings.Contains(strings.Join(out.Warnings, " "), "could not read run") {
+		t.Errorf("warning should name the read failure: %v", out.Warnings)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v on an unreadable run", got)
 	}
 }
