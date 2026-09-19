@@ -3245,10 +3245,10 @@ type IssueComment struct {
 }
 
 // UpdateIssueComment edits an existing issue comment in place. ADR-019
-// / #320 (Fishhawk as coordination layer) leans on this for the
-// sticky status comment (E20 / #326) and `update_on_change` plan
-// comments (E17.2 / #337) — both flows need to mutate a previously-
-// posted comment instead of spamming new ones.
+// / #320 (Fishhawk as coordination layer) leans on this for the sticky
+// status/anchor comment (E20 / #326, living anchor #1054) and the PR
+// status comment (E42.1 / #1784) — both need to mutate a
+// previously-posted comment instead of spamming new ones.
 //
 //	PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}
 //

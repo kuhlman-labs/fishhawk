@@ -301,6 +301,89 @@ func TestRenderAnchorBody_CurrentAndSupersededPlans(t *testing.T) {
 	}
 }
 
+// TestRenderAnchorBody_UnpublishedRevisionsNote pins the one-shot
+// (!UpdateOnChange) render (E45.41 / #3346): a zero UnpublishedRevisions
+// renders no note, and a positive count names it.
+func TestRenderAnchorBody_UnpublishedRevisionsNote(t *testing.T) {
+	base := AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypePlan, State: run.StageStateRunning}},
+		ExternalURL: "https://app.example",
+		Now:         time.Now(),
+	}
+
+	t.Run("zero revisions renders no note", func(t *testing.T) {
+		in := base
+		in.CurrentPlan = &AnchorPlanView{Summary: "Add the thing.", UnpublishedRevisions: 0}
+		body := RenderAnchorBody(in)
+		if strings.Contains(body, "does not set `update_on_change`") {
+			t.Errorf("expected no unpublished-revisions note when UnpublishedRevisions is 0: %q", body)
+		}
+	})
+
+	t.Run("two revisions renders the note naming the count", func(t *testing.T) {
+		in := base
+		in.CurrentPlan = &AnchorPlanView{Summary: "Add the thing.", UnpublishedRevisions: 2}
+		body := RenderAnchorBody(in)
+		if !strings.Contains(body, "revised 2 time(s)") {
+			t.Errorf("expected unpublished-revisions note naming 2 time(s): %q", body)
+		}
+		if !strings.Contains(body, "does not set `update_on_change`") {
+			t.Errorf("expected unpublished-revisions note explaining the cause: %q", body)
+		}
+	})
+}
+
+// TestRenderAnchorBody_PlanEchoSuppressed pins the !Declared render (E45.41
+// / #3346): the anchor's plan section collapses to a one-line run-page
+// pointer with no summary and no Plan details block, and the marker +
+// deep-link invariants still hold in that shape. Also pins that the
+// suppression fires even when CurrentPlan is nil (the loadAnchorPlans
+// !Declared branch always returns a nil CurrentPlan).
+func TestRenderAnchorBody_PlanEchoSuppressed(t *testing.T) {
+	r := anchorRun()
+	base := AnchorInput{
+		Run:         r,
+		Stages:      []*run.Stage{{Type: run.StageTypePlan, State: run.StageStateRunning}},
+		ExternalURL: "https://app.example",
+		Now:         time.Now(),
+	}
+
+	t.Run("suppressed with nil CurrentPlan still renders the pointer line", func(t *testing.T) {
+		in := base
+		in.PlanEchoSuppressed = true
+		body := RenderAnchorBody(in)
+		if !strings.Contains(body, "Not echoed to this issue") {
+			t.Errorf("expected the not-echoed pointer line: %q", body)
+		}
+		if !strings.Contains(body, "declares no `originating_issue` persistence") {
+			t.Errorf("expected the pointer line to name the cause: %q", body)
+		}
+		if strings.Contains(body, "Plan details") {
+			t.Errorf("suppressed anchor must not render a Plan details block: %q", body)
+		}
+		if !strings.Contains(body, stickyMarker(stickyLocusAnchor, r.ID)) {
+			t.Errorf("marker invariant must hold in the suppressed shape: %q", body)
+		}
+		if !strings.Contains(body, "[View run →]") {
+			t.Errorf("deep-link invariant must hold in the suppressed shape: %q", body)
+		}
+	})
+
+	t.Run("suppressed WITH a populated CurrentPlan still shows only the pointer", func(t *testing.T) {
+		in := base
+		in.PlanEchoSuppressed = true
+		in.CurrentPlan = &AnchorPlanView{Summary: "Should never render."}
+		body := RenderAnchorBody(in)
+		if strings.Contains(body, "Should never render.") {
+			t.Errorf("suppression must win over a populated CurrentPlan: %q", body)
+		}
+		if !strings.Contains(body, "Not echoed to this issue") {
+			t.Errorf("expected the not-echoed pointer line: %q", body)
+		}
+	})
+}
+
 func TestRenderAnchorBody_ReviewVerdictsInline(t *testing.T) {
 	entries := []*audit.Entry{
 		startedEntry(10, "plan"),

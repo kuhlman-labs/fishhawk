@@ -86,6 +86,22 @@ Notes:
   annotated with its rejection reason, derived by aligning the run's plan-gate
   reject decisions (`approval_submitted` with decision `reject`, ascending by
   `Sequence`) to the superseded plan artifacts oldest-first.
+- **Whether the plan projects at all is gated by the plan stage's declared
+  `persistence` (E45.41 / #3346).** `spec.IssueEchoPolicyFor` resolves the
+  run's cached `WorkflowSpec` into `{Declared, UpdateOnChange}` from the plan
+  stage's `originating_issue`/`rendered_comment` entries (`fishhawk_audit_log`
+  is unconditional and never gates this). Declared+`update_on_change:true`
+  renders today's tracking projection above; declared with the flag omitted
+  pins the FIRST plan artifact one-shot and notes the unpublished revision
+  count; no `originating_issue` entry at all suppresses the plan section to a
+  one-line run-page pointer. A nil/unparseable cached spec or a workflow id
+  absent from it FAILS OPEN to the tracking projection with a warn log — a run
+  is only minted from a validated spec, so these are legacy rows or
+  corruption, and hiding the review surface on that edge is worse than an
+  un-honoured declaration. This resolution is GitHub-only: a GitLab-triggered
+  run's plan is not echoed to the originating issue at all today, regardless
+  of the declaration (tracked under E45, #1852; issue-echo parity slice #3481
+  / E45.52).
 - **Reviewer-verdict isolation (binding condition 1).** The anchor counts
   only the verdicts of the MOST-RECENT review dispatch per stage: it floors
   verdict counting at the latest `*_review_started` audit `Sequence` (the

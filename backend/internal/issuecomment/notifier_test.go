@@ -2055,6 +2055,265 @@ func TestNotifyStatusUpdateForRun_AnchorEndToEnd(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------
+// Plan-stage persistence -> issue-echo policy, end to end (E45.41 / #3346).
+//
+// Each fixture below sets a run row's cached WorkflowSpec to a minimal
+// workflow-v2 document whose feature_change plan stage declares a
+// specific persistence block, then drives NotifyStatusUpdateForRun and
+// asserts on the POSTED anchor body — proving the spec bytes -> spec
+// parse -> notifier policy -> anchor render -> IssueCommenter chain end
+// to end, not just the pure resolver in package spec.
+// ---------------------------------------------------------------------
+
+// persistenceDeclaredUpdateOnChange declares originating_issue/
+// rendered_comment WITH update_on_change:true — today's default shape,
+// matching every shipped preset and .fishhawk/workflows.yaml.
+const persistenceDeclaredUpdateOnChange = `            persistence:
+              - target: originating_issue
+                mode: rendered_comment
+                update_on_change: true
+              - target: fishhawk_audit_log
+                mode: canonical`
+
+// persistenceDeclaredOmittedFlag declares the same originating_issue/
+// rendered_comment entry but OMITS update_on_change — the one-shot case.
+const persistenceDeclaredOmittedFlag = `            persistence:
+              - target: originating_issue
+                mode: rendered_comment
+              - target: fishhawk_audit_log
+                mode: canonical`
+
+// persistenceAuditLogOnly declares ONLY fishhawk_audit_log/canonical — no
+// originating_issue entry at all, so IssueEchoPolicyFor resolves
+// !Declared and the anchor suppresses the plan section.
+const persistenceAuditLogOnly = `            persistence:
+              - target: fishhawk_audit_log
+                mode: canonical`
+
+// specWithPlanPersistence builds a minimal workflow-v2 document whose
+// feature_change plan stage carries the given persistence YAML block
+// (one of the consts above, indented to align under `produces:`).
+func specWithPlanPersistence(persistence string) []byte {
+	return []byte(fmt.Sprintf(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+%s
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`, persistence))
+}
+
+// specOtherWorkflowNoFeatureChange is a parseable workflow-v2 document that
+// declares no `feature_change` workflow at all — the workflow-id-absent
+// fail-open fixture (test (e) below). The run row's WorkflowID stays
+// "feature_change" so the lookup genuinely misses.
+const specOtherWorkflowNoFeatureChange = `version: "2"
+workflows:
+  other_workflow:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// specUnparseableBytes is not valid YAML — the unparseable-spec fail-open
+// fixture (test (d) below).
+var specUnparseableBytes = []byte("not: [valid: yaml")
+
+// planEchoPolicyFixture wires a Notifier against an issue-triggered run
+// (runID) whose plan stage carries TWO plan artifacts (older "First plan
+// version" then newer "Second plan version") and the given cached
+// WorkflowSpec bytes (nil for the legacy/no-spec fail-open shape). runID
+// is caller-supplied (rather than freshly generated) so the two
+// fail-open comparison tests below can drive two independently-faked
+// notifiers against the IDENTICAL run id and diff their rendered bodies
+// byte for byte — every render surface that embeds the run id (header,
+// marker, deep link) then matches by construction, isolating the diff to
+// whatever the policy resolution actually changed. Returns the notifier
+// and the fakes so each test can drive NotifyStatusUpdateForRun and
+// assert on the posted body.
+func planEchoPolicyFixture(t *testing.T, runID uuid.UUID, workflowSpec []byte) (*issuecomment.Notifier, *fakeGitHub) {
+	t.Helper()
+	planStageID := uuid.New()
+	triggerRef := "issue:42"
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", WorkflowID: "feature_change", State: run.StateRunning,
+			TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef, InstallationID: int64Ptr(99),
+			WorkflowSpec: workflowSpec,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval},
+		}},
+	}
+	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		planStageID: {
+			{ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan,
+				Content: planArtifactJSON(t, "First plan version", "a.go"), CreatedAt: time.Unix(100, 0)},
+			{ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan,
+				Content: planArtifactJSON(t, "Second plan version", "b.go"), CreatedAt: time.Unix(200, 0)},
+		},
+	}}
+	gh := &fakeGitHub{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: repoRuns, Audit: &fakeAudit{}, Artifacts: arts,
+		ExternalURL: "https://app.example",
+		Now:         func() time.Time { return time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC) },
+	})
+	if n == nil {
+		t.Fatal("notifier nil")
+	}
+	return n, gh
+}
+
+// TestNotifyStatusUpdateForRun_PlanEchoPolicy_DeclaredUpdateOnChange is case
+// (a): declared + update_on_change:true, two plan artifacts -> the body
+// carries the NEWER summary as current and the older under superseded.
+func TestNotifyStatusUpdateForRun_PlanEchoPolicy_DeclaredUpdateOnChange(t *testing.T) {
+	runID := uuid.New()
+	n, gh := planEchoPolicyFixture(t, runID, specWithPlanPersistence(persistenceDeclaredUpdateOnChange))
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(gh.calls) == 0 {
+		t.Fatal("expected an anchor comment to post")
+	}
+	body := gh.calls[0].body
+	if !strings.Contains(body, "Second plan version") {
+		t.Errorf("expected the NEWER plan as current:\n%s", body)
+	}
+	if !strings.Contains(body, "Superseded plan") || !strings.Contains(body, "First plan version") {
+		t.Errorf("expected the older plan superseded:\n%s", body)
+	}
+	if strings.Contains(body, "Not echoed to this issue") {
+		t.Errorf("declared policy must not suppress the plan section:\n%s", body)
+	}
+}
+
+// TestNotifyStatusUpdateForRun_PlanEchoPolicy_DeclaredOmittedFlag is case
+// (b): declared, update_on_change omitted, two artifacts -> the body
+// carries the OLDER summary as current (the one-shot pin — binding
+// condition 1: confirm the actual sort direction of the collected anchor
+// views before indexing), no superseded section, and the
+// unpublished-revisions note naming "1 time(s)".
+func TestNotifyStatusUpdateForRun_PlanEchoPolicy_DeclaredOmittedFlag(t *testing.T) {
+	runID := uuid.New()
+	n, gh := planEchoPolicyFixture(t, runID, specWithPlanPersistence(persistenceDeclaredOmittedFlag))
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(gh.calls) == 0 {
+		t.Fatal("expected an anchor comment to post")
+	}
+	body := gh.calls[0].body
+	if !strings.Contains(body, "First plan version") {
+		t.Errorf("expected the OLDER (first-published) plan as current under the one-shot pin:\n%s", body)
+	}
+	if strings.Contains(body, "Second plan version") {
+		t.Errorf("the newer, never-republished revision must not appear as current or superseded:\n%s", body)
+	}
+	if strings.Contains(body, "Superseded plan") {
+		t.Errorf("the one-shot pin carries no superseded section:\n%s", body)
+	}
+	if !strings.Contains(body, "revised 1 time(s)") {
+		t.Errorf("expected the unpublished-revisions note naming 1 time(s):\n%s", body)
+	}
+}
+
+// TestNotifyStatusUpdateForRun_PlanEchoPolicy_Undeclared is case (c): the
+// plan stage declares only fishhawk_audit_log persistence -> the body
+// carries the not-echoed pointer line and NEITHER a plan summary NOR a
+// Plan details block.
+func TestNotifyStatusUpdateForRun_PlanEchoPolicy_Undeclared(t *testing.T) {
+	runID := uuid.New()
+	n, gh := planEchoPolicyFixture(t, runID, specWithPlanPersistence(persistenceAuditLogOnly))
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(gh.calls) == 0 {
+		t.Fatal("expected an anchor comment to post")
+	}
+	body := gh.calls[0].body
+	if !strings.Contains(body, "Not echoed to this issue") {
+		t.Errorf("expected the not-echoed pointer line:\n%s", body)
+	}
+	if strings.Contains(body, "First plan version") || strings.Contains(body, "Second plan version") {
+		t.Errorf("undeclared policy must render no plan summary:\n%s", body)
+	}
+	if strings.Contains(body, "Plan details") {
+		t.Errorf("undeclared policy must render no Plan details block:\n%s", body)
+	}
+}
+
+// TestNotifyStatusUpdateForRun_PlanEchoPolicy_UnparseableSpecFailsOpen is
+// case (d): a cached WorkflowSpec that isn't valid YAML fails open to the
+// SAME unconditional-projection shape as the legacy nil-spec fixtures —
+// asserted here by diffing the two bodies byte for byte.
+func TestNotifyStatusUpdateForRun_PlanEchoPolicy_UnparseableSpecFailsOpen(t *testing.T) {
+	runID := uuid.New()
+	legacyN, legacyGH := planEchoPolicyFixture(t, runID, nil)
+	if err := legacyN.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("legacy NotifyStatusUpdateForRun: %v", err)
+	}
+	unparseableN, unparseableGH := planEchoPolicyFixture(t, runID, specUnparseableBytes)
+	if err := unparseableN.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("unparseable-spec NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(legacyGH.calls) == 0 || len(unparseableGH.calls) == 0 {
+		t.Fatal("expected both fixtures to post an anchor comment")
+	}
+	if legacyGH.calls[0].body != unparseableGH.calls[0].body {
+		t.Errorf("unparseable-spec body diverged from the legacy nil-spec fail-open shape:\nlegacy:\n%s\nunparseable:\n%s",
+			legacyGH.calls[0].body, unparseableGH.calls[0].body)
+	}
+}
+
+// TestNotifyStatusUpdateForRun_PlanEchoPolicy_WorkflowIDMissingFailsOpen is
+// case (e): the cached spec parses cleanly but carries no workflow keyed by
+// the run's WorkflowID -> the same fail-open shape as (d) and the legacy
+// nil-spec fixtures.
+func TestNotifyStatusUpdateForRun_PlanEchoPolicy_WorkflowIDMissingFailsOpen(t *testing.T) {
+	runID := uuid.New()
+	legacyN, legacyGH := planEchoPolicyFixture(t, runID, nil)
+	if err := legacyN.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("legacy NotifyStatusUpdateForRun: %v", err)
+	}
+	missingN, missingGH := planEchoPolicyFixture(t, runID, []byte(specOtherWorkflowNoFeatureChange))
+	if err := missingN.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("workflow-id-missing NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(legacyGH.calls) == 0 || len(missingGH.calls) == 0 {
+		t.Fatal("expected both fixtures to post an anchor comment")
+	}
+	if legacyGH.calls[0].body != missingGH.calls[0].body {
+		t.Errorf("workflow-id-missing body diverged from the legacy nil-spec fail-open shape:\nlegacy:\n%s\nmissing:\n%s",
+			legacyGH.calls[0].body, missingGH.calls[0].body)
+	}
+}
+
 // econEntry is a small audit-chain entry builder for the BuildRunEconomics
 // fold test: category + ascending sequence + timestamp + optional payload.
 func econEntry(seq int64, category string, ts int64, payload map[string]any) *audit.Entry {

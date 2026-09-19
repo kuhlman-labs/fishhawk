@@ -57,6 +57,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // CategoryIssueCommented is the audit-log category the notifier writes
@@ -148,18 +149,19 @@ const (
 	// answer "how many status updates fired per run" without
 	// scanning payload kinds.
 	KindStatusUpdate Kind = "status_update"
-	// KindPlanFull tags the full-plan-document post (E17.2 / #337).
-	// Distinct from KindPlan (the legacy summary post) because the
-	// payload carries github_comment_id and the comment is editable
-	// via UpdateIssueComment on subsequent plan re-uploads when the
-	// spec opts in to `update_on_change`. Audit-log dedup uses this
-	// kind plus KindPlanUpdated to find the most-recent comment id
-	// for a run.
+	// KindPlanFull and KindPlanUpdated (below) are RETIRED (E17.2 / #337):
+	// the standalone full-plan-document comment they tagged was subsumed by
+	// the living anchor (#1054), which projects the plan into the run's
+	// single anchor comment instead. Nothing writes these kinds anymore.
+	// They are kept only because their string values are stable audit-log
+	// payload constants that a pre-#1054 row may still carry; a reader of
+	// old rows can still match on them. The anchor's own plan-echo policy —
+	// whether and how the plan is projected — is spec.IssueEchoPolicyFor
+	// (E45.41 / #3346), resolved by resolvePlanEchoPolicy and consumed by
+	// loadAnchorPlans below.
 	KindPlanFull Kind = "plan_full"
-	// KindPlanUpdated tags an edit-in-place of the full-plan
-	// comment. Each re-upload that lands a UpdateIssueComment call
-	// appends one row carrying the (unchanged) github_comment_id so
-	// the audit chain records every revision.
+	// KindPlanUpdated is the edit-in-place sibling of the retired
+	// KindPlanFull; see that constant's doc.
 	KindPlanUpdated Kind = "plan_updated"
 	// KindBudgetAlert tags an advisory periodic-budget warning comment
 	// (ADR-030 / #688). Non-sticky and append-only like KindCIRetry; the
@@ -181,9 +183,8 @@ const (
 // shape stay focused.
 //
 // CreateIssueComment returns the created IssueComment so the
-// sticky-status-comment flow (E20.2 / #328) and the plan
-// `update_on_change` flow (E17.2 / #337) can persist the comment
-// id for later edits via UpdateIssueComment.
+// sticky-status-comment / living-anchor flow (E20.2 / #328, #1054) can
+// persist the comment id for later edits via UpdateIssueComment.
 //
 // CreateReview posts an advisory COMMENT-type pull-request review of a
 // terminal agent implement verdict (E42.2 / #1785), so the verdict lands in
@@ -905,7 +906,7 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 	if err != nil {
 		return fmt.Errorf("issuecomment: list audit: %w", err)
 	}
-	current, superseded := n.loadAnchorPlans(ctx, stages, entries)
+	current, superseded, suppressed := n.loadAnchorPlans(ctx, runRow, stages, entries)
 	// Roll the full decomposition lineage into the economics block (#2100). A
 	// load failure to ENUMERATE children warn-logs and falls back to the
 	// single-run block rather than aborting the anchor rebuild — best-effort per
@@ -925,14 +926,15 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 		children = nil
 	}
 	body := RenderAnchorBody(AnchorInput{
-		Run:             runRow,
-		Stages:          stages,
-		Audit:           entries,
-		CurrentPlan:     current,
-		SupersededPlans: superseded,
-		Economics:       BuildRunEconomics(runRow, entries, children),
-		ExternalURL:     n.externalURL,
-		Now:             n.now(),
+		Run:                runRow,
+		Stages:             stages,
+		Audit:              entries,
+		CurrentPlan:        current,
+		SupersededPlans:    superseded,
+		PlanEchoSuppressed: suppressed,
+		Economics:          BuildRunEconomics(runRow, entries, children),
+		ExternalURL:        n.externalURL,
+		Now:                n.now(),
 	})
 	if err := n.NotifyStatusUpdate(ctx, runID, body); err != nil {
 		return err
@@ -999,19 +1001,65 @@ func (n *Notifier) NotifyPageClassForRun(ctx context.Context, runID uuid.UUID) e
 	return n.firePings(ctx, ctxv, entries, stages, ctxv.runURL)
 }
 
+// resolvePlanEchoPolicy resolves the issue-echo policy for the plan
+// artifact from runRow's cached workflow spec (E45.41 / #3346), mirroring
+// the spec.ParseBytes + Workflows[WorkflowID] pattern
+// server/trace.go's loadStageConstraintsFromCache uses on the same
+// cached bytes. Fails OPEN to today's unconditional projection
+// ({Declared: true, UpdateOnChange: true}) — with a warn log naming the
+// reason — on a nil/legacy cached spec (len==0), an unparseable spec, or
+// a workflow id absent from it: a run is only minted from a validated
+// spec, so these are legacy rows (pre-#283 column) or corruption, and
+// hiding the operator's review surface on that edge is judged worse than
+// an un-honoured persistence declaration.
+func (*Notifier) resolvePlanEchoPolicy(ctx context.Context, runRow *run.Run) spec.IssueEchoPolicy {
+	fallback := spec.IssueEchoPolicy{Declared: true, UpdateOnChange: true}
+	if len(runRow.WorkflowSpec) == 0 {
+		return fallback
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		slog.Default().WarnContext(ctx,
+			"issuecomment: cached workflow spec unparseable; anchor plan echo fails open to unconditional projection",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()))
+		return fallback
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		slog.Default().WarnContext(ctx,
+			"issuecomment: workflow id absent from cached spec; anchor plan echo fails open to unconditional projection",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("workflow_id", runRow.WorkflowID))
+		return fallback
+	}
+	return spec.IssueEchoPolicyFor(wf, spec.ArtifactPlan)
+}
+
 // loadAnchorPlans projects the run's plan artifacts into the anchor's
-// current + superseded plan views. The latest plan artifact (by
-// CreatedAt) across the run's plan stages is the current plan; any
-// earlier ones are superseded, oldest-first, each annotated with the
-// rejection reason that retired it (derived from the run's plan-gate
-// reject decisions, chronologically aligned — see planRejectionReasons).
-// Returns (nil, nil) when no artifact lister is wired (graceful
+// current + superseded plan views, GATED by the workflow's plan-stage
+// issue-echo policy (E45.41 / #3346, resolvePlanEchoPolicy):
+//
+//   - Declared + UpdateOnChange: today's projection — the latest plan
+//     artifact (by CreatedAt) across the run's plan stages is the current
+//     plan; any earlier ones are superseded, oldest-first, each annotated
+//     with the rejection reason that retired it (derived from the run's
+//     plan-gate reject decisions, chronologically aligned — see
+//     planRejectionReasons).
+//   - Declared + !UpdateOnChange: one-shot — the FIRST (oldest) plan
+//     artifact is pinned as current with no superseded list; its
+//     UnpublishedRevisions counts the later artifacts that were never
+//     republished.
+//   - !Declared: suppressed — no plan content is projected at all
+//     (returns nil, nil, true); the anchor renders only a run-page pointer.
+//
+// Returns (nil, nil, false) when no artifact lister is wired (graceful
 // degradation — the anchor omits the plan sections) or no plan artifact
 // exists yet. Best-effort throughout: a load or decode failure for one
 // stage is skipped, never fatal.
-func (n *Notifier) loadAnchorPlans(ctx context.Context, stages []*run.Stage, entries []*audit.Entry) (*AnchorPlanView, []AnchorPlanView) {
+func (n *Notifier) loadAnchorPlans(ctx context.Context, runRow *run.Run, stages []*run.Stage, entries []*audit.Entry) (*AnchorPlanView, []AnchorPlanView, bool) {
 	if n.artifacts == nil {
-		return nil, nil
+		return nil, nil, false
 	}
 	type dated struct {
 		view AnchorPlanView
@@ -1049,11 +1097,23 @@ func (n *Notifier) loadAnchorPlans(ctx context.Context, stages []*run.Stage, ent
 		}
 	}
 	if len(views) == 0 {
-		return nil, nil
+		return nil, nil, false
 	}
 	// Oldest first so each superseded plan lines up with the rejection
-	// (in chronological order) that retired it. The newest is current.
+	// (in chronological order) that retired it, and so the one-shot branch
+	// below can take views[0] as "the first published version."
 	sort.SliceStable(views, func(i, j int) bool { return views[i].at.Before(views[j].at) })
+
+	policy := n.resolvePlanEchoPolicy(ctx, runRow)
+	if !policy.Declared {
+		return nil, nil, true
+	}
+	if !policy.UpdateOnChange {
+		current := views[0].view
+		current.UnpublishedRevisions = len(views) - 1
+		return &current, nil, false
+	}
+
 	current := views[len(views)-1].view
 	reasons := planRejectionReasons(entries)
 	superseded := make([]AnchorPlanView, 0, len(views)-1)
@@ -1064,7 +1124,7 @@ func (n *Notifier) loadAnchorPlans(ctx context.Context, stages []*run.Stage, ent
 		}
 		superseded = append(superseded, v)
 	}
-	return &current, superseded
+	return &current, superseded, false
 }
 
 // ChildRunEconomics bundles a decomposition slice child's run row and its

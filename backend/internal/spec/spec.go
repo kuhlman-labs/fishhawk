@@ -961,6 +961,54 @@ const (
 	ModeCanonical       PersistenceMode = "canonical"
 )
 
+// IssueEchoPolicy is the resolved projection of an artifact-producing
+// stage's persistence declarations onto the living-anchor issue comment
+// (E45.41 / #3346, issue-anchor mechanism #1054). It is the ONLY consumer
+// of the four persistence fields (target / mode / update_on_change) this
+// package declares — fishhawk_audit_log/canonical persistence is always
+// satisfied unconditionally by the artifact store + audit chain,
+// independent of this policy.
+type IssueEchoPolicy struct {
+	// Declared is true iff some matching stage declares a persistence entry
+	// with target originating_issue and mode rendered_comment. False means
+	// the anchor projects no plan content — only a run-page pointer.
+	Declared bool
+	// UpdateOnChange is the OR of update_on_change across the matching
+	// originating_issue/rendered_comment entries ONLY; a flag set on a
+	// fishhawk_audit_log/canonical entry is ignored — canonical storage is
+	// unconditional and carries no revision-echo semantics.
+	UpdateOnChange bool
+}
+
+// IssueEchoPolicyFor resolves the issue-echo policy for the artifacts of
+// kind produced by wf's stages (E45.41 / #3346). It scans every stage's
+// Produces entries matching kind and every Persistence entry on each
+// match; Declared is true iff at least one entry declares target
+// originating_issue and mode rendered_comment; UpdateOnChange is the OR of
+// update_on_change across those matching entries only. A workflow with no
+// matching stage, or a matching stage with no matching persistence entry,
+// resolves to the zero value (not declared).
+func IssueEchoPolicyFor(wf Workflow, kind ArtifactKind) IssueEchoPolicy {
+	var policy IssueEchoPolicy
+	for _, st := range wf.Stages {
+		for _, p := range st.Produces {
+			if p.Artifact != kind {
+				continue
+			}
+			for _, persist := range p.Persistence {
+				if persist.Target != PersistenceOriginatingIssue || persist.Mode != ModeRenderedComment {
+					continue
+				}
+				policy.Declared = true
+				if persist.UpdateOnChange {
+					policy.UpdateOnChange = true
+				}
+			}
+		}
+	}
+	return policy
+}
+
 // Constraint carries constraint kinds for a stage. SURFACE vs
 // REPRESENTATION (E52.6 / #2218): v0 and v1 spell a stage's constraints as
 // a LIST of objects each pinned to exactly one kind (maxProperties:1), which
