@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 )
 
@@ -150,6 +151,51 @@ func TestHandleHealth_ProcessStart(t *testing.T) {
 	zeroSrv.handleHealth(zrec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if strings.Contains(zrec.Body.String(), `"process_start"`) {
 		t.Errorf("process_start must be omitted for a zero boot marker: %s", zrec.Body.String())
+	}
+}
+
+// TestHealth_DevMode_Advertised pins the E72.13 / #3500 dev-mode posture on
+// the wire: a daemon with a dev-only surface mounted answers
+// /healthz with dev_mode:true (either surface alone suffices).
+func TestHealth_DevMode_Advertised(t *testing.T) {
+	cases := map[string]Config{
+		"fixtures":   {DevFixtures: &fakeDevApplier{}},
+		"stub_forge": {DevStubForge: stub.New()},
+		"both":       {DevFixtures: &fakeDevApplier{}, DevStubForge: stub.New()},
+	}
+	for name, cfg := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := New(cfg)
+			rec := httptest.NewRecorder()
+			s.handleHealth(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			if !strings.Contains(rec.Body.String(), `"dev_mode":true`) {
+				t.Errorf("raw body missing \"dev_mode\":true: %s", rec.Body.String())
+			}
+			var body healthResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if !body.DevMode {
+				t.Errorf("DevMode = false, want true")
+			}
+		})
+	}
+}
+
+// TestHealth_Production_OmitsDevMode: with no dev surface the dev_mode key is
+// ABSENT from the JSON bytes — a production /healthz stays byte-identical.
+func TestHealth_Production_OmitsDevMode(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	s.handleHealth(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), `"dev_mode"`) {
+		t.Errorf("dev_mode must be omitted on a production daemon: %s", rec.Body.String())
 	}
 }
 

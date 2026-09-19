@@ -26,6 +26,15 @@
 //     address is refused outright (a rebinding-shaped answer). Literal IP
 //     and localhost entries are dialed as declared — a dev target on
 //     localhost is a legitimate, operator-declared destination.
+//   - Plain-HTTP forwards on an ADMITTED host are additionally screened by
+//     a verb-level deny table (E72.13 / #3500, deniedVerbs): the Fishhawk
+//     routes that mint a run, spawn a runner or mint a token answer 403
+//     naming the verb, so an acceptance agent that reaches the preview
+//     backend through the proxy cannot host-dispatch a stage from it. This
+//     layer is DEFENCE IN DEPTH only — Go's ProxyFromEnvironment never
+//     proxies localhost/loopback targets, and the Mcp-Name header the /mcp
+//     rows key on is client-supplied — so the server-side dev-mode refusal
+//     is the authoritative control (see README).
 package egressproxy
 
 import (
@@ -36,10 +45,99 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
 )
+
+// deniedVerbs is the fixed verb-level deny table for plain-HTTP forwards
+// (E72.13 / #3500). Each row is METHOD + a path pattern whose "{id}"
+// segments match any single non-empty path segment; a row with mcpNames
+// applies only when the request's Mcp-Name header names one of them. The
+// table is deliberately a package-level literal, not configuration: the
+// verbs it names are the run-minting / runner-spawning / token-minting
+// routes, and no acceptance invocation has a legitimate reason to reach
+// them.
+var deniedVerbs = []deniedVerb{
+	{method: http.MethodPost, pattern: "/v0/runs"},
+	{method: http.MethodPost, pattern: "/v0/runs/{id}/stages/{id}/host-dispatch"},
+	{method: http.MethodPost, pattern: "/v0/runs/{id}/auto-drive"},
+	{method: http.MethodPost, pattern: "/v0/campaigns"},
+	{method: http.MethodPost, pattern: "/v0/campaigns/{id}/runs"},
+	{method: http.MethodPost, pattern: "/v0/campaigns/{id}/resume"},
+	{method: http.MethodPost, pattern: "/v0/tokens"},
+	{method: http.MethodPost, pattern: "/v0/tokens/login"},
+	{method: http.MethodPost, pattern: "/mcp", mcpNames: []string{
+		"fishhawk_start_run",
+		"fishhawk_run_stage",
+		"fishhawk_dispatch_stage",
+		"fishhawk_run_children",
+		"fishhawk_drive_run",
+		"fishhawk_start_campaign",
+		"fishhawk_start_campaign_item_run",
+		"fishhawk_resume_campaign",
+	}},
+}
+
+// deniedVerb is one row of deniedVerbs.
+type deniedVerb struct {
+	method   string
+	pattern  string
+	mcpNames []string // non-empty: the row applies only to these Mcp-Name values
+}
+
+// mcpNameHeader is the header the MCP transport carries the invoked tool
+// name in; the /mcp deny row keys on it.
+const mcpNameHeader = "Mcp-Name"
+
+// DeniedVerb reports whether method+urlPath (+ the Mcp-Name header for the
+// /mcp row) matches a deniedVerbs row, returning a reason naming the verb.
+// urlPath is path.Clean'd first so a trailing slash or a "." segment cannot
+// dodge a row; matching is segment-wise with "{id}" admitting any single
+// non-empty segment (a UUID or otherwise — the route, not the id format,
+// is what is denied). Exported so the pure matcher is testable from the
+// external test package; handleForward is its only production caller.
+func DeniedVerb(method, urlPath string, hdr http.Header) (reason string, denied bool) {
+	cleaned := path.Clean("/" + urlPath)
+	for _, row := range deniedVerbs {
+		if row.method != method || !patternMatches(row.pattern, cleaned) {
+			continue
+		}
+		if len(row.mcpNames) == 0 {
+			return fmt.Sprintf("%s %s is a run-minting/dispatch verb", method, row.pattern), true
+		}
+		name := hdr.Get(mcpNameHeader)
+		for _, n := range row.mcpNames {
+			if n == name {
+				return fmt.Sprintf("%s %s with %s %s is a run-minting/dispatch tool", method, row.pattern, mcpNameHeader, name), true
+			}
+		}
+	}
+	return "", false
+}
+
+// patternMatches compares a cleaned request path against a row pattern
+// segment by segment.
+func patternMatches(pattern, cleaned string) bool {
+	want := strings.Split(strings.Trim(pattern, "/"), "/")
+	got := strings.Split(strings.Trim(cleaned, "/"), "/")
+	if len(want) != len(got) {
+		return false
+	}
+	for i := range want {
+		if want[i] == "{id}" {
+			if got[i] == "" {
+				return false
+			}
+			continue
+		}
+		if want[i] != got[i] {
+			return false
+		}
+	}
+	return true
+}
 
 // DefaultModelHosts are the model API endpoints admitted for the acceptance
 // agent (allow-list class 2, ADR-050 decision #1). Ports default to 443/80
@@ -279,6 +377,13 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 	e, ok := p.match(host, port)
 	if !ok {
 		p.deny(w, r.URL.Host, "host is not on the acceptance egress allow-list")
+		return
+	}
+	// Verb-level deny on an admitted host (E72.13 / #3500): a run-minting,
+	// runner-spawning or token-minting verb is refused BEFORE RoundTrip, so
+	// the upstream never sees it. CONNECT tunnels are opaque and unchanged.
+	if reason, denied := DeniedVerb(r.Method, r.URL.Path, r.Header); denied {
+		p.deny(w, r.URL.Host, reason)
 		return
 	}
 	transport := &http.Transport{

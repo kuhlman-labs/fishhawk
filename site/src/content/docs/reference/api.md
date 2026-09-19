@@ -13,7 +13,13 @@ the human companion is
 [`docs/api/v0.md`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.md).
 
 `GET /healthz` needs no credential and reports the build's commit and its
-embedded schema hashes. Everything else requires a bearer token.
+embedded schema hashes. Everything else requires a bearer token. A daemon with
+a dev-only surface mounted (`--dev-fixtures` / `--dev-stub-forge`, the shape
+`scripts/dev preview` runs) advertises `dev_mode: true` there; such a daemon
+refuses the host-dispatch spawn marker for every caller (403
+`host_dispatch_refused_dev_mode`, before the credential check) and stamps
+`forge_writes: deny` on every prompt response, so no runner it could dispatch
+pushes a branch or opens a pull request on the real forge.
 
 Two runner-facing report bodies share one endpoint each and are discriminated
 by an `outcome` field the table below does not spell out: the pull-request

@@ -299,6 +299,21 @@ type promptResponse struct {
 	// acceptance dispatch category-C rather than degrading the gate to an
 	// unverifiable warn, so the drift is loud but total.
 	AcceptanceExpectedHeadSHA string `json:"acceptance_expected_head_sha,omitempty"`
+	// ForgeWrites is the backend's forge-write policy for the stage (E72.13 /
+	// #3500): "deny" when this daemon is in dev mode (a dev-only surface is
+	// mounted — `scripts/dev preview`), omitted otherwise. The runner's
+	// pre-spawn forge-writes gate refuses the stage on "deny" (runner_failed
+	// forge_writes_denied, category C) before any agent spawn, push or PR
+	// open, so a runner a dev-mode daemon somehow dispatched still writes
+	// nothing to the real forge. Stamped on EVERY stage type, on both the
+	// dispatch and the render path.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (`forge_writes`) MUST stay
+	// byte-identical to the runner's upload.FetchedPrompt.ForgeWrites decoder
+	// (runner/internal/upload/upload.go), the same convention as
+	// AcceptanceExpectedHeadSHA above. A tag drift here silently drops the
+	// deny and the runner-side gate falls open to the env-only source.
+	ForgeWrites string `json:"forge_writes,omitempty"`
 	// Replayable scenario corpus inputs (E72.4 / #3328), served ONLY on
 	// acceptance stages and all omitempty so every other response is
 	// byte-identical. AcceptanceRunBranch is the run branch the acceptance
@@ -1498,6 +1513,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		VerifyCommand:        verifyCmd,
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
 		VerifyMaxIterations:  verifyMaxIterations,
+		ForgeWrites:          s.forgeWritesPolicy(),
 		DiffCoverage:         s.resolveDiffCoverageConfig(r.Context(), runRow, stage.Type),
 		MinRunnerVersion:     version.MinRunnerVersion,
 		AgentVersionRange:    s.resolveExecutorAgentVersionRange(r.Context(), runRow, stage.Type),
@@ -2152,6 +2168,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		VerifyCommand:        verifyCmd,
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
 		VerifyMaxIterations:  verifyMaxIterations,
+		ForgeWrites:          s.forgeWritesPolicy(),
 		DiffCoverage:         s.resolveDiffCoverageConfig(r.Context(), runRow, stage.Type),
 		MinRunnerVersion:     version.MinRunnerVersion,
 		AgentVersionRange:    s.resolveExecutorAgentVersionRange(r.Context(), runRow, stage.Type),

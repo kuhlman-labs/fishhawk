@@ -1324,6 +1324,23 @@ never do, and a production deployment never should. Acceptance-side
 contract (routes, the delivery body, the 404 ⇒ skip rule):
 `docs/acceptance-preview.md` § "Stub forge".
 
+The same serve line also carries `FISHHAWK_FORGE_WRITES=deny` (E72.13 /
+[#3500](https://github.com/kuhlman-labs/fishhawk/issues/3500)). It is
+NOT read by `fishhawkd` itself: it rides on the daemon's environment so
+that any `fishhawk-runner` the preview's embedded `/mcp` spawn verbs
+might launch inherits it through `os.Environ()` and refuses pre-spawn
+(`runner_failed forge_writes_denied`, category C) before it can push a
+branch or open a PR on the real forge with the operator's credentials —
+the #3500 escape. It is the SECOND, independent deny source: either dev
+flag above already puts the daemon in dev mode, whose host-dispatch
+marker refuses every caller and whose prompt responses carry
+`forge_writes: "deny"`, so a runner that never fetched a prompt is the
+only one this variable reaches. Serve concern only — the `migrate up`
+line carries none of the three. `scripts/test-dev` pins the exact
+`FISHHAWK_FORGE_WRITES=deny` word on the serve line and its absence from
+the migrate line, the same two-assertion shape as the two dev flags.
+Runner-side contract: `runner/README.md` § "Forge-writes gate".
+
 ### Fail-loud contract (`_preview_seed_apply`)
 
 The seed POST runs only AFTER `_await_preview_healthz` has proven the

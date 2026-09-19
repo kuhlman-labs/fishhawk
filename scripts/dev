@@ -3645,9 +3645,17 @@ cmd_preview() {
   # #3327): both forge families served from in-memory state behind the
   # loopback-only /v0/dev/forge* control routes, so a forge-driven criterion
   # (a signed webhook delivery, a parent close) is drivable from the sandbox.
-  # Both are serve concerns — never on the migrate line.
+  # FISHHAWK_FORGE_WRITES=deny (E72.13 / #3500) is inherited through
+  # os.Environ() by any fishhawk-runner the preview daemon's embedded /mcp
+  # spawn verbs might launch, and that runner refuses pre-spawn
+  # (runner_failed forge_writes_denied, category C) before it can push a
+  # branch or open a PR on the real forge. Either dev flag already puts the
+  # daemon in dev mode, whose host-dispatch marker refuses every caller and
+  # whose prompt responses carry forge_writes:"deny"; the env var is the
+  # second, independent deny source for a runner that never fetched one.
+  # All three are serve concerns — never on the migrate line.
   _preview_branch_env
-  "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "FISHHAWKD_ADDR=$paddr" "FISHHAWKD_DEV_FIXTURES=1" "FISHHAWKD_DEV_STUB_FORGE=1" "$pbin" serve >> "$PREVIEW_LOG_FILE" 2>&1 &
+  "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "FISHHAWKD_ADDR=$paddr" "FISHHAWKD_DEV_FIXTURES=1" "FISHHAWKD_DEV_STUB_FORGE=1" "FISHHAWK_FORGE_WRITES=deny" "$pbin" serve >> "$PREVIEW_LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PREVIEW_PID_FILE"
