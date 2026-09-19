@@ -64,6 +64,9 @@ func TestEnv_PostureTable(t *testing.T) {
 		"all_proxy":         proxy,
 		"NO_PROXY":          "",
 		"no_proxy":          "",
+		// E72.13 / #3500: the forge-writes deny every descendant runner
+		// inherits, injected as a fixed value.
+		acceptenv.ForgeWritesVar: acceptenv.ForgeWritesDeny,
 	}
 	for k, want := range present {
 		if got, ok := m[k]; !ok || got != want {
@@ -129,5 +132,78 @@ func TestEnv_PassthroughCannotRepointProxy(t *testing.T) {
 	}
 	if len(refused) != 2 {
 		t.Errorf("refused = %v, want both proxy-var passthroughs named", refused)
+	}
+}
+
+// TestEnv_InjectsForgeWritesDeny (E72.13 / #3500) pins that the acceptance
+// env carries EXACTLY ONE FISHHAWK_FORGE_WRITES entry and that its value is
+// "deny" — the fixed injection a descendant fishhawk-runner's pre-spawn
+// gate reads. A bare base env (nothing to pass through) is the minimal
+// vehicle: the entry comes from the composer, not from the base.
+func TestEnv_InjectsForgeWritesDeny(t *testing.T) {
+	env, refused := acceptenv.Env([]string{"PATH=/usr/bin"}, proxy)
+	if len(refused) != 0 {
+		t.Fatalf("refused = %v, want none", refused)
+	}
+	var got []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, acceptenv.ForgeWritesVar+"=") {
+			got = append(got, kv)
+		}
+	}
+	want := []string{acceptenv.ForgeWritesVar + "=" + acceptenv.ForgeWritesDeny}
+	if !slices.Equal(got, want) {
+		t.Fatalf("forge-writes entries = %v, want exactly %v", got, want)
+	}
+}
+
+// TestEnv_RefusesForgeWritesPassthrough (E72.13 / #3500) proves the deny is
+// not re-pointable through the credential channel: a passthrough named
+// FISHHAWK_FORGE_WRITES (any case) is refused and reported, and the env
+// still carries the single injected deny.
+func TestEnv_RefusesForgeWritesPassthrough(t *testing.T) {
+	base := []string{
+		"FISHHAWK_ACCEPTANCE_ENV_FISHHAWK_FORGE_WRITES=allow",
+		"FISHHAWK_ACCEPTANCE_ENV_fishhawk_forge_writes=allow",
+	}
+	env, refused := acceptenv.Env(base, proxy)
+	if !slices.Contains(refused, "FISHHAWK_FORGE_WRITES") || !slices.Contains(refused, "fishhawk_forge_writes") {
+		t.Errorf("refused = %v, want both forge-writes passthroughs named", refused)
+	}
+	m := envMap(t, env)
+	if got := m[acceptenv.ForgeWritesVar]; got != acceptenv.ForgeWritesDeny {
+		t.Errorf("%s = %q, want %q (passthrough must not re-point it)", acceptenv.ForgeWritesVar, got, acceptenv.ForgeWritesDeny)
+	}
+	if _, ok := m["fishhawk_forge_writes"]; ok {
+		t.Error("lower-case forge-writes passthrough leaked onto the env")
+	}
+	count := 0
+	for _, kv := range env {
+		if strings.HasPrefix(kv, acceptenv.ForgeWritesVar+"=") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("FISHHAWK_FORGE_WRITES entries = %d, want exactly 1", count)
+	}
+}
+
+// TestEnv_DropsBaseForgeWritesValue (E72.13 / #3500) proves a base-env
+// FISHHAWK_FORGE_WRITES=allow never survives: the allow-list drops it and
+// the composer's fixed deny is the only entry under that name.
+func TestEnv_DropsBaseForgeWritesValue(t *testing.T) {
+	env, refused := acceptenv.Env([]string{acceptenv.ForgeWritesVar + "=allow"}, proxy)
+	if len(refused) != 0 {
+		t.Fatalf("refused = %v, want none (a base value is dropped by omission)", refused)
+	}
+	var got []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, acceptenv.ForgeWritesVar+"=") {
+			got = append(got, kv)
+		}
+	}
+	want := []string{acceptenv.ForgeWritesVar + "=" + acceptenv.ForgeWritesDeny}
+	if !slices.Equal(got, want) {
+		t.Fatalf("forge-writes entries = %v, want exactly %v (base allow must be dropped)", got, want)
 	}
 }
