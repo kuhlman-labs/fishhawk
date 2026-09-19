@@ -883,6 +883,68 @@ the cancel row safe to write. `applies_to.go`'s `abandonUnauditedOverrideRun`
 is not hooked either — it fires at run creation before any approval can carry
 a retirement, and its audit store is the thing that just failed.
 
+## Preview/dev-mode host-dispatch refusal (`devmode.go`, E72.13 / #3500)
+
+#3500: the acceptance agent host-dispatched stages on the PREVIEW fishhawkd
+(`scripts/dev preview`), whose spawned runners pushed branches and opened pull
+requests on the real forge with the operator's credentials. The controls here
+are deliberately identity-independent — the escape did not depend on which
+credential the agent held (the preview's fixed Postgres role can mint a
+`write:runs` operator token), so nothing below keys on identity.
+
+- **Dev mode IS the presence of a dev surface.** `devModeSurfaces()` returns
+  the mounted dev-only surfaces in fixed order (`dev_fixtures` when
+  `Config.DevFixtures != nil`, `dev_stub_forge` when `Config.DevStubForge !=
+  nil`); `devModeActive()` is `len > 0`. There is no separate flag or env var:
+  `scripts/dev preview` mounts both (`FISHHAWKD_DEV_FIXTURES=1` +
+  `FISHHAWKD_DEV_STUB_FORGE=1`) and a production deployment mounts neither, so
+  the posture cannot drift from the surfaces that define it.
+- **Host-dispatch refuses every caller.** `handleHostDispatchStage` checks
+  `devModeActive()` FIRST — after the run_id/stage_id parse (a malformed id
+  still answers 400) but BEFORE the auth ladder and every dependency guard —
+  and answers **403 `host_dispatch_refused_dev_mode`** with `details
+  {reason: dev_mode, dev_surfaces: [...]}`. An anonymous caller, an `fhm_`
+  token and a `write:runs` operator bearer are refused identically. The stage
+  row is never read on that path, so its state is untouched (the regression
+  test re-reads it and asserts `awaiting_host_dispatch`, committed state not
+  error identity). Because every MCP host-spawn verb (`fishhawk_run_stage` /
+  `dispatch_stage` / `run_children` / `drive_run`, the embedded `/mcp` route
+  included) calls the marker fail-closed before `cmd.Start`, no runner is
+  spawned — that fail-closed behaviour is pre-existing and pinned in
+  `backend/internal/mcpserver`, untouched here.
+- **Audit row.** `refuseHostDispatchDevMode` appends a `host_dispatch_refused`
+  row (`CategoryHostDispatchRefused`, registered in `audit.KnownCategories`)
+  on the run chain — ActorKind system, stage-scoped, payload `{reason:
+  dev_mode, dev_surfaces, stage_id, subject (the caller's subject or
+  "anonymous"), source: host_dispatch}`. Best-effort, mirroring
+  `emitHostDispatchAcceptanceAnchor`: a nil `AuditRepo` or a failed append
+  WARN-logs and the 403 is still written. Placing the refusal before auth
+  means an anonymous caller learns the daemon is in dev mode and causes a row
+  to be written; on a dev-mode daemon the credential-less `/v0/dev/*` routes
+  already reveal and mutate dev state, and the row is bounded to an existing
+  run's chain.
+- **`/healthz` `dev_mode: true`** (`handleHealth`, omitempty) advertises the
+  posture; **`forge_writes: "deny"`** is stamped on EVERY prompt response
+  (`forgeWritesPolicy()`, both `handleGetStagePrompt` and
+  `handleGetStagePromptRender`) — a CROSS-MODULE WIRE field mirrored by
+  `runner/internal/upload.FetchedPrompt.ForgeWrites` and registered in the
+  `wirecontract` `prompt_response` ModeSubset pair, so a tag drift fails
+  `TestCrossModuleWireParity`. The runner's pre-spawn gate that refuses on it
+  (`runner_failed` reason `forge_writes_denied`, category C) is the sibling
+  slice, documented in `runner/README.md`. Both fields are omitted on a
+  production daemon, keeping its wire surfaces byte-identical.
+- **MCP-token pin.** `TestHandleIssueMCPToken_ScopesNeverReachHostDispatch`
+  pins that the run-bound MCP token — the one token the acceptance sandbox can
+  mint via its signing key — never carries `write:runs` or `write:approvals`
+  on any stage type, so it cannot reach the marker (#3500 done-means 2).
+- **Tests** (`host_dispatch_test.go`): refuses anonymous / `write:runs`
+  bearer / each surface alone; nil `AuditRepo` and a failing append still
+  refuse; a malformed id still 400s with no row; and the no-dev-surface
+  control (`TestHostDispatch_ProductionNoDevSurface_Unchanged`) proves the
+  production path still transitions `awaiting_host_dispatch → dispatched`
+  with no refusal row. Counterfactual: deleting the `devModeActive()` branch
+  answers 200 with the stage `dispatched`.
+
 ## Pre-spawn acceptance-dispatch admission (E31.23 / #1928)
 
 `acceptance_admission.go::handleAcceptanceAdmission` —

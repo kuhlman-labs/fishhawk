@@ -6466,6 +6466,18 @@ paths:
                       from a real instant rather than decoding a zero time that
                       would compare as before every audit entry.
                     example: "2026-08-15T13:30:15.123456789Z"
+                  dev_mode:
+                    type: boolean
+                    description: |
+                      True when a dev-only surface is mounted
+                      (`--dev-fixtures` / `--dev-stub-forge`, what
+                      `scripts/dev preview` runs) — E72.13 / #3500. A dev-mode
+                      daemon refuses the host-dispatch spawn marker for every
+                      caller (403 `host_dispatch_refused_dev_mode`) and stamps
+                      `forge_writes: deny` on prompt responses so no runner it
+                      could dispatch writes to the real forge. Omitted when
+                      false, so a production `/healthz` is byte-identical.
+                    example: true
         '503':
           description: Process is shutting down or otherwise not ready.
           content:
@@ -10285,6 +10297,20 @@ paths:
         **Authorization.** Requires an authenticated identity carrying
         `write:runs` (anonymous → 401; a token without the scope → 403). The
         operator/MCP token that drives dispatch already carries it.
+
+        **Dev mode (E72.13 / #3500).** A fishhawkd with a dev-only surface
+        mounted (`--dev-fixtures` / `--dev-stub-forge` — what `scripts/dev
+        preview` runs; `/healthz` advertises `dev_mode: true`) refuses EVERY
+        caller with 403 `host_dispatch_refused_dev_mode`, identity-independent
+        and evaluated BEFORE the authorization ladder (only the path-value
+        parse precedes it, so a malformed id still answers 400). The refusal
+        appends a `host_dispatch_refused` audit row to the run chain (reason
+        `dev_mode`, the mounted surfaces, the caller subject or `anonymous`)
+        and never reads or writes the stage, so its state is unchanged. Every
+        MCP host-spawn verb calls this marker fail-closed before spawning, so
+        a preview daemon never spawns a runner that could push or open a pull
+        request on the real forge. A production daemon (no dev surface) never
+        enters this branch and its 401/403 ladder is unchanged.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -10332,7 +10358,15 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            The identity lacks `write:runs` scope (`insufficient_scope`).
+            One of two refusals: (1) the identity lacks `write:runs` scope
+            (`insufficient_scope`); (2) `host_dispatch_refused_dev_mode` —
+            this fishhawkd is in dev mode (E72.13 / #3500), an
+            identity-independent refusal that fires BEFORE the auth ladder for
+            anonymous and authenticated callers alike. `details.reason` is
+            `dev_mode` and `details.dev_surfaces` lists the mounted surfaces
+            (`dev_fixtures`, `dev_stub_forge`); a `host_dispatch_refused`
+            audit row is appended to the run chain and the stage state is
+            unchanged.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -13051,6 +13085,18 @@ paths:
                       proceeding unverified (#3091): with no expectation
                       there is nothing to verify the target against, so a
                       recorded verdict would bind to no tree.
+                  forge_writes:
+                    type: string
+                    enum: [deny]
+                    description: |
+                      The backend's forge-write policy for this stage (E72.13
+                      / #3500): `deny` when this fishhawkd is in dev mode (a
+                      dev-only surface is mounted — `scripts/dev preview`).
+                      The runner's pre-spawn forge-writes gate refuses the
+                      stage on `deny` (`runner_failed` reason
+                      `forge_writes_denied`, category C) before any agent
+                      spawn, push or pull-request open. Stamped on every stage
+                      type; omitted on a production daemon.
                   acceptance_run_branch:
                     type: string
                     description: |
@@ -13436,6 +13482,10 @@ paths:
                   acceptance_expected_head_sha:
                     type: string
                     description: The run's merge-candidate identity — the newest `head_sha` across the run's reported-head ledger entries (the ADR-035 lineage source, same as `fixup_expected_head_sha`), falling back to the newest `integration_commit_recorded` `merge_sha` on the run's own chain for a decomposed parent whose reported-head ledger is empty (#3091); served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when resolution fails, in which case the runner fails the stage pre-spawn category-C `acceptance_expected_head_unresolved` rather than proceeding unverified (#3091).
+                  forge_writes:
+                    type: string
+                    enum: [deny]
+                    description: The backend's forge-write policy for this stage (E72.13 / #3500) — `deny` when this fishhawkd is in dev mode (a dev-only surface is mounted, `scripts/dev preview`); the runner's pre-spawn forge-writes gate refuses the stage on it (`runner_failed` reason `forge_writes_denied`, category C) before any agent spawn, push or pull-request open. Stamped on every stage type; omitted on a production daemon.
                   acceptance_run_branch:
                     type: string
                     description: The run branch the acceptance runner pushes its scenario-corpus commit to (E72.4 / #3328); acceptance stages only, absent when unresolvable.

@@ -110,6 +110,18 @@ DEV ONLY. `scripts/dev preview` sets it on the acceptance-preview serve line so
 the sandboxed acceptance agent can materialize named scenarios; never enable
 it on a production deployment.
 
+**Either `--dev-fixtures` or `--dev-stub-forge` puts the daemon in DEV MODE
+(E72.13 / #3500).** A dev-mode daemon refuses the host-dispatch spawn marker
+(`POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`) for EVERY caller —
+anonymous, `fhm_` and `write:runs` operator tokens alike, before the auth
+ladder — with 403 `host_dispatch_refused_dev_mode` plus a
+`host_dispatch_refused` audit row, so no MCP host-spawn verb can spawn a runner
+from it; `/healthz` advertises `dev_mode: true`; and every prompt response
+carries `forge_writes: deny`, which the runner's pre-spawn forge-writes gate
+refuses on (`runner_failed` reason `forge_writes_denied`, category C). There is
+no separate flag: dev mode is the presence of a dev surface. Contract:
+`backend/internal/server/README.md` § "Preview/dev-mode host-dispatch refusal".
+
 | Env var | Flag | Effect | Default |
 |---|---|---|---|
 | `FISHHAWKD_DEV_FIXTURES` | `--dev-fixtures` | With `--db`: registers `GET/POST /v0/dev/fixtures` and `POST /v0/dev/sign` (a `WARN` names the surface at boot). Every route refuses a non-loopback peer `403 dev_surface_loopback_only` and is credential-less (no CSRF exemption is needed — the csrf middleware passes a session-less identity). Without `--db` the surface stays OFF and the log says so (`dev fixtures requested but no database configured; surface stays off`). **Trace-store consequence:** with `FISHHAWKD_S3_BUCKET` unset the daemon selects an in-memory trace store (`trace store: in-memory (dev fixtures)`) so the preview's `POST /v0/runs/{id}/trace` → `cost_recorded` → `spend_alert` / `unpriced_model_alert` path is drivable (#1874); a configured bucket always wins. | `false` |

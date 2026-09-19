@@ -239,6 +239,12 @@ type healthResponse struct {
 	// a caller can tell "no boundary published" from a real instant rather
 	// than decoding a zero time that would compare as before every entry.
 	ProcessStart string `json:"process_start,omitempty"`
+	// DevMode is true when a dev-only surface is mounted (Config.DevFixtures /
+	// Config.DevStubForge — `scripts/dev preview`), advertising that this
+	// daemon refuses host-dispatch and stamps forge_writes: deny on prompt
+	// responses (E72.13 / #3500). omitempty keeps a production /healthz
+	// byte-identical.
+	DevMode bool `json:"dev_mode,omitempty"`
 }
 
 // handleHealth answers liveness probes with a small JSON payload that
@@ -248,7 +254,8 @@ type healthResponse struct {
 // prove the listener on the port is the daemon it spawned (#1018).
 // process_start publishes the boot marker (#2712) so fishhawk_await_review
 // can decide whether an in-flight review's dispatching daemon is still the
-// one serving this request.
+// one serving this request. dev_mode (omitted when false) advertises the
+// E72.13 / #3500 dev-mode posture — see devmode.go.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{
 		Status:           "ok",
@@ -267,6 +274,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"workflow-v2":        spec.EmbeddedSchemaHashV2(),
 		},
 		StartNonce: s.cfg.StartNonce,
+		DevMode:    s.devModeActive(),
 	}
 	if !s.processStart.IsZero() {
 		resp.ProcessStart = s.processStart.UTC().Format(time.RFC3339Nano)

@@ -841,6 +841,54 @@ func TestFetchPrompt_HeldCommitBaseSHAOmittedWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesForgeWrites confirms the client decodes the
+// backend's forge_writes policy (E72.13 / #3500) into
+// FetchedPrompt.ForgeWrites — the value the pre-spawn forge-writes gate
+// refuses the stage on. A tag drift here silently drops the deny and the gate
+// falls open to the env-only source.
+func TestFetchPrompt_DecodesForgeWrites(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "acceptance",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"forge_writes": "deny"
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.ForgeWrites != "deny" {
+		t.Errorf("ForgeWrites = %q, want deny", got.ForgeWrites)
+	}
+}
+
+// TestFetchPrompt_ForgeWritesOmittedWhenAbsent: a production backend omits
+// the key and the field decodes empty, so the gate's backend source is inert.
+func TestFetchPrompt_ForgeWritesOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.ForgeWrites != "" {
+		t.Errorf("ForgeWrites = %q, want empty when absent", got.ForgeWrites)
+	}
+}
+
 // TestFetchPrompt_DecodesHeldCommitResumeKind confirms the client decodes the
 // backend's held_commit_resume_kind discriminator (#2169) into
 // FetchedPrompt.HeldCommitResumeKind. That value is what selects the resume's

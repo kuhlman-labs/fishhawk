@@ -746,3 +746,23 @@ func TestHandleIssueMCPToken_TokenCanReadOwnRunAmendments(t *testing.T) {
 		t.Errorf("body: %s", w.Body.String())
 	}
 }
+
+// TestHandleIssueMCPToken_ScopesNeverReachHostDispatch pins #3500 done-means
+// 2: the one token the acceptance sandbox can mint via its signing key — the
+// run-bound MCP token — never carries write:runs or write:approvals, the two
+// scopes mcpToolScopes grants the host-spawn verbs (fishhawk_run_stage /
+// dispatch_stage / run_children / drive_run) under, so it cannot reach the
+// host-dispatch marker on ANY stage type, including the self-retry shape that
+// widens the grant to write:retries.
+func TestHandleIssueMCPToken_ScopesNeverReachHostDispatch(t *testing.T) {
+	for _, typ := range []run.StageType{run.StageTypePlan, run.StageTypeImplement, run.StageTypeReview, run.StageTypeAcceptance} {
+		t.Run(string(typ), func(t *testing.T) {
+			s, sf, mt, runRow := scopeAmendmentTokenServerSeeded(t, stageSeed{typ, run.StageStateRunning})
+			for _, sc := range issuedScopes(t, s, sf, mt, runRow) {
+				if sc == "write:runs" || sc == "write:approvals" {
+					t.Errorf("%s-stage MCP token granted %s (reaches the host-dispatch marker): %v", typ, sc, mt.issued[0].Scopes)
+				}
+			}
+		})
+	}
+}
