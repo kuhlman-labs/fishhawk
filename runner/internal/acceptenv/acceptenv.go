@@ -26,6 +26,13 @@
 //   - HTTP_PROXY / HTTPS_PROXY / ALL_PROXY (upper and lower case) are set
 //     to the egress proxy and NO_PROXY is cleared, so every cooperating
 //     HTTP client in the invocation routes through the ADR-050 proxy.
+//   - FISHHAWK_FORGE_WRITES=deny is injected as a FIXED value (E72.13 /
+//     #3500), never copied from the base env: every descendant
+//     fishhawk-runner the acceptance agent could spawn inherits the deny
+//     and refuses pre-spawn (runner_failed forge_writes_denied, category
+//     C) before it can push a branch or open a pull request on the real
+//     forge. A passthrough named FISHHAWK_FORGE_WRITES is REFUSED exactly
+//     like a proxy-var passthrough — the containment is not re-pointable.
 package acceptenv
 
 import (
@@ -37,6 +44,15 @@ import (
 // credentials: FISHHAWK_ACCEPTANCE_ENV_FOO=bar on the runner env becomes
 // FOO=bar on the acceptance invocation env.
 const PassthroughPrefix = "FISHHAWK_ACCEPTANCE_ENV_"
+
+// ForgeWritesVar is the env var the runner's pre-spawn forge-writes gate
+// reads (E72.13 / #3500); ForgeWritesDeny is the only value it recognizes.
+// Env injects ForgeWritesVar=ForgeWritesDeny unconditionally so a runner
+// spawned from inside the acceptance sandbox refuses before any forge write.
+const (
+	ForgeWritesVar  = "FISHHAWK_FORGE_WRITES"
+	ForgeWritesDeny = "deny"
+)
 
 // allowExact is the system-essential allow-list (PATH to find the agent
 // binary and standard tools, HOME for its config, plus locale/terminal/
@@ -100,9 +116,9 @@ func Env(base []string, proxyURL string) (env []string, refused []string) {
 				refused = append(refused, name)
 				continue
 			}
-			if isProxyVar(name) {
-				// The proxy vars are the containment; a passthrough must not
-				// re-point them.
+			if isProxyVar(name) || isForgeWritesVar(name) {
+				// The proxy vars and the forge-writes deny are the
+				// containment; a passthrough must not re-point them.
 				refused = append(refused, name)
 				continue
 			}
@@ -128,6 +144,10 @@ func Env(base []string, proxyURL string) (env []string, refused []string) {
 		out = append(out, k+"="+proxyURL)
 	}
 	out = append(out, "NO_PROXY=", "no_proxy=")
+	// Deny forge writes to every descendant runner (E72.13 / #3500). Fixed
+	// value: a base-env FISHHAWK_FORGE_WRITES is dropped by the allow-list
+	// above, so this is the ONLY entry under that name.
+	out = append(out, ForgeWritesVar+"="+ForgeWritesDeny)
 
 	sort.Strings(refused)
 	return out, refused
@@ -144,6 +164,12 @@ func allowed(key string) bool {
 		}
 	}
 	return false
+}
+
+// isForgeWritesVar reports whether name is the forge-writes gate variable
+// (any case), which a passthrough must not re-point.
+func isForgeWritesVar(name string) bool {
+	return strings.ToUpper(name) == ForgeWritesVar
 }
 
 // isProxyVar reports whether name is one of the proxy-routing variables

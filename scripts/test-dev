@@ -2783,8 +2783,24 @@ if [[ -n "$sp_migrate_line" && "$sp_migrate_line" != *'FISHHAWKD_DEV_STUB_FORGE'
 else
   fail "cmd_preview migrate line should not carry FISHHAWKD_DEV_STUB_FORGE (got: $sp_migrate_line)"
 fi
-# The two dev flags are on the ONE serve line, not a second spawn: exactly one
-# `"$pbin" serve` line exists in cmd_preview.
+# DONE-MEANS for the forge-writes deny (E72.13 / #3500): FISHHAWK_FORGE_WRITES=deny
+# rides on the SAME serve exec line (so any runner the preview daemon's
+# embedded /mcp spawn verbs launch inherits the deny through os.Environ() and
+# refuses pre-spawn), and NOT on migrate. Same two-assertion shape as the two
+# dev flags above: the exact `=deny` value on the serve line, the name absent
+# from the migrate line.
+if [[ "$sp_serve_line" == *'FISHHAWK_FORGE_WRITES=deny'* && "$sp_serve_line" == *'FISHHAWKD_ADDR=$paddr'* ]]; then
+  pass "cmd_preview passes FISHHAWK_FORGE_WRITES=deny on the preview serve exec line"
+else
+  fail "cmd_preview should carry FISHHAWK_FORGE_WRITES=deny on the serve exec line (got: $sp_serve_line)"
+fi
+if [[ -n "$sp_migrate_line" && "$sp_migrate_line" != *'FISHHAWK_FORGE_WRITES'* ]]; then
+  pass "cmd_preview does NOT pass FISHHAWK_FORGE_WRITES on the migrate line"
+else
+  fail "cmd_preview migrate line should not carry FISHHAWK_FORGE_WRITES (got: $sp_migrate_line)"
+fi
+# The two dev flags and the forge-writes deny are on the ONE serve line, not a
+# second spawn: exactly one `"$pbin" serve` line exists in cmd_preview.
 sp_serve_count="$(print -r -- "$preview_body" | grep -cF '"$pbin" serve')"
 if [[ "$sp_serve_count" == 1 ]]; then
   pass "cmd_preview spawns exactly one serve line carrying both dev flags"

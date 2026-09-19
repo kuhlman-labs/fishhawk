@@ -316,3 +316,144 @@ func TestClose_Idempotent(t *testing.T) {
 		t.Fatalf("second Close: %v", err)
 	}
 }
+
+// TestForward_DeniesRunMintingVerbs (E72.13 / #3500) drives a REAL proxy in
+// front of an httptest upstream that counts hits: every row of the
+// verb-level deny table answers 403 with ZERO upstream hits, while the
+// positive controls (a read, a non-minting write, and an /mcp call naming
+// a read-only tool) are forwarded exactly once. The upstream host is on the
+// allow-list, so the ONLY thing standing between each denied request and
+// the upstream is the verb table.
+func TestForward_DeniesRunMintingVerbs(t *testing.T) {
+	var hits atomic.Int64
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, "forwarded ok")
+	}))
+	defer backend.Close()
+	backendHost := strings.TrimPrefix(backend.URL, "http://")
+	p := startProxy(t, egressproxy.Config{AllowHosts: []string{backendHost}})
+	client := proxiedClient(t, p)
+
+	const id = "0d54c898-58a9-473a-a4bc-d9877895226c"
+	type tc struct {
+		name    string
+		method  string
+		path    string
+		mcpName string
+		denied  bool
+		want    string // substring the 403 body must name
+	}
+	cases := []tc{
+		{name: "POST /v0/runs", method: "POST", path: "/v0/runs", denied: true, want: "POST /v0/runs"},
+		{name: "host-dispatch", method: "POST", path: "/v0/runs/" + id + "/stages/" + id + "/host-dispatch", denied: true, want: "host-dispatch"},
+		{name: "auto-drive", method: "POST", path: "/v0/runs/" + id + "/auto-drive", denied: true, want: "auto-drive"},
+		{name: "POST /v0/campaigns", method: "POST", path: "/v0/campaigns", denied: true, want: "POST /v0/campaigns"},
+		{name: "campaign runs", method: "POST", path: "/v0/campaigns/" + id + "/runs", denied: true, want: "/runs"},
+		{name: "campaign resume", method: "POST", path: "/v0/campaigns/" + id + "/resume", denied: true, want: "/resume"},
+		{name: "POST /v0/tokens", method: "POST", path: "/v0/tokens", denied: true, want: "POST /v0/tokens"},
+		{name: "tokens login", method: "POST", path: "/v0/tokens/login", denied: true, want: "/v0/tokens/login"},
+		{name: "mcp start_run", method: "POST", path: "/mcp", mcpName: "fishhawk_start_run", denied: true, want: "fishhawk_start_run"},
+		{name: "mcp run_stage", method: "POST", path: "/mcp", mcpName: "fishhawk_run_stage", denied: true, want: "fishhawk_run_stage"},
+		{name: "mcp dispatch_stage", method: "POST", path: "/mcp", mcpName: "fishhawk_dispatch_stage", denied: true, want: "fishhawk_dispatch_stage"},
+		{name: "mcp run_children", method: "POST", path: "/mcp", mcpName: "fishhawk_run_children", denied: true, want: "fishhawk_run_children"},
+		{name: "mcp drive_run", method: "POST", path: "/mcp", mcpName: "fishhawk_drive_run", denied: true, want: "fishhawk_drive_run"},
+		{name: "mcp start_campaign", method: "POST", path: "/mcp", mcpName: "fishhawk_start_campaign", denied: true, want: "fishhawk_start_campaign"},
+		{name: "mcp start_campaign_item_run", method: "POST", path: "/mcp", mcpName: "fishhawk_start_campaign_item_run", denied: true, want: "fishhawk_start_campaign_item_run"},
+		{name: "mcp resume_campaign", method: "POST", path: "/mcp", mcpName: "fishhawk_resume_campaign", denied: true, want: "fishhawk_resume_campaign"},
+		{name: "trailing slash cannot dodge", method: "POST", path: "/v0/runs/", denied: true, want: "POST /v0/runs"},
+		// Positive controls: forwarded, one upstream hit each.
+		{name: "GET /v0/runs", method: "GET", path: "/v0/runs"},
+		{name: "POST trace", method: "POST", path: "/v0/runs/" + id + "/trace"},
+		{name: "mcp get_plan", method: "POST", path: "/mcp", mcpName: "fishhawk_get_plan"},
+		{name: "GET /healthz", method: "GET", path: "/healthz"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			before := hits.Load()
+			req, err := http.NewRequest(c.method, backend.URL+c.path, strings.NewReader("{}"))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			if c.mcpName != "" {
+				req.Header.Set("Mcp-Name", c.mcpName)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("do: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			delta := hits.Load() - before
+			if c.denied {
+				if resp.StatusCode != http.StatusForbidden {
+					t.Errorf("status = %d, want 403; body: %s", resp.StatusCode, body)
+				}
+				if !strings.Contains(string(body), c.want) {
+					t.Errorf("403 body should name the verb %q, got: %s", c.want, body)
+				}
+				if delta != 0 {
+					t.Errorf("upstream hits = %d, want 0 (a denied verb must never reach the upstream)", delta)
+				}
+				return
+			}
+			if resp.StatusCode != http.StatusOK || string(body) != "forwarded ok" {
+				t.Errorf("positive control: status = %d body = %q, want 200 forwarded ok", resp.StatusCode, body)
+			}
+			if delta != 1 {
+				t.Errorf("upstream hits = %d, want exactly 1", delta)
+			}
+		})
+	}
+}
+
+// TestDeniedVerb_Table pins the pure matcher: segment wildcards admit a
+// non-UUID id (the route is denied, not an id format), path.Clean folds a
+// trailing slash and a dot segment, the method is part of the key, a
+// shorter or longer path is not a match, and the /mcp row applies only
+// with a listed Mcp-Name (absent or read-only names pass — the documented
+// header-spoof residual).
+func TestDeniedVerb_Table(t *testing.T) {
+	mcp := func(name string) http.Header {
+		h := http.Header{}
+		if name != "" {
+			h.Set("Mcp-Name", name)
+		}
+		return h
+	}
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		hdr    http.Header
+		denied bool
+	}{
+		{"exact runs", "POST", "/v0/runs", nil, true},
+		{"non-uuid id segment", "POST", "/v0/runs/abc/stages/xyz/host-dispatch", nil, true},
+		{"trailing slash", "POST", "/v0/runs/abc/auto-drive/", nil, true},
+		{"dot segment", "POST", "/v0/./runs", nil, true},
+		{"double slash", "POST", "/v0//runs", nil, true},
+		{"GET runs passes", "GET", "/v0/runs", nil, false},
+		{"runs by id passes", "POST", "/v0/runs/abc", nil, false},
+		{"stage without host-dispatch passes", "POST", "/v0/runs/abc/stages/xyz", nil, false},
+		{"empty id segment is not a match", "POST", "/v0/runs//stages/xyz/host-dispatch", nil, false},
+		{"tokens", "POST", "/v0/tokens", nil, true},
+		{"tokens login", "POST", "/v0/tokens/login", nil, true},
+		{"tokens by id passes", "DELETE", "/v0/tokens/abc", nil, false},
+		{"mcp start_run", "POST", "/mcp", mcp("fishhawk_start_run"), true},
+		{"mcp no header passes", "POST", "/mcp", mcp(""), false},
+		{"mcp read tool passes", "POST", "/mcp", mcp("fishhawk_get_run_status"), false},
+		{"mcp GET passes", "GET", "/mcp", mcp("fishhawk_start_run"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			reason, denied := egressproxy.DeniedVerb(c.method, c.path, c.hdr)
+			if denied != c.denied {
+				t.Fatalf("DeniedVerb(%s %s) = (%q, %v), want denied=%v", c.method, c.path, reason, denied, c.denied)
+			}
+			if denied && reason == "" {
+				t.Errorf("denied with an empty reason")
+			}
+		})
+	}
+}
