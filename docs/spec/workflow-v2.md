@@ -723,9 +723,15 @@ not a "implement" stage (ADR-065 §3)
 grooming_report-producing stage must declare schema: grooming_report_v1, got ""
 ```
 
-`persistence` says where a copy of the artifact lands. `target` is `fishhawk_audit_log` (the authoritative copy, `mode: canonical`) or `originating_issue` (the human-readable echo on the tracker, `mode: rendered_comment`).
+`persistence` says where a copy of the artifact lands. `target` is `fishhawk_audit_log` (the authoritative copy, `mode: canonical`) or `originating_issue` (the human-readable echo on the tracker, `mode: rendered_comment`). `fishhawk_audit_log` / `canonical` is unconditional: the artifact store + audit chain record it regardless of anything below.
 
-`target: originating_issue` + `mode: rendered_comment` on a plan stage is the **canonical plan-review surface** (ADR-020): the backend posts the full plan as a markdown document on the triggering issue, and reviewers read and approve from the issue thread. `update_on_change: true` edits the existing comment in place on a re-upload; if the comment was deleted the backend falls back to a fresh one. Omitting the flag makes the post one-shot — the comment lands on the first upload and re-uploads are skipped. When a plan stage declares no `originating_issue` target at all, the backend posts a short summary comment linking to the plan document instead.
+`target: originating_issue` + `mode: rendered_comment` on a plan stage governs the **living anchor** (#1054): the single run-status comment the backend keeps edited in place on the triggering issue, which projects run state, reviewer verdicts, economics and the plan itself. This is the *only* consumer of `originating_issue`/`rendered_comment` persistence (`spec.IssueEchoPolicyFor`, E45.41 / #3346) — declaring it does not create a second, separate plan-document comment.
+
+- **Declared + `update_on_change: true`**: the anchor's plan section tracks the latest plan artifact; each earlier version is kept collapsed as "superseded", annotated with the rejection reason (if any) that retired it.
+- **Declared, flag omitted**: one-shot — the *first* published plan artifact is pinned as the anchor's current plan forever; later revisions are not republished, and the anchor notes how many were skipped.
+- **No `originating_issue` entry on the plan stage at all**: the anchor carries no plan content — only a one-line pointer to view the plan on the run page. The plan is still fully readable there and in `fishhawk_audit_log`/`canonical`.
+
+A GitHub Issues-triggered run is the only anchor-bearing path today: the notifier that projects this policy is scoped to the GitHub App and the `originating_issue` echo, however declared, is **not delivered** for a GitLab-triggered run — tracked as the forge-routed notifier work under E45 (#1852; issue-echo parity slice #3481 / E45.52).
 
 ## Constraints
 

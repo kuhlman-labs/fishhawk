@@ -47,6 +47,14 @@ type AnchorPlanView struct {
 	// RecommendationRationale is the rationale paired with RecommendedModel
 	// (model_recommendation.rationale). Empty when absent.
 	RecommendationRationale string
+	// UnpublishedRevisions counts later plan artifacts that were never
+	// republished to this anchor because the plan stage's persistence
+	// declaration omits `update_on_change` (E45.41 / #3346, one-shot pin —
+	// see spec.IssueEchoPolicyFor). Zero means either update_on_change IS
+	// set (every revision is republished, the common case) or this is the
+	// only plan version. >0 renders an explanatory note under the plan
+	// summary.
+	UnpublishedRevisions int
 }
 
 // AnchorInput bundles everything RenderAnchorBody projects. CurrentPlan
@@ -65,9 +73,16 @@ type AnchorInput struct {
 	// run's cost/latency rollups and populates this; nil (or an all-zero
 	// rollup) omits the block. It is a DROPPABLE section — the degradation
 	// ladder sheds it FIRST when the body exceeds the comment cap.
-	Economics   *EconomicsInput
-	ExternalURL string
-	Now         time.Time
+	Economics *EconomicsInput
+	// PlanEchoSuppressed is true when a plan artifact exists but the
+	// workflow's plan stage declares no originating_issue/rendered_comment
+	// persistence entry (E45.41 / #3346, spec.IssueEchoPolicyFor
+	// Declared==false). The current-plan section then renders only a
+	// one-line run-page pointer — no summary, no Plan details — regardless
+	// of CurrentPlan's value.
+	PlanEchoSuppressed bool
+	ExternalURL        string
+	Now                time.Time
 }
 
 // anchorSections is the assembled, still-mutable form of the anchor body
@@ -119,7 +134,7 @@ func RenderAnchorBody(in AnchorInput) string {
 		stages:          renderAnchorStages(in.Stages),
 		timeline:        renderAnchorTimeline(in.Audit),
 		reviews:         renderAnchorReviews(in.Stages, in.Audit),
-		currentPlan:     renderCurrentPlan(in.CurrentPlan),
+		currentPlan:     renderCurrentPlan(in.CurrentPlan, in.PlanEchoSuppressed),
 		modelResolved:   renderResolvedModel(in.Audit),
 		supersededPlans: renderSupersededPlans(in.SupersededPlans),
 		economics:       renderEconomicsSection(in.Economics),
@@ -513,7 +528,18 @@ func renderStageReviews(stageType string, entries []*audit.Entry) string {
 // into a `Plan details` <details> (#1073). The <summary> attribute holds
 // the short label `Plan details`, never plan prose, and the summary text
 // is never duplicated inside the details body.
-func renderCurrentPlan(p *AnchorPlanView) string {
+//
+// suppressed (E45.41 / #3346) short-circuits the whole section to a
+// one-line run-page pointer — no summary, no Plan details, no
+// unpublished-revisions note — regardless of p; this is the !Declared
+// case of spec.IssueEchoPolicyFor, so there is nothing plan-shaped to
+// show on the issue at all. p.UnpublishedRevisions (the one-shot,
+// !UpdateOnChange case) renders an explanatory note under the summary
+// when non-zero.
+func renderCurrentPlan(p *AnchorPlanView, suppressed bool) string {
+	if suppressed {
+		return "**Plan**\n\n_Not echoed to this issue — the plan stage declares no `originating_issue` persistence. View it on the run page._"
+	}
 	if p == nil {
 		return ""
 	}
@@ -523,6 +549,9 @@ func renderCurrentPlan(p *AnchorPlanView) string {
 		fmt.Fprintf(&b, "%s\n", p.Summary)
 	} else {
 		b.WriteString("_No summary provided._\n")
+	}
+	if p.UnpublishedRevisions > 0 {
+		fmt.Fprintf(&b, "\n_This plan has been revised %d time(s) since it was first published; the plan stage does not set `update_on_change`, so this echo is not republished — the current plan is on the run page._\n", p.UnpublishedRevisions)
 	}
 	if p.RecommendedModel != "" {
 		// The planner's complexity-informed implement-model recommendation

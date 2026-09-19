@@ -7438,3 +7438,118 @@ workflows:
 		})
 	}
 }
+
+// TestIssueEchoPolicyFor_Pin is the direct pin on the persistence resolver
+// that makes the plan stage's `persistence` block a real consumer on the
+// living-anchor path (E45.41 / #3346). One case per resolution branch.
+func TestIssueEchoPolicyFor_Pin(t *testing.T) {
+	wf := func(persist ...spec.Persistence) spec.Workflow {
+		return spec.Workflow{Stages: []spec.Stage{{
+			ID:   "plan",
+			Type: spec.StageTypePlan,
+			Produces: []spec.Produces{{
+				Artifact:    spec.ArtifactPlan,
+				Persistence: persist,
+			}},
+		}}}
+	}
+	cases := []struct {
+		name string
+		wf   spec.Workflow
+		kind spec.ArtifactKind
+		want spec.IssueEchoPolicy
+	}{
+		{
+			name: "declared with update_on_change true",
+			wf: wf(
+				spec.Persistence{Target: spec.PersistenceOriginatingIssue, Mode: spec.ModeRenderedComment, UpdateOnChange: true},
+				spec.Persistence{Target: spec.PersistenceFishhawkAuditLog, Mode: spec.ModeCanonical},
+			),
+			kind: spec.ArtifactPlan,
+			want: spec.IssueEchoPolicy{Declared: true, UpdateOnChange: true},
+		},
+		{
+			name: "declared with update_on_change flag omitted",
+			wf: wf(
+				spec.Persistence{Target: spec.PersistenceOriginatingIssue, Mode: spec.ModeRenderedComment},
+				spec.Persistence{Target: spec.PersistenceFishhawkAuditLog, Mode: spec.ModeCanonical},
+			),
+			kind: spec.ArtifactPlan,
+			want: spec.IssueEchoPolicy{Declared: true, UpdateOnChange: false},
+		},
+		{
+			name: "originating_issue with canonical mode only -> not declared",
+			wf: wf(
+				spec.Persistence{Target: spec.PersistenceOriginatingIssue, Mode: spec.ModeCanonical},
+			),
+			kind: spec.ArtifactPlan,
+			want: spec.IssueEchoPolicy{},
+		},
+		{
+			name: "fishhawk_audit_log only -> not declared",
+			wf: wf(
+				spec.Persistence{Target: spec.PersistenceFishhawkAuditLog, Mode: spec.ModeCanonical},
+			),
+			kind: spec.ArtifactPlan,
+			want: spec.IssueEchoPolicy{},
+		},
+		{
+			name: "audit_log update_on_change ignored alongside an undeclared-flag originating_issue entry",
+			wf: wf(
+				spec.Persistence{Target: spec.PersistenceOriginatingIssue, Mode: spec.ModeRenderedComment},
+				spec.Persistence{Target: spec.PersistenceFishhawkAuditLog, Mode: spec.ModeCanonical, UpdateOnChange: true},
+			),
+			kind: spec.ArtifactPlan,
+			want: spec.IssueEchoPolicy{Declared: true, UpdateOnChange: false},
+		},
+		{
+			name: "artifact kind mismatch -> not declared",
+			wf: wf(
+				spec.Persistence{Target: spec.PersistenceOriginatingIssue, Mode: spec.ModeRenderedComment, UpdateOnChange: true},
+			),
+			kind: spec.ArtifactPullRequest,
+			want: spec.IssueEchoPolicy{},
+		},
+		{
+			name: "empty produces -> zero value",
+			wf:   spec.Workflow{Stages: []spec.Stage{{ID: "plan", Type: spec.StageTypePlan}}},
+			kind: spec.ArtifactPlan,
+			want: spec.IssueEchoPolicy{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := spec.IssueEchoPolicyFor(tc.wf, tc.kind); got != tc.want {
+				t.Errorf("IssueEchoPolicyFor = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIssueEchoPolicyFor_PresetsDeclareLivingAnchorEcho is a done-means pin:
+// every embedded onboarding preset's feature_change plan stage must resolve
+// to {Declared:true, UpdateOnChange:true} so a silent preset edit that would
+// change dogfood anchor rendering fails in-loop rather than shipping quietly.
+func TestIssueEchoPolicyFor_PresetsDeclareLivingAnchorEcho(t *testing.T) {
+	for _, p := range []spec.Preset{spec.PresetLow, spec.PresetMedium, spec.PresetHigh} {
+		t.Run(string(p), func(t *testing.T) {
+			data, err := spec.PresetBytes(p)
+			if err != nil {
+				t.Fatalf("PresetBytes(%q): %v", p, err)
+			}
+			parsed, err := spec.ParseBytes(data)
+			if err != nil {
+				t.Fatalf("ParseBytes(%q): %v", p, err)
+			}
+			wf, ok := parsed.Workflows["feature_change"]
+			if !ok {
+				t.Fatalf("preset %q has no feature_change workflow", p)
+			}
+			got := spec.IssueEchoPolicyFor(wf, spec.ArtifactPlan)
+			want := spec.IssueEchoPolicy{Declared: true, UpdateOnChange: true}
+			if got != want {
+				t.Errorf("preset %q IssueEchoPolicyFor(plan) = %+v, want %+v", p, got, want)
+			}
+		})
+	}
+}
