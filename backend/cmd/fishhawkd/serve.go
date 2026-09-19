@@ -2921,9 +2921,20 @@ func runServe(args []string, logSink io.Writer) int {
 	// through to the mirror rather than denying everything.
 	if pool != nil {
 		cfg.RepoProviders = account.NewResolver(accountdb.New(pool))
+		// POST /v0/runs gitlab forge seam (E45.46 / #3463): the exact
+		// project_path → installation_ref resolver, plus the deployment
+		// GitLab root as the single-run read's forge_base_url fallback.
+		// Same pool gate as RepoProviders — without a database the create
+		// path refuses a gitlab run 503 gitlab_unconfigured.
+		cfg.GitLabInstallations = account.NewGitLabProjectResolver(accountdb.New(pool))
+		cfg.GitLabBaseURL = *gitlabBaseURL
 		cfg.RepoVisibility = resolveRepoVisibility(
 			repoacl.NewPostgresStore(pool), cfg.IdentityProvider, *repoACLTTL, logger)
 	}
+	logger.Info("gitlab run creation via POST /v0/runs",
+		slog.Bool("installation_registry", cfg.GitLabInstallations != nil),
+		slog.String("gitlab_base_url_fallback", cfg.GitLabBaseURL),
+		slog.String("ref", "#3463"))
 	if cfg.RepoVisibility != nil {
 		logger.Info("repo-scoped read filtering enabled (non-admin workspace members see only repos they hold forge read on)",
 			slog.Duration("ttl", *repoACLTTL),

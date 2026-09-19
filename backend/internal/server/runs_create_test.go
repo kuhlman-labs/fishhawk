@@ -8,9 +8,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -981,5 +984,540 @@ func TestCreateRun_V2AutoAdvanceParityWithV1Drive(t *testing.T) {
 	}
 	if v2Drive != v1Drive {
 		t.Errorf("v2 `auto_advance: true` produced Drive=%v, want the same %v as v1 `drive: true`", v2Drive, v1Drive)
+	}
+}
+
+// --- Forge ladder + gitlab run creation (E45.46 / #3463) ---
+
+// fakeGitLabInstallations is a fixed-answer GitLabInstallationResolver that
+// records every lookup so a test can assert the registry was (or was NOT)
+// consulted.
+type fakeGitLabInstallations struct {
+	inst         account.GitLabInstallation
+	found        bool
+	err          error
+	projectCalls int
+	lastPath     string
+	refCalls     int
+	lastRef      string
+}
+
+func (f *fakeGitLabInstallations) ResolveGitLabProject(_ context.Context, projectPath string) (account.GitLabInstallation, bool, error) {
+	f.projectCalls++
+	f.lastPath = projectPath
+	return f.inst, f.found, f.err
+}
+
+func (f *fakeGitLabInstallations) ResolveGitLabInstallationByRef(_ context.Context, ref string) (account.GitLabInstallation, bool, error) {
+	f.refCalls++
+	f.lastRef = ref
+	return f.inst, f.found, f.err
+}
+
+// neverDialedGitHubClient is a *githubclient.Client whose installation endpoint
+// fails the test if hit — the never-dialed seam for the gitlab branch.
+func neverDialedGitHubClient(t *testing.T) (*githubclient.Client, *installRecorder) {
+	t.Helper()
+	rec := &installRecorder{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, r *http.Request) {
+		rec.mu.Lock()
+		rec.hits++
+		rec.mu.Unlock()
+		t.Errorf("GitHub client dialed %s %s for a gitlab run; want the App installation lookup skipped", r.Method, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}, rec
+}
+
+func postForgeCreateRun(t *testing.T, s *Server, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(string(raw)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	return w
+}
+
+func gitlabCreateBody() map[string]any {
+	return map[string]any{
+		"repo":           "acme/platform/api",
+		"workflow_id":    "trivial",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"workflow_spec":  minimalSpecYAML,
+		"forge":          "gitlab",
+	}
+}
+
+func forgeGetRun(t *testing.T, s *Server, id uuid.UUID) runResponse {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+id.String(), nil)
+	req.SetPathValue("run_id", id.String())
+	w := httptest.NewRecorder()
+	s.handleGetRun(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET run status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// TestCreateRun_Forge_ExplicitGitLab_StampsInstallationRef is the
+// cross-boundary test: request payload → resolveCreateForge →
+// resolveCreateGitLabInstallation → CreateRunForTrigger → run.CreateRunParams
+// (committed-state read of the captured params) with the GitHub client
+// NEVER dialed. It then pins the read surfaces: GET /v0/runs/{id} carries
+// forge:gitlab + forge_base_url (installation column, else cfg fallback) and
+// the LIST body carries forge but NO forge_base_url — the single-run-only
+// asymmetry the spawn-side helper relies on.
+func TestCreateRun_Forge_ExplicitGitLab_StampsInstallationRef(t *testing.T) {
+	cases := []struct {
+		name        string
+		instBaseURL string
+		cfgBaseURL  string
+		wantBaseURL string
+	}{
+		{"installation_column_wins", "https://gitlab.example.com", "https://fallback.example.com", "https://gitlab.example.com"},
+		{"empty_column_falls_to_cfg", "", "https://fallback.example.com", "https://fallback.example.com"},
+		{"neither_omitted", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeRepo()
+			gh, rec := neverDialedGitHubClient(t)
+			gl := &fakeGitLabInstallations{
+				inst:  account.GitLabInstallation{InstallationRef: "gitlab:4242", ProjectPath: "acme/platform/api", ForgeBaseURL: tc.instBaseURL},
+				found: true,
+			}
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitHub: gh, GitLabInstallations: gl, GitLabBaseURL: tc.cfgBaseURL,
+				// Registry says github for this owner: explicit gitlab must win.
+				RepoProviders: &fakeProviderResolver{provider: "github", found: true}})
+
+			w := postForgeCreateRun(t, s, gitlabCreateBody())
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			// Committed state: what the handler threaded into the repo.
+			p := repo.lastCreateRunParams
+			if p.InstallationRef == nil || *p.InstallationRef != "gitlab:4242" {
+				t.Errorf("CreateRunParams.InstallationRef = %v, want gitlab:4242", p.InstallationRef)
+			}
+			if p.InstallationID != nil {
+				t.Errorf("CreateRunParams.InstallationID = %d, want nil", *p.InstallationID)
+			}
+			if p.RunnerKind != run.RunnerKindLocal {
+				t.Errorf("CreateRunParams.RunnerKind = %q, want local", p.RunnerKind)
+			}
+			if gl.projectCalls != 1 || gl.lastPath != "acme/platform/api" {
+				t.Errorf("ResolveGitLabProject calls=%d path=%q, want 1 call with the repo", gl.projectCalls, gl.lastPath)
+			}
+			rec.mu.Lock()
+			hits := rec.hits
+			rec.mu.Unlock()
+			if hits != 0 {
+				t.Errorf("GitHub installation endpoint hits = %d, want 0 (never dialed)", hits)
+			}
+			var created runResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+				t.Fatal(err)
+			}
+			if created.Forge != "gitlab" {
+				t.Errorf("201 body forge = %q, want gitlab", created.Forge)
+			}
+
+			got := forgeGetRun(t, s, created.ID)
+			if got.Forge != "gitlab" {
+				t.Errorf("GET forge = %q, want gitlab", got.Forge)
+			}
+			if got.ForgeBaseURL != tc.wantBaseURL {
+				t.Errorf("GET forge_base_url = %q, want %q", got.ForgeBaseURL, tc.wantBaseURL)
+			}
+			if gl.refCalls != 1 || gl.lastRef != "gitlab:4242" {
+				t.Errorf("ResolveGitLabInstallationByRef calls=%d ref=%q, want 1 call with the stamped ref", gl.refCalls, gl.lastRef)
+			}
+
+			// LIST: forge present, forge_base_url absent — raw-body check so
+			// an omitempty-elided field is distinguishable from an empty one.
+			lreq := httptest.NewRequest(http.MethodGet, "/v0/runs?repo=acme/platform/api", nil)
+			lw := httptest.NewRecorder()
+			s.handleListRuns(lw, withAuth(lreq))
+			if lw.Code != http.StatusOK {
+				t.Fatalf("list status = %d:\n%s", lw.Code, lw.Body.String())
+			}
+			var list struct {
+				Items []map[string]any `json:"items"`
+			}
+			if err := json.Unmarshal(lw.Body.Bytes(), &list); err != nil {
+				t.Fatal(err)
+			}
+			if len(list.Items) != 1 {
+				t.Fatalf("list items = %d, want 1", len(list.Items))
+			}
+			if list.Items[0]["forge"] != "gitlab" {
+				t.Errorf("list item forge = %v, want gitlab", list.Items[0]["forge"])
+			}
+			if _, present := list.Items[0]["forge_base_url"]; present {
+				t.Errorf("list item carries forge_base_url = %v; want ABSENT (single-run read only)", list.Items[0]["forge_base_url"])
+			}
+			if gl.refCalls != 1 {
+				t.Errorf("list read consulted the registry (refCalls=%d); want no per-row lookup", gl.refCalls)
+			}
+		})
+	}
+}
+
+// TestCreateRun_GetRun_ResolverErrorFallsToDeploymentDefault pins the
+// warn-and-fall-back branch of the single-run read: a registry error never
+// fails the GET; forge_base_url falls to cfg.GitLabBaseURL.
+func TestCreateRun_GetRun_ResolverErrorFallsToDeploymentDefault(t *testing.T) {
+	repo := newFakeRepo()
+	gl := &fakeGitLabInstallations{err: errors.New("registry down")}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitLabInstallations: gl, GitLabBaseURL: "https://fallback.example.com"})
+	ref := "gitlab:9"
+	seeded, err := repo.CreateRun(context.Background(), run.CreateRunParams{Repo: "acme/api", WorkflowID: "w", WorkflowSHA: "s", TriggerSource: run.TriggerCLI, RunnerKind: run.RunnerKindLocal, InstallationRef: &ref})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := forgeGetRun(t, s, seeded.ID)
+	if got.Forge != "gitlab" || got.ForgeBaseURL != "https://fallback.example.com" {
+		t.Errorf("GET = forge %q base %q, want gitlab / the deployment default on a resolver error", got.Forge, got.ForgeBaseURL)
+	}
+}
+
+// TestCreateRun_Forge_DerivedFromRepoProviders: forge omitted + the registry
+// says gitlab for the owner → a gitlab run (installation stamped, never
+// dialed GitHub).
+func TestCreateRun_Forge_DerivedFromRepoProviders(t *testing.T) {
+	repo := newFakeRepo()
+	gh, _ := neverDialedGitHubClient(t)
+	gl := &fakeGitLabInstallations{inst: account.GitLabInstallation{InstallationRef: "gitlab:4242"}, found: true}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitHub: gh, GitLabInstallations: gl,
+		RepoProviders: &fakeProviderResolver{provider: "gitlab", found: true}})
+	body := gitlabCreateBody()
+	delete(body, "forge")
+	w := postForgeCreateRun(t, s, body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if p := repo.lastCreateRunParams; p.InstallationRef == nil || *p.InstallationRef != "gitlab:4242" {
+		t.Errorf("InstallationRef = %v, want gitlab:4242 derived from the registry", p.InstallationRef)
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Forge != "gitlab" {
+		t.Errorf("forge = %q, want gitlab", created.Forge)
+	}
+}
+
+// TestCreateRun_Forge_ExplicitGitHubWinsOverRegistryGitLab is the backend half
+// of constraint 1's "explicit wins": the registry says gitlab for the owner,
+// the body pins github → a github run whose App installation IS resolved, and
+// the gitlab registry is never consulted. Counterfactual vehicle for the
+// explicit-wins branch of resolveCreateForge.
+func TestCreateRun_Forge_ExplicitGitHubWinsOverRegistryGitLab(t *testing.T) {
+	repo := newFakeRepo()
+	rec := &installRecorder{}
+	gh := recordingInstallGitHubClient(t, 77, rec)
+	gl := &fakeGitLabInstallations{inst: account.GitLabInstallation{InstallationRef: "gitlab:4242"}, found: true}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitHub: gh, GitLabInstallations: gl,
+		RepoProviders: &fakeProviderResolver{provider: "gitlab", found: true}})
+	body := gitlabCreateBody()
+	body["repo"] = "acme/api"
+	body["forge"] = "github"
+	w := postForgeCreateRun(t, s, body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	p := repo.lastCreateRunParams
+	if p.InstallationRef != nil {
+		t.Errorf("InstallationRef = %q, want nil on an explicit github run", *p.InstallationRef)
+	}
+	if p.InstallationID == nil || *p.InstallationID != 77 {
+		t.Errorf("InstallationID = %v, want 77 (App installation resolved)", p.InstallationID)
+	}
+	if gl.projectCalls != 0 {
+		t.Errorf("gitlab registry consulted %d times; want 0", gl.projectCalls)
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Forge != "github" {
+		t.Errorf("forge = %q, want github", created.Forge)
+	}
+}
+
+// Omitted forge with an unregistered or doubly-registered owner (found=false)
+// defaults to github: today's behaviour, the App installation resolved.
+func TestCreateRun_Forge_AmbiguousOrUnknownOwner_DefaultsGitHub(t *testing.T) {
+	for _, name := range []string{"unknown", "ambiguous"} {
+		t.Run(name, func(t *testing.T) {
+			repo := newFakeRepo()
+			rec := &installRecorder{}
+			gh := recordingInstallGitHubClient(t, 5, rec)
+			gl := &fakeGitLabInstallations{found: true, inst: account.GitLabInstallation{InstallationRef: "gitlab:1"}}
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitHub: gh, GitLabInstallations: gl,
+				RepoProviders: &fakeProviderResolver{found: false}})
+			body := gitlabCreateBody()
+			body["repo"] = "acme/api"
+			delete(body, "forge")
+			w := postForgeCreateRun(t, s, body)
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			p := repo.lastCreateRunParams
+			if p.InstallationID == nil || *p.InstallationID != 5 || p.InstallationRef != nil {
+				t.Errorf("params = (id %v, ref %v), want (5, nil): github default", p.InstallationID, p.InstallationRef)
+			}
+			if gl.projectCalls != 0 {
+				t.Errorf("gitlab registry consulted; want 0 calls")
+			}
+		})
+	}
+}
+
+func TestCreateRun_Forge_ResolverError_503(t *testing.T) {
+	repo := newFakeRepo()
+	gl := &fakeGitLabInstallations{}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitLabInstallations: gl,
+		RepoProviders: &fakeProviderResolver{err: errors.New("db down")}})
+	body := gitlabCreateBody()
+	delete(body, "forge")
+	w := postForgeCreateRun(t, s, body)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeErrorCode(t, w); code != "forge_unresolvable" {
+		t.Errorf("code = %q, want forge_unresolvable", code)
+	}
+	if len(repo.runs) != 0 {
+		t.Errorf("run rows = %d, want 0", len(repo.runs))
+	}
+}
+
+func TestCreateRun_Forge_InvalidValue_400(t *testing.T) {
+	repo := newFakeRepo()
+	// A resolver that would answer if consulted: the explicit invalid value
+	// must be refused BEFORE the ladder reaches it.
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo,
+		RepoProviders: &fakeProviderResolver{provider: "github", found: true}})
+	body := gitlabCreateBody()
+	body["forge"] = "bitbucket"
+	w := postForgeCreateRun(t, s, body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeErrorCode(t, w); code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+	if !strings.Contains(w.Body.String(), `"field":"forge"`) || !strings.Contains(w.Body.String(), "github, gitlab") {
+		t.Errorf("body should name the forge field and both accepted values: %s", w.Body.String())
+	}
+	if len(repo.runs) != 0 {
+		t.Errorf("run rows = %d, want 0", len(repo.runs))
+	}
+}
+
+// One case per branch: github_actions explicit, and empty (which would
+// default to github_actions). Both refused 400 naming both accepted kinds,
+// BEFORE the registry is consulted. Counterfactual vehicle for the
+// runner_kind pairing check.
+func TestCreateRun_GitLab_RejectsRunnerKindGitHubActionsAndEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind any // nil → omit the field
+	}{
+		{"github_actions", "github_actions"},
+		{"empty", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeRepo()
+			gl := &fakeGitLabInstallations{found: true, inst: account.GitLabInstallation{InstallationRef: "gitlab:1"}}
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitLabInstallations: gl})
+			body := gitlabCreateBody()
+			if tc.kind == nil {
+				delete(body, "runner_kind")
+			} else {
+				body["runner_kind"] = tc.kind
+			}
+			w := postForgeCreateRun(t, s, body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			if code := decodeErrorCode(t, w); code != "validation_failed" {
+				t.Errorf("code = %q, want validation_failed", code)
+			}
+			b := w.Body.String()
+			if !strings.Contains(b, `"field":"runner_kind"`) || !strings.Contains(b, "local") || !strings.Contains(b, "gitlab_ci") {
+				t.Errorf("body should name runner_kind and both accepted kinds (local, gitlab_ci): %s", b)
+			}
+			if gl.projectCalls != 0 {
+				t.Errorf("registry consulted %d times; want 0 (pairing refused first)", gl.projectCalls)
+			}
+			if len(repo.runs) != 0 {
+				t.Errorf("run rows = %d, want 0", len(repo.runs))
+			}
+		})
+	}
+}
+
+func TestCreateRun_GitLab_RequiresInlineSpec_422(t *testing.T) {
+	repo := newFakeRepo()
+	gl := &fakeGitLabInstallations{found: true, inst: account.GitLabInstallation{InstallationRef: "gitlab:1"}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitLabInstallations: gl})
+	body := gitlabCreateBody()
+	delete(body, "workflow_spec")
+	w := postForgeCreateRun(t, s, body)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeErrorCode(t, w); code != "workflow_spec_required" {
+		t.Errorf("code = %q, want workflow_spec_required", code)
+	}
+	if gl.projectCalls != 0 {
+		t.Errorf("registry consulted; want 0 calls")
+	}
+	if len(repo.runs) != 0 {
+		t.Errorf("run rows = %d, want 0", len(repo.runs))
+	}
+}
+
+func TestCreateRun_GitLab_UnregisteredProject_422_NamesRemedy(t *testing.T) {
+	repo := newFakeRepo()
+	gl := &fakeGitLabInstallations{found: false}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitLabInstallations: gl})
+	w := postForgeCreateRun(t, s, gitlabCreateBody())
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeErrorCode(t, w); code != "gitlab_project_not_registered" {
+		t.Errorf("code = %q, want gitlab_project_not_registered", code)
+	}
+	var e errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &e); err != nil {
+		t.Fatal(err)
+	}
+	want := "fishhawkd installation register --provider gitlab --account-key acme --installation-ref gitlab:<project_id> --project-path acme/platform/api"
+	if !strings.Contains(e.Error.Message, want) {
+		t.Errorf("message should name the remedy %q:\n%s", want, e.Error.Message)
+	}
+	if len(repo.runs) != 0 {
+		t.Errorf("run rows = %d, want 0", len(repo.runs))
+	}
+}
+
+func TestCreateRun_GitLab_NoRegistry_503(t *testing.T) {
+	repo := newFakeRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo}) // GitLabInstallations nil
+	w := postForgeCreateRun(t, s, gitlabCreateBody())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeErrorCode(t, w); code != "gitlab_unconfigured" {
+		t.Errorf("code = %q, want gitlab_unconfigured", code)
+	}
+	if len(repo.runs) != 0 {
+		t.Errorf("run rows = %d, want 0", len(repo.runs))
+	}
+}
+
+func TestCreateRun_GitLab_ResolverError_500(t *testing.T) {
+	repo := newFakeRepo()
+	gl := &fakeGitLabInstallations{err: errors.New("registry down")}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitLabInstallations: gl})
+	w := postForgeCreateRun(t, s, gitlabCreateBody())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeErrorCode(t, w); code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", code)
+	}
+	if len(repo.runs) != 0 {
+		t.Errorf("run rows = %d, want 0", len(repo.runs))
+	}
+}
+
+// A plain github create (no forge field, no resolver wired) is byte-for-byte
+// today's behaviour, and the response now ALWAYS carries forge:github on both
+// the 201 body and the list read.
+func TestCreateRun_GitHub_Unchanged_ForgeFieldPresent(t *testing.T) {
+	repo := newFakeRepo()
+	rec := &installRecorder{}
+	gh := recordingInstallGitHubClient(t, 9, rec)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, GitHub: gh})
+	body := gitlabCreateBody()
+	body["repo"] = "acme/api"
+	delete(body, "forge")
+	w := postForgeCreateRun(t, s, body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if p := repo.lastCreateRunParams; p.InstallationID == nil || *p.InstallationID != 9 || p.InstallationRef != nil {
+		t.Errorf("params = (id %v, ref %v), want (9, nil)", p.InstallationID, p.InstallationRef)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw["forge"] != "github" {
+		t.Errorf("201 body forge = %v, want github", raw["forge"])
+	}
+	if _, present := raw["forge_base_url"]; present {
+		t.Errorf("201 body carries forge_base_url on a github run; want absent")
+	}
+	id := uuid.MustParse(raw["id"].(string))
+	got := forgeGetRun(t, s, id)
+	if got.Forge != "github" || got.ForgeBaseURL != "" {
+		t.Errorf("GET = forge %q base %q, want github / empty", got.Forge, got.ForgeBaseURL)
+	}
+}
+
+// TestCreateRun_BadRunnerKindMessageNamesEveryKind is the done-means for the
+// derived message: the 400 for an unknown runner_kind must name EVERY member
+// of run.ValidRunnerKinds — the literal it replaced silently omitted gitlab_ci.
+func TestCreateRun_BadRunnerKindMessageNamesEveryKind(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	body := gitlabCreateBody()
+	delete(body, "forge")
+	body["runner_kind"] = "k8s"
+	w := postForgeCreateRun(t, s, body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &e); err != nil {
+		t.Fatal(err)
+	}
+	for kind := range run.ValidRunnerKinds {
+		if !strings.Contains(e.Error.Message, kind) {
+			t.Errorf("message %q does not name runner_kind %q", e.Error.Message, kind)
+		}
+	}
+	if len(run.ValidRunnerKinds) < 3 {
+		t.Fatalf("ValidRunnerKinds has %d members; the done-means needs gitlab_ci present", len(run.ValidRunnerKinds))
 	}
 }

@@ -146,6 +146,51 @@ func (q *Queries) ListAccounts(ctx context.Context) ([]Account, error) {
 	return items, nil
 }
 
+const listGitLabInstallationsByProjectPath = `-- name: ListGitLabInstallationsByProjectPath :many
+SELECT id, account_id, provider, installation_ref, created_at, updated_at, forge_base_url, oauth_base_url, project_path FROM installations
+ WHERE provider = 'gitlab'
+   AND project_path = $1
+ ORDER BY installation_ref ASC
+`
+
+// The POST /v0/runs forge seam for a GitLab project (E45.46 / #3463): the
+// registered gitlab installation(s) whose project_path (0078, E45.26 / #2877)
+// EXACTLY equals the run's repo — the same exact-path binding the run-creation
+// authorization gate enforces. Case-sensitive on purpose (GitLab paths are).
+// More than one row is possible only through operator error (two refs bound to
+// one path); the resolver treats that as AMBIGUOUS (found=false), never an
+// arbitrary first row, so the stable installation_ref order matters only for
+// deterministic diagnostics.
+func (q *Queries) ListGitLabInstallationsByProjectPath(ctx context.Context, projectPath *string) ([]Installation, error) {
+	rows, err := q.db.Query(ctx, listGitLabInstallationsByProjectPath, projectPath)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Installation
+	for rows.Next() {
+		var i Installation
+		if err := rows.Scan(
+			&i.ID,
+			&i.AccountID,
+			&i.Provider,
+			&i.InstallationRef,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.ForgeBaseUrl,
+			&i.OauthBaseUrl,
+			&i.ProjectPath,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listInstallations = `-- name: ListInstallations :many
 SELECT i.id, i.account_id, i.provider, i.installation_ref, i.forge_base_url, i.oauth_base_url, i.project_path, i.created_at, i.updated_at, a.account_key
   FROM installations i

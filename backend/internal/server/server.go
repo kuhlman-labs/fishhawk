@@ -545,6 +545,24 @@ type Config struct {
 	// resolver ERROR fails the request closed with 503.
 	RepoProviders ProviderResolver
 
+	// GitLabInstallations resolves the registered gitlab installation for a
+	// GitLab project path on POST /v0/runs (E45.46 / #3463): a `forge: gitlab`
+	// run is stamped with the installation_ref (`gitlab:<project_id>`) whose
+	// project_path EXACTLY equals the request's repo, and the single-run read
+	// resolves the run's forge_base_url back through it. Satisfied by
+	// *account.GitLabProjectResolver. NIL means no registry is wired (no
+	// database): creating a gitlab run then refuses 503 gitlab_unconfigured
+	// rather than minting an unattributed run the runner cannot push from.
+	GitLabInstallations GitLabInstallationResolver
+
+	// GitLabBaseURL is the deployment-level GitLab instance root
+	// (FISHHAWKD_GITLAB_BASE_URL). Consulted ONLY as the forge_base_url
+	// fallback on GET /v0/runs/{id} for a gitlab run whose installation row
+	// carries no forge_base_url; empty leaves the field omitted so the
+	// spawn-side consumer fails closed instead of targeting gitlab.com by
+	// accident.
+	GitLabBaseURL string
+
 	// ExternalURL is the operator-facing root URL for the SPA, e.g.
 	// `https://app.fishhawk.example.com`. Used to build links in
 	// surfaces that escape the backend (today: GitHub Check Runs,
