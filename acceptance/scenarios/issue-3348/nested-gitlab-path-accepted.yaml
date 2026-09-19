@@ -1,0 +1,14 @@
+id: scenario:issue-3348/nested-gitlab-path-accepted
+statement: 'GET /v0/onboarding/readiness?repo=gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator&forge=gitlab with an authenticated token returns 200 (not 400): the body echoes that exact repo, carries forge=gitlab, an app object whose installed is false with a non-empty reason when no GitLab forge is configured on the preview, a spec object with source=unavailable and a note, a scopes object, and NO merge_gate key at all.'
+verify_hint: 'HTTP: call the route on the localhost preview with a nested five-segment repo and forge=gitlab; assert status 200 and inspect the JSON body for repo, forge, app.installed/app.reason, spec.source and the absence of the merge_gate key.'
+steps: 'GET /v0/onboarding/readiness?repo=gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator&forge=gitlab with the operator bearer (fhk_… minted via `fishhawkd token issue -db <preview db> -scopes read:onboarding,…`); decoded the JSON and listed its top-level keys. Stub forge state at the time: empty (no project seeded), so no GitLab project was resolvable. Supplementary: with a gitlab account ''acme'' registered (`fishhawkd account create --provider gitlab --account-key acme`) GET …?repo=acme/platform/widgets with NO forge parameter.'
+assertions:
+    expected: '200 (not 400): body echoes that exact repo, forge=gitlab, app.installed false with non-empty reason, spec.source=unavailable with a note, a scopes object, NO merge_gate key.'
+    observed_at_record: '200; body {repo ''gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator'', forge gitlab, app {installed false, reason ''project is not visible to the deployment GitLab credential; register it with `fishhawkd installation register --provider gitlab --project-path <path>` and confirm the token can read it''}, spec {source unavailable, valid false, note ''project is not resolvable with the deployment GitLab credential; cannot fetch the workflow spec''}, reviewers [], scopes {adequate true, required [...], missing []}}; key set [repo, forge, app, spec, reviewers, scopes] — merge_gate absent. Supplementary: acme/platform/widgets with no forge param -> 200 forge gitlab, no merge_gate (registry resolution).'
+    repro_handle: 'curl -H ''Authorization: Bearer <tok>'' ''http://localhost:8090/v0/onboarding/readiness?repo=gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator&forge=gitlab'''
+origin:
+    issue: 3348
+    pr: 3487
+    run_id: 5e502953-9cff-498b-a0a7-395150d5e219
+    head_sha: 1ff94a4a6dedd9fdfb8f062a56610b8eba3b61c5
+    recorded_at: 2026-09-19T06:25:03Z

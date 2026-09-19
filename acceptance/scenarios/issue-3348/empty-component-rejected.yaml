@@ -1,0 +1,14 @@
+id: scenario:issue-3348/empty-component-rejected
+statement: GET /v0/onboarding/readiness?repo=a//b&forge=gitlab (and a/ /b, a/b/) returns 400 validation_failed with details.field=repo — nesting is accepted, an empty or whitespace-only component is not.
+verify_hint: 'HTTP: call the route with each malformed repo value and forge=gitlab; assert 400 validation_failed field repo on every one.'
+steps: GET /v0/onboarding/readiness?repo=<v>&forge=gitlab with the operator bearer for v in a//b, a/%20/b (decodes to 'a/ /b'), a/b/.
+assertions:
+    expected: 400 validation_failed with details.field=repo on every one.
+    observed_at_record: Each -> 400 {error.code validation_failed, message 'repo must be <owner>/<name> (GitHub) or <namespace>/<project> with every component non-empty (GitLab; nested groups allowed)', details {field repo, got <value>}} (got 'a//b', 'a/ /b', 'a/b/').
+    repro_handle: 'for v in a//b a/%20/b a/b/; do curl -H ''Authorization: Bearer <tok>'' "http://localhost:8090/v0/onboarding/readiness?repo=$v&forge=gitlab"; done'
+origin:
+    issue: 3348
+    pr: 3487
+    run_id: 5e502953-9cff-498b-a0a7-395150d5e219
+    head_sha: 1ff94a4a6dedd9fdfb8f062a56610b8eba3b61c5
+    recorded_at: 2026-09-19T06:25:03Z

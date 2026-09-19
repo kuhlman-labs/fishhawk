@@ -1,0 +1,14 @@
+id: scenario:issue-3348/invalid-forge-rejected
+statement: GET /v0/onboarding/readiness?repo=owner/name&forge=bitbucket returns 400 validation_failed with details.field=forge.
+verify_hint: 'HTTP: call the route with forge=bitbucket; assert 400 and details.field forge.'
+steps: GET /v0/onboarding/readiness?repo=owner/name&forge=bitbucket with the operator bearer.
+assertions:
+    expected: 400 validation_failed with details.field=forge.
+    observed_at_record: 400 {error.code validation_failed, message 'forge must be github or gitlab', details {field forge, got bitbucket}}.
+    repro_handle: 'curl -H ''Authorization: Bearer <tok>'' ''http://localhost:8090/v0/onboarding/readiness?repo=owner/name&forge=bitbucket'''
+origin:
+    issue: 3348
+    pr: 3487
+    run_id: 5e502953-9cff-498b-a0a7-395150d5e219
+    head_sha: 1ff94a4a6dedd9fdfb8f062a56610b8eba3b61c5
+    recorded_at: 2026-09-19T06:25:03Z
