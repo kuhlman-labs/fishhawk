@@ -27,7 +27,7 @@ type DispatchStageInput struct {
 	Workflow      string `json:"workflow" jsonschema:"workflow ID matching the run's workflow"`
 	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review | acceptance. dispatch is the DEFAULT verb for a local acceptance stage (E31.9) — it validates against a running preview/target instance and runs long, so non-blocking dispatch keeps the session free; no new argv (composeRunnerArgv passes --stage through, and acceptance takes neither --plan-out nor --check-base-ref)"`
 	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path)"`
-	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
+	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement stage; defaults to main. It applies even when push_and_open_pr is false — the runner passes --base-branch (and --check-base-ref for every implement stage) unconditionally and provisions the run worktree from it"`
 	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1), same as fishhawk_run_stage. A bare omitted value resolves to true. On a STANDALONE implement stage false is supported and unchanged (the E22.8/#406 commit-yourself flow): the agent's work is left in the working tree for the operator to commit, and the stage settles on its trace upload. On a DECOMPOSITION CHILD or a FIX-UP pass false is REFUSED (#2691), because those stages settle on a push this flag suppresses — use fishhawk_run_children for a decomposition child, and re-dispatch without push_and_open_pr=false for a fix-up"`
 	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary, then PATH"`
@@ -214,6 +214,15 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		return nil, DispatchStageOutput{}, guardErr
 	}
 
+	// (1b) Forge target (E45.46 / #3463), the parity mirror of the run_stage
+	// call site: the ONE single-run read every spawn producer routes through,
+	// FAIL CLOSED before RecordAutoDriveAct, the host-dispatch marker and the
+	// spawn, so a refusal commits no state and spawns nothing.
+	forgeTarget, err := r.resolveRunForgeTarget(ctx, runUUID)
+	if err != nil {
+		return nil, DispatchStageOutput{}, err
+	}
+
 	// (2) Resolve the stage id from (run_id, stage type) — the same
 	// belongs-to-run-validating resolver fishhawk_run_stage uses.
 	resolvedStageID, err := r.resolveStageID(ctx, runUUID, in.Stage, in.StageID)
@@ -266,7 +275,12 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	// push_and_open_pr=false makes a missing repo a warning, not an error.
 	// Seeded with any guard fail-open warning from step (1a) and (2a).
 	warnings := append(append(append(guardWarnings, siblingWarnings...), noPRWarnings...), selfHostWarnings...)
+	// A gitlab run defaults an omitted github_repo to the run row's project
+	// path BEFORE the github.com-only origin auto-detect (E45.46 / #3463).
 	repo := in.GitHubRepo
+	if repo == "" && forgeTarget.Forge == startRunForgeGitLab {
+		repo = forgeTarget.Repo
+	}
 	if repo == "" {
 		detected, derr := runStageDetectGitHubRepo(workingDir)
 		switch {
@@ -298,7 +312,7 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		PushAndOpenPR: in.PushAndOpenPR,
 		RunnerBinary:  in.RunnerBinary,
 	}
-	argv := r.composeRunnerArgv(runStageIn, resolvedStageID, repo, baseBranch, pushAndOpenPR)
+	argv := r.composeRunnerArgv(runStageIn, resolvedStageID, repo, baseBranch, pushAndOpenPR, forgeTarget)
 	env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 
 	// (5a') auto_preview (E68.43 / #3321). ONE resolution feeds BOTH the gate's

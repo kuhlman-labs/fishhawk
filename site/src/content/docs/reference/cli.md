@@ -76,7 +76,7 @@ Every command below is rendered from the `cli/internal/cmdinfo` inventory, which
 
 #### `fishhawk run start`
 
-Flags: `--backend-url`, `--token`, `--timeout`, `--repo`, `--workflow`, `--workflow-sha`, `--trigger-ref`, `--runner-kind`, `--working-dir`, `--spec-file`, `--issue`, `--override-budget`, `--upstream-run-id`, `--applies-to-override`, `--applies-to-override-reason`
+Flags: `--backend-url`, `--token`, `--timeout`, `--repo`, `--workflow`, `--workflow-sha`, `--trigger-ref`, `--runner-kind`, `--working-dir`, `--spec-file`, `--issue`, `--forge`, `--override-budget`, `--upstream-run-id`, `--applies-to-override`, `--applies-to-override-reason`
 
 #### `fishhawk run status`
 
@@ -192,7 +192,7 @@ Flags: `--out`, `--in-place`, `--report-only`
 
 #### `fishhawk runner start`
 
-Flags: `--backend-url`, `--token`, `--timeout`, `--run-id`, `--stage-id`, `--workflow`, `--stage`, `--working-dir`, `--github-repo`, `--base-branch`, `--no-pr`, `--runner-binary`
+Flags: `--backend-url`, `--token`, `--timeout`, `--run-id`, `--stage-id`, `--workflow`, `--stage`, `--working-dir`, `--github-repo`, `--forge`, `--gitlab-base-url`, `--base-branch`, `--no-pr`, `--runner-binary`
 
 #### `fishhawk doctor`
 

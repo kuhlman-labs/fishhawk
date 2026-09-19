@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/cli/internal/ghcomment"
+	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
 )
 
 // runRunner dispatches to `fishhawk runner <subcommand>`. v0 ships
@@ -33,6 +34,14 @@ func runRunner(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 }
+
+// Forge ids the CLI recognises (E45.46 / #3463). They are the
+// fishhawk-runner's `--forge` values and the backend's Run.forge
+// values verbatim.
+const (
+	forgeGitHub = "github"
+	forgeGitLab = "gitlab"
+)
 
 // runnerStartCommand is the subprocess fishhawk runner start spawns.
 // Exposed as a var so tests can substitute a recording fake without
@@ -67,18 +76,31 @@ var gitRemoteOriginURL = func(dir string) (string, error) {
 // runRunnerStart implements `fishhawk runner start --run-id … --stage-id …`.
 //
 // The verb is intentionally thin: it gathers the operator's config
-// (backend URL, token, working dir, GitHub repo), composes the
+// (backend URL, token, working dir, repo, forge), composes the
 // fishhawk-runner subprocess argv, spawns it, pipes its stdout and
 // stderr through, and exits with the runner's exit code. Test seams
-// (`runnerStartCommand`, `runnerBinaryLookPath`, `gitRemoteOriginURL`)
-// let unit tests assert on the constructed argv without spawning a
-// real subprocess.
+// (`runnerStartCommand`, `runnerBinaryLookPath`, `gitRemoteOriginURL`,
+// `runnerNewClient`) let unit tests assert on the constructed argv
+// without spawning a real subprocess.
 //
 // Per ADR-022's addendum (#388): local-runner runs carry
 // runner_kind=local at the backend; the operator-side write tools
 // minted the run with that tag via `fishhawk run start
 // --runner-kind local` upstream. This verb just invokes the
 // runner against an already-minted run.
+//
+// Forge target (E45.46 / #3463). A run row carries its forge, and a
+// gitlab run must be spawned with `--forge gitlab --gitlab-base-url
+// <url>` or the runner targets api.github.com for the push + MR open.
+// So whenever ANY of --forge, --github-repo, or (for a gitlab target)
+// --gitlab-base-url is omitted, the verb reads the run row FIRST via
+// the single-run GET /v0/runs/{id} — the only route the backend
+// serves forge_base_url on — and resolves each omitted value from it.
+// The read is FAIL-CLOSED, symmetric with the MCP spawn producers:
+// with --forge omitted an unreadable row REFUSES to spawn rather than
+// defaulting to github with a warning, because a gitlab run spawned as
+// github is the silent wrong-forge class this exists to close.
+// Explicit flags always win over the row.
 func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fishhawk runner start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -89,7 +111,11 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 	stage := fs.String("stage", "", "stage type (plan|implement|review) matching the workflow spec (required)")
 	workingDir := fs.String("working-dir", ".", "checkout directory the agent runs in")
 	githubRepo := fs.String("github-repo", "",
-		"GitHub repo as owner/name; auto-detected from `git remote get-url origin` when empty")
+		"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the run row's repo for a gitlab run, else auto-detected from `git remote get-url origin`")
+	forgeFlag := fs.String("forge", "",
+		"github | gitlab; omitted derives from the run row")
+	gitlabBaseURL := fs.String("gitlab-base-url", "",
+		"GitLab instance root; omitted derives from the run row's forge_base_url")
 	baseBranch := fs.String("base-branch", "main",
 		"base branch for the implement-stage PR (no effect when --no-pr is set)")
 	noPR := fs.Bool("no-pr", false,
@@ -104,6 +130,12 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return exitUsage
 	}
+	switch *forgeFlag {
+	case "", forgeGitHub, forgeGitLab:
+	default:
+		_, _ = fmt.Fprintf(stderr, "fishhawk runner start: --forge %q is not one of github, gitlab\n", *forgeFlag)
+		return exitUsage
+	}
 
 	// Resolve the runner binary path. --runner-binary > FISHHAWK_RUNNER_BIN > PATH.
 	binary := *runnerBinary
@@ -116,14 +148,94 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		binary = resolved
 	}
 
+	// Pre-spawn run-row read (E45.46 / #3463). Needed whenever a
+	// forge-dependent value is omitted: the forge itself, the repo
+	// (the row's path_with_namespace is the only sane default for a
+	// gitlab run — origin auto-detect is github.com-only), or the
+	// gitlab base URL. Runs BEFORE the origin auto-detect and BEFORE
+	// the argv build; all flags explicit → zero network calls, as
+	// before.
+	forge := *forgeFlag
+	baseURL := *gitlabBaseURL
+	repo := *githubRepo
+	needRow := forge == "" || repo == "" || (forge == forgeGitLab && baseURL == "")
+	var row *httpclient.Run
+	if needRow {
+		parsedRunID, perr := uuid.Parse(*runID)
+		var readErr error
+		if perr != nil {
+			readErr = fmt.Errorf("--run-id %q is not a UUID: %w", *runID, perr)
+		} else {
+			rowCtx, rowCancel := context.WithTimeout(context.Background(), *cf.timeout)
+			row, readErr = runnerNewClient(cf).GetRun(rowCtx, parsedRunID)
+			rowCancel()
+		}
+		if readErr != nil {
+			row = nil
+			switch forge {
+			case "":
+				// Fail closed: never a github default with a warning.
+				_, _ = fmt.Fprintf(stderr,
+					"fishhawk runner start: could not read run %s to resolve its forge (%v); not spawning (a gitlab run spawned as github would target api.github.com). Pass --forge explicitly, or fix backend reachability (--backend-url / FISHHAWK_BACKEND_URL)\n",
+					*runID, readErr)
+				return exitFailure
+			case forgeGitLab:
+				// The forge is known but a gitlab spawn still needs
+				// what the row would have supplied; name each
+				// missing flag.
+				var missing []string
+				if baseURL == "" {
+					missing = append(missing, "--gitlab-base-url")
+				}
+				if repo == "" {
+					missing = append(missing, "--github-repo")
+				}
+				_, _ = fmt.Fprintf(stderr,
+					"fishhawk runner start: could not read run %s (%v) and --forge gitlab needs %s; not spawning. Pass the flag(s) explicitly, or fix backend reachability (--backend-url / FISHHAWK_BACKEND_URL)\n",
+					*runID, readErr, strings.Join(missing, " and "))
+				return exitFailure
+			default:
+				// --forge github explicit with only --github-repo
+				// omitted: the forge is known and the run-row repo
+				// default is a convenience the github path never
+				// had, so fall through to today's origin auto-detect.
+			}
+		}
+	}
+	if forge == "" {
+		forge = forgeGitHub
+		if row != nil && row.Forge != "" {
+			forge = row.Forge
+		}
+	}
+	if forge == forgeGitLab {
+		if baseURL == "" && row != nil {
+			baseURL = row.ForgeBaseURL
+		}
+		if baseURL == "" {
+			// Refuse BEFORE any spawn: the runner with --forge gitlab
+			// and no base URL would refuse too, but naming both
+			// remedies here saves the round trip.
+			_, _ = fmt.Fprintf(stderr,
+				"fishhawk runner start: run %s is a gitlab run but no GitLab base URL is known; not spawning. Pass --gitlab-base-url, or set FISHHAWKD_GITLAB_BASE_URL on fishhawkd / re-register the installation with --forge-base-url so the run row carries forge_base_url\n",
+				*runID)
+			return exitFailure
+		}
+		if repo == "" && row != nil {
+			// The run row's project path is the only sane default
+			// on gitlab: detectGitHubRepo parses github.com URLs
+			// only and is skipped.
+			repo = row.Repo
+		}
+	}
+
 	// Resolve the GitHub repo. Flag wins; otherwise auto-detect
 	// from `git remote get-url origin`. Auto-detect failure is a
 	// soft failure — the runner can still proceed when --no-pr is
 	// set (no push, no PR, no repo lookup needed). For PR-shaped
 	// runs without --github-repo and no detectable origin, the
 	// runner will surface its own error.
-	repo := *githubRepo
-	if repo == "" {
+	if repo == "" && forge != forgeGitLab {
 		detected, err := detectGitHubRepo(*workingDir)
 		switch {
 		case err == nil:
@@ -163,6 +275,12 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if repo != "" {
 		argv = append(argv, "--github-repo", repo)
+	}
+	// A gitlab target rides on the runner's own --forge /
+	// --gitlab-base-url flags (ADR-058 / E45.5); github emits
+	// nothing new so the github argv is byte-identical to before.
+	if forge == forgeGitLab {
+		argv = append(argv, "--forge", forgeGitLab, "--gitlab-base-url", baseURL)
 	}
 	if *baseBranch != "" {
 		argv = append(argv, "--base-branch", *baseBranch)
@@ -220,6 +338,12 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 	var stageParseErr error
 	if perr == nil {
 		parsedStageID, stageParseErr = uuid.Parse(*stageID)
+	}
+	// The sticky status comment is posted via `gh` against
+	// github.com, so a gitlab run skips both comment blocks (the
+	// auto-PR path is github-only too — the runner opened the MR).
+	if forge == forgeGitLab {
+		return exitOK
 	}
 	if perr == nil && stageParseErr == nil && *stage == "implement" && !*noPR {
 		clientCtx, clientCancel := context.WithTimeout(context.Background(), *cf.timeout)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,12 +15,14 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/escalation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -91,6 +94,21 @@ type runResponse struct {
 	RetryAttempt       int        `json:"retry_attempt"`
 	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
 	RunnerKind         string     `json:"runner_kind"`
+	// Forge is the run's canonical forge id (`github` | `gitlab`), derived
+	// from the run row by runForge (E45.46 / #3463): gitlab_ci runner_kind
+	// OR a `gitlab:`-schemed installation_ref reads as gitlab, everything
+	// else — including the pre-0076 nil ref — as github. ALWAYS present, on
+	// both GET /v0/runs/{id} and the list endpoint, so a spawn-side consumer
+	// never has to guess. The MCP / CLI client mirrors decode it; the json
+	// tag MUST byte-match its counterparts.
+	Forge string `json:"forge"`
+	// ForgeBaseURL is a gitlab run's instance root, resolved at READ time on
+	// GET /v0/runs/{id} ONLY: the installation row's forge_base_url, else the
+	// deployment default (FISHHAWKD_GITLAB_BASE_URL), else OMITTED. The list
+	// endpoint deliberately never sets it (no per-row registry read), which
+	// is exactly the asymmetry the spawn-side helper relies on to insist on
+	// a single-run read. Omitted on every github run.
+	ForgeBaseURL string `json:"forge_base_url,omitempty"`
 	// RunnerKindResolved echoes whether RunnerKind has been LOCKED by the
 	// run's first signed runner self-report (#1346/#1348). Always emitted
 	// (false for legacy / un-resolved rows), matching drive / cost_usd_total
@@ -638,6 +656,7 @@ func toRunResponse(r *run.Run) runResponse {
 		RetryAttempt:            r.RetryAttempt,
 		MaxRetriesSnapshot:      r.MaxRetriesSnapshot,
 		RunnerKind:              r.RunnerKind,
+		Forge:                   runForge(r),
 		RunnerKindResolved:      r.RunnerKindResolved,
 		Drive:                   r.Drive,
 		CostUSDTotal:            r.CostUSDTotal,
@@ -686,6 +705,12 @@ type createRunRequest struct {
 	// passes `local`. Validated against `run.ValidRunnerKinds` at
 	// the handler.
 	RunnerKind string `json:"runner_kind,omitempty"`
+	// Forge selects the run's forge (`github` | `gitlab`), E45.46 / #3463.
+	// Optional; resolved through resolveCreateForge's ladder — explicit
+	// value, else the registered accounts.provider for the repo owner, else
+	// github. A gitlab run is stamped with the installation_ref registered
+	// for the EXACT project path and skips the GitHub App lookup.
+	Forge string `json:"forge,omitempty"`
 	// WorkingDir binds the local checkout the run's local stages execute
 	// in (E66.42 / #2482), recorded on the run row so every later
 	// runner-spawning MCP verb inherits it instead of re-typing the path.
@@ -787,6 +812,133 @@ var validTriggerSourcesMessage = func() string {
 	return "trigger_source must be one of " + strings.Join(names, ", ")
 }()
 
+// validRunnerKindsMessage is the 400 body for an unrecognized runner_kind,
+// rendered from run.ValidRunnerKinds (sorted, since the map has no order) so
+// the message can never name a different set than the one enforced — the
+// literal it replaces silently omitted gitlab_ci (E45.46 / #3463).
+var validRunnerKindsMessage = func() string {
+	names := make([]string, 0, len(run.ValidRunnerKinds))
+	for k := range run.ValidRunnerKinds {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return "runner_kind must be one of " + strings.Join(names, ", ")
+}()
+
+// GitLabInstallationResolver is the registry seam handleCreateRun and
+// handleGetRun consult for a gitlab run (E45.46 / #3463). Satisfied by
+// *account.GitLabProjectResolver; tests inject a fake. Both methods report
+// (installation, found, err) with the account.Resolver posture: an ambiguous
+// binding is found=false, a query error is propagated.
+type GitLabInstallationResolver interface {
+	ResolveGitLabProject(ctx context.Context, projectPath string) (account.GitLabInstallation, bool, error)
+	ResolveGitLabInstallationByRef(ctx context.Context, ref string) (account.GitLabInstallation, bool, error)
+}
+
+// createForgeGitLabRunnerKinds is the runner_kind set a gitlab run admits:
+// the operator-local runner (a GitLab project MAY be driven by a local
+// runner — the decision #3463 records) and the gitlab_ci runner. github_actions
+// cannot push to a GitLab project and empty would default to it, so both are
+// refused BEFORE any registry lookup.
+var createForgeGitLabRunnerKinds = []string{run.RunnerKindLocal, run.RunnerKindGitLabCI}
+
+// resolveCreateForge is the POST /v0/runs forge ladder (E45.46 / #3463),
+// evaluated after field validation and BEFORE the GitHub App installation
+// lookup. In order: (1) an EXPLICIT req.Forge wins — `github` or `gitlab`;
+// any other value is a 400 validation_failed naming both; (2) omitted →
+// the registered accounts.provider for the repo owner via cfg.RepoProviders
+// (found → that provider; a resolver ERROR → 503 forge_unresolvable, fail
+// closed rather than guessing on a transient DB fault; not-found or an
+// owner registered under BOTH forges → github); (3) no resolver wired →
+// github.
+//
+// REST derives from the registry when `forge` is omitted; the MCP / CLI
+// surfaces PIN `forge: github` explicitly whenever they fetched the issue
+// from github.com via `gh` (a github.com-fetched issue is never attached to
+// a gitlab run). The ladder itself is unchanged by that — explicit always
+// wins — so the backend can never re-derive gitlab under such a request.
+//
+// Returns (forge, true) on success; on refusal it has written the error
+// response and returns ("", false).
+func (s *Server) resolveCreateForge(w http.ResponseWriter, r *http.Request, req *createRunRequest) (string, bool) {
+	switch req.Forge {
+	case identity.ProviderGitHub, webhook.ForgeGitLab:
+		return req.Forge, true
+	case "":
+	default:
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"forge must be one of github, gitlab",
+			map[string]any{"field": "forge", "got": req.Forge})
+		return "", false
+	}
+	if s.cfg.RepoProviders == nil {
+		return identity.ProviderGitHub, true
+	}
+	provider, found, err := s.cfg.RepoProviders.ResolveProvider(r.Context(), req.Repo)
+	if err != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "forge_unresolvable",
+			"could not resolve the repo's forge from the installation registry; retry, or pass forge explicitly",
+			map[string]any{"repo": req.Repo, "error": err.Error()})
+		return "", false
+	}
+	if !found {
+		return identity.ProviderGitHub, true
+	}
+	return provider, true
+}
+
+// resolveCreateGitLabInstallation is the gitlab branch of handleCreateRun
+// (E45.46 / #3463), run only when the ladder resolved `gitlab`. In this
+// order, each fail-closed: runner_kind must be local or gitlab_ci (400,
+// observable before any registry lookup so an unregistered project still
+// learns the pairing rule); the workflow_spec must be inline (422
+// workflow_spec_required — there is no GitLab spec-fetch fallback); the
+// registry must be wired (503 gitlab_unconfigured); the resolver must not
+// fault (500); and the project must be registered under EXACTLY this path
+// (422 gitlab_project_not_registered naming the register command). On
+// success it returns the installation_ref to stamp on the run row; the
+// GitHub App lookup is SKIPPED entirely for this branch.
+//
+// Returns (ref, true) on success; on refusal it has written the error
+// response and returns (nil, false).
+func (s *Server) resolveCreateGitLabInstallation(w http.ResponseWriter, r *http.Request, req *createRunRequest) (*string, bool) {
+	if !slices.Contains(createForgeGitLabRunnerKinds, req.RunnerKind) {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"runner_kind must be one of "+strings.Join(createForgeGitLabRunnerKinds, ", ")+" for a gitlab run (github_actions cannot push to a GitLab project, and an omitted runner_kind defaults to it)",
+			map[string]any{"field": "runner_kind", "got": req.RunnerKind, "forge": webhook.ForgeGitLab})
+		return nil, false
+	}
+	if req.WorkflowSpec == "" {
+		s.writeError(w, r, http.StatusUnprocessableEntity, "workflow_spec_required",
+			"a gitlab run requires the inline workflow_spec; there is no GitLab spec-fetch fallback",
+			map[string]any{"field": "workflow_spec", "forge": webhook.ForgeGitLab})
+		return nil, false
+	}
+	if s.cfg.GitLabInstallations == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "gitlab_unconfigured",
+			"this deployment has no installation registry (no database), so it cannot attribute a gitlab run to a registered project",
+			map[string]any{"forge": webhook.ForgeGitLab})
+		return nil, false
+	}
+	inst, found, err := s.cfg.GitLabInstallations.ResolveGitLabProject(r.Context(), req.Repo)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not resolve the gitlab installation for the project",
+			map[string]any{"repo": req.Repo, "error": err.Error()})
+		return nil, false
+	}
+	if !found {
+		namespace, _, _ := strings.Cut(req.Repo, "/")
+		s.writeError(w, r, http.StatusUnprocessableEntity, "gitlab_project_not_registered",
+			"no gitlab installation is registered for project path "+req.Repo+" (exact match; an ambiguous double registration also lands here); register it with: "+
+				"fishhawkd installation register --provider gitlab --account-key "+namespace+" --installation-ref gitlab:<project_id> --project-path "+req.Repo,
+			map[string]any{"repo": req.Repo, "forge": webhook.ForgeGitLab})
+		return nil, false
+	}
+	ref := inst.InstallationRef
+	return &ref, true
+}
+
 // handleCreateRun implements POST /v0/runs. Validates the request
 // body, calls into the run repository, and returns the canonical
 // Run JSON. The state machine starts every new run in
@@ -835,7 +987,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	if req.RunnerKind != "" {
 		if _, ok := run.ValidRunnerKinds[req.RunnerKind]; !ok {
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"runner_kind must be one of github_actions, local",
+				validRunnerKindsMessage,
 				map[string]any{"field": "runner_kind", "got": req.RunnerKind})
 			return
 		}
@@ -913,11 +1065,29 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// ErrNotInstalled (it cannot read the spec without an installation);
 	// it reuses installResolveErr instead of calling GetRepoInstallation
 	// a second time.
+	//
+	// Forge ladder first (E45.46 / #3463): a gitlab run stamps the
+	// registered installation_ref instead and SKIPS this GitHub App lookup
+	// entirely — a GitLab project has no App installation to resolve, and
+	// dialing api.github.com for it would be the cross-forge leak the
+	// rest of the package refuses. The github branch below is byte-for-byte
+	// the pre-#3463 behaviour.
+	forgeID, ok := s.resolveCreateForge(w, r, &req)
+	if !ok {
+		return
+	}
 	var (
 		installationID    *int64
+		installationRef   *string
 		installResolveErr error
 	)
-	if s.cfg.GitHub != nil {
+	if forgeID == webhook.ForgeGitLab {
+		installationRef, ok = s.resolveCreateGitLabInstallation(w, r, &req)
+		if !ok {
+			return
+		}
+	}
+	if s.cfg.GitHub != nil && forgeID != webhook.ForgeGitLab {
 		if owner, name, ok := strings.Cut(req.Repo, "/"); ok && owner != "" && name != "" {
 			id, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), forge.RepoRef{Owner: owner, Name: name})
 			switch {
@@ -1264,6 +1434,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		RunnerKind:         req.RunnerKind,
 		WorkingDir:         req.WorkingDir,
 		InstallationID:     installationID,
+		InstallationRef:    installationRef,
 		IssueContext:       issueCtx,
 		Drive:              req.Drive,
 		IdempotencyKey:     idemp,
@@ -1498,6 +1669,12 @@ type CreateRunForTriggerParams struct {
 	// InstallationID is the best-effort resolved GitHub App installation
 	// (#713); nil when no App is attributable.
 	InstallationID *int64
+	// InstallationRef is the ADR-057 / ADR-058 forge-neutral credential
+	// handle stamped on a gitlab run (`gitlab:<project_id>`, E45.46 /
+	// #3463), resolved from the registered installation whose project_path
+	// exactly equals Repo. Nil for every github run minted here — the
+	// GitHub ref is derived from InstallationID by the persistence layer.
+	InstallationRef *string
 	// IssueContext caches the triggering issue's title/body/url/number on
 	// the run row (#415); nil for non-issue triggers.
 	IssueContext *run.IssueContext
@@ -1562,9 +1739,11 @@ func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerP
 		// Best-effort App installation (#713). Nil when no App is
 		// installed; the runner then falls back to the operator's `gh` token.
 		InstallationID: p.InstallationID,
-		IssueContext:   p.IssueContext,
-		IdempotencyKey: p.IdempotencyKey,
-		UpstreamRunID:  p.UpstreamRunID,
+		// Registered gitlab installation (E45.46 / #3463); nil on github.
+		InstallationRef: p.InstallationRef,
+		IssueContext:    p.IssueContext,
+		IdempotencyKey:  p.IdempotencyKey,
+		UpstreamRunID:   p.UpstreamRunID,
 		// Capture the required-status-checks snapshot for the local / MCP /
 		// CLI / campaign create paths (#2506), from the best-effort App
 		// installation resolved at handleCreateRun (runs.go, #713). Fail-safe:
@@ -1692,6 +1871,27 @@ func (s *Server) recordDriveDeployInitialization(ctx context.Context, runRow *ru
 // handleGetRun implements GET /v0/runs/{run_id}. Returns 404 with
 // the run_not_found code if the ID doesn't resolve, and 400 if the
 // path parameter isn't a valid UUID.
+// resolveRunForgeBaseURL resolves a gitlab run's instance root for the
+// single-run read (E45.46 / #3463): the registered installation's
+// forge_base_url when the run carries an installation_ref that resolves and
+// the column is non-empty, else cfg.GitLabBaseURL, else "" (omitted). A
+// registry error is warn-logged and falls to the deployment default; it is a
+// read surface, not a gate, and the spawn-side consumer fails closed on an
+// empty value.
+func (s *Server) resolveRunForgeBaseURL(ctx context.Context, got *run.Run) string {
+	if s.cfg.GitLabInstallations != nil && got.InstallationRef != nil && *got.InstallationRef != "" {
+		inst, found, err := s.cfg.GitLabInstallations.ResolveGitLabInstallationByRef(ctx, *got.InstallationRef)
+		switch {
+		case err != nil:
+			s.cfg.Logger.Warn("resolve gitlab installation for forge_base_url failed; falling back to the deployment default",
+				"run_id", got.ID.String(), "installation_ref", *got.InstallationRef, "error", err.Error())
+		case found && inst.ForgeBaseURL != "":
+			return inst.ForgeBaseURL
+		}
+	}
+	return s.cfg.GitLabBaseURL
+}
+
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RunRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
@@ -1720,6 +1920,15 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := toRunResponse(got)
+	// forge_base_url (E45.46 / #3463) on the single-run read ONLY — the
+	// list endpoint deliberately omits it (no per-row registry read), and
+	// the spawn-side helper relies on that asymmetry to insist on this
+	// route. Best-effort ladder: the installation row's forge_base_url,
+	// else the deployment default, else omitted; a resolver error warn-logs
+	// and falls to the deployment default rather than failing the read.
+	if resp.Forge == webhook.ForgeGitLab {
+		resp.ForgeBaseURL = s.resolveRunForgeBaseURL(r.Context(), got)
+	}
 	// Attach the open-concern summary (#964) on the single-run read
 	// ONLY — the list endpoint deliberately omits it (no N+1 concern
 	// query per row). Best-effort: a concern-store failure warn-logs
@@ -2748,7 +2957,7 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("runner_kind"); v != "" {
 		if _, ok := run.ValidRunnerKinds[v]; !ok {
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"runner_kind must be one of github_actions, local",
+				validRunnerKindsMessage,
 				map[string]any{"field": "runner_kind", "got": v})
 			return
 		}

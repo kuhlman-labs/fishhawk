@@ -2698,3 +2698,112 @@ func TestDispatchStage_NoAutoPreviewStillParksAtNeedsTarget(t *testing.T) {
 		t.Errorf("preview working_dir = %q, want the dispatch working dir", got)
 	}
 }
+
+// --- forge target (E45.46 / #3463) -------------------------------------------
+
+// TestDispatchStage_GitLab_ArgvMatchesRunStage: for the SAME gitlab-run input
+// (github_repo omitted → the run row's path_with_namespace), the detached
+// dispatch argv is byte-identical to fishhawk_run_stage's and carries the two
+// gitlab flags — the shared composeRunnerArgv + resolveRunForgeTarget path.
+func TestDispatchStage_GitLab_ArgvMatchesRunStage(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+	withFakeGitRemote(t, "git@gitlab.example.com:acme/platform/widgets.git", nil) // github.com-only detector would refuse
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	seedGitLabRun(fb, runID, "acme/platform/widgets", "https://gitlab.example.com")
+
+	if _, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", WorkingDir: "/tmp/checkout",
+	}); err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	// The detached spawn flips the stage to dispatched; re-park it so the
+	// blocking verb's sibling guard admits the second spawn.
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	if _, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", WorkingDir: "/tmp/checkout",
+	}); err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if len(*calls) != 2 {
+		t.Fatalf("expected 2 spawn invocations (dispatch + run_stage), got %d", len(*calls))
+	}
+	dispatchArgv, runStageArgv := (*calls)[0], (*calls)[1]
+	if strings.Join(dispatchArgv, "\x00") != strings.Join(runStageArgv, "\x00") {
+		t.Errorf("dispatch argv != run_stage argv\n dispatch: %v\n run_stage: %v", dispatchArgv, runStageArgv)
+	}
+	if !argvHasPair(dispatchArgv, "--github-repo", "acme/platform/widgets") {
+		t.Errorf("dispatch argv should default --github-repo from the run row: %v", dispatchArgv)
+	}
+	if !argvHasPair(dispatchArgv, "--forge", "gitlab") || !argvHasPair(dispatchArgv, "--gitlab-base-url", "https://gitlab.example.com") {
+		t.Errorf("dispatch argv should carry the gitlab forge flags: %v", dispatchArgv)
+	}
+}
+
+// TestDispatchStage_ForgeTarget_ReadViaSingleRunGet: the detached spawn carried
+// the base URL the fake serves ONLY on GET /v0/runs/{id}; the list route was
+// never read. Counterfactual: derive the target from a list read and this goes
+// RED on the base-URL refusal.
+func TestDispatchStage_ForgeTarget_ReadViaSingleRunGet(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	seedGitLabRun(fb, runID, "acme/widgets", "https://gitlab.example.com")
+	fb.mu.Lock()
+	fb.listResp = listRunsResult{Items: []Run{fb.getRunByID[runID]}}
+	fb.mu.Unlock()
+
+	if _, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		WorkingDir: "/tmp/checkout", GitHubRepo: "acme/widgets",
+	}); err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if len(*calls) != 1 || !argvHasPair((*calls)[0], "--gitlab-base-url", "https://gitlab.example.com") {
+		t.Fatalf("spawn did not carry the single-run-route base URL: %v", *calls)
+	}
+	fb.mu.Lock()
+	gets, lists := fb.getRunCalledByID[runID], fb.listRunCalls
+	fb.mu.Unlock()
+	if gets < 1 || lists != 0 {
+		t.Fatalf("single-run GETs = %d, list GETs = %d; the forge target must come from the single-run route only", gets, lists)
+	}
+}
+
+// TestDispatchStage_GitLabRun_NoBaseURL_RefusesBeforeMarker: the detached
+// verb's parity refusal — no marker POST, no record-act, no spawn.
+func TestDispatchStage_GitLabRun_NoBaseURL_RefusesBeforeMarker(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	seedGitLabRun(fb, runID, "acme/widgets", "")
+
+	_, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		WorkingDir: "/tmp/checkout", GitHubRepo: "acme/widgets",
+	})
+	if err == nil || !strings.Contains(err.Error(), "forge_base_url") {
+		t.Fatalf("expected the empty-base-URL refusal; got %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("runner spawned despite the refusal: %v", *calls)
+	}
+	fb.mu.Lock()
+	marker := fb.hostDispatchCalledByID[stageID]
+	fb.mu.Unlock()
+	if marker != 0 {
+		t.Fatalf("host-dispatch marker POSTed %d times before the refusal", marker)
+	}
+}

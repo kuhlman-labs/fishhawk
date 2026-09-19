@@ -30,7 +30,11 @@ type fanoutRunsRepo struct {
 	*stubRuns
 	mu sync.Mutex
 
-	createdRuns   []*run.Run
+	createdRuns []*run.Run
+	// createdParams records every CreateRun's params verbatim, so a test can
+	// assert what the orchestrator PASSED (the run.ChildParamsFrom shape)
+	// and not only what this fake chose to carry onto the row.
+	createdParams []run.CreateRunParams
 	createdStages []*run.Stage
 	listFilters   []run.ListRunsFilter
 	listResult    []*run.Run
@@ -64,11 +68,16 @@ func (r *fanoutRunsRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*r
 		RequiredChecksSnapshot: p.RequiredChecksSnapshot,
 		MaxRetriesSnapshot:     p.MaxRetriesSnapshot,
 		WorkingDir:             p.WorkingDir,
-		State:                  run.StatePending,
-		CreatedAt:              time.Now().UTC(),
-		UpdatedAt:              time.Now().UTC(),
+		// InstallationRef is carried for the same reason (E45.46 / #3463):
+		// a gitlab parent's children must inherit its `gitlab:<id>` ref, and
+		// a fake that dropped it made that assertion vacuous.
+		InstallationRef: p.InstallationRef,
+		State:           run.StatePending,
+		CreatedAt:       time.Now().UTC(),
+		UpdatedAt:       time.Now().UTC(),
 	}
 	r.createdRuns = append(r.createdRuns, rr)
+	r.createdParams = append(r.createdParams, p)
 	r.stubRuns.mu.Lock()
 	r.runs[rr.ID] = rr
 	r.stubRuns.mu.Unlock()
@@ -538,6 +547,86 @@ func TestFanout_ChildInheritsRequiredChecksAndMaxRetriesSnapshot(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestFanout_GitLabParent_ChildrenInheritInstallationRefAndSpec pins the
+// decomposition-child half of E45.46 / #3463: children are minted SERVER-SIDE
+// by fanoutIfDecomposed → run.ChildParamsFrom → Runs.CreateRun (never through
+// POST /v0/runs, so the create handler's forge ladder is never consulted for
+// them), and a gitlab parent's children therefore carry its installation_ref
+// (forge gitlab by derivation), its inline workflow_spec, its local
+// runner_kind and its repo verbatim. Asserted on BOTH the params the
+// orchestrator passed and the minted rows.
+func TestFanout_GitLabParent_ChildrenInheritInstallationRefAndSpec(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent, stages := rs.seed(t, "acme/platform/api", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	// Seeded by construction, before the fan-out runs: the shape POST
+	// /v0/runs mints for a gitlab run (installation_ref stamped, no GitHub
+	// App id, inline spec, local runner).
+	ref := "gitlab:4242"
+	parent.InstallationRef = &ref
+	parent.InstallationID = nil
+	parent.RunnerKind = run.RunnerKindLocal
+	parent.WorkflowSpec = []byte("version: \"2\"\nworkflows:\n  feature_change:\n    stages: []\n")
+	planStage := stages[0]
+
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{
+		byStage: map[uuid.UUID][]*artifact.Artifact{
+			planStage.ID: {{
+				ID:            uuid.New(),
+				StageID:       planStage.ID,
+				Kind:          artifact.KindPlan,
+				SchemaVersion: &schemaV,
+				Content:       decomposedPlanBytes(t, []string{"Part A", "Part B", "Part C"}),
+				ContentHash:   "deadbeef",
+				CreatedAt:     time.Now().UTC(),
+			}},
+		},
+	}
+
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Artifacts: arts, Audit: &recordingAudit{}}
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDecomposed {
+		t.Fatalf("Advance outcome = %q, want %q", out, OutcomeDecomposed)
+	}
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if got := len(rs.createdRuns); got != 3 {
+		t.Fatalf("createdRuns = %d, want 3", got)
+	}
+	if got := len(rs.createdParams); got != 3 {
+		t.Fatalf("createdParams = %d, want 3", got)
+	}
+	for i, p := range rs.createdParams {
+		if p.InstallationRef == nil || *p.InstallationRef != ref {
+			t.Errorf("child %d CreateRunParams.InstallationRef = %v, want %q (run.ChildParamsFrom inherits it)", i, p.InstallationRef, ref)
+		}
+	}
+	for i, child := range rs.createdRuns {
+		if child.InstallationRef == nil || *child.InstallationRef != ref {
+			t.Errorf("child %d installation_ref = %v, want %q (inherited from the gitlab parent)", i, child.InstallationRef, ref)
+		}
+		if child.InstallationID != nil {
+			t.Errorf("child %d installation_id = %d, want nil (a gitlab run has no GitHub App installation)", i, *child.InstallationID)
+		}
+		if !bytes.Equal(child.WorkflowSpec, parent.WorkflowSpec) {
+			t.Errorf("child %d workflow_spec = %q, want the parent's inline spec bytes", i, child.WorkflowSpec)
+		}
+		if child.RunnerKind != run.RunnerKindLocal {
+			t.Errorf("child %d runner_kind = %q, want local", i, child.RunnerKind)
+		}
+		if child.Repo != parent.Repo {
+			t.Errorf("child %d repo = %q, want %q", i, child.Repo, parent.Repo)
+		}
 	}
 }
 

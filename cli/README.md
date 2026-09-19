@@ -191,13 +191,54 @@ overwrite, `2` usage or I/O. Full contract, translation table and refusal taxono
 `fishhawk runner start --run-id … --stage-id … --workflow … --stage …` (`cmd/fishhawk/runner.go`) is a thin wrapper
 around the `fishhawk-runner` binary. It composes the runner's argv from the operator's config — backend URL via
 `--backend-url`, token via the `FISHHAWK_API_TOKEN` env — auto-detects `--github-repo` from
-`git remote get-url origin` when not set, and defaults `--no-pr` on (the operator commits themselves).
+`git remote get-url origin` when not set on a github run, and passes `--no-pr` through only when given (default off:
+the implement stage pushes and opens the change request).
 
-- **Test seams:** three seams (`runnerStartCommand`, `runnerBinaryLookPath`, `gitRemoteOriginURL`) let unit tests
-  assert on the constructed argv without actually spawning the binary.
+- **Test seams:** four seams (`runnerStartCommand`, `runnerBinaryLookPath`, `gitRemoteOriginURL`, `runnerNewClient`)
+  let unit tests assert on the constructed argv without actually spawning the binary or reaching a backend.
 - **Binary resolution order:** `--runner-binary` flag > `FISHHAWK_RUNNER_BIN` env > `exec.LookPath("fishhawk-runner")`.
 
 It closes the Phase C dev loop with #406's runner flags as the substrate.
+
+### Forge target: `--forge` / `--gitlab-base-url` and the pre-spawn run read (E45.46 / #3463)
+
+A run row carries its forge, and a gitlab run must be spawned with `--forge gitlab --gitlab-base-url <url>` or the
+runner targets api.github.com for the implement-stage push + MR open. `runner start` therefore takes two new flags —
+`--forge` (`github | gitlab`; omitted derives from the run row) and `--gitlab-base-url` (the GitLab instance root;
+omitted derives from the run row's `forge_base_url`) — and, symmetric with the MCP spawn producers
+(`fishhawk_run_stage` and its siblings), resolves them **fail-closed** from the run row.
+
+**When the row is read.** Whenever ANY of `--forge`, `--github-repo`, or (for a gitlab target) `--gitlab-base-url` is
+omitted, the verb performs ONE single-run `GET /v0/runs/{id}` via `runnerNewClient` BEFORE the origin auto-detect and
+BEFORE the argv build — the single-run route is the only one the backend serves `forge_base_url` on (the list route
+deliberately omits it). With `--forge github --github-repo <slug>` both explicit, the verb makes zero network calls
+before the spawn, as before. Explicit flags always win over the row.
+
+**Fail-closed rules on an unreadable row** (backend unreachable, non-2xx, or a non-UUID `--run-id`):
+
+| Flags given | Outcome |
+|---|---|
+| `--forge` omitted | **REFUSES to spawn** (`exitFailure`), naming the run id, the read error, `--forge` and backend reachability (`--backend-url` / `FISHHAWK_BACKEND_URL`). Never a github default with a warning — a gitlab run spawned as github is the silent wrong-forge class this closes. |
+| `--forge gitlab` explicit, `--gitlab-base-url` and/or `--github-repo` omitted | REFUSES, naming each missing flag: the forge is known but the spawn still needs what the row would have supplied. |
+| `--forge github` explicit, only `--github-repo` omitted | Falls through to today's origin auto-detect: the forge is known, and the run-row repo default is a convenience the github path never had. |
+
+**Resolution on a readable row.** forge = flag, else `row.forge` (an empty value from a backend predating the field →
+github). For gitlab: base URL = flag, else `row.forge_base_url`; still empty → REFUSES before any spawn naming
+`--gitlab-base-url` and the two server-side remedies (`FISHHAWKD_GITLAB_BASE_URL` on fishhawkd, or re-registering the
+installation with `--forge-base-url`). repo = flag, else `row.repo` (the project's `path_with_namespace`, nested groups
+intact) — the github.com-only `detectGitHubRepo` is skipped on gitlab. The argv then appends
+`--forge gitlab --gitlab-base-url <url>` right after `--github-repo` (the runner keeps `--github-repo` as the project
+slug on both forges); a github run emits nothing new, so its argv is byte-identical to before. After the runner exits,
+the GitHub sticky status comment (`postOrEditStatusComment`, posted via `gh`) is skipped for a gitlab run.
+
+**`run start` ladder difference (`--forge` on run-create).** `fishhawk run start --forge github|gitlab` is validated
+locally (anything else is a usage error with no request) and sent as the optional `forge` field on `POST /v0/runs`,
+where explicit always wins. Omitted, the behaviour depends on whether the CLI fetched the issue from github.com:
+with `--issue` (or an `issue:N` trigger ref) and `--forge` omitted, the `gh issue view` fetch runs and the request
+**pins `forge: github`** — on the ATTEMPT, not on gh success, so an absent gh or a transient gh error cannot mint two
+otherwise-identical invocations under different forges; with neither, the request omits `forge` and the backend
+derives it from the registered installation for the repo owner (default github). `--forge gitlab` with `--issue`
+skips gh entirely (gh reads github.com only) and warns that the run proceeds without inline issue context.
 
 ## Campaign command internals (E25.9 / #1448)
 

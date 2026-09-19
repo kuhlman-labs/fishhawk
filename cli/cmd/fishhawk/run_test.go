@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -412,5 +413,205 @@ func TestRunStatus_RefreshesAndPersistsOnOrdinaryCLIPath(t *testing.T) {
 	}
 	if stored.RefreshToken != "fhr_rotated" || stored.Token != "fho_rotated" {
 		t.Fatalf("rotation not persisted: %+v", stored)
+	}
+}
+
+// --- --forge on `run start` (E45.46 / #3463) ---------------------------------
+//
+// Same flag-to-wire division as the applies_to cases above: these
+// drive the real runStart and assert on the RAW JSON the backend
+// receives (the literal `forge` key, or its absence), plus the
+// ghIssueCommand seam — whether gh was invoked at all.
+
+// withGhOnPath makes exec.LookPath("gh") succeed by dropping an
+// executable stub named `gh` at the front of PATH. fetchIssueViaGh
+// checks LookPath BEFORE consulting the ghIssueCommand seam, so a
+// host without gh would otherwise take the ErrGhNotInstalled branch
+// and never reach the seam whose invocation these tests observe.
+func withGhOnPath(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// withRecordingGh swaps the ghIssueCommand seam for one that counts
+// invocations and returns the fixture issue (or, when fail is set,
+// exits non-zero so the gh-error branch runs).
+func withRecordingGh(t *testing.T, fail bool) *atomic.Int64 {
+	t.Helper()
+	calls := new(atomic.Int64)
+	orig := ghIssueCommand
+	ghIssueCommand = func(_ string, _ ...string) *exec.Cmd {
+		calls.Add(1)
+		if fail {
+			return exec.Command("/usr/bin/false")
+		}
+		return exec.Command("sh", "-c", `printf '{"title":"Add foo","body":"b","url":"https://github.com/x/y/issues/42","number":42}'`)
+	}
+	t.Cleanup(func() { ghIssueCommand = orig })
+	return calls
+}
+
+// withGhNeverInvoked fails the test if the gh seam is consulted.
+func withGhNeverInvoked(t *testing.T) {
+	t.Helper()
+	orig := ghIssueCommand
+	ghIssueCommand = func(_ string, _ ...string) *exec.Cmd {
+		t.Error("gh must NOT be invoked on this path")
+		return exec.Command("/usr/bin/false")
+	}
+	t.Cleanup(func() { ghIssueCommand = orig })
+}
+
+// TestRunStart_ForgeFlagPassthrough: an explicit --forge reaches the
+// body as the literal `forge` key, both values.
+func TestRunStart_ForgeFlagPassthrough(t *testing.T) {
+	for _, forge := range []string{"gitlab", "github"} {
+		t.Run(forge, func(t *testing.T) {
+			fake := newStartRunCapture(t)
+			withGhNeverInvoked(t)
+			var stdout, stderr bytes.Buffer
+			code := runStart([]string{
+				"--repo", "group/sub/proj", "--workflow", "trivial",
+				"--working-dir", specDir(t),
+				"--backend-url", fake.srv.URL, "--token", "tok-test",
+				"--forge", forge,
+			}, &stdout, &stderr)
+			if code != exitOK {
+				t.Fatalf("runStart exit = %d, want exitOK\nstderr: %s", code, stderr.String())
+			}
+			if got := fake.body["forge"]; got != forge {
+				t.Errorf("wire key forge = %v, want %q — body: %+v", got, forge, fake.body)
+			}
+		})
+	}
+}
+
+// TestRunStart_InvalidForge_Usage: a value outside github|gitlab is a
+// local usage error naming --forge, with ZERO backend requests and no
+// gh invocation. Runs without a discovered spec so the refusal is
+// pinned to precede discovery.
+func TestRunStart_InvalidForge_Usage(t *testing.T) {
+	fake := newStartRunCapture(t)
+	withGhNeverInvoked(t)
+	var stdout, stderr bytes.Buffer
+	code := runStart([]string{
+		"--repo", "x/y", "--workflow", "trivial",
+		"--working-dir", t.TempDir(),
+		"--backend-url", fake.srv.URL, "--token", "tok-test",
+		"--forge", "bitbucket", "--issue", "42",
+	}, &stdout, &stderr)
+	if code != exitUsage {
+		t.Fatalf("runStart exit = %d, want exitUsage\nstderr: %s", code, stderr.String())
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("--forge")) {
+		t.Errorf("stderr does not name the offending flag: %s", stderr.String())
+	}
+	if n := fake.requests.Load(); n != 0 {
+		t.Errorf("backend received %d requests, want 0", n)
+	}
+}
+
+// TestRunStart_GitLabWithIssue_SkipsGh: --forge gitlab with --issue
+// never shells to gh (it reads github.com only), warns naming the
+// degraded prompt, sends forge:gitlab, and ships no issue_context.
+func TestRunStart_GitLabWithIssue_SkipsGh(t *testing.T) {
+	fake := newStartRunCapture(t)
+	withGhOnPath(t)
+	withGhNeverInvoked(t)
+	var stdout, stderr bytes.Buffer
+	code := runStart([]string{
+		"--repo", "group/sub/proj", "--workflow", "trivial",
+		"--working-dir", specDir(t),
+		"--backend-url", fake.srv.URL, "--token", "tok-test",
+		"--forge", "gitlab", "--issue", "42",
+	}, &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("runStart exit = %d, want exitOK\nstderr: %s", code, stderr.String())
+	}
+	if got := fake.body["forge"]; got != "gitlab" {
+		t.Errorf("wire key forge = %v, want gitlab", got)
+	}
+	if _, ok := fake.body["issue_context"]; ok {
+		t.Errorf("issue_context must not be shipped when gh was skipped: %+v", fake.body)
+	}
+	if !strings.Contains(stderr.String(), "--forge gitlab") || !strings.Contains(stderr.String(), "not fetching issue #42") {
+		t.Errorf("stderr should warn that the gh fetch was skipped: %s", stderr.String())
+	}
+	// The issue-trigger shape is otherwise unchanged.
+	if got := fake.body["trigger_ref"]; got != "issue:42" {
+		t.Errorf("trigger_ref = %v, want issue:42", got)
+	}
+}
+
+// TestRunStart_OmittedForgeWithIssue_PinsGitHubAndInvokesGh (constraint
+// 1): --forge omitted with --issue → gh IS invoked and the raw body
+// PINS "forge":"github". The pin rides on the ATTEMPT: the gh-error
+// subcase still pins github (and warns), so an unauthed gh cannot mint
+// the same invocation under a different forge.
+func TestRunStart_OmittedForgeWithIssue_PinsGitHubAndInvokesGh(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		ghFails bool
+	}{
+		{"gh succeeds", false},
+		{"gh errors", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newStartRunCapture(t)
+			withGhOnPath(t)
+			calls := withRecordingGh(t, tc.ghFails)
+			var stdout, stderr bytes.Buffer
+			code := runStart([]string{
+				"--repo", "x/y", "--workflow", "trivial",
+				"--working-dir", specDir(t),
+				"--backend-url", fake.srv.URL, "--token", "tok-test",
+				"--issue", "42",
+			}, &stdout, &stderr)
+			if code != exitOK {
+				t.Fatalf("runStart exit = %d, want exitOK\nstderr: %s", code, stderr.String())
+			}
+			if n := calls.Load(); n != 1 {
+				t.Errorf("gh invoked %d times, want 1", n)
+			}
+			if got := fake.body["forge"]; got != "github" {
+				t.Errorf("wire key forge = %v, want the github PIN after a gh fetch attempt — body: %+v", got, fake.body)
+			}
+			if tc.ghFails {
+				if _, ok := fake.body["issue_context"]; ok {
+					t.Errorf("issue_context shipped although gh failed: %+v", fake.body)
+				}
+				if !strings.Contains(stderr.String(), "proceeding without inline issue context") {
+					t.Errorf("stderr should carry the gh-error warning: %s", stderr.String())
+				}
+			} else if _, ok := fake.body["issue_context"]; !ok {
+				t.Errorf("issue_context missing after a successful gh fetch: %+v", fake.body)
+			}
+		})
+	}
+}
+
+// TestRunStart_OmittedForgeNoIssue_SendsNoForge (constraint 1's other
+// half): no --issue and no --forge → the body lacks the `forge` key
+// entirely (the backend derives from the registry) and gh is never
+// invoked.
+func TestRunStart_OmittedForgeNoIssue_SendsNoForge(t *testing.T) {
+	fake := newStartRunCapture(t)
+	withGhOnPath(t)
+	withGhNeverInvoked(t)
+	var stdout, stderr bytes.Buffer
+	code := runStart([]string{
+		"--repo", "x/y", "--workflow", "trivial",
+		"--working-dir", specDir(t),
+		"--backend-url", fake.srv.URL, "--token", "tok-test",
+	}, &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("runStart exit = %d, want exitOK\nstderr: %s", code, stderr.String())
+	}
+	if got, ok := fake.body["forge"]; ok {
+		t.Errorf("forge key present (%v) with no issue and no --forge; the backend must derive: %+v", got, fake.body)
 	}
 }

@@ -1059,14 +1059,42 @@ components:
         table in `backend/internal/run/transition.go`.
       required:
         [id, repo, workflow_id, workflow_sha, trigger_source, state,
-         retry_attempt, max_retries_snapshot, runner_kind,
+         retry_attempt, max_retries_snapshot, runner_kind, forge,
          runner_kind_resolved, drive, cost_usd_total, resolved_model,
          created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
         repo:
           type: string
+          description: |
+            `owner/name` on GitHub, or the GitLab `path_with_namespace`
+            (nested groups allowed) for a `forge: gitlab` run.
           example: kuhlman-labs/fishhawk
+        forge:
+          type: string
+          enum: [github, gitlab]
+          description: |
+            The run's canonical forge (E45.46 / #3463), derived from the
+            run row: a `gitlab_ci` `runner_kind` OR a `gitlab:`-schemed
+            `installation_ref` reads as `gitlab`; everything else —
+            including a legacy row with no ref — as `github`. ALWAYS
+            present, on both `GET /v0/runs/{run_id}` and the list
+            endpoint, so a runner-spawning consumer never has to guess.
+        forge_base_url:
+          type: string
+          format: uri
+          description: |
+            A `gitlab` run's instance root, e.g.
+            `https://gitlab.example.com` (E45.46 / #3463). Present ONLY on
+            `GET /v0/runs/{run_id}` — the list endpoint NEVER carries it
+            (no per-row registry read), which is the asymmetry the MCP /
+            CLI spawn helpers rely on to insist on a single-run read.
+            Resolved at read time, not persisted: the registered
+            installation's `forge_base_url`, else the deployment default
+            `FISHHAWKD_GITLAB_BASE_URL`, else omitted (a spawn-side
+            consumer then refuses rather than targeting gitlab.com by
+            accident). Omitted on every `github` run.
+          example: https://gitlab.example.com
         workflow_id:
           type: string
           example: feature_change
@@ -1172,7 +1200,7 @@ components:
           example: 1
         runner_kind:
           type: string
-          enum: [github_actions, local]
+          enum: [github_actions, local, gitlab_ci]
           description: |
             Execution backend the run uses (ADR-022 / #388). Today's
             published runner (`fishhawk/runner@v1`) on GitHub Actions
@@ -7388,14 +7416,46 @@ paths:
                   type: [string, "null"]
                 runner_kind:
                   type: string
-                  enum: [github_actions, local]
+                  enum: [github_actions, local, gitlab_ci]
                   description: |
                     Optional. Execution backend the run will use
                     (ADR-022 / #388). Defaults to `github_actions`
                     when omitted. The local-runner CLI (Phase C of
                     E22 / #389) passes `local` to mint a run that
                     runs on the operator's workstation instead of
-                    GitHub Actions.
+                    GitHub Actions. A `forge: gitlab` run accepts
+                    ONLY `local` or `gitlab_ci` — `github_actions`,
+                    and an omitted value that would default to it, is
+                    refused `400 validation_failed` (field
+                    `runner_kind`) before any registry lookup. The
+                    400 message for an unrecognised value names every
+                    accepted kind, derived from the same set the
+                    check enforces.
+                forge:
+                  type: string
+                  enum: [github, gitlab]
+                  description: |
+                    Optional. The run's forge (E45.46 / #3463),
+                    resolved through a fixed ladder: (1) an EXPLICIT
+                    value wins; (2) omitted → the registered
+                    `accounts.provider` for the repo owner (an owner
+                    registered under BOTH forges, or under neither,
+                    falls through); (3) `github`. A registry fault
+                    while deriving is `503 forge_unresolvable` — pass
+                    `forge` explicitly or retry. `repo` is the GitLab
+                    `path_with_namespace` for a `gitlab` run. A
+                    `gitlab` run is stamped with the `installation_ref`
+                    (`gitlab:<project_id>`) of the registered
+                    installation whose `project_path` EXACTLY equals
+                    `repo`, requires the inline `workflow_spec` (no
+                    GitLab spec-fetch fallback), and SKIPS the GitHub
+                    App installation lookup entirely. The MCP
+                    `fishhawk_start_run` and CLI `fishhawk run start`
+                    clients PIN `github` here whenever they fetched
+                    the issue from github.com via `gh` (a
+                    github.com-fetched issue is never attached to a
+                    gitlab run); only a request that omits the field
+                    lets the registry ladder derive it.
                 working_dir:
                   type: string
                   description: |
@@ -7564,7 +7624,19 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Run' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '400':
+          description: |
+            `validation_failed` — a malformed body or field. Beyond the
+            shape checks: `forge` outside `github` / `gitlab` (field
+            `forge`, message names both), and a `gitlab` run whose
+            `runner_kind` is `github_actions` or omitted (field
+            `runner_kind`, message names the accepted `local` and
+            `gitlab_ci`) — refused before any registry lookup so an
+            unregistered project still learns the pairing rule. Also
+            `plan_reviewer_unconfigured` (see below).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402':
           description: |
@@ -7586,6 +7658,18 @@ paths:
             the spec (#413). `repo_not_installed` when the App is
             absent from the target repo; `spec_not_found` when the
             file doesn't exist at the requested `workflow_sha`.
+
+            For a `forge: gitlab` run (E45.46 / #3463):
+            `workflow_spec_required` when the inline `workflow_spec`
+            is omitted (there is no GitLab spec-fetch fallback), and
+            `gitlab_project_not_registered` when no gitlab
+            installation's `project_path` EXACTLY equals `repo` — an
+            ambiguous double registration lands here too, never an
+            arbitrary row. The message names the remedy verbatim:
+            `fishhawkd installation register --provider gitlab
+            --account-key <namespace> --installation-ref
+            gitlab:<project_id> --project-path <repo>`. No run row is
+            created for either.
 
             Also `workflow_not_applicable` (E53.3 / #2226) when the
             requested workflow declares an `applies_to` predicate the
@@ -7644,6 +7728,14 @@ paths:
             creates no run row, and a post-insert run-scoped append
             failure cancels the created run (`details.run_id`).
             Transient — retry once the audit store is reachable.
+
+            `forge_unresolvable` (E45.46 / #3463) when `forge` was
+            omitted and the installation registry faulted while
+            deriving it — fail-closed rather than guessing a forge on a
+            transient DB fault; pass `forge` explicitly or retry.
+            `gitlab_unconfigured` when a `gitlab` run is requested on a
+            deployment with no installation registry (no database),
+            which cannot attribute the run to a registered project.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

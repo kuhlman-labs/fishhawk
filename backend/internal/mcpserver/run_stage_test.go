@@ -1879,23 +1879,36 @@ func TestRunStage_NextActions_SurfacedAfterStage(t *testing.T) {
 // the operator named. The GET is forced to 500 for this run so
 // fetchRunDriveView returns an error (runView nil), NOT a zero view with a nil
 // Concerns field; the pre-spawn runner_kind guard fails OPEN and the stdio
-// working_dir resolver degrades to the explicit path on the same error, so the
-// stage still runs to the hint computation.
+// working_dir resolver degrades to the explicit path on the same error. The
+// pre-spawn forge-target read (resolveRunForgeTarget, E45.46 / #3463) does
+// NOT fail open — an unreadable run REFUSES the spawn — so the 500 is armed
+// AT SPAWN TIME (inside the fake runner command), after every pre-spawn read
+// has succeeded and before the post-run fetch the arm under test needs to
+// fail.
 func TestRunStage_ReviewActionHint_StoreUnavailableWhenRunFetchFails(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil) // stdio: an unreadable run degrades to the explicit working_dir
-	captureArgv(t)
 
 	runID := uuid.New()
 	stageID := uuid.New()
 	seedStageOfType(fb, runID, stageID, "implement", "pending")
 	// The audit fallback source: two implement-stage concerns in the latest round.
 	seedImplementReviewedAudit(fb, runID, stageID, 2)
-	// Force GET /v0/runs/{id} to 500 for THIS run so the post-run
-	// fetchRunDriveView errors and runView is nil — the arm under test.
-	fb.mu.Lock()
-	fb.getStatusByID[runID] = http.StatusInternalServerError
-	fb.mu.Unlock()
+	// Force GET /v0/runs/{id} to 500 for THIS run from the spawn onward, so the
+	// post-run fetchRunDriveView errors and runView is nil — the arm under test.
+	origCmd := runStageCommand
+	origLook := runStageLookPath
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		fb.mu.Lock()
+		fb.getStatusByID[runID] = http.StatusInternalServerError
+		fb.mu.Unlock()
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() {
+		runStageCommand = origCmd
+		runStageLookPath = origLook
+	})
 
 	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
 		RunID:      runID.String(),
@@ -3280,7 +3293,7 @@ func TestComposeRunnerArgv_RunIDFlagAndValueAreAdjacentTokens(t *testing.T) {
 		Workflow:   "feature_change",
 		Stage:      "implement",
 		WorkingDir: "/tmp/checkout",
-	}, "stage-1", "kuhlman-labs/fishhawk", "main", true)
+	}, "stage-1", "kuhlman-labs/fishhawk", "main", true, runForgeTarget{Forge: startRunForgeGitHub})
 
 	idx := -1
 	for i, tok := range argv {
@@ -3981,4 +3994,348 @@ func TestRunStage_AcceptanceParkNamesDefaultPreviewCommand(t *testing.T) {
 		t.Fatalf("runStage(implement): %v", err)
 	}
 	assertPreviewFoldedBeforeAcceptanceDispatch(t, out.NextActions, "scripts/dev preview "+headSHA)
+}
+
+// --- forge target (E45.46 / #3463) -------------------------------------------
+//
+// Fixture contract shared by every producer pin below: the fake backend serves
+// forge_base_url ONLY on GET /v0/runs/{id} (newFakeBackend's list route strips
+// it, mirroring the real handleGetRun/list asymmetry), so a producer that
+// derived its target from anything but the single-run GET hits
+// resolveRunForgeTarget's empty-base-URL refusal and its test goes RED.
+
+// seedGitLabRun seeds a gitlab run row served on the single-run route with the
+// given instance root (empty models an unregistered base URL).
+func seedGitLabRun(fb *fakeBackend, runID uuid.UUID, repo, baseURL string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: repo, State: "running", RunnerKind: "local",
+		Forge: "gitlab", ForgeBaseURL: baseURL,
+	}
+}
+
+// argvHasPair reports whether flag is immediately followed by value in argv.
+func argvHasPair(argv []string, flag, value string) bool {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == flag && argv[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+// TestComposeRunnerArgv_GitLabTargetEmitsForgeFlags pins the exact gitlab argv,
+// including the position of the two new flags: right after --github-repo and
+// before --base-branch.
+func TestComposeRunnerArgv_GitLabTargetEmitsForgeFlags(t *testing.T) {
+	r := &runResolver{api: &apiClient{baseURL: "http://127.0.0.1:1"}}
+	argv := r.composeRunnerArgv(RunStageInput{
+		RunID: "run-1", Workflow: "feature_change", Stage: "implement", WorkingDir: "/tmp/checkout",
+	}, "stage-1", "acme/platform/widgets", "main", true,
+		runForgeTarget{Forge: "gitlab", GitLabBaseURL: "https://gitlab.example.com", Repo: "acme/platform/widgets"})
+
+	want := []string{
+		"--run-id", "run-1",
+		"--backend-url", "http://127.0.0.1:1",
+		"--workflow", "feature_change",
+		"--stage", "implement",
+		stageIDArgFlag, "stage-1",
+		"--working-dir", "/tmp/checkout",
+		"--fetch-prompt",
+		"--upload-trace",
+		"--github-repo", "acme/platform/widgets",
+		"--forge", "gitlab",
+		"--gitlab-base-url", "https://gitlab.example.com",
+		"--base-branch", "main",
+		"--check-base-ref", "main",
+	}
+	if strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("gitlab argv:\n got %q\nwant %q", argv, want)
+	}
+}
+
+// TestComposeRunnerArgv_GitHubTargetUnchanged: a github target appends NOTHING
+// — the argv is byte-identical to the pre-#3463 golden.
+func TestComposeRunnerArgv_GitHubTargetUnchanged(t *testing.T) {
+	r := &runResolver{api: &apiClient{baseURL: "http://127.0.0.1:1"}}
+	argv := r.composeRunnerArgv(RunStageInput{
+		RunID: "run-1", Workflow: "feature_change", Stage: "implement", WorkingDir: "/tmp/checkout",
+	}, "stage-1", "x/y", "main", true, runForgeTarget{Forge: "github", Repo: "x/y"})
+
+	want := []string{
+		"--run-id", "run-1",
+		"--backend-url", "http://127.0.0.1:1",
+		"--workflow", "feature_change",
+		"--stage", "implement",
+		stageIDArgFlag, "stage-1",
+		"--working-dir", "/tmp/checkout",
+		"--fetch-prompt",
+		"--upload-trace",
+		"--github-repo", "x/y",
+		"--base-branch", "main",
+		"--check-base-ref", "main",
+	}
+	if strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("github argv changed:\n got %q\nwant %q", argv, want)
+	}
+	for _, tok := range argv {
+		if tok == "--forge" || tok == "--gitlab-base-url" {
+			t.Fatalf("github argv must carry no forge flag: %v", argv)
+		}
+	}
+}
+
+// TestResolveRunForgeTarget pins the helper's rule table directly, one case per
+// branch, and the single-run-GET contract: exactly ONE GET /v0/runs/{id} and
+// ZERO GET /v0/runs (list) per call.
+func TestResolveRunForgeTarget(t *testing.T) {
+	t.Run("gitlab_with_base_url", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		runID := uuid.New()
+		seedGitLabRun(fb, runID, "acme/widgets", "https://gitlab.example.com")
+		got, err := r.resolveRunForgeTarget(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("resolveRunForgeTarget: %v", err)
+		}
+		want := runForgeTarget{Forge: "gitlab", GitLabBaseURL: "https://gitlab.example.com", Repo: "acme/widgets"}
+		if got != want {
+			t.Fatalf("target = %+v, want %+v", got, want)
+		}
+		fb.mu.Lock()
+		gets, lists := fb.getRunCalledByID[runID], fb.listRunCalls
+		fb.mu.Unlock()
+		if gets != 1 || lists != 0 {
+			t.Fatalf("single-run GETs = %d, list GETs = %d; want exactly 1 and 0", gets, lists)
+		}
+	})
+	t.Run("gitlab_no_base_url_refuses_naming_both_remedies", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		runID := uuid.New()
+		seedGitLabRun(fb, runID, "acme/widgets", "")
+		_, err := r.resolveRunForgeTarget(context.Background(), runID)
+		if err == nil {
+			t.Fatal("a gitlab run with no forge_base_url must REFUSE")
+		}
+		for _, want := range []string{"not spawning", "FISHHAWKD_GITLAB_BASE_URL", "--forge-base-url"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal should name %q; got %v", want, err)
+			}
+		}
+	})
+	t.Run("read_error_refuses", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		runID := uuid.New()
+		fb.mu.Lock()
+		fb.getStatusByID[runID] = http.StatusInternalServerError
+		fb.mu.Unlock()
+		_, err := r.resolveRunForgeTarget(context.Background(), runID)
+		if err == nil {
+			t.Fatal("an unreadable run must REFUSE, never default to github")
+		}
+		if !strings.Contains(err.Error(), "could not read run") || !strings.Contains(err.Error(), "not spawning") {
+			t.Errorf("refusal wording: %v", err)
+		}
+	})
+	t.Run("older_backend_no_forge_defaults_github", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		runID := uuid.New()
+		fb.mu.Lock()
+		fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"} // no forge key
+		fb.mu.Unlock()
+		got, err := r.resolveRunForgeTarget(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("resolveRunForgeTarget: %v", err)
+		}
+		if got.Forge != "github" || got.Repo != "x/y" || got.GitLabBaseURL != "" {
+			t.Fatalf("target = %+v, want github/x/y", got)
+		}
+	})
+	t.Run("unknown_forge_refuses", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		runID := uuid.New()
+		fb.mu.Lock()
+		fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running", Forge: "bitbucket"}
+		fb.mu.Unlock()
+		_, err := r.resolveRunForgeTarget(context.Background(), runID)
+		if err == nil || !strings.Contains(err.Error(), `"bitbucket"`) {
+			t.Fatalf("an unknown forge must REFUSE naming the value; got %v", err)
+		}
+	})
+}
+
+// TestRunStage_GitLabRun_DefaultsRepoFromRunRow_SkipsOriginDetect: github_repo
+// omitted on a gitlab run → `--github-repo <path_with_namespace>` from the run
+// row, and the github.com-only origin detector is never consulted (it would
+// refuse the GitLab origin stubbed here). Counterfactual: delete the
+// `repo = forgeTarget.Repo` default in runStage and this goes RED on the
+// auto-detect error.
+func TestRunStage_GitLabRun_DefaultsRepoFromRunRow_SkipsOriginDetect(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	argv := captureArgv(t)
+	withFakeGitRemote(t, "git@gitlab.example.com:acme/platform/widgets.git", nil)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	seedGitLabRun(fb, runID, "acme/platform/widgets", "https://gitlab.example.com")
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if !argvHasPair(*argv, "--github-repo", "acme/platform/widgets") {
+		t.Fatalf("argv should carry --github-repo from the run row; got %v", *argv)
+	}
+	if !argvHasPair(*argv, "--forge", "gitlab") || !argvHasPair(*argv, "--gitlab-base-url", "https://gitlab.example.com") {
+		t.Fatalf("argv should carry the gitlab forge flags; got %v", *argv)
+	}
+}
+
+// TestRunStage_ForgeTarget_ReadViaSingleRunGet: the spawn carried the base URL
+// the fake serves ONLY on the single-run route, and the list route was never
+// read. Counterfactual: switch resolveRunForgeTarget to a list read and this
+// goes RED on the base-URL refusal (the list body omits forge_base_url).
+func TestRunStage_ForgeTarget_ReadViaSingleRunGet(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	argv := captureArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	seedGitLabRun(fb, runID, "acme/widgets", "https://gitlab.example.com")
+	// The list route would serve the SAME row minus forge_base_url.
+	fb.mu.Lock()
+	fb.listResp = listRunsResult{Items: []Run{fb.getRunByID[runID]}}
+	fb.mu.Unlock()
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", GitHubRepo: "acme/widgets",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if !argvHasPair(*argv, "--gitlab-base-url", "https://gitlab.example.com") {
+		t.Fatalf("spawn did not carry the single-run-route base URL: %v", *argv)
+	}
+	fb.mu.Lock()
+	gets, lists := fb.getRunCalledByID[runID], fb.listRunCalls
+	fb.mu.Unlock()
+	if gets < 1 {
+		t.Fatalf("GET /v0/runs/{id} was never read for the target")
+	}
+	if lists != 0 {
+		t.Fatalf("GET /v0/runs (list) was read %d times; the forge target must come from the single-run route only", lists)
+	}
+}
+
+// TestRunStage_GitLabRun_NoBaseURL_RefusesBeforeHostDispatchMarker: a gitlab
+// run with no forge_base_url refuses with NO host-dispatch marker POST and NO
+// spawn — committed state, not just error identity. Counterfactual: delete the
+// empty-ForgeBaseURL refusal in resolveRunForgeTarget and this goes RED (the
+// marker fires and a runner spawns with an empty --gitlab-base-url).
+func TestRunStage_GitLabRun_NoBaseURL_RefusesBeforeHostDispatchMarker(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	seedGitLabRun(fb, runID, "acme/widgets", "")
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", GitHubRepo: "acme/widgets",
+	})
+	if err == nil {
+		t.Fatal("expected a refusal for a gitlab run with no forge_base_url")
+	}
+	if !strings.Contains(err.Error(), "forge_base_url") {
+		t.Errorf("refusal should name forge_base_url: %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("runner spawned despite the refusal: %v", *calls)
+	}
+	fb.mu.Lock()
+	marker := fb.hostDispatchCalledByID[stageID]
+	fb.mu.Unlock()
+	if marker != 0 {
+		t.Fatalf("host-dispatch marker POSTed %d times; the refusal must land BEFORE any state-committing step", marker)
+	}
+}
+
+// TestRunStage_RunReadFails_RefusesSpawn: an unreadable run row refuses the
+// spawn (no github default, no marker, no runner). Counterfactual: make
+// resolveRunForgeTarget return a github target on a read error and this goes
+// RED.
+func TestRunStage_RunReadFails_RefusesSpawn(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	fb.mu.Lock()
+	fb.getStatusByID[runID] = http.StatusInternalServerError
+	fb.mu.Unlock()
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", GitHubRepo: "x/y",
+	})
+	if err == nil {
+		t.Fatal("expected a refusal when the run row is unreadable")
+	}
+	if !strings.Contains(err.Error(), "could not read run") || !strings.Contains(err.Error(), "not spawning") {
+		t.Errorf("refusal wording: %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("runner spawned despite the unreadable run: %v", *calls)
+	}
+	fb.mu.Lock()
+	marker := fb.hostDispatchCalledByID[stageID]
+	fb.mu.Unlock()
+	if marker != 0 {
+		t.Fatalf("host-dispatch marker POSTed %d times on a refused spawn", marker)
+	}
+}
+
+// TestRunStage_OlderBackendNoForgeField_DefaultsGitHub: a run row with no
+// forge key (pre-#3463 backend) spawns as github with the unchanged argv —
+// the one mixed-version degrade.
+func TestRunStage_OlderBackendNoForgeField_DefaultsGitHub(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	argv := captureArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	fb.mu.Lock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.mu.Unlock()
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	for _, tok := range *argv {
+		if tok == "--forge" || tok == "--gitlab-base-url" {
+			t.Fatalf("github argv must carry no forge flag: %v", *argv)
+		}
+	}
+	if !argvHasPair(*argv, "--github-repo", "x/y") {
+		t.Fatalf("argv missing --github-repo x/y: %v", *argv)
+	}
 }

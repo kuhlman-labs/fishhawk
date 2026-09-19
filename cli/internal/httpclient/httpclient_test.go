@@ -257,6 +257,78 @@ func TestGetRun_HappyPath(t *testing.T) {
 	}
 }
 
+// TestStartRun_Forge_Serializes pins the E45.46 / #3463 wire key: a set
+// Forge reaches the body as the literal `forge` key the backend's
+// createRunRequest decodes, and an empty Forge OMITS the key so the
+// backend's registry ladder derives the forge (the CLI never sends
+// `"forge":""`, which the backend would 400 as an invalid value).
+func TestStartRun_Forge_Serializes(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.startResp = Run{ID: uuid.New(), State: "pending"}
+	c := New(srv.URL, "")
+
+	if _, err := c.StartRun(context.Background(), CreateRunInput{
+		Repo: "group/sub/proj", WorkflowID: "w", WorkflowSHA: "abc", TriggerSource: "cli",
+		Forge: "gitlab",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(fb.gotStartBody), `"forge":"gitlab"`) {
+		t.Errorf("body missing forge:gitlab: %s", fb.gotStartBody)
+	}
+
+	if _, err := c.StartRun(context.Background(), CreateRunInput{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "abc", TriggerSource: "cli",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(fb.gotStartBody), `"forge"`) {
+		t.Errorf("forge key present when empty (backend must derive): %s", fb.gotStartBody)
+	}
+}
+
+// TestGetRun_DecodesForgeFields pins the raw-JSON → Run decode for the
+// two E45.46 / #3463 response fields under the backend's literal keys
+// (`forge`, `forge_base_url`) — the tags on the CLI struct are the wire
+// contract with backend/internal/server's runResponse, and a tag drift
+// would silently zero both and route a gitlab run at api.github.com.
+func TestGetRun_DecodesForgeFields(t *testing.T) {
+	id := uuid.New()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"` + id.String() + `","repo":"group/sub/proj","workflow_id":"w","state":"running","runner_kind":"local","forge":"gitlab","forge_base_url":"https://gitlab.example.com"}`))
+	}))
+	t.Cleanup(srv.Close)
+	got, err := New(srv.URL, "").GetRun(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Forge != "gitlab" {
+		t.Errorf("Forge = %q, want gitlab", got.Forge)
+	}
+	if got.ForgeBaseURL != "https://gitlab.example.com" {
+		t.Errorf("ForgeBaseURL = %q, want https://gitlab.example.com", got.ForgeBaseURL)
+	}
+	if got.Repo != "group/sub/proj" {
+		t.Errorf("Repo = %q, want the nested path_with_namespace intact", got.Repo)
+	}
+
+	// An older backend without the fields decodes to empty strings —
+	// the consumer-side github default lives in the callers, not here.
+	older := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"` + id.String() + `","repo":"x/y","workflow_id":"w","state":"running","runner_kind":"local"}`))
+	}))
+	t.Cleanup(older.Close)
+	got, err = New(older.URL, "").GetRun(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Forge != "" || got.ForgeBaseURL != "" {
+		t.Errorf("older backend decoded to Forge=%q ForgeBaseURL=%q, want both empty", got.Forge, got.ForgeBaseURL)
+	}
+}
+
 func TestGetRun_NotFound(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	fb.getStatus = http.StatusNotFound

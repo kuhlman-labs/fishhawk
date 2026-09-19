@@ -199,6 +199,23 @@ type Run struct {
 	RetryAttempt       int     `json:"retry_attempt"`
 	MaxRetriesSnapshot int     `json:"max_retries_snapshot"`
 	RunnerKind         string  `json:"runner_kind,omitempty"`
+	// Forge mirrors the backend runResponse.forge (E45.46 / #3463): the run's
+	// canonical forge id (`github` | `gitlab`), present on EVERY run read. An
+	// OLDER backend omits it, so it decodes to "" — resolveRunForgeTarget
+	// treats that as github (the mixed-version degrade). The json tag MUST
+	// byte-match the backend's runResponse field or this mirror silently
+	// decodes to empty and every gitlab run spawns as github — the #371-class
+	// hand-maintained-wire-mirror trap, here with a cross-forge consequence.
+	Forge string `json:"forge,omitempty" jsonschema:"the run's forge (github | gitlab); absent on an older backend, which the spawn producers read as github"`
+	// ForgeBaseURL mirrors the backend runResponse.forge_base_url (E45.46 /
+	// #3463): a gitlab run's instance root, resolved at READ time. The backend
+	// emits it on the SINGLE-run read ONLY (handleGetRun) — the list route
+	// omits it — so it is populated when this Run came from GetRun and empty
+	// otherwise. resolveRunForgeTarget depends on that asymmetry: it reads the
+	// single-run route and REFUSES a gitlab run whose value is empty, so a
+	// producer that derived its target from a list read would refuse
+	// spuriously. The json tag MUST byte-match the backend's runResponse field.
+	ForgeBaseURL string `json:"forge_base_url,omitempty" jsonschema:"a gitlab run's instance root (single-run read only); absent for a github run"`
 	// RunnerKindResolved mirrors GET /v0/runs/{id}'s lock flag (#1355):
 	// true once the run's first signed runner self-report LOCKED runner_kind
 	// (#1346/#1348). The host-dispatch guard (guardHostDispatch) reads it to
@@ -1018,6 +1035,13 @@ type createRunRequest struct {
 	IssueContext   *IssueContext `json:"issue_context,omitempty"`
 	BudgetOverride bool          `json:"budget_override,omitempty"`
 	UpstreamRunID  string        `json:"upstream_run_id,omitempty"`
+	// Forge is the optional explicit forge selector (E45.46 / #3463):
+	// `github` | `gitlab`. omitempty is load-bearing — an EMPTY value sends
+	// NO key, and the backend then derives the forge from its installation
+	// registry; the start_run tool pins "github" here whenever it fetched the
+	// issue from github.com via gh, so the backend can never re-derive gitlab
+	// under a github.com-fetched issue.
+	Forge string `json:"forge,omitempty"`
 	// AppliesToOverride + AppliesToOverrideReason are the audited
 	// escape hatch past the workflow's `applies_to` routing
 	// declaration (E53.3 / #2226). The reason is REQUIRED whenever the
@@ -1055,6 +1079,10 @@ type StartRunParams struct {
 	UpstreamRunID           string
 	AppliesToOverride       bool
 	AppliesToOverrideReason string
+	// Forge is the explicit forge selector forwarded verbatim as the
+	// request's `forge` (E45.46 / #3463); empty omits the key so the backend
+	// derives it. See createRunRequest.Forge.
+	Forge string
 }
 
 // approvalRequest mirrors the backend's
@@ -2855,6 +2883,7 @@ func (c *apiClient) StartRun(ctx context.Context, p StartRunParams) (*Run, bool,
 		UpstreamRunID:           p.UpstreamRunID,
 		AppliesToOverride:       p.AppliesToOverride,
 		AppliesToOverrideReason: p.AppliesToOverrideReason,
+		Forge:                   p.Forge,
 	}
 	if p.TriggerRef != "" {
 		ref := p.TriggerRef
