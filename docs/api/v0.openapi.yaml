@@ -8895,6 +8895,9 @@ paths:
         entry (modeled on `vouch-commit`) and queues the squash merge through
         the SAME merge seam the delegated `may_merge` arm of the auto-driver
         uses — so the human merge and the delegated merge converge on one path.
+        The seam is forge-resolved by the run's `installation_ref` family
+        (E45.47 / #3464): a GitHub run enables GitHub auto-merge, a GitLab run
+        queues `merge_when_pipeline_succeeds` (squash) on the merge request.
         The PR-approval review itself stays a `gh pr review --approve` step
         under the operator's own GitHub identity (App-identity approval is
         deferred to E39).

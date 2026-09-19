@@ -7,8 +7,10 @@
 // best-effort: a missed or dropped delivery leaves the run parked at
 // review awaiting_approval indefinitely with no operator-visible
 // recovery. This ticker is the catch-net — it walks the review stages
-// parked in awaiting_approval, reads each run's live PR state from the
-// GitHub REST API, and resolves the gate through the SAME path the
+// parked in awaiting_approval, reads each run's live PR state off its
+// forge (a github-family run through PRGetter, any other family through
+// the forge resolved from its InstallationRef family — E45.47 / #3464),
+// and resolves the gate through the SAME path the
 // webhook uses (server.ResolveReviewFromPollState). Because both
 // surfaces share one resolution method and TransitionStage is a no-op
 // on an already-terminal stage, the poll is idempotent against the
@@ -59,7 +61,11 @@
 // REST calls every interval, against GitHub's 5,000/hour
 // per-installation budget. A future phase may add adaptive cadence + a
 // per-stage last-polled gate (cf. reactionpoller) if the call volume
-// warrants it.
+// warrants it. The per-family poll (E45.47 / #3464) does not change this
+// shape: each parked stage still costs one GetPullRequest against its
+// OWN forge's request budget (GitHub's per-installation quota, or the
+// GitLab project's), so a mixed-forge deployment spreads the cost across
+// both budgets rather than concentrating it on one.
 package mergereconciler
 
 import (
@@ -67,6 +73,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -179,8 +187,19 @@ type Ticker struct {
 	// pull_request_url). Required.
 	Runs run.Repository
 
-	// PRGetter reads live PR state from GitHub. Required.
+	// PRGetter reads live PR state from GitHub — the github-family poll
+	// source. Required UNLESS ForgeResolver is set: Run() requires at least
+	// one of the two, so a GitLab-only deployment can start the ticker with
+	// ForgeResolver alone. A github-family run whose PRGetter is nil skips
+	// cleanly rather than polling.
 	PRGetter PRGetter
+
+	// ForgeResolver resolves a NON-github forge by family id for the
+	// per-family poll (E45.47 / #3464). OPTIONAL: nil defaults to forge.Get at
+	// use, so production needs no wiring — serve.go registers the forges at
+	// startup. A github-family run NEVER consults it (it polls only through
+	// PRGetter), so registry availability can never change a GitHub outcome.
+	ForgeResolver func(id string) (forge.Forge, error)
 
 	// Resolver resolves the review stage through the shared
 	// webhook+poll path. Required.
@@ -246,8 +265,11 @@ func (t *Ticker) Run(ctx context.Context) error {
 	if t.Runs == nil {
 		return errors.New("mergereconciler: ticker requires Runs")
 	}
-	if t.PRGetter == nil {
-		return errors.New("mergereconciler: ticker requires PRGetter")
+	// Per-family poll (E45.47 / #3464): PRGetter serves github-family runs and
+	// ForgeResolver serves every other family. At least one must be wired, or
+	// the ticker can poll nothing.
+	if t.PRGetter == nil && t.ForgeResolver == nil {
+		return errors.New("mergereconciler: ticker requires PRGetter or ForgeResolver")
 	}
 	if t.Resolver == nil {
 		return errors.New("mergereconciler: ticker requires Resolver")
@@ -320,9 +342,10 @@ func (t *Ticker) Tick(ctx context.Context) {
 
 // reconcileStage reads one parked review stage's live PR state and
 // resolves the gate when the PR has reached a terminal merge state.
-// Skips cleanly (no transition) when the run has no installation or no
-// PR URL, when the PR URL is malformed, or when the PR is still open.
-// Per-row errors log but don't propagate.
+// Skips cleanly (no transition) when the run cannot be polled (no
+// GitHub installation for a github-family run, an unresolved forge for
+// any other family) or has no PR URL, when the PR/MR URL is malformed,
+// or when the PR is still open. Per-row errors log but don't propagate.
 //
 // Each call issues one synchronous GetPullRequest (two when the
 // optional AuditCheckRepublisher recompute consults the auditcomplete
@@ -336,24 +359,21 @@ func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run
 			slog.String("error", err.Error()))
 		return
 	}
-	if runRow.InstallationID == nil {
-		// No installation_id → no GitHub creds to poll with. Pre-existing
-		// no-PR parked runs are correctly untouched here. Same skip-clean
-		// posture as the reactionpoller.
-		return
-	}
 	if runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
 		// Run never reached a PR (no implement-stage PR artifact). Nothing
 		// to reconcile; leave parked.
 		return
 	}
 	prURL := *runRow.PullRequestURL
-	repo, number, err := parsePRURL(prURL)
-	if err != nil {
-		logger.LogAttrs(ctx, slog.LevelWarn, "mergereconciler: malformed pull_request_url",
-			slog.String("run_id", s.RunID.String()),
-			slog.String("pr_url", prURL),
-			slog.String("error", err.Error()))
+
+	// Per-family resolution (E45.47 / #3464): resolve the PR/MR number and a
+	// poll closure over the right forge. A github-family run polls ONLY through
+	// PRGetter; any other family parses the merge-request URL and resolves the
+	// forge through ForgeResolver / forge.Get. ok=false skips cleanly (no creds,
+	// a malformed URL, or an unresolved forge) — the pre-#3464 skip-clean
+	// posture unchanged.
+	number, poll, ok := t.resolvePoll(ctx, logger, s, runRow, prURL)
+	if !ok {
 		return
 	}
 
@@ -366,7 +386,7 @@ func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run
 		t.AuditCheckRepublisher.RepublishAuditCheck(ctx, s.RunID)
 	}
 
-	pr, err := t.PRGetter.GetPullRequest(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, number)
+	pr, err := poll(ctx)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "mergereconciler: get pull request failed",
 			slog.String("run_id", s.RunID.String()),
@@ -417,6 +437,151 @@ func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run
 		if t.DriveObserver != nil && runRow.Drive {
 			t.DriveObserver.ObserveParkedReviewForDrive(ctx, s, prURL)
 		}
+	}
+}
+
+// resolvePoll resolves the per-family poll for a parked review stage (E45.47 /
+// #3464): the PR/MR number and a closure that reads its live state off the
+// right forge. ok=false means skip cleanly — no creds, a malformed URL, or an
+// unresolved forge — mirroring the pre-#3464 skip-clean posture.
+//
+// A github-family run polls ONLY through PRGetter with the GitHub installation
+// scope; a nil PRGetter or a nil InstallationID skips. Any other family parses
+// the merge-request URL, resolves the forge through ForgeResolver (defaulting
+// to forge.Get, isNilForge-guarded against a typed-nil), and polls it with the
+// run's forge-neutral InstallationRef scope. A github-family run NEVER reaches
+// the resolver, so registry availability can never change a GitHub outcome.
+func (t *Ticker) resolvePoll(ctx context.Context, logger *slog.Logger, s *run.Stage, runRow *run.Run, prURL string) (number int, poll func(context.Context) (*forge.PullRequest, error), ok bool) {
+	family := forgeFamilyFromRef(runRow.InstallationRef)
+	if family == "github" {
+		if t.PRGetter == nil {
+			// GitLab-only deployment (PRGetter unwired). A github-family run
+			// has no poll source; skip cleanly.
+			return 0, nil, false
+		}
+		if runRow.InstallationID == nil {
+			// No installation_id → no GitHub creds to poll with. Same skip-clean
+			// posture as the reactionpoller.
+			return 0, nil, false
+		}
+		repo, num, err := parsePRURL(prURL)
+		if err != nil {
+			logger.LogAttrs(ctx, slog.LevelWarn, "mergereconciler: malformed pull_request_url",
+				slog.String("run_id", s.RunID.String()),
+				slog.String("pr_url", prURL),
+				slog.String("error", err.Error()))
+			return 0, nil, false
+		}
+		scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
+		return num, func(ctx context.Context) (*forge.PullRequest, error) {
+			return t.PRGetter.GetPullRequest(ctx, scope, repo, num)
+		}, true
+	}
+
+	repo, num, err := parseMergeRequestURL(prURL)
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "mergereconciler: malformed pull_request_url",
+			slog.String("run_id", s.RunID.String()),
+			slog.String("pr_url", prURL),
+			slog.String("error", err.Error()))
+		return 0, nil, false
+	}
+	resolver := t.ForgeResolver
+	if resolver == nil {
+		resolver = forge.Get
+	}
+	f, ferr := resolver(family)
+	if ferr != nil || isNilForge(f) {
+		logger.LogAttrs(ctx, slog.LevelWarn, "mergereconciler: forge unresolved for family",
+			slog.String("run_id", s.RunID.String()),
+			slog.String("family", family),
+			slog.String("pr_url", prURL))
+		return 0, nil, false
+	}
+	ref := ""
+	if runRow.InstallationRef != nil {
+		ref = *runRow.InstallationRef
+	}
+	scope := forge.FromRef(ref)
+	return num, func(ctx context.Context) (*forge.PullRequest, error) {
+		return f.GetPullRequest(ctx, scope, repo, num)
+	}, true
+}
+
+// forgeFamilyFromRef derives a run's forge family from its persisted credential
+// ref — the local mirror of server.observationForgeID, kept in this package for
+// the same no-import reason parseCampaignPRURL cites. nil / empty / a bare
+// decimal (no ':') is the pre-0076 GitHub shape; "<forge>:<id>" names that
+// forge.
+func forgeFamilyFromRef(ref *string) string {
+	if ref == nil || *ref == "" {
+		return "github"
+	}
+	if i := strings.Index(*ref, ":"); i >= 0 {
+		return (*ref)[:i]
+	}
+	return "github"
+}
+
+// parseMergeRequestURL extracts (repo, number) from a GitLab merge-request URL.
+// It accepts the canonical <host>/<path...>/-/merge_requests/<n> shape (checked
+// FIRST, so its own /merge_requests/ substring is never mis-split on the /-/
+// separator) and the legacy /merge_requests/<n> shape. RepoRef comes from the
+// last two project-path segments; the GitLab adapter ignores RepoRef and scopes
+// by the credential ref, so a nested group path still resolves. A /pull/ URL (a
+// GitHub shape presented on a gitlab ref) is rejected so the caller skips
+// cleanly rather than confirming another forge's pull request.
+func parseMergeRequestURL(prURL string) (forge.RepoRef, int, error) {
+	u, err := url.Parse(strings.TrimSpace(prURL))
+	if err != nil {
+		return forge.RepoRef{}, 0, fmt.Errorf("not a merge request url: %q", prURL)
+	}
+	path := u.Path
+	if strings.Contains(path, "/pull/") {
+		return forge.RepoRef{}, 0, fmt.Errorf("github pull url, not a merge request: %q", prURL)
+	}
+	var projectPath, numStr string
+	if idx := strings.LastIndex(path, "/-/merge_requests/"); idx >= 0 {
+		projectPath = strings.Trim(path[:idx], "/")
+		numStr = path[idx+len("/-/merge_requests/"):]
+	} else if idx := strings.LastIndex(path, "/merge_requests/"); idx >= 0 {
+		projectPath = strings.Trim(path[:idx], "/")
+		numStr = path[idx+len("/merge_requests/"):]
+	} else {
+		return forge.RepoRef{}, 0, fmt.Errorf("not a merge request url: %q", prURL)
+	}
+	if cut := strings.IndexAny(numStr, "/?#"); cut >= 0 {
+		numStr = numStr[:cut]
+	}
+	n, err := strconv.Atoi(numStr)
+	if err != nil || n <= 0 {
+		return forge.RepoRef{}, 0, fmt.Errorf("merge request url has non-numeric number: %q", prURL)
+	}
+	segs := strings.Split(projectPath, "/")
+	if len(segs) < 2 {
+		return forge.RepoRef{}, 0, fmt.Errorf("merge request url missing owner/name: %q", prURL)
+	}
+	owner, name := segs[len(segs)-2], segs[len(segs)-1]
+	if owner == "" || name == "" {
+		return forge.RepoRef{}, 0, fmt.Errorf("merge request url missing owner/name: %q", prURL)
+	}
+	return forge.RepoRef{Owner: owner, Name: name}, n, nil
+}
+
+// isNilForge reports whether f is effectively nil — a nil interface OR a
+// non-nil interface wrapping a typed-nil pointer (a resolver returning e.g.
+// (*someForge)(nil)). The local mirror of server.isNilForge: a bare f == nil
+// catches only the former and would panic on the first GetPullRequest dispatch.
+func isNilForge(f forge.Forge) bool {
+	if f == nil {
+		return true
+	}
+	v := reflect.ValueOf(f)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return v.IsNil()
+	default:
+		return false
 	}
 }
 

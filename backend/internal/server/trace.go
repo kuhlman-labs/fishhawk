@@ -27,7 +27,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupattempt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -3503,28 +3502,25 @@ func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uui
 		return
 	}
 
-	// GitHub-wired diff source. CLI/dev posture (no client / no
-	// installation) skips silently — same posture as the consolidated-PR
-	// open path; drive parks the review gate until a round dispatches.
-	if s.cfg.GitHub == nil || runRow.InstallationID == nil || *runRow.InstallationID == 0 {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "consolidated review: GitHub/installation not wired — skipping dispatch",
-			slog.String("run_id", parentRunID.String()))
-		return
-	}
-	repo, err := parseRepoOwnerName(runRow.Repo)
-	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "consolidated review: parse repo failed",
-			slog.String("run_id", parentRunID.String()), slog.String("error", err.Error()))
+	// Per-family diff source (E45.47 / #3464). A github-family run resolves
+	// ONLY through cfg.GitHub; any other family resolves the forge through
+	// cfg.ForgeResolver (defaulting to forge.Get). CLI/dev posture (no client /
+	// no installation / unresolved forge) skips silently — same posture as the
+	// consolidated-PR open path; drive parks the review gate until a round
+	// dispatches.
+	comparer, scope, repo, reason := s.forgeCompareFor(runRow)
+	if reason != "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "consolidated review: forge compare not wired — skipping dispatch",
+			slog.String("run_id", parentRunID.String()), slog.String("reason", reason))
 		return
 	}
 
-	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
 	stageID := implStage.ID
 	reviewCtx := context.WithoutCancel(ctx)
 	s.bgReviews.Add(1)
 	go func() {
 		defer s.bgReviews.Done()
-		cmp, cerr := s.cfg.GitHub.ComparePatch(reviewCtx, scope, repo, base, head)
+		cmp, cerr := comparer.ComparePatch(reviewCtx, scope, repo, base, head)
 		if cerr != nil {
 			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn, "consolidated review: compare patch failed — review not dispatched",
 				slog.String("run_id", parentRunID.String()),
@@ -3687,11 +3683,14 @@ func (s *Server) maybeBackstopFixupReReview(ctx context.Context, runID uuid.UUID
 			slog.String("head_sha", headSHA))
 		return
 	}
-	// (d) GitHub-wired diff source. CLI/dev posture (no client / no installation)
-	// skips silently — the same posture as DispatchConsolidatedReview.
-	if s.cfg.GitHub == nil || s.cfg.RunRepo == nil {
+	// (d) The diff source needs the run row. CLI/dev posture is decided
+	// PER-FAMILY after GetRun via forgeCompareFor (E45.47 / #3464); a nil GitHub
+	// client no longer skips here, so a GitLab run with no GitHub client reaches
+	// the forge ladder — a github-family run still skips with 'github client not
+	// wired'.
+	if s.cfg.RunRepo == nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-			"fixup re-review backstop: GitHub/run repo not wired — skipping dispatch",
+			"fixup re-review backstop: run repo not wired — skipping dispatch",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stage.ID.String()))
 		return
@@ -3705,29 +3704,22 @@ func (s *Server) maybeBackstopFixupReReview(ctx context.Context, runID uuid.UUID
 			slog.String("error", err.Error()))
 		return
 	}
-	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
+	comparer, scope, repo, reason := s.forgeCompareFor(runRow)
+	if reason != "" {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-			"fixup re-review backstop: GitHub/installation not wired — skipping dispatch",
+			"fixup re-review backstop: forge compare not wired — skipping dispatch",
 			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stage.ID.String()))
-		return
-	}
-	repo, err := parseRepoOwnerName(runRow.Repo)
-	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"fixup re-review backstop: parse repo failed — skipping dispatch",
-			slog.String("run_id", runID.String()),
-			slog.String("error", err.Error()))
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("reason", reason))
 		return
 	}
 
-	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
 	stageID := stage.ID
 	reviewCtx := context.WithoutCancel(ctx)
 	s.bgReviews.Add(1)
 	go func() {
 		defer s.bgReviews.Done()
-		cmp, cerr := s.cfg.GitHub.ComparePatch(reviewCtx, scope, repo, baseSHA, headSHA)
+		cmp, cerr := comparer.ComparePatch(reviewCtx, scope, repo, baseSHA, headSHA)
 		if cerr != nil {
 			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn,
 				"fixup re-review backstop: compare patch failed — review not dispatched",
@@ -5596,16 +5588,19 @@ func hasFixupRoutedConcern(prior []prompt.PriorConcern) bool {
 // PullRequestURL (no PR opened) is treated as "compare unavailable" alongside the
 // no-client / no-installation cases.
 func (s *Server) resolveFixupDeltaDiff(ctx context.Context, runRow *run.Run, runID, stageID uuid.UUID, currentHead string) (policy.Diff, bool) {
-	// GitHub compare unavailable: no client, no installation, or no PR opened.
-	// ComparePatch runs against the App installation over the run's PR, so all
-	// three are hard preconditions (and the nil InstallationID guard prevents a
-	// nil-pointer dereference below).
-	if s.cfg.GitHub == nil {
+	// Per-family compare source (E45.47 / #3464): a github-family run resolves
+	// ONLY through cfg.GitHub, any other family through cfg.ForgeResolver
+	// (defaulting to forge.Get). Any unavailability reason — no client, no
+	// installation, unresolved forge, or an unparseable repo — keeps the full
+	// bundle diff (fail-closed to the pre-#1725 behavior), preserving
+	// first-review and no-forge coverage unchanged.
+	comparer, scope, repo, reason := s.forgeCompareFor(runRow)
+	if reason != "" {
 		return policy.Diff{}, false
 	}
-	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
-		return policy.Diff{}, false
-	}
+	// No PR opened: ComparePatch operates on commit SHAs, but a fix-up delta
+	// re-review only happens on a run that reached the PR stage, so a nil
+	// PullRequestURL is treated as "compare unavailable".
 	if runRow.PullRequestURL == nil {
 		return policy.Diff{}, false
 	}
@@ -5620,16 +5615,7 @@ func (s *Server) resolveFixupDeltaDiff(ctx context.Context, runRow *run.Run, run
 	if priorHead == "" || priorHead == currentHead {
 		return policy.Diff{}, false
 	}
-	repo, err := parseRepoOwnerName(runRow.Repo)
-	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: parse repo for fixup delta failed — keeping full diff",
-			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stageID.String()),
-			slog.String("error", err.Error()),
-		)
-		return policy.Diff{}, false
-	}
-	cmp, err := s.cfg.GitHub.ComparePatch(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, priorHead, currentHead)
+	cmp, err := comparer.ComparePatch(ctx, scope, repo, priorHead, currentHead)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: compare patch for fixup delta failed — keeping full diff",
 			slog.String("run_id", runID.String()),
@@ -5815,7 +5801,11 @@ func (s *Server) resolveStageCumulativeEval(ctx context.Context, runRow *run.Run
 		return incomplete(cumulativeReasonBaseEqualsHead)
 	}
 	// (e) Forge preconditions — the CLI/dev posture, INFO-logged, no WARN.
-	if s.cfg.GitHub == nil || runRow == nil || runRow.InstallationID == nil || *runRow.InstallationID == 0 || headSHA == "" {
+	// Per-family compare source (E45.47 / #3464): a github-family run resolves
+	// ONLY through cfg.GitHub, any other family through cfg.ForgeResolver
+	// (defaulting to forge.Get). A nil runRow or an empty head can't reach the
+	// resolver, so they are guarded first.
+	if runRow == nil || headSHA == "" {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 			"implement review: forge compare not wired for cumulative evaluation — evaluating against this pass only",
 			slog.String("run_id", runID.String()),
@@ -5823,18 +5813,18 @@ func (s *Server) resolveStageCumulativeEval(ctx context.Context, runRow *run.Run
 		)
 		return incomplete(cumulativeReasonForgeUnavailable)
 	}
-	repo, err := parseRepoOwnerName(runRow.Repo)
-	if err != nil {
+	comparer, scope, repo, reason := s.forgeCompareFor(runRow)
+	if reason != "" {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-			"implement review: parse repo for cumulative evaluation failed — evaluating against this pass only",
+			"implement review: forge compare not wired for cumulative evaluation — evaluating against this pass only",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
-			slog.String("error", err.Error()),
+			slog.String("reason", reason),
 		)
 		return incomplete(cumulativeReasonForgeUnavailable)
 	}
 	// (f) Compare error.
-	cmp, err := s.cfg.GitHub.ComparePatch(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, stageBase, headSHA)
+	cmp, err := comparer.ComparePatch(ctx, scope, repo, stageBase, headSHA)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"implement review: cumulative compare failed — evaluating against this pass only",

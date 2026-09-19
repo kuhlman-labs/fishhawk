@@ -409,13 +409,16 @@ type Config struct {
 	// the ID-addressed fix-up path returning 503.
 	ConcernRepo concern.Repository
 
-	// GateMerger is the GitHub auto-merge seam the local auto-driver
-	// endpoint (POST /v0/runs/{run_id}/auto-drive, #1700) dispatches a
-	// delegated may_merge gate through — the SAME githubAutoMerger seam
-	// serve.go builds for the campaign GateActor. A nil merger keeps
-	// may_merge fail-CLOSED to observe-only, byte-identical to today: the
-	// auto-drive handler passes it straight to AutoDriveRunGate, whose
-	// merge arm already returns observe-only when the merger is nil.
+	// GateMerger is the forge-resolved merge seam the local auto-driver
+	// endpoint (POST /v0/runs/{run_id}/auto-drive, #1700) and POST
+	// /v0/runs/{run_id}/merge dispatch a delegated may_merge gate through —
+	// serve.go binds a server.ForgeMerger wrapping the githubAutoMerger leaf
+	// (E45.47 / #3464), which routes a github-family run through that leaf
+	// byte-for-byte and any other forge family through cfg.ForgeResolver /
+	// forge.Get. A nil merger keeps may_merge fail-CLOSED to observe-only,
+	// byte-identical to today: the auto-drive handler passes it straight to
+	// AutoDriveRunGate, whose merge arm already returns observe-only when the
+	// merger is nil.
 	GateMerger GitHubMerger
 
 	// PRStateReader is the forge pull-request read seam the merge-observation
@@ -438,13 +441,16 @@ type Config struct {
 	PRStateReader PullRequestStateReader
 
 	// ForgeResolver is the injectable forge-registry lookup a NON-GitHub
-	// forge family is resolved through. Three consumers share it: the
+	// forge family is resolved through. Its consumers: the
 	// merge-observation verb's pull-request read (E64.40 / #3151, see
-	// PRStateReader), and — through the shared issueOpsFor ladder, which
-	// additionally type-asserts the resolved forge to forge.IssueOperations
-	// and treats a forge lacking it as nil — the E50.6 split-parent
-	// auto-close watcher (E50.17 / #2900) and the prompt handler's
-	// forge-neutral issue fetch (fillIssueContext, E45.42 / #3347). Nil
+	// PRStateReader); the forge-resolved merge seam (ForgeMerger, E45.47 /
+	// #3464) and forgeCompareFor's four implement-review diff sites (the
+	// consolidated review, the fix-up re-review backstop, the fix-up delta
+	// framing, and the cumulative evaluation); and — through the shared
+	// issueOpsFor ladder, which additionally type-asserts the resolved forge
+	// to forge.IssueOperations and treats a forge lacking it as nil — the
+	// E50.6 split-parent auto-close watcher (E50.17 / #2900) and the prompt
+	// handler's forge-neutral issue fetch (fillIssueContext, E45.42 / #3347). Nil
 	// defaults to forge.Get, so production needs no serve.go wiring —
 	// serve.go already registers both forges at startup. It is the seam a
 	// test injects its own resolver through rather than depending on ambient
@@ -1353,10 +1359,13 @@ func (s *Server) buildHandler() http.Handler {
 //
 // awaiting_merge is presentation-only: this method emits audit entries
 // and never transitions the stage — the merge itself stays a judgment
-// point (drive.RuleMerge), resolved by the webhook/poll once GitHub
-// performs it. Best-effort and idempotent: every read failure skips
-// quietly (the next tick retries) and each rule is recorded at most
-// once per stage via Engine.Recorded.
+// point (drive.RuleMerge), resolved by the webhook/poll once the forge
+// performs it. Since #3464 the GitLab fix-up/consolidated implement-review
+// paths dispatch too (forgeCompareFor), so a GitLab run's review evidence
+// completes and checks_green_awaiting_merge fires the same as a GitHub
+// run's. Best-effort and idempotent: every read failure skips quietly
+// (the next tick retries) and each rule is recorded at most once per
+// stage via Engine.Recorded.
 func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Stage, prURL string) {
 	if s.drive == nil || s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil || stage == nil {
 		return

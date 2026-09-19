@@ -2418,13 +2418,13 @@ func runServe(args []string, logSink io.Writer) int {
 		// is a secret and must never be logged or traced (#1114). Absent, a
 		// user-owned project board stays best-effort boarded:false (#1107).
 		cfg.GitHub.ProjectsToken = *projectsToken
-		// Bind the SAME GitHub auto-merge seam the campaign GateActor uses into
-		// the server so the local auto-driver endpoint (POST
+		// Bind the SAME forge-resolved merge seam the campaign GateActor uses
+		// into the server so the local auto-driver endpoint (POST
 		// /v0/runs/{run_id}/auto-drive, #1700) can dispatch a delegated
-		// may_merge. Guarded by this cfg.GitHub != nil block exactly like the
-		// campaign wiring — a nil GateMerger keeps may_merge fail-CLOSED to
-		// observe-only, byte-identical to today.
-		cfg.GateMerger = githubAutoMerger{gh: cfg.GitHub}
+		// may_merge. server.ForgeMerger routes a github-family run through the
+		// githubAutoMerger leaf and any other family through the registry
+		// (E45.47 / #3464).
+		cfg.GateMerger = newForgeMerger(cfg.GitHub)
 		logger.Info("github app + REST client configured",
 			slog.Int64("app_id", appID),
 			slog.Bool("projects_token_configured", *projectsToken != ""))
@@ -2447,7 +2447,7 @@ func runServe(args []string, logSink io.Writer) int {
 			Tokens:  cfg.GitHubTokens,
 			HTTP:    st.HTTPClient(),
 		}
-		cfg.GateMerger = githubAutoMerger{gh: cfg.GitHub}
+		cfg.GateMerger = newForgeMerger(cfg.GitHub)
 		forge.Register(forgegitlab.New(stub.GitLabBaseURL,
 			forgegitlab.NewStaticCredentialProvider(stub.InstallationToken),
 			forgegitlab.WithHTTPClient(st.HTTPClient())))
@@ -2699,11 +2699,21 @@ func runServe(args []string, logSink io.Writer) int {
 	// allowlist onto the forge. A nil resolver (nil pool) leaves the factory's
 	// hook nil → deployment-default base; fail-closed on a DB fault / bad scheme
 	// / disallowed host is enforced inside the gitlabclient factory.
-	if glForge := resolveGitLabForge(*gitlabBaseURL, *gitlabToken,
+	glForge := resolveGitLabForge(*gitlabBaseURL, *gitlabToken,
 		forgegitlab.WithResolveBaseURL(installationBaseURLResolver(endpointResolver, "gitlab")),
 		forgegitlab.WithAllowedInstallationHosts(gitlabInstallationAllowlist),
-	); glForge != nil {
+	)
+	if glForge != nil {
 		forge.Register(glForge)
+	}
+	// GitLab-only deployment (no GitHub App / stub configured, so the blocks
+	// above left GateMerger unbound): bind the forge-resolved merge seam with a
+	// NIL github leaf so a GitLab run can still reach may_merge (E45.47 /
+	// #3464). A github-family run routed through this seam fails closed with an
+	// explicit "no github merge client" error rather than panicking.
+	if cfg.GateMerger == nil && glForge != nil {
+		cfg.GateMerger = newForgeMerger(nil)
+		logger.Info("gitlab-only merge seam bound (server.ForgeMerger, no github leaf); GitLab may_merge enabled (E45.47 / #3464)")
 	}
 	if len(forge.Registered()) > 0 {
 		logger.Info("forge providers registered", slog.Any("forges", forge.Registered()))
@@ -3141,12 +3151,23 @@ func runServe(args []string, logSink io.Writer) int {
 		switch {
 		case cfg.RunRepo == nil || cfg.AuditRepo == nil:
 			logger.Warn("--enable-merge-reconciler set but RunRepo or AuditRepo unconfigured; ticker not started")
-		case cfg.GitHub == nil:
-			logger.Warn("--enable-merge-reconciler set but GitHub client unconfigured (no app id?); ticker not started")
+		case !mergeReconcilerForgeAvailable(cfg.GitHub, glForge):
+			logger.Warn("--enable-merge-reconciler set but no forge configured (no GitHub app id and no GitLab forge?); ticker not started")
 		default:
+			// PRGetter is the github-family poll source; leave it a NIL interface
+			// (not a typed-nil *githubclient.Client, which would be a non-nil
+			// interface that dispatches a nil) when no GitHub client is wired, so a
+			// GitLab-only deployment's github-family resolvePoll skips cleanly.
+			// ForgeResolver (forge.Get) serves every non-github family — E45.47 /
+			// #3464.
+			var prGetter mergereconciler.PRGetter
+			if cfg.GitHub != nil {
+				prGetter = cfg.GitHub
+			}
 			ticker := &mergereconciler.Ticker{
-				Runs:     cfg.RunRepo,
-				PRGetter: cfg.GitHub,
+				Runs:          cfg.RunRepo,
+				PRGetter:      prGetter,
+				ForgeResolver: forge.Get,
 				// Resolver is the config-selected review-resolution provider
 				// (ADR-031 Phase 2). For the github_merge default it wraps
 				// srv.ResolveReviewFromPollState, so resolution is byte-for-byte
@@ -3633,13 +3654,39 @@ func campaignOperatorIdentity() server.Identity {
 	}
 }
 
-// githubAutoMerger satisfies server.GitHubMerger over the GitHub App client:
-// may_merge dispatches a run's pull request through GitHub's auto-merge
-// (EnableAutoMerge, squash), and the existing webhook / resolveReviewStageOnMerge
-// path settles the review stage. Fails before any HTTP call when the run lacks
-// the installation id or PR url the merge needs.
+// githubAutoMerger is the GITHUB-FAMILY LEAF of server.ForgeMerger (E45.47 /
+// #3464): may_merge dispatches a github-family run's pull request through
+// GitHub's auto-merge (EnableAutoMerge, squash), and the existing webhook /
+// resolveReviewStageOnMerge path settles the review stage. Fails before any
+// HTTP call when the run lacks the installation id or PR url the merge needs.
+// server.ForgeMerger delegates github-family runs here byte-for-byte and routes
+// every other forge family through the registry instead; newForgeMerger wraps
+// this leaf.
 type githubAutoMerger struct {
 	gh *githubclient.Client
+}
+
+// newForgeMerger builds the forge-RESOLVED merge seam (server.ForgeMerger,
+// E45.47 / #3464) every GitHubMerger binding uses so a GitLab run reaches the
+// merge the GitHub-only bindings previously refused it. When gh is non-nil the
+// github-family leaf is a githubAutoMerger over it; when gh is nil the leaf is a
+// NIL INTERFACE (never githubAutoMerger{gh: nil}, which is a non-nil interface
+// that panics on a github-family merge) so a github-family merge fails closed
+// with an explicit error. Resolver is left nil (forge.Get), late-bound per
+// merge call, so a gitlab forge registered later in startup is still found.
+func newForgeMerger(gh *githubclient.Client) server.GitHubMerger {
+	if gh == nil {
+		return server.ForgeMerger{}
+	}
+	return server.ForgeMerger{GitHub: githubAutoMerger{gh: gh}}
+}
+
+// mergeReconcilerForgeAvailable reports whether the merge reconciler has at
+// least one forge to poll (E45.47 / #3464): a GitHub client for github-family
+// runs, or a registered GitLab forge for gitlab-family runs. Pure, so the
+// startup gate is table-testable.
+func mergeReconcilerForgeAvailable(gh *githubclient.Client, gl *forgegitlab.Forge) bool {
+	return gh != nil || gl != nil
 }
 
 func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.Run) error {
@@ -3962,7 +4009,7 @@ func newCampaignGateActor(cfg server.Config, srv *server.Server, logger *slog.Lo
 	return campaignGateActor{
 		srv:    srv,
 		id:     campaignOperatorIdentity(),
-		merger: githubAutoMerger{gh: cfg.GitHub},
+		merger: newForgeMerger(cfg.GitHub),
 	}
 }
 

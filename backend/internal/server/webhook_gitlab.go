@@ -110,13 +110,16 @@ func (s *Server) handleWebhookGitLab(w http.ResponseWriter, r *http.Request) {
 	// The MR lifecycle is consumed server-side (the dispatcher skips
 	// object_kind merge_request): a merge/close drives the review-stage
 	// state machine via the ADR-018 resolver shared with the GitHub
-	// pull_request.closed path. A transient RunRepo lookup failure is the
-	// GitLab receiver's ONLY review-gate signal (the GitHub path has the
-	// merge-reconciler poll as a backstop; GitLab has none), so — unlike a
-	// parse failure or a genuine no-match, which stay best-effort 202 — it
-	// propagates as a non-nil error here. We unmark the already-recorded
-	// delivery and surface a 5xx so GitLab redelivers and re-drives the
-	// transition (E45.21; mirrors the dispatch-drop fix above).
+	// pull_request.closed path. Since #3464 the merge-reconciler poll backstops
+	// BOTH families when --enable-merge-reconciler is on (it now parses the MR
+	// URL and polls the resolved GitLab forge), so a GitLab review gate is no
+	// longer signalled ONLY by this webhook when the reconciler runs. But the
+	// reconciler is OFF by default, so a transient RunRepo lookup failure is
+	// still the webhook's own last line: — unlike a parse failure or a genuine
+	// no-match, which stay best-effort 202 — it propagates as a non-nil error
+	// here. We unmark the already-recorded delivery and surface a 5xx so GitLab
+	// redelivers and re-drives the transition (E45.21; mirrors the dispatch-drop
+	// fix above).
 	if ev.Type == "merge_request" {
 		if err := s.handleGitLabMergeRequest(r.Context(), ev.RawBody); err != nil {
 			s.unmarkGitLabDelivery(r.Context(), ev.DeliveryID)
