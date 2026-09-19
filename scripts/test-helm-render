@@ -1255,7 +1255,7 @@ secrets:
 
 # r14a THE GITHUB-ONLY CLAIM (binding condition 1, restated): a deploy that sets
 # NO gitlab.* emits NO FISHHAWKD_GITLAB_* key in the ConfigMap and NO GitLab key
-# in the chartManaged Secret. assert_field_absent matches at YAML KEY position, so
+# anywhere in the render. assert_field_absent matches at YAML KEY position, so
 # the explanatory comment block that names the keys cannot green it. values-local
 # is chartManaged with the full baseline but no gitlab config — the real
 # GitHub-only posture.
@@ -1264,8 +1264,22 @@ assert_render_ok "r14a GitHub-only ConfigMap renders"
 for glk in FISHHAWKD_GITLAB_BASE_URL FISHHAWKD_GITLAB_OAUTH_CLIENT_ID FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL FISHHAWKD_GITLAB_DEVICE_CLIENT_ID FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST; do
   assert_field_absent "r14a GitHub-only ConfigMap omits $glk" "$out" "$glk"
 done
-render -f "$CHART/values-local.yaml" --show-only templates/secret.yaml
-assert_absent "r14a GitHub-only chartManaged Secret carries no GitLab key" "$out" "FISHHAWKD_GITLAB"
+# `helm template` (no --show-only) renders EVERY manifest template, including
+# externalsecret.yaml, but NOT NOTES.txt — `helm template` never emits NOTES.txt
+# and --show-only cannot select it (see the r9 header comment + notes() helper
+# above). So this whole-render pass covers every rendered MANIFEST, honestly
+# stated as such, and is deliberately NOT a --show-only templates/secret.yaml
+# render: that form is blind to any other template (e.g. externalsecret.yaml)
+# that could leak a GitLab key without this case noticing.
+render -f "$CHART/values-local.yaml"
+assert_render_ok "r14a GitHub-only WHOLE render (all manifests) renders"
+assert_absent "r14a GitHub-only WHOLE render carries no FISHHAWKD_GITLAB occurrence in any manifest" "$out" "FISHHAWKD_GITLAB"
+# NOTES.txt is a SEPARATE render path (helm install --dry-run via the notes()
+# helper) and is not covered by the whole-render assertion above at all, so it
+# gets its own explicit pass over the same GitHub-only values.
+notes -f "$CHART/values-local.yaml"
+assert_render_ok "r14a GitHub-only NOTES.txt renders"
+assert_absent "r14a GitHub-only NOTES.txt carries no FISHHAWKD_GITLAB occurrence" "$out" "FISHHAWKD_GITLAB"
 
 # r14b A COMPLETE GITLAB CONFIG renders all five ConfigMap keys with their values
 # AND all three secret keys inside the Secret's stringData block.
@@ -1470,6 +1484,13 @@ existingSecret: fishhawk-secrets
 YAML
 render -f "$tmproot/r14m.yaml"
 assert_render_ok "r14m positive existing-secret: complete GitLab trio renders OK"
+# Explicit UNKNOWN-posture pin: existing mode means the chart cannot inspect a
+# pre-created Secret, so it must emit NO derived-requiredness message naming
+# FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET on either stream — the whole-chart render
+# above already succeeded, so this asserts the absence is not incidental to that
+# success. $out and $err are concatenated so the pin covers a fail() message on
+# stderr AND any rendered key/comment on stdout in one assertion.
+assert_absent "r14m existing-mode emits no FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET derived-requiredness message (secret half is UNKNOWN, chart cannot inspect a pre-created Secret)" "$out$err" "FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET"
 render -f "$tmproot/r14m.yaml" --show-only templates/configmap.yaml
 assert_contains "r14m existing-mode ConfigMap carries the GitLab OAuth client id" "$out" 'FISHHAWKD_GITLAB_OAUTH_CLIENT_ID: "gl-cid"'
 
