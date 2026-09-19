@@ -3195,7 +3195,8 @@ Unlike `applies_to` there is **no two-phase split**: escalations are evaluated o
 |---|---|---|
 | `Match` error (a malformed glob that bypassed validation) | retryable 503 `escalation_unevaluable` | `Evaluate` errors → the caller's existing degradation |
 | Plan unreadable/absent while a `paths`-bearing escalation is declared | same 503 | same |
-| Membership resolution error on an escalated group | `predicateUnavailable` → 503 `forge_unavailable` | n/a |
+| Membership resolution error on an escalated group | `predicateUnavailable` → 503 `forge_unavailable` (`retryable: true`) | n/a |
+| No configured identity provider for the run's forge (E45.49 / #3466) | `predicateUnconfigured` → 503 `forge_unavailable` (`reason: identity_provider_unconfigured`, `retryable: false`, no `approval_predicate_rejected` audit entry) | escalated count fails closed (ok=false, gate not advanced) |
 | Gate `approvals` block unreadable while an escalation IS firing | retryable 503 `escalation_unevaluable` (`reason: baseline_unreadable`) | n/a |
 
 The last row is #2374, and its reason is that an escalation raises **relative to** the baseline: composing a firing escalation against a `nil` baseline drops the baseline's own `member_of` / `min_permission`, so a `member_of` baseline under a COUNT-ONLY escalation would compose to "the raised count, no membership at all" and admit an out-of-group approver — a shape the count-time forge re-validation does not cover either, since a count-only escalation carries no escalated forge predicate to re-resolve. The refusal is gated strictly on a firing (or unevaluable) escalation: a fetch error with NOTHING escalated keeps the pre-existing baseline fail-**open** read unchanged. It applies at BOTH approval points — `checkApprovalPredicates` returns the 503 pre-Submit, and `approveStageAs` (reached directly by the campaign auto-driver, which has no pre-Submit gate) RECORDS the approval but does NOT advance, the same posture its post-Submit resolver-error branch takes.
@@ -4628,6 +4629,27 @@ It excludes two shapes:
 2. An entry with an empty DEVICE client id. Discovery exists to tell the CLI
    which id to drive the device flow with; a provider it cannot drive is not
    advertised.
+
+**The approvals gate is the one keyed lookup, not a range (E45.49 / #3466).**
+`resolvePredicates` (`quorum.go`) resolves `min_permission` / `member_of`
+PER RUN FORGE — the run row's `InstallationRef` → `observationForgeID`
+(`github` for nil/empty, so every pre-#3466 run and GitHub-seeded fixture is
+unchanged) keys `cfg.IdentityProviders` through `predicateIdentityProvider`,
+which applies exclusion 1 (`identity.IsConfigured`) but deliberately NOT
+exclusion 2: quorum needs only the members/permission reads, so a provider
+with no device leg must still resolve predicates. Before #3466 the resolver
+read the GitHub-only `cfg.IdentityProvider` singleton, so a GitLab run's
+approver was evaluated against the NoOp default's CLEAN deny and refused
+with a misleading `403 approver_predicate_unmet`. Now a forge with no
+configured provider yields the fourth outcome `predicateUnconfigured` →
+`503 forge_unavailable` with `details.reason: identity_provider_unconfigured`,
+`details.forge`, `retryable: false` and a forge-specific env-var hint in
+`next_actions`; nothing was evaluated, so NO `approval_predicate_rejected`
+entry is written. Precedence: the `min_permission` empty-repo and
+unparseable-tier `predicateUnavailable` checks run BEFORE the provider lookup
+and shadow it. `countEscalatedForgeApprovers` derives the same forge and
+treats unconfigured as not-countable. Residual: the repo ACL
+(`serve.go::resolveRepoVisibility`) still reads the singular field.
 
 Two **deliberately redundant** layers keep a NoOp out of the map, and each is
 observed by its own test:

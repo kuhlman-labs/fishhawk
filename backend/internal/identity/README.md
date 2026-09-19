@@ -94,9 +94,9 @@ Deny-by-default: any value not listed maps to `PermissionNone` — including new
 
 ## Wiring and first consumer
 
-Wired via a config-gated factory: `serve.go::resolveIdentityProvider` constructs the GitHub impl only when OAuth client config is present; `server.New` defaults a nil `Config.IdentityProvider` to `identity.NewNoOp()`.
+Wired via config-gated factories into a FORGE-KEYED map: `serve.go::resolveIdentityProvider` constructs the GitHub impl only when OAuth client config is present and hands it to the singular `Config.IdentityProvider`, which `server.New` seeds into `Config.IdentityProviders["github"]` STRICTLY BEFORE defaulting a nil singular field to `identity.NewNoOp()` (so the NoOp is never in the map); `serve.go::resolveGitLabIdentityProvider` lands the GitLab impl directly in `Config.IdentityProviders["gitlab"]` (E66.4).
 
-The GitLab provider ships here **ahead of its wiring** (E66.4 is decomposed producer-first): the `serve.go` factory, the `FISHHAWKD_GITLAB_DEVICE_CLIENT_ID` flag, the multi-provider `server.Config` maps and the discovery/mint plumbing land with the server slice. This package adds only new exported symbols, so it compiles and ships green with no caller changes.
+**Consumers resolve per forge.** The approvals gate (`server/quorum.go::resolvePredicates`, E45.49 / #3466) derives the run's forge from the run row's `InstallationRef` and looks the provider up through `predicateIdentityProvider` — `IsConfigured`-gated (nil / typed-nil / NoOp excluded) with NO device-client-id filter, because quorum needs only `PermissionLevel` / `ResolveMembership`, not the device flow. A forge with no configured provider answers `503 forge_unavailable` / `reason: identity_provider_unconfigured` / `retryable: false` rather than the misleading `403` the NoOp's clean deny used to produce. Two residuals: `resolveGitLabIdentityProvider` still requires BOTH `FISHHAWKD_GITLAB_BASE_URL` and `FISHHAWKD_GITLAB_DEVICE_CLIENT_ID` to construct the provider at all (a base-URL-plus-`FISHHAWKD_GITLAB_TOKEN`-only deployment gets the actionable 503 naming the missing variable), and the repo ACL (`serve.go::resolveRepoVisibility`) remains GitHub-singular.
 
 ### Endpoint binding — Mode 1 only; per-installation deferred (E44.16 / #2094)
 

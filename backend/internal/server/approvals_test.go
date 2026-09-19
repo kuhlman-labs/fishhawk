@@ -525,6 +525,27 @@ func newApprovalServerWithIdentity(t *testing.T, idp *fakeIdentityProvider) (*Se
 	return s, ar, rr, au, idp
 }
 
+// newApprovalServerWithIdentityMap is newApprovalServerWithIdentity plus the
+// forge-keyed cfg.IdentityProviders map (#3466): `single` seeds the github
+// entry via the singular field (nil leaves github unconfigured — New's NoOp
+// default is never seeded into the map), and `providers` wires the other
+// forges directly.
+func newApprovalServerWithIdentityMap(t *testing.T, single identity.IdentityProvider, providers map[string]identity.IdentityProvider) (*Server, *fakeApprovalRepo, *approvalRunRepo, *approvalAuditFake) {
+	t.Helper()
+	ar := newFakeApprovalRepo()
+	rr := newApprovalRunRepo()
+	au := newApprovalAuditFake()
+	s := New(Config{
+		Addr:              "127.0.0.1:0",
+		ApprovalRepo:      ar,
+		RunRepo:           rr,
+		AuditRepo:         au,
+		IdentityProvider:  single,
+		IdentityProviders: providers,
+	})
+	return s, ar, rr, au
+}
+
 func submitApproval(t *testing.T, s *Server, stageID uuid.UUID, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	url := fmt.Sprintf("/v0/stages/%s/approvals", stageID)
@@ -7443,6 +7464,47 @@ func seedPredicateStage(rr *approvalRunRepo, au *approvalAuditFake, count int, m
 	return seedQuorumStageSpec(rr, au, quorumPredicateSpec(count, minPerm, memberOf), entries...)
 }
 
+// seedPredicateStageForForge is seedPredicateStage with the run row's
+// InstallationRef set to "<forge>:<ref>", the shape observationForgeID splits
+// on its first colon to derive the run's forge family (#3466).
+func seedPredicateStageForForge(rr *approvalRunRepo, au *approvalAuditFake, count int, minPerm, memberOf, author, installationRef string) *run.Stage {
+	stage := seedPredicateStage(rr, au, count, minPerm, memberOf, author)
+	rr.mu.Lock()
+	rr.runs[stage.RunID].InstallationRef = &installationRef
+	rr.mu.Unlock()
+	return stage
+}
+
+// decodeApprovalError decodes the {"error":{code,details}} envelope of a
+// refused approval response.
+func decodeApprovalError(t *testing.T, w *httptest.ResponseRecorder) (string, map[string]any) {
+	t.Helper()
+	var body struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal error body: %v\n%s", err, w.Body.String())
+	}
+	return body.Error.Code, body.Error.Details
+}
+
+// assertNoPredicateRejectionAudit fails if any approval_predicate_rejected
+// audit entry was appended: on the unconfigured branch the predicate was
+// never EVALUATED, so no rejection may be recorded (#3466).
+func assertNoPredicateRejectionAudit(t *testing.T, au *approvalAuditFake) {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category == "approval_predicate_rejected" {
+			t.Fatalf("an approval_predicate_rejected entry was written, want none (the predicate was never evaluated): %+v", e)
+		}
+	}
+}
+
 // predicateRejectionSnapshot returns the predicate_snapshot object of the
 // approval_predicate_rejected audit entry for subject, failing if none exists.
 func predicateRejectionSnapshot(t *testing.T, au *approvalAuditFake, subject string) map[string]any {
@@ -7754,6 +7816,197 @@ func TestSubmitApproval_Predicate_RealGitHubProvider_EndToEnd(t *testing.T) {
 	}
 	if snap["min_permission"] != "maintain" {
 		t.Errorf("min_permission = %v, want maintain", snap["min_permission"])
+	}
+}
+
+// --- per-forge predicate routing (E45.49 / #3466) --------------------------
+
+// TestSubmitApproval_Predicate_GitLabForge_RoutesToGitLabProvider pins the
+// #3466 routing end to end through the HTTP handler: a run whose
+// InstallationRef names the gitlab forge resolves min_permission against the
+// gitlab entry of cfg.IdentityProviders, never the GitHub singleton — which
+// here denies everyone, so a mis-route would 403.
+func TestSubmitApproval_Predicate_GitLabForge_RoutesToGitLabProvider(t *testing.T) {
+	gh := &fakeIdentityProvider{perm: identity.PermissionNone}
+	gl := &fakeIdentityProvider{perm: identity.PermissionMaintain}
+	s, _, rr, au := newApprovalServerWithIdentityMap(t, gh,
+		map[string]identity.IdentityProvider{identity.ProviderGitLab: gl})
+	stage := seedPredicateStageForForge(rr, au, 1, "write", "", "gitlab:author", "gitlab:42")
+
+	w := submitApprovalAs(t, s, stage.ID, "gitlab:alice", `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded (count=1 quorum reached)", got)
+	}
+	if gl.permCalls != 1 || gh.permCalls != 0 {
+		t.Errorf("permCalls = gitlab %d / github %d, want 1 / 0", gl.permCalls, gh.permCalls)
+	}
+	payload := approvalPayloadFor(t, au, "gitlab:alice")
+	snap, _ := payload["predicate_snapshot"].(map[string]any)
+	if snap["resolved_permission"] != "maintain" {
+		t.Errorf("resolved_permission = %v, want maintain (from the gitlab provider)", snap["resolved_permission"])
+	}
+}
+
+// TestSubmitApproval_Predicate_GitLabForge_MemberOf is the member_of twin of
+// the routing pin above.
+func TestSubmitApproval_Predicate_GitLabForge_MemberOf(t *testing.T) {
+	gh := &fakeIdentityProvider{member: false}
+	gl := &fakeIdentityProvider{member: true}
+	s, _, rr, au := newApprovalServerWithIdentityMap(t, gh,
+		map[string]identity.IdentityProvider{identity.ProviderGitLab: gl})
+	stage := seedPredicateStageForForge(rr, au, 1, "", "acme/reviewers", "gitlab:author", "gitlab:42")
+
+	w := submitApprovalAs(t, s, stage.ID, "gitlab:alice", `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if gl.memberCalls != 1 || gh.memberCalls != 0 {
+		t.Errorf("memberCalls = gitlab %d / github %d, want 1 / 0", gl.memberCalls, gh.memberCalls)
+	}
+	payload := approvalPayloadFor(t, au, "gitlab:alice")
+	snap, _ := payload["predicate_snapshot"].(map[string]any)
+	if snap["member_resolved"] != true {
+		t.Errorf("member_resolved = %v, want true (from the gitlab provider)", snap["member_resolved"])
+	}
+}
+
+// TestSubmitApproval_Predicate_Unconfigured_503NotRejected pins the #3466
+// failure shape: with NO identity provider (New's NoOp default, which is
+// never seeded into the map) a min_permission gate must answer 503
+// forge_unavailable / reason identity_provider_unconfigured / retryable
+// false — NOT the misleading 403 approver_predicate_unmet a NoOp's clean
+// deny produced — insert no row, leave the stage untouched, and write no
+// approval_predicate_rejected audit entry.
+func TestSubmitApproval_Predicate_Unconfigured_503NotRejected(t *testing.T) {
+	s, ar, rr, au := newApprovalServerWithIdentityMap(t, nil, nil)
+	stage := seedPredicateStage(rr, au, 1, "write", "", "github:author")
+
+	w := submitApprovalAs(t, s, stage.ID, "github:r1", `{"decision":"approve"}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeApprovalError(t, w)
+	if code != "forge_unavailable" {
+		t.Errorf("code = %q, want forge_unavailable", code)
+	}
+	if details["reason"] != "identity_provider_unconfigured" {
+		t.Errorf("details.reason = %v, want identity_provider_unconfigured", details["reason"])
+	}
+	if details["retryable"] != false {
+		t.Errorf("details.retryable = %v, want false", details["retryable"])
+	}
+	if details["forge"] != identity.ProviderGitHub {
+		t.Errorf("details.forge = %v, want github", details["forge"])
+	}
+	if details["predicate"] != "min_permission" {
+		t.Errorf("details.predicate = %v, want min_permission", details["predicate"])
+	}
+	na, _ := details["next_actions"].([]any)
+	if len(na) != 1 || !strings.Contains(na[0].(string), "FISHHAWKD_OAUTH_CLIENT_ID") {
+		t.Errorf("details.next_actions = %v, want the github env-var hint", details["next_actions"])
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("unconfigured approve inserted %d rows, want 0", len(ar.all))
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (no advance)", got)
+	}
+	assertNoPredicateRejectionAudit(t, au)
+}
+
+// TestSubmitApproval_Predicate_GitLabRun_GitHubOnlyProvider_503 pins the
+// issue's exact deployment: a GitHub provider IS configured, the run is on
+// gitlab, and the gate must name the gitlab misconfiguration rather than
+// answer with the GitHub provider's (irrelevant) verdict.
+func TestSubmitApproval_Predicate_GitLabRun_GitHubOnlyProvider_503(t *testing.T) {
+	gh := &fakeIdentityProvider{perm: identity.PermissionAdmin, member: true}
+	s, ar, rr, au := newApprovalServerWithIdentityMap(t, gh, nil)
+	stage := seedPredicateStageForForge(rr, au, 1, "write", "", "gitlab:author", "gitlab:42")
+
+	w := submitApprovalAs(t, s, stage.ID, "gitlab:alice", `{"decision":"approve"}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeApprovalError(t, w)
+	if code != "forge_unavailable" {
+		t.Errorf("code = %q, want forge_unavailable", code)
+	}
+	if details["reason"] != "identity_provider_unconfigured" {
+		t.Errorf("details.reason = %v, want identity_provider_unconfigured", details["reason"])
+	}
+	if details["retryable"] != false {
+		t.Errorf("details.retryable = %v, want false", details["retryable"])
+	}
+	if details["forge"] != identity.ProviderGitLab {
+		t.Errorf("details.forge = %v, want gitlab", details["forge"])
+	}
+	na, _ := details["next_actions"].([]any)
+	if len(na) != 1 || !strings.Contains(na[0].(string), "FISHHAWKD_GITLAB_BASE_URL") {
+		t.Errorf("details.next_actions = %v, want the gitlab env-var hint", details["next_actions"])
+	}
+	if gh.permCalls != 0 {
+		t.Errorf("github permCalls = %d, want 0 (the github provider must not answer for a gitlab run)", gh.permCalls)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("unconfigured approve inserted %d rows, want 0", len(ar.all))
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (no advance)", got)
+	}
+	assertNoPredicateRejectionAudit(t, au)
+}
+
+// TestSubmitApproval_Predicate_RealGitLabProvider_EndToEnd is the #3466
+// cross-layer test, mirroring TestSubmitApproval_Predicate_RealGitHubProvider_EndToEnd:
+// HTTP handler → run-row forge derivation → cfg.IdentityProviders → the REAL
+// identity.GitLabIdentityProvider → an httptest GitLab whose
+// /api/v4/projects/{id}/members/all (id path-escaped, "acme%2Frepo") reports
+// alice at access_level 40 (Maintainer). A min_permission:maintain gate must
+// accept her, with the GitHub singleton (denying everyone) never consulted.
+func TestSubmitApproval_Predicate_RealGitLabProvider_EndToEnd(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() != "/api/v4/projects/acme%2Frepo/members/all" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.EscapedPath())
+			w.WriteHeader(http.StatusNotImplemented)
+			return
+		}
+		if got := r.Header.Get("PRIVATE-TOKEN"); got != "glpat-test" {
+			t.Errorf("PRIVATE-TOKEN = %q, want the deployment token", got)
+		}
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"username":"alice","access_level":40}]`))
+	}))
+	t.Cleanup(srv.Close)
+
+	gl := identity.NewGitLabIdentityProvider(srv.URL, "client",
+		func(context.Context) (string, error) { return "glpat-test", nil })
+	gh := &fakeIdentityProvider{perm: identity.PermissionNone}
+	s, _, rr, au := newApprovalServerWithIdentityMap(t, gh,
+		map[string]identity.IdentityProvider{identity.ProviderGitLab: gl})
+	stage := seedPredicateStageForForge(rr, au, 1, "maintain", "", "gitlab:author", "gitlab:42")
+
+	w := submitApprovalAs(t, s, stage.ID, "gitlab:alice", `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if hits != 1 {
+		t.Errorf("gitlab members/all hits = %d, want 1", hits)
+	}
+	if gh.permCalls != 0 {
+		t.Errorf("github permCalls = %d, want 0", gh.permCalls)
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded", got)
+	}
+	payload := approvalPayloadFor(t, au, "gitlab:alice")
+	snap, _ := payload["predicate_snapshot"].(map[string]any)
+	if snap["resolved_permission"] != "maintain" {
+		t.Errorf("resolved_permission = %v, want maintain (mapped from access_level 40 over real HTTP)", snap["resolved_permission"])
 	}
 }
 
