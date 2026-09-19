@@ -1,0 +1,14 @@
+id: scenario:issue-2975/account-create-rerun-without-display-name-clears-it
+statement: After `fishhawkd account create --provider gitlab --account-key acme --display-name Acme` followed by `fishhawkd account create --provider gitlab --account-key acme` (no --display-name), the second command exits 0 and `fishhawkd account list --provider gitlab` renders exactly one acme row with an EMPTY DISPLAY_NAME column — the declarative branch of the convention.
+verify_hint: 'CLI exit code + stdout: run the two `fishhawkd account create` invocations against the preview''s FISHHAWKD_DATABASE_URL, then `fishhawkd account list --provider gitlab` and inspect the DISPLAY_NAME column and row count.'
+steps: 'Built fishhawkd from the sanctioned checkout (cd backend && go build -o /tmp/fh-acc-fishhawkd ./cmd/fishhawkd; checkout HEAD a61b4fce == preview worktree HEAD == MCP serverInfo v0.1.0+a61b4…; checkout untouched). Against the preview''s FISHHAWKD_DATABASE_URL (read from the running `fishhawkd serve` process environment): verified no gitlab/acme row existed; ran `fishhawkd account create -db <url> --provider gitlab --account-key acme --display-name Acme` (exit 0, ''created account id=1bc1a4bd-… provider=gitlab account_key=acme granularity=group''); `fishhawkd account list -db <url> --provider gitlab` showed DISPLAY_NAME Acme; ran `fishhawkd account create -db <url> --provider gitlab --account-key acme` (no --display-name); ran `fishhawkd account list -db <url> --provider gitlab`; cross-checked with a psql select on accounts. Test rows deleted afterwards.'
+assertions:
+    expected: Second command exits 0 and `account list --provider gitlab` renders exactly one acme row with an EMPTY DISPLAY_NAME column.
+    observed_at_record: 'Second create exited 0 and reported the SAME id 1bc1a4bd-832e-4459-be19-00c66b1d9afc. `account list --provider gitlab`: header plus exactly one row ''gitlab  acme  group  <blank DISPLAY_NAME>  1bc1a4bd-…''. psql: display_name IS NULL, granularity group, home_region NULL.'
+    repro_handle: FH=/tmp/fh-acc-fishhawkd; DB='postgres://fishhawk_preview:fishhawk_preview@localhost:5432/fishhawk_preview?sslmode=disable'; $FH account create -db "$DB" --provider gitlab --account-key acme --display-name Acme && $FH account create -db "$DB" --provider gitlab --account-key acme; echo exit=$?; $FH account list -db "$DB" --provider gitlab
+origin:
+    issue: 2975
+    pr: 3483
+    run_id: 651eeb07-63ef-4507-84ac-864918f3beeb
+    head_sha: a61b4fce126e3b1ee888f60bda4fbc93d20da344
+    recorded_at: 2026-09-19T01:52:51Z

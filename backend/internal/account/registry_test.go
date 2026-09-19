@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 )
 
 // fakeRegistryQueries is an in-memory RegistryQueries for the branches that need
@@ -510,5 +511,51 @@ func TestRegisterInstallation_TrimsProjectPath(t *testing.T) {
 	got := fake.lastInstallation.ProjectPath
 	if got == nil || *got != "acme/widgets" {
 		t.Errorf("persisted project_path = %v, want %q (trimmed)", got, "acme/widgets")
+	}
+}
+
+// TestCreateAccount_PreservesHomeRegionPinAndClearsDisplayName is the
+// domain-level done-means for the omitted-field convention
+// (backend/internal/account/README.md): CreateAccount is DECLARATIVE for the
+// column its caller owns (display_name — an omitted flag clears the stored
+// name on re-run) and PRESERVES a column another writer owns (home_region,
+// owned by PinAccountHomeRegion first-write-wins). Runs against a REAL
+// migrated database through the production accountdb.Queries — a
+// comment-only or no-op change to the shipped SQL fails both assertions.
+func TestCreateAccount_PreservesHomeRegionPinAndClearsDisplayName(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	q := accountdb.New(pool)
+	ctx := context.Background()
+
+	if _, err := CreateAccount(ctx, q, CreateAccountRequest{
+		Provider: "gitlab", AccountKey: "acme", DisplayName: "Acme",
+	}); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if err := NewRegionPinner(q, "eu").Pin(ctx, "gitlab", "acme", "eu"); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	if _, err := CreateAccount(ctx, q, CreateAccountRequest{
+		Provider: "gitlab", AccountKey: "acme",
+	}); err != nil {
+		t.Fatalf("second create: %v", err)
+	}
+
+	var count int
+	var homeRegion, displayName *string
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*), max(home_region), max(display_name) FROM accounts WHERE provider = $1 AND account_key = $2`,
+		"gitlab", "acme",
+	).Scan(&count, &homeRegion, &displayName); err != nil {
+		t.Fatalf("read back account: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("account row count = %d, want 1", count)
+	}
+	if homeRegion == nil || *homeRegion != "eu" {
+		t.Errorf("home_region = %v, want the pin 'eu' preserved (other-writer column)", homeRegion)
+	}
+	if displayName != nil {
+		t.Errorf("display_name = %v, want NULL (declarative, caller-owned column cleared by the omitted flag)", *displayName)
 	}
 }

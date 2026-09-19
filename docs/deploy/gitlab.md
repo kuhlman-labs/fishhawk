@@ -149,6 +149,8 @@ Run creation from a GitLab trigger is live as of #2043. To turn it on for a depl
 
    `installation register` FAILS CLOSED if no `acme` account exists yet, naming the `account create` line to run first — it never conjures the account, because the account is the operator's authorization decision. Verify what is registered with `fishhawkd installation list`, which renders each `installation_ref` alongside its owning `account_key` and its `PROJECT_PATH` (a gitlab row recording none renders `(unbound)`).
 
+   Re-running the `account create` command is safe (idempotent on `provider,account_key`) but re-run it WITH `--display-name` or the name is cleared — see the account README's omitted-field convention.
+
    `gitlab:4242` is `gitlab:<numeric project id>` — the same string the run row's `installation_ref` carries. Without a matching row (or without a database at all) an admitted GitLab trigger is refused before the spec is read and before any pipeline is created, and a `run_rejected_misconfigured` audit row records the reason (`gitlab_project_not_registered`, `gitlab_project_registry_unwired`, `gitlab_project_authorization_lookup_failed`, or `gitlab_project_path_unbound`). A registered project id paired with any project path other than the registered one is refused too — both halves of the payload identity are bound.
 
    The SAME gate runs on the CI-failure retry path, before any candidate lookup, retry child, or pipeline trigger. The audit payload's `path` field names which gate refused (`create_run` or `ci_failure_retry`), since both share the `run_rejected_misconfigured` category.

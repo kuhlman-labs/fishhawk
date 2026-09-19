@@ -12,12 +12,19 @@
 -- Idempotent create-or-update keyed on the forge-neutral natural key
 -- (provider, account_key). The endpoint columns now live on installations
 -- (Amendment A1), so accounts carries none.
-INSERT INTO accounts (id, provider, account_key, display_name, granularity, home_region)
-VALUES ($1, $2, $3, $4, $5, $6)
+--
+-- Omitted-field convention (backend/internal/account/README.md): this upsert
+-- is DECLARATIVE for the columns its caller owns (display_name, granularity —
+-- an omitted optional input writes NULL, so a re-run makes the row match what
+-- was supplied) and PRESERVES every column another writer owns by leaving it
+-- out of both the insert column list and the DO UPDATE SET. home_region is
+-- absent for that reason: PinAccountHomeRegion owns it first-write-wins
+-- (ADR-062), and this upsert must never clear a pin on re-run.
+INSERT INTO accounts (id, provider, account_key, display_name, granularity)
+VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (provider, account_key) DO UPDATE
    SET display_name = EXCLUDED.display_name,
-       granularity  = EXCLUDED.granularity,
-       home_region  = EXCLUDED.home_region
+       granularity  = EXCLUDED.granularity
 RETURNING *;
 
 -- name: UpsertSingleTenantAccount :one
@@ -29,7 +36,8 @@ RETURNING *;
 --
 -- home_region is deliberately absent from BOTH the insert column list and the
 -- DO UPDATE SET: PinAccountHomeRegion owns that column (first-write-wins), and
--- a boot-time upsert re-running on every restart must never clear a pin.
+-- a boot-time upsert re-running on every restart must never clear a pin. Same
+-- omitted-field convention as UpsertAccount above (README.md).
 --
 -- The RETURNING list is EXPLICIT (not `*`) and held to the eight columns the
 -- hand-written db.Account model carries — auto_join_role (migration 0056) is

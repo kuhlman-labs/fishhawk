@@ -239,6 +239,39 @@ account actually admits a member — real bootstrap, then the real
 non-matching-granularity negative twin). Operator guide:
 `docs/deploy/self-hosted.md`.
 
+## Omitted-field convention for account upserts (E45.36 / #2975)
+
+**An account upsert is declarative for the columns its caller owns — an
+omitted optional input writes NULL, so a re-run makes the row match what was
+supplied — and preserves, by omitting them from both the insert column list
+and the DO UPDATE SET, every column another writer owns.**
+
+| Column | Convention |
+|---|---|
+| `display_name` | declarative in both `UpsertAccount` and `UpsertSingleTenantAccount` |
+| `granularity` | declarative in both `UpsertAccount` and `UpsertSingleTenantAccount` |
+| `home_region` | owned by `PinAccountHomeRegion` (first-write-wins, ADR-062); absent from BOTH upserts |
+| `auto_join_role` | owned by `UpsertSingleTenantAccount`, declarative there; absent from `UpsertAccount` |
+
+The stakes differ by column: `home_region` and `auto_join_role` are pins other
+logic depends on (region routing, the login gate's auto-join admission), so
+silently clearing one on an unrelated re-run is a real defect — a cosmetic
+field like `display_name` is not. Deciding which upsert owns a column, not
+whether omission is declarative or additive, is the actual choice; a caller
+that genuinely wants additive semantics for a caller-owned field needs a
+distinct verb, not a COALESCE inside this upsert.
+
+For the next column added to `accounts`: decide who owns it. If it is not
+this upsert's caller, leave it out of both the insert column list and the DO
+UPDATE SET — do not write it and do not COALESCE it.
+
+Tests pinning each branch: `TestCreateAccount_PreservesHomeRegionPinAndClearsDisplayName`
+(`registry_test.go`, domain layer) and `TestRunAccountCreate_WritesRowAndIsIdempotent`
+(`backend/cmd/fishhawkd/account_test.go`, CLI layer) both assert a re-run
+clears `display_name` and preserves a pinned `home_region` in the same pass.
+`TestEnsureSingleTenantAccount_LeavesHomeRegionAlone` is the `UpsertSingleTenantAccount`
+precedent this generalizes.
+
 ## Operator registry surface (`registry.go`, E45.33 / #2923)
 
 `registry.go` is the multi-tenant analog of the single-tenant bootstrap: the
@@ -268,9 +301,11 @@ constraint literals live in exactly one place.
 `auto_join_role` is the single-tenant profile's concept — `UpsertSingleTenantAccount`
 is its only writer. A multi-tenant account admits members via invited grants, not
 an auto-join policy, so `CreateAccount` calls `UpsertAccount` (which never touches
-that column) with a `nil` `DisplayName` for the empty case. Granularity defaults
-per provider: `organization` for github, `group` for gitlab (a GitLab namespace is
-a group), exported as `DefaultGranularityGitHub` / `DefaultGranularityGitLab`.
+that column) with a `nil` `DisplayName` for the empty case. It likewise never
+touches `home_region` — see "Omitted-field convention for account upserts" above.
+Granularity defaults per provider: `organization` for github, `group` for gitlab
+(a GitLab namespace is a group), exported as `DefaultGranularityGitHub` /
+`DefaultGranularityGitLab`.
 
 ### The account-existence check is a DISTINCT control, not FK reliance
 
