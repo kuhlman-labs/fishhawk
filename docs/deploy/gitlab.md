@@ -207,7 +207,9 @@ A failed **Pipeline Hook** triggers the auto-retry when its `ref` matches a run'
 
 ## Deploy stages on GitLab
 
-A deploy stage on a GitLab-created run must use the **`webhook`** delegate. The `github_actions` delegate dispatches `workflow_dispatch` through a GitHub App installation, and a GitLab run (`runner_kind: gitlab_ci`, or `installation_ref: gitlab:<project_id>`) has none — so `backend/internal/server/deploy_trigger.go` fails the stage at trigger time (category C) instead of parking it, with a `deployment_dispatch_failed` audit row whose `reason` names the fix and whose payload carries `runner_kind`, `installation_ref` and `remedy: "executor.delegate.target: webhook"` (#3465). The check runs BEFORE the deployment's GitHub-client guard, so a GitLab-only backend with no GitHub client configured fails loud rather than leaving the stage at `dispatched` forever. Minimal shape, pointing the webhook at a GitLab pipeline trigger (`POST /projects/:id/trigger/pipeline` with the trigger token in the URL) or any deploy endpoint you operate:
+A deploy stage on a GitLab-created run must use the **`webhook`** delegate. The `github_actions` delegate dispatches `workflow_dispatch` through a GitHub App installation, and a GitLab run (`runner_kind: gitlab_ci`, or `installation_ref: gitlab:<project_id>`) has none — so `backend/internal/server/deploy_trigger.go` fails the stage at trigger time (category C) instead of parking it, with a `deployment_dispatch_failed` audit row whose `reason` names the fix and whose payload carries `runner_kind`, `installation_ref` and `remedy: "executor.delegate.target: webhook"` (#3465). The check runs BEFORE the deployment's GitHub-client guard, so a GitLab-only backend with no GitHub client configured fails loud rather than leaving the stage at `dispatched` forever.
+
+**Keep the deploy credential OUT of `url`.** The webhook delegate has no secret mechanism: the spec is repository content with no environment or variable substitution (`$NAME` in `url` is sent literally, not expanded), the POST carries no authentication header, and `triggerDeployWebhook` persists `delegate.url` VERBATIM into the `deployment_dispatched` audit payload and every `deployment_dispatch_failed` payload — so a GitLab pipeline trigger token pasted into the URL (`/projects/:id/trigger/pipeline?token=…`) would land in source history, in the persisted workflow spec, and in every audit row and proxy/access log that records the URL. Point `url` at a deploy endpoint you operate that holds the trigger token server-side (a CI/CD variable, a secret in the relay's own environment) and calls `POST /projects/:id/trigger/pipeline` itself, authenticating Fishhawk's caller by network placement, mTLS or a source-IP allow-list rather than by anything in the spec. Minimal shape:
 
 ```yaml
 stages:
@@ -216,7 +218,7 @@ stages:
     executor:
       delegate:
         target: webhook
-        url: https://gitlab.example.com/api/v4/projects/1234/trigger/pipeline?token=$DEPLOY_TRIGGER_TOKEN&ref=main
+        url: https://deploy-relay.example.internal/fishhawk/deploy   # your relay; it holds the GitLab trigger token, never this spec
     gates:
       - type: approval
         approvers:
