@@ -1026,10 +1026,14 @@ type issueGetter interface {
 // prompts. Auditability of "what the agent was asked to do" is
 // the load-bearing reason for that choice.
 func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
+	// A nil issueGetter is tolerated since E45.45 / #3461: a GitLab-only
+	// fishhawkd (no GitHub App configured) must still serve prompts. On a
+	// github-family run, fillIssueContext degrades to
+	// issueContextReasonForgeUnresolved instead of dereferencing nil.
 	github := s.issueGetter()
-	if s.cfg.SigningRepo == nil || s.cfg.RunRepo == nil || github == nil {
+	if s.cfg.SigningRepo == nil || s.cfg.RunRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "prompt_unconfigured",
-			"prompt construction requires signing, run, and GitHub repos to be configured", nil)
+			"prompt construction requires signing and run repos to be configured", nil)
 		return
 	}
 
@@ -1739,10 +1743,14 @@ func (s *Server) writePromptBuildError(w http.ResponseWriter, r *http.Request, s
 // session view (#215) to show the user the deterministic prompt
 // the agent received.
 func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Request) {
+	// A nil issueGetter is tolerated since E45.45 / #3461: a GitLab-only
+	// fishhawkd (no GitHub App configured) must still serve prompts. On a
+	// github-family run, fillIssueContext degrades to
+	// issueContextReasonForgeUnresolved instead of dereferencing nil.
 	github := s.issueGetter()
-	if s.cfg.RunRepo == nil || github == nil {
+	if s.cfg.RunRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "prompt_unconfigured",
-			"prompt construction requires run repo and GitHub access to be configured", nil)
+			"prompt construction requires the run repo to be configured", nil)
 		return
 	}
 
@@ -2507,7 +2515,9 @@ const (
 	issueContextReasonNoCredential = "no_credential"
 	// issueContextReasonForgeUnresolved: issueOpsFor returned nil for the
 	// run's forge family (resolver error, nil/typed-nil forge, or a forge
-	// lacking forge.IssueOperations). A server misconfiguration.
+	// lacking forge.IssueOperations); or, for a github-family run, the
+	// issueGetter is nil (E45.45 / #3461 — a GitLab-only fishhawkd with no
+	// GitHub App configured). A server misconfiguration.
 	issueContextReasonForgeUnresolved = "forge_unresolved"
 	// issueContextReasonFetchFailed: the forge fetch of the issue itself
 	// errored (comments are best-effort and never produce this reason).
@@ -2550,7 +2560,11 @@ const issueContextUnresolvedCategory = "issue_context_unresolved"
 //     the operator passed issue_context. Used as-is; no forge call.
 //  2. github family: the webhook-dispatched path — fetch via the GitHub App
 //     installation token through the issueGetter seam (byte-for-byte the
-//     pre-#3347 path; it NEVER consults cfg.ForgeResolver).
+//     pre-#3347 path; it NEVER consults cfg.ForgeResolver). A nil issueGetter
+//     (E45.45 / #3461 — a GitLab-only fishhawkd with no GitHub App
+//     configured) degrades to issueContextReasonForgeUnresolved rather than
+//     dereferencing nil, checked after the credential check so a
+//     credential-less run still reports no_credential.
 //     Any other family: resolve forge.IssueOperations through the shared
 //     issueOpsFor ladder (cfg.ForgeResolver / forge.Get, isNilForge, the
 //     capability assertion), authenticate with forge.FromRef(installation_ref)
@@ -2623,6 +2637,14 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 	}
 	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		return issueContextReasonNoCredential
+	}
+	if github == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: no GitHub client configured for github-family run",
+			slog.String("run_id", runRow.ID.String()),
+			slog.Int("issue", issueNumber),
+			slog.String("forge", forgeNameGitHub),
+		)
+		return issueContextReasonForgeUnresolved
 	}
 	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
 	issue, err := github.GetIssue(ctx, scope, repo, issueNumber)
@@ -2843,7 +2865,9 @@ func (s *Server) warnOverCapComments(ctx context.Context, runRow *run.Run, issue
 }
 
 // issueGetter returns the configured client cast to the small
-// interface the handler needs. Returns nil when GitHub is unset.
+// interface the handler needs. Returns nil when GitHub is unset —
+// callers MUST tolerate nil (E45.45 / #3461: a GitLab-only fishhawkd
+// has no GitHub client and must still serve prompts).
 // The promptIssueGetterOverride test seam takes precedence so
 // handler tests don't need a real *githubclient.Client.
 func (s *Server) issueGetter() issueGetter {

@@ -1194,9 +1194,26 @@ type issueContextHarness struct {
 
 func newIssueContextHarness(t *testing.T, resolver func(string) (forge.Forge, error)) *issueContextHarness {
 	t.Helper()
+	return newIssueContextHarnessOpts(t, resolver, false)
+}
+
+// newIssueContextHarnessNoGitHub builds the harness with NO GitHub client
+// configured (cfg.GitHub unset) and, critically, does NOT set
+// promptIssueGetterOverride (E45.45 / #3461) — so s.issueGetter() returns a
+// genuinely nil issueGetter. Every OTHER prompt test injects the override,
+// which is exactly how the pre-fix gap survived: a typed-nil override would
+// make issueGetter() return a non-nil interface wrapping a nil pointer (Go
+// interface semantics) and silently bypass the control this harness exists
+// to prove.
+func newIssueContextHarnessNoGitHub(t *testing.T, resolver func(string) (forge.Forge, error)) *issueContextHarness {
+	t.Helper()
+	return newIssueContextHarnessOpts(t, resolver, true)
+}
+
+func newIssueContextHarnessOpts(t *testing.T, resolver func(string) (forge.Forge, error), noGitHub bool) *issueContextHarness {
+	t.Helper()
 	rr := newPromptRunRepo()
 	sf := newSigningFake()
-	gh := &stubIssueGetter{}
 	au := &planAuditRepo{}
 	s := New(Config{
 		Addr:          "127.0.0.1:0",
@@ -1205,7 +1222,11 @@ func newIssueContextHarness(t *testing.T, resolver func(string) (forge.Forge, er
 		AuditRepo:     au,
 		ForgeResolver: resolver,
 	})
-	s.promptIssueGetterOverride = gh
+	var gh *stubIssueGetter
+	if !noGitHub {
+		gh = &stubIssueGetter{}
+		s.promptIssueGetterOverride = gh
+	}
 	var buf bytes.Buffer
 	s.cfg.Logger = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	return &issueContextHarness{s: s, rr: rr, sf: sf, gh: gh, au: au, logs: &buf}
@@ -1452,6 +1473,68 @@ func TestFillIssueContext_GitLabFamily_FetchesViaIssueOperations(t *testing.T) {
 	}
 }
 
+// TestGetStagePrompt_GitLabOnly_NoGitHubClient_ServesForgeFetchedContext is
+// the cross-boundary integration test for E45.45 / #3461: a GitLab-only
+// fishhawkd (no GitHub App configured) must still serve BOTH /prompt and
+// /prompt-render for a gitlab-family run instead of 503 prompt_unconfigured.
+// The harness leaves s.issueGetter() genuinely nil (newIssueContextHarnessNoGitHub
+// — every OTHER prompt test injects promptIssueGetterOverride, which is
+// exactly how this gap survived), drives both endpoints end to end through
+// router -> handler -> fillIssueContext -> fillIssueContextViaForge -> the
+// httptest GitLab fake, and asserts the forge-fetched title/body/note/web_url
+// render with no github.com URL, zero issue_context_unresolved rows and zero
+// unresolved WARNs. Restoring the deleted `|| github == nil` leg in either
+// gate reddens this test with a 503.
+func TestGetStagePrompt_GitLabOnly_NoGitHubClient_ServesForgeFetchedContext(t *testing.T) {
+	fake, resolver := newGitLabIssueForge(t)
+	fake.issueBody = `{"iid":42,"title":"GitLab-only title","description":"GitLab-only body","state":"opened","web_url":"https://gitlab.example/grp/sub/proj/-/issues/42"}`
+	fake.notesBody = `[{"id":1,"body":"gitlab-only note","system":false,"created_at":"2026-09-01T00:00:00Z","author":{"username":"glbob"}}]`
+	h := newIssueContextHarnessNoGitHub(t, resolver)
+	if h.gh != nil {
+		t.Fatalf("harness must leave gh nil to prove issueGetter() is genuinely nil, got %+v", h.gh)
+	}
+
+	// Plan stage via the signed /prompt endpoint (renders title/body/comments;
+	// the URL line is the implement-stage link-only shape, checked below).
+	runID, stageID, priv := h.seed(t, gitlabRun(), run.StageTypePlan)
+	planPrompt := h.promptOK(t, runID, stageID, priv)
+	for _, want := range []string{"GitLab-only title", "GitLab-only body", "gitlab-only note", "@glbob"} {
+		if !strings.Contains(planPrompt, want) {
+			t.Errorf("plan /prompt missing %q:\n%s", want, planPrompt)
+		}
+	}
+	if strings.Contains(planPrompt, "https://github.com/") {
+		t.Errorf("plan /prompt fabricated a github.com URL on a GitHub-less server:\n%s", planPrompt)
+	}
+
+	// Implement stage via the unsigned /prompt-render preview endpoint.
+	_, stageID2, _ := h.seed(t, gitlabRun(), run.StageTypeImplement)
+	w := promptRenderRequest(t, h.s, stageID2)
+	if w.Code != http.StatusOK {
+		t.Fatalf("/prompt-render status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	implBody := w.Body.String()
+	for _, want := range []string{"GitLab-only title", "https://gitlab.example/grp/sub/proj/-/issues/42"} {
+		if !strings.Contains(implBody, want) {
+			t.Errorf("implement /prompt-render missing %q:\n%s", want, implBody)
+		}
+	}
+	if strings.Contains(implBody, "https://github.com/") {
+		t.Errorf("implement /prompt-render fabricated a github.com URL on a GitHub-less server:\n%s", implBody)
+	}
+
+	calls := fake.callLog()
+	if len(calls) != 4 || calls[0] != "GET /api/v4/projects/5/issues/42" || calls[1] != "GET /api/v4/projects/5/issues/42/notes" {
+		t.Errorf("gitlab fake calls = %v, want issue GET then notes GET per prompt build (2 builds)", calls)
+	}
+	if rows := h.unresolvedRows(t); len(rows) != 0 {
+		t.Errorf("resolved GitLab fetch on a GitHub-less server wrote %d issue_context_unresolved rows, want 0: %v", len(rows), rows)
+	}
+	if n := h.unresolvedWarns(); n != 0 {
+		t.Errorf("resolved GitLab fetch on a GitHub-less server logged %d unresolved WARNs, want 0:\n%s", n, h.logs.String())
+	}
+}
+
 // TestFillIssueContext_GitLabFamily_NoURL_NeverFabricatesGitHub is the
 // operator's binding condition (1): the ONLY test that actually REACHES the
 // format-string fallback on a non-GitHub family. The run is gitlab-family
@@ -1579,6 +1662,7 @@ func TestFillIssueContext_Unresolved_WarnsAndAudits(t *testing.T) {
 		resolver   func(*testing.T) func(string) (forge.Forge, error)
 		row        func() *run.Run
 		gh         func(*stubIssueGetter)
+		noGitHub   bool // build via newIssueContextHarnessNoGitHub instead; c.gh is skipped
 		wantReason string
 		wantForge  string
 		wantURL    string // when non-empty, assert the prompt renders "URL: "+wantURL
@@ -1593,6 +1677,33 @@ func TestFillIssueContext_Unresolved_WarnsAndAudits(t *testing.T) {
 	cases := []tc{
 		{
 			name: "github_no_installation_no_credential", resolver: nilResolver, row: ghRow,
+			wantReason: issueContextReasonNoCredential, wantForge: "github",
+		},
+		// github_no_client_forge_unresolved is the counterfactual vehicle for
+		// the fillIssueContext nil guard (E45.45 / #3461): a github-family
+		// run WITH a credential but no configured GitHub client degrades to
+		// forge_unresolved instead of panicking on a nil dereference.
+		// Deleting the guard reddens this case with a nil-interface panic.
+		{
+			name: "github_no_client_forge_unresolved", resolver: nilResolver, row: ghRowWithInstallation,
+			noGitHub:   true,
+			wantReason: issueContextReasonForgeUnresolved, wantForge: "github",
+			wantURL: "https://github.com/o/n/issues/42",
+		},
+		{
+			name: "github_no_client_forge_unresolved_prompt_render", resolver: nilResolver, row: ghRowWithInstallation,
+			noGitHub:   true,
+			wantReason: issueContextReasonForgeUnresolved, wantForge: "github",
+			wantURL: "https://github.com/o/n/issues/42", render: true,
+		},
+		// github_no_client_no_installation_still_no_credential pins the
+		// ordering inside the github branch: the credential check runs
+		// BEFORE the nil-client check, so a credential-less run on a
+		// GitHub-less server still reports no_credential, not
+		// forge_unresolved.
+		{
+			name: "github_no_client_no_installation_still_no_credential", resolver: nilResolver, row: ghRow,
+			noGitHub:   true,
 			wantReason: issueContextReasonNoCredential, wantForge: "github",
 		},
 		{
@@ -1714,9 +1825,14 @@ func TestFillIssueContext_Unresolved_WarnsAndAudits(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			h := newIssueContextHarness(t, c.resolver(t))
-			if c.gh != nil {
-				c.gh(h.gh)
+			var h *issueContextHarness
+			if c.noGitHub {
+				h = newIssueContextHarnessNoGitHub(t, c.resolver(t))
+			} else {
+				h = newIssueContextHarness(t, c.resolver(t))
+				if c.gh != nil {
+					c.gh(h.gh)
+				}
 			}
 			runID, stageID, priv := h.seed(t, c.row(), run.StageTypeImplement)
 
@@ -2210,6 +2326,77 @@ func TestGetStagePrompt_Unconfigured(t *testing.T) {
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
 	}
+}
+
+// TestGetStagePrompt_Unconfigured_RemainingPreconditions pins the gate
+// conditions that SURVIVE E45.45 / #3461's removal of the `github == nil`
+// leg: /prompt still 503s when SigningRepo or RunRepo is nil (message no
+// longer naming GitHub), /prompt-render still 503s when RunRepo is nil, and
+// — the control proving the gate itself no longer fires — neither endpoint
+// 503s when SigningRepo and RunRepo are BOTH set and only GitHub is nil.
+func TestGetStagePrompt_Unconfigured_RemainingPreconditions(t *testing.T) {
+	assertPromptUnconfigured := func(t *testing.T, w *httptest.ResponseRecorder, route string) {
+		t.Helper()
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s status = %d, want 503:\n%s", route, w.Code, w.Body.String())
+		}
+		var env errorEnvelope
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("%s decode: %v", route, err)
+		}
+		if env.Error.Code != "prompt_unconfigured" {
+			t.Errorf("%s code = %q, want prompt_unconfigured", route, env.Error.Code)
+		}
+		if strings.Contains(env.Error.Message, "GitHub") {
+			t.Errorf("%s message must not mention GitHub: %q", route, env.Error.Message)
+		}
+	}
+
+	t.Run("signing_nil_run_set", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: newPromptRunRepo()})
+		req := httptest.NewRequest(http.MethodGet,
+			"/v0/stages/"+uuid.New().String()+"/prompt", nil)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		assertPromptUnconfigured(t, w, "/prompt")
+	})
+
+	t.Run("run_nil_signing_set", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", SigningRepo: newSigningFake()})
+		stageID := uuid.New()
+
+		req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt", nil)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		assertPromptUnconfigured(t, w, "/prompt")
+
+		reqR := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+		wR := httptest.NewRecorder()
+		s.Handler().ServeHTTP(wR, reqR)
+		assertPromptUnconfigured(t, wR, "/prompt-render")
+	})
+
+	t.Run("signing_and_run_set_github_nil_gate_does_not_fire", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: newPromptRunRepo(), SigningRepo: newSigningFake()})
+		// No stage seeded: the point is only that the gate itself doesn't
+		// fire on a nil GitHub client. Any status other than 503
+		// prompt_unconfigured is acceptable here.
+		stageID := uuid.New()
+
+		req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt", nil)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		if w.Code == http.StatusServiceUnavailable {
+			t.Errorf("/prompt status = 503 with signing+run configured and GitHub nil; gate must not fire:\n%s", w.Body.String())
+		}
+
+		reqR := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+		wR := httptest.NewRecorder()
+		s.Handler().ServeHTTP(wR, reqR)
+		if wR.Code == http.StatusServiceUnavailable {
+			t.Errorf("/prompt-render status = 503 with run configured and GitHub nil; gate must not fire:\n%s", wR.Body.String())
+		}
+	})
 }
 
 func TestParseIssueRef(t *testing.T) {
