@@ -110,6 +110,15 @@ See [`deploy/helm/fishhawk/README.md`](https://github.com/kuhlman-labs/fishhawk/
 (base-URL-alone is a supported login-gate posture), the all-three-or-none OAuth
 trio guard, and which secrets are required when.
 
+**A GitLab-only backend needs no GitHub App (E45.45 / #3461).** A `fishhawkd`
+configured with only the `gitlab.*` / `secrets.values.gitlab*` values above —
+no `--github-app-id` / App private key file — serves stage prompts and
+executes runs without a GitHub App: the prompt handlers' `prompt_unconfigured`
+gate requires only the run (and, for the signed route, signing) repositories,
+not a GitHub client. If a github-family run somehow lands on such a server, it
+records an `issue_context_unresolved` audit row with reason `forge_unresolved`
+rather than 503ing the prompt.
+
 ## Onboarding the file
 
 Unlike the GitHub App-PR scaffold — which seeds four files including

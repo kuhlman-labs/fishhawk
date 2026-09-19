@@ -13150,7 +13150,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
-          description: Backend wiring incomplete (run, signing, or GitHub repo unconfigured).
+          description: |
+            Backend wiring incomplete (run or signing repo unconfigured). A missing GitHub client no longer refuses the prompt (#3461):
+            issue context on a github-family run degrades to an issue_context_unresolved audit row instead.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -13440,7 +13442,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
-          description: Backend wiring incomplete (run repo or GitHub unconfigured).
+          description: Backend wiring incomplete (run repo unconfigured); a missing GitHub client does not refuse (#3461).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
