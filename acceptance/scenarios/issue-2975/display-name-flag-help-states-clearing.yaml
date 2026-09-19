@@ -1,0 +1,14 @@
+id: scenario:issue-2975/display-name-flag-help-states-clearing
+statement: '`fishhawkd account create --help` (or `fishhawkd account create -h`) prints usage on stderr whose `--display-name` line states that omitting the flag on a re-run clears the stored name.'
+verify_hint: 'CLI stderr: run `fishhawkd account create -h` and read the --display-name usage text.'
+steps: Ran `/tmp/fh-acc-fishhawkd account create -h` with stdout and stderr captured separately; also `--help`; also the preview's own binary (/Users/brettkuhlman/Documents/Projects/fishhawk/.fishhawk/cache/preview-worktree/bin/fishhawkd account create -h).
+assertions:
+    expected: Usage on stderr whose --display-name line states that omitting the flag on a re-run clears the stored name.
+    observed_at_record: 'Exit 2 (Go flag help convention), stdout 0 bytes, stderr usage: ''-display-name string / cosmetic display name (optional; omitting it on a re-run clears the stored name)''. Identical text from --help and from the preview''s own binary.'
+    repro_handle: /tmp/fh-acc-fishhawkd account create -h 2>&1 >/dev/null | grep -A1 display-name
+origin:
+    issue: 2975
+    pr: 3483
+    run_id: 651eeb07-63ef-4507-84ac-864918f3beeb
+    head_sha: a61b4fce126e3b1ee888f60bda4fbc93d20da344
+    recorded_at: 2026-09-19T01:52:51Z
