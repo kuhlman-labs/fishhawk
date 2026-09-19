@@ -19,6 +19,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -1446,4 +1447,233 @@ func mapKeys(m map[string]any) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// --- Dev mode (E72.13 / #3500) ---
+
+// devModeHostDispatchServer wires the shared orchestratorRepo fake plus an
+// auditFake and mounts the given dev surfaces, seeding a run with one stage
+// parked at awaiting_host_dispatch — the exact shape the acceptance agent
+// drove on the preview daemon.
+func devModeHostDispatchServer(t *testing.T, fixtures, stubForge bool) (*Server, *orchestratorRepo, *auditFake, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingHostDispatch)
+	cfg := Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au}
+	if fixtures {
+		cfg.DevFixtures = &fakeDevApplier{}
+	}
+	if stubForge {
+		cfg.DevStubForge = stub.New()
+	}
+	s := New(cfg)
+	return s, rr, au, runRow.ID, stage.ID
+}
+
+// hostDispatchRefusedEntries returns the run chain's host_dispatch_refused
+// rows for the stage.
+func hostDispatchRefusedEntries(au *auditFake, stageID uuid.UUID) []audit.ChainAppendParams {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for _, p := range au.appended {
+		if p.Category == CategoryHostDispatchRefused && p.StageID != nil && *p.StageID == stageID {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// assertDevModeRefused is the shared assertion for the dev-mode refusal: 403
+// host_dispatch_refused_dev_mode naming the mounted surfaces, the stage
+// re-read STILL awaiting_host_dispatch (committed state, not just the error
+// identity — a refusal that fired and rolled back would answer the same
+// error), and exactly one host_dispatch_refused row carrying reason dev_mode
+// and the given subject.
+func assertDevModeRefused(t *testing.T, w *httptest.ResponseRecorder, rr *orchestratorRepo, au *auditFake,
+	stageID uuid.UUID, wantSurfaces []string, wantSubject string) {
+	t.Helper()
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body: %v (%s)", err, w.Body.String())
+	}
+	if body.Error.Code != "host_dispatch_refused_dev_mode" {
+		t.Errorf("error code = %q, want host_dispatch_refused_dev_mode", body.Error.Code)
+	}
+	if body.Error.Details["reason"] != "dev_mode" {
+		t.Errorf("details.reason = %v, want dev_mode", body.Error.Details["reason"])
+	}
+	var gotSurfaces []string
+	if raw, ok := body.Error.Details["dev_surfaces"].([]any); ok {
+		for _, v := range raw {
+			gotSurfaces = append(gotSurfaces, v.(string))
+		}
+	}
+	if !reflect.DeepEqual(gotSurfaces, wantSurfaces) {
+		t.Errorf("details.dev_surfaces = %v, want %v", gotSurfaces, wantSurfaces)
+	}
+	cur, err := rr.GetStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if cur.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("persisted state = %q, want awaiting_host_dispatch (a dev-mode daemon never marks a spawn)", cur.State)
+	}
+	entries := hostDispatchRefusedEntries(au, stageID)
+	if len(entries) != 1 {
+		t.Fatalf("host_dispatch_refused entries = %d, want exactly 1", len(entries))
+	}
+	e := entries[0]
+	if e.ActorKind == nil || *e.ActorKind != audit.ActorSystem {
+		t.Errorf("actor_kind = %v, want system", e.ActorKind)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("decode refusal payload: %v (%s)", err, e.Payload)
+	}
+	if payload["reason"] != "dev_mode" {
+		t.Errorf("payload.reason = %v, want dev_mode", payload["reason"])
+	}
+	if payload["subject"] != wantSubject {
+		t.Errorf("payload.subject = %v, want %q", payload["subject"], wantSubject)
+	}
+	if payload["stage_id"] != stageID.String() {
+		t.Errorf("payload.stage_id = %v, want %s", payload["stage_id"], stageID)
+	}
+	if payload["source"] != "host_dispatch" {
+		t.Errorf("payload.source = %v, want host_dispatch", payload["source"])
+	}
+	var payloadSurfaces []string
+	if raw, ok := payload["dev_surfaces"].([]any); ok {
+		for _, v := range raw {
+			payloadSurfaces = append(payloadSurfaces, v.(string))
+		}
+	}
+	if !reflect.DeepEqual(payloadSurfaces, wantSurfaces) {
+		t.Errorf("payload.dev_surfaces = %v, want %v", payloadSurfaces, wantSurfaces)
+	}
+}
+
+// (a) An ANONYMOUS caller is refused — the dev-mode branch precedes the auth
+// ladder, so the answer is 403 host_dispatch_refused_dev_mode, not 401.
+func TestHostDispatch_DevMode_RefusesAnonymous(t *testing.T) {
+	s, rr, au, runID, stageID := devModeHostDispatchServer(t, true, true)
+	w := postHostDispatch(t, s, runID, stageID, func(req *http.Request) *http.Request { return req })
+	assertDevModeRefused(t, w, rr, au, stageID, []string{"dev_fixtures", "dev_stub_forge"}, "anonymous")
+}
+
+// (b) The regression test of #3500 done-means 3 on the server side: an
+// acceptance-shaped caller holding the STRONGEST identity — a write:runs
+// operator bearer, the token the sandbox minted — still cannot mark a spawn.
+// Counterfactual (step 10): deleting the devModeActive() branch in
+// handleHostDispatchStage makes this 200 with the stage 'dispatched'.
+func TestHostDispatch_DevMode_RefusesWriteRunsBearer(t *testing.T) {
+	s, rr, au, runID, stageID := devModeHostDispatchServer(t, true, true)
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	assertDevModeRefused(t, w, rr, au, stageID, []string{"dev_fixtures", "dev_stub_forge"}, "github:ops")
+}
+
+// (c) EITHER surface alone puts the daemon in dev mode.
+func TestHostDispatch_DevMode_EachSurfaceAlone(t *testing.T) {
+	cases := []struct {
+		name                string
+		fixtures, stubForge bool
+		want                []string
+	}{
+		{"fixtures_only", true, false, []string{"dev_fixtures"}},
+		{"stub_forge_only", false, true, []string{"dev_stub_forge"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, au, runID, stageID := devModeHostDispatchServer(t, tc.fixtures, tc.stubForge)
+			w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+			assertDevModeRefused(t, w, rr, au, stageID, tc.want, "github:ops")
+		})
+	}
+}
+
+// (d) The 403 never depends on the audit row: a nil AuditRepo WARN-skips the
+// row and still refuses, leaving the stage parked.
+func TestHostDispatch_DevMode_NilAuditRepo_StillRefuses(t *testing.T) {
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingHostDispatch)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, DevFixtures: &fakeDevApplier{}}) // AuditRepo deliberately nil
+
+	w := postHostDispatch(t, s, runRow.ID, stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "host_dispatch_refused_dev_mode") {
+		t.Fatalf("status = %d body = %s, want 403 host_dispatch_refused_dev_mode", w.Code, w.Body.String())
+	}
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("persisted state = %q, want awaiting_host_dispatch", cur.State)
+	}
+}
+
+// A failing audit append likewise never weakens the refusal.
+func TestHostDispatch_DevMode_AuditAppendFails_StillRefuses(t *testing.T) {
+	s, rr, au, runID, stageID := devModeHostDispatchServer(t, true, false)
+	au.appendErrCategory = CategoryHostDispatchRefused
+
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "host_dispatch_refused_dev_mode") {
+		t.Fatalf("status = %d body = %s, want 403 host_dispatch_refused_dev_mode", w.Code, w.Body.String())
+	}
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("persisted state = %q, want awaiting_host_dispatch", cur.State)
+	}
+	if n := len(hostDispatchRefusedEntries(au, stageID)); n != 0 {
+		t.Errorf("host_dispatch_refused entries = %d, want 0 (the append was injected to fail)", n)
+	}
+}
+
+// The run_id/stage_id parse PRECEDES the refusal: a malformed id on a
+// dev-mode daemon still answers 400 validation_failed, and no row is written.
+func TestHostDispatch_DevMode_BadUUID_Still400(t *testing.T) {
+	s, _, au, _, stageID := devModeHostDispatchServer(t, true, true)
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/not-a-uuid/stages/"+stageID.String()+"/host-dispatch", nil)
+	req.SetPathValue("run_id", "not-a-uuid")
+	req.SetPathValue("stage_id", stageID.String())
+	w := httptest.NewRecorder()
+	s.handleHostDispatchStage(w, withHostDispatchOperator(req))
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "validation_failed") {
+		t.Fatalf("status = %d body = %s, want 400 validation_failed", w.Code, w.Body.String())
+	}
+	if n := len(hostDispatchRefusedEntries(au, stageID)); n != 0 {
+		t.Errorf("host_dispatch_refused entries = %d, want 0 (parse failed before the refusal)", n)
+	}
+}
+
+// (e) Production control: with NO dev surface mounted the marker is
+// byte-identical to pre-#3500 — awaiting_host_dispatch → dispatched with no
+// refusal row. TestHostDispatch_AwaitingHostDispatch_MarksDispatched,
+// TestHostDispatch_Anonymous_Unauthorized and TestHostDispatch_MissingScope_Forbidden
+// pin the rest of that ladder.
+func TestHostDispatch_ProductionNoDevSurface_Unchanged(t *testing.T) {
+	s, rr, au, runID, stageID := devModeHostDispatchServer(t, false, false)
+	if s.devModeActive() {
+		t.Fatal("devModeActive() = true with no dev surface mounted")
+	}
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("persisted state = %q, want dispatched", cur.State)
+	}
+	if n := len(hostDispatchRefusedEntries(au, stageID)); n != 0 {
+		t.Errorf("host_dispatch_refused entries = %d, want 0 on a production daemon", n)
+	}
 }

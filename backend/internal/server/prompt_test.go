@@ -763,6 +763,82 @@ func TestGetStagePrompt_Plan_CarriesResolvedModel(t *testing.T) {
 	}
 }
 
+// TestPromptResponse_DevMode_ForgeWritesDeny pins the E72.13 / #3500 emitter
+// half of the forge_writes wire seam: a dev-mode daemon (a dev-only surface
+// mounted) stamps forge_writes:"deny" on BOTH the signed /prompt dispatch
+// response and the /prompt-render preview, under the byte-identical json tag
+// the runner's upload.FetchedPrompt decoder reads. Counterfactual (step 10):
+// deleting the forgeWritesPolicy() assignment at either build site reds the
+// matching sub-case.
+func TestPromptResponse_DevMode_ForgeWritesDeny(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	s.cfg.DevFixtures = &fakeDevApplier{}
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+	rr.runRow = &run.Run{
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   "manual",
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	for name, w := range map[string]*httptest.ResponseRecorder{
+		"prompt":        promptRequest(t, s, runID, stageID, priv, ""),
+		"prompt_render": promptRenderRequest(t, s, stageID),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if resp.ForgeWrites != "deny" {
+				t.Errorf("ForgeWrites = %q, want deny", resp.ForgeWrites)
+			}
+			if !contains(w.Body.String(), `"forge_writes":"deny"`) {
+				t.Errorf("response missing the forge_writes json tag:\n%s", w.Body.String())
+			}
+		})
+	}
+}
+
+// TestPromptResponse_Production_OmitsForgeWrites: with no dev surface the
+// forge_writes key is ABSENT on both endpoints — every production prompt
+// response stays byte-identical.
+func TestPromptResponse_Production_OmitsForgeWrites(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+	rr.runRow = &run.Run{
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   "manual",
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	for name, w := range map[string]*httptest.ResponseRecorder{
+		"prompt":        promptRequest(t, s, runID, stageID, priv, ""),
+		"prompt_render": promptRenderRequest(t, s, stageID),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if contains(w.Body.String(), `"forge_writes"`) {
+				t.Errorf("forge_writes must be omitted on a production daemon:\n%s", w.Body.String())
+			}
+		})
+	}
+}
+
 // TestGetStagePrompt_Plan_EmptyModelOmitted asserts the byte-identical
 // today's-spawn path (#1416): with no plan executor.model and no default, the
 // resolved plan model is empty and the plan_model key is OMITTED from the

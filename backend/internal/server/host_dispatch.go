@@ -70,12 +70,33 @@ type hostDispatchResponse struct {
 // dispatch_not_admissible: none is ever host-spawned, so marking it 'dispatched'
 // would misrepresent state and could wedge the stage.
 //
+// Dev mode (E72.13 / #3500): a daemon with a dev-only surface mounted
+// (Config.DevFixtures / Config.DevStubForge — what `scripts/dev preview`
+// runs) refuses EVERY caller, identity-independent, with 403
+// host_dispatch_refused_dev_mode and a host_dispatch_refused audit row, BEFORE
+// the auth ladder and every dependency guard. The acceptance agent's escape
+// did not depend on which credential it held, so the marker refuses an
+// anonymous caller, an fhm_ token and a write:runs operator token identically;
+// only the run_id/stage_id parse precedes it, so a malformed id still answers
+// 400. The stage row is never read on that path, so its state is untouched.
+// A production daemon (no dev surface) never enters the branch and its
+// 401/403 ladder below is byte-identical to pre-#3500.
+//
 // Auth mirrors the reap-failure endpoint: an authenticated identity carrying
 // write:runs. Anonymous → 401; an authenticated token without write:runs → 403;
 // a cookie session with an empty TokenID is not scope-gated (matching the
 // sibling write handlers). The operator/MCP token that drives dispatch already
 // carries write:runs, so the auth-change impact inventory is empty.
 func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request) {
+	if s.devModeActive() {
+		runID, stageID, ok := s.parseHostDispatchIDs(w, r)
+		if !ok {
+			return
+		}
+		s.refuseHostDispatchDevMode(w, r, runID, stageID)
+		return
+	}
+
 	// Auth ladder BEFORE the nil-dependency guard (the #1915 revive convention)
 	// so an anonymous caller gets 401 rather than a 503 that would leak
 	// configuration state before authentication.
@@ -98,18 +119,8 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	runID, err := uuid.Parse(r.PathValue("run_id"))
-	if err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"run_id must be a valid UUID",
-			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
-		return
-	}
-	stageID, err := uuid.Parse(r.PathValue("stage_id"))
-	if err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"stage_id must be a valid UUID",
-			map[string]any{"field": "stage_id", "got": r.PathValue("stage_id")})
+	runID, stageID, ok := s.parseHostDispatchIDs(w, r)
+	if !ok {
 		return
 	}
 
@@ -339,6 +350,28 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		StageState:   string(updated.State),
 		BaseBranch:   baseBranch,
 	})
+}
+
+// parseHostDispatchIDs parses the run_id / stage_id path values, answering
+// 400 validation_failed (and returning ok=false) on a malformed one. Shared by
+// the dev-mode refusal and the production path so both answer a bad id the
+// same way.
+func (s *Server) parseHostDispatchIDs(w http.ResponseWriter, r *http.Request) (runID, stageID uuid.UUID, ok bool) {
+	runID, err := uuid.Parse(r.PathValue("run_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"run_id must be a valid UUID",
+			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
+		return uuid.Nil, uuid.Nil, false
+	}
+	stageID, err = uuid.Parse(r.PathValue("stage_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"stage_id must be a valid UUID",
+			map[string]any{"field": "stage_id", "got": r.PathValue("stage_id")})
+		return uuid.Nil, uuid.Nil, false
+	}
+	return runID, stageID, true
 }
 
 // emitHostDispatchAcceptanceAnchor writes the acceptance_dispatched audit entry

@@ -252,6 +252,7 @@ var KnownCategories = map[string]struct{}{
 	"grooming_disposition_recorded":           {},
 	"grooming_mutation_applied":               {},
 	"grooming_report_recorded":                {},
+	"host_dispatch_refused":                   {}, // E72.13 / #3500: dev-mode host-dispatch refusal (server/devmode.go)
 	"implement_review_backstop_elapsed":       {},
 	"implement_review_diff_truncated":         {},
 	"implement_review_failed":                 {},

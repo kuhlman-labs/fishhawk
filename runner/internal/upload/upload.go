@@ -722,6 +722,19 @@ type FetchedPrompt struct {
 	// category-C rather than degrading it to an unverifiable warn, so the
 	// drift is loud but total.
 	AcceptanceExpectedHeadSHA string `json:"acceptance_expected_head_sha,omitempty"`
+	// ForgeWrites is the backend's forge-write policy for the stage (E72.13 /
+	// #3500): "deny" when the backend is in dev mode (a dev-only surface is
+	// mounted — `scripts/dev preview`), empty otherwise. The pre-spawn
+	// forge-writes gate in main.go (the slice-1 sibling) refuses the stage
+	// on "deny" — runner_failed forge_writes_denied, category C — before any
+	// agent spawn, push or PR open. Decoded here.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (forge_writes) MUST stay
+	// byte-identical to the backend's promptResponse.ForgeWrites
+	// (backend/internal/server/prompt.go), the same convention as
+	// AcceptanceExpectedHeadSHA above. A tag drift silently drops the deny
+	// and the gate falls open to the env-only source.
+	ForgeWrites string `json:"forge_writes,omitempty"`
 	// Replayable scenario corpus inputs (E72.4 / #3328), served ONLY on
 	// acceptance stages. AcceptanceRunBranch is the run branch the acceptance
 	// runner pushes its scenario-corpus commit to (empty → persist_skipped,
