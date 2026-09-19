@@ -121,6 +121,12 @@ func (r CreateAccountRequest) Validate() error {
 // profile's concept (UpsertSingleTenantAccount is its only writer), and a
 // multi-tenant account admits members via invited grants, not an auto-join
 // policy. The upsert is idempotent on (provider, account_key).
+//
+// Per the omitted-field convention (backend/internal/account/README.md), the
+// upsert is DECLARATIVE for the columns this caller owns — display_name and
+// granularity — so an omitted --display-name clears the stored name on a
+// re-run. It never touches home_region or auto_join_role, which other writers
+// own (PinAccountHomeRegion, UpsertSingleTenantAccount respectively).
 func CreateAccount(ctx context.Context, q RegistryQueries, req CreateAccountRequest) (accountdb.Account, error) {
 	resolved := req.resolveDefaults()
 	if err := resolved.Validate(); err != nil {
@@ -138,7 +144,6 @@ func CreateAccount(ctx context.Context, q RegistryQueries, req CreateAccountRequ
 		AccountKey:  resolved.AccountKey,
 		DisplayName: displayName,
 		Granularity: resolved.Granularity,
-		HomeRegion:  nil,
 	})
 }
 
