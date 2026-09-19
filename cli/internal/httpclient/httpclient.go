@@ -84,23 +84,33 @@ type errorEnvelope struct {
 // Run is the CLI-side projection of the OpenAPI Run schema. Field
 // names + types match the wire shape verbatim.
 type Run struct {
-	ID                 uuid.UUID     `json:"id"`
-	Repo               string        `json:"repo"`
-	WorkflowID         string        `json:"workflow_id"`
-	WorkflowSHA        string        `json:"workflow_sha"`
-	TriggerSource      string        `json:"trigger_source"`
-	TriggerRef         *string       `json:"trigger_ref"`
-	State              string        `json:"state"`
-	ParentRunID        *uuid.UUID    `json:"parent_run_id"`
-	UpstreamRunID      *uuid.UUID    `json:"upstream_run_id,omitempty"`
-	DecomposedFrom     *uuid.UUID    `json:"decomposed_from,omitempty"`
-	PullRequestURL     *string       `json:"pull_request_url"`
-	RetryAttempt       int           `json:"retry_attempt"`
-	MaxRetriesSnapshot int           `json:"max_retries_snapshot"`
-	RunnerKind         string        `json:"runner_kind"`
-	IssueContext       *IssueContext `json:"issue_context,omitempty"`
-	CreatedAt          time.Time     `json:"created_at"`
-	UpdatedAt          time.Time     `json:"updated_at"`
+	ID                 uuid.UUID  `json:"id"`
+	Repo               string     `json:"repo"`
+	WorkflowID         string     `json:"workflow_id"`
+	WorkflowSHA        string     `json:"workflow_sha"`
+	TriggerSource      string     `json:"trigger_source"`
+	TriggerRef         *string    `json:"trigger_ref"`
+	State              string     `json:"state"`
+	ParentRunID        *uuid.UUID `json:"parent_run_id"`
+	UpstreamRunID      *uuid.UUID `json:"upstream_run_id,omitempty"`
+	DecomposedFrom     *uuid.UUID `json:"decomposed_from,omitempty"`
+	PullRequestURL     *string    `json:"pull_request_url"`
+	RetryAttempt       int        `json:"retry_attempt"`
+	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
+	RunnerKind         string     `json:"runner_kind"`
+	// Forge is the run's forge id (`github` | `gitlab`), always present
+	// on a backend since E45.46 / #3463; empty from an older backend
+	// (consumers default it to github). Tag MUST byte-match the
+	// backend's runResponse.
+	Forge string `json:"forge,omitempty"`
+	// ForgeBaseURL is the GitLab instance root for a gitlab run. The
+	// backend populates it ONLY on the single-run GET /v0/runs/{id}
+	// (never on the list route), so `runner start` reads the run row
+	// via GetRun when it needs the base URL.
+	ForgeBaseURL string        `json:"forge_base_url,omitempty"`
+	IssueContext *IssueContext `json:"issue_context,omitempty"`
+	CreatedAt    time.Time     `json:"created_at"`
+	UpdatedAt    time.Time     `json:"updated_at"`
 }
 
 // IssueContext mirrors the OpenAPI shape: the GitHub issue payload
@@ -189,6 +199,13 @@ type CreateRunInput struct {
 	// #1417). Distinct from parent_run_id. Set by the CLI's
 	// `-upstream-run-id` flag.
 	UpstreamRunID *string `json:"upstream_run_id,omitempty"`
+	// Forge selects the run's forge (`github` | `gitlab`), E45.46 /
+	// #3463. Empty omits the field so the backend derives the forge
+	// from the installation registry for the repo owner (default
+	// github). `run start` PINS "github" whenever it fetched the issue
+	// from github.com via gh, so a github.com-fetched issue is never
+	// attached to a gitlab run; explicit always wins over the ladder.
+	Forge string `json:"forge,omitempty"`
 }
 
 // StartRun calls POST /v0/runs.

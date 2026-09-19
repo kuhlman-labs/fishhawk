@@ -83,7 +83,7 @@ func Commands() []Command {
 		// run
 		{Key: "run start", Synopsis: "Trigger a workflow run.", Args: "",
 			Flags: withCommon("repo", "workflow", "workflow-sha", "trigger-ref", "runner-kind",
-				"working-dir", "spec-file", "issue", "override-budget", "upstream-run-id",
+				"working-dir", "spec-file", "issue", "forge", "override-budget", "upstream-run-id",
 				"applies-to-override", "applies-to-override-reason")},
 		{Key: "run status", Synopsis: "Show a run's current state.", Args: "<run-id>",
 			Flags: withCommon("output", "o")},
@@ -157,7 +157,7 @@ func Commands() []Command {
 			Flags: []string{"out", "in-place", "report-only"}},
 		{Key: "runner start", Synopsis: "Spawn the fishhawk-runner locally against an already-minted run.", Args: "",
 			Flags: withCommon("run-id", "stage-id", "workflow", "stage", "working-dir",
-				"github-repo", "base-branch", "no-pr", "runner-binary")},
+				"github-repo", "forge", "gitlab-base-url", "base-branch", "no-pr", "runner-binary")},
 		{Key: "doctor", Synopsis: "Run local-loop install checks.", Args: "",
 			Flags: withCommon("runner-binary", "working-dir", "repo", "spec-only",
 				"run-verify-command", "skip-verify-command", "verify-timeout")},

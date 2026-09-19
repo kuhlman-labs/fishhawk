@@ -179,7 +179,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fishhawk run start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cf := bindCommonFlags(fs)
-	repo := fs.String("repo", "", "owner/name of the repo (required)")
+	repo := fs.String("repo", "", "owner/name on GitHub, or the GitLab path_with_namespace (nested groups allowed) (required)")
 	workflowID := fs.String("workflow", "", "workflow ID matching .fishhawk/workflows.yaml (required)")
 	workflowSHA := fs.String("workflow-sha", "",
 		"git blob SHA of .fishhawk/workflows.yaml; auto-computed from the discovered spec when omitted")
@@ -192,6 +192,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		"explicit path to a workflow spec file; overrides auto-discovery")
 	issueArg := fs.String("issue", "",
 		"GitHub issue number, #N, or .../issues/N URL; CLI fetches via `gh` and ships inline")
+	forge := fs.String("forge", "",
+		"github | gitlab. Omitted with --issue: the CLI fetches the issue from github.com via gh and PINS forge=github on the request; omitted without --issue: the backend derives from the registered installation (default github); gitlab: skips gh, pass issue_context inline")
 	overrideBudget := fs.Bool("override-budget", false,
 		"force the run past a blocking periodic cost budget that is over its limit for the current period (#688)")
 	upstreamRunID := fs.String("upstream-run-id", "",
@@ -213,6 +215,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintf(stderr, "fishhawk run start: --upstream-run-id %q is not a valid UUID\n", *upstreamRunID)
 			return exitUsage
 		}
+	}
+	// Validate --forge locally so a typo is a usage error with no
+	// backend round-trip (E45.46 / #3463). Empty is the "let the
+	// ladder decide" value, resolved below.
+	switch *forge {
+	case "", forgeGitHub, forgeGitLab:
+	default:
+		_, _ = fmt.Fprintf(stderr, "fishhawk run start: --forge %q is not one of github, gitlab\n", *forge)
+		return exitUsage
 	}
 
 	// Validate the applies_to override pair BEFORE discoverSpec runs.
@@ -325,11 +336,29 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		in.UpstreamRunID = upstreamRunID
 	}
 
-	// Fetch the issue locally via gh and bundle the payload.
-	// Best-effort: a missing or unauthed gh emits a warning and
-	// the run proceeds without the cache (degraded prompt =
-	// pre-#415 shape).
-	if issueNumber > 0 {
+	// Forge ladder difference (E45.46 / #3463). The backend derives
+	// the forge from the installation registry when the request
+	// omits it; explicit always wins. This CLI fetches the issue from
+	// github.com via gh, so whenever that fetch is ATTEMPTED with
+	// --forge omitted the request PINS forge=github — a github.com-
+	// fetched issue is never attached to a gitlab run, and the pin
+	// rides on the attempt (not on gh success) so an absent gh binary
+	// or a transient gh error cannot mint two otherwise-identical
+	// invocations under different forges. --forge gitlab skips gh
+	// entirely; omitted without an issue sends no forge at all.
+	in.Forge = *forge
+	switch {
+	case issueNumber > 0 && *forge == forgeGitLab:
+		_, _ = fmt.Fprintf(stderr,
+			"fishhawk run start: --forge gitlab: not fetching issue #%d via gh (gh reads github.com only); the run proceeds without inline issue context\n", issueNumber)
+	case issueNumber > 0:
+		if in.Forge == "" {
+			in.Forge = forgeGitHub
+		}
+		// Fetch the issue locally via gh and bundle the payload.
+		// Best-effort: a missing or unauthed gh emits a warning and
+		// the run proceeds without the cache (degraded prompt =
+		// pre-#415 shape).
 		ic, ferr := fetchIssueViaGh(*repo, issueNumber)
 		switch {
 		case ferr == nil:
