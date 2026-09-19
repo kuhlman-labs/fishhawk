@@ -655,7 +655,7 @@ Two `inputs` shapes:
 ```yaml
 inputs:
   # external trigger
-  - source: github_issue   # github_issue | pull_request
+  - source: github_issue   # forge-neutral issue-anchored member | pull_request
     required: true         # optional boolean
 
   # an artifact from an earlier stage in the same run
@@ -664,6 +664,8 @@ inputs:
 ```
 
 `source` names the external trigger the run is opened against. `required` marks the trigger as mandatory for the stage. `artifact` + `from_stage` wire an earlier stage's output into this one; the input-artifact enum has exactly two members, `plan` and `pull_request`.
+
+`github_issue` is the `source` enum's ISSUE-ANCHORED member — `Run.IsIssueAnchored` (`backend/internal/run/run.go`) keys on it (alongside `on_demand`) — and it is the correct value on EVERY forge, not a GitHub-only literal. A GitLab issue trigger creates the run with `trigger_source: github_issue` (`matchGitLabIssue` in `backend/internal/webhook/dispatcher.go`). There is deliberately NO `gitlab_issue` member: adding one would need a `runs_trigger_source_check` migration and a widening of `IsIssueAnchored`, and it is not required because the existing member is already forge-neutral. Do not infer a `gitlab_issue` member from the widened `grooming-report-v1.schema.json` enum (`github_issue | gitlab_issue | jira_issue`) — that is a DIFFERENT schema for a different surface. See [`docs/deploy/gitlab.md`](../deploy/gitlab.md) § "What is GitHub-only today" for the GitLab issue-input degradation and the supported escape hatch.
 
 ### `needs:` shorthand
 
@@ -1135,7 +1137,7 @@ test_conventions:
 | `reviewers.agents[].optional` | `true` \| `false` (default `false`) | per-reviewer degradation policy |
 | `reviewers.human` | integer `>= 0` (default `0`) | absent block → no reviewers configured; `Reviewers` nil; agent count `0`; resolves `gateless` (no `{human: 1}` default) |
 | `reviewers.review_timeout` | duration string | this stage's review-budget floor |
-| Input `source` | `github_issue` \| `pull_request` | external trigger |
+| Input `source` | `github_issue` \| `pull_request` | external trigger; `github_issue` is the issue-anchored member (`Run.IsIssueAnchored`) and is correct on every forge — no `gitlab_issue` member exists |
 | Input `artifact` | `plan` \| `pull_request` | what a later stage may consume |
 | Produced `artifact` | `plan` \| `pull_request` \| `deployment` \| `acceptance` \| `grooming_report` | `deployment` deploy-only, `acceptance` acceptance-only, `grooming_report` plan-only (v2-only) |
 | `produces[].schema` | `standard_v1` \| `grooming_report_v1` | required alongside the `plan` and `grooming_report` artifacts respectively |

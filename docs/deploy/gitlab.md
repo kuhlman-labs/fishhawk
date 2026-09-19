@@ -195,3 +195,34 @@ A failed **Pipeline Hook** triggers the auto-retry when its `ref` matches a run'
 - **A merge-request pipeline is a DISTINCT deferral, not the first-stage case.** An MR pipeline runs on the merge request's target branch, so it is never on a run branch either — but it is not a run's first pipeline, and saying so would send you down the wrong path. It draws its own reason, `merge_request_pipeline_ref_not_a_run_branch`, so a missing retry on an MR pipeline is diagnosable as what it actually is. Fishhawk identifies these by the Pipeline Hook's `object_attributes.source == "merge_request_event"` (the primary, documented signal) or by a `refs/merge-requests/<iid>/head` / `.../merge` ref shape. Same remedy as above: re-run the pipeline manually, or let the next stage's pipeline on the run branch carry the retry.
 - **Every other non-retry is also named** in a `ci_retry_skipped` audit row: `no_candidate_run_owns_pipeline_ref`, `pipeline_sha_does_not_match_run_head_sha`, `run_head_sha_lookup_failed`, `run_lineage_cancelled`, `retry_policy_unresolvable_from_cached_spec`, `gitlab_pipeline_trigger_unconfigured`, `run_has_no_credential_scope`. Query them with `GET /v0/runs/{run_id}/audit?category=ci_retry_skipped`.
 - **Two of those reasons are yours to fix**, and each names a different remedy. `gitlab_pipeline_trigger_unconfigured` means the deployment has no GitLab pipeline trigger wired at all — configure the GitLab forge credentials. `run_has_no_credential_scope` means THAT run row carries no `installation_ref`, so no credential scope can be resolved for it — backfill the row's `installation_ref` (the shape a run minted before migration `0076` and missed by its backfill carries). Until then Fishhawk refuses the retry outright rather than marking a stage `dispatched` with no pipeline behind it.
+
+## What is GitHub-only today
+
+The workflow-spec issue trigger and the issue-content prompt path are forge-neutral; a handful of surrounding entry points and side effects are still GitHub-only. Each item names its code site and its open tracking issue so the follow-up doc sweep (#3467) can retire the line when the fix lands.
+
+- **`inputs[].source: github_issue` is forge-neutral — not a GitHub-only literal.** It is the workflow spec's issue-anchored enum member on every forge; a GitLab issue trigger mints a run with `trigger_source: github_issue`. Full reasoning: [`docs/spec/workflow-v2.md`](../spec/workflow-v2.md) § "Inputs and `needs:`". There is no `gitlab_issue` member and none is needed.
+
+- **Issue CONTENT reaches the prompt forge-neutrally.** The run's `run.IssueContext` (`backend/internal/run/run.go` — `Title`/`Body`/`URL`/`Number`/`Comments`/`Labels`) is forge-agnostic, and `fillIssueContext` (`backend/internal/server/prompt.go`) is forge-neutral since E45.42 / #3347: branch 1 uses the cached `issue_context` verbatim (including its `URL`); a gitlab-family run (installation_ref `gitlab:<id>`, or `runner_kind gitlab_ci`) fetches through the forge ladder; and the `IssueURL` ladder never fabricates a `github.com` URL for a non-GitHub run (the github.com format string is applied for a github-family run ONLY). This path is done — no tracking issue.
+
+- **The DEFAULT fetch entry point is NOT forge-neutral (#3463).** `fishhawk_start_run`'s `issue` param shells to `gh issue view` (`backend/internal/mcpserver/issue_fetch.go`), which resolves against github.com regardless of the project's forge. Separately, a local-runner run started with no `installation_ref` resolves as the **github family** (`runForge` in `backend/internal/server/issue_approval.go`: a nil/empty ref → `github`), and with `InstallationID` nil it has no credential, so `fillIssueContext` leaves the prompt without issue context and records an `issue_context_unresolved` audit row with reason `no_credential`. Closing the MCP/CLI issue-fetch entry-point gap for non-GitHub forges is tracked in **#3463**.
+
+- **SUPPORTED PATH TODAY: pass `issue_context` inline.** Supply `issue_context` (title, body, url, number, comments) together with `trigger_source: github_issue` to `fishhawk_start_run`. This satisfies the issue-anchored pairing check at run creation (`backend/internal/server/runs.go` — `issue_context` is only valid when `Run.IsIssueAnchored` holds for the `trigger_source`), persists on the run row, and is served by branch 1 of `fillIssueContext`. Put the GitLab **web** URL in `issue_context.url` so the rendered issue link is correct. Minimal argument shape:
+
+  ```json
+  {
+    "trigger_source": "github_issue",
+    "issue_context": {
+      "title": "Widget import fails on empty CSV",
+      "body": "Steps to reproduce ...",
+      "url": "https://gitlab.example.com/acme/widgets/-/issues/42",
+      "number": 42,
+      "comments": ["First triage note ...", "Repro confirmed ..."]
+    }
+  }
+  ```
+
+- **RESIDUAL — issue-comment persistence is skipped on GitLab (#3346).** A GitLab-created run carries `InstallationID` nil (`backend/internal/webhook/gitlab_dispatch.go` step 4 sets the credential reference but leaves `InstallationID` nil, because a GitLab project has no GitHub installation id), and every `backend/internal/issuecomment` notifier path gates on `InstallationID == nil`. So `persistence.target: originating_issue` (the plan `rendered_comment`) and the status/approval comments are silently skipped on GitLab. Tracked in **E45.41 / #3346**.
+
+- **RESIDUAL — `fishhawk_doctor` has no not-applicable path for GitLab (#3348).** Its GitHub-only checks have no GitLab branch, so a GitLab deployment sees them as unconditional rather than skipped-as-not-applicable. Tracked in **E45.43 / #3348**.
+
+- **RESIDUAL — merge / auto-merger is GitHub-only (#3464).** The run-completion merge path is not yet wired for the GitLab forge. Tracked in **#3464**.

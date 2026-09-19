@@ -124,6 +124,9 @@ workflows:
               # agent_version: ">=2.1 <2.2"
           human: 1
         inputs:
+          # github_issue names the issue-ANCHORED input, not the forge: it is
+          # the correct value on GitLab too (Run.IsIssueAnchored keys on it; a
+          # GitLab issue trigger mints it). No gitlab_issue member exists.
           - source: github_issue
             required: true
         produces:
