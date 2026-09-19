@@ -241,10 +241,41 @@ The id-set-but-secret-missing case is produced by `validateSecretContract` via
 the derived requiredness above — one message per condition, not two guards
 racing.
 
-**Residual (honest):** the chart makes GitLab **configurable**; a GitLab repo
-still cannot produce a run until an `installations` row exists
-(`gitLabProjectRegistry`, `serve.go`), which has no CLI or API route today — the
-separate onboarding gap #2922 itself flags.
+**Registering the GitLab project** (required): the chart makes GitLab
+**configurable**, but a GitLab repo still cannot produce a run until an
+`installations` row exists (`gitLabProjectRegistry`, `serve.go`) — run creation
+is authorization-gated and fails closed without one. Register it with the
+`fishhawkd` subcommands (E45.33 / #2923; full contract in
+[`docs/deploy/gitlab.md`](../../../docs/deploy/gitlab.md) § "Go-live"):
+
+```sh
+fishhawkd account create \
+  --provider gitlab --account-key <ns> --display-name <display name>
+
+fishhawkd installation register \
+  --provider gitlab --account-key <ns> --installation-ref gitlab:<project-id> \
+  --project-path <ns>/<project>
+```
+
+`--project-path` is **required** for `--provider gitlab` and must be the
+project's `path_with_namespace`. `--db` defaults to `FISHHAWKD_DATABASE_URL`.
+Verify with `fishhawkd installation list --provider gitlab`.
+
+**Kubernetes shape.** The image is distroless with `ENTRYPOINT ["/fishhawkd"]`
+(no shell), so exec the binary directly in any running `fishhawkd` pod, where
+`envFrom` already supplies `FISHHAWKD_DATABASE_URL`:
+
+```sh
+kubectl exec deploy/<release>-fishhawk -- /fishhawkd installation register \
+  --provider gitlab --account-key <ns> --installation-ref gitlab:<project-id> \
+  --project-path <ns>/<project>
+```
+
+On the split `profile: api` deployment shape the workload is
+`deploy/<release>-fishhawk-api` instead. Alternatively run a one-off
+Job/`kubectl run` on the same image, overriding `args` exactly as
+`templates/migrate-job.yaml` does. There is still no HTTP/API route — only
+this direct-DB subcommand.
 
 ## Secrets ([#849](https://github.com/kuhlman-labs/fishhawk/issues/849))
 

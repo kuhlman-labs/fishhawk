@@ -1,10 +1,10 @@
 # backend/internal/forge
 
-Forge-neutral seams (ADR-057/ADR-058): the `CredentialScope` credential seam (#2009, the #1855 split) and the `Forge` interface over a code host's operational surface (#1858 / E45.4). Both are GitHub-only today; both exist so a second forge (GitLab per ADR-058) has a place to land instead of a tree full of `*githubclient.Client` fields.
+Forge-neutral seams (ADR-057/ADR-058): the `CredentialScope` credential seam (#2009, the #1855 split) and the `Forge` interface over a code host's operational surface (#1858 / E45.4). Both are implemented for two forges — GitHub (`githubclient` + `githubapp`) and GitLab (`backend/internal/forge/gitlab`, satisfying `forge.Forge`, `forge.FileFetcher` and `forge.IssueOperations` with compile-time assertions, registered via `resolveGitLabForge` in `backend/cmd/fishhawkd/serve.go`, ADR-058 / E45) — existing so a forge-neutral caller holds a `forge.Forge` instead of a tree full of `*githubclient.Client` fields.
 
 ## What a credential scope is
 
-`CredentialScope` names "which installation to authenticate as" without committing to a specific forge. Its canonical wire form is the `installations.installation_ref` TEXT column (ADR-057/ADR-058): today that's the stringified GitHub App installation id (e.g. `"4242"`, per `docs/ARCHITECTURE.md`'s installations-table contract and `backend/internal/postgres/postgres_test.go`'s `"4242"` round-trip). A future GitLab implementation (ADR-058) stores a different shape of ref in the same column — the type itself carries no forge assumption.
+`CredentialScope` names "which installation to authenticate as" without committing to a specific forge. Its canonical wire form is the `installations.installation_ref` TEXT column (ADR-057/ADR-058): today that's the stringified GitHub App installation id (e.g. `"4242"`, per `docs/ARCHITECTURE.md`'s installations-table contract and `backend/internal/postgres/postgres_test.go`'s `"4242"` round-trip). The GitLab implementation (ADR-058) stores a different shape of ref in the same column — `gitlab:<project_id>`, per `docs/deploy/gitlab.md` — the type itself carries no forge assumption.
 
 ## Construction never validates
 
