@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1065,6 +1066,17 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 	// lossless. The detector is fail-closed — a nil-ish (CommentOnly
 	// false) verdict changes nothing.
 	constraints.CommentOnly = policy.DetectCommentOnlyGo(diff)
+
+	// Permanent ci_green deferral (#3465): a run with NO required-checks
+	// snapshot still defers ci_green (#297), but the post-CI
+	// re-evaluation that would normally resolve that deferral never fires
+	// for it — isRequiredCheck is false for every check on a snapshot-less
+	// run — so the deferral can never clear. Gated on ci_green being a
+	// DECLARED required outcome so every other payload stays byte-identical;
+	// EmitEvaluation surfaces it as `deferred_unresolvable`.
+	if slices.Contains(constraints.RequiredOutcomes, "ci_green") && runRow.RequiredChecksSnapshot == nil {
+		constraints.CIGreenUnresolvable = true
+	}
 
 	// Happy path: real evaluation. EmitEvaluation handles the empty-
 	// constraints case cleanly — Evaluate returns no violations, the

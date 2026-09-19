@@ -186,6 +186,21 @@ type Constraints struct {
 	// NEVER the patch. An untagged field would silently drop the verdict
 	// and flip a satisfied outcome into a violation on re-eval.
 	CommentOnly *CommentOnlySignal `json:"comment_only,omitempty"`
+	// CIGreenUnresolvable is true when the evaluated run carries NO
+	// required-checks snapshot (#3465). ci_green is still DEFERRED per
+	// #297 (no violation, listed in deferred_outcomes), but a nil
+	// snapshot means no later post-CI re-evaluation can ever supply a
+	// signal — isRequiredCheck is false for every incoming check on a
+	// snapshot-less run — so the deferral is PERMANENT, not pending
+	// branch protection. Set at trace-upload time (trace.go) only when
+	// ci_green is a declared required outcome; carried on the payload as
+	// `deferred_unresolvable` via UnresolvableDeferredOutcomes. The
+	// evaluator does not read it: it is an honesty annotation, never a
+	// verdict input. Additive + omitempty, so every payload with the
+	// flag false is byte-identical to before the field existed, and the
+	// json tag round-trips it through the post-CI re-evaluation like its
+	// siblings above.
+	CIGreenUnresolvable bool `json:"ci_green_unresolvable,omitempty"`
 }
 
 // DiffCoverageConfig is the stage's declared `diff_coverage` constraint,
@@ -640,7 +655,8 @@ func verificationNotPassedDetail(v *VerificationSignal) string {
 // Callers persist this list in the policy_evaluated audit payload
 // so reviewers can see which outcomes the policy engine declined
 // to assert on. The SPA renders the list as an info note next to
-// the pass state.
+// the pass state. The subset whose signal can NEVER arrive for this
+// run is named separately by UnresolvableDeferredOutcomes (#3465).
 func DeferredRequiredOutcomes(c Constraints) []string {
 	var out []string
 	for _, o := range c.RequiredOutcomes {
@@ -649,6 +665,28 @@ func DeferredRequiredOutcomes(c Constraints) []string {
 		}
 	}
 	return out
+}
+
+// UnresolvableDeferredOutcomes returns the subset of
+// DeferredRequiredOutcomes whose signal can never arrive for this run
+// (#3465): today exactly [ci_green] when ci_green is deferred AND
+// c.CIGreenUnresolvable is set (the evaluated run carries no
+// required-checks snapshot, so no post-CI re-evaluation will ever
+// fire). Returns nil otherwise — including when ci_green already has a
+// signal, since a resolved outcome is not deferred at all. Callers
+// persist it as `deferred_unresolvable` beside `deferred_outcomes` so
+// a reader can tell a deferral waiting on branch protection from one
+// that is an honest, permanent gap.
+func UnresolvableDeferredOutcomes(c Constraints) []string {
+	if !c.CIGreenUnresolvable {
+		return nil
+	}
+	for _, o := range DeferredRequiredOutcomes(c) {
+		if o == "ci_green" {
+			return []string{"ci_green"}
+		}
+	}
+	return nil
 }
 
 func diffTouchesTests(diff Diff) bool {

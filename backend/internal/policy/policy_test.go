@@ -370,6 +370,60 @@ func TestRequiredOutcomes_CIGreen_NoSignal_Defers(t *testing.T) {
 	}
 }
 
+// TestUnresolvableDeferredOutcomes_Table pins the #3465 asymmetry: the
+// unresolvable list is the deferred list INTERSECTED with the
+// CIGreenUnresolvable flag — never wider than the deferral, and empty
+// whenever ci_green is not deferred at all.
+func TestUnresolvableDeferredOutcomes_Table(t *testing.T) {
+	cases := []struct {
+		name string
+		c    Constraints
+		want []string
+	}{
+		{"ci_green required, nil signal, flagged", Constraints{RequiredOutcomes: []string{"ci_green"}, CIGreenUnresolvable: true}, []string{"ci_green"}},
+		{"ci_green required, nil signal, not flagged", Constraints{RequiredOutcomes: []string{"ci_green"}}, nil},
+		{"ci_green required, false signal, flagged", Constraints{RequiredOutcomes: []string{"ci_green"}, CIGreen: ptrBool(false), CIGreenUnresolvable: true}, nil},
+		{"ci_green not required, flagged", Constraints{RequiredOutcomes: []string{"tests_added_or_updated"}, CIGreenUnresolvable: true}, nil},
+		{"verification_reported only", Constraints{RequiredOutcomes: []string{"verification_reported"}}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := UnresolvableDeferredOutcomes(tc.c)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+			for i, w := range tc.want {
+				if got[i] != w {
+					t.Errorf("got[%d] = %q, want %q", i, got[i], w)
+				}
+			}
+		})
+	}
+}
+
+// TestEvaluate_CIGreenUnresolvableFlag_DoesNotChangeVerdict: the flag is
+// informational (#3465). Flagged and unflagged constraints produce the
+// same violations — none for a deferred ci_green, and the same
+// tests_added_or_updated violation when that outcome is unmet.
+func TestEvaluate_CIGreenUnresolvableFlag_DoesNotChangeVerdict(t *testing.T) {
+	for _, outcomes := range [][]string{
+		{"ci_green"},
+		{"ci_green", "tests_added_or_updated"},
+	} {
+		d := diff("backend/main.go")
+		unflagged := Evaluate(d, Constraints{RequiredOutcomes: outcomes})
+		flagged := Evaluate(d, Constraints{RequiredOutcomes: outcomes, CIGreenUnresolvable: true})
+		if len(flagged) != len(unflagged) {
+			t.Fatalf("outcomes %v: flagged violations %+v, unflagged %+v — the flag must not change the verdict", outcomes, flagged, unflagged)
+		}
+		for i := range flagged {
+			if flagged[i].Constraint != unflagged[i].Constraint || flagged[i].Detail != unflagged[i].Detail {
+				t.Errorf("outcomes %v: violation[%d] flagged %+v != unflagged %+v", outcomes, i, flagged[i], unflagged[i])
+			}
+		}
+	}
+}
+
 func TestDeferredRequiredOutcomes_OnlyDefersCIGreenWhenSignalAbsent(t *testing.T) {
 	// Other outcomes are never deferred: tests_added_or_updated is
 	// always evaluable against the diff at upload time. ci_green

@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
 // categoryDeploymentDispatchFailed records that the delegating deploy stage
@@ -135,6 +136,26 @@ func (s *Server) triggerDeployGitHubActions(ctx context.Context, stage *run.Stag
 	if delegate.WorkflowRef == "" {
 		return s.failDeployTrigger(ctx, stage,
 			"deploy trigger: github_actions delegate is missing workflow_ref", nil)
+	}
+	// A GitLab-created run has no GitHub App installation, so the
+	// github_actions delegate can never dispatch for it (#3465): fail the
+	// stage NAMING the forge-neutral remedy rather than falling into the
+	// generic no-installation_id message. Placed BEFORE the cfg.GitHub ==
+	// nil guard deliberately — on a GitLab-only deployment that guard would
+	// leave the stage parked at `dispatched` forever with no message at
+	// all, and the InstallationID branch below would never be reached.
+	if isGitLabRun(runRow) {
+		installationRef := ""
+		if runRow.InstallationRef != nil {
+			installationRef = *runRow.InstallationRef
+		}
+		return s.failDeployTrigger(ctx, stage,
+			"deploy trigger: the github_actions delegate dispatches workflow_dispatch through a GitHub App installation, and this run was created for GitLab (runner_kind gitlab_ci / installation_ref gitlab:<id>) so it has none; declare executor.delegate.target: webhook — the forge-neutral deploy path — for this workflow's deploy stage (see docs/deploy/gitlab.md 'Deploy stages on GitLab')",
+			map[string]any{
+				"runner_kind":      runRow.RunnerKind,
+				"installation_ref": installationRef,
+				"remedy":           "executor.delegate.target: webhook",
+			})
 	}
 	if s.cfg.GitHub == nil {
 		// Un-wired/demo backend — mirror orchestrator.dispatchViaWorkflow: WARN
@@ -290,6 +311,16 @@ func (s *Server) recordDispatchAndPark(ctx context.Context, stage *run.Stage, pa
 		return stage, fmt.Errorf("deploy trigger: running → awaiting_deployment: %w", err)
 	}
 	return parked, nil
+}
+
+// isGitLabRun reports whether the run was created for GitLab (#3465). It is a
+// thin wrapper over the existing runForge classifier (issue_approval.go:
+// RunnerKind gitlab_ci wins, else the installation_ref scheme — a `gitlab:`
+// ref is GitLab; nil, empty and bare-decimal refs are GitHub) so the deploy
+// trigger and the issue-approval path classify a run's forge IDENTICALLY
+// rather than each re-deriving it. A nil run is not a GitLab run.
+func isGitLabRun(r *run.Run) bool {
+	return r != nil && runForge(r) == webhook.ForgeGitLab
 }
 
 // failDeployTrigger writes a deployment_dispatch_failed audit (system actor) and

@@ -1780,6 +1780,9 @@ func toStringSlice(v any) []string {
 // canned states keyed by (stage_id, check_name).
 type fakeStageCheckRepo struct {
 	byKey map[string]*stagecheck.Check
+	// latestErr, when set, is returned by LatestForStage so the deploy
+	// gate's stage_check_read_failed branch (#3465) is reachable.
+	latestErr error
 }
 
 func newFakeStageCheckRepo() *fakeStageCheckRepo {
@@ -1808,6 +1811,9 @@ func (f *fakeStageCheckRepo) Append(context.Context, stagecheck.AppendParams) (*
 	return nil, errors.New("not used")
 }
 func (f *fakeStageCheckRepo) LatestForStage(_ context.Context, stageID uuid.UUID) ([]*stagecheck.Check, error) {
+	if f.latestErr != nil {
+		return nil, f.latestErr
+	}
 	var out []*stagecheck.Check
 	for _, c := range f.byKey {
 		if c.StageID == stageID {
@@ -6022,6 +6028,304 @@ func TestDeployCIGreen_NilSnapshot_NotSatisfied(t *testing.T) {
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+}
+
+// decodeDeployRefusal reads the 422 body's message and details map so the
+// per-branch deploy verdict tests (#3465) can assert on WHICH branch refused.
+func decodeDeployRefusal(t *testing.T, w *httptest.ResponseRecorder) (string, map[string]any) {
+	t.Helper()
+	body := decodeErrorEnvelope(t, w)
+	return body.Message, body.Details
+}
+
+// seedGreenCheck records a completed/success check for name on stageID.
+func seedGreenCheck(scs *fakeStageCheckRepo, stageID uuid.UUID, name string) {
+	success := "success"
+	scs.byKey[scs.keyFor(stageID, name)] = &stagecheck.Check{
+		StageID: stageID, Name: name, Status: "completed", Conclusion: &success,
+	}
+}
+
+// seedFailedCheck records a completed/failure check for name on stageID.
+func seedFailedCheck(scs *fakeStageCheckRepo, stageID uuid.UUID, name string) {
+	failure := "failure"
+	scs.byKey[scs.keyFor(stageID, name)] = &stagecheck.Check{
+		StageID: stageID, Name: name, Status: "completed", Conclusion: &failure,
+	}
+}
+
+// stringsOf converts a decoded JSON []any of strings into []string.
+func stringsOf(t *testing.T, v any) []string {
+	t.Helper()
+	raw, ok := v.([]any)
+	if !ok {
+		t.Fatalf("details list = %T (%v), want []any", v, v)
+	}
+	out := make([]string, 0, len(raw))
+	for _, e := range raw {
+		out = append(out, fmt.Sprint(e))
+	}
+	return out
+}
+
+// Branch (1): upstream_run_id SET but unresolvable → the verdict names
+// upstream_unresolvable and keeps required_upstream (#3465).
+func TestDeployCIGreen_UpstreamUnresolvable_Verdict(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	s.cfg.StageCheckRepo = newFakeStageCheckRepo()
+	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	missing := uuid.New()
+	deployRun.UpstreamRunID = &missing
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+	msg, details := decodeDeployRefusal(t, w)
+	if !strings.Contains(msg, "could not be resolved") {
+		t.Errorf("message = %q, want it to name the unresolvable upstream", msg)
+	}
+	if details["branch"] != "upstream_unresolvable" {
+		t.Errorf("details.branch = %v, want upstream_unresolvable", details["branch"])
+	}
+	if details["required_upstream"] != "ci_green" {
+		t.Errorf("details.required_upstream = %v, want ci_green", details["required_upstream"])
+	}
+}
+
+// Branch (2): a NIL snapshot with a GREEN implement-stage check seeded by
+// construction → the message names the missing snapshot and #3490, and the
+// details discriminate snapshot_absent. This is the counterfactual vehicle
+// for the nil-snapshot branch: with it deleted the verdict falls through to
+// contexts_pending (aggregateCIGreen nil), which this test rejects.
+func TestDeployCIGreen_NilSnapshot_MessageNamesMissingSnapshot(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	runRow.RequiredChecksSnapshot = nil
+	implStage := rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	seedGreenCheck(scs, implStage.ID, "ci/build")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+	msg, details := decodeDeployRefusal(t, w)
+	if !strings.Contains(msg, "no required-checks snapshot") {
+		t.Errorf("message = %q, want it to name the missing snapshot", msg)
+	}
+	if !strings.Contains(msg, "#3490") {
+		t.Errorf("message = %q, want it to point at #3490", msg)
+	}
+	if details["branch"] != "snapshot_absent" {
+		t.Errorf("details.branch = %v, want snapshot_absent", details["branch"])
+	}
+	if details["snapshot_present"] != false {
+		t.Errorf("details.snapshot_present = %v, want false", details["snapshot_present"])
+	}
+	if details["evaluated_run_id"] != runRow.ID.String() {
+		t.Errorf("details.evaluated_run_id = %v, want %s", details["evaluated_run_id"], runRow.ID)
+	}
+	if details["required_upstream"] != "ci_green" {
+		t.Errorf("details.required_upstream = %v, want ci_green", details["required_upstream"])
+	}
+}
+
+// Branch (3): snapshot PRESENT (so the nil-snapshot branch cannot mask it)
+// but StageCheckRepo unwired → stage_checks_unavailable.
+func TestDeployCIGreen_StageCheckRepoUnwired_Verdict(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	s.cfg.StageCheckRepo = nil
+	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
+	rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+	msg, details := decodeDeployRefusal(t, w)
+	if !strings.Contains(msg, "stage-check store is not wired") {
+		t.Errorf("message = %q, want it to name the unwired stage-check store", msg)
+	}
+	if details["branch"] != "stage_checks_unavailable" {
+		t.Errorf("details.branch = %v, want stage_checks_unavailable", details["branch"])
+	}
+}
+
+// Branch (4): snapshot present, repo wired, but NO implement stage →
+// no_implement_stage naming the evaluated run.
+func TestDeployCIGreen_NoImplementStage_Verdict(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	s.cfg.StageCheckRepo = newFakeStageCheckRepo()
+	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+	msg, details := decodeDeployRefusal(t, w)
+	if !strings.Contains(msg, "has no implement stage") {
+		t.Errorf("message = %q, want it to name the missing implement stage", msg)
+	}
+	if details["branch"] != "no_implement_stage" {
+		t.Errorf("details.branch = %v, want no_implement_stage", details["branch"])
+	}
+	if details["evaluated_run_id"] != runRow.ID.String() {
+		t.Errorf("details.evaluated_run_id = %v, want %s", details["evaluated_run_id"], runRow.ID)
+	}
+}
+
+// Branch (5): LatestForStage errors → stage_check_read_failed, and the
+// error text stays in the server log, NOT in the 422 body.
+func TestDeployCIGreen_CheckReadError_Verdict(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	scs.latestErr = errors.New("pgconn: connection reset by SECRET-HOST")
+	s.cfg.StageCheckRepo = scs
+	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
+	rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+	msg, details := decodeDeployRefusal(t, w)
+	if !strings.Contains(msg, "checks failed") {
+		t.Errorf("message = %q, want it to name the failed check read", msg)
+	}
+	if details["branch"] != "stage_check_read_failed" {
+		t.Errorf("details.branch = %v, want stage_check_read_failed", details["branch"])
+	}
+	if strings.Contains(w.Body.String(), "SECRET-HOST") {
+		t.Errorf("422 body echoes the repository error text:\n%s", w.Body.String())
+	}
+}
+
+// Branch (7): two required contexts, only one green → contexts_pending
+// naming exactly the unreported one.
+func TestDeployCIGreen_Pending_MessageNamesContexts(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build", "ci/lint"}}
+	implStage := rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	seedGreenCheck(scs, implStage.ID, "ci/build")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+	msg, details := decodeDeployRefusal(t, w)
+	if !strings.Contains(msg, "ci/lint") || strings.Contains(msg, "ci/build") {
+		t.Errorf("message = %q, want it to name ci/lint and not ci/build", msg)
+	}
+	if details["branch"] != "contexts_pending" {
+		t.Errorf("details.branch = %v, want contexts_pending", details["branch"])
+	}
+	if details["snapshot_present"] != true {
+		t.Errorf("details.snapshot_present = %v, want true", details["snapshot_present"])
+	}
+	if got := stringsOf(t, details["pending_contexts"]); !reflect.DeepEqual(got, []string{"ci/lint"}) {
+		t.Errorf("pending_contexts = %v, want [ci/lint]", got)
+	}
+	if _, has := details["failed_contexts"]; has {
+		t.Errorf("failed_contexts present on a pending verdict: %v", details["failed_contexts"])
+	}
+}
+
+// Branch (6): a failed required context → contexts_failed naming it.
+func TestDeployCIGreen_Failed_MessageNamesContexts(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build", "ci/lint"}}
+	implStage := rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	seedFailedCheck(scs, implStage.ID, "ci/build")
+	seedGreenCheck(scs, implStage.ID, "ci/lint")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+	msg, details := decodeDeployRefusal(t, w)
+	if !strings.Contains(msg, "ci/build") || !strings.Contains(msg, "reported failure") {
+		t.Errorf("message = %q, want it to name ci/build as failed", msg)
+	}
+	if details["branch"] != "contexts_failed" {
+		t.Errorf("details.branch = %v, want contexts_failed", details["branch"])
+	}
+	if got := stringsOf(t, details["failed_contexts"]); !reflect.DeepEqual(got, []string{"ci/build"}) {
+		t.Errorf("failed_contexts = %v, want [ci/build]", got)
+	}
+}
+
+// fishhawk_audit_complete is excluded from BOTH buckets, exactly as
+// aggregateCIGreen excludes it (#229 / #231): a snapshot listing only it plus
+// one green context is satisfied, and one listing it plus an unreported
+// context names only the unreported one.
+func TestDeployCIGreen_AuditCompleteExcludedFromBuckets(t *testing.T) {
+	implID := uuid.New()
+	green := &stagecheck.Check{StageID: implID, Name: "ci/build", Status: "completed", Conclusion: ptrString("success")}
+
+	snap := &run.RequiredChecksSnapshot{Contexts: []string{auditCompleteCheckName, "ci/build"}}
+	pending, failed := requiredCheckBuckets(snap, []*stagecheck.Check{green})
+	if len(pending) != 0 || len(failed) != 0 {
+		t.Errorf("buckets = pending %v failed %v, want both empty (audit-complete excluded)", pending, failed)
+	}
+
+	snap = &run.RequiredChecksSnapshot{Contexts: []string{auditCompleteCheckName, "ci/lint"}}
+	pending, failed = requiredCheckBuckets(snap, nil)
+	if !reflect.DeepEqual(pending, []string{"ci/lint"}) || len(failed) != 0 {
+		t.Errorf("buckets = pending %v failed %v, want pending [ci/lint] only", pending, failed)
+	}
+}
+
+// TestRequiredCheckBuckets_AgreesWithAggregate pins that the naming helper
+// mirrors aggregateCIGreen's walk: aggregate true ⇔ both buckets empty; nil
+// ⇔ pending non-empty and failed empty; false ⇔ failed non-empty. A drift in
+// either walk reddens a row here.
+func TestRequiredCheckBuckets_AgreesWithAggregate(t *testing.T) {
+	implID := uuid.New()
+	mk := func(name, status string, conclusion *string) *stagecheck.Check {
+		return &stagecheck.Check{StageID: implID, Name: name, Status: status, Conclusion: conclusion}
+	}
+	success, failure := "success", "failure"
+	cases := []struct {
+		name        string
+		snap        *run.RequiredChecksSnapshot
+		checks      []*stagecheck.Check
+		wantPending []string
+		wantFailed  []string
+	}{
+		{"nil snapshot", nil, []*stagecheck.Check{mk("ci/build", "completed", &success)}, nil, nil},
+		{"all green", &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}},
+			[]*stagecheck.Check{mk("ci/build", "completed", &success)}, nil, nil},
+		{"unreported", &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}, nil, []string{"ci/build"}, nil},
+		{"in progress", &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}},
+			[]*stagecheck.Check{mk("ci/build", "in_progress", nil)}, []string{"ci/build"}, nil},
+		{"one failed one pending", &run.RequiredChecksSnapshot{Contexts: []string{"ci/build", "ci/lint"}},
+			[]*stagecheck.Check{mk("ci/build", "completed", &failure)}, []string{"ci/lint"}, []string{"ci/build"}},
+		{"audit-complete only", &run.RequiredChecksSnapshot{Contexts: []string{auditCompleteCheckName}}, nil, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pending, failed := requiredCheckBuckets(tc.snap, tc.checks)
+			if !reflect.DeepEqual(pending, tc.wantPending) || !reflect.DeepEqual(failed, tc.wantFailed) {
+				t.Fatalf("buckets = pending %v failed %v, want pending %v failed %v", pending, failed, tc.wantPending, tc.wantFailed)
+			}
+			g := aggregateCIGreen(tc.snap, tc.checks)
+			switch {
+			case tc.snap == nil:
+				if g != nil {
+					t.Errorf("aggregate = %v on a nil snapshot, want nil", *g)
+				}
+			case len(failed) > 0:
+				if g == nil || *g {
+					t.Errorf("aggregate = %v with failed %v, want false", g, failed)
+				}
+			case len(pending) > 0:
+				if g != nil {
+					t.Errorf("aggregate = %v with pending %v, want nil", *g, pending)
+				}
+			default:
+				if g == nil || !*g {
+					t.Errorf("aggregate = %v with empty buckets, want true", g)
+				}
+			}
+		})
+	}
 }
 
 // seedUpstreamRun points a deploy run's UpstreamRunID at a freshly-seeded

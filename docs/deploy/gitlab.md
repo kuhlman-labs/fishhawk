@@ -205,6 +205,37 @@ A failed **Pipeline Hook** triggers the auto-retry when its `ref` matches a run'
 - **Every other non-retry is also named** in a `ci_retry_skipped` audit row: `no_candidate_run_owns_pipeline_ref`, `pipeline_sha_does_not_match_run_head_sha`, `run_head_sha_lookup_failed`, `run_lineage_cancelled`, `retry_policy_unresolvable_from_cached_spec`, `gitlab_pipeline_trigger_unconfigured`, `run_has_no_credential_scope`. Query them with `GET /v0/runs/{run_id}/audit?category=ci_retry_skipped`.
 - **Two of those reasons are yours to fix**, and each names a different remedy. `gitlab_pipeline_trigger_unconfigured` means the deployment has no GitLab pipeline trigger wired at all — configure the GitLab forge credentials. `run_has_no_credential_scope` means THAT run row carries no `installation_ref`, so no credential scope can be resolved for it — backfill the row's `installation_ref` (the shape a run minted before migration `0076` and missed by its backfill carries). Until then Fishhawk refuses the retry outright rather than marking a stage `dispatched` with no pipeline behind it.
 
+## Deploy stages on GitLab
+
+A deploy stage on a GitLab-created run must use the **`webhook`** delegate. The `github_actions` delegate dispatches `workflow_dispatch` through a GitHub App installation, and a GitLab run (`runner_kind: gitlab_ci`, or `installation_ref: gitlab:<project_id>`) has none — so `backend/internal/server/deploy_trigger.go` fails the stage at trigger time (category C) instead of parking it, with a `deployment_dispatch_failed` audit row whose `reason` names the fix and whose payload carries `runner_kind`, `installation_ref` and `remedy: "executor.delegate.target: webhook"` (#3465). The check runs BEFORE the deployment's GitHub-client guard, so a GitLab-only backend with no GitHub client configured fails loud rather than leaving the stage at `dispatched` forever.
+
+**Keep the deploy credential OUT of `url`.** The webhook delegate has no secret mechanism: the spec is repository content with no environment or variable substitution (`$NAME` in `url` is sent literally, not expanded), the POST carries no authentication header, and `triggerDeployWebhook` persists `delegate.url` VERBATIM into the `deployment_dispatched` audit payload and every `deployment_dispatch_failed` payload — so a GitLab pipeline trigger token pasted into the URL (`/projects/:id/trigger/pipeline?token=…`) would land in source history, in the persisted workflow spec, and in every audit row and proxy/access log that records the URL. Point `url` at a deploy endpoint you operate that holds the trigger token server-side (a CI/CD variable, a secret in the relay's own environment) and calls `POST /projects/:id/trigger/pipeline` itself, authenticating Fishhawk's caller by network placement, mTLS or a source-IP allow-list rather than by anything in the spec. Minimal shape:
+
+```yaml
+stages:
+  - id: deploy
+    type: deploy
+    executor:
+      delegate:
+        target: webhook
+        url: https://deploy-relay.example.internal/fishhawk/deploy   # your relay; it holds the GitLab trigger token, never this spec
+    gates:
+      - type: approval
+        approvers:
+          any_of: [release_managers]
+```
+
+The webhook POST body is `{fishhawk_run_id, fishhawk_stage_id, repo, workflow_id}`. A webhook target has no GitHub Actions run to poll, so the deploy stage reaches its terminal state only when your pipeline calls back into `POST /v0/runs/{run_id}/deployment` with the outcome (`backend/internal/deployreconciler/README.md`) — wire that call into the pipeline the webhook triggers.
+
+## `ci_green` on GitLab today
+
+Two surfaces read the run's **required-checks snapshot** (`runs.required_checks_snapshot`), and a GitLab run never receives one — only the GitHub webhook run-creation path captures it (the GitLab pipeline→`stage_checks` ingester and snapshot are tracked in **E45.55 / #3490**). What that means, honestly:
+
+- **`constraints: [required_upstream: [ci_green]]` on a deploy stage cannot clear on a GitLab run.** The pre-flight approval gate refuses `422 deploy_upstream_not_satisfied` with `details.branch: snapshot_absent`, `snapshot_present: false` and the evaluated run id; the message states that retrying will not change the verdict until the run carries a snapshot and points at #3490. Every other refusing branch (`upstream_unresolvable`, `stage_checks_unavailable`, `no_implement_stage`, `stage_check_read_failed`, `contexts_failed`, `contexts_pending`) is likewise named in `details.branch`, so a GitLab operator can tell the permanent case from a transient one. Until #3490 lands, do not declare `required_upstream: [ci_green]` on a GitLab deploy stage — use the approval gate (and `review_merged`, which reads the PR/MR url plus a succeeded review stage) instead. Full branch table: `backend/internal/server/README.md` § "Deploy gate `ci_green` verdict".
+- **`constraints: [required_outcomes: [ci_green]]` on an implement stage passes VACUOUSLY on a GitLab run, and the pass is now labelled permanent.** The policy engine defers `ci_green` when no CI signal exists at trace-upload time (#297, `deferred_outcomes: [ci_green]`); on GitHub the post-CI re-evaluation later supplies the signal, but that re-evaluation keys on the snapshot and never fires for a snapshot-less run. The `policy_evaluated` audit payload therefore also carries `deferred_unresolvable: [ci_green]` and `applied_constraints.ci_green_unresolvable: true` (#3465) — read it as "this outcome was not asserted and nothing downstream will assert it". Contract: `backend/internal/policy/README.md` § "Permanent `ci_green` deferral".
+- **The deploy gate reads checks from the evaluated run's IMPLEMENT stage.** Moving the reader to the review stage (where GitHub's `ingestCheckRun` records rows) is **E68.67 / #3489**, independent of the GitLab gap.
+- **RESIDUAL — no GitLab pipeline→`stage_checks` ingester or required-checks snapshot (#3490).** Until it lands, `ci_green` is a GitHub-only signal on both surfaces above; the refusals and the `deferred_unresolvable` label are what make that visible rather than silent. Tracked in **E45.55 / #3490**.
+
 ## What is GitHub-only today
 
 The workflow-spec issue trigger and the issue-content prompt path are forge-neutral; a handful of surrounding entry points and side effects are still GitHub-only. Each item names its code site and its open tracking issue so the follow-up doc sweep (#3467) can retire the line when the fix lands.
