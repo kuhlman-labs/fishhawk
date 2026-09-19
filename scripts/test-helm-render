@@ -1264,16 +1264,20 @@ assert_render_ok "r14a GitHub-only ConfigMap renders"
 for glk in FISHHAWKD_GITLAB_BASE_URL FISHHAWKD_GITLAB_OAUTH_CLIENT_ID FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL FISHHAWKD_GITLAB_DEVICE_CLIENT_ID FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST; do
   assert_field_absent "r14a GitHub-only ConfigMap omits $glk" "$out" "$glk"
 done
-# `helm template` (no --show-only) renders EVERY manifest template, including
-# externalsecret.yaml, but NOT NOTES.txt — `helm template` never emits NOTES.txt
-# and --show-only cannot select it (see the r9 header comment + notes() helper
-# above). So this whole-render pass covers every rendered MANIFEST, honestly
-# stated as such, and is deliberately NOT a --show-only templates/secret.yaml
-# render: that form is blind to any other template (e.g. externalsecret.yaml)
-# that could leak a GitLab key without this case noticing.
+# `helm template` (no --show-only) renders EVERY manifest template that is
+# ACTIVE for these values, but NOT NOTES.txt — `helm template` never emits
+# NOTES.txt and --show-only cannot select it (see the r9 header comment +
+# notes() helper above). values-local runs secrets.mode: chartManaged, under
+# which templates/externalsecret.yaml's own `{{- if eq .Values.secrets.mode
+# "externalSecrets" }}` guard means it does NOT render here — so this pass
+# covers every manifest template THAT RENDERS UNDER VALUES-LOCAL, honestly
+# stated as such (not "every manifest template" unconditionally), and is
+# deliberately NOT a --show-only templates/secret.yaml render: that form is
+# blind to any OTHER active template (e.g. configmap.yaml) that could leak a
+# GitLab key without this case noticing.
 render -f "$CHART/values-local.yaml"
-assert_render_ok "r14a GitHub-only WHOLE render (all manifests) renders"
-assert_absent "r14a GitHub-only WHOLE render carries no FISHHAWKD_GITLAB occurrence in any manifest" "$out" "FISHHAWKD_GITLAB"
+assert_render_ok "r14a GitHub-only WHOLE render (active manifests) renders"
+assert_absent "r14a GitHub-only WHOLE render carries no FISHHAWKD_GITLAB occurrence in any active manifest" "$out" "FISHHAWKD_GITLAB"
 # NOTES.txt is a SEPARATE render path (helm install --dry-run via the notes()
 # helper) and is not covered by the whole-render assertion above at all, so it
 # gets its own explicit pass over the same GitHub-only values.
