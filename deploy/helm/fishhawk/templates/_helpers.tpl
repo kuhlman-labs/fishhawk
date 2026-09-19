@@ -794,12 +794,12 @@ message names the offending key and the way out.
 {{- end -}}
 {{- /*
      Suffix guard. The $secretKeys deny-list above only covers keys the chart
-     ALREADY KNOWS, but config.extraEnv exists precisely for keys it does not —
-     so that list is structurally the wrong population. The concrete case is the
-     GitLab family (#2922): the chart has no field for FISHHAWKD_GITLAB_*, which
-     routes an operator straight to this escape hatch with a client secret in
-     hand. Refuse anything secret-SHAPED as well, so an unmapped credential
-     fails loudly instead of landing in a world-readable ConfigMap.
+     ALREADY KNOWS — including the FISHHAWKD_GITLAB_* family, mapped via the
+     gitlab: values block (configmap.yaml) and fishhawk.secretKeySpec (#2922) —
+     but config.extraEnv exists precisely for keys the chart does NOT map yet.
+     A future forge or provider credential the chart hasn't learned about would
+     land here first, so refuse anything secret-SHAPED regardless of family
+     instead of trusting the deny-list's coverage to stay complete.
 
      Bare "_KEY" is deliberately NOT in this list: it false-positives on ordinary
      non-secret names such as a partition or sort key. "_PRIVATE_KEY" and

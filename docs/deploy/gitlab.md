@@ -9,11 +9,14 @@ composite action, the Fishhawk backend triggers a **pipeline** via the GitLab
 pipelines API and the pipeline invokes the published, backend-agnostic
 `fishhawk-runner` against the GitLab forge (`--forge=gitlab`).
 
-> **Status — plumbing only (ADR-058 / #1861).** The `gitlab_ci` runner backend
-> is dormant: no `gitlab_ci` run is created yet, so this template is exercised
-> only by unit/wire tests. Go-live enablement (run creation, image publishing,
-> credential wiring) is tracked in **#2043**. The steps below describe the
-> intended operator path once enablement lands.
+> **Status — live (ADR-058 / #1861).** GitLab run creation is live via the
+> GitLab webhook receiver (E45.22 / #2043, closed) —
+> `backend/internal/webhook/gitlab_dispatch.go` creates `gitlab_ci` runs, and
+> this template is what those runs execute. Setup is in "## Go-live:
+> GitLab-triggered runs" below. The MCP/CLI operator-verb path
+> (`fishhawk_start_run forge=gitlab` / `fishhawk run start --forge gitlab`) is
+> also live and can create and drive a GitLab run with a local runner
+> (E45.46 / #3463, closed).
 
 ## What the template does
 
@@ -283,9 +286,9 @@ The workflow-spec issue trigger, the issue-content prompt path and (since #3463)
   }
   ```
 
-- **RESIDUAL — issue-comment persistence is skipped on GitLab (#3346).** A GitLab-created run carries `InstallationID` nil (`backend/internal/webhook/gitlab_dispatch.go` step 4 sets the credential reference but leaves `InstallationID` nil, because a GitLab project has no GitHub installation id), and every `backend/internal/issuecomment` notifier path gates on `InstallationID == nil`. So `persistence.target: originating_issue` (the plan `rendered_comment`) and the status/approval comments are silently skipped on GitLab. Tracked in **E45.41 / #3346**.
+- **RESIDUAL — issue-comment persistence is still skipped on GitLab (E45.52 / #3481).** The GitHub anchor half landed under E45.41 / #3346 (closed). A GitLab-created run carries `InstallationID` nil (`backend/internal/webhook/gitlab_dispatch.go` step 4 sets the credential reference but leaves `InstallationID` nil, because a GitLab project has no GitHub installation id), and every `backend/internal/issuecomment` notifier path gates on `InstallationID == nil`. So `persistence.target: originating_issue` (the plan `rendered_comment`) and the status/approval comments are silently skipped on GitLab until the notifier routes through `forge.IssueOperations`. Tracked in **E45.52 / #3481**.
 
-- **RESIDUAL — `fishhawk_doctor` has no not-applicable path for GitLab (#3348).** Its GitHub-only checks have no GitLab branch, so a GitLab deployment sees them as unconditional rather than skipped-as-not-applicable. Tracked in **E45.43 / #3348**.
+- **RETIRED — `fishhawk_doctor` now has a not-applicable path for GitLab (E45.43 / #3348, closed).** Its GitHub-only checks skip as not-applicable on a GitLab deployment instead of running unconditionally.
 
 - **Merge, merge reconciler and implement review are forge-resolved (E45.47 / #3464).** The run-completion merge seam (`POST /v0/runs/{run_id}/merge` and the delegated `may_merge`), the merge-status reconciler poll, and the four implement-review diff sites (consolidated review, post-fix-up re-review, fix-up delta, cumulative evaluation) all resolve by forge family, so a GitLab run reaches `awaiting_merge` and merges (`merge_when_pipeline_succeeds`, squash). The merge reconciler is off by default (`--enable-merge-reconciler`) and now starts on a GitLab-only deployment. Named residuals that remain:
   - A conflicting GitLab MR is not classified — `prMergeConflicting` fails OPEN, so a conflict falls through to the merge queue rather than a `409 merge_conflicting` (the `forge.PullRequest` mergeability fields are zero on the GitLab adapter).
