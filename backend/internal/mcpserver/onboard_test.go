@@ -17,21 +17,23 @@ import (
 // --- fishhawk_doctor (E29.6 / #1506) ---
 
 // doctorFakeBackend is a self-contained backend stub for the doctor tool: it
-// serves only GET /v0/onboarding/readiness. lastRepo captures the last repo
-// query so tests assert the env fallback; status drives the HTTP status
+// serves only GET /v0/onboarding/readiness. lastRepo / lastForge capture the
+// last repo and forge query values so tests assert the env fallbacks and the
+// forge passthrough (E45.43 / #3348); status drives the HTTP status
 // (default 200); errBody, when set, is written verbatim for the error-path
 // tests; rawBody, when set, is written verbatim as a 200 body so a test can
 // serve a payload the Go struct cannot express (a response that OMITS
 // merge_gate, as a pre-#3161 fishhawkd does); resp overrides the default
 // echoed report.
 type doctorFakeBackend struct {
-	mu       sync.Mutex
-	lastRepo string
-	calls    int
-	status   int
-	errBody  string
-	rawBody  string
-	resp     *OnboardingReadinessReport
+	mu        sync.Mutex
+	lastRepo  string
+	lastForge string
+	calls     int
+	status    int
+	errBody   string
+	rawBody   string
+	resp      *OnboardingReadinessReport
 }
 
 func newDoctorFakeBackend(t *testing.T) (*doctorFakeBackend, *httptest.Server) {
@@ -42,6 +44,7 @@ func newDoctorFakeBackend(t *testing.T) (*doctorFakeBackend, *httptest.Server) {
 		fb.mu.Lock()
 		fb.calls++
 		fb.lastRepo = r.URL.Query().Get("repo")
+		fb.lastForge = r.URL.Query().Get("forge")
 		status := fb.status
 		errBody := fb.errBody
 		rawBody := fb.rawBody
@@ -116,6 +119,85 @@ func TestDoctor_RepoFromEnv(t *testing.T) {
 	}
 	if fb.lastRepo != "kuhlman-labs/fishhawk" {
 		t.Errorf("query repo = %q, want env fallback", fb.lastRepo)
+	}
+	if fb.lastForge != "" {
+		t.Errorf("query forge = %q, want empty (GITHUB_REPOSITORY implies no forge default)", fb.lastForge)
+	}
+}
+
+// TestDoctor_ForgePassthrough: an explicit forge input and a nested GitLab
+// path reach the backend query untouched (E45.43 / #3348).
+func TestDoctor_ForgePassthrough(t *testing.T) {
+	fb, srv := newDoctorFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	const nested = "gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator"
+	_, _, err := r.doctor(context.Background(), nil, DoctorInput{Repo: nested, Forge: "gitlab"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if fb.lastRepo != nested {
+		t.Errorf("query repo = %q, want the nested path untouched", fb.lastRepo)
+	}
+	if fb.lastForge != "gitlab" {
+		t.Errorf("query forge = %q, want gitlab", fb.lastForge)
+	}
+}
+
+// TestDoctor_RepoFromCIProjectPath: with only GitLab CI's CI_PROJECT_PATH set,
+// the repo comes from it AND forge defaults to gitlab.
+func TestDoctor_RepoFromCIProjectPath(t *testing.T) {
+	fb, srv := newDoctorFakeBackend(t)
+	r := newResolver(srv, map[string]string{"CI_PROJECT_PATH": "acme/platform/widgets"})
+
+	_, _, err := r.doctor(context.Background(), nil, DoctorInput{})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if fb.lastRepo != "acme/platform/widgets" {
+		t.Errorf("query repo = %q, want CI_PROJECT_PATH fallback", fb.lastRepo)
+	}
+	if fb.lastForge != "gitlab" {
+		t.Errorf("query forge = %q, want gitlab (CI_PROJECT_PATH supplied the repo)", fb.lastForge)
+	}
+}
+
+// TestDoctor_GitHubRepositoryOutranksCIProjectPath: both env vars set →
+// GITHUB_REPOSITORY wins and no forge default is applied.
+func TestDoctor_GitHubRepositoryOutranksCIProjectPath(t *testing.T) {
+	fb, srv := newDoctorFakeBackend(t)
+	r := newResolver(srv, map[string]string{
+		"GITHUB_REPOSITORY": "kuhlman-labs/fishhawk",
+		"CI_PROJECT_PATH":   "acme/platform/widgets",
+	})
+
+	_, _, err := r.doctor(context.Background(), nil, DoctorInput{})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if fb.lastRepo != "kuhlman-labs/fishhawk" {
+		t.Errorf("query repo = %q, want GITHUB_REPOSITORY to outrank CI_PROJECT_PATH", fb.lastRepo)
+	}
+	if fb.lastForge != "" {
+		t.Errorf("query forge = %q, want empty", fb.lastForge)
+	}
+}
+
+// TestDoctor_ForgeInputOverridesEnvDefault: CI_PROJECT_PATH supplies the repo
+// but an explicit forge:github input outranks the gitlab env default.
+func TestDoctor_ForgeInputOverridesEnvDefault(t *testing.T) {
+	fb, srv := newDoctorFakeBackend(t)
+	r := newResolver(srv, map[string]string{"CI_PROJECT_PATH": "acme/widgets"})
+
+	_, _, err := r.doctor(context.Background(), nil, DoctorInput{Forge: "github"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if fb.lastRepo != "acme/widgets" {
+		t.Errorf("query repo = %q, want CI_PROJECT_PATH fallback", fb.lastRepo)
+	}
+	if fb.lastForge != "github" {
+		t.Errorf("query forge = %q, want github (explicit input outranks the env default)", fb.lastForge)
 	}
 }
 
@@ -505,5 +587,92 @@ func TestDoctorToolDescription_DescribesMergeGate(t *testing.T) {
 	}
 	if strings.Contains(desc, "returns four server-side-only checks") {
 		t.Errorf("fishhawk_doctor description still says four checks")
+	}
+}
+
+// gitlabReadinessBody is a literal gitlab-family backend body (E45.43 /
+// #3348): it carries forge, app.note, NO installation_id and NO merge_gate.
+const gitlabReadinessBody = `{
+  "repo": "gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator",
+  "forge": "gitlab",
+  "app": {"installed": true, "note": "gitlab: project resolvable with the deployment credential; no App installation applies on GitLab"},
+  "spec": {"source": "fetched", "valid": true},
+  "reviewers": [{"provider": "anthropic", "model": "claude-opus-4-8", "available": true}],
+  "scopes": {"adequate": true, "required": ["read:runs"], "missing": []}
+}`
+
+// TestOnboardingReadinessReport_GitLabBodyMirrorsBackendTags decodes the
+// literal gitlab-family body and asserts the two new fields land (a tag typo
+// on either side zero-values one) and MergeGate stays nil.
+func TestOnboardingReadinessReport_GitLabBodyMirrorsBackendTags(t *testing.T) {
+	var got OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(gitlabReadinessBody), &got); err != nil {
+		t.Fatalf("decode backend body: %v", err)
+	}
+	if got.Forge != "gitlab" {
+		t.Errorf("Forge = %q, want gitlab", got.Forge)
+	}
+	if !got.App.Installed || got.App.InstallationID != 0 {
+		t.Errorf("App = %+v, want installed with no installation id", got.App)
+	}
+	if !strings.HasPrefix(got.App.Note, "gitlab: project resolvable") {
+		t.Errorf("App.Note = %q, want the gitlab note", got.App.Note)
+	}
+	if got.MergeGate != nil {
+		t.Errorf("MergeGate = %+v, want nil on a gitlab-family body", *got.MergeGate)
+	}
+}
+
+// TestDoctor_GitLabReport_ReemitsForgeAndNoteAndNoMergeGate walks the whole
+// tool path against the gitlab-family body and asserts the RE-EMITTED WIRE
+// BYTES carry "forge":"gitlab" and "note", and NO merge_gate key — the
+// deliberate omission on GitLab must survive the mirror exactly as the
+// pre-#3161 absence does (TestDoctor_MergeGateAbsent_PreservesAbsence).
+func TestDoctor_GitLabReport_ReemitsForgeAndNoteAndNoMergeGate(t *testing.T) {
+	fb, srv := newDoctorFakeBackend(t)
+	fb.rawBody = gitlabReadinessBody
+	r := newResolver(srv, nil)
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{
+		Repo: "gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator", Forge: "gitlab"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if !out.Report.App.Installed {
+		t.Fatalf("report did not decode: %+v", out.Report)
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal DoctorOutput: %v", err)
+	}
+	body := string(encoded)
+	if !strings.Contains(body, `"forge":"gitlab"`) {
+		t.Errorf("DoctorOutput lacks \"forge\":\"gitlab\":\n%s", body)
+	}
+	if !strings.Contains(body, `"note":"gitlab: project resolvable`) {
+		t.Errorf("DoctorOutput lacks the app note:\n%s", body)
+	}
+	if strings.Contains(body, "merge_gate") {
+		t.Errorf("DoctorOutput re-emits a merge_gate on a gitlab-family report:\n%s", body)
+	}
+	if strings.Contains(body, "installation_id") {
+		t.Errorf("DoctorOutput re-emits an installation_id on a gitlab-family report:\n%s", body)
+	}
+}
+
+// TestDoctorToolDescription_DescribesForgeFamily pins the SHIPPED description's
+// GitLab claims (E45.43 / #3348): the forge input, the CI_PROJECT_PATH
+// fallback, and the deliberate merge_gate omission on GitLab.
+func TestDoctorToolDescription_DescribesForgeFamily(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
+	for _, want := range []string{
+		"ALSO OMITTED on a GitLab-family report",
+		"CI_PROJECT_PATH",
+		"pass forge=gitlab",
+		"nested groups",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_doctor description missing %q:\n%s", want, desc)
+		}
 	}
 }

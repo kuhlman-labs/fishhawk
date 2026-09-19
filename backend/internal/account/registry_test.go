@@ -647,3 +647,33 @@ func TestCreateAccount_PreservesHomeRegionPinAndClearsDisplayName(t *testing.T) 
 		t.Errorf("display_name = %v, want NULL (declarative, caller-owned column cleared by the omitted flag)", *displayName)
 	}
 }
+
+// TestProjectPathWellFormed pins the exported shape predicate the onboarding
+// readiness endpoint reuses (E45.43 / #3348): nested groups of any depth are
+// accepted, and every empty / whitespace-only component — namespace,
+// intermediate group, or terminal project — is refused. It is the same rule
+// ValidateGitLabProjectPath enforces (TestRegisterInstallation_GitLabProjectPath
+// stays green as the proof that delegating to it changed nothing there).
+func TestProjectPathWellFormed(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{"a/b", true},
+		{"a/b/c", true},
+		{"gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator", true},
+		{"  acme/widgets  ", true},
+		{"", false},
+		{"noslash", false},
+		{"/name", false},
+		{"owner/", false},
+		{"a//b", false},
+		{"a/ /b", false},
+		{"a/b/", false},
+		{" / ", false},
+	} {
+		if got := ProjectPathWellFormed(tc.path); got != tc.want {
+			t.Errorf("ProjectPathWellFormed(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}

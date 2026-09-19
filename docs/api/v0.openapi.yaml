@@ -5308,22 +5308,46 @@ components:
       type: object
       description: |
         Aggregated first-run readiness for a repository (E29.4), consumed by
-        `fishhawk doctor` (E29.5). The five checks cascade: a not-installed
-        repo yields an unavailable spec, no reviewers and an `unknown` merge
-        gate, each with an explanatory note. Read-only; performs no writes.
+        `fishhawk doctor` (E29.5). The checks cascade: a not-installed repo
+        yields an unavailable spec, no reviewers and an `unknown` merge gate,
+        each with an explanatory note. Read-only; performs no writes.
+
+        Forge-family-aware since E45.43 / #3348: `forge` names the family that
+        answered. On `github` all five checks run. On `gitlab` four run —
+        `app` becomes "is the project resolvable with the deployment GitLab
+        credential" (with `app.note` stating so; `installation_id` is never
+        set), `spec` is read through the forge adapter by the project's full
+        namespaced path, `reviewers` and `scopes` are unchanged — and
+        `merge_gate` is OMITTED ENTIRELY, because branch protection and
+        rulesets are GitHub-only surfaces the backend never reads there;
+        rendering one as `not_required` would claim a read that never
+        happened.
 
         `merge_gate` (#3161) is deliberately OPTIONAL and absent from
-        `required`: a pre-#3161 fishhawkd serves no such key, and its response
-        must still validate. A client that sees no `merge_gate` has learned
-        nothing about the repo's protection and must not render a verdict.
+        `required`: a pre-#3161 fishhawkd serves no such key, a gitlab-family
+        response omits it by design, and both must still validate. A client
+        that sees no `merge_gate` has learned nothing about the repo's
+        protection and must not render a verdict.
       required: [repo, app, spec, reviewers, scopes]
       properties:
         repo:
           type: string
+          description: |
+            The probed repository as sent: `owner/name` on GitHub, or a
+            `namespace/project` path — nested groups allowed — on GitLab.
           example: kuhlman-labs/fishhawk
+        forge:
+          type: string
+          enum: [github, gitlab]
+          description: |
+            The forge family that answered (E45.43 / #3348). Absent from
+            `required` only for pre-#3348 backends, which never set it.
         app:
           type: object
-          description: GitHub App installation status for the target repo.
+          description: |
+            GitHub App installation status for the target repo. On the gitlab
+            family, whether the project is resolvable with the deployment
+            credential (`note` says so; no App installation applies).
           required: [installed]
           properties:
             installed:
@@ -5331,10 +5355,16 @@ components:
             installation_id:
               type: integer
               format: int64
-              description: Present only when installed.
+              description: Present only when installed, github family only.
             reason:
               type: string
               description: Why the App is not installed (or could not be resolved).
+            note:
+              type: string
+              description: |
+                Context on what `installed` means for this forge — on gitlab,
+                that the project resolved with the deployment credential and
+                no App installation applies.
         spec:
           type: object
           description: The committed workflow spec's fetch + parse + validate state.
@@ -5402,8 +5432,10 @@ components:
             default branch (#3161), reconciled from classic branch protection
             plus repo rulesets.
 
-            OPTIONAL — a pre-#3161 fishhawkd omits it entirely, and that
-            absence is not a verdict.
+            OPTIONAL — a pre-#3161 fishhawkd omits it entirely, and a
+            gitlab-family response (E45.43 / #3348) omits it BY DESIGN because
+            the protection surfaces are GitHub-only; neither absence is a
+            verdict.
 
             Read `status` FAIL-CLOSED. `not_required` is a POSITIVE finding:
             both protection surfaces answered definitively and neither
@@ -6776,19 +6808,40 @@ paths:
       operationId: getOnboardingReadiness
       summary: First-run readiness for a repository
       description: |
-        Aggregates the five server-side-only checks a repo's first run needs
-        (E29.4), consumed by `fishhawk doctor` (E29.5): GitHub App
-        installation, the committed workflow spec's parse/validate state,
-        per-reviewer availability on this deployment, the caller token's
-        scope adequacy against the run-driving scope subset, and — since
-        #3161 — `merge_gate`, whether the `fishhawk_audit_complete` check
-        Fishhawk publishes is actually REQUIRED by the repository's
-        protection on its default branch. Read-only.
+        Aggregates the server-side-only checks a repo's first run needs
+        (E29.4), consumed by `fishhawk doctor` (E29.5) — five on GitHub, four
+        on GitLab (E45.43 / #3348): App installation (on GitLab: project
+        resolvability with the deployment credential), the committed workflow
+        spec's parse/validate state, per-reviewer availability on this
+        deployment, the caller token's scope adequacy against the run-driving
+        scope subset, and — since #3161, GitHub only — `merge_gate`, whether
+        the `fishhawk_audit_complete` check Fishhawk publishes is actually
+        REQUIRED by the repository's protection on its default branch.
+        Read-only.
 
-        `merge_gate` is OPTIONAL: a pre-#3161 fishhawkd omits it, and that
-        absence is not a verdict. Read its `status` fail-closed — `unknown`
-        means the question could not be settled, NOT that the check is
-        unrequired.
+        Forge-family resolution, in order: an explicit `forge` query value;
+        else the account registry's provider for the repo's owner (the same
+        discriminator the repo-visibility gate uses); else `github`. A
+        registry store fault answers 503 `service_unavailable`. The response's
+        `forge` field names the family that answered. A GitLab project whose
+        namespace is not registered as an account is answered as a GitHub
+        repo unless `forge=gitlab` is passed.
+
+        `repo` accepts `owner/name` on GitHub and a `namespace/project` path
+        with nested groups (`group/subgroup/project`) on GitLab; every
+        component must be non-empty. Two 400 `validation_failed` causes are
+        specific to this endpoint: a `forge` value outside `github|gitlab`
+        (field `forge`), and a nested path on the github family (field
+        `repo`, message naming `forge=gitlab` as the remedy). With
+        `forge=github` explicit that nested-path 400 fires BEFORE the
+        visibility gate; with `forge` omitted the family is only known after
+        registry resolution, which follows visibility, so it fires after.
+
+        `merge_gate` is OPTIONAL: a pre-#3161 fishhawkd omits it, and a
+        gitlab-family response omits it by design (the protection surfaces
+        are GitHub-only); neither absence is a verdict. Read its `status`
+        fail-closed — `unknown` means the question could not be settled, NOT
+        that the check is unrequired.
 
         Does NOT gate on a write scope, because scope adequacy is itself a
         reported field: a write-scope gate would lock out exactly the callers
@@ -6805,10 +6858,24 @@ paths:
         - name: repo
           in: query
           required: true
-          description: Target repository in owner/name form.
+          description: |
+            Target repository: `owner/name` on GitHub, or a `namespace/project`
+            path (nested groups allowed) on GitLab. Every component must be
+            non-empty.
           schema:
             type: string
           example: kuhlman-labs/fishhawk
+        - name: forge
+          in: query
+          required: false
+          description: |
+            Forge family of `repo`. Omitted, the backend resolves it from the
+            account registry and defaults to `github`. Any other value is 400
+            `validation_failed` on field `forge`.
+          schema:
+            type: string
+            enum: [github, gitlab]
+          example: gitlab
       responses:
         '200':
           description: Aggregated readiness for the repository.

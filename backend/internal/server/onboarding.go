@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -30,30 +31,49 @@ var requiredRunScopes = []string{
 	"read:runs", "read:audit", "write:runs", "write:approvals", "write:stages",
 }
 
-// onboardingReadinessResponse aggregates the five server-side-only checks
-// `fishhawk doctor` (E29.5) needs before a repo's first run: GitHub App
-// installation, the committed workflow spec's parse/validate state, per
-// reviewer availability on this deployment, the caller token's scope
-// adequacy, and — since #3161 — whether the `fishhawk_audit_complete` check
-// Fishhawk publishes is actually REQUIRED by the repo's branch protection.
-// The checks cascade — a not-installed repo yields an unavailable spec, empty
-// reviewers and an `unknown` merge gate — each with an explanatory note.
+// onboardingReadinessResponse aggregates the server-side-only checks
+// `fishhawk doctor` (E29.5) needs before a repo's first run — five on the
+// GitHub family, four on GitLab (E45.43 / #3348): App installation (on GitLab:
+// project resolvability with the deployment credential), the committed
+// workflow spec's parse/validate state, per reviewer availability on this
+// deployment, the caller token's scope adequacy, and — since #3161, GitHub
+// only — whether the `fishhawk_audit_complete` check Fishhawk publishes is
+// actually REQUIRED by the repo's branch protection. The checks cascade — a
+// not-installed repo yields an unavailable spec, empty reviewers and an
+// `unknown` merge gate — each with an explanatory note.
+//
+// Forge names the family that answered ("github" or "gitlab"), resolved per
+// request by onboardingForgeFamily.
+//
+// MergeGate is a POINTER and is OMITTED ENTIRELY (nil) on the gitlab family:
+// mergegate.Reconcile reads branch protection + rulesets through a
+// *githubclient.Client — GitHub-only surfaces the GitLab adapter stubs
+// (ListRulesetRequiredChecks returns nil, nil) — so no authoritative
+// merge-gate read exists on GitLab, and rendering one as `not_required` would
+// be exactly the over-claim mergeGateReadiness's invariant forbids. Both
+// client mirrors already model absence as a pointer (#3161), so the omitted
+// key is read as "no claim about the merge gate", never as a verdict.
 type onboardingReadinessResponse struct {
 	Repo      string              `json:"repo"`
+	Forge     string              `json:"forge"`
 	App       appInstallReadiness `json:"app"`
 	Spec      specReadiness       `json:"spec"`
 	Reviewers []reviewerReadiness `json:"reviewers"`
 	Scopes    scopeReadiness      `json:"scopes"`
-	MergeGate mergeGateReadiness  `json:"merge_gate"`
+	MergeGate *mergeGateReadiness `json:"merge_gate,omitempty"`
 }
 
 // appInstallReadiness reports whether the GitHub App is installed on the
 // target repo. Reason carries the human-readable explanation when it is not
-// (or when the client could not resolve the installation).
+// (or when the client could not resolve the installation). On the gitlab
+// family Installed means "the project is resolvable with the deployment
+// credential" and Note says so — no App installation applies there, and
+// InstallationID is never set.
 type appInstallReadiness struct {
 	Installed      bool   `json:"installed"`
 	InstallationID int64  `json:"installation_id,omitempty"`
 	Reason         string `json:"reason,omitempty"`
+	Note           string `json:"note,omitempty"`
 }
 
 // specReadiness reports the committed workflow spec's fetch + parse + validate
@@ -288,9 +308,251 @@ func (s *Server) probeMergeGate(ctx context.Context, repo string, repoRef github
 	return out
 }
 
-// handleGetOnboardingReadiness implements GET /v0/onboarding/readiness?repo=owner/name
-// (E29.4). It aggregates the server-side-only readiness probes a first run
-// needs, reusing the exact classification the run-create path performs.
+// Reason strings for the gitlab-family `app` rung (E45.43 / #3348).
+const (
+	onboardingGitLabForgeUnconfigured = "gitlab forge not configured on this deployment (set FISHHAWKD_GITLAB_TOKEN and FISHHAWKD_GITLAB_BASE_URL)"
+	onboardingGitLabProjectNotVisible = "project is not visible to the deployment GitLab credential; register it with `fishhawkd installation register --provider gitlab --project-path <path>` and confirm the token can read it"
+	onboardingGitLabInstalledNote     = "gitlab: project resolvable with the deployment credential; no App installation applies on GitLab"
+)
+
+// onboardingForgeFor resolves the forge adapter for a NON-GitHub family
+// through the same ladder issueOpsFor walks: cfg.ForgeResolver defaulting to
+// the process registry (forge.Get), a resolver error or a nil forge — INCLUDING
+// a typed nil inside a non-nil interface, which isNilForge unwraps — yielding
+// nil so the caller degrades to a naming reason instead of dereferencing it.
+func (s *Server) onboardingForgeFor(forgeID string) forge.Forge {
+	resolver := s.cfg.ForgeResolver
+	if resolver == nil {
+		resolver = forge.Get
+	}
+	f, err := resolver(forgeID)
+	if err != nil || isNilForge(f) {
+		return nil
+	}
+	return f
+}
+
+// onboardingForgeFamily decides which forge family answers a readiness
+// request. An explicit (already validated) `forge` query value wins; otherwise
+// cfg.RepoProviders.ResolveProvider — the accounts-table discriminator the
+// conventions loader and the repo-visibility gate already key on — decides.
+// Not found, a provider outside {github, gitlab}, or no resolver wired at all
+// falls back to github, the byte-identical legacy behaviour; a resolver STORE
+// fault is returned so the handler answers 503 rather than guessing a family.
+func (s *Server) onboardingForgeFamily(ctx context.Context, explicit, repo string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	if s.cfg.RepoProviders == nil {
+		return observationForgeGitHub, nil
+	}
+	provider, found, err := s.cfg.RepoProviders.ResolveProvider(ctx, repo)
+	if err != nil {
+		return "", err
+	}
+	if found && (provider == observationForgeGitHub || provider == observationForgeGitLab) {
+		return provider, nil
+	}
+	return observationForgeGitHub, nil
+}
+
+// onboardingNestedPath reports whether repo carries more than the single
+// owner/name separator — a nested GitLab project path, which the github
+// family refuses.
+func onboardingNestedPath(repo string) bool {
+	return strings.Count(repo, "/") > 1
+}
+
+// writeOnboardingNestedOnGitHub is the 400 both nested-on-github orderings
+// share (see the handler comment): the path shape is a GitLab project's, so
+// the remedy is to name the family.
+func (s *Server) writeOnboardingNestedOnGitHub(w http.ResponseWriter, r *http.Request, repo string) {
+	s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+		"github repositories are owner/name; a nested path is a GitLab project — pass forge=gitlab",
+		map[string]any{"field": "repo", "got": repo})
+}
+
+// classifySpecBytes is the forge-independent half of readiness check (2): the
+// spec bytes were fetched, so Source is "fetched" and the three-arm parse →
+// validate → valid switch decides Valid/Error. The parsed spec is returned
+// only when it validated cleanly, so the reviewer probe runs only then.
+func classifySpecBytes(content []byte) (specReadiness, *spec.Spec) {
+	out := specReadiness{Source: "fetched"}
+	p, perr := spec.ParseBytes(content)
+	if perr != nil {
+		out.Error = perr.Error()
+		return out, nil
+	}
+	if verr := spec.Validate(p); verr != nil {
+		out.Error = verr.Error()
+		return out, nil
+	}
+	out.Valid = true
+	return out, p
+}
+
+// probeGitHub runs readiness checks (1) and (2) on the github family: the
+// GitHub App installation resolve and the workflow spec fetch, exactly as the
+// run-create path performs them. installed + installationID feed the merge
+// gate probe, which only this family runs.
+func (s *Server) probeGitHub(ctx context.Context, repo string, repoRef githubclient.RepoRef,
+) (app appInstallReadiness, sp specReadiness, parsed *spec.Spec, installed bool, installationID int64) {
+	// (1) GitHub App installation. Reuse the runs.go run-create switch:
+	// nil → installed, ErrNotInstalled → not-installed with reason, any
+	// other error → not-installed with the error as reason + a WARN. Never
+	// 500 the whole endpoint on a transient installation-resolve error.
+	if s.cfg.GitHub == nil {
+		app.Reason = "github client not configured on this deployment"
+	} else {
+		id, err := s.cfg.GitHub.GetRepoInstallation(ctx, repoRef)
+		switch {
+		case err == nil:
+			app.Installed = true
+			app.InstallationID = id
+			installationID = id
+		case errors.Is(err, githubclient.ErrNotInstalled):
+			app.Reason = "GitHub App is not installed on the target repository"
+		default:
+			app.Reason = err.Error()
+			s.cfg.Logger.Warn("onboarding readiness: resolve repo installation failed",
+				"repo", repo, "error", err.Error())
+		}
+	}
+
+	// (2) Workflow spec fetch + parse + validate. Only meaningful once the
+	// App is installed (the fetch needs an installation token). Empty ref
+	// resolves the repo's default branch, matching run-create (runs.go).
+	if !app.Installed {
+		sp.Source = "unavailable"
+		sp.Note = "GitHub App is not installed on the target repository; cannot fetch the workflow spec"
+		return app, sp, nil, false, 0
+	}
+	fc, err := s.cfg.GitHub.GetWorkflowSpec(ctx, forge.FromGitHubInstallationID(installationID), repoRef, "")
+	switch {
+	case err == nil:
+		sp, parsed = classifySpecBytes(fc.Content)
+	case errors.Is(err, githubclient.ErrNotFound):
+		sp.Source = "unavailable"
+		sp.Note = "no workflow spec found on the repository's default branch"
+	default:
+		sp.Source = "unavailable"
+		sp.Note = err.Error()
+		s.cfg.Logger.Warn("onboarding readiness: fetch workflow spec failed",
+			"repo", repo, "error", err.Error())
+	}
+	return app, sp, parsed, true, installationID
+}
+
+// probeGitLab runs readiness checks (1) and (2) on the gitlab family (E45.43 /
+// #3348). There is no App to install, so (1) becomes "is the project
+// resolvable with the deployment credential" (Forge.ResolveRepoScope: a 404
+// surfaces as forge.ErrNotInstalled) with Note stating what installed means
+// here, and (2) reads the spec through forge.FileFetcher on the resolved
+// scope — which addresses the project by its FULL namespaced path, so nested
+// groups work — before handing the bytes to the shared classifier. Every
+// degrade (forge unconfigured or typed-nil, project not visible, resolve or
+// fetch fault, an adapter without file reads) lands as a naming reason on a
+// 200, never a 5xx: this is a readiness REPORT.
+func (s *Server) probeGitLab(ctx context.Context, repo string, ref forge.RepoRef,
+) (app appInstallReadiness, sp specReadiness, parsed *spec.Spec) {
+	f := s.onboardingForgeFor(observationForgeGitLab)
+	if f == nil {
+		app.Reason = onboardingGitLabForgeUnconfigured
+		sp.Source = "unavailable"
+		sp.Note = onboardingGitLabForgeUnconfigured
+		return app, sp, nil
+	}
+	scope, err := f.ResolveRepoScope(ctx, ref)
+	switch {
+	case err == nil:
+		app.Installed = true
+		app.Note = onboardingGitLabInstalledNote
+	case errors.Is(err, forge.ErrNotInstalled):
+		app.Reason = onboardingGitLabProjectNotVisible
+	default:
+		app.Reason = err.Error()
+		s.cfg.Logger.Warn("onboarding readiness: resolve gitlab project failed",
+			"repo", repo, "error", err.Error())
+	}
+	if !app.Installed {
+		sp.Source = "unavailable"
+		sp.Note = "project is not resolvable with the deployment GitLab credential; cannot fetch the workflow spec"
+		return app, sp, nil
+	}
+	fetcher, ok := f.(forge.FileFetcher)
+	if !ok {
+		sp.Source = "unavailable"
+		sp.Note = "gitlab forge does not expose file reads"
+		return app, sp, nil
+	}
+	fc, err := fetcher.FetchFile(ctx, scope, ref, githubclient.WorkflowSpecPath, "")
+	switch {
+	case err == nil:
+		sp, parsed = classifySpecBytes(fc.Content)
+	case errors.Is(err, forge.ErrNotFound):
+		sp.Source = "unavailable"
+		sp.Note = "no workflow spec found on the project default branch"
+	default:
+		sp.Source = "unavailable"
+		sp.Note = err.Error()
+		s.cfg.Logger.Warn("onboarding readiness: fetch gitlab workflow spec failed",
+			"repo", repo, "error", err.Error())
+	}
+	return app, sp, parsed
+}
+
+// probeReviewers runs readiness check (3): per-reviewer availability, only
+// when the spec parsed + validated cleanly (a nil parsed yields the empty,
+// non-null list). Reuses the ReviewerSet.For probe unavailableSpecReviewers
+// performs and surfaces the adapter's missing-env-var hint verbatim.
+func (s *Server) probeReviewers(parsed *spec.Spec) []reviewerReadiness {
+	out := []reviewerReadiness{}
+	if parsed == nil {
+		return out
+	}
+	for _, rv := range collectSpecReviewers(parsed) {
+		rr := reviewerReadiness{
+			Provider:        rv.Provider,
+			Model:           rv.Model,
+			ReasoningEffort: rv.ReasoningEffort,
+		}
+		if s.cfg.PlanReviewers == nil {
+			rr.MissingHint = "no reviewer backend is wired on this deployment; set FISHHAWKD_ANTHROPIC_API_KEY, FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER, or FISHHAWKD_ENABLE_CODEX_REVIEWER"
+		} else if _, err := s.cfg.PlanReviewers.For(rv.Provider, rv.Model, rv.ReasoningEffort); err != nil {
+			rr.MissingHint = err.Error()
+		} else {
+			rr.Available = true
+		}
+		out = append(out, rr)
+	}
+	return out
+}
+
+// probeScopes runs readiness check (4): caller-token scope adequacy against
+// the run-driving subset. Cookie-session callers (TokenID == "") authenticate
+// via OAuth, carry no explicit scope list, and bypass scope enforcement
+// (requireWriteScope), so they are adequate by construction.
+func probeScopes(ident Identity) scopeReadiness {
+	out := scopeReadiness{Required: requiredRunScopes, Missing: []string{}}
+	if ident.TokenID == "" {
+		out.Adequate = true
+		out.Note = "cookie-session caller: scope enforcement is bypassed for OAuth sessions"
+		return out
+	}
+	for _, want := range requiredRunScopes {
+		if !hasScope(ident, want) {
+			out.Missing = append(out.Missing, want)
+		}
+	}
+	out.Adequate = len(out.Missing) == 0
+	return out
+}
+
+// handleGetOnboardingReadiness implements
+// GET /v0/onboarding/readiness?repo=<path>[&forge=github|gitlab] (E29.4,
+// forge-family-aware since E45.43 / #3348). It aggregates the server-side-only
+// readiness probes a first run needs, reusing the exact classification the
+// run-create path performs.
 //
 // Two-part gate:
 //
@@ -309,12 +571,27 @@ func (s *Server) probeMergeGate(ctx context.Context, repo string, repoRef github
 //     resolution fault, and the cross-forge / prefixless-subject fail-closed
 //     denies.
 //
-// The ordering invariant is load-bearing: 401 anonymous → 400 malformed repo →
-// visibility. Anonymous is rejected before any filter resolve (an
-// unauthenticated caller must not learn a repo exists), the repo string is
-// validated to a well-formed owner/name before the filter is handed it, and
-// only then does the visibility gate run — so a denied caller reaches ZERO
-// forge calls, ZERO spec fetches, and receives no spec.Error text at all.
+// The ordering invariant is load-bearing: 401 anonymous → 400 malformed
+// forge/repo → visibility → family resolution. Anonymous is rejected before
+// any filter resolve (an unauthenticated caller must not learn a repo
+// exists); the `forge` value is validated to the two known families and the
+// repo string to a well-formed <namespace>/<project> path (nested GitLab
+// groups allowed, every component non-empty) before the filter is handed it;
+// and only then does the visibility gate run — so a denied caller reaches
+// ZERO forge calls, ZERO spec fetches, and receives no spec.Error text at all.
+//
+// The github family's stricter two-segment rule lands in one of two places,
+// depending on WHEN the family is known:
+//
+//   - forge=github EXPLICIT: the nested-path 400 fires BEFORE
+//     enforceRepoVisibility, so an authenticated caller gets the promised
+//     validation_failed ahead of any visibility denial, with zero visibility
+//     and zero forge calls.
+//   - forge OMITTED: the family is only known after RepoProviders resolution,
+//     which necessarily follows visibility (the resolver is a store read the
+//     denied caller must not trigger), so a registry-resolved github family
+//     rejects the nested path AFTER the visibility gate — still with zero
+//     forge calls.
 func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Request) {
 	ident := IdentityFrom(r.Context())
 	if ident.IsAnonymous() {
@@ -323,15 +600,29 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	repo := r.URL.Query().Get("repo")
-	owner, name, ok := strings.Cut(repo, "/")
-	// strings.Cut splits on the FIRST "/", so a value like "owner/name/extra"
-	// would otherwise pass with name == "name/extra". Reject any residual
-	// slash: the contract is exactly one owner/name pair.
-	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+	forgeParam := strings.TrimSpace(r.URL.Query().Get("forge"))
+	switch forgeParam {
+	case "", observationForgeGitHub, observationForgeGitLab:
+	default:
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"repo must be in owner/name format",
+			"forge must be github or gitlab",
+			map[string]any{"field": "forge", "got": forgeParam})
+		return
+	}
+
+	repo := r.URL.Query().Get("repo")
+	// The shared shape rule (account.ProjectPathWellFormed): a non-empty
+	// namespace, then one or more non-empty components. This admits a nested
+	// GitLab path; the github family's two-segment rule is applied below.
+	if !account.ProjectPathWellFormed(repo) {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"repo must be <owner>/<name> (GitHub) or <namespace>/<project> with every component non-empty (GitLab; nested groups allowed)",
 			map[string]any{"field": "repo", "got": repo})
+		return
+	}
+	// Explicit github family: the two-segment rule fires BEFORE visibility.
+	if forgeParam == observationForgeGitHub && onboardingNestedPath(repo) {
+		s.writeOnboardingNestedOnGitHub(w, r, repo)
 		return
 	}
 
@@ -341,119 +632,51 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 	if !s.enforceRepoVisibility(w, r, repo) {
 		return
 	}
-	repoRef := githubclient.RepoRef{Owner: owner, Name: name}
+
+	family, err := s.onboardingForgeFamily(r.Context(), forgeParam, repo)
+	if err != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "service_unavailable",
+			"could not resolve the repository forge; retry shortly", nil)
+		return
+	}
+	// Registry-resolved github family: the two-segment rule fires AFTER
+	// visibility (the family was not known before it).
+	if family == observationForgeGitHub && onboardingNestedPath(repo) {
+		s.writeOnboardingNestedOnGitHub(w, r, repo)
+		return
+	}
+	// Owner is the first segment, Name the remainder: RepoRef.String()
+	// re-joins the full path, which is what the GitLab adapter addresses the
+	// project by (gitlab.go ResolveRepoScope / FetchFile).
+	owner, name, _ := strings.Cut(repo, "/")
+	repoRef := forge.RepoRef{Owner: owner, Name: name}
 
 	resp := onboardingReadinessResponse{
-		Repo:      repo,
-		Reviewers: []reviewerReadiness{},
+		Repo:  repo,
+		Forge: family,
 	}
-
-	// (1) GitHub App installation. Reuse the runs.go run-create switch:
-	// nil → installed, ErrNotInstalled → not-installed with reason, any
-	// other error → not-installed with the error as reason + a WARN. Never
-	// 500 the whole endpoint on a transient installation-resolve error.
-	var installationID int64
-	if s.cfg.GitHub == nil {
-		resp.App.Reason = "github client not configured on this deployment"
-	} else {
-		id, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), repoRef)
-		switch {
-		case err == nil:
-			resp.App.Installed = true
-			resp.App.InstallationID = id
-			installationID = id
-		case errors.Is(err, githubclient.ErrNotInstalled):
-			resp.App.Reason = "GitHub App is not installed on the target repository"
-		default:
-			resp.App.Reason = err.Error()
-			s.cfg.Logger.Warn("onboarding readiness: resolve repo installation failed",
-				"repo", repo, "error", err.Error())
-		}
-	}
-
-	// (2) Workflow spec fetch + parse + validate. Only meaningful once the
-	// App is installed (the fetch needs an installation token). Empty ref
-	// resolves the repo's default branch, matching run-create (runs.go).
 	var parsedSpec *spec.Spec
-	switch {
-	case !resp.App.Installed:
-		resp.Spec.Source = "unavailable"
-		resp.Spec.Note = "GitHub App is not installed on the target repository; cannot fetch the workflow spec"
+	switch family {
+	case observationForgeGitLab:
+		// (1)+(2) on GitLab; (5) merge gate is OMITTED — see the response
+		// type's doc comment for why nil is the only honest rendering.
+		resp.App, resp.Spec, parsedSpec = s.probeGitLab(r.Context(), repo, repoRef)
 	default:
-		fc, err := s.cfg.GitHub.GetWorkflowSpec(r.Context(), forge.FromGitHubInstallationID(installationID), repoRef, "")
-		switch {
-		case err == nil:
-			resp.Spec.Source = "fetched"
-			p, perr := spec.ParseBytes(fc.Content)
-			switch {
-			case perr != nil:
-				resp.Spec.Valid = false
-				resp.Spec.Error = perr.Error()
-			default:
-				if verr := spec.Validate(p); verr != nil {
-					resp.Spec.Valid = false
-					resp.Spec.Error = verr.Error()
-				} else {
-					resp.Spec.Valid = true
-					parsedSpec = p
-				}
-			}
-		case errors.Is(err, githubclient.ErrNotFound):
-			resp.Spec.Source = "unavailable"
-			resp.Spec.Note = "no workflow spec found on the repository's default branch"
-		default:
-			resp.Spec.Source = "unavailable"
-			resp.Spec.Note = err.Error()
-			s.cfg.Logger.Warn("onboarding readiness: fetch workflow spec failed",
-				"repo", repo, "error", err.Error())
-		}
+		var installed bool
+		var installationID int64
+		resp.App, resp.Spec, parsedSpec, installed, installationID = s.probeGitHub(r.Context(), repo, repoRef)
+		// (5) Merge gate: is the check Fishhawk publishes actually required by
+		// the repo's protection on its REAL default branch (#3161)? Needs an
+		// installation token, so it runs only once the App is installed; every
+		// other posture degrades to `unknown` with a naming reason rather than
+		// to `not_required`.
+		mg := s.probeMergeGate(r.Context(), repo, repoRef, installed, installationID)
+		resp.MergeGate = &mg
 	}
 
-	// (3) Per-reviewer availability. Only when the spec parsed + validated
-	// cleanly. Reuse the ReviewerSet.For probe unavailableSpecReviewers
-	// performs and surface the adapter's missing-env-var hint verbatim.
-	if parsedSpec != nil {
-		for _, rv := range collectSpecReviewers(parsedSpec) {
-			out := reviewerReadiness{
-				Provider:        rv.Provider,
-				Model:           rv.Model,
-				ReasoningEffort: rv.ReasoningEffort,
-			}
-			if s.cfg.PlanReviewers == nil {
-				out.MissingHint = "no reviewer backend is wired on this deployment; set FISHHAWKD_ANTHROPIC_API_KEY, FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER, or FISHHAWKD_ENABLE_CODEX_REVIEWER"
-			} else if _, err := s.cfg.PlanReviewers.For(rv.Provider, rv.Model, rv.ReasoningEffort); err != nil {
-				out.MissingHint = err.Error()
-			} else {
-				out.Available = true
-			}
-			resp.Reviewers = append(resp.Reviewers, out)
-		}
-	}
-
-	// (5) Merge gate: is the check Fishhawk publishes actually required by the
-	// repo's protection on its REAL default branch (#3161)? Needs an
-	// installation token, so it runs only once the App is installed; every
-	// other posture degrades to `unknown` with a naming reason rather than to
-	// `not_required`.
-	resp.MergeGate = s.probeMergeGate(r.Context(), repo, repoRef, resp.App.Installed, installationID)
-
-	// (4) Caller-token scope adequacy against the run-driving subset. Cookie
-	// -session callers (TokenID == "") authenticate via OAuth, carry no
-	// explicit scope list, and bypass scope enforcement (requireWriteScope),
-	// so they are adequate by construction.
-	resp.Scopes.Required = requiredRunScopes
-	resp.Scopes.Missing = []string{}
-	if ident.TokenID == "" {
-		resp.Scopes.Adequate = true
-		resp.Scopes.Note = "cookie-session caller: scope enforcement is bypassed for OAuth sessions"
-	} else {
-		for _, want := range requiredRunScopes {
-			if !hasScope(ident, want) {
-				resp.Scopes.Missing = append(resp.Scopes.Missing, want)
-			}
-		}
-		resp.Scopes.Adequate = len(resp.Scopes.Missing) == 0
-	}
+	// (3) Per-reviewer availability, (4) caller-token scope adequacy.
+	resp.Reviewers = s.probeReviewers(parsedSpec)
+	resp.Scopes = probeScopes(ident)
 
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
