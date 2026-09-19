@@ -492,6 +492,94 @@ func TestRegisterInstallation_GitLabProjectPath(t *testing.T) {
 	}
 }
 
+// TestRegisterInstallation_BaseURLsForwardedTheRightWayRound closes the #2976
+// untested-path concern: every installation the existing tests register omits
+// both optional base URLs, so a transposition of the two adjacent
+// ForgeBaseUrl/OauthBaseUrl fields in RegisterInstallation's
+// UpsertInstallationParams literal (or the hand-written ListInstallations scan
+// this pairs with, see the pgtest-backed sibling in
+// backend/cmd/fishhawkd/installation_test.go) would be invisible. Asserts on
+// fake.lastInstallation — the COMMITTED-STATE read — not only the returned
+// Installation.
+func TestRegisterInstallation_BaseURLsForwardedTheRightWayRound(t *testing.T) {
+	cases := []struct {
+		name         string
+		forgeBaseURL string
+		oauthBaseURL string
+		wantForge    *string
+		wantOAuth    *string
+	}{
+		{
+			name:         "distinct_valid_urls_land_on_their_own_field",
+			forgeBaseURL: "https://forge.example.test",
+			oauthBaseURL: "https://oauth.example.test",
+			wantForge:    strPtr("https://forge.example.test"),
+			wantOAuth:    strPtr("https://oauth.example.test"),
+		},
+		{
+			name:         "forge_only_does_not_fabricate_oauth",
+			forgeBaseURL: "https://forge.example.test",
+			wantForge:    strPtr("https://forge.example.test"),
+			wantOAuth:    nil,
+		},
+		{
+			name:         "oauth_only_does_not_fabricate_forge",
+			oauthBaseURL: "https://oauth.example.test",
+			wantForge:    nil,
+			wantOAuth:    strPtr("https://oauth.example.test"),
+		},
+		{
+			name:         "whitespace_padded_values_stored_trimmed",
+			forgeBaseURL: "  https://forge.example.test  ",
+			oauthBaseURL: "  https://oauth.example.test  ",
+			wantForge:    strPtr("https://forge.example.test"),
+			wantOAuth:    strPtr("https://oauth.example.test"),
+		},
+		{
+			name:         "whitespace_only_values_are_nil_not_empty",
+			forgeBaseURL: "   ",
+			oauthBaseURL: "   ",
+			wantForge:    nil,
+			wantOAuth:    nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeRegistryQueries{account: accountdb.Account{
+				ID: uuid.New(), Provider: "gitlab", AccountKey: "acme", Granularity: "group",
+			}}
+			if _, err := RegisterInstallation(context.Background(), fake, RegisterInstallationRequest{
+				Provider:        "gitlab",
+				AccountKey:      "acme",
+				InstallationRef: "gitlab:4242",
+				ProjectPath:     "acme/widgets",
+				ForgeBaseURL:    tc.forgeBaseURL,
+				OAuthBaseURL:    tc.oauthBaseURL,
+			}); err != nil {
+				t.Fatalf("RegisterInstallation: %v", err)
+			}
+			assertBaseURLPtr(t, "ForgeBaseUrl", fake.lastInstallation.ForgeBaseUrl, tc.wantForge)
+			assertBaseURLPtr(t, "OauthBaseUrl", fake.lastInstallation.OauthBaseUrl, tc.wantOAuth)
+		})
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+// assertBaseURLPtr compares two *string by VALUE, not by pointer identity —
+// RegisterInstallation always allocates its own pointer.
+func assertBaseURLPtr(t *testing.T, field string, got, want *string) {
+	t.Helper()
+	switch {
+	case want == nil && got != nil:
+		t.Errorf("%s = %q, want nil", field, *got)
+	case want != nil && got == nil:
+		t.Errorf("%s = nil, want %q", field, *want)
+	case want != nil && got != nil && *got != *want:
+		t.Errorf("%s = %q, want %q", field, *got, *want)
+	}
+}
+
 // TestRegisterInstallation_TrimsProjectPath pins that a path is stored trimmed:
 // the authorizer compares the recorded value against a payload path byte for
 // byte, so a stray flag-quoting space would silently produce a row that never
