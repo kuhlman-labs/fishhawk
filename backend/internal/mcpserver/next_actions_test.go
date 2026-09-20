@@ -5048,3 +5048,73 @@ func TestNextActions_RejectWithoutConcernAdvisory(t *testing.T) {
 		foldRejectWithoutConcernAdvisory(implWith(PlanReview{RejectWithoutConcern: true}), nil)
 	})
 }
+
+// ---------------------------------------------------------------------------
+// foldGroomingApplyAdvisory (E54.77 / #3232)
+// ---------------------------------------------------------------------------
+
+// TestFoldGroomingApplyAdvisory_InFlightPrepends: an in-flight apply PREPENDS
+// the re-poll advisory so it is the suggested default (actions[0]) ahead of the
+// gate approval the run would otherwise lead with, and names both the
+// progress fraction and the two ways to wait (re-poll / fishhawk_await_audit).
+func TestFoldGroomingApplyAdvisory_InFlightPrepends(t *testing.T) {
+	r := naRun("running")
+	na := &NextActions{State: "human_review_gate_parked", Actions: []SuggestedAction{{Action: "approve_review_gate"}}}
+	foldGroomingApplyAdvisory(r, &GroomingApplyStatus{State: groomingApplyStateInFlight, CandidateCount: 12, Recorded: 5, Remaining: 7}, na)
+
+	if len(na.Actions) != 2 {
+		t.Fatalf("actions = %d, want the advisory PLUS the original (additive, never replacing)", len(na.Actions))
+	}
+	got := na.Actions[0]
+	if got.Action != "fishhawk_get_run_status" {
+		t.Errorf("actions[0].action = %q, want fishhawk_get_run_status PREPENDED as the default", got.Action)
+	}
+	if got.Params["run_id"] != r.ID {
+		t.Errorf("actions[0].params.run_id = %q, want %s", got.Params["run_id"], r.ID)
+	}
+	if got.Consumes != consumesNone {
+		t.Errorf("consumes = %q, want none", got.Consumes)
+	}
+	for _, want := range []string{"5/12 recorded", "grooming_apply_status.state is completed", "fishhawk_await_audit", "grooming_apply_completed", "do not attest the confirm gate"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Errorf("reason missing %q: %q", want, got.Reason)
+		}
+	}
+	if na.Actions[1].Action != "approve_review_gate" {
+		t.Errorf("actions[1].action = %q, want the original approve_review_gate retained after the advisory", na.Actions[1].Action)
+	}
+	if na.State != "human_review_gate_parked" {
+		t.Errorf("state = %q, want unchanged — the fold is display-only and relabels nothing", na.State)
+	}
+}
+
+// TestFoldGroomingApplyAdvisory_CompletedNoop: a completed apply leaves the
+// actions byte-identical — the advisory is for a PARTIAL ledger only.
+func TestFoldGroomingApplyAdvisory_CompletedNoop(t *testing.T) {
+	r := naRun("running")
+	na := &NextActions{State: "human_review_gate_parked", Actions: []SuggestedAction{{Action: "approve_review_gate"}}}
+	before, _ := json.Marshal(na)
+	foldGroomingApplyAdvisory(r, &GroomingApplyStatus{State: groomingApplyStateCompleted, CandidateCount: 12, Recorded: 12}, na)
+	after, _ := json.Marshal(na)
+	if string(before) != string(after) {
+		t.Errorf("completed apply changed next_actions:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// TestFoldGroomingApplyAdvisory_NilNoop: an omitted block (an ordinary run, or
+// a read error), a nil run and a nil next_actions are each a silent no-op —
+// never a panic, never a false advisory.
+func TestFoldGroomingApplyAdvisory_NilNoop(t *testing.T) {
+	r := naRun("running")
+	na := &NextActions{State: "plan_running", Actions: []SuggestedAction{{Action: "fishhawk_await_stage"}}}
+	before, _ := json.Marshal(na)
+	foldGroomingApplyAdvisory(r, nil, na)
+	foldGroomingApplyAdvisory(nil, &GroomingApplyStatus{State: groomingApplyStateInFlight}, na)
+	after, _ := json.Marshal(na)
+	if string(before) != string(after) {
+		t.Errorf("nil status / nil run changed next_actions:\nbefore %s\nafter  %s", before, after)
+	}
+	// Defensive nil-na guard: never reached from getRunStatus, but must not
+	// panic if a future caller passes nil.
+	foldGroomingApplyAdvisory(r, &GroomingApplyStatus{State: groomingApplyStateInFlight}, nil)
+}

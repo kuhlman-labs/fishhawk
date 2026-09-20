@@ -1695,6 +1695,18 @@ type GetRunStatusOutput struct {
 	// named why in summary_suppressed, and this field carries that verbatim
 	// rather than rendering a story that could contradict the verdict.
 	AcceptanceTranscript *AcceptanceTranscriptStatus `json:"acceptance_transcript,omitempty" jsonschema:"acceptance transcript summary (E72.5 / #3329) from the newest acceptance_outcome_recorded entry's transcript block: artifact_id + content_hash of the stored acceptance_transcript artifact, artifact_path (the REST GET path that returns the full transcript — request/response bodies are stored-only and never surfaced here), and criteria[] rows {id, outcome, request_count, failing_request{method,path,status}|null} where failing_request is the LAST request of a failed criterion. The verdict is authoritative and the transcript descriptive: criteria is omitted and summary_suppressed names the reason (criterion_not_in_verdict | criterion_outcome_disagrees) when the backend found the transcript disagreeing with the verdict rows. Omitted when the run has no acceptance stage, no recorded outcome, or the outcome carries no transcript"`
+	// GroomingApplyStatus surfaces the on-approval grooming apply's progress
+	// (E54.77 / #3232). The server hook runs the apply DETACHED from the
+	// approve request, so fishhawk_approve_plan returns before the mutations
+	// land; this block is how the operator sees where the apply stands. It is
+	// derived from three audit categories (grooming_apply_started as the
+	// denominator, grooming_mutation_applied as the per-entry ledger,
+	// grooming_apply_completed as the terminal summary), anchored on the
+	// NEWEST started row so a re-approval's fresh apply supersedes an older
+	// one. Cost-gated on a started row existing — a run without one issues
+	// exactly one small category read and stays byte-identical. Best-effort:
+	// a read/decode error leaves it nil, never failing the snapshot.
+	GroomingApplyStatus *GroomingApplyStatus `json:"grooming_apply_status,omitempty" jsonschema:"progress of the detached on-approval grooming apply (E54.77 / #3232), derived from the grooming_apply_started / grooming_mutation_applied / grooming_apply_completed audit rows anchored on the NEWEST started row. state is in_flight until a grooming_apply_completed row lands after the anchor, then completed. recorded is the number of per-entry grooming_mutation_applied rows seen (capped at 10 pages of 500 — a larger apply reports a partial count); remaining = candidate_count - recorded while in flight, 0 once completed. budget_exhausted counts skipped rows carrying skip_reason apply_budget_exhausted — the never-evaluated tail of an over-budget apply, which RESURFACES on the next grooming run. Omitted when the run carries no grooming_apply_started row (an ordinary run, or a grooming apply that degraded before launch — that degrade is on recent_audit as grooming_apply_completed)"`
 	// Elisions records what the response byte budget removed (ADR-077 /
 	// #2508). omitempty, so an UNDER-budget response is byte-identical to the
 	// pre-#2508 wire and the block never appears on the happy path. See
@@ -1754,6 +1766,31 @@ type AcceptanceTranscriptRequest struct {
 	Method string `json:"method" jsonschema:"HTTP method"`
 	Path   string `json:"path" jsonschema:"request path (RFC 3986 charset, bounded at backend ingest)"`
 	Status int    `json:"status" jsonschema:"HTTP response status"`
+}
+
+// GroomingApplyStatus is the MCP run-status projection of the detached
+// on-approval grooming apply (E54.77 / #3232). It is DERIVED here from three
+// audit categories the server writes (backend/internal/server/grooming_apply.go
+// + backend/internal/workmgmt/grooming_apply.go); the payload keys it decodes
+// cross the server→mcpserver boundary with NO shared type (the #875 compile
+// trap), so tools_test.go LOADS its fixtures from the goldens in
+// backend/internal/audit/testdata/grooming_apply/ — a key rename on either side
+// reddens a test rather than silently zeroing a count.
+type GroomingApplyStatus struct {
+	State          string `json:"state" jsonschema:"in_flight (no grooming_apply_completed row after the anchor yet) or completed"`
+	CandidateCount int    `json:"candidate_count" jsonschema:"the started row's denominator: how many mutation records the apply will settle"`
+	Recorded       int    `json:"recorded" jsonschema:"per-entry grooming_mutation_applied rows recorded after the anchor (partial past 10 pages of 500)"`
+	Applied        int    `json:"applied" jsonschema:"rows with outcome applied (from the completed summary once it lands, else tallied from the recorded rows)"`
+	Failed         int    `json:"failed" jsonschema:"rows with outcome failed"`
+	Skipped        int    `json:"skipped" jsonschema:"rows with outcome skipped (budget_exhausted is a SUBSET of this count)"`
+	Refused        int    `json:"refused" jsonschema:"rows with outcome refused"`
+	// BudgetExhausted is the over-budget tail: skipped rows whose skip_reason
+	// is apply_budget_exhausted were never evaluated (no mutator, no reader)
+	// and resurface on the next grooming run — the resume path.
+	BudgetExhausted int    `json:"budget_exhausted" jsonschema:"skipped rows carrying skip_reason apply_budget_exhausted — the never-evaluated tail of an over-budget apply; each resurfaces on the next grooming run, so no hand-apply is needed"`
+	Remaining       int    `json:"remaining" jsonschema:"candidate_count - recorded while in flight (floored at 0); 0 once completed"`
+	StartedAt       string `json:"started_at,omitempty" jsonschema:"RFC 3339 timestamp from the started row"`
+	DegradeReason   string `json:"degrade_reason,omitempty" jsonschema:"set only when the completed row is a server-authored degrade (the apply did not run); names why"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -2137,6 +2174,16 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 		acceptanceTranscript = r.acceptanceTranscriptFor(ctx, runID)
 	}
 
+	// Best-effort grooming-apply progress (E54.77 / #3232). One small
+	// grooming_apply_started category read gates the two ledger reads, so an
+	// ordinary run pays one read and stays byte-identical. On any error the
+	// field stays nil — never fails the snapshot. Folded into next_actions
+	// AFTER the other folds so an in-flight apply's re-poll advisory is the
+	// FIRST action: attesting the confirm gate on a partial apply is the
+	// mistake this surface exists to prevent.
+	groomingApplyStatus := r.groomingApplyStatusFor(ctx, runID)
+	foldGroomingApplyAdvisory(runRow, groomingApplyStatus, nextActions)
+
 	// Compact-by-default projection (#1727), applied AFTER all reads and
 	// helper computations (next_actions/wait-status/hints saw the full
 	// data) but BEFORE serialization, so the heavy free-text is stripped
@@ -2211,6 +2258,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 		ChildrenStatus:            childrenStatus,
 		SecurityFindings:          securityFindings,
 		AcceptanceTranscript:      acceptanceTranscript,
+		GroomingApplyStatus:       groomingApplyStatus,
 	}
 
 	// Response byte bound (ADR-077 / #2508). Runs at ONE call site, AFTER the
@@ -2368,6 +2416,176 @@ func decodeAcceptanceTranscriptStatus(raw json.RawMessage) *AcceptanceTranscript
 		SummarySuppressed: block.SummarySuppressed,
 		DisagreeingIDs:    block.DisagreeingIDs,
 	}
+}
+
+// Grooming-apply audit categories (E54.77 / #3232). Literal here because
+// mcpserver does not import workmgmt or server (the #875 compile trap). MUST
+// match backend/internal/server/grooming_apply.go groomingApplyStartedCategory
+// and backend/internal/workmgmt/grooming_apply.go
+// GroomingMutationAppliedCategory / GroomingApplyCompletedCategory; the
+// payload KEYS are pinned by the goldens in
+// backend/internal/audit/testdata/grooming_apply/ that tools_test.go loads.
+const (
+	auditCategoryGroomingApplyStarted    = "grooming_apply_started"
+	auditCategoryGroomingMutationApplied = "grooming_mutation_applied"
+	auditCategoryGroomingApplyCompleted  = "grooming_apply_completed"
+	// groomingSkipReasonApplyBudgetExhausted MUST match
+	// workmgmt.GroomingSkipApplyBudgetExhausted.
+	groomingSkipReasonApplyBudgetExhausted = "apply_budget_exhausted"
+	// groomingApplyStateInFlight / groomingApplyStateCompleted are the closed
+	// GroomingApplyStatus.State vocabulary.
+	groomingApplyStateInFlight  = "in_flight"
+	groomingApplyStateCompleted = "completed"
+	// groomingApplyAuditPageLimit is the server's auditMaxLimit (reads.go);
+	// groomingApplyAuditMaxPages bounds the cursor walk so a pathological
+	// history cannot hold the snapshot open — past it the count is PARTIAL
+	// (fail-open, stated on the DTO), never an error.
+	groomingApplyAuditPageLimit = 500
+	groomingApplyAuditMaxPages  = 10
+)
+
+// groomingApplyStatusFor derives the grooming-apply progress block (E54.77 /
+// #3232). Read order is load-bearing: (1) ONE page of grooming_apply_started
+// — nil when none, so a run that never launched an apply pays exactly this
+// read and issues neither ledger read (a degrade-only apply writes no started
+// row and is already visible on recent_audit; stated residual, not a gap);
+// (2) the NEWEST started row by sequence is the anchor, so a re-approval's
+// fresh apply is not mixed with an older one's rows; (3) grooming_mutation_applied
+// and grooming_apply_completed are each read with SinceSequence = anchor and
+// WALKED by cursor (bounded pages), because a large apply exceeds one page.
+// Counts come from the completed summary once it lands (the writer's own
+// tally) and are tallied from the per-entry rows while in flight. Best-effort:
+// any read/decode error → nil, never failing the snapshot.
+func (r *runResolver) groomingApplyStatusFor(ctx context.Context, runID uuid.UUID) *GroomingApplyStatus {
+	started, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: auditCategoryGroomingApplyStarted,
+	})
+	if err != nil || len(started) == 0 {
+		return nil
+	}
+	anchor := started[0]
+	for _, e := range started[1:] {
+		if e.Sequence > anchor.Sequence {
+			anchor = e
+		}
+	}
+	var startedPayload struct {
+		CandidateCount int    `json:"candidate_count"`
+		StartedAt      string `json:"started_at"`
+	}
+	if !decodeAuditPayloadInto(anchor.Payload, &startedPayload) {
+		return nil
+	}
+	status := &GroomingApplyStatus{
+		State:          groomingApplyStateInFlight,
+		CandidateCount: startedPayload.CandidateCount,
+		StartedAt:      startedPayload.StartedAt,
+	}
+
+	rows, ok := r.walkGroomingApplyAudit(ctx, runID, auditCategoryGroomingMutationApplied, anchor.Sequence)
+	if !ok {
+		return nil
+	}
+	for _, e := range rows {
+		var rec struct {
+			Outcome    string `json:"outcome"`
+			SkipReason string `json:"skip_reason"`
+		}
+		if !decodeAuditPayloadInto(e.Payload, &rec) {
+			return nil
+		}
+		status.Recorded++
+		switch rec.Outcome {
+		case "applied":
+			status.Applied++
+		case "failed":
+			status.Failed++
+		case "skipped":
+			status.Skipped++
+			if rec.SkipReason == groomingSkipReasonApplyBudgetExhausted {
+				status.BudgetExhausted++
+			}
+		case "refused":
+			status.Refused++
+		}
+	}
+
+	completed, ok := r.walkGroomingApplyAudit(ctx, runID, auditCategoryGroomingApplyCompleted, anchor.Sequence)
+	if !ok {
+		return nil
+	}
+	if len(completed) == 0 {
+		status.Remaining = max(status.CandidateCount-status.Recorded, 0)
+		return status
+	}
+	newest := completed[0]
+	for _, e := range completed[1:] {
+		if e.Sequence > newest.Sequence {
+			newest = e
+		}
+	}
+	var summary struct {
+		Applied         int    `json:"applied"`
+		Failed          int    `json:"failed"`
+		Skipped         int    `json:"skipped"`
+		Refused         int    `json:"refused"`
+		BudgetExhausted int    `json:"budget_exhausted"`
+		DegradeReason   string `json:"degrade_reason"`
+	}
+	if !decodeAuditPayloadInto(newest.Payload, &summary) {
+		return nil
+	}
+	status.State = groomingApplyStateCompleted
+	status.Remaining = 0
+	status.Applied = summary.Applied
+	status.Failed = summary.Failed
+	status.Skipped = summary.Skipped
+	status.Refused = summary.Refused
+	status.BudgetExhausted = summary.BudgetExhausted
+	status.DegradeReason = summary.DegradeReason
+	return status
+}
+
+// walkGroomingApplyAudit reads every entry of one category with sequence
+// strictly greater than since, following NextCursor for up to
+// groomingApplyAuditMaxPages pages. A read error on any page returns ok=false
+// (the caller omits the block); exhausting the page cap returns the PARTIAL
+// set with ok=true — fail-open, so a pathological history degrades to an
+// under-count rather than an unbounded walk or a missing block.
+func (r *runResolver) walkGroomingApplyAudit(ctx context.Context, runID uuid.UUID, category string, since int64) ([]AuditEntry, bool) {
+	var out []AuditEntry
+	cursor := ""
+	for page := 0; page < groomingApplyAuditMaxPages; page++ {
+		entries, next, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+			Category:      category,
+			SinceSequence: since,
+			Limit:         groomingApplyAuditPageLimit,
+			Cursor:        cursor,
+		})
+		if err != nil {
+			return nil, false
+		}
+		out = append(out, entries...)
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	return out, true
+}
+
+// decodeAuditPayloadInto re-marshals a decoded audit payload (the client hands
+// back `any`) into the typed target. False on a nil payload or any
+// marshal/unmarshal error — the caller treats that as "omit the block".
+func decodeAuditPayloadInto(payload any, target any) bool {
+	if payload == nil {
+		return false
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	return json.Unmarshal(raw, target) == nil
 }
 
 // latestFixupSequenceFor returns the audit sequence of the most-recent
