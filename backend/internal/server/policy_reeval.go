@@ -35,8 +35,12 @@ import (
 //     transitions, not raw event counts.
 //
 // Runs server-side (rather than as a dispatcher MatchAction) so it
-// sees the stage_checks state ingestCheckRun just wrote. The
-// dispatcher's existing CI-retry path stays as-is; this is a
+// sees the stage_checks state ingestCheckRun just wrote. The checks
+// are READ from the run's REVIEW stage (findCISignalStage, #3489) —
+// the stage ingestCheckRun writes against — while the evaluation
+// itself (the prior-payload lookup and the appended
+// `policy_evaluated` row) stays anchored to the IMPLEMENT stage.
+// The dispatcher's existing CI-retry path stays as-is; this is a
 // distinct concern.
 //
 // Best-effort throughout: failures log but never unwind the webhook
@@ -111,10 +115,19 @@ func (s *Server) reevaluateCIPolicyForPR(
 		return
 	}
 
-	checks, err := s.cfg.StageCheckRepo.LatestForStage(ctx, implStage.ID)
+	// The CI signal is read from the review stage — the stage
+	// ingestCheckRun appends rows to — NOT the implement stage the
+	// evaluation is anchored to (#3489).
+	ciStage := s.findCISignalStage(ctx, parent.ID)
+	if ciStage == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "policy reeval: run has no review stage to read CI checks from",
+			slog.String("run_id", parent.ID.String()))
+		return
+	}
+	checks, err := s.cfg.StageCheckRepo.LatestForStage(ctx, ciStage.ID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "policy reeval: list stage checks failed",
-			slog.String("stage_id", implStage.ID.String()),
+			slog.String("stage_id", ciStage.ID.String()),
 			slog.String("error", err.Error()))
 		return
 	}
@@ -159,17 +172,49 @@ func (s *Server) findLatestRunForPR(ctx context.Context, prURL string) *run.Run 
 }
 
 // findImplementStage returns the implement stage for the run, or
-// nil when none exists.
+// nil when none exists. It anchors the policy evaluation (the
+// prior-payload lookup and the appended `policy_evaluated` row);
+// it is NOT the stage the CI signal is read from — see
+// findCISignalStage.
 func (s *Server) findImplementStage(ctx context.Context, runID uuid.UUID) *run.Stage {
+	return s.findStageOfType(ctx, runID, run.StageTypeImplement)
+}
+
+// findCISignalStage returns the stage whose stage_checks rows carry
+// the run's GitHub CI signal, or nil when the run has none.
+//
+// GitHub `check_run` rows are appended by ingestCheckRun against the
+// run's REVIEW stage(s): stagecheck/queries.sql's
+// FindRunStagesForCheckRun filters `s.stage_type = 'review'` (#254),
+// because the review stage is the only one whose gate is tied to
+// merge state. Every reader of LatestForStage for the CI signal —
+// the deploy gate's ci_green verdict and the post-CI policy re-eval —
+// MUST resolve its stage through this helper; reading any other
+// stage (the implement stage, as both readers did before #3489)
+// reads a stage that never receives a row, so the signal is
+// permanently pending.
+//
+// The FIRST review stage in sequence order is returned. The ingester
+// appends to EVERY review stage the query returns, so any of them
+// carries the same rows; the first is simply the deterministic pick.
+func (s *Server) findCISignalStage(ctx context.Context, runID uuid.UUID) *run.Stage {
+	return s.findStageOfType(ctx, runID, run.StageTypeReview)
+}
+
+// findStageOfType returns the first stage of type t on the run in
+// the repository's sequence order, or nil when none exists or the
+// listing fails (logged at WARN).
+func (s *Server) findStageOfType(ctx context.Context, runID uuid.UUID, t run.StageType) *run.Stage {
 	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "policy reeval: list stages failed",
 			slog.String("run_id", runID.String()),
+			slog.String("stage_type", string(t)),
 			slog.String("error", err.Error()))
 		return nil
 	}
 	for i := range stages {
-		if stages[i].Type == run.StageTypeImplement {
+		if stages[i].Type == t {
 			return stages[i]
 		}
 	}
