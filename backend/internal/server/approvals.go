@@ -1438,13 +1438,18 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 // submission is a delegated / agent one that is recorded-but-never-counted
 // and so not forge-gated. It returns (nil, false) after writing the response
 // on a rejection (403 approver_predicate_unmet), an unresolvable forge (503
-// forge_unavailable, details.retryable:true), or a run forge with no
-// configured identity provider (503 forge_unavailable with
+// forge_unavailable, details.retryable:true), a run forge with no configured
+// identity provider (503 forge_unavailable with
 // details.reason:identity_provider_unconfigured and details.retryable:false,
 // #3466 — the predicate was never evaluated, so no
-// approval_predicate_rejected audit entry is written) — in all three cases no
-// approval row is inserted, so a corrected retry (or a retry once the forge
-// is reachable / the provider is configured) flows normally.
+// approval_predicate_rejected audit entry is written), or a run row that
+// could not be read (503 forge_unavailable with
+// details.reason:run_row_unreadable and details.retryable:true, #3502 — the
+// run's forge and repository are unknown, so the predicate cannot be
+// evaluated and no approval_predicate_rejected audit entry is written) — in
+// all four cases no approval row is inserted, so a corrected retry (or a
+// retry once the forge is reachable / the provider is configured) flows
+// normally.
 //
 // Fail-open on the gate READ: a nil approvals block or a spec-read error
 // falls through to today's path (matching checkApproverAuthorization's
@@ -1541,16 +1546,39 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 	}
 
 	// Resolve the run's target repo ("owner/name") and its forge family
-	// (InstallationRef → observationForgeID; github for a nil ref or a
-	// failed read, matching countEscalatedForgeApprovers). A read failure or
-	// an empty repo leaves resolvePredicates to fail closed (unavailable)
-	// rather than wave the approver through.
-	var repo string
-	var installationRef *string
-	if runRow, rerr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID); rerr == nil {
-		repo = runRow.Repo
-		installationRef = runRow.InstallationRef
+	// (InstallationRef → observationForgeID; github for a nil ref on a
+	// SUCCESSFUL read). A read FAILURE is refused here, before the forge is
+	// derived at all (#3502): defaulting forge to github on an unreadable row
+	// would resolve a member_of-only gate on a GitLab run against the GitHub
+	// provider during a transient store hiccup — the #3466 misdiagnosis
+	// class, surfacing as a misleading 403 approver_predicate_unmet instead
+	// of a retryable 503. This read is the THIRD read of the same run row in
+	// this request (after fetchApprovalsForStage and
+	// resolveStageEscalations), so any error here is transient by
+	// construction — run.ErrNotFound is not special-cased.
+	runRow, rerr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID)
+	if rerr != nil {
+		predicate := "member_of"
+		if effective.minPermission != "" {
+			predicate = "min_permission"
+		}
+		s.writeError(w, r, http.StatusServiceUnavailable, "forge_unavailable",
+			"the run row could not be read, so the run's forge and repository are unknown and the gate's permission/membership predicate could not be evaluated; the approval gate failed closed",
+			map[string]any{
+				"stage_id":  stage.ID.String(),
+				"retryable": true,
+				"reason":    "run_row_unreadable",
+				"error":     rerr.Error(),
+				"predicate": predicate,
+				"ref":       renderMemberOf(effective.memberOf),
+				"next_actions": []string{
+					"Retry the approval; the run row read failed transiently, so the run's forge could not be determined",
+				},
+			})
+		return nil, false
 	}
+	repo := runRow.Repo
+	installationRef := runRow.InstallationRef
 	forge := observationForgeID(installationRef)
 
 	outcome, resolution, predicate := s.resolvePredicates(r.Context(), forge, repo, subject, effective)

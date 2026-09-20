@@ -411,17 +411,23 @@ func (s *Server) distinctEligibleApproverSubjects(ctx context.Context, runID, st
 //
 // The provider is resolved PER RUN FORGE: the same GetRun read that yields the
 // repo also yields InstallationRef, whose forge family (observationForgeID —
-// github for a nil/empty ref or a failed read) keys cfg.IdentityProviders, so a
-// GitLab run's escalated approvers are re-validated against the GitLab provider
-// rather than the GitHub-only singleton.
+// github for a nil/empty ref on a SUCCESSFUL read) keys cfg.IdentityProviders, so
+// a GitLab run's escalated approvers are re-validated against the GitLab
+// provider rather than the GitHub-only singleton. A FAILED read is refused
+// before the forge is derived (#3502) — it returns ok=false rather than
+// defaulting to github, which would re-validate a GitLab run's escalated
+// approvers against the wrong provider during a transient store hiccup; the
+// caller's existing not-advancing posture for ok=false covers this.
 func (s *Server) countEscalatedForgeApprovers(ctx context.Context, stage *run.Stage, subjects []string, effective escalatedApprovals) (int, bool) {
 	var repo string
 	var installationRef *string
 	if s.cfg.RunRepo != nil {
-		if runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID); err == nil {
-			repo = runRow.Repo
-			installationRef = runRow.InstallationRef
+		runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+		if err != nil {
+			return 0, false
 		}
+		repo = runRow.Repo
+		installationRef = runRow.InstallationRef
 	}
 	forge := observationForgeID(installationRef)
 	n := 0

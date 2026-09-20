@@ -3266,6 +3266,7 @@ Unlike `applies_to` there is **no two-phase split**: escalations are evaluated o
 | Membership resolution error on an escalated group | `predicateUnavailable` → 503 `forge_unavailable` (`retryable: true`) | n/a |
 | No configured identity provider for the run's forge (E45.49 / #3466) | `predicateUnconfigured` → 503 `forge_unavailable` (`reason: identity_provider_unconfigured`, `retryable: false`, no `approval_predicate_rejected` audit entry) | escalated count fails closed (ok=false, gate not advanced) |
 | Gate `approvals` block unreadable while an escalation IS firing | retryable 503 `escalation_unevaluable` (`reason: baseline_unreadable`) | n/a |
+| Run row unreadable at the predicate site (E45.58 / #3502) | retryable 503 `forge_unavailable` (`reason: run_row_unreadable`) | escalated count fails closed (ok=false, gate not advanced) |
 
 The last row is #2374, and its reason is that an escalation raises **relative to** the baseline: composing a firing escalation against a `nil` baseline drops the baseline's own `member_of` / `min_permission`, so a `member_of` baseline under a COUNT-ONLY escalation would compose to "the raised count, no membership at all" and admit an out-of-group approver — a shape the count-time forge re-validation does not cover either, since a count-only escalation carries no escalated forge predicate to re-resolve. The refusal is gated strictly on a firing (or unevaluable) escalation: a fetch error with NOTHING escalated keeps the pre-existing baseline fail-**open** read unchanged. It applies at BOTH approval points — `checkApprovalPredicates` returns the 503 pre-Submit, and `approveStageAs` (reached directly by the campaign auto-driver, which has no pre-Submit gate) RECORDS the approval but does NOT advance, the same posture its post-Submit resolver-error branch takes.
 
@@ -4718,6 +4719,22 @@ unparseable-tier `predicateUnavailable` checks run BEFORE the provider lookup
 and shadow it. `countEscalatedForgeApprovers` derives the same forge and
 treats unconfigured as not-countable. Residual: the repo ACL
 (`serve.go::resolveRepoVisibility`) still reads the singular field.
+
+**A failed run-row read is refused, not defaulted to github (E45.58 / #3502).**
+Both call sites read the run row to derive `InstallationRef` before deriving
+the forge. Before #3502 a FAILED read (as opposed to a successful read of a
+nil/empty ref) was silently swallowed the same way as the nil-ref case,
+defaulting `forge` to `github` — so a transient store hiccup on a GitLab run
+could resolve a `member_of`-only gate against the GitHub provider, the same
+misdiagnosis class as the unconfigured-provider defect above. Now a failed
+read is refused BEFORE `observationForgeID` is called at all:
+`checkApprovalPredicates` returns retryable `503 forge_unavailable` with
+`details.reason: run_row_unreadable` and `details.error`, and
+`countEscalatedForgeApprovers` returns `(0, false)`. Neither site special-cases
+`run.ErrNotFound`: the predicate-site read is the THIRD read of the same run
+row within one request (after `fetchApprovalsForStage` and
+`resolveStageEscalations`), so any error reaching it is transient by
+construction.
 
 Two **deliberately redundant** layers keep a NoOp out of the map, and each is
 observed by its own test:

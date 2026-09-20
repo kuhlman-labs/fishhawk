@@ -14786,7 +14786,19 @@ paths:
               `predicate` (`min_permission` | `member_of`), `ref` (the
               `member_of` group when set), and a human-readable
               `next_actions` array instructing the caller to retry once
-              the forge is reachable. The SAME code also carries a
+              the forge is reachable. The SAME code also carries a third
+              shape (E45.58 / #3502): the run row itself could not be
+              read, so the run's forge and repository are unknown and the
+              predicate could not be evaluated even before a provider
+              lookup — never defaulted to `github` (the pre-#3502 defect,
+              which could misroute a GitLab run's gate against the GitHub
+              provider during a transient store hiccup). `details` then
+              carries `retryable: true`, `reason: run_row_unreadable`,
+              `error` (the underlying read error), `predicate`, `ref`,
+              and a `next_actions` array instructing the caller to retry.
+              No approval row is inserted and NO
+              `approval_predicate_rejected` audit entry is written. The
+              SAME code also carries a
               non-retryable shape (E45.49 / #3466): no identity provider
               is configured for the run's forge (the run row's
               `installation_ref` forge family — `github` when absent —
