@@ -52,6 +52,48 @@ type IssueOperations interface {
 	SetIssueState(ctx context.Context, scope CredentialScope, repo RepoRef, number int, u IssueStateUpdate) error
 }
 
+// IssueCommentEditor is the OPTIONAL edit-in-place capability a forge may
+// carry alongside IssueOperations (E45.52 / #3481): post a comment and
+// learn the id the forge assigned it, and later rewrite that comment's
+// body in place. Its consumer is the issuecomment notifier's living anchor
+// (the sticky plan echo), which on GitHub edits one comment across a run's
+// life and needs the same on every other forge that can express it.
+//
+// It is a SEPARATE interface rather than two more IssueOperations methods
+// because it is capability-NEGOTIATED, not required: a consumer holding an
+// IssueOperations type-asserts it to IssueCommentEditor, and a forge that
+// does not implement it is NOT an error — the consumer degrades to
+// append-only (a fresh PostIssueComment per update) and names that on its
+// audit row. Folding the methods into IssueOperations would instead force
+// every forge to fabricate a "no id" post and a failing edit, and would
+// churn every existing implementation and fake for one consumer.
+//
+// Both methods take the issue number even though a GitHub comment id is
+// globally addressable: GitLab's note endpoints are project-AND-issue
+// scoped (PUT /projects/:id/issues/:issue_iid/notes/:note_id), and every
+// caller of this capability already holds the number (the notifier's
+// comment context carries TriggerRef issue:N, and orphan rediscovery runs
+// against that same context), so the argument costs the consumer nothing
+// and spares the adapter a lookup it has no endpoint for.
+//
+// The names deliberately avoid shadowing the GitHub adapter's promoted
+// CreateIssueComment / UpdateIssueComment — the same non-shadowing rule as
+// IssueOperations and FetchFile-vs-GetFile above.
+//
+// Errors: the sentinels in types.go. EditIssueComment MUST return
+// ErrNotFound (errors.Is) when the comment no longer exists, because the
+// notifier's deleted-comment fallback keys on it to create a fresh anchor
+// instead of failing the update.
+type IssueCommentEditor interface {
+	// PostIssueCommentWithID appends body as a new comment on issue number
+	// and returns the forge's id for the created comment (GitHub comment
+	// id, GitLab note id) so a later EditIssueComment can address it.
+	PostIssueCommentWithID(ctx context.Context, scope CredentialScope, repo RepoRef, number int, body string) (int64, error)
+	// EditIssueComment replaces the body of comment commentID on issue
+	// number in place. Returns ErrNotFound when the comment was deleted.
+	EditIssueComment(ctx context.Context, scope CredentialScope, repo RepoRef, number int, commentID int64, body string) error
+}
+
 // Issue is an issue as IssueOperations.FetchIssue reads it back.
 type Issue struct {
 	// Number is the forge's user-facing issue number (GitHub `number`,
