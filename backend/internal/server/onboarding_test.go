@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -2067,5 +2069,237 @@ func TestOnboardingReadiness_ExplicitForgeOverridesRegistry(t *testing.T) {
 	}
 	if projects, _ := gl.calls(); len(projects) != 0 {
 		t.Errorf("gitlab project calls = %v, want 0", projects)
+	}
+}
+
+// --- Validate-then-use trim mismatch (#3488) --------------------------------
+
+// TestOnboardingReadiness_PaddedRepo_TrimmedOnce is the CROSS-BOUNDARY
+// counterfactual vehicle for the single upfront strings.TrimSpace in
+// handleGetOnboardingReadiness: account.ProjectPathWellFormed trims its input
+// INTERNALLY, so a padded repo query passes validation regardless of whether
+// the handler itself trims — the only way to observe a missing trim is to
+// watch what the padded value reaches DOWNSTREAM of validation (the
+// visibility mirror, the forge, and the echoed response field). Deleting the
+// handler's TrimSpace and re-running this test must go RED: sub-test
+// "github" then draws a spurious 403 (the mirror is asked about "  x/y  ", a
+// key its fixture never seeds — the deny is default-false by construction),
+// and sub-test "gitlab" then records the padded project path and echoes the
+// padded repo.
+func TestOnboardingReadiness_PaddedRepo_TrimmedOnce(t *testing.T) {
+	t.Run("github", func(t *testing.T) {
+		fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+		ghSrv := fake.server(t)
+		// Keyed ONLY by the trimmed path: a padded value reaching the
+		// mirror verbatim is denied by construction (the fake's default
+		// answer for an unlisted key is false).
+		vis := newFakeRepoVisibility(map[string]bool{"x/y": true})
+		s := newOnboardingVisServer(t, ghSrv, vis, fakeAccountRoles{role: account.RoleMember}, nil, nil)
+
+		mid := memberIdentity()
+		code, resp := decodeReadiness(t, s, onboardingReq("  x/y  ", &mid))
+		if code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (padded repo trimmed before visibility)", code)
+		}
+		if resp.Repo != "x/y" {
+			t.Errorf("Repo = %q, want the trimmed value echoed", resp.Repo)
+		}
+		vis.mu.Lock()
+		calls := append([]string(nil), vis.calls...)
+		vis.mu.Unlock()
+		if len(calls) != 1 || !strings.HasSuffix(calls[0], "|x/y") {
+			t.Errorf("mirror calls = %v, want exactly one ending in |x/y (trimmed before the visibility check)", calls)
+		}
+		if fake.installationCalls != 1 {
+			t.Errorf("github installation calls = %d, want 1", fake.installationCalls)
+		}
+	})
+
+	t.Run("gitlab", func(t *testing.T) {
+		gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+		s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, nil)
+		id := testOperatorIdentity()
+
+		raw := rawReadiness(t, s, onboardingReqForge("  acme/platform/widgets  ", "gitlab", &id))
+		if raw["repo"] != "acme/platform/widgets" {
+			t.Errorf("repo = %v, want the trimmed value echoed", raw["repo"])
+		}
+		projects, _ := gl.calls()
+		if len(projects) != 1 || projects[0] != "acme/platform/widgets" {
+			t.Errorf("gitlab project calls = %v, want exactly one with the trimmed path "+
+				"(a padded Owner would surface as an escaped-space path)", projects)
+		}
+	})
+
+	// The 400-before-visibility ordering (approval condition 1 / #3348) is
+	// unchanged by the trim: a padded EXPLICIT-github nested path still 400s
+	// naming forge=gitlab, with zero visibility calls.
+	t.Run("padded_nested_github_before_visibility", func(t *testing.T) {
+		gh := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+		vis := newFakeRepoVisibility(map[string]bool{}) // denies everything
+		s := newOnboardingVisServer(t, gh.server(t), vis, fakeAccountRoles{role: account.RoleMember}, nil, nil)
+
+		w := httptest.NewRecorder()
+		s.handleGetOnboardingReadiness(w, onboardingReqForge("  a/b/c  ", "github", ptrIdentity(memberIdentity())))
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (explicit github nested check precedes visibility):\n%s", w.Code, w.Body.String())
+		}
+		var env errorEnvelope
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode error: %v", err)
+		}
+		if env.Error.Code != "validation_failed" || !strings.Contains(env.Error.Message, "forge=gitlab") {
+			t.Errorf("error = %+v, want validation_failed naming forge=gitlab", env.Error)
+		}
+		if vis.callCount() != 0 {
+			t.Errorf("mirror Visible calls = %d, want 0", vis.callCount())
+		}
+		if gh.installationCalls != 0 || gh.specCalls != 0 {
+			t.Errorf("github calls = install:%d spec:%d, want 0/0", gh.installationCalls, gh.specCalls)
+		}
+	})
+}
+
+// --- probeGitLab degrade arms (#3488, issue Notes item 2) -------------------
+
+// gitlabResolveOnlyForge is a forge.Forge implementing only Name() and
+// ResolveRepoScope; the rest embeds a nil forge.Forge, unreachable in these
+// tests. Because forge.FileFetcher (forge.go:137) is a SEPARATE interface
+// from forge.Forge, this type does NOT implement it — an embedded nil
+// forge.Forge cannot satisfy FileFetcher either — so probeGitLab's
+// `f.(forge.FileFetcher)` type assertion fails by construction, exercising
+// the "gitlab forge does not expose file reads" degrade without a special
+// case in the fake.
+type gitlabResolveOnlyForge struct {
+	forge.Forge
+	resolveErr error
+}
+
+func (f *gitlabResolveOnlyForge) Name() string { return "gitlab" }
+
+func (f *gitlabResolveOnlyForge) ResolveRepoScope(_ context.Context, _ forge.RepoRef) (forge.CredentialScope, error) {
+	if f.resolveErr != nil {
+		return forge.CredentialScope{}, f.resolveErr
+	}
+	return forge.CredentialScope{}, nil
+}
+
+// gitlabFetchErrForge adds a failing FetchFile on top of a successfully
+// resolving gitlabResolveOnlyForge, so it DOES implement forge.FileFetcher
+// (unlike its embedded base) and exercises the fetch-fault degrade.
+type gitlabFetchErrForge struct {
+	gitlabResolveOnlyForge
+	fetchErr error
+}
+
+func (f *gitlabFetchErrForge) FetchFile(_ context.Context, _ forge.CredentialScope, _ forge.RepoRef, _, _ string) (*forge.FileContent, error) {
+	return nil, f.fetchErr
+}
+
+// TestOnboardingReadiness_GitLab_ForgeWithoutFileReads: the forge resolves the
+// project but does not implement forge.FileFetcher → 200, app installed (the
+// resolve succeeded), spec unavailable with the file-reads note, empty
+// non-null reviewers, no merge_gate. Counterfactual (run, not reasoned):
+// delete the `fetcher, ok := f.(forge.FileFetcher); if !ok {...}` guard in
+// probeGitLab and call `f.(forge.FileFetcher).FetchFile` directly — this test
+// goes RED with a type-assertion panic recovered/reported by the test
+// runner, restore after observing it.
+func TestOnboardingReadiness_GitLab_ForgeWithoutFileReads(t *testing.T) {
+	f := &gitlabResolveOnlyForge{}
+	s := newOnboardingGitLabServer(t, nil, f, nil, nil)
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	app := rawObject(t, raw, "app")
+	if app["installed"] != true || app["note"] != onboardingGitLabInstalledNote {
+		t.Errorf("app = %v, want installed:true with the gitlab note", app)
+	}
+	if _, present := app["reason"]; present {
+		t.Errorf("app.reason present on a successful resolve: %v", app["reason"])
+	}
+	sp := rawObject(t, raw, "spec")
+	if sp["source"] != "unavailable" || sp["note"] != "gitlab forge does not expose file reads" {
+		t.Errorf("spec = %v, want unavailable + the file-reads note", sp)
+	}
+	rv, ok := raw["reviewers"].([]any)
+	if !ok || len(rv) != 0 {
+		t.Errorf("reviewers = %v, want an empty non-null list", raw["reviewers"])
+	}
+	if _, present := raw["merge_gate"]; present {
+		t.Errorf("merge_gate present on the gitlab family")
+	}
+}
+
+// TestOnboardingReadiness_GitLab_ResolveFault: ResolveRepoScope fails with an
+// error that does NOT wrap forge.ErrNotInstalled → 200, app.installed false
+// with the raw error text as reason, spec unavailable with the
+// resolve-failure note, and a WARN log naming the failure. Counterfactuals
+// (run, not reasoned): (1) delete the s.cfg.Logger.Warn call in this arm of
+// probeGitLab → the log assertion goes RED; (2) change the `default:` case to
+// route through the ErrNotInstalled branch instead → the app.reason
+// assertion goes RED (it would read the register-command reason instead of
+// the raw error text). Restore after each.
+func TestOnboardingReadiness_GitLab_ResolveFault(t *testing.T) {
+	resolveErr := errors.New("gitlab 502 bad gateway")
+	f := &gitlabResolveOnlyForge{resolveErr: resolveErr}
+	s := newOnboardingGitLabServer(t, nil, f, nil, nil)
+	logBuf := &bytes.Buffer{}
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	app := rawObject(t, raw, "app")
+	if app["installed"] != false || app["reason"] != resolveErr.Error() {
+		t.Errorf("app = %v, want installed:false reason=%q", app, resolveErr.Error())
+	}
+	sp := rawObject(t, raw, "spec")
+	const wantNote = "project is not resolvable with the deployment GitLab credential; cannot fetch the workflow spec"
+	if sp["source"] != "unavailable" || sp["note"] != wantNote {
+		t.Errorf("spec = %v, want unavailable + %q", sp, wantNote)
+	}
+	rec := soleLogRecord(t, logBuf, "onboarding readiness: resolve gitlab project failed")
+	if rec["level"] != "WARN" {
+		t.Errorf("log level = %v, want WARN", rec["level"])
+	}
+	if rec["repo"] != "acme/widgets" {
+		t.Errorf("log repo = %v, want acme/widgets", rec["repo"])
+	}
+	if rec["error"] != resolveErr.Error() {
+		t.Errorf("log error = %v, want %q", rec["error"], resolveErr.Error())
+	}
+}
+
+// TestOnboardingReadiness_GitLab_FetchFault: resolve succeeds but FetchFile
+// fails with an error that does NOT wrap forge.ErrNotFound → 200, app
+// installed (resolve succeeded), spec unavailable with the raw error text as
+// note, and a WARN log naming the failure. Counterfactual (run, not
+// reasoned): delete the s.cfg.Logger.Warn call in this arm of probeGitLab →
+// the log assertion goes RED. Restore after observing it.
+func TestOnboardingReadiness_GitLab_FetchFault(t *testing.T) {
+	fetchErr := errors.New("gitlab 500 on repository files")
+	f := &gitlabFetchErrForge{fetchErr: fetchErr}
+	s := newOnboardingGitLabServer(t, nil, f, nil, nil)
+	logBuf := &bytes.Buffer{}
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	app := rawObject(t, raw, "app")
+	if app["installed"] != true {
+		t.Errorf("app = %v, want installed:true (resolve succeeded)", app)
+	}
+	sp := rawObject(t, raw, "spec")
+	if sp["source"] != "unavailable" || sp["note"] != fetchErr.Error() {
+		t.Errorf("spec = %v, want unavailable note=%q", sp, fetchErr.Error())
+	}
+	rec := soleLogRecord(t, logBuf, "onboarding readiness: fetch gitlab workflow spec failed")
+	if rec["level"] != "WARN" {
+		t.Errorf("log level = %v, want WARN", rec["level"])
+	}
+	if rec["repo"] != "acme/widgets" {
+		t.Errorf("log repo = %v, want acme/widgets", rec["repo"])
+	}
+	if rec["error"] != fetchErr.Error() {
+		t.Errorf("log error = %v, want %q", rec["error"], fetchErr.Error())
 	}
 }

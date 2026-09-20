@@ -6901,7 +6901,8 @@ paths:
           description: |
             Target repository: `owner/name` on GitHub, or a `namespace/project`
             path (nested groups allowed) on GitLab. Every component must be
-            non-empty.
+            non-empty. Surrounding whitespace is trimmed before validation and
+            the response echoes the trimmed value.
           schema:
             type: string
           example: kuhlman-labs/fishhawk

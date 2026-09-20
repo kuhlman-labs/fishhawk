@@ -1,0 +1,14 @@
+id: scenario:issue-3488/padded-repo-echoed-trimmed
+statement: GET /v0/onboarding/readiness with a whitespace-padded repo query value (e.g. repo='  x/y  ' url-encoded) from an authenticated bearer-token caller returns 200 and the response body's `repo` field is the trimmed value 'x/y'.
+verify_hint: 'HTTP: GET /v0/onboarding/readiness?repo=%20%20x%2Fy%20%20 with the preview''s bearer token; assert status 200 and body.repo == "x/y" (the github-family probes degrade to a 200 report even with no GitHub App configured on the preview — app.installed false with a reason — so the trimmed echo is observable regardless of forge wiring).'
+steps: 'With an operator bearer (fhk_… minted via `/tmp/fh-acc-fishhawkd token issue -db <preview db> -subject bootstrap -scopes read:onboarding,…`; bearer callers are unfiltered by the visibility gate): GET /v0/onboarding/readiness?repo=%20%20x%2Fy%20%20; GET …?repo=%20%20x%2Fy%20%20&forge=github; GET …?repo=%09x%2Fy%0A (tab/newline padding). Then, to show the trimmed value flows past the echo into the RepoRef split / forge resolve: POST /v0/dev/forge/issues {forge gitlab, repo acme/widgets, project_id 42, number 1, state opened, title seed} -> 201, GET …?repo=acme%2Fwidgets&forge=gitlab and GET …?repo=%20%20acme%2Fwidgets%20%20&forge=gitlab; DELETE /v0/dev/forge afterwards.'
+assertions:
+    expected: 200 and body.repo == 'x/y'.
+    observed_at_record: 'All three padded github-family calls: 200 with body.repo exactly ''x/y'', forge github, app.installed false reason ''githubclient: AppJWT not configured for App-level requests'', merge_gate.remediation ''Install the Fishhawk GitHub App on x/y, then re-run the check.'' (no padding anywhere in the body). GitLab probe: unpadded and padded acme/widgets both 200 with app.installed true (''gitlab: project resolvable with the deployment credential…'') and spec.note ''no workflow spec found on the project default branch'' — identical reports, so the padded repo resolved the same stub project.'
+    repro_handle: 'curl -s ''http://localhost:8090/v0/onboarding/readiness?repo=%20%20x%2Fy%20%20'' -H ''Authorization: Bearer <tok>'''
+origin:
+    issue: 3488
+    pr: 3519
+    run_id: 9c780400-6aa8-422e-a9d6-93e409bf37e0
+    head_sha: 57119f59f75fc4c5b9d5ed9ee38e361e8eb318d5
+    recorded_at: 2026-09-20T07:55:06Z
