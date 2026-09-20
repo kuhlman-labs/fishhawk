@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -221,6 +222,60 @@ func argsHaveFlag(args []string, flag string) bool {
 // TestInvoke_ModelFlag asserts the implement-model routing (#1013): a non-empty
 // Invocation.Model appends `--model <m>` before the positional prompt; an empty
 // Model appends NO --model flag (byte-identical to today's spawn).
+// TestInvoke_ExecWrapper pins the ExecWrapper spawn contract (#3393) at the
+// adapter: with a wrapper the captured process NAME is the wrapper and the
+// argv is wrapper[1:] ++ [binary] ++ <today's args> in that exact order; with
+// an empty wrapper the spawn (name and argv) is byte-identical to the
+// unwrapped pin. Deleting the agent.WrapArgv call reddens the wrapper case.
+func TestInvoke_ExecWrapper(t *testing.T) {
+	capture := func(name *string, args *[]string) func(ctx context.Context, n string, a ...string) *exec.Cmd {
+		return func(ctx context.Context, n string, a ...string) *exec.Cmd {
+			*name = n
+			*args = append([]string(nil), a...)
+			c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+			c.Env = append(os.Environ(), "GO_HELPER_PROCESS=1", "HELPER_MODE=happy")
+			return c
+		}
+	}
+	var plainName string
+	var plainArgs []string
+	plain := &Invoker{Binary: "BINARY", Cmd: capture(&plainName, &plainArgs), Now: frozenNow()}
+	if _, err := plain.Invoke(context.Background(), agent.Invocation{Prompt: "p", Model: "m"}); err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if plainName != "BINARY" {
+		t.Fatalf("unwrapped name = %q, want the binary", plainName)
+	}
+
+	t.Run("wrapper becomes the process name, binary + args appended in order", func(t *testing.T) {
+		var name string
+		var args []string
+		inv := &Invoker{Binary: "BINARY", Cmd: capture(&name, &args), Now: frozenNow()}
+		wrapper := []string{"/fake/sandbox-exec", "-p", "PROFILE"}
+		if _, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p", Model: "m", ExecWrapper: wrapper}); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if name != "/fake/sandbox-exec" {
+			t.Fatalf("name = %q, want the wrapper", name)
+		}
+		want := append([]string{"-p", "PROFILE", "BINARY"}, plainArgs...)
+		if !reflect.DeepEqual(args, want) {
+			t.Fatalf("argv =\n%q\nwant\n%q", args, want)
+		}
+	})
+	t.Run("empty wrapper is byte-identical to the unwrapped spawn", func(t *testing.T) {
+		var name string
+		var args []string
+		inv := &Invoker{Binary: "BINARY", Cmd: capture(&name, &args), Now: frozenNow()}
+		if _, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p", Model: "m", ExecWrapper: []string{}}); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if name != plainName || !reflect.DeepEqual(args, plainArgs) {
+			t.Fatalf("empty wrapper changed the spawn: %q %q vs %q %q", name, args, plainName, plainArgs)
+		}
+	})
+}
+
 func TestInvoke_ModelFlag(t *testing.T) {
 	t.Run("non-empty model appends --model", func(t *testing.T) {
 		var captured []string

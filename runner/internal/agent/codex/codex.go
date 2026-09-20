@@ -188,7 +188,11 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		args = append(args, "--model", inv.Model)
 	}
 	args = append(args, inv.Prompt)
-	cmd := cmdFn(ctx, binary, args...)
+	// An ExecWrapper (the acceptance net sandbox, #3393) becomes the
+	// process name with the binary + args appended positionally; an empty
+	// wrapper leaves the spawn byte-identical.
+	spawnName, spawnArgs := agent.WrapArgv(inv.ExecWrapper, binary, args)
+	cmd := cmdFn(ctx, spawnName, spawnArgs...)
 	cmd.Dir = inv.WorkingDir
 
 	// Put the child in its own process group so a budget/timeout kill can
@@ -275,7 +279,7 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		// rather than leaking a raw fork/exec string.
 		if agent.IsArgListTooLong(err) {
 			return res, fmt.Errorf("%w: prompt %d bytes, argv %d bytes (%s): %v",
-				agent.ErrPromptTooLarge, len(inv.Prompt), agent.ArgvBytes(append([]string{binary}, args...)), binary, err)
+				agent.ErrPromptTooLarge, len(inv.Prompt), agent.ArgvBytes(append([]string{spawnName}, spawnArgs...)), binary, err)
 		}
 		return res, fmt.Errorf("codex: start: %w", err)
 	}

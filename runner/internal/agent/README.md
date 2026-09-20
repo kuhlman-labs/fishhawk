@@ -2,6 +2,10 @@
 
 The agent abstraction (`Invoker`, `Invocation`, `Result`, `Event`) shared by the provider adapters (`claudecode/`, `codex/` — see their READMEs for adapter internals).
 
+## `Invocation.ExecWrapper` — OS-level confinement wrapper (#3393)
+
+`Invocation.ExecWrapper []string`, when non-empty, is a confinement wrapper the adapter execs INSTEAD of the agent binary: the process name is `ExecWrapper[0]` and the argv is `ExecWrapper[1:] ++ [binary] ++ args`. BOTH adapters route their one `cmdFn(ctx, …)` spawn through the shared `agent.WrapArgv(wrapper, binary, args) (name, argv)` so the ordering lives in one place and cannot drift; args ride through positionally, never interpolated. Nil / empty is byte-identical to the unwrapped spawn (`TestWrapArgv`, `claudecode.TestInvoke_ExecWrapper`, `codex.TestInvoke_ExecWrapper`). Everything downstream — `cmd.Dir`, env composition, `Setpgid`, the kill-tree, the out-of-tree detector — is untouched: the wrapped process is still the direct child and group leader. The E2BIG diagnostic (`ArgvBytes`) counts the REAL spawn argv, wrapper and profile included. The runner sets it for the acceptance stage only, to `runner/internal/netsandbox`'s `sandbox-exec -p <profile>` (see that README for the profile, policy and residuals).
+
 ## Trace-line reader (`linereader.go`, #3020)
 
 `TraceLineReader` replaces `bufio.Scanner` in both adapters. It reads the child's newline-delimited trace stream one logical line at a time over `bufio.Reader.ReadSlice`, and — the one behaviour that matters — TRUNCATES a line whose CONTENT exceeds `MaxTraceLineBytes` (4 MiB, ~4x the prior scanner limit) rather than aborting the whole read the way `bufio.Scanner`'s `ErrTooLong` did. It retains the first `max` bytes, discards the rest of the physical line, and CONTINUES on the next line, so an over-long line costs one log line, not the whole pass. `Truncated()` reports the truncation; `OriginalBytes()`/`RetainedBytes()` carry the counts an adapter puts in the `trace_line_truncated` event.

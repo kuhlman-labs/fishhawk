@@ -1145,6 +1145,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	//      (spec-declared target hosts + model APIs + backend). A start
 	//      error fails the stage category-C BEFORE any agent spawn — the
 	//      acceptance agent never runs uncontained.
+	//   2b. The acceptance spawn is wrapped in the OS-level net sandbox
+	//      (Seatbelt via sandbox-exec on macOS, #3393) so no DESCENDANT
+	//      can opt out of the proxy by clearing its env; policy
+	//      FISHHAWK_ACCEPTANCE_NET_SANDBOX, unavailable is LOUD, never
+	//      silent.
 	//   3. The invocation env is REPLACED with the acceptenv minimized
 	//      set (BaseEnv): default-deny essentials + model key +
 	//      operator-declared FISHHAWK_ACCEPTANCE_ENV_* passthrough, with
@@ -1178,6 +1183,32 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		defer func() { _ = proxy.Close() }()
+
+		// OS-level confinement of the WHOLE acceptance process tree (#3393):
+		// the env-carried controls above bind only cooperating processes —
+		// a nested `env -i fishhawk-runner …` inherited none of them and
+		// pushed to the real repository. On macOS the spawn is wrapped in
+		// `sandbox-exec -p <profile>` (runner/internal/netsandbox), whose
+		// Seatbelt profile denies every outbound IP connection except the
+		// proxy's own loopback port and the allow-list's loopback entries;
+		// descendants inherit it regardless of their env. Rendered strictly
+		// AFTER egressproxy.Start (the proxy port is dynamic) and BEFORE the
+		// target gate / tree provisioning. Policy:
+		// FISHHAWK_ACCEPTANCE_NET_SANDBOX=auto|require|off; a failing branch
+		// (invalid mode, require+unavailable, malformed profile) fails
+		// category-C with NO agent spawn — the same shape as the proxy-start
+		// failure right above.
+		sandboxWrapper, sandboxFailReason, sandboxFailDetail := configureAcceptanceNetSandbox(
+			ctx, os.Getenv, proxy.URL(),
+			egressproxy.BuildAllowlist(egressTargetHosts, cfg.backendURL),
+			probeNetSandbox, logSink)
+		if sandboxFailReason != "" {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":%q,"category":"C","detail":%q}`+"\n",
+				sandboxFailReason, sandboxFailDetail)
+			return exitFailure
+		}
+		inv.ExecWrapper = sandboxWrapper
 
 		// Pre-spawn target-identity gate + preview provisioning hook
 		// (E31.18 / #1569): provision (FISHHAWK_ACCEPTANCE_PREVIEW_CMD) →

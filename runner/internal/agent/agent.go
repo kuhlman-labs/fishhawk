@@ -111,6 +111,19 @@ type Invocation struct {
 	// StructuredOutput stays nil).
 	JSONSchema string
 
+	// ExecWrapper, when non-empty, is an OS-level confinement wrapper the
+	// adapter execs INSTEAD of the agent binary: the process name becomes
+	// ExecWrapper[0] and the argv is ExecWrapper[1:] ++ [binary] ++ args
+	// (see WrapArgv — both adapters route through it so they cannot
+	// drift). The wrapper must enclose the WHOLE process tree (the runner
+	// wires runner/internal/netsandbox's `sandbox-exec -p <profile>` here
+	// for the acceptance stage, #3393), so adapters MUST NOT reorder, drop,
+	// or interpolate it, and everything downstream — cmd.Dir, env
+	// composition, Setpgid, the kill-tree, the out-of-tree detector — is
+	// unchanged: the wrapped process is still the direct child and group
+	// leader. Nil / empty is byte-identical to today's spawn.
+	ExecWrapper []string
+
 	// ProgressSink receives single-line JSON stage_progress
 	// heartbeats emitted at a fixed cadence during the invocation
 	// (#580). Each line is a complete `{"event":"stage_progress",...}`
@@ -358,6 +371,24 @@ func ArgvBytes(args []string) int {
 // single errors.Is against syscall.E2BIG.
 func IsArgListTooLong(err error) bool {
 	return errors.Is(err, syscall.E2BIG)
+}
+
+// WrapArgv applies an Invocation.ExecWrapper to a spawn: with an empty
+// wrapper it returns (binary, args) unchanged — byte-identical to today's
+// spawn — and with a non-empty wrapper it returns (wrapper[0],
+// wrapper[1:] ++ [binary] ++ args). args is appended verbatim, never
+// interpolated into the wrapper, so a prompt carrying quotes or shell
+// metacharacters rides through positionally. Shared by every adapter so
+// the wrapper ordering lives in one place.
+func WrapArgv(wrapper []string, binary string, args []string) (name string, argv []string) {
+	if len(wrapper) == 0 {
+		return binary, args
+	}
+	out := make([]string, 0, len(wrapper)+len(args))
+	out = append(out, wrapper[1:]...)
+	out = append(out, binary)
+	out = append(out, args...)
+	return wrapper[0], out
 }
 
 // MakePayload marshals v to a json.RawMessage or panics. Helper for
