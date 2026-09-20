@@ -130,14 +130,25 @@ type Comparison struct {
 // ProjectInfo is the subset of a GET /projects/:id response the adapter
 // reads: the numeric id (echoed for a parse-back sanity check on a
 // "gitlab:<id>" scope ref), the web URL, the default branch (forge
-// Repository), and the namespaced path. Distinct from the package's
-// existing Project (id + web_url only) because the forge adapter also needs
-// the default branch and path; kept additive rather than widening Project.
+// Repository), the namespaced path, and the two merge-requirement settings
+// the forge.CIRequirementReader capability maps (E45.55 / #3490). Distinct
+// from the package's existing Project (id + web_url only) because the forge
+// adapter also needs the default branch and path; kept additive rather than
+// widening Project.
 type ProjectInfo struct {
 	ID                int    `json:"id"`
 	WebURL            string `json:"web_url"`
 	DefaultBranch     string `json:"default_branch"`
 	PathWithNamespace string `json:"path_with_namespace"`
+	// OnlyAllowMergeIfPipelineSucceeds is the project setting that refuses
+	// a merge until the head pipeline succeeds
+	// (https://docs.gitlab.com/api/projects/#get-a-single-project). It is
+	// the GitLab source of forge.CIRequirement.PipelineMustSucceed.
+	OnlyAllowMergeIfPipelineSucceeds bool `json:"only_allow_merge_if_pipeline_succeeds"`
+	// AllowMergeOnSkippedPipeline is the companion setting that lets a
+	// SKIPPED pipeline satisfy the requirement above. It is the GitLab
+	// source of forge.CIRequirement.AllowSkippedPipeline.
+	AllowMergeOnSkippedPipeline bool `json:"allow_merge_on_skipped_pipeline"`
 }
 
 // CreateBranch creates branch pointing at ref (a branch name, tag, or SHA).

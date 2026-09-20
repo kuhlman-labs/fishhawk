@@ -718,6 +718,17 @@ type RunnerKindResolution struct {
 // only reads `required_status_checks.contexts` and the surfaces
 // that contributed; future fields land alongside without a schema
 // migration.
+//
+// Three states, on every forge (E45.55 / #3490): NIL means greenness is
+// UNKNOWN (no snapshot could be taken — the deploy gate refuses
+// snapshot_absent); PRESENT-BUT-EMPTY (zero Contexts, zero Sources) means
+// the forge AUTHORITATIVELY requires nothing, so ci_green is satisfied
+// with no check rows; PRESENT-AND-POPULATED names the contexts that must
+// pass. On GitLab the second state is the
+// `only_allow_merge_if_pipeline_succeeds=false` project, and the third is
+// the single context `gitlab/pipeline` with source
+// `gitlab:only_allow_merge_if_pipeline_succeeds` (see
+// webhook.GitLabPipelineCheckContext).
 type RequiredChecksSnapshot struct {
 	// Contexts is the deduped union of context names across each
 	// surface in Sources. Order is the order discovered (classic
@@ -735,6 +746,18 @@ type RequiredChecksSnapshot struct {
 	// means "greenness unknown", present-but-empty means "nothing
 	// required".
 	Sources []string `json:"sources"`
+	// GitLabAllowSkippedPipeline mirrors the GitLab project setting
+	// `allow_merge_on_skipped_pipeline` at run-create time (E45.55 /
+	// #3490). Set ONLY by the GitLab create path (webhook
+	// handleGitLabCreateRun) alongside the `gitlab/pipeline` context;
+	// consumed by the server's pipeline ingester to decide whether a
+	// `skipped` pipeline maps onto a passing or a failing stage check.
+	// Deliberately NOT omitempty: when a snapshot is present the field is
+	// always serialized, so a stored `false` is an explicit decision that a
+	// reader can distinguish from an absent key only by the surrounding
+	// snapshot's presence. Additive JSONB — a legacy row without the key
+	// (and every GitHub snapshot) decodes false.
+	GitLabAllowSkippedPipeline bool `json:"gitlab_allow_skipped_pipeline"`
 }
 
 // Stage is one ordered unit of work within a run.

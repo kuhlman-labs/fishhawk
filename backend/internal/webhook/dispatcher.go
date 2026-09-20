@@ -1316,6 +1316,16 @@ type Dispatcher struct {
 	// an optional side effect off. See GitLabProjectAuthorizer.
 	GitLabProjects GitLabProjectAuthorizer
 
+	// GitLabCIRequirements reads the project's merge-time CI requirement
+	// (`only_allow_merge_if_pipeline_succeeds` +
+	// `allow_merge_on_skipped_pipeline`) so the GitLab create path can capture
+	// a RequiredChecksSnapshot (E45.55 / #3490). NIL DEGRADES, never refuses:
+	// the run is still minted with a nil snapshot ("greenness unknown") and a
+	// WARN, so a deployment without the seam parks its deploy gate at
+	// snapshot_absent rather than passing ci_green vacuously. A read error
+	// degrades the same way. See captureGitLabRequiredChecks.
+	GitLabCIRequirements forge.CIRequirementReader
+
 	// GitLabTrigger creates the GitLab pipeline both GitLab paths dispatch
 	// through. NIL — the production default — resolves it from the forge
 	// registry via runnerbackend.GitLabPipelineTrigger(), preserving the

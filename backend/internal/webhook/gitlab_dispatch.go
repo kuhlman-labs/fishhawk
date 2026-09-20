@@ -27,18 +27,44 @@ import (
 // It is a SEPARATE path from Handle's GitHub create rather than a shared one
 // for three reasons the shared code cannot absorb: the spec read goes through
 // the forge-neutral FileFetcher (the GitHub client's scope parse rejects a
-// "gitlab:<project_id>" ref outright), there is no branch-protection snapshot
-// to take (GitLab's protected-branches API contributes no required-status
-// contexts, so the snapshot would be empty and the ADR-017 refusal would
-// reject every GitLab run), and the comment-back / board-sync notifiers are
-// GitHub-only. Everything that IS shared — applies_to admission, the blocking
-// budget gate, the coarse plan-reviewer gate, stage creation, the
-// run_dispatched audit — is called here, not reimplemented.
+// "gitlab:<project_id>" ref outright), the RequiredChecksSnapshot comes from a
+// different source with different semantics (GitLab's protected-branches API
+// contributes no required-status contexts; the requirement is the project's
+// single `only_allow_merge_if_pipeline_succeeds` flag read through the
+// forge.CIRequirementReader capability, and an OFF flag is an authoritative
+// present-but-empty snapshot rather than the ADR-017 refusal the GitHub path
+// applies to an empty union — see captureGitLabRequiredChecks, E45.55 /
+// #3490), and the comment-back / board-sync notifiers are GitHub-only.
+// Everything that IS shared — applies_to admission, the blocking budget gate,
+// the coarse plan-reviewer gate, stage creation, the run_dispatched audit — is
+// called here, not reimplemented.
 
 // gitLabWorkflowSpecPath is the repo-relative path of the workflow spec.
 // Mirrors githubclient.WorkflowSpecPath; named locally so this package does
 // not import the GitHub client for a constant.
 const gitLabWorkflowSpecPath = ".fishhawk/workflows.yaml"
+
+// The GitLab CI-requirement snapshot vocabulary (E45.55 / #3490). This file
+// is the SINGLE defining site; the server's pipeline ingester and the
+// stage-check readers name these constants rather than re-spelling them.
+const (
+	// GitLabPipelineCheckContext is the one required-check context a GitLab
+	// run's RequiredChecksSnapshot carries when the project refuses merges
+	// until the pipeline succeeds. It is also the stage_checks check_name the
+	// server's pipeline ingester writes, so the ci_green readers match the
+	// snapshot against the ingested rows by this exact string.
+	GitLabPipelineCheckContext = "gitlab/pipeline"
+	// GitLabPipelineRequirementSource is the snapshot Sources entry naming
+	// the GitLab project setting the context was derived from — the GitLab
+	// analogue of the GitHub `branch_protection` / `ruleset:<id>` entries.
+	GitLabPipelineRequirementSource = "gitlab:only_allow_merge_if_pipeline_succeeds"
+)
+
+// gitLabCIRequirementReadTimeout bounds the ONE forge read the capture step
+// performs, so a slow Projects API cannot hold the webhook receiver past
+// GitLab's delivery timeout. Its expiry is a read error and degrades to a nil
+// snapshot like any other.
+const gitLabCIRequirementReadTimeout = 10 * time.Second
 
 // GitLabProjectAuthorizer answers whether the GitLab project a webhook payload
 // names is one this deployment is REGISTERED to act on. It is the
@@ -229,6 +255,60 @@ func (d *Dispatcher) writeGitLabUnauthorizedProjectAudit(ctx context.Context, ev
 	}
 }
 
+// captureGitLabRequiredChecks resolves the run's RequiredChecksSnapshot from
+// the project's merge-time CI requirement (E45.55 / #3490). It NEVER returns
+// an error: the snapshot is best-effort at create time, and every degrade is
+// a WARN plus a NIL snapshot so the run is still minted and its deploy gate
+// parks at snapshot_absent (greenness unknown) rather than passing vacuously.
+//
+// Three outcomes, mirroring the three states run.RequiredChecksSnapshot
+// documents:
+//
+//   - seam nil, or the read fails → NIL. Greenness unknown.
+//   - PipelineMustSucceed → {Contexts:[gitlab/pipeline],
+//     Sources:[gitlab:only_allow_merge_if_pipeline_succeeds],
+//     GitLabAllowSkippedPipeline: <the project flag>}. The ingester's
+//     `gitlab/pipeline` rows decide ci_green.
+//   - PipelineMustSucceed false → PRESENT-BUT-EMPTY (non-nil, zero contexts,
+//     zero sources; serialises as {"contexts":[],"sources":[],
+//     "gitlab_allow_skipped_pipeline":false}, never null). The project
+//     authoritatively requires nothing, so ci_green is satisfied with no rows.
+//     This is deliberately NOT the ADR-017 empty-snapshot refusal the GitHub
+//     dispatcher applies: there, an empty union means an un-queried or
+//     ungated repo; here the forge answered the question directly.
+func (d *Dispatcher) captureGitLabRequiredChecks(ctx context.Context, ev Event, scope forge.CredentialScope, repo forge.RepoRef) *run.RequiredChecksSnapshot {
+	if d.GitLabCIRequirements == nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"gitlab dispatch: no CI-requirement reader configured; run created without a required-checks snapshot",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("repo", ev.Repo))
+		return nil
+	}
+	readCtx, cancel := context.WithTimeout(ctx, gitLabCIRequirementReadTimeout)
+	defer cancel()
+	req, err := d.GitLabCIRequirements.ReadCIRequirement(readCtx, scope, repo)
+	if err != nil || req == nil {
+		if err == nil {
+			err = errors.New("reader returned a nil requirement with no error")
+		}
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"gitlab dispatch: CI-requirement read failed; run created without a required-checks snapshot",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("repo", ev.Repo),
+			slog.String("credential_ref", ev.CredentialRef),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	if !req.PipelineMustSucceed {
+		return &run.RequiredChecksSnapshot{Contexts: []string{}, Sources: []string{}}
+	}
+	return &run.RequiredChecksSnapshot{
+		Contexts:                   []string{GitLabPipelineCheckContext},
+		Sources:                    []string{GitLabPipelineRequirementSource},
+		GitLabAllowSkippedPipeline: req.AllowSkippedPipeline,
+	}
+}
+
 // handleGitLabCreateRun creates a run from an admitted GitLab trigger.
 //
 // The run is stamped runner_kind=gitlab_ci as a CREATION-TIME HINT with
@@ -334,6 +414,13 @@ func (d *Dispatcher) handleGitLabCreateRun(ctx context.Context, ev Event, m Matc
 		return nil
 	}
 
+	// Step 3.7: the RequiredChecksSnapshot (E45.55 / #3490), captured ONCE
+	// here per the freshness contract and inherited by decomposition
+	// children through run.ChildParamsFrom. After the admission gates so a
+	// refused trigger costs no forge read; before CreateRun so the row is
+	// minted with it. Best-effort: never a refusal, never a 5xx.
+	snapshot := d.captureGitLabRequiredChecks(ctx, ev, scope, repo)
+
 	// Step 4: create the run. installation_ref carries the forge-neutral
 	// credential reference; InstallationID stays nil because a GitLab project
 	// has no GitHub App installation id.
@@ -356,8 +443,9 @@ func (d *Dispatcher) handleGitLabCreateRun(ctx context.Context, ev Event, m Matc
 		// column default (false) — CreateRunParams carries no field for it —
 		// so the runner's signed self-report remains authoritative and can
 		// still contradict this hint without a lock conflict.
-		RunnerKind:      run.RunnerKindGitLabCI,
-		RequiresCharter: &requiresCharter,
+		RunnerKind:             run.RunnerKindGitLabCI,
+		RequiresCharter:        &requiresCharter,
+		RequiredChecksSnapshot: snapshot,
 	})
 	if err != nil {
 		return fmt.Errorf("dispatcher: create gitlab run: %w", err)

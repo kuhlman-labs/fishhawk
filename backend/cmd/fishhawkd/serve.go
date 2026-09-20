@@ -872,6 +872,23 @@ func registeredFileFetcher(id string) forge.FileFetcher {
 	return ff
 }
 
+// registeredCIRequirementReader resolves id from the forge registry as a
+// forge.CIRequirementReader, or nil when the forge is absent (unconfigured)
+// or does not implement the merge-requirement read capability (E45.55 /
+// #3490). The GitLab dispatcher treats nil as "greenness unknown": the run is
+// still minted, with a nil RequiredChecksSnapshot and a WARN.
+func registeredCIRequirementReader(id string) forge.CIRequirementReader {
+	f, err := forge.Get(id)
+	if err != nil {
+		return nil
+	}
+	r, ok := f.(forge.CIRequirementReader)
+	if !ok {
+		return nil
+	}
+	return r
+}
+
 // documentInjectionForgeIDs is the preference order the repo-document
 // injection seam selects a forge in: github first, gitlab as the single-forge
 // fallback. Config.DocumentResolver holds ONE Fetcher and ONE commit resolver,
@@ -2532,6 +2549,15 @@ func runServe(args []string, logSink io.Writer) int {
 			// (E45.22 / #2043). nil — no database — fails closed: GitLab run
 			// creation refuses rather than acting on an unvouched project.
 			GitLabProjects: gitlabProjects,
+			// GitLabCIRequirements reads the project's merge-time CI
+			// requirement so the GitLab create path can capture a
+			// RequiredChecksSnapshot (E45.55 / #3490) — the registered
+			// GitLab forge's forge.CIRequirementReader, resolved the same
+			// way GitLabFiles is. nil when GitLab is unconfigured: the run
+			// is still minted with a nil snapshot (greenness unknown) and
+			// a WARN, so its deploy gate parks at snapshot_absent rather
+			// than passing ci_green vacuously.
+			GitLabCIRequirements: registeredCIRequirementReader("gitlab"),
 			// ApprovalHandler is wired below after the Server
 			// is constructed — the Server implements the
 			// interface and holds all the deps the handler

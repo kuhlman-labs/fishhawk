@@ -909,8 +909,12 @@ func TestGetProjectByID_RequestShapeAndResult(t *testing.T) {
 		if rec.path != "/api/v4/projects/42" {
 			t.Errorf("path = %s", rec.path)
 		}
+		// The two merge-requirement settings ride on the same response
+		// (E45.55 / #3490); their JSON names are pinned here because they
+		// are config-shaped strings no compiler checks.
 		return jsonResponse(http.StatusOK,
-			`{"id":42,"web_url":"https://gl/g/p","default_branch":"main","path_with_namespace":"g/p"}`), nil
+			`{"id":42,"web_url":"https://gl/g/p","default_branch":"main","path_with_namespace":"g/p",`+
+				`"only_allow_merge_if_pipeline_succeeds":true,"allow_merge_on_skipped_pipeline":true}`), nil
 	})
 	pi, err := c.GetProjectByID(context.Background(), 42)
 	if err != nil {
@@ -918,6 +922,12 @@ func TestGetProjectByID_RequestShapeAndResult(t *testing.T) {
 	}
 	if pi.ID != 42 || pi.DefaultBranch != "main" || pi.PathWithNamespace != "g/p" {
 		t.Errorf("project = %+v", pi)
+	}
+	if !pi.OnlyAllowMergeIfPipelineSucceeds {
+		t.Error("OnlyAllowMergeIfPipelineSucceeds = false, want true (json only_allow_merge_if_pipeline_succeeds)")
+	}
+	if !pi.AllowMergeOnSkippedPipeline {
+		t.Error("AllowMergeOnSkippedPipeline = false, want true (json allow_merge_on_skipped_pipeline)")
 	}
 }
 
