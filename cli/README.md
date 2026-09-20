@@ -222,8 +222,11 @@ before the spawn, as before. Explicit flags always win over the row.
 | `--forge gitlab` explicit, `--gitlab-base-url` and/or `--github-repo` omitted | REFUSES, naming each missing flag: the forge is known but the spawn still needs what the row would have supplied. |
 | `--forge github` explicit, only `--github-repo` omitted | Falls through to today's origin auto-detect: the forge is known, and the run-row repo default is a convenience the github path never had. |
 
-**Resolution on a readable row.** forge = flag, else `row.forge` (an empty value from a backend predating the field →
-github). For gitlab: base URL = flag, else `row.forge_base_url`; still empty → REFUSES before any spawn naming
+**Resolution on a readable row.** forge = flag, else `row.forge`, three-way: empty (a backend predating the field) or
+`"github"` → github; `"gitlab"` → gitlab; any other value → **REFUSES to spawn** (`exitFailure`) naming the run id and
+the unknown value, before any spawn — the CLI knows only github and gitlab, so pass `--forge` explicitly or rebuild the
+CLI against the backend that minted the run. This mirrors the MCP spawn producers' `resolveRunForgeTarget` unknown-forge
+arm (`backend/internal/mcpserver/run_stage.go`, E45.59 / #3505). For gitlab: base URL = flag, else `row.forge_base_url`; still empty → REFUSES before any spawn naming
 `--gitlab-base-url` and the two server-side remedies (`FISHHAWKD_GITLAB_BASE_URL` on fishhawkd, or re-registering the
 installation with `--forge-base-url`). repo = flag, else `row.repo` (the project's `path_with_namespace`, nested groups
 intact) — the github.com-only `detectGitHubRepo` is skipped on gitlab. The argv then appends
