@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 282 names are tool I/O request/response structs. The MCP
+// The bulk of these 283 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -165,6 +165,10 @@ var exportBaseline = []string{
 	"GetPlanOutput",
 	"GetRunStatusInput",
 	"GetRunStatusOutput",
+	// E54.77 / #3232: the typed grooming_apply_status block on
+	// fishhawk_get_run_status, exported for the SDK's jsonschema reflection
+	// like every DTO.
+	"GroomingApplyStatus",
 	// #2712: the decoded /healthz slice the restart-strand probe reads
 	// (process_start + the sibling identity fields). Exported alongside the
 	// other apiClient result types.
