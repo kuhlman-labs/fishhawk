@@ -1,0 +1,24 @@
+-- 0084: stage_checks.gitlab_pipeline_id (E45.55 / #3490).
+--
+-- The GitLab Pipeline Hook ingester (server/gitlab_pipeline.go) is the
+-- SECOND writer of stage_checks, beside the GitHub check_run ingester. It
+-- records each pipeline event against the run's review stage under the
+-- check_name 'gitlab/pipeline' and persists the pipeline's instance-global
+-- object_attributes.id here.
+--
+-- The column is NOT only forensic — it is ALSO an ORDERING KEY for the two
+-- latest-row readers (stagecheck/queries.sql::ListStageChecksLatest and
+-- ::GetStageCheckLatest), which order by
+--   [check_name,] gitlab_pipeline_id DESC NULLS LAST, ts DESC
+-- so that within one (stage_id, check_name) the HIGHEST pipeline id is the
+-- latest row regardless of the row's ts or of webhook delivery order. The
+-- same head_sha can carry several pipelines (retry / manual re-run /
+-- merge-request vs branch pipeline) and GitLab pipeline ids are
+-- monotonically increasing per instance, so the newest id is authoritative.
+-- GitHub check_run rows carry NULL here and sort LAST on that key, which
+-- keeps their pure ts ordering byte-identical.
+--
+-- NULLABLE with NO default on purpose: NULL means "not a GitLab pipeline
+-- row", never a pipeline id of 0. No backfill — pre-0084 rows are all
+-- GitHub-sourced and must stay NULL.
+ALTER TABLE stage_checks ADD COLUMN IF NOT EXISTS gitlab_pipeline_id BIGINT;

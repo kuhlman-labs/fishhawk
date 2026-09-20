@@ -1,10 +1,13 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +42,28 @@ func (s *stubFileFetcher) FetchFile(_ context.Context, scope forge.CredentialSco
 		return nil, s.err
 	}
 	return &forge.FileContent{Path: path, Content: s.content, SHA: s.sha}, nil
+}
+
+// stubCIRequirementReader is a forge.CIRequirementReader returning a fixed
+// requirement or a fixed error, recording the scope + repo it was asked for
+// so a test can assert the read addressed the run's project.
+type stubCIRequirementReader struct {
+	req *forge.CIRequirement
+	err error
+
+	calls    int
+	gotScope forge.CredentialScope
+	gotRepo  forge.RepoRef
+}
+
+func (s *stubCIRequirementReader) ReadCIRequirement(_ context.Context, scope forge.CredentialScope,
+	repo forge.RepoRef) (*forge.CIRequirement, error) {
+	s.calls++
+	s.gotScope, s.gotRepo = scope, repo
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.req, nil
 }
 
 // stubGitLabProjects is a GitLabProjectAuthorizer that vouches for an explicit
@@ -729,6 +754,152 @@ func TestGitLabDispatch_PersistsGroomingDetermination(t *testing.T) {
 			}
 			if *got != tc.want {
 				t.Errorf("stored requires_charter = %v, want %v", *got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandle_GitLabTrigger_CapturesCIRequirementSnapshot is the done-means
+// anchor for the GitLab RequiredChecksSnapshot capture (E45.55 / #3490). The
+// context and source strings are config-shaped values the ci_green readers
+// match BYTE-EXACTLY against ingested stage_checks rows, so the cells assert
+// the SHIPPED strings rather than the presence of an edit; and the
+// nil-vs-present-but-empty distinction is what separates "greenness unknown"
+// (deploy gate refuses snapshot_absent) from "nothing required" (ci_green
+// satisfied), so both arms are pinned on the CREATED run's stored value.
+//
+// Every degrade cell asserts the run was still minted with the gitlab:4242
+// scope ref — the capture is best-effort and must never become a refusal.
+func TestHandle_GitLabTrigger_CapturesCIRequirementSnapshot(t *testing.T) {
+	cases := []struct {
+		name string
+		// reader nil → the seam is left unwired.
+		reader *stubCIRequirementReader
+		// wantNil → the stored snapshot must be nil; else wantSnap is
+		// compared field-by-field (Contexts/Sources non-nil, possibly empty).
+		wantNil  bool
+		wantSnap run.RequiredChecksSnapshot
+		// wantWarn is a substring the WARN log must carry on a degrade.
+		wantWarn string
+	}{
+		{
+			name:   "ON + skipped allowed",
+			reader: &stubCIRequirementReader{req: &forge.CIRequirement{PipelineMustSucceed: true, AllowSkippedPipeline: true}},
+			wantSnap: run.RequiredChecksSnapshot{
+				Contexts:                   []string{"gitlab/pipeline"},
+				Sources:                    []string{"gitlab:only_allow_merge_if_pipeline_succeeds"},
+				GitLabAllowSkippedPipeline: true,
+			},
+		},
+		{
+			name:   "ON + skipped disallowed",
+			reader: &stubCIRequirementReader{req: &forge.CIRequirement{PipelineMustSucceed: true, AllowSkippedPipeline: false}},
+			wantSnap: run.RequiredChecksSnapshot{
+				Contexts:                   []string{"gitlab/pipeline"},
+				Sources:                    []string{"gitlab:only_allow_merge_if_pipeline_succeeds"},
+				GitLabAllowSkippedPipeline: false,
+			},
+		},
+		{
+			name: "OFF → present-but-empty, never nil",
+			// AllowSkippedPipeline true here proves the OFF arm does NOT
+			// carry the flag through: with nothing required it is inert.
+			reader:   &stubCIRequirementReader{req: &forge.CIRequirement{PipelineMustSucceed: false, AllowSkippedPipeline: true}},
+			wantSnap: run.RequiredChecksSnapshot{Contexts: []string{}, Sources: []string{}},
+		},
+		{
+			name:     "seam nil → nil snapshot + WARN, run still created",
+			reader:   nil,
+			wantNil:  true,
+			wantWarn: "no CI-requirement reader configured",
+		},
+		{
+			name:     "reader error → nil snapshot + WARN, run still created",
+			reader:   &stubCIRequirementReader{err: errors.New("boom: projects api 502")},
+			wantNil:  true,
+			wantWarn: "CI-requirement read failed",
+		},
+		{
+			// A reader violating its own contract ((nil, nil)) is treated as
+			// a failed read, never dereferenced into a fabricated answer.
+			name:     "reader returns nil requirement with nil error → nil snapshot + WARN",
+			reader:   &stubCIRequirementReader{},
+			wantNil:  true,
+			wantWarn: "reader returned a nil requirement with no error",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _, _, runs, _ := newGitLabDispatcher(t, validSpec)
+			var logBuf bytes.Buffer
+			d.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			if tc.reader != nil {
+				d.GitLabCIRequirements = tc.reader
+			}
+
+			if err := d.Handle(context.Background(), gitlabIssueTriggerEvent()); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(runs.created) != 1 {
+				t.Fatalf("runs.created = %d, want 1 (the capture must never refuse the run)", len(runs.created))
+			}
+			created := runs.created[0]
+			if created.InstallationRef == nil || *created.InstallationRef != "gitlab:4242" {
+				t.Errorf("installation_ref = %v, want gitlab:4242", created.InstallationRef)
+			}
+
+			if tc.reader != nil && tc.reader.calls == 1 {
+				// The read addressed the run's own project.
+				if tc.reader.gotScope.Ref() != "gitlab:4242" {
+					t.Errorf("ReadCIRequirement scope ref = %q, want gitlab:4242", tc.reader.gotScope.Ref())
+				}
+				if tc.reader.gotRepo.String() != "acme/widgets" {
+					t.Errorf("ReadCIRequirement repo = %q, want acme/widgets", tc.reader.gotRepo.String())
+				}
+			} else if tc.reader != nil {
+				t.Errorf("ReadCIRequirement calls = %d, want exactly 1", tc.reader.calls)
+			}
+
+			got := created.RequiredChecksSnapshot
+			if tc.wantNil {
+				if got != nil {
+					t.Fatalf("snapshot = %+v, want nil (greenness unknown)", *got)
+				}
+				if !strings.Contains(logBuf.String(), tc.wantWarn) || !strings.Contains(logBuf.String(), "level=WARN") {
+					t.Errorf("log = %q, want a WARN containing %q", logBuf.String(), tc.wantWarn)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("snapshot = nil, want a present snapshot")
+			}
+			// Contexts/Sources must be NON-NIL slices even when empty so the
+			// present-but-empty arm serialises as [] rather than null.
+			if got.Contexts == nil || got.Sources == nil {
+				t.Fatalf("snapshot slices nil (%+v); want non-nil so JSON carries [] not null", *got)
+			}
+			if !slices.Equal(got.Contexts, tc.wantSnap.Contexts) {
+				t.Errorf("contexts = %v, want %v", got.Contexts, tc.wantSnap.Contexts)
+			}
+			if !slices.Equal(got.Sources, tc.wantSnap.Sources) {
+				t.Errorf("sources = %v, want %v", got.Sources, tc.wantSnap.Sources)
+			}
+			if got.GitLabAllowSkippedPipeline != tc.wantSnap.GitLabAllowSkippedPipeline {
+				t.Errorf("gitlab_allow_skipped_pipeline = %v, want %v",
+					got.GitLabAllowSkippedPipeline, tc.wantSnap.GitLabAllowSkippedPipeline)
+			}
+			// The wire shape: the flag is ALWAYS serialised when the snapshot
+			// is present (no omitempty — operator condition 2), and the empty
+			// arm carries [] not null.
+			b, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if !strings.Contains(string(b), `"gitlab_allow_skipped_pipeline":`) {
+				t.Errorf("json = %s, want gitlab_allow_skipped_pipeline always present", b)
+			}
+			if len(tc.wantSnap.Contexts) == 0 && string(b) != `{"contexts":[],"sources":[],"gitlab_allow_skipped_pipeline":false}` {
+				t.Errorf("present-but-empty json = %s", b)
 			}
 		})
 	}

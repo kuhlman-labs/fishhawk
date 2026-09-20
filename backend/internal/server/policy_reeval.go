@@ -84,6 +84,22 @@ func (s *Server) reevaluateCIPolicyForPR(
 	if parent == nil {
 		return
 	}
+	s.reevaluateCIPolicyForRun(ctx, parent, checkName)
+}
+
+// reevaluateCIPolicyForRun runs the post-CI re-eval for ONE already-
+// resolved run and the check that just terminated. It holds everything
+// from the required-check filter onward; reevaluateCIPolicyForPR is the
+// GitHub caller (resolving the run by PR URL), and the GitLab pipeline
+// ingester (gitlab_pipeline.go) calls it once per run whose review
+// stage received a `gitlab/pipeline` row — the ingester already holds
+// the run (it read the snapshot flag from it), and a GitLab run's
+// pull_request_url is not the lookup key the pipeline hook carries
+// (E45.55 / #3490). Same best-effort contract as the caller.
+func (s *Server) reevaluateCIPolicyForRun(ctx context.Context, parent *run.Run, checkName string) {
+	if parent == nil {
+		return
+	}
 	if !isRequiredCheck(parent.RequiredChecksSnapshot, checkName) {
 		return
 	}

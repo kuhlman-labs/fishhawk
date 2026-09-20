@@ -13735,6 +13735,16 @@ paths:
                         github_check_run_id:
                           type: [integer, "null"]
                           format: int64
+                        gitlab_pipeline_id:
+                          type: [integer, "null"]
+                          format: int64
+                          description: |
+                            The GitLab pipeline's instance-global `object_attributes.id`
+                            for a `gitlab/pipeline` row written by the Pipeline Hook
+                            ingester (E45.55 / #3490); omitted for GitHub-sourced rows.
+                            Within one check name the highest id is the latest row
+                            regardless of `ts` — the same head SHA can carry several
+                            pipelines (retry, manual re-run).
                         ts:
                           type: string
                           format: date-time
@@ -18257,10 +18267,22 @@ paths:
         verbatim `X-Gitlab-Token` secret (GitLab sends the configured
         token, not an HMAC); deliveries dedup by `X-Gitlab-Event-UUID`
         (namespaced into the shared delivery store). Issue-label and note
-        triggers route through the shared dispatcher; a merge/close drives
-        the review-stage state machine. Actual run creation from GitLab
-        triggers is the CI/dispatch phase's work (E45.8 / #1861). See
-        E45.6 (#1860).
+        triggers route through the shared dispatcher (an admitted issue
+        trigger mints the run and captures its required-checks snapshot
+        from the project's `only_allow_merge_if_pipeline_succeeds` /
+        `allow_merge_on_skipped_pipeline` settings, E45.55 / #3490); a
+        merge/close drives the review-stage state machine. A Pipeline
+        Hook (`object_kind: pipeline`, every status) is recorded as a
+        `gitlab/pipeline` stage check on the review stage of every run
+        whose `pull_request` artifact matches the pipeline's SHA (and MR
+        iid when present) AND whose `repo` + `installation_ref` match the
+        delivering project — a fork sharing the SHA never receives a row —
+        then the post-CI policy evaluation re-runs for each such run, so
+        `ci_green` is a real signal on GitLab. A `skipped` pipeline passes
+        only when the run's snapshot carries
+        `gitlab_allow_skipped_pipeline: true`; otherwise it is recorded
+        with the fail-bucket conclusion `skipped_not_allowed`. Pipeline
+        ingest is best-effort and never changes the 202. See E45.6 (#1860).
       tags: [webhooks]
       security: []
       parameters:

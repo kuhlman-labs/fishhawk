@@ -4289,6 +4289,35 @@ func TestGitLabIdentityWarnings(t *testing.T) {
 	}
 }
 
+// TestRegisteredCIRequirementReader pins the three-way resolution the GitLab
+// dispatcher's RequiredChecksSnapshot capture depends on (E45.55 / #3490):
+// an unregistered id and a registered forge that lacks the read capability
+// both yield nil (greenness unknown — the run is still minted with a nil
+// snapshot), while the real GitLab adapter resolves as the reader. It mutates
+// the process-wide registry, so each id is unique to this test except
+// "gitlab", which TestResolveGitLabForge registers the same adapter under.
+func TestRegisteredCIRequirementReader(t *testing.T) {
+	if r := registeredCIRequirementReader("cireq-unregistered"); r != nil {
+		t.Errorf("unregistered id resolved %T, want nil", r)
+	}
+	forge.Register(&fetchlessForge{name: "cireq-readerless"})
+	if r := registeredCIRequirementReader("cireq-readerless"); r != nil {
+		t.Errorf("forge without ReadCIRequirement resolved %T, want nil", r)
+	}
+	glForge := resolveGitLabForge("https://gitlab.com", "glpat-tok")
+	if glForge == nil {
+		t.Fatal("resolveGitLabForge = nil with both base URL and token set")
+	}
+	forge.Register(glForge)
+	r := registeredCIRequirementReader("gitlab")
+	if r == nil {
+		t.Fatal("registered gitlab adapter did not resolve as a forge.CIRequirementReader")
+	}
+	if _, ok := r.(forge.Forge); !ok || r.(forge.Forge).Name() != "gitlab" {
+		t.Errorf("resolved reader is %T, want the registered gitlab adapter", r)
+	}
+}
+
 // TestWebhookDispatcher_WiresGitLabFileFetcher pins the GitLab run-creation
 // wiring (E45.22 / #2043). The dispatcher literal lives inside serve's
 // several-hundred-line config assembly, which no unit test can construct, so
@@ -4306,6 +4335,10 @@ func TestGitLabIdentityWarnings(t *testing.T) {
 //     gitlab_project_registry_unwired. Safe, but it turns GitLab go-live off
 //     entirely while the whole unit suite stays green, because those tests
 //     supply their own authorizer.
+//   - GitLabCIRequirements nil (E45.55 / #3490) mints every GitLab run with a
+//     NIL RequiredChecksSnapshot and a WARN, so every GitLab deploy gate
+//     parks at snapshot_absent — safe, but ci_green never becomes a real
+//     signal, and the webhook unit tests supply their own reader.
 func TestWebhookDispatcher_WiresGitLabFileFetcher(t *testing.T) {
 	src, err := os.ReadFile("serve.go")
 	if err != nil {
@@ -4326,6 +4359,8 @@ func TestWebhookDispatcher_WiresGitLabFileFetcher(t *testing.T) {
 			"GitLab run creation would be a silent no-op"},
 		{`GitLabProjects: gitlabProjects`,
 			"every GitLab delivery would fail closed as gitlab_project_registry_unwired"},
+		{`GitLabCIRequirements: registeredCIRequirementReader("gitlab")`,
+			"every GitLab run would carry a nil RequiredChecksSnapshot and its deploy gate would park at snapshot_absent"},
 	} {
 		if !strings.Contains(literal, want.line) {
 			t.Errorf("webhook.Dispatcher literal is missing %s; %s. Literal:\n%s",

@@ -38,6 +38,7 @@ func (r *postgresRepo) Append(ctx context.Context, p AppendParams) (*Check, erro
 		Conclusion:       p.Conclusion,
 		HeadSha:          p.HeadSHA,
 		GithubCheckRunID: p.GitHubCheckRunID,
+		GitlabPipelineID: p.GitLabPipelineID,
 		Ts:               pgtype.Timestamptz{Time: p.Timestamp, Valid: true},
 		Payload:          payload,
 	})
@@ -92,6 +93,24 @@ func (r *postgresRepo) FindMatchingStages(ctx context.Context, prNumber int, hea
 	return out, nil
 }
 
+func (r *postgresRepo) FindMatchingStagesForGitLabPipeline(ctx context.Context, m GitLabPipelineMatch) ([]StageRef, error) {
+	q := stagecheckdb.New(r.pool)
+	rows, err := q.FindRunStagesForGitLabPipeline(ctx, stagecheckdb.FindRunStagesForGitLabPipelineParams{
+		HeadSha:         m.HeadSHA,
+		MrIid:           int32(m.MergeRequestIID),
+		Repo:            m.Repo,
+		InstallationRef: m.InstallationRef,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("find matching stages for gitlab pipeline: %w", err)
+	}
+	out := make([]StageRef, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, StageRef{StageID: row.StageID, RunID: row.RunID})
+	}
+	return out, nil
+}
+
 func rowToCheck(r stagecheckdb.StageCheck) *Check {
 	out := &Check{
 		ID:               r.ID,
@@ -102,6 +121,7 @@ func rowToCheck(r stagecheckdb.StageCheck) *Check {
 		Conclusion:       r.Conclusion,
 		HeadSHA:          r.HeadSha,
 		GitHubCheckRunID: r.GithubCheckRunID,
+		GitLabPipelineID: r.GitlabPipelineID,
 		Timestamp:        r.Ts.Time,
 		Payload:          json.RawMessage(r.Payload),
 	}

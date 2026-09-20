@@ -36,6 +36,35 @@ func TestDeriveState(t *testing.T) {
 	}
 }
 
+// TestDeriveState_SkippedNotAllowedIsFail pins the ONE non-GitHub
+// conclusion (E45.55 / #3490): the GitLab pipeline ingester records a
+// `skipped` pipeline as `skipped_not_allowed` when the run's snapshot
+// does not carry allow_merge_on_skipped_pipeline, and DeriveState must
+// read that as FAIL — not borrow the GitHub skipped-is-pass rule, and
+// not fall into the unknown-conclusion pending bucket (which would let a
+// pending row hide a merge GitLab itself would refuse). The sibling
+// `skipped` cell stays pass, so the two conclusions are distinguishable
+// by the reader, not only by the writer.
+func TestDeriveState_SkippedNotAllowedIsFail(t *testing.T) {
+	if got := stagecheck.DeriveState("completed", ptr("skipped_not_allowed")); got != stagecheck.StateFail {
+		t.Errorf("DeriveState(completed, skipped_not_allowed) = %q, want %q", got, stagecheck.StateFail)
+	}
+	if got := stagecheck.DeriveState("completed", ptr("skipped")); got != stagecheck.StatePass {
+		t.Errorf("DeriveState(completed, skipped) = %q, want %q (the allowed arm is unchanged)", got, stagecheck.StatePass)
+	}
+	// Not completed → pending regardless of conclusion; the fail
+	// verdict is reserved for a terminal pipeline.
+	if got := stagecheck.DeriveState("in_progress", ptr("skipped_not_allowed")); got != stagecheck.StatePending {
+		t.Errorf("DeriveState(in_progress, skipped_not_allowed) = %q, want %q", got, stagecheck.StatePending)
+	}
+	// skipped_not_allowed is NOT a supersession: RedVerdict must be red so
+	// the drive ci_failed park (#3414) trips on it.
+	c := &stagecheck.Check{State: stagecheck.StateFail, Conclusion: ptr("skipped_not_allowed")}
+	if !c.RedVerdict() {
+		t.Errorf("RedVerdict() = false for skipped_not_allowed, want true (it is a verdict about the merge, not a supersession)")
+	}
+}
+
 func TestConclusionSuperseded(t *testing.T) {
 	cases := []struct {
 		name       string

@@ -1,14 +1,22 @@
 // Package stagecheck records and reads the state of each blocking
 // check declared on a workflow-spec gate (#228). Two writers feed
 // it today: GitHub `check_run` webhook events for ci_pass-style
-// external checks, and (in #229) the backend's own audit-completeness
-// derivation. Two readers consume it: the review-stage detail page
-// (read-only render) and the approval handler (gate enforcement).
+// external checks, and GitLab Pipeline Hook events recorded under
+// the `gitlab/pipeline` check name (E45.55 / #3490); the backend's
+// own audit-completeness derivation (#229) is the unfilled third.
+// Two readers consume it: the review-stage detail page (read-only
+// render) and the deploy gate's ci_green verdict.
 //
 // Rows are append-only — every status update writes a new row, and
 // the latest per (stage_id, check_name) is what consumers see. The
 // retention story matches audit_entries: nothing is ever mutated
 // or deleted.
+//
+// "Latest" is STRUCTURAL, not a guard in the writer: both latest-row
+// readers order by `gitlab_pipeline_id DESC NULLS LAST, ts DESC`, so
+// within one (stage_id, check_name) the highest GitLab pipeline id is
+// the latest row regardless of ts or delivery order, while GitHub rows
+// (NULL id) keep pure ts ordering. See README.md § Precedence.
 package stagecheck
 
 import (
@@ -51,6 +59,12 @@ type Check struct {
 	Conclusion       *string // verbatim GitHub conclusion (success / failure / …)
 	HeadSHA          string
 	GitHubCheckRunID *int64
+	// GitLabPipelineID is the GitLab pipeline's instance-global
+	// object_attributes.id for a `gitlab/pipeline` row; nil for every
+	// GitHub-sourced row. Beyond forensics it is an ORDERING KEY: the
+	// latest-row readers sort it DESC NULLS LAST ahead of ts, so the
+	// highest id wins within a check_name (#3490).
+	GitLabPipelineID *int64
 	Timestamp        time.Time
 	Payload          json.RawMessage
 }
@@ -65,8 +79,33 @@ type AppendParams struct {
 	Conclusion       *string
 	HeadSHA          string
 	GitHubCheckRunID *int64
+	GitLabPipelineID *int64 // see Check.GitLabPipelineID; nil for GitHub rows
 	Timestamp        time.Time
 	Payload          json.RawMessage
+}
+
+// StageRef names one stage together with the run that owns it. The
+// GitLab pipeline ingester needs both: the stage to append the row to,
+// and the run to read the RequiredChecksSnapshot flag from and to
+// re-run the post-CI policy evaluation for.
+type StageRef struct {
+	StageID uuid.UUID
+	RunID   uuid.UUID
+}
+
+// GitLabPipelineMatch is the project-scoped key the GitLab pipeline
+// ingester resolves to review stages. Repo AND InstallationRef are
+// BOTH required: a fork of the same project can carry the same
+// head_sha and the same merge-request iid, and only the pair
+// (runs.repo, runs.installation_ref) pins the row to the project the
+// webhook actually came from. MergeRequestIID 0 means "no
+// pr_number filter" — a branch pipeline that carries no merge_request
+// still matches the run by head_sha alone.
+type GitLabPipelineMatch struct {
+	Repo            string
+	InstallationRef string
+	HeadSHA         string
+	MergeRequestIID int
 }
 
 // Repository is the persistence surface for stage check states.
@@ -98,6 +137,17 @@ type Repository interface {
 	// matches — the check_run event is for a non-Fishhawk PR or a
 	// PR that doesn't gate on this check.
 	FindMatchingStages(ctx context.Context, prNumber int, headSHA, checkName string) ([]uuid.UUID, error)
+
+	// FindMatchingStagesForGitLabPipeline is the GitLab Pipeline Hook
+	// sibling of FindMatchingStages (E45.55 / #3490): it walks the
+	// same artifacts → implement stage → run → review stage path but
+	// is PROJECT-SCOPED — a run matches only when BOTH runs.repo and
+	// runs.installation_ref equal the match's, so a fork sharing the
+	// head_sha and the merge-request iid never receives a row.
+	// MergeRequestIID 0 disables the pr_number predicate. Returns the
+	// (stage, run) pairs in run-creation then stage-sequence order;
+	// empty when nothing matches.
+	FindMatchingStagesForGitLabPipeline(ctx context.Context, m GitLabPipelineMatch) ([]StageRef, error)
 }
 
 // DeriveState rolls a GitHub `check_run.status` + `conclusion`
@@ -128,6 +178,14 @@ func DeriveState(status string, conclusion *string) State {
 		// Treating as pass matches GitHub's own UI semantics.
 		return StatePass
 	case "failure", "timed_out", "cancelled", "action_required", "stale", "startup_failure":
+		return StateFail
+	case "skipped_not_allowed":
+		// The ONE non-GitHub conclusion (E45.55 / #3490): the GitLab
+		// pipeline ingester records a `skipped` pipeline under this
+		// conclusion when the run's RequiredChecksSnapshot does NOT
+		// carry allow_merge_on_skipped_pipeline — GitLab itself would
+		// refuse the merge, so the gate must read it as fail rather
+		// than borrow GitHub's skipped-is-pass semantics above.
 		return StateFail
 	default:
 		// Unknown conclusion → pending so we don't accidentally
