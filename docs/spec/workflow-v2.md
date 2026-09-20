@@ -572,7 +572,33 @@ Deploy stages only. `executor.delegate` names the external pipeline via a `targe
 | `target` | Required | Optional | Meaning |
 |---|---|---|---|
 | `github_actions` | `workflow_ref` | `git_ref` | Dispatch a GitHub Actions workflow via `workflow_dispatch`. `workflow_ref` is the workflow file or id (e.g. `deploy.yml`); `git_ref` is the branch, tag or sha to dispatch against — absent means the provider default. Requires a GitHub App installation on the run (`installation_id`); a run created for GitLab has none, so the deploy stage fails at trigger time with a message naming `webhook` (#3465). |
-| `webhook` | `url` | — | POST the deploy trigger to a generic webhook endpoint. Forge-neutral — the deploy path for GitLab-created runs ([docs/deploy/gitlab.md](../deploy/gitlab.md)). |
+| `webhook` | `url` | `secret_env`, `secret_header`, `secret_field` | POST the deploy trigger to a generic webhook endpoint. Forge-neutral — the deploy path for GitLab-created runs ([docs/deploy/gitlab.md](../deploy/gitlab.md)). The three optional fields are the **secret channel** (E45.57 / #3497), below. |
+
+#### Webhook secret channel
+
+Never put a credential in `url`: the URL is committed with this document and recorded verbatim in audit payloads. Declare the credential's **name** instead and fishhawkd resolves its value at dispatch:
+
+- `secret_env` — the name of an environment variable (`^[A-Za-z_][A-Za-z0-9_]*$`) read from **fishhawkd's own process environment** at deploy dispatch — the process that runs `fishhawkd`, not the runner host or the MCP host. The value is never in this document. Unset **or empty** at dispatch fails the deploy stage category C with a `deployment_dispatch_failed` row naming the **variable**, before any request leaves the process. On rollback the same refusal is a `502 rollback_dispatch_failed` naming the variable.
+- `secret_header` — the request header that carries the value. Defaults to `PRIVATE-TOKEN` (GitLab's access-token header) when `secret_env` is set and `secret_field` is not.
+- `secret_field` — a **top-level JSON body key** that carries the value instead of a header (GitLab's pipeline-trigger `token`).
+
+The schema enforces that neither `secret_header` nor `secret_field` may be declared without `secret_env` (`dependentRequired`) and that the two placements are mutually exclusive (`not: {required: [secret_header, secret_field]}`). Both the CLI and the backend apply those.
+
+**Two further rules are enforced SERVER-SIDE at run admission (`POST /v0/runs`) ONLY — `fishhawk validate` is schema-only and ACCEPTS such a spec:**
+
+1. `secret_env` MUST NOT start with `FISHHAWKD_` or `FISHHAWK_` — Fishhawk's own configuration namespace. A committed spec naming `FISHHAWKD_DATABASE_URL` would otherwise exfiltrate fishhawkd's own credentials to an arbitrary URL. (The JSON Schema cannot express a negative prefix: the validator compiles `pattern` with Go regexp, which has no lookahead.)
+2. `secret_field` MUST NOT be one of the **reserved trigger-body keys** the POST already writes — `fishhawk_run_id`, `fishhawk_stage_id`, `fishhawk_rollback`, `repo`, `workflow_id`, `variables` (`spec.WebhookReservedBodyKeys`). The correlation marker would be overwritten silently otherwise; for `fishhawk_rollback` the receiver would lose the rollback/forward distinction.
+
+**Wire shape and two intentional tightenings (accepted for every webhook target, not only GitLab).** The trigger body carries the flat correlation keys as before **plus** an additive `variables` object (`FISHHAWK_RUN_ID`, `FISHHAWK_STAGE_ID`, `FISHHAWK_REPO`, `FISHHAWK_WORKFLOW_ID`, and `FISHHAWK_ROLLBACK: "true"` on rollback) so a GitLab pipeline trigger targeted directly receives them as CI variables — a relay decoding into a struct ignores it; one validating with `additionalProperties: false` must admit it. And fishhawkd **never follows a redirect** from the target: a 3xx fails the stage (or the rollback) carrying **only the status code** — never the `Location` header, never the response body — and an unparsable `Location` is reported as the fixed error class `redirect_parse`. A target that previously relied on fishhawkd following a 3xx now fails with that status. Transport failures are reported by class (`timeout`, `dns`, `connection_refused`, `tls`, `redirect_parse`, `other`) plus the committed `url`, and the resolved value is redacted from every reason, detail, error and log line. The `deployment_dispatched` / `deployment_rollback_initiated` payloads record `secret_env` and `secret_placement` (`header` | `body`) — names only.
+
+```yaml
+executor:
+  delegate:
+    target: webhook
+    url: https://gitlab.example.com/api/v4/projects/42/trigger/pipeline?ref=main
+    secret_env: DEPLOY_TRIGGER_TOKEN
+    secret_field: token
+```
 
 ### Agent version compatibility
 
@@ -1137,7 +1163,7 @@ test_conventions:
 | `executor.agent_self_retry` | `true` \| `false` (default `false`) | agent branch only |
 | `executor.timeout`, `executor.verify.timeout`, `policy.max_stage_runtime`, `budget.max_runtime` | `^([0-9]+(ns\|us\|ms\|s\|m\|h))+$` | one duration grammar throughout v2 |
 | `executor.verify.max_iterations` | integer `>= 0` (default `0`) | `0` = single-shot gate |
-| `executor.delegate.target` | `github_actions` \| `webhook` | `workflow_ref` (+ optional `git_ref`), or `url` |
+| `executor.delegate.target` | `github_actions` \| `webhook` | `workflow_ref` (+ optional `git_ref`), or `url` (+ optional `secret_env`, `secret_header` \| `secret_field`) |
 | `reviewers.agents[].provider` | `anthropic` \| `claudecode` \| `codex` | must be a configured capability on the deployment |
 | `reviewers.agents[].reasoning_effort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | codex-only |
 | `reviewers.agents[].optional` | `true` \| `false` (default `false`) | per-reviewer degradation policy |

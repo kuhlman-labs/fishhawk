@@ -1,13 +1,21 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -202,7 +210,7 @@ func TestTriggerDeploy_GitHubActions_UnresolvedStillParks(t *testing.T) {
 // awaiting_deployment.
 func TestTriggerDeploy_Webhook_PostsAndParks(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
-	var gotBody map[string]string
+	var gotBody map[string]any
 	hooked := make(chan struct{}, 1)
 	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
@@ -229,9 +237,21 @@ func TestTriggerDeploy_Webhook_PostsAndParks(t *testing.T) {
 	if gotBody["fishhawk_run_id"] != stage.RunID.String() {
 		t.Errorf("webhook body run_id = %q", gotBody["fishhawk_run_id"])
 	}
+	// The `variables` object repeats the correlation in CI-variable form
+	// (E45.57 / #3497) so a GitLab trigger pipeline receives $FISHHAWK_RUN_ID.
+	vars, _ := gotBody["variables"].(map[string]any)
+	if vars["FISHHAWK_RUN_ID"] != stage.RunID.String() {
+		t.Errorf("webhook body variables.FISHHAWK_RUN_ID = %v, want %s", vars["FISHHAWK_RUN_ID"], stage.RunID)
+	}
+	if _, has := gotBody["fishhawk_rollback"]; has {
+		t.Errorf("forward trigger body carries fishhawk_rollback: %v", gotBody)
+	}
 	p := auditPayload(t, au, CategoryDeploymentDispatched)
 	if p["target"] != "webhook" || p["url"] != hook.URL {
 		t.Errorf("payload target/url = %v / %v", p["target"], p["url"])
+	}
+	if _, has := p["secret_env"]; has {
+		t.Errorf("no-secret dispatch payload carries secret_env: %v", p)
 	}
 }
 
@@ -699,3 +719,474 @@ workflows:
             target: webhook
             url: %s
 `
+
+// deploySpecWebhookSecretFmt is the workflow-v2 webhook fixture for the secret
+// channel (E45.57 / #3497): first %s is the url, second %s the indented
+// secret_* tail (12 spaces) spliced under it.
+const deploySpecWebhookSecretFmt = `
+version: "2"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: webhook
+            url: %s
+%s
+        produces:
+          - artifact: deployment
+`
+
+const webhookTestSecret = "glptt-s3cr3t-TRIGGER-TOKEN-0badf00d"
+
+// withSecretLookup injects a map-backed DeploySecretLookup by mutating s.cfg
+// after construction, exactly as the deploy tests mutate s.cfg.GitHub.
+func withSecretLookup(s *Server, m map[string]string) {
+	s.cfg.DeploySecretLookup = func(name string) (string, bool) {
+		v, ok := m[name]
+		return v, ok
+	}
+}
+
+// captureLogger swaps s.cfg.Logger for a text handler over a buffer so a test
+// can assert on every log line the dispatch emits.
+func captureLogger(s *Server) *bytes.Buffer {
+	buf := &bytes.Buffer{}
+	s.cfg.Logger = slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return buf
+}
+
+// countingHook is an httptest server that records every request's headers
+// and decoded JSON body under a mutex and answers with status.
+type countingHook struct {
+	mu      sync.Mutex
+	hits    int
+	headers http.Header
+	body    map[string]any
+	srv     *httptest.Server
+}
+
+// newCountingHook answers every request with status after applying the
+// response headers and writing respBody (a response that echoes the secret
+// back, so a sink reading resp.Header/resp.Body would be caught).
+func newCountingHook(t *testing.T, status int, respHeaders map[string]string, respBody string) *countingHook {
+	t.Helper()
+	h := &countingHook{}
+	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		h.mu.Lock()
+		h.hits++
+		h.headers = r.Header.Clone()
+		h.body = body
+		h.mu.Unlock()
+		for k, v := range respHeaders {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(status)
+		if respBody != "" {
+			_, _ = w.Write([]byte(respBody))
+		}
+	}))
+	t.Cleanup(h.srv.Close)
+	return h
+}
+
+func (h *countingHook) snapshot() (int, http.Header, map[string]any) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.hits, h.headers, h.body
+}
+
+// assertSecretAbsent asserts the secret literal (and its URL-escaped form)
+// appears in NO appended audit payload of ANY category, the log buffer, nor
+// any of the extra strings (returned error, reason, response body).
+func assertSecretAbsent(t *testing.T, au *approvalAuditFake, logBuf *bytes.Buffer, secret string, extras map[string]string) {
+	t.Helper()
+	needles := []string{secret, url.QueryEscape(secret)}
+	au.mu.Lock()
+	for i, p := range au.appended {
+		for _, n := range needles {
+			if bytes.Contains(p.Payload, []byte(n)) {
+				t.Errorf("audit row %d (%s) carries the secret: %s", i, p.Category, p.Payload)
+			}
+		}
+	}
+	au.mu.Unlock()
+	if logBuf != nil {
+		for _, n := range needles {
+			if strings.Contains(logBuf.String(), n) {
+				t.Errorf("log buffer carries the secret:\n%s", logBuf.String())
+			}
+		}
+	}
+	for name, str := range extras {
+		for _, n := range needles {
+			if strings.Contains(str, n) {
+				t.Errorf("%s carries the secret: %q", name, str)
+			}
+		}
+	}
+}
+
+// (1) secret_env alone: the value rides the PRIVATE-TOKEN default header, the
+// body carries both the flat correlation and variables.FISHHAWK_RUN_ID, and
+// the dispatch payload records names only. Cross-boundary: the REAL v2 YAML
+// parses through spec.ParseBytes into the run's cached spec and is observed on
+// the wire.
+func TestTriggerDeploy_Webhook_SecretHeader_Sent(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	withSecretLookup(s, map[string]string{"DEPLOY_TRIGGER_TOKEN": webhookTestSecret})
+	logBuf := captureLogger(s)
+	hook := newCountingHook(t, http.StatusAccepted, nil, "")
+	stage, _ := seedDispatchedDeploy(rr, fmt.Sprintf(deploySpecWebhookSecretFmt, hook.srv.URL,
+		"            secret_env: DEPLOY_TRIGGER_TOKEN"), instID(99))
+
+	got, err := s.triggerDeploy(context.Background(), stage)
+	if err != nil {
+		t.Fatalf("triggerDeploy: %v", err)
+	}
+	if got.State != run.StageStateAwaitingDeployment {
+		t.Fatalf("stage state = %q, want awaiting_deployment", got.State)
+	}
+	hits, headers, body := hook.snapshot()
+	if hits != 1 {
+		t.Fatalf("webhook hits = %d, want 1", hits)
+	}
+	if h := headers.Get("PRIVATE-TOKEN"); h != webhookTestSecret {
+		t.Errorf("PRIVATE-TOKEN header = %q, want the injected value", h)
+	}
+	if body["fishhawk_run_id"] != stage.RunID.String() {
+		t.Errorf("body fishhawk_run_id = %v", body["fishhawk_run_id"])
+	}
+	vars, _ := body["variables"].(map[string]any)
+	if vars["FISHHAWK_RUN_ID"] != stage.RunID.String() || vars["FISHHAWK_STAGE_ID"] != stage.ID.String() {
+		t.Errorf("body variables = %v", vars)
+	}
+	if _, has := body["token"]; has {
+		t.Errorf("header placement also wrote a body field: %v", body)
+	}
+	p := auditPayload(t, au, CategoryDeploymentDispatched)
+	if p["secret_env"] != "DEPLOY_TRIGGER_TOKEN" || p["secret_placement"] != "header" {
+		t.Errorf("payload secret_env/secret_placement = %v / %v", p["secret_env"], p["secret_placement"])
+	}
+	assertSecretAbsent(t, au, logBuf, webhookTestSecret, nil)
+}
+
+// (2) secret_header: a custom header name carries the value; PRIVATE-TOKEN is
+// NOT sent.
+func TestTriggerDeploy_Webhook_SecretHeaderCustom_Sent(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	withSecretLookup(s, map[string]string{"DEPLOY_TRIGGER_TOKEN": webhookTestSecret})
+	hook := newCountingHook(t, http.StatusAccepted, nil, "")
+	stage, _ := seedDispatchedDeploy(rr, fmt.Sprintf(deploySpecWebhookSecretFmt, hook.srv.URL,
+		"            secret_env: DEPLOY_TRIGGER_TOKEN\n            secret_header: X-Deploy-Token"), instID(99))
+
+	got, err := s.triggerDeploy(context.Background(), stage)
+	if err != nil || got.State != run.StageStateAwaitingDeployment {
+		t.Fatalf("triggerDeploy = %v / %v, want awaiting_deployment", got.State, err)
+	}
+	_, headers, _ := hook.snapshot()
+	if h := headers.Get("X-Deploy-Token"); h != webhookTestSecret {
+		t.Errorf("X-Deploy-Token header = %q, want the injected value", h)
+	}
+	if h := headers.Get("PRIVATE-TOKEN"); h != "" {
+		t.Errorf("PRIVATE-TOKEN header = %q, want absent under a custom secret_header", h)
+	}
+}
+
+// (3) secret_field: the value lands in the JSON body under the configured key,
+// with NO PRIVATE-TOKEN header, and the payload records placement body.
+func TestTriggerDeploy_Webhook_SecretField_InBody(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	withSecretLookup(s, map[string]string{"DEPLOY_TRIGGER_TOKEN": webhookTestSecret})
+	hook := newCountingHook(t, http.StatusAccepted, nil, "")
+	stage, _ := seedDispatchedDeploy(rr, fmt.Sprintf(deploySpecWebhookSecretFmt, hook.srv.URL,
+		"            secret_env: DEPLOY_TRIGGER_TOKEN\n            secret_field: token"), instID(99))
+
+	got, err := s.triggerDeploy(context.Background(), stage)
+	if err != nil || got.State != run.StageStateAwaitingDeployment {
+		t.Fatalf("triggerDeploy = %v / %v, want awaiting_deployment", got.State, err)
+	}
+	_, headers, body := hook.snapshot()
+	if body["token"] != webhookTestSecret {
+		t.Errorf("body token = %v, want the injected value", body["token"])
+	}
+	if h := headers.Get("PRIVATE-TOKEN"); h != "" {
+		t.Errorf("PRIVATE-TOKEN header = %q, want absent under secret_field", h)
+	}
+	p := auditPayload(t, au, CategoryDeploymentDispatched)
+	if p["secret_placement"] != "body" {
+		t.Errorf("payload secret_placement = %v, want body", p["secret_placement"])
+	}
+}
+
+// (4)+(5) secret_env unset / empty: the stage fails category C BEFORE any
+// POST leaves the process (the reachable webhook server records ZERO
+// requests), and the deployment_dispatch_failed row names the variable.
+func TestTriggerDeploy_Webhook_SecretEnvUnsetOrEmpty_FailsStage(t *testing.T) {
+	cases := []struct {
+		name   string
+		lookup map[string]string
+		want   string
+	}{
+		{name: "unset", lookup: map[string]string{}, want: "unset"},
+		{name: "empty", lookup: map[string]string{"DEPLOY_TRIGGER_TOKEN": ""}, want: "empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, rr, au := newApprovalServer(t)
+			withSecretLookup(s, tc.lookup)
+			hook := newCountingHook(t, http.StatusAccepted, nil, "")
+			stage, _ := seedDispatchedDeploy(rr, fmt.Sprintf(deploySpecWebhookSecretFmt, hook.srv.URL,
+				"            secret_env: DEPLOY_TRIGGER_TOKEN"), instID(99))
+
+			got, err := s.triggerDeploy(context.Background(), stage)
+			if err != nil {
+				t.Fatalf("triggerDeploy: %v", err)
+			}
+			if got.State != run.StageStateFailed {
+				t.Fatalf("stage state = %q, want failed", got.State)
+			}
+			if got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+				t.Errorf("failure category = %v, want C", got.FailureCategory)
+			}
+			p := auditPayload(t, au, categoryDeploymentDispatchFailed)
+			reason, _ := p["reason"].(string)
+			if !strings.Contains(reason, "DEPLOY_TRIGGER_TOKEN") || !strings.Contains(reason, tc.want) {
+				t.Errorf("reason = %q, want it to name DEPLOY_TRIGGER_TOKEN as %s", reason, tc.want)
+			}
+			if p["secret_env"] != "DEPLOY_TRIGGER_TOKEN" || p["url"] != hook.srv.URL {
+				t.Errorf("details secret_env/url = %v / %v", p["secret_env"], p["url"])
+			}
+			if hits, _, _ := hook.snapshot(); hits != 0 {
+				t.Errorf("webhook hits = %d, want 0 — the refusal must fire before any POST", hits)
+			}
+			if n := countAppendedCategory(au, CategoryDeploymentDispatched); n != 0 {
+				t.Errorf("deployment_dispatched entries = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// (6) REDACTION: for every webhook failure mode the secret literal is absent
+// from every audit payload (all categories), the log buffer, the returned
+// error and the stage's failure reason. Subtests (5) and (6) additionally pin
+// the redirect posture: a 3xx is never followed (the second server records
+// zero requests; details carry status only, no location, no body), and an
+// unparsable Location — which net/http embeds RAW in its error BEFORE
+// CheckRedirect runs — is classified redirect_parse rather than propagated.
+func TestTriggerDeploy_Webhook_SecretNeverLeaks(t *testing.T) {
+	type arm struct {
+		name      string
+		target    func(t *testing.T, second *countingHook) string // returns the delegate url
+		wantState run.StageState
+		wantClass string
+		want3xx   bool
+	}
+	arms := []arm{
+		{
+			name: "2xx_park",
+			target: func(t *testing.T, _ *countingHook) string {
+				return newCountingHook(t, http.StatusAccepted, map[string]string{"X-Echo": webhookTestSecret}, "").srv.URL
+			},
+			wantState: run.StageStateAwaitingDeployment,
+		},
+		{
+			name: "non_2xx_fail",
+			target: func(t *testing.T, _ *countingHook) string {
+				return newCountingHook(t, http.StatusInternalServerError,
+					map[string]string{"X-Echo": webhookTestSecret}, "rejected token "+webhookTestSecret).srv.URL
+			},
+			wantState: run.StageStateFailed,
+		},
+		{
+			name: "transport_failure",
+			target: func(t *testing.T, _ *countingHook) string {
+				closed := httptest.NewServer(http.NotFoundHandler())
+				u := closed.URL
+				closed.Close()
+				return u
+			},
+			wantState: run.StageStateFailed,
+			wantClass: webhookErrClassConnectionRefused,
+		},
+		{
+			name: "env_unset",
+			target: func(t *testing.T, _ *countingHook) string {
+				return newCountingHook(t, http.StatusAccepted, nil, "").srv.URL
+			},
+			wantState: run.StageStateFailed,
+		},
+		{
+			name: "redirect_not_followed",
+			target: func(t *testing.T, second *countingHook) string {
+				return newCountingHook(t, http.StatusFound,
+					map[string]string{"Location": second.srv.URL + "/?token=" + url.QueryEscape(webhookTestSecret)},
+					"moved; token "+webhookTestSecret).srv.URL
+			},
+			wantState: run.StageStateFailed,
+			want3xx:   true,
+		},
+		{
+			name: "malformed_location",
+			target: func(t *testing.T, _ *countingHook) string {
+				// An unparsable host: net/http returns `failed to parse
+				// Location header %q` carrying this raw header BEFORE
+				// CheckRedirect is consulted.
+				return newCountingHook(t, http.StatusFound,
+					map[string]string{"Location": "http://[" + webhookTestSecret}, "").srv.URL
+			},
+			wantState: run.StageStateFailed,
+			wantClass: webhookErrClassRedirectParse,
+		},
+	}
+	for _, a := range arms {
+		t.Run(a.name, func(t *testing.T) {
+			s, _, rr, au := newApprovalServer(t)
+			lookup := map[string]string{"DEPLOY_TRIGGER_TOKEN": webhookTestSecret}
+			if a.name == "env_unset" {
+				lookup = map[string]string{}
+			}
+			withSecretLookup(s, lookup)
+			logBuf := captureLogger(s)
+			second := newCountingHook(t, http.StatusAccepted, nil, "")
+			target := a.target(t, second)
+			stage, _ := seedDispatchedDeploy(rr, fmt.Sprintf(deploySpecWebhookSecretFmt, target,
+				"            secret_env: DEPLOY_TRIGGER_TOKEN"), instID(99))
+
+			got, err := s.triggerDeploy(context.Background(), stage)
+			errStr := ""
+			if err != nil {
+				errStr = err.Error()
+			}
+			if got.State != a.wantState {
+				t.Fatalf("stage state = %q, want %q (err %v)", got.State, a.wantState, err)
+			}
+			extras := map[string]string{"returned error": errStr}
+			if got.State == run.StageStateFailed {
+				if got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+					t.Errorf("failure category = %v, want C", got.FailureCategory)
+				}
+				if got.FailureReason != nil {
+					extras["failure reason"] = *got.FailureReason
+				}
+				p := auditPayload(t, au, categoryDeploymentDispatchFailed)
+				if a.wantClass != "" {
+					if p["error_class"] != a.wantClass {
+						t.Errorf("details error_class = %v, want %s (reason %v)", p["error_class"], a.wantClass, p["reason"])
+					}
+					if _, has := p["error"]; has {
+						t.Errorf("details carry a raw error string: %v", p["error"])
+					}
+				}
+				if a.want3xx {
+					if p["status"] != float64(http.StatusFound) {
+						t.Errorf("details status = %v, want 302", p["status"])
+					}
+					if _, has := p["location"]; has {
+						t.Errorf("details carry location: %v", p)
+					}
+					if hits, _, _ := second.snapshot(); hits != 0 {
+						t.Errorf("redirect target received %d request(s), want 0 — the redirect must not be followed", hits)
+					}
+				}
+			}
+			assertSecretAbsent(t, au, logBuf, webhookTestSecret, extras)
+		})
+	}
+}
+
+// (7) LIST-AGREEMENT: the top-level keys the two builders actually write
+// (forward + rollback, minus the configured secret_field) are a subset of
+// spec.WebhookReservedBodyKeys, and the runtime assertion refuses a body
+// carrying a key outside the slice BEFORE any POST (zero requests on a
+// reachable server).
+func TestWebhookReservedBodyKeys_MatchBuilders(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	withSecretLookup(s, map[string]string{"DEPLOY_TRIGGER_TOKEN": webhookTestSecret})
+	hook := newCountingHook(t, http.StatusAccepted, nil, "")
+	stage, runRow := seedDispatchedDeploy(rr, fmt.Sprintf(deploySpecWebhookSecretFmt, hook.srv.URL,
+		"            secret_env: DEPLOY_TRIGGER_TOKEN\n            secret_field: token"), instID(99))
+	delegate := &spec.DelegateConfig{Target: spec.DelegateTargetWebhook, URL: hook.srv.URL,
+		SecretEnv: "DEPLOY_TRIGGER_TOKEN", SecretField: "token"}
+
+	for _, rollback := range []bool{false, true} {
+		if _, werr := s.postWebhookDeploy(context.Background(), stage, delegate, webhookTriggerBody(stage, runRow, rollback)); werr != nil {
+			t.Fatalf("postWebhookDeploy(rollback=%v): %+v", rollback, werr)
+		}
+		_, _, body := hook.snapshot()
+		var keys []string
+		for k := range body {
+			if k == "token" {
+				continue
+			}
+			keys = append(keys, k)
+			if !spec.IsWebhookReservedBodyKey(k) {
+				t.Errorf("rollback=%v: builder wrote key %q outside spec.WebhookReservedBodyKeys", rollback, k)
+			}
+		}
+		sort.Strings(keys)
+		if rollback && body[rollbackDispatchInput] != true {
+			t.Errorf("rollback body lacks fishhawk_rollback: %v", keys)
+		}
+		if !rollback {
+			if _, has := body[rollbackDispatchInput]; has {
+				t.Errorf("forward body carries fishhawk_rollback: %v", keys)
+			}
+		}
+	}
+
+	// Refusal arm: a foreign key is a programming error named BEFORE the POST.
+	before, _, _ := hook.snapshot()
+	body := webhookTriggerBody(stage, runRow, false)
+	body["foreign_key"] = "x"
+	_, werr := s.postWebhookDeploy(context.Background(), stage, delegate, body)
+	if werr == nil {
+		t.Fatal("postWebhookDeploy accepted a body key outside spec.WebhookReservedBodyKeys")
+	}
+	if !strings.Contains(werr.Reason, "foreign_key") || werr.Details["body_key"] != "foreign_key" {
+		t.Errorf("refusal = %+v, want it to name foreign_key", werr)
+	}
+	if after, _, _ := hook.snapshot(); after != before {
+		t.Errorf("webhook hits went %d → %d, want no POST under the reserved-key refusal", before, after)
+	}
+}
+
+// fakeTimeoutErr is a net.Error whose Timeout() is true.
+type fakeTimeoutErr struct{}
+
+func (fakeTimeoutErr) Error() string   { return "i/o timeout" }
+func (fakeTimeoutErr) Timeout() bool   { return true }
+func (fakeTimeoutErr) Temporary() bool { return false }
+
+// classifyWebhookDoError maps each error family onto its class and never a
+// raw string; redactSecret is exact-match and a no-op on an empty value.
+func TestClassifyWebhookDoError_AndRedact(t *testing.T) {
+	timeout := &url.Error{Op: "Post", URL: "http://x", Err: fakeTimeoutErr{}}
+	cases := map[string]error{
+		webhookErrClassRedirectParse:     &url.Error{Op: "Post", URL: "http://x", Err: fmt.Errorf(webhookLocationParsePrefix+" %q: bad", "http://["+webhookTestSecret)},
+		webhookErrClassTimeout:           timeout,
+		webhookErrClassDNS:               &url.Error{Op: "Post", URL: "http://x", Err: &net.DNSError{Err: "no such host", Name: "x"}},
+		webhookErrClassConnectionRefused: &url.Error{Op: "Post", URL: "http://x", Err: &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}},
+		webhookErrClassTLS:               &url.Error{Op: "Post", URL: "http://x", Err: &tls.CertificateVerificationError{}},
+		webhookErrClassOther:             errors.New("something else"),
+	}
+	for want, err := range cases {
+		if got := classifyWebhookDoError(err); got != want {
+			t.Errorf("classify(%v) = %q, want %q", err, got, want)
+		}
+	}
+	if got := redactSecret("token="+webhookTestSecret+"&x="+webhookTestSecret, webhookTestSecret); got != "token=[redacted]&x=[redacted]" {
+		t.Errorf("redactSecret = %q", got)
+	}
+	if got := redactSecret("untouched", ""); got != "untouched" {
+		t.Errorf("redactSecret(empty value) = %q, want untouched", got)
+	}
+	d := redactSecretDetails(map[string]any{"a": "x" + webhookTestSecret, "n": 7}, webhookTestSecret)
+	if d["a"] != "x[redacted]" || d["n"] != 7 {
+		t.Errorf("redactSecretDetails = %v", d)
+	}
+}

@@ -817,15 +817,29 @@ type Executor struct {
 //   - github_actions — dispatch a workflow via workflow_dispatch;
 //     WorkflowRef is required (the workflow file or id), GitRef is the
 //     optional branch/tag/sha to dispatch against.
-//   - webhook — POST the deploy trigger to URL (required).
+//   - webhook — POST the deploy trigger to URL (required). The optional
+//     secret channel (E45.57 / #3497, workflow-v2 only) authenticates
+//     the POST without the credential ever appearing in the spec:
+//     SecretEnv NAMES an environment variable fishhawkd reads from its
+//     own process environment at dispatch; SecretHeader is the request
+//     header carrying the value (default DelegateDefaultSecretHeader);
+//     SecretField is the alternative placement as a top-level JSON body
+//     key (GitLab's `token`). The schema enforces that either placement
+//     requires SecretEnv (dependentRequired) and that the two placements
+//     are mutually exclusive (not:{required:[secret_header,secret_field]});
+//     Validate additionally refuses a SecretEnv in Fishhawk's own config
+//     namespace and a SecretField in WebhookReservedBodyKeys.
 //
 // The schema's nested oneOf enforces which fields each target requires;
 // the unset fields stay empty.
 type DelegateConfig struct {
-	Target      string `json:"target" yaml:"target"`
-	WorkflowRef string `json:"workflow_ref,omitempty" yaml:"workflow_ref,omitempty"`
-	GitRef      string `json:"git_ref,omitempty" yaml:"git_ref,omitempty"`
-	URL         string `json:"url,omitempty" yaml:"url,omitempty"`
+	Target       string `json:"target" yaml:"target"`
+	WorkflowRef  string `json:"workflow_ref,omitempty" yaml:"workflow_ref,omitempty"`
+	GitRef       string `json:"git_ref,omitempty" yaml:"git_ref,omitempty"`
+	URL          string `json:"url,omitempty" yaml:"url,omitempty"`
+	SecretEnv    string `json:"secret_env,omitempty" yaml:"secret_env,omitempty"`
+	SecretHeader string `json:"secret_header,omitempty" yaml:"secret_header,omitempty"`
+	SecretField  string `json:"secret_field,omitempty" yaml:"secret_field,omitempty"`
 }
 
 // Delegate targets per the schema's delegate.target discriminator.
@@ -833,6 +847,58 @@ const (
 	DelegateTargetGitHubActions = "github_actions"
 	DelegateTargetWebhook       = "webhook"
 )
+
+// DelegateDefaultSecretHeader is the request header a webhook delegate's
+// resolved secret rides when secret_env is set and neither secret_header
+// nor secret_field is declared. PRIVATE-TOKEN is GitLab's personal/project
+// access-token header, the first-class target of the secret channel.
+const DelegateDefaultSecretHeader = "PRIVATE-TOKEN"
+
+// WebhookReservedBodyKeys is the SINGLE source of truth for the top-level
+// JSON keys the two webhook deploy POSTs (the forward trigger and the
+// rollback re-dispatch in backend/internal/server) write into the trigger
+// body. A webhook delegate's secret_field MUST NOT collide with one of them
+// — the correlation marker would otherwise be overwritten silently, and for
+// fishhawk_rollback the receiver would lose the rollback/forward distinction
+// — so Validate refuses such a spec at run admission, and the server's
+// request builder asserts at runtime that it never writes a key OUTSIDE this
+// set, keeping the writers and this list in lockstep.
+var WebhookReservedBodyKeys = []string{
+	"fishhawk_run_id",
+	"fishhawk_stage_id",
+	"fishhawk_rollback",
+	"repo",
+	"workflow_id",
+	"variables",
+}
+
+// IsWebhookReservedBodyKey reports whether k is one of WebhookReservedBodyKeys.
+func IsWebhookReservedBodyKey(k string) bool {
+	for _, r := range WebhookReservedBodyKeys {
+		if r == k {
+			return true
+		}
+	}
+	return false
+}
+
+// SecretPlacement resolves where a webhook delegate's secret value is
+// placed: (header, "") for a request header, ("", field) for a top-level
+// JSON body key. It applies the DelegateDefaultSecretHeader default when
+// SecretEnv is set and neither placement is declared, and returns ("", "")
+// when the delegate declares no secret channel at all.
+func (d *DelegateConfig) SecretPlacement() (header, field string) {
+	if d == nil || d.SecretEnv == "" {
+		return "", ""
+	}
+	if d.SecretField != "" {
+		return "", d.SecretField
+	}
+	if d.SecretHeader != "" {
+		return d.SecretHeader, ""
+	}
+	return DelegateDefaultSecretHeader, ""
+}
 
 // VerifyConfig holds the optional in-band test gate for a stage.
 // Command is a shell expression (passed to sh -c) that must exit 0

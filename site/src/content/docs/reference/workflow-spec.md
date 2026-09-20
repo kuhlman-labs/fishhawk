@@ -51,7 +51,7 @@ the declared minor. At v2 a field is accepted because the schema declares it.
 | Key | What |
 |---|---|
 | `id`, `type` | The stage's name and kind (`plan`, `implement`, `review`, …). |
-| `executor` | `agent:` for an agent stage, `human: true` for a human one. `verify:` names the test command run before the pull request opens. |
+| `executor` | `agent:` for an agent stage, `human: true` for a human one. `verify:` names the test command run before the pull request opens. A `deploy` stage instead declares `delegate:` — a GitHub Actions workflow or a webhook `url`; a webhook may name a `secret_env` (an environment variable fishhawkd reads at dispatch, placed in a `secret_header` or a `secret_field`) so the credential is never in the file. |
 | `inputs` | A `github_issue`, or an `artifact` `from_stage:` an earlier stage. |
 | `produces` | The artifact this stage must emit — `plan`, `pull_request`, … |
 | `constraints` | Rules checked against the real diff. See [constraint](/fishhawk/concepts/constraint/). |

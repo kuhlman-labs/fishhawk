@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -175,7 +174,7 @@ func (s *Server) handleRollbackDeployment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	target, ghaRunID, externalURL, derr := s.dispatchRollback(r.Context(), runRow, deployStage, delegate)
+	target, ghaRunID, externalURL, hook, derr := s.dispatchRollback(r.Context(), runRow, deployStage, delegate)
 	if derr != nil {
 		s.writeError(w, r, derr.status, derr.code, derr.message, derr.details)
 		return
@@ -188,7 +187,7 @@ func (s *Server) handleRollbackDeployment(w http.ResponseWriter, r *http.Request
 	dispatchedAt := time.Now().UTC()
 	subj := id.Subject
 	actorKind := actorKindForSubject(id.Subject)
-	payload, _ := json.Marshal(map[string]any{
+	initiated := map[string]any{
 		"run_id":           runID.String(),
 		"stage_id":         deployStage.ID.String(),
 		"target":           target,
@@ -201,7 +200,14 @@ func (s *Server) handleRollbackDeployment(w http.ResponseWriter, r *http.Request
 		"dispatched_at":    dispatchedAt.Format(time.RFC3339),
 		"auth_method":      "bearer",
 		"actor_subject":    subj,
-	})
+	}
+	if hook != nil && hook.SecretEnv != "" {
+		// Webhook secret channel NAMES only (E45.57 / #3497), matching the
+		// forward trigger's deployment_dispatched payload — never the value.
+		initiated["secret_env"] = hook.SecretEnv
+		initiated["secret_placement"] = hook.SecretPlacement
+	}
+	payload, _ := json.Marshal(initiated)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &deployStage.ID,
@@ -252,14 +258,15 @@ func (e *rollbackDispatchError) Error() string { return e.code + ": " + e.messag
 // 204 with no body, mirroring slice-1's trigger). webhook POSTs a rollback
 // payload to the delegate URL. A dispatch failure returns a *rollbackDispatchError
 // the handler maps to the response.
-func (s *Server) dispatchRollback(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig) (target string, ghaRunID int64, externalURL string, derr *rollbackDispatchError) {
+func (s *Server) dispatchRollback(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig) (target string, ghaRunID int64, externalURL string, hook *webhookDeployResult, derr *rollbackDispatchError) {
 	switch delegate.Target {
 	case spec.DelegateTargetGitHubActions:
-		return s.dispatchRollbackGitHubActions(ctx, runRow, stage, delegate)
+		target, ghaRunID, externalURL, derr = s.dispatchRollbackGitHubActions(ctx, runRow, stage, delegate)
+		return target, ghaRunID, externalURL, nil, derr
 	case spec.DelegateTargetWebhook:
 		return s.dispatchRollbackWebhook(ctx, runRow, stage, delegate)
 	default:
-		return "", 0, "", &rollbackDispatchError{
+		return "", 0, "", nil, &rollbackDispatchError{
 			status:  http.StatusUnprocessableEntity,
 			code:    "rollback_unconfigured",
 			message: fmt.Sprintf("deploy delegate target %q is not supported", delegate.Target),
@@ -342,48 +349,30 @@ func (s *Server) dispatchRollbackGitHubActions(ctx context.Context, runRow *run.
 	return spec.DelegateTargetGitHubActions, ghaRunID, externalURL, nil
 }
 
-func (*Server) dispatchRollbackWebhook(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig) (string, int64, string, *rollbackDispatchError) {
+// dispatchRollbackWebhook POSTs the rollback payload through the SAME shared
+// dispatcher as the forward trigger (postWebhookDeploy; E45.57 / #3497), so the
+// rollback carries the same secret channel, the same redirect refusal, the same
+// error classification and the same redaction: a missing secret names the
+// variable, never its value; a non-2xx carries ONLY {status, url}. It returns
+// the secret_env / secret_placement NAMES for the deployment_rollback_initiated
+// payload.
+func (s *Server) dispatchRollbackWebhook(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig) (string, int64, string, *webhookDeployResult, *rollbackDispatchError) {
 	if delegate.URL == "" {
-		return "", 0, "", &rollbackDispatchError{
+		return "", 0, "", nil, &rollbackDispatchError{
 			status: http.StatusUnprocessableEntity, code: "rollback_unconfigured",
 			message: "webhook delegate is missing url",
 		}
 	}
-	triggerBody, _ := json.Marshal(map[string]any{
-		"fishhawk_run_id":     stage.RunID.String(),
-		"fishhawk_stage_id":   stage.ID.String(),
-		rollbackDispatchInput: true,
-		"repo":                runRow.Repo,
-		"workflow_id":         runRow.WorkflowID,
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, delegate.URL, bytes.NewReader(triggerBody))
-	if err != nil {
-		return "", 0, "", &rollbackDispatchError{
+	res, werr := s.postWebhookDeploy(ctx, stage, delegate, webhookTriggerBody(stage, runRow, true))
+	if werr != nil {
+		return "", 0, "", nil, &rollbackDispatchError{
 			status: http.StatusBadGateway, code: "rollback_dispatch_failed",
-			message: "building the webhook rollback request failed",
-			details: map[string]any{"error": err.Error(), "url": delegate.URL},
-		}
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := deployHTTPClient.Do(req)
-	if err != nil {
-		return "", 0, "", &rollbackDispatchError{
-			status: http.StatusBadGateway, code: "rollback_dispatch_failed",
-			message: "webhook rollback POST failed",
-			details: map[string]any{"error": err.Error(), "url": delegate.URL},
-		}
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", 0, "", &rollbackDispatchError{
-			status: http.StatusBadGateway, code: "rollback_dispatch_failed",
-			message: "webhook rollback POST returned a non-2xx status",
-			details: map[string]any{"status": resp.StatusCode, "url": delegate.URL},
+			message: "webhook rollback: " + werr.Reason,
+			details: werr.Details,
 		}
 	}
 	// The webhook delegate URL is the external handle; there is no GHA run id.
-	return spec.DelegateTargetWebhook, 0, delegate.URL, nil
+	return spec.DelegateTargetWebhook, 0, delegate.URL, res, nil
 }
 
 // deployStageForRun returns the run's deploy stage, or nil when the run has

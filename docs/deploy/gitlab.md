@@ -212,23 +212,50 @@ A failed **Pipeline Hook** triggers the auto-retry when its `ref` matches a run'
 
 A deploy stage on a GitLab-created run must use the **`webhook`** delegate. The `github_actions` delegate dispatches `workflow_dispatch` through a GitHub App installation, and a GitLab run (`runner_kind: gitlab_ci`, or `installation_ref: gitlab:<project_id>`) has none — so `backend/internal/server/deploy_trigger.go` fails the stage at trigger time (category C) instead of parking it, with a `deployment_dispatch_failed` audit row whose `reason` names the fix and whose payload carries `runner_kind`, `installation_ref` and `remedy: "executor.delegate.target: webhook"` (#3465). The check runs BEFORE the deployment's GitHub-client guard, so a GitLab-only backend with no GitHub client configured fails loud rather than leaving the stage at `dispatched` forever.
 
-**Keep the deploy credential OUT of `url`.** The webhook delegate has no secret mechanism: the spec is repository content with no environment or variable substitution (`$NAME` in `url` is sent literally, not expanded), the POST carries no authentication header, and `triggerDeployWebhook` persists `delegate.url` VERBATIM into the `deployment_dispatched` audit payload and every `deployment_dispatch_failed` payload — so a GitLab pipeline trigger token pasted into the URL (`/projects/:id/trigger/pipeline?token=…`) would land in source history, in the persisted workflow spec, and in every audit row and proxy/access log that records the URL. Point `url` at a deploy endpoint you operate that holds the trigger token server-side (a CI/CD variable, a secret in the relay's own environment) and calls `POST /projects/:id/trigger/pipeline` itself, authenticating Fishhawk's caller by network placement, mTLS or a source-IP allow-list rather than by anything in the spec. Minimal shape:
+**Keep the deploy credential OUT of `url`.** The spec is repository content with no environment or variable substitution (`$NAME` in `url` is sent literally, not expanded), and `triggerDeployWebhook` persists `delegate.url` VERBATIM into the `deployment_dispatched` audit payload and every `deployment_dispatch_failed` payload — so a GitLab pipeline trigger token pasted into the URL (`/projects/:id/trigger/pipeline?token=…`) would land in source history, in the persisted workflow spec, and in every audit row and proxy/access log that records the URL. Use the webhook delegate's **secret channel** instead (E45.57 / #3497, workflow-v2 only): declare the NAME of an environment variable and where its value goes, and fishhawkd resolves the value at dispatch. Direct trigger-token flow, targeting GitLab's [pipeline trigger API](https://docs.gitlab.com/api/pipeline_triggers/) with no relay:
 
 ```yaml
-stages:
-  - id: deploy
-    type: deploy
-    executor:
-      delegate:
-        target: webhook
-        url: https://deploy-relay.example.internal/fishhawk/deploy   # your relay; it holds the GitLab trigger token, never this spec
-    gates:
-      - type: approval
-        approvers:
-          any_of: [release_managers]
+version: "2"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: webhook
+            url: https://gitlab.example.com/api/v4/projects/<project_id>/trigger/pipeline?ref=main
+            secret_env: DEPLOY_TRIGGER_TOKEN   # the NAME; the value lives only in fishhawkd's environment
+            secret_field: token                # GitLab reads the trigger token from the JSON body key `token`
+        gates:
+          - type: approval
+            approvers:
+              any_of: [release_managers]
 ```
 
-The webhook POST body is `{fishhawk_run_id, fishhawk_stage_id, repo, workflow_id}`. A webhook target has no GitHub Actions run to poll, so the deploy stage reaches its terminal state only when your pipeline calls back into `POST /v0/runs/{run_id}/deployment` with the outcome (`backend/internal/deployreconciler/README.md`) — wire that call into the pipeline the webhook triggers.
+How the variable reaches fishhawkd — it is read from the **process environment of `fishhawkd` itself**, not the runner host and not the MCP host:
+
+- Shell / systemd: `export DEPLOY_TRIGGER_TOKEN=glptt-…` in the environment that spawns `fishhawkd` (or an `Environment=` line in the unit).
+- Helm chart (`deploy/helm/fishhawk`): add the key to the Secret the workloads consume via `envFrom` — in the default `secrets.mode: existing` that is your `existingSecret` (`fishhawk-secrets`); `externalSecrets` mode adds a `data[]` entry; dev-only `chartManaged` reads `secrets.values`. The `envFrom` wiring puts every key of that Secret into fishhawkd's environment, so no template change is needed.
+
+The name is refused at run admission if it starts with `FISHHAWKD_` or `FISHHAWK_` (Fishhawk's own configuration namespace — a committed spec could otherwise exfiltrate fishhawkd's database URL or forge token), and `secret_field` is refused if it collides with a reserved trigger-body key (`fishhawk_run_id`, `fishhawk_stage_id`, `fishhawk_rollback`, `repo`, `workflow_id`, `variables`). Both refusals are server-side only (`POST /v0/runs`); `fishhawk validate` accepts such a spec. An unset or empty variable at dispatch fails the deploy stage category C with a `deployment_dispatch_failed` row naming the variable — no request leaves the process. For a target that authenticates by header instead, drop `secret_field`: the value rides `PRIVATE-TOKEN` by default, or the header you name in `secret_header`.
+
+The webhook POST body is `{fishhawk_run_id, fishhawk_stage_id, repo, workflow_id, variables: {FISHHAWK_RUN_ID, FISHHAWK_STAGE_ID, FISHHAWK_REPO, FISHHAWK_WORKFLOW_ID}}` (plus `fishhawk_rollback: true` / `variables.FISHHAWK_ROLLBACK: "true"` on a rollback re-dispatch), with `token` added when `secret_field: token` is set. GitLab turns the `variables` object into CI variables of the triggered pipeline, so a callback job can report the outcome directly:
+
+```yaml
+# .gitlab-ci.yml of the deploy project
+report_to_fishhawk:
+  stage: .post
+  script:
+    - >
+      curl -fsS -X POST "$FISHHAWKD_URL/v0/runs/$FISHHAWK_RUN_ID/deployment"
+      -H "Authorization: Bearer $FISHHAWK_API_TOKEN" -H "Content-Type: application/json"
+      -d "{\"outcome\":\"success\",\"stage_id\":\"$FISHHAWK_STAGE_ID\"}"
+```
+
+A webhook target has no GitHub Actions run to poll, so the deploy stage reaches its terminal state only when your pipeline calls back into `POST /v0/runs/{run_id}/deployment` with the outcome (`backend/internal/deployreconciler/README.md`). fishhawkd **never follows a redirect** from the trigger endpoint: a 3xx fails the stage carrying only the status code (never the `Location` header or the body), so point `url` at the final endpoint. Transport failures are recorded by class (`timeout`, `dns`, `connection_refused`, `tls`, `redirect_parse`, `other`) plus the committed `url`; the resolved token is redacted from every audit row, log line and error.
+
+**Extra-key tolerance is pending the live walk (#2032).** GitLab's trigger endpoint documents `token`, `ref`, `variables` and `inputs`; whether it tolerates the flat correlation keys (`fishhawk_run_id`, `repo`, …) alongside them in a JSON body is undocumented (Grape ignores undeclared params by default). If the live walk disproves it, the fallback is the **relay**: point `url` at a deploy endpoint you operate (`https://deploy-relay.example.internal/fishhawk/deploy`), authenticate Fishhawk's call with `secret_env` + `secret_header` (or by network placement / mTLS / a source-IP allow-list), and have the relay hold the GitLab trigger token in its own environment and call `POST /projects/:id/trigger/pipeline` itself, forwarding `variables` as-is and dropping the flat keys. The relay receives the same body shape documented above; a relay validating with `additionalProperties: false` must admit the additive `variables` key.
 
 ## `ci_green` on GitLab today
 
