@@ -1,0 +1,15 @@
+{
+  "entry_id": "hygiene:github/kuhlman-labs%2ffishhawk%234:missing_label_namespace",
+  "class": "hygiene",
+  "report_class": "hygiene",
+  "kind": "label_set",
+  "before": {},
+  "after": {
+    "list": [
+      "area:api"
+    ]
+  },
+  "outcome": "skipped",
+  "skip_reason": "apply_budget_exhausted",
+  "idempotence_checked": false
+}

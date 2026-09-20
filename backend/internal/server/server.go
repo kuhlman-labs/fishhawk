@@ -975,6 +975,15 @@ type Server struct {
 	// here.
 	bgReviews sync.WaitGroup
 
+	// bgGroomingApply tracks the DETACHED on-approval grooming apply
+	// (E54.77 / #3232). applyApprovedGrooming returns to the approve
+	// request once the capture window is settled and the apply inputs
+	// are resolved; workmgmt.ApplyGrooming then runs on a goroutine in
+	// this group under its own candidate-scaled budget. Shutdown drains
+	// it alongside bgReviews, bounded by the shutdown context, so a
+	// wedged forge cannot block a graceful stop past the deadline.
+	bgGroomingApply sync.WaitGroup
+
 	// p95Cache memoizes implement-stage calibration p95 results keyed
 	// by workflow_id so resolveImplementTimeout's per-prompt-fetch call
 	// to implementCalibrationP95 doesn't run a full AuditRepo.ListAll
@@ -1289,19 +1298,21 @@ func (s *Server) Start() error {
 // Shutdown gracefully drains in-flight requests, capped by
 // ShutdownTimeout from the parent context. After the HTTP server
 // drains, it also waits for any detached advisory review goroutines
-// (#584) to finish, bounded by the same shutdown context so a hung
-// reviewer can't block shutdown past the deadline.
+// (#584) and any detached grooming apply (E54.77 / #3232) to finish,
+// bounded by the same shutdown context so a hung reviewer or a wedged
+// forge can't block shutdown past the deadline.
 func (s *Server) Shutdown(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, s.cfg.ShutdownTimeout)
 	defer cancel()
 	err := s.http.Shutdown(shutdownCtx)
 
-	// Drain in-flight detached reviews, bounded by the shutdown
-	// context. A WaitGroup can't be select-ed on directly, so signal
-	// completion through a channel.
+	// Drain in-flight detached reviews and grooming applies, bounded by
+	// the shutdown context. A WaitGroup can't be select-ed on directly,
+	// so signal completion through a channel.
 	done := make(chan struct{})
 	go func() {
 		s.bgReviews.Wait()
+		s.bgGroomingApply.Wait()
 		close(done)
 	}()
 	select {
@@ -1317,6 +1328,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // blocking reviewer, then call this, then assert. Production code never
 // calls it (Shutdown drains the same group, bounded by its context).
 func (s *Server) waitBackgroundReviews() { s.bgReviews.Wait() }
+
+// waitGroomingApply blocks until every detached on-approval grooming apply
+// (E54.77 / #3232) has finished — the deterministic sync point tests use to
+// assert on the audit rows the detached apply writes. Production code never
+// calls it (Shutdown drains the same group, bounded by its context).
+func (s *Server) waitGroomingApply() { s.bgGroomingApply.Wait() }
 
 // resolveRepoScope resolves the GitHub App installation for owner/name into a
 // forge.CredentialScope (ADR-058 / #1855), the input the scope-taking

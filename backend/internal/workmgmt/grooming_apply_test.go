@@ -9,9 +9,12 @@ import (
 	"go/parser"
 	"go/token"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // ---------------------------------------------------------------------------
@@ -3770,5 +3773,200 @@ func TestGroomingResumeStep_OneRuleServesBothPaths(t *testing.T) {
 	// marker is not a half-write, whatever the ledger says.
 	if _, ok := groomingResumeStep(epic, nil, GroomingValue{Scalar: "#389", List: []string{"#389"}}, req); ok {
 		t.Error("epic arm resumed against a body that already carries the marker")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Over-budget apply (E54.77 / #3232)
+// ---------------------------------------------------------------------------
+
+// ctxHonouringSink is a GroomingAuditSink that behaves like the production
+// Postgres repository: it REFUSES a write whose context is already done. It
+// also records, per write, whether the handed context carried a deadline and
+// was live at call time — the property the per-write auditWriteCtx exists to
+// guarantee. fakeGroomingSink ignores ctx, which is exactly what let the old
+// bounded-context coverage pass without the per-write derivation.
+type ctxHonouringSink struct {
+	mu        sync.Mutex
+	records   []GroomingMutationRecord
+	summaries []GroomingApplySummary
+	// writes logs (hadDeadline, wasLive) per call, mutation and summary alike.
+	writes []ctxWriteObservation
+}
+
+type ctxWriteObservation struct {
+	hadDeadline bool
+	wasLive     bool
+}
+
+func (s *ctxHonouringSink) observe(ctx context.Context) error {
+	_, hasDeadline := ctx.Deadline()
+	s.writes = append(s.writes, ctxWriteObservation{hadDeadline: hasDeadline, wasLive: ctx.Err() == nil})
+	return ctx.Err()
+}
+
+func (s *ctxHonouringSink) RecordGroomingMutation(ctx context.Context, rec GroomingMutationRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.observe(ctx); err != nil {
+		return err
+	}
+	s.records = append(s.records, rec)
+	return nil
+}
+
+func (s *ctxHonouringSink) RecordGroomingApplyCompleted(ctx context.Context, sum GroomingApplySummary) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.observe(ctx); err != nil {
+		return err
+	}
+	s.summaries = append(s.summaries, sum)
+	return nil
+}
+
+// budgetConsumingMutator parks the FIRST dispatch until ctx is done — the
+// server fixture's wedged-forge shape — and applies every later one.
+type budgetConsumingMutator struct {
+	mu    sync.Mutex
+	calls []GroomingMutationRequest
+}
+
+func (m *budgetConsumingMutator) ApplyGroomingMutation(ctx context.Context, req GroomingMutationRequest) (*GroomingMutationResult, error) {
+	m.mu.Lock()
+	m.calls = append(m.calls, req)
+	first := len(m.calls) == 1
+	m.mu.Unlock()
+	if first {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return &GroomingMutationResult{Applied: true, ProviderResponse: "applied " + string(req.Kind)}, nil
+}
+
+func (m *budgetConsumingMutator) dialed() []GroomingMutationRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]GroomingMutationRequest(nil), m.calls...)
+}
+
+// overBudgetReport is four approved hygiene label sets: the first dispatch
+// consumes the budget, so the remaining three reach the loop on a dead ctx.
+func overBudgetReport() *plan.GroomingReport {
+	return &plan.GroomingReport{HygieneDefects: []plan.HygieneDefect{
+		hygieneEntry(1, "missing_label_namespace", "area:api"),
+		hygieneEntry(2, "missing_label_namespace", "area:api"),
+		hygieneEntry(3, "missing_label_namespace", "area:api"),
+		hygieneEntry(4, "missing_label_namespace", "area:api"),
+	}}
+}
+
+// runOverBudgetApply drives ApplyGrooming with a ctx whose deadline the first
+// dispatch consumes, under a ctx-honouring sink.
+func runOverBudgetApply(t *testing.T) (*GroomingApplyResult, *ctxHonouringSink, *budgetConsumingMutator, error) {
+	t.Helper()
+	report := overBudgetReport()
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(50*time.Millisecond))
+	t.Cleanup(cancel)
+	sink := &ctxHonouringSink{}
+	mut := &budgetConsumingMutator{}
+	rdr := &fakeGroomingReader{}
+	res, err := ApplyGrooming(ctx, mut, rdr, sink, GroomingApplyRequest{
+		Target: groomingTarget(), Report: report, Decisions: approveAll(report),
+		Modes: map[string]GroomingMode{"hygiene": GroomingModeAuto}, States: groomingStates(),
+	})
+	return res, sink, mut, err
+}
+
+// TestApplyGrooming_AuditWritesSurviveAnExpiredContext pins the per-write sink
+// context (E54.77 / #3232): once the apply budget expires, every remaining
+// audit write still lands because each runs on a FRESH context carrying its
+// own deadline. COUNTERFACTUAL: pass ctx straight through to the sink instead
+// of auditWriteCtx(ctx) → the ctx-honouring sink returns DeadlineExceeded for
+// every post-budget write → records < candidates and a GroomingAuditError.
+func TestApplyGrooming_AuditWritesSurviveAnExpiredContext(t *testing.T) {
+	res, sink, _, err := runOverBudgetApply(t)
+	if err != nil {
+		t.Fatalf("ApplyGrooming returned %v, want nil — no audit write may fail on the expired apply ctx", err)
+	}
+	if res == nil {
+		t.Fatal("nil result")
+	}
+	const candidates = 4
+	if len(sink.records) != candidates {
+		t.Errorf("sink records = %d, want %d (one per candidate, budget expiry or not)", len(sink.records), candidates)
+	}
+	if len(sink.summaries) != 1 {
+		t.Errorf("sink summaries = %d, want exactly 1", len(sink.summaries))
+	}
+	if len(sink.writes) != candidates+1 {
+		t.Fatalf("sink writes = %d, want %d", len(sink.writes), candidates+1)
+	}
+	for i, w := range sink.writes {
+		if !w.hadDeadline || !w.wasLive {
+			t.Errorf("write %d saw ctx {deadline:%v live:%v}, want a live ctx with its own deadline", i, w.hadDeadline, w.wasLive)
+		}
+	}
+}
+
+// TestApplyGrooming_BudgetExhaustedCandidatesSkippedNotDialed pins the
+// ctx.Err() pre-check (E54.77 / #3232): once ctx is done every remaining
+// candidate is recorded skipped/apply_budget_exhausted WITHOUT a dispatch, and
+// Summary.BudgetExhausted counts exactly those. COUNTERFACTUAL: delete the
+// pre-check → the later candidates are dialed on the dead ctx and recorded
+// `failed` → the outcome and call-log assertions go red.
+func TestApplyGrooming_BudgetExhaustedCandidatesSkippedNotDialed(t *testing.T) {
+	res, _, mut, err := runOverBudgetApply(t)
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	if dialed := mut.dialed(); len(dialed) != 1 {
+		t.Errorf("mutator dialed %d times (%+v), want ONLY the first, budget-consuming dispatch", len(dialed), dialed)
+	}
+	if len(res.Failed) != 1 {
+		t.Errorf("failed = %d (%+v), want 1 — the wedged first dispatch", len(res.Failed), res.Failed)
+	}
+	exhausted := 0
+	for _, rec := range res.Skipped {
+		if rec.SkipReason != GroomingSkipApplyBudgetExhausted {
+			t.Errorf("skipped %q carries skip_reason %q, want %q", rec.EntryID, rec.SkipReason, GroomingSkipApplyBudgetExhausted)
+			continue
+		}
+		exhausted++
+		if rec.Error != "" || len(rec.StepsLanded) != 0 {
+			t.Errorf("exhausted %q carries error=%q steps=%v, want neither — it was never evaluated", rec.EntryID, rec.Error, rec.StepsLanded)
+		}
+		if rec.EntryID == "" || rec.Kind == "" || rec.Class == "" {
+			t.Errorf("exhausted record lacks its base identity: %+v", rec)
+		}
+	}
+	if exhausted != 3 {
+		t.Errorf("apply_budget_exhausted records = %d, want 3", exhausted)
+	}
+	if res.Summary.BudgetExhausted != exhausted {
+		t.Errorf("Summary.BudgetExhausted = %d, want %d", res.Summary.BudgetExhausted, exhausted)
+	}
+	if got := res.Summary.Applied + res.Summary.Failed + res.Summary.Skipped + res.Summary.Refused; got != 4 {
+		t.Errorf("outcome counts sum to %d, want 4 — budget_exhausted is a subset of skipped, not a fifth bucket", got)
+	}
+}
+
+// TestGroomingCandidateCount pins the exported denominator: one per report
+// entry across every class (a finding-only vision-drift flag included), and
+// zero for a nil report.
+func TestGroomingCandidateCount(t *testing.T) {
+	if got := GroomingCandidateCount(nil); got != 0 {
+		t.Errorf("GroomingCandidateCount(nil) = %d, want 0", got)
+	}
+	report := &plan.GroomingReport{
+		HygieneDefects:           []plan.HygieneDefect{hygieneEntry(1, "missing_label_namespace", "area:api")},
+		DependencyEdges:          []plan.DependencyEdge{dependencyEntry(10, 11)},
+		Ordering:                 []plan.OrderingEntry{orderingEntry(12, 1)},
+		Duplicates:               []plan.DuplicateCandidate{duplicateEntry(13, 14)},
+		DecompositionSuggestions: []plan.DecompositionSuggestion{decompositionEntry(15)},
+		VisionDrift:              []plan.VisionDriftFlag{visionDriftEntry(16)},
+	}
+	if got := GroomingCandidateCount(report); got != 6 {
+		t.Errorf("GroomingCandidateCount = %d, want 6 (one per report entry)", got)
 	}
 }

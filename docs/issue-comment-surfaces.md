@@ -2013,19 +2013,27 @@ Notes:
   Listed here so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
 - The grooming-apply kinds — `grooming_mutation_applied` and
-  `grooming_apply_completed` (E54.5 / #2237) — are **internal, audit-only
-  categories, not issue-comment surfaces**. Nothing in `issuecomment` posts
-  them; neither has a Notifier method. They are the two constants
-  `workmgmt.GroomingMutationAppliedCategory` /
+  `grooming_apply_completed` (E54.5 / #2237), plus `grooming_apply_started`
+  (E54.77 / #3232) — are **internal, audit-only categories, not issue-comment
+  surfaces**. Nothing in `issuecomment` posts them; none has a Notifier method.
+  The first two are the constants `workmgmt.GroomingMutationAppliedCategory` /
   `workmgmt.GroomingApplyCompletedCategory` declared in
   `backend/internal/workmgmt/grooming_apply.go`, written through the
-  `workmgmt.GroomingAuditSink` interface that `ApplyGrooming` calls — the
-  apply layer defines the sink, it does not implement one, so **no backend
-  code writes either category yet**: #2237 reserves the apply seam and no HTTP
-  route, MCP tool or CLI verb resolves a `GroomingMutator`. They are
-  registered now because the completeness AST sweep collects the constants and
-  because an unregistered category is un-awaitable and unfilterable via GET
-  `/v0/runs/{run_id}/audit?category=`.
+  `workmgmt.GroomingAuditSink` interface that `ApplyGrooming` calls; the apply
+  layer defines the sink and the SERVER implements it — since E54.19 / #2822
+  the groom-gate approval hook (`backend/internal/server/grooming_apply.go`,
+  `groomingApplyAuditSink`) writes both, so they are live categories, not a
+  reserved seam. `grooming_apply_started` is server-authored (the
+  `groomingApplyStartedCategory` const in the same file), written ONCE per apply
+  immediately before the DETACHED apply goroutine starts, carrying
+  `{candidate_count, budget_seconds, started_at}` — the progress denominator
+  `fishhawk_get_run_status`'s `grooming_apply_status` block reads against the
+  mutation rows that follow; a degrade path writes NO started row. Every sink
+  write runs on a fresh per-write context that survives the apply budget, so
+  the row recording a budget expiry cannot die of that expiry (#3232). All
+  three are registered because the completeness AST sweep collects the
+  constants and because an unregistered category is un-awaitable and
+  unfilterable via GET `/v0/runs/{run_id}/audit?category=`.
   `grooming_mutation_applied` is written once per **SETTLED** candidate —
   applied, failed AND skipped alike, so one category filter returns the whole
   apply — carrying `{entry_id, class, report_class, kind, item_ref, before,
@@ -2043,8 +2051,13 @@ Notes:
   landed mutation from a containment refusal, and `skip_reason` (the closed set
   in `grooming_apply.go`: `not_approved`, `mode_report_surface_only`,
   `destructive_not_authorized`, `delegation_tier_not_authorized`,
-  `already_applied`, `icebox_column_unavailable`, …) to tell WHICH rule refused
-  it. **`refused` is DISTINCT from `skipped` (#2860)**: a skip is a no-op the
+  `already_applied`, `icebox_column_unavailable`, `apply_budget_exhausted`, …)
+  to tell WHICH rule refused it. **`apply_budget_exhausted` (#3232)** marks a
+  candidate the apply never EVALUATED because its budget was already spent when
+  the loop reached it — no mutator, no reader, no containment ladder — so the
+  row carries no `error` and no `steps_landed`; the churn guard maps no
+  baseline disposition for it, so the entry RESURFACES on the next grooming
+  run rather than needing a hand-apply. **`refused` is DISTINCT from `skipped` (#2860)**: a skip is a no-op the
   layer OBSERVED as already-satisfied, while `refused` is a requested write the
   provider DECLINED — nothing changed and nothing was already correct — and it
   carries `refuse_reason` instead of `skip_reason`. Collapsing the two is how a
@@ -2059,8 +2072,11 @@ Notes:
   one an operator most often needs to act on by hand: the entry proposed an
   `autonomy:` delegation-tier label, which no whole-report approval applies, and
   `after` carries every proposed label. `grooming_apply_completed` is written
-  once per apply with `{applied, failed, skipped, refused, applied_ids,
-  failed_ids, skipped_ids, refused_ids, audit_errors}`. `refused_ids` NAMES
+  once per apply with `{applied, failed, skipped, refused, budget_exhausted,
+  applied_ids, failed_ids, skipped_ids, refused_ids, audit_errors}`.
+  `budget_exhausted` (#3232) counts the `skipped` rows carrying
+  `apply_budget_exhausted` — a subset of `skipped`, not a fifth outcome, so
+  `applied+failed+skipped+refused` still equals the candidate count. `refused_ids` NAMES
   which entries were declined rather than only counting them — not naming them
   is what made the 0/8 rate invisible — and the server-authored degrade payload
   is a strict superset of these count fields, so `refused` serializes as `0` on
