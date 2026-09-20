@@ -85,10 +85,81 @@ func (q *Queries) FindRunStagesForCheckRun(ctx context.Context, arg FindRunStage
 	return items, nil
 }
 
+const findRunStagesForGitLabPipeline = `-- name: FindRunStagesForGitLabPipeline :many
+SELECT s.id AS stage_id, s.run_id
+  FROM artifacts a
+  JOIN stages s_pr ON s_pr.id = a.stage_id
+  JOIN runs r ON r.id = s_pr.run_id
+  JOIN stages s ON s.run_id = r.id
+ WHERE a.kind = 'pull_request'
+   AND (a.content->>'head_sha') = $1::text
+   AND ($2::int = 0 OR (a.content->>'pr_number')::int = $2::int)
+   AND r.repo = $3::text
+   AND r.installation_ref = $4::text
+   AND s.stage_type = 'review'
+ ORDER BY r.created_at ASC, s.sequence ASC
+`
+
+type FindRunStagesForGitLabPipelineParams struct {
+	HeadSha         string `json:"head_sha"`
+	MrIid           int32  `json:"mr_iid"`
+	Repo            string `json:"repo"`
+	InstallationRef string `json:"installation_ref"`
+}
+
+type FindRunStagesForGitLabPipelineRow struct {
+	StageID uuid.UUID `json:"stage_id"`
+	RunID   uuid.UUID `json:"run_id"`
+}
+
+// GitLab Pipeline Hook sibling of FindRunStagesForCheckRun (E45.55 /
+// #3490). Locate the review stage of every run whose pull_request
+// artifact matches the pipeline's head_sha (and, when the hook names a
+// merge request, its iid as pr_number; mr_iid = 0 disables that
+// predicate so a branch pipeline still matches by sha).
+//
+// BOTH run predicates are LOAD-BEARING. GitLab pipeline hooks are
+// delivered per project, and a fork of the same project can carry the
+// SAME head_sha and the SAME merge-request iid; head_sha + iid alone
+// would therefore route a fork's pipeline onto the upstream run (or
+// vice versa). runs.repo pins the project path and
+// runs.installation_ref pins the credential scope ("gitlab:<project_id>")
+// the webhook was authorized under — deleting either admits a decoy
+// that shares the other (pinned by
+// TestFindMatchingStagesForGitLabPipeline_ProjectScoped with one decoy
+// per predicate).
+//
+// Returns (stage_id, run_id) pairs: the ingester appends to the stage
+// and re-runs the post-CI policy evaluation for the run.
+func (q *Queries) FindRunStagesForGitLabPipeline(ctx context.Context, arg FindRunStagesForGitLabPipelineParams) ([]FindRunStagesForGitLabPipelineRow, error) {
+	rows, err := q.db.Query(ctx, findRunStagesForGitLabPipeline,
+		arg.HeadSha,
+		arg.MrIid,
+		arg.Repo,
+		arg.InstallationRef,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []FindRunStagesForGitLabPipelineRow
+	for rows.Next() {
+		var i FindRunStagesForGitLabPipelineRow
+		if err := rows.Scan(&i.StageID, &i.RunID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getStageCheckLatest = `-- name: GetStageCheckLatest :one
-SELECT id, stage_id, check_name, status, conclusion, head_sha, github_check_run_id, ts, payload FROM stage_checks
+SELECT id, stage_id, check_name, status, conclusion, head_sha, github_check_run_id, ts, payload, gitlab_pipeline_id FROM stage_checks
  WHERE stage_id = $1 AND check_name = $2
- ORDER BY ts DESC
+ ORDER BY gitlab_pipeline_id DESC NULLS LAST, ts DESC
  LIMIT 1
 `
 
@@ -98,9 +169,15 @@ type GetStageCheckLatestParams struct {
 }
 
 // Single-check variant of ListStageChecksLatest. Used internally
-// when the approval handler walks a gate's declared blocking_checks
-// and asks "what's the latest state?". Returns ErrNoRows when
-// the check has never been observed (caller maps to not_tracked).
+// when a reader asks "what's the latest state of this one check?"
+// (the GitLab pipeline ingester's write-avoidance read). Returns
+// ErrNoRows when the check has never been observed (caller maps to
+// not_tracked).
+//
+// Same structural precedence as ListStageChecksLatest: the highest
+// gitlab_pipeline_id wins within (stage, check_name) regardless of ts
+// or delivery order; NULL-id GitHub rows sort last on that key and
+// keep pure ts ordering. Mirrored verbatim in db/queries.sql.go.
 func (q *Queries) GetStageCheckLatest(ctx context.Context, arg GetStageCheckLatestParams) (StageCheck, error) {
 	row := q.db.QueryRow(ctx, getStageCheckLatest, arg.StageID, arg.CheckName)
 	var i StageCheck
@@ -114,6 +191,7 @@ func (q *Queries) GetStageCheckLatest(ctx context.Context, arg GetStageCheckLate
 		&i.GithubCheckRunID,
 		&i.Ts,
 		&i.Payload,
+		&i.GitlabPipelineID,
 	)
 	return i, err
 }
@@ -122,10 +200,10 @@ const insertStageCheck = `-- name: InsertStageCheck :one
 
 INSERT INTO stage_checks (
     id, stage_id, check_name, status, conclusion, head_sha,
-    github_check_run_id, ts, payload
+    github_check_run_id, ts, payload, gitlab_pipeline_id
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-RETURNING id, stage_id, check_name, status, conclusion, head_sha, github_check_run_id, ts, payload
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+RETURNING id, stage_id, check_name, status, conclusion, head_sha, github_check_run_id, ts, payload, gitlab_pipeline_id
 `
 
 type InsertStageCheckParams struct {
@@ -138,6 +216,7 @@ type InsertStageCheckParams struct {
 	GithubCheckRunID *int64             `json:"github_check_run_id"`
 	Ts               pgtype.Timestamptz `json:"ts"`
 	Payload          []byte             `json:"payload"`
+	GitlabPipelineID *int64             `json:"gitlab_pipeline_id"`
 }
 
 // Stage-checks queries consumed by the postgres adapter for the
@@ -156,6 +235,7 @@ func (q *Queries) InsertStageCheck(ctx context.Context, arg InsertStageCheckPara
 		arg.GithubCheckRunID,
 		arg.Ts,
 		arg.Payload,
+		arg.GitlabPipelineID,
 	)
 	var i StageCheck
 	err := row.Scan(
@@ -168,20 +248,31 @@ func (q *Queries) InsertStageCheck(ctx context.Context, arg InsertStageCheckPara
 		&i.GithubCheckRunID,
 		&i.Ts,
 		&i.Payload,
+		&i.GitlabPipelineID,
 	)
 	return i, err
 }
 
 const listStageChecksLatest = `-- name: ListStageChecksLatest :many
-SELECT DISTINCT ON (check_name) id, stage_id, check_name, status, conclusion, head_sha, github_check_run_id, ts, payload
+SELECT DISTINCT ON (check_name) id, stage_id, check_name, status, conclusion, head_sha, github_check_run_id, ts, payload, gitlab_pipeline_id
   FROM stage_checks
  WHERE stage_id = $1
- ORDER BY check_name, ts DESC
+ ORDER BY check_name, gitlab_pipeline_id DESC NULLS LAST, ts DESC
 `
 
 // Return one row per (stage_id, check_name) — the most recent state
 // the row table holds. Powers the review-stage page's checks panel
-// and the approval handler's gate-enforcement read.
+// and the deploy gate's ci_green read.
+//
+// PRECEDENCE IS STRUCTURAL (E45.55 / #3490): within (stage,
+// 'gitlab/pipeline') the highest gitlab_pipeline_id is authoritative
+// regardless of ts or webhook delivery order — the same head_sha can
+// carry several pipelines (retry / manual re-run) and GitLab ids are
+// monotonically increasing, so an older id appended LATER can never
+// become the latest row. GitHub rows carry NULL and sort LAST on that
+// key, so their ts ordering is unchanged. DISTINCT ON requires the
+// ORDER BY to lead with check_name. Mirrored verbatim in
+// db/queries.sql.go (the Go const is what executes).
 func (q *Queries) ListStageChecksLatest(ctx context.Context, stageID uuid.UUID) ([]StageCheck, error) {
 	rows, err := q.db.Query(ctx, listStageChecksLatest, stageID)
 	if err != nil {
@@ -201,6 +292,7 @@ func (q *Queries) ListStageChecksLatest(ctx context.Context, stageID uuid.UUID) 
 			&i.GithubCheckRunID,
 			&i.Ts,
 			&i.Payload,
+			&i.GitlabPipelineID,
 		); err != nil {
 			return nil, err
 		}

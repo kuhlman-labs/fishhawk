@@ -4048,6 +4048,95 @@ func TestMigrateDown_ArtifactAcceptanceTranscriptReversal(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_StageChecksGitLabPipelineIDReversal pins 0084 (E45.55 /
+// #3490) in BOTH directions and on the column's SHAPE: stage_checks.
+// gitlab_pipeline_id EXISTS after MigrateUp, is NULLABLE bigint with NO
+// column default; it is GONE after rolling back through 0084 with the
+// stage_checks table surviving (0084 is a single ALTER, never a DROP TABLE);
+// and it RETURNS on a second MigrateUp. Mirrors the 0082 column-reversal
+// shape.
+//
+// The nullable + no-default assertions are the done-means no compiler
+// checks: the column doubles as an ORDERING KEY for the stagecheck latest-row
+// readers (`gitlab_pipeline_id DESC NULLS LAST, ts DESC`), and the GitHub
+// check_run rows keep their pure ts ordering ONLY because they carry NULL
+// there. A `DEFAULT 0` regression would sort every GitHub row ahead of
+// nothing and behind every GitLab row uniformly — harmless today, but a NOT
+// NULL or a default would make "NULL = not a GitLab pipeline row" undecidable.
+func TestMigrateDown_StageChecksGitLabPipelineIDReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+
+	pipelineIDColumn := func() int {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = 'stage_checks' AND column_name = 'gitlab_pipeline_id'`).Scan(&n); err != nil {
+			t.Fatalf("query stage_checks.gitlab_pipeline_id: %v", err)
+		}
+		return n
+	}
+	assertShape := func(phase string) {
+		t.Helper()
+		var nullable, dataType string
+		var columnDefault *string
+		if err := pool.QueryRow(ctx,
+			`SELECT is_nullable, data_type, column_default FROM information_schema.columns
+			  WHERE table_name = 'stage_checks' AND column_name = 'gitlab_pipeline_id'`).Scan(&nullable, &dataType, &columnDefault); err != nil {
+			t.Fatalf("%s: query stage_checks.gitlab_pipeline_id shape: %v", phase, err)
+		}
+		if nullable != "YES" {
+			t.Errorf("%s: stage_checks.gitlab_pipeline_id is_nullable = %q, want YES (NULL = not a GitLab pipeline row is load-bearing for the reader ORDER BY)", phase, nullable)
+		}
+		if columnDefault != nil {
+			t.Errorf("%s: stage_checks.gitlab_pipeline_id column_default = %q, want none", phase, *columnDefault)
+		}
+		if dataType != "bigint" {
+			t.Errorf("%s: stage_checks.gitlab_pipeline_id data_type = %q, want bigint", phase, dataType)
+		}
+	}
+
+	if n := pipelineIDColumn(); n != 1 {
+		t.Fatalf("stage_checks.gitlab_pipeline_id count after MigrateUp = %d, want 1 (0084 added it)", n)
+	}
+	assertShape("after MigrateUp")
+
+	// Roll back through 0084, the reversal under test. downThrough names 0084
+	// (rather than a single MigrateDown at the tip) so this stays a one-line
+	// target when a migration lands above it.
+	downThrough(t, url, "0084")
+	if n := pipelineIDColumn(); n != 0 {
+		t.Errorf("stage_checks.gitlab_pipeline_id count after MigrateDown = %d, want 0 (0084 reverted)", n)
+	}
+	var stageChecksTable int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'stage_checks'`).Scan(&stageChecksTable); err != nil {
+		t.Fatalf("query stage_checks table: %v", err)
+	}
+	if stageChecksTable != 1 {
+		t.Errorf("'stage_checks' table count after MigrateDown = %d, want 1 (0084 is a single ALTER)", stageChecksTable)
+	}
+
+	// Re-apply: the column returns with the same shape, so the up migration
+	// is re-runnable after a rollback (IF NOT EXISTS keeps it idempotent).
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp (re-apply after rollback): %v", err)
+	}
+	if n := pipelineIDColumn(); n != 1 {
+		t.Fatalf("stage_checks.gitlab_pipeline_id count after re-apply = %d, want 1 (0084 re-added it)", n)
+	}
+	assertShape("after re-apply")
+}
+
 // stagesDispatchedAtColumnSQL counts whether stages.dispatched_at (0072, #2744)
 // exists. 1 after MigrateUp, 0 after the one-step rollback.
 const stagesDispatchedAtColumnSQL = `SELECT count(*) FROM information_schema.columns

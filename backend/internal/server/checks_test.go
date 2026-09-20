@@ -31,6 +31,11 @@ type stageCheckRepoFake struct {
 	matchingErr   error
 	matchedStages []uuid.UUID
 	appendCalls   []stagecheck.AppendParams
+	// gitlabMatches is what FindMatchingStagesForGitLabPipeline returns;
+	// gitlabMatchCalls records every match it was asked to resolve so a
+	// test can assert the project-scoped key the ingester passed.
+	gitlabMatches    []stagecheck.StageRef
+	gitlabMatchCalls []stagecheck.GitLabPipelineMatch
 }
 
 func newStageCheckRepoFake() *stageCheckRepoFake {
@@ -66,6 +71,13 @@ func (f *stageCheckRepoFake) FindMatchingStages(_ context.Context, _ int, _, _ s
 		return nil, f.matchingErr
 	}
 	return f.matchedStages, nil
+}
+func (f *stageCheckRepoFake) FindMatchingStagesForGitLabPipeline(_ context.Context, m stagecheck.GitLabPipelineMatch) ([]stagecheck.StageRef, error) {
+	f.gitlabMatchCalls = append(f.gitlabMatchCalls, m)
+	if f.matchingErr != nil {
+		return nil, f.matchingErr
+	}
+	return f.gitlabMatches, nil
 }
 
 // stageGetterRepo is a minimal run.Repository fake for the

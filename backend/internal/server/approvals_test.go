@@ -1894,6 +1894,9 @@ func (f *fakeStageCheckRepo) LatestForStageAndName(_ context.Context, stageID uu
 func (f *fakeStageCheckRepo) FindMatchingStages(context.Context, int, string, string) ([]uuid.UUID, error) {
 	return nil, errors.New("not used")
 }
+func (f *fakeStageCheckRepo) FindMatchingStagesForGitLabPipeline(context.Context, stagecheck.GitLabPipelineMatch) ([]stagecheck.StageRef, error) {
+	return nil, nil
+}
 
 // TestSubmitApproval_Approve_SucceedsRegardlessOfCheckState pins
 // the post-#253 (ADR-017) contract: the approval handler does NOT
