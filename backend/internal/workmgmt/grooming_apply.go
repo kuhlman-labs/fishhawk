@@ -107,6 +107,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -281,7 +282,35 @@ const (
 	// GroomingSkipItemRefUnresolvable marks an item_ref this layer cannot
 	// resolve to a provider-native issue reference.
 	GroomingSkipItemRefUnresolvable = "item_ref_unresolvable"
+	// GroomingSkipApplyBudgetExhausted marks a candidate the apply never
+	// EVALUATED because ctx was already done when the loop reached it (E54.77 /
+	// #3232). Once ctx is exhausted EVERY remaining candidate — whatever its
+	// class or decision — is recorded skipped with this reason and NOTHING
+	// further is evaluated: no mutator, no reader, no containment ladder,
+	// because a read on a dead context would only fail with a misleading
+	// provider error and be recorded `failed`. The entry RESURFACES on the next
+	// grooming run: the churn guard's priorGroomingDispositions maps no case
+	// for this reason, so it contributes no baseline disposition. That is the
+	// resume path — an over-budget tail is never hand-applied.
+	GroomingSkipApplyBudgetExhausted = "apply_budget_exhausted"
 )
+
+// groomingAuditWriteBudget bounds ONE audit-sink write. Every sink call in
+// ApplyGrooming runs on a FRESH context derived through auditWriteCtx — the
+// caller's values, NOT its cancellation, plus this deadline — so a write that
+// records a budget expiry cannot itself die of the same expiry (E54.77 /
+// #3232: the failure and its record used to share one deadline-bound ctx, so
+// past the budget no row landed at all). A Postgres append takes milliseconds;
+// a sink that genuinely hangs past this is a sink outage and is surfaced in
+// AuditErrors like any other per-write failure. It is a var, not a const, only
+// so a test can shrink it; production never reassigns it.
+var groomingAuditWriteBudget = 15 * time.Second
+
+// auditWriteCtx derives the per-write sink context: ctx's values with its
+// cancellation dropped, bounded by groomingAuditWriteBudget.
+func auditWriteCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), groomingAuditWriteBudget)
+}
 
 // GroomingMutationRecord is the per-candidate audit row. It carries the join
 // key (EntryID), what was proposed (Kind/Before/After), and what happened
@@ -318,15 +347,21 @@ type GroomingMutationRecord struct {
 // GroomingApplySummary is the once-per-apply audit payload: the counts and the
 // entry ids per outcome, plus any audit-sink errors collected during the loop.
 type GroomingApplySummary struct {
-	Applied     int      `json:"applied"`
-	Failed      int      `json:"failed"`
-	Skipped     int      `json:"skipped"`
-	Refused     int      `json:"refused"`
-	AppliedIDs  []string `json:"applied_ids,omitempty"`
-	FailedIDs   []string `json:"failed_ids,omitempty"`
-	SkippedIDs  []string `json:"skipped_ids,omitempty"`
-	RefusedIDs  []string `json:"refused_ids,omitempty"`
-	AuditErrors []string `json:"audit_errors,omitempty"`
+	Applied int `json:"applied"`
+	Failed  int `json:"failed"`
+	Skipped int `json:"skipped"`
+	Refused int `json:"refused"`
+	// BudgetExhausted counts the Skipped records carrying
+	// GroomingSkipApplyBudgetExhausted (E54.77 / #3232) — the never-evaluated
+	// tail of an over-budget apply. It is a SUBSET of Skipped, not a fifth
+	// outcome, so applied+failed+skipped+refused still equals the candidate
+	// count.
+	BudgetExhausted int      `json:"budget_exhausted"`
+	AppliedIDs      []string `json:"applied_ids,omitempty"`
+	FailedIDs       []string `json:"failed_ids,omitempty"`
+	SkippedIDs      []string `json:"skipped_ids,omitempty"`
+	RefusedIDs      []string `json:"refused_ids,omitempty"`
+	AuditErrors     []string `json:"audit_errors,omitempty"`
 }
 
 // GroomingApplyResult is what ApplyGrooming returns: every settled candidate,
@@ -344,6 +379,14 @@ type GroomingApplyResult struct {
 // after each candidate settles (so a mid-run failure still leaves everything
 // before it audited), and an error from either is collected and surfaced as a
 // *GroomingAuditError after the loop rather than aborting it.
+//
+// THE CONTEXT EACH METHOD RECEIVES SURVIVES THE APPLY BUDGET (E54.77 / #3232).
+// ApplyGrooming derives a fresh per-write context (auditWriteCtx: the apply
+// context's values with its cancellation dropped, bounded by
+// groomingAuditWriteBudget) for every call, so a sink implementation that
+// honours ctx — the production Postgres repository does — still lands the row
+// that records a budget expiry. A per-write failure is therefore a SINK
+// outage, never a budget expiry.
 type GroomingAuditSink interface {
 	RecordGroomingMutation(ctx context.Context, rec GroomingMutationRecord) error
 	RecordGroomingApplyCompleted(ctx context.Context, sum GroomingApplySummary) error
@@ -1026,7 +1069,17 @@ func ApplyGrooming(ctx context.Context, mutator GroomingMutator, reader WorkItem
 	var auditErrs []string
 
 	for _, c := range candidates {
-		rec := settleGroomingCandidate(ctx, c, req, decisions, mutator, reader)
+		var rec GroomingMutationRecord
+		if ctx.Err() != nil {
+			// BUDGET EXHAUSTED (E54.77 / #3232): record the candidate without
+			// evaluating it — no mutator, no reader, no containment ladder — so
+			// exactly one row per entry still lands and the entry resurfaces on
+			// the next grooming run. See GroomingSkipApplyBudgetExhausted.
+			rec = groomingSkipped(candidateRecord(c), GroomingSkipApplyBudgetExhausted)
+			result.Summary.BudgetExhausted++
+		} else {
+			rec = settleGroomingCandidate(ctx, c, req, decisions, mutator, reader)
+		}
 		switch rec.Outcome {
 		case GroomingOutcomeApplied:
 			result.Applied = append(result.Applied, rec)
@@ -1044,8 +1097,13 @@ func ApplyGrooming(ctx context.Context, mutator GroomingMutator, reader WorkItem
 			result.Summary.SkippedIDs = append(result.Summary.SkippedIDs, rec.EntryID)
 		}
 		// Audit immediately, so a later failure still leaves everything before
-		// it audited. A sink error is collected, never an abort.
-		if err := sink.RecordGroomingMutation(ctx, rec); err != nil {
+		// it audited. A sink error is collected, never an abort. The write runs
+		// on its OWN context (auditWriteCtx) so an expired apply budget cannot
+		// take the record of the expiry down with it.
+		wctx, wcancel := auditWriteCtx(ctx)
+		err := sink.RecordGroomingMutation(wctx, rec)
+		wcancel()
+		if err != nil {
 			auditErrs = append(auditErrs, fmt.Sprintf("%s: %v", rec.EntryID, err))
 		}
 	}
@@ -1056,14 +1114,42 @@ func ApplyGrooming(ctx context.Context, mutator GroomingMutator, reader WorkItem
 	result.Summary.Refused = len(result.Refused)
 	result.Summary.AuditErrors = auditErrs
 
-	if err := sink.RecordGroomingApplyCompleted(ctx, result.Summary); err != nil {
-		auditErrs = append(auditErrs, fmt.Sprintf("apply summary: %v", err))
+	sctx, scancel := auditWriteCtx(ctx)
+	serr := sink.RecordGroomingApplyCompleted(sctx, result.Summary)
+	scancel()
+	if serr != nil {
+		auditErrs = append(auditErrs, fmt.Sprintf("apply summary: %v", serr))
 		result.Summary.AuditErrors = auditErrs
 	}
 	if len(auditErrs) > 0 {
 		return result, &GroomingAuditError{Errors: auditErrs}
 	}
 	return result, nil
+}
+
+// candidateRecord builds the record BASE for one candidate — the join key and
+// what was proposed — shared by the containment ladder and the
+// budget-exhausted arm, so both record the same identity for the same entry.
+func candidateRecord(c groomingCandidate) GroomingMutationRecord {
+	return GroomingMutationRecord{
+		EntryID:     c.entryID,
+		Class:       c.class,
+		ReportClass: c.reportClass,
+		Kind:        c.kind,
+		After:       c.after,
+	}
+}
+
+// GroomingCandidateCount is the number of mutation records ApplyGrooming will
+// write for report — one per derived candidate, which is one per report entry
+// (a vision-drift flag derives a finding-only candidate, still recorded). The
+// server stamps it on the grooming_apply_started row as the progress
+// denominator (E54.77 / #3232) without re-deriving. Nil-safe.
+func GroomingCandidateCount(report *plan.GroomingReport) int {
+	if report == nil {
+		return 0
+	}
+	return len(deriveGroomingMutations(report))
 }
 
 // settleGroomingCandidate runs the containment ladder for ONE candidate and
@@ -1073,13 +1159,7 @@ func ApplyGrooming(ctx context.Context, mutator GroomingMutator, reader WorkItem
 // gate approval.
 func settleGroomingCandidate(ctx context.Context, c groomingCandidate, req GroomingApplyRequest,
 	decisions map[string]GroomingDecision, mutator GroomingMutator, reader WorkItemReader) GroomingMutationRecord {
-	rec := GroomingMutationRecord{
-		EntryID:     c.entryID,
-		Class:       c.class,
-		ReportClass: c.reportClass,
-		Kind:        c.kind,
-		After:       c.after,
-	}
+	rec := candidateRecord(c)
 
 	// Rule 0: a derivation-time skip (a finding, an unmappable defect, a
 	// missing or invalid structured fix) never reaches a decision or a

@@ -163,6 +163,7 @@ func TestGroomingDispositionsConsumedEndToEnd(t *testing.T) {
 		t.Fatalf("submit approval: %v", err)
 	}
 	f.s.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.s.waitGroomingApply()
 
 	// The approved dedup entry dispatched a close; the rejected hygiene did not.
 	mutations := map[string]workmgmt.GroomingMutationRecord{}
@@ -287,6 +288,7 @@ func TestGroomingWindow_MultiEntryCaptureVsApprovalSettlement(t *testing.T) {
 				time.Sleep(stagger)
 			}
 			f.s.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+			f.s.waitGroomingApply()
 		}()
 		close(start)
 		wg.Wait()
@@ -367,6 +369,7 @@ func TestGroomingWindow_MultiEntryCaptureVsRejectionSettlement(t *testing.T) {
 				time.Sleep(stagger)
 			}
 			f.s.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionReject)
+			f.s.waitGroomingApply()
 		}()
 		close(start)
 		wg.Wait()

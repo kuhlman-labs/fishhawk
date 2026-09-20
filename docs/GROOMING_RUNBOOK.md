@@ -9,8 +9,9 @@ State as of 2026-08-24. Loop verified end to end by walks #2828, #2839, #2848.
 ## 1. What works today
 
 An on-demand run produces a charter-anchored `grooming_report`, parks at an approval
-gate, and **approving it applies the hygiene-class mutations** to the tracker with every
-mutation audited.
+gate, and **approving it launches the hygiene-class mutations** against the tracker —
+the approve returns once the capture window is settled, the apply runs DETACHED on
+the server (E54.77 / #3232), and every mutation is audited.
 
 That path was assembled from five changes, each unblocking the next:
 
@@ -76,15 +77,32 @@ The value alone. Prose in that field means the #2847 defect has returned.
 
 ## 4. Approving is a write
 
-`fishhawk_approve_plan` executes the hygiene mutations server-side. There is no separate
+`fishhawk_approve_plan` launches the hygiene mutations server-side. There is no separate
 apply step to reconsider at — the gate IS the apply trigger, which is why the `apply`
-stage was removed (#2851).
+stage was removed (#2851). **The approve returns BEFORE the apply finishes** (E54.77 /
+#3232): the hook settles the capture window, writes one `grooming_apply_started` audit
+row (`candidate_count`, `budget_seconds`) and hands the apply to a detached server
+goroutine with a candidate-scaled budget (3m floor, 3s per candidate), so a long
+report no longer times out the approve call client-side.
 
 - `hygiene` applies (labels, fields, boarding, epic links — objective and reversible),
   **except a proposed `autonomy:` delegation-tier label**, which is refused with a named
   audited skip and needs your hand or #2843 (see §8).
 - `ordering`, `dedup`, `scoping` receive no decision and apply nothing. They are
   non-delegable by construction and refused at `mode: auto` at parse time.
+
+**Await completion before you check anything.** Because the approve returns while the
+apply is still running, first `fishhawk_await_audit` on `grooming_apply_completed` (or
+re-poll `fishhawk_get_run_status` until `grooming_apply_status.state` is `completed`;
+while it is `in_flight` the block reports `recorded`/`candidate_count` and `next_actions`
+leads with the re-poll). Do not attest the confirm gate (§5) on a partial apply.
+
+**An over-budget tail is recorded, not lost.** If the apply's budget runs out, the
+candidate in flight is recorded `failed` and every candidate after it is recorded
+`skipped` with `skip_reason: apply_budget_exhausted` — never dialed — and the completed
+row's `budget_exhausted` count names the tail. Those entries are NOT suppressed by the
+churn guard, so they RESURFACE on the next grooming run; approve that run rather than
+hand-applying them.
 
 **Verify on the forge, not from the summary.** On walk #2844 the summary truthfully
 reported eight applied while every applied VALUE was garbage. An audit row saying

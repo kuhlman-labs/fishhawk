@@ -139,6 +139,14 @@ import "sort"
 // artifact is refused (409 grooming_window_closed) and the settlement consumes
 // exactly the dispositions recorded below it. It is INTERNAL, audit-only — it
 // renders no issue comment.
+// E54.77 / #3232 added grooming_apply_started, written ONCE per apply by the
+// server's on-approval hook (server/grooming_apply.go) immediately BEFORE the
+// detached apply goroutine starts, carrying {candidate_count, budget_seconds,
+// started_at}. It is the progress DENOMINATOR fishhawk_get_run_status reads
+// against the grooming_mutation_applied rows that follow it, so an over-budget
+// apply is visible while it runs rather than only once grooming_apply_completed
+// lands. A degrade path (nothing dispatched) writes NO started row. It is
+// INTERNAL, audit-only: it renders no issue comment.
 // E54.6 / #2238 added campaign_grooming_source_resolved, written once per
 // campaign created from an approved grooming run's ratified order (the third
 // POST /v0/campaigns source): it carries the campaign id, the source
@@ -247,6 +255,7 @@ var KnownCategories = map[string]struct{}{
 	"fixup_no_changes":                        {},
 	"fixup_pushed":                            {},
 	"grooming_apply_completed":                {},
+	"grooming_apply_started":                  {}, // E54.77 / #3232: once-per-apply progress denominator (server/grooming_apply.go)
 	"grooming_apply_window_closed":            {},
 	"grooming_churn_filtered":                 {},
 	"grooming_disposition_recorded":           {},
