@@ -2,7 +2,9 @@ package gitlabclient
 
 // This file carries the four issue-thread operations the forge/gitlab
 // adapter's forge.IssueOperations implementation needs (E50.17 / #2900):
-// read an issue, list its notes, post a note, and edit its state. Before
+// read an issue, list its notes, post a note, and edit its state — plus
+// UpdateIssueNote, the edit-in-place leg of forge.IssueCommentEditor
+// (E45.52 / #3481). Before
 // this file the client spoke only CreateIssue and LinkIssues on the
 // issues surface. Each method reuses the c.do + errForStatus helpers and
 // the same argument-validation posture (project id > 0, iid > 0, a
@@ -222,6 +224,49 @@ func (c *Client) CreateIssueNote(ctx context.Context, projectID, iid int, body s
 	var out noteResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("gitlabclient: decode create issue note: %w", err)
+	}
+	n := out.note()
+	return &n, nil
+}
+
+// UpdateIssueNote replaces the body of an existing note on the issue.
+//
+//	PUT /api/v4/projects/:id/issues/:iid/notes/:note_id
+//
+// (https://docs.gitlab.com/ee/api/notes.html#modify-existing-issue-note).
+// The note endpoint is issue-scoped, so the iid is required alongside the
+// global note id. Same argument-validation posture as CreateIssueNote —
+// project id > 0, iid > 0, note id > 0, a non-empty body — each refused
+// locally before any HTTP call. It backs the forge/gitlab adapter's
+// forge.IssueCommentEditor.EditIssueComment (E45.52 / #3481).
+func (c *Client) UpdateIssueNote(ctx context.Context, projectID, iid int, noteID int64, body string) (*Note, error) {
+	if projectID <= 0 {
+		return nil, fmt.Errorf("gitlabclient: project id required")
+	}
+	if iid <= 0 {
+		return nil, fmt.Errorf("gitlabclient: issue iid required")
+	}
+	if noteID <= 0 {
+		return nil, fmt.Errorf("gitlabclient: note id required")
+	}
+	if strings.TrimSpace(body) == "" {
+		return nil, fmt.Errorf("gitlabclient: note body required")
+	}
+
+	resp, err := c.do(ctx, http.MethodPut,
+		fmt.Sprintf("/api/v4/projects/%d/issues/%d/notes/%d", projectID, iid, noteID),
+		map[string]any{"body": body})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := errForStatus("update issue note", resp); err != nil {
+		return nil, err
+	}
+
+	var out noteResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("gitlabclient: decode update issue note: %w", err)
 	}
 	n := out.note()
 	return &n, nil

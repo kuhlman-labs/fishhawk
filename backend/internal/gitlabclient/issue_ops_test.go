@@ -383,6 +383,86 @@ func TestGitLabClient_CreateIssueNote_ValidatesArgs(t *testing.T) {
 	}
 }
 
+// --- UpdateIssueNote ------------------------------------------------------
+
+// TestGitLabClient_UpdateIssueNote_RequestShapeAndResult pins the exact
+// wire shape of an edit: a PUT to the ISSUE-scoped note path (project id,
+// iid AND note id all in the path) carrying `body` byte-intact, and the
+// returned note decoded through the same noteResponse flattening as
+// CreateIssueNote. Deleting the path formatting reddens the path assertion.
+func TestGitLabClient_UpdateIssueNote_RequestShapeAndResult(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("PUT /api/v4/projects/42/issues/7/notes/99", func(w http.ResponseWriter, r *http.Request) {
+		writeIssueJSON(w, http.StatusOK, `{"id":99,"body":"<!-- k -->\nedited","system":false,"created_at":"2026-09-02T00:00:00Z","author":{"username":"bot"}}`)
+	})
+
+	n, err := s.client().UpdateIssueNote(context.Background(), 42, 7, 99, "<!-- k -->\nedited")
+	if err != nil {
+		t.Fatalf("UpdateIssueNote: %v", err)
+	}
+	if n.ID != 99 || n.Body != "<!-- k -->\nedited" || n.Author != "bot" || n.CreatedAt != "2026-09-02T00:00:00Z" {
+		t.Errorf("Note = %+v, want id 99 / edited marker body / bot", n)
+	}
+	reqs := s.requests()
+	if len(reqs) != 1 || reqs[0].Method != http.MethodPut || reqs[0].Path != "/api/v4/projects/42/issues/7/notes/99" {
+		t.Fatalf("requests = %+v, want one PUT .../issues/7/notes/99", reqs)
+	}
+	if got := reqs[0].Body["body"]; got != "<!-- k -->\nedited" {
+		t.Errorf("request body.body = %v, want the note text byte-intact", got)
+	}
+	if len(reqs[0].Body) != 1 {
+		t.Errorf("request body = %v, want ONLY the body key", reqs[0].Body)
+	}
+}
+
+func TestGitLabClient_UpdateIssueNote_APIError(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("PUT /api/v4/projects/42/issues/7/notes/99", func(w http.ResponseWriter, r *http.Request) {
+		writeIssueJSON(w, http.StatusNotFound, `{"message":"404 Note Not Found"}`)
+	})
+	n, err := s.client().UpdateIssueNote(context.Background(), 42, 7, 99, "x")
+	if n != nil {
+		t.Errorf("Note = %+v on error, want nil", n)
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound || apiErr.Op != "update issue note" {
+		t.Fatalf("err = %v, want *APIError status 404 op update issue note", err)
+	}
+}
+
+// TestGitLabClient_UpdateIssueNote_ValidatesArgs pins each local refusal
+// as its own row — deleting one validation branch reddens exactly that row
+// — and that NONE of them reaches the wire.
+func TestGitLabClient_UpdateIssueNote_ValidatesArgs(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeIssueJSON(w, http.StatusOK, `{"id":99}`)
+	})
+	c := s.client()
+	for _, tc := range []struct {
+		name      string
+		projectID int
+		iid       int
+		noteID    int64
+		body      string
+	}{
+		{"project 0", 0, 7, 99, "x"},
+		{"iid 0", 42, 0, 99, "x"},
+		{"note 0", 42, 7, 0, "x"},
+		{"note negative", 42, 7, -1, "x"},
+		{"blank body", 42, 7, 99, "   "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := c.UpdateIssueNote(context.Background(), tc.projectID, tc.iid, tc.noteID, tc.body); err == nil {
+				t.Errorf("UpdateIssueNote(%s) = nil, want an error", tc.name)
+			}
+		})
+	}
+	if n := len(s.requests()); n != 0 {
+		t.Errorf("argument validation must fire before any HTTP call; got %d requests", n)
+	}
+}
+
 // --- UpdateIssue ----------------------------------------------------------
 
 // TestGitLabClient_UpdateIssue_SendsStateEvent pins the exact wire shape of

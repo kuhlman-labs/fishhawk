@@ -1354,6 +1354,149 @@ func TestGitLabForge_IssueOperations_ErrorMapping(t *testing.T) {
 	}
 }
 
+// --- forge.IssueCommentEditor (E45.52 / #3481) --------------------------
+
+// TestGitLabForge_PostIssueCommentWithID_ReturnsNoteID pins that the
+// with-id post delegates to CreateIssueNote (POST .../issues/7/notes, body
+// byte-intact) AND surfaces the note id GitLab assigned — the value the
+// notifier audits as github_comment_id and later edits by.
+func TestGitLabForge_PostIssueCommentWithID_ReturnsNoteID(t *testing.T) {
+	a := newIssueForge(t)
+	a.mux.HandleFunc("POST /api/v4/projects/5/issues/7/notes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusCreated, `{"id":99,"body":"x","author":{"username":"bot"}}`)
+	})
+	var ed forge.IssueCommentEditor = a.f
+	id, err := ed.PostIssueCommentWithID(context.Background(), gitlabScope("5"), forge.RepoRef{}, 7, "<!-- k -->\nhello")
+	if err != nil {
+		t.Fatalf("PostIssueCommentWithID: %v", err)
+	}
+	if id != 99 {
+		t.Errorf("id = %d, want the note id 99 GitLab returned", id)
+	}
+	calls := a.calls()
+	if len(calls) != 1 || calls[0].Method != http.MethodPost || calls[0].Path != "/api/v4/projects/5/issues/7/notes" {
+		t.Fatalf("calls = %+v, want one POST .../issues/7/notes", calls)
+	}
+	if got := calls[0].Body["body"]; got != "<!-- k -->\nhello" {
+		t.Errorf("body.body = %v, want the note text byte-intact", got)
+	}
+}
+
+// TestGitLabForge_EditIssueComment_SendsPut pins the exact edit route the
+// operator's approval condition (1) names — PUT
+// /api/v4/projects/5/issues/7/notes/99, i.e. the project id from the
+// SCOPE, the issue iid from the number argument and the note id in the
+// path — carrying the new body byte-intact and nothing else.
+func TestGitLabForge_EditIssueComment_SendsPut(t *testing.T) {
+	a := newIssueForge(t)
+	a.mux.HandleFunc("PUT /api/v4/projects/5/issues/7/notes/99", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `{"id":99,"body":"edited","author":{"username":"bot"}}`)
+	})
+	var ed forge.IssueCommentEditor = a.f
+	if err := ed.EditIssueComment(context.Background(), gitlabScope("5"), forge.RepoRef{Owner: "group/sub", Name: "proj"}, 7, 99, "<!-- k -->\nedited"); err != nil {
+		t.Fatalf("EditIssueComment: %v", err)
+	}
+	calls := a.calls()
+	if len(calls) != 1 || calls[0].Method != http.MethodPut || calls[0].Path != "/api/v4/projects/5/issues/7/notes/99" {
+		t.Fatalf("calls = %+v, want exactly one PUT /api/v4/projects/5/issues/7/notes/99", calls)
+	}
+	if got := calls[0].Body["body"]; got != "<!-- k -->\nedited" {
+		t.Errorf("body.body = %v, want the edited text byte-intact", got)
+	}
+	if len(calls[0].Body) != 1 {
+		t.Errorf("body = %v, want ONLY the body key", calls[0].Body)
+	}
+}
+
+// TestGitLabForge_EditIssueComment_NotFoundMapsToForgeErrNotFound pins the
+// deleted-note arm: a 404 from the PUT must be errors.Is forge.ErrNotFound,
+// because the notifier's deleted-comment fallback keys on that sentinel to
+// create a fresh anchor. Deleting mapError on the edit path reddens it (the
+// raw *gitlabclient.APIError is not the forge sentinel). The original
+// status stays matchable through the errors.Join.
+func TestGitLabForge_EditIssueComment_NotFoundMapsToForgeErrNotFound(t *testing.T) {
+	a := newIssueForge(t)
+	a.mux.HandleFunc("PUT /api/v4/projects/5/issues/7/notes/99", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, `{"message":"404 Note Not Found"}`)
+	})
+	var ed forge.IssueCommentEditor = a.f
+	err := ed.EditIssueComment(context.Background(), gitlabScope("5"), forge.RepoRef{}, 7, 99, "x")
+	if !errors.Is(err, forge.ErrNotFound) {
+		t.Fatalf("err = %v, want errors.Is forge.ErrNotFound", err)
+	}
+	var apiErr *gitlabclient.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		t.Errorf("err = %v, want the original 404 *gitlabclient.APIError still matchable", err)
+	}
+}
+
+// TestGitLabForge_IssueCommentEditor_ErrorMapping pins the base mapper on
+// both editor methods for the non-404 arm too (403 → ErrForbidden), and
+// the 404 arm on the with-id post.
+func TestGitLabForge_IssueCommentEditor_ErrorMapping(t *testing.T) {
+	for _, tc := range issueCommentEditorCalls() {
+		for _, sc := range []struct {
+			status int
+			want   error
+		}{
+			{http.StatusNotFound, forge.ErrNotFound},
+			{http.StatusForbidden, forge.ErrForbidden},
+		} {
+			t.Run(tc.name+"/"+http.StatusText(sc.status), func(t *testing.T) {
+				a := newIssueForge(t)
+				a.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+					writeJSON(w, sc.status, `{"message":"x"}`)
+				})
+				if err := tc.call(a.f, gitlabScope("5")); !errors.Is(err, sc.want) {
+					t.Errorf("err = %v, want errors.Is %v", err, sc.want)
+				}
+			})
+		}
+	}
+}
+
+// issueCommentEditorCalls enumerates the two editor methods so the scope
+// and error-mapping cases run each one.
+func issueCommentEditorCalls() []struct {
+	name string
+	call func(ed forge.IssueCommentEditor, scope forge.CredentialScope) error
+} {
+	return []struct {
+		name string
+		call func(ed forge.IssueCommentEditor, scope forge.CredentialScope) error
+	}{
+		{"PostIssueCommentWithID", func(ed forge.IssueCommentEditor, scope forge.CredentialScope) error {
+			_, err := ed.PostIssueCommentWithID(context.Background(), scope, forge.RepoRef{}, 7, "x")
+			return err
+		}},
+		{"EditIssueComment", func(ed forge.IssueCommentEditor, scope forge.CredentialScope) error {
+			return ed.EditIssueComment(context.Background(), scope, forge.RepoRef{}, 7, 99, "x")
+		}},
+	}
+}
+
+// TestGitLabForge_IssueCommentEditor_NonGitLabScopeRejected pins that both
+// editor methods fail closed on a non-gitlab-shaped scope (a GitHub
+// installation id) BEFORE any HTTP call — a wrong forge's scope can never
+// address, let alone rewrite, a GitLab note.
+func TestGitLabForge_IssueCommentEditor_NonGitLabScopeRejected(t *testing.T) {
+	for _, tc := range issueCommentEditorCalls() {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newIssueForge(t)
+			a.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, http.StatusOK, `{"id":99}`)
+			})
+			err := tc.call(a.f, forge.FromGitHubInstallationID(12345))
+			if err == nil || !strings.Contains(err.Error(), "not gitlab-shaped") {
+				t.Errorf("err = %v, want a not-gitlab-shaped rejection", err)
+			}
+			if n := len(a.calls()); n != 0 {
+				t.Errorf("a wrong-forge scope reached the wire (%d calls), want 0", n)
+			}
+		})
+	}
+}
+
 // --- forge.CIRequirementReader (E45.55 / #3490) -------------------------
 
 // TestGitLabForge_ReadCIRequirement pins the adapter's mapping of the two
