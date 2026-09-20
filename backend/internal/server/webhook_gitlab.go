@@ -94,8 +94,8 @@ func (s *Server) handleWebhookGitLab(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// Dispatch through the shared pipeline. MatchGitLabEvent handles
-	// issue-label / note triggers and parks the deliberately-out-of-
-	// scope kinds (MR lifecycle, pipeline, build); a non-nil error is a
+	// issue-label / note triggers and parks the kinds consumed server-side
+	// below (MR lifecycle, pipeline) or out of scope (build); a non-nil error is a
 	// transient infra failure the caller surfaces as 5xx so GitLab
 	// redelivers. dispatchGitLabDelivery unmarks the delivery on that
 	// error so the redelivery actually re-processes (see its doc).
@@ -127,6 +127,17 @@ func (s *Server) handleWebhookGitLab(w http.ResponseWriter, r *http.Request) {
 				"gitlab merge_request lookup failed", map[string]any{"error": err.Error()})
 			return
 		}
+	}
+
+	// A Pipeline Hook (object_kind `pipeline`, every status) is consumed
+	// server-side as the GitLab CI signal (E45.55 / #3490): the dispatcher
+	// parks the kind, and ingestGitLabPipeline writes one `gitlab/pipeline`
+	// stage_checks row per project-scoped matching review stage, then
+	// re-runs the post-CI policy evaluation for each run that received a
+	// terminal row. Best-effort like ingestCheckRun on the GitHub receiver —
+	// it never influences the 202.
+	if ev.Type == "pipeline" {
+		s.ingestGitLabPipeline(r.Context(), ev)
 	}
 
 	// An issue close (object_kind `issue`, action `close`) drives the E50.6

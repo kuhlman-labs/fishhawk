@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
@@ -59,12 +60,13 @@ func (h *recordingLogHandler) find(msg string, match func(map[string]any) bool) 
 }
 
 type gitlabServerOpts struct {
-	noSecret   bool
-	noStore    bool
-	runRepo    run.Repository
-	auditRepo  *prEventsAuditRepo
-	dispatcher *webhook.Dispatcher
-	logHandler *recordingLogHandler
+	noSecret       bool
+	noStore        bool
+	runRepo        run.Repository
+	auditRepo      *prEventsAuditRepo
+	stageCheckRepo stagecheck.Repository
+	dispatcher     *webhook.Dispatcher
+	logHandler     *recordingLogHandler
 }
 
 func newGitLabWebhookServer(t *testing.T, opts gitlabServerOpts) (*Server, *webhook.MemoryStore) {
@@ -83,6 +85,9 @@ func newGitLabWebhookServer(t *testing.T, opts gitlabServerOpts) (*Server, *webh
 	}
 	if opts.auditRepo != nil {
 		cfg.AuditRepo = opts.auditRepo
+	}
+	if opts.stageCheckRepo != nil {
+		cfg.StageCheckRepo = opts.stageCheckRepo
 	}
 	if opts.dispatcher != nil {
 		cfg.WebhookDispatcher = opts.dispatcher
@@ -230,6 +235,53 @@ func TestHandleWebhookGitLab_RecognizedSkip_202(t *testing.T) {
 	if w := postGitLab(t, s, gitlabHeaders("Pipeline Hook", "p1"), body); w.Code != http.StatusAccepted {
 		t.Errorf("status = %d, want 202 (recognized skip)", w.Code)
 	}
+}
+
+// TestWebhookGitLab_PipelineEventRoutesToIngest pins the receiver's
+// object_kind=pipeline routing (E45.55 / #3490): a Pipeline Hook reaches
+// ingestGitLabPipeline — observable as the stagecheck repository's
+// FindMatchingStagesForGitLabPipeline being asked for the event's
+// project-scoped key — while a Merge Request Hook does NOT. Both deliveries
+// stay 202. The dispatcher is the real one (it parks both kinds).
+func TestWebhookGitLab_PipelineEventRoutesToIngest(t *testing.T) {
+	pipelineBody := []byte(`{"object_kind":"pipeline","user":{"username":"alice"},
+		"project":{"id":4242,"path_with_namespace":"acme/widgets"},
+		"object_attributes":{"id":100,"sha":"abc123","status":"success"},
+		"merge_request":{"iid":7}}`)
+	mrBody := []byte(`{"object_kind":"merge_request","user":{"username":"alice"},
+		"project":{"id":4242,"path_with_namespace":"acme/widgets"},
+		"object_attributes":{"iid":7,"action":"update","last_commit":{"id":"abc123"}}}`)
+
+	t.Run("pipeline_hook_reaches_ingester", func(t *testing.T) {
+		checks := newStageCheckRepoFake()
+		s, _ := newGitLabWebhookServer(t, gitlabServerOpts{
+			dispatcher: &webhook.Dispatcher{}, runRepo: &pipelineRunRepo{reevalRunRepo: newReevalRunRepo()},
+			stageCheckRepo: checks,
+		})
+		if w := postGitLab(t, s, gitlabHeaders("Pipeline Hook", "pipe-1"), pipelineBody); w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+		}
+		if n := len(checks.gitlabMatchCalls); n != 1 {
+			t.Fatalf("FindMatchingStagesForGitLabPipeline calls = %d, want 1 — the pipeline delivery must route to ingestGitLabPipeline", n)
+		}
+		want := stagecheck.GitLabPipelineMatch{Repo: "acme/widgets", InstallationRef: "gitlab:4242", HeadSHA: "abc123", MergeRequestIID: 7}
+		if got := checks.gitlabMatchCalls[0]; got != want {
+			t.Errorf("match key = %+v, want %+v (Repo / CredentialRef must come from the parsed event)", got, want)
+		}
+	})
+	t.Run("merge_request_hook_does_not_reach_ingester", func(t *testing.T) {
+		checks := newStageCheckRepoFake()
+		s, _ := newGitLabWebhookServer(t, gitlabServerOpts{
+			dispatcher: &webhook.Dispatcher{}, runRepo: &pipelineRunRepo{reevalRunRepo: newReevalRunRepo()},
+			stageCheckRepo: checks,
+		})
+		if w := postGitLab(t, s, gitlabHeaders("Merge Request Hook", "mr-1"), mrBody); w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+		}
+		if n := len(checks.gitlabMatchCalls); n != 0 {
+			t.Fatalf("FindMatchingStagesForGitLabPipeline calls = %d, want 0 for a merge_request delivery", n)
+		}
+	})
 }
 
 // stubDeliveryStore is a DeliveryStore whose Mark result is fixed by

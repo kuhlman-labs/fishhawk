@@ -216,6 +216,65 @@ func TestListStageChecks_HappyPath(t *testing.T) {
 	}
 }
 
+// TestListStageChecks_RendersGitLabPipelineID pins the HTTP render boundary
+// for the `gitlab_pipeline_id` detail field (E45.55 / #3490, approval
+// condition 3): a row whose GitLabPipelineID is set renders the key with
+// its value, and a NULL-id (GitHub-sourced) row OMITS the key entirely —
+// asserted on the raw JSON, not a decoded struct, so a `,omitempty` drift
+// cannot hide behind a zero-valued pointer.
+func TestListStageChecks_RendersGitLabPipelineID(t *testing.T) {
+	s, rr, scs := newChecksServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	rr.runs[runID] = &run.Run{ID: runID}
+	// A non-review stage keeps the self-derived fishhawk_audit_complete row
+	// out of items, so the two seeded rows are the whole payload.
+	rr.stages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	pipelineID := int64(100)
+	scs.seed(stageID, &stagecheck.Check{
+		StageID: stageID, Name: "gitlab/pipeline", State: stagecheck.StatePass,
+		Status: "completed", Conclusion: ptrStr("success"), HeadSHA: "abc",
+		GitLabPipelineID: &pipelineID, Timestamp: time.Now().UTC(),
+	})
+	checkRunID := int64(999)
+	scs.seed(stageID, &stagecheck.Check{
+		StageID: stageID, Name: "ci/build", State: stagecheck.StatePass,
+		Status: "completed", Conclusion: ptrStr("success"), HeadSHA: "abc",
+		GitHubCheckRunID: &checkRunID, Timestamp: time.Now().UTC(),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s/checks", stageID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 2 {
+		t.Fatalf("Items len = %d, want 2:\n%s", len(got.Items), w.Body.String())
+	}
+	byName := map[string]map[string]json.RawMessage{}
+	for _, it := range got.Items {
+		var name string
+		_ = json.Unmarshal(it["name"], &name)
+		byName[name] = it
+	}
+	if raw, ok := byName["gitlab/pipeline"]["gitlab_pipeline_id"]; !ok || string(raw) != "100" {
+		t.Errorf("gitlab/pipeline row: gitlab_pipeline_id = %s (present=%v), want 100", raw, ok)
+	}
+	if raw, ok := byName["ci/build"]["gitlab_pipeline_id"]; ok {
+		t.Errorf("ci/build row: gitlab_pipeline_id = %s, want the key OMITTED for a NULL-id row", raw)
+	}
+	if raw, ok := byName["ci/build"]["github_check_run_id"]; !ok || string(raw) != "999" {
+		t.Errorf("ci/build row: github_check_run_id = %s (present=%v), want 999 (GitHub rows unchanged)", raw, ok)
+	}
+}
+
 func TestListStageChecks_DeclaredButNotObserved(t *testing.T) {
 	// Empty Items + non-empty Declared → SPA renders all as
 	// not_tracked. The handler doesn't fill in placeholder rows;

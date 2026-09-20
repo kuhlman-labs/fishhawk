@@ -34,17 +34,21 @@ const CategoryAuditCheckPublishRecovered = "audit_check_publish_recovered"
 // stageCheckResponse mirrors what the SPA's BlockingChecksPanel
 // expects: a small `{name, state, …}` shape with the SPA's enum
 // rather than raw GitHub fields. Detail fields (conclusion,
-// head_sha, github_check_run_id) are forwarded for forensic /
+// head_sha, github_check_run_id, gitlab_pipeline_id) are forwarded for forensic /
 // audit-export use. `missing` is populated only for self-derived
 // checks like fishhawk_audit_complete (#229) where the failure
 // reason is structured rather than a raw GitHub conclusion.
 type stageCheckResponse struct {
-	Name             string                      `json:"name"`
-	State            string                      `json:"state"`
-	Status           string                      `json:"status,omitempty"`
-	Conclusion       *string                     `json:"conclusion,omitempty"`
-	HeadSHA          string                      `json:"head_sha,omitempty"`
-	GitHubCheckRunID *int64                      `json:"github_check_run_id,omitempty"`
+	Name             string  `json:"name"`
+	State            string  `json:"state"`
+	Status           string  `json:"status,omitempty"`
+	Conclusion       *string `json:"conclusion,omitempty"`
+	HeadSHA          string  `json:"head_sha,omitempty"`
+	GitHubCheckRunID *int64  `json:"github_check_run_id,omitempty"`
+	// GitLabPipelineID is the GitLab pipeline's instance-global id for a
+	// `gitlab/pipeline` row written by ingestGitLabPipeline (E45.55 /
+	// #3490); omitted for every GitHub-sourced row.
+	GitLabPipelineID *int64                      `json:"gitlab_pipeline_id,omitempty"`
 	Timestamp        time.Time                   `json:"ts,omitempty"`
 	Missing          []auditcomplete.MissingItem `json:"missing,omitempty"`
 	// Resolved carries the structured RESOLUTIONS behind a self-derived
@@ -365,6 +369,7 @@ func toStageCheckResponse(c *stagecheck.Check) stageCheckResponse {
 		Conclusion:       c.Conclusion,
 		HeadSHA:          c.HeadSHA,
 		GitHubCheckRunID: c.GitHubCheckRunID,
+		GitLabPipelineID: c.GitLabPipelineID,
 		Timestamp:        c.Timestamp,
 	}
 }

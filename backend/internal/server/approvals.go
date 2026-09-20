@@ -5359,13 +5359,16 @@ type deployUpstreamVerdict struct {
 //     RequiredChecksSnapshot. Evaluated BEFORE any stage/check I/O because it
 //     is a property of the run row alone and the one branch that is
 //     PERMANENT: no retry can clear it until the run carries a snapshot. A
-//     snapshot is captured only by the GitHub webhook run-creation path
-//     today; POST /v0/runs, the CLI and MCP runs carry none, and GitLab runs
-//     never receive one (#3490 tracks the GitLab ingester).
+//     snapshot is captured by the GitHub webhook run-creation path (branch
+//     protection + rulesets) and by the GitLab webhook run-creation path
+//     (the project's only_allow_merge_if_pipeline_succeeds setting, E45.55 /
+//     #3490 — nil only when the Projects API read failed or the reader is
+//     unwired); POST /v0/runs, the CLI and MCP runs carry none.
 //  3. stage_checks_unavailable — StageCheckRepo is unwired.
 //  4. no_ci_signal_stage    — the evaluated run has no review stage, and the
-//     review stage is where GitHub check_run rows are recorded (stagecheck
-//     FindRunStagesForCheckRun filters stage_type = 'review', #254), so there
+//     review stage is where GitHub check_run rows AND GitLab gitlab/pipeline
+//     rows are recorded (stagecheck FindRunStagesForCheckRun /
+//     FindRunStagesForGitLabPipeline filter stage_type = 'review', #254 / #3490), so there
 //     is no stage to read the checks from. #3489 moved the read here from the
 //     implement stage, which never receives a row.
 //  5. stage_check_read_failed — LatestForStage errored (logged at WARN; the
@@ -5401,7 +5404,7 @@ func (s *Server) deployCIGreenVerdict(ctx context.Context, runRow *run.Run) depl
 	// can clear it, and for a snapshot-less run nothing ever will.
 	if evalRun.RequiredChecksSnapshot == nil {
 		return refuse("snapshot_absent",
-			fmt.Sprintf("required upstream ci_green is not satisfied: no required-checks snapshot was captured for the evaluated run %s, so there is nothing for ci_green to evaluate against and it cannot clear — retrying this approval will not change the verdict until the run carries a snapshot. A snapshot is captured only by the GitHub webhook run-creation path today; runs created via POST /v0/runs, the CLI or MCP carry none, and GitLab runs never receive one (tracked in #3490)", evalRun.ID),
+			fmt.Sprintf("required upstream ci_green is not satisfied: no required-checks snapshot was captured for the evaluated run %s, so there is nothing for ci_green to evaluate against and it cannot clear — retrying this approval will not change the verdict until the run carries a snapshot. A snapshot is captured by the GitHub webhook run-creation path (branch protection + rulesets) and by the GitLab webhook run-creation path (the project's only_allow_merge_if_pipeline_succeeds setting, E45.55 / #3490; a GitLab run has none only when that Projects API read failed or the reader is unwired — see the fishhawkd log at run creation); runs created via POST /v0/runs, the CLI or MCP carry none", evalRun.ID),
 			map[string]any{"snapshot_present": false, "evaluated_run_id": evalRun.ID.String()})
 	}
 	if s.cfg.StageCheckRepo == nil {
@@ -5412,7 +5415,7 @@ func (s *Server) deployCIGreenVerdict(ctx context.Context, runRow *run.Run) depl
 	ciStage := s.findCISignalStage(ctx, evalRun.ID)
 	if ciStage == nil {
 		return refuse("no_ci_signal_stage",
-			fmt.Sprintf("required upstream ci_green cannot be evaluated: the evaluated run %s has no review stage, and GitHub check_run results are recorded against the run's review stage (stagecheck FindRunStagesForCheckRun, #254); an unevaluable upstream denies the deploy (fail-closed)", evalRun.ID),
+			fmt.Sprintf("required upstream ci_green cannot be evaluated: the evaluated run %s has no review stage, and CI results (GitHub check_run rows and GitLab gitlab/pipeline rows) are recorded against the run's review stage (stagecheck FindRunStagesForCheckRun / FindRunStagesForGitLabPipeline, #254 / #3490); an unevaluable upstream denies the deploy (fail-closed)", evalRun.ID),
 			map[string]any{"evaluated_run_id": evalRun.ID.String()})
 	}
 	checks, err := s.cfg.StageCheckRepo.LatestForStage(ctx, ciStage.ID)
