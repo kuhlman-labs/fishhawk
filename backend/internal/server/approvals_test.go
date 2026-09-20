@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -126,6 +127,47 @@ func newApprovalRunRepo() *approvalRunRepo {
 		stages: map[uuid.UUID]*run.Stage{},
 		runs:   map[uuid.UUID]*run.Run{},
 	}
+}
+
+// callerScopedGetRunFailRepo wraps an *approvalRunRepo and fails GetRun ONLY
+// when its DIRECT caller (runtime.Caller(1) — the immediate frame that
+// invoked GetRun, not a transitive one) is the fully-qualified function named
+// by fn (e.g.
+// "github.com/kuhlman-labs/fishhawk/backend/internal/server.(*Server).checkApprovalPredicates").
+// Every other caller's read (fetchApprovalsForStage, resolveStageEscalations,
+// checkApproverAuthorization) delegates to the embedded repo and succeeds, so
+// a fixture using this type can land a transient failure on EXACTLY the
+// predicate-site read within a single request that reads the same run row
+// multiple times (#3502). fired counts matches; every test using this fixture
+// asserts fired >= 1 so a future rename of fn silently stops matching — and
+// the assertion goes red — rather than the test passing vacuously against the
+// happy path. A control sub-test with a non-existent fn proves the same
+// fixture is otherwise inert.
+type callerScopedGetRunFailRepo struct {
+	*approvalRunRepo
+	fn  string
+	err error
+
+	mu    sync.Mutex
+	fired int
+}
+
+func (r *callerScopedGetRunFailRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	if pc, _, _, ok := runtime.Caller(1); ok {
+		if name := runtime.FuncForPC(pc).Name(); name == r.fn {
+			r.mu.Lock()
+			r.fired++
+			r.mu.Unlock()
+			return nil, r.err
+		}
+	}
+	return r.approvalRunRepo.GetRun(ctx, id)
+}
+
+func (r *callerScopedGetRunFailRepo) Fired() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.fired
 }
 
 // seedRun lets tests stand up a *run.Run keyed by id so GetRun can
@@ -7991,6 +8033,176 @@ func TestSubmitApproval_Predicate_GitLabRun_GitHubOnlyProvider_503(t *testing.T)
 		t.Errorf("stage state = %q, want awaiting_approval (no advance)", got)
 	}
 	assertNoPredicateRejectionAudit(t, au)
+}
+
+// checkApprovalPredicatesFn is the fully-qualified direct-caller name
+// callerScopedGetRunFailRepo matches to land a GetRun failure on exactly the
+// checkApprovalPredicates predicate-site read (#3502). Verified empirically
+// via runtime.FuncForPC against a live call.
+const checkApprovalPredicatesFn = "github.com/kuhlman-labs/fishhawk/backend/internal/server.(*Server).checkApprovalPredicates"
+
+// TestCheckApprovalPredicates_RunReadError_FailsClosed503 pins the #3502 fix
+// at the direct-call layer: a member_of-only GitLab gate whose run-row read
+// fails transiently must refuse with a retryable 503 forge_unavailable
+// (reason run_row_unreadable) BEFORE the forge is derived — never fall
+// through to the github default (which would consult the wrong provider, the
+// #3466 misdiagnosis class). gh is the singleton that would WRONGLY credit
+// the approver if consulted; gl is the correct (but never-reached) provider.
+func TestCheckApprovalPredicates_RunReadError_FailsClosed503(t *testing.T) {
+	gh := &fakeIdentityProvider{member: false}
+	gl := &fakeIdentityProvider{member: true}
+	s, _, rr, au := newApprovalServerWithIdentityMap(t, gh,
+		map[string]identity.IdentityProvider{identity.ProviderGitLab: gl})
+	stage := seedPredicateStageForForge(rr, au, 1, "", "acme/reviewers", "gitlab:author", "gitlab:42")
+
+	fake := &callerScopedGetRunFailRepo{approvalRunRepo: rr, fn: checkApprovalPredicatesFn,
+		err: errors.New("dial tcp: connection reset by peer")}
+	s.cfg.RunRepo = fake
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/stages/x/approvals", nil)
+	w := httptest.NewRecorder()
+	res, ok := s.checkApprovalPredicates(w, req, stage, "gitlab:alice", false)
+	if ok {
+		t.Fatalf("ok = true, want false — a run-row read failure must refuse before the forge is derived")
+	}
+	if res != nil {
+		t.Errorf("resolution = %v, want nil on a refusal", res)
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeApprovalError(t, w)
+	if code != "forge_unavailable" {
+		t.Errorf("code = %q, want forge_unavailable", code)
+	}
+	if details["retryable"] != true {
+		t.Errorf("details.retryable = %v, want true", details["retryable"])
+	}
+	if details["reason"] != "run_row_unreadable" {
+		t.Errorf("details.reason = %v, want run_row_unreadable", details["reason"])
+	}
+	if details["predicate"] != "member_of" {
+		t.Errorf("details.predicate = %v, want member_of", details["predicate"])
+	}
+	if fake.Fired() != 1 {
+		t.Fatalf("fake.Fired() = %d, want 1 — the fixture never landed on the predicate-site read (a rename of checkApprovalPredicates?)", fake.Fired())
+	}
+	if gh.memberCalls != 0 || gl.memberCalls != 0 {
+		t.Errorf("memberCalls = github %d / gitlab %d, want 0/0 (no provider consulted on an unreadable run row)", gh.memberCalls, gl.memberCalls)
+	}
+	assertNoPredicateRejectionAudit(t, au)
+
+	t.Run("control: a non-matching caller name leaves the fixture inert (happy path 200)", func(t *testing.T) {
+		gh2 := &fakeIdentityProvider{member: false}
+		gl2 := &fakeIdentityProvider{member: true}
+		s2, _, rr2, au2 := newApprovalServerWithIdentityMap(t, gh2,
+			map[string]identity.IdentityProvider{identity.ProviderGitLab: gl2})
+		stage2 := seedPredicateStageForForge(rr2, au2, 1, "", "acme/reviewers", "gitlab:author", "gitlab:42")
+		control := &callerScopedGetRunFailRepo{approvalRunRepo: rr2, fn: "no.such.function",
+			err: errors.New("unreachable")}
+		s2.cfg.RunRepo = control
+
+		req2 := httptest.NewRequest(http.MethodPost, "/v0/stages/x/approvals", nil)
+		w2 := httptest.NewRecorder()
+		res2, ok2 := s2.checkApprovalPredicates(w2, req2, stage2, "gitlab:alice", false)
+		if !ok2 {
+			t.Fatalf("ok = false, want true — a non-matching fn must leave the fixture inert:\n%s", w2.Body.String())
+		}
+		if res2 == nil || res2.MemberResolved == nil || !*res2.MemberResolved {
+			t.Errorf("resolution = %v, want a satisfied member_of resolution against the gitlab provider", res2)
+		}
+		if control.Fired() != 0 {
+			t.Errorf("control.Fired() = %d, want 0", control.Fired())
+		}
+	})
+}
+
+// TestSubmitApproval_RunReadError_MemberOf_GitLabRun_503NotMisrouted is the
+// cross-boundary twin of the direct-call test above, driven through the real
+// POST /v0/stages/{id}/approvals handler. Pre-fix, this exact fixture answers
+// 403 approver_predicate_unmet via the github singleton — the misdiagnosis
+// #3502 closes: a transient run-row read failure must never be silently
+// treated as "forge is github".
+func TestSubmitApproval_RunReadError_MemberOf_GitLabRun_503NotMisrouted(t *testing.T) {
+	gh := &fakeIdentityProvider{member: false}
+	gl := &fakeIdentityProvider{member: true}
+	s, ar, rr, au := newApprovalServerWithIdentityMap(t, gh,
+		map[string]identity.IdentityProvider{identity.ProviderGitLab: gl})
+	stage := seedPredicateStageForForge(rr, au, 1, "", "acme/reviewers", "gitlab:author", "gitlab:42")
+
+	fake := &callerScopedGetRunFailRepo{approvalRunRepo: rr, fn: checkApprovalPredicatesFn,
+		err: errors.New("dial tcp: connection reset by peer")}
+	s.cfg.RunRepo = fake
+
+	w := submitApprovalAs(t, s, stage.ID, "gitlab:alice", `{"decision":"approve"}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (pre-fix: 403 approver_predicate_unmet via the github singleton):\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeApprovalError(t, w)
+	if code != "forge_unavailable" {
+		t.Errorf("code = %q, want forge_unavailable", code)
+	}
+	if details["retryable"] != true {
+		t.Errorf("details.retryable = %v, want true", details["retryable"])
+	}
+	if details["reason"] != "run_row_unreadable" {
+		t.Errorf("details.reason = %v, want run_row_unreadable", details["reason"])
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("approvals inserted = %d, want 0", len(ar.all))
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (no advance)", got)
+	}
+	if gh.memberCalls != 0 || gl.memberCalls != 0 {
+		t.Errorf("memberCalls = github %d / gitlab %d, want 0/0", gh.memberCalls, gl.memberCalls)
+	}
+	if fake.Fired() < 1 {
+		t.Fatalf("fake.Fired() = %d, want >= 1", fake.Fired())
+	}
+	assertNoPredicateRejectionAudit(t, au)
+}
+
+// TestSubmitApproval_RunReadError_MinPermission_GitLabRun_503 is the
+// min_permission-only sibling of the member_of test above, proving the
+// run-row-unreadable branch precedes the empty-repo unavailable shadow: with
+// no forge derivable at all, details.predicate must report min_permission
+// (mirroring resolvePredicates' own evaluation order) and details.reason must
+// be run_row_unreadable, not the pre-existing empty-repo "unavailable" shape.
+func TestSubmitApproval_RunReadError_MinPermission_GitLabRun_503(t *testing.T) {
+	gh := &fakeIdentityProvider{perm: identity.PermissionAdmin}
+	gl := &fakeIdentityProvider{perm: identity.PermissionWrite}
+	s, ar, rr, au := newApprovalServerWithIdentityMap(t, gh,
+		map[string]identity.IdentityProvider{identity.ProviderGitLab: gl})
+	stage := seedPredicateStageForForge(rr, au, 1, "write", "", "gitlab:author", "gitlab:42")
+
+	fake := &callerScopedGetRunFailRepo{approvalRunRepo: rr, fn: checkApprovalPredicatesFn,
+		err: errors.New("dial tcp: connection reset by peer")}
+	s.cfg.RunRepo = fake
+
+	w := submitApprovalAs(t, s, stage.ID, "gitlab:alice", `{"decision":"approve"}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeApprovalError(t, w)
+	if code != "forge_unavailable" {
+		t.Errorf("code = %q, want forge_unavailable", code)
+	}
+	if details["reason"] != "run_row_unreadable" {
+		t.Errorf("details.reason = %v, want run_row_unreadable", details["reason"])
+	}
+	if details["predicate"] != "min_permission" {
+		t.Errorf("details.predicate = %v, want min_permission", details["predicate"])
+	}
+	if gh.permCalls != 0 || gl.permCalls != 0 {
+		t.Errorf("permCalls = github %d / gitlab %d, want 0/0", gh.permCalls, gl.permCalls)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("approvals inserted = %d, want 0", len(ar.all))
+	}
+	if fake.Fired() < 1 {
+		t.Fatalf("fake.Fired() = %d, want >= 1", fake.Fired())
+	}
 }
 
 // TestSubmitApproval_Predicate_RealGitLabProvider_EndToEnd is the #3466

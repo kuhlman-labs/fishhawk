@@ -1412,6 +1412,112 @@ func TestApproveStageAs_Escalation_CountTimeMembershipReValidation(t *testing.T)
 			t.Errorf("recorded %d stage transitions, want 0 (the gate was held closed)", len(rr.transitions))
 		}
 	})
+
+	// #3502: a transient run-row read failure at countEscalatedForgeApprovers
+	// must be refused BEFORE the forge is derived — never defaulted to
+	// github, which would re-validate a gitlab run's escalated approvers
+	// against the wrong provider. Both gh and gl below would WRONGLY credit
+	// r1/r2 if consulted, so a gate that advances proves the misrouted
+	// github default fired.
+	t.Run("a transient run-row read failure fails closed before any forge derivation", func(t *testing.T) {
+		countEscalatedForgeApproversFn := "github.com/kuhlman-labs/fishhawk/backend/internal/server.(*Server).countEscalatedForgeApprovers"
+		newFixture := func() (*Server, *approvalRunRepo, *run.Stage) {
+			gh := &perSubjectIdentityProvider{memberBySubject: map[string]bool{
+				"gitlab:r1": true, "gitlab:r2": true,
+			}}
+			gl := &perSubjectIdentityProvider{memberBySubject: map[string]bool{
+				"gitlab:r1": true, "gitlab:r2": true,
+			}}
+			ar := newFakeApprovalRepo()
+			rr := newApprovalRunRepo()
+			au := newApprovalAuditFake()
+			s := New(Config{Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr, AuditRepo: au,
+				IdentityProvider:  gh,
+				IdentityProviders: map[string]identity.IdentityProvider{identity.ProviderGitLab: gl}})
+			stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+			setForge(rr, stage, "gitlab:42")
+			return s, rr, stage
+		}
+
+		t.Run("direct call returns (0, false) without consulting either provider", func(t *testing.T) {
+			gh := &perSubjectIdentityProvider{memberBySubject: map[string]bool{"gitlab:r1": true, "gitlab:r2": true}}
+			gl := &perSubjectIdentityProvider{memberBySubject: map[string]bool{"gitlab:r1": true, "gitlab:r2": true}}
+			ar := newFakeApprovalRepo()
+			rr := newApprovalRunRepo()
+			au := newApprovalAuditFake()
+			s := New(Config{Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr, AuditRepo: au,
+				IdentityProvider:  gh,
+				IdentityProviders: map[string]identity.IdentityProvider{identity.ProviderGitLab: gl}})
+			stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+			setForge(rr, stage, "gitlab:42")
+
+			fake := &callerScopedGetRunFailRepo{approvalRunRepo: rr, fn: countEscalatedForgeApproversFn,
+				err: errors.New("dial tcp: connection reset by peer")}
+			s.cfg.RunRepo = fake
+
+			n, ok := s.countEscalatedForgeApprovers(context.Background(), stage, []string{"gitlab:r1", "gitlab:r2"},
+				effectiveApprovals(&spec.Approvals{Count: func(i int) *int { return &i }(1)},
+					spec.ComposedRequirements{MemberOf: []string{"acme/security"}}))
+			if ok || n != 0 {
+				t.Fatalf("countEscalatedForgeApprovers = (%d, %v), want (0, false)", n, ok)
+			}
+			if fake.Fired() != 1 {
+				t.Fatalf("fake.Fired() = %d, want 1 (a rename of countEscalatedForgeApprovers?)", fake.Fired())
+			}
+			if gh.memberCalls != 0 || gl.memberCalls != 0 {
+				t.Errorf("memberCalls = github %d / gitlab %d, want 0/0 (no provider consulted)", gh.memberCalls, gl.memberCalls)
+			}
+		})
+
+		t.Run("cross-boundary: two approvals leave the gate held (no transitions)", func(t *testing.T) {
+			s, rr, stage := newFixture()
+			fake := &callerScopedGetRunFailRepo{approvalRunRepo: rr, fn: countEscalatedForgeApproversFn,
+				err: errors.New("dial tcp: connection reset by peer")}
+			s.cfg.RunRepo = fake
+
+			if _, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("gitlab:r1"),
+				approveActionParams{Stage: stage, Decision: approval.DecisionApprove}); err != nil {
+				t.Fatalf("r1 approve: %v", err)
+			}
+			res2, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("gitlab:r2"),
+				approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+			if err != nil {
+				t.Fatalf("r2 approve: %v", err)
+			}
+			if res2.Stage.State != run.StageStateAwaitingApproval {
+				t.Fatalf("state = %q, want awaiting_approval — a transient run-row read failure must hold the gate, not credit the github default", res2.Stage.State)
+			}
+			if len(rr.transitions) != 0 {
+				t.Errorf("recorded %d stage transitions, want 0 (the gate was held closed)", len(rr.transitions))
+			}
+			if fake.Fired() < 1 {
+				t.Errorf("fake.Fired() = %d, want >= 1", fake.Fired())
+			}
+		})
+
+		t.Run("control: a non-matching caller name still advances the gate (proves the RED is attributable to the read failure)", func(t *testing.T) {
+			s, rr, stage := newFixture()
+			control := &callerScopedGetRunFailRepo{approvalRunRepo: rr, fn: "no.such.function",
+				err: errors.New("unreachable")}
+			s.cfg.RunRepo = control
+
+			if _, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("gitlab:r1"),
+				approveActionParams{Stage: stage, Decision: approval.DecisionApprove}); err != nil {
+				t.Fatalf("r1 approve: %v", err)
+			}
+			res2, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("gitlab:r2"),
+				approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+			if err != nil {
+				t.Fatalf("r2 approve: %v", err)
+			}
+			if res2.Stage.State != run.StageStateSucceeded {
+				t.Fatalf("state = %q, want succeeded (control: the fixture must be inert on a non-matching fn)", res2.Stage.State)
+			}
+			if control.Fired() != 0 {
+				t.Errorf("control.Fired() = %d, want 0", control.Fired())
+			}
+		})
+	})
 }
 
 // TestApproveStageAs_Escalation_SnapshotRecordsEscalatedFields is the #2227
