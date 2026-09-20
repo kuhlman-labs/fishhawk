@@ -1,0 +1,14 @@
+id: scenario:issue-3488/padded-nested-path-still-400-on-github
+statement: GET /v0/onboarding/readiness?forge=github with a whitespace-padded nested repo path (e.g. '  a/b/c  ') still returns 400 validation_failed on field `repo` with a message naming forge=gitlab — trimming does not weaken the github two-segment rule.
+verify_hint: 'HTTP: GET /v0/onboarding/readiness?repo=%20%20a%2Fb%2Fc%20%20&forge=github with the preview''s bearer token; assert 400, error.code == validation_failed, error.details.field == repo, message contains ''forge=gitlab''.'
+steps: GET /v0/onboarding/readiness?repo=%20%20a%2Fb%2Fc%20%20&forge=github with the operator bearer; also the same padded value with no forge parameter; also padded '  a//b  '&forge=gitlab and a whitespace-only repo '%20%20%20'.
+assertions:
+    expected: 400 validation_failed, details.field repo, message contains 'forge=gitlab'.
+    observed_at_record: 'Padded nested + forge=github: 400 {error.code validation_failed, message ''github repositories are owner/name; a nested path is a GitLab project — pass forge=gitlab'', details {field repo, got ''a/b/c''}} — the echoed got is the trimmed value. Without forge: same 400. Padded a//b on gitlab: 400 validation_failed field repo got ''a//b''. Whitespace-only: 400 validation_failed field repo got ''''.'
+    repro_handle: 'curl -s ''http://localhost:8090/v0/onboarding/readiness?repo=%20%20a%2Fb%2Fc%20%20&forge=github'' -H ''Authorization: Bearer <tok>'''
+origin:
+    issue: 3488
+    pr: 3519
+    run_id: 9c780400-6aa8-422e-a9d6-93e409bf37e0
+    head_sha: 57119f59f75fc4c5b9d5ed9ee38e361e8eb318d5
+    recorded_at: 2026-09-20T07:55:06Z
