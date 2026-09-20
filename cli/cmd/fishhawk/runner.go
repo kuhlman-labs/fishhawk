@@ -202,11 +202,25 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 	}
+	if forge == "" && row != nil {
+		switch row.Forge {
+		case "", forgeGitHub:
+			forge = forgeGitHub
+		case forgeGitLab:
+			forge = forgeGitLab
+		default:
+			// Fail closed: never fall through to a github argv for a
+			// forge this CLI doesn't know (E45.59 / #3505), mirroring
+			// resolveRunForgeTarget's unknown-forge arm in
+			// backend/internal/mcpserver/run_stage.go.
+			_, _ = fmt.Fprintf(stderr,
+				"fishhawk runner start: run %s carries unknown forge %q; not spawning (this fishhawk CLI knows github and gitlab — rebuild it against the backend that minted the run, or pass --forge explicitly)\n",
+				*runID, row.Forge)
+			return exitFailure
+		}
+	}
 	if forge == "" {
 		forge = forgeGitHub
-		if row != nil && row.Forge != "" {
-			forge = row.Forge
-		}
 	}
 	if forge == forgeGitLab {
 		if baseURL == "" && row != nil {

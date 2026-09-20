@@ -937,6 +937,41 @@ func TestRunnerStart_OlderBackendNoForgeField_DefaultsGitHub(t *testing.T) {
 	}
 }
 
+// TestRunnerStart_UnknownForgeFromRunRow_RefusesBeforeSpawn (E45.59 /
+// #3505): a run row carrying a forge this CLI doesn't know (neither
+// "", "github" nor "gitlab") must REFUSE before any spawn, naming the
+// value — never fall through to a github argv.
+func TestRunnerStart_UnknownForgeFromRunRow_RefusesBeforeSpawn(t *testing.T) {
+	cap := withFakeRunnerSpawn(t)
+	withFakeGitRemoteNeverCalled(t)
+	fb := newRunRowBackend(t, httpclient.Run{
+		ID: uuid.MustParse(fixtureRunID), Repo: "x/y", WorkflowID: "w",
+		State: "running", RunnerKind: "local", Forge: "gitea",
+	})
+	withFakeHTTPClient(t, fb.srv)
+
+	var stdout, stderr strings.Builder
+	got := run([]string{
+		"runner", "start",
+		"--run-id", fixtureRunID, "--stage-id", fixtureStageID,
+		"--workflow", "w", "--stage", "implement",
+	}, &stdout, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	for _, want := range []string{"gitea", "--forge"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr should contain %q: %s", want, stderr.String())
+		}
+	}
+	if cap.args != nil {
+		t.Errorf("runner must NOT be spawned for an unknown forge: %v", cap.args)
+	}
+	if n := fb.getCalls.Load(); n != 1 {
+		t.Errorf("GET /v0/runs/{id} called %d times, want exactly 1", n)
+	}
+}
+
 // TestRunnerStart_AllFlagsExplicit_NoRunRead: --forge github +
 // --github-repo explicit → zero network calls before the spawn, as
 // before #3463 (the seam points at a backend that counts).
