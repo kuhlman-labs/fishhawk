@@ -134,6 +134,7 @@ type StageCheck struct {
 	GithubCheckRunID *int64             `json:"github_check_run_id"`
 	Ts               pgtype.Timestamptz `json:"ts"`
 	Payload          []byte             `json:"payload"`
+	GitlabPipelineID *int64             `json:"gitlab_pipeline_id"`
 }
 
 type User struct {
