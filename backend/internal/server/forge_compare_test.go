@@ -175,12 +175,37 @@ func TestForgeCompareFor_Rungs(t *testing.T) {
 	})
 
 	t.Run("gitlab nil resolver defaults to registry", func(t *testing.T) {
-		// No ForgeResolver wired: forgeCompareFor falls back to forge.Get, which
-		// resolves nothing for "gitlab" in the test process → unresolved.
-		s := New(Config{})
-		if _, _, _, reason := s.forgeCompareFor(gitlabRunRow("acme/widgets")); reason != "forge gitlab unresolved" {
-			t.Fatalf("reason = %q, want 'forge gitlab unresolved' (nil resolver -> forge.Get)", reason)
-		}
+		t.Run("unregistered fails closed", func(t *testing.T) {
+			snap := forge.SnapshotRegistry()
+			t.Cleanup(func() { forge.RestoreRegistry(snap) })
+			// No ForgeResolver wired: forgeCompareFor falls back to forge.Get, which
+			// resolves nothing for "gitlab" in the test process → unresolved.
+			s := New(Config{})
+			if _, _, _, reason := s.forgeCompareFor(gitlabRunRow("acme/widgets")); reason != "forge gitlab unresolved" {
+				t.Fatalf("reason = %q, want 'forge gitlab unresolved' (nil resolver -> forge.Get)", reason)
+			}
+		})
+
+		t.Run("registered gitlab forge is dialed", func(t *testing.T) {
+			snap := forge.SnapshotRegistry()
+			t.Cleanup(func() { forge.RestoreRegistry(snap) })
+			fake := &fakeCompareForge{name: "gitlab"}
+			forge.Register(fake)
+
+			// ForgeResolver left nil → defaults to forge.Get, which finds the
+			// registered fake.
+			s := New(Config{})
+			c, scope, _, reason := s.forgeCompareFor(gitlabRunRow("acme/widgets"))
+			if reason != "" {
+				t.Fatalf("reason = %q, want empty (registered gitlab forge resolves)", reason)
+			}
+			if c != patchComparer(fake) {
+				t.Fatalf("comparer = %v, want the registered fake", c)
+			}
+			if scope.Ref() != "gitlab:5" {
+				t.Errorf("scope = %q, want gitlab:5", scope.Ref())
+			}
+		})
 	})
 
 	t.Run("gitlab unsplittable repo", func(t *testing.T) {

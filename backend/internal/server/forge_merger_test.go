@@ -264,13 +264,41 @@ func TestForgeMerger_GitLabFamily_Rungs(t *testing.T) {
 }
 
 func TestForgeMerger_GitLabFamily_NilResolver_DefaultsToRegistry(t *testing.T) {
-	// No Resolver wired: MergePullRequest falls back to forge.Get, which resolves
-	// nothing for "gitlab" in the test process → a resolve error, not a panic.
-	m := ForgeMerger{}
-	err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL))
-	if err == nil {
-		t.Fatal("MergePullRequest(nil resolver) = nil, want a forge-resolution error")
-	}
+	t.Run("unregistered fails closed", func(t *testing.T) {
+		snap := forge.SnapshotRegistry()
+		t.Cleanup(func() { forge.RestoreRegistry(snap) })
+		// No Resolver wired: MergePullRequest falls back to forge.Get, which
+		// resolves nothing for "gitlab" in the test process → a resolve error,
+		// not a panic.
+		m := ForgeMerger{}
+		err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL))
+		if err == nil {
+			t.Fatal("MergePullRequest(nil resolver) = nil, want a forge-resolution error")
+		}
+	})
+
+	t.Run("registered gitlab forge is dialed", func(t *testing.T) {
+		snap := forge.SnapshotRegistry()
+		t.Cleanup(func() { forge.RestoreRegistry(snap) })
+		fake := &fakeMergeForge{name: "gitlab"}
+		forge.Register(fake)
+
+		// Resolver left nil → defaults to forge.Get, which finds the registered
+		// fake.
+		m := ForgeMerger{}
+		if err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL)); err != nil {
+			t.Fatalf("MergePullRequest(registered gitlab forge) error = %v, want nil", err)
+		}
+		if fake.enableCalls != 1 {
+			t.Fatalf("enableCalls = %d, want 1 (fake forge must be dialed via the process registry default)", fake.enableCalls)
+		}
+		if fake.scope.Ref() != "gitlab:5" {
+			t.Errorf("scope = %q, want gitlab:5", fake.scope.Ref())
+		}
+		if fake.number != 7 {
+			t.Errorf("number = %d, want 7", fake.number)
+		}
+	})
 }
 
 func TestForgeMerger_GitLabFamily_NoPullRequestURL_FailsClosed(t *testing.T) {
