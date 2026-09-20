@@ -1267,14 +1267,18 @@ done
 # `helm template` (no --show-only) renders EVERY manifest template that is
 # ACTIVE for these values, but NOT NOTES.txt — `helm template` never emits
 # NOTES.txt and --show-only cannot select it (see the r9 header comment +
-# notes() helper above). values-local runs secrets.mode: chartManaged, under
-# which templates/externalsecret.yaml's own `{{- if eq .Values.secrets.mode
-# "externalSecrets" }}` guard means it does NOT render here — so this pass
-# covers every manifest template THAT RENDERS UNDER VALUES-LOCAL, honestly
-# stated as such (not "every manifest template" unconditionally), and is
-# deliberately NOT a --show-only templates/secret.yaml render: that form is
-# blind to any OTHER active template (e.g. configmap.yaml) that could leak a
-# GitLab key without this case noticing.
+# notes() helper above). This case has THREE surfaces: (1) the values-local
+# whole render below covers every template active under chartManaged, which
+# EXCLUDES templates/externalsecret.yaml by its own `{{- if eq
+# .Values.secrets.mode "externalSecrets" }}` guard — honestly stated as such
+# (not "every manifest template" unconditionally), and deliberately NOT a
+# --show-only templates/secret.yaml render: that form is blind to any OTHER
+# active template (e.g. configmap.yaml) that could leak a GitLab key without
+# this case noticing; (2) NOTES.txt via the notes() helper; (3) a SEPARATE
+# GitHub-only externalSecrets-mode whole render (below) that brings
+# externalsecret.yaml INTO the assertion, with an anti-vacuity
+# `kind: ExternalSecret` check proving the guard actually opened rather than
+# the case passing because the template silently stayed excluded. Ref #3480.
 render -f "$CHART/values-local.yaml"
 assert_render_ok "r14a GitHub-only WHOLE render (active manifests) renders"
 assert_absent "r14a GitHub-only WHOLE render carries no FISHHAWKD_GITLAB occurrence in any active manifest" "$out" "FISHHAWKD_GITLAB"
@@ -1284,6 +1288,46 @@ assert_absent "r14a GitHub-only WHOLE render carries no FISHHAWKD_GITLAB occurre
 notes -f "$CHART/values-local.yaml"
 assert_render_ok "r14a GitHub-only NOTES.txt renders"
 assert_absent "r14a GitHub-only NOTES.txt carries no FISHHAWKD_GITLAB occurrence" "$out" "FISHHAWKD_GITLAB"
+# r14a-es (#3480 residual): the values-local render above runs chartManaged,
+# so externalsecret.yaml never renders and no r14a assertion has ever touched
+# it — a FISHHAWKD_GITLAB key leaking into that template in a GitHub-only
+# externalSecrets deployment would decay silently. This third surface is a
+# GitHub-only externalSecrets-mode whole render (data[] mapping only the three
+# base required keys, no gitlab.*, same shape as r14l/r14i minus their GitLab
+# entries) that brings the template INTO the render. No config.oauthClientId,
+# so the GitHub OAuth trio stays OFF and FISHHAWKD_OAUTH_CLIENT_SECRET is not
+# demanded (r2c's failure mode).
+cat > "$tmproot/r14a-es.yaml" <<'YAML'
+profile: prod
+secrets:
+  mode: externalSecrets
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  externalSecrets:
+    secretStoreRef:
+      name: fishhawk-store
+    data:
+      - secretKey: FISHHAWKD_DATABASE_URL
+        remoteRef:
+          key: fishhawk/db
+      - secretKey: FISHHAWKD_GITHUB_WEBHOOK_SECRET
+        remoteRef:
+          key: fishhawk/webhook
+      - secretKey: FISHHAWKD_ANTHROPIC_API_KEY
+        remoteRef:
+          key: fishhawk/anthropic
+YAML
+render -f "$tmproot/r14a-es.yaml"
+assert_render_ok "r14a GitHub-only externalSecrets WHOLE render renders"
+# Anti-vacuity: prove the mode guard actually OPENED and the ExternalSecret CR
+# was emitted, so the assert_absent below cannot green by the guard silently
+# staying closed.
+assert_contains "r14a GitHub-only externalSecrets render actually emits the ExternalSecret CR" "$out" "kind: ExternalSecret"
+assert_absent "r14a GitHub-only externalSecrets WHOLE render carries no FISHHAWKD_GITLAB occurrence (externalsecret.yaml now IN the render)" "$out" "FISHHAWKD_GITLAB"
+notes -f "$tmproot/r14a-es.yaml"
+assert_render_ok "r14a GitHub-only externalSecrets NOTES.txt renders"
+assert_absent "r14a GitHub-only externalSecrets NOTES.txt carries no FISHHAWKD_GITLAB occurrence" "$out" "FISHHAWKD_GITLAB"
 
 # r14b A COMPLETE GITLAB CONFIG renders all five ConfigMap keys with their values
 # AND all three secret keys inside the Secret's stringData block.
