@@ -1197,10 +1197,17 @@ func New(cfg Config) *Server {
 		// ExternalURL no longer suppresses it — comments post with link-less
 		// short-ids), so this guard now hinges on the GitHub client alone.
 		if ghChannel := issuecomment.New(issuecomment.Deps{
-			GitHub:      cfg.GitHub,
-			Runs:        cfg.RunRepo,
-			Audit:       cfg.AuditRepo,
-			ExternalURL: cfg.ExternalURL,
+			GitHub: cfg.GitHub,
+			// ForgeIssueOps routes every NON-GitHub comment family (a run
+			// whose InstallationRef carries a `<scheme>:` prefix, e.g.
+			// `gitlab:5`) through the shared issueOpsFor ladder so a
+			// GitLab-triggered run receives the anchor / plan echo
+			// (E45.52 / #3481). The github family never consults it —
+			// it keeps the cfg.GitHub client path byte-for-byte.
+			ForgeIssueOps: s.issueOpsFor,
+			Runs:          cfg.RunRepo,
+			Audit:         cfg.AuditRepo,
+			ExternalURL:   cfg.ExternalURL,
 			// Artifacts feeds the living anchor's plan section (#1054).
 			// Without it loadAnchorPlans short-circuits and the anchor
 			// renders no plan in production (#1069 regression) despite a
