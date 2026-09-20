@@ -136,28 +136,65 @@ func resolveByteBudget(name, raw string) int {
 // INCLUDING both surrounding quote bytes. A raw byte count is not a bound on
 // encoded size: the encoder emits two-byte short escapes, the six-byte \u00XX
 // form for every other control byte, the six-byte form for < > & (Go's default
-// HTML escaping) and for U+2028 / U+2029, and � (six bytes) for each
-// INVALID UTF-8 byte — an inflation factor that reaches 6x.
+// HTML escaping) and for U+2028 / U+2029, and a per-invalid-UTF-8-byte cost
+// that is ENCODER-DEPENDENT: the classic encoder (Go 1.25 default, or
+// GOEXPERIMENT=nojsonv2 on 1.27) emits the six-byte `�` escape, while Go
+// 1.27's default jsonv2 implementation substitutes the raw three-byte U+FFFD
+// instead (#3237). That cost is measured once at init from the running
+// encoder (see invalidUTF8ByteCost) rather than hard-coded, so the bound stays
+// exact under either implementation.
 //
 // Invalid UTF-8 is its own cost class: a `for range` over a string yields
 // U+FFFD with a one-byte advance for an invalid byte, which is NOT the width
 // the encoder emits, so the walk uses utf8.DecodeRuneInString and counts
 // RuneError-with-size-1 explicitly.
 func jsonEncodedLen(s string) int {
+	return jsonEncodedLenAt(s, invalidUTF8ByteCost)
+}
+
+// jsonEncodedLenAt is jsonEncodedLen with the per-invalid-byte cost injected,
+// so the walk's accounting can be pinned independently of which encoder this
+// toolchain happens to run (TestJSONEncodedLenAt_ChargesTheInjectedInvalidByteCost).
+func jsonEncodedLenAt(s string, invalidByteCost int) int {
 	n := 2 // the surrounding quotes
 	for i := 0; i < len(s); {
 		r, size := utf8.DecodeRuneInString(s[i:])
-		n += jsonRuneCost(r, size)
+		if r == utf8.RuneError && size == 1 {
+			n += invalidByteCost
+		} else {
+			n += jsonRuneCost(r, size)
+		}
 		i += size
 	}
 	return n
 }
 
-// jsonRuneCost is the encoded byte cost of one decoded rune.
-func jsonRuneCost(r rune, size int) int {
-	if r == utf8.RuneError && size == 1 {
-		return 6 // �
+// measureInvalidUTF8ByteCost returns the encoded byte cost marshal charges for
+// one invalid UTF-8 byte, measured by marshalling a lone continuation byte
+// ("\x80" — invalid under every decoder) and subtracting the two surrounding
+// quote bytes. It falls back to 6 — the classic encoder's cost and the LARGER
+// of the two known costs, so a degenerate measurement degrades to a sound
+// over-estimate, never an under-estimate — on a marshal error or an output too
+// short to be a quoted non-empty string (len < 3).
+func measureInvalidUTF8ByteCost(marshal func(any) ([]byte, error)) int {
+	const fallback = 6
+	raw, err := marshal("\x80")
+	if err != nil || len(raw) < 3 {
+		return fallback
 	}
+	return len(raw) - 2
+}
+
+// invalidUTF8ByteCost is measured ONCE at package init from the SAME encoder
+// (json.Marshal) that later marshals every bounded response — that identity is
+// what makes jsonEncodedLen's bound EXACT rather than merely safe.
+var invalidUTF8ByteCost = measureInvalidUTF8ByteCost(json.Marshal)
+
+// jsonRuneCost is the encoded byte cost of one VALID decoded rune.
+// capJSONString stops at an invalid byte before ever reaching this function
+// (see its own comment), so it is unaffected by dropping the RuneError branch
+// here; jsonEncodedLenAt charges the invalid-byte cost itself, above.
+func jsonRuneCost(r rune, size int) int {
 	if r < utf8.RuneSelf {
 		switch r {
 		case '"', '\\', '\n', '\r', '\t':

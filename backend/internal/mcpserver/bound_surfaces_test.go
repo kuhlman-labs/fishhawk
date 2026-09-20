@@ -123,9 +123,9 @@ func marshalLen(t *testing.T, v any) int {
 
 // TestBoundListAudit_AtAdvertisedMaxLimit drives the surface at limit=200, the
 // value the tool advertises and the one that returns ~172 KB unbounded. The
-// escaping rows are separate cases on purpose: jsonEncodedLen's 6x inflation is
-// exactly what a raw-byte cap would miss, so a bound proven only on plain ASCII
-// would not be a bound at all.
+// escaping rows are separate cases on purpose: jsonEncodedLen's up-to-6x
+// inflation is exactly what a raw-byte cap would miss, so a bound proven only
+// on plain ASCII would not be a bound at all.
 func TestBoundListAudit_AtAdvertisedMaxLimit(t *testing.T) {
 	runID := uuid.NewString()
 	rows := []struct {
@@ -134,7 +134,7 @@ func TestBoundListAudit_AtAdvertisedMaxLimit(t *testing.T) {
 	}{
 		{"plain prose", strings.Repeat("plain reviewer prose. ", 200)},
 		{"all-'<' bytes (6x HTML-escape inflation)", strings.Repeat("<", 4000)},
-		{"invalid UTF-8 (6x replacement-char inflation)", strings.Repeat("\xff", 4000)},
+		{"invalid UTF-8 (3x–6x encoder-dependent replacement-char inflation)", strings.Repeat("\xff", 4000)},
 		{"control bytes (6x \\u00XX inflation)", strings.Repeat("\x01", 4000)},
 	}
 	for _, row := range rows {
