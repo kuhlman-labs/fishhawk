@@ -636,38 +636,39 @@ func TestParsePRURL(t *testing.T) {
 
 func TestParseMergeRequestURL(t *testing.T) {
 	cases := []struct {
-		in        string
-		wantOwner string
-		wantName  string
-		wantNum   int
-		wantErr   bool
+		in          string
+		wantProject string
+		wantOwner   string
+		wantName    string
+		wantNum     int
+		wantErr     bool
 	}{
 		// canonical + legacy happy paths.
-		{"https://gitlab.example.com/acme/widgets/-/merge_requests/7", "acme", "widgets", 7, false},
-		{"https://gitlab.example.com/group/sub/project/-/merge_requests/9", "sub", "project", 9, false},
-		{"https://gitlab.example.com/acme/widgets/merge_requests/3", "acme", "widgets", 3, false},
+		{"https://gitlab.example.com/acme/widgets/-/merge_requests/7", "acme/widgets", "acme", "widgets", 7, false},
+		{"https://gitlab.example.com/group/sub/project/-/merge_requests/9", "group/sub/project", "sub", "project", 9, false},
+		{"https://gitlab.example.com/acme/widgets/merge_requests/3", "acme/widgets", "acme", "widgets", 3, false},
 		// trailing segment/query/fragment after the number is trimmed.
-		{"https://gitlab.example.com/acme/widgets/-/merge_requests/7/notes", "acme", "widgets", 7, false},
+		{"https://gitlab.example.com/acme/widgets/-/merge_requests/7/notes", "acme/widgets", "acme", "widgets", 7, false},
 		// a github /pull/ url is rejected rather than confirmed under gitlab.
-		{"https://github.com/acme/widgets/pull/7", "", "", 0, true},
+		{"https://github.com/acme/widgets/pull/7", "", "", "", 0, true},
 		// url.Parse failure (invalid percent-escape).
-		{"http://%zz/-/merge_requests/1", "", "", 0, true},
+		{"http://%zz/-/merge_requests/1", "", "", "", 0, true},
 		// no merge_requests segment at all.
-		{"https://gitlab.example.com/acme/widgets", "", "", 0, true},
+		{"https://gitlab.example.com/acme/widgets", "", "", "", 0, true},
 		// non-numeric merge-request number.
-		{"https://gitlab.example.com/acme/widgets/-/merge_requests/abc", "", "", 0, true},
+		{"https://gitlab.example.com/acme/widgets/-/merge_requests/abc", "", "", "", 0, true},
 		// zero / negative number rejected.
-		{"https://gitlab.example.com/acme/widgets/-/merge_requests/0", "", "", 0, true},
+		{"https://gitlab.example.com/acme/widgets/-/merge_requests/0", "", "", "", 0, true},
 		// project path with fewer than two segments.
-		{"https://gitlab.example.com/-/merge_requests/7", "", "", 0, true},
+		{"https://gitlab.example.com/-/merge_requests/7", "", "", "", 0, true},
 		// two-plus segments but a middle empty one leaves owner or name blank.
-		{"https://gitlab.example.com/a//b/-/merge_requests/7", "", "", 0, true},
+		{"https://gitlab.example.com/a//b/-/merge_requests/7", "", "", "", 0, true},
 	}
 	for _, c := range cases {
-		repo, n, err := parseMergeRequestURL(c.in)
+		project, repo, n, err := parseMergeRequestURL(c.in)
 		if c.wantErr {
 			if err == nil {
-				t.Errorf("parseMergeRequestURL(%q) = (%+v, %d, nil), want error", c.in, repo, n)
+				t.Errorf("parseMergeRequestURL(%q) = (%q, %+v, %d, nil), want error", c.in, project, repo, n)
 			}
 			continue
 		}
@@ -675,9 +676,9 @@ func TestParseMergeRequestURL(t *testing.T) {
 			t.Errorf("parseMergeRequestURL(%q) errored: %v", c.in, err)
 			continue
 		}
-		if repo.Owner != c.wantOwner || repo.Name != c.wantName || n != c.wantNum {
-			t.Errorf("parseMergeRequestURL(%q) = (%s/%s, %d), want (%s/%s, %d)",
-				c.in, repo.Owner, repo.Name, n, c.wantOwner, c.wantName, c.wantNum)
+		if project != c.wantProject || repo.Owner != c.wantOwner || repo.Name != c.wantName || n != c.wantNum {
+			t.Errorf("parseMergeRequestURL(%q) = (%q, %s/%s, %d), want (%q, %s/%s, %d)",
+				c.in, project, repo.Owner, repo.Name, n, c.wantProject, c.wantOwner, c.wantName, c.wantNum)
 		}
 	}
 }
@@ -1019,8 +1020,14 @@ func (r *orderLogRepublisher) RepublishAuditCheck(_ context.Context, _ uuid.UUID
 
 // gitlabReviewRun builds a gitlab-family run + parked review stage.
 func gitlabReviewRun(prURL string) (*run.Run, *run.Stage) {
+	return gitlabReviewRunWithRepo("acme/widgets", prURL)
+}
+
+// gitlabReviewRunWithRepo is the repo-parameterised sibling of
+// gitlabReviewRun, for the URL-project/runRow.Repo cross-check tests (#3493).
+func gitlabReviewRunWithRepo(repo, prURL string) (*run.Run, *run.Stage) {
 	runID := uuid.New()
-	r := &run.Run{ID: runID, Repo: "acme/widgets", InstallationRef: strPtr("gitlab:5")}
+	r := &run.Run{ID: runID, Repo: repo, InstallationRef: strPtr("gitlab:5")}
 	if prURL != "" {
 		r.PullRequestURL = strPtr(prURL)
 	}
@@ -1043,6 +1050,85 @@ func TestTick_GitLabFamily_Merged_ResolvesSucceeded(t *testing.T) {
 	}
 	if fake.scope.Ref() != "gitlab:5" || fake.number != 7 {
 		t.Errorf("poll scope=%q number=%d, want gitlab:5 / 7", fake.scope.Ref(), fake.number)
+	}
+}
+
+// TestTick_GitLabFamily_URLProjectMismatch_Skips is the counterfactual vehicle
+// for the URL-project/runRow.Repo cross-check (#3493): a stored
+// pull_request_url naming a DIFFERENT project than the run's own repo must be
+// refused BEFORE any forge poll or resolve. Deleting the EqualFold guard in
+// resolvePoll must turn fake.calls / res.calls from 0 to 1 here.
+func TestTick_GitLabFamily_URLProjectMismatch_Skips(t *testing.T) {
+	r, s := gitlabReviewRunWithRepo("acme/widgets", "https://gitlab.example.com/other/project/-/merge_requests/7")
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	fake := &fakeForge{name: "gitlab", pr: &forge.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return fake, nil }, Resolver: res}
+	tk.Tick(context.Background())
+
+	if fake.calls != 0 {
+		t.Errorf("poll calls = %d, want 0 (URL names a foreign project; resolver never consulted)", fake.calls)
+	}
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0", len(res.calls))
+	}
+}
+
+// TestTick_GitLabFamily_TailMatchOnly_Skips pins full-path comparison over a
+// last-two-segments comparison: a URL whose LAST TWO segments match
+// runRow.Repo but whose full project path does not (a foreign group
+// containing an "acme/widgets" nested path) must still be refused.
+func TestTick_GitLabFamily_TailMatchOnly_Skips(t *testing.T) {
+	r, s := gitlabReviewRunWithRepo("acme/widgets", "https://gitlab.example.com/othergroup/acme/widgets/-/merge_requests/7")
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	fake := &fakeForge{name: "gitlab", pr: &forge.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return fake, nil }, Resolver: res}
+	tk.Tick(context.Background())
+
+	if fake.calls != 0 {
+		t.Errorf("poll calls = %d, want 0 (tail-only match must not satisfy the full-path cross-check)", fake.calls)
+	}
+	if len(res.calls) != 0 {
+		t.Errorf("resolve calls = %d, want 0", len(res.calls))
+	}
+}
+
+// TestTick_GitLabFamily_NestedProjectPath_Polls: a nested group path
+// (group/sub/project) matching runRow.Repo verbatim still polls — the
+// cross-check tolerates nested paths exactly as forgeCompareFor does.
+func TestTick_GitLabFamily_NestedProjectPath_Polls(t *testing.T) {
+	r, s := gitlabReviewRunWithRepo("group/sub/project", "https://gitlab.example.com/group/sub/project/-/merge_requests/9")
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	fake := &fakeForge{name: "gitlab", pr: &forge.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return fake, nil }, Resolver: res}
+	tk.Tick(context.Background())
+
+	if fake.calls != 1 {
+		t.Errorf("poll calls = %d, want 1 (nested project path matches runRow.Repo)", fake.calls)
+	}
+	if len(res.calls) != 1 || !res.calls[0].merged {
+		t.Errorf("resolve calls = %+v, want one merged=true resolve", res.calls)
+	}
+}
+
+// TestTick_GitLabFamily_URLProjectCaseInsensitive_Polls: the cross-check uses
+// EqualFold, exactly as the merge seam does, so a run repo differing only by
+// case from the URL's project still polls.
+func TestTick_GitLabFamily_URLProjectCaseInsensitive_Polls(t *testing.T) {
+	r, s := gitlabReviewRunWithRepo("Acme/Widgets", canonicalMRURL)
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	fake := &fakeForge{name: "gitlab", pr: &forge.PullRequest{State: "closed", Merged: true}}
+	res := &stubResolver{}
+	tk := &Ticker{Runs: repo, ForgeResolver: func(string) (forge.Forge, error) { return fake, nil }, Resolver: res}
+	tk.Tick(context.Background())
+
+	if fake.calls != 1 {
+		t.Errorf("poll calls = %d, want 1 (case-insensitive project match)", fake.calls)
+	}
+	if len(res.calls) != 1 || !res.calls[0].merged {
+		t.Errorf("resolve calls = %+v, want one merged=true resolve", res.calls)
 	}
 }
 

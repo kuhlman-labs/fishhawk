@@ -478,12 +478,27 @@ func (t *Ticker) resolvePoll(ctx context.Context, logger *slog.Logger, s *run.St
 		}, true
 	}
 
-	repo, num, err := parseMergeRequestURL(prURL)
+	projectPath, repo, num, err := parseMergeRequestURL(prURL)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "mergereconciler: malformed pull_request_url",
 			slog.String("run_id", s.RunID.String()),
 			slog.String("pr_url", prURL),
 			slog.String("error", err.Error()))
+		return 0, nil, false
+	}
+	// Cross-check the URL's project against the run's own repository (the
+	// reconciler mirror of resolveObservationTarget's GitLab arm,
+	// obsTargetMismatch): a stored pull_request_url naming a DIFFERENT
+	// project than runRow.Repo must not be polled. Full project-path
+	// comparison (not last-two-segments), case-insensitive, so a nested
+	// group path (group/sub/project) still matches runRow.Repo verbatim.
+	if !strings.EqualFold(projectPath, strings.Trim(runRow.Repo, "/")) {
+		logger.LogAttrs(ctx, slog.LevelWarn,
+			"mergereconciler: pull_request_url project does not name the run's repository; skipping poll",
+			slog.String("run_id", s.RunID.String()),
+			slog.String("pr_url", prURL),
+			slog.String("repo", runRow.Repo),
+			slog.String("url_project", projectPath))
 		return 0, nil, false
 	}
 	resolver := t.ForgeResolver
@@ -523,24 +538,28 @@ func forgeFamilyFromRef(ref *string) string {
 	return "github"
 }
 
-// parseMergeRequestURL extracts (repo, number) from a GitLab merge-request URL.
-// It accepts the canonical <host>/<path...>/-/merge_requests/<n> shape (checked
-// FIRST, so its own /merge_requests/ substring is never mis-split on the /-/
-// separator) and the legacy /merge_requests/<n> shape. RepoRef comes from the
-// last two project-path segments; the GitLab adapter ignores RepoRef and scopes
-// by the credential ref, so a nested group path still resolves. A /pull/ URL (a
+// parseMergeRequestURL extracts (projectPath, repo, number) from a GitLab
+// merge-request URL. It accepts the canonical <host>/<path...>/-/merge_requests/<n>
+// shape (checked FIRST, so its own /merge_requests/ substring is never
+// mis-split on the /-/ separator) and the legacy /merge_requests/<n> shape.
+// RepoRef is advisory — built from the last two project-path segments only
+// because the GitLab adapter ignores RepoRef and scopes by the credential
+// ref, so a nested group path still resolves through it. projectPath is the
+// FULL slash-trimmed path ahead of the merge_requests segment; the caller
+// cross-checks it against runRow.Repo before polling (#3493), which is why it
+// is returned separately from the two-segment RepoRef. A /pull/ URL (a
 // GitHub shape presented on a gitlab ref) is rejected so the caller skips
 // cleanly rather than confirming another forge's pull request.
-func parseMergeRequestURL(prURL string) (forge.RepoRef, int, error) {
-	u, err := url.Parse(strings.TrimSpace(prURL))
-	if err != nil {
-		return forge.RepoRef{}, 0, fmt.Errorf("not a merge request url: %q", prURL)
+func parseMergeRequestURL(prURL string) (projectPath string, repo forge.RepoRef, number int, err error) {
+	u, perr := url.Parse(strings.TrimSpace(prURL))
+	if perr != nil {
+		return "", forge.RepoRef{}, 0, fmt.Errorf("not a merge request url: %q", prURL)
 	}
 	path := u.Path
 	if strings.Contains(path, "/pull/") {
-		return forge.RepoRef{}, 0, fmt.Errorf("github pull url, not a merge request: %q", prURL)
+		return "", forge.RepoRef{}, 0, fmt.Errorf("github pull url, not a merge request: %q", prURL)
 	}
-	var projectPath, numStr string
+	var numStr string
 	if idx := strings.LastIndex(path, "/-/merge_requests/"); idx >= 0 {
 		projectPath = strings.Trim(path[:idx], "/")
 		numStr = path[idx+len("/-/merge_requests/"):]
@@ -548,24 +567,24 @@ func parseMergeRequestURL(prURL string) (forge.RepoRef, int, error) {
 		projectPath = strings.Trim(path[:idx], "/")
 		numStr = path[idx+len("/merge_requests/"):]
 	} else {
-		return forge.RepoRef{}, 0, fmt.Errorf("not a merge request url: %q", prURL)
+		return "", forge.RepoRef{}, 0, fmt.Errorf("not a merge request url: %q", prURL)
 	}
 	if cut := strings.IndexAny(numStr, "/?#"); cut >= 0 {
 		numStr = numStr[:cut]
 	}
-	n, err := strconv.Atoi(numStr)
-	if err != nil || n <= 0 {
-		return forge.RepoRef{}, 0, fmt.Errorf("merge request url has non-numeric number: %q", prURL)
+	n, nerr := strconv.Atoi(numStr)
+	if nerr != nil || n <= 0 {
+		return "", forge.RepoRef{}, 0, fmt.Errorf("merge request url has non-numeric number: %q", prURL)
 	}
 	segs := strings.Split(projectPath, "/")
 	if len(segs) < 2 {
-		return forge.RepoRef{}, 0, fmt.Errorf("merge request url missing owner/name: %q", prURL)
+		return "", forge.RepoRef{}, 0, fmt.Errorf("merge request url missing owner/name: %q", prURL)
 	}
 	owner, name := segs[len(segs)-2], segs[len(segs)-1]
 	if owner == "" || name == "" {
-		return forge.RepoRef{}, 0, fmt.Errorf("merge request url missing owner/name: %q", prURL)
+		return "", forge.RepoRef{}, 0, fmt.Errorf("merge request url missing owner/name: %q", prURL)
 	}
-	return forge.RepoRef{Owner: owner, Name: name}, n, nil
+	return projectPath, forge.RepoRef{Owner: owner, Name: name}, n, nil
 }
 
 // isNilForge reports whether f is effectively nil — a nil interface OR a

@@ -42,6 +42,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -733,6 +734,139 @@ func TestMergeReconcilerForgeAvailable(t *testing.T) {
 				t.Errorf("mergeReconcilerForgeAvailable = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// stubGitHubMerger is a minimal server.GitHubMerger used only to stand in for
+// an "already bound" GateMerger in TestBindGitLabOnlyGateMerger's table — its
+// identity (distinct from nil and from newForgeMerger's server.ForgeMerger)
+// is what the "current already set" rows need to prove the helper leaves an
+// existing binding untouched.
+type stubGitHubMerger struct{}
+
+func (stubGitHubMerger) MergePullRequest(context.Context, *runpkg.Run) error { return nil }
+
+// TestBindGitLabOnlyGateMerger pins bindGitLabOnlyGateMerger's four-row
+// decision table (E45.47 / #3464, binding approval condition 2): it binds the
+// GitLab-only fallback merger (a nil-github-leaf server.ForgeMerger) iff no
+// GateMerger is bound yet AND a GitLab forge is configured, and never
+// overwrites an existing binding.
+func TestBindGitLabOnlyGateMerger(t *testing.T) {
+	gl := &forgegitlab.Forge{}
+	existing := stubGitHubMerger{}
+	cases := []struct {
+		name        string
+		current     server.GitHubMerger
+		gl          *forgegitlab.Forge
+		wantBound   bool
+		wantNilLeaf bool // only checked when wantBound
+	}{
+		{"neither", nil, nil, false, false},
+		{"gitlab-only", nil, gl, true, true},
+		{"existing+gitlab", existing, gl, false, false},
+		{"existing-only", existing, nil, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			merger, bound := bindGitLabOnlyGateMerger(tc.current, tc.gl)
+			if bound != tc.wantBound {
+				t.Fatalf("bound = %v, want %v", bound, tc.wantBound)
+			}
+			if !tc.wantBound {
+				if merger != nil {
+					t.Errorf("merger = %v, want nil when not bound", merger)
+				}
+				return
+			}
+			fm, ok := merger.(server.ForgeMerger)
+			if !ok {
+				t.Fatalf("merger = %T, want server.ForgeMerger", merger)
+			}
+			if tc.wantNilLeaf && fm.GitHub != nil {
+				t.Errorf("ForgeMerger.GitHub = %v (%T), want a nil interface (github family must fail closed, not panic)", fm.GitHub, fm.GitHub)
+			}
+		})
+	}
+}
+
+// TestMergeReconcilerPollSources pins mergeReconcilerPollSources's two poll
+// sources (E45.47 / #3464, binding approval condition 2). PRGetter must be a
+// nil INTERFACE (not a typed-nil *githubclient.Client) when gh is nil — the
+// pre-#3464 typed-nil trap that made a GitLab-only deployment's github-family
+// resolvePoll panic instead of skip. The resolver always resolves via the
+// process forge registry.
+func TestMergeReconcilerPollSources(t *testing.T) {
+	t.Run("nil client leaves PRGetter a nil interface", func(t *testing.T) {
+		prGetter, _ := mergeReconcilerPollSources(nil)
+		if prGetter != nil {
+			t.Errorf("PRGetter = %v, want nil interface (not a typed-nil *githubclient.Client)", prGetter)
+		}
+	})
+
+	t.Run("non-nil client is carried through", func(t *testing.T) {
+		gh := &githubclient.Client{}
+		prGetter, _ := mergeReconcilerPollSources(gh)
+		if prGetter != mergereconciler.PRGetter(gh) {
+			t.Errorf("PRGetter = %v, want the configured client", prGetter)
+		}
+	})
+
+	t.Run("resolver resolves via the process registry", func(t *testing.T) {
+		snap := forge.SnapshotRegistry()
+		t.Cleanup(func() { forge.RestoreRegistry(snap) })
+		fake := &fakeMergeForgeReconcilerTest{name: "gitlab"}
+		forge.Register(fake)
+
+		_, resolver := mergeReconcilerPollSources(nil)
+		f, err := resolver("gitlab")
+		if err != nil || f != forge.Forge(fake) {
+			t.Fatalf("resolver(gitlab) = (%v, %v), want the registered fake and no error", f, err)
+		}
+
+		_, err = resolver("unknown-forge")
+		var unknown *forge.UnknownForgeError
+		if !errors.As(err, &unknown) {
+			t.Fatalf("resolver(unknown-forge) error = %v (%T), want *forge.UnknownForgeError", err, err)
+		}
+	})
+}
+
+// fakeMergeForgeReconcilerTest is a minimal named forge.Forge for
+// TestMergeReconcilerPollSources's registry-resolution subtest. The rest
+// embeds a nil forge.Forge, unreachable in this test.
+type fakeMergeForgeReconcilerTest struct {
+	forge.Forge
+	name string
+}
+
+func (f *fakeMergeForgeReconcilerTest) Name() string { return f.name }
+
+// TestServeGo_WiresMergeReconcilerPollHelpers is a body-grep pin (binding
+// approval condition 2): the honest counterfactual for bindGitLabOnlyGateMerger
+// / mergeReconcilerPollSources is the helper unit tests above ONLY — a
+// call-site bypass (e.g. assigning cfg.GitHub directly into the ticker
+// literal instead of calling mergeReconcilerPollSources) is not detectable by
+// them, since the helper itself would still pass. This pin closes that gap
+// the same way TestWebhookDispatcher_WiresGitLabFileFetcher pins the
+// webhook.Dispatcher literal: it reads serve.go as text and asserts both call
+// sites are present, so a direct-assignment regression at either call site
+// fails here even though the helpers' own tests stay green.
+func TestServeGo_WiresMergeReconcilerPollHelpers(t *testing.T) {
+	src, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatalf("read serve.go: %v", err)
+	}
+	body := string(src)
+	// The call-site argument is part of the pattern (not just the function
+	// name) so this cannot match the helper's own "func …(" definition line —
+	// only an actual call at the wiring site satisfies it.
+	for _, want := range []struct{ call, consequence string }{
+		{"bindGitLabOnlyGateMerger(cfg.GateMerger", "the GitLab-only GateMerger fallback binding would bypass its table-tested decision logic"},
+		{"mergeReconcilerPollSources(cfg.GitHub)", "the merge-reconciler ticker's PRGetter/ForgeResolver wiring would bypass the typed-nil-safe helper"},
+	} {
+		if !strings.Contains(body, want.call) {
+			t.Errorf("serve.go does not call %s; %s", want.call, want.consequence)
+		}
 	}
 }
 
