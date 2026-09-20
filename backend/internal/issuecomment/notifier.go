@@ -1,5 +1,8 @@
-// Package issuecomment posts back to GitHub-issue-triggered runs in
-// the place the user already lives — the issue conversation (#234).
+// Package issuecomment posts back to issue-triggered runs in the place
+// the user already lives — the issue conversation (#234). GitHub-family
+// runs post through the App client; every other forge family (a run whose
+// InstallationRef carries a `<scheme>:` prefix, e.g. `gitlab:5`) posts its
+// issue-locus surfaces through forge.IssueOperations (E45.52 / #3481).
 //
 // Two moments matter for the v0 demo loop:
 //   - Pickup: the dispatcher accepted the trigger and created a Run.
@@ -178,9 +181,13 @@ const (
 )
 
 // IssueCommenter is the slice of githubclient.Client this package
-// needs. Defining it as an interface keeps the unit tests free of a
-// fake api.github.com and lets the dispatcher's existing GitHubAPI
-// shape stay focused.
+// needs for the GITHUB comment family. Defining it as an interface keeps
+// the unit tests free of a fake api.github.com and lets the dispatcher's
+// existing GitHubAPI shape stay focused. Every other family (a run whose
+// InstallationRef carries a `<scheme>:` prefix, e.g. `gitlab:5`) posts its
+// issue-locus comments through Deps.ForgeIssueOps → forge.IssueOperations
+// instead (E45.52 / #3481) and never touches this client; the PR/MR-locus
+// surfaces (CreateReview, the sticky PR status comment) remain GitHub-only.
 //
 // CreateIssueComment returns the created IssueComment so the
 // sticky-status-comment / living-anchor flow (E20.2 / #328, #1054) can
@@ -215,27 +222,43 @@ type PlanArtifactLister interface {
 // independent audit entry, and the dedup check is read-then-write
 // scoped to a single run).
 //
-// Notifier is the GitHub-comment Channel: the first (and, in v0, only)
+// Notifier is the issue-comment Channel: the first (and, in v0, only)
 // channel behind the Channel routing abstraction (ADR-015 #79 option B).
+// It posts to GitHub through IssueCommenter and to every other forge
+// family through Deps.ForgeIssueOps (E45.52 / #3481; see
+// resolveCommentTarget for the family split).
 // Its method set IS the Channel surface, so it satisfies Channel
 // unchanged (the compile-time assertion lives in channel.go) and the
 // Router fans every Notify* call out to it. A future Slack adapter is a
 // sibling Channel, not a change to this type.
 type Notifier struct {
-	github      IssueCommenter
-	runs        run.Repository
-	audit       audit.Repository
-	artifacts   PlanArtifactLister
-	externalURL string
-	now         func() time.Time
+	github IssueCommenter
+	// forgeIssueOps resolves the forge-neutral issue capability for a
+	// NON-GitHub comment family (E45.52 / #3481); nil keeps every non-GitHub
+	// run on the pre-#3481 silent skip. See Deps.ForgeIssueOps.
+	forgeIssueOps func(forgeID string) forge.IssueOperations
+	runs          run.Repository
+	audit         audit.Repository
+	artifacts     PlanArtifactLister
+	externalURL   string
+	now           func() time.Time
 }
 
 // Deps groups the dependencies New needs.
 type Deps struct {
-	GitHub      IssueCommenter
-	Runs        run.Repository
-	Audit       audit.Repository
-	ExternalURL string
+	GitHub IssueCommenter
+	// ForgeIssueOps resolves the forge.IssueOperations for a NON-GitHub
+	// comment family (E45.52 / #3481) — server.New wires the shared
+	// issueOpsFor ladder. The family is derived from the run's
+	// InstallationRef (+ the gitlab_ci runner kind) by commentForgeFamily;
+	// the github family NEVER consults it and keeps the GitHub client path
+	// byte-for-byte. Nil means every non-GitHub family keeps today's silent
+	// skip. A resolver returning nil for a family is a misconfiguration
+	// (one WARN log, no audit row), not a fact about the run.
+	ForgeIssueOps func(forgeID string) forge.IssueOperations
+	Runs          run.Repository
+	Audit         audit.Repository
+	ExternalURL   string
 	// Artifacts optionally loads plan artifacts so the living anchor
 	// (#1054) can render the current + superseded plan content. When
 	// nil the anchor omits the plan sections (graceful degradation).
@@ -250,15 +273,21 @@ type Deps struct {
 // without nil-checking the receiver — the methods short-circuit on
 // a nil receiver.
 //
-// The notifier constructs whenever GitHub / Runs / Audit are wired. An UNSET
+// The notifier constructs whenever Runs / Audit and at least ONE posting
+// client (GitHub or ForgeIssueOps, E45.52 / #3481) are wired. An UNSET
 // ExternalURL no longer suppresses comments (#1787): every renderer degrades a
 // run reference to a plain, link-less short-id (and omits footer "view run"
 // links) when the base URL is empty, so link-less comments still post — the
-// nil-notifier dividing line is "no GitHub client", not "no base URL". This
+// nil-notifier dividing line is "no posting client", not "no base URL". This
 // unblocks the dogfood posture, which leaves ExternalURL unset rather than
 // pointing it at an operator-host-local address that would post dead links.
+// With ForgeIssueOps wired but GitHub nil, a github-family run is a logical
+// skip (resolveCommentTarget guards n.github == nil), never a panic.
 func New(d Deps) *Notifier {
-	if d.GitHub == nil || d.Runs == nil || d.Audit == nil {
+	if d.Runs == nil || d.Audit == nil {
+		return nil
+	}
+	if d.GitHub == nil && d.ForgeIssueOps == nil {
 		return nil
 	}
 	now := d.Now
@@ -266,12 +295,13 @@ func New(d Deps) *Notifier {
 		now = time.Now
 	}
 	return &Notifier{
-		github:      d.GitHub,
-		runs:        d.Runs,
-		audit:       d.Audit,
-		artifacts:   d.Artifacts,
-		externalURL: strings.TrimRight(d.ExternalURL, "/"),
-		now:         now,
+		github:        d.GitHub,
+		forgeIssueOps: d.ForgeIssueOps,
+		runs:          d.Runs,
+		audit:         d.Audit,
+		artifacts:     d.Artifacts,
+		externalURL:   strings.TrimRight(d.ExternalURL, "/"),
+		now:           now,
 	}
 }
 
@@ -534,8 +564,9 @@ func truncateForGitHubComment(body, runURL, stageID, externalURL, runID string) 
 //     read the child's TriggerSource here, not the parent's,
 //     because the comment routes to the child's run page and the
 //     contextFor helper validates the child.
-//   - The child run is missing installation_id or a decodable issue
-//     number.
+//   - The child run has no posting credential for its comment family
+//     (github: installation_id; other forges: installation_ref) or no
+//     decodable issue number.
 //   - A ci_retry comment with the SAME retry_attempt already landed
 //     on this run (per-attempt dedup; redeliveries of the same
 //     check_run.completed are absorbed, but a fresh attempt N+1
@@ -570,18 +601,8 @@ func (n *Notifier) contextForCIRetry(ctx context.Context, runID uuid.UUID, attem
 	if err != nil {
 		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
 	}
-	if !runRow.IsIssueAnchored() {
-		return commentContext{}, false, nil
-	}
-	if runRow.InstallationID == nil || runRow.TriggerRef == nil {
-		return commentContext{}, false, nil
-	}
-	number, ok := parseIssueRef(*runRow.TriggerRef)
+	ctxv, ok := n.resolveCommentTarget(ctx, runRow)
 	if !ok {
-		return commentContext{}, false, nil
-	}
-	repo, err := parseRepo(runRow.Repo)
-	if err != nil {
 		return commentContext{}, false, nil
 	}
 	already, err := n.alreadyPostedAttempt(ctx, runID, attempt)
@@ -591,12 +612,7 @@ func (n *Notifier) contextForCIRetry(ctx context.Context, runID uuid.UUID, attem
 	if already {
 		return commentContext{}, false, nil
 	}
-	return commentContext{
-		run:         runRow,
-		repo:        repo,
-		issueNumber: number,
-		runURL:      runURLFor(n.externalURL, runID),
-	}, true, nil
+	return ctxv, true, nil
 }
 
 // alreadyPostedAttempt returns true when a ci_retry audit entry on
@@ -625,7 +641,7 @@ func (n *Notifier) alreadyPostedAttempt(ctx context.Context, runID uuid.UUID, at
 // post() but stamps retry_attempt into the payload so dedup can
 // scope per-attempt.
 func (n *Notifier) postCIRetry(ctx context.Context, ctxv commentContext, attempt int, body string) error {
-	if _, err := n.github.CreateIssueComment(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID), ctxv.repo, ctxv.issueNumber, body); err != nil {
+	if _, err := n.createComment(ctx, ctxv, body); err != nil {
 		return fmt.Errorf("issuecomment: create comment: %w", err)
 	}
 	systemKind := audit.ActorSystem
@@ -683,9 +699,9 @@ type BudgetAlertPayload struct {
 // Returns posted=false (and skips silently) when:
 //   - The receiver is nil.
 //   - The tier is empty.
-//   - The run isn't issue-triggered (CLI / PR / local runner with no
-//     installation_id), or its trigger ref / repo is unparseable —
-//     contextForBudgetAlert validates this.
+//   - The run isn't issue-triggered (CLI / PR / local github-family
+//     runner with no installation_id), or its trigger ref / repo is
+//     unparseable — contextForBudgetAlert validates this.
 //   - A budget_alert comment with the SAME (period_start, tier) already
 //     landed on this run (per-period/per-tier dedup; a re-evaluation in
 //     the same period or a redelivered upload is absorbed, but the warn
@@ -717,18 +733,8 @@ func (n *Notifier) contextForBudgetAlert(ctx context.Context, runID uuid.UUID, p
 	if err != nil {
 		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
 	}
-	if !runRow.IsIssueAnchored() {
-		return commentContext{}, false, nil
-	}
-	if runRow.InstallationID == nil || runRow.TriggerRef == nil {
-		return commentContext{}, false, nil
-	}
-	number, ok := parseIssueRef(*runRow.TriggerRef)
+	ctxv, ok := n.resolveCommentTarget(ctx, runRow)
 	if !ok {
-		return commentContext{}, false, nil
-	}
-	repo, err := parseRepo(runRow.Repo)
-	if err != nil {
 		return commentContext{}, false, nil
 	}
 	already, err := n.alreadyPostedBudgetTier(ctx, runID, periodStart, tier)
@@ -738,12 +744,7 @@ func (n *Notifier) contextForBudgetAlert(ctx context.Context, runID uuid.UUID, p
 	if already {
 		return commentContext{}, false, nil
 	}
-	return commentContext{
-		run:         runRow,
-		repo:        repo,
-		issueNumber: number,
-		runURL:      runURLFor(n.externalURL, runID),
-	}, true, nil
+	return ctxv, true, nil
 }
 
 // alreadyPostedBudgetTier returns true when a budget_alert comment on
@@ -768,7 +769,7 @@ func (n *Notifier) alreadyPostedBudgetTier(ctx context.Context, runID uuid.UUID,
 // postBudgetAlert fires the comment and writes the audit row, stamping
 // period_start + budget_tier so the dedup can scope per-period/per-tier.
 func (n *Notifier) postBudgetAlert(ctx context.Context, ctxv commentContext, p BudgetAlertPayload, body string) error {
-	if _, err := n.github.CreateIssueComment(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID), ctxv.repo, ctxv.issueNumber, body); err != nil {
+	if _, err := n.createComment(ctx, ctxv, body); err != nil {
 		return fmt.Errorf("issuecomment: create comment: %w", err)
 	}
 	systemKind := audit.ActorSystem
@@ -817,6 +818,14 @@ func (n *Notifier) postBudgetAlert(ctx context.Context, ctxv commentContext, p B
 // The audit row's payload carries `kind: status_update`,
 // `issue_number`, `repo`, and `github_comment_id`. Subsequent
 // reads use the most-recent row's comment id.
+//
+// Forge routing (E45.52 / #3481): a github-family run takes the GitHub
+// client path above unchanged. Any other family posts through
+// forge.IssueOperations, edit-in-place negotiated via the optional
+// forge.IssueCommentEditor — a forge WITHOUT it degrades to append-only
+// (one fresh PostIssueComment per update, no id lookup and no marker
+// rediscovery, since neither could be acted on) and the audit row names
+// which happened (`comment_mode: edit_in_place | append_only`, `forge`).
 func (n *Notifier) NotifyStatusUpdate(ctx context.Context, runID uuid.UUID, body string) error {
 	if n == nil {
 		return nil
@@ -831,6 +840,17 @@ func (n *Notifier) NotifyStatusUpdate(ctx context.Context, runID uuid.UUID, body
 		return err
 	}
 
+	if !ctxv.canEdit() {
+		// Append-only degradation: the forge implements IssueOperations but not
+		// IssueCommentEditor, so there is no id to persist and no edit to aim it
+		// at. Skip the audit id lookup AND the marker rediscovery (neither could
+		// be acted on) and post a fresh comment per update.
+		if _, err := n.createComment(ctx, ctxv, body); err != nil {
+			return fmt.Errorf("issuecomment: create status comment: %w", err)
+		}
+		return n.appendStatusAudit(ctx, ctxv, 0)
+	}
+
 	// Look up the run's existing status comment id, if any.
 	existingID, err := n.findStatusCommentID(ctx, runID)
 	if err != nil {
@@ -838,12 +858,11 @@ func (n *Notifier) NotifyStatusUpdate(ctx context.Context, runID uuid.UUID, body
 	}
 	if existingID == 0 {
 		// The audit chain has no id. Either this is the genuine first post, or a
-		// prior post landed on GitHub but its audit append failed and orphaned the
-		// id (#1793). Re-discover by matching the hidden anchor marker on the
+		// prior post landed on the forge but its audit append failed and orphaned
+		// the id (#1793). Re-discover by matching the hidden anchor marker on the
 		// thread before creating a second comment; on no match / list error this
 		// returns 0 and we fall through to create, preserving today's behavior.
-		if recovered := n.rediscoverStickyComment(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID),
-			ctxv.repo, ctxv.issueNumber, stickyMarker(stickyLocusAnchor, runID)); recovered > 0 {
+		if recovered := n.rediscoverStickyComment(ctx, ctxv, stickyMarker(stickyLocusAnchor, runID)); recovered > 0 {
 			existingID = recovered
 		}
 	}
@@ -851,26 +870,25 @@ func (n *Notifier) NotifyStatusUpdate(ctx context.Context, runID uuid.UUID, body
 	if existingID > 0 {
 		// Try to edit in place. If the comment was deleted, fall
 		// through to create.
-		got, updErr := n.github.UpdateIssueComment(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID),
-			ctxv.repo, existingID, body)
+		editedID, updErr := n.editComment(ctx, ctxv, existingID, body)
 		switch {
 		case updErr == nil:
-			return n.appendStatusAudit(ctx, ctxv, got.ID)
-		case errors.Is(updErr, githubclient.ErrNotFound):
+			return n.appendStatusAudit(ctx, ctxv, editedID)
+		case errors.Is(updErr, githubclient.ErrNotFound) || errors.Is(updErr, forge.ErrNotFound):
 			// Operator deleted the comment between updates. Fall
 			// through to create a fresh one; the next call will
-			// edit that one.
+			// edit that one. (githubclient.ErrNotFound IS forge.ErrNotFound
+			// by alias; both are named so the contract reads on either side.)
 		default:
 			return fmt.Errorf("issuecomment: update status comment: %w", updErr)
 		}
 	}
 
-	created, err := n.github.CreateIssueComment(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID),
-		ctxv.repo, ctxv.issueNumber, body)
+	createdID, err := n.createComment(ctx, ctxv, body)
 	if err != nil {
 		return fmt.Errorf("issuecomment: create status comment: %w", err)
 	}
-	return n.appendStatusAudit(ctx, ctxv, created.ID)
+	return n.appendStatusAudit(ctx, ctxv, createdID)
 }
 
 // NotifyStatusUpdateForRun is the convenience entry point every
@@ -1431,32 +1449,11 @@ func (n *Notifier) contextForStatus(ctx context.Context, runID uuid.UUID) (comme
 	if err != nil {
 		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
 	}
-	if !runRow.IsIssueAnchored() {
-		return commentContext{}, false, nil
-	}
-	// Local-runner runs (#416) carry no installation_id by design:
-	// the backend can't mint an App token for the operator's repo,
-	// and the operator's own `gh` does the posting from the CLI
-	// side. The nil-installation_id branch below silently skips —
-	// the GHA flow keeps working unchanged, and the CLI's
-	// ghcomment package handles the local case directly.
-	if runRow.InstallationID == nil || runRow.TriggerRef == nil {
-		return commentContext{}, false, nil
-	}
-	number, ok := parseIssueRef(*runRow.TriggerRef)
+	ctxv, ok := n.resolveCommentTarget(ctx, runRow)
 	if !ok {
 		return commentContext{}, false, nil
 	}
-	repo, err := parseRepo(runRow.Repo)
-	if err != nil {
-		return commentContext{}, false, nil
-	}
-	return commentContext{
-		run:         runRow,
-		repo:        repo,
-		issueNumber: number,
-		runURL:      runURLFor(n.externalURL, runID),
-	}, true, nil
+	return ctxv, true, nil
 }
 
 // findStatusCommentID returns the most-recent status comment id
@@ -1481,14 +1478,27 @@ func (n *Notifier) findStatusCommentID(ctx context.Context, runID uuid.UUID) (in
 // appendStatusAudit records that the run's status comment is at
 // `commentID` as of now. Called from both the edit-in-place and
 // fresh-create paths.
+//
+// The github-family payload is byte-identical to the pre-#3481 shape. A
+// non-GitHub family (E45.52 / #3481) additionally carries `forge` (the
+// family) and `comment_mode` — `edit_in_place` when the forge implements
+// forge.IssueCommentEditor, `append_only` when it does not (commentID is
+// then 0: the forge returned no id, and there is nothing to edit next time).
+// `github_comment_id` stays the lookup key on every forge so
+// findStatusCommentID and every existing reader keep working unchanged.
 func (n *Notifier) appendStatusAudit(ctx context.Context, ctxv commentContext, commentID int64) error {
 	systemKind := audit.ActorSystem
-	payload, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"kind":              string(KindStatusUpdate),
 		"issue_number":      ctxv.issueNumber,
 		"repo":              ctxv.repo.String(),
 		"github_comment_id": commentID,
-	})
+	}
+	if ctxv.ops != nil {
+		fields["forge"] = ctxv.family
+		fields["comment_mode"] = ctxv.commentMode()
+	}
+	payload, _ := json.Marshal(fields)
 	if _, err := n.audit.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     ctxv.run.ID,
 		Timestamp: n.now().UTC(),
@@ -1520,13 +1530,15 @@ func extractGithubCommentID(payload []byte) int64 {
 
 // rediscoverStickyComment recovers the id of an orphaned sticky comment — one
 // posted successfully but whose id never reached the audit chain because the
-// subsequent audit append failed (#1793). It LISTS the issue/PR thread and
-// returns the id of the first comment whose body contains marker, or 0 on no
-// match. Fail-open: a list error (or an empty thread) returns 0, degrading to
-// today's behavior (create a fresh comment) — the extra list call is off the
-// hot path because it fires only when the audit lookup already returned 0.
-func (n *Notifier) rediscoverStickyComment(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int, marker string) int64 {
-	comments, err := n.github.ListIssueComments(ctx, scope, repo, number)
+// subsequent audit append failed (#1793). It LISTS the issue/PR thread named
+// by ctxv (through listComments, so the github family and every forge family
+// share it) and returns the id of the first comment whose body contains
+// marker, or 0 on no match. Fail-open: a list error (or an empty thread)
+// returns 0, degrading to today's behavior (create a fresh comment) — the
+// extra list call is off the hot path because it fires only when the audit
+// lookup already returned 0.
+func (n *Notifier) rediscoverStickyComment(ctx context.Context, ctxv commentContext, marker string) int64 {
+	comments, err := n.listComments(ctx, ctxv)
 	if err != nil {
 		// Fail-open: degrade to create, matching the surrounding best-effort
 		// posture. The next successful audit append re-anchors the id.
@@ -1587,8 +1599,13 @@ func (n *Notifier) maybeUpdatePRStatusComment(ctx context.Context, runRow *run.R
 		// before creating a second comment; leave lastHash empty so the recovered
 		// comment is edited in place (not dedup-skipped). No match / list error
 		// returns 0 and we fall through to create, preserving today's behavior.
-		if recovered := n.rediscoverStickyComment(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID),
-			repo, prNumber, stickyMarker(stickyLocusPRStatus, runRow.ID)); recovered > 0 {
+		// PR/MR locus stays GitHub-only (InstallationID guard above), so the
+		// rediscovery context is the github family — ops nil — aimed at the PR.
+		prCtx := commentContext{
+			run: runRow, repo: repo, issueNumber: prNumber, family: commentFamilyGitHub,
+			scope: forge.FromGitHubInstallationID(*runRow.InstallationID),
+		}
+		if recovered := n.rediscoverStickyComment(ctx, prCtx, stickyMarker(stickyLocusPRStatus, runRow.ID)); recovered > 0 {
 			existingID = recovered
 		}
 	}
@@ -2177,56 +2194,295 @@ func renderRunNotApplicableBody(workflowID, message string) string {
 }
 
 // commentContext bundles the per-run inputs the post-helpers need:
-// the run row (for installation_id), the parsed repo, the issue
-// number, and the pre-rendered run URL. Built once per call.
+// the run row, the parsed repo, the issue number, the pre-rendered run
+// URL, and — since E45.52 / #3481 — the comment FAMILY the run resolves
+// to plus the credential scope and (for a non-GitHub family) the
+// forge.IssueOperations every issue-locus post goes through. Built once
+// per call by resolveCommentTarget.
+//
+// `ops == nil` IS the github family: the posting seam (createComment /
+// editComment / listComments) reads it to pick the GitHub client path, so
+// a github context never touches a forge and a forge context never touches
+// n.github. `repo` is githubclient.RepoRef, an identity alias of
+// forge.RepoRef, so one field serves both families (a nested GitLab path
+// `group/sub/proj` splits on the LAST slash into {group/sub, proj}).
 type commentContext struct {
 	run         *run.Run
 	repo        githubclient.RepoRef
 	issueNumber int
 	runURL      string
+	// family is commentForgeFamily(run): "github", "gitlab", or whatever
+	// scheme the InstallationRef carries.
+	family string
+	// scope is the credential scope every post on this context uses:
+	// FromGitHubInstallationID for the github family, FromRef(InstallationRef)
+	// for every other.
+	scope forge.CredentialScope
+	// ops is the resolved forge capability for a non-GitHub family; nil for
+	// the github family.
+	ops forge.IssueOperations
+}
+
+// Comment families (E45.52 / #3481). commentFamilyGitHub keeps the
+// dedicated githubclient path; every other value routes through
+// forge.IssueOperations. commentFamilyGitLab is the family a gitlab_ci
+// runner kind (or a `gitlab:<project_id>` InstallationRef) resolves to.
+const (
+	commentFamilyGitHub = "github"
+	commentFamilyGitLab = "gitlab"
+)
+
+// Audit `comment_mode` values a non-GitHub status_comment_posted row carries
+// (E45.52 / #3481): the forge implemented forge.IssueCommentEditor and the
+// anchor is edited in place, or it did not and each update appended a fresh
+// comment.
+const (
+	commentModeEditInPlace = "edit_in_place"
+	commentModeAppendOnly  = "append_only"
+)
+
+// errEditUnsupported is returned by editComment for a forge context whose
+// IssueOperations does not implement forge.IssueCommentEditor. It is a
+// package sentinel — NotifyStatusUpdate never reaches editComment on such a
+// context (canEdit gates the whole edit path), so surfacing it names a
+// caller bug rather than a forge condition.
+var errEditUnsupported = errors.New("issuecomment: forge does not implement edit-in-place (forge.IssueCommentEditor)")
+
+// commentForgeFamily derives the comment family for a run, mirroring
+// server.runForge / runForgeFromRef EXACTLY so the notifier and the
+// approval/prompt paths agree on which forge a run belongs to (E45.52 /
+// #3481): a gitlab_ci runner kind is GitLab; a nil, empty, or scheme-less
+// InstallationRef (the bare-decimal GitHub App installation id, the pre-0076
+// and un-stamped shapes) is GitHub; a `<scheme>:<rest>` ref yields that
+// scheme. An EMPTY scheme (a ref starting with ":") is returned VERBATIM —
+// not laundered into GitHub — so it resolves to no forge and skips.
+func commentForgeFamily(r *run.Run) string {
+	if r == nil {
+		return commentFamilyGitHub
+	}
+	if r.RunnerKind == run.RunnerKindGitLabCI {
+		return commentFamilyGitLab
+	}
+	if r.InstallationRef == nil || *r.InstallationRef == "" {
+		return commentFamilyGitHub
+	}
+	scheme, _, ok := strings.Cut(*r.InstallationRef, ":")
+	if !ok {
+		return commentFamilyGitHub
+	}
+	return scheme
+}
+
+// canEdit reports whether the context can edit a comment in place: always
+// for the github family (UpdateIssueComment), and for a forge family only
+// when its IssueOperations also implements forge.IssueCommentEditor.
+func (c commentContext) canEdit() bool {
+	if c.ops == nil {
+		return true
+	}
+	_, ok := c.ops.(forge.IssueCommentEditor)
+	return ok
+}
+
+// commentMode names the audit `comment_mode` for a forge context.
+func (c commentContext) commentMode() string {
+	if c.canEdit() {
+		return commentModeEditInPlace
+	}
+	return commentModeAppendOnly
+}
+
+// resolveCommentTarget is the ONE issue-locus target resolver every
+// entry point shares (contextFor, contextForStatus, contextForCIRetry,
+// contextForBudgetAlert; E45.52 / #3481). It returns (ctx, true) when the
+// run has an issue to post to and a client to post with, or (zero, false)
+// on every logical skip — a skip is never an error, so callers stay
+// branch-free and a misconfigured forge never fails a transition.
+//
+// ISSUE-ANCHORED, not github_issue-only (E54.22 / #2826): an ON-DEMAND
+// grooming run IS anchored to an issue by design — ADR-065's groom stage
+// declares `inputs: [{source: github_issue, required: true}]` — so it must
+// receive its gate comments exactly as a github_issue run does. The SOURCE
+// check is widened only; an `issue:N`-parsable TriggerRef is still required
+// immediately afterwards (run.Run.IsIssueAnchored's contract).
+//
+// Family split (operator decision on #3481: InstallationRef is the
+// discriminator):
+//
+//   - github family: the pre-#3481 path byte-for-byte. Local-runner runs
+//     (#416) carry no installation_id by design — the backend can't mint an
+//     App token for the operator's repo, and the operator's own `gh` does
+//     the posting from the CLI side — so a nil InstallationID silently
+//     skips; so does a Notifier built without a GitHub client, and a repo
+//     parseRepo refuses (exactly two segments). Scope is
+//     FromGitHubInstallationID.
+//   - every other family: a nil/empty InstallationRef skips (nothing to
+//     scope a credential from); a Notifier built without ForgeIssueOps
+//     skips (pre-#3481 posture); a resolver returning nil skips with ONE
+//     WARN log naming family + run id (mirroring prompt.go's
+//     forge_unresolved reason) and NO audit row — a misconfiguration is not
+//     a fact about the run. The repo splits on its LAST slash (nested
+//     GitLab paths, the same rule as server.splitParentRepoRef — parseRepo
+//     would reject `group/sub/proj`). Scope is FromRef(InstallationRef).
+func (n *Notifier) resolveCommentTarget(ctx context.Context, runRow *run.Run) (commentContext, bool) {
+	if !runRow.IsIssueAnchored() {
+		return commentContext{}, false
+	}
+	if runRow.TriggerRef == nil {
+		return commentContext{}, false
+	}
+	number, ok := parseIssueRef(*runRow.TriggerRef)
+	if !ok {
+		return commentContext{}, false
+	}
+	ctxv := commentContext{
+		run:         runRow,
+		issueNumber: number,
+		runURL:      runURLFor(n.externalURL, runRow.ID),
+		family:      commentForgeFamily(runRow),
+	}
+	if ctxv.family == commentFamilyGitHub {
+		if runRow.InstallationID == nil {
+			return commentContext{}, false
+		}
+		if n.github == nil {
+			return commentContext{}, false
+		}
+		repo, err := parseRepo(runRow.Repo)
+		if err != nil {
+			return commentContext{}, false
+		}
+		ctxv.repo = repo
+		ctxv.scope = forge.FromGitHubInstallationID(*runRow.InstallationID)
+		return ctxv, true
+	}
+	if runRow.InstallationRef == nil || *runRow.InstallationRef == "" {
+		return commentContext{}, false
+	}
+	if n.forgeIssueOps == nil {
+		return commentContext{}, false
+	}
+	ops := n.forgeIssueOps(ctxv.family)
+	if ops == nil {
+		slog.Default().WarnContext(ctx,
+			"issuecomment: forge unresolved for comment family; issue comment skipped",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("forge", ctxv.family))
+		return commentContext{}, false
+	}
+	repo, ok := splitRepoLastSlash(runRow.Repo)
+	if !ok {
+		return commentContext{}, false
+	}
+	ctxv.repo = repo
+	ctxv.scope = forge.FromRef(*runRow.InstallationRef)
+	ctxv.ops = ops
+	return ctxv, true
+}
+
+// splitRepoLastSlash splits a forge repo path on its LAST slash so a nested
+// GitLab path (`group/sub/proj`) yields {group/sub, proj}. Same rule as
+// server.splitParentRepoRef. Refuses an empty owner or name.
+func splitRepoLastSlash(full string) (forge.RepoRef, bool) {
+	full = strings.TrimSpace(full)
+	i := strings.LastIndex(full, "/")
+	if i <= 0 || i == len(full)-1 {
+		return forge.RepoRef{}, false
+	}
+	return forge.RepoRef{Owner: full[:i], Name: full[i+1:]}, true
+}
+
+// createComment posts body as a new comment on the context's issue and
+// returns the forge-assigned comment id (E45.52 / #3481). github family →
+// n.github.CreateIssueComment (the exact pre-#3481 call); forge family →
+// forge.IssueCommentEditor.PostIssueCommentWithID when the ops implement
+// it, else IssueOperations.PostIssueComment with id 0 (append-only: the
+// forge returns no id).
+func (n *Notifier) createComment(ctx context.Context, ctxv commentContext, body string) (int64, error) {
+	if ctxv.ops == nil {
+		created, err := n.github.CreateIssueComment(ctx, ctxv.scope, ctxv.repo, ctxv.issueNumber, body)
+		if err != nil {
+			return 0, err
+		}
+		return created.ID, nil
+	}
+	if editor, ok := ctxv.ops.(forge.IssueCommentEditor); ok {
+		return editor.PostIssueCommentWithID(ctx, ctxv.scope, ctxv.repo, ctxv.issueNumber, body)
+	}
+	return 0, ctxv.ops.PostIssueComment(ctx, ctxv.scope, ctxv.repo, ctxv.issueNumber, body)
+}
+
+// editComment rewrites comment id in place and returns the id the edit
+// landed on (E45.52 / #3481). github family → n.github.UpdateIssueComment
+// (the exact pre-#3481 call; the returned id is the response's); forge
+// family → forge.IssueCommentEditor.EditIssueComment, which takes the issue
+// number because GitLab's note endpoint is issue-scoped. A forge without the
+// editor returns errEditUnsupported. A deleted comment surfaces as
+// forge.ErrNotFound (githubclient.ErrNotFound is the same value).
+func (n *Notifier) editComment(ctx context.Context, ctxv commentContext, id int64, body string) (int64, error) {
+	if ctxv.ops == nil {
+		got, err := n.github.UpdateIssueComment(ctx, ctxv.scope, ctxv.repo, id, body)
+		if err != nil {
+			return 0, err
+		}
+		return got.ID, nil
+	}
+	editor, ok := ctxv.ops.(forge.IssueCommentEditor)
+	if !ok {
+		return 0, errEditUnsupported
+	}
+	if err := editor.EditIssueComment(ctx, ctxv.scope, ctxv.repo, ctxv.issueNumber, id, body); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// stickyCandidate is the forge-neutral projection of one thread comment the
+// orphan-rediscovery marker match (#1793) reads.
+type stickyCandidate struct {
+	ID   int64
+	Body string
+}
+
+// listComments lists the context's issue thread (E45.52 / #3481). github
+// family → n.github.ListIssueComments (the exact pre-#3481 call); forge
+// family → IssueOperations.FetchIssueComments.
+func (n *Notifier) listComments(ctx context.Context, ctxv commentContext) ([]stickyCandidate, error) {
+	if ctxv.ops == nil {
+		comments, err := n.github.ListIssueComments(ctx, ctxv.scope, ctxv.repo, ctxv.issueNumber)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]stickyCandidate, 0, len(comments))
+		for _, c := range comments {
+			out = append(out, stickyCandidate{ID: c.ID, Body: c.Body})
+		}
+		return out, nil
+	}
+	comments, err := ctxv.ops.FetchIssueComments(ctx, ctxv.scope, ctxv.repo, ctxv.issueNumber)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]stickyCandidate, 0, len(comments))
+	for _, c := range comments {
+		out = append(out, stickyCandidate{ID: c.ID, Body: c.Body})
+	}
+	return out, nil
 }
 
 // contextFor returns (ctx, true) when the run is eligible for a
 // comment of `kind`, or (zero, false) when it should be skipped.
 // The error return is non-nil only on transient I/O failures the
 // caller should retry; logical "skip" cases return (zero, false,
-// nil).
+// nil). Target resolution (issue anchoring, family split, credential
+// scope) is resolveCommentTarget's; this adds only the per-kind dedup.
 func (n *Notifier) contextFor(ctx context.Context, runID uuid.UUID, kind Kind) (commentContext, bool, error) {
 	runRow, err := n.runs.GetRun(ctx, runID)
 	if err != nil {
 		return commentContext{}, false, fmt.Errorf("issuecomment: get run: %w", err)
 	}
-	// ISSUE-ANCHORED, not github_issue-only (E54.22 / #2826). This and the
-	// five sibling entry points (contextForCIRetry, contextForBudgetAlert,
-	// NotifyStatusUpdateForRun, NotifyPageClassForRun, contextForStatus) each
-	// suppress comment posting for a run that has no issue to post to. An
-	// ON-DEMAND grooming run IS anchored to an issue by design — ADR-065's
-	// groom stage declares `inputs: [{source: github_issue, required: true}]`
-	// — so it must receive its gate comments (approval, status, budget) on
-	// that issue exactly as a github_issue run does. Suppressing it would
-	// make the operator's approval gate invisible on the very issue the run
-	// is about.
-	//
-	// This widens the SOURCE check ONLY. Every one of the six sites still
-	// requires a non-nil InstallationID and an `issue:N`-parsable TriggerRef
-	// immediately afterwards, so an on_demand run with no issue reference
-	// still short-circuits one line later — see run.Run.IsIssueAnchored's
-	// contract.
-	if !runRow.IsIssueAnchored() {
-		return commentContext{}, false, nil
-	}
-	if runRow.InstallationID == nil {
-		return commentContext{}, false, nil
-	}
-	if runRow.TriggerRef == nil {
-		return commentContext{}, false, nil
-	}
-	number, ok := parseIssueRef(*runRow.TriggerRef)
+	ctxv, ok := n.resolveCommentTarget(ctx, runRow)
 	if !ok {
-		return commentContext{}, false, nil
-	}
-	repo, err := parseRepo(runRow.Repo)
-	if err != nil {
 		return commentContext{}, false, nil
 	}
 
@@ -2237,13 +2493,7 @@ func (n *Notifier) contextFor(ctx context.Context, runID uuid.UUID, kind Kind) (
 	if already {
 		return commentContext{}, false, nil
 	}
-
-	return commentContext{
-		run:         runRow,
-		repo:        repo,
-		issueNumber: number,
-		runURL:      runURLFor(n.externalURL, runID),
-	}, true, nil
+	return ctxv, true, nil
 }
 
 // alreadyPosted returns true when an issue_commented audit entry
@@ -2263,14 +2513,15 @@ func (n *Notifier) alreadyPosted(ctx context.Context, runID uuid.UUID, kind Kind
 	return false, nil
 }
 
-// post fires the GitHub call and writes the audit entry. The order
-// matters: comment first, audit entry second. If the comment fails
+// post fires the forge call (createComment: GitHub client for the github
+// family, forge.IssueOperations otherwise) and writes the audit entry. The
+// order matters: comment first, audit entry second. If the comment fails
 // we never write the audit entry, so a retry will try again. If the
 // audit append fails after a successful comment, we log but treat
 // the comment as posted — the next NotifyXxx call would re-post
 // (rare; the audit log is highly available).
 func (n *Notifier) post(ctx context.Context, ctxv commentContext, kind Kind, body string) error {
-	if _, err := n.github.CreateIssueComment(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID), ctxv.repo, ctxv.issueNumber, body); err != nil {
+	if _, err := n.createComment(ctx, ctxv, body); err != nil {
 		return fmt.Errorf("issuecomment: create comment: %w", err)
 	}
 	systemKind := audit.ActorSystem
