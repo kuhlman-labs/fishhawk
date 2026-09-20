@@ -534,7 +534,7 @@ Per `MVP_SPEC.md` §4.3:
 | `fishhawk_audit_log` | `canonical` | Full structure, immutable. The audit log is the source of truth. Unconditional — recorded regardless of the `originating_issue` declaration below. |
 | `originating_issue`  | `rendered_comment` | Projected into the run's living-anchor comment on the GitHub issue (#1054), not a standalone plan comment. Whether and how it tracks a regenerated plan is governed by `update_on_change` — see `workflow-v2.md`'s [Produces](workflow-v2.md#produces) section for the full one-shot / tracking / undeclared contract. |
 
-The runner ships the canonical JSON to the backend; the backend resolves the workflow's declared persistence into `spec.IssueEchoPolicyFor` (E45.41 / #3346) and the notifier folds the plan into the living anchor accordingly, posted via the GitHub App's installation token. This projection is GitHub-only today — a GitLab-triggered run's plan is not echoed to the originating issue regardless of this declaration (tracked under E45, #1852; issue-echo parity slice #3481 / E45.52).
+The runner ships the canonical JSON to the backend; the backend resolves the workflow's declared persistence into `spec.IssueEchoPolicyFor` (E45.41 / #3346) and the notifier folds the plan into the living anchor accordingly — posted via the GitHub App's installation token for a github-family run, and through `forge.IssueOperations` for every other forge family whose adapter implements it (GitLab included; edit-in-place needs `forge.IssueCommentEditor`, else the anchor degrades to append-only), per E45.52 / #3481.
 
 ## See also
 

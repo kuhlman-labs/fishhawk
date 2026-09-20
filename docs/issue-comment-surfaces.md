@@ -1,6 +1,9 @@
 # Issue-comment surfaces
 
-Inventory of every comment Fishhawk posts to a triggering GitHub issue. The
+Inventory of every comment Fishhawk posts to a triggering issue — on GitHub
+through the App client, and on every other forge family through
+`forge.IssueOperations` (E45.52 / #3481; see "Routing" below for which
+surfaces are forge-routed and which remain GitHub-only). The
 `backend/internal/issuecomment` package owns all of these; this doc is the
 quick map of *what's live* so future work doesn't have to grep-reconstruct
 it.
@@ -98,10 +101,11 @@ Notes:
   absent from it FAILS OPEN to the tracking projection with a warn log — a run
   is only minted from a validated spec, so these are legacy rows or
   corruption, and hiding the review surface on that edge is worse than an
-  un-honoured declaration. This resolution is GitHub-only: a GitLab-triggered
-  run's plan is not echoed to the originating issue at all today, regardless
-  of the declaration (tracked under E45, #1852; issue-echo parity slice #3481
-  / E45.52).
+  un-honoured declaration. The resolution is forge-neutral: since E45.52 /
+  #3481 a GitLab-triggered run (InstallationID nil, `installation_ref`
+  `gitlab:<project_id>`) receives the same anchor through
+  `forge.IssueOperations`, edited in place when the forge implements
+  `forge.IssueCommentEditor` (the GitLab adapter does) — see "Routing" below.
 - **Reviewer-verdict isolation (binding condition 1).** The anchor counts
   only the verdicts of the MOST-RECENT review dispatch per stage: it floors
   verdict counting at the latest `*_review_started` audit `Sequence` (the
@@ -2306,13 +2310,93 @@ Notes:
 
 ## Routing
 
-All surfaces above only fire when the run's `TriggerSource = github_issue`.
-PR-triggered and CLI-triggered runs are out of scope for this package —
-they have different surfaces and a different conversation locus.
+All surfaces above only fire when the run is issue-anchored
+(`Run.IsIssueAnchored`: `TriggerSource` `github_issue` — the forge-neutral
+issue-anchored member, which a GitLab issue trigger also mints — or
+`on_demand`). PR-triggered and CLI-triggered runs are out of scope for this
+package — they have different surfaces and a different conversation locus.
 
-The `Notifier`'s `contextFor` / `contextForStatus` helpers gate the skip:
-missing `installation_id`, unparseable `trigger_ref`, or non-issue
-`trigger_source` short-circuits before any GitHub call.
+Every issue-locus entry point (`contextFor`, `contextForStatus`,
+`contextForCIRetry`, `contextForBudgetAlert`) shares ONE target resolver,
+`resolveCommentTarget`: a non-issue `trigger_source` or an unparseable
+`trigger_ref` short-circuits before any forge call, then the run's **comment
+family** decides the client.
+
+### Forge family routing (E45.52 / #3481)
+
+`commentForgeFamily` mirrors `server.runForge` / `runForgeFromRef` exactly so
+the notifier and the approval/prompt paths agree on which forge a run belongs
+to: a `gitlab_ci` runner kind is `gitlab`; a nil, empty, or scheme-less
+`installation_ref` (the bare-decimal GitHub App installation id, and the
+pre-0076 / un-stamped shapes) is `github`; a `<scheme>:<rest>` ref yields that
+scheme (`gitlab:5` → `gitlab`). An empty scheme (`:x`) is returned verbatim —
+never laundered into `github` — so it resolves to no forge and skips. The
+operator decision on #3481 is that **`installation_ref` is the family
+discriminator**: the github family keeps its `githubclient` path byte-for-byte
+and every other family goes through `forge.IssueOperations`.
+
+- **github family** — the pre-#3481 path unchanged. A nil `installation_id`
+  skips (local-runner runs, #416, post from the CLI side — see below); so does
+  a `Notifier` built without a GitHub client, or a repo `parseRepo` refuses
+  (exactly two segments). Credential scope is
+  `forge.FromGitHubInstallationID`. The forge resolver is NEVER consulted for
+  this family (`TestNotifyStatusUpdate_GitHub_NeverConsultsForgeOps`), and the
+  `status_comment_posted` payload keeps its exact pre-#3481 four keys.
+- **every other family** — resolved through `Deps.ForgeIssueOps` (wired by
+  `server.New` to the shared `issueOpsFor` ladder). A nil/empty
+  `installation_ref` skips (nothing to scope a credential from); a `Notifier`
+  built without `ForgeIssueOps` skips (the pre-#3481 posture); a resolver
+  returning nil skips with ONE WARN log naming the family + run id and NO
+  audit row — a misconfigured forge is not a fact about the run. The repo
+  splits on its LAST slash (nested GitLab paths `group/sub/proj` → owner
+  `group/sub`, name `proj`; the same rule as `server.splitParentRepoRef`).
+  Credential scope is `forge.FromRef(installation_ref)`.
+
+**Forge-routed surfaces** (all issue-locus): the living anchor
+(`status_comment_posted`), page-class pings (`anchor_ping_posted`), the
+CI-failure retry comment, the budget alert, and the generic per-kind
+`contextFor` → `post` path. Every one goes through three seam helpers —
+`createComment` / `editComment` / `listComments` — whose github branch is the
+exact GitHub client call it replaced and whose forge branch is
+`forge.IssueOperations` (+ the editor below).
+
+**Edit-in-place negotiation.** The anchor edits ONE comment across a run's
+life, which needs a comment id back from the post and an edit endpoint.
+`forge.IssueOperations.PostIssueComment` returns no id, so edit-in-place is
+capability-NEGOTIATED through the standalone optional
+`forge.IssueCommentEditor` (`PostIssueCommentWithID` + `EditIssueComment`,
+both taking the issue number because GitLab's note endpoint is
+project-AND-issue scoped; the GitLab adapter implements it). The notifier
+type-asserts the resolved `IssueOperations` to it:
+
+- **editor present → `comment_mode: edit_in_place`.** Same shape as GitHub:
+  audit-chain id lookup (`github_comment_id` stays the lookup key on EVERY
+  forge, so `findStatusCommentID` and every existing reader are unchanged),
+  `#1793` orphan rediscovery by listing the thread through
+  `FetchIssueComments` and matching the hidden anchor marker, edit by id, and
+  a deleted comment (`forge.ErrNotFound`, which `githubclient.ErrNotFound`
+  aliases) falls back to a fresh create. Any OTHER edit error surfaces rather
+  than stacking a duplicate anchor.
+- **editor absent → `comment_mode: append_only`.** The forge can post but
+  cannot hand back an id or edit, so each update appends a fresh comment and
+  the notifier skips BOTH the audit id lookup and the marker rediscovery
+  (neither could be acted on); the audit row records `github_comment_id: 0`.
+
+**Audit payload.** A non-github `status_comment_posted` row carries two extra
+keys — `forge` (the family, e.g. `gitlab`) and `comment_mode`
+(`edit_in_place` | `append_only`) — naming which of the two happened. The
+github-family payload is deliberately byte-identical to the pre-#3481 shape
+(no new keys). Readers use `github_comment_id` on every forge.
+
+**Residuals — still GitHub-only after #3481.** The PR/MR-locus surfaces
+(sticky PR status comment `pr_status_comment_posted` and the advisory
+agent-review PR reviews `pr_review_posted`) stay on their `installation_id`
+guard; slash-approval replies (`NotifySlashApprovalReply`) and the run-rejected
+/ not-applicable posts (`NotifyRunRejected`, `NotifyRunNotApplicable`) call the
+GitHub client with a caller-supplied scope. And `server.New` still constructs
+the notifier only when a GitHub App client is configured, so a GitLab-only
+fishhawkd with no GitHub App has no notifier at all (slice 2 of #3481 wires
+`ForgeIssueOps` inside that same block).
 
 ### Channel routing (ADR-015 #79 option B)
 
@@ -2352,11 +2436,14 @@ the manifest.
 
 ## Local-runner runs (#416, #428)
 
-For runs minted with `runner_kind=local`, the backend's `IssueNotifier` is a
-no-op by design: the run carries no `installation_id` (the operator's local
-flow doesn't go through a GitHub App webhook), so `contextForStatus` returns
-early. Comment posting moves to the CLI side, where the operator's authed
-`gh` is available.
+For github-family runs minted with `runner_kind=local`, the backend's
+`IssueNotifier` is a no-op by design: the run carries no `installation_id`
+(the operator's local flow doesn't go through a GitHub App webhook), so
+`resolveCommentTarget` (via `contextForStatus`) returns early. Comment posting
+moves to the CLI side, where the operator's authed `gh` is available. (A run
+whose `installation_ref` names another forge family takes the forge-routed
+path under "Routing" above regardless of runner kind — the credential comes
+from the ref, not from a GitHub installation.)
 
 **Edit-in-place sticky comment (#428).** Every CLI verb that changes run or
 stage state calls `ghcomment.PostOrEditStatusComment`, which:

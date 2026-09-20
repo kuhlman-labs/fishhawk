@@ -95,6 +95,11 @@ var _ forge.FileFetcher = (*Forge)(nil)
 // (E50.17 / #2900).
 var _ forge.IssueOperations = (*Forge)(nil)
 
+// Compile-time assertion that the adapter provides the optional
+// edit-in-place comment capability the issuecomment notifier negotiates
+// for its living anchor on a non-GitHub forge (E45.52 / #3481).
+var _ forge.IssueCommentEditor = (*Forge)(nil)
+
 // Compile-time assertion that the adapter provides the standalone
 // merge-requirement read capability the GitLab run-creation path consumes
 // to capture a run's RequiredChecksSnapshot (E45.55 / #3490).
@@ -857,6 +862,42 @@ func (f *Forge) PostIssueComment(ctx context.Context, scope forge.CredentialScop
 		return err
 	}
 	if _, err := c.CreateIssueNote(ctx, pid, number, body); err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
+// --- forge.IssueCommentEditor (E45.52 / #3481) --------------------------
+
+// PostIssueCommentWithID posts body as a new note on the issue and returns
+// the note id GitLab assigned, so the notifier's living anchor can address
+// it through EditIssueComment later. Same CreateIssueNote delegation as
+// PostIssueComment; the RepoRef is ignored because the scope's numeric
+// project id addresses the project.
+func (f *Forge) PostIssueCommentWithID(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, number int, body string) (int64, error) {
+	c, pid, err := f.resolve(ctx, scope)
+	if err != nil {
+		return 0, err
+	}
+	n, err := c.CreateIssueNote(ctx, pid, number, body)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	return n.ID, nil
+}
+
+// EditIssueComment rewrites note commentID on issue number in place via
+// PUT /projects/:id/issues/:iid/notes/:note_id. The issue number is
+// load-bearing here, not ceremony: GitLab's note endpoints are issue-scoped
+// and there is no note-id-only edit route. A 404 (the note was deleted)
+// maps to forge.ErrNotFound through mapError — the sentinel the notifier's
+// deleted-comment fallback keys on to create a fresh anchor.
+func (f *Forge) EditIssueComment(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, number int, commentID int64, body string) error {
+	c, pid, err := f.resolve(ctx, scope)
+	if err != nil {
+		return err
+	}
+	if _, err := c.UpdateIssueNote(ctx, pid, number, commentID, body); err != nil {
 		return mapError(err)
 	}
 	return nil
