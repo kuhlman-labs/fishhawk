@@ -1353,3 +1353,97 @@ func TestGitLabForge_IssueOperations_ErrorMapping(t *testing.T) {
 		}
 	}
 }
+
+// --- forge.CIRequirementReader (E45.55 / #3490) -------------------------
+
+// TestGitLabForge_ReadCIRequirement pins the adapter's mapping of the two
+// GET /projects/:id merge-requirement settings onto forge.CIRequirement, that
+// the request addresses the SCOPE's project id (not anything derived from
+// the RepoRef), and that a 403 maps to forge.ErrForbidden — the arm the
+// dispatcher's capture step degrades to a nil snapshot on.
+func TestGitLabForge_ReadCIRequirement(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		body    string
+		want    forge.CIRequirement
+		wantErr error
+	}{
+		{
+			name:   "both on",
+			status: http.StatusOK,
+			body:   `{"id":77,"only_allow_merge_if_pipeline_succeeds":true,"allow_merge_on_skipped_pipeline":true}`,
+			want:   forge.CIRequirement{PipelineMustSucceed: true, AllowSkippedPipeline: true},
+		},
+		{
+			name:   "succeeds on, skipped off",
+			status: http.StatusOK,
+			body:   `{"id":77,"only_allow_merge_if_pipeline_succeeds":true,"allow_merge_on_skipped_pipeline":false}`,
+			want:   forge.CIRequirement{PipelineMustSucceed: true, AllowSkippedPipeline: false},
+		},
+		{
+			name:   "succeeds off",
+			status: http.StatusOK,
+			body:   `{"id":77,"only_allow_merge_if_pipeline_succeeds":false,"allow_merge_on_skipped_pipeline":true}`,
+			want:   forge.CIRequirement{PipelineMustSucceed: false, AllowSkippedPipeline: true},
+		},
+		{
+			name:    "403 → ErrForbidden",
+			status:  http.StatusForbidden,
+			body:    `{"message":"403 Forbidden"}`,
+			wantErr: forge.ErrForbidden,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			var gotPath string
+			mux.HandleFunc("/api/v4/projects/", func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				writeJSON(w, tc.status, tc.body)
+			})
+			f, _ := newForge(t, mux)
+			// The RepoRef deliberately names a DIFFERENT project than the
+			// scope: the request must address the scope's id.
+			got, err := f.ReadCIRequirement(context.Background(), gitlabScope("77"),
+				forge.RepoRef{Owner: "other", Name: "project"})
+			if gotPath != "/api/v4/projects/77" {
+				t.Errorf("request path = %q, want /api/v4/projects/77 (the scope's project id)", gotPath)
+			}
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("err = %v, want errors.Is %v", err, tc.wantErr)
+				}
+				if got != nil {
+					t.Errorf("requirement = %+v on error, want nil", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ReadCIRequirement: %v", err)
+			}
+			if *got != tc.want {
+				t.Errorf("requirement = %+v, want %+v", *got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGitLabForge_ReadCIRequirement_RejectsNonGitLabScope pins the
+// fail-closed scope parse: a GitHub-shaped scope never reaches the wire.
+func TestGitLabForge_ReadCIRequirement_RejectsNonGitLabScope(t *testing.T) {
+	mux := http.NewServeMux()
+	var calls atomic.Int32
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		writeJSON(w, http.StatusOK, `{}`)
+	})
+	f, _ := newForge(t, mux)
+	_, err := f.ReadCIRequirement(context.Background(), forge.FromGitHubInstallationID(12345), forge.RepoRef{})
+	if err == nil || !strings.Contains(err.Error(), "not gitlab-shaped") {
+		t.Errorf("err = %v, want a not-gitlab-shaped rejection", err)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("a wrong-forge scope reached the wire (%d calls), want 0", n)
+	}
+}

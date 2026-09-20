@@ -95,6 +95,11 @@ var _ forge.FileFetcher = (*Forge)(nil)
 // (E50.17 / #2900).
 var _ forge.IssueOperations = (*Forge)(nil)
 
+// Compile-time assertion that the adapter provides the standalone
+// merge-requirement read capability the GitLab run-creation path consumes
+// to capture a run's RequiredChecksSnapshot (E45.55 / #3490).
+var _ forge.CIRequirementReader = (*Forge)(nil)
+
 // Option customises a Forge at construction.
 type Option func(*forgeConfig)
 
@@ -743,6 +748,29 @@ func (f *Forge) FetchFile(ctx context.Context, scope forge.CredentialScope, repo
 		return nil, mapError(err)
 	}
 	return &forge.FileContent{Path: file.FilePath, Content: file.Content, SHA: file.BlobID}, nil
+}
+
+// --- forge.CIRequirementReader (E45.55 / #3490) -------------------------
+
+// ReadCIRequirement implements forge.CIRequirementReader: it reads the
+// project's two merge-requirement settings from GET /projects/:id and maps
+// them onto the forge-neutral CIRequirement. The project is the scope's
+// "gitlab:<id>" — repo is ignored, as on every other scope-taking method,
+// because the scope already names the project authoritatively. Errors map
+// through mapError (404 → ErrNotFound, 401/403 → ErrForbidden).
+func (f *Forge) ReadCIRequirement(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef) (*forge.CIRequirement, error) {
+	c, pid, err := f.resolve(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	pi, err := c.GetProjectByID(ctx, pid)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &forge.CIRequirement{
+		PipelineMustSucceed:  pi.OnlyAllowMergeIfPipelineSucceeds,
+		AllowSkippedPipeline: pi.AllowMergeOnSkippedPipeline,
+	}, nil
 }
 
 // --- forge.IssueOperations (E50.17 / #2900) -----------------------------
