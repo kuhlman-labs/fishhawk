@@ -627,6 +627,13 @@ var runStatusPathTable = []pathClassification{
 	{Path: "acceptance_transcript", Tier: "T3", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
 		return []retrievalPointer{pointerListAudit(runID, "acceptance_outcome_recorded", 0)}
 	}},
+	{Path: "grooming_apply_status", Tier: "T3", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
+		return []retrievalPointer{
+			pointerListAudit(runID, auditCategoryGroomingApplyStarted, 0),
+			pointerListAudit(runID, auditCategoryGroomingMutationApplied, 0),
+			pointerListAudit(runID, auditCategoryGroomingApplyCompleted, 0),
+		}
+	}},
 	{Path: "elisions", Tier: tierNever},
 
 	// --- run.* -----------------------------------------------------------
@@ -828,6 +835,7 @@ var runStatusTiers = []runStatusTier{
 	{name: "T3", apply: func(out *GetRunStatusOutput, runID string, led *elisionLedger) {
 		tierSecurityFindings(out, runID, led)
 		tierAcceptanceTranscript(out, runID, led)
+		tierGroomingApplyStatus(out, runID, led)
 	}},
 	{name: "T4", apply: tierImplementReviews},
 	{name: "T5", apply: tierRecentAuditCap},
@@ -892,6 +900,29 @@ func tierAcceptanceTranscript(out *GetRunStatusOutput, runID string, led *elisio
 	out.AcceptanceTranscript = nil
 	led.add(classified("acceptance_transcript", runID,
 		"the per-criterion transcript summary is stored on the newest acceptance_outcome_recorded audit entry (transcript block); the full transcript is one artifact fetch away", n))
+}
+
+// tierGroomingApplyStatus drops the grooming-apply progress block (E54.77 /
+// #3232) in the same T3 slot as its two stored siblings. The block is DERIVED
+// from three audit categories, so — like T4's two implement-review entries —
+// it emits THREE entries, one per originating category, each with its own
+// category-exact anchored pointer: no single category returns the whole block,
+// and the one pointer promise (a pointer returns AT LEAST the omitted content)
+// is kept per entry rather than stretched across a pointer that cannot honour
+// it. omitted_count is the number of per-entry rows the block had tallied
+// (recorded) on every entry, mirroring T4's shared n.
+func tierGroomingApplyStatus(out *GetRunStatusOutput, runID string, led *elisionLedger) {
+	if out.GroomingApplyStatus == nil {
+		return
+	}
+	n := out.GroomingApplyStatus.Recorded
+	out.GroomingApplyStatus = nil
+	surfaces := mustPath("grooming_apply_status").Surfaces(runID)
+	led.add(
+		newStoredElision("grooming_apply_status", "the grooming_apply_started denominator row is stored on the audit chain", surfaces[0], n),
+		newStoredElision("grooming_apply_status", "the per-entry grooming_mutation_applied ledger is stored on the audit chain", surfaces[1], n),
+		newStoredElision("grooming_apply_status", "the grooming_apply_completed summary row is stored on the audit chain", surfaces[2], n),
+	)
 }
 
 func tierImplementReviews(out *GetRunStatusOutput, runID string, led *elisionLedger) {

@@ -10,6 +10,7 @@ package server
 // groomingSourceArtifactRepo) without modifying any of them.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -200,9 +203,13 @@ type groomingApplyMutator struct {
 	mu    sync.Mutex
 	calls []workmgmt.GroomingMutationRequest
 	err   error
-	// block makes the first dispatch wait for the context (or the duration),
-	// which is how the bounded-context test wedges a forge.
+	// block makes EVERY dispatch wait for the context (or the duration),
+	// which is how the over-budget test wedges a forge.
 	block time.Duration
+	// release, when non-nil, parks the FIRST dispatch until it is closed OR
+	// ctx is done — the deterministic wedge the detached-apply tests use to
+	// observe the hook returning while the apply is still running.
+	release chan struct{}
 	// refuse makes every dispatch return a REFUSAL carrying this reason.
 	refuse string
 }
@@ -210,8 +217,15 @@ type groomingApplyMutator struct {
 func (m *groomingApplyMutator) ApplyGroomingMutation(ctx context.Context, req workmgmt.GroomingMutationRequest) (*workmgmt.GroomingMutationResult, error) {
 	m.mu.Lock()
 	m.calls = append(m.calls, req)
-	block, err := m.block, m.err
+	block, err, release, first := m.block, m.err, m.release, len(m.calls) == 1
 	m.mu.Unlock()
+	if release != nil && first {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-release:
+		}
+	}
 	if block > 0 {
 		select {
 		case <-ctx.Done():
@@ -276,12 +290,22 @@ func (r *groomingApplyReader) ListWorkItems(context.Context, workmgmt.ListWorkIt
 // returns a zero Sequence). It does NOT implement audit.GroomingWindowAppender,
 // so the apply-hook unit tests exercise the fallback; the atomic capability path
 // is covered by the pgtest suites.
+//
+// IT HONOURS ctx (E54.77 / #3232), as the production Postgres repository does:
+// an append whose context is already done returns ctx.Err() and records
+// nothing. The earlier fake ignored ctx, which is what let the old
+// bounded-context test pass while the post-budget audit writes were in fact
+// dying on the expired apply context in production.
 type groomingApplyAuditFake struct {
 	*approvalAuditFake
 	// failCategories fails AppendChained for exactly these categories, sparing
 	// every other (notably the window watermark), so a test can model a SINK
 	// outage that must not abort dispatch while the settlement still lands.
 	failCategories map[string]bool
+	// wedgeCategories parks AppendChained for exactly these categories until
+	// ctx is done, then returns ctx.Err() — a stalled database, the shape the
+	// prelaunch budget bounds.
+	wedgeCategories map[string]bool
 	// listErr fails ListForRunByCategory, which the #2810 evidence scan's
 	// fail-closed branch needs. Nil by default, so every existing caller is
 	// byte-for-byte unchanged.
@@ -289,6 +313,12 @@ type groomingApplyAuditFake struct {
 }
 
 func (a *groomingApplyAuditFake) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if a.wedgeCategories[p.Category] {
+		<-ctx.Done()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if a.failCategories[p.Category] {
 		return nil, errors.New("groomingApplyAuditFake: injected append failure for " + p.Category)
 	}
@@ -534,16 +564,47 @@ func (f *groomingApplyFixture) seedApproval(t *testing.T, subject string, decisi
 	}
 }
 
-// groomingAudit returns the appended audit rows of the two grooming categories.
+// apply runs the hook and then WAITS for the detached apply (E54.77 / #3232),
+// so every row assertion that follows reads a settled trail. Tests that need
+// to observe the hook returning BEFORE the apply finishes call the hook and
+// waitGroomingApply separately.
+func (f *groomingApplyFixture) apply(t *testing.T, decision approval.Decision) {
+	t.Helper()
+	f.applyCtx(t, context.Background(), decision)
+}
+
+func (f *groomingApplyFixture) applyCtx(t *testing.T, ctx context.Context, decision approval.Decision) {
+	t.Helper()
+	f.server.applyApprovedGrooming(ctx, f.stage, decision)
+	f.server.waitGroomingApply()
+}
+
+// groomingAudit returns the appended audit rows of the three grooming-apply
+// categories: started, per-mutation, completed.
 func (f *groomingApplyFixture) groomingAudit() []audit.ChainAppendParams {
 	f.audit.mu.Lock()
 	defer f.audit.mu.Unlock()
 	var out []audit.ChainAppendParams
 	for _, p := range f.audit.appended {
 		if p.Category == workmgmt.GroomingMutationAppliedCategory ||
-			p.Category == workmgmt.GroomingApplyCompletedCategory {
+			p.Category == workmgmt.GroomingApplyCompletedCategory ||
+			p.Category == groomingApplyStartedCategory {
 			out = append(out, p)
 		}
+	}
+	return out
+}
+
+// startedRows decodes the grooming_apply_started rows.
+func (f *groomingApplyFixture) startedRows(t *testing.T) []groomingApplyStartedPayload {
+	t.Helper()
+	var out []groomingApplyStartedPayload
+	for _, p := range f.rowsOfCategory(groomingApplyStartedCategory) {
+		var got groomingApplyStartedPayload
+		if err := json.Unmarshal(p.Payload, &got); err != nil {
+			t.Fatalf("decode grooming_apply_started payload: %v (%s)", err, p.Payload)
+		}
+		out = append(out, got)
 	}
 	return out
 }
@@ -808,7 +869,7 @@ func TestApplyApprovedGrooming_RejectDispatchesNothing(t *testing.T) {
 	f := newGroomingApplyFixture(t, groomingApplyOpts{})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionReject)
+	f.apply(t, approval.DecisionReject)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 		t.Errorf("mutator dialed %v on a REJECT; a rejected report must apply nothing", dialed)
@@ -861,7 +922,7 @@ func TestApplyApprovedGrooming_RejectClosesWindowAndAppliesNothing(t *testing.T)
 	f := newGroomingApplyFixture(t, groomingApplyOpts{})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionReject)
+	f.apply(t, approval.DecisionReject)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 		t.Errorf("mutator dialed %v on a REJECT; a rejected report must apply nothing", dialed)
@@ -888,7 +949,7 @@ func TestApplyApprovedGrooming_RejectSettlementFailureLoggedAppliesNothing(t *te
 	f := newGroomingApplyFixture(t, groomingApplyOpts{})
 	f.audit.failCategories = map[string]bool{audit.GroomingApplyWindowClosedCategory: true}
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionReject)
+	f.apply(t, approval.DecisionReject)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 		t.Errorf("mutator dialed %v on a REJECT with a failed settlement", dialed)
@@ -910,7 +971,7 @@ func TestApplyApprovedGrooming_ApprovedDedupDispatchesWithGate(t *testing.T) {
 	f.seedDisposition(t, f.reportArtifactID(t), f.ids.duplicate, plan.GroomingClassDuplicate,
 		"approved", groomingApplyRepo+"#16")
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	dialed := f.mutator.dialedEntryIDs()
 	sawDup := false
@@ -935,7 +996,7 @@ func TestApplyApprovedGrooming_PostRatificationDegradeLeavesWindowClosed(t *test
 	f := newGroomingApplyFixture(t, groomingApplyOpts{mutatorErr: errors.New("mutator down")})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if got := f.degradeReason(t); got != groomingApplyMutatorUnavailable {
 		t.Errorf("degrade_reason = %q, want %q", got, groomingApplyMutatorUnavailable)
@@ -952,7 +1013,7 @@ func TestApplyApprovedGrooming_PreRatificationDegradeLeavesWindowOpen(t *testing
 	f := newGroomingApplyFixture(t, groomingApplyOpts{})
 	// No approval rows: C3 fails ungranted BEFORE settlement.
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if got := f.degradeReason(t); got != groomingApplyNotRatified {
 		t.Errorf("degrade_reason = %q, want %q", got, groomingApplyNotRatified)
@@ -982,7 +1043,7 @@ func TestApplyApprovedGrooming_ContestedGateDispatchesNothing(t *testing.T) {
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 	f.seedApproval(t, "someone-else", approval.DecisionReject)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 		t.Errorf("mutator dialed %v on a CONTESTED gate; a contested gate must apply nothing", dialed)
@@ -1002,7 +1063,7 @@ func TestApplyApprovedGrooming_UngrantedGateDispatchesNothing(t *testing.T) {
 	f := newGroomingApplyFixture(t, groomingApplyOpts{})
 	// No approval rows at all: grants == 0.
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 		t.Errorf("mutator dialed %v on an ungranted gate", dialed)
@@ -1019,7 +1080,7 @@ func TestApplyApprovedGrooming_ApprovalRepoErrorDispatchesNothing(t *testing.T) 
 	f := newGroomingApplyFixture(t, groomingApplyOpts{})
 	f.approvals.setListErr(errors.New("approvals unavailable"))
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 		t.Errorf("mutator dialed %v with an unreadable approval list", dialed)
@@ -1043,7 +1104,7 @@ func TestApplyApprovedGrooming_OrdinaryPlanStageNoOps(t *testing.T) {
 	f := newGroomingApplyFixture(t, groomingApplyOpts{omitReport: true})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 		t.Errorf("mutator dialed %v on an ordinary plan stage", dialed)
@@ -1063,7 +1124,7 @@ func TestApplyApprovedGrooming_ArtifactListErrorIsSilent(t *testing.T) {
 	f.artifacts.err = errors.New("artifacts unavailable")
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 		t.Errorf("mutator dialed %v with an unreadable artifact list", dialed)
@@ -1102,7 +1163,7 @@ func TestApplyApprovedGrooming_DegradeModes(t *testing.T) {
 			f := newGroomingApplyFixture(t, tc.opts)
 			f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-			f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+			f.apply(t, approval.DecisionApprove)
 
 			if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 				t.Errorf("mutator dialed %v on the %s degrade path", dialed, tc.name)
@@ -1130,7 +1191,7 @@ func TestApplyApprovedGrooming_RepoUnresolvableDegrades(t *testing.T) {
 	f.run.Repo = "not-a-full-name"
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 		t.Errorf("mutator dialed %v with an unresolvable repo", dialed)
@@ -1152,7 +1213,7 @@ func TestApplyApprovedGrooming_NonHygieneEntriesRecordedNoDecision(t *testing.T)
 	f := newGroomingApplyFixture(t, groomingApplyOpts{})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	recs := f.mutationRecords(t)
 	for _, id := range []string{f.ids.ordering, f.ids.duplicate, f.ids.decomposition} {
@@ -1194,7 +1255,7 @@ func TestApplyApprovedGrooming_ReportModeClassNotDispatched(t *testing.T) {
 	f := newGroomingApplyFixture(t, groomingApplyOpts{specYAML: groomingApplySpecHygieneReport})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 		t.Errorf("mutator dialed %v under mode: report; report mode surfaces and acts on nothing", dialed)
@@ -1220,7 +1281,7 @@ func TestApplyApprovedGrooming_UnreadableSpecResolvesGated(t *testing.T) {
 	f := newGroomingApplyFixture(t, groomingApplyOpts{specYAML: "version: \"2\"\nnot: valid yaml at all\n  - x\n"})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	for _, c := range f.mutator.dialed() {
 		if c.Kind.Destructive() {
@@ -1240,7 +1301,7 @@ func TestApplyApprovedGrooming_ProviderFailureRecordedFailed(t *testing.T) {
 	f := newGroomingApplyFixture(t, groomingApplyOpts{mutatorFailure: errors.New("projects token unset")})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 2 {
 		t.Errorf("dialed = %v, want 2 — continue-and-report must not abort on the first failure", dialed)
@@ -1264,21 +1325,22 @@ func TestApplyApprovedGrooming_ProviderFailureRecordedFailed(t *testing.T) {
 	}
 }
 
-// TestApplyApprovedGrooming_BoundedContext: a wedged forge cannot hold the
-// operator's approve request open. Every deadline-competing duration is derived
-// through timescale.D so the discrimination ratio holds at any factor; no raw
-// elapsed upper bound is asserted.
-func TestApplyApprovedGrooming_BoundedContext(t *testing.T) {
-	budget := timescale.D(150 * time.Millisecond)
-	prev := groomingApplyBudget
-	groomingApplyBudget = budget
-	t.Cleanup(func() { groomingApplyBudget = prev })
-
-	// The wedge is an order of magnitude past the budget, so the budget — not
-	// the sleep — is what releases the call.
-	f := newGroomingApplyFixture(t, groomingApplyOpts{mutatorBlock: budget * 10})
+// TestApplyApprovedGrooming_ReturnsBeforeApplyFinishes pins the DETACHMENT
+// (E54.77 / #3232): the hook returns to the approve request while the forge is
+// still parked on the first dispatch, having written exactly one
+// grooming_apply_started row (candidate_count = report entries, budget_seconds
+// = groomingApplyBudgetFor(n)) and no grooming_apply_completed row yet. Every
+// deadline-competing duration is derived through timescale.D; no raw elapsed
+// upper bound is asserted. COUNTERFACTUAL: run ApplyGrooming inline instead of
+// on the bgGroomingApply goroutine → the hook blocks on the parked mutator →
+// the bounded-return select goes red.
+func TestApplyApprovedGrooming_ReturnsBeforeApplyFinishes(t *testing.T) {
+	f := newGroomingApplyFixture(t, groomingApplyOpts{})
+	release := make(chan struct{})
+	f.mutator.release = release
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
+	bound := timescale.D(2 * time.Second)
 	done := make(chan struct{})
 	go func() {
 		f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
@@ -1286,26 +1348,231 @@ func TestApplyApprovedGrooming_BoundedContext(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(budget * 8):
-		t.Fatal("applyApprovedGrooming did not return within 8x its budget; a wedged forge is holding the approve request open")
+	case <-time.After(bound):
+		close(release)
+		t.Fatal("applyApprovedGrooming did not return while the forge was parked; the apply is not detached from the approve request")
 	}
 
-	// The wedged candidates are RECORDED, not silently dropped.
+	// The apply is IN FLIGHT: the first candidate parks in the mutator (the
+	// goroutine reaches it asynchronously — poll at an unscaled 20ms up to the
+	// bound), the started row stands, and no completed row has landed.
+	deadline := time.Now().Add(bound)
+	for len(f.mutator.dialedEntryIDs()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 1 {
+		t.Errorf("dialed = %v, want exactly the parked first dispatch", dialed)
+	}
+	if n := len(f.rowsOfCategory(workmgmt.GroomingApplyCompletedCategory)); n != 0 {
+		t.Errorf("grooming_apply_completed rows = %d before release, want 0", n)
+	}
+	started := f.startedRows(t)
+	if len(started) != 1 {
+		t.Fatalf("grooming_apply_started rows = %d, want exactly 1", len(started))
+	}
+	wantN := workmgmt.GroomingCandidateCount(f.report)
+	if started[0].CandidateCount != wantN || wantN != 6 {
+		t.Errorf("started.candidate_count = %d, want %d (one per report entry)", started[0].CandidateCount, wantN)
+	}
+	if want := int(groomingApplyBudgetFor(wantN) / time.Second); started[0].BudgetSeconds != want {
+		t.Errorf("started.budget_seconds = %d, want %d", started[0].BudgetSeconds, want)
+	}
+	if started[0].StartedAt == "" {
+		t.Error("started.started_at is empty")
+	}
+
+	close(release)
+	f.server.waitGroomingApply()
+	if n := len(f.rowsOfCategory(workmgmt.GroomingApplyCompletedCategory)); n != 1 {
+		t.Errorf("grooming_apply_completed rows = %d after release, want 1", n)
+	}
+	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 2 {
+		t.Errorf("dialed = %v after release, want both hygiene-class entries", dialed)
+	}
+}
+
+// TestApplyApprovedGrooming_OverBudget_EveryEntryAudited is the issue's
+// DONE-MEANS test (E54.77 / #3232), under an audit fake that HONOURS ctx like
+// the production repository: the budget is shrunk to the floor (per-candidate
+// scale zeroed), the forge wedges past it, and afterwards EVERY entry has
+// exactly one grooming_mutation_applied row — the wedged one `failed`, every
+// never-dialed one `skipped`/apply_budget_exhausted — plus exactly one
+// grooming_apply_completed row whose counts sum to the entry count and whose
+// budget_exhausted names the tail. COUNTERFACTUAL (run, not reasoned): revert
+// workmgmt's per-write auditWriteCtx to the raw apply ctx → the ctx-honouring
+// fake refuses every post-budget write → rows < entries and no completed row.
+func TestApplyApprovedGrooming_OverBudget_EveryEntryAudited(t *testing.T) {
+	budget := timescale.D(150 * time.Millisecond)
+	prevFloor, prevPer := groomingApplyBudget, groomingApplyPerCandidateBudget
+	groomingApplyBudget, groomingApplyPerCandidateBudget = budget, 0
+	t.Cleanup(func() { groomingApplyBudget, groomingApplyPerCandidateBudget = prevFloor, prevPer })
+
+	// Every dispatch wedges an order of magnitude past the budget, so the
+	// budget — not the sleep — is what releases the first one, and nothing
+	// after it may be dialed at all.
+	f := newGroomingApplyFixture(t, groomingApplyOpts{mutatorBlock: budget * 10})
+	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
+
+	f.apply(t, approval.DecisionApprove)
+
+	entries := workmgmt.GroomingCandidateCount(f.report)
+	rows := f.rowsOfCategory(workmgmt.GroomingMutationAppliedCategory)
+	if len(rows) != entries {
+		t.Errorf("grooming_mutation_applied rows = %d, want %d (one per entry, budget expiry or not); trail=%v",
+			len(rows), entries, f.groomingAuditCategories())
+	}
 	recs := f.mutationRecords(t)
-	for _, id := range []string{f.ids.hygiene, f.ids.dependency} {
-		if _, ok := recs[id]; !ok {
-			t.Errorf("no grooming_mutation_applied row for %q; a budget expiry must still audit every candidate", id)
+	if len(recs) != len(rows) {
+		t.Errorf("distinct entry ids = %d over %d rows; an entry was recorded twice", len(recs), len(rows))
+	}
+	dialed := f.mutator.dialedEntryIDs()
+	if len(dialed) != 1 {
+		t.Fatalf("dialed = %v, want exactly the one wedged dispatch", dialed)
+	}
+	if rec := recs[dialed[0]]; rec.Outcome != workmgmt.GroomingOutcomeFailed {
+		t.Errorf("wedged %q outcome = %q, want failed", dialed[0], rec.Outcome)
+	}
+	exhausted := 0
+	for id, rec := range recs {
+		if rec.SkipReason == workmgmt.GroomingSkipApplyBudgetExhausted {
+			exhausted++
+			if rec.Outcome != workmgmt.GroomingOutcomeSkipped {
+				t.Errorf("%q: apply_budget_exhausted with outcome %q, want skipped", id, rec.Outcome)
+			}
 		}
 	}
+	// The wedged dispatch is the FIRST dialed hygiene-class candidate; every
+	// candidate the loop reaches after the budget expires — dialable or not —
+	// is exhausted, and nothing else was dialed.
+	if exhausted == 0 {
+		t.Error("no entry recorded apply_budget_exhausted; the over-budget tail was evaluated instead of skipped")
+	}
+	completed := f.rowsOfCategory(workmgmt.GroomingApplyCompletedCategory)
+	if len(completed) != 1 {
+		t.Fatalf("grooming_apply_completed rows = %d, want exactly 1", len(completed))
+	}
+	var sum workmgmt.GroomingApplySummary
+	if err := json.Unmarshal(completed[0].Payload, &sum); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if got := sum.Applied + sum.Failed + sum.Skipped + sum.Refused; got != entries {
+		t.Errorf("summary counts sum to %d, want %d: %+v", got, entries, sum)
+	}
+	if sum.BudgetExhausted != exhausted {
+		t.Errorf("summary.budget_exhausted = %d, want %d (the apply_budget_exhausted rows)", sum.BudgetExhausted, exhausted)
+	}
+	if sum.Failed != 1 {
+		t.Errorf("summary.failed = %d, want 1 (the wedged dispatch)", sum.Failed)
+	}
+	if len(sum.AuditErrors) != 0 {
+		t.Errorf("summary.audit_errors = %v, want none — every write ran on a live per-write context", sum.AuditErrors)
+	}
+}
+
+// TestGroomingApplyBudgetFor pins the pure budget: the floor at or below
+// floor/per-candidate entries, n*per-candidate above.
+func TestGroomingApplyBudgetFor(t *testing.T) {
+	prevFloor, prevPer := groomingApplyBudget, groomingApplyPerCandidateBudget
+	groomingApplyBudget, groomingApplyPerCandidateBudget = 3*time.Minute, 3*time.Second
+	t.Cleanup(func() { groomingApplyBudget, groomingApplyPerCandidateBudget = prevFloor, prevPer })
+	cases := []struct {
+		n    int
+		want time.Duration
+	}{
+		{0, 3 * time.Minute},
+		{1, 3 * time.Minute},
+		{60, 3 * time.Minute},
+		{61, 183 * time.Second},
+		{215, 645 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := groomingApplyBudgetFor(tc.n); got != tc.want {
+			t.Errorf("groomingApplyBudgetFor(%d) = %v, want %v", tc.n, got, tc.want)
+		}
+	}
+}
+
+// TestApplyApprovedGrooming_PrelaunchTimeout_DegradesNamed pins the prelaunch
+// bound (approval condition 2): the audit fake wedges the window-watermark
+// append until ctx is done, the hook returns within a timescale.D bound, the
+// degrade names grooming_apply_prelaunch_timeout, nothing is dispatched and NO
+// grooming_apply_started row stands. COUNTERFACTUAL: derive the synchronous
+// ctx without the WithTimeout → the wedged append never releases → the
+// bounded-return select goes red.
+func TestApplyApprovedGrooming_PrelaunchTimeout_DegradesNamed(t *testing.T) {
+	budget := timescale.D(150 * time.Millisecond)
+	prev := groomingApplyPrelaunchBudget
+	groomingApplyPrelaunchBudget = budget
+	t.Cleanup(func() { groomingApplyPrelaunchBudget = prev })
+
+	f := newGroomingApplyFixture(t, groomingApplyOpts{})
+	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
+	f.audit.wedgeCategories = map[string]bool{audit.GroomingApplyWindowClosedCategory: true}
+
+	done := make(chan struct{})
+	go func() {
+		f.apply(t, approval.DecisionApprove)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(budget * 20):
+		t.Fatal("applyApprovedGrooming did not return within 20x the prelaunch budget; a stalled database is holding the approve request open")
+	}
+
+	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
+		t.Errorf("dialed = %v, want 0 — a prelaunch timeout launches nothing", dialed)
+	}
+	if n := len(f.rowsOfCategory(groomingApplyStartedCategory)); n != 0 {
+		t.Errorf("grooming_apply_started rows = %d, want 0 on a prelaunch timeout", n)
+	}
+	if got := f.degradeReason(t); got != groomingApplyPrelaunchTimeout {
+		t.Errorf("degrade_reason = %q, want %q", got, groomingApplyPrelaunchTimeout)
+	}
+}
+
+// TestServer_ShutdownDrainsDetachedGroomingApply pins the Shutdown drain: with
+// the forge parked, Shutdown does not return before the apply is released, and
+// once released it returns with the completed row in place. COUNTERFACTUAL:
+// drop bgGroomingApply.Wait() from Shutdown → Shutdown returns while the apply
+// is still parked → the "has not returned" select goes red.
+func TestServer_ShutdownDrainsDetachedGroomingApply(t *testing.T) {
+	f := newGroomingApplyFixture(t, groomingApplyOpts{})
+	release := make(chan struct{})
+	f.mutator.release = release
+	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
+	f.server.cfg.ShutdownTimeout = timescale.D(10 * time.Second)
+
+	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+
+	shut := make(chan error, 1)
+	go func() { shut <- f.server.Shutdown(context.Background()) }()
+	select {
+	case err := <-shut:
+		close(release)
+		t.Fatalf("Shutdown returned (%v) while the detached apply was still parked; it must drain bgGroomingApply", err)
+	case <-time.After(timescale.D(300 * time.Millisecond)):
+	}
+
+	close(release)
+	select {
+	case <-shut:
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("Shutdown did not return after the apply was released")
+	}
 	if n := len(f.rowsOfCategory(workmgmt.GroomingApplyCompletedCategory)); n != 1 {
-		t.Errorf("grooming_apply_completed rows = %d, want 1", n)
+		t.Errorf("grooming_apply_completed rows = %d after Shutdown, want 1", n)
 	}
 }
 
 // TestApplyApprovedGrooming_DetachedFromRequestCancellation is the other half of
 // the context construction: cancelling the CALLER's context (an operator's
-// client disconnecting mid-approve) must not strand a half-applied report.
-// context.WithoutCancel is what makes the apply run to completion.
+// client disconnecting mid-approve) must not strand the settlement or a
+// half-applied report. With the ctx-HONOURING audit fake this genuinely proves
+// it: the context.WithoutCancel at hook ENTRY is what lets the window
+// settlement, the started row and the apply land on a dead request ctx.
+// COUNTERFACTUAL: delete the WithoutCancel at entry → the settlement append
+// returns context.Canceled → degrade window_unsettled → dialed 0 → red.
 func TestApplyApprovedGrooming_DetachedFromRequestCancellation(t *testing.T) {
 	f := newGroomingApplyFixture(t, groomingApplyOpts{})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
@@ -1313,10 +1580,16 @@ func TestApplyApprovedGrooming_DetachedFromRequestCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already dead before the hook runs
 
-	f.server.applyApprovedGrooming(ctx, f.stage, approval.DecisionApprove)
+	f.applyCtx(t, ctx, approval.DecisionApprove)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 2 {
-		t.Errorf("dialed = %v, want 2 — a cancelled request context must not abort the apply", dialed)
+		t.Errorf("dialed = %v, want 2 — a cancelled request context must not abort the apply; trail=%v", dialed, f.groomingAuditCategories())
+	}
+	if rows := f.windowRows(t); len(rows) != 1 {
+		t.Errorf("window rows = %d, want 1 — the settlement must land on a dead request ctx", len(rows))
+	}
+	if n := len(f.rowsOfCategory(groomingApplyStartedCategory)); n != 1 {
+		t.Errorf("grooming_apply_started rows = %d, want 1", n)
 	}
 }
 
@@ -1337,13 +1610,13 @@ func TestApplyApprovedGrooming_AuditSinkErrorSurfaced(t *testing.T) {
 		workmgmt.GroomingApplyCompletedCategory:  true,
 	}
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 2 {
 		t.Errorf("dialed = %v, want 2 — an audit-sink failure must not abort the apply", dialed)
 	}
-	if rows := f.groomingAudit(); len(rows) != 0 {
-		t.Errorf("grooming audit rows = %d, want 0 — the sink was failing throughout", len(rows))
+	if got := f.groomingAuditCategories(); len(got) != 1 || got[0] != groomingApplyStartedCategory {
+		t.Errorf("grooming audit trail = %v, want only the started row — the per-mutation sink was failing throughout", got)
 	}
 }
 
@@ -1366,7 +1639,7 @@ func TestApplyApprovedGrooming_WindowUnsettledDegrade(t *testing.T) {
 		audit.GroomingApplyWindowClosedCategory: true,
 	}
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	if dialed := f.mutator.dialedEntryIDs(); len(dialed) != 0 {
 		t.Errorf("dialed = %v, want 0 — a failed window settlement must not dispatch", dialed)
@@ -1376,6 +1649,9 @@ func TestApplyApprovedGrooming_WindowUnsettledDegrade(t *testing.T) {
 	}
 	if got := f.degradeReason(t); got != groomingApplyWindowUnsettled {
 		t.Errorf("degrade_reason = %q, want %q", got, groomingApplyWindowUnsettled)
+	}
+	if n := len(f.rowsOfCategory(groomingApplyStartedCategory)); n != 0 {
+		t.Errorf("grooming_apply_started rows = %d, want 0 — a degrade path launches no apply and records no start", n)
 	}
 }
 
@@ -1387,7 +1663,7 @@ func TestGroomingApplyAuditSink_MarshalsBare(t *testing.T) {
 	f := newGroomingApplyFixture(t, groomingApplyOpts{})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	rows := f.rowsOfCategory(workmgmt.GroomingMutationAppliedCategory)
 	if len(rows) == 0 {
@@ -1570,6 +1846,9 @@ func TestApproveGroomStage_AppliesHygieneAndAuditsEndToEnd(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("approve status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
+	// The apply is DETACHED from the approve request (E54.77 / #3232): wait for
+	// it before reading the rows it writes.
+	s.waitGroomingApply()
 
 	// (1) The provider was dialed for EXACTLY the hygiene-class entry ids.
 	dialed := mut.dialedEntryIDs()
@@ -1718,6 +1997,9 @@ func TestApproveGroomStage_DelegationTierLabelNotApplied(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("approve status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
+	// The apply is DETACHED from the approve request (E54.77 / #3232): wait for
+	// it before reading the rows it writes.
+	s.waitGroomingApply()
 
 	// (a) The provider was NOT dialed for the tier entry — and WAS for the
 	// clerical hygiene entry beside it, so this is a refusal and not a
@@ -1822,7 +2104,7 @@ func TestApplyApprovedGrooming_RefusedIDsReachTheCompletedPayload(t *testing.T) 
 	f := newGroomingApplyFixture(t, groomingApplyOpts{mutatorRefusal: "not on board"})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	rows := f.rowsOfCategory(workmgmt.GroomingApplyCompletedCategory)
 	if len(rows) != 1 {
@@ -1892,7 +2174,7 @@ func TestApplyApprovedGrooming_DegradePayloadCarriesRefusedZero(t *testing.T) {
 	f := newGroomingApplyFixture(t, groomingApplyOpts{badReport: true})
 	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
 
-	f.server.applyApprovedGrooming(context.Background(), f.stage, approval.DecisionApprove)
+	f.apply(t, approval.DecisionApprove)
 
 	rows := f.rowsOfCategory(workmgmt.GroomingApplyCompletedCategory)
 	if len(rows) != 1 {
@@ -2398,5 +2680,363 @@ func TestGroomingPartialWriteEvidenceCrossesTheAuditSeam(t *testing.T) {
 	if fx.addItems != addsBefore {
 		t.Errorf("AddItem calls = %d, want %d (the resume must not re-add an already-boarded card)",
 			fx.addItems, addsBefore)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cross-boundary goldens (E54.77 / #3232, approval condition 1)
+// ---------------------------------------------------------------------------
+
+// groomingApplyGoldenDir is the golden fixture directory shared with mcpserver.
+// The three payloads cross the server→mcpserver boundary WITH NO SHARED TYPE,
+// so each file's bytes are produced by marshalling the SERVER's real payload
+// struct and mcpserver LOADS its fixtures from these files: a key rename on
+// either side reddens a test. Regenerate with
+// FISHHAWK_UPDATE_GOLDENS=1 scripts/test single -run TestGroomingApplyGoldens ./backend/internal/server/.
+const groomingApplyGoldenDir = "../audit/testdata/grooming_apply"
+
+// groomingApplyGoldens returns the three golden payloads, keyed by category,
+// built from the server's real payload structs with fixed values: a started
+// row, a mutation row skipped with apply_budget_exhausted, and a completed
+// summary carrying a non-zero budget_exhausted count. Every entry id is the
+// one plan.GroomingEntryID DERIVES for the hygiene defect on issue #N of
+// groomingApplyRepo — the ids a real run over groomingApplyGoldenReport
+// writes — so the pgtest can compare persisted rows to these files exactly.
+func groomingApplyGoldens() map[string]any {
+	hygieneID := func(n int) string {
+		return plan.GroomingEntryID(plan.GroomingClassHygiene, "missing_label_namespace", groomingApplyRef(n))
+	}
+	return map[string]any{
+		groomingApplyStartedCategory: groomingApplyStartedPayload{
+			CandidateCount: 4, BudgetSeconds: 180, StartedAt: "2026-09-20T12:00:00Z",
+		},
+		workmgmt.GroomingMutationAppliedCategory: workmgmt.GroomingMutationRecord{
+			EntryID:     hygieneID(4),
+			Class:       "hygiene",
+			ReportClass: "hygiene",
+			Kind:        workmgmt.GroomingKindLabelSet,
+			After:       workmgmt.GroomingValue{List: []string{"area:api"}},
+			Outcome:     workmgmt.GroomingOutcomeSkipped,
+			SkipReason:  workmgmt.GroomingSkipApplyBudgetExhausted,
+		},
+		workmgmt.GroomingApplyCompletedCategory: workmgmt.GroomingApplySummary{
+			Applied: 0, Failed: 1, Skipped: 3, Refused: 0, BudgetExhausted: 3,
+			FailedIDs:  []string{hygieneID(1)},
+			SkippedIDs: []string{hygieneID(2), hygieneID(3), hygieneID(4)},
+		},
+	}
+}
+
+func groomingApplyGoldenPath(category string) string {
+	return filepath.Join(groomingApplyGoldenDir, category+".json")
+}
+
+// TestGroomingApplyGoldens_MatchServerPayloadStructs pins the golden bytes to
+// the server's structs: marshalling each fixed payload must reproduce the
+// committed file byte-for-byte. A key rename in groomingApplyStartedPayload,
+// workmgmt.GroomingMutationRecord or workmgmt.GroomingApplySummary fails
+// here; regenerating the goldens then reddens mcpserver's loaded fixtures.
+func TestGroomingApplyGoldens_MatchServerPayloadStructs(t *testing.T) {
+	update := os.Getenv("FISHHAWK_UPDATE_GOLDENS") == "1"
+	for category, payload := range groomingApplyGoldens() {
+		want, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			t.Fatalf("marshal %s golden: %v", category, err)
+		}
+		want = append(want, '\n')
+		path := groomingApplyGoldenPath(category)
+		if update {
+			if err := os.WriteFile(path, want, 0o644); err != nil {
+				t.Fatalf("write %s: %v", path, err)
+			}
+			continue
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read golden %s: %v (regenerate with FISHHAWK_UPDATE_GOLDENS=1)", path, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("golden %s is not the server struct's marshal output; regenerate with FISHHAWK_UPDATE_GOLDENS=1 and re-run mcpserver's loaded fixtures.\n got: %s\nwant: %s", path, got, want)
+		}
+	}
+}
+
+// groomingApplyGoldenReport builds the report the goldens were AUTHORED
+// against: four hygiene defects on issues #1..#4 of groomingApplyRepo, each
+// carrying the structured fix {labels: [area:api]}. Driven through the real
+// hook with every dispatch wedged on the apply context, it settles
+// deterministically — #1 is dispatched and fails on the expired context, #2..#4
+// are skipped apply_budget_exhausted — which is exactly the shape the completed
+// golden and the mutation golden (#4) encode, so the pgtest below can compare
+// the persisted rows to the goldens VALUE-FOR-VALUE rather than by key set.
+//
+// ONE structural addition the goldens do not carry: the report schema REQUIRES
+// a non-empty ordering, and an ordering entry derives a rank_set candidate
+// (deriveGroomingMutations), so a schema-valid report always has one more
+// candidate than the four the goldens were authored with. It is the LAST
+// derived candidate (hygiene derives first) and is therefore also exhausted;
+// the second return value is its entry id, which the pgtest subtracts by name —
+// asserting its exact contribution to the counts — and nothing else.
+//
+// The hygiene ids are the ones plan.GroomingEntryID derives for #1..#4 — the
+// same ids groomingApplyGoldens carries; the second return value is the
+// ordering entry's.
+func groomingApplyGoldenReport() (report *plan.GroomingReport, orderingID string) {
+	ordered := groomingApplyRef(1)
+	orderingID = plan.GroomingEntryID(plan.GroomingClassOrdering, "", ordered)
+	report = &plan.GroomingReport{
+		Kind:          "grooming_report",
+		ReportVersion: "grooming_report_v1",
+		TicketReference: plan.TicketReference{
+			Type: plan.TicketType("github_issue"), ID: groomingApplyRepo + "#2822",
+			URL: "https://github.com/" + groomingApplyRepo + "/issues/2822",
+		},
+		GeneratedBy: plan.GeneratedBy{
+			Agent: "test", Model: "test-model",
+			Timestamp: time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC),
+		},
+		Summary: "four hygiene defects, the golden shape",
+		Ordering: []plan.OrderingEntry{{
+			ID: orderingID, ItemRef: ordered, Rank: 1, Score: 90,
+			RubricCitations: []plan.RubricCitation{{RubricID: "V1"}},
+		}},
+		// The schema wants every other class array present, empty not null.
+		Duplicates:               []plan.DuplicateCandidate{},
+		DependencyEdges:          []plan.DependencyEdge{},
+		VisionDrift:              []plan.VisionDriftFlag{},
+		DecompositionSuggestions: []plan.DecompositionSuggestion{},
+	}
+	for n := 1; n <= 4; n++ {
+		ref := groomingApplyRef(n)
+		report.HygieneDefects = append(report.HygieneDefects, plan.HygieneDefect{
+			ID: plan.GroomingEntryID(plan.GroomingClassHygiene, "missing_label_namespace", ref), ItemRef: ref,
+			Defect: "missing_label_namespace", Detail: "no area: label",
+			SuggestedFix: "attach the area label",
+			Fix:          &plan.HygieneFix{Labels: []string{"area:api"}},
+		})
+	}
+	return report, orderingID
+}
+
+// decodeGoldenStrict decodes raw into a fresh T, refusing any key T does not
+// declare — so a key the writer emits that the golden's struct lacks (or a
+// golden key the struct renamed away) fails here, before any value comparison.
+func decodeGoldenStrict[T any](t *testing.T, label, category string, raw []byte) T {
+	t.Helper()
+	var v T
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("%s %s does not decode into %T: %v\n%s", label, category, v, err, raw)
+	}
+	return v
+}
+
+// assertDecodeEqualToGolden asserts a written audit payload DECODE-EQUALS the
+// category's golden: both decode strictly (no unknown keys) into the SAME
+// server struct type T, and the two values must then be reflect.DeepEqual —
+// every contract-bearing value (counts, ids, outcome, skip_reason, kind,
+// before/after) is compared, not just the key set. Variable fields are
+// accounted for EXPLICITLY: normalize, when non-nil, receives the decoded row
+// and the decoded golden, asserts each run-dependent field's own invariant
+// (a parseable timestamp, the budget the test configured) and then copies the
+// golden's value over it, so nothing else escapes the equality. A nil
+// normalize means the category has no variable fields and the row must equal
+// the golden outright.
+func assertDecodeEqualToGolden[T any](t *testing.T, category string, row []byte, normalize func(t *testing.T, got, golden *T)) {
+	t.Helper()
+	raw, err := os.ReadFile(groomingApplyGoldenPath(category))
+	if err != nil {
+		t.Fatalf("read golden for %s: %v", category, err)
+	}
+	golden := decodeGoldenStrict[T](t, "golden", category, raw)
+	got := decodeGoldenStrict[T](t, "written row", category, row)
+	if normalize != nil {
+		normalize(t, &got, &golden)
+	}
+	if !reflect.DeepEqual(got, golden) {
+		gotJSON, _ := json.MarshalIndent(got, "", "  ")
+		goldenJSON, _ := json.MarshalIndent(golden, "", "  ")
+		t.Errorf("written %s row is not value-equal to its golden (after normalising the declared variable fields)\n got: %s\nwant: %s", category, gotJSON, goldenJSON)
+	}
+}
+
+// TestApproveGroomStage_OverBudgetRowsDecodeEqualToGoldens is the pgtest half
+// of approval condition 1: an over-budget apply driven through the REAL
+// approve handler and the REAL Postgres audit repository (which honours ctx)
+// writes a grooming_apply_started row, one grooming_mutation_applied row per
+// entry (the tail skipped apply_budget_exhausted) and one
+// grooming_apply_completed row with budget_exhausted set — and each of the
+// three decode-equals its golden VALUE-FOR-VALUE through the server's struct
+// type. The report is groomingApplyGoldenReport, the shape the goldens were
+// authored against, so every departure from the goldens is NAMED and asserted
+// before it is normalised away: the started row's timestamp and budget_seconds
+// (the test budget is sub-second; the golden carries the production 180s), and
+// the schema-mandated ordering candidate the goldens do not carry (one more
+// candidate, one more exhausted skip — see groomingApplyGoldenReport).
+func TestApproveGroomStage_OverBudgetRowsDecodeEqualToGoldens(t *testing.T) {
+	// Wide enough that the prelaunch DB work (ratification, window settlement,
+	// the started append) cannot plausibly consume the budget before #1 is
+	// dispatched — #1 must FAIL on the expired context, not be exhausted, for
+	// the completed golden's failed/skipped split to hold.
+	budget := timescale.D(400 * time.Millisecond)
+	prevFloor, prevPer := groomingApplyBudget, groomingApplyPerCandidateBudget
+	groomingApplyBudget, groomingApplyPerCandidateBudget = budget, 0
+	t.Cleanup(func() { groomingApplyBudget, groomingApplyPerCandidateBudget = prevFloor, prevPer })
+
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := run.NewPostgresRepository(pool)
+	artRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	apprRepo := approval.NewPostgresRepository(pool)
+
+	rn, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: groomingApplyRepo, WorkflowID: "backlog_grooming", WorkflowSHA: "abc",
+		TriggerSource: run.TriggerCLI, WorkflowSpec: []byte(groomingApplySpec),
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stage, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID: rn.ID, Sequence: 0, Type: run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("create groom stage: %v", err)
+	}
+	if _, err := runRepo.TransitionStage(ctx, stage.ID, run.StageStateAwaitingApproval, nil); err != nil {
+		t.Fatalf("park stage: %v", err)
+	}
+	report, orderingID := groomingApplyGoldenReport()
+	sv := "grooming_report_v1"
+	if _, err := artRepo.Create(ctx, artifact.CreateParams{
+		StageID: stage.ID, Kind: artifact.KindGroomingReport, SchemaVersion: &sv,
+		Content: groomingApplyReportJSON(t, report),
+	}); err != nil {
+		t.Fatalf("create artifact: %v", err)
+	}
+
+	mut := &groomingApplyMutator{block: budget * 10}
+	rdr := &groomingApplyReader{}
+	prevConv, prevMut, prevRdr := conventionsLoader, groomingMutatorFor, groomingReaderFor
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		return workmgmt.Conventions{Provider: "github", States: map[string]string{
+			workmgmt.CanonicalStateBacklog: "Backlog", workmgmt.CanonicalStateUpNext: "Up Next",
+		}}, nil
+	}
+	groomingMutatorFor = func(string) (workmgmt.GroomingMutator, error) { return mut, nil }
+	groomingReaderFor = func(string) (workmgmt.WorkItemReader, error) { return rdr, nil }
+	t.Cleanup(func() {
+		conventionsLoader, groomingMutatorFor, groomingReaderFor = prevConv, prevMut, prevRdr
+	})
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: runRepo, ArtifactRepo: artRepo,
+		AuditRepo: auditRepo, ApprovalRepo: apprRepo,
+	})
+	approvedAt := time.Now().UTC()
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"over budget"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	s.waitGroomingApply()
+	settledAt := time.Now().UTC()
+
+	entries := workmgmt.GroomingCandidateCount(report)
+	started, err := auditRepo.ListForRunByCategory(ctx, rn.ID, groomingApplyStartedCategory)
+	if err != nil || len(started) != 1 {
+		t.Fatalf("grooming_apply_started rows = %d (err %v), want 1", len(started), err)
+	}
+	assertDecodeEqualToGolden(t, groomingApplyStartedCategory, started[0].Payload,
+		func(t *testing.T, got, golden *groomingApplyStartedPayload) {
+			// candidate_count: the goldens' four plus the schema-mandated
+			// ordering candidate. Pin it to the report's real derivation, then
+			// normalise.
+			if got.CandidateCount != entries || entries != golden.CandidateCount+1 {
+				t.Errorf("candidate_count = %d, want %d (the golden's %d hygiene candidates + the ordering candidate)", got.CandidateCount, entries, golden.CandidateCount)
+			}
+			got.CandidateCount = golden.CandidateCount
+			// started_at: run-dependent; must be an RFC3339 UTC instant stamped
+			// between the approve request and the apply settling.
+			at, perr := time.Parse(time.RFC3339Nano, got.StartedAt)
+			if perr != nil {
+				t.Errorf("started_at %q does not parse as RFC3339Nano: %v", got.StartedAt, perr)
+			} else if at.Before(approvedAt.Add(-time.Second)) || at.After(settledAt.Add(time.Second)) {
+				t.Errorf("started_at %s is outside the approve→settle window [%s, %s]", at, approvedAt, settledAt)
+			}
+			got.StartedAt = golden.StartedAt
+			// budget_seconds: the test shrinks the budget below one second; the
+			// golden carries the production 180s. Pin the row to the configured
+			// budget, then normalise.
+			if want := int(budget / time.Second); got.BudgetSeconds != want {
+				t.Errorf("budget_seconds = %d, want %d (the configured test budget)", got.BudgetSeconds, want)
+			}
+			got.BudgetSeconds = golden.BudgetSeconds
+		})
+
+	mutations, err := auditRepo.ListForRunByCategory(ctx, rn.ID, workmgmt.GroomingMutationAppliedCategory)
+	if err != nil {
+		t.Fatalf("list mutation rows: %v", err)
+	}
+	if len(mutations) != entries {
+		t.Errorf("grooming_mutation_applied rows = %d, want %d (one per entry)", len(mutations), entries)
+	}
+	// The mutation golden is the row for #4 — the last HYGIENE candidate,
+	// exhausted without ever being evaluated (no read, so before is empty).
+	// Find the persisted row carrying #4's id and compare it OUTRIGHT: a
+	// mutation row has no run-dependent field, so normalize is nil and every
+	// value — entry_id, class, kind, before/after, outcome, skip_reason — must
+	// equal the golden's.
+	goldenMutation := groomingApplyGoldens()[workmgmt.GroomingMutationAppliedCategory].(workmgmt.GroomingMutationRecord)
+	exhaustedRows, goldenRowSeen := 0, 0
+	for _, e := range mutations {
+		var rec workmgmt.GroomingMutationRecord
+		if err := json.Unmarshal(e.Payload, &rec); err != nil {
+			t.Fatalf("decode mutation: %v", err)
+		}
+		if rec.SkipReason == workmgmt.GroomingSkipApplyBudgetExhausted {
+			exhaustedRows++
+		}
+		if rec.EntryID == goldenMutation.EntryID {
+			goldenRowSeen++
+			assertDecodeEqualToGolden[workmgmt.GroomingMutationRecord](t, workmgmt.GroomingMutationAppliedCategory, e.Payload, nil)
+		}
+	}
+	if goldenRowSeen != 1 {
+		t.Fatalf("grooming_mutation_applied rows for %q = %d, want exactly 1 (the golden's row)", goldenMutation.EntryID, goldenRowSeen)
+	}
+	if exhaustedRows == 0 {
+		t.Fatal("no grooming_mutation_applied row skipped apply_budget_exhausted; the golden's arm was not exercised")
+	}
+
+	// The completed golden encodes the whole settlement — #1 failed on the
+	// expired context, #2..#4 exhausted. The persisted row additionally carries
+	// the schema-mandated ordering candidate, exhausted LAST: assert exactly
+	// that contribution (one trailing skipped id, +1 skipped, +1
+	// budget_exhausted), subtract it, and compare everything else — failed_ids
+	// and the remaining skipped_ids included — outright.
+	completed, err := auditRepo.ListForRunByCategory(ctx, rn.ID, workmgmt.GroomingApplyCompletedCategory)
+	if err != nil || len(completed) != 1 {
+		t.Fatalf("grooming_apply_completed rows = %d (err %v), want 1", len(completed), err)
+	}
+	assertDecodeEqualToGolden(t, workmgmt.GroomingApplyCompletedCategory, completed[0].Payload,
+		func(t *testing.T, got, golden *workmgmt.GroomingApplySummary) {
+			n := len(got.SkippedIDs)
+			if n == 0 || got.SkippedIDs[n-1] != orderingID {
+				t.Fatalf("skipped_ids = %v, want the ordering candidate %q exhausted last", got.SkippedIDs, orderingID)
+			}
+			got.SkippedIDs = got.SkippedIDs[:n-1]
+			if got.Skipped != golden.Skipped+1 || got.BudgetExhausted != golden.BudgetExhausted+1 {
+				t.Errorf("skipped/budget_exhausted = %d/%d, want the golden's %d/%d plus the ordering candidate", got.Skipped, got.BudgetExhausted, golden.Skipped, golden.BudgetExhausted)
+			}
+			got.Skipped, got.BudgetExhausted = golden.Skipped, golden.BudgetExhausted
+		})
+	var sum workmgmt.GroomingApplySummary
+	if err := json.Unmarshal(completed[0].Payload, &sum); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if sum.BudgetExhausted != exhaustedRows || sum.Applied+sum.Failed+sum.Skipped+sum.Refused != entries {
+		t.Errorf("summary = %+v, want budget_exhausted %d and counts summing to %d", sum, exhaustedRows, entries)
 	}
 }

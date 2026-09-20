@@ -2099,6 +2099,31 @@ func driveAction(run *Run, da *RunNextAction) SuggestedAction {
 // backend, not the reverse).
 const driveNextActionMergePR = "merge_pr"
 
+// foldGroomingApplyAdvisory PREPENDS a re-poll advisory while the detached
+// on-approval grooming apply is in flight (E54.77 / #3232). The approve request
+// returns once the capture window is settled, so an operator reading the
+// snapshot right after fishhawk_approve_plan sees a partial ledger; attesting
+// the confirm gate on that partial apply is the mistake this fold names. It
+// is a FOLD off the already-derived status block (no extra round-trip, no new
+// classifyNextActions parameter — the ~118 call sites are untouched) and a
+// no-op unless the block exists and is in_flight: a completed apply, an
+// omitted block or a nil next_actions leave the actions byte-identical.
+// Prepended, not appended, so it is the suggested default (actions[0]).
+func foldGroomingApplyAdvisory(run *Run, status *GroomingApplyStatus, na *NextActions) {
+	if run == nil || na == nil || status == nil || status.State != groomingApplyStateInFlight {
+		return
+	}
+	reason := fmt.Sprintf("grooming apply in flight: %d/%d recorded — re-poll until grooming_apply_status.state is completed, or fishhawk_await_audit on grooming_apply_completed; do not attest the confirm gate on a partial apply (an over-budget tail is recorded apply_budget_exhausted and resurfaces on the next grooming run)", status.Recorded, status.CandidateCount)
+	advisory := SuggestedAction{
+		Action:       "fishhawk_get_run_status",
+		Params:       map[string]string{"run_id": run.ID},
+		Precondition: "always legal (read-only); the detached grooming apply has a grooming_apply_started row and no grooming_apply_completed row after it yet",
+		Consumes:     consumesNone,
+		Reason:       reason,
+	}
+	na.Actions = append([]SuggestedAction{advisory}, na.Actions...)
+}
+
 // pollAction is the re-poll entry: always legal (read-only), carrying
 // the advertised cadence the wait contract suggests for the state.
 func pollAction(run *Run, intervalSeconds int, reason string) SuggestedAction {

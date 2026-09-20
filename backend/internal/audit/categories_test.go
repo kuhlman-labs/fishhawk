@@ -26,6 +26,7 @@ func TestIsKnownCategory(t *testing.T) {
 		"merge_verdict_recorded",   // E48.7 / #1954 operator merge-verdict chain entry
 		"grooming_report_recorded", // E54.3 / #2235 grooming_report ingest entry
 		"grooming_churn_filtered",  // E54.8 / #2240 churn-guard verdict entry
+		"grooming_apply_started",   // E54.77 / #3232 once-per-apply progress denominator
 		// E64.62 / #3202 bounded conflict-resolution pass: the trigger the
 		// rebase verb's 202 arm writes, and the failure that CONSUMES it.
 		"stage_conflict_resolution_triggered",

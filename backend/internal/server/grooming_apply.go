@@ -71,6 +71,23 @@ package server
 // fileOrLinkLiveValidationWalk, recordPlanPredictedRuntime): the gate already
 // passed and its approval row is in place, so nothing here ever unwinds the
 // approval.
+//
+// DETACHED AND BOUNDED, IN TWO HALVES (E54.77 / #3232). The hook detaches from
+// the request's cancellation at ENTRY (context.WithoutCancel), so a client
+// disconnect can strand neither the window settlement nor the apply. The
+// SYNCHRONOUS half — ratification, window settlement, input resolution and the
+// grooming_apply_started row — runs under groomingApplyPrelaunchBudget, so a
+// stalled database cannot hold the approve request open indefinitely; on
+// expiry it degrades with grooming_apply_prelaunch_timeout and writes NO
+// started row. The APPLY half then runs on a goroutine tracked by
+// Server.bgGroomingApply (drained by Shutdown) under a candidate-scaled budget
+// (groomingApplyBudgetFor), and the approve response returns as soon as the
+// goroutine is launched. Progress is observable from the audit trail: one
+// grooming_apply_started row (the denominator), one grooming_mutation_applied
+// row per candidate — an over-budget tail is recorded skipped with
+// apply_budget_exhausted rather than lost — and one grooming_apply_completed
+// row whose budget_exhausted count names that tail. An operator awaits
+// grooming_apply_completed (fishhawk_await_audit) before checking the forge.
 
 import (
 	"context"
@@ -100,15 +117,64 @@ var (
 	groomingReaderFor  = workmgmt.ReaderFor
 )
 
-// groomingApplyBudget bounds the detached apply. The hook runs SYNCHRONOUSLY on
-// the operator's approve request, so a wedged forge would otherwise hold that
-// request open; the apply is continue-and-report, so a candidate whose dispatch
-// exceeds the budget is recorded rather than retried.
-// It is a var, not a const, ONLY so a test can shrink it: the bounded-context
-// behaviour is a real failure mode (a wedged forge on the operator's approve
-// request) and a three-minute constant is untestable in a unit test. Production
-// never reassigns it.
+// groomingApplyBudget is the FLOOR of the detached apply's budget (E54.77 /
+// #3232); groomingApplyBudgetFor scales it by candidate count. The apply no
+// longer runs on the approve request — it runs on Server.bgGroomingApply — so
+// the budget bounds a wedged forge's hold on that goroutine, not on the
+// operator; the apply is continue-and-report, so a candidate whose dispatch
+// exceeds the budget is recorded failed and every candidate after it is
+// recorded skipped/apply_budget_exhausted rather than dialed on a dead context.
+// It is a var, not a const, ONLY so a test can shrink it: the over-budget
+// behaviour is a real failure mode and a three-minute constant is untestable
+// in a unit test. Production never reassigns it.
 var groomingApplyBudget = 3 * time.Minute
+
+// groomingApplyPerCandidateBudget is the per-candidate scale of the detached
+// apply's budget. The observed rate on run 2aa8c37e was ~1 mutation/s, so 3s
+// per candidate is a 3x margin; 215 candidates → ~10m45s, which holds no
+// request open because the apply is detached. A var so the over-budget test
+// can zero it and make the floor the whole budget.
+var groomingApplyPerCandidateBudget = 3 * time.Second
+
+// groomingApplyPrelaunchBudget bounds the SYNCHRONOUS half of the hook — the
+// part still on the operator's approve request: ratification, window
+// settlement, input resolution and the grooming_apply_started append. A
+// stalled database would otherwise hold the approve request open
+// indefinitely; on expiry the hook degrades with
+// grooming_apply_prelaunch_timeout and writes no started row. A var so a test
+// can shrink it; production never reassigns it.
+var groomingApplyPrelaunchBudget = 30 * time.Second
+
+// groomingApplyBudgetFor is the PURE budget for an apply over `candidates`
+// entries: the floor, or the per-candidate scale, whichever is larger.
+func groomingApplyBudgetFor(candidates int) time.Duration {
+	if candidates <= 0 {
+		return groomingApplyBudget
+	}
+	scaled := time.Duration(candidates) * groomingApplyPerCandidateBudget
+	if scaled > groomingApplyBudget {
+		return scaled
+	}
+	return groomingApplyBudget
+}
+
+// groomingApplyStartedCategory is the once-per-apply progress denominator
+// (E54.77 / #3232), written immediately before the detached apply starts.
+// Registered in audit.KnownCategories; the payload is groomingApplyStartedPayload.
+const groomingApplyStartedCategory = "grooming_apply_started"
+
+// groomingApplyStartedPayload is the grooming_apply_started row. It CROSSES A
+// MODULE BOUNDARY WITH NO SHARED TYPE: mcpserver decodes it by key name into
+// its GroomingApplyStatus block. The golden fixture
+// backend/internal/audit/testdata/grooming_apply/grooming_apply_started.json is
+// this struct's marshal output (TestGroomingApplyGoldens_MatchServerPayloadStructs
+// regenerates and pins it), and mcpserver's fixtures are LOADED from that file,
+// so a key rename on either side reddens a test.
+type groomingApplyStartedPayload struct {
+	CandidateCount int    `json:"candidate_count"`
+	BudgetSeconds  int    `json:"budget_seconds"`
+	StartedAt      string `json:"started_at"`
+}
 
 // The closed set of degrade reasons. Each names ONE rung of the resolution
 // ladder that could not produce an input, and each is carried on the
@@ -135,6 +201,16 @@ const (
 	// direction, since the alternative is resuming on unknown provenance. It
 	// never aborts the apply.
 	groomingApplyPriorStepsUnreadable = "grooming_apply_prior_steps_unreadable"
+
+	// groomingApplyPrelaunchTimeout names an expiry of groomingApplyPrelaunchBudget
+	// (E54.77 / #3232): the synchronous half of the hook — ratification,
+	// settlement, input resolution or the started append — did not finish in
+	// time, so nothing was dispatched and NO grooming_apply_started row stands.
+	// Whether the window closed depends on which step stalled: a settlement that
+	// timed out did not land its watermark (a later approve can settle it); a
+	// stall AFTER settlement leaves the window closed like any other
+	// post-ratification degrade.
+	groomingApplyPrelaunchTimeout = "grooming_apply_prelaunch_timeout"
 )
 
 // groomingApplyDegradePayload is the server-authored grooming_apply_completed
@@ -147,12 +223,13 @@ const (
 // path, so the churn guard's disposition baseline is unaffected and every entry
 // correctly resurfaces on the next grooming run.
 type groomingApplyDegradePayload struct {
-	Applied       int    `json:"applied"`
-	Failed        int    `json:"failed"`
-	Skipped       int    `json:"skipped"`
-	Refused       int    `json:"refused"`
-	Degraded      bool   `json:"degraded"`
-	DegradeReason string `json:"degrade_reason"`
+	Applied         int    `json:"applied"`
+	Failed          int    `json:"failed"`
+	Skipped         int    `json:"skipped"`
+	Refused         int    `json:"refused"`
+	BudgetExhausted int    `json:"budget_exhausted"`
+	Degraded        bool   `json:"degraded"`
+	DegradeReason   string `json:"degrade_reason"`
 }
 
 // consumedDisposition is one collapsed operator verdict consumed from the
@@ -511,6 +588,17 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 		return
 	}
 
+	// DETACH AT ENTRY (E54.77 / #3232): keep the request's values, drop its
+	// cancellation. With a ctx-honouring audit repository (the production one)
+	// a client disconnect would otherwise fail the window SETTLEMENT, not just
+	// the apply. Then BOUND the synchronous half: everything up to and
+	// including the started append runs under groomingApplyPrelaunchBudget so a
+	// stalled database cannot hold the approve request open indefinitely. The
+	// detached apply derives its own context from `base`, never from this one.
+	base := context.WithoutCancel(ctx)
+	ctx, prelaunchCancel := context.WithTimeout(base, groomingApplyPrelaunchBudget)
+	defer prelaunchCancel()
+
 	// C2 (early-out, NOT a control), EVALUATED BEFORE THE DECISION BRANCH: no
 	// grooming_report on this stage means an ordinary plan approval OR reject.
 	// Return having written nothing — a reject on an ordinary plan stage settles
@@ -522,7 +610,7 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 
 	sink := &groomingApplyAuditSink{s: s, runID: stage.RunID, stageID: stage.ID}
 	if degrade != "" {
-		s.degradeGroomingApply(ctx, sink, stage, degrade, "grooming report could not be parsed")
+		s.degradeGroomingApplyPrelaunch(ctx, sink, stage, degrade, "grooming report could not be parsed")
 		return
 	}
 
@@ -556,7 +644,7 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 	// introduce here.
 	approvals, aerr := s.cfg.ApprovalRepo.ListForStage(ctx, stage.ID)
 	if aerr != nil {
-		s.degradeGroomingApply(ctx, sink, stage, groomingApplyNotRatified, aerr.Error())
+		s.degradeGroomingApplyPrelaunch(ctx, sink, stage, groomingApplyNotRatified, aerr.Error())
 		return
 	}
 	grants, rejections := 0, 0
@@ -575,7 +663,7 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 		// PRE-RATIFICATION DEGRADE: nothing was decided, so the window is NOT
 		// closed — the gate may still settle, and closing here would permanently
 		// refuse a legitimate later capture (#2991).
-		s.degradeGroomingApply(ctx, sink, stage, groomingApplyNotRatified,
+		s.degradeGroomingApplyPrelaunch(ctx, sink, stage, groomingApplyNotRatified,
 			"the grooming gate is contested or ungranted; nothing applied")
 		return
 	}
@@ -590,7 +678,7 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 	if serr != nil {
 		// The watermark did not land, so nothing was consumed and the window is
 		// still open; a later approve can settle it.
-		s.degradeGroomingApply(ctx, sink, stage, groomingApplyWindowUnsettled, serr.Error())
+		s.degradeGroomingApplyPrelaunch(ctx, sink, stage, groomingApplyWindowUnsettled, serr.Error())
 		return
 	}
 	decisions, gateApproved := mergeGroomingDecisions(report, consumed)
@@ -599,29 +687,29 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 	// named reason with NO dispatch.
 	rn, rerr := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
 	if rerr != nil {
-		s.degradeGroomingApply(ctx, sink, stage, groomingApplyRunUnreadable, rerr.Error())
+		s.degradeGroomingApplyPrelaunch(ctx, sink, stage, groomingApplyRunUnreadable, rerr.Error())
 		return
 	}
 	owner, name, ok := splitRepoFullName(rn.Repo)
 	if !ok {
-		s.degradeGroomingApply(ctx, sink, stage, groomingApplyRepoUnresolvable, rn.Repo)
+		s.degradeGroomingApplyPrelaunch(ctx, sink, stage, groomingApplyRepoUnresolvable, rn.Repo)
 		return
 	}
 	conv, cerr := conventionsLoader(ctx, rn.Repo)
 	if cerr != nil {
-		s.degradeGroomingApply(ctx, sink, stage, groomingApplyConventionsUnavailable, cerr.Error())
+		s.degradeGroomingApplyPrelaunch(ctx, sink, stage, groomingApplyConventionsUnavailable, cerr.Error())
 		return
 	}
 	mutator, merr := groomingMutatorFor(conv.Provider)
 	if merr != nil {
-		s.degradeGroomingApply(ctx, sink, stage, groomingApplyMutatorUnavailable, merr.Error())
+		s.degradeGroomingApplyPrelaunch(ctx, sink, stage, groomingApplyMutatorUnavailable, merr.Error())
 		return
 	}
 	reader, rderr := groomingReaderFor(conv.Provider)
 	if rderr != nil {
 		// A nil reader would fail every observable candidate CLOSED one by one;
 		// refusing the whole apply here is the same verdict, named once.
-		s.degradeGroomingApply(ctx, sink, stage, groomingApplyReaderUnavailable, rderr.Error())
+		s.degradeGroomingApplyPrelaunch(ctx, sink, stage, groomingApplyReaderUnavailable, rderr.Error())
 		return
 	}
 
@@ -676,14 +764,52 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 		// than misrouting.
 	}
 
-	// DETACHED and BOUNDED (the acceptance_admission.go precedent).
-	// context.WithoutCancel keeps the request's values but drops its
-	// cancellation, so an operator's client disconnect cannot strand a
-	// half-applied report mid-loop; the timeout bounds a wedged forge so it
-	// cannot hold the approve request open.
-	applyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), groomingApplyBudget)
-	defer cancel()
+	// RECORD THE START (E54.77 / #3232): one grooming_apply_started row carrying
+	// the candidate count and the scaled budget — the denominator the run-status
+	// progress block reads. A failed append logs at Error and does NOT abort the
+	// apply (the mutations are the point; the status block degrades to omitted)
+	// — UNLESS the failure is the prelaunch budget expiring, which is the named
+	// degrade and launches nothing.
+	candidates := workmgmt.GroomingCandidateCount(report)
+	budget := groomingApplyBudgetFor(candidates)
+	if err := sink.append(ctx, groomingApplyStartedCategory, groomingApplyStartedPayload{
+		CandidateCount: candidates,
+		BudgetSeconds:  int(budget / time.Second),
+		StartedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		if ctx.Err() != nil {
+			s.degradeGroomingApplyPrelaunch(ctx, sink, stage, groomingApplyPrelaunchTimeout, err.Error())
+			return
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelError, "grooming apply: started marker not recorded; applying anyway",
+			slog.String("run_id", stage.RunID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+	}
 
+	// DETACHED and BOUNDED (the acceptance_admission.go precedent), now on a
+	// goroutine Shutdown drains. The apply context derives from `base` — the
+	// request's values with neither its cancellation nor the prelaunch deadline
+	// — bounded by the candidate-scaled budget. The goroutine closes over only
+	// already-resolved values (req, mutator, reader, sink, ids, budget), never
+	// the request; the approve response returns as soon as it is launched.
+	runID, stageID := stage.RunID, stage.ID
+	s.bgGroomingApply.Add(1)
+	go func() {
+		defer s.bgGroomingApply.Done()
+		applyCtx, cancel := context.WithTimeout(base, budget)
+		defer cancel()
+		s.runDetachedGroomingApply(applyCtx, runID, stageID, mutator, reader, sink, req)
+	}()
+}
+
+// runDetachedGroomingApply is the body of the detached apply goroutine: it runs
+// workmgmt.ApplyGrooming under applyCtx and logs the outcome. Every audit row
+// is written by the workmgmt layer through the sink (on per-write contexts that
+// survive applyCtx's expiry), so this function only logs.
+func (s *Server) runDetachedGroomingApply(applyCtx context.Context, runID, stageID uuid.UUID,
+	mutator workmgmt.GroomingMutator, reader workmgmt.WorkItemReader, sink workmgmt.GroomingAuditSink,
+	req workmgmt.GroomingApplyRequest) {
 	result, err := workmgmt.ApplyGrooming(applyCtx, mutator, reader, sink, req)
 	var auditErr *workmgmt.GroomingAuditError
 	switch {
@@ -693,16 +819,16 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 		// unrecorded mutation is the one outcome AC3 exists to prevent.
 		s.cfg.Logger.LogAttrs(applyCtx, slog.LevelError,
 			"grooming apply completed with audit write failures",
-			slog.String("run_id", stage.RunID.String()),
-			slog.String("stage_id", stage.ID.String()),
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
 			slog.String("error", auditErr.Error()),
 		)
 	default:
 		// A join error or an argument error means NOTHING ran.
 		s.cfg.Logger.LogAttrs(applyCtx, slog.LevelWarn,
 			"grooming apply refused; nothing was dispatched",
-			slog.String("run_id", stage.RunID.String()),
-			slog.String("stage_id", stage.ID.String()),
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()),
 		)
 		return
@@ -711,12 +837,13 @@ func (s *Server) applyApprovedGrooming(ctx context.Context, stage *run.Stage, de
 		return
 	}
 	s.cfg.Logger.LogAttrs(applyCtx, slog.LevelInfo, "grooming apply completed",
-		slog.String("run_id", stage.RunID.String()),
-		slog.String("stage_id", stage.ID.String()),
+		slog.String("run_id", runID.String()),
+		slog.String("stage_id", stageID.String()),
 		slog.Int("applied", result.Summary.Applied),
 		slog.Int("failed", result.Summary.Failed),
 		slog.Int("skipped", result.Summary.Skipped),
 		slog.Int("refused", result.Summary.Refused),
+		slog.Int("budget_exhausted", result.Summary.BudgetExhausted),
 	)
 }
 
@@ -891,6 +1018,11 @@ func (s *Server) groomingModesForRun(ctx context.Context, rn *run.Run) map[strin
 // naming why the apply did not happen, alongside a Warn log. It writes NO
 // grooming_mutation_applied row, so the churn guard's disposition read is
 // untouched.
+//
+// The degrade row is written on a FRESH context (ctx's values, not its
+// cancellation, bounded by groomingApplyPrelaunchBudget): when the reason IS an
+// expired prelaunch context, writing the record on that same context would lose
+// the record along with the apply — the #3232 failure shape.
 func (s *Server) degradeGroomingApply(ctx context.Context, sink *groomingApplyAuditSink, stage *run.Stage, reason, detail string) {
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "grooming apply degraded; nothing was dispatched",
 		slog.String("run_id", stage.RunID.String()),
@@ -898,7 +1030,9 @@ func (s *Server) degradeGroomingApply(ctx context.Context, sink *groomingApplyAu
 		slog.String("degrade_reason", reason),
 		slog.String("detail", detail),
 	)
-	if err := sink.append(ctx, workmgmt.GroomingApplyCompletedCategory, groomingApplyDegradePayload{
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), groomingApplyPrelaunchBudget)
+	defer cancel()
+	if err := sink.append(wctx, workmgmt.GroomingApplyCompletedCategory, groomingApplyDegradePayload{
 		Degraded: true, DegradeReason: reason,
 	}); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelError, "grooming apply: degrade marker not recorded",
@@ -907,4 +1041,16 @@ func (s *Server) degradeGroomingApply(ctx context.Context, sink *groomingApplyAu
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+// degradeGroomingApplyPrelaunch is degradeGroomingApply for the hook's
+// SYNCHRONOUS half (E54.77 / #3232): when the prelaunch context has expired,
+// the step's own failure is a symptom and the named reason is
+// grooming_apply_prelaunch_timeout, whatever rung reported it.
+func (s *Server) degradeGroomingApplyPrelaunch(ctx context.Context, sink *groomingApplyAuditSink, stage *run.Stage, reason, detail string) {
+	if ctx.Err() != nil {
+		detail = reason + ": " + detail
+		reason = groomingApplyPrelaunchTimeout
+	}
+	s.degradeGroomingApply(ctx, sink, stage, reason, detail)
 }

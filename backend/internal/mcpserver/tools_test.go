@@ -15298,3 +15298,422 @@ func TestGetRunStatus_AcceptanceTranscript_EndpointProducedThroughRealRouter(t *
 		t.Errorf("artifact_path returned kind=%q content=%q, want the stored acceptance_transcript", art.Kind, art.Content)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// grooming apply status on fishhawk_get_run_status (E54.77 / #3232)
+// ---------------------------------------------------------------------------
+
+// groomingApplyGoldenDir is the golden fixture directory slice 0 committed
+// (approval condition 1). The three payloads cross the server→mcpserver
+// boundary WITH NO SHARED TYPE, so every fixture below is LOADED from these
+// files — produced by marshalling the SERVER's real payload structs and pinned
+// there by TestGroomingApplyGoldens_MatchServerPayloadStructs — never
+// hand-authored: a key rename on either side reddens a test here.
+const groomingApplyGoldenDir = "../audit/testdata/grooming_apply"
+
+// loadGroomingApplyGolden reads one golden payload as the decoded map the
+// fake's audit endpoint serves.
+func loadGroomingApplyGolden(t *testing.T, category string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(groomingApplyGoldenDir, category+".json"))
+	if err != nil {
+		t.Fatalf("read golden %s: %v (slice 0 owns backend/internal/audit/testdata/grooming_apply/)", category, err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode golden %s: %v", category, err)
+	}
+	return payload
+}
+
+// overrideGoldenKey sets one key of a loaded golden to a per-test value and
+// FAILS if the golden does not already carry that key — so an override can
+// never re-introduce a key the server has renamed away (that would silently
+// keep the decoder's stale key alive in the fixture).
+func overrideGoldenKey(t *testing.T, golden map[string]any, key string, value any) map[string]any {
+	t.Helper()
+	if _, ok := golden[key]; !ok {
+		t.Fatalf("golden has no key %q — the server payload changed shape; update the decoder, not the fixture", key)
+	}
+	out := make(map[string]any, len(golden))
+	for k, v := range golden {
+		out[k] = v
+	}
+	out[key] = value
+	return out
+}
+
+// groomingApplyStatusRun is a backlog_grooming-shaped run: no implement stage,
+// a human review gate parked at awaiting_approval, no PR — so the classifier's
+// human_review_gate_parked arm leads with approve_review_gate, which is exactly
+// the action the in-flight advisory must displace from actions[0].
+func groomingApplyStatusRun(fb *fakeBackend, runID uuid.UUID) {
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "backlog_grooming", State: "running"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "review", State: "awaiting_approval", Executor: StageExecutor{Kind: "human"}},
+	}
+}
+
+// seedGroomingMutationRows appends n grooming_mutation_applied rows from the
+// golden, each with the given outcome (and the golden's skip_reason retained
+// only on the skipped arm).
+func seedGroomingMutationRows(t *testing.T, fb *fakeBackend, runID uuid.UUID, n int, outcome string) {
+	t.Helper()
+	golden := loadGroomingApplyGolden(t, auditCategoryGroomingMutationApplied)
+	for i := 0; i < n; i++ {
+		row := overrideGoldenKey(t, golden, "outcome", outcome)
+		row = overrideGoldenKey(t, row, "entry_id", fmt.Sprintf("hygiene:github/x/y#%d:missing_label_namespace", i))
+		if outcome != "skipped" {
+			delete(row, "skip_reason")
+		}
+		seedRawReviewAudit(fb, runID, auditCategoryGroomingMutationApplied, row)
+	}
+}
+
+func groomingStatusFor(t *testing.T, srv *httptest.Server, runID uuid.UUID) GetRunStatusOutput {
+	t.Helper()
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	return out
+}
+
+// TestGetRunStatus_GroomingApplyStatus_InFlight: a started row plus a partial
+// ledger and no completed row → in_flight with the tallied counts (the golden
+// row's apply_budget_exhausted skip counted into budget_exhausted), remaining =
+// candidate_count - recorded, and the re-poll advisory PREPENDED to
+// next_actions ahead of approve_review_gate.
+func TestGetRunStatus_GroomingApplyStatus_InFlight(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	started := loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, overrideGoldenKey(t, started, "candidate_count", 7))
+	seedGroomingMutationRows(t, fb, runID, 1, "applied")
+	seedGroomingMutationRows(t, fb, runID, 1, "failed")
+	// The golden row itself: skipped / apply_budget_exhausted, loaded verbatim.
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingMutationApplied, loadGroomingApplyGolden(t, auditCategoryGroomingMutationApplied))
+
+	out := groomingStatusFor(t, srv, runID)
+	st := out.GroomingApplyStatus
+	if st == nil {
+		t.Fatal("GroomingApplyStatus = nil, want the in-flight block")
+	}
+	if st.State != groomingApplyStateInFlight {
+		t.Errorf("state = %q, want in_flight (no completed row after the anchor)", st.State)
+	}
+	if st.CandidateCount != 7 || st.Recorded != 3 || st.Remaining != 4 {
+		t.Errorf("progress = %d/%d remaining %d, want 3/7 remaining 4", st.Recorded, st.CandidateCount, st.Remaining)
+	}
+	if st.Applied != 1 || st.Failed != 1 || st.Skipped != 1 || st.Refused != 0 || st.BudgetExhausted != 1 {
+		t.Errorf("tally = applied %d failed %d skipped %d refused %d budget_exhausted %d, want 1/1/1/0/1", st.Applied, st.Failed, st.Skipped, st.Refused, st.BudgetExhausted)
+	}
+	if st.StartedAt != started["started_at"] {
+		t.Errorf("started_at = %q, want the golden's %v", st.StartedAt, started["started_at"])
+	}
+	if st.DegradeReason != "" {
+		t.Errorf("degrade_reason = %q, want empty while in flight", st.DegradeReason)
+	}
+	na := out.NextActions
+	if na == nil || len(na.Actions) < 2 {
+		t.Fatalf("next_actions = %+v, want the advisory plus the gate approval", na)
+	}
+	if na.Actions[0].Action != "fishhawk_get_run_status" || !strings.Contains(na.Actions[0].Reason, "grooming apply in flight: 3/7 recorded") {
+		t.Errorf("next_actions[0] = %+v, want the in-flight re-poll advisory PREPENDED", na.Actions[0])
+	}
+	if na.Actions[1].Action != "approve_review_gate" {
+		t.Errorf("next_actions[1].action = %q, want approve_review_gate displaced to second", na.Actions[1].Action)
+	}
+}
+
+// TestGetRunStatus_GroomingApplyStatus_Completed: a completed row after the
+// anchor → completed, counts taken from the writer's own summary (the golden:
+// failed 1, skipped 3, budget_exhausted 3), remaining 0, and NO advisory.
+func TestGetRunStatus_GroomingApplyStatus_Completed(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted))
+	seedGroomingMutationRows(t, fb, runID, 1, "failed")
+	seedGroomingMutationRows(t, fb, runID, 3, "skipped")
+	completed := loadGroomingApplyGolden(t, auditCategoryGroomingApplyCompleted)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyCompleted, completed)
+
+	out := groomingStatusFor(t, srv, runID)
+	st := out.GroomingApplyStatus
+	if st == nil {
+		t.Fatal("GroomingApplyStatus = nil, want the completed block")
+	}
+	if st.State != groomingApplyStateCompleted || st.Remaining != 0 {
+		t.Errorf("state/remaining = %q/%d, want completed/0", st.State, st.Remaining)
+	}
+	if st.CandidateCount != 4 || st.Recorded != 4 {
+		t.Errorf("progress = %d/%d, want 4/4", st.Recorded, st.CandidateCount)
+	}
+	if st.Applied != 0 || st.Failed != 1 || st.Skipped != 3 || st.Refused != 0 || st.BudgetExhausted != 3 {
+		t.Errorf("summary = applied %d failed %d skipped %d refused %d budget_exhausted %d, want the golden's 0/1/3/0/3", st.Applied, st.Failed, st.Skipped, st.Refused, st.BudgetExhausted)
+	}
+	if st.DegradeReason != "" {
+		t.Errorf("degrade_reason = %q, want empty on a ran apply", st.DegradeReason)
+	}
+	for _, a := range out.NextActions.Actions {
+		if strings.Contains(a.Reason, "grooming apply in flight") {
+			t.Errorf("completed apply still carries the in-flight advisory: %+v", a)
+		}
+	}
+	if out.NextActions.Actions[0].Action != "approve_review_gate" {
+		t.Errorf("next_actions[0].action = %q, want approve_review_gate to lead once the apply completed", out.NextActions.Actions[0].Action)
+	}
+}
+
+// TestGetRunStatus_GroomingApplyStatus_CompletedDegradeCarriesReason: a
+// server-authored degrade row (the apply did not run) is a completed row too;
+// its degrade_reason is carried verbatim.
+func TestGetRunStatus_GroomingApplyStatus_CompletedDegradeCarriesReason(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted))
+	completed := loadGroomingApplyGolden(t, auditCategoryGroomingApplyCompleted)
+	completed["degrade_reason"] = "grooming_apply_mutator_unavailable"
+	completed["degraded"] = true
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyCompleted, completed)
+
+	st := groomingStatusFor(t, srv, runID).GroomingApplyStatus
+	if st == nil || st.State != groomingApplyStateCompleted || st.DegradeReason != "grooming_apply_mutator_unavailable" {
+		t.Errorf("GroomingApplyStatus = %+v, want completed with the degrade reason carried", st)
+	}
+}
+
+// TestGetRunStatus_GroomingApplyStatus_OmittedWithoutStartedRow: no started
+// row → the field is ABSENT on the wire, and the two ledger categories are NOT
+// read at all (asserted on the fake's per-category call log, mirroring the
+// transcript's NoAcceptanceStage_NoRead), even when such rows exist — an
+// ordinary run pays one small read and stays byte-identical.
+func TestGetRunStatus_GroomingApplyStatus_OmittedWithoutStartedRow(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	seedGroomingMutationRows(t, fb, runID, 2, "applied")
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyCompleted, loadGroomingApplyGolden(t, auditCategoryGroomingApplyCompleted))
+
+	out := groomingStatusFor(t, srv, runID)
+	if out.GroomingApplyStatus != nil {
+		t.Errorf("GroomingApplyStatus = %+v, want nil without a started row", out.GroomingApplyStatus)
+	}
+	raw, _ := json.Marshal(out)
+	if strings.Contains(string(raw), `"grooming_apply_status"`) {
+		t.Errorf("wire carries grooming_apply_status without a started row:\n%s", raw)
+	}
+	fb.mu.Lock()
+	startedReads := fb.perRunAuditCategoryReads[auditCategoryGroomingApplyStarted]
+	mutationReads := fb.perRunAuditCategoryReads[auditCategoryGroomingMutationApplied]
+	completedReads := fb.perRunAuditCategoryReads[auditCategoryGroomingApplyCompleted]
+	fb.mu.Unlock()
+	if startedReads != 1 {
+		t.Errorf("grooming_apply_started reads = %d, want exactly 1 (the gate read)", startedReads)
+	}
+	if mutationReads != 0 || completedReads != 0 {
+		t.Errorf("ledger reads = mutation %d / completed %d, want 0/0 (cost-gated on the started row)", mutationReads, completedReads)
+	}
+	for _, a := range out.NextActions.Actions {
+		if strings.Contains(a.Reason, "grooming apply in flight") {
+			t.Errorf("omitted block still folded an advisory: %+v", a)
+		}
+	}
+}
+
+// TestGetRunStatus_GroomingApplyStatus_WalksAuditPages: the per-entry ledger
+// exceeds one 500-row page; the cursor walk counts both pages (the fake serves
+// real limit/cursor pagination), so a large apply is not under-reported.
+func TestGetRunStatus_GroomingApplyStatus_WalksAuditPages(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	started := loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, overrideGoldenKey(t, started, "candidate_count", groomingApplyAuditPageLimit+150))
+	seedGroomingMutationRows(t, fb, runID, groomingApplyAuditPageLimit+100, "applied")
+
+	st := groomingStatusFor(t, srv, runID).GroomingApplyStatus
+	if st == nil {
+		t.Fatal("GroomingApplyStatus = nil")
+	}
+	if st.Recorded != groomingApplyAuditPageLimit+100 || st.Applied != groomingApplyAuditPageLimit+100 || st.Remaining != 50 {
+		t.Errorf("recorded/applied/remaining = %d/%d/%d, want %d/%d/50 across two pages", st.Recorded, st.Applied, st.Remaining, groomingApplyAuditPageLimit+100, groomingApplyAuditPageLimit+100)
+	}
+	fb.mu.Lock()
+	reads := fb.perRunAuditCategoryReads[auditCategoryGroomingMutationApplied]
+	fb.mu.Unlock()
+	if reads != 2 {
+		t.Errorf("grooming_mutation_applied reads = %d, want 2 (one per page)", reads)
+	}
+}
+
+// TestGetRunStatus_GroomingApplyStatus_PageCapBoundsTheWalk: a fake that hands
+// back an ADVANCING cursor forever (perRunAuditNeverEndByRun) cannot hold the
+// snapshot open — the walk stops at groomingApplyAuditMaxPages and reports the
+// PARTIAL count (fail-open), never an error and never an omitted block.
+func TestGetRunStatus_GroomingApplyStatus_PageCapBoundsTheWalk(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted))
+	seedGroomingMutationRows(t, fb, runID, 3, "applied")
+	fb.perRunAuditNeverEndByRun[runID] = true
+
+	st := groomingStatusFor(t, srv, runID).GroomingApplyStatus
+	if st == nil {
+		t.Fatal("GroomingApplyStatus = nil, want the partial block (fail-open)")
+	}
+	if st.Recorded != 3 || st.State != groomingApplyStateInFlight {
+		t.Errorf("recorded/state = %d/%q, want 3/in_flight", st.Recorded, st.State)
+	}
+	fb.mu.Lock()
+	reads := fb.perRunAuditCategoryReads[auditCategoryGroomingMutationApplied]
+	fb.mu.Unlock()
+	if reads != groomingApplyAuditMaxPages {
+		t.Errorf("grooming_mutation_applied reads = %d, want exactly the %d-page cap", reads, groomingApplyAuditMaxPages)
+	}
+}
+
+// TestGetRunStatus_GroomingApplyStatus_AnchorsOnNewestStartedRow: a
+// re-approval writes a second started row; rows (and a completed row) before it
+// belong to the OLDER apply and are excluded, so the block reports the newest
+// apply as in_flight with only its own rows.
+func TestGetRunStatus_GroomingApplyStatus_AnchorsOnNewestStartedRow(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	started := loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, started)
+	seedGroomingMutationRows(t, fb, runID, 4, "applied")
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyCompleted, loadGroomingApplyGolden(t, auditCategoryGroomingApplyCompleted))
+	// The re-approval: a fresh started row with a different denominator.
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, overrideGoldenKey(t, started, "candidate_count", 2))
+	seedGroomingMutationRows(t, fb, runID, 1, "refused")
+
+	st := groomingStatusFor(t, srv, runID).GroomingApplyStatus
+	if st == nil {
+		t.Fatal("GroomingApplyStatus = nil")
+	}
+	if st.State != groomingApplyStateInFlight {
+		t.Errorf("state = %q, want in_flight — the older apply's completed row is BEFORE the newest anchor", st.State)
+	}
+	if st.CandidateCount != 2 || st.Recorded != 1 || st.Refused != 1 || st.Applied != 0 || st.Remaining != 1 {
+		t.Errorf("block = %+v, want candidate_count 2 / recorded 1 / refused 1 / applied 0 / remaining 1 (older rows excluded)", st)
+	}
+	fb.mu.Lock()
+	q := fb.perRunAuditLastQueryByID[runID]
+	fb.mu.Unlock()
+	if !strings.Contains(q, "since_sequence=7") {
+		t.Errorf("last audit query = %q, want since_sequence=7 (the newest started row's sequence: 1 started + 4 mutations + 1 completed precede it)", q)
+	}
+}
+
+// TestGetRunStatus_GroomingApplyStatus_ReadErrorOmits: a failing ledger read
+// omits the block rather than failing the snapshot (best-effort).
+func TestGetRunStatus_GroomingApplyStatus_ReadErrorOmits(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted))
+	seedGroomingMutationRows(t, fb, runID, 2, "applied")
+	// Fail ONLY the ledger read (the fake's per-category reviewFlip hook), so
+	// every other read of the snapshot succeeds and the omission is
+	// attributable to this block's best-effort rule alone.
+	fb.reviewFlip = func(category string) {
+		if category == auditCategoryGroomingMutationApplied {
+			fb.perRunAuditStatus = http.StatusInternalServerError
+			return
+		}
+		fb.perRunAuditStatus = http.StatusOK
+	}
+
+	out := groomingStatusFor(t, srv, runID)
+	if out.GroomingApplyStatus != nil {
+		t.Errorf("GroomingApplyStatus = %+v, want nil on a ledger read error", out.GroomingApplyStatus)
+	}
+	for _, a := range out.NextActions.Actions {
+		if strings.Contains(a.Reason, "grooming apply in flight") {
+			t.Errorf("omitted block still folded an advisory: %+v", a)
+		}
+	}
+}
+
+// TestGetRunStatus_GroomingApplyStatus_UndecodablePayloadOmits: a started row
+// whose payload is not an object cannot yield a denominator; the block is
+// omitted, never a zero block.
+func TestGetRunStatus_GroomingApplyStatus_UndecodablePayloadOmits(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID: uuid.NewString(), Sequence: 1, RunID: runID.String(), Category: auditCategoryGroomingApplyStarted, Payload: []any{"not", "an", "object"},
+	})
+	if st := groomingStatusFor(t, srv, runID).GroomingApplyStatus; st != nil {
+		t.Errorf("GroomingApplyStatus = %+v, want nil on an undecodable started payload", st)
+	}
+}
+
+// TestGroomingApplyGoldens_CarryTheDecodedKeys pins the cross-boundary
+// contract from the CONSUMER side: every key the decoder reads must be present
+// in the golden the server marshalled, so a rename on the server side (which
+// regenerates the golden) reddens here even before a status test notices a
+// zeroed count.
+func TestGroomingApplyGoldens_CarryTheDecodedKeys(t *testing.T) {
+	for category, keys := range map[string][]string{
+		auditCategoryGroomingApplyStarted:    {"candidate_count", "budget_seconds", "started_at"},
+		auditCategoryGroomingMutationApplied: {"entry_id", "outcome", "skip_reason"},
+		auditCategoryGroomingApplyCompleted:  {"applied", "failed", "skipped", "refused", "budget_exhausted"},
+	} {
+		golden := loadGroomingApplyGolden(t, category)
+		for _, k := range keys {
+			if _, ok := golden[k]; !ok {
+				t.Errorf("golden %s lacks key %q the mcpserver decoder reads — the server payload was renamed; update groomingApplyStatusFor", category, k)
+			}
+		}
+	}
+	// The golden mutation row IS the over-budget skip the decoder classifies.
+	row := loadGroomingApplyGolden(t, auditCategoryGroomingMutationApplied)
+	if row["outcome"] != "skipped" || row["skip_reason"] != groomingSkipReasonApplyBudgetExhausted {
+		t.Errorf("golden mutation row = outcome %v / skip_reason %v, want skipped / %s", row["outcome"], row["skip_reason"], groomingSkipReasonApplyBudgetExhausted)
+	}
+}
+
+// TestGetRunStatus_GroomingApplyStatus_RemainingFlooredAtZero: more recorded
+// rows than the denominator (a started row stamped before a late-derived
+// extra candidate) never yields a negative remaining.
+func TestGetRunStatus_GroomingApplyStatus_RemainingFlooredAtZero(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	started := loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, overrideGoldenKey(t, started, "candidate_count", 1))
+	seedGroomingMutationRows(t, fb, runID, 3, "applied")
+
+	st := groomingStatusFor(t, srv, runID).GroomingApplyStatus
+	if st == nil || st.Recorded != 3 || st.CandidateCount != 1 || st.Remaining != 0 {
+		t.Errorf("GroomingApplyStatus = %+v, want recorded 3 / candidate_count 1 / remaining 0 (floored, never negative)", st)
+	}
+}
+
+// TestGetRunStatus_GroomingApplyStatus_UndecodableMutationRowOmits: a ledger
+// row whose payload is not an object cannot be tallied; the block is omitted
+// rather than reporting a count that silently excludes it.
+func TestGetRunStatus_GroomingApplyStatus_UndecodableMutationRowOmits(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	groomingApplyStatusRun(fb, runID)
+	seedRawReviewAudit(fb, runID, auditCategoryGroomingApplyStarted, loadGroomingApplyGolden(t, auditCategoryGroomingApplyStarted))
+	seedGroomingMutationRows(t, fb, runID, 1, "applied")
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID: uuid.NewString(), Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1), RunID: runID.String(),
+		Category: auditCategoryGroomingMutationApplied, Payload: "not an object",
+	})
+	if st := groomingStatusFor(t, srv, runID).GroomingApplyStatus; st != nil {
+		t.Errorf("GroomingApplyStatus = %+v, want nil on an undecodable ledger row", st)
+	}
+}

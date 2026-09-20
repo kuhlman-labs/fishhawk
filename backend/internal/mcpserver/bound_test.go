@@ -139,6 +139,13 @@ func maximalRunStatusOutput(runID string) GetRunStatusOutput {
 			FailingRequest: &AcceptanceTranscriptRequest{Method: "GET", Path: "/v0/runs/abc/audit?category=acceptance_outcome_recorded", Status: 200},
 		})
 	}
+	// The grooming-apply progress block (E54.77 / #3232) rides the ladder with
+	// the fixture so its T3 drop is measured, not assumed.
+	out.GroomingApplyStatus = &GroomingApplyStatus{
+		State: groomingApplyStateInFlight, CandidateCount: 9, Recorded: 5,
+		Applied: 2, Failed: 1, Skipped: 2, BudgetExhausted: 1, Remaining: 4,
+		StartedAt: "2026-09-20T12:00:00Z",
+	}
 	for i := 0; i < 12; i++ {
 		out.DriveStatus.AutoAdvanced = append(out.DriveStatus.AutoAdvanced, RunAutoAdvance{Rule: "reviews_settled_gate", From: "a", To: "b", Timestamp: now})
 	}
@@ -359,6 +366,7 @@ func TestBound_UnderBudget_ReturnsTheInputBytesUnchanged(t *testing.T) {
 	if in.Run.IssueContext == nil || in.Cost == nil || in.ChildrenStatus == nil ||
 		len(in.RecentAudit) <= recentAuditTierCap || len(in.SecurityFindings) == 0 ||
 		in.AcceptanceTranscript == nil || len(in.AcceptanceTranscript.Criteria) == 0 ||
+		in.GroomingApplyStatus == nil || in.GroomingApplyStatus.Recorded == 0 ||
 		len(in.NextActions.Actions) <= nextActionsTierCap {
 		t.Fatalf("the fixture does not carry every tier's target — an unchanged result would prove nothing: %+v", in)
 	}
@@ -465,11 +473,16 @@ func TestEveryResponsePathIsClassified(t *testing.T) {
 // bandedElisions drives the whole matrix: every tier band from a generous
 // budget down to the floor, returning each band's emitted elisions.
 //
-// The 13 KiB band is inside the diagnosis-skeleton fit window (#3043). Adding
+// The 15 KiB band is inside the diagnosis-skeleton fit window (#3043). Adding
 // run.concerns.open_implement as an itemised skeleton omission (consistent with
 // its siblings run.concerns.open / by_state, since skeletonRunStatus never
-// copies Run.Concerns) grows the skeleton to a constant 12465 bytes, so it no
-// longer fits the 12 KiB band and its fit window shifts to [~12465, ~16383].
+// copies Run.Concerns) grew the skeleton to a constant 12465 bytes, so it no
+// longer fit the 12 KiB band and its fit window shifted to [~12465, ~16383];
+// the three per-category grooming_apply_status elision entries (E54.77 /
+// #3232, T3) ride inside every skeleton measurement and grew it again to a
+// constant 13446 bytes, so the window is now [~13446, ~17511] and the 13 KiB
+// band fell below its floor — hence 15 KiB, ~1.9 KiB above the floor and
+// ~2.1 KiB below the T9 ceiling.
 // Without a band in that window no probe would engage the skeleton tier at all,
 // and the skeleton-ONLY next_actions.actions computed elision — which
 // TestElisions_ComputedCarryNoPointer requires — would vanish from the matrix.
@@ -478,7 +491,7 @@ func TestEveryResponsePathIsClassified(t *testing.T) {
 func bandedElisions(t *testing.T, runID string) map[int]*Elisions {
 	t.Helper()
 	out := map[int]*Elisions{}
-	for _, b := range []int{28 * 1024, 20 * 1024, 13 * 1024, 12 * 1024, 8 * 1024, 6 * 1024, 5 * 1024, minimalRunStatusMaxBytes} {
+	for _, b := range []int{28 * 1024, 20 * 1024, 15 * 1024, 12 * 1024, 8 * 1024, 6 * 1024, 5 * 1024, minimalRunStatusMaxBytes} {
 		bounded, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(b))
 		if err != nil {
 			t.Fatalf("budget %d: %v", b, err)
@@ -492,18 +505,20 @@ func bandedElisions(t *testing.T, runID string) map[int]*Elisions {
 }
 
 // TestElisions_SkeletonBandEngagesSkeletonTier is the amendment's binding
-// condition (#3043): the 13 KiB band added to bandedElisions must POSITIVELY
+// condition (#3043): the skeleton band added to bandedElisions must POSITIVELY
 // engage the diagnosis-skeleton tier and carry the skeleton-only
 // next_actions.actions computed elision — not merely make TestElisions_*
 // pass by probing nothing. If a future field addition shifts the skeleton fit
-// window past 13 KiB, this fails LOUDLY (naming the tier it landed on and the
-// measured skeleton size to re-diagnose) instead of the coverage silently
-// evaporating. The skeleton is a constant 12465 bytes; the fit window is
-// [~12465, ~16383], so 13 KiB (13312) sits ~850 B above the floor and ~3 KiB
-// below the T9 ceiling — comfortably inside, one band suffices.
+// window past the band, this fails LOUDLY (naming the tier it landed on and
+// the measured skeleton size to re-diagnose) instead of the coverage silently
+// evaporating — as it did when E54.77 / #3232's three grooming_apply_status
+// elision entries grew the skeleton from 12465 to 13446 bytes and the 13 KiB
+// band fell below the floor. The skeleton is a constant 13446 bytes; the fit
+// window is [~13446, ~17511], so 15 KiB (15360) sits ~1.9 KiB above the floor
+// and ~2.1 KiB below the T9 ceiling — comfortably inside, one band suffices.
 func TestElisions_SkeletonBandEngagesSkeletonTier(t *testing.T) {
 	runID := uuid.NewString()
-	const band = 13 * 1024
+	const band = 15 * 1024
 	bounded, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(band))
 	if err != nil {
 		t.Fatalf("band %d: %v", band, err)
@@ -513,7 +528,7 @@ func TestElisions_SkeletonBandEngagesSkeletonTier(t *testing.T) {
 	}
 	if bounded.Elisions.Tier != "skeleton" {
 		raw, _ := json.Marshal(bounded)
-		t.Fatalf("band %d engaged tier %q, want \"skeleton\"; the skeleton fit window shifted (measured skeleton size ~12465B, serialized here %dB) — re-pick the band inside the new window",
+		t.Fatalf("band %d engaged tier %q, want \"skeleton\"; the skeleton fit window shifted (measured skeleton size ~13446B, serialized here %dB) — re-pick the band inside the new window",
 			band, bounded.Elisions.Tier, len(raw))
 	}
 	found := false
@@ -609,6 +624,7 @@ func TestElisions_DroppedSetCarriesCount(t *testing.T) {
 	want := map[string]int{
 		"security_findings":          len(fixture.SecurityFindings),
 		"acceptance_transcript":      len(fixture.AcceptanceTranscript.Criteria),
+		"grooming_apply_status":      fixture.GroomingApplyStatus.Recorded,
 		"implement_reviews":          len(fixture.ImplementReviews),
 		"run.concerns.items":         len(fixture.Run.Concerns.Items),
 		"run.review_authority":       len(fixture.Run.ReviewAuthority),
