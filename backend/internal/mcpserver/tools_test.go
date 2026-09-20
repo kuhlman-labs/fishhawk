@@ -15363,7 +15363,7 @@ func seedGroomingMutationRows(t *testing.T, fb *fakeBackend, runID uuid.UUID, n 
 	golden := loadGroomingApplyGolden(t, auditCategoryGroomingMutationApplied)
 	for i := 0; i < n; i++ {
 		row := overrideGoldenKey(t, golden, "outcome", outcome)
-		row = overrideGoldenKey(t, row, "entry_id", fmt.Sprintf("hygiene:github/x%%2fy%%23%d:missing_label_namespace", i))
+		row = overrideGoldenKey(t, row, "entry_id", fmt.Sprintf("hygiene:github/x/y#%d:missing_label_namespace", i))
 		if outcome != "skipped" {
 			delete(row, "skip_reason")
 		}

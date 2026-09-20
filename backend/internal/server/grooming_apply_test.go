@@ -2698,14 +2698,20 @@ const groomingApplyGoldenDir = "../audit/testdata/grooming_apply"
 // groomingApplyGoldens returns the three golden payloads, keyed by category,
 // built from the server's real payload structs with fixed values: a started
 // row, a mutation row skipped with apply_budget_exhausted, and a completed
-// summary carrying a non-zero budget_exhausted count.
+// summary carrying a non-zero budget_exhausted count. Every entry id is the
+// one plan.GroomingEntryID DERIVES for the hygiene defect on issue #N of
+// groomingApplyRepo — the ids a real run over groomingApplyGoldenReport
+// writes — so the pgtest can compare persisted rows to these files exactly.
 func groomingApplyGoldens() map[string]any {
+	hygieneID := func(n int) string {
+		return plan.GroomingEntryID(plan.GroomingClassHygiene, "missing_label_namespace", groomingApplyRef(n))
+	}
 	return map[string]any{
 		groomingApplyStartedCategory: groomingApplyStartedPayload{
 			CandidateCount: 4, BudgetSeconds: 180, StartedAt: "2026-09-20T12:00:00Z",
 		},
 		workmgmt.GroomingMutationAppliedCategory: workmgmt.GroomingMutationRecord{
-			EntryID:     "hygiene:github/kuhlman-labs%2ffishhawk%234:missing_label_namespace",
+			EntryID:     hygieneID(4),
 			Class:       "hygiene",
 			ReportClass: "hygiene",
 			Kind:        workmgmt.GroomingKindLabelSet,
@@ -2715,12 +2721,8 @@ func groomingApplyGoldens() map[string]any {
 		},
 		workmgmt.GroomingApplyCompletedCategory: workmgmt.GroomingApplySummary{
 			Applied: 0, Failed: 1, Skipped: 3, Refused: 0, BudgetExhausted: 3,
-			FailedIDs: []string{"hygiene:github/kuhlman-labs%2ffishhawk%231:missing_label_namespace"},
-			SkippedIDs: []string{
-				"hygiene:github/kuhlman-labs%2ffishhawk%232:missing_label_namespace",
-				"hygiene:github/kuhlman-labs%2ffishhawk%233:missing_label_namespace",
-				"hygiene:github/kuhlman-labs%2ffishhawk%234:missing_label_namespace",
-			},
+			FailedIDs:  []string{hygieneID(1)},
+			SkippedIDs: []string{hygieneID(2), hygieneID(3), hygieneID(4)},
 		},
 	}
 }
@@ -2759,69 +2761,104 @@ func TestGroomingApplyGoldens_MatchServerPayloadStructs(t *testing.T) {
 	}
 }
 
-// assertDecodeEqualToGolden asserts a written audit payload DECODE-EQUALS the
-// category's golden through the server's struct type: both the row and the
-// golden decode into a fresh value of that type and re-marshal to their own
-// bytes exactly (so neither carries a key the struct does not, and neither
-// drops one it does), and both expose the same top-level key set modulo
-// omitempty — every key the golden carries that the row omits must be an
-// omitempty field of the struct.
-func assertDecodeEqualToGolden(t *testing.T, category string, row []byte) {
+// groomingApplyGoldenReport builds the report the goldens were AUTHORED
+// against: four hygiene defects on issues #1..#4 of groomingApplyRepo, each
+// carrying the structured fix {labels: [area:api]}. Driven through the real
+// hook with every dispatch wedged on the apply context, it settles
+// deterministically — #1 is dispatched and fails on the expired context, #2..#4
+// are skipped apply_budget_exhausted — which is exactly the shape the completed
+// golden and the mutation golden (#4) encode, so the pgtest below can compare
+// the persisted rows to the goldens VALUE-FOR-VALUE rather than by key set.
+//
+// ONE structural addition the goldens do not carry: the report schema REQUIRES
+// a non-empty ordering, and an ordering entry derives a rank_set candidate
+// (deriveGroomingMutations), so a schema-valid report always has one more
+// candidate than the four the goldens were authored with. It is the LAST
+// derived candidate (hygiene derives first) and is therefore also exhausted;
+// the second return value is its entry id, which the pgtest subtracts by name —
+// asserting its exact contribution to the counts — and nothing else.
+//
+// The hygiene ids are the ones plan.GroomingEntryID derives for #1..#4 — the
+// same ids groomingApplyGoldens carries; the second return value is the
+// ordering entry's.
+func groomingApplyGoldenReport() (report *plan.GroomingReport, orderingID string) {
+	ordered := groomingApplyRef(1)
+	orderingID = plan.GroomingEntryID(plan.GroomingClassOrdering, "", ordered)
+	report = &plan.GroomingReport{
+		Kind:          "grooming_report",
+		ReportVersion: "grooming_report_v1",
+		TicketReference: plan.TicketReference{
+			Type: plan.TicketType("github_issue"), ID: groomingApplyRepo + "#2822",
+			URL: "https://github.com/" + groomingApplyRepo + "/issues/2822",
+		},
+		GeneratedBy: plan.GeneratedBy{
+			Agent: "test", Model: "test-model",
+			Timestamp: time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC),
+		},
+		Summary: "four hygiene defects, the golden shape",
+		Ordering: []plan.OrderingEntry{{
+			ID: orderingID, ItemRef: ordered, Rank: 1, Score: 90,
+			RubricCitations: []plan.RubricCitation{{RubricID: "V1"}},
+		}},
+		// The schema wants every other class array present, empty not null.
+		Duplicates:               []plan.DuplicateCandidate{},
+		DependencyEdges:          []plan.DependencyEdge{},
+		VisionDrift:              []plan.VisionDriftFlag{},
+		DecompositionSuggestions: []plan.DecompositionSuggestion{},
+	}
+	for n := 1; n <= 4; n++ {
+		ref := groomingApplyRef(n)
+		report.HygieneDefects = append(report.HygieneDefects, plan.HygieneDefect{
+			ID: plan.GroomingEntryID(plan.GroomingClassHygiene, "missing_label_namespace", ref), ItemRef: ref,
+			Defect: "missing_label_namespace", Detail: "no area: label",
+			SuggestedFix: "attach the area label",
+			Fix:          &plan.HygieneFix{Labels: []string{"area:api"}},
+		})
+	}
+	return report, orderingID
+}
+
+// decodeGoldenStrict decodes raw into a fresh T, refusing any key T does not
+// declare — so a key the writer emits that the golden's struct lacks (or a
+// golden key the struct renamed away) fails here, before any value comparison.
+func decodeGoldenStrict[T any](t *testing.T, label, category string, raw []byte) T {
 	t.Helper()
-	golden, err := os.ReadFile(groomingApplyGoldenPath(category))
+	var v T
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("%s %s does not decode into %T: %v\n%s", label, category, v, err, raw)
+	}
+	return v
+}
+
+// assertDecodeEqualToGolden asserts a written audit payload DECODE-EQUALS the
+// category's golden: both decode strictly (no unknown keys) into the SAME
+// server struct type T, and the two values must then be reflect.DeepEqual —
+// every contract-bearing value (counts, ids, outcome, skip_reason, kind,
+// before/after) is compared, not just the key set. Variable fields are
+// accounted for EXPLICITLY: normalize, when non-nil, receives the decoded row
+// and the decoded golden, asserts each run-dependent field's own invariant
+// (a parseable timestamp, the budget the test configured) and then copies the
+// golden's value over it, so nothing else escapes the equality. A nil
+// normalize means the category has no variable fields and the row must equal
+// the golden outright.
+func assertDecodeEqualToGolden[T any](t *testing.T, category string, row []byte, normalize func(t *testing.T, got, golden *T)) {
+	t.Helper()
+	raw, err := os.ReadFile(groomingApplyGoldenPath(category))
 	if err != nil {
 		t.Fatalf("read golden for %s: %v", category, err)
 	}
-	proto, ok := groomingApplyGoldens()[category]
-	if !ok {
-		t.Fatalf("no golden prototype for %s", category)
+	golden := decodeGoldenStrict[T](t, "golden", category, raw)
+	got := decodeGoldenStrict[T](t, "written row", category, row)
+	if normalize != nil {
+		normalize(t, &got, &golden)
 	}
-	typ := reflect.TypeOf(proto)
-	roundTrip := func(label string, raw []byte) map[string]json.RawMessage {
-		v := reflect.New(typ)
-		dec := json.NewDecoder(bytes.NewReader(raw))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(v.Interface()); err != nil {
-			t.Fatalf("%s %s does not decode into %s: %v\n%s", label, category, typ, err, raw)
-		}
-		re, err := json.Marshal(v.Elem().Interface())
-		if err != nil {
-			t.Fatalf("re-marshal %s: %v", label, err)
-		}
-		var keysIn, keysOut map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &keysIn); err != nil {
-			t.Fatalf("%s %s keys: %v", label, category, err)
-		}
-		if err := json.Unmarshal(re, &keysOut); err != nil {
-			t.Fatalf("%s %s re-marshalled keys: %v", label, category, err)
-		}
-		if len(keysIn) != len(keysOut) {
-			t.Errorf("%s %s loses or gains keys through %s: in=%v out=%v", label, category, typ, sortedRawKeys(keysIn), sortedRawKeys(keysOut))
-		}
-		return keysIn
+	if !reflect.DeepEqual(got, golden) {
+		gotJSON, _ := json.MarshalIndent(got, "", "  ")
+		goldenJSON, _ := json.MarshalIndent(golden, "", "  ")
+		t.Errorf("written %s row is not value-equal to its golden (after normalising the declared variable fields)\n got: %s\nwant: %s", category, gotJSON, goldenJSON)
 	}
-	rowKeys := roundTrip("written row", row)
-	goldenKeys := roundTrip("golden", golden)
-	tags := jsonTagNames(t, typ)
-	for k := range rowKeys {
-		if _, ok := tags[k]; !ok {
-			t.Errorf("written %s row carries key %q that %s does not declare", category, k, typ)
-		}
-	}
-	for k := range goldenKeys {
-		if _, ok := tags[k]; !ok {
-			t.Errorf("golden %s carries key %q that %s does not declare", category, k, typ)
-		}
-	}
-}
-
-func sortedRawKeys(m map[string]json.RawMessage) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // TestApproveGroomStage_OverBudgetRowsDecodeEqualToGoldens is the pgtest half
@@ -2830,9 +2867,19 @@ func sortedRawKeys(m map[string]json.RawMessage) []string {
 // writes a grooming_apply_started row, one grooming_mutation_applied row per
 // entry (the tail skipped apply_budget_exhausted) and one
 // grooming_apply_completed row with budget_exhausted set — and each of the
-// three decode-equals its golden through the server's struct type.
+// three decode-equals its golden VALUE-FOR-VALUE through the server's struct
+// type. The report is groomingApplyGoldenReport, the shape the goldens were
+// authored against, so every departure from the goldens is NAMED and asserted
+// before it is normalised away: the started row's timestamp and budget_seconds
+// (the test budget is sub-second; the golden carries the production 180s), and
+// the schema-mandated ordering candidate the goldens do not carry (one more
+// candidate, one more exhausted skip — see groomingApplyGoldenReport).
 func TestApproveGroomStage_OverBudgetRowsDecodeEqualToGoldens(t *testing.T) {
-	budget := timescale.D(150 * time.Millisecond)
+	// Wide enough that the prelaunch DB work (ratification, window settlement,
+	// the started append) cannot plausibly consume the budget before #1 is
+	// dispatched — #1 must FAIL on the expired context, not be exhausted, for
+	// the completed golden's failed/skipped split to hold.
+	budget := timescale.D(400 * time.Millisecond)
 	prevFloor, prevPer := groomingApplyBudget, groomingApplyPerCandidateBudget
 	groomingApplyBudget, groomingApplyPerCandidateBudget = budget, 0
 	t.Cleanup(func() { groomingApplyBudget, groomingApplyPerCandidateBudget = prevFloor, prevPer })
@@ -2861,7 +2908,7 @@ func TestApproveGroomStage_OverBudgetRowsDecodeEqualToGoldens(t *testing.T) {
 	if _, err := runRepo.TransitionStage(ctx, stage.ID, run.StageStateAwaitingApproval, nil); err != nil {
 		t.Fatalf("park stage: %v", err)
 	}
-	report, _ := groomingApplyFullReport()
+	report, orderingID := groomingApplyGoldenReport()
 	sv := "grooming_report_v1"
 	if _, err := artRepo.Create(ctx, artifact.CreateParams{
 		StageID: stage.ID, Kind: artifact.KindGroomingReport, SchemaVersion: &sv,
@@ -2888,18 +2935,45 @@ func TestApproveGroomStage_OverBudgetRowsDecodeEqualToGoldens(t *testing.T) {
 		Addr: "127.0.0.1:0", RunRepo: runRepo, ArtifactRepo: artRepo,
 		AuditRepo: auditRepo, ApprovalRepo: apprRepo,
 	})
+	approvedAt := time.Now().UTC()
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"over budget"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("approve status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
 	s.waitGroomingApply()
+	settledAt := time.Now().UTC()
 
 	entries := workmgmt.GroomingCandidateCount(report)
 	started, err := auditRepo.ListForRunByCategory(ctx, rn.ID, groomingApplyStartedCategory)
 	if err != nil || len(started) != 1 {
 		t.Fatalf("grooming_apply_started rows = %d (err %v), want 1", len(started), err)
 	}
-	assertDecodeEqualToGolden(t, groomingApplyStartedCategory, started[0].Payload)
+	assertDecodeEqualToGolden(t, groomingApplyStartedCategory, started[0].Payload,
+		func(t *testing.T, got, golden *groomingApplyStartedPayload) {
+			// candidate_count: the goldens' four plus the schema-mandated
+			// ordering candidate. Pin it to the report's real derivation, then
+			// normalise.
+			if got.CandidateCount != entries || entries != golden.CandidateCount+1 {
+				t.Errorf("candidate_count = %d, want %d (the golden's %d hygiene candidates + the ordering candidate)", got.CandidateCount, entries, golden.CandidateCount)
+			}
+			got.CandidateCount = golden.CandidateCount
+			// started_at: run-dependent; must be an RFC3339 UTC instant stamped
+			// between the approve request and the apply settling.
+			at, perr := time.Parse(time.RFC3339Nano, got.StartedAt)
+			if perr != nil {
+				t.Errorf("started_at %q does not parse as RFC3339Nano: %v", got.StartedAt, perr)
+			} else if at.Before(approvedAt.Add(-time.Second)) || at.After(settledAt.Add(time.Second)) {
+				t.Errorf("started_at %s is outside the approve→settle window [%s, %s]", at, approvedAt, settledAt)
+			}
+			got.StartedAt = golden.StartedAt
+			// budget_seconds: the test shrinks the budget below one second; the
+			// golden carries the production 180s. Pin the row to the configured
+			// budget, then normalise.
+			if want := int(budget / time.Second); got.BudgetSeconds != want {
+				t.Errorf("budget_seconds = %d, want %d (the configured test budget)", got.BudgetSeconds, want)
+			}
+			got.BudgetSeconds = golden.BudgetSeconds
+		})
 
 	mutations, err := auditRepo.ListForRunByCategory(ctx, rn.ID, workmgmt.GroomingMutationAppliedCategory)
 	if err != nil {
@@ -2908,7 +2982,14 @@ func TestApproveGroomStage_OverBudgetRowsDecodeEqualToGoldens(t *testing.T) {
 	if len(mutations) != entries {
 		t.Errorf("grooming_mutation_applied rows = %d, want %d (one per entry)", len(mutations), entries)
 	}
-	exhaustedRows := 0
+	// The mutation golden is the row for #4 — the last HYGIENE candidate,
+	// exhausted without ever being evaluated (no read, so before is empty).
+	// Find the persisted row carrying #4's id and compare it OUTRIGHT: a
+	// mutation row has no run-dependent field, so normalize is nil and every
+	// value — entry_id, class, kind, before/after, outcome, skip_reason — must
+	// equal the golden's.
+	goldenMutation := groomingApplyGoldens()[workmgmt.GroomingMutationAppliedCategory].(workmgmt.GroomingMutationRecord)
+	exhaustedRows, goldenRowSeen := 0, 0
 	for _, e := range mutations {
 		var rec workmgmt.GroomingMutationRecord
 		if err := json.Unmarshal(e.Payload, &rec); err != nil {
@@ -2916,18 +2997,41 @@ func TestApproveGroomStage_OverBudgetRowsDecodeEqualToGoldens(t *testing.T) {
 		}
 		if rec.SkipReason == workmgmt.GroomingSkipApplyBudgetExhausted {
 			exhaustedRows++
-			assertDecodeEqualToGolden(t, workmgmt.GroomingMutationAppliedCategory, e.Payload)
 		}
+		if rec.EntryID == goldenMutation.EntryID {
+			goldenRowSeen++
+			assertDecodeEqualToGolden[workmgmt.GroomingMutationRecord](t, workmgmt.GroomingMutationAppliedCategory, e.Payload, nil)
+		}
+	}
+	if goldenRowSeen != 1 {
+		t.Fatalf("grooming_mutation_applied rows for %q = %d, want exactly 1 (the golden's row)", goldenMutation.EntryID, goldenRowSeen)
 	}
 	if exhaustedRows == 0 {
 		t.Fatal("no grooming_mutation_applied row skipped apply_budget_exhausted; the golden's arm was not exercised")
 	}
 
+	// The completed golden encodes the whole settlement — #1 failed on the
+	// expired context, #2..#4 exhausted. The persisted row additionally carries
+	// the schema-mandated ordering candidate, exhausted LAST: assert exactly
+	// that contribution (one trailing skipped id, +1 skipped, +1
+	// budget_exhausted), subtract it, and compare everything else — failed_ids
+	// and the remaining skipped_ids included — outright.
 	completed, err := auditRepo.ListForRunByCategory(ctx, rn.ID, workmgmt.GroomingApplyCompletedCategory)
 	if err != nil || len(completed) != 1 {
 		t.Fatalf("grooming_apply_completed rows = %d (err %v), want 1", len(completed), err)
 	}
-	assertDecodeEqualToGolden(t, workmgmt.GroomingApplyCompletedCategory, completed[0].Payload)
+	assertDecodeEqualToGolden(t, workmgmt.GroomingApplyCompletedCategory, completed[0].Payload,
+		func(t *testing.T, got, golden *workmgmt.GroomingApplySummary) {
+			n := len(got.SkippedIDs)
+			if n == 0 || got.SkippedIDs[n-1] != orderingID {
+				t.Fatalf("skipped_ids = %v, want the ordering candidate %q exhausted last", got.SkippedIDs, orderingID)
+			}
+			got.SkippedIDs = got.SkippedIDs[:n-1]
+			if got.Skipped != golden.Skipped+1 || got.BudgetExhausted != golden.BudgetExhausted+1 {
+				t.Errorf("skipped/budget_exhausted = %d/%d, want the golden's %d/%d plus the ordering candidate", got.Skipped, got.BudgetExhausted, golden.Skipped, golden.BudgetExhausted)
+			}
+			got.Skipped, got.BudgetExhausted = golden.Skipped, golden.BudgetExhausted
+		})
 	var sum workmgmt.GroomingApplySummary
 	if err := json.Unmarshal(completed[0].Payload, &sum); err != nil {
 		t.Fatalf("decode summary: %v", err)

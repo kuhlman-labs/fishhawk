@@ -5,11 +5,11 @@
   "refused": 0,
   "budget_exhausted": 3,
   "failed_ids": [
-    "hygiene:github/kuhlman-labs%2ffishhawk%231:missing_label_namespace"
+    "hygiene:github/kuhlman-labs/fishhawk#1:missing_label_namespace"
   ],
   "skipped_ids": [
-    "hygiene:github/kuhlman-labs%2ffishhawk%232:missing_label_namespace",
-    "hygiene:github/kuhlman-labs%2ffishhawk%233:missing_label_namespace",
-    "hygiene:github/kuhlman-labs%2ffishhawk%234:missing_label_namespace"
+    "hygiene:github/kuhlman-labs/fishhawk#2:missing_label_namespace",
+    "hygiene:github/kuhlman-labs/fishhawk#3:missing_label_namespace",
+    "hygiene:github/kuhlman-labs/fishhawk#4:missing_label_namespace"
   ]
 }
