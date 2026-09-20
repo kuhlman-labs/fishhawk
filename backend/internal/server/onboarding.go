@@ -610,7 +610,17 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	repo := r.URL.Query().Get("repo")
+	// Trimmed ONCE, here, before any consumer sees it. ProjectPathWellFormed
+	// trims INTERNALLY (registry_test.go pins "  acme/widgets  " as
+	// well-formed), so without this the handler's own copy of `repo` would
+	// pass validation yet reach enforceRepoVisibility, the RepoRef split,
+	// both probes and the response echo verbatim — a padded query drawing a
+	// spurious 403/not-visible/not-installed answer (#3488). Every consumer
+	// below (the 400 `got` detail, the nested-path checks, the visibility
+	// gate, onboardingForgeFamily, the strings.Cut split, probeGitHub/
+	// probeGitLab/probeMergeGate, and resp.Repo) reads this single trimmed
+	// value — no second trim anywhere.
+	repo := strings.TrimSpace(r.URL.Query().Get("repo"))
 	// The shared shape rule (account.ProjectPathWellFormed): a non-empty
 	// namespace, then one or more non-empty components. This admits a nested
 	// GitLab path; the github family's two-segment rule is applied below.

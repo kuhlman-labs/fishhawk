@@ -1758,8 +1758,13 @@ func TestFillIssueContext_Unresolved_WarnsAndAudits(t *testing.T) {
 		// github_no_client_forge_unresolved is the counterfactual vehicle for
 		// the fillIssueContext nil guard (E45.45 / #3461): a github-family
 		// run WITH a credential but no configured GitHub client degrades to
-		// forge_unresolved instead of panicking on a nil dereference.
-		// Deleting the guard reddens this case with a nil-interface panic.
+		// forge_unresolved instead of panicking on a nil dereference. Both
+		// this case and its _prompt_render sibling below drive the SERVED
+		// handler chain (promptOK / promptRenderRequest go through
+		// s.Handler(), which installs the recovery middleware), so deleting
+		// the guard reddens this case as a recovered 500 response (and a
+		// missing issue_context_unresolved audit row) rather than as a raw
+		// test-process panic.
 		{
 			name: "github_no_client_forge_unresolved", resolver: nilResolver, row: ghRowWithInstallation,
 			noGitHub:   true,
