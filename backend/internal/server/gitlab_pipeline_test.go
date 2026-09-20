@@ -486,6 +486,52 @@ func TestIngestGitLabPipeline_SkipsAppendForSupersededPipeline(t *testing.T) {
 			t.Fatalf("Append calls = %d, want 1 (a status update for the same pipeline)", n)
 		}
 	})
+	// A same-id RESTART (running, no finished_at, the ORIGINAL created_at)
+	// must be stamped strictly after the latest row for that id, or the
+	// readers' ts tiebreak would keep the earlier terminal row authoritative.
+	t.Run("same_id_restart_floors_ts", func(t *testing.T) {
+		fx := newPipelineFixture(t)
+		_, _, reviewID := fx.addRun(gitLabSnapshot(false))
+		id := int64(100)
+		latestTS := time.Date(2026, 9, 19, 10, 5, 0, 0, time.UTC)
+		fx.checks.seed(reviewID, &stagecheck.Check{
+			StageID: reviewID, Name: webhook.GitLabPipelineCheckContext,
+			State: stagecheck.StatePass, Status: "completed", Conclusion: ptrStr("success"),
+			GitLabPipelineID: &id, Timestamp: latestTS,
+		})
+		body := makeGitLabPipelinePayload(4242, "acme/widgets", 100, "abc123", "running", "2026-09-19 10:00:00 UTC", "", 7)
+		fx.srv.ingestGitLabPipeline(context.Background(), gitLabPipelineEvent("acme/widgets", "gitlab:4242", body))
+		if n := len(fx.checks.appendCalls); n != 1 {
+			t.Fatalf("Append calls = %d, want 1", n)
+		}
+		a := fx.checks.appendCalls[0]
+		if a.Status != "in_progress" {
+			t.Fatalf("row status = %s, want in_progress", a.Status)
+		}
+		if !a.Timestamp.After(latestTS) {
+			t.Fatalf("row ts = %v, want strictly after the latest same-id row (%v), not the payload's created_at", a.Timestamp, latestTS)
+		}
+	})
+	// A DIFFERENT id is never floored: the id key already out-sorts, and
+	// the payload stamp is kept verbatim.
+	t.Run("newer_id_keeps_payload_ts", func(t *testing.T) {
+		fx := newPipelineFixture(t)
+		_, _, reviewID := fx.addRun(gitLabSnapshot(false))
+		id := int64(100)
+		fx.checks.seed(reviewID, &stagecheck.Check{
+			StageID: reviewID, Name: webhook.GitLabPipelineCheckContext,
+			State: stagecheck.StatePass, Status: "completed", Conclusion: ptrStr("success"),
+			GitLabPipelineID: &id, Timestamp: time.Date(2026, 9, 19, 11, 5, 0, 0, time.UTC),
+		})
+		body := makeGitLabPipelinePayload(4242, "acme/widgets", 101, "abc123", "failed", "2026-09-19 10:00:00 UTC", "2026-09-19 10:05:00 UTC", 7)
+		fx.srv.ingestGitLabPipeline(context.Background(), gitLabPipelineEvent("acme/widgets", "gitlab:4242", body))
+		if n := len(fx.checks.appendCalls); n != 1 {
+			t.Fatalf("Append calls = %d, want 1", n)
+		}
+		if want := time.Date(2026, 9, 19, 10, 5, 0, 0, time.UTC); !fx.checks.appendCalls[0].Timestamp.Equal(want) {
+			t.Fatalf("row ts = %v, want the payload's finished_at %v (no floor across ids)", fx.checks.appendCalls[0].Timestamp, want)
+		}
+	})
 	t.Run("newer_incoming_appends", func(t *testing.T) {
 		fx := newPipelineFixture(t)
 		_, _, reviewID := fx.addRun(gitLabSnapshot(false))

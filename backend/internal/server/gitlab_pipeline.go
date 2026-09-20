@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -47,7 +48,9 @@ type gitLabPipelinePayload struct {
 // on GitLab's side degrades to the now() fallback rather than a parse
 // error. Since precedence within a check_name is decided by
 // gitlab_pipeline_id (see ingestGitLabPipeline), a wrong parse can no
-// longer flip which row is latest — it only mis-stamps ts.
+// longer flip which row is latest across ids — it only mis-stamps ts;
+// within ONE id the same-id floor in ingestGitLabPipeline keeps delivery
+// order authoritative.
 var gitLabPipelineTimestampLayouts = []string{
 	time.RFC3339Nano,
 	time.RFC3339,
@@ -145,6 +148,19 @@ func gitLabPipelineCheckState(status string, allowSkipped bool) (checkStatus str
 // never surface. Deleting the skip leaves every precedence test green
 // (pinned by the counterfactual in gitlab_pipeline_pg_test.go).
 //
+// Same-id restart: a retried JOB keeps its pipeline id, so the id key is
+// a tie and the readers fall through to `ts DESC`. A nonterminal restart
+// event carries no finished_at and stamps the pipeline's ORIGINAL
+// created_at, which predates the terminal row it supersedes — a
+// ts-ordered tie would keep the earlier success authoritative while CI
+// is running. So the same latest read also FLOORS the row: when the
+// latest row carries the SAME id and a ts >= the payload's, the new row
+// is stamped latest.ts + 1µs (timestamptz resolution), making delivery
+// order authoritative within one pipeline id. That floor IS
+// correctness-bearing (pinned by TestGitLabPipelinePG_SameIDRestart:
+// success → running → failed for one id must read pending, then fail);
+// a failed latest read degrades to the payload timestamp with a WARN.
+//
 // Skipped pipelines: `skipped` is recorded as pass ONLY when the run's
 // RequiredChecksSnapshot carries GitLabAllowSkippedPipeline; a run with a
 // nil snapshot (or the flag off) records the fail-bucket conclusion
@@ -228,16 +244,29 @@ func (s *Server) ingestGitLabPipeline(ctx context.Context, ev webhook.Event) {
 		allowSkipped := r != nil && r.RequiredChecksSnapshot != nil && r.RequiredChecksSnapshot.GitLabAllowSkippedPipeline
 		checkStatus, conclusion := gitLabPipelineCheckState(p.ObjectAttributes.Status, allowSkipped)
 
-		// Write-avoidance only — see the doc comment. Correctness lives
-		// in the readers' ORDER BY, not here.
+		// The latest read serves two purposes: the `>` skip is
+		// write-avoidance only (see the doc comment), but the SAME-ID
+		// ts floor is correctness-bearing — a retried job keeps the
+		// pipeline id, so a later status for that id must out-sort the
+		// terminal row it supersedes on the readers' ts tiebreak.
+		rowTS := ts
 		latest, err := s.cfg.StageCheckRepo.LatestForStageAndName(ctx, ref.StageID, webhook.GitLabPipelineCheckContext)
-		if err == nil && latest != nil && latest.GitLabPipelineID != nil && *latest.GitLabPipelineID > pipelineID {
+		switch {
+		case err != nil && !errors.Is(err, stagecheck.ErrNotFound):
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "gitlab pipeline: latest-row read failed; recording with the payload timestamp",
+				slog.String("stage_id", ref.StageID.String()),
+				slog.Int64("pipeline_id", pipelineID),
+				slog.String("error", err.Error()),
+			)
+		case err == nil && latest != nil && latest.GitLabPipelineID != nil && *latest.GitLabPipelineID > pipelineID:
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "gitlab pipeline: superseded by a newer pipeline on this stage; not recorded",
 				slog.String("stage_id", ref.StageID.String()),
 				slog.Int64("pipeline_id", pipelineID),
 				slog.Int64("latest_pipeline_id", *latest.GitLabPipelineID),
 			)
 			continue
+		case err == nil && latest != nil && latest.GitLabPipelineID != nil && *latest.GitLabPipelineID == pipelineID && !rowTS.After(latest.Timestamp):
+			rowTS = latest.Timestamp.Add(time.Microsecond)
 		}
 
 		id := pipelineID
@@ -248,7 +277,7 @@ func (s *Server) ingestGitLabPipeline(ctx context.Context, ev webhook.Event) {
 			Conclusion:       conclusion,
 			HeadSHA:          p.ObjectAttributes.SHA,
 			GitLabPipelineID: &id,
-			Timestamp:        ts,
+			Timestamp:        rowTS,
 			Payload:          ev.RawBody,
 		}); err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "gitlab pipeline: append failed",

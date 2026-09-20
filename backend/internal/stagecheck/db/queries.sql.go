@@ -170,7 +170,8 @@ type GetStageCheckLatestParams struct {
 
 // Single-check variant of ListStageChecksLatest. Used internally
 // when a reader asks "what's the latest state of this one check?"
-// (the GitLab pipeline ingester's write-avoidance read). Returns
+// (the GitLab pipeline ingester's write-avoidance skip and same-id ts
+// floor). Returns
 // ErrNoRows when the check has never been observed (caller maps to
 // not_tracked).
 //

@@ -599,6 +599,56 @@ func TestGitLabPipelinePG_ReevalReach(t *testing.T) {
 	assertBranch(t, fx.verdict(t, b.run.ID), "contexts_pending")
 }
 
+// TestGitLabPipelinePG_SameIDRestart pins the same-id ts floor against
+// real SQL: a retried JOB keeps pipeline id 100, so success (finished_at
+// T2) → running (no finished_at; created_at T1 < T2) → failed (finished_at
+// T3) all tie on the id key and fall through to `ts DESC`. Without the
+// floor the running row would be stamped T1 and the earlier success would
+// stay authoritative while CI is running (Satisfied = true); with it the
+// running row out-sorts the success (contexts_pending), and the terminal
+// row then out-sorts the running row (contexts_failed). The second arm
+// delivers the terminal event with a STALE finished_at (== T2) to show
+// that delivery order, not the payload stamp, decides within one id.
+func TestGitLabPipelinePG_SameIDRestart(t *testing.T) {
+	const t1c, t2f, t3f = "2026-09-19 10:00:00 UTC", "2026-09-19 10:05:00 UTC", "2026-09-19 10:30:00 UTC"
+	for name, terminalFinishedAt := range map[string]string{"later_finished_at": t3f, "stale_finished_at": t2f} {
+		t.Run(name, func(t *testing.T) {
+			pf := newPGProjectsForge(t, true, true)
+			fx := newGitLabPipelinePGFixture(t, pf.f)
+			pr := fx.mintRun(t, "acme/widgets", "gitlab:4242", 24, 7, "abc123")
+
+			fx.deliver(t, "acme/widgets", "gitlab:4242", 100, "abc123", "success", t1c, t2f, 7)
+			if v := fx.verdict(t, pr.run.ID); !v.Satisfied {
+				t.Fatalf("precondition: Satisfied = false after 100 success (branch=%v)", v.Details["branch"])
+			}
+
+			// Job retry: same id, status running, no finished_at, ORIGINAL created_at.
+			fx.deliver(t, "acme/widgets", "gitlab:4242", 100, "abc123", "running", t1c, "", 7)
+			assertBranch(t, fx.verdict(t, pr.run.ID), "contexts_pending")
+			row := fx.latestPipelineRow(t, pr.reviewStageID)
+			if row == nil || row.GitLabPipelineID == nil || *row.GitLabPipelineID != 100 || row.Status != "in_progress" {
+				t.Fatalf("latest row after restart = %+v, want pipeline 100 / in_progress", row)
+			}
+			if success := mustTime(t, "2026-09-19T10:05:00Z"); !row.Timestamp.After(success) {
+				t.Fatalf("running row ts = %v, want strictly after the superseded success (%v) — the same-id floor must lift created_at", row.Timestamp, success)
+			}
+			if g, n := fx.latestPolicyCIGreen(t, pr.run.ID, pr.implStageID); n != 2 || g == nil || !*g {
+				t.Errorf("after restart: policy_evaluated rows = %d ci_green = %v, want 2 rows (no re-eval on a nonterminal row) and the prior &true", n, g)
+			}
+
+			fx.deliver(t, "acme/widgets", "gitlab:4242", 100, "abc123", "failed", t1c, terminalFinishedAt, 7)
+			assertBranch(t, fx.verdict(t, pr.run.ID), "contexts_failed")
+			row = fx.latestPipelineRow(t, pr.reviewStageID)
+			if row == nil || row.Conclusion == nil || *row.Conclusion != "failure" {
+				t.Fatalf("latest row after terminal = %+v, want failure", row)
+			}
+			if g, n := fx.latestPolicyCIGreen(t, pr.run.ID, pr.implStageID); n != 3 || g == nil || *g {
+				t.Errorf("after terminal: policy_evaluated rows = %d ci_green = %v, want 3 rows and &false", n, g)
+			}
+		})
+	}
+}
+
 // mustTime parses an RFC 3339 instant or fails the test.
 func mustTime(t *testing.T, s string) time.Time {
 	t.Helper()
