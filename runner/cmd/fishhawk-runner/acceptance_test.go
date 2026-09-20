@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1963,6 +1964,7 @@ func TestAcceptenv_ExcludesPreviewVars(t *testing.T) {
 		previewTeardownCmdEnv + "=scripts/dev preview-down",
 		previewProvisionTimeoutSecsEnv + "=300",
 		previewReadyTimeoutSecsEnv + "=60",
+		acceptanceNetSandboxEnvVar + "=off",
 	}
 	env, refused := acceptenv.Env(base, "http://127.0.0.1:9")
 	if len(refused) != 0 {
@@ -1972,6 +1974,201 @@ func TestAcceptenv_ExcludesPreviewVars(t *testing.T) {
 		if strings.HasPrefix(kv, "FISHHAWK_ACCEPTANCE_PREVIEW") {
 			t.Errorf("preview var survived acceptenv: %s", kv)
 		}
+		// The net-sandbox policy var is runner-process config too (#3393):
+		// it must never reach the sandboxed agent, where a nested process
+		// could read it to learn the kill switch exists.
+		if strings.HasPrefix(kv, acceptanceNetSandboxEnvVar+"=") {
+			t.Errorf("net-sandbox policy var survived acceptenv: %s", kv)
+		}
+	}
+}
+
+// --- net sandbox (#3393) run()-level cases ---------------------------------
+
+// withNetSandboxProbe swaps the host probe seam for the test's duration.
+func withNetSandboxProbe(t *testing.T, available bool, reason string) {
+	t.Helper()
+	orig := probeNetSandbox
+	probeNetSandbox = func(context.Context) (bool, string) { return available, reason }
+	t.Cleanup(func() { probeNetSandbox = orig })
+}
+
+// TestRun_AcceptanceStage_NetSandboxRequired_Unavailable_FailsPreSpawn:
+// mode require with the sandbox unavailable fails category-C with NO agent
+// invocation and no ShipAcceptance — the stage never runs env-only when the
+// operator demanded OS-level confinement.
+func TestRun_AcceptanceStage_NetSandboxRequired_Unavailable_FailsPreSpawn(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	t.Setenv(acceptanceNetSandboxEnvVar, "require")
+	withNetSandboxProbe(t, false, "net-sandbox unavailable: test-injected")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0 (never run env-only under require)", invoker.callIdx)
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"event":"acceptance_net_sandbox_required"`) ||
+		!strings.Contains(out, `"reason":"acceptance_net_sandbox_required","category":"C"`) ||
+		!strings.Contains(out, "test-injected") {
+		t.Errorf("missing category-C acceptance_net_sandbox_required naming the reason: %s", out)
+	}
+	if fu.gotAcceptanceArgs != nil {
+		t.Error("ShipAcceptance must not be called when the required sandbox is unavailable")
+	}
+}
+
+// TestRun_AcceptanceStage_NetSandboxAuto_Unavailable_ProceedsLoudly: the
+// default mode with the sandbox unavailable proceeds env-only — but LOUDLY
+// (acceptance_net_sandbox_unavailable naming the reason) and with no wrapper
+// on the invocation.
+func TestRun_AcceptanceStage_NetSandboxAuto_Unavailable_ProceedsLoudly(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	// No env var set: the DEFAULT must be auto.
+	withNetSandboxProbe(t, false, "net-sandbox unavailable: test-injected")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"event":"acceptance_net_sandbox_unavailable"`) ||
+		!strings.Contains(out, `"mode":"auto"`) ||
+		!strings.Contains(out, "test-injected") ||
+		!strings.Contains(out, `"enforcement":"env-only"`) {
+		t.Errorf("missing loud acceptance_net_sandbox_unavailable{mode:auto,reason,enforcement}: %s", out)
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invocation not captured")
+	}
+	if len(invoker.gotInv.ExecWrapper) != 0 {
+		t.Errorf("ExecWrapper = %q, want none when unavailable", invoker.gotInv.ExecWrapper)
+	}
+	if fu.gotAcceptanceArgs == nil {
+		t.Error("verdict must ship on the auto+unavailable path")
+	}
+}
+
+// TestRun_AcceptanceStage_NetSandboxAuto_Available_WrapsSpawn: with the
+// sandbox available the invocation carries the sandbox-exec wrapper whose
+// profile admits the LIVE proxy's actual port and denies everything else;
+// the fakeInvoker is what receives it, so this pins the main.go wiring
+// (deleting `inv.ExecWrapper = sandboxWrapper` reddens it).
+func TestRun_AcceptanceStage_NetSandboxAuto_Available_WrapsSpawn(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	withNetSandboxProbe(t, true, "")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"event":"acceptance_net_sandbox_applied"`) ||
+		!strings.Contains(out, `"mechanism":"seatbelt"`) {
+		t.Errorf("missing acceptance_net_sandbox_applied{seatbelt}: %s", out)
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invocation not captured")
+	}
+	w := invoker.gotInv.ExecWrapper
+	if len(w) != 3 || w[0] != "sandbox-exec" || w[1] != "-p" {
+		t.Fatalf("ExecWrapper = %q, want sandbox-exec -p <profile>", w)
+	}
+	// The profile must admit the port the LIVE proxy actually bound — read
+	// it back from the HTTPS_PROXY acceptenv pointed the agent at.
+	var proxyPort string
+	for _, kv := range invoker.gotInv.BaseEnv {
+		if strings.HasPrefix(kv, "HTTPS_PROXY=http://") {
+			_, proxyPort, _ = net.SplitHostPort(strings.TrimPrefix(kv, "HTTPS_PROXY=http://"))
+		}
+	}
+	if proxyPort == "" {
+		t.Fatalf("no HTTPS_PROXY in BaseEnv: %q", invoker.gotInv.BaseEnv)
+	}
+	if !strings.Contains(w[2], `(allow network-outbound (remote ip "localhost:`+proxyPort+`"))`) {
+		t.Errorf("profile does not admit the live proxy port %s:\n%s", proxyPort, w[2])
+	}
+	if !strings.Contains(w[2], `(deny network-outbound (remote ip "*:*"))`) {
+		t.Errorf("profile lacks the deny clause:\n%s", w[2])
+	}
+	if strings.Contains(w[2], "anthropic") || strings.Contains(w[2], "fishhawk.test") {
+		t.Errorf("profile admits a non-loopback host direct:\n%s", w[2])
+	}
+	if fu.gotAcceptanceArgs == nil {
+		t.Error("verdict must ship on the applied path")
+	}
+}
+
+// TestRun_AcceptanceStage_NetSandboxOff_NoWrapper: the kill switch logs
+// acceptance_net_sandbox_disabled, never probes, and hands the agent an
+// unwrapped invocation.
+func TestRun_AcceptanceStage_NetSandboxOff_NoWrapper(t *testing.T) {
+	_, _, args := acceptanceStageSetup(t)
+	t.Setenv(acceptanceNetSandboxEnvVar, "off")
+	orig := probeNetSandbox
+	probeNetSandbox = func(context.Context) (bool, string) {
+		t.Error("probe must not run under mode off")
+		return true, ""
+	}
+	t.Cleanup(func() { probeNetSandbox = orig })
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"acceptance_net_sandbox_disabled"`) {
+		t.Errorf("missing acceptance_net_sandbox_disabled: %s", stderr.String())
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invocation not captured")
+	}
+	if len(invoker.gotInv.ExecWrapper) != 0 {
+		t.Errorf("ExecWrapper = %q, want none under off", invoker.gotInv.ExecWrapper)
+	}
+	// The policy var itself never reaches the agent.
+	for _, kv := range invoker.gotInv.BaseEnv {
+		if strings.HasPrefix(kv, acceptanceNetSandboxEnvVar+"=") {
+			t.Errorf("policy var leaked into BaseEnv: %s", kv)
+		}
+	}
+}
+
+// TestRun_AcceptanceStage_NetSandboxInvalidMode_FailsPreSpawn: a
+// misspelled policy value fails category-C before any spawn rather than
+// silently degrading to some mode the operator did not choose.
+func TestRun_AcceptanceStage_NetSandboxInvalidMode_FailsPreSpawn(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	t.Setenv(acceptanceNetSandboxEnvVar, "strict")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0", invoker.callIdx)
+	}
+	if !strings.Contains(stderr.String(), `"reason":"acceptance_net_sandbox_config","category":"C"`) {
+		t.Errorf("missing category-C acceptance_net_sandbox_config: %s", stderr.String())
+	}
+	if fu.gotAcceptanceArgs != nil {
+		t.Error("ShipAcceptance must not be called on a config failure")
 	}
 }
 

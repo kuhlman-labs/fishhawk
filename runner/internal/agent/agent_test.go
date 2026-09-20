@@ -243,3 +243,50 @@ func TestIsArgListTooLong(t *testing.T) {
 		}
 	}
 }
+
+// TestWrapArgv pins the ExecWrapper spawn contract (#3393): an empty wrapper
+// is byte-identical to the unwrapped spawn; a non-empty wrapper becomes the
+// process name with wrapper[1:] ++ [binary] ++ args as argv, in that exact
+// order; and args ride through positionally — never interpolated into the
+// wrapper — so quotes, spaces and $(...) reach the child verbatim.
+func TestWrapArgv(t *testing.T) {
+	args := []string{"-p", `it's "quoted" $(rm -rf /) with spaces`, "--model", "m"}
+
+	t.Run("empty wrapper is identity", func(t *testing.T) {
+		for _, w := range [][]string{nil, {}} {
+			name, argv := WrapArgv(w, "/usr/local/bin/claude", args)
+			if name != "/usr/local/bin/claude" {
+				t.Fatalf("name = %q, want the binary", name)
+			}
+			if !reflect.DeepEqual(argv, args) {
+				t.Fatalf("argv = %q, want byte-identical %q", argv, args)
+			}
+		}
+	})
+	t.Run("wrapper prefix ordering", func(t *testing.T) {
+		wrapper := []string{"sandbox-exec", "-p", "(version 1)\n(allow default)\n"}
+		name, argv := WrapArgv(wrapper, "/usr/local/bin/claude", args)
+		if name != "sandbox-exec" {
+			t.Fatalf("name = %q, want wrapper[0]", name)
+		}
+		want := []string{"-p", "(version 1)\n(allow default)\n", "/usr/local/bin/claude",
+			"-p", `it's "quoted" $(rm -rf /) with spaces`, "--model", "m"}
+		if !reflect.DeepEqual(argv, want) {
+			t.Fatalf("argv =\n%q\nwant\n%q", argv, want)
+		}
+	})
+	t.Run("single-element wrapper", func(t *testing.T) {
+		name, argv := WrapArgv([]string{"/usr/bin/env"}, "bin", []string{"a"})
+		if name != "/usr/bin/env" || !reflect.DeepEqual(argv, []string{"bin", "a"}) {
+			t.Fatalf("got %q %q", name, argv)
+		}
+	})
+	t.Run("caller slices not aliased", func(t *testing.T) {
+		wrapper := []string{"w", "-x"}
+		_, argv := WrapArgv(wrapper, "bin", args)
+		argv[0] = "mutated"
+		if wrapper[1] != "-x" || args[0] != "-p" {
+			t.Fatal("WrapArgv aliased a caller slice")
+		}
+	})
+}

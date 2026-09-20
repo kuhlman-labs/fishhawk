@@ -109,9 +109,10 @@ never reaches this package.
 - `HTTP(S)_PROXY` / `ALL_PROXY` (both cases) pointed at the proxy, with
   `NO_PROXY` cleared;
 - `FISHHAWK_FORGE_WRITES=deny` (E72.13 / #3500), a FIXED injection never
-  copied from the base env: every descendant `fishhawk-runner` the
-  acceptance agent could spawn inherits it and refuses pre-spawn
-  (`runner_failed forge_writes_denied`, category C). A passthrough named
+  copied from the base env: a descendant `fishhawk-runner` that INHERITS
+  the env refuses pre-spawn (`runner_failed forge_writes_denied`,
+  category C). Inheritance is NOT the control that confines descendants
+  (#3393 — an `env -i` spawn sheds it); the OS-level net sandbox below is. A passthrough named
   `FISHHAWK_FORGE_WRITES` (any case) is REFUSED and reported exactly like
   a proxy-var passthrough; a base-env value is dropped by the allow-list,
   so the injected deny is the only entry under that name
@@ -126,12 +127,20 @@ MCP token (ADR-050 decision 2); evidence ships signature-authed.
 The E31.7 runner acceptance executor (#1535) calls `BuildAllowlist` →
 `Start` → `acceptenv.Env` around the acceptance invocation.
 
-Residual: proxy env binds cooperating clients only — a raw-socket
-bypass needs the OS sandbox (#611-class). Documented as a security
-invariant in `docs/ARCHITECTURE.md` §6. The verb-level deny table above
-adds two more stated residuals (Go loopback bypass, `Mcp-Name` omission /
-spoof), which is why the server-side dev-mode refusal, not this proxy,
-is the control that closed #3500.
+Proxy env binds cooperating clients only. The raw-socket / cleared-env
+bypass — a descendant that never reads `HTTP(S)_PROXY`, the #3393
+incident shape — is CLOSED on macOS by `runner/internal/netsandbox`
+(E72 / #3393): the acceptance spawn is wrapped in `sandbox-exec -p
+<profile>`, a Seatbelt profile inherited by every descendant that denies
+every outbound IP connection except this proxy's loopback port and the
+allow-list's loopback entries, so the only route out is THROUGH this
+proxy. It remains a residual on Linux (no equivalent ships; the runner
+logs `acceptance_net_sandbox_unavailable` there — see the netsandbox
+README) and for unix-domain sockets. Documented as a security invariant
+in `docs/ARCHITECTURE.md` §6. The verb-level deny table above adds two
+more stated residuals (Go loopback bypass, `Mcp-Name` omission / spoof),
+which is why the server-side dev-mode refusal, not this proxy, is the
+control that closed #3500.
 
 ## Acceptance containment posture (Rule-of-Two, ADR-050 / #1532)
 

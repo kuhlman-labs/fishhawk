@@ -352,7 +352,11 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		args = append(args, "--json-schema", inv.JSONSchema)
 	}
 	args = append(args, "-p", inv.Prompt)
-	cmd := cmdFn(ctx, binary, args...)
+	// An ExecWrapper (the acceptance net sandbox, #3393) becomes the
+	// process name with the binary + args appended positionally; an empty
+	// wrapper leaves the spawn byte-identical.
+	spawnName, spawnArgs := agent.WrapArgv(inv.ExecWrapper, binary, args)
+	cmd := cmdFn(ctx, spawnName, spawnArgs...)
 	cmd.Dir = inv.WorkingDir
 	// Compose env so a Cmd builder (e.g. tests) can pre-set
 	// vars on cmd.Env and we layer the API key on top. nil means
@@ -423,7 +427,7 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		// thinking-block retry below never re-spends it.
 		if agent.IsArgListTooLong(err) {
 			return res, false, fmt.Errorf("%w: prompt %d bytes, argv %d bytes (%s): %v",
-				agent.ErrPromptTooLarge, len(inv.Prompt), agent.ArgvBytes(append([]string{binary}, args...)), binary, err)
+				agent.ErrPromptTooLarge, len(inv.Prompt), agent.ArgvBytes(append([]string{spawnName}, spawnArgs...)), binary, err)
 		}
 		return res, false, fmt.Errorf("claudecode: start: %w", err)
 	}
