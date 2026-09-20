@@ -163,6 +163,11 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 					Message: "deploy stage must not use an agent or human executor; it delegates to an external pipeline via executor.delegate (ADR-038)",
 				}
 			}
+			if err := validateWebhookSecretChannel(stage.Executor.Delegate, func(suffix string) string {
+				return stagePath(i, "/executor/delegate"+suffix)
+			}); err != nil {
+				return err
+			}
 		} else if stage.Executor.Delegate != nil {
 			// A delegating executor is meaningless off a deploy stage. This
 			// else-branch is type-generic: it fires for an acceptance stage
@@ -699,6 +704,58 @@ func validateApproverRefs(s *Spec, gatePath, key string, refs []string) error {
 					role,
 				),
 			}
+		}
+	}
+	return nil
+}
+
+// webhookSecretEnvForbiddenPrefixes is Fishhawk's own configuration
+// namespace. A webhook delegate's secret_env naming a variable under it would
+// let a committed spec exfiltrate fishhawkd's own credentials (database URL,
+// forge tokens) to an arbitrary URL, so validateWebhookSecretChannel refuses
+// it at run admission.
+var webhookSecretEnvForbiddenPrefixes = []string{"FISHHAWKD_", "FISHHAWK_"}
+
+// validateWebhookSecretChannel applies the SEMANTIC rules of a webhook
+// delegate's secret channel (E45.57 / #3497) that the JSON Schema cannot
+// express (santhosh-tekuri/jsonschema compiles `pattern` with Go regexp, which
+// has no negative lookahead, and the reserved-key set lives in Go):
+//
+//	(a) secret_env MUST NOT start with FISHHAWKD_ or FISHHAWK_ — the
+//	    exfiltration guard over Fishhawk's own configuration namespace;
+//	(b) secret_field MUST NOT be one of WebhookReservedBodyKeys — the
+//	    correlation marker would be overwritten silently otherwise;
+//	(c) belt-and-braces re-check of the schema's mutual exclusivity of
+//	    secret_header and secret_field.
+//
+// These are SERVER-SIDE rules applied at run admission (POST /v0/runs) by the
+// backend validator; `fishhawk validate` is schema-only and ACCEPTS such a
+// spec. A nil or non-webhook delegate is a no-op. path renders the reported
+// path from a suffix under /executor/delegate.
+func validateWebhookSecretChannel(d *DelegateConfig, path func(suffix string) string) error {
+	if d == nil || d.Target != DelegateTargetWebhook {
+		return nil
+	}
+	for _, prefix := range webhookSecretEnvForbiddenPrefixes {
+		if strings.HasPrefix(d.SecretEnv, prefix) {
+			return &ValidationError{
+				Path: path("/secret_env"),
+				Message: fmt.Sprintf("webhook delegate secret_env %q is in Fishhawk's own configuration namespace (%s); name a variable outside it so a committed spec cannot exfiltrate fishhawkd's credentials",
+					d.SecretEnv, strings.Join(webhookSecretEnvForbiddenPrefixes, " / ")),
+			}
+		}
+	}
+	if d.SecretField != "" && IsWebhookReservedBodyKey(d.SecretField) {
+		return &ValidationError{
+			Path: path("/secret_field"),
+			Message: fmt.Sprintf("webhook delegate secret_field %q collides with a reserved trigger-body key (%s); the correlation marker would be overwritten silently — choose another key",
+				d.SecretField, strings.Join(WebhookReservedBodyKeys, ", ")),
+		}
+	}
+	if d.SecretHeader != "" && d.SecretField != "" {
+		return &ValidationError{
+			Path:    path(""),
+			Message: "webhook delegate declares both secret_header and secret_field; the secret is placed in exactly one of them",
 		}
 	}
 	return nil

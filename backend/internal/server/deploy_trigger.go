@@ -3,11 +3,17 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
@@ -30,7 +36,258 @@ const categoryDeploymentDispatchFailed = "deployment_dispatch_failed"
 // deployHTTPClient is the outbound client for the webhook delegate target. A
 // dedicated client (not http.DefaultClient) bounds the POST and keeps the
 // trigger's outbound surface explicit.
-var deployHTTPClient = &http.Client{Timeout: 30 * time.Second}
+//
+// CheckRedirect returns http.ErrUseLastResponse so NEITHER webhook POST (the
+// forward trigger or the rollback re-dispatch) ever follows a redirect (E45.57
+// / #3497). The POST may carry the resolved secret in a header or the body: a
+// target that reflects the credential into a Location header, or a 307/308
+// that would re-send the header/body to another host, must never produce a
+// second request — Go's default policy would follow a 302 with GET and a
+// 307/308 re-sending the body, and strips only Authorization /
+// WWW-Authenticate / Cookie on a cross-host hop, so a PRIVATE-TOKEN header
+// would be forwarded. A 3xx is returned as-is and lands in the non-2xx arm,
+// whose reason/details carry ONLY the status code (never Location, never the
+// body). CheckRedirect alone is NOT sufficient: net/http parses the Location
+// header BEFORE consulting CheckRedirect and embeds the RAW header in the
+// `failed to parse Location header %q` error, so postWebhookDeploy classifies
+// every Do error into a fixed vocabulary and redacts the secret from every
+// sink instead of propagating err.Error() verbatim.
+var deployHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+// Fixed vocabulary for a webhook deploy POST transport failure (E45.57 /
+// #3497, operator condition 1a). Only the CLASS — never the underlying error
+// string, which can embed a raw Location header carrying the secret — reaches
+// the failure reason, audit details and log line.
+const (
+	webhookErrClassTimeout           = "timeout"
+	webhookErrClassDNS               = "dns"
+	webhookErrClassConnectionRefused = "connection_refused"
+	webhookErrClassTLS               = "tls"
+	webhookErrClassRedirectParse     = "redirect_parse"
+	webhookErrClassOther             = "other"
+)
+
+// webhookLocationParsePrefix is the prefix net/http (client.go) gives the
+// error it returns when a 3xx Location header does not parse; that error is
+// built BEFORE CheckRedirect runs and embeds the raw header verbatim.
+const webhookLocationParsePrefix = "failed to parse Location header"
+
+// classifyWebhookDoError maps a deployHTTPClient.Do error onto the fixed
+// vocabulary above. It inspects the error only through errors.As / prefix
+// checks and returns a constant — the input string is never returned.
+func classifyWebhookDoError(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil && strings.HasPrefix(ue.Err.Error(), webhookLocationParsePrefix) {
+		return webhookErrClassRedirectParse
+	}
+	if strings.HasPrefix(err.Error(), webhookLocationParsePrefix) {
+		return webhookErrClassRedirectParse
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return webhookErrClassTimeout
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return webhookErrClassDNS
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return webhookErrClassConnectionRefused
+	}
+	var certErr *tls.CertificateVerificationError
+	var recErr tls.RecordHeaderError
+	var alertErr tls.AlertError
+	if errors.As(err, &certErr) || errors.As(err, &recErr) || errors.As(err, &alertErr) {
+		return webhookErrClassTLS
+	}
+	return webhookErrClassOther
+}
+
+// redactSecret replaces every occurrence of the resolved secret value in s
+// with "[redacted]". Belt-and-braces (E45.57 / #3497, operator condition 1b):
+// applied to EVERY string that reaches a sink for a webhook dispatch — the
+// failure reason, each string detail value, the error returned upward and the
+// log attrs — so even a sink the classifier does not cover cannot carry the
+// value. An empty value is a no-op (nothing to redact).
+func redactSecret(s, value string) string {
+	if value == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, value, "[redacted]")
+}
+
+// redactSecretDetails applies redactSecret to every string value of details
+// (nested maps are not produced by the webhook path; only the top level is
+// walked) and returns the same map.
+func redactSecretDetails(details map[string]any, value string) map[string]any {
+	for k, v := range details {
+		if str, ok := v.(string); ok {
+			details[k] = redactSecret(str, value)
+		}
+	}
+	return details
+}
+
+// webhookSecretPlacement names where the resolved secret rode for the audit
+// payloads (names only — never the value).
+const (
+	webhookSecretPlacementHeader = "header"
+	webhookSecretPlacementBody   = "body"
+)
+
+// webhookDeployResult is the outcome of a successful (2xx) webhook deploy
+// POST: the NAMES the audit payload records — the variable the secret was
+// read from and where it was placed — never the value.
+type webhookDeployResult struct {
+	SecretEnv       string
+	SecretPlacement string
+	DispatchedAt    time.Time
+}
+
+// webhookDeployError is a webhook deploy POST failure with the secret already
+// redacted from every field. Reason is a caller-prefixable sentence; Details
+// carries only committed/spec-derived or classified values (url, secret_env,
+// status, error_class); Class is set for a transport failure.
+type webhookDeployError struct {
+	Reason  string
+	Details map[string]any
+	Class   string
+}
+
+// webhookTriggerBody builds the JSON trigger body both webhook POST sites
+// send. The flat correlation keys are the ones the reconciler / callback
+// contract already documents; the `variables` object repeats them in
+// CI-variable form so a GitLab pipeline trigger targeted DIRECTLY receives
+// them as `$FISHHAWK_RUN_ID` etc. (E45.57 / #3497). rollback adds the
+// fishhawk_rollback marker in both forms. Every top-level key written here
+// MUST be in spec.WebhookReservedBodyKeys — postWebhookDeploy asserts it.
+func webhookTriggerBody(stage *run.Stage, runRow *run.Run, rollback bool) map[string]any {
+	variables := map[string]string{
+		"FISHHAWK_RUN_ID":      stage.RunID.String(),
+		"FISHHAWK_STAGE_ID":    stage.ID.String(),
+		"FISHHAWK_REPO":        runRow.Repo,
+		"FISHHAWK_WORKFLOW_ID": runRow.WorkflowID,
+	}
+	body := map[string]any{
+		"fishhawk_run_id":   stage.RunID.String(),
+		"fishhawk_stage_id": stage.ID.String(),
+		"repo":              runRow.Repo,
+		"workflow_id":       runRow.WorkflowID,
+	}
+	if rollback {
+		body[rollbackDispatchInput] = true
+		variables["FISHHAWK_ROLLBACK"] = "true"
+	}
+	body["variables"] = variables
+	return body
+}
+
+// lookupDeploySecret resolves the configured secret lookup seam: cfg's
+// injected function, or os.LookupEnv over fishhawkd's own process environment.
+func (s *Server) lookupDeploySecret(name string) (string, bool) {
+	if s.cfg.DeploySecretLookup != nil {
+		return s.cfg.DeploySecretLookup(name)
+	}
+	return os.LookupEnv(name)
+}
+
+// postWebhookDeploy is the ONE shared request builder + dispatcher behind both
+// webhook POST sites (forward trigger and rollback; E45.57 / #3497). It:
+//
+//  1. asserts at runtime that every key in body is in
+//     spec.WebhookReservedBodyKeys — a violation is a programming error that
+//     names the offending KEY, so the validator's reserved set and the
+//     writers can never silently diverge (checked BEFORE the secret field is
+//     inserted; the field itself was validated non-reserved at admission);
+//  2. resolves delegate.secret_env through the lookup seam; unset OR empty
+//     fails naming ONLY the variable name;
+//  3. places the value per SecretPlacement — header → req.Header.Set,
+//     field → a top-level body key — and POSTs through deployHTTPClient,
+//     which never follows a redirect;
+//  4. maps a Do error onto the fixed class vocabulary (never err.Error())
+//     and a non-2xx onto {status, url} ONLY — neither resp.Header (Location)
+//     nor resp.Body is ever read into a sink;
+//  5. redacts the resolved value from every string that leaves this function.
+//
+// The caller has already refused an empty delegate.URL with its own message.
+func (s *Server) postWebhookDeploy(ctx context.Context, stage *run.Stage, delegate *spec.DelegateConfig, body map[string]any) (*webhookDeployResult, *webhookDeployError) {
+	for k := range body {
+		if !spec.IsWebhookReservedBodyKey(k) {
+			return nil, &webhookDeployError{
+				Reason:  fmt.Sprintf("webhook trigger body key %q is not in spec.WebhookReservedBodyKeys (programming error: extend the reserved set)", k),
+				Details: map[string]any{"body_key": k, "url": delegate.URL},
+			}
+		}
+	}
+
+	var secret, placement string
+	header, field := delegate.SecretPlacement()
+	if delegate.SecretEnv != "" {
+		value, ok := s.lookupDeploySecret(delegate.SecretEnv)
+		if !ok || value == "" {
+			state := "unset"
+			if ok {
+				state = "empty"
+			}
+			return nil, &webhookDeployError{
+				Reason:  fmt.Sprintf("webhook secret env var %s is %s in fishhawkd's environment", delegate.SecretEnv, state),
+				Details: map[string]any{"secret_env": delegate.SecretEnv, "url": delegate.URL},
+			}
+		}
+		secret = value
+		if field != "" {
+			body[field] = secret
+			placement = webhookSecretPlacementBody
+		} else {
+			placement = webhookSecretPlacementHeader
+		}
+	}
+	fail := func(reason string, details map[string]any, class string) (*webhookDeployResult, *webhookDeployError) {
+		return nil, &webhookDeployError{
+			Reason:  redactSecret(reason, secret),
+			Details: redactSecretDetails(details, secret),
+			Class:   class,
+		}
+	}
+
+	dispatchedAt := time.Now().UTC()
+	triggerBody, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, delegate.URL, bytes.NewReader(triggerBody))
+	if err != nil {
+		return fail("building webhook request failed", map[string]any{"error": err.Error(), "url": delegate.URL}, "")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if header != "" && secret != "" {
+		req.Header.Set(header, secret)
+	}
+
+	resp, err := deployHTTPClient.Do(req)
+	if err != nil {
+		class := classifyWebhookDoError(err)
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "deploy webhook POST failed",
+			slog.String("run_id", stage.RunID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error_class", class),
+			slog.String("url", redactSecret(delegate.URL, secret)))
+		return fail("webhook POST failed: "+class, map[string]any{"error_class": class, "url": delegate.URL}, class)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Status code ONLY: never Location, never the body.
+		return fail(fmt.Sprintf("webhook POST returned a non-2xx status (%d)", resp.StatusCode),
+			map[string]any{"status": resp.StatusCode, "url": delegate.URL}, "")
+	}
+	return &webhookDeployResult{
+		SecretEnv:       delegate.SecretEnv,
+		SecretPlacement: placement,
+		DispatchedAt:    dispatchedAt,
+	}, nil
+}
 
 // triggerDeploy fires the external delegating pipeline for an approved+dispatched
 // deploy stage and parks it at awaiting_deployment (#1386 / E23.6, ADR-038).
@@ -236,38 +493,20 @@ func (s *Server) triggerDeployGitHubActions(ctx context.Context, stage *run.Stag
 // triggerDeployWebhook POSTs the deploy trigger to the delegate's URL and parks
 // the stage at awaiting_deployment. The external webhook-driven pipeline reports
 // its terminal outcome by calling back into POST /v0/runs/{run_id}/deployment
-// (#1395) — the reconciler does NOT poll webhook targets (slice 2).
+// (#1395) — the reconciler does NOT poll webhook targets (slice 2). The POST
+// goes through postWebhookDeploy, which carries the secret channel
+// (secret_env / secret_header / secret_field), refuses redirects, classifies
+// transport errors and redacts the secret (E45.57 / #3497); every failure
+// fails the stage category C via failDeployTrigger with the NAME of the secret
+// variable at most, never its value.
 func (s *Server) triggerDeployWebhook(ctx context.Context, stage *run.Stage, runRow *run.Run, delegate *spec.DelegateConfig) (*run.Stage, error) {
 	if delegate.URL == "" {
 		return s.failDeployTrigger(ctx, stage,
 			"deploy trigger: webhook delegate is missing url", nil)
 	}
-	dispatchedAt := time.Now().UTC()
-	triggerBody, _ := json.Marshal(map[string]any{
-		"fishhawk_run_id":   stage.RunID.String(),
-		"fishhawk_stage_id": stage.ID.String(),
-		"repo":              runRow.Repo,
-		"workflow_id":       runRow.WorkflowID,
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, delegate.URL, bytes.NewReader(triggerBody))
-	if err != nil {
-		return s.failDeployTrigger(ctx, stage,
-			"deploy trigger: building webhook request failed",
-			map[string]any{"error": err.Error(), "url": delegate.URL})
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := deployHTTPClient.Do(req)
-	if err != nil {
-		return s.failDeployTrigger(ctx, stage,
-			"deploy trigger: webhook POST failed",
-			map[string]any{"error": err.Error(), "url": delegate.URL})
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return s.failDeployTrigger(ctx, stage,
-			"deploy trigger: webhook POST returned a non-2xx status",
-			map[string]any{"status": resp.StatusCode, "url": delegate.URL})
+	res, werr := s.postWebhookDeploy(ctx, stage, delegate, webhookTriggerBody(stage, runRow, false))
+	if werr != nil {
+		return s.failDeployTrigger(ctx, stage, "deploy trigger: "+werr.Reason, werr.Details)
 	}
 
 	payload := map[string]any{
@@ -275,7 +514,12 @@ func (s *Server) triggerDeployWebhook(ctx context.Context, stage *run.Stage, run
 		"stage_id":      stage.ID.String(),
 		"target":        spec.DelegateTargetWebhook,
 		"url":           delegate.URL,
-		"dispatched_at": dispatchedAt.Format(time.RFC3339),
+		"dispatched_at": res.DispatchedAt.Format(time.RFC3339),
+	}
+	if res.SecretEnv != "" {
+		// Names only — the variable read and where its value rode.
+		payload["secret_env"] = res.SecretEnv
+		payload["secret_placement"] = res.SecretPlacement
 	}
 	return s.recordDispatchAndPark(ctx, stage, payload)
 }

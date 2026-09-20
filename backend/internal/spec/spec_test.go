@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -7551,5 +7552,209 @@ func TestIssueEchoPolicyFor_PresetsDeclareLivingAnchorEcho(t *testing.T) {
 				t.Errorf("preset %q IssueEchoPolicyFor(plan) = %+v, want %+v", p, got, want)
 			}
 		})
+	}
+}
+
+// webhookSecretSpecFmt is the workflow-v2 fixture for the webhook delegate
+// secret channel (E45.57 / #3497): %s is the indented delegate tail (the
+// secret_* keys) spliced under `url`.
+const webhookSecretSpecFmt = `
+version: "2"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: webhook
+            url: https://gitlab.example.com/api/v4/projects/7/trigger/pipeline?ref=main
+%s
+        produces:
+          - artifact: deployment
+`
+
+// TestParse_V2Deploy_WebhookSecretEnv_Valid: the three declarable shapes of
+// the secret channel parse, and SecretPlacement resolves each — including the
+// PRIVATE-TOKEN default when only secret_env is set (the done-means test for
+// the default value).
+func TestParse_V2Deploy_WebhookSecretEnv_Valid(t *testing.T) {
+	cases := []struct {
+		name       string
+		tail       string
+		wantHeader string
+		wantField  string
+	}{
+		{
+			name:       "secret_env_alone_defaults_to_private_token",
+			tail:       "            secret_env: DEPLOY_TRIGGER_TOKEN",
+			wantHeader: spec.DelegateDefaultSecretHeader,
+		},
+		{
+			name:       "secret_env_with_custom_header",
+			tail:       "            secret_env: DEPLOY_TRIGGER_TOKEN\n            secret_header: X-Deploy-Token",
+			wantHeader: "X-Deploy-Token",
+		},
+		{
+			name:      "secret_env_with_body_field",
+			tail:      "            secret_env: DEPLOY_TRIGGER_TOKEN\n            secret_field: token",
+			wantField: "token",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := spec.ParseBytes([]byte(fmt.Sprintf(webhookSecretSpecFmt, tc.tail)))
+			if err != nil {
+				t.Fatalf("ParseBytes: %v", err)
+			}
+			d := s.Workflows["release"].Stages[0].Executor.Delegate
+			if d == nil || d.SecretEnv != "DEPLOY_TRIGGER_TOKEN" {
+				t.Fatalf("Delegate = %+v, want secret_env DEPLOY_TRIGGER_TOKEN", d)
+			}
+			header, field := d.SecretPlacement()
+			if header != tc.wantHeader || field != tc.wantField {
+				t.Errorf("SecretPlacement() = (%q, %q), want (%q, %q)", header, field, tc.wantHeader, tc.wantField)
+			}
+		})
+	}
+	if spec.DelegateDefaultSecretHeader != "PRIVATE-TOKEN" {
+		t.Errorf("DelegateDefaultSecretHeader = %q, want PRIVATE-TOKEN", spec.DelegateDefaultSecretHeader)
+	}
+	var none *spec.DelegateConfig
+	if h, f := none.SecretPlacement(); h != "" || f != "" {
+		t.Errorf("nil SecretPlacement() = (%q, %q), want empty", h, f)
+	}
+	if h, f := (&spec.DelegateConfig{Target: spec.DelegateTargetWebhook}).SecretPlacement(); h != "" || f != "" {
+		t.Errorf("no-secret SecretPlacement() = (%q, %q), want empty", h, f)
+	}
+}
+
+// TestParse_V2Deploy_WebhookSecret_HeaderAndField_Rejected: the schema's
+// `not: {required: [secret_header, secret_field]}` refuses both placements.
+func TestParse_V2Deploy_WebhookSecret_HeaderAndField_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(fmt.Sprintf(webhookSecretSpecFmt,
+		"            secret_env: DEPLOY_TRIGGER_TOKEN\n            secret_header: X-Deploy-Token\n            secret_field: token")))
+	if err == nil {
+		t.Fatal("ParseBytes accepted secret_header AND secret_field; want a schema rejection")
+	}
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %T %v, want *SchemaError", err, err)
+	}
+}
+
+// TestParse_V2Deploy_WebhookSecretHeader_WithoutEnv_Rejected: the schema's
+// dependentRequired refuses a placement declared without secret_env.
+func TestParse_V2Deploy_WebhookSecretHeader_WithoutEnv_Rejected(t *testing.T) {
+	for _, tail := range []string{
+		"            secret_header: X-Deploy-Token",
+		"            secret_field: token",
+	} {
+		_, err := spec.ParseBytes([]byte(fmt.Sprintf(webhookSecretSpecFmt, tail)))
+		if err == nil {
+			t.Errorf("ParseBytes accepted %q without secret_env; want a schema rejection", strings.TrimSpace(tail))
+			continue
+		}
+		var se *spec.SchemaError
+		if !errors.As(err, &se) {
+			t.Errorf("err = %T %v, want *SchemaError", err, err)
+		}
+	}
+}
+
+// TestParse_V2Deploy_WebhookSecretEnv_FishhawkNamespace_Rejected: the
+// semantic validator refuses a secret_env in Fishhawk's own configuration
+// namespace at the delegate path (the exfiltration guard).
+func TestParse_V2Deploy_WebhookSecretEnv_FishhawkNamespace_Rejected(t *testing.T) {
+	for _, name := range []string{"FISHHAWKD_DATABASE_URL", "FISHHAWK_GITLAB_TOKEN"} {
+		t.Run(name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(fmt.Sprintf(webhookSecretSpecFmt, "            secret_env: "+name)))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %T %v, want *ValidationError", err, err)
+			}
+			if want := "/workflows/release/stages/0/executor/delegate/secret_env"; ve.Path != want {
+				t.Errorf("path = %q, want %q", ve.Path, want)
+			}
+			if !strings.Contains(ve.Message, name) || !strings.Contains(ve.Message, "FISHHAWKD_") || !strings.Contains(ve.Message, "FISHHAWK_") {
+				t.Errorf("message = %q, want it to name %s and both prefixes", ve.Message, name)
+			}
+		})
+	}
+	// A name merely CONTAINING the prefix is fine — the guard is prefix-anchored.
+	if _, err := spec.ParseBytes([]byte(fmt.Sprintf(webhookSecretSpecFmt, "            secret_env: MY_FISHHAWK_TOKEN"))); err != nil {
+		t.Errorf("MY_FISHHAWK_TOKEN refused: %v; the guard must be prefix-anchored", err)
+	}
+}
+
+// TestParse_V2Deploy_WebhookSecretField_ReservedKey_Rejected iterates a
+// HARDCODED literal list of the six reserved trigger-body keys (operator
+// condition 2 on #3497) and SEPARATELY asserts that list equals
+// spec.WebhookReservedBodyKeys order-insensitively. Removing a key from the
+// exported slice reddens BOTH the equality assertion and that key's row (the
+// validator no longer refuses it), which is what proves the slice is what the
+// validator reads.
+func TestParse_V2Deploy_WebhookSecretField_ReservedKey_Rejected(t *testing.T) {
+	reserved := []string{"fishhawk_run_id", "fishhawk_stage_id", "fishhawk_rollback", "repo", "workflow_id", "variables"}
+
+	want := append([]string(nil), reserved...)
+	got := append([]string(nil), spec.WebhookReservedBodyKeys...)
+	sort.Strings(want)
+	sort.Strings(got)
+	if !reflect.DeepEqual(want, got) {
+		t.Errorf("spec.WebhookReservedBodyKeys = %v, want the hardcoded set %v (order-insensitive)", got, want)
+	}
+	for _, k := range reserved {
+		if !spec.IsWebhookReservedBodyKey(k) {
+			t.Errorf("IsWebhookReservedBodyKey(%q) = false, want true", k)
+		}
+	}
+	if spec.IsWebhookReservedBodyKey("token") {
+		t.Error("IsWebhookReservedBodyKey(token) = true, want false")
+	}
+
+	for _, k := range reserved {
+		t.Run(k, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(fmt.Sprintf(webhookSecretSpecFmt,
+				"            secret_env: DEPLOY_TRIGGER_TOKEN\n            secret_field: "+k)))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("secret_field %q: err = %T %v, want *ValidationError", k, err, err)
+			}
+			if want := "/workflows/release/stages/0/executor/delegate/secret_field"; ve.Path != want {
+				t.Errorf("path = %q, want %q", ve.Path, want)
+			}
+			if !strings.Contains(ve.Message, k) || !strings.Contains(ve.Message, "reserved") {
+				t.Errorf("message = %q, want it to name %q as reserved", ve.Message, k)
+			}
+		})
+	}
+}
+
+// TestParse_V1Deploy_WebhookSecretEnv_Rejected: workflow-v1 is frozen — a
+// version "1.0" document carrying secret_env fails the v1 schema's
+// unevaluatedProperties:false.
+func TestParse_V1Deploy_WebhookSecretEnv_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: webhook
+            url: https://example.com/deploy
+            secret_env: DEPLOY_TRIGGER_TOKEN
+        produces:
+          - artifact: deployment
+`))
+	if err == nil {
+		t.Fatal("v1 ParseBytes accepted secret_env; the v1 schema is frozen")
+	}
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %T %v, want *SchemaError", err, err)
 	}
 }

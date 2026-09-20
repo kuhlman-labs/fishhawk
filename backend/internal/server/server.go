@@ -275,6 +275,15 @@ type Config struct {
 	// GitHubTokens is nil.
 	GitHub *githubclient.Client
 
+	// DeploySecretLookup resolves a webhook deploy delegate's
+	// executor.delegate.secret_env at deploy dispatch (E45.57 / #3497):
+	// it is handed the variable NAME from the run's committed spec and
+	// returns the value plus whether it was set. Nil → os.LookupEnv over
+	// fishhawkd's own process environment — the value is never in the
+	// spec, only on the host that runs fishhawkd. Tests inject a
+	// map-backed fake by mutating s.cfg after construction.
+	DeploySecretLookup func(name string) (value string, ok bool)
+
 	// IdentityProvider resolves an operator's forge-neutral identity:
 	// device-flow verification, repository permission tier, and
 	// org/team membership. Nil is tolerated — New defaults it to

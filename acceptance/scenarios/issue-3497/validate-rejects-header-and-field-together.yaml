@@ -1,0 +1,14 @@
+id: scenario:issue-3497/validate-rejects-header-and-field-together
+statement: '`fishhawk validate` exits 1 naming the `executor/delegate` path when a webhook delegate declares BOTH `secret_header` and `secret_field`, and when `secret_header` is declared without `secret_env`.'
+verify_hint: 'CLI exit code + stderr: two temp v2 spec files, each exits 1 with an error located under stages[].executor.delegate.'
+steps: 'Same CLI build and spec skeleton: both.yaml (secret_env DEPLOY_TRIGGER_TOKEN + secret_header PRIVATE-TOKEN + secret_field token), header-no-env.yaml (secret_header PRIVATE-TOKEN only), field-no-env.yaml (secret_field token only). Ran `/tmp/fh-acc-fishhawk validate <file>` capturing exit code and stderr.'
+assertions:
+    expected: Exit 1 naming the executor/delegate path for header+field together and for secret_header without secret_env.
+    observed_at_record: 'both.yaml exit 1, stderr includes "/workflows/release/stages/0/executor/delegate: ''not'' failed" (plus sibling oneOf-branch lines); header-no-env.yaml exit 1, stderr includes "/workflows/release/stages/0/executor/delegate: properties ''secret_env'' required, if ''secret_header'' exists"; field-no-env.yaml exit 1 with the matching secret_field line. Every error is located under stages/0/executor/delegate.'
+    repro_handle: /tmp/fh-acc-fishhawk validate /tmp/fh-acc-specs/both.yaml; /tmp/fh-acc-fishhawk validate /tmp/fh-acc-specs/header-no-env.yaml
+origin:
+    issue: 3497
+    pr: 3521
+    run_id: e8078ef3-3ba3-40fe-aa64-709b453c70ac
+    head_sha: 3d8732e54998ef2bfc902d9ced970a60e2d6ac46
+    recorded_at: 2026-09-20T10:12:36Z
