@@ -188,6 +188,92 @@ func TestJSONEncodedLen_MatchesEncoder_Differential(t *testing.T) {
 	}
 }
 
+// TestMeasureInvalidUTF8ByteCost pins measureInvalidUTF8ByteCost's named
+// branches with FAKE marshal funcs written as literal bytes, plus a row
+// checking the real json.Marshal measurement lands on one of the two known
+// encoder costs.
+func TestMeasureInvalidUTF8ByteCost(t *testing.T) {
+	cases := []struct {
+		name    string
+		marshal func(any) ([]byte, error)
+		want    int
+	}{
+		{
+			name:    "classic encoder shape (six-byte escape)",
+			marshal: func(any) ([]byte, error) { return []byte("\"\\ufffd\""), nil },
+			want:    6,
+		},
+		{
+			name:    "jsonv2 encoder shape (raw three-byte U+FFFD)",
+			marshal: func(any) ([]byte, error) { return []byte("\"\xef\xbf\xbd\""), nil },
+			want:    3,
+		},
+		{
+			name:    "marshal error falls back to 6",
+			marshal: func(any) ([]byte, error) { return nil, fmt.Errorf("boom") },
+			want:    6,
+		},
+		{
+			name:    "degenerate too-short output falls back to 6",
+			marshal: func(any) ([]byte, error) { return []byte(`""`), nil },
+			want:    6,
+		},
+		{
+			name:    "empty output falls back to 6",
+			marshal: func(any) ([]byte, error) { return nil, nil },
+			want:    6,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := measureInvalidUTF8ByteCost(tc.marshal); got != tc.want {
+				t.Errorf("measureInvalidUTF8ByteCost() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+
+	real := measureInvalidUTF8ByteCost(json.Marshal)
+	raw, err := json.Marshal("\x80")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if want := len(raw) - 2; real != want {
+		t.Errorf("real json.Marshal measurement = %d, want %d (len(json.Marshal(\"\\x80\")) - 2)", real, want)
+	}
+	if real != 3 && real != 6 {
+		t.Errorf("real json.Marshal measurement = %d, want one of {3, 6} (jsonv2 vs classic encoder)", real)
+	}
+}
+
+// TestJSONEncodedLenAt_ChargesTheInjectedInvalidByteCost is the
+// toolchain-INDEPENDENT pin: the walk charges the INJECTED cost per invalid
+// byte and never to a valid rune. RED under both Go 1.25 and 1.27 if the walk
+// hard-codes 6 or misroutes the injected cost to a valid rune.
+func TestJSONEncodedLenAt_ChargesTheInjectedInvalidByteCost(t *testing.T) {
+	if got, want := jsonEncodedLenAt("\x80", 3), 5; got != want {
+		t.Errorf("jsonEncodedLenAt(%q, 3) = %d, want %d", "\x80", got, want)
+	}
+	if got, want := jsonEncodedLenAt("\x80", 6), 8; got != want {
+		t.Errorf("jsonEncodedLenAt(%q, 6) = %d, want %d", "\x80", got, want)
+	}
+	if got, want := jsonEncodedLenAt("a\xe2\x28\xa1b", 3), 11; got != want {
+		t.Errorf("jsonEncodedLenAt(%q, 3) = %d, want %d", "a\xe2\x28\xa1b", got, want)
+	}
+	// A VALID string's length must be invariant to the injected cost.
+	valid := "<\x00日"
+	if got3, got6 := jsonEncodedLenAt(valid, 3), jsonEncodedLenAt(valid, 6); got3 != got6 {
+		t.Errorf("jsonEncodedLenAt(%q, ...) varies with the injected invalid-byte cost (3 -> %d, 6 -> %d) — a valid rune must never be charged it", valid, got3, got6)
+	}
+}
+
+// TestJSONEncodedLen_UsesTheMeasuredCost pins that the public helper reads the
+// package-level measured cost.
+func TestJSONEncodedLen_UsesTheMeasuredCost(t *testing.T) {
+	if got, want := jsonEncodedLen("\x80"), 2+invalidUTF8ByteCost; got != want {
+		t.Errorf("jsonEncodedLen(%q) = %d, want 2 + invalidUTF8ByteCost = %d", "\x80", got, want)
+	}
+}
+
 func TestCapJSONString_EncodedLengthContract(t *testing.T) {
 	for i, s := range adversarialStrings {
 		for b := -1; b <= 64; b++ {
