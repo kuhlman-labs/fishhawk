@@ -168,6 +168,30 @@ For the acceptance agent this means: the preview's spawn verbs are NOT a drivabl
 
 Long-form contract (state model, served API subsets, the in-process transport, faults): `backend/internal/forge/stub/README.md`. Route contract: `docs/api/v0.md` § "Stub forge (preview only)". The acceptance prompt's `### Stub forge` section (`backend/internal/prompt/README.md`) states the same rules to the validator.
 
+### OAuth authorization server on the preview (E66.36 / #2473)
+
+`scripts/dev preview` forwards exactly three preview-safe `FISHHAWKD_OAUTH_*`
+keys (`FISHHAWKD_OAUTH_ISSUER`, `FISHHAWKD_OAUTH_RESOURCE`,
+`FISHHAWKD_OAUTH_REQUIRE_LOOPBACK`) from the operator's `.env` onto the
+preview's serve exec line — never a credential-bearing key. The AS is
+enabled iff the operator's `.env` carries `FISHHAWKD_OAUTH_ISSUER`; a preview
+started without it answers every `/v0/oauth/*` route with `503
+oauth_as_unconfigured`, which is a target-capability skip, not a code
+failure.
+
+When the AS is enabled, drive the four routes on the **preview's own host**
+(`localhost:8090`) directly rather than following the origins the metadata
+document advertises — those are the operator's TLS front-end issuer (e.g.
+`https://localhost:8443`), which the sandbox's default-deny egress would
+refuse. The expected non-503 response per route is: `GET
+/.well-known/oauth-authorization-server` → 200 (metadata); the protected
+resource metadata route → 200 (PRM); `POST /v0/oauth/authorize` → a 4xx from
+the request-validation ladder (malformed/missing parameters, unknown
+client, …, never 503); `POST /v0/oauth/token` → a 4xx (invalid grant, unknown
+client, …, never 503). Consent and code-binding criteria still need an
+authenticated session the sandbox cannot obtain, and stay
+`requires_live_validation`.
+
 ## Replayable scenario corpus (E72.4 / #3328)
 
 Every drivable criterion that PASSES is persisted as a scenario under `acceptance/scenarios/issue-<N>/<criterion-id>.yaml` (id `scenario:issue-<N>/<criterion-id>`, origin `{issue, pr, run_id, head_sha, recorded_at}` — `pr: 0` means UNKNOWN, never the issue number) and replayed FIRST against every later preview head as a regression pass. The runner side, in order:
