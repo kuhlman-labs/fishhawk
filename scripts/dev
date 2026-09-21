@@ -3343,6 +3343,58 @@ _preview_branch_env() {
   if [[ -n "${TZ:-}" ]]; then reply+=("TZ=${TZ}"); fi
 }
 
+# Preview-safe FISHHAWKD_* passthrough (E66.36 / #2473). The env -i default-
+# deny boundary above stays exactly as strict as it was — nothing is
+# inherited wholesale. This is a SEPARATE, explicitly enumerated allow-list:
+# a key must be listed HERE, by name, to ever reach the untrusted branch
+# binary, its value always comes from the already-sourced .env (never from
+# whatever the operator's shell happens to export), and a key only belongs on
+# this list when it is preview-safe — no secret, no egress credential. Today
+# that is exactly the three OAuth AS enablement/shape knobs; do not add
+# FISHHAWKD_OAUTH_CLIENT_SECRET or any other credential-bearing key.
+PREVIEW_PASSTHROUGH_KEYS=(FISHHAWKD_OAUTH_ISSUER FISHHAWKD_OAUTH_RESOURCE FISHHAWKD_OAUTH_REQUIRE_LOOPBACK)
+
+# Pure: build the passthrough KEY=VALUE words for the preview-safe
+# FISHHAWKD_* keys in PREVIEW_PASSTHROUGH_KEYS. Reads each key's CURRENT
+# value out of the shell (the .env-sourced value by the time cmd_preview
+# calls this) via zsh's `${(P)name}` indirect expansion, and appends a word
+# only when that value is non-empty — an unset/empty key contributes nothing,
+# so `reply` stays empty when the operator's .env carries none of them (the
+# preview then serves AS-off, exactly today's posture). FISHHAWKD_OAUTH_ISSUER
+# is validated up front: RFC 8414 §2 grants no loopback/http exemption
+# (docs/local-tls.md § Non-goal), and the binary's own resolveOAuthIssuer is
+# the enforcement authority — this check exists only to fail fast with an
+# actionable message instead of a 30s healthz timeout. On refusal, `reply` is
+# reset empty and the function returns 1; the caller must _die rather than
+# splice a half-built passthrough.
+_preview_passthrough_env() {
+  reply=()
+  local key value
+  for key in "${PREVIEW_PASSTHROUGH_KEYS[@]}"; do
+    value="${(P)key:-}"
+    if [[ -z "$value" ]]; then continue; fi
+    if [[ "$key" == "FISHHAWKD_OAUTH_ISSUER" && "$value" != https://* ]]; then
+      print -u2 "error: FISHHAWKD_OAUTH_ISSUER must be an https origin (RFC 8414 §2 grants no loopback exemption; docs/local-tls.md § Non-goal) — got ${value}"
+      reply=()
+      return 1
+    fi
+    reply+=("${key}=${value}")
+  done
+  return 0
+}
+
+# Pure: render the one-line OAuth AS notice for the preview startup banner —
+# on with the issuer, or off naming the missing key and the resulting 503 so
+# an operator immediately sees why the four AS routes are unconfigured.
+_preview_as_notice() {
+  local issuer="$1"
+  if [[ -n "$issuer" ]]; then
+    print "preview: OAuth AS on (issuer ${issuer})"
+  else
+    print "preview: OAuth AS off — FISHHAWKD_OAUTH_ISSUER not set in .env; the four /v0/oauth routes answer 503 oauth_as_unconfigured"
+  fi
+}
+
 # Seeded preview (E72.2 / #3326): `scripts/dev preview <ref> [--seed <name>]`
 # materializes a named fixture scenario into the freshly provisioned target
 # via the preview binary's dev-only, loopback-only POST /v0/dev/fixtures. The
@@ -3529,6 +3581,18 @@ cmd_preview() {
   if [[ -z "$ref" ]]; then
     _die "no SHA to preview — pass one (scripts/dev preview <sha-or-ref>) or set FISHHAWK_PREVIEW_SHA"
   fi
+
+  # Preview-safe FISHHAWKD_* passthrough (E66.36 / #2473), computed right
+  # after .env lands and BEFORE any DB or build work — the same fail-early
+  # posture as the argument parsing above. _preview_passthrough_env prints
+  # its own actionable message on refusal (a non-https issuer).
+  local -a preview_as_env
+  if ! _preview_passthrough_env; then
+    _die "invalid FISHHAWKD_OAUTH_ISSUER for the preview passthrough"
+  fi
+  preview_as_env=("${reply[@]}")
+  _preview_as_notice "${FISHHAWKD_OAUTH_ISSUER:-}"
+
   local base_url="${FISHHAWKD_DATABASE_URL:-}"
   if [[ -z "$base_url" ]]; then
     _die "FISHHAWKD_DATABASE_URL is not set — the preview needs it to derive its isolated _preview database"
@@ -3654,8 +3718,13 @@ cmd_preview() {
   # whose prompt responses carry forge_writes:"deny"; the env var is the
   # second, independent deny source for a runner that never fetched one.
   # All three are serve concerns — never on the migrate line.
+  # preview_as_env (computed above via _preview_passthrough_env, E66.36 /
+  # #2473) carries the preview-safe OAuth AS enablement/shape keys sourced
+  # from .env — empty when the operator set none, so the preview serves
+  # AS-off exactly as before. Serve concern only, same as the three flags
+  # above — never on the migrate line.
   _preview_branch_env
-  "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "FISHHAWKD_ADDR=$paddr" "FISHHAWKD_DEV_FIXTURES=1" "FISHHAWKD_DEV_STUB_FORGE=1" "FISHHAWK_FORGE_WRITES=deny" "$pbin" serve >> "$PREVIEW_LOG_FILE" 2>&1 &
+  "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "FISHHAWKD_ADDR=$paddr" "FISHHAWKD_DEV_FIXTURES=1" "FISHHAWKD_DEV_STUB_FORGE=1" "FISHHAWK_FORGE_WRITES=deny" "${preview_as_env[@]}" "$pbin" serve >> "$PREVIEW_LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PREVIEW_PID_FILE"
@@ -3679,7 +3748,9 @@ cmd_preview() {
     fi
   fi
 
-  print "preview fishhawkd started (pid ${pid}, git_sha ${short_sha}) on ${paddr} — db ${preview_db}, dev fixtures + stub forge on, logs: ${PREVIEW_LOG_FILE}"
+  local as_state="off"
+  if [[ -n "${FISHHAWKD_OAUTH_ISSUER:-}" ]]; then as_state="on"; fi
+  print "preview fishhawkd started (pid ${pid}, git_sha ${short_sha}) on ${paddr} — db ${preview_db}, dev fixtures + stub forge on, oauth AS ${as_state}, logs: ${PREVIEW_LOG_FILE}"
 }
 
 # `scripts/dev preview-down` — TERM→KILL the tracked preview daemon, remove

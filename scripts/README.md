@@ -1341,6 +1341,54 @@ line carries none of the three. `scripts/test-dev` pins the exact
 the migrate line, the same two-assertion shape as the two dev flags.
 Runner-side contract: `runner/README.md` § "Forge-writes gate".
 
+### Preview-safe FISHHAWKD_* passthrough (E66.36 / #2473)
+
+The `env -i` default-deny boundary above means the acceptance preview's
+default-deny env historically excluded the AS enablement/shape knobs too, so
+all four `/v0/oauth/*` routes answered `503 oauth_as_unconfigured` on every
+preview and no OAuth-AS criterion could ever be validated from the sandbox.
+`cmd_preview` now splices a SEPARATE, explicitly enumerated allow-list onto
+the serve exec line — `_preview_passthrough_env` walks the fixed array
+`PREVIEW_PASSTHROUGH_KEYS=(FISHHAWKD_OAUTH_ISSUER FISHHAWKD_OAUTH_RESOURCE
+FISHHAWKD_OAUTH_REQUIRE_LOOPBACK)` and appends a `KEY=VALUE` word for each
+listed key that is set non-empty. A key outside that list never reaches the
+target — the `env -i` boundary from `_preview_branch_env` is unchanged, this
+is a second, narrower gate layered on top of it. Values come from the
+already-sourced `.env`, exactly like `FISHHAWKD_DATABASE_URL` above; nothing
+is inherited wholesale from the operator's shell.
+
+`FISHHAWKD_OAUTH_ISSUER` is validated up front: a value that does not start
+with `https://` is refused (`reply` reset empty, non-zero return) with an
+actionable message naming RFC 8414 §2 (no loopback/http exemption) and
+`docs/local-tls.md` § "Non-goal" — this is a fail-fast convenience, not the
+enforcement authority, which stays the binary's own `resolveOAuthIssuer`.
+`cmd_preview` calls `_preview_passthrough_env` right after `.env` lands and
+BEFORE any DB or build work (the same fail-early posture as argument
+parsing), and `_die`s on a non-zero return.
+
+The resulting words are spliced onto the **serve** exec line only — never
+`migrate up` — after `FISHHAWK_FORGE_WRITES=deny` and before `"$pbin" serve`,
+alongside the existing `${reply[@]}` `env -i` prefix and `FISHHAWKD_ADDR`
+words. A startup line then states the AS state plainly:
+`preview: OAuth AS on (issuer <issuer>)` or `preview: OAuth AS off —
+FISHHAWKD_OAUTH_ISSUER not set in .env; the four /v0/oauth routes answer 503
+oauth_as_unconfigured` (`_preview_as_notice`), and the final "preview
+fishhawkd started" line also names `oauth AS on|off`.
+
+With an operator `.env` carrying the `docs/local-tls.md` § "AS config
+recipe" values, the preview now answers the AS routes with the AS enabled
+instead of 503, so `/.well-known/oauth-authorization-server`, the PRM route,
+`/v0/oauth/authorize` and `/v0/oauth/token` are drivable from the acceptance
+sandbox. One caveat: the metadata document advertises endpoints under the
+ISSUER origin (the operator's TLS front end, e.g. `https://localhost:8443`),
+while the routes themselves are served on the preview's own host
+(`localhost:8090`) — drive them there directly rather than following the
+advertised origin, which the sandbox's egress wall would refuse.
+Preview-only authenticated-session provisioning (consent, code binding) is
+out of scope here — the preview's database isolation (`fishhawk_preview`
+role, least-privilege section above) means sharing an issuer string with the
+dev stack does not cross-honour tokens or codes between the two.
+
 ### Fail-loud contract (`_preview_seed_apply`)
 
 The seed POST runs only AFTER `_await_preview_healthz` has proven the
@@ -1385,6 +1433,18 @@ helpers invoked with the tracked paths), a transport failure, the
 malformed-name seam (no request made), and a hermetic no-temp-litter
 check under a fixture `TMPDIR`. Every control was deleted → RED →
 restored (record in the PR notes for #3326).
+
+`scripts/test-dev` §15m pins the preview-safe passthrough (E66.36 / #2473):
+a REAL `env -i` + passthrough exec proving a listed key reaches the child
+environment while a non-listed `FISHHAWKD_*` key and a `.env` secret do not;
+the all-unset no-op (return 0, empty `reply`); a single-key case (exactly
+one word); the http-issuer and scheme-less-issuer refusals (non-zero, empty
+`reply`, actionable stderr) alongside the https-accepted case; the
+`_preview_as_notice` on/off wording; and `cmd_preview` body/line-order greps
+(the splice on the serve line only, the existing `${reply[@]}` prefix and
+`FISHHAWKD_ADDR=$paddr` retained, invocation ordered after `.env` and before
+the worktree add, `_die` on refusal). Every control was deleted → RED →
+restored (record in the PR notes for #2473).
 
 ## Docs-site voice gate (E12.1 / [#2261](https://github.com/kuhlman-labs/fishhawk/issues/2261))
 

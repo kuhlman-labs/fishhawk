@@ -3202,6 +3202,139 @@ else
   fail "cmd_preview should exec migrate up / serve via _preview_branch_env"
 fi
 
+# 15m. Preview-safe FISHHAWKD_* passthrough (E66.36 / #2473). The env -i
+# default-deny boundary from 15h is UNCHANGED — this pins the separate,
+# explicitly enumerated allow-list layered on top of it.
+
+# (a) REAL exec containment: a listed key reaches the child environment while
+# a credential-bearing/non-listed key never does, even when present in the
+# sourced .env. Wrapped in a subshell with `export` (not the prefix-assignment
+# idiom used below) because this composes _preview_branch_env +
+# _preview_passthrough_env with a FURTHER real exec of `env` — a prefix
+# assignment's scope ends with the single command it prefixes, so it would no
+# longer be set by the time that composed exec ran.
+sp15m_exec_out="$(
+  export FISHHAWKD_OAUTH_ISSUER=https://localhost:8443
+  export FISHHAWKD_OAUTH_REQUIRE_LOOPBACK=true
+  export FISHHAWKD_OAUTH_CLIENT_SECRET=leaked-oauth-secret
+  export FISHHAWKD_GITHUB_WEBHOOK_SECRET=leaked-webhook
+  export ANTHROPIC_API_KEY=leaked-model-key
+  _preview_branch_env
+  sp15m_branch=("${reply[@]}")
+  _preview_passthrough_env
+  sp15m_passthru=("${reply[@]}")
+  "${sp15m_branch[@]}" "${sp15m_passthru[@]}" env
+)"
+if [[ "$sp15m_exec_out" == *'FISHHAWKD_OAUTH_ISSUER=https://localhost:8443'* && "$sp15m_exec_out" == *'FISHHAWKD_OAUTH_REQUIRE_LOOPBACK=true'* ]]; then
+  pass "_preview_passthrough_env: a listed key reaches the child environment via a real exec"
+else
+  fail "_preview_passthrough_env should forward FISHHAWKD_OAUTH_ISSUER/_REQUIRE_LOOPBACK to the child (got: $sp15m_exec_out)"
+fi
+if print -r -- "$sp15m_exec_out" | grep -q 'leaked-'; then
+  fail "_preview_passthrough_env leaked a non-listed .env value into the branch-exec env: $sp15m_exec_out"
+else
+  pass "_preview_passthrough_env forwards no leaked value for a non-listed key"
+fi
+if print -r -- "$sp15m_exec_out" | grep -qE 'FISHHAWKD_OAUTH_CLIENT_SECRET|FISHHAWKD_GITHUB_WEBHOOK_SECRET'; then
+  fail "_preview_passthrough_env should never forward FISHHAWKD_OAUTH_CLIENT_SECRET or FISHHAWKD_GITHUB_WEBHOOK_SECRET by name"
+else
+  pass "_preview_passthrough_env forwards no non-listed FISHHAWKD_* key by name"
+fi
+
+# (b) all three keys unset/empty: return 0, empty reply (no-op).
+unset FISHHAWKD_OAUTH_ISSUER FISHHAWKD_OAUTH_RESOURCE FISHHAWKD_OAUTH_REQUIRE_LOOPBACK 2>/dev/null
+_preview_passthrough_env
+sp15m_rc=$?
+if [[ $sp15m_rc -eq 0 && ${#reply[@]} -eq 0 ]]; then
+  pass "_preview_passthrough_env: all keys unset returns 0 with an empty reply"
+else
+  fail "_preview_passthrough_env should no-op on unset keys (rc=$sp15m_rc, reply=${reply[*]})"
+fi
+
+# (c) exactly one key set yields exactly one word.
+FISHHAWKD_OAUTH_RESOURCE=https://localhost:8443/mcp _preview_passthrough_env
+sp15m_rc=$?
+if [[ $sp15m_rc -eq 0 && ${#reply[@]} -eq 1 && "${reply[1]}" == 'FISHHAWKD_OAUTH_RESOURCE=https://localhost:8443/mcp' ]]; then
+  pass "_preview_passthrough_env: a single set key yields exactly one word"
+else
+  fail "_preview_passthrough_env should yield exactly one FISHHAWKD_OAUTH_RESOURCE word (rc=$sp15m_rc, reply=${reply[*]})"
+fi
+
+# (d) http-issuer refusal (no http escape hatch — RFC 8414 §2), a scheme-less
+# issuer refused the same way, and an https issuer accepted.
+FISHHAWKD_OAUTH_ISSUER=http://localhost:8090 _preview_passthrough_env
+sp15m_http_rc=$?
+sp15m_http_len=${#reply[@]}
+sp15m_http_err="$(FISHHAWKD_OAUTH_ISSUER=http://localhost:8090 _preview_passthrough_env 2>&1 1>/dev/null)"
+if [[ $sp15m_http_rc -ne 0 && $sp15m_http_len -eq 0 && "$sp15m_http_err" == *https* && "$sp15m_http_err" == *docs/local-tls.md* ]]; then
+  pass "_preview_passthrough_env refuses a plain-http FISHHAWKD_OAUTH_ISSUER (empty reply, actionable stderr)"
+else
+  fail "_preview_passthrough_env should refuse a http:// issuer with actionable stderr (rc=$sp15m_http_rc, len=$sp15m_http_len, stderr=$sp15m_http_err)"
+fi
+FISHHAWKD_OAUTH_ISSUER=localhost:8443 _preview_passthrough_env
+if [[ $? -ne 0 && ${#reply[@]} -eq 0 ]]; then
+  pass "_preview_passthrough_env refuses a scheme-less FISHHAWKD_OAUTH_ISSUER"
+else
+  fail "_preview_passthrough_env should refuse a scheme-less issuer (reply=${reply[*]})"
+fi
+FISHHAWKD_OAUTH_ISSUER=https://localhost:8443 _preview_passthrough_env
+if [[ $? -eq 0 && ${#reply[@]} -eq 1 && "${reply[1]}" == 'FISHHAWKD_OAUTH_ISSUER=https://localhost:8443' ]]; then
+  pass "_preview_passthrough_env accepts an https FISHHAWKD_OAUTH_ISSUER"
+else
+  fail "_preview_passthrough_env should accept an https issuer (reply=${reply[*]})"
+fi
+unset FISHHAWKD_OAUTH_ISSUER FISHHAWKD_OAUTH_RESOURCE FISHHAWKD_OAUTH_REQUIRE_LOOPBACK 2>/dev/null
+
+# (e) _preview_as_notice on/off wording.
+sp15m_notice_on="$(_preview_as_notice 'https://localhost:8443')"
+if [[ "$sp15m_notice_on" == 'preview: OAuth AS on (issuer https://localhost:8443)' ]]; then
+  pass "_preview_as_notice: on wording names the issuer"
+else
+  fail "_preview_as_notice on wording mismatch (got: $sp15m_notice_on)"
+fi
+sp15m_notice_off="$(_preview_as_notice '')"
+if [[ "$sp15m_notice_off" == *'OAuth AS off'* && "$sp15m_notice_off" == *'FISHHAWKD_OAUTH_ISSUER'* && "$sp15m_notice_off" == *'503 oauth_as_unconfigured'* ]]; then
+  pass "_preview_as_notice: off wording names the missing key and the resulting 503"
+else
+  fail "_preview_as_notice off wording mismatch (got: $sp15m_notice_off)"
+fi
+
+# (f) cmd_preview wiring: serve-line-only placement, the existing env -i
+# prefix + FISHHAWKD_ADDR retained, invocation ordered after .env and before
+# the worktree add, and a _die on refusal.
+preview_body="$(typeset -f cmd_preview)"
+sp15m_serve_line="$(print -r -- "$preview_body" | grep -F '"$pbin" serve' | head -n 1)"
+sp15m_migrate_line="$(print -r -- "$preview_body" | grep -F '"$pbin" migrate up' | head -n 1)"
+if [[ "$sp15m_serve_line" == *'"${preview_as_env[@]}"'* ]]; then
+  pass "cmd_preview splices \${preview_as_env[@]} onto the serve exec line"
+else
+  fail "cmd_preview should splice \${preview_as_env[@]} onto the serve line (got: $sp15m_serve_line)"
+fi
+if [[ -n "$sp15m_migrate_line" && "$sp15m_migrate_line" != *'preview_as_env'* ]]; then
+  pass "cmd_preview does NOT splice preview_as_env onto the migrate line"
+else
+  fail "cmd_preview migrate line should not carry preview_as_env (got: $sp15m_migrate_line)"
+fi
+if [[ "$sp15m_serve_line" == *'"${reply[@]}"'* && "$sp15m_serve_line" == *'FISHHAWKD_ADDR=$paddr'* ]]; then
+  pass "cmd_preview serve line keeps the \${reply[@]} env -i prefix and FISHHAWKD_ADDR=\$paddr with the new splice"
+else
+  fail "cmd_preview serve line should retain \${reply[@]} and FISHHAWKD_ADDR=\$paddr (got: $sp15m_serve_line)"
+fi
+sp15m_env_ln="$(print -r -- "$preview_body" | grep -n 'source "${REPO_ROOT}/.env"' | head -n 1 | cut -d: -f1)"
+sp15m_passthru_ln="$(print -r -- "$preview_body" | grep -n '_preview_passthrough_env' | head -n 1 | cut -d: -f1)"
+sp15m_worktree_ln="$(print -r -- "$preview_body" | grep -n 'git -C "${REPO_ROOT}" worktree add' | head -n 1 | cut -d: -f1)"
+if [[ -n "$sp15m_env_ln" && -n "$sp15m_passthru_ln" && -n "$sp15m_worktree_ln" ]] \
+   && (( sp15m_passthru_ln > sp15m_env_ln )) && (( sp15m_passthru_ln < sp15m_worktree_ln )); then
+  pass "cmd_preview invokes _preview_passthrough_env AFTER .env source and BEFORE the worktree add"
+else
+  fail "cmd_preview should call _preview_passthrough_env after .env and before worktree add (env line ${sp15m_env_ln:-none}, passthrough line ${sp15m_passthru_ln:-none}, worktree line ${sp15m_worktree_ln:-none})"
+fi
+if print -r -- "$preview_body" | grep -qF '_die "invalid FISHHAWKD_OAUTH_ISSUER for the preview passthrough"'; then
+  pass "cmd_preview _die's on a non-zero _preview_passthrough_env"
+else
+  fail "cmd_preview should _die on a non-zero _preview_passthrough_env"
+fi
+
 # 15k. OPTIONAL live containment test (E31.19 / #1577) — gated on a host psql
 # AND a reachable dev Postgres (skips cleanly like the 15g nc block otherwise).
 # Drives BOTH enumerated failure modes end-to-end against a real Postgres:

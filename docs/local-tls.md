@@ -202,6 +202,13 @@ FISHHAWKD_OAUTH_RESOURCE=https://localhost:8443/…   # carry :8443 exactly (see
 `ParseIssuer` imposes no port constraint, and `resolveOAuthIssuer` accepts an
 origin-only issuer with no path, so `https://localhost:8443` is valid.
 
+`scripts/dev preview` (E66.36 / #2473) forwards exactly these three keys
+from `.env` onto the preview's serve exec line, so the seeded merge-candidate
+target serves plain http on `:8090` behind the same https issuer string as
+this dev stack — the ingress-terminated production posture, not a distinct
+config. See `scripts/README.md` § "Preview-safe FISHHAWKD_* passthrough" and
+`docs/acceptance-preview.md` § "OAuth authorization server on the preview".
+
 ### Audience-port foot-gun
 
 **A non-default port IS significant in audience matching.**
