@@ -990,6 +990,58 @@ assert_render_ok "r11g explicit-null oauthClientId is treated as OAuth-off and r
 render -f "$tmproot/r11g.yaml" --show-only templates/configmap.yaml
 assert_field_absent "r11g explicit-null oauthClientId emits no FISHHAWKD_OAUTH_CLIENT_ID" "$out" "FISHHAWKD_OAUTH_CLIENT_ID"
 
+# r11h the externalSecrets COUNTERPART of r11e (#2970). id + callback set,
+# externalSecrets data[] PRESENT but carrying no FISHHAWKD_OAUTH_CLIENT_SECRET
+# mapping -> validateSecretContract's externalSecrets branch, DERIVED
+# requiredness (the same derivation r11e pins on the chartManaged branch). r2c
+# above already seeds an identical fixture and pins the substring
+# FISHHAWKD_OAUTH_CLIENT_SECRET, but that substring alone does not discriminate
+# WHICH guard produced it: validateOAuthTrio branch (iii)'s fail text also names
+# that key, so r2c would stay green even if the trio guard fired instead of the
+# contract. r11h pins the externalSecrets-branch text specifically and asserts
+# BOTH trio messages are absent, so one message per condition is enforced on
+# this branch exactly as r11e enforces it on chartManaged.
+cat > "$tmproot/r11h.yaml" <<'YAML'
+profile: prod
+config:
+  oauthClientId: "cid"
+  oauthCallbackUrl: "https://r11h.example/v0/auth/github/callback"
+secrets:
+  mode: externalSecrets
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  externalSecrets:
+    secretStoreRef:
+      name: fishhawk-store
+    data:
+      - secretKey: FISHHAWKD_DATABASE_URL
+        remoteRef: {key: fishhawk/db}
+      - secretKey: FISHHAWKD_GITHUB_WEBHOOK_SECRET
+        remoteRef: {key: fishhawk/webhook}
+      - secretKey: FISHHAWKD_ANTHROPIC_API_KEY
+        remoteRef: {key: fishhawk/anthropic}
+YAML
+render -f "$tmproot/r11h.yaml"
+assert_render_fails "r11h id set + externalSecrets data[] present WITHOUT the OAuth mapping -> validateSecretContract (derived requiredness)" \
+  'does not map the required Secret key "FISHHAWKD_OAUTH_CLIENT_SECRET"'
+assert_render_fails "r11h message names the data[] remedy" "add it to secrets.externalSecrets.data[] with its remoteRef"
+assert_absent "r11h no validateOAuthTrio branch (iii) message pre-empted the contract message" "$err" \
+  "an OAuth client secret is supplied"
+assert_absent "r11h no validateOAuthTrio branch (i) message pre-empted the contract message" "$err" \
+  "the OAuth callback URL is empty"
+
+# r11i the positive control: the SAME fixture WITH the OAuth mapping added
+# renders. Proves r11h failed on the missing mapping, not on the externalSecrets
+# fixture being unrenderable at all.
+cat "$tmproot/r11h.yaml" > "$tmproot/r11i.yaml"
+cat >> "$tmproot/r11i.yaml" <<'YAML'
+      - secretKey: FISHHAWKD_OAUTH_CLIENT_SECRET
+        remoteRef: {key: fishhawk/oauth}
+YAML
+render -f "$tmproot/r11i.yaml"
+assert_render_ok "r11i the same fixture WITH the OAuth mapping renders (derived requirement is satisfiable in externalSecrets mode)"
+
 # ---------------------------------------------------------------------------
 # r12 — config.extraEnv passthrough + its three guards + the ANTI-DRIFT loop.
 # ---------------------------------------------------------------------------
