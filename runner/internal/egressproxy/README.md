@@ -68,7 +68,7 @@ never reaches this package.
   hits, plus forwarded positive controls (`GET /v0/runs`,
   `POST /v0/runs/{id}/trace`, `POST /mcp` with `Mcp-Name: fishhawk_get_plan`).
 
-  **This layer is defence in depth, NOT the control.** Two bypasses are
+  **This layer is defence in depth, NOT the control.** Three bypasses are
   structural and stated here so nobody leans on it:
 
   1. **Loopback is never proxied by a Go client.** `net/http`'s
@@ -86,15 +86,29 @@ never reaches this package.
      calls `fishhawk_run_stage`, is forwarded. `TestDeniedVerb_Table`'s
      "mcp no header passes" / "mcp read tool passes" cases pin that
      behaviour as the documented residual, not as a guarantee.
+  3. **HTTPS CONNECT tunnels are opaque to the verb table.** `DeniedVerb`
+     screens absolute-form plain-HTTP forwards only. An admitted `https://`
+     destination — the Fishhawk backend entry when `--backend-url` is
+     https, every model host, any https spec target — is reached through a
+     CONNECT tunnel whose TLS payload the proxy cannot read (see the
+     CONNECT bullet above: "the TLS payload stays opaque"), so a
+     `POST /v0/runs` or `POST /mcp` carried inside that tunnel is never
+     matched against the table — the proxy admits by host:port and
+     forwards the bytes. `TestForward_DeniesRunMintingVerbs` is a
+     plain-HTTP-only pin; nothing pins the tunnel because nothing can.
 
   The AUTHORITATIVE control is server-side: a dev-mode `fishhawkd`
   (`FISHHAWKD_DEV_FIXTURES` / `FISHHAWKD_DEV_STUB_FORGE` — what
   `scripts/dev preview` runs) refuses its host-dispatch spawn marker for
   EVERY caller, identity-independent, with `403
   host_dispatch_refused_dev_mode` and a `host_dispatch_refused` audit row
-  (`backend/internal/server/devmode.go`), and stamps `forge_writes:
+  (`backend/internal/server/devmode.go`), stamps `forge_writes:
   "deny"` onto every prompt response so a runner that is somehow spawned
-  refuses pre-spawn anyway (`runner/README.md` § `FISHHAWK_FORGE_WRITES`).
+  refuses pre-spawn anyway, and advertises `/healthz` `dev_mode: true`,
+  which the runner probes once pre-spawn on BOTH launch paths so a
+  DIRECTLY-launched runner (`--prompt-file`, no prompt fetch, scrubbed env)
+  refuses too (E72.16 / #3510; `runner/README.md` §
+  `FISHHAWK_FORGE_WRITES`).
 
 ## Invocation env (`runner/internal/acceptenv`)
 

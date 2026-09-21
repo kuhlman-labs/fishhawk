@@ -88,6 +88,18 @@ func runTestMain(m *testing.M) int {
 	// t.Setenv (implementEnv and the diff-coverage tests already do).
 	os.Unsetenv("GITHUB_REF_NAME")
 	os.Unsetenv("GITHUB_REPOSITORY")
+	// Forge-writes /healthz dev_mode probe stub (E72.16 / #3510). run() now
+	// GETs <backend-url>/healthz once, pre-spawn, on EVERY launch path, and
+	// ~130 run()-driving tests across this package name
+	// https://api.fishhawk.test as --backend-url. Without this stub each of
+	// them would pay a DNS lookup or a 5s transport timeout per test. The
+	// stub answers a not-dev-mode outcome so those tests keep their exact
+	// pre-#3510 behavior; a test that exercises the real probe opts in via
+	// withRealDevModeProbe. Installed BEFORE the git LookPath early return
+	// below so a git-less host sees it too.
+	probeBackendDevMode = func(context.Context, string) devModeProbe {
+		return devModeProbe{outcome: "stubbed", detail: "runTestMain stub: no dial"}
+	}
 	if _, err := exec.LookPath("git"); err != nil {
 		return runSuite() // git unavailable — degrade to the original CWD.
 	}
@@ -156,6 +168,18 @@ func runTestMain(m *testing.M) int {
 }
 
 // TestHarnessNeutralizesActionsEnv pins the runTestMain posture directly:
+// withRealDevModeProbe swaps the runTestMain stub for the production HTTP
+// /healthz probe (probeBackendDevModeHTTP) for the duration of t and restores
+// the stub in Cleanup. It is the ONLY way a test in this package exercises
+// the real probe, so a test naming it is provably on the production path
+// (E72.16 / #3510).
+func withRealDevModeProbe(t *testing.T) {
+	t.Helper()
+	orig := probeBackendDevMode
+	probeBackendDevMode = probeBackendDevModeHTTP
+	t.Cleanup(func() { probeBackendDevMode = orig })
+}
+
 // GITHUB_REF_NAME and GITHUB_REPOSITORY must read empty inside this
 // package's test process, because runTestMain unsets both before m.Run()
 // (#3402). Deleting that unset turns this RED under
