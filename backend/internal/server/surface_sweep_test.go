@@ -1031,3 +1031,109 @@ func TestRunSurfaceSweep_CrossSliceFindings(t *testing.T) {
 		t.Errorf("returned cross-slice findings diverge from recorded:\nreturned: %s\nrecorded: %s", gotJSON, recordedJSON)
 	}
 }
+
+// auditCategoryPlanBody builds a schema-valid flat plan whose approach names
+// an audit category in the #3400 plan's verbatim phrasing, with the given
+// scope.files and optional surface_sweep_exemptions (#3410).
+func auditCategoryPlanBody(t *testing.T, files []plan.ScopeFile, exemptions []plan.SurfaceSweepExemption) []byte {
+	t.Helper()
+	fileMaps := make([]any, 0, len(files))
+	for _, f := range files {
+		fileMaps = append(fileMaps, map[string]any{"path": f.Path, "operation": string(f.Operation)})
+	}
+	m := planfixture.Valid(func(p map[string]any) {
+		p["scope"] = map[string]any{"files": fileMaps}
+		p["approach"] = []any{map[string]any{"step": 1, "description": "append an advisory `zz_never_registered_cat` audit row (system actor)"}}
+		if len(exemptions) > 0 {
+			exMaps := make([]any, 0, len(exemptions))
+			for _, e := range exemptions {
+				exMaps = append(exMaps, map[string]any{"pattern": e.Pattern, "sibling": e.Sibling, "reason": e.Reason})
+			}
+			p["surface_sweep_exemptions"] = exMaps
+		}
+	})
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	if err := plan.Validate(body); err != nil {
+		t.Fatalf("fixture plan does not validate: %v", err)
+	}
+	return body
+}
+
+// TestRunSurfaceSweep_AuditCategoryFinding is the #3410 done-means test on
+// the REAL wiring: a plan whose prose names an unregistered audit category
+// while scoping backend/ without backend/internal/audit/categories.go draws
+// the finding through runSurfaceSweep AND the persisted plan_surface_sweep
+// payload carries it; the same plan with the registry in scope draws none
+// and the payload contains no "category" key (existing payloads stay
+// byte-identical); the exemption form records an applied exemption.
+func TestRunSurfaceSweep_AuditCategoryFinding(t *testing.T) {
+	const registry = "backend/internal/audit/categories.go"
+	foo := plan.ScopeFile{Path: "backend/internal/server/foo.go", Operation: plan.FileOpModify}
+
+	t.Run("finding", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+		got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, auditCategoryPlanBody(t, []plan.ScopeFile{foo}, nil))
+		if got == nil {
+			t.Fatal("want a non-nil result")
+		}
+		if len(got.Findings) != 1 {
+			t.Fatalf("want 1 finding, got %+v", got.Findings)
+		}
+		f := got.Findings[0]
+		if f.Pattern != "new audit category requires registry" || f.Category != "zz_never_registered_cat" ||
+			f.SubPlanTitle != "" || len(f.MissingSiblings) != 1 || f.MissingSiblings[0] != registry ||
+			f.TriggerPath != `audit category "zz_never_registered_cat" named at approach step 1` {
+			t.Errorf("finding = %+v", f)
+		}
+		raw := lastSurfaceSweepRaw(t, au)
+		for _, want := range []string{`"category":"zz_never_registered_cat"`, registry, `"pattern":"new audit category requires registry"`} {
+			if !strings.Contains(raw, want) {
+				t.Errorf("persisted payload missing %q:\n%s", want, raw)
+			}
+		}
+	})
+	t.Run("registry in scope → clean, no category key", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+		got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID,
+			auditCategoryPlanBody(t, []plan.ScopeFile{foo, {Path: registry, Operation: plan.FileOpModify}}, nil))
+		if got == nil || len(got.Findings) != 0 {
+			t.Fatalf("want zero findings, got %+v", got)
+		}
+		if raw := lastSurfaceSweepRaw(t, au); strings.Contains(raw, `"category"`) {
+			t.Errorf("clean payload must carry no category key:\n%s", raw)
+		}
+	})
+	t.Run("exemption → applied, no finding", func(t *testing.T) {
+		s, _, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+		got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, auditCategoryPlanBody(t, []plan.ScopeFile{foo},
+			[]plan.SurfaceSweepExemption{{Pattern: "new audit category requires registry", Sibling: registry, Reason: "it is a runner log event"}}))
+		if got == nil || len(got.Findings) != 0 {
+			t.Fatalf("want zero findings, got %+v", got)
+		}
+		if len(got.AppliedExemptions) != 1 || got.AppliedExemptions[0].Reason != "it is a runner log event" ||
+			got.AppliedExemptions[0].Sibling != registry || got.AppliedExemptions[0].SubPlanTitle != "" {
+			t.Errorf("applied = %+v", got.AppliedExemptions)
+		}
+	})
+}
+
+// lastSurfaceSweepRaw returns the single persisted plan_surface_sweep payload
+// as raw JSON text so byte-level key presence can be asserted.
+func lastSurfaceSweepRaw(t *testing.T, au *auditFake) string {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var raws []string
+	for _, ap := range au.appended {
+		if ap.Category == categoryPlanSurfaceSweep {
+			raws = append(raws, string(ap.Payload))
+		}
+	}
+	if len(raws) != 1 {
+		t.Fatalf("want exactly 1 plan_surface_sweep entry, got %d", len(raws))
+	}
+	return raws[0]
+}

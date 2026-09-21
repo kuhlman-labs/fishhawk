@@ -1741,6 +1741,7 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 				TriggerPath:     f.TriggerPath,
 				MissingSiblings: f.MissingSiblings,
 				SubPlanTitle:    f.SubPlanTitle,
+				Category:        f.Category,
 			})
 		}
 		for _, f := range sweep.CrossSliceFindings {

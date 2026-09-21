@@ -5314,7 +5314,17 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// push the spawn past the OS argument-size limit (E2BIG). The full
 		// output remains on the verify_run trace event.
 		var elided int
-		fixInv.Prompt, elided = verifyFixPrompt(cfg.verifyCmd, out, cfg.scopeFiles, cfg.approvedAmendments)
+		// OUT-OF-SCOPE PATHS (#3410): repo-relative paths the verify output
+		// names that exist under repoDir but are outside the effective scope,
+		// so the fix agent files an amendment instead of retrying an in-scope
+		// workaround. Log only — no bundle event, no in-band relay.
+		outOfScope := outOfScopePathsInVerifyOutput(out, cfg.scopeFiles, fileExistsUnder(repoDir))
+		if len(outOfScope) > 0 {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"verify_fix_out_of_scope_named","run_id":%q,"stage_id":%q,"iteration":%d,"paths":%q}`+"\n",
+				cfg.runID, cfg.stageID, iter+1, strings.Join(outOfScope, ","))
+		}
+		fixInv.Prompt, elided = verifyFixPrompt(cfg.verifyCmd, out, cfg.scopeFiles, cfg.approvedAmendments, outOfScope)
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_fix_reinvoke","run_id":%q,"stage_id":%q,"iteration":%d,"prompt_bytes":%d,"output_bytes":%d,"output_elided_bytes":%d}`+"\n",
 			cfg.runID, cfg.stageID, iter+1, len(fixInv.Prompt), len(out), elided)
@@ -5789,7 +5799,22 @@ func boundVerifyFixOutput(out string) (excerpt string, elided int) {
 // an approval condition); the agent-authored amendment `reason` is
 // deliberately NOT rendered so untrusted agent prose is never re-injected
 // into a later invocation.
-func verifyFixPrompt(verifyCmd, output string, scope []upload.ScopeFile, granted []upload.ScopeAmendment) (prompt string, elidedBytes int) {
+//
+// outOfScope (#3410) is the detector's list of repo-relative paths the verify
+// output names that exist on disk but are NOT in the effective scope — the
+// exact shape of the completeness test's `add them to
+// backend/internal/audit/categories.go`. When non-empty an OUT-OF-SCOPE PATHS
+// block names each and tells the agent to file a mid-stage scope amendment
+// rather than retry an in-scope workaround. In the effective-scope form (scope
+// non-empty) the compact amendment recipe is rendered ALWAYS — the fix agent
+// never saw writeScopeAmendments (the #3390 class), and fixInv inherits
+// baseInv.Env so FISHHAWK_API_TOKEN / FISHHAWK_BACKEND_URL are present. The
+// empty-scope `git add -A` fallback renders neither — the OUT-OF-SCOPE block
+// is gated on a non-empty scope here AND the detector returns nil for an
+// empty scope, so a non-empty outOfScope argument with an empty scope is
+// ignored rather than rendered as a restriction on an editable tree. Both
+// blocks are fixed-size (~1.5 KiB), so the #3408 bound is untouched.
+func verifyFixPrompt(verifyCmd, output string, scope []upload.ScopeFile, granted []upload.ScopeAmendment, outOfScope []string) (prompt string, elidedBytes int) {
 	excerpt, elided := boundVerifyFixOutput(output)
 	var b strings.Builder
 	fmt.Fprintf(&b, `The verify command failed against the committed scope-only tree.
@@ -5815,16 +5840,29 @@ file now. Do not work around it in another file, and do not treat the grant as
 pending or denied.
 `)
 	}
+	// Both #3410 blocks are gated on a non-empty scope: in the empty-scope
+	// `git add -A` fallback the whole tree is editable, so an OUT-OF-SCOPE
+	// block would forbid edits the agent can and should make and point at a
+	// "(recipe below)" that is never rendered. The detector already returns
+	// nil for an empty scope; this gate keeps the renderer honest on its own.
+	if len(scope) > 0 {
+		if oos := renderOutOfScopePaths(outOfScope); oos != "" {
+			b.WriteString("\n" + oos)
+		}
+		b.WriteString("\n" + renderFixScopeAmendmentRecipe())
+	}
 
 	allowed := "the files you are\nalready allowed to change (the approved scope)"
+	amend := ""
 	if len(scope) > 0 {
 		allowed = "the files listed under\n\"Effective scope\" above"
+		amend = " — or, when the fix genuinely needs a file outside that list, file a\nscope amendment as described above rather than retrying"
 	}
 	fmt.Fprintf(&b, `
 Edit the code so this command passes. The fix must live in %s — a change that only works
 because of an out-of-scope file will be dropped when the commit is scoped and
 will fail verification again. Make the smallest change that turns the command
-green.`, allowed)
+green%s.`, allowed, amend)
 	return b.String(), elided
 }
 

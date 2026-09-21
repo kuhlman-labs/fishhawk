@@ -114,6 +114,15 @@ Before opening a PR that adds or tightens handler-side authorization (scope chec
 
 Cross-reference: this checklist codifies the rollout discipline introduced by #529; see #472 for the analogous schema-change discipline.
 
+### Audit-category change checklist
+
+A **new audit category** — any string literal reaching `audit.Entry` / `ChainAppendParams` / `AppendChained` / an emit helper — obliges `backend/internal/audit/categories.go` in the SAME plan scope. The committed-tree verify gate's `TestKnownCategoriesCoversEmittedCategories` fails on an unregistered emitted category, and an implement agent whose scope omits the registry cannot reach the file (run 49f642b8 / #3410 discovered the obligation only by failing that gate and burning a scope amendment on it).
+
+1. **Scope the registry.** Add `backend/internal/audit/categories.go` (modify) to `scope.files` alongside the emitter — a one-line registration.
+2. **The plan gate flags the omission.** The plan-gate surface sweep's audit-category rule (`backend/internal/server/audit_category_sweep.go`) reads the plan's own prose for a snake_case token named as an audit category/entry/row/event, drops the ones `audit.IsKnownCategory` already registers, and — when the plan touches `backend/` without the registry — records a `new audit category requires registry` finding rendered to the plan reviewer as `NEW AUDIT CATEGORY`. It is exemptible via `surface_sweep_exemptions` `{pattern: "new audit category requires registry", sibling: "backend/internal/audit/categories.go"}` ONLY when the token is not in fact a category (a runner log event, a tool name); an exemption is recorded and reviewer-challengeable.
+3. **Operator-visible categories also oblige `backend/internal/issuecomment`'s `activityCategories`** (#3392/#3406) — the activity-comment renderer's allow-list — so the entry surfaces on the issue thread; and any new issue-comment surface still obliges `docs/issue-comment-surfaces.md` (the path-triggered "audit kind requires surfaces doc" pattern).
+4. **In a fix loop, do not retry.** When the verify output names the registry (`add them to backend/internal/audit/categories.go`), the fix prompt lists it under `OUT-OF-SCOPE PATHS` with the mid-stage scope-amendment recipe — file the amendment; an in-scope workaround is the #1170 silent wrong-fix class.
+
 ### Rebuild matrix
 
 `scripts/dev up` auto-detects which binaries need rebuilding by diffing `origin/main...HEAD` (falling back to `main...HEAD` with a warning if origin is unreachable) against the table below. `fishhawkd` always rebuilds as the baseline; the others rebuild only when their source changed. `scripts/dev up --all` forces all five. Each rebuild prints a line naming the trigger (`baseline`, `--all`, or the path that matched).
