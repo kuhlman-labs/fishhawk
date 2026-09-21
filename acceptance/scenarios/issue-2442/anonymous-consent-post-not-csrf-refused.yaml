@@ -1,0 +1,14 @@
+id: scenario:issue-2442/anonymous-consent-post-not-csrf-refused
+statement: 'POST /v0/oauth/authorize with a form-encoded body carrying a csrf_token field but NO session cookie responds 401 auth_required (JSON Error envelope) — it is neither refused 403 csrf_required nor 500: the session-bound form-token check runs only for cookie-session identities.'
+verify_hint: Send POST /v0/oauth/authorize (Content-Type application/x-www-form-urlencoded, body csrf_token=anything&action=approve&client_id=x) with no cookies to the localhost preview; observe HTTP 401 with error auth_required in the JSON body.
+steps: 'Precondition checked: GET /.well-known/oauth-authorization-server returns issuer https://localhost:8443 (OAuth AS enabled), and GET /v0/oauth/authorize with no params answers 400 invalid_client (not 503 oauth_as_unconfigured). POST http://localhost:8090/v0/oauth/authorize with Content-Type application/x-www-form-urlencoded, body csrf_token=anything&action=approve&client_id=x and NO cookies. Also POSTed tab A''s real, complete consent form (valid csrf_token for the minted session) with NO cookies.'
+assertions:
+    expected: 401 auth_required JSON Error envelope; neither 403 csrf_required nor 500.
+    observed_at_record: 401 Unauthorized, Content-Type application/json, body {"error":{"code":"auth_required","message":"sign in to submit an authorization decision"}} — not 403 csrf_required, not 500. The real-form anonymous POST also 401 auth_required.
+    repro_handle: 'curl -s -i -X POST http://localhost:8090/v0/oauth/authorize -H ''Content-Type: application/x-www-form-urlencoded'' --data ''csrf_token=anything&action=approve&client_id=x'''
+origin:
+    issue: 2442
+    pr: 3558
+    run_id: 75de11bd-cd33-4fdb-bc41-043237effb6a
+    head_sha: 67fd2258fcd856aab223dc4bc02c23a4dfd57617
+    recorded_at: 2026-09-21T05:16:10Z
