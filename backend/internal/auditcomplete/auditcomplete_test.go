@@ -1231,6 +1231,293 @@ func TestVouchSeamConstants_MatchStoredRowLiterals(t *testing.T) {
 	}
 }
 
+// --- #3429: rule 5 honors the fan-in integration merge categories ---
+
+// seedIntegrationChild adds one decomposition child so len(children) > 0 gates
+// the parent-chain integration read on. The child carries no stages/entries —
+// gather never walks into a child for stages; the child only makes the parent a
+// decomposed run.
+func seedIntegrationChild(runs *fakeRuns, parent uuid.UUID) {
+	p := parent
+	runs.childPages = map[uuid.UUID][]*run.Run{
+		parent: {{ID: uuid.New(), DecomposedFrom: &p}},
+	}
+}
+
+// integrationRecordedPayload renders what the orchestrator's
+// emitIntegrationCommitRecorded writes, using the STORED-ROW literals rather
+// than the exported constants so the seam pin below is not circular.
+func integrationRecordedPayload(sha string) json.RawMessage {
+	return json.RawMessage(`{"merge_sha":"` + sha + `","slice_index":0,"child_run_id":"c","consolidated_branch":"b"}`)
+}
+
+// slicesIntegratedPayload renders what emitSlicesIntegrated writes.
+func slicesIntegratedPayload(shas ...string) json.RawMessage {
+	quoted := make([]string, 0, len(shas))
+	for _, s := range shas {
+		quoted = append(quoted, `"`+s+`"`)
+	}
+	return json.RawMessage(`{"integration_commit_shas":[` + strings.Join(quoted, ",") + `],"child_run_ids":["c"],"consolidated_branch":"b","slice_count":1}`)
+}
+
+// TestCompute_Rule5_IntegrationCommitRecordedHead_NotForeign: a live PR HEAD
+// present ONLY in an integration_commit_recorded {merge_sha} entry on the
+// PARENT chain (the post-PR-open re-integration shape #1806 records) is
+// Fishhawk-recorded, not foreign_commit. Counterfactual: deleting the
+// addIntegrationCommitSHAs call in gatherForeignCommitInputs turns this RED.
+func TestCompute_Rule5_IntegrationCommitRecordedHead_NotForeign(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const mergeHead = "1111abc00000000000000000000000000000abc1"
+	seedIntegrationChild(runs, runID)
+	ar.appendChained(t, runID, nil, "integration_commit_recorded", integrationRecordedPayload(mergeHead))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, mergeHead, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (integration merge head must not be foreign); missing=%+v", state, missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("integration_commit_recorded merge sha should be known, not foreign_commit; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_SlicesIntegratedHead_NotForeign: same via the terminal
+// slices_integrated {integration_commit_shas:[X]} batch instead. Counterfactual:
+// dropping ONLY the slices_integrated read turns this RED while
+// TestCompute_Rule5_IntegrationCommitRecordedHead_NotForeign stays GREEN,
+// proving each category's union is independently load-bearing.
+func TestCompute_Rule5_SlicesIntegratedHead_NotForeign(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const mergeHead = "2222def00000000000000000000000000000def2"
+	seedIntegrationChild(runs, runID)
+	ar.appendChained(t, runID, nil, "slices_integrated", slicesIntegratedPayload(mergeHead))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, mergeHead, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (slices_integrated merge head must not be foreign); missing=%+v", state, missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("slices_integrated sha should be known, not foreign_commit; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_IntegrationOtherSha_StillForeign is the fail-closed control:
+// both integration entries name X, but the live head is a DIFFERENT un-recorded
+// commit → foreign_commit, and the detail lists X as known (proving the
+// integration reads landed and simply did not match).
+func TestCompute_Rule5_IntegrationOtherSha_StillForeign(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const integrated = "3333aaa00000000000000000000000000000aaa3"
+	const liveForeign = "deadbeef1111deadbeef1111deadbeef11111111"
+	seedIntegrationChild(runs, runID)
+	ar.appendChained(t, runID, nil, "integration_commit_recorded", integrationRecordedPayload(integrated))
+	ar.appendChained(t, runID, nil, "slices_integrated", slicesIntegratedPayload(integrated))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, liveForeign, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail (un-recorded live head is still foreign); missing=%+v", state, missing)
+	}
+	detail := foreignCommitDetail(missing)
+	if detail == "" {
+		t.Fatalf("expected foreign_commit; got %+v", missing)
+	}
+	if !strings.Contains(detail, liveForeign[:7]) {
+		t.Errorf("detail should name the live head %s: %s", liveForeign[:7], detail)
+	}
+	if !strings.Contains(detail, integrated[:7]) {
+		t.Errorf("detail should list the integration sha %s as known: %s", integrated[:7], detail)
+	}
+}
+
+// TestCompute_Rule5_ChildChainIntegrationSha_StillForeign: an integration entry
+// recorded on the CHILD's chain (never the parent's) is NOT read by the
+// parent-chain-only union, at parity with the ledger — so the live head that
+// matches it is still foreign. A child is present so len(children) > 0 and the
+// parent-chain integration read genuinely runs (and finds nothing).
+func TestCompute_Rule5_ChildChainIntegrationSha_StillForeign(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const childMerge = "4444bbb00000000000000000000000000000bbb4"
+	childID := uuid.New()
+	parent := runID
+	runs.childPages = map[uuid.UUID][]*run.Run{
+		runID: {{ID: childID, DecomposedFrom: &parent}},
+	}
+	ar.appendChained(t, childID, nil, "integration_commit_recorded", integrationRecordedPayload(childMerge))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, childMerge, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail (a child-chain integration sha is foreign to the parent-only union); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("expected foreign_commit for a child-chain integration sha; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_SlicesIntegratedReadError_Pending: a transient read failure
+// on the slices_integrated category aborts the gather into head_fetch_failed
+// (pending), never a silent under-population. Counterfactual: replacing the
+// return-err with a continue turns this RED.
+func TestCompute_Rule5_SlicesIntegratedReadError_Pending(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	seedIntegrationChild(runs, runID)
+	ar.catErr = map[string]error{"slices_integrated": errors.New("db down")}
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, recordedSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (slices_integrated read error is transient); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingHeadFetchFail) {
+		t.Errorf("expected head_fetch_failed; got %+v", missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("an integration read error must never surface as foreign_commit; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_IntegrationCommitRecordedReadError_Pending: the sibling
+// fail-closed mode on the integration_commit_recorded category.
+func TestCompute_Rule5_IntegrationCommitRecordedReadError_Pending(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	seedIntegrationChild(runs, runID)
+	ar.catErr = map[string]error{"integration_commit_recorded": errors.New("db down")}
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, recordedSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (integration_commit_recorded read error is transient); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingHeadFetchFail) {
+		t.Errorf("expected head_fetch_failed; got %+v", missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("an integration read error must never surface as foreign_commit; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_NoChildren_SkipsIntegrationReads pins the cost bound: a run
+// with NO decomposition children issues NEITHER integration category read, so a
+// non-decomposed recompute pays zero extra reads per hop. Counterfactual:
+// removing the len(children) > 0 gate makes this RED (the reads appear in
+// catCalls).
+func TestCompute_Rule5_NoChildren_SkipsIntegrationReads(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	// No childPages entry — a flat run.
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, recordedSHA, nil),
+	}
+	state, _, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass", state)
+	}
+	for _, c := range ar.catCalls {
+		if c == runID.String()+"/slices_integrated" || c == runID.String()+"/integration_commit_recorded" {
+			t.Errorf("a childless run must not issue integration reads; saw %q in %v", c, ar.catCalls)
+		}
+	}
+}
+
+// TestCompute_Rule5_MalformedIntegrationPayload_Skipped: an integration row
+// whose sha field does not decode contributes nothing and does not abort — the
+// artifact-recorded live head still evaluates normally, and a foreign head is
+// still foreign.
+func TestCompute_Rule5_MalformedIntegrationPayload_Skipped(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	seedIntegrationChild(runs, runID)
+	ar.appendChained(t, runID, nil, "integration_commit_recorded", json.RawMessage(`{"merge_sha":42}`))
+	ar.appendChained(t, runID, nil, "slices_integrated", json.RawMessage(`{"integration_commit_shas":"notarray"}`))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, recordedSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (malformed integration rows are skipped); missing=%+v", state, missing)
+	}
+	const liveForeign = "deadbeef1111deadbeef1111deadbeef11111111"
+	d.PRHead = stubPRHead(t, liveForeign, nil)
+	state, missing, err = auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail || !containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("malformed integration rows must not whitelist anything; state=%s missing=%+v", state, missing)
+	}
+}
+
+// TestIntegrationSeamConstants_MatchStoredRowLiterals pins the four exported
+// integration seam constants the server aliases to the literals the stored
+// slices_integrated / integration_commit_recorded rows carry, so neither reader
+// can drift on a rename (#3429).
+func TestIntegrationSeamConstants_MatchStoredRowLiterals(t *testing.T) {
+	if auditcomplete.CategorySlicesIntegrated != "slices_integrated" {
+		t.Errorf("CategorySlicesIntegrated = %q, want the stored-row literal", auditcomplete.CategorySlicesIntegrated)
+	}
+	if auditcomplete.IntegrationCommitSHAsField != "integration_commit_shas" {
+		t.Errorf("IntegrationCommitSHAsField = %q, want the stored-row literal", auditcomplete.IntegrationCommitSHAsField)
+	}
+	if auditcomplete.CategoryIntegrationCommitRecorded != "integration_commit_recorded" {
+		t.Errorf("CategoryIntegrationCommitRecorded = %q, want the stored-row literal", auditcomplete.CategoryIntegrationCommitRecorded)
+	}
+	if auditcomplete.IntegrationMergeSHAField != "merge_sha" {
+		t.Errorf("IntegrationMergeSHAField = %q, want the stored-row literal", auditcomplete.IntegrationMergeSHAField)
+	}
+	var batch map[string]json.RawMessage
+	if err := json.Unmarshal(slicesIntegratedPayload("x"), &batch); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := batch[auditcomplete.IntegrationCommitSHAsField]; !ok {
+		t.Errorf("stored slices_integrated payload does not carry %q: %v", auditcomplete.IntegrationCommitSHAsField, batch)
+	}
+	var rec map[string]json.RawMessage
+	if err := json.Unmarshal(integrationRecordedPayload("x"), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rec[auditcomplete.IntegrationMergeSHAField]; !ok {
+		t.Errorf("stored integration_commit_recorded payload does not carry %q: %v", auditcomplete.IntegrationMergeSHAField, rec)
+	}
+}
+
 // TestLatestReportedHeadSHA covers the shared resolver's precedence + ordering
 // (#1682): fixup_pushed wins over child_pushed wins over pull_request_opened;
 // within a category the highest-sequence entry wins; no head → (_, false).

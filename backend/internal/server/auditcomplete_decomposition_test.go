@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
@@ -78,6 +79,18 @@ type childFixtureSpec struct {
 
 func seedDecompositionFixture(t *testing.T, specs ...childFixtureSpec) *decompositionFixture {
 	t.Helper()
+	return seedDecompositionFixtureLive(t, "", specs...)
+}
+
+// seedDecompositionFixtureLive is seedDecompositionFixture with an opt-in live
+// PR head (#3429). When livePRHead is non-empty the fixture wires Config.GitHub
+// to an httptest forge serving GET /repos/{owner}/{repo}/pulls/1 (the PR number
+// pullRequestArtifactBody records) with that head sha, which ACTIVATES rule 5 of
+// auditcomplete.ComputeResult against the fixture's artifact-recorded head +
+// PR number. Empty livePRHead leaves GitHub nil so rule 5 stays skipped, exactly
+// as every pre-#3429 decomposition test expects.
+func seedDecompositionFixtureLive(t *testing.T, livePRHead string, specs ...childFixtureSpec) *decompositionFixture {
+	t.Helper()
 	ctx := context.Background()
 	pool := pgtest.NewPool(t)
 	runs := run.NewPostgresRepository(pool)
@@ -129,12 +142,28 @@ func seedDecompositionFixture(t *testing.T, specs ...childFixtureSpec) *decompos
 		f.childImpl[child.ID] = childImpl
 	}
 
-	f.server = New(Config{
+	cfg := Config{
 		Addr: "127.0.0.1:0", RunRepo: runs, ArtifactRepo: arts, AuditRepo: audits,
 		StageCheckRepo: newStageCheckRepoFake(),
 		ExternalURL:    "https://app.fishhawk.example.com",
-	})
+	}
+	if livePRHead != "" {
+		cfg.GitHub = newVouchPRGitHubClient(t, vouchPRStub{headSHA: livePRHead})
+	}
+	f.server = New(cfg)
 	return f
+}
+
+// appendParentAuditEntry appends a run-scoped (no stage) chained audit entry to
+// runID's chain — the shape the orchestrator's fan-in emits for
+// slices_integrated / integration_commit_recorded.
+func appendParentAuditEntry(t *testing.T, audits audit.Repository, runID uuid.UUID, category string, payload json.RawMessage) {
+	t.Helper()
+	if _, err := audits.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Now().UTC(), Category: category, Payload: payload,
+	}); err != nil {
+		t.Fatalf("append %s: %v", category, err)
+	}
 }
 
 // seedDecompStageRow creates a stage and walks it to `state` the way the runner
@@ -341,4 +370,127 @@ func TestAuditCompleteResolutionReachesPublishedCheck(t *testing.T) {
 			t.Errorf("published check-run summary must name satisfying child run %s; got:\n%s", id, summary)
 		}
 	}
+}
+
+// TestAuditCompleteDecomposition_IntegrationMergeHeadNotForeign is the #3429
+// cross-boundary pin: a post-PR-open integrate-wave advances the consolidated
+// PR head to a fan-in "Integrate slice N" merge that the PR-open-time artifact
+// never recorded. Rule 5's known set must union both integration categories on
+// the decomposed parent's OWN chain, at parity with the lineage ledger the same
+// server builds — so the recomputed audit_complete row carries no foreign_commit
+// for a head buildReportedHeadLedger already accepts. Every subtest seeds two
+// traced+succeeded children so rule 2b resolves and every other rule passes,
+// leaving rule 5 the only rule that can fail.
+func TestAuditCompleteDecomposition_IntegrationMergeHeadNotForeign(t *testing.T) {
+	const liveHead = "5e5e5e5e00000000000000000000000000005e5e"
+	ctx := context.Background()
+
+	// requireNoForeignCommit asserts the checks row is pass with no foreign_commit
+	// item AND the same server's ledger accepts liveHead (the parity assertion).
+	requireNoForeignCommit := func(t *testing.T, f *decompositionFixture) {
+		t.Helper()
+		row := f.auditCompleteRowFor(t)
+		for _, m := range row.Missing {
+			if m.Kind == auditcomplete.MissingForeignCommit {
+				t.Fatalf("recomputed audit_complete reported foreign_commit for an integration merge head: %+v", m)
+			}
+		}
+		if row.State != string(stagecheck.StatePass) {
+			t.Fatalf("state = %s, want pass; missing=%+v", row.State, row.Missing)
+		}
+		// Parity: the SAME server's reported-head ledger already accepts liveHead.
+		parent, err := f.runs.GetRun(ctx, f.parent.ID)
+		if err != nil {
+			t.Fatalf("reload parent: %v", err)
+		}
+		ledger, complete := f.server.buildReportedHeadLedger(ctx, parent, "")
+		if !complete {
+			t.Fatalf("ledger incomplete; want complete so the parity claim is real")
+		}
+		if _, ok := ledger[liveHead]; !ok {
+			t.Fatalf("ledger does not accept liveHead %s, but rule 5 did — the asymmetry this test guards against", liveHead)
+		}
+	}
+
+	t.Run("integration_commit_recorded only (conflict/re-integration shape)", func(t *testing.T) {
+		f := seedDecompositionFixtureLive(t, liveHead,
+			childFixtureSpec{implState: run.StageStateSucceeded, traced: true},
+			childFixtureSpec{implState: run.StageStateSucceeded, traced: true},
+		)
+		appendParentAuditEntry(t, f.audits, f.parent.ID, "integration_commit_recorded",
+			json.RawMessage(`{"merge_sha":"`+liveHead+`","slice_index":1,"child_run_id":"c","consolidated_branch":"b"}`))
+		requireNoForeignCommit(t, f)
+	})
+
+	t.Run("slices_integrated only", func(t *testing.T) {
+		f := seedDecompositionFixtureLive(t, liveHead,
+			childFixtureSpec{implState: run.StageStateSucceeded, traced: true},
+			childFixtureSpec{implState: run.StageStateSucceeded, traced: true},
+		)
+		appendParentAuditEntry(t, f.audits, f.parent.ID, "slices_integrated",
+			json.RawMessage(`{"integration_commit_shas":["`+liveHead+`"],"child_run_ids":["c"],"consolidated_branch":"b","slice_count":1}`))
+		requireNoForeignCommit(t, f)
+	})
+
+	t.Run("unrecorded live head still flags", func(t *testing.T) {
+		const freshHead = "cafecafe00000000000000000000000000cafeca"
+		f := seedDecompositionFixtureLive(t, freshHead,
+			childFixtureSpec{implState: run.StageStateSucceeded, traced: true},
+			childFixtureSpec{implState: run.StageStateSucceeded, traced: true},
+		)
+		// No integration entry recorded — the fresh head is attributable to nothing.
+		row := f.auditCompleteRowFor(t)
+		if row.State != string(stagecheck.StateFail) {
+			t.Fatalf("state = %s, want fail for an unrecorded live head; missing=%+v", row.State, row.Missing)
+		}
+		var detail string
+		for _, m := range row.Missing {
+			if m.Kind == auditcomplete.MissingForeignCommit {
+				detail = m.Detail
+			}
+		}
+		if detail == "" {
+			t.Fatalf("want a foreign_commit item; got %+v", row.Missing)
+		}
+		// The artifact-recorded head (abc12345) is the known set the detail lists.
+		if !strings.Contains(detail, "abc1234") {
+			t.Errorf("detail should list the artifact head abc12345 as known: %s", detail)
+		}
+	})
+
+	t.Run("merge sha recorded on a CHILD chain is foreign to both readers", func(t *testing.T) {
+		f := seedDecompositionFixtureLive(t, liveHead,
+			childFixtureSpec{implState: run.StageStateSucceeded, traced: true},
+			childFixtureSpec{implState: run.StageStateSucceeded, traced: true},
+		)
+		// The integration entry sits on the CHILD's chain, which neither the
+		// parent-chain-only rule-5 union nor the ledger reads → foreign to both.
+		appendParentAuditEntry(t, f.audits, f.childIDs[0], "integration_commit_recorded",
+			json.RawMessage(`{"merge_sha":"`+liveHead+`","slice_index":1,"child_run_id":"c","consolidated_branch":"b"}`))
+		row := f.auditCompleteRowFor(t)
+		if row.State != string(stagecheck.StateFail) {
+			t.Fatalf("state = %s, want fail (a child-chain integration sha is foreign); missing=%+v", row.State, row.Missing)
+		}
+		foreign := false
+		for _, m := range row.Missing {
+			if m.Kind == auditcomplete.MissingForeignCommit {
+				foreign = true
+			}
+		}
+		if !foreign {
+			t.Fatalf("want a foreign_commit item; got %+v", row.Missing)
+		}
+		// Parity in the refusing direction: the ledger also lacks liveHead.
+		parent, err := f.runs.GetRun(ctx, f.parent.ID)
+		if err != nil {
+			t.Fatalf("reload parent: %v", err)
+		}
+		ledger, complete := f.server.buildReportedHeadLedger(ctx, parent, "")
+		if !complete {
+			t.Fatalf("ledger incomplete")
+		}
+		if _, ok := ledger[liveHead]; ok {
+			t.Fatalf("ledger unexpectedly accepts a child-chain integration sha %s", liveHead)
+		}
+	})
 }

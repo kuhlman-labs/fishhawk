@@ -317,6 +317,29 @@ const (
 	VouchedSHAField               = "vouched_sha"
 )
 
+// The integration-commit seam constants are the fan-in's write→read seam,
+// exported so the server aliases them (server/lineage.go) and a rename on
+// either reader is a compile-time drift, not a silent one (#3429 — the same
+// pattern as CategoryOperatorCommitVouched). The WRITER is the orchestrator
+// (emitSlicesIntegrated / emitIntegrationCommitRecorded), which keeps its own
+// literals because it does not import auditcomplete; the stored-row spelling is
+// pinned by TestVouchSeamConstants' integration sibling. The READERS are
+// server/lineage.go's buildReportedHeadLedger (the ADR-035 branch-lineage
+// ledger) and this package's gatherForeignCommitInputs (rule 5's known set).
+//
+// CategorySlicesIntegrated carries the terminal batch of "Integrate slice N"
+// merge SHAs (integration_commit_shas, a []string) the fan-in created on the
+// consolidated branch once every slice merged cleanly (#1459).
+// CategoryIntegrationCommitRecorded carries a SINGLE merge SHA (merge_sha)
+// emitted the instant each merge is created, durable across a partial fan-in
+// that never reached the terminal batch (#1806).
+const (
+	CategorySlicesIntegrated          = "slices_integrated"
+	IntegrationCommitSHAsField        = "integration_commit_shas"
+	CategoryIntegrationCommitRecorded = "integration_commit_recorded"
+	IntegrationMergeSHAField          = "merge_sha"
+)
+
 // LatestReportedHeadSHA applies HeadReportCategoriesByPrecedence to a run's
 // chained audit entries: for the highest-precedence category that carries at
 // least one entry with a non-empty head_sha payload field, it returns the
@@ -937,11 +960,23 @@ type foreignCommitInputs struct {
 // gatherForeignCommitInputs walks runID upward via parent_run_id
 // (#216) and collects every implement-stage `pull_request`
 // artifact's head_sha + the PR's number, every walked run's own
-// head-report heads (#1682), and every walked run's operator-vouched
-// commits plus those of its decomposition children (#3415). Returns
+// head-report heads (#1682), every walked run's operator-vouched
+// commits plus those of its decomposition children (#3415), and —
+// on a walked run that HAS decomposition children — that run's own
+// fan-in integration merge commits (#3429). Returns
 // (inputs, true, nil) when there's enough to call PRHead; (_, false,
 // nil) when there's no implement stage / no installation / no PR yet;
 // error only on transient I/O.
+//
+// Reachability of the integration union (#3429): a decomposed parent never
+// emits pull_request_opened, and consolidated_pr_opened carries NO head_sha, so
+// the PR-open-time head is known only through the kind=pull_request artifact
+// recorded at PR-open time — the consolidated-branch tip THEN. That artifact is
+// idempotent, so a post-PR-open integrate-wave that creates a fresh "Integrate
+// slice N" merge advances the live PR head PAST the recorded tip, and without
+// this union rule 5 flags that merge foreign even though server/lineage.go's
+// ledger already accepts it. The union reads only the parent's OWN chain, at
+// parity with the ledger.
 func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) (foreignCommitInputs, bool, error) {
 	known := make(map[string]struct{})
 	var (
@@ -1052,6 +1087,20 @@ func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) 
 		if err != nil {
 			return foreignCommitInputs{}, false, err
 		}
+		// #3429: a decomposed parent's fan-in records its "Integrate slice N"
+		// merge commits on the PARENT's own chain (RunID = parent), and a
+		// post-PR-open integrate-wave can advance the live PR head to one of
+		// those merges past the PR-open-time artifact tip. Union both
+		// integration categories at PARITY with server/lineage.go's ledger
+		// (parent chain only). Gated on len(children) > 0 as the cost bound the
+		// issue asks for: the orchestrator never writes these on a childless
+		// run, so the read would find nothing there, and a non-decomposed
+		// recompute pays zero extra category reads per hop.
+		if len(children) > 0 {
+			if err := addIntegrationCommitSHAs(ctx, deps, r.ID, known); err != nil {
+				return foreignCommitInputs{}, false, err
+			}
+		}
 		for _, child := range children {
 			if child == nil {
 				continue
@@ -1118,6 +1167,62 @@ func addVouchedSHAs(ctx context.Context, deps Deps, runID uuid.UUID, known map[s
 		}
 		if json.Unmarshal(e.Payload, &p) == nil && p.VouchedSHA != "" {
 			known[p.VouchedSHA] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// addIntegrationCommitSHAs unions the fan-in integration merge commits recorded
+// on runID's own chain into known (#3429): every non-empty SHA in the
+// integration_commit_shas array of each CategorySlicesIntegrated entry, plus
+// every non-empty merge_sha of each CategoryIntegrationCommitRecorded entry.
+// This is rule 5's parity with server/lineage.go buildReportedHeadLedger, which
+// unions BOTH categories parent-chain-only; without it a post-PR-open
+// re-integration merge (an operator integrate-wave that advances the
+// consolidated head past the recorded PR-open-time tip) reads as foreign_commit
+// even though the lineage ledger already accepts it.
+//
+// A read error on EITHER category is returned wrapped so the caller aborts the
+// gather into head_fetch_failed (pending) — the same transient-I/O posture the
+// head-category and vouch reads take, never a silent under-population that
+// false-flags a legitimate integration merge. A malformed payload is skipped
+// (the orchestrator is the single writer and always emits the field). Read the
+// PARENT's own chain only — the orchestrator emits both categories with RunID =
+// the decomposed parent, and the ledger likewise never reads them from children.
+func addIntegrationCommitSHAs(ctx context.Context, deps Deps, runID uuid.UUID, known map[string]struct{}) error {
+	batches, err := deps.Audit.ListForRunByCategory(ctx, runID, CategorySlicesIntegrated)
+	if err != nil {
+		return fmt.Errorf("list %s for %s: %w", CategorySlicesIntegrated, shortID(runID), err)
+	}
+	for _, e := range batches {
+		if e == nil {
+			continue
+		}
+		var p struct {
+			IntegrationCommitSHAs []string `json:"integration_commit_shas"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		for _, sha := range p.IntegrationCommitSHAs {
+			if sha != "" {
+				known[sha] = struct{}{}
+			}
+		}
+	}
+	recorded, err := deps.Audit.ListForRunByCategory(ctx, runID, CategoryIntegrationCommitRecorded)
+	if err != nil {
+		return fmt.Errorf("list %s for %s: %w", CategoryIntegrationCommitRecorded, shortID(runID), err)
+	}
+	for _, e := range recorded {
+		if e == nil {
+			continue
+		}
+		var p struct {
+			MergeSHA string `json:"merge_sha"`
+		}
+		if json.Unmarshal(e.Payload, &p) == nil && p.MergeSHA != "" {
+			known[p.MergeSHA] = struct{}{}
 		}
 	}
 	return nil

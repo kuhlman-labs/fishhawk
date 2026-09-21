@@ -1231,6 +1231,18 @@ Mechanics:
     #3415 symptom. The issue title blamed the write path ("does not union
     the sha into the reported-head ledger"); the write path was fine, the
     second reader was blind.
+- The fan-in INTEGRATION categories now flow to both readers the same way
+  (#3429). `buildReportedHeadLedger` and `gatherForeignCommitInputs` each
+  union `slices_integrated` `integration_commit_shas` + `integration_commit_recorded`
+  `merge_sha` on the decomposed parent's OWN chain, via the shared seam
+  constants `auditcomplete.CategorySlicesIntegrated` /
+  `CategoryIntegrationCommitRecorded` (aliased here as
+  `lineageIntegrationLedgerCategory` / `lineageIntegrationCommitCategory`, so a
+  rename on either reader is a compile-time drift). Rule 5 was again the
+  later reader that omitted the union, so a post-PR-open integrate-wave
+  advanced the live head to a fan-in merge the ledger accepted while rule 5
+  stamped `foreign_commit`; the union is gated on the run having decomposition
+  children so a non-decomposed recompute pays nothing.
 - **Re-posts the `fishhawk_audit_complete` check at the vouched head
   (E64.14 / #3109).** After the `operator_commit_vouched` entry is
   durable, the handler calls
