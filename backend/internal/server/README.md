@@ -937,8 +937,11 @@ credential the agent held (the preview's fixed Postgres role can mint a
   `wirecontract` `prompt_response` ModeSubset pair, so a tag drift fails
   `TestCrossModuleWireParity`. The runner's pre-spawn gate that refuses on it
   (`runner_failed` reason `forge_writes_denied`, category C) is the sibling
-  slice, documented in `runner/README.md`. Both fields are omitted on a
-  production daemon, keeping its wire surfaces byte-identical.
+  slice, documented in `runner/README.md`; since E72.16 / #3510 the runner
+  ALSO probes the `/healthz` `dev_mode` field once pre-spawn on both launch
+  paths, so that gate no longer depends on a prompt fetch (a `--prompt-file`
+  launch with a scrubbed env is refused by the probe). Both fields are
+  omitted on a production daemon, keeping its wire surfaces byte-identical.
 - **MCP-token pin.** `TestHandleIssueMCPToken_ScopesNeverReachHostDispatch`
   pins that the run-bound MCP token — the one token the acceptance sandbox can
   mint via its signing key — never carries `write:runs` or `write:approvals`

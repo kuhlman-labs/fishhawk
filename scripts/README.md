@@ -1334,8 +1334,11 @@ branch or open a PR on the real forge with the operator's credentials —
 the #3500 escape. It is the SECOND, independent deny source: either dev
 flag above already puts the daemon in dev mode, whose host-dispatch
 marker refuses every caller and whose prompt responses carry
-`forge_writes: "deny"`, so a runner that never fetched a prompt is the
-only one this variable reaches. Serve concern only — the `migrate up`
+`forge_writes: "deny"`; the runner itself also probes the daemon's
+`/healthz` `dev_mode: true` once pre-spawn on BOTH launch paths (the
+THIRD, launch-path-independent source, E72.16 / #3510), so this
+variable is the belt for a runner whose env was not scrubbed rather
+than the only signal a `--prompt-file` launch sees. Serve concern only — the `migrate up`
 line carries none of the three. `scripts/test-dev` pins the exact
 `FISHHAWK_FORGE_WRITES=deny` word on the serve line and its absence from
 the migrate line, the same two-assertion shape as the two dev flags.

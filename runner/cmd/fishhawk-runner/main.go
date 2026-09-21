@@ -584,8 +584,28 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 
 	// forgeWritesSignal is the backend's forge_writes policy from the prompt
 	// response (E72.13 / #3500): "deny" on a dev-mode fishhawkd, "" otherwise
-	// and on the --prompt-file path, which fetches nothing.
+	// and on the --prompt-file path, which fetches nothing. The THIRD deny
+	// source, the backend's /healthz dev_mode (E72.16 / #3510), is probed
+	// below independent of the launch path.
 	var forgeWritesSignal string
+
+	// Forge-writes /healthz dev_mode probe (E72.16 / #3510): ONE direct GET
+	// of <backend-url>/healthz, here — the first backend contact of run(),
+	// ahead of the fetch block — so both refuseIfForgeWritesDenied sites
+	// (the fetch-block site and the --prompt-file convergence site) consume
+	// the same result and the fetch path pays no second probe. A
+	// --prompt-file launch from an env that scrubbed FISHHAWK_FORGE_WRITES
+	// fetches no prompt and so saw neither of the #3500 signals; this is what
+	// covers it. Every outcome is logged; only dev_mode denies (fail-open on
+	// unreachable / unverifiable / production — a production daemon omits
+	// the key). Not gated on cfg.noPR: the deny is a posture, not a
+	// per-write check, matching the two existing sites.
+	healthz := probeBackendDevMode(ctx, cfg.backendURL)
+	logEvent(logSink, "forge_writes_healthz_probe", map[string]string{
+		"backend_url": cfg.backendURL,
+		"outcome":     healthz.outcome,
+		"detail":      healthz.detail,
+	})
 
 	// If --fetch-prompt is set and no --prompt-file was supplied,
 	// pull the constructed prompt from the backend and write it to
@@ -670,15 +690,17 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				return exitFailure
 			}
 		}
-		// Forge-writes gate (E72.13 / #3500), FIRST site. Placed here — after
-		// the version checks and BEFORE the conflict-resolution pass, the
-		// lineage worktree provisioning and the held-commit PR-open below — so
-		// a denied posture (env FISHHAWK_FORGE_WRITES=deny, or the dev-mode
-		// backend's forge_writes:"deny" on this prompt response) refuses the
-		// stage before any forge write is reachable and before any agent is
-		// spawned. Category C: the posture is not retryable.
+		// Forge-writes gate (E72.13 / #3500, E72.16 / #3510), FIRST site.
+		// Placed here — after the version checks and BEFORE the
+		// conflict-resolution pass, the lineage worktree provisioning and the
+		// held-commit PR-open below — so a denied posture (env
+		// FISHHAWK_FORGE_WRITES=deny, the dev-mode backend's
+		// forge_writes:"deny" on this prompt response, or its /healthz
+		// dev_mode:true from the probe above) refuses the stage before any
+		// forge write is reachable and before any agent is spawned.
+		// Category C: the posture is not retryable.
 		forgeWritesSignal = promptForgeWrites
-		if refuseIfForgeWritesDenied(logSink, os.Environ(), forgeWritesSignal) {
+		if refuseIfForgeWritesDenied(logSink, os.Environ(), forgeWritesSignal, healthz.devMode) {
 			return exitFailure
 		}
 		cfg.promptFile = path
@@ -886,14 +908,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.workingDir = wt
 	}
 
-	// Forge-writes gate (E72.13 / #3500), SECOND site: the convergence point
-	// the --prompt-file path reaches without passing the fetch block above.
-	// Evaluated before the held-commit PR-open and before the agent
-	// invocation is wired, with the env as the only signal on that path
-	// (forgeWritesSignal is "" when nothing was fetched). On the fetched path
-	// the first site already passed, so this re-evaluation of the same inputs
-	// proceeds identically and logs nothing.
-	if refuseIfForgeWritesDenied(logSink, os.Environ(), forgeWritesSignal) {
+	// Forge-writes gate (E72.13 / #3500, E72.16 / #3510), SECOND site: the
+	// convergence point the --prompt-file path reaches without passing the
+	// fetch block above. Evaluated before the held-commit PR-open and before
+	// the agent invocation is wired, with the env and the /healthz dev_mode
+	// probe as the signals on that path (forgeWritesSignal is "" when nothing
+	// was fetched — the probe is what covers a --prompt-file launch whose env
+	// was scrubbed, #3510). On the fetched path the first site already
+	// passed, so this re-evaluation of the same inputs proceeds identically
+	// and logs nothing.
+	if refuseIfForgeWritesDenied(logSink, os.Environ(), forgeWritesSignal, healthz.devMode) {
 		return exitFailure
 	}
 
