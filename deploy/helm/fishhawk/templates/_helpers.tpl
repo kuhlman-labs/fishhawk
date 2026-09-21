@@ -719,10 +719,13 @@ rather than two guards racing (the same division of labour the GitHub trio uses)
 
 {{/*
 Every ConfigMap key the chart itself renders (E69.4 / #2915). Hand-authored, so
-it is a DRIFT risk — scripts/test-helm-render r12 renders an all-config-keys-set
-ConfigMap, extracts every emitted FISHHAWKD_* key, and asserts the collision
-guard below fires for EACH, so a key added to configmap.yaml without a matching
-entry here reddens the gate. Consumed by fishhawk.validateExtraEnv.
+it is a DRIFT risk — scripts/test-helm-render pins this list BOTH ways against
+an all-config-keys-set ConfigMap render: r12 asserts the collision guard below
+fires for every emitted FISHHAWKD_* key, so a key added to configmap.yaml
+without a matching entry here reddens the forward loop; r12g source-parses this
+list and asserts every entry is emitted, so a stale or misspelled entry with no
+emitted counterpart reddens the reverse loop (#2969). Consumed by
+fishhawk.validateExtraEnv.
 */}}
 {{- define "fishhawk.managedConfigKeys" -}}
 {{- $keys := list

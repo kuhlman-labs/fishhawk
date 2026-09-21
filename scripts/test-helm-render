@@ -1255,6 +1255,53 @@ if [ "$drift_ok" -eq 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# r12g — REVERSE anti-drift (#2969). The forward loop above proves list ⊇
+#        emitted: no emitted key escapes the collision guard. It says nothing
+#        about the other direction — a stale or misspelled entry in the
+#        hand-authored fishhawk.managedConfigKeys list is undetectable by it.
+#        r12g proves emitted ⊇ list: no stale/misspelled entry survives.
+#        Together the two pin EQUALITY against the r12-allkeys fixture.
+#
+#        This is a SOURCE parse of the `list` literal in the define — helm
+#        exposes no way to render a bare named template's output — so a
+#        refactor of managedConfigKeys to a computed/non-literal list hollows
+#        the extraction. The FISHHAWKD_ADDR sentinel below is what catches
+#        that (same disclosure pattern as scripts/check-site-ia). A NEW
+#        ConfigMap key gated on a values field this fixture leaves unset
+#        surfaces here as a reverse-loop FAIL naming the key; the fix is to
+#        set that field in r12-allkeys.yaml, not to touch this loop.
+#
+#        Extraction is LOOSE by design: it captures every quoted string
+#        literal in the define body, not only tokens already shaped like
+#        FISHHAWKD_*, so a malformed entry (e.g. "FISHHAWKD_STALE-ENTRY" or
+#        "fishhawkd_typo") is extracted and then FAILS the reverse loop
+#        (absent from the emitted set) rather than being filtered out before
+#        the check ever sees it.
+# ---------------------------------------------------------------------------
+listed_keys=$(awk '
+  /define "fishhawk.managedConfigKeys"/ { f=1; next }
+  f && /^\{\{- end -\}\}/ { f=0 }
+  f { print }
+' "$CHART/templates/_helpers.tpl" | grep -oE '"[^"]*"' | tr -d '"' | sort -u)
+assert_contains "r12g managedConfigKeys extraction is non-vacuous (finds FISHHAWKD_ADDR)" "$listed_keys" "FISHHAWKD_ADDR"
+listed_count=$(printf '%s\n' "$listed_keys" | grep -c .)
+emitted_count=$(printf '%s\n' "$emitted_keys" | grep -c .)
+if [ "$listed_count" -eq "$emitted_count" ]; then
+  pass "r12g managedConfigKeys entry count ($listed_count) equals the emitted FISHHAWKD_* key count ($emitted_count)"
+else
+  fail "r12g managedConfigKeys entry count ($listed_count) does not equal the emitted FISHHAWKD_* key count ($emitted_count) — a partial extraction (awk range closing early) or a genuine drift would otherwise silently under-cover the reverse loop"
+fi
+reverse_ok=1
+while IFS= read -r k; do
+  [ -n "$k" ] || continue
+  if ! printf '%s\n' "$emitted_keys" | grep -qxF -- "$k"; then
+    fail "r12g anti-drift (reverse): fishhawk.managedConfigKeys lists $k but the all-config-keys fixture never emits it (stale/misspelled entry, or a key the fixture leaves unset)"
+    reverse_ok=0
+  fi
+done <<< "$listed_keys"
+[ "$reverse_ok" -eq 1 ] && pass "r12g anti-drift (reverse): every fishhawk.managedConfigKeys entry is emitted by the all-config-keys fixture (list ⊆ emitted)"
+
+# ---------------------------------------------------------------------------
 # r13 — CROSS-BOUNDARY. The chart configures a SEPARATE binary, so pin the
 #       joint-validation claim to the contract it mirrors: fishhawkd reads
 #       FISHHAWKD_OAUTH_CLIENT_ID and enforces all-three-or-none at startup
