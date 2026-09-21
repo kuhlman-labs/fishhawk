@@ -332,8 +332,10 @@ Notes:
   - **CI failure** — `ci_failure_retry_dispatched` / `ci_retry_exhausted`.
   - **Acceptance scenario-corpus reports (E72.4, #3328)** — two kinds written
     by `server/pullrequest.go` on the acceptance runner's post-verdict report,
-    each followed by a `notifyStatusUpdate` anchor rebuild (no new comment
-    surface, no page-class ping). `acceptance_scenarios_pushed` stays
+    each followed by an anchor rebuild (no new comment surface, no page-class
+    ping) — `notifyStatusUpdate` for the audit-only push, `notifyOperatorVisible`
+    (the #3406 intent marker, see "Writer-side intent contract" below) for the
+    rendered drop. `acceptance_scenarios_pushed` stays
     audit-only — `activityCategories` does not admit it, so the rebuild
     renders no line for it; `acceptance_scenario_retirement_dropped` is
     admitted (#3392, see below) and DOES render on the anchor/status comment
@@ -371,8 +373,8 @@ Notes:
     `awaiting_host_dispatch` / `dispatched` (a `running` or terminal stage
     means the runner fetched the retirements and owns the report). Idempotent
     per stage+reason, actor `system`, and — UNLIKE the #3396 writer — followed
-    by a `notifyStatusUpdate` refresh, so the drop renders on the anchor at
-    cancel time. Its own chain-read failure mirrors #3396 (`retired: []` + an
+    by a `notifyOperatorVisible` refresh (#3406), so the drop renders on the
+    anchor at cancel time. Its own chain-read failure mirrors #3396 (`retired: []` + an
     `error` field). **The anchor / status comment is a
     LIVE surface for the drop (#3392):** `status_template.go`'s
     `activityCategories` admits `acceptance_scenario_retirement_dropped`, and
@@ -385,7 +387,7 @@ Notes:
     every other reason clause on this timeline uses) so a handful of long
     reasons can never blow the anchor's body-size ladder and drop the WHOLE
     timeline, and the row is **retained** (not informational) under the
-    anchor's 12-row cap. The `notifyStatusUpdate` refresh from the
+    anchor's 12-row cap. The `notifyOperatorVisible` refresh from the
     runner-reported writer and the #3389 cancel writer rebuild the anchor
     immediately; the empty-`retired` #3396 second writer emits no refresh of
     its own, so that row surfaces on the anchor's NEXT rebuild, rendering an honest "no scenario entries on the
@@ -394,8 +396,10 @@ Notes:
     timeline. A completeness gate
     (`backend/internal/issuecomment/activity_categories_completeness_test.go`)
     now pins `activityCategories` ↔ `renderActivityLine` parity in both
-    directions, which is what would have caught this category's original
-    omission. A
+    directions; the writer-side half — that the server writer's INTENT for the
+    anchor is bound to that registry — is the #3406 gate described under
+    "Writer-side intent contract" below, which is what would have caught this
+    category's original omission. A
     third kind, `acceptance_scenario_regression` `{scenario_id, origin_pr?,
     origin_issue, origin_run_id, path, origin_unresolved?, observed, expected,
     repro_handle}`, is written by `server/acceptance.go` per FAILED replayed
@@ -1550,7 +1554,8 @@ Notes:
   It is the durable record of which commit the fix-up landed onto the open PR; it
   drives the fix-up stage's terminal transition but posts nothing to the issue
   thread (the existing PR's sticky status comment is refreshed via the separate
-  `notifyStatusUpdate` hook, not this audit kind). Mirrors the sibling `child_pushed`
+  `notifyOperatorVisible` hook — the #3406 marker, since `fixup_pushed` renders
+  on the anchor timeline — not this audit kind). Mirrors the sibling `child_pushed`
   (#771). Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
 - The fix-up no-changes audit kind — `fixup_no_changes` (#856) — is an **internal,
@@ -2323,6 +2328,58 @@ Notes:
   release_publish_audit_failed` rather than a false success. Listed here only so
   a reader grepping the audit categories doesn't mistake it for a comment
   surface.
+
+## Writer-side intent contract (#3406)
+
+The `activityCategories` set in `issuecomment/status_template.go` is a closed
+registry in a different package from the writers that append audit rows; an
+audit category a `server` writer appends and refreshes the anchor for, but
+never registers there, renders NOTHING — `pickActivity` drops it as system
+noise, silently (the `acceptance_scenario_retirement_dropped` shape #3392
+fixed). The same-file parity gate in
+`issuecomment/activity_categories_completeness_test.go` cannot see that shape
+(no `case` and no entry to compare), so the writer side now carries an
+explicit intent marker and a cross-package static gate:
+
+- **`(*Server).notifyOperatorVisible(ctx, runID, category)`**
+  (`server/operator_visible.go`) is the declarative statement "I just appended
+  audit category X and intend the operator to see it on the anchor / status
+  comment." It logs at **ERROR** (`operator-visible audit category is not
+  renderable on the anchor; register it in issuecomment.activityCategories`,
+  attrs `category` + `run_id`) when `issuecomment.RendersActivity(category)`
+  is false — before and independent of the notifier nil-guard, because the
+  mismatch is a defect whether or not a notifier is configured — and then
+  delegates to `notifyStatusUpdate` unconditionally, so the refresh behaviour
+  is unchanged. The six writers whose refresh trigger IS a rendered category
+  use it: the two `acceptance_scenario_retirement_dropped` writers
+  (runner-reported + cancel), `fixup_pushed`, `deployment_rollback_initiated`,
+  `pr_merged`, `pr_closed_without_merge`.
+- **`notifyStatusUpdate`'s `source` is a call-site TRANSITION tag**
+  (`trace_handler`, `approval_submit`, `scope_parked`, …), never an audit
+  category the writer intends the operator to see.
+- **The gate** (`server/operator_visible_gate_test.go`, in-loop via `go test
+  -race ./...`) type-checks the server package's non-test files through
+  `go/types` and sweeps every call of both helpers. Each category argument
+  must be a string literal or an identifier / selector whose `types.Info.Uses`
+  object is a string-kinded `*types.Const` — a variable, parameter, shadowing
+  local, call or concatenation FAILS CLOSED naming `file:line` (resolution is
+  never by identifier name, so a shadowing local cannot be misread as the
+  package const; the fixture self-test carries that exact row). Every
+  `notifyOperatorVisible` category must be admitted by
+  `issuecomment.RendersActivity` AND `audit.IsKnownCategory`. No
+  `notifyStatusUpdate` source may be an `audit.KnownCategories` member unless
+  the reasoned `auditOnlyStatusRefreshSources` table names it (a category the
+  writer deliberately keeps audit-only today — `acceptance_reopened`,
+  `child_pushed`, `fixup_no_changes`, `plan_revised`, … each with its own
+  one-line reason); an exemption whose category has since become renderable
+  fails as **stale** (convert the site and drop it), and one no site
+  references fails as **orphaned**. Naming an audit category as a refresh
+  trigger is therefore an explicit choice either way, never an inference.
+- **Honest residual:** a writer that appends a NEW category and refreshes with
+  a non-category transition tag (`"trace_handler"`) is bound by neither gate —
+  only naming-the-category and marking are bound. Register the category in
+  `activityCategories` + `renderActivityLine` and mark the writer with
+  `notifyOperatorVisible` when the row is meant for the operator.
 
 ## Routing
 

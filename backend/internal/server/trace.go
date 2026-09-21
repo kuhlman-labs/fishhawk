@@ -934,10 +934,18 @@ func (s *Server) notifyPlanReady(ctx context.Context, runID uuid.UUID, stage *ru
 // 404-recovery; here we just call it and log on failure. The state
 // machine is authoritative; the comment is a UI mirror.
 //
-// `source` is a short tag identifying the call site (e.g.
-// "trace_handler", "approval_submit", "pr_merged"). It lands in the
+// `source` is a short tag identifying the call-site TRANSITION (e.g.
+// "trace_handler", "approval_submit", "scope_parked"). It lands in the
 // log line as a slog attribute so operators tailing logs can pinpoint
-// which transition tripped a notify failure.
+// which transition tripped a notify failure. It is NOT an audit
+// category: a writer whose refresh trigger IS an audit category it
+// intends the operator to see on the anchor calls notifyOperatorVisible
+// (operator_visible.go, #3406) instead, which checks the category is
+// renderable and then delegates here. The gate in
+// operator_visible_gate_test.go enforces both halves — every
+// notifyOperatorVisible category renders, and no notifyStatusUpdate
+// source is an audit category unless auditOnlyStatusRefreshSources
+// names it with a reason.
 func (s *Server) notifyStatusUpdate(ctx context.Context, runID uuid.UUID, source string) {
 	if s.issueNotifier == nil {
 		return

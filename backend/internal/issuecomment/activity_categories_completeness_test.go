@@ -33,19 +33,21 @@ import (
 // category AND the file to edit, so the fix is one line away from the
 // message.
 //
-// What this gate does NOT catch (stated honestly, not papered over): a
-// category a server writer INTENDS for the anchor timeline — an
-// AppendChained call followed by a notifyStatusUpdate refresh — that has
-// NEITHER a `case` NOR an activityCategories entry. That is the exact shape
-// this issue's defect had before the fix landed: nothing here would have
-// caught it, because there was no case and no entry to compare against each
-// other; the mismatch was invisible to a same-file parity check. Catching
-// THAT needs a cross-package "writer intends the anchor" gate — an explicit
-// intent marker on the writer side plus a sweep over the ~47
-// notifyStatusUpdate call sites in backend/internal/server, whose semantics
-// are mostly state transitions rather than audit categories. That gate is
-// larger than this issue's scope and is deliberately left for the operator
-// to file rather than attempted here.
+// What this gate does NOT catch on its own: a category a server writer
+// INTENDS for the anchor timeline — an AppendChained call followed by a
+// status refresh — that has NEITHER a `case` NOR an activityCategories entry.
+// That is the exact shape this issue's defect had before the fix landed: a
+// same-file parity check has no case and no entry to compare against each
+// other, so the mismatch is invisible here. That half is closed by the
+// cross-package "writer intends the anchor" gate (#3406):
+// backend/internal/server/operator_visible_gate_test.go type-checks the
+// server package and asserts every category passed to
+// (*Server).notifyOperatorVisible — the explicit writer-side intent marker —
+// is admitted by RendersActivity (this registry) and by
+// audit.IsKnownCategory, and that no notifyStatusUpdate refresh is tagged
+// with an audit category unless a reasoned exemption names it. The residual
+// that remains: a writer that appends a NEW category and refreshes with a
+// non-category transition tag is bound by neither gate.
 func TestActivityCategoriesMatchRenderActivityLine(t *testing.T) {
 	cases, err := collectRenderActivityLineCases("status_template.go")
 	if err != nil {
@@ -167,5 +169,27 @@ func TestActivityCategoriesRegisteredInAuditKnownCategories(t *testing.T) {
 			"activityCategoryKnownCategoryExemptions in "+
 			"backend/internal/issuecomment/activity_categories_completeness_test.go if this is a deliberate "+
 			"forward registration", c)
+	}
+}
+
+// TestRendersActivity pins the read accessor the server package's
+// writer-intent marker and gate consult (#3406): true for a registered
+// activityCategories member, false for an unregistered string and for the
+// empty string — so the marker's runtime check and the static gate cannot
+// silently invert.
+func TestRendersActivity(t *testing.T) {
+	cases := []struct {
+		category string
+		want     bool
+	}{
+		{"fixup_pushed", true},
+		{"pr_merged", true},
+		{"not_a_rendered_category", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := RendersActivity(tc.category); got != tc.want {
+			t.Errorf("RendersActivity(%q) = %v, want %v", tc.category, got, tc.want)
+		}
 	}
 }

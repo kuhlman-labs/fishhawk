@@ -129,6 +129,15 @@ func pickActivity(entries []*audit.Entry, limit int) []*audit.Entry {
 // vocabulary in `backend/internal/audit/categories.md` (conceptual
 // — we don't have a doc, but the source-of-truth list lives in
 // the comments throughout the codebase).
+//
+// Writer-side contract (#3406): a backend/internal/server writer that
+// appends an audit category and INTENDS the operator to see it on the anchor
+// / status comment calls (*Server).notifyOperatorVisible with that category
+// rather than tagging notifyStatusUpdate with it. The server-package gate
+// (backend/internal/server/operator_visible_gate_test.go) type-checks the
+// server package and asserts every category so marked is admitted here (via
+// RendersActivity) — so a writer's intent and this registry can no longer
+// drift apart silently across the package boundary.
 var activityCategories = map[string]struct{}{
 	"run_dispatched":              {},
 	"plan_generated":              {},
@@ -196,6 +205,18 @@ var activityCategories = map[string]struct{}{
 	// so selectAnchorTimeline RETAINS it under the row cap like the other
 	// decision-class kinds.
 	"acceptance_scenario_retirement_dropped": {},
+}
+
+// RendersActivity reports whether category is a member of the
+// activityCategories closed set — i.e. whether an audit row of that category
+// is surfaced on the anchor / status comment timeline rather than dropped by
+// pickActivity as system noise. It is the read accessor the server package's
+// writer-intent marker (notifyOperatorVisible) and its static gate consult
+// (#3406); the set itself stays unexported so registration remains a
+// deliberate edit to this file.
+func RendersActivity(category string) bool {
+	_, ok := activityCategories[category]
+	return ok
 }
 
 // actorRenderers supplies the actor-identity render functions

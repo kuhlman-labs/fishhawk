@@ -409,7 +409,7 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		// Sticky status comment (E20.4 / #330). The PR merging is the
 		// terminal state for review-gated workflows; this is one of the
 		// most operator-visible moments of the run lifecycle.
-		s.notifyStatusUpdate(ctx, target.ID, "pr_merged")
+		s.notifyOperatorVisible(ctx, target.ID, CategoryPRMerged)
 		// Board-state sync (#1012): the PR merging advances the work item to
 		// the done canonical state. Best-effort; never unwinds the merge.
 		s.notifyBoardTransition(ctx, target.ID, lifecycleRunMerged)
@@ -460,7 +460,7 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 	// Sticky status comment (E20.4 / #330). Review stage cancelled
 	// is a terminal-ish surface state — the user should see the
 	// run's review row flip to cancelled in the comment.
-	s.notifyStatusUpdate(ctx, target.ID, "pr_closed_without_merge")
+	s.notifyOperatorVisible(ctx, target.ID, CategoryPRClosedWithoutMerge)
 }
 
 // advanceRunAfterReviewResolve drives the run to its terminal state
