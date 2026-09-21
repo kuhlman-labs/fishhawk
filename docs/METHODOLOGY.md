@@ -29,7 +29,7 @@ This is a methodology commitment, not a marketing line. The honest version of "b
 
 The tiers describe how Fishhawk's own changes are produced. They are not a feature of the product; they are a commitment about how this codebase is developed — and each tier is **declared in the workflow spec** as `autonomy: low | medium | high` (ADR-066 / #2222).
 
-Read each tier as **two halves on different footing**. The *delegation* half — what an agent may do at that tier — is **enforced**: unified autonomy resolution expands the tier to an action matrix and re-evaluates each delegated action's condition against run state at action time (detailed under [Autonomy tiers in the workflow spec](#autonomy-tiers-in-the-workflow-spec)). The *surface* half — which **kinds of change** belong at which tier — is a commitment enforced only where a workflow **declares** the control that carries it: `applies_to` for routing a change to the right workflow, `escalations` for raising the bar on a sensitive path. Each list below is annotated with that control. The low-autonomy list is the case where the mechanism exists but this repository has **not** yet declared it — [the escalations section](#per-path-escalations-the-mechanism-and-why-this-repository-has-not-declared-it) states why, and [What is enforced, and what is still a commitment](#what-is-enforced-and-what-is-still-a-commitment) gives the per-control split in full.
+Read each tier as **two halves on different footing**. The *delegation* half — what an agent may do at that tier — is **enforced**: unified autonomy resolution expands the tier to an action matrix and re-evaluates each delegated action's condition against run state at action time (detailed under [Autonomy tiers in the workflow spec](#autonomy-tiers-in-the-workflow-spec)). The *surface* half — which **kinds of change** belong at which tier — is a commitment enforced only where a workflow **declares** the control that carries it: `applies_to` for routing a change to the right workflow, `escalations` for raising the bar on a sensitive path. Each list below is annotated with that control. The low-autonomy list is carried by an `escalations` declaration this repository **does** make, on `feature_change` (#2383) — [the escalations section](#per-path-escalations-the-mechanism-and-this-repositorys-declaration) quotes it, and [What is enforced, and what is still a commitment](#what-is-enforced-and-what-is-still-a-commitment) gives the per-control split in full.
 
 ### Low autonomy (human-led)
 
@@ -44,7 +44,9 @@ Applies to:
 - GitHub App authentication flow
 - Anything else where a subtle bug has catastrophic consequences
 
-**Carried by `escalations`** — the control that would raise the approval count, add a `member_of` group, tighten `min_permission` and clamp `max_autonomy` on these paths. The mechanism is shipped and tested (#2227), but **this repository declares no escalations today**, so this list is still a *commitment* rather than an enforced control (see [Per-path escalations](#per-path-escalations-the-mechanism-and-why-this-repository-has-not-declared-it) for why).
+**Carried by `escalations`** — the control that raises the approval count, adds a `member_of` group, tightens `min_permission` and clamps `max_autonomy` on a matching path. The mechanism is shipped and tested (#2227) and **this repository declares it**: `feature_change` matches `backend/internal/spec/**`, `cli/internal/spec/**`, `backend/internal/audit/**`, `backend/internal/policy/**`, `backend/internal/auth/**`, `backend/internal/githubapp/**` and `verifier/**` and raises `max_autonomy` to a `medium` ceiling (declared `low` in #2383; raised to `medium` in #3079 when the workflow itself moved to `autonomy: high`). On those paths approve, fix-up and retry stay delegated; waive and merge return to a human.
+
+Read the split honestly: the *delegation* half of this list is enforced by that ceiling; the *authorship* half — "human writes the code" — is carried by no control and stays a convention (the `autonomy:low` issue label and the campaign's `item_human_led` refusal, see `GROOMING_RUNBOOK.md`). The declaration deliberately raises no `approvals` count: this repository has one eligible approver, so a count of two would be unsatisfiable and every escalated run would stop at a gate no one can clear (see [Per-path escalations](#per-path-escalations-the-mechanism-and-this-repositorys-declaration) for the declaration as shipped).
 
 ### Medium autonomy (agent-implements, human-approves)
 
@@ -208,6 +210,7 @@ The autonomy tiers are a mix of controls the product **enforces** and commitment
 - Approval quorum, membership and permission predicates on the gate's `approvals` block.
 - Unified autonomy resolution — the tier expands to an action matrix and each delegated action's condition is re-evaluated against current run state at action time.
 - The escalation **mechanism**, **wherever a workflow declares it** — the approval gate raises the count, the membership conjunction and the minimum permission; delegation resolution applies the `max_autonomy` clamp.
+- This repository's **own declaration** — the `feature_change` escalation on the low-autonomy surfaces (`backend/internal/spec/**`, `cli/internal/spec/**`, `backend/internal/audit/**`, `backend/internal/policy/**`, `backend/internal/auth/**`, `backend/internal/githubapp/**`, `verifier/**`), evaluated at the approval gate against the plan's `scope.files` and applied in delegation resolution as a `max_autonomy: medium` ceiling on an `autonomy: high` workflow. What it enforces is the *delegation* half of the low tier: waive and merge return to a human on those paths; approve, fix-up and retry stay delegated.
 - `permissions.network` on an agent-executor **acceptance** stage, where it normalizes into `egress` and the runner's default-deny proxy applies it — the pre-existing ADR-050 control.
 
 **2. Declared but not enforced.**
@@ -221,23 +224,39 @@ The autonomy tiers are a mix of controls the product **enforces** and commitment
 
 **4. Still a commitment.**
 
-- The low-autonomy surface list — the spec parser and validator, the audit-log integrity layer, the policy engine, anything cryptographic, the GitHub App auth flow — is a *commitment*, not an enforced control, until `escalations` are declared on those paths. The next section states why the declaration is not yet in place.
+- The *authorship* half of the low-autonomy tier — that a human, not an agent, is the author of record on the spec parser and validator, the audit-log integrity layer, the policy engine, anything cryptographic and the GitHub App auth flow. The declared escalation clamps what an agent may *decide* on those paths; no control carries who *writes* them. That stays a convention: the `autonomy:low` issue label and the campaign's `item_human_led` refusal (`GROOMING_RUNBOOK.md`).
+- The second-approver raise — `approvals: {count: 2}` alongside the `max_autonomy` ceiling. Deferred until a second eligible approver exists, because with one approver a count of two is unsatisfiable: a control that cannot be met is an outage, not a stricter control. The next section quotes the declaration as shipped.
 
 ---
 
-## Per-path escalations (the mechanism, and why this repository has not declared it)
+## Per-path escalations (the mechanism, and this repository's declaration)
 
-`escalations` is the control that would carry the low-autonomy surface list. Each entry pairs a `match` predicate with a `require` block that **raises** the bar for a matching change: a higher approval `count`, an added `member_of` group (a *conjunction* — an approver must belong to every composed group), a stricter `min_permission`, and a `max_autonomy` ceiling applied **last**, over the fully-resolved action matrix, after tier expansion and after every explicit `actions` override. Composition across several matching escalations is the strictest per dimension — max count, sorted union of groups, strictest permission, lowest tier — and therefore **order-independent**. An escalation may only ever **raise**; a declaration that would change nothing is refused at parse time.
+`escalations` is the control that carries the low-autonomy surface list. Each entry pairs a `match` predicate with a `require` block that **raises** the bar for a matching change: a higher approval `count`, an added `member_of` group (a *conjunction* — an approver must belong to every composed group), a stricter `min_permission`, and a `max_autonomy` ceiling applied **last**, over the fully-resolved action matrix, after tier expansion and after every explicit `actions` override. Composition across several matching escalations is the strictest per dimension — max count, sorted union of groups, strictest permission, lowest tier — and therefore **order-independent**. An escalation may only ever **raise**; a declaration that would change nothing is refused at parse time.
 
-The mechanism is **shipped and tested** (E53.4 / #2227). What has **not** happened is a declaration on the real paths in this repository — its crypto, policy-engine and audit-integrity surfaces. This repository declares **no escalations today**, and the reason is specific: **#2374**, an open **fail-open window** on the `fetchApprovalsForStage` error path, where a firing count-only escalation is evaluated against a nil baseline and discards the baseline's `member_of` conjunction. That window is one I introduced in the enforcement seam, and the deliberate choice was **not to ship a declaration in front of it**: declaring an escalation on the crypto and audit-integrity paths while that path can silently drop a membership requirement would advertise a guarantee known to be conditional. Closing #2374 is the precondition; the declaration follows it, not the other way round.
+The mechanism is **shipped and tested** (E53.4 / #2227), and this repository **declares it** on `feature_change`. The history is short. **#2374** — a fail-open window on the `fetchApprovalsForStage` error path, where a firing count-only escalation was evaluated against a nil baseline and discarded the baseline's `member_of` conjunction — was the precondition, one introduced in the enforcement seam itself; PR #2380 closed it on 2026-07-31, and the declaration followed the same day in #2383 (operator-authored, since `.fishhawk/**` is in `feature_change`'s implement-stage `forbidden_paths`). #3079 later raised the ceiling from `low` to `medium` alongside moving `feature_change` to `autonomy: high`. The live block, as declared in `.fishhawk/workflows.yaml`:
 
-This is a gap in *declaration*, not in *mechanism*, and it is stated flatly rather than softened: no escalation has been declared on a sensitive path in this repository, and none should read as if one had.
+```yaml
+    escalations:
+      - match:
+          paths:
+            - "backend/internal/spec/**"
+            - "cli/internal/spec/**"
+            - "backend/internal/audit/**"
+            - "backend/internal/policy/**"
+            - "backend/internal/auth/**"
+            - "backend/internal/githubapp/**"
+            - "verifier/**"
+        require:
+          max_autonomy: medium
+```
+
+What the declaration does and does not do, stated flatly: it raises the autonomy ceiling on a matching change and nothing else. It raises no approval count, adds no `member_of` group and tightens no `min_permission` — this repository has one eligible approver, and a count it cannot satisfy would stop every escalated run at a gate no one can clear. `approvals: {count: 2}` is the raise to add once a second approver exists.
 
 ---
 
 ## Dogfood record
 
-What has actually been demonstrated live against a running backend, with dates. This section is the honest treatment of the E53 capstone's two demonstration criteria: one was met, one was not, and both are recorded as such — neither faked, neither hedged.
+What has actually been demonstrated live against a running backend, with dates. This section is the honest treatment of the E53 capstone's two demonstration criteria: both were met on 2026-07-31, and the one residual (the clamp half of criterion 7) is recorded as such — neither faked, neither hedged.
 
 **2026-07-31 — `applies_to` routing refusal, demonstrated (criterion 6).** Starting `routine_change` on an issue labelled `type:feature`, against that workflow's `applies_to: {labels: ["type:chore"]}` declaration, was refused with HTTP 422 `workflow_not_applicable`. Transcribed from the run's authoritative record (PR #2378, delivering #2360), the refusal reads:
 
@@ -253,7 +272,19 @@ this change, or pass applies_to_override with a reason to force this run
 
 The message names the requiring criterion, the change's own labels, the workflows that **would** accept the change, and the three remedies — amend the declaration, start under an accepting workflow, or pass `applies_to_override` with a reason. The admit direction was demonstrated in the same exercise: `routine_change` on a `type:chore` issue was admitted.
 
-**The firing escalation has NOT been demonstrated live (criterion 7).** No `escalations` declaration exists on a real path in this repository, so no escalation has fired in a live run, and this criterion is **not met** — not partially completed. The blocker is **#2374**, the fail-open window described in the previous section; the demonstration is deferred until that closes. What exists instead is unit and fixture coverage of the mechanism — the firing walk, the strictest-per-dimension composition, and the enforcement seam — under E53.4 / #2227. The mechanism is tested; the live declaration is not in place, and nothing here implies otherwise.
+**2026-07-31 — firing escalation, demonstrated (criterion 7).** Run `02d7b82a` (the #2377 change itself) touched `backend/internal/spec/**` and `cli/internal/spec/**`, both declared escalated paths. The gate recorded an `escalation_fired` audit entry; transcribed from the record on #2229 (comment of 2026-07-31T16:00Z), it reads:
+
+```
+category: escalation_fired
+summary:  1 escalation fired: escalation 0 (paths=backend/internal/spec/**,
+          cli/internal/spec/**,backend/internal/audit/**,backend/internal/policy/**,
+          backend/internal/auth/**,backend/internal/githubapp/**,verifier/**).
+          Raised: max_autonomy=low
+```
+
+and it was surfaced on the run's `escalations` block with the matched predicate and `require: {max_autonomy: low}` — the ceiling as declared on that date (#2383). The ceiling is `medium` today (#3079); the quote is kept as recorded. The discriminating control: run `d440a6aa` (#2374) touched only `backend/internal/server/**`, not an escalated path, and no escalation fired on it — the predicate distinguishes rather than firing on everything. What was observed live: the escalation fires, names its predicate, records the raise, surfaces on run status, and stays out of the way of a non-matching change.
+
+What was **not** observed live, carried as #2229 states it: the **clamp** half — no action class resolving to `mode: auto` on an escalated change. That is pinned by #2227's tests (the `ClampResolvedMatrix` table, plus the delegation integration test asserting the *derived* `OperatorAgent` knob is empty, not merely the surfaced matrix), and was not driven through a live run at the time because doing so meant walking an escalated run through the delegated-approve arm while #2381 was an open wedge in exactly that arm. No later live observation of the clamp is recorded, so this document does not claim one.
 
 ---
 
