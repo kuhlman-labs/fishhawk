@@ -57,10 +57,17 @@ func newAuthorizeServer(t *testing.T) (*Server, *fakeOAuthStore, *cimdRoundTripp
 	return srv, store, rt
 }
 
+// testSessionPlaintext is the raw fishhawk_session cookie value getAuthorize
+// attaches for a signed-in identity: the consent render derives its
+// session-bound csrf_token key from that cookie (#2442). The handler reads the
+// raw cookie; the middleware, bypassed here, is what validates it.
+const testSessionPlaintext = "fhs_test-session-plaintext"
+
 func getAuthorize(srv *Server, query string, id *Identity) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodGet, "/v0/oauth/authorize?"+query, nil)
 	if id != nil {
 		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, *id))
+		req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: testSessionPlaintext})
 	}
 	rr := httptest.NewRecorder()
 	srv.handleOAuthAuthorize(rr, req)
@@ -1418,4 +1425,50 @@ func TestOAuthAuthorize_ChoicePage_EscapesNext(t *testing.T) {
 			t.Errorf("choice page dropped the href value instead of escaping it:\n%s", body)
 		}
 	})
+}
+
+// TestOAuthAuthorize_ConsentGETSetsNoCSRFCookie is the done-means for the #2442
+// clobber removal: a signed-in consent GET driven through the full stack returns
+// 200 with a non-empty hidden csrf_token and sets NO __Host-csrf cookie, so an
+// authorize navigation can never overwrite the SPA's cookie or a sibling tab's.
+func TestOAuthAuthorize_ConsentGETSetsNoCSRFCookie(t *testing.T) {
+	srv, sess := newOAuthStackServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/v0/oauth/authorize?"+authorizeQuery(nil), nil)
+	req.AddCookie(sess) // session cookie only — no __Host-csrf, as on the cross-site arrival
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("consent GET: status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if consentFormTokenFromBody(t, w.Body.String()) == "" {
+		t.Fatal("consent page embedded an empty csrf_token")
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == CSRFCookieName {
+			t.Fatalf("consent GET set a %s cookie (%q); the #2442 form token must not touch the cookie slot", CSRFCookieName, c.Value)
+		}
+	}
+}
+
+// TestOAuthAuthorize_ConsentRenderWithoutSessionCookieFailsClosed pins the
+// renderConsent guard: a signed-in identity whose request carries NO
+// fishhawk_session cookie (unreachable through the middleware, which sets
+// SessionID only from that cookie) is refused 500 internal_error rather than
+// rendering a page with an unkeyed token.
+func TestOAuthAuthorize_ConsentRenderWithoutSessionCookieFailsClosed(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.seedClient(storeClient("github", "client-x", []string{"https://app.example/cb"}))
+	repo := newFakeAuthRepo()
+	srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()), AuthRepo: repo})
+	id := signedInIdentity(repo, "github")
+	req := httptest.NewRequest(http.MethodGet, "/v0/oauth/authorize?"+authorizeQuery(nil), nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id)) // identity, but no cookie
+	rr := httptest.NewRecorder()
+	srv.handleOAuthAuthorize(rr, req)
+	if rr.Code != http.StatusInternalServerError || !strings.Contains(rr.Body.String(), "internal_error") {
+		t.Fatalf("status = %d, want 500 internal_error; body=%s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), `name="csrf_token"`) {
+		t.Fatal("consent page rendered with no session cookie to key the token")
+	}
 }

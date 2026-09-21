@@ -6106,9 +6106,9 @@ paths:
         two UNREDIRECTABLE cases — an unresolvable `client_id` and a
         `redirect_uri` that does not match the registered client) or as a `302`
         redirect back to the client carrying `error`, `state`, and `iss`
-        (RFC 9207). The consent GET MINTS a `__Host-csrf` cookie when the
-        request carries none, because that cookie is `SameSite=Strict` and is
-        not sent on the cross-site top-level authorize navigation.
+        (RFC 9207). The consent page embeds a session-bound signed `csrf_token`
+        hidden field (#2442); the GET neither reads nor sets the `__Host-csrf`
+        cookie, so concurrent authorization flows do not invalidate each other.
 
         For a LOOPBACK `redirect_uri` the authorization response — the success
         redirect AND every error/deny redirect — is delivered to the PORT the
@@ -6199,10 +6199,11 @@ paths:
       summary: OAuth 2.1 authorization endpoint (consent decision)
       description: |
         Records the operator's consent decision for a pending authorization
-        request. Form-encoded (`approve` or `deny`). CSRF is enforced via the
-        `__Host-csrf` cookie with a narrow path-scoped `csrf_token` form-field
-        fallback (the `SameSite=Strict` cookie is not sent on the cross-site
-        top-level navigation). On approve, responds `302` to the `redirect_uri`
+        request. Form-encoded (`approve` or `deny`). CSRF is enforced either via
+        the `X-CSRF-Token` header ≡ `__Host-csrf` cookie path (unchanged) OR,
+        with no header, via the path-scoped session-bound signed `csrf_token`
+        form field the consent page embedded (#2442); an expired, unbound or
+        tampered token is `403 csrf_required`. On approve, responds `302` to the `redirect_uri`
         carrying `code`, `state`, and `iss` (RFC 9207). On deny, responds `302`
         carrying `error=access_denied`, `state`, and `iss`.
 
@@ -6226,7 +6227,7 @@ paths:
                   description: The consent decision; any value other than `approve` is treated as a denial.
                 csrf_token:
                   type: string
-                  description: Path-scoped CSRF fallback, matched against the `__Host-csrf` cookie.
+                  description: Path-scoped CSRF form token — the session-bound signed value the consent page embedded (#2442), verified against the request's session cookie; not a cookie mirror.
                 client_id: { type: string }
                 redirect_uri: { type: string, format: uri }
                 response_type: { type: string, enum: [code] }
@@ -6264,7 +6265,10 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
           description: |
-            Either the CSRF cookie / `csrf_token` form field did not validate, or
+            Either CSRF did not validate — the `X-CSRF-Token` header did not match
+            the `__Host-csrf` cookie, or the `csrf_token` form field was missing,
+            expired, tampered, or not bound to this session (`error:
+            csrf_required`) — or
             the loopback gate refused the route (`error: oauth_as_loopback_only`,
             #2441 — `--oauth-require-loopback` set on a non-loopback bind). Both
             use the standard Fishhawk `Error` envelope.

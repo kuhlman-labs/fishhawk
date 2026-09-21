@@ -316,27 +316,24 @@ func (s *Server) handleOAuthConsent(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
-// renderConsent renders the consent page. CONDITION 1: when the request carries
-// no __Host-csrf cookie (the Strict cookie is NOT sent on the cross-site
-// top-level authorize navigation that brings the user here), mint a fresh one
-// with the existing generator/setter and embed THAT value, relying on the
-// same-site form POST to carry the newly set cookie. A handler that read only
-// the request cookie would embed nothing and 403 every legitimate user — a
-// failure no httptest-cookie test can see. See backend/internal/server/README.md.
+// renderConsent renders the consent page. The hidden csrf_token is a STATELESS,
+// SESSION-BOUND signed token (consentcsrf.go, #2442): this route neither reads
+// nor writes the __Host-csrf cookie. The Strict cookie is never sent on the
+// cross-site top-level authorize navigation that brings the user here, so the
+// earlier mint-on-GET design (#2436 CONDITION 1) overwrote the single host-wide
+// cookie slot on EVERY render and made concurrent consent flows invalidate each
+// other's forms. Each rendered page now carries its own independently-verifiable
+// token, verified by the csrf middleware's form-field branch against the
+// request's session cookie. The session cookie is present by construction
+// (this runs only under id.SessionID != "", which bearerAuth sets exclusively
+// from that cookie); an empty plaintext still fails closed rather than minting
+// an unkeyed token. See backend/internal/server/README.md.
 func (s *Server) renderConsent(w http.ResponseWriter, r *http.Request, req authorizeRequest, resolved authorizeResolved) {
-	csrfToken := ""
-	if c, err := r.Cookie(CSRFCookieName); err == nil {
-		csrfToken = c.Value
-	}
-	if csrfToken == "" {
-		tok, err := generateCSRFToken()
-		if err != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"could not generate a CSRF token", nil)
-			return
-		}
-		setCSRFCookie(w, tok)
-		csrfToken = tok
+	csrfToken, err := mintConsentCSRFToken(sessionPlaintextFrom(r), s.nowFunc())
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not mint the consent token", nil)
+		return
 	}
 
 	display := resolved.client.ClientName

@@ -2,11 +2,14 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -195,13 +198,26 @@ func TestCSRF_SessionCookiePOSTWithMatchingHeaderPasses(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// OAuth AS CSRF: form-field fallback, CONDITION 1 (mint-on-GET) and
+// OAuth AS CSRF: the session-bound signed csrf_token form field (#2442) and
 // CONDITION 3 (bounded body) — ADR-076 slice 3 / #2436.
+//
+// Every test here drives srv.Handler() so recovery → bearerAuth → csrf → mux →
+// handleOAuthAuthorize/handleOAuthConsent → consent template are crossed in
+// one test. httptest does not model SameSite, so the cross-site arrival is
+// modelled by simply not attaching a __Host-csrf cookie.
 // ---------------------------------------------------------------------------
 
 // newOAuthStackServer signs a user in through the real fake auth repo (so the
 // session cookie authenticates through the middleware) and wires the AS.
 func newOAuthStackServer(t *testing.T) (*Server, *http.Cookie) {
+	t.Helper()
+	srv, sess, _ := newOAuthStackServerWithRepo(t)
+	return srv, sess
+}
+
+// newOAuthStackServerWithRepo is newOAuthStackServer also returning the fake
+// auth repo, for tests that need a SECOND signed-in session on the same server.
+func newOAuthStackServerWithRepo(t *testing.T) (*Server, *http.Cookie, *fakeAuthRepo) {
 	t.Helper()
 	store := newFakeOAuthStore()
 	store.seedClient(storeClient("github", "client-x", []string{"https://app.example/cb"}))
@@ -211,13 +227,26 @@ func newOAuthStackServer(t *testing.T) (*Server, *http.Cookie) {
 		t.Fatalf("SignIn: %v", err)
 	}
 	srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()), AuthRepo: repo})
-	return srv, &http.Cookie{Name: auth.SessionCookieName, Value: sess.PlainText}
+	return srv, &http.Cookie{Name: auth.SessionCookieName, Value: sess.PlainText}, repo
 }
 
-// consentGETMintedCSRF drives the consent GET (session cookie, NO csrf cookie)
-// through the full stack and returns the minted __Host-csrf cookie value —
-// modelling the SameSite=Strict arrival CONDITION 1 fixes.
-func consentGETMintedCSRF(t *testing.T, srv *Server, sess *http.Cookie) string {
+var consentFormTokenRE = regexp.MustCompile(`name="csrf_token" value="([^"]+)"`)
+
+// consentFormTokenFromBody extracts the hidden csrf_token from a rendered
+// consent page, or "" when absent.
+func consentFormTokenFromBody(t *testing.T, body string) string {
+	t.Helper()
+	m := consentFormTokenRE.FindStringSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// consentGETFormToken drives the consent GET (session cookie, NO csrf cookie —
+// the SameSite=Strict arrival) through the full stack and returns the hidden
+// csrf_token embedded in the rendered page.
+func consentGETFormToken(t *testing.T, srv *Server, sess *http.Cookie) string {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/v0/oauth/authorize?"+authorizeQuery(nil), nil)
 	req.AddCookie(sess) // Lax session cookie IS sent; Strict CSRF cookie is NOT
@@ -226,13 +255,44 @@ func consentGETMintedCSRF(t *testing.T, srv *Server, sess *http.Cookie) string {
 	if w.Code != http.StatusOK {
 		t.Fatalf("consent GET: status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
-	for _, c := range w.Result().Cookies() {
-		if c.Name == CSRFCookieName && c.Value != "" {
-			return c.Value
-		}
+	tok := consentFormTokenFromBody(t, w.Body.String())
+	if tok == "" {
+		t.Fatal("consent GET rendered no csrf_token form field")
 	}
-	t.Fatal("consent GET did not mint a __Host-csrf cookie (CONDITION 1)")
-	return ""
+	return tok
+}
+
+// postConsentForm submits form as the consent POST with the session cookie and
+// NO __Host-csrf cookie (the form path must succeed without one) plus any
+// extra cookies the caller wants attached.
+func postConsentForm(srv *Server, sess *http.Cookie, form url.Values, extra ...*http.Cookie) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/v0/oauth/authorize", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(sess)
+	for _, c := range extra {
+		req.AddCookie(c)
+	}
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	return w
+}
+
+func assertConsentApproved(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if w.Code != http.StatusFound {
+		t.Fatalf("consent POST: status = %d, want 302; body=%s", w.Code, w.Body.String())
+	}
+	loc, _ := url.Parse(w.Header().Get("Location"))
+	if loc.Query().Get("code") == "" {
+		t.Fatalf("consent POST redirected without a code: %s", w.Header().Get("Location"))
+	}
+}
+
+func assertCSRFRefused(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "csrf_required") {
+		t.Fatalf("status = %d, want 403 csrf_required; body=%s", w.Code, w.Body.String())
+	}
 }
 
 func TestCSRF_TokenEndpointExempt(t *testing.T) {
@@ -253,41 +313,43 @@ func TestCSRF_TokenEndpointExempt(t *testing.T) {
 	}
 }
 
-// TestCSRF_ConsentAcceptsFormFieldFallback is the CONDITION 1 proof: a GET
-// carrying only the session cookie mints a CSRF cookie, and the POST using that
-// Set-Cookie value SUCCEEDS. A 403-asserting test proves only fail-safe.
+// TestCSRF_ConsentAcceptsFormFieldFallback: the form token alone, with NO
+// __Host-csrf cookie on the POST, authorizes the consent. A 403-asserting test
+// proves only fail-safe; this is the success proof.
 func TestCSRF_ConsentAcceptsFormFieldFallback(t *testing.T) {
 	srv, sess := newOAuthStackServer(t)
-	tok := consentGETMintedCSRF(t, srv, sess)
-
+	tok := consentGETFormToken(t, srv, sess)
 	form := consentForm(nil)
 	form.Set("csrf_token", tok)
-	req := httptest.NewRequest(http.MethodPost, "/v0/oauth/authorize", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(sess)
-	req.AddCookie(&http.Cookie{Name: CSRFCookieName, Value: tok})
-	w := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w, req)
-	if w.Code != http.StatusFound {
-		t.Fatalf("consent POST: status = %d, want 302; body=%s", w.Code, w.Body.String())
+	assertConsentApproved(t, postConsentForm(srv, sess, form))
+}
+
+// TestCSRF_ConcurrentConsentFlows_FirstFormSucceeds is the #2442 obligation: two
+// consent pages rendered for the same session, and the FIRST one's form still
+// submits after the second render (the pre-change cookie double-submit 403'd
+// it, because the second GET overwrote the single __Host-csrf slot). The second
+// form submits too — the tokens are independent.
+func TestCSRF_ConcurrentConsentFlows_FirstFormSucceeds(t *testing.T) {
+	srv, sess := newOAuthStackServer(t)
+	tokA := consentGETFormToken(t, srv, sess) // tab A
+	tokB := consentGETFormToken(t, srv, sess) // tab B
+	if tokA == tokB {
+		t.Fatal("two consent renders embedded the same token")
 	}
-	loc, _ := url.Parse(w.Header().Get("Location"))
-	if loc.Query().Get("code") == "" {
-		t.Fatal("consent POST redirected without a code")
-	}
+	formA := consentForm(nil)
+	formA.Set("csrf_token", tokA)
+	assertConsentApproved(t, postConsentForm(srv, sess, formA))
+	formB := consentForm(nil)
+	formB.Set("csrf_token", tokB)
+	assertConsentApproved(t, postConsentForm(srv, sess, formB))
 }
 
 func TestCSRF_FormFallbackPreservesBodyForHandler(t *testing.T) {
 	srv, sess := newOAuthStackServer(t)
-	tok := consentGETMintedCSRF(t, srv, sess)
+	tok := consentGETFormToken(t, srv, sess)
 	form := consentForm(nil)
 	form.Set("csrf_token", tok)
-	req := httptest.NewRequest(http.MethodPost, "/v0/oauth/authorize", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(sess)
-	req.AddCookie(&http.Cookie{Name: CSRFCookieName, Value: tok})
-	w := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w, req)
+	w := postConsentForm(srv, sess, form)
 	// A 302 with a code proves the downstream handler still saw the full form
 	// (client_id, redirect_uri, scope, ...) after the middleware read the body.
 	if w.Code != http.StatusFound || w.Header().Get("Location") == "" {
@@ -297,32 +359,109 @@ func TestCSRF_FormFallbackPreservesBodyForHandler(t *testing.T) {
 
 func TestCSRF_ConsentFormFieldMismatchRefused(t *testing.T) {
 	srv, sess := newOAuthStackServer(t)
-	tok := consentGETMintedCSRF(t, srv, sess)
+	_ = consentGETFormToken(t, srv, sess)
 	form := consentForm(nil)
 	form.Set("csrf_token", "wrong-token")
-	req := httptest.NewRequest(http.MethodPost, "/v0/oauth/authorize", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(sess)
-	req.AddCookie(&http.Cookie{Name: CSRFCookieName, Value: tok})
-	w := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", w.Code)
-	}
+	assertCSRFRefused(t, postConsentForm(srv, sess, form))
 }
 
 func TestCSRF_ConsentMissingFormFieldRefused(t *testing.T) {
 	srv, sess := newOAuthStackServer(t)
-	tok := consentGETMintedCSRF(t, srv, sess)
+	_ = consentGETFormToken(t, srv, sess)
 	form := consentForm(nil) // no csrf_token field
+	assertCSRFRefused(t, postConsentForm(srv, sess, form))
+}
+
+// TestCSRF_ConsentTokenTamperedRefused: flipping one byte of the decoded MAC
+// and re-encoding is refused (RED when the ConstantTimeCompare check is
+// deleted).
+func TestCSRF_ConsentTokenTamperedRefused(t *testing.T) {
+	srv, sess := newOAuthStackServer(t)
+	tok := consentGETFormToken(t, srv, sess)
+	raw, err := base64.RawURLEncoding.DecodeString(tok)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	raw[len(raw)-1] ^= 0x01
+	form := consentForm(nil)
+	form.Set("csrf_token", base64.RawURLEncoding.EncodeToString(raw))
+	assertCSRFRefused(t, postConsentForm(srv, sess, form))
+}
+
+// TestCSRF_ConsentTokenNotBoundToSessionRefused: a token minted for session A
+// is refused when submitted under session B's cookie (RED when the key ignores
+// the session).
+func TestCSRF_ConsentTokenNotBoundToSessionRefused(t *testing.T) {
+	srv, sessA, repo := newOAuthStackServerWithRepo(t)
+	tokA := consentGETFormToken(t, srv, sessA)
+	// A second signed-in session on the SAME server.
+	_, sessBRow, err := repo.SignIn(context.Background(), "github", auth.GitHubProfile{ID: 8, Login: "hubot"}, uuid.New())
+	if err != nil {
+		t.Fatalf("SignIn B: %v", err)
+	}
+	sessB := &http.Cookie{Name: auth.SessionCookieName, Value: sessBRow.PlainText}
+	form := consentForm(nil)
+	form.Set("csrf_token", tokA)
+	assertCSRFRefused(t, postConsentForm(srv, sessB, form))
+	// Control: the same token under its own session is accepted.
+	assertConsentApproved(t, postConsentForm(srv, sessA, form))
+}
+
+// TestCSRF_ConsentTokenExpiredRefused: the middleware reads s.nowFunc at REQUEST
+// time, so advancing the clock past consentCSRFTokenTTL refuses a token a
+// within-TTL sibling still accepts (RED when the TTL check is deleted).
+func TestCSRF_ConsentTokenExpiredRefused(t *testing.T) {
+	srv, sess := newOAuthStackServer(t)
+	base := time.Now()
+	srv.nowFunc = func() time.Time { return base }
+	tok := consentGETFormToken(t, srv, sess)
+	form := consentForm(nil)
+	form.Set("csrf_token", tok)
+
+	srv.nowFunc = func() time.Time { return base.Add(consentCSRFTokenTTL + time.Second) }
+	assertCSRFRefused(t, postConsentForm(srv, sess, form))
+
+	// Within-TTL control: a token minted now under the advanced clock is fine.
+	tok2 := consentGETFormToken(t, srv, sess)
+	form2 := consentForm(nil)
+	form2.Set("csrf_token", tok2)
+	assertConsentApproved(t, postConsentForm(srv, sess, form2))
+}
+
+// TestCSRF_ConsentCookieValueInFormRefused pins that the form branch is
+// signature-only: the OLD protocol — a generateCSRFToken value in the form
+// field with the matching __Host-csrf cookie attached — is refused (RED if the
+// cookie-compare fallback is re-added).
+func TestCSRF_ConsentCookieValueInFormRefused(t *testing.T) {
+	srv, sess := newOAuthStackServer(t)
+	cookieTok, err := generateCSRFToken()
+	if err != nil {
+		t.Fatalf("generateCSRFToken: %v", err)
+	}
+	form := consentForm(nil)
+	form.Set("csrf_token", cookieTok)
+	assertCSRFRefused(t, postConsentForm(srv, sess, form, &http.Cookie{Name: CSRFCookieName, Value: cookieTok}))
+}
+
+// TestCSRF_AnonymousConsentPostIs401NotCSRF (approval condition 1): the
+// anonymous bypass precedes the form branch, so a form-encoded POST carrying a
+// csrf_token but NO session cookie reaches the handler and is refused 401
+// auth_required — never 403 csrf_required.
+func TestCSRF_AnonymousConsentPostIs401NotCSRF(t *testing.T) {
+	srv, sess := newOAuthStackServer(t)
+	tok := consentGETFormToken(t, srv, sess)
+	form := consentForm(nil)
+	form.Set("csrf_token", tok)
 	req := httptest.NewRequest(http.MethodPost, "/v0/oauth/authorize", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(sess)
-	req.AddCookie(&http.Cookie{Name: CSRFCookieName, Value: tok})
+	// No cookies at all.
 	w := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", w.Code)
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "auth_required") {
+		t.Fatalf("anonymous consent POST: status = %d, want 401 auth_required; body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "csrf_required") {
+		t.Fatalf("anonymous consent POST was CSRF-refused instead of 401: %s", w.Body.String())
 	}
 }
 
@@ -331,13 +470,12 @@ func TestCSRF_ConsentMissingFormFieldRefused(t *testing.T) {
 // 403s (widening the fallback to all paths would redden this).
 func TestCSRF_FormFallbackIsPathScoped(t *testing.T) {
 	srv, sess := newOAuthStackServer(t)
-	tok := consentGETMintedCSRF(t, srv, sess)
+	tok := consentGETFormToken(t, srv, sess)
 	form := url.Values{}
-	form.Set("csrf_token", tok) // a form field, but /logout is not a fallback path
+	form.Set("csrf_token", tok) // a valid form token, but /logout is not a fallback path
 	req := httptest.NewRequest(http.MethodPost, "/v0/auth/logout", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(sess)
-	req.AddCookie(&http.Cookie{Name: CSRFCookieName, Value: tok})
 	w := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusForbidden {
@@ -345,11 +483,15 @@ func TestCSRF_FormFallbackIsPathScoped(t *testing.T) {
 	}
 }
 
+// TestCSRF_HeaderPathUnchanged (approval condition 3): the header path
+// X-CSRF-Token ≡ __Host-csrf still works on the consent POST with no form
+// field; when a header is present the middleware never enters the form branch.
 func TestCSRF_HeaderPathUnchanged(t *testing.T) {
 	srv, sess := newOAuthStackServer(t)
-	tok := consentGETMintedCSRF(t, srv, sess)
-	// The header path still works on the consent POST (no form field needed):
-	// when a header is present the middleware uses it and skips the fallback.
+	tok, err := generateCSRFToken()
+	if err != nil {
+		t.Fatalf("generateCSRFToken: %v", err)
+	}
 	form := consentForm(nil)
 	req := httptest.NewRequest(http.MethodPost, "/v0/oauth/authorize", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -367,15 +509,9 @@ func TestCSRF_HeaderPathUnchanged(t *testing.T) {
 // body is refused before the handler runs, bounding the allocation.
 func TestCSRF_ConsentOversizedBodyRejected(t *testing.T) {
 	srv, sess := newOAuthStackServer(t)
-	tok := consentGETMintedCSRF(t, srv, sess)
 	form := url.Values{}
 	form.Set("filler", strings.Repeat("a", (1<<20)+4096)) // > 1 MiB
-	req := httptest.NewRequest(http.MethodPost, "/v0/oauth/authorize", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(sess)
-	req.AddCookie(&http.Cookie{Name: CSRFCookieName, Value: tok})
-	w := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w, req)
+	w := postConsentForm(srv, sess, form)
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", w.Code)
 	}
