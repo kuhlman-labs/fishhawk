@@ -5809,8 +5809,11 @@ func boundVerifyFixOutput(out string) (excerpt string, elided int) {
 // non-empty) the compact amendment recipe is rendered ALWAYS — the fix agent
 // never saw writeScopeAmendments (the #3390 class), and fixInv inherits
 // baseInv.Env so FISHHAWK_API_TOKEN / FISHHAWK_BACKEND_URL are present. The
-// empty-scope `git add -A` fallback renders neither. Both blocks are
-// fixed-size (~1.5 KiB), so the #3408 bound is untouched.
+// empty-scope `git add -A` fallback renders neither — the OUT-OF-SCOPE block
+// is gated on a non-empty scope here AND the detector returns nil for an
+// empty scope, so a non-empty outOfScope argument with an empty scope is
+// ignored rather than rendered as a restriction on an editable tree. Both
+// blocks are fixed-size (~1.5 KiB), so the #3408 bound is untouched.
 func verifyFixPrompt(verifyCmd, output string, scope []upload.ScopeFile, granted []upload.ScopeAmendment, outOfScope []string) (prompt string, elidedBytes int) {
 	excerpt, elided := boundVerifyFixOutput(output)
 	var b strings.Builder
@@ -5837,10 +5840,15 @@ file now. Do not work around it in another file, and do not treat the grant as
 pending or denied.
 `)
 	}
-	if oos := renderOutOfScopePaths(outOfScope); oos != "" {
-		b.WriteString("\n" + oos)
-	}
+	// Both #3410 blocks are gated on a non-empty scope: in the empty-scope
+	// `git add -A` fallback the whole tree is editable, so an OUT-OF-SCOPE
+	// block would forbid edits the agent can and should make and point at a
+	// "(recipe below)" that is never rendered. The detector already returns
+	// nil for an empty scope; this gate keeps the renderer honest on its own.
 	if len(scope) > 0 {
+		if oos := renderOutOfScopePaths(outOfScope); oos != "" {
+			b.WriteString("\n" + oos)
+		}
 		b.WriteString("\n" + renderFixScopeAmendmentRecipe())
 	}
 

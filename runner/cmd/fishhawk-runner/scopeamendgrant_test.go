@@ -179,6 +179,19 @@ func TestOutOfScopePathsInVerifyOutput(t *testing.T) {
 		})
 	}
 
+	// Empty scope (the `git add -A` fallback): the whole tree is editable, so
+	// an existing named path is NOT out of scope — nil, never the path. The
+	// non-empty-scope call on the same input is the discriminator.
+	const named = "add them to " + registry + "):"
+	for _, emptyScope := range [][]upload.ScopeFile{nil, {}} {
+		if got := outOfScopePathsInVerifyOutput(named, emptyScope, existsSet(registry)); got != nil {
+			t.Errorf("empty scope %v must report nothing out of scope, got %v", emptyScope, got)
+		}
+	}
+	if got := outOfScopePathsInVerifyOutput(named, scope, existsSet(registry)); !reflect.DeepEqual(got, []string{registry}) {
+		t.Errorf("non-empty scope must report %q, got %v", registry, got)
+	}
+
 	// 12 distinct paths cap to 10, sorted.
 	var sb strings.Builder
 	for i := 11; i >= 0; i-- {
@@ -219,7 +232,8 @@ func TestFileExistsUnder(t *testing.T) {
 // the marker, each path and the instruction; the recipe with both endpoint
 // strings, the bearer env and the ?wait=30 poll is rendered whenever the scope
 // is non-empty (even with no out-of-scope path); an empty scope renders
-// neither.
+// neither, asserted with a NON-EMPTY outOfScope so the marker's absence is
+// the gate's doing and not the list's.
 func TestVerifyFixPrompt_RendersOutOfScopeAndRecipe(t *testing.T) {
 	recipe := []string{
 		verifyFixAmendmentRecipeHeader,
@@ -256,10 +270,19 @@ func TestVerifyFixPrompt_RendersOutOfScopeAndRecipe(t *testing.T) {
 		}
 	}
 
+	// Empty scope (the `git add -A` fallback) with a NON-EMPTY outOfScope:
+	// neither block renders. The whole tree is editable there, so an
+	// OUT-OF-SCOPE block would forbid an edit the agent can and should make
+	// and point at a "(recipe below)" that never renders — the withPaths case
+	// above is the discriminator proving the same list renders under a
+	// non-empty scope.
 	noScope, _ := verifyFixPrompt("go test ./...", "out", nil, nil, []string{"backend/internal/audit/categories.go"})
-	for _, absent := range []string{verifyFixAmendmentRecipeHeader, "scope-amendments", "as described above"} {
+	for _, absent := range []string{
+		verifyFixAmendmentRecipeHeader, "scope-amendments", "as described above",
+		verifyFixOutOfScopeMarker, "- backend/internal/audit/categories.go", "NOT editable in this fix", "recipe below",
+	} {
 		if strings.Contains(noScope, absent) {
-			t.Errorf("empty scope must render no recipe; found %q:\n%s", absent, noScope)
+			t.Errorf("empty scope must render neither the recipe nor the OUT-OF-SCOPE block; found %q:\n%s", absent, noScope)
 		}
 	}
 	if !strings.Contains(noScope, "already allowed to change (the approved scope)") {

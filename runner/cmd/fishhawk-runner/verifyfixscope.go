@@ -54,9 +54,13 @@ var verifyFixPathTokenRE = regexp.MustCompile(`(?:^|[^A-Za-z0-9_/.])([A-Za-z0-9_
 // no filesystem. A module-relative path a tool prints (go test / golangci-lint
 // run from inside a module) does not resolve from the repo root and so is NOT
 // reported — the intended precision/recall trade; a widened matcher would spam
-// every fix prompt.
+// every fix prompt. An EMPTY scope is the `git add -A` fallback, in which the
+// whole tree is editable: nothing can be out of scope, so the detector returns
+// nil (no block, no verify_fix_out_of_scope_named line) rather than
+// classifying every existing named file as a restricted path the fix agent
+// must not edit — the exact harm mode #3410 targets, inverted.
 func outOfScopePathsInVerifyOutput(output string, scope []upload.ScopeFile, exists func(rel string) bool) []string {
-	if output == "" || exists == nil {
+	if output == "" || exists == nil || len(scope) == 0 {
 		return nil
 	}
 	inScope := make(map[string]bool, len(scope))
