@@ -46,7 +46,11 @@ const lineageVouchLedgerCategory = CategoryOperatorCommitVouched
 // so a later report boundary (e.g. a fix-up on the consolidated parent)
 // attributes the integration merges instead of flagging them foreign. A
 // standalone run has no such entry, so the read is a no-op for it.
-const lineageIntegrationLedgerCategory = "slices_integrated"
+//
+// Aliased to auditcomplete.CategorySlicesIntegrated so this ledger and rule 5's
+// known set (auditcomplete.gatherForeignCommitInputs — the SECOND reader added
+// by #3429) cannot drift on a rename; the value is unchanged.
+const lineageIntegrationLedgerCategory = auditcomplete.CategorySlicesIntegrated
 
 // lineageIntegrationCommitCategory is the incremental companion to
 // slices_integrated (#1806). The orchestrator emits one integration_commit_recorded
@@ -58,7 +62,11 @@ const lineageIntegrationLedgerCategory = "slices_integrated"
 // these alongside slices_integrated.integration_commit_shas so the ADR-035
 // guard attributes the merges even when the clean-integration signal never
 // fired. A standalone run has no such entry, so the read is a no-op for it.
-const lineageIntegrationCommitCategory = "integration_commit_recorded"
+//
+// Aliased to auditcomplete.CategoryIntegrationCommitRecorded so this ledger and
+// rule 5's known set (auditcomplete.gatherForeignCommitInputs — the SECOND
+// reader added by #3429) cannot drift on a rename; the value is unchanged.
+const lineageIntegrationCommitCategory = auditcomplete.CategoryIntegrationCommitRecorded
 
 // lineageChildLedgerCategories are the audit categories read from a
 // decomposition CHILD run's chain when building the PARENT's ledger
