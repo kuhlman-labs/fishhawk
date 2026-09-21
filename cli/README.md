@@ -403,6 +403,8 @@ Or from this directory directly:
     go build ./...
     go test ./...
 
+`cmd/fishhawk`'s tests push into `t.TempDir()` bare origins (`autopr_test.go`), so this package carries the same git auto-maintenance pin as `runner/cmd/fishhawk-runner` (#3503, extended here by #3507): `cmd/fishhawk/gitmaint_test.go` adds a `TestMain` that writes a one-key `[maintenance]\n\tauto = false\n` gitconfig into its own temp dir and exports `GIT_CONFIG_GLOBAL` at it before `m.Run()`, plus a `TestHarnessDisablesAutoMaintenanceOnLocalPush` that pushes a real commit into a real bare origin under `GIT_TRACE2_EVENT` and fails if the trace shows a spawned `maintenance` child. Deleting the `TestMain` `os.Setenv` line turns it RED under `GIT_CONFIG_GLOBAL=/dev/null go test -run TestHarnessDisablesAutoMaintenanceOnLocalPush ./cmd/fishhawk/...` (the `scripts/test` posture). No test in this package overrides `GIT_CONFIG_GLOBAL` per-test, so — unlike `runner/internal/gitops` — there is no per-test coupling to repoint.
+
 ## Local invocation
 
     # Start a run
