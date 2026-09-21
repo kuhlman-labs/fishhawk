@@ -535,16 +535,7 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 
 	stageIDCopy := stageID
 	systemKind := audit.ActorSystem
-	payload := map[string]any{
-		"run_id":           runID.String(),
-		"stage_id":         stageID.String(),
-		"failure_category": string(cat),
-		"reason":           req.Reason,
-		"detail":           req.Detail,
-		"exit_code":        req.ExitCode,
-		"reported_at":      time.Now().UTC().Format(time.RFC3339Nano),
-		"auth_method":      "bearer",
-	}
+	payload := reapFailureAuditPayload(runID, stageID, cat, req)
 	// expected_state is added ONLY for a conditional call, so the UNCONDITIONAL
 	// payload's key set is byte-for-byte what it was before #2699 — "unconditional
 	// callers are unaffected" stays a fact rather than an assertion. An
@@ -606,11 +597,31 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 //
 // The payload is the dispatch_reaper_failed key set (run_id, stage_id,
 // failure_category, reason, detail, exit_code, reported_at, auth_method) so
-// the reaper's failure line is preserved verbatim on the chain. Every audit
-// read error is PROPAGATED (never a silent false) so the handler fails closed.
+// the reaper's failure line is preserved verbatim on the chain — built by the
+// SAME reapFailureAuditPayload builder the dispatch_reaper_failed append uses,
+// so the two cannot drift (E72.12 / #3458). Every audit read error is
+// PROPAGATED (never a silent false) so the handler fails closed.
 func (s *Server) recordAcceptanceVerdictUnshipped(ctx context.Context, runID uuid.UUID, stage *run.Stage, req reapFailureRequest, cat run.FailureCategory) (bool, error) {
 	if stage.Type != run.StageTypeAcceptance || stage.State != run.StageStateSucceeded {
 		return false, nil
+	}
+	// Serialize the check-then-append under the per-stage admission fence
+	// (E72.12 / #3458). This is the SAME single-process lock host_dispatch.go
+	// and TryShortCircuitAcceptance take (#1936), and the ship handler's
+	// acceptance_outcome_recorded append goes through it too
+	// (appendAcceptanceOutcomeSerialized, narrow hold). Holding it across the
+	// anchor / outcome / live-marker reads AND the AppendChained below means a
+	// concurrent second report sees the live marker and appends nothing, and
+	// an outcome cannot land between this path's read and its append — the
+	// interleaving that would leave a LIVE marker over a shipped verdict. The
+	// mutex is non-reentrant: handleReapStageFailure's already-terminal branch
+	// holds no other lock when it calls here, and nothing below re-enters the
+	// admission walk. No lock when Orchestrator is nil (same as host_dispatch).
+	// Residual: process-local, so the multi-replica hazard is the one
+	// orchestrator.go already states for the fence.
+	if s.cfg.Orchestrator != nil {
+		unlock := s.cfg.Orchestrator.LockStageAdmission(stage.ID)
+		defer unlock()
 	}
 	// Anchor: the newest validation episode for this stage. A read error on the
 	// dispatched anchor must not collapse into "no anchor" here (that is
@@ -641,16 +652,7 @@ func (s *Server) recordAcceptanceVerdictUnshipped(ctx context.Context, runID uui
 	}
 	stageIDCopy := stage.ID
 	systemKind := audit.ActorSystem
-	payload, _ := json.Marshal(map[string]any{
-		"run_id":           runID.String(),
-		"stage_id":         stage.ID.String(),
-		"failure_category": string(cat),
-		"reason":           req.Reason,
-		"detail":           req.Detail,
-		"exit_code":        req.ExitCode,
-		"reported_at":      time.Now().UTC().Format(time.RFC3339Nano),
-		"auth_method":      "bearer",
-	})
+	payload, _ := json.Marshal(reapFailureAuditPayload(runID, stage.ID, cat, req))
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
 		StageID:   &stageIDCopy,
@@ -663,6 +665,31 @@ func (s *Server) recordAcceptanceVerdictUnshipped(ctx context.Context, runID uui
 	}
 	s.notifyStatusUpdate(ctx, runID, CategoryAcceptanceVerdictUnshipped)
 	return true, nil
+}
+
+// reapFailureAuthMethod is the reap endpoint's recorded auth method — the
+// value carried as `auth_method` by BOTH the dispatch_reaper_failed row and
+// the acceptance_verdict_unshipped marker (the endpoint admits bearer tokens
+// only). One const so the two payloads cannot disagree (E72.12 / #3458).
+const reapFailureAuthMethod = "bearer"
+
+// reapFailureAuditPayload builds the UNCONDITIONAL reap-failure audit payload
+// (run_id, stage_id, failure_category, reason, detail, exit_code, reported_at,
+// auth_method) shared by the dispatch_reaper_failed append and the
+// acceptance_verdict_unshipped marker (E72.12 / #3458). The conditional
+// caller adds expected_state on top; the key set here is exactly what
+// TestReapStageFailure_UnconditionalAuditPayloadKeySet pins.
+func reapFailureAuditPayload(runID, stageID uuid.UUID, cat run.FailureCategory, req reapFailureRequest) map[string]any {
+	return map[string]any{
+		"run_id":           runID.String(),
+		"stage_id":         stageID.String(),
+		"failure_category": string(cat),
+		"reason":           req.Reason,
+		"detail":           req.Detail,
+		"exit_code":        req.ExitCode,
+		"reported_at":      time.Now().UTC().Format(time.RFC3339Nano),
+		"auth_method":      reapFailureAuthMethod,
+	}
 }
 
 // newestStageScopedSeq returns the highest audit sequence among the run's

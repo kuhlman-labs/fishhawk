@@ -10,13 +10,16 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // reapServer wires a server with the shared orchestratorRepo fake + a real
@@ -2156,5 +2159,250 @@ func TestReapStageFailure_AlreadyTerminalNoOp_BodyUnchanged(t *testing.T) {
 	}
 	if bytes.Contains(w.Body.Bytes(), []byte("acceptance_verdict_unshipped_recorded")) {
 		t.Errorf("no-op body carries the acceptance flag: %s", w.Body.String())
+	}
+}
+
+// --- E72.12 / #3458: the marker path is serialized under LockStageAdmission ---
+
+// hookAuditRepo wraps seqAuditRepo (reused unchanged from
+// acceptance_integration_test.go — increasing sequences on append, so a marker
+// appended during a test sits ABOVE the seeded anchor exactly as in
+// production) and fires afterList AFTER every ListForRunByCategory read of
+// the given category, handing the hook the entries the read returned. The
+// hook runs AFTER the delegate so a test can inject work between the marker
+// path's live-marker read and its append — the window the per-stage lock
+// closes.
+type hookAuditRepo struct {
+	*seqAuditRepo
+	hookCategory string
+	afterList    func(entries []*audit.Entry)
+}
+
+func (h *hookAuditRepo) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	entries, err := h.seqAuditRepo.ListForRunByCategory(ctx, runID, category)
+	if err == nil && category == h.hookCategory && h.afterList != nil {
+		h.afterList(entries)
+	}
+	return entries, err
+}
+
+// reapHookServer builds reapAcceptanceServer's shape over a hookAuditRepo:
+// a succeeded ACCEPTANCE stage, a real Orchestrator (so LockStageAdmission is
+// taken — reapServer wires `Orchestrator: &orchestrator.Orchestrator{Runs:
+// rr}`), and an acceptance_dispatched anchor seeded at seq 2 on the
+// underlying auditFake.
+func reapHookServer(t *testing.T) (*Server, *hookAuditRepo, *auditFake, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	rr.mu.Lock()
+	rr.stagesByID[stage.ID].Type = run.StageTypeAcceptance
+	rr.mu.Unlock()
+	hook := &hookAuditRepo{seqAuditRepo: newSeqAuditRepo(au), hookCategory: CategoryAcceptanceVerdictUnshipped}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    hook,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	seedStageScoped(au, runRow.ID, stage.ID, CategoryAcceptanceDispatched, 2)
+	return s, hook, au, runRow.ID, stage.ID
+}
+
+// twoPartyBarrier is the deterministic race fixture for the concurrent-report
+// test (binding condition 2): each party arrives after completing its
+// live-marker read and waits until BOTH have arrived — or the bounded window
+// expires. With the lock DELETED both reports enter the hook concurrently,
+// both arrive, both are released having observed NO marker, and both append
+// → two markers, deterministically. With the lock PRESENT the second report is
+// blocked on the mutex and can never arrive while the first waits, so the
+// first's wait expires (the bound, timescale-scaled per #1984), it appends and
+// releases, and the second then reads the LIVE marker and appends nothing →
+// one marker. The bound never flips a lock-present run into a false RED: the
+// expiry is the EXPECTED path there, and an in-memory concurrent party arrives
+// in microseconds when the lock is absent.
+type twoPartyBarrier struct {
+	mu      sync.Mutex
+	arrived int
+	full    chan struct{}
+	bound   time.Duration
+}
+
+func newTwoPartyBarrier(bound time.Duration) *twoPartyBarrier {
+	return &twoPartyBarrier{full: make(chan struct{}), bound: bound}
+}
+
+// arrive registers one party and blocks until both have arrived or the bound
+// expires; it reports whether the barrier filled.
+func (b *twoPartyBarrier) arrive() bool {
+	b.mu.Lock()
+	b.arrived++
+	if b.arrived == 2 {
+		close(b.full)
+	}
+	b.mu.Unlock()
+	select {
+	case <-b.full:
+		return true
+	case <-time.After(b.bound):
+		return false
+	}
+}
+
+// (A) TestReapStageFailure_AcceptanceUnshipped_ConcurrentReports_OneMarker:
+// two reap-failure reports race on the same succeeded acceptance stage. Both
+// are launched concurrently; the audit-read hook is a two-party barrier fired
+// AFTER each report's live-marker read, so with the lock deleted BOTH complete
+// that read (observing no marker) before EITHER appends, and TWO markers land
+// (observed RED: `acceptance_verdict_unshipped entries = 2, want 1`). Under the
+// lock exactly ONE marker lands and exactly one response carries
+// acceptance_verdict_unshipped_recorded:true. Committed audit state is read
+// after both calls return (counterfactual rule 3). Counterfactual: delete the
+// LockStageAdmission acquisition in recordAcceptanceVerdictUnshipped → RED.
+func TestReapStageFailure_AcceptanceUnshipped_ConcurrentReports_OneMarker(t *testing.T) {
+	s, hook, au, runID, stageID := reapHookServer(t)
+	barrier := newTwoPartyBarrier(timescale.D(300 * time.Millisecond))
+	hook.afterList = func([]*audit.Entry) { barrier.arrive() }
+
+	body := reapFailureRequest{Category: "C", Reason: "acceptance_upload", Detail: "413 body_too_large", ExitCode: 1}
+	results := make(chan *httptest.ResponseRecorder, 2)
+	for range 2 {
+		go func() { results <- postReapFailure(t, s, runID, stageID, body, withReapOperator) }()
+	}
+	recorded := 0
+	for range 2 {
+		select {
+		case w := <-results:
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp reapFailureResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if resp.AcceptanceVerdictUnshippedRecorded {
+				recorded++
+			}
+		case <-time.After(timescale.D(10 * time.Second)):
+			t.Fatal("a reap-failure report never returned (lock hang?)")
+		}
+	}
+	if n := len(unshippedAudit(au)); n != 1 {
+		t.Errorf("acceptance_verdict_unshipped entries = %d, want 1 (the second report must see the first's live marker)", n)
+	}
+	if recorded != 1 {
+		t.Errorf("responses with acceptance_verdict_unshipped_recorded:true = %d, want exactly 1", recorded)
+	}
+}
+
+// (B) TestReapStageFailure_AcceptanceUnshipped_OutcomeLandingMidWalk_NeverLiveOverShippedVerdict:
+// while the reap path is between its live-marker read and its append, a
+// verdict ships through the REAL ship-side helper
+// (appendAcceptanceOutcomeSerialized). The hook spawns that append and waits
+// on its done channel for a bounded window: under BOTH locks the outcome is
+// blocked until the marker path releases, so it lands ABOVE the marker and
+// acceptanceVerdictUnshippedLive reports live == false; with EITHER lock
+// deleted the outcome lands inside the window, BELOW the marker, and the
+// committed chain carries a LIVE marker over a shipped verdict → RED. The
+// reap response flag must agree with the committed state (recorded:true iff
+// a marker exists). Counterfactuals: delete the lock in
+// recordAcceptanceVerdictUnshipped → RED; delete the lock in
+// appendAcceptanceOutcomeSerialized → RED.
+func TestReapStageFailure_AcceptanceUnshipped_OutcomeLandingMidWalk_NeverLiveOverShippedVerdict(t *testing.T) {
+	s, hook, au, runID, stageID := reapHookServer(t)
+	ctx := context.Background()
+	outcomeDone := make(chan error, 1)
+	var once sync.Once
+	hook.afterList = func([]*audit.Entry) {
+		once.Do(func() {
+			go func() {
+				sid := stageID
+				kind := audit.ActorSystem
+				payload, _ := json.Marshal(map[string]any{"verdict": acceptanceVerdictPassed})
+				_, err := s.appendAcceptanceOutcomeSerialized(ctx, stageID, audit.ChainAppendParams{
+					RunID: runID, StageID: &sid, Timestamp: time.Now().UTC(),
+					Category: CategoryAcceptanceOutcomeRecorded, ActorKind: &kind, Payload: payload,
+				})
+				outcomeDone <- err
+			}()
+			// Bounded wait: under the lock the append cannot complete inside
+			// this window (expected expiry); without it the in-memory append
+			// completes in microseconds.
+			select {
+			case err := <-outcomeDone:
+				outcomeDone <- err
+			case <-time.After(timescale.D(300 * time.Millisecond)):
+			}
+		})
+	}
+
+	w := postReapFailure(t, s, runID, stageID,
+		reapFailureRequest{Category: "C", Reason: "acceptance_upload"}, withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	select {
+	case err := <-outcomeDone:
+		if err != nil {
+			t.Fatalf("outcome append: %v", err)
+		}
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("the outcome append never completed (lock hang?)")
+	}
+	var resp reapFailureResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// Committed-state read after both calls returned.
+	_, live, err := s.acceptanceVerdictUnshippedLive(ctx, runID, stageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live {
+		t.Errorf("acceptanceVerdictUnshippedLive = true: a LIVE marker sits over a shipped verdict (the outcome landed between the marker path's read and its append)")
+	}
+	markers := len(unshippedAudit(au))
+	if resp.AcceptanceVerdictUnshippedRecorded != (markers == 1) {
+		t.Errorf("response recorded=%v but markers=%d — the flag must agree with the committed chain", resp.AcceptanceVerdictUnshippedRecorded, markers)
+	}
+}
+
+// (C) TestReapStageFailure_UnshippedMarkerPayload_SharedWithReaperFailed: the
+// marker payload is built by the SAME reapFailureAuditPayload builder as the
+// dispatch_reaper_failed row — its key set equals the recorded unconditional
+// key set TestReapStageFailure_UnconditionalAuditPayloadKeySet pins, and its
+// auth_method is the single reapFailureAuthMethod const. Counterfactual:
+// re-inline a divergent map in the marker append → RED.
+func TestReapStageFailure_UnshippedMarkerPayload_SharedWithReaperFailed(t *testing.T) {
+	s, _, au, runID, stageID := reapAcceptanceServer(t, run.StageStateSucceeded)
+	seedStageScoped(au, runID, stageID, CategoryAcceptanceDispatched, 2)
+	w := postReapFailure(t, s, runID, stageID,
+		reapFailureRequest{Category: "C", Reason: "acceptance_upload", Detail: "413 body_too_large", ExitCode: 1},
+		withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	markers := unshippedAudit(au)
+	if len(markers) != 1 {
+		t.Fatalf("acceptance_verdict_unshipped entries = %d, want 1", len(markers))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(markers[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(payload))
+	for k := range payload {
+		got = append(got, k)
+	}
+	sort.Strings(got)
+	want := append([]string(nil), unconditionalAuditPayloadKeys...)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("marker payload keys = %v, want the unconditional dispatch_reaper_failed key set %v", got, want)
+	}
+	if payload["auth_method"] != reapFailureAuthMethod {
+		t.Errorf("auth_method = %v, want %q", payload["auth_method"], reapFailureAuthMethod)
 	}
 }

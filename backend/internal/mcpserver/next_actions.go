@@ -545,6 +545,21 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 				return &NextActions{State: "succeeded_acceptance_undecidable", Actions: mergeRitualActions(run,
 					"the run succeeded with its PR open; the acceptance stage could not DECIDE one or more acceptance criteria (#2512) — no criterion failed, so this is not a triage, and the run is merge-eligible with no arbitration. But it is NOT a validated pass: acknowledge in your merge verdict which criteria went undecided")}
 			}
+			// E72.12 / #3458: the terminal-run twin of the
+			// acceptance_verdict_unshipped arm. The run reported succeeded with
+			// its PR open, but the newest acceptance signal is a LIVE
+			// acceptance_verdict_unshipped marker — nothing verified this head,
+			// the server gate refuses the merge 409 acceptance_gate_not_passed,
+			// and the recovery is fishhawk_retry_stage. NEVER the merge ritual:
+			// falling to succeeded_pr_open here would offer approve_pr /
+			// fishhawk_merge_run on a run the server cannot merge. Checked
+			// beside the not_validated / undecidable twins and BEFORE the
+			// succeeded_pr_open fallthrough. Same degradation as its siblings:
+			// a marker aged out of the recent-audit window leaves the flag empty
+			// and falls to succeeded_pr_open.
+			if acceptanceVerdict == acceptanceVerdictUnshipped {
+				return succeededAcceptanceVerdictUnshippedActions(run, acceptance)
+			}
 			return &NextActions{State: "succeeded_pr_open", Actions: mergeRitualActions(run, "the run succeeded with its PR open")}
 		}
 		return &NextActions{State: run.State}
@@ -1659,16 +1674,48 @@ func acceptanceOutcomeUnknownActions(run *Run, acceptance *Stage) *NextActions {
 // The recovery is fishhawk_retry_stage: the re-open + re-dispatch append a
 // fresh anchor above the marker and retire it by construction.
 func acceptanceVerdictUnshippedActions(run *Run, acceptance *Stage) *NextActions {
+	return acceptanceVerdictUnshippedActionsFor("acceptance_verdict_unshipped", run, acceptance)
+}
+
+// succeededAcceptanceVerdictUnshippedActions is the TERMINAL-RUN twin of
+// acceptanceVerdictUnshippedActions (E72.12 / #3458): the run reported
+// succeeded with its PR open while the acceptance verdict never shipped. Same
+// read-then-retry actions, never the merge ritual — the server gate refuses
+// the merge 409 on the same marker, and fishhawk_retry_stage re-opens the
+// stage. When the acceptance stage is absent from the snapshot (defensive: the
+// sentinel implies a marker implies a stage) it degrades to the list_audit read
+// alone — still never mergeRitualActions.
+func succeededAcceptanceVerdictUnshippedActions(run *Run, acceptance *Stage) *NextActions {
+	if acceptance == nil {
+		return &NextActions{
+			State:   "succeeded_acceptance_verdict_unshipped",
+			Actions: []SuggestedAction{acceptanceVerdictUnshippedReadAction(run)},
+		}
+	}
+	return acceptanceVerdictUnshippedActionsFor("succeeded_acceptance_verdict_unshipped", run, acceptance)
+}
+
+// acceptanceVerdictUnshippedReadAction is the leading fishhawk_list_audit read
+// on the acceptance_verdict_unshipped marker, shared by the running-run arm
+// and its terminal-run twin.
+func acceptanceVerdictUnshippedReadAction(run *Run) SuggestedAction {
+	return SuggestedAction{
+		Action:       "fishhawk_list_audit",
+		Params:       map[string]string{"run_id": run.ID, "category": auditCategoryAcceptanceVerdictUnshipped},
+		Precondition: "the acceptance stage settled succeeded but its verdict upload FAILED (the reap-failure report recorded an acceptance_verdict_unshipped marker newer than any acceptance_outcome_recorded entry) — the full verdict is on the trace bundle's acceptance_evidence event, not on the audit chain",
+		Consumes:     consumesNone,
+		Reason:       "read the runner's failure line (reason / detail / exit_code) from the marker before re-running — deliberately NOT the merge ritual (nothing verified this head: the run may report succeeded, but the acceptance verdict never shipped and the server gate refuses the merge 409 acceptance_gate_not_passed; fishhawk_retry_stage re-opens the stage)",
+	}
+}
+
+// acceptanceVerdictUnshippedActionsFor builds the read → retry → poll block
+// under the given state label, so the running-run arm and its terminal-run
+// twin cannot drift in their actions.
+func acceptanceVerdictUnshippedActionsFor(state string, run *Run, acceptance *Stage) *NextActions {
 	return &NextActions{
-		State: "acceptance_verdict_unshipped",
+		State: state,
 		Actions: []SuggestedAction{
-			{
-				Action:       "fishhawk_list_audit",
-				Params:       map[string]string{"run_id": run.ID, "category": auditCategoryAcceptanceVerdictUnshipped},
-				Precondition: "the acceptance stage settled succeeded but its verdict upload FAILED (the reap-failure report recorded an acceptance_verdict_unshipped marker newer than any acceptance_outcome_recorded entry) — the full verdict is on the trace bundle's acceptance_evidence event, not on the audit chain",
-				Consumes:     consumesNone,
-				Reason:       "read the runner's failure line (reason / detail / exit_code) from the marker before re-running — deliberately NOT the merge ritual (nothing verified this head; the server gate refuses the merge 409 acceptance_gate_not_passed)",
-			},
+			acceptanceVerdictUnshippedReadAction(run),
 			{
 				Action:       "fishhawk_retry_stage",
 				Params:       map[string]string{"stage_id": acceptance.ID},
@@ -2211,6 +2258,13 @@ const (
 	// AND drive.RuleAcceptanceVerdictUnshipped AND the next_actions.state string
 	// below; the cross-module literal test pins all three.
 	auditCategoryAcceptanceVerdictUnshipped = "acceptance_verdict_unshipped"
+	// auditCategoryAcceptanceDispatched is the per-episode dispatch anchor the
+	// backend writes when an acceptance stage is dispatched. Together with
+	// categoryAcceptanceReopened (merge_run.go) it RETIRES an older
+	// acceptance_verdict_unshipped marker in latestAcceptanceVerdict's window
+	// walk (E72.12 / #3458), mirroring acceptanceVerdictUnshippedLive's
+	// `M > A` rule. MUST match backend/internal/server.CategoryAcceptanceDispatched.
+	auditCategoryAcceptanceDispatched = "acceptance_dispatched"
 
 	// acceptanceVerdictUnshipped is a CLASSIFIER-LOCAL sentinel, never a wire
 	// verdict (E72.11 / #3447): latestAcceptanceVerdict returns it when the
@@ -2292,25 +2346,71 @@ func isAcceptancePagedDisposition(d string) bool {
 // item 0 newest — the same slice mergeObservedIn scans), or "" when none is
 // present or the payload is malformed.
 //
-// E72.11 / #3447: the walk ALSO stops at an acceptance_verdict_unshipped
+// E72.11 / #3447: the walk ALSO stops at a LIVE acceptance_verdict_unshipped
 // marker, returning the classifier-local acceptanceVerdictUnshipped sentinel
 // when the marker is NEWER than any recorded outcome in the window — the
 // reap-failure handler writes the marker only when no outcome exists for the
 // current validation episode, so "marker newest" is exactly "verdict never
 // shipped". An outcome newer than the marker (the verdict shipped after all,
-// or a later episode shipped one) wins as before. A marker aged out of the
-// window degrades to "" and the existing settled-outcome-unknown read arm
-// (fail toward read, never toward merge).
+// or a later episode shipped one) wins as before.
+//
+// E72.12 / #3458: the marker is ANCHOR-AWARE, mirroring the backend gate's
+// acceptanceVerdictUnshippedLive `M > A` rule exactly. Walking newest-first,
+// every acceptance_dispatched / acceptance_reopened entry seen ABOVE a marker
+// is an episode anchor; a marker is RETIRED when ANY such anchor is either
+// unscoped (no stage id — fail toward read) or scoped to the marker's stage
+// (the #3222 stage-as-parameter discipline applied inside the window: the
+// classifier has no stage-id parameter at this call site, so the set of
+// anchor stage ids is collected as the walk proceeds and the marker is tested
+// against it, never against only the newest anchor — a newer anchor scoped
+// to ANOTHER stage must not shadow an older same-stage one). A retired marker
+// is walked past: an older acceptance_outcome_recorded in the window then
+// decides (its verdict, as the backend's un-anchored latestAcceptanceOutcome
+// does), or the walk ends at "" — the settled-outcome-unknown read arm (fail
+// toward read, never toward merge). So dispatch(11)/reopen(10)/marker(9)
+// classifies acceptance_settled_outcome_unknown, matching the backend gate.
+// Outcomes deliberately stay UN-anchored: the backend's latestAcceptanceOutcome
+// does not anchor them either, and anchoring only one side would let the two
+// surfaces disagree. An anchor OLDER than the marker (below it in the walk)
+// retires nothing — that is the run-8b911565 live shape. A marker aged out of
+// the window degrades to "" as before.
 func latestAcceptanceVerdict(recent []AuditEntry) string {
+	anchorStages := map[string]struct{}{}
+	unscopedAnchor := false
 	for _, e := range recent {
 		switch e.Category {
+		case auditCategoryAcceptanceDispatched, categoryAcceptanceReopened:
+			if e.StageID == nil {
+				unscopedAnchor = true
+			} else {
+				anchorStages[*e.StageID] = struct{}{}
+			}
 		case auditCategoryAcceptanceOutcomeRecorded:
 			return acceptancePayloadString(e.Payload, "verdict")
 		case auditCategoryAcceptanceVerdictUnshipped:
+			if unshippedMarkerRetired(e, anchorStages, unscopedAnchor) {
+				continue
+			}
 			return acceptanceVerdictUnshipped
 		}
 	}
 	return ""
+}
+
+// unshippedMarkerRetired reports whether an acceptance_verdict_unshipped
+// marker is retired by the anchors already seen above it in the newest-first
+// walk: an unscoped anchor retires every marker (fail toward read), an unscoped
+// marker is retired by any anchor, and a scoped marker is retired only by an
+// anchor scoped to the SAME stage.
+func unshippedMarkerRetired(marker AuditEntry, anchorStages map[string]struct{}, unscopedAnchor bool) bool {
+	if unscopedAnchor {
+		return true
+	}
+	if marker.StageID == nil {
+		return len(anchorStages) > 0
+	}
+	_, same := anchorStages[*marker.StageID]
+	return same
 }
 
 // latestAcceptanceTriageDisposition returns the triage disposition CORRELATED

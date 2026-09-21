@@ -1253,7 +1253,7 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		// governance record. The helper fails closed on a read error.
 		if _, herr := s.ensureGovernanceAuditEntry(r.Context(), runID,
 			CategoryAcceptanceOutcomeRecorded, existing.ID.String(), func() error {
-				_, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+				_, aerr := s.appendAcceptanceOutcomeSerialized(r.Context(), stageID, audit.ChainAppendParams{
 					RunID:        runID,
 					StageID:      &stageID,
 					Timestamp:    time.Now().UTC(),
@@ -1310,7 +1310,7 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	if _, err := s.appendAcceptanceOutcomeSerialized(r.Context(), stageID, audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &stageID,
 		Timestamp:    time.Now().UTC(),
@@ -2051,6 +2051,25 @@ func (s *Server) acceptanceVerdictUnshippedLive(ctx context.Context, runID, stag
 		return markerSeq, false, nil
 	}
 	return markerSeq, true, nil
+}
+
+// appendAcceptanceOutcomeSerialized appends an acceptance_outcome_recorded
+// entry under the per-stage admission fence (E72.12 / #3458). The lock is
+// orchestrator.LockStageAdmission — the SAME single-process mutex
+// host_dispatch.go, TryShortCircuitAcceptance (#1936) and the reap-failure
+// marker path (recordAcceptanceVerdictUnshipped) take — so an outcome cannot
+// land between the marker path's anchor/outcome/live-marker reads and its
+// append, the interleaving that would leave a LIVE marker newer than a shipped
+// verdict. The hold is deliberately NARROW: only the AppendChained call, NEVER
+// across handleShipAcceptance's triage / fixup dispatch / Advance tail, which
+// can re-enter the admission walk for the same stage and would deadlock on the
+// non-reentrant mutex. No lock when Orchestrator is nil (behavior unchanged).
+func (s *Server) appendAcceptanceOutcomeSerialized(ctx context.Context, stageID uuid.UUID, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if s.cfg.Orchestrator != nil {
+		unlock := s.cfg.Orchestrator.LockStageAdmission(stageID)
+		defer unlock()
+	}
+	return s.cfg.AuditRepo.AppendChained(ctx, p)
 }
 
 // acceptanceStageOf returns the run's acceptance stage from the supplied slice,
