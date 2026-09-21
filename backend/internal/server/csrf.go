@@ -139,7 +139,9 @@ const csrfFormFallbackMaxBytes = 1 << 20
 // is a narrow exact-match list mirroring csrfExemptPath's reviewable-here
 // convention: a plain HTML consent form cannot set a request header, so
 // enforcement on /v0/oauth/authorize needs a form-field path. Every other route
-// stays header-only.
+// stays header-only. The form field carries a session-bound signed token
+// (consentcsrf.go, #2442), NOT a mirror of the __Host-csrf cookie — the cookie
+// is never consulted on this branch.
 func csrfFormFallbackPath(p string) bool {
 	return p == "/v0/oauth/authorize"
 }
@@ -161,7 +163,10 @@ func isFormURLEncoded(ct string) bool {
 // request, the X-CSRF-Token header MUST equal the __Host-csrf
 // cookie value. Bearer-token requests bypass — bearer tokens aren't
 // vulnerable to CSRF in the first place — and so do anonymous
-// requests, which the per-handler logic 401s on its own.
+// requests, which the per-handler logic 401s on its own. The one
+// path-scoped exception is the consent form's session-bound signed
+// csrf_token field (below, #2442); the header path is unchanged for
+// every route including the consent POST.
 //
 // The middleware sits after bearerAuth in the chain so it can read
 // the resolved Identity. A missing or mismatched token returns 403
@@ -188,12 +193,15 @@ func (s *Server) csrf(next http.Handler) http.Handler {
 			cookieValue = c.Value
 		}
 
-		// Form-field fallback (CONDITION 3, #2436): on the ONE fallback path,
-		// with a form-encoded body and no header, read the csrf_token form
-		// value and compare it exactly as the header would be. The body MUST be
-		// buffered and RESTORED — ParseForm consumes it, so without the restore
-		// the handler's own ParseForm sees an empty form. The read is bounded to
-		// foreclose an unbounded allocation from an unauthenticated request.
+		// Form-field fallback (CONDITION 3, #2436; session-bound token, #2442):
+		// on the ONE fallback path, with a form-encoded body and no header, read
+		// the csrf_token form value and verify it as a signed token bound to
+		// this request's session cookie and the request-time clock — the
+		// __Host-csrf cookie is NOT consulted here, so concurrent consent flows
+		// cannot invalidate each other's forms. The body MUST be buffered and
+		// RESTORED — ParseForm consumes it, so without the restore the handler's
+		// own ParseForm sees an empty form. The read is bounded to foreclose an
+		// unbounded allocation from an unauthenticated request.
 		if header == "" && csrfFormFallbackPath(r.URL.Path) && isFormURLEncoded(r.Header.Get("Content-Type")) {
 			buf, err := io.ReadAll(io.LimitReader(r.Body, csrfFormFallbackMaxBytes+1))
 			if err != nil {
@@ -207,9 +215,19 @@ func (s *Server) csrf(next http.Handler) http.Handler {
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(buf))
+			formToken := ""
 			if vals, perr := url.ParseQuery(string(buf)); perr == nil {
-				header = vals.Get("csrf_token")
+				formToken = vals.Get("csrf_token")
 			}
+			if verr := verifyConsentCSRFToken(sessionPlaintextFrom(r), formToken, s.nowFunc()); verr != nil {
+				s.writeError(w, r, http.StatusForbidden, "csrf_required",
+					"the consent form's csrf_token is missing, expired, or not bound to this session; "+
+						"reload the authorization page and submit again",
+					nil)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
 		}
 
 		if header == "" || cookieValue == "" ||

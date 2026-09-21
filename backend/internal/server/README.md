@@ -3294,6 +3294,7 @@ Pinned by, in `onboarding_test.go`: `TestOnboardingReadiness_RepoNotVisible` (th
 - The OAuth callback (`server.handleGitHubCallback`) mints a 32-byte hex token and sets it in the `__Host-csrf` cookie alongside `fishhawk_session`; logout clears both.
 - The `csrf` middleware sits after `bearerAuth` in the chain (`recovery → requestID → logging → bearerAuth → csrf → mux`) and enforces `X-CSRF-Token` ≡ `__Host-csrf` on POST/PUT/PATCH/DELETE for session-cookie identities only.
   Bearer-token clients (CLI, server-to-server) and GET-style methods bypass; safe-listed paths (`/v0/auth/github/*`, `/webhooks/github`) bypass too.
+- ONE path-scoped exception: on `POST /v0/oauth/authorize` with a form-encoded body and no header, the middleware verifies the consent form's `csrf_token` field as a session-bound signed token (`consentcsrf.go`, #2442) instead of comparing it to the cookie — see "CSRF on `/v0/oauth/authorize`" below. The header path is unchanged on that route too.
 - Mismatch returns `403 csrf_required`.
 - Frontend's `frontend/src/api/client.ts` reads the cookie via `getCookie()` (`frontend/src/lib/cookie.ts`) and auto-attaches the header on every state-changing call. Vitest runs jsdom under `https://localhost/` so `__Host-` cookies are accepted (jsdom rejects them under HTTP).
 
@@ -3841,29 +3842,90 @@ endpoint that mints tokens, for no client benefit. Consequence, asserted in
 that authorized on a port-bearing URI and exchanges with the portless one is
 correctly refused `invalid_grant`.
 
-### CSRF on `/v0/oauth/authorize`: the SameSite trap (CONDITION-1)
+### CSRF on `/v0/oauth/authorize`: the session-bound form token (#2442)
 
-The `POST` consent decision is CSRF-protected by the standard `__Host-csrf`
-cookie, but with a NARROW, path-scoped `csrf_token` form-field fallback that
-exists nowhere else in the surface. The reason is a cookie-attribute
-interaction, not laxness: the `__Host-csrf` cookie is `SameSite=Strict`, so it
-is **NOT sent on the cross-site top-level navigation** that lands the browser on
-`GET /v0/oauth/authorize` from the MCP client's site — while the
-`SameSite=Lax` session cookie IS. A double-submit that read only the Strict
-cookie would therefore see no token on the very first consent render and wedge
-the flow.
+The `POST` consent decision is CSRF-protected, but NOT by the `__Host-csrf`
+cookie double-submit every other route uses: the consent page embeds a
+**stateless, session-bound signed `csrf_token`** in its hidden form field, and
+the `csrf` middleware's ONE path-scoped form branch verifies that token instead
+of comparing it to the cookie. This route neither reads nor writes
+`__Host-csrf`.
 
-So the consent **GET mints a `__Host-csrf` cookie when the request carries
-none**, and the POST accepts the token from the `csrf_token` form field matched
-against that cookie. The fallback is scoped to this one path.
+**Why the shared cookie collided.** The `__Host-csrf` cookie is
+`SameSite=Strict`, so it is **NOT sent on the cross-site top-level navigation**
+that lands the browser on `GET /v0/oauth/authorize` from the MCP client's site
+(the `SameSite=Lax` session cookie IS). The #2436 design therefore minted a
+fresh cookie on every consent render — and because the mint branch always
+fired, every render OVERWROTE the single host-wide cookie slot. Two concurrent
+authorization flows (two MCP clients, or one client retried in a second tab)
+rendered two pages but the browser held only the SECOND cookie, so the first
+page's form 403'd `csrf_required` on submit. The signed token removes the shared
+slot: every rendered page carries its own independently-verifiable value, N
+concurrent consent pages all submit, the SPA's cookie is never clobbered by an
+authorize navigation, and SameSite is out of the picture.
+
+**Token format** (`consentcsrf.go`):
+`base64url( ts[8] || nonce[16] || HMAC-SHA256(key, label || ts || nonce) )`,
+`ts` = big-endian unix seconds of the mint, `label` =
+`fishhawk-consent-csrf-v1`. This is the OWASP HMAC-based synchronizer-token
+pattern, keyed **per session** — `key = SHA-256(label || 0x00 ||
+fishhawk_session-cookie-plaintext)` — rather than per server secret, because
+`Config` carries no signing secret and a process-random key would break across
+the Helm chart's replicas and across a `fishhawkd` restart mid-consent. The key
+derivation is DOMAIN-SEPARATED from `auth.HashPlaintext` (the unlabelled
+SHA-256 persisted in the sessions table) by the label + `0x00` separator, so a
+sessions-table read never yields the CSRF key
+(`TestConsentCSRFKey_IsNotThePersistedSessionHash`). A forger needs the
+HttpOnly session cookie plaintext to compute a valid token — the same secret the
+double-submit ultimately protected — and cannot read the consent HTML
+cross-origin; HMAC output does not reveal its key (RFC 2104 §6), so embedding
+the MAC in the page exposes nothing. Both `renderConsent` and the middleware
+read the raw cookie from the request rather than carrying the plaintext on
+`Identity` (context-visible; must not carry a credential); `renderConsent` runs
+only under `id.SessionID != ""`, which `bearerAuth` sets exclusively from that
+cookie, and an empty plaintext still fails closed `500 internal_error`
+(`TestOAuthAuthorize_ConsentRenderWithoutSessionCookieFailsClosed`).
+
+**TTL.** `consentCSRFTokenTTL = 1h`, checked against `s.nowFunc()` at request
+time: long enough to read the page, short enough to bound replay of a leaked
+one. The boundary is pinned (`ts+TTL` passes, `ts+TTL+1s` refused).
+
+**Three refusal modes**, each `403 csrf_required` at the middleware with a
+form-specific message: `ErrConsentCSRFMalformed` (not base64url, or not exactly
+56 bytes), `ErrConsentCSRFExpired`, `ErrConsentCSRFInvalid` (MAC does not verify
+under THIS session's key — tampered, or minted for another session). The
+comparison is constant-time. The OLD protocol — a cookie value in the form field
+with the matching cookie attached — is refused too: the form branch is
+signature-only and never falls back to the cookie mirror
+(`TestCSRF_ConsentCookieValueInFormRefused`).
+
+**The header path is unchanged for every route including the consent POST**:
+with an `X-CSRF-Token` header present the middleware never enters the form
+branch and compares header ≡ `__Host-csrf` exactly as before
+(`TestCSRF_HeaderPathUnchanged`). The anonymous bypass (`id.SessionID == ""` →
+next) precedes the form branch, so an anonymous consent POST reaches the handler
+and is `401 auth_required`, never `403`
+(`TestCSRF_AnonymousConsentPostIs401NotCSRF`).
+
+**Tests** (all through `srv.Handler()`, crossing middleware + handler +
+template): `TestCSRF_ConcurrentConsentFlows_FirstFormSucceeds` (the #2442
+obligation — two GETs, the FIRST form still submits; RED under the pre-change
+code), `TestCSRF_ConsentAcceptsFormFieldFallback` (form token, NO cookie on the
+POST → 302), `TestCSRF_ConsentTokenTamperedRefused`,
+`TestCSRF_ConsentTokenNotBoundToSessionRefused`,
+`TestCSRF_ConsentTokenExpiredRefused`, `TestCSRF_ConsentMissingFormFieldRefused`,
+`TestCSRF_FormFallbackIsPathScoped`, and the done-means for the clobber removal
+`TestOAuthAuthorize_ConsentGETSetsNoCSRFCookie` (200, non-empty `csrf_token`, NO
+`Set-Cookie __Host-csrf`). The codec is unit-pinned with `errors.Is` identity in
+`consentcsrf_test.go`.
 
 **General lesson, recorded because it defeated handler-level testing:** a test
 suite that constructs cookies programmatically cannot observe `SameSite` at
 all — `net/http` does not replay the browser's cross-site send/suppress rule —
-so a handler test that hand-attaches the `__Host-csrf` cookie will pass while a
-real browser sends no such cookie on the cross-site navigation. Handler-level
-testing cannot catch this class; the mint-on-GET behavior is the structural fix,
-not a test assertion.
+so a handler test that hand-attaches the `__Host-csrf` cookie passes while a
+real browser sends no such cookie on the cross-site navigation. The stack tests
+above model the cross-site arrival by attaching NO `__Host-csrf` cookie; the
+browser-level check stays with the operator walk (#2439).
 
 **Bounded form read (CONDITION-3).** The `csrf_token` fallback parses the POST
 body under a 1 MiB cap — implemented with `io.LimitReader` (reading one byte past
