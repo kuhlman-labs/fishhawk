@@ -1831,12 +1831,29 @@ type SurfaceSweepExemptionEvidence struct {
 // touches TriggerPath but omits the pattern's required sibling surfaces.
 // SubPlanTitle, when set, names the decomposition sub-plan whose own scope
 // produced the finding (#1077); empty for parent-scope findings.
+//
+// Category is set ONLY by the prose-triggered audit-category rule (#3410):
+// the unregistered audit category the plan named. When set the finding
+// renders as a distinct NEW AUDIT CATEGORY line naming the token, the
+// registry file and the verify-gate test; when empty the MISSING SIBLINGS
+// render is byte-identical to before the field existed.
 type SurfaceSweepFindingEvidence struct {
 	Pattern         string
 	TriggerPath     string
 	MissingSiblings []string
 	SubPlanTitle    string
+	Category        string
 }
+
+// auditCategoryRegistryPath and auditCategoryVerifyTest name the registry
+// file and the committed-tree verify test the NEW AUDIT CATEGORY line points
+// the reviewer at (#3410). Hand-mirrored from backend/internal/server's
+// audit_category_sweep.go (this package must not import server); the
+// cross-package render test in server/plan_test.go pins both literals.
+const (
+	auditCategoryRegistryPath = "backend/internal/audit/categories.go"
+	auditCategoryVerifyTest   = "TestKnownCategoriesCoversEmittedCategories"
+)
 
 // CrossSliceCouplingFindingEvidence is one cross-slice coupling finding
 // (#1102): a lockstep pattern's member files are partitioned across 2+
@@ -5260,6 +5277,18 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 			b.WriteString("- findings: none (checked and clean)\n")
 		} else {
 			for _, f := range sw.Findings {
+				if f.Category != "" {
+					// #3410 audit-category rule: prose-triggered, so the
+					// "trigger path" is where the token was named, and the
+					// remedy is a one-line registration or an exemption.
+					fmt.Fprintf(b, "- %sNEW AUDIT CATEGORY (%s): the plan names audit category %q (%s) that is absent from audit.KnownCategories, "+
+						"but %s is not in scope.files. Scope it (a one-line registration) — the committed-tree verify gate's %s fails on an "+
+						"unregistered emitted category and the implement agent cannot reach the file otherwise (#3410) — or, if %q is not in fact a new "+
+						"audit category, declare a surface_sweep_exemptions entry {pattern: %q, sibling: %q}.\n",
+						subPlanPrefix(f.SubPlanTitle), f.Pattern, f.Category, f.TriggerPath, auditCategoryRegistryPath, auditCategoryVerifyTest,
+						f.Category, f.Pattern, auditCategoryRegistryPath)
+					continue
+				}
 				fmt.Fprintf(b, "- %sMISSING SIBLINGS (%s): %s is in scope but the pattern's required sibling(s) are absent from scope.files: %s\n",
 					subPlanPrefix(f.SubPlanTitle), f.Pattern, f.TriggerPath, strings.Join(f.MissingSiblings, ", "))
 			}

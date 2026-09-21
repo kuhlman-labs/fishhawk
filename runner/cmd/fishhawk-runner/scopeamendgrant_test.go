@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -42,7 +45,7 @@ func grantRow(id, stageID, decisionReason string) upload.ScopeAmendment {
 // (the `git add -A` fallback) omits the section and keeps the legacy
 // "approved scope" wording; the Command/Output blocks are unchanged.
 func TestVerifyFixPrompt_RendersEffectiveScope(t *testing.T) {
-	prompt, elided := verifyFixPrompt("go test ./...", "--- FAIL: TestGet", grantScope(), nil)
+	prompt, elided := verifyFixPrompt("go test ./...", "--- FAIL: TestGet", grantScope(), nil, nil)
 	if elided != 0 {
 		t.Fatalf("elided = %d, want 0", elided)
 	}
@@ -67,9 +70,12 @@ func TestVerifyFixPrompt_RendersEffectiveScope(t *testing.T) {
 	if strings.Contains(prompt, verifyFixGrantedMarker) {
 		t.Errorf("nil granted must render no GRANTED block:\n%s", prompt)
 	}
+	if strings.Contains(prompt, verifyFixOutOfScopeMarker) {
+		t.Errorf("nil outOfScope must render no OUT-OF-SCOPE block:\n%s", prompt)
+	}
 
 	// Empty scope: section omitted, legacy wording kept.
-	empty, _ := verifyFixPrompt("go test ./...", "out", nil, nil)
+	empty, _ := verifyFixPrompt("go test ./...", "out", nil, nil, nil)
 	if strings.Contains(empty, verifyFixEffectiveScopeHeader) {
 		t.Errorf("empty scope must omit the effective-scope section:\n%s", empty)
 	}
@@ -89,7 +95,7 @@ func TestVerifyFixPrompt_RendersGrantedMidStage(t *testing.T) {
 			Paths: []upload.ScopeAmendmentPath{{Path: "docs/x.md", Operation: "create"}, {Path: "", Operation: "modify"}, {Path: "pkg/noop.go"}}},
 		{ID: "amd-empty", Status: "approved", StageID: verifyFixStageID},
 	}
-	prompt, _ := verifyFixPrompt("go test ./...", "out", grantScope(), granted)
+	prompt, _ := verifyFixPrompt("go test ./...", "out", grantScope(), granted, nil)
 	for _, want := range []string{
 		verifyFixGrantedMarker,
 		"- amendment amd-1 granted mod/other.go (modify)\n  Operator decision reason: edit only the init func\n",
@@ -116,10 +122,230 @@ func TestVerifyFixPrompt_RendersGrantedMidStage(t *testing.T) {
 		t.Errorf("section order = output %d, scope %d, granted %d, closing %d:\n%s", o, s, g, c, prompt)
 	}
 
-	none, _ := verifyFixPrompt("go test ./...", "out", grantScope(), nil)
-	if strings.Contains(none, verifyFixGrantedMarker) || strings.Contains(none, "amendment") {
+	none, _ := verifyFixPrompt("go test ./...", "out", grantScope(), nil, nil)
+	if strings.Contains(none, verifyFixGrantedMarker) || strings.Contains(none, "- amendment") {
 		t.Errorf("nil granted must omit the GRANTED block entirely:\n%s", none)
 	}
+	if strings.Contains(prompt, verifyFixOutOfScopeMarker) || strings.Contains(none, verifyFixOutOfScopeMarker) {
+		t.Errorf("nil outOfScope must render no OUT-OF-SCOPE block")
+	}
+}
+
+// --- #3410 OUT-OF-SCOPE PATHS detector + always-on amendment recipe ---
+
+// TestOutOfScopePathsInVerifyOutput is the pure-detector table with an
+// injected exists func: the verbatim #3400 verify excerpt yields the registry
+// path; in-scope paths, non-existent paths, module-relative paths exists()
+// rejects, bare basenames, absolute and parent-relative tokens (rejected as
+// WHOLE tokens even when the suffix exists — binding condition 1) are dropped;
+// duplicates collapse; 12 paths cap to 10 sorted.
+func TestOutOfScopePathsInVerifyOutput(t *testing.T) {
+	scope := []upload.ScopeFile{{Path: "backend/internal/server/foo.go", Operation: "modify"}, {Path: `backend\internal\server\bar.go`}}
+	existsSet := func(paths ...string) func(string) bool {
+		set := map[string]bool{}
+		for _, p := range paths {
+			set[p] = true
+		}
+		return func(rel string) bool { return set[rel] }
+	}
+	const registry = "backend/internal/audit/categories.go"
+	all := func(string) bool { return true }
+
+	cases := []struct {
+		name   string
+		output string
+		exists func(string) bool
+		want   []string
+	}{
+		{"verbatim #3400 excerpt", "    categories_completeness_test.go:98: emitted audit categories not registered in KnownCategories (add them to backend/internal/audit/categories.go):\n        zz_cat", existsSet(registry), []string{registry}},
+		{"in-scope path dropped", "fix backend/internal/server/foo.go and backend/internal/server/bar.go", all, nil},
+		{"non-existent dropped", "see backend/internal/audit/categories.go", existsSet("other/file.go"), nil},
+		{"module-relative exists() rejects", "internal/server/trace.go:12: undefined: x", existsSet(registry), nil},
+		{"basename without slash dropped", "categories_completeness_test.go:98: boom", all, nil},
+		{"parent-relative rejected whole", "open ../foo/bar.go: no such file", existsSet("foo/bar.go"), nil},
+		{"absolute rejected whole", "open /abs/path.go: permission denied", existsSet("abs/path.go"), nil},
+		{"dot-dot segment mid-token dropped", "see a/../b/c.go", existsSet("b/c.go"), nil},
+		{"duplicates collapse", registry + " and again " + registry + ", then (" + registry + ")", existsSet(registry), []string{registry}},
+		{"trailing punctuation trimmed", "add them to " + registry + "):", existsSet(registry), []string{registry}},
+		{"empty output", "", all, nil},
+		{"nil exists", "x " + registry, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := outOfScopePathsInVerifyOutput(tc.output, scope, tc.exists)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// 12 distinct paths cap to 10, sorted.
+	var sb strings.Builder
+	for i := 11; i >= 0; i-- {
+		fmt.Fprintf(&sb, "err in pkg/f%02d.go; ", i)
+	}
+	got := outOfScopePathsInVerifyOutput(sb.String(), scope, all)
+	if len(got) != verifyFixMaxOutOfScopePaths {
+		t.Fatalf("len = %d, want %d: %v", len(got), verifyFixMaxOutOfScopePaths, got)
+	}
+	for i, p := range got {
+		if want := fmt.Sprintf("pkg/f%02d.go", i); p != want {
+			t.Errorf("got[%d] = %q, want %q", i, p, want)
+		}
+	}
+}
+
+// TestFileExistsUnder pins the production predicate: a regular file is true;
+// a directory and a missing path are false.
+func TestFileExistsUnder(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(dir, "a", "b.go"), "package a\n")
+	exists := fileExistsUnder(dir)
+	if !exists("a/b.go") {
+		t.Error("regular file must exist")
+	}
+	if exists("a") {
+		t.Error("a directory must not count")
+	}
+	if exists("a/missing.go") {
+		t.Error("a missing file must not count")
+	}
+}
+
+// TestVerifyFixPrompt_RendersOutOfScopeAndRecipe: non-empty outOfScope renders
+// the marker, each path and the instruction; the recipe with both endpoint
+// strings, the bearer env and the ?wait=30 poll is rendered whenever the scope
+// is non-empty (even with no out-of-scope path); an empty scope renders
+// neither.
+func TestVerifyFixPrompt_RendersOutOfScopeAndRecipe(t *testing.T) {
+	recipe := []string{
+		verifyFixAmendmentRecipeHeader,
+		"POST $FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments",
+		"GET $FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments?wait=30",
+		"Authorization: Bearer $FISHHAWK_API_TOKEN",
+		"file a\nscope amendment as described above rather than retrying",
+	}
+
+	withPaths, _ := verifyFixPrompt("go test ./...", "out", grantScope(), nil, []string{"backend/internal/audit/categories.go", "docs/x.md"})
+	for _, want := range append([]string{
+		verifyFixOutOfScopeMarker,
+		"- backend/internal/audit/categories.go\n- docs/x.md\n",
+		"do NOT retry an in-scope\nworkaround and do NOT edit it",
+	}, recipe...) {
+		if !strings.Contains(withPaths, want) {
+			t.Errorf("prompt missing %q:\n%s", want, withPaths)
+		}
+	}
+	// Order: Effective scope → OUT-OF-SCOPE → recipe → closing paragraph.
+	s, o, r, c := strings.Index(withPaths, verifyFixEffectiveScopeHeader), strings.Index(withPaths, verifyFixOutOfScopeMarker),
+		strings.Index(withPaths, verifyFixAmendmentRecipeHeader), strings.Index(withPaths, "Edit the code so this command passes")
+	if s >= o || o >= r || r >= c {
+		t.Errorf("section order = scope %d, out-of-scope %d, recipe %d, closing %d:\n%s", s, o, r, c, withPaths)
+	}
+
+	noPaths, _ := verifyFixPrompt("go test ./...", "out", grantScope(), nil, nil)
+	if strings.Contains(noPaths, verifyFixOutOfScopeMarker) {
+		t.Errorf("empty outOfScope must render no marker:\n%s", noPaths)
+	}
+	for _, want := range recipe {
+		if !strings.Contains(noPaths, want) {
+			t.Errorf("recipe must render with a non-empty scope even with no out-of-scope path; missing %q:\n%s", want, noPaths)
+		}
+	}
+
+	noScope, _ := verifyFixPrompt("go test ./...", "out", nil, nil, []string{"backend/internal/audit/categories.go"})
+	for _, absent := range []string{verifyFixAmendmentRecipeHeader, "scope-amendments", "as described above"} {
+		if strings.Contains(noScope, absent) {
+			t.Errorf("empty scope must render no recipe; found %q:\n%s", absent, noScope)
+		}
+	}
+	if !strings.Contains(noScope, "already allowed to change (the approved scope)") {
+		t.Errorf("empty scope must keep the legacy wording:\n%s", noScope)
+	}
+}
+
+// TestRun_VerifyFixLoop_OutOfScopePathNamed_FixPromptCarriesIt is the
+// cross-boundary e2e over the TestRun_NoAmendment_FixPromptScopeOnly harness:
+// the base repo additionally commits mod/registry.go (out of scope) and the
+// verify command names it; the captured iteration-1 fix prompt carries the
+// OUT-OF-SCOPE marker with the path and the runner log carries
+// verify_fix_out_of_scope_named. The control names only the in-scope
+// mod/reg.go: no marker, no log line — but the amendment recipe is STILL
+// rendered (binding condition 3: always-on rendering pinned end to end).
+func TestRun_VerifyFixLoop_OutOfScopePathNamed_FixPromptCarriesIt(t *testing.T) {
+	const recipePOST = "POST $FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments"
+	drive := func(t *testing.T, verifyCmd string) (fixPrompt, stderr string) {
+		t.Helper()
+		pinAmendmentWatchInterval(t)
+		repo := verifyFixBaseRepo(t)
+		mustWrite(t, filepath.Join(repo, "mod", "registry.go"), "package mod\n\n// out-of-scope registry\n")
+		runGit := func(args ...string) {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = repo
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v\n%s", args, err, out)
+			}
+		}
+		runGit("add", "-A")
+		runGit("commit", "-q", "-m", "base: out-of-scope registry")
+		mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+		mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+		invoker := &fakeInvoker{
+			mirrorWorkingTreeFrom: repo,
+			canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+			onInvoke: func(idx int, inv agent.Invocation) {
+				if idx == 1 {
+					fixPrompt = inv.Prompt
+				}
+			},
+		}
+		withFakeInvoker(t, invoker)
+		implementEnv(t, "kuhlman-labs/fishhawk", "main")
+		fu := newFakeUploader(t)
+		fp := undecidedVerifyFixPrompt()
+		fp.VerifyCommand = verifyCmd
+		fu.promptResp = fp
+		withFakeUploader(t, fu)
+		withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+		bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+		var sb strings.Builder
+		if got := run(verifyFixRunArgs(repo, bundlePath), &sb); got != exitFailure {
+			t.Errorf("run = %d, want exitFailure:\n%s", got, sb.String())
+		}
+		if fixPrompt == "" {
+			t.Fatal("iteration-1 fix prompt was never captured")
+		}
+		return fixPrompt, sb.String()
+	}
+
+	t.Run("out-of-scope path named", func(t *testing.T) {
+		fixPrompt, stderr := drive(t, `sh -c 'echo "registry miss: add them to mod/registry.go"; exit 1'`)
+		for _, want := range []string{verifyFixOutOfScopeMarker, "- mod/registry.go\n", recipePOST} {
+			if !strings.Contains(fixPrompt, want) {
+				t.Errorf("fix prompt missing %q:\n%s", want, fixPrompt)
+			}
+		}
+		if !strings.Contains(stderr, `"event":"verify_fix_out_of_scope_named"`) || !strings.Contains(stderr, `"paths":"mod/registry.go"`) {
+			t.Errorf("runner log missing verify_fix_out_of_scope_named for mod/registry.go:\n%s", stderr)
+		}
+	})
+	t.Run("control: in-scope path only", func(t *testing.T) {
+		fixPrompt, stderr := drive(t, `sh -c 'echo "registry miss: add them to mod/reg.go"; exit 1'`)
+		if strings.Contains(fixPrompt, verifyFixOutOfScopeMarker) {
+			t.Errorf("in-scope-only output must render no OUT-OF-SCOPE marker:\n%s", fixPrompt)
+		}
+		if strings.Contains(stderr, "verify_fix_out_of_scope_named") {
+			t.Errorf("in-scope-only output must emit no verify_fix_out_of_scope_named line:\n%s", stderr)
+		}
+		if !strings.Contains(fixPrompt, recipePOST) {
+			t.Errorf("amendment recipe must render regardless (always-on):\n%s", fixPrompt)
+		}
+	})
 }
 
 // TestUnusedScopeAmendmentGrants is the pure-predicate table: which granted
@@ -887,6 +1113,11 @@ func TestRun_NoAmendment_FixPromptScopeOnly(t *testing.T) {
 	}
 	if strings.Contains(fixPrompt, verifyFixGrantedMarker) {
 		t.Errorf("no-amendment stage must render no GRANTED block:\n%s", fixPrompt)
+	}
+	// #3410 always-on half: the amendment recipe renders in the effective-scope
+	// form even when nothing is granted and no out-of-scope path is named.
+	if !strings.Contains(fixPrompt, "POST $FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments") {
+		t.Errorf("no-amendment stage must still render the amendment recipe:\n%s", fixPrompt)
 	}
 	for _, absent := range []string{"scope_amendment_grant_unused", "scope_amendment_grant_check_failed", "file not modified"} {
 		if strings.Contains(stderr.String(), absent) {

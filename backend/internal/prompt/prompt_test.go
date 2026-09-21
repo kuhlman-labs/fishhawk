@@ -4011,6 +4011,61 @@ func TestBuild_PlanReview_GateEvidence_AppliedExemptionRenders(t *testing.T) {
 	}
 }
 
+// TestBuild_PlanReview_GateEvidence_AuditCategoryRenders pins the #3410
+// render branch: a finding carrying Category renders as a NEW AUDIT CATEGORY
+// line naming the token, the registry file and the verify-gate test — and NO
+// MISSING SIBLINGS line for that finding; a finding with an empty Category
+// renders byte-identically to the pre-field MISSING SIBLINGS line.
+func TestBuild_PlanReview_GateEvidence_AuditCategoryRenders(t *testing.T) {
+	build := func(f SurfaceSweepFindingEvidence) string {
+		t.Helper()
+		got, err := Build("plan_review", Trigger{
+			Repo:         "x/y",
+			ApprovedPlan: fixturePlan(),
+			PlanGateEvidence: &PlanGateEvidence{
+				SurfaceSweep: &SurfaceSweepEvidence{ScannedFiles: 1, Findings: []SurfaceSweepFindingEvidence{f}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+
+	withCat := build(SurfaceSweepFindingEvidence{
+		Pattern:         "new audit category requires registry",
+		TriggerPath:     `audit category "zz_new_cat" named at approach step 2`,
+		MissingSiblings: []string{"backend/internal/audit/categories.go"},
+		Category:        "zz_new_cat",
+	})
+	for _, w := range []string{
+		"- NEW AUDIT CATEGORY (new audit category requires registry): the plan names audit category \"zz_new_cat\" (audit category \"zz_new_cat\" named at approach step 2) that is absent from audit.KnownCategories, but backend/internal/audit/categories.go is not in scope.files.",
+		"TestKnownCategoriesCoversEmittedCategories",
+		`declare a surface_sweep_exemptions entry {pattern: "new audit category requires registry", sibling: "backend/internal/audit/categories.go"}.`,
+	} {
+		if !strings.Contains(withCat, w) {
+			t.Errorf("plan_review prompt missing %q:\n%s", w, withCat)
+		}
+	}
+	if strings.Contains(withCat, "MISSING SIBLINGS") {
+		t.Errorf("a Category finding must not also render a MISSING SIBLINGS line:\n%s", withCat)
+	}
+
+	// Empty Category: the legacy render, byte-identical.
+	legacy := build(SurfaceSweepFindingEvidence{
+		Pattern:         "actor @-mention render surfaces",
+		TriggerPath:     "backend/internal/issuecomment/status_template.go",
+		MissingSiblings: []string{"backend/internal/issuecomment/notifier.go"},
+	})
+	const wantLegacy = "- MISSING SIBLINGS (actor @-mention render surfaces): backend/internal/issuecomment/status_template.go is in scope but the pattern's required sibling(s) are absent from scope.files: backend/internal/issuecomment/notifier.go\n"
+	if !strings.Contains(legacy, wantLegacy) {
+		t.Errorf("empty-Category finding must render the legacy line:\nwant %q\n%s", wantLegacy, legacy)
+	}
+	if strings.Contains(legacy, "NEW AUDIT CATEGORY") {
+		t.Errorf("empty-Category finding must not render the audit-category line:\n%s", legacy)
+	}
+}
+
 // TestBuild_PlanReview_GateEvidence_ContradictionClauseRenders pins the
 // #1611 escape valve: the always-rendered header must carry the
 // evidence_conflict contradiction clause so a reviewer whose artifact

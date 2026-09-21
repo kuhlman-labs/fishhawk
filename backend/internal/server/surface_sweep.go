@@ -30,11 +30,16 @@ const categoryPlanSurfaceSweep = "plan_surface_sweep"
 // SubPlanTitle attributes the finding to a decomposition sub-plan when the
 // trigger came from that sub-plan's own scope.files rather than the flat
 // parent scope (#1077). Empty for parent-scope findings.
+//
+// Category is set ONLY by the prose-triggered audit-category rule (#3410,
+// audit_category_sweep.go): the unregistered audit category the plan named.
+// omitempty keeps every path-triggered finding's payload byte-identical.
 type SurfaceSweepFinding struct {
 	Pattern         string   `json:"pattern"`
 	TriggerPath     string   `json:"trigger_path"`
 	MissingSiblings []string `json:"missing_siblings"`
 	SubPlanTitle    string   `json:"sub_plan_title,omitempty"`
+	Category        string   `json:"category,omitempty"`
 }
 
 // CrossSliceClaim records which member files of a lockstep pattern one
@@ -571,6 +576,17 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 			}
 		}
 	}
+
+	// Audit-category rule (#3410): a prose-named audit category absent from
+	// audit.KnownCategories while backend/internal/audit/categories.go is in
+	// neither the top-level nor any sub-plan scope. Plan-level (no
+	// SubPlanTitle) because the mention is in the plan's own prose; carried in
+	// this same plan_surface_sweep entry so the rule introduces no category
+	// of its own. NOT a surfacePatterns entry: it is prose-triggered, not
+	// path-triggered, so the plan-prompt sibling map is unchanged.
+	catFindings, catApplied := evaluateAuditCategoryRule(parsedPlan, audit.IsKnownCategory, exemptions)
+	findings = append(findings, catFindings...)
+	applied = append(applied, catApplied...)
 
 	if findings == nil {
 		// Marshal an empty array rather than null so the audit payload's

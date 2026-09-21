@@ -4981,6 +4981,59 @@ func TestPlanGateEvidence_GeneratedSurfaceSeam(t *testing.T) {
 	}
 }
 
+// TestPlanGateEvidence_AuditCategorySeam mirrors the generated-surface seam
+// test for the #3410 audit-category rule: body → runSurfaceSweep →
+// planGateEvidence → prompt.Build(plan_review), asserting the rendered line
+// names the pattern, the token, the registry file and the verify-gate test.
+// A dropped Category copy in planGateEvidence fails at the rendered string
+// (the MISSING SIBLINGS line would render instead).
+func TestPlanGateEvidence_AuditCategorySeam(t *testing.T) {
+	s, _, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	body := auditCategoryPlanBody(t, []plan.ScopeFile{
+		{Path: "backend/internal/server/foo.go", Operation: plan.FileOpModify},
+	}, nil)
+
+	sweep := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+	if sweep == nil || len(sweep.Findings) != 1 || sweep.Findings[0].Category != "zz_never_registered_cat" {
+		t.Fatalf("runSurfaceSweep = %+v, want one audit-category finding", sweep)
+	}
+
+	ev := planGateEvidence(nil, sweep, nil, nil, nil)
+	if ev == nil || ev.SurfaceSweep == nil || len(ev.SurfaceSweep.Findings) != 1 {
+		t.Fatalf("planGateEvidence produced no SurfaceSweep evidence: %+v", ev)
+	}
+	if got := ev.SurfaceSweep.Findings[0].Category; got != "zz_never_registered_cat" {
+		t.Fatalf("SurfaceSweepFindingEvidence.Category = %q (a drop in planGateEvidence)", got)
+	}
+
+	parsedPlan, err := plan.Parse(body)
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	rendered, err := prompt.Build("plan_review", prompt.Trigger{
+		Repo:             "x/y",
+		ApprovedPlan:     parsedPlan,
+		PlanGateEvidence: ev,
+	})
+	if err != nil {
+		t.Fatalf("prompt.Build: %v", err)
+	}
+	for _, want := range []string{
+		"NEW AUDIT CATEGORY (new audit category requires registry)",
+		`"zz_never_registered_cat" (audit category "zz_never_registered_cat" named at approach step 1)`,
+		"backend/internal/audit/categories.go",
+		"TestKnownCategoriesCoversEmittedCategories",
+		`{pattern: "new audit category requires registry", sibling: "backend/internal/audit/categories.go"}`,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("plan-review prompt missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "MISSING SIBLINGS (new audit category requires registry)") {
+		t.Errorf("audit-category finding must not render as a MISSING SIBLINGS line:\n%s", rendered)
+	}
+}
+
 // stageTransitionSummary reports whether rr recorded a transition of stageID to
 // failed carrying FailureCategory B, and whether any advancement transition
 // (awaiting_approval or succeeded) was recorded for it.
