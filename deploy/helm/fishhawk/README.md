@@ -702,9 +702,11 @@ named mode), the migrate Job's timing and `restartPolicy`, the
 the derived ingress URLs, the Mode-1 half-configured fail-closed case,
 the OAuth-trio positive + OFF posture (r10) and one case per named
 `fishhawk.validateOAuthTrio` failure mode (r11), the `config.extraEnv`
-passthrough with its collision / identifier guards and an anti-drift
-loop pinning `fishhawk.managedConfigKeys` to the rendered ConfigMap
-(r12), a cross-boundary grep pinning the trio claim to `serve.go` (r13),
+passthrough with its collision / identifier guards and a BIDIRECTIONAL
+anti-drift pin between `fishhawk.managedConfigKeys` and the rendered
+ConfigMap — forward (r12: no emitted key escapes the list) and reverse
+(r12g: no stale/misspelled list entry survives undetected, #2969) — a
+cross-boundary grep pinning the trio claim to `serve.go` (r13),
 the GitLab family (r14), a **registry-existence check** over every
 third-party image the chart RENDERS (r15 — extracted from
 `helm template` output, classified by an anonymous Docker Hub
