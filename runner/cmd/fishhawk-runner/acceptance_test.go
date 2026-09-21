@@ -1523,11 +1523,28 @@ func TestRun_AcceptanceStage_OversizedVerdict_ShipsBounded(t *testing.T) {
 
 // TestRun_AcceptanceStage_UnderCapVerdict_ShipsByteIdentical: the common case
 // is untouched — no bounded event, and the shipped bytes are exactly the
-// redacted (transcript-injected) verdict.
+// validated + redacted verdict. The expected bytes are computed INDEPENDENTLY
+// of the ship (validateAcceptanceVerdict + redactAcceptanceVerdict over the
+// canned verdict with the fixture's served ids AC1/AC2 and an empty replay set
+// — the setup loads no corpus, so InjectReplay never runs), so the assertion
+// is against an oracle the ship site cannot influence rather than a re-bound
+// of the shipped capture compared with itself (E72.12 / #3458). The trace
+// bundle's acceptance_evidence payload is NOT a byte-safe oracle: encoding/json
+// compacts json.RawMessage on Marshal. Counterfactual: make the ship site alter
+// the bytes (ship a re-bound body from a tiny cap) → RED on bytes.Equal.
 func TestRun_AcceptanceStage_UnderCapVerdict_ShipsByteIdentical(t *testing.T) {
 	_, fu, args := acceptanceStageSetup(t)
 	verdict := []byte(`{"verdict":"passed",  "criteria":[{"id":"AC1","result":"passed","observed":"a <b> & c"}],"notes":"n"}`)
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: verdict}})
+
+	// Independent oracle, computed BEFORE run(): the same pure pipeline the
+	// runner applies, over the same inputs the fixture serves.
+	coerced, err := validateAcceptanceVerdict(verdict,
+		acceptanceServedVerdictIDs([]string{"AC1", "AC2"}, scenario.ReplaySet{}), func(string, string) {})
+	if err != nil {
+		t.Fatalf("oracle validate: %v", err)
+	}
+	expected, _ := redactAcceptanceVerdict(coerced)
 
 	var stderr strings.Builder
 	if got := run(args, &stderr); got != exitOK {
@@ -1539,14 +1556,9 @@ func TestRun_AcceptanceStage_UnderCapVerdict_ShipsByteIdentical(t *testing.T) {
 	if len(fu.acceptanceBodies) != 1 {
 		t.Fatalf("ShipAcceptance calls = %d, want 1", len(fu.acceptanceBodies))
 	}
-	// The verdict passes through validation/redaction (which may
-	// re-marshal); the bound itself must not alter the bytes that reach the
-	// ship — assert the shipped body decodes to the same value AND the
-	// ship-site bound of those bytes is a no-op.
 	shipped := fu.acceptanceBodies[0]
-	rebound, rep, err := upload.BoundAcceptanceVerdict(shipped, upload.MaxAcceptanceVerdictBytes)
-	if err != nil || rep.Bounded || !bytes.Equal(rebound, shipped) {
-		t.Fatalf("bound of the shipped body is not a no-op: rep=%+v err=%v", rep, err)
+	if !bytes.Equal(shipped, expected) {
+		t.Fatalf("shipped body differs from the independently computed validated+redacted verdict:\n got: %s\nwant: %s", shipped, expected)
 	}
 	var v struct {
 		Criteria []map[string]string `json:"criteria"`

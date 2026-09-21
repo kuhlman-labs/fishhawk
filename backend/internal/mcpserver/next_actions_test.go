@@ -2438,26 +2438,36 @@ func TestLatestAcceptanceSignals(t *testing.T) {
 func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 	// MUST match backend/internal/server/acceptance.go verbatim.
 	want := map[string]string{
-		"CategoryAcceptanceOutcomeRecorded": auditCategoryAcceptanceOutcomeRecorded,
-		"CategoryAcceptanceTriageDecided":   auditCategoryAcceptanceTriageDecided,
-		"acceptanceVerdictPassed":           acceptanceVerdictPassed,
-		"acceptanceVerdictFailed":           acceptanceVerdictFailed,
-		"acceptanceVerdictNotValidated":     acceptanceVerdictNotValidated,
-		"acceptanceVerdictUndecidable":      acceptanceVerdictUndecidable,
-		"fixup_dispatched":                  acceptanceDispositionFixupDispatched,
-		"retry_dispatched":                  acceptanceDispositionRetryDispatched,
-		"paged":                             acceptanceDispositionPaged,
-		"rerun_budget_exhausted":            acceptanceDispositionRerunBudget,
-		"fixup_unavailable_paged":           acceptanceDispositionFixupUnavailable,
-		"retry_unavailable_paged":           acceptanceDispositionRetryUnavailable,
-		"unsettled_paged":                   acceptanceDispositionUnsettled,
-		"externally_unvalidatable_paged":    acceptanceDispositionUnvalidatable,
+		"CategoryAcceptanceOutcomeRecorded":  auditCategoryAcceptanceOutcomeRecorded,
+		"CategoryAcceptanceTriageDecided":    auditCategoryAcceptanceTriageDecided,
+		"CategoryAcceptanceDispatched":       auditCategoryAcceptanceDispatched,
+		"CategoryAcceptanceReopened":         categoryAcceptanceReopened,
+		"CategoryAcceptanceVerdictUnshipped": auditCategoryAcceptanceVerdictUnshipped,
+		"acceptanceVerdictPassed":            acceptanceVerdictPassed,
+		"acceptanceVerdictFailed":            acceptanceVerdictFailed,
+		"acceptanceVerdictNotValidated":      acceptanceVerdictNotValidated,
+		"acceptanceVerdictUndecidable":       acceptanceVerdictUndecidable,
+		"fixup_dispatched":                   acceptanceDispositionFixupDispatched,
+		"retry_dispatched":                   acceptanceDispositionRetryDispatched,
+		"paged":                              acceptanceDispositionPaged,
+		"rerun_budget_exhausted":             acceptanceDispositionRerunBudget,
+		"fixup_unavailable_paged":            acceptanceDispositionFixupUnavailable,
+		"retry_unavailable_paged":            acceptanceDispositionRetryUnavailable,
+		"unsettled_paged":                    acceptanceDispositionUnsettled,
+		"externally_unvalidatable_paged":     acceptanceDispositionUnvalidatable,
 	}
 	expect := map[string]string{
 		"CategoryAcceptanceOutcomeRecorded": "acceptance_outcome_recorded",
 		"CategoryAcceptanceTriageDecided":   "acceptance_triage_decided",
-		"acceptanceVerdictPassed":           "passed",
-		"acceptanceVerdictFailed":           "failed",
+		// E72.12 / #3458: the two episode anchors and the marker they retire in
+		// latestAcceptanceVerdict's window walk. A rename on the server side with
+		// no mirror would silently stop retiring the marker (the fold keeps
+		// classifying acceptance_verdict_unshipped after a retry re-open).
+		"CategoryAcceptanceDispatched":       "acceptance_dispatched",
+		"CategoryAcceptanceReopened":         "acceptance_reopened",
+		"CategoryAcceptanceVerdictUnshipped": "acceptance_verdict_unshipped",
+		"acceptanceVerdictPassed":            "passed",
+		"acceptanceVerdictFailed":            "failed",
 		// #2347: the SERVER-INTERNAL third verdict. Pinned here because the MCP
 		// mirrors rather than imports it (#875) — a rename on the plan/server side
 		// with no mirror silently routes every short-circuited run into the
@@ -2571,11 +2581,14 @@ func naUnshippedEntry(seq int64) AuditEntry {
 
 // TestLatestAcceptanceVerdict_UnshippedMarker pins the E72.11 / #3447 fold of
 // the unshipped marker into the recent-window verdict signal: the walk is
-// newest-first, and whichever of {acceptance_outcome_recorded,
+// newest-first, and whichever of {acceptance_outcome_recorded, LIVE
 // acceptance_verdict_unshipped} is hit FIRST decides — a marker newer than
 // every outcome yields the classifier-local sentinel; an outcome newer than
 // the marker yields that outcome's verdict (the verdict shipped after all, or
-// a later episode shipped one); a window with no marker is unchanged.
+// a later episode shipped one); a window with no marker is unchanged. The
+// anchor-retirement half of the fold (E72.12 / #3458 — no anchor appears in
+// these windows, so every marker here is live) is pinned separately by
+// TestLatestAcceptanceVerdict_MarkerRetiredByAnchor.
 func TestLatestAcceptanceVerdict_UnshippedMarker(t *testing.T) {
 	// Marker newest (run-8b911565 shape: a stale first-attempt passed outcome
 	// below a newer marker).
@@ -2648,6 +2661,183 @@ func TestNextActions_AcceptanceVerdictUnshipped(t *testing.T) {
 		na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, verdict, "", releaseSignals{})
 		if na == nil || na.State != "acceptance_settled_outcome_unknown" {
 			t.Fatalf("state = %+v, want acceptance_settled_outcome_unknown", na)
+		}
+	})
+}
+
+// naAnchorEntry builds an acceptance_dispatched / acceptance_reopened episode
+// anchor at the given sequence, stage-scoped when stageID is non-empty and
+// UNSCOPED (nil StageID) otherwise.
+func naAnchorEntry(category string, seq int64, stageID string) AuditEntry {
+	e := AuditEntry{Category: category, Sequence: seq}
+	if stageID != "" {
+		sid := stageID
+		e.StageID = &sid
+	}
+	return e
+}
+
+// naScopedUnshippedEntry is naUnshippedEntry scoped to a stage.
+func naScopedUnshippedEntry(seq int64, stageID string) AuditEntry {
+	e := naUnshippedEntry(seq)
+	sid := stageID
+	e.StageID = &sid
+	return e
+}
+
+// TestLatestAcceptanceVerdict_MarkerRetiredByAnchor pins the E72.12 / #3458
+// anchor-aware fold: an acceptance_dispatched / acceptance_reopened anchor
+// seen ABOVE a marker (newer) that is unscoped or scoped to the marker's stage
+// RETIRES the marker, so the walk continues to an older outcome (its verdict
+// decides) or ends at "" (settled-outcome-unknown). An anchor OLDER than the
+// marker retires nothing (the run-8b911565 live shape). The marker is tested
+// against EVERY anchor seen above it, not only the newest — the binding
+// condition-1 rows. Counterfactual: revert the marker case to an unconditional
+// return → every "" row goes RED; keep only the NEWEST anchor → the
+// dispatch(B,12)/reopen(A,11)/marker(A,9) row goes RED.
+func TestLatestAcceptanceVerdict_MarkerRetiredByAnchor(t *testing.T) {
+	const stageA, stageB = "stage-a", "stage-b"
+	dispatched := func(seq int64, stage string) AuditEntry {
+		return naAnchorEntry(auditCategoryAcceptanceDispatched, seq, stage)
+	}
+	reopened := func(seq int64, stage string) AuditEntry {
+		return naAnchorEntry(categoryAcceptanceReopened, seq, stage)
+	}
+	cases := []struct {
+		name   string
+		recent []AuditEntry
+		want   string
+	}{
+		{"dispatch(11)/reopen(10)/marker(9) → retired, no older outcome",
+			[]AuditEntry{dispatched(11, stageA), reopened(10, stageA), naScopedUnshippedEntry(9, stageA)}, ""},
+		{"dispatch(11)/reopen(10)/marker(9)/outcome(5,passed) → retired, older outcome decides",
+			[]AuditEntry{dispatched(11, stageA), reopened(10, stageA), naScopedUnshippedEntry(9, stageA), naOutcomeEntry(5, acceptanceVerdictPassed)}, acceptanceVerdictPassed},
+		{"reopen(10) alone above marker(9) → retired",
+			[]AuditEntry{reopened(10, stageA), naScopedUnshippedEntry(9, stageA)}, ""},
+		{"dispatch(11) alone above marker(9) → retired",
+			[]AuditEntry{dispatched(11, stageA), naScopedUnshippedEntry(9, stageA)}, ""},
+		{"marker(12) above dispatch(11)/reopen(10) → live (older anchors retire nothing)",
+			[]AuditEntry{naScopedUnshippedEntry(12, stageA), dispatched(11, stageA), reopened(10, stageA)}, acceptanceVerdictUnshipped},
+		{"anchor(11) scoped to stage B above marker(9) scoped to stage A → live (stage mismatch)",
+			[]AuditEntry{dispatched(11, stageB), naScopedUnshippedEntry(9, stageA)}, acceptanceVerdictUnshipped},
+		{"unscoped anchor above a scoped marker → retired (fail toward read)",
+			[]AuditEntry{dispatched(11, ""), naScopedUnshippedEntry(9, stageA)}, ""},
+		{"unscoped anchor above an unscoped marker → retired",
+			[]AuditEntry{reopened(11, ""), naUnshippedEntry(9)}, ""},
+		{"scoped anchor above an unscoped marker → retired",
+			[]AuditEntry{dispatched(11, stageA), naUnshippedEntry(9)}, ""},
+		// Binding condition 1: EVERY anchor seen above the marker is tested,
+		// not only the newest. The newest anchor (dispatch, stage B) does not
+		// match, but the older reopen (stage A) does → retired.
+		{"dispatch(B,12)/reopen(A,11)/marker(A,9) → retired by the non-newest same-stage anchor",
+			[]AuditEntry{dispatched(12, stageB), reopened(11, stageA), naScopedUnshippedEntry(9, stageA)}, ""},
+		{"dispatch(B,12)/marker(A,9) → live (the only anchor is another stage's)",
+			[]AuditEntry{dispatched(12, stageB), naScopedUnshippedEntry(9, stageA)}, acceptanceVerdictUnshipped},
+		{"outcome(13) above dispatch(11)/marker(9) → outcome wins (un-anchored)",
+			[]AuditEntry{naOutcomeEntry(13, acceptanceVerdictFailed), dispatched(11, stageA), naScopedUnshippedEntry(9, stageA)}, acceptanceVerdictFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := latestAcceptanceVerdict(tc.recent); got != tc.want {
+				t.Errorf("latestAcceptanceVerdict = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNextActions_AcceptanceVerdictUnshipped_RetiredByAnchor drives the
+// retired shape end to end through nextActionsFor on a RUNNING run with a
+// succeeded acceptance stage: dispatch(11)/reopen(10)/marker(9) classifies
+// acceptance_settled_outcome_unknown (matching the backend gate), never
+// acceptance_verdict_unshipped and never a merge action.
+func TestNextActions_AcceptanceVerdictUnshipped_RetiredByAnchor(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naLocalRun("running")
+	run.PullRequestURL = &prURL
+	stages := naAcceptanceStages("succeeded")
+	acceptanceID := stages[2].ID
+	verdict := latestAcceptanceVerdict([]AuditEntry{
+		naAnchorEntry(auditCategoryAcceptanceDispatched, 11, acceptanceID),
+		naAnchorEntry(categoryAcceptanceReopened, 10, acceptanceID),
+		naScopedUnshippedEntry(9, acceptanceID),
+	})
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, verdict, "", releaseSignals{})
+	if na == nil || na.State != "acceptance_settled_outcome_unknown" {
+		t.Fatalf("state = %+v, want acceptance_settled_outcome_unknown (retired marker)", na)
+	}
+	for _, a := range na.Actions {
+		if a.Action == "approve_pr" || a.Action == "merge_pr" || a.Action == "fishhawk_merge_run" {
+			t.Fatalf("merge ritual action %q surfaced on a retired unshipped marker", a.Action)
+		}
+	}
+}
+
+// TestNextActions_SucceededAcceptanceVerdictUnshipped_NoMerge pins the E72.12 /
+// #3458 terminal-run twin: a TERMINAL succeeded run with an open PR whose
+// newest acceptance signal is a live marker classifies
+// succeeded_acceptance_verdict_unshipped — list_audit on the marker, then
+// retry_stage on the acceptance stage, NEVER approve_pr / merge_pr /
+// fishhawk_merge_run. Control: an outcome NEWER than the marker classifies
+// succeeded_pr_open with the merge ritual intact. Counterfactual: delete the
+// twin branch in classifyNextActions → the run falls to succeeded_pr_open and
+// the state + no-merge assertions go RED.
+func TestNextActions_SucceededAcceptanceVerdictUnshipped_NoMerge(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naLocalRun("succeeded")
+	run.PullRequestURL = &prURL
+	stages := naAcceptanceStages("succeeded")
+	acceptanceID := stages[2].ID
+
+	t.Run("marker newest → twin arm, no merge", func(t *testing.T) {
+		verdict := latestAcceptanceVerdict([]AuditEntry{naUnshippedEntry(20), naOutcomeEntry(10, acceptanceVerdictPassed)})
+		na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, verdict, "", releaseSignals{})
+		if na == nil || na.State != "succeeded_acceptance_verdict_unshipped" {
+			t.Fatalf("state = %+v, want succeeded_acceptance_verdict_unshipped", na)
+		}
+		if len(na.Actions) < 2 {
+			t.Fatalf("actions = %+v, want list_audit then retry_stage", na.Actions)
+		}
+		if na.Actions[0].Action != "fishhawk_list_audit" || na.Actions[0].Params["category"] != auditCategoryAcceptanceVerdictUnshipped {
+			t.Errorf("actions[0] = %+v, want fishhawk_list_audit on category %q", na.Actions[0], auditCategoryAcceptanceVerdictUnshipped)
+		}
+		if na.Actions[1].Action != "fishhawk_retry_stage" || na.Actions[1].Params["stage_id"] != acceptanceID {
+			t.Errorf("actions[1] = %+v, want fishhawk_retry_stage on the acceptance stage %q", na.Actions[1], acceptanceID)
+		}
+		for _, a := range na.Actions {
+			if a.Action == "approve_pr" || a.Action == "merge_pr" || a.Action == "fishhawk_merge_run" {
+				t.Fatalf("merge ritual action %q surfaced on a succeeded run with an unshipped acceptance verdict", a.Action)
+			}
+		}
+		for _, want := range []string{"succeeded", "never shipped", "409", "retry_stage"} {
+			if !strings.Contains(na.Actions[0].Reason, want) {
+				t.Errorf("read-action reason lacks %q: %s", want, na.Actions[0].Reason)
+			}
+		}
+	})
+	t.Run("acceptance stage absent → list_audit only, still no merge", func(t *testing.T) {
+		verdict := latestAcceptanceVerdict([]AuditEntry{naUnshippedEntry(20)})
+		na := nextActionsFor(run, naAcceptanceStages("succeeded")[:2], nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, verdict, "", releaseSignals{})
+		if na == nil || na.State != "succeeded_acceptance_verdict_unshipped" {
+			t.Fatalf("state = %+v, want succeeded_acceptance_verdict_unshipped", na)
+		}
+		if len(na.Actions) != 1 || na.Actions[0].Action != "fishhawk_list_audit" {
+			t.Fatalf("actions = %+v, want the single list_audit read", na.Actions)
+		}
+	})
+	t.Run("control: outcome newer than marker → succeeded_pr_open with the merge ritual", func(t *testing.T) {
+		verdict := latestAcceptanceVerdict([]AuditEntry{naOutcomeEntry(30, acceptanceVerdictPassed), naUnshippedEntry(20)})
+		na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, verdict, "", releaseSignals{})
+		if na == nil || na.State != "succeeded_pr_open" {
+			t.Fatalf("state = %+v, want succeeded_pr_open", na)
+		}
+		merge := false
+		for _, a := range na.Actions {
+			if a.Action == "fishhawk_merge_run" {
+				merge = true
+			}
+		}
+		if !merge {
+			t.Errorf("merge ritual missing on the control: %+v", na.Actions)
 		}
 	})
 }
