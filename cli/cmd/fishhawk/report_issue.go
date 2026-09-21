@@ -29,11 +29,21 @@ type productReportRequest struct {
 }
 
 type productReport struct {
-	Fingerprint string `json:"fingerprint"`
-	Action      string `json:"action"`
-	Number      int    `json:"number"`
-	URL         string `json:"url"`
-	Destination string `json:"destination"`
+	Fingerprint      string             `json:"fingerprint"`
+	Action           string             `json:"action"`
+	Number           int                `json:"number"`
+	URL              string             `json:"url"`
+	Destination      string             `json:"destination"`
+	FingerprintBasis productReportBasis `json:"fingerprint_basis"`
+}
+
+// productReportBasis mirrors the backend's fingerprint_basis object (#3233):
+// what the dedup fingerprint was keyed on. An older fishhawkd omits it, so it
+// decodes to the zero value and the `matched on:` line renders empty.
+type productReportBasis struct {
+	Kind          string   `json:"kind"`
+	Components    []string `json:"components"`
+	DedupSearched bool     `json:"dedup_searched"`
 }
 
 // reportIssueHTTPDo is the HTTP seam for the report-issue verb. Tests swap
@@ -179,6 +189,13 @@ func printProductReport(w io.Writer, r *productReport) {
 	}
 	_, _ = fmt.Fprintf(w, "  action:      %s\n", r.Action)
 	_, _ = fmt.Fprintf(w, "  fingerprint: %s\n", r.Fingerprint)
+	if r.FingerprintBasis.Kind != "" {
+		_, _ = fmt.Fprintf(w, "  matched on:  %s (%s)\n",
+			r.FingerprintBasis.Kind, strings.Join(r.FingerprintBasis.Components, ", "))
+		if !r.FingerprintBasis.DedupSearched {
+			_, _ = fmt.Fprintf(w, "  dedup:       not searched (healthy run, no free text) — filed fresh\n")
+		}
+	}
 	_, _ = fmt.Fprintf(w, "  destination: %s\n", r.Destination)
 	_, _ = fmt.Fprintf(w, "  url:         %s\n", r.URL)
 }

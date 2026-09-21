@@ -26,6 +26,14 @@ The redaction contract holds by construction, on the same idiom as `FailureDetai
 
 The class is a fourth fingerprint component (`fingerprint.go`), included ONLY when non-empty, so it splits distinct root causes that share a failing surface (#1962) while keeping every unclassified failure's pre-change 3-component fingerprint.
 
+## Report fingerprint (#3233)
+
+`fingerprint.go` also carries the report-shape fingerprint keying the product-report egress uses:
+
+- `FingerprintOf(components ...string)` — the generic primitive: normalize each component (trim + lowercase), NUL-join, SHA-256, first 12 hex. `Fingerprint(errorCode, surface, detailClass, versionFamily)` delegates to it (dropping an empty detail class first), so the failure digest is **byte-identical** to the pre-change value — every open deduped failure report keeps matching.
+- `DescriptionDigest(text)` — SHA-256 (12 hex) of the description after TrimSpace + ToLower + collapsing every Unicode-whitespace run to one space; `""` for all-whitespace. A DIGEST, never the text, and the caller passes the REDACTED description, so no free text or secret-derived material enters the fingerprint.
+- `ReportFingerprint(bundle, redactedDescription) (fingerprint, FingerprintBasis)` — keys by report SHAPE. A **failing** run → the unchanged failure tuple (`kind: failure`, `dedup_searched: true`; the description is deliberately NOT hashed, so the same failure on the same workflow still dedups). A **healthy** run WITH consented free text → `(run_state, workflow_id, description_digest, version_family)` (`kind: healthy_description`, `dedup_searched: true`). A **healthy** run with NO free text → `(run_state, workflow_id, run_id, version_family)` (`kind: healthy_unique`, `dedup_searched: false`; the handler skips the dedup search and files fresh — the run id makes the marker unique per run, so no later report can collide onto it). `FingerprintBasis{Kind, Components, DedupSearched}` names what was hashed so the response, audit payload, report body and occurrence comment can show the keying. A failure tuple (single-letter category first) and a healthy tuple (run-state word first) cannot collide by concatenation across the NUL separator.
+
 ## Read handler and consumers
 
 Read handler: `backend/internal/server/diagnostics.go::handleGetRunDiagnostics` loads run + stages + audit (`GetRun` / `ListStagesForRun` / `ListForRun`) and returns the bundle; pure read, no egress.

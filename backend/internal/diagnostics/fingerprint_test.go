@@ -83,6 +83,157 @@ func TestFingerprint_NoConcatenationCollision(t *testing.T) {
 	}
 }
 
+// TestFingerprint_DelegatesToFingerprintOf pins that Fingerprint produces the
+// exact byte value FingerprintOf does over the same components (the empty
+// detail class collapses to the 3-component form, a set class to the
+// 4-component form) — the backward-compatibility contract for every open
+// deduped report. FingerprintOf is the primitive Fingerprint delegates to, so
+// a change to the normalize/NUL-join order that broke compatibility would
+// break this equality.
+func TestFingerprint_DelegatesToFingerprintOf(t *testing.T) {
+	// 3-component (empty detail class): matches the legacy 3-component digest.
+	if got, want := Fingerprint("C", "fixup_base_checkout", "", "v0.4"),
+		FingerprintOf("C", "fixup_base_checkout", "v0.4"); got != want {
+		t.Errorf("3-component: Fingerprint = %q, FingerprintOf = %q", got, want)
+	}
+	if got, want := Fingerprint("C", "fixup_base_checkout", "", "v0.4"),
+		legacyThreeComponentDigest("C", "fixup_base_checkout", "v0.4"); got != want {
+		t.Errorf("3-component: Fingerprint = %q, legacy golden = %q", got, want)
+	}
+	// 4-component (set detail class): matches FingerprintOf over the 4 parts.
+	if got, want := Fingerprint("C", "fixup_base_checkout", "auth-401", "v0.4"),
+		FingerprintOf("C", "fixup_base_checkout", "auth-401", "v0.4"); got != want {
+		t.Errorf("4-component: Fingerprint = %q, FingerprintOf = %q", got, want)
+	}
+}
+
+// TestDescriptionDigest pins the whitespace/case invariance, the difference
+// across distinct text, and the empty-on-whitespace contract (#3233).
+func TestDescriptionDigest(t *testing.T) {
+	a := DescriptionDigest("The planner mis-ordered my stages")
+	b := DescriptionDigest("  the  PLANNER   mis-ordered\tmy\nstages ")
+	if a != b {
+		t.Errorf("case/whitespace variants must digest identically: %q != %q", a, b)
+	}
+	if a == "" {
+		t.Error("a non-empty description must produce a non-empty digest")
+	}
+	if DescriptionDigest("a different description") == a {
+		t.Error("distinct descriptions must digest differently")
+	}
+	for _, ws := range []string{"", "   ", "\t\n ", "   "} {
+		if got := DescriptionDigest(ws); got != "" {
+			t.Errorf("DescriptionDigest(%q) = %q, want empty", ws, got)
+		}
+	}
+}
+
+// healthyBundle builds a no-failing-stage bundle for the ReportFingerprint
+// table.
+func healthyBundle(runID, workflowID string) DiagnosticBundle {
+	return DiagnosticBundle{
+		RunID:      runID,
+		WorkflowID: workflowID,
+		RunState:   "running",
+		Versions:   VersionFacts{Fishhawkd: Component{Version: "0.4.2"}},
+	}
+}
+
+// TestReportFingerprint pins the three keyings, their Components lists, the
+// DedupSearched flag, and the cross-workflow / cross-run / cross-description
+// discrimination (#3233).
+func TestReportFingerprint(t *testing.T) {
+	// Failure keying: ignores the description, lists detail class only when set.
+	failing := DiagnosticBundle{
+		RunID:      "run-1",
+		WorkflowID: "feature_change",
+		RunState:   "failed",
+		FailingStage: &FailingStage{
+			Type:            "implement",
+			FailureCategory: "B",
+			FailureSurface:  "scope_violation",
+		},
+		Versions: VersionFacts{Fishhawkd: Component{Version: "0.4.2"}},
+	}
+	fpNoText, basisNoText := ReportFingerprint(failing, "")
+	fpText, _ := ReportFingerprint(failing, "some operator prose")
+	if fpNoText != fpText {
+		t.Errorf("failure keying must ignore the description: %q != %q", fpNoText, fpText)
+	}
+	if basisNoText.Kind != FingerprintKindFailure || basisNoText.DedupSearched != true {
+		t.Errorf("failure basis = %+v, want kind=failure dedup_searched=true", basisNoText)
+	}
+	if got, want := basisNoText.Components, []string{"failure_category", "failure_surface", "version_family"}; !slicesEqual(got, want) {
+		t.Errorf("failure components (no detail class) = %v, want %v", got, want)
+	}
+	withClass := failing
+	fs := *failing.FailingStage
+	fs.FailureDetailClass = "auth-401"
+	withClass.FailingStage = &fs
+	_, basisClass := ReportFingerprint(withClass, "")
+	if got, want := basisClass.Components, []string{"failure_category", "failure_surface", "failure_detail_class", "version_family"}; !slicesEqual(got, want) {
+		t.Errorf("failure components (detail class) = %v, want %v", got, want)
+	}
+
+	// Healthy, different workflow -> different fingerprint under BOTH healthy
+	// kinds. No description -> healthy_unique.
+	uA, basisUA := ReportFingerprint(healthyBundle("run-x", "backlog_grooming"), "")
+	uB, basisUB := ReportFingerprint(healthyBundle("run-x", "feature_change"), "")
+	if uA == uB {
+		t.Errorf("healthy_unique fingerprints must differ by workflow: both %q", uA)
+	}
+	if basisUA.Kind != FingerprintKindHealthyUnique || basisUA.DedupSearched != false {
+		t.Errorf("healthy_unique basis = %+v, want kind=healthy_unique dedup_searched=false", basisUA)
+	}
+	if got, want := basisUA.Components, []string{"run_state", "workflow_id", "run_id", "version_family"}; !slicesEqual(got, want) {
+		t.Errorf("healthy_unique components = %v, want %v", got, want)
+	}
+	_ = basisUB
+	// healthy_unique differs across two run ids.
+	uR1, _ := ReportFingerprint(healthyBundle("run-1", "feature_change"), "")
+	uR2, _ := ReportFingerprint(healthyBundle("run-2", "feature_change"), "")
+	if uR1 == uR2 {
+		t.Errorf("healthy_unique fingerprints must differ by run id: both %q", uR1)
+	}
+
+	// With a description -> healthy_description, keyed on the digest. Different
+	// workflows differ; same workflow + normalized-same description matches.
+	dA, basisD := ReportFingerprint(healthyBundle("run-a", "backlog_grooming"), "grooming apply lost the tail")
+	dB, _ := ReportFingerprint(healthyBundle("run-b", "feature_change"), "grooming apply lost the tail")
+	if dA == dB {
+		t.Errorf("healthy_description fingerprints must differ by workflow: both %q", dA)
+	}
+	if basisD.Kind != FingerprintKindHealthyDescription || basisD.DedupSearched != true {
+		t.Errorf("healthy_description basis = %+v, want kind=healthy_description dedup_searched=true", basisD)
+	}
+	if got, want := basisD.Components, []string{"run_state", "workflow_id", "description_digest", "version_family"}; !slicesEqual(got, want) {
+		t.Errorf("healthy_description components = %v, want %v", got, want)
+	}
+	same1, _ := ReportFingerprint(healthyBundle("run-p", "backlog_grooming"), "The Same Text")
+	same2, _ := ReportFingerprint(healthyBundle("run-q", "backlog_grooming"), "  the   same    text ")
+	if same1 != same2 {
+		t.Errorf("same workflow + normalized-same description must match: %q != %q", same1, same2)
+	}
+	diff, _ := ReportFingerprint(healthyBundle("run-r", "backlog_grooming"), "a wholly different description")
+	if diff == same1 {
+		t.Errorf("same workflow + different description must differ: both %q", diff)
+	}
+}
+
+// slicesEqual is a local string-slice equality helper (the package targets a
+// go.mod pin without slices.Equal guaranteed in scope).
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestVersionFamily(t *testing.T) {
 	cases := map[string]string{
 		"v0.4.2":   "v0.4",
