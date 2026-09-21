@@ -1,0 +1,14 @@
+id: scenario:issue-1516/initialize-instructions-point-at-skill
+statement: The MCP initialize response's instructions field names the `fishhawk://onboarding-skill` resource as the entry point for onboarding a new repository, alongside the existing `fishhawk://runbook` pointer.
+verify_hint: 'MCP surface: read InitializeResult.instructions from a session against the preview''s /mcp endpoint and check it contains fishhawk://onboarding-skill and fishhawk://runbook.'
+steps: The preview's /mcp speaks the sessionless 2026-07-28 protocol (initialize answers -32601 method not found); the instructions field is served by server/discover. Called POST http://localhost:8090/mcp server/discover (Mcp-Protocol-Version 2026-07-28, Mcp-Method server/discover, params._meta) with the operator bearer and read result.instructions. Cross-checked by building bin/fishhawk-mcp from the sanctioned checkout (cd backend && go build -o /tmp/fh1516/fishhawk-mcp ./cmd/fishhawk-mcp) and sending a JSON-RPC initialize (protocolVersion 2025-06-18) over stdio with FISHHAWK_BACKEND_URL=http://localhost:8090 FISHHAWK_API_TOKEN=<bearer>, reading InitializeResult.instructions.
+assertions:
+    expected: instructions names fishhawk://onboarding-skill as the onboarding entry point alongside the existing fishhawk://runbook pointer.
+    observed_at_record: 'server/discover result: serverInfo fishhawk-mcp v0.1.0+806e41cf; instructions 4990 bytes containing ''Read the fishhawk://runbook resource for the full procedure and the edge-case playbook …'' and ''Onboarding a NEW repository (no .fishhawk/workflows.yaml yet): read the fishhawk://onboarding-skill resource — a Claude Code SKILL.md-shaped walk through fishhawk_doctor → fishhawk_init → commit the spec.'' The stdio InitializeResult.instructions (serverInfo fishhawk-mcp v0.1.0, protocolVersion 2025-06-18) is byte-identical to the /mcp instructions and contains both URIs.'
+    repro_handle: /tmp/fh1516/mcp.py server/discover '{}' | python3 -c 'import sys,json;i=json.load(sys.stdin)["result"]["instructions"];print("fishhawk://onboarding-skill" in i, "fishhawk://runbook" in i)'
+origin:
+    issue: 1516
+    pr: 3571
+    run_id: 87804aa4-18e4-4dfd-a1c7-5056e85cc582
+    head_sha: 806e41cf4f3322972947f1c0de545cf86f6aafff
+    recorded_at: 2026-09-21T18:37:53Z

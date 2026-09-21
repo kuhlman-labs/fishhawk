@@ -38,7 +38,9 @@ Refinement intake (separate from the run loop): when you have a natural-language
 
 Backlog grooming (also separate from the run loop): backlog_grooming is a NON-DIFF workflow — it proposes tracker mutations and parks at an approval gate. Approving that gate EXECUTES the approved mutations server-side; there is no separate apply step, so read the grooming report BEFORE you approve. Start it with trigger_source:on_demand (omit it and applies_to refuses the workflow and the run never starts) and drive its propose stage with the stage TYPE plan, not the stage id. See the runbook's "Backlog grooming loop" section.
 
-Read the fishhawk://runbook resource for the full procedure and the edge-case playbook (local-drive dispatch, fixup re-dispatch, failed-run revive, decomposed-parent fan-out (run_children/consolidate_slices), drive_run loop shape, batch-as-campaign local drive (start_campaign/start_campaign_item_run/get_campaign_status), scope amendments, heterogeneous-review waits, post-failure clean-tree, refinement intake loop, backlog grooming loop).`
+Read the fishhawk://runbook resource for the full procedure and the edge-case playbook (local-drive dispatch, fixup re-dispatch, failed-run revive, decomposed-parent fan-out (run_children/consolidate_slices), drive_run loop shape, batch-as-campaign local drive (start_campaign/start_campaign_item_run/get_campaign_status), scope amendments, heterogeneous-review waits, post-failure clean-tree, refinement intake loop, backlog grooming loop).
+
+Onboarding a NEW repository (no .fishhawk/workflows.yaml yet): read the fishhawk://onboarding-skill resource — a Claude Code SKILL.md-shaped walk through fishhawk_doctor → fishhawk_init → commit the spec.`
 
 // runbookMarkdown is the long-form operator runbook, embedded as a
 // product file so the binary serves it without a filesystem dependency.
@@ -49,16 +51,29 @@ Read the fishhawk://runbook resource for the full procedure and the edge-case pl
 //go:embed runbook.md
 var runbookMarkdown string
 
+// onboardingSkillMarkdown is the SKILL.md-shaped onboarding walk, embedded
+// as a product file for the same reason runbookMarkdown is: the binary
+// serves it without a filesystem dependency. A renamed or missing
+// onboarding_skill.md is a build-time failure (the //go:embed directive),
+// and an empty file is caught by the unit assertion in onboarding_test.go.
+//
+//go:embed onboarding_skill.md
+var onboardingSkillMarkdown string
+
 // runbookURI is the MCP resource URI the runbook is served under. The
 // fishhawk:// scheme is non-empty and absolute, so srv.AddResource
 // accepts it (it panics only on an invalid or empty-scheme URI).
 const runbookURI = "fishhawk://runbook"
 
-// registerOnboardingResources registers the readable fishhawk://runbook
-// resource on srv. It is called on the single shared construction path
-// (newServer) so the resource is transport-neutral — it crosses the
-// registration->transport seam identically on the stdio and
-// streamable-HTTP transports.
+// onboardingSkillURI is the MCP resource URI the onboarding skill is
+// served under — a distinct fishhawk:// URI from runbookURI.
+const onboardingSkillURI = "fishhawk://onboarding-skill"
+
+// registerOnboardingResources registers the readable fishhawk://runbook and
+// fishhawk://onboarding-skill resources on srv. It is called on the single
+// shared construction path (newServer) so both resources are
+// transport-neutral — they cross the registration->transport seam
+// identically on the stdio and streamable-HTTP transports.
 func registerOnboardingResources(srv *mcp.Server) {
 	srv.AddResource(
 		&mcp.Resource{
@@ -74,6 +89,24 @@ func registerOnboardingResources(srv *mcp.Server) {
 					URI:      runbookURI,
 					MIMEType: "text/markdown",
 					Text:     runbookMarkdown,
+				}},
+			}, nil
+		},
+	)
+	srv.AddResource(
+		&mcp.Resource{
+			URI:         onboardingSkillURI,
+			Name:        "fishhawk-onboarding-skill",
+			Title:       "Fishhawk repository onboarding skill",
+			Description: "A Claude Code SKILL.md-shaped walk through fishhawk_doctor → fishhawk_init → committing the spec, for onboarding a repository that has no .fishhawk/workflows.yaml yet.",
+			MIMEType:    "text/markdown",
+		},
+		func(_ context.Context, _ *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			return &mcp.ReadResourceResult{
+				Contents: []*mcp.ResourceContents{{
+					URI:      onboardingSkillURI,
+					MIMEType: "text/markdown",
+					Text:     onboardingSkillMarkdown,
 				}},
 			}, nil
 		},

@@ -87,14 +87,17 @@ A connecting client whose agent holds no operator memory gets enough to drive a 
 
 - **Non-empty server `instructions`** — returned on every MCP `initialize`. A concise happy-path verb sequence (`fishhawk_start_run` → `fishhawk_run_stage` plan → `fishhawk_approve_plan` → `fishhawk_dispatch_stage` implement → `fishhawk_await_review` → the acceptance stage when declared → approve PR → merge → post-merge) plus the gate semantics that decide when each verb is legal (don't approve before plan review clears, wait for all configured reviewers, operator-gated scope amendments, a failed acceptance verdict leaves the stage succeeded and routes through deterministic triage, `next_actions` is authoritative). Plus two pointers to the loops that are NOT the run loop: refinement intake (`fishhawk_draft_epic`) and **backlog grooming** — the latter stating in-band that `backlog_grooming` is non-diff, that approving its gate EXECUTES the tracker mutations server-side with no separate apply step, and that `trigger_source:on_demand` is required to start it, so the write hazard reaches a reader who never opens the resource. Kept deliberately short; the long form lives in the runbook resource it points at.
 - **`fishhawk://runbook` resource** — a listable/readable `text/markdown` resource carrying the full loop-driving procedure (the ADR-040 operator-role contract) and the edge-case playbook: `runner_kind:local` for the local dogfood loop, failed-run revive (`fishhawk_revive_run`, incl. the re-parked-acceptance pre-dispatch check), the decomposed-parent native path (`fishhawk_run_children` → `fishhawk_consolidate_slices`, never `fishhawk_dispatch_stage` on an `awaiting_children` parent), the `fishhawk_drive_run` loop shape (gate-ordered dispatch, delegated plan approval, `awaiting_host_dispatch` auto-dispatch, and its `decision_required`/`paged`/`dispatched_stale` stops), the acceptance stage (E31.9 — advisory runner-hosted validator against a preview you provision; verdict-vs-stage-state; deterministic triage table; the local-runner explicit-re-dispatch rule; paged arbitration), local-drive fixup requiring an explicit `fishhawk_dispatch_stage` to spawn the runner, the scope-amendment decide/naming flow, heterogeneous-review two-verdict waits, post-failure clean-tree discipline, and the **backlog grooming loop** (E54.35 — a non-diff workflow that leads with the write hazard: `fishhawk_approve_plan` on a grooming gate EXECUTES the approved mutations server-side and the gate IS the apply trigger, so the report is read BEFORE approving; then `trigger_source:on_demand`, the stage-TYPE `plan` vs stage-id distinction, the action matrix deciding which classes act — `hygiene` the one auto-eligible class under `objective_reversible`, `ordering`/`dedup`/`scoping` refused `mode: auto` at parse time and left as proposals, with an escalation `max_autonomy` ceiling clamping further — verifying applied mutations on the FORGE rather than from the run summary, and seeding a campaign from an approved order via `grooming_run_id` with its four refusals). The grooming section is deliberately repo-agnostic: it describes the MECHANISM and carries no owner, org or forge URL, since the runbook ships to every connecting repository.
+- **`fishhawk://onboarding-skill` resource** (E29.6 / #1516) — a second listable/readable `text/markdown` resource: a Claude Code SKILL.md-shaped document (YAML frontmatter `name`/`description`, then a body) walking `fishhawk_doctor` → read the readiness rungs → `fishhawk_init` → write `workflow_yaml` to `.fishhawk/workflows.yaml` → re-run `fishhawk_doctor` until `spec.valid` → the operator commits and opens the PR under their own identity (ADR-040) → the first `fishhawk_start_run`. Repo-agnostic like the grooming section — no owner, org or forge URL — because it ships with the binary to every connecting repository, including one with no fishhawk files yet. Carries a one-line install hint: copy the resource to `.claude/skills/fishhawk-onboarding/SKILL.md` in the target repo to make it a standing project skill there.
 
-Both register in the single shared `newServer` construction path (`onboarding.go`, content in `runbook.md`), so they are **transport-neutral** — identical over stdio and streamable-HTTP, and they carry into the #655 gateway unchanged.
+Both `onboardingInstructions` and the `fishhawk://runbook` resource point at `fishhawk://onboarding-skill` so a connecting session discovers it without operator memory.
+
+All three register in the single shared `newServer` construction path (`onboarding.go`, content in `runbook.md` and `onboarding_skill.md`), so they are **transport-neutral** — identical over stdio and streamable-HTTP, and they carry into the #655 gateway unchanged.
 
 Implementation: `onboardingInstructions` is wired into `buildServer`'s `mcp.ServerOptions{Instructions: …}` so it is
-returned verbatim on every `initialize`; `registerOnboardingResources(srv)` adds the readable `fishhawk://runbook`
-`text/markdown` resource. The in-memory round-trip in `onboarding_test.go` and the HTTP-session assertion in
-`http_transport_test.go` pin both seams. This is the in-band counterpart to #996 Themes 2/3 (the thin operator agent +
-onboarding-as-data).
+returned verbatim on every `initialize`; `registerOnboardingResources(srv)` adds the readable `fishhawk://runbook` and
+`fishhawk://onboarding-skill` `text/markdown` resources. The in-memory round-trip in `onboarding_test.go` and the
+HTTP-session assertion in `http_transport_test.go` pin all three seams. This is the in-band counterpart to #996 Themes
+2/3 (the thin operator agent + onboarding-as-data).
 
 ## Onboarding tools (`fishhawk_doctor` / `fishhawk_init`, [#1506](https://github.com/kuhlman-labs/fishhawk/issues/1506))
 
@@ -119,9 +122,12 @@ Two thin tools (E29.6) wrap the E29 onboarding engine so a connecting Claude Cod
 Wiring: the `OnboardingReadinessReport` wire mirror (+ nested `OnboardingApp`/`OnboardingSpec`/`OnboardingReviewer`/`OnboardingScopes`)
 lives in `client.go` — all scalar/string/slice fields, so it is #371-safe. Both tools register in `tools.go`, bumping the
 house-style tool-count guard to 39; tests live in `onboard_test.go` (the low `client_test.go` stem-sibling needs no new
-coverage). The planned `.claude/skills/onboarding/SKILL.md` conversational-entry seed is DEFERRED — `.claude/` is
-gitignored repo-wide, so the skill file cannot be committed; the onboarding frontend ships in full via the two tools
-regardless, and the skill is a follow-up if the repo later tracks `.claude/`.
+coverage). Both tool descriptions point at the `fishhawk://onboarding-skill` resource so a connecting agent discovers
+the full walk without operator memory. The conversational-entry SKILL.md seed ships as that embedded resource (E29.6 /
+[#1516](https://github.com/kuhlman-labs/fishhawk/issues/1516)) rather than un-ignoring `.claude/` — un-ignoring is not a
+one-line negation (a parent-directory exclusion cannot be re-included by negating only the child path), and the
+resource route ships with the binary to every connecting repository, including one that has no fishhawk files yet and
+so could never see a SKILL.md committed in this repo's own `.claude/`.
 
 ## The audit-check wording sweep (E64.44 / [#3161](https://github.com/kuhlman-labs/fishhawk/issues/3161))
 

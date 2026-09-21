@@ -271,14 +271,20 @@ func TestServeHTTP_RoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListResources over HTTP: %v", err)
 		}
-		found := false
+		var foundRunbook, foundSkill bool
 		for _, r := range list.Resources {
-			if r.URI == "fishhawk://runbook" {
-				found = true
+			switch r.URI {
+			case "fishhawk://runbook":
+				foundRunbook = true
+			case "fishhawk://onboarding-skill":
+				foundSkill = true
 			}
 		}
-		if !found {
+		if !foundRunbook {
 			t.Fatalf("HTTP ListResources did not include %s (resource did not cross the transport seam)", "fishhawk://runbook")
+		}
+		if !foundSkill {
+			t.Fatalf("HTTP ListResources did not include %s (resource did not cross the transport seam)", "fishhawk://onboarding-skill")
 		}
 
 		res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "fishhawk://runbook"})
@@ -290,6 +296,17 @@ func TestServeHTTP_RoundTrip(t *testing.T) {
 		}
 		if !strings.Contains(res.Contents[0].Text, "runner_kind:local") {
 			t.Error("HTTP runbook content missing the runner_kind:local edge case")
+		}
+
+		skillRes, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "fishhawk://onboarding-skill"})
+		if err != nil {
+			t.Fatalf("ReadResource(fishhawk://onboarding-skill) over HTTP: %v", err)
+		}
+		if len(skillRes.Contents) == 0 || strings.TrimSpace(skillRes.Contents[0].Text) == "" {
+			t.Fatal("HTTP onboarding-skill read returned empty content")
+		}
+		if !strings.Contains(skillRes.Contents[0].Text, "fishhawk_init") {
+			t.Error("HTTP onboarding-skill content missing the fishhawk_init anchor")
 		}
 	})
 

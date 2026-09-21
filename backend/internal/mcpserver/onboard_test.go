@@ -590,6 +590,21 @@ func TestDoctorToolDescription_DescribesMergeGate(t *testing.T) {
 	}
 }
 
+// TestOnboardingToolDescriptions_NameTheSkillResource pins the #1516
+// discoverability sentence on both onboarding tool descriptions: a
+// connecting agent reading either tool's description learns the
+// fishhawk://onboarding-skill resource exists without operator memory.
+func TestOnboardingToolDescriptions_NameTheSkillResource(t *testing.T) {
+	doctorDesc := registeredToolDescription(t, "fishhawk_doctor")
+	if !strings.Contains(doctorDesc, "fishhawk://onboarding-skill") {
+		t.Errorf("fishhawk_doctor description missing fishhawk://onboarding-skill:\n%s", doctorDesc)
+	}
+	initDesc := registeredToolDescription(t, "fishhawk_init")
+	if !strings.Contains(initDesc, "fishhawk://onboarding-skill") {
+		t.Errorf("fishhawk_init description missing fishhawk://onboarding-skill:\n%s", initDesc)
+	}
+}
+
 // gitlabReadinessBody is a literal gitlab-family backend body (E45.43 /
 // #3348): it carries forge, app.note, NO installation_id and NO merge_gate.
 const gitlabReadinessBody = `{

@@ -1,0 +1,14 @@
+id: scenario:issue-1516/onboarding-tools-name-skill
+statement: The `fishhawk_doctor` and `fishhawk_init` tool descriptions returned by tools/list each mention `fishhawk://onboarding-skill`, and the tool count is unchanged (no new tool).
+verify_hint: 'MCP surface: tools/list against the preview''s /mcp endpoint; inspect the two descriptions and the total count (54).'
+steps: Called POST http://localhost:8090/mcp tools/list (Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/list, params._meta) with the operator bearer; counted tools and unique names, checked nextCursor, and inspected the fishhawk_doctor and fishhawk_init descriptions plus every other description for the resource URI.
+assertions:
+    expected: Both fishhawk_doctor and fishhawk_init descriptions mention fishhawk://onboarding-skill; total tool count 54 (no new tool).
+    observed_at_record: 54 tools, 54 unique names, no nextCursor. fishhawk_doctor description (3963 bytes) contains 'The fishhawk://onboarding-skill resource walks the full onboarding flow (doctor → init → commit).'; fishhawk_init description (1410 bytes) contains 'Read fishhawk://onboarding-skill for the full walk, and run fishhawk_doctor first to learn whether a spec is missing.'; no other tool's description names the resource.
+    repro_handle: /tmp/fh1516/mcp.py tools/list '{}' | python3 -c 'import sys,json;t=json.load(sys.stdin)["result"]["tools"];print(len(t),[ (x["name"], "fishhawk://onboarding-skill" in x["description"]) for x in t if x["name"] in ("fishhawk_doctor","fishhawk_init")])'
+origin:
+    issue: 1516
+    pr: 3571
+    run_id: 87804aa4-18e4-4dfd-a1c7-5056e85cc582
+    head_sha: 806e41cf4f3322972947f1c0de545cf86f6aafff
+    recorded_at: 2026-09-21T18:37:53Z

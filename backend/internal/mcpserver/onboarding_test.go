@@ -49,6 +49,103 @@ func TestOnboardingContent_NonEmpty(t *testing.T) {
 	if strings.TrimSpace(runbookMarkdown) == "" {
 		t.Error("runbookMarkdown is empty — runbook.md failed to embed (renamed or missing?)")
 	}
+	if strings.TrimSpace(onboardingSkillMarkdown) == "" {
+		t.Error("onboardingSkillMarkdown is empty — onboarding_skill.md failed to embed (renamed or missing?)")
+	}
+}
+
+// TestOnboarding_SkillResourceListedAndReadable asserts the onboarding-skill
+// resource crosses the registration->transport seam: it is listable
+// alongside the runbook (not instead of it), and its read returns
+// SKILL.md-shaped content — YAML frontmatter naming/describing it, the
+// happy-path tool/path anchors, and doctor-before-init ordering.
+func TestOnboarding_SkillResourceListedAndReadable(t *testing.T) {
+	ctx := context.Background()
+	cs := connectInMemory(t)
+
+	list, err := cs.ListResources(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListResources: %v", err)
+	}
+	var skillFound, runbookFound bool
+	for _, r := range list.Resources {
+		switch r.URI {
+		case onboardingSkillURI:
+			skillFound = true
+			if r.MIMEType != "text/markdown" {
+				t.Errorf("onboarding-skill MIMEType = %q, want text/markdown", r.MIMEType)
+			}
+		case runbookURI:
+			runbookFound = true
+		}
+	}
+	if !skillFound {
+		t.Fatalf("ListResources did not include %s", onboardingSkillURI)
+	}
+	if !runbookFound {
+		t.Fatalf("ListResources dropped %s when adding %s", runbookURI, onboardingSkillURI)
+	}
+
+	res, err := cs.ReadResource(ctx, &mcp.ReadResourceParams{URI: onboardingSkillURI})
+	if err != nil {
+		t.Fatalf("ReadResource(%s): %v", onboardingSkillURI, err)
+	}
+	if len(res.Contents) == 0 {
+		t.Fatal("ReadResource returned no contents")
+	}
+	c := res.Contents[0]
+	if c.MIMEType != "text/markdown" {
+		t.Errorf("content MIMEType = %q, want text/markdown", c.MIMEType)
+	}
+	text := c.Text
+	if strings.TrimSpace(text) == "" {
+		t.Fatal("onboarding-skill content is empty")
+	}
+	if !strings.HasPrefix(text, "---") {
+		t.Fatal("onboarding-skill content must start with a YAML frontmatter block (---)")
+	}
+	frontmatterEnd := strings.Index(text[3:], "---")
+	if frontmatterEnd < 0 {
+		t.Fatal("onboarding-skill content frontmatter block is not closed")
+	}
+	frontmatter := text[:frontmatterEnd+3]
+	if !strings.Contains(frontmatter, "name:") {
+		t.Error("onboarding-skill frontmatter missing a name: line")
+	}
+	if !strings.Contains(frontmatter, "description:") {
+		t.Error("onboarding-skill frontmatter missing a description: line")
+	}
+	for _, anchor := range []string{
+		"fishhawk_doctor",
+		"fishhawk_init",
+		".fishhawk/workflows.yaml",
+		"fishhawk_start_run",
+		"fishhawk://runbook",
+		".claude/skills/",
+	} {
+		if !strings.Contains(text, anchor) {
+			t.Errorf("onboarding-skill missing anchor %q", anchor)
+		}
+	}
+	doctorAt := strings.Index(text, "fishhawk_doctor")
+	initAt := strings.Index(text, "fishhawk_init")
+	if doctorAt < 0 || initAt < 0 || doctorAt >= initAt {
+		t.Errorf("onboarding-skill must mention fishhawk_doctor before fishhawk_init; doctor at %d, init at %d", doctorAt, initAt)
+	}
+}
+
+// TestOnboardingSkill_IsRepoAgnostic mirrors the grooming-section repo-
+// agnostic assertion (~line 544): the skill ships to every connecting
+// repository, so it must carry no owner, org or forge URL.
+func TestOnboardingSkill_IsRepoAgnostic(t *testing.T) {
+	for _, banned := range []string{
+		"kuhlman-labs",
+		"https://github.com/",
+	} {
+		if strings.Contains(onboardingSkillMarkdown, banned) {
+			t.Errorf("onboarding_skill.md contains repo-specific string %q; the resource ships to every connecting repository", banned)
+		}
+	}
 }
 
 // TestOnboarding_InstructionsDeliveredOnInitialize asserts the server
@@ -83,6 +180,7 @@ func TestOnboarding_InstructionsDeliveredOnInitialize(t *testing.T) {
 		// E34.4: the refinement intake one-liner names the tool.
 		"fishhawk_draft_epic",
 		runbookURI,
+		onboardingSkillURI,
 	} {
 		if !strings.Contains(got, anchor) {
 			t.Errorf("instructions missing happy-path anchor %q", anchor)

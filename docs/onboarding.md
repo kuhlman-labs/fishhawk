@@ -45,6 +45,11 @@ The overriding invariant: a repo whose **GitHub App is not installed still
 FAILS** (non-zero exit). Every relaxation below is scoped by a positive
 server-side signal — never a blanket softening.
 
+Over MCP, the guided walk through this same preflight is the
+`fishhawk://onboarding-skill` resource (`fishhawk_doctor` → `fishhawk_init`) —
+the in-band counterpart to this CLI page, for a client whose agent holds no
+operator memory. See `backend/internal/mcpserver/README.md`.
+
 ### Credential ladder and the token rung
 
 The **token valid** rung resolves a bearer credential with the SAME ladder
