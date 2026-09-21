@@ -1,0 +1,14 @@
+id: scenario:issue-3510/unreachable-healthz-is-not-a-deny
+statement: A direct --prompt-file launch whose --backend-url does not answer /healthz logs a forge_writes_healthz_probe event with outcome unreachable and does NOT emit a forge_writes_denied refusal for that reason.
+verify_hint: 'CLI stderr of bin/fishhawk-runner --prompt-file --backend-url http://127.0.0.1:1 (a closed loopback port): the probe event''s outcome is unreachable and no forge_writes_denied line with source healthz appears.'
+steps: 'Built bin from the sanctioned checkout (HEAD d6e150e9): cd runner && go build -o /tmp/fh-acc-runner ./cmd/fishhawk-runner. Same stub agent, throwaway repo and prompt file. Ran env -u FISHHAWK_FORGE_WRITES ANTHROPIC_API_KEY=dummy FISHHAWK_AGENT_BIN=/tmp/fh3510/stub-agent /tmp/fh-acc-runner --prompt-file /tmp/fh3510/prompt.txt --backend-url http://127.0.0.1:1 --run-id 33333333-3333-4333-8333-333333333333 --workflow feature_change --stage implement --github-repo kuhlman-labs/fishhawk --working-dir /tmp/fh3510/work --timeout 30s (127.0.0.1:1 is a closed loopback port). Captured exit code, stderr (/tmp/fh3510/c3.err), stdout and the stub agent log. Control: curl to the same URL from the sandbox also cannot reach it (proxy 403 / direct connect refused).'
+assertions:
+    expected: forge_writes_healthz_probe with outcome unreachable and no forge_writes_denied refusal with source healthz.
+    observed_at_record: 'Exit code 0. stderr: {"event":"forge_writes_healthz_probe","backend_url":"http://127.0.0.1:1","detail":"GET /healthz: Get \"http://127.0.0.1:1/healthz\": dial tcp 127.0.0.1:1: connect: operation not permitted","outcome":"unreachable"} -> runner_completed outcome ok. grep -c forge_writes_denied /tmp/fh3510/c3.err == 0. Stub agent invoked for work (fail-open), stdout carries invocation_start/result.success/invocation_end.'
+    repro_handle: env -u FISHHAWK_FORGE_WRITES ANTHROPIC_API_KEY=dummy FISHHAWK_AGENT_BIN=/tmp/fh3510/stub-agent /tmp/fh-acc-runner --prompt-file /tmp/fh3510/prompt.txt --backend-url http://127.0.0.1:1 --run-id 33333333-3333-4333-8333-333333333333 --workflow feature_change --stage implement --github-repo kuhlman-labs/fishhawk --working-dir /tmp/fh3510/work --timeout 30s; echo EXIT=$?; grep -c forge_writes_denied /tmp/fh3510/c3.err
+origin:
+    issue: 3510
+    pr: 3560
+    run_id: 6ee0e134-980d-4121-acae-1f69e803451a
+    head_sha: d6e150e9b7a027f7028e09c58f5386c2e3bcb73a
+    recorded_at: 2026-09-21T06:44:53Z

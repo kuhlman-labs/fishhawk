@@ -1,0 +1,14 @@
+id: scenario:issue-3510/readme-distinguishes-marker-vs-direct-launch
+statement: runner/README.md's forge-writes section describes marker-mediated launches as refused by the dev-mode host-dispatch marker and direct --prompt-file launches as covered by the /healthz dev_mode probe, and no longer states that the path is unreachable from the sandbox because host-dispatch refuses.
+verify_hint: 'Read runner/README.md § Forge-writes gate at the PR head (a rendered file in the checkout, not a Go test): the ''unreachable from the sandbox'' sentence is gone and a launch-path paragraph names both classes.'
+steps: 'Posture B per the verify_hint (a rendered file in the checkout). Read runner/README.md at the sanctioned read-only checkout /tmp/fishhawk-acceptance-tree-6ee0e134-980d-4121-acae-1f69e803451a-5739d0d4-3b7a-4bcc-a21f-8c4ef1013bc4 (HEAD d6e150e9 == preview /healthz git_sha): `grep -ci ''unreachable from the sandbox'' runner/README.md` and `sed -n 706,720p runner/README.md` (§ ''Forge-writes gate — FISHHAWK_FORGE_WRITES''). Also checked runner/internal/egressproxy/README.md for the CONNECT-tunnel residual named in the issue Notes.'
+assertions:
+    expected: '''unreachable from the sandbox'' sentence gone; a launch-path paragraph names marker-mediated (refused by layer 1 host-dispatch) and direct --prompt-file (covered by the /healthz dev_mode probe) launches.'
+    observed_at_record: '0 occurrences of ''unreachable from the sandbox'' (and none of ''unreachable from''). The section now has a ''**Launch paths.**'' paragraph: ''A MARKER-MEDIATED launch (fishhawk_run_stage / fishhawk_dispatch_stage / fishhawk_run_children / fishhawk_drive_run -> the host-dispatch marker) never reaches this gate on a dev-mode daemon: layer 1 refuses the marker for every caller (403 host_dispatch_refused_dev_mode), so no runner is spawned. A DIRECT launch — bin/fishhawk-runner --prompt-file … from a shell, or a descendant spawned with a cleared env (#3393) — is one layer 1 never sees; ... The /healthz probe above is what covers the direct launch.'' A ''/healthz probe (E72.16 / #3510)'' paragraph documents the four outcomes (dev_mode / production / unverifiable / unreachable) and the deliberate fail-open. runner/internal/egressproxy/README.md records ''HTTPS CONNECT tunnels are opaque to the verb table'' as residual 3 beside the loopback and Mcp-Name residuals. sha256 runner/README.md = e5710175a40932d93f508cf409c796543202fdad429ea029deba1457a27ec761.'
+    repro_handle: cd /tmp/fishhawk-acceptance-tree-6ee0e134-980d-4121-acae-1f69e803451a-5739d0d4-3b7a-4bcc-a21f-8c4ef1013bc4 && grep -ci 'unreachable from the sandbox' runner/README.md; grep -n 'Launch paths' runner/README.md; grep -n 'CONNECT tunnels are opaque' runner/internal/egressproxy/README.md
+origin:
+    issue: 3510
+    pr: 3560
+    run_id: 6ee0e134-980d-4121-acae-1f69e803451a
+    head_sha: d6e150e9b7a027f7028e09c58f5386c2e3bcb73a
+    recorded_at: 2026-09-21T06:44:53Z

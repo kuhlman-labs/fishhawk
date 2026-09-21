@@ -1,0 +1,14 @@
+id: scenario:issue-3510/prompt-file-launch-proceeds-on-production-healthz
+statement: 'The same direct --prompt-file launch against a backend whose /healthz carries no dev_mode key proceeds past the forge-writes gate: stderr carries a forge_writes_healthz_probe event with outcome production and no forge_writes_denied line.'
+verify_hint: 'CLI stderr of bin/fishhawk-runner --prompt-file against the main (non-dev-mode) fishhawkd''s URL: the probe event names outcome production and no runner_failed forge_writes_denied line appears.'
+steps: 'Built bin from the sanctioned checkout /tmp/fishhawk-acceptance-tree-6ee0e134-980d-4121-acae-1f69e803451a-5739d0d4-3b7a-4bcc-a21f-8c4ef1013bc4 (HEAD d6e150e9; checkout left untouched): cd runner && go build -o /tmp/fh-acc-runner ./cmd/fishhawk-runner. Same stub agent (/tmp/fh3510/stub-agent via FISHHAWK_AGENT_BIN), throwaway repo /tmp/fh3510/work and /tmp/fh3510/prompt.txt. Confirmed GET http://localhost:8080/healthz (the main, non-dev-mode fishhawkd on this host; git_sha ce8bd525) returns a JSON object WITHOUT a dev_mode key (keys: git_sha, min_runner_version, process_start, schemas, start_nonce, status, version). Ran env -u FISHHAWK_FORGE_WRITES ANTHROPIC_API_KEY=dummy FISHHAWK_AGENT_BIN=/tmp/fh3510/stub-agent /tmp/fh-acc-runner --prompt-file /tmp/fh3510/prompt.txt --backend-url http://localhost:8080 --run-id 22222222-2222-4222-8222-222222222222 --workflow feature_change --stage implement --github-repo kuhlman-labs/fishhawk --working-dir /tmp/fh3510/work --timeout 30s. Captured exit code, stderr (/tmp/fh3510/c2.err), stdout (/tmp/fh3510/c2.out) and the stub agent log.'
+assertions:
+    expected: forge_writes_healthz_probe event with outcome production and no forge_writes_denied line; launch proceeds.
+    observed_at_record: 'Exit code 0. stderr: ... {"event":"forge_writes_healthz_probe","backend_url":"http://localhost:8080","detail":"/healthz omits dev_mode","outcome":"production"} -> {"event":"runner_completed","outcome":"ok","tokens_used":0}. No forge_writes_denied line anywhere. The stub agent WAS invoked for work (argv --print --verbose --output-format stream-json ... -p ''You are a stub prompt. Do nothing.'', cwd /private/tmp/fh3510/work) and stdout carries invocation_start / result.success / invocation_end — the launch proceeded past the gate.'
+    repro_handle: env -u FISHHAWK_FORGE_WRITES ANTHROPIC_API_KEY=dummy FISHHAWK_AGENT_BIN=/tmp/fh3510/stub-agent /tmp/fh-acc-runner --prompt-file /tmp/fh3510/prompt.txt --backend-url http://localhost:8080 --run-id 22222222-2222-4222-8222-222222222222 --workflow feature_change --stage implement --github-repo kuhlman-labs/fishhawk --working-dir /tmp/fh3510/work --timeout 30s; echo EXIT=$?
+origin:
+    issue: 3510
+    pr: 3560
+    run_id: 6ee0e134-980d-4121-acae-1f69e803451a
+    head_sha: d6e150e9b7a027f7028e09c58f5386c2e3bcb73a
+    recorded_at: 2026-09-21T06:44:53Z
