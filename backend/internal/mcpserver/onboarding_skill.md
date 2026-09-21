@@ -1,0 +1,70 @@
+---
+name: fishhawk-onboarding
+description: Help me onboard a repo to Fishhawk — first-run readiness and a starter workflow spec via fishhawk_doctor and fishhawk_init.
+---
+
+# Fishhawk onboarding
+
+Use this skill when a connecting repository has no `.fishhawk/workflows.yaml`
+yet, or you are unsure whether it is ready for its first Fishhawk run. It
+walks `fishhawk_doctor` (readiness) then `fishhawk_init` (starter spec) to a
+committed spec and a first run.
+
+## Step 1 — `fishhawk_doctor`
+
+Call `fishhawk_doctor`, passing `repo` (owner/name on GitHub, or a
+namespace/project path on GitLab) and `forge` when it cannot be resolved from
+the environment. Read each rung of the returned report:
+
+- **`app`** not installed — surface the reason to the operator; installing the
+  App (or registering the GitLab deployment credential) is a human action, not
+  something this skill does.
+- **`spec`** unavailable or invalid — proceed to Step 2.
+- **`reviewers[]`** carrying a `missing_hint` — the named environment variable
+  is a deployment-side action; surface it, do not attempt to set it yourself.
+- **`scopes`** with a non-empty `missing[]` — the caller token needs to be
+  re-issued with the missing scopes.
+- **`merge_gate`** — read FAIL-CLOSED. `unknown` is not evidence the merge
+  check is unrequired; it means the question could not be settled. (Omitted
+  entirely on a GitLab-family report — that is by design, not a stale
+  backend.)
+
+## Step 2 — `fishhawk_init`
+
+Once a spec is missing or invalid, call `fishhawk_init` with the chosen
+autonomy preset:
+
+- **low** — human-led: nothing delegated, every judgment point pages a human.
+- **medium** — the recommended default: the operator agent may approve /
+  route fixup / retry under named conditions; waive and merge stay human.
+- **high** — adds waive (solo low-severity concern) and merge (gates
+  resolved, CI green) on top of medium.
+
+`fishhawk_init` returns `workflow_yaml` and `target_path` — it writes nothing
+itself. Write `workflow_yaml` to `target_path` (`.fishhawk/workflows.yaml`) in
+the target repository's working tree.
+
+## Step 3 — Re-verify
+
+Re-run `fishhawk_doctor` until the `spec` rung reports `valid: true`. If it
+still fails, read the `error` field and correct the written spec before
+proceeding.
+
+## Step 4 — Commit and open the PR
+
+The agent takes no git actions. The operator commits the written
+`.fishhawk/workflows.yaml` and opens the pull request under their own
+identity — this mirrors the operator-role rule the rest of the loop follows:
+the agent proposes, the operator acts.
+
+## Step 5 — First run
+
+Once the spec is merged, start the first run with `fishhawk_start_run`
+(`runner_kind:local` for a local dogfood loop). For the loop itself — plan,
+approve, dispatch, review, acceptance, merge — read the `fishhawk://runbook`
+resource.
+
+## Install as a project skill
+
+To make this walk available as a standing project skill in the target repo,
+copy this document to `.claude/skills/fishhawk-onboarding/SKILL.md`.

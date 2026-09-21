@@ -113,7 +113,8 @@ CI's CI_PROJECT_PATH (which also defaults forge to gitlab). The endpoint gates
 on AUTHENTICATION only, so a token with a scope gap still gets a report naming
 its gap rather than a 403. Pair with fishhawk_init to scaffold a missing spec.
 Tool errors: authentication_required (401), validation_failed (400, malformed
-repo or forge).
+repo or forge). The fishhawk://onboarding-skill resource walks the full
+onboarding flow (doctor → init → commit).
 `),
 	}, resolver.doctor)
 }
@@ -148,7 +149,8 @@ scaffold bytes for the conversational agent to write to target_path
 (budget / single-reviewer / human-gates) plus the AGENTS.md/CLAUDE.md bridge the
 CLI performs are a follow-up. Run fishhawk_doctor first to see whether a spec is
 already present. An unknown preset returns a clean tool error naming the valid
-tiers.
+tiers. Read fishhawk://onboarding-skill for the full walk, and run
+fishhawk_doctor first to learn whether a spec is missing.
 `),
 	}, resolver.init)
 }
