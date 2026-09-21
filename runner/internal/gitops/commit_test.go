@@ -5882,10 +5882,23 @@ func wireAuthFor(token string) string {
 // prompt, run an askpass program, or consult the operator's credential
 // helper (osxkeychain lives in the SYSTEM config on macOS): the failure is
 // the deterministic `could not read Username … terminal prompts disabled`.
+//
+// GIT_CONFIG_GLOBAL points at gitMaintenancePinPath (the runTestMain pin
+// file, #3507) rather than "/dev/null": newRefreshWireFixture pushes into a
+// TempDir bare origin (commit_test.go), so a plain "/dev/null" override
+// here would defeat the TestMain maintenance.auto=false pin for the
+// duration of any test calling this. The pin file carries no
+// credential.helper/askpass/gpgsign keys, so the no-prompt intent below is
+// unchanged. Falls back to "/dev/null" if gitMaintenancePinPath was never
+// set (e.g. runTestMain's temp-dir write failed).
 func gitNoPromptEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("GIT_TERMINAL_PROMPT", "0")
-	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	globalConfig := gitMaintenancePinPath
+	if globalConfig == "" {
+		globalConfig = "/dev/null"
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
 	t.Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
 	t.Setenv("GIT_ASKPASS", "")
 	t.Setenv("SSH_ASKPASS", "")
