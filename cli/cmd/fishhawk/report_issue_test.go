@@ -54,6 +54,11 @@ func newReportBackend(t *testing.T, runID string) (*reportBackend, *httptest.Ser
 				Number:      4242,
 				URL:         "https://github.com/kuhlman-labs/fishhawk/issues/4242",
 				Destination: "kuhlman-labs/fishhawk",
+				FingerprintBasis: productReportBasis{
+					Kind:          "failure",
+					Components:    []string{"failure_category", "failure_surface", "version_family"},
+					DedupSearched: true,
+				},
 			}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -74,10 +79,17 @@ func TestRunReportIssue_TextOutput_DefaultsToFactsOnly(t *testing.T) {
 		t.Fatalf("status = %d, want exitOK", got)
 	}
 	out := stdout.String()
-	for _, want := range []string{"filed product report #4242", "created", "abc123", "kuhlman-labs/fishhawk"} {
+	for _, want := range []string{
+		"filed product report #4242", "created", "abc123", "kuhlman-labs/fishhawk",
+		"matched on:  failure (failure_category, failure_surface, version_family)",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("text output missing %q:\n%s", want, out)
 		}
+	}
+	// A searched (failure) keying must NOT render the "not searched" line.
+	if strings.Contains(out, "not searched") {
+		t.Errorf("failure keying rendered a dedup-skip line:\n%s", out)
 	}
 	// Default path: kind=bug, no free text on the wire.
 	if rb.lastBody.Kind != "bug" {
@@ -99,6 +111,9 @@ func TestRunReportIssue_JSONOutput(t *testing.T) {
 	if got != exitOK {
 		t.Fatalf("status = %d, want exitOK", got)
 	}
+	if !strings.Contains(stdout.String(), `"fingerprint_basis"`) {
+		t.Errorf("json output missing fingerprint_basis verbatim:\n%s", stdout.String())
+	}
 	var pr productReport
 	if err := json.Unmarshal([]byte(stdout.String()), &pr); err != nil {
 		t.Fatalf("decode round-trip: %v", err)
@@ -106,13 +121,21 @@ func TestRunReportIssue_JSONOutput(t *testing.T) {
 	if pr.Number != 4242 || pr.Action != "created" {
 		t.Errorf("decoded = %+v, want number=4242 action=created", pr)
 	}
+	if pr.FingerprintBasis.Kind != "failure" {
+		t.Errorf("decoded basis kind = %q, want failure", pr.FingerprintBasis.Kind)
+	}
 }
 
 func TestRunReportIssue_OccurrenceRendering(t *testing.T) {
 	id := uuid.New()
 	rb, srv := newReportBackend(t, id.String())
 	rb.resp = &productReport{Fingerprint: "fp", Action: "occurrence", Number: 7,
-		URL: "https://github.com/kuhlman-labs/fishhawk/issues/7", Destination: "kuhlman-labs/fishhawk"}
+		URL: "https://github.com/kuhlman-labs/fishhawk/issues/7", Destination: "kuhlman-labs/fishhawk",
+		FingerprintBasis: productReportBasis{
+			Kind:          "healthy_unique",
+			Components:    []string{"run_state", "workflow_id", "run_id", "version_family"},
+			DedupSearched: false,
+		}}
 	t.Setenv("FISHHAWK_BACKEND_URL", srv.URL)
 	t.Setenv("FISHHAWK_TOKEN", "")
 
@@ -121,8 +144,16 @@ func TestRunReportIssue_OccurrenceRendering(t *testing.T) {
 	if got != exitOK {
 		t.Fatalf("status = %d, want exitOK", got)
 	}
-	if !strings.Contains(stdout.String(), "occurrence appended to existing report #7") {
-		t.Errorf("occurrence not rendered:\n%s", stdout.String())
+	out := stdout.String()
+	if !strings.Contains(out, "occurrence appended to existing report #7") {
+		t.Errorf("occurrence not rendered:\n%s", out)
+	}
+	// A healthy_unique (dedup_searched=false) keying renders the skip line.
+	if !strings.Contains(out, "matched on:  healthy_unique (run_state, workflow_id, run_id, version_family)") {
+		t.Errorf("matched-on line missing:\n%s", out)
+	}
+	if !strings.Contains(out, "dedup:       not searched (healthy run, no free text) — filed fresh") {
+		t.Errorf("dedup-skip line missing:\n%s", out)
 	}
 }
 

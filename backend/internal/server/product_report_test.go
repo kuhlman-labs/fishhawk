@@ -186,7 +186,7 @@ func TestProductReport_DedupMiss_CreatesMarkedReport(t *testing.T) {
 	}
 
 	// Audit seam: a product_report_filed entry naming what left the boundary.
-	assertProductReportAudit(t, af, runID, resp.Fingerprint, "created")
+	assertProductReportAudit(t, af, runID, resp.Fingerprint, "created", "failure")
 }
 
 // TestProductReport_DedupHit_AppendsOccurrence asserts a fingerprint hit
@@ -218,7 +218,7 @@ func TestProductReport_DedupHit_AppendsOccurrence(t *testing.T) {
 	if strings.Contains(fp.occurrenceNote, "SENSITIVE") {
 		t.Errorf("free text leaked into occurrence comment: %q", fp.occurrenceNote)
 	}
-	assertProductReportAudit(t, af, runID, resp.Fingerprint, "occurrence")
+	assertProductReportAudit(t, af, runID, resp.Fingerprint, "occurrence", "failure")
 }
 
 // TestProductReport_UnknownFeedbackProvider_501Redacts drives the
@@ -563,7 +563,7 @@ func TestProductReport_FreeText_AbsentWithoutConsent(t *testing.T) {
 	}
 }
 
-func assertProductReportAudit(t *testing.T, af *scAuditFake, runID uuid.UUID, fingerprint, action string) {
+func assertProductReportAudit(t *testing.T, af *scAuditFake, runID uuid.UUID, fingerprint, action, wantKind string) {
 	t.Helper()
 	var found bool
 	for _, p := range af.appendedParams {
@@ -587,6 +587,14 @@ func assertProductReportAudit(t *testing.T, af *scAuditFake, runID uuid.UUID, fi
 		if payload["action"] != action {
 			t.Errorf("audit action = %v, want %s", payload["action"], action)
 		}
+		// The fingerprint_basis rides the audit payload (#3233).
+		basis, ok := payload["fingerprint_basis"].(map[string]any)
+		if !ok {
+			t.Fatalf("audit payload missing fingerprint_basis map: %v", payload["fingerprint_basis"])
+		}
+		if basis["kind"] != wantKind {
+			t.Errorf("audit fingerprint_basis.kind = %v, want %s", basis["kind"], wantKind)
+		}
 	}
 	if !found {
 		t.Errorf("no product_report_filed audit entry; appended=%d", len(af.appendedParams))
@@ -600,14 +608,16 @@ func assertProductReportAudit(t *testing.T, af *scAuditFake, runID uuid.UUID, fi
 // filed. This lets one provider instance be driven across several POSTs
 // to observe created-vs-occurrence keyed on the actual fingerprint.
 type dedupFeedbackProvider struct {
-	name  string
-	filed map[string]int // fingerprint -> upstream number
-	next  int
+	name        string
+	filed       map[string]int // fingerprint -> upstream number
+	next        int
+	searchCalls int // how many times SearchOpenByFingerprint was invoked (#3233)
 }
 
 func (f *dedupFeedbackProvider) Name() string { return f.name }
 
 func (f *dedupFeedbackProvider) SearchOpenByFingerprint(_ context.Context, _ workmgmt.Target, fingerprint string) (*workmgmt.ExistingReport, error) {
+	f.searchCalls++
 	if num, ok := f.filed[fingerprint]; ok {
 		return &workmgmt.ExistingReport{Number: num, URL: "https://github.com/kuhlman-labs/fishhawk/issues/" + fingerprint}, nil
 	}
@@ -743,6 +753,270 @@ func decodeProductReportResp(t *testing.T, rec *httptest.ResponseRecorder) produ
 		t.Fatalf("decode: %v", err)
 	}
 	return resp
+}
+
+// healthyRunFixture builds a server + HEALTHY run (state running, stages
+// [plan=succeeded, review=awaiting_approval], NO failing stage) of the given
+// workflow, so the healthy-run fingerprint keyings (#3233) can be exercised.
+// It does NOT register a provider — the caller registers a shared dedup
+// provider so a single store is observed across POSTs.
+func healthyRunFixture(t *testing.T, af *scAuditFake, workflowID string) (*Server, uuid.UUID) {
+	t.Helper()
+	runID := uuid.New()
+	inst := int64(99)
+	stored := &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     workflowID,
+		WorkflowSHA:    "specsha123",
+		RunnerKind:     run.RunnerKindLocal,
+		State:          run.StateRunning,
+		InstallationID: &inst,
+	}
+	stages := []*run.Stage{
+		{ID: uuid.New(), Sequence: 0, Type: run.StageTypePlan, State: run.StageStateSucceeded},
+		{ID: uuid.New(), Sequence: 1, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+	}
+	af.allEntries = []*audit.Entry{
+		{Sequence: 100, Category: "stage_dispatched"},
+		{Sequence: 101, Category: "policy_evaluated"},
+	}
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		RunRepo:   &statusCommentRunRepo{stored: stored, stages: stages},
+		AuditRepo: af,
+	})
+	return s, runID
+}
+
+// registerSharedDedupProvider registers dp as the feedback provider and
+// restores the prior registration on cleanup (the pattern
+// TestProductReport_DetailClass_SplitsConflatedSurface established).
+func registerSharedDedupProvider(t *testing.T, dp *dedupFeedbackProvider) {
+	t.Helper()
+	if dp.name == "" {
+		dp.name = workmgmt.Default().Provider
+	}
+	if prev, err := workmgmt.GetFeedback(dp.name); err == nil {
+		t.Cleanup(func() { workmgmt.RegisterFeedback(prev) })
+	}
+	workmgmt.RegisterFeedback(dp)
+}
+
+// TestProductReport_HealthyRuns_DifferentWorkflows_FileSeparately is the
+// issue's done-means (#3233): two healthy runs of DIFFERENT workflows, both
+// posting `{}` bodies, must BOTH file (distinct healthy_unique fingerprints,
+// dedup_searched=false, and the provider search was REFUSED — searchCalls
+// stays 0), not collide onto one occurrence comment. A repeat healthy report
+// files fresh again (no self-dedup). Two FAILING runs on the same workflow
+// with the same category/surface/class still dedup (created then occurrence,
+// kind failure, dedup_searched=true) — the failure keying is unchanged.
+func TestProductReport_HealthyRuns_DifferentWorkflows_FileSeparately(t *testing.T) {
+	dp := &dedupFeedbackProvider{}
+	registerSharedDedupProvider(t, dp)
+
+	af1 := &scAuditFake{}
+	sA, runA := healthyRunFixture(t, af1, "backlog_grooming")
+	recA := postProductReport(sA, runA, "mcp:run:"+runA.String(), `{}`)
+	respA := decodeProductReportResp(t, recA)
+
+	af2 := &scAuditFake{}
+	sB, runB := healthyRunFixture(t, af2, "feature_change")
+	recB := postProductReport(sB, runB, "mcp:run:"+runB.String(), `{}`)
+	respB := decodeProductReportResp(t, recB)
+
+	if respA.Action != "created" || respB.Action != "created" {
+		t.Fatalf("healthy runs of different workflows must both file: A=%q B=%q", respA.Action, respB.Action)
+	}
+	if respA.Fingerprint == respB.Fingerprint {
+		t.Fatalf("healthy runs of different workflows collided onto one fingerprint: %q", respA.Fingerprint)
+	}
+	for _, resp := range []productReportResponse{respA, respB} {
+		if resp.FingerprintBasis.Kind != diagnostics.FingerprintKindHealthyUnique {
+			t.Errorf("basis kind = %q, want healthy_unique", resp.FingerprintBasis.Kind)
+		}
+		if resp.FingerprintBasis.DedupSearched {
+			t.Errorf("healthy_unique dedup_searched = true, want false (%+v)", resp.FingerprintBasis)
+		}
+	}
+	// The dedup search was REFUSED, not merely missed — no fingerprint was
+	// ever handed to the provider's search. This is the assertion the
+	// Condition-1 counterfactual reddens (flip the handler to still search /
+	// set DedupSearched=true).
+	if dp.searchCalls != 0 {
+		t.Errorf("provider searchCalls = %d, want 0 — the healthy_unique keying must skip the dedup search", dp.searchCalls)
+	}
+
+	// A repeat healthy report on a second backlog_grooming run files fresh.
+	af3 := &scAuditFake{}
+	sC, runC := healthyRunFixture(t, af3, "backlog_grooming")
+	recC := postProductReport(sC, runC, "mcp:run:"+runC.String(), `{}`)
+	respC := decodeProductReportResp(t, recC)
+	if respC.Action != "created" {
+		t.Errorf("a repeat healthy report must file fresh, got %q", respC.Action)
+	}
+	if dp.searchCalls != 0 {
+		t.Errorf("provider searchCalls = %d after the repeat, want 0", dp.searchCalls)
+	}
+
+	// Two FAILING runs on the same workflow with the same class STILL dedup.
+	const surface = "fixup_base_checkout"
+	afF1 := &scAuditFake{}
+	sF1, runF1 := fingerprintFixture(t, afF1, run.FailureC,
+		"fatal: unable to access 'https://x/': The requested URL returned error: 401", surface)
+	respF1 := decodeProductReportResp(t, postProductReport(sF1, runF1, "mcp:run:"+runF1.String(), `{}`))
+	if respF1.Action != "created" || respF1.FingerprintBasis.Kind != diagnostics.FingerprintKindFailure {
+		t.Fatalf("first failing run = %+v, want created/failure", respF1)
+	}
+	if !respF1.FingerprintBasis.DedupSearched {
+		t.Errorf("failure keying dedup_searched = false, want true")
+	}
+	afF2 := &scAuditFake{}
+	sF2, runF2 := fingerprintFixture(t, afF2, run.FailureC,
+		"remote: Authentication failed for 'https://x/'", surface)
+	respF2 := decodeProductReportResp(t, postProductReport(sF2, runF2, "mcp:run:"+runF2.String(), `{}`))
+	if respF2.Action != "occurrence" {
+		t.Errorf("second failing run of the same class = %q, want occurrence (still dedups)", respF2.Action)
+	}
+	if respF2.FingerprintBasis.Kind != diagnostics.FingerprintKindFailure {
+		t.Errorf("failure basis kind = %q, want failure", respF2.FingerprintBasis.Kind)
+	}
+}
+
+// TestProductReport_HealthyRuns_SameDescription_Dedups pins the
+// healthy_description keying in BOTH directions (binding condition 2): two
+// healthy runs of the SAME workflow with the SAME normalized description
+// (case/whitespace differ) produce the SAME fingerprint and dedup; a third
+// with a DIFFERENT description files fresh.
+func TestProductReport_HealthyRuns_SameDescription_Dedups(t *testing.T) {
+	dp := &dedupFeedbackProvider{}
+	registerSharedDedupProvider(t, dp)
+
+	body := func(desc string) string {
+		b, _ := json.Marshal(map[string]any{"include_free_text": true, "description": desc})
+		return string(b)
+	}
+
+	af1 := &scAuditFake{}
+	s1, run1 := healthyRunFixture(t, af1, "backlog_grooming")
+	resp1 := decodeProductReportResp(t, postProductReport(s1, run1, "mcp:run:"+run1.String(), body("Grooming apply lost the tail")))
+	if resp1.Action != "created" {
+		t.Fatalf("first described report = %q, want created", resp1.Action)
+	}
+	if resp1.FingerprintBasis.Kind != diagnostics.FingerprintKindHealthyDescription {
+		t.Fatalf("basis kind = %q, want healthy_description", resp1.FingerprintBasis.Kind)
+	}
+	if !resp1.FingerprintBasis.DedupSearched {
+		t.Errorf("healthy_description dedup_searched = false, want true")
+	}
+	var hasDigest bool
+	for _, c := range resp1.FingerprintBasis.Components {
+		if c == "description_digest" {
+			hasDigest = true
+		}
+	}
+	if !hasDigest {
+		t.Errorf("healthy_description components = %v, want a description_digest entry", resp1.FingerprintBasis.Components)
+	}
+
+	// Same workflow, same text differing only in case/whitespace -> dedup.
+	af2 := &scAuditFake{}
+	s2, run2 := healthyRunFixture(t, af2, "backlog_grooming")
+	resp2 := decodeProductReportResp(t, postProductReport(s2, run2, "mcp:run:"+run2.String(), body("  grooming   APPLY  lost the   tail ")))
+	if resp2.Action != "occurrence" {
+		t.Errorf("same normalized description = %q, want occurrence", resp2.Action)
+	}
+	if resp2.Fingerprint != resp1.Fingerprint {
+		t.Errorf("same normalized description fingerprints differ: %q vs %q", resp2.Fingerprint, resp1.Fingerprint)
+	}
+
+	// Same workflow, DIFFERENT description -> different fingerprint, files fresh.
+	af3 := &scAuditFake{}
+	s3, run3 := healthyRunFixture(t, af3, "backlog_grooming")
+	resp3 := decodeProductReportResp(t, postProductReport(s3, run3, "mcp:run:"+run3.String(), body("an entirely different friction report")))
+	if resp3.Action != "created" {
+		t.Errorf("different description = %q, want created (files fresh)", resp3.Action)
+	}
+	if resp3.Fingerprint == resp1.Fingerprint {
+		t.Errorf("different descriptions produced the same fingerprint: %q", resp3.Fingerprint)
+	}
+}
+
+// TestProductReport_ResponseAndAuditCarryFingerprintBasis pins the wire field,
+// the audit payload key, the filed body's `(basis: ...)` line, and the
+// occurrence `matched on:` line (#3233), on the failing fixture.
+func TestProductReport_ResponseAndAuditCarryFingerprintBasis(t *testing.T) {
+	fp := &fakeFeedbackProvider{}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+
+	rec := postProductReport(s, runID, "mcp:run:"+runID.String(), "")
+	resp := decodeProductReportResp(t, rec)
+	// The fixture's reason is unclassified, so no failure_detail_class component.
+	if resp.FingerprintBasis.Kind != diagnostics.FingerprintKindFailure {
+		t.Errorf("basis kind = %q, want failure", resp.FingerprintBasis.Kind)
+	}
+	wantComps := []string{"failure_category", "failure_surface", "version_family"}
+	if strings.Join(resp.FingerprintBasis.Components, ",") != strings.Join(wantComps, ",") {
+		t.Errorf("basis components = %v, want %v", resp.FingerprintBasis.Components, wantComps)
+	}
+	if !resp.FingerprintBasis.DedupSearched {
+		t.Errorf("failure basis dedup_searched = false, want true")
+	}
+	// The wire body carries the fingerprint_basis object.
+	if !strings.Contains(rec.Body.String(), `"fingerprint_basis"`) {
+		t.Errorf("wire body missing fingerprint_basis: %s", rec.Body.String())
+	}
+	// The filed report body names the basis.
+	if !strings.Contains(fp.filedReport.Body, "(basis: failure;") {
+		t.Errorf("filed body missing the basis line: %q", fp.filedReport.Body)
+	}
+	assertProductReportAudit(t, af, runID, resp.Fingerprint, "created", "failure")
+
+	// On a dedup hit, the occurrence note names what it matched on.
+	fp2 := &fakeFeedbackProvider{searchHit: &workmgmt.ExistingReport{Number: 9, URL: "https://example.test/9"}}
+	af2 := &scAuditFake{}
+	s2, runID2 := productReportFixture(t, fp2, af2)
+	rec2 := postProductReport(s2, runID2, "mcp:run:"+runID2.String(), "")
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(fp2.occurrenceNote, "matched on: failure") {
+		t.Errorf("occurrence note missing 'matched on: failure': %q", fp2.occurrenceNote)
+	}
+}
+
+// TestProductReport_HealthyUnique_NeverEchoesDescriptionDigest pins that an
+// UN-consented description neither keys the fingerprint (the run gets
+// healthy_unique, not healthy_description) nor appears — as digest OR raw
+// text — in the body or response (#3233).
+func TestProductReport_HealthyUnique_NeverEchoesDescriptionDigest(t *testing.T) {
+	dp := &dedupFeedbackProvider{}
+	registerSharedDedupProvider(t, dp)
+
+	description := "a private note the operator did not consent to send"
+	digest := diagnostics.DescriptionDigest(description)
+	if digest == "" {
+		t.Fatal("test setup: description must produce a non-empty digest")
+	}
+	body, _ := json.Marshal(map[string]any{"description": description}) // include_free_text omitted
+
+	af := &scAuditFake{}
+	s, runID := healthyRunFixture(t, af, "feature_change")
+	rec := postProductReport(s, runID, "mcp:run:"+runID.String(), string(body))
+	resp := decodeProductReportResp(t, rec)
+	if resp.FingerprintBasis.Kind != diagnostics.FingerprintKindHealthyUnique {
+		t.Errorf("basis kind = %q, want healthy_unique (un-consented description must not key)", resp.FingerprintBasis.Kind)
+	}
+	if strings.Contains(rec.Body.String(), digest) {
+		t.Errorf("response echoed the description digest %q: %s", digest, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), description) {
+		t.Errorf("response echoed the raw un-consented description: %s", rec.Body.String())
+	}
+	if dp.filed == nil {
+		t.Fatal("provider.File was not called")
+	}
 }
 
 // TestReportLabels_IncludeAutonomyDefault is the reportLabels unit assertion
@@ -930,7 +1204,10 @@ func TestProductReport_WedgeEvidenceInBody(t *testing.T) {
 // TestProductReport_OccurrenceCommentCarriesWedgeSummary is verification
 // item (5)'s occurrence half: the dedup-hit comment carries the one-line
 // wedge summary, and the response reports that nothing was created to
-// board.
+// board. The wedged fixture run carries no captured FailingStage, so it
+// keys on the healthy path; a consented description drives the
+// healthy_description keying whose dedup search reaches the seeded hit
+// (#3233 — the healthy_unique keying skips the search by design).
 func TestProductReport_OccurrenceCommentCarriesWedgeSummary(t *testing.T) {
 	fp := &fakeFeedbackProvider{
 		searchHit: &workmgmt.ExistingReport{Number: 11, URL: "https://example.test/11"},
@@ -938,7 +1215,8 @@ func TestProductReport_OccurrenceCommentCarriesWedgeSummary(t *testing.T) {
 	s, runID := wedgedProductReportServer(t, fp,
 		&workmgmt.Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7})
 
-	rec := postProductReport(s, runID, "mcp:run:"+runID.String(), `{}`)
+	rec := postProductReport(s, runID, "mcp:run:"+runID.String(),
+		`{"include_free_text":true,"description":"the run is wedged at the merge gate"}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 (body %s)", rec.Code, rec.Body.String())
 	}
@@ -1240,8 +1518,10 @@ func TestProductReport_FingerprintStableAcrossWedge(t *testing.T) {
 		BlockedDependents:  3,
 		IntegrateWaveError: "slice_integration_conflict",
 	}
-	if a, b := bundleFingerprint(base), bundleFingerprint(withWedge); a != b {
-		t.Fatalf("fingerprint drifted with wedge context: %q vs %q — every open deduped report would stop matching", a, b)
+	fpBase, _ := diagnostics.ReportFingerprint(base, "")
+	fpWedge, _ := diagnostics.ReportFingerprint(withWedge, "")
+	if fpBase != fpWedge {
+		t.Fatalf("fingerprint drifted with wedge context: %q vs %q — every open deduped report would stop matching", fpBase, fpWedge)
 	}
 }
 

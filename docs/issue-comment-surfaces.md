@@ -2115,9 +2115,14 @@ Notes:
   resolved from the subject, may now name an operator/operator-agent
   (`actor_kind=agent` for the `operator-agent/` prefix) in addition to the
   run-bound agent. No new surface or audit category is added. It names ONLY
-  what left the boundary — `{fingerprint, destination, action
-  (created|occurrence), upstream_url, upstream_num}` — and carries no diffs,
-  paths, prompts, free text, or audit payload bodies. The write is best-effort
+  what left the boundary — `{fingerprint, fingerprint_basis, destination,
+  action (created|occurrence), upstream_url, upstream_num}` — and carries no
+  diffs, paths, prompts, free text, or audit payload bodies. `fingerprint_basis`
+  (#3233) is a product-facts object `{kind, components, dedup_searched}` naming
+  what the fingerprint was keyed on (failure tuple, or a healthy run's workflow
+  + description digest, or its run id); it carries no digest value or free text,
+  only the component NAMES. The occurrence comment itself now names what it
+  matched on. The write is best-effort
   (the egress already happened). Listed here so a future reader grepping the
   audit categories doesn't mistake it for a comment surface.
 - The product-feedback **occurrence comment** (#1006) IS an egress comment

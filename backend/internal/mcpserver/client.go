@@ -3869,6 +3869,31 @@ type ProductReport struct {
 	// product-owned literal naming which step failed, never the
 	// provider's raw error.
 	BoardingError string `json:"boarding_error,omitempty"`
+	// FingerprintBasis names WHAT the dedup fingerprint was computed over
+	// (#3233): the keying kind (failure | healthy_description |
+	// healthy_unique), the ordered component names actually hashed, and
+	// whether the handler searched the upstream repo. It lets an operator see
+	// a collision instead of trusting action=occurrence. A local mirror of
+	// the wire shape (the mcpserver client mirrors wire JSON locally rather
+	// than importing server/diagnostics types); the json tag MUST byte-match
+	// the backend or the field silently decodes to zero.
+	//
+	// The type is deliberately UNEXPORTED — same rationale as
+	// runCompletionBlocked: the exported FingerprintBasis field means
+	// encoding/json and the jsonschema reflector reach it exactly as they
+	// would an exported type, nothing outside this package names it, and the
+	// package's export-surface baseline is not in this slice's scope.
+	FingerprintBasis productReportFingerprintBasis `json:"fingerprint_basis"`
+}
+
+// productReportFingerprintBasis mirrors the backend
+// diagnostics.FingerprintBasis wire shape (#3233). The json tags MUST
+// byte-match the backend or each field silently decodes to its zero value
+// (the #371-class hand-maintained-wire-mirror trap).
+type productReportFingerprintBasis struct {
+	Kind          string   `json:"kind" jsonschema:"the fingerprint keying: failure (unchanged failure tuple), healthy_description (workflow + consented-description digest), or healthy_unique (run id, filed fresh with no dedup search)"`
+	Components    []string `json:"components" jsonschema:"the ordered component names actually hashed into the fingerprint"`
+	DedupSearched bool     `json:"dedup_searched" jsonschema:"whether the handler searched the upstream repo for an existing report; false on healthy_unique, which files fresh"`
 }
 
 // ReportProductIssue files a deduped, audited upstream product report for

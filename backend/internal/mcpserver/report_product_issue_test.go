@@ -355,6 +355,56 @@ func TestReportProductIssue_NoProjectArmSurvivesRESTDecode(t *testing.T) {
 	}
 }
 
+// TestReportProductIssue_FingerprintBasisSurvivesRESTDecode pins that the
+// fingerprint_basis object (#3233) decodes through the real apiClient into
+// the tool output. The fake serves RAW JSON (not the mirror struct), so a
+// mirror with a wrong/missing tag decodes it to a zero value and this goes
+// red — the #2591 silent-drop shape.
+func TestReportProductIssue_FingerprintBasisSurvivesRESTDecode(t *testing.T) {
+	fb, srv := newProductReportFakeBackend(t)
+	fb.reportExtra = map[string]any{
+		"fingerprint_basis": map[string]any{
+			"kind":           "healthy_unique",
+			"components":     []any{"run_state", "workflow_id", "run_id", "version_family"},
+			"dedup_searched": false,
+		},
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.reportProductIssue(context.Background(), nil, ReportProductIssueInput{RunID: sampleRunUUID})
+	if err != nil {
+		t.Fatalf("reportProductIssue: %v", err)
+	}
+	basis := out.Report.FingerprintBasis
+	if basis.Kind != "healthy_unique" {
+		t.Errorf("basis.Kind = %q, want healthy_unique — the mirror dropped kind", basis.Kind)
+	}
+	if basis.DedupSearched {
+		t.Errorf("basis.DedupSearched = true, want false")
+	}
+	if len(basis.Components) != 4 || basis.Components[2] != "run_id" {
+		t.Errorf("basis.Components = %v, want the 4 healthy_unique names", basis.Components)
+	}
+}
+
+// TestReportProductIssue_FingerprintBasisWireFieldName is a direct JSON-decode
+// pin on the wire field name `fingerprint_basis` (#3233): a tag typo would
+// leave the field zero here.
+func TestReportProductIssue_FingerprintBasisWireFieldName(t *testing.T) {
+	const raw = `{"fingerprint":"abc","action":"created","number":1,"url":"u","destination":"d",` +
+		`"fingerprint_basis":{"kind":"failure","components":["failure_category","failure_surface","version_family"],"dedup_searched":true}}`
+	var pr ProductReport
+	if err := json.Unmarshal([]byte(raw), &pr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if pr.FingerprintBasis.Kind != "failure" || !pr.FingerprintBasis.DedupSearched {
+		t.Errorf("fingerprint_basis decoded to %+v, want failure/true", pr.FingerprintBasis)
+	}
+	if len(pr.FingerprintBasis.Components) != 3 {
+		t.Errorf("components = %v, want 3", pr.FingerprintBasis.Components)
+	}
+}
+
 // TestReportProductIssue_HealthyRunPreviewOmitsWedge pins the absent
 // case: no wedge_context on the wire means a nil block in the tool
 // output, never a zero-valued one that renders as an empty wedge.

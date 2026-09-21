@@ -192,7 +192,7 @@ The label rule is deliberately **stricter than the forge** — GitHub accepts `g
 
 The report body and the dedup-hit occurrence comment render the diagnostic bundle's `wedge_context` block (red required-check names, campaign item state, blocked-dependent count, a closed fan-in marker) when the run is wedged, and omit it entirely otherwise — an un-wedged run's body is byte-identical to the pre-#1737 rendering. The block is assembled by `backend/internal/diagnostics` from typed state only, so it inherits that package's redaction-safe-by-construction contract; a stage's free-text `FailureReason` never reaches it.
 
-**The dedup fingerprint is deliberately unchanged.** `bundleFingerprint` hashes only (failure category, failure surface, failure detail class, version family) and never the bundle as a whole, so every currently-open deduped report keeps matching its recurrences across this change. `TestProductReport_FingerprintStableAcrossWedge` pins it.
+**The dedup fingerprint is unaffected by wedge context.** `diagnostics.ReportFingerprint` never hashes the bundle as a whole, so adding wedge evidence to the body never re-keys a report — every currently-open deduped report keeps matching its recurrences across the #1737 change. `TestProductReport_FingerprintStableAcrossWedge` pins it. (Since #3233 the fingerprint IS keyed by report shape: a failing run keys on (failure category, failure surface, failure detail class, version family) — unchanged — while a healthy run keys on workflow + a digest of the consented description, or on the run id and files fresh; wedge context is still not an input.)
 
 ## Charter declaration (E54.1 / #2233)
 

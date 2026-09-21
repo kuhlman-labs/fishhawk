@@ -88,6 +88,12 @@ type productReportResponse struct {
 	// not_attempted_* statuses means "not attempted", never "attempted
 	// and succeeded silently".
 	BoardingError string `json:"boarding_error,omitempty"`
+	// FingerprintBasis names WHAT the dedup fingerprint was computed over —
+	// the keying kind, the ordered component names actually hashed, and
+	// whether the handler searched the upstream repo for an existing report
+	// (#3233). It lets an operator SEE a collision instead of trusting
+	// `action: occurrence`.
+	FingerprintBasis diagnostics.FingerprintBasis `json:"fingerprint_basis"`
 }
 
 // handleFileProductReport implements POST /v0/runs/{run_id}/product-reports.
@@ -241,16 +247,24 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 	// required checks, campaign item state + blocked dependents, a fan-in
 	// conflict marker. collectWedgeFacts is best-effort throughout, so a
 	// missing fact yields a thinner report, never a failed egress. The
-	// dedup fingerprint is deliberately UNAFFECTED (see bundleFingerprint).
+	// dedup fingerprint is deliberately UNAFFECTED by wedge context (see
+	// diagnostics.ReportFingerprint).
 	bundle := diagnostics.CollectWithWedge(runRow, stages, auditEntries,
 		currentVersionFacts(), s.collectWedgeFacts(r.Context(), runRow, stages))
-	fingerprint := bundleFingerprint(bundle)
 
 	// Consent/redaction boundary (binding condition 2): operator free text
 	// crosses ONLY when include_free_text is set, and even then it is run
 	// through redaction.RedactDefault FIRST. Without the flag, freeText stays
-	// empty and the report carries product facts only.
+	// empty and the report carries product facts only. Computed BEFORE the
+	// fingerprint because a healthy-run keying hashes the redacted description
+	// digest (#3233), so freeText is a fingerprint input.
 	freeText := redactedFreeText(req)
+
+	// Fingerprint keyed by report SHAPE (#3233): the failure tuple is
+	// unchanged; a healthy run keys on workflow + consented-description digest,
+	// or on the run id (filing fresh, no dedup search) when there is no free
+	// text. basis names what was hashed so the wire can show the keying.
+	fingerprint, basis := diagnostics.ReportFingerprint(bundle, freeText)
 
 	owner, name, _ := splitRepoFullName(productRepo)
 	// Project: the conventions' board, so a filed report lands on the
@@ -265,11 +279,18 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 		target.Scope = forge.FromGitHubInstallationID(*runRow.InstallationID)
 	}
 
-	existing, err := provider.SearchOpenByFingerprint(r.Context(), target, fingerprint)
-	if err != nil {
-		s.writeError(w, r, http.StatusBadGateway, "product_report_failed",
-			"dedup search against the product repo failed", map[string]any{"error": err.Error()})
-		return
+	// Dedup search gate (#3233): the healthy_unique keying embeds the run id,
+	// so the marker is unique per run and no later report can match it — the
+	// handler skips the search entirely and files fresh. Every other keying
+	// searches for an existing fingerprint-marked report.
+	var existing *workmgmt.ExistingReport
+	if basis.DedupSearched {
+		existing, err = provider.SearchOpenByFingerprint(r.Context(), target, fingerprint)
+		if err != nil {
+			s.writeError(w, r, http.StatusBadGateway, "product_report_failed",
+				"dedup search against the product repo failed", map[string]any{"error": err.Error()})
+			return
+		}
 	}
 
 	var (
@@ -281,7 +302,7 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 	if existing != nil {
 		// Dedup hit: append an occurrence comment, create nothing.
 		if err := provider.AppendOccurrence(r.Context(), target, existing.Number,
-			renderOccurrenceComment(bundle, fingerprint, freeText)); err != nil {
+			renderOccurrenceComment(bundle, fingerprint, basis, freeText)); err != nil {
 			s.writeError(w, r, http.StatusBadGateway, "product_report_failed",
 				"could not append occurrence to the existing report", map[string]any{"error": err.Error()})
 			return
@@ -291,7 +312,7 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 		// Dedup miss: file a new fingerprint-marked report.
 		created, err = provider.File(r.Context(), target, workmgmt.FeedbackReport{
 			Title:          renderReportTitle(bundle, req.Kind),
-			Body:           renderReportBody(bundle, fingerprint, freeText),
+			Body:           renderReportBody(bundle, fingerprint, basis, freeText),
 			Labels:         reportLabels(req.Kind),
 			Fingerprint:    fingerprint,
 			BoardPlacement: workmgmt.BoardPlacement{Status: productReportBoardStatus},
@@ -304,15 +325,16 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 		action, resultNum, resultURL = "created", created.Number, created.URL
 	}
 
-	s.auditProductReport(r, runRow, fingerprint, owner+"/"+name, action, resultNum, resultURL, id.Subject)
+	s.auditProductReport(r, runRow, fingerprint, basis, owner+"/"+name, action, resultNum, resultURL, id.Subject)
 
 	resp := productReportResponse{
-		Fingerprint:    fingerprint,
-		Action:         action,
-		Number:         resultNum,
-		URL:            resultURL,
-		Destination:    owner + "/" + name,
-		BoardingStatus: workmgmt.BoardingStatusOf(target, created),
+		Fingerprint:      fingerprint,
+		Action:           action,
+		Number:           resultNum,
+		URL:              resultURL,
+		Destination:      owner + "/" + name,
+		BoardingStatus:   workmgmt.BoardingStatusOf(target, created),
+		FingerprintBasis: basis,
 	}
 	rawBoardingCause := ""
 	if created != nil {
@@ -457,17 +479,19 @@ func (s *Server) decodeProductReportRequest(w http.ResponseWriter, r *http.Reque
 }
 
 // auditProductReport writes the source-side product_report_filed entry.
-// It names what left the boundary — fingerprint, destination,
-// created-vs-occurrence, and the upstream number/URL — and carries no
-// free text. Best-effort: the egress already happened, so a write failure
-// is logged, not surfaced.
-func (s *Server) auditProductReport(r *http.Request, runRow *run.Run, fingerprint, destination, action string, number int, url, subject string) {
+// It names what left the boundary — fingerprint, the fingerprint_basis
+// (kind + component names + dedup_searched, product facts only, #3233),
+// destination, created-vs-occurrence, and the upstream number/URL — and
+// carries no free text. Best-effort: the egress already happened, so a
+// write failure is logged, not surfaced.
+func (s *Server) auditProductReport(r *http.Request, runRow *run.Run, fingerprint string, basis diagnostics.FingerprintBasis, destination, action string, number int, url, subject string) {
 	payload, _ := json.Marshal(map[string]any{
-		"fingerprint":  fingerprint,
-		"destination":  destination,
-		"action":       action,
-		"upstream_url": url,
-		"upstream_num": number,
+		"fingerprint":       fingerprint,
+		"fingerprint_basis": basis,
+		"destination":       destination,
+		"action":            action,
+		"upstream_url":      url,
+		"upstream_num":      number,
 	})
 	kind := actorKindForSubject(subject)
 	subj := subject
@@ -484,24 +508,6 @@ func (s *Server) auditProductReport(r *http.Request, runRow *run.Run, fingerprin
 			slog.String("run_id", runRow.ID.String()),
 		)
 	}
-}
-
-// bundleFingerprint computes the dedup fingerprint from the bundle's
-// product facts. The failing stage supplies the error code (failure
-// category), surface, and detail class; the run state stands in for the
-// error code when there is no failing stage (e.g. a feature request off a
-// green run, where the detail class is "" — the surface fallback). The
-// detail class distinguishes distinct root causes sharing a surface
-// (#1962); an empty class reproduces the pre-change fingerprint. The
-// version family is the fishhawkd major.minor.
-func bundleFingerprint(b diagnostics.DiagnosticBundle) string {
-	errorCode, surface, detailClass := b.RunState, "", ""
-	if b.FailingStage != nil {
-		errorCode = b.FailingStage.FailureCategory
-		surface = b.FailingStage.FailureSurface
-		detailClass = b.FailingStage.FailureDetailClass
-	}
-	return diagnostics.Fingerprint(errorCode, surface, detailClass, diagnostics.VersionFamily(b.Versions.Fishhawkd.Version))
 }
 
 // redactedFreeText returns the operator free text that may cross the egress
@@ -556,7 +562,7 @@ func renderReportTitle(b diagnostics.DiagnosticBundle, kind string) string {
 // redaction-scrubbed operator free text ONLY when freeText is non-empty
 // (the caller passes "" unless include_free_text consent was given). The
 // provider appends the hidden fingerprint marker.
-func renderReportBody(b diagnostics.DiagnosticBundle, fingerprint, freeText string) string {
+func renderReportBody(b diagnostics.DiagnosticBundle, fingerprint string, basis diagnostics.FingerprintBasis, freeText string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Auto-collected Fishhawk diagnostic bundle (product facts only).\n\n")
 	fmt.Fprintf(&sb, "- run: `%s`\n", b.RunID)
@@ -580,7 +586,8 @@ func renderReportBody(b diagnostics.DiagnosticBundle, fingerprint, freeText stri
 	}
 	fmt.Fprintf(&sb, "- versions: fishhawkd `%s` (`%s`), min runner `%s`\n",
 		b.Versions.Fishhawkd.Version, b.Versions.Fishhawkd.GitSHA, b.Versions.MinRunnerVersion)
-	fmt.Fprintf(&sb, "- fingerprint: `%s`\n", fingerprint)
+	fmt.Fprintf(&sb, "- fingerprint: `%s` (basis: %s; %s)\n",
+		fingerprint, basis.Kind, strings.Join(basis.Components, ", "))
 	sb.WriteString(renderWedgeLines(b.WedgeContext))
 	if freeText != "" {
 		fmt.Fprintf(&sb, "\n## Operator notes (redacted)\n\n%s\n", freeText)
@@ -647,11 +654,12 @@ func wedgeSummaryLine(wc *diagnostics.WedgeContext) string {
 // an existing report on a dedup hit. Product facts only, plus the
 // redaction-scrubbed operator free text when consent was given (freeText
 // non-empty).
-func renderOccurrenceComment(b diagnostics.DiagnosticBundle, fingerprint, freeText string) string {
+func renderOccurrenceComment(b diagnostics.DiagnosticBundle, fingerprint string, basis diagnostics.FingerprintBasis, freeText string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb,
-		"Another occurrence of fingerprint `%s`.\n\n- run: `%s`\n- run state: `%s`\n- observed: %s",
-		fingerprint, b.RunID, b.RunState, time.Now().UTC().Format(time.RFC3339))
+		"Another occurrence of fingerprint `%s` (matched on: %s — %s).\n\n- run: `%s`\n- run state: `%s`\n- observed: %s",
+		fingerprint, basis.Kind, strings.Join(basis.Components, ", "),
+		b.RunID, b.RunState, time.Now().UTC().Format(time.RFC3339))
 	sb.WriteString(wedgeSummaryLine(b.WedgeContext))
 	if freeText != "" {
 		fmt.Fprintf(&sb, "\n\n## Operator notes (redacted)\n\n%s\n", freeText)

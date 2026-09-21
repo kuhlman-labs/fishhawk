@@ -88,8 +88,16 @@ case); an operator/operator-agent session has no FISHHAWK_RUN_ID, so pass
 run_id explicitly. kind is 'bug' (default) or 'feature'. description +
 include_free_text carry the consented, redacted free text.
 
+On a HEALTHY run (no failing stage) the fingerprint is NOT keyed on the
+failure tuple: with a consented description it keys on the workflow plus a
+digest of that redacted description; with no free text it keys on the run id
+and the backend SKIPS the dedup search and files fresh (#3233). The failure
+keying is unchanged, so open deduped failure reports keep matching.
+
 Returns the egress outcome (report.action created|occurrence, fingerprint,
-upstream number/url, destination, plus boarded / boarding_status /
+report.fingerprint_basis {kind: failure|healthy_description|healthy_unique,
+components: the ordered names hashed, dedup_searched: whether the upstream was
+searched}, upstream number/url, destination, plus boarded / boarding_status /
 boarding_error), a transparency preview of the product facts that were
 attached (diagnostics), and free_text_included. boarding_status
 disambiguates boarded=false: 'not_attempted_no_project' means the repo

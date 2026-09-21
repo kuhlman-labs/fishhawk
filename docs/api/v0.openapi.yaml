@@ -4851,15 +4851,52 @@ components:
         outcome. Since #1737 it also reports whether a NEWLY filed report
         reached the project board; placement is best-effort, so a
         placement failure still returns 201 with the filed report intact.
-      required: [fingerprint, action, number, url, destination, boarded, boarding_status]
+      required: [fingerprint, action, number, url, destination, boarded, boarding_status, fingerprint_basis]
       properties:
         fingerprint:
           type: string
           description: >-
-            Stable dedup fingerprint over (failure category, audit surface,
-            failure detail class, version family). The detail class is
-            included only when the failure reason classified; an
-            unclassified failure keeps the 3-component fingerprint (#1962).
+            Stable dedup fingerprint. On a FAILING run it is keyed over
+            (failure category, audit surface, failure detail class, version
+            family) — unchanged, so open deduped failure reports keep
+            matching (the detail class is included only when the failure
+            reason classified; an unclassified failure keeps the 3-component
+            digest, #1962). On a HEALTHY run (no failing stage) it is keyed
+            by report SHAPE (#3233): with a consented description, over
+            (run state, workflow id, description digest, version family);
+            with no free text, over (run state, workflow id, run id, version
+            family), in which case the dedup search is skipped and the report
+            is filed fresh. See `fingerprint_basis` for what was actually
+            hashed.
+        fingerprint_basis:
+          type: object
+          description: >-
+            Names WHAT the dedup fingerprint was computed over (#3233), so an
+            operator can see a collision instead of trusting
+            `action: occurrence`. `kind` is the keying; `components` lists the
+            ordered component names actually hashed; `dedup_searched` reports
+            whether the upstream repo was searched for an existing report
+            (false only on the healthy_unique keying, which files fresh).
+          required: [kind, components, dedup_searched]
+          properties:
+            kind:
+              type: string
+              enum: [failure, healthy_description, healthy_unique]
+              description: >-
+                failure — the unchanged failure tuple; healthy_description —
+                a healthy run keyed on workflow + a digest of the consented
+                description; healthy_unique — a healthy run with no free text,
+                keyed on the run id and filed fresh (no dedup search).
+            components:
+              type: array
+              items: { type: string }
+              description: The ordered component names hashed into the fingerprint.
+            dedup_searched:
+              type: boolean
+              description: >-
+                Whether the handler searched the upstream repo for an existing
+                fingerprint-marked report. false on healthy_unique (filed
+                fresh); true otherwise.
         action:
           type: string
           enum: [created, occurrence]
@@ -10839,13 +10876,21 @@ paths:
       description: |
         The deduped, audited egress path for upstream Fishhawk product
         feedback (#1006). Collects the run's product-facts diagnostic
-        bundle, fingerprints the failure over (failure category, audit
-        surface, failure detail class, fishhawkd version family), searches the FIXED upstream
-        product repo for an open report already carrying that fingerprint,
-        and either appends an occurrence comment (dedup hit, nothing
-        created) or files a new fingerprint-marked report (dedup miss).
-        A source-side `product_report_filed` audit entry names what left
-        the boundary (fingerprint, destination, created-vs-occurrence).
+        bundle and fingerprints it by report SHAPE (#3233). On a FAILING run
+        the fingerprint is keyed over (failure category, audit surface,
+        failure detail class, fishhawkd version family) — unchanged, so open
+        deduped failure reports keep matching. On a HEALTHY run (no failing
+        stage) it keys on the workflow plus a digest of the consented
+        description, or — with no free text — on the run id, in which case
+        the dedup search is SKIPPED and the report is filed fresh (this is
+        what stops two unrelated friction reports on running/awaiting_approval
+        runs from colliding onto one occurrence comment). When a search runs,
+        it queries the FIXED upstream product repo for an open report already
+        carrying that fingerprint, and either appends an occurrence comment
+        (dedup hit, nothing created) or files a new fingerprint-marked report
+        (dedup miss). The response and the source-side `product_report_filed`
+        audit entry both carry a `fingerprint_basis` naming what was hashed
+        (fingerprint, fingerprint_basis, destination, created-vs-occurrence).
 
         **Egress is gated** by a mutually-exclusive entitlement switch
         (widened in #1274). The report may be filed by the run's own
