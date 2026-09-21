@@ -79,7 +79,11 @@ grooming run should flag it as such rather than ranking it.
   improves an agent's coding ability rather than the governance around it is out.
 - **N2 — Fishhawk is not a project management tool.** The customer's tracker is
   source of truth. The board is a projection and a selection surface, never a
-  coordination bus (ADR-064).
+  coordination bus (ADR-064). This is about the customer's work: Fishhawk does not
+  replace their tracker or own their planning. Fishhawk planning its *own*
+  program — a ratified charter, a release brief the groomer reads from, readiness
+  against approved criteria (E71) — reads from the tracker and is in scope; it is
+  not N2 drift.
 - **N3 — Fishhawk is not a CI/CD platform.** It runs on the customer's CI.
 - **N4 — Fishhawk does not own deploy mechanics.** The governed deploy *gate* and
   the signed record are in scope (ADR-038); pipeline logic, production credential
