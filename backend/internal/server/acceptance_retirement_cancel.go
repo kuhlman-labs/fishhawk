@@ -197,5 +197,5 @@ func (s *Server) recordAcceptanceRetirementsDroppedOnCancel(ctx context.Context,
 	if !appended {
 		return
 	}
-	s.notifyStatusUpdate(ctx, runID, CategoryAcceptanceScenarioRetirementDropped)
+	s.notifyOperatorVisible(ctx, runID, CategoryAcceptanceScenarioRetirementDropped)
 }

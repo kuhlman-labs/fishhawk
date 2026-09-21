@@ -1236,7 +1236,7 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 	// the trace-time hook already dispatched for this head.
 	s.maybeBackstopFixupReReview(r.Context(), runID, stage, pr.HeadSHA, pr.BaseSHA)
 
-	s.notifyStatusUpdate(r.Context(), runID, "fixup_pushed")
+	s.notifyOperatorVisible(r.Context(), runID, CategoryFixupPushed)
 
 	s.writeJSON(w, r, http.StatusOK, pullRequestFixupPushResponse{
 		StageID: stageID,
@@ -2019,6 +2019,6 @@ func (s *Server) recordAcceptanceScenarioRetirementDropped(w http.ResponseWriter
 		respond()
 		return
 	}
-	s.notifyStatusUpdate(r.Context(), runID, outcomeAcceptanceScenarioRetirementDropped)
+	s.notifyOperatorVisible(r.Context(), runID, outcomeAcceptanceScenarioRetirementDropped)
 	respond()
 }

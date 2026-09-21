@@ -225,7 +225,7 @@ func (s *Server) handleRollbackDeployment(w http.ResponseWriter, r *http.Request
 
 	// Surface the rollback on the issue timeline (the deploy audit categories
 	// render data-drivenly through the issuecomment activity set).
-	s.notifyStatusUpdate(r.Context(), runID, "deployment_rollback_initiated")
+	s.notifyOperatorVisible(r.Context(), runID, CategoryDeploymentRollbackInitiated)
 
 	s.writeJSON(w, r, http.StatusAccepted, rollbackResponse{
 		RunID:          runID.String(),
