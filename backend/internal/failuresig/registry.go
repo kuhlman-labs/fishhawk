@@ -51,6 +51,16 @@ const (
 	// "runner exited 0 without settling the stage (state=%s)"
 	// (backend/internal/mcpserver/run_stage.go:1336, reapZeroExitStrand).
 	AnchorZeroExitStrand = "runner exited 0 without settling the stage"
+
+	// AnchorVerifyGateTimedOut is the lead every verify-gate failure the
+	// RUNNER's own executor.verify.timeout killed begins with (#3383):
+	// "verify gate timed out: %q (%s form) was killed by the runner when
+	// executor.verify.timeout (%s) expired …" — emitted by
+	// runner/cmd/fishhawk-runner/verifytimeout.go::verifyGateTimedOutLead
+	// at all four gate sites (the fix loop, the single-shot committed gate,
+	// the #960 strict re-verify and the working-tree gate). MUST match that
+	// constant byte-for-byte.
+	AnchorVerifyGateTimedOut = "verify gate timed out"
 )
 
 // Failure categories this catalog keys on.
@@ -137,6 +147,23 @@ func Registry() []Signature {
 				"then fishhawk_retry_stage to re-spawn in place",
 			},
 			match: func(ev Evidence) bool { return cites(ev.FailureReason, AnchorRunnerExitedBeforeReporting) },
+		},
+		{
+			ID:    "verify_gate_timed_out",
+			Title: "Verify gate killed by its timeout — no verdict",
+			Means: "The runner SIGKILLed the verify command when executor.verify.timeout expired, before it reached a verdict. The captured output is INCOMPLETE and ends where the process died: any FAIL/panic lines in it are real, but the absence of FAIL lines proves nothing — the tests that had not yet run were never judged, so the change was NOT judged either way.",
+			Playbook: []string{
+				"read the trailer at the end of the failure reason (`--- fishhawk-runner: verify TERMINATED, no verdict ---`) for the configured timeout, the wall-clock elapsed and the verify form (scoped/full/working-tree)",
+				"fishhawk_retry_stage once — host load is the usual cause, and the stage is retryable in place",
+				"if it recurs, raise executor.verify.timeout in .fishhawk/workflows.yaml (a full `scripts/test verify` exceeds 10m on clean main; a large -coverpkg set runs well past 15m), or check the change for a hang in the module where the output stopped",
+			},
+			// Requires category C ALONGSIDE the anchor: a category-A/B reason
+			// that merely quotes the phrase (a test printing it) never
+			// matches. Placed BEFORE infra_flake_recurred so a timed-out
+			// absorb re-run (whose reason can cite both) names this entry.
+			match: func(ev Evidence) bool {
+				return ev.FailureCategory == categoryRefusal && cites(ev.FailureReason, AnchorVerifyGateTimedOut)
+			},
 		},
 		{
 			ID:    "infra_flake_recurred",

@@ -1976,7 +1976,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 
 		// Verify gate: optional in-band test gate that fires after constraint
 		// evaluation and before bundle building. Non-zero exit from the
-		// verify command demotes to category-A (#441).
+		// verify command demotes to category-A (#441); a command the runner's
+		// own timeout killed before a verdict demotes to category C instead
+		// (#3383, workingTreeGateFailureCategory).
 		//
 		// Single-shot WORKING-TREE gate. It runs ONLY on the paths that have
 		// no committed scope-only tree to gate: plan/non-implement stages and
@@ -1993,7 +1995,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			res.Events = append(res.Events, ev)
 			if demote != nil {
 				res.OK = false
-				res.FailureCategory = "A"
+				res.FailureCategory = workingTreeGateFailureCategory(demote)
 				res.FailureReason = demote.Error()
 				invokeErr = demote
 			}
@@ -4400,24 +4402,27 @@ func validatePlan(path string) (agent.Event, error) {
 
 // runVerifyGate runs the --verify-cmd shell command as an in-band test
 // gate after the agent exits cleanly. It captures combined output,
-// emits a verify_run event, and returns a non-nil error (which the
-// caller uses to demote the run to category-A) when the command exits
-// non-zero.
+// emits a verify_run event, and returns a non-nil error when the command
+// exits non-zero — the run() call site maps it through
+// workingTreeGateFailureCategory: category-A for an ordinary red exit, or
+// category C wrapping errVerifyGateTimedOut when the runner's own deadline
+// killed the command before a verdict (#3383), in which case the output ends
+// with verifyTimeoutTrailer and the verify_run event carries timed_out:true.
 //
-// The command runs via "sh -c <verifyCmd>" so the flag accepts any
-// shell expression. Setpgid=true places the child in a new process
-// group; cmd.Cancel kills the whole group on context cancellation so
-// grandchildren (e.g. go test subprocesses) don't keep the output
-// pipe open and block CombinedOutput.
+// The command runs via "sh -c <verifyCmd>" so the flag accepts any shell
+// expression, and it is executed through the execBoundedHostArgvFn seam —
+// the same Setpgid + process-group-SIGKILL + CombinedOutput + exit-mapping
+// contract the committed-tree gates use (grandchildren such as go test
+// subprocesses cannot keep the output pipe open and block CombinedOutput) —
+// with the same sanitized, lint-cache-isolated env. It deliberately does NOT
+// route through the isolation selection (runBoundedGateArgv): this gate runs
+// the WORKING TREE on the host by design (plan and --no-pr stages have no
+// committed scope-only tree to isolate).
 func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, error) {
 	timeout := cfg.verifyTimeout
 	if timeout == 0 {
 		timeout = 10 * time.Minute
 	}
-	childCtx, childCancel := context.WithTimeout(ctx, timeout)
-	defer childCancel()
-
-	cmd := exec.CommandContext(childCtx, "sh", "-c", cfg.verifyCmd)
 	// Strip runner credentials from the gate subprocess env (ADR-029 #650
 	// item 4): the verify command runs agent-authored code, so it must not
 	// see the installation token / API keys / MCP token.
@@ -4430,25 +4435,15 @@ func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, e
 		defer func() { _ = os.RemoveAll(lintCacheDir) }()
 		gateEnv = withIsolatedLintCache(gateEnv, lintCacheDir)
 	}
-	cmd.Env = gateEnv
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-		return nil
-	}
 
-	output, cmdErr := cmd.CombinedOutput()
-
-	exitCode := 0
-	if cmdErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(cmdErr, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = -1
-		}
+	start := time.Now()
+	output, exitCode, timedOut := execBoundedHostArgvFn(ctx, []string{"sh", "-c", cfg.verifyCmd}, "", gateEnv, timeout)
+	if timedOut {
+		const form = "working-tree"
+		elapsed := time.Since(start)
+		output += verifyTimeoutTrailer(cfg.verifyCmd, form, timeout, elapsed, output)
+		ev := verifyRunEventTimedOut(cfg.verifyCmd, "", "", output, timeout, elapsed)
+		return ev, fmt.Errorf("%w: %s", errVerifyGateTimedOut, verifyTimedOutReason(cfg.verifyCmd, form, timeout, 1))
 	}
 
 	outcome := "passed"
@@ -4463,7 +4458,7 @@ func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, e
 		Payload: agent.MakePayload(map[string]any{
 			"command":   cfg.verifyCmd,
 			"exit_code": exitCode,
-			"output":    string(output),
+			"output":    output,
 			"outcome":   outcome,
 		}),
 	}
@@ -5000,6 +4995,8 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		fatalErr        error  // non-nil on a POST-commit reset failure (#816) or a passed-but-unresolvable verified tree (#960) → hard abort
 		refused         bool   // a gate-isolation refusal (ADR-063 / #2134) → category C, no fix re-invoke
 		unavailable     bool   // a host-caused container pre-exec failure (#3448) → category C, no fix re-invoke
+		timedOut        bool   // the runner's own deadline killed the LAST verify (#3383) → category C, no absorb, no fix re-invoke
+		form            string // the verify form of the deciding (last) verify run: scoped, or full after the (c2) re-verify
 		flakeRetried    bool   // once-per-stage testcontainers infra-flake absorb (#972) already spent
 		autoformatted   bool   // once-per-stage gofmt/goimports auto-format absorb (#3316) already spent
 	)
@@ -5043,11 +5040,12 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// (c) Verify against the committed tree. With a scope set in force this
 		// is the SCOPED form — a fast pre-pass over the touched packages, NOT
 		// the authority.
+		form = verifyFormName(scopePkgs)
 		ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
 		res.Events = append(res.Events, ev)
 		attempts++
 		lastOutput = out
-		logVerifyFormOutcome(logSink, *cfg, iter+1, verifyFormName(scopePkgs), outcome)
+		logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
 
 		// (c2) FULL re-verify on the passing iteration (#3315). A scoped pass
 		// proves only the named packages; a change can break a test in a package
@@ -5072,11 +5070,12 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// — the scoped call above WAS the full form, so re-running it would
 		// double every iteration's cost for no added coverage.
 		if len(scopePkgs) > 0 && outcome == "passed" {
+			form = verifyFormFull
 			fev, fout, foutcome, fdisp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 			res.Events = append(res.Events, fev)
 			out, outcome, disp = fout, foutcome, fdisp
 			lastOutput = fout
-			logVerifyFormOutcome(logSink, *cfg, iter+1, verifyFormFull, outcome)
+			logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
 		}
 
 		// Capture the verified tree's object hash BEFORE the reset (#960).
@@ -5138,6 +5137,21 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// fails category C so it is retryable in place once the deployment
 		// is corrected. gateCheckoutRefused (the seed refused the checkout's
 		// OWN metadata) and gateExecuted fall through: tree-attributable.
+		//
+		// gateTimedOut (#3383) is the third break: the gate RAN but the
+		// runner's own deadline killed it before a verdict. The output is a
+		// no-verdict fragment, so it never reaches the fix agent (nothing to
+		// fix) and never enters either absorb below — an infra or gofmt
+		// literal that happens to sit in a timed-out fragment must not buy a
+		// second full-timeout run. Deliberately NO automatic re-run: a flake
+		// absorb repeats a verify that fails in seconds, whereas a timed-out
+		// verify already spent the whole executor.verify.timeout inside a
+		// stage whose wall clock the operator sized, and a deterministic hang
+		// would time out again. Category C keeps the stage retryable in
+		// place from a reason that now names the cause. Because this switch
+		// runs on EVERY iteration — including the `iter--; continue` re-runs
+		// the absorbs schedule — the disposition read here is always the
+		// LAST verify's: an absorb re-run that itself times out lands here.
 		switch disp {
 		case gateRefused:
 			refused = true
@@ -5149,8 +5163,11 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_gate_unavailable","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, iter+1, strings.TrimSpace(out))
+		case gateTimedOut:
+			timedOut = true
+			res.Events = append(res.Events, logVerifyGateTimedOut(logSink, *cfg, iter+1, form, timeout))
 		}
-		if refused || unavailable {
+		if refused || unavailable || timedOut {
 			break
 		}
 
@@ -5386,6 +5403,9 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 	case lastIterErr != nil:
 		summary["outcome"] = "skipped"
 		summary["detail"] = lastIterErr.Error()
+	case timedOut:
+		summary["outcome"] = "failed"
+		summary["detail"] = verifyTimedOutReason(cfg.verifyCmd, form, timeout, attempts)
 	case !passed:
 		summary["outcome"] = "failed"
 	default:
@@ -5433,6 +5453,15 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		return reinvoked, "", nil
 	}
 
+	if timedOut {
+		// No verdict (#3383): category C with a lead naming the cause; the
+		// output already ends with the runner-authored trailer.
+		res.OK = false
+		res.FailureCategory = "C"
+		res.FailureReason = verifyTimedOutReason(cfg.verifyCmd, form, timeout, attempts) + "\n" + lastOutput
+		return reinvoked, "", nil
+	}
+
 	if !passed {
 		res.OK = false
 		res.FailureCategory = "A"
@@ -5474,6 +5503,12 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 //     call site via committedGateFailureCategory (#3449). Both never-executed
 //     dispositions are read from runVerifyCommittedTree's out-of-band
 //     gateDisposition, never from the untrusted output text.
+//   - A verify the RUNNER's own deadline killed (#3383, gateTimedOut — read
+//     from the disposition of the LAST run, so an absorb re-run that itself
+//     times out counts) wraps gitops.ErrVerifyInfraFailure +
+//     errVerifyGateTimedOut: category C at the call site, the absorb is
+//     SKIPPED (a re-run would cost another full timeout), and the error
+//     leads with verifyGateTimedOutLead over output ending in the trailer.
 //   - A POST-commit gitResetSoftHEAD1 failure is FATAL, not a skip (#802
 //     approval condition). After the throwaway commit is materialized, a failed
 //     undo leaves HEAD on the throwaway commit, so openPRAndShipArtifact's real
@@ -5552,9 +5587,18 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	// identically, and an unavailable container host does not come back
 	// inside one re-run. Both are read from the out-of-band disposition —
 	// never from the output text — and classified at (f) as category C.
+	// A timed-out gate (#3383) never enters the absorb either: the output
+	// is a no-verdict fragment, and a re-run would cost another full
+	// executor.verify.timeout. It is logged here so the trace carries the
+	// verify_gate_timed_out event beside the verify_run it describes.
 	refused := outcome == "failed" && disp == gateRefused
 	unavailable := outcome == "failed" && disp == gateUnavailable
-	if !refused && !unavailable && outcome == "failed" && isVerifyInfraFailure(out) {
+	timedOut := outcome == "failed" && disp == gateTimedOut
+	verifyAttempts := 1
+	if timedOut {
+		events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, verifyFormFull, timeout))
+	}
+	if !refused && !unavailable && !timedOut && outcome == "failed" && isVerifyInfraFailure(out) {
 		const detail = "infrastructure-failure signature in verify output (container-start timeout or lint-lock contention); re-running verify once"
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
@@ -5570,9 +5614,15 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 		events = append(events, ev)
 		// The re-run's own disposition decides (f): a host that went away
 		// between the two runs is classified as unavailable, not as a red
-		// tree.
+		// tree, and an absorb re-run that itself timed out is a timed-out
+		// gate (#3383 — the LAST execution's disposition governs).
 		refused = outcome == "failed" && disp == gateRefused
 		unavailable = outcome == "failed" && disp == gateUnavailable
+		verifyAttempts = 2
+		timedOut = outcome == "failed" && disp == gateTimedOut
+		if timedOut {
+			events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, verifyFormFull, timeout))
+		}
 	}
 
 	// Capture the verified tree's object hash BEFORE the reset (#960). Only a
@@ -5623,6 +5673,15 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 			// container path failed on the HOST before the gate executed.
 			return events, "", fmt.Errorf("%w: %w: committed tree verify command %q could not be executed by the gate container: %s",
 				gitops.ErrVerifyInfraFailure, errGateContainerUnavailable, cfg.verifyCmd, strings.TrimSpace(out))
+		}
+		if timedOut {
+			// Category C (retryable in place): the runner's own deadline
+			// killed the gate before a verdict (#3383). Ahead of the infra
+			// signature check so a timed-out fragment that happens to carry
+			// an infra literal is still reported as what it is. The output
+			// already ends with the trailer.
+			return events, "", fmt.Errorf("%w: %w: %s\n%s",
+				gitops.ErrVerifyInfraFailure, errVerifyGateTimedOut, verifyTimedOutReason(cfg.verifyCmd, verifyFormFull, timeout, verifyAttempts), out)
 		}
 		if isVerifyInfraFailure(out) {
 			return events, "", fmt.Errorf("%w: committed tree verify command %q failed for an infrastructure reason: %s; %d file(s) outside scope are build/test-required: %s\n%s",
@@ -6030,9 +6089,12 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 // executed for a reason the tree cannot have caused (category C at the
 // gates), gateCheckoutRefused means the container seed refused the
 // checkout's own metadata (tree-attributable, classified as an executed
-// failure). The tolerant tmp-dir and clone "skipped" branches return
-// gateExecuted: their pre-#2134 outcome mapping is unchanged and must never
-// become category C.
+// failure). gateTimedOut (#3383) means the gate ran but the runner's own
+// deadline killed it before a verdict: the output is appended with the
+// explicit verifyTimeoutTrailer (operator TEXT only — no site classifies on
+// it) and the verify_run event carries timed_out:true. The tolerant tmp-dir
+// and clone "skipped" branches return gateExecuted: their pre-#2134 outcome
+// mapping is unchanged and must never become category C.
 func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration, scopePkgs []string) (agent.Event, string, string, gateDisposition) {
 	// Best-effort tree identity for the trace event: the enforcement-grade
 	// capture is the gates' fail-closed gitRevParseTreeOf; an empty tree_sha
@@ -6066,8 +6128,14 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 		extraEnv = verifyLockPathEnv(extraEnv, repoDir)
 	}
 
+	start := time.Now()
 	output, exitCode, disp := runBoundedGateCommandDisposed(ctx, verifyCmd, wt,
 		filepath.Join(parent, "golangci-lint-cache"), timeout, extraEnv...)
+	if disp == gateTimedOut {
+		elapsed := time.Since(start)
+		output += verifyTimeoutTrailer(verifyCmd, verifyFormName(scopePkgs), timeout, elapsed, output)
+		return verifyRunEventTimedOut(verifyCmd, headSHA, treeSHA, output, timeout, elapsed), output, "failed", gateTimedOut
+	}
 	outcome := "passed"
 	if exitCode != 0 {
 		outcome = "failed"
@@ -6093,7 +6161,9 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 // It returns the combined output and the exit code: 0 on success, the
 // child's code on a non-zero exit, and -1 when the command could not be
 // run or was killed (including the timeout), so a caller can always name
-// what happened.
+// what happened. A caller that must DISTINGUISH the runner's own timeout
+// from a red exit uses the Disposed twin below, whose gateDisposition
+// carries gateTimedOut out of band (#3383).
 //
 // Callers: the committed-tree verify gate (above, and through it the
 // verify-fix loop and the #960 strict re-verify) and the diff-coverage
@@ -6199,7 +6269,9 @@ func runBoundedGateArgv(ctx context.Context, argv []string, dir, lintCacheDir st
 // switch, plus the gateDisposition of the outcome — gateRefused for a refused
 // selection (the refusal text and -1, nothing executed), runGateInContainer's
 // own disposition on the container path, and gateExecuted on the sandbox and
-// clone paths (the argv ran; the exit code is the verdict). An empty argv is
+// clone paths (the argv ran; the exit code is the verdict) — unless the seam
+// reports the runner's own deadline expired, which is gateTimedOut (#3383:
+// the argv ran but reached no verdict). An empty argv is
 // ("", -1, gateExecuted): a caller bug, not a deployment condition.
 func runBoundedGateArgvDisposed(ctx context.Context, argv []string, dir, lintCacheDir string, timeout time.Duration, extraEnv ...string) (string, int, gateDisposition) {
 	if len(argv) == 0 {
@@ -6214,23 +6286,35 @@ func runBoundedGateArgvDisposed(ctx context.Context, argv []string, dir, lintCac
 	case gateiso.PathContainer:
 		return runGateInContainer(ctx, sel, argv, dir, lintCacheDir, sanitized, extraEnv, timeout)
 	case gateiso.PathCloneSandbox:
-		out, code := execBoundedHostArgvFn(ctx, gateiso.WrapSandbox(argv), dir, env, timeout)
+		out, code, timedOut := execBoundedHostArgvFn(ctx, gateiso.WrapSandbox(argv), dir, env, timeout)
+		if timedOut {
+			return out, code, gateTimedOut
+		}
 		return out, code, gateExecuted
 	default:
-		out, code := execBoundedHostArgvFn(ctx, argv, dir, env, timeout)
+		out, code, timedOut := execBoundedHostArgvFn(ctx, argv, dir, env, timeout)
+		if timedOut {
+			return out, code, gateTimedOut
+		}
 		return out, code, gateExecuted
 	}
 }
 
 // execBoundedHostArgv is the HOST half of the containment contract: a child
 // context bounded by timeout, Setpgid + process-group SIGKILL on
-// cancellation, CombinedOutput, and the 0 / child-code / -1 exit mapping. env
-// is passed as-is — runBoundedGateArgv has already built the sanitized gate
-// env for the host paths, and passes the runner's own environment for the
-// container runtime CLI. It is reached only through execBoundedHostArgvFn.
-func execBoundedHostArgv(ctx context.Context, argv []string, dir string, env []string, timeout time.Duration) (string, int) {
+// cancellation, CombinedOutput, and the 0 / child-code / -1 exit mapping —
+// -1 when the command could not be run or was killed; the third value,
+// timedOut, names the RUNNER's own deadline as the killer (#3383). It is
+// derived AFTER CombinedOutput: the command did not return success AND the
+// child context's deadline expired AND the parent context is still live —
+// so a parent cancellation (a runner shutdown) keeps (-1, false), and a
+// command that returned 0 as the deadline fired is a pass. env is passed
+// as-is — runBoundedGateArgv has already built the sanitized gate env for
+// the host paths, and passes the runner's own environment for the container
+// runtime CLI. It is reached only through execBoundedHostArgvFn.
+func execBoundedHostArgv(ctx context.Context, argv []string, dir string, env []string, timeout time.Duration) (string, int, bool) {
 	if len(argv) == 0 {
-		return "", -1
+		return "", -1, false
 	}
 	childCtx, childCancel := context.WithTimeout(ctx, timeout)
 	defer childCancel()
@@ -6255,7 +6339,8 @@ func execBoundedHostArgv(ctx context.Context, argv []string, dir string, env []s
 			exitCode = -1
 		}
 	}
-	return string(output), exitCode
+	timedOut := cmdErr != nil && errors.Is(childCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+	return string(output), exitCode, timedOut
 }
 
 // diffCoverageTimeout bounds the customer coverage command. It is the same
@@ -8685,9 +8770,11 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		}
 		// nil scope set = the FULL verify form (#3315): the #960 strict re-verify
 		// is the pre-push authority and is never narrowed.
-		// The disposition is dropped here on purpose (#3448): this site keeps
-		// its isReverifyInfraFailure classification (out_of_scope for #3448).
-		ev, out, outcome, _ := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
+		// The disposition is read for ONE case only (#3383): gateTimedOut, the
+		// runner's own deadline killing the re-verify before a verdict. Every
+		// other failure keeps this site's isReverifyInfraFailure
+		// classification unchanged (out_of_scope for #3448).
+		ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
 		// Emit the decisive re-verify's verify_run record unconditionally
 		// (pass or fail) before the outcome check (#969). The gate's first
 		// verify_run shipped inside the trace bundle, but the bundle is
@@ -8726,14 +8813,26 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// byte-identical to this one, this site — and only this site, and only
 		// when that evidence holds (reverifySignalRuleAdmissible) — also
 		// treats a signal death as infrastructure.
+		// A timed-out re-verify (#3383) SKIPS the absorb: a re-run costs another
+		// full reverifyTimeout, and the fragment carries no verdict to match.
 		signalRuleOK := reverifySignalRuleAdmissible(treeDelta, tdErr == nil, gateScopeFiles)
-		if outcome != "passed" && isReverifyInfraFailure(out, signalRuleOK) {
+		timedOut := outcome != "passed" && disp == gateTimedOut
+		if timedOut {
+			logVerifyGateTimedOut(logSink, cfg, 1, verifyFormFull, reverifyTimeout)
+		}
+		if outcome != "passed" && !timedOut && isReverifyInfraFailure(out, signalRuleOK) {
 			const detail = "infrastructure-failure signature in the pre-push strict re-verify output; re-running the re-verify once against the same committed head"
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, 1, detail)
-			ev, out, outcome, _ = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
+			ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
 			emitReverifyRun(ev)
+			// The LAST execution's disposition governs (#3383): an absorb
+			// re-run that itself timed out is a timed-out re-verify.
+			timedOut = outcome != "passed" && disp == gateTimedOut
+			if timedOut {
+				logVerifyGateTimedOut(logSink, cfg, 2, verifyFormFull, reverifyTimeout)
+			}
 		}
 		if outcome != "passed" {
 			// LEAD with the command that actually failed and a bounded excerpt
@@ -8745,6 +8844,14 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				cfg.verifyCmd, outcome, verifyFailureExcerpt(out))
 			accounting := fmt.Sprintf("gates verified tree %s but the staged commit %s carries tree %s; %d file(s) excluded as scope drift: %s",
 				verifiedTreeSHA, headSHA, realTree, len(drift), strings.Join(drift, ", "))
+			// A re-verify the runner's own deadline killed reached NO verdict
+			// (#3383): category C via pushFailureCategory, never
+			// ErrPushedTreeNotVerified. The push decision is unchanged — origin
+			// is touched only on an explicit passed outcome.
+			if timedOut {
+				return fmt.Errorf("%w: %s; %s\n%s", gitops.ErrVerifyInfraFailure,
+					verifyTimedOutReason(cfg.verifyCmd, verifyFormFull, reverifyTimeout, 1), accounting, out)
+			}
 			// Split by cause: an infra failure that survived the absorb above
 			// is category-C (retryable in place), NOT the category-B park a
 			// genuine drift/test failure earns.

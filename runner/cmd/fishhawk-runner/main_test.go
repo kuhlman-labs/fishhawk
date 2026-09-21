@@ -14969,6 +14969,11 @@ func TestCommittedGateFailureCategory(t *testing.T) {
 			err:  fmt.Errorf("%w: %w: both", gitops.ErrVerifyInfraFailure, gitops.ErrCommittedTestsFailed),
 			want: "C",
 		},
+		{
+			name: "timed-out gate wraps infra + timed-out sentinels (#3383)",
+			err:  fmt.Errorf("%w: %w: killed by the runner", gitops.ErrVerifyInfraFailure, errVerifyGateTimedOut),
+			want: "C",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := committedGateFailureCategory(tc.err); got != tc.want {
